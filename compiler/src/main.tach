@@ -97,10 +97,10 @@ use crate::back::objfile::{OUTPUT_MODE, OUT_ASM, OUT_EXECUTABLE, OUT_OBJECT, out
 use crate::back::objfile::output::{add_link_arg, add_link_include, is_link_input, link_args_given};
 use crate::back::regalloc::{PRINT_REGALLOC, VERIFY_REGALLOC};
 use crate::base::{
-    FILES, FILE_COUNT, IntVec, STDERR, STDOUT, alloc_zeroed, buf_new, buf_str, buf_write_fd, die,
-    die2, load_sources, streq,
+    FILES, FILE_COUNT, IntVec, OVERLAY, STDERR, STDOUT, alloc_zeroed, buf_int, buf_new, buf_str,
+    buf_write_fd, die, die2, load_sources, streq,
 };
-use crate::base::diag::{DENY_WARNINGS, DIAG_SHORT, ERRORS_AS_DUMP, ERR_KIND};
+use crate::base::diag::{DENY_WARNINGS, DIAG_PROG, DIAG_SHORT, ERRORS_AS_DUMP, ERR_KIND};
 use crate::base::json::DIAG_JSON;
 use crate::base::target::{
     T_AARCH64_LINUX, T_AARCH64_MACOS, T_X86_64_LINUX, T_X86_64_MACOS, set_target, target_is_linux,
@@ -112,18 +112,23 @@ use crate::front::cimport::import_c_headers;
 use crate::front::effects::{EFFECTS_WANTED, PRINT_EFFECTS};
 use crate::front::lexer::{dump_tokens, init_lexer, lex_range};
 use crate::front::modules::load_modules;
+use crate::front::own::{is_values_option, values_option};
 use crate::front::stdalloc::{CHECK_ALLOC_LINUX, CHECK_ALLOC_MODE};
 use crate::gen0::gen::{EMIT_IR, EMIT_MIR, compile_program};
 use crate::middle::effects_verify::VERIFY_EFFECTS;
 use crate::middle::egraph::{EGRAPH, check_rules};
+use crate::middle::gvn::NOALIAS_OFF;
 use crate::middle::ifconv::IFCONV;
 use crate::middle::ipo::PRINT_ATTRS;
+use crate::middle::ir::{IR_CALL_LOCS, IR_LOCS};
 use crate::middle::ir::verify::{PRINT_AFTER_ALL, VERIFY_IR};
 use crate::middle::opt::OPT_LEVEL;
 use crate::middle::profile::{PROFILE_GENERATE, PROFILE_USE};
 use crate::middle::slp::SLP;
+use crate::middle::trace::TRACE;
 use crate::middle::unsafecheck::CHECK_UNSAFE;
 use crate::middle::vectorize::VECTORIZE;
+use crate::middle::vectorize::checks::{VEC_STAT_LOOPS, VEC_STAT_SKIPPED, VEC_STAT_TESTS};
 use crate::middle::vectorize::unroll::UNROLL_RUNTIME;
 use crate::tools::batch::run_batch;
 use crate::tools::commands::run_command;
@@ -141,7 +146,7 @@ fn usage() -> ! {
 
 // The release this source is; see docs/releases.md.
 pub fn version() -> *u8 {
-    c"0.16.0"
+    c"0.17.0"
 }
 
 // struct utsname: sysname is the first field on every system; machine is
@@ -195,11 +200,22 @@ fn main(argc: i32, argv: **u8) -> i32 {
     unsafe {
         // (0.15) `--json`, anywhere: diagnostics and output as JSON lines
         // (base::diag::DIAG_JSON), for every command; taken out of argv.
+        DIAG_PROG = argv[0];
         let mut argc = argc;
         let mut k = 1;
         while k < argc as i64 {
-            if streq(argv[k], c"--json") {
-                DIAG_JSON = true;
+            // (0.17: --values=off|report|warn|error, front/own, for every
+            // command that checks)
+            let values = values_option(argv[k]);
+            // (`fix --values`, the migration: the fix\x27s own option)
+            let fix_values = streq(argv[k], c"--values") && argc >= 2 && streq(argv[1], c"fix");
+            if !values && !fix_values && is_values_option(argv[k]) {
+                die2(c"unknown option (expected --values=off, report, warn or error): ", argv[k]);
+            }
+            if streq(argv[k], c"--json") || values {
+                if !values {
+                    DIAG_JSON = true;
+                }
                 for m in k..argc as i64 - 1 {
                     argv[m] = argv[m + 1];
                 }
@@ -247,6 +263,7 @@ fn main(argc: i32, argv: **u8) -> i32 {
         let mut target = 0;
         let mut include_dirs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut emit_imports = false;
+        let mut vec_stats = false;
         let mut i = 1;
         while i < argc as i64 {
             let arg = argv[i];
@@ -311,6 +328,23 @@ fn main(argc: i32, argv: **u8) -> i32 {
             }
             if streq(arg, c"-g") {
                 DEBUG_INFO = true;
+                i += 1;
+                continue;
+            }
+            // (0.17) `--overlay PATH COPY`: PATH is read from COPY (as
+            // check's; tachyonc probe builds a program so).
+            if streq(arg, c"--overlay") {
+                if i + 2 >= argc as i64 {
+                    usage();
+                }
+                OVERLAY.push(argv[i + 1] as i64);
+                OVERLAY.push(argv[i + 2] as i64);
+                i += 3;
+                continue;
+            }
+            // (0.17) Failure traces (middle/trace.tach).
+            if streq(arg, c"--trace") {
+                TRACE = true;
                 i += 1;
                 continue;
             }
@@ -412,6 +446,18 @@ fn main(argc: i32, argv: **u8) -> i32 {
                 i += 1;
                 continue;
             }
+            if streq(arg, c"--no-noalias") {
+                // (0.17: reference parameters' facts off, to measure them;
+                // they hold only under --values=error, middle/gvn.tach)
+                NOALIAS_OFF = true;
+                i += 1;
+                continue;
+            }
+            if streq(arg, c"--vec-stats") {
+                vec_stats = true;
+                i += 1;
+                continue;
+            }
             if streq(arg, c"--verify-effects") {
                 // (0.16: the effects checked against the IR, -O1 and -O2)
                 VERIFY_EFFECTS = true;
@@ -479,6 +525,12 @@ fn main(argc: i32, argv: **u8) -> i32 {
         if CHECK_UNSAFE && OPT_LEVEL == 0 {
             die(c"--check-unsafe needs -O1 or -O2");
         }
+        // (-O0's generator has no frames to trace: --trace builds at -O1)
+        if TRACE && OPT_LEVEL == 0 {
+            OPT_LEVEL = 1;
+        }
+        IR_LOCS = DEBUG_INFO || TRACE;
+        IR_CALL_LOCS = TRACE;
         // (-O0 optimizes nothing: a profile changes nothing there.)
         if OPT_LEVEL == 0 {
             PROFILE_USE = 0 as *u8;
@@ -525,6 +577,17 @@ fn main(argc: i32, argv: **u8) -> i32 {
         import_c_headers(target, &include_dirs, emit_imports, output);
         lex_range(FILES[FILE_COUNT - 1].end, FILES[FILE_COUNT - 1].end, true);
         compile_program(output);
+        if vec_stats {
+            let b = buf_new();
+            buf_str(b, c"vector loops ");
+            buf_int(b, VEC_STAT_LOOPS);
+            buf_str(b, c", overlap tests ");
+            buf_int(b, VEC_STAT_TESTS);
+            buf_str(b, c", tests dropped by noalias ");
+            buf_int(b, VEC_STAT_SKIPPED);
+            buf_str(b, c"\n");
+            buf_write_fd(b, STDERR);
+        }
         0
     }
 }

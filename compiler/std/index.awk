@@ -22,11 +22,14 @@
 # section needs. (POSIX awk; LC_ALL=C: lengths are bytes.)
 
 BEGIN {
-    n = split("Stable sort (0.15)|HashMap|Debug of HashMap (0.15)|== on HashMap (0.15)|Iterators (0.14)|Adapters|Sources|Text (0.14)|Errors of reading and parsing (0.15)|Integer limits (0.15)|Bits (0.16)|Conversions (0.15)|Clone and hashing (0.15)|Clone, Eq, Ord and Hash without an impl (0.15)|Arenas (0.16)|FixedBuf (0.16)|HashMap's room (0.16)|Slices (0.16)|Gpa's leak checks (0.16)|The checking allocator's hooks for arenas (0.16)", lz, "|")
+    n = split("Stable sort (0.15)|HashMap|Debug of HashMap (0.15)|== on HashMap (0.15)|Iterators (0.14)|Adapters|Sources|Text (0.14)|Errors of reading and parsing (0.15)|Integer limits (0.15)|Bits (0.16)|Conversions (0.15)|Clone and hashing (0.15)|Clone, Eq, Ord and Hash without an impl (0.15)|Arenas (0.16)|FixedBuf (0.16)|HashMap's room (0.16)|Slices (0.16)|Gpa's leak checks (0.16)|The checking allocator's hooks for arenas (0.16)|Panic and unreachable, the prelude's (0.17)", lz, "|")
     for (i = 1; i <= n; i++) LAZY[lz[i]] = 1
     TRIGGERS["Iterators (0.14)"] = "Iterator IntoIterator"
     TRIGGERS["Conversions (0.15)"] = "From Into main_error"
     TRIGGERS["Clone, Eq, Ord and Hash without an impl (0.15)"] = "Eq Ord Hash Clone clone cmp eq hash sort sort_by sort_stable HashMap"
+    # (0.17) Words std's own code uses that need a section too: `x.clone()`
+    # of a number (Vec::filled_in) is copy_clone
+    NEEDS["Clone, Eq, Ord and Hash without an impl (0.15)"] = "clone"
     s = 0
     start[0] = 0
     title[0] = ""
@@ -186,6 +189,8 @@ END {
             if (i == j) continue
             need = 0
             nd = split(keys_list[j], dw, " ")
+            for (k = 1; k <= nd && !need; k++) if ((i, dw[k]) in USES) need = 1
+            nd = split(NEEDS[title[j]], dw, " ")
             for (k = 1; k <= nd && !need; k++) if ((i, dw[k]) in USES) need = 1
             np = split(impls[j], ip, " ")
             for (k = 1; k + 1 <= np && !need; k += 2) {

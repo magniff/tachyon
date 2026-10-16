@@ -12,7 +12,29 @@ pub struct Program {
 pub struct ParseError {
     // Counted from 1.
     pub line: i64,
-    pub message: [u8],
+    pub message: Message,
+}
+
+// An error message: `what`, then ` 'word'` when it quotes a word. Both are
+// views of literals or of the program's text, so nothing is allocated.
+pub struct Message {
+    what: [u8],
+    word: Option<[u8]>,
+}
+
+impl Message {
+    pub fn push_to(self: &Message, out: &mut Buf) {
+        out.push_str(self.what);
+        if let Some(w) = self.word {
+            out.push_str(" '");
+            out.push_str(w);
+            out.push('\'');
+        }
+    }
+}
+
+fn plain(what: [u8]) -> Message {
+    Message { what: what, word: None }
 }
 
 // A label and the instruction it names.
@@ -87,18 +109,13 @@ pub fn parse_number(word: [u8]) -> Option<i64> {
     Some(if neg { -n } else { n })
 }
 
-// `what 'word'`, as text that lives until the program ends.
-fn quoted(what: [u8], word: [u8], gpa: Gpa) -> [u8] {
-    let mut s = Buf::new_in(gpa);
-    s.push_str(what);
-    s.push_str(" '");
-    s.push_str(word);
-    s.push('\'');
-    s.as_slice()
+// `what 'word'`.
+fn quoted(what: [u8], word: [u8]) -> Message {
+    Message { what: what, word: Some(word) }
 }
 
 // The operand of a jump: a label or an instruction number.
-fn jump_target(word: [u8], labels: [Label], gpa: Gpa) -> Result<i64, [u8]> {
+fn jump_target(word: [u8], labels: [Label], gpa: Gpa) -> Result<i64, Message> {
     if let Some(n) = parse_number(word) {
         return Ok(n);
     }
@@ -107,23 +124,23 @@ fn jump_target(word: [u8], labels: [Label], gpa: Gpa) -> Result<i64, [u8]> {
             return Ok(l.pc);
         }
     }
-    Err(quoted("unknown label", word, gpa))
+    Err(quoted("unknown label", word))
 }
 
 // One instruction from its words.
-fn parse_op(w: [[u8]], labels: [Label], gpa: Gpa) -> Result<Op, [u8]> {
+fn parse_op(w: [[u8]], labels: [Label], gpa: Gpa) -> Result<Op, Message> {
     let name = w[0];
     let with_operand = name == "push" || name == "jmp" || name == "jz";
     if with_operand && w.len < 2 {
-        return Err("missing operand");
+        return Err(plain("missing operand"));
     }
     if (with_operand && w.len > 2) || (!with_operand && w.len > 1) {
-        return Err("extra operand");
+        return Err(plain("extra operand"));
     }
     if name == "push" {
         return match parse_number(w[1]) {
             Some(n) => Ok(Op::Push(n)),
-            None => Err(quoted("bad number", w[1], gpa)),
+            None => Err(quoted("bad number", w[1])),
         };
     }
     if name == "jmp" {
@@ -147,7 +164,7 @@ fn parse_op(w: [[u8]], labels: [Label], gpa: Gpa) -> Result<Op, [u8]> {
             return Ok(op);
         }
     }
-    Err(quoted("unknown instruction", name, gpa))
+    Err(quoted("unknown instruction", name))
 }
 
 fn is_label_line(w: [[u8]]) -> bool {
@@ -158,7 +175,6 @@ fn is_label_line(w: [[u8]]) -> bool {
 // first, so a jump may name a label further down.
 pub fn parse(text: [u8], gpa: Gpa) -> Result<Program, ParseError> {
     let mut lines: Vec<[u8]> = Vec::new_in(gpa);
-    defer lines.free();
     let mut start = 0;
     for i in 0..text.len + 1 {
         if i == text.len || text[i] == '\n' {
@@ -167,12 +183,10 @@ pub fn parse(text: [u8], gpa: Gpa) -> Result<Program, ParseError> {
         }
     }
     let mut labels: Vec<Label> = Vec::new_in(gpa);
-    defer labels.free();
     let mut list = false;
     let mut count = 0;
     for i in 0..lines.len() {
         let mut w = words(lines.get(i), gpa);
-        defer w.free();
         if w.len() == 0 {
             continue;
         }
@@ -188,11 +202,11 @@ pub fn parse(text: [u8], gpa: Gpa) -> Result<Program, ParseError> {
                 }
             }
             if !is_label(name) {
-                return Err(ParseError { line: i + 1, message: quoted("bad label", name, gpa) });
+                return Err(ParseError { line: i + 1, message: quoted("bad label", name) });
             }
             if taken {
                 return Err(ParseError {
-                    line: i + 1, message: quoted("duplicate label", name, gpa)
+                    line: i + 1, message: quoted("duplicate label", name)
                 });
             }
             labels.push(Label { name: name, pc: count });
@@ -203,14 +217,12 @@ pub fn parse(text: [u8], gpa: Gpa) -> Result<Program, ParseError> {
     let mut ops: Vec<Op> = Vec::new_in(gpa);
     for i in 0..lines.len() {
         let mut w = words(lines.get(i), gpa);
-        defer w.free();
         if w.len() == 0 || w.get(0) == ".list" || is_label_line(w.as_slice()) {
             continue;
         }
         match parse_op(w.as_slice(), labels.as_slice(), gpa) {
             Ok(op) => ops.push(op),
             Err(message) => {
-                ops.free();
                 return Err(ParseError { line: i + 1, message: message });
             }
         }

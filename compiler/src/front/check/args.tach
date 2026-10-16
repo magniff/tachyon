@@ -8,20 +8,23 @@
 // Also the shorthand of a struct literal's field (`P { x, y }`), whose
 // unknown name gets the long form as its help.
 
-use crate::base::{IntVec, SRC, buf_bytes, free};
+use crate::base::{
+    BUFS, FILES, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, free,
+};
 use crate::base::diag::{
-    ERR_HELP, err_begin, err_end, err_end_soft, err_help, err_help_sym, err_int, err_str, err_sym,
+    ERR_HELP, buf_file_line, err_begin, err_end, err_end_soft, err_fix, err_help, err_help_fmt,
+    err_help_sym, err_int, err_str, err_sym, err_try_fmt,
 };
 use crate::front::ast::{
     CALL_ARGS_DONE, FIELD_SHORTHAND, NODES, NodeKind, child, list_begin, list_end, list_push,
 };
-use crate::front::check::{ENV, FNS, SELF_TYPE, lookup_local};
+use crate::front::check::{ENV, FNS, LOCALS, SELF_TYPE, lookup_local};
 use crate::front::check::check_mode::check_expr;
 use crate::front::check::names::near_to;
 use crate::front::check::unsafety::UNSAFE_DEPTH;
 use crate::front::check::vectors::sym_is_c;
 use crate::front::generics::instantiate::{clone_node, node_field_a, node_field_b, node_field_c};
-use crate::front::modules::CUR_MOD;
+use crate::front::modules::{CUR_MOD, file_of_pos};
 use crate::front::modules::lookup::{B_NONE, binding_kind, lookup_quiet};
 use crate::front::traits::impl_trait_node;
 use crate::front::types::{buf_type, fn_param, is_integer};
@@ -114,6 +117,9 @@ pub fn normalize_args(n: i64, f: i64, first_param: i64) {
                     DEFAULTS_USED = true;
                 }
                 DEFAULT_ARGS.put(c + 1, f + 1);
+                // (0.17: a default's nodes are checked with its declaration,
+                // not here: the own pass scans this function, front/own/fast)
+                crate::front::own::fast::note_scan();
                 slots[k] = c;
             }
         }
@@ -190,6 +196,87 @@ fn arity_error(n: i64, f: i64, first_param: i64, params: i64) -> ! {
         err_int(params - first_param);
         err_str(c" arguments, got more");
         err_end()
+    }
+}
+
+// (0.17) The help of a call of f with `count` arguments where it takes
+// `params` (a method's: without self): its signature
+// and where it is; with too few, the try: line is the call with a VALUE
+// for each missing argument.
+pub fn arity_help(n: i64, f: i64, count: i64, params: i64) {
+    unsafe {
+        let node = FNS[f].node;
+        if node == 0 || NODES[node].end <= NODES[node].start {
+            return;
+        }
+        let s = NODES[node].start;
+        let mut e = s;
+        let mut depth = 0;
+        while e < NODES[node].end && !(SRC[e] == '{' && depth == 0) && SRC[e] != ';' {
+            if SRC[e] == '(' || SRC[e] == '[' || SRC[e] == '<' {
+                depth += 1;
+            } else if SRC[e] == ')' || SRC[e] == ']' || SRC[e] == '>' && SRC[e - 1] != '-' {
+                depth -= 1;
+            }
+            e += 1;
+        }
+        let sig = buf_new();
+        let mut space = false;
+        for k in s..e {
+            let c = SRC[k];
+            if c == ' ' || c == '\n' || c == '\t' {
+                space = true;
+                continue;
+            }
+            if space && BUFS[sig].len > 0 && BUFS[sig].data[BUFS[sig].len - 1] != '(' && c != ')' {
+                buf_byte(sig, ' ');
+            }
+            space = false;
+            buf_byte(sig, c);
+        }
+        let at = buf_new();
+        buf_file_line(at, s);
+        err_help_fmt(f"its signature: `{buf_slice(sig)}` ({buf_slice(at)})");
+        if count < params && NODES[n].end > NODES[n].start && SRC[NODES[n].end - 1] == ')' {
+            let t = buf_new();
+            buf_bytes(t, SRC[NODES[n].start..NODES[n].end - 1]);
+            // (0.18) a missing argument a local of its parameter's name and
+            // type gives (`gpa`); when every one is, the call is the fix
+            let off = FNS[f].param_count - params;
+            let is_fn = NODES[node].kind == NodeKind::Fn || NODES[node].kind == NodeKind::ExternFn;
+            let mut all = true;
+            for k in count..params {
+                if k > 0 {
+                    buf_str(t, c", ");
+                }
+                let name = if is_fn && k + off < NODES[node].count {
+                    NODES[child(node, k + off)].a
+                } else {
+                    -1
+                };
+                let mut given = false;
+                if name > 0 {
+                    match lookup_local(name) {
+                        Option::Some(id) => {
+                            if LOCALS[id].ty == fn_param(f, k + off) {
+                                buf_bytes(t, SYMS[name].text);
+                                given = true;
+                            }
+                        }
+                        Option::None => {}
+                    }
+                }
+                if !given {
+                    buf_str(t, c"VALUE");
+                    all = false;
+                }
+            }
+            buf_byte(t, ')');
+            err_try_fmt(buf_slice(t));
+            if all {
+                err_fix(NODES[n].start, NODES[n].end, buf_slice(t));
+            }
+        }
     }
 }
 

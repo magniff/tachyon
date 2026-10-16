@@ -18,12 +18,13 @@ use crate::tools::query::diagnostics::{diag, try_query};
 use crate::tools::query::effects::put_def_effects;
 use crate::tools::query::names::{canonical_name, path_matches};
 use crate::tools::query::positions::{
-    collapse, is_space, line_end, line_of, line_start, put_loc, put_path, sort_by_position,
-    token_at,
+    collapse, is_space, line_end, line_of, line_start, put_lines, put_loc, put_path,
+    sort_by_position, token_at,
 };
 use crate::tools::query::refs::{OPT_ALL, file_text};
 use crate::tools::query::sections::{B_START, OPT_BANNERS, banners_of_module, put_banner_line};
 use crate::tools::query::stdq::{is_std_module, put_std_use};
+use crate::tools::query::values::put_def_views;
 use crate::tools::query_text::section_start;
 
 // ---- def, show, items ----
@@ -104,6 +105,8 @@ pub fn query_def_one(out: i64, d: i64) {
         put_signature(out, d);
         // (0.16: a function's effects, effects.tach)
         put_def_effects(out, d, c"\t");
+        // (0.17: its view summary, values.tach)
+        put_def_views(out, d, c"\t");
         buf_byte(out, '\n');
     }
 }
@@ -160,12 +163,9 @@ pub fn query_show(matches: *IntVec, name: [u8]) -> i64 {
             buf_str(out, c"// ");
             buf_bytes(out, SYMS[DEFS[d].fqn].text);
             buf_byte(out, '\t');
-            put_path(out, file_of_pos(first));
-            buf_byte(out, ':');
-            buf_int(out, line_of(first));
-            buf_byte(out, '-');
-            buf_int(out, line_of(last));
+            put_lines(out, first, last);
             put_def_effects(out, d, c"\t");
+            put_def_views(out, d, c"\t");
             buf_byte(out, '\n');
             put_std_use(out, d);
             buf_bytes(out, SRC[first..last]);
@@ -364,6 +364,59 @@ pub fn query_items(modules: *IntVec) {
             while bk < banners.count {
                 put_banner_line(out, banners.data[bk]);
                 bk += 1;
+            }
+        }
+        buf_write_fd(out, STDOUT);
+    }
+}
+
+// (0.17) `query items TYPE`: a struct's, enum's or trait's own line, then
+// the functions of its impl blocks (std's: its API), by position; the
+// definitions of the types named are in `types`.
+pub fn query_type_items(types: *IntVec) {
+    unsafe {
+        let out = buf_new();
+        let mut all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for d in 0..DEF_COUNT {
+            all.push(d);
+        }
+        sort_by_position(&all);
+        for i in 0..types.count {
+            let t = types.data[i];
+            buf_str(out, c"# ");
+            buf_bytes(out, SYMS[DEFS[t].fqn].text);
+            buf_byte(out, '\t');
+            put_loc(out, DEFS[t].name_pos);
+            buf_byte(out, '\n');
+            buf_int(out, line_of(DEFS[t].name_pos));
+            buf_byte(out, '\t');
+            buf_str(out, kind_name(DEFS[t].kind));
+            buf_byte(out, '\t');
+            put_signature(out, t);
+            buf_byte(out, '\n');
+            let std = is_std_module(DEFS[t].module);
+            let mut impl_of = -1;
+            for j in 0..all.count {
+                let d = all.data[j];
+                let k = DEFS[d].kind;
+                let mine = ((k == K_METHOD || k == K_IMPL_METHOD) && DEFS[d].owner >= 0
+                    && DEFS[d].owner == DEFS[t].fqn) || (k == K_TRAIT_FN && DEFS[d].parent == t);
+                if !mine || (std && !OPT_ALL && !DEFS[d].public && k == K_METHOD) {
+                    continue;
+                }
+                if k == K_METHOD || k == K_IMPL_METHOD {
+                    let block = impl_block(d);
+                    if block != impl_of {
+                        put_impl_header(out, d);
+                        impl_of = block;
+                    }
+                }
+                buf_int(out, line_of(DEFS[d].name_pos));
+                buf_byte(out, '\t');
+                buf_str(out, kind_name(k));
+                buf_byte(out, '\t');
+                put_signature(out, d);
+                buf_byte(out, '\n');
             }
         }
         buf_write_fd(out, STDOUT);

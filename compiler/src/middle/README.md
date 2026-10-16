@@ -37,4 +37,5 @@ again. `back` takes the optimized IR.
 | `licm.tach` | loop-invariant code motion |
 | `promote.tach` | scalar promotion of memory in loops |
 | `profile.tach` | `--profile-generate`, `--profile-use` |
+| `trace.tach` | `--trace` (0.17): a shadow stack of frames, each at the statement its function runs; failures and fatal signals print it |
 | `unsafecheck.tach` | `--check-unsafe`: unsafe code's accesses checked at run time |

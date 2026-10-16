@@ -8,7 +8,8 @@
 # (`tachyonc guide`, 0.13), tests/fmt/run.sh (`tachyonc fmt --check`
 # of the tree, and formatting changes no program, 0.13) and
 # tests/walkthrough/run.sh (the sessions of examples/tools/*/README.md,
-# 0.15, and of every examples/GROUP/NAME/README.md with one, 0.16). POSIX sh and awk only, so it runs the same on macOS and Linux.
+# 0.15, and of every examples/GROUP/NAME/README.md with one, 0.16) and
+# tests/own-try/run.sh (the own pass's try: lines run, 0.17). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-d FORMAT] [FILTER]
 #
@@ -233,70 +234,7 @@ missing_message() {
 # Writes the directives of case file $1 into directory $2: one file per
 # directive (args, stdin, expect, exit, errors, xfail, source, build).
 read_directives() {
-    awk -v dir="$2" -v target="$TARGET" '
-        {
-            line = $0
-            sub(/\r$/, "", line)
-            sub(/^[ \t]+/, "", line)
-            if (substr(line, 1, 2) != "//") next
-            c = substr(line, 3)
-            if (substr(c, 1, 1) == " ") c = substr(c, 2)
-            i = index(c, ":")
-            if (i == 0) next
-            key = substr(c, 1, i - 1)
-            value = substr(c, i + 1)
-            if (substr(value, 1, 1) == " ") value = substr(value, 2)
-            if (key == "ARGS") args = value
-            else if (key == "STDIN") stdin = stdin (nstdin++ ? "\n" : "") value
-            else if (key == "EXPECT") expect = expect (nexpect++ ? "\n" : "") value
-            else if (key == "EXIT") exitcode = value + 0
-            else if (key == "STDERR") stderrs = stderrs value "\n"
-            else if (key == "ERROR") errors = errors value "\n"
-            else if (key == "ERROR-COUNT") errcount = value
-            else if (key == "XFAIL" || key == "XFAIL(" target ")") xfail = value
-            else if (key == "SOURCE") source = value
-            else if (key == "CSOURCE") csources = csources " " value
-            else if (key == "CHEADER") cheader = value
-            else if (key == "BUILD") build = 1
-            else if (key == "CHECK") checks = checks "+" value "\n"
-            else if (key == "CHECK-NOT") checks = checks "-" value "\n"
-            else if (key == "CHECK-OPT") checkopt = value
-            else if (key == "ASM(" target ")") asms = asms "+" value "\n"
-            else if (key == "ASM-NOT(" target ")") asms = asms "-" value "\n"
-            else if (key == "FIXIMPORTS") fiximports = 1
-            else if (key == "FIXUNSAFE") fiximports = 2
-            else if (key == "FIXED") fixed = fixed value "\n"
-            else if (key == "FLAGS") flags = flags " " value
-            else if (key == "WARNING") warnings = warnings value "\n"
-            else if (key == "PROFILE") profile = 1
-            else if (key == "LINK") link = 1
-            else if (key == "NO-EXTRA-FLAGS") noextra = 1
-        }
-        END {
-            printf "%s", args > (dir "/args")
-            printf "%s", stdin > (dir "/stdin")
-            printf "%s", expect > (dir "/expect")
-            printf "%d", exitcode > (dir "/exit")
-            printf "%s", stderrs > (dir "/stderrs")
-            printf "%s", errors > (dir "/errors")
-            printf "%s", errcount > (dir "/errcount")
-            printf "%s", xfail > (dir "/xfail")
-            printf "%s", source > (dir "/source")
-            printf "%s", csources > (dir "/csources")
-            printf "%s", cheader > (dir "/cheader")
-            printf "%d", build > (dir "/build")
-            printf "%s", checks > (dir "/checks")
-            printf "%s", asms > (dir "/asms")
-            printf "%s", (checkopt == "" ? "2" : checkopt) > (dir "/checkopt")
-            printf "%d", fiximports > (dir "/fiximports")
-            printf "%s", fixed > (dir "/fixed")
-            printf "%s", flags > (dir "/flags")
-            printf "%s", warnings > (dir "/warnings")
-            printf "%d", profile > (dir "/profile")
-            printf "%d", link > (dir "/link")
-            printf "%d", noextra > (dir "/noextra")
-        }
-    ' "$1"
+    awk -v dir="$2" -v target="$TARGET" -f "$ROOT/tests/directives.awk" "$1"
 }
 
 # The file's content without trailing whitespace.
@@ -633,6 +571,9 @@ esac
 case walkthrough in
     *"$FILTER"*) "$ROOT/tests/walkthrough/run.sh" -c "$COMPILER" >"$WORK/walkthrough.out" 2>&1 & ;;
 esac
+case own-try in
+    *"$FILTER"*) "$ROOT/tests/own-try/run.sh" -c "$COMPILER" >"$WORK/own-try.out" 2>&1 & ;;
+esac
 
 # The slots: JOBS of them in a FIFO of our own, or the shared ones of
 # $TACHYON_JOBSERVER (see above).
@@ -804,6 +745,26 @@ case walkthrough in
             count=$((count + 1))
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/walkthrough.out" >>"$FAILURES"
+        ;;
+esac
+
+# The try: lines of the own pass's diagnostics (0.17): tests/own-try/run.sh
+# (run above), each tests/own-try/NAME/ checked under --values=error and
+# each try: of its first error run; category "own-try".
+case own-try in
+    *"$FILTER"*)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "own-try pass" >>"$TALLY"; count=$((count + 1)) ;;
+                xfail) echo "own-try xfail" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "own-try fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/own-try.out"
+        if ! grep -q '^pass\|^xfail' "$WORK/own-try.out"; then
+            echo "own-try fail" >>"$TALLY"
+            count=$((count + 1))
+        fi
+        grep '^FAIL' "$WORK/own-try.out" >>"$FAILURES"
         ;;
 esac
 

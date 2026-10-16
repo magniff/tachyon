@@ -2,16 +2,17 @@
 // function types; and the type arguments after a name (`Vec<T>`,
 // `f::<T>`), splitting the `>` off `>>`.
 
-use crate::base::intern_c;
+use crate::base::{SYMS, intern_c};
 use crate::base::diag::{err_begin, err_end, err_str, error_at};
 use crate::front::ast::{
-    EFFECTS_BOUND, NODES, NodeKind, SCRATCH, list_begin, list_end, list_push, new_node,
+    EFFECTS_BOUND, NODES, NODE_REF, NODE_REF_MUT, NodeKind, SCRATCH, list_begin, list_end,
+    list_push, new_node,
 };
 use crate::front::effects::EFFECT_BOUNDS;
-use crate::front::lexer::{STRS, TOKS};
+use crate::front::lexer::{TOKS, str_at};
 use crate::front::lexer::Tok::{
     Amp, AmpAmp, Arrow, Bang, ColonColon, Comma, Ellipsis, Eof, Eq, Extern, Fn, Gt, GtEq, Ident,
-    LBracket, LParen, Lt, RBracket, RParen, Reserved, Semi, Shr, ShrEq, Star, Str, Unsafe,
+    LBracket, LParen, Lt, Mut, RBracket, RParen, Reserved, Semi, Shr, ShrEq, Star, Str, Unsafe,
 };
 use crate::front::parser::{
     NO_STRUCT, P, advance, at, cur, cur_start, eat, expect, expect_ident, help_ampersand_type,
@@ -261,7 +262,7 @@ pub fn parse_type() -> i64 {
             advance();
             if at(Str) {
                 let abi = TOKS[P].value as i64;
-                if !(STRS[abi].len == 1 && STRS[abi].ptr[0] == 'C') {
+                if !(str_at(abi).len == 1 && str_at(abi).ptr[0] == 'C') {
                     error_at(cur_start(), c"unsupported ABI; only \"C\" is supported");
                 }
                 advance();
@@ -273,7 +274,37 @@ pub fn parse_type() -> i64 {
         if kind == Reserved {
             reserved_error();
         }
-        if kind == Amp || kind == AmpAmp {
+        if kind == Amp && !(tok_kind(1) == Ident && SYMS[TOKS[P + 1].value as i64].text == "str") {
+            // (0.17) References: `&T`, `&mut T`; `&[T]` is `[T]`, `&mut [T]`
+            // the exclusive slice (docs/design/value-semantics.md §2.3).
+            advance();
+            let mutable = eat(Mut);
+            let inner = parse_type();
+            if NODES[inner].kind == NodeKind::TySlice {
+                if mutable {
+                    NODES[inner].p |= NODE_REF_MUT;
+                }
+                NODES[inner].start = start;
+                return inner;
+            }
+            let n = new_node(NodeKind::TyPtr, start, prev_end());
+            NODES[n].a = inner;
+            NODES[n].p |= if mutable { NODE_REF | NODE_REF_MUT } else { NODE_REF };
+            return n;
+        }
+        if kind == AmpAmp {
+            // `&&T` is `& &T`.
+            advance();
+            let inner = new_node(NodeKind::TyPtr, start + 1, 0);
+            NODES[inner].p |= NODE_REF;
+            NODES[inner].a = parse_type();
+            NODES[inner].end = prev_end();
+            let n = new_node(NodeKind::TyPtr, start, prev_end());
+            NODES[n].a = inner;
+            NODES[n].p |= NODE_REF;
+            return n;
+        }
+        if kind == Amp {
             err_begin(start);
             err_str(c"expected type, got '&'");
             help_ampersand_type();

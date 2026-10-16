@@ -10,13 +10,12 @@ struct Stack<T> { items: Vec<T> }
 
 impl<T> Stack<T> {
     fn new(gpa: Gpa) -> Stack<T> { Stack { items: Vec::new_in(gpa) } }
-    fn push(self: *Stack<T>, x: T) { self.items.push(x); }
-    fn pop(self: *Stack<T>) -> Option<T> { self.items.pop() }
-    fn free(self: *Stack<T>) { self.items.free(); }
-}
+    fn push(self: &mut Stack<T>, x: T) { self.items.push(x); }
+    fn pop(self: &mut Stack<T>) -> Option<T> { self.items.pop() }
+}                                          // no free: a Stack drops its Vec
 
 impl Stack<i64> {                          // methods of one instance only
-    fn sum(self: *Stack<i64>) -> i64 {
+    fn sum(self: &Stack<i64>) -> i64 {
         let mut t = 0;
         for x in self.items.as_slice() { t += x; }
         t
@@ -37,7 +36,6 @@ fn sum_pair(p: Pair<i64>) -> i64 { p.0 + p.1 }
 
 fn main(gpa: Gpa) -> i32 {
     let mut s: Stack<i64> = Stack::new(gpa);
-    defer s.free();
     s.push(4);
     s.push(9);
     std::print_int(s.sum());

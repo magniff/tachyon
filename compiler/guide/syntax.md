@@ -35,6 +35,7 @@ pub struct Point { x: i64, y: i64 }
 struct Wrapper<T> { inner: T }      // generic
 enum Dir { North, South }           // fieldless: compares with ==, casts with `as`
 enum Tok { Num(i64), Op(u8), End }  // tuple variants
+enum Ev { Key { code: u8, shift: bool }, Quit }   // struct-like variants (0.17)
 #[repr(C)] union Bits { i: u32, f: f32 }
 
 pub fn add(a: i64, b: i64) -> i64 { a + b }
@@ -44,11 +45,11 @@ fn bump(mut n: i64) -> i64 { n += 1; n }   // a mutable parameter
 unsafe fn raw(p: *i64) -> i64 { p[0] }     // callers need unsafe
 
 impl Point {
-    fn len2(self: *Point) -> i64 { self.x * self.x + self.y * self.y }
+    fn len2(self: &Point) -> i64 { self.x * self.x + self.y * self.y }
 }
 
-trait Named { fn name(self: *Self) -> [u8]; }
-impl Named for Point { fn name(self: *Point) -> [u8] { "point" } }
+trait Named { fn name(self: &Self) -> [u8]; }
+impl Named for Point { fn name(self: &Point) -> [u8] { "point" } }
 
 mod util { pub fn twice(x: i64) -> i64 { x * 2 } }
 
@@ -110,7 +111,9 @@ expression). `e?` (0.15) is postfix, as tight as a call: `parse(s)?.len`
 `let v = if ok { x } else { return 1 };`.
 
 In an `if`, `while`, `match` or `for` head, `Name {` starts the body: put
-a struct literal there in parentheses, `if p == (P { x: 1 }) { ... }`.
+a struct literal there in parentheses, `if p == (P { x: 1 }) { ... }`
+(0.17: `Name { a: ...` with a field's colon is read as a literal there
+too).
 
 ## Control flow
 
@@ -146,6 +149,7 @@ odd
 ```
 
 `match`: arms are tried in order; a pattern may be a literal, a range
-`'a'..='z'`, alternatives `A | B`, a variant `E::V(x, _)`, a tuple
-`(a, 0)`, a binding (`n`), `_`, with a guard `n if n > 0`. The arms must
+`'a'..='z'`, alternatives `A | B`, a variant `E::V(x, _)` or `E::K {
+code, shift: true }` (`E::K { code, .. }` leaves the other fields out), a
+tuple `(a, 0)`, a binding (`n`), `_`, with a guard `n if n > 0`. The arms must
 cover every value; a match is an expression.

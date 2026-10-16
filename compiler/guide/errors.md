@@ -2,8 +2,20 @@
 
 `tachyonc check`, and a build whose output is not a terminal (an
 agent's shell, a pipe; `--diagnostics=short` anywhere): one line per
-error, `FILE:LINE:COL: error[KIND] MESSAGE | help: HELP | note: NOTE`,
-every error of every file at once (up to 50), sorted by position.
+error, `FILE:LINE:COL: error[KIND] MESSAGE | help: HELP | note: NOTE |
+try: TRY`, every error of every file at once (up to 50), sorted by
+position. A `try:` (0.17) is text to use as it is: code to paste where
+the error is (`a as i32`, `std::trim(s)`, the missing match arms), a
+`use` line, or a `tachyonc` command to run (`tachyonc fix --only unsafe
+main.tach`, `tachyonc edit new-file util.tach main.tach`); VALUE in it
+is yours to fill in.
+An error whose fix the compiler knows exactly (0.18: a did-you-mean with
+one name that near, a conversion, a path from `crate::`, a Rust type or
+label respelled, a missing `use` or `pub`, a missing `gpa` argument)
+also has `try: tachyonc fix --suggested main.tach`: one command makes
+all of them, as one checked edit (`--dry-run` shows the diff, `tachyonc
+undo` takes it back, `--at FILE:LINE` fixes one line's), then prints the
+errors left. Run it instead of editing those lines by hand or with sed.
 KIND is `tokenizer error`, `parser error`, `module error`, `type error`
 or `unsafe`. Fix the first errors first: a parser error can hide
 type errors in the same function. `tachyonc query show FILE:LINE` prints
@@ -16,27 +28,52 @@ error (short form, without the position), and the fix.
 let s: String = String::new();
 ```
 ```err
-error[type error] unknown type 'String' | help: text is `[u8]`, a slice of bytes (string literals are one); build it in a `std::Buf`
+error[type error] unknown type 'String' | help: text is `[u8]`, a slice of bytes (string literals are one); text you build is a `std::Buf` (`Buf::new_in(gpa)`, `b.push_str(s)`, `b.as_slice()` is its `[u8]`) | try: [u8]
 ```
-Also `str`, `char` (use `u8`), `Box`, `usize` indices (use `i64`).
+The `try:` is the type to write. Also `str` (`[u8]`), `char` (`u8`),
+`Box`, `Rc` (`*T`), `HashSet` (`HashMap<K, bool>`), `BTreeMap`,
+`VecDeque`, `RefCell`.
 
 ```tach
-fn get(x: &i64) -> i64 { *x }
+use std::collections::HashMap;
 ```
 ```err
-error[parser error] expected type, got '&' | help: write `*T`: one pointer type for `&T` and `&mut T`
+error[type error] no 'collections' in module 'std' | help: tachyon's std is one module, without 'collections': its items are `std::NAME` | try: use std::HashMap;
 ```
-`*i64`; `&str` is `[u8]`. In an expression, `&mut x` is `&x`.
+std has no submodules: `use std::{IoError, is_digit};` (`HashMap`,
+`read_line` and std's most used names are in the prelude: no `use`).
+`use std::io;` gets what reads stdin (`read_line`, `read_stdin_in`,
+`Scanner`).
+
+```tach
+fn main() -> i32 { let s = "  a "; let t = s.trim(); 0 }
+```
+```err
+error[type error] no method 'trim' on type '[u8]' | help: 'trim' is no method: std's function `trim` takes the value as its first argument | try: trim(s)
+```
+A method std has as a function (`trim`, `sort`, `parse` as `parse_int`,
+`split_whitespace` as `split_whitespace_in(s, gpa)`) gets the call to
+write; another unknown method, the type's nearest methods and `tachyonc
+query items TYPE`, which lists them all.
+
+```tach
+fn count(s: &str) -> i64 { s.len }
+```
+```err
+error[parser error] expected type, got '&' | help: `&str` is `[u8]` in tachyon: a slice of bytes, as string literals are
+```
+`&T` and `&mut T` are references (0.17): `&x` and `&mut x` take them,
+and reading through one is safe; `*T` is the raw pointer.
 
 ```tach
 struct P { x: i64 }
 impl P { fn get(&self) -> i64 { self.x } }
 ```
 ```err
-error[parser error] expected identifier, got '&' | help: write the type of self: `self: *T` (a pointer: `&self`, `&mut self`) or `self: T` (a copy)
+error[parser error] expected identifier, got '&' | help: write the type of self: `self: &Self` for `&self`, `self: &mut Self` for `&mut self`, or `self: Self` (a copy)
 ```
-`fn get(self: *P) -> i64`; `fn get(self)` is an error too: write
-`self: P` for a copy.
+`fn get(self: &P) -> i64` (`self: *P` still works); `fn get(self)` is
+an error too: write `self: P` for a copy.
 
 ```tach
 println!("{}", 1);
@@ -51,9 +88,10 @@ what replaces `vec!`, `format!`, `assert!` and the others.
 'outer: for i in 0..3 { break 'outer; }
 ```
 ```err
-error[tokenizer error] unterminated character literal
+error[tokenizer error] unterminated character literal | help: a label has no quote: `outer: loop { break :outer; }` | try: outer: for i in 0..3 { break :outer; }
 ```
-Labels have no quote: `outer: for i in 0..3 { break :outer; }`.
+Labels have no quote: `outer: for i in 0..3 { break :outer; }` (the
+try: line is yours, respelled).
 
 ```tach
 let o: Option<i64> = Some(1);
@@ -215,8 +253,23 @@ enum E { A, B, C }
 fn f(e: E) -> i64 { match e { E::A => 1, E::B => 2 } }
 ```
 ```err
-error[type error] non-exhaustive match: 'E::C' is not covered | help: add an arm for it, or a wildcard arm '_ =>'
+error[type error] non-exhaustive match: 'E::C' is not covered | help: add an arm for it (try:), or a wildcard arm '_ =>' | try: E::C => VALUE,
 ```
+The `try:` lists every missing pattern as an arm to paste (integers as
+ranges: `201..=255 => VALUE,`). An unreachable arm's help gives the line
+of the arm above that already matches all it matches.
+
+```tach
+fn f() -> i64 { 1 }
+fn main() -> i32 { 0 }
+fn f() -> i64 { 2 }
+```
+```err
+duplicate function 'f'
+```
+The help says where the other one is, and the two `try:` lines delete
+either (`tachyonc edit delete main.tach:3 main.tach`); to change an item
+in place, `tachyonc edit replace f < new.tach` instead of adding a second.
 
 ```tach
 enum E { A(i64), B }
@@ -228,29 +281,48 @@ error[type error] unknown variant 'A'
 `E::A(x)`, or `use E::{A, B};` once.
 
 ```tach
-struct P { x: i64 }
+enum Ev { Key { code: i64, shift: bool }, Quit }
 fn main() -> i32 {
-    let p = P { x: 1 };
-    if p == P { x: 1 } { println("same"); }
-    0
+    let e = Ev::Key(1, false);
+    match e { Ev::Key(c, _) => c as i32, Ev::Quit => 0 }
 }
 ```
 ```err
-error[parser error] expected ';' or '}' after expression, got ':'
+error[type error] variant 'Ev::Key' has named fields; give them by name | try: Ev::Key { code: 1, shift: false }
 ```
-In a condition, parenthesize a struct literal: `if p == (P { x: 1 })`.
+A struct-like variant (0.17) is built and matched by name, as in Rust:
+`Ev::Key { code: 1, shift: false }`, `Ev::Key { code, .. } => code`.
+
+```tach
+enum Ev { Key { code: i64, shift: bool }, Quit }
+fn code(e: Ev) -> i64 {
+    match e { Ev::Key { code } => code, Ev::Quit => 0 }
+}
+```
+```err
+error[type error] the pattern of 'Ev::Key' does not mention field 'shift' | help: match it too, or end the pattern with '..' to leave the rest out | try: Ev::Key { code, .. }
+```
+
+```tach
+enum Ev { Key { code: i64, shift: bool }, Quit }
+fn code(e: Ev) -> i64 { e.code }
+```
+```err
+error[type error] cannot access field 'code' on type 'Ev' | help: a variant's fields are read through a pattern (no '.field' on an enum) | try: if let Ev::Key { code, .. } = e { ... }
+```
 
 ## Slices, Vec, std
 
 ```tach
-let mut v: Vec<i64> = Vec::new_in(gpa);
-v.push(1);
-let a = v[0];
+let mut m: HashMap<i64, i64> = HashMap::new_in(gpa);
+let a = m[0];
 ```
 ```err
-error[type error] cannot index type 'Vec<i64>'
+error[type error] cannot index type 'HashMap<i64, i64>'
 ```
-`v.get(0)`, `v.set(0, x)`, `v.as_slice()[0]`.
+`m.get(0)` (an Option), `m.insert(0, x)`. A `Vec` and a `Buf` index as
+their slice (0.17): `v[0]`, `v[0] = x`, `v[1..3]` are
+`v.as_slice()[0]`, ..., checked.
 
 ```tach
 let n = 3;
@@ -262,18 +334,9 @@ error[type error] 'for' iterates over ranges, slices, arrays, iterators and type
 `for x in 0..n`. A type of yours iterates with `impl Iterator for T`, or
 an `iter` method returning one (`tachyonc guide iterators`).
 
-```tach
-let s = "abc";
-let n = s.len();
-```
-```err
-error[type error] no method 'len' on type '[u8]' | help: `len` is a field of slices: `s.len`
-```
-(`Vec` has the method `len()`.) A misspelt method, field or item gets
-the nearest name of its kind:
+A misspelt method, field or item gets the nearest name of its kind:
 
 ```tach
-use std::Buf;
 fn main(gpa: Gpa) -> i32 { let mut b = Buf::new_in(gpa); b.push_string("x"); 0 }
 ```
 ```err
@@ -287,25 +350,25 @@ fn main() -> i32 { let a = [1, 2, 3]; sum(a) as i32 }
 ```err
 error[type error] expected '[i64]', got '[i64; 3]'
 ```
-`sum(a[..])`. An array has no `.len` either: `a[..].len`.
+`sum(a[..])`. An array's length is `a.len()` (or `a[..].len`).
 
 ```tach
-let b = Buf::new_in(gpa);
+let e: IoError = IoError::Read;
 ```
 ```err
-error[type error] unknown type 'Buf'
+error[type error] unknown type 'IoError'
 ```
-`use std::Buf;` (only the prelude names need no import).
+`use std::IoError;` (the prelude's names need no import: `tachyonc guide
+modules`).
 
 ```tach
-use std::HashMap;
 struct K { a: i64 }
 fn main(gpa: Gpa) -> i32 { let m: HashMap<K, i64> = HashMap::new_in(gpa); 0 }
 ```
 ```err
 error[type error] the trait 'Hash' is not implemented for 'K' | help: required by the bound 'K: Hash' of 'HashMap'
 ```
-`impl Hash for K { fn hash(self: *K) -> u64 { std::hash_u64(self.a as u64) } }`.
+`impl Hash for K { fn hash(self: &K) -> u64 { std::hash_u64(self.a as u64) } }`.
 
 ## Closures and iterators (0.14)
 
@@ -374,7 +437,7 @@ Return `Option<i64>` (or `Result<i64, E>`), or `match` on the value.
 `v.ok_or(MyError::Missing)?`.
 
 ```tach
-use std::{ParseIntError, parse_int};
+use std::ParseIntError;
 enum AppError { Bad }
 fn read(s: [u8]) -> Result<i64, AppError> { let n = parse_int(s)?; Ok(n) }
 ```
@@ -472,22 +535,22 @@ A generic body is checked per use; the note names the instance.
 Implement `Ord` for `P`, or bound `T: Ord` to say what it needs.
 
 ```tach
-trait A { fn a(self: *Self) -> i64; fn b(self: *Self) -> i64; }
+trait A { fn a(self: &Self) -> i64; fn b(self: &Self) -> i64; }
 struct S { }
-impl A for S { fn a(self: *S) -> i64 { 1 } }
+impl A for S { fn a(self: &S) -> i64 { 1 } }
 ```
 ```err
 error[type error] the impl of trait 'A' is missing 'b' | help: it has no default: write it in the impl
 ```
 
 ```tach
-trait A { fn a(self: *Self) -> i64; }
-fn f(x: *dyn A) -> i64 { 0 }
+trait A { fn a(self: &Self) -> i64; }
+fn f(x: &dyn A) -> i64 { 0 }
 ```
 ```err
 error[parser error] 'dyn' is a reserved keyword
 ```
-No trait objects: `fn f<T: A>(x: *T)`, or an enum of the cases.
+No trait objects: `fn f<T: A>(x: &T)`, or an enum of the cases.
 
 ## Modules and imports
 
@@ -506,16 +569,29 @@ fn main() -> i32 { helper() as i32 }
 ```err
 error[type error] undefined variable 'helper' | help: add `use crate::m::helper;`
 ```
-Add the `use` line the help names, or run `tachyonc fix`.
+Add the `use` line the help names, or run the `try:` line, `tachyonc fix
+--suggested main.tach`, which adds every missing one (and makes the
+other errors' exact fixes; `fix --only imports`: the imports alone).
+
+In a module other than the root, a path starts in that module, or with
+a sibling module, or one of the root (0.17): `use table::Table;` and
+`table::f(x)` in check.tach are `crate::table::...` when `mod table;` is
+in main.tach. A module elsewhere (`crate::a::table`) is `unknown module
+'table'`, whose help says `crate::a::table::...` and whose `try:` is the
+`use` line so written (in code: `use crate::a::table;`). `mod util;` with no util.tach is
+`cannot find the file of module 'util'`, whose `try:` makes it:
+`tachyonc edit new-file util.tach main.tach < util.tach` (the text on
+stdin; the `mod` line that is there stays). A `mod` line for a file that
+is next to a submodule's file belongs in the root.
 
 ```tach
 fn main() -> i32 { let text = read_to_string(); 0 }
 ```
 ```err
-error[type error] undefined variable 'read_to_string' | help: std reads stdin: `std::read_stdin_in(gpa)` (all of it, a Buf), `std::read_line(&buf)` (one line, Ok(false) at the end), `std::Scanner` (tokens)
+error[type error] undefined variable 'read_to_string' | help: std reads stdin: `read_stdin_in(gpa)` (all of it, a Buf), `read_line(&buf)` (one line, Ok(false) at the end), `Scanner` (tokens)
 ```
-std's items get their `use` line (`add `use std::read_line;``) or the
-nearest std name; an unknown function with neither points to `tachyonc
+std's items outside the prelude get their `use` line (`add `use
+std::is_digit;``) or the nearest std name; an unknown function with neither points to `tachyonc
 guide std`.
 
 ```tach
@@ -548,14 +624,27 @@ fn main() -> i32 { abs(-3) }
 ```err
 error[unsafe] calling a C function is unsafe
 ```
-`unsafe { abs(-3) }`. `tachyonc fix --only unsafe` wraps every such
-place.
+`unsafe { abs(-3) }`. The error's `try:`, `tachyonc fix --only unsafe
+main.tach`, wraps every such place; the check hook prints it once at the
+head of its report, with how many errors it answers.
+
+```tach
+fn helper() -> i64 { let v: Vec<i64> = Vec::new(); v.len() }
+fn main() -> i32 { helper() as i32 }
+```
+```err
+add the parameter `gpa: Gpa` to 'helper' and pass it down
+```
+Allocation is explicit (0.16): the help says where the allocator comes
+from here (this function's `gpa`, main's parameter, or one to add), and
+the `try:`, `tachyonc fix --only alloc016 main.tach`, threads main's
+`gpa` down to every such call.
 
 ```tach
 struct P { x: i64 }
 fn main() -> i32 {
     let mut p = P { x: 1 };
-    let q = &p;
+    let q: *P = &p;
     q.x = 9;
     0
 }
@@ -563,8 +652,9 @@ fn main() -> i32 {
 ```err
 error[unsafe] access to a field through a raw pointer is unsafe
 ```
-A local holding a pointer is raw. Use `p.x = 9;`, or pass `&p` to a
-function taking `*P` (a borrow, safe there).
+A local declared `*P` holds a raw pointer. Use `p.x = 9;`, keep a
+reference (`let q = &mut p;`, 0.17: `q.x = 9` is safe), or pass `&mut p`
+to a function taking `&mut P`.
 
 ```tach
 struct P { x: i64 }
@@ -578,12 +668,28 @@ error[type error] cannot take address of non-lvalue expression
 `let p = P { x: 1 }; get(&p)`.
 
 ```tach
+fn factorial(n: i64) -> i64 { if n < 2 { 1 } else { n * factorial(n - 1) } }
+fn main() -> i32 { let f = &factorial; f(5) as i32 }
+```
+```err
+error[type error] cannot take the address of 'factorial': a function's name is already a pointer to it
+```
+A function's name is a `fn(i64) -> i64` value: `let f = factorial;`,
+then `f(5)`; `(*f)(5)` is `f(5)` too. `fix --suggested` drops the `&`
+(the `*`).
+
+```tach
 fn first(p: *i64) -> i64 { p[1] }
 ```
 ```err
 error[unsafe] indexing a raw pointer is unsafe
 ```
-A pointer is one value; for many, take a slice `[i64]`.
+A pointer is one value; for many, take a slice `[i64]`. A pointer to a
+Vec, a Buf or a slice (`v: *Vec<i64>`) indexes what it points to, checked:
+safely through a parameter, in `unsafe` through a raw one (`let p = &v;`:
+index `v`).
+`out[0] = acc` meant to write through the pointer: the error's try: is
+`*out = acc`, safe through a borrow.
 
 ```tach
 fn read(x: *i64) -> i64 { *x }
@@ -593,8 +699,8 @@ fn get(h: H) -> i64 { read(h.p) }
 ```err
 error[unsafe] passing a raw pointer to a pointer parameter is unsafe
 ```
-Only `&place` and pointer parameters are borrows; vouch for others in
-`unsafe { read(h.p) }`.
+A `*T` field is a raw pointer: vouch for it in `unsafe { read(h.p) }`,
+or hold a reference (`struct H { p: &mut i64 }`, 0.17).
 
 ```tach
 fn add(p: *i64, x: i64) { *p += x; }
@@ -612,15 +718,87 @@ fn main() -> i32 { std::print_cstr(c"x"); 0 }
 error[unsafe] calling an `unsafe fn` is unsafe
 ```
 `std::panic`, `print_cstr` and `Buf::push_cstr` take C strings and are
-`unsafe fn`; for literals use `print("x")`.
+`unsafe fn`; for literals use `print("x")`, `panic("x")` (the prelude's,
+safe).
+
+## Moves, references and views (0.17)
+
+```tach
+struct P { x: i64 }
+fn bump(p: &mut P) { p.x += 1; }
+fn main() -> i32 { let mut q = P { x: 1 }; bump(&q); q.x as i32 }
+```
+```err
+error[type error] expected '&mut P', got '&P'
+```
+The parameter is `&mut P`: write `bump(&mut q)` (the `try:`; `tachyonc
+fix --suggested` makes it). `&q` to a `*P` parameter (before 0.17's
+spelling) is accepted.
+
+```tach
+fn first(a: &i64) -> i64 { a[0] }
+```
+```err
+error[unsafe] indexing a pointer is unsafe pointer arithmetic
+```
+`a` is one value, not an array: `*a` (and `*out = acc` to write one).
+`p[i]` on a reference to a Vec, Buf or slice is its element, checked.
+
+The own pass's errors (`own.*`) are one line each, with both positions,
+a `help:` with the fix and `try:` lines; `tachyonc explain own.CODE` has
+each in full, `tachyonc query own FILE:LINE:COL` the state of every
+local there. The common ones:
+
+```text
+error[own.moved] 'v' is used here after it moved into 'total(v)' at 5:19
+```
+`total(v: Vec<i64>)` takes `v` (an owned value moves). When it only
+reads: `v: &Vec<i64>` and `total(&v)`; when it changes it: `&mut
+Vec<i64>` and `total(&mut v)` (a push through a by-value Vec was lost
+before 0.17); else `total(v.clone())`. The try: `tachyonc refactor
+signature total --type v '&Vec<i64>' --default '&$v'` changes both.
+
+```text
+error[own.move_out] cannot move 'self.keys' (Vec<Entry>) out of '*self': 'rehash' borrows 'self'
+```
+`let old = self.keys.take();` (leaves an empty Vec on the same
+allocator; `std::take(&mut x)` for a `Default` value), or loop
+over `self.keys` by reference.
+
+```text
+error[own.conflict] 'v.push(4)' may move v's elements while 'first' (4:17) views them; 'first' is used at 6:16
+error[own.conflict] 'v.push' may move v's elements while the 'for' at 7:1 iterates over them
+error[own.conflict] 'a' is borrowed mutably by argument 1 and read by argument 2
+```
+A view (a slice, `&x`, a `for` over `v`) is still used after `v`
+changes. Use it before the change, or take it again after; keep an
+index (`for i in 0..v.len() { let x = v[i]; ... }`); copy a plain value
+out first (`let x = v[0];`); `v.swap(i, j)` for two elements; `let n =
+rng.next();` before `rng.big(n)`. `guide views` has the rules.
+
+```text
+error[own.escape] 'greet' returns a view of 'b', which is dropped when 'greet' returns
+```
+Return the `Buf` (`-> Buf`, `b`), not `b.as_slice()`; the caller takes
+the view.
+
+```text
+error[own.readonly] cannot write 'p.x': 'p' is '&P', a shared reference
+```
+`p: &mut P`, and `&mut x` at the calls (`tachyonc refactor signature F
+--type p '&mut P'` changes both); a slice: `s: &mut [T]`, passed as
+`v.as_mut_slice()` or `&mut a[..]`. Old code: `tachyonc fix --values`.
 
 ## At run time
 
-A failed check prints one line on stderr and exits with code 101:
+A failed check prints its message on stderr and exits with code 101:
 `index out of bounds: index I, length N`, `slice range out of bounds:
 ...`, `called unwrap on None`, `called unwrap on Err`, `invalid value V
-for enum E`. Arithmetic never fails (it wraps; `/ 0` is 0). Runaway
-recursion is stopped by the operating system (a signal, no message).
+for enum E`. A note follows (0.17). A program built with `--trace`
+prints, instead, the failing line and the calls that led to it
+(`tachyonc test` builds so; `guide debug`). Arithmetic never fails (it
+wraps; `/ 0` is 0). Runaway recursion is stopped by the operating system
+(a signal, no message).
 
 ```tach
 enum Level { Low, High }
@@ -637,4 +815,5 @@ fn main() -> i32 {
 ```out (exit 101)
 5
 invalid value 3 for enum Level
+note: build with --trace for the line and its callers
 ```

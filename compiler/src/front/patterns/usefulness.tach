@@ -8,11 +8,16 @@
 // wildcard), with the column types at MTY[types + col]. Matrices are made
 // on top of MAT and dropped on return.
 
-use crate::base::{IntVec, buf_byte, buf_fmt, buf_int, buf_str, buf_uint, free, sym_text};
-use crate::base::diag::{ERR, err_begin, err_end, err_help, err_str};
+use crate::base::{
+    IntVec, buf_byte, buf_fmt, buf_int, buf_new, buf_slice, buf_str, buf_uint, free, sym_text,
+};
+use crate::base::diag::{
+    ERR, err_begin, err_end, err_help, err_help_fmt, err_str, err_try_fmt, pos_line,
+};
 use crate::front::ast::{ARM_SYNTHETIC, NODES, child};
 use crate::front::ast::NodeKind::{PatBind, PatOr, PatRange, PatWild};
 use crate::front::check::type_error;
+use crate::front::check::variant_fields::has_named_fields;
 use crate::front::types::{
     ENUMS, TYPES, TY_BOOL, TY_UNIT, TyKind, VARIANTS, buf_type, enum_variant, int_max, is_integer,
     is_signed, type_elem, variant_field,
@@ -432,6 +437,10 @@ fn find_missing(m: i64, rows: i64, cols: i64, types: i64) -> bool {
                         if kind == 1 { enum_variant(TYPES[ty].a, start) }
                         else if kind == 4 { key_value(start, ty) } else { start },
                         ty, base, arity);
+                    if kind == 4 {
+                        // (0.17) an integer witness is its whole segment
+                        WIT.data[node + 3] = key_value(end, ty);
+                    }
                     for k in 0..cols - 1 {
                         WSTACK.push(WSTACK.data[base + arity + k]);
                     }
@@ -492,6 +501,7 @@ fn find_missing(m: i64, rows: i64, cols: i64, types: i64) -> bool {
                         node = witness_node(W_BOOL, c, ty, 0, 0);
                     } else if kind == 4 {
                         node = witness_node(W_INT, key_value(start, ty), ty, 0, 0);
+                        WIT.data[node + 3] = key_value(end, ty);
                     }
                     break;
                 }
@@ -533,19 +543,43 @@ fn buf_witness(out: i64, node: i64) {
         let ty = WIT.data[node + 2];
         let first = WIT.data[node + 3];
         let kids = WIT.data[node + 4];
-        if kind == W_ANY {
+        if witness_any(node) {
             buf_byte(out, '_');
         } else if kind == W_BOOL {
             buf_str(out, if value != 0 { c"true" } else { c"false" });
         } else if kind == W_INT {
+            // (0.17) the segment, `low..=high`, when it is more than one value
             if is_signed(ty) {
                 buf_int(out, value);
+                if first != value {
+                    buf_str(out, c"..=");
+                    buf_int(out, first);
+                }
             } else {
                 buf_uint(out, value as u64);
+                if first != value {
+                    buf_str(out, c"..=");
+                    buf_uint(out, first as u64);
+                }
             }
         } else if kind == W_VARIANT {
             buf_type(out, ty);
             buf_fmt(out, f"::{sym_text(VARIANTS[value].name)}");
+        }
+        if kind == W_VARIANT && kids > 0 && has_named_fields(value) {
+            // (0.17) `E::V { a: 1, .. }`: the fields that matter, by name
+            let names = NODES[VARIANTS[value].node].d;
+            buf_str(out, c" { ");
+            for i in 0..kids {
+                let kid = WKIDS.data[first + i];
+                if !witness_any(kid) {
+                    buf_fmt(out, f"{sym_text(NODES[child(names, i)].a)}: ");
+                    buf_witness(out, kid);
+                    buf_str(out, c", ");
+                }
+            }
+            buf_str(out, c".. }");
+            return;
         }
         if kind == W_TUPLE || (kind == W_VARIANT && kids > 0) {
             buf_byte(out, '(');
@@ -563,7 +597,95 @@ fn buf_witness(out: i64, node: i64) {
     }
 }
 
+// Whether witness `node` matches anything: `_`, or every integer.
+fn witness_any(node: i64) -> bool {
+    unsafe {
+        let kind = WIT.data[node];
+        let ty = WIT.data[node + 2];
+        kind == W_ANY || (kind == W_INT && int_key(WIT.data[node + 1], ty) == min_key(ty)
+            && int_key(WIT.data[node + 3], ty) == max_key(ty))
+    }
+}
+
+// (0.17) The patterns no row of the one-column matrix (0, rows) matches,
+// one per constructor of its type (an enum's variants, bool's values, an
+// integer's missing ranges, adjacent ones joined), as witness nodes into
+// `list`, at most `max`; whether there were more. Other types: nothing
+// (the caller has the first witness).
+fn missing_witnesses(rows: i64, list: *IntVec, max: i64) -> bool {
+    unsafe {
+        let ty = MTY.data[0];
+        let kind = ctor_kind(ty);
+        if kind != 1 && kind != 2 && kind != 4 {
+            return false;
+        }
+        let mark = MAT.count;
+        let tmark = MTY.count;
+        let mut erows = 0;
+        let em = expand_rows(0, rows, 1, &erows);
+        if kind == 4 {
+            int_segments(em, erows, 1, ty, 0);
+        }
+        let mut complete = false;
+        let total = ctor_count(em, erows, 1, ty, &complete);
+        let cuts = MAT.count;
+        if kind == 4 {
+            for i in 0..CUTS.count {
+                MAT.push(CUTS.data[i]);
+            }
+        }
+        let mut last = -1;
+        let mut last_end = 0;
+        let mut more = false;
+        for c in 0..total {
+            let start = if kind == 4 { MAT.data[cuts + c] } else { c };
+            let end = if kind == 4 {
+                if c + 1 < total { MAT.data[cuts + c + 1] - 1 } else { max_key(ty) }
+            } else { c };
+            let arity_mark = MTY.count;
+            let arity = push_ctor_types(ty, start);
+            let s = MAT.count;
+            let mut srows = 0;
+            for r in 0..erows {
+                if push_specialized(mat_row(em, 1, r), 1, ty, start, end, arity) {
+                    srows += 1;
+                }
+            }
+            WSTACK.count = 0;
+            if find_missing(s, srows, arity, arity_mark) {
+                if kind == 4 && last >= 0 && last_end + 1 == start {
+                    WIT.data[last + 3] = key_value(end, ty);
+                    last_end = end;
+                } else if list.count >= max {
+                    more = true;
+                } else {
+                    let node = witness_node(if kind == 1 { W_VARIANT } else if kind == 2 { W_BOOL }
+                        else { W_INT },
+                        if kind == 1 { enum_variant(TYPES[ty].a, start) }
+                        else if kind == 4 { key_value(start, ty) } else { start },
+                        ty, 0, arity);
+                    if kind == 4 {
+                        WIT.data[node + 3] = key_value(end, ty);
+                        last = node;
+                        last_end = end;
+                    }
+                    list.push(node);
+                }
+            } else {
+                last = -1;
+            }
+            MAT.count = s;
+            MTY.count = arity_mark;
+        }
+        MAT.count = mark;
+        MTY.count = tmark;
+        more
+    }
+}
+
 // Reachability of every arm, and exhaustiveness, of match n on type st.
+// (0.17) An unreachable arm's help names the arm above that covers it; a
+// non-exhaustive match's `try:` is the missing arms, ready to paste.
 pub fn check_arms(n: i64, st: i64) {
     unsafe {
         MAT.count = 0;
@@ -573,6 +695,7 @@ pub fn check_arms(n: i64, st: i64) {
         let rows_start = 0;
         let mut rows = 0;
         let mut kept = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut kept_arms = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..NODES[n].count {
             let arm = child(n, i);
             let p = NODES[arm].a;
@@ -584,11 +707,11 @@ pub fn check_arms(n: i64, st: i64) {
             let q = MAT.count;
             MAT.push(p);
             if !useful(rows_start, kept.count, 1, 0, q) && (NODES[arm].p & ARM_SYNTHETIC) == 0 {
-                type_error(p,
-                    c"unreachable match arm: the arms above match every value it matches");
+                unreachable_arm(p, &kept, &kept_arms);
             }
             if NODES[arm].b == 0 {
                 kept.push(p);
+                kept_arms.push(arm);
                 rows += 1;
             }
         }
@@ -598,17 +721,73 @@ pub fn check_arms(n: i64, st: i64) {
         }
         WSTACK.count = 0;
         if find_missing(0, kept.count, 1, 0) {
+            let first = WSTACK.data[0];
             err_begin(NODES[n].start);
             err_str(c"non-exhaustive match: '");
-            buf_witness(ERR, WSTACK.data[0]);
+            buf_witness(ERR, first);
             err_str(c"' is not covered");
+            let mut list = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            MAT.count = 0;
+            for r in 0..kept.count {
+                MAT.push(kept.data[r]);
+            }
+            let more = missing_witnesses(kept.count, &list, 8);
+            if list.count == 0 {
+                list.push(first);
+            }
             if rows < NODES[n].count {
                 err_help(c"arms with guards do not count; add an arm without a guard");
+            } else if list.count > 1 {
+                let plus: [u8] = if more { "+" } else { "" };
+                err_help_fmt(
+                    f"{list.count}{plus} patterns are not covered: add the arms (try:), or a wildcard arm '_ =>'");
             } else {
-                err_help(c"add an arm for it, or a wildcard arm '_ =>'");
+                err_help(c"add an arm for it (try:), or a wildcard arm '_ =>'");
             }
+            let t = buf_new();
+            for k in 0..list.count {
+                if k > 0 {
+                    buf_byte(t, ' ');
+                }
+                buf_witness(t, list.data[k]);
+                buf_str(t, c" => VALUE,");
+            }
+            if more {
+                buf_str(t, c" _ => VALUE,");
+            }
+            err_try_fmt(buf_slice(t));
+            free(list.data as *u8);
             err_end();
         }
         free(kept.data as *u8);
+        free(kept_arms.data as *u8);
+    }
+}
+
+// The error of an unreachable arm (pattern p) after the arms `kept` (their
+// patterns; `arms`, the arm nodes): the first arm above that matches all
+// it matches alone, by its line, else the arms above together.
+fn unreachable_arm(p: i64, kept: *IntVec, arms: *IntVec) -> ! {
+    unsafe {
+        let mut cover = -1;
+        for j in 0..kept.count {
+            MAT.count = 0;
+            MAT.push(kept.data[j]);
+            let q = MAT.count;
+            MAT.push(p);
+            if !useful(0, 1, 1, 0, q) {
+                cover = arms.data[j];
+                break;
+            }
+        }
+        err_begin(NODES[p].start);
+        err_str(c"unreachable match arm: the arms above match every value it matches");
+        if cover >= 0 {
+            err_help_fmt(
+                f"the arm at line {pos_line(NODES[cover].start)} matches all it matches: delete this arm, or move it above that one");
+        } else {
+            err_help(c"together, the arms above match all it matches: delete this arm, or move it above them");
+        }
+        err_end()
     }
 }

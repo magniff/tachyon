@@ -192,8 +192,13 @@ at one place: the `mod` line first (0.12).
 
 Refused, nothing written: a name the item would take that is taken
 there (`refactor.collision`), a method or a field (`refactor.not-movable`),
-an inline module (`refactor.inline`), a module that does not exist
-(`refactor.no-module`, `try: refactor new-module MODULE`).
+an inline module (`refactor.inline`).
+
+(0.17) A MODULE that does not exist (`--to report`, `--to crate::geo::util`)
+is made for the move: `refactor new-module MODULE` and the move run as one
+script, checked once, one edit (one `undo`), and `note
+refactor.made-module` says so. Before, it was `refactor.no-module` and a
+second command.
 
 ## new-module, move-module
 

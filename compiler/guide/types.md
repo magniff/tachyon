@@ -7,7 +7,7 @@
 | `bool` | `true`, `false` |
 | `()` | the unit type |
 | `!` | never: `return`, `break`, `loop` without `break`, `fn f() -> !` |
-| `(A, B)` | tuples: `t.0`; `(x,)` has one element |
+| `(A, B)` | tuples: `t.0` (through a pointer too: `p.0`); `(x,)` has one element |
 | `[T; N]` | an array, a value; `N` a constant expression |
 | `[T]` | a slice: `.ptr` (a `*T`) and `.len` (an `i64`) |
 | `*T` | a pointer (`*u8` is also C's `void *` and `char *`) |
@@ -70,29 +70,36 @@ println("");
 Indexing (`a[i]`, any integer type) and slicing (`a[lo..hi]`, `a[..hi]`,
 `a[lo..]`, `a[..]`) are checked: out of bounds, the program prints
 `index out of bounds: index I, length N` and exits with 101. An array
-has no `.len`; slice it: `a[..].len`. A function taking `[T]` gets
+has no `.len` field: `a.len()` (0.17), or slice it: `a[..].len`. A function taking `[T]` gets
 `a[..]`, not `a`. A slice of a raw pointer, `p[0..n]`, is unchecked and
 unsafe.
 
-## Pointers
+## References and pointers
 
-`&place` makes a `*T`; `*p` reads or writes the pointee, `p.f` reaches a
-field (and `p.m()` calls a method) through it. A pointer parameter and
-`&place` passed directly are *borrows*, safe to dereference; any other
-pointer (a local holding `&x`, a field, a C result) is raw, used only in
-`unsafe`. `0 as *T` is null. There is no pointer arithmetic: index a raw
-pointer (`p[i]`, `&p[i]`) in unsafe code, or cast through `i64`.
+`&place` makes a shared reference `&T`, `&mut place` an exclusive one
+`&mut T` (0.17): both are checked (`tachyonc guide memory`), safe to read
+and write through, kept in locals and fields. `*r` is the value, `r.f`
+reaches a field (and `r.m()` calls a method) through it. A raw pointer
+`*T` (from C, from a reference where a `*T` is expected, `0 as *T` for
+null) is dereferenced only in `unsafe`. There is no pointer arithmetic:
+index a raw pointer (`p[i]`, `&p[i]`) in unsafe code, or cast through
+`i64`. On a reference to a Vec, a Buf or a slice, `p[i]` indexes the one
+it points to, checked: safe through a reference, `unsafe` through a raw
+pointer. A `*T` parameter (without `mut`) is still taken as `&mut T` in
+0.17; `tachyonc fix --values` rewrites it.
 
 ```tach
 struct Counter { n: i64 }
 
-fn bump(c: *Counter) { c.n += 1; }      // c is a borrow: safe
+fn bump(c: &mut Counter) { c.n += 1; }   // a reference: safe
 
 fn main() -> i32 {
     let mut c = Counter { n: 0 };
-    bump(&c);
-    let p = &c;                          // a local pointer: raw
-    unsafe { p.n += 10; }
+    bump(&mut c);
+    let r = &mut c;                      // a reference in a local: safe
+    r.n += 5;
+    let p: *Counter = &mut c;            // a raw pointer: unsafe
+    unsafe { p.n += 5; }
     std::print_int(c.n);
     println("");
     0

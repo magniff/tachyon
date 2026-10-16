@@ -1,0 +1,261 @@
+// The own pass's diagnostics (0.17, docs/design/value-semantics.md §2.9,
+// §4 "Diagnostic codes"). Every one follows §2.9's contract: one line with
+// the position, the code, what happened and the other position; a `help:`
+// with the fix in words (and its text); `try:` lines that run as they are.
+//
+// How a finding is shown depends on --values (mod.tach, OWN_MODE):
+// - off: the pass does not run;
+// - report (the default until T7): it is recorded, and printed only
+//   when --values=report is given (`note[own.moved]: ...`, then a count);
+// - warn: a warning; error (the default from T7): an error.
+//
+// A message is built as an error is (err_* in base/diag): own_begin, then
+// own_str/own_sym/own_type/own_pos, own_help, own_try, then own_end. The
+// explain entries are tools/explain/own_table.tach.
+//
+// Phase 0 contract: the codes and these helpers are fixed; T1 reports
+// own.moved, own.move_out, own.partial, own.drop_view; T2 own.conflict,
+// own.escape, own.static, own.readonly; T3 own.views.
+
+use crate::base::{
+    IntVec, STDERR, SYMS, buf_byte, buf_bytes, buf_clear, buf_int, buf_new, buf_slice, buf_str,
+    buf_write_fd,
+};
+use crate::base::diag::{buf_position, report_error_once, report_warning};
+use crate::front::ast::NODES;
+use crate::front::types::buf_type;
+
+// The codes (§4). own.readonly is new in Phase 0: a write through a `&T`
+// or a `[T]` (U2).
+pub const OWN_MOVED: i64 = 0;
+pub const OWN_MOVE_OUT: i64 = 1;
+pub const OWN_PARTIAL: i64 = 2;
+pub const OWN_CONFLICT: i64 = 3;
+pub const OWN_ESCAPE: i64 = 4;
+pub const OWN_STATIC: i64 = 5;
+pub const OWN_VIEWS: i64 = 6;
+pub const OWN_DROP_VIEW: i64 = 7;
+pub const OWN_READONLY: i64 = 8;
+pub const OWN_CODES: i64 = 9;
+
+pub fn code_name(c: i64) -> *u8 {
+    if c == OWN_MOVED { return c"own.moved"; }
+    if c == OWN_MOVE_OUT { return c"own.move_out"; }
+    if c == OWN_PARTIAL { return c"own.partial"; }
+    if c == OWN_CONFLICT { return c"own.conflict"; }
+    if c == OWN_ESCAPE { return c"own.escape"; }
+    if c == OWN_STATIC { return c"own.static"; }
+    if c == OWN_VIEWS { return c"own.views"; }
+    if c == OWN_DROP_VIEW { return c"own.drop_view"; }
+    c"own.readonly"
+}
+
+// --values: off, report, warn, error.
+pub const MODE_OFF: i64 = 0;
+pub const MODE_REPORT: i64 = 1;
+pub const MODE_WARN: i64 = 2;
+pub const MODE_ERROR: i64 = 3;
+// The default is error (0.17, T7: the corpus migrated by `fix --values`);
+// --values=report, warn or off opt out for one release.
+pub static mut OWN_MODE: i64 = 3;
+// Whether --values=report was given (print the recorded findings).
+pub static mut OWN_REPORT_PRINT: bool = false;
+
+// The findings recorded in report mode (buffers), and counts per code.
+pub static mut OWN_REPORTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static mut OWN_COUNTS: [i64; 9] = [0; 9];
+
+// The message being built.
+static mut MSG: i64 = -1;
+static mut HELP: i64 = -1;
+static mut TRY: i64 = -1;
+static mut M_NODE: i64 = 0;
+static mut M_CODE: i64 = 0;
+
+static mut M_SOFT: bool = false;
+// A finding's code carries this bit when it is a warning in every mode
+// (own_soft).
+const SOFT_BIT: i64 = 1 << 20;
+
+// Starts a finding of code `code` at node n.
+pub fn own_begin(n: i64, code: i64) {
+    unsafe {
+        if MSG < 0 {
+            MSG = buf_new();
+            HELP = buf_new();
+            TRY = buf_new();
+        }
+        buf_clear(MSG);
+        buf_clear(HELP);
+        buf_clear(TRY);
+        M_NODE = n;
+        M_CODE = code;
+        M_SOFT = false;
+    }
+}
+
+pub fn own_str(s: *u8) {
+    unsafe { buf_str(MSG, s); }
+}
+
+pub fn own_bytes(s: [u8]) {
+    unsafe { buf_bytes(MSG, s); }
+}
+
+// A name, quoted: 'v'.
+pub fn own_sym(sym: i64) {
+    unsafe {
+        buf_str(MSG, c"'");
+        buf_bytes(MSG, SYMS[sym].text);
+        buf_str(MSG, c"'");
+    }
+}
+
+pub fn own_type(t: i64) {
+    unsafe { buf_type(MSG, t); }
+}
+
+// Node n's position, `LINE:COL` (the other position of the line).
+pub fn own_pos(n: i64) {
+    unsafe { buf_position(MSG, NODES[n].start); }
+}
+
+pub fn own_help(s: *u8) {
+    unsafe { buf_str(HELP, s); }
+}
+
+pub fn own_help_bytes(s: [u8]) {
+    unsafe { buf_bytes(HELP, s); }
+}
+
+// A `try:` line: a command that runs as it is (one call per line).
+pub fn own_try(s: [u8]) {
+    unsafe {
+        if buf_slice(TRY).len > 0 {
+            // (each line a try: of its own, as check prints them)
+            buf_str(TRY, c"\ntry: ");
+        }
+        buf_bytes(TRY, s);
+    }
+}
+
+// The finding being built is a warning even under --values=error: a
+// conflict that comes only from an assumed summary (design §7 V3).
+pub fn own_soft() {
+    unsafe { M_SOFT = true; }
+}
+
+// Ends the finding. It waits (PENDING) until the driver keeps the walk
+// it came from (own_flush) or walks again (own_discard): a function walked
+// twice, wider, or a fixed-point round that is not the last (T3).
+pub fn own_end() {
+    unsafe {
+        if OWN_MODE == MODE_OFF {
+            return;
+        }
+        let msg = buf_new();
+        buf_bytes(msg, buf_slice(MSG));
+        let help = buf_new();
+        buf_bytes(help, buf_slice(HELP));
+        if buf_slice(TRY).len > 0 {
+            if buf_slice(HELP).len > 0 {
+                buf_str(help, c" | ");
+            }
+            buf_str(help, c"try: ");
+            buf_bytes(help, buf_slice(TRY));
+        }
+        PENDING.push(NODES[M_NODE].start);
+        PENDING.push(if M_SOFT { M_CODE | SOFT_BIT } else { M_CODE });
+        PENDING.push(msg);
+        PENDING.push(help);
+    }
+}
+
+// A finding in one call: the message, then ` (LINE:COL)` of node other
+// when it is not 0.
+pub fn own_error(n: i64, code: i64, msg: *u8, other: i64) {
+    unsafe {
+        own_begin(n, code);
+        own_str(msg);
+        if other > 0 {
+            own_str(c" (");
+            own_pos(other);
+            own_str(c")");
+        }
+        own_end();
+    }
+}
+
+static mut PENDING: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+pub fn own_discard() {
+    unsafe { PENDING.count = 0; }
+}
+
+// The findings waiting: recorded (report), warnings or errors, by
+// OWN_MODE; once per position and code.
+pub fn own_flush() {
+    unsafe {
+        let mut i = 0;
+        while i < PENDING.count {
+            let pos = PENDING.data[i];
+            let soft = (PENDING.data[i + 1] & SOFT_BIT) != 0;
+            let code = PENDING.data[i + 1] & ~SOFT_BIT;
+            let msg = PENDING.data[i + 2];
+            let help = PENDING.data[i + 3];
+            i += 4;
+            if code >= 0 && code < OWN_CODES {
+                OWN_COUNTS[code] += 1;
+            }
+            if OWN_MODE == MODE_REPORT {
+                let line = buf_new();
+                buf_str(line, c"note[");
+                buf_str(line, code_name(code));
+                buf_str(line, c"]: ");
+                buf_bytes(line, buf_slice(msg));
+                buf_str(line, c"\n --> ");
+                buf_position(line, pos);
+                buf_str(line, c"\n");
+                if buf_slice(help).len > 0 {
+                    buf_str(line, c"  = help: ");
+                    buf_bytes(line, buf_slice(help));
+                    buf_str(line, c"\n");
+                }
+                OWN_REPORTS.push(line);
+                continue;
+            }
+            let has_help = buf_slice(help).len > 0;
+            buf_byte(msg, 0);
+            buf_byte(help, 0);
+            let h = if has_help { buf_slice(help).ptr } else { 0 as *u8 };
+            if OWN_MODE == MODE_WARN || soft {
+                report_warning(pos, 1000 + code, code_name(code), buf_slice(msg).ptr, h);
+            } else {
+                report_error_once(pos, 1000 + code, code_name(code), buf_slice(msg).ptr, h, "");
+            }
+        }
+        PENDING.count = 0;
+    }
+}
+
+// --values=report: the findings recorded, then their count, on stderr.
+pub fn print_reports() {
+    unsafe {
+        let out = buf_new();
+        for i in 0..OWN_REPORTS.count {
+            buf_bytes(out, buf_slice(OWN_REPORTS.data[i]));
+        }
+        buf_str(out, c"own: ");
+        buf_int(out, OWN_REPORTS.count);
+        buf_str(out, c" findings (");
+        buf_int(out, crate::front::own::walk::WALKED);
+        buf_str(out, c" functions walked, ");
+        buf_int(out, crate::front::own::fast::SKIPPED);
+        buf_str(out, c" skipped, ");
+        buf_int(out, crate::front::own::walk::VISITS);
+        buf_str(out, c" node visits, ");
+        buf_int(out, crate::front::own::walk::LOOP_ROUNDS);
+        buf_str(out, c" loop rounds)\n");
+        buf_write_fd(out, STDERR);
+    }
+}

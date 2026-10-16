@@ -37,6 +37,7 @@ use crate::tools::edit::{TARGET, edit_replace};
 use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit};
 use crate::tools::edit::cli::{ambiguous, source_only, take_edit_option};
 use crate::tools::edit::items::{after_line, blank_line, indent_of, item_tail};
+use crate::tools::edit::stdedit::{rerun_in_std_tree, rerun_wanted, std_rerun};
 use crate::tools::proc::{buf_cstr, read_file_if, read_stdin};
 use crate::tools::query::{
     c_slice, def_at_line, ends_with_c, file_line, file_named, resolve_name, root_or_diag,
@@ -316,7 +317,7 @@ pub fn run_patch(argc: i64, argv: **u8) -> i64 {
         let summary = buf_new();
         if insert {
             if !find_scope() {
-                return 1;
+                return if rerun_wanted() { rerun_in_std_tree(argc, argv) } else { 1 };
             }
             if !insert_at(c_slice(anchor), after, buf_slice(input)) {
                 return 1;
@@ -340,7 +341,7 @@ pub fn run_patch(argc: i64, argv: **u8) -> i64 {
                 }
                 TARGET_ARG = TARGETS.data[t] as *u8;
                 if !find_scope() {
-                    return 1;
+                    return if rerun_wanted() { rerun_in_std_tree(argc, argv) } else { 1 };
                 }
                 for k in 0..OLDS.count {
                     if PAIR_TARGET.data[k] == t && !patch_pair(k) {
@@ -526,11 +527,16 @@ fn find_scope() -> bool {
         if r == 0 {
             if spans.count == 0 {
                 let d = diag(c"error", c"patch.no-region");
-                buf_str(d, if rk == 1 { c"no use lines in " } else { c"no header comment in " });
+                buf_str(d,
+                    if rk == 1 { c"no use lines in " } else if rk == 2 { c"no header comment in " }
+                    else { c"no extern block in " });
                 buf_bytes(d, mod_fqn_text(FILES[rf].module));
-                buf_str(d, c"; edit replace adds them\n");
+                buf_str(d,
+                    if rk == 3 { c"; edit replace adds one\n" }
+                    else { c"; edit replace adds them\n" });
                 let out = try_begin(c"replace", name, true);
-                buf_str(out, if rk == 1 { c" < uses.tach" } else { c" < header.txt" });
+                buf_str(out, if rk == 1 { c" < uses.tach" } else if rk == 2 { c" < header.txt" }
+                    else { c" < extern.tach" });
                 try_end(out);
                 return false;
             }
@@ -575,6 +581,11 @@ fn find_scope() -> bool {
         let d = matches.data[0];
         let f = file_of_pos(DEFS[d].start);
         if FILES[f].path[0] == '<' {
+            // (0.17: std, in the repository: run_patch runs again in its
+            // files; stdedit.tach)
+            if std_rerun(f) {
+                return false;
+            }
             let e = diag(c"error", c"edit.not-source");
             buf_bytes(e, SYMS[DEFS[d].fqn].text);
             buf_str(e, c" is in ");
@@ -583,8 +594,10 @@ fn find_scope() -> bool {
             return false;
         }
         buf_bytes(SCOPE_NAME, SYMS[DEFS[d].fqn].text);
-        // A module of a file of its own (`mod m;`): that file.
-        if DEFS[d].kind == K_MOD {
+        // A module of a file of its own (`mod m;`): that file; but its
+        // `mod m;` line when named by FILE:LINE (0.17).
+        let mut at_line = 0;
+        if DEFS[d].kind == K_MOD && file_line(name, &at_line) < 0 {
             for g in 0..FILE_COUNT {
                 if FILES[g].path[0] != '<'
                     && (FILES[g].start < DEFS[d].start || FILES[g].start >= DEFS[d].end)

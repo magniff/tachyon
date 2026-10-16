@@ -1,0 +1,357 @@
+// tachyonc probe's code (0.17): what is written into the copies of the
+// program's files: the type questions, then each probe's count and the
+// printing of its values by type, and the statics at the end.
+
+use crate::base::{IntVec, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str};
+use crate::front::types::{FIELDS, STRUCTS, STRUCT_COUNT, buf_type};
+use crate::tools::probe::{AT_AFTER, MAX_HITS, PROBES, Probe, probe};
+
+// ---- The code of the probes ----
+
+// The copy of file f's text with its probes: each probe's code (the type
+// questions when `typing`, else the printing), the probes' statics at the
+// end; the probes' spans set.
+pub fn copy_with_probes(f: i64, text: [u8], typing: bool) -> i64 {
+    unsafe {
+        // The probes of f by offset.
+        let mut order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..PROBES.count {
+            if probe(k).file == f {
+                let mut j = order.count;
+                order.push(k);
+                while j > 0 && probe(order.data[j - 1]).at > probe(k).at {
+                    order.data[j] = order.data[j - 1];
+                    j -= 1;
+                }
+                order.data[j] = k;
+            }
+        }
+        let out = buf_new();
+        let mut done = 0;
+        for j in 0..order.count {
+            let k = order.data[j];
+            let p = probe(k);
+            buf_bytes(out, text[done..p.at]);
+            done = p.at;
+            if p.how == AT_AFTER {
+                buf_byte(out, ' ');
+            }
+            p.from = buf_slice(out).len;
+            p.spans.count = 0;
+            if typing {
+                put_type_questions(out, p);
+            } else {
+                put_probe(out, k, p);
+            }
+            p.to = buf_slice(out).len;
+            buf_byte(out, ' ');
+        }
+        buf_bytes(out, text[done..text.len]);
+        if !typing {
+            buf_bytes(out, "\n// (tachyonc probe)\nstatic mut __PROBE_N: [i64; 32] = [0; 32];\nstatic mut __PROBE_ON: bool = false;\nextern \"C\" {\n    #[link_name = \"atexit\"]\n    fn __probe_atexit(f: extern \"C\" fn()) -> i32;\n}\nextern \"C\" fn __probe_report() {\n    unsafe {\n        for k in 0..32 {\n            if __PROBE_N[k] > 0 {\n                std::eprintln(f\"@@probe-total {k} {__PROBE_N[k]}\");\n            }\n        }\n    }\n}\n");
+        }
+        out
+    }
+}
+
+// `{ let _: () = (EXPR); ... }`: check's errors name the types.
+fn put_type_questions(out: i64, p: *Probe) {
+    unsafe {
+        buf_bytes(out, "{ ");
+        for x in 0..p.exprs.count {
+            buf_bytes(out, "let __probe_t: () = ");
+            p.spans.push(buf_slice(out).len);
+            buf_byte(out, '(');
+            buf_str(out, p.exprs.data[x] as *u8);
+            buf_bytes(out, "); ");
+        }
+        buf_bytes(out, "}");
+    }
+}
+
+// The probe: its count, the atexit report once, the values the first
+// MAX_HITS times, as one line `@@probe K<TAB>v0<TAB>v1`.
+fn put_probe(out: i64, k: i64, p: *Probe) {
+    unsafe {
+        buf_bytes(out, "{ unsafe { __PROBE_N[");
+        buf_int(out, k);
+        buf_bytes(out, "] += 1; let __probe_n = __PROBE_N[");
+        buf_int(out, k);
+        buf_bytes(out,
+            "]; if (__probe_n & (__probe_n - 1)) == 0 { std::eprintln(f\"@@probe-count ");
+        buf_int(out, k);
+        buf_bytes(out, " {__probe_n}\"); } ");
+        buf_bytes(out,
+            "if !__PROBE_ON { __PROBE_ON = true; __probe_atexit(__probe_report); } } ");
+        if p.exprs.count > 0 {
+            buf_bytes(out, "if unsafe { __PROBE_N[");
+            buf_int(out, k);
+            buf_bytes(out, "] } <= ");
+            buf_int(out, MAX_HITS);
+            buf_bytes(out, " { std::eprint(\"@@probe ");
+            buf_int(out, k);
+            buf_bytes(out, "\"); ");
+            for x in 0..p.exprs.count {
+                p.spans.push(buf_slice(out).len);
+                buf_bytes(out, "std::eprint(\"\\t\"); ");
+                let ty = p.types.data[x];
+                if ty < 0 {
+                    buf_bytes(out, "std::eprint(\"()\"); ");
+                } else {
+                    // (0.17) a place is printed through a reference: the
+                    // probe must not move the value out of the program
+                    let place = is_place_text(p.exprs.data[x] as *u8);
+                    if place {
+                        buf_bytes(out, "{ let __probe_v = &(");
+                    } else {
+                        buf_bytes(out, "{ let __probe_v = (");
+                    }
+                    buf_str(out, p.exprs.data[x] as *u8);
+                    buf_bytes(out, "); ");
+                    if place {
+                        put_printer(out, "(*__probe_v)", buf_slice(ty), p.opaque.data[x], 0);
+                    } else {
+                        put_printer(out, "__probe_v", buf_slice(ty), p.opaque.data[x], 0);
+                    }
+                    buf_bytes(out, "} ");
+                }
+            }
+            buf_bytes(out, "std::eprintln(\"\"); } ");
+        }
+        buf_bytes(out, "}");
+    }
+}
+
+// Whether the probed expression `s` is a place (a name, or names and
+// field numbers joined by dots), which the probe borrows.
+fn is_place_text(s: *u8) -> bool {
+    unsafe {
+        let mut i = 0;
+        while s[i] != 0 {
+            let c = s[i];
+            let word = c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_';
+            if !(word || c == '.' && i > 0 || c >= '0' && c <= '9' && i > 0) {
+                return false;
+            }
+            i += 1;
+        }
+        i > 0
+    }
+}
+
+fn is_int_type(t: [u8]) -> bool {
+    t == "i8" || t == "i16" || t == "i32" || t == "i64" || t == "u8" || t == "u16" || t == "u32"
+        || t == "u64" || t == "isize" || t == "usize"
+}
+
+// The end of the type starting at t[i] (at a top-level `,`, `;`, `)`, `]`
+// or `>`).
+fn type_end(t: [u8], i0: i64) -> i64 {
+    let mut i = i0;
+    let mut depth = 0;
+    while i < t.len {
+        let c = t[i];
+        if c == '(' || c == '[' || c == '<' {
+            depth += 1;
+        } else if c == ')' || c == ']' || c == '>' {
+            if depth == 0 {
+                return i;
+            }
+            depth -= 1;
+        } else if (c == ',' || c == ';') && depth == 0 {
+            return i;
+        }
+        i += 1;
+    }
+    i
+}
+
+pub fn trim(t: [u8]) -> [u8] {
+    let mut a = 0;
+    let mut b = t.len;
+    while a < b && t[a] == ' ' {
+        a += 1;
+    }
+    while b > a && t[b - 1] == ' ' {
+        b -= 1;
+    }
+    t[a..b]
+}
+
+// Whether v holds x.
+pub fn has(v: *IntVec, x: i64) -> bool {
+    unsafe {
+        for i in 0..v.count {
+            if v.data[i] == x {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// `Name { f: .., g: .. }` of `v`, when t names a struct of the program;
+// false when it does not.
+fn put_fields(out: i64, v: [u8], t: [u8], depth: i64) -> bool {
+    unsafe {
+        let mut st = -1;
+        for s in 0..STRUCT_COUNT {
+            if STRUCTS[s].generic == 0 && STRUCTS[s].closure == 0
+                && SYMS[STRUCTS[s].name].text == t {
+                st = s;
+            }
+        }
+        if st < 0 {
+            return false;
+        }
+        buf_bytes(out, "std::eprint(\"");
+        buf_bytes(out, t);
+        buf_bytes(out, " { \"); ");
+        for i in 0..STRUCTS[st].field_count {
+            let fi = FIELDS[STRUCTS[st].fields + i];
+            let name = SYMS[fi.name].text;
+            if i > 0 {
+                buf_bytes(out, "std::eprint(\", \"); ");
+            }
+            buf_bytes(out, "std::eprint(\"");
+            buf_bytes(out, name);
+            buf_bytes(out, ": \"); { let __probe_f"); // (0.17: by reference)
+            buf_int(out, depth);
+            buf_bytes(out, " = &");
+            buf_bytes(out, v);
+            buf_byte(out, '.');
+            buf_bytes(out, name);
+            buf_bytes(out, "; ");
+            let ft = buf_new();
+            buf_type(ft, fi.ty);
+            let fv = buf_new();
+            buf_bytes(fv, "(*__probe_f");
+            buf_int(fv, depth);
+            buf_byte(fv, ')');
+            put_printer(out, buf_slice(fv), buf_slice(ft), 0, depth + 1);
+            buf_bytes(out, "} ");
+        }
+        buf_bytes(out, "std::eprint(\" }\"); ");
+        true
+    }
+}
+
+// Statements printing `v` (a name) of type t on stderr; `opaque` 1: a
+// struct of the program field by field (else as 2), 2: its type only (Debug
+// was missing).
+fn put_printer(out: i64, v: [u8], t: [u8], opaque: i64, depth: i64) {
+    unsafe {
+        if opaque == 1 && put_fields(out, v, t, depth) {
+            return;
+        }
+        if opaque > 0 || depth > 3 {
+            buf_bytes(out, "std::eprint(\"<");
+            buf_bytes(out, t);
+            buf_bytes(out, ">\"); ");
+            return;
+        }
+        if is_int_type(t) || t == "bool" || t == "f64" || t == "f32" {
+            buf_bytes(out, "std::eprint(f\"{");
+            buf_bytes(out, v);
+            buf_bytes(out, "}\"); ");
+            return;
+        }
+        if t == "[u8]" {
+            buf_bytes(out, "std::eprint(f\"{");
+            buf_bytes(out, v);
+            buf_bytes(out, ":?}\"); ");
+            return;
+        }
+        if t.len > 0 && t[0] == '*' {
+            buf_bytes(out, "{ let __probe_a = ");
+            buf_bytes(out, v);
+            buf_bytes(out, " as u64; std::eprint(f\"0x{__probe_a:x}\"); } ");
+            return;
+        }
+        let s = buf_new();
+        buf_bytes(s, "__probe_s");
+        buf_int(s, depth);
+        let ix = buf_new();
+        buf_bytes(ix, "__probe_i");
+        buf_int(ix, depth);
+        let e = buf_new();
+        buf_bytes(e, "__probe_e");
+        buf_int(e, depth);
+        // (0.17) elements and fields are bound by reference, never moved
+        let ed = buf_new();
+        buf_bytes(ed, "(*__probe_e");
+        buf_int(ed, depth);
+        buf_byte(ed, ')');
+        if t.len > 2 && t[0] == '[' && t[t.len - 1] == ']' {
+            let end = type_end(t, 1);
+            let elem = trim(t[1..end]);
+            buf_bytes(out, "{ let ");
+            buf_bytes(out, buf_slice(s));
+            buf_bytes(out, " = ");
+            buf_bytes(out, v);
+            if end < t.len - 1 {
+                buf_bytes(out, "[..]");
+            }
+            buf_bytes(out, "; std::eprint(\"[\"); for ");
+            buf_bytes(out, buf_slice(ix));
+            buf_bytes(out, " in 0..");
+            buf_bytes(out, buf_slice(s));
+            buf_bytes(out, ".len { if ");
+            buf_bytes(out, buf_slice(ix));
+            buf_bytes(out, " == 16 { std::eprint(f\", ... ({");
+            buf_bytes(out, buf_slice(s));
+            buf_bytes(out, ".len} in all)\"); break; } if ");
+            buf_bytes(out, buf_slice(ix));
+            buf_bytes(out, " > 0 { std::eprint(\", \"); } let ");
+            buf_bytes(out, buf_slice(e));
+            buf_bytes(out, " = &");
+            buf_bytes(out, buf_slice(s));
+            buf_byte(out, '[');
+            buf_bytes(out, buf_slice(ix));
+            buf_bytes(out, "]; ");
+            put_printer(out, buf_slice(ed), elem, 0, depth + 1);
+            buf_bytes(out, "} std::eprint(\"]\"); } ");
+            return;
+        }
+        if t.len > 8 && t[0..7] == "Option<" && t[t.len - 1] == '>' {
+            let elem = trim(t[7..t.len - 1]);
+            buf_bytes(out, "match ");
+            buf_bytes(out, v);
+            buf_bytes(out, " { Option::Some(");
+            buf_bytes(out, buf_slice(e));
+            buf_bytes(out, ") => { std::eprint(\"Some(\"); ");
+            put_printer(out, buf_slice(e), elem, 0, depth + 1);
+            buf_bytes(out, "std::eprint(\")\"); } Option::None => { std::eprint(\"None\"); } } ");
+            return;
+        }
+        if t.len > 2 && t[0] == '(' && t[t.len - 1] == ')' {
+            buf_bytes(out, "std::eprint(\"(\"); ");
+            let mut i = 1;
+            let mut n = 0;
+            while i < t.len - 1 {
+                let end = type_end(t, i);
+                let field = buf_new();
+                buf_bytes(field, v);
+                buf_byte(field, '.');
+                buf_int(field, n);
+                if n > 0 {
+                    buf_bytes(out, "std::eprint(\", \"); ");
+                }
+                buf_bytes(out, "{ let ");
+                buf_bytes(out, buf_slice(e));
+                buf_bytes(out, " = &");
+                buf_bytes(out, buf_slice(field));
+                buf_bytes(out, "; ");
+                put_printer(out, buf_slice(ed), trim(t[i..end]), 0, depth + 1);
+                buf_bytes(out, "} ");
+                n += 1;
+                i = end + 1;
+            }
+            buf_bytes(out, "std::eprint(\")\"); ");
+            return;
+        }
+        buf_bytes(out, "std::eprint(f\"{");
+        buf_bytes(out, v);
+        buf_bytes(out, ":?}\"); ");
+    }
+}

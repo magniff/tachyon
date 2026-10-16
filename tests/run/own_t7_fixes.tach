@@ -1,0 +1,87 @@
+// (0.17, T7) Correct code the migration found rejected, now accepted:
+// - a view a method makes of a `&mut` parameter is a reborrow of it: the
+//   parameter stays usable after a call writes through the view;
+// - HashMap::get_mut and get_or_insert give writable views (`&mut [V]`),
+//   and `Option<&mut [V]>` keeps its methods (`&mut [T]` binds as a type
+//   argument);
+// - an Arena is a handle whose copies share the arena (plain until 0.17.1);
+// - std's debug_list borrows its elements (a Vec<Buf> prints);
+// - reading a field through a `&mut` parameter leaves a view of another
+//   field alive, and a view bound by `if let` out of a method of a `&mut`
+//   parameter reborrows it (err_own_conflict keeps the real conflicts).
+struct Acc { bal: i64 }
+struct S { mark: Vec<i64>, stamp: i64 }
+
+fn stamp(s: &mut S) {
+    let mark = s.mark.as_mut_slice();
+    mark[0] = s.stamp;
+}
+
+fn move_one(m: &mut HashMap<[u8], Acc>) {
+    if let Some(a) = m.get_mut("a") {
+        a[0].bal -= 1;
+    }
+    if let Some(b) = m.get_mut("b") {
+        b[0].bal += 1;
+    }
+}
+
+fn twice(v: &mut Vec<i64>) {
+    sort(v.as_mut_slice());
+    sort(v.as_mut_slice());
+    let s = v.as_mut_slice();
+    s[0] += 100;
+    v.push(9);
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let mut v: Vec<i64> = Vec::new_in(gpa);
+    v.push(3);
+    v.push(1);
+    twice(&mut v);
+    println(f"{v[0]} {v[1]} {v.len()}");
+
+    let mut m: HashMap<[u8], Acc> = HashMap::new_in(gpa);
+    m.insert("a", Acc { bal: 1 });
+    if let Some(a) = m.get_mut("a") {
+        a[0].bal += 10;
+    }
+    if m.get_mut("b").is_none() {
+        println("no b");
+    }
+    m.get_mut("a").unwrap()[0].bal += 100;
+    m.get_or_insert("a", Acc { bal: 0 })[0].bal += 1000;
+    let bal = m.get("a").unwrap().bal;
+    println(f"{bal}");
+    m.insert("b", Acc { bal: 0 });
+    move_one(&mut m);
+    let ab = m.get("a").unwrap().bal * 10 + m.get("b").unwrap().bal;
+    let mut st = S { mark: Vec::new_in(gpa), stamp: 7 };
+    st.mark.push(0);
+    stamp(&mut st);
+    println(f"{ab} {st.mark[0]}");
+
+    let a = Arena::new_in(gpa);
+    let mut x: Vec<i64, Arena> = Vec::new_in(a);
+    let mut y: Vec<i64, Arena> = Vec::new_in(a);
+    x.push(1);
+    y.push(2);
+    println(f"{x[0] + y[0]} {a.used() > 0}");
+    drop(x);
+    drop(y);
+    // (an Arena does not drop until 0.17.1: its chunks are given back here)
+    unsafe {
+        a.free_all();
+    }
+
+    let mut bufs: Vec<Buf> = Vec::new_in(gpa);
+    bufs.push(Buf::from_in("hi", gpa));
+    println(f"{bufs:?}");
+    0
+}
+// EXPECT: 101 3 3
+// EXPECT: no b
+// EXPECT: 1111
+// EXPECT: 11101 7
+// EXPECT: 3 true
+// EXPECT: ["hi"]

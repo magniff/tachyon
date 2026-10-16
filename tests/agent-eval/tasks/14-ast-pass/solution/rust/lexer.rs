@@ -99,7 +99,13 @@ fn single(c: u8) -> Option<TokenKind> {
 
 // A token of one or two characters: `first` alone, or `second` when the
 // next character is `next`.
-fn one_or_two(src: &[u8], i: i64, next: u8, first: TokenKind, second: TokenKind) -> (TokenKind, i64) {
+fn one_or_two(
+    src: &[u8],
+    i: i64,
+    next: u8,
+    first: TokenKind,
+    second: TokenKind,
+) -> (TokenKind, i64) {
     if i + 1 < src.len() as i64 && src[(i + 1) as usize] == next {
         (second, 2)
     } else {
@@ -145,10 +151,16 @@ pub fn tokenize(src: &[u8]) -> Result<Lexed, i64> {
         } else if is_digit(c) {
             let mut value: i64 = 0;
             while i < n && is_digit(src[i as usize]) {
-                value = value.wrapping_mul(10).wrapping_add((src[i as usize] - b'0') as i64);
+                value = value
+                    .wrapping_mul(10)
+                    .wrapping_add((src[i as usize] - b'0') as i64);
                 i += 1;
             }
-            tokens.push(Token { kind: TokenKind::Num, value: value, line: line });
+            tokens.push(Token {
+                kind: TokenKind::Num,
+                value: value,
+                line: line,
+            });
         } else if is_alpha(c) {
             let start = i;
             while i < n && (is_alpha(src[i as usize]) || is_digit(src[i as usize])) {
@@ -156,10 +168,18 @@ pub fn tokenize(src: &[u8]) -> Result<Lexed, i64> {
             }
             let word = &src[start as usize..i as usize];
             match keyword(word) {
-                Some(kind) => tokens.push(Token { kind: kind, value: 0, line: line }),
+                Some(kind) => tokens.push(Token {
+                    kind: kind,
+                    value: 0,
+                    line: line,
+                }),
                 None => {
                     let id = intern(&mut ids, &mut names, word);
-                    tokens.push(Token { kind: TokenKind::Ident, value: id, line: line });
+                    tokens.push(Token {
+                        kind: TokenKind::Ident,
+                        value: id,
+                        line: line,
+                    });
                 }
             }
         } else {
@@ -178,11 +198,26 @@ pub fn tokenize(src: &[u8]) -> Result<Lexed, i64> {
             if kind == TokenKind::End {
                 return Err(line);
             }
-            tokens.push(Token { kind: kind, value: 0, line: line });
+            tokens.push(Token {
+                kind: kind,
+                value: 0,
+                line: line,
+            });
             i += len;
         }
     }
-    let last_line = if tokens.is_empty() { 1 } else { tokens[tokens.len() - 1].line };
-    tokens.push(Token { kind: TokenKind::End, value: 0, line: last_line });
-    Ok(Lexed { tokens: tokens, names: names })
+    let last_line = if tokens.is_empty() {
+        1
+    } else {
+        tokens[tokens.len() - 1].line
+    };
+    tokens.push(Token {
+        kind: TokenKind::End,
+        value: 0,
+        line: last_line,
+    });
+    Ok(Lexed {
+        tokens: tokens,
+        names: names,
+    })
 }

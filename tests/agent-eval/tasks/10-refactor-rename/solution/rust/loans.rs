@@ -27,7 +27,11 @@ impl Loans {
     }
 
     pub fn lend(&mut self, member: i64, book: i64, day: i64) {
-        self.list.push(Loan { member: member, book: book, day: day });
+        self.list.push(Loan {
+            member: member,
+            book: book,
+            day: day,
+        });
     }
 
     // The index of the oldest loan of `book` to `member`.

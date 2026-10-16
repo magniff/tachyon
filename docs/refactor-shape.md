@@ -15,9 +15,9 @@ anything query accepts.
 tachyonc refactor signature FN --add 'x: T [= VALUE]' [--at N] [--fill-calls] | --remove x
                                | --rename-param a b | --reorder b,a,c | --type x T [--default EXPR]
 tachyonc refactor field STRUCT --add 'g: T = VALUE' | --remove g | --rename g h | --type g T
-tachyonc refactor variant ENUM --add 'X(T, ...)' [--arm EXPR] [--arm-in SITE EXPR]... | --remove V | --rename V W
-tachyonc rewrite 'PATTERN' 'REPLACEMENT' [--where '$x: T']... [--subst 'P' 'R']... [--in FILE|MODULE] [--list]
-tachyonc rewrite 'PATTERN' --list [--where ...] [--in FILE|MODULE]   (0.16)
+tachyonc refactor variant ENUM --add 'X(T, ...)'|'X { a: T, ... }' [--arm EXPR] [--arm-in SITE EXPR]... | --remove V | --rename V W
+tachyonc rewrite 'PATTERN' 'REPLACEMENT' [--where '$x: T']... [--subst 'P' 'R']... [--in FILE|MODULE|ITEM]... [--list]
+tachyonc rewrite 'PATTERN' --list [--where ...] [--in FILE|MODULE|ITEM]   (0.16)
 tachyonc refactor extract-function FN --lines A-B --to NEW          (0.13)
 tachyonc refactor inline FN [--at FILE:LINE] [--keep]                 (0.13)
 tachyonc refactor --script FILE
@@ -125,7 +125,9 @@ A `#[repr(C)]` struct's layout changes with --add, --remove and --type:
   => EXPR` after its last arm (the enum written as that match's arms
   write it; else by its full path); without, the command is refused and
   lists them, `FILE:LINE:COL→FUNCTION` on stdout, then
-  `error refactor.non-exhaustive` and `try: query show FILE:LINE`.
+  `error refactor.non-exhaustive` and `try: query show FILE:LINE`. A
+  struct-like variant (0.17), `--add 'X { a: T }'`, gets the arm
+  `E::X { .. } => EXPR`.
 - `--arm-in SITE EXPR` (0.14, repeatable): the arm of the matches SITE
   names, for matches of different result types: SITE is the function
   (any item) the match is in, as `query` takes a NAME, or `FILE:LINE` of
@@ -178,7 +180,9 @@ by the compiler's parser, with holes:
 | `--where '$x: name'`, `--where '$x: name ~ RE'`, `$x~/RE/` | (0.16) only a name: an identifier or a path (`V`, `crate::m::V`, the name a `for` or `let` binds), not another expression (`IRFUNCS[f].blocks`); with RE, a name whose text RE matches (`^ $ . * + ? [a-z] [^...] \d \w`, anywhere unless anchored: `$v~/^v_/`) |
 
 The pattern is matched against every node as parsed (`--in FILE|MODULE`:
-the sites in that file or module), node by node: same kind, same
+the sites in that file or module, its children too; 0.17: `--in ITEM`, a
+function, a type, a const...: the sites in its text; `--in` repeated: the
+sites in any of them), node by node: same kind, same
 operator, same names, and a part without holes matches code with the
 same tokens; parentheses do not count (`$a + $b` matches `(x + y)`). A
 site's replacement is REPLACEMENT with each hole replaced by the exact
@@ -215,6 +219,16 @@ A site where the replacement drops a hole bound to a name (`for $i`,
 `let $x =`) that the code it keeps still uses is left as it is: `note
 rewrite.dropped` counts them and names the first, `try: query show` it.
 The imports the replacement's names need are added (`note edit.imports`).
+(0.17) The names of `use` lines that the rewrite leaves unused (the last
+calls of a helper in a file rewritten away) are removed in the same edit
+(`note rewrite.imports`).
+
+(0.17) A rewrite refused because it breaks the program (`edit.breaks`,
+nothing written) whose holes have several types at the sites gets a
+`note rewrite.where` naming each type and its number of sites, and a
+`try:` per type with its `--where` (three at most), before the
+`--no-check` one: the replacement may fit only some of them
+(`$v.is_empty()` for a `Vec`, not a `*Buf`).
 
 (0.16) **New names, substitutions.** A hole of the replacement that the
 pattern lacks is a new name, which the replacement must bind (`for $x
@@ -351,6 +365,8 @@ inlined crate::calc::quad at 1 call, deleted it→2 files→+10 -12 lines
   one given by position or by label; one left to its default gets the
   default as written in FN (checked where the call is). A parameter
   put in for a field shorthand `S { x }` writes `S { x: ARG }`.
+- (0.17) A call in an f-string's hole gets the body on one line (`f"{if
+  b == 0 { 0 } else { a / b }}"`), a body with a `//` comment its lines.
 - Refused: a body with a `return` or (0.15) a `?` (`refactor.escapes`), a call of FN in
   its body (`refactor.recursive`), a generic or bodiless FN
   (`refactor.generic`), an `extern "C"` one (`refactor.extern`), a name
@@ -482,4 +498,6 @@ as it changes the program through the edit engine (`edit_replace`,
 - A struct field added by `refactor field --add` is not `pub` unless the
   text says so.
 - `refactor variant --add --arm` (and `--arm-in`) binds no fields (`X(_,
-  _)`); an arm using them is written by hand (`edit`).
+  _)`, `X { .. }`); an arm using them is written by hand (`edit`).
+- `refactor field` takes a struct; a struct-like variant's fields (0.17)
+  are changed with `edit` (the variant, its literals and patterns).

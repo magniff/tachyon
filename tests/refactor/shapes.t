@@ -100,7 +100,7 @@ $ refactor signature area --type p '*Point' --dry-run
 @@ -17 +17 @@
 -pub fn area(p: Point) -> i64 {
 +pub fn area(p: *Point) -> i64 {
-main.tach:16:18: error[type error] expected '*Point', got 'Point'  [in crate::main]
+main.tach:16:18: error[type error] expected '*Point', got 'Point' | help: a pointer to it: its address | try: &p | try: tachyonc fix --suggested main.tach  [in crate::main]
 warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change) (dry run)
 [exit 1]
 ## Refused: a function used as a value, a missing default, an unknown
@@ -137,9 +137,9 @@ $ refactor signature twice --rename-param x n --dry-run
 ## Ambiguous, and not a function.
 $ refactor signature size --remove unit
 error query.ambiguous: 3 definitions match 'size'; name one
-try: tachyonc refactor signature crate::geom::Shape::size
-try: tachyonc refactor signature '<crate::geom::Point as Shape>::size'
-try: tachyonc refactor signature '<crate::geom::Pair as Shape>::size'
+try: tachyonc refactor signature crate::geom::Shape::size --remove unit
+try: tachyonc refactor signature '<crate::geom::Point as Shape>::size' --remove unit
+try: tachyonc refactor signature '<crate::geom::Pair as Shape>::size' --remove unit
 [exit 1]
 $ refactor signature Point --remove x
 error refactor.kind: crate::geom::Point is a struct, not a function
@@ -205,7 +205,7 @@ $ refactor field Point --rename y height --dry-run
 -        (self.x + self.y) * unit
 +        (self.x + self.height) * unit
 $ refactor field Point --type x i32
-geom.tach:47:27: error[type error] expected 'i32', got 'i64'  [in crate::geom::Point::scale]
+geom.tach:47:27: error[type error] expected 'i32', got 'i64' | help: only widening is implicit: convert explicitly | try: k as i32 | try: tachyonc fix --suggested main.tach  [in crate::geom::Point::scale]
 error edit.breaks: 1 new error (1 in crate::geom::Point::scale, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::geom::Point no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: tachyonc refactor field crate::geom::Point --type x i32
@@ -276,8 +276,7 @@ $ refactor variant Kind --add 'Ring(i64, i64)'
 kinds.tach:9:5	kinds::weight
 kinds.tach:33:5	kinds::sides
 error refactor.non-exhaustive: 2 matches on crate::kinds::Kind would not cover Ring; nothing written
-try: tachyonc query show kinds.tach:9
-try: tachyonc query show kinds.tach:33
+try: tachyonc query show kinds.tach:9 kinds.tach:33
 try: tachyonc refactor variant crate::kinds::Kind --add 'Ring(i64, i64)' --arm 'EXPR' --dry-run
 try: tachyonc refactor variant crate::kinds::Kind --add 'Ring(i64, i64)' --arm-in kinds::weight 'EXPR' --arm-in kinds::sides 'EXPR' --dry-run
 [exit 1]

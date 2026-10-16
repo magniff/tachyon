@@ -18,11 +18,11 @@ struct Point { x: f64, y: f64 }
 enum Shape { Circle(Point, f64), Rect(Point, Point), Empty }
 
 trait Area {
-    fn area(self: *Self) -> f64;
+    fn area(self: &Self) -> f64;
 }
 
 impl Area for Shape {
-    fn area(self: *Shape) -> f64 {
+    fn area(self: &Shape) -> f64 {
         match *self {
             Shape::Circle(_, r) => 3.14159 * r * r,
             Shape::Rect(a, b) => (b.x - a.x) * (b.y - a.y),
@@ -62,9 +62,11 @@ full grammar is in [docs/grammar.md](docs/grammar.md).
 ## Built for agents
 
 **The compiler teaches the language.** A newcomer has never seen tachyon,
-so `tachyonc guide` prints a reference sized for a context window (about
-5k tokens; `--list` for the topics): where tachyon differs from Rust,
-std's API generated from its source, the first errors with their fixes.
+so `tachyonc guide` prints a core sized for a context window (about 2k
+tokens): where tachyon looks like Rust and means something else, as
+paired Rust and tachyon lines, std's most used items, the first errors
+with their fixes. The rest is on demand: `guide TOPIC`, `guide --find
+WORDS`, `guide TOPIC#SECTION` (std's API is generated from its source).
 It is built into the compiler, so it matches its version, and every
 example in it is compiled and run by the test suite.
 
@@ -121,10 +123,13 @@ by zero is defined (`x / 0 == 0`), shifts and float-to-integer
 conversions are defined, indexing and slicing are bounds-checked (exit
 code 101 with a message), and there are no uninitialized variables. Raw
 pointer dereference, calls into C and union reads are allowed only inside
-`unsafe`; `--check-unsafe` checks those accesses at run time. One gap
-remains, documented: a slice used after its storage is freed (tachyon has
-no lifetimes yet; 0.17 closes it). See "Undefined behaviour" in
-[docs/grammar.md](docs/grammar.md).
+`unsafe`; `--check-unsafe` checks those accesses at run time. Since
+0.17, value semantics close the last gap without lifetime annotations:
+owned values move and are dropped at the end of their scope, references
+(`&T`, `&mut T`) and slices are checked so that none outlives or is
+invalidated under what it views (aliasing XOR mutation). See
+"Undefined behaviour" in [docs/grammar.md](docs/grammar.md) and
+`tachyonc guide memory`.
 
 **Every name is traceable.** There are no wildcard imports: every name a
 file uses is declared there, imported by name, or written with its path,
@@ -240,17 +245,20 @@ checks every release; `-g` writes DWARF line tables.
 ## Status
 
 Tachyon is at 0.x: the language is not stable, and minor releases may
-break programs (with a `tachyonc fix` migration from 0.14 on). Release
-0.12 reorganizes the compiler's own source into folders by phase, no
-file over 1,000 lines, with the compiler's own refactoring commands,
-proven output-identical by `same-output`. Next:
+break programs (with a `tachyonc fix` migration from 0.14 on). The
+current release is 0.17.0: memory safety by mutable value semantics
+(owned values move and are dropped at the end of their scope, references
+and slices are checked with inferred view summaries and no lifetime
+annotations, `tachyonc fix --values` migrates 0.16 code), on 0.16's
+effects and explicit allocators. See [docs/releases.md](docs/releases.md)
+for every release. Next:
 
-- **0.13**: the tools, improved from what 0.12's reorganization recorded
-- **0.14**: the agent eval as a release gate; closures and iterators
-- **0.15**: `?` on `Result`/`Option`, lossless widening, `From`/`Into`, `derive`, interpolation
-- **0.16**: inferred, declarable effects (`#[pure]`, `#[no_alloc]`); explicit allocators
-- **0.17**: memory safety by mutable value semantics (moves, destructors)
-- **0.18**: contracts (`requires`, `ensures`), `test` blocks, property and fuzz tests
+- **0.17.1**: references as results and type arguments, arena handles as
+  references, the rest of 0.17's value-semantics items
+- **0.18**: contracts (`requires`, `ensures`), `test` blocks, property and fuzz tests;
+  the compiler's own source on value semantics and arenas; code generation on threads
+- **0.19 to 0.23**: `std::arch` intrinsics, collections, text and I/O,
+  concurrency, GPU support, windows and a terminal emulator on std
 
 **Toward 1.0.** 1.0 is not a feature milestone. It ships when the
 surface language has been reworked against real programs, the tools

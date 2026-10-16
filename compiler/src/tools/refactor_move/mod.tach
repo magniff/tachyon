@@ -27,26 +27,28 @@ pub mod imports;
 mod place;
 
 use crate::base::{
-    BUFS, FILES, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
-    intern,
+    BUFS, FILES, IntVec, SRC, SYMS, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice,
+    buf_str, intern,
 };
 use crate::front::ast::{NODES, NODE_COUNT, child};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
 use crate::front::modules::{file_of_pos, module_at, module_count};
 use crate::middle::lower::ssa::HMap;
+use crate::tools::edit::{DRY_RUN, NO_CHECK, SHOW, TARGET_NAME};
 use crate::tools::edit::cli::delete_lines;
+use crate::tools::proc::{buf_cstr, remove_file, run_inherit, write_file_if};
 use crate::tools::query::c_slice;
-use crate::tools::query::defs::{DEFS, K_IMPL_METHOD, K_METHOD, K_MOD, mod_fqn_text};
-use crate::tools::query::diagnostics::{diag, try_begin, try_end};
+use crate::tools::query::defs::{DEFS, K_IMPL_METHOD, K_METHOD, K_MOD, bytes_eq, mod_fqn_text};
+use crate::tools::query::diagnostics::{PROG, diag, try_begin, try_end, write_diags};
 use crate::tools::query::positions::token_at;
 use crate::tools::refactor_mod::{
     NM_BODY, NM_HEAD, NM_USES, binding_of, collision, emit_regions, is_new, item_binding, load_refs,
     own_file, put_edit,
 };
 use crate::tools::refactor_mod::cli::{
-    OPT_AFTER, OPT_AUTO, OPT_BEFORE, OPT_HEADER, OPT_INTO, OPT_ITEMS, OPT_PLAN, OPT_REEXPORT,
-    TIDY_AFTER, finish, inline_module, make_path, module_named, no_module, one_definition,
-    path_segments,
+    OPT_AFTER, OPT_AUTO, OPT_BEFORE, OPT_DIR, OPT_HEADER, OPT_INTO, OPT_ITEMS, OPT_NO_TIDY,
+    OPT_PLAN, OPT_REEXPORT, TIDY_AFTER, finish, inline_module, make_path, module_named, no_module,
+    one_definition, path_segments,
 };
 use crate::tools::refactor_move::imports::{
     IM_REGION, REFUSED, SPLIT_FROM, analyze, emit_use_edits, reexport_lines, region_uses,
@@ -619,6 +621,9 @@ pub fn run_move(words: *IntVec, to: *u8, root: *u8) -> i64 {
     unsafe {
         TIDY_AFTER = true;
         let t = module_named(c_slice(to));
+        if t == -1 {
+            return move_to_new(words, c_slice(to), root);
+        }
         if t < 0 {
             return no_module(c_slice(to), c"new-module");
         }
@@ -661,6 +666,105 @@ pub fn run_move(words: *IntVec, to: *u8, root: *u8) -> i64 {
         buf_str(what, c" to ");
         buf_bytes(what, mod_fqn_text(t));
         finish(what, root)
+    }
+}
+
+// (0.17) `refactor move PATH... --to MODULE` when MODULE does not exist:
+// a script of two steps, `refactor new-module MODULE` and the move, run
+// as one edit by a copy of this program (stdout and stderr its own).
+fn move_to_new(words: *IntVec, to: [u8], root: *u8) -> i64 {
+    unsafe {
+        let path = buf_new();
+        if !bytes_eq(to, c_slice(c"crate"))
+            && !(to.len > 7 && bytes_eq(to[0..7], c_slice(c"crate::"))) {
+            buf_str(path, c"crate::");
+        }
+        buf_bytes(path, to);
+        let script = buf_new();
+        buf_str(script, c"refactor new-module ");
+        buf_bytes(script, buf_slice(path));
+        if OPT_DIR {
+            buf_str(script, c" --dir");
+        }
+        buf_str(script, c"\nrefactor move");
+        for i in 0..(*words).count {
+            buf_byte(script, ' ');
+            buf_str(script, (*words).data[i] as *u8);
+        }
+        buf_str(script, c" --to ");
+        buf_bytes(script, buf_slice(path));
+        if OPT_AFTER != 0 as *u8 {
+            buf_str(script, c" --after ");
+            buf_str(script, OPT_AFTER);
+        }
+        if OPT_BEFORE != 0 as *u8 {
+            buf_str(script, c" --before ");
+            buf_str(script, OPT_BEFORE);
+        }
+        if OPT_NO_TIDY {
+            buf_str(script, c" --no-tidy");
+        }
+        buf_byte(script, '\n');
+        let file_buf = buf_new();
+        buf_str(file_buf, root);
+        buf_str(file_buf, c".tachyon-move~");
+        let file = buf_cstr(file_buf);
+        if !write_file_if(file, buf_slice(script)) {
+            let d = diag(c"error", c"refactor.script");
+            buf_str(d, c"cannot write '");
+            buf_str(d, file);
+            buf_str(d, c"'\n");
+            return 2;
+        }
+        let label = buf_new();
+        buf_str(label, c"moved ");
+        if (*words).count == 1 {
+            buf_str(label, (*words).data[0] as *u8);
+        } else {
+            buf_int(label, (*words).count);
+            buf_str(label, c" items");
+        }
+        buf_str(label, c" to ");
+        buf_bytes(label, buf_slice(path));
+        buf_str(label, c", a new module");
+        let args = alloc_array::<*u8>(14);
+        args[0] = PROG;
+        args[1] = c"refactor";
+        args[2] = c"--script";
+        args[3] = file;
+        args[4] = c"--root";
+        args[5] = root;
+        args[6] = c"--label";
+        args[7] = buf_cstr(label);
+        let mut n = 8;
+        if DRY_RUN {
+            args[n] = c"--dry-run";
+            n += 1;
+        }
+        if NO_CHECK {
+            args[n] = c"--no-check";
+            n += 1;
+        }
+        if SHOW {
+            args[n] = c"--show";
+            n += 1;
+        }
+        if TARGET_NAME != 0 as *u8 {
+            args[n] = c"--target";
+            args[n + 1] = TARGET_NAME;
+            n += 2;
+        }
+        args[n] = 0 as *u8;
+        write_diags();
+        let status = run_inherit(args);
+        remove_file(file);
+        if status == 0 {
+            let d = diag(c"note", c"refactor.made-module");
+            buf_str(d, c"there was no module ");
+            buf_bytes(d, buf_slice(path));
+            buf_str(d, c"; it was made for the move (refactor new-module)\n");
+        }
+        status
     }
 }
 

@@ -45,7 +45,12 @@ impl Catalog {
                 self.items[i].copies
             }
             None => {
-                self.items.push(Book { id: id, title: title.to_string(), copies: copies, lent: 0 });
+                self.items.push(Book {
+                    id: id,
+                    title: title.to_string(),
+                    copies: copies,
+                    lent: 0,
+                });
                 copies
             }
         }

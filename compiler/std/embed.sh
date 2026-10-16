@@ -1,7 +1,7 @@
 #!/bin/sh
 # Makes compiler/src/front/stdsrc.tach from compiler/std/std.tach and the
 # files appended to it, in this order: iter.tach (0.14), io.tach, fmt.tach,
-# convert.tach and clone.tach (0.15), alloc.tach (0.16): the standard
+# convert.tach and clone.tach (0.15), alloc.tach (0.16), values.tach (0.17): the standard
 # library's source, one module, built into the compiler as a function that
 # writes it to a buffer (string literals cannot span lines, so one call per
 # line). Its end is front/stdalloc.tach's std_alloc_tail (0.16): Gpa's
@@ -9,14 +9,16 @@
 # with --check-alloc, the checking Gpa, alloc_check.tach
 # (std_check_gpa_source), and its index (std_check_index).
 # Run it after changing any of them; tests/run.sh checks they agree.
+# (0.17: `tachyonc edit` of a std item, or of one of these files, runs it.)
 # (0.15) It also writes std_index, the sections' index (index.awk).
 #
 # usage: compiler/std/embed.sh [-c]   (-c: only check, exit 1 if stale)
 set -eu
 cd "$(dirname "$0")/../.."
 out=compiler/src/front/stdsrc.tach
-tmp=$(mktemp)
-files="std iter io fmt convert clone alloc"
+# (next to the output: writable in a sandbox that only allows the tree, and mv is a rename)
+tmp=$(mktemp "$out.XXXXXX")
+files="std iter io fmt convert clone alloc values"
 # (sed, not awk: awks differ on backslashes in replacements.)
 lines() {
     sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/        buf_str(out, c"/' -e 's/$/\\n");/'

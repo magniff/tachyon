@@ -24,6 +24,12 @@ once each, with how many errors they answer:
     tachyonc check main.tach: 3 errors
     try: tachyonc fix --only unsafe main.tach   (3 of the errors)
 
+(0.18) `fix --suggested` first: the errors' exact fixes (a did-you-mean
+name, a conversion, a missing `use` or `pub`, ...), which the hook only
+names, never applies:
+
+    try: tachyonc fix --suggested main.tach   (2 of the errors: their exact fixes, one checked edit)
+
 and the compiler is run under the name the agent can type (`tachyonc` when
 it is the one on PATH, else its path from the event's directory), so the
 `try:` lines it prints run as they are.
@@ -60,7 +66,8 @@ it is the one on PATH, else its path from the event's directory), so the
   slower than SLOW_MS; turn-end.py runs what was left), its counts and
   the newly failing cases. TACHYON_CHECK_TESTS=0 leaves them out.
 - The hint `unfamiliar-construct` of hints.txt, once a session, when the
-  same error is made twice or an error's help names the guide.
+  same error is made twice or an error's help names the guide
+  (TACHYON_HINTS=0: never).
 
 TACHYON_CHECK_HOOK=0 turns it off. Development tooling only.
 """
@@ -167,9 +174,13 @@ def root_of(path):
     return None
 
 
-def compiler_for(where, ran=None):
+def compiler_for(where, ran=None, root=None):
     """The tachyonc to check with: the one the agent ran (a path), the
-    override, the checkout's tools binary or build, the one on PATH."""
+    override, the checkout's tools binary or build, the one on PATH.
+    (0.17) For a program outside the compiler's own source (a test case,
+    an example), target/tachyonc when it is newer than target/tools/tachyonc:
+    a compiler just rebuilt from changed source checks the programs written
+    for that change (the tools binary, older, reports what was fixed)."""
     if ran and os.sep in ran:
         p = ran if os.path.isabs(ran) else os.path.join(where, ran)
         if os.access(p, os.X_OK):
@@ -179,8 +190,15 @@ def compiler_for(where, ran=None):
         return env
     top = checkout_root(where)
     if top:
-        for rel in ("target/tools/tachyonc", "target/tachyonc"):
-            p = os.path.join(top, rel)
+        tools, build = (os.path.join(top, rel) for rel in ("target/tools/tachyonc", "target/tachyonc"))
+        own = root and os.path.abspath(root).startswith(os.path.join(top, "compiler") + os.sep)
+        if root and not own and os.access(build, os.X_OK) and os.access(tools, os.X_OK):
+            try:
+                if os.path.getmtime(build) > os.path.getmtime(tools):
+                    return build
+            except OSError:
+                pass
+        for p in (tools, build):
             if os.access(p, os.X_OK):
                 return p
     return which("tachyonc")
@@ -246,17 +264,19 @@ def typed_name(compiler, cwd):
 
 
 FIX = re.compile(r"^\S*tachyonc\S* fix\b")
+SUGGESTED = re.compile(r" fix --suggested\b")
 
 
 def fix_commands(errors):
     """The `tachyonc fix ...` commands of the errors' try: lines, each with
-    how many errors name it, in order of first appearance."""
+    how many errors name it, in order of first appearance; (0.18) `fix
+    --suggested` (the errors' exact fixes) first."""
     seen = {}
     for d in errors:
         for t in d.get("try") or []:
             if FIX.match(t):
                 seen[t] = seen.get(t, 0) + 1
-    return list(seen.items())
+    return sorted(seen.items(), key=lambda kv: not SUGGESTED.search(kv[0]))
 
 
 def line_of(d, summarized=()):
@@ -279,8 +299,11 @@ def fix_lines(errors):
     head (with how many of the errors they answer), and the set of them."""
     n = len(errors)
     fixes = fix_commands(errors)
-    return ([f"try: {cmd}   ({'the error' if n == 1 else 'all of them' if k == n else f'{k} of the errors'})"
-             for cmd, k in fixes], {cmd for cmd, _ in fixes})
+    def which(cmd, k):
+        what = 'the error' if n == 1 else 'all of them' if k == n else f'{k} of the errors'
+        # (0.18) the hook applies nothing: the agent sees the fixes and runs them
+        return what + ": their exact fixes, one checked edit" if SUGGESTED.search(cmd) else what
+    return ([f"try: {cmd}   ({which(cmd, k)})" for cmd, k in fixes], {cmd for cmd, _ in fixes})
 
 
 def report(diags, root_shown, edited):
@@ -325,6 +348,24 @@ def shell_writes(command, cwd):
     return out
 
 
+REDIR = re.compile(r"^\d*(?:<<?<?|>>?|&>>?)$")
+
+
+def operands(words):
+    """words without redirections: `edit replace f < new.tach` reads
+    new.tach as its stdin, it is not the root (0.17 validation round: the
+    snippet was checked alone and its names reported as errors)."""
+    out, skip = [], False
+    for w in words:
+        if skip:
+            skip = False
+        elif REDIR.match(w):
+            skip = True
+        elif not re.match(r"^\d*(?:<|>|&>)", w):
+            out.append(w)
+    return out
+
+
 def trigger(event):
     """(file edited or None, root or None, compiler the agent ran or None,
     the directory the change was made from) when the event changed tachyon
@@ -354,8 +395,9 @@ def trigger(event):
                     root = words[i + 1]
                 elif w.startswith("--root="):
                     root = w[7:]
-            if root is None and words and words[-1].endswith(".tach") and "new-file" not in words:
-                root = words[-1]
+            ops = operands(words)
+            if root is None and ops and ops[-1].endswith(".tach") and "new-file" not in ops:
+                root = ops[-1]
             return (None, root, path or None, here)
         for path, here in shell_writes(command, cwd):
             if os.path.exists(path):
@@ -558,8 +600,10 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
             seen[k] = seen.get(k, 0) + 1
             if (seen[k] >= 2 or any("guide " in h for h in d.get("help") or [])) and \
                     "unfamiliar-construct" not in hinted:
-                hinted.append("unfamiliar-construct")
-                texts.append(hs.hint("unfamiliar-construct", TACHYONC=tachyonc_shown(compiler, run_dir)))
+                note = hs.hint("unfamiliar-construct", TACHYONC=tachyonc_shown(compiler, run_dir))
+                if note:  # ("" when TACHYON_HINTS=0)
+                    hinted.append("unfamiliar-construct")
+                    texts.append(note)
             new_keys.discard(k)
     rec = {"kind": "check-hook", "tool": event.get("tool_name") or event.get("hook_event_name"),
            "root": shown[-120:], "errors": len(errors),
@@ -620,7 +664,7 @@ def main():
         root = os.path.normpath(os.path.join(cwd, root))
     if ran and os.sep in ran and not os.path.isabs(ran):
         ran = os.path.join(cwd, ran)
-    compiler = compiler_for(cwd if not edited else os.path.dirname(os.path.abspath(edited)), ran)
+    compiler = compiler_for(cwd if not edited else os.path.dirname(os.path.abspath(edited)), ran, root)
     if not compiler:
         return 0
     st = hs.load(event)

@@ -88,7 +88,7 @@ goes. Indexing a slice with an `i32` works directly (any integer type
 indexes):
 
 ```tach
-fn find(self: *UnionFind, x: i64) -> i64 {
+fn find(self: &mut UnionFind, x: i64) -> i64 {
     let p = self.parent.as_slice();
     let mut x = x;
     while p[x] as i64 != x {

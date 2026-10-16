@@ -6,6 +6,7 @@ use crate::base::{
     BUFS, IntVec, OVERLAY, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
     buf_write_fd, intern, streq,
 };
+use crate::base::diag::{FIX_AT_FILE, FIX_AT_LINE, SUGGESTED};
 use crate::front::ambient::AMBIENT_GPA;
 use crate::front::ast::{KEEP_PARSED, NODES};
 use crate::front::generics::{TPL_NONE, template_of_key};
@@ -17,14 +18,16 @@ use crate::front::types::{
 };
 use crate::tools::edit::{TARGET, TARGET_NAME, edit_count};
 use crate::tools::edit::apply::{
-    STRICT_ALLOC, copy_rewritten, finish_edit, overlay_args, prepare_edit, set_command, write_round,
+    LEFT_OK, STRICT_ALLOC, copy_rewritten, finish_edit, overlay_args, prepare_edit, set_command,
+    write_round,
 };
 use crate::tools::edit::cli::take_edit_option;
-use crate::tools::fix::{missing_use_edits, pub_edits, unused_import_edits};
+use crate::tools::fix::{missing_use_edits, pub_edits, suggested_edits, unused_import_edits};
 use crate::tools::fiximports::{FIX_IMPORTS, fix_imports_edits};
 use crate::tools::fixstd015::std015_edits;
 use crate::tools::fixunsafe::{FIX_UNSAFE, WHOLE_BODIES, fix_unsafe_edits};
-use crate::tools::query::{c_slice, root_or_diag};
+use crate::tools::fixvalues::{VALUES_COUNTS, values_edits};
+use crate::tools::query::{c_slice, file_line, root_or_diag};
 use crate::tools::query::command_line::load_program;
 use crate::tools::query::defs::{mod_fqn, mod_fqn_text};
 use crate::tools::query::diagnostics::{
@@ -46,6 +49,12 @@ const F_REEXPORTS: i64 = 32;
 const F_STD015: i64 = 64;
 // (0.16: refactor_shape/alloc016.tach)
 const F_ALLOC016: i64 = 128;
+// (0.18: --suggested, `--only suggested`) the errors' exact fixes
+// (fix::suggested_edits), with the imports and pubs the errors ask for
+const F_SUGGESTED: i64 = 256;
+// (0.17: --values, fixvalues.tach)
+const F_VALUES: i64 = 512;
+const F_SUGGESTS: i64 = F_IMPORTS | F_PUB | F_SUGGESTED;
 const F_ALL: i64 = 15;
 
 // ---- Which module a missing import comes from (0.16) ----
@@ -313,6 +322,8 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
         let mut only_arg = if alias == F_IMPORTS { c"imports" }
             else if alias == F_UNSAFE { c"unsafe" } else { 0 as *u8 };
         let mut round = false;
+        let mut suggested = false;
+        let mut at = 0 as *u8;
         let mut root = 0 as *u8;
         let mut i = if alias != 0 { 1 } else { 2 };
         while i < argc {
@@ -324,6 +335,35 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
             if streq(a, c"--round") {
                 round = true;
                 i += 1;
+                continue;
+            }
+            if streq(a, c"--suggested") {
+                suggested = true;
+                i += 1;
+                continue;
+            }
+            if streq(a, c"--values") {
+                only = if only_arg == 0 as *u8 { F_VALUES } else { only | F_VALUES };
+                only_arg = c"values";
+                i += 1;
+                continue;
+            }
+            if streq(a, c"--at") && i + 1 < argc {
+                at = argv[i + 1];
+                let s = c_slice(at);
+                let mut line = 0;
+                let n = file_line(s, &line);
+                if n <= 0 || line <= 0 {
+                    let d = diag(c"error", c"fix.usage");
+                    buf_str(d, c"--at takes FILE:LINE, the line of an error\n");
+                    return 2;
+                }
+                let f = buf_new();
+                buf_bytes(f, s[0..n]);
+                buf_byte(f, 0);
+                FIX_AT_FILE = BUFS[f].data;
+                FIX_AT_LINE = line;
+                i += 2;
                 continue;
             }
             if streq(a, c"--tidy-edited") {
@@ -370,10 +410,12 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
                         else if word_is(w, c"tidy-imports") { F_TIDY }
                         else if word_is(w, c"reexports") { F_REEXPORTS }
                         else if word_is(w, c"std015") { F_STD015 }
-                        else if word_is(w, c"alloc016") { F_ALLOC016 } else { 0 };
+                        else if word_is(w, c"alloc016") { F_ALLOC016 }
+                        else if word_is(w, c"values") { F_VALUES }
+                        else if word_is(w, c"suggested") { F_SUGGESTS } else { 0 };
                     if bit == 0 {
                         let d = diag(c"error", c"fix.usage");
-                        buf_str(d, c"--only takes imports, unused, pub, unsafe, tidy-imports, reexports, std015 or alloc016, not '");
+                        buf_str(d, c"--only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015, alloc016 or values, not '");
                         buf_bytes(d, w);
                         buf_str(d, c"'\n");
                         return 2;
@@ -407,6 +449,16 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
             root = a;
             i += 1;
         }
+        if suggested {
+            only = if only_arg == 0 as *u8 { F_SUGGESTS } else { only | F_SUGGESTS };
+        }
+        if (only & F_SUGGESTED) != 0 {
+            LEFT_OK = true;
+        } else if at != 0 as *u8 {
+            let d = diag(c"error", c"fix.usage");
+            buf_str(d, c"--at is for --suggested: the fixes of the errors at a line\n");
+            return 2;
+        }
         ROOT_GIVEN = root;
         root = root_or_diag(root, c"fix", c_slice(c""), false);
         if root == 0 as *u8 {
@@ -426,8 +478,13 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
             STRICT_ALLOC = true;
         }
         if !load_program(root, TARGET) {
-            program_errors(c"error", root, true);
-            return 1;
+            // (0.18) a program that does not parse: its errors' exact
+            // fixes alone (a Rust label respelled)
+            if (only & F_SUGGESTED) == 0 || SUGGESTED.count == 0 || OPT_IN != 0 as *u8 {
+                program_errors(c"error", root, true);
+                return 1;
+            }
+            only = F_SUGGESTED;
         }
         if OPT_IN != 0 as *u8 && !resolve_in(c_slice(OPT_IN)) {
             let d = diag(c"error", c"fix.bad-in");
@@ -447,8 +504,10 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
         let tidied = if (only & F_TIDY) != 0 { tidy_import_edits() } else { 0 };
         let migrated = if (only & F_STD015) != 0 { std015_edits() } else { 0 };
         let explicit = if (only & F_ALLOC016) != 0 { alloc016_edits() } else { 0 };
+        let exact = if (only & F_SUGGESTED) != 0 { suggested_edits() } else { 0 };
+        let valued = if (only & F_VALUES) != 0 { values_edits() } else { 0 };
         let mut counts = [imports, wild, unused, public, wrapped, through, dropped, tidied,
-            migrated, explicit];
+            migrated, explicit, exact];
         if round {
             // (a later round, on the edited program: what it fixed, the
             // copies it rewrote)
@@ -457,7 +516,7 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
             }
             let out = buf_new();
             buf_str(out, c"count");
-            for k in 0..10 {
+            for k in 0..11 {
                 buf_byte(out, '\t');
                 buf_int(out, counts[k]);
             }
@@ -480,9 +539,10 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
             return status;
         }
         // More rounds, on the edited program: a fix may let the checker
-        // see more (the next unknown name of a statement).
-        for _ in 0..4 {
-            if !more_round(root, only_arg, &counts) {
+        // see more (the next unknown name of a statement). (--values: its
+        // own fixed point, one round)
+        for _ in 0..if only == F_VALUES { 0 } else { 4 } {
+            if !more_round(root, only_arg, suggested, at, &counts) {
                 break;
             }
         }
@@ -498,6 +558,18 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
         put_count(what, counts[7], c"untidy use line", c"untidy use lines");
         put_count(what, counts[8], c"call of 0.14's std", c"calls of 0.14's std");
         put_count(what, counts[9], c"allocation made explicit", c"allocations made explicit");
+        put_count(what, counts[10], c"suggested fix", c"suggested fixes");
+        if valued > 0 {
+            put_count(what, VALUES_COUNTS[0], c"parameter to &mut T", c"parameters to &mut T");
+            put_count(what, VALUES_COUNTS[1], c"parameter to &T", c"parameters to &T");
+            put_count(what, VALUES_COUNTS[2], c"slice parameter to &mut [T]",
+                c"slice parameters to &mut [T]");
+            put_count(what, VALUES_COUNTS[3], c"owned parameter to &T (only read)",
+                c"owned parameters to &T (only read)");
+            put_count(what, VALUES_COUNTS[4], c"argument", c"arguments");
+            put_count(what, VALUES_COUNTS[5], c"defer x.free() (dropped now)",
+                c"defer x.free()s (dropped now)");
+        }
         let status = finish_edit(buf_slice(what), root);
         if AMBIGUOUS || ALLOC016_LEFT > 0 { 1 } else { status }
     }
@@ -506,7 +578,7 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
 // A round of fix on the edited program (`PROG fix --round ... --overlay
 // FILE COPY... ROOT`): adds what it fixed to counts. Whether it fixed
 // anything.
-fn more_round(root: *u8, only_arg: *u8, counts: *[i64; 10]) -> bool {
+fn more_round(root: *u8, only_arg: *u8, suggested: bool, at: *u8, counts: *[i64; 11]) -> bool {
     unsafe {
         let mut args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         args.push(PROG as i64);
@@ -519,6 +591,13 @@ fn more_round(root: *u8, only_arg: *u8, counts: *[i64; 10]) -> bool {
         if OPT_IN != 0 as *u8 {
             args.push(c"--in" as i64);
             args.push(OPT_IN as i64);
+        }
+        if suggested {
+            args.push(c"--suggested" as i64);
+        }
+        if at != 0 as *u8 {
+            args.push(c"--at" as i64);
+            args.push(at as i64);
         }
         if TIDY_EDITED {
             args.push(c"--tidy-edited" as i64);
@@ -550,7 +629,7 @@ fn more_round(root: *u8, only_arg: *u8, counts: *[i64; 10]) -> bool {
             } else if line.len > 6 && line[0] == 'c' && line[5] == '\t' {
                 let mut k = 0;
                 let mut p = 6;
-                while p < line.len && k < 10 {
+                while p < line.len && k < 11 {
                     let mut n = 0;
                     while p < line.len && line[p] >= '0' && line[p] <= '9' {
                         n = n * 10 + (line[p] - '0') as i64;

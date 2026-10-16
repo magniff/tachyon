@@ -15,11 +15,14 @@ small queries.
 ## The loop
 
 1. Write the program; `tachyonc check` (the front end only: fast, every
-   error, one line each).
+   error, one line each). Before writing a construct you are unsure of,
+   `tachyonc guide --find WORDS` or `tachyonc guide TOPIC#SECTION`
+   prints the lines on it.
 2. Fix each error: `tachyonc query show FILE:LINE` prints the item at
    the error's position; `tachyonc edit patch` changes a few lines of it.
-3. `tachyonc fix` for the mechanical ones (missing `use` lines, unsafe
-   blocks, `pub`).
+3. `tachyonc fix --suggested` when errors have `try: tachyonc fix
+   --suggested main.tach` (0.18): their exact fixes, one checked edit,
+   then the errors left; `tachyonc fix` for unsafe blocks.
 4. Build and run: `tachyonc main.tach -o prog && ./prog`.
 
 ## The program
@@ -30,6 +33,31 @@ files are the modules it loads.
 
 ## Reading
 
+For an item you have not seen, ask `tachyonc query context NAME` first:
+one call gives its source, the signatures of what it calls and uses,
+and its callers (instead of `show`, then `def`, then `refs`):
+
+```text
+$ tachyonc query context parse_item
+// crate::parse_item  main.tach:5-9  effects: panic
+fn parse_item(sc: *Scanner) -> Option<Item> {
+    let name = sc.next_token()?;
+    ...
+}
+// calls (3)
+std::Scanner::next_token  <std>:2184:12  method  pub fn next_token(self: *Scanner) -> Option<[u8]>
+...
+// types (3)
+crate::Item  main.tach:3:8  struct  struct Item { name: [u8], qty: i64 }
+...
+// callers (1)
+main  main.tach:19:26  while let Some(it) = parse_item(&sc) {
+```
+
+(The fields are separated by TABs.) It stays within about 2,000 tokens
+(`--budget N`); a module's name gives its items and its most used
+bodies.
+
 | to | run |
 |---|---|
 | an item with what it calls, its types and callers | `tachyonc query context NAME` (`--budget N`) |
@@ -38,6 +66,7 @@ files are the modules it loads.
 | where it is defined, its signature | `tachyonc query def NAME` |
 | every use | `tachyonc query refs NAME` (`--count`, `--in FILE\|MODULE`; a local: `FN::x`) |
 | who calls a function; what it calls | `tachyonc query callers NAME`; `query callees FN` (`--transitive`) |
+| each local's kind, moves and views there (0.17) | `tachyonc query own main.tach:12:5` |
 | what a function may do: allocate, io, panic... (0.16) | `tachyonc query effects NAME\|MODULE` (`--why io`, `--has alloc(Gpa)`) |
 | a module's items, with signatures | `tachyonc query items MODULE`; every module: `query items` |
 | a module's `use` lines, header comment | `tachyonc query show MODULE::use` (`::header`) |
@@ -47,6 +76,7 @@ files are the modules it loads.
 | std's API, a std item | `tachyonc query items std`, `query show std::read_line` (any program) |
 | what a snippet does | `tachyonc try 'let v = [3, 1]; v[..].len'` prints `i64 = 2` |
 | the guide on some words | `tachyonc guide --find WORDS`, `guide TOPIC#SECTION`, `explain WORDS` |
+| items like one, to copy for a new one; recipes for adding an X (0.17) | `tachyonc query similar NAME`; `query examples KIND`; `tachyonc guide how` |
 
 NAME is `f`, `module::f`, `Type::method`, `Enum::Variant`,
 `Struct.field`, `<Type as Trait>::f` or `FILE:LINE`; several in one call;
@@ -73,18 +103,56 @@ an edit then `check`.
 | merge conflicts | `tachyonc query conflicts --show`, then `tachyonc edit resolve FILE:LINE --ours` (`--theirs`, `--both`, `< text`) |
 | rename anything, with every use | `tachyonc refactor rename PATH NEW` |
 | rename a local or parameter | `tachyonc refactor rename FILE:LINE:COL NEW` or `refactor rename FN::x NEW` (shadowing respected) |
-| a parameter, with every call | `tachyonc refactor signature FN --add 'x: i64 = 0'` (a default; `--fill-calls`: each call gets 0; `--remove`, `--rename-param`, `--reorder`, `--type`) |
-| a field, with every literal | `tachyonc refactor field STRUCT --add 'g: i64 = 0'` |
+| a parameter, with every call | `tachyonc refactor signature FN --add 'x: i64 = 0'` (a default; `--fill-calls`: each call gets 0; `--remove`, `--rename-param`, `--reorder`, `--type`; `--type v '&mut T'`: the calls' `&v` become `&mut v`) |
+| a field, with every literal | `tachyonc refactor field STRUCT --add 'g: i64 = 0'` (`--type g T --default EXPR`) |
 | a variant, with every match | `tachyonc refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match) |
-| move items to a module | `tachyonc refactor move PATH --to MODULE` |
+| move items to a module | `tachyonc refactor move PATH --to MODULE` (made when missing) |
 | an idiom everywhere, typed | `tachyonc rewrite 'old($a)' 'new($a)' --dry-run` |
 | imports, unused, pub, unsafe | `tachyonc fix` (`--only imports,unused,pub,unsafe`, `--dry-run`) |
+| `*T` and by-value parameters to `&T`/`&mut T`, with every call (0.17) | `tachyonc fix --values` (`--dry-run`) |
+| the errors' exact fixes (their `try: tachyonc fix --suggested`) | `tachyonc fix --suggested` (`--dry-run`, `--at FILE:LINE`) |
 
 Every edit is atomic: the edited program is checked first, and an edit
 that adds an error writes nothing and prints the errors, each tagged
 `[edited: PATH]` or `[in PATH]` (an item the edit did not change: change
 it in the same `edit apply`, or run the refactoring the `try:` line
 names). `--dry-run` prints the diff instead; `--no-check` writes anyway.
+
+## Testing
+
+`tachyonc test` builds the program when a source changed and runs its
+cases: `tests/NAME.in` (stdin; none: empty) with `tests/NAME.out` (the
+expected stdout), next to `main.tach`; `tests/NAME.exit` holds an exit
+status other than 0. It prints the counts first, then each failing case
+with a few lines of difference, within about 1,000 tokens:
+
+```text
+$ tachyonc test
+test main.tach: 4 passed, 1 failed (tests/)
+FAIL big: stdout differs at line 3 (10 lines expected, 9 printed)
+  - 42 apples
+  - 43 pears
+  + 41 apples
+  + 43 pears
+(outputs: .tachyonc/test/NAME.got, NAME.err)
+```
+
+`tachyonc test big small` runs the cases whose names contain a word;
+`--full` every failure in full; `--input FILE` (`-`: stdin) one run,
+its output and exit status; `--timeout S` per case (10). Output is
+compared with `\r\n` as `\n` and trailing whitespace at the end left
+out. In the tachyon tree, `tachyonc test FILTER` rebuilds
+`target/tachyonc` when the source is newer and runs `tests/run.sh
+FILTER`, summarized the same way.
+
+## Debugging
+
+A bug: `tachyonc guide debug`. Tests are built with `--trace`, so a crash
+or a hang prints its line and callers. `tachyonc probe FILE:LINE EXPR...
+--input FILE` prints values at a line without editing the source.
+`tachyonc reduce FILE --until 'CMD'` shrinks a failing input. In the
+tachyon tree, `tachyonc test FILTER` also runs each failure with
+`target/tools/tachyonc`, to tell new failures from old ones.
 
 ## Diagnostics
 
@@ -110,5 +178,6 @@ Exit status: 0 done, 1 refused or failed (nothing written), 2 usage.
 
 `-O0`, `-O1`, `-O2` (the default; all behave the same), `--target
 aarch64-macos|aarch64-linux|x86_64-linux|x86_64-macos`, `-g` (debug line
-tables), `--check-unsafe`, `--check-alloc` (0.16), `--emit-header`,
+tables), `--trace` (0.17: a failure prints its line and callers),
+`--check-unsafe`, `--check-alloc` (0.16), `--emit-header`,
 `--emit-imports`, `-I DIR`, `--version`. `tachyonc guide TOPIC` for the language.

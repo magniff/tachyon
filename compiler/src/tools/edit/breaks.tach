@@ -18,14 +18,13 @@
 // edit's diff (its hunks: old lines A..A+B are new lines C..C+D).
 
 use crate::base::{
-    FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice,
-    buf_str, buf_write_fd,
+    FILES, IntVec, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
+    buf_write_fd,
 };
-use crate::tools::edit::{ADDED, CH_FILE, CH_TEXT, DRY_RUN, NEW_PATH, REMOVED};
+use crate::tools::edit::{ADDED, CH_FILE, CH_TEXT, DRY_RUN, REMOVED};
 use crate::tools::edit::apply::try_again;
-use crate::tools::edit::diff::diff_texts;
+use crate::tools::edit::diff::{diff_texts, file_by_path};
 use crate::tools::edit::items::item_tail;
-use crate::tools::proc::same_bytes;
 use crate::tools::query::{c_slice, def_at_line};
 use crate::tools::query::defs::{
     DEFS, K_ENUM, K_FN, K_IMPL_METHOD, K_METHOD, K_STRUCT, K_TRAIT_FN, bytes_eq, find_in,
@@ -39,6 +38,10 @@ use crate::tools::query::show::text_start;
 // edit changed it, whether it is in text the edit wrote.
 static mut E_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut E_EDITED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// (0.17) Lines a command adds to edit.breaks's, before its `--no-check`
+// one (rewrite: the --where that fit), in a buffer; -1: none.
+pub static mut BREAK_HINTS: i64 = -1;
 
 // The new errors (lines, in buffers) of an edit: printed, tagged; then
 // `edit.breaks` and its `try:` lines (`refused`: nothing was written).
@@ -165,6 +168,9 @@ pub fn report_breaks(added: *IntVec, refused: bool) {
             put_root(out);
             try_end(out);
         }
+        if BREAK_HINTS >= 0 {
+            buf_bytes(diags(), buf_slice(BREAK_HINTS));
+        }
         try_again(c"--no-check");
     }
 }
@@ -207,40 +213,6 @@ fn changed_index(f: i64) -> i64 {
         for i in 0..CH_FILE.count {
             if CH_FILE.data[i] == f {
                 return i;
-            }
-        }
-        -1
-    }
-}
-
-// path without its leading `./`.
-fn plain_path(p: [u8]) -> [u8] {
-    let mut s = p;
-    while s.len >= 2 && s[0] == '.' && s[1] == '/' {
-        s = s[2..s.len];
-    }
-    s
-}
-
-// The file of path: an index into FILES, -2 for a file the edit makes,
-// -1 for neither.
-fn file_by_path(path: [u8]) -> i64 {
-    unsafe {
-        let p = plain_path(path);
-        for i in 0..CH_FILE.count {
-            let f = CH_FILE.data[i];
-            if same_bytes(file_text(f), p) {
-                return f;
-            }
-        }
-        for i in 0..NEW_PATH.count {
-            if same_bytes(plain_path(c_slice(NEW_PATH.data[i] as *u8)), p) {
-                return -2;
-            }
-        }
-        for f in 0..FILE_COUNT {
-            if FILES[f].path[0] != '<' && same_bytes(file_text(f), p) {
-                return f;
             }
         }
         -1
@@ -457,6 +429,29 @@ fn error_item(line: [u8], edited: *bool) -> i64 {
     let d = def_at_line(f, old);
     *edited = d >= 0 && touched(&h, d);
     d
+}
+
+// (0.18) Whether the error of short diagnostic line `line` is on a line
+// the edit wrote (`fix --suggested`: an error on no such line is one the
+// fixes let the checker reach, not one they made).
+pub fn on_changed_line(line: [u8]) -> bool {
+    let mut at = 0;
+    let f = error_place(line, &at);
+    if f == -2 {
+        return true;
+    }
+    if f < 0 {
+        return false;
+    }
+    let i = changed_index(f);
+    if i < 0 {
+        return false;
+    }
+    let mut h = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    hunks(i, &h);
+    let mut anchor = 0;
+    let mut insert = false;
+    old_line(&h, at, &anchor, &insert) < 0
 }
 
 // The definitions the edit changes (from its hunks), added to v.

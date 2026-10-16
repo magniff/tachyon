@@ -21,7 +21,7 @@ The code (0.12: in folders, see compiler/README.md): the middle end in
 | flag | pipeline |
 |---|---|
 | `-O0` | the 0.1 code generator (`gen.tach`), unchanged: stack-machine code straight from the AST |
-| `-O1` | lowering to SSA; per function, twice: SCCP, instruction combining, (the first time) scalar replacement of aggregates and constant tables, CFG simplification, GVN with memory forwarding and dead stores, dead code elimination, CFG simplification; linear-scan register allocation |
+| `-O1` | lowering to SSA; (0.17) the calls of small leaf functions inlined; per function, twice: SCCP, instruction combining, (the first time) scalar replacement of aggregates and constant tables, CFG simplification, GVN with memory forwarding and dead stores, dead code elimination, CFG simplification; linear-scan register allocation |
 | `-O2` (default) | `-O1`, then per function in call-graph order (callees first): tail recursion elimination, inlining, the loop optimizer (0.4: rotation, induction variables and unrolling, value ranges, strength reduction and unswitching, aggressive DCE) and loop-invariant code motion, each followed by the `-O1` pipeline again; functions left without callers are not emitted |
 
 `-O0` stays as an independent oracle: it shares only the front end with
@@ -39,7 +39,8 @@ every function after every pass (on stderr).
 A function is a control flow graph of basic blocks. Instructions compute
 typed scalar values in SSA form; memory is explicit.
 
-- **Values** are instruction ids (`INSTS`). Types are the checker's scalar
+- **Values** are instruction ids (`INSTS`), local to their function (0.17:
+  each function has its own tables, see "0.17: compile time"). Types are the checker's scalar
   types (`i8` ... `u64`, `f32`, `f64`, `bool`); pointers, function values
   and the addresses of compound values (structs, tuples, arrays) are `u64`.
 - **Integers are canonical**: kept sign- or zero-extended to 64 bits, as in
@@ -126,7 +127,10 @@ The pipeline (`optimize_program` in `opt.tach`) runs the cleanup on
 every function, then the `-O1` pipeline twice per function, then at `-O2`
 inlining and LICM in call-graph order, each followed by the `-O1`
 pipeline, and finally drops functions nobody calls (other than `main` and
-those whose address is taken).
+those whose address is taken). From 0.17 each function is then selected,
+allocated, emitted and freed on its own (`emit_ir_functions`), and at
+`-O1` its cleanup and scalar pipeline run there too: one function is
+optimized and emitted end to end (see "0.17: compile time").
 
 ## The back end
 
@@ -1696,3 +1700,339 @@ one branch for the exit), `opt_u32_ops` (w registers, no `mov wN, wN`,
 against -O0), `opt_bits` (cnt, clz, rbit; constants folded; -O0's
 bodies), `opt_vectorize_widen` (umlal for `out[j] += k * b[j]` and a dot
 product).
+
+## 0.17: compile time
+
+The roadmap's compile-speed track, part 1: a profile of the compiler
+compiling itself, the hot spots that were repeated work fixed, and the
+middle and back end restructured so that each function is optimized and
+emitted on its own, with instruction, block and slot ids local to it:
+the prerequisite for per-function arenas and for code generation on
+several threads (0.18).
+
+**Method.** `sample` (macOS) on the self-compile (`-c
+compiler/src/main.tach`) at each level, three runs, shares of
+`compile_program`'s samples (inclusive); instructions retired and peak
+RSS from `/usr/bin/time -l`; `--time-passes` with `clock()` replaced by
+instructions retired (a C file defining `clock` from
+`proc_pid_rusage`, linked into a build of the compiler: `tachyonc
+compiler/src/main.tach iclock.c -o icount`) for each phase's
+instructions, which a loaded machine does not blur. `same-output`
+against the compiler before each change proved every change but two
+(see below) left the output of 6984 compilations as it was.
+
+**The hot spots** (share of the self-compile before, at the level where
+it was largest, and after):
+
+| # | where | before | why | fix | after |
+|---|---|---|---|---|---|
+| 1 | `calls_returns_twice` from `should_inline` | 32% (-O2) | every candidate call scanned the caller and the callee, comparing each call's name with seven strings | the caller's answer once per `inline_calls` (it cannot change while it inlines), the callee's cached once its component is done (`FN_RT`) | 1.7% |
+| 2 | `layout_blocks` | 6.5% (-O2) | each loop header cleared every block's mark (quadratic), and the loop depths, which only the back end reads, were computed for every dominator computation | marks of the last walk cleared; `layout_order` for the middle end | 0.2% |
+| 3 | `dominates` in `analyze_loops` | 3.8% (-O2) | a walk up the dominator tree for every predecessor of every block | a predecessor earlier in reverse post-order is not dominated by the header | 0.1% |
+| 4 | `add_piece_defs`, `emit_call_pieces` | 11.8% (-O1) | the rest of the block scanned for every call's result pieces | only a call returning an aggregate has pieces | 0.2% |
+| 5 | `next_intersection` with fixed intervals | 10.8% (-O1) | every caller-saved register asked where the calls meet the interval, the same lists | registers grouped by identical fixed ranges, one answer per group and step (`fixed_intersection`) | 4.0% |
+| 6 | `ir_operand`, `ir_operand_count`, `Op::is_call` | 8.4% (-O1) | calls: the compiler spends its inlining budget before its passes' turn | `#[inline]`, and small leaves no longer charged to the program's budget | 0 |
+| 7 | `resolve_all` | 8.8% (-O2) | every operand of every instruction rewritten, replaced or not | only replaced operands written | 6.8% |
+| 8 | `__bzero` from `gvn_reset` | 3.6% (-O1) | the value numbering table cleared at the size of the largest function, for every function | sized per function | 0.3% |
+| 9 | program-wide tables | 5.2% (-O1, `number_values`) | one instruction table for the program (130 MB at -O2): a function's instructions scattered, scratch arrays sized by the program's slots | ids local to each function (below) | 0.2% |
+| 10 | `text_is` in the assembler | 10% (-O0 instructions) | `strlen` and `memcmp` against each word, for every operand and directive | byte by byte, first byte first | 0.1% |
+| 11 | the assembler's byte helpers | 7% (-O0 instructions) | `is_space`, `tchar` calls; `out32` as four `buf_byte`; lines found byte by byte | inline; one check for four bytes; `memchr` | |
+| 12 | `add_clobbers` | 1.6% (-O1) | 64 registers tested at every call | the clobbered list made once per function | 1.2% |
+| 13 | `IntVec::push` | 5.4% (-O2) | a call of `grow` for every element | stores directly when there is room | 3.8% |
+| 14 | `analyze_loops`, `compute_dominators` | 10.8% (-O2) | every loop pass, and canonicalization after each loop it changes, finds the loops and the dominators again | open (0.18: the analyses kept while the CFG has not changed, which needs the CFG's changes counted) | 8.3% |
+| 15 | assembling -O0's text | 3.8 of 6.4 G (-O0, phases) | -O0 writes 30 MB of assembly and reads it back | cheaper parsing (10, 11); open: direct encoding | 2.3 of 4.9 G |
+
+Also open: the value-range facts (`decide`, `narrow_by_facts`: a linear
+scan of the facts per query, 2.5% at -O2) and the front end's check
+(1.4 G instructions at every level), outside this track.
+
+Two changes change output, on purpose: small leaves (at most 6
+instructions, no calls) are no longer charged to the program's inlining
+budget (`INLINE_LEAF`; the cold-block and per-caller rules still apply):
+in the compiler the budget was spent (384k of 374k) before its own
+passes came, so `Op::is_call` stayed a call in its hottest loops; 94 of
+6984 compilations differ (larger std users in the suite, four examples,
+the compiler), bench/ does not; the compiler built with it is 3.6%
+faster at -O0 and 3.1% at -O1, and does 0.8% more work at -O2 (it
+inlines more of itself). And `--emit-ir`, `--emit-mir` and
+`--print-regalloc` print the ids, now each function's.
+
+**Function-local ids** (`middle/ir`). Each IR function has its own
+tables (`IRTables`: instructions, blocks, slots, the operand lists ARGS
+and ARGTY, the switch cases SWCASES and -g's INST_LOC), ids local to it
+(0 is "none" in each). The current function's tables are the statics
+every pass reads (`INSTS`, `BLOCKS`, ...), so the passes did not change:
+`ir_enter(fi)` switches (it replaced the `IRF = fi` every pass began
+with), `ir_view(g)` gives the inliner a callee's tables while the
+caller's are current (`inline_call` copies through them), `ir_shrink`
+gives back a function's unused room once it is lowered and once its
+component is optimized (tables start at 64 entries and double; that
+room was more than half of the IR), and `ir_free_func` frees a function
+after it is emitted. What read several functions at once is explicit:
+the inliner's cost model reads which arguments are constants in the
+caller, then the callee's parameters in its tables; interprocedural
+constant propagation records each call site with its caller and passes
+constants by value; the call graph, call counts, std's reachability,
+effects verification and profiles enter each function they read.
+egraph's scratch instruction, made once for the program, would have
+been another function's instruction: other functions use the free entry
+past their last (`ir_scratch`). `--verify-ir` checks that a verified
+function's tables are the current ones.
+
+**The pipeline** (`emit_ir_functions`). After the whole-program phases
+(at -O2: interprocedural constants, the call graph's components bottom
+up, dead functions), each function in order is selected, its uses
+counted, allocated, emitted and freed; at -O1 its cleanup and scalar
+pipeline run there too (`optimize_function`, `PER_FUNCTION`), so a
+function goes from lowered IR to machine code before the next one
+starts. `--time-passes` reports the IR's tables (lowered and optimized).
+
+**Ready for threads?** What a function's optimization and emission touch,
+besides its own tables:
+- *pass state*: about 440 statics in middle/, back/ and gen0/ (scratch
+  arrays and work lists of the passes, the loop forest, the value-range
+  facts, the register allocator's intervals, the emitter's frame and
+  peephole memory, the CODE buffer): per-function by use, shared by
+  storage; 0.18 moves them into a per-thread context with the current
+  tables;
+- *read from other functions*: callees' attributes (`FN_ATTRS`,
+  `FN_NOCAPTURE`, final once their component is done), sizes and flags
+  (`FN_SIZE`, `FN_RT`, `FN_LIVE`), and a callee's IR when it is inlined;
+  the inliner marks the callee's instructions (`aux`) as it copies them,
+  which two callers on two threads must not: the mapping belongs in the
+  caller's scratch;
+- *written for the program*: the inlining budget (`PROGRAM_SIZE`: the
+  decisions depend on the order functions are processed in), the
+  constant tables SROA makes (string ids, in order), the emitter's label
+  numbers (`LABEL_COUNT`), the assembly text (in order), the runtime
+  pieces it needs (`PANIC_USED`, `ENUM_PANICS`), debug information
+  (`DBG_FNS`) and statistics. For output identical whatever the thread
+  count, 0.18 emits each function into a buffer of its own with local
+  label numbers, rebased when the buffers are joined in order, and
+  registers constant data at that join.
+
+**Measured** (aarch64-macos, the compiler compiling itself, `-c`; wall
+time best of 5 alternating (load about 5), instructions retired, peak
+RSS; v0.15.0 and release-0.17 before this work on the same source;
+after: with 0.17's cheaper f-strings, below, merged):
+
+| | v0.15.0 | before | after |
+|---|---|---|---|
+| -O0 wall / instructions / RSS | 317 ms / 6.96 G / 284 MB | 313 ms / 7.02 G / 289 MB | 255 ms / 5.45 G / 254 MB |
+| -O1 | 910 ms / 13.93 G / 533 MB | 916 ms / 14.08 G / 543 MB | 676 ms / 10.90 G / 353 MB |
+| -O2 | 2745 ms / 49.50 G / 762 MB | 2656 ms / 46.02 G / 764 MB | 1677 ms / 28.05 G / 471 MB |
+| a 7-line std program, -O0 | 2.8 ms / 37 M | 3.1 ms / 43 M | 3.0 ms / 39 M |
+| the same, -O2 | 5.0 ms / 64 M | 5.9 ms / 79 M | 5.5 ms / 71 M |
+| the same with `println(f"sum {s}")`, -O2 | | 7.4 ms / 104 M | 6.4 ms / 87 M |
+
+The phases (`--time-passes` counting instructions, millions; before →
+after, before the f-string work was merged: its -O1 leaf inlining adds
+about 2% to -O1):
+
+| phase | -O0 | -O1 | -O2 |
+|---|---|---|---|
+| parse, check, effects | 1645 → 1646 | 1685 → 1681 | 1781 → 1683 |
+| lower to SSA | | 460 → 538 | 459 → 538 |
+| scalar pipeline | | 4158 → 3133 | 4164 → 3016 |
+| inlining (and its simplification) | | | 12745 → 4028 |
+| loop passes, LICM, promotion | | | 15341 → 10904 |
+| other -O2 phases | | | 991 → 892 |
+| instruction selection | | 687 → 486 | 922 → 674 |
+| register allocation and emission | 983 → 984 | 4362 → 3358 | 6603 → 5250 |
+| data and output (the assembler) | 3772 → 2258 | 1768 → 1131 | 2199 → 1384 |
+| total | 6400 → 4887 | 13121 → 10326 | 45204 → 28369 |
+
+Lowering costs 17% more: each function's tables are allocated, and
+shrunk once lowered.
+
+(The small program: `Vec::new_in(gpa)`, ten pushes, a sum, `print_int`,
+`println("")`; v0.15.0's is the same with `Vec::new()`. Of its
+instructions, 13.5 M are the process's start.)
+
+## 0.17: cheaper f-strings
+
+Until 0.17 every f-string was a closure in a `std::Interp` (0.15,
+[design/errors-formatting.md](design/errors-formatting.md)), handed to
+an instance of the generic function it was passed to: per f-string a
+closure function, its environment, an `Interp` type and its Display
+`fmt`, and an instance of `println` or `push_fmt` (and of every generic
+function in between), which -O0 and -O1 do not inline.
+
+**Written in place** (`front/check/interp.tach`, `direct_kind` and
+`direct_call`). An f-string passed straight to std's `print`,
+`println`, `eprint`, `eprintln`, `format_in` or `Buf::push_fmt` (outside
+std, without a turbofish) makes none of them: the checker makes the call
+a block that evaluates what the call evaluated, in its order (push_fmt's
+receiver, the holes left to right once, format_in's allocator), then
+runs the f-string's Fmt writes in place (`push_writes`, the closure's
+body as before):
+
+```
+println(f"n={n}")    =>  { let __f0 = n; { let mut __out = std::Fmt::to_fd(1);
+                            __out.byte('n'); __out.byte('='); __out.display(&__f0);
+                            __out.byte('\n'); __out.flush(); } }
+b.push_fmt(f"..")    =>  { let __r = &b; let __f0 = ..; { let mut __out = std::__buf_fmt(__r);
+                            loop { WRITES; if std::__buf_fmt_end(__r, &__out) { break; } } } }
+format_in(f"..", a)  =>  { let __f0 = ..; let __a = a; { let mut __b = std::Buf::new_in(__a);
+                            let mut __t = [0u8; 256]; let mut __out = std::__fmt_tmp(&__t);
+                            loop { WRITES; if std::__fmt_in_end(&__b, &__out, &__t) { break; } }
+                            __b } }
+```
+
+The retry loop is std's own (0.16): the writes run again when the text
+did not fit the Buf's room (or format_in's 256 bytes on the stack), the
+holes' values bound outside it. The call node becomes an `Interp` node
+whose `y` is the block (so the back ends, effects inference and every
+walk treat it as an f-string's); a copy of the call as written stays for
+`query refs`; `query type` shows the f-string's type as elsewhere; an
+effect's explanation names the call (`'println(f"..")' calls
+'std::println'`); `--check-alloc` sites are the call's. f-strings
+elsewhere (a variable, a function of the program taking `T: Display`,
+std's own) are as before.
+
+**-O1 inlines small leaf functions** (`middle/inline.tach`,
+`simplify_inlining_leaves`, -O1's scalar pipeline): the functions with
+no calls are simplified first; one of at most 6 instructions
+(`func_size`; 40 with `#[inline]`; never `#[inline(never)]` or
+`#[cold]`) is inlined into every caller, which is then simplified (when
+it is emitted, `optimize_with_leaves`: the leaves' IR is kept until the
+end); one nothing else keeps (its address not taken, no caller calling
+setjmp or the like, which inline nothing, not global) is not emitted.
+-O2 is unchanged (its output is identical). The size, measured
+(instructions retired at -O1; the compiler's -O1 compile of itself):
+
+| leaf size | -O1 compile | matmul | iterchain | wordcount | json |
+|---|---|---|---|---|---|
+| none (0.16) | 14.03 G | 1882 M | 49.1 G | 2150 M | 2206 M |
+| 4 | +0.3% | 1882 M | 32.7 G | 2150 M | 2206 M |
+| 5 | +1.0% | 745 M | - | 2150 M | 2206 M |
+| 6 | +2.0% | 745 M | 31.0 G | 1939 M | 2073 M |
+| 8 | +3.0% | 745 M | 31.0 G | 2023 M | 2073 M |
+| 10 | +4.6% | 745 M | 31.0 G | 2025 M | 2073 M |
+
+The leaves are bigger than their calls: the -O1 code of the compiler
+grows (1.5% more instructions at 10) and with it the time of every pass
+after inlining. Inlining small functions that call (Fmt's `display`,
+`byte`), bottom-up, cost 31% at 6; inlining leaves of more than 3
+instructions only in loops, 1.2% at 6 for fewer gains (json, iterchain).
+Neither is done.
+
+**Measured** (aarch64-macos, instructions retired, best of 9; the
+compiler built as bootstrap.sh builds it; "self" is the compile of
+0.17's compiler source as of this change, `-c`; this work alone, on
+0.16's pipeline: with the rest of 0.17's compile-time work see "0.17:
+compile time"):
+
+| | v0.15.0 | 0.16 (before) | 0.17 |
+|---|---|---|---|
+| self -O0 | 6.914 G | 6.968 G | 6.994 G |
+| self -O1 | 13.860 G | 14.005 G | 14.303 G |
+| self -O2 | 48.806 G | 45.375 G | 45.453 G |
+| small program -O0 / -O2 | 37.1 / 63.8 M | 43.0 / 78.9 M | 43.3 / 79.0 M |
+| the same, `println(f"sum {s}")` -O0 / -O2 | 39.1 / 80.0 M | 45.5 / 103.9 M | 45.3 / 101.7 M |
+| fmtloop run, -O1 / -O2 | | 934 / 657 M | 877 / 651 M |
+| fmtints run, -O1 / -O2 | | 825 / 657 M | 813 / 657 M |
+
+(v0.15.0's small programs are its own spelling, `Vec::new()`; the run
+time of instructions retired varies by about 0.5% from run to run.) The
+compiler's own f-strings (144) go through its own generic functions
+(`buf_fmt`, `err_fmt`, `err_help_fmt`), so they keep the Interp
+lowering: written as `(*fmt_scratch()).push_fmt(f"..")` at each call
+site, the self-compile takes 1.0% fewer instructions at -O0 and -O1
+(measured on a copy). The small program's gap to v0.15.0 is std's
+(0.16's allocators), not its f-strings.
+
+Tests: `fmt_direct` and `fmt_direct_o0` (every form, the order of the
+holes, specs, Debug, pointer holes, a push_fmt and a format_in over 256
+bytes that write twice), `fmt_direct_ir` (no closure, Interp or
+instance at -O0), `fmt_direct_err`, `checkalloc_fmt_direct`,
+`query/fstring017` (type, refs, effects), `opt_leaf_o1`.
+
+## 0.17: value semantics in the optimizer
+
+docs/design/value-semantics.md §4, "Optimizer work for zero cost" (task
+T5). What the own pass guarantees under `--values=error` becomes facts
+for the optimizer. `error` is the default since the migration (T7);
+under the opt-outs `report`, `warn` and `off` the facts are unsound
+(`sweep(sa, sa)`), so nothing changes there.
+
+**Reference parameters** (middle/gvn.tach, "Reference parameters"). The
+facts come from the parameter types, and only when the own pass ran in
+error mode (`noalias_active`: `OWN_MODE == MODE_ERROR`; that mode stops
+the compilation at its first error):
+
+- a `&mut T` or `&mut [T]` parameter (exclusive) shares no memory with
+  another reference parameter or a static (`params_disjoint`, in
+  `may_alias`: gvn, licm, slp and the vectorizer get it);
+- a `&T` or `[T]` parameter (shared) is the same when the function writes
+  through it nowhere (a write through `[T]` is `own.readonly`'s; until
+  that is checked, such a parameter is left raw);
+- a reference parameter the function passes to no call and writes
+  nowhere is not written by its calls (`param_frozen`, in
+  `call_may_write`): its loads stay valid across calls;
+- legacy `*T` parameters stay raw: a raw pointer passed to one is not a
+  tracked loan. So do the parameters of exported functions and of
+  functions with C's convention (their callers are not checked).
+- the vectorizer emits no run-time overlap test between the groups of two
+  such parameters (vectorize/checks.tach, `needs_test`); fewer pairs
+  also keep a loop under VEC_MAX_OVERLAPS and lower its cost.
+
+*Inlining.* The facts are about a function's parameters, which inlining
+removes. A function is optimized before it is inlined, so its vector
+loops and hoisted loads keep what the facts gave; the exception was a
+`#[inline]` function, whose loop passes wait for its callers
+(`inlined_everywhere`). One whose reference parameters give facts (an
+exclusive one and another, `has_ref_facts`) now runs them first. Noalias
+scopes on the inlined body (per-instruction tags, so that the caller's
+own passes keep the facts) are left for later.
+
+`--no-noalias` turns the facts off; `--vec-stats` prints the vector loops
+made, the overlap tests emitted and those the facts dropped.
+
+**Measured** (aarch64-macos, `--values=error` against `--values=error
+--no-noalias`, bench/ programs migrated to `&mut [T]`/`[T]` parameters
+by hand; times are the best of 21 interleaved runs on a machine at load
+about 30, so a few percent is noise):
+
+| program | overlap tests | assembly lines | -O2 time |
+|---|---|---|---|
+| stencil (`sweep(src: [f64], dst: &mut [f64])`) | 4 → 0 | 345 → 282 | 13.2 → 13.9 ms (noise; the vector loop is unrolled twice as far) |
+| matmul (`multiply(a: [f64], b: [f64], c: &mut [f64])`) | 2 → 0 | 263 → 209 | 23.8 → 25.0 ms (noise) |
+| sort (std's `sort(s: [T])` writes through `[T]` until T4) | none | identical | 75.3 → 75.2 ms |
+| 8 streams, 3 written (18 pairs, over the limit of 16) | not vectorized → vectorized, 18 dropped | | 25.1 → 12.2 ms (**2.06×**) |
+
+As the prototype found (value-semantics.md §8.5), the overlap tests run
+once per outer iteration, so bench/ does not move; the facts pay in
+kernels with many streams and short trip counts.
+
+**Moves** (middle/copies.tach). Under `--values=error`, `let w = v` of an
+owned local is a move: the lowering notes its copy (`note_move_copies`,
+lower_let). The own pass guarantees v is not read before it is bound
+again, and in a loop it must be bound again before the next move; with
+every other use of v before the copy (as copy elision requires), v is
+written whole in each iteration before it is moved. So copy elision,
+which keeps away from copies in loops, elides a move in a loop too.
+Moving an argument without its copy at the call (§4's "Passing") is left
+for later: it needs the moves enforced (T1).
+
+**NRVO** (middle/copies.tach, `elide_result_copy`). A function returning
+a compound value through the result pointer, whose every return copies
+one local slot there (and nothing else touches the result), builds the
+local in the result: the copies go. The caller's result is a fresh slot
+(lower/calls.tach), which nothing else the function sees reaches. Only
+for copies over INLINE_COPY_MAX bytes (memcpy calls): smaller locals are
+scalar replacement's, which the result's memory would stop. A copy must
+end its returning block, so that a defer after it cannot reach the
+result. This does not depend on the own pass.
+
+**Drops.** Drop glue and std's `drop` impls are `#[inline]` (T1, T4), so
+`should_inline` inlines them everywhere, in cold blocks too; Gpa's free
+inlines to `free`, which heap_to_stack keeps working on.
+
+Tests: `opt_noalias_refs` (loads of a `&T` kept across a call and a store
+through a `&mut T`; a vector loop over `[f64]`/`&mut [f64]` with no
+overlap test and no scalar loop), `opt_noalias_gated` (overlapping slices
+and a `&T` written through a raw pointer, without `--values=error`: the
+test stays and the results are right), `opt_copy_move` (a move elided in
+a loop), `opt_nrvo` (the returned local built in the result; not with two
+locals; a defer after the return value).

@@ -18,7 +18,7 @@
 #   compiles    every program of the corpus (tests/run, examples, bench,
 #               compiler/src) compiled at -O2 from the tree and from the
 #               copy: the same assembly, exit status and messages (their
-#               positions aside)
+#               positions and the compiler's path aside)
 #   same-output the compiler built from the copy's compiler/src: the same
 #               object as the one built from the tree's, and `same-output`
 #               against it: identical
@@ -106,8 +106,12 @@ compile_one() { # <n> <program>
     echo $? >"$d/a.rc"
     "$COMPILER" --diagnostics=human -O2 -S "$COPY/$2" -o "$d/b.s" >"$d/b.out" 2>&1
     echo $? >"$d/b.rc"
-    sed -e "s|$ROOT/||g" -e 's|line [0-9]*, column [0-9]*|POS|g' "$d/a.out" >"$d/a.msg"
-    sed -e "s|$COPY/||g" -e 's|line [0-9]*, column [0-9]*|POS|g' "$d/b.out" >"$d/b.msg"
+    # (0.17: try: lines start with the compiler as it was run, and name
+    # positions as FILE:LINE and `the arm at line N`)
+    sed -e "s|$COMPILER|tachyonc|g" -e "s|$ROOT/||g" -e 's|line [0-9]*, column [0-9]*|POS|g' \
+        -e 's|\.tach:[0-9][0-9]*|.tach:N|g' -e 's|at line [0-9]*|at line N|g' "$d/a.out" >"$d/a.msg"
+    sed -e "s|$COMPILER|tachyonc|g" -e "s|$COPY/||g" -e 's|line [0-9]*, column [0-9]*|POS|g' \
+        -e 's|\.tach:[0-9][0-9]*|.tach:N|g' -e 's|at line [0-9]*|at line N|g' "$d/b.out" >"$d/b.msg"
     if cmp -s "$d/a.rc" "$d/b.rc" && cmp -s "$d/a.msg" "$d/b.msg" \
         && { [ ! -f "$d/a.s" ] || cmp -s "$d/a.s" "$d/b.s"; }; then
         echo same >"$d/result"

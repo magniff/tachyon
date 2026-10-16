@@ -33,7 +33,8 @@ use crate::front::assoc::{
     assoc_constraints_hold, collect_impl_assoc, collect_trait_assoc, constraint_error,
 };
 use crate::front::ast::{
-    FN_LAZY, FN_SIG_FAILED, NODES, NodeKind, child, list_begin, list_end, list_push, new_node,
+    FN_DEFAULT_COPY, FN_LAZY, FN_SIG_FAILED, NODES, NodeKind, child, list_begin, list_end,
+    list_push, new_node,
 };
 use crate::front::check::{
     CHECK_UNCHECKED, PROGRAM, SELF_TYPE, TRY_RESULT, Try, attempt, has_error_type, pop_scope,
@@ -49,7 +50,7 @@ use crate::front::convert::{
     same_trait_args, trait_param_count,
 };
 use crate::front::derive::derive_conflict_help;
-use crate::front::derive::intrinsic::{is_plain, tuple_implements, tuple_operator};
+use crate::front::derive::intrinsic::{copy_aggregate, is_plain, tuple_implements, tuple_operator};
 use crate::front::effects::check::note_effect_bound;
 use crate::front::generics::{
     CUR_INST, TPL_NONE, env_enter, env_leave, instance_of, instance_targs, mangle_type,
@@ -57,10 +58,11 @@ use crate::front::generics::{
 use crate::front::generics::instantiate::clone_node;
 use crate::front::lexer::{SUF_NONE, Tok};
 use crate::front::modules::{CUR_MOD, STD_MODULE, module_of, qualify};
+use crate::front::own::kinds::is_plain_type;
 use crate::front::patterns::check_pattern;
 use crate::front::types::{
     FNS, FN_COUNT, TLISTS, TSCRATCH, TYPES, TY_BOOL, TY_ERROR, TY_NEVER, TY_UNIT, TyKind, err_type,
-    fn_param, is_fieldless_enum, is_numeric, is_pointer, make_type,
+    fn_param, is_fieldless_enum, is_numeric, is_pointer, is_ref, make_type,
 };
 
 // (0.15: params, the Generics node of a generic trait's type parameters,
@@ -378,7 +380,7 @@ pub fn collect_impl(node: i64) {
             if impl_is_generic(node) {
                 NODES[f].g = merged_generics(NODES[node].g, NODES[f].g);
             }
-            NODES[f].p |= 1;
+            NODES[f].p |= 1 | FN_DEFAULT_COPY;
             // (0.14: checked only when used, ensure_checked; `sum` is no
             // error for an iterator of slices that never sums)
             if NODES[f].g == 0 {
@@ -438,7 +440,16 @@ pub fn check_impl_signatures() {
                 && ((NODES[decl].p & 64) == (NODES[FNS[f].node].p & 64));
             if same {
                 for k in 0..count {
-                    if TSCRATCH.data[mark + k] != fn_param(f, k) {
+                    let tt = TSCRATCH.data[mark + k];
+                    let it = fn_param(f, k);
+                    if tt != it && is_ref(tt) && it > 0 && TYPES[it].kind == TyKind::Ptr
+                        && TYPES[it].b == 0 && TYPES[it].a == TYPES[tt].a {
+                        // (0.17: an impl's legacy `*T` where the trait has
+                        // `&T` or `&mut T`, `fn cmp(self: *P, other: *P)` for
+                        // Ord's `&Self`: it is the trait's, and its body is
+                        // checked so)
+                        TLISTS.data[FNS[f].params + k] = tt;
+                    } else if tt != it {
                         same = false;
                     }
                 }
@@ -576,8 +587,13 @@ fn intrinsic(tr: i64, t: i64) -> bool {
         if tr == std_trait(c"Hash") {
             return tuple_implements(tr, t);
         }
+        // (0.17: `T: Copy` holds for plain types, front/own/kinds.tach)
+        if tr == std_trait(c"Copy") {
+            return is_plain_type(t);
+        }
         if tr == std_trait(c"Clone") {
-            return is_plain(t) || tuple_implements(tr, t);
+            // (0.17: what owns nothing, structs too, clones by copying)
+            return is_plain(t) || copy_aggregate(t) || tuple_implements(tr, t);
         }
         false
     }
@@ -857,8 +873,13 @@ pub fn operator_call(n: i64, t: i64) -> i64 {
     unsafe {
         let op = NODES[n].op;
         let pos = NODES[n].start;
-        let l = intern_c(c"==l");
-        let r = intern_c(c"==r");
+        // (0.17: an arithmetic operator's operands move into its by-value
+        // `add(self, other)`: `=+` lets move, own/walk.tach; a comparison's
+        // are read)
+        let arith = !(op == Tok::EqEq || op == Tok::BangEq || op == Tok::Lt || op == Tok::Gt
+            || op == Tok::LtEq || op == Tok::GtEq);
+        let l = if arith { intern_c(c"=+l") } else { intern_c(c"==l") };
+        let r = if arith { intern_c(c"=+r") } else { intern_c(c"==r") };
         let block = new_node(NodeKind::Block, NODES[n].start, NODES[n].end);
         let mark = list_begin();
         let let_l = op_let(l, NODES[n].b, pos);
@@ -912,7 +933,8 @@ pub fn operator_call(n: i64, t: i64) -> i64 {
 pub fn negation_call(n: i64, t: i64) -> i64 {
     unsafe {
         let pos = NODES[n].start;
-        let l = intern_c(c"==l");
+        // (0.17: the operand moves into `neg(self)`, as operator_call's)
+        let l = intern_c(c"=+l");
         let block = new_node(NodeKind::Block, NODES[n].start, NODES[n].end);
         let mark = list_begin();
         let let_l = op_let(l, NODES[n].b, pos);

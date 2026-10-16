@@ -2,7 +2,7 @@
 // the struct, its literals and its field accesses; and the member lookups
 // and renames refactor variant shares.
 
-use crate::base::{IntVec, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern};
+use crate::base::{IntVec, SRC, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern};
 use crate::front::ast::{NODES, NODE_COUNT, NodeKind, REPR_C};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
 use crate::front::types::{STRUCTS, TYPES, TyKind};
@@ -20,8 +20,9 @@ use crate::tools::refactor_shape::{
     orig_of, put_count, refs_of, replace_name, split_default, sym_text, take_args, text_buf,
     try_query_name, usage_error,
 };
+use crate::tools::refactor_shape::signature::with_argument;
 use crate::tools::rewrite::sort_by_start;
-use crate::tools::rewrite::parsed::{pa, pb, pc, pchild, pcount, pend, pstart};
+use crate::tools::rewrite::parsed::{pa, pb, pc, pchild, pcount, pend, pk, pstart};
 
 // ---- refactor field ----
 
@@ -152,7 +153,8 @@ fn field_inner(argc: i64, argv: **u8) -> i64 {
         let mut words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut opts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let example = c"STRUCT --add 'g: i64 = 0' --dry-run";
-        if !take_args(argc, argv, c"--add=1 --remove=1 --rename=2 --type=2", &root, &words, &opts) {
+        if !take_args(argc, argv, c"--add=1 --remove=1 --rename=2 --type=2 --default=1", &root,
+            &words, &opts) {
             return 2;
         }
         if words.count != 1 {
@@ -167,6 +169,11 @@ fn field_inner(argc: i64, argv: **u8) -> i64 {
             + (retype != 0 as *u8) as i64;
         if actions != 1 {
             return usage_error(c"one of --add, --remove, --rename, --type", example);
+        }
+        let default = opt(&opts, c"--default", false);
+        if default != 0 as *u8 && retype == 0 as *u8 {
+            return usage_error(c"--default goes with --type (the literals' new value)",
+                c"STRUCT --type f T --default EXPR");
         }
         let name = c_slice(words.data[0] as *u8);
         ROOT_GIVEN = root;
@@ -323,12 +330,39 @@ fn field_inner(argc: i64, argv: **u8) -> i64 {
             let ty = c_slice(opt(&opts, c"--type", true));
             let t = pb(pchild(s, k));
             edit_replace(pstart(t), pend(t), text_buf(ty));
+            // (0.17: --default EXPR, each literal's value of the field
+            // becomes EXPR, `$NAME` the old value)
+            let mut changed = 0;
+            if default != 0 as *u8 {
+                for i in 0..lits.count {
+                    let l = lits.data[i];
+                    for j in 0..pcount(l) {
+                        let fi = pchild(l, j);
+                        if pk(fi) != NodeKind::FieldInit || pa(fi) != fname {
+                            continue;
+                        }
+                        let v = pb(fi);
+                        let value = with_argument(c_slice(default), sym_text(fname),
+                            SRC[pstart(v)..pend(v)]);
+                        let init = buf_new();
+                        buf_bytes(init, sym_text(fname));
+                        buf_str(init, c": ");
+                        buf_bytes(init, buf_slice(value));
+                        edit_replace(pstart(fi), pend(fi), init);
+                        changed += 1;
+                    }
+                }
+            }
             buf_str(what, c"changed field ");
             buf_bytes(what, sym_text(fname));
             buf_str(what, c" to ");
             buf_bytes(what, ty);
             buf_str(what, c" in ");
             buf_bytes(what, fqn);
+            if default != 0 as *u8 {
+                buf_str(what, c", ");
+                put_count(what, changed, c"literal", c"literals");
+            }
         }
         if layout {
             let e = diag(c"warning", c"refactor.layout");

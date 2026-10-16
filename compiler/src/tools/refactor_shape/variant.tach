@@ -18,7 +18,7 @@ use crate::tools::fix::remove_use_name;
 use crate::tools::query::{QF_DEF, c_slice, file_line, file_named, resolve_name, root_or_diag};
 use crate::tools::query::defs::{DEFS, K_ENUM};
 use crate::tools::query::diagnostics::{
-    PROG, ROOT_GIVEN, TOOL, diag, put_root, put_word, try_end, write_diags,
+    PROG, ROOT_GIVEN, TOOL, diag, diags, put_cword, put_root, put_word, try_end, write_diags,
 };
 use crate::tools::query::positions::{enclosing, line_of, line_start, put_loc, put_path, token_at};
 use crate::tools::query::refs::{R_FLAGS, R_POS, put_short};
@@ -204,7 +204,8 @@ fn variant_inner(argc: i64, argv: **u8) -> i64 {
             let text = c_slice(add);
             let vname = leading_name(text);
             if vname < 0 {
-                return usage_error(c"--add takes the variant: 'X', 'X(T, ...)'", example);
+                return usage_error(c"--add takes the variant: 'X', 'X(T, ...)', 'X { a: T, ... }'",
+                    example);
             }
             if variant_named(e, vname) {
                 let x = diag(c"error", c"refactor.clash");
@@ -217,7 +218,10 @@ fn variant_inner(argc: i64, argv: **u8) -> i64 {
             // (its fields: the commas between its parentheses, plus one)
             let mut fields = 0;
             let open = find_byte(text, '(');
-            if open >= 0 {
+            // (0.17) `X { a: T }`: its arms match it as `X { .. }`
+            let brace = find_byte(text, '{');
+            let named = brace >= 0 && (open < 0 || brace < open);
+            if open >= 0 && !named {
                 fields = 1;
                 let mut depth = 0;
                 for i in open + 1..text.len {
@@ -288,7 +292,9 @@ fn variant_inner(argc: i64, argv: **u8) -> i64 {
                     buf_str(pat, c"::");
                 }
                 buf_bytes(pat, sym_text(vname));
-                if fields > 0 {
+                if named {
+                    buf_str(pat, c" { .. }");
+                } else if fields > 0 {
                     buf_byte(pat, '(');
                     for k in 0..fields {
                         buf_str(pat, if k > 0 { c", _" } else { c"_" });
@@ -542,12 +548,24 @@ fn put_site(out: i64, m: i64, ms: *IntVec) {
 fn non_exhaustive(fqn: [u8], text: [u8], missing: *IntVec, opts: *IntVec) -> i64 {
     unsafe {
         put_sites(missing);
+        // (0.17: one query showing them all)
+        let shows = diags();
+        buf_str(shows, c"try:");
+        put_cword(shows, PROG);
+        buf_str(shows, c" query show");
         for i in 0..(*missing).count {
-            if i == 2 {
-                break;
+            let at = buf_new();
+            put_loc(at, pstart((*missing).data[i]));
+            let s = buf_slice(at);
+            let mut e = s.len;
+            while e > 0 && s[e - 1] != ':' {
+                e -= 1;
             }
-            try_show_at(pstart((*missing).data[i]));
+            buf_byte(shows, ' ');
+            buf_bytes(shows, s[0..e - 1]);
         }
+        put_root(shows);
+        try_end(shows);
         let given = opt(opts, c"--arm-in", false) != 0 as *u8;
         if !given {
             let out = try_refactor(fqn);

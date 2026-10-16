@@ -77,7 +77,11 @@ pub fn push_map(out: &mut String, level: &Level, world: &World) {
     for i in 0..world.boxes.len() {
         let b = world.boxes[i];
         let k = cell_index(level, b);
-        cells[k] = if tile_at(level, b) == b'G' { b'*' } else { b'$' };
+        cells[k] = if tile_at(level, b) == b'G' {
+            b'*'
+        } else {
+            b'$'
+        };
     }
     cells[cell_index(level, world.robot)] = b'@';
     for r in 0..level.height {

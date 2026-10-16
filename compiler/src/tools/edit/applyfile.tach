@@ -26,6 +26,7 @@ use crate::tools::edit::{TARGET, edit_replace};
 use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit, set_command};
 use crate::tools::edit::cli::{item_edit, region_edit, source_only, take_edit_option};
 use crate::tools::edit::items::item_text;
+use crate::tools::edit::stdedit::{rerun_in_std_tree, rerun_wanted};
 use crate::tools::proc::{read_file_if, read_stdin};
 use crate::tools::query::{c_slice, ends_with_c, file_line, resolve_name, root_or_diag};
 use crate::tools::query::cache::cache_restore;
@@ -107,18 +108,76 @@ pub fn run_apply(argc: i64, argv: **u8) -> i64 {
             buf_int(summary, B_HOW.count);
             buf_str(summary, c" blocks: ");
         }
+        let mut skip = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        chain_blocks(&skip);
         for k in 0..B_HOW.count {
             if k > 0 {
                 buf_str(summary, c"; ");
             }
+            if skip.data[k] != 0 {
+                buf_str(summary, if B_HOW.data[k] == 'a' { c"inserted after " }
+                    else { c"inserted before " });
+                buf_bytes(summary, buf_slice(B_NAME.data[k]));
+                continue;
+            }
             if !apply_block(k, summary) {
-                return 1;
+                return if rerun_wanted() { rerun_in_std_tree(argc, argv) } else { 1 };
             }
             if B_HOW.data[k] != 'd' {
                 ADD_IMPORTS = true;
             }
         }
         apply_edit(buf_slice(summary), root)
+    }
+}
+
+// (0.17) Blocks `@@ new after|before X` where X is an item an earlier
+// block adds (not in the program yet): their text goes with that block's
+// (after or before it); skip[k] is 1 for them.
+fn chain_blocks(skip: *IntVec) {
+    unsafe {
+        let mut owner = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut orig = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..B_HOW.count {
+            skip.push(0);
+            owner.push(k);
+            orig.push(B_TEXT.data[k]);
+        }
+        for k in 0..B_HOW.count {
+            let how = B_HOW.data[k];
+            if how != 'a' && how != 'b' {
+                continue;
+            }
+            let name = buf_slice(B_NAME.data[k]);
+            let mut found = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            find_defs(name, false, &found);
+            if found.count > 0 {
+                continue;
+            }
+            let seg = last_segment(name);
+            for j in 0..k {
+                let hj = B_HOW.data[j];
+                if hj == 'd' || !defines(buf_slice(orig.data[j]), seg) {
+                    continue;
+                }
+                let o = owner.data[j];
+                let merged = buf_new();
+                let first = if how == 'a' { B_TEXT.data[o] } else { B_TEXT.data[k] };
+                let second = if how == 'a' { B_TEXT.data[k] } else { B_TEXT.data[o] };
+                let t = buf_slice(first);
+                let mut e = t.len;
+                while e > 0 && t[e - 1] == '\n' {
+                    e -= 1;
+                }
+                buf_bytes(merged, t[0..e]);
+                buf_str(merged, c"\n\n");
+                buf_bytes(merged, buf_slice(second));
+                B_TEXT.data[o] = merged;
+                owner.data[k] = o;
+                skip.data[k] = 1;
+                break;
+            }
+        }
     }
 }
 
@@ -347,6 +406,11 @@ fn apply_block(k: i64, summary: i64) -> bool {
         let d = matches.data[0];
         let f = crate::front::modules::file_of_pos(DEFS[d].start);
         if FILES[f].path[0] == '<' {
+            // (0.17: std, in the repository: run_apply runs again in its
+            // files; stdedit.tach)
+            if crate::tools::edit::stdedit::std_rerun(f) {
+                return false;
+            }
             let e = diag(c"error", c"edit.not-source");
             buf_bytes(e, crate::base::SYMS[DEFS[d].fqn].text);
             buf_str(e, c" is in ");

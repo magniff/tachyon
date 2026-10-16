@@ -6,7 +6,7 @@ one function at a time. `main.tach` stocks the shop and replays a day at
 the till.
 
 The session asks the compiler how the module's items depend on each
-other, lets it plan a split into files of at most 180 lines, applies the
+other, lets it plan a split into files of at most 170 lines, applies the
 plan in one edit, and checks that the program still prints the same
 receipts. Every command below is run by `tests/walkthrough/run.sh` on a
 fresh copy of this directory, and its output is checked against this
@@ -36,9 +36,9 @@ takings: 99.58
 command that shows the way out:
 
 ```console
-$ tachyonc lint --max-lines 180
-error lint.max-lines: shop.tach: 415 lines (at most 180)
-try: tachyonc query deps crate::shop --max-lines 180
+$ tachyonc lint --max-lines 170
+error lint.max-lines: shop.tach: 410 lines (at most 170)
+try: tachyonc query deps crate::shop --max-lines 170
 [exit 1]
 ```
 
@@ -50,8 +50,8 @@ $ tachyonc query items shop --comments | grep section
 7-84	section	Products and stock
 86-163	section	Carts
 165-240	section	Prices and discounts
-242-306	section	Receipts
-308-415	section	Commands
+242-302	section	Receipts
+304-410	section	Commands
 ```
 
 ## 2. What uses what
@@ -61,10 +61,10 @@ uses it (one line each), then groups of items that use each other most
 and fit the size. The groups alone:
 
 ```console
-$ tachyonc query deps shop --max-lines 180 | grep -v '^[A-Za-z_]*	'
-# crate::shop	shop.tach	361 lines	39 items
-group 1	166	Product Store new_store add_product find_sku product in_stock restock take_stock free_store print_stock Command number parse_command run
-group 2	151	Line Cart new_cart line_index add_to_cart remove_from_cart qty_of items_in clear_cart free_cart Total subtotal total money pad_to receipt_line print_receipt checkout
+$ tachyonc query deps shop --max-lines 170 | grep -v '^[A-Za-z_]*	'
+# crate::shop	shop.tach	356 lines	39 items
+group 1	164	Product Store new_store add_product find_sku product in_stock restock take_stock free_store print_stock Command number parse_command run
+group 2	148	Line Cart new_cart line_index add_to_cart remove_from_cart qty_of items_in clear_cart free_cart Total subtotal total money pad_to receipt_line print_receipt checkout
 group 3	44	TAX_PERMILLE Coupon parse_coupon discount round_div tax_on
 ```
 
@@ -86,19 +86,19 @@ lines share, with the reason on the line above. The part most used from
 outside stays in `shop` itself:
 
 ```console
-$ tachyonc refactor split shop --plan --max-lines 180
-# crate::shop	415 lines	5 parts of at most 180 lines
-# commands: banner '// ---- Commands ----': 4 of 4 items, 90 of 90 lines
+$ tachyonc refactor split shop --plan --max-lines 170
+# crate::shop	410 lines	5 parts of at most 170 lines
+# commands: banner '// ---- Commands ----': 4 of 4 items, 89 of 89 lines
 tachyonc refactor split crate::shop --into crate::shop::commands --items Command,number,parse_command,run
 # carts: banner '// ---- Carts ----': 10 of 12 items, 67 of 88 lines
 tachyonc refactor split crate::shop --into crate::shop::carts --items Line,Cart,new_cart,line_index,add_to_cart,remove_from_cart,qty_of,items_in,clear_cart,free_cart,subtotal,checkout
 # stays in crate::shop: the part most used from other modules
-# receipts: banner '// ---- Receipts ----': 4 of 6 items, 50 of 63 lines
+# receipts: banner '// ---- Receipts ----': 4 of 6 items, 47 of 60 lines
 tachyonc refactor split crate::shop --into crate::shop::receipts --items Total,total,money,pad_to,receipt_line,print_receipt
 # prices_discounts: banner '// ---- Prices and discounts ----': 6 of 6 items, 44 of 44 lines
 tachyonc refactor split crate::shop --into crate::shop::prices_discounts --items TAX_PERMILLE,Coupon,parse_coupon,discount,round_div,tax_on
 note refactor.plan: the same in one edit: --auto (other names: --names a,b)
-try: tachyonc refactor split crate::shop --auto --max-lines 180
+try: tachyonc refactor split crate::shop --auto --max-lines 170
 ```
 
 The plan is plain commands: run them one by one, edit the item lists
@@ -107,17 +107,17 @@ the parts other names, in the plan's order; `prices_discounts` becomes
 `pricing`:
 
 ```console
-$ tachyonc refactor split shop --auto --max-lines 180 --names commands,carts,receipts,pricing
-split crate::shop into 4 modules	6 files	+347 -323 lines
+$ tachyonc refactor split shop --auto --max-lines 170 --names commands,carts,receipts,pricing
+split crate::shop into 4 modules	6 files	+343 -319 lines
 $ tachyonc query stats
 105	12	shop/carts.tach
-100	11	shop/mod.tach
-100	4	shop/commands.tach
-77	6	shop/receipts.tach
+99	11	shop/mod.tach
+99	4	shop/commands.tach
+74	6	shop/receipts.tach
 54	6	shop/pricing.tach
-35	1	main.tach
-471	40	total
-$ tachyonc lint --max-lines 180 && echo every file fits
+34	1	main.tach
+465	40	total
+$ tachyonc lint --max-lines 170 && echo every file fits
 every file fits
 ```
 
@@ -143,14 +143,14 @@ $ tachyonc query items shop
 15	struct	pub struct Product
 23	struct	pub struct Store
 29	fn	pub fn new_store(gpa: Gpa) -> Store
-33	fn	pub fn add_product(st: *Store, sku: i64, name: [u8], price: i64, stock: i64)
-38	fn	pub fn find_sku(st: *Store, sku: i64) -> Option<i64>
-47	fn	pub fn product(st: *Store, sku: i64) -> Option<Product>
-54	fn	pub fn in_stock(st: *Store, sku: i64) -> i64
-62	fn	pub fn restock(st: *Store, sku: i64, n: i64) -> bool
-75	fn	fn take_stock(st: *Store, sku: i64, n: i64) -> i64
-88	fn	pub fn free_store(st: *Store)
-92	fn	pub fn print_stock(st: *Store, gpa: Gpa)
+33	fn	pub fn add_product(st: &mut Store, sku: i64, name: [u8], price: i64, stock: i64)
+38	fn	pub fn find_sku(st: &Store, sku: i64) -> Option<i64>
+47	fn	pub fn product(st: &Store, sku: i64) -> Option<Product>
+54	fn	pub fn in_stock(st: &Store, sku: i64) -> i64
+62	fn	pub fn restock(st: &mut Store, sku: i64, n: i64) -> bool
+75	fn	fn take_stock(st: &mut Store, sku: i64, n: i64) -> i64
+88	fn	pub fn free_store(st: &mut Store)
+92	fn	pub fn print_stock(st: &Store, gpa: Gpa)
 ```
 
 Code outside the module was changed too: `main.tach` imports from where
@@ -159,7 +159,7 @@ the items are now.
 ```console
 $ git diff main.tach
 diff --git a/main.tach b/main.tach
-index 72e1780..d1b7712 100644
+index 1c2053b..d8aade5 100644
 --- a/main.tach
 +++ b/main.tach
 @@ -2,7 +2,10 @@
@@ -193,7 +193,7 @@ The split was one edit: one `undo` puts `shop.tach` back whole.
 
 ```console
 $ tachyonc undo
-undid split crate::shop into 4 modules	6 files	+347 -323 lines
+undid split crate::shop into 4 modules	6 files	+343 -319 lines
 $ ls *.tach
 main.tach
 shop.tach

@@ -4,32 +4,37 @@
 // `#[inline]`, `#[cold]`).
 
 pub mod params;
+pub mod attrs;
 
-use crate::base::{intern, intern_c};
-use crate::base::diag::{err_begin, err_end, err_help, err_str, error_at};
-use crate::front::ambient::AMBIENT_TRY;
+use crate::base::{
+    FILES, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern_c, sym_text,
+};
+use crate::base::diag::{err_begin, err_end, err_help, err_help_fmt, err_str, err_try_fmt, error_at};
 use crate::front::ast::{
-    EFFECTS_DECL, EFFECTS_NO_ALLOC, EFFECTS_NO_IO, EFFECTS_NO_PANIC, EFFECTS_PURE, FN_AMBIENT,
-    FN_BODY_FAILED, FN_COLD, FN_EFFECT_DECL, FN_INLINE, FN_NO_INLINE, FN_UNSAFE, NODES, NodeKind,
-    REPR_C, REPR_INT, REPR_PACKED, REPR_UNION, SCRATCH, STRUCT_SCOPED, STRUCT_SEALED, child,
-    list_begin, list_end, list_push, new_node,
+    FN_BODY_FAILED, FN_EFFECT_DECL, FN_UNSAFE, NODES, NodeKind, REPR_C, REPR_INT, REPR_PACKED,
+    REPR_UNION, SCRATCH, STRUCT_SCOPED, STRUCT_SEALED, child, list_begin, list_end, list_push,
+    new_node,
 };
 use crate::front::check::name_error;
-use crate::front::lexer::{STRS, TOKS, Tok};
+use crate::front::lexer::{TOKS, Tok};
 use crate::front::lexer::Tok::{
     Arrow, As, Colon, ColonColon, Comma, Const, Enum, Eof, Eq, Extern, Fn, For, Gt, Hash, Impl,
     Import, Int, LBrace, LBracket, LParen, Lt, Mod, Mut, Plus, Pub, RBrace, RBracket, RParen,
     Reserved, Semi, Star, Static, Str, Struct, Trait, Type, Union, Unsafe, Use,
 };
+use crate::front::modules::file_of_pos;
 use crate::front::parser::{
     BODY_FAILED, P, UNDERSCORE, advance, at, cur, cur_start, eat, expect, expect_binding_name,
     expect_ident, prev_end, reserved_error, syntax_error, tok_kind,
 };
 use crate::front::parser::exprs::parse_expr;
 use crate::front::parser::foreign::parse_extern;
+use crate::front::parser::items::attrs::{
+    check_fn_attributes, parse_fn_attribute, parse_fn_attributes, take_effect_decls,
+};
 use crate::front::parser::items::params::parse_params;
 use crate::front::parser::stmts::parse_block;
-use crate::front::parser::types::{is_int_type_name, parse_bound, parse_effect_list, parse_type};
+use crate::front::parser::types::{is_int_type_name, parse_bound, parse_type};
 
 // One item (or the several items of an impl or extern block), pushed to
 // the program's list.
@@ -385,7 +390,7 @@ fn parse_generic_params(defaults: bool) -> i64 {
     }
 }
 
-// `enum E { A, B(T, ...), C = expr, ... }`
+// `enum E { A, B(T, ...), C { x: T, ... }, D = expr, ... }`
 fn parse_enum() -> i64 {
     unsafe {
         let start = cur_start();
@@ -399,10 +404,9 @@ fn parse_enum() -> i64 {
             let variant = new_node(NodeKind::Variant, cur_start(), 0);
             NODES[variant].a = expect_binding_name();
             if at(LBrace) {
-                error_at(cur_start(),
-                    c"struct-like enum variants are not supported yet; use a tuple variant");
-            }
-            if eat(LParen) {
+                // (0.17) `V { a: A, b: B }`
+                parse_variant_fields(variant);
+            } else if eat(LParen) {
                 NODES[variant].c = 1;
                 let types = list_begin();
                 while !at(RParen) && !at(Eof) {
@@ -427,6 +431,41 @@ fn parse_enum() -> i64 {
         expect(RBrace);
         NODES[n].end = prev_end();
         n
+    }
+}
+
+// (0.17) The fields of `V { a: A, b: B }`, after the variant's name: the
+// variant's list holds the types (as for `V(A, B)`, c = 1), its d a node
+// whose list holds a Field node per field (a: the name, b: 0).
+fn parse_variant_fields(variant: i64) {
+    unsafe {
+        let names = new_node(NodeKind::None, cur_start(), 0);
+        expect(LBrace);
+        let mark = list_begin();
+        while !at(RBrace) && !at(Eof) {
+            let field = new_node(NodeKind::Field, cur_start(), 0);
+            NODES[field].a = expect_binding_name();
+            NODES[field].end = prev_end();
+            expect(Colon);
+            // (the type, kept on the stack after its field until the end)
+            NODES[field].c = parse_type();
+            list_push(field);
+            if !eat(Comma) {
+                break;
+            }
+        }
+        list_end(names, mark);
+        expect(RBrace);
+        NODES[names].end = prev_end();
+        let types = list_begin();
+        for i in 0..NODES[names].count {
+            let field = child(names, i);
+            list_push(NODES[field].c);
+            NODES[field].c = 0;
+        }
+        list_end(variant, types);
+        NODES[variant].c = (NODES[names].count > 0) as i64;
+        NODES[variant].d = names;
     }
 }
 
@@ -560,136 +599,6 @@ fn parse_import(public: bool) {
     }
 }
 
-// The effect declarations parsed before the function being parsed (0.16):
-// the first EffectSet and the last (chained by b).
-static mut EFFECT_DECLS: i64 = 0;
-static mut EFFECT_DECLS_LAST: i64 = 0;
-
-// The text of an #[ambient("...")] before the function being parsed (-1:
-// none).
-static mut AMBIENT_PENDING: i64 = -1;
-
-// After `#[` and the name `name` (at pos): when it is an effect
-// declaration (0.16), parses it as an EffectSet (its arguments, for
-// `effects`), adds it to EFFECT_DECLS and returns true.
-pub fn parse_effect_attribute(name: i64, pos: i64) -> bool {
-    unsafe {
-        let form = if name == intern_c(c"effects") { EFFECTS_DECL }
-            else if name == intern_c(c"pure") { EFFECTS_PURE }
-            else if name == intern_c(c"no_alloc") { EFFECTS_NO_ALLOC }
-            else if name == intern_c(c"no_io") { EFFECTS_NO_IO }
-            else if name == intern_c(c"no_panic") { EFFECTS_NO_PANIC }
-            else { 0 };
-        if form == 0 {
-            return false;
-        }
-        let n = new_node(NodeKind::EffectSet, pos, prev_end());
-        NODES[n].c = form;
-        if form == EFFECTS_DECL {
-            parse_effect_list(n);
-        }
-        if EFFECT_DECLS == 0 {
-            EFFECT_DECLS = n;
-        } else {
-            NODES[EFFECT_DECLS_LAST].b = n;
-        }
-        EFFECT_DECLS_LAST = n;
-        true
-    }
-}
-
-// Gives function (or extern) node f the effect declarations parsed before
-// it (0.16): its z, and FN_EFFECT_DECL. Called with f = 0, drops them.
-pub fn take_effect_decls(f: i64) {
-    unsafe {
-        if f != 0 && EFFECT_DECLS != 0 {
-            NODES[f].z = EFFECT_DECLS;
-            NODES[f].p |= FN_EFFECT_DECL;
-        }
-        if f != 0 && AMBIENT_PENDING >= 0 {
-            AMBIENT_TRY.put(NODES[f].start + 1, AMBIENT_PENDING + 1);
-        }
-        EFFECT_DECLS = 0;
-        EFFECT_DECLS_LAST = 0;
-        AMBIENT_PENDING = -1;
-    }
-}
-
-// Whether effect declarations wait for their function (0.16).
-pub fn has_effect_decls() -> bool {
-    unsafe { EFFECT_DECLS != 0 }
-}
-
-// `#[inline]`, `#[inline(never)]` or `#[cold]` (0.6) after `#[` and the
-// name: its FN_ flag, or 0 when `name` is another attribute. (0.16) An
-// effect declaration, `#[effects(...)]`, `#[pure]`, `#[no_alloc]`,
-// `#[no_io]` or `#[no_panic]`: FN_EFFECT_DECL, its EffectSet added to
-// those take_effect_decls gives the function.
-fn parse_fn_attribute(name: i64, pos: i64) -> i64 {
-    unsafe {
-        if parse_effect_attribute(name, pos) {
-            return FN_EFFECT_DECL;
-        }
-        // (0.16: std's `#[ambient("Vec::new_in(gpa)")]`, front/ambient.tach)
-        if name == intern_c(c"ambient") {
-            expect(LParen);
-            if !at(Str) {
-                syntax_error(c"expected the text to write instead, as a string");
-            }
-            AMBIENT_PENDING = intern(STRS[TOKS[P].value as i64]);
-            advance();
-            expect(RParen);
-            return FN_AMBIENT;
-        }
-        if name == intern_c(c"cold") {
-            return FN_COLD;
-        }
-        if name != intern_c(c"inline") {
-            return 0;
-        }
-        if eat(LParen) {
-            let arg = expect_ident();
-            if arg != intern_c(c"never") {
-                name_error(pos, c"unknown inline option '", arg,
-                    c"' (expected #[inline] or #[inline(never)])");
-            }
-            expect(RParen);
-            return FN_NO_INLINE;
-        }
-        FN_INLINE
-    }
-}
-
-// The function attributes before a function in an impl block (0.6).
-fn parse_fn_attributes() -> i64 {
-    let mut flags = 0;
-    let start = cur_start();
-    take_effect_decls(0);
-    while at(Hash) {
-        let pos = cur_start();
-        advance();
-        expect(LBracket);
-        let name = expect_ident();
-        let flag = parse_fn_attribute(name, pos);
-        if flag == 0 {
-            unsafe {
-                name_error(pos, c"unknown attribute '", name,
-                    c"' before a function (expected inline, inline(never), cold, effects, pure, no_alloc, no_io or no_panic)");
-            }
-        }
-        flags |= flag;
-        expect(RBracket);
-    }
-    check_fn_attributes(flags, start);
-    flags
-}
-
-fn check_fn_attributes(flags: i64, pos: i64) {
-    if (flags & FN_INLINE) != 0 && (flags & FN_NO_INLINE) != 0 {
-        unsafe { error_at(pos, c"a function cannot be both #[inline] and #[inline(never)]"); }
-    }
-}
-
 // Attributes, then the item: `#[repr(...)]` before a struct, union or
 // enum; `#[derive(...)]` (0.15) before a struct or an enum; `#[inline]`, `#[inline(never)]`, `#[cold]` (0.6) before a function.
 // `pub` may come before the attributes or (0.6) after them.
@@ -745,7 +654,7 @@ fn parse_attributed_item(public: bool) -> i64 {
             }
             if name != intern_c(c"repr") {
                 name_error(TOKS[P - 1].start, c"unknown attribute '", name,
-                    c"' (expected repr, derive, sealed, scoped, inline, inline(never), cold, effects, pure, no_alloc, no_io or no_panic)");
+                    c"' (expected repr, derive, sealed, scoped, inline, inline(never), cold, effects, pure, no_alloc, no_io, no_panic, views or stores)");
             }
             repr = true;
             expect(LParen);

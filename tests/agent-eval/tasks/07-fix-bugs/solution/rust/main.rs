@@ -58,7 +58,12 @@ fn read_inventory(sc: &mut Scanner) -> Inventory {
         let price = sc.next_int();
         let stock = sc.next_int();
         let name = sc.next_word();
-        inv.add(Item { sku: sku, name: name, price: price, stock: stock });
+        inv.add(Item {
+            sku: sku,
+            name: name,
+            price: price,
+            stock: stock,
+        });
     }
     inv.sort_by_sku();
     inv
@@ -78,7 +83,11 @@ fn read_orders(sc: &mut Scanner) -> Vec<Order> {
             let qty = sc.next_int();
             lines.push(OrderLine { sku: sku, qty: qty });
         }
-        list.push(Order { customer: customer, tier: tier, lines: lines });
+        list.push(Order {
+            customer: customer,
+            tier: tier,
+            lines: lines,
+        });
     }
     list
 }

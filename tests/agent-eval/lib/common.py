@@ -20,7 +20,11 @@ PROGRAM_CONDS = TACH_CONDS + ("rust",)
 # (0.16) the compiler tasks' conditions: AGENTS.md with the tools table and
 # the hooks, or without them (lib/ctasks.py)
 COMPILER_CONDS = ("compiler-tools", "compiler-plain")
-ALL_CONDS = PROGRAM_CONDS + COMPILER_CONDS
+# (0.17) every base condition, in report order; a condition is
+# BASE[+hook][+test] (lib/conds.py)
+ALL_CONDS = ("bare", "guide", "tools", "both", "guide-core", "tools-core", "both-core",
+             "rust-pairs", "guide-mini", "guide-example", "rust", "compiler-tools",
+             "compiler-plain", "compiler-tools-core")
 KINDS = ("write", "fix", "extend", "refactor", "perf")
 
 TACH_BUILD = ["tachyonc", "main.tach", "-o", "prog"]
@@ -57,6 +61,50 @@ def private_paths():
 
 def lang_of(cond):
     return "rust" if cond == "rust" else "tach"
+
+
+def cond_key(cond):
+    """Report order of a condition name (base, then modifiers)."""
+    base, _, mods = cond.partition("+")
+    return (ALL_CONDS.index(base) if base in ALL_CONDS else 99, mods)
+
+
+# macOS mktemp without a template ignores $TMPDIR (and so does -t): it
+# makes the file in the per-user temp directory (/var/folders/...), which the
+# agent's sandbox does not let it write. The repository's scripts call it so
+# (compiler/std/embed.sh, compiler/guide/embed.sh, and tests/run.sh through
+# `embed.sh -c`), so every agent's bin directory has this shim: no template,
+# one in $TMPDIR (the sandbox's own temp directory inside Claude Code).
+MKTEMP_SHIM = r"""#!/bin/sh
+# (agent eval) mktemp in $TMPDIR: a template there when none is given, and
+# (0.17) for -t PREFIX, which macOS puts in the per-user temp directory
+# whatever $TMPDIR says (the sandbox forbids it); a template given as an
+# argument is used as it is.
+flags=""; prefix=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        -t) shift; prefix=$1 ;;
+        -*t) flags="$flags ${1%t}"; shift; prefix=$1 ;;
+        -t*) prefix=${1#-t} ;;
+        -*) flags="$flags $1" ;;
+        *) break ;;
+    esac
+    shift
+done
+if [ $# -gt 0 ]; then
+    exec /usr/bin/mktemp $flags "$@"
+fi
+exec /usr/bin/mktemp $flags "${TMPDIR:-/tmp}/${prefix:-tmp}.XXXXXXXXXX"
+"""
+
+
+def install_mktemp_shim(bin_dir):
+    p = os.path.join(bin_dir, "mktemp")
+    with open(p, "w") as fh:
+        fh.write(MKTEMP_SHIM)
+    os.chmod(p, 0o755)
+    return p
 
 
 def base_env(bin_dir):
@@ -297,15 +345,95 @@ def tail(b, n=2000):
 
 
 def install_hooks(ws_root):
-    """The agent hooks (tools/agent-hooks: check-after-edit.py, query-first.py
-    and the module they load) copied out of the repository, which the
-    agent's sandbox cannot read: {"check": path, "query": path}."""
+    """The agent hooks (tools/agent-hooks/: check-after-edit.py,
+    query-first.py, turn-end.py, the modules and files they load:
+    tachyonc_cmd.py, hookstate.py, hints.txt, settings-eval.json; every file
+    but the tests) and (0.17) lib/hook-tee.py
+    copied out of the repository, which the agent's sandbox cannot read:
+    {"check": path, "query": path, "tee": path, "dir": the copies}."""
     d = os.path.join(ws_root, "hooks")
     os.makedirs(d, exist_ok=True)
-    for f in ("check-after-edit.py", "query-first.py", "tachyonc_cmd.py"):
-        shutil.copyfile(os.path.join(HOOKS_DIR, f), os.path.join(d, f))
+    for f in sorted(os.listdir(HOOKS_DIR)):
+        # the scripts and what they read (hints.txt, settings), not their tests
+        if os.path.isfile(os.path.join(HOOKS_DIR, f)) and not f.startswith("test-"):
+            shutil.copyfile(os.path.join(HOOKS_DIR, f), os.path.join(d, f))
+    shutil.copyfile(os.path.join(EVAL_DIR, "lib", "hook-tee.py"), os.path.join(d, "hook-tee.py"))
     return {"check": os.path.join(d, "check-after-edit.py"),
-            "query": os.path.join(d, "query-first.py")}
+            "query": os.path.join(d, "query-first.py"),
+            "turn_end": os.path.join(d, "turn-end.py"),
+            "tee": os.path.join(d, "hook-tee.py"), "dir": d}
+
+
+_HOOK_PATH = re.compile(r"""(?:["']?\$\{?CLAUDE_PROJECT_DIR\}?["']?/)?(?:\./)?"""
+                        r"""tools/agent-hooks/([\w.-]+\.py)""")
+
+
+def eval_settings_hooks(path, hooks_dir, key, python="/usr/bin/python3 -I", mods=(), query=False):
+    """(0.17) The hooks of a condition in tools/agent-hooks/settings-eval.json
+    (the repository's hook settings for the eval: `conditions[key]`, e.g.
+    `hook+test`), each command's @HOOKS@ the copies' directory (hooks_dir,
+    lib/common.install_hooks) and @PYTHON@ `python`. None when the file
+    does not exist; an error when it lacks the condition or a file it lists
+    was not copied. (A file with a top-level `hooks`, the first draft's
+    form, is read with its tools/agent-hooks/ paths pointed at the copies.)
+    (E3, E5, E6) mods: the condition's modifiers of the file's `modifiers`
+    (+rewrite, +nohints, +note): their `add` conditions' hooks too, their
+    `env` in front of every command; query: the query-first hook from the
+    file's `query` condition too (instead of the harness's own entry), so
+    that it gets the modifiers' environment."""
+    if not os.path.isfile(path):
+        return None
+    with open(path) as fh:
+        data = json.load(fh)
+    if "conditions" not in data:
+        if mods:
+            raise SystemExit("%s has no `conditions` (modifiers %s need them)" % (path, ", ".join(mods)))
+        hooks_list = [data.get("hooks") or {}]
+        sub = lambda c: _HOOK_PATH.sub(lambda m: shlex_quote(os.path.join(hooks_dir, m.group(1))), c)
+    else:
+        known = data.get("modifiers") or {}
+        bad = [m for m in mods if m not in known]
+        if bad:
+            raise SystemExit("%s has no modifier %s (it has %s)"
+                             % (path, ", ".join(bad), ", ".join(sorted(known))))
+        keys = ([key] if key else []) + (["query"] if query else [])
+        for m in mods:
+            keys += [k for k in known[m].get("add") or [] if k not in keys]
+        for k in keys:
+            if k not in data["conditions"]:
+                raise SystemExit("%s has no condition %r (it has %s)"
+                                 % (path, k, ", ".join(sorted(data["conditions"]))))
+        missing = [f for f in data.get("files") or []
+                   if not os.path.isfile(os.path.join(hooks_dir, f))]
+        if missing:
+            raise SystemExit("hooks directory %s lacks %s (install_hooks)" % (hooks_dir,
+                                                                             ", ".join(missing)))
+        hooks_list = [data["conditions"][k] for k in keys]
+        env = {}
+        for m in mods:
+            env.update(known[m].get("env") or {})
+        prefix = "".join("%s=%s " % (k, shlex_quote(str(v))) for k, v in sorted(env.items()))
+        sub = lambda c: prefix + c.replace("@HOOKS@", shlex_quote(hooks_dir)).replace("@PYTHON@", python)
+    out = {}
+    for hooks in hooks_list:
+        for ev, entries in hooks.items():
+            new = out.setdefault(ev, [])
+            for e in entries:
+                e = dict(e)
+                hs = []
+                for h in e.get("hooks") or []:
+                    h = dict(h)
+                    if h.get("command"):
+                        h["command"] = sub(h["command"])
+                    hs.append(h)
+                e["hooks"] = hs
+                new.append(e)
+    return out
+
+
+def shlex_quote(s):
+    import shlex
+    return shlex.quote(s)
 
 
 def install_check_hook(ws_root):

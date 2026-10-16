@@ -24,7 +24,7 @@ struct Rng { state: u64 }
 impl Rng {
     fn new(seed: u64) -> Rng { Rng { state: seed | 1 } }
 
-    fn next(self: *Rng) -> u64 {
+    fn next(self: &mut Rng) -> u64 {
         let mut x = self.state;
         x ^= x >> 12;
         x ^= x << 25;
@@ -34,7 +34,7 @@ impl Rng {
     }
 
     // A value in lo..=hi.
-    fn range(self: *Rng, lo: i64, hi: i64) -> i64 {
+    fn range(self: &mut Rng, lo: i64, hi: i64) -> i64 {
         lo + ((self.next() >> 33) % ((hi - lo + 1) as u64)) as i64
     }
 }
@@ -79,11 +79,11 @@ struct MinHeap<T: Ord> { items: Vec<T> }
 impl<T: Ord> MinHeap<T> {
     fn new(gpa: Gpa) -> MinHeap<T> { MinHeap { items: Vec::new_in(gpa) } }
 
-    fn len(self: *MinHeap<T>) -> i64 { self.items.len() }
+    fn len(self: &MinHeap<T>) -> i64 { self.items.len() }
 
-    fn push(self: *MinHeap<T>, x: T) {
+    fn push(self: &mut MinHeap<T>, x: T) {
         self.items.push(x);
-        let s = self.items.as_slice();
+        let s = self.items.as_mut_slice();
         let mut i = s.len - 1;
         while i > 0 && x < s[(i - 1) / 2] {
             s[i] = s[(i - 1) / 2];
@@ -92,9 +92,9 @@ impl<T: Ord> MinHeap<T> {
         s[i] = x;
     }
 
-    fn pop(self: *MinHeap<T>) -> Option<T> {
+    fn pop(self: &mut MinHeap<T>) -> Option<T> {
         let last = self.items.pop()?;
-        let s = self.items.as_slice();
+        let s = self.items.as_mut_slice();
         if s.len == 0 { return Some(last); }
         let top = s[0];
         let mut i = 0;
@@ -110,7 +110,7 @@ impl<T: Ord> MinHeap<T> {
         Some(top)
     }
 
-    fn free(self: *MinHeap<T>) { self.items.free(); }
+    fn free(self: &mut MinHeap<T>) { self.items.free(); }
 }
 
 // A subtree in the heap. The derived Ord compares the weights, then the
@@ -125,7 +125,6 @@ struct Subtree { weight: i64, node: i64 }
 // `kids` holds each node's two children, (-1, -1) for a leaf.
 fn code_lengths(freq: [i64], gpa: Gpa) -> [i64; 256] {
     let mut kids = Vec::filled_in(256, (-1, -1), gpa);
-    defer kids.free();
     let mut heap: MinHeap<Subtree> = MinHeap::new(gpa);
     defer heap.free();
     for b in 0..256 {
@@ -145,7 +144,6 @@ fn code_lengths(freq: [i64], gpa: Gpa) -> [i64; 256] {
     }
     // The depths, walking down from the root with a stack.
     let mut stack: Vec<(i64, i64)> = Vec::new_in(gpa);
-    defer stack.free();
     stack.push((kids.len() - 1, 0));
     while let Some((node, depth)) = stack.pop() {
         let (left, right) = kids.get(node);
@@ -178,7 +176,6 @@ struct ByLength { len: i64, byte: i64 }
 impl Codebook {
     fn new(lengths: [i64; 256], gpa: Gpa) -> Result<Codebook, HuffError> {
         let mut order: Vec<ByLength> = Vec::new_in(gpa);
-        defer order.free();
         for b in 0..256 {
             if lengths[b] > 0 { order.push(ByLength { len: lengths[b], byte: b }); }
         }
@@ -200,9 +197,9 @@ impl Codebook {
     // The decoder's table, indexed by the next max_len bits of the
     // stream: each entry is (byte | length << 8). A code of length L
     // fills the 2^(max_len - L) entries that start with it.
-    fn decode_table(self: *Codebook, gpa: Gpa) -> Vec<u32> {
+    fn decode_table(self: &Codebook, gpa: Gpa) -> Vec<u32> {
         let mut table = Vec::filled_in(1 << self.max_len, 0u32, gpa);
-        let t = table.as_slice();
+        let t = table.as_mut_slice();
         for b in 0..256 {
             let len = self.len[b];
             if len == 0 { continue; }
@@ -214,7 +211,7 @@ impl Codebook {
         table
     }
 
-    fn code_text(self: *Codebook, b: u8, gpa: Gpa) -> std::Buf {
+    fn code_text(self: &Codebook, b: u8, gpa: Gpa) -> std::Buf {
         let mut s = std::Buf::new_in(gpa);
         for k in 0..self.len[b] {
             s.push(if (self.code[b] >> (self.len[b] - 1 - k)) & 1 == 1 { '1' } else { '0' });
@@ -228,7 +225,7 @@ impl Codebook {
 // Packs each byte's code into a bit stream, most significant bit first:
 // `acc` holds the bits not yet written (fewer than 8 between bytes), the
 // last byte is padded with zero bits.
-fn encode(text: [u8], book: *Codebook, gpa: Gpa) -> Vec<u8> {
+fn encode(text: [u8], book: &Codebook, gpa: Gpa) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity_in(text.len / 2, gpa);
     let mut acc = 0u64;
     let mut bits = 0;
@@ -248,9 +245,8 @@ fn encode(text: [u8], book: *Codebook, gpa: Gpa) -> Vec<u8> {
 // Decodes `count` bytes: keeps up to 64 bits of the stream in `acc`,
 // looks the next max_len of them up in the table, consumes the length
 // found there.
-fn decode(bits: [u8], count: i64, book: *Codebook, gpa: Gpa) -> Vec<u8> {
+fn decode(bits: [u8], count: i64, book: &Codebook, gpa: Gpa) -> Vec<u8> {
     let mut table = book.decode_table(gpa);
-    defer table.free();
     let t = table.as_slice();
     let max = book.max_len;
     let mask = (1u64 << max) - 1;
@@ -312,10 +308,8 @@ fn round_trip(text: [u8], gpa: Gpa, table: bool = false) -> Result<(), HuffError
     let book = Codebook::new(code_lengths(freq[..], gpa), gpa)?;
     let t1 = now_ns();
     let mut packed = encode(text, &book, gpa);
-    defer packed.free();
     let t2 = now_ns();
     let mut back = decode(packed.as_slice(), text.len, &book, gpa);
-    defer back.free();
     let t3 = now_ns();
 
     if table {
@@ -324,7 +318,6 @@ fn round_trip(text: [u8], gpa: Gpa, table: bool = false) -> Result<(), HuffError
             for b in 0..256 {
                 if book.len[b] != len { continue; }
                 let mut code = book.code_text(b as u8, gpa);
-                defer code.free();
                 let q = if b == ' ' { '\'' } else { ' ' }; // quote the space
                 println(f"{q:c}{b as u8:c}{q:c}  {freq[b]:>5}  {len:>4}  {code}");
             }
@@ -354,7 +347,6 @@ fn main(gpa: Gpa) -> Result<(), HuffError> {
     round_trip("this is an example of a huffman tree", gpa, table: true)?;
     println("");
     let mut text = generate_text(4 << 20, 2026, gpa);
-    defer text.free();
     println(f"{text.as_slice()[..60]:?}...");
     round_trip(text.as_slice(), gpa)?;
     Ok(())

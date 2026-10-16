@@ -8,7 +8,7 @@ use crate::base::diag::{
     ERR_HELP, RECOVER_DEPTH, err_begin, err_end, err_help, err_str, err_sym, recover_enter,
     recover_leave,
 };
-use crate::front::ast::{BLOCK_UNSAFE, FN_LAZY, FN_UNSAFE, NODES, child};
+use crate::front::ast::{BLOCK_UNSAFE, DEFER_IMPLICIT, FN_LAZY, FN_UNSAFE, NODES, NodeKind, child};
 use crate::front::ast::NodeKind::{Block, Defer, Ident, If, Let, Loop, PatTuple, Path, Range, While};
 use crate::front::check::{
     CUR_FN, DEFER_LOOP_BASE, ENV, LOCALS, LOCAL_COUNT, LOOP_BASE, LOOP_STACK, RETURN_TYPE, SCOPES,
@@ -21,13 +21,19 @@ use crate::front::check::check_mode::check_expr;
 use crate::front::check::iterate::check_for_iter;
 use crate::front::check::resolve::resolve_type;
 use crate::front::check::synth_mode::{is_context_literal, literal_takes_rhs_type, synth_expr};
-use crate::front::check::unsafety::{UNSAFE_DEPTH, WRAP_NODE, is_borrow_param};
+use crate::front::check::unsafety::{
+    UNSAFE_DEPTH, WRAP_NODE, is_borrow_param, pointee_is_param, written_param,
+};
 use crate::front::check::widen::{join_values, widens};
 use crate::front::closures::escape::check_scope_exit;
 use crate::front::closures::scoped::check_scope_instance;
 use crate::front::generics::{CUR_INST, TP_BASE, env_enter, env_leave, template_of_key};
+use crate::front::lexer::Tok;
 use crate::front::modules::CUR_MOD;
 use crate::front::modules::lookup::{B_ITEM, B_TVARIANT, binding_kind, binding_value, lookup_quiet};
+use crate::front::own::drops::{
+    after_stmt, after_tail, block_begin, block_end, check_implicit_defer, param_drops,
+};
 use crate::front::parser::UNDERSCORE;
 use crate::front::patterns::{check_irrefutable, check_pattern};
 use crate::front::traits::bounded_param_of_type;
@@ -62,6 +68,8 @@ pub fn check_function(item: i64) {
         let saved_fn = CUR_FN;
         let saved_base = LOOP_BASE;
         CUR_FN = f;
+        // (0.17: the own pass's record starts, front/own/fast.tach)
+        crate::front::own::fast::check_begin(f);
         LOOP_BASE = 0;
         LOOP_STACK.count = 0;
         DEFER_LOOP_BASE = -1;
@@ -76,6 +84,7 @@ pub fn check_function(item: i64) {
                     true);
                 LOCALS[NODES[param].x].borrow = is_borrow_param(param);
                 LOCALS[NODES[param].x].tparam = bounded_param_of_type(NODES[param].b);
+                LOCALS[NODES[param].x].twritten = written_param(NODES[param].b, -1);
             } else {
                 NODES[param].x = -1;
             }
@@ -83,6 +92,8 @@ pub fn check_function(item: i64) {
         UNSAFE_DEPTH = if (FNS[f].attrs & FN_UNSAFE) != 0 { 1 } else { 0 };
         WRAP_NODE = 0;
         let body = NODES[item].c;
+        // (0.17, T1: the by-value parameters' drops, front/own/drops)
+        param_drops(item, f);
         let body_ty = check_block(body, RETURN_TYPE);
         if body_ty != RETURN_TYPE && body_ty != TY_NEVER {
             err_begin(NODES[body].start);
@@ -97,6 +108,7 @@ pub fn check_function(item: i64) {
         }
         SELF_TYPE = 0;
         CUR_FN = saved_fn;
+        crate::front::own::fast::check_end();
         LOOP_BASE = saved_base;
         if FNS[f].tmpl != 0 {
             env_leave(saved_env);
@@ -117,6 +129,8 @@ pub fn check_block(block: i64, expected: i64) -> i64 {
         }
         let saved_wrap = WRAP_NODE;
         let mut diverges = false;
+        // (0.17, T1: the drops of its owned locals, front/own/drops)
+        let drops = block_begin(block);
         for i in 0..NODES[block].count {
             // A recovery point: after an error, on at the next statement. A
             // block with a statement that failed counts as diverging, which
@@ -128,6 +142,7 @@ pub fn check_block(block: i64, expected: i64) -> i64 {
             WRAP_NODE = stmt;
             if _setjmp(recover_enter()) == 0 {
                 result = check_stmt(stmt);
+                after_stmt(block, drops, i, stmt);
             } else {
                 restore_check_state(state);
                 poison_statement(stmt);
@@ -144,7 +159,9 @@ pub fn check_block(block: i64, expected: i64) -> i64 {
             WRAP_NODE = tail;
             ty = if expected != 0 { check_expr(tail, expected) } else { synth_expr(tail) };
             check_scope_exit(ty, locals, NODES[tail].start);
+            after_tail(block, drops);
         }
+        block_end(block, drops);
         WRAP_NODE = saved_wrap;
         if is_unsafe {
             UNSAFE_DEPTH -= 1;
@@ -185,7 +202,14 @@ fn check_stmt(stmt: i64) -> bool {
 fn check_defer(stmt: i64) -> bool {
     let saved = DEFER_LOOP_BASE;
     DEFER_LOOP_BASE = LOOP_STACK.count;
-    unsafe { synth_expr(NODES[stmt].a); }
+    unsafe {
+        if (NODES[stmt].p & DEFER_IMPLICIT) != 0 {
+            // (0.17, T1: a drop, front/own/drops)
+            check_implicit_defer(stmt);
+        } else {
+            synth_expr(NODES[stmt].a);
+        }
+    }
     DEFER_LOOP_BASE = saved;
     false
 }
@@ -204,6 +228,19 @@ fn check_let(stmt: i64) -> bool {
         }
         check_pattern(NODES[stmt].a, binding_ty);
         check_irrefutable(NODES[stmt].a, c"let");
+        // (0.17) `let p = &v;`: v, for an error indexing through p
+        let pat = NODES[stmt].a;
+        if NODES[pat].kind == NodeKind::PatBind && NODES[pat].b == 0
+            && NODES[init].kind == NodeKind::Unary && NODES[init].op == Tok::Amp {
+            LOCALS[NODES[pat].x].init = NODES[init].b;
+        }
+        // (0.17) `let p: *T = ..` or `let p = self.ptr;`: p points, as
+        // written, to a type parameter
+        if NODES[pat].kind == NodeKind::PatBind {
+            LOCALS[NODES[pat].x].twritten = if NODES[stmt].b != 0 {
+                written_param(NODES[stmt].b, -1)
+            } else if pointee_is_param(init) { 1 } else { 0 };
+        }
         actual == TY_NEVER
     }
 }

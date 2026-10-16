@@ -3,14 +3,14 @@
 // (literals, paths, struct literals, tuples, arrays) and the expressions
 // with blocks: `if`, `if let`, `match` and the loops.
 
-use crate::base::{buf_bytes, intern_c};
-use crate::base::diag::{ERR, err_begin, err_end, err_help, err_str, error_at};
+use crate::base::{buf_bytes, intern_c, sym_text};
+use crate::base::diag::{ERR, err_begin, err_end, err_help, err_str, err_try_fmt, error_at};
 use crate::front::ast::{
     ARM_NO_ELSE, ARM_SYNTHETIC, BLOCK_UNSAFE, CLOSURE_MOVE, FIELD_SHORTHAND, FMT_BIN, FMT_CHAR,
-    FMT_HEX, FMT_LEFT, FMT_RIGHT, FMT_UPPER, FMT_ZERO, NODES, NodeKind, SCRATCH, list_begin,
-    list_end, list_push, new_node,
+    FMT_HEX, FMT_LEFT, FMT_RIGHT, FMT_UPPER, FMT_ZERO, NODES, NODE_REF_MUT, NodeKind, SCRATCH,
+    list_begin, list_end, list_push, new_node,
 };
-use crate::front::lexer::{STRS, SUF_NONE, TOKS, Tok, is_digit};
+use crate::front::lexer::{SUF_NONE, TOKS, Tok, is_digit, str_at};
 use crate::front::lexer::Tok::{
     Amp, AmpAmp, AmpEq, Arrow, As, At, Bang, BangEq, Break, CStr, Caret, CaretEq, Char, Colon,
     ColonColon, Comma, Continue, Dot, DotDot, DotDotEq, Else, Eof, Eq, EqEq, False, FatArrow, Float,
@@ -195,15 +195,15 @@ fn parse_prefix() -> i64 {
         let start = cur_start();
         if kind == Minus || kind == Bang || kind == Tilde || kind == Star || kind == Amp {
             advance();
-            if kind == Amp && at(Mut) {
-                err_begin(cur_start());
-                err_str(c"expected expression, got 'mut'");
-                err_help(
-                    c"`&mut x` is `&x` in tachyon: one pointer type, `*T`, for `&T` and `&mut T`");
-                err_end();
-            }
+            // (0.17) `&mut x`: an exclusive reference (`&x`: a shared one;
+            // docs/design/value-semantics.md §2.3)
+            let mutable = kind == Amp && eat(Mut);
             let operand = parse_expr_bp(PREFIX_BP);
-            return make_unary(kind, operand, start);
+            let n = make_unary(kind, operand, start);
+            if mutable {
+                NODES[n].p |= NODE_REF_MUT;
+            }
+            return n;
         }
         if kind == AmpAmp {
             // `&&x` is `& &x`.
@@ -563,7 +563,7 @@ fn parse_fstring() -> i64 {
 fn fstring_text() {
     unsafe {
         let id = TOKS[P].value as i64;
-        if STRS[id].len > 0 {
+        if str_at(id).len > 0 {
             let s = new_node(NodeKind::Str, TOKS[P].start, TOKS[P].end);
             NODES[s].a = id;
             list_push(s);
@@ -580,7 +580,7 @@ fn parse_spec(hole: i64, spec: i64) {
         if spec < 0 {
             return;
         }
-        let s = STRS[spec];
+        let s = str_at(spec);
         let pos = TOKS[P].start + 1;
         let mut i = 0;
         let mut flags = 0;
@@ -682,7 +682,12 @@ fn parse_name_or_struct_literal() -> i64 {
             syntax_error(c"expected a name after '::'");
         }
         let last = SCRATCH.data[SCRATCH.count - 1];
-        if !NO_STRUCT && at(LBrace) {
+        // (0.17) In a condition, `Name { a: ...` is a literal too (no block
+        // starts with `a:` but a labelled loop's).
+        let in_condition = NO_STRUCT && at(LBrace) && tok_kind(1) == Ident
+            && tok_kind(2) == Colon && tok_kind(3) != Loop && tok_kind(3) != While
+            && tok_kind(3) != For;
+        if (!NO_STRUCT || in_condition) && at(LBrace) {
             advance();
             let n = new_node(NodeKind::StructLit, start, 0);
             NODES[n].a = NODES[last].a;

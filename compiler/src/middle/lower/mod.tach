@@ -27,7 +27,6 @@ use crate::back::abi::{
     ABI_PIECE_COUNT, ABI_PIECE_OFFSET, ABI_PIECE_TY, AbiClass, conv_classify,
     conv_returns_through_pointer, fn_uses_c,
 };
-use crate::back::dwarf::DEBUG_INFO;
 use crate::base::{alloc_array, intern_c};
 use crate::base::target::X86;
 use crate::front::ast::{DEFERS, DEFER_LOOPS, NODES, NODE_COUNT, NodeKind, child};
@@ -43,10 +42,11 @@ use crate::front::types::{
 };
 use crate::gen0::gen::MAIN_SYM;
 use crate::gen0::gen::expr::arith_op_of_assign;
+use crate::middle::copies::{moves_local, note_move_copies};
 use crate::middle::ir::{
-    BLOCKS, CUR, INLINE_COPY_MAX, INSTS, IRF, IRFUNCS, IR_LOC, Op, SLOTS, Term, emit_ir, init_ir,
-    ir_const, ir_load, ir_new_block, ir_new_func, ir_new_slot, ir_offset, ir_slot_addr, ir_store,
-    ir_type,
+    BLOCKS, CUR, INLINE_COPY_MAX, INSTS, INST_COUNT, IRF, IRFUNCS, IR_EXPR_LOC, IR_LOC, IR_LOCS, Op,
+    SLOTS, Term, emit_ir, init_ir, ir_const, ir_enter, ir_load, ir_new_block, ir_new_func,
+    ir_new_slot, ir_offset, ir_shrink, ir_slot_addr, ir_store, ir_type,
 };
 use crate::middle::ir::cfg::ir_terminate;
 use crate::middle::lower::calls::{push_arg, take_args};
@@ -120,8 +120,9 @@ fn lower_function(item: i64) {
     unsafe {
         let f = NODES[item].x - 1;
         // (-g) The parameters and the frame come from the declaration.
-        IR_LOC = if DEBUG_INFO { NODES[item].start + 1 } else { 0 };
-        IRF = ir_new_func(f, item);
+        IR_LOC = if IR_LOCS { NODES[item].start + 1 } else { 0 };
+        IR_EXPR_LOC = 0;
+        ir_enter(ir_new_func(f, item));
         DEFS.clear();
         DEFERS.count = 0;
         DEFER_LOOPS.count = 0;
@@ -170,6 +171,7 @@ fn lower_function(item: i64) {
             ir_terminate(CUR, Term::Unreach, 0, 0, 0);
         }
         IR_LOC = 0;
+        ir_shrink();
     }
 }
 
@@ -235,8 +237,9 @@ fn lower_block(block: i64) -> i64 {
         let outer = IR_LOC;
         for i in 0..NODES[block].count {
             let stmt = child(block, i);
-            if DEBUG_INFO {
+            if IR_LOCS {
                 IR_LOC = NODES[stmt].start + 1;
+                IR_EXPR_LOC = 0;
             }
             if NODES[stmt].kind == Let {
                 lower_let(stmt);
@@ -249,8 +252,9 @@ fn lower_block(block: i64) -> i64 {
         let tail = NODES[block].a;
         let mut value = 0;
         if tail != 0 {
-            if DEBUG_INFO {
+            if IR_LOCS {
                 IR_LOC = NODES[tail].start + 1;
+                IR_EXPR_LOC = 0;
             }
             value = lower_expr(tail);
         }
@@ -262,6 +266,7 @@ fn lower_block(block: i64) -> i64 {
             DEFERS.count = mark;
         }
         IR_LOC = outer;
+        IR_EXPR_LOC = 0;
         value
     }
 }
@@ -307,7 +312,12 @@ fn lower_let(stmt: i64) {
         if NODES[init].ty == TY_NEVER {
             return;
         }
+        let first = INST_COUNT;
         bind_pattern_ir(NODES[stmt].a, value, is_fresh(init));
+        // (0.17: a move, COPY_MOVE; copies.tach)
+        if moves_local(init) {
+            note_move_copies(first);
+        }
     }
 }
 

@@ -1,0 +1,819 @@
+// `tachyonc probe` (0.17): a program run with values printed at lines,
+// its source unchanged.
+//
+//     tachyonc probe FILE:LINE [EXPR...] [FILE:LINE [EXPR...]]... [--count FILE:LINE]
+//         [--max N] [--input FILE] [--timeout S] [-O N] [--root ROOT] [-- ARGS...]
+//
+// Each FILE:LINE gets a probe: the statement that begins the line (a
+// `let`: after it, its names visible; a loop: at the start of its body,
+// each time round; a line opening a block, `} else {`, `X => {`, `fn
+// f(..) {`: at the start of that block). Each time the probe runs it
+// counts, and the first N times (--max, 10) prints its expressions'
+// values. The program is built with the probes written into copies of its
+// files (`--overlay`: the files themselves are not changed; lines keep
+// their numbers) and with --trace, then run (ARGS, stdin from --input
+// FILE or this command's), and the report printed: per probe its count and
+// values, then the exit status, the start of stdout and stderr.
+//
+// The values are printed by their types, found first by `check` of the
+// copies with `let _: () = (EXPR);` (the errors name the types): integers,
+// floats and bool as Display, [u8] quoted, arrays, slices (the first 16
+// elements), Option and tuples element by element, pointers as addresses,
+// anything else by Debug, else as `<TYPE>`.
+
+mod code;
+mod run;
+
+use crate::base::{
+    FILES, IntVec, SRC, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
+    streq,
+};
+use crate::front::ast::{NODES, NODE_COUNT, NodeKind, child};
+use crate::front::cpp::directives::file_exists;
+use crate::tools::probe::code::{copy_with_probes, has};
+use crate::tools::probe::run::{report, run_program};
+use crate::tools::proc::{buf_cstr, make_dirs, read_file_if, run_capture, write_file_if};
+use crate::tools::query::{c_slice, find_root, parse_count};
+use crate::tools::query::command_line::load_program;
+use crate::tools::query::diagnostics::{
+    PROG, ROOT_GIVEN, TOOL, diag, put_word, try_begin, try_end, write_diags,
+};
+use crate::tools::query::names::path_matches;
+use crate::tools::query::positions::{LINES, line_end, line_index};
+use crate::tools::query::refs::file_text;
+
+extern "C" {
+    fn getenv(name: *u8) -> *u8;
+    fn fork() -> i32;
+    fn execvp(file: *u8, argv: **u8) -> i32;
+    fn waitpid(pid: i32, status: *i32, options: i32) -> i32;
+    fn open(path: *u8, flags: i32) -> i32;
+    fn creat(path: *u8, mode: i32) -> i32;
+    fn dup2(from: i32, to: i32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn alarm(seconds: u32) -> u32;
+    fn _exit(code: i32) -> !;
+}
+
+// Where a probe goes in its line's statement.
+const AT_BEFORE: i64 = 0;
+const AT_AFTER: i64 = 1;
+const AT_BODY: i64 = 2;
+const AT_BLOCK: i64 = 3;
+
+// At most this many probes.
+const PROBES_MAX: i64 = 32;
+
+struct Probe {
+    // As given (FILE:LINE), its file (FILES index) and line.
+    site: *u8, file: i64, line: i64,
+    // The expressions (*u8 each), and per expression its type (a buffer;
+    // -1: the expression is `()`) and whether it is shown by type only.
+    exprs: IntVec, types: IntVec, opaque: IntVec,
+    // Where it goes: the offset in its file's text, how, the statement's
+    // first line (for the report).
+    at: i64, how: i64, what: [u8],
+    // Its code's span in the copy of its file (offsets), and each
+    // expression's.
+    from: i64, to: i64, spans: IntVec,
+}
+
+impl Probe {
+    // FILE of FILE:LINE, as a C string.
+    fn site_file(self: *Probe) -> *u8 {
+        unsafe {
+            let s = c_slice(self.site);
+            let mut colon = s.len - 1;
+            while s[colon] != ':' {
+                colon -= 1;
+            }
+            let b = buf_new();
+            buf_bytes(b, s[0..colon]);
+            buf_cstr(b)
+        }
+    }
+}
+
+static mut PROBES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut MAX_HITS: i64 = 10;
+static mut TIMEOUT: i64 = 10;
+static mut INPUT: *u8 = 0 as *u8;
+static mut OPT: *u8 = 0 as *u8;
+static mut ARGS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn probe(k: i64) -> *Probe {
+    unsafe { PROBES.data[k] as *Probe }
+}
+
+pub fn run_probe(argc: i64, argv: **u8) -> i64 {
+    let status = probe_inner(argc, argv);
+    write_diags();
+    status
+}
+
+fn usage(why: *u8, word: *u8) -> i64 {
+    unsafe {
+        let d = diag(c"error", c"probe.usage");
+        buf_str(d, why);
+        if word != 0 as *u8 {
+            buf_str(d, c" '");
+            buf_str(d, word);
+            buf_byte(d, '\'');
+        }
+        buf_str(d, c"; usage: tachyonc probe FILE:LINE [EXPR...]... [--count FILE:LINE] [--max N] [--input FILE] [--timeout S] [-O N] [--root ROOT] [-- ARGS...]\n");
+        2
+    }
+}
+
+// FILE:LINE, FILE ending in .tach: the line, else -1.
+fn site_line(a: *u8) -> i64 {
+    unsafe {
+        let s = c_slice(a);
+        let mut i = s.len;
+        while i > 0 && s[i - 1] >= '0' && s[i - 1] <= '9' {
+            i -= 1;
+        }
+        if i == s.len || i < 7 || s[i - 1] != ':' || s[i - 6..i - 1] != ".tach" {
+            return -1;
+        }
+        let mut n = 0;
+        for k in i..s.len {
+            n = n * 10 + (s[k] - '0') as i64;
+        }
+        n
+    }
+}
+
+fn new_probe(site: *u8) -> *Probe {
+    unsafe {
+        let p = alloc_array::<Probe>(1);
+        p[0] = Probe {
+            site, file: -1, line: site_line(site),
+            exprs: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            types: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            opaque: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            at: 0, how: AT_BEFORE, what: c_slice(c""),
+            from: 0, to: 0, spans: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        };
+        PROBES.push(p as i64);
+        p
+    }
+}
+
+fn probe_inner(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        PROG = argv[0];
+        TOOL = 0 as *u8;
+        let mut root = 0 as *u8;
+        let mut last = 0 as *Probe;
+        let mut i = 2;
+        while i < argc {
+            let a = argv[i];
+            if streq(a, c"--") {
+                for k in i + 1..argc {
+                    ARGS.push(argv[k] as i64);
+                }
+                break;
+            }
+            let valued = streq(a, c"--max") || streq(a, c"--timeout") || streq(a, c"--input")
+                || streq(a, c"--root") || streq(a, c"-O") || streq(a, c"--count");
+            if valued && i + 1 >= argc {
+                return usage(c"a value is needed after", a);
+            }
+            if streq(a, c"--max") || streq(a, c"--timeout") {
+                let n = parse_count(argv[i + 1]);
+                if n <= 0 {
+                    return usage(c"a number is needed after", a);
+                }
+                if streq(a, c"--max") {
+                    MAX_HITS = n;
+                } else {
+                    TIMEOUT = n;
+                }
+                i += 2;
+                continue;
+            }
+            if streq(a, c"--input") {
+                INPUT = argv[i + 1];
+                i += 2;
+                continue;
+            }
+            if streq(a, c"--root") {
+                root = argv[i + 1];
+                ROOT_GIVEN = root;
+                i += 2;
+                continue;
+            }
+            if streq(a, c"-O") || streq(a, c"-O0") || streq(a, c"-O1") || streq(a, c"-O2") {
+                if streq(a, c"-O") {
+                    let b = buf_new();
+                    buf_str(b, c"-O");
+                    buf_str(b, argv[i + 1]);
+                    OPT = buf_cstr(b);
+                    i += 1;
+                } else {
+                    OPT = a;
+                }
+                i += 1;
+                continue;
+            }
+            if streq(a, c"--count") {
+                if site_line(argv[i + 1]) < 1 {
+                    return usage(c"--count takes FILE:LINE, not", argv[i + 1]);
+                }
+                new_probe(argv[i + 1]);
+                last = 0 as *Probe;
+                i += 2;
+                continue;
+            }
+            if a[0] == '-' && a[1] != 0 && site_line(a) < 1 {
+                return usage(c"unknown option", a);
+            }
+            if site_line(a) >= 1 {
+                last = new_probe(a);
+            } else if last == 0 as *Probe {
+                return usage(c"an expression needs a FILE:LINE before it:", a);
+            } else {
+                last.exprs.push(a as i64);
+            }
+            i += 1;
+        }
+        if PROBES.count == 0 {
+            return usage(c"no FILE:LINE given", 0 as *u8);
+        }
+        if PROBES.count > PROBES_MAX {
+            return usage(c"at most 32 probes", 0 as *u8);
+        }
+        let mut r = find_root(root);
+        if r == 0 as *u8 && file_exists(probe(0).site_file()) {
+            // (no main.tach: the probed file is the root)
+            r = probe(0).site_file();
+        }
+        if r == 0 as *u8 {
+            let d = diag(c"error", c"probe.no-root");
+            buf_str(d, c"no main.tach here: name the program's root (--root ROOT)\n");
+            return 2;
+        }
+        if !load_program(r, 0) {
+            let d = diag(c"error", c"probe.build");
+            buf_str(d, c"the program does not parse\n");
+            let t = try_begin(c"check", c_slice(c""), false);
+            put_word(t, c_slice(r));
+            try_end(t);
+            return 1;
+        }
+        for k in 0..PROBES.count {
+            if !locate(probe(k)) {
+                return 1;
+            }
+        }
+        run_probes(r)
+    }
+}
+
+// ---- Where a probe goes ----
+
+// The statement beginning probe p's line, or the block that line opens:
+// p.at, p.how, p.what; false (a diagnostic) when there is none.
+fn locate(p: *Probe) -> bool {
+    unsafe {
+        let s = c_slice(p.site);
+        let mut colon = s.len - 1;
+        while s[colon] != ':' {
+            colon -= 1;
+        }
+        let name = s[0..colon];
+        let mut f = -1;
+        for g in 0..crate::base::FILE_COUNT {
+            let t = file_text(g);
+            if f < 0 && t.len > 0 && t[0] != '<' && path_matches(t, name) {
+                f = g;
+            }
+        }
+        if f < 0 {
+            let d = diag(c"error", c"probe.no-file");
+            buf_str(d, c"no file '");
+            buf_bytes(d, name);
+            buf_str(d, c"' in the program (a probe goes in a file of it)\n");
+            let t = try_begin(c"items", c_slice(c""), false);
+            try_end(t);
+            return false;
+        }
+        p.file = f;
+        let first_line = line_index(FILES[f].start);
+        let idx = first_line + p.line - 1;
+        if p.line < 1 || idx >= LINES.count || LINES.data[idx] >= FILES[f].end {
+            let d = diag(c"error", c"probe.no-line");
+            buf_bytes(d, file_text(f));
+            buf_str(d, c" has no line ");
+            buf_int(d, p.line);
+            buf_byte(d, '\n');
+            return false;
+        }
+        let ls = LINES.data[idx];
+        let le = line_end(ls);
+        let mut fp = ls;
+        while fp < le && (SRC[fp] == ' ' || SRC[fp] == '\t') {
+            fp += 1;
+        }
+        // The statements (and blocks' last expressions) beginning the
+        // line: the widest.
+        let mut best = 0;
+        let mut tail = false;
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind != NodeKind::Block || NODES[n].start < FILES[f].start
+                || NODES[n].end > FILES[f].end {
+                continue;
+            }
+            for c in 0..NODES[n].count + 1 {
+                let st = if c < NODES[n].count { child(n, c) } else { NODES[n].a };
+                if st <= 0 || NODES[st].start != fp {
+                    continue;
+                }
+                if best == 0
+                    || NODES[st].end - NODES[st].start > NODES[best].end - NODES[best].start {
+                    best = st;
+                    tail = c == NODES[n].count;
+                }
+            }
+        }
+        p.what = SRC[fp..le];
+        if best != 0 {
+            let k = NODES[best].kind;
+            let e = if k == NodeKind::ExprStmt { NODES[best].a } else if tail { best } else { 0 };
+            if k == NodeKind::Let {
+                // After it: its names are visible.
+                let mut q = NODES[best].end;
+                if SRC[q - 1] != ';' {
+                    while q < FILES[f].end && (SRC[q] == ' ' || SRC[q] == '\t') {
+                        q += 1;
+                    }
+                    if SRC[q] == ';' {
+                        q += 1;
+                    } else {
+                        q = NODES[best].end;
+                    }
+                }
+                p.at = q - FILES[f].start;
+                p.how = AT_AFTER;
+                return true;
+            }
+            if e > 0 && (NODES[e].kind == NodeKind::While || NODES[e].kind == NodeKind::For
+                || NODES[e].kind == NodeKind::Loop) {
+                // In the body, each time round: the last block opening on
+                // this line.
+                let body = opening_block(f, ls, le, NODES[e].start, NODES[e].end);
+                if body > 0 {
+                    p.at = NODES[body].start + 1 - FILES[f].start;
+                    p.how = AT_BODY;
+                    return true;
+                }
+            }
+            p.at = fp - FILES[f].start;
+            p.how = AT_BEFORE;
+            return true;
+        }
+        let b = opening_block(f, ls, le, FILES[f].start, FILES[f].end);
+        if b > 0 {
+            p.at = NODES[b].start + 1 - FILES[f].start;
+            p.how = AT_BLOCK;
+            return true;
+        }
+        let d = diag(c"error", c"probe.no-statement");
+        buf_bytes(d, file_text(f));
+        buf_byte(d, ':');
+        buf_int(d, p.line);
+        buf_str(d, c" begins no statement and opens no block; a probe goes at a line that does\n");
+        // The nearest lines that do.
+        let mut shown = 0;
+        let mut dist = 1;
+        while dist < 20 && shown < 2 {
+            let lines: [i64; 2] = [p.line - dist, p.line + dist];
+            for j in 0..2 {
+                let l = lines[j];
+                if shown < 2 && l >= 1 && starts_statement(f, l) {
+                    let t = try_begin(c"probe", c_slice(c""), false);
+                    let w = buf_new();
+                    buf_bytes(w, file_text(f));
+                    buf_byte(w, ':');
+                    buf_int(w, l);
+                    put_word(t, buf_slice(w));
+                    for x in 0..p.exprs.count {
+                        put_word(t, c_slice(p.exprs.data[x] as *u8));
+                    }
+                    try_end(t);
+                    shown += 1;
+                }
+            }
+            dist += 1;
+        }
+        false
+    }
+}
+
+// The last block of file f whose `{` is on the line [ls, le), within
+// [lo, hi); 0: none.
+fn opening_block(f: i64, ls: i64, le: i64, lo: i64, hi: i64) -> i64 {
+    unsafe {
+        let mut b = 0;
+        for n in 1..NODE_COUNT {
+            let st = NODES[n].start;
+            if NODES[n].kind == NodeKind::Block && st >= ls && st < le && st >= lo && st < hi
+                && SRC[st] == '{' && NODES[n].end <= FILES[f].end
+                && (b == 0 || st > NODES[b].start) {
+                b = n;
+            }
+        }
+        b
+    }
+}
+
+// Whether line l of file f begins a statement (for the try: lines).
+fn starts_statement(f: i64, l: i64) -> bool {
+    unsafe {
+        let idx = line_index(FILES[f].start) + l - 1;
+        if idx >= LINES.count || LINES.data[idx] >= FILES[f].end {
+            return false;
+        }
+        let ls = LINES.data[idx];
+        let mut fp = ls;
+        while fp < line_end(ls) && (SRC[fp] == ' ' || SRC[fp] == '\t') {
+            fp += 1;
+        }
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind == NodeKind::Block && NODES[n].start >= FILES[f].start
+                && NODES[n].end <= FILES[f].end {
+                for c in 0..NODES[n].count {
+                    if NODES[child(n, c)].start == fp {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+// ---- Building and running ----
+
+// A compiler error line `PATH:LINE:COL: ...` of the copy of file f (text
+// `copy`): its offset in the copy and the message (after `] `), or -1.
+fn error_offset(line: [u8], path: [u8], copy: [u8], message: *[u8]) -> i64 {
+    unsafe {
+        // (the path as the compiler prints it: `./` left out)
+        let mut colon = 0;
+        while colon < line.len && line[colon] != ':' {
+            colon += 1;
+        }
+        if colon == 0 || colon >= line.len || !path_matches(path, line[0..colon]) {
+            return -1;
+        }
+        let mut i = colon + 1;
+        let mut l = 0;
+        while i < line.len && line[i] >= '0' && line[i] <= '9' {
+            l = l * 10 + (line[i] - '0') as i64;
+            i += 1;
+        }
+        if i >= line.len || line[i] != ':' {
+            return -1;
+        }
+        i += 1;
+        let mut c = 0;
+        while i < line.len && line[i] >= '0' && line[i] <= '9' {
+            c = c * 10 + (line[i] - '0') as i64;
+            i += 1;
+        }
+        let mut m = i;
+        while m < line.len && line[m] != ']' {
+            m += 1;
+        }
+        let mut text = if m + 2 <= line.len { line[m + 2..line.len] } else { line[i..line.len] };
+        // (short diagnostics: ` | help: ...` after the message)
+        for q in 0..text.len {
+            if q + 3 <= text.len && text[q..q + 3] == " | " {
+                text = text[0..q];
+                break;
+            }
+        }
+        *message = text;
+        // The offset of line l, column c.
+        let mut at = 0;
+        let mut k = 1;
+        while k < l && at < copy.len {
+            if copy[at] == '\n' {
+                k += 1;
+            }
+            at += 1;
+        }
+        at + c - 1
+    }
+}
+
+// The lines of a compiler's output.
+fn next_line(s: [u8], i: i64) -> i64 {
+    let mut e = i;
+    while e < s.len && s[e] != '\n' {
+        e += 1;
+    }
+    e
+}
+
+// The probe and expression whose code holds offset `at` of file f's copy:
+// k * 64 + x, or -1 (x: 63 when the probe's code but no expression's).
+fn holder(f: i64, at: i64) -> i64 {
+    unsafe {
+        for k in 0..PROBES.count {
+            let p = probe(k);
+            if p.file == f && at >= p.from && at < p.to {
+                let mut x = 63;
+                for j in 0..p.spans.count {
+                    if at >= p.spans.data[j] {
+                        x = j;
+                    }
+                }
+                return k * 64 + x;
+            }
+        }
+        -1
+    }
+}
+
+// The files with probes, each once.
+fn probe_files(files: *IntVec) {
+    unsafe {
+        for k in 0..PROBES.count {
+            let f = probe(k).file;
+            let mut seen = false;
+            for j in 0..files.count {
+                seen = seen || files.data[j] == f;
+            }
+            if !seen {
+                files.push(f);
+            }
+        }
+    }
+}
+
+// Writes the copies (typing: the type questions) into dir: argv words
+// `--overlay PATH COPY` for each, appended to args; the copies' texts in
+// copies (buffers, by the order of files).
+fn write_copies(dir: *u8, files: *IntVec, typing: bool, args: *IntVec, copies: *IntVec) -> bool {
+    unsafe {
+        copies.count = 0;
+        for j in 0..files.count {
+            let f = files.data[j];
+            let original = buf_new();
+            if !read_file_if(FILES[f].path, original) {
+                let d = diag(c"error", c"probe.no-file");
+                buf_str(d, c"cannot read '");
+                buf_str(d, FILES[f].path);
+                buf_str(d, c"'\n");
+                return false;
+            }
+            let copy = copy_with_probes(f, buf_slice(original), typing);
+            let path = buf_new();
+            buf_str(path, dir);
+            buf_bytes(path, "/copy");
+            buf_int(path, j);
+            // (not .tach: no tool takes them for sources)
+            buf_bytes(path, ".probe");
+            let p = buf_cstr(path);
+            if !write_file_if(p, buf_slice(copy)) {
+                let d = diag(c"error", c"probe.no-file");
+                buf_str(d, c"cannot write '");
+                buf_str(d, p);
+                buf_str(d, c"'\n");
+                return false;
+            }
+            args.push(c"--overlay" as i64);
+            args.push(FILES[f].path as i64);
+            args.push(p as i64);
+            copies.push(copy);
+        }
+        true
+    }
+}
+
+fn run_words(args: *IntVec, out: i64) -> i64 {
+    unsafe {
+        let argv = alloc_array::<*u8>(args.count + 1);
+        for i in 0..args.count {
+            argv[i] = args.data[i] as *u8;
+        }
+        argv[args.count] = 0 as *u8;
+        run_capture(argv, out)
+    }
+}
+
+// The compiler's errors that are not in a probe's code: the program's own
+// (printed, with a count); a probe's: per expression, `bad` (the message),
+// its type (the "expected '()', got 'T'" of the type questions), or (not
+// typing) opaque when a trait is missing. Whether everything is answered
+// (no error but the type questions' and missing traits).
+fn read_errors(log: [u8], files: *IntVec, copies: *IntVec, typing: bool) -> bool {
+    unsafe {
+        let mut ok = true;
+        // (each expression one level a round)
+        let mut bumped = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut i = 0;
+        while i < log.len {
+            let e = next_line(log, i);
+            let line = log[i..e];
+            i = e + 1;
+            if !(contains(line, ": error") || contains(line, ": warning")) {
+                continue;
+            }
+            let is_error = contains(line, ": error");
+            let mut found = -1;
+            let mut msg = line[0..0];
+            for j in 0..files.count {
+                let f = files.data[j];
+                let at = error_offset(line, c_slice(FILES[f].path), buf_slice(copies.data[j]),
+                    &msg);
+                if at >= 0 && found < 0 {
+                    found = holder(f, at);
+                }
+            }
+            if !is_error {
+                continue;
+            }
+            if found < 0 {
+                ok = false;
+                let d = diag(c"error", c"probe.build");
+                buf_str(d, c"the program does not build: ");
+                buf_bytes(d, line);
+                buf_byte(d, '\n');
+                continue;
+            }
+            let p = probe(found / 64);
+            let x = found % 64;
+            let got = "expected '()', got '";
+            if typing && x < 63 && starts(msg, got) && msg[msg.len - 1] == '\'' {
+                let t = buf_new();
+                buf_bytes(t, msg[got.len..msg.len - 1]);
+                p.types.data[x] = t;
+                continue;
+            }
+            if !typing && x < 63 && contains(msg, "does not implement") {
+                if p.opaque.data[x] < 2 && !has(&bumped, found) {
+                    p.opaque.data[x] = p.opaque.data[x] + 1;
+                    bumped.push(found);
+                }
+                continue;
+            }
+            ok = false;
+            let d = diag(c"error", c"probe.expr");
+            buf_str(d, p.site);
+            if x < 63 {
+                buf_str(d, c": in '");
+                buf_str(d, p.exprs.data[x] as *u8);
+                buf_str(d, c"'");
+            }
+            buf_str(d, c": ");
+            buf_bytes(d, msg);
+            buf_byte(d, '\n');
+        }
+        ok
+    }
+}
+
+fn contains(hay: [u8], needle: [u8]) -> bool {
+    if needle.len > hay.len {
+        return false;
+    }
+    for i in 0..hay.len - needle.len + 1 {
+        if hay[i..i + needle.len] == needle {
+            return true;
+        }
+    }
+    false
+}
+
+fn starts(s: [u8], p: [u8]) -> bool {
+    s.len >= p.len && s[0..p.len] == p
+}
+
+// The directory of the copies and the build: .tachyonc/probe next to the
+// root, else $TMPDIR/tachyonc-probe.
+fn work_dir(root: *u8) -> *u8 {
+    unsafe {
+        let s = c_slice(root);
+        let mut slash = s.len;
+        while slash > 0 && s[slash - 1] != '/' {
+            slash -= 1;
+        }
+        let b = buf_new();
+        buf_bytes(b, s[0..slash]);
+        buf_bytes(b, ".tachyonc/probe");
+        let local = buf_cstr(b);
+        if make_dirs(local) {
+            return local;
+        }
+        let t = buf_new();
+        let tmp = getenv(c"TMPDIR");
+        buf_str(t, if tmp != 0 as *u8 && tmp[0] != 0 { tmp } else { c"/tmp" });
+        buf_bytes(t, "/tachyonc-probe");
+        let dir = buf_cstr(t);
+        make_dirs(dir);
+        dir
+    }
+}
+
+fn path_in(dir: *u8, name: [u8]) -> *u8 {
+    let b = buf_new();
+    buf_str(b, dir);
+    buf_byte(b, '/');
+    buf_bytes(b, name);
+    buf_cstr(b)
+}
+
+fn run_probes(root: *u8) -> i64 {
+    unsafe {
+        let dir = work_dir(root);
+        let mut files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        probe_files(&files);
+        let mut copies = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..PROBES.count {
+            let p = probe(k);
+            for _ in 0..p.exprs.count {
+                p.types.push(-1);
+                p.opaque.push(0);
+            }
+        }
+        // The types, from check.
+        let mut typed = false;
+        for k in 0..PROBES.count {
+            typed = typed || probe(k).exprs.count > 0;
+        }
+        if typed {
+            let mut args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            args.push(PROG as i64);
+            args.push(c"check" as i64);
+            args.push(root as i64);
+            if !write_copies(dir, &files, true, &args, &copies) {
+                return 1;
+            }
+            let log = buf_new();
+            run_words(&args, log);
+            if !read_errors(buf_slice(log), &files, &copies, true) {
+                return 1;
+            }
+        }
+        // The build (again with opaque values when a trait is missing).
+        let bin = path_in(dir, "prog");
+        let mut built = false;
+        let mut round = 0;
+        while !built && round < 3 {
+            let mut args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            args.push(PROG as i64);
+            args.push(root as i64);
+            args.push(c"-o" as i64);
+            args.push(bin as i64);
+            args.push(c"--diagnostics=short" as i64);
+            if OPT == 0 as *u8 || !streq(OPT, c"-O0") {
+                args.push(c"--trace" as i64);
+            }
+            if OPT != 0 as *u8 {
+                args.push(OPT as i64);
+            }
+            if !write_copies(dir, &files, false, &args, &copies) {
+                return 1;
+            }
+            let log = buf_new();
+            let rc = run_words(&args, log);
+            if rc == 0 {
+                built = true;
+            } else {
+                let mut opaque_before = 0;
+                for k in 0..PROBES.count {
+                    for x in 0..probe(k).opaque.count {
+                        opaque_before += probe(k).opaque.data[x];
+                    }
+                }
+                let answered = read_errors(buf_slice(log), &files, &copies, false);
+                let mut opaque_after = 0;
+                for k in 0..PROBES.count {
+                    for x in 0..probe(k).opaque.count {
+                        opaque_after += probe(k).opaque.data[x];
+                    }
+                }
+                if !answered || opaque_after == opaque_before {
+                    if answered {
+                        let d = diag(c"error", c"probe.build");
+                        buf_str(d, c"the program with its probes does not build:\n");
+                        buf_bytes(d, buf_slice(log));
+                    }
+                    return 1;
+                }
+            }
+            round += 1;
+        }
+        if !built {
+            return 1;
+        }
+        let out_path = path_in(dir, "out");
+        let err_path = path_in(dir, "err");
+        let status = run_program(bin, out_path, err_path);
+        report(status, out_path, err_path)
+    }
+}

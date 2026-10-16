@@ -4,9 +4,9 @@
 // arithmetic operands are checked against it; everything else is
 // synthesized and compared with it.
 
-use crate::base::buf_uint;
-use crate::base::diag::{ERR, err_begin, err_end, err_int, err_str, err_sym};
-use crate::front::ast::{NODES, NodeKind, REPR_UNION, child};
+use crate::base::{buf_new, buf_slice, buf_uint, intern_c};
+use crate::base::diag::{ERR, err_begin, err_end, err_help, err_help_fmt, err_int, err_str, err_sym};
+use crate::front::ast::{NODES, NODE_REF_MUT, NodeKind, REPR_UNION, child, new_node};
 use crate::front::ast::NodeKind::{
     Array, Binary, Block, Char, Closure, Float, If, Int, Loop, Match, Range, Repeat, StructLit,
     Tuple, Unary,
@@ -21,6 +21,7 @@ use crate::front::check::resolve::resolve_alias;
 use crate::front::check::sealed::check_literal;
 use crate::front::check::synth_mode::{fold_layout_query, help_near_field, synth_expr};
 use crate::front::check::try_op::check_try;
+use crate::front::check::variant_fields::variant_literal;
 use crate::front::check::vectors::sym_is_c;
 use crate::front::check::widen::try_widen;
 use crate::front::closures::{check_closure, coerce_closure};
@@ -29,15 +30,16 @@ use crate::front::convert::into_call;
 use crate::front::generics::{HINT_NODE, HINT_TY, check_arg, env_lookup};
 use crate::front::generics::instantiate::infer_struct_literal;
 use crate::front::lexer::{SUF_NONE, Tok};
-use crate::front::modules::CUR_MOD;
+use crate::front::modules::{CUR_MOD, STD_MODULE};
 use crate::front::modules::lookup::{
     B_ITEM, B_PRIVATE, access_error, binding_kind, binding_value, lookup_item, note_c_use,
     path_module,
 };
 use crate::front::patterns::check_match;
 use crate::front::types::{
-    STRUCTS, SYM_ALIAS, SYM_STRUCT, TYPES, TY_ERROR, TY_NEVER, TyKind, err_type, find_field,
-    int_max, is_float, is_integer, is_numeric, is_signed, struct_field, struct_type, type_elem,
+    FNS, REF_MUT, REF_SHARED, STRUCTS, SYM_ALIAS, SYM_STRUCT, TYPES, TY_ERROR, TY_NEVER, TyKind,
+    buf_type, err_type, find_field, int_max, is_float, is_integer, is_numeric, is_signed,
+    struct_field, struct_type, type_elem,
 };
 
 fn passes_expected_to_operands(op: Tok, expected: i64) -> bool {
@@ -57,8 +59,13 @@ pub fn check_expr(n: i64, expected: i64) -> i64 {
     fold_layout_query(n);
     HINT_NODE = n;
     HINT_TY = expected;
+    // (0.17: the own pass's record of the types and loans a function has,
+    // front/own/fast.tach; its fast path reads it instead of the nodes)
+    let mark = crate::front::own::fast::expr_enter(n);
+    crate::front::own::fast::check_node(n);
     let actual = check_expr_inner(n, expected);
     unsafe { NODES[n].ty = expected; }
+    crate::front::own::fast::check_exit(n, expected, mark);
     actual
 }
 
@@ -98,6 +105,10 @@ fn check_expr_inner(n: i64, expected: i64) -> i64 {
                 return expected;
             }
             StructLit => {
+                // (0.17: `E::V { a: x }`, a struct-like variant's literal)
+                if variant_literal(n) {
+                    return check_expr_inner(n, expected);
+                }
                 check_struct_literal(n, expected);
                 return expected;
             }
@@ -153,9 +164,107 @@ fn check_expr_inner(n: i64, expected: i64) -> i64 {
         if coerce_closure(n, expected) {
             return expected;
         }
+        // (0.17: references)
+        if coerce_ref(n, actual, expected) {
+            return expected;
+        }
         mismatch_error(n, expected, actual);
     }
     expected
+}
+
+// (0.17, docs/design/value-semantics.md §2.3) Value n of type `actual`
+// where `expected` is expected (they differ): whether a reference converts.
+// `&T` and `&mut T` become a raw `*T` (dereferencing one stays unsafe),
+// `&mut T` a `&T`, `&mut [T]` a `[T]`; a reference to a slice is the slice
+// (`f(&s)` for `s: [T]`, `&mut s` for a `&mut [T]`), n rewritten to read it.
+pub fn coerce_ref(n: i64, actual: i64, expected: i64) -> bool {
+    unsafe {
+        if actual <= 0 || expected <= 0 {
+            return false;
+        }
+        let ak = TYPES[actual].kind;
+        let ek = TYPES[expected].kind;
+        if ak == TyKind::Slice && ek == TyKind::Slice {
+            if TYPES[actual].a != TYPES[expected].a {
+                return false;
+            }
+            if TYPES[actual].b == REF_MUT && TYPES[expected].b == 0 {
+                return true;
+            }
+            // (0.17, the legacy slice rule, like the legacy `*T` parameters
+            // through 0.17) a `[T]` where `&mut [T]` is expected,
+            // `sort(a[..])`, `sort(v.as_slice())`, `sort(s)`: the exclusive
+            // view, as `&mut a[..]`, `v.as_mut_slice()`; the own pass takes
+            // the parameter's loan (a write through a read-only view is its
+            // own.readonly), `fix --values` writes the `&mut`
+            if TYPES[actual].b == 0 && TYPES[expected].b == REF_MUT {
+                if fresh_slice(n) && NODES[n].kind == NodeKind::Index {
+                    NODES[n].p |= NODE_REF_MUT;
+                }
+                return true;
+            }
+            return false;
+        }
+        if ak != TyKind::Ptr || TYPES[actual].b == 0 {
+            return false;
+        }
+        let pointee = TYPES[actual].a;
+        if ek == TyKind::Ptr && pointee_fits(pointee, TYPES[expected].a) {
+            return TYPES[expected].b == 0 || TYPES[expected].b == REF_SHARED;
+        }
+        if ek == TyKind::Slice && TYPES[pointee].kind == TyKind::Slice
+            && TYPES[pointee].a == TYPES[expected].a
+            && (TYPES[expected].b == 0 || TYPES[actual].b == REF_MUT) {
+            if NODES[n].kind == Unary && NODES[n].op == Tok::Amp {
+                // `&s`: s itself
+                let operand = NODES[n].b;
+                let flags = NODES[n].p;
+                NODES[n] = NODES[operand];
+                NODES[n].p |= flags & NODE_REF_MUT;
+            } else {
+                // `*r`
+                let inner = new_node(Unary, NODES[n].start, NODES[n].end);
+                NODES[inner] = NODES[n];
+                NODES[n].kind = Unary;
+                NODES[n].op = Tok::Star;
+                NODES[n].b = inner;
+                NODES[n].a = 0;
+                NODES[n].count = 0;
+                NODES[n].p = 0;
+            }
+            return true;
+        }
+        false
+    }
+}
+
+// (0.17) Whether n makes a slice of a place: `a[x..y]`, `v.as_slice()` (a
+// call of std's as_slice, once checked) (coerce_ref's legacy slice rule).
+fn fresh_slice(n: i64) -> bool {
+    unsafe {
+        if NODES[n].kind == NodeKind::Index {
+            return NODES[NODES[n].b].kind == NodeKind::Range;
+        }
+        if NODES[n].kind == NodeKind::MethodCall {
+            return NODES[n].count == 0 && NODES[n].b == intern_c(c"as_slice");
+        }
+        let f = NODES[n].x - 1;
+        NODES[n].kind == NodeKind::Call && f >= 0 && FNS[f].module == STD_MODULE
+            && NODES[FNS[f].node].a == intern_c(c"as_slice")
+    }
+}
+
+// Whether a pointer to `a` converts to a pointer to `e`: the same type, or
+// pointers all the way where e's are raw (`&&T` to `**T`).
+fn pointee_fits(a: i64, e: i64) -> bool {
+    unsafe {
+        if a == e {
+            return true;
+        }
+        TYPES[a].kind == TyKind::Ptr && TYPES[e].kind == TyKind::Ptr && TYPES[e].b == 0
+            && pointee_fits(TYPES[a].a, TYPES[e].a)
+    }
 }
 
 fn check_int_fits(n: i64, value: u64, ty: i64) {
@@ -167,8 +276,33 @@ fn check_int_fits(n: i64, value: u64, ty: i64) {
             err_str(c" does not fit in type '");
             err_type(ty);
             err_str(c"'");
+            int_range_help(ty);
             err_end();
         }
+    }
+}
+
+// (0.17) The help of a literal out of integer type ty's range: the range,
+// and what to write instead.
+pub fn int_range_help(ty: i64) {
+    unsafe {
+        let max = int_max(ty);
+        let b = buf_new();
+        buf_type(b, ty);
+        err_help(c"'");
+        err_help_fmt(buf_slice(b));
+        err_help(c"' holds ");
+        if is_signed(ty) {
+            err_help(c"-");
+            err_help_fmt(max + 1);
+        } else {
+            err_help(c"0");
+        }
+        err_help(c"..=");
+        err_help_fmt(max);
+        err_help(c": a wider type (`i64`), or the literal's low bits with `as` (`LITERAL as ");
+        err_help_fmt(buf_slice(b));
+        err_help(c"`)");
     }
 }
 
@@ -350,6 +484,7 @@ fn check_negation(n: i64, expected: i64) {
                 err_str(c" does not fit in type '");
                 err_type(expected);
                 err_str(c"'");
+                int_range_help(expected);
                 err_end();
             }
             NODES[operand].ty = expected;

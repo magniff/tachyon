@@ -126,7 +126,13 @@ test_seed() {
             "$SEED" build --target "$SEED_TARGET" "$exe.tach" -o "$exe" >"$exe.log" 2>&1 \
                 || { why="the seed failed to compile it"; break; }
         else
-            "$COMPILER" --target "$TARGET" "-$level" --deny-warnings --verify-ir "$program" -o "$exe.o" >"$exe.log" 2>&1 \
+            # (0.17: --values=off. The programs are 0.16 code: slices
+            # written through `let sl = a[..]` while a is read, and
+            # genvec.awk's kernels aliased on purpose, for the run-time
+            # alias checks; the own pass is not what they test, and they
+            # hold no owned or reference values, so their code is the
+            # default's)
+            "$COMPILER" --target "$TARGET" "-$level" --deny-warnings --verify-ir --values=off "$program" -o "$exe.o" >"$exe.log" 2>&1 \
                 || { why="-$level failed to compile it: $(head -3 "$exe.log")"; break; }
             # shellcheck disable=SC2086
             cc_run $ARCH -o "$exe" "$exe.o" >>"$exe.log" 2>&1 || { why="-$level: cc failed"; break; }

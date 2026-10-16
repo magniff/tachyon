@@ -37,14 +37,16 @@ mod interp;
 pub mod widen;
 pub mod args;
 mod sealed;
+pub mod variant_fields;
 
-use crate::base::{IntVec, _setjmp, grow, intern_c};
+use crate::base::{BUFS, IntVec, SRC, _setjmp, buf_fmt, buf_new, buf_slice, cstr, grow, intern_c};
 use crate::base::diag::{
-    RECOVER_DEPTH, err_begin, err_end, err_str, err_sym, error_at, error_count, errors_forget,
-    errors_mark, exit_if_errors, recover_enter, recover_leave,
+    RECOVER_DEPTH, err_begin, err_end, err_fix, err_help, err_str, err_sym, err_try_fmt, error_at,
+    error_count, errors_forget, errors_mark, exit_if_errors, recover_enter, recover_leave,
 };
 use crate::front::ast::{
-    FN_BODY_FAILED, FN_LAZY, FN_SIG_FAILED, NODES, SCRATCH, child, list_begin, list_end, list_push,
+    FN_BODY_FAILED, FN_DEFAULT_COPY, FN_LAZY, FN_SIG_FAILED, NODES, NodeKind, SCRATCH, child,
+    list_begin, list_end, list_push,
 };
 use crate::front::ast::NodeKind::{
     Array, Const, Enum, Fn, Impl, Let, PatBind, Static, Struct, Tuple, Use,
@@ -62,15 +64,16 @@ use crate::front::check::unsafety::{UNSAFE_DEPTH, WRAP_NODE, check_wrapped};
 use crate::front::consteval::const_value_of;
 use crate::front::generics::{CUR_INST, INST_QUEUE, TP_BASE, TP_NAMES, TP_TYPES};
 use crate::front::generics::instantiate::{UNIFY_SELF, UNIFY_SELF_TY, fn_instance};
-use crate::front::modules::{CUR_MOD, init_modules};
+use crate::front::modules::{CUR_MOD, STD_MODULE, init_modules, module_of};
 use crate::front::modules::lookup::{collect_uses, resolve_all_uses, resolve_use_of};
 use crate::front::patterns::OR_MODE;
 use crate::front::traits::{
-    check_impl_signatures, check_later_bounds, collect_impl, collect_impls, init_traits,
-    trait_named,
+    bound_trait, check_impl_signatures, check_later_bounds, collect_impl, collect_impls, implements,
+    init_traits, trait_named,
 };
 use crate::front::types::{
-    ENUMS, FNS, FN_COUNT, STRUCTS, TLISTS, TSCRATCH, TYPES, TY_ERROR, TyKind, err_type, type_elem,
+    ENUMS, FNS, FN_COUNT, REF_MUT, REF_SHARED, STRUCTS, TLISTS, TSCRATCH, TYPES, TY_BOOL, TY_ERROR,
+    TY_I64, TY_U8, TyKind, buf_type, err_type, is_integer, is_numeric, is_ref, type_elem,
 };
 use crate::tools::fiximports::report_legacy_imports;
 use crate::tools::query::command_line::QUERY;
@@ -86,6 +89,8 @@ use crate::front::derive::{check_derives, expand_derives};
 use crate::front::effects::EFFECTS_WANTED;
 use crate::front::effects::check::{check_effects, effects_declared};
 use crate::front::effects::infer::{infer_effects, note_body_failed};
+use crate::front::lexer::Tok;
+use crate::front::own::check_own;
 
 // What an identifier names.
 pub enum Res { None, Local, Const, Static, Fn }
@@ -95,8 +100,13 @@ pub enum Res { None, Local, Const, Static, Fn }
 // unsafety.tach).
 // `tparam` (0.9): the bounded type parameter its declared type names (a
 // parameter `x: T` or `x: *T`), whose bounds its methods come from; 0.
+// `init` (0.17): v, for a local `let p = &v;` (not `mut`); 0.
+// `twritten` (0.17): its type as written names a type parameter P: 1 for
+// `*P`, 2 for `[P]` (written_param); 0.
 struct Local {
     name: i64, ty: i64, mutable: bool, is_param: bool, offset: i64, borrow: bool, tparam: i64,
+    init: i64,
+    twritten: i64,
 }
 
 pub static mut LOCALS: *Local = 0 as *Local;
@@ -131,6 +141,9 @@ pub fn type_error(n: i64, message: *u8) -> ! {
     unsafe { error_at(NODES[n].start, message) }
 }
 
+// A value of type `actual` where `expected` goes (0.17: the conversion to
+// write, as the try: line, when there is one: `x as i32`, `a[..]`,
+// `b.as_slice()`, `v.as_slice()`, `&x`).
 pub fn mismatch_error(n: i64, expected: i64, actual: i64) -> ! {
     unsafe {
         err_begin(NODES[n].start);
@@ -139,7 +152,90 @@ pub fn mismatch_error(n: i64, expected: i64, actual: i64) -> ! {
         err_str(c"', got '");
         err_type(actual);
         err_str(c"'");
+        mismatch_help(n, expected, actual);
         err_end()
+    }
+}
+
+fn mismatch_help(n: i64, expected: i64, actual: i64) {
+    unsafe {
+        if n == 0 || NODES[n].end <= NODES[n].start || expected == TY_ERROR || actual == TY_ERROR {
+            return;
+        }
+        let text = SRC[NODES[n].start..NODES[n].end];
+        // (an operator's operand: what binds looser than `as` and `!=`)
+        let k = NODES[n].kind;
+        let simple = !(k == NodeKind::Binary || k == NodeKind::Unary || k == NodeKind::Cast
+            || k == NodeKind::Range || k == NodeKind::If || k == NodeKind::Match
+            || k == NodeKind::Block || k == NodeKind::Closure);
+        let open: [u8] = if simple { "" } else { "(" };
+        let close: [u8] = if simple { "" } else { ")" };
+        let ek = TYPES[expected].kind;
+        let ak = TYPES[actual].kind;
+        // The conversion, written in place of the value (0.18: the fix
+        // `tachyonc fix --suggested` makes; `&x` of a simple value only).
+        let t = buf_new();
+        let mut exact = true;
+        if is_numeric(expected) && is_numeric(actual) {
+            err_help(c"only widening is implicit: convert explicitly");
+            buf_fmt(t, f"{open}{text}{close} as ");
+            buf_type(t, expected);
+        } else if expected == TY_BOOL && is_integer(actual) {
+            err_help(c"a condition is a bool: compare (`x != 0`); bitwise not is `~x`");
+            buf_fmt(t, f"{open}{text}{close} != 0");
+        } else if ek == TyKind::Slice && ak == TyKind::Array {
+            err_help(c"an array is not a slice: take one of all of it");
+            buf_fmt(t, f"{open}{text}{close}[..]");
+        }
+        else if ek == TyKind::Slice && TYPES[expected].a == TY_U8 && is_std_named(actual, c"Buf") {
+            err_help(c"a Buf's text is its slice");
+            buf_fmt(t, f"{open}{text}{close}.as_slice()");
+        } else if ek == TyKind::Slice && is_std_named(actual, c"Vec") {
+            err_help(c"a Vec's elements are its slice");
+            buf_fmt(t, f"{open}{text}{close}.as_slice()");
+        } else if ek == TyKind::Ptr && TYPES[expected].a == actual {
+            if TYPES[expected].b == REF_MUT {
+                // (0.17)
+                err_help(c"an exclusive reference to it");
+                buf_fmt(t, f"&mut {text}");
+            } else {
+                err_help(c"a pointer to it: its address");
+                buf_fmt(t, f"&{text}");
+            }
+            exact = simple;
+        } else if ek == TyKind::Ptr && ak == TyKind::Ptr && TYPES[expected].a == TYPES[actual].a
+            && TYPES[expected].b == REF_MUT && TYPES[actual].b == REF_SHARED && k == NodeKind::Unary
+            && NODES[n].op == Tok::Amp {
+            // (0.17) `&x` where `&mut T` is expected
+            err_help(
+                c"the parameter is `&mut`: the callee may change it; pass an exclusive reference");
+            let operand = NODES[n].b;
+            buf_fmt(t, f"&mut {SRC[NODES[operand].start..NODES[operand].end]}");
+        } else if ek == TyKind::Ptr && ak == TyKind::Ptr && TYPES[expected].a == TYPES[actual].a
+            && TYPES[expected].b != 0 && TYPES[actual].b == 0 {
+            // (0.17) a raw pointer where a reference is expected
+            err_help(c"a raw pointer is not a reference: nothing checks what it points to; pass `&place`, or, in unsafe code, `&*p`");
+        }
+        if BUFS[t].len > 0 {
+            err_try_fmt(buf_slice(t));
+            if exact {
+                err_fix(NODES[n].start, NODES[n].end, buf_slice(t));
+            }
+        }
+    }
+}
+
+// Whether type t is std's struct `name` (an instance of it).
+pub fn is_std_named(t: i64, name: *u8) -> bool {
+    unsafe {
+        if TYPES[t].kind != TyKind::Struct {
+            return false;
+        }
+        let b = buf_new();
+        buf_type(b, t);
+        let s = buf_slice(b);
+        let w = cstr(name);
+        s.len >= w.len && s[0..w.len] == w && (s.len == w.len || s[w.len] == '<')
     }
 }
 
@@ -178,10 +274,16 @@ pub fn define_local(name: i64, ty: i64, mutable: bool, is_param: bool) -> i64 {
         LOCALS = grow(LOCALS, LOCAL_COUNT, &LOCAL_CAP);
         let id = LOCAL_COUNT;
         LOCALS[id] = Local {
-            name: name, ty: ty, mutable: mutable, is_param: is_param, offset: 0, borrow: false,
+            name: name, ty: ty, mutable: mutable, is_param: is_param, offset: 0,
+            // (0.17: a reference is a borrow)
+            borrow: ty > 0 && is_ref(ty),
             tparam: 0,
+            init: 0,
+            twritten: 0,
         };
         LOCAL_COUNT += 1;
+        // (0.17: the own pass's record, front/own/fast.tach)
+        crate::front::own::fast::note_type(ty);
         ENV.push(id);
         id
     }
@@ -245,6 +347,14 @@ pub fn check_program(program: i64) {
             check_function_recovering(FNS[INST_QUEUE.data[q]].node);
             q += 1;
         }
+        // (0.17: std from its files, to be edited: its generic functions too)
+        if crate::front::stdtree::STD_TREE != 0 as *u8 {
+            check_std_generics(program);
+            while q < INST_QUEUE.count {
+                check_function_recovering(FNS[INST_QUEUE.data[q]].node);
+                q += 1;
+            }
+        }
         if QUERY {
             check_unchecked(program);
         }
@@ -259,6 +369,9 @@ pub fn check_program(program: i64) {
             infer_effects();
             check_effects();
         }
+        exit_if_errors();
+        // (0.17: value semantics, front/own; --values)
+        check_own();
         exit_if_errors();
         finish_program(program);
     }
@@ -388,6 +501,92 @@ fn check_unchecked(program: i64) {
         INST_QUEUE.count = queued;
         CLOSURE_FNS.count = closures;
         errors_forget(mark);
+    }
+}
+
+// (0.17) With std read from its files to be edited (front/stdtree.tach):
+// std's generic functions that nothing instantiated, each instantiated
+// once, i64 for its type parameters (Gpa where i64 does not satisfy the
+// bounds: an `Allocator`), so that an edit's errors in their bodies are
+// found. One whose bounds neither satisfies (an `Fn`, an `Iterator`) is
+// checked only where a program uses it, and so is a trait's default method
+// copied into an impl (lazy: `sum` of an iterator of pairs). Its errors are kept: the edit's
+// check reports those it added.
+fn check_std_generics(program: i64) {
+    unsafe {
+        let gpa = crate::front::effects::infer::std_struct_type(c"Gpa");
+        let fns = FN_COUNT;
+        for i in 0..NODES[program].count {
+            let item = child(program, i);
+            if NODES[item].kind != Fn || NODES[item].x == 0
+                || (NODES[item].p & (FN_SIG_FAILED | FN_LAZY | FN_DEFAULT_COPY)) != 0
+                || module_of(item) != STD_MODULE {
+                continue;
+            }
+            let f = NODES[item].x - 1;
+            if FNS[f].generic == 0 || FNS[f].tmpl != 0
+                || (0..fns).any(|g| FNS[g].tmpl == f + 1) {
+                continue;
+            }
+            let params = NODES[item].g;
+            let m = TSCRATCH.count;
+            for k in 0..FNS[f].generic {
+                let t = simple_targ(child(params, k), gpa);
+                if t == 0 {
+                    break;
+                }
+                TSCRATCH.push(t);
+            }
+            if TSCRATCH.count - m != FNS[f].generic {
+                TSCRATCH.count = m;
+                continue;
+            }
+            let depth = RECOVER_DEPTH;
+            let state = save_check_state();
+            if _setjmp(recover_enter()) == 0 {
+                fn_instance(f, m, item);
+            } else {
+                restore_check_state(state);
+            }
+            recover_leave(depth);
+        }
+    }
+}
+
+// A type for type parameter p (check_std_generics): i64, or gpa, the one
+// that satisfies its bounds; 0 when neither does or a bound is not a
+// plain trait.
+fn simple_targ(p: i64, gpa: i64) -> i64 {
+    unsafe {
+        let bounds = NODES[p].h;
+        if bounds == 0 {
+            return TY_I64;
+        }
+        for c in 0..2 {
+            let t = if c == 0 { TY_I64 } else { gpa };
+            if t == 0 {
+                continue;
+            }
+            let mut ok = true;
+            for i in 0..NODES[bounds].count {
+                let b = child(bounds, i);
+                if NODES[b].kind == crate::front::ast::NodeKind::EffectSet {
+                    continue;
+                }
+                if NODES[b].kind == crate::front::ast::NodeKind::TyFn || NODES[b].h != 0
+                    || NODES[b].g != 0 {
+                    return 0;
+                }
+                if !implements(bound_trait(b), t) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return t;
+            }
+        }
+        0
     }
 }
 
@@ -558,6 +757,11 @@ pub fn poison_pattern(p: i64) {
         }
         if NODES[p].kind == PatBind {
             NODES[p].x = define_local(NODES[p].a, TY_ERROR, true, false);
+            return;
+        }
+        if NODES[p].kind == NodeKind::FieldInit {
+            // (0.17) a field of `E::V { a, b: q }`: its pattern
+            poison_pattern(NODES[p].b);
             return;
         }
         for i in 0..NODES[p].count {

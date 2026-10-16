@@ -6,6 +6,8 @@ Python script (see [agent-tool-usage.md](agent-tool-usage.md)). They are
 built on `tachyonc query` ([query.md](query.md)): NAME is anything query
 accepts, positions and spans are the compiler's, and every problem is
 one line `SEVERITY CODE: MESSAGE` followed by `try:` lines, as there.
+Every query, edit and refactoring in one table, a row each: [query.md,
+"Every command at a glance"](query.md#every-command-at-a-glance-for-agents).
 
 Sessions with these tools on small programs, each step's command and
 its output, tested by `tests/walkthrough/run.sh`: [examples/tools](../examples/tools/README.md).
@@ -24,7 +26,8 @@ tachyonc edit insert --after|--before NAME [ROOT] < TEXT
 tachyonc edit delete NAME [ROOT]
 tachyonc undo [--force]                        the last edit, undone
 tachyonc check [ROOT]                          the front end's errors, one per line
-tachyonc fix [ROOT] [--only imports,unused,pub,unsafe,tidy-imports,reexports,std015,alloc016] [--in FILE|MODULE]
+tachyonc fix [ROOT] [--only imports,unused,pub,unsafe,tidy-imports,reexports,std015,alloc016,values] [--values] [--in FILE|MODULE]
+tachyonc fix --suggested [--at FILE:LINE] [ROOT]   (0.18) the errors' exact fixes
 tachyonc same-output OLD [--corpus DIR|FILE]... [-j N] [--work DIR]
 tachyonc lint --max-lines N [ROOT]
 tachyonc query stats [MODULE|FILE] [--over N] [--all]
@@ -124,9 +127,12 @@ patched crate::middle::range::decide→compiler/src/middle/range.tach→+1 -1 li
   comments of the item after), or a module
   or a file of the program (all of its text: its `use` lines, its header
   comment), or (0.12) `MODULE::use` (its `use` lines: from the first to
-  the last) or `MODULE::header` (the comment at the top of its file), as
+  the last) or `MODULE::header` (the comment at the top of its file), or
+  (0.17) `MODULE::extern` (its `extern "C" { ... }` blocks), as
   `query show` prints them; the root module is `crate` or the root file's
-  name (`main::header`). An item's text is its lines with the comment and attribute
+  name (`main::header`, `crate::extern`). `FILE:LINE` on a `mod x;` line
+  (0.17) is that line (`mod x;` -> `pub mod x;`), not x's file, which the
+  module's name gives. An item's text is its lines with the comment and attribute
   lines above it, as `query show` prints them.
 - **Each OLD must occur exactly once** in TARGET's text, matched byte for
   byte; it may start and end inside a line, in every form (0.13). When
@@ -294,6 +300,10 @@ them one edit: checked once, all or nothing, one `undo`, `--dry-run`,
 | `@@ delete NAME` | NAME deleted (no text) |
 | `@@ MODULE::use`, `@@ MODULE::header` | the module's `use` lines or header comment |
 
+(0.17) `@@ new after X` or `@@ new before X`, where X is an item an
+earlier block of the file adds, goes next to that block's text: new
+items chain in one file.
+
 So the output of `query show A B` (or the items of `query context`),
 changed and given back, is a round trip: change the items in place, add
 blocks for new ones, apply. Each block is made as `edit replace`,
@@ -338,8 +348,12 @@ try: tachyonc edit patch scale --old 'k: i64' --new 'k: i64, m: i64' --no-check
   (`refactor signature`: `--add 'x: T = VALUE'` with `--at N` when not
   last, `--remove x`, `--rename-param a b` when only names changed in
   place, `--type x T --default '$x as T'` between number types or
-  `--default EXPR`, `--reorder`), a struct's fields (`refactor field
-  --add`, `--rename`, `--type`; a removed field: `query refs S.g`, its
+  `--default EXPR`, `--reorder`; 0.17: `--type x '&mut T'` alone makes
+  the calls' `&v` `&mut v`, a value `v` becomes `&v` or `&mut v`, and a
+  slice `a[..]` `&mut a[..]`; `--default '&$v'` of an argument `&v` is
+  `&v`), a struct's fields (`refactor field --add`, `--rename`, `--type`,
+  0.17: `--type f T --default EXPR`, each literal's value as EXPR with
+  `$f` the old one; a removed field: `query refs S.g`, its
   uses), an enum's variants (`refactor variant --add 'X(T)' --arm
   'EXPR'`, `--rename`, `--remove`). VALUE and EXPR are to be filled in.
   With errors only in the edited text, a renamed parameter still used by
@@ -389,6 +403,38 @@ made crate::lib::extra→2 files→+6 -0 lines
 `error edit.exists` when PATH exists; `error edit.no-parent` when no
 file of the program would have it as a child's file (`refactor
 new-module` makes the modules of a path).
+
+## Editing std by name (0.17)
+
+In the tachyon repository (`compiler/std/` with its `embed.sh`, from the
+current directory or one of the three above it), an edit whose target
+is a std item (`edit patch std::trim`, `edit insert --after Vec::swap`,
+`edit replace std::split`, `edit delete`, `edit wrap`, a block of `edit
+apply`) or one of std's files (`edit patch compiler/std/io.tach:102`)
+runs again with `--std-tree compiler/std`: std is then read from its
+files, each a file of the module `std` under its own path, so the edit
+is made in `compiler/std/FILE.tach` and checked with the edited std:
+every function of std, and each generic one nothing instantiates with
+`i64` for its type parameters (`Gpa` for an `Allocator`), so an error in
+a body is found at once (`compiler/std/io.tach:124:16: error[type
+error] expected '[u8]', got 'i64'`). Once it is written, `compiler/std/embed.sh` makes
+`compiler/src/front/stdsrc.tach` from the files (`note edit.std`);
+`undo` of a std edit does the same. The compiler that runs has the old
+std until it is rebuilt (`bootstrap/bootstrap.sh --dev`).
+
+```
+$ tachyonc edit insert --after std::trim < strip_prefix.tach
+inserted after std::trim→compiler/std/io.tach→+9 -0 lines
+note edit.std: ran compiler/std/embed.sh: compiler/src/front/stdsrc.tach has std's new text; rebuild to use it (bootstrap/bootstrap.sh --dev)
+```
+
+`tachyonc check` in the repository reads std from its files when they
+differ from the compiler's std (edited with the Edit tool, or not yet
+built in), with every function checked as above (`note
+check.std-files`); otherwise std is the compiler's, as before. Outside
+the repository std is the compiler's text and an edit of it is refused
+(`edit.not-source`). The recipe, with the test and the guide entry:
+`tachyonc guide how add-std-fn`.
 
 ## Items as text
 
@@ -440,7 +486,16 @@ with TEXT and removes the others (none: TEXT goes after the header);
 line or before the first; `edit delete` removes them. The header is the
 comment lines at the top of the file, except those right above the first
 item (its own comment; not above a `mod` or `use` line). A header is
-replaced, not inserted next to (`edit.layout`).
+replaced, not inserted next to (`edit.layout`). (0.17) `MODULE::extern`
+is one too: its `extern "C"` blocks (replace: the first becomes TEXT;
+with none, TEXT goes after the `use` lines; insert after the last or
+before the first).
+
+**Files and modules (0.17).** `edit replace FILE.tach < TEXT` replaces
+the whole file. `edit delete MODULE` (or `@@ delete MODULE`) removes its
+`mod` line and its file, and its children's files: one edit, one `undo`.
+A one-line `const` or `static` inserted next to one (`edit insert
+--after B`) joins its run: no blank line between them.
 
 An item that shares a line with other code (a field of
 `struct P { x: i64, y: i64 }`) is its exact bytes: replace replaces
@@ -492,8 +547,11 @@ fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block→3 files→+3 
 | `std015` | (0.15) a program written against 0.14's std moved to 0.15's I/O API, where failure is a Result with a typed error: each call the checker resolved to std's `parse_int` or `Scanner::next_int` gets `.ok()` (the old `Option<i64>`), `read_line` `.unwrap_or(false)` (the old `bool`), `read_stdin` `.unwrap()` (the old `Buf`), so the program means what it meant (exactly, but for `read_stdin` on a read error, which 0.14 read as empty input). Calls in generic functions are found through their instances; a function of the program with one of those names is not std's. A call whose value is already handled as a Result is left as it is, so a second run finds nothing: the operand of `?`; the receiver of `ok`, `err`, `map_err`, `is_ok`, `is_err`, `unwrap`, `unwrap_or`, `expect`, or `unwrap_or_else` with a one-parameter closure (for `read_line` and `read_stdin`, whose old types had none of Result's methods: of `unwrap_or_else`, `map`, `and_then` too); the scrutinee of a `match` or `if let` with an `Ok` or `Err` pattern; the value of a `let` whose type is written `Result<...>`. A Result kept in a local and handled further on (`let r = parse_int(s); match r { Ok(..) .. }`) is not recognised: run it once, on 0.14 code |
 | `alloc016` | (0.16) a program written against 0.15's std, whose containers took their memory from an ambient allocator, made explicit (docs/design/effects-allocation.md §2.3): each call the checker resolved to one of std's 0.15 allocating forms (`#[ambient]`: `Vec::new()`, `with_capacity`, `filled`, `Buf::new()`, `HashMap::new()`, `collect()`, `format(x)`, `read_stdin()`, `split`, `split_whitespace`, `sort_stable`, `sort_stable_by`) becomes its `_in` form with the allocator last (`Vec::new_in(gpa)`, `it.collect_in(gpa)`, `format_in(x, gpa)`), and the `use` lines naming them are renamed (or gain the new name while a call is left). N, the functions holding such a call (in a closure of theirs too) and every caller of one, transitively, take `gpa: Gpa` after their other parameters (`fn main()` becomes `fn main(gpa: Gpa)`, `main(argc, argv)` gets it last), and each call of them passes `gpa` (labelled when it leaves a default before it); a trait's function of the program changes with the trait's declaration and every impl; a function that has a parameter of type `Gpa` already uses it by its name, and its callers stay as they are. What cannot take a parameter is an error naming where it allocates, `fix.alloc016-manual`: an impl of std's trait (`Display::fmt`), a function used as a value, a C-called `extern "C" fn`, a call in a parameter's default (take an `Option` and make the value in the body); the functions of N only it calls are left too. A call in a static's or constant's value: `fix.alloc016-static`. The edit is checked with the 0.15 forms errors (the program before it is checked the same way, so the calls left by an error are no new errors); exit 1 when something was left. A second run finds nothing |
 
+| `values` | (0.17; `--values`) a program moved to references (docs/design/value-semantics.md §5, rules 2-4), computed over the whole program, callees first, to a fixed point (std's bodies count, std is never rewritten): a non-`mut` `p: *T` (`self: *T`) of a safe function becomes `&mut T` when the function writes through it (a field, an element, `v[i] = x` through a receiver, a callee that writes what it is given, a view of it passed to one: `sort_by(v.as_slice(), ..)`), else `&T`, and the calls' `&x` become `&mut x` for a `&mut` parameter (a receiver `x.m()` is the checker's; a raw pointer passed on becomes `&mut *p`); a slice parameter that is written becomes `&mut [T]`, the calls' `a[..]` `&mut a[..]` and `v.as_slice()` `v.as_mut_slice()`; a by-value parameter of an owned type (a Vec, Buf, HashMap, a struct holding one) that the function only reads (no move, no write, no use as a value) becomes `&T`, the calls' `v` become `&v` and its own `&v` `v`. Left as they are: a trait's functions and its impls', closures, functions used as values, `unsafe fn`s, C's, `main`, `**T` and `*[T]`, a pointer parameter copied into a local (a raw walk, `q = (*q).next`). A call whose argument cannot follow (a temporary to a `&T`, a slice local to a `&mut [T]`) keeps that parameter, and the fixed point runs again. Rule 1: `defer x.free();` (or `defer { x.free(); }`) of a Vec, Buf or HashMap local declared in the same block is deleted once the type has a Drop (std's, 0.17 T4), whose drop at the block's end frees it; conflicts and views of statics are the checker's to report (rule 7). A second run finds nothing |
+| `suggested` | (0.18; `--suggested`) the fixes the compiler knows exactly, which an error marks with `try: tachyonc fix --suggested ROOT`: the range of the source its fix replaces and the text, recorded with the error (base/diag.tach, `err_fix`), and the `imports` and `pub` fixes. Which: a did-you-mean (a variable, function, method, field, path member, argument name) when no other name is as near; a numeric conversion (`x as u8`), `n != 0` for a condition, `a[..]` for an array where a slice goes, `.as_slice()` of a Buf or Vec, `&x` (a simple value); `s.trim()` as `trim(s)` (std's function for a method it lacks; with `gpa` when the function's local `gpa` is the allocator); a 0.15 allocating form (`Vec::new()`, `format(x)`) as its `_in` form when the function has a local `gpa` (else `fix --only alloc016` threads one); a call missing arguments that locals of the parameters' names and types give (`parse_table(s)` becomes `parse_table(s, gpa)`); a module path written from the crate's root (`crate::table::f`, a `use` line's path); a Rust type with one spelling (`String`, `&str`: `[u8]`; `char`: `u8`; `usize`: `i64`); a Rust label (`'outer:`, `break 'outer`); `.len` of a sealed field read as `.len()`. A tie, a VALUE to fill in, a choice between fixes: no suggestion. A new error on a line the edit wrote refuses it (`edit.breaks`); new errors elsewhere are the ones the fixes let the checker reach. After the summary, the edited program's errors are printed as `check` prints them, then `note fix.left: N errors left (above)`. `--at FILE:LINE`: the fixes of that line's errors only |
+
 By default the first four (`imports`, `unused`, `pub`, `unsafe`),
-everywhere; `tidy-imports`, `reexports`, `std015` and `alloc016` only when asked
+everywhere; `tidy-imports`, `reexports`, `std015`, `alloc016`, `values` and `suggested` only when asked
 for (`--only reexports,tidy-imports` does both: the rounds tidy what the
 first rewrote).
 
@@ -629,7 +687,8 @@ references between them).
 
 ### query unused
 
-`query unused [MODULE|FILE]`: the definitions nothing refers to (its
+`query unused [MODULE|FILE]` (0.17: MODULE with its child modules): the
+definitions nothing refers to (its
 own `use` lines and itself aside: a function that only calls itself is
 unused) and the imports nothing in their file names, in order:
 `PATH→FILE:LINE:COL→KIND` (`KIND` `import` for an import, whose PATH is
@@ -733,6 +792,9 @@ together, as both sides' `use` lines importing a name twice).
 
 | code | severity | exit | when | try |
 |---|---|---|---|---|
+| `edit.std` | note | 0 | (0.17) a std edit in the repository wrote std's files; embed.sh made stdsrc.tach | rebuild: `bootstrap/bootstrap.sh --dev` |
+| `edit.std` | warning | 0 | (0.17) the same, and embed.sh failed | `compiler/std/embed.sh` |
+| `check.std-files` | note | 0 | (0.17) std's files differ from the compiler's std: checked with them | |
 | `edit.breaks` | error | 1 | the edit adds errors (they are printed); nothing written | the command with `--no-check` |
 | `edit.breaks` | warning | 1, 0 | the same with `--dry-run`, or `--no-check` (written) | `tachyonc check` |
 | `edit.refactor` | note | | (0.15) with edit.breaks: an edited item's shape changed and its uses broke | the refactoring that changes them with it |

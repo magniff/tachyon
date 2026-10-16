@@ -5,7 +5,7 @@
 $ check --json
 $ query def add --json
 crate::add	main.tach:3:4	fn	fn add(a: i64, b: i64) -> i64	effects: none
-std::Add::add	<std>:523:20	trait-method	fn add(self: Self, other: Self) -> Self
+std::Add::add	<std>:609:20	trait-method	fn add(self: Self, other: Self) -> Self
 ## (quotes and tabs escaped)
 $ query grep bad --json
 # main.tach
@@ -26,17 +26,17 @@ $ undo --json
 % printf 'use std::{println};\nfn main() {\n    let x: i64 = "s\\t";\n    prinln(x);\n}\n' > bad.tach
 $ --json check bad.tach
 {"kind":"diagnostic","severity":"error","code":"type error","file":"bad.tach","line":3,"col":18,"message":"expected 'i64', got '[u8]'","help":[],"notes":[],"try":[]}
-{"kind":"diagnostic","severity":"error","code":"type error","file":"bad.tach","line":4,"col":5,"message":"undefined variable 'prinln'","help":["did you mean 'println'?"],"notes":[],"try":[]}
+{"kind":"diagnostic","severity":"error","code":"type error","file":"bad.tach","line":4,"col":5,"message":"undefined variable 'prinln'","help":["did you mean 'println'?"],"notes":[],"try":["tachyonc fix --suggested bad.tach"]}
 [exit 1]
 $ bad.tach -o prog --json
 {"kind":"diagnostic","severity":"error","code":"type error","file":"bad.tach","line":3,"col":18,"message":"expected 'i64', got '[u8]'","help":[],"notes":[],"try":[]}
-{"kind":"diagnostic","severity":"error","code":"type error","file":"bad.tach","line":4,"col":5,"message":"undefined variable 'prinln'","help":["did you mean 'println'?"],"notes":[],"try":[]}
+{"kind":"diagnostic","severity":"error","code":"type error","file":"bad.tach","line":4,"col":5,"message":"undefined variable 'prinln'","help":["did you mean 'println'?"],"notes":[],"try":["tachyonc fix --suggested bad.tach"]}
 [exit 1]
 ## A build whose stderr is not a terminal (here, a file) prints check's
 ## one-line form; --diagnostics=human the human form.
 $ bad.tach -o prog
 bad.tach:3:18: error[type error] expected 'i64', got '[u8]'
-bad.tach:4:5: error[type error] undefined variable 'prinln' | help: did you mean 'println'?
+bad.tach:4:5: error[type error] undefined variable 'prinln' | help: did you mean 'println'? | try: tachyonc fix --suggested bad.tach
 [exit 1]
 $ --diagnostics=human bad.tach -o prog
 error[type error]: expected 'i64', got '[u8]'
@@ -44,4 +44,5 @@ error[type error]: expected 'i64', got '[u8]'
 error[type error]: undefined variable 'prinln'
  --> bad.tach: line 4, column 5
   = help: did you mean 'println'?
+  = try: tachyonc fix --suggested bad.tach
 [exit 1]

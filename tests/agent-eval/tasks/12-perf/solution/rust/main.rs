@@ -10,7 +10,10 @@ struct Rng {
 
 impl Rng {
     fn next(&mut self) -> u64 {
-        self.x = self.x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.x = self
+            .x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.x >> 33
     }
 }
@@ -18,7 +21,10 @@ impl Rng {
 fn main() {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).unwrap();
-    let nums: Vec<u64> = input.split_whitespace().map(|w| w.parse().unwrap()).collect();
+    let nums: Vec<u64> = input
+        .split_whitespace()
+        .map(|w| w.parse().unwrap())
+        .collect();
     let (n, q, m) = (nums[0] as usize, nums[1] as usize, nums[2]);
     let mut rng = Rng { x: nums[3] };
 
@@ -30,7 +36,10 @@ fn main() {
     let mut sorted = a.clone();
     sorted.sort_unstable();
     sorted.dedup();
-    let rank: Vec<u32> = a.iter().map(|v| sorted.binary_search(v).unwrap() as u32).collect();
+    let rank: Vec<u32> = a
+        .iter()
+        .map(|v| sorted.binary_search(v).unwrap() as u32)
+        .collect();
 
     // Queries as lists by right end: head[r], next[j].
     let mut ql: Vec<u32> = vec![0; q];

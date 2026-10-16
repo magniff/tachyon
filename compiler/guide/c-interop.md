@@ -141,11 +141,9 @@ buffers):
 
 ```tach
 import "stdio.h" as c;
-use std::Buf;
 
 fn main(gpa: Gpa) -> i32 {
-    let mut line = Buf::new_in(gpa);
-    defer line.free();
+    let mut line = Buf::new_in(gpa);              // dropped (freed) at the end
     loop {
         let ch = unsafe { c::getchar() };
         if ch < 0 || ch == '\n' as i32 { break; }

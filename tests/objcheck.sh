@@ -18,6 +18,11 @@
 # same as well (on Linux it is part of the executables' data, compared
 # above).
 #
+# (0.17) A program is built with its test case's FLAGS (`// FLAGS:` in the
+# program, or in the tests/examples/*.test naming an example), as
+# tests/run.sh builds it, and a case marked XFAIL is left out: both read by
+# tests/directives.awk, the suite's own reader.
+#
 # usage: tests/objcheck.sh [-c COMPILER] [-t TARGET] [-j JOBS] [FILTER]
 #
 #   -c COMPILER   the tachyonc to check (default: target/tachyonc)
@@ -43,8 +48,8 @@ while [ $# -gt 0 ]; do
         -c) COMPILER=$2; shift 2 ;;
         -t) TARGET=$2; shift 2 ;;
         -j) JOBS=$2; shift 2 ;;
-        -h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        -*) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
         *) FILTER=$1; shift ;;
     esac
 done
@@ -135,13 +140,43 @@ dsym() {
     esac
 }
 
+# The file holding a program's test directives: the program itself, or for
+# an example the first tests/examples/*.test whose SOURCE it is.
+case_file() {
+    case "$1" in
+        examples/*) grep -l -x "// SOURCE: $1" tests/examples/*.test 2>/dev/null | head -1 ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# A program's directives (tests/directives.awk, as tests/run.sh reads them)
+# into directory $2; nothing when it has no test case.
+case_directives() { # <program> <dir>
+    mkdir -p "$2"
+    cd_file=$(case_file "$1")
+    [ -n "$cd_file" ] || return 0
+    awk -v dir="$2" -v target="$TARGET" -f "$ROOT/tests/directives.awk" "$cd_file"
+}
+
+# The compiler options a program's test case gives it (FLAGS, @ROOT@ the
+# root of the tree).
+case_flags() {
+    [ -f "$WORK/directives/$(echo "$1" | tr / _)/flags" ] || return 0
+    sed "s|@ROOT@|$ROOT|g" "$WORK/directives/$(echo "$1" | tr / _)/flags"
+}
+
 check() { # <file> <level> <dir> [-g]
     f=$1 o=$2 d=$3 g=${4:-}
     mkdir -p "$d"
+    # The case's FLAGS (0.17: --values=off, --check-alloc, ...), as
+    # tests/run.sh builds it.
+    flags=$(case_flags "$f")
+    # (--check-unsafe needs the IR: -O1 for -O0, as tests/run.sh does.)
+    case "$o:$flags" in 0:*--check-unsafe*) o=1 ;; esac
     # shellcheck disable=SC2086
-    "$COMPILER" --target "$TARGET" "-O$o" $g -c "$f" -o "$d/ours.o" >"$d/out" 2>&1 || { echo "FAIL $f -O$o $g: tachyonc -c: $(head -c 300 "$d/out")"; return; }
+    "$COMPILER" --target "$TARGET" "-O$o" $g $flags -c "$f" -o "$d/ours.o" >"$d/out" 2>&1 || { echo "FAIL $f -O$o $g: tachyonc -c: $(head -c 300 "$d/out")"; return; }
     # shellcheck disable=SC2086
-    "$COMPILER" --target "$TARGET" "-O$o" $g -S "$f" -o "$d/prog.s" >"$d/out" 2>&1 || { echo "FAIL $f -O$o $g: tachyonc -S"; return; }
+    "$COMPILER" --target "$TARGET" "-O$o" $g $flags -S "$f" -o "$d/prog.s" >"$d/out" 2>&1 || { echo "FAIL $f -O$o $g: tachyonc -S"; return; }
     # shellcheck disable=SC2086
     cc_run $LINK_FLAGS -c "$d/prog.s" -o "$d/cc.o" >"$d/out" 2>&1 || { echo "FAIL $f -O$o: cc -c"; return; }
     # shellcheck disable=SC2086
@@ -197,6 +232,12 @@ for f in tests/run/*.tach tests/run/*/main.tach examples/*/main.tach examples/*/
         examples/*) grep -l -x "// SOURCE: $f" tests/examples/*.test 2>/dev/null \
             | xargs grep -q '^// CSOURCE' 2>/dev/null && continue ;;
     esac
+    # Its test case's directives; a known bug (XFAIL) is the suite's to
+    # report, not a difference from cc.
+    dd="$WORK/directives/$(echo "$f" | tr / _)"
+    rm -rf "$dd"
+    case_directives "$f" "$dd"
+    [ -s "$dd/xfail" ] && continue
     echo "$f" >>"$list"
 done
 # The slots: JOBS of them, or (0.11) the ones $TACHYON_JOBSERVER shares

@@ -1,0 +1,1041 @@
+// `tachyonc fix --values` (0.17, docs/design/value-semantics.md §5): the
+// parameters rewritten for references, with every call.
+//
+// - Rule 2: a non-`mut` `p: *T` (`self: *T`) of a safe function becomes
+//   `&mut T` when the function writes through it, else `&T`; the calls'
+//   `&x` become `&mut x` for a `&mut` parameter (a receiver `x.m()` is
+//   referenced by itself), a raw pointer passed on becomes `&mut *p`.
+// - Rule 3: a slice parameter that is written becomes `&mut [T]`; the
+//   calls' `a[..]` become `&mut a[..]`, `v.as_slice()` `v.as_mut_slice()`.
+// - Rule 4, the move migration: a by-value parameter of an owned type
+//   (holding a Vec, Buf, HashMap) that the function only reads becomes
+//   `&T`, the calls' `v` `&v`, its own `&v` `v`.
+//
+// "Writes" and "only reads" are computed over the whole program, callees
+// first, to a fixed point: passing `p` (or `&p.f`) on to a parameter that
+// is written writes `p`; passing `v` by value to a parameter that keeps it
+// moves `v`. std's functions are read (their `*T` receivers count by their
+// bodies) and never rewritten. A function used as a value, one of a trait
+// or an impl of one, an `unsafe fn`, C's and `main` keep their signatures.
+// A call whose argument cannot be rewritten (a temporary to a `&T`, a
+// slice local to a `&mut [T]`) keeps its parameter as it is, and the fixed
+// point runs again. Left to hand (§5 rule 7): conflicts, views of statics,
+// trait methods taking `self: Self`. Rule 1: `defer x.free();` of a Vec,
+// Buf or HashMap local of the same block is deleted, once the container
+// has a Drop (std's, T4): its drop frees it.
+
+use crate::base::{FILES, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_str, intern};
+use crate::front::ast::{
+    DEFER_IMPLICIT, FN_UNSAFE, NODES, NODE_COUNT, NODE_RAW, NODE_REF_MUT, NodeKind, child,
+};
+use crate::front::check::Res;
+use crate::front::lexer::Tok;
+use crate::front::modules::{STD_MODULE, file_of_pos};
+use crate::front::own::kinds::{K_NEEDS_DROP, is_owned_type, type_kind};
+use crate::front::types::{FNS, FN_COUNT, REF_MUT, STRUCTS, TYPES, TyKind, fn_param};
+use crate::middle::lower::ssa::HMap;
+use crate::tools::edit::edit_replace;
+use crate::tools::query::defs::{DEFS, DEF_COUNT, K_IMPL_METHOD, K_TRAIT_FN, def_of_node};
+
+// The classes of parameters (pclass).
+const PC_NONE: i64 = 0;
+const PC_PTR: i64 = 1;
+const PC_SLICE: i64 = 2;
+const PC_OWNED: i64 = 3;
+
+// The flags of a parameter (per function node and index).
+const F_WRITE: i64 = 1;
+const F_MOVE: i64 = 2;
+const F_FORCED: i64 = 4;
+
+// The conversions (conv).
+const CV_NONE: i64 = 0;
+const CV_MUT: i64 = 1;
+const CV_SHARED: i64 = 2;
+const CV_MUT_SLICE: i64 = 3;
+const CV_OWNED_REF: i64 = 4;
+
+// Contexts of a use.
+const CX_READ: i64 = 0;
+const CX_MOVE: i64 = 1;
+// (moved into a local: `let q = p;`, `q = p;`)
+const CX_BIND: i64 = 2;
+
+// The phases of a walk of a body: marking the flags, finding the calls
+// that cannot be rewritten, making the edits.
+const PH_MARK: i64 = 0;
+const PH_VERIFY: i64 = 1;
+const PH_EDIT: i64 = 2;
+
+static mut FLAGS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static mut CHANGED: bool = false;
+static mut PHASE: i64 = 0;
+static mut CUR_F: i64 = 0;
+static mut CUR_LOCALS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut IN_HOLE: i64 = 0;
+// Function nodes used as a value (+ 1 → 1).
+static mut AS_VALUE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// Positions edited (+ 1 → 1): a generic function's instances share them.
+static mut EDITED: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static mut HAS_AS_MUT_SLICE: bool = false;
+
+// The counts, for the report: parameters to `&mut T`, to `&T`, to `&mut
+// [T]`, owned to `&T`; arguments rewritten; `defer x.free()` deleted.
+pub static mut VALUES_COUNTS: [i64; 6] = [0; 6];
+
+// The template's node of function f (an instance's flags are its
+// template's).
+fn base_node(f: i64) -> i64 {
+    unsafe {
+        if FNS[f].tmpl > 0 { FNS[FNS[f].tmpl - 1].node } else { FNS[f].node }
+    }
+}
+
+fn key(f: i64, i: i64) -> i64 {
+    base_node(f) * 64 + i + 1
+}
+
+fn flags(f: i64, i: i64) -> i64 {
+    unsafe { FLAGS.get(key(f, i)) }
+}
+
+fn mark(f: i64, i: i64, bits: i64) {
+    unsafe {
+        let old = FLAGS.get(key(f, i));
+        if (old | bits) != old {
+            FLAGS.put(key(f, i), old | bits);
+            CHANGED = true;
+        }
+    }
+}
+
+fn has_body(f: i64) -> bool {
+    unsafe {
+        let item = FNS[f].node;
+        f >= 0 && !FNS[f].is_extern && item > 0 && NODES[item].kind == NodeKind::Fn
+            && NODES[item].c != 0
+    }
+}
+
+fn in_std(pos: i64) -> bool {
+    unsafe { FILES[file_of_pos(pos)].path[0] == '<' }
+}
+
+// Whether f's signature may change: a safe function of the program, not
+// C's, a trait's or an impl's of one, not used as a value, not main.
+fn eligible(f: i64) -> bool {
+    unsafe {
+        if !has_body(f) || FNS[f].export || (FNS[f].attrs & FN_UNSAFE) != 0 {
+            return false;
+        }
+        let node = base_node(f);
+        if in_std(NODES[node].start) || AS_VALUE.get(node + 1) != 0 {
+            return false;
+        }
+        let name = SYMS[NODES[node].a].text;
+        if name.len == 4 && name[0] == 'm' && name[1] == 'a' && name[2] == 'i' && name[3] == 'n'
+            && FNS[f].self_ty == 0 {
+            return false;
+        }
+        let d = def_of_node(node);
+        // (a closure's function has no definition: its type is its
+        // caller's to choose)
+        d >= 0 && DEFS[d].kind != K_IMPL_METHOD && DEFS[d].kind != K_TRAIT_FN
+    }
+}
+
+// The class of parameter i of f, by its type and how it is written.
+fn pclass(f: i64, i: i64) -> i64 {
+    unsafe {
+        if i >= FNS[f].param_count || i >= 63 {
+            return PC_NONE;
+        }
+        let item = FNS[f].node;
+        if item <= 0 || i >= NODES[item].count {
+            return PC_NONE;
+        }
+        let pn = child(item, i);
+        let tn = NODES[pn].b;
+        let t = fn_param(f, i);
+        if t <= 0 || tn <= 0 {
+            return PC_NONE;
+        }
+        let k = TYPES[t].kind;
+        // (not `**T` nor `*[T]`: a reference to a pointer or a slice is
+        // left to hand)
+        if k == TyKind::Ptr && TYPES[t].b == 0 && NODES[pn].c == 0 && SRC[NODES[tn].start] == '*'
+            && TYPES[t].a > 0 && TYPES[TYPES[t].a].kind != TyKind::Ptr
+            && TYPES[TYPES[t].a].kind != TyKind::Slice {
+            return PC_PTR;
+        }
+        if k == TyKind::Slice && TYPES[t].b != REF_MUT && SRC[NODES[tn].start] == '[' {
+            return PC_SLICE;
+        }
+        if k != TyKind::Ptr && k != TyKind::Slice && FNS[f].generic == 0 && FNS[f].tmpl == 0
+            && SRC[NODES[tn].start] != '&' && is_owned_type(t) {
+            return PC_OWNED;
+        }
+        PC_NONE
+    }
+}
+
+// The conversion parameter i of f gets.
+fn conv(f: i64, i: i64) -> i64 {
+    if f < 0 || !eligible(f) {
+        return CV_NONE;
+    }
+    let c = pclass(f, i);
+    let fl = flags(f, i);
+    if c == PC_NONE || (fl & F_FORCED) != 0 {
+        return CV_NONE;
+    }
+    if c == PC_PTR {
+        return if (fl & F_WRITE) != 0 { CV_MUT } else { CV_SHARED };
+    }
+    if c == PC_SLICE {
+        return if (fl & F_WRITE) != 0 { CV_MUT_SLICE } else { CV_NONE };
+    }
+    if (fl & (F_WRITE | F_MOVE)) != 0 { CV_NONE } else { CV_OWNED_REF }
+}
+
+// Whether a call of f may write through (or into) what its parameter i
+// gets.
+fn callee_writes(f: i64, i: i64) -> bool {
+    unsafe {
+        if f < 0 || FNS[f].is_extern || i >= FNS[f].param_count {
+            return true;
+        }
+        let t = fn_param(f, i);
+        if t <= 0 {
+            return true;
+        }
+        let k = TYPES[t].kind;
+        if k == TyKind::Slice {
+            if TYPES[t].b == REF_MUT {
+                return true;
+            }
+        } else if k == TyKind::Ptr {
+            if TYPES[t].b == REF_MUT {
+                return true;
+            }
+            if TYPES[t].b != 0 {
+                return false;
+            }
+            let item = FNS[f].node;
+            if (FNS[f].attrs & FN_UNSAFE) != 0 || item <= 0 || i >= NODES[item].count
+                || NODES[child(item, i)].c != 0 {
+                return true;
+            }
+        } else {
+            return false;
+        }
+        if !has_body(f) {
+            return true;
+        }
+        let fl = flags(f, i);
+        (fl & F_WRITE) != 0 || (fl & F_FORCED) != 0 && k == TyKind::Ptr
+    }
+}
+
+// Whether a call of f keeps (moves) the value its by-value parameter i
+// gets: unless the parameter becomes `&T`.
+fn callee_consumes(f: i64, i: i64) -> bool {
+    conv(f, i) != CV_OWNED_REF
+}
+
+// The parameter index of local l of the function walked, or -1.
+fn param_of_local(l: i64) -> i64 {
+    unsafe {
+        if l < 0 {
+            return -1;
+        }
+        for i in 0..CUR_LOCALS.count {
+            if CUR_LOCALS.data[i] == l {
+                return i;
+            }
+        }
+        -1
+    }
+}
+
+// The parameter expression n is (a bare name), or -1.
+fn param_ident(n: i64) -> i64 {
+    unsafe {
+        if n <= 0 || NODES[n].kind != NodeKind::Ident || NODES[n].res != Res::Local {
+            return -1;
+        }
+        param_of_local(NODES[n].y)
+    }
+}
+
+// The root of place n (through fields, indexes, derefs); its node.
+fn place_root(n: i64) -> i64 {
+    unsafe {
+        let mut e = n;
+        while e > 0 {
+            let k = NODES[e].kind;
+            if k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Index {
+                e = NODES[e].a;
+            } else if k == NodeKind::Unary && NODES[e].op == Tok::Star {
+                e = NODES[e].b;
+            } else {
+                return e;
+            }
+        }
+        e
+    }
+}
+
+// The root a write to place n writes: place_root, and through a method's
+// receiver when the place is its result (`v[i] = x` on a borrowed Vec is
+// `v.as_slice()[i] = x`).
+fn write_root(n: i64) -> i64 {
+    unsafe {
+        let mut r = place_root(n);
+        let mut steps = 0;
+        while r > 0 && NODES[r].kind == NodeKind::Call && NODES[r].count > 0 && steps < 8 {
+            let mut a = child(r, 0);
+            if NODES[a].kind == NodeKind::Unary && NODES[a].op == Tok::Amp {
+                a = NODES[a].b;
+            }
+            r = place_root(a);
+            steps += 1;
+        }
+        r
+    }
+}
+
+// Whether place n goes through a deref or an index (it is not its root).
+fn deeper(n: i64) -> bool {
+    place_root(n) != n
+}
+
+// The expressions inside place n that are evaluated (indexes), and its
+// root when it is no name.
+fn place_parts(n: i64) {
+    unsafe {
+        let mut e = n;
+        while e > 0 {
+            let k = NODES[e].kind;
+            if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+                e = NODES[e].a;
+            } else if k == NodeKind::Index {
+                scan(NODES[e].b, CX_READ);
+                e = NODES[e].a;
+            } else if k == NodeKind::Unary && NODES[e].op == Tok::Star {
+                e = NODES[e].b;
+            } else {
+                if k != NodeKind::Ident {
+                    scan(e, CX_READ);
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn mark_cur(p: i64, bits: i64) {
+    if PHASE == PH_MARK && p >= 0 {
+        mark(CUR_F, p, bits);
+    }
+}
+
+// A use of parameter p the walk knows nothing more about: a pointer kept
+// somewhere may be written through; an owned value used as a value is not
+// only read. (A slice kept, `let rest = s[1..]`, counts as read: a write
+// through the copy is left to the checker, own.readonly.)
+fn bare_use(p: i64, ctx: i64) {
+    let c = pclass(CUR_F, p);
+    if c == PC_OWNED {
+        mark_cur(p, F_MOVE);
+    } else if c == PC_PTR && ctx == CX_BIND && IN_HOLE == 0 {
+        // (a local made from it would be a reference, and a raw walk
+        // `q = (*q).next` would no longer check)
+        mark_cur(p, F_WRITE | F_FORCED);
+    } else if c == PC_PTR && ctx == CX_MOVE && IN_HOLE == 0 {
+        mark_cur(p, F_WRITE);
+    }
+}
+
+// Place n read (ctx: moved out when its value is owned).
+fn place_read(n: i64, ctx: i64) {
+    unsafe {
+        place_parts(n);
+        let p = param_ident(place_root(n));
+        if p < 0 {
+            return;
+        }
+        if !deeper(n) {
+            bare_use(p, ctx);
+            return;
+        }
+        if pclass(CUR_F, p) == PC_OWNED && (IN_HOLE > 0
+            || ctx != CX_READ && is_owned_type(NODES[n].ty)) {
+            mark_cur(p, F_MOVE);
+        }
+    }
+}
+
+// Every parameter named inside n is used in ways unknown (a closure's
+// captures).
+fn mark_all(n: i64) {
+    unsafe {
+        if n <= 0 || PHASE != PH_MARK {
+            return;
+        }
+        let s = NODES[n].start;
+        let e = NODES[n].end;
+        for m in n..NODE_COUNT {
+            if NODES[m].start >= s && NODES[m].end <= e {
+                let p = param_ident(m);
+                if p >= 0 {
+                    mark_cur(p, F_WRITE | F_MOVE);
+                }
+            }
+        }
+        // (a capture's node can come before the closure's)
+        for m in 1..n {
+            if NODES[m].start >= s && NODES[m].end <= e && NODES[m].kind == NodeKind::Ident {
+                let p = param_ident(m);
+                if p >= 0 {
+                    mark_cur(p, F_WRITE | F_MOVE);
+                }
+            }
+        }
+    }
+}
+
+fn scan_list(n: i64, ctx: i64) {
+    unsafe {
+        for i in 0..NODES[n].count {
+            scan(child(n, i), ctx);
+        }
+    }
+}
+
+// Whether `let` s is a `for`'s sequence (`__for_seq`, made by the checker)
+// over a parameter.
+fn for_sequence(s: i64) -> bool {
+    unsafe {
+        let pat = NODES[s].a;
+        if pat <= 0 || NODES[pat].kind != NodeKind::PatBind {
+            return false;
+        }
+        let name = SYMS[NODES[pat].a].text;
+        name.len > 5 && name[0] == '_' && name[1] == '_' && name[2] == 'f' && name[3] == 'o'
+            && name[4] == 'r' && param_ident(NODES[s].c) >= 0
+    }
+}
+
+// Walks expression n of the current function.
+fn scan(n: i64, ctx: i64) {
+    unsafe {
+        if n <= 0 {
+            return;
+        }
+        match NODES[n].kind {
+            NodeKind::Ident => {
+                let p = param_ident(n);
+                if p >= 0 {
+                    bare_use(p, ctx);
+                }
+            }
+            NodeKind::FieldAccess | NodeKind::TupleField => place_read(n, ctx),
+            NodeKind::Unary => {
+                let op = NODES[n].op;
+                if op == Tok::Star {
+                    place_read(n, ctx);
+                } else if op == Tok::Amp {
+                    borrow(n, -1, -1);
+                } else {
+                    scan(NODES[n].b, CX_READ);
+                }
+            }
+            NodeKind::Index => {
+                if NODES[NODES[n].b].kind == NodeKind::Range {
+                    scan(NODES[n].b, CX_READ);
+                    let p = param_ident(NODES[n].a);
+                    if p >= 0 && pclass(CUR_F, p) == PC_SLICE {
+                        bare_use(p, ctx);
+                    } else {
+                        place_parts(NODES[n].a);
+                    }
+                } else {
+                    // (pointer arithmetic on a `*T` parameter, `p[1]` in
+                    // unsafe code: it stays a raw pointer)
+                    let p = param_ident(NODES[n].a);
+                    if p >= 0 && (NODES[n].p & NODE_RAW) != 0 {
+                        force(CUR_F, p);
+                    }
+                    place_read(n, ctx);
+                }
+            }
+            NodeKind::Cast => scan(NODES[n].a, CX_READ),
+            NodeKind::Binary => {
+                scan(NODES[n].b, CX_READ);
+                scan(NODES[n].c, CX_READ);
+            }
+            NodeKind::Assign => {
+                let target = NODES[n].b;
+                scan(NODES[n].c, if NODES[n].op == Tok::Eq { CX_BIND } else { CX_READ });
+                place_parts(target);
+                let p = param_ident(write_root(target));
+                if p >= 0 {
+                    mark_cur(p, F_WRITE);
+                }
+            }
+            NodeKind::Call => scan_call(n),
+            NodeKind::Block => {
+                for i in 0..NODES[n].count {
+                    let s = child(n, i);
+                    let k = NODES[s].kind;
+                    if k == NodeKind::Let && for_sequence(s) {
+                        // (a `for` over a parameter reads it: by reference
+                        // from 0.17)
+                    } else if k == NodeKind::Let {
+                        scan(NODES[s].c, CX_BIND);
+                    } else if k == NodeKind::Defer && (NODES[s].p & DEFER_IMPLICIT) != 0 {
+                        // (a drop the checker placed, --values=error: not a
+                        // use the program makes)
+                    } else if k == NodeKind::Defer || k == NodeKind::ExprStmt {
+                        scan(NODES[s].a, CX_READ);
+                    } else {
+                        scan(s, CX_READ);
+                    }
+                }
+                scan(NODES[n].a, ctx);
+            }
+            NodeKind::If => {
+                scan(NODES[n].a, CX_READ);
+                scan(NODES[n].b, ctx);
+                scan(NODES[n].c, ctx);
+            }
+            NodeKind::Match => {
+                scan(NODES[n].a, CX_MOVE);
+                for i in 0..NODES[n].count {
+                    let arm = child(n, i);
+                    scan(NODES[arm].b, CX_READ);
+                    scan(NODES[arm].c, ctx);
+                }
+            }
+            NodeKind::Loop => scan(NODES[n].b, CX_READ),
+            NodeKind::While => {
+                scan(NODES[n].b, CX_READ);
+                scan(NODES[n].c, CX_READ);
+            }
+            NodeKind::For => {
+                // (`for x in v` reads v, by reference from 0.17)
+                if param_ident(NODES[n].c) < 0 {
+                    scan(NODES[n].c, CX_READ);
+                }
+                scan(NODES[n].d, CX_READ);
+            }
+            NodeKind::Break => scan(NODES[n].b, CX_MOVE),
+            NodeKind::Return => scan(NODES[n].a, CX_MOVE),
+            NodeKind::Tuple | NodeKind::Array | NodeKind::StructLit | NodeKind::VariantLit => {
+                scan_list(n, CX_MOVE);
+            }
+            NodeKind::FieldInit | NodeKind::NamedArg => scan(NODES[n].b, ctx),
+            NodeKind::Repeat => scan(NODES[n].a, CX_MOVE),
+            NodeKind::Range => {
+                scan(NODES[n].a, CX_READ);
+                scan(NODES[n].b, CX_READ);
+            }
+            NodeKind::Closure => mark_all(NODES[n].y),
+            NodeKind::Try => scan(NODES[n].y, ctx),
+            NodeKind::Interp => {
+                IN_HOLE += 1;
+                scan(NODES[n].y, ctx);
+                IN_HOLE -= 1;
+            }
+            NodeKind::EnumPanic => scan(NODES[n].a, CX_READ),
+            NodeKind::VecOp => {
+                scan(NODES[n].a, CX_READ);
+                scan_list(n, CX_READ);
+            }
+            _ => {}
+        }
+    }
+}
+
+// `&place` (node n), passed as argument i of a call of f (f, i: -1, not
+// an argument).
+fn borrow(n: i64, f: i64, i: i64) {
+    unsafe {
+        let operand = NODES[n].b;
+        place_parts(operand);
+        let p = param_ident(place_root(operand));
+        if p < 0 || IN_HOLE > 0 {
+            return;
+        }
+        let mutable = (NODES[n].p & NODE_REF_MUT) != 0;
+        let receiver = i == 0 && NODES[n].start == NODES[operand].start;
+        let c = pclass(CUR_F, p);
+        if mutable || (i >= 0 && callee_writes(f, i)) || i < 0 && c == PC_PTR && deeper(operand) {
+            mark_cur(p, F_WRITE);
+        }
+        // (an owned parameter's own `&v` becomes `v` once it is `&T`)
+        if c == PC_OWNED && !receiver && !deeper(operand) && PHASE == PH_EDIT
+            && conv(CUR_F, p) == CV_OWNED_REF {
+            replace_text(NODES[n].start, NODES[operand].start, c"");
+        }
+    }
+}
+
+// Call n: each argument by what its parameter does with it.
+fn scan_call(n: i64) {
+    unsafe {
+        let f = NODES[n].x - 1;
+        if f < 0 {
+            scan(NODES[n].a, CX_READ);
+        }
+        for i in 0..NODES[n].count {
+            let mut arg = child(n, i);
+            if NODES[arg].kind == NodeKind::NamedArg {
+                arg = NODES[arg].b;
+            }
+            argument(f, i, arg, n);
+        }
+    }
+}
+
+// Argument arg of a call of f, at parameter i.
+fn argument(f: i64, i: i64, arg: i64, call: i64) {
+    unsafe {
+        let k = NODES[arg].kind;
+        // (a method's receiver, `x.m()`, is referenced or dereferenced
+        // by the checker: nothing to write)
+        let receiver = i == 0 && NODES[arg].start == NODES[call].start;
+        if PHASE != PH_MARK && f >= 0 && conv(f, i) != CV_NONE && !in_std(NODES[arg].start)
+            && !receiver {
+            rewrite_argument(f, i, arg);
+        }
+        if k == NodeKind::Unary && NODES[arg].op == Tok::Amp {
+            borrow(arg, f, i);
+            return;
+        }
+        let p = param_ident(arg);
+        let slicing = k == NodeKind::Index && NODES[NODES[arg].b].kind == NodeKind::Range;
+        let q = if slicing { param_ident(place_root(NODES[arg].a)) } else { p };
+        if q >= 0 && IN_HOLE == 0 {
+            let c = pclass(CUR_F, q);
+            if slicing {
+                scan(NODES[arg].b, CX_READ);
+            }
+            if c == PC_PTR || c == PC_SLICE {
+                if callee_writes(f, i) {
+                    mark_cur(q, F_WRITE);
+                }
+                return;
+            }
+            if c == PC_OWNED && !slicing {
+                if f < 0 || callee_consumes(f, i) {
+                    mark_cur(q, F_MOVE);
+                }
+                return;
+            }
+        }
+        // (a view of a parameter passed on, `v.as_slice()`, to a parameter
+        // that is written: sort_by)
+        let w = param_ident(write_root(arg));
+        if w >= 0 && IN_HOLE == 0 && pclass(CUR_F, w) != PC_NONE && callee_writes(f, i) {
+            mark_cur(w, F_WRITE);
+        }
+        let by_value = f < 0 || i >= FNS[f].param_count || fn_param(f, i) <= 0
+            || TYPES[fn_param(f, i)].kind != TyKind::Ptr;
+        scan(arg, if by_value { CX_MOVE } else { CX_READ });
+    }
+}
+
+// ---- the edits ----
+
+fn replace_text(a: i64, b: i64, text: *u8) {
+    unsafe {
+        if EDITED.get(a + 1) != 0 {
+            return;
+        }
+        let t = buf_new();
+        buf_str(t, text);
+        if edit_replace(a, b, t) {
+            EDITED.put(a + 1, 1);
+        }
+    }
+}
+
+fn force(f: i64, i: i64) {
+    mark(f, i, F_FORCED);
+}
+
+fn plain_expr(n: i64) -> bool {
+    unsafe {
+        let k = NODES[n].kind;
+        k == NodeKind::Ident || k == NodeKind::FieldAccess || k == NodeKind::TupleField
+            || k == NodeKind::Call || k == NodeKind::Index
+    }
+}
+
+// Argument arg of a call of f at parameter i, whose type changes (conv):
+// rewritten (PH_EDIT), or the parameter kept (forced) when it cannot be.
+fn rewrite_argument(f: i64, i: i64, arg: i64) {
+    unsafe {
+        let cv = conv(f, i);
+        let k = NODES[arg].kind;
+        let t = NODES[arg].ty;
+        let p = param_ident(arg);
+        let caller = if p >= 0 { conv(CUR_F, p) } else { CV_NONE };
+        let edit = PHASE == PH_EDIT;
+        if cv == CV_MUT || cv == CV_SHARED {
+            if k == NodeKind::Unary && NODES[arg].op == Tok::Amp {
+                let operand = NODES[arg].b;
+                if i == 0 && NODES[arg].start == NODES[operand].start {
+                    return;
+                }
+                // (`&` of a place reached through a raw pointer stays raw)
+                let root = place_root(operand);
+                let rt = NODES[root].ty;
+                if rt > 0 && TYPES[rt].kind == TyKind::Ptr && TYPES[rt].b == 0
+                    && param_ident(root) < 0 && root != operand {
+                    force(f, i);
+                    return;
+                }
+                if cv == CV_MUT && (NODES[arg].p & NODE_REF_MUT) == 0 && edit {
+                    replace_text(NODES[arg].start, NODES[arg].start + 1, c"&mut ");
+                    VALUES_COUNTS[4] += 1;
+                }
+                return;
+            }
+            if p >= 0 && (caller == CV_MUT || caller == CV_SHARED) {
+                if caller == CV_SHARED && cv == CV_MUT {
+                    force(f, i);
+                }
+                return;
+            }
+            if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b != 0 {
+                if TYPES[t].b != REF_MUT && cv == CV_MUT {
+                    force(f, i);
+                }
+                return;
+            }
+            if t > 0 && TYPES[t].kind == TyKind::Ptr {
+                if edit {
+                    wrap(arg, if cv == CV_MUT { c"&mut *" } else { c"&*" });
+                    VALUES_COUNTS[4] += 1;
+                }
+                return;
+            }
+            force(f, i);
+            return;
+        }
+        if cv == CV_MUT_SLICE {
+            if p >= 0 && caller == CV_MUT_SLICE {
+                return;
+            }
+            if t > 0 && TYPES[t].kind == TyKind::Slice && TYPES[t].b == REF_MUT {
+                return;
+            }
+            if k == NodeKind::Index && NODES[NODES[arg].b].kind == NodeKind::Range {
+                if edit {
+                    replace_text(NODES[arg].start, NODES[arg].start, c"&mut ");
+                    VALUES_COUNTS[4] += 1;
+                }
+                return;
+            }
+            let s = SRC[NODES[arg].start..NODES[arg].end];
+            let tail = ".as_slice()";
+            if HAS_AS_MUT_SLICE && s.len > tail.len && same(s[s.len - tail.len..s.len], tail) {
+                if edit {
+                    replace_text(NODES[arg].end - tail.len, NODES[arg].end, c".as_mut_slice()");
+                    VALUES_COUNTS[4] += 1;
+                }
+                return;
+            }
+            force(f, i);
+            return;
+        }
+        if cv == CV_OWNED_REF {
+            if p >= 0 && caller == CV_OWNED_REF {
+                return;
+            }
+            let root = place_root(arg);
+            if (k == NodeKind::Ident || k == NodeKind::FieldAccess || k == NodeKind::TupleField)
+                && NODES[root].kind == NodeKind::Ident
+                && (NODES[root].res == Res::Local || NODES[root].res == Res::Static) {
+                if edit {
+                    replace_text(NODES[arg].start, NODES[arg].start, c"&");
+                    VALUES_COUNTS[4] += 1;
+                }
+                return;
+            }
+            force(f, i);
+        }
+    }
+}
+
+// Wraps arg: PREFIX(arg), parentheses unless it is a name, a field, a
+// call or an index.
+fn wrap(arg: i64, prefix: *u8) {
+    unsafe {
+        let a = NODES[arg].start;
+        let b = NODES[arg].end;
+        if EDITED.get(a + 1) != 0 {
+            return;
+        }
+        let t = buf_new();
+        buf_str(t, prefix);
+        let plain = plain_expr(arg);
+        if !plain {
+            buf_byte(t, '(');
+        }
+        buf_bytes(t, SRC[a..b]);
+        if !plain {
+            buf_byte(t, ')');
+        }
+        if edit_replace(a, b, t) {
+            EDITED.put(a + 1, 1);
+        }
+    }
+}
+
+fn same(a: [u8], b: [u8]) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    for i in 0..a.len {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    true
+}
+
+// The parameters' types of function f, rewritten (PH_EDIT).
+fn edit_params(f: i64) {
+    unsafe {
+        let item = FNS[f].node;
+        for i in 0..FNS[f].param_count {
+            let cv = conv(f, i);
+            if cv == CV_NONE || i >= NODES[item].count {
+                continue;
+            }
+            let tn = NODES[child(item, i)].b;
+            let s = NODES[tn].start;
+            if EDITED.get(s + 1) != 0 {
+                continue;
+            }
+            if cv == CV_MUT {
+                replace_text(s, s + 1, c"&mut ");
+                VALUES_COUNTS[0] += 1;
+            } else if cv == CV_SHARED {
+                replace_text(s, s + 1, c"&");
+                VALUES_COUNTS[1] += 1;
+            } else if cv == CV_MUT_SLICE {
+                replace_text(s, s, c"&mut ");
+                VALUES_COUNTS[2] += 1;
+            } else {
+                replace_text(s, s, c"&");
+                VALUES_COUNTS[3] += 1;
+            }
+        }
+    }
+}
+
+// Walks the body of every function with a body (std's too: their writes
+// count) in phase ph.
+fn walk_all(ph: i64) {
+    unsafe {
+        PHASE = ph;
+        for f in 0..FN_COUNT {
+            if !has_body(f) || FNS[f].generic > 0 && FNS[f].tmpl == 0 {
+                continue;
+            }
+            let item = FNS[f].node;
+            if ph != PH_MARK && in_std(NODES[item].start) {
+                continue;
+            }
+            CUR_F = f;
+            CUR_LOCALS.count = 0;
+            for i in 0..NODES[item].count {
+                CUR_LOCALS.push(NODES[child(item, i)].x);
+            }
+            IN_HOLE = 0;
+            if ph == PH_EDIT && eligible(f) {
+                edit_params(f);
+            }
+            scan(NODES[item].c, CX_MOVE);
+        }
+    }
+}
+
+// The functions used as values (an Ident or Path naming one that is not a
+// call's callee).
+fn find_values() {
+    unsafe {
+        let mut callees = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind == NodeKind::Call && NODES[n].a > 0 {
+                callees.put(NODES[n].a + 1, 1);
+            }
+        }
+        for n in 1..NODE_COUNT {
+            let k = NODES[n].kind;
+            if (k == NodeKind::Ident || k == NodeKind::Path) && NODES[n].res == Res::Fn
+                && NODES[n].y >= 0 && callees.get(n + 1) == 0 {
+                AS_VALUE.put(base_node(NODES[n].y) + 1, 1);
+            }
+        }
+        let sym = intern("as_mut_slice");
+        for d in 0..DEF_COUNT {
+            if DEFS[d].name == sym {
+                HAS_AS_MUT_SLICE = true;
+            }
+        }
+    }
+}
+
+// ---- rule 1: `defer x.free();` ----
+
+// Whether type t is std's Vec, Buf or HashMap (their drop is their free).
+fn std_container(t: i64) -> bool {
+    unsafe {
+        if t <= 0 || TYPES[t].kind != TyKind::Struct {
+            return false;
+        }
+        let s0 = TYPES[t].a;
+        let s = if STRUCTS[s0].tmpl != 0 { STRUCTS[s0].tmpl - 1 } else { s0 };
+        if STRUCTS[s].module != STD_MODULE {
+            return false;
+        }
+        let name = SYMS[STRUCTS[s].name].text;
+        // (and only once its drop frees it: std's Drop impls, T4; before
+        // them the defer is the only free)
+        (same(name, "Vec") || same(name, "Buf") || same(name, "HashMap"))
+            && (type_kind(t) & K_NEEDS_DROP) != 0
+    }
+}
+
+// The local `x` of a deferred `x.free()` (e: the deferred expression, or
+// a block of that one statement), or -1.
+fn freed_local(e: i64) -> i64 {
+    unsafe {
+        let mut c = e;
+        if c > 0 && NODES[c].kind == NodeKind::Block {
+            if NODES[c].a != 0 || NODES[c].count != 1 {
+                return -1;
+            }
+            let s = child(c, 0);
+            if NODES[s].kind != NodeKind::ExprStmt {
+                return -1;
+            }
+            c = NODES[s].a;
+        }
+        if c <= 0 || NODES[c].kind != NodeKind::Call || NODES[c].count != 1 {
+            return -1;
+        }
+        let f = NODES[c].x - 1;
+        if f < 0 || FNS[f].node <= 0 || !in_std(NODES[FNS[f].node].start)
+            || !same(SYMS[NODES[FNS[f].node].a].text, "free") {
+            return -1;
+        }
+        let mut r = child(c, 0);
+        if NODES[r].kind == NodeKind::Unary && NODES[r].op == Tok::Amp {
+            r = NODES[r].b;
+        }
+        if NODES[r].kind != NodeKind::Ident || NODES[r].res != Res::Local
+            || !std_container(NODES[r].ty) {
+            return -1;
+        }
+        NODES[r].y
+    }
+}
+
+// Deletes statement node s (with its `;`), and its line when nothing else
+// is on it.
+fn delete_statement(s: i64) {
+    unsafe {
+        let mut a = NODES[s].start;
+        let mut b = NODES[s].end;
+        let lim = FILES[file_of_pos(a)].end;
+        let mut k = b;
+        while k < lim && (SRC[k] == ' ' || SRC[k] == '\t') {
+            k += 1;
+        }
+        if k < lim && SRC[k] == ';' {
+            b = k + 1;
+        }
+        let mut ls = a;
+        while ls > 0 && (SRC[ls - 1] == ' ' || SRC[ls - 1] == '\t') {
+            ls -= 1;
+        }
+        let mut le = b;
+        while le < lim && (SRC[le] == ' ' || SRC[le] == '\t') {
+            le += 1;
+        }
+        if (ls == 0 || SRC[ls - 1] == '\n') && le < lim && SRC[le] == '\n' {
+            a = ls;
+            b = le + 1;
+        }
+        replace_text(a, b, c"");
+    }
+}
+
+// Rule 1: `defer x.free();` deleted where x is a Vec, Buf or HashMap
+// local declared in the same block: its drop at the end of the block
+// frees it (0.17, T1's drops).
+fn free_defer_edits() {
+    unsafe {
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind != NodeKind::Block || in_std(NODES[n].start) {
+                continue;
+            }
+            for i in 0..NODES[n].count {
+                let s = child(n, i);
+                if NODES[s].kind != NodeKind::Defer || (NODES[s].p & DEFER_IMPLICIT) != 0 {
+                    continue;
+                }
+                let l = freed_local(NODES[s].a);
+                if l < 0 || EDITED.get(NODES[s].start + 1) != 0 {
+                    continue;
+                }
+                let mut declared = false;
+                for j in 0..i {
+                    let d = child(n, j);
+                    if NODES[d].kind == NodeKind::Let && NODES[d].a > 0
+                        && NODES[NODES[d].a].kind == NodeKind::PatBind
+                        && NODES[NODES[d].a].x == l {
+                        declared = true;
+                    }
+                }
+                if declared {
+                    delete_statement(s);
+                    VALUES_COUNTS[5] += 1;
+                }
+            }
+        }
+    }
+}
+
+// The edits of `fix --values`; the number of parameters changed.
+pub fn values_edits() -> i64 {
+    unsafe {
+        find_values();
+        // (the flags to a fixed point; then the calls checked, and again
+        // while one forces a parameter to stay)
+        let mut rounds = 0;
+        while rounds < 64 {
+            CHANGED = true;
+            while CHANGED {
+                CHANGED = false;
+                walk_all(PH_MARK);
+            }
+            CHANGED = false;
+            walk_all(PH_VERIFY);
+            if !CHANGED {
+                break;
+            }
+            rounds += 1;
+        }
+        walk_all(PH_EDIT);
+        free_defer_edits();
+        VALUES_COUNTS[0] + VALUES_COUNTS[1] + VALUES_COUNTS[2] + VALUES_COUNTS[3] + VALUES_COUNTS[5]
+    }
+}

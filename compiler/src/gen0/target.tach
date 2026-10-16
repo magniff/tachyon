@@ -26,7 +26,7 @@ use crate::base::{
     BUFS, IntVec, SYMS, buf_byte, buf_bytes, buf_clear, buf_fmt, buf_int, buf_new, buf_slice,
     buf_str, buf_uint, cstr, intern_c, strlen,
 };
-use crate::front::lexer::{STRS, Tok, add_string};
+use crate::front::lexer::{Tok, add_string, str_at};
 use crate::front::types::{ENUMS, align_to, is_float, scalar_type};
 use crate::gen0::arm64::{
     a64_add_imm, a64_align_down, a64_arg_location, a64_bitnot, a64_call, a64_call_indirect,
@@ -56,6 +56,7 @@ use crate::middle::ir::Cond;
 use crate::middle::lower::ssa::HMap;
 
 use crate::base::target::{APPLE_A64, ELF, X86};
+use crate::middle::trace::trace_dump_fn;
 
 pub const R_ACC: i64 = 0;
 pub const R_SECOND: i64 = 1;
@@ -260,7 +261,7 @@ pub fn data_string(id: i64) {
             data_align(STR_ALIGN.data[id]);
         }
         buf_fmt(DATA, f"{cstr(local_prefix())}str.{id}:\n");
-        data_bytes(STRS[id]);
+        data_bytes(str_at(id));
         buf_str(DATA, c"    .byte 0\n");
     }
 }
@@ -651,6 +652,12 @@ pub fn emit_panic(kind: i64) {
     if X86 { x64_panic(kind); } else { a64_panic(kind); }
 }
 
+// (0.17) The line after a failure's message, without --trace; std's panic
+// prints the same (std::panic_note).
+pub fn panic_note_text() -> [u8] {
+    "note: build with --trace for the line and its callers\n"
+}
+
 // The helper and its messages, when a check was generated.
 pub fn emit_runtime() {
     unsafe {
@@ -662,9 +669,11 @@ pub fn emit_runtime() {
         if X86 { x64_runtime(); } else { a64_runtime(); }
         buf_bytes(ASM, buf_slice(CODE));
         CODE = out;
-        // The four messages, 64 bytes apart.
+        // The four messages, 128 bytes apart; (0.17) each with a note on
+        // --trace, without --trace (with it, the trace follows them).
+        let note = if trace_dump_fn() >= 0 { "" } else { panic_note_text() };
         data_section(writable: false);
-        buf_fmt(DATA, f".p2align 6\n{cstr(local_prefix())}rt.messages:\n");
+        buf_fmt(DATA, f".p2align 7\n{cstr(local_prefix())}rt.messages:\n");
         let messages: [*u8; 4] = [
             c"index out of bounds: index %lld, length %llu\n",
             c"index out of bounds: index %llu, length %llu\n",
@@ -675,17 +684,19 @@ pub fn emit_runtime() {
             let text = messages[i];
             let n = strlen(text) as i64;
             data_bytes(text[0..n]);
-            buf_fmt(DATA, f"    .space {64 - n}\n");
+            data_bytes(note);
+            buf_fmt(DATA, f"    .space {128 - n - note.len as i64}\n");
         }
         for i in 0..ENUM_PANICS.count {
             let m = buf_new();
             buf_str(m, c"invalid value %lld for enum ");
             let name = SYMS[ENUMS[ENUM_PANICS.data[i]].name].text;
-            let room = 62 - BUFS[m].len;
+            let room = 126 - note.len as i64 - BUFS[m].len;
             buf_bytes(m, if name.len as i64 > room { name[0..room] } else { name });
             buf_byte(m, '\n');
+            buf_bytes(m, note);
             data_bytes(buf_slice(m));
-            buf_fmt(DATA, f"    .space {64 - BUFS[m].len}\n");
+            buf_fmt(DATA, f"    .space {128 - BUFS[m].len}\n");
         }
     }
 }

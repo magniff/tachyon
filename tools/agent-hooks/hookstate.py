@@ -2,7 +2,9 @@
 the check hook last reported for each program root (its errors, its tests,
 the fingerprint of the sources then), which hints were given, the last
 queries; the fingerprint of a program's sources; the hint texts
-(hints.txt); when the session started.
+(hints.txt; TACHYON_HINTS=0 turns the hints off); when the session
+started. A hook that runs beside another on the same event keeps its
+state in a part of its own (`load(event, part)`).
 
 The state is one JSON file per session in $TACHYON_HOOK_STATE, else
 $TMPDIR/tachyon-agent-hooks/ (written whole, renamed over: a hook that
@@ -38,23 +40,30 @@ def session_key(event):
     return re.sub(r"[^\w.-]", "_", s)[:120]
 
 
-def load(event):
+def state_path(d, event, part=None):
+    """The state file of a session, or of one hook's part of it (`part`:
+    hooks that run on the same event in parallel keep their state apart,
+    so that one's save does not undo the other's)."""
+    return os.path.join(d, session_key(event) + ("-" + part if part else "") + ".json")
+
+
+def load(event, part=None):
     d = state_dir()
     if not d:
         return {}
     try:
-        with open(os.path.join(d, session_key(event) + ".json")) as fh:
+        with open(state_path(d, event, part)) as fh:
             st = json.load(fh)
             return st if isinstance(st, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
-def save(event, st):
+def save(event, st, part=None):
     d = state_dir()
     if not d:
         return
-    path = os.path.join(d, session_key(event) + ".json")
+    path = state_path(d, event, part)
     tmp = "%s.%d~" % (path, os.getpid())
     try:
         with open(tmp, "w") as fh:
@@ -123,19 +132,36 @@ def has_tests(root):
 
 
 _HINTS = None
+# (0.17, E3/E7) Every text a hook adds to the agent's context is a factual
+# statement with the command in it, never an instruction framed as a
+# system message; short, the same words every time (nothing that varies
+# from run to run: no times, no ids), so that it costs its tokens once.
 DEFAULT_HINTS = {
-    "repeat-query": "hint: one call gives what show, refs and def gave about {NAME}: its source, "
-                    "what it calls and its callers: `{TACHYONC} query context {NAME}`",
-    "unfamiliar-construct": "hint: before writing a construct you are unsure of, `{TACHYONC} guide "
-                            "--find WORDS` (the error's words) or `{TACHYONC} guide TOPIC#SECTION` "
-                            "prints the lines on it",
+    "repeat-query": "note: `{TACHYONC} query context {NAME}` prints in one call what show, refs and "
+                    "def print about {NAME}: its source, the items it uses, its callers",
+    "unfamiliar-construct": "note: `{TACHYONC} guide --find WORDS` prints the guide's lines on WORDS "
+                            "(an error's own words work); `{TACHYONC} guide TOPIC#SECTION` prints "
+                            "one section",
+    "rewritten": "note hook.query-first: `{FROM}` ran as `{TO}`: {WHY}",
+    "rewritten-first": "note hook.query-first: shell reads of large .tach files are answered with "
+                       "the matching query (sed -n, head, tail: `query text`; cat: `query items`; "
+                       "grep: `query refs` or `query grep`), each command of a line on its own, "
+                       "the others as typed; `{FROM}` ran as `{TO}`: {WHY}",
+    "rewritten-also": "note hook.query-first: also `{FROM}` ran as `{TO}`: {WHY}",
+    "repeat-lookup": "note: `{WHAT}` printed the same text at shell call {N} of this session",
 }
+# The hints proper (E3): TACHYON_HINTS=0 turns these off; the other texts
+# (a rewrite's note, a repeat lookup's) have switches of their own.
+HINT_KEYS = ("repeat-query", "unfamiliar-construct")
 
 
-def hint(key, **values):
-    """The hint KEY of hints.txt (`KEY: TEXT` lines; written by the guide's
-    work, kept as it is), its {NAME}s filled in; the built-in text when the
-    file lacks it."""
+def hints_on():
+    return os.environ.get("TACHYON_HINTS", "1") != "0"
+
+
+def text(key, **values):
+    """The text KEY of hints.txt (`KEY: TEXT` lines), its {NAME}s filled
+    in; the built-in text when the file lacks it."""
     global _HINTS
     if _HINTS is None:
         _HINTS = dict(DEFAULT_HINTS)
@@ -147,10 +173,17 @@ def hint(key, **values):
                         _HINTS[m.group(1)] = m.group(2)
         except OSError:
             pass
-    text = _HINTS.get(key, "")
+    out = _HINTS.get(key, "")
     for k, v in values.items():
-        text = text.replace("{%s}" % k, v)
-    return text
+        out = out.replace("{%s}" % k, str(v))
+    return out
+
+
+def hint(key, **values):
+    """The hint KEY (text()), or "" when hints are off (TACHYON_HINTS=0)."""
+    if key in HINT_KEYS and not hints_on():
+        return ""
+    return text(key, **values)
 
 
 def session_start(event):

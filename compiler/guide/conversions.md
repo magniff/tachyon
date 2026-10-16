@@ -103,7 +103,7 @@ Inside a closure it returns from the closure (give it `-> T`). `defer`s
 run, as for `return`.
 
 ```tach
-use std::{ParseIntError, parse_int};
+use std::ParseIntError;
 
 enum AppError { Parse(ParseIntError), Negative(i64) }
 
@@ -193,11 +193,10 @@ InvalidDigit(i64), Overflow }`, `pub enum ScanError { End,
 Parse(ParseIntError) }`; each has Display and Debug.
 
 ```tach
-use std::{ScanError, Scanner, read_stdin_in};
+use std::ScanError;
 
 fn main(gpa: Gpa) -> i32 {
-    let mut input = read_stdin_in(gpa).unwrap();
-    defer input.free();
+    let input = read_stdin_in(gpa).unwrap();
     let mut sc = Scanner::new(input.as_slice());
     let mut sum = 0;
     loop {

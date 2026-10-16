@@ -19,9 +19,12 @@ fail() {
 
 files=$(find . -name "*.$ext" -not -path './.git/*' | sort)
 
-# The old names are gone everywhere: code, comments and strings.
+# The old names are gone everywhere: code, comments and strings. (0.16) Not
+# the iterator protocol's associated type, `type Item = ...` and
+# `Iterator<Item = ...>`: it is the language's name, not the old struct.
 for w in Item qty calc; do
-    hit=$(grep -nw -- "$w" $files | head -n 1 | cut -c1-100)
+    hit=$(grep -nw -- "$w" $files | grep -Ev 'type[[:space:]]+Item[[:space:]]*=|[<,][[:space:]]*Item[[:space:]]*=' |
+        head -n 1 | cut -c1-100)
     [ -z "$hit" ] || fail "'$w' still appears: $hit"
 done
 

@@ -48,6 +48,9 @@ is. `--dry-run` prints the diff without writing it:
 $ tachyonc rewrite 'buf_add($b, $s)' '$b.push_str($s)' --dry-run | head -12
 --- a/report.tach
 +++ b/report.tach
+@@ -3 +3 @@
+-use crate::compat::{buf_add, buf_add_int, vec_at};
++use crate::compat::{buf_add_int, vec_at};
 @@ -9 +9 @@
 -        buf_add(b, "#");
 +        b.push_str("#");
@@ -55,21 +58,24 @@ $ tachyonc rewrite 'buf_add($b, $s)' '$b.push_str($s)' --dry-run | head -12
 -    buf_add(b, "lines ");
 +    b.push_str("lines ");
 @@ -16 +16 @@
--    buf_add(b, ", words ");
-+    b.push_str(", words ");
-@@ -18 +18 @@
+note rewrite.imports: removed 1 import the rewrite left unused
 $ tachyonc rewrite 'buf_add($b, $s)' '$b.push_str($s)'
-rewrote 24 sites in 1 file	report.tach	+24 -24 lines
+rewrote 24 sites in 1 file	report.tach	+25 -25 lines
+note rewrite.imports: removed 1 import the rewrite left unused
 $ tachyonc rewrite 'buf_add_int($b, $n)' '$b.push_int($n)'
-rewrote 10 sites in 1 file	report.tach	+10 -10 lines
+rewrote 10 sites in 1 file	report.tach	+11 -11 lines
+note rewrite.imports: removed 1 import the rewrite left unused
 $ tachyonc rewrite 'vec_at($v, $i)' '$v.get($i)' --show
-rewrote 3 sites in 2 files	2 files	+3 -3 lines
-// report.tach:32
-32	        let c = top.get(i);
-// stats.tach:65
-65	        out.push(v.get(i));
-// stats.tach:74
-74	        if v.get(i).n == 1 {
+rewrote 3 sites in 2 files	2 files	+3 -5 lines
+// report.tach:2: 1 line removed after line 2
+// report.tach:31
+31	        let c = top.get(i);
+// stats.tach:2: 1 line removed after line 2
+// stats.tach:64
+64	        out.push(v.get(i));
+// stats.tach:73
+73	        if v.get(i).n == 1 {
+note rewrite.imports: removed 2 imports the rewrite left unused
 ```
 
 That was 37 call sites in two files, none of them read or edited by
@@ -80,43 +86,39 @@ is not a call.
 
 ## 2. The helpers go
 
-Nothing calls them any more, and the `use` lines that imported them are
-now unused. `query unused` lists both; `fix --only unused` removes the
-imports:
+Nothing calls them any more. The `use` names that imported them went
+with the last call in each file (`note rewrite.imports`), so only the
+functions are left; `query unused` lists them:
 
 ```console
 $ tachyonc query unused
 crate::compat::buf_add	compat.tach:7:8	fn
 crate::compat::buf_add_int	compat.tach:12:8	fn
 crate::compat::vec_at	compat.tach:17:8	fn
-crate::compat::buf_add	report.tach:3:21	import
-crate::compat::buf_add_int	report.tach:3:30	import
-crate::compat::vec_at	report.tach:3:43	import
-crate::compat::vec_at	stats.tach:3:20	import
-$ tachyonc fix --only unused --show
-fixed 4 unused imports	2 files	+0 -2 lines
-// report.tach:2: 1 line removed after line 2
-// stats.tach:2: 1 line removed after line 2
 ```
 
-The module itself goes with `edit delete`, which removes its `mod` line
-(the file stays on disk: `git rm` it):
+The module goes with `edit delete`: its `mod` line and its file, in one
+edit (`undo` brings both back):
 
 ```console
-$ tachyonc edit delete compat && git rm -q compat.tach
-deleted crate::compat	main.tach	+0 -1 lines
+$ tachyonc edit delete compat
+deleted crate::compat	2 files	+0 -20 lines
 ```
 
 ## 3. A rewrite that only fits some types
 
 `v.len() == 0` is `v.is_empty()` for a `Vec`, but `Buf` has no
 `is_empty`. Asked to rewrite every site, the tool makes the change,
-checks the program, finds the site it would break, and writes nothing:
+checks the program, finds the site it would break, and writes nothing;
+the hole has two types at the sites, and each gets a command:
 
 ```console
 $ tachyonc rewrite '$v.len() == 0' '$v.is_empty()'
-report.tach:68:8: error[type error] no method 'is_empty' on type '*Buf'  [edited: crate::report::finish]
+report.tach:68:8: error[type error] no method 'is_empty' on type '&mut Buf' | help: no `is_empty`: `x.len() == 0` | try: tachyonc query items Buf main.tach  [edited: crate::report::finish]
 error edit.breaks: 1 new error; nothing written
+note rewrite.where: $v has 2 types at the sites: Vec<[u8]> (1 site), &mutBuf (1 site); --where takes the ones the replacement fits
+try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8]>'
+try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: &mutBuf'
 try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --no-check
 [exit 1]
 ```
@@ -127,10 +129,10 @@ it skipped is reported with its type, and a command for it:
 ```console
 $ tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8]>' --show
 rewrote 1 site in 1 file	main.tach	+1 -1 lines
-// main.tach:19
-19	    if ws.is_empty() {
-note rewrite.types: 1 site matches but for --where; first: $v is *Buf at report.tach:68:8
-try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: *Buf' --dry-run
+// main.tach:17
+17	    if ws.is_empty() {
+note rewrite.types: 1 site matches but for --where; first: $v is &mut Buf at report.tach:68:8
+try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: &mut Buf' --dry-run
 ```
 
 ## 4. Index loops become `for x in v`

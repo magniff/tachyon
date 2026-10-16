@@ -21,14 +21,14 @@ file, one per line, `FILE:LINE:COL: error[KIND] MESSAGE | help: ...`:
 
 ```console
 $ tachyonc check
-main.tach:8:38: error[type error] 'letter' is private | help: make it public: `pub fn letter` at grades.tach:21:1
+main.tach:8:38: error[type error] 'letter' is private | help: make it public: `pub fn letter` at grades.tach:21:1 | try: tachyonc fix --suggested main.tach
 main.tach:9:14: error[type error] unresolved import 'roster::add_score'
-main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
-main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
-main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
-main.tach:23:19: error[type error] unknown type 'HashMap' | help: add `use std::HashMap;`
-grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'?
-grades.tach:39:17: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (`tachyonc fix --only unsafe` does the former)
+main.tach:16:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: &mut Roster, name: [u8])` (roster.tach:17)
+main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: &mut Roster, name: [u8])` (roster.tach:17)
+main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: &mut Roster, name: [u8])` (roster.tach:17)
+main.tach:31:23: error[type error] undefined variable 'I64_MIN' | help: add `use std::I64_MIN;` | try: tachyonc fix --suggested main.tach
+grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: tachyonc fix --suggested main.tach
+grades.tach:39:17: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: tachyonc fix --only unsafe main.tach
 roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
 [exit 1]
 ```
@@ -41,23 +41,26 @@ Most say what to do, in their `help:`. A `KIND` (`type error`,
 $ tachyonc explain unsafe
 unsafe: error (compiler)
 An unsafe operation (a raw pointer's dereference or indexing, a C call, a union field) outside unsafe code.
-fix: Put it in an `unsafe { }` block (`tachyonc fix --only unsafe` does), or the function in `unsafe fn`.
+fix: Put it in an `unsafe { }` block, or the function in `unsafe fn`; the try: line, `tachyonc fix --only unsafe ROOT`, wraps every such place (the check hook prints it once, with how many errors it answers).
 example:
-    main.tach:39:13: error[unsafe] dereference of a raw pointer is unsafe | help: put it in an `unsafe { ... }` block
+    main.tach:39:13: error[unsafe] dereference of a raw pointer is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: tachyonc fix --only unsafe main.tach
 ```
 
 ## 2. The mechanical ones: `fix`
 
 A missing `use` line, an item that must become `pub`, a C call outside
 `unsafe`: these have exactly one fix, and `fix` makes them all in one
-edit. `--dry-run` shows the diff first:
+edit. (An error whose `try:` is `tachyonc fix --suggested` has an exact
+fix the compiler knows, `totl` for `total` too: `fix --suggested` makes
+those, then prints the errors left; `totl` is fixed by hand below, to
+show `edit patch`.) `--dry-run` shows the diff first:
 
 ```console
 $ tachyonc fix --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -9,0 +10 @@
-+use std::HashMap;
++use std::I64_MIN;
 --- a/grades.tach
 +++ b/grades.tach
 @@ -21 +21 @@
@@ -70,10 +73,10 @@ $ tachyonc fix
 fixed 1 missing import, 1 pub, 1 unsafe block	2 files	+3 -2 lines
 $ tachyonc check
 main.tach:9:14: error[type error] unresolved import 'roster::add_score'
-main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
-main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
-main.tach:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
-grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'?
+main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: &mut Roster, name: [u8])` (roster.tach:17)
+main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: &mut Roster, name: [u8])` (roster.tach:17)
+main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: &mut Roster, name: [u8])` (roster.tach:17)
+grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: tachyonc fix --suggested main.tach
 roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
 [exit 1]
 ```
@@ -86,9 +89,9 @@ The item at an error's position is `query show FILE:LINE`:
 $ tachyonc query show roster.tach:26
 // crate::roster::with_scores	roster.tach:21-30
 // How many students have at least `n` scores.
-pub fn with_scores(r: *Roster, n: i64) -> i64 {
+pub fn with_scores(r: &Roster, n: i64) -> i64 {
     let count = 0;
-    for s in r.students.iter() {
+    for s in r.students.as_slice() {
         if s.scores.len() >= n {
             count += 1;
         }
@@ -110,8 +113,8 @@ patched crate::roster::with_scores	roster.tach	+1 -1 lines
 ```
 
 An OLD that is not there is refused, with the nearest line of the item
-and a `try:` command built from it. Here it shows that `len` is a field,
-not a method:
+and a `try:` command built from it. Here it shows that the source
+writes the field, `scores.len` (a slice has both, `.len` and `.len()`):
 
 ```console
 $ tachyonc edit patch grades.tach:18 --old 'totl / scores.len()' --new 'total / scores.len()'
@@ -133,14 +136,14 @@ two-argument `enrol` and no `add_score`.
 ```console
 $ tachyonc check
 main.tach:9:14: error[type error] unresolved import 'roster::add_score'
-main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
-main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
-main.tach:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3
+main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: &mut Roster, name: [u8])` (roster.tach:17)
+main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: &mut Roster, name: [u8])` (roster.tach:17)
+main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: &mut Roster, name: [u8])` (roster.tach:17)
 [exit 1]
 $ tachyonc query show roster::enrol
 // crate::roster::enrol	roster.tach:16-19	effects: alloc(Gpa) panic
 // A student with no scores yet.
-pub fn enrol(r: *Roster, name: [u8]) {
+pub fn enrol(r: &mut Roster, name: [u8]) {
     r.students.push(Student { name: name, scores: Vec::new_in(r.students.allocator()) });
 }
 warning query.program-errors: 4 errors in the program; results may be incomplete
@@ -157,45 +160,41 @@ a valid input.)
 $ tachyonc edit apply --show <<'EOF'
 > @@ roster::enrol
 > // A student and their scores so far.
-> pub fn enrol(r: *Roster, name: [u8], scores: [i64]) {
+> pub fn enrol(r: &mut Roster, name: [u8], scores: [i64]) {
 >     let mut v: Vec<i64> = Vec::new_in(r.students.allocator());
 >     v.extend_from_slice(scores);
 >     r.students.push(Student { name: name, scores: v });
 > }
 > @@ new after roster::enrol
 > // One more score for the student called `name`; false when there is none.
-> pub fn add_score(r: *Roster, name: [u8], score: i64) -> bool {
+> pub fn add_score(r: &mut Roster, name: [u8], score: i64) -> bool {
 >     for i in 0..r.students.len() {
->         let mut s = r.students.get(i);
->         if s.name == name {
->             s.scores.push(score);
->             r.students.set(i, s);
+>         if r.students[i].name == name {
+>             r.students[i].scores.push(score);
 >             return true;
 >         }
 >     }
 >     false
 > }
 > EOF
-applied 2 blocks: replaced crate::roster::enrol; inserted after crate::roster::enrol	roster.tach	+18 -3 lines
-// roster.tach:16-33
+applied 2 blocks: replaced crate::roster::enrol; inserted after crate::roster::enrol	roster.tach	+16 -3 lines
+// roster.tach:16-31
 16	// A student and their scores so far.
-17	pub fn enrol(r: *Roster, name: [u8], scores: [i64]) {
+17	pub fn enrol(r: &mut Roster, name: [u8], scores: [i64]) {
 18	    let mut v: Vec<i64> = Vec::new_in(r.students.allocator());
 19	    v.extend_from_slice(scores);
 20	    r.students.push(Student { name: name, scores: v });
 21	}
 22	
 23	// One more score for the student called `name`; false when there is none.
-24	pub fn add_score(r: *Roster, name: [u8], score: i64) -> bool {
+24	pub fn add_score(r: &mut Roster, name: [u8], score: i64) -> bool {
 25	    for i in 0..r.students.len() {
-26	        let mut s = r.students.get(i);
-27	        if s.name == name {
-28	            s.scores.push(score);
-29	            r.students.set(i, s);
-30	            return true;
-31	        }
-32	    }
-33	    false
+26	        if r.students[i].name == name {
+27	            r.students[i].scores.push(score);
+28	            return true;
+29	        }
+30	    }
+31	    false
 ```
 
 ## 5. It builds
@@ -211,8 +210,8 @@ best: Ada (95); 3 students have 3 scores or more
 $ git diff --stat
  grades.tach |  6 +++---
  main.tach   |  1 +
- roster.tach | 23 +++++++++++++++++++----
- 3 files changed, 23 insertions(+), 7 deletions(-)
+ roster.tach | 21 +++++++++++++++++----
+ 3 files changed, 21 insertions(+), 7 deletions(-)
 ```
 
 ## Why not by hand
@@ -222,10 +221,10 @@ $ git diff --stat
   loop would have shown them a few at a time.
 - Three of them were fixed by `fix` with no file opened; the edit is the
   same one a careful human would make (`pub fn letter`, an
-  `unsafe { }` around the one call, the `use std::HashMap;` line).
+  `unsafe { }` around the one call, the `use std::I64_MIN;` line).
 - Each other fix named the item it changes, not a line number that
   moves after every edit, and was checked before it was written: a
-  patch that had introduced a new error (`scores.len()` on a slice)
+  patch that had introduced a new error (`scores.size()` on a slice)
   would have been refused, with the error.
 - `edit apply` made a change that is only correct as a whole (a new
   signature, a new function) in one step, so there was never a state of

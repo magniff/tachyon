@@ -49,12 +49,16 @@ mod budget;
 mod context;
 mod derived;
 mod effects;
+pub mod values;
 mod callees;
 mod locals;
 pub mod command_line;
+mod similar;
+mod examples;
+mod ownat;
 
 use crate::base::{
-    FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_new, buf_str,
+    FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str,
     buf_write_fd, streq, strlen,
 };
 use crate::base::diag::edit_distance;
@@ -66,7 +70,10 @@ use crate::tools::plan::deps::query_deps;
 use crate::tools::query_text::{
     WITH_COMMENTS, all_files, infer_root, run_text, show_files, show_region,
 };
-use defs::{DEFS, DEF_COUNT, K_FIELD, K_VARIANT, find_defs, last_segment, mod_fqn_text};
+use defs::{
+    DEFS, DEF_COUNT, K_ENUM, K_FIELD, K_STRUCT, K_TRAIT, K_VARIANT, find_defs, last_segment,
+    mod_fqn_text,
+};
 use diagnostics::{
     CMD, OPT_EXACT, PROG, ROOT_GIVEN, alias_defs, diag, is_query_command, no_match, no_module,
     program_errors, push_once, try_begin, try_end, try_query, write_diags,
@@ -78,7 +85,9 @@ use refs::{
     resolve_in, try_refs,
 };
 use sections::{OPT_BANNERS, show_section};
-use show::{find_modules, query_def, query_items, query_modules, query_show, text_start};
+use show::{
+    find_modules, query_def, query_items, query_modules, query_show, query_type_items, text_start,
+};
 use typeat::query_type;
 
 use budget::{OPT_BUDGET, begin_output, end_output};
@@ -87,12 +96,18 @@ use callees::{OPT_TRANSITIVE, OPT_WRITES, query_callees};
 use command_line::load_program;
 use context::{context_module, query_context, query_context_module};
 use crate::base::timer::{TIME_PASSES, T_ANSWER, timer_add, timer_now, timer_report};
+use crate::front::stdtree::{STD_TREE, find_std_tree};
 use crate::tools::conflicts::run_conflicts;
+use crate::tools::edit::stdedit::names_std_file;
 use derived::derived_note;
 use effects::{OPT_HAS, OPT_WHY, check_effect_options, query_effects, query_effects_module};
+use examples::{check_kinds, list_examples, query_examples};
 use locals::{QUERY_ARGV, full_requested, has_column, local_refs};
 use names::{canonical_name, is_name_char, is_symbol, item_below, module_def, path_matches};
+use ownat::query_own;
+use similar::query_similar;
 use stdq::{all_std, ask_with_std, names_std, std_requested, std_root, wants_std};
+use values::{OPT_VIEWS_WHY, query_views, query_views_module};
 
 extern "C" {
     fn getenv(name: *u8) -> *u8;
@@ -176,18 +191,22 @@ fn put_usage(out: i64) {
         buf_str(out, c"       tachyonc query context NAME...|MODULE [--budget TOKENS]   (source, calls, types, callers)\n");
         buf_str(out, c"       tachyonc query text FILE[:A[-B]]...\n");
         buf_str(out, c"       tachyonc query diff\n");
-        buf_str(out, c"       tachyonc query refs|callers NAME... [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]\n");
+        buf_str(out, c"       tachyonc query refs|callers NAME... [--exact] [--count] [--in FILE|MODULE|ITEM] [--limit N] [--all]\n");
         buf_str(out, c"       tachyonc query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]\n");
         buf_str(out, c"       tachyonc query items [MODULE...] [--comments]\n");
         buf_str(out, c"       tachyonc query show MODULE::section TITLE\n");
-        buf_str(out, c"       tachyonc query grep PATTERN... [--in FILE|MODULE] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]\n");
+        buf_str(out, c"       tachyonc query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]\n");
         buf_str(out, c"       tachyonc query type FILE:LINE[:COL]...\n");
+        buf_str(out, c"       tachyonc query own FILE:LINE:COL...   (0.17: each local's kind, moves and views there)\n");
         buf_str(out, c"       tachyonc query stats [MODULE|FILE] [--over N] [--all]\n");
         buf_str(out, c"       tachyonc query deps MODULE [--max-lines N]\n");
         buf_str(out, c"       tachyonc query unused [MODULE] [--all]\n");
         buf_str(out, c"       tachyonc query impact NAME\n");
         buf_str(out, c"       tachyonc query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (alloc(Gpa) io global panic diverge unsafe)\n");
+        buf_str(out, c"       tachyonc query views NAME...|MODULE [--why]   (what results and `&mut` parameters view: views(self), views(*self), stores(word))\n");
         buf_str(out, c"       tachyonc query conflicts [FILE|DIR|FILE:LINE...] [--show]\n");
+        buf_str(out, c"       tachyonc query similar NAME... [--limit N]   (items like NAME to copy, nearest first)\n");
+        buf_str(out, c"       tachyonc query examples [KIND...]   (items to start from for an \"add an X\" change; tachyonc guide how)\n");
         buf_str(out, c"NAME: a path or its end (f, m::f, T::f, T.field), or FILE:LINE; std's too (std::f, Vec::push)\n");
         buf_str(out, c"--budget TOKENS: any answer cut to about TOKENS (default 8000; 0: no limit; context: 2000)\n");
         buf_str(out, c"ROOT: --root ROOT, a last argument ending in .tach, $TACHYON_ROOT, ./main.tach, ./compiler/src/main.tach\n");
@@ -201,7 +220,7 @@ fn usage_error() -> i64 {
     unsafe { diag(c"error", c"query.usage") }
 }
 
-const N_COMMANDS: i64 = 17;
+const N_COMMANDS: i64 = 21;
 
 fn command_name(i: i64) -> *u8 {
     if i == 0 { c"def" } else if i == 1 { c"show" } else if i == 2 { c"refs" }
@@ -209,7 +228,9 @@ fn command_name(i: i64) -> *u8 {
     else if i == 6 { c"deps" } else if i == 7 { c"unused" } else if i == 8 { c"impact" }
     else if i == 9 { c"text" } else if i == 10 { c"diff" } else if i == 11 { c"grep" }
     else if i == 12 { c"type" } else if i == 13 { c"context" } else if i == 14 { c"callees" }
-    else if i == 15 { c"conflicts" } else { c"effects" }
+    else if i == 15 { c"conflicts" } else if i == 16 { c"effects" }
+    else if i == 17 { c"similar" } else if i == 18 { c"examples" } else if i == 19 { c"own" }
+    else { c"views" }
 }
 
 // The command nearest to cmd (edit distance at most 2), or 0.
@@ -293,7 +314,7 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
             let valued = streq(a, c"--in") || streq(a, c"--limit") || streq(a, c"--root")
                 || streq(a, c"--over") || streq(a, c"--max-lines") || streq(a, c"--kind")
                 || streq(a, c"--budget") || streq(a, c"--writes") || streq(a, c"--has")
-                || streq(a, c"--why");
+                || streq(a, c"--why") && !streq(cmd, c"views") || streq(a, c"--std-tree");
             if streq(a, c"--count") {
                 OPT_COUNT = true;
             } else if streq(a, c"--transitive") {
@@ -315,6 +336,9 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
                 OPT_WHERE |= G_STRING;
             } else if streq(a, c"--word") {
                 OPT_WORD = true;
+            } else if streq(a, c"--why") && streq(cmd, c"views") {
+                // (0.17: `query views --why`, a flag)
+                OPT_VIEWS_WHY = true;
             } else if valued {
                 if i + 1 >= argc || argv[i + 1][0] == '-' {
                     bad = a;
@@ -336,6 +360,10 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
                     i += 1;
                 } else if streq(a, c"--why") {
                     OPT_WHY = argv[i + 1];
+                    i += 1;
+                } else if streq(a, c"--std-tree") {
+                    // (0.17: std from its files; front/stdtree.tach)
+                    STD_TREE = argv[i + 1];
                     i += 1;
                 } else {
                     let n = parse_count(argv[i + 1]);
@@ -359,6 +387,11 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
                 args.push(a as i64);
             }
             i += 1;
+        }
+        // (0.17: a std file named, `query show compiler/std/io.tach:102`:
+        // std from its files)
+        if names_std_file(argc, argv) {
+            STD_TREE = find_std_tree();
         }
         let items = streq(cmd, c"items");
         let is_refs = streq(cmd, c"refs") || streq(cmd, c"callers") || streq(cmd, c"grep")
@@ -398,6 +431,15 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
             root = args.data[args.count] as *u8;
         }
         ROOT_GIVEN = root;
+        // (0.17: examples.tach; the kinds without the program)
+        if streq(cmd, c"examples") {
+            if args.count == 0 {
+                return list_examples();
+            }
+            if !check_kinds(&args) {
+                return 2;
+            }
+        }
         let needs_name = !items && !streq(cmd, c"unused") && !streq(cmd, c"stats");
         let single = streq(cmd, c"deps") || streq(cmd, c"impact") || streq(cmd, c"stats")
             || streq(cmd, c"unused");
@@ -471,7 +513,7 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
         // they read the program in full, and leave the cache as it is)
         // (0.15: a question about std reads the program with std, and
         // without the cache, which holds the program as it is)
-        let mut with_std = std_only || std_requested()
+        let mut with_std = std_only || std_requested() || streq(cmd, c"examples")
             || (OPT_IN != 0 as *u8 && names_std(c_slice(OPT_IN)));
         for k in 0..args.count {
             if names_std(c_slice(args.data[k] as *u8)) {
@@ -499,8 +541,19 @@ fn run_query_inner(argc: i64, argv: **u8) -> i64 {
             program_errors(c"error", root, true);
             return 1;
         }
-        if !with_std && STD_MODULE < 0 && !items && !streq(cmd, c"grep") && !streq(cmd, c"type")
-            && wants_std(&args) {
+        // (0.17: `items TYPE` of a std type, when no module is named so)
+        let mut items_of_types = items;
+        for k in 0..args.count {
+            let mut ms = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            if items {
+                find_modules(c_slice(args.data[k] as *u8), OPT_EXACT, &ms);
+            }
+            if ms.count > 0 {
+                items_of_types = false;
+            }
+        }
+        if !with_std && STD_MODULE < 0 && (!items || items_of_types) && !streq(cmd, c"grep")
+            && !streq(cmd, c"type") && !streq(cmd, c"own") && wants_std(&args) {
             // (a NAME std defines and the program does not: asked again
             // with std)
             ask_with_std(argv);
@@ -721,17 +774,35 @@ fn answer(cmd: *u8, args: *IntVec, items: bool, is_refs: bool) -> i64 {
                 return 0;
             }
             let mut modules = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            let mut types = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             let mut status = 0;
             for i in 0..n {
                 let text = c_slice((*args).data[i] as *u8);
                 let before = modules.count;
                 find_modules(text, OPT_EXACT, &modules);
                 if modules.count == before {
-                    no_module(text);
-                    status = 1;
+                    // (0.17: a type: its impl blocks' functions)
+                    let mut defs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                    find_defs(text, OPT_EXACT, &defs);
+                    let t0 = types.count;
+                    for j in 0..defs.count {
+                        let k = DEFS[defs.data[j]].kind;
+                        if k == K_STRUCT || k == K_ENUM || k == K_TRAIT {
+                            types.push(defs.data[j]);
+                        }
+                    }
+                    if types.count == t0 {
+                        no_module(text);
+                        status = 1;
+                    }
                 }
             }
-            query_items(&modules);
+            if modules.count > 0 {
+                query_items(&modules);
+            }
+            if types.count > 0 {
+                query_type_items(&types);
+            }
             return status;
         }
         if streq(cmd, c"stats") {
@@ -772,6 +843,13 @@ fn answer(cmd: *u8, args: *IntVec, items: bool, is_refs: bool) -> i64 {
             }
             return query_callees(&fns, c_slice((*args).data[0] as *u8), &table);
         }
+        // (0.17: similar.tach, examples.tach)
+        if streq(cmd, c"similar") {
+            return query_similar(args);
+        }
+        if streq(cmd, c"examples") {
+            return query_examples(args);
+        }
         if streq(cmd, c"context") {
             // (0.15: context.tach)
             let mut status = 0;
@@ -803,6 +881,23 @@ fn answer(cmd: *u8, args: *IntVec, items: bool, is_refs: bool) -> i64 {
                     status = 1;
                 }
                 continue;
+            }
+            // (0.17: ownat.tach)
+            if streq(cmd, c"own") {
+                if query_own(text) != 0 {
+                    status = 1;
+                }
+                continue;
+            }
+            if streq(cmd, c"views") {
+                // (0.17: a module's functions, values.tach)
+                let m = context_module(text);
+                if m >= 0 {
+                    if query_views_module(m) != 0 {
+                        status = 1;
+                    }
+                    continue;
+                }
             }
             if streq(cmd, c"effects") {
                 // (0.16: a module's functions, effects.tach)
@@ -866,6 +961,11 @@ fn answer(cmd: *u8, args: *IntVec, items: bool, is_refs: bool) -> i64 {
             } else if streq(cmd, c"effects") {
                 // (0.16, effects.tach)
                 if query_effects(&matches) != 0 {
+                    status = 1;
+                }
+            } else if streq(cmd, c"views") {
+                // (0.17, values.tach)
+                if query_views(&matches) != 0 {
                     status = 1;
                 }
             } else {

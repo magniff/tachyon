@@ -17,23 +17,26 @@
 use crate::base::{
     SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern, intern_c,
 };
-use crate::base::diag::{ERR_HELP, err_begin, err_end, err_help, err_str, report_warning};
+use crate::base::diag::{
+    ERR_HELP, err_begin, err_end, err_help, err_help_sym, err_str, report_warning,
+};
 use crate::front::ast::{
-    CLOSURE_MOVE, FMT_BIN, FMT_CHAR, FMT_HEX, NODES, NodeKind, child, list_begin, list_end,
-    list_push, new_node,
+    CLOSURE_HOLES, CLOSURE_MOVE, FMT_BIN, FMT_CHAR, FMT_HEX, NODES, NodeKind, child, list_begin,
+    list_end, list_push, new_node,
 };
 use crate::front::check::{
     CONST_CONTEXT, LOCALS, lookup_local, mismatch_error, pop_scope, push_scope, type_error,
 };
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::check::unsafety::is_borrow;
-use crate::front::lexer::{STRS, SUF_I64, Tok};
-use crate::front::modules::STD_MODULE;
+use crate::front::lexer::{SUF_I64, SUF_U8, Tok, str_at};
+use crate::front::modules::{CUR_MOD, STD_MODULE};
+use crate::front::own::drops::NO_DROP;
 use crate::front::patterns::check_pattern;
 use crate::front::traits::{implements, std_trait};
 use crate::front::types::{
-    FNS, TYPES, TY_ERROR, TY_I64, TY_U64, TY_U8, TyKind, buf_type, err_type, is_integer, is_pointer,
-    is_signed, primitive_name,
+    FNS, TYPES, TY_ERROR, TY_I64, TY_U64, TY_U8, TY_UNIT, TyKind, buf_type, err_type, is_integer,
+    is_pointer, is_signed, primitive_name,
 };
 
 // Texts up to this long are written byte by byte (Fmt::byte is inlined,
@@ -80,7 +83,7 @@ pub fn brace_warning(n: i64, f: i64) {
         if NODES[arg].kind != NodeKind::Str || SRC[NODES[arg].start] != '"' {
             return;
         }
-        let s = STRS[NODES[arg].a];
+        let s = str_at(NODES[arg].a);
         let mut k = 0;
         while k < s.len {
             let hole = local_hole(s, k);
@@ -153,14 +156,73 @@ fn expand(n: i64) -> i64 {
     unsafe {
         let start = NODES[n].start;
         let end = NODES[n].end;
-        let count = NODES[n].count;
         if CONST_CONTEXT {
             type_error(n,
                 c"an f-string cannot be used in a constant expression: it is made when it runs");
         }
-        // The holes, left to right, once.
+        if !check_holes(n) {
+            NODES[n].y = new_node(NodeKind::Block, start, end);
+            return TY_ERROR;
+        }
+        let out = intern_c(c"__out");
+        let lets = list_begin();
+        push_hole_lets(n);
+        let block = new_node(NodeKind::Block, start, end);
+        list_end(block, lets);
+        // The closure's body.
+        let stmts = list_begin();
+        push_writes(n, out, false);
+        let body = new_node(NodeKind::Block, start, end);
+        list_end(body, stmts);
+        // move |__out: *std::Fmt| body
+        let fmt_name = new_node(NodeKind::TyName, start, end);
+        NODES[fmt_name].a = intern_c(c"Fmt");
+        let smark = list_begin();
+        list_push(std_ident(n));
+        list_end(fmt_name, smark);
+        let fmt_ptr = new_node(NodeKind::TyPtr, start, end);
+        NODES[fmt_ptr].a = fmt_name;
+        let param = new_node(NodeKind::Param, start, end);
+        NODES[param].a = out;
+        NODES[param].b = fmt_ptr;
+        let closure = new_node(NodeKind::Closure, start, end);
+        NODES[closure].c = CLOSURE_MOVE | CLOSURE_HOLES;
+        NODES[closure].a = body;
+        let pmark = list_begin();
+        list_push(param);
+        list_end(closure, pmark);
+        // std::Interp { f: closure }
+        let lit = new_node(NodeKind::StructLit, start, end);
+        NODES[lit].a = intern_c(c"Interp");
+        let prefix = new_node(NodeKind::Path, start, end);
+        let prefix_mark = list_begin();
+        list_push(std_ident(n));
+        list_end(prefix, prefix_mark);
+        NODES[lit].h = prefix;
+        let field = new_node(NodeKind::FieldInit, start, end);
+        NODES[field].a = intern_c(c"f");
+        NODES[field].b = closure;
+        let fmark = list_begin();
+        list_push(field);
+        list_end(lit, fmark);
+        NODES[block].a = lit;
+        // The `let`s by hand (their values are checked), then the literal.
+        push_scope();
+        bind_lets(block);
+        let t = synth_expr(lit);
+        pop_scope();
+        NODES[block].ty = t;
+        NODES[n].y = block;
+        t
+    }
+}
+
+// The holes of f-string n checked, left to right, once: whether none
+// failed.
+fn check_holes(n: i64) -> bool {
+    unsafe {
         let mut failed = false;
-        for i in 0..count {
+        for i in 0..NODES[n].count {
             let item = child(n, i);
             if NODES[item].kind == NodeKind::InterpHole {
                 let t = synth_expr(NODES[item].a);
@@ -172,35 +234,66 @@ fn expand(n: i64) -> i64 {
                 }
             }
         }
-        if failed {
-            NODES[n].y = new_node(NodeKind::Block, start, end);
-            return TY_ERROR;
-        }
-        let out = intern_c(c"__out");
-        let lets = list_begin();
+        !failed
+    }
+}
+
+// `let __fN = eN;` for each hole of f-string n, into the list being made.
+fn push_hole_lets(n: i64) {
+    unsafe {
         let mut holes = 0;
-        for i in 0..count {
+        for i in 0..NODES[n].count {
             let item = child(n, i);
             if NODES[item].kind == NodeKind::InterpHole {
-                let bind = new_node(NodeKind::PatBind, NODES[item].start, NODES[item].end);
-                NODES[bind].a = hidden(c"__f", holes);
-                let binding = new_node(NodeKind::Let, NODES[item].start, NODES[item].end);
-                NODES[binding].a = bind;
-                NODES[binding].c = NODES[item].a;
-                list_push(binding);
+                list_push(let_node(hidden(c"=f", holes), NODES[item].a, item, false));
                 holes += 1;
             }
         }
-        let block = new_node(NodeKind::Block, start, end);
-        list_end(block, lets);
-        // The closure's body.
-        let stmts = list_begin();
-        holes = 0;
-        for i in 0..count {
+    }
+}
+
+// `let [mut] name = value;`, at node at.
+fn let_node(name: i64, value: i64, at: i64, mutable: bool) -> i64 {
+    unsafe {
+        let bind = new_node(NodeKind::PatBind, NODES[at].start, NODES[at].end);
+        NODES[bind].a = name;
+        NODES[bind].b = if mutable { 1 } else { 0 };
+        let binding = new_node(NodeKind::Let, NODES[at].start, NODES[at].end);
+        NODES[binding].a = bind;
+        NODES[binding].c = value;
+        binding
+    }
+}
+
+// The `let`s of block b, whose values are checked, bound by hand (in the
+// scope the caller opens).
+fn bind_lets(b: i64) {
+    unsafe {
+        for i in 0..NODES[b].count {
+            let binding = child(b, i);
+            let bind = NODES[binding].a;
+            let value = NODES[binding].c;
+            let t = NODES[value].ty;
+            check_pattern(bind, t);
+            // (`{self}`, `{&p}`: a borrow, as passed directly)
+            if is_pointer(t) && is_borrow(value) {
+                LOCALS[NODES[bind].x].borrow = true;
+            }
+        }
+    }
+}
+
+// The statements that write f-string n's text to `out` (a `*std::Fmt`;
+// `direct`: a std::Fmt, a local), into the list being made, the holes
+// read from `__f0`, `__f1`...
+fn push_writes(n: i64, out: i64, direct: bool) {
+    unsafe {
+        let mut holes = 0;
+        for i in 0..NODES[n].count {
             let item = child(n, i);
             if NODES[item].kind == NodeKind::Str {
                 // (a short text: its bytes, `__out.byte(b'a')`, inlined)
-                let text = STRS[NODES[item].a];
+                let text = str_at(NODES[item].a);
                 if text.len <= SHORT_TEXT {
                     for k in 0..text.len {
                         let c = new_node(NodeKind::Char, NODES[item].start, NODES[item].end);
@@ -212,13 +305,13 @@ fn expand(n: i64) -> i64 {
                 }
                 continue;
             }
-            let name = hidden(c"__f", holes);
+            let name = hidden(c"=f", holes);
             let debug = NODES[item].b == 1;
             // (`__out.display(&__f0)`; through a pointer, `__f0.fmt(__out)`:
             // a pointer value is passed as a receiver)
             let write = if takes_pointer(item) {
-                call1(ident(name, item), if debug { c"fmt_debug" } else { c"fmt" },
-                    ident(out, item))
+                let to = if direct { unary(Tok::Amp, ident(out, item)) } else { ident(out, item) };
+                call1(ident(name, item), if debug { c"fmt_debug" } else { c"fmt" }, to)
             } else {
                 call1(ident(out, item), if debug { c"debug" } else { c"display" },
                     unary(Tok::Amp, ident(name, item)))
@@ -256,12 +349,7 @@ fn expand(n: i64) -> i64 {
                 list_push(int_node(NODES[item].d, item));
                 list_push(int_node(flags, item));
                 list_end(spec, amark);
-                let bind = new_node(NodeKind::PatBind, NODES[item].start, NODES[item].end);
-                NODES[bind].a = saved;
-                let binding = new_node(NodeKind::Let, NODES[item].start, NODES[item].end);
-                NODES[binding].a = bind;
-                NODES[binding].c = spec;
-                list_push(binding);
+                list_push(let_node(saved, spec, item, false));
                 list_push(stmt(write));
                 list_push(stmt(call1(ident(out, item), c"end_spec", ident(saved, item))));
             } else {
@@ -269,60 +357,277 @@ fn expand(n: i64) -> i64 {
             }
             holes += 1;
         }
+    }
+}
+
+// ---- (0.17) f-strings written straight into std's printing ----
+
+// What direct_kind returns: the std function an f-string is passed to.
+const D_PRINT: i64 = 1;
+const D_PRINTLN: i64 = 2;
+const D_EPRINT: i64 = 3;
+const D_EPRINTLN: i64 = 4;
+const D_FORMAT_IN: i64 = 5;
+const D_PUSH_FMT: i64 = 6;
+
+// (0.17) Whether call n of function f (a template; n's named arguments
+// normalized; `method`: a method call, its receiver not among them) is
+// std's print, println, eprint, eprintln, format_in or (a method)
+// Buf::push_fmt with an f-string as its Display argument, outside std:
+// which one (D_*), else 0.
+pub fn direct_kind(n: i64, f: i64, method: bool) -> i64 {
+    unsafe {
+        if STD_MODULE < 0 || FNS[f].module != STD_MODULE || CUR_MOD == STD_MODULE || CONST_CONTEXT
+            || NODES[n].count == 0 {
+            return 0;
+        }
+        let fs = child(n, 0);
+        if NODES[fs].kind != NodeKind::Interp || NODES[fs].y != 0 {
+            return 0;
+        }
+        let name = SYMS[NODES[FNS[f].node].a].text;
+        let k = if method {
+            if name == "push_fmt" { D_PUSH_FMT } else { 0 }
+        } else if name == "print" {
+            D_PRINT
+        } else if name == "println" {
+            D_PRINTLN
+        } else if name == "eprint" {
+            D_EPRINT
+        } else if name == "eprintln" {
+            D_EPRINTLN
+        } else if name == "format_in" {
+            D_FORMAT_IN
+        } else {
+            0
+        };
+        let count = if k == D_FORMAT_IN { 2 } else { 1 };
+        if k == 0 || NODES[n].count != count
+            || NODES[child(n, count - 1)].kind == NodeKind::NamedArg {
+            return 0;
+        }
+        k
+    }
+}
+
+// (0.17) Call n of std function f (direct_kind k; `recv`, push_fmt's
+// receiver as its `self` takes it, checked, else 0) with its f-string fs
+// written in place: no closure, no std::Interp, no instance of f. n
+// becomes an Interp node (the back ends lower its y, as an f-string's)
+// whose y is the block
+//
+//   { [let __r = recv;] let __f0 = e0; ...; [let __a = a;] BODY }
+//
+// (BODY: direct_body): the receiver, the holes left to right, then the
+// allocator, where the call evaluates them. A copy of the call as written
+// is kept for `query refs` (not lowered); fs's y is -1 (`query type`
+// shows its type as an Interp's); n's x is f + 1 (effects: what the
+// writes do is the call's, `println(f"..")` calls 'std::println'). The
+// call's type.
+pub fn direct_call(n: i64, f: i64, k: i64, recv: i64) -> i64 {
+    unsafe {
+        let start = NODES[n].start;
+        let end = NODES[n].end;
+        let fs = child(n, 0);
+        let orig = new_node(NodeKind::Call, start, end);
+        NODES[orig].a = if recv == 0 { NODES[n].a } else { 0 };
+        NODES[orig].x = f + 1;
+        let omark = list_begin();
+        if recv != 0 {
+            list_push(recv);
+        }
+        for i in 0..NODES[n].count {
+            list_push(child(n, i));
+        }
+        list_end(orig, omark);
+        let mut ok = check_holes(fs);
+        let mut alloc = 0;
+        if k == D_FORMAT_IN {
+            alloc = child(n, 1);
+            let t = synth_expr(alloc);
+            ok = ok && t != TY_ERROR && allocator_ok(t, f, start);
+        }
+        NODES[fs].y = -1;
+        NODES[fs].ty = TY_UNIT;
+        let block = new_node(NodeKind::Block, start, end);
+        let mut t = TY_ERROR;
+        if ok {
+            let lets = list_begin();
+            if recv != 0 {
+                list_push(let_node(intern_c(c"__r"), recv, n, false));
+            }
+            push_hole_lets(fs);
+            if alloc != 0 {
+                list_push(let_node(intern_c(c"__a"), alloc, n, false));
+            }
+            list_end(block, lets);
+            let body = direct_body(fs, k, n);
+            NODES[block].a = body;
+            push_scope();
+            bind_lets(block);
+            if recv != 0 {
+                // (its safety is the call's, checked)
+                LOCALS[NODES[NODES[child(block, 0)].a].x].borrow = true;
+            }
+            t = synth_expr(body);
+            pop_scope();
+        }
+        NODES[block].ty = t;
+        NODES[orig].ty = t;
+        let lowered = new_node(NodeKind::Interp, start, end);
+        NODES[n] = NODES[lowered];
+        NODES[n].x = f + 1;
+        NODES[n].y = block;
+        NODES[n].ty = t;
+        t
+    }
+}
+
+// (0.17) Whether t, format_in's allocator, is an Allocator; else the error
+// instantiating f (format_in) gives.
+fn allocator_ok(t: i64, f: i64, pos: i64) -> bool {
+    unsafe {
+        let tr = std_trait(c"Allocator");
+        if tr < 0 || implements(tr, t) {
+            return true;
+        }
+        err_begin(pos);
+        err_str(c"the trait 'Allocator' is not implemented for '");
+        err_type(t);
+        err_str(c"'");
+        err_help(c"required by the bound 'A: Allocator' of '");
+        err_help_sym(FNS[f].display);
+        err_help(c"'");
+        err_end();
+        false
+    }
+}
+
+// (0.17) The block direct_call writes f-string fs with, at call n, for
+// kind k:
+//
+//   print, println, eprint, eprintln (fd 1 or 2):
+//     { let mut __out = std::Fmt::to_fd(FD); WRITES; [__out.byte('\n');]
+//       __out.flush(); }
+//   push_fmt:
+//     { let mut __out = std::__buf_fmt(__r);
+//       loop { WRITES; if std::__buf_fmt_end(__r, &__out) { break; } } }
+//   format_in:
+//     { let mut __b = std::Buf::new_in(__a); let mut __t = [0u8; 256];
+//       let mut __out = std::__fmt_tmp(&__t);
+//       loop { WRITES; if std::__fmt_in_end(&__b, &__out, &__t) { break; } }
+//       __b }
+//
+// (WRITES: push_writes; std's helpers: compiler/std/fmt.tach.)
+fn direct_body(fs: i64, k: i64, n: i64) -> i64 {
+    unsafe {
+        let out = intern_c(c"__out");
+        let none = 0 as *u8;
+        let stmts = list_begin();
+        let mut tail = 0;
+        if k == D_FORMAT_IN {
+            let b = intern_c(c"__b");
+            let t = intern_c(c"__t");
+            let new_in = std_call(c"Buf", c"new_in", ident(intern_c(c"__a"), n), 0, 0, n);
+            // (0.17: no drop: the block's value, moved out by its tail; the
+            // own walk sees the holes as borrows, not this move)
+            let lb = let_node(b, new_in, n, true);
+            NODES[lb].p |= NO_DROP;
+            list_push(lb);
+            let zero = new_node(NodeKind::Int, NODES[n].start, NODES[n].end);
+            NODES[zero].b = SUF_U8;
+            let tmp = new_node(NodeKind::Repeat, NODES[n].start, NODES[n].end);
+            NODES[tmp].a = zero;
+            NODES[tmp].b = int_node(256, n);
+            list_push(let_node(t, tmp, n, true));
+            let fmt = std_call(none, c"__fmt_tmp", unary(Tok::Amp, ident(t, n)), 0, 0, n);
+            list_push(let_node(out, fmt, n, true));
+            let end = std_call(none, c"__fmt_in_end", unary(Tok::Amp, ident(b, n)),
+                unary(Tok::Amp, ident(out, n)), unary(Tok::Amp, ident(t, n)), n);
+            list_push(stmt(retry_loop(fs, out, end, n)));
+            tail = ident(b, n);
+        } else if k == D_PUSH_FMT {
+            let r = intern_c(c"__r");
+            list_push(let_node(out, std_call(none, c"__buf_fmt", ident(r, n), 0, 0, n), n, true));
+            let end = std_call(none, c"__buf_fmt_end", ident(r, n), unary(Tok::Amp, ident(out, n)),
+                0, n);
+            list_push(stmt(retry_loop(fs, out, end, n)));
+        } else {
+            let fd = new_node(NodeKind::Int, NODES[n].start, NODES[n].end);
+            NODES[fd].a = if k == D_EPRINT || k == D_EPRINTLN { 2 } else { 1 };
+            list_push(let_node(out, std_call(c"Fmt", c"to_fd", fd, 0, 0, n), n, true));
+            push_writes(fs, out, true);
+            if k == D_PRINTLN || k == D_EPRINTLN {
+                let c = new_node(NodeKind::Char, NODES[n].start, NODES[n].end);
+                NODES[c].a = '\n' as i64;
+                list_push(stmt(call1(ident(out, n), c"byte", c)));
+            }
+            let flush = method_call(ident(out, n), c"flush");
+            list_end(flush, list_begin());
+            list_push(stmt(flush));
+        }
+        let body = new_node(NodeKind::Block, NODES[n].start, NODES[n].end);
+        list_end(body, stmts);
+        NODES[body].a = tail;
+        body
+    }
+}
+
+// `loop { WRITES; if done { break; } }`: f-string fs written to `out`
+// until `done` (a call) says the text is all there.
+fn retry_loop(fs: i64, out: i64, done: i64, n: i64) -> i64 {
+    unsafe {
+        let start = NODES[n].start;
+        let end = NODES[n].end;
+        let stmts = list_begin();
+        push_writes(fs, out, true);
+        let then = new_node(NodeKind::Block, start, end);
+        let tmark = list_begin();
+        list_push(stmt(new_node(NodeKind::Break, start, end)));
+        list_end(then, tmark);
+        let test = new_node(NodeKind::If, start, end);
+        NODES[test].a = done;
+        NODES[test].b = then;
+        list_push(stmt(test));
         let body = new_node(NodeKind::Block, start, end);
         list_end(body, stmts);
-        // move |__out: *std::Fmt| body
-        let fmt_name = new_node(NodeKind::TyName, start, end);
-        NODES[fmt_name].a = intern_c(c"Fmt");
-        let smark = list_begin();
-        list_push(std_ident(n));
-        list_end(fmt_name, smark);
-        let fmt_ptr = new_node(NodeKind::TyPtr, start, end);
-        NODES[fmt_ptr].a = fmt_name;
-        let param = new_node(NodeKind::Param, start, end);
-        NODES[param].a = out;
-        NODES[param].b = fmt_ptr;
-        let closure = new_node(NodeKind::Closure, start, end);
-        NODES[closure].c = CLOSURE_MOVE;
-        NODES[closure].a = body;
-        let pmark = list_begin();
-        list_push(param);
-        list_end(closure, pmark);
-        // std::Interp { f: closure }
-        let lit = new_node(NodeKind::StructLit, start, end);
-        NODES[lit].a = intern_c(c"Interp");
-        let prefix = new_node(NodeKind::Path, start, end);
-        let prefix_mark = list_begin();
-        list_push(std_ident(n));
-        list_end(prefix, prefix_mark);
-        NODES[lit].h = prefix;
-        let field = new_node(NodeKind::FieldInit, start, end);
-        NODES[field].a = intern_c(c"f");
-        NODES[field].b = closure;
-        let fmark = list_begin();
-        list_push(field);
-        list_end(lit, fmark);
-        NODES[block].a = lit;
-        // The `let`s by hand (their values are checked), then the literal.
-        push_scope();
-        let mut k = 0;
-        for i in 0..count {
-            let item = child(n, i);
-            if NODES[item].kind == NodeKind::InterpHole {
-                let bind = NODES[child(block, k)].a;
-                check_pattern(bind, NODES[item].ty);
-                // (`{self}`, `{&p}`: a borrow, as passed directly)
-                if is_pointer(NODES[item].ty) && is_borrow(NODES[item].a) {
-                    LOCALS[NODES[bind].x].borrow = true;
+        let repeat = new_node(NodeKind::Loop, start, end);
+        NODES[repeat].b = body;
+        repeat
+    }
+}
+
+// `std::T::name(a0, a1, a2)` (T: none, `std::name(..)`; an argument 0:
+// none, the rest too), at node at. (A path of three segments has them
+// all in its list: front/parser/exprs.tach.)
+fn std_call(t: *u8, name: *u8, a0: i64, a1: i64, a2: i64, at: i64) -> i64 {
+    unsafe {
+        let path = new_node(NodeKind::Path, NODES[at].start, NODES[at].end);
+        NODES[path].b = intern_c(name);
+        if t == 0 as *u8 {
+            NODES[path].a = intern_c(c"std");
+        } else {
+            NODES[path].a = intern_c(t);
+            let pmark = list_begin();
+            list_push(std_ident(at));
+            list_push(ident(NODES[path].a, at));
+            list_push(ident(NODES[path].b, at));
+            list_end(path, pmark);
+        }
+        let call = new_node(NodeKind::Call, NODES[at].start, NODES[at].end);
+        NODES[call].a = path;
+        let amark = list_begin();
+        if a0 != 0 {
+            list_push(a0);
+            if a1 != 0 {
+                list_push(a1);
+                if a2 != 0 {
+                    list_push(a2);
                 }
-                k += 1;
             }
         }
-        let t = synth_expr(lit);
-        pop_scope();
-        NODES[block].ty = t;
-        NODES[n].y = block;
-        t
+        list_end(call, amark);
+        call
     }
 }
 
@@ -403,7 +708,7 @@ fn spec_error(h: i64, t: i64, message: *u8) -> ! {
     }
 }
 
-// `__f3`, `__s3`: a hidden local's name.
+// `=f3` (0.17: a hole, which the own walk reads, not moves: front/own/walk.tach's eval_let), `__s3`: a hidden local's name.
 fn hidden(prefix: *u8, i: i64) -> i64 {
     let out = buf_new();
     buf_str(out, prefix);

@@ -11,16 +11,18 @@
 //   tachyonc guide --list       NAME TAB SIZE TAB SUMMARY per topic, SIZE
 //                               as `N tokens` (bytes / 4)
 //   tachyonc guide --all        every topic, in order
+//   tachyonc guide --full       (0.17) the long form: topic language,
+//                               with std's API in it
 
 pub mod text;
 mod stdapi;
 pub mod find;
 
 use crate::base::{
-    STDERR, STDOUT, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd, streq,
+    STDERR, STDOUT, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd, cstr, streq,
 };
 use crate::guide::find::{FIND_BUDGET, FIND_OVER, guide_find, guide_section, put_sections_try};
-use crate::guide::stdapi::std_api;
+use crate::guide::stdapi::{API_CORE, API_DOC, API_INDEX, std_api};
 use crate::guide::text::{TOPIC_COUNT, topic_name, topic_summary, topic_text};
 
 // The topic named `name`, or -1.
@@ -34,8 +36,25 @@ fn topic_of(name: [u8]) -> i64 {
 }
 
 // Writes topic i to buffer out, with its placeholder lines filled in:
-// `@STD-API@` (std's API) and `@TOPICS@` (the other topics).
+// `@STD-API@` (std's API: 0.17, its index; `@STD-API-DOC@`, render_doc),
+// `@TOPICS@` (the other topics,
+// a line each), (0.17) `@TOPIC-NAMES@` (their names, on one line) and
+// `@STD-API-FULL@` (std's API, signatures only, in `guide --full`; else
+// nothing).
 pub fn render(i: i64, out: i64) {
+    render_in(i, out, false, false);
+}
+
+// (0.17) render, with the section `@STD-API-DOC@` makes (every item of
+// std with its comment): for `guide TOPIC#SECTION` (`guide std#every-item`).
+pub fn render_doc(i: i64, out: i64) {
+    render_in(i, out, false, true);
+}
+
+// render, with `full`: `guide --full` (0.17), the long form with std's
+// API in it; with `doc` (0.17), `@STD-API-DOC@` as std's API with its
+// comments, a section of its own.
+fn render_in(i: i64, out: i64, full: bool, doc: bool) {
     let raw = buf_new();
     topic_text(i, raw);
     let text = buf_slice(raw);
@@ -47,10 +66,24 @@ pub fn render(i: i64, out: i64) {
         }
         let line = text[start..end];
         if line == "@STD-API@" {
-            // (0.15: the core guide, topic 0, without what is in progress)
-            std_api(out, i == 0);
+            std_api(out, API_INDEX);
+        } else if line == "@STD-API-DOC@" {
+            // (0.17: a section of its own, only for `guide std#every-item`)
+            if doc {
+                buf_bytes(out, "## Every item with its comment\n\n```text\n");
+                std_api(out, API_DOC);
+                buf_bytes(out, "```\n");
+            }
+        } else if line == "@STD-API-FULL@" {
+            if full {
+                buf_bytes(out, "\n```text\n");
+                std_api(out, API_CORE);
+                buf_bytes(out, "```\n");
+            }
         } else if line == "@TOPICS@" {
             topic_lines(out);
+        } else if line == "@TOPIC-NAMES@" {
+            topic_names(out);
         } else {
             buf_bytes(out, line);
             buf_bytes(out, "\n");
@@ -70,6 +103,20 @@ fn topic_lines(out: i64) {
     }
 }
 
+// The topics but the core, by name on one line (0.17), for the short
+// core guide's end: `rust` `syntax` ...
+fn topic_names(out: i64) {
+    for i in 1..TOPIC_COUNT {
+        if i > 1 {
+            buf_bytes(out, " ");
+        }
+        buf_bytes(out, "`");
+        buf_bytes(out, topic_name(i));
+        buf_bytes(out, "`");
+    }
+    buf_bytes(out, "\n");
+}
+
 // --list: each topic with its size, in tokens at 4 bytes a token.
 fn list(out: i64) {
     for i in 0..TOPIC_COUNT {
@@ -86,12 +133,14 @@ fn list(out: i64) {
 
 fn usage(out: i64) {
     buf_bytes(out,
-        "usage: tachyonc guide [TOPIC[#SECTION]...] [--list] [--all] [--find WORDS] [--budget N]\n");
-    buf_bytes(out, "  (no TOPIC)   the core guide: the language, Rust habits, errors, tools\n");
+        "usage: tachyonc guide [TOPIC[#SECTION]...] [--list] [--all] [--full] [--find WORDS] [--budget N]\n");
+    buf_bytes(out, "  (no TOPIC)   the core guide: Rust habits, std, first errors, the loop\n");
     buf_bytes(out, "  TOPIC...     the topics, in turn\n");
     buf_bytes(out, "  --list       the topics, with their sizes\n");
     buf_bytes(out, "  --all        every topic\n");
-    buf_bytes(out, "  TOPIC#SECTION  one section (TOPIC#: its sections)\n");
+    buf_bytes(out, "  --full       the long form (topic language), with std's API\n");
+    buf_bytes(out, "  TOPIC#SECTION  one section (TOPIC#: its sections; TOPIC SECTION... too)\n");
+    buf_bytes(out, "  how [TASK]   recipes for \"add an X\" (guide how add-std-fn)\n");
     buf_bytes(out, "  --find WORDS   the paragraphs about WORDS, each under # TOPIC#SECTION\n");
     buf_bytes(out, "  --budget N     about N tokens at most (--find: 1000 by default)\n");
 }
@@ -158,6 +207,9 @@ pub fn run_guide(argc: i64, argv: **u8) -> i64 {
                 for i in 0..TOPIC_COUNT {
                     render(i, out);
                 }
+            } else if name == "--full" {
+                // (0.17: the long form, std's API in it)
+                render_in(topic_of("language"), out, true, false);
             } else if name == "--help" || name == "-h" {
                 usage(out);
             } else if n > 0 && name[0] == '-' {
@@ -192,6 +244,22 @@ pub fn run_guide(argc: i64, argv: **u8) -> i64 {
                         buf_bytes(err, "\n");
                         put_sections_try(err, prog, i);
                         status = 1;
+                    }
+                } else if k < argc && argv[k][0] != '-' && topic_of(cstr(argv[k])) < 0 {
+                    // (0.17: TOPIC SECTION..., `guide how add-std-fn`: the
+                    // words after a topic that are no topics, its sections)
+                    while k < argc && argv[k][0] != '-' && topic_of(cstr(argv[k])) < 0 {
+                        let want = cstr(argv[k]);
+                        k += 1;
+                        if !guide_section(i, want, out) {
+                            buf_bytes(err, "error guide.no-section: no section '");
+                            buf_bytes(err, want);
+                            buf_bytes(err, "' in ");
+                            buf_bytes(err, name);
+                            buf_bytes(err, "\n");
+                            put_sections_try(err, prog, i);
+                            status = 1;
+                        }
                     }
                 } else {
                     render(i, out);

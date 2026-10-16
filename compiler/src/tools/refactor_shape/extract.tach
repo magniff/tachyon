@@ -22,7 +22,7 @@
 use crate::base::{
     BUFS, FILES, IntVec, SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern,
 };
-use crate::front::ast::{NODES, NODE_COUNT, NodeKind, child};
+use crate::front::ast::{DEFER_IMPLICIT, NODES, NODE_COUNT, NodeKind, child};
 use crate::front::check::LOCALS;
 use crate::front::modules::file_of_pos;
 use crate::front::types::{TY_NEVER, TY_UNIT, buf_type, is_pointer};
@@ -34,7 +34,7 @@ use crate::tools::query::defs::{DEFS, DEF_COUNT, K_FN, K_IMPL_METHOD, K_METHOD};
 use crate::tools::query::diagnostics::{
     PROG, ROOT_GIVEN, TOOL, diag, diags, put_cword, put_root, put_word, try_end, write_diags,
 };
-use crate::tools::query::positions::{LINES, line_index, line_of};
+use crate::tools::query::positions::{LINES, line_index, line_of, put_path};
 use crate::tools::refactor_mod::cli::is_ident;
 use crate::tools::refactor_shape::{SUB, load_and_find, opt, sym_text, take_args, usage_error};
 use crate::tools::refactor_shape::body::{
@@ -117,12 +117,11 @@ fn extract_inner(argc: i64, argv: **u8) -> i64 {
         let file = file_of_pos(DEFS[d].start);
         let first_line = line_index(FILES[file].start);
         let file_lines = line_index(FILES[file].end - 1) - first_line + 1;
-        if lb > file_lines {
-            return usage_error(c"--lines goes past the end of FN's file", example);
-        }
-        let ra = LINES.data[first_line + la - 1];
-        let rb = after_line(LINES.data[first_line + lb - 1]);
-        if ra <= NODES[body].start || rb > NODES[body].end {
+        // (0.17: past the file's end, the body's lines are the help)
+        let past = lb > file_lines;
+        let ra = if past { 0 } else { LINES.data[first_line + la - 1] };
+        let rb = if past { 0 } else { after_line(LINES.data[first_line + lb - 1]) };
+        if past || ra <= NODES[body].start || rb > NODES[body].end {
             let e = diag(c"error", c"refactor.range");
             buf_str(e, c"lines ");
             put_range(e, la, lb);
@@ -215,7 +214,8 @@ fn extract_inner(argc: i64, argv: **u8) -> i64 {
             } else if k == NodeKind::Try {
                 // (0.15: `e?` returns from the function when e is None or Err)
                 what = c"may return (`?`) from ";
-            } else if k == NodeKind::Defer {
+            } else if k == NodeKind::Defer && (NODES[n].p & DEFER_IMPLICIT) == 0 {
+                // (a drop the checker placed moves with its binding)
                 what = c"defers to the end of a block of ";
             } else if (k == NodeKind::Break || k == NodeKind::Continue) && !loop_inside(n, sa, sb) {
                 what = if k == NodeKind::Break { c"breaks out of a loop of " }
@@ -780,7 +780,7 @@ fn try_show(fqn: [u8]) {
 fn try_show_at(file: i64, line: i64) {
     unsafe {
         let b = buf_new();
-        buf_str(b, FILES[file].path);
+        put_path(b, file);
         buf_byte(b, ':');
         buf_int(b, line);
         try_query(c"show", buf_slice(b));

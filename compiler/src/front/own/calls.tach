@@ -1,0 +1,422 @@
+// Calls (0.17, docs/design/value-semantics.md §4 step 4, "Calls"). T2 owns
+// this file.
+//
+// The walk evaluates a call's arguments left to right as pending entries
+// (state.tach PEND: a loan `&place`, a reference passed on, a view, a
+// value); then on_call, in order:
+// 1. an argument a later one changed (G2: `take(v.as_slice(), grow(&mut
+//    v))`, a `&mut self` receiver changed by its own argument) is a
+//    conflict at the later one;
+// 2. an argument overlapping one the call writes is a conflict (`f(&mut a,
+//    &a)`, `v.extend_from_slice(v.as_slice())`); a `&mut self` receiver is
+//    two-phase: reads of it in the arguments are fine (`v.push(v.len())`);
+// 3. what the call writes invalidates the views of it (not the slot it is
+//    written through, nor that slot's parents);
+// 4. the callee's summary (infer::summary_at_call: declared, inferred,
+//    the parametric floor, or top, through the type filter; the join of the
+//    address-taken functions' for a call through a fn value) gives what its
+//    `&mut` arguments' referents come to hold (stores), and the result's
+//    origin;
+// 5. a callee whose effects include `global` invalidates the views of
+//    statics (own.static at their use).
+// A top summary (one region: every level from every argument) marks what
+// it gives (state::mark_place): conflicts that come from it are warnings
+// (§7 V3).
+
+use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::check::Res;
+use crate::front::effects::{EFF_GLOBAL, effects_top, fn_effects};
+use crate::front::modules::STD_MODULE;
+use crate::front::own::diag::{
+    OWN_CONFLICT, own_begin, own_end, own_help, own_pos, own_soft, own_str,
+};
+use crate::front::own::infer::summary_at_call;
+use crate::front::own::kinds::is_view_type;
+use crate::front::own::state::{
+    CUR, NSLOT, PE, PEND, PE_BY, PE_INVALID, PE_NODE, PE_OV, PE_PLACE, PK_MUT, PK_MUT_VIEW, PK_NONE,
+    PK_RAW, PK_RESERVE, PK_SHARED, PK_VIEW, PL_COUNT, POOL_TOP, STATIC_MASK, at, clear_bit, get_bit,
+    is_empty, l1, l2, mark_place, new_ov, or_expanded, or_into, ov_hits, root_of, set_bit, slot_off,
+};
+use crate::front::own::summary::{S_L1_P, S_L1_STAR, S_L2_P, S_L2_STAR};
+use crate::front::own::views::{
+    H_CALL, H_GLOBAL, QUIET, close_mask, first_place, hidden_place, invalidate, own_place, own_src,
+    seen,
+};
+use crate::front::types::{FNS, TYPES, TyKind};
+
+// Whether origin o holds the mark place (it came in part from a top
+// summary).
+pub fn any_mark(o: i64) -> bool {
+    unsafe {
+        if o < 0 {
+            return false;
+        }
+        let p = mark_place();
+        p >= 0 && (get_bit(l1(o), p) || get_bit(l2(o), p))
+    }
+}
+
+fn set_mark(o: i64) {
+    unsafe {
+        let p = mark_place();
+        if p >= 0 {
+            set_bit(l1(o), p);
+            set_bit(l2(o), p);
+        }
+    }
+}
+
+fn is_mut_kind(k: i64) -> bool {
+    k == PK_MUT || k == PK_RESERVE || k == PK_MUT_VIEW
+}
+
+fn reporting(n: i64) -> bool {
+    unsafe { !QUIET && !seen(n) }
+}
+
+// The slot an argument goes through (a slot local, a place under one, a
+// reference passed on), or -1.
+fn arg_slot(e: i64) -> i64 {
+    unsafe {
+        let k = NODES[e].kind;
+        if k == NodeKind::Ident && NODES[e].res == Res::Local {
+            return crate::front::own::state::slot_of_local(NODES[e].y);
+        }
+        if k == NodeKind::Index || k == NodeKind::Cast || k == NodeKind::FieldAccess
+            || k == NodeKind::TupleField {
+            return arg_slot(NODES[e].a);
+        }
+        if k == NodeKind::Unary {
+            return arg_slot(NODES[e].b);
+        }
+        if k == NodeKind::Call && NODES[e].count > 0 && is_view_type(NODES[e].ty) {
+            // (a view a method makes of its receiver: a reborrow of it,
+            // views::root_slot)
+            return arg_slot(child(e, 0));
+        }
+        -1
+    }
+}
+
+// Whether the path of expression e goes through a pointer, a reference or
+// a slice (its place is inside what something points to).
+fn path_derefs(e: i64) -> bool {
+    unsafe {
+        let k = NODES[e].kind;
+        if k == NodeKind::FieldAccess {
+            return NODES[e].y == 1 || path_derefs(NODES[e].a);
+        }
+        if k == NodeKind::TupleField {
+            return path_derefs(NODES[e].a);
+        }
+        if k == NodeKind::Unary {
+            return NODES[e].op == crate::front::lexer::Tok::Star || path_derefs(NODES[e].b);
+        }
+        if k == NodeKind::Index {
+            let bt = NODES[NODES[e].a].ty;
+            if bt > 0 && (TYPES[bt].kind == TyKind::Ptr || TYPES[bt].kind == TyKind::Slice) {
+                return true;
+            }
+            return path_derefs(NODES[e].a);
+        }
+        false
+    }
+}
+
+// The mask of what pending entry e may write: what its level 1 points into,
+// expanded, and the paths through references that reach it.
+fn write_mask(e: i64) -> i64 {
+    unsafe {
+        let m = new_ov();
+        or_expanded(at(m), l1(PEND.data[e + PE_OV]));
+        close_mask(at(m));
+        m
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Summaries applied (the type filter is in them: infer::summary_at_call)
+
+// dst gets the levels argument j (origin o) gives through the summary
+// masks m (S_* indexed).
+fn apply(dst: i64, o: i64, j: i64, m: *i64) {
+    unsafe {
+        let bit = if j >= 63 { -1 } else { 1 << j };
+        if (m[S_L1_P] & bit) != 0 {
+            or_into(l1(dst), l1(o));
+        }
+        if (m[S_L1_STAR] & bit) != 0 {
+            or_into(l1(dst), l2(o));
+        }
+        if (m[S_L2_P] & bit) != 0 {
+            or_into(l2(dst), l2(o));
+        }
+        if (m[S_L2_STAR] & bit) != 0 {
+            or_into(l2(dst), l2(o));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The call
+
+// Call n of function f (-1: through a fn value), its arguments pending at
+// state::PEND[base..] (PE words each); dst (-1: none) gets the result's
+// views.
+pub fn on_call(n: i64, f: i64, base: i64, dst: i64) {
+    unsafe {
+        crate::front::own::observe::at(n);
+        let end = PEND.count;
+        let mark = POOL_TOP;
+        // (whether a written argument's referent holds views: the stores)
+        let mut stores = false;
+        // 1. Arguments a later one changed.
+        let mut e = base;
+        while e < end {
+            if PEND.data[e + PE_INVALID] != 0 {
+                changed_by_later(e, n);
+            }
+            e += PE;
+        }
+        // 2. Arguments overlapping one the call writes; 3. what it writes.
+        let mut a = base;
+        while a < end {
+            let ka = PEND.data[a];
+            if is_mut_kind(ka) && PEND.data[a + PE_OV] >= 0 {
+                let m = write_mask(a);
+                let mut b = base;
+                while b < end {
+                    let kb = PEND.data[b];
+                    let ob = PEND.data[b + PE_OV];
+                    if b != a && kb != PK_NONE && kb != PK_RAW && ob >= 0
+                        && !(is_mut_kind(kb) && b < a) && ov_hits(ob, at(m)) {
+                        overlap(a, b, m);
+                    }
+                    b += PE;
+                }
+                if NSLOT > 0 || base > 0 {
+                    invalidate(at(m), n, H_CALL, arg_slot(PEND.data[a + PE_NODE]), base);
+                }
+                POOL_TOP = m;
+                if !stores && end - base > PE && NSLOT > 0 {
+                    stores = arg_slot(PEND.data[a + PE_NODE]) >= 0;
+                }
+            }
+            a += PE;
+        }
+        // 5. Statics (before the stores and the result: they do not hold
+        // views of statics that the call may have changed).
+        if (NSLOT > 0 || base > 0) && !is_empty(STATIC_MASK) {
+            let eff = if f >= 0 { fn_effects(f) } else { effects_top() };
+            if (eff.bits & EFF_GLOBAL) != 0 {
+                global_call(n, base);
+            }
+        }
+        let rt = NODES[n].ty;
+        let result = dst >= 0 && end > base && is_view_type(rt);
+        if !stores && !result {
+            return;
+        }
+        let s = summary_at_call(n, f);
+        // 4. The stores into `&mut` arguments' referents (std's are pinned
+        // by T4: an unpinned one assumes none, until its legacy `*T`
+        // parameters are `&T` or `&mut T`)
+        if stores && !(s.top && f >= 0 && FNS[f].module == STD_MODULE) {
+            let mut a2 = base;
+            while a2 < end {
+                if is_mut_kind(PEND.data[a2]) {
+                    store(a2, base, end, s.sto, s.top);
+                }
+                a2 += PE;
+            }
+        }
+        POOL_TOP = mark;
+        // 6. The result.
+        if result {
+            let mut b = base;
+            let mut j = 0;
+            while b < end {
+                let o = PEND.data[b + PE_OV];
+                if o >= 0 && PEND.data[b] != PK_NONE {
+                    apply(dst, o, j, &s.ret[0]);
+                }
+                b += PE;
+                j += 1;
+            }
+            if s.top && !is_empty(l1(dst)) {
+                set_mark(dst);
+            }
+        }
+    }
+}
+
+// Pending entry a (written by the call) stores the other arguments' views
+// as the summary's stores say (sto, top: a top summary).
+fn store(a: i64, base: i64, end: i64, sto: [i64; 4], top: bool) {
+    unsafe {
+        let arg = PEND.data[a + PE_NODE];
+        let ts = arg_slot(arg);
+        if ts < 0 {
+            return;
+        }
+        let at_ty = NODES[arg].ty;
+        if at_ty <= 0 || !is_view_type(if TYPES[at_ty].kind == TyKind::Ptr { TYPES[at_ty].a }
+            else { at_ty }) {
+            return;
+        }
+        let tmp = new_ov();
+        let mut b = base;
+        let mut j = 0;
+        while b < end {
+            let o = PEND.data[b + PE_OV];
+            if b != a && o >= 0 && PEND.data[b] != PK_NONE {
+                apply(tmp, o, j, &sto[0]);
+            }
+            b += PE;
+            j += 1;
+        }
+        if is_empty(l1(tmp)) && is_empty(l2(tmp)) {
+            POOL_TOP = tmp;
+            return;
+        }
+        // (minus loans on the referent itself)
+        let pa = PEND.data[a + PE_PLACE];
+        if pa >= 0 {
+            let r = root_of(pa);
+            for q in 0..PL_COUNT {
+                if root_of(q) == r {
+                    clear_bit(l1(tmp), q);
+                    clear_bit(l2(tmp), q);
+                }
+            }
+        }
+        if top {
+            set_mark(tmp);
+        }
+        let off = slot_off(CUR, ts);
+        let through = NODES[arg].kind == NodeKind::Ident || PEND.data[a] == PK_MUT_VIEW
+            || NODES[arg].kind == NodeKind::Unary && path_derefs(NODES[arg].b);
+        if through {
+            // (what the slot points to now holds them)
+            or_into(l2(off), l1(tmp));
+            or_into(l2(off), l2(tmp));
+        } else {
+            or_into(l1(off), l1(tmp));
+            or_into(l2(off), l2(tmp));
+        }
+        POOL_TOP = tmp;
+    }
+}
+
+// A call whose effects include `global`: the views of statics are invalid
+// from here (slots, and pending views of enclosing calls; a loan on a
+// static's own place stays: its address does not change).
+fn global_call(n: i64, base: i64) {
+    unsafe {
+        let m = new_ov();
+        or_expanded(at(m), STATIC_MASK);
+        close_mask(at(m));
+        // (the pending views only)
+        let mut e = 0;
+        while e < base {
+            let k = PEND.data[e];
+            let o = PEND.data[e + PE_OV];
+            if (k == PK_VIEW || k == PK_MUT_VIEW) && o >= 0 && PEND.data[e + PE_INVALID] == 0
+                && ov_hits(o, at(m)) {
+                PEND.data[e + PE_INVALID] = H_GLOBAL;
+                PEND.data[e + PE_BY] = n;
+            }
+            e += PE;
+        }
+        invalidate(at(m), n, H_GLOBAL, -1, 0);
+        POOL_TOP = m;
+    }
+}
+
+// Pending entry e was changed by a later argument (PE_BY, how PE_INVALID)
+// before call n: the finding, at the later argument.
+fn changed_by_later(e: i64, n: i64) {
+    unsafe {
+        let arg = PEND.data[e + PE_NODE];
+        let by = PEND.data[e + PE_BY];
+        let k = PEND.data[e];
+        let at_node = if by > 0 { by } else { n };
+        let pl = PEND.data[e + PE_PLACE];
+        let o = PEND.data[e + PE_OV];
+        if hidden_place(pl) || o >= 0 && hidden_place(first_place(o, 0 as *i64))
+            || !reporting(at_node) {
+            return;
+        }
+        own_begin(at_node, OWN_CONFLICT);
+        if k == PK_RESERVE {
+            own_str(c"the receiver ");
+            own_src(arg);
+            own_str(c" of ");
+            own_src(n);
+            own_str(c" is changed by its own argument ");
+            own_src(at_node);
+            own_help(c"a '&mut self' receiver is borrowed when the call happens, after its arguments, and must not change in between: compute the argument into a 'let' before the call");
+        } else {
+            own_src(at_node);
+            own_str(c" may change what argument ");
+            own_src(arg);
+            own_str(c" (");
+            own_pos(arg);
+            own_str(if k == PK_MUT || k == PK_SHARED { c") borrows, " } else { c") views, " });
+            own_str(c"before ");
+            own_src(n);
+            own_str(c" uses it");
+            own_help(c"evaluate the later argument into a 'let' before the call, then take the view (or the borrow) in the call");
+        }
+        if any_mark(PEND.data[e + PE_OV]) {
+            own_soft();
+        }
+        own_end();
+    }
+}
+
+// Pending entries a (written by the call) and b overlap (mask m: what a
+// writes): the finding, at b.
+fn overlap(a: i64, b: i64, m: i64) {
+    unsafe {
+        let an = PEND.data[a + PE_NODE];
+        let bn = PEND.data[b + PE_NODE];
+        let ob = PEND.data[b + PE_OV];
+        let mut q = -1;
+        for p in 0..PL_COUNT {
+            if get_bit(at(m), p) && (get_bit(l1(ob), p) || get_bit(l2(ob), p))
+                && crate::front::own::state::PL_RKIND[root_of(p)]
+                != crate::front::own::state::RK_MARK {
+                q = p;
+                break;
+            }
+        }
+        // (a desugaring's own temporaries: views::hidden_local)
+        if hidden_place(q) || hidden_place(PEND.data[a + PE_PLACE]) || !reporting(bn) {
+            return;
+        }
+        own_begin(bn, OWN_CONFLICT);
+        if q >= 0 {
+            own_place(q);
+        } else {
+            own_str(c"a place");
+        }
+        own_str(c" is borrowed mutably by ");
+        own_src(an);
+        own_str(c" and ");
+        let kb = PEND.data[b];
+        own_str(if is_mut_kind(kb) { c"mutably again by " } else if kb == PK_VIEW { c"viewed by " }
+            else { c"read by " });
+        own_src(bn);
+        own_str(c" in the same call");
+        if PEND.data[a] == PK_RESERVE {
+            own_help(c"the call changes its receiver while this argument still views it: copy what it views first ('.clone()'), or pass a part the receiver does not hold");
+        } else {
+            own_help(c"pass disjoint places ('&mut a.x, &a.y'), copy the plain value out first, or for two elements of one Vec use 'v.swap(i, j)'");
+        }
+        if any_mark(ob) || any_mark(PEND.data[a + PE_OV]) {
+            own_soft();
+        }
+        own_end();
+    }
+}

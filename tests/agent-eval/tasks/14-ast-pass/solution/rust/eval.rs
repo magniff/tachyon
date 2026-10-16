@@ -100,7 +100,11 @@ impl<'a> Machine<'a> {
             Expr::Var(name, line) => {
                 let i = self.find(name);
                 if i < 0 {
-                    return Err(RtError { kind: ErrorKind::UndefinedVariable, line: line, name: name });
+                    return Err(RtError {
+                        kind: ErrorKind::UndefinedVariable,
+                        line: line,
+                        name: name,
+                    });
                 }
                 Ok(self.values[i as usize])
             }
@@ -119,7 +123,11 @@ impl<'a> Machine<'a> {
                 let right = self.eval(b)?;
                 match apply_binary(op, left, right) {
                     Some(v) => Ok(v),
-                    None => Err(RtError { kind: ErrorKind::DivisionByZero, line: line, name: 0 }),
+                    None => Err(RtError {
+                        kind: ErrorKind::DivisionByZero,
+                        line: line,
+                        name: 0,
+                    }),
                 }
             }
         }
@@ -149,7 +157,11 @@ impl<'a> Machine<'a> {
                 let v = self.eval(e)?;
                 let i = self.find(name);
                 if i < 0 {
-                    return Err(RtError { kind: ErrorKind::UndefinedVariable, line: line, name: name });
+                    return Err(RtError {
+                        kind: ErrorKind::UndefinedVariable,
+                        line: line,
+                        name: name,
+                    });
                 }
                 self.values[i as usize] = v;
             }
@@ -191,7 +203,13 @@ impl<'a> Machine<'a> {
 // Runs the program; appends what it printed to `out`, ending with the
 // error line if it stopped on an error.
 pub fn run(ast: &Ast, out: &mut Vec<u8>) {
-    let mut m = Machine { ast: ast, names: Vec::new(), values: Vec::new(), top: 0, out: Vec::new() };
+    let mut m = Machine {
+        ast: ast,
+        names: Vec::new(),
+        values: Vec::new(),
+        top: 0,
+        out: Vec::new(),
+    };
     let r = m.exec_block(ast.top_first, ast.top_count);
     out.extend_from_slice(&m.out);
     if let Err(e) = r {

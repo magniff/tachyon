@@ -23,7 +23,14 @@ pub struct Machine {
 
 impl Machine {
     pub fn new() -> Machine {
-        Machine { stack: Vec::new(), pc: 0, steps: 0, cost: 0, counts: [0; 4], status: RUNNING }
+        Machine {
+            stack: Vec::new(),
+            pc: 0,
+            steps: 0,
+            cost: 0,
+            counts: [0; 4],
+            status: RUNNING,
+        }
     }
 
     fn pop(&mut self) -> i64 {

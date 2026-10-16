@@ -65,17 +65,26 @@ pub fn verify(ops: &[Op]) -> Result<(), VerifyError> {
         let op = ops[pc as usize];
         if let Some(t) = target(op) {
             if t < 0 || t >= n {
-                return Err(VerifyError { pc: pc, message: "bad jump target" });
+                return Err(VerifyError {
+                    pc: pc,
+                    message: "bad jump target",
+                });
             }
         }
         let (needs, delta) = stack_effect(op);
         let d = depth[pc as usize];
         if d < needs {
-            return Err(VerifyError { pc: pc, message: "stack underflow" });
+            return Err(VerifyError {
+                pc: pc,
+                message: "stack underflow",
+            });
         }
         let after = d + delta;
         if after > MAX_DEPTH {
-            return Err(VerifyError { pc: pc, message: "stack overflow" });
+            return Err(VerifyError {
+                pc: pc,
+                message: "stack overflow",
+            });
         }
         let mut next: Vec<i64> = Vec::new();
         if falls_through(op) && pc + 1 < n {
@@ -90,7 +99,10 @@ pub fn verify(ops: &[Op]) -> Result<(), VerifyError> {
                 depth[s as usize] = after;
                 todo.push(s);
             } else if known != after {
-                return Err(VerifyError { pc: s, message: "inconsistent stack depth" });
+                return Err(VerifyError {
+                    pc: s,
+                    message: "inconsistent stack depth",
+                });
             }
         }
     }

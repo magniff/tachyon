@@ -39,7 +39,8 @@ use crate::back::dwarf::DEBUG_INFO;
 use crate::back::enc_arm64::init_a64;
 use crate::back::enc_x86::init_x86;
 use crate::base::{
-    BUFS, SYMS, buf_byte, buf_fmt, buf_new, buf_write_file, cstr, die, grow, intern, strlen,
+    BUFS, SYMS, buf_byte, buf_fmt, buf_new, buf_reserve, buf_write_file, cstr, die, grow, intern,
+    strlen,
 };
 use crate::gen0::target::ASM;
 use crate::middle::lower::ssa::HMap;
@@ -50,6 +51,7 @@ use resolve::{build_sections, layout, resolve_fixups};
 
 // The assembler's text helpers, used by the instruction encoders.
 use crate::base::target::{ELF, X86};
+use crate::base::timer::{T_CODEGEN, T_OUTPUT, timer_now, timer_sub};
 use output::{c_module_symbols, link_command};
 
 // ---- Sections ----
@@ -143,11 +145,18 @@ pub fn out16(v: i64) {
     out8(v >> 8);
 }
 
+// (0.17: the four bytes with one check for room, not four buf_byte calls)
 pub fn out32(v: i64) {
-    out8(v);
-    out8(v >> 8);
-    out8(v >> 16);
-    out8(v >> 24);
+    unsafe {
+        buf_reserve(OBJ_BYTES, 4);
+        let at = BUFS[OBJ_BYTES].len;
+        let d = BUFS[OBJ_BYTES].data;
+        d[at] = (v & 255) as u8;
+        d[at + 1] = ((v >> 8) & 255) as u8;
+        d[at + 2] = ((v >> 16) & 255) as u8;
+        d[at + 3] = ((v >> 24) & 255) as u8;
+        BUFS[OBJ_BYTES].len = at + 4;
+    }
 }
 
 pub fn out64(v: i64) {
@@ -357,30 +366,16 @@ pub fn is_debug(sec: i64) -> bool {
 
 // ---- The driver ----
 
-// Assembles ASM into an object file at `path`.
+// Assembles ASM into an object file at `path` (what asm_flush has not
+// assembled yet).
 pub fn write_object(path: *u8) {
     unsafe {
-        OBJ_BYTES = buf_new();
-        MAPPING = ELF && !X86;
-        HOOKS = MAPPING;
-        CUR_SEC = SEC_TEXT;
-        SEC_USED[SEC_TEXT] = true;
-        new_frag(SEC_TEXT);
-        if X86 {
-            init_x86();
-        } else {
-            init_a64();
+        if !ASM_STREAM {
+            assembler_begin();
         }
-        let t = BUFS[ASM].data;
-        let n = BUFS[ASM].len;
-        let mut i = 0;
-        while i < n {
-            let mut e = i;
-            while e < n && t[e] != '\n' {
-                e += 1;
-            }
-            assemble_line(i, e);
-            i = e + 1;
+        assemble_text();
+        if ASM_STREAM {
+            BUFS[ASM].len = 0;
         }
         new_frag(CUR_SEC);
         layout();
@@ -401,12 +396,80 @@ pub fn write_object(path: *u8) {
     }
 }
 
+// The assembler's state before the first line.
+fn assembler_begin() {
+    unsafe {
+        OBJ_BYTES = buf_new();
+        MAPPING = ELF && !X86;
+        HOOKS = MAPPING;
+        CUR_SEC = SEC_TEXT;
+        SEC_USED[SEC_TEXT] = true;
+        new_frag(SEC_TEXT);
+        if X86 {
+            init_x86();
+        } else {
+            init_a64();
+        }
+    }
+}
+
+// Assembles the lines in ASM.
+fn assemble_text() {
+    unsafe {
+        let t = BUFS[ASM].data;
+        let n = BUFS[ASM].len;
+        let mut i = 0;
+        while i < n {
+            // (0.17: the end of the line by memchr, not byte by byte)
+            let nl = memchr(&t[i], 10, (n - i) as u64);
+            let e = if nl == 0 as *u8 { n } else { i + (nl as i64 - (&t[i]) as i64) };
+            assemble_line(i, e);
+            i = e + 1;
+        }
+    }
+}
+
+// (0.17) Whether the assembly is assembled as it is written (asm_flush
+// after each function): when the output is an object (or a program) and
+// there is no debug information, whose sections are made from the whole
+// text. The text in memory is then one function's, not the program's
+// (30 MB at -O0 for the compiler), and it is read while it is in the
+// cache.
+pub static mut ASM_STREAM: bool = false;
+
+// From the first function on (after the file's header): see ASM_STREAM.
+pub fn asm_stream_begin() {
+    unsafe {
+        if OUTPUT_MODE != OUT_ASM && !DEBUG_INFO {
+            ASM_STREAM = true;
+            assembler_begin();
+        }
+    }
+}
+
+// Assembles the text written so far (whole lines: a function's), when
+// streaming.
+pub fn asm_flush() {
+    unsafe {
+        if ASM_STREAM {
+            // (its time is the output's, as when the text is assembled at
+            // the end, not the code generation's that runs it)
+            let t = timer_now();
+            c_module_symbols();
+            assemble_text();
+            BUFS[ASM].len = 0;
+            timer_sub(T_CODEGEN, T_OUTPUT, t);
+        }
+    }
+}
+
 // ---- Output ----
 
 extern "C" {
     fn system(command: *u8) -> i32;
     fn unlink(path: *u8) -> i32;
     fn getenv(name: *u8) -> *u8;
+    fn memchr(s: *u8, c: i32, n: u64) -> *u8;
 }
 
 // What the compiler writes: assembly (`-S`, `--emit-asm`, or an output

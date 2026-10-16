@@ -7,8 +7,7 @@ $ refactor variant Shape --add 'Ring(i64)'
 shapes.tach:9:5	shapes::area
 shapes.tach:16:5	shapes::round
 error refactor.non-exhaustive: 2 matches on crate::shapes::Shape would not cover Ring; nothing written
-try: tachyonc query show shapes.tach:9
-try: tachyonc query show shapes.tach:16
+try: tachyonc query show shapes.tach:9 shapes.tach:16
 try: tachyonc refactor variant crate::shapes::Shape --add 'Ring(i64)' --arm 'EXPR' --dry-run
 try: tachyonc refactor variant crate::shapes::Shape --add 'Ring(i64)' --arm-in shapes::area 'EXPR' --arm-in shapes::round 'EXPR' --dry-run
 [exit 1]

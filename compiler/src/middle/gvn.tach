@@ -6,17 +6,21 @@
 
 // The dominator tree: children of the block at layout index k are
 // DOM_CHILD[DOM_START[k] .. DOM_START[k + 1]] (blocks).
+use crate::back::abi::fn_uses_c;
 use crate::back::regalloc::ORDER;
 use crate::base::{IntVec, alloc_array, free, intern_c, memset};
-use crate::front::types::{TY_U64, is_integer, type_size};
+use crate::front::own::diag::{MODE_ERROR, OWN_MODE};
+use crate::front::types::{
+    FNS, REF_MUT, REF_SHARED, TYPES, TY_U64, TyKind, fn_param, is_integer, type_size,
+};
 use crate::middle::egraph::{EGRAPH, egraph_rewrite, egraph_start};
 use crate::middle::fold::is_const;
 use crate::middle::gvn_calls::{call_numbering, inherit_into};
 use crate::middle::ipo::{call_reads, call_writes};
 use crate::middle::ir::{
-    BLOCKS, Cond, INSTS, IRFUNCS, Op, SLOTS, SLOT_COUNT, Term, ir_arg, ir_insert_before, ir_make,
-    ir_operand, ir_operand_count, ir_replace, ir_resolve_operands, ir_set_operand, ir_unlink,
-    ir_val,
+    BLOCKS, Cond, INSTS, INST_COUNT, IRF, IRFUNCS, Op, SLOTS, SLOT_COUNT, Term, ir_arg,
+    ir_insert_before, ir_make, ir_operand, ir_operand_count, ir_replace, ir_resolve_operands,
+    ir_set_operand, ir_unlink, ir_val,
 };
 use crate::middle::ir::Op::{
     Add, And, CallC, Cmp, Const, Conv, Copy, GAddr, Load, Mul, Or, Phi, SAddr, Slot, Store, Xor,
@@ -60,6 +64,7 @@ pub fn build_dom_tree(fi: i64) {
 
 static mut GVN_TABLE: *i64 = 0 as *i64;
 static mut GVN_SIZE: i64 = 0;
+static mut GVN_CAP: i64 = 0;
 static mut GVN_COUNT: i64 = 0;
 // Slots filled, in order, to undo a scope.
 static mut GVN_LOG: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -132,19 +137,25 @@ fn gvn_equal(v: i64, w: i64) -> bool {
     }
 }
 
+// (0.17: the table is as large as this function needs, GVN_SIZE, in an
+// allocation kept from call to call, GVN_CAP: clearing the largest
+// function's table for every function was a few percent of -O2. The
+// value found for an expression does not depend on the size: the table
+// holds no two equal entries.)
 fn gvn_reset(capacity: i64) {
     unsafe {
         let mut size = 1024;
         while size < capacity * 2 {
             size *= 2;
         }
-        if size > GVN_SIZE {
+        if size > GVN_CAP {
             free(GVN_TABLE as *u8);
             GVN_TABLE = alloc_array::<i64>(size);
-            GVN_SIZE = size;
+            GVN_CAP = size;
         } else {
-            memset(GVN_TABLE as *u8, 0, (GVN_SIZE * 8) as u64);
+            memset(GVN_TABLE as *u8, 0, (size * 8) as u64);
         }
+        GVN_SIZE = size;
         GVN_COUNT = 0;
         GVN_LOG.count = 0;
     }
@@ -354,7 +365,221 @@ fn is_private_slot(base: i64) -> bool {
 // constant.
 pub fn call_may_write(base: i64) -> bool {
     let root = root_of(base);
-    !is_private_root(root) && !is_constant_memory(root)
+    !is_private_root(root) && !is_constant_memory(root) && !param_frozen(base)
+}
+
+// ---- (0.17) Reference parameters: noalias and read-only ----
+//
+// What 0.17's parameter types tell the optimizer (docs/design/
+// value-semantics.md §4, "Optimizer work"), once the own pass has checked
+// exclusivity: memory reached through a `&mut T` or `&mut [T]` parameter is
+// reached through nothing else during the call, so it is distinct from
+// every other reference parameter and from statics; a `&T` or `[T]`
+// parameter is frozen for the call, so a call cannot write it, and, when
+// the function itself writes through it nowhere, it is distinct from the
+// others too. Legacy `*T` parameters stay raw (a raw pointer passed to one
+// is not tracked), as do the parameters of exported functions and of
+// functions with C's convention (their callers are not checked).
+//
+// Sound only when the own pass ran in `error` mode, which stops the
+// compilation at its first error: under `--values=warn` or `report`,
+// `sweep(sa, sa)` would be miscompiled. `--no-noalias` turns the facts off
+// (to measure them).
+pub static mut NOALIAS_OFF: bool = false;
+static mut RO_FN: i64 = -1;
+static mut RO_STAMP: i64 = -1;
+static mut RO_WRITTEN: i64 = 0;
+
+// Parameter classes (param_class).
+const PC_NONE: i64 = 0;
+const PC_EXCLUSIVE: i64 = 1;
+const PC_SHARED: i64 = 2;
+
+// Whether reference parameters' facts may be used: the own pass ran in
+// error mode (the optimizer runs only when it found no error).
+pub fn noalias_active() -> bool {
+    unsafe { OWN_MODE == MODE_ERROR && !NOALIAS_OFF }
+}
+
+// The class of parameter k of the function being optimized.
+fn param_class(k: i64) -> i64 {
+    unsafe { param_class_of(IRFUNCS[IRF].f, k) }
+}
+
+// The class of parameter k of function f, by its type: PC_EXCLUSIVE
+// (`&mut T`, `&mut [T]`), PC_SHARED (`&T`, `[T]`) or PC_NONE.
+fn param_class_of(f: i64, k: i64) -> i64 {
+    unsafe {
+        if f < 0 || k < 0 || k >= FNS[f].param_count || fn_uses_c(f) {
+            return PC_NONE;
+        }
+        let t = fn_param(f, k);
+        if t <= 0 {
+            return PC_NONE;
+        }
+        let kind = TYPES[t].kind;
+        if kind == TyKind::Slice {
+            return if TYPES[t].b == REF_MUT { PC_EXCLUSIVE } else { PC_SHARED };
+        }
+        if kind != TyKind::Ptr {
+            return PC_NONE;
+        }
+        if TYPES[t].b == REF_MUT {
+            PC_EXCLUSIVE
+        } else if TYPES[t].b == REF_SHARED {
+            PC_SHARED
+        } else {
+            PC_NONE
+        }
+    }
+}
+
+// Whether function f's reference parameters give the optimizer facts it
+// can use: an exclusive one and another (the facts are about pairs, and a
+// static). Its loop passes then run before it is inlined (inline.tach,
+// inlined_everywhere), while the parameters are still there.
+pub fn has_ref_facts(f: i64) -> bool {
+    if !noalias_active() {
+        return false;
+    }
+    let mut refs = 0;
+    let mut exclusive = false;
+    unsafe {
+        for k in 0..FNS[f].param_count {
+            let class = param_class_of(f, k);
+            if class != PC_NONE {
+                refs += 1;
+            }
+            if class == PC_EXCLUSIVE {
+                exclusive = true;
+            }
+        }
+    }
+    exclusive && refs >= 2
+}
+
+// The reference parameter (its index + 1) address v points into, through
+// additions, or 0: a `&T`/`&mut T` parameter, or the pointer (the first
+// piece) of a slice parameter.
+pub fn param_root(v: i64) -> i64 {
+    unsafe {
+        let mut x = v;
+        for _ in 0..64 {
+            let op = INSTS[x].op;
+            if op == Op::Param {
+                let k = INSTS[x].imm;
+                if k < 0 || INSTS[x].ty != TY_U64 {
+                    return 0;
+                }
+                let class = param_class(k);
+                if class == PC_NONE {
+                    return 0;
+                }
+                let f = IRFUNCS[IRF].f;
+                let slice = TYPES[fn_param(f, k)].kind == TyKind::Slice;
+                if slice && INSTS[x].imm2 != 1 || !slice && INSTS[x].imm2 != 0 {
+                    return 0;
+                }
+                return k + 1;
+            }
+            if op != Add || INSTS[x].ty != TY_U64 {
+                return 0;
+            }
+            if is_const(INSTS[x].b) {
+                x = INSTS[x].a;
+                continue;
+            }
+            let pa = param_root(INSTS[x].a);
+            let pb = param_root(INSTS[x].b);
+            if pa != 0 && pb == 0 {
+                return pa;
+            }
+            if pb != 0 && pa == 0 {
+                return pb;
+            }
+            return 0;
+        }
+        0
+    }
+}
+
+// Whether parameter p (index + 1) has a fact here: exclusive, or shared and
+// never written through by the function (a write through `[T]` is
+// own.readonly's; until it is checked, such a parameter is left raw).
+fn param_kept_apart(p: i64) -> bool {
+    let class = param_class(p - 1);
+    class == PC_EXCLUSIVE || class == PC_SHARED && !param_written(p)
+}
+
+// Whether bases b1 and b2 point into memory that 0.17's parameter rules
+// keep apart: two different reference parameters, or one and a static.
+pub fn params_disjoint(b1: i64, b2: i64) -> bool {
+    if !noalias_active() {
+        return false;
+    }
+    let p1 = param_root(b1);
+    let p2 = param_root(b2);
+    if p1 == 0 && p2 == 0 || p1 == p2 {
+        return false;
+    }
+    if p1 != 0 && p2 != 0 {
+        return param_kept_apart(p1) && param_kept_apart(p2);
+    }
+    let p = if p1 == 0 { p2 } else { p1 };
+    let other = if p1 == 0 { root_of(b1) } else { root_of(b2) };
+    unsafe { other != 0 && INSTS[other].op == GAddr && param_kept_apart(p) }
+}
+
+// Whether the function being optimized may write through parameter p
+// (index + 1): a store or copy into it, or the parameter passed to a call
+// (or stored, compared... used other than as an address). A bit per
+// parameter, recomputed when the function or its instructions change.
+fn param_written(p: i64) -> bool {
+    unsafe {
+        if RO_FN != IRF || RO_STAMP != INST_COUNT {
+            RO_FN = IRF;
+            RO_STAMP = INST_COUNT;
+            RO_WRITTEN = 0;
+            for i in 0..IRFUNCS[IRF].blocks.count {
+                let b = IRFUNCS[IRF].blocks.data[i];
+                if BLOCKS[b].removed != 0 {
+                    continue;
+                }
+                let mut v = BLOCKS[b].first;
+                while v != 0 {
+                    let op = INSTS[v].op;
+                    for k in 0..ir_operand_count(v) {
+                        let operand = ir_operand(v, k);
+                        if operand == 0 {
+                            continue;
+                        }
+                        let read = (op == Load && k == 0) || (op == Copy && k == 1)
+                            || (op == Add && INSTS[v].ty == TY_U64) || op == Cmp;
+                        if !read {
+                            let q = param_root(operand);
+                            if q > 0 && q < 63 {
+                                RO_WRITTEN = RO_WRITTEN | (1 << (q - 1));
+                            }
+                        }
+                    }
+                    v = INSTS[v].next;
+                }
+            }
+        }
+        p >= 63 || (RO_WRITTEN & (1 << (p - 1))) != 0
+    }
+}
+
+// Whether no call of the function can write the memory at base: a
+// reference parameter the function passes to no call and writes nowhere
+// (an exclusive one is reached through nothing else; a shared one is
+// frozen for the call).
+fn param_frozen(base: i64) -> bool {
+    if !noalias_active() {
+        return false;
+    }
+    let p = param_root(base);
+    p != 0 && !param_written(p)
 }
 
 // Whether [base1 + off1, + size1) and [base2 + off2, + size2) may overlap,
@@ -363,6 +588,9 @@ pub fn call_may_write(base: i64) -> bool {
 pub fn may_alias(base1: i64, off1: i64, size1: i64, base2: i64, off2: i64, size2: i64) -> bool {
     if base1 == base2 {
         return off1 < off2 + size2 && off2 < off1 + size1;
+    }
+    if params_disjoint(base1, base2) {
+        return false;
     }
     let r1 = root_of(base1);
     let r2 = root_of(base2);

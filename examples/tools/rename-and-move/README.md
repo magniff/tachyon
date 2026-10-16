@@ -47,8 +47,8 @@ catalog.tach:25:        self.books.push(Book { id: id, title: title, author: aut
 catalog.tach:49:            if b.count == 0 {
 catalog.tach:52:            b.count -= 1;
 catalog.tach:64:        b.count += 1;
-loans.tach:38:    m.count += 1;
-loans.tach:65:                m.count -= 1;
+loans.tach:39:    m.count += 1;
+loans.tach:67:                m.count -= 1;
 members.tach:6:    // the count of books held now
 members.tach:7:    pub count: i64,
 members.tach:24:        self.list.push(Member { id: id, name: name, count: 0, limit: limit, owed: 0 });
@@ -117,19 +117,19 @@ plain `book_index(cat, id)` inside `catalog.tach`, and the qualified
 $ tachyonc refactor rename crate::catalog::find book_index --show
 renamed crate::catalog::find to book_index	catalog.tach	+3 -3 lines
 // catalog.tach:35
-35	pub fn book_index(cat: *Catalog, id: i64) -> Option<i64> {
+35	pub fn book_index(cat: &Catalog, id: i64) -> Option<i64> {
 // catalog.tach:46
 46	    match book_index(cat, id) {
 // catalog.tach:62
 62	    if let Some(i) = book_index(cat, id) {
 $ tachyonc refactor rename crate::members::find member_index --show
 renamed crate::members::find to member_index	2 files	+3 -3 lines
-// loans.tach:27
-27	    let i = match crate::members::member_index(ms, member) {
-// loans.tach:63
-63	            if let Some(i) = crate::members::member_index(ms, member) {
+// loans.tach:28
+28	    let i = match crate::members::member_index(ms, member) {
+// loans.tach:65
+65	            if let Some(i) = crate::members::member_index(ms, member) {
 // members.tach:34
-34	pub fn member_index(ms: *Members, id: i64) -> Option<i64> {
+34	pub fn member_index(ms: &Members, id: i64) -> Option<i64> {
 ```
 
 ## 3. A local and a parameter
@@ -142,17 +142,17 @@ backquotes) follows it:
 ```console
 $ tachyonc refactor rename give_back::d days_late --show
 renamed local d to days_late in crate::loans::give_back, 1 use	loans.tach	+2 -2 lines
-// loans.tach:61-62
-61	            let days_late = today - l.due;
-62	            let fee = late_fee(days_late);
+// loans.tach:63-64
+63	            let days_late = today - l.due;
+64	            let fee = late_fee(days_late);
 $ tachyonc refactor rename late_fee::d days_late --show
 renamed parameter d to days_late in crate::loans::late_fee, 2 uses	loans.tach	+4 -4 lines
-// loans.tach:45-47
-45	// The fee for a book returned `days_late` days after it was due.
-46	pub fn late_fee(days_late: i64) -> i64 {
-47	    if days_late <= 0 {
-// loans.tach:50
-50	    let fee = days_late * FEE_PER_DAY;
+// loans.tach:46-48
+46	// The fee for a book returned `days_late` days after it was due.
+47	pub fn late_fee(days_late: i64) -> i64 {
+48	    if days_late <= 0 {
+// loans.tach:51
+51	    let fee = days_late * FEE_PER_DAY;
 ```
 
 ## 4. The fee rules move to a module of their own
@@ -170,7 +170,7 @@ moved 3 items to crate::fees	2 files	+14 -13 lines
 // loans.tach:4
 4	use crate::fees::late_fee;
 // loans.tach:8: 4 lines removed after line 8
-// loans.tach:39: 9 lines removed after line 39
+// loans.tach:40: 9 lines removed after line 40
 // fees.tach:1-13
 1	// cents per day late
 2	pub const FEE_PER_DAY: i64 = 25;

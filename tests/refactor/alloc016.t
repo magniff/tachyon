@@ -2,23 +2,16 @@
 ## (tests/refactor/alloc016/): an impl of std's Display, a function used as
 ## a value, a parameter's default, a write of a sealed std type's field;
 ## each is an error naming where it is, and the rest of the program is
-## threaded (count, main; the reads of `v.len` become `v.len()`).
+## threaded (count, main; the reads of `v.len` stay: 0.17 reads them as
+## `v.len()`).
 $ fix --only alloc016 --dry-run
 --- a/main.tach
 +++ b/main.tach
-@@ -24 +24 @@
--    f(3).len
-+    f(3).len()
-@@ -28,3 +28,3 @@
+@@ -28,2 +28,2 @@
 -fn count(n: i64) -> i64 {
 -    let v: Vec<i64> = Vec::filled(n, 0);
--    v.len
 +fn count(n: i64, gpa: Gpa) -> i64 {
 +    let v: Vec<i64> = Vec::filled_in(n, 0, gpa);
-+    v.len()
-@@ -35 +35 @@
--    x + v.len
-+    x + v.len()
 @@ -43 +43 @@
 -fn main() {
 +fn main(gpa: Gpa) {
@@ -35,5 +28,5 @@ error fix.alloc016-manual: crate::make needs an allocator (it allocates at main.
 try: tachyonc query show main.tach:18
 [exit 1]
 $ fix --only nonsense
-error fix.usage: --only takes imports, unused, pub, unsafe, tidy-imports, reexports, std015 or alloc016, not 'nonsense'
+error fix.usage: --only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015, alloc016 or values, not 'nonsense'
 [exit 2]

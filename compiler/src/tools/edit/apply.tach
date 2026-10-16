@@ -10,12 +10,13 @@ use crate::base::{
 };
 use crate::base::diag::errors_short;
 use crate::front::cpp::directives::file_exists;
+use crate::front::stdtree::STD_TREE;
 use crate::tools::edit::{
     ADDED, ARGC, ARGV, CH_FILE, CH_TEXT, DEL_FILE, DEL_TO, DRY_RUN, NEW_PATH, NEW_TEXT, NO_CHECK,
     REMOVED, SHOW, TARGET_NAME, edit_new_file, gone_path, move_files, new_texts, remove_empty_dirs,
     sorted_edits,
 };
-use crate::tools::edit::breaks::report_breaks;
+use crate::tools::edit::breaks::{on_changed_line, report_breaks};
 use crate::tools::edit::diff::{diff_moved, diff_texts, shown_path};
 use crate::tools::edit::undo::journal;
 use crate::tools::proc::{
@@ -23,7 +24,8 @@ use crate::tools::proc::{
     write_file_if,
 };
 use crate::tools::query::c_slice;
-use crate::tools::query::diagnostics::{PROG, diag, diags, put_cword, try_end};
+use crate::tools::query::defs::bytes_eq;
+use crate::tools::query::diagnostics::{PROG, diag, diags, put_cword, put_word, try_end};
 use crate::tools::query::refs::file_text;
 
 // ---- Checking the edited program ----
@@ -106,6 +108,7 @@ fn check_edited(root: *u8, added: *IntVec) -> bool {
         if status != 0 && status != 1 {
             return false;
         }
+        EDITED_ERRORS = out;
         let mut now = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         error_lines(buf_slice(out), &now);
         let used = crate::base::alloc_array::<bool>(old.count / 2 + 1);
@@ -148,12 +151,48 @@ fn check_run(root: *u8, edited: bool, out: i64) -> i64 {
             args.push(c"--target" as i64);
             args.push(TARGET_NAME as i64);
         }
+        if STD_TREE != 0 as *u8 {
+            args.push(c"--std-tree" as i64);
+            args.push(STD_TREE as i64);
+        }
         if edited {
             overlay_args(&args);
         }
         args.push(root as i64);
         args.push(0);
         run_capture(args.data as **u8, out)
+    }
+}
+
+// (0.18) `fix --suggested`: new errors on no line the edit wrote do not
+// refuse it (the fixes let the checker reach them); the edited program's
+// errors are printed after the summary (EDITED_ERRORS: check's output on
+// the edited program, a buffer).
+pub static mut LEFT_OK: bool = false;
+static mut EDITED_ERRORS: i64 = -1;
+
+// The errors left in the edited program, one per line, then `note
+// fix.left`; nothing when it checks clean.
+fn errors_left() {
+    unsafe {
+        if EDITED_ERRORS < 0 {
+            return;
+        }
+        let mut lines = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        error_lines(buf_slice(EDITED_ERRORS), &lines);
+        let n = lines.count / 2;
+        if n == 0 {
+            return;
+        }
+        let out = buf_new();
+        for i in 0..n {
+            buf_bytes(out, buf_slice(lines.data[2 * i + 1]));
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDOUT);
+        let d = diag(c"note", c"fix.left");
+        buf_int(d, n);
+        buf_str(d, if n == 1 { c" error left (above)\n" } else { c" errors left (above)\n" });
     }
 }
 
@@ -169,13 +208,67 @@ pub fn try_again(option: *u8) {
         buf_str(out, c"try:");
         put_cword(out, PROG);
         for i in 1..ARGC {
-            put_cword(out, ARGV[i]);
+            if !std_tree_arg(i) {
+                put_cword(out, ARGV[i]);
+            }
         }
         if option != 0 as *u8 {
             buf_byte(out, ' ');
             buf_str(out, option);
         }
         try_end(out);
+    }
+}
+
+// (0.17) `try: PROG ARGS...`, the command as it was run, into out (the
+// line not ended: the caller adds to it).
+pub fn put_command(out: i64) {
+    unsafe {
+        buf_str(out, c"try:");
+        put_cword(out, PROG);
+        for i in 1..ARGC {
+            if !std_tree_arg(i) {
+                put_cword(out, ARGV[i]);
+            }
+        }
+    }
+}
+
+// (0.17) Whether ARGV[i] is `--std-tree` or its value, which a std edit
+// runs again with (stdedit.tach): not in the command a `try:` line shows.
+fn std_tree_arg(i: i64) -> bool {
+    unsafe {
+        (i + 1 < ARGC && streq(ARGV[i], c"--std-tree"))
+            || (i > 1 && streq(ARGV[i - 1], c"--std-tree"))
+    }
+}
+
+// (0.17) The command as it was run with its words `name` replaced by
+// `new` (for a `try:` line naming one of several definitions): false,
+// writing nothing, when no word of it is `name`.
+pub fn try_replaced(name: [u8], new: [u8]) -> bool {
+    unsafe {
+        let mut found = false;
+        for i in 1..ARGC {
+            if bytes_eq(c_slice(ARGV[i]), name) {
+                found = true;
+            }
+        }
+        if !found {
+            return false;
+        }
+        let out = diags();
+        buf_str(out, c"try:");
+        put_cword(out, PROG);
+        for i in 1..ARGC {
+            if bytes_eq(c_slice(ARGV[i]), name) {
+                put_word(out, new);
+            } else {
+                put_cword(out, ARGV[i]);
+            }
+        }
+        try_end(out);
+        true
     }
 }
 
@@ -400,6 +493,19 @@ pub fn finish_edit(what: [u8], root: *u8) -> i64 {
             }
             imports_note(rounds);
         }
+        // (0.18: fix --suggested) new errors only on lines the edit did
+        // not write: the fixes let the checker reach them
+        if LEFT_OK && checked && added.count > 0 && !NO_CHECK {
+            let mut caused = 0;
+            for i in 0..added.count {
+                if on_changed_line(buf_slice(added.data[i])) {
+                    caused += 1;
+                }
+            }
+            if caused == 0 {
+                added.count = 0;
+            }
+        }
         if !checked {
             let d = diag(c"warning", c"edit.unchecked");
             buf_str(d, c"the edited program could not be checked (");
@@ -450,6 +556,9 @@ pub fn finish_edit(what: [u8], root: *u8) -> i64 {
         if SHOW {
             show_changes(buf_slice(diff));
         }
+        if LEFT_OK && checked {
+            errors_left();
+        }
         if ok { 0 } else { 1 }
     }
 }
@@ -486,8 +595,9 @@ pub static mut IMPORTS_NOTED: bool = false;
 fn imports_round(root: *u8) -> bool {
     unsafe {
         let mut any = false;
+        // (0.17: the files the edit makes too, edit new-file's)
         let n = CH_FILE.count;
-        for i in 0..n {
+        for i in 0..n + NEW_PATH.count {
             let mut args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             args.push(PROG as i64);
             args.push(c"fix" as i64);
@@ -496,7 +606,8 @@ fn imports_round(root: *u8) -> bool {
             args.push(c"imports" as i64);
             args.push(c"--in" as i64);
             // (as --in takes it: without `./`)
-            let mut path = FILES[CH_FILE.data[i]].path;
+            let mut path = if i < n { FILES[CH_FILE.data[i]].path }
+                else { NEW_PATH.data[i - n] as *u8 };
             while path[0] == '.' && path[1] == '/' {
                 path = &path[2];
             }

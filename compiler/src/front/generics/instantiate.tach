@@ -8,7 +8,7 @@ use crate::base::{
     IntVec, SYMS, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, free,
     intern,
 };
-use crate::base::diag::{buf_position, err_begin, err_end, err_help, err_str, err_sym};
+use crate::base::diag::{buf_position, err_begin, err_end, err_help, err_str, err_sym, err_try_fmt};
 use crate::front::assoc::{infer_from_assoc, is_projection_node};
 use crate::front::ast::{NODES, NodeKind, child, list_begin, list_end, list_push, new_node};
 use crate::front::ast::NodeKind::{
@@ -35,7 +35,7 @@ use crate::front::modules::{CUR_MOD, module_of};
 use crate::front::traits::check_bounds;
 use crate::front::types::{
     ENUMS, FNS, FN_COUNT, STRUCTS, SYM_ALIAS, TLISTS, TSCRATCH, TYPES, TY_NEVER, TyKind, buf_type,
-    err_type, is_integer, type_elem,
+    decay_ref, err_type, is_integer, is_mut_slice, type_elem,
 };
 use std::Option;
 
@@ -188,7 +188,19 @@ pub fn unify(params: i64, bound: *i64, tmod: i64, p: i64, t: i64) -> bool {
                 }
                 match tparam_index(params, NODES[p].a) {
                     Option::Some(k) => {
+                        // (0.17: a reference binds its raw type: references
+                        // are not type arguments until 0.17.1; a `&mut [T]`,
+                        // a slice, binds as itself, `Option<&mut [V]>` from
+                        // HashMap::get_mut, and joins `[T]` as `[T]`)
+                        let t = if is_mut_slice(t) { t } else { decay_ref(t) };
                         if bound[k] == 0 {
+                            bound[k] = t;
+                            return true;
+                        }
+                        if is_mut_slice(t) && bound[k] == decay_ref(t) {
+                            return true;
+                        }
+                        if is_mut_slice(bound[k]) && decay_ref(bound[k]) == t {
                             bound[k] = t;
                             return true;
                         }
@@ -393,8 +405,14 @@ fn join_arg(params: i64, bound: *i64, loose: *i64, p: i64, t: i64) -> bool {
     }
 }
 
-// All parameters bound, or an error naming the first that is not.
-fn require_bound(params: i64, bound: *i64, pos: i64, what: i64, how: *u8) {
+// All parameters bound, or an error naming the first that is not. 0.17:
+// the help says how to give it, and the try: line is the path with its
+// type arguments written (those inferred, the others by their names):
+// `shape` 0 a call of `what` (a function, or `Type::f` whose first
+// `outer` parameters are the type's), 1 a variant `member` of enum
+// `what` (3: with fields), 2 a literal of struct `what`.
+fn require_bound(params: i64, bound: *i64, pos: i64, what: i64, shape: i64, outer: i64,
+    member: i64) {
     unsafe {
         for i in 0..NODES[params].count {
             if bound[i] == 0 {
@@ -404,10 +422,71 @@ fn require_bound(params: i64, bound: *i64, pos: i64, what: i64, how: *u8) {
                 err_str(c"' of '");
                 err_sym(what);
                 err_str(c"'");
-                err_help(how);
+                err_help(c"nothing here says what it is: give the variable a type (`let x: TYPE = ...`), or write the type arguments (try:, with the parameter's type for its name)");
+                let t = buf_new();
+                let w = SYMS[what].text;
+                if shape == 0 && outer > 0 {
+                    let mut cut = w.len;
+                    let mut k = w.len;
+                    while k > 1 {
+                        if w[k - 1] == ':' && w[k - 2] == ':' {
+                            cut = k - 2;
+                            break;
+                        }
+                        k -= 1;
+                    }
+                    buf_bytes(t, w[0..cut]);
+                    put_targs(t, params, bound, 0, outer);
+                    buf_bytes(t, w[cut..w.len]);
+                    put_targs(t, params, bound, outer, NODES[params].count);
+                } else {
+                    buf_bytes(t, w);
+                    put_targs(t, params, bound, 0, NODES[params].count);
+                }
+                if shape == 0 {
+                    buf_str(t, c"(...)");
+                } else if shape == 1 || shape == 3 {
+                    buf_str(t, c"::");
+                    buf_bytes(t, SYMS[member].text);
+                    if shape == 3 {
+                        buf_str(t, c"(...)");
+                    }
+                } else {
+                    buf_str(t, c" { ... }");
+                }
+                err_try_fmt(buf_slice(t));
                 err_end();
             }
         }
+    }
+}
+
+// `::<A, B>` of parameters from..to: an inferred one's type, else its
+// name; nothing after the last unbound one (its defaults apply), nothing
+// at all when all are bound.
+fn put_targs(out: i64, params: i64, bound: *i64, from: i64, to: i64) {
+    unsafe {
+        let mut last = -1;
+        for i in from..to {
+            if bound[i] == 0 {
+                last = i;
+            }
+        }
+        if last < 0 {
+            return;
+        }
+        buf_str(out, c"::<");
+        for i in from..last + 1 {
+            if i > from {
+                buf_str(out, c", ");
+            }
+            if bound[i] != 0 {
+                buf_type(out, bound[i]);
+            } else {
+                buf_bytes(out, SYMS[NODES[child(params, i)].a].text);
+            }
+        }
+        buf_byte(out, '>');
     }
 }
 
@@ -656,8 +735,7 @@ pub fn instantiate_call(tf: i64, n: i64, first_param: i64, self_ty: i64, written
         UNIFY_SELF = saved_self;
         UNIFY_SELF_TY = saved_self_ty;
         bind_impl_defaults(template, bound);
-        require_bound(params, bound, NODES[n].start, FNS[tf].display,
-            c"write the type arguments: 'f::<T>(...)'");
+        require_bound(params, bound, NODES[n].start, FNS[tf].display, 0, impl_count, 0);
         let mark = TSCRATCH.count;
         for i in 0..count {
             TSCRATCH.push(bound[i]);
@@ -696,8 +774,7 @@ pub fn infer_enum(tpl: i64, written: i64, member: i64, n: i64, pos: i64) -> i64 
             infer_from(params, bound, ENUMS[e].module, n, 0, variant, 0, false, 0, 0);
         }
         bind_defaults(item, ENUMS[e].module, bound, 0, NODES[params].count);
-        let how = c"write the type arguments: 'E::<T>::V'";
-        require_bound(params, bound, pos, ENUMS[e].name, how);
+        require_bound(params, bound, pos, ENUMS[e].name, if n != 0 { 3 } else { 1 }, 0, member);
         for i in 0..NODES[params].count {
             TSCRATCH.push(bound[i]);
         }
@@ -770,8 +847,7 @@ pub fn infer_struct_literal(s: i64, n: i64, expected: i64) -> i64 {
             }
         }
         bind_defaults(item, STRUCTS[s].module, bound, 0, NODES[params].count);
-        require_bound(params, bound, NODES[n].start, STRUCTS[s].name,
-            c"write the type arguments: 'S::<T> { ... }'");
+        require_bound(params, bound, NODES[n].start, STRUCTS[s].name, 2, 0, 0);
         for i in 0..NODES[params].count {
             TSCRATCH.push(bound[i]);
         }

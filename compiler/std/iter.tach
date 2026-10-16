@@ -528,7 +528,8 @@ impl<T> Iterator for SliceIter<T> {
 impl<T> SliceIter<T> {
     // The items left, as a slice.
     #[inline]
-    pub fn as_slice(self: *SliceIter<T>) -> [T] {
+    #[views(*self)]
+    pub fn as_slice(self: &SliceIter<T>) -> [T] {
         self.s[self.pos..self.s.len]
     }
 }
@@ -536,14 +537,29 @@ impl<T> SliceIter<T> {
 impl<T>[T] {
     // Its items, by value.
     #[inline]
+    #[views(self)]
     pub fn iter(self: [T]) -> SliceIter<T> {
         SliceIter { s: self, pos: 0 }
     }
 
+    // Its items, by reference (0.17): `for x in s.iter_ref()`, x a `&T`,
+    // the elements neither copied nor moved.
+    #[inline]
+    #[views(self)]
+    pub fn iter_ref(self: [T]) -> SliceRefIter<T> {
+        SliceRefIter { s: self, pos: 0 }
+    }
+
     // Sorts it in place by f (see sort_by).
     #[inline]
-    pub fn sort_by<F: FnMut(*T, *T) -> i64>(self: [T], f: F) {
+    pub fn sort_by<F: FnMut(&T, &T) -> i64>(self: &mut [T], f: F) {
         sort_by(self, f);
+    }
+
+    // Exchanges elements i and j (checked; 0.17).
+    #[inline]
+    pub fn swap(self: &mut [T], i: i64, j: i64) {
+        swap_at::<T>(self, i, j);
     }
 }
 
@@ -551,28 +567,66 @@ impl<T, A: Allocator> Vec<T, A> {
     // Its items, by value (a view: valid until the vector grows or is
     // freed).
     #[inline]
-    pub fn iter(self: *Vec<T, A>) -> SliceIter<T> {
+    #[views(self)]
+    pub fn iter(self: &Vec<T, A>) -> SliceIter<T> {
         SliceIter { s: self.as_slice(), pos: 0 }
+    }
+
+    // Its items, by reference (0.17): `for x in v.iter_ref()`, x a `&T`.
+    #[inline]
+    #[views(self)]
+    pub fn iter_ref(self: &Vec<T, A>) -> SliceRefIter<T> {
+        SliceRefIter { s: self.as_slice(), pos: 0 }
     }
 
     // Sorts it in place by f (see sort_by).
     #[inline]
-    pub fn sort_by<F: FnMut(*T, *T) -> i64>(self: *Vec<T, A>, f: F) {
-        sort_by(self.as_slice(), f);
+    pub fn sort_by<F: FnMut(&T, &T) -> i64>(self: &mut Vec<T, A>, f: F) {
+        sort_by(self.as_mut_slice(), f);
     }
 }
 
-// `m.iter()`: (key, value) in slot order, until the map changes.
-pub struct HashMapIter<K, V> { keys: *K, values: *V, states: *u8, cap: i64, pos: i64, left: i64 }
+// The items of a slice, by reference (0.17): `v.iter_ref()`,
+// `s.iter_ref()`; a view of the slice.
+pub struct SliceRefIter<T> { s: [T], pos: i64 }
+
+impl<T> Iterator for SliceRefIter<T> {
+    type Item = &T;
+
+    #[inline]
+    fn next(self: *SliceRefIter<T>) -> Option<&T> {
+        if self.pos < self.s.len {
+            let x = &self.s[self.pos];
+            self.pos += 1;
+            Option::Some(x)
+        } else {
+            Option::None
+        }
+    }
+
+    #[inline]
+    fn exact_len(self: *SliceRefIter<T>) -> i64 {
+        self.s.len - self.pos
+    }
+
+    #[inline]
+    fn at(self: *SliceRefIter<T>, k: i64) -> &T {
+        &self.s[self.pos + k]
+    }
+}
+
+// `m.iter()`: (key, value) in slot order, until the map changes. (0.17) A
+// view of the map: `states` is its slots' states.
+pub struct HashMapIter<K, V> { keys: *K, values: *V, states: [u8], pos: i64, left: i64 }
 
 impl<K, V> Iterator for HashMapIter<K, V> {
     type Item = (K, V);
 
     #[inline]
     fn next(self: *HashMapIter<K, V>) -> Option<(K, V)> {
-        for i in self.pos..self.cap {
+        for i in self.pos..self.states.len {
             self.pos = i + 1;
-            if unsafe { self.states[i] } == SLOT_FULL {
+            if unsafe { self.states.ptr[i] } == SLOT_FULL {
                 self.left -= 1;
                 return Option::Some((unsafe { self.keys[i] }, unsafe { self.values[i] }));
             }
@@ -589,8 +643,8 @@ impl<K, V> Iterator for HashMapIter<K, V> {
     fn fold<B, F: FnMut(B, (K, V)) -> B>(self: HashMapIter<K, V>, init: B, f: F) -> B {
         let mut g = f;
         let mut acc = init;
-        for i in self.pos..self.cap {
-            if unsafe { self.states[i] } == SLOT_FULL {
+        for i in self.pos..self.states.len {
+            if unsafe { self.states.ptr[i] } == SLOT_FULL {
                 acc = g(acc, (unsafe { self.keys[i] }, unsafe { self.values[i] }));
             }
         }
@@ -650,63 +704,66 @@ impl<K, V> Iterator for Values<K, V> {
 
 impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
     #[inline]
-    pub fn iter(self: *HashMap<K, V, A>) -> HashMapIter<K, V> {
+    #[views(self)]
+    pub fn iter(self: &HashMap<K, V, A>) -> HashMapIter<K, V> {
         HashMapIter {
-            keys: self.keys, values: self.values, states: self.states, cap: self.cap, pos: 0,
-            left: self.len,
+            keys: self.keys, values: self.values, states: unsafe { self.states[0..self.cap] },
+            pos: 0, left: self.len,
         }
     }
 
     #[inline]
-    pub fn keys(self: *HashMap<K, V, A>) -> Keys<K, V> {
+    #[views(self)]
+    pub fn keys(self: &HashMap<K, V, A>) -> Keys<K, V> {
         Keys { it: self.iter() }
     }
 
     #[inline]
-    pub fn values(self: *HashMap<K, V, A>) -> Values<K, V> {
+    #[views(self)]
+    pub fn values(self: &HashMap<K, V, A>) -> Values<K, V> {
         Values { it: self.iter() }
     }
 }
 
 // Sorts s in place by f: f(a, b) is negative, zero or positive as *a goes
 // before, with or after *b (`|a, b| a.cmp(b)`: smallest first). A
-// heapsort: not stable.
-pub fn sort_by<T, F: FnMut(*T, *T) -> i64>(s: [T], f: F) {
+// heapsort: not stable. (0.17) f takes references; the elements move as
+// bits, so any T sorts, owned ones too.
+pub fn sort_by<T, F: FnMut(&T, &T) -> i64>(s: &mut [T], f: F) {
     let mut g = f;
     let n = s.len;
+    let p = s.ptr;
     let mut start = n / 2;
     let mut end = n;
     // (each round takes one from start or end: n / 2 + n at most; 0.16:
-    // counted loops, no effect diverge)
-    for _ in 0..n / 2 + n + 1 {
-        // Build the heap from n/2 down, then move its top behind it.
-        if start > 0 {
-            start -= 1;
-        } else {
-            end -= 1;
-            if end <= 0 {
-                return;
+    // counted loops, no effect diverge; every index is below end <= n)
+    unsafe {
+        for _ in 0..n / 2 + n + 1 {
+            // Build the heap from n/2 down, then move its top behind it.
+            if start > 0 {
+                start -= 1;
+            } else {
+                end -= 1;
+                if end <= 0 {
+                    return;
+                }
+                swap_raw::<T>(p, 0, end);
             }
-            let top = s[0];
-            s[0] = s[end];
-            s[end] = top;
-        }
-        let mut root = start;
-        for _ in 0..64 {
-            let mut child = 2 * root + 1;
-            if child >= end {
-                break;
+            let mut root = start;
+            for _ in 0..64 {
+                let mut child = 2 * root + 1;
+                if child >= end {
+                    break;
+                }
+                if child + 1 < end && g(&*(&p[child]), &*(&p[child + 1])) < 0 {
+                    child += 1;
+                }
+                if g(&*(&p[root]), &*(&p[child])) >= 0 {
+                    break;
+                }
+                swap_raw::<T>(p, root, child);
+                root = child;
             }
-            if child + 1 < end && g(&s[child], &s[child + 1]) < 0 {
-                child += 1;
-            }
-            if g(&s[root], &s[child]) >= 0 {
-                break;
-            }
-            let t = s[root];
-            s[root] = s[child];
-            s[child] = t;
-            root = child;
         }
     }
 }

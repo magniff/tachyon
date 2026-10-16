@@ -96,6 +96,18 @@ if want programs; then
     wait_all
 fi
 
+# 3b. `guide` on the hard tasks 13-18: both against guide isolates the tools
+if want programs; then
+    for m in $MODELS; do
+        say "programs 13-18: $m, guide x $REPS"
+        $RUN run --model "$m" --set programs --cond guide --reps "$REPS" \
+            --tasks 13-port-c,14-ast-pass,15-multi-module,16-perf-tight,17-debug-crash,18-api-refactor \
+            --jobs "$JOBS" --tachyonc "$TACHYONC" --out "$OUT/0.16-programs-$(slug "$m")" &
+        pids="$pids $!"
+    done
+    wait_all
+fi
+
 # 4. the same with the check hook (0.15), in `both`
 if want hook; then
     for m in $MODELS; do

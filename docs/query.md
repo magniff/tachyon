@@ -22,10 +22,12 @@ tachyonc query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE]
 tachyonc query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
 tachyonc query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]   (0.16)
 tachyonc query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (0.16) the inferred effects
-tachyonc query items [MODULE...] [--root ROOT] [--comments]
+tachyonc query views NAME...|MODULE [--why]   (0.17) what results and `&mut` parameters view
+tachyonc query items [MODULE|TYPE...] [--root ROOT] [--comments]
 tachyonc query show MODULE::section TITLE                   (0.13)
-tachyonc query grep PATTERN... [--in FILE|MODULE] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
+tachyonc query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
 tachyonc query type FILE:LINE[:COL]...                      (0.13)
+tachyonc query own FILE:LINE:COL...                         (0.17)
 tachyonc query stats [MODULE|FILE] [--over N] [--all]      (refactor.md)
 tachyonc query deps MODULE [--max-lines N]                 (refactor.md)
 tachyonc query unused [MODULE|FILE] [--all]                (refactor.md)
@@ -56,6 +58,88 @@ deps, unused, impact) are in [refactor.md](refactor.md).
 Exit status: 0 answered, 1 no answer (nothing matches, an ambiguous
 `show`, a program that could not be read), 2 usage error (or no root).
 
+## Every command at a glance (for agents)
+
+The table AGENTS.md carried until 0.17, when its core was cut to the
+eight rows agents use (the rest cost tokens on every turn and was not
+used: docs/research/applying-to-tachyon.md, item 2). Each row is what you
+want and the command that does it, for the compiler's own source
+(`target/tachyonc`; any program with `--root ROOT`). `tachyonc --help`
+and `tachyonc CMD --help` print the same commands, `tachyonc guide
+tools` the ones a program needs.
+
+| you want | run |
+|---|---|
+| an item with what it calls, its types and callers, in one answer | `target/tachyonc query context NAME` (`--budget N`; a MODULE: its items and central bodies) |
+| the source of a function, type, method | `target/tachyonc query show NAME` |
+| where something is used | `target/tachyonc query refs NAME` (`--count`, `--in FILE\|MODULE`, `--kind write,call,...`; a local: `FN::x` or `FILE:LINE:COL`) |
+| what a function calls, all it reaches; can it change a table | `target/tachyonc query callees FN` (`--transitive`; `--writes TABLE`: the writes and borrows it reaches, with the call chain) |
+| text that is not a name (a message, a comment), with its item | `target/tachyonc query grep TEXT` (`--comments`, `--strings`, `--code`, `--word`, `--in`) |
+| a module's section banners; one section | `target/tachyonc query items MODULE --comments`, `query show MODULE::section TITLE` |
+| the type of an expression | `target/tachyonc query type FILE:LINE:COL` |
+| each local's kind, moves and views at a position (0.17) | `target/tachyonc query own FILE:LINE:COL` |
+| what a function may do (allocate, io, panic, loop forever) | `target/tachyonc query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
+| where it is defined, its signature | `target/tachyonc query def NAME` |
+| what a module contains; a type's methods | `target/tachyonc query items MODULE`; `query items TYPE` |
+| the item at a compiler error's position | `target/tachyonc query show FILE:LINE` (`--with-comments`: its section comment too) |
+| a module's `use` lines, header comment, extern blocks | `target/tachyonc query show MODULE::use` (`::header`, `::extern`) |
+| change a module's `use` lines or header comment | `target/tachyonc edit patch\|replace MODULE::use` (`MODULE::header`, `MODULE::extern`; `edit insert --after MODULE::use`, `edit delete`) |
+| lines of any file (a test, a fixture, conflict markers), a small file | `target/tachyonc query text FILE:A-B`, `query show FILE.tach` |
+| merge conflicts: the regions, their items, both sides; resolve one | `target/tachyonc query conflicts [FILE] [--show]`; `target/tachyonc edit resolve FILE:LINE\|NAME --ours\|--theirs\|--both` (`< text`, `--all`) |
+| change a few lines inside an item (a condition, a statement; FILE:LINE: a comment between items too) | `target/tachyonc edit patch NAME\|FILE:LINE --old 'TEXT' --new 'TEXT'` (pairs repeat; several lines: `< pairs` or `--pairs FILE`, blocks `<<<<<<< OLD` / `=======` / `>>>>>>> NEW`; `--loose` for other indentation; OLD there several times: `--nth N`, `--all`) |
+| add statements inside an item | `target/tachyonc edit insert --in NAME --after\|--before 'ANCHOR' < text` |
+| replace, add or remove an item by name | `target/tachyonc edit replace NAME < new.tach`, `edit insert --after\|--before NAME`, `edit delete NAME` (a module: its file too; `edit replace FILE.tach`: a whole file; `--dry-run` for the diff; the `use` lines new text needs are added) |
+| change several items (several files) in one checked edit | `target/tachyonc edit apply items.tach`: blocks `@@ NAME` (its new text), `@@ new after NAME`, `@@ new in MODULE`, `@@ delete NAME`, or `query show`'s output edited; `edit patch --in NAME` (or `@@ NAME` in `--pairs FILE`) starts another target's pairs |
+| an edit refused with `edit.breaks` | each error says `[edited: PATH]` or `[in PATH]`; run the `try:` refactoring it names (`note edit.refactor`), or change the broken items in the same edit (`note edit.together`); `--no-check` last |
+| see what an edit changed, without reading the file back | `--show` on any edit or refactoring; `target/tachyonc query diff` (the last one) |
+| wrap a body or lines in a block (`unsafe`, `loop`), re-indented; make a file with its `mod` line | `target/tachyonc edit wrap NAME --in unsafe [--lines A-B]`, `edit new-file PATH < text` |
+| take the last edit back | `target/tachyonc undo` (outside git: the journal is `.tachyonc/` next to the root) |
+| add, remove, rename, reorder or retype a parameter, with every call | `target/tachyonc refactor signature FN --add 'x: i64 = 0'` (`--remove x`, `--rename-param a b`, `--reorder b,a`, `--type x T --default '$x as T'`) |
+| add, remove, rename or retype a field, with every literal and access | `target/tachyonc refactor field STRUCT --add 'g: i64 = 0'` (`--remove g`, `--rename g h`, `--type g T`) |
+| add a variant (an arm in each match that needs one), remove, rename one | `target/tachyonc refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match; `--remove V`, `--rename V W`) |
+| move lines of a function into a new one, parameters and result computed | `target/tachyonc refactor extract-function FN --lines A-B --to NEW` |
+| put a small function's body where it is called (and delete it) | `target/tachyonc refactor inline FN` (`--at FILE:LINE`: one call) |
+| replace an idiom everywhere, typed | `target/tachyonc rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: *IntVec' --dry-run` (`--list`: the sites and their holes; `--subst 'P' 'R'`: inside the holes' code; `--where '$v: name ~ RE'`; `--in FN\|MODULE\|FILE`, repeated) |
+| rename anything (a module: its file too), with every reference | `target/tachyonc refactor rename PATH NEW` (a local or parameter: `FILE:LINE:COL` or `FN::x`, shadowing respected) |
+| move items to another module, imports and `pub` fixed | `target/tachyonc refactor move PATH... --to MODULE` (`--after\|--before ITEM`: where; a MODULE that does not exist is made) |
+| make a module; move one (file, folder, paths) | `target/tachyonc refactor new-module crate::a::b`, `refactor move-module crate::a crate::x::a` |
+| split a module into files | `target/tachyonc refactor split MODULE --plan` (then `--auto`, or `--into M --items a,b`; `--names a,b`; `--reexport` leaves code outside as it is; `--header TEXT`) |
+| several changes, checked once, all or nothing | `target/tachyonc refactor --script steps.txt` (one command per line; `<<END` ... `END` gives one its stdin) |
+| several queries and edits in one call, outputs under `## $ tachyonc ARGS` lines | `target/tachyonc batch < cmds.txt` (one command per line; `--stop` at the first failure) |
+| the errors, one per line (front end only) | `target/tachyonc check` |
+| build what changed and run the tests; counts, then each failure | `target/tachyonc test [FILTER...]` (a program: `tests/NAME.in`/`.out`; `--full`, `--budget N`) |
+| a crash's line and callers; values at a line as the program runs; a failing input made small | `target/tachyonc test` (built with `--trace`), `target/tachyonc probe FILE:LINE EXPR... -- ARGS`, `target/tachyonc reduce FILE --until 'CMD'` (`guide debug`) |
+| missing/unused imports, `pub`, `unsafe` blocks | `target/tachyonc fix` (`--only imports,unused,pub,unsafe`, `--in FILE\|MODULE`, `--dry-run`; several modules have the name: `--use PATH::NAME`) |
+| imports through re-exports, then the re-exports; merged, sorted, wrapped `use` lines | `target/tachyonc fix --only reexports,tidy-imports` (`// api:` above a `pub use` keeps it) |
+| prove a refactoring changed no output | `target/tachyonc same-output OLD_TACHYONC` |
+| file and item sizes | `target/tachyonc query stats [MODULE\|FILE]` |
+| how a module's items use each other, how to split it | `target/tachyonc query deps MODULE --max-lines 1000` |
+| what nothing uses | `target/tachyonc query unused [MODULE\|FILE]` |
+| what a signature change touches | `target/tachyonc query impact NAME` |
+| files over a size | `target/tachyonc lint --max-lines 1000` |
+| lay code out (indentation, spaces, wrapping, `use` lines; edits do it too) | `target/tachyonc fmt FILE\|MODULE` (`--check`, `--dry-run`; `--all` the tree) |
+| what a diagnostic code means, how to fix it | `target/tachyonc explain CODE` (`explain TOOL` lists its codes; `explain WORDS`: the guide on them) |
+| std's API, a std item (from any program, or none) | `target/tachyonc query items std`, `query show std::read_line`, `query def Vec::push` |
+| what an expression or a few statements do, with std | `target/tachyonc try 'STATEMENTS'` (prints the output and `TYPE = VALUE`; `--file F`) |
+| the language on a word, an error message; one section | `target/tachyonc guide --find WORDS`, `guide TOPIC#SECTION` (`guide TOPIC#`: its sections) |
+| add a std function, pass, diagnostic, test, subcommand: the steps; items to copy | `target/tachyonc guide how TASK`; `query examples KIND`; `query similar NAME` |
+| a command's options | `target/tachyonc CMD [SUB] --help` |
+
+NAME is `foo`, `module::foo`, `Type::method`, `Enum::Variant`,
+`Struct.field` or `FILE:LINE`; several in one call; every spelling a
+tool prints is taken back (`FILE:L:C:`, `FILE:A-B`, `Vec<i64>::push`,
+`main.0`, `./x.tach`). Any query takes `--budget N` (tokens; answers over
+8000 are cut, with the command that prints the rest). The root defaults to
+`compiler/src/main.tach` (`--root ROOT`, or a last argument ending in
+`.tach`, for other programs). A problem is one stderr line, `error CODE:
+message`, then `try:` lines: commands to run as they are. A build prints
+its errors as `check` does, one line each, when its output is not a
+terminal (`--diagnostics=human` for the long form), so a `check` before
+a build is redundant. Edits are atomic: an edit that adds an error
+writes nothing and prints the errors ([refactor.md](refactor.md)).
+`--json` on any command prints JSON lines, for scripts and hooks
+([JSON](#json-for-a-harness-015)).
+
 ## Output formats
 
 One line of grammar per kind of line (`\t` is a TAB; `[...]` optional):
@@ -65,6 +149,7 @@ One line of grammar per kind of line (`\t` is a TAB; `[...]` optional):
 | def | definition | `PATH \t FILE:LINE:COL \t KIND \t SIGNATURE [\t effects: SET]` |
 | show | header | `// PATH \t FILE:FIRST-LAST [\t effects: SET]`, then the source lines, verbatim |
 | effects (0.16) | function | `PATH \t SET`, then with `--why` its chain, indented two spaces |
+| views (0.17) | function | `PATH \t views(..) [stores(..)] HOW`, then with `--why` a line per source, indented two spaces |
 | show, > 5 matches | path | `PATH` (stdout), then `error query.ambiguous` |
 | refs, callers | file header | `# FILE` |
 | refs, callers | reference | `LINE:COL \t (def \| REFKIND \t ENCLOSING) [\t ->TARGET] \t SOURCE` |
@@ -339,7 +424,12 @@ references.
   modules included: `gvn`, `crate::ir`), or the item holding a line,
   `FILE:LINE` (0.12; `rewrite --in` too; `fix --in FILE:LINE` fixes that
   line's module), or (0.13) a directory, by whole components
-  (`compiler/src/front/`, `front/check`).
+  (`compiler/src/front/`, `front/check`), or (0.17) an item, by NAME
+  (`--in run_patch`: the references in its text; a function, a type, a
+  const...).
+- (0.17) A string or C-string constant (`const S: [u8] = "..."`, `const
+  C: *u8 = c"..."`) has its uses as references: the checker puts the
+  literal in their place, refs finds them by their name.
 - None left: `note query.empty: 0 refs` (exit 0).
 - (0.16) A local variable or a parameter: `FN::x` (every local named
   `x` in FN: the one a `let` shadows and the one shadowing it too), or
@@ -447,6 +537,34 @@ crate::total→alloc(Gpa) panic
   ...the chain...
 ```
 
+## views (0.17)
+
+`views NAME...` prints each function's view summary
+(docs/design/value-semantics.md §2.4): which parameters its result
+points into, and what its `&mut` parameters may come to hold. `p` is
+what the argument p points into (the referent of `p: &T`, the storage of
+`p: [T]`), `*p` what the views p holds point into: `Vec::as_slice` is
+`views(self)`, a parser method returning a token's text `views(*self)`,
+`intern(names: &mut Vec<[u8]>, word: [u8])` `views() stores(word)`.
+After it, how it is known: `inferred` (from the body, callees first),
+`declared` (`#[views(..)]`, `#[stores(..)]`), `parametric` (a generic
+result made of its type parameters: by its type), `assumed` (a body that
+did not check: every parameter). A MODULE gives its functions whose
+summary is not `views()`.
+
+- `--why` adds, under each function's line, the `return` or tail that
+  makes each source, and the callee's summary when the value is a call.
+
+`def`, `show` and `context` add `views: SUMMARY` after the effects when
+it is not `views()`; `--print-views` prints every function's summary
+after checking, as `--print-effects` does.
+
+```
+$ tachyonc query views Parser --why
+crate::Parser::name→views(*self) inferred
+  why: parse.tach:4:83 't.text': views what 'self' holds
+```
+
 ## context (0.15)
 
 `query context NAME` answers in one call what takes three to five
@@ -507,6 +625,42 @@ not, and where there is no program at all (a directory without
 - `text std:A-B` prints std's source (as `<std>` numbers it), `grep
   TEXT --in std` searches it.
 
+(0.17) In the tachyon repository, where std's files are
+(`compiler/std/*.tach`, found from the current directory or one of the
+three above it) and are the std built into the compiler, std's
+positions are those files' lines: `query def std::trim` prints
+`compiler/std/io.tach:102:8`, not `<std>:2075:8`; a FILE:LINE in one of
+them (`query show compiler/std/io.tach:102`, `--in
+compiler/std/io.tach`) reads std from its files. Elsewhere std is the
+compiler's text, `<std>`. The edits of std items: refactor.md, "Editing
+std by name".
+
+## similar and examples (0.17)
+
+`query similar NAME...` prints the items like NAME, nearest first (3,
+`--limit N`), in full as `show` prints them, after a line saying how
+many there are and the edit that adds one beside NAME: the templates
+for a new item of the kind. A method: the methods of its type (none:
+of the other types of its module); a trait's method: the same method
+of the trait's other impls; anything else: the items of its kind in
+its module, its file's first.
+
+```
+$ tachyonc query similar std::trim --limit 1
+// 1 of 135 fns like std::trim, nearest first; a new one beside it: tachyonc edit insert --after std::trim < new.tach
+// std::is_digit→compiler/std/io.tach:96-99→effects: none
+...
+```
+
+`query examples` lists the kinds of "add an X" change to the compiler
+and std (`std-fn`, `std-method`, `peephole`, `egraph-rule`, `pass`,
+`diagnostic`, `tool-diagnostic`, `subcommand`, `query-command`,
+`test`), each with where it goes and its recipe in `tachyonc guide how`;
+`query examples KIND` prints the kind's items to start from (their
+definitions, then the first one's source; `test`: files). The table of
+items is the compiler's own; tests/query/run.sh checks that every one
+is still found (`self_examples`).
+
 ## items
 
 `items MODULE` lists a module's items in order, without bodies:
@@ -525,6 +679,12 @@ An impl block is its header line (kind `impl`) followed by its
 functions. MODULE is a module path, matched like NAME (`gvn`,
 `crate::gvn`, `crate`, `std`). `items` alone lists the module tree:
 `PATH→FILE→ITEMS` per module.
+
+`items TYPE` (0.17), when no module has that name: a struct's, enum's
+or trait's line (`# PATH→FILE:LINE:COL`, then `LINE→KIND→SIGNATURE`),
+then the functions of its impl blocks, each block under its header; a
+std type (`items Buf`, `items std::Vec`) lists std's API for it. An
+unknown method's error names it as its `try:` line.
 
 ### Banners and comments (0.13)
 
@@ -574,7 +734,9 @@ lexer's tokens. `--code`, `--comments`, `--strings` keep the hits there
 (any of them); `--word` the hits that are whole identifiers. `--in`,
 `--count`, `--limit N`, `--all` and the budget are refs'. The files the
 compiler makes (`<std>`, `<C import>`) are searched only when `--in`
-names them. No hit: `note query.empty`.
+names them. No hit: `note query.empty`. (0.17) A hit in a comment right
+above an item (its doc comment, no blank line between) is that item's
+(`route::ride_cost`, a field's `Entry.line`), not the module's.
 
 ## type (0.13)
 
@@ -603,6 +765,28 @@ gives the f-string's type. What the compiler writes for an f-string or a
 `?` (the hidden locals `__f0`, `__out`, the match a `?` is) is never
 shown.
 
+## own (0.17)
+
+`own FILE:LINE:COL` shows the own pass's state at a position
+(docs/design/value-semantics.md §2.9): the position and its function,
+then a line per local in scope there (parameters first, then in the
+order they are declared), its name, type and kind (`plain`, `owned`,
+`view`, `owned view`), and, from the own pass's walk of the function
+(front/own/observe.tach), whether it is moved (where, into what) and the
+views it holds (what they view, where they were taken, what invalidated
+them). Without the walk (a template never instantiated, or before the
+checker has it), the kinds alone:
+
+```
+main.tach:16:17 in crate::main
+gpa    Gpa       plain
+v      Vec<i64>  owned
+first  [i64]     view
+```
+
+A `let`'s names are in scope after the `let`. A position in no function
+the checker saw: `error query.no-match`, `try:` the item at that line.
+
 ## Diagnostics
 
 Every problem is reported on stderr, after the answer, in one format:
@@ -620,6 +804,7 @@ when it was given, names quoted for the shell when they need it).
 
 | code | severity | exit | when | try |
 |---|---|---|---|---|
+| `query.no-kind` | error | 2 | (0.17) `query examples KIND` names no kind | `query examples` |
 | `query.no-match` | error | 1 | no definition (or module, for items) answers to NAME | the nearest definitions by edit distance (the same command with their paths); else the items of the module NAME names, or the module tree |
 | `query.alias` | note | (the answer's) | NAME is the other name an import gives (`use a::f as g;`), answered for what it imports (0.13) | |
 | `query.empty` | note | 0 | grep found nothing | |
@@ -794,6 +979,195 @@ $ tachyonc batch < cmds.txt        (query show clamp; query refs clamp --count)
 - `error batch.format` (a quote not closed, `<<WORD` without its line
   WORD): nothing runs. `error batch.usage`: the options, a FILE that
   cannot be read, a line that is no tool command (`## exit 2`).
+
+## test: build, run the cases, a summary (0.17)
+
+`tachyonc test [FILTER...] [ROOT.tach]` is the one verification command
+(docs/research/applying-to-tachyon.md, item 3): it builds what changed,
+runs the tests and ends with a summary whose first line is always the
+counts, then only the failing cases, each with a few lines of
+difference, within `--budget N` tokens (1,000; `--full`: every failure,
+40 lines each, no budget unless given). It never needs `| tail`.
+
+**A program** (ROOT, default `./main.tach`). A case is `tests/NAME.in`
+(its stdin; none: empty) with `tests/NAME.out` (the expected stdout) in
+ROOT's directory (`--dir DIR`: another), and `tests/NAME.exit`, when
+there, the expected exit status (default 0): the agent eval's own
+convention, and the one agents write by hand. Output is compared as the
+eval grades it: `\r\n` as `\n`, trailing whitespace at the end left out.
+The program is built into `.tachyonc/test/prog` next to ROOT when a
+`.tach` file under ROOT's directory is newer than the build, or the
+compiler or `-O` level differs; each run's stdout and stderr stay there
+(`NAME.got`, `NAME.err`). A case may run `--timeout S` seconds (10).
+
+```text
+$ tachyonc test --timeout 1
+test main.tach: 2 passed, 3 failed (tests/)
+FAIL bad: stdout differs at line 2 (3 lines expected, 3 printed)
+  - line 2: B
+  - line 3: c
+  + line 2: b
+  + line 3: c
+FAIL crash: exit 3 (expected 0)
+FAIL hang: no exit after 1 s (--timeout S)
+  stderr: stopped by signal 14 (SIGALRM: a time limit)
+  stderr: trace, innermost call first:
+  stderr:   main.tach:12  main
+(outputs: .tachyonc/test/NAME.got, NAME.err)
+```
+
+(0.17) The program is built with `--trace` (not with `-O 0`; `--no-trace`
+turns it off): a case that crashes or runs out of time shows the first
+12 lines of its stderr, the message and the frames, innermost first, each
+`FILE:LINE  function`.
+
+A FILTER selects the cases whose name contains it. Without cases, the
+build alone (`test main.tach: builds; no tests in tests/ ...`), or one
+run on `--input FILE` (`-`: stdin): its exit status, its output within
+the budget, its stderr. A build that fails prints `test ROOT: does not
+build (N errors)` and the errors, one line each.
+
+**The tachyon tree** (`./compiler/src/main.tach` and `./tests/run.sh`,
+no ROOT): `compiler/std/embed.sh` when compiler/std is newer than its
+embedding; `target/tachyonc` rebuilt (one build, by
+`target/tools/tachyonc` when there; `bootstrap/bootstrap.sh --dev`
+checks the fixpoint) when a `.tach` file of compiler/src or compiler/std
+is newer; then `tests/run.sh [-O N] FILTER` once per FILTER (none: the
+whole suite), its `FAIL` blocks (8 lines each) and totals summarized:
+
+```text
+$ target/tachyonc test gvn inline
+test gvn inline: 40 passed, 1 failed (tests/run.sh; target/tachyonc rebuilt in 1.9 s; 7.31 s)
+FAIL run_gvn_loads:
+  stdout mismatch
+  ...
+```
+
+(0.17) Each failing case is run again with `target/tools/tachyonc`, the
+last build whose suite passed (when its bytes differ from
+`target/tachyonc`'s; `--against TACHYONC` another, `--against none`
+not at all): its block ends with `(new: passes with ...)` or `(fails
+with ... too: not from this change)`, and the headline counts both
+(`with target/tools/tachyonc: 1 new, 6 failing too`). A failure that
+fails before the change too is the environment's or older: no need to
+stash the change and rebuild to find out.
+
+A FILTER that matches no case is named in the headline (`no case
+matches 'x'`). Exit status: 0 every case passed, 1 a failure or a build
+error, 2 a usage error (`test.usage`) or nothing to run (`test.no-root`).
+tests/refactor/testcmd.t has a transcript.
+
+## probe, reduce, --trace: what a program does (0.17)
+
+`tachyonc guide debug` is the agent-facing text, with the recipe.
+
+- `tachyonc FILE.tach --trace -o prog` (middle/trace.tach): each
+  function of the program's own files keeps a frame on a shadow stack
+  (4096 entries, a ring), set at its entry, before each call (the line
+  of the expression lowered last, so the line of `v[i]` in a statement
+  of several lines) and at each loop header; a failed check (rt.panic,
+  std's panic) prints the frames after its message, and SIGINT, SIGALRM,
+  SIGTERM and SIGSEGV print them too. Built on the IR after lowering,
+  before inlining, so the frames are the source's at every level (with
+  -O0: -O1). The cost: about 25% on the compiler's own run time, a
+  larger binary (the site strings); none without the flag. Without it,
+  a failure's message is followed by `note: build with --trace for the
+  line and its callers`.
+- `tachyonc probe FILE:LINE [EXPR...]... [--count FILE:LINE] [--max N]
+  [--input FILE] [--timeout S] [-O N] [--root ROOT] [-- ARGS]`
+  (tools/probe/): the line's statement found in the front end's tree
+  (before it; after a `let`; in a loop's body; at the start of a block
+  the line opens); copies of the files with the probes written in, on
+  the same lines, passed to the compiler with `--overlay PATH COPY`;
+  `check` of the copies with `let _: () = (EXPR);` names each
+  expression's type, which picks its printer (Display for numbers and
+  bool, quoted `[u8]`, elements of arrays, slices, Option and tuples,
+  addresses of pointers, Debug, else a struct's fields, else `<TYPE>`);
+  the build (with --trace) is run, and its stderr's `@@probe` lines
+  become the report. Counts come from an atexit report, else (stopped)
+  from the powers of two each probe announces (`at least N`).
+- `tachyonc reduce FILE --until 'CMD' [--out F] [--max-runs N]
+  [--timeout S]` (tools/reduce.tach): delta debugging on lines; CMD
+  (`sh -c`, `{}` the candidate, which keeps FILE's name in
+  `.tachyonc/reduce/`) exits 0 while the failure is there; each run in
+  a process group killed after S seconds (5).
+
+Codes: `probe.usage`, `probe.no-root`, `probe.no-file`,
+`probe.no-line`, `probe.no-statement`, `probe.expr`, `probe.build`,
+`reduce.usage`, `reduce.no-file`, `reduce.not-failing`
+(`tachyonc explain CODE`). tests/refactor/debugtools.t has a
+transcript; tests/run/trace_*.tach the traces.
+
+## The agent hooks (0.17)
+
+tools/agent-hooks, registered in .claude/settings.json (and per
+condition in tools/agent-hooks/settings-eval.json for the agent eval):
+
+- **check-after-edit.py** (PostToolUse): `check --json` after every
+  Write or Edit of a `.tach` file, every `tachyonc edit|refactor|fix|
+  rewrite|undo` that wrote, and every shell command that writes a `.tach`
+  file (`> f.tach`, `tee`, `cp`, `mv`). The root and the compiler are
+  the command's own: a Bash line's `cd`s are followed (`cd WORKTREE &&
+  tachyonc edit ...` checks WORKTREE). The compiler is
+  target/tools/tachyonc, except for a program outside the compiler's
+  own source (a test case, an example) when target/tachyonc is newer: a
+  compiler just rebuilt from a fixed source checks the programs written
+  for the fix (0.17; the tools binary reported the errors the fix had
+  removed). After the session's first check
+  of a root it reports the delta: `tachyonc check main.tach: 2 errors (1
+  new, 1 fixed, 1 as before)` and only the new errors; `0 errors (2
+  fixed)` when it became clean; nothing when it was and is clean. After
+  a clean check of a program with tests (`tests/*.out`), `tachyonc test
+  ROOT --full --timeout 2` runs (not again within 20 s,
+  `$TACHYON_TEST_DEBOUNCE`; never again for a program whose tests took
+  over 8 s) and its line follows: the counts, the newly failing cases
+  with their differences, the fixed ones by name. TACHYON_CHECK_TESTS=0
+  leaves the tests out.
+- **turn-end.py** (Stop): when a root this session touched (or the
+  current directory's) changed since its last clean check and test run,
+  `check` (and the tests) once; errors or failures block the stop once,
+  with `turn-end: unchecked changes in main.tach: 2 errors` and the
+  errors as the reason. Never twice for the same sources.
+- **query-first.py** (PreToolUse, PostToolUse on Bash): blocks a shell
+  read of `.tach` source, judging each command of a line on its own (in
+  the directory its `cd`s lead to, `$VAR`s assigned on the line
+  expanded); a whole file under 300 lines is read freely with `cat`,
+  `head`, `tail`, `sed -n`; a larger one gets its length and `query items
+  MODULE`; a `.tach` file outside any program's module tree (a probe, a
+  scratch copy: not a main.tach, not declared by a `mod` line) is not
+  source. The blocked record logs the `try:` commands it gave. After a
+  call: a `# no-query:` reason asking for line numbers for the Edit tool
+  is answered with `edit insert --after NAME` and `query def NAME`; the
+  hints of tools/agent-hooks/hints.txt (`repeat-query` after the third
+  show, refs, def or callers in a row on related items: one name, a name
+  and its type or module, a name the previous answer printed;
+  `unfamiliar-construct` from the check hook) are printed as written
+  there, each once a session; TACHYON_HINTS=0 turns them off. Every text
+  a hook adds is a factual statement with its command, the same words
+  every time (no times, no ids: appended text is written to the prompt
+  cache once). With TACHYON_QUERY_MODE=rewrite (the eval's `+rewrite`), a
+  read whose query is not in doubt runs as that query instead of being
+  blocked (PreToolUse `updatedInput`, permission `allow`, and a one-line
+  `note hook.query-first: ... ran as ...` beside the result): `sed -n
+  'A,Bp' F`, `head -N F`, `tail -n N F` → `query text F:A-B`; `cat F` →
+  `query items MODULE`; `grep -n NAME F` (flags among `-nrRwHsI`) →
+  `query refs NAME --in F`, else `query grep NAME`. A pipe, several
+  files, a regex or another flag is blocked as before; writes always are.
+- **lookup-note.py** (PostToolUse on Bash; the eval's `+note`): when a
+  `guide`, `query`, `explain` or `--help` call prints the same text as
+  the same call earlier in the session, one line: ``note: `tachyonc
+  guide std` printed the same text at shell call 4 of this session``, once
+  per call. The call runs: an old result may have been cleared from the
+  context. TACHYON_LOOKUP_NOTE=0 turns it off.
+
+The hooks keep a small per-session state ($TACHYON_HOOK_STATE, default
+$TMPDIR/tachyon-agent-hooks). Measured on an M-series Mac under load
+(load average 6 on 12 cores; medians, Python's start included): a Bash
+call that changes nothing, 46 ms in the check hook (45 before 0.17) and
+60 ms in query-first (as before); the check hook after an edit, 76 ms
+(62 before: the state and the fingerprint); with a build and the 10
+cases of the eval's 01-wordfreq, 180 ms; the turn-end hook with nothing
+to check, 60 ms.
 
 ## Known limits
 

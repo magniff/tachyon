@@ -77,30 +77,70 @@ pub fn eprintln<T: Display>(x: T) {
 // it): `format_in(f"{x:>8}", gpa)`. (0.16: up to 256 bytes, x's Display
 // runs once, into a buffer on the stack.)
 pub fn format_in<T: Display, A: Allocator>(x: T, a: A) -> Buf<A> {
-    let mut tmp: [u8; 256] = [0; 256];
-    let mut f = Fmt::to_fd(-1);
-    f.out = &tmp[0];
-    f.cap = 256;
     let mut b: Buf<A> = Buf::new_in(a);
+    let mut tmp: [u8; 256] = [0; 256];
+    let mut f = __fmt_tmp(&tmp);
     // (one call of x's Display in the code: first to tmp, then, when the
     // text did not fit, to b's room)
-    let mut in_buf = false;
     loop {
         x.fmt(&f);
-        if in_buf {
-            if fmt_end_vec(&b.bytes, &f) {
-                return b;
-            }
-        } else if f.need == 0 {
-            b.bytes.reserve(f.len);
-            b.bytes.extend_from_slice(tmp[0..f.len]);
+        if __fmt_in_end(&b, &f, &tmp) {
             return b;
-        } else {
-            b.bytes.reserve(f.need);
-            f = fmt_to_vec(&b.bytes);
-            in_buf = true;
         }
     }
+}
+
+// (0.17) What the compiler writes for an f-string passed straight to
+// format_in, push_fmt, print, println, eprint or eprintln
+// (front/check/interp.tach): the holes' values, then the writes of
+// the text in place, with no closure. `format_in(f"..", a)` is
+//
+//   { let __f0 = e0; ...; let __a = a; let mut __b = std::Buf::new_in(__a);
+//     let mut __t = [0u8; 256]; let mut __out = std::__fmt_tmp(&__t);
+//     loop { WRITES; if std::__fmt_in_end(&__b, &__out, &__t) { break; } }
+//     __b }
+//
+// and `b.push_fmt(f"..")` is `{ let __r = &b; let __f0 = e0; ...; let mut
+// __out = std::__buf_fmt(__r); loop { WRITES; if std::__buf_fmt_end(__r,
+// &__out) { break; } } }`. Not for programs to call.
+
+// A Fmt writing into tmp (format_in's first pass).
+#[inline]
+#[views(tmp)]
+pub fn __fmt_tmp(tmp: *[u8; 256]) -> Fmt {
+    let mut f = Fmt::to_fd(-1);
+    f.out = (*tmp)[..];
+    f
+}
+
+// The end of a pass of format_in: the text written to tmp, when it fits,
+// copied to b, of its length (true); else b reserves the length and f
+// writes into b's room (false); after that pass, as __buf_fmt_end.
+pub fn __fmt_in_end<A: Allocator>(b: *Buf<A>, f: *Fmt, tmp: *[u8; 256]) -> bool {
+    if f.out.ptr != (*tmp)[..].ptr {
+        return fmt_end_vec(&b.bytes, f);
+    }
+    if f.need == 0 {
+        b.bytes.reserve(f.len);
+        b.bytes.extend_from_slice((*tmp)[0..f.len]);
+        return true;
+    }
+    b.bytes.reserve(f.need);
+    *f = fmt_to_vec(&b.bytes);
+    false
+}
+
+// A Fmt writing into b's room (push_fmt).
+#[inline]
+#[views(b)]
+pub fn __buf_fmt<A: Allocator>(b: *Buf<A>) -> Fmt {
+    fmt_to_vec(&b.bytes)
+}
+
+// The text f wrote is b's (true), or did not fit: b grows, f starts again.
+#[inline]
+pub fn __buf_fmt_end<A: Allocator>(b: *Buf<A>, f: *Fmt) -> bool {
+    fmt_end_vec(&b.bytes, f)
 }
 
 #[ambient("format_in(x, gpa)")]
@@ -112,11 +152,11 @@ impl<A: Allocator> Buf<A> {
     // Appends x's Display: `b.push_fmt(f"{k}={v};")`. (0.16: into the room
     // the Buf has; when the text does not fit, the Buf grows and x's
     // Display runs again.)
-    pub fn push_fmt<T: Display>(self: *Buf<A>, x: T) {
-        let mut f = fmt_to_vec(&self.bytes);
+    pub fn push_fmt<T: Display>(self: &mut Buf<A>, x: T) {
+        let mut f = __buf_fmt(self);
         loop {
             x.fmt(&f);
-            if fmt_end_vec(&self.bytes, &f) {
+            if __buf_fmt_end(self, &f) {
                 return;
             }
         }
@@ -127,9 +167,8 @@ impl<A: Allocator> Buf<A> {
 #[inline]
 fn fmt_to_vec<A: Allocator>(v: *Vec<u8, A>) -> Fmt {
     let mut f = Fmt::to_fd(-1);
-    f.out = v.ptr;
+    f.out = unsafe { v.ptr[0..v.cap] };
     f.len = v.len;
-    f.cap = v.cap;
     f
 }
 
@@ -199,9 +238,9 @@ fn fmt_flush() {
 #[inline]
 fn fmt_room(f: *Fmt, n: i64) -> [u8] {
     let at = f.len;
-    if at + n <= f.cap {
+    if at + n <= f.out.len {
         f.len = at + n;
-        return unsafe { f.out[at..at + n] };
+        return unsafe { f.out.ptr[at..at + n] };
     }
     if f.fd == FMT_FD && FMT_LEN + n <= FMT_CAP {
         let at = FMT_LEN;
@@ -291,9 +330,9 @@ fn fmt_str_fd(fd: i32, s: [u8]) {
 fn fmt_str_buf(f: *Fmt, s: [u8]) {
     let at = f.len;
     let n = s.len;
-    if at + n <= f.cap {
+    if at + n <= f.out.len {
         unsafe {
-            memcpy(&f.out[at], s.ptr, n as u64);
+            memcpy(&f.out.ptr[at], s.ptr, n as u64);
         }
         f.len = at + n;
     } else {
@@ -327,22 +366,24 @@ fn fmt_decimal(f: *Fmt, u: u64, negative: bool) {
 }
 
 // What Display and Debug write to: a file descriptor `fd` (through std's
-// buffer: `flush` writes it out), or (fd -1) the room out[len..cap] of a
+// buffer: `flush` writes it out), or (fd -1) the room out[len..] of a
 // Buf, `need` the length the text reached when it did not fit (0: it
-// fits). `width`, `prec` (-1: none) and `flags` are the spec of the hole
+// fits). (0.17) A view: `out`, the Buf's room, so a Buf cannot change while
+// a Fmt writes into it. `width`, `prec` (-1: none) and `flags` are the spec of the hole
 // being written, `mark` the position it started at. (0.16: sealed; std's
 // functions make one.)
 #[sealed]
 pub struct Fmt {
-    out: *u8, len: i64, cap: i64, need: i64, fd: i32, width: i64, prec: i64, flags: i64,
+    out: [u8], len: i64, need: i64, fd: i32, width: i64, prec: i64, flags: i64,
     mark: i64,
 }
 
 impl Fmt {
     #[inline]
+    #[views()]
     pub fn to_fd(fd: i32) -> Fmt {
         Fmt {
-            out: 0 as *u8, len: 0, cap: 0, need: 0, fd: fd, width: -1, prec: -1, flags: 0, mark: 0
+            out: "", len: 0, need: 0, fd: fd, width: -1, prec: -1, flags: 0, mark: 0
         }
     }
 
@@ -354,9 +395,9 @@ impl Fmt {
     #[inline]
     pub fn byte(self: *Fmt, b: u8) {
         let at = self.len;
-        if at < self.cap {
+        if at < self.out.len {
             unsafe {
-                self.out[at] = b;
+                self.out.ptr[at] = b;
             }
             self.len = at + 1;
             return;
@@ -580,11 +621,11 @@ fn fmt_pad(f: *Fmt) {
         FMT_LEN += pad;
     } else {
         // (when the text was lost or the room is short: counted)
-        if f.need != 0 || f.len + pad > f.cap {
+        if f.need != 0 || f.len + pad > f.out.len {
             fmt_lost(f, pad);
             return;
         }
-        text = f.out;
+        text = f.out.ptr;
         f.len += pad;
     }
     let mut at = start - base;
@@ -780,8 +821,7 @@ pub fn debug_list<T: Debug>(f: *Fmt, s: [T]) {
         if i > 0 {
             f.str(", ");
         }
-        let x = s[i];
-        f.debug(&x);
+        f.debug(&s[i]);
     }
     f.byte(']');
 }

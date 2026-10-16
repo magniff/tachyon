@@ -114,17 +114,15 @@ unsafe fn owned(p: *u8, gpa: Gpa) -> Buf {
 
 Copying out matters: `readdir` reuses its `struct dirent`, and a later
 `setenv` may move what `getenv` returned. A `Buf` belongs to the program,
-and is freed explicitly (`defer b.free();`), as tachyon has no
-destructors.
+and is dropped (freed) at the end of its owner's scope.
 
 ### getenv: NULL becomes None
 
 ```tach
-fn env(name: [u8]) -> Option<Buf> {
-    let mut cname = cstring(name);
-    defer cname.free();
+fn env(name: [u8], gpa: Gpa) -> Option<Buf> {
+    let cname = cstring(name, gpa);
     let p = unsafe { c::getenv(cname.as_slice().ptr) };
-    if p == 0 as *u8 { None } else { Some(unsafe { owned(p) }) }
+    if p == 0 as *u8 { None } else { Some(unsafe { owned(p, gpa) }) }
 }
 ```
 
@@ -228,7 +226,7 @@ a read-only `c"..."` literal.
   buffer for C; copy C strings out (`Buf::push_cstr`) before C reuses
   them.
 - **Memory**: whatever C allocates, C frees (`closedir`, `free`); whatever
-  tachyon allocates (`Buf`, `Vec`), tachyon frees, typically with `defer`.
+  tachyon allocates (`Buf`, `Vec`), tachyon frees, when it is dropped.
 - **Linking**: all of this is libc, which `tachyonc -o prog` links.
 
 ## Language features

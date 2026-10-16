@@ -129,9 +129,9 @@ example:
 $ explain type-error
 type error: error (compiler)
 The program is not well typed, or names something that is not there or not visible: an undefined name, a private item, a wrong type or argument count.
-fix: Read the message and its help; `tachyonc fix` adds the imports and `pub` it can.
+fix: Read the message and its help, and use its try: lines (0.17) as they are: code to paste (a conversion, the missing match arms, std's function for a method, a `use` line), or a command to run (`tachyonc fix --only imports|pub|alloc016 ROOT`, `tachyonc edit delete FILE:LINE` for a duplicate, `tachyonc query items TYPE` for a type's methods); VALUE in one is yours to fill in.
 example:
-    main.tach:4:5: error[type error] 'secret' is private
+    main.tach:4:5: error[type error] 'secret' is private | help: make it public: `pub fn secret` at util.tach:2:1 | try: tachyonc fix --only pub main.tach
 $ explain fmt
 fmt.bad-in	error, exit 1
 fmt.no-file	error, exit 1

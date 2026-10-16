@@ -11,7 +11,7 @@ use crate::front::ast::{NODES, NODE_COUNT, NodeKind, child};
 use crate::front::check::{Res, SELF_TYPE_SYM};
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
 use crate::front::modules::{MODULES, file_of_pos, module_at, module_count};
-use crate::front::types::{CONSTS, FNS, STATICS, STRUCTS, TYPES, TyKind, VARIANTS};
+use crate::front::types::{CONSTS, CONST_COUNT, FNS, STATICS, STRUCTS, TYPES, TyKind, VARIANTS};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::query::{
     QF_CALL, QF_DEF, QF_INIT, QF_PAT, QF_USE, QF_WRITE, def_at_line, parse_digits, trailing_number,
@@ -20,7 +20,7 @@ use crate::tools::query::cache::{RESTORED, cached_refs};
 use crate::tools::query::command_line::NOTES;
 use crate::tools::query::defs::{
     DEFS, DEF_COUNT, K_ALIAS, K_ENUM, K_IMPL_METHOD, K_MOD, K_STRUCT, K_TRAIT, K_TRAIT_FN, bytes_eq,
-    def_of_node, find_in, is_alias_name, mod_fqn, trait_of,
+    def_of_node, find_defs, find_in, is_alias_name, mod_fqn, trait_of,
 };
 use crate::tools::query::derived::in_derive;
 use crate::tools::query::diagnostics::{diag, put_cword, put_word, try_begin, try_end};
@@ -118,6 +118,38 @@ fn add_name_ref(def: i64, n: i64, flags: i64) {
         } else {
             add_ref(def, NODES[n].start, NODES[n].end, -1, false, NODES[n].start, flags);
         }
+    }
+}
+
+// (0.17) The string constant (`const S: [u8] = "..."`, `const C: *u8 =
+// c"..."`) whose use node n is: the checker replaced the name by the
+// literal (synth_name), so the node is a Str or CStr written as a name or
+// a path. -1 when n is a literal.
+fn string_const_at(n: i64) -> i64 {
+    unsafe {
+        let s = NODES[n].start;
+        let e = NODES[n].end;
+        if e <= s || SRC[s] == '"' || (SRC[s] == 'c' && s + 1 < e && SRC[s + 1] == '"')
+            || !(SRC[s] == '_' || (SRC[s] >= 'a' && SRC[s] <= 'z')
+                || (SRC[s] >= 'A' && SRC[s] <= 'Z')) {
+            return -1;
+        }
+        let mut from = s;
+        for i in s + 1..e {
+            if SRC[i - 1] == ':' && SRC[i] == ':' {
+                from = i + 1;
+            }
+        }
+        let name = SRC[from..e];
+        for c in 0..CONST_COUNT {
+            let node = CONSTS[c].node;
+            let init = NODES[node].c;
+            if init > 0 && NODES[init].kind == NODES[n].kind && NODES[init].a == NODES[n].a
+                && bytes_eq(SYMS[NODES[node].a].text, name) {
+                return c;
+            }
+        }
+        -1
     }
 }
 
@@ -299,6 +331,11 @@ pub fn collect_refs() {
                         add_ref(field, NODES[init].start, -1, -1, false, NODES[init].start,
                             QF_INIT);
                     }
+                }
+            } else if kind == NodeKind::Str || kind == NodeKind::CStr {
+                let c = string_const_at(n);
+                if c >= 0 {
+                    add_name_ref(CONSTS[c].node, n, 0);
                 }
             } else if kind == NodeKind::VariantLit {
                 let v = NODES[n].a;
@@ -490,9 +527,9 @@ pub static mut OPT_IN: *u8 = 0 as *u8;
 // --in: per file, per module, whether it is in.
 pub static mut IN_FILE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 pub static mut IN_MODULE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-// --in FILE:LINE: the text of the item holding that line, [IN_START, IN_END).
-pub static mut IN_START: i64 = -1;
-pub static mut IN_END: i64 = -1;
+// --in FILE:LINE or an item (0.17): the texts of the items, in pairs
+// [start, end); their files are marked 2 in IN_FILE.
+pub static mut IN_RANGES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 pub static mut IN_NO_ITEM: bool = false;
 
 // The path of file f as printed.
@@ -506,19 +543,20 @@ pub fn file_text(f: i64) -> [u8] {
     }
 }
 
-// Resolves --in X: a file (X has a `/`, ends in `.tach` or is `<std>`;
-// the path, or its end by whole components) or a module (matched like
-// NAME, with its inline modules), or FILE:LINE (the item holding that
-// line: ref_in; its file for the fixes by module). Whether anything
-// matched.
+// Resolves --in X (0.17: called once per --in, the matches adding up): a
+// file (X has a `/`, ends in `.tach` or is `<std>`; the path, or its end
+// by whole components) or a module (matched like NAME, with its inline
+// modules), or FILE:LINE (the item holding that line: ref_in; its file
+// for the fixes by module), or an item (a function, type...: its text).
+// Whether anything matched.
 pub fn resolve_in(x0: [u8]) -> bool {
     unsafe {
         let x = canonical_name(x0);
         let mut any = false;
-        for _ in 0..FILE_COUNT {
+        while IN_FILE.count < FILE_COUNT {
             IN_FILE.push(0);
         }
-        for _ in 0..module_count() {
+        while IN_MODULE.count < module_count() {
             IN_MODULE.push(0);
         }
         // (FILE:LINE: the item holding that line; its file for what works by
@@ -534,9 +572,7 @@ pub fn resolve_in(x0: [u8]) -> bool {
                         IN_NO_ITEM = true;
                         return false;
                     }
-                    IN_START = text_start(d);
-                    IN_END = DEFS[d].end;
-                    IN_FILE.data[f] = 1;
+                    in_item(d);
                     return true;
                 }
             }
@@ -560,7 +596,32 @@ pub fn resolve_in(x0: [u8]) -> bool {
             IN_MODULE.data[modules.data[i]] = 1;
             any = true;
         }
+        if any {
+            return true;
+        }
+        // (0.17: an item: a function, a method, a type...)
+        let mut found = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_defs(x, false, &found);
+        for i in 0..found.count {
+            let d = found.data[i];
+            if DEFS[d].kind != K_MOD && FILES[file_of_pos(DEFS[d].start)].path[0] != '<' {
+                in_item(d);
+                any = true;
+            }
+        }
         any
+    }
+}
+
+// (0.17) Item d's text is in --in.
+fn in_item(d: i64) {
+    unsafe {
+        IN_RANGES.push(text_start(d));
+        IN_RANGES.push(DEFS[d].end);
+        let f = file_of_pos(DEFS[d].start);
+        if IN_FILE.data[f] == 0 {
+            IN_FILE.data[f] = 2;
+        }
     }
 }
 
@@ -592,7 +653,7 @@ pub fn put_bad_in(d: i64, x: *u8) {
             buf_byte(d, '\n');
             return;
         }
-        buf_str(d, c"no file or module '");
+        buf_str(d, c"no file, module or item '");
         buf_str(d, x);
         buf_str(d, c"' in the program\n");
     }
@@ -604,10 +665,14 @@ pub fn ref_in(pos: i64) -> bool {
         if OPT_IN == 0 as *u8 {
             return true;
         }
-        if IN_START >= 0 {
-            return pos >= IN_START && pos < IN_END;
+        let mut k = 0;
+        while k < IN_RANGES.count {
+            if pos >= IN_RANGES.data[k] && pos < IN_RANGES.data[k + 1] {
+                return true;
+            }
+            k += 2;
         }
-        if IN_FILE.data[file_of_pos(pos)] != 0 {
+        if IN_FILE.data[file_of_pos(pos)] == 1 {
             return true;
         }
         let mut m = module_at(pos);
