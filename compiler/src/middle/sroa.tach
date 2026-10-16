@@ -10,14 +10,12 @@
 // overlap otherwise. Bytes outside the leaves (padding) are not kept.
 
 use crate::back::abi::abi_leaves;
-use crate::back::regalloc::prepare::{layout_blocks, layout_order};
-use crate::base::{BUFS, IntVec, alloc_array, buf_clear, buf_new, buf_reserve, free, memset};
+use crate::back::regalloc::prepare::layout_order;
+use crate::base::{BUFS, IntVec, alloc_array, buf_clear, buf_reserve, free, memset};
 use crate::front::consteval::{bits_of, wrap_int, write_scalar};
-use crate::front::lexer::str_at;
 use crate::front::types::{
     TY_BOOL, TY_F32, TY_F64, TY_U64, int_bits, is_integer, is_void, type_size,
 };
-use crate::gen0::target::add_const_data;
 use crate::middle::ctx::FnCtx;
 use crate::middle::fold::{is_const, op_before};
 use crate::middle::gvn::{
@@ -31,6 +29,7 @@ use crate::middle::ir::Op::{Add, Const, Conv, Copy, Load, SAddr, Slot, Store};
 use crate::middle::ir::cfg::{succ, succ_count};
 use crate::middle::lower::ssa::{ir_seal, new_synth_var, ssa_read, ssa_write};
 use crate::middle::opt::{compute_dominators, dominates, remove_trivial_phis, resolve_all};
+use crate::middle::parallel::{const_data, const_data_bytes};
 
 const SROA_MAX_LEAVES: i64 = 32;
 
@@ -557,7 +556,8 @@ pub fn promote_constant_slots(mut cx: *FnCtx, fi: i64) -> bool {
             }
         }
         let mut changed = false;
-        let scratch = buf_new();
+        // (0.18.1: the context's buffer: a task makes none)
+        let scratch = cx.scratch_buf;
         for k in 0..IRFUNCS[fi].slots.count {
             let s = IRFUNCS[fi].slots.data[k];
             if block_of[s] <= 0 || reads[s] == 0 {
@@ -585,7 +585,7 @@ pub fn promote_constant_slots(mut cx: *FnCtx, fi: i64) -> bool {
                 }
                 v = next;
             }
-            let id = add_const_data(BUFS[scratch].data[0..size], cx.slots[s].align);
+            let id = const_data(cx, fi, BUFS[scratch].data[0..size], cx.slots[s].align);
             let data = ir_make(cx, SAddr, TY_U64, 0, 0, id);
             ir_prepend(cx, IRFUNCS[fi].entry, data);
             for i in 0..cx.order.count {
@@ -618,12 +618,13 @@ pub fn constant_load(id: i64, offset: i64, ty: i64, ok: *bool) -> i64 {
         let size = type_size(ty);
         *ok = false;
         // (A vector, 0.10, is no constant.)
-        if size > 8 || offset < 0 || offset + size > str_at(id).len as i64 {
+        let bytes = const_data_bytes(id);
+        if size > 8 || offset < 0 || offset + size > bytes.len as i64 {
             return 0;
         }
         let mut bits: u64 = 0;
         for i in 0..size {
-            bits |= (str_at(id).ptr[offset + i] as u64) << (8 * i) as u64;
+            bits |= (bytes.ptr[offset + i] as u64) << (8 * i) as u64;
         }
         *ok = true;
         if ty == TY_F32 {

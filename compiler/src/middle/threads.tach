@@ -1,0 +1,175 @@
+// (0.18.1) The code generator's threads: the compiler's one binding of
+// pthreads, and its only code that runs on more than one thread without
+// a context of its own (docs/optimizer.md, "0.18.1: threads"). std's
+// concurrency is 0.21's; this is the smallest island that runs
+// middle::parallel's tasks.
+//
+// A pool of POOL_THREADS - 1 workers beside the main thread, made at the
+// first parallel phase and kept to the end of code generation. Each
+// thread has its own FnCtx (POOL_CTX[i], made by the main thread before
+// the workers start; index 0 is the main thread's). A phase hands the
+// pool the tasks that are ready; the threads take them, run them
+// (parallel::run_task) and report them done (parallel::task_done, which
+// may make others ready). Everything the threads share here is read and
+// written with MUTEX held: READY, REMAINING, PHASE_KIND, STOP, and
+// parallel's schedule (task_done runs under it). A task's results (its
+// function's IR, its text, its facts) are written before its thread takes
+// MUTEX to report it done, and read by a thread that took MUTEX after,
+// so they are ordered (the mutex's acquire and release). -j1, or a
+// program with few functions, makes no thread: the main thread runs every
+// task, in order.
+
+use crate::base::{IntVec, alloc_zeroed, die};
+use crate::middle::ctx::{FnCtx, fnctx_new};
+use crate::middle::parallel::run_task;
+
+extern "C" {
+    fn pthread_create(thread: *u64, attr: *u8, start: extern "C" fn(*u8) -> *u8, arg: *u8) -> i32;
+    fn pthread_join(thread: u64, result: *u8) -> i32;
+    fn pthread_attr_init(attr: *u8) -> i32;
+    fn pthread_attr_setstacksize(attr: *u8, size: u64) -> i32;
+    fn pthread_mutex_init(mutex: *u8, attr: *u8) -> i32;
+    fn pthread_mutex_lock(mutex: *u8) -> i32;
+    fn pthread_mutex_unlock(mutex: *u8) -> i32;
+    fn pthread_cond_init(cond: *u8, attr: *u8) -> i32;
+    fn pthread_cond_wait(cond: *u8, mutex: *u8) -> i32;
+    fn pthread_cond_broadcast(cond: *u8) -> i32;
+    fn sysconf(name: i32) -> i64;
+}
+
+// Room for a pthread_mutex_t, pthread_cond_t or pthread_attr_t (64, 48
+// and 64 bytes on macOS; 48, 48 and 64 on Linux, aarch64).
+const PTHREAD_ROOM: i64 = 256;
+// A worker's stack (the main thread's is 8 MB by default; the passes
+// recurse over dominator trees and expressions).
+const STACK_SIZE: i64 = 64 * 1024 * 1024;
+
+// The threads in all, the main thread with them (1: none made).
+pub static mut POOL_THREADS: i64 = 1;
+// Each thread's context, by index (0: the main thread's tasks').
+pub static mut POOL_CTX: **FnCtx = 0 as **FnCtx;
+
+// The contexts made (POOL_THREADS until the pool stops).
+pub static mut POOL_CONTEXTS: i64 = 0;
+static mut THREADS: *u64 = 0 as *u64;
+static mut MUTEX: *u8 = 0 as *u8;
+// Broadcast when tasks become ready, when a phase ends and at the stop.
+static mut WAKE: *u8 = 0 as *u8;
+static mut READY: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut REMAINING: i64 = 0;
+static mut PHASE_KIND: i64 = 0;
+static mut STOP: bool = false;
+
+// The number of processors online (sysconf), at least 1.
+pub fn processors(macos: bool) -> i64 {
+    // _SC_NPROCESSORS_ONLN
+    let n = unsafe { sysconf(if macos { 58 } else { 84 }) };
+    if n < 1 { 1 } else { n }
+}
+
+// Makes the contexts of `threads` threads and starts the workers (none
+// for 1). Main thread only, before the first phase.
+pub fn pool_start(threads: i64) {
+    unsafe {
+        POOL_THREADS = threads;
+        POOL_CONTEXTS = threads;
+        POOL_CTX = alloc_zeroed(threads * 8) as **FnCtx;
+        for i in 0..threads {
+            POOL_CTX[i] = fnctx_new();
+        }
+        if threads == 1 {
+            return;
+        }
+        MUTEX = alloc_zeroed(PTHREAD_ROOM);
+        WAKE = alloc_zeroed(PTHREAD_ROOM);
+        pthread_mutex_init(MUTEX, 0 as *u8);
+        pthread_cond_init(WAKE, 0 as *u8);
+        let attr = alloc_zeroed(PTHREAD_ROOM);
+        pthread_attr_init(attr);
+        pthread_attr_setstacksize(attr, STACK_SIZE as u64);
+        THREADS = alloc_zeroed(threads * 8) as *u64;
+        for i in 1..threads {
+            if pthread_create(&THREADS[i], attr, worker_main, i as *u8) != 0 {
+                die(c"cannot start a code generation thread (try -j1)");
+            }
+        }
+    }
+}
+
+// Stops the workers and waits for them. Main thread only, between phases.
+pub fn pool_stop() {
+    unsafe {
+        if POOL_THREADS <= 1 {
+            return;
+        }
+        pthread_mutex_lock(MUTEX);
+        STOP = true;
+        pthread_cond_broadcast(WAKE);
+        pthread_mutex_unlock(MUTEX);
+        for i in 1..POOL_THREADS {
+            pthread_join(THREADS[i], 0 as *u8);
+        }
+        POOL_THREADS = 1;
+    }
+}
+
+// Runs a phase's tasks (all can start), the last of `tasks` first;
+// returns when all are done. With one thread the main thread runs them.
+pub fn pool_run(kind: i64, tasks: *IntVec) {
+    unsafe {
+        if POOL_THREADS == 1 {
+            let mut i = (*tasks).count;
+            while i > 0 {
+                i -= 1;
+                run_task(POOL_CTX[0], kind, (*tasks).data[i]);
+            }
+            return;
+        }
+        pthread_mutex_lock(MUTEX);
+        PHASE_KIND = kind;
+        READY.count = 0;
+        for i in 0..(*tasks).count {
+            READY.push((*tasks).data[i]);
+        }
+        REMAINING = (*tasks).count;
+        pthread_cond_broadcast(WAKE);
+        take_tasks(0);
+        pthread_mutex_unlock(MUTEX);
+    }
+}
+
+// A thread's loop over the ready tasks, MUTEX held (released while a
+// task runs). The main thread (index 0) returns when the phase is done;
+// a worker when the pool stops.
+fn take_tasks(index: i64) {
+    unsafe {
+        let cx = POOL_CTX[index];
+        loop {
+            while READY.count == 0 && !(index == 0 && REMAINING == 0) && !STOP {
+                pthread_cond_wait(WAKE, MUTEX);
+            }
+            if READY.count == 0 {
+                return;
+            }
+            let task = READY.pop();
+            let kind = PHASE_KIND;
+            pthread_mutex_unlock(MUTEX);
+            run_task(cx, kind, task);
+            pthread_mutex_lock(MUTEX);
+            REMAINING -= 1;
+            if REMAINING == 0 {
+                pthread_cond_broadcast(WAKE);
+            }
+        }
+    }
+}
+
+// A worker thread: its index is its argument.
+extern "C" fn worker_main(arg: *u8) -> *u8 {
+    unsafe {
+        pthread_mutex_lock(MUTEX);
+        take_tasks(arg as i64);
+        pthread_mutex_unlock(MUTEX);
+    }
+    0 as *u8
+}

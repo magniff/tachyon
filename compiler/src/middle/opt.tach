@@ -12,7 +12,7 @@ use crate::base::timer::{
 };
 use crate::front::modules::{STD_MODULE, module_of};
 use crate::front::types::FNS;
-use crate::gen0::gen::fn_is_global;
+use crate::gen0::gen::{EMIT_IR, EMIT_MIR, fn_is_global};
 use crate::middle::adce::aggressive_dce;
 use crate::middle::copies::elide_copies;
 use crate::middle::ctx::FnCtx;
@@ -23,13 +23,12 @@ use crate::middle::gvn::run_gvn;
 use crate::middle::gvn_calls::repeated_pure_calls;
 use crate::middle::ifconv::if_convert_loops;
 use crate::middle::inline::{
-    FN_ADDRESS, FN_CALLS, FN_LIVE, FN_SCC, FN_SIZE, SCC_ORDER, compute_sccs, count_call_sites,
+    FN_ADDRESS, FN_CALLS, FN_LIVE, FN_SCC, FN_SIZE, compute_sccs, count_call_sites,
     forget_fn_caches, func_size, init_fn_caches, inline_rounds, inlined_everywhere, ir_callee,
     optimize_with_leaves, simplify_inlining_leaves, start_inlining_budget,
 };
 use crate::middle::ipo::{
-    PRINT_ATTRS, has_effect, heap_to_stack, infer_component_attrs, init_attrs, print_attrs,
-    propagate_constants,
+    PRINT_ATTRS, has_effect, heap_to_stack, init_attrs, print_attrs, propagate_constants,
 };
 use crate::middle::ir::{
     FN_IR, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_arg, ir_enter, ir_operand,
@@ -43,6 +42,7 @@ use crate::middle::licm::run_licm;
 use crate::middle::loops::{rotate_loops, seal_all};
 use crate::middle::lower::ssa::ssa_undef;
 use crate::middle::lsr::reduce_and_unswitch;
+use crate::middle::parallel::{cleanup_all, optimize_components, parallel_begin, simplify_all};
 use crate::middle::promote::promote_loop_memory;
 use crate::middle::range::fold_by_ranges;
 use crate::middle::scev::transform_loops;
@@ -553,7 +553,7 @@ fn mark_live(mut cx: *FnCtx, v: i64, work: *IntVec) {
 // ---- The pipeline ----
 
 // Cleanup that every IR function gets before code generation.
-fn cleanup_function(mut cx: *FnCtx, fi: i64) {
+pub fn cleanup_function(mut cx: *FnCtx, fi: i64) {
     resolve_all(cx, fi);
     remove_unreachable(cx, fi);
     remove_trivial_phis(cx, fi);
@@ -620,12 +620,10 @@ pub fn optimize_program(mut cx: *FnCtx) {
             FN_LIVE[fi] = 1;
         }
         drop_unreachable_std(cx);
-        for fi in 0..IRFUNC_COUNT {
-            if FN_LIVE[fi] != 0 {
-                ir_enter(cx, fi);
-                cleanup_function(cx, fi);
-            }
-        }
+        // (0.18.1) The tasks' threads (middle::parallel), and each function's
+        // cleanup on them.
+        parallel_begin(cx);
+        cleanup_all(cx);
         if OPT_LEVEL == 0 {
             return;
         }
@@ -636,12 +634,7 @@ pub fn optimize_program(mut cx: *FnCtx) {
             timer_add(T_SCALAR, t);
             return;
         }
-        for fi in 0..IRFUNC_COUNT {
-            if FN_LIVE[fi] != 0 {
-                ir_enter(cx, fi);
-                simplify_function(cx, fi);
-            }
-        }
+        simplify_all(cx);
         timer_add(T_SCALAR, t);
         if OPT_LEVEL < 2 {
             return;
@@ -674,79 +667,91 @@ pub fn optimize_program(mut cx: *FnCtx) {
         }
         start_inlining_budget();
         timer_add(T_IPCP, t);
-        let mut component_start = 0;
-        for i in 0..SCC_ORDER.count {
-            let fi = SCC_ORDER.data[i];
-            // (0.14: a std function the program cannot reach, and so its
-            // whole component)
-            if FN_LIVE[fi] == 0 {
-                if i + 1 == SCC_ORDER.count || FN_SCC[SCC_ORDER.data[i + 1]] != FN_SCC[fi] {
-                    component_start = i + 1;
-                }
-                continue;
-            }
-            ir_enter(cx, fi);
-            t = timer_now();
-            if eliminate_tail_recursion(cx, fi) {
-                cleanup_function(cx, fi);
-                simplify_function(cx, fi);
-            }
-            timer_add(T_TRE, t);
-            t = timer_now();
-            inline_rounds(cx, fi);
-            timer_add(T_INLINE, t);
-            t = timer_now();
-            if heap_to_stack(cx, fi) {
-                simplify_function(cx, fi);
-            } else if repeated_pure_calls(cx, fi) {
-                // (0.16: merged now that the callees' attributes are known)
-                run_gvn(cx, fi);
-                eliminate_dead_code(cx, fi);
-            }
-            timer_add(T_HEAP, t);
-            if inlined_everywhere(fi) {
-                DEFERRED[fi] = 1;
-            } else {
-                loop_pipeline(cx, fi);
-            }
-            t = timer_now();
-            FN_SIZE[fi] = func_size(cx, fi);
-            ir_shrink(cx);
-            // (asked before, through a call made direct, it is asked again)
-            forget_fn_caches(fi);
-            if i + 1 == SCC_ORDER.count || FN_SCC[SCC_ORDER.data[i + 1]] != FN_SCC[fi] {
-                infer_component_attrs(cx, component_start, i + 1);
-                component_start = i + 1;
-            }
-            timer_add(T_ATTRS, t);
-        }
+        // (0.18.1: each component once the components it calls are done,
+        // middle::parallel; one thread takes them in SCC_ORDER, as 0.17 did)
+        optimize_components(cx);
         t = timer_now();
         remove_dead_functions(cx);
         timer_add(T_GLOBAL_DCE, t);
         // The functions whose loop passes waited for their callers, and that
-        // are still called somewhere.
-        for fi in 0..IRFUNC_COUNT {
-            if DEFERRED[fi] != 0 && FN_LIVE[fi] != 0 {
-                ir_enter(cx, fi);
-                loop_pipeline(cx, fi);
+        // are still called somewhere, then SLP (finish_function): when each
+        // is emitted (0.18.1), or here for the IR printers.
+        if EMIT_IR || EMIT_MIR {
+            for fi in 0..IRFUNC_COUNT {
+                deferred_loops(cx, fi);
+            }
+            for fi in 0..IRFUNC_COUNT {
+                slp_function(cx, fi);
             }
         }
-        // (0.11: last, on the code as it will be emitted: stores packed
-        // earlier would hide their values from the loads of the functions
-        // they are inlined into)
-        t = timer_now();
-        for fi in 0..IRFUNC_COUNT {
-            if FN_LIVE[fi] != 0 && slp_vectorize(cx, fi) {
-                ir_enter(cx, fi);
-                resolve_all(cx, fi);
-                eliminate_dead_code(cx, fi);
-                verify_func(cx, fi, c"SLP vectorization");
-            }
-        }
-        timer_add(T_SLP, t);
         if PRINT_ATTRS {
             print_attrs();
         }
+    }
+}
+
+// (0.18.1) The bottom-up pipeline of function fi, of its component's task
+// (middle::parallel): tail recursion, inlining, heap to stack, the loop
+// passes (or not yet, DEFERRED), its size.
+pub fn optimize_component_function(mut cx: *FnCtx, fi: i64) {
+    unsafe {
+        ir_enter(cx, fi);
+        let mut t = timer_now();
+        if eliminate_tail_recursion(cx, fi) {
+            cleanup_function(cx, fi);
+            simplify_function(cx, fi);
+        }
+        timer_add(T_TRE, t);
+        t = timer_now();
+        inline_rounds(cx, fi);
+        timer_add(T_INLINE, t);
+        t = timer_now();
+        if heap_to_stack(cx, fi) {
+            simplify_function(cx, fi);
+        } else if repeated_pure_calls(cx, fi) {
+            // (0.16: merged now that the callees' attributes are known)
+            run_gvn(cx, fi);
+            eliminate_dead_code(cx, fi);
+        }
+        timer_add(T_HEAP, t);
+        if inlined_everywhere(fi) {
+            DEFERRED[fi] = 1;
+        } else {
+            loop_pipeline(cx, fi);
+        }
+        t = timer_now();
+        FN_SIZE[fi] = func_size(cx, fi);
+        ir_shrink(cx);
+        // (asked before, through a call made direct, it is asked again)
+        forget_fn_caches(fi);
+        timer_add(T_ATTRS, t);
+    }
+}
+
+// (0.18.1) -O2: function fi's loop passes, when they waited for its
+// callers (DEFERRED) and it is still called.
+pub fn deferred_loops(mut cx: *FnCtx, fi: i64) {
+    unsafe {
+        if DEFERRED[fi] != 0 && FN_LIVE[fi] != 0 {
+            ir_enter(cx, fi);
+            loop_pipeline(cx, fi);
+        }
+    }
+}
+
+// (0.18.1) -O2: function fi's SLP vectorization (0.11: last, on the code
+// as it will be emitted: stores packed earlier would hide their values
+// from the loads of the functions they are inlined into).
+pub fn slp_function(mut cx: *FnCtx, fi: i64) {
+    unsafe {
+        let t = timer_now();
+        if FN_LIVE[fi] != 0 && slp_vectorize(cx, fi) {
+            ir_enter(cx, fi);
+            resolve_all(cx, fi);
+            eliminate_dead_code(cx, fi);
+            verify_func(cx, fi, c"SLP vectorization");
+        }
+        timer_add(T_SLP, t);
     }
 }
 

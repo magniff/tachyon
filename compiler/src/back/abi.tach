@@ -29,9 +29,8 @@
 
 // How a value is passed.
 use crate::back::regalloc::intervals::min_i64;
-use crate::base::IntVec;
 use crate::base::target::{APPLE_A64, X86};
-use crate::front::ast::REPR_PACKED;
+use crate::front::ast::{REPR_C, REPR_PACKED};
 use crate::front::types::{
     ENUMS, FNS, STRUCTS, TYPES, TY_F32, TY_F64, TY_U16, TY_U32, TY_U64, TY_U8, TyKind, VARIANTS,
     align_to, enum_variant, field_offset, is_compound, is_float, is_void, max_i64, scalar_type,
@@ -171,7 +170,7 @@ pub fn abi_leaves(mut cx: *FnCtx, ty: i64, offset: i64) {
         } else if kind == TyKind::Struct {
             let s = TYPES[ty].a;
             for i in 0..STRUCTS[s].field_count {
-                abi_leaves(cx, (*struct_field(s, i)).ty, offset + field_offset(s, i));
+                abi_leaves(cx, (*struct_field(s, i)).ty, offset + struct_offset(cx, s, i));
             }
         } else if kind == TyKind::Tuple {
             for i in 0..TYPES[ty].count {
@@ -194,13 +193,40 @@ pub fn abi_leaves(mut cx: *FnCtx, ty: i64, offset: i64) {
             for i in 0..ENUMS[e].variant_count {
                 let v = enum_variant(e, i);
                 for k in 0..VARIANTS[v].field_count {
-                    abi_leaves(cx, variant_field(v, k), offset + variant_field_offset(v, k));
+                    abi_leaves(cx, variant_field(v, k), offset + variant_offset(cx, v, k));
                 }
             }
         } else if !is_void(ty) {
             cx.abi_leaves.push(offset);
             cx.abi_leaves.push(scalar_type(ty));
         }
+    }
+}
+
+// (0.18.1) variant_field_offset and field_offset, in a task without the
+// enum's or struct's type made (make_type writes the program's tables,
+// even to find a type that exists; middle::parallel): the layouts are
+// made before the tasks run, the payloads and the fields' offsets with
+// them.
+fn variant_offset(mut cx: *FnCtx, v: i64, i: i64) -> i64 {
+    unsafe {
+        if cx.task_phase == 0 {
+            return variant_field_offset(v, i);
+        }
+        let e = VARIANTS[v].enum_id;
+        if (ENUMS[e].repr & REPR_C) != 0 {
+            return ENUMS[e].payload + tuple_offset(VARIANTS[v].shape, i);
+        }
+        tuple_offset(VARIANTS[v].shape, i + 1)
+    }
+}
+
+fn struct_offset(mut cx: *FnCtx, s: i64, i: i64) -> i64 {
+    unsafe {
+        if cx.task_phase == 0 {
+            return field_offset(s, i);
+        }
+        (*struct_field(s, i)).offset
     }
 }
 

@@ -6,7 +6,7 @@
 
 use crate::back::abi::{fn_type_uses_c, fn_uses_c};
 use crate::back::regalloc::intervals::calls_returns_twice;
-use crate::back::regalloc::prepare::{layout_blocks, layout_order};
+use crate::back::regalloc::prepare::layout_order;
 use crate::base::{
     IntVec, STDERR, alloc_array, buf_byte, buf_int, buf_new, buf_str, buf_write_fd, free, intern_c,
     sym_name,
@@ -35,6 +35,7 @@ use crate::middle::ir::Op::{
 use crate::middle::ir::cfg::{succ, succ_count};
 use crate::middle::ir::verify::verify_func;
 use crate::middle::opt::{resolve_all, simplify_function};
+use crate::middle::parallel::fn_facts_ready;
 
 // ---- Attributes ----
 
@@ -78,7 +79,9 @@ pub fn call_attrs(mut cx: *FnCtx, v: i64) -> i64 {
                 // A C function (builtin.tach's table, or its declaration).
                 return front_attrs(cx.insts[v].imm);
             }
-            if ATTRS_READY && FN_ATTRS_DONE[g] != 0 {
+            // (0.18.1: in the bottom-up phase, a callee whose component is
+            // below this one's: one being done on another thread is not)
+            if ATTRS_READY && fn_facts_ready(cx, g, FN_ATTRS_DONE[g] != 0) {
                 return FN_ATTRS[g] | front_attrs(cx.insts[v].imm);
             }
             return front_attrs(cx.insts[v].imm);
@@ -348,7 +351,8 @@ fn captured(mut cx: *FnCtx, fi: i64, p: i64) -> bool {
                                 cx.used_component = true;
                             }
                             if g < 0 || bit >= 63 || g == fi
-                                || (FN_SCC[g] != FN_SCC[fi] && FN_ATTRS_DONE[g] == 0)
+                                || (FN_SCC[g] != FN_SCC[fi]
+                                    && !fn_facts_ready(cx, g, FN_ATTRS_DONE[g] != 0))
                                 || FN_NOCAPTURE[g] & (1 << bit) == 0 {
                                 result = true;
                             }
@@ -857,6 +861,18 @@ pub fn heap_to_stack(mut cx: *FnCtx, fi: i64) -> bool {
             verify_func(cx, fi, c"heap to stack");
         }
         changed
+    }
+}
+
+// (0.18.1) The symbols heap_to_stack compares with, made before the tasks
+// run (middle::parallel: interning grows the program's table).
+pub fn init_syms() {
+    unsafe {
+        if MALLOC_SYM == 0 {
+            MALLOC_SYM = intern_c(c"malloc");
+            CALLOC_SYM = intern_c(c"calloc");
+            FREE_SYM = intern_c(c"free");
+        }
     }
 }
 

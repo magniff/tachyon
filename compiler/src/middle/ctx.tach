@@ -5,7 +5,7 @@
 // thread has its own (docs/optimizer.md, "0.18.1: threads"). Every
 // function that reaches one takes `cx`; serial code passes main_cx().
 
-use crate::base::{IntVec, alloc_zeroed};
+use crate::base::{IntVec, alloc_zeroed, buf_new};
 
 use crate::back::regalloc::Interval;
 use crate::middle::fold::lattice::Lattice;
@@ -101,9 +101,6 @@ pub struct FnCtx {
     // variables (to undo a failed branch).
     pub bind: [i64; 8],
     pub trail: IntVec,
-    // The scratch instruction folding evaluates constants with.
-    pub scratch_inst: i64,
-    pub scratch_fn: i64,
     pub consts: [i64; 8],
     pub build_cmp_ty: i64,
     pub found: IntVec,
@@ -563,10 +560,46 @@ pub struct FnCtx {
     // whole file.
     pub code: i64,
     pub asm: i64,
+    // The local labels made so far (LABEL_COUNT until 0.18.1): the
+    // program's for the main thread's context; in a task's, its function's,
+    // numbered from 1 and written L\x01<n> (local_labels), which the join
+    // renumbers (middle::parallel).
+    pub label_count: i64,
+    pub local_labels: bool,
+    // (0.18.1) The task this context runs (middle::parallel): its phase and
+    // its rank there (0: serial code), which order the constant data it
+    // makes; the component of the -O2 bottom-up phase (-1: none), its
+    // calls inlined (pairs of callee and count: FN_CALLS as this component
+    // sees it) and its growth (PROGRAM_SIZE as it sees it).
+    pub task_phase: i64,
+    pub task_rank: i64,
+    pub cur_comp: i64,
+    pub comp_dec: IntVec,
+    pub comp_growth: i64,
+    // (0.18.1) Counts for --vec-stats (VEC_STAT_*), summed over the
+    // contexts.
+    pub vec_loops: i64,
+    pub vec_tests: i64,
+    pub vec_skipped: i64,
+    // (0.18.1) The scratch text of cx_fmt (base::buf_fmt's is the program's).
+    pub fmt: *std::Buf,
+    // (0.18.1) While a callee is copied into its caller (inline_call), its
+    // blocks' and instructions' copies, by the callee's ids (the aux of the
+    // callee's tables until 0.18.1, which another thread may read).
+    pub inl_bmap: *i64,
+    pub inl_bmap_cap: i64,
+    pub inl_imap: *i64,
+    pub inl_imap_cap: i64,
+    // (0.18.1) A buffer for a pass's scratch bytes (base::buf_new makes the
+    // program's, which a task must not).
+    pub scratch_buf: i64,
+    // back::regalloc's IVS capacity (IV_CAP until 0.18.1).
+    pub iv_cap: i64,
 }
 
-// A context with every field at the static's initial value.
-pub fn fnctx_new() -> *FnCtx {
+// A context with every field at the static's initial value, and no
+// buffers yet (-1).
+fn fnctx_fields() -> *FnCtx {
     unsafe {
         let cx = alloc_zeroed(size_of(FnCtx)) as *FnCtx;
         cx.lp_header = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -625,8 +658,6 @@ pub fn fnctx_new() -> *FnCtx {
         cx.run = 0;
         cx.bind = [0; 8];
         cx.trail = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        cx.scratch_inst = 0;
-        cx.scratch_fn = -1;
         cx.consts = [0; 8];
         cx.build_cmp_ty = 0;
         cx.found = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -858,7 +889,53 @@ pub fn fnctx_new() -> *FnCtx {
         cx.isel_cap = 0;
         cx.code = -1;
         cx.asm = -1;
+        cx.label_count = 0;
+        cx.local_labels = false;
+        cx.task_phase = 0;
+        cx.task_rank = 0;
+        cx.cur_comp = -1;
+        cx.comp_dec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        cx.comp_growth = 0;
+        cx.vec_loops = 0;
+        cx.vec_tests = 0;
+        cx.vec_skipped = 0;
+        cx.fmt = alloc_zeroed(size_of(std::Buf)) as *std::Buf;
+        cx.inl_bmap = 0 as *i64;
+        cx.inl_bmap_cap = 0;
+        cx.inl_imap = 0 as *i64;
+        cx.inl_imap_cap = 0;
+        cx.scratch_buf = -1;
+        cx.iv_cap = 0;
         cx
+    }
+}
+
+// A new context: its fields at the statics' initial values, and buffers
+// of its own (serial code only: buf_new grows the program's table).
+pub fn fnctx_new() -> *FnCtx {
+    unsafe {
+        let cx = fnctx_fields();
+        cx.code = buf_new();
+        cx.asm = buf_new();
+        cx.scratch_buf = buf_new();
+        cx
+    }
+}
+
+// (testing, middle::parallel) A new context with cx's buffers and scratch
+// text: one per task, made while other tasks run (so without buf_new).
+pub fn fnctx_new_with(mut cx: *FnCtx) -> *FnCtx {
+    unsafe {
+        let code = cx.code;
+        let asm = cx.asm;
+        let scratch = cx.scratch_buf;
+        let fmt = cx.fmt;
+        let n = fnctx_fields();
+        n.code = code;
+        n.asm = asm;
+        n.scratch_buf = scratch;
+        n.fmt = fmt;
+        n
     }
 }
 

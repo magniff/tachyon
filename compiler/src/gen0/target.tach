@@ -57,6 +57,7 @@ use crate::middle::lower::ssa::HMap;
 
 use crate::base::target::{APPLE_A64, ELF, X86};
 use crate::middle::ctx::FnCtx;
+use crate::middle::parallel::const_data_id;
 use crate::middle::trace::trace_dump_fn;
 
 pub const R_ACC: i64 = 0;
@@ -69,7 +70,6 @@ pub const R_LOOP_COUNT: i64 = 11;
 pub static mut DATA: i64 = -1;
 // Temporaries currently pushed (16 bytes each).
 pub static mut DEPTH: i64 = 0;
-pub static mut LABEL_COUNT: i64 = 0;
 
 // ---- Output helpers ----
 
@@ -79,6 +79,16 @@ pub fn o(mut cx: *FnCtx, s: *u8) {
 
 pub fn oi(mut cx: *FnCtx, value: i64) {
     unsafe { buf_int(cx.code, value); }
+}
+
+// (0.18.1) buf_fmt with cx's scratch text: base::buf_fmt's is the
+// program's, which two tasks would share.
+pub fn cx_fmt<T: std::Display>(mut cx: *FnCtx, b: i64, x: T) {
+    unsafe {
+        (*cx.fmt).clear();
+        (*cx.fmt).push_fmt(x);
+        buf_bytes(b, (*cx.fmt).as_slice());
+    }
 }
 
 pub fn on(mut cx: *FnCtx) {
@@ -123,9 +133,11 @@ pub fn end(mut cx: *FnCtx, s: *u8) {
     }
 }
 
-pub fn new_label() -> i64 {
-    LABEL_COUNT += 1;
-    LABEL_COUNT
+pub fn new_label(mut cx: *FnCtx) -> i64 {
+    unsafe {
+        cx.label_count += 1;
+        cx.label_count
+    }
 }
 
 // Assembler-local labels: "L" on Mach-O, ".L" on ELF.
@@ -149,9 +161,38 @@ pub fn static_prefix() -> *u8 {
 
 pub fn emit_label(mut cx: *FnCtx, label: i64) {
     unsafe {
-        o(cx, local_prefix());
-        oi(cx, label);
+        o_label(cx, label);
         o(cx, c":\n");
+    }
+}
+
+// A local label as an operand: L<n> (.L<n> on ELF). In a task's context
+// (local_labels) the number is the function's own, written L\x01<n>,
+// which the join renumbers (middle::parallel, join_text).
+pub fn o_label(mut cx: *FnCtx, label: i64) {
+    unsafe {
+        o(cx, local_prefix());
+        if cx.local_labels {
+            buf_byte(cx.code, 1);
+        }
+    }
+    oi(cx, label);
+}
+
+// The label of string literal or constant data `id`: Lstr.<id>. Constant
+// data a task made, not numbered yet (a negative id, middle::parallel):
+// Lstr.\x02<n>, which the join numbers.
+pub fn o_str_label(mut cx: *FnCtx, id: i64) {
+    unsafe {
+        o(cx, local_prefix());
+        o(cx, c"str.");
+    }
+    let real = const_data_id(id);
+    if real < 0 {
+        unsafe { buf_byte(cx.code, 2); }
+        oi(cx, -id - 1);
+    } else {
+        oi(cx, real);
     }
 }
 

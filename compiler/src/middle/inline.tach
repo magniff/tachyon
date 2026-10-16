@@ -12,7 +12,7 @@
 
 use crate::back::abi::{AbiClass, conv_classify, conv_returns_through_pointer, fn_uses_c};
 use crate::back::regalloc::intervals::calls_returns_twice;
-use crate::base::{IntVec, alloc_array, free};
+use crate::base::{IntVec, alloc_array, alloc_zeroed, free, memset};
 use crate::front::ast::{FN_CLOSURE, NODES};
 use crate::front::types::{FNS, fn_attr_cold, fn_attr_inline, fn_param, is_void, type_size};
 use crate::gen0::gen::fn_is_global;
@@ -21,13 +21,14 @@ use crate::middle::fold::is_const;
 use crate::middle::gvn::has_ref_facts;
 use crate::middle::ipo::devirtualize;
 use crate::middle::ir::{
-    FN_IR, IRFUNCS, IRFUNC_COUNT, IRTables, Op, Term, ir_append, ir_arg, ir_enter, ir_make,
-    ir_new_block, ir_new_slot, ir_prepend, ir_replace, ir_set_arg, ir_unlink, ir_val, ir_view,
+    FN_IR, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_arg, ir_enter, ir_make, ir_new_block,
+    ir_new_slot, ir_prepend, ir_replace, ir_set_arg, ir_unlink, ir_val, ir_view,
 };
 use crate::middle::ir::cfg::{copy_terminator, ir_switch_no_preds, pred_index, succ, succ_count};
 use crate::middle::loops::{analyze_loops, block_array, innermost_loop};
 use crate::middle::lower::ssa::ssa_undef;
 use crate::middle::opt::{PER_FUNCTION, optimize_after_inlining, resolve_all, simplify_function};
+use crate::middle::parallel::fn_facts_ready;
 use crate::middle::profile::{is_cold_block, is_hot_count};
 
 const INLINE_SMALL: i64 = 30;
@@ -73,8 +74,9 @@ pub static mut FN_RT: *i64 = 0 as *i64;
 
 // (0.17) See deciders: -1 not yet known.
 pub static mut FN_DECIDERS_START: *i64 = 0 as *i64;
-static mut FN_DECIDERS_LEN: *i64 = 0 as *i64;
-static mut DECIDERS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// (0.18.1) Per function, the deciders (its own list: the function's task
+// makes it, its callers read it).
+static mut FN_DECIDERS: *IntVec = 0 as *IntVec;
 
 // (0.17) The inliner's caches of function information (FN_RT, deciders),
 // for IRFUNC_COUNT functions, none known.
@@ -82,7 +84,7 @@ pub fn init_fn_caches() {
     unsafe {
         FN_RT = alloc_array::<i64>(IRFUNC_COUNT + 1);
         FN_DECIDERS_START = alloc_array::<i64>(IRFUNC_COUNT + 1);
-        FN_DECIDERS_LEN = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        FN_DECIDERS = alloc_zeroed((IRFUNC_COUNT + 1) * size_of(IntVec)) as *IntVec;
         for fi in 0..IRFUNC_COUNT {
             FN_RT[fi] = -1;
             FN_DECIDERS_START[fi] = -1;
@@ -169,7 +171,7 @@ pub fn count_call_sites(mut cx: *FnCtx) {
 pub static mut SCC_ORDER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
 // The direct callees of fi (with repeats), in `out`.
-fn callees(mut cx: *FnCtx, fi: i64, out: *IntVec) {
+pub fn callees(mut cx: *FnCtx, fi: i64, out: *IntVec) {
     (*out).count = 0;
     unsafe {
         ir_enter(cx, fi);
@@ -375,9 +377,9 @@ fn inline_cost(mut cx: *FnCtx, g: i64, call: i64) -> i64 {
     unsafe {
         let nargs = cx.insts[call].nargs;
         let mut cost = FN_SIZE[g];
-        let start = deciders(cx, g);
-        for i in start..start + FN_DECIDERS_LEN[g] {
-            let k = DECIDERS.data[i];
+        let list = deciders(cx, g);
+        for i in 0..(*list).count {
+            let k = (*list).data[i];
             if k < nargs && is_const(cx, ir_val(cx, ir_arg(cx, call, k))) {
                 cost -= CONST_ARG_BONUS;
             }
@@ -387,29 +389,29 @@ fn inline_cost(mut cx: *FnCtx, g: i64, call: i64) -> i64 {
 }
 
 // The call operands of g's parameters that decide something in it (one
-// per parameter instruction, in order): DECIDERS[deciders(g) ..
-// + FN_DECIDERS_LEN[g]], found once g is optimized (reset with FN_RT).
-fn deciders(mut cx: *FnCtx, g: i64) -> i64 {
+// per parameter instruction, in order): FN_DECIDERS[g], found once g is
+// optimized (reset with FN_RT; 0.18.1: by g's task, finish_component).
+fn deciders(mut cx: *FnCtx, g: i64) -> *IntVec {
     unsafe {
         if FN_DECIDERS_START[g] < 0 {
             let back = cx.ir_cur;
             ir_enter(cx, g);
-            FN_DECIDERS_START[g] = DECIDERS.count;
+            FN_DECIDERS_START[g] = 0;
+            FN_DECIDERS[g].count = 0;
             let entry = IRFUNCS[g].entry;
             let mut v = cx.blocks[entry].first;
             while v != 0 {
                 if cx.insts[v].op == Op::Param {
                     let k = param_operand(cx, g, v);
                     if k >= 0 && decides(cx, g, v) {
-                        DECIDERS.push(k);
+                        FN_DECIDERS[g].push(k);
                     }
                 }
                 v = cx.insts[v].next;
             }
-            FN_DECIDERS_LEN[g] = DECIDERS.count - FN_DECIDERS_START[g];
             ir_enter(cx, back);
         }
-        FN_DECIDERS_START[g]
+        &FN_DECIDERS[g]
     }
 }
 
@@ -468,6 +470,11 @@ fn should_inline(mut cx: *FnCtx, fi: i64, g: i64, call: i64) -> bool {
         if g == fi || FN_SCC[g] == FN_SCC[fi] || FN_LIVE[g] == 0 {
             return false;
         }
+        // (0.18.1) Only a callee whose component is done (below this one: a
+        // call made direct may call any function).
+        if !fn_facts_ready(cx, g, true) {
+            return false;
+        }
         // A function calling setjmp (or the like) keeps its own frame, and
         // its callers theirs (see regalloc.tach).
         if cx.caller_rt || callee_returns_twice(cx, g) {
@@ -487,11 +494,11 @@ fn should_inline(mut cx: *FnCtx, fi: i64, g: i64, call: i64) -> bool {
         // (0.17: computed once; it scans the callee for what each constant
         // argument decides)
         let cost = inline_cost(cx, g, call);
-        if cost <= INLINE_TINY && PROGRAM_SIZE + FN_SIZE[g] <= PROGRAM_BUDGET {
+        if cost <= INLINE_TINY && program_size(cx) + FN_SIZE[g] <= PROGRAM_BUDGET {
             return true;
         }
         let b = cx.insts[call].block;
-        let once = FN_CALLS[g] == 1 && FN_ADDRESS[g] == 0 && !fn_is_global(gf);
+        let once = calls_left(cx, g) == 1 && FN_ADDRESS[g] == 0 && !fn_is_global(gf);
         // A closure called once is inlined whatever its size: it is moved,
         // not copied, and its size before its environment is known (the
         // loads through it) says little of what it becomes (a closure
@@ -505,7 +512,7 @@ fn should_inline(mut cx: *FnCtx, fi: i64, g: i64, call: i64) -> bool {
         // last in the order, found the budget spent.
         let small_leaf = FN_SIZE[g] <= INLINE_LEAF && callee_is_leaf(cx, g);
         if FN_SIZE[fi] + FN_SIZE[g] > INLINE_BUDGET
-            || (PROGRAM_SIZE + FN_SIZE[g] > PROGRAM_BUDGET && !small_leaf) {
+            || (program_size(cx) + FN_SIZE[g] > PROGRAM_BUDGET && !small_leaf) {
             return false;
         }
         // (0.10: with a profile, a call that never ran is cold, and a hot one
@@ -576,9 +583,9 @@ pub fn inline_calls(mut cx: *FnCtx, fi: i64) -> bool {
                     // up the budgets in the middle of an iterator chain.
                     if !counted_after(g) {
                         FN_SIZE[fi] += FN_SIZE[g];
-                        PROGRAM_SIZE += FN_SIZE[g];
+                        program_grows(cx, FN_SIZE[g]);
                     }
-                    FN_CALLS[g] -= 1;
+                    note_inlined(cx, g);
                     // The continuation block keeps the call site's loop depth
                     // and coldness.
                     let depth = site_depth(cx, b);
@@ -612,20 +619,35 @@ fn scaled_count(count: i64, site: i64, entry: i64) -> i64 {
 }
 
 // Records the loop depth and coldness of a block made after
-// mark_call_sites (when the tables cover it).
+// mark_call_sites. (0.18.1: the tables grow to cover it; 0.17 recorded it
+// only when they covered it already, which depended on the largest
+// function optimized before, on this thread.)
 fn set_site(mut cx: *FnCtx, b: i64, depth: i64, cold: bool) {
     unsafe {
-        if b < cx.site_depth_cap && b < cx.site_cold_cap {
-            if b >= cx.site_nblocks {
-                for x in cx.site_nblocks..b + 1 {
-                    cx.site_depth[x] = 0;
-                    cx.site_cold[x] = 0;
-                }
-                cx.site_nblocks = b + 1;
+        if b >= cx.site_depth_cap || b >= cx.site_cold_cap {
+            let cap = (b + 1) * 2;
+            let depths = alloc_array::<i64>(cap);
+            let colds = alloc_array::<i64>(cap);
+            for x in 0..cx.site_nblocks {
+                depths[x] = cx.site_depth[x];
+                colds[x] = cx.site_cold[x];
             }
-            cx.site_depth[b] = depth;
-            cx.site_cold[b] = if cold { 1 } else { 0 };
+            free(cx.site_depth as *u8);
+            free(cx.site_cold as *u8);
+            cx.site_depth = depths;
+            cx.site_cold = colds;
+            cx.site_depth_cap = cap;
+            cx.site_cold_cap = cap;
         }
+        if b >= cx.site_nblocks {
+            for x in cx.site_nblocks..b + 1 {
+                cx.site_depth[x] = 0;
+                cx.site_cold[x] = 0;
+            }
+            cx.site_nblocks = b + 1;
+        }
+        cx.site_depth[b] = depth;
+        cx.site_cold[b] = if cold { 1 } else { 0 };
     }
 }
 
@@ -646,7 +668,7 @@ pub fn inline_rounds(mut cx: *FnCtx, fi: i64) -> bool {
             let after = func_size(cx, fi);
             // (0.14: not a function that goes once inlined everywhere)
             if !inlined_everywhere(fi) {
-                PROGRAM_SIZE += after - before;
+                program_grows(cx, after - before);
             }
             FN_SIZE[fi] = after;
         }
@@ -669,9 +691,9 @@ pub fn start_inlining_budget() {
 
 // ---- Inlining one call ----
 
-// The copy of value `v` of the callee (its aux, in the callee's tables).
-fn mapped(gt: *IRTables, v: i64) -> i64 {
-    if v == 0 { 0 } else { unsafe { gt.insts[v].aux } }
+// The copy of value `v` of the callee (cx.inl_imap; its aux until 0.18.1).
+fn mapped(mut cx: *FnCtx, v: i64) -> i64 {
+    if v == 0 { 0 } else { unsafe { cx.inl_imap[v] } }
 }
 
 // Inlines callee g at call `call` of function fi. Returns the continuation
@@ -679,10 +701,12 @@ fn mapped(gt: *IRTables, v: i64) -> i64 {
 // its own tables, gt, while fi's are current: ids are each function's.)
 fn inline_call(mut cx: *FnCtx, fi: i64, call: i64, g: i64) -> i64 {
     unsafe {
-        ir_enter(cx, g);
-        resolve_all(cx, g);
+        // (0.18.1: g is resolved already, finish_component_function and
+        // simplify_inlining_leaves; its tables are only read: another thread
+        // may be copying it too)
         ir_enter(cx, fi);
         let gt = ir_view(g);
+        inline_maps(cx, gt.block_count + 1, gt.inst_count + 1);
         let b = cx.insts[call].block;
         // The continuation: the instructions after the call, and b's end.
         let cont = ir_new_block(cx);
@@ -727,7 +751,7 @@ fn inline_call(mut cx: *FnCtx, fi: i64, call: i64, g: i64) -> i64 {
             cx.blocks[nb].novec = gt.blocks[gb].novec;
             cx.blocks[nb].count = scaled_count(gt.blocks[gb].count, cx.blocks[b].count,
                 gt.blocks[gentry].count);
-            gt.blocks[gb].aux = nb;
+            cx.inl_bmap[gb] = nb;
             let mut gv = gt.blocks[gb].first;
             while gv != 0 {
                 let op = gt.insts[gv].op;
@@ -735,9 +759,9 @@ fn inline_call(mut cx: *FnCtx, fi: i64, call: i64, g: i64) -> i64 {
                     let index = gt.insts[gv].imm;
                     let piece = gt.insts[gv].imm2;
                     if index < 0 {
-                        gt.insts[gv].aux = cx.insts[call].c;
+                        cx.inl_imap[gv] = cx.insts[call].c;
                     } else {
-                        gt.insts[gv].aux = ir_arg(cx, call,
+                        cx.inl_imap[gv] = ir_arg(cx, call,
                             param_first[index] + if piece > 0 { piece - 1 } else { 0 });
                     }
                 } else {
@@ -761,7 +785,7 @@ fn inline_call(mut cx: *FnCtx, fi: i64, call: i64, g: i64) -> i64 {
                         }
                     }
                     ir_append(cx, nb, nv);
-                    gt.insts[gv].aux = nv;
+                    cx.inl_imap[gv] = nv;
                 }
                 gv = gt.insts[gv].next;
             }
@@ -778,52 +802,52 @@ fn inline_call(mut cx: *FnCtx, fi: i64, call: i64, g: i64) -> i64 {
             if gt.blocks[gb].removed != 0 {
                 continue;
             }
-            let nb = gt.blocks[gb].aux;
+            let nb = cx.inl_bmap[gb];
             let mut nv = cx.blocks[nb].first;
             while nv != 0 {
-                cx.insts[nv].a = mapped(&gt, cx.insts[nv].a);
-                cx.insts[nv].b = mapped(&gt, cx.insts[nv].b);
-                cx.insts[nv].c = mapped(&gt, cx.insts[nv].c);
+                cx.insts[nv].a = mapped(cx, cx.insts[nv].a);
+                cx.insts[nv].b = mapped(cx, cx.insts[nv].b);
+                cx.insts[nv].c = mapped(cx, cx.insts[nv].c);
                 for a in 0..cx.insts[nv].nargs {
-                    ir_set_arg(cx, nv, a, mapped(&gt, ir_arg(cx, nv, a)));
+                    ir_set_arg(cx, nv, a, mapped(cx, ir_arg(cx, nv, a)));
                 }
                 nv = cx.insts[nv].next;
             }
             for p in 0..gt.blocks[gb].preds.count {
-                cx.blocks[nb].preds.push(gt.blocks[gt.blocks[gb].preds.data[p]].aux);
+                cx.blocks[nb].preds.push(cx.inl_bmap[gt.blocks[gb].preds.data[p]]);
             }
             let term = gt.blocks[gb].term;
             let gcond = gt.blocks[gb].cond;
             if term == Term::Ret {
                 if copy_result {
-                    let copy = ir_make(cx, Op::Copy, 0, cx.insts[call].c, mapped(&gt, gcond),
+                    let copy = ir_make(cx, Op::Copy, 0, cx.insts[call].c, mapped(cx, gcond),
                         type_size(ret));
                     ir_append(cx, nb, copy);
                 }
                 cx.blocks[nb].term = Term::Jump;
                 cx.blocks[nb].s0 = cont;
                 cx.blocks[cont].preds.push(nb);
-                returns.push(mapped(&gt, gcond));
+                returns.push(mapped(cx, gcond));
             } else if term == Term::Switch {
                 let mark = cx.ssa_stack.count;
                 let cases = gt.blocks[gb].cases;
                 for c in 0..gt.blocks[gb].ncases {
                     cx.ssa_stack.push(gt.swcases.data[cases + 2 * c]);
-                    cx.ssa_stack.push(gt.blocks[gt.swcases.data[cases + 2 * c + 1]].aux);
+                    cx.ssa_stack.push(cx.inl_bmap[gt.swcases.data[cases + 2 * c + 1]]);
                 }
-                ir_switch_no_preds(cx, nb, mapped(&gt, gcond), gt.blocks[gt.blocks[gb].s0].aux,
+                ir_switch_no_preds(cx, nb, mapped(cx, gcond), cx.inl_bmap[gt.blocks[gb].s0],
                     mark);
             } else {
                 let s0 = gt.blocks[gb].s0;
                 let s1 = gt.blocks[gb].s1;
                 cx.blocks[nb].term = term;
-                cx.blocks[nb].cond = mapped(&gt, gcond);
-                cx.blocks[nb].s0 = if s0 != 0 { gt.blocks[s0].aux } else { 0 };
-                cx.blocks[nb].s1 = if s1 != 0 { gt.blocks[s1].aux } else { 0 };
+                cx.blocks[nb].cond = mapped(cx, gcond);
+                cx.blocks[nb].s0 = if s0 != 0 { cx.inl_bmap[s0] } else { 0 };
+                cx.blocks[nb].s1 = if s1 != 0 { cx.inl_bmap[s1] } else { 0 };
             }
         }
         // Enter the copy.
-        let entry = gt.blocks[gentry].aux;
+        let entry = cx.inl_bmap[gentry];
         cx.blocks[b].term = Term::Jump;
         cx.blocks[b].cond = 0;
         cx.blocks[b].s0 = entry;
@@ -911,6 +935,71 @@ pub fn inlined_everywhere(fi: i64) -> bool {
     }
 }
 
+// (0.18.1) Room in cx's maps from a callee's blocks and instructions to
+// their copies for `blocks` and `insts` ids, all 0 (inline_call).
+fn inline_maps(mut cx: *FnCtx, blocks: i64, insts: i64) {
+    unsafe {
+        if cx.inl_bmap_cap < blocks {
+            free(cx.inl_bmap as *u8);
+            cx.inl_bmap_cap = blocks * 2;
+            cx.inl_bmap = alloc_array::<i64>(cx.inl_bmap_cap);
+        }
+        if cx.inl_imap_cap < insts {
+            free(cx.inl_imap as *u8);
+            cx.inl_imap_cap = insts * 2;
+            cx.inl_imap = alloc_array::<i64>(cx.inl_imap_cap);
+        }
+        memset(cx.inl_bmap as *u8, 0, (blocks * 8) as u64);
+        memset(cx.inl_imap as *u8, 0, (insts * 8) as u64);
+    }
+}
+
+// (0.18.1) The program's size as the component being optimized sees it:
+// the program's before the bottom-up phase, and what the component
+// itself added (PROGRAM_SIZE, which every component added to in 0.17,
+// made the decisions depend on the order the components were done in).
+fn program_size(mut cx: *FnCtx) -> i64 {
+    unsafe { PROGRAM_SIZE + cx.comp_growth }
+}
+
+fn program_grows(mut cx: *FnCtx, n: i64) {
+    unsafe { cx.comp_growth += n; }
+}
+
+// (0.18.1) Between the bottom-up phase's levels (middle::parallel): what
+// a level's components added.
+pub fn add_program_size(n: i64) {
+    unsafe { PROGRAM_SIZE += n; }
+}
+
+// (0.18.1) The calls of g left as the component being optimized sees them:
+// those before the bottom-up phase, less the ones it inlined itself.
+fn calls_left(mut cx: *FnCtx, g: i64) -> i64 {
+    unsafe {
+        let mut n = FN_CALLS[g];
+        for i in 0..cx.comp_dec.count {
+            if cx.comp_dec.data[i] == g {
+                n -= 1;
+            }
+        }
+        n
+    }
+}
+
+fn note_inlined(mut cx: *FnCtx, g: i64) {
+    unsafe { cx.comp_dec.push(g); }
+}
+
+// (0.18.1) What the callers of fi read of it, made by fi's task once its
+// component is done (so that no caller's task writes it): its call flags,
+// its deciders, and its operands resolved (inline_call copies them).
+pub fn finish_component_function(mut cx: *FnCtx, fi: i64) {
+    ir_enter(cx, fi);
+    callee_flags(cx, fi);
+    deciders(cx, fi);
+    resolve_all(cx, fi);
+}
+
 // ---- (0.17) -O1: small leaf functions ----
 
 // The largest leaf -O1 inlines (func_size, once simplified), and one with
@@ -946,6 +1035,9 @@ pub fn simplify_inlining_leaves(mut cx: *FnCtx) {
             }
             ir_enter(cx, fi);
             simplify_function(cx, fi);
+            // (0.18.1: resolved now, as inline_call reads it; it was resolved
+            // there, which another thread may be doing too)
+            resolve_all(cx, fi);
             LEAF_DONE[fi] = 1;
             let f = IRFUNCS[fi].f;
             let hint = fn_attr_inline(f);
