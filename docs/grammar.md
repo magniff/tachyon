@@ -1550,7 +1550,9 @@ static) they read through it, so they are `unsafe` (the error's try: is
 `fix --only unsafe`, or `v[i]` for a local `let p = &v;`). The type is
 the one written in the source, not an instance's: where p points, as
 written, to a type parameter (`p: *T`, a field `*T` of a generic struct,
-`x as *T`, the `ptr` of an `s: [T]`, a local from one of these), `p[i]`
+`x as *T`, the `ptr` of an `s: [T]`, a call to a function declared
+`-> *T` with T its own or its impl's parameter, a local from one of
+these), `p[i]`
 is pointer arithmetic for every `T`, a Vec too, so a generic body means
 one thing in every instance (std's Vec indexes its `ptr: *T` so); only a
 pointee written as a Vec, a Buf or a slice (`*Vec<T>`) is indexed
