@@ -1,0 +1,142 @@
+// std::gpu::hal: the backend interface (docs/design/gpu.md, §2.1, §2.8).
+// Metal (gpu/metal) implements it now and Vulkan (gpu/vk, G3) next; the
+// public API (gpu/mod.tach) calls the backend chosen for the target
+// through it. Until OS-specific module files exist (C1) the choice is the
+// `use self::metal as backend` line of gpu/mod.tach.
+//
+// Everything is static: no `dyn`, one implementation per build. The hal
+// validates nothing: the public API checks the rules (gpu/rules.tach)
+// before it calls down. A function returning Option fails with None when
+// the driver refuses (out of memory, a shader or pipeline it rejects);
+// its `err` Buf, when it takes one, gets the driver's message.
+
+use crate::gpu::shader::{Binding, EntryPoint, ShaderSource};
+use crate::gpu::types::{Color, Format, IndexFormat, Load, PipelineState, SamplerDesc, TextureDesc};
+use std::Buf;
+
+pub trait Api {
+    type Adapter;
+    type Device;
+    type Queue;
+    type Buffer;
+    type Texture;
+    type TextureView;
+    type Sampler;
+    type Shader;
+    type ComputePipeline;
+    type RenderPipeline;
+    type BindGroup;
+    type CommandBuffer;
+    type ComputeEncoder;
+    type RenderEncoder;
+    type PassDesc;
+
+    // ---- adapters and devices ----
+    fn adapters(out: *Vec<Self::Adapter>);
+    fn default_adapter() -> Option<Self::Adapter>;
+    fn adapter_name<A: Allocator>(a: *Self::Adapter, out: *Buf<A>);
+    fn adapter_low_power(a: *Self::Adapter) -> bool;
+    fn adapter_free(a: *Self::Adapter);
+    fn open(a: *Self::Adapter) -> Option<(Self::Device, Self::Queue)>;
+    fn device_free(d: *Self::Device);
+    fn queue_free(q: *Self::Queue);
+    /// Waits for everything submitted to the device's queue.
+    fn device_wait_idle(d: *Self::Device);
+
+    // ---- resources ----
+    /// A buffer of size bytes, host-visible, holding init (zeros past it).
+    fn create_buffer(d: *Self::Device, size: i64, init: [u8]) -> Option<Self::Buffer>;
+    /// The buffer's memory, for mapping: valid while the buffer is.
+    fn buffer_bytes(b: *Self::Buffer) -> [u8];
+    fn buffer_free(b: *Self::Buffer);
+    fn create_texture(d: *Self::Device, desc: *TextureDesc) -> Option<Self::Texture>;
+    fn texture_free(t: *Self::Texture);
+    /// A view of t, of t's own format or another of the same size.
+    fn create_view(t: *Self::Texture, format: Format, same_format: bool) -> Option<Self::TextureView>;
+    fn view_free(v: *Self::TextureView);
+    fn create_sampler(d: *Self::Device, desc: *SamplerDesc) -> Option<Self::Sampler>;
+    fn sampler_free(s: *Self::Sampler);
+    fn create_shader<A: Allocator>(d: *Self::Device, src: *ShaderSource, err: *Buf<A>) -> Option<Self::Shader>;
+    fn shader_free(s: *Self::Shader);
+
+    fn create_compute_pipeline<A: Allocator>(d: *Self::Device, s: *Self::Shader, entry: *EntryPoint,
+        err: *Buf<A>) -> Option<Self::ComputePipeline>;
+
+    fn compute_pipeline_free(p: *Self::ComputePipeline);
+
+    fn create_render_pipeline<A: Allocator>(d: *Self::Device, vs: *Self::Shader,
+        vs_entry: *EntryPoint, fs: *Self::Shader, fs_entry: *EntryPoint, has_fs: bool,
+        state: *PipelineState, err: *Buf<A>) -> Option<Self::RenderPipeline>;
+
+    fn render_pipeline_free(p: *Self::RenderPipeline);
+
+    // ---- bind groups: resources at the slots their bindings name ----
+    fn bind_group_new(d: *Self::Device) -> Self::BindGroup;
+
+    fn bind_group_buffer(g: *Self::BindGroup, b: *Binding, buf: *Self::Buffer, offset: i64,
+        size: i64);
+
+    fn bind_group_texture(g: *Self::BindGroup, b: *Binding, v: *Self::TextureView);
+    fn bind_group_sampler(g: *Self::BindGroup, b: *Binding, s: *Self::Sampler);
+    fn bind_group_free(g: *Self::BindGroup);
+
+    // ---- recording ----
+    /// A command buffer of the device's queue.
+    fn begin(d: *Self::Device) -> Self::CommandBuffer;
+
+    fn copy_buffer(cb: *Self::CommandBuffer, src: *Self::Buffer, src_offset: i64,
+        dst: *Self::Buffer, dst_offset: i64, size: i64);
+
+    fn copy_texture_to_buffer(cb: *Self::CommandBuffer, src: *Self::Texture, layer: i64, x: i64,
+        y: i64, w: i64, h: i64, dst: *Self::Buffer, offset: i64, bytes_per_row: i64);
+
+    fn copy_buffer_to_texture(cb: *Self::CommandBuffer, src: *Self::Buffer, offset: i64,
+        bytes_per_row: i64, dst: *Self::Texture, layer: i64, x: i64, y: i64, w: i64, h: i64);
+
+    fn begin_compute(cb: *Self::CommandBuffer) -> Self::ComputeEncoder;
+    fn compute_set_pipeline(e: *Self::ComputeEncoder, p: *Self::ComputePipeline);
+    fn compute_set_bind_group(e: *Self::ComputeEncoder, g: *Self::BindGroup);
+    fn dispatch(e: *Self::ComputeEncoder, x: i64, y: i64, z: i64);
+    fn end_compute(e: *Self::ComputeEncoder);
+
+    fn pass_new() -> Self::PassDesc;
+
+    fn pass_color(p: *Self::PassDesc, i: i64, v: *Self::TextureView, load: Load, clear: Color,
+        store: bool);
+
+    fn pass_depth(p: *Self::PassDesc, v: *Self::TextureView, load: Load, clear: f64, store: bool);
+    fn pass_free(p: *Self::PassDesc);
+    fn begin_render(cb: *Self::CommandBuffer, p: *Self::PassDesc) -> Self::RenderEncoder;
+    fn render_set_pipeline(e: *Self::RenderEncoder, p: *Self::RenderPipeline);
+    fn render_set_bind_group(e: *Self::RenderEncoder, g: *Self::BindGroup);
+    fn render_set_vertex_buffer(e: *Self::RenderEncoder, slot: i64, b: *Self::Buffer, offset: i64);
+
+    fn render_set_index_buffer(e: *Self::RenderEncoder, b: *Self::Buffer, format: IndexFormat,
+        offset: i64);
+
+    fn render_set_viewport(e: *Self::RenderEncoder, x: f32, y: f32, w: f32, h: f32, min_depth: f32,
+        max_depth: f32);
+
+    fn render_set_scissor(e: *Self::RenderEncoder, x: i64, y: i64, w: i64, h: i64);
+    fn render_set_blend_constant(e: *Self::RenderEncoder, c: Color);
+
+    fn draw(e: *Self::RenderEncoder, first_vertex: i64, vertices: i64, first_instance: i64,
+        instances: i64);
+
+    fn draw_indexed(e: *Self::RenderEncoder, first_index: i64, indices: i64, base_vertex: i64,
+        first_instance: i64, instances: i64);
+
+    fn end_render(e: *Self::RenderEncoder);
+
+    // ---- submission ----
+    fn submit(q: *Self::Queue, cb: *Self::CommandBuffer);
+    fn command_buffer_free(cb: *Self::CommandBuffer);
+    /// Writes data at offset, ordered before the commands submitted next.
+    fn write_buffer(q: *Self::Queue, b: *Self::Buffer, offset: i64, data: [u8]);
+
+    fn write_texture(q: *Self::Queue, t: *Self::Texture, layer: i64, x: i64, y: i64, w: i64, h: i64,
+        data: [u8], bytes_per_row: i64);
+
+    /// Waits for everything submitted to q; false if a submission failed.
+    fn queue_wait_idle(q: *Self::Queue) -> bool;
+}
