@@ -25,7 +25,7 @@ $ text std:1-2
 2	// (compiler/std/embed.sh makes compiler/src/front/stdsrc.tach from this file
 $ grep 'pub fn read_line' --in std
 # <std>
-2243:1	code	std	pub fn read_line<A: Allocator>(line: *Buf<A>) -> Result<bool, IoError> {
+2238:1	code	std	pub fn read_line<A: Allocator>(line: *Buf<A>) -> Result<bool, IoError> {
 $ def no_such_name
 error query.no-match: no definition 'no_such_name'
 try: tachyonc query items
