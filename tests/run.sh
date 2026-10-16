@@ -8,7 +8,8 @@
 # (`tachyonc guide`, 0.13), tests/fmt/run.sh (`tachyonc fmt --check`
 # of the tree, and formatting changes no program, 0.13) and
 # tests/walkthrough/run.sh (the sessions of examples/tools/*/README.md,
-# 0.15, and of every examples/GROUP/NAME/README.md with one, 0.16). POSIX sh and awk only, so it runs the same on macOS and Linux.
+# 0.15, and of every examples/GROUP/NAME/README.md with one, 0.16) and
+# tests/own-try/run.sh (the own pass's try: lines run, 0.17). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-d FORMAT] [FILTER]
 #
@@ -633,6 +634,9 @@ esac
 case walkthrough in
     *"$FILTER"*) "$ROOT/tests/walkthrough/run.sh" -c "$COMPILER" >"$WORK/walkthrough.out" 2>&1 & ;;
 esac
+case own-try in
+    *"$FILTER"*) "$ROOT/tests/own-try/run.sh" -c "$COMPILER" >"$WORK/own-try.out" 2>&1 & ;;
+esac
 
 # The slots: JOBS of them in a FIFO of our own, or the shared ones of
 # $TACHYON_JOBSERVER (see above).
@@ -804,6 +808,26 @@ case walkthrough in
             count=$((count + 1))
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/walkthrough.out" >>"$FAILURES"
+        ;;
+esac
+
+# The try: lines of the own pass's diagnostics (0.17): tests/own-try/run.sh
+# (run above), each tests/own-try/NAME/ checked under --values=error and
+# each try: of its first error run; category "own-try".
+case own-try in
+    *"$FILTER"*)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "own-try pass" >>"$TALLY"; count=$((count + 1)) ;;
+                xfail) echo "own-try xfail" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "own-try fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/own-try.out"
+        if ! grep -q '^pass\|^xfail' "$WORK/own-try.out"; then
+            echo "own-try fail" >>"$TALLY"
+            count=$((count + 1))
+        fi
+        grep '^FAIL' "$WORK/own-try.out" >>"$FAILURES"
         ;;
 esac
 

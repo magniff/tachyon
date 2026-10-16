@@ -652,9 +652,9 @@ fn main() -> i32 {
 ```err
 error[unsafe] access to a field through a raw pointer is unsafe
 ```
-A local holding a raw pointer (`let q: *P = &p;`) is raw. Use `p.x = 9;`,
-keep a reference (`let q = &mut p;`, 0.17), or pass `&mut p` to a
-function taking `&mut P` (or `*P`: a borrow, safe there).
+A local declared `*P` holds a raw pointer. Use `p.x = 9;`, keep a
+reference (`let q = &mut p;`, 0.17: `q.x = 9` is safe), or pass `&mut p`
+to a function taking `&mut P`.
 
 ```tach
 struct P { x: i64 }
@@ -688,8 +688,8 @@ fn get(h: H) -> i64 { read(h.p) }
 ```err
 error[unsafe] passing a raw pointer to a pointer parameter is unsafe
 ```
-Only `&place` and pointer parameters are borrows; vouch for others in
-`unsafe { read(h.p) }`.
+A `*T` field is a raw pointer: vouch for it in `unsafe { read(h.p) }`,
+or hold a reference (`struct H { p: &mut i64 }`, 0.17).
 
 ```tach
 fn add(p: *i64, x: i64) { *p += x; }
@@ -709,6 +709,73 @@ error[unsafe] calling an `unsafe fn` is unsafe
 `std::panic`, `print_cstr` and `Buf::push_cstr` take C strings and are
 `unsafe fn`; for literals use `print("x")`, `panic("x")` (the prelude's,
 safe).
+
+## Moves, references and views (0.17)
+
+```tach
+struct P { x: i64 }
+fn bump(p: &mut P) { p.x += 1; }
+fn main() -> i32 { let mut q = P { x: 1 }; bump(&q); q.x as i32 }
+```
+```err
+error[type error] expected '&mut P', got '&P'
+```
+The parameter is `&mut P`: write `bump(&mut q)` (the `try:`; `tachyonc
+fix --suggested` makes it). `&q` to a `*P` parameter (before 0.17's
+spelling) is accepted.
+
+```tach
+fn first(a: &i64) -> i64 { a[0] }
+```
+```err
+error[unsafe] indexing a pointer is unsafe pointer arithmetic
+```
+`a` is one value, not an array: `*a` (and `*out = acc` to write one).
+`p[i]` on a reference to a Vec, Buf or slice is its element, checked.
+
+The own pass's errors (`own.*`) are one line each, with both positions,
+a `help:` with the fix and `try:` lines; `tachyonc explain own.CODE` has
+each in full, `tachyonc query own FILE:LINE:COL` the state of every
+local there. The common ones:
+
+```text
+error[own.moved] 'v' is used here after it moved into 'total(v)' at 5:19
+```
+`total(v: Vec<i64>)` takes `v` (an owned value moves). When it only
+reads: `v: &Vec<i64>` and `total(&v)`; when it changes it: `&mut
+Vec<i64>` and `total(&mut v)` (a push through a by-value Vec was lost
+before 0.17); else `total(v.clone())`. The try: `tachyonc refactor
+signature total --type v '&Vec<i64>' --default '&$v'` changes both.
+
+```text
+error[own.move_out] cannot move 'self.keys' (Vec<Entry>) out of '*self': 'rehash' borrows 'self'
+```
+`let old = std::take(&mut self.keys);` (leaves an empty Vec), or loop
+over `self.keys` by reference.
+
+```text
+error[own.conflict] 'v.push(4)' may move v's elements while 'first' (4:17) views them; 'first' is used at 6:16
+error[own.conflict] 'v.push' may move v's elements while the 'for' at 7:1 iterates over them
+error[own.conflict] 'a' is borrowed mutably by argument 1 and read by argument 2
+```
+A view (a slice, `&x`, a `for` over `v`) is still used after `v`
+changes. Use it before the change, or take it again after; keep an
+index (`for i in 0..v.len() { let x = v[i]; ... }`); copy a plain value
+out first (`let x = v[0];`); `v.swap(i, j)` for two elements; `let n =
+rng.next();` before `rng.big(n)`. `guide views` has the rules.
+
+```text
+error[own.escape] 'greet' returns a view of 'b', which is dropped when 'greet' returns
+```
+Return the `Buf` (`-> Buf`, `b`), not `b.as_slice()`; the caller takes
+the view.
+
+```text
+error[own.readonly] cannot write 'p.x': 'p' is '&P', a shared reference
+```
+`p: &mut P`, and `&mut x` at the calls (`tachyonc refactor signature F
+--type p '&mut P'` changes both); a slice: `s: &mut [T]`, passed as
+`v.as_mut_slice()` or `&mut a[..]`. Old code: `tachyonc fix --values`.
 
 ## At run time
 

@@ -1,8 +1,10 @@
 // The explanations of the own pass's codes (0.17, front/own/diag.tach;
-// docs/design/value-semantics.md §2.9, §4). Phase 0 wrote what each code
-// reports; T6 completes the fixes and the examples, with the tasks that
-// report them (T1: moved, move_out, partial, drop_view; T2: conflict,
-// escape, static, readonly; T3: views).
+// docs/design/value-semantics.md §2.9, §4): what each reports, the fix
+// with its replacement text (agents fix by hand more often than they run a
+// try: line), and an example: the code, then the diagnostic as `check`
+// prints it, split at its ` | `. The tasks that report them: T1 moved,
+// move_out, partial, drop_view; T2 conflict, escape, static, readonly; T3
+// views. tests/own-try runs the try: lines of these examples.
 
 use crate::tools::explain::Explain;
 
@@ -11,73 +13,179 @@ pub const OWN_COUNT: i64 = 9;
 pub static OWN_TABLE: [Explain; 9] = [
     Explain {
         code: "own.moved",
-        severity: "error (--values=error; a warning with warn, a note with report)",
-        means: "A value of an owned type (one with a Drop, or holding a Vec, Buf, HashMap) is \
-            used after it moved: into a by-value parameter, a `let`, a struct field, a `return`.",
-        fix: "Pass a reference (`&v`, the parameter `&Vec<T>`) when the callee only reads it, or \
-            a copy (`v.clone()`); the line's try: names the edit.",
-        example: "main.tach:6:5: error[own.moved] 'v' is used here after it moved into 'total(v)' at 5:19",
+        severity: "error (--values=error, the 0.17 default; a warning with warn, a note with report)",
+        means: "A value of an owned type (one with a Drop, or holding a Vec, Buf or HashMap) is \
+            used after it moved. `let w = v`, a by-value argument `f(v)`, a struct literal's \
+            field, `return v` and a `move` capture all move it: the old name is dead until it \
+            is assigned again. Plain values (numbers, structs of them) copy and never move.",
+        fix: "When the callee only reads it, take a reference: the parameter `v: &Vec<T>` \
+            (`&mut Vec<T>` if it pushes) and the call `f(&v)` (`f(&mut v)`); `tachyonc \
+            refactor signature F --type v '&Vec<T>' --default '&$v'` changes both. Else pass \
+            a copy, `f(v.clone())`, or use the value before the move. A collection passed by \
+            value to a function that pushes to it was a lost push before 0.17 too: make it \
+            `&mut Vec<T>`.",
+        example: "fn total(v: Vec<i64>) -> i64 { let mut s = 0; for x in v { s += x; } s }\n\
+            ...\n\
+            let n = total(v);\n\
+            v.push(n);\n\
+            \n\
+            main.tach:6:5: error[own.moved] 'v' is used here after it moved into 'total(v)' at 5:19\n\
+            \x20 help: 'total' only reads its parameter 'v': take it by reference ('v: &Vec<i64>'), or pass a copy\n\
+            \x20 try: tachyonc refactor signature total --type v '&Vec<i64>' --default '&$v'\n\
+            \x20 try: tachyonc edit patch main.tach:5 --old 'total(v)' --new 'total(v.clone())'",
     },
     Explain {
-        code: "own.move_out", severity: "error (as own.moved)",
-        means: "An owned value is moved out of an index, `*r`, a static or a borrowed parameter, \
-            which would leave the place without a value.",
-        fix: "Take it out and leave an empty one (`std::take(&mut place)`), swap it \
-            (`std::replace`), remove it (`v.remove(i)`), or copy it (`.clone()`).",
-        example: "table.tach:2:15: error[own.move_out] cannot move 'self.keys' (Vec<Entry>) out of '*self'",
+        code: "own.move_out",
+        severity: "error (as own.moved)",
+        means: "An owned value is moved out of a place that must keep one: an index (`v[i]`), \
+            `*r`, a static, or a field of a parameter taken by reference (`self.keys` in a \
+            `self: &mut T` method). The place would be left without a value, and its owner \
+            would drop it again.",
+        fix: "Take it out and leave an empty one: `std::take(&mut self.keys)`; swap a new \
+            value in: `std::replace(&mut self.keys, new)`; remove an element: `v.remove(i)`; \
+            or copy it: `self.keys.clone()`. To only read it, borrow: `for k in self.keys`, \
+            `let ks = &self.keys;`.",
+        example: "fn rehash(self: &mut Table) {\n\
+            \x20   let old = self.keys;\n\
+            \x20   for k in old { self.insert(k); }\n\
+            }\n\
+            \n\
+            table.tach:2:15: error[own.move_out] cannot move 'self.keys' (Vec<Entry>) out of '*self': 'rehash' borrows 'self'\n\
+            \x20 help: take it out and leave an empty Vec in its place, or iterate over it by reference\n\
+            \x20 try: tachyonc edit patch table.tach:2 --old 'self.keys' --new 'std::take(&mut self.keys)'",
     },
     Explain {
-        code: "own.partial", severity: "error (as own.moved)",
-        means: "A field is moved out of a value whose type implements Drop: its drop would see \
-            the field gone.",
-        fix: "Move the whole value, or take the field out with `std::take`.",
-        example: "error[own.partial] cannot move 'f.name' out of 'f': 'File' implements Drop",
+        code: "own.partial",
+        severity: "error (as own.moved)",
+        means: "A field is moved out of a value whose type implements Drop: its `drop` would run \
+            on a value with the field gone. Moving fields out of a struct without its own Drop \
+            is allowed (a partial move; the rest is dropped field by field).",
+        fix: "Take the field out and leave an empty one, `std::take(&mut f.name)`, or copy it, \
+            `f.name.clone()`; or move the whole value.",
+        example: "impl Drop for File { fn drop(self: &mut File) { close(self.fd); } }\n\
+            let name = f.name;\n\
+            \n\
+            main.tach:9:16: error[own.partial] cannot move 'f.name' out of 'f': 'File' implements Drop\n\
+            \x20 help: take it out and leave an empty Buf, or copy it\n\
+            \x20 try: tachyonc edit patch main.tach:9 --old 'f.name' --new 'std::take(&mut f.name)'",
     },
     Explain {
-        code: "own.conflict", severity: "error (as own.moved)",
-        means: "A place is written, moved, dropped or mutably borrowed while a view or a loan of \
-            it is still used later: a view after a push, a `for` loop over a Vec it pushes to, \
-            two arguments of one call where one writes what the other reads.",
-        fix: "Use the view before the change, keep an index instead of a view, or copy the \
-            value out first; `tachyonc query own FILE:LINE:COL` shows the state.",
-        example: "main.tach:5:5: error[own.conflict] 'v.push(4)' may move v's elements while 'first' (4:17) views them; 'first' is used at 6:16",
+        code: "own.conflict",
+        severity: "error (as own.moved)",
+        means: "A place is written, moved, dropped or borrowed `&mut` while a view or a loan of \
+            it is used later (aliasing XOR mutation, checked within the function): a slice of a \
+            Vec used after a push (the push may move the elements); a `for` loop over a Vec \
+            that pushes to it; two arguments of one call where one is `&mut a` and another \
+            reads `a`; a `&mut self` method whose arguments change the receiver \
+            (`rng.big(rng.next())`); a view returned by a method of a type that owns the text \
+            (`views(self)`) kept across the next call. The line names both positions; when a \
+            callee causes it, it names the callee's view summary and the line that makes it.",
+        fix: "Use the view before the change, or take it again after (`let s = v.as_slice();` \
+            after the push); keep an index instead of a view; copy a plain element out first \
+            (`let x = v[0];`); loop over indexes (`for i in 0..v.len() { let x = v[i]; ... }`) \
+            or collect the new elements and append them after the loop; hoist an argument \
+            that changes the receiver into a `let`; `v.swap(i, j)` for two elements. A lexer \
+            that owns its text and returns views of it: let it view text its caller owns \
+            (`src: [u8]`), or copy each word. `tachyonc query own FILE:LINE:COL` shows every \
+            local's state there.",
+        example: "let first = v.as_slice();\n\
+            v.push(4);\n\
+            println(f\"{first[0]}\");\n\
+            \n\
+            main.tach:5:5: error[own.conflict] 'v.push(4)' may move v's elements while 'first' (4:17) views them; 'first' is used at 6:16\n\
+            \x20 help: use 'first' before the push, keep an index instead of a view, or keep a copy\n\
+            \x20 try: tachyonc edit patch main.tach:4 --old 'v.as_slice()' --new 'v.clone()'\n\
+            \x20 try: tachyonc query own main.tach:6:16\n\
+            \n\
+            for x in v { if x % 2 == 0 { v.push(x / 2); } }\n\
+            \n\
+            main.tach:7:30: error[own.conflict] 'v.push' may move v's elements while the 'for' at 7:1 iterates over them\n\
+            \x20 try: tachyonc edit patch main.tach:7 --old 'for x in v {' --new 'for i in 0..v.len() { let x = v[i];'",
     },
     Explain {
-        code: "own.escape", severity: "error (as own.moved)",
-        means: "A view outlives what it points into: a function returns a view of a local, or \
-            of an owned parameter it drops; a block's value views a local of the block.",
-        fix: "Return the owner (the Buf, the Vec) instead, and let the caller take its view.",
-        example: "greet.tach:3:5: error[own.escape] 'greet' returns a view of 'b', which is dropped when 'greet' returns",
+        code: "own.escape",
+        severity: "error (as own.moved)",
+        means: "A view outlives what it points into: a function returns a slice (or a struct \
+            holding one) of a local, or of an owned parameter, which is dropped when it \
+            returns; a block's value views a local of the block; a view is stored into a \
+            static or into a `&mut` parameter's referent that outlives its owner.",
+        fix: "Return the owner (the Buf, the Vec) instead of a view of it; a caller that wants \
+            a view takes `.as_slice()` of what it got. Or take the text as a parameter (`s: \
+            [u8]`), so that the result views the caller's text. A function that returns a view \
+            of its parameter (`fn first_word(s: [u8]) -> [u8]`) is fine.",
+        example: "fn greet(name: [u8]) -> [u8] {\n\
+            \x20   let b = format(f\"hello {name}\");\n\
+            \x20   b.as_slice()\n\
+            }\n\
+            \n\
+            greet.tach:3:5: error[own.escape] 'greet' returns a view of 'b', which is dropped when 'greet' returns\n\
+            \x20 help: return the Buf itself; a caller that wants a view takes '.as_slice()' of it\n\
+            \x20 try: tachyonc edit patch greet --old '-> [u8]' --new '-> Buf' --old 'b.as_slice()' --new 'b'",
     },
     Explain {
-        code: "own.static", severity: "error (as own.moved)",
-        means: "A view of a static is used after a call that may write statics (its effects \
-            include `global`).",
+        code: "own.static",
+        severity: "error (as own.moved)",
+        means: "A view of a static (`TYPES.as_slice()`, `&TABLE`) is used after a call whose \
+            effects include `global` (it may write statics, and so grow or free what the view \
+            points into); or `&S`/`&mut S` of a static is passed to such a function.",
         fix: "Copy the plain value out first (`let t = TYPES[i];`), or take the view again \
-            after the call.",
-        example: "types.tach:41:9: error[own.static] 'template_instance' writes statics (global) while 't' (40:9) views TYPES",
+            after the call. `tachyonc query effects F --why global` shows why the callee \
+            writes statics.",
+        example: "let t = TYPES.as_slice();\n\
+            let id = intern(name);\n\
+            let k = t[i];\n\
+            \n\
+            types.tach:41:9: error[own.static] 'intern' writes statics (global) while 't' (40:9) views TYPES; 't' is used at 42:13\n\
+            \x20 help: copy the plain value first: 'let t = TYPES[i];'\n\
+            \x20 try: tachyonc query effects intern --why global",
     },
     Explain {
-        code: "own.views", severity: "error",
-        means: "A `#[views(...)]` or `#[stores(...)]` names something that is not a parameter \
-            (`p`) or what a parameter's views point into (`*p`); (T3) a body returns or stores \
-            more than its declaration says.",
-        fix: "Name the parameters the result points into; `tachyonc query views NAME` shows \
-            the inferred summary.",
-        example: "lex.tach:9:5: error[own.views] 'word' has no parameter 'src'",
+        code: "own.views",
+        severity: "error",
+        means: "A `#[views(...)]` or `#[stores(...)]` declaration is wrong: it names something \
+            that is not a parameter (`p`) or what a parameter's views point into (`*p`); or \
+            the body returns or stores views of more than it declares (the declaration pins \
+            the summary its callers rely on).",
+        fix: "Name the parameters the result points into: `#[views(self)]` for a view of what \
+            `self` points to (`self.src.as_slice()[a..b]`), `#[views(*self)]` for a view \
+            `self` holds (a token's text out of `self.toks`). `tachyonc query views NAME \
+            --why` shows the inferred summary and the line making each source; removing the \
+            declaration lets it be inferred.",
+        example: "#[views(*self)]\n\
+            fn word(self: &mut Lexer) -> [u8] { ...; self.src.as_slice()[a..b] }\n\
+            \n\
+            lex.tach:9:5: error[own.views] 'word' is #[views(*self)] but returns a view of 'self': 'self.src.as_slice()[a..b]' at 14:9\n\
+            \x20 help: declare #[views(self)], or return a view of what 'self' holds\n\
+            \x20 try: tachyonc query views Lexer::word --why",
     },
     Explain {
-        code: "own.drop_view", severity: "error",
-        means: "A view type (one holding a slice or a reference) implements Drop: its drop could \
-            read what its owner already freed.",
-        fix: "Implement Drop on the owner instead, or make the type own its data.",
-        example: "error[own.drop_view] 'Scanner' holds a view ('text: [u8]') and cannot implement Drop",
+        code: "own.drop_view",
+        severity: "error",
+        means: "A view type (one holding a slice, a reference, or a closure capturing by \
+            reference) implements Drop. Its drop could read what its owner already freed, so \
+            view types have none: this is what keeps tachyon free of Rust's drop-check rules.",
+        fix: "Implement Drop on the owner instead (the type holding the Buf or Vec), or make \
+            the type own its data (`text: Buf` rather than `text: [u8]`).",
+        example: "struct Scanner { text: [u8], pos: i64 }\n\
+            impl Drop for Scanner { fn drop(self: &mut Scanner) { ... } }\n\
+            \n\
+            scan.tach:2:1: error[own.drop_view] 'Scanner' holds a view ('text: [u8]') and cannot implement Drop\n\
+            \x20 help: implement Drop on the type that owns the text, or let 'Scanner' own it ('text: Buf')",
     },
     Explain {
-        code: "own.readonly", severity: "error (as own.moved)",
-        means: "A write through a shared reference (`&T`) or a read-only slice (`[T]`).",
-        fix: "Take `&mut T` (`&mut x` at the call), or `&mut [T]` (`v.as_mut_slice()`, `&mut \
-            a[..]`).",
-        example: "error[own.readonly] cannot write 'p.x': 'p' is '&P', a shared reference",
+        code: "own.readonly",
+        severity: "error (as own.moved)",
+        means: "A write through a shared reference (`&T`) or a read-only slice (`[T]`, the same \
+            as `&[T]`): an assignment, a compound assignment, a `&mut` borrow or a call of a \
+            method taking `self: &mut Self` through it.",
+        fix: "Take `p: &mut T` and pass `&mut x` at the calls (`tachyonc refactor signature F \
+            --type p '&mut T'` rewrites `&x` to `&mut x` at every call); for a slice, `s: &mut \
+            [T]`, passed as `v.as_mut_slice()` or `&mut a[..]`. `tachyonc fix --values` does \
+            this for every written parameter.",
+        example: "fn reset(p: &P) { p.x = 0; }\n\
+            \n\
+            main.tach:1:20: error[own.readonly] cannot write 'p.x': 'p' is '&P', a shared reference\n\
+            \x20 help: take '&mut P' and pass '&mut x' at the calls\n\
+            \x20 try: tachyonc refactor signature reset --type p '&mut P'",
     },
 ];

@@ -17,15 +17,13 @@ often than to something else; each error names the fix.
 | `CString`, `.as_ptr()` | `c"text"` (a `*u8`); a slice is not NUL-terminated |
 | `match s { "a" => .. }` | `if s == "a" { .. } else if ...` |
 | `x.to_string()`, `s.parse::<i64>()` | `Buf::push_int`; `std::parse_int(s)` (a `Result<i64, ParseIntError>`, 0.15) |
-| `s.trim()`, `s.split(',')`, `s.split_whitespace()` | `std::trim(s)`; `std::split_in(s, ',', gpa)`, `std::split_whitespace_in(s, gpa)`: a `Vec<[u8]>` of views of `s` (free it) |
+| `s.trim()`, `s.split(',')`, `s.split_whitespace()` | `std::trim(s)`; `std::split_in(s, ',', gpa)`, `std::split_whitespace_in(s, gpa)`: a `Vec<[u8]>` of views of `s` |
 
 ```tach
 fn main(gpa: Gpa) -> i32 {
-    let mut b = Buf::new_in(gpa);
-    defer b.free();
+    let mut b = Buf::new_in(gpa);              // freed at the end of main
     b.push_str("sum=");
-    let mut parts = split_in("40,2", ',', gpa);
-    defer parts.free();
+    let parts = split_in("40,2", ',', gpa);
     let mut sum = 0;
     for p in parts.as_slice() {
         sum += parse_int(p).unwrap_or(0);
@@ -45,39 +43,54 @@ not a number
 
 | Rust | tachyon |
 |---|---|
-| `&T`, `&mut T` | `*T`; `&x` is the address of `x`; no lifetimes; `x` need not be `mut` to take `&x` |
-| `*r` on a reference | `*p`; safe on a borrow (`&place`, a pointer parameter), else `unsafe` |
-| `r.field` through a reference | `p.f` (auto-deref, one level) |
-| moves, `Clone`, `Copy` | every value is copied by `=` and by calls (bitwise); no moves |
-| `Drop`, RAII, scope guards | `defer stmt;` runs when the block exits; std types have `free()` |
-| `Box<T>`, `Rc<T>`, `Arc<T>` | none: a `Vec<T>`, or `malloc` in `unsafe` |
+| `&T`, `&mut T`, `&x`, `&mut x` | the same (0.17): checked, no lifetimes written; `&mut x` at the call when the parameter is `&mut T` |
+| `&self`, `&mut self` | `self: &Self`, `self: &mut Self` (written out); calls reference the receiver: `v.push(1)` |
+| `*r`, `r.field` | the same; fields and methods reach through a reference |
+| moves, `Clone`, `Copy` | the same: an owned value (`Vec`, `Buf`, `HashMap`, a struct holding one) moves; `.clone()` copies; plain values copy (no `Copy` derive) |
+| `Drop`, RAII | the same: dropped at the end of the scope, last first; `impl Drop for T { fn drop(self: &mut T) }`; `drop(x)` |
+| `&str`, `&[T]`, `&mut [T]` | `[u8]`, `[T]` (read-only), `&mut [T]` (writable) |
+| lifetimes `'a`, `fn f<'a>(x: &'a str) -> &'a str` | none: each function's view summary is inferred (`query views NAME`); `#[views(s)]` pins one (`guide views`) |
+| the borrow checker | the own pass: `own.moved`, `own.conflict`, `own.escape`... each with `try:` lines (`tachyonc explain own.conflict`) |
+| `Box<T>`, `Rc<T>`, `Arc<T>` | none: a `Vec<T>`, an index, or `malloc` in `unsafe` |
 | `Vec::new()`, the global allocator | `Vec::new_in(gpa)`: allocation is explicit (0.16); `gpa: Gpa` comes from `fn main(gpa: Gpa)` and is passed down; `arena_scope(gpa, \|a\| ..)` (`guide allocators`) |
-| `Option<&T>` | `Option<*T>`, or an index |
-| `&mut v[i]`, `m.get_mut(&k)` | `v[i].f = x` (0.17); `m.get_mut(k)`: an `Option<[V]>`, a view of one element (`a[0].f += 1`) |
+| `Option<&T>` | `Option<T>` of a copy, an index, or a one-element view `[T]` (references as type arguments: 0.17.1) |
+| `&mut v[i]`, `m.get_mut(&k)` | `v[i].f = x`; `m.get_mut(k)`: an `Option<[V]>`, a view of one element (`a[0].f += 1`) |
 | `*m.entry(k).or_insert(0) += 1` | `m.get_or_insert(k, 0)[0] += 1` |
+| `std::mem::take`, `replace` | `std::take(&mut x)`, `std::replace(&mut x, v)` |
 | `Mutex`, threads | none in tachyon (C's threads are C's business) |
 
-A `Vec`, `Buf` or `HashMap` value is a handle (a pointer, a length, a
-capacity). Copying it shares the memory; a push through one copy is not
-seen by the other's length. Pass `&v`:
+Pass a container to a function that changes it as `&mut`, one that reads
+it as `&`; return a new one by value (the caller owns it):
 
 ```tach
-fn fill(v: *Vec<i64>, n: i64) {          // v.push works through the pointer
+fn fill(v: &mut Vec<i64>, n: i64) {      // v.push works through the reference
     for i in 0..n { v.push(i * i); }
+}
+
+fn sum(v: &Vec<i64>) -> i64 {
+    let mut s = 0;
+    for x in v { s += x; }
+    s
 }
 
 fn main(gpa: Gpa) -> i32 {
     let mut v: Vec<i64> = Vec::new_in(gpa);
-    defer v.free();
-    fill(&v, 4);
-    std::print_int(v.len() + v.get(3));
+    fill(&mut v, 4);
+    let r = &mut v;                      // a reference in a local: passed on twice
+    fill(r, 1);
+    fill(r, 1);
+    std::print_int(v.len() + sum(&v));
     println("");
     0
 }
 ```
 ```out
-13
+20
 ```
+
+Before 0.17, `*T` was the one pointer type and `&x` its address: a
+non-`mut` `p: *T` parameter is still accepted (as `&mut T`), and
+`tachyonc fix --values` rewrites such code to references.
 
 ## Errors and Option
 
@@ -196,7 +209,7 @@ fn main() -> i32 {
 
 | Rust | tachyon |
 |---|---|
-| `fn f(&self)`, `&mut self`, `self` | `fn f(self: *T)`, `fn f(self: *T)`, `fn f(self: T)`; `Self` works |
+| `fn f(&self)`, `&mut self`, `self` | `fn f(self: &T)`, `fn f(self: &mut T)`, `fn f(self: T)`; `Self` works (`self: *T`, before 0.17: as `&mut T`) |
 | `'a: loop { break 'a; }` | `a: loop { break :a; }` |
 | `let x;` then assign | `let x = ...;` always |
 | `let Some(x) = o else { .. };` | `let x = match o { Some(x) => x, None => return 1 };` |

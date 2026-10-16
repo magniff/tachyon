@@ -66,6 +66,7 @@ bodies.
 | where it is defined, its signature | `tachyonc query def NAME` |
 | every use | `tachyonc query refs NAME` (`--count`, `--in FILE\|MODULE`; a local: `FN::x`) |
 | who calls a function; what it calls | `tachyonc query callers NAME`; `query callees FN` (`--transitive`) |
+| each local's kind, moves and views there (0.17) | `tachyonc query own main.tach:12:5` |
 | what a function may do: allocate, io, panic... (0.16) | `tachyonc query effects NAME\|MODULE` (`--why io`, `--has alloc(Gpa)`) |
 | a module's items, with signatures | `tachyonc query items MODULE`; every module: `query items` |
 | a module's `use` lines, header comment | `tachyonc query show MODULE::use` (`::header`) |
@@ -102,12 +103,13 @@ an edit then `check`.
 | merge conflicts | `tachyonc query conflicts --show`, then `tachyonc edit resolve FILE:LINE --ours` (`--theirs`, `--both`, `< text`) |
 | rename anything, with every use | `tachyonc refactor rename PATH NEW` |
 | rename a local or parameter | `tachyonc refactor rename FILE:LINE:COL NEW` or `refactor rename FN::x NEW` (shadowing respected) |
-| a parameter, with every call | `tachyonc refactor signature FN --add 'x: i64 = 0'` (a default; `--fill-calls`: each call gets 0; `--remove`, `--rename-param`, `--reorder`, `--type`) |
-| a field, with every literal | `tachyonc refactor field STRUCT --add 'g: i64 = 0'` |
+| a parameter, with every call | `tachyonc refactor signature FN --add 'x: i64 = 0'` (a default; `--fill-calls`: each call gets 0; `--remove`, `--rename-param`, `--reorder`, `--type`; `--type v '&mut T'`: the calls' `&v` become `&mut v`) |
+| a field, with every literal | `tachyonc refactor field STRUCT --add 'g: i64 = 0'` (`--type g T --default EXPR`) |
 | a variant, with every match | `tachyonc refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match) |
 | move items to a module | `tachyonc refactor move PATH --to MODULE` (made when missing) |
 | an idiom everywhere, typed | `tachyonc rewrite 'old($a)' 'new($a)' --dry-run` |
 | imports, unused, pub, unsafe | `tachyonc fix` (`--only imports,unused,pub,unsafe`, `--dry-run`) |
+| `*T` and by-value parameters to `&T`/`&mut T`, with every call (0.17) | `tachyonc fix --values` (`--dry-run`) |
 | the errors' exact fixes (their `try: tachyonc fix --suggested`) | `tachyonc fix --suggested` (`--dry-run`, `--at FILE:LINE`) |
 
 Every edit is atomic: the edited program is checked first, and an edit

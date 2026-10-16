@@ -283,7 +283,7 @@ if ! "$COMPILER" guide --list >"$WORK/list" 2>&1; then
     result FAIL guide-list "tachyonc guide --list failed:" "$(cat "$WORK/list")"
 fi
 missing=""
-for t in core language rust syntax types std errors unsafe c-interop modules generics traits closures iterators conversions formatting memory tools; do
+for t in core language rust syntax types std errors unsafe c-interop modules generics traits closures iterators conversions formatting memory views tools; do
     awk -F '\t' -v t="$t" '$1 == t { found = 1 } END { exit !found }' "$WORK/list" || missing="$missing $t"
 done
 if [ -n "$missing" ]; then
