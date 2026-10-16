@@ -57,7 +57,7 @@ write; another unknown method, the type's nearest methods and `tachyonc
 query items TYPE`, which lists them all.
 
 ```tach
-fn count(s: &str) -> i64 { s.len }
+fn count(s: &str) -> i64 { s.len() }
 ```
 ```err
 error[parser error] expected type, got '&' | help: `&str` is `[u8]` in tachyon: a slice of bytes, as string literals are
@@ -351,7 +351,7 @@ fn main() -> i32 { let a = [1, 2, 3]; sum(a) as i32 }
 ```err
 error[type error] expected '[i64]', got '[i64; 3]'
 ```
-`sum(a[..])`. An array's length is `a.len()` (or `a[..].len`).
+`sum(a[..])`. An array's length is `a.len()`.
 
 ```tach
 let e: IoError = IoError::Read;

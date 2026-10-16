@@ -106,7 +106,7 @@ not drop yet: `unsafe { a.free_all(); }` returns its memory, 0.17),
 fn longest(words: [[u8]], gpa: Gpa) -> i64 {
     arena_scope(gpa, |a| {
         let mut lens: Vec<i64, ScopedArena> = Vec::new_in(a);
-        for w in words { lens.push(w.len); }
+        for w in words { lens.push(w.len()); }
         lens.iter().max().unwrap_or(0)        // an i64 leaves, the Vec does not
     })
 }

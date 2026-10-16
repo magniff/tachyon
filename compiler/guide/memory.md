@@ -101,7 +101,7 @@ let s = v.as_slice();
 print(f"{s[0]} ");                        // used before the pushes
 for i in 0..100 { v.push(i); }            // may move the elements
 let s2 = v.as_slice();                    // a fresh view
-println(f"{s2.len}");
+println(f"{s2.len()}");
 ```
 ```out
 1 101

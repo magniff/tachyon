@@ -105,7 +105,7 @@ From loosest to tightest (all left-associative except where noted):
 | `f()` `a[i]` `a[i..j]` `x.f` `x.0` `x.m()` | `*p.x` is `*(p.x)` |
 
 No `**` (power), no ternary (`if c { a } else { b }` is an
-expression). `e?` (0.15) is postfix, as tight as a call: `parse(s)?.len`
+expression). `e?` (0.15) is postfix, as tight as a call: `parse(s)?.len()`
 (`tachyonc guide conversions`). `return`,
 `break`, `continue` have type `!` and fit anywhere:
 `let v = if ok { x } else { return 1 };`.

@@ -79,7 +79,7 @@ let c = 3u32;             // suffixes; 1_000, 0xff, 0b1010
 let d = 2.5;              // f64; 2.5f32 is f32
 let e = 'A';              // u8: a byte, ASCII only
 let f = true;             // bool
-let s = "bytes";          // [u8]: s.len() (or the field s.len, an i64), s[0], s[1..3]
+let s = "bytes";          // [u8]: s.len() (an i64), s[0], s[1..3]
 let p = c"for C";         // *u8, NUL-terminated
 let t = (1, "two");       // a tuple: t.0, t.1
 let arr = [0; 8];         // [i64; 8]; also [1, 2, 3]; arr[i] is checked
@@ -244,7 +244,7 @@ re-exports. A missing import's error says which `use` line to add, and
 ```tach
 fn sum(xs: [i64]) -> i64 {
     let mut t = 0;
-    for i in 0..xs.len { t += xs[i]; }    // indices are i64; checked
+    for i in 0..xs.len() { t += xs[i]; }    // indices are i64; checked
     t
 }
 
@@ -269,7 +269,7 @@ main.tach:16:20: index out of bounds: index 4, length 4
 ```
 
 An array `[T; N]` is a value (copied by `=`; `a.len()` is N); a slice
-`[T]` is a pointer and a length (`.ptr`, `.len`, `.len()`) viewing an
+`[T]` is a pointer and a length (`.len()`; `.ptr` for C) viewing an
 array, a `Vec` or memory. A `[T]` is read-only; `&mut [T]`
 (`&mut a[..]`, `v.as_mut_slice()`) writes its elements (0.17).
 

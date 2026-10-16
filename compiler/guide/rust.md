@@ -10,7 +10,7 @@ often than to something else; each error names the fix.
 |---|---|
 | `&str`, `String`, `&[u8]` | `[u8]`: a pointer and a length; `"abc"` is one; no UTF-8 type |
 | `String::new()`, `push_str`, `format!` | `std::Buf` (`Buf::new_in(gpa)`): `push`, `push_str`, `push_int`, `push_fmt(f"..")` (or `push_str(f"..")`), `as_slice`; `format_in(f"..", gpa)` |
-| `s.len()` | the same (0.17), an `i64`; or the field `s.len` |
+| `s.len()` | the same, an `i64` |
 | `s == "x"`, `s < t` | the same (std's `Eq` and `Ord` for `[u8]`, by bytes) |
 | `&s[1..3]` | `s[1..3]` (checked) |
 | `s.as_bytes()[0]`, `b'a'` | `s[0]`, `'a'` (a `u8`) |
@@ -143,7 +143,7 @@ too big: 500
 |---|---|
 | `for x in v.iter()`, `for x in &v` | the same (0.14), and `for x in v`: a copy of each element |
 | `for (i, x) in s.iter().enumerate()` | the same (0.14) |
-| `for x in v.iter_mut() { *x += 1 }` | `for i in 0..s.len { s[i] += 1; }` |
+| `for x in v.iter_mut() { *x += 1 }` | `for i in 0..s.len() { s[i] += 1; }` |
 | `.map()`, `.filter()`, `.sum()`, `.collect()` | the same (0.14); `collect_in(gpa)` makes a `Vec` only (`guide iterators`) |
 | `\|x\| x + 1`, `move \|\|` | the same (0.14); a `let mut` is captured by reference, the rest by value (`guide closures`) |
 | `impl Fn(i64) -> i64`, `Box<dyn Fn>` | a generic parameter `F: Fn(i64) -> i64`; none as a result |
@@ -192,7 +192,7 @@ fn main() -> i32 {
 
 | Rust | tachyon |
 |---|---|
-| `usize` for lengths and indices | `i64` (`s.len`, `v.len()`); indexing takes any integer type |
+| `usize` for lengths and indices | `i64` (`s.len()`, `v.len()`); indexing takes any integer type |
 | implicit widening `i32` -> `i64` | the same (0.15), lossless only; `i64::from(x)`; narrowing is `x as i32` |
 | `i32::MAX`, `u8::MIN` | the same (0.15), for the integer types |
 | overflow: panic in debug, wrap in release | always wraps (two's complement) |

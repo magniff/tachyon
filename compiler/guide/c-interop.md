@@ -37,8 +37,8 @@ tachyon has 7 bytes, 1 0.125
 ```
 
 - `c"..."` is a NUL-terminated `*u8`, for C. A `[u8]` slice (`"..."`) is
-  not terminated: pass `s.ptr` and `s.len` to C (`write(1, s.ptr,
-  s.len as u64)`), or copy into a buffer with a 0 at the end.
+  not terminated: pass `s.ptr` and `s.len()` to C (`write(1, s.ptr,
+  s.len() as u64)`), or copy into a buffer with a 0 at the end.
 - A C string to a slice: `unsafe { p[0..c::strlen(p) as i64] }`.
 - Variadic functions (`printf`) take any FFI-safe value; `%ld` for `i64`,
   `%d` for `i32` and `bool`, `%f` for `f64` (and `f32`), `%s` for `*u8`.
