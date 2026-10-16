@@ -6,6 +6,7 @@
 // forms of `op $imm32, %eax`, the MR form for register moves, D1 for
 // shifts by one; branches to labels are relaxed by objfile.tach.
 
+use crate::arch::table::{insn_hex, insn_named, insn_text};
 use crate::back::objfile::{
     ATEXT, FX_X86_BRANCH, FX_X86_GOT, FX_X86_RIP, NameMap, TAIL_JCC, TAIL_JMP, asym, c_bytes,
     emit_relaxable, fixup, here, name_get, name_put, out16, out32, out64, out8,
@@ -592,12 +593,46 @@ fn branch_target(mut cx: *FnCtx, k: i64) -> i64 {
     }
 }
 
+// (0.19) The intrinsics' instructions the table above lacks
+// (compiler/arch/insn_x86.def, arch/table.tach): class `sse` (`op src,
+// dst`, ModRM reg = dst) or `ssei` (`op $imm8, src, dst`), the mandatory
+// prefix, the opcode map (0f, 0f38, 0f3a), REX.W (flag `w`). False when
+// the table has no such mnemonic. (T5 adds VEX.)
+fn x86_table_instruction(mut cx: *FnCtx, name: [u8]) -> bool {
+    unsafe {
+        let k = insn_named(name);
+        if k < 0 {
+            return false;
+        }
+        let class = insn_text(k, 1);
+        let pfx = insn_hex(k, 2);
+        let map = insn_hex(k, 3);
+        let opcode = insn_hex(k, 4);
+        let w = insn_text(k, 5) == "w";
+        let oplen = if map == 0x0f { 2 } else { 3 };
+        let full = map << 8 | opcode;
+        if class == "sse" {
+            need_ops(cx, 2);
+            enc(cx, pfx, false, w, full, oplen, XOPS[1].reg, XOPS[0], false, 0, 0);
+        } else if class == "ssei" {
+            need_ops(cx, 3);
+            enc(cx, pfx, false, w, full, oplen, XOPS[2].reg, XOPS[1], false, XOPS[0].imm, 1);
+        } else {
+            asm_error(cx, c"internal error: an instruction class the encoder does not know");
+        }
+        true
+    }
+}
+
 pub fn x86_instruction(mut cx: *FnCtx, a: i64, b: i64) {
     unsafe {
         for k in 0..OP_COUNT {
             parse_xop(cx, k);
         }
         let v = name_get(&XMN, ATEXT[a..b]);
+        if v == 0 && x86_table_instruction(cx, ATEXT[a..b]) {
+            return;
+        }
         if v == 0 {
             asm_error(cx, c"unknown instruction");
         }
