@@ -27,10 +27,13 @@
 // a usage error or no case to run.
 
 mod repo;
+pub mod program;
+// (0.18 T3: tachyonc fuzz)
+pub mod fuzz;
 
 use crate::base::{
-    BUFS, IntVec, STDOUT, alloc_array, buf_byte, buf_bytes, buf_hex, buf_int, buf_new, buf_slice,
-    buf_str, buf_write_fd, streq, strlen,
+    IntVec, STDOUT, alloc_array, buf_byte, buf_bytes, buf_hex, buf_int, buf_new, buf_slice, buf_str,
+    buf_write_fd, streq, strlen,
 };
 use crate::front::cpp::directives::file_exists;
 use crate::tools::proc::{
@@ -41,6 +44,7 @@ use crate::tools::query::{c_slice, ends_with_c, parse_count};
 use crate::tools::query::diagnostics::{
     PROG, TOOL, diag, put_cword, try_begin, try_end, write_diags,
 };
+use crate::tools::testrun::program::{ACCEPT, CASES, NO_CHECK_ALLOC, NO_CONTRACTS, SEED, run_all};
 use crate::tools::testrun::repo::run_repo;
 use crate::tools::v018::{not_yet, test_option018};
 
@@ -112,7 +116,7 @@ fn usage(why: *u8, word: *u8) -> i64 {
             buf_str(d, word);
             buf_byte(d, '\'');
         }
-        buf_str(d, c"; usage: tachyonc test [FILTER...] [ROOT.tach] [--dir DIR] [--input FILE] [--budget N] [--full] [--timeout S] [-O N] [--no-trace] [--against TACHYONC]\n");
+        buf_str(d, c"; usage: tachyonc test [FILTER...] [ROOT.tach] [--dir DIR] [--input FILE] [--budget N] [--full] [--timeout S] [-O N] [--no-trace] [--against TACHYONC] [--accept] [--cases N] [--seed S] [--no-contracts] [--no-check-alloc]\n");
         2
     }
 }
@@ -126,9 +130,41 @@ fn test_inner(argc: i64, argv: **u8) -> i64 {
         let mut i = 2;
         while i < argc {
             let a = argv[i];
-            // (0.18 T2: --accept, --cases, --seed, ...; tools/v018.tach)
+            // (0.18: the language's tests, tools/testrun/program.tach)
+            if streq(a, c"--accept") || streq(a, c"--no-contracts")
+                || streq(a, c"--no-check-alloc") {
+                if streq(a, c"--accept") {
+                    ACCEPT = true;
+                } else if streq(a, c"--no-contracts") {
+                    NO_CONTRACTS = true;
+                } else {
+                    NO_CHECK_ALLOC = true;
+                }
+                put_cword(ARGS, a);
+                i += 1;
+                continue;
+            }
+            if streq(a, c"--cases") || streq(a, c"--seed") {
+                if i + 1 >= argc {
+                    return usage(c"a value is needed after", a);
+                }
+                if streq(a, c"--cases") {
+                    let n = parse_count(argv[i + 1]);
+                    if n <= 0 {
+                        return usage(c"--cases takes a number, not", argv[i + 1]);
+                    }
+                    CASES = n;
+                } else {
+                    SEED = argv[i + 1];
+                }
+                put_cword(ARGS, a);
+                put_cword(ARGS, argv[i + 1]);
+                i += 2;
+                continue;
+            }
+            // (0.18 T3: --fuzz S; --gen: tools/v018.tach)
             if test_option018(a) {
-                return not_yet(c"test.not-yet", a, c"T2");
+                return not_yet(c"test.not-yet", a, if streq(a, c"--fuzz") { c"T3" } else { c"T2" });
             }
             let valued = streq(a, c"--budget") || streq(a, c"--timeout") || streq(a, c"--dir")
                 || streq(a, c"--input") || streq(a, c"--root") || streq(a, c"-O")
@@ -547,6 +583,17 @@ fn build_key() -> [u8] {
     }
 }
 
+// (0.18) build_key at another level than OPT.
+fn build_key_for(level: *u8) -> [u8] {
+    unsafe {
+        let was = OPT;
+        OPT = level;
+        let key = build_key();
+        OPT = was;
+        key
+    }
+}
+
 // Builds the program into prog when a source is newer (or there is none):
 // false, with its errors printed, when it does not build.
 fn build_program(root: *u8, src_dir: *u8, work: *u8, prog: *u8, out: i64) -> bool {
@@ -750,6 +797,8 @@ fn put_difference(block: i64, want: [u8], got: [u8]) {
     }
 }
 
+// The program at root: its cases and tests (0.18: tools/testrun/program.tach),
+// or one run on --input.
 fn run_program(root: *u8) -> i64 {
     unsafe {
         let out = buf_new();
@@ -766,112 +815,15 @@ fn run_program(root: *u8) -> i64 {
             buf_str(d, c"' (set TMPDIR)\n");
             return 2;
         }
-        let prog = join(work, "prog");
-        if !build_program(root, src_dir, work, prog, out) {
-            buf_write_fd(out, STDOUT);
-            return 1;
-        }
-        let mut names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         if INPUT != 0 as *u8 {
+            let prog = join(work, "prog");
+            if !build_program(root, src_dir, work, prog, out) {
+                buf_write_fd(out, STDOUT);
+                return 1;
+            }
             return run_on_input(root, prog, work, out);
         }
-        let listed = list_cases(tests, &names);
-        if names.count == 0 {
-            if FILTERS.count > 0 && listed {
-                let d = diag(c"error", c"test.no-root");
-                buf_str(d, c"no case in ");
-                buf_str(d, shown);
-                buf_str(d, c"/ matches the filters\n");
-                let t = try_begin(c"test", c_slice(c""), false);
-                put_cword(t, root);
-                try_end(t);
-                return 2;
-            }
-            buf_bytes(out, "test ");
-            buf_str(out, root);
-            buf_bytes(out, ": builds; no tests in ");
-            buf_str(out, shown);
-            buf_bytes(out, "/ (a case: NAME.in, its stdin, and NAME.out, the expected stdout; --input FILE: one run)\n");
-            buf_write_fd(out, STDOUT);
-            return 0;
-        }
-        let mut blocks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let mut failed = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let mut passed = 0;
-        for k in 0..names.count {
-            let name = buf_slice(names.data[k]);
-            let input = case_file(tests, name, ".in");
-            let expect = case_file(tests, name, ".out");
-            let got_path = case_file(work, name, ".got");
-            let err_path = case_file(work, name, ".err");
-            let status = run_case(prog, if file_exists(input) { input } else { 0 as *u8 }, got_path,
-                err_path);
-            let got_b = buf_new();
-            read_file_if(got_path, got_b);
-            let got = normal(buf_slice(got_b));
-            let want_b = buf_new();
-            let has_want = read_file_if(expect, want_b);
-            let want = normal(buf_slice(want_b));
-            let want_exit = expected_exit(case_file(tests, name, ".exit"));
-            let block = buf_new();
-            buf_bytes(block, "FAIL ");
-            buf_bytes(block, name);
-            buf_bytes(block, ": ");
-            if status == -1 || status != want_exit {
-                if status == -1 {
-                    buf_bytes(block, "no exit after ");
-                    buf_int(block, TIMEOUT);
-                    buf_bytes(block, " s (--timeout S)\n");
-                } else {
-                    buf_bytes(block, "exit ");
-                    buf_int(block, status);
-                    buf_bytes(block, " (expected ");
-                    buf_int(block, want_exit);
-                    buf_bytes(block, ")\n");
-                }
-                // (0.17: with --trace, where it failed or ran when stopped)
-                let err = buf_new();
-                read_file_if(err_path, err);
-                put_lines(block, normal(buf_slice(err)), 0, stderr_lines(), "  stderr: ");
-            } else if !has_want {
-                buf_bytes(block, "no ");
-                buf_str(block, shown);
-                buf_byte(block, '/');
-                buf_bytes(block, name);
-                buf_bytes(block, ".out to compare with; it printed ");
-                put_lines_count(block, line_count(got));
-                buf_byte(block, '\n');
-                put_lines(block, got, 0, detail_lines(), "  + ");
-            } else if got != want {
-                put_difference(block, want, got);
-            } else {
-                passed += 1;
-                continue;
-            }
-            blocks.push(block);
-            failed.push(names.data[k]);
-        }
-        buf_bytes(out, "test ");
-        buf_str(out, root);
-        buf_bytes(out, ": ");
-        buf_int(out, passed);
-        buf_bytes(out, " passed");
-        if blocks.count > 0 {
-            buf_bytes(out, ", ");
-            buf_int(out, blocks.count);
-            buf_bytes(out, " failed");
-        }
-        buf_bytes(out, " (");
-        buf_str(out, shown);
-        buf_bytes(out, "/)\n");
-        if blocks.count > 0 {
-            put_failures(out, &blocks, &failed);
-            buf_bytes(out, "(outputs: ");
-            buf_str(out, shown_path(work));
-            buf_bytes(out, "/NAME.got, NAME.err)\n");
-        }
-        buf_write_fd(out, STDOUT);
-        if blocks.count > 0 { 1 } else { 0 }
+        run_all(root, src_dir, tests, shown, work, out)
     }
 }
 
