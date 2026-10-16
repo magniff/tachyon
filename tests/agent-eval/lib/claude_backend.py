@@ -172,12 +172,18 @@ def settings(deny_read, check_hook=None, query_hook=None, extra_hooks=None, tee=
     }
 
 
-def command(prompt, model, check_hook=None, query_hook=None, extra_hooks=None, tee=None):
+def command(prompt, model, check_hook=None, query_hook=None, extra_hooks=None, tee=None,
+            stream_input=False):
+    """The command line. stream_input (0.18, +debrief): the prompt comes on
+    stdin as a stream-json user message instead of the argument, so that
+    the same session can be asked a second message (the debrief); the
+    model sees the same first message either way."""
     claude = shutil.which("claude")
     if not claude:
         raise SystemExit("claude not found on PATH")
-    return [
-        claude, "-p", prompt,
+    head = ([claude, "-p", "--input-format", "stream-json"] if stream_input
+            else [claude, "-p", prompt])
+    return head + [
         "--model", model,
         "--output-format", "stream-json", "--verbose",
         "--setting-sources", "",
@@ -201,23 +207,25 @@ def env(bin_dir):
 
 
 def run(prompt, ws, bin_dir, model, timeout_s, rdir, check_hook=None, query_hook=None,
-        extra_hooks=None, tee=None):
+        extra_hooks=None, tee=None, debrief=None, on_task_done=None):
     """Runs the agent in `ws`; the stream goes to rdir/transcript.jsonl.
     Returns the agent's half of result.json. check_hook: (the hook
     script, its log) for --check-hook and compiler-tools, or None;
     query_hook: the query-first hook script (compiler-tools), or None;
     (0.17) extra_hooks: settings-eval.json's hooks (+test); tee: the
-    hook-tee.py copy, whose log is rdir/hook-output.jsonl."""
+    hook-tee.py copy, whose log is rdir/hook-output.jsonl. (0.18,
+    +debrief) debrief: a second message for the same session once the
+    task's turn has ended (lib/debrief.py); on_task_done() runs between
+    the two (the runner snapshots the workspace there)."""
+    if debrief is not None:
+        return _run_with_debrief(prompt, ws, bin_dir, model, timeout_s, rdir, check_hook,
+                                 query_hook, extra_hooks, tee, debrief, on_task_done)
     tpath = os.path.join(rdir, "transcript.jsonl")
     epath = os.path.join(rdir, "agent.stderr")
     t0 = time.time()
     timed_out = False
     with open(tpath, "wb") as out, open(epath, "wb") as err:
-        e = env(bin_dir)
-        if check_hook:
-            e["TACHYON_CHECK_HOOK_LOG"] = check_hook[1]
-        if tee:
-            e["EVAL_HOOK_OUTPUT_LOG"] = os.path.join(rdir, "hook-output.jsonl")
+        e = _env(bin_dir, rdir, check_hook, tee)
         argv = command(prompt, model, check_hook and check_hook[0], query_hook, extra_hooks, tee)
         with open(os.path.join(rdir, "command.json"), "w") as fh:
             json.dump(argv[:2] + ["(prompt.md)"] + argv[3:], fh, indent=1)
@@ -241,6 +249,198 @@ def run(prompt, ws, bin_dir, model, timeout_s, rdir, check_hook=None, query_hook
             res["error"] = "claude exited %d: %s" % (
                 p.returncode, fh.read()[-300:].decode("utf-8", "replace"))
     return res
+
+
+def _env(bin_dir, rdir, check_hook, tee):
+    e = env(bin_dir)
+    if check_hook:
+        e["TACHYON_CHECK_HOOK_LOG"] = check_hook[1]
+    if tee:
+        e["EVAL_HOOK_OUTPUT_LOG"] = os.path.join(rdir, "hook-output.jsonl")
+    return e
+
+
+# (0.18, +debrief) how long the debrief turn may take, and how long the
+# stream must be quiet after the task's result before it is sent (a
+# background command finishing then starts another turn of the task)
+DEBRIEF_TIMEOUT_S = 240
+QUIET_S = 3.0
+
+
+def user_message(text):
+    return json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n"
+
+
+def _run_with_debrief(prompt, ws, bin_dir, model, timeout_s, rdir, check_hook, query_hook,
+                      extra_hooks, tee, debrief, on_task_done):
+    """The task as run() runs it, but its prompt sent on stdin (stream-json);
+    when the task's turn ends (a `result` event, then QUIET_S without
+    output), on_task_done(), then the debrief as a second user message of
+    the same session, whose events go to rdir/debrief.jsonl. The task's
+    half of result.json comes from transcript.jsonl alone, as without
+    the debrief; the debrief's (its answer, cost, tokens) is
+    res["debrief"]. A task that times out or dies gets no debrief."""
+    import queue
+    import threading
+    tpath = os.path.join(rdir, "transcript.jsonl")
+    dpath = os.path.join(rdir, "debrief.jsonl")
+    epath = os.path.join(rdir, "agent.stderr")
+    t0 = time.time()
+    timed_out = False
+    debrief_out = {"sent": False}
+    lines = queue.Queue()
+
+    def reader(stream):
+        for raw in iter(stream.readline, b""):
+            lines.put(raw)
+        lines.put(None)
+
+    with open(tpath, "wb") as out, open(epath, "wb") as err:
+        e = _env(bin_dir, rdir, check_hook, tee)
+        argv = command(prompt, model, check_hook and check_hook[0], query_hook, extra_hooks, tee,
+                       stream_input=True)
+        with open(os.path.join(rdir, "command.json"), "w") as fh:
+            json.dump(argv + ["(stdin: prompt.md, then debrief-prompt.md)"], fh, indent=1)
+        p = subprocess.Popen(argv, cwd=ws, env=e, stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=err, start_new_session=True)
+        th = threading.Thread(target=reader, args=(p.stdout,), daemon=True)
+        th.start()
+        p.stdin.write(user_message(prompt).encode())
+        p.stdin.flush()
+        deadline = t0 + timeout_s
+        ended = False      # the task's result seen
+        eof = False
+        task_wall = None
+        while True:
+            now = time.time()
+            if now >= deadline:
+                timed_out = not ended
+                break
+            wait = min(deadline - now, QUIET_S) if ended else deadline - now
+            try:
+                raw = lines.get(timeout=wait)
+            except queue.Empty:
+                if ended:
+                    break  # quiet after the result: the task is over
+                continue
+            if raw is None:
+                eof = True
+                break
+            out.write(raw)
+            out.flush()
+            if _event_type(raw) == "result":
+                ended = True
+                task_wall = time.time() - t0
+        if timed_out:
+            kill_group(p)
+        if ended and not eof and not timed_out:
+            if on_task_done:
+                try:
+                    on_task_done()
+                except Exception as x:  # the debrief is skipped, the task stands
+                    debrief_out["error"] = "on_task_done: %r" % x
+            if "error" not in debrief_out:
+                debrief_out = _debrief_turn(p, lines, debrief, dpath)
+        try:
+            p.stdin.close()
+        except OSError:
+            pass
+        try:
+            p.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            kill_group(p)
+            p.wait()
+    wall = task_wall if task_wall is not None else time.time() - t0
+    res = parse_stream(tpath)
+    res["wall_s"] = round(wall, 1)
+    res["exit_code"] = p.returncode
+    if timed_out:
+        res["error"] = "timeout after %ds" % timeout_s
+    elif res.get("error") is None and not ended:
+        with open(epath, "rb") as fh:
+            res["error"] = "claude exited %s before the task's result: %s" % (
+                p.returncode, fh.read()[-300:].decode("utf-8", "replace"))
+    if not debrief_out.get("sent"):
+        debrief_out.setdefault("error", "not asked: " + ("the task timed out" if timed_out
+                                                          else "the session ended"))
+    else:
+        debrief_out.update(parse_debrief(dpath, res.get("cost_usd")))
+    res["debrief"] = debrief_out
+    return res
+
+
+def _event_type(raw):
+    try:
+        return json.loads(raw).get("type")
+    except ValueError:
+        return None
+
+
+def _debrief_turn(p, lines, text, dpath):
+    """Sends the debrief and copies its events to dpath until its result
+    (or DEBRIEF_TIMEOUT_S)."""
+    import queue
+    out = {"sent": True}
+    t0 = time.time()
+    try:
+        p.stdin.write(user_message(text).encode())
+        p.stdin.flush()
+    except OSError as x:
+        return {"sent": False, "error": "could not send: %r" % x}
+    with open(dpath, "wb") as fh:
+        while True:
+            left = t0 + DEBRIEF_TIMEOUT_S - time.time()
+            if left <= 0:
+                out["error"] = "no answer in %ds" % DEBRIEF_TIMEOUT_S
+                break
+            try:
+                raw = lines.get(timeout=left)
+            except queue.Empty:
+                continue
+            if raw is None:
+                out["error"] = "the session ended before the answer"
+                break
+            fh.write(raw)
+            fh.flush()
+            if _event_type(raw) == "result":
+                break
+    out["wall_s"] = round(time.time() - t0, 1)
+    return out
+
+
+def parse_debrief(dpath, task_cost):
+    """The debrief's answer (its assistant text), tool calls, tokens and
+    cost: the session's cumulative total_cost_usd after the debrief minus
+    the task's."""
+    text, calls, total = [], 0, None
+    u = Counter()
+    if not os.path.isfile(dpath):
+        return {"answer": None}
+    with open(dpath, "rb") as fh:
+        for raw in fh:
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            if d.get("type") == "assistant" and d.get("parent_tool_use_id") is None:
+                for c in (d.get("message") or {}).get("content") or []:
+                    if c.get("type") == "text":
+                        text.append(c.get("text") or "")
+                    elif c.get("type") == "tool_use":
+                        calls += 1
+            elif d.get("type") == "result":
+                total = d.get("total_cost_usd")
+                for k in ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                          "cache_creation_input_tokens"):
+                    u[k] += (d.get("usage") or {}).get(k) or 0
+    cost = (round(total - task_cost, 6) if total is not None and task_cost is not None
+            else None)
+    answer = "\n".join(t.strip() for t in text if t.strip()) or None
+    return {"answer": answer, "words": len(answer.split()) if answer else 0,
+            "tool_calls": calls, "cost_usd": cost,
+            "input_tokens": u["input_tokens"] + u["cache_read_input_tokens"]
+            + u["cache_creation_input_tokens"],
+            "output_tokens": u["output_tokens"], "cache_read_tokens": u["cache_read_input_tokens"]}
 
 
 def parse_stream(path):
