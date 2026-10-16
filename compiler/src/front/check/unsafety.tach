@@ -9,21 +9,22 @@
 // pointer), calling an `unsafe fn`, and reading a union's field.
 //
 // A *borrow* is a pointer known to point to live memory of its type: `&p`
-// for a place p, or a parameter declared with a pointer type (and not
-// `mut`), `self: *T` included. Dereferencing a borrow (`*b`, `b.f`, a
-// method through it) is safe; any other pointer is raw. So that borrowed
-// parameters can be trusted, passing a raw pointer where a function takes
-// a pointer parameter is unsafe (and so is calling through a function
-// pointer with one, or using such a function as a value).
+// for a place p, or a reference (`&T`, `&mut T`: a parameter, `self`
+// included, a local, a field, a result). Dereferencing a borrow (`*b`,
+// `b.f`, a method through it) is safe; any other pointer is raw, a `*T`
+// parameter too (0.18.1, V4: through 0.18.0 one not `mut` was a borrow,
+// the legacy `&mut T`); dereferencing one through a `*T` parameter says
+// to make it a reference (`fix --values`). The types keep a raw pointer
+// from a reference parameter, so passing a pointer is always safe.
 //
 // An unsafe operation outside unsafe code is an error (`error[unsafe]`;
 // a warning in 0.9). `--fix-unsafe` wraps them in unsafe blocks
 // (fixunsafe.tach).
 
-use crate::base::{SRC, buf_fmt, buf_new, buf_slice, intern_c};
+use crate::base::{SRC, buf_fmt, buf_new, buf_slice, cstr, intern_c};
 use crate::base::diag::{
-    ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_help_fmt, err_str,
-    err_try_fmt, err_try_tool, error_keyed, report_error_once,
+    ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help_fmt, err_str, err_try_fmt,
+    err_try_tool, error_keyed, report_error_once,
 };
 use crate::front::ambient::check_ambient_call;
 use crate::front::ast::{FN_UNSAFE, NODES, NODE_REF, NodeKind, child};
@@ -36,9 +37,7 @@ use crate::front::check::check_mode::check_expr;
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::generics::env_lookup;
 use crate::front::lexer::Tok;
-use crate::front::types::{
-    FNS, STRUCTS, TYPES, TY_BOOL, TyKind, err_type, fn_param, is_numeric, is_ref,
-};
+use crate::front::types::{FNS, STRUCTS, TYPES, TY_BOOL, TyKind, err_type, is_numeric, is_ref};
 use crate::tools::fixunsafe::{FIX_UNSAFE, note_unsafe_site};
 
 pub static mut UNSAFE_DEPTH: i64 = 0;
@@ -71,8 +70,6 @@ const U_UNSAFE_CALL: i64 = 8;
 
 pub const U_UNION: i64 = 9;
 
-pub const U_PTR_ARG: i64 = 10;
-
 pub const U_FN_VALUE: i64 = 11;
 
 // Operation n, of kind `key`, needs unsafe code.
@@ -91,6 +88,50 @@ pub fn unsafe_op(n: i64, key: i64, message: *u8) {
     }
 }
 
+// (0.18.1, V4) Whether expression e is a parameter written `p: *T` (not
+// `mut`, not `self` of a method of C's): a raw pointer, which until 0.18.1
+// was a borrow.
+fn raw_param(e: i64) -> bool {
+    unsafe {
+        if NODES[e].kind != Ident || NODES[e].res != Res::Local || NODES[e].y < 0 {
+            return false;
+        }
+        let local = NODES[e].y;
+        let t = LOCALS[local].ty;
+        LOCALS[local].is_param && !LOCALS[local].mutable && t > 0 && TYPES[t].kind == TyKind::Ptr
+            && TYPES[t].b == 0
+    }
+}
+
+// Operation n, of kind `key`, through pointer `base` needs unsafe code.
+// Through a `*T` parameter (V4) the help is the parameter's type: `&T`, or
+// `&mut T` when written through, which `fix --values` writes with every
+// call.
+pub fn unsafe_through(n: i64, base: i64, key: i64, message: *u8) {
+    if UNSAFE_DEPTH > 0 || CONST_CONTEXT {
+        return;
+    }
+    if (FIX_UNSAFE && WRAP_NODE != 0) || !raw_param(base) {
+        unsafe_op(n, key, message);
+        return;
+    }
+    unsafe {
+        if error_keyed(NODES[n].start, key) {
+            return;
+        }
+        let p = SRC[NODES[base].start..NODES[base].end];
+        let saved = ERR_KIND;
+        ERR_KIND = c"unsafe";
+        err_begin(NODES[n].start);
+        err_fmt(f"{cstr(message)}: `{p}` is a `*T` parameter");
+        err_help_fmt(f"a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `{p}` one (the first try: changes such parameters, with their calls), or put this in an `unsafe {{ ... }}` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C)");
+        err_try_tool("fix --values", true);
+        err_try_tool("fix --only unsafe", true);
+        err_end_soft();
+        ERR_KIND = saved;
+    }
+}
+
 // (0.17) `p[i]` (`p[a..b]`) on a raw pointer p to a Vec, a Buf or a slice
 // (pointee), outside unsafe code. It indexes the one p points to, checked,
 // as through a borrow; reading through a raw pointer is what is unsafe, so
@@ -102,6 +143,17 @@ pub fn unsafe_view_index(n: i64, base: i64, index: i64, pointee: i64, slicing: b
     }
     if FIX_UNSAFE && WRAP_NODE != 0 {
         note_unsafe_site(WRAP_NODE);
+        return;
+    }
+    if !(FIX_UNSAFE && WRAP_NODE != 0) && raw_param(base) {
+        // (c"..." to a `*u8` parameter: a raw pointer, through 0.18.0)
+        unsafe {
+            if slicing {
+                unsafe_through(n, base, U_SLICE, c"slicing through a raw pointer is unsafe");
+            } else {
+                unsafe_through(n, base, U_INDEX, c"indexing through a raw pointer is unsafe");
+            }
+        }
         return;
     }
     unsafe {
@@ -122,7 +174,7 @@ pub fn unsafe_view_index(n: i64, base: i64, index: i64, pointee: i64, slicing: b
         if NODES[base].kind == Ident && NODES[base].res == Res::Local && NODES[base].y >= 0 {
             let local = NODES[base].y;
             place = LOCALS[local].init;
-            what = if LOCALS[local].is_param { "a `mut` parameter" } else { "a local" };
+            what = if LOCALS[local].is_param { "a `*T` parameter" } else { "a local" };
         } else if NODES[base].kind == Ident && NODES[base].res == Res::Static {
             what = "a static";
         } else if NODES[base].kind == FieldAccess {
@@ -179,7 +231,7 @@ pub fn unsafe_index_zero(n: i64, base: i64, pointee: i64) {
         if !is_borrow(base) {
             report_error_once(NODES[n].start, U_INDEX, c"unsafe",
                 c"indexing a raw pointer is unsafe",
-                c"`p[0]` is pointer arithmetic; the value p points to is `*p` (`*p = x` writes it), unsafe as well through a raw pointer (not a borrow: a `mut` parameter, a local, a field), so put it in an `unsafe { ... }` block (the try: line wraps every such place)",
+                c"`p[0]` is pointer arithmetic; the value p points to is `*p` (`*p = x` writes it), unsafe as well through a raw pointer (not a borrow: a `*T` parameter, a local, a field), so put it in an `unsafe { ... }` block (the try: line wraps every such place)",
                 "fix --only unsafe");
             return;
         }
@@ -197,7 +249,7 @@ pub fn unsafe_index_zero(n: i64, base: i64, pointee: i64) {
         err_begin(NODES[n].start);
         err_fmt(
             f"indexing a pointer is unsafe pointer arithmetic; the value '{b}' points to is `*{b}`");
-        err_help_fmt(f"`{b}[0]` indexes memory from {b}, unchecked (a borrow is one value, not an array); `*{b}` reads and writes the value it points to, safely through a borrow (a pointer parameter not `mut`, `&x`)");
+        err_help_fmt(f"`{b}[0]` indexes memory from {b}, unchecked (a borrow is one value, not an array); `*{b}` reads and writes the value it points to, safely through a borrow (`&T`, `&mut T`, `&x`)");
         let assign = ASSIGNING;
         if assign != 0 && NODES[assign].b == n {
             let rest = SRC[NODES[n].end..NODES[assign].end];
@@ -235,30 +287,12 @@ pub fn check_wrapped(e: i64, expected: i64) -> i64 {
     ty
 }
 
-// Whether parameter node `param` is a borrow: a pointer type as written,
-// not `mut`.
+// Whether parameter node `param` is a borrow: a reference, `&T` or
+// `&mut T` (0.18.1, V4: a `*T` parameter is raw, `mut` or not).
 pub fn is_borrow_param(param: i64) -> bool {
     unsafe {
         let t = NODES[param].b;
-        // (0.17: a reference parameter, `mut` or not)
-        t != 0 && NODES[t].kind == TyPtr && (NODES[param].c == 0 || (NODES[t].p & NODE_REF) != 0)
-    }
-}
-
-pub fn has_borrow_param(f: i64) -> bool {
-    unsafe {
-        if FNS[f].is_extern {
-            return false;
-        }
-        let item = FNS[f].node;
-        for i in 0..NODES[item].count {
-            // (0.17: a `&T` or `&mut T` parameter is checked at the calls
-            // through the value too, by its type)
-            if is_borrow_param(child(item, i)) && !is_ref(fn_param(f, i)) {
-                return true;
-            }
-        }
-        false
+        t != 0 && NODES[t].kind == TyPtr && (NODES[t].p & NODE_REF) != 0
     }
 }
 
@@ -383,8 +417,8 @@ pub fn mark_no_read(target: i64) {
 
 // A direct call n of function f (its arguments in n's list, from `first`
 // on for the ones written after a method's receiver): calling C or an
-// `unsafe fn`, and passing a raw pointer to a borrowed parameter, are
-// unsafe.
+// `unsafe fn` is unsafe. (0.18.1, V4: a pointer parameter is a reference,
+// whose arguments the types check, or raw, which takes any pointer.)
 pub fn check_call_safety(n: i64, f: i64, first: i64) {
     unsafe {
         // (0.16: std's functions of an ambient allocator)
@@ -395,15 +429,6 @@ pub fn check_call_safety(n: i64, f: i64, first: i64) {
         }
         if (FNS[f].attrs & FN_UNSAFE) != 0 {
             unsafe_op(n, U_UNSAFE_CALL, c"calling an `unsafe fn` is unsafe");
-        }
-        let item = FNS[f].node;
-        let count = if NODES[n].count < NODES[item].count { NODES[n].count }
-            else { NODES[item].count };
-        for i in first..count {
-            let arg = child(n, i);
-            if is_borrow_param(child(item, i)) && !is_borrow(arg) {
-                unsafe_op(arg, U_PTR_ARG, c"passing a raw pointer to a pointer parameter is unsafe (the function dereferences it as a borrow): pass `&place` or a pointer parameter");
-            }
         }
     }
 }

@@ -12,9 +12,11 @@ of an `unsafe fn`:
 - indexing or slicing a raw pointer: `p[i]`, `p[lo..hi]` (unchecked);
 - casting an integer to a pointer (except the literal `0`, null);
 - reading a union's field;
-- passing a raw pointer to a pointer parameter, calling a plain `fn`
-  pointer with one, using an `unsafe fn` or a function with pointer
-  parameters as a value.
+- using an `unsafe fn` as a value.
+
+A `*T` is raw wherever it comes from, a parameter too (0.18.1): in Rust's
+terms `*mut T` / `*const T`. Passing, comparing and casting one is safe;
+dereferencing it is not.
 
 ## References and raw pointers
 
@@ -28,11 +30,12 @@ the raw pointer, the escape hatch: nothing checks what it points to.
 - A raw pointer: a `*T` local or field, `malloc`'s result, `c"..."`
   (read-only memory), and `&(*p).f` of a place reached through a raw
   `p`. In `unsafe` code `&*p` makes a reference of it: the code vouches.
-- A `*T` parameter written without `mut`, in a safe function, is
-  accepted as `&mut T` until 0.18.1 (the legacy rule, which ends with
-  0.18.1: from then on every `*T` is raw, `mut` or not; `tachyonc fix
-  --values` rewrites it to `&mut T` or `&T`). A `mut p: *T` parameter
-  and any `*T` of an `unsafe fn` or of C are raw.
+- Every `*T` is raw, a parameter too, `mut` or not (0.18.1; before, a
+  non-`mut` `*T` parameter was checked as `&mut T`). Borrowing is `&T` /
+  `&mut T`: `fn read(x: &i64)`. `tachyonc fix --values` makes such
+  parameters references, with their calls (it keeps raw a pointer that is
+  indexed, compared, cast, stored or given to C); `fix --only unsafe`
+  wraps the rest. `&x` and `&mut x` convert to a `*T` parameter.
 - `p[i]` on a reference to a Vec, a Buf or a slice is the element of the
   one it points to, checked; `p[i]` on a raw pointer is pointer
   arithmetic, unchecked and unsafe. On `out: &mut i64` the value is

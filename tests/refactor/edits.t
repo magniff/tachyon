@@ -32,7 +32,7 @@ pub fn scale(p: Point, k: i64) -> Point {
 
 impl Point {
     // x + y.
-    pub fn sum(self: *Point) -> i64 {
+    pub fn sum(self: &Point) -> i64 {
         self.x + self.y
     }
 }
@@ -43,7 +43,7 @@ $ edit replace geom::area < $T/inputs/area_doc.tach
 replaced crate::geom::area	geom.tach	+2 -3 lines
 % git diff
 diff --git a/geom.tach b/geom.tach
-index 9d87d0e..3cd33d0 100644
+index 1681721..11d94eb 100644
 --- a/geom.tach
 +++ b/geom.tach
 @@ -5,7 +5,7 @@ pub struct Point {
@@ -59,9 +59,15 @@ index 9d87d0e..3cd33d0 100644
 $ edit replace Point::sum --dry-run < $T/inputs/sum_unindented.tach
 --- a/geom.tach
 +++ b/geom.tach
-@@ -20 +20 @@
+@@ -19,2 +19,2 @@
+-    pub fn sum(self: &Point) -> i64 {
 -        self.x + self.y
++    pub fn sum(self: *Point) -> i64 {
 +        self.y + self.x
+geom.tach:20:9: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: tachyonc fix --values main.tach | try: tachyonc fix --only unsafe main.tach  [edited: crate::geom::Point::sum]
+geom.tach:20:18: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: tachyonc fix --values main.tach | try: tachyonc fix --only unsafe main.tach  [edited: crate::geom::Point::sum]
+warning edit.breaks: 2 new errors (dry run)
+[exit 1]
 ## The text as `query show` prints it: its header line is dropped.
 $ edit replace geom::scale --dry-run < $T/inputs/scale_shown.tach
 --- a/geom.tach
@@ -87,6 +93,10 @@ $ edit insert --before Point::sum --dry-run < $T/inputs/diag.tach
 +        self.x - self.y
 +    }
 +
+geom.tach:19:9: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: tachyonc fix --values main.tach | try: tachyonc fix --only unsafe main.tach  [edited]
+geom.tach:19:18: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: tachyonc fix --values main.tach | try: tachyonc fix --only unsafe main.tach  [edited]
+warning edit.breaks: 2 new errors (dry run)
+[exit 1]
 ## Deleting: an item with one blank line; a variant of a one-line enum;
 ## a field (the struct literals need it: refused).
 $ edit delete geom::Corner --dry-run

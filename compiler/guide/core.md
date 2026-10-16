@@ -85,8 +85,10 @@ from C
 Also: `usize` is `i64` (lengths, indices); integers wrap; `a as i32`
 narrows, widening is implicit; `x?`, closures, `impl Trait for T`, `T:
 Trait`, `#[derive(Eq, Debug)]` are Rust's; no `dyn`, `where`, `Box` (a
-`Vec` or `*T`); `&x` and `&mut x` are references (`&T`, `&mut T`,
-0.17), and `p.0`, `p.x` reach through a reference or a pointer; `match e` on
+`Vec` or `&T`); `&x` and `&mut x` are references (`&T`, `&mut T`,
+0.17): the way to borrow, in parameters too; `*T` is a raw pointer
+(Rust's `*mut T`), dereferencing it needs `unsafe` (0.18.1; old code:
+`tachyonc fix --values`); `p.0`, `p.x` reach through a reference; `match e` on
 `e: &E` binds references into it (`E::A(n) => *n`), as Rust does. Arguments may have defaults and names: `fn f(a: i64, b: i64 =
 2)`, `f(1, b: 3)`. The prelude (no `use`) has `Option`, `Result`, `Vec`,
 `Buf`, `HashMap`, `BinaryHeap` and `MinHeap` (priority queues: `pop` the largest, the smallest), `print`, `println`, `format_in`, `Gpa`, `read_line`,
@@ -152,7 +154,8 @@ with its comment: `tachyonc guide --find split_in`.
 | error (short form) | fix |
 |---|---|
 | `non-exhaustive match: 'E::B' is not covered` | an arm for it, or `_ =>` |
-| `calling a C function is unsafe`; `dereference of a raw pointer is unsafe` | `unsafe { ... }`; `tachyonc fix --only unsafe` adds them |
+| `calling a C function is unsafe` | `unsafe { ... }`; `tachyonc fix --only unsafe` adds them |
+| `dereference of a raw pointer is unsafe: 'p' is a '*T' parameter` | a borrow is `p: &T` (`&mut T`): `tachyonc fix --values`; or `unsafe { ... }` |
 | `no 'collections' in module 'std'`; `unknown type 'String'` | std is one module: `use std::name;` (its most used names need none); text is `[u8]`, built in a `Buf` |
 | `allocation is explicit: pass an allocator` | `Vec::new_in(gpa)`, `gpa` from `fn main(gpa: Gpa)` passed down |
 | `expected '&mut P', got '&P'` | `&mut x` at the call |

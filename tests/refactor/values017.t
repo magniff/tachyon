@@ -7,10 +7,11 @@
 ## function used as a value. (T7: the program before the fix is 0.16
 ## code, which the default --values=error rejects: it is built with the
 ## opt-out, 0.16's semantics.)
-$ --values=off main.tach -o prog
-ok: built prog
-% ./prog
-3 3 0 6 0 0 1 9 12
+## (0.18.1, V4: a `*T` parameter is raw, so the program before the fix no
+## longer builds; the output after it is the one 0.16's semantics gave,
+## recorded here before 0.18.1: `3 3 0 6 0 0 1 9 12`. A closure's `*T` annotation is respelled
+## by `fix --suggested`; what the fix keeps raw is wrapped in `unsafe` by
+## `fix --only unsafe`, the second try: of the error.)
 $ fix --values
 fixed 5 parameters to &mut T, 3 parameters to &T, 1 slice parameter to &mut [T], 3 owned parameters to &T (only read), 8 arguments	main.tach	+20 -20 lines
 % cat main.tach
@@ -91,6 +92,13 @@ fn ranked(v: &mut Vec<Stats>) {
     let f = unsafe { by_rank };
     sort_by(v.as_slice(), f);
 }
+$ fix --suggested
+fixed 2 suggested fixes	main.tach	+1 -1 lines
+main.tach:71:43: error[unsafe] access to a field through a raw pointer is unsafe: `a` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `a` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: tachyonc fix --values main.tach | try: tachyonc fix --only unsafe main.tach
+main.tach:71:51: error[unsafe] access to a field through a raw pointer is unsafe: `b` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `b` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: tachyonc fix --values main.tach | try: tachyonc fix --only unsafe main.tach
+note fix.left: 2 errors left (above)
+$ fix --only unsafe
+fixed 1 unsafe block	main.tach	+1 -1 lines
 $ main.tach -o prog
 ok: built prog
 % ./prog

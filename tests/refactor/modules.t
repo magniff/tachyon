@@ -79,8 +79,8 @@ $ refactor rename Point::sum total --dry-run
 --- a/geom.tach
 +++ b/geom.tach
 @@ -12 +12 @@
--    pub fn sum(self: *Point) -> i64 {
-+    pub fn total(self: *Point) -> i64 {
+-    pub fn sum(self: &Point) -> i64 {
++    pub fn total(self: &Point) -> i64 {
 ## A module: its file is renamed too.
 $ refactor rename crate::util tools
 renamed crate::util to tools	3 files	+4 -4 lines
@@ -188,7 +188,7 @@ pub struct Point {
 
 impl Point {
     // x + y.
-    pub fn sum(self: *Point) -> i64 {
+    pub fn sum(self: &Point) -> i64 {
         self.x + self.y
     }
 }
@@ -233,7 +233,7 @@ $ refactor move geom::Point --to crate::shapes
 moved crate::geom::Point to crate::shapes	3 files	+16 -14 lines
 % git diff
 diff --git a/geom.tach b/geom.tach
-index bf000c1..872f916 100644
+index 97f33f8..872f916 100644
 --- a/geom.tach
 +++ b/geom.tach
 @@ -1,19 +1,8 @@
@@ -249,7 +249,7 @@ index bf000c1..872f916 100644
 -
 -impl Point {
 -    // x + y.
--    pub fn sum(self: *Point) -> i64 {
+-    pub fn sum(self: &Point) -> i64 {
 -        self.x + self.y
 -    }
 -}
@@ -272,7 +272,7 @@ index 620be80..2ddb6f5 100644
  
  fn main() -> i32 {
 diff --git a/shapes.tach b/shapes.tach
-index 0c40caf..2869d54 100644
+index 0c40caf..bd6cf2f 100644
 --- a/shapes.tach
 +++ b/shapes.tach
 @@ -1,6 +1,6 @@
@@ -295,7 +295,7 @@ index 0c40caf..2869d54 100644
 +
 +impl Point {
 +    // x + y.
-+    pub fn sum(self: *Point) -> i64 {
++    pub fn sum(self: &Point) -> i64 {
 +        self.x + self.y
 +    }
 +}
@@ -508,7 +508,7 @@ pub struct Point {
 
 impl Point {
     // x + y.
-    pub fn sum(self: *Point) -> i64 {
+    pub fn sum(self: &Point) -> i64 {
         self.x + self.y
     }
 }
@@ -664,7 +664,7 @@ split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
 +
 +impl Point {
 +    // x + y.
-+    pub fn sum(self: *Point) -> i64 {
++    pub fn sum(self: &Point) -> i64 {
 +        self.x + self.y
 +    }
 +}
@@ -703,7 +703,7 @@ split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
 -
 -impl Point {
 -    // x + y.
--    pub fn sum(self: *Point) -> i64 {
+-    pub fn sum(self: &Point) -> i64 {
 -        self.x + self.y
 -    }
 -}

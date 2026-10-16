@@ -53,8 +53,8 @@ pub struct Point {
     pub x: i64,
 }
 $ def len
-crate::geom::V2::len	clash/geom.tach:15:12	method	pub fn len(self: *V2) -> i64	effects: none
-crate::myvec::Vec::len	clash/myvec.tach:11:12	method	pub fn len(self: *Vec) -> i64	effects: none
+crate::geom::V2::len	clash/geom.tach:15:12	method	pub fn len(self: &V2) -> i64	effects: none
+crate::myvec::Vec::len	clash/myvec.tach:11:12	method	pub fn len(self: &Vec) -> i64	effects: none
 std::Vec::len	../../compiler/std/std.tach:157:12	method	pub fn len(self: &Vec<T, A>) -> i64
 std::Buf::len	../../compiler/std/std.tach:459:12	method	pub fn len(self: &Buf<A>) -> i64
 std::HashMap::len	../../compiler/std/std.tach:1143:12	method	pub fn len(self: &HashMap<K, V, A>) -> i64
@@ -62,18 +62,18 @@ std::BinaryHeap::len	../../compiler/std/collections.tach:192:12	method	pub fn le
 std::MinHeap::len	../../compiler/std/collections.tach:288:12	method	pub fn len(self: &MinHeap<T, A>) -> i64
 $ refs V2::len
 # clash/geom.tach
-15:12	def	pub fn len(self: *V2) -> i64 {
+15:12	def	pub fn len(self: &V2) -> i64 {
 # clash/main.tach
 40:17	call	main	mine.push(v.len());
 $ refs myvec::Vec::len
 # clash/main.tach
 47:76	call	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
 # clash/myvec.tach
-11:12	def	pub fn len(self: *Vec) -> i64 {
+11:12	def	pub fn len(self: &Vec) -> i64 {
 $ def V2::add
 <crate::geom::V2 as Add>::add	clash/geom.tach:21:8	method	fn add(self: V2, o: V2) -> V2	effects: none
 $ def Vec::add
-crate::myvec::Vec::add	clash/myvec.tach:15:12	method	pub fn add(self: *Vec, k: i64)	effects: none
+crate::myvec::Vec::add	clash/myvec.tach:15:12	method	pub fn add(self: &mut Vec, k: i64)	effects: none
 $ refs '<V2 as Add>::add'
 # clash/geom.tach
 21:8	def	fn add(self: V2, o: V2) -> V2 {
@@ -93,28 +93,28 @@ $ refs crate::myvec::Vec::add
 # clash/main.tach
 41:10	call	main	mine.add(1);
 # clash/myvec.tach
-15:12	def	pub fn add(self: *Vec, k: i64) {
+15:12	def	pub fn add(self: &mut Vec, k: i64) {
 $ refs Area::area
 # clash/geom.tach
-27:8	def	-><geom::V2 as Area>::area	fn area(self: *V2) -> i64 {
+27:8	def	-><geom::V2 as Area>::area	fn area(self: &V2) -> i64 {
 # clash/main.tach
 27:7	call	twice_generic	-><geom::V2 as Area>::area	x.area() + x.area()
 27:7	call	twice_generic	-><shapes::Square as Area>::area	x.area() + x.area()
 27:18	call	twice_generic	-><geom::V2 as Area>::area	x.area() + x.area()
 27:18	call	twice_generic	-><shapes::Square as Area>::area	x.area() + x.area()
 # clash/shapes.tach
-2:8	def	->shapes::Area::area	fn area(self: *Self) -> i64;
+2:8	def	->shapes::Area::area	fn area(self: &Self) -> i64;
 5:14	call	shapes::Area::twice	-><geom::V2 as Area>::area	self.area() * 2
 5:14	call	shapes::Area::twice	-><shapes::Square as Area>::area	self.area() * 2
-14:8	def	-><shapes::Square as Area>::area	fn area(self: *Square) -> i64 {
+14:8	def	-><shapes::Square as Area>::area	fn area(self: &Square) -> i64 {
 $ refs Area::twice
 # clash/main.tach
 47:61	call	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
 # clash/shapes.tach
-4:8	def	fn twice(self: *Self) -> i64 {
+4:8	def	fn twice(self: &Self) -> i64 {
 $ show '<Square as Area>::area'
 // <crate::shapes::Square as Area>::area	clash/shapes.tach:14-16	effects: none
-    fn area(self: *Square) -> i64 {
+    fn area(self: &Square) -> i64 {
         self.side * self.side
     }
 $ refs crate::shapes::Area
@@ -123,12 +123,12 @@ $ refs crate::shapes::Area
 26:6	type	geom	impl Area for V2 {
 # clash/main.tach
 17:14	use	crate	use shapes::{Area, Shape, Square};
-26:21	type	twice_generic	fn twice_generic<T: Area>(x: *T) -> i64 {
+26:21	type	twice_generic	fn twice_generic<T: Area>(x: &T) -> i64 {
 # clash/shapes.tach
 1:11	def	pub trait Area {
 13:6	type	shapes	impl Area for Square {
 $ def push
-crate::myvec::Vec::push	clash/myvec.tach:7:12	method	pub fn push(self: *Vec, x: i64)	effects: none
+crate::myvec::Vec::push	clash/myvec.tach:7:12	method	pub fn push(self: &mut Vec, x: i64)	effects: none
 std::Vec::push	../../compiler/std/std.tach:238:12	method	pub fn push(self: &mut Vec<T, A>, x: T)
 std::Buf::push	../../compiler/std/std.tach:463:12	method	pub fn push(self: &mut Buf<A>, b: u8)
 std::BinaryHeap::push	../../compiler/std/collections.tach:202:12	method	pub fn push(self: &mut BinaryHeap<T, A>, x: T)
@@ -143,19 +143,19 @@ $ refs crate::myvec::Vec::push
 # clash/main.tach
 40:10	call	main	mine.push(v.len());
 # clash/myvec.tach
-7:12	def	pub fn push(self: *Vec, x: i64) {
+7:12	def	pub fn push(self: &mut Vec, x: i64) {
 $ refs geom::V2
 # clash/geom.tach
 8:12	def	pub struct V2 {
 13:6	type	geom	impl V2 {
-15:23	type	geom::V2::len	pub fn len(self: *V2) -> i64 {
+15:23	type	geom::V2::len	pub fn len(self: &V2) -> i64 {
 20:14	type	geom	impl Add for V2 {
 21:18	type	<geom::V2 as Add>::add	fn add(self: V2, o: V2) -> V2 {
 21:25	type	<geom::V2 as Add>::add	fn add(self: V2, o: V2) -> V2 {
 21:32	type	<geom::V2 as Add>::add	fn add(self: V2, o: V2) -> V2 {
 22:9	init	<geom::V2 as Add>::add	V2 { x: self.x + o.x, y: self.y + o.y }
 26:15	type	geom	impl Area for V2 {
-27:20	type	<geom::V2 as Area>::area	fn area(self: *V2) -> i64 {
+27:20	type	<geom::V2 as Area>::area	fn area(self: &V2) -> i64 {
 # clash/main.tach
 16:19	use	crate	use geom::{Point, V2};
 35:13	init	main	let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
@@ -220,7 +220,7 @@ $ refs a
 15:5	mod	crate	use a::helper as a_helper;
 33:13	mod	main	let p = a::Point { x: Point(n) };
 $ def twice_generic
-crate::twice_generic	clash/main.tach:26:4	fn	fn twice_generic<T: Area>(x: *T) -> i64
+crate::twice_generic	clash/main.tach:26:4	fn	fn twice_generic<T: Area>(x: &T) -> i64
 $ callers twice_generic
 # clash/main.tach
 47:17	call	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
@@ -238,11 +238,11 @@ $ items geom
 4	fn	pub fn Point(x: i64) -> i64
 8	struct	pub struct V2
 13	impl	impl V2
-15	method	pub fn len(self: *V2) -> i64
+15	method	pub fn len(self: &V2) -> i64
 20	impl	impl Add for V2
 21	method	fn add(self: V2, o: V2) -> V2
 26	impl	impl Area for V2
-27	method	fn area(self: *V2) -> i64
+27	method	fn area(self: &V2) -> i64
 $ items crate
 # crate	clash/main.tach
 3	mod	mod a
@@ -252,7 +252,7 @@ $ items crate
 7	mod	mod myvec
 9	mod	mod sys
 21	fn	fn printf(x: i64) -> i64
-26	fn	fn twice_generic<T: Area>(x: *T) -> i64
+26	fn	fn twice_generic<T: Area>(x: &T) -> i64
 30	fn	fn main(gpa: Gpa) -> i32
 $ items sys
 # crate::sys	clash/main.tach
@@ -269,9 +269,9 @@ $ refs MyVec
 # clash/myvec.tach
 2:12	def	pub struct Vec {
 6:6	type	myvec	impl Vec {
-7:24	type	myvec::Vec::push	pub fn push(self: *Vec, x: i64) {
-11:23	type	myvec::Vec::len	pub fn len(self: *Vec) -> i64 {
-15:23	type	myvec::Vec::add	pub fn add(self: *Vec, k: i64) {
+7:28	type	myvec::Vec::push	pub fn push(self: &mut Vec, x: i64) {
+11:23	type	myvec::Vec::len	pub fn len(self: &Vec) -> i64 {
+15:27	type	myvec::Vec::add	pub fn add(self: &mut Vec, k: i64) {
 note query.alias: 'MyVec' is an import alias in crate, for crate::myvec::Vec
 $ refs a_helper
 # clash/a.tach

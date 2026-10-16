@@ -10,7 +10,7 @@ $ items crate shapes --comments
 15	struct	pub struct Counter
 19	impl	impl Counter
 20	method	pub fn new() -> Self
-24	method	pub fn bump(self: *Counter) -> i64
+24	method	pub fn bump(self: &mut Counter) -> i64
 30-56	section	Shapes
 32-32	comment	(the shapes come from shapes.tach)
 34	fn	fn make(k: i64) -> Shape
@@ -36,7 +36,7 @@ impl Counter {
         Self { n: 0 }
     }
 
-    pub fn bump(self: *Counter) -> i64 {
+    pub fn bump(self: &mut Counter) -> i64 {
         self.n += 1;
         self.n
     }
@@ -131,7 +131,7 @@ $ refs Counter COUNT
 19:6	type	crate	->Counter	impl Counter {
 20:21	type	Counter::new	->Counter	pub fn new() -> Self {
 21:9	init	Counter::new	->Counter	Self { n: 0 }
-24:24	type	Counter::bump	->Counter	pub fn bump(self: *Counter) -> i64 {
+24:28	type	Counter::bump	->Counter	pub fn bump(self: &mut Counter) -> i64 {
 36:9	write	make	->COUNT	COUNT = COUNT + 1;
 36:17	read	make	->COUNT	COUNT = COUNT + 1;
 43:13	type	twice_area	->Counter	let c = Counter::new();

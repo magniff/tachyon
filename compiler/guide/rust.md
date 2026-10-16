@@ -88,9 +88,10 @@ fn main(gpa: Gpa) -> i32 {
 20
 ```
 
-Before 0.17, `*T` was the one pointer type and `&x` its address: a
-non-`mut` `p: *T` parameter is still accepted (as `&mut T`), and
-`tachyonc fix --values` rewrites such code to references.
+`*T` is Rust's `*mut T` / `*const T`: dereferencing it needs `unsafe`,
+a parameter too (0.18.1). Before 0.17, `*T` was the one pointer type and
+`&x` its address; `tachyonc fix --values` rewrites such code to
+references.
 
 ## Errors and Option
 
@@ -154,8 +155,8 @@ too big: 500
 
 A function value is `fn(A) -> R`, a plain function, no environment.
 Its parameters may be references (`fn(&mut Sum, i64)`, 0.17); a
-function with raw `*T` parameters used as a value is called in
-`unsafe` (its callee is not checked):
+function with `*T` parameters is a value like any other (an `unsafe fn`
+as a value is unsafe):
 
 ```tach
 struct Sum { total: i64 }
@@ -212,7 +213,7 @@ fn main() -> i32 {
 
 | Rust | tachyon |
 |---|---|
-| `fn f(&self)`, `&mut self`, `self` | `fn f(self: &T)`, `fn f(self: &mut T)`, `fn f(self: T)`; `Self` works (`self: *T`, before 0.17: as `&mut T`) |
+| `fn f(&self)`, `&mut self`, `self` | `fn f(self: &T)`, `fn f(self: &mut T)`, `fn f(self: T)`; `Self` works (`self: *T` is the raw pointer, 0.18.1) |
 | `'a: loop { break 'a; }` | `a: loop { break :a; }` |
 | `let x;` then assign | `let x = ...;` always |
 | `let Some(x) = o else { .. };` | the same (0.18.1); the block must leave (`return`, `break`, `continue`, `panic`) |
@@ -240,7 +241,7 @@ fn main() -> i32 {
 | `extern crate`, Cargo dependencies | none: one program from its files; C through headers |
 | `pub use` | the same |
 | `std::collections::HashMap` | `std::HashMap` |
-| `std::io::stdin().read_line(&mut s)` | `std::read_line(&buf)`: the line without its `'\n'`; `Ok(false)` at the end of input |
+| `std::io::stdin().read_line(&mut s)` | `std::read_line(&mut buf)`: the line without its `'\n'`; `Ok(false)` at the end of input |
 | `io::read_to_string(io::stdin())` | `std::read_stdin_in(gpa)`, a `Result<Buf, IoError>`; `std::Scanner` for its tokens, numbers and lines |
 | `std::env::args()` | `fn main(argc: i32, argv: **u8) -> i32` |
 

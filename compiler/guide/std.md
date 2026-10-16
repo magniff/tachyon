@@ -146,7 +146,7 @@ MinHeap: `tachyonc guide --find dijkstra`.
 
 ## Input
 
-`read_line(&buf)` reads stdin a line at a time: the line goes into the
+`read_line(&mut buf)` reads stdin a line at a time: the line goes into the
 `Buf` without its `'\n'`, and the result is `Ok(false)` at the end of
 input (an empty line is `Ok(true)` with an empty `buf`; a read error is
 `Err(IoError::Read)`). `read_stdin_in(gpa)` returns all of stdin that is left

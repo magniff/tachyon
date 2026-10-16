@@ -40,7 +40,7 @@ on the command line make one program; `mod name;` loads `name.tach`.
 | Rust | tachyon |
 |---|---|
 | `String`, `&str` | `[u8]`, a byte slice: `"text"` is a `[u8]`; build text with `std::Buf`; `c"text"` is a NUL-terminated `*u8` for C |
-| `&T`, `&mut T`, `Box<T>` | `&T`, `&mut T` (0.17): `&x`, `&mut x`, checked and safe; no lifetimes; `*T` is the raw pointer (a `*T` parameter is still taken as `&mut T`); no `Box` |
+| `&T`, `&mut T`, `Box<T>` | `&T`, `&mut T` (0.17): `&x`, `&mut x`, checked and safe; no lifetimes; `*T` is the raw pointer: dereferencing it needs `unsafe`, parameter or not (0.18.1); no `Box` |
 | `fn f(&self)`, `fn f(&mut self)` | `fn f(self: &T)`, `fn f(self: &mut T)` (0.17); `fn f(self: T)` takes the value (an owned one moves) |
 | `use m::*;` | not allowed: `use m::{a, b};`, or the path `m::a` |
 | `println!("{}", x)`, `format!` | no macros: `println(f"x = {x:>4} {v:?}")`, `format_in(f"..", gpa)` (a `Buf`) (`guide formatting`) |
@@ -383,7 +383,7 @@ fn main(gpa: Gpa) -> i32 {
 ## Input, output, arguments
 
 std prints and reads stdin: `read_stdin_in(gpa)` (all of it, a
-`Result<Buf, IoError>`), `read_line(&buf)` (the next line, without its
+`Result<Buf, IoError>`), `read_line(&mut buf)` (the next line, without its
 `'\n'`; `Ok(false)` at the end), `Scanner` (tokens, numbers, lines of a
 text), `parse_int` (a `Result`), `split_in`, `trim` (`guide conversions`:
 Option means absent, Result failed). Files go through C (`fopen`):
@@ -434,8 +434,8 @@ fn main() -> i32 {
 Unsafe operations: calling C or an `unsafe fn`, dereferencing (`*p`,
 `p.f`) or indexing (`p[i]`) a raw pointer, reading a union field. A
 reference (`&T`, `&mut T`) is safe to read and write through wherever
-it is kept, and so is a `*T` parameter (taken as `&mut T` in 0.17); any
-other `*T` (a local or field of that type, a C result) is raw.
+it is kept; every `*T` is raw, a parameter too (0.18.1: `mut` or not;
+`fix --values` makes a parameter a reference).
 `tachyonc fix --only unsafe` wraps what needs it; `#[repr(C)]`, callbacks
 and linking: `guide c-interop`.
 

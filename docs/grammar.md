@@ -360,14 +360,15 @@ run time and in constant folding, which agree):
 **Safe code has no undefined behaviour** *(0.9)*. Everything that can
 have undefined behaviour is an *unsafe operation*, allowed only in unsafe
 code: inside an `unsafe { ... }` block or the body of an `unsafe fn` (see
-"Unsafe code" below for the rules, including borrowed pointer
+"Unsafe code" below for the rules, including raw pointer
 parameters). The unsafe operations, and what they promise:
 
 - Dereferencing a raw pointer (`*p`, `p.f`, a method called through `p`)
   that does not point to live memory of its type and alignment: null,
   dangling (freed, or a returned local's address), out of bounds or
-  misaligned. A *borrow* (`&place`, or a pointer parameter) is not a raw
-  pointer: dereferencing it is safe.
+  misaligned. A *borrow* (`&T` / `&mut T`: `&place`, a reference
+  parameter) is not a raw pointer: dereferencing it is safe. Every `*T`
+  is raw, a parameter too (0.18.1).
 - Indexing a raw pointer, `p[i]` (unchecked by design: a pointer has no
   length), and slicing one, `p[lo..hi]` (the slice is only as valid as
   the memory behind it). On a raw pointer to a Vec, a Buf or a slice they
@@ -383,10 +384,10 @@ parameters). The unsafe operations, and what they promise:
 - Calling an `unsafe fn`, whose contract the caller keeps.
 - Reading a field of a union (its bytes, reinterpreted). Writing one, and
   taking its address, are safe.
-- Passing a pointer that is not a borrow to a function's pointer
-  parameter (which the function dereferences as a borrow), calling a
-  plain function pointer with one, and using an `unsafe fn` or a function
-  with pointer parameters as a value.
+- Using an `unsafe fn` as a value. (Until 0.18.0 also passing a raw
+  pointer to a pointer parameter, and using a function with pointer
+  parameters as a value; 0.18.1: a `*T` parameter is raw, so both are
+  safe.)
 
 What unsafe code must keep, so that the safe code around it stays
 defined, is the same list: every pointer it hands to safe code as a
@@ -710,7 +711,7 @@ whole API, from that source: `tachyonc guide std` (0.17: a line per
 item; with the comments, `guide std#every-item`; one name, `guide --find
 NAME`).
 
-0.14 adds reading stdin without `unsafe` (`read_line(&buf)`, a line
+0.14 adds reading stdin without `unsafe` (`read_line(&mut buf)`, a line
 without its `'\n'`, false at the end of input; `read_stdin()`, all of
 it), text helpers (`parse_int` to an `Option<i64>`, `trim`, `split`,
 `split_whitespace`, `is_space`, `is_digit`, and `Scanner`: `next_token`,
@@ -860,8 +861,7 @@ unsafe_block = "unsafe" block ;                        (* an expression, block-l
 An `unsafe { ... }` block is a block whose statements are *unsafe code*:
 the operations listed in "Undefined behaviour" (dereferencing, indexing
 and slicing raw pointers, integer-to-pointer casts, calling C or an
-`unsafe fn`, reading a union's field, passing raw pointers where
-borrows are expected) are allowed in it. Like any block, it is an
+`unsafe fn` or using one as a value, reading a union's field) are allowed in it. Like any block, it is an
 expression (`let x = unsafe { *p };`) and a block-like statement. The
 body of an `unsafe fn` is unsafe code; calling one is an unsafe
 operation, so its callers take on its contract (document it next to the
@@ -879,26 +879,26 @@ fn main() -> i32 {
 }
 ```
 
-**Borrows.** Tachyon has raw pointers only, and methods take
-`self: *T`; to keep ordinary code safe, a pointer known to be valid is a
-*borrow*:
+**Borrows and raw pointers** *(0.18.1)*. A *borrow* is a reference,
+`&T` or `&mut T`: `&place` (the address of a local, a static, a field or
+a checked element) and the receiver a method call takes that way
+(`v.push(1)`), kept in a parameter, a local or a field. Dereferencing a
+borrow (`*p`, `p.f`, `p.m()`) is safe; indexing one is safe when it
+points to a Vec, a Buf or a slice (0.17: it indexes the pointee,
+checked).
 
-- `&place` (the address of a local, a static, a field or a checked
-  element), and the receiver a method call takes that way (`v.push(1)`);
-- a parameter declared with a pointer type and not `mut`, `self: *T`
-  included.
-
-Dereferencing a borrow (`*p`, `p.f`, `p.m()`) is safe; indexing it
-(`p[i]`) is not (a borrow is one value, not an array), except that a
-pointer to a Vec, a Buf or a slice indexes its pointee (0.17). In exchange, a
-call passing something other than a borrow to a pointer parameter (a
-pointer field, a local holding a pointer, `malloc`'s result, `c"..."`,
-which is read-only memory) is unsafe: the caller vouches for it. A
-parameter of a generic type (`x: T`) is not a borrow, even when `T` is a
-pointer, so `Vec<*u8>::push(c"text")` is safe. A plain function pointer
-does not say whether its function borrows: calling one with a pointer
-argument that is not a borrow is unsafe, and so is making a function
-with pointer parameters into a value (`let f = add_one;`).
+Every `*T` is a raw pointer, as in Rust: a parameter too, `mut` or not
+(before 0.18.1 a non-`mut` `*T` parameter of a safe function was
+checked as `&mut T`: the legacy rule, gone). Dereferencing, indexing,
+field access and a method call through a `*T` need `unsafe`, except a
+method whose own `self` is `*T`, which takes the pointer as it is.
+Passing a pointer on to a `*T` parameter, comparing and casting one are
+safe, and so is using a function with pointer parameters as a value;
+`&x` and `&mut x` convert to a `*T`. The error is `dereference of a raw
+pointer is unsafe: `p` is a `*T` parameter`, with `try: tachyonc fix
+--values` (parameters to `&T` / `&mut T`, with their calls; it keeps raw
+a pointer that is indexed, compared, cast, stored or given to C) and
+`try: tachyonc fix --only unsafe`.
 
 **Diagnostics.** An unsafe operation outside unsafe code is an error,
 `error[unsafe]` (each place once, in source order, with the other
@@ -992,8 +992,8 @@ numbers all of them, every type with `==` `Eq`, numbers, pointers and
 fieldless enums `Ord`. Compound assignment (`+=`) stays numeric.
 
 **std** (0.9): the traits `Add`, `Sub`, `Mul`, `Div`, `Neg`, `Eq`, `Ord`,
-`Hash` (`fn hash(self: &Self) -> u64`; 0.17: `&Self`, and an impl's
-legacy `*Self` is taken as `&Self`), in the prelude; impls of `Eq`,
+`Hash` (`fn hash(self: &Self) -> u64`; 0.17: `&Self`; an impl spells it, 0.18.1: `self: *Self`
+is an error), in the prelude; impls of `Eq`,
 `Ord` and `Hash` for the integer types, `bool` and `[u8]` (byte strings:
 by bytes, lexicographically, FNV-1a); `sort<T: Ord>(s: [T])` (in place,
 not stable; a heapsort, an introsort from 0.14); and `HashMap<K: Hash + Eq, V>` (open addressing
@@ -1533,12 +1533,12 @@ type  += "&" type | "&" "mut" type  (* "&" "[" type "]" is the slice type itself
 **References** (value semantics, Phase 0;
 [design/value-semantics.md](design/value-semantics.md) §2.3). `&T` is a
 shared reference and `&mut T` an exclusive one: `&x` and `&mut x` take
-them, and reading through one is safe (`let r = &p; r.x`), as through a
-pointer parameter. `&[T]` is `[T]`; `&mut [T]` is the exclusive slice
+them, and reading through one is safe (`let r = &p; r.x`), but
+not through a `*T`. `&[T]` is `[T]`; `&mut [T]` is the exclusive slice
 (`&mut a[..]`). A reference converts where a raw `*T` is wanted, `&mut T`
 where `&T` is, `&mut [T]` where `[T]` is, and a reference to a slice where
-the slice is (`f(&s)`). A `*T` parameter not written `mut` takes `&x` and
-`&mut x` alike (until 0.18 it is checked as `&mut T`). `&x` where `&mut T`
+the slice is (`f(&s)`). `&x` and `&mut x` both convert to a `*T`
+parameter, which is raw (0.18.1). `&x` where `&mut T`
 is wanted is an error naming `&mut x`. A place reached through a raw
 pointer still gives a raw pointer (`&*p` gives a reference). Function
 attributes `#[views(a, *b)]` and `#[stores(c)]` declare a view summary.
@@ -1581,8 +1581,8 @@ indexed (`m.get(k)` is an Option: Rust's `m[k]` panics). On any pointer
 to a Vec, a Buf or a slice, `p[i]`, `p[i] = x`, `&p[i]` and `p[a..b]`
 index the pointee (`p.as_slice()[i]`, `(*p)[i]`), checked, as `p.get(i)`
 is: the type decides what they mean. Whether the pointer is a borrow
-decides only safety: through a borrow (a pointer parameter, `&v`) they
-are safe; through a raw pointer (a `mut` parameter, a local, a field, a
+decides only safety: through a borrow (`&T` / `&mut T`, `&v`) they
+are safe; through a raw pointer (a `*T` parameter, a local, a field, a
 static) they read through it, so they are `unsafe` (the error's try: is
 `fix --only unsafe`, or `v[i]` for a local `let p = &v;`). The type is
 the one written in the source, not an instance's: where p points, as
@@ -1600,17 +1600,16 @@ value it points to (`try: *out = acc` for `out[0] = acc`).
 **std on values** (value semantics, T4). `v[i] = x`, `v[i] += x`,
 `v[i].f = x` and `&mut v[a..b]` go through `v.as_mut_slice()` (an
 exclusive view; reads through `v.as_slice()`). Until 0.18 a `[T]` is
-accepted where `&mut [T]` is wanted (`sort(v.as_slice())`, `sort(s)`),
-as a legacy `*T` parameter takes `&x`: the call takes the exclusive
-loan. A function or closure whose parameter is written `*T` satisfies an
-`Fn` bound's `&T` (`sort_by(|a: *T, b: *T| ..)`), and a function whose
-pointer parameters are all references is safe to use as a value. A
+accepted where `&mut [T]` is wanted (`sort(v.as_slice())`, `sort(s)`):
+the call takes the exclusive loan. A closure parameter annotated `*T`
+where the bound wants `&T` is an error (0.18.1; `fix --suggested`
+writes `&T`); a function with pointer parameters is a value like any. A
 struct or enum that owns nothing (no Vec, Buf, HashMap or Drop in it)
 is `Clone` without an impl, by copying, as numbers are. A method may
 take `self: &mut [T]`, called on a slice (`s.swap(i, j)`, `s.sort()`).
 
 **Through a pointer.** `p.0` on a `*(A, B)` is `(*p).0`, as `p.x` on a
-`*S` is `(*p).x`: safe when `p` is a borrow (a parameter, `&x`),
+`*S` is `(*p).x`: safe when `p` is a borrow (`&T`, `&mut T`, `&x`),
 `unsafe` on a raw pointer.
 
 **`len()`.** `s.len()` on a slice is its field `s.len`; `a.len()` on

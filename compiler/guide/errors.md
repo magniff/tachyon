@@ -396,6 +396,16 @@ A closure that captures is no plain `fn`: `fn run<F: Fn(i64) -> i64>(f:
 F) -> i64`. One that captures nothing converts.
 
 ```tach
+fn apply<F: Fn(&i64) -> i64>(f: F) -> i64 { let x = 1; f(&x) }
+fn main() -> i32 { apply(|a: *i64| 1); 0 }
+```
+```err
+error[type error] closure parameter of type '*i64' where '&i64' is wanted
+```
+A `*T` is a raw pointer (0.18.1), not a reference: annotate `&i64` as the
+bound does, or leave the parameter untyped (`fix --suggested` writes it).
+
+```tach
 fn apply<F: Fn(i64)>(f: F) { f(1); }
 fn main() -> i32 {
     let mut total = 0;
@@ -553,6 +563,17 @@ error[parser error] 'dyn' is a reserved keyword
 ```
 No trait objects: `fn f<T: A>(x: &T)`, or an enum of the cases.
 
+```tach
+struct K { n: i64 }
+impl Ord for K { fn cmp(self: *K, o: *K) -> i64 { 0 } }
+fn main() -> i32 { 0 }
+```
+```err
+error[type error] 'cmp' takes 'self' as a raw pointer where trait 'Ord' declares '&K'
+```
+An impl spells the trait's references (`self: &K, o: &K`); `tachyonc fix
+--values` respells every such impl.
+
 ## Modules and imports
 
 ```tach
@@ -589,7 +610,7 @@ is next to a submodule's file belongs in the root.
 fn main() -> i32 { let text = read_to_string(); 0 }
 ```
 ```err
-error[type error] undefined variable 'read_to_string' | help: std reads stdin: `read_stdin_in(gpa)` (all of it, a Buf), `read_line(&buf)` (one line, Ok(false) at the end), `Scanner` (tokens)
+error[type error] undefined variable 'read_to_string' | help: std reads stdin: `read_stdin_in(gpa)` (all of it, a Buf), `read_line(&mut buf)` (one line, Ok(false) at the end), `Scanner` (tokens)
 ```
 std's items outside the prelude get their `use` line (`add `use
 std::is_digit;``) or the nearest std name; an unknown function with neither points to `tachyonc
@@ -690,32 +711,33 @@ fn first(p: *i64) -> i64 { p[1] }
 ```err
 error[unsafe] indexing a raw pointer is unsafe
 ```
-A pointer is one value; for many, take a slice `[i64]`. A pointer to a
-Vec, a Buf or a slice (`v: *Vec<i64>`) indexes what it points to, checked:
-safely through a parameter, in `unsafe` through a raw one (`let p = &v;`:
-index `v`).
+A pointer is one value; for many, take a slice `[i64]`. A reference to
+a Vec, a Buf or a slice (`v: &Vec<i64>`) indexes what it points to,
+checked and safe; through a `*T` it needs `unsafe` (`let p = &v;`: index
+`v`).
 `out[0] = acc` meant to write through the pointer: the error's try: is
 `*out = acc`, safe through a borrow.
 
 ```tach
 fn read(x: *i64) -> i64 { *x }
-struct H { p: *i64 }
-fn get(h: H) -> i64 { read(h.p) }
 ```
 ```err
-error[unsafe] passing a raw pointer to a pointer parameter is unsafe
+error[unsafe] dereference of a raw pointer is unsafe: `x` is a `*T` parameter
 ```
-A `*T` field is a raw pointer: vouch for it in `unsafe { read(h.p) }`,
-or hold a reference (`struct H { p: &mut i64 }`, 0.17).
+A `*T` parameter is a raw pointer (0.18.1), as in Rust. Make it a
+borrow, `x: &i64` (`&mut i64` when written through; `tachyonc fix
+--values` changes such parameters with their calls), or vouch for it in
+`unsafe { *x }` (`fix --only unsafe`). The same for a field access, a
+method call and an index through it.
 
 ```tach
-fn add(p: *i64, x: i64) { *p += x; }
-fn main() -> i32 { let f = add; 0 }
+unsafe fn danger() -> i64 { 1 }
+fn main() -> i32 { let f = danger; 0 }
 ```
 ```err
-error[unsafe] using an `unsafe fn`, or a function with pointer parameters, as a value is unsafe
+error[unsafe] using an `unsafe fn` as a value is unsafe
 ```
-`let f = unsafe { add };` and call it in `unsafe` too.
+Call it in `unsafe`, or wrap it in a safe `fn`.
 
 ```tach
 fn main() -> i32 { std::print_cstr(c"x"); 0 }

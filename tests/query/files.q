@@ -11,6 +11,6 @@ crate::util::half	text/util.tach:5:8	fn	pub fn half(x: i64) -> i64	effects: none
 $ show clash/geom.tach:16
 // crate::geom::V2::len	clash/geom.tach:14-17	effects: none
     /// Its squared length.
-    pub fn len(self: *V2) -> i64 {
+    pub fn len(self: &V2) -> i64 {
         self.x * self.x + self.y * self.y
     }
