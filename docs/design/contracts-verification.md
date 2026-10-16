@@ -1258,6 +1258,82 @@ compiled programs' output is unchanged.
 8. **Acceptance:** `same-output` against night-final's compiler is identical;
    the suite passes; bench is within noise.
 
+### Phase 0 contract (as built on b18-phase0)
+
+Phase 0 was built on release-0.17 (0.16's compiler builds it), next to
+0.17's phase 0 (c17-phase0) and 0.19's (a19-phase0), which will be merged
+with it. So it changes the shared front-end files as little as it can:
+everything it reads goes to side tables keyed by node (no field or kind
+is added to the AST's `Node`), and each shared file gets one-line hooks.
+
+**What phase 0 does.**
+- The parser reads clauses, invariants, `distinct` and the test
+  attributes (front/parser/clauses.tach) into front/contracts's tables:
+  `CLAUSE_OWNER/KIND/COND/MESSAGE/POS` (`add_clause`, `clause_count`),
+  `DISTINCT_ALIASES` (`mark_distinct`, `is_distinct`), `TEST_ITEM/KIND`
+  (`add_test_item`, `test_kind`; TEST_FN, TEST_PROPERTY, TEST_FUZZ,
+  TEST_CFG).
+- `check_program` calls `check_contracts()` (empty) before
+  `exit_if_errors`. Conditions are not checked: a clause's names are not
+  resolved, and `query refs` does not see them yet.
+- A distinct alias is a transparent alias; test items are compiled as
+  ordinary items.
+- `lower_check(.., site: i64 = 0)` and `emit_panic(kind, site: i64 = 0)`
+  take a site (always 0, unused); front/contracts/sites.tach has
+  `site_of` (returns 0) and the kinds.
+- main reads `--debug-contracts`, `-j N` / `-jN` (kept in
+  `front::contracts::flags::JOBS`, the compiler still runs on one thread)
+  and `--coverage` (an error naming T3).
+- `tachyonc test --accept|--cases|--seed|--no-contracts|--no-check-alloc|--fuzz|--gen`,
+  `tachyonc reduce --differs|--fails|--test` and `tachyonc fuzz` print
+  `error test.not-yet` / `reduce.not-yet` / `fuzz.not-yet` naming the
+  task (tools/v018.tach).
+- `explain` knows the five codes phase 0 prints or names (the `.not-yet` ones, `test.signature`, `test.generate`) (tools/explain/v018_table.tach;
+  tests/refactor/run.sh wants every entry to be printed somewhere). The
+  other codes of §2.14 are constants in front/contracts/diag.tach, and
+  each task adds their entries when it starts reporting them (and the
+  code's prefix to run.sh's list).
+- `fmt` lays the syntax out (tools/fmt/clauses.tach, three hooks in
+  layout.tach): clause lines continue the signature, a body's `{` after
+  them is at the signature's level, the line after an `invariant` starts
+  an item, `distinct *T` is a prefix `*`.
+- std gains two lazy sections, loaded only when a program names them:
+  `Testing (0.18)` (compiler/std/test.tach: `Arbitrary`, `Gen`,
+  `assert_snapshot`, bodies that panic) and `Non-null pointers (0.18)`
+  (compiler/std/nonnull.tach: `NonNull<T>` in the distinct form).
+- The compiler's names: `base::comp::{Comp, Ast}` (zero-sized
+  `impl Allocator`, on C's allocator for now) and `middle::ctx::{FnCtx,
+  Program}` with `Program::freeze()`; docs/design/018-migration/.
+
+**Left to the tasks** (said here so that nobody waits for phase 0):
+- the assert family and the bang spellings go to **T1**: their prelude
+  names would take the prelude past its 64 entries together with 0.17's
+  `Drop`, `drop`, `forget`, `needs_drop`, `take` and `replace`
+  (`PRELUDE_DECLARED: [bool; 64]` in front/modules/lookup.tach), so T1
+  adds them after c17-phase0's merge, raising that bound;
+- cloning a generic function's clauses into its instances (**T1**);
+- leaving test items out of other builds, a test module's view of its
+  parent, and `use super::*`'s `import.wildcard` error (**T2**, with T9's
+  `fix`);
+- `query checks` (**T5**: a new query command touches the query table,
+  its help and the hook's tables);
+- `&mut Gen`, `&Program`, `&mut FnCtx`: the reference types are 0.17's
+  syntax, so phase 0 uses `*Gen` and no signatures yet.
+
+**Per task: what it owns, its hooks, what it must not touch.**
+
+| task | owns (new files are its own) | its hooks (already in place) | must not touch |
+|---|---|---|---|
+| T1 | front/contracts/{mod,desugar,diag}.tach (the tables' readers, `check_contracts`), the clause lines of compiler/std/*.tach, the prelude entries for the assert family, the bang spellings in front/parser/exprs.tach (`parse_primary`'s `at_macro_call` branch), tests/run/contract_* | `check_contracts()` in `check_program`; the parser's `parse_clauses`, `parse_type_invariant` | the table layout in front/contracts/mod.tach (add tables, do not change these), front/parser/clauses.tach's grammar (ask the lead), other tasks' std files |
+| T2 | tools/testrun/*, front/tests/* (new), compiler/std/test.tach, tools/v018.tach's `test_option018`, tests/testcmd/* | `test_option018` in `test_inner`; `TEST_ITEM/KIND`; `at_cfg_test`/`parse_cfg_test_item` in `parse_top_item` | the parser's hooks (read the tables instead), main's option loop |
+| T3 | middle/coverage.tach (new), compiler/std/fuzz.tach (new, a lazy section), tools/reduce.tach's program modes, tools/v018.tach's `run_fuzz` and `reduce_mode018` | `run_fuzz` in `run_command`; `reduce_mode018` in `reduce_inner`; `--coverage` in front/contracts/flags.tach | gen0 beyond one hook line; T2's harness (call it) |
+| T4 | the distinct kind in front/types.tach, the operator and conversion parts of front/check, front/layout's niche, compiler/std/nonnull.tach, front/cimport's `_Nonnull`, tests/run/distinct_*, nonnull_* | `DISTINCT_ALIASES`; `parse_alias_target` | the clause tables (an invariant is T1's to check) |
+| T5 | front/contracts/sites.tach, the `site` argument's use in middle/lower/calls.tach and gen0/target.tach (`emit_runtime`), middle/range.tach, middle/ipo.tach, `query checks` | `lower_check(.., site)`, `emit_panic(kind, site)`, `site_of` | the parser; the checker |
+| T6 | base/comp.tach, front/tools/base edits by replayed scripts (docs/design/018-migration/front-*) | `Comp`, `Ast` | middle, back, gen0 |
+| T7 | middle/ctx.tach, base/threads.tach (new), back/emit/join.tach (new), tools/refactor_ctx/ (new), middle/back/gen0 edits by replayed scripts (middle-*) | `FnCtx`, `Program::freeze`, `JOBS` | front; the files T5 owns until T5 has merged |
+| T8 | back/codecache.tach (new), Program's read recording, tests/incremental/ | T7's Program | T7's schedule |
+| T9 | tools/query (clauses in def/show/context), tools/fmt (with tools/fmt/clauses.tach), refactor's clause handling, fix's `--suggested` forms and the `use super::*` deletion, tools/explain/v018_table.tach's texts, compiler/guide/*, docs, tools/agent-hooks/check-after-edit.py, tests/agent-eval tasks | the explain table | the compiler's semantics |
+
 ### The tasks
 
 | task | owns | consumes | provides |

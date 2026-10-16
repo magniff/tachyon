@@ -1585,6 +1585,35 @@ beside `crate::a::parser`, and `crate::lexer`), it is an error,
 `use` line with its path from the root.
 `use m::{self, X};` is not supported: its error's `try:` is `use m;`.
 
+## Additions of 0.18: contracts and tests (phase 0)
+
+The design is [design/contracts-verification.md](design/contracts-verification.md).
+Phase 0 reads this syntax and keeps it (front/contracts's tables); the
+checks, the tests and distinct types come with the tasks named there.
+
+```ebnf
+fn_item    = signature { clause } ( block | ";" ) ;            (* fns, trait fns, impl fns *)
+clause     = [ "debug" ] ( "requires" | "ensures" ) expr [ "else" expr ] ;
+type_inv   = [ "debug" ] "invariant" expr [ "else" expr ] [ ";" ] ;   (* after a struct's or enum's "}" *)
+alias      = "type" ident [ generics ] "=" [ "distinct" ] type [ type_inv ] ";" ;
+attribute += "test" | "property" | "fuzz" | "cfg" "(" "test" ")" ;
+```
+
+- `requires`, `ensures`, `invariant`, `debug` and `distinct` are not
+  reserved: they are read as such only where a clause (or a distinct
+  type) may stand, so a variable may still be called `result` or `debug`.
+  In an `ensures`, `result` is the returned value and `old(e)` is `e` at
+  the function's entry (T1).
+- A clause's condition is an expression in which `{` ends it, as in an
+  `if`'s condition. The message after `else` is a string or an f-string.
+- `#[cfg(test)]` marks the item after it (all of a module's items);
+  `#[test]`, `#[property]` and `#[fuzz]` mark a function. Phase 0
+  compiles them as ordinary items (T2 leaves them out of builds that are
+  not tests).
+- Phase 0 checks a distinct type as a transparent alias (T4 makes it a
+  type of its own) and ignores the invariants and clauses (T1 checks
+  them).
+
 ## Importing C headers
 
 `import "stdio.h" as c;` *(0.4; `as`: 0.5, required since 0.8)* reads a C
