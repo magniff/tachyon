@@ -66,7 +66,7 @@ bodies.
 | where it is defined, its signature | `tachyonc query def NAME` |
 | every use | `tachyonc query refs NAME` (`--count`, `--in FILE\|MODULE`; a local: `FN::x`) |
 | who calls a function; what it calls | `tachyonc query callers NAME`; `query callees FN` (`--transitive`) |
-| each local's kind, moves and views at a point (0.17) | `tachyonc query own FILE:LINE:COL` |
+| each local's kind, moves and views there (0.17) | `tachyonc query own main.tach:12:5` |
 | what a function may do: allocate, io, panic... (0.16) | `tachyonc query effects NAME\|MODULE` (`--why io`, `--has alloc(Gpa)`) |
 | a module's items, with signatures | `tachyonc query items MODULE`; every module: `query items` |
 | a module's `use` lines, header comment | `tachyonc query show MODULE::use` (`::header`) |
