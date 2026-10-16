@@ -2464,3 +2464,109 @@ call).
   by it, as strings) would keep the rest.
 - *The serial parts* above, and per-function assembly (T7's), whose bytes
   the cache could keep instead of the text.
+
+## Contracts and generated code: the evidence
+
+0.18 turns a checked `requires` into a branch at the call and a checked
+`ensures` into a branch after the call (front/contracts/expand.tach), so
+the range analysis (middle/range) sees their conditions as facts once
+the callee is inlined. Nothing is ever assumed: a fact comes only from a
+check that ran. This section measures whether that makes code faster
+(0.18.1, aarch64-macos, -O2, the M-series host).
+
+**The bench pair.** bench/contracts.tach has four kernels over
+`Vec<i64>`; bench/contracts_plain.tach is the same program without the
+clauses (an argument 1-4 runs one kernel). Instructions retired (robust
+under load); wall time the best of 5 runs at a load of about 5.5 on 12
+cores, so only large differences in it mean anything. "HEAD" is
+release-0.18.1 as it was (29de9e34); "fixed" adds the two range fixes
+below. Checks are `query checks` (`--print-checks=`), per iteration of
+the kernel's hot loop; the plain columns are the fixed compiler's
+(HEAD's where it differs).
+
+| kernel | clause | checks in the loop: plain / HEAD / fixed | instructions: plain / HEAD / fixed (M) | wall ms: plain / fixed | vectorized |
+|---|---|---|---|---|---|
+| 1 prefix: `for i in 0..n { s += v[i] }` | `requires 0 <= n && n <= v.len()` | 1 / 1 / **0** | 1315 / 1313 / **218** (-83%) | 47 / 19 | fixed only |
+| 2 window: `weigh(v, i)` reads v[i..i + 4], called for each i | `requires 0 <= i && i + 4 <= v.len()` | 4 / 5 / 5 | 1731 / 2142 / 2140 (+24%) | 47 / 57 | no |
+| 3 bucket: `counts[bucket(x, counts.len())] += 1` | `requires n > 0`, `ensures 0 <= result && result < n` | 1 / 4 / 3 | 1212 / 1812 / 1632 (+35%) | 67 / 70 | no |
+| 4 dot: `for i in 0..a.len() { s += a[i] * b[i] }` | `requires a.len() == b.len()` | 1 (HEAD: 2) / 0 / **0** | 1651 (HEAD: 1979) / 1487 / **669** (-59%) | 56 / 29 | no |
+| all four | | | 5882 (HEAD: 6201) / 6717 / 4624 | | |
+
+The whole program: with HEAD the clauses cost 8% more instructions than
+none (6717M against 6201M, HEAD's plain); with the fixes they save 21%.
+
+**The survey.** `--print-checks=` over bench/ (23 programs) and the 39
+examples, at -O2, as they are (no clauses of their own; std's apply).
+
+| | left | removed by ranges | removed otherwise |
+|---|---|---|---|
+| HEAD, all 62 programs | 1670 (user code 577, std 1093) | 1138 | 304 |
+| fixed, all 62 programs | 1564 (user code 578, std 986) | 1166 | 304 |
+| fixed, bench/ user code only | 72 (63 index, 7 contract, 2 slice) | 30 | 12 |
+
+std's clauses: 31 of the 211 contract checks at call sites are proven
+by ranges (a `v.get(i)` in a loop to `v.len()`), and after that its
+body's own check is a double. The bench's 39 distinct sites left in user
+code: about 3 would go with a natural clause (iterloop's `dot` and
+`take_loop`, bounded by a min of two lengths, with a `requires` instead
+of the min; sort's `s[i]` with the length stated); the rest are
+data-dependent (interp's `code[pc]`, `regs[r]`, `stack[sp]`, json's
+`s[pos]`, fannkuch's `perm[k - i]`), would need a type invariant (not a
+fact in 0.18), or are analysis gaps listed below.
+
+**The fixes (this branch).** Both small, in middle/range/mod.tach, with
+tests/run/opt_range_chain.tach:
+- *`sub len, 0`.* Indexing a Vec reads its length as a slice's, `len - 0`
+  in u64, which instcombine keeps because the type changes; the analysis
+  took it for another value, so even `for i in 0..v.len() { v[i] }` kept
+  its check in 0.18. `bits_of_value` now looks through `x + 0` and `x -
+  0` of 64-bit integers. This alone removes 106 checks in the survey and
+  5% of the plain bench's instructions.
+- *One step of transitivity.* `decide` chains two facts through a third
+  value when the direct facts leave a comparison open: `i < n` (the
+  loop's) and `n <= v.len()` (a requires', an assert's, a guard's) give
+  `i < v.len()`; `a.len() == b.len()` with `i < a.len()` gives `i <
+  b.len()`. Same signedness only; a signed chain decides an unsigned
+  check when i is known non-negative, as for a direct fact.
+
+Cost: the -O2 self-compile +0.6% instructions (the chaining itself is
+below the noise; the rest is the compiler's own code optimized more); the
+compiler's binary +0.3%; every bench program within ±0.1% except the
+pair (contracts -31%, contracts_plain -5%).
+
+**Verdict.** Contracts speed code up where a clause states a relation
+the analysis can chain to a loop bound: a length bounding a loop
+(prefix, 6x fewer instructions once the loop vectorizes) and two lengths
+equal (dot, 2.5x). Without the fixes above they did not: the prefix
+clause removed nothing and the program with clauses ran 8% more
+instructions than without. Where the clause's condition does not match
+the check's form (window: `i + 4 <= len` against `i + 1 < len`) or
+where the callee's own result is not bounded (bucket: `h % n`), the
+clause is one more check per call, and the code is slower (+24%, +35%
+instructions; the branches predict well, so wall time moves less). A
+clause is not free: a contract that removes nothing costs its check.
+
+**What the analysis could use but does not (0.18.1 follow-ups).**
+1. *Offsets.* `i + 4 <= len` implies `i + k < len` for 0 <= k < 4, and a
+   loop to `len - 3` implies `i + 4 <= len`; with them window's requires
+   is proven at the call and its four checks go.
+2. *Remainders.* `x % n` (unsigned, n > 0) is in [0, n): the analysis
+   would then fold bucket's ensures and drop the index check without
+   any clause.
+3. *Entry facts in a callee that is not inlined* (design §2.5 item 2): a
+   requires on a function too large to inline gives its body nothing
+   today; facts come only through inlining.
+4. *A min as a bound.* `let m = if n < len { n } else { len }` is a phi
+   both of whose inputs are at most len; iterloop's `dot` and
+   `take_loop` keep their checks for it.
+5. *Rotated loops.* When a loop is rotated before it is inlined, the
+   check compares `i + 1` (unsigned) after the exit test, whose lower
+   bound the phi ranges lose (`i + 1` may wrap as far as they know), so
+   a chained signed fact does not decide it; seen with `sum_prefix(v, n -
+   1)` called once.
+6. *Non-negative while-loop indices.* wordcount's `while i < n && ..
+   s[i]` keeps its check: `i < n` is signed, the check unsigned, and i's
+   lower bound (it starts at 0 and only grows) is not derived.
+7. *Tools.* `query checks crate` prints nothing (the names it matches
+   have no `crate::`; `--print-checks=` lists every function), and a
+   removed check says `removed (ranges)`, not the fact that removed it.

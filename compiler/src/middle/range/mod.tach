@@ -171,14 +171,26 @@ fn edge_fact(mut cx: *FnCtx, p: i64, x: i64) {
 }
 
 // v with conversions between 64-bit integer types (which change no bits)
-// looked through: values equal as bits compare equal.
+// looked through, and (0.18.1) `x + 0` and `x - 0` of 64-bit integer types,
+// which instcombine keeps when the type changes (a Vec's length read as a
+// slice's, `sub len, 0` in u64): values equal as bits compare equal.
 pub fn bits_of_value(mut cx: *FnCtx, v: i64) -> i64 {
     unsafe {
         let mut x = ir_val(cx, v);
-        while cx.insts[x].op == Op::Conv && is_integer(cx.insts[x].ty)
-            && is_integer(cx.insts[x].imm2)
-            && int_bits(cx.insts[x].ty) == 64 && int_bits(cx.insts[x].imm2) == 64 {
-            x = ir_val(cx, cx.insts[x].a);
+        loop {
+            let op = cx.insts[x].op;
+            if op == Op::Conv && is_integer(cx.insts[x].ty) && is_integer(cx.insts[x].imm2)
+                && int_bits(cx.insts[x].ty) == 64 && int_bits(cx.insts[x].imm2) == 64 {
+                x = ir_val(cx, cx.insts[x].a);
+            } else if (op == Op::Add || op == Op::Sub) && is_integer(cx.insts[x].ty)
+                && int_bits(cx.insts[x].ty) == 64 && is_const(cx, cx.insts[x].b)
+                && cx.insts[cx.insts[x].b].imm == 0
+                && is_integer(cx.insts[cx.insts[x].a].ty)
+                && int_bits(cx.insts[cx.insts[x].a].ty) == 64 {
+                x = ir_val(cx, cx.insts[x].a);
+            } else {
+                break;
+            }
         }
         x
     }
@@ -436,6 +448,24 @@ fn decide(mut cx: *FnCtx, c: i64) -> i64 {
                 outcomes &= fs;
             }
         }
+        // (0.18.1) One step of transitivity, when the facts above left c open:
+        // facts a R w and w R' b of one signedness, both orders the same way
+        // (< or <=; > or >=), give a R'' b, strict when either is. So `i < n` (a
+        // counted loop's) and `n <= len` (a requires', a guard's) decide the
+        // check `i < len`.
+        if order && (outcomes & q) != 0 && (outcomes & ~q) != 0 {
+            let s = chained(cx, a, b);
+            if s != 7 {
+                let fsigned = (s & 8) != 0;
+                let fs = s & 7;
+                if !signed && fsigned && !nonneg && alo < 0 && (fs & 4) == 0 {
+                    range_at(cx, a, &alo, &ahi);
+                }
+                if fsigned == signed || nonneg || (fsigned && alo >= 0 && (fs & 4) == 0) {
+                    outcomes &= fs;
+                }
+            }
+        }
         if outcomes == 0 {
             return -1;
         }
@@ -446,6 +476,70 @@ fn decide(mut cx: *FnCtx, c: i64) -> i64 {
             return 0;
         }
         -1
+    }
+}
+
+// The order between a and b that two facts give through a third value w
+// (see decide): a set of outcomes (1 less, 2 equal, 4 greater), with 8
+// when the facts are signed; 7 when no two facts chain.
+fn chained(mut cx: *FnCtx, a: i64, b: i64) -> i64 {
+    unsafe {
+        let mut i = 0;
+        while i < cx.facts.count {
+            let f = cx.facts.data[i];
+            let holds = cx.facts.data[i + 1] != 0;
+            i += 2;
+            if cx.insts[f].op != Op::Cmp || !is_integer(cx.insts[f].imm2) {
+                continue;
+            }
+            let fa = bits_of_value(cx, cx.insts[f].a);
+            let fb = bits_of_value(cx, cx.insts[f].b);
+            let mut s1 = cond_set(cx.insts[f].cond);
+            if !holds {
+                s1 = 7 & ~s1;
+            }
+            let mut w = fb;
+            if fb == a && fa != a {
+                w = fa;
+                s1 = mirror_set(s1);
+            } else if fa != a || fb == a {
+                continue;
+            }
+            if w == b || ((s1 & 4) != 0 && (s1 & 1) != 0) {
+                continue;
+            }
+            let signed = is_signed(cx.insts[f].imm2);
+            let mut j = 0;
+            while j < cx.facts.count {
+                let g = cx.facts.data[j];
+                let gholds = cx.facts.data[j + 1] != 0;
+                j += 2;
+                if g == f || cx.insts[g].op != Op::Cmp || !is_integer(cx.insts[g].imm2)
+                    || is_signed(cx.insts[g].imm2) != signed {
+                    continue;
+                }
+                let ga = bits_of_value(cx, cx.insts[g].a);
+                let gb = bits_of_value(cx, cx.insts[g].b);
+                let mut s2 = cond_set(cx.insts[g].cond);
+                if !gholds {
+                    s2 = 7 & ~s2;
+                }
+                if ga == b && gb == w {
+                    s2 = mirror_set(s2);
+                } else if ga != w || gb != b {
+                    continue;
+                }
+                let strict = (s1 & 2) == 0 || (s2 & 2) == 0;
+                let sign = if signed { 8 } else { 0 };
+                if (s1 & 4) == 0 && (s2 & 4) == 0 {
+                    return sign | if strict { 1 } else { 3 };
+                }
+                if (s1 & 1) == 0 && (s2 & 1) == 0 {
+                    return sign | if strict { 4 } else { 6 };
+                }
+            }
+        }
+        7
     }
 }
 
