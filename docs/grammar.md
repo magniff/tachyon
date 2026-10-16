@@ -1565,17 +1565,20 @@ an array is its length, and `v.len` on std's `Vec`, `Buf` and `HashMap`
 (whose `len` field is sealed, or which have none) is `v.len()`: a read
 only; `v.len = n` and `&v.len` are still errors.
 
-**Paths.** A `use` path's first segment that is not `crate`, `self`,
-`super`, `std` nor a name of the module it is written in is looked up
-beside that module (a child of its parent), then at the root:
-`use lexer::{Tok, next};` in `parser.tach`, where `main.tach` has
-`mod lexer; mod parser;`, is `use crate::lexer::{Tok, next};`. When both
-are modules and differ (`crate::a::lexer` beside `crate::a::parser`, and
-`crate::lexer`), it is an error, `ambiguous module`, whose `try:` lines
-are the two `crate::` paths. Paths in expressions are unchanged: a
-sibling there is `crate::lexer::next(..)` or imported (`use
-crate::lexer;`; the error `unknown module 'lexer'` names that line, in
-an expression, a type or a struct literal's path).
+**Paths.** A path's first segment that is not `crate`, `self`, `super`,
+`std` nor a name of the module it is written in is looked up beside that
+module (a child of its parent), then at the root: `use lexer::{Tok,
+next};` in `parser.tach`, where `main.tach` has `mod lexer; mod parser;`,
+is `use crate::lexer::{Tok, next};`. A path in code starts the same way
+(0.17): `lexer::next(..)`, `fn f(t: lexer::Tok)`, `lexer::Tok { .. }` and
+`lexer::Kind::Ident` in a pattern are `crate::lexer::...` there, as the
+`use` line would be; a name in scope in the module (an item, an import)
+still comes first. When both are modules and differ (`crate::a::lexer`
+beside `crate::a::parser`, and `crate::lexer`), it is an error,
+`ambiguous module`, whose `try:` lines are the two `crate::` paths (the
+`use` line, or the path in code, so written). A module elsewhere
+(`crate::b::lexer`) is `unknown module 'lexer'`, whose `try:` is the
+`use` line with its path from the root.
 `use m::{self, X};` is not supported: its error's `try:` is `use m;`.
 
 ## Importing C headers

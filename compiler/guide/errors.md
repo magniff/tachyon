@@ -572,13 +572,12 @@ Add the `use` line the help names, or run the `try:` line, `tachyonc fix
 --suggested main.tach`, which adds every missing one (and makes the
 other errors' exact fixes; `fix --only imports`: the imports alone).
 
-In a module other than the root, a path starts in that module; a `use`
-path may also start with a sibling module (0.17): `use table::Table;` in
-check.tach is `use crate::table::Table;` when `mod table;` is in
-main.tach. A module elsewhere (`crate::a::table`) is `unknown module
+In a module other than the root, a path starts in that module, or with
+a sibling module, or one of the root (0.17): `use table::Table;` and
+`table::f(x)` in check.tach are `crate::table::...` when `mod table;` is
+in main.tach. A module elsewhere (`crate::a::table`) is `unknown module
 'table'`, whose help says `crate::a::table::...` and whose `try:` is the
-`use` line so written; in an expression, `table::f(x)` needs `use
-crate::table;` (the `try:`). `mod util;` with no util.tach is
+`use` line so written (in code: `use crate::a::table;`). `mod util;` with no util.tach is
 `cannot find the file of module 'util'`, whose `try:` makes it:
 `tachyonc edit new-file util.tach main.tach < util.tach` (the text on
 stdin; the `mod` line that is there stays). A `mod` line for a file that
