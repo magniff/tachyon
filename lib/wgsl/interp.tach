@@ -1,0 +1,1646 @@
+// The CPU interpreter (docs/design/gpu.md §2.10, §4): the third back end
+// over the IR and the oracle of the tests and the shader fuzzer. It runs
+// compute entry points with WGSL's semantics, the checked ones included:
+// wrapping integers, division by zero, shifts modulo 32, clamped indices,
+// runtime-sized arrays that read zero and skip writes out of range.
+//
+// Values are 32-bit words in WGSL's memory layout, everywhere: an
+// expression's value lives in its register (words of the frame), so a
+// load or store is a copy. Each invocation keeps its own call and control
+// stacks, so a workgroup barrier suspends it: the invocations of a
+// workgroup run in turn until each reaches the barrier, then all resume.
+use ir::{
+    AT_ADD, AT_AND, AT_CMPXCHG, AT_EXCHANGE, AT_LOAD, AT_MAX, AT_MIN, AT_OR, AT_STORE, AT_SUB,
+    AT_XOR, BIND_BUILTIN, BI_GLOBAL_INVOCATION_ID, BI_LOCAL_INVOCATION_ID,
+    BI_LOCAL_INVOCATION_INDEX, BI_NUM_WORKGROUPS, BI_WORKGROUP_ID, CK_CLAMP, CK_RZSW, E_ACCESS,
+    E_ACCESS_INDEX, E_ARG, E_ARRAY_LENGTH, E_ATOMIC_RESULT, E_BINARY, E_BITCAST, E_CALL_RESULT,
+    E_COMPOSE, E_CONVERT, E_DERIVATIVE, E_GLOBAL, E_IMAGE_LOAD, E_IMAGE_QUERY, E_IMAGE_SAMPLE,
+    E_LITERAL, E_LOAD, E_LOCAL, E_MATH, E_SELECT, E_SPLAT, E_SWIZZLE, E_UNARY, E_WG_UNIFORM_RESULT,
+    E_ZERO, Function, Module, OP_ADD, OP_AND, OP_DIV, OP_EQ, OP_GE, OP_GT, OP_LAND, OP_LE, OP_LOR,
+    OP_LT, OP_MOD, OP_MUL, OP_NE, OP_OR, OP_SHL, OP_SHR, OP_SUB, OP_XOR, SK_BOOL, SK_F32, SK_I32,
+    SK_U32, SP_HANDLE, SP_PRIVATE, SP_STORAGE, SP_UNIFORM, SP_WORKGROUP, S_ATOMIC, S_BARRIER,
+    S_BLOCK, S_BREAK, S_CALL, S_CONTINUE, S_EMIT, S_IF, S_IMAGE_STORE, S_KILL, S_LOOP, S_RETURN,
+    S_STORE, S_SWITCH, S_WG_UNIFORM_LOAD, TK_ARRAY, TK_MATRIX, TK_POINTER, TK_SAMPLER, TK_SCALAR,
+    TK_STRUCT, TK_TEXTURE, TK_VECTOR, UN_BITNOT, UN_NEG, UN_NOT, V, bits_f32, f32_bits,
+};
+
+import "math.h" as cm;
+
+// Pointer spaces (bits 48..55 of a pointer); bit 56: out of range (RZSW).
+const PS_FUNC: i64 = 1;
+const PS_PRIVATE: i64 = 2;
+const PS_WORKGROUP: i64 = 3;
+const PS_BUFFER: i64 = 4;
+const PTR_INVALID: i64 = 72057594037927936;
+const OFF_MASK: i64 = 4294967295;
+
+const CT_BLOCK: u8 = 0;
+const CT_BODY: u8 = 1;
+const CT_CONT: u8 = 2;
+const CT_SWITCH: u8 = 3;
+
+const ST_RUN: u8 = 0;
+const ST_BARRIER: u8 = 1;
+const ST_DONE: u8 = 2;
+
+pub struct FnInfo {
+    // each expression's register: a word offset in the frame
+    regs: V<i64>,
+    // each local's offset in the frame
+    locals: V<i64>,
+    size: i64,
+    // the E_ARG expression of each parameter, or -1
+    arg_exprs: V<i64>,
+}
+
+struct Frame { func: i64, base: i64, ctl_base: i64, ret: i64 }
+
+// A position in a block; for loops `s` is the S_LOOP statement.
+struct Ctl { kind: u8, blk: i64, pos: i64, s: i64 }
+
+pub struct Inv {
+    mem: V<u32>,
+    privm: V<u32>,
+    frames: V<Frame>,
+    ctl: V<Ctl>,
+    state: u8,
+    // workgroupUniformLoad's two barriers
+    phase: i64,
+}
+
+pub struct Interp {
+    a: ScopedArena,
+    fns: V<FnInfo>,
+    // per global: its words (buffers), and offsets in private or workgroup memory
+    bufs: V<V<u32>>,
+    goff: V<i64>,
+    priv_words: i64,
+    wg_words: i64,
+    priv_init: V<u32>,
+    wg: V<u32>,
+    failed: bool,
+    err: Buf<ScopedArena>,
+    steps: i64,
+    max_steps: i64,
+    // builtins of the invocation being started
+    wg_size: [i64; 3],
+    groups: [i64; 3],
+}
+
+fn words_of(m: *Module, t: i64) -> i64 {
+    let ty = m.types[t];
+    if ty.kind == TK_POINTER {
+        return 2;
+    }
+    if ty.kind == TK_TEXTURE || ty.kind == TK_SAMPLER {
+        return 1;
+    }
+    ty.size / 4
+}
+
+pub fn new_interp(m: *Module, a: ScopedArena) -> Interp {
+    let mut it = Interp {
+        a: a,
+        fns: Vec::new_in(a),
+        bufs: Vec::new_in(a),
+        goff: Vec::new_in(a),
+        priv_words: 0,
+        wg_words: 0,
+        priv_init: Vec::new_in(a),
+        wg: Vec::new_in(a),
+        failed: false,
+        err: Buf::new_in(a),
+        steps: 0,
+        max_steps: 2000000000,
+        wg_size: [1, 1, 1],
+        groups: [1, 1, 1],
+    };
+    for h in 0..m.functions.len() {
+        let f = m.functions[h];
+        let mut fi = FnInfo {
+            regs: Vec::with_capacity_in(f.exprs.len(), a), locals: Vec::new_in(a), size: 0,
+            arg_exprs: Vec::filled_in(f.params.len(), -1, a)
+        };
+        let mut off = 0;
+        for l in 0..f.locals.len() {
+            fi.locals.push(off);
+            off += words_of(m, f.locals[l].ty);
+        }
+        for e in 0..f.exprs.len() {
+            fi.regs.push(off);
+            off += words_of(m, f.exprs[e].ty);
+            if f.exprs[e].op == E_ARG {
+                fi.arg_exprs[f.exprs[e].a] = e;
+            }
+        }
+        fi.size = off;
+        it.fns.push(fi);
+    }
+    for g in 0..m.globals.len() {
+        let gl = m.globals[g];
+        it.bufs.push(Vec::new_in(a));
+        if gl.space == SP_PRIVATE {
+            it.goff.push(it.priv_words);
+            it.priv_words += words_of(m, gl.ty);
+        } else if gl.space == SP_WORKGROUP {
+            it.goff.push(it.wg_words);
+            it.wg_words += words_of(m, gl.ty);
+        } else {
+            it.goff.push(0);
+        }
+    }
+    // private globals' initial values, from the module's constant expressions
+    for _ in 0..it.priv_words {
+        it.priv_init.push(0);
+    }
+    let mut cf = FnInfo {
+        regs: Vec::new_in(a), locals: Vec::new_in(a), size: 0, arg_exprs: Vec::new_in(a)
+    };
+    let mut off = 0;
+    for e in 0..m.consts.exprs.len() {
+        cf.regs.push(off);
+        off += words_of(m, m.consts.exprs[e].ty);
+    }
+    cf.size = off;
+    if off > 0 {
+        let mut tmp = Inv {
+            mem: Vec::filled_in(off, 0u32, a), privm: Vec::new_in(a), frames: Vec::new_in(a),
+            ctl: Vec::new_in(a), state: ST_RUN, phase: 0
+        };
+        for g in 0..m.globals.len() {
+            let gl = m.globals[g];
+            if gl.space == SP_PRIVATE && gl.init >= 0 {
+                const_eval(m, &cf, &tmp, gl.init);
+                let w = words_of(m, gl.ty);
+                for k in 0..w {
+                    it.priv_init[it.goff[g] + k] = tmp.mem[cf.regs[gl.init] + k];
+                }
+            }
+        }
+    }
+    it
+}
+
+// Evaluates a constant expression of the module's init function (and its
+// operands) into tmp's registers.
+fn const_eval(m: *Module, cf: *FnInfo, tmp: *Inv, e: i64) {
+    let x = m.consts.exprs[e];
+    let dst = cf.regs[e];
+    let w = words_of(m, x.ty);
+    if x.op == E_LITERAL {
+        tmp.mem[dst] = x.a as u32;
+    } else if x.op == E_ZERO {
+        for k in 0..w {
+            tmp.mem[dst + k] = 0;
+        }
+    } else if x.op == E_SPLAT {
+        const_eval(m, cf, tmp, x.a);
+        for k in 0..w {
+            tmp.mem[dst + k] = tmp.mem[cf.regs[x.a]];
+        }
+    } else if x.op == E_COMPOSE {
+        let t = m.types[x.ty];
+        let mut at = 0;
+        for i in 0..x.b {
+            let a = m.consts.args[x.a + i];
+            const_eval(m, cf, tmp, a);
+            let aw = words_of(m, m.consts.exprs[a].ty);
+            let o = compose_offset(m, t, i, at);
+            for k in 0..aw {
+                tmp.mem[dst + o + k] = tmp.mem[cf.regs[a] + k];
+            }
+            at += aw;
+        }
+    }
+}
+
+// Where the i-th argument of a composition of type t goes (`at`: the
+// words the earlier arguments filled, for vectors).
+fn compose_offset(m: *Module, t: ir::Type, i: i64, at: i64) -> i64 {
+    if t.kind == TK_VECTOR {
+        at
+    } else if t.kind == TK_MATRIX {
+        i * t.stride / 4
+    } else if t.kind == TK_ARRAY {
+        i * t.stride / 4
+    } else {
+        m.members[t.mstart + i].offset / 4
+    }
+}
+
+fn fl(x: u32) -> f32 { bits_f32(x) }
+
+fn ub(x: f32) -> u32 { f32_bits(x) }
+
+fn si(x: u32) -> i64 { x as i32 as i64 }
+
+impl Interp {
+    pub fn fail(self: *Interp, msg: [u8]) {
+        if !self.failed {
+            self.failed = true;
+            self.err.push_str(msg);
+        }
+    }
+
+    // A buffer's binding: its words (sized to the binding).
+    pub fn set_buffer(self: *Interp, g: i64, words: [u32]) {
+        let mut v: V<u32> = Vec::with_capacity_in(words.len, self.a);
+        v.extend_from_slice(words);
+        self.bufs[g] = v;
+    }
+
+    // ---- Memory ----
+
+    fn read(self: *Interp, inv: *Inv, ptr: i64, k: i64) -> u32 {
+        let sp = (ptr >> 48) & 255;
+        let off = (ptr & OFF_MASK) + k;
+        if ptr & PTR_INVALID != 0 {
+            return 0;
+        }
+        if sp == PS_FUNC {
+            inv.mem[off]
+        } else if sp == PS_PRIVATE {
+            inv.privm[off]
+        } else if sp == PS_WORKGROUP {
+            self.wg[off]
+        } else {
+            let b = (ptr >> 32) & 65535;
+            let buf = self.bufs[b];
+            if off >= buf.len() {
+                // a fixed-size part beyond a too-small binding reads zero
+                return 0;
+            }
+            buf[off]
+        }
+    }
+
+    fn write(self: *Interp, inv: *Inv, ptr: i64, k: i64, v: u32) {
+        let sp = (ptr >> 48) & 255;
+        let off = (ptr & OFF_MASK) + k;
+        if ptr & PTR_INVALID != 0 {
+            return;
+        }
+        if sp == PS_FUNC {
+            inv.mem[off] = v;
+        } else if sp == PS_PRIVATE {
+            inv.privm[off] = v;
+        } else if sp == PS_WORKGROUP {
+            self.wg[off] = v;
+        } else {
+            let b = (ptr >> 32) & 65535;
+            let mut buf = self.bufs[b];
+            if off < buf.len() {
+                buf[off] = v;
+            }
+        }
+    }
+
+    fn get_ptr(self: *Interp, inv: *Inv, addr: i64) -> i64 {
+        (inv.mem[addr] as i64) | ((inv.mem[addr + 1] as i64) << 32)
+    }
+
+    fn put_ptr(self: *Interp, inv: *Inv, addr: i64, p: i64) {
+        inv.mem[addr] = (p & OFF_MASK) as u32;
+        inv.mem[addr + 1] = ((p >> 32) & OFF_MASK) as u32;
+    }
+
+    // The length of the runtime-sized array at byte `offset` of global g.
+    fn runtime_len(self: *Interp, g: i64, offset: i64, stride: i64) -> i64 {
+        let bytes = self.bufs[g].len() * 4 - offset;
+        if bytes <= 0 || stride <= 0 {
+            return 0;
+        }
+        bytes / stride
+    }
+
+    // The global a pointer expression starts from, or -1.
+    fn root_global(self: *Interp, f: *Function, e: i64) -> i64 {
+        let x = f.exprs[e];
+        if x.op == E_GLOBAL {
+            return x.a;
+        }
+        if x.op == E_ACCESS || x.op == E_ACCESS_INDEX {
+            return self.root_global(f, x.a);
+        }
+        -1
+    }
+
+    // ---- Running a dispatch ----
+
+    // Runs entry point `ei` over groups[0] x groups[1] x groups[2] workgroups.
+    pub fn dispatch(self: *Interp, m: *Module, ei: i64, groups: [i64; 3]) -> bool {
+        let en = m.entries[ei];
+        let n = en.wg[0] * en.wg[1] * en.wg[2];
+        self.wg_size = en.wg;
+        self.groups = groups;
+        let fi = en.func;
+        let size = self.fns[fi].size;
+        let mut invs: V<Inv> = Vec::with_capacity_in(n, self.a);
+        for _ in 0..n {
+            invs.push(Inv {
+                mem: Vec::filled_in(size + 64, 0u32, self.a),
+                privm: Vec::filled_in(self.priv_words, 0u32, self.a),
+                frames: Vec::new_in(self.a),
+                ctl: Vec::new_in(self.a),
+                state: ST_RUN,
+                phase: 0,
+            });
+        }
+        self.wg = Vec::filled_in(self.wg_words, 0u32, self.a);
+        for gz in 0..groups[2] {
+            for gy in 0..groups[1] {
+                for gx in 0..groups[0] {
+                    for k in 0..self.wg_words {
+                        self.wg[k] = 0;
+                    }
+                    for li in 0..n {
+                        let lx = li % en.wg[0];
+                        let ly = (li / en.wg[0]) % en.wg[1];
+                        let lz = li / (en.wg[0] * en.wg[1]);
+                        let mut inv = invs[li];
+                        inv.mem.truncate(0);
+                        for _ in 0..size {
+                            inv.mem.push(0);
+                        }
+                        for k in 0..self.priv_words {
+                            inv.privm[k] = self.priv_init[k];
+                        }
+                        inv.frames.clear();
+                        inv.ctl.clear();
+                        inv.state = ST_RUN;
+                        inv.phase = 0;
+                        inv.frames.push(Frame { func: fi, base: 0, ctl_base: 0, ret: -1 });
+                        let body = m.functions[fi].body;
+                        inv.ctl.push(Ctl { kind: CT_BLOCK, blk: body, pos: 0, s: -1 });
+                        self.set_builtins(m, &inv, fi, [lx, ly, lz], [gx, gy, gz], li);
+                        invs[li] = inv;
+                    }
+                    // run the workgroup's invocations, barrier to barrier
+                    loop {
+                        let mut running = 0;
+                        let mut at_barrier = 0;
+                        for li in 0..n {
+                            if invs[li].state == ST_DONE {
+                                continue;
+                            }
+                            invs[li].state = ST_RUN;
+                            let mut inv = invs[li];
+                            self.run(m, &inv);
+                            invs[li] = inv;
+                            if self.failed {
+                                return false;
+                            }
+                            if inv.state == ST_BARRIER {
+                                at_barrier += 1;
+                            }
+                            running += 1;
+                        }
+                        if running == 0 {
+                            break;
+                        }
+                        if at_barrier != 0 && at_barrier != running {
+                            self.fail("a barrier was reached by some invocations of a workgroup and not others (non-uniform control flow)");
+                            return false;
+                        }
+                        if at_barrier == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn set_builtins(self: *Interp, m: *Module, inv: *Inv, fi: i64, l: [i64; 3], g: [i64; 3],
+        li: i64) {
+        let f = m.functions[fi];
+        for p in 0..f.params.len() {
+            let e = self.fns[fi].arg_exprs[p];
+            if e < 0 {
+                continue;
+            }
+            let dst = self.fns[fi].regs[e];
+            let pt = m.types[f.params[p].ty];
+            if pt.kind == TK_STRUCT {
+                for k in 0..pt.mcount {
+                    let mem = m.members[pt.mstart + k];
+                    self.put_builtin(inv, mem.binding.value, dst + mem.offset / 4, l, g, li);
+                }
+            } else if f.params[p].binding.kind == BIND_BUILTIN {
+                self.put_builtin(inv, f.params[p].binding.value, dst, l, g, li);
+            }
+        }
+    }
+
+    fn put_builtin(self: *Interp, inv: *Inv, b: i64, dst: i64, l: [i64; 3], g: [i64; 3], li: i64) {
+        for k in 0..3 {
+            let v = if b == BI_LOCAL_INVOCATION_ID {
+                l[k]
+            } else if b == BI_GLOBAL_INVOCATION_ID {
+                g[k] * self.wg_size[k] + l[k]
+            } else if b == BI_WORKGROUP_ID {
+                g[k]
+            } else if b == BI_NUM_WORKGROUPS {
+                self.groups[k]
+            } else {
+                li
+            };
+            inv.mem[dst + k] = v as u32;
+            if b == BI_LOCAL_INVOCATION_INDEX {
+                return;
+            }
+        }
+    }
+
+    // ---- Statements ----
+
+    // Runs an invocation until it ends, reaches a barrier or fails.
+    fn run(self: *Interp, m: *Module, inv: *Inv) {
+        loop {
+            if self.failed {
+                return;
+            }
+            if inv.frames.len() == 0 {
+                inv.state = ST_DONE;
+                return;
+            }
+            let fr = inv.frames[inv.frames.len() - 1];
+            if inv.ctl.len() == fr.ctl_base {
+                // the function ran off its end: return nothing
+                self.ret(m, inv, -1);
+                continue;
+            }
+            let ci = inv.ctl.len() - 1;
+            let c = inv.ctl[ci];
+            let f = m.functions[fr.func];
+            let blk = f.blocks[c.blk];
+            if c.pos >= blk.count {
+                self.end_block(m, inv, &f, ci);
+                continue;
+            }
+            inv.ctl[ci].pos += 1;
+            let s = f.items[blk.start + c.pos];
+            if !self.exec(m, inv, &f, fr, s) {
+                return;
+            }
+        }
+    }
+
+    // The block at ctl[ci] finished.
+    fn end_block(self: *Interp, m: *Module, inv: *Inv, f: *Function, ci: i64) {
+        let c = inv.ctl[ci];
+        if c.kind == CT_BODY {
+            let st = f.stmts[c.s];
+            inv.ctl[ci] = Ctl { kind: CT_CONT, blk: st.b, pos: 0, s: c.s };
+            return;
+        }
+        if c.kind == CT_CONT {
+            let st = f.stmts[c.s];
+            if st.c >= 0 {
+                let fr = inv.frames[inv.frames.len() - 1];
+                if inv.mem[fr.base + self.fns[fr.func].regs[st.c]] != 0 {
+                    inv.ctl.truncate(ci);
+                    return;
+                }
+            }
+            self.steps += 1;
+            if self.steps > self.max_steps {
+                self.fail("the step limit was reached (an endless loop?)");
+                return;
+            }
+            inv.ctl[ci] = Ctl { kind: CT_BODY, blk: st.a, pos: 0, s: c.s };
+            return;
+        }
+        inv.ctl.truncate(ci);
+        let _ = m;
+    }
+
+    // Returns from the current function with the value at register `src`
+    // of its frame (or none).
+    fn ret(self: *Interp, m: *Module, inv: *Inv, src_e: i64) {
+        let fr = inv.frames.pop().unwrap();
+        if fr.ret >= 0 && src_e >= 0 {
+            let w = words_of(m, m.functions[fr.func].exprs[src_e].ty);
+            let src = fr.base + self.fns[fr.func].regs[src_e];
+            for k in 0..w {
+                inv.mem[fr.ret + k] = inv.mem[src + k];
+            }
+        }
+        inv.ctl.truncate(fr.ctl_base);
+        if inv.frames.len() == 0 {
+            inv.state = ST_DONE;
+        } else {
+            inv.mem.truncate(fr.base);
+        }
+    }
+
+    // Runs statement s; false when the invocation stops (a barrier, the
+    // end, an error).
+    fn exec(self: *Interp, m: *Module, inv: *Inv, f: *Function, fr: Frame, s: i64) -> bool {
+        let st = f.stmts[s];
+        let regs = self.fns[fr.func].regs;
+        let op = st.op;
+        if op == S_EMIT {
+            for e in st.a..st.b {
+                self.eval(m, inv, f, fr, e);
+            }
+            return !self.failed;
+        }
+        if op == S_STORE {
+            let p = self.get_ptr(inv, fr.base + regs[st.a]);
+            let w = words_of(m, f.exprs[st.b].ty);
+            let src = fr.base + regs[st.b];
+            for k in 0..w {
+                self.write(inv, p, k, inv.mem[src + k]);
+            }
+            return true;
+        }
+        if op == S_BLOCK {
+            inv.ctl.push(Ctl { kind: CT_BLOCK, blk: st.a, pos: 0, s: -1 });
+            return true;
+        }
+        if op == S_IF {
+            let c = inv.mem[fr.base + regs[st.a]];
+            inv.ctl.push(Ctl {
+                kind: CT_BLOCK, blk: if c != 0 { st.b } else { st.c }, pos: 0, s: -1
+            });
+            return true;
+        }
+        if op == S_LOOP {
+            inv.ctl.push(Ctl { kind: CT_BODY, blk: st.a, pos: 0, s: s });
+            return true;
+        }
+        if op == S_SWITCH {
+            let v = inv.mem[fr.base + regs[st.a]] as i64;
+            let mut body = -1;
+            for k in st.b..st.b + st.c {
+                let cs = f.cases[k];
+                for j in cs.vstart..cs.vstart + cs.vcount {
+                    if (f.vals[j] & OFF_MASK) == v {
+                        body = cs.body;
+                    }
+                }
+                if cs.is_default && body < 0 {
+                    // remembered, but a later case may still match
+                }
+            }
+            if body < 0 {
+                for k in st.b..st.b + st.c {
+                    if f.cases[k].is_default {
+                        body = f.cases[k].body;
+                    }
+                }
+            }
+            inv.ctl.push(Ctl { kind: CT_SWITCH, blk: body, pos: 0, s: s });
+            return true;
+        }
+        if op == S_BREAK {
+            loop {
+                let c = inv.ctl.pop().unwrap();
+                if c.kind == CT_BODY || c.kind == CT_CONT || c.kind == CT_SWITCH {
+                    return true;
+                }
+            }
+        }
+        if op == S_CONTINUE {
+            loop {
+                let ci = inv.ctl.len() - 1;
+                let c = inv.ctl[ci];
+                if c.kind == CT_BODY {
+                    let ls = f.stmts[c.s];
+                    inv.ctl[ci] = Ctl { kind: CT_CONT, blk: ls.b, pos: 0, s: c.s };
+                    return true;
+                }
+                inv.ctl.truncate(ci);
+            }
+        }
+        if op == S_RETURN {
+            self.ret(m, inv, st.a);
+            return inv.state != ST_DONE;
+        }
+        if op == S_KILL {
+            inv.frames.clear();
+            inv.ctl.clear();
+            inv.state = ST_DONE;
+            return false;
+        }
+        if op == S_BARRIER {
+            inv.state = ST_BARRIER;
+            return false;
+        }
+        if op == S_WG_UNIFORM_LOAD {
+            if inv.phase == 0 {
+                inv.phase = 1;
+                let ci = inv.ctl.len() - 1;
+                inv.ctl[ci].pos -= 1;
+                inv.state = ST_BARRIER;
+                return false;
+            }
+            inv.phase = 0;
+            let p = self.get_ptr(inv, fr.base + regs[st.a]);
+            let w = words_of(m, f.exprs[st.b].ty);
+            let dst = fr.base + regs[st.b];
+            for k in 0..w {
+                inv.mem[dst + k] = self.read(inv, p, k);
+            }
+            inv.state = ST_BARRIER;
+            return false;
+        }
+        if op == S_CALL {
+            let callee = st.a;
+            let cf = self.fns[callee];
+            let base = inv.mem.len();
+            for _ in 0..cf.size {
+                inv.mem.push(0);
+            }
+            let params = m.functions[callee].params;
+            for k in 0..st.c {
+                let ae = f.args[st.b + k];
+                let pe = cf.arg_exprs[k];
+                if pe < 0 {
+                    continue;
+                }
+                let w = words_of(m, params[k].ty);
+                let src = fr.base + regs[ae];
+                let dst = base + cf.regs[pe];
+                for j in 0..w {
+                    inv.mem[dst + j] = inv.mem[src + j];
+                }
+            }
+            let ret = if st.d >= 0 { fr.base + regs[st.d] } else { -1 };
+            inv.frames.push(Frame { func: callee, base: base, ctl_base: inv.ctl.len(), ret: ret });
+            inv.ctl.push(Ctl { kind: CT_BLOCK, blk: m.functions[callee].body, pos: 0, s: -1 });
+            if inv.frames.len() > 64 {
+                self.fail("calls nest too deep");
+                return false;
+            }
+            return true;
+        }
+        if op == S_ATOMIC {
+            let p = self.get_ptr(inv, fr.base + regs[st.a]);
+            let sk = m.types[m.pointee(f.exprs[st.a].ty)].scalar;
+            let old = self.read(inv, p, 0);
+            let v = if st.c >= 0 { inv.mem[fr.base + regs[st.c]] } else { 0 };
+            let fun = st.b;
+            let mut new = old;
+            if fun == AT_ADD {
+                new = old + v;
+            } else if fun == AT_SUB {
+                new = old - v;
+            } else if fun == AT_AND {
+                new = old & v;
+            } else if fun == AT_OR {
+                new = old | v;
+            } else if fun == AT_XOR {
+                new = old ^ v;
+            } else if fun == AT_MIN {
+                new = if sk == SK_I32 { if si(v) < si(old) { v } else { old } }
+                    else { if v < old { v } else { old } };
+            } else if fun == AT_MAX {
+                new = if sk == SK_I32 { if si(v) > si(old) { v } else { old } }
+                    else { if v > old { v } else { old } };
+            } else if fun == AT_EXCHANGE || fun == AT_STORE {
+                new = v;
+            } else if fun == AT_CMPXCHG {
+                let cmp = inv.mem[fr.base + regs[st.e]];
+                if old == cmp {
+                    new = v;
+                }
+            }
+            if fun != AT_LOAD {
+                self.write(inv, p, 0, new);
+            }
+            if st.d >= 0 {
+                let dst = fr.base + regs[st.d];
+                inv.mem[dst] = old;
+                if fun == AT_CMPXCHG {
+                    let cmp = inv.mem[fr.base + regs[st.e]];
+                    // exchanged: the member at offset 4
+                    inv.mem[dst + 1] = if old == cmp && p & PTR_INVALID == 0 { 1 } else { 0 };
+                }
+            }
+            return true;
+        }
+        if op == S_IMAGE_STORE {
+            self.fail("textures are not run by the interpreter yet");
+            return false;
+        }
+        self.fail("unknown statement");
+        false
+    }
+
+    // ---- Expressions ----
+
+    fn eval(self: *Interp, m: *Module, inv: *Inv, f: *Function, fr: Frame, e: i64) {
+        let x = f.exprs[e];
+        let regs = self.fns[fr.func].regs;
+        let dst = fr.base + regs[e];
+        let op = x.op;
+        if op == E_LITERAL {
+            inv.mem[dst] = x.a as u32;
+            return;
+        }
+        if op == E_ZERO {
+            let w = words_of(m, x.ty);
+            for k in 0..w {
+                inv.mem[dst + k] = 0;
+            }
+            return;
+        }
+        if op == E_ARG || op == E_CALL_RESULT || op == E_ATOMIC_RESULT
+            || op == E_WG_UNIFORM_RESULT {
+            return;
+        }
+        if op == E_GLOBAL {
+            let g = x.a;
+            let gl = m.globals[g];
+            let p = if gl.space == SP_PRIVATE {
+                (PS_PRIVATE << 48) | self.goff[g]
+            } else if gl.space == SP_WORKGROUP {
+                (PS_WORKGROUP << 48) | self.goff[g]
+            } else if gl.space == SP_HANDLE {
+                g
+            } else {
+                (PS_BUFFER << 48) | (g << 32)
+            };
+            if gl.space == SP_HANDLE {
+                inv.mem[dst] = g as u32;
+            } else {
+                self.put_ptr(inv, dst, p);
+            }
+            return;
+        }
+        if op == E_LOCAL {
+            let off = fr.base + self.fns[fr.func].locals[x.a];
+            self.put_ptr(inv, dst, (PS_FUNC << 48) | off);
+            return;
+        }
+        if op == E_LOAD {
+            let p = self.get_ptr(inv, fr.base + regs[x.a]);
+            let w = words_of(m, x.ty);
+            for k in 0..w {
+                inv.mem[dst + k] = self.read(inv, p, k);
+            }
+            return;
+        }
+        if op == E_ACCESS || op == E_ACCESS_INDEX {
+            let bt0 = f.exprs[x.a].ty;
+            let is_ptr = m.types[bt0].kind == TK_POINTER;
+            let bt = if is_ptr { m.types[bt0].base } else { bt0 };
+            let t = m.types[bt];
+            let mut idx = 0;
+            let mut invalid = false;
+            if op == E_ACCESS_INDEX {
+                idx = x.b;
+            } else {
+                let iv = inv.mem[fr.base + regs[x.b]] as i64;
+                idx = iv;
+                if x.c == CK_CLAMP {
+                    if idx > x.d - 1 {
+                        idx = x.d - 1;
+                    }
+                } else if x.c == CK_RZSW {
+                    let g = self.root_global(f, x.a);
+                    let bp = self.get_ptr(inv, fr.base + regs[x.a]);
+                    let start = (bp & OFF_MASK) * 4;
+                    let len = if g >= 0 { self.runtime_len(g, start, t.stride) } else { 0 };
+                    if idx >= len {
+                        invalid = true;
+                        idx = 0;
+                    }
+                } else if x.c == ir::CK_PENDING {
+                    self.fail("an index has no bounds check (internal error)");
+                    return;
+                }
+                // CK_NONE: proven in range
+            }
+            // the word offset of the component
+            let off = if t.kind == TK_STRUCT {
+                m.members[t.mstart + idx].offset / 4
+            } else if t.kind == TK_VECTOR {
+                idx
+            } else {
+                idx * t.stride / 4
+            };
+            if is_ptr {
+                let mut p = self.get_ptr(inv, fr.base + regs[x.a]) + off;
+                if invalid {
+                    p = p | PTR_INVALID;
+                }
+                self.put_ptr(inv, dst, p);
+            } else {
+                let w = words_of(m, x.ty);
+                let src = fr.base + regs[x.a] + off;
+                for k in 0..w {
+                    inv.mem[dst + k] = inv.mem[src + k];
+                }
+            }
+            return;
+        }
+        if op == E_COMPOSE {
+            let t = m.types[x.ty];
+            let mut at = 0;
+            for k in 0..x.b {
+                let a = f.args[x.a + k];
+                let aw = words_of(m, f.exprs[a].ty);
+                let o = compose_offset(m, t, k, at);
+                let src = fr.base + regs[a];
+                for j in 0..aw {
+                    inv.mem[dst + o + j] = inv.mem[src + j];
+                }
+                at += aw;
+            }
+            return;
+        }
+        if op == E_SPLAT {
+            let v = inv.mem[fr.base + regs[x.a]];
+            let n = m.types[x.ty].n;
+            for k in 0..n {
+                inv.mem[dst + k] = v;
+            }
+            return;
+        }
+        if op == E_SWIZZLE {
+            let src = fr.base + regs[x.a];
+            // through a temporary: the source may be read after the first write
+            let mut tmp: [u32; 4] = [0; 4];
+            for k in 0..x.c {
+                tmp[k] = inv.mem[src + ((x.b >> (2 * k)) & 3)];
+            }
+            for k in 0..x.c {
+                inv.mem[dst + k] = tmp[k];
+            }
+            return;
+        }
+        if op == E_UNARY {
+            let t = m.types[x.ty];
+            let n = if t.kind == TK_VECTOR { t.n } else { 1 };
+            let src = fr.base + regs[x.b];
+            for k in 0..n {
+                let v = inv.mem[src + k];
+                inv.mem[dst + k] = if x.a == UN_NEG {
+                    if t.scalar == SK_F32 { ub(-fl(v)) } else { 0 - v }
+                } else if x.a == UN_NOT {
+                    if v == 0 { 1 } else { 0 }
+                } else {
+                    ~v
+                };
+            }
+            return;
+        }
+        if op == E_BINARY {
+            self.binary(m, inv, f, fr, e);
+            return;
+        }
+        if op == E_SELECT {
+            let t = m.types[x.ty];
+            let w = words_of(m, x.ty);
+            let ct = m.types[f.exprs[x.a].ty];
+            let c = fr.base + regs[x.a];
+            let tsrc = fr.base + regs[x.b];
+            let fsrc = fr.base + regs[x.c];
+            for k in 0..w {
+                let ck = if ct.kind == TK_VECTOR { inv.mem[c + k] } else { inv.mem[c] };
+                inv.mem[dst + k] = if ck != 0 { inv.mem[tsrc + k] } else { inv.mem[fsrc + k] };
+            }
+            let _ = t;
+            return;
+        }
+        if op == E_CONVERT {
+            let t = m.types[x.ty];
+            let from = m.types[f.exprs[x.a].ty].scalar;
+            let n = if t.kind == TK_VECTOR { t.n } else { 1 };
+            let src = fr.base + regs[x.a];
+            for k in 0..n {
+                inv.mem[dst + k] = convert(inv.mem[src + k], from, t.scalar);
+            }
+            return;
+        }
+        if op == E_BITCAST {
+            let w = words_of(m, x.ty);
+            let src = fr.base + regs[x.a];
+            for k in 0..w {
+                inv.mem[dst + k] = inv.mem[src + k];
+            }
+            return;
+        }
+        if op == E_MATH {
+            self.math(m, inv, f, fr, e);
+            return;
+        }
+        if op == E_ARRAY_LENGTH {
+            inv.mem[dst] = self.runtime_len(x.a, x.c, x.d) as u32;
+            return;
+        }
+        if op == E_DERIVATIVE {
+            // one invocation alone: its derivatives are zero
+            let w = words_of(m, x.ty);
+            for k in 0..w {
+                inv.mem[dst + k] = 0;
+            }
+            return;
+        }
+        if op == E_IMAGE_SAMPLE || op == E_IMAGE_LOAD || op == E_IMAGE_QUERY {
+            self.fail("textures are not run by the interpreter yet");
+            return;
+        }
+        self.fail("unknown expression");
+    }
+
+    fn binary(self: *Interp, m: *Module, inv: *Inv, f: *Function, fr: Frame, e: i64) {
+        let x = f.exprs[e];
+        let regs = self.fns[fr.func].regs;
+        let dst = fr.base + regs[e];
+        let lt = m.types[f.exprs[x.b].ty];
+        let rt = m.types[f.exprs[x.c].ty];
+        let l = fr.base + regs[x.b];
+        let r = fr.base + regs[x.c];
+        let op = x.a;
+        if lt.kind == TK_MATRIX || rt.kind == TK_MATRIX {
+            self.matrix_binary(m, inv, op, lt, rt, x.ty, l, r, dst);
+            return;
+        }
+        let n = if lt.kind == TK_VECTOR { lt.n } else { 1 };
+        let sk = lt.scalar;
+        // the result first in a temporary: dst never overlaps l or r, but stay simple
+        for k in 0..n {
+            let a = inv.mem[l + k];
+            let b = inv.mem[r + k];
+            inv.mem[dst + k] = scalar_binary(op, sk, a, b);
+        }
+    }
+
+    fn matrix_binary(self: *Interp, m: *Module, inv: *Inv, op: i64, lt: ir::Type, rt: ir::Type,
+        ty: i64, l: i64, r: i64, dst: i64) {
+        let res = m.types[ty];
+        if op == OP_ADD || op == OP_SUB {
+            let cs = lt.stride / 4;
+            for c in 0..lt.n {
+                for k in 0..lt.m {
+                    let a = fl(inv.mem[l + c * cs + k]);
+                    let b = fl(inv.mem[r + c * cs + k]);
+                    inv.mem[dst + c * cs + k] = ub(if op == OP_ADD { a + b } else { a - b });
+                }
+            }
+            return;
+        }
+        // multiplication
+        if lt.kind == TK_MATRIX && rt.kind == TK_SCALAR {
+            let cs = lt.stride / 4;
+            let s = fl(inv.mem[r]);
+            for c in 0..lt.n {
+                for k in 0..lt.m {
+                    inv.mem[dst + c * cs + k] = ub(fl(inv.mem[l + c * cs + k]) * s);
+                }
+            }
+            return;
+        }
+        if lt.kind == TK_SCALAR {
+            let cs = rt.stride / 4;
+            let s = fl(inv.mem[l]);
+            for c in 0..rt.n {
+                for k in 0..rt.m {
+                    inv.mem[dst + c * cs + k] = ub(s * fl(inv.mem[r + c * cs + k]));
+                }
+            }
+            return;
+        }
+        if lt.kind == TK_MATRIX && rt.kind == TK_VECTOR {
+            // (C x R) * vecC -> vecR
+            let cs = lt.stride / 4;
+            let mut out: [f32; 4] = [0.0; 4];
+            for k in 0..lt.m {
+                let mut acc: f32 = 0.0;
+                for c in 0..lt.n {
+                    acc = acc + fl(inv.mem[l + c * cs + k]) * fl(inv.mem[r + c]);
+                }
+                out[k] = acc;
+            }
+            for k in 0..lt.m {
+                inv.mem[dst + k] = ub(out[k]);
+            }
+            return;
+        }
+        if lt.kind == TK_VECTOR {
+            // vecR * (C x R) -> vecC
+            let cs = rt.stride / 4;
+            let mut out: [f32; 4] = [0.0; 4];
+            for c in 0..rt.n {
+                let mut acc: f32 = 0.0;
+                for k in 0..rt.m {
+                    acc = acc + fl(inv.mem[l + k]) * fl(inv.mem[r + c * cs + k]);
+                }
+                out[c] = acc;
+            }
+            for c in 0..rt.n {
+                inv.mem[dst + c] = ub(out[c]);
+            }
+            return;
+        }
+        // (K x R) * (C x K) -> (C x R)
+        let ls = lt.stride / 4;
+        let rs = rt.stride / 4;
+        let ds = res.stride / 4;
+        let mut out: [f32; 16] = [0.0; 16];
+        for c in 0..rt.n {
+            for k in 0..lt.m {
+                let mut acc: f32 = 0.0;
+                for j in 0..lt.n {
+                    acc = acc + fl(inv.mem[l + j * ls + k]) * fl(inv.mem[r + c * rs + j]);
+                }
+                out[c * 4 + k] = acc;
+            }
+        }
+        for c in 0..rt.n {
+            for k in 0..lt.m {
+                inv.mem[dst + c * ds + k] = ub(out[c * 4 + k]);
+            }
+        }
+    }
+
+    fn math(self: *Interp, m: *Module, inv: *Inv, fx: *Function, fr: Frame, e: i64) {
+        let x = fx.exprs[e];
+        let regs = self.fns[fr.func].regs;
+        let dst = fr.base + regs[e];
+        let fun = x.a;
+        let nargs = x.c;
+        let mut a: [i64; 4] = [0; 4];
+        for k in 0..nargs {
+            a[k] = fr.base + regs[fx.args[x.b + k]];
+        }
+        let at = m.types[fx.exprs[fx.args[x.b]].ty];
+        let n = if at.kind == TK_VECTOR { at.n } else { 1 };
+        let sk = at.scalar;
+        if fun == ir::MF_DOT {
+            let mut accf: f32 = 0.0;
+            let mut acci: u32 = 0;
+            for k in 0..n {
+                let p = inv.mem[a[0] + k];
+                let q = inv.mem[a[1] + k];
+                if sk == SK_F32 {
+                    accf = accf + fl(p) * fl(q);
+                } else {
+                    acci = acci + p * q;
+                }
+            }
+            inv.mem[dst] = if sk == SK_F32 { ub(accf) } else { acci };
+            return;
+        }
+        if fun == ir::MF_LENGTH || fun == ir::MF_DISTANCE || fun == ir::MF_NORMALIZE {
+            let mut acc: f32 = 0.0;
+            for k in 0..n {
+                let mut v = fl(inv.mem[a[0] + k]);
+                if fun == ir::MF_DISTANCE {
+                    v = v - fl(inv.mem[a[1] + k]);
+                }
+                acc = acc + v * v;
+            }
+            let len = unsafe { cm::sqrtf(acc) };
+            if fun == ir::MF_NORMALIZE {
+                for k in 0..n {
+                    inv.mem[dst + k] = ub(fl(inv.mem[a[0] + k]) / len);
+                }
+            } else {
+                inv.mem[dst] = ub(len);
+            }
+            return;
+        }
+        if fun == ir::MF_CROSS {
+            let p = [fl(inv.mem[a[0]]), fl(inv.mem[a[0] + 1]), fl(inv.mem[a[0] + 2])];
+            let q = [fl(inv.mem[a[1]]), fl(inv.mem[a[1] + 1]), fl(inv.mem[a[1] + 2])];
+            inv.mem[dst] = ub(p[1] * q[2] - p[2] * q[1]);
+            inv.mem[dst + 1] = ub(p[2] * q[0] - p[0] * q[2]);
+            inv.mem[dst + 2] = ub(p[0] * q[1] - p[1] * q[0]);
+            return;
+        }
+        if fun == ir::MF_REFLECT || fun == ir::MF_FACE_FORWARD {
+            // reflect(e1, e2) = e1 - 2 * dot(e2, e1) * e2
+            // faceForward(e1, e2, e3) = if dot(e2, e3) < 0 { e1 } else { -e1 }
+            let p = if fun == ir::MF_REFLECT { a[1] } else { a[1] };
+            let q = if fun == ir::MF_REFLECT { a[0] } else { a[2] };
+            let mut d: f32 = 0.0;
+            for k in 0..n {
+                d = d + fl(inv.mem[p + k]) * fl(inv.mem[q + k]);
+            }
+            for k in 0..n {
+                let e1 = fl(inv.mem[a[0] + k]);
+                inv.mem[dst + k] = if fun
+                    == ir::MF_REFLECT { ub(e1 - 2.0 * d * fl(inv.mem[a[1] + k])) }
+                    else if d < 0.0 { ub(e1) } else { ub(-e1) };
+            }
+            return;
+        }
+        if fun == ir::MF_ALL || fun == ir::MF_ANY {
+            let mut r = if fun == ir::MF_ALL { 1u32 } else { 0u32 };
+            for k in 0..n {
+                let v = inv.mem[a[0] + k];
+                if fun == ir::MF_ALL && v == 0 {
+                    r = 0;
+                }
+                if fun == ir::MF_ANY && v != 0 {
+                    r = 1;
+                }
+            }
+            inv.mem[dst] = r;
+            return;
+        }
+        if fun == ir::MF_DETERMINANT || fun == ir::MF_TRANSPOSE {
+            let cs = at.stride / 4;
+            if fun == ir::MF_TRANSPOSE {
+                let rt = m.types[x.ty];
+                let rs = rt.stride / 4;
+                for c in 0..at.n {
+                    for k in 0..at.m {
+                        inv.mem[dst + k * rs + c] = inv.mem[a[0] + c * cs + k];
+                    }
+                }
+                return;
+            }
+            let mut mm: [f32; 16] = [0.0; 16];
+            for c in 0..at.n {
+                for k in 0..at.m {
+                    mm[c * 4 + k] = fl(inv.mem[a[0] + c * cs + k]);
+                }
+            }
+            inv.mem[dst] = ub(determinant(mm, at.n));
+            return;
+        }
+        if fun >= ir::MF_PACK4X8UNORM && fun <= ir::MF_UNPACK2X16FLOAT
+            || fun >= ir::MF_PACK4X8SNORM {
+            self.packing(inv, fun, a[0], dst);
+            return;
+        }
+        // component-wise
+        let mix_scalar = false;
+        let _ = mix_scalar;
+        for k in 0..n {
+            let p = inv.mem[a[0] + k];
+            let q = if nargs > 1 { inv.mem[a[1] + k] } else { 0 };
+            let r = if nargs > 2 { inv.mem[a[2] + k] } else { 0 };
+            let s = if nargs > 3 { inv.mem[a[3] + k] } else { 0 };
+            if fun == ir::MF_EXTRACT_BITS {
+                inv.mem[dst + k] = extract_bits(p, inv.mem[a[1]], inv.mem[a[2]], sk == SK_I32);
+                continue;
+            }
+            if fun == ir::MF_INSERT_BITS {
+                inv.mem[dst + k] = insert_bits(p, q, inv.mem[a[2]], inv.mem[a[3]]);
+                continue;
+            }
+            let _ = s;
+            inv.mem[dst + k] = component_math(fun, sk, p, q, r);
+        }
+    }
+
+    fn packing(self: *Interp, inv: *Inv, fun: i64, src: i64, dst: i64) {
+        if fun == ir::MF_PACK4X8UNORM || fun == ir::MF_PACK4X8SNORM {
+            let mut r: u32 = 0;
+            for k in 0..4 {
+                let v = fl(inv.mem[src + k]);
+                let q = if fun == ir::MF_PACK4X8UNORM {
+                    (round_even(clampf(v, 0.0, 1.0) * 255.0) as i64) & 255
+                } else {
+                    (round_even(clampf(v, -1.0, 1.0) * 127.0) as i64) & 255
+                };
+                r = r | ((q as u32) << (8 * k) as u32);
+            }
+            inv.mem[dst] = r;
+        } else if fun == ir::MF_UNPACK4X8UNORM || fun == ir::MF_UNPACK4X8SNORM {
+            let v = inv.mem[src];
+            for k in 0..4 {
+                let b = (v >> (8 * k) as u32) & 255;
+                inv.mem[dst + k] = if fun == ir::MF_UNPACK4X8UNORM {
+                    ub(b as f32 / 255.0)
+                } else {
+                    let sb = if b >= 128 { b as i64 - 256 } else { b as i64 };
+                    ub(maxf(sb as f32 / 127.0, -1.0))
+                };
+            }
+        } else if fun == ir::MF_PACK2X16UNORM || fun == ir::MF_PACK2X16SNORM {
+            let mut r: u32 = 0;
+            for k in 0..2 {
+                let v = fl(inv.mem[src + k]);
+                let q = if fun == ir::MF_PACK2X16UNORM {
+                    (round_even(clampf(v, 0.0, 1.0) * 65535.0) as i64) & 65535
+                } else {
+                    (round_even(clampf(v, -1.0, 1.0) * 32767.0) as i64) & 65535
+                };
+                r = r | ((q as u32) << (16 * k) as u32);
+            }
+            inv.mem[dst] = r;
+        } else if fun == ir::MF_UNPACK2X16UNORM || fun == ir::MF_UNPACK2X16SNORM {
+            let v = inv.mem[src];
+            for k in 0..2 {
+                let b = (v >> (16 * k) as u32) & 65535;
+                inv.mem[dst + k] = if fun == ir::MF_UNPACK2X16UNORM {
+                    ub(b as f32 / 65535.0)
+                } else {
+                    let sb = if b >= 32768 { b as i64 - 65536 } else { b as i64 };
+                    ub(maxf(sb as f32 / 32767.0, -1.0))
+                };
+            }
+        } else if fun == ir::MF_PACK2X16FLOAT {
+            let lo = f32_to_f16(fl(inv.mem[src]));
+            let hi = f32_to_f16(fl(inv.mem[src + 1]));
+            inv.mem[dst] = lo | (hi << 16);
+        } else {
+            let v = inv.mem[src];
+            inv.mem[dst] = ub(f16_to_f32(v & 65535));
+            inv.mem[dst + 1] = ub(f16_to_f32(v >> 16));
+        }
+    }
+}
+
+fn clampf(x: f32, lo: f32, hi: f32) -> f32 { if x < lo { lo } else if x > hi { hi } else { x } }
+
+fn maxf(a: f32, b: f32) -> f32 { if a > b { a } else { b } }
+
+fn round_even(x: f32) -> f32 { unsafe { cm::rintf(x) } }
+
+fn f32_to_f16(x: f32) -> u32 {
+    let b = ub(x);
+    let sign = (b >> 16) & 32768;
+    let exp = ((b >> 23) & 255) as i64 - 127 + 15;
+    let man = b & 8388607;
+    if ((b >> 23) & 255) == 255 {
+        return sign | 31744 | (if man != 0 { 512 } else { 0 });
+    }
+    if exp >= 31 {
+        return sign | 31744;
+    }
+    if exp <= 0 {
+        if exp < -10 {
+            return sign;
+        }
+        let m2 = man | 8388608;
+        let shift = (14 - exp) as u32;
+        let mut h = m2 >> shift;
+        let rem = m2 & ((1u32 << shift) - 1);
+        let half = 1u32 << (shift - 1);
+        if rem > half || (rem == half && (h & 1) != 0) {
+            h += 1;
+        }
+        return sign | h;
+    }
+    let mut h = sign | ((exp as u32) << 10) | (man >> 13);
+    let rem = man & 8191;
+    if rem > 4096 || (rem == 4096 && (h & 1) != 0) {
+        h += 1;
+    }
+    h
+}
+
+fn f16_to_f32(h: u32) -> f32 {
+    let sign = (h & 32768) << 16;
+    let exp = (h >> 10) & 31;
+    let man = h & 1023;
+    if exp == 0 {
+        let v = man as f32 / 16777216.0;
+        return if sign != 0 { -v } else { v };
+    }
+    if exp == 31 {
+        return fl(sign | 2139095040 | (man << 13));
+    }
+    fl(sign | ((exp + 112) << 23) | (man << 13))
+}
+
+fn determinant(m: [f32; 16], n: i64) -> f32 {
+    if n == 2 {
+        return m[0] * m[5] - m[4] * m[1];
+    }
+    if n == 3 {
+        return m[0] * (m[5] * m[10] - m[9] * m[6]) - m[4] * (m[1] * m[10] - m[9] * m[2]) + m[8] * (
+            m[1] * m[6] - m[5] * m[2]);
+    }
+    let mut det: f32 = 0.0;
+    for c in 0..4 {
+        let mut sub: [f32; 16] = [0.0; 16];
+        let mut sc = 0;
+        for j in 0..4 {
+            if j == c {
+                continue;
+            }
+            for k in 1..4 {
+                sub[sc * 4 + k - 1] = m[j * 4 + k];
+            }
+            sc += 1;
+        }
+        let d = determinant(sub, 3);
+        det = if c % 2 == 0 { det + m[c * 4] * d } else { det - m[c * 4] * d };
+    }
+    det
+}
+
+pub fn convert(v: u32, from: u8, to: u8) -> u32 {
+    if from == to {
+        return v;
+    }
+    if to == SK_BOOL {
+        return if from == SK_F32 { if fl(v) != 0.0 { 1 } else { 0 } } else if v != 0 { 1 }
+            else { 0 };
+    }
+    if from == SK_BOOL {
+        return if to == SK_F32 { if v != 0 { ub(1.0) } else { 0 } } else { v };
+    }
+    if to == SK_F32 {
+        return if from == SK_I32 { ub(si(v) as f32) } else { ub(v as i64 as f32) };
+    }
+    if from == SK_F32 {
+        let x = fl(v);
+        if x != x {
+            return 0;
+        }
+        if to == SK_I32 {
+            if x <= -2147483648.0 {
+                return 2147483648;
+            }
+            if x >= 2147483647.0 {
+                return 2147483647;
+            }
+            return (x as i64) as u32;
+        }
+        if x <= 0.0 {
+            return 0;
+        }
+        if x >= 4294967295.0 {
+            return 4294967295;
+        }
+        return (x as i64) as u32;
+    }
+    // i32 <-> u32: the bits
+    v
+}
+
+pub fn scalar_binary(op: i64, sk: u8, a: u32, b: u32) -> u32 {
+    if sk == SK_F32 {
+        let x = fl(a);
+        let y = fl(b);
+        if op == OP_ADD {
+            return ub(x + y);
+        }
+        if op == OP_SUB {
+            return ub(x - y);
+        }
+        if op == OP_MUL {
+            return ub(x * y);
+        }
+        if op == OP_DIV {
+            return ub(x / y);
+        }
+        if op == OP_MOD {
+            // WGSL: x - y * trunc(x / y)
+            return ub(unsafe { cm::fmodf(x, y) });
+        }
+        let c = if op == OP_EQ { x == y } else if op == OP_NE { x != y }
+            else if op == OP_LT { x < y } else if op == OP_LE { x <= y }
+            else if op == OP_GT { x > y } else { x >= y };
+        return if c { 1 } else { 0 };
+    }
+    if op == OP_ADD {
+        return a + b;
+    }
+    if op == OP_SUB {
+        return a - b;
+    }
+    if op == OP_MUL {
+        return a * b;
+    }
+    if op == OP_DIV {
+        if b == 0 {
+            return a;
+        }
+        if sk == SK_I32 {
+            if a == 2147483648 && b == 4294967295 {
+                return a;
+            }
+            return (si(a) / si(b)) as u32;
+        }
+        return a / b;
+    }
+    if op == OP_MOD {
+        if b == 0 {
+            return 0;
+        }
+        if sk == SK_I32 {
+            if a == 2147483648 && b == 4294967295 {
+                return 0;
+            }
+            return (si(a) % si(b)) as u32;
+        }
+        return a % b;
+    }
+    if op == OP_AND || op == OP_LAND {
+        return a & b;
+    }
+    if op == OP_OR || op == OP_LOR {
+        return a | b;
+    }
+    if op == OP_XOR {
+        return a ^ b;
+    }
+    if op == OP_SHL {
+        return a << (b & 31);
+    }
+    if op == OP_SHR {
+        if sk == SK_I32 {
+            return (si(a) >> (b & 31) as i64) as u32;
+        }
+        return a >> (b & 31);
+    }
+    let c = if sk == SK_I32 {
+        let x = si(a);
+        let y = si(b);
+        if op == OP_EQ { x == y } else if op == OP_NE { x != y } else if op == OP_LT { x < y }
+        else if op == OP_LE { x <= y } else if op == OP_GT { x > y } else { x >= y }
+    } else {
+        if op == OP_EQ { a == b } else if op == OP_NE { a != b } else if op == OP_LT { a < b }
+        else if op == OP_LE { a <= b } else if op == OP_GT { a > b } else { a >= b }
+    };
+    if c { 1 } else { 0 }
+}
+
+fn extract_bits(e: u32, offset: u32, count: u32, signed: bool) -> u32 {
+    let o = if offset > 32 { 32 } else { offset };
+    let c = if count > 32 - o { 32 - o } else { count };
+    if c == 0 {
+        return 0;
+    }
+    let v = if o == 32 { 0 } else { e >> o };
+    if c == 32 {
+        return v;
+    }
+    let mask = (1u32 << c) - 1;
+    let r = v & mask;
+    if signed && (r >> (c - 1)) & 1 != 0 {
+        return r | ~mask;
+    }
+    r
+}
+
+fn insert_bits(e: u32, nb: u32, offset: u32, count: u32) -> u32 {
+    let o = if offset > 32 { 32 } else { offset };
+    let c = if count > 32 - o { 32 - o } else { count };
+    if c == 0 {
+        return e;
+    }
+    let mask = if c == 32 { 4294967295u32 } else { ((1u32 << c) - 1) << o };
+    (e & ~mask) | ((nb << o) & mask)
+}
+
+fn clz(x: u32) -> u32 {
+    if x == 0 {
+        return 32;
+    }
+    std::leading_zeros(x as u64) as u32 - 32
+}
+
+fn ctz(x: u32) -> u32 {
+    if x == 0 {
+        return 32;
+    }
+    std::trailing_zeros(x as u64) as u32
+}
+
+pub fn component_math(fun: i64, sk: u8, p: u32, q: u32, r: u32) -> u32 {
+    if sk != SK_F32 {
+        let signed = sk == SK_I32;
+        if fun == ir::MF_ABS {
+            return if signed && si(p) < 0 { 0 - p } else { p };
+        }
+        if fun == ir::MF_MIN {
+            return if (signed && si(q) < si(p)) || (!signed && q < p) { q } else { p };
+        }
+        if fun == ir::MF_MAX {
+            return if (signed && si(q) > si(p)) || (!signed && q > p) { q } else { p };
+        }
+        if fun == ir::MF_CLAMP {
+            let lo = component_math(ir::MF_MAX, sk, p, q, 0);
+            return component_math(ir::MF_MIN, sk, lo, r, 0);
+        }
+        if fun == ir::MF_SIGN {
+            return if si(p) > 0 { 1 } else if si(p) < 0 { 4294967295 } else { 0 };
+        }
+        if fun == ir::MF_COUNT_ONE_BITS {
+            let mut c: u32 = 0;
+            let mut x = p;
+            while x != 0 {
+                c += x & 1;
+                x = x >> 1;
+            }
+            return c;
+        }
+        if fun == ir::MF_COUNT_LEADING_ZEROS {
+            return clz(p);
+        }
+        if fun == ir::MF_COUNT_TRAILING_ZEROS {
+            return ctz(p);
+        }
+        if fun == ir::MF_FIRST_LEADING_BIT {
+            let x = if signed && si(p) < 0 { ~p } else { p };
+            if x == 0 {
+                return 4294967295;
+            }
+            return 31 - clz(x);
+        }
+        if fun == ir::MF_FIRST_TRAILING_BIT {
+            if p == 0 {
+                return 4294967295;
+            }
+            return ctz(p);
+        }
+        if fun == ir::MF_REVERSE_BITS {
+            let mut x = p;
+            let mut rr: u32 = 0;
+            for _ in 0..32 {
+                rr = (rr << 1) | (x & 1);
+                x = x >> 1;
+            }
+            return rr;
+        }
+        return 0;
+    }
+    let x = fl(p);
+    let y = fl(q);
+    let z = fl(r);
+    let v: f32 = if fun == ir::MF_ABS {
+        if x < 0.0 { -x } else if x == 0.0 { 0.0 } else { x }
+    } else if fun == ir::MF_MIN {
+        unsafe { cm::fminf(x, y) }
+    } else if fun == ir::MF_MAX {
+        unsafe { cm::fmaxf(x, y) }
+    } else if fun == ir::MF_CLAMP {
+        unsafe { cm::fminf(cm::fmaxf(x, y), z) }
+    } else if fun == ir::MF_SIGN {
+        if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }
+    } else if fun == ir::MF_FLOOR {
+        unsafe { cm::floorf(x) }
+    } else if fun == ir::MF_CEIL {
+        unsafe { cm::ceilf(x) }
+    } else if fun == ir::MF_ROUND {
+        unsafe { cm::rintf(x) }
+    } else if fun == ir::MF_FRACT {
+        x - unsafe { cm::floorf(x) }
+    } else if fun == ir::MF_TRUNC {
+        unsafe { cm::truncf(x) }
+    } else if fun == ir::MF_SQRT {
+        unsafe { cm::sqrtf(x) }
+    } else if fun == ir::MF_INVERSE_SQRT {
+        1.0 / unsafe { cm::sqrtf(x) }
+    } else if fun == ir::MF_EXP {
+        unsafe { cm::expf(x) }
+    } else if fun == ir::MF_EXP2 {
+        unsafe { cm::exp2f(x) }
+    } else if fun == ir::MF_LOG {
+        unsafe { cm::logf(x) }
+    } else if fun == ir::MF_LOG2 {
+        unsafe { cm::log2f(x) }
+    } else if fun == ir::MF_POW {
+        unsafe { cm::powf(x, y) }
+    } else if fun == ir::MF_SIN {
+        unsafe { cm::sinf(x) }
+    } else if fun == ir::MF_COS {
+        unsafe { cm::cosf(x) }
+    } else if fun == ir::MF_TAN {
+        unsafe { cm::tanf(x) }
+    } else if fun == ir::MF_ASIN {
+        unsafe { cm::asinf(x) }
+    } else if fun == ir::MF_ACOS {
+        unsafe { cm::acosf(x) }
+    } else if fun == ir::MF_ATAN {
+        unsafe { cm::atanf(x) }
+    } else if fun == ir::MF_ATAN2 {
+        unsafe { cm::atan2f(x, y) }
+    } else if fun == ir::MF_SINH {
+        unsafe { cm::sinhf(x) }
+    } else if fun == ir::MF_COSH {
+        unsafe { cm::coshf(x) }
+    } else if fun == ir::MF_TANH {
+        unsafe { cm::tanhf(x) }
+    } else if fun == ir::MF_ASINH {
+        unsafe { cm::asinhf(x) }
+    } else if fun == ir::MF_ACOSH {
+        unsafe { cm::acoshf(x) }
+    } else if fun == ir::MF_ATANH {
+        unsafe { cm::atanhf(x) }
+    } else if fun == ir::MF_MIX {
+        x * (1.0 - z) + y * z
+    } else if fun == ir::MF_STEP {
+        if y >= x { 1.0 } else { 0.0 }
+    } else if fun == ir::MF_SMOOTHSTEP {
+        let t = clampf((z - x) / (y - x), 0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    } else if fun == ir::MF_FMA {
+        unsafe { cm::fmaf(x, y, z) }
+    } else if fun == ir::MF_DEGREES {
+        x * 57.295779513082322865
+    } else if fun == ir::MF_RADIANS {
+        x * 0.017453292519943295
+    } else if fun == ir::MF_SATURATE {
+        clampf(x, 0.0, 1.0)
+    } else if fun == ir::MF_LDEXP {
+        unsafe { cm::ldexpf(x, q as i32) }
+    } else {
+        0.0
+    };
+    ub(v)
+}

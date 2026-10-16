@@ -1,0 +1,91 @@
+// The translator's entry: WGSL source to an output (the IR as text, MSL,
+// SPIR-V), on an arena of its own (docs/design/gpu.md §2.10: everything a
+// translation allocates is freed when it ends; no io, no globals).
+use front::new_front;
+
+pub const TARGET_CHECK: i64 = 0;
+pub const TARGET_IR: i64 = 1;
+pub const TARGET_MSL: i64 = 2;
+pub const TARGET_SPIRV: i64 = 3;
+
+pub struct Options {
+    target: i64,
+    // bench only: no bounds checks (the cost of the checks is measured
+    // against this; never shipped)
+    no_checks: bool,
+    // drop checks proven unneeded by a dominating loop condition
+    prove: bool,
+}
+
+pub fn options(target: i64) -> Options { Options { target: target, no_checks: false, prove: true } }
+
+// A shader the translator rejects: its first error.
+pub struct ShaderError { code: [u8], pos: i64, line: i64, col: i64, msg: Buf, help: Buf }
+
+pub fn new_error(gpa: Gpa) -> ShaderError {
+    ShaderError { code: "", pos: 0, line: 0, col: 0, msg: Buf::new_in(gpa), help: Buf::new_in(gpa) }
+}
+
+impl ShaderError {
+    pub fn free(self: *ShaderError) {
+        self.msg.free();
+        self.help.free();
+    }
+}
+
+// The 1-based line and column of byte `pos`.
+pub fn line_col(src: [u8], pos: i64) -> (i64, i64) {
+    let mut line = 1;
+    let mut col = 1;
+    let end = if pos < src.len { pos } else { src.len };
+    for i in 0..end {
+        if src[i] == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+pub fn fill_error(fr: *front::Front, err: *ShaderError) {
+    err.code = fr.err_code;
+    err.pos = fr.err_pos;
+    let (l, c) = line_col(fr.src, fr.err_pos);
+    err.line = l;
+    err.col = c;
+    err.msg.clear();
+    err.msg.push_str(fr.emsg.as_slice());
+    err.help.clear();
+    err.help.push_str(fr.ehelp.as_slice());
+}
+
+// Translates src; the output is appended to `out` (SPIR-V: its words,
+// little-endian). False, with err filled, when the shader is rejected.
+pub fn translate(src: [u8], opts: Options, out: *Buf, err: *ShaderError, gpa: Gpa) -> bool {
+    arena_scope(gpa, |a| -> bool {
+        let mut fr = new_front(src, a);
+        fr.module();
+        if !fr.failed {
+            uniformity::check(&fr);
+        }
+        if fr.failed {
+            fill_error(&fr, err);
+            return false;
+        }
+        if !opts.no_checks {
+            bounds::insert_checks(&fr.m, a, opts.prove);
+        } else {
+            bounds::insert_no_checks(&fr.m);
+        }
+        if opts.target == TARGET_IR {
+            dump::dump(&fr.m, out);
+        } else if opts.target == TARGET_MSL {
+            msl::write(&fr.m, a, out);
+        } else if opts.target == TARGET_SPIRV {
+            spirv::write(&fr.m, a, out);
+        }
+        true
+    })
+}

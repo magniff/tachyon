@@ -1,0 +1,2225 @@
+// The MSL writer (docs/design/gpu.md §2.10): MSL 3.0 text for Metal's
+// run-time compiler, with WGSL's semantics kept where MSL's differ.
+//
+// - Layout: structs get explicit padding and `packed_` vec3 members, so
+//   every struct has WGSL's offsets and size; fixed-size arrays are
+//   wrapped in a struct (`_w_arrN { T inner[N]; }`) to be values.
+// - No undefined behaviour: signed + - * and negation go through uint;
+//   integer / and % through helpers (by zero, MIN / -1); shift amounts are
+//   masked; float to int conversions saturate; every index is clamped or,
+//   for runtime-sized arrays, guarded against the binding's size from the
+//   hidden sizes buffer (`[[buffer(30)]]`).
+// - Bindings: buffers take slots 0.. in declaration order, textures and
+//   samplers theirs; `reflect` gives the slots.
+// - Values: an expression is written where it is used, except loads,
+//   results, `let`s and those used more than once, which get a name where
+//   they are evaluated (their S_EMIT).
+use entry::builtin_name;
+use ir::{
+    ACC_WRITE, AT_ADD, AT_AND, AT_CMPXCHG, AT_EXCHANGE, AT_LOAD, AT_MAX, AT_MIN, AT_OR, AT_STORE,
+    AT_SUB, AT_XOR, BARRIER_WORKGROUP, BIND_BUILTIN, BIND_LOCATION, BI_FRAG_DEPTH, BI_FRONT_FACING,
+    BI_GLOBAL_INVOCATION_ID, BI_INSTANCE_INDEX, BI_LOCAL_INVOCATION_ID, BI_LOCAL_INVOCATION_INDEX,
+    BI_NUM_WORKGROUPS, BI_POSITION, BI_SAMPLE_INDEX, BI_SAMPLE_MASK, BI_VERTEX_INDEX,
+    BI_WORKGROUP_ID, Binding, CK_CLAMP, CK_RZSW, E_ACCESS, E_ACCESS_INDEX, E_ARG, E_ARRAY_LENGTH,
+    E_ATOMIC_RESULT, E_BINARY, E_BITCAST, E_CALL_RESULT, E_COMPOSE, E_CONVERT, E_DERIVATIVE,
+    E_GLOBAL, E_IMAGE_LOAD, E_IMAGE_QUERY, E_IMAGE_SAMPLE, E_LITERAL, E_LOAD, E_LOCAL, E_MATH,
+    E_SELECT, E_SPLAT, E_SWIZZLE, E_UNARY, E_WG_UNIFORM_RESULT, E_ZERO, Function, IMG_SAMPLE_BIAS,
+    IMG_SAMPLE_COMPARE, IMG_SAMPLE_COMPARE_LEVEL, IMG_SAMPLE_LEVEL, INTERP_FLAT, INTERP_LINEAR,
+    IQ_LAYERS, IQ_LEVELS, Module, OP_ADD, OP_AND, OP_DIV, OP_EQ, OP_GE, OP_GT, OP_LAND, OP_LE,
+    OP_LOR, OP_LT, OP_MOD, OP_MUL, OP_NE, OP_OR, OP_SHL, OP_SHR, OP_SUB, OP_XOR, SK_BOOL, SK_F32,
+    SK_I32, SK_U32, SP_FUNCTION, SP_HANDLE, SP_PRIVATE, SP_STORAGE, SP_UNIFORM, SP_WORKGROUP,
+    STAGE_COMPUTE, STAGE_FRAGMENT, STAGE_VERTEX, S_ATOMIC, S_BARRIER, S_BLOCK, S_BREAK, S_CALL,
+    S_CONTINUE, S_EMIT, S_IF, S_IMAGE_STORE, S_KILL, S_LOOP, S_RETURN, S_STORE, S_SWITCH,
+    S_WG_UNIFORM_LOAD, TEX_2D_ARRAY, TEX_DEPTH_2D, TEX_STORAGE_2D, TK_ARRAY, TK_ATOMIC, TK_MATRIX,
+    TK_POINTER, TK_SAMPLER, TK_SCALAR, TK_STRUCT, TK_TEXTURE, TK_VECTOR, Type, UN_BITNOT, UN_NEG,
+    UN_NOT, V, bits_f32,
+};
+
+pub const SIZES_SLOT: i64 = 30;
+
+const RESERVED: [[u8]; 103] = [
+    "main", "kernel", "vertex", "fragment", "device", "constant", "thread", "threadgroup",
+    "threadgroup_imageblock", "ray_data", "object_data", "metal", "using", "namespace",
+    "template", "typename", "class", "struct", "union", "enum", "public", "private", "protected",
+    "virtual", "operator", "new", "delete", "this", "auto", "register", "static", "extern",
+    "inline", "volatile", "const", "constexpr", "explicit", "friend", "mutable", "goto",
+    "sizeof", "typedef", "typeid", "signed", "unsigned", "short", "long", "int", "uint", "char",
+    "uchar", "float", "half", "double", "bool", "void", "true", "false", "nullptr", "do",
+    "while", "for", "if", "else", "switch", "case", "default", "break", "continue", "return",
+    "try", "catch", "throw", "and", "or", "not", "xor", "bitand", "bitor", "compl", "not_eq",
+    "and_eq", "or_eq", "xor_eq", "asm", "export", "alignas", "alignof", "decltype", "noexcept",
+    "static_assert", "static_cast", "dynamic_cast", "const_cast", "reinterpret_cast", "wchar_t",
+    "char16_t", "char32_t", "int8_t", "uint8_t", "int16_t", "size_t", "ptrdiff_t",
+];
+
+const MATH_NAMES: [[u8]; 39] = [
+    "abs", "min", "max", "clamp", "sign", "floor", "ceil", "rint", "fract", "trunc", "sqrt",
+    "rsqrt", "exp", "exp2", "log", "log2", "pow", "sin", "cos", "tan", "asin", "acos", "atan",
+    "atan2", "sinh", "cosh", "tanh", "mix", "step", "smoothstep", "fma", "length", "distance",
+    "dot", "cross", "normalize", "reflect", "determinant", "transpose",
+];
+
+// Where an entry point's resources are bound.
+pub struct Slots {
+    // per global: its buffer, texture or sampler slot, or -1
+    slot: V<i64>,
+    // per global: its index in the sizes buffer (runtime-sized storage), or -1
+    size_index: V<i64>,
+    sizes_count: i64,
+}
+
+pub fn slots(m: *Module, a: ScopedArena) -> Slots {
+    let mut s = Slots { slot: Vec::new_in(a), size_index: Vec::new_in(a), sizes_count: 0 };
+    let mut nb = 0;
+    let mut nt = 0;
+    let mut ns = 0;
+    for g in 0..m.globals.len() {
+        let gl = m.globals[g];
+        let k = m.types[gl.ty].kind;
+        if gl.space == SP_UNIFORM || gl.space == SP_STORAGE {
+            s.slot.push(nb);
+            nb += 1;
+        } else if k == TK_TEXTURE {
+            s.slot.push(nt);
+            nt += 1;
+        } else if k == TK_SAMPLER {
+            s.slot.push(ns);
+            ns += 1;
+        } else {
+            s.slot.push(-1);
+        }
+        if gl.space == SP_STORAGE && m.is_runtime_sized(gl.ty) {
+            s.size_index.push(s.sizes_count);
+            s.sizes_count += 1;
+        } else {
+            s.size_index.push(-1);
+        }
+    }
+    s
+}
+
+struct W {
+    a: ScopedArena,
+    out: Buf<ScopedArena>,
+    // the types' MSL names, made on first use; -1 slots are not yet written
+    tname: V<[u8]>,
+    tdone: V<bool>,
+    types_out: Buf<ScopedArena>,
+    // helpers used
+    need_div: bool,
+    need_f2i: bool,
+    need_sign: bool,
+    need_flb: bool,
+    need_ftb: bool,
+    need_cmpxchg: V<[u8]>,
+    sl: Slots,
+    // per function: the globals it uses (directly or through calls)
+    uses: V<V<bool>>,
+    fnames: V<[u8]>,
+    gnames: V<[u8]>,
+    // the function being written
+    fh: i64,
+    refc: V<i64>,
+    baked: V<bool>,
+    // a name per local, parameter and baked expression of the function
+    lnames: V<[u8]>,
+    enames: V<[u8]>,
+    used: HashMap<[u8], bool, ScopedArena>,
+    indent: i64,
+    loop_n: i64,
+    // entry points: the stage being written (255: a plain function), and
+    // its output struct's name
+    stage: i64,
+    out_name: [u8],
+    ret_ty: i64,
+    // each type's kind
+    kinds: V<u8>,
+}
+
+fn is_reserved(s: [u8]) -> bool {
+    for i in 0..RESERVED.len() {
+        if RESERVED[i] == s {
+            return true;
+        }
+    }
+    false
+}
+
+impl W {
+    fn p(self: *W, s: [u8]) { self.out.push_str(s); }
+
+    fn line(self: *W) {
+        self.out.push('\n');
+        for _ in 0..self.indent {
+            self.out.push_str("    ");
+        }
+    }
+
+    // A WGSL identifier as an MSL one: reserved words get a `_`, names
+    // starting with `_` a `u` (the writer's own names start with `_`).
+    fn escape(self: *W, s: [u8]) -> [u8] {
+        if s.len == 0 {
+            return "_w_t";
+        }
+        let mut b = Buf::new_in(self.a);
+        if s[0] == '_' {
+            b.push('u');
+        }
+        b.push_str(s);
+        if is_reserved(s) || s.len > 3 && s[0..3] == "_w_" {
+            b.push('_');
+        }
+        b.as_slice()
+    }
+
+    // A name unique in the function being written.
+    fn unique(self: *W, base: [u8]) -> [u8] {
+        let s = self.escape(base);
+        if !self.used.contains_key(s) {
+            self.used.insert(s, true);
+            return s;
+        }
+        let mut k = 1;
+        loop {
+            let mut b = Buf::new_in(self.a);
+            b.push_str(s);
+            b.push_str(f"_{k}");
+            let t = b.as_slice();
+            if !self.used.contains_key(t) {
+                self.used.insert(t, true);
+                return t;
+            }
+            k += 1;
+        }
+    }
+
+    // ---- Types ----
+
+    fn scalar(sk: u8) -> [u8] {
+        if sk == SK_BOOL {
+            "bool"
+        } else if sk == SK_I32 {
+            "int"
+        } else if sk == SK_U32 {
+            "uint"
+        } else {
+            "float"
+        }
+    }
+
+    // The MSL name of type t (declaring structs and array wrappers once).
+    fn ty(self: *W, m: *Module, t: i64) -> [u8] {
+        if self.tdone[t] {
+            return self.tname[t];
+        }
+        let ty = m.types[t];
+        let mut b = Buf::new_in(self.a);
+        if ty.kind == TK_SCALAR {
+            b.push_str(W::scalar(ty.scalar));
+        } else if ty.kind == TK_VECTOR {
+            b.push_str(f"metal::{W::scalar(ty.scalar)}{ty.n}");
+        } else if ty.kind == TK_MATRIX {
+            b.push_str(f"metal::float{ty.n}x{ty.m}");
+        } else if ty.kind == TK_ATOMIC {
+            b.push_str(if ty.scalar == SK_I32 { "metal::atomic_int" }
+                else { "metal::atomic_uint" });
+        } else if ty.kind == TK_ARRAY {
+            let el = self.ty(m, ty.base);
+            b.push_str(f"_w_arr{t}");
+            if ty.n > 0 {
+                self.types_out.push_str(f"struct _w_arr{t} {{\n    {el} inner[{ty.n}];\n}};\n");
+            }
+        } else if ty.kind == TK_STRUCT {
+            b.push_str(self.escape(ty.name));
+            self.struct_def(m, t, b.as_slice());
+        } else if ty.kind == TK_TEXTURE {
+            let st = W::scalar(ty.scalar);
+            if ty.n == TEX_DEPTH_2D {
+                b.push_str("metal::depth2d<float, metal::access::sample>");
+            } else if ty.n == TEX_2D_ARRAY {
+                b.push_str(f"metal::texture2d_array<{st}, metal::access::sample>");
+            } else if ty.n == TEX_STORAGE_2D {
+                b.push_str(f"metal::texture2d<{st}, metal::access::write>");
+            } else {
+                b.push_str(f"metal::texture2d<{st}, metal::access::sample>");
+            }
+        } else if ty.kind == TK_SAMPLER {
+            b.push_str("metal::sampler");
+        } else {
+            b.push_str("void");
+        }
+        self.tname[t] = b.as_slice();
+        self.tdone[t] = true;
+        self.tname[t]
+    }
+
+    // A member's MSL type: vec3 members are packed (12 bytes, as WGSL's).
+    fn member_ty(self: *W, m: *Module, t: i64) -> [u8] {
+        let ty = m.types[t];
+        if ty.kind == TK_VECTOR && ty.n == 3 {
+            let mut b = Buf::new_in(self.a);
+            b.push_str(f"metal::packed_{W::scalar(ty.scalar)}3");
+            return b.as_slice();
+        }
+        if ty.kind == TK_ARRAY && ty.n == 0 {
+            return self.ty(m, ty.base);
+        }
+        self.ty(m, t)
+    }
+
+    fn struct_def(self: *W, m: *Module, t: i64, name: [u8]) {
+        let ty = m.types[t];
+        // member types first: they must be declared before
+        for i in ty.mstart..ty.mstart + ty.mcount {
+            self.member_ty(m, m.members[i].ty);
+        }
+        let mut b = Buf::new_in(self.a);
+        b.push_str(f"struct {name} {{\n");
+        let mut off = 0;
+        let mut pad = 0;
+        for i in ty.mstart..ty.mstart + ty.mcount {
+            let mem = m.members[i];
+            if mem.offset > off {
+                b.push_str(f"    char _pad{pad}[{mem.offset - off}];\n");
+                pad += 1;
+            }
+            let mt = m.types[mem.ty];
+            let mty = self.member_ty(m, mem.ty);
+            if mt.kind == TK_ARRAY && mt.n == 0 {
+                b.push_str(f"    {mty} {self.escape(mem.name)}[1];\n");
+                off = mem.offset + mt.stride;
+            } else {
+                b.push_str(f"    {mty} {self.escape(mem.name)};\n");
+                off = mem.offset + mt.size;
+            }
+        }
+        if ty.size > off
+            && !(ty.mcount > 0 && m.is_runtime_sized(m.members[ty.mstart + ty.mcount - 1].ty)) {
+            b.push_str(f"    char _pad{pad}[{ty.size - off}];\n");
+        }
+        b.push_str("};\n");
+        self.types_out.push_str(b.as_slice());
+    }
+
+    // The padding members before member k of struct t (for aggregate
+    // initialization), and after the last.
+    fn pads_before(m: *Module, t: i64, k: i64) -> bool {
+        let ty = m.types[t];
+        let mem = m.members[ty.mstart + k];
+        if k == 0 {
+            return mem.offset > 0;
+        }
+        let prev = m.members[ty.mstart + k - 1];
+        mem.offset > prev.offset + m.types[prev.ty].size
+    }
+
+    fn space(sp: u8, access: u8) -> [u8] {
+        if sp == SP_STORAGE {
+            if access & ACC_WRITE != 0 { "device" } else { "const device" }
+        } else if sp == SP_UNIFORM {
+            "constant"
+        } else if sp == SP_WORKGROUP {
+            "threadgroup"
+        } else {
+            "thread"
+        }
+    }
+}
+
+// ---- Analysis ----
+
+fn calls_of(f: *Function, list: *V<i64>) {
+    for s in 0..f.stmts.len() {
+        if f.stmts[s].op == S_CALL {
+            list.push(f.stmts[s].a);
+        }
+    }
+}
+
+// Functions in an order where each comes after those it calls.
+pub fn call_order(m: *Module, a: ScopedArena) -> V<i64> {
+    let n = m.functions.len();
+    let mut state: V<u8> = Vec::filled_in(n, 0u8, a);
+    let mut order: V<i64> = Vec::new_in(a);
+    for i in 0..n {
+        visit(m, i, &state, &order, a);
+    }
+    order
+}
+
+fn visit(m: *Module, i: i64, state: *V<u8>, order: *V<i64>, a: ScopedArena) {
+    if state[i] != 0 {
+        return;
+    }
+    state[i] = 1;
+    let mut cs: V<i64> = Vec::new_in(a);
+    calls_of(&m.functions[i], &cs);
+    for k in 0..cs.len() {
+        visit(m, cs[k], state, order, a);
+    }
+    order.push(i);
+}
+
+// Which globals each function uses, through its calls too (order: callees first).
+pub fn global_uses(m: *Module, order: *V<i64>, a: ScopedArena) -> V<V<bool>> {
+    let ng = m.globals.len();
+    let mut uses: V<V<bool>> = Vec::new_in(a);
+    for _ in 0..m.functions.len() {
+        uses.push(Vec::filled_in(ng, false, a));
+    }
+    for oi in 0..order.len() {
+        let h = order[oi];
+        let f = m.functions[h];
+        let mut u = uses[h];
+        for e in 0..f.exprs.len() {
+            if f.exprs[e].op == E_GLOBAL {
+                u[f.exprs[e].a] = true;
+            }
+            if f.exprs[e].op == E_ARRAY_LENGTH {
+                u[f.exprs[e].a] = true;
+            }
+        }
+        for s in 0..f.stmts.len() {
+            if f.stmts[s].op == S_CALL {
+                let cu = uses[f.stmts[s].a];
+                for g in 0..ng {
+                    if cu[g] {
+                        u[g] = true;
+                    }
+                }
+            }
+        }
+    }
+    uses
+}
+
+// Whether function h needs the sizes buffer (a runtime-sized array it or a
+// callee reads).
+fn needs_sizes(w: *W, m: *Module, h: i64) -> bool {
+    for g in 0..m.globals.len() {
+        if w.uses[h][g] && w.sl.size_index[g] >= 0 {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn write(m: *Module, a: ScopedArena, out: *Buf) {
+    let mut w = new_writer(m, a);
+    let order = call_order(m, a);
+    w.uses = global_uses(m, &order, a);
+    for oi in 0..order.len() {
+        let h = order[oi];
+        let mut is_entry = false;
+        for e in 0..m.entries.len() {
+            if m.entries[e].func == h {
+                is_entry = true;
+            }
+        }
+        if !is_entry {
+            write_fn(&w, m, h);
+        }
+    }
+    for e in 0..m.entries.len() {
+        write_entry(&w, m, e);
+    }
+    finish(&w, out);
+}
+
+fn new_writer(m: *Module, a: ScopedArena) -> W {
+    let mut w = W {
+        a: a,
+        out: Buf::with_capacity_in(16384, a),
+        tname: Vec::new_in(a),
+        tdone: Vec::new_in(a),
+        types_out: Buf::new_in(a),
+        need_div: false,
+        need_f2i: false,
+        need_sign: false,
+        need_flb: false,
+        need_ftb: false,
+        need_cmpxchg: Vec::new_in(a),
+        sl: slots(m, a),
+        uses: Vec::new_in(a),
+        fnames: Vec::new_in(a),
+        gnames: Vec::new_in(a),
+        fh: -1,
+        refc: Vec::new_in(a),
+        baked: Vec::new_in(a),
+        lnames: Vec::new_in(a),
+        enames: Vec::new_in(a),
+        used: HashMap::new_in(a),
+        indent: 0,
+        loop_n: 0,
+        stage: 255,
+        out_name: "",
+        ret_ty: -1,
+        kinds: Vec::new_in(a),
+    };
+    for t in 0..m.types.len() {
+        w.tname.push("");
+        w.tdone.push(false);
+        w.kinds.push(m.types[t].kind);
+    }
+    // module-scope names: functions and globals, unique among themselves
+    for h in 0..m.functions.len() {
+        let n = w.unique(m.functions[h].name);
+        w.fnames.push(n);
+    }
+    for g in 0..m.globals.len() {
+        let n = w.unique(m.globals[g].name);
+        w.gnames.push(n);
+    }
+    w
+}
+
+fn helpers<A: Allocator>(w: *W, out: *Buf<A>) {
+    if w.need_div {
+        out.push_str("static inline int _w_div(int a, int b) { return a / metal::select(b, 1, b == 0 || (a == (-2147483647 - 1) && b == -1)); }\n");
+        out.push_str("static inline uint _w_div(uint a, uint b) { return a / metal::select(b, 1u, b == 0u); }\n");
+        out.push_str("static inline int _w_mod(int a, int b) { int c = metal::select(b, 1, b == 0 || (a == (-2147483647 - 1) && b == -1)); return a - (a / c) * c; }\n");
+        out.push_str("static inline uint _w_mod(uint a, uint b) { return metal::select(a % metal::select(b, 1u, b == 0u), 0u, b == 0u); }\n");
+        for n in 2..5 {
+            for k in 0..2 {
+                let t = if k == 0 { "int" } else { "uint" };
+                out.push_str(
+                    f"static inline metal::{t}{n} _w_div(metal::{t}{n} a, metal::{t}{n} b) {{ metal::{t}{n} r; for (int i = 0; i < {n}; i++) r[i] = _w_div(a[i], b[i]); return r; }}\n");
+                out.push_str(
+                    f"static inline metal::{t}{n} _w_mod(metal::{t}{n} a, metal::{t}{n} b) {{ metal::{t}{n} r; for (int i = 0; i < {n}; i++) r[i] = _w_mod(a[i], b[i]); return r; }}\n");
+            }
+        }
+    }
+    if w.need_f2i {
+        out.push_str("static inline int _w_f2i(float x) { return metal::isnan(x) ? 0 : int(metal::clamp(x, -2147483648.0f, 2147483520.0f)); }\n");
+        out.push_str("static inline uint _w_f2u(float x) { return metal::isnan(x) ? 0u : uint(metal::clamp(x, 0.0f, 4294967040.0f)); }\n");
+        for n in 2..5 {
+            out.push_str(
+                f"static inline metal::int{n} _w_f2i(metal::float{n} x) {{ metal::int{n} r; for (int i = 0; i < {n}; i++) r[i] = _w_f2i(x[i]); return r; }}\n");
+            out.push_str(
+                f"static inline metal::uint{n} _w_f2u(metal::float{n} x) {{ metal::uint{n} r; for (int i = 0; i < {n}; i++) r[i] = _w_f2u(x[i]); return r; }}\n");
+        }
+    }
+    if w.need_sign {
+        out.push_str("template <typename T> static inline T _w_isign(T x) { return metal::select(metal::select(T(0), T(-1), x < T(0)), T(1), x > T(0)); }\n");
+    }
+    if w.need_flb {
+        out.push_str("static inline uint _w_flb(uint x) { return metal::select(31u - metal::clz(x), 4294967295u, x == 0u); }\n");
+        out.push_str("static inline int _w_flb(int x) { uint y = as_type<uint>(metal::select(x, ~x, x < 0)); return as_type<int>(metal::select(31u - metal::clz(y), 4294967295u, y == 0u)); }\n");
+        for n in 2..5 {
+            for k in 0..2 {
+                let t = if k == 0 { "int" } else { "uint" };
+                out.push_str(
+                    f"static inline metal::{t}{n} _w_flb(metal::{t}{n} x) {{ metal::{t}{n} r; for (int i = 0; i < {n}; i++) r[i] = _w_flb(x[i]); return r; }}\n");
+            }
+        }
+    }
+    if w.need_ftb {
+        out.push_str("template <typename T> static inline T _w_ftb(T x) { return metal::select(metal::ctz(x), T(4294967295u), x == T(0)); }\n");
+    }
+    for i in 0..w.need_cmpxchg.len() {
+        out.push_str(w.need_cmpxchg[i]);
+    }
+}
+
+fn finish(w: *W, out: *Buf) {
+    out.push_str(
+        "// Generated by wgslc (MSL 3.0).\n#include <metal_stdlib>\n#include <simd/simd.h>\n\n");
+    helpers(w, out);
+    out.push('\n');
+    out.push_str(w.types_out.as_slice());
+    out.push_str(w.out.as_slice());
+}
+
+// ---- Functions ----
+
+fn count_refs(w: *W, f: *Function) {
+    w.refc.clear();
+    w.baked.clear();
+    for _ in 0..f.exprs.len() {
+        w.refc.push(0);
+        w.baked.push(false);
+    }
+    for e in 0..f.exprs.len() {
+        let x = f.exprs[e];
+        let op = x.op;
+        if op == E_ACCESS || op == E_BINARY {
+            if op == E_ACCESS {
+                w.refc[x.a] += 1;
+                w.refc[x.b] += 1;
+            } else {
+                w.refc[x.b] += 1;
+                w.refc[x.c] += 1;
+            }
+        }
+        else if op == E_ACCESS_INDEX || op == E_SPLAT || op == E_SWIZZLE || op == E_LOAD
+            || op == E_CONVERT || op == E_BITCAST {
+            w.refc[x.a] += 1;
+        } else if op == E_UNARY || op == E_DERIVATIVE {
+            w.refc[x.b] += 1;
+        } else if op == E_SELECT {
+            w.refc[x.a] += 1;
+            w.refc[x.b] += 1;
+            w.refc[x.c] += 1;
+        } else if op == E_COMPOSE {
+            for k in x.a..x.a + x.b {
+                w.refc[f.args[k]] += 1;
+            }
+        } else if op == E_MATH {
+            for k in x.b..x.b + x.c {
+                w.refc[f.args[k]] += 1;
+            }
+        } else if op == E_IMAGE_SAMPLE {
+            for k in x.c..x.c + (x.d >> 8) {
+                w.refc[f.args[k]] += 1;
+            }
+        } else if op == E_IMAGE_LOAD {
+            for k in x.c..x.c + x.d {
+                w.refc[f.args[k]] += 1;
+            }
+        } else if op == E_IMAGE_QUERY {
+            if x.c >= 0 {
+                w.refc[x.c] += 1;
+            }
+        }
+    }
+    for s in 0..f.stmts.len() {
+        let st = f.stmts[s];
+        if st.op == S_IF || st.op == S_SWITCH {
+            w.refc[st.a] += 1;
+        } else if st.op == S_STORE {
+            w.refc[st.a] += 1;
+            w.refc[st.b] += 1;
+        } else if st.op == S_RETURN && st.a >= 0 {
+            w.refc[st.a] += 1;
+        } else if st.op == S_LOOP && st.c >= 0 {
+            w.refc[st.c] += 1;
+        } else if st.op == S_CALL {
+            for k in st.b..st.b + st.c {
+                w.refc[f.args[k]] += 1;
+            }
+        } else if st.op == S_ATOMIC {
+            if st.c >= 0 {
+                w.refc[st.c] += 1;
+            }
+            if st.e >= 0 {
+                w.refc[st.e] += 1;
+            }
+        } else if st.op == S_IMAGE_STORE {
+            w.refc[st.b] += 1;
+            w.refc[st.c] += 1;
+            if st.d >= 0 {
+                w.refc[st.d] += 1;
+            }
+        }
+    }
+    for e in 0..f.exprs.len() {
+        let x = f.exprs[e];
+        let op = x.op;
+        let leaf = op == E_LITERAL || op == E_ARG || op == E_GLOBAL || op == E_LOCAL
+            || op == E_CALL_RESULT || op == E_ATOMIC_RESULT || op == E_WG_UNIFORM_RESULT;
+        if leaf {
+            continue;
+        }
+        let k = w.kinds[f.exprs[e].ty];
+        if k == TK_POINTER {
+            continue;
+        }
+        if op == E_LOAD || op == E_IMAGE_SAMPLE || op == E_IMAGE_LOAD || op == E_DERIVATIVE
+            || w.refc[e] > 1 || f.names[e].len > 0 {
+            w.baked[e] = true;
+        }
+    }
+}
+
+// ---- Expressions ----
+
+impl W {
+    fn lit(self: *W, m: *Module, f: *Function, e: i64) {
+        let x = f.exprs[e];
+        let sk = m.types[x.ty].scalar;
+        if sk == SK_BOOL {
+            self.p(if x.a != 0 { "true" } else { "false" });
+        } else if sk == SK_U32 {
+            self.out.push_str(f"{x.a}u");
+        } else if sk == SK_I32 {
+            let v = x.a as u32 as i32 as i64;
+            if v == -2147483648 {
+                self.p("(-2147483647 - 1)");
+            } else if v < 0 {
+                self.out.push_str(f"({v})");
+            } else {
+                self.out.push_str(f"{v}");
+            }
+        } else {
+            let v = bits_f32(x.a as u32);
+            let ex = (x.a >> 23) & 255;
+            if ex == 255 {
+                self.out.push_str(f"as_type<float>({x.a}u)");
+                return;
+            }
+            let mut b = Buf::new_in(self.a);
+            b.push_str(f"{v}");
+            let s = b.as_slice();
+            let mut has_dot = false;
+            for i in 0..s.len {
+                if s[i] == '.' || s[i] == 'e' || s[i] == 'E' || s[i] == 'n' || s[i] == 'i' {
+                    has_dot = true;
+                }
+            }
+            if s[0] == '-' {
+                self.p("(");
+            }
+            self.p(s);
+            if !has_dot {
+                self.p(".0");
+            }
+            self.p("f");
+            if s[0] == '-' {
+                self.p(")");
+            }
+        }
+    }
+
+    // e as a value: its name, or its text.
+    fn val(self: *W, m: *Module, f: *Function, e: i64) {
+        let op = f.exprs[e].op;
+        if self.baked[e] || op == E_CALL_RESULT || op == E_ATOMIC_RESULT
+            || op == E_WG_UNIFORM_RESULT {
+            self.p(self.enames[e]);
+            return;
+        }
+        if op == E_ARG {
+            self.p(self.enames[e]);
+            return;
+        }
+        self.render(m, f, e);
+    }
+
+    // The unsigned type of the same shape as t (i32 -> uint, int3 -> uint3).
+    fn utype(self: *W, m: *Module, t: i64) -> [u8] {
+        let ty = m.types[t];
+        if ty.kind == TK_VECTOR {
+            let mut b = Buf::new_in(self.a);
+            b.push_str(f"metal::uint{ty.n}");
+            return b.as_slice();
+        }
+        "uint"
+    }
+
+    // The index of an E_ACCESS, clamped when its check says so.
+    fn index(self: *W, m: *Module, f: *Function, e: i64) {
+        let x = f.exprs[e];
+        if x.c == CK_CLAMP {
+            self.p("metal::min(uint(");
+            self.val(m, f, x.b);
+            self.out.push_str(f"), {x.d - 1}u)");
+        } else {
+            self.val(m, f, x.b);
+        }
+    }
+
+    // A pointer expression as an lvalue.
+    fn lval(self: *W, m: *Module, f: *Function, e: i64) {
+        let x = f.exprs[e];
+        if x.op == E_GLOBAL {
+            self.p(self.gnames[x.a]);
+        } else if x.op == E_LOCAL {
+            self.p(self.lnames[x.a]);
+        } else if x.op == E_ARG {
+            self.out.push_str(f"(*{self.enames[e]})");
+        } else if x.op == E_ACCESS || x.op == E_ACCESS_INDEX {
+            let bt = m.types[m.pointee(f.exprs[x.a].ty)];
+            self.lval(m, f, x.a);
+            self.selector(m, f, e, bt);
+        } else {
+            self.p("/* not a pointer */");
+        }
+    }
+
+    // `.member`, `[i]` or `.inner[i]` after a base of type bt.
+    fn selector(self: *W, m: *Module, f: *Function, e: i64, bt: Type) {
+        let x = f.exprs[e];
+        if x.op == E_ACCESS_INDEX {
+            if bt.kind == TK_STRUCT {
+                self.p(".");
+                self.p(self.escape(m.members[bt.mstart + x.b].name));
+            } else if bt.kind == TK_ARRAY && bt.n > 0 {
+                self.out.push_str(f".inner[{x.b}]");
+            } else {
+                self.out.push_str(f"[{x.b}]");
+            }
+            return;
+        }
+        if bt.kind == TK_ARRAY && bt.n > 0 {
+            self.p(".inner");
+        }
+        self.p("[");
+        self.index(m, f, e);
+        self.p("]");
+    }
+
+    // Whether e (a pointer, or a member value) is a struct's vec3 member,
+    // which MSL holds packed.
+    fn is_packed_member(self: *W, m: *Module, f: *Function, e: i64) -> bool {
+        let x = f.exprs[e];
+        if x.op != E_ACCESS_INDEX {
+            return false;
+        }
+        let bt0 = f.exprs[x.a].ty;
+        let bt = if m.types[bt0].kind == TK_POINTER { m.types[bt0].base } else { bt0 };
+        if m.types[bt].kind != TK_STRUCT {
+            return false;
+        }
+        let mt = m.types[m.members[m.types[bt].mstart + x.b].ty];
+        mt.kind == TK_VECTOR && mt.n == 3
+    }
+
+    // The conditions under which the pointer e is in range (runtime-sized
+    // arrays); false when there are none.
+    fn guards(self: *W, m: *Module, f: *Function, e: i64, any: bool) -> bool {
+        let x = f.exprs[e];
+        let mut a = any;
+        if x.op == E_ACCESS || x.op == E_ACCESS_INDEX {
+            a = self.guards(m, f, x.a, a);
+            if x.op == E_ACCESS && x.c == CK_RZSW {
+                if a {
+                    self.p(" && ");
+                }
+                self.p("uint(");
+                self.val(m, f, x.b);
+                self.p(") < ");
+                self.runtime_len(m, f, x.a);
+                a = true;
+            }
+        }
+        a
+    }
+
+    fn has_guards(self: *W, f: *Function, e: i64) -> bool {
+        let x = f.exprs[e];
+        if x.op == E_ACCESS && x.c == CK_RZSW {
+            return true;
+        }
+        if x.op == E_ACCESS || x.op == E_ACCESS_INDEX {
+            return self.has_guards(f, x.a);
+        }
+        false
+    }
+
+    // The length of the runtime-sized array pointer `base` points to.
+    fn runtime_len(self: *W, m: *Module, f: *Function, base: i64) {
+        let b = f.exprs[base];
+        let mut g = -1;
+        let mut off = 0;
+        if b.op == E_GLOBAL {
+            g = b.a;
+        } else if b.op == E_ACCESS_INDEX && f.exprs[b.a].op == E_GLOBAL {
+            g = f.exprs[b.a].a;
+            let st = m.types[m.globals[g].ty];
+            off = m.members[st.mstart + b.b].offset;
+        }
+        let stride = m.types[m.pointee(b.ty)].stride;
+        self.len_text(g, off, stride);
+    }
+
+    fn len_text(self: *W, g: i64, off: i64, stride: i64) {
+        if g < 0 {
+            self.p("0u");
+            return;
+        }
+        let k = self.sl.size_index[g];
+        if off == 0 {
+            self.out.push_str(f"(_w_sizes[{k}] / {stride}u)");
+        } else {
+            self.out.push_str(
+                f"(_w_sizes[{k}] >= {off}u ? (_w_sizes[{k}] - {off}u) / {stride}u : 0u)");
+        }
+    }
+
+    fn render(self: *W, m: *Module, f: *Function, e: i64) {
+        let x = f.exprs[e];
+        let op = x.op;
+        let t = m.types[x.ty];
+        if op == E_LITERAL {
+            self.lit(m, f, e);
+        } else if op == E_ZERO {
+            self.p(self.ty(m, x.ty));
+            self.p(" {}");
+        } else if op == E_COMPOSE {
+            let tn = self.ty(m, x.ty);
+            self.p(tn);
+            if t.kind == TK_VECTOR || t.kind == TK_MATRIX {
+                self.p("(");
+            } else if t.kind == TK_ARRAY {
+                self.p(" {{");
+            } else {
+                self.p(" {");
+            }
+            for k in 0..x.b {
+                if k > 0 {
+                    self.p(", ");
+                }
+                if t.kind == TK_STRUCT && W::pads_before(m, x.ty, k) {
+                    self.p("{}, ");
+                }
+                self.val(m, f, f.args[x.a + k]);
+            }
+            if t.kind == TK_VECTOR || t.kind == TK_MATRIX {
+                self.p(")");
+            } else if t.kind == TK_ARRAY {
+                self.p("}}");
+            } else {
+                self.p("}");
+            }
+        } else if op == E_SPLAT {
+            self.p(self.ty(m, x.ty));
+            self.p("(");
+            self.val(m, f, x.a);
+            self.p(")");
+        } else if op == E_SWIZZLE {
+            self.p("(");
+            self.val(m, f, x.a);
+            self.p(").");
+            for k in 0..x.c {
+                self.out.push("xyzw"[(x.b >> (2 * k)) & 3]);
+            }
+        } else if op == E_ACCESS || op == E_ACCESS_INDEX {
+            let bt = m.types[f.exprs[x.a].ty];
+            let packed = op == E_ACCESS_INDEX && self.is_packed_member(m, f, e);
+            if packed {
+                self.p(self.ty(m, x.ty));
+                self.p("(");
+            }
+            self.p("(");
+            self.val(m, f, x.a);
+            self.p(")");
+            self.selector(m, f, e, bt);
+            if packed {
+                self.p(")");
+            }
+        } else if op == E_LOAD {
+            let pe = x.a;
+            let g = self.has_guards(f, pe);
+            if g {
+                self.p("(");
+                self.guards(m, f, pe, false);
+                self.p(" ? ");
+            }
+            let packed = self.is_packed_member(m, f, pe);
+            if packed {
+                self.p(self.ty(m, x.ty));
+                self.p("(");
+            }
+            self.lval(m, f, pe);
+            if packed {
+                self.p(")");
+            }
+            if g {
+                self.p(" : ");
+                self.p(self.ty(m, x.ty));
+                self.p(" {})");
+            }
+        } else if op == E_UNARY {
+            let sk = t.scalar;
+            if x.a == UN_NEG && sk == SK_I32 {
+                self.out.push_str(f"as_type<{self.ty(m, x.ty)}>(-as_type<{self.utype(m, x.ty)}>(");
+                self.val(m, f, x.b);
+                self.p("))");
+            } else {
+                self.p(if x.a == UN_NEG { "(-" } else if x.a == UN_NOT { "(!" } else { "(~" });
+                self.val(m, f, x.b);
+                self.p(")");
+            }
+        } else if op == E_BINARY {
+            self.binary(m, f, e);
+        } else if op == E_SELECT {
+            let ct = m.types[f.exprs[x.a].ty];
+            if ct.kind == TK_SCALAR {
+                self.p("(");
+                self.val(m, f, x.a);
+                self.p(" ? ");
+                self.val(m, f, x.b);
+                self.p(" : ");
+                self.val(m, f, x.c);
+                self.p(")");
+            } else {
+                self.p("metal::select(");
+                self.val(m, f, x.c);
+                self.p(", ");
+                self.val(m, f, x.b);
+                self.p(", ");
+                self.val(m, f, x.a);
+                self.p(")");
+            }
+        } else if op == E_CONVERT {
+            let from = m.types[f.exprs[x.a].ty].scalar;
+            if from == SK_F32 && (t.scalar == SK_I32 || t.scalar == SK_U32) {
+                self.need_f2i = true;
+                self.p(if t.scalar == SK_I32 { "_w_f2i(" } else { "_w_f2u(" });
+            } else {
+                self.p(self.ty(m, x.ty));
+                self.p("(");
+            }
+            self.val(m, f, x.a);
+            self.p(")");
+        } else if op == E_BITCAST {
+            self.out.push_str(f"as_type<{self.ty(m, x.ty)}>(");
+            self.val(m, f, x.a);
+            self.p(")");
+        } else if op == E_MATH {
+            self.math(m, f, e);
+        } else if op == E_ARRAY_LENGTH {
+            self.len_text(x.a, x.c, x.d);
+        } else if op == E_DERIVATIVE {
+            self.p(if x.a == 0 { "metal::dfdx(" } else if x.a == 1 { "metal::dfdy(" }
+                else { "metal::fwidth(" });
+            self.val(m, f, x.b);
+            self.p(")");
+        } else if op == E_IMAGE_SAMPLE {
+            self.sample(m, f, e);
+        } else if op == E_IMAGE_LOAD {
+            self.image_load(m, f, e);
+        } else if op == E_IMAGE_QUERY {
+            let tex = self.enames_or_global(m, f, x.a);
+            if x.b == IQ_LEVELS {
+                self.out.push_str(f"{tex}.get_num_mip_levels()");
+            } else if x.b == IQ_LAYERS {
+                self.out.push_str(f"{tex}.get_array_size()");
+            } else {
+                let tt = m.types[f.exprs[x.a].ty];
+                if x.c >= 0 && tt.n != TEX_STORAGE_2D {
+                    self.out.push_str(f"metal::uint2({tex}.get_width(");
+                    self.val(m, f, x.c);
+                    self.out.push_str(f"), {tex}.get_height(");
+                    self.val(m, f, x.c);
+                    self.p("))");
+                } else {
+                    self.out.push_str(f"metal::uint2({tex}.get_width(), {tex}.get_height())");
+                }
+            }
+        } else {
+            self.p("/* ? */");
+        }
+    }
+
+    fn enames_or_global(self: *W, m: *Module, f: *Function, e: i64) -> [u8] {
+        let x = f.exprs[e];
+        let _ = m;
+        if x.op == E_GLOBAL {
+            return self.gnames[x.a];
+        }
+        self.enames[e]
+    }
+
+    fn binary(self: *W, m: *Module, f: *Function, e: i64) {
+        let x = f.exprs[e];
+        let op = x.a;
+        let lt = m.types[f.exprs[x.b].ty];
+        let sk = lt.scalar;
+        let int = (sk == SK_I32 || sk == SK_U32) && lt.kind != TK_MATRIX;
+        if int && (op == OP_DIV || op == OP_MOD) {
+            // a literal divisor other than 0 (and -1 for i32) needs no helper
+            let r = f.exprs[x.c];
+            let lit_ok = r.op == E_LITERAL && r.a != 0 && !(sk == SK_I32 && r.a == 4294967295);
+            if lit_ok && !(sk == SK_I32 && op == OP_MOD) {
+                self.p("(");
+                self.val(m, f, x.b);
+                self.p(if op == OP_DIV { " / " } else { " % " });
+                self.val(m, f, x.c);
+                self.p(")");
+                return;
+            }
+            self.need_div = true;
+            self.p(if op == OP_DIV { "_w_div(" } else { "_w_mod(" });
+            self.val(m, f, x.b);
+            self.p(", ");
+            self.val(m, f, x.c);
+            self.p(")");
+            return;
+        }
+        if sk == SK_I32 && (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_SHL) {
+            let tn = self.ty(m, f.exprs[x.b].ty);
+            let un = self.utype(m, f.exprs[x.b].ty);
+            self.out.push_str(f"as_type<{tn}>(as_type<{un}>(");
+            self.val(m, f, x.b);
+            self.p(if op == OP_ADD { ") + as_type<" } else if op == OP_SUB { ") - as_type<" }
+                else if op == OP_MUL { ") * as_type<" } else { ") << (" });
+            if op == OP_SHL {
+                self.val(m, f, x.c);
+                self.p(" & 31u))");
+            } else {
+                self.out.push_str(f"{un}>(");
+                self.val(m, f, x.c);
+                self.p(")))");
+            }
+            return;
+        }
+        if op == OP_MOD && sk == SK_F32 {
+            self.p("metal::fmod(");
+            self.val(m, f, x.b);
+            self.p(", ");
+            self.val(m, f, x.c);
+            self.p(")");
+            return;
+        }
+        self.p("(");
+        self.val(m, f, x.b);
+        let s = if op == OP_ADD {
+            " + "
+        } else if op == OP_SUB {
+            " - "
+        } else if op == OP_MUL {
+            " * "
+        } else if op == OP_DIV {
+            " / "
+        } else if op == OP_EQ {
+            " == "
+        } else if op == OP_NE {
+            " != "
+        } else if op == OP_LT {
+            " < "
+        } else if op == OP_LE {
+            " <= "
+        } else if op == OP_GT {
+            " > "
+        } else if op == OP_GE {
+            " >= "
+        } else if op == OP_AND {
+            if sk == SK_BOOL && lt.kind == TK_SCALAR { " && " } else { " & " }
+        } else if op == OP_OR {
+            if sk == SK_BOOL && lt.kind == TK_SCALAR { " || " } else { " | " }
+        } else if op == OP_XOR {
+            if sk == SK_BOOL { " != " } else { " ^ " }
+        } else if op == OP_SHL {
+            " << ("
+        } else if op == OP_SHR {
+            " >> ("
+        } else if op == OP_LAND {
+            " && "
+        } else {
+            " || "
+        };
+        self.p(s);
+        self.val(m, f, x.c);
+        if op == OP_SHL || op == OP_SHR {
+            self.p(" & 31u)");
+        }
+        self.p(")");
+    }
+
+    fn math(self: *W, m: *Module, f: *Function, e: i64) {
+        let x = f.exprs[e];
+        let fun = x.a;
+        let a0 = f.args[x.b];
+        let at = m.types[f.exprs[a0].ty];
+        let sk = at.scalar;
+        let int = sk == SK_I32 || sk == SK_U32;
+        if fun == ir::MF_ABS && sk == SK_I32 {
+            // abs(MIN) is MIN: through uint
+            self.out.push_str(
+                f"as_type<{self.ty(m, x.ty)}>(metal::select(as_type<{self.utype(m, x.ty)}>(");
+            self.val(m, f, a0);
+            self.out.push_str(f"), -as_type<{self.utype(m, x.ty)}>(");
+            self.val(m, f, a0);
+            self.p("), ");
+            self.val(m, f, a0);
+            self.out.push_str(f" < {self.ty(m, x.ty)}(0)))");
+            return;
+        }
+        if fun == ir::MF_ABS && sk == SK_U32 {
+            self.val(m, f, a0);
+            return;
+        }
+        if fun == ir::MF_SIGN && int {
+            self.need_sign = true;
+            self.p("_w_isign(");
+            self.val(m, f, a0);
+            self.p(")");
+            return;
+        }
+        if fun == ir::MF_DOT && int {
+            // wrapping: as the sum of products, through uint
+            let n = at.n;
+            self.out.push_str(f"as_type<{W::scalar(sk)}>(");
+            for k in 0..n {
+                if k > 0 {
+                    self.p(" + ");
+                }
+                self.p("as_type<uint>(");
+                self.val(m, f, a0);
+                self.out.push_str(f"[{k}]) * as_type<uint>(");
+                self.val(m, f, f.args[x.b + 1]);
+                self.out.push_str(f"[{k}])");
+            }
+            self.p(")");
+            return;
+        }
+        if fun == ir::MF_FIRST_LEADING_BIT {
+            self.need_flb = true;
+            self.p("_w_flb(");
+            self.val(m, f, a0);
+            self.p(")");
+            return;
+        }
+        if fun == ir::MF_FIRST_TRAILING_BIT {
+            self.need_ftb = true;
+            self.p("_w_ftb(");
+            self.val(m, f, a0);
+            self.p(")");
+            return;
+        }
+        if fun == ir::MF_EXTRACT_BITS || fun == ir::MF_INSERT_BITS {
+            // WGSL clamps offset and count; Metal leaves them undefined
+            let k = if fun == ir::MF_EXTRACT_BITS { 1 } else { 2 };
+            self.p(if fun == ir::MF_EXTRACT_BITS { "metal::extract_bits(" }
+                else { "metal::insert_bits(" });
+            for i in 0..k {
+                self.val(m, f, f.args[x.b + i]);
+                self.p(", ");
+            }
+            self.p("metal::min(");
+            self.val(m, f, f.args[x.b + k]);
+            self.p(", 32u), metal::min(");
+            self.val(m, f, f.args[x.b + k + 1]);
+            self.p(", 32u - metal::min(");
+            self.val(m, f, f.args[x.b + k]);
+            self.p(", 32u)))");
+            return;
+        }
+        if fun == ir::MF_DEGREES || fun == ir::MF_RADIANS {
+            self.p("(");
+            self.val(m, f, a0);
+            self.p(if fun == ir::MF_DEGREES { " * 57.2957795131f)" }
+                else { " * 0.0174532925199f)" });
+            return;
+        }
+        if fun == ir::MF_PACK2X16FLOAT {
+            self.p("as_type<uint>(metal::half2(");
+            self.val(m, f, a0);
+            self.p("))");
+            return;
+        }
+        if fun == ir::MF_UNPACK2X16FLOAT {
+            self.p("metal::float2(as_type<metal::half2>(");
+            self.val(m, f, a0);
+            self.p("))");
+            return;
+        }
+        let name = if fun < MATH_NAMES.len() {
+            MATH_NAMES[fun]
+        } else if fun == ir::MF_COUNT_ONE_BITS {
+            "popcount"
+        } else if fun == ir::MF_COUNT_LEADING_ZEROS {
+            "clz"
+        } else if fun == ir::MF_COUNT_TRAILING_ZEROS {
+            "ctz"
+        } else if fun == ir::MF_REVERSE_BITS {
+            "reverse_bits"
+        } else if fun == ir::MF_ALL {
+            "all"
+        } else if fun == ir::MF_ANY {
+            "any"
+        } else if fun == ir::MF_SATURATE {
+            "saturate"
+        } else if fun == ir::MF_ASINH {
+            "asinh"
+        } else if fun == ir::MF_ACOSH {
+            "acosh"
+        } else if fun == ir::MF_ATANH {
+            "atanh"
+        } else if fun == ir::MF_FACE_FORWARD {
+            "faceforward"
+        } else if fun == ir::MF_LDEXP {
+            "ldexp"
+        } else if fun == ir::MF_PACK4X8UNORM {
+            "pack_float_to_unorm4x8"
+        } else if fun == ir::MF_UNPACK4X8UNORM {
+            "unpack_unorm4x8_to_float"
+        } else if fun == ir::MF_PACK4X8SNORM {
+            "pack_float_to_snorm4x8"
+        } else if fun == ir::MF_UNPACK4X8SNORM {
+            "unpack_snorm4x8_to_float"
+        } else if fun == ir::MF_PACK2X16UNORM {
+            "pack_float_to_unorm2x16"
+        } else if fun == ir::MF_UNPACK2X16UNORM {
+            "unpack_unorm2x16_to_float"
+        } else if fun == ir::MF_PACK2X16SNORM {
+            "pack_float_to_snorm2x16"
+        } else {
+            "unpack_snorm2x16_to_float"
+        };
+        self.p("metal::");
+        self.p(name);
+        self.p("(");
+        for k in 0..x.c {
+            if k > 0 {
+                self.p(", ");
+            }
+            self.val(m, f, f.args[x.b + k]);
+        }
+        self.p(")");
+    }
+
+    fn sample(self: *W, m: *Module, f: *Function, e: i64) {
+        let x = f.exprs[e];
+        let kind = x.d & 255;
+        let n = x.d >> 8;
+        let tt = m.types[f.exprs[x.a].ty];
+        let tex = self.enames_or_global(m, f, x.a);
+        let smp = self.enames_or_global(m, f, x.b);
+        let compare = kind == IMG_SAMPLE_COMPARE || kind == IMG_SAMPLE_COMPARE_LEVEL;
+        self.out.push_str(f"{tex}.{if compare { "sample_compare" } else { "sample" }}({smp}, ");
+        self.val(m, f, f.args[x.c]);
+        let mut k = 1;
+        if tt.n == TEX_2D_ARRAY {
+            self.p(", ");
+            self.val(m, f, f.args[x.c + 1]);
+            k = 2;
+        }
+        if kind == IMG_SAMPLE_BIAS {
+            self.p(", metal::bias(");
+            self.val(m, f, f.args[x.c + k]);
+            self.p(")");
+        } else if kind == IMG_SAMPLE_LEVEL {
+            self.p(", metal::level(");
+            self.val(m, f, f.args[x.c + k]);
+            self.p(")");
+        } else if compare {
+            self.p(", ");
+            self.val(m, f, f.args[x.c + k]);
+            if kind == IMG_SAMPLE_COMPARE_LEVEL {
+                self.p(", metal::level(0)");
+            }
+        }
+        let _ = n;
+        self.p(")");
+    }
+
+    // textureLoad: the level, layer and coordinates clamped into range.
+    fn image_load(self: *W, m: *Module, f: *Function, e: i64) {
+        let x = f.exprs[e];
+        let tt = m.types[f.exprs[x.a].ty];
+        let tex = self.enames_or_global(m, f, x.a);
+        let arrayed = tt.n == TEX_2D_ARRAY;
+        let lvl = f.args[x.c + x.d - 1];
+        let mut lb = Buf::new_in(self.a);
+        let saved = self.out;
+        self.out = lb;
+        self.out.push_str(f"metal::min(uint(");
+        self.val(m, f, lvl);
+        self.out.push_str(f"), {tex}.get_num_mip_levels() - 1u)");
+        lb = self.out;
+        self.out = saved;
+        let l = lb.as_slice();
+        self.out.push_str(f"{tex}.read(metal::min(metal::uint2(");
+        self.val(m, f, f.args[x.c]);
+        self.out.push_str(
+            f"), metal::uint2({tex}.get_width({l}) - 1u, {tex}.get_height({l}) - 1u))");
+        if arrayed {
+            self.p(", metal::min(uint(");
+            self.val(m, f, f.args[x.c + 1]);
+            self.out.push_str(f"), {tex}.get_array_size() - 1u)");
+        }
+        self.out.push_str(f", {l})");
+    }
+}
+
+// ---- Statements ----
+
+impl W {
+    fn block(self: *W, m: *Module, f: *Function, blk: i64) {
+        let b = f.blocks[blk];
+        for i in b.start..b.start + b.count {
+            self.stmt(m, f, f.items[i]);
+        }
+    }
+
+    fn braced(self: *W, m: *Module, f: *Function, blk: i64) {
+        self.p("{");
+        self.indent += 1;
+        self.block(m, f, blk);
+        self.indent -= 1;
+        self.line();
+        self.p("}");
+    }
+
+    fn atomic_fn(fun: i64) -> [u8] {
+        if fun == AT_ADD {
+            "metal::atomic_fetch_add_explicit"
+        } else if fun == AT_SUB {
+            "metal::atomic_fetch_sub_explicit"
+        } else if fun == AT_AND {
+            "metal::atomic_fetch_and_explicit"
+        } else if fun == AT_OR {
+            "metal::atomic_fetch_or_explicit"
+        } else if fun == AT_XOR {
+            "metal::atomic_fetch_xor_explicit"
+        } else if fun == AT_MIN {
+            "metal::atomic_fetch_min_explicit"
+        } else if fun == AT_MAX {
+            "metal::atomic_fetch_max_explicit"
+        } else if fun == AT_EXCHANGE {
+            "metal::atomic_exchange_explicit"
+        } else if fun == AT_LOAD {
+            "metal::atomic_load_explicit"
+        } else {
+            "metal::atomic_store_explicit"
+        }
+    }
+
+    fn stmt(self: *W, m: *Module, f: *Function, s: i64) {
+        let st = f.stmts[s];
+        let op = st.op;
+        if op == S_EMIT {
+            for e in st.a..st.b {
+                if self.baked[e] {
+                    self.line();
+                    self.p(self.ty(m, f.exprs[e].ty));
+                    self.p(" ");
+                    self.p(self.enames[e]);
+                    self.p(" = ");
+                    self.render(m, f, e);
+                    self.p(";");
+                }
+            }
+            return;
+        }
+        self.line();
+        if op == S_STORE {
+            let g = self.has_guards(f, st.a);
+            if g {
+                self.p("if (");
+                self.guards(m, f, st.a, false);
+                self.p(") { ");
+            }
+            self.lval(m, f, st.a);
+            self.p(" = ");
+            self.val(m, f, st.b);
+            self.p(";");
+            if g {
+                self.p(" }");
+            }
+        } else if op == S_BLOCK {
+            self.braced(m, f, st.a);
+        } else if op == S_IF {
+            self.p("if (");
+            self.val(m, f, st.a);
+            self.p(") ");
+            self.braced(m, f, st.b);
+            if f.blocks[st.c].count > 0 {
+                self.p(" else ");
+                self.braced(m, f, st.c);
+            }
+        } else if op == S_SWITCH {
+            self.p("switch (");
+            self.val(m, f, st.a);
+            self.p(") {");
+            for k in st.b..st.b + st.c {
+                let c = f.cases[k];
+                self.line();
+                for j in c.vstart..c.vstart + c.vcount {
+                    let sel_t = m.types[f.exprs[st.a].ty].scalar;
+                    if sel_t == SK_U32 {
+                        self.out.push_str(f"case {f.vals[j] & 4294967295}u: ");
+                    } else {
+                        let v = f.vals[j] as u32 as i32 as i64;
+                        if v == -2147483648 {
+                            self.p("case (-2147483647 - 1): ");
+                        } else {
+                            self.out.push_str(f"case {v}: ");
+                        }
+                    }
+                }
+                if c.is_default {
+                    self.p("default: ");
+                }
+                self.p("{");
+                self.indent += 1;
+                self.block(m, f, c.body);
+                self.line();
+                self.p("break;");
+                self.indent -= 1;
+                self.line();
+                self.p("}");
+            }
+            self.line();
+            self.p("}");
+        } else if op == S_LOOP {
+            let has_cont = f.blocks[st.b].count > 0 || st.c >= 0;
+            if !has_cont {
+                self.p("while (true) ");
+                self.braced(m, f, st.a);
+                return;
+            }
+            let li = self.loop_n;
+            self.loop_n += 1;
+            self.out.push_str(f"bool _w_loop{li} = true;");
+            self.line();
+            self.p("while (true) {");
+            self.indent += 1;
+            self.line();
+            self.out.push_str(f"if (!_w_loop{li}) {{");
+            self.indent += 1;
+            self.block(m, f, st.b);
+            if st.c >= 0 {
+                self.line();
+                self.p("if (");
+                self.val(m, f, st.c);
+                self.p(") { break; }");
+            }
+            self.indent -= 1;
+            self.line();
+            self.p("}");
+            self.line();
+            self.out.push_str(f"_w_loop{li} = false;");
+            self.block(m, f, st.a);
+            self.indent -= 1;
+            self.line();
+            self.p("}");
+        } else if op == S_BREAK {
+            self.p("break;");
+        } else if op == S_CONTINUE {
+            self.p("continue;");
+        } else if op == S_RETURN {
+            self.ret(m, f, st.a);
+        } else if op == S_KILL {
+            self.p("metal::discard_fragment();");
+        } else if op == S_BARRIER {
+            self.p(if st.a
+                == BARRIER_WORKGROUP {
+                "metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);"
+            } else { "metal::threadgroup_barrier(metal::mem_flags::mem_device);" });
+        } else if op == S_WG_UNIFORM_LOAD {
+            self.p("metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);");
+            self.line();
+            self.p(self.ty(m, f.exprs[st.b].ty));
+            self.out.push_str(f" {self.enames[st.b]} = ");
+            self.lval(m, f, st.a);
+            self.p(";");
+            self.line();
+            self.p("metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);");
+        } else if op == S_CALL {
+            if st.d >= 0 {
+                self.p(self.ty(m, f.exprs[st.d].ty));
+                self.out.push_str(f" {self.enames[st.d]} = ");
+            }
+            self.call(m, f, st.a, st.b, st.c);
+            self.p(";");
+        } else if op == S_ATOMIC {
+            self.atomic(m, f, s);
+        } else if op == S_IMAGE_STORE {
+            let tex = self.enames_or_global(m, f, st.a);
+            self.p("if (metal::all(metal::uint2(");
+            self.val(m, f, st.b);
+            self.out.push_str(
+                f") < metal::uint2({tex}.get_width(), {tex}.get_height()))) {{ {tex}.write(");
+            self.val(m, f, st.c);
+            self.p(", metal::uint2(");
+            self.val(m, f, st.b);
+            self.p(")); }");
+        }
+    }
+
+    fn atomic(self: *W, m: *Module, f: *Function, s: i64) {
+        let st = f.stmts[s];
+        let g = self.has_guards(f, st.a);
+        let pt = m.types[f.exprs[st.a].ty];
+        let sk = m.types[pt.base].scalar;
+        let tn = W::scalar(sk);
+        let sp = W::space(pt.space, pt.access);
+        if st.b == AT_CMPXCHG {
+            let rty = self.ty(m, f.exprs[st.d].ty);
+            let mut h = Buf::new_in(self.a);
+            h.push_str(f"static inline {rty} _w_cmpxchg({sp} metal::atomic_{tn}* p, {tn} cmp, {tn} v) {{ {tn} old = cmp; bool ok = metal::atomic_compare_exchange_weak_explicit(p, &old, v, metal::memory_order_relaxed, metal::memory_order_relaxed); return {rty} {{old, ok}}; }}\n");
+            let hs = h.as_slice();
+            let mut have = false;
+            for i in 0..self.need_cmpxchg.len() {
+                if self.need_cmpxchg[i] == hs {
+                    have = true;
+                }
+            }
+            if !have {
+                self.need_cmpxchg.push(hs);
+            }
+            self.out.push_str(f"{rty} {self.enames[st.d]} = ");
+            if g {
+                self.p("(");
+                self.guards(m, f, st.a, false);
+                self.p(") ? ");
+            }
+            self.p("_w_cmpxchg(&");
+            self.lval(m, f, st.a);
+            self.p(", ");
+            self.val(m, f, st.e);
+            self.p(", ");
+            self.val(m, f, st.c);
+            self.p(")");
+            if g {
+                self.out.push_str(f" : {rty} {{}}");
+            }
+            self.p(";");
+            return;
+        }
+        if st.d >= 0 {
+            self.out.push_str(f"{tn} {self.enames[st.d]} = ");
+        }
+        if g {
+            if st.d >= 0 {
+                self.p("(");
+                self.guards(m, f, st.a, false);
+                self.p(") ? ");
+            } else {
+                self.p("if (");
+                self.guards(m, f, st.a, false);
+                self.p(") ");
+            }
+        }
+        self.p(W::atomic_fn(st.b));
+        self.p("(&");
+        self.lval(m, f, st.a);
+        if st.c >= 0 {
+            self.p(", ");
+            self.val(m, f, st.c);
+        }
+        self.p(", metal::memory_order_relaxed)");
+        if g && st.d >= 0 {
+            self.out.push_str(f" : {tn}(0)");
+        }
+        self.p(";");
+    }
+
+    fn call(self: *W, m: *Module, f: *Function, callee: i64, start: i64, n: i64) {
+        self.p(self.fnames[callee]);
+        self.p("(");
+        let mut first = true;
+        for k in start..start + n {
+            if !first {
+                self.p(", ");
+            }
+            first = false;
+            let a = f.args[k];
+            if m.types[f.exprs[a].ty].kind == TK_POINTER {
+                self.p("&");
+                self.lval(m, f, a);
+            } else {
+                self.val(m, f, a);
+            }
+        }
+        for g in 0..m.globals.len() {
+            if self.uses[callee][g] {
+                if !first {
+                    self.p(", ");
+                }
+                first = false;
+                self.p(self.gnames[g]);
+            }
+        }
+        if needs_sizes(self, m, callee) {
+            if !first {
+                self.p(", ");
+            }
+            self.p("_w_sizes");
+        }
+        self.p(")");
+    }
+
+    fn ret(self: *W, m: *Module, f: *Function, e: i64) {
+        if e < 0 {
+            self.p("return;");
+            return;
+        }
+        if self.stage == 255 || self.stage == STAGE_COMPUTE as i64 {
+            self.p("return ");
+            self.val(m, f, e);
+            self.p(";");
+            return;
+        }
+        // an entry point's result: into its output struct
+        let rt = m.types[self.ret_ty];
+        self.p("{ const auto _w_r = ");
+        self.val(m, f, e);
+        self.out.push_str(f"; return {self.out_name} {{ ");
+        if rt.kind == TK_STRUCT && f.result_binding.kind == ir::BIND_NONE {
+            for k in 0..rt.mcount {
+                if k > 0 {
+                    self.p(", ");
+                }
+                self.out.push_str(f"_w_r.{self.escape(m.members[rt.mstart + k].name)}");
+            }
+        } else {
+            self.p("_w_r");
+        }
+        self.p(" }; }");
+    }
+}
+
+// ---- Functions and entry points ----
+
+fn start_fn(w: *W, m: *Module, h: i64) {
+    let f = m.functions[h];
+    w.fh = h;
+    w.used = HashMap::new_in(w.a);
+    w.loop_n = 0;
+    // the module-scope names stay reserved
+    for k in 0..w.fnames.len() {
+        w.used.insert(w.fnames[k], true);
+    }
+    for k in 0..w.gnames.len() {
+        w.used.insert(w.gnames[k], true);
+    }
+    count_refs(w, &f);
+    w.enames.clear();
+    for e in 0..f.exprs.len() {
+        let x = f.exprs[e];
+        if x.op == E_ARG {
+            let n = w.unique(f.params[x.a].name);
+            w.enames.push(n);
+        }
+        else if w.baked[e] || x.op == E_CALL_RESULT || x.op == E_ATOMIC_RESULT
+            || x.op == E_WG_UNIFORM_RESULT {
+            if f.names[e].len > 0 {
+                let n = w.unique(f.names[e]);
+                w.enames.push(n);
+            } else {
+                let mut b = Buf::new_in(w.a);
+                b.push_str(f"_e{e}");
+                w.enames.push(b.as_slice());
+            }
+        } else {
+            w.enames.push("");
+        }
+    }
+    w.lnames.clear();
+    for l in 0..f.locals.len() {
+        let n = w.unique(f.locals[l].name);
+        w.lnames.push(n);
+    }
+}
+
+// The parameter list's global part: each global the function uses.
+fn global_params(w: *W, m: *Module, h: i64, first: bool) -> bool {
+    let mut fst = first;
+    for g in 0..m.globals.len() {
+        if !w.uses[h][g] {
+            continue;
+        }
+        if !fst {
+            w.p(", ");
+        }
+        fst = false;
+        let gl = m.globals[g];
+        let tk = m.types[gl.ty].kind;
+        if gl.space == SP_HANDLE {
+            w.p(w.ty(m, gl.ty));
+            w.p(" ");
+        } else if tk == TK_ARRAY && m.types[gl.ty].n == 0 {
+            w.out.push_str(f"{W::space(gl.space, gl.access)} {w.ty(m, m.types[gl.ty].base)}* ");
+        } else {
+            w.out.push_str(f"{W::space(gl.space, gl.access)} {w.ty(m, gl.ty)}& ");
+        }
+        w.p(w.gnames[g]);
+    }
+    if needs_sizes(w, m, h) {
+        if !fst {
+            w.p(", ");
+        }
+        fst = false;
+        w.p("constant uint* _w_sizes");
+    }
+    fst
+}
+
+fn declare_locals(w: *W, m: *Module, f: *Function) {
+    for l in 0..f.locals.len() {
+        w.line();
+        w.out.push_str(f"{w.ty(m, f.locals[l].ty)} {w.lnames[l]} = {{}};");
+    }
+}
+
+fn write_fn(w: *W, m: *Module, h: i64) {
+    let f = m.functions[h];
+    start_fn(w, m, h);
+    w.stage = 255;
+    w.p("\n");
+    if f.result >= 0 {
+        w.p(w.ty(m, f.result));
+    } else {
+        w.p("void");
+    }
+    w.out.push_str(f" {w.fnames[h]}(");
+    let mut first = true;
+    for k in 0..f.params.len() {
+        if !first {
+            w.p(", ");
+        }
+        first = false;
+        let pt = m.types[f.params[k].ty];
+        let ae = arg_expr(&f, k);
+        let pname = if ae >= 0 { w.enames[ae] } else { w.unique(f.params[k].name) };
+        if pt.kind == TK_POINTER {
+            w.out.push_str(f"thread {w.ty(m, pt.base)}* {pname}");
+        } else {
+            w.out.push_str(f"{w.ty(m, f.params[k].ty)} {pname}");
+        }
+    }
+    global_params(w, m, h, first);
+    w.p(") {");
+    w.indent = 1;
+    declare_locals(w, m, &f);
+    w.block(m, &f, f.body);
+    w.indent = 0;
+    w.p("\n}\n");
+}
+
+fn arg_expr(f: *Function, k: i64) -> i64 {
+    for e in 0..f.exprs.len() {
+        if f.exprs[e].op == E_ARG && f.exprs[e].a == k {
+            return e;
+        }
+    }
+    -1
+}
+
+fn builtin_attr(b: i64) -> [u8] {
+    if b == BI_POSITION {
+        "position"
+    } else if b == BI_VERTEX_INDEX {
+        "vertex_id"
+    } else if b == BI_INSTANCE_INDEX {
+        "instance_id"
+    } else if b == BI_FRONT_FACING {
+        "front_facing"
+    } else if b == BI_FRAG_DEPTH {
+        "depth(any)"
+    } else if b == BI_SAMPLE_INDEX {
+        "sample_id"
+    } else if b == BI_SAMPLE_MASK {
+        "sample_mask"
+    } else if b == BI_LOCAL_INVOCATION_ID {
+        "thread_position_in_threadgroup"
+    } else if b == BI_LOCAL_INVOCATION_INDEX {
+        "thread_index_in_threadgroup"
+    } else if b == BI_GLOBAL_INVOCATION_ID {
+        "thread_position_in_grid"
+    } else if b == BI_WORKGROUP_ID {
+        "threadgroup_position_in_grid"
+    } else {
+        "threadgroups_per_grid"
+    }
+}
+
+fn interp_attr(b: Binding) -> [u8] {
+    if b.interp == INTERP_FLAT {
+        ", flat"
+    } else if b.interp == INTERP_LINEAR {
+        ", center_no_perspective"
+    } else {
+        ""
+    }
+}
+
+// One IO value of an entry point: as a stage_in member (`in_struct`) or a
+// parameter.
+fn io_decl(w: *W, m: *Module, stage: u8, ty: i64, b: Binding, name: [u8], output: bool) {
+    w.p(w.ty(m, ty));
+    w.out.push_str(f" {name} [[");
+    if b.kind == BIND_BUILTIN {
+        w.p(builtin_attr(b.value));
+    } else if stage == STAGE_VERTEX && !output {
+        w.out.push_str(f"attribute({b.value})");
+    } else if stage == STAGE_FRAGMENT && output {
+        w.out.push_str(f"color({b.value})");
+    } else {
+        w.out.push_str(f"user(loc{b.value}){interp_attr(b)}");
+    }
+    w.p("]]");
+}
+
+fn uses_workgroup(w: *W, m: *Module, h: i64) -> bool {
+    for g in 0..m.globals.len() {
+        if w.uses[h][g] && m.globals[g].space == SP_WORKGROUP {
+            return true;
+        }
+    }
+    false
+}
+
+// Zeroes a workgroup variable (atomics by atomic stores).
+fn zero_workgroup(w: *W, m: *Module, lv: [u8], t: i64, depth: i64) {
+    if !m.has_atomic(t) {
+        w.line();
+        w.out.push_str(f"{lv} = {w.ty(m, t)} {{}};");
+        return;
+    }
+    let ty = m.types[t];
+    if ty.kind == TK_ATOMIC {
+        w.line();
+        w.out.push_str(f"metal::atomic_store_explicit(&{lv}, 0, metal::memory_order_relaxed);");
+    } else if ty.kind == TK_ARRAY {
+        w.line();
+        w.out.push_str(f"for (uint _w_i{depth} = 0u; _w_i{depth} < {ty.n}u; _w_i{depth}++) {{");
+        w.indent += 1;
+        let mut b = Buf::new_in(w.a);
+        b.push_str(f"{lv}.inner[_w_i{depth}]");
+        zero_workgroup(w, m, b.as_slice(), ty.base, depth + 1);
+        w.indent -= 1;
+        w.line();
+        w.p("}");
+    } else if ty.kind == TK_STRUCT {
+        for k in ty.mstart..ty.mstart + ty.mcount {
+            let mut b = Buf::new_in(w.a);
+            b.push_str(f"{lv}.{w.escape(m.members[k].name)}");
+            zero_workgroup(w, m, b.as_slice(), m.members[k].ty, depth);
+        }
+    }
+}
+
+fn write_entry(w: *W, m: *Module, ei: i64) {
+    let en = m.entries[ei];
+    let h = en.func;
+    let f = m.functions[h];
+    start_fn(w, m, h);
+    w.stage = en.stage as i64;
+    w.ret_ty = f.result;
+    let ename = w.fnames[h];
+    // the stage_in struct: location inputs of vertex and fragment shaders
+    let mut in_name: [u8] = "";
+    if en.stage != STAGE_COMPUTE {
+        let mut any = false;
+        let mut sb = Buf::new_in(w.a);
+        let saved = w.out;
+        w.out = sb;
+        for k in 0..f.params.len() {
+            let pt = m.types[f.params[k].ty];
+            if pt.kind == TK_STRUCT && f.params[k].binding.kind == ir::BIND_NONE {
+                for j in pt.mstart..pt.mstart + pt.mcount {
+                    let mem = m.members[j];
+                    if mem.binding.kind == BIND_LOCATION
+                        || (mem.binding.kind == BIND_BUILTIN && mem.binding.value == BI_POSITION
+                            && en.stage == STAGE_FRAGMENT) {
+                        w.p("\n    ");
+                        let mut nb = Buf::new_in(w.a);
+                        nb.push_str(f"_w_p{k}_{j - pt.mstart}");
+                        io_decl(w, m, en.stage, mem.ty, mem.binding, nb.as_slice(), false);
+                        w.p(";");
+                        any = true;
+                    }
+                }
+            }
+            else if f.params[k].binding.kind == BIND_LOCATION
+                || (f.params[k].binding.kind == BIND_BUILTIN
+                    && f.params[k].binding.value == BI_POSITION && en.stage == STAGE_FRAGMENT) {
+                w.p("\n    ");
+                let mut nb = Buf::new_in(w.a);
+                nb.push_str(f"_w_p{k}");
+                io_decl(w, m, en.stage, f.params[k].ty, f.params[k].binding, nb.as_slice(), false);
+                w.p(";");
+                any = true;
+            }
+        }
+        sb = w.out;
+        w.out = saved;
+        if any {
+            let mut nb = Buf::new_in(w.a);
+            nb.push_str(f"{ename}_Input");
+            in_name = nb.as_slice();
+            w.out.push_str(f"\nstruct {in_name} {{{sb.as_slice()}\n}};\n");
+        }
+        // the output struct
+        if f.result >= 0 {
+            let mut nb = Buf::new_in(w.a);
+            nb.push_str(f"{ename}_Output");
+            w.out_name = nb.as_slice();
+            w.out.push_str(f"\nstruct {w.out_name} {{");
+            let rt = m.types[f.result];
+            if rt.kind == TK_STRUCT && f.result_binding.kind == ir::BIND_NONE {
+                for j in rt.mstart..rt.mstart + rt.mcount {
+                    let mem = m.members[j];
+                    w.p("\n    ");
+                    let mut mb = Buf::new_in(w.a);
+                    mb.push_str(f"m{j - rt.mstart}");
+                    io_decl(w, m, en.stage, mem.ty, mem.binding, mb.as_slice(), true);
+                    w.p(";");
+                }
+            } else {
+                w.p("\n    ");
+                io_decl(w, m, en.stage, f.result, f.result_binding, "m0", true);
+                w.p(";");
+            }
+            w.p("\n};\n");
+        }
+    }
+    let kw = if en.stage == STAGE_COMPUTE { "kernel void" }
+        else if en.stage == STAGE_VERTEX { "vertex" } else { "fragment" };
+    w.out.push_str(f"\n{kw} ");
+    if en.stage != STAGE_COMPUTE {
+        if f.result >= 0 {
+            w.out.push_str(f"{w.out_name} ");
+        } else {
+            w.p("void ");
+        }
+    }
+    w.out.push_str(f"{ename}(");
+    let mut first = true;
+    if in_name.len > 0 {
+        w.out.push_str(f"{in_name} _w_in [[stage_in]]");
+        first = false;
+    }
+    // builtin inputs as parameters
+    let mut has_lid = false;
+    for k in 0..f.params.len() {
+        let pt = m.types[f.params[k].ty];
+        if pt.kind == TK_STRUCT && f.params[k].binding.kind == ir::BIND_NONE {
+            for j in pt.mstart..pt.mstart + pt.mcount {
+                let mem = m.members[j];
+                if mem.binding.kind == BIND_BUILTIN
+                    && !(mem.binding.value == BI_POSITION && en.stage == STAGE_FRAGMENT) {
+                    if !first {
+                        w.p(", ");
+                    }
+                    first = false;
+                    let mut nb = Buf::new_in(w.a);
+                    nb.push_str(f"_w_p{k}_{j - pt.mstart}");
+                    io_decl(w, m, en.stage, mem.ty, mem.binding, nb.as_slice(), false);
+                    if mem.binding.value == BI_LOCAL_INVOCATION_INDEX {
+                        has_lid = true;
+                    }
+                }
+            }
+        }
+        else if f.params[k].binding.kind == BIND_BUILTIN
+            && !(f.params[k].binding.value == BI_POSITION && en.stage == STAGE_FRAGMENT) {
+            if !first {
+                w.p(", ");
+            }
+            first = false;
+            let mut nb = Buf::new_in(w.a);
+            nb.push_str(f"_w_p{k}");
+            io_decl(w, m, en.stage, f.params[k].ty, f.params[k].binding, nb.as_slice(), false);
+            if f.params[k].binding.value == BI_LOCAL_INVOCATION_INDEX {
+                has_lid = true;
+            }
+        }
+    }
+    let wg = en.stage == STAGE_COMPUTE && uses_workgroup(w, m, h);
+    if wg && !has_lid {
+        if !first {
+            w.p(", ");
+        }
+        first = false;
+        w.p("uint _w_lindex [[thread_index_in_threadgroup]]");
+    }
+    // resources
+    for g in 0..m.globals.len() {
+        if !w.uses[h][g] {
+            continue;
+        }
+        let gl = m.globals[g];
+        if gl.space == SP_PRIVATE || gl.space == SP_WORKGROUP {
+            continue;
+        }
+        if !first {
+            w.p(", ");
+        }
+        first = false;
+        let tk = m.types[gl.ty].kind;
+        let slot = w.sl.slot[g];
+        if gl.space == SP_HANDLE {
+            w.out.push_str(
+                f"{w.ty(m, gl.ty)} {w.gnames[g]} [[{if tk == TK_TEXTURE { "texture" } else { "sampler" }}({slot})]]");
+        } else if tk == TK_ARRAY && m.types[gl.ty].n == 0 {
+            w.out.push_str(
+                f"{W::space(gl.space, gl.access)} {w.ty(m, m.types[gl.ty].base)}* {w.gnames[g]} [[buffer({slot})]]");
+        } else {
+            w.out.push_str(
+                f"{W::space(gl.space, gl.access)} {w.ty(m, gl.ty)}& {w.gnames[g]} [[buffer({slot})]]");
+        }
+    }
+    if needs_sizes(w, m, h) {
+        if !first {
+            w.p(", ");
+        }
+        w.out.push_str(f"constant uint* _w_sizes [[buffer({SIZES_SLOT})]]");
+    }
+    w.p(") {");
+    w.indent = 1;
+    // private and workgroup variables
+    for g in 0..m.globals.len() {
+        if !w.uses[h][g] {
+            continue;
+        }
+        let gl = m.globals[g];
+        if gl.space == SP_PRIVATE {
+            w.line();
+            w.out.push_str(f"{w.ty(m, gl.ty)} {w.gnames[g]} = ");
+            if gl.init >= 0 {
+                write_const(w, m, gl.init);
+            } else {
+                w.out.push_str(f"{w.ty(m, gl.ty)} {{}}");
+            }
+            w.p(";");
+        } else if gl.space == SP_WORKGROUP {
+            w.line();
+            w.out.push_str(f"threadgroup {w.ty(m, gl.ty)} {w.gnames[g]};");
+        }
+    }
+    if wg {
+        let lid = if has_lid { lid_name(w, m, &f) } else { "_w_lindex" };
+        w.line();
+        w.out.push_str(f"if ({lid} == 0u) {{");
+        w.indent += 1;
+        for g in 0..m.globals.len() {
+            if w.uses[h][g] && m.globals[g].space == SP_WORKGROUP {
+                zero_workgroup(w, m, w.gnames[g], m.globals[g].ty, 0);
+            }
+        }
+        w.indent -= 1;
+        w.line();
+        w.p("}");
+        w.line();
+        w.p("metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);");
+    }
+    // the parameters as WGSL sees them
+    for k in 0..f.params.len() {
+        let ae = arg_expr(&f, k);
+        if ae < 0 {
+            continue;
+        }
+        let pt = m.types[f.params[k].ty];
+        w.line();
+        if pt.kind == TK_STRUCT && f.params[k].binding.kind == ir::BIND_NONE {
+            w.out.push_str(f"{w.ty(m, f.params[k].ty)} {w.enames[ae]} = {{}};");
+            for j in pt.mstart..pt.mstart + pt.mcount {
+                let mem = m.members[j];
+                let from_in = mem.binding.kind == BIND_LOCATION
+                    || (mem.binding.kind == BIND_BUILTIN && mem.binding.value == BI_POSITION
+                        && en.stage == STAGE_FRAGMENT);
+                w.line();
+                w.out.push_str(
+                    f"{w.enames[ae]}.{w.escape(mem.name)} = {if from_in { "_w_in." } else { "" }}_w_p{k}_{j - pt.mstart};");
+            }
+        } else {
+            let from_in = f.params[k].binding.kind == BIND_LOCATION
+                || (f.params[k].binding.kind == BIND_BUILTIN
+                    && f.params[k].binding.value == BI_POSITION && en.stage == STAGE_FRAGMENT);
+            w.out.push_str(
+                f"{w.ty(m, f.params[k].ty)} {w.enames[ae]} = {if from_in { "_w_in." } else { "" }}_w_p{k};");
+        }
+    }
+    declare_locals(w, m, &f);
+    w.block(m, &f, f.body);
+    w.indent = 0;
+    w.p("\n}\n");
+    w.stage = 255;
+}
+
+fn lid_name(w: *W, m: *Module, f: *Function) -> [u8] {
+    for k in 0..f.params.len() {
+        let pt = m.types[f.params[k].ty];
+        if pt.kind == TK_STRUCT && f.params[k].binding.kind == ir::BIND_NONE {
+            for j in pt.mstart..pt.mstart + pt.mcount {
+                let mem = m.members[j];
+                if mem.binding.kind == BIND_BUILTIN
+                    && mem.binding.value == BI_LOCAL_INVOCATION_INDEX {
+                    let mut b = Buf::new_in(w.a);
+                    b.push_str(f"_w_p{k}_{j - pt.mstart}");
+                    return b.as_slice();
+                }
+            }
+        }
+        else if f.params[k].binding.kind == BIND_BUILTIN
+            && f.params[k].binding.value == BI_LOCAL_INVOCATION_INDEX {
+            let mut b = Buf::new_in(w.a);
+            b.push_str(f"_w_p{k}");
+            return b.as_slice();
+        }
+    }
+    "_w_lindex"
+}
+
+// A private global's initializer: an expression of the module's constants.
+fn write_const(w: *W, m: *Module, e: i64) {
+    let saved_baked = w.baked;
+    let saved_names = w.enames;
+    let mut nb: V<bool> = Vec::filled_in(m.consts.exprs.len(), false, w.a);
+    let mut nn: V<[u8]> = Vec::filled_in(m.consts.exprs.len(), "", w.a);
+    w.baked = nb;
+    w.enames = nn;
+    w.render(m, &m.consts, e);
+    nb = w.baked;
+    nn = w.enames;
+    let _ = nb;
+    let _ = nn;
+    w.baked = saved_baked;
+    w.enames = saved_names;
+}
+
+// ---- Jobs for tests/wgsl/metalrun ----
+
+// The MSL of the module, then what metalrun needs: the entry point's
+// name, workgroup size, dispatch, and each buffer's slot and words.
+pub fn metal_job<A: Allocator>(m: *Module, a: ScopedArena, ei: i64, job: *job::Job, out: *Buf<A>) {
+    let mut text = Buf::new_in(a);
+    let mut w = new_writer(m, a);
+    let order = call_order(m, a);
+    w.uses = global_uses(m, &order, a);
+    for oi in 0..order.len() {
+        let h = order[oi];
+        let mut is_entry = false;
+        for e in 0..m.entries.len() {
+            if m.entries[e].func == h {
+                is_entry = true;
+            }
+        }
+        if !is_entry {
+            write_fn(&w, m, h);
+        }
+    }
+    for e in 0..m.entries.len() {
+        write_entry(&w, m, e);
+    }
+    let mut gpa_text = Buf::new_in(a);
+    finish_into(&w, &gpa_text);
+    text.push_str(gpa_text.as_slice());
+    let en = m.entries[ei];
+    out.push_str(f"msl {text.len()}\n");
+    out.push_str(text.as_slice());
+    out.push_str(f"\nentry {w.fnames[en.func]}\n");
+    out.push_str(f"tg {en.wg[0]} {en.wg[1]} {en.wg[2]}\n");
+    out.push_str(f"dispatch {job.groups[0]} {job.groups[1]} {job.groups[2]}\n");
+    let mut sizes: V<i64> = Vec::filled_in(w.sl.sizes_count, 0, a);
+    for i in 0..job.buffers.len() {
+        let b = job.buffers[i];
+        let g = job::find_global(m, b.group, b.binding);
+        if w.sl.size_index[g] >= 0 {
+            sizes[w.sl.size_index[g]] = b.bytes;
+        }
+        out.push_str(f"buffer {b.group} {b.binding} {w.sl.slot[g]} {b.bytes}");
+        for k in 0..b.words.len() {
+            out.push_str(f" {b.words[k]}");
+        }
+        out.push('\n');
+    }
+    if w.sl.sizes_count > 0 {
+        out.push_str(f"sizes {SIZES_SLOT} {sizes.len()}");
+        for k in 0..sizes.len() {
+            out.push_str(f" {sizes[k]}");
+        }
+        out.push('\n');
+    }
+}
+
+fn finish_into(w: *W, out: *Buf<ScopedArena>) {
+    let mut tmp = Buf::new_in(w.a);
+    let _ = tmp;
+    // finish writes to a gpa Buf in `write`; here the same text into an arena one
+    out.push_str(
+        "// Generated by wgslc (MSL 3.0).\n#include <metal_stdlib>\n#include <simd/simd.h>\n\n");
+    let mut h = Buf::new_in(w.a);
+    helpers(w, &h);
+    out.push_str(h.as_slice());
+    out.push('\n');
+    out.push_str(w.types_out.as_slice());
+    out.push_str(w.out.as_slice());
+    tmp = h;
+}

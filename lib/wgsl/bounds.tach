@@ -1,0 +1,297 @@
+// Bounds checks (D15: no undefined behaviour in shaders). Every E_ACCESS
+// gets its check: a clamp for vectors, matrices and fixed-size arrays
+// (naga's Restrict), read-zero-skip-write for runtime-sized arrays. A
+// check is dropped only where a dominating comparison proves the index in
+// range: the head of a counted loop, `for (var i = 0u; i < N; i++)`,
+// whose body indexes something of length N or more with `i`.
+use ir::{
+    CK_CLAMP, CK_NONE, CK_PENDING, CK_RZSW, E_ACCESS, E_BINARY, E_LITERAL, E_LOAD, E_LOCAL,
+    Function, Module, OP_LT, S_BLOCK, S_BREAK, S_CALL, S_EMIT, S_IF, S_LOOP, S_STORE, S_SWITCH,
+    TK_ARRAY, TK_POINTER, T_I32, T_U32, V,
+};
+
+// A fact: local `l` is below `n` (and not negative) while it holds.
+struct Fact { local: i64, n: i64 }
+
+pub fn insert_checks(m: *Module, a: ScopedArena, prove: bool) {
+    for h in 0..m.functions.len() {
+        let mut f = m.functions[h];
+        for e in 0..f.exprs.len() {
+            let x = f.exprs[e];
+            if x.op != E_ACCESS || x.c != CK_PENDING {
+                continue;
+            }
+            let bt0 = f.exprs[x.a].ty;
+            let bt = if m.types[bt0].kind == TK_POINTER { m.types[bt0].base } else { bt0 };
+            let t = m.types[bt];
+            if t.kind == TK_ARRAY && t.n == 0 {
+                f.exprs[e].c = CK_RZSW;
+            } else {
+                f.exprs[e].c = CK_CLAMP;
+                f.exprs[e].d = t.n;
+            }
+        }
+        if prove && f.body >= 0 {
+            let mut facts: V<Fact> = Vec::new_in(a);
+            prove_block(m, &f, f.body, &facts);
+        }
+        m.functions[h] = f;
+    }
+    let mut c = m.consts;
+    for e in 0..c.exprs.len() {
+        if c.exprs[e].op == E_ACCESS && c.exprs[e].c == CK_PENDING {
+            c.exprs[e].c = CK_CLAMP;
+            c.exprs[e].d = m.types[c.exprs[c.exprs[e].a].ty].n;
+        }
+    }
+    m.consts = c;
+}
+
+// The local an expression loads, or -1.
+fn loaded_local(f: *Function, e: i64) -> i64 {
+    let x = f.exprs[e];
+    if x.op == E_LOAD && f.exprs[x.a].op == E_LOCAL {
+        return f.exprs[x.a].a;
+    }
+    -1
+}
+
+// Whether the block (or what it calls) may store to local l.
+fn stores_local(f: *Function, blk: i64, l: i64) -> bool {
+    let b = f.blocks[blk];
+    for i in b.start..b.start + b.count {
+        let st = f.stmts[f.items[i]];
+        if st.op == S_STORE {
+            let p = f.exprs[st.a];
+            // a store through any pointer derived from the local
+            if p.op == E_LOCAL && p.a == l {
+                return true;
+            }
+            if p.op != E_LOCAL && reaches_local(f, st.a, l) {
+                return true;
+            }
+        } else if st.op == S_CALL {
+            // a pointer to the local passed to a function
+            for k in st.b..st.b + st.c {
+                if reaches_local(f, f.args[k], l) {
+                    return true;
+                }
+            }
+        } else if st.op == S_BLOCK {
+            if stores_local(f, st.a, l) {
+                return true;
+            }
+        } else if st.op == S_IF {
+            if stores_local(f, st.b, l) || stores_local(f, st.c, l) {
+                return true;
+            }
+        } else if st.op == S_SWITCH {
+            for k in st.b..st.b + st.c {
+                if stores_local(f, f.cases[k].body, l) {
+                    return true;
+                }
+            }
+        } else if st.op == S_LOOP {
+            if stores_local(f, st.a, l) || stores_local(f, st.b, l) {
+                return true;
+            }
+        } else if st.op == ir::S_ATOMIC {
+            if reaches_local(f, st.a, l) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// Whether pointer expression e is local l or derived from it.
+fn reaches_local(f: *Function, e: i64, l: i64) -> bool {
+    let x = f.exprs[e];
+    if x.op == E_LOCAL {
+        return x.a == l;
+    }
+    if x.op == E_ACCESS || x.op == ir::E_ACCESS_INDEX {
+        return reaches_local(f, x.a, l);
+    }
+    false
+}
+
+// The facts the head of a loop body establishes: `if (load(l) < N) {}
+// else { break; }`, with l an unsigned local or a signed one that starts
+// at a non-negative value and is only increased (checked by the caller).
+fn head_fact(m: *Module, f: *Function, body: i64) -> Fact {
+    let b = f.blocks[body];
+    let none = Fact { local: -1, n: 0 };
+    for i in b.start..b.start + b.count {
+        let st = f.stmts[f.items[i]];
+        if st.op == S_EMIT {
+            continue;
+        }
+        if st.op != S_IF {
+            return none;
+        }
+        let then_b = f.blocks[st.b];
+        let else_b = f.blocks[st.c];
+        if then_b.count != 0 || else_b.count != 1 || f.stmts[f.items[else_b.start]].op != S_BREAK {
+            return none;
+        }
+        let c = f.exprs[st.a];
+        if c.op != E_BINARY || c.a != OP_LT {
+            return none;
+        }
+        let l = loaded_local(f, c.b);
+        let lim = f.exprs[c.c];
+        if l < 0 || lim.op != E_LITERAL {
+            return none;
+        }
+        let lt = f.locals[l].ty;
+        if lt != T_U32 && lt != T_I32 {
+            return none;
+        }
+        let n = if lt == T_I32 { lim.a as u32 as i32 as i64 } else { lim.a };
+        if n <= 0 {
+            return none;
+        }
+        let _ = m;
+        return Fact { local: l, n: n };
+    }
+    none
+}
+
+// Whether local l (an i32) is never negative at the loop: it was stored a
+// non-negative literal just before the loop, and the loop's continuing
+// block only adds a positive literal to it.
+fn nonneg_counter(f: *Function, items: *V<i64>, pos: i64, l: i64, cont: i64, n: i64) -> bool {
+    // the statement before the loop (skipping emits) stores a literal
+    let mut k = pos - 1;
+    let mut ok = false;
+    while k >= 0 {
+        let st = f.stmts[items[k]];
+        if st.op == S_EMIT {
+            k -= 1;
+            continue;
+        }
+        if st.op == S_STORE && f.exprs[st.a].op == E_LOCAL && f.exprs[st.a].a == l {
+            let v = f.exprs[st.b];
+            ok = v.op == E_LITERAL && (v.a as u32 as i32) >= 0;
+        }
+        break;
+    }
+    if !ok {
+        return false;
+    }
+    // continuing: only `l = load(l) + positive literal`
+    let cb = f.blocks[cont];
+    for i in cb.start..cb.start + cb.count {
+        let st = f.stmts[f.items[i]];
+        if st.op == S_STORE && reaches_local(f, st.a, l) {
+            let v = f.exprs[st.b];
+            if v.op != E_BINARY || v.a != ir::OP_ADD || loaded_local(f, v.b) != l {
+                return false;
+            }
+            let inc = f.exprs[v.c];
+            // positive, and i + inc cannot wrap past i32's top while i < n
+            if inc.op != E_LITERAL || (inc.a as u32 as i32) <= 0
+                || n + (inc.a as u32 as i32) as i64 > 2147483647 {
+                return false;
+            }
+        } else if st.op != S_EMIT {
+            if st.op == S_CALL || st.op == S_BLOCK || st.op == S_IF || st.op == S_LOOP
+                || st.op == S_SWITCH {
+                if stores_local(f, cont, l) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn prove_block(m: *Module, f: *Function, blk: i64, facts: *V<Fact>) {
+    let b = f.blocks[blk];
+    // the block's items, so nonneg_counter can look back
+    let mut items: V<i64> = Vec::new_in(f.items.allocator());
+    for i in b.start..b.start + b.count {
+        items.push(f.items[i]);
+    }
+    for i in 0..items.len() {
+        let s = items[i];
+        let st = f.stmts[s];
+        if st.op == S_EMIT {
+            for e in st.a..st.b {
+                prove_expr(m, f, e, facts);
+            }
+        } else if st.op == S_BLOCK {
+            prove_block(m, f, st.a, facts);
+        } else if st.op == S_IF {
+            prove_block(m, f, st.b, facts);
+            prove_block(m, f, st.c, facts);
+        } else if st.op == S_SWITCH {
+            for k in st.b..st.b + st.c {
+                prove_block(m, f, f.cases[k].body, facts);
+            }
+        } else if st.op == S_LOOP {
+            let base = facts.len();
+            // facts from outside the loop hold inside only when it keeps them
+            let mut kept = 0;
+            for k in 0..base {
+                if !stores_local(f, st.a, facts[k].local)
+                    && !stores_local(f, st.b, facts[k].local) {
+                    kept += 1;
+                } else {
+                    facts[k].n = -facts[k].n - 1;
+                }
+            }
+            let _ = kept;
+            let fact = head_fact(m, f, st.a);
+            let mut added = false;
+            if fact.local >= 0 && !stores_local(f, st.a, fact.local) {
+                let lt = f.locals[fact.local].ty;
+                if lt == T_U32 || nonneg_counter(f, &items, i, fact.local, st.b, fact.n) {
+                    facts.push(fact);
+                    added = true;
+                }
+            }
+            prove_block(m, f, st.a, facts);
+            if added {
+                facts.truncate(base);
+            }
+            prove_block(m, f, st.b, facts);
+            for k in 0..base {
+                if facts[k].n < 0 {
+                    facts[k].n = -facts[k].n - 1;
+                }
+            }
+        }
+    }
+}
+
+fn prove_expr(m: *Module, f: *Function, e: i64, facts: *V<Fact>) {
+    let x = f.exprs[e];
+    if x.op != E_ACCESS || x.c != CK_CLAMP {
+        return;
+    }
+    let l = loaded_local(f, x.b);
+    if l < 0 {
+        return;
+    }
+    for k in 0..facts.len() {
+        if facts[k].local == l && facts[k].n > 0 && facts[k].n <= x.d {
+            f.exprs[e].c = CK_NONE;
+            return;
+        }
+    }
+}
+
+// Bench only: every check off (CK_NONE), to measure what checks cost.
+pub fn insert_no_checks(m: *Module) {
+    for h in 0..m.functions.len() {
+        let mut f = m.functions[h];
+        for e in 0..f.exprs.len() {
+            if f.exprs[e].op == E_ACCESS {
+                f.exprs[e].c = CK_NONE;
+            }
+        }
+        m.functions[h] = f;
+    }
+}
