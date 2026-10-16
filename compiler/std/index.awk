@@ -20,6 +20,13 @@
 # TRIGGERS words that ask for one besides its names (what the compiler
 # itself calls). Every other section is core, and so is what a core
 # section needs. (POSIX awk; LC_ALL=C: lengths are bytes.)
+#
+# (0.20) std's modules: embed.sh puts each between the banners `// ---- mod
+# std::a ----` and `// ---- end mod std::a ----`; the first section holds
+# its `mod a {` line and its file's header and `use` lines, the last its
+# `}`, and both are core. The module's items before its first banner are
+# a section titled `std::a`. `use` lines need no section (a `use` of a
+# section not read imports nothing: front/modules/lookup).
 
 BEGIN {
     n = split("Stable sort (0.15)|HashMap|Debug of HashMap (0.15)|== on HashMap (0.15)|Iterators (0.14)|Adapters|Sources|Text (0.14)|Errors of reading and parsing (0.15)|Integer limits (0.15)|Bits (0.16)|Conversions (0.15)|Clone and hashing (0.15)|Clone, Eq, Ord and Hash without an impl (0.15)|Arenas (0.16)|FixedBuf (0.16)|HashMap's room (0.16)|Slices (0.16)|Gpa's leak checks (0.16)|The checking allocator's hooks for arenas (0.16)|Panic and unreachable, the prelude's (0.17)|Testing (0.18)|Non-null pointers (0.18)|The test runtime's implementation (0.18)|The fuzzer's implementation (0.18)|Heaps (0.18.1)|More of Vec and Range (0.18.1)|Run-time CPU features (0.19)|CPU features on macOS (0.19)|CPU features on Linux (0.19)|CPU features on x86-64 (0.19)", lz, "|")
@@ -111,19 +118,37 @@ function impl_pair(h,    i, c, depth, rest, f) {
     return ""
 }
 
+# (0.20) Section s starts at byte pos, titled t.
+function new_section(t) {
+    end_[s] = pos
+    s++
+    start[s] = pos
+    title[s] = t
+}
+
 {
     line = $0
     len = length(line) + 1
     if (line ~ /^\/\/ ---- .* ----$/) {
-        end_[s] = pos
-        s++
-        start[s] = pos
         t = line
         sub(/^\/\/ ---- /, "", t)
         sub(/ ----$/, "", t)
-        title[s] = t
+        new_section(t)
+    } else if (title[s] ~ /^mod / && line ~ /^[^ \t\/}]/ && line !~ /^(pub )?(mod|use) /) {
+        # (0.20) A module's items before its first banner: a section of
+        # their own, titled with the module's path, not its `mod` line's
+        # (always read)
+        t = title[s]
+        sub(/^mod /, "", t)
+        new_section(t)
     }
     pos += len
+    # (0.20) `use` lines name what the code below them uses, and a `use`
+    # of a section not read imports nothing: they need no section.
+    if (in_use || line ~ /^(pub )?use /) {
+        in_use = index(line, ";") == 0
+        next
+    }
     code = line
     # (comments, strings and characters hold no names)
     gsub(/"([^"\\]|\\.)*"/, "\"\"", code)

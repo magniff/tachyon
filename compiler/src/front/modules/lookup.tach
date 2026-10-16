@@ -18,10 +18,11 @@ use crate::front::check::collect::template_variant_named;
 use crate::front::check::names::{help_near_item, import_path_for};
 use crate::front::lexer::is_ident_byte;
 use crate::front::modules::{
-    CUR_MOD, C_MODULE, MODULES, MODULE_COUNT, STD_MODULE, child_module, file_of_pos, is_within,
-    module_of, qualified_if_known, qualify,
+    CUR_MOD, C_MODULE, MODULES, MODULE_COUNT, STD_MODULE, child_module, file_of_pos, in_std,
+    is_within, item_key_if_known, module_of, qualified_if_known, qualify,
 };
 use crate::front::parser::items::ITEM_PUBLIC;
+use crate::front::stdtree::STD_TREE;
 use crate::front::types::{ENUMS, SYM_ENUM, VARIANTS, find_variant, item_node_of};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::fix::note_private;
@@ -212,7 +213,9 @@ pub fn resolve_use_of(u: i64) {
                 if binding_kind(result) == B_PRIVATE {
                     access_error(result, NODES[id].start, name);
                 }
-                if result == B_NONE {
+                // (0.20: std's built-in text is read in sections, and an
+                // import of std's from a section not read imports nothing)
+                if result == B_NONE && !(in_std(m) && STD_TREE == 0 as *u8) {
                     unresolved_import(id, path, prefix, m);
                 }
             } else if binding_kind(prefix) == B_ITEM && SYM_ENUM[binding_value(prefix)] != 0 {
@@ -420,6 +423,35 @@ pub fn lookup_name(m: i64, name: i64, from: i64) -> i64 {
         SCOPE_CACHE.put(k, result + 1);
     }
     result
+}
+
+// (0.20) The key of the item `std::NAME` names, -1 for none: std's own
+// item, else what std re-exports under that name (std's items are in its
+// modules, and `std::NAME` keeps naming them); before the imports are
+// read, the item of that name in the first of std's modules that has one.
+pub fn std_item_key(name: i64) -> i64 {
+    unsafe {
+        if STD_MODULE < 0 {
+            return -1;
+        }
+        let own = item_key_if_known(STD_MODULE, name);
+        if own >= 0 && item_node_of(own) != 0 {
+            return own;
+        }
+        if SCOPES_READY {
+            let b = lookup_quiet(STD_MODULE, name, STD_MODULE);
+            return if binding_kind(b) == B_ITEM { binding_value(b) } else { -1 };
+        }
+        for m in 0..MODULE_COUNT {
+            if m != STD_MODULE && in_std(m) {
+                let k = item_key_if_known(m, name);
+                if k >= 0 && item_node_of(k) != 0 {
+                    return k;
+                }
+            }
+        }
+        -1
+    }
 }
 
 // What `name` stands for in module m, seen from `from`, where a value or a
@@ -883,17 +915,19 @@ pub fn resolve_path(m: i64, path: i64, count: i64, entry: i64) -> i64 {
 // the root its try: lines.
 pub fn sibling_module(m: i64, name: i64, seg: i64, path: i64, entry: i64) -> i64 {
     unsafe {
-        if m == 0 {
+        // (0.20: std's root is std, not the program's)
+        if m == 0 || m == STD_MODULE {
             return -1;
         }
+        let root = if in_std(m) { STD_MODULE } else { 0 };
         let parent = MODULES[m].parent;
         let mut sibling = -1;
         if parent >= 0 {
             sibling = child_module(parent, name);
         }
         let mut top = -1;
-        if parent != 0 {
-            top = child_module(0, name);
+        if parent != root {
+            top = child_module(root, name);
         }
         if sibling == STD_MODULE || sibling == C_MODULE {
             sibling = -1;
