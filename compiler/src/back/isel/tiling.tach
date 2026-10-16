@@ -107,7 +107,7 @@ fn isel_address(mut cx: *FnCtx, v: i64) {
             let mut k = 0;
             if chosen_scale < 0 && coverable(cx, index, Shl, addr)
                 && is_wide_int(cx.insts[index].ty)
-                && isel_const(cx, cx.insts[index].b, &k) && base_ok(cx, base) {
+                && isel_const(cx, cx.insts[index].b, &mut k) && base_ok(cx, base) {
                 let s = k & 63;
                 if (X86 && s <= 3) || (!X86 && (s == 0 || (1 << s as u64) == size)) {
                     chosen_base = base;
@@ -167,7 +167,7 @@ fn isel_lea(mut cx: *FnCtx, v: i64) {
         let a = cx.insts[v].a;
         let b = cx.insts[v].b;
         let mut k = 0;
-        if isel_const(cx, b, &k) {
+        if isel_const(cx, b, &mut k) {
             let disp = if cx.insts[v].op == Sub { 0 - k } else { k };
             if !fits_i32(k) || !fits_i32(disp) || cx.insts[a].op.is_remat() {
                 return;
@@ -177,7 +177,8 @@ fn isel_lea(mut cx: *FnCtx, v: i64) {
             cx.insts[v].scale = 0;
             // (x * 3) + k = k(x, x, 2), and (x + y) + k = k(x, y).
             let mut m = 0;
-            if coverable(cx, a, Mul, v) && cx.insts[a].ty == ty && isel_const(cx, cx.insts[a].b, &m)
+            if coverable(cx, a, Mul, v) && cx.insts[a].ty == ty
+                && isel_const(cx, cx.insts[a].b, &mut m)
                 && (m == 3 || m == 5 || m == 9) {
                 cx.insts[v].scale = log2(m - 1);
                 isel_set_operands(cx, v, cx.insts[a].a, cx.insts[a].a, 0);
@@ -200,7 +201,7 @@ fn isel_lea(mut cx: *FnCtx, v: i64) {
             let index = if side == 0 { b } else { a };
             let mut s = 0;
             if coverable(cx, index, Shl, v) && cx.insts[index].ty == ty
-                && isel_const(cx, cx.insts[index].b, &s)
+                && isel_const(cx, cx.insts[index].b, &mut s)
                 && (s & 63) <= 3 && cx.insts[base].op != Slot {
                 cx.insts[v].op = Lea;
                 cx.insts[v].imm = 0;
@@ -232,7 +233,7 @@ fn isel_madd(mut cx: *FnCtx, v: i64) -> bool {
             let other = if side == 0 { cx.insts[v].a } else { cx.insts[v].b };
             let mut k = 0;
             if coverable(cx, m, Mul, v) && cx.insts[m].ty == ty && cx.insts[other].op != Const
-                && !(isel_const(cx, cx.insts[m].b, &k) && ma_int_imm_ok(Mul, k)) {
+                && !(isel_const(cx, cx.insts[m].b, &mut k) && ma_int_imm_ok(Mul, k)) {
                 cx.insts[v].op = if sub { MSub } else { MAdd };
                 isel_set_operands(cx, v, cx.insts[m].a, cx.insts[m].b, other);
                 return true;
@@ -260,7 +261,7 @@ fn isel_shop(mut cx: *FnCtx, v: i64) -> bool {
             let mut k = 0;
             let sop = cx.insts[s].op;
             if (sop == Shl || sop == Shr) && coverable(cx, s, sop, v) && cx.insts[s].ty == ty
-                && isel_const(cx, cx.insts[s].b, &k) {
+                && isel_const(cx, cx.insts[s].b, &mut k) {
                 let amount = k & (if int_bits(ty) == 64 { 63 } else { 31 });
                 let kind = if sop == Shl { 0 } else if is_signed(ty) { 2 } else { 1 };
                 cx.insts[v].op = ShOp;
@@ -281,9 +282,9 @@ fn isel_ubfx(mut cx: *FnCtx, v: i64) -> bool {
         let s = cx.insts[v].a;
         let mut mask = 0;
         let mut k = 0;
-        if !isel_const(cx, cx.insts[v].b, &mask) || mask <= 0 || !coverable(cx, s, Shr, v)
+        if !isel_const(cx, cx.insts[v].b, &mut mask) || mask <= 0 || !coverable(cx, s, Shr, v)
             || cx.insts[s].ty != ty
-            || !isel_const(cx, cx.insts[s].b, &k) {
+            || !isel_const(cx, cx.insts[s].b, &mut k) {
             return false;
         }
         if (mask & (mask + 1)) != 0 {
@@ -318,7 +319,7 @@ fn isel_branch(mut cx: *FnCtx, b: i64) {
         }
         let op = cx.insts[c].cond;
         let mut zero = 1;
-        if (op != Cond::Eq && op != Cond::Ne) || !isel_const(cx, cx.insts[c].b, &zero)
+        if (op != Cond::Eq && op != Cond::Ne) || !isel_const(cx, cx.insts[c].b, &mut zero)
             || zero != 0 {
             return;
         }
@@ -328,7 +329,7 @@ fn isel_branch(mut cx: *FnCtx, b: i64) {
         }
         let mut mask = 0;
         cx.insts[c].op = Test;
-        if isel_const(cx, cx.insts[and].b, &mask) && test_imm_ok(mask) {
+        if isel_const(cx, cx.insts[and].b, &mut mask) && test_imm_ok(mask) {
             cx.insts[c].imm = mask;
             isel_set_operands(cx, c, cx.insts[and].a, 0, 0);
         } else {
@@ -351,7 +352,7 @@ fn isel_select_test(mut cx: *FnCtx, v: i64) {
         cx.insts[v].scale = 1;
         isel_retain(cx, cx.insts[lhs].a);
         ir_set_arg(cx, v, 0, cx.insts[lhs].a);
-        if isel_const(cx, cx.insts[lhs].b, &mask) && test_imm_ok(mask) {
+        if isel_const(cx, cx.insts[lhs].b, &mut mask) && test_imm_ok(mask) {
             cx.insts[v].imm = mask;
         } else {
             isel_retain(cx, cx.insts[lhs].b);
@@ -373,7 +374,7 @@ fn isel_select_increment(mut cx: *FnCtx, v: i64) {
         let mut one = 0;
         let other = cx.insts[v].b;
         if coverable(cx, other, Add, v) && cx.insts[other].ty == cx.insts[v].ty
-            && isel_const(cx, cx.insts[other].b, &one)
+            && isel_const(cx, cx.insts[other].b, &mut one)
             && one == 1 {
             cx.insts[v].scale = cx.insts[v].scale | 2;
             isel_set_operands(cx, v, cx.insts[v].a, cx.insts[other].a, 0);
@@ -382,7 +383,7 @@ fn isel_select_increment(mut cx: *FnCtx, v: i64) {
         let then = cx.insts[v].a;
         let invertible = (cx.insts[v].scale & 1) == 1 || !is_float(cx.insts[v].imm2);
         if invertible && coverable(cx, then, Add, v) && cx.insts[then].ty == cx.insts[v].ty
-            && isel_const(cx, cx.insts[then].b, &one) && one == 1 {
+            && isel_const(cx, cx.insts[then].b, &mut one) && one == 1 {
             cx.insts[v].scale = cx.insts[v].scale | 2;
             cx.insts[v].cond = cx.insts[v].cond.negate();
             isel_set_operands(cx, v, cx.insts[v].b, cx.insts[then].a, 0);

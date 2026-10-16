@@ -358,7 +358,7 @@ pub fn cc_begin() {
             return;
         }
         let moves = move_copies();
-        names_begin(moves);
+        names_begin(&*moves);
         FN_IRH = alloc_zeroed((IRFUNC_COUNT + 1) * size_of(H2)) as *H2;
         FN_IRH_OK = alloc_array::<bool>(IRFUNC_COUNT + 1);
         FN_STRS = alloc_zeroed((IRFUNC_COUNT + 1) * size_of(IntVec)) as *IntVec;
@@ -444,11 +444,11 @@ pub fn cc_phase(kind: i64) {
         }
         strings_begin();
         let mut h = h2_new(0x656e76);
-        h2_put(&h, ARGS_H);
-        h2_put(&h, types_hash());
-        h2_puti(&h, if ATTRS_READY { 1 } else { 0 });
-        h2_puti(&h, crate::front::types::TY_STRING);
-        h2_puti(&h, crate::front::types::TY_U8_PTR);
+        h2_put(&mut h, ARGS_H);
+        h2_put(&mut h, types_hash());
+        h2_puti(&mut h, if ATTRS_READY { 1 } else { 0 });
+        h2_puti(&mut h, crate::front::types::TY_STRING);
+        h2_puti(&mut h, crate::front::types::TY_U8_PTR);
         ENV = h;
         // (-O1: the small leaves' IR, which the emission tasks inline, hashed
         // first)
@@ -459,7 +459,7 @@ pub fn cc_phase(kind: i64) {
                     ir_enter(cx, g);
                     FN_STRS[g].count = 0;
                     let mut h2 = H2 { a: 0, b: 0 };
-                    FN_IRH_OK[g] = ir_hash(cx, g, 0, &FN_STRS[g], &h2);
+                    FN_IRH_OK[g] = ir_hash(cx, g, 0, &FN_STRS[g], &mut h2);
                     FN_IRH[g] = h2;
                 }
             }
@@ -584,7 +584,7 @@ const R_BUDGET: i64 = 8;
 
 // Whether IR function g is one of the task's own (what it reads of them
 // is its own doing).
-fn is_own(cc: *CcCtx, g: i64) -> bool {
+fn is_own(cc: &CcCtx, g: i64) -> bool {
     unsafe {
         if (*cc).comp >= 0 {
             return comp_of(g) == (*cc).comp;
@@ -598,7 +598,7 @@ fn is_own(cc: *CcCtx, g: i64) -> bool {
 pub fn cc_note(mut cx: *FnCtx, kind: i64, g: i64) {
     unsafe {
         let cc = cx.cc;
-        if cc == 0 as *CcCtx || !(*cc).rec || g < 0 || is_own(cc, g) {
+        if cc == 0 as *CcCtx || !(*cc).rec || g < 0 || is_own(&*cc, g) {
             return;
         }
         if (*cc).seen[g] != (*cc).stamp {
@@ -634,7 +634,7 @@ pub fn cc_note(mut cx: *FnCtx, kind: i64, g: i64) {
 pub fn cc_note_calls(mut cx: *FnCtx, g: i64, own_dec: i64, one: bool) {
     unsafe {
         let cc = cx.cc;
-        if cc == 0 as *CcCtx || !(*cc).rec || g < 0 || is_own(cc, g) {
+        if cc == 0 as *CcCtx || !(*cc).rec || g < 0 || is_own(&*cc, g) {
             return;
         }
         (*cc).reads.push(R_CALLS);
@@ -782,7 +782,7 @@ fn task_begin(mut cx: *FnCtx, comp: i64, fi: i64) -> *CcCtx {
 
 // The key of a task: its kind, the phase's hash, and per function its
 // symbol, what is known of it and its IR's hash.
-fn key_put_fn(k: *H2, fi: i64, irh: *H2) {
+fn key_put_fn(k: &mut H2, fi: i64, irh: *H2) {
     unsafe {
         h2_puti(k, FN_NAMEH[IRFUNCS[fi].f]);
         h2_put(k, own_fp(fi));
@@ -793,14 +793,14 @@ fn key_put_fn(k: *H2, fi: i64, irh: *H2) {
 
 // Hashes function fi's IR as the task receives it into the key, its
 // strings appended to the task's; false when it cannot be.
-fn hash_input(mut cx: *FnCtx, cc: *CcCtx, fi: i64, key: *H2) -> bool {
+fn hash_input(mut cx: *FnCtx, cc: &mut CcCtx, fi: i64, key: &mut H2) -> bool {
     unsafe {
         (*cc).members.push(fi);
         (*cc).own_start.push((*cc).own_strs.count);
         (*cc).consts_before.push(const_data_count(fi));
         let mut h = H2 { a: 0, b: 0 };
         ir_enter(cx, fi);
-        let ok = ir_hash(cx, fi, 0, &(*cc).own_strs, &h);
+        let ok = ir_hash(cx, fi, 0, &(*cc).own_strs, &mut h);
         key_put_fn(key, fi, &h);
         ok
     }
@@ -810,7 +810,7 @@ fn hash_input(mut cx: *FnCtx, cc: *CcCtx, fi: i64, key: *H2) -> bool {
 
 // Whether every read entry r records reads the same now (r is left after
 // them, and the alias hash).
-fn reads_hold(mut cx: *FnCtx, cc: *CcCtx, r: *Reader) -> bool {
+fn reads_hold(mut cx: *FnCtx, cc: &mut CcCtx, r: &mut Reader) -> bool {
     unsafe {
         let n = get_count(r);
         (*cc).reads.count = 0;
@@ -887,20 +887,20 @@ fn ready_or_done(mut cx: *FnCtx, g: i64) -> bool {
 // Which strings of the task's lists (its own, then those of the
 // functions whose IR it read, (*cc).reads after reads_hold) are the same
 // id: for each, how far back the first of its id is, hashed.
-fn alias_hash(cc: *CcCtx) -> u64 {
+fn alias_hash(cc: &CcCtx) -> u64 {
     unsafe {
         let mut map = crate::middle::lower::ssa::HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0,
             count: 0 };
         let mut h: u64 = 0x616c6961;
         let mut pos = 0;
         for i in 0..(*cc).own_strs.count {
-            h = alias_put(&map, h, (*cc).own_strs.data[i], pos);
+            h = alias_put(&mut map, h, (*cc).own_strs.data[i], pos);
             pos += 1;
         }
         for k in 0..(*cc).reads.count {
             let g = (*cc).reads.data[k];
             for i in 0..FN_STRS[g].count {
-                h = alias_put(&map, h, FN_STRS[g].data[i], pos);
+                h = alias_put(&mut map, h, FN_STRS[g].data[i], pos);
                 pos += 1;
             }
         }
@@ -910,7 +910,7 @@ fn alias_hash(cc: *CcCtx) -> u64 {
     }
 }
 
-fn alias_put(map: *crate::middle::lower::ssa::HMap, h: u64, id: i64, pos: i64) -> u64 {
+fn alias_put(map: &mut crate::middle::lower::ssa::HMap, h: u64, id: i64, pos: i64) -> u64 {
     unsafe {
         let key = (id << 1) | 1;
         let first = (*map).get(key);
@@ -924,7 +924,7 @@ fn alias_put(map: *crate::middle::lower::ssa::HMap, h: u64, id: i64, pos: i64) -
 
 // The recorded reads into an entry's body: the reads, then the alias hash
 // over the strings of the functions whose IR was read (in their order).
-fn put_reads(cc: *CcCtx, b: *ByteBuf) {
+fn put_reads(cc: &mut CcCtx, b: &mut ByteBuf) {
     unsafe {
         let n = (*cc).reads.count / 3;
         put_u(b, n as u64);
@@ -951,25 +951,25 @@ fn put_reads(cc: *CcCtx, b: *ByteBuf) {
 
 // The strings an entry's outputs may name: the task's own lists, then
 // those of the functions whose IR it read (src: their place).
-fn rel_sources(cc: *CcCtx, irs: *IntVec) {
+fn rel_sources(cc: &mut CcCtx, irs: &IntVec) {
     unsafe {
         let rel: *Rel = &(*cc).rel;
-        rel_clear(rel);
+        rel_clear(&mut *rel);
         let m = (*cc).own_start.count;
         for i in 0..m {
             let from = (*cc).own_start.data[i];
             let to = if i + 1 < m { (*cc).own_start.data[i + 1] } else { (*cc).own_strs.count };
-            rel_add_source(rel, i, &(*cc).own_strs.data[from], to - from);
+            rel_add_source(&mut *rel, i, &(*cc).own_strs.data[from], to - from);
         }
         for j in 0..(*irs).count {
             let g = (*irs).data[j];
-            rel_add_source(rel, m + j, FN_STRS[g].data, FN_STRS[g].count);
+            rel_add_source(&mut *rel, m + j, FN_STRS[g].data, FN_STRS[g].count);
         }
     }
 }
 
 // The IR functions whose IR the task read, in the order of its reads.
-fn read_irs(cc: *CcCtx) -> IntVec {
+fn read_irs(cc: &CcCtx) -> IntVec {
     unsafe {
         let mut irs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let n = (*cc).reads.count / 3;
@@ -986,12 +986,12 @@ fn read_irs(cc: *CcCtx) -> IntVec {
 // owner (a function of the task: 1 + its place among them, with k past
 // what it had when the task began; else 0 and the owner's symbol),
 // symbols by text, functions by symbol.
-fn put_tables(cc: *CcCtx, b: *ByteBuf) {
+fn put_tables(cc: &mut CcCtx, b: &mut ByteBuf) {
     unsafe {
         let rel: *Rel = &(*cc).rel;
         put_u(b, (*rel).strs.count as u64);
         for i in 0..(*rel).strs.count {
-            let s = rel_str_source(rel, i);
+            let s = rel_str_source(&*rel, i);
             put_u(b, (s >> 32) as u64);
             put_u(b, (s & 0xffffffff) as u64);
         }
@@ -1050,14 +1050,14 @@ fn put_tables(cc: *CcCtx, b: *ByteBuf) {
 }
 
 // The task's j-th function.
-fn member_fn(cc: *CcCtx, j: i64) -> i64 {
+fn member_fn(cc: &CcCtx, j: i64) -> i64 {
     unsafe { (*cc).members.data[j] }
 }
 
 // Reads an entry's tables, mapped to this build's ids (members: the
 // task's functions, start in SCC_ORDER or the one; irs: the functions
 // whose IR it read): false when one names what is not here.
-fn get_tables(cc: *CcCtx, r: *Reader, irs: *IntVec, ids: *Ids) -> bool {
+fn get_tables(cc: &mut CcCtx, r: &mut Reader, irs: &IntVec, ids: &mut Ids) -> bool {
     unsafe {
         let m = (*cc).own_start.count;
         let ns = get_count(r);
@@ -1119,7 +1119,7 @@ fn get_tables(cc: *CcCtx, r: *Reader, irs: *IntVec, ids: *Ids) -> bool {
         (*ids).nsyms = ny;
         for i in 0..ny {
             let mut len = 0;
-            let p = get_bytes(r, &len);
+            let p = get_bytes(r, &mut len);
             if (*r).bad {
                 return false;
             }
@@ -1175,14 +1175,14 @@ pub fn cc_component_begin(mut cx: *FnCtx, c: i64, start: i64, end: i64) -> bool 
         let cc = task_begin(cx, c, SCC_ORDER.data[start]);
         (*cc).own_scc = FN_SCC[SCC_ORDER.data[start]];
         let mut key = h2_new(E_COMPONENT as u64);
-        h2_put(&key, ENV.a);
-        h2_put(&key, ENV.b);
-        h2_puti(&key, end - start);
+        h2_put(&mut key, ENV.a);
+        h2_put(&mut key, ENV.b);
+        h2_puti(&mut key, end - start);
         let mut ok = true;
         for i in start..end {
             let fi = SCC_ORDER.data[i];
             FN_IRH_OK[fi] = false;
-            if !hash_input(cx, cc, fi, &key) {
+            if !hash_input(cx, &mut *cc, fi, &mut key) {
                 ok = false;
             }
         }
@@ -1197,7 +1197,7 @@ pub fn cc_component_begin(mut cx: *FnCtx, c: i64, start: i64, end: i64) -> bool 
         }
         let e = pack_find(key.a, key.b);
         if e >= 0 {
-            let got = component_hit(cx, cc, e, c, start, end);
+            let got = component_hit(cx, &mut *cc, e, c, start, end);
             if got == OUT_HIT {
                 pack_used(e);
                 OUT_COMP[first] = OUT_HIT;
@@ -1214,7 +1214,7 @@ pub fn cc_component_begin(mut cx: *FnCtx, c: i64, start: i64, end: i64) -> bool 
 }
 
 // The members' facts a component's task leaves (in its entry).
-fn put_facts(b: *ByteBuf, fi: i64) {
+fn put_facts(b: &mut ByteBuf, fi: i64) {
     unsafe {
         put_s(b, FN_SIZE[fi]);
         put_s(b, FN_RT[fi]);
@@ -1232,7 +1232,7 @@ fn put_facts(b: *ByteBuf, fi: i64) {
 
 // The constant data function fi's task made (from its count at the start,
 // `before`): their phase, rank (less `rank0`), alignment and bytes.
-fn put_consts(b: *ByteBuf, fi: i64, before: i64, rank0: i64) {
+fn put_consts(b: &mut ByteBuf, fi: i64, before: i64, rank0: i64) {
     unsafe {
         let n = const_data_count(fi);
         put_u(b, (n - before) as u64);
@@ -1240,7 +1240,7 @@ fn put_consts(b: *ByteBuf, fi: i64, before: i64, rank0: i64) {
             let mut phase = 0;
             let mut rank = 0;
             let mut align = 0;
-            let bytes = const_data_entry(fi, k, &phase, &rank, &align);
+            let bytes = const_data_entry(fi, k, &mut phase, &mut rank, &mut align);
             put_u(b, phase as u64);
             put_s(b, rank - rank0);
             put_s(b, align);
@@ -1263,62 +1263,62 @@ pub fn cc_component_end(mut cx: *FnCtx, c: i64, start: i64, end: i64) {
             OUT_COMP[SCC_ORDER.data[start]] = OUT_POISON;
             return;
         }
-        let mut irs = read_irs(cc);
-        rel_sources(cc, &irs);
+        let mut irs = read_irs(&*cc);
+        rel_sources(&mut *cc, &irs);
         let out: *ByteBuf = &(*cc).out;
         (*out).len = 0;
-        put_s(out, COMP_GROWTH[c]);
-        put_u(out, COMP_INLINED[c].count as u64);
+        put_s(&mut *out, COMP_GROWTH[c]);
+        put_u(&mut *out, COMP_INLINED[c].count as u64);
         for m in 0..COMP_INLINED[c].count {
-            put_u(out, rel_fn(&(*cc).rel, IRFUNCS[COMP_INLINED[c].data[m]].f) as u64);
+            put_u(&mut *out, rel_fn(&(*cc).rel, IRFUNCS[COMP_INLINED[c].data[m]].f) as u64);
         }
         for i in start..end {
             let fi = SCC_ORDER.data[i];
             ir_enter(cx, fi);
-            encode_ir(cx, fi, out, &(*cc).rel);
-            put_facts(out, fi);
-            put_u(out, FN_IRH[fi].a);
-            put_u(out, FN_IRH[fi].b);
-            put_consts(out, fi, (*cc).consts_before.data[i - start], start);
+            encode_ir(cx, fi, &mut *out, &(*cc).rel);
+            put_facts(&mut *out, fi);
+            put_u(&mut *out, FN_IRH[fi].a);
+            put_u(&mut *out, FN_IRH[fi].b);
+            put_consts(&mut *out, fi, (*cc).consts_before.data[i - start], start);
         }
         ir_release(cx);
         free(irs.data as *u8);
-        if !store(cc, E_COMPONENT, SCC_ORDER.data[start]) {
+        if !store(&mut *cc, E_COMPONENT, SCC_ORDER.data[start]) {
             OUT_COMP[SCC_ORDER.data[start]] = OUT_POISON;
             return;
         }
         if CHECK {
-            check_component(cx, cc, start, end);
+            check_component(cx, &mut *cc, start, end);
         }
     }
 }
 
 // (testing, $TACHYON_CACHE_CHECK) The entry just made, read back: its IR
 // must be the tables it was made from.
-fn check_component(mut cx: *FnCtx, cc: *CcCtx, start: i64, end: i64) {
+fn check_component(mut cx: *FnCtx, cc: &mut CcCtx, start: i64, end: i64) {
     unsafe {
         let body: *ByteBuf = &(*cc).body;
         let mut r = Reader { p: (*body).data, at: 0, end: (*body).len, bad: false };
-        get_u(&r);
-        let n = get_count(&r);
+        get_u(&mut r);
+        let n = get_count(&mut r);
         for i in 0..n {
-            get_u(&r);
-            get_s(&r);
-            get_s(&r);
+            get_u(&mut r);
+            get_s(&mut r);
+            get_s(&mut r);
         }
-        get_u(&r);
+        get_u(&mut r);
         let mut irs = read_irs(cc);
         let mut ids = Ids { strs: 0 as *i64, nstrs: 0, consts: 0 as *i64, nconsts: 0,
             syms: 0 as *i64, nsyms: 0, fns: 0 as *i64, nfns: 0, rtids: 0 as *i64, nrtids: 0 };
         let name = crate::base::sym_name(FNS[IRFUNCS[SCC_ORDER.data[start]].f].name);
-        if !get_tables(cc, &r, &irs, &ids) {
+        if !get_tables(cc, &mut r, &irs, &mut ids) {
             eprintln(f"code cache check: {crate::base::cstr(name)}: tables do not read back");
             return;
         }
-        get_s(&r);
-        let ni = get_count(&r);
+        get_s(&mut r);
+        let ni = get_count(&mut r);
         for m in 0..ni {
-            get_u(&r);
+            get_u(&mut r);
         }
         for i in start..end {
             let fi = SCC_ORDER.data[i];
@@ -1333,19 +1333,19 @@ fn check_component(mut cx: *FnCtx, cc: *CcCtx, start: i64, end: i64) {
                     swcases: IntVec { data: 0 as *i64, count: 0, cap: 0 },
                     inst_loc: IntVec { data: 0 as *i64, count: 0, cap: 0 } } };
             let fname = crate::base::sym_name(FNS[IRFUNCS[fi].f].name);
-            if !decode_ir(&r, fi, &ids, &copy) {
+            if !decode_ir(&mut r, fi, &mut ids, &copy) {
                 eprintln(
                     f"code cache check: {crate::base::cstr(fname)}: IR does not read back (at {r.at} of {r.end})");
                 return;
             }
             ir_enter(cx, fi);
-            let d = crate::back::codecache::snapshot::copy_differs(cx, fi, &copy);
+            let d = crate::back::codecache::snapshot::copy_differs(cx, fi, &mut copy);
             if d != 0 {
                 eprintln(
                     f"code cache check: {crate::base::cstr(fname)}: IR differs read back ({d})");
             }
             free_copy(&copy);
-            skip_facts(&r);
+            skip_facts(&mut r);
         }
         ir_release(cx);
         ids_free(&ids);
@@ -1359,7 +1359,7 @@ fn out_hash(mut cx: *FnCtx, fi: i64) {
         ir_enter(cx, fi);
         FN_STRS[fi].count = 0;
         let mut h = H2 { a: 0, b: 0 };
-        let ok = ir_hash(cx, fi, 0, &FN_STRS[fi], &h);
+        let ok = ir_hash(cx, fi, 0, &FN_STRS[fi], &mut h);
         FN_IRH[fi] = h;
         FN_IRH_OK[fi] = ok;
         if !ok {
@@ -1370,18 +1370,18 @@ fn out_hash(mut cx: *FnCtx, fi: i64) {
 
 // The entry of the task in cc: its reads, tables and outputs (cc.out),
 // stored in the slot of function fi.
-fn store(cc: *CcCtx, kind: i64, fi: i64) -> bool {
+fn store(cc: &mut CcCtx, kind: i64, fi: i64) -> bool {
     unsafe {
         if (*cc).rel.bad {
             return false;
         }
         let body: *ByteBuf = &(*cc).body;
         (*body).len = 0;
-        put_u(body, kind as u64);
-        put_reads(cc, body);
-        put_tables(cc, body);
+        put_u(&mut *body, kind as u64);
+        put_reads(cc, &mut *body);
+        put_tables(cc, &mut *body);
         let out: *ByteBuf = &(*cc).out;
-        bb_append(body, (*out).data, (*out).len);
+        bb_append(&mut *body, (*out).data, (*out).len);
         let copy = alloc_zeroed((*body).len + 1);
         memcpy(copy, (*body).data, (*body).len as u64);
         pack_new(SLOTS_PER_FN * fi + kind - 1, (*cc).key.a, (*cc).key.b, copy, (*body).len);
@@ -1389,7 +1389,7 @@ fn store(cc: *CcCtx, kind: i64, fi: i64) -> bool {
     }
 }
 
-fn bb_append(b: *ByteBuf, p: *u8, n: i64) {
+fn bb_append(b: &mut ByteBuf, p: *u8, n: i64) {
     unsafe {
         crate::back::codecache::snapshot::bb_reserve(b, n);
         if n > 0 {
@@ -1401,13 +1401,13 @@ fn bb_append(b: *ByteBuf, p: *u8, n: i64) {
 
 // Reads entry e for component c: its reads checked, then its outputs
 // installed. OUT_HIT, or why not (nothing installed then).
-fn component_hit(mut cx: *FnCtx, cc: *CcCtx, e: i64, c: i64, start: i64, end: i64) -> i64 {
+fn component_hit(mut cx: *FnCtx, cc: &mut CcCtx, e: i64, c: i64, start: i64, end: i64) -> i64 {
     unsafe {
         let mut r = Reader { p: 0 as *u8, at: 0, end: 0, bad: false };
-        if !pack_body(e, &r) || get_u(&r) as i64 != E_COMPONENT {
+        if !pack_body(e, &mut r) || get_u(&mut r) as i64 != E_COMPONENT {
             return OUT_BAD;
         }
-        if !reads_hold(cx, cc, &r) {
+        if !reads_hold(cx, cc, &mut r) {
             return OUT_READ;
         }
         let mut irs = (*cc).reads;
@@ -1415,8 +1415,8 @@ fn component_hit(mut cx: *FnCtx, cc: *CcCtx, e: i64, c: i64, start: i64, end: i6
         let mut ids = Ids { strs: 0 as *i64, nstrs: 0, consts: 0 as *i64, nconsts: 0,
             syms: 0 as *i64, nsyms: 0, fns: 0 as *i64, nfns: 0, rtids: 0 as *i64, nrtids: 0 };
         let mut result = OUT_BAD;
-        if get_tables(cc, &r, &irs, &ids) {
-            result = component_install(cx, cc, &r, &ids, c, start, end);
+        if get_tables(cc, &mut r, &irs, &mut ids) {
+            result = component_install(cx, cc, &mut r, &mut ids, c, start, end);
         }
         ids_free(&ids);
         free(irs.data as *u8);
@@ -1426,7 +1426,7 @@ fn component_hit(mut cx: *FnCtx, cc: *CcCtx, e: i64, c: i64, start: i64, end: i6
 
 // The outputs of a component's entry (r at them), installed when all of
 // them read.
-fn component_install(mut cx: *FnCtx, cc: *CcCtx, r: *Reader, ids: *Ids, c: i64, start: i64,
+fn component_install(mut cx: *FnCtx, cc: &CcCtx, r: &mut Reader, ids: &mut Ids, c: i64, start: i64,
     end: i64) -> i64 {
     unsafe {
         let n = end - start;
@@ -1505,7 +1505,7 @@ fn n_free(copies: *IRCopy, n: i64) {
     }
 }
 
-fn skip_facts(r: *Reader) {
+fn skip_facts(r: &mut Reader) {
     unsafe {
         for i in 0..3 {
             get_s(r);
@@ -1525,12 +1525,12 @@ fn skip_facts(r: *Reader) {
             get_s(r);
             get_s(r);
             let mut len = 0;
-            get_bytes(r, &len);
+            get_bytes(r, &mut len);
         }
     }
 }
 
-fn get_facts(r: *Reader, fi: i64) {
+fn get_facts(r: &mut Reader, fi: i64) {
     unsafe {
         FN_SIZE[fi] = get_s(r);
         FN_RT[fi] = get_s(r);
@@ -1550,7 +1550,7 @@ fn get_facts(r: *Reader, fi: i64) {
 // The constant data an entry's task made for function fi, made again (in
 // its order: the same placeholders), in phase `phase`'s order with rank
 // rank0 + the recorded one.
-fn replay_consts(mut cx: *FnCtx, r: *Reader, fi: i64, phase: i64, rank0: i64) {
+fn replay_consts(mut cx: *FnCtx, r: &mut Reader, fi: i64, phase: i64, rank0: i64) {
     unsafe {
         let nc = get_count(r);
         let saved_phase = cx.task_phase;
@@ -1560,7 +1560,7 @@ fn replay_consts(mut cx: *FnCtx, r: *Reader, fi: i64, phase: i64, rank0: i64) {
             let rank = get_s(r);
             let align = get_s(r);
             let mut len = 0;
-            let p = get_bytes(r, &len);
+            let p = get_bytes(r, &mut len);
             cx.task_phase = ph;
             cx.task_rank = rank + rank0;
             const_data(cx, fi, p[0..len], align);
@@ -1640,8 +1640,8 @@ pub fn cc_emit_begin(mut cx: *FnCtx, fi: i64, task: i64) -> bool {
             (*cc).own_scc = FN_SCC[fi];
         }
         let mut key = h2_new(E_EMIT as u64);
-        h2_put(&key, ENV.a);
-        h2_put(&key, ENV.b);
+        h2_put(&mut key, ENV.a);
+        h2_put(&mut key, ENV.b);
         let mut ok = true;
         if FN_IRH_OK[fi] {
             (*cc).members.push(fi);
@@ -1650,9 +1650,9 @@ pub fn cc_emit_begin(mut cx: *FnCtx, fi: i64, task: i64) -> bool {
             for i in 0..FN_STRS[fi].count {
                 (*cc).own_strs.push(FN_STRS[fi].data[i]);
             }
-            key_put_fn(&key, fi, &FN_IRH[fi]);
+            key_put_fn(&mut key, fi, &FN_IRH[fi]);
         } else {
-            ok = hash_input(cx, cc, fi, &key);
+            ok = hash_input(cx, &mut *cc, fi, &mut key);
             ir_release(cx);
         }
         FN_IRH_OK[fi] = false;
@@ -1666,7 +1666,7 @@ pub fn cc_emit_begin(mut cx: *FnCtx, fi: i64, task: i64) -> bool {
         }
         let e = pack_find(key.a, key.b);
         if e >= 0 {
-            let got = emit_hit(cx, cc, e, fi, task);
+            let got = emit_hit(cx, &mut *cc, e, fi, task);
             if got == OUT_HIT {
                 pack_used(e);
                 OUT_EMIT[fi] = OUT_HIT;
@@ -1723,23 +1723,23 @@ pub fn cc_emit_end(mut cx: *FnCtx, fi: i64, task: i64) {
             OUT_EMIT[fi] = OUT_POISON;
             return;
         }
-        let mut irs = read_irs(cc);
-        rel_sources(cc, &irs);
+        let mut irs = read_irs(&*cc);
+        rel_sources(&mut *cc, &irs);
         let out: *ByteBuf = &(*cc).out;
         (*out).len = 0;
-        put_bytes(out, (*t).data, (*t).len);
-        put_s(out, (*t).labels);
-        put_u(out, nr as u64);
+        put_bytes(&mut *out, (*t).data, (*t).len);
+        put_s(&mut *out, (*t).labels);
+        put_u(&mut *out, nr as u64);
         for i in 0..nr {
-            put_u(out, rel_saddr(&(*cc).rel, (*cc).relocs.data[i]) as u64);
+            put_u(&mut *out, rel_saddr(&(*cc).rel, (*cc).relocs.data[i]) as u64);
         }
-        put_consts(out, fi, (*cc).consts_before.data[0], 0);
-        put_u(out, (*t).nrtids as u64);
+        put_consts(&mut *out, fi, (*cc).consts_before.data[0], 0);
+        put_u(&mut *out, (*t).nrtids as u64);
         for i in 0..(*t).nrtids {
-            put_u(out, rel_rtid(&(*cc).rel, (*t).rtids[i]) as u64);
+            put_u(&mut *out, rel_rtid(&(*cc).rel, (*t).rtids[i]) as u64);
         }
         free(irs.data as *u8);
-        if !store(cc, E_EMIT, fi) {
+        if !store(&mut *cc, E_EMIT, fi) {
             OUT_EMIT[fi] = OUT_POISON;
         }
     }
@@ -1747,13 +1747,13 @@ pub fn cc_emit_end(mut cx: *FnCtx, fi: i64, task: i64) {
 
 // Reads entry e for function fi's emission: its reads checked, then its
 // text and constant data installed. OUT_HIT, or why not.
-fn emit_hit(mut cx: *FnCtx, cc: *CcCtx, e: i64, fi: i64, task: i64) -> i64 {
+fn emit_hit(mut cx: *FnCtx, cc: &mut CcCtx, e: i64, fi: i64, task: i64) -> i64 {
     unsafe {
         let mut r = Reader { p: 0 as *u8, at: 0, end: 0, bad: false };
-        if !pack_body(e, &r) || get_u(&r) as i64 != E_EMIT {
+        if !pack_body(e, &mut r) || get_u(&mut r) as i64 != E_EMIT {
             return OUT_BAD;
         }
-        if !reads_hold(cx, cc, &r) {
+        if !reads_hold(cx, cc, &mut r) {
             return OUT_READ;
         }
         let mut irs = (*cc).reads;
@@ -1761,8 +1761,8 @@ fn emit_hit(mut cx: *FnCtx, cc: *CcCtx, e: i64, fi: i64, task: i64) -> i64 {
         let mut ids = Ids { strs: 0 as *i64, nstrs: 0, consts: 0 as *i64, nconsts: 0,
             syms: 0 as *i64, nsyms: 0, fns: 0 as *i64, nfns: 0, rtids: 0 as *i64, nrtids: 0 };
         let mut result = OUT_BAD;
-        if get_tables(cc, &r, &irs, &ids) {
-            result = emit_install(cx, &r, &ids, fi, task);
+        if get_tables(cc, &mut r, &irs, &mut ids) {
+            result = emit_install(cx, &mut r, &mut ids, fi, task);
         }
         ids_free(&ids);
         free(irs.data as *u8);
@@ -1770,16 +1770,16 @@ fn emit_hit(mut cx: *FnCtx, cc: *CcCtx, e: i64, fi: i64, task: i64) -> i64 {
     }
 }
 
-fn emit_install(mut cx: *FnCtx, r: *Reader, ids: *Ids, fi: i64, task: i64) -> i64 {
+fn emit_install(mut cx: *FnCtx, r: &mut Reader, ids: &mut Ids, fi: i64, task: i64) -> i64 {
     unsafe {
         let mut len = 0;
-        let text = get_bytes(r, &len);
+        let text = get_bytes(r, &mut len);
         let labels = get_s(r);
         let nr = get_count(r);
         let relocs = alloc_array::<i64>(nr + 1);
         let mut bad = false;
         for i in 0..nr {
-            relocs[i] = crate::back::codecache::snapshot::ids_saddr(ids, get_u(r) as i64, &bad);
+            relocs[i] = crate::back::codecache::snapshot::ids_saddr(ids, get_u(r) as i64, &mut bad);
         }
         if bad || (*r).bad {
             free(relocs as *u8);
@@ -1794,14 +1794,14 @@ fn emit_install(mut cx: *FnCtx, r: *Reader, ids: *Ids, fi: i64, task: i64) -> i6
             get_s(r);
             get_s(r);
             let mut n = 0;
-            get_bytes(r, &n);
+            get_bytes(r, &mut n);
         }
         // (its RTID values, after: the text's loads of them)
         let nt = get_count(r);
         let rtids = alloc_array::<i64>(nt + 1);
         for k in 0..nt {
             rtids[k] = crate::back::codecache::snapshot::ids_at((*ids).rtids, (*ids).nrtids,
-                get_u(r) as i64, &bad);
+                get_u(r) as i64, &mut bad);
         }
         if (*r).bad || bad {
             free(relocs as *u8);
@@ -1816,7 +1816,7 @@ fn emit_install(mut cx: *FnCtx, r: *Reader, ids: *Ids, fi: i64, task: i64) -> i6
             get_s(r);
             let align = get_s(r);
             let mut n = 0;
-            let p = get_bytes(r, &n);
+            let p = get_bytes(r, &mut n);
             cx.task_phase = ph;
             cx.task_rank = if ph == P_EMIT { task } else { fi };
             const_data(cx, fi, p[0..n], align);
@@ -1868,9 +1868,9 @@ pub fn cc_scalar_begin(mut cx: *FnCtx, fi: i64, task: i64) -> bool {
         (*sr).hit = -1;
         FN_IRH_OK[fi] = false;
         let mut key = h2_new(E_SCALAR as u64);
-        h2_put(&key, ENV.a);
-        h2_put(&key, ENV.b);
-        let ok = hash_input(cx, cc, fi, &key);
+        h2_put(&mut key, ENV.a);
+        h2_put(&mut key, ENV.b);
+        let ok = hash_input(cx, &mut *cc, fi, &mut key);
         ir_release(cx);
         (*cc).key = key;
         if !ok {
@@ -1881,7 +1881,7 @@ pub fn cc_scalar_begin(mut cx: *FnCtx, fi: i64, task: i64) -> bool {
         }
         let e = pack_find(key.a, key.b);
         if e >= 0 {
-            let got = scalar_hit(cx, cc, e, fi, task);
+            let got = scalar_hit(cx, &mut *cc, e, fi, task);
             if got == OUT_HIT {
                 pack_used(e);
                 OUT_SCALAR[fi] = OUT_HIT;
@@ -1929,9 +1929,9 @@ pub fn cc_scalar_simplify_begin(mut cx: *FnCtx, fi: i64, task: i64) -> bool {
         let sr = scalar_rec(fi);
         if (*sr).hit >= 0 {
             let mut r = Reader { p: 0 as *u8, at: 0, end: 0, bad: false };
-            pack_body_at((*sr).hit, &r);
+            pack_body_at((*sr).hit, &mut r);
             r.at = (*sr).at;
-            replay_phase(cx, &r, fi, P_SIMPLIFY, task);
+            replay_phase(cx, &mut r, fi, P_SIMPLIFY, task);
             return true;
         }
         let cc = task_begin(cx, -1, fi);
@@ -1959,18 +1959,18 @@ pub fn cc_scalar_end(mut cx: *FnCtx, fi: i64) {
             ir_release(cx);
             return;
         }
-        let mut irs = read_irs(cc);
-        rel_sources(cc, &irs);
+        let mut irs = read_irs(&*cc);
+        rel_sources(&mut *cc, &irs);
         let out: *ByteBuf = &(*cc).out;
         (*out).len = 0;
         ir_enter(cx, fi);
-        encode_ir(cx, fi, out, &(*cc).rel);
+        encode_ir(cx, fi, &mut *out, &(*cc).rel);
         ir_release(cx);
-        put_u(out, FN_IRH[fi].a);
-        put_u(out, FN_IRH[fi].b);
-        put_consts(out, fi, (*cc).consts_before.data[0], 0);
+        put_u(&mut *out, FN_IRH[fi].a);
+        put_u(&mut *out, FN_IRH[fi].b);
+        put_consts(&mut *out, fi, (*cc).consts_before.data[0], 0);
         free(irs.data as *u8);
-        if !store(cc, E_SCALAR, fi) {
+        if !store(&mut *cc, E_SCALAR, fi) {
             OUT_SCALAR[fi] = OUT_POISON;
         }
     }
@@ -1979,13 +1979,13 @@ pub fn cc_scalar_end(mut cx: *FnCtx, fi: i64) {
 // Reads entry e for function fi's scalar phases: its reads checked, then
 // its IR installed and the cleanup's constant data made (the rest waits
 // for the scalar pipeline's task: SCALAR_REC). OUT_HIT, or why not.
-fn scalar_hit(mut cx: *FnCtx, cc: *CcCtx, e: i64, fi: i64, task: i64) -> i64 {
+fn scalar_hit(mut cx: *FnCtx, cc: &mut CcCtx, e: i64, fi: i64, task: i64) -> i64 {
     unsafe {
         let mut r = Reader { p: 0 as *u8, at: 0, end: 0, bad: false };
-        if !pack_body(e, &r) || get_u(&r) as i64 != E_SCALAR {
+        if !pack_body(e, &mut r) || get_u(&mut r) as i64 != E_SCALAR {
             return OUT_BAD;
         }
-        if !reads_hold(cx, cc, &r) {
+        if !reads_hold(cx, cc, &mut r) {
             return OUT_READ;
         }
         let mut irs = (*cc).reads;
@@ -1993,20 +1993,20 @@ fn scalar_hit(mut cx: *FnCtx, cc: *CcCtx, e: i64, fi: i64, task: i64) -> i64 {
         let mut ids = Ids { strs: 0 as *i64, nstrs: 0, consts: 0 as *i64, nconsts: 0,
             syms: 0 as *i64, nsyms: 0, fns: 0 as *i64, nfns: 0, rtids: 0 as *i64, nrtids: 0 };
         let mut result = OUT_BAD;
-        if get_tables(cc, &r, &irs, &ids) {
+        if get_tables(cc, &mut r, &irs, &mut ids) {
             let copy = alloc_zeroed(size_of(IRCopy)) as *IRCopy;
-            if decode_ir(&r, fi, &ids, copy) {
-                let h_a = get_u(&r);
-                let h_b = get_u(&r);
+            if decode_ir(&mut r, fi, &mut ids, copy) {
+                let h_a = get_u(&mut r);
+                let h_b = get_u(&mut r);
                 let at = r.at;
-                if consts_read(&r) {
+                if consts_read(&mut r) {
                     install_ir(cx, fi, copy);
                     list_strings(cx, fi);
                     ir_release(cx);
                     FN_IRH[fi] = H2 { a: h_a, b: h_b };
                     FN_IRH_OK[fi] = true;
                     r.at = at;
-                    replay_phase(cx, &r, fi, P_CLEANUP, task);
+                    replay_phase(cx, &mut r, fi, P_CLEANUP, task);
                     let sr = scalar_rec(fi);
                     (*sr).hit = e;
                     (*sr).at = at;
@@ -2026,7 +2026,7 @@ fn scalar_hit(mut cx: *FnCtx, cc: *CcCtx, e: i64, fi: i64, task: i64) -> i64 {
 }
 
 // Whether an entry's constant data reads whole (r is left after it).
-fn consts_read(r: *Reader) -> bool {
+fn consts_read(r: &mut Reader) -> bool {
     unsafe {
         let nc = get_count(r);
         for k in 0..nc {
@@ -2034,7 +2034,7 @@ fn consts_read(r: *Reader) -> bool {
             get_s(r);
             get_s(r);
             let mut n = 0;
-            get_bytes(r, &n);
+            get_bytes(r, &mut n);
         }
         !(*r).bad
     }
@@ -2042,7 +2042,7 @@ fn consts_read(r: *Reader) -> bool {
 
 // The constant data of an entry (r at its list) made in phase `phase`
 // made again for function fi, in their order, with rank `rank`.
-fn replay_phase(mut cx: *FnCtx, r: *Reader, fi: i64, phase: i64, rank: i64) {
+fn replay_phase(mut cx: *FnCtx, r: &mut Reader, fi: i64, phase: i64, rank: i64) {
     unsafe {
         let nc = get_count(r);
         let saved_phase = cx.task_phase;
@@ -2052,7 +2052,7 @@ fn replay_phase(mut cx: *FnCtx, r: *Reader, fi: i64, phase: i64, rank: i64) {
             get_s(r);
             let align = get_s(r);
             let mut n = 0;
-            let p = get_bytes(r, &n);
+            let p = get_bytes(r, &mut n);
             if ph == phase {
                 cx.task_phase = ph;
                 cx.task_rank = rank;
