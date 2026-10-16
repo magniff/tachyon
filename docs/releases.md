@@ -48,8 +48,148 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.15.0 | `v0.15.0` | 0.14.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | errors, conversions, less boilerplate: `?` on `Option` and `Result`, generic traits, `From`/`Into`, `main` returning `Result`, std's I/O on `Result` with typed errors (`fix --only std015` moves 0.14 code); lossless integer widening and joins, `i64::MAX`; f-strings over `Display` and `Debug`, generic `print`/`format`; `#[derive(Eq, Ord, Hash, Debug, Clone)]`; named and default arguments, field shorthand; `==` on `Vec`, `Buf`, `HashMap` by contents; std loaded by sections; if-conversion, vector masks and min/max reductions, split accumulators, `ldp`/`stp` (iterloop from 2.1 to about 1.05 times C); the tools for agents (`query context`, budgets, std from any program, `try`, `batch`, `edit apply`, merge conflicts, `--json`, the check hook); back end, gen0 and base on closures and iterators; algorithm and tool examples; six harder eval tasks |
 | 0.16.0 | `v0.16.0` | 0.15.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | effects and explicit allocation: inferred effect sets (`alloc(A)`, `io`, `global`, `panic`, `diverge`, `unsafe`) shown by `query effects` (`--why`, `--has`), `#[pure]`/`#[no_alloc]`/`#[no_io]`/`#[no_panic]`/`#[effects(..)]` and `effects(..)` bounds checked transitively (std's `Eq`/`Ord`/`Hash` pure), `--verify-effects`; allocation explicit (`fn main(gpa: Gpa)`, `Vec::new_in(gpa)`, `fix --only alloc016` moves 0.15 code), the `Allocator` trait, `Gpa`, arenas, `arena_scope`, `FixedBuf`, a `Fmt` that never allocates; `#[sealed]` std types, `#[scoped]` arenas; `--check-alloc` (use after free, double free, leaks, arena resets and scopes); pure calls numbered and hoisted, arena allocation without a call; link inputs on the command line (`x.c`, `-l`, `-L`); examples in folders with READMEs, C interop and language tours; the compiler's source on 0.15's features; compiler tasks in the agent eval |
 | 0.17.0 | `v0.17.0` | 0.16.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | memory safety by mutable value semantics: owned values (`Vec`, `Buf`, `HashMap`, `Drop` types, what holds one) move and are dropped at the end of their scope (`Drop`, generated drop glue, drop flags, `.clone()` explicit); references `&T`/`&mut T` and slices split into read-only `[T]` and exclusive `&mut [T]`, second-class: views checked so none outlives or is invalidated under what it views, with inferred view summaries (`views(..)`, `stores(..)`, `#[views]` pins), two-phase receivers and reborrows, no lifetime annotations; `--values=error` the default (`warn`, `report`, `off` for 0.17 only); noalias and read-only facts from reference parameters, NRVO, moves elided in loops; std on values (`Drop` for the containers, `&Self`/`&mut Self` receivers, sorts on `&mut [T]`, `Eq`/`Ord`/`Hash` on `&Self`); `fix --values` and the corpus migrated; `query own`, `query views`, `explain own.*`, tests/own-try; familiar forms (`&mut x`, `v[i]` on Vec and Buf, indexing through a pointer by its type, `p.0`, `len()`, `panic`/`unreachable`, a larger prelude, module paths in code resolved as `use` lines, struct-like enum variants); `fix --suggested`, the `&f` diagnostic; `--trace`, `probe`, `reduce`, `tachyonc test`, `guide debug`; compile speed (per-function IR and pipeline, -O1 leaf inlining, f-strings written in place: the compiler compiles itself 14% faster at -O0, 37% at -O2, in a third less memory) |
+| 0.18.0 | `v0.18.0` | 0.17.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | contracts and verification in the language: `requires`/`ensures` (`result`, `old(..)`, `else` messages, `debug` clauses), checked at run time, a requires at the call so the caller is blamed, pure conditions (`contract.effect`); std's own clauses (`unwrap`, `Vec::get`, ...); `assert`, `assert_eq`, `assert_ne`, `debug_assert`; every run-time check one line `FILE:LINE:COL: message` with the condition and its values; `query checks` (the checks the optimizer proved away and those left), `--no-positions`; `#[test]`, `#[cfg(test)]` modules, `assert_snapshot`, `#[property]` with inputs generated from the types and shrunk, contracts tested as properties, `#[fuzz]` with block coverage (`--coverage`, `tachyonc fuzz`), leaks failing a test; `tachyonc test` builds at -O0 and -O2 and compares them; `reduce` over programs (`--differs`, `--fails`, `--test`); `type X = distinct T`, `std::NonNull<T>` with the null niche (`Option<NonNull<T>>` is a pointer, FFI-safe, `_Nonnull` imported) and a checked `as NonNull<T>`; std's `Display`, `Debug`, `Iterator`, `Clone` on references, `fix --values` over traits; the agent eval's `+debrief` |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.18
+
+The design, its decisions, each task's notes and the integration with
+0.17 ("as built") are in docs/design/contracts-verification.md; the
+syntax in docs/grammar.md, "Additions of 0.18"; `tachyonc guide
+contracts`, `guide testing`, `guide types#distinct-types`.
+
+- **Contracts**: `requires` and `ensures` clauses between a function's
+  signature and its body (functions, impl functions), `result` and
+  `old(e)` in an ensures, `else "message"` or `else f"..."`, `debug`
+  clauses checked only in test builds (and with `--debug-contracts`).
+  The words are contextual: no program breaks. Always checked, exit 101:
+  - a **requires is checked at the call**, after the arguments are
+    evaluated, so the failure blames the caller's line, and names the
+    clause: `main.tach:18:16: requires failed: 's.len() > 0' of 'median'
+    (main.tach:2:5): s.len() = 0`;
+  - an **ensures is checked in the callee** at each return (the body is
+    moved to a companion function and its result checked):
+    `main.tach:8:5: ensures failed: 'result <= hi' of 'clamp': result =
+    6, hi = 5`;
+  - a failing `&&` chain reports the conjunct that failed and the
+    integer operands of its comparisons and calls;
+  - conditions are pure by 0.16's effects (`contract.effect` with the
+    call and a `query effects --why`); owned parameters are read in
+    place, never moved; `old(..)` of a by-value owned parameter or of a
+    view is `contract.old` (`old(v.len())`, `old(v.clone())`).
+  - std states its preconditions as clauses (`Option::unwrap`,
+    `Result::unwrap`, `Vec::get`, `set`, `swap`, `insert`, `remove`),
+    with their old messages, now at the caller's line.
+- **Assertions**: `assert`, `assert_eq`, `assert_ne`, `debug_assert` in
+  the prelude (the bang spellings `assert!` and so on are accepted),
+  each failure with its condition's text and values.
+- **One failure line for every run-time check** (an index, a slice, `as
+  E`, a vector lane, a contract, an assertion, `NonNull`): `FILE:LINE:COL:
+  message`, from a site table the checks pass to the runtime; the `note:
+  build with --trace` line is gone. Every path the compiler writes into
+  what it makes (these positions, `--trace`, `--check-alloc`,
+  `--check-unsafe`, `tachyonc test`'s labels, `-g`'s compile unit, whose
+  `DW_AT_comp_dir` is now the root's directory) is relative to the root
+  file's directory (`-g`'s `.file` names are that directory joined with
+  it, so any assembler resolves them), so the output is the same whatever the current
+  directory and however the root's path is spelled
+  (tests/refactor/paths018). `--no-positions` makes every site 0,
+  so code that only moved compiles to the same assembly.
+- **The optimizer proves, never assumes**: a contract check is a check
+  like a bounds check, removed only where the range analysis decides it;
+  `tachyonc query checks FN|MODULE` (and `--print-checks`) lists each
+  check left after the optimizer and those it removed.
+- **Tests in the language**: `#[test]` functions (taking nothing or
+  `gpa: Gpa`, returning `()` or a Result), `#[cfg(test)]` modules that
+  see their parent's items without an import (`use super::*;` stays an
+  error: no wildcard imports), `assert_snapshot(x)` against
+  `tests/snapshots/`; test builds use `--trace` and `--check-alloc`, and a
+  test that leaks fails.
+- **Properties**: `#[property]` functions whose parameters are generated
+  from their types (numbers, bool, text, Vec, Option, Result, tuples,
+  Buf, the program's structs and enums through a made `Arbitrary`, or the
+  program's own `impl Arbitrary` taking `&mut Gen`); 100 cases with
+  growing sizes, each in its own process and leak-checked; a failure is
+  shrunk and replayed with its inputs. A function with an `ensures` is
+  tested as a property, its `requires` filtering the inputs.
+- **Fuzzing**: `#[fuzz]` targets (a `[u8]` parameter is the input);
+  `--coverage` counts the program's blocks; `tachyonc fuzz NAME` mutates
+  inputs that reach new counts (AFL's buckets, splices, the program's
+  string constants), shrinks a crash and saves it; `tachyonc test`
+  replays the saved crashes.
+- **`tachyonc test`** builds the program and its tests at -O2 and -O0,
+  runs every case (`tests/NAME.in`/`.out`) and test in its own process,
+  several at once, and compares the two levels: a difference is a `DIFF`
+  line, the compiler's bug. Summary first, one line per failure with its
+  trace, input and `try:`; `--accept`, `--cases`, `--seed`,
+  `--no-contracts`, `--no-check-alloc`.
+- **`tachyonc reduce` over programs**: `--differs` (-O0 and -O2
+  disagree), `--fails 'TEXT'`, `--test NAME`; the program is cut by its
+  layout (items, then statements) to a fixpoint, into `PROG.min.tach` (a
+  planted miscompile in a generated 428-line program: 12 lines).
+- **Distinct types**: `type X = distinct T` is a type of its own (Go's
+  defined types): literals convert, `as` converts to and from T for free,
+  T's operators and comparisons between two X, T's `Eq`, `Ord`, `Hash`,
+  `Debug`, `Display` and `Clone` without an impl, none of T's methods
+  (`impl X` adds its own); over plain types only (`distinct.kind`);
+  mixing is `distinct.mix` with the conversion `fix --suggested` writes.
+  The code generators never see one.
+- **`std::NonNull<T>`**: `NonNull::new` (an Option), `as_ptr`,
+  `p.is_null()` on any pointer; the null niche makes an enum of a
+  fieldless variant and a NonNull one pointer, so `Option<NonNull<T>>` is
+  8 bytes, C's nullable pointer and FFI-safe (layout, both back ends, the
+  C ABI, `--emit-header`, the ABI fuzzer); C headers' `_Nonnull`
+  pointers import as NonNull. `p as NonNull<T>` from a raw pointer is
+  checked (`null pointer made NonNull`, exit 101), so safe code cannot
+  make a null one.
+- **std's traits on references**: `Display` and `Debug` take `self:
+  &Self, f: &mut Fmt`, `Iterator::next` `self: &mut Self`, `Clone::clone`
+  `self: &Self`; derive and the f-string lowering follow; an impl written
+  the 0.16 way is still accepted by the legacy rule. `fix --values` now
+  rewrites a program's own traits with every impl together, and respells
+  impls of std's traits as their declarations; the examples, the eval's
+  tasks, the tests and the guide are in the reference spelling (every
+  test prints what it printed).
+- **With 0.17's value semantics** (the integration's decisions, each
+  tested): a requires check reads the call's arguments in place; an
+  ensures may not read a by-value owned parameter (gone after the body)
+  or keep a view in `old(..)`; distinct types are plain, so not over a
+  reference or a type with `Drop`; `NonNull` is `distinct *T`, a value;
+  generators take `&mut Gen`; property and fuzz cases are leak-checked;
+  the test runtime and the fuzzer are lazy sections of std.
+- **The agent eval**: `+debrief` (after the task, the same session is
+  asked what confused it, which diagnostics helped or misled, what it
+  would change, and three ratings; its cost apart), `run.py debrief`,
+  `costx`, `binaudit`, and the 0.18 plan (216 runs).
+- **V4 decided** (the user, 2026-10-16): once the compiler's source has
+  moved to `&`/`&mut` (0.18.1), the legacy rule that a non-`mut` `*T`
+  parameter is a borrow goes, and every `*T` is raw.
+- **Caught by the release gate, fixed before the tag**: the check-site
+  table wrote paths as given, so the compiler built on aarch64-linux
+  differed from the cross-built one (paths relative to the root's
+  directory, tests/refactor/paths018); GNU as refused the companions'
+  `f?pre` symbols (`f$pre` and `f$body` now, tests/refactor/symbols018);
+  nonnull_cimport needs clang (`// REQUIRES: clang`, a new directive);
+  iterchain ran 5.8% more instructions than with 0.17.0, its dot loop
+  unrolled twice instead of four times because a constant only a check's
+  cold failure reads counted in the unroller's size (no longer,
+  tests/run/opt_unroll_exit_consts); and realpath per source file had
+  made compilations slow under a large directory.
+- **Tested on aarch64 only**, as 0.15 to 0.17 (`gate.sh --with-x86`).
+- **Breaking**:
+  - std's `Display`, `Debug`, `Iterator` and `Clone` are declared with
+    references; 0.16-style impls (`self: *T, f: *Fmt`) still compile
+    (`fix --values` respells them);
+  - `unwrap` and `Vec::get`/`set`/`swap`/`insert`/`remove` failures are
+    reported at the caller's line, and every run-time failure is one line
+    with a position (programs that compare stderr see the new line);
+  - a failure's position, and `--trace`'s, `--check-alloc`'s and
+    `-g`'s file names, are relative to the root file's directory, not
+    to the directory the compiler ran in;
+  - the prelude gains `assert`, `assert_eq`, `assert_ne`,
+    `debug_assert`, `assert_snapshot` (a program's own names hide them);
+    `test`, `property`, `fuzz` and `cfg(test)` are attributes.
 
 ### What's new in 0.17
 

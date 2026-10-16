@@ -919,8 +919,8 @@ in std is safe and uses unsafe blocks inside.
 
 ```
 trait Shape {
-    fn area(self: *Self) -> i64;
-    fn describe(self: *Self) {            // a default
+    fn area(self: &Self) -> i64;
+    fn describe(self: &Self) {            // a default
         print("area ");
         std::print_int(self.area());
     }
@@ -929,7 +929,7 @@ trait Shape {
 struct Square { side: i64 }
 
 impl Shape for Square {
-    fn area(self: *Square) -> i64 { self.side * self.side }
+    fn area(self: &Square) -> i64 { self.side * self.side }
 }
 
 fn total<T: Shape>(items: [T]) -> i64 { ... }   // bounds
@@ -1168,11 +1168,11 @@ let g: fn(i64) -> i64 = |x| x * 2;   // captures nothing: a plain fn
 ```tach
 trait Source {
     type Item;                                  // declared: no default, no bounds
-    fn get(self: *Self) -> Self::Item;
+    fn get(self: &Self) -> Self::Item;
 }
 impl Source for Counter {
     type Item = i64;                            // every declared name is defined
-    fn get(self: *Counter) -> i64 { self.n }
+    fn get(self: &Counter) -> i64 { self.n }
 }
 fn first<I: Source>(it: I) -> I::Item { ... }
 fn total<I: Iterator<Item = T>, T: Add>(it: I) -> T { ... }
@@ -1232,9 +1232,9 @@ The `Iterator` trait (in the prelude):
 ```
 pub trait Iterator {
     type Item;
-    fn next(self: *Self) -> Option<Self::Item>;
-    fn exact_len(self: *Self) -> i64                 // items left, or -1 (default)
-    fn at(self: *Self, k: i64) -> Self::Item         // k-th left: k = 0, 1, 2, ... while exact_len > k
+    fn next(self: &mut Self) -> Option<Self::Item>;
+    fn exact_len(self: &Self) -> i64                 // items left, or -1 (default)
+    fn at(self: &Self, k: i64) -> Self::Item         // k-th left: k = 0, 1, 2, ... while exact_len > k
     fn map, filter, enumerate, zip, take             // adapters: Map, Filter, Enumerate, Zip, Take
     fn fold, for_each, count, sum, min, max, collect // consumers (collect: a Vec)
 }
@@ -1624,6 +1624,35 @@ beside `crate::a::parser`, and `crate::lexer`), it is an error,
 (`crate::b::lexer`) is `unknown module 'lexer'`, whose `try:` is the
 `use` line with its path from the root.
 `use m::{self, X};` is not supported: its error's `try:` is `use m;`.
+
+## Additions of 0.18: contracts and tests (phase 0)
+
+The design is [design/contracts-verification.md](design/contracts-verification.md).
+Phase 0 reads this syntax and keeps it (front/contracts's tables); the
+checks, the tests and distinct types come with the tasks named there.
+
+```ebnf
+fn_item    = signature { clause } ( block | ";" ) ;            (* fns, trait fns, impl fns *)
+clause     = [ "debug" ] ( "requires" | "ensures" ) expr [ "else" expr ] ;
+type_inv   = [ "debug" ] "invariant" expr [ "else" expr ] [ ";" ] ;   (* after a struct's or enum's "}" *)
+alias      = "type" ident [ generics ] "=" [ "distinct" ] type [ type_inv ] ";" ;
+attribute += "test" | "property" | "fuzz" | "cfg" "(" "test" ")" ;
+```
+
+- `requires`, `ensures`, `invariant`, `debug` and `distinct` are not
+  reserved: they are read as such only where a clause (or a distinct
+  type) may stand, so a variable may still be called `result` or `debug`.
+  In an `ensures`, `result` is the returned value and `old(e)` is `e` at
+  the function's entry (T1).
+- A clause's condition is an expression in which `{` ends it, as in an
+  `if`'s condition. The message after `else` is a string or an f-string.
+- `#[cfg(test)]` marks the item after it (all of a module's items);
+  `#[test]`, `#[property]` and `#[fuzz]` mark a function. Phase 0
+  compiles them as ordinary items (T2 leaves them out of builds that are
+  not tests).
+- Phase 0 checks a distinct type as a transparent alias (T4 makes it a
+  type of its own) and ignores the invariants and clauses (T1 checks
+  them).
 
 ## Importing C headers
 

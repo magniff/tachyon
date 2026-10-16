@@ -246,17 +246,17 @@ checks every release; `-g` writes DWARF line tables.
 
 Tachyon is at 0.x: the language is not stable, and minor releases may
 break programs (with a `tachyonc fix` migration from 0.14 on). The
-current release is 0.17.0: memory safety by mutable value semantics
-(owned values move and are dropped at the end of their scope, references
-and slices are checked with inferred view summaries and no lifetime
-annotations, `tachyonc fix --values` migrates 0.16 code), on 0.16's
-effects and explicit allocators. See [docs/releases.md](docs/releases.md)
-for every release. Next:
+current release is 0.18.0: contracts (`requires`, `ensures`, checked at
+run time, the caller blamed, one failure line with the values), tests,
+properties, fuzzing and snapshots in the language with `tachyonc test`
+comparing -O0 and -O2, distinct types and `NonNull`; on 0.17's memory
+safety by mutable value semantics and 0.16's effects and explicit
+allocators. See [docs/releases.md](docs/releases.md) for every release.
+Next:
 
-- **0.17.1**: references as results and type arguments, arena handles as
-  references, the rest of 0.17's value-semantics items
-- **0.18**: contracts (`requires`, `ensures`), `test` blocks, property and fuzz tests;
-  the compiler's own source on value semantics and arenas; code generation on threads
+- **0.17.1 and 0.18.1**: references as results and type arguments, arena
+  handles as references; the compiler's own source on values and arenas,
+  functions compiled in parallel, incremental rebuilds; every `*T` raw
 - **0.19 to 0.23**: `std::arch` intrinsics, collections, text and I/O,
   concurrency, GPU support, windows and a terminal emulator on std
 

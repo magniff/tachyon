@@ -12,7 +12,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from lib import anatomy, claude_backend, conds, ctasks, ollama_backend, selfcheck
+from lib import anatomy, claude_backend, conds, ctasks, debrief, ollama_backend, selfcheck
 from lib.common import (DEFAULT_RESULTS_DIR, REPO_ROOT, base_env, check_hook_summary,
                         copy_tree, eval_settings_hooks, final_check, install_hooks,
                         install_mktemp_shim, kill_leftovers, load_tasks, private_paths,
@@ -96,21 +96,24 @@ def one_run(ctx, task, cond, rep):
                           guide_example=ctx.get("guide_example"))
     with open(os.path.join(rdir, "prompt.md"), "w") as fh:
         fh.write(prompt)
+    db_text, snap, on_done = debrief_setup(c, ws, base, rdir)
     backend, name = ctx["backend"], ctx["model_name"]
     say("start %s %s %s rep%d" % (task.id, ctx["model"], cond, rep))
     t0 = time.time()
     try:
         mod = claude_backend if backend == "claude" else ollama_backend
         if ctx.get("dry_run"):
-            agent = dry_run(ctx, prompt, ws, rdir, hook, None, extra)
+            agent = dry_run(ctx, prompt, ws, rdir, hook, None, extra, debrief=db_text)
         elif backend == "claude":
             agent = mod.run(prompt, ws, bin_dir, name, task.timeout_s, rdir, check_hook=hook,
-                            extra_hooks=extra, tee=ctx["hooks"]["tee"])
+                            extra_hooks=extra, tee=ctx["hooks"]["tee"], debrief=db_text,
+                            on_task_done=on_done)
         else:
             agent = mod.run(prompt, ws, bin_dir, name, task.timeout_s, rdir, check_hook=hook)
     except Exception as e:  # a broken backend still leaves a result
         agent = {"error": "runner: %r" % e, "wall_s": round(time.time() - t0, 1)}
     agent["leftover_processes"] = kill_leftovers(ws)
+    debrief_restore(ws, snap, agent)
     if hook:
         agent["check_hook"] = check_hook_summary(hook[1])
         if os.path.exists(hook[1]):
@@ -137,6 +140,9 @@ def one_run(ctx, task, cond, rep):
         "tool_calls_by_kind": {}, "input_tokens": None, "output_tokens": None,
         "cache_read_tokens": None, "cost_usd": None, "error": None,
         "compiler": ctx["versions"][lang],
+        # (0.18) the binary the run had, for run.py binaudit
+        "tachyonc_md5": ctx.get("tach_md5") if lang == "tach" else None,
+        "ws_root": ctx["ws_root"],
         "started": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t0)),
     }
     res.update(agent)
@@ -200,20 +206,23 @@ def one_compiler_run(ctx, task, cond, rep):
                              and claude_backend.PERMS == "allowlist" else None)
     with open(os.path.join(rdir, "prompt.md"), "w") as fh:
         fh.write(prompt)
+    db_text, snap, on_done = debrief_setup(c, ws, base, rdir)
     say("start %s %s %s rep%d" % (task.id, ctx["model"], cond, rep))
     t0 = time.time()
     try:
         if ctx.get("dry_run"):
-            agent = dry_run(ctx, prompt, ws, rdir, hook, qhook, extra)
+            agent = dry_run(ctx, prompt, ws, rdir, hook, qhook, extra, debrief=db_text)
         elif ctx["backend"] != "claude":
             agent = {"error": "compiler tasks run on the claude backend only", "wall_s": 0}
         else:
             agent = claude_backend.run(prompt, ws, bin_dir, ctx["model_name"], task.timeout_s,
                                        rdir, check_hook=hook, query_hook=qhook,
-                                       extra_hooks=extra, tee=ctx["hooks"]["tee"])
+                                       extra_hooks=extra, tee=ctx["hooks"]["tee"],
+                                       debrief=db_text, on_task_done=on_done)
     except Exception as e:  # a broken backend still leaves a result
         agent = {"error": "runner: %r" % e, "wall_s": round(time.time() - t0, 1)}
     agent["leftover_processes"] = kill_leftovers(ws)
+    debrief_restore(ws, snap, agent)
     if hook:
         agent["check_hook"] = check_hook_summary(hook[1])
         if os.path.exists(hook[1]):
@@ -262,6 +271,31 @@ def one_compiler_run(ctx, task, cond, rep):
     return res
 
 
+def debrief_setup(c, ws, base, rdir):
+    """(0.18, +debrief) The debrief's text (also rdir/debrief-prompt.md),
+    where the workspace's snapshot goes, and the callback that takes it
+    when the task's turn ends; (None, None, None) without +debrief."""
+    if not c.debrief:
+        return None, None, None
+    text = debrief.prompt_for(c)
+    with open(os.path.join(rdir, "debrief-prompt.md"), "w") as fh:
+        fh.write(text + "\n")
+    snap = os.path.join(base, "ws.task-end")
+    return text, snap, lambda: debrief.snapshot(ws, snap)
+
+
+def debrief_restore(ws, snap, agent):
+    """(0.18) The workspace as the task left it, before the grading: the
+    snapshot taken when the task's turn ended replaces what the debrief
+    turn may have changed."""
+    if snap and os.path.isdir(snap):
+        try:
+            debrief.restore(ws, snap)
+            (agent.get("debrief") or {})["restored"] = True
+        except OSError as e:
+            agent["error"] = agent.get("error") or "debrief restore: %r" % e
+
+
 def eval_hooks(ctx, key, mods=(), query=False):
     """(0.17) The hooks of settings-eval.json's condition `key` (None: no
     check or Stop hook), pointed at the copies; cached in ctx. None when
@@ -279,7 +313,7 @@ def eval_hooks(ctx, key, mods=(), query=False):
     return cache[ck]
 
 
-def dry_run(ctx, prompt, ws, rdir, check_hook, query_hook, extra_hooks=None):
+def dry_run(ctx, prompt, ws, rdir, check_hook, query_hook, extra_hooks=None, debrief=None):
     """--dry-run: no model. Writes the backend's settings and command line
     (settings.json, command.json) and feeds each registered hook a
     synthetic event, matched and run as Claude Code would run it: a Write
@@ -291,10 +325,15 @@ def dry_run(ctx, prompt, ws, rdir, check_hook, query_hook, extra_hooks=None):
                                        extra_hooks, tee)
     write_json(os.path.join(rdir, "settings.json"), settings)
     argv = claude_backend.command("(prompt.md)", ctx["model_name"],
-                                  check_hook and check_hook[0], query_hook, extra_hooks, tee)
+                                  check_hook and check_hook[0], query_hook, extra_hooks, tee,
+                                  stream_input=debrief is not None)
     write_json(os.path.join(rdir, "command.json"), argv)
     hooks = settings.get("hooks", {})
     out = {"hooks_registered": {ev: [h.get("matcher", "*") for h in hs] for ev, hs in hooks.items()}}
+    if debrief is not None:
+        # (0.18) the two stdin messages the session would get
+        out["debrief"] = {"stdin": [claude_backend.user_message("(prompt.md)").strip(),
+                                    claude_backend.user_message(debrief).strip()[:200]]}
     env = claude_backend.env(os.path.join(os.path.dirname(ws), "bin"))
     if check_hook:
         env["TACHYON_CHECK_HOOK_LOG"] = check_hook[1]
@@ -347,6 +386,14 @@ def dry_run(ctx, prompt, ws, rdir, check_hook, query_hook, extra_hooks=None):
     return {"error": None, "wall_s": 0.0, "dry_run": out}
 
 
+def file_md5(path):
+    h = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def program_workspace(ctx, task, lang, base):
     """A program run's workspace under `base`: bin/ with the compiler (or
     rustc) and the mktemp shim, ws/ with the starter and one git commit.
@@ -373,6 +420,8 @@ def main(args):
     if not cs:
         raise SystemExit("--cond takes %s" % conds.help_text())
     names = [c.name for c in cs]
+    if backend != "claude" and any(c.debrief for c in cs):
+        raise SystemExit("--cond: +debrief runs on the claude backend only")
     missing = [(c.name, f, what) for c in cs for f, what in c.needs()]
     if missing and not args.dry_run:
         raise SystemExit("not yet runnable (a dry run works with a stub):\n" + "\n".join(
@@ -398,11 +447,12 @@ def main(args):
         raise SystemExit("no task fits the conditions: compiler tasks (--set compiler) run "
                          "in the compiler-* conditions, program tasks in the others")
     bins = prepare_bins(ws_root, os.path.abspath(args.tachyonc))
+    tach_md5 = file_md5(os.path.join(bins["tach"], "tachyonc"))
     hooks = install_hooks(ws_root)
     ctx = {"model": args.model, "backend": backend, "model_name": model_name,
            "out": out, "ws_root": ws_root, "bins": bins,
            "keep_ws": args.keep_workspaces or args.dry_run, "dry_run": args.dry_run,
-           "check_hook": args.check_hook, "hooks": hooks,
+           "check_hook": args.check_hook, "hooks": hooks, "tach_md5": tach_md5,
            "tools_tachyonc": os.path.abspath(args.tools_tachyonc)
            if getattr(args, "tools_tachyonc", None) else None,
            "versions": {"tach": tool_version(bins["tach"], "tach"),
@@ -466,7 +516,7 @@ def main(args):
             "selfcheck": sc and {k: sc.get(k) for k in ("ok", "mode", "path", "refusals")},
             "ctasks": {k: {"base": v["ref"], "commit": v["sha"], "builder": v["builder"]}
                        for k, v in ctx["ctasks"].items()},
-            "tachyonc": os.path.abspath(args.tachyonc),
+            "tachyonc": os.path.abspath(args.tachyonc), "tachyonc_md5": tach_md5,
             "tools_tachyonc": ctx["tools_tachyonc"],
             "versions": ctx["versions"], "ws_root": ws_root}) + "\n")
     nj = 1 if backend == "ollama" else max(1, args.jobs)

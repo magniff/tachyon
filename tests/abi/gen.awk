@@ -21,7 +21,9 @@ function rnd(n) { return int(rand() * n) }
 
 # ---- Types ----
 #
-# A type is a scalar name (i8 ... u64, f32, f64, bool, ptr), "S<k>" (a
+# A type is a scalar name (i8 ... u64, f32, f64, bool, ptr; 0.18: nn, a
+# std::NonNull<u8>, and onn, an Option<std::NonNull<u8>>: C's pointer,
+# never null and nullable, as arguments and results), "S<k>" (a
 # struct or union, TK[k] "struct" or "union"), "E" (the fieldless enum),
 # "P<k>" (an enum with fields), or "A<n>:<scalar>" (an array, as a field
 # only).
@@ -33,11 +35,13 @@ function c_scalar(t) {
     if (t == "f32") return "float"
     if (t == "f64") return "double"
     if (t == "bool") return "bool"
-    if (t == "ptr") return "uint8_t *"
+    if (t == "ptr" || t == "nn" || t == "onn") return "uint8_t *"
     return (substr(t, 1, 1) == "u" ? "uint" : "int") substr(t, 2) "_t"
 }
 
-function t_scalar(t) { return t == "ptr" ? "*u8" : t }
+function t_scalar(t) {
+    return t == "ptr" ? "*u8" : t == "nn" ? "std::NonNull<u8>" : t == "onn" ? "Option<std::NonNull<u8>>" : t
+}
 
 function c_type(t) {
     if (t == "E") return "En"
@@ -55,6 +59,9 @@ function pick_scalar(    k) {
 
 # A type for an argument, a result or a field (`depth` limits nesting).
 function pick_type(depth,    k) {
+    # (0.18: the null niche; not in import mode, where C's `uint8_t *` is
+    # a *u8)
+    if (!IMPORT && rnd(12) == 0) return rnd(2) ? "nn" : "onn"
     k = rnd(10)
     if (k < 5 || depth > 2) return pick_scalar()
     if (k < 8 && NS > 0) return "S" rnd(NS)
@@ -74,7 +81,8 @@ function h(n) { return (n * 2654435761 + SEED * 40503) % 1000003 }
 function leaf(t,    k, v) {
     k = h(LEAF++)
     if (t == "bool") return k % 2 ? "true" : "false"
-    if (t == "ptr") return 4096 + 16 * (k % 1000)
+    if (t == "ptr" || t == "nn") return 4096 + 16 * (k % 1000)
+    if (t == "onn") return k % 3 == 0 ? 0 : 4096 + 16 * (k % 1000)
     if (t == "f32") return sprintf("%.2f", (k % 801 - 400) / 4)
     if (t == "f64") return sprintf("%.3f", (k % 2001 - 1000) / 8)
     if (t == "i8") { split("-128 -1 0 1 77 127 -77", V, " "); return V[1 + k % 7] }
@@ -91,7 +99,7 @@ function leaf(t,    k, v) {
 # A scalar constant in C.
 function c_leaf(t, v) {
     if (t == "f32") return v "f"
-    if (t == "ptr") return "(uint8_t *)(uintptr_t)" v
+    if (t == "ptr" || t == "nn" || t == "onn") return "(uint8_t *)(uintptr_t)" v
     if (t == "i64" && v == "-9223372036854775808") return "(-9223372036854775807LL - 1)"
     if (t == "i32" && v == "-2147483648") return "(-2147483647 - 1)"
     if (t == "i64") return v "LL"
@@ -103,6 +111,8 @@ function c_leaf(t, v) {
 # The same in tachyon (in a context of type t).
 function t_leaf(t, v) {
     if (t == "ptr") return "(" v " as *u8)"
+    if (t == "nn") return "(" v " as *u8 as std::NonNull<u8>)"
+    if (t == "onn") return "std::NonNull::new(" v " as *u8)"
     return v
 }
 
@@ -180,6 +190,11 @@ function c_value(t,    s, i, k, m, n) {
 # Statements checking that tachyon expression `e` (of type t) holds the
 # value (calling fail(fk, arg) otherwise); printed with indentation `ind`.
 function t_checks(t, e, fk, arg, ind,    i, k, m, n, v, b) {
+    if (t == "onn") {
+        v = leaf(t)
+        print ind "if (match " e " { Some(p) => p.as_ptr() as u64, None => 0 }) != " v " { " CQ "fail(" fk ", " arg "); }" > TF
+        return
+    }
     if (is_scalar(t) && t !~ /^A/) {
         v = leaf(t)
         print ind "if " e " != " t_leaf(t, v) " { " CQ "fail(" fk ", " arg "); }" > TF

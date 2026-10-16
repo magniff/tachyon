@@ -775,14 +775,14 @@ Steps 1, 2 and 4 passed. Step 3 failed the gate on the eval solutions (3.4%), wh
 - **V2. The check-time budget is 8% of the type checker, not 5%** (§4). 5% needs further work beyond the lean two-level pass, and T2 can do it if compile speed must win here.
 - **V3. The fallback if summaries slip:** view conflicts that come only from a non-inferred summary become warnings in 0.17.0 (§6). The alternative is to hold 0.17.0 for T3.
 
-**Open, for the user (new on 2026-10-16):**
-- **V4. What `mut p: *T` parameters mean under references.** Today a non-`mut` `*T` parameter is a borrow (safe to dereference) and a `mut` one is raw: `mut` there means "a pointer I will move or do arithmetic on", not "I write through it". The legacy rule (§2.3) makes the first `&mut T` in 0.17; Phase 0 keeps the second raw and settles nothing else. The options:
+**Decided by the user on 2026-10-16 (V4; it was open):**
+- **V4. What `mut p: *T` parameters mean under references.** *Decided 2026-10-16: (d), all `*T` raw.* Once compiler/src has migrated to `&`/`&mut` (0.18.1, with the compiler-on-values work), the legacy rule that a non-`mut` `*T` parameter is accepted as `&mut T` is removed. From then on every `*T` is a raw pointer, as Rust's raw pointers are (a dereference needs `unsafe`), `mut` or not, and borrowing is spelled only `&` / `&mut`. The question as it was put: Today a non-`mut` `*T` parameter is a borrow (safe to dereference) and a `mut` one is raw: `mut` there means "a pointer I will move or do arithmetic on", not "I write through it". The legacy rule (§2.3) makes the first `&mut T` in 0.17; Phase 0 keeps the second raw and settles nothing else. The options:
   - (a) **Raw, always** (today's meaning, Phase 0's): `mut p: *T` is unchecked, its dereferences need `unsafe`, and passing `&x` to it takes no loan. Simple and sound, but the same spelling with and without `mut` means a checked and an unchecked parameter, and `mut` is the word agents add when a write fails to compile.
   - (b) **`&mut T` whose binding can be reassigned**, like a non-`mut` one: `mut` only makes the local rebindable (`p = p.next`). Uniform, but a rebound `p` holds a different loan, which the walk must track (a reborrow of whatever is assigned), and today's raw-pointer walks over linked structures become errors.
   - (c) **Rejected in safe functions from 0.17.1**, with a `try:` that writes `p: &mut T` (and `let mut q = p;` inside) or `unsafe fn`: no meaning to learn, and `fix --values` rewrites the corpus's cases. The cost is churn in tests and the compiler, which uses `mut` pointer parameters for cursor-style loops.
   - (d) **Deprecated with 0.18's rule** (all `*T` parameters raw): `mut` stops mattering because every `*T` parameter is raw, and references are spelled `&`/`&mut`. This defers the question to the compiler's migration.
 
-  *Phase 0 implements (a)*, the current semantics, as kinds.tach's `param_mode` (`P_RAW`). Whichever the user picks changes that one function and the guide.
+  *Phase 0 implements (a)*, the current semantics, as kinds.tach's `param_mode` (`P_RAW`). Whichever the user picks changes that one function and the guide. With (d) decided, `param_mode` loses its legacy `P_MUT` case for `*T` in 0.18.1, and `mut p: *T` stays `P_RAW` as it is now.
 
 **Decided here** (each can be revisited):
 - drops at scope end in reverse order (not at last use);
@@ -793,7 +793,7 @@ Steps 1, 2 and 4 passed. Step 3 failed the gate on the eval solutions (3.4%), wh
 - liveness is implicit: an error is reported where an invalidated view is used;
 - `for x in v` borrows (`into_iter` consumes);
 - `free` stays as a consuming, deprecated alias;
-- legacy `*T` parameters are `&mut T` until 0.18;
+- legacy `*T` parameters are `&mut T` until 0.18.1 (V4, decided 2026-10-16: then every `*T` is raw);
 - the checker runs on the AST, and drops become implicit defers;
 - statics are never dropped, and hold only ∅ views;
 - leaks are safe.
@@ -830,7 +830,7 @@ Decided by the user on 2026-10-16:
 - **V3: if summaries slip**, view conflicts that come only from a non-inferred summary are warnings in 0.17.0.
 - **U1–U4 confirmed** as taken.
 - **The night's surface changes are approved** (grammar.md, "Additions of 0.17: familiar forms"): `&mut x`, which parsed as `&x`, gets its tracked meaning in Phase 0, consistently with what agents write today (`&x` to a legacy `*T` parameter is still accepted, as an exclusive loan); `p[i]` on a pointer to a Vec, Buf or slice indexes the pointee; paths in code resolve like `use` lines.
-- **`mut` pointer parameters are to be addressed explicitly later**: V4 in §7. Phase 0 implements the legacy `*T` rule as written and keeps `mut p: *T` raw.
+- **`mut` pointer parameters are to be addressed explicitly later**: V4 in §7. Phase 0 implements the legacy `*T` rule as written and keeps `mut p: *T` raw. *Decided 2026-10-16 (V4): every `*T` raw once compiler/src has migrated, in 0.18.1.*
 
 ## Phase 0 contract (2026-10-16, branch c17-phase0)
 

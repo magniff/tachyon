@@ -238,6 +238,7 @@ for f in tests/run/*.tach tests/run/*/main.tach examples/*/main.tach examples/*/
     rm -rf "$dd"
     case_directives "$f" "$dd"
     [ -s "$dd/xfail" ] && continue
+    grep -qw clang "$dd/requires" 2>/dev/null && ! "$CC" --version 2>/dev/null | grep -qi clang && continue
     echo "$f" >>"$list"
 done
 # The slots: JOBS of them, or (0.11) the ones $TACHYON_JOBSERVER shares

@@ -14,6 +14,8 @@
 | `fn(A, B) -> R` | a plain function value |
 | `extern "C" fn(A) -> R` | a C function pointer, another type |
 | `S`, `E`, `S<T>` | structs, enums, unions, their instances |
+| `type X = distinct T` | a type of its own with T's representation (0.18) |
+| `std::NonNull<T>` | a `*T` that is never null; `Option<NonNull<T>>` is one pointer |
 | `v2f64 v4f32 v2i64 v4i32 v8i16 v16i8` | SIMD vectors of 16 bytes |
 
 ## Numbers
@@ -107,6 +109,79 @@ fn main() -> i32 {
 ```
 ```out
 11
+```
+
+## Distinct types
+
+`type NodeId = distinct i64;` is a new type, as Go's defined types are:
+T's representation and ABI, but not interchangeable with T. `as`
+converts both ways for free (`id as i64`, `n as NodeId`); a literal is
+the one implicit conversion. T's operators work between two values of
+the type, or one and a literal (`a + 1`, `m / 2.0`, `a < b` is a bool);
+mixing it with T is `distinct.mix`, whose `try:` is the `as` to write
+(`tachyonc fix --suggested` writes them all). It has T's Eq, Ord, Hash,
+Debug, Display and Clone (`Vec<NodeId>` sorts, prints, is a HashMap key)
+and T's literal patterns, but none of T's methods (`distinct.method`):
+`impl NodeId { .. }` adds its own. `type Id<T> = distinct i64;` makes
+`Id<Node>` and `Id<Edge>` two types. T is plain: numbers, bool, raw
+pointers, and structs, tuples and arrays of them; not owned (a Vec, a
+type with a Drop impl) nor a view (a slice, a `&T`) (`distinct.kind`).
+
+```tach
+type NodeId = distinct i64;
+type Meters = distinct f64;
+
+impl NodeId {
+    fn next(self: NodeId) -> NodeId { self + 1 }
+}
+
+fn main() {
+    let a: NodeId = 3;
+    let b = a.next() * 2;              // NodeId
+    let x: f64 = 0.5;
+    let d: Meters = 2.0;
+    let e = d + x as Meters;           // `d + x` is distinct.mix
+    println(f"{b} {a < b} {e} {b as i64 + 1}");
+}
+```
+```out
+8 true 2.5 9
+```
+
+`std::NonNull<T>` is std's `distinct *T` that is never null:
+`NonNull::new(p)` is `Some` unless p is null, `p as NonNull<T>` is
+checked (a null p exits 101: `null pointer made NonNull`), `p.as_ptr()`
+(or `p as *T`) is the raw pointer, and dereferencing stays `unsafe`.
+`Option<NonNull<T>>` is one pointer, `None` the null one, so it is the
+field type of a nullable link and C's nullable pointer in an `extern
+"C"` signature; a C header's `_Nonnull` pointers import as NonNull (a
+result is C's promise, which the unsafe call vouches for). `_Nonnull`
+is clang's nullability qualifier: imports read headers as the system's
+C compiler does, so they see it where that compiler is clang (macOS);
+with gcc (most Linux systems) a header has no such qualifier and its
+pointers import as `*T`. Any `*T` has `p.is_null()`.
+
+```tach
+use std::NonNull;
+
+struct Node { value: i64, next: Option<NonNull<Node>> }
+
+fn main() {
+    let b = Node { value: 2, next: None };
+    let a = Node { value: 1, next: NonNull::new(&b) };
+    let mut total = 0;
+    let mut cur = NonNull::new(&a);
+    while let Some(p) = cur {
+        unsafe {
+            total += (*p.as_ptr()).value;
+            cur = (*p.as_ptr()).next;
+        }
+    }
+    println(f"{total} {size_of(Option<NonNull<Node>>)}");
+}
+```
+```out
+3 8
 ```
 
 ## Enums as integers

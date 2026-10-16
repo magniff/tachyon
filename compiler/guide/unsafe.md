@@ -29,10 +29,10 @@ the raw pointer, the escape hatch: nothing checks what it points to.
   (read-only memory), and `&(*p).f` of a place reached through a raw
   `p`. In `unsafe` code `&*p` makes a reference of it: the code vouches.
 - A `*T` parameter written without `mut`, in a safe function, is
-  accepted as `&mut T` through 0.17 (the legacy rule; `tachyonc fix
-  --values` rewrites it to `&mut T` or `&T`, and from 0.18 `*T`
-  parameters are raw). A `mut p: *T` parameter and any `*T` of an
-  `unsafe fn` or of C are raw.
+  accepted as `&mut T` until 0.18.1 (the legacy rule, which ends with
+  0.18.1: from then on every `*T` is raw, `mut` or not; `tachyonc fix
+  --values` rewrites it to `&mut T` or `&T`). A `mut p: *T` parameter
+  and any `*T` of an `unsafe fn` or of C are raw.
 - `p[i]` on a reference to a Vec, a Buf or a slice is the element of the
   one it points to, checked; `p[i]` on a raw pointer is pointer
   arithmetic, unchecked and unsafe. On `out: &mut i64` the value is

@@ -79,7 +79,7 @@ pub enum Error {
 
 // What `{e}` in an f-string prints.
 impl Display for Error {
-    fn fmt(self: *Error, f: *Fmt) {
+    fn fmt(self: &Error, f: &mut Fmt) {
         match *self {
             Error::Unknown(w) => f.write(f"unknown command {w}"),
             Error::Arity(w, n) => f.write(f"{w} takes {n - 1} arguments"),
@@ -235,7 +235,7 @@ total 129
 - `#[derive(Eq, Ord, Hash, Debug, Clone)]` (no `PartialEq`, no `Copy`
   derive: a struct of numbers and views, as `Item`, copies; one holding a
   `Vec`, `Buf` or `HashMap`, as `Store`, moves). `Display` is written by
-  hand, with `f.write(f"..")`; its `self: *Self` is a reference.
+  hand, with `f.write(f"..")`; its `self: &Self` is a reference.
 - Nothing allocates without an allocator. `main` gets `gpa` and passes
   it down. A function that allocates takes `gpa: Gpa`; one holding a
   `Vec` can use `v.allocator()`. Nothing is freed by hand: a value is

@@ -46,7 +46,26 @@ tests/agent-eval/run.py run --model claude:haiku --set compiler \
 
 A round is planned in `plans/` (0.16: [plans/0.16.md](plans/0.16.md),
 one command, `sh tests/agent-eval/plans/0.16.sh`; 0.17: the validation
-round against 0.16, [plans/0.17-validation.md](plans/0.17-validation.md)).
+round against 0.16, [plans/0.17-validation.md](plans/0.17-validation.md);
+0.18: value semantics, contracts and the agents' own opinions,
+[plans/0.18.md](plans/0.18.md)).
+
+```sh
+# (0.18) a debrief after each run's task: the same session is asked what
+# confused it, which diagnostics helped or misled, what it would change,
+# and three ratings out of 5 (prompts/debrief.md; result.json's debrief,
+# its cost apart from the task's; the workspace put back before grading)
+tests/agent-eval/run.py run --model claude:haiku --cond guide-mini+readfirst+debrief,rust+debrief ...
+tests/agent-eval/run.py debrief RUNDIR... --md docs/eval/FILE.md   # by theme, ratings, raw answers
+
+# (0.18) cost x Rust (and tier-free), turns, success, errors by family
+# (own.*, contract.*, test.*, distinct.*, then the classes)
+tests/agent-eval/run.py costx --rust DIR:rust --cell LABEL=DIR:COND,... --md FILE
+
+# (0.18) the compiler binary each program run used (its recorded md5 and
+# its workspace root's copy), against the one intended
+tests/agent-eval/run.py binaudit RUNDIR... --expect target/tachyonc
+```
 
 ```sh
 # (0.17) the self-check alone: can agents build, run, test and write in

@@ -21,8 +21,8 @@ use crate::base::diag::{
     ERR_HELP, err_begin, err_end, err_help, err_help_sym, err_str, report_warning,
 };
 use crate::front::ast::{
-    CLOSURE_HOLES, CLOSURE_MOVE, FMT_BIN, FMT_CHAR, FMT_HEX, NODES, NodeKind, child, list_begin,
-    list_end, list_push, new_node,
+    CLOSURE_HOLES, CLOSURE_MOVE, FMT_BIN, FMT_CHAR, FMT_HEX, NODES, NODE_REF, NODE_REF_MUT,
+    NodeKind, child, list_begin, list_end, list_push, new_node,
 };
 use crate::front::check::{
     CONST_CONTEXT, LOCALS, lookup_local, mismatch_error, pop_scope, push_scope, type_error,
@@ -174,7 +174,7 @@ fn expand(n: i64) -> i64 {
         push_writes(n, out, false);
         let body = new_node(NodeKind::Block, start, end);
         list_end(body, stmts);
-        // move |__out: *std::Fmt| body
+        // move |__out: &mut std::Fmt| body (0.18: Display's `f: &mut Fmt`)
         let fmt_name = new_node(NodeKind::TyName, start, end);
         NODES[fmt_name].a = intern_c(c"Fmt");
         let smark = list_begin();
@@ -182,6 +182,7 @@ fn expand(n: i64) -> i64 {
         list_end(fmt_name, smark);
         let fmt_ptr = new_node(NodeKind::TyPtr, start, end);
         NODES[fmt_ptr].a = fmt_name;
+        NODES[fmt_ptr].p |= NODE_REF | NODE_REF_MUT;
         let param = new_node(NodeKind::Param, start, end);
         NODES[param].a = out;
         NODES[param].b = fmt_ptr;
@@ -310,7 +311,7 @@ fn push_writes(n: i64, out: i64, direct: bool) {
             // (`__out.display(&__f0)`; through a pointer, `__f0.fmt(__out)`:
             // a pointer value is passed as a receiver)
             let write = if takes_pointer(item) {
-                let to = if direct { unary(Tok::Amp, ident(out, item)) } else { ident(out, item) };
+                let to = if direct { amp_mut(ident(out, item)) } else { ident(out, item) };
                 call1(ident(name, item), if debug { c"fmt_debug" } else { c"fmt" }, to)
             } else {
                 call1(ident(out, item), if debug { c"debug" } else { c"display" },
@@ -543,13 +544,13 @@ fn direct_body(fs: i64, k: i64, n: i64) -> i64 {
             let fmt = std_call(none, c"__fmt_tmp", unary(Tok::Amp, ident(t, n)), 0, 0, n);
             list_push(let_node(out, fmt, n, true));
             let end = std_call(none, c"__fmt_in_end", unary(Tok::Amp, ident(b, n)),
-                unary(Tok::Amp, ident(out, n)), unary(Tok::Amp, ident(t, n)), n);
+                amp_mut(ident(out, n)), unary(Tok::Amp, ident(t, n)), n);
             list_push(stmt(retry_loop(fs, out, end, n)));
             tail = ident(b, n);
         } else if k == D_PUSH_FMT {
             let r = intern_c(c"__r");
             list_push(let_node(out, std_call(none, c"__buf_fmt", ident(r, n), 0, 0, n), n, true));
-            let end = std_call(none, c"__buf_fmt_end", ident(r, n), unary(Tok::Amp, ident(out, n)),
+            let end = std_call(none, c"__buf_fmt_end", ident(r, n), amp_mut(ident(out, n)),
                 0, n);
             list_push(stmt(retry_loop(fs, out, end, n)));
         } else {
@@ -683,14 +684,14 @@ fn missing_trait(h: i64, t: i64, debug: bool) -> ! {
                 err_help(
                     c"derive it: '#[derive(Debug)]' before the type, or write 'impl Debug for ");
                 buf_type(ERR_HELP, t);
-                err_help(c" { fn fmt_debug(self: *");
+                err_help(c" { fn fmt_debug(self: &");
             } else {
                 err_help(c"write 'impl Display for ");
                 buf_type(ERR_HELP, t);
-                err_help(c" { fn fmt(self: *");
+                err_help(c" { fn fmt(self: &");
             }
             buf_type(ERR_HELP, t);
-            err_help(c", f: *std::Fmt) { f.write(f\"...\"); } }'");
+            err_help(c", f: &mut std::Fmt) { f.write(f\"...\"); } }'");
         } else if !debug {
             err_help(c"write it with Debug, '{x:?}', or format its parts");
         }
@@ -735,6 +736,13 @@ fn unary(op: Tok, e: i64) -> i64 {
         NODES[u].b = e;
         u
     }
+}
+
+// `&mut e` (0.18: what Display's and Fmt's `&mut Fmt` take).
+fn amp_mut(e: i64) -> i64 {
+    let u = unary(Tok::Amp, e);
+    unsafe { NODES[u].p |= NODE_REF_MUT; }
+    u
 }
 
 // An i64 literal of value v (a negative one as `-v`), at node at.

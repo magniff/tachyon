@@ -45,8 +45,7 @@ fn main(gpa: Gpa) -> i32 {             // gpa: the program's allocator; 0 = exit
     v.push(5);
     v.push(2);
     v[0] += 10;                        // as Rust: checked (v[1..2] a slice)
-    // Rust: v.sort();
-    sort(v.as_slice());
+    v.sort();                          // as Rust; or sort(v.as_mut_slice())
     // Rust: let mut p = P { x: 1 }; p.bump();
     let mut p = P { x: 1 };
     p.bump();                          // passes &mut p
@@ -158,6 +157,12 @@ with its comment: `tachyonc guide --find split_in`.
 | `own.conflict: ... while 'first' views them` | use the view before the change, or take it again after (`guide views`) |
 
 Every error has a `help:`; `tachyonc guide errors` has more.
+
+Tests and checks (0.18): `#[test] fn` and `#[property] fn p(v: Vec<i64>)`
+(inputs generated, shrunk) sit next to the code and `tachyonc test` runs
+them at -O0 and -O2; `requires`/`ensures` clauses and `assert_eq(a, b)`
+are checked at run time, a failure one line `FILE:L:C: message` (`guide
+testing`, `guide contracts`).
 
 ## The loop
 

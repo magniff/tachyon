@@ -988,9 +988,8 @@ Moved to 0.17.1:
   solutions as agents wrote them, 14 of 18 are rejected under the new
   default (written `[T]` in 9 tasks, handle moves, views of leaked Bufs,
   ledger's two `get_mut`, legacy `*T` conflicts);
-- open for the user, V4 (design §7): what `mut p: *T` parameters mean
-  under references (raw as today, a rebindable `&mut T`, rejected in safe
-  code, or 0.18's all-raw rule).
+- V4 (design §7), decided by the user on 2026-10-16: every `*T` becomes
+  raw in 0.18.1 (see 0.18).
 
 ## 0.18: contracts and verification in the language
 
@@ -1015,6 +1014,103 @@ Moved to 0.17.1:
   already serves the query tools
 - the language specification waits for 0.23 (see "After 0.23: the
   specification")
+- 0.18.1: once compiler/src has migrated to `&`/`&mut` (with the
+  compiler-on-values work above), the legacy rule that a non-`mut` `*T`
+  parameter is accepted as `&mut T` is removed (V4 in
+  docs/design/value-semantics.md §7, decided by the user on 2026-10-16):
+  from then on every `*T` is a raw pointer, as Rust's are (a dereference
+  needs `unsafe`), `mut` or not, and borrowing is only `&` / `&mut`
+
+Done (0.18.0). The design (docs/design/contracts-verification.md, with
+the decisions taken for the user's review: contracts always checked, a
+requires checked at the call and blaming the caller, facts only from
+checks that ran, one failure line, Rust's `#[test]`, test modules
+without `use super::*`, Go's defined types, `NonNull<T>` with a null
+niche), a phase 0 that reads the syntax, and four tasks built in
+parallel on 0.17 before its value semantics, then merged onto v0.17.0:
+contracts and check positions (T1, T5: `requires`/`ensures`, the
+assertions, std's clauses, the site table and one failure line, `query
+checks`, `--no-positions`); tests and properties (T2: `#[test]`,
+`#[cfg(test)]`, snapshots, `#[property]` with generated, shrunk inputs,
+`tachyonc test` comparing -O0 and -O2); fuzzing and reduce (T3:
+`--coverage`, `#[fuzz]`, `tachyonc fuzz`, `reduce --differs/--fails/
+--test`); distinct types and `NonNull` (T4: the null niche, the checked
+cast). Also in 0.18: std's `Display`, `Debug`, `Iterator` and `Clone`
+on references and `fix --values` over traits, with the corpus moved;
+the eval harness's `+debrief`. Decided at integration (each with a
+test): a requires check reads the call's arguments in place; `old(..)`
+of a by-value owned parameter or of a view is `contract.old`; distinct
+types only over plain types (not a reference, not a `Drop` type);
+generators take `&mut Gen`; property and fuzz cases are leak-checked;
+the test runtime and the fuzzer are lazy std sections; the `note: build
+with --trace` line is gone. V4 was decided by the user (below). Not
+done in 0.18.0, and now 0.18.1's: the compiler's source on values and
+arenas, functions compiled in parallel, incremental rebuilds.
+
+The release gate (`gate.sh --release --no-x86` on aarch64-macos, 9:58
+wall, every step passing; x86_64 not run, by instruction): the chain
+(fixpoint, built by 0.17.0) and the suite at -O0/1/2 (1168 tests, 3
+XFAIL); fuzz 60 in each of the ten modes, ABI 100 in three modes,
+objcheck 1820 of 1820, header layouts, lldb at -O0 and -O2, stress-grow,
+examples-checkalloc (87); aarch64-linux (the cross-built fixpoint, the
+suite at every level, 1167 and nonnull_cimport skipped, fuzz 300 in
+nine modes, ABI 150 in three, objcheck 1820, layouts, gdb). Its first
+runs found, and the release fixed before the tag: the check-site table
+wrote each file's path as given, so the compiler built in the
+aarch64-linux container differed from the cross-built one (every path
+the compiler writes into its output is now relative to the root's
+directory, tests/refactor/paths018; -g's `.file` names the root's
+directory joined with it); GNU as refused the contract companions'
+`f?pre` symbols (now `f$pre`, tests/refactor/symbols018);
+nonnull_cimport tested clang's `_Nonnull` where cc is gcc (`// REQUIRES:
+clang`); and the benchmarks found iterchain 5.8% slower in instructions
+than 0.17.0, from the b18-contracts merge: dot's loop was unrolled
+twice, not four times, because a constant only its checks' cold failure
+calls read counted in the unroller's size (no longer,
+tests/run/opt_unroll_exit_consts). Measuring the compile times then
+found out_path calling realpath for every file (twice 0.17.0's -O0
+self-compile under a large directory): paths are now made relative by
+their text. Benchmarks and compile times in "Benchmarks", 0.18.
+
+Moved to 0.18.1:
+- the compiler's source on value semantics and arenas (design §4.1,
+  §4.2): the front end's tables as `Vec<T, Comp>`, the syntax tree's
+  arena released after lowering, `FnCtx`/`Program` for middle, back and
+  gen0, per-function IR arenas;
+- compile speed, part 2: functions optimized and emitted in parallel
+  (§4.3; in progress on branch p181-par), output byte-identical for every
+  `-j`, checked by the gate; incremental rebuilds from the per-function
+  cache (§4.4);
+- V4: once compiler/src uses `&`/`&mut`, the legacy rule that a non-`mut`
+  `*T` parameter is a borrow is removed (decided 2026-10-16), and every
+  `*T` is raw;
+- contracts: the checking entry for calls through `fn` values and trait
+  objects (they skip a requires today), hence facts at the callee's
+  entry and std's body checks removed behind its requires; facts from
+  `ensures` on call results (`middle::ipo`); type invariants and
+  `contract.sealed`; `contract.violated` at compile time,
+  `contract.impl-requires` and clauses on trait methods; `macro.args`;
+  values other than integers in failure lines; `query effects --why`
+  naming a clause; `Vec::get`'s body check behind its requires when the
+  length goes through `as_slice`;
+- tests: `probe --test/--seed`, `--against CMD --gen CMD`, `test --fuzz
+  S`, failing property inputs saved to a corpus, effects (no io, no
+  global) required of contracts tested as properties, the bang spellings
+  in try: lines and kept by `fmt`, a leak's site naming the property
+  rather than the generated `<test>` source;
+- reduce: expressions replaced by literals, calls inlined, several
+  files, candidates checked in the process;
+- distinct types: field access through a distinct struct, `!` on a
+  distinct bool, a distinct type's `invariant`;
+- the gate: the level comparison over tests/run as `tachyonc test` runs
+  it, a fuzz mode whose programs carry clauses, the `-j` and incremental
+  byte comparisons, `TACHYON_ARENA_SHUFFLE`, a valgrind row on
+  aarch64-linux (0.17.0's gate found two heap bugs macOS hid), a lock on
+  bootstrap.sh's shared release cache;
+- compile time: std's text built by section as it is loaded (a small
+  program compiles with about 10 M more instructions than with 0.17.0,
+  "Benchmarks", 0.18);
+- 0.17.1's list (above) stands.
 
 ## After 0.18: a standard library, and a real program on it
 
@@ -1891,3 +1987,94 @@ about 8.5% over 0.16's checker against the 8% budget, accepted for
 0.17.0 (getting at least 0.5% back is a 0.17.1 item). The small
 program: `Vec::new_in(gpa)`, ten pushes, a sum, `print_int`,
 `println("")`.
+
+### 0.18
+
+aarch64-macos (Apple silicon, native; `gate.sh --only bench`, the
+fastest of 5 runs in ms, right after the release gate; other agents'
+work kept the load average between 6 and 25, so the times move by
+several percent from run to run; "0.17.0" is v0.17.0's build of the same
+programs in the same run; the geometric mean is over cc -O2's):
+
+| program | 0.17.0 | 0.18 -O2 | cc -O2 |
+|---|---|---|---|
+| arena_trees | 33 | 34 | 42 |
+| binarytrees | 153 | 157 | 154 |
+| collatz | 314 | 314 | 315 |
+| fannkuch | 121 | 122 | 144 |
+| fib | 14 | 14 | 14 |
+| interp | 42 | 43 | 40 |
+| iterchain | 191 | 194 | 188 |
+| iterloop | 195 | 197 | 187 |
+| json | 107 | 106 | 94 |
+| mandelbrot | 171 | 171 | 166 |
+| matmul | 20 | 18 | 45 |
+| nbody | 31 | 32 | 29 |
+| sieve | 82 | 85 | 101 |
+| sort | 65 | 65 | 61 |
+| stencil | 9 | 10 | 10 |
+| wordcount | 175 | 124 | 92 |
+| md5 | 24 | 22 | - |
+| fmtints | 22 | 22 | - |
+| fmtloop | 22 | 22 | - |
+| purecall | 78 | 90 | - |
+| purecall_hoisted | 88 | 87 | - |
+| geomean vs cc -O2 (16 programs) | 0.969 | 0.958 | 1 |
+
+(-O0 and -O1 in the same run: geomean 7.877 and 1.580.) The pairs,
+fastest of 10: iterchain over iterloop **0.985**, fmtloop over fmtints
+**1.000**, purecall over purecall_hoisted **1.012**. With the load this
+high the times are not the measure; the instructions retired are (one
+run each, which vary by about 0.3% from run to run):
+
+| program | 0.17.0 | 0.18 |
+|---|---|---|
+| arena_trees | 693.6 M | 693.0 M |
+| binarytrees | 5106.4 M | 5105.5 M |
+| collatz | 3040.2 M | 3040.1 M |
+| fannkuch | 1284.7 M | 1284.5 M |
+| interp | 1500.3 M | 1500.2 M |
+| iterchain | 4478.9 M | 4479.7 M |
+| iterloop | 4510.7 M | 4510.3 M |
+| json | 1516.8 M | 1516.6 M |
+| mandelbrot | 2172.2 M | 2172.1 M |
+| matmul | 251.7 M | 248.3 M |
+| nbody | 622.2 M | 622.3 M |
+| sieve | 467.6 M | 468.5 M |
+| sort | 415.7 M | 414.8 M |
+| stencil | 236.0 M | 236.0 M |
+| wordcount | 1591.2 M | 1593.4 M |
+| purecall | 1128.8 M | 1128.8 M |
+
+The generated code is 0.17.0's: contract checks are checks the range
+analysis removes like bounds checks, std's clauses replaced the checks
+its bodies made, and the check sites' constants live on the cold paths.
+Before the unroller's fix (tests/run/opt_unroll_exit_consts) iterchain
+took 4741 M, its pair 1.031.
+
+Compile time (aarch64-macos, best of 7 alternating, wall, load 13 to
+16, so a few percent is noise; the instructions retired, `/usr/bin/time
+-l`, are the measure; 0.18's source, 159,250 lines in 338 files, in a
+copy outside the tree; no query cache):
+
+| | 0.17.0 | 0.18 |
+|---|---|---|
+| the compiler to an object, -O0 | 376 ms / 7.33 G / 343 MB | 386 ms / 7.50 G / 352 MB |
+| the compiler to an object, -O1 | 932 ms / 14.09 G / 439 MB | 943 ms / 14.29 G / 441 MB |
+| the compiler to an object, -O2 | 2193 ms / 35.41 G / 580 MB | 2185 ms / 35.61 G / 581 MB |
+| `tachyonc check compiler/src/main.tach` | 181 ms / 3.23 G | 183 ms / 3.28 G |
+| `tachyonc query refs run_gvn` | 241 ms / 4.23 G | 251 ms / 4.45 G |
+| a small std program to an object, -O0 | 3.9 ms / 47 M | 4.6 ms / 57 M |
+| a small std program to an object, -O2 | 6.7 ms / 79 M | 7.3 ms / 91 M |
+
+The compiler compiles itself with 2.3% more instructions at -O0, 1.4%
+at -O1 and 0.6% at -O2: the contracts' expansion and checks, the tests'
+and distinct types' front-end work, and the check-site table. `check`
+does 1.5% more, a query without the cache 5.2% more. A small std
+program pays most (about 10 M instructions, 0.6 ms; 13.5 M of either
+column is the process's start): std is 23% larger (175 to 216 KB: its
+clauses, the test runtime, the fuzzer, NonNull), and its text is built
+for every compilation though the new sections are only lexed by the
+builds that name them; the phase 0 syntax hooks, the contracts and the
+tests each added a third of it (bisected on release-0.18's merges).
+Building std's text by section, as it is loaded, is a 0.18.1 item.
