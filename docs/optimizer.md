@@ -2223,24 +2223,30 @@ at -O0, -O1 and -O2 compiled at -j1 and -j8 (the self-compile also at
 same object, the same output and the same exit: 2095 compilations. `TACHYON_PHASE_TIMES=1` prints each
 phase's wall time.
 
-**Measured** (aarch64-macos, the compiler compiling itself, `-c`; best
-wall of 5 alternating runs (-O0's of 3, after its assembler thread),
-median user time, peak RSS; other agents' work kept the load at 2 to 6,
-and a run at load 20 to 40 gave times within 5% of these):
+**Measured** (aarch64-macos, the compiler compiling itself, `-c`, after
+the merge of 0.18.0, against v0.18.0; best wall of 5 alternating runs,
+median user time, peak RSS, median instructions retired; an agent eval
+and other agents kept the load at 7 to 9, so the wall times are a few
+percent high):
 
-| | v0.17.0 | -j1 | -j2 | -j4 | -j8 | -j10 |
+| | v0.18.0 | -j1 | -j2 | -j4 | -j8 | -j10 |
 |---|---|---|---|---|---|---|
-| -O0 wall / user / RSS | 0.33 s / 0.31 / 316 MB | 0.32 / 0.30 / 280 | 0.27 / 0.30 / 300 | 0.27 / 0.30 / 299 | **0.27** / 0.30 / 300 | 0.27 / 0.30 / 299 |
-| -O1 | 0.81 s / 0.78 / 432 MB | 0.78 / 0.75 / 417 | 0.53 / 0.79 / 421 | 0.41 / 0.85 / 423 | **0.35** / 1.00 / 427 | 0.35 / 1.02 / 433 |
-| -O2 | 1.98 s / 1.94 / 581 MB | 2.03 / 1.99 / 600 | 1.22 / 2.04 / 599 | 0.85 / 2.26 / 616 | **0.69** / 2.76 / 632 | 0.68 / 2.80 / 637 |
+| -O0 wall / user / RSS | 0.35 s / 0.33 / 370 MB | 0.35 / 0.32 / 338 | 0.30 / 0.33 / 356 | 0.29 / 0.35 / 357 | **0.30** / 0.44 / 360 | 0.29 / 0.33 / 355 |
+| -O0 instructions | 7.63 G | 7.49 | 7.52 | 7.52 | 7.53 | 7.52 |
+| -O1 wall / user / RSS | 0.87 s / 0.84 / 480 MB | 0.83 / 0.81 / 456 | 0.57 / 0.84 / 473 | 0.42 / 0.84 / 477 | **0.37** / 1.06 / 504 | 0.36 / 1.09 / 484 |
+| -O1 instructions | 14.47 G | 13.21 | 13.24 | 13.24 | 13.28 | 13.28 |
+| -O2 wall / user / RSS | 2.13 s / 2.09 / 630 MB | 2.16 / 2.18 / 642 | 1.33 / 2.30 / 643 | 0.87 / 2.35 / 652 | **0.72** / 2.92 / 671 | 0.70 / 3.06 / 678 |
+| -O2 instructions | 35.88 G | 33.64 | 33.84 | 33.75 | 33.79 | 33.79 |
 
--O2 is 2.9 times faster at -j8 (the design's goal was 3, and at most
-0.65 s at -j10), -O1 2.3 times, -O0 1.2 times (its assembler beside
-its code generation; the goal was 0.20 s). The user time grows with the
+-O2 is 3.0 times faster at -j8 and -j10 (the design's goal was 3, and
+at most 0.65 s at -j10), -O1 2.4 times, -O0 1.2 times (its assembler
+beside its code generation; the goal was 0.20 s). The instructions
+retired fall at -j1 (the context's fields cost less than the statics
+did, and -O0's assembler no longer interns every label), though -O2
+inlines more (the budget's view, above). The user time grows with the
 threads (the efficiency cores run slower; the allocator and the caches
-are shared). -O0's RSS at -j1 falls because the assembler no longer
-interns every label into the program's symbols. -O2's RSS grows with the IR the budget's new view inlines, and
-by each thread's scratch.
+are shared). Measured before the merge, against v0.17.0 at load 2 to 6:
+-O2 1.98 s to 0.69 s at -j8, -O1 0.81 to 0.35, -O0 0.33 to 0.27.
 
 Phases at -O2 -j8 (`TACHYON_PHASE_TIMES=1`, ms; -j1's in parentheses):
 front end 115, lowering 45, cleanup 13 (20), scalar pipeline 40 (206),
