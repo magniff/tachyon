@@ -146,9 +146,11 @@ too big: 500
 | `.map()`, `.filter()`, `.sum()`, `.collect()` | the same (0.14); `collect_in(gpa)` makes a `Vec` only (`guide iterators`) |
 | `\|x\| x + 1`, `move \|\|` | the same (0.14); a `let mut` is captured by reference, the rest by value (`guide closures`) |
 | `impl Fn(i64) -> i64`, `Box<dyn Fn>` | a generic parameter `F: Fn(i64) -> i64`; none as a result |
-| `(0..n).rev()` | `let mut i = n; while i > 0 { i -= 1; ... }` |
+| `(0..n).rev()` | the same (0.18.1) |
 | `.step_by(2)` | `while` with `i += 2` |
 | `sort()`, `sort_by(\|a, b\| ...)` | `std::sort(s)` (`T: Ord`; not stable); `v.sort_by(\|a, b\| b.cmp(a))` (0.14; `a`, `b`: `&T`) |
+| `v.sort_by_key(\|x\| x.k)`, `v.retain(..)`, `v.contains(&x)`, `v.first()` | the same on a `Vec` (0.18.1; `sort_by_key` is stable); `contains(x)` takes x by value |
+| `BinaryHeap<T>`; a min-heap `BinaryHeap<Reverse<T>>` | `BinaryHeap<T>`; `MinHeap<T>`, no `Reverse` (0.18.1, `guide std#heaps-priority-queues`) |
 
 A function value is `fn(A) -> R`, a plain function, no environment.
 Its parameters may be references (`fn(&mut Sum, i64)`, 0.17); a

@@ -58,6 +58,8 @@ crate::myvec::Vec::len	clash/myvec.tach:11:12	method	pub fn len(self: *Vec) -> i
 std::Vec::len	../../compiler/std/std.tach:157:12	method	pub fn len(self: &Vec<T, A>) -> i64
 std::Buf::len	../../compiler/std/std.tach:459:12	method	pub fn len(self: &Buf<A>) -> i64
 std::HashMap::len	../../compiler/std/std.tach:1143:12	method	pub fn len(self: &HashMap<K, V, A>) -> i64
+std::BinaryHeap::len	../../compiler/std/collections.tach:192:12	method	pub fn len(self: &BinaryHeap<T, A>) -> i64
+std::MinHeap::len	../../compiler/std/collections.tach:288:12	method	pub fn len(self: &MinHeap<T, A>) -> i64
 $ refs V2::len
 # clash/geom.tach
 15:12	def	pub fn len(self: *V2) -> i64 {
@@ -129,6 +131,8 @@ $ def push
 crate::myvec::Vec::push	clash/myvec.tach:7:12	method	pub fn push(self: *Vec, x: i64)	effects: none
 std::Vec::push	../../compiler/std/std.tach:238:12	method	pub fn push(self: &mut Vec<T, A>, x: T)
 std::Buf::push	../../compiler/std/std.tach:463:12	method	pub fn push(self: &mut Buf<A>, b: u8)
+std::BinaryHeap::push	../../compiler/std/collections.tach:202:12	method	pub fn push(self: &mut BinaryHeap<T, A>, x: T)
+std::MinHeap::push	../../compiler/std/collections.tach:298:12	method	pub fn push(self: &mut MinHeap<T, A>, x: T)
 $ refs Vec::push --count
 2	crate::myvec::Vec::push
 25	std::Vec::push

@@ -380,11 +380,13 @@ fi
 # (0.17) `guide std` itself is the index: a line per item, the receiver
 # as `Self`, no comments, nothing of std's own workings, within about
 # 4k tokens (under the 30000 characters an agent's shell shows whole;
-# 0.18: 18500 bytes, for the assertions, Arbitrary and Gen, NonNull);
+# 0.18: 18500 bytes, for the assertions, Arbitrary and Gen, NonNull;
+# 0.18.1: 19500, for the heaps, whose methods it leaves to their section,
+# and Vec's sort_by_key, retain, contains, first);
 # std#every-item is not in it. Its first screen (what `| head -60`
 # shows) is the most used names, then the overview.
 size=$(wc -c <"$WORK/topic-std.md" | tr -d ' ')
-if [ "$size" -le 18500 ] \
+if [ "$size" -le 19500 ] \
     && head -60 "$WORK/topic-std.md" | grep -q '^## The most used$' \
     && head -60 "$WORK/topic-std.md" | grep -qF 'Vec::new_in(gpa) -> Vec<T>' \
     && head -60 "$WORK/topic-std.md" | grep -q '^## Overview$' && grep -qF 'fn push(self: &mut Self, x: T)' "$WORK/topic-std.md" \
@@ -395,7 +397,7 @@ if [ "$size" -le 18500 ] \
     && grep -q '^## Every item with its comment$' "$WORK/std/every.md"; then
     result pass guide-std-index
 else
-    result FAIL guide-std-index "tachyonc guide std is $size bytes (18500 at most), or not the index (most used first)"
+    result FAIL guide-std-index "tachyonc guide std is $size bytes (19500 at most), or not the index (most used first)"
 fi
 
 # The guide by piece (0.15): --find prints the paragraphs about the

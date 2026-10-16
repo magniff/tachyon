@@ -48,6 +48,7 @@ o.is_some() -> bool              Option
 v.remove(i: i64) -> T            m.remove(k) -> Option<V>
 split_in(s: [u8], sep: u8, gpa) -> Vec<[u8]>
 m.contains_key(k: K) -> bool
+MinHeap::new_in(gpa), h.push(x), h.pop() -> Option<T>   a priority queue, smallest first; BinaryHeap: largest
 ```
 
 ## Overview
@@ -61,7 +62,8 @@ prelude names need no import: `Option`, `Some`, `None`, `Result`, `Ok`,
 and (0.17) `Buf`, `HashMap`, `read_line`, `read_stdin_in`, `Scanner`,
 `parse_int`, `trim`, `split_in`, `split_whitespace_in`, `sort`,
 `sort_by`, `sort_stable`, `sort_stable_by` (and their `_in` forms),
-`cmp_of`, `eq_of`, `Fmt`, `panic(msg)` and `unreachable()`.
+`cmp_of`, `eq_of`, `Fmt`, `panic(msg)` and `unreachable()`; (0.18.1)
+the heaps `BinaryHeap` and `MinHeap`.
 Anything else is used by path (`std::print_int(n)`) or imported by name
 (`use std::{IoError, is_digit};`).
 
@@ -89,8 +91,8 @@ dropped (freed) at the end of its scope (0.17): no `free` calls.
 - To change a value in place, `get_mut(k)` and `get_or_insert(k, d)`
   give a writable view of one element (`&mut [V]`; `a[0]` is the value),
   safe to use until the map's next insert, remove or free, like
-  `as_mut_slice()`:
-  `counts.get_or_insert(word, 0)[0] += 1;` counts.
+  `as_mut_slice()`: Rust's `*m.entry(k).or_insert(0) += 1` is
+  `counts.get_or_insert(word, 0)[0] += 1;`.
 - `sort(s)` sorts a slice in place by `Ord` (an introsort: O(n log n),
   not stable); `v.sort()`, `s.sort()` too.
 - (0.17) `sort(&mut a[..])`, `sort(v.as_mut_slice())`; `v.free()`
@@ -126,6 +128,15 @@ fn main(gpa: Gpa) -> i32 {
 c=10 a=3 b=1
 3 has b
 ```
+
+## Heaps: priority queues
+
+`BinaryHeap<T>` and `MinHeap<T>` (`T: Ord`; tuples compare field by
+field) are priority queues: `push(x)`, `pop() -> Option<T>`, `peek()`,
+`len()`, `from_vec(v)`, `into_sorted_vec()`; a BinaryHeap pops the
+largest first, a MinHeap the smallest (Rust's `BinaryHeap<Reverse<T>>`:
+tachyon has no tuple structs, so no `Reverse(x)`). Dijkstra with a
+MinHeap: `tachyonc guide --find dijkstra`.
 
 ## Input
 
