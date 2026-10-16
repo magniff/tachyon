@@ -24,9 +24,37 @@ The prototype (§8, branch c17-proto) measured every assumption of the first ver
 
 U1–U4 are kept: the prototype supports U2 and does not touch U1 or U3. **U4 now depends on change 1**: errors in 0.17.0 are right only if inferred summaries ship in 0.17.0. If T3 slips, view conflicts must be warnings until it lands. §7 lists this and the other new choices (V1–V3) for the user.
 
+**Decided on 2026-10-16** (the user; recorded in "Decisions", after §7): V1–V3 as recommended, U1–U4 confirmed, the night's surface changes approved, and the meaning of `mut p: *T` parameters left open (V4, §7).
+
 ## Pending: eval findings
 
-Tonight's agent-eval round may add requirements: code agents write that this design still rejects, `try:` lines they fail to apply, and how they use `query own`/`query views`. The findings go here, then into §2.9 and the T6 tests. Until then §2.9's six situations come from the prototype's corpus.
+*Filled on 2026-10-16.* Sources: the 0.16 round (516 runs, docs/eval/0.16-findings.md on branch eval-run16), the 0.17 validation (588 runs, docs/eval/0.17-validation-results.md), the 0.17 iterations (docs/eval/0.17-iterations.md), and a scan of 684 runs of both rounds (.claude/briefs/research/syntax-confusions.md, "syntax-confusions" below).
+
+**The `error[unsafe]` family: pointers used as references.** 221 errors in 16 runs, 44 tool calls spent on them (syntax-confusions §1, §3.1; each error counted once per run, file, line and message):
+- a local holding `&x` and passed on (`let p = &ps; bump(p)`): 134 in 8 runs;
+- a field reached through a stored or local pointer (`struct Parser { q: *Query }`, `self.q.nodes.push(n)`): 71 in 6 runs;
+- a method called through such a pointer: 9 in 5 runs;
+- `a[0]` on a `*T` closure parameter (`|a, b| cmp(a[0], b[0])`): 5 in 4 runs;
+- a function with pointer parameters used as a value (`sort_by(by_rank)`): 2 in 2 runs.
+
+One `let p = &ps` gives an error at every use, so single runs show 24–35 of them. Every form is safe under §2.3/§2.4: `let r = &x` is a tracked reference, a reference can be a field of a view struct, closure parameters are `&T`. The goal: only C calls stay in this class, and `own.*` stays under 5% of all errors with no run lost (0.16-findings, "Input for V1–V3").
+
+**Agents write `&x`, rarely `&mut x`** (syntax-confusions §3.2): `&mut x` at a call in 3 of 684 runs (41 uses); `&T`/`&mut T` in a type in 1 run; `&x` at a call in 337 runs (2,077 uses); `*T` parameter or field types in 389 runs; `self: *T` in 137; `&self`/`&mut self` in none. 0.17's familiar forms parse `&mut x` as `&x` (grammar.md, "Additions of 0.17"). For Phase 0:
+- `&mut x` takes its tracked meaning with almost no agent code depending on the old one;
+- `&x` passed to a legacy `*T` parameter (`&mut T` by §2.3) keeps checking as agents write it today: the loan's kind is the parameter's;
+- agents pass one reference local many times (`let p = &ps; expect_kw(p, ..)?; bump(p)`). Since `&mut` moves (§2.1), passing a `&mut` local to a parameter must be an implicit reborrow, or this family comes back as `own.moved` (T2).
+
+**`p[i]` through a pointer to a Vec.** Once `v[i]` worked on a Vec, agents indexed `dist: *Vec<i64>` parameters, and the error's `try:` offered `unsafe` (a read past `dist`): 4 of 234 runs at 0.17v, 7 of 39 at night-final b0f233f; on task 03 it put Sonnet at 3.57–4.70× Rust against 1.83× (0.17-iterations, 8–9). 3ab0088 indexes the pointee through a borrow of a Vec, Buf or slice: 0 of 9 task-03 runs then had the error, 2.12× Rust (iteration 10). On references `p[i]`, `p[a..b]`, `p.0` and `p.x` keep reaching the pointee; `out[0] = acc` on `out: &mut i64` gets `try: *out = acc`, never `unsafe`.
+
+**For §2.9 and T6:**
+- *Situation 7, a reference kept in a local or a field*: `let p = &mut ps;` passed to several helpers, and `struct Parser { q: &mut Query }` with `self.q.nodes.push(n)`, check clean. T6 case: the reconstructed 15-multi-module parser (syntax-confusions §3.1).
+- T6: `&x` to a `*T` or `&T` parameter checks clean; to a `&mut T` parameter it is one error whose `try:` rewrites `&x` to `&mut x` (Phase 0 has the type error and the fix).
+- T6: tuple comparators `|a, b| a.0 < b.0` check clean; `a[0]` on a `&T` parameter gets `try: *a`.
+- A variant of situation 1: a collection passed by value where a reference was meant (9 runs switched `*T` and `T` and lost a push through a copied handle, syntax-confusions §3.2). It now moves at the call; the `try:` is `refactor signature F --type v '&mut Vec<T>'`.
+- T6 corpus: the parsers of 14-ast-pass and 15-multi-module and the programs keeping views in containers check clean (58 of 174 from-scratch programs store views in containers, 31 have slice fields; 0.16-findings, V1).
+- The `try:` contract: agents ran a `try:` line 3 times in 172 errors and `fix --suggested` 0 times in 7 offers; they fix by hand (Sonnet with `sed -i` in 40–60% of runs, 0.17-iterations 9). So `help:` carries the replacement text itself. Under V3, a warning is one counted line and never blocks the Stop hook (0.16-findings).
+
+*Not reconciled:* 0.16-findings counts 13 such errors in 11 runs (distinct messages per run, 6% of errors), against syntax-confusions' 221 over both rounds; the two count differently.
 
 ## 1. Current state and every known safety gap
 
@@ -91,6 +119,8 @@ U1 decides the spelling. The recommendation, used below, is Rust's:
 - Fields and methods go through references automatically, as with `p.f` today. Values need `*r`.
 - **`&place` in any position is now a tracked reference.** `let r = &x;` is safe and checked; today it is a raw `*T`. A reference converts to a raw `*T` implicitly wherever `*T` is expected, which is safe because raw dereference stays unsafe.
 - **Legacy `*T` parameters.** A non-`mut` `p: *T` parameter of a safe function is accepted through 0.17 as `&mut T` and checked as one. The bootstrap needs this: 0.17's compiler source is compiled by 0.16, which has no `&mut`, and it uses `*IntVec`/`*i64` parameters about 540 times. `fix --values` rewrites them. From 0.18, after the compiler has migrated, `*T` parameters are raw.
+  - A `mut p: *T` parameter, any `*T` parameter of an `unsafe fn`, and C's are raw in 0.17 (today's rule: `mut` makes a pointer parameter raw). What they mean under references is open: V4 (§7).
+  - At a call, the loan an argument `&x` (or `&mut x`) takes is the parameter's kind, not the spelling: `&x` to a legacy `*T` parameter is an exclusive loan, as agents write it today (§"Pending: eval findings").
 
 ### 2.4 Views: second-class, with two-level origins and inferred summaries
 
@@ -745,6 +775,15 @@ Steps 1, 2 and 4 passed. Step 3 failed the gate on the eval solutions (3.4%), wh
 - **V2. The check-time budget is 8% of the type checker, not 5%** (§4). 5% needs further work beyond the lean two-level pass, and T2 can do it if compile speed must win here.
 - **V3. The fallback if summaries slip:** view conflicts that come only from a non-inferred summary become warnings in 0.17.0 (§6). The alternative is to hold 0.17.0 for T3.
 
+**Open, for the user (new on 2026-10-16):**
+- **V4. What `mut p: *T` parameters mean under references.** Today a non-`mut` `*T` parameter is a borrow (safe to dereference) and a `mut` one is raw: `mut` there means "a pointer I will move or do arithmetic on", not "I write through it". The legacy rule (§2.3) makes the first `&mut T` in 0.17; Phase 0 keeps the second raw and settles nothing else. The options:
+  - (a) **Raw, always** (today's meaning, Phase 0's): `mut p: *T` is unchecked, its dereferences need `unsafe`, and passing `&x` to it takes no loan. Simple and sound, but the same spelling with and without `mut` means a checked and an unchecked parameter, and `mut` is the word agents add when a write fails to compile.
+  - (b) **`&mut T` whose binding can be reassigned**, like a non-`mut` one: `mut` only makes the local rebindable (`p = p.next`). Uniform, but a rebound `p` holds a different loan, which the walk must track (a reborrow of whatever is assigned), and today's raw-pointer walks over linked structures become errors.
+  - (c) **Rejected in safe functions from 0.17.1**, with a `try:` that writes `p: &mut T` (and `let mut q = p;` inside) or `unsafe fn`: no meaning to learn, and `fix --values` rewrites the corpus's cases. The cost is churn in tests and the compiler, which uses `mut` pointer parameters for cursor-style loops.
+  - (d) **Deprecated with 0.18's rule** (all `*T` parameters raw): `mut` stops mattering because every `*T` parameter is raw, and references are spelled `&`/`&mut`. This defers the question to the compiler's migration.
+
+  *Phase 0 implements (a)*, the current semantics, as kinds.tach's `param_mode` (`P_RAW`). Whichever the user picks changes that one function and the guide.
+
 **Decided here** (each can be revisited):
 - drops at scope end in reverse order (not at last use);
 - plain/owned is structural, with no Copy derive;
@@ -784,6 +823,61 @@ Checked against the prototype (Revision 1):
 - U3: not measured (0.17.1).
 - **U4: kept, with a condition for the user.** Errors in 0.17.0 are right only if inferred summaries (V1) ship in 0.17.0. Under the first version's one-region rule, 3.4% of agent-written functions would have been rejected wrongly. If T3 slips, apply V3, warnings for summary-only conflicts, or hold the release.
 
+
+Decided by the user on 2026-10-16:
+- **V1: infer view summaries** (`views(...)`, `stores(...)`), pinned by `#[views]`.
+- **V2: the budget is 8%** of the type checker.
+- **V3: if summaries slip**, view conflicts that come only from a non-inferred summary are warnings in 0.17.0.
+- **U1–U4 confirmed** as taken.
+- **The night's surface changes are approved** (grammar.md, "Additions of 0.17: familiar forms"): `&mut x`, which parsed as `&x`, gets its tracked meaning in Phase 0, consistently with what agents write today (`&x` to a legacy `*T` parameter is still accepted, as an exclusive loan); `p[i]` on a pointer to a Vec, Buf or slice indexes the pointee; paths in code resolve like `use` lines.
+- **`mut` pointer parameters are to be addressed explicitly later**: V4 in §7. Phase 0 implements the legacy `*T` rule as written and keeps `mut p: *T` raw.
+
+## Phase 0 contract (2026-10-16, branch c17-phase0)
+
+Phase 0 fixed the interfaces below; T1–T6 build against them in parallel. A task changes only the files it owns; a change to a fixed signature, to `state.tach`'s layout or to `walk.tach`'s traversal goes through the lead. These are the tasks' briefs.
+
+**What Phase 0 contains** (commits "References", "front/own", "std: Drop ..."):
+- **References.** `&T`, `&mut T` are pointer types whose `b` is `REF_SHARED`/`REF_MUT` (types.tach: `ref_to`, `ref_kind`, `is_ref`, `decay_ref`); `&mut [T]` is a slice whose `b` is `REF_MUT` (`mut_slice_of`, `is_mut_slice`); `&[T]` is `[T]`. `&place` is `&T`, `&mut place` is `&mut T` (`NODE_REF_MUT` on the Unary node); a local holding one is a borrow, safe to read through. Where a type is expected, `check_mode::coerce_ref` converts a reference to a raw `*T` (and `&&T` to `**T`), `&mut T` to `&T`, `&mut [T]` to `[T]`, and a reference to a slice to the slice. `&x` where `&mut T` is wanted is a type error whose `try:` is `&mut x`.
+  - *Deviation:* a place reached through a raw pointer still gives a raw `*T` (`&(*p).f`); `&*p` gives a reference. This keeps today's unsafe code compiling.
+  - *Deviation:* a type argument inferred from a reference is its raw type (`decay_ref` in `unify`): references as type arguments are 0.17.1's.
+  - Not in Phase 0: writes through `&T` and `[T]` are still accepted (U2's read-only rule is T2's `own.readonly`); `-> &T` results are not rejected yet (T2: an `own.escape` until 0.17.1's projections).
+- **The prelude** (compiler/std/values.tach, appended after alloc.tach): `Drop` (`fn drop(self: &mut Self)`), `drop`, `forget`, `needs_drop` (returns false until T1 folds it), `Copy` (an intrinsic bound: plain types only, `traits::intrinsic` through `kinds::is_plain_type`); `std::Default`, `std::replace`, `std::take<T: Default>`. Drops do not run and nothing moves yet.
+- **`#[views(a, *b)]` and `#[stores(c)]`**: two attributes (the text form `views(..) stores(..)` maps to them one to one), parsed into EffectSet nodes of form `VIEWS_FORM`/`STORES_FORM` (`attrs::VIEWS_OF`), stored as `FnInfo.views_decl`, checked against the parameter names in every mode (`own.views`).
+- **`--values=off|report|warn|error`** (`own::values_option`, diag.tach `OWN_MODE`). `report` is the default until T7; it records findings and walks only when they are printed (`--values=report`). The query cache's file is keyed by the mode, and `check --values=report` does not use the cache.
+- **Cost.** With every event a stub, the walk costs 7.3–8.1 ms against a check of 76–82 ms on the self-compile (load 16–22): **about 10% of the checker**, 6,376 functions, 375,519 node visits, 4,868 loop rounds. That is the traversal itself, already over V2's 8%: T2 owns the budget (§4) and must find time in the traversal (a per-function pre-filter, cheaper places), not only in the events. By default (`report`, not printed) the pass costs nothing.
+- **Tests:** `own_refs`, `err_own_refs`, `own_prelude`, `err_own_copy_views`, `err_own_views_attr`, `own_parser_views` (clean under `--values=error`; must stay clean), `own_drop_order` (XFAIL until T1), `own_report_basics` (XFAIL until T1 and T2); tests/refactor/run.sh `own_report_compiler` (compiler/src is clean under `--values=report`).
+
+**The fixed interfaces** (front/own/):
+
+| file | fixed |
+|---|---|
+| `mod.tach` | `check_own()` (after the effects, then `exit_if_errors`), `values_option(arg) -> bool`, `is_values_option` |
+| `kinds.tach` | `type_kind(t)` with `K_OWNED`, `K_VIEW`, `K_NEEDS_DROP`, `K_LEVEL2` (0: plain); `is_plain_type`, `is_owned_type`, `is_view_type`, `owned_base_type`, `has_drop_impl`, `view_elem(t)` (0 none, -1 several), `kind_word`; `param_mode(f, i)` → `P_VALUE`, `P_SHARED`, `P_MUT` (incl. the legacy rule), `P_RAW`, `P_VIEW`, `P_MUT_VIEW`; `mode_borrows`, `mode_writes` |
+| `state.tach` | places (`local_place`, `root_place(l, inner)`, `static_place`, `child_place`, `TUPLE_FIELD`, `PL_*`, `PL_MASK`, `STATIC_MASK`, `PL_OVERFLOW`); slots (`slot_for`, `slot_of_local`, `slot_of_place`, `SLOT_LOCAL`, `SLOT_PARENT`, `SLOT_CAP`/`SLOT_OVERFLOW`); bitsets (`set_bit`, `clear_bit`, `get_bit`, `any_and`, `or_into`, `or_expanded`, `is_empty`); the pool (`alloc`, `at`, `POOL_TOP` as a stack); the state (`CUR`, `S_MOVED`, `S_DMOVED`, `S_SLOTS`, `OV`, `SW`, `slot_off`, `slot_flags`, `F_INVALID`/`F_STATIC`/`F_SCOPE`, `new_state`, `copy_state`, `join_state`, `same_state`, `moved_bits`, `dmoved_bits`); origins (`new_ov`, `l1`, `l2`, `ov_or`, `ov_copy`, `ov_clear`, `ov_inner`, `ov_hits`); pending arguments (`PEND`, `PE` words: `PE_KIND`, `PE_PLACE`, `PE_OV`, `PE_INVALID`, `PE_BY`, `PE_NODE`, `PE_MODE`; kinds `PK_NONE`, `PK_SHARED`, `PK_RESERVE`, `PK_MUT`, `PK_VIEW`, `PK_MUT_VIEW`, `PK_RAW`) |
+| `walk.tach` | `walk_fn(f, round) -> ViewSummary`; the events `ev_read(p, n)`, `ev_write(p, n, how)` (`W_WRITE`, `W_MOVE`, `W_DROP`, `W_MUT_BORROW`), `ev_move(p, n, how)` (`MO_PLACE`, `MO_INDEX`, `MO_DEREF`, `MO_STATIC`), `ev_init(p)`, `ev_drop(l, d)`, `ev_borrow(p, n, kind, raw, dst)`, `ev_value(p, n, ty, dst)`, `ev_bind(l, n, v)`, `ev_assign(p, n, v)`, `ev_scope(mark, v, tail)`, `ev_call(n, f, base, dst)`, `ev_result(e, v)`; what the walk exposes: `CUR_F`, `PARAM_LOCALS`, `BOUND`, `DEFS`, `NO_MOVE`, `IN_DEFER`, `PO_DEREF`/`PO_INDEX`/`PO_RAW`/`PO_INNER`/`PO_VIEWSLOT` |
+| `summary.tach` | `struct ViewSummary { ret: [i64; 4], sto: [i64; 4], top: bool, declared: bool }` indexed by `S_L1_P`, `S_L1_STAR`, `S_L2_P`, `S_L2_STAR` (bit i: parameter i); `summary_of(f)`, `summary_store(f, s)`, `declared_summary`/`parse_views_attr(f)`, `ret_parametric(f)`, `summary_text(out, f, s)` (*deviation:* it takes f, for the names), `collect_begin(f, round)`, `collect_result(e, v)`, `collect_end(f) -> ViewSummary`, `validate_views_decls()` |
+| `diag.tach` | the codes `OWN_MOVED`, `OWN_MOVE_OUT`, `OWN_PARTIAL`, `OWN_CONFLICT`, `OWN_ESCAPE`, `OWN_STATIC`, `OWN_VIEWS`, `OWN_DROP_VIEW`, `OWN_READONLY` (new: a write through `&T` or `[T]`); `own_begin(n, code)`, `own_str`, `own_bytes`, `own_sym`, `own_type`, `own_pos`, `own_help`, `own_help_bytes`, `own_try(cmd)`, `own_end()`, `own_error(n, code, msg, other)`; `own_flush`/`own_discard` (the driver's: findings wait until the walk that made them is kept); `OWN_MODE`, `MODE_*` |
+| `observe.tach` | `own_state_at(out, pos) -> bool` |
+| ast.tach | `NODE_REF`, `NODE_REF_MUT`, `FN_VIEWS_DECL`, `DEFER_IMPLICIT` (a Defer made for a drop, its `b` the binding), `BLOCK_DROPS_DONE` |
+| tools | `tools/query/values.tach`: `def_kind_text`, `def_views_text`, the cache's two texts per definition (`C_OWN_TEXT`, version 6); `tools/explain/own_table.tach`: the `explain own.*` entries |
+
+**The tasks:**
+
+| task | owns | fills | must not change |
+|---|---|---|---|
+| T1 moves and drops | front/own/{moves, drops (new), glue (new)}.tach; the drop hooks in check/body.tach (`check_block`, `check_function`, `check_defer`); `needs_drop`'s folding; values.tach's `drop`/`forget` bodies | `moves::on_fn`, `on_read`, `on_move`, `on_init`, `on_drop` over `moved_bits`/`dmoved_bits`/`PL_MOVED_BY`; implicit defers (`DEFER_IMPLICIT`), glue, drop flags, owned temporaries, the assignment desugaring, `match` binding modes through references; `own.moved`, `own.move_out`, `own.partial`, `own.drop_view`; removes `own_drop_order`'s XFAIL | walk.tach, state.tach's layout, views/calls/summary |
+| T2 views and exclusivity | front/own/{views, calls, observe}.tach; closures/escape.tach (subsumed) | every `views::on_*`, `calls::on_call` (pending conflicts, two-phase, stores, the type filter at calls, `global`), parameter roots in `on_enter`, reborrows (`on_let`, and a `&mut` reference local passed to a parameter is an implicit reborrow, not a move), `for` loans (`on_for_alias`), escapes; `own.conflict`, `own.escape`, `own.static`, `own.readonly`; `own_state_at`; **the cost budget**, traversal included; `own_report_basics`' views half | moves.tach, summary.tach's types, the walk's traversal (asks the lead) |
+| T3 summaries | front/own/{summary, infer (new)}.tach; the driver in `check_own` (SCC order, the fixed point, `own_flush` only from the final round); `query views`, `--print-views` | `collect_result`, `collect_end`, `summary_store`; inference callees first over the effects' SCCs (effects must then be inferred whenever the own pass walks: `EFFECTS_WANTED` is false at -O0); checks `#[views]` against bodies (`own.views`); why-chains; `def_views_text` used by def/show/context | `ViewSummary`'s fields, `summary_of`'s contract (declared > inferred > floor > top) |
+| T4 std | compiler/std/*.tach (values.tach included) | Drop impls (Vec, Buf, HashMap, Arena), consuming `free`, `Default` impls (an empty container needs its allocator: `take` on `Vec<T, Arena>`, or a `take` that keeps it, is T4's call), `as_mut_slice`, `swap`, `sort(&mut [T])`, `&T` receivers, `#[views]` pins | the prelude's names and signatures |
+| T5 optimizer | middle/{copies, gvn, licm, vectorize, inline}.tach | noalias/readonly only when `OWN_MODE == MODE_ERROR` and no own error | front/own |
+| T6 tools and guide | tools/*, compiler/guide/*, tools/explain/own_table.tach | `query own`, the explain entries' fixes and examples, `fix --values` (incl. rule 2: `&x` to `&mut x` where the parameter became `&mut`), fmt, `refactor signature`/`field` with `&`/`&mut`, tests/own-try, the guide (memory, unsafe, rust, errors, core; a `views` topic) | front/own's diagnostics' text contract (§2.9) |
+| T7 migration | tests/, examples/, bench/, tests/agent-eval | `fix --values` applied; the default `--values=error` | — |
+
+**Found while building Phase 0 (for the tasks and the user):**
+- **The skeleton alone is over the budget** (about 10% of the checker, above). V2's 8% now has to be met by T2 with a cheaper traversal, or V2 revisited.
+- **`&mut` moves (§2.1), but agents pass one reference local many times** (§"Pending: eval findings"). Passing a `&mut` local to a parameter must be an implicit reborrow (T2), or it reintroduces the `error[unsafe]` family as `own.moved`.
+- **`Default` for containers carries an allocator.** `std::take(&mut self.keys)` needs an empty `Vec<T, A>`; `Gpa` is zero-sized, an arena handle is not. T4 decides between `A: Default` (no `take` on arena containers) and a container-specific `take`.
+- **Kinds can be asked during type checking** (the `Copy` bound) before a closure's captures are known; `type_kind` memoizes by type id, so T1 must make sure closure kinds are computed after `finish_closure`, or not memoized before.
 
 ## 8. Prototype results (§6, branch c17-proto, 2026-10-15)
 
