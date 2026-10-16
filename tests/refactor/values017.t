@@ -4,8 +4,10 @@
 ## [T]`; owned parameters only read `&T` (total, count, first; keep
 ## returns its own, so it stays); the calls follow, and the program's
 ## output is the same. Kept: a raw walk, `**T`, a closure's parameters, a
-## function used as a value.
-$ main.tach -o prog
+## function used as a value. (T7: the program before the fix is 0.16
+## code, which the default --values=error rejects: it is built with the
+## opt-out, 0.16's semantics.)
+$ --values=off main.tach -o prog
 % ./prog
 3 3 0 6 0 0 1 9 12
 $ fix --values

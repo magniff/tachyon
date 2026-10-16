@@ -382,11 +382,12 @@ defined, is the same list: every pointer it hands to safe code as a
 borrow points to live memory of its type, and every slice it makes is
 valid for its length while it is used. The same holds for memory a
 slice views: a slice of an array is valid while the array lives, and one
-from `Vec::as_slice` until the vector grows or is freed (tachyon has no
-lifetimes; using a view after its storage is gone is the one way safe
-code can still reach undefined behaviour, and std's types assume their
-fields are changed by their methods only, as tachyon has no private
-fields yet). A view need not have a name: a slice argument (or a
+from `Vec::as_slice` until the vector grows or is freed. Until 0.17,
+using a view after its storage was gone was the one way safe code could
+still reach undefined behaviour; from 0.17 the own pass rejects it under
+`--values=error`, the default (its opt-outs `warn`, `report` and `off`
+do not; std's types also assume their fields are changed by their
+methods only, as tachyon has no private fields yet). A view need not have a name: a slice argument (or a
 receiver taken by value) is a copy made before the later arguments run
 (`take(v.as_slice(), grow(&v))`); the base of an index that is not a
 place, before its index (`v.as_slice()[grow(&v)]`); and `for x in v`,
@@ -1530,6 +1531,19 @@ is wanted is an error naming `&mut x`. A place reached through a raw
 pointer still gives a raw pointer (`&*p` gives a reference). Function
 attributes `#[views(a, *b)]` and `#[stores(c)]` declare a view summary.
 (Phase 0: what the own pass checks of them comes with its tasks.)
+
+**Moves, drops and the checks** (value semantics, T1–T3, T7;
+[design/value-semantics.md](design/value-semantics.md) §2). A value of
+an owned type (a `Vec`, `Buf`, `HashMap`, a type with `Drop`, a struct
+holding one) moves on `=`, a by-value argument and `return`, and is
+dropped at the end of its scope; views (slices, references) cannot
+outlive or alias against what they view. These checks and the drops are
+on by default: `--values=error` (the default since T7, which moved the
+tests, examples and evals over with `tachyonc fix --values`).
+`--values=warn` and `--values=report` keep 0.16's semantics (no drops)
+and only warn or list; `--values=off` turns the pass off. They are
+opt-outs for 0.17 only. `defer v.free()` stays legal (`free` frees now
+and leaves the container empty) and is no longer needed.
 
 **The prelude** gains `Buf`, `HashMap`, `read_line`, `read_stdin_in`,
 `Scanner`, `parse_int`, `trim`, `split_in`, `split_whitespace_in`,

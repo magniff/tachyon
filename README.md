@@ -18,11 +18,11 @@ struct Point { x: f64, y: f64 }
 enum Shape { Circle(Point, f64), Rect(Point, Point), Empty }
 
 trait Area {
-    fn area(self: *Self) -> f64;
+    fn area(self: &Self) -> f64;
 }
 
 impl Area for Shape {
-    fn area(self: *Shape) -> f64 {
+    fn area(self: &Shape) -> f64 {
         match *self {
             Shape::Circle(_, r) => 3.14159 * r * r,
             Shape::Rect(a, b) => (b.x - a.x) * (b.y - a.y),
@@ -123,10 +123,13 @@ by zero is defined (`x / 0 == 0`), shifts and float-to-integer
 conversions are defined, indexing and slicing are bounds-checked (exit
 code 101 with a message), and there are no uninitialized variables. Raw
 pointer dereference, calls into C and union reads are allowed only inside
-`unsafe`; `--check-unsafe` checks those accesses at run time. One gap
-remains, documented: a slice used after its storage is freed (tachyon has
-no lifetimes yet; 0.17 closes it). See "Undefined behaviour" in
-[docs/grammar.md](docs/grammar.md).
+`unsafe`; `--check-unsafe` checks those accesses at run time. Since
+0.17, value semantics close the last gap without lifetime annotations:
+owned values move and are dropped at the end of their scope, references
+(`&T`, `&mut T`) and slices are checked so that none outlives or is
+invalidated under what it views (aliasing XOR mutation). See
+"Undefined behaviour" in [docs/grammar.md](docs/grammar.md) and
+`tachyonc guide memory`.
 
 **Every name is traceable.** There are no wildcard imports: every name a
 file uses is declared there, imported by name, or written with its path,

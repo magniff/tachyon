@@ -4,7 +4,7 @@ Allocation is explicit: nothing allocates without being given an
 allocator. A program's general-purpose allocator is the `gpa: Gpa` its
 `main` takes; a function that allocates takes one as a parameter, or
 works on a container it was given (a `Vec` holds its allocator: `push`,
-`clone` and `free` use it). There is no global allocator to reach for,
+`clone` and its drop use it). There is no global allocator to reach for,
 so a function's signature says whether it allocates.
 
 ## Gpa, from main
@@ -16,21 +16,19 @@ fn squares(n: i64, gpa: Gpa) -> Vec<i64> {   // allocates: takes the allocator
     v
 }
 
-fn total(v: *Vec<i64>) -> i64 {              // grows nothing: no allocator
+fn total(v: &Vec<i64>) -> i64 {              // grows nothing: no allocator
     v.iter().sum()
 }
 
 fn main(gpa: Gpa) -> i32 {                    // or main(argc, argv, gpa)
     let mut v = squares(4, gpa);
-    defer v.free();
     v.push(100);                              // the Vec's own allocator
     let mut b = Buf::new_in(gpa);
-    defer b.free();
     b.push_int(total(&v));
     let words: Vec<i64> = (1..4).map(|x| x * 10).collect_in(gpa);
     println(f"{b.as_slice()} {words:?}");
     0
-}
+}                                             // words, b, v dropped: freed
 ```
 ```out
 114 [10, 20, 30]
@@ -68,7 +66,7 @@ bytes). Code generic over the allocator names it; code that only reads
 takes a slice:
 
 ```tach
-fn fill<A: Allocator>(v: *Vec<i64, A>, n: i64) {
+fn fill<A: Allocator>(v: &mut Vec<i64, A>, n: i64) {
     for i in 0..n { v.push(i); }
 }
 
@@ -78,8 +76,7 @@ fn sum(s: [i64]) -> i64 {                     // any Vec's as_slice()
 
 fn main(gpa: Gpa) -> i32 {
     let mut v: Vec<i64> = Vec::new_in(gpa);
-    defer v.free();
-    fill(&v, 5);
+    fill(&mut v, 5);
     println(sum(v.as_slice()));
     0
 }
@@ -98,7 +95,8 @@ An arena allocates by bumping a pointer and frees everything at once.
 `arena_scope(gpa, |a| ...)` makes one (its memory from `gpa`), runs the
 closure with it, and frees all of it when the closure returns; nothing allocated from it may leave
 the closure (the compiler rejects a result or a capture that holds the
-`ScopedArena`). `Arena::new_in(gpa)` is a handle kept longer,
+`ScopedArena`). `Arena::new_in(gpa)` is a handle kept longer (it does
+not drop yet: `unsafe { a.free_all(); }` returns its memory, 0.17),
 `a.scope(|s| ...)` a scope of it; `FixedBuf::new(mem)` allocates from memory you give it.
 
 ```tach
@@ -121,5 +119,5 @@ allocated and freed; leaks are listed at exit (`gpa.check_leaks()` in a
 test). Arenas and `FixedBuf` are checked the same way: a block
 used after their `reset`, after its scope ended, or after it moved is
 reported. Views (`as_slice()`, a `[T]`) into memory that was freed or
-moved are the one hole left in safe code (0.17 closes it); this mode is
-how to find one.
+moved are rejected in safe code since 0.17 (`tachyonc guide views`);
+this mode still finds them in `unsafe` code and under `--values=off`.

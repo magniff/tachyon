@@ -9,7 +9,7 @@ family, and `#[derive]`.
 whose type has `Display` (`{expr:?}`: `Debug`). It is a value too (an
 `std::Interp`), passed to anything taking `T: Display`: `print`,
 `println`, `eprint`, `eprintln` (stderr), `format` (a new `Buf`, the
-caller frees it), `b.push_fmt(..)` (appends to a `Buf`; 0.17:
+caller owns it), `b.push_fmt(..)` (appends to a `Buf`; 0.17:
 `b.push_str(f"..")` is the same call), `f.write(..)` (inside a Display
 impl). A plain `"..."` never formats: `"{x}"` is
 those three bytes (a literal holding `{name}` of a local passed to
@@ -40,8 +40,7 @@ fn main(gpa: Gpa) -> i32 {
     println(f"{name} has {n} and {x}");
     println(f"[{n:>6}] [{n:<6}] [{n:06}] [{n:x}] [{n:X}] [{n:b}]");
     println(f"[{name:>9}] [{x:.3}] [{'A':c}] {{braces}} {n * 2 + 1}");
-    let mut s = format_in(f"{n}-{n + 1}", gpa);   // a Buf
-    defer s.free();
+    let s = format_in(f"{n}-{n + 1}", gpa);       // a Buf, dropped at the end
     eprintln(f"to stderr: {s.as_slice()}");
     0
 }
@@ -118,7 +117,6 @@ fn main(gpa: Gpa) -> i32 {
     let shapes = [Shape::Circle(3), Shape::Rect(p, q), Shape::Line { from: p, len: 4 }, Shape::Empty];
     for s in shapes { println(f"{s:?}"); }
     let mut v: Vec<i64> = Vec::new_in(gpa);
-    defer v.free();
     v.push(1);
     v.push(2);
     println(f"{v:?} {v.last():?} {"hi":?}");
@@ -159,10 +157,9 @@ tuples of them) is a copy. `Clone` is in std for `Vec` (deep), `Buf`,
 struct Key { group: i64, id: i64 }
 
 fn main(gpa: Gpa) -> i32 {
-    let keys = [Key { group: 2, id: 1 }, Key { group: 1, id: 9 }, Key { group: 1, id: 3 }];
-    sort(keys[..]);                          // by group, then id
+    let mut keys = [Key { group: 2, id: 1 }, Key { group: 1, id: 9 }, Key { group: 1, id: 3 }];
+    sort(&mut keys[..]);                     // by group, then id
     let mut m: HashMap<Key, i64> = HashMap::new_in(gpa);
-    defer m.free();
     for k in keys { m.insert(k, k.id * 10); }
     let wanted = Key { group: 2, id: 1 };
     println(f"{keys[0]:?} {m.get(wanted):?}");
