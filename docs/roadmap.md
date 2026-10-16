@@ -965,9 +965,8 @@ Moved to 0.17.1:
   solutions as agents wrote them, 14 of 18 are rejected under the new
   default (written `[T]` in 9 tasks, handle moves, views of leaked Bufs,
   ledger's two `get_mut`, legacy `*T` conflicts);
-- open for the user, V4 (design §7): what `mut p: *T` parameters mean
-  under references (raw as today, a rebindable `&mut T`, rejected in safe
-  code, or 0.18's all-raw rule).
+- V4 (design §7), decided by the user on 2026-10-16: every `*T` becomes
+  raw in 0.18.1 (see 0.18).
 
 ## 0.18: contracts and verification in the language
 
@@ -992,6 +991,12 @@ Moved to 0.17.1:
   already serves the query tools
 - the language specification waits for 0.23 (see "After 0.23: the
   specification")
+- 0.18.1: once compiler/src has migrated to `&`/`&mut` (with the
+  compiler-on-values work above), the legacy rule that a non-`mut` `*T`
+  parameter is accepted as `&mut T` is removed (V4 in
+  docs/design/value-semantics.md §7, decided by the user on 2026-10-16):
+  from then on every `*T` is a raw pointer, as Rust's are (a dereference
+  needs `unsafe`), `mut` or not, and borrowing is only `&` / `&mut`
 
 ## After 0.18: a standard library, and a real program on it
 
