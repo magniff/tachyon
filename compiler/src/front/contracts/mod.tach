@@ -12,19 +12,20 @@ pub mod sites;
 pub mod diag;
 pub mod flags;
 
-use crate::base::{IntVec, buf_fmt, buf_new, buf_slice, cstr, free, sym_text};
+use crate::base::{IntVec, SRC, buf_fmt, buf_new, buf_slice, cstr, free, sym_text};
 use crate::base::diag::{err_begin, err_fmt, err_help, err_str, err_try_tool};
 use crate::front::ast::{NODES, NodeKind, child};
-use crate::front::check::Res;
+use crate::front::check::{LOCALS, Res};
 use crate::front::contracts::checks::{
     CHECK_FN, CHECK_KIND, CHECK_OWNER, CHK_ENSURES, CHK_INVARIANT, CHK_REQUIRES,
 };
-use crate::front::contracts::diag::{CONTRACT_EFFECT, end_with_code};
+use crate::front::contracts::diag::{CONTRACT_EFFECT, CONTRACT_OLD, end_with_code};
 use crate::front::contracts::expand::subtree;
 use crate::front::effects::{
     ALLOC_ANY, EFF_GLOBAL, EFF_IO, EFF_UNKNOWN, FN_EFFECTS_COUNT, fn_effects,
 };
-use crate::front::types::FNS;
+use crate::front::own::kinds::{is_owned_type, is_view_type};
+use crate::front::types::{FNS, err_type};
 
 // A clause's kind (CLAUSE_KIND), with CLAUSE_DEBUG for `debug requires ...`.
 pub const CLAUSE_REQUIRES: i64 = 1;
@@ -122,11 +123,13 @@ pub fn test_kind(item: i64) -> i64 {
 // a passing check must not change what the program does, and turning
 // `debug` clauses on and off must not either), from the inferred effects
 // of what it calls (contract.effect). Called by check_program after the
-// effects. (The conditions' types and names were checked with the
-// functions expand.tach made of them.)
+// effects. (0.18, with 0.17's values) An ensures reads no moved
+// parameter and keeps no view in an old(..) (contract.old). (The
+// conditions' types and names were checked with the functions expand.tach
+// made of them.)
 pub fn check_contracts() {
     unsafe {
-        if CHECK_CALLS.count == 0 || FN_EFFECTS_COUNT == 0 {
+        if CHECK_CALLS.count == 0 {
             return;
         }
         let mut seen = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -144,11 +147,63 @@ pub fn check_contracts() {
             if kind != CHK_REQUIRES && kind != CHK_ENSURES && kind != CHK_INVARIANT {
                 continue;
             }
-            if impure(child(call, 0), check) {
+            if kind == CHK_ENSURES && ensures_values(child(call, 0), check) {
+                seen.push(check);
+                continue;
+            }
+            if FN_EFFECTS_COUNT != 0 && impure(child(call, 0), check) {
                 seen.push(check);
             }
         }
         free(seen.data as *u8);
+    }
+}
+
+// (0.18, with 0.17's values) contract.old in the ensures condition at n
+// (of check `check`), reported once: the condition runs after the body,
+// so a by-value parameter of an owned type is gone (the body took it),
+// and an `old(e)` that views something would see what the body changed.
+// Generic instances are left to the own pass, which rejects both too.
+fn ensures_values(n: i64, check: i64) -> bool {
+    unsafe {
+        if n <= 0 || NODES[n].kind == NodeKind::Closure {
+            return false;
+        }
+        if NODES[n].kind == NodeKind::Ident && NODES[n].res == Res::Local {
+            let l = NODES[n].y;
+            let name = sym_text(LOCALS[l].name);
+            let ty = LOCALS[l].ty;
+            let owner = sym_text(NODES[CHECK_OWNER.data[check]].a);
+            if name.len > 4 && name[0..4] == "?old" && ty > 0 && is_view_type(ty) {
+                err_begin(NODES[n].start);
+                err_fmt(
+                    f"'{SRC[NODES[n].start..NODES[n].end]}' keeps a view: the ensures of '{owner}' runs after the body, which may change what it views");
+                err_help(
+                    c"take a plain part at entry (`old(x.len())`), or a copy (`old(x.clone())`)");
+                end_with_code(CONTRACT_OLD);
+                return true;
+            }
+            if LOCALS[l].is_param && ty > 0 && is_owned_type(ty) {
+                err_begin(NODES[n].start);
+                err_fmt(f"the ensures of '{owner}' reads '{name}' after the body took it ('");
+                err_type(ty);
+                err_str(c"' is owned, passed by value)");
+                err_help(c"read it at entry, `old(x.len())` or `old(x.clone())`, or take it by reference (`x: &T`)");
+                end_with_code(CONTRACT_OLD);
+                return true;
+            }
+        }
+        for k in 0..3 {
+            if ensures_values(subtree(n, k), check) {
+                return true;
+            }
+        }
+        for i in 0..NODES[n].count {
+            if ensures_values(child(n, i), check) {
+                return true;
+            }
+        }
+        false
     }
 }
 

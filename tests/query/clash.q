@@ -55,9 +55,9 @@ pub struct Point {
 $ def len
 crate::geom::V2::len	clash/geom.tach:15:12	method	pub fn len(self: *V2) -> i64	effects: none
 crate::myvec::Vec::len	clash/myvec.tach:11:12	method	pub fn len(self: *Vec) -> i64	effects: none
-std::Vec::len	../../compiler/std/std.tach:157:12	method	pub fn len(self: &Vec<T, A>) -> i64
-std::Buf::len	../../compiler/std/std.tach:447:12	method	pub fn len(self: &Buf<A>) -> i64
-std::HashMap::len	../../compiler/std/std.tach:1131:12	method	pub fn len(self: &HashMap<K, V, A>) -> i64
+std::Vec::len	../../compiler/std/std.tach:161:12	method	pub fn len(self: &Vec<T, A>) -> i64
+std::Buf::len	../../compiler/std/std.tach:463:12	method	pub fn len(self: &Buf<A>) -> i64
+std::HashMap::len	../../compiler/std/std.tach:1147:12	method	pub fn len(self: &HashMap<K, V, A>) -> i64
 $ refs V2::len
 # clash/geom.tach
 15:12	def	pub fn len(self: *V2) -> i64 {
@@ -127,8 +127,8 @@ $ refs crate::shapes::Area
 13:6	type	shapes	impl Area for Square {
 $ def push
 crate::myvec::Vec::push	clash/myvec.tach:7:12	method	pub fn push(self: *Vec, x: i64)	effects: none
-std::Vec::push	../../compiler/std/std.tach:238:12	method	pub fn push(self: &mut Vec<T, A>, x: T)
-std::Buf::push	../../compiler/std/std.tach:451:12	method	pub fn push(self: &mut Buf<A>, b: u8)
+std::Vec::push	../../compiler/std/std.tach:242:12	method	pub fn push(self: &mut Vec<T, A>, x: T)
+std::Buf::push	../../compiler/std/std.tach:467:12	method	pub fn push(self: &mut Buf<A>, b: u8)
 $ refs Vec::push --count
 2	crate::myvec::Vec::push
 9	std::Vec::push
