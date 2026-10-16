@@ -2200,7 +2200,7 @@ texts on to that thread measured no gain.
 `tests/threads_writes.sh` checks the groups: it lists every static that
 code reachable from `run_task` writes (by `query callees --transitive`
 and `query refs`; a mutating method call and an address taken count),
-71 of them, and every one must be in its table with the reason; then
+78 of them, and every one must be in its table with the reason; then
 the statics the join writes that task code reads or writes, 14, against
 a second table; then those -O0's assembler thread and its main thread
 share, 12, each on an internal error's path, under -g (which does not
@@ -2220,7 +2220,7 @@ words); the -j1 and -j4 objects are the same there too.
 `--quick`, with `tests/threads_writes.sh`): every program of the corpus
 at -O0, -O1 and -O2 compiled at -j1 and -j8 (the self-compile also at
 -j3, and with `TACHYON_FRESH_CONTEXTS=1`, and to assembly) must give the
-same object, the same output and the same exit: 2095 compilations. `TACHYON_PHASE_TIMES=1` prints each
+same object, the same output and the same exit: 2179 compilations. `TACHYON_PHASE_TIMES=1` prints each
 phase's wall time.
 
 **Measured** (aarch64-macos, the compiler compiling itself, `-c`, after
