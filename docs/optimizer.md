@@ -1947,3 +1947,91 @@ holes, specs, Debug, pointer holes, a push_fmt and a format_in over 256
 bytes that write twice), `fmt_direct_ir` (no closure, Interp or
 instance at -O0), `fmt_direct_err`, `checkalloc_fmt_direct`,
 `query/fstring017` (type, refs, effects), `opt_leaf_o1`.
+
+## 0.17: value semantics in the optimizer
+
+docs/design/value-semantics.md §4, "Optimizer work for zero cost" (task
+T5). What the own pass guarantees under `--values=error` becomes facts
+for the optimizer. Under `report` (the default until the migration) and
+`warn` the facts are unsound (`sweep(sa, sa)`), so nothing changes there.
+
+**Reference parameters** (middle/gvn.tach, "Reference parameters"). The
+facts come from the parameter types, and only when the own pass ran in
+error mode (`noalias_active`: `OWN_MODE == MODE_ERROR`; that mode stops
+the compilation at its first error):
+
+- a `&mut T` or `&mut [T]` parameter (exclusive) shares no memory with
+  another reference parameter or a static (`params_disjoint`, in
+  `may_alias`: gvn, licm, slp and the vectorizer get it);
+- a `&T` or `[T]` parameter (shared) is the same when the function writes
+  through it nowhere (a write through `[T]` is `own.readonly`'s; until
+  that is checked, such a parameter is left raw);
+- a reference parameter the function passes to no call and writes
+  nowhere is not written by its calls (`param_frozen`, in
+  `call_may_write`): its loads stay valid across calls;
+- legacy `*T` parameters stay raw: a raw pointer passed to one is not a
+  tracked loan. So do the parameters of exported functions and of
+  functions with C's convention (their callers are not checked).
+- the vectorizer emits no run-time overlap test between the groups of two
+  such parameters (vectorize/checks.tach, `needs_test`); fewer pairs
+  also keep a loop under VEC_MAX_OVERLAPS and lower its cost.
+
+*Inlining.* The facts are about a function's parameters, which inlining
+removes. A function is optimized before it is inlined, so its vector
+loops and hoisted loads keep what the facts gave; the exception was a
+`#[inline]` function, whose loop passes wait for its callers
+(`inlined_everywhere`). One whose reference parameters give facts (an
+exclusive one and another, `has_ref_facts`) now runs them first. Noalias
+scopes on the inlined body (per-instruction tags, so that the caller's
+own passes keep the facts) are left for later.
+
+`--no-noalias` turns the facts off; `--vec-stats` prints the vector loops
+made, the overlap tests emitted and those the facts dropped.
+
+**Measured** (aarch64-macos, `--values=error` against `--values=error
+--no-noalias`, bench/ programs migrated to `&mut [T]`/`[T]` parameters
+by hand; times are the best of 21 interleaved runs on a machine at load
+about 30, so a few percent is noise):
+
+| program | overlap tests | assembly lines | -O2 time |
+|---|---|---|---|
+| stencil (`sweep(src: [f64], dst: &mut [f64])`) | 4 → 0 | 345 → 282 | 13.2 → 13.9 ms (noise; the vector loop is unrolled twice as far) |
+| matmul (`multiply(a: [f64], b: [f64], c: &mut [f64])`) | 2 → 0 | 263 → 209 | 23.8 → 25.0 ms (noise) |
+| sort (std's `sort(s: [T])` writes through `[T]` until T4) | none | identical | 75.3 → 75.2 ms |
+| 8 streams, 3 written (18 pairs, over the limit of 16) | not vectorized → vectorized, 18 dropped | | 25.1 → 12.2 ms (**2.06×**) |
+
+As the prototype found (value-semantics.md §8.5), the overlap tests run
+once per outer iteration, so bench/ does not move; the facts pay in
+kernels with many streams and short trip counts.
+
+**Moves** (middle/copies.tach). Under `--values=error`, `let w = v` of an
+owned local is a move: the lowering notes its copy (`note_move_copies`,
+lower_let). The own pass guarantees v is not read before it is bound
+again, and in a loop it must be bound again before the next move; with
+every other use of v before the copy (as copy elision requires), v is
+written whole in each iteration before it is moved. So copy elision,
+which keeps away from copies in loops, elides a move in a loop too.
+Moving an argument without its copy at the call (§4's "Passing") is left
+for later: it needs the moves enforced (T1).
+
+**NRVO** (middle/copies.tach, `elide_result_copy`). A function returning
+a compound value through the result pointer, whose every return copies
+one local slot there (and nothing else touches the result), builds the
+local in the result: the copies go. The caller's result is a fresh slot
+(lower/calls.tach), which nothing else the function sees reaches. Only
+for copies over INLINE_COPY_MAX bytes (memcpy calls): smaller locals are
+scalar replacement's, which the result's memory would stop. A copy must
+end its returning block, so that a defer after it cannot reach the
+result. This does not depend on the own pass.
+
+**Drops.** Drop glue and std's `drop` impls are `#[inline]` (T1, T4), so
+`should_inline` inlines them everywhere, in cold blocks too; Gpa's free
+inlines to `free`, which heap_to_stack keeps working on.
+
+Tests: `opt_noalias_refs` (loads of a `&T` kept across a call and a store
+through a `&mut T`; a vector loop over `[f64]`/`&mut [f64]` with no
+overlap test and no scalar loop), `opt_noalias_gated` (overlapping slices
+and a `&T` written through a raw pointer, without `--values=error`: the
+test stays and the results are right), `opt_copy_move` (a move elided in
+a loop), `opt_nrvo` (the returned local built in the result; not with two
+locals; a defer after the return value).
