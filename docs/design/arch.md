@@ -1422,6 +1422,46 @@ the `AE_*` codes.
   `query`. `arch.feature_ambiguous` has no run test until an AArch64 aes
   intrinsic exists (T4).
 
+**T7 as built (branch a19-t7).** What T4 and T5 need to know:
+- `tests/arch/gen.sh` (`gen.awk`) writes one program per `# ---- Family
+  ----` section of each table (40 intrinsics at most): edges (every pair
+  of the first two inputs), mixed edges, `-r` random cases (2,000), every
+  8-bit value or pair, at run time; then constant edges and random lanes
+  (the folds); every value of a constant range below 16, else its ends,
+  middle and three more. Run at the suite's level (`tests/run.sh
+  arch-gen`; -O0 and -O2 without one); about 0.6 s for the 23 seeds, so
+  `--quick` and `--release` run the same.
+- **The semantics column is the reference** when it is `r[k] = E`, `r =
+  E`, `r = max|min|sum over k of E`, `S[I] = E` or uses `X[A..B]`
+  (compiler/arch/README.md, "Semantics"): integers below 64 bits in i64,
+  64-bit lanes in their own type, floats in f64; the result is `as` the
+  lane type. Saturating 64-bit semantics need an explicit form (`if a[k] >
+  b[k] { a[k] - b[k] } else { 0 }`). Opaque x86 types are bytes unless a
+  trailing note says `(i16 lanes)` or `(a, b: i16 lanes; r: i8 lanes)`.
+  Tuples are their lanes one after the other (`t[idx[k]]` over 32 lanes
+  for tbl2).
+- **Prose needs `fn ref_NAME`** in `tests/arch/ref/*.tach` (T4's:
+  `a64_*.tach`; shared ones: `crc.tach`, `movemask.tach`, `bits.tach`):
+  the intrinsic's parameters with vectors and slices as `[D]`, scalars
+  as `D`, constants and indexes as `i64`, a store's slice as `&mut [D]`,
+  then `k: i64` for a vector result; it returns lane k (or the value). An
+  intrinsic with neither, or of a type the generator does not know, fails
+  `arch-gen` with `error NAME: ...`. `cast` forms are compared by bytes;
+  `feat.*`, `hint` and `raw` memory forms are skipped.
+- `tests/fuzz/run.sh -A` (`genarch.awk`, the gate's `fuzz-arch`) draws
+  every register and `[u8]` memory intrinsic of the target's table whose
+  types are integer vectors of 8 or 16 bytes, `__m128i` or integer
+  scalars; floats, tuples and 256-bit types are not drawn yet.
+- `tests/objcheck.sh` checks the generated programs of the target's
+  architecture (with the portable one) as part of its corpus, so the
+  gate's `objcheck-x86-arch` covers every x86 intrinsic.
+- Fixed on the way: a memory intrinsic's bounds check now names the
+  index's position at -O1/-O2 as at -O0 (`middle/lower/arch.tach`,
+  `checked_address`'s `site`).
+- Not done: the KATs (AES, SHA: no such intrinsic yet; the CRC reference
+  is bitwise), `tests/run/opt_arch_*` beyond the seed, the container's
+  `TACHYON_ARCH_DISABLE` double runs (T3), the `#[property]` conversion.
+
 ## 8. Open questions
 
 - **O1. Latency and throughput in `query show`.** Useful for choosing
