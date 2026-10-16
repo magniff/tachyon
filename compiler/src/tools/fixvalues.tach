@@ -20,16 +20,19 @@
 // A call whose argument cannot be rewritten (a temporary to a `&T`, a
 // slice local to a `&mut [T]`) keeps its parameter as it is, and the fixed
 // point runs again. Left to hand (§5 rule 7): conflicts, views of statics,
-// trait methods taking `self: Self`. Rule 1 (deleting `defer x.free()`)
-// waits for drops (T1).
+// trait methods taking `self: Self`. Rule 1: `defer x.free();` of a Vec,
+// Buf or HashMap local of the same block is deleted, once the container
+// has a Drop (std's, T4): its drop frees it.
 
 use crate::base::{FILES, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_str, intern};
-use crate::front::ast::{FN_UNSAFE, NODES, NODE_COUNT, NODE_REF_MUT, NodeKind, child};
+use crate::front::ast::{
+    DEFER_IMPLICIT, FN_UNSAFE, NODES, NODE_COUNT, NODE_REF_MUT, NodeKind, child,
+};
 use crate::front::check::Res;
 use crate::front::lexer::Tok;
-use crate::front::modules::file_of_pos;
-use crate::front::own::kinds::is_owned_type;
-use crate::front::types::{FNS, FN_COUNT, REF_MUT, TYPES, TyKind, fn_param};
+use crate::front::modules::{STD_MODULE, file_of_pos};
+use crate::front::own::kinds::{K_NEEDS_DROP, is_owned_type, type_kind};
+use crate::front::types::{FNS, FN_COUNT, REF_MUT, STRUCTS, TYPES, TyKind, fn_param};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::edit::edit_replace;
 use crate::tools::query::defs::{DEFS, DEF_COUNT, K_IMPL_METHOD, K_TRAIT_FN, def_of_node};
@@ -77,8 +80,8 @@ static mut EDITED: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, coun
 static mut HAS_AS_MUT_SLICE: bool = false;
 
 // The counts, for the report: parameters to `&mut T`, to `&T`, to `&mut
-// [T]`, owned to `&T`; arguments rewritten.
-pub static mut VALUES_COUNTS: [i64; 5] = [0; 5];
+// [T]`, owned to `&T`; arguments rewritten; `defer x.free()` deleted.
+pub static mut VALUES_COUNTS: [i64; 6] = [0; 6];
 
 // The template's node of function f (an instance's flags are its
 // template's).
@@ -880,6 +883,128 @@ fn find_values() {
     }
 }
 
+// ---- rule 1: `defer x.free();` ----
+
+// Whether type t is std's Vec, Buf or HashMap (their drop is their free).
+fn std_container(t: i64) -> bool {
+    unsafe {
+        if t <= 0 || TYPES[t].kind != TyKind::Struct {
+            return false;
+        }
+        let s0 = TYPES[t].a;
+        let s = if STRUCTS[s0].tmpl != 0 { STRUCTS[s0].tmpl - 1 } else { s0 };
+        if STRUCTS[s].module != STD_MODULE {
+            return false;
+        }
+        let name = SYMS[STRUCTS[s].name].text;
+        // (and only once its drop frees it: std's Drop impls, T4; before
+        // them the defer is the only free)
+        (same(name, "Vec") || same(name, "Buf") || same(name, "HashMap"))
+            && (type_kind(t) & K_NEEDS_DROP) != 0
+    }
+}
+
+// The local `x` of a deferred `x.free()` (e: the deferred expression, or
+// a block of that one statement), or -1.
+fn freed_local(e: i64) -> i64 {
+    unsafe {
+        let mut c = e;
+        if c > 0 && NODES[c].kind == NodeKind::Block {
+            if NODES[c].a != 0 || NODES[c].count != 1 {
+                return -1;
+            }
+            let s = child(c, 0);
+            if NODES[s].kind != NodeKind::ExprStmt {
+                return -1;
+            }
+            c = NODES[s].a;
+        }
+        if c <= 0 || NODES[c].kind != NodeKind::Call || NODES[c].count != 1 {
+            return -1;
+        }
+        let f = NODES[c].x - 1;
+        if f < 0 || FNS[f].node <= 0 || !in_std(NODES[FNS[f].node].start)
+            || !same(SYMS[NODES[FNS[f].node].a].text, "free") {
+            return -1;
+        }
+        let mut r = child(c, 0);
+        if NODES[r].kind == NodeKind::Unary && NODES[r].op == Tok::Amp {
+            r = NODES[r].b;
+        }
+        if NODES[r].kind != NodeKind::Ident || NODES[r].res != Res::Local
+            || !std_container(NODES[r].ty) {
+            return -1;
+        }
+        NODES[r].y
+    }
+}
+
+// Deletes statement node s (with its `;`), and its line when nothing else
+// is on it.
+fn delete_statement(s: i64) {
+    unsafe {
+        let mut a = NODES[s].start;
+        let mut b = NODES[s].end;
+        let lim = FILES[file_of_pos(a)].end;
+        let mut k = b;
+        while k < lim && (SRC[k] == ' ' || SRC[k] == '\t') {
+            k += 1;
+        }
+        if k < lim && SRC[k] == ';' {
+            b = k + 1;
+        }
+        let mut ls = a;
+        while ls > 0 && (SRC[ls - 1] == ' ' || SRC[ls - 1] == '\t') {
+            ls -= 1;
+        }
+        let mut le = b;
+        while le < lim && (SRC[le] == ' ' || SRC[le] == '\t') {
+            le += 1;
+        }
+        if (ls == 0 || SRC[ls - 1] == '\n') && le < lim && SRC[le] == '\n' {
+            a = ls;
+            b = le + 1;
+        }
+        replace_text(a, b, c"");
+    }
+}
+
+// Rule 1: `defer x.free();` deleted where x is a Vec, Buf or HashMap
+// local declared in the same block: its drop at the end of the block
+// frees it (0.17, T1's drops).
+fn free_defer_edits() {
+    unsafe {
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind != NodeKind::Block || in_std(NODES[n].start) {
+                continue;
+            }
+            for i in 0..NODES[n].count {
+                let s = child(n, i);
+                if NODES[s].kind != NodeKind::Defer || (NODES[s].p & DEFER_IMPLICIT) != 0 {
+                    continue;
+                }
+                let l = freed_local(NODES[s].a);
+                if l < 0 || EDITED.get(NODES[s].start + 1) != 0 {
+                    continue;
+                }
+                let mut declared = false;
+                for j in 0..i {
+                    let d = child(n, j);
+                    if NODES[d].kind == NodeKind::Let && NODES[d].a > 0
+                        && NODES[NODES[d].a].kind == NodeKind::PatBind
+                        && NODES[NODES[d].a].x == l {
+                        declared = true;
+                    }
+                }
+                if declared {
+                    delete_statement(s);
+                    VALUES_COUNTS[5] += 1;
+                }
+            }
+        }
+    }
+}
+
 // The edits of `fix --values`; the number of parameters changed.
 pub fn values_edits() -> i64 {
     unsafe {
@@ -901,6 +1026,7 @@ pub fn values_edits() -> i64 {
             rounds += 1;
         }
         walk_all(PH_EDIT);
-        VALUES_COUNTS[0] + VALUES_COUNTS[1] + VALUES_COUNTS[2] + VALUES_COUNTS[3]
+        free_defer_edits();
+        VALUES_COUNTS[0] + VALUES_COUNTS[1] + VALUES_COUNTS[2] + VALUES_COUNTS[3] + VALUES_COUNTS[5]
     }
 }

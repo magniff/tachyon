@@ -668,6 +668,17 @@ error[type error] cannot take address of non-lvalue expression
 `let p = P { x: 1 }; get(&p)`.
 
 ```tach
+fn factorial(n: i64) -> i64 { if n < 2 { 1 } else { n * factorial(n - 1) } }
+fn main() -> i32 { let f = &factorial; f(5) as i32 }
+```
+```err
+error[type error] cannot take the address of 'factorial': a function's name is already a pointer to it
+```
+A function's name is a `fn(i64) -> i64` value: `let f = factorial;`,
+then `f(5)`; `(*f)(5)` is `f(5)` too. `fix --suggested` drops the `&`
+(the `*`).
+
+```tach
 fn first(p: *i64) -> i64 { p[1] }
 ```
 ```err
