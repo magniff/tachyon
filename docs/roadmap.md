@@ -932,6 +932,29 @@ record that makes it so) against the 8% budget, accepted for 0.17.0.
 Not done: the compiler's source on effect annotations (0.16), with the
 compiler's move to value semantics in 0.18.
 
+The release gate (`gate.sh --release --no-x86` on aarch64-macos, 6:51
+wall, every step passing; x86_64 not run, by instruction): the chain
+(fixpoint, built by 0.16.0) and the suite at -O0/1/2 (1114 tests, 3
+XFAIL); fuzz 60 in each of the ten modes, ABI 100 in three modes,
+objcheck 1728 of 1728, header layouts, lldb at -O0 and -O2, stress-grow,
+examples-checkalloc (87); aarch64-linux (the cross-built fixpoint, the
+suite at every level, fuzz 300 in nine modes, ABI 150 in three, objcheck
+1728, layouts, gdb). The first two runs failed, and each failure was
+fixed before the tag: objcheck built the programs 0.17's migration marks
+`// FLAGS: --values=off` without their flags (it now reads each case's
+directives with the suite's reader, tests/directives.awk); on
+aarch64-linux the compiler stopped in opt_slp at -O2 (glibc: "corrupted
+size vs. prev_size"): the SLP vectorizer's tables by instruction were
+sized once per pass, which function-local ids made too small for a
+function whose packing adds more than half again its instructions
+(tests/run/opt_slp_grow); and once a "Bus error" at -O1 on macOS
+(fmt_direct), which valgrind showed as a read before the own pass's
+place masks when a dropped local had no place, in a function past 64
+places (tests/run/own_many_places). Valgrind on aarch64-linux then found
+nothing on the `opt_*`, `own_*` and `fmt_*` tests, the bench programs or
+the compiler's -O2 self-compile. Benchmarks and compile times in
+"Benchmarks", 0.17.
+
 Moved to 0.17.1:
 - the own pass's cost back under the 8% budget (at least 0.5%: a cheaper
   per-function record, or std's instances skipped);
@@ -1796,3 +1819,80 @@ ms at -O2: std's allocation layer (the Allocator trait, Gpa's methods
 inlined, alloc.tach's sections) and, at -O2, the effects the optimizer
 reads (at -O0 inference is skipped when nothing reads it).
 
+### 0.17
+
+aarch64-macos (Apple silicon, native; `gate.sh --only bench`, that is
+`bench/run.sh -p <0.16.0> -r 5`, the fastest of 5 runs in ms, right
+after the release gate, load average 2.7 at the start, falling from 26
+over the last quarter hour; the "0.16.0" column is 0.16's own table,
+since 0.16.0 cannot build most of the programs migrated to 0.17's values;
+where it can, its build in the same run is in parentheses; the geometric
+mean is over cc -O2's, programs with a C version only):
+
+| program | 0.16.0 | 0.17 -O2 | cc -O2 |
+|---|---|---|---|
+| arena_trees | 33 | 32 | 39 |
+| binarytrees | 159 (164) | 155 | 161 |
+| collatz | 291 (291) | 291 | 291 |
+| fannkuch | 117 (117) | 117 | 140 |
+| fib | 14 (14) | 14 | 14 |
+| interp | 42 | 42 | 41 |
+| iterchain | 193 | 190 | 184 |
+| iterloop | 191 | 191 | 184 |
+| json | 105 | 105 | 94 |
+| mandelbrot | 162 (165) | 164 | 157 |
+| matmul | 18 | 18 | 44 |
+| nbody | 31 | 32 | 28 |
+| sieve | 59 (77) | 78 | 86 |
+| sort | 55 | 57 | 53 |
+| stencil | 8 | 8 | 8 |
+| wordcount | 85 | 85 | 71 |
+| md5 | 20 | 21 | - |
+| fmtints | 22 | 22 | - |
+| fmtloop | 22 (22) | 22 | - |
+| purecall | 74 (74) | 74 | - |
+| purecall_hoisted | 74 (74) | 75 | - |
+| geomean vs cc -O2 (16 programs) | 0.953 | 0.953 | 1 |
+
+(-O0 and -O1 in the same run: geomean 7.674 and 1.475; a first run at
+load 16 to 35 gave 0.960.) The pairs, fastest of 10: iterchain over
+iterloop 190 against 191 ms, **0.995**; fmtloop over fmtints 22 against
+22, **1.000**; purecall over purecall_hoisted 74 against 74, **1.000**.
+The generated code is where 0.16's was: drops are inlined glue that
+replaces the hand-written frees (the migrated programs' code is the
+same or within noise), and the noalias facts remove the vectorizer's
+overlap tests from stencil (4 to 0) and matmul (2 to 0) without moving
+their times, as the prototype predicted (docs/optimizer.md, "0.17: value
+semantics in the optimizer": the facts pay in kernels with many streams,
+2.06 times on 8 streams). sieve's 59 in 0.16's table against 78 now is
+the machine: 0.16.0's own build took 77 in the same run, and C 86
+against 70 then.
+
+Compile time (aarch64-macos, wall time, best of 7, the two compilers
+alternating on the same input: 0.17's source, 150,200 lines in 315
+files; `TACHYON_CACHE=off`; load average 2.3 to 5.9):
+
+| | 0.16.0 | 0.17 |
+|---|---|---|
+| the compiler to an object, -O0 | 370 ms | 318 ms (-14%) |
+| the compiler to an object, -O1 | 1104 ms | 815 ms (-26%) |
+| the compiler to an object, -O2 | 3134 ms | 1967 ms (-37%) |
+| `tachyonc check compiler/src/main.tach` | 143 ms | 154 ms (+7.6%) |
+| `tachyonc query refs run_gvn` | 188 ms | 202 ms (+7.6%) |
+| a small std program to an object, -O0 | 3.3 ms | 3.5 ms |
+| a small std program to an object, -O2 | 6.1 ms | 6.0 ms |
+
+Instructions retired and peak memory of the same compilations
+(`/usr/bin/time -l`): -O0 8.41 G and 356 MB against 6.80 G and 306 MB;
+-O2 53.15 G and 874 MB against 32.70 G and 570 MB. The compile-speed
+track (docs/optimizer.md, "0.17: compile time" and "0.17: cheaper
+f-strings": the hot spots, function-local ids and the per-function
+pipeline, -O1 leaf inlining, f-strings written in place) makes the
+compiler compile itself 14% faster at -O0, 26% at -O1 and 37% at -O2,
+with a third less memory at -O2. `check` and the queries without the
+cache pay the own pass: 7.6% here, which with the record the checker
+keeps for its fast path (the checker 2% slower, the pass 6.3% of it) is
+about 8.5% over 0.16's checker against the 8% budget, accepted for
+0.17.0 (getting at least 0.5% back is a 0.17.1 item). The small
+program: `Vec::new_in(gpa)`, ten pushes, a sum, `print_int`,
+`println("")`.
