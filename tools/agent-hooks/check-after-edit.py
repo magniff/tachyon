@@ -630,6 +630,22 @@ def root_shown(root, cwd, run_dir):
     return os.path.relpath(root, cwd) if root.startswith(cwd + os.sep) else root
 
 
+def expects_errors(cwd, *paths):
+    """(0.19) Whether one of paths is a test case meant to fail: a line
+    `// ERROR: ...` (tests/run.sh's directive). The hook applies no fix to
+    it, which would rewrite the error the case is about."""
+    for path in paths:
+        if not path:
+            continue
+        try:
+            with open(os.path.join(cwd, path), errors="replace") as fh:
+                if any(line.startswith("// ERROR:") for line in fh):
+                    return True
+        except OSError:
+            pass
+    return False
+
+
 def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
     """Checks root (None: check's default in cwd), compares with this
     session's last check of it, runs its tests when they exist, are fast
@@ -647,6 +663,8 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
     # (0.18.1) the errors' exact fixes, applied: fix --suggested, then check again
     fixed_text, hook_fixed = "", None
     exact = exact_errors(errors) if not at_turn_end and os.environ.get("TACHYON_HOOK_FIX", "1") != "0" else []
+    if exact and expects_errors(cwd, key_root, edited):
+        exact = []
     if exact:
         changed = apply_exact(compiler, root, run_dir)
         again = run_check(compiler, root, run_dir) if changed else None

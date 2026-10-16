@@ -350,6 +350,14 @@ try:
     del os.environ["TACHYON_HOOK_FIX"]
     case("hook fix: TACHYON_HOOK_FIX=0 applies nothing", (fix_calls(), got.split("\n")[1]),
          ("", "try: tachyonc fix --suggested main.tach   (the error: their exact fixes, one checked edit)"))
+    # (0.19) A test case meant to fail (`// ERROR:` lines) is left as it
+    # is: its fixes are named, not applied.
+    write(os.path.join(prog, "main.tach"), "// ERROR: undefined variable 'prinln'\nfn main() {}\n")
+    fake3_says([typo], [["fixed 1 suggested fix", "main.tach", "+1 -1 lines"]], [])
+    got = ctx_of(run(ev, fake3)[1])
+    write(os.path.join(prog, "main.tach"), "mod util;\nfn main() {}\n")
+    case("hook fix: not in an ERROR test case", (fix_calls(), got.split("\n")[1]),
+         ("", "try: tachyonc fix --suggested main.tach   (the error: their exact fixes, one checked edit)"))
     with open(log) as fh:
         recs = [json.loads(x) for x in fh if x.strip()]
     case("hook fix: logged", [r.get("hook_fixed") for r in recs if "hook_fixed" in r][:2], [2, 1])
