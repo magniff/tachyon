@@ -634,10 +634,14 @@ case hooks in
             : >"$WORK/hooks.out"
         fi ;;
 esac
-# (0.19) std::arch's generated programs (tests/arch/gen.sh), every
-# intrinsic at -O0 and -O2.
+# (0.19) std::arch's generated programs (tests/arch/gen.sh): every
+# intrinsic against its reference, at run time and folded, at this
+# level (without -O: at -O0 and -O2).
 case arch-gen in
-    *"$FILTER"*) "$ROOT/tests/arch/gen.sh" -c "$COMPILER" -o "$WORK/arch-gen" --check >"$WORK/arch-gen.out" 2>&1 & ;;
+    *"$FILTER"*)
+        arch_levels=${OPT#-O}
+        [ -n "$arch_levels" ] || arch_levels=0,2
+        "$ROOT/tests/arch/gen.sh" -c "$COMPILER" -o "$WORK/arch-gen" -O "$arch_levels" --check >"$WORK/arch-gen.out" 2>&1 & ;;
 esac
 
 # The slots: JOBS of them in a FIFO of our own, or the shared ones of

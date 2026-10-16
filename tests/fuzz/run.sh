@@ -5,7 +5,7 @@
 #
 # usage: tests/fuzz/run.sh [-c COMPILER] [-s SEED] [-t TARGET] [-n COUNT]
 #                          [-f FIRST] [-k DIR] [-j JOBS] [-l] [-g] [-p] [-C] [-N]
-#                          [-V] [-D] [-R]
+#                          [-V] [-D] [-R] [-A]
 #
 #   -c COMPILER   the tachyonc to test (default: target/tachyonc)
 #   -s SEED       also compare with the seed binary (divisors are then
@@ -27,6 +27,10 @@
 #                 the seed, which traps on 0)
 #   -R            loops indexing arrays of fixed sizes with steps of any
 #                 kind, from genrange.awk (0.11: ranges through phis)
+#   -A            intrinsics (0.19): expression trees over the target's
+#                 table (compiler/arch/*.def) and portable vector
+#                 operations, on loads near a slice's end, from
+#                 genarch.awk
 #   -j JOBS       programs tested at once (default: the number of CPUs,
 #                 or the slots of $TACHYON_JOBSERVER, see tests/run.sh)
 
@@ -58,8 +62,9 @@ while [ $# -gt 0 ]; do
         -V) VECTOR=1; shift ;;
         -D) DIVIDE=1; shift ;;
         -R) RANGES=1; shift ;;
+        -A) ARCHMODE=1; shift ;;
         -j) JOBS=$2; shift 2 ;;
-        *) sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        *) sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
 if [ -z "$TARGET" ]; then
@@ -109,6 +114,8 @@ test_seed() {
     program="$WORK/p$seed.tach"
     if [ "${VECTOR:-0}" = 1 ]; then
         awk -v seed="$seed" -f "$ROOT/tests/fuzz/genvec.awk" >"$program"
+    elif [ "${ARCHMODE:-0}" = 1 ]; then
+        awk -v seed="$seed" -f "$ROOT/tests/fuzz/genarch.awk" "$ROOT/compiler/arch/portable.def" "$ROOT/compiler/arch/${TARGET%%-*}.def" >"$program"
     elif [ "${RANGES:-0}" = 1 ]; then
         awk -v seed="$seed" -f "$ROOT/tests/fuzz/genrange.awk" >"$program"
     elif [ "${DIVIDE:-0}" = 1 ]; then
@@ -121,7 +128,7 @@ test_seed() {
     for level in O0 O1 O2 seed; do
         exe="$WORK/p$seed.$level"
         if [ "$level" = seed ]; then
-            [ -n "$SEED" ] && [ "${DIVIDE:-0}" = 0 ] || continue
+            [ -n "$SEED" ] && [ "${DIVIDE:-0}" = 0 ] && [ "${ARCHMODE:-0}" = 0 ] || continue
             awk -f "$ROOT/tests/seed-compat.awk" "$program" >"$exe.tach"
             "$SEED" build --target "$SEED_TARGET" "$exe.tach" -o "$exe" >"$exe.log" 2>&1 \
                 || { why="the seed failed to compile it"; break; }

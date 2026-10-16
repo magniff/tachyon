@@ -1,7 +1,8 @@
 #!/bin/sh
 # Checks the compiler's object files (0.7) against the system assembler:
 # every program of the corpus (tests/run, examples, bench, the compiler
-# itself) is compiled at -O0 and -O2 both to an object (tachyonc -c) and
+# itself; 0.19: the intrinsics' programs tests/arch/gen.sh writes) is
+# compiled at -O0 and -O2 both to an object (tachyonc -c) and
 # to assembly, which `cc -c` assembles; both objects are linked by cc into
 # executables, and the two executables must hold the same code and data:
 # their disassembly (alignment padding aside: the system assemblers pick
@@ -241,6 +242,22 @@ for f in tests/run/*.tach tests/run/*/main.tach examples/*/main.tach examples/*/
     grep -qw clang "$dd/requires" 2>/dev/null && ! "$CC" --version 2>/dev/null | grep -qi clang && continue
     echo "$f" >>"$list"
 done
+# (0.19) The intrinsics' generated programs (tests/arch/gen.sh), of the
+# target's architecture and the portable ones: every intrinsic, each
+# constant parameter at its extremes, encoded by the compiler and by cc.
+case "$TARGET" in
+    aarch64-*) arch_prefix=a64 ;;
+    x86_64-*) arch_prefix=x86 ;;
+esac
+if sh "$ROOT/tests/arch/gen.sh" -c "$COMPILER" -o "$WORK/arch-gen" -r 20 >"$WORK/arch-gen.log" 2>&1; then
+    for f in "$WORK"/arch-gen/arch_"$arch_prefix"_*.tach "$WORK"/arch-gen/arch_portable_*.tach; do
+        [ -f "$f" ] || continue
+        case "arch-gen/$(basename "$f")" in *"$FILTER"*) echo "$f" >>"$list" ;; esac
+    done
+else
+    echo "FAIL tests/arch/gen.sh: $(tail -3 "$WORK/arch-gen.log")"
+    gen_failed=1
+fi
 # The slots: JOBS of them, or (0.11) the ones $TACHYON_JOBSERVER shares
 # between the runners of bootstrap/gate.sh (see tests/run.sh).
 if [ -z "$JOBS" ] && [ -n "${TACHYON_JOBSERVER:-}" ] && [ -p "$TACHYON_JOBSERVER" ]; then
@@ -282,4 +299,4 @@ while [ "$i" -le "$n" ]; do
     i=$((i + 1))
 done
 echo "objcheck: $ok of $n compilations for $TARGET give the same program as cc -c, $failed differ"
-[ "$failed" -eq 0 ]
+[ "$failed" -eq 0 ] && [ "${gen_failed:-0}" = 0 ]
