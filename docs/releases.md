@@ -1585,7 +1585,15 @@ md5 example against `md5sum`, then runs the checks asked for at once
 (`bootstrap/gate.sh --inside`).
 
 Built steps are cached in `target/bootstrap/<host>/`; a rerun only rebuilds
-HEAD. Options of `bootstrap.sh`:
+HEAD. (0.18.1) Runs from several worktrees share the main checkout's
+cache safely: a release's entry is written under a lock (`<entry>.lock`,
+a directory made by `mkdir`, with its holder's pid), built in
+`<entry>.building` and renamed into place once its fixpoint (and suite)
+passed, so no run sees a half-built entry or deletes another's tree (two
+gates built 0.17.0 into it at once, and one removed the other's tree
+mid-suite). A second run waits for the lock, then finds the entry built;
+a lock whose holder is gone, or older than
+`TACHYON_BOOTSTRAP_LOCK_STALE` minutes (120), is taken over. Options of `bootstrap.sh`:
 
 ```
 --until 0.1.0      stop after a release: a from-scratch build of any release
