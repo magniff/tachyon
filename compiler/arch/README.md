@@ -34,7 +34,7 @@ internal error of the compiler on the first program that names
 | flags | `pure`, `commutative`, `tied=PARAM` (the instruction overwrites that parameter's register: the result starts as a copy of it); `-` none | `pure tied=a` |
 | memory | `none`, `load(SLICE, BYTES)`, `store(SLICE, BYTES)` (SLICE's parameter is followed by the index; checked `0 <= i`, `i + BYTES / elem <= len`), `raw` (a pointer form: unsafe) | `load(s, 16)` |
 | fold | the constant folder's family (T6, `middle/fold/arch.tach`); `-` none | `lanes.qsub_u`, `perm.tbl` |
-| semantics | one line of what it computes, lane `k` of result `r`: the reference T7's generator tests against | `r[k] = max(a[k] - b[k], 0)` |
+| semantics | one line of what it computes, lane `k` of result `r`: the reference `tests/arch/gen.sh` tests against (below, "Semantics") | `r[k] = max(a[k] - b[k], 0)` |
 | equivalent | the other architecture's equivalent or recipe (`query arch --equiv`) | `x86_64: _mm_subs_epu8` |
 | doc | one line for `query show` and the guide | `lanewise a - b, saturating at 0` |
 
@@ -58,6 +58,36 @@ registers), AT&T syntax on x86-64. Placeholders in angle brackets:
 Instructions are separated by `; ` (a result moved between register
 files, as `umaxv` then `umov`). Under `tied=P` the template writes the
 tied register as `<d>`.
+
+### Semantics
+
+`tests/arch/gen.sh` turns the column into the scalar reference each
+intrinsic is tested against, when it is one of:
+
+| form | means | example |
+|---|---|---|
+| `r[k] = E` | lane k of the result (a vector) | `r[k] = if idx[k] < 16 { t[idx[k]] } else { 0 }` |
+| `r = E` | the result (a scalar) | `r = v[lane]` |
+| `r = max\|min\|sum over k of E` | a reduction over the lanes of the first vector parameter | `r = max over k of a[k]` |
+| `S[I] = E` | a store into slice parameter S, for each lane k | `s[i + k] = v[k]` |
+| `X[A..B]` | the elements from A: `r = s[i..i + 16]` is `r[k] = s[i + k]`, `s[i..i + 16] = v` is `s[i + k] = v[k]` | |
+
+E is a tachyon expression naming only the parameters, `k`, `if`/`else`,
+`as`, integer and float literals, the lane types and `max`, `min`,
+`abs`, `clamp`. A vector parameter is its lanes, indexed by `k` (`a[k]`,
+or any lane: `t[idx[k]]`); a tuple's lanes follow each other. Integers
+narrower than 64 bits are computed in `i64` (so `a[k] - b[k]` of u8
+lanes may be negative, and `max(a[k] - b[k], 0)` saturates); 64-bit
+lanes in their own type (`u64` compares unsigned; arithmetic wraps);
+floats in `f64`. The result is converted to the result's lane type with
+`as`: it truncates, so wrapping needs nothing more. A trailing
+parenthesized note is a comment (`(wrapping)`), except the lanes an
+opaque x86 type is read as: `(bytes)`, `(i16 lanes)`, or by name, `(a,
+b: i16 lanes; r: i8 lanes)`; `__m128i` is bytes unless it says. Any
+other text is prose: the intrinsic then needs `fn ref_NAME` in
+`tests/arch/ref/*.tach` (gen.sh's header gives its parameters), and
+gen.sh reports one that has neither. A `cast` form is compared byte for
+byte with its operand.
 
 ## Instruction lines
 
@@ -93,8 +123,12 @@ is dst) and `ssei` (`op $imm8, src, dst`). VEX (AVX) is T5's.
 
 1. Its line in the architecture's table, its instruction's line when the
    encoder lacks it; `compiler/arch/embed.sh`.
-2. `tests/arch/gen.sh --check` builds every intrinsic at -O0 and -O2 and
-   compares them (the AArch64 program is run); `tests/objcheck.sh arch_`
-   (and `-t x86_64-macos arch_`) checks the encoder against `cc -c`.
+2. Its semantics as above, or a reference in `tests/arch/ref/`;
+   `tests/arch/gen.sh --check` (`tests/run.sh arch-gen`) tests it
+   against the reference at -O0 and -O2, at run time and folded (the
+   host's architecture runs; the other is compiled); `tests/objcheck.sh
+   arch_` (and `-t x86_64-macos arch_`) checks the encoder against `cc
+   -c` on the generated programs; `tests/fuzz/run.sh -A` draws it into
+   random programs.
 3. A new form, class or placeholder is a change to the compiler: its
    owner is in docs/design/arch.md, "Phase 0 contract".

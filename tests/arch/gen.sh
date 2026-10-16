@@ -1,131 +1,185 @@
 #!/bin/sh
-# The intrinsics' test programs, written from the tables (0.19,
-# docs/design/arch.md §6). This is the Phase 0 skeleton T7 grows: for
-# each architecture's table (compiler/arch/aarch64.def, x86_64.def), one
-# program calling every intrinsic once on fixed arguments, each call under
-# `has` of its features, printing what it returns; `--check` builds them
-# at -O0 and -O2 and compares the outputs (the AArch64 program is run, the
-# x86-64 one only compiled and assembled: x86-64 is not executed). T7
-# adds the scalar references from the `semantics` column, the edge and
-# random vectors, constants against run-time values, and the families.
+# Every intrinsic of the tables against a scalar reference (0.19,
+# docs/design/arch.md §6). tests/arch/gen.awk writes, from each table
+# (compiler/arch/portable.def, aarch64.def, x86_64.def), one program per
+# family (the table's `# ---- Family ----` sections, 40 intrinsics at
+# most each): target/arch-tests/arch_<a64|x86|portable>_<family>.tach.
+# Each intrinsic is called
 #
-# usage: tests/arch/gen.sh [-c COMPILER] [-o DIR] [--check]
+#   - at run time, on inputs the optimizer cannot see: every pair of edge
+#     values (0, 1, 2, MAX, MIN, MIN + 1, -2, -1, 0x55.., 0x33..; floats:
+#     ±0, ±1, ±inf, NaN, the least denormal, MAX, the least normal) of
+#     its first two inputs, mixed edges, random values (-r), and every
+#     value (one 8-bit input) or every pair (two) of its 8-bit inputs;
+#     a memory form at every index of a slice twice its size;
+#   - with constant arguments, edges and random lanes, which -O1 and -O2
+#     may fold: a fold must agree with the instruction;
+#   - for every value of a constant parameter (a range of 16 or more: its
+#     ends, the middle and three more), so every immediate's extremes are
+#     encoded,
+#
+# and each result is compared, lane by lane, with the reference: the
+# table's `semantics` column, translated (compiler/arch/README.md,
+# "Semantics"), or, when the column is prose, `fn ref_NAME` in
+# tests/arch/ref/*.tach. The reference takes the intrinsic's parameters
+# (a vector or a slice as its lanes, `[D]`; a scalar as `D`; a constant
+# or an index as `i64`; the slice of a store as `&mut [D]`, which it
+# writes) and, for a vector result, the lane `k: i64`, and returns that
+# lane (or the scalar) as `D`: D is i64 for integers narrower than 64
+# bits, the lane type itself for 64-bit ones, f64 for floats. A ref file
+# holds only functions; its helpers' names must be its own. A failure
+# prints `FAIL NAME`, the inputs and the lane.
+#
+# --check builds each program at each level (-O): the host's
+# architecture's programs (and the portable ones) are run and must
+# report no failure; the other architecture's are compiled and assembled
+# for its Linux and macOS targets (x86-64 is not executed). An intrinsic
+# the generator cannot test (prose semantics and no ref_NAME, a type it
+# does not know) is an error.
+#
+# usage: tests/arch/gen.sh [-c COMPILER] [-o DIR] [-r N] [-O LEVELS] [-j JOBS] [--check] [FILTER]
 #
 #   -c COMPILER   the tachyonc to build with (default: target/tachyonc)
 #   -o DIR        where the programs go (default: target/arch-tests)
-#   --check       then build, run and compare them
-set -eu
+#   -r N          random cases per intrinsic (default 2000; memory forms
+#                 take N / 50 + 4, at every index)
+#   -O LEVELS     the levels to build at, comma-separated (default 0,2)
+#   -j JOBS       builds at once (default: the CPUs, or the slots of
+#                 $TACHYON_JOBSERVER, see tests/run.sh)
+#   --check       then build, run and check them
+#   FILTER        only the programs whose name contains FILTER
+set -u
+LC_ALL=C
+export LC_ALL
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 COMPILER="$ROOT/target/tachyonc"
 OUT="$ROOT/target/arch-tests"
+RANDOM_N=2000
+LEVELS="0,2"
+JOBS=""
 CHECK=0
+FILTER=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -c) COMPILER=$2; shift 2 ;;
         -o) OUT=$2; shift 2 ;;
+        -r) RANDOM_N=$2; shift 2 ;;
+        -O) LEVELS=$2; shift 2 ;;
+        -j) JOBS=$2; shift 2 ;;
         --check) CHECK=1; shift ;;
-        *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        -*) sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        *) FILTER=$1; shift ;;
     esac
 done
+case "$COMPILER" in /*) ;; *) COMPILER="$(pwd)/$COMPILER" ;; esac
 mkdir -p "$OUT"
+rm -f "$OUT"/arch_*.tach
 
-# The program for table $1 (aarch64 or x86_64) on stdout.
-program() {
-    awk -v arch="$1" '
-        function trim(s) { sub(/^ +/, "", s); sub(/ +$/, "", s); return s }
-        # An argument of type t (the parameter p of a call).
-        function arg(t, p) {
-            if (p ~ /const/) { split(p, r, /const /); split(r[2], lohi, /\.\.=/); return lohi[1] }
-            if (t == "[u8]") return "buf[..]"
-            if (t == "i64") return "0"
-            if (t == "u8" || t == "i8") return "7"
-            if (t == "u16" || t == "i16") return "300"
-            if (t == "u32" || t == "i32") return "305419896"
-            if (t == "u64" || t == "i64") return "72623859790382856"
-            if (t == "uint8x16_t") return "vbytes()"
-            if (t == "uint16x8_t") return "v8u16::from_bits(vbytes())"
-            if (t == "uint64x1_t") return "v1u64(72623859790382856)"
-            if (t == "__m128i") return "_mm_loadu_si128(buf[..], 0)"
-            return "UNKNOWN_" t
-        }
-        # The statements printing value `v` of type t.
-        function show(t, v) {
-            if (t == "") return "        show_bytes(buf[..]);\n"
-            if (t == "uint8x16_t") return "        let r = " v ";\n        let mut o: [u8; 16] = [0; 16];\n        r.store(o[..], 0);\n        show_bytes(o[..]);\n"
-            if (t == "uint16x8_t") return "        let r = " v ";\n        let mut o: [u16; 8] = [0; 8];\n        r.store(o[..], 0);\n        for k in 0..8 { print(f\" {o[k]}\"); }\n        println(\"\");\n"
-            if (t == "uint8x8_t") return "        let r = " v ";\n        let mut o: [u8; 8] = [0; 8];\n        r.store(o[..], 0);\n        show_bytes(o[..]);\n"
-            if (t == "__m128i") return "        let mut o: [u8; 16] = [0; 16];\n        _mm_storeu_si128(o[..], 0, " v ");\n        show_bytes(o[..]);\n"
-            return "        println(f\"{" v "}\");\n"
-        }
-        BEGIN { n = 0 }
-        /^[ \t]*#/ || /^[ \t]*$/ { next }
-        {
-            nf = split($0, f, / \| /)
-            name = trim(f[1]); feats = trim(f[2]); sig = trim(f[3])
-            lp = index(sig, "("); rp = index(sig, ")")
-            params = substr(sig, lp + 1, rp - lp - 1)
-            ret = ""
-            rest = substr(sig, rp + 1)
-            if (rest ~ /->/) { sub(/^ *-> */, "", rest); ret = trim(rest) }
-            np = split(params, ps, /, /)
-            args = ""
-            for (i = 1; i <= np; i++) {
-                split(ps[i], nt, /: /)
-                args = args (i > 1 ? ", " : "") arg(trim(nt[2]), ps[i])
-            }
-            guard = "true"
-            if (feats != "-") {
-                nfe = split(feats, fe, /,/)
-                guard = ""
-                for (i = 1; i <= nfe; i++) guard = guard (i > 1 ? " && " : "") "has(\"" arch "." trim(fe[i]) "\")"
-            }
-            names[n] = name
-            body[n] = "fn t_" n "() {\n    print(\"" name ":\");\n    let mut buf: [u8; 32] = [0; 32];\n    for i in 0..32 { buf[i] = (i * 3 + 1) as u8; }\n    if " guard " {\n" show(ret, "std::arch::" arch "::" name "(" args ")") "    } else {\n        println(\" skip\");\n    }\n}\n"
-            n++
-        }
-        END {
-            print "// Generated by tests/arch/gen.sh from compiler/arch/" arch ".def (do not edit)."
-            print "use std::arch::has;"
-            if (arch == "x86_64") print "use std::arch::x86_64::{_mm_loadu_si128, _mm_storeu_si128};"
-            print ""
-            print "fn vbytes() -> v16u8 {"
-            print "    v16u8(1, 4, 7, 10, 13, 16, 19, 22, 200, 3, 0, 255, 128, 64, 32, 9)"
-            print "}"
-            print ""
-            print "fn show_bytes(s: [u8]) {"
-            print "    for k in 0..s.len as i64 { print(f\" {s[k]}\"); }"
-            print "    println(\"\");"
-            print "}"
-            print ""
-            for (i = 0; i < n; i++) print body[i]
-            print "fn main() {"
-            for (i = 0; i < n; i++) print "    t_" i "();"
-            print "}"
-        }
-    ' "$ROOT/compiler/arch/$1.def"
-}
-
-for a in aarch64 x86_64; do
-    program "$a" >"$OUT/all_$a.tach"
-done
-echo "gen: $OUT/all_aarch64.tach $OUT/all_x86_64.tach"
-[ "$CHECK" = 1 ] || exit 0
+# The hand-written references: `NAME PATH` for each `fn ref_NAME(`.
+for f in "$ROOT"/tests/arch/ref/*.tach; do
+    [ -f "$f" ] || continue
+    sed -n 's/^fn ref_\([A-Za-z0-9_]*\)(.*/\1/p' "$f" | while read -r n; do echo "$n $f"; done
+done >"$OUT/refs"
 
 status=0
-host=$("$COMPILER" --version | sed 's/.*host: \([a-z0-9_-]*\).*/\1/')
-for level in 0 2; do
-    "$COMPILER" -O$level "$OUT/all_aarch64.tach" -o "$OUT/a64_O$level" || status=1
-    if [ "${host%%-*}" = aarch64 ] && [ -x "$OUT/a64_O$level" ]; then
-        "$OUT/a64_O$level" >"$OUT/a64_O$level.out" || status=1
+: >"$OUT/gen.log"
+for t in portable aarch64 x86_64; do
+    awk -v table="$t" -v out="$OUT" -v nrandom="$RANDOM_N" -v refs="$OUT/refs" \
+        -f "$ROOT/tests/arch/gen.awk" "$ROOT/compiler/arch/$t.def" >>"$OUT/gen.log" || status=1
+done
+grep '^error' "$OUT/gen.log" | sed 's/^/gen: /'
+grep -q '^error' "$OUT/gen.log" && status=1
+programs=""
+for p in $(sed -n 's/^program //p' "$OUT/gen.log"); do
+    case "$(basename "$p")" in *"$FILTER"*) programs="$programs $p" ;; esac
+done
+ntests=0
+[ -z "$programs" ] || ntests=$(cat $programs | grep -c '^fn test_')
+echo "gen: $(echo $programs | wc -w | tr -d ' ') programs, $ntests intrinsics, $(grep -c '^skip' "$OUT/gen.log") skipped, $(grep -c '^error' "$OUT/gen.log") not testable"
+[ "$CHECK" = 1 ] || exit $status
+
+host=$("$COMPILER" --version | sed 's/.*host: \([a-z0-9_]*\)-\([a-z]*\).*/\1/')
+
+# One build (and run): program $1 at level $2; $3 a target to compile
+# for without running, or "" for the host. A line `ok ...` or `FAIL ...`.
+build() {
+    p=$1 o=$2 t=$3
+    b="$OUT/$(basename "$p" .tach).O$o${t:+.$t}"
+    if [ -n "$t" ]; then
+        "$COMPILER" "-O$o" --target "$t" -c "$p" -o "$b.o" >"$b.log" 2>&1 \
+            || { echo "FAIL $(basename "$p") -O$o --target $t: $(grep -v '^ok' "$b.log" | head -3)"; return; }
+        rm -f "$b.o"
+        echo "ok $(basename "$p") -O$o --target $t"
+        return
     fi
-    for t in x86_64-linux x86_64-macos; do
-        "$COMPILER" -O$level --target "$t" -c "$OUT/all_x86_64.tach" -o "$OUT/x86_O$level.$t.o" || status=1
+    "$COMPILER" "-O$o" "$p" -o "$b" >"$b.log" 2>&1 \
+        || { echo "FAIL $(basename "$p") -O$o: $(grep -v '^ok' "$b.log" | head -3)"; return; }
+    "$b" >"$b.out" 2>&1
+    rc=$?
+    rm -f "$b"
+    if [ $rc -ne 0 ] || grep -q '^FAIL' "$b.out"; then
+        echo "FAIL $(basename "$p") -O$o: exit $rc"
+        grep '^FAIL' "$b.out" | head -5 | sed 's/^/    /'
+        tail -1 "$b.out" | sed 's/^/    /'
+        return
+    fi
+    echo "ok $(basename "$p") -O$o"
+}
+
+# The slots: JOBS of them, or the ones $TACHYON_JOBSERVER shares (see
+# tests/run.sh).
+if [ -z "$JOBS" ] && [ -n "${TACHYON_JOBSERVER:-}" ] && [ -p "$TACHYON_JOBSERVER" ]; then
+    exec 3<>"$TACHYON_JOBSERVER"
+else
+    [ -n "$JOBS" ] || JOBS=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+    rm -f "$OUT/slots"
+    mkfifo "$OUT/slots"
+    exec 3<>"$OUT/slots"
+    i=0
+    while [ "$i" -lt "$JOBS" ]; do
+        echo >&3
+        i=$((i + 1))
+    done
+fi
+n=0
+for p in $programs; do
+    case "$(basename "$p")" in
+        arch_a64_*) native=aarch64 ;;
+        arch_x86_*) native=x86_64 ;;
+        *) native=$host ;;
+    esac
+    for o in $(echo "$LEVELS" | tr ',' ' '); do
+        if [ "$native" = "$host" ]; then
+            targets="-"
+        else
+            targets="$native-linux $native-macos"
+        fi
+        # (the portable programs, also for the other architecture)
+        case "$(basename "$p")" in
+            arch_portable_*) [ "$host" = aarch64 ] && targets="- x86_64-linux" || targets="- aarch64-linux" ;;
+        esac
+        for t in $targets; do
+            [ "$t" = - ] && t=""
+            n=$((n + 1))
+            read -r _ <&3
+            ( build "$p" "$o" "$t" >"$OUT/result.$n"; echo >&3 ) &
+        done
     done
 done
-if [ -f "$OUT/a64_O0.out" ] && ! cmp -s "$OUT/a64_O0.out" "$OUT/a64_O2.out"; then
-    echo "gen: -O0 and -O2 differ:"
-    diff "$OUT/a64_O0.out" "$OUT/a64_O2.out" | head -20
-    status=1
-fi
+wait
+exec 3>&-
+rm -f "$OUT/slots"
+i=1
+failed=0
+while [ "$i" -le "$n" ]; do
+    if ! grep -q '^ok' "$OUT/result.$i"; then
+        failed=$((failed + 1))
+        cat "$OUT/result.$i"
+    fi
+    rm -f "$OUT/result.$i"
+    i=$((i + 1))
+done
+echo "gen: $n builds, $failed failing"
+[ "$failed" -eq 0 ] || status=1
 [ $status = 0 ] && echo "gen: ok"
 exit $status
