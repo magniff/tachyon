@@ -6,8 +6,8 @@
 
 use TyKind::{Array, Enum, Fn, Prim, Ptr, Slice, Struct, Tuple, Vector};
 use crate::base::{
-    IntVec, alloc_array, alloc_zeroed, buf_byte, buf_int, buf_str, die, free, grow, intern_c,
-    sym_name, sym_table,
+    IntVec, alloc_array, alloc_zeroed, buf_byte, buf_int, buf_new, buf_slice, buf_str, die, free,
+    grow, intern, intern_c, sym_name, sym_table,
 };
 use crate::base::diag::{ERR, ERR_POISONED};
 use crate::front::ast::{
@@ -321,6 +321,53 @@ pub fn vec_mask_type(t: i64) -> i64 {
     }
 }
 
+// (0.19) The vector types beyond 0.10's six: unsigned, 64-bit and 256-bit
+// (their operators are T1's, docs/design/arch.md), and Intel's opaque ones
+// (`__m128i` ...: vectors of i64 lanes with an element in their list that
+// makes them distinct, named so that only std::arch::x86_64's aliases can
+// spell them: arch/virtual.tach).
+fn init_arch_vector_types() {
+    unsafe {
+        let names: [*u8; 24] = [c"v8i8", c"v4i16", c"v2i32", c"v1i64", c"v8u8", c"v4u16",
+            c"v2u32", c"v1u64", c"v2f32", c"v1f64", c"v16u8", c"v8u16", c"v4u32", c"v2u64",
+            c"v32i8", c"v16i16", c"v8i32", c"v4i64", c"v32u8", c"v16u16", c"v8u32", c"v4u64",
+            c"v8f32", c"v4f64"];
+        let elems: [i64; 24] = [TY_I8, TY_I16, TY_I32, TY_I64, TY_U8, TY_U16, TY_U32, TY_U64,
+            TY_F32, TY_F64, TY_U8, TY_U16, TY_U32, TY_U64, TY_I8, TY_I16, TY_I32, TY_I64, TY_U8,
+            TY_U16, TY_U32, TY_U64, TY_F32, TY_F64];
+        let lanes: [i64; 24] = [8, 4, 2, 1, 8, 4, 2, 1, 2, 1, 16, 8, 4, 2, 32, 16, 8, 4, 32, 16, 8,
+            4, 8, 4];
+        for i in 0..24 {
+            SYM_PRIMITIVE[intern_c(names[i])] = make_type(Vector, elems[i], lanes[i],
+                TSCRATCH.count);
+        }
+        for i in 0..6 {
+            let mark = TSCRATCH.count;
+            TSCRATCH.push(i + 1);
+            let t = make_type(Vector, TY_I64, if i < 3 { 2 } else { 4 }, mark);
+            let name = buf_new();
+            buf_str(name, c"__tachyon");
+            buf_str(name, opaque_vector_name(t));
+            SYM_PRIMITIVE[intern(buf_slice(name))] = t;
+        }
+    }
+}
+
+// Whether t is one of Intel's opaque vector types (0.19): no operators,
+// no lanes; `from_bits` converts.
+pub fn is_opaque_vector(t: i64) -> bool {
+    unsafe { TYPES[t].kind == Vector && TYPES[t].count > 0 }
+}
+
+// The name of opaque vector type t (0.19).
+pub fn opaque_vector_name(t: i64) -> *u8 {
+    unsafe {
+        let k = type_elem(t, 0);
+        if k == 1 { c"__m128i" } else if k == 2 { c"__m128" } else if k == 3 { c"__m128d" }
+        else if k == 4 { c"__m256i" } else if k == 5 { c"__m256" } else { c"__m256d" }
+    }
+}
+
 pub fn is_integer(t: i64) -> bool {
     t >= TY_I8 && t <= TY_U64
 }
@@ -413,6 +460,8 @@ pub fn buf_type(out: i64, t: i64) {
         let kind = TYPES[t].kind;
         if kind == TyKind::None || kind == Prim {
             buf_str(out, primitive_name(t));
+        } else if kind == Vector && TYPES[t].count > 0 {
+            buf_str(out, opaque_vector_name(t));
         } else if kind == Vector {
             buf_byte(out, 'v');
             buf_int(out, TYPES[t].b);
@@ -665,6 +714,7 @@ pub fn init_declarations() {
         for i in 0..6 {
             SYM_PRIMITIVE[vsyms[i]] = vtypes[i];
         }
+        init_arch_vector_types();
         if i8_sym != syms[0] {
             die(c"internal error: symbol table");
         }
@@ -777,8 +827,9 @@ pub fn compute_layout(t: i64) {
             size = 16;
             align = 8;
         } else if kind == Vector {
-            size = 16;
-            align = 16;
+            // (0.19: 8, 16 or 32 bytes, aligned to their size)
+            size = TYPES[t].b * type_size(TYPES[t].a);
+            align = size;
         } else if kind == TyKind::Distinct {
             size = type_size(TYPES[t].a);
             align = type_align(TYPES[t].a);

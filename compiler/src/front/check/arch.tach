@@ -1,0 +1,111 @@
+// Calls of std::arch's intrinsics (0.19, docs/design/arch.md §2.1, §2.9):
+// after a call of a virtual declaration is checked as any call
+// (check_direct_call), its immediates are checked against the table's
+// ranges and has()/detect() take a known feature's name as a literal.
+// (T1 adds the Rust-form diagnostics, arch.rust_form and arch.raw_form.)
+
+use crate::arch::{
+    FEAT_DETECT, FORM_FEAT, INTRS, intr_param_hi, intr_param_is_const, intr_param_lo,
+    intr_param_name, intrinsic_of_fn,
+};
+use crate::arch::features::parse_feature;
+use crate::base::sym_text;
+use crate::base::diag::{err_fmt, err_help};
+use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::check::Res;
+use crate::front::consteval::const_eval;
+use crate::front::features::{
+    AE_CONST_ARG, AE_FEATURE_LITERAL, arch_error_begin, arch_error_end, note_feature_call,
+    unknown_feature,
+};
+use crate::front::lexer::{Tok, str_at};
+
+// Call n of function f, a declaration of std::arch's (FN_INTRINSIC).
+pub fn check_intrinsic_call(n: i64, f: i64) {
+    unsafe {
+        let id = intrinsic_of_fn(f);
+        if id < 0 || NODES[n].count != INTRS[id].nparams {
+            return;
+        }
+        if INTRS[id].form == FORM_FEAT {
+            check_feature_call(n, id);
+            return;
+        }
+        for k in 0..INTRS[id].nparams {
+            if intr_param_is_const(id, k) {
+                check_immediate(n, f, id, k);
+            }
+        }
+    }
+}
+
+// has("f") and detect("f"): a literal naming a feature.
+fn check_feature_call(n: i64, id: i64) {
+    unsafe {
+        let arg = child(n, 0);
+        if NODES[arg].kind != NodeKind::Str {
+            arch_error_begin(NODES[arg].start, AE_FEATURE_LITERAL);
+            err_fmt(f"'{sym_text(INTRS[id].name)}' takes the feature's name as a string literal: its answer is a constant of the build or one cached bit");
+            err_help(c"write the name: `std::arch::has(\"neon\")`; `tachyonc explain arch.feature_name` lists them");
+            arch_error_end();
+            return;
+        }
+        let name = str_at(NODES[arg].a);
+        let bit = parse_feature(name);
+        if bit < 0 {
+            unknown_feature(name, NODES[arg].start, arg);
+            return;
+        }
+        note_feature_call(n, bit, INTRS[id].form_arg == FEAT_DETECT);
+    }
+}
+
+// Whether e is a constant expression: literals, constants, and operators
+// and casts of them.
+fn is_constant(e: i64) -> bool {
+    unsafe {
+        let kind = NODES[e].kind;
+        if kind == NodeKind::Int || kind == NodeKind::Char || kind == NodeKind::Bool {
+            return true;
+        }
+        if kind == NodeKind::Ident {
+            return NODES[e].res == Res::Const;
+        }
+        if kind == NodeKind::Unary {
+            return NODES[e].op != Tok::Star && NODES[e].op != Tok::Amp && is_constant(NODES[e].b);
+        }
+        if kind == NodeKind::Binary {
+            return is_constant(NODES[e].a) && is_constant(NODES[e].b);
+        }
+        if kind == NodeKind::Cast {
+            return is_constant(NODES[e].a);
+        }
+        false
+    }
+}
+
+// Immediate k of intrinsic id at call n (of declaration f): a constant in
+// the table's range (arch.const_arg).
+fn check_immediate(n: i64, f: i64, id: i64, k: i64) {
+    unsafe {
+        let arg = child(n, k);
+        let lo = intr_param_lo(id, k);
+        let hi = intr_param_hi(id, k);
+        let fname = sym_text(INTRS[id].name);
+        let pname = sym_text(intr_param_name(id, k));
+        if !is_constant(arg) {
+            arch_error_begin(NODES[arg].start, AE_CONST_ARG);
+            err_fmt(
+                f"'{fname}' takes {pname} as a constant in {lo}..={hi}: its instruction encodes it");
+            err_help(c"write a literal or a `const`; to choose at run time, branch on the value (`if n == 3 { f(a, 3) } else { ... }`)");
+            arch_error_end();
+            return;
+        }
+        let value = const_eval(arg);
+        if value < lo || value > hi {
+            arch_error_begin(NODES[arg].start, AE_CONST_ARG);
+            err_fmt(f"'{fname}' takes {pname} in {lo}..={hi}; got {value}");
+            arch_error_end();
+        }
+    }
+}

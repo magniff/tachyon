@@ -1,0 +1,141 @@
+// The explanations of std::arch's diagnostic codes (0.19,
+// docs/design/arch.md §2.9), for `tachyonc explain CODE` and `explain
+// arch`. Phase 0 reports arch.const_arg, arch.feature_literal,
+// arch.feature_name, arch.cpu and arch.baseline; the other entries
+// describe the errors T1 and T2 add (their examples are the design's).
+
+use crate::tools::explain::Explain;
+
+pub const ARCH_COUNT: i64 = 13;
+
+pub static ARCH_TABLE: [Explain; 13] = [
+    Explain {
+        code: "arch.baseline", severity: "error (compiler, exit 1)",
+        means: "`-C target-feature=-NAME` removes a feature the target's ABI needs (neon or fp on \
+            AArch64, sse2 on x86-64): the calling convention passes floats and vectors in those \
+            registers.",
+        fix: "Drop the removal; to build for an older CPU, choose it with `-C target-cpu=NAME`.",
+        example: "error[arch.baseline] -C target-feature cannot remove a feature the target's ABI \
+            needs: -neon",
+    },
+    Explain {
+        code: "arch.const_arg", severity: "error (compiler)",
+        means: "An intrinsic's immediate (a shift count, a lane, an `ext` position) is not a \
+            constant, or is out of the range its instruction encodes; `query show NAME` gives \
+            the range.",
+        fix: "Pass a literal or a `const` in the range; to choose at run time, branch on the \
+            value and call the intrinsic with a constant in each branch.",
+        example: "utf8.tach:21:20: error[arch.const_arg] 'vextq_u8' takes n in 0..=15; got 16",
+    },
+    Explain {
+        code: "arch.cpu", severity: "error (compiler, exit 1)",
+        means: "`-C target-cpu=NAME` names no CPU of the target's architecture, or `native` when \
+            the target is another architecture than the compiling machine's.",
+        fix: "Use a listed name: generic, apple-m1..apple-m4, neoverse-n1, neoverse-v1, \
+            neoverse-n2, cortex-a72, cortex-a76 on aarch64; x86-64, x86-64-v2..v4, core2, \
+            haswell, skylake, znver2..znver4 on x86_64.",
+        example: "error[arch.cpu] unknown CPU for this target (...): apple-m9",
+    },
+    Explain {
+        code: "arch.declared", severity: "error (compiler)",
+        means: "A function's #[target_feature(enable = \"...\")] is smaller than what its body \
+            needs: a call in it needs a feature it does not declare (and no guard there knows).",
+        fix: "Add the feature to the declaration (the try: line), or guard the call with \
+            `if std::arch::detect(\"f\") { ... }`.",
+        example: "crc.tach:9:9: error[arch.declared] 'fold' is #[target_feature(enable = \"neon\")], \
+            but '__crc32cd' at crc.tach:9:9 needs crc | try: tachyonc edit patch crc.tach:7 --old \
+            'enable = \"neon\"' --new 'enable = \"neon,crc\"'",
+    },
+    Explain {
+        code: "arch.feature", severity: "error (compiler)",
+        means: "A call needs a target feature the point does not know: not the build's baseline, \
+            not declared by the enclosing function, not under a has/detect guard. The error is \
+            at the entry point (main, an extern \"C\" function, a test, an address-taken \
+            function) where the requirement surfaces, with the chain down to the intrinsic.",
+        fix: "Test the CPU and keep a fallback (`if std::arch::detect(\"avx2\") { f_avx2(s) } \
+            else { f(s) }`), compile one function per feature set with #[multiversion], or \
+            build for CPUs that have it (`-C target-feature=+avx2`).",
+        example: "sum.tach:14:13: error[arch.feature] 'sum_avx2' needs avx2 (from \
+            '_mm256_add_epi32' at sum.tach:5:17), which 'main' does not know here: \
+            x86_64-linux's baseline is sse2",
+    },
+    Explain {
+        code: "arch.feature_ambiguous", severity: "error (compiler)",
+        means: "An unqualified feature name of both architectures (`aes`) means the target's, but \
+            it guards or enables the other architecture's intrinsics.",
+        fix: "Qualify it: `x86_64.aes` or `aarch64.aes`.",
+        example: "aes.tach:4:8: error[arch.feature_ambiguous] 'aes' is aarch64.aes here, but the \
+            branch calls x86_64's _mm_aesenc_si128 | try: tachyonc edit patch aes.tach:4 --old \
+            '\"aes\"' --new '\"x86_64.aes\"'",
+    },
+    Explain {
+        code: "arch.feature_literal", severity: "error (compiler)",
+        means: "std::arch::has or detect is given something else than a string literal: the \
+            feature must be known where the program is compiled (has is a constant; detect one \
+            cached bit).",
+        fix: "Write the feature's name in the call: `std::arch::has(\"neon\")`; to choose by a \
+            value, branch on it around literal calls.",
+        example: "fast.tach:4:24: error[arch.feature_literal] 'has' takes the feature's name as a \
+            string literal: its answer is a constant of the build or one cached bit",
+    },
+    Explain {
+        code: "arch.feature_name", severity: "error (compiler)",
+        means: "A name in has(\"...\"), detect(\"...\"), #[target_feature], #[multiversion] or \
+            -C target-feature is no target feature of either architecture.",
+        fix: "Use the name the help suggests (`fix --suggested` writes it); the features are \
+            neon, fp, crc, aes, sha2, sha3, dotprod, rdm, lse, fp16, i8mm, bf16 (AArch64) and \
+            sse ... sse4.2, popcnt, lzcnt, bmi1, bmi2, pclmulqdq, aes, sha, avx, avx2, fma \
+            (x86-64).",
+        example: "fast.tach:4:24: error[arch.feature_name] unknown target feature 'avx-2' | help: \
+            did you mean 'avx2'?",
+    },
+    Explain {
+        code: "arch.fn_pointer", severity: "error (compiler)",
+        means: "The address of a function that needs features beyond the baseline is taken as a \
+            plain `fn` value: its callers cannot know the features, so the call cannot be \
+            checked.",
+        fix: "Make it #[multiversion] (its dispatcher needs only the baseline), or pass a \
+            closure that tests the CPU first.",
+        example: "tbl.tach:12:20: error[arch.fn_pointer] 'sum_avx2' needs avx2, so its address \
+            cannot be a plain fn value",
+    },
+    Explain {
+        code: "arch.misaligned", severity: "panic (run time, exit 101)",
+        means: "An aligned memory intrinsic (`_mm_load_si128`, `_mm_store_si128`, \
+            `_mm256_load_*`) was given an address that is not a multiple of its size; the \
+            program stops instead of faulting.",
+        fix: "Use the unaligned form (`_mm_loadu_si128`), or align the data (a #[repr(C, \
+            align(16))] struct, an index that is a multiple of 16 bytes).",
+        example: "misaligned access: address % 16 = 8",
+    },
+    Explain {
+        code: "arch.multiversion", severity: "error (compiler)",
+        means: "In a #[multiversion] function, a call only some clones can make (it needs a \
+            feature of one of the listed sets) is not under has(\"f\"), so the other clones \
+            cannot be compiled.",
+        fix: "Put the call under `if std::arch::has(\"f\") { ... } else { ... }`: has is a \
+            constant in each clone.",
+        example: "dot.tach:6:13: error[arch.multiversion] '_mm256_madd_epi16' needs avx2, which \
+            the baseline clone of 'dot_u8' does not have: put it under std::arch::has(\"avx2\")",
+    },
+    Explain {
+        code: "arch.raw_form", severity: "error (compiler)",
+        means: "A memory intrinsic is given a pointer, as in C or Rust: the safe form takes a \
+            slice and an index and checks them; the pointer form is in the `raw` submodule and \
+            is unsafe.",
+        fix: "Pass the slice and the index (`vld1q_u8(s, i)`), or call \
+            `std::arch::aarch64::raw::vld1q_u8(p)` in unsafe code.",
+        example: "scan.tach:3:13: error[arch.raw_form] 'vld1q_u8(p)' passes a pointer: the safe \
+            form takes a slice and an index ('vld1q_u8(s, i)')",
+    },
+    Explain {
+        code: "arch.rust_form", severity: "error (compiler)",
+        means: "A Rust spelling of an intrinsic: an immediate as a const generic \
+            (`vshrq_n_u8::<3>(v)`), or `is_x86_feature_detected!(\"avx2\")`.",
+        fix: "Pass the immediate as an argument (`vshrq_n_u8(v, 3)`); test a feature with \
+            `std::arch::detect(\"avx2\")`.",
+        example: "scan.tach:8:17: error[arch.rust_form] 'vshrq_n_u8::<3>(v)': tachyon passes an \
+            intrinsic's immediates as arguments | try: tachyonc edit patch scan.tach:8 --old \
+            'vshrq_n_u8::<3>(v)' --new 'vshrq_n_u8(v, 3)'",
+    },
+];
