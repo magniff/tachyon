@@ -92,7 +92,7 @@ pub struct Shape {
 }
 
 impl Shape {
-    pub fn grow(self: *Shape, by: i64) {
+    pub fn grow(self: &mut Shape, by: i64) {
         (*self).w = (*self).w + 1;
     }
 }

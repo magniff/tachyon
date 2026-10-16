@@ -3,10 +3,10 @@
 ## one impl writes: Counter::tick), and the calls follow (bump, twice);
 ## an impl of a trait that declares `&Self` (std's Ord, Eq; Display with
 ## `&mut Fmt`) is spelled so. The output is the same.
-$ --values=off main.tach -o prog
-ok: built prog
-% ./prog
-16 9 shape rect true 10 3 true false $7
+## (0.18.1, V4: a `*T` parameter is raw, so the program before the fix no
+## longer builds; the output after it is the one 0.16's semantics gave,
+## recorded here before 0.18.1: `16 9 shape rect true 10 3 true false $7`. What the fix keeps raw is wrapped in
+## `unsafe` by `fix --only unsafe`, the second try: of the error.)
 $ fix --values
 fixed 9 parameters to &mut T, 17 parameters to &T, 4 arguments	main.tach	+24 -23 lines
 % cat main.tach
@@ -68,6 +68,8 @@ fn main() {
     println(
         f"{total(&a)} {total(&r)} {a.name()} {r.name()} {a.same(&b)} {twice(&mut fx)} {twice(&mut lv)} {x < y} {x == y} {m}");
 }
+$ fix --only unsafe
+note fix.none: nothing to fix
 $ main.tach -o prog
 ok: built prog
 % ./prog

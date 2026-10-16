@@ -81,8 +81,9 @@ fn main(gpa: Gpa) {
 - Aliasing XOR mutation: while a `&mut x` (or a view of `x`) is in use,
   `x` is not read or changed another way. `f(&mut a, &a)` is an error;
   `v.push(v.len())` is fine (the receiver is taken after the arguments).
-- A `*T` parameter (without `mut`) is still accepted as `&mut T` in
-  0.17; `tachyonc fix --values` rewrites it to `&mut T` or `&T`.
+- Borrowing is `&T` / `&mut T`. `*T` is a raw pointer, `mut` or not (0.18.1):
+  dereferencing it needs `unsafe`. `tachyonc fix --values` rewrites a
+  `*T` parameter to `&T` / `&mut T`, with its calls.
 
 ## Views
 

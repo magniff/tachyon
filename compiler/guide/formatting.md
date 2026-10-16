@@ -53,14 +53,14 @@ to stderr: 42-43
 ```
 
 ```tach
-fn next(c: *i64) -> i64 {
+fn next(c: &mut i64) -> i64 {
     *c += 1;
     *c
 }
 
 fn main() -> i32 {
     let mut c = 0;
-    let line = f"{next(&c)} {next(&c)}";     // evaluated here: 1, then 2
+    let line = f"{next(&mut c)} {next(&mut c)}";     // evaluated here: 1, then 2
     c = 100;
     println(line);
     println(line);

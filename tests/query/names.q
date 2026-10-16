@@ -10,19 +10,19 @@ pub fn helper() -> i64 {
 }
 // crate::geom::V2::len	clash/geom.tach:14-17	effects: none
     /// Its squared length.
-    pub fn len(self: *V2) -> i64 {
+    pub fn len(self: &V2) -> i64 {
         self.x * self.x + self.y * self.y
     }
 $ show clash/geom.tach:16 --root clash/main.tach
 // crate::geom::V2::len	clash/geom.tach:14-17	effects: none
     /// Its squared length.
-    pub fn len(self: *V2) -> i64 {
+    pub fn len(self: &V2) -> i64 {
         self.x * self.x + self.y * self.y
     }
 $ show geom.tach:16:9 clash/main.tach:33 --root clash/main.tach
 // crate::geom::V2::len	clash/geom.tach:14-17	effects: none
     /// Its squared length.
-    pub fn len(self: *V2) -> i64 {
+    pub fn len(self: &V2) -> i64 {
         self.x * self.x + self.y * self.y
     }
 // crate::main	clash/main.tach:30-52	effects: alloc(Gpa) io panic unsafe

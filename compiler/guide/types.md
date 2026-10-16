@@ -87,8 +87,8 @@ null) is dereferenced only in `unsafe`. There is no pointer arithmetic:
 index a raw pointer (`p[i]`, `&p[i]`) in unsafe code, or cast through
 `i64`. On a reference to a Vec, a Buf or a slice, `p[i]` indexes the one
 it points to, checked: safe through a reference, `unsafe` through a raw
-pointer. A `*T` parameter (without `mut`) is still taken as `&mut T` in
-0.17; `tachyonc fix --values` rewrites it.
+pointer. A `*T` parameter is raw like any `*T` (0.18.1); `tachyonc fix --values`
+makes it a reference.
 
 ```tach
 struct Counter { n: i64 }

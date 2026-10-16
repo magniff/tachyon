@@ -5,10 +5,10 @@
 ## place reached through a raw pointer keeps its parameter (npreds); a
 ## slice shown in an f-string is read (show). Before 0.18.1 these became
 ## `&mut u8`, and their calls `&mut *(c"help")`.
-$ --values=off main.tach -o prog
-ok: built prog
-% ./prog
-true true 122 true true 5 1 <bc>
+## (0.18.1, V4: a `*T` parameter is raw, so the program before the fix no
+## longer builds; the output after it is the one 0.16's semantics gave,
+## recorded here before 0.18.1: `true true 122 true true 5 1 <bc>`. What the fix keeps raw is wrapped in
+## `unsafe` by `fix --only unsafe`, the second try: of the error.)
 $ fix --values
 fixed 1 parameter to &mut T, 1 parameter to &T, 2 arguments	main.tach	+4 -4 lines
 % grep -n 'fn \|add(' main.tach
@@ -27,6 +27,8 @@ fixed 1 parameter to &mut T, 1 parameter to &T, 2 arguments	main.tach	+4 -4 line
 46:fn main(gpa: Gpa) {
 48:    add(&mut st, 4);
 49:    add(&mut st, 6);
+$ fix --only unsafe
+fixed 1 unsafe block	main.tach	+1 -1 lines
 $ main.tach -o prog
 ok: built prog
 % ./prog

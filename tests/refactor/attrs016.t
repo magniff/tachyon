@@ -22,7 +22,7 @@ fn middle(a: i64, b: i64, c: i64) -> i64 {
 
 fn main(gpa: Gpa) {
     let mut v: Vec<i64> = Vec::new_in(gpa);
-    grow(&v);
+    grow(&mut v);
     println(middle(2, 10, 0) + v.len() * 2 + util::one());
 }
 pub fn one() -> i64 {
@@ -30,7 +30,7 @@ pub fn one() -> i64 {
 }
 
 #[effects(alloc(Gpa), panic)]
-pub fn grow(v: *Vec<i64>) {
+pub fn grow(v: &mut Vec<i64>) {
     v.push(1);
 }
 % "$COMPILER" main.tach -o prog && ./prog

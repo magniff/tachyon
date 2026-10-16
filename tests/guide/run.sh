@@ -415,7 +415,7 @@ fi
 "$COMPILER" guide --find read a line >"$WORK/find.out" 2>"$WORK/find.err"
 rc=$?
 if [ $rc -eq 0 ] && head -1 "$WORK/find.out" | grep -q '^# std#input$' \
-    && grep -q 'read_line(&buf)' "$WORK/find.out" \
+    && grep -q 'read_line(&mut buf)' "$WORK/find.out" \
     && [ "$(wc -c <"$WORK/find.out" | tr -d ' ')" -le 4000 ]; then
     result pass guide-find
 else
@@ -530,7 +530,7 @@ try_case panic 'snippet:1:37: index out of bounds: index 3, length 0
 exit 101' 'let v: Vec<i64> = Vec::new_in(gpa); v.get(3)'
 printf 'struct P { x: i64 }\n\nlet p = P { x: 4 };\np.x * 10\n' >"$WORK/snip.tach"
 try_case file 'i64 = 40' --file "$WORK/snip.tach"
-got=$(printf '7\n' | "$COMPILER" try 'let mut b = Buf::new_in(gpa); read_line(&b).unwrap(); parse_int(b.as_slice()).ok()' 2>&1)
+got=$(printf '7\n' | "$COMPILER" try 'let mut b = Buf::new_in(gpa); read_line(&mut b).unwrap(); parse_int(b.as_slice()).ok()' 2>&1)
 if [ "$got" = 'Option<i64> = Some(7)' ]; then result pass try-stdin; else result FAIL try-stdin "$got"; fi
 "$COMPILER" try >"$WORK/try.out" 2>&1
 rc=$?
