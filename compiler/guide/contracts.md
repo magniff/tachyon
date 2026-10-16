@@ -101,9 +101,15 @@ it; guide debug).
 ## Contracts and the optimizer
 
 A check passes facts on: after `requires i < v.len()`, `v[i]` in the
-body needs no bounds check. Nothing is assumed: a fact comes only from
-a check that ran. `tachyonc query checks FN` lists the checks left
-after the optimizer and the ones it removed.
+body needs no bounds check, where the call is inlined and (0.18.1, -O2)
+in a function no caller inlines, since every direct call checks first.
+Nothing is assumed: a fact comes only from a check that ran, so a
+function whose address is taken (an indirect call does not check its
+requires) or that C calls keeps its own checks. Integers wrap: `i + 4
+<= v.len()` holds for an i near `i64::MAX`, so it does not prove
+`v[i + 1]`; `x % n` with `requires n > 0` is in `0..n`. `tachyonc
+query checks FN` lists the checks left after the optimizer and the ones
+it removed.
 
 ## Contracts as tests
 

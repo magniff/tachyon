@@ -16,21 +16,23 @@
 // The node is rewritten in place (its parent keeps it); its parts are
 // checked already.
 
-use crate::base::{buf_bytes, buf_clear, buf_new, buf_slice, buf_str, intern, intern_c};
+use crate::base::{buf_bytes, buf_clear, buf_new, buf_slice, buf_str, intern, intern_c, sym_text};
 use crate::front::ast::{
     INT_SITE, NODES, NODE_CHECKED, NodeKind, child, list_begin, list_end, list_push, new_node,
 };
 use crate::front::check::{CUR_FN, Res, pop_scope, push_scope};
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::contracts::checks::{CHECK_FN, CHECK_TEXT, CHK_ASSERT, add_check};
-use crate::front::contracts::expand::{ANY_REQUIRES, PRE_OF};
+use crate::front::contracts::expand::{ANY_REQUIRES, PRE_OF, subtree};
 use crate::front::contracts::flags::DEBUG_CONTRACTS;
 use crate::front::contracts::sites::site_of;
 use crate::front::generics::instantiate::fn_instance;
 use crate::front::lexer::{Tok, add_string};
 use crate::front::modules::STD_MODULE;
 use crate::front::patterns::check_pattern;
-use crate::front::types::{FNS, FN_COUNT, TLISTS, TSCRATCH, TY_BOOL, TY_I64, TY_UNIT};
+use crate::front::types::{
+    FNS, FN_COUNT, TLISTS, TSCRATCH, TY_BOOL, TY_I64, TY_UNIT, fn_param, is_compound, is_void,
+};
 use crate::middle::lower::ssa::HMap;
 
 static mut WORDS: bool = false;
@@ -117,6 +119,7 @@ pub fn desugar_call(n: i64) -> i64 {
         } else {
             crate::front::assoc::ensure_checked(pt, n);
         }
+        PRE_INST.put(f + 1, pre + 1);
         requires_call(n, pre);
         n
     }
@@ -191,6 +194,106 @@ fn requires_call(n: i64, pre: i64) {
         NODES[n].a = inner;
         NODES[n].ty = ty;
         NODES[n].p = p | NODE_CHECKED;
+    }
+}
+
+// (0.18.1) The `$pre` companion of each function (an instance too) that a
+// direct call has called (requires_call), by FNS index + 1: the checks
+// every direct call of it runs first.
+pub static mut PRE_INST: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// (0.18.1) The `$pre` companion whose clauses function f may take as facts
+// at its entry (middle::entryfacts), or -1. Every direct call of f runs
+// them first, with the same arguments (requires_call); so f must have been
+// called directly (PRE_INST), take no compound or unit parameter (they are
+// passed to the companion again, as they are), not be entered from C
+// (exported, extern, main), and each clause must be cheap to evaluate
+// again: locals, constants, operators, fields and std's `len()`. Whether
+// f's address is taken (an indirect call does not check) the middle says
+// (entryfacts::strip_taken).
+pub fn entry_pre(f: i64) -> i64 {
+    unsafe {
+        if !ANY_REQUIRES || f < 0 {
+            return -1;
+        }
+        let pre = PRE_INST.get(f + 1) - 1;
+        if pre < 0 || FNS[f].export || FNS[f].is_extern || FNS[f].variadic
+            || sym_text(FNS[f].name) == "main" {
+            return -1;
+        }
+        for i in 0..FNS[f].param_count {
+            let ty = fn_param(f, i);
+            if is_compound(ty) || is_void(ty) {
+                return -1;
+            }
+        }
+        let item = FNS[pre].node;
+        let body = NODES[item].c;
+        if body <= 0 || NODES[body].kind != NodeKind::Block || NODES[body].a > 0 {
+            return -1;
+        }
+        for i in 0..NODES[body].count {
+            let s = child(body, i);
+            if NODES[s].kind != NodeKind::ExprStmt {
+                return -1;
+            }
+            let call = NODES[s].a;
+            if NODES[call].kind != NodeKind::Call || NODES[call].count < 1
+                || !cheap(child(call, 0), 0) {
+                return -1;
+            }
+        }
+        pre
+    }
+}
+
+// Whether expression n is cheap and safe to evaluate again at a callee's
+// entry (see entry_pre).
+fn cheap(n: i64, depth: i64) -> bool {
+    unsafe {
+        if n <= 0 || depth > 8 {
+            return false;
+        }
+        match NODES[n].kind {
+            NodeKind::Int | NodeKind::Bool | NodeKind::Char => true,
+            NodeKind::Ident => NODES[n].res == Res::Local || NODES[n].res == Res::Const,
+            NodeKind::Binary | NodeKind::Unary | NodeKind::Cast | NodeKind::FieldAccess
+                | NodeKind::TupleField => {
+                for k in 0..3 {
+                    let e = subtree(n, k);
+                    if e > 0 && !cheap(e, depth + 1) {
+                        return false;
+                    }
+                }
+                true
+            }
+            NodeKind::Call | NodeKind::MethodCall => {
+                let f = NODES[n].x - 1;
+                if f < 0 {
+                    return false;
+                }
+                let t = if FNS[f].tmpl > 0 { FNS[f].tmpl - 1 } else { f };
+                let name = sym_text(FNS[t].name);
+                let method = name.len > 4 && (name[name.len - 4..name.len] == ".len"
+                    || name[name.len - 4..name.len] == ":len");
+                if FNS[t].module != STD_MODULE || !(name == "len" || method) {
+                    return false;
+                }
+                if NODES[n].kind == NodeKind::MethodCall {
+                    let r = subtree(n, 0);
+                    if r > 0 && !cheap(r, depth + 1) {
+                        return false;
+                    }
+                }
+                for i in 0..NODES[n].count {
+                    if !cheap(child(n, i), depth + 1) {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
     }
 }
 

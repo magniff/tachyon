@@ -2480,20 +2480,23 @@ clauses (an argument 1-4 runs one kernel). Instructions retired (robust
 under load); wall time the best of 5 runs at a load of about 5.5 on 12
 cores, so only large differences in it mean anything. "HEAD" is
 release-0.18.1 as it was (29de9e34); "fixed" adds the two range fixes
-below. Checks are `query checks` (`--print-checks=`), per iteration of
-the kernel's hot loop; the plain columns are the fixed compiler's
-(HEAD's where it differs).
+below; "facts" adds the entry facts and remainders (c181-facts, below:
+"After entry facts"). Checks are `query checks` (`--print-checks=`), per
+iteration of the kernel's hot loop; the plain columns are the fixed
+compiler's (HEAD's where it differs; the facts compiler's plain program
+is the fixed one's, byte for byte).
 
-| kernel | clause | checks in the loop: plain / HEAD / fixed | instructions: plain / HEAD / fixed (M) | wall ms: plain / fixed | vectorized |
+| kernel | clause | checks in the loop: plain / HEAD / fixed / facts | instructions: plain / HEAD / fixed / facts (M) | wall ms: plain / fixed | vectorized |
 |---|---|---|---|---|---|
-| 1 prefix: `for i in 0..n { s += v[i] }` | `requires 0 <= n && n <= v.len()` | 1 / 1 / **0** | 1315 / 1313 / **218** (-83%) | 47 / 19 | fixed only |
-| 2 window: `weigh(v, i)` reads v[i..i + 4], called for each i | `requires 0 <= i && i + 4 <= v.len()` | 4 / 5 / 5 | 1731 / 2142 / 2140 (+24%) | 47 / 57 | no |
-| 3 bucket: `counts[bucket(x, counts.len())] += 1` | `requires n > 0`, `ensures 0 <= result && result < n` | 1 / 4 / 3 | 1212 / 1812 / 1632 (+35%) | 67 / 70 | no |
-| 4 dot: `for i in 0..a.len() { s += a[i] * b[i] }` | `requires a.len() == b.len()` | 1 (HEAD: 2) / 0 / **0** | 1651 (HEAD: 1979) / 1487 / **669** (-59%) | 56 / 29 | no |
-| all four | | | 5882 (HEAD: 6201) / 6717 / 4624 | | |
+| 1 prefix: `for i in 0..n { s += v[i] }` | `requires 0 <= n && n <= v.len()` | 1 / 1 / **0** / 0 | 1315 / 1313 / **218** (-83%) / 218 | 47 / 19 | fixed, facts |
+| 2 window: `weigh(v, i)` reads v[i..i + 4], called for each i | `requires 0 <= i && i + 4 <= v.len()` | 4 / 5 / 5 / 5 | 1731 / 2142 / 2140 (+24%) / 2142 (+24%) | 47 / 57 | no |
+| 3 bucket: `counts[bucket(x, counts.len())] += 1` | `requires n > 0`, `ensures 0 <= result && result < n` | 1 / 4 / 3 / **1** | 1212 / 1812 / 1632 (+35%) / **1393** (+15%) | 67 / 70 | no |
+| 4 dot: `for i in 0..a.len() { s += a[i] * b[i] }` | `requires a.len() == b.len()` | 1 (HEAD: 2) / 0 / **0** / 0 | 1651 (HEAD: 1979) / 1487 / **669** (-59%) / 670 | 56 / 29 | no |
+| all four | | | 5882 (HEAD: 6201) / 6717 / 4624 / **4383** | | |
 
 The whole program: with HEAD the clauses cost 8% more instructions than
-none (6717M against 6201M, HEAD's plain); with the fixes they save 21%.
+none (6717M against 6201M, HEAD's plain); with the fixes they save 21%,
+with the entry facts and remainders 25% (4383M against 5871M).
 
 **The survey.** `--print-checks=` over bench/ (23 programs) and the 39
 examples, at -O2, as they are (no clauses of their own; std's apply).
@@ -2550,12 +2553,9 @@ clause is not free: a contract that removes nothing costs its check.
 1. *Offsets.* `i + 4 <= len` implies `i + k < len` for 0 <= k < 4, and a
    loop to `len - 3` implies `i + 4 <= len`; with them window's requires
    is proven at the call and its four checks go.
-2. *Remainders.* `x % n` (unsigned, n > 0) is in [0, n): the analysis
-   would then fold bucket's ensures and drop the index check without
-   any clause.
-3. *Entry facts in a callee that is not inlined* (design §2.5 item 2): a
-   requires on a function too large to inline gives its body nothing
-   today; facts come only through inlining.
+2. *Remainders* (done in c181-facts, below).
+3. *Entry facts in a callee that is not inlined* (done in c181-facts,
+   below, for a callee no caller inlines).
 4. *A min as a bound.* `let m = if n < len { n } else { len }` is a phi
    both of whose inputs are at most len; iterloop's `dot` and
    `take_loop` keep their checks for it.
@@ -2570,3 +2570,61 @@ clause is not free: a contract that removes nothing costs its check.
 7. *Tools.* `query checks crate` prints nothing (the names it matches
    have no `crate::`; `--print-checks=` lists every function), and a
    removed check says `removed (ranges)`, not the fact that removed it.
+
+**After entry facts (c181-facts).** Three changes, in middle/:
+- *Entry facts* (middle/entryfacts.tach). A requires is checked at every
+  direct call, before it, so at the callee's entry its clauses hold:
+  every direct call passed the checks with these arguments, or the
+  program exited 101. At -O2 a function's entry calls its `$pre`
+  companion with a site no check has; once inlined there, the failing
+  side of each of its checks is emptied (a branch into an empty
+  unreachable block: the condition is a fact for the range analysis and
+  value numbering), and before code generation each such branch becomes
+  a jump and the condition, unused, goes; the code emitted has nothing
+  of it. *Soundness:* an indirect call skips the requires (its checking
+  entry is still to come), so a function whose address the program takes
+  (any `faddr` of it in the IR, scanned before the first pass and before
+  the code cache's keys) assumes nothing; neither does a function C may
+  call (`extern "C"`, exported, `main`), one with a compound parameter
+  (passed again as it is), or a clause that is not cheap to evaluate
+  again (locals, constants, operators, fields and std's `len()` only).
+  The optimizer never assumes a clause that is not checked.
+  tests/run/opt_entry_facts.tach (a bounds check gone; the address-taken
+  and the exported function keep theirs) and
+  contract_entry_indirect.tach (through a fn value, an index out of
+  bounds still stops at the body's check, exit 101).
+- *Only where no caller inlines.* A function a caller may inline
+  (inline::never_inlined: not `#[inline(never)]`, cold, nor larger than
+  INLINE_ONCE as lowered) takes no entry facts: its inlined copy has the
+  call's checks before it anyway, and with the facts its own loop passes
+  ran on a loop without checks, which came to the caller unrolled where
+  the caller would have vectorized it (prefix 218M to 582M, dot 669M to
+  914M, measured with facts everywhere). So none of the bench pair's
+  kernels (all inlined) changes by entry facts; they serve non-inlined
+  callees: `at(v, i)` with `requires i < v.len()` loses its bounds check.
+- *Remainders* (middle/range): `x % n` with n known positive (its range
+  with the facts: a requires' `n > 0`) is in [0, n) (unsigned; |x % n| <
+  n signed), and is below n itself (`decide`, rem_below). Bucket's
+  ensures fold and its loop keeps one check, its requires, as the plain
+  program keeps one, the index's; its body is one instruction shorter
+  per iteration than plain's. The 15% left is register pressure in
+  `main` (all kernels inlined into it): the LCG's constant is
+  materialized each iteration.
+
+*The window is not fixed, and cannot be soundly without a length bound.*
+Integers wrap: `i + 4 <= v.len()` holds for i near i64::MAX, where
+i + 4 wraps negative, so neither the clause nor the loop's `i < len - 3`
+(len - 3 wraps for a negative len) proves `i + k < len`; offset facts
+need i + 4 not to wrap, i.e. len >= 0, which is the Vec's invariant, not
+a checked fact (type invariants give no facts in 0.18). The clause stays
+one more check per call (+24%).
+
+*Elsewhere:* every other bench program's binary is byte for byte the
+same; the -O2 self-compile within the noise (36.19G and 36.21G
+instructions, base 36.15G-36.19G), the compiler's binary the same size.
+
+*Left:* the checking entry for indirect calls (then a function whose
+address is taken could assume too); entry facts for a function its
+callers inline (the phase order above: the facts after its loop passes);
+a non-negative length (the window); facts at the instance level of a
+callee whose clause calls more than `len()`.
