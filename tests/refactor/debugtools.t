@@ -121,5 +121,5 @@ $ reduce big.in --until 'false'
 error reduce.not-failing: the command does not hold (exit 0) on big.in as it is: false
 [exit 1]
 $ reduce big.in
-error reduce.usage: FILE and --until 'CMD' are needed; usage: tachyonc reduce FILE --until 'CMD' [--out FILE] [--max-runs N] [--timeout S] ({} in CMD: the candidate; exit 0: it still fails)
+error reduce.usage: FILE and --until 'CMD' are needed; usage: tachyonc reduce FILE --until 'CMD' [--out FILE] [--max-runs N] [--timeout S] ({} in CMD: the candidate; exit 0: it still fails); tachyonc reduce PROG.tach --differs [--input F] | --fails 'TEXT' | --test NAME [--differs] (a program made small)
 [exit 2]

@@ -111,8 +111,8 @@ crate::heap::pop	heap.tach:35:8	fn	pub fn pop(h: *MinHeap) -> Option<Entry>
 crate::graph::edges_from	graph.tach:57:8	fn	pub fn edges_from(g: *Graph, i: i64) -> [Edge]
 std::Vec::filled_in	<std>:160:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
 crate::heap::push	heap.tach:22:8	fn	pub fn push(h: *MinHeap, e: Entry)
-std::Vec::set	<std>:270:12	method	pub fn set(self: *Vec<T, A>, i: i64, x: T)
 std::Option::unwrap	<std>:86:12	method	pub fn unwrap(self: Option<T>) -> T
+std::Vec::set	<std>:270:12	method	pub fn set(self: *Vec<T, A>, i: i64, x: T)
 std::Vec::free	<std>:330:12	method	pub fn free(self: *Vec<T, A>)
 std::Vec::get	<std>:266:12	method	pub fn get(self: *Vec<T, A>, i: i64) -> T
 note query.budget: over the budget of 600 tokens, left out: types or uses 8, callers 1

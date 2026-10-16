@@ -1663,3 +1663,72 @@ later by a `fix` migration or a flag.
     not merged text.
 19. **What 0.18 needs from 0.17** is §0's table: 0.18 waits for 0.17.0, and does
     not wait for 0.17.1.
+
+### T2 notes (tests and properties, as built on b18-tests)
+
+- **Where the test build is made.** front/tests reads the tokens after the
+  modules' files are read (a hook in `load_modules`), so that std's lazy
+  sections the generated code names are loaded: one `<test>` source per
+  module with tests (or a type a property generates), in that module, so
+  that private names resolve. The program's root `main` is renamed
+  `__tachyon_program_main`; the made `main(argc, argv, gpa)` runs
+  `--tachyon-test NAME` (or `--tachyon-list`). Each module on the way to a
+  test gets a `pub fn __tachyon_tests(name, gpa) -> bool` dispatcher.
+- **Generators are made, not derived by traits:** a parameter's type is
+  turned into an expression (`std::gen_vec(g, |g: *std::Gen| ..)` for
+  `Vec<T>`, tuples element by element, `[T]` an owned Vec lent); any other
+  type goes through `std::arbitrary_of::<T>`, and a struct or enum of the
+  program without its own `impl Arbitrary` gets a structural one in its
+  module. Inputs are printed with `{:?}` when the type derives or
+  implements Debug (tuples element by element), else `(no Debug)`.
+- **Test items in other builds** are dropped after parsing in
+  `compile_program` only: `check` and the queries see (and check) them.
+  The lookup hook makes a `#[cfg(test)]` module see its parent's items
+  (and its parent's imports) before the prelude.
+- **The runtime** (std/test.tach, "The test runtime's implementation"):
+  a property's cases each run in a forked child (stdout and stderr to
+  /dev/null); the child tells the choices it used through a pipe. Sizes
+  grow over 100 cases whatever `--cases` is, so -O0's 20 cases are -O2's
+  first 20. A process that ends a test (a failed check) leaves through an
+  exit handler registered after --check-alloc's, so its leaks are not
+  listed after the failure; `test_exit` does the same for runner
+  processes. Leaks of a `#[test]` are checked by the made code with
+  --check-alloc (`gpa.live_blocks()`); properties are not leak-checked
+  until 0.17's drops free their values.
+- **The runner** (tools/testrun/program.tach): builds the program and the
+  test binary at -O2 then -O0 (.tachyonc/test/O2, O0), runs every case
+  and test as its own process, as many at once as there are processors,
+  -O2's first (new snapshots are written then compared at -O0). A time
+  limit at either level is not compared. `TACHYON_PLANT_MISCOMPILE` (a
+  test-only switch: -O1/-O2 read the literal 12345 as 12346) is in the
+  build key.
+- **Left for 0.18.1:** `probe --test/--seed`, `--against CMD --gen CMD`,
+  `test --fuzz S`, failing property inputs saved to a corpus (a property's
+  failure is replayed from its seed: the summary's try: line), effects
+  (no io, no global) as a condition for contracts tested as properties
+  (it waits for T1's clause checks), the bang spellings in the summary's
+  try: lines (T1), positions on every failure line (T5's site table).
+
+### T3 notes (fuzzing and reduce, as built on b18-tests)
+
+- **Coverage** counts blocks, not edges: every block of the program's IR
+  functions as lowered (`&&` and `||` are blocks), into std's
+  `COVERAGE_MAP: [u8; 65536]` (block k at k % 65536). It is done right
+  after lowering, as --profile-generate's counters are, so the optimizer
+  sees ordinary loads and stores (no new IR operation). -O0 is promoted to
+  -O1. A program built with --coverage but no fuzz target gets an anchor
+  (`__tachyon_coverage`) so that the map exists and the counters run.
+- **The fuzzer** is in the test binary (std/fuzz.tach): one fork per run,
+  the child's counters sent back through a pipe, AFL's count buckets,
+  mutations over the input's bytes (bits, bytes, runs deleted or
+  repeated, splices, the program's string constants). It found the
+  crash behind a 4-byte magic in about 16,000 runs (10 s) on the M-series
+  laptop (tests/refactor/fuzzcmd.t).
+- **reduce's program modes** cut by the formatted layout (lines and their
+  indentation: items, then statements with the lines under them), not
+  through the edit engine: a candidate that does not build is simply not
+  interesting. Halves, then single units, deepest last, to a fixpoint.
+  The generated 428-line program of tests/refactor/reducecmd.t goes to
+  12 lines in about 300 runs (11 s). Replacing expressions with literals
+  and inlining calls (the design's other steps), several files, and
+  candidates checked in-process are left for 0.18.1.
