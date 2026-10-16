@@ -28,5 +28,5 @@ error fix.alloc016-manual: crate::make needs an allocator (it allocates at main.
 try: tachyonc query show main.tach:18
 [exit 1]
 $ fix --only nonsense
-error fix.usage: --only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015 or alloc016, not 'nonsense'
+error fix.usage: --only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015, alloc016 or values, not 'nonsense'
 [exit 2]
