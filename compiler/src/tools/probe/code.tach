@@ -98,16 +98,44 @@ fn put_probe(out: i64, k: i64, p: *Probe) {
                 if ty < 0 {
                     buf_bytes(out, "std::eprint(\"()\"); ");
                 } else {
-                    buf_bytes(out, "{ let __probe_v = (");
+                    // (0.17) a place is printed through a reference: the
+                    // probe must not move the value out of the program
+                    let place = is_place_text(p.exprs.data[x] as *u8);
+                    if place {
+                        buf_bytes(out, "{ let __probe_v = &(");
+                    } else {
+                        buf_bytes(out, "{ let __probe_v = (");
+                    }
                     buf_str(out, p.exprs.data[x] as *u8);
                     buf_bytes(out, "); ");
-                    put_printer(out, "__probe_v", buf_slice(ty), p.opaque.data[x], 0);
+                    if place {
+                        put_printer(out, "(*__probe_v)", buf_slice(ty), p.opaque.data[x], 0);
+                    } else {
+                        put_printer(out, "__probe_v", buf_slice(ty), p.opaque.data[x], 0);
+                    }
                     buf_bytes(out, "} ");
                 }
             }
             buf_bytes(out, "std::eprintln(\"\"); } ");
         }
         buf_bytes(out, "}");
+    }
+}
+
+// Whether the probed expression `s` is a place (a name, or names and
+// field numbers joined by dots), which the probe borrows.
+fn is_place_text(s: *u8) -> bool {
+    unsafe {
+        let mut i = 0;
+        while s[i] != 0 {
+            let c = s[i];
+            let word = c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_';
+            if !(word || c == '.' && i > 0 || c >= '0' && c <= '9' && i > 0) {
+                return false;
+            }
+            i += 1;
+        }
+        i > 0
     }
 }
 
@@ -187,9 +215,9 @@ fn put_fields(out: i64, v: [u8], t: [u8], depth: i64) -> bool {
             }
             buf_bytes(out, "std::eprint(\"");
             buf_bytes(out, name);
-            buf_bytes(out, ": \"); { let __probe_f");
+            buf_bytes(out, ": \"); { let __probe_f"); // (0.17: by reference)
             buf_int(out, depth);
-            buf_bytes(out, " = ");
+            buf_bytes(out, " = &");
             buf_bytes(out, v);
             buf_byte(out, '.');
             buf_bytes(out, name);
@@ -197,8 +225,9 @@ fn put_fields(out: i64, v: [u8], t: [u8], depth: i64) -> bool {
             let ft = buf_new();
             buf_type(ft, fi.ty);
             let fv = buf_new();
-            buf_bytes(fv, "__probe_f");
+            buf_bytes(fv, "(*__probe_f");
             buf_int(fv, depth);
+            buf_byte(fv, ')');
             put_printer(out, buf_slice(fv), buf_slice(ft), 0, depth + 1);
             buf_bytes(out, "} ");
         }
@@ -248,6 +277,11 @@ fn put_printer(out: i64, v: [u8], t: [u8], opaque: i64, depth: i64) {
         let e = buf_new();
         buf_bytes(e, "__probe_e");
         buf_int(e, depth);
+        // (0.17) elements and fields are bound by reference, never moved
+        let ed = buf_new();
+        buf_bytes(ed, "(*__probe_e");
+        buf_int(ed, depth);
+        buf_byte(ed, ')');
         if t.len > 2 && t[0] == '[' && t[t.len - 1] == ']' {
             let end = type_end(t, 1);
             let elem = trim(t[1..end]);
@@ -270,12 +304,12 @@ fn put_printer(out: i64, v: [u8], t: [u8], opaque: i64, depth: i64) {
             buf_bytes(out, buf_slice(ix));
             buf_bytes(out, " > 0 { std::eprint(\", \"); } let ");
             buf_bytes(out, buf_slice(e));
-            buf_bytes(out, " = ");
+            buf_bytes(out, " = &");
             buf_bytes(out, buf_slice(s));
             buf_byte(out, '[');
             buf_bytes(out, buf_slice(ix));
             buf_bytes(out, "]; ");
-            put_printer(out, buf_slice(e), elem, 0, depth + 1);
+            put_printer(out, buf_slice(ed), elem, 0, depth + 1);
             buf_bytes(out, "} std::eprint(\"]\"); } ");
             return;
         }
@@ -305,10 +339,10 @@ fn put_printer(out: i64, v: [u8], t: [u8], opaque: i64, depth: i64) {
                 }
                 buf_bytes(out, "{ let ");
                 buf_bytes(out, buf_slice(e));
-                buf_bytes(out, " = ");
+                buf_bytes(out, " = &");
                 buf_bytes(out, buf_slice(field));
                 buf_bytes(out, "; ");
-                put_printer(out, buf_slice(e), trim(t[i..end]), 0, depth + 1);
+                put_printer(out, buf_slice(ed), trim(t[i..end]), 0, depth + 1);
                 buf_bytes(out, "} ");
                 n += 1;
                 i = end + 1;
