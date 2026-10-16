@@ -62,7 +62,10 @@ no-query: need the comment above run_gvn, show omits it` (or `# no-tool:
 every Write/Edit of a `.tach` file and every writing `tachyonc` command:
 what changed since the last check (new errors, how many fixed) is added
 to that call's result; nothing added means no change, so do not run
-`check` after an edit. `turn-end.py` checks once more when you stop and
+`check` after an edit. Errors with an exact fix (`try: tachyonc fix
+--suggested`) it fixes itself and says so, each with its fix (`tachyonc
+undo` takes it back; `TACHYON_HOOK_FIX=0`: off). `check` and a build
+print `ok: ...` when there is no error. `turn-end.py` checks once more when you stop and
 blocks the stop once if errors are left. When a tool falls short, record
 it in one line: `tools/agent-feedback "query refs" "misses uses inside
 never-instantiated generic fns"`.

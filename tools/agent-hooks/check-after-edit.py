@@ -25,10 +25,22 @@ once each, with how many errors they answer:
     try: tachyonc fix --only unsafe main.tach   (3 of the errors)
 
 (0.18) `fix --suggested` first: the errors' exact fixes (a did-you-mean
-name, a conversion, a missing `use` or `pub`, ...), which the hook only
-names, never applies:
+name, a conversion, a missing `use` or `pub`, ...):
 
     try: tachyonc fix --suggested main.tach   (2 of the errors: their exact fixes, one checked edit)
+
+(0.18.1) The hook applies them itself: when errors have that `try:` (the
+compiler marks only exact fixes so), it runs `tachyonc fix --suggested
+ROOT` (one checked edit, journaled: `tachyonc undo` takes it back),
+checks again and says what it fixed, each error with its fix, before the
+errors left (the 0.18 eval: the line was offered 43 times and run once):
+
+    tachyonc fix --suggested main.tach, run by the hook (tachyonc undo takes it back; positions as before it; main.tach changed: read it again before an Edit):
+    fixed main.tach:2:5: undefined variable 'prinln' | did you mean 'println'?
+    tachyonc check main.tach: 0 errors (1 fixed)
+
+TACHYON_HOOK_FIX=0: the hook names the fix and applies nothing, as
+before. Not at a turn's end (turn-end.py).
 
 and the compiler is run under the name the agent can type (`tachyonc` when
 it is the one on PATH, else its path from the event's directory), so the
@@ -69,7 +81,8 @@ it is the one on PATH, else its path from the event's directory), so the
   same error is made twice or an error's help names the guide
   (TACHYON_HINTS=0: never).
 
-TACHYON_CHECK_HOOK=0 turns it off. Development tooling only.
+TACHYON_CHECK_HOOK=0 turns it off; TACHYON_HOOK_FIX=0 leaves the exact
+fixes to the agent. Development tooling only.
 """
 import json
 import os
@@ -204,20 +217,28 @@ def compiler_for(where, ran=None, root=None):
     return which("tachyonc")
 
 
+def run_typed(compiler, cwd, args):
+    """compiler with args, run in cwd under the name the agent types (its
+    try: lines say so); None when it could not run."""
+    import subprocess  # (here: the hook's no-op path stays cheaper)
+    try:
+        return subprocess.run([typed_name(compiler, cwd)] + args, executable=compiler, cwd=cwd,
+                              capture_output=True, text=True, timeout=TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def root_args(root, cwd):
+    """[root] as a command names it from cwd; [] for check's default."""
+    return [os.path.relpath(root, cwd) if root and root.startswith(cwd + os.sep) else root] if root else []
+
+
 def run_check(compiler, root, cwd):
     """The diagnostics of `check` on root (None: check's default), as
     dicts with the keys of --json; None when check could not run."""
-    import subprocess  # (here: the hook's no-op path stays cheaper)
-
-    shown = typed_name(compiler, cwd)
-
     def run(args):
-        try:
-            return subprocess.run([shown] + args[1:], executable=args[0], cwd=cwd, capture_output=True,
-                                  text=True, timeout=TIMEOUT)
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-    tail = [os.path.relpath(root, cwd) if root and root.startswith(cwd + os.sep) else root] if root else []
+        return run_typed(args[0], cwd, args[1:])
+    tail = root_args(root, cwd)
     r = run([compiler, "check", "--json"] + tail)
     if r is None:
         return None
@@ -249,6 +270,47 @@ def parse_short(line):
             "help": [p[6:] for p in parts[1:] if p.startswith("help: ")],
             "notes": [p[6:] for p in parts[1:] if p.startswith("note: ")],
             "try": [p[5:] for p in parts[1:] if p.startswith("try: ")]}
+
+
+def exact_errors(errors):
+    """(0.18.1) The errors the compiler has an exact fix for: their try:
+    names `fix --suggested`."""
+    return [d for d in errors if any(SUGGESTED.search(t) for t in d.get("try") or [])]
+
+
+def apply_exact(compiler, root, cwd):
+    """(0.18.1) `tachyonc fix --suggested ROOT` (--json): the errors'
+    exact fixes, one checked edit. [(file, what it fixed there)], or None
+    when it changed nothing (refused, or nothing to fix)."""
+    r = run_typed(compiler, cwd, ["fix", "--suggested", "--json"] + root_args(root, cwd))
+    if r is None:
+        return None
+    changed = []
+    for line in (r.stdout + r.stderr).splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        f = d.get("fields") if isinstance(d, dict) and d.get("kind") == "output" else None
+        if f and str(f[0]).startswith("fixed"):
+            changed.append((str(f[1]) if len(f) > 1 else "", str(f[0])))
+    return changed or None
+
+
+def fixed_report(fixed, changed, root_shown):
+    """(0.18.1) What the hook's `fix --suggested` did: a head, then each
+    fixed error with its fix (its help), at the position it had."""
+    where = " " + root_shown if root_shown else ""
+    files = ", ".join(sorted({f for f, _ in changed if f})) or "the files"
+    lines = [f"tachyonc fix --suggested{where}, run by the hook (tachyonc undo takes it back; positions as "
+             f"before it; {files} changed: read {'it' if ',' not in files else 'them'} again before an Edit):"]
+    for d in fixed:
+        pos = f"{d['file']}:{d['line']}:{d['col']}: " if d.get("file") else ""
+        fix = " | ".join(d.get("help") or []) or "its exact fix"
+        lines.append(f"fixed {pos}{d.get('message', '')} | {fix}")
+    if not fixed:
+        lines.append("fixed: " + "; ".join(f"{f}: {what}" for f, what in changed))
+    return "\n".join(lines)
 
 
 def typed_name(compiler, cwd):
@@ -301,7 +363,8 @@ def fix_lines(errors):
     fixes = fix_commands(errors)
     def which(cmd, k):
         what = 'the error' if n == 1 else 'all of them' if k == n else f'{k} of the errors'
-        # (0.18) the hook applies nothing: the agent sees the fixes and runs them
+        # (0.18: named for the agent to run; 0.18.1: what is left after the
+        # hook ran it, or all of it with TACHYON_HOOK_FIX=0)
         return what + ": their exact fixes, one checked edit" if SUGGESTED.search(cmd) else what
     return ([f"try: {cmd}   ({which(cmd, k)})" for cmd, k in fixes], {cmd for cmd, _ in fixes})
 
@@ -581,12 +644,33 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
     key_root = root or default_root(cwd)
     shown = root_shown(root, cwd, run_dir)
     errors = [d for d in diags if d.get("severity") == "error"]
+    # (0.18.1) the errors' exact fixes, applied: fix --suggested, then check again
+    fixed_text, hook_fixed = "", None
+    exact = exact_errors(errors) if not at_turn_end and os.environ.get("TACHYON_HOOK_FIX", "1") != "0" else []
+    if exact:
+        changed = apply_exact(compiler, root, run_dir)
+        again = run_check(compiler, root, run_dir) if changed else None
+        if again is not None:
+            errors = [d for d in again if d.get("severity") == "error"]
+            left = {}
+            for d in errors:
+                left[error_key(d)] = left.get(error_key(d), 0) + 1
+            fixed = []
+            for d in exact:
+                if left.get(error_key(d), 0) > 0:
+                    left[error_key(d)] -= 1
+                else:
+                    fixed.append(d)
+            hook_fixed = len(fixed)
+            fixed_text = fixed_report(fixed, changed, shown)
     roots = st.setdefault("roots", {})
     key = key_root or ("check@" + cwd)
     prev = roots.get(key) or {}
     keys = [error_key(d) for d in errors]
     text = report(errors, shown, edited) if at_turn_end else delta_report(errors, prev.get("errors"), shown, edited)
-    texts = [text] if text else []
+    if fixed_text and not text:
+        text = f"tachyonc check{' ' + shown if shown else ''}: 0 errors"
+    texts = [t for t in (fixed_text, text) if t]
     entry = {"errors": keys, "time": time.time(), "root": key_root}
     fp = hs.fingerprint(key_root)[0] if key_root else ""
     entry["fp"] = fp
@@ -610,6 +694,8 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
            "codes": sorted({d.get("code") or "" for d in errors}), "ms": ms}
     if prev.get("errors") is not None:
         rec["new"] = len([k for k in keys if k not in (prev.get("errors") or [])])
+    if hook_fixed is not None:
+        rec["hook_fixed"] = hook_fixed
     last = prev.get("tests")
     if last:
         entry["tests"] = last
