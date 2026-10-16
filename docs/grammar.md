@@ -876,7 +876,8 @@ fn main() -> i32 {
   included.
 
 Dereferencing a borrow (`*p`, `p.f`, `p.m()`) is safe; indexing it
-(`p[i]`) is not (a borrow is one value, not an array). In exchange, a
+(`p[i]`) is not (a borrow is one value, not an array), except that a
+borrow of a Vec, a Buf or a slice indexes its pointee (0.17). In exchange, a
 call passing something other than a borrow to a pointer parameter (a
 pointer field, a local holding a pointer, `malloc`'s result, `c"..."`,
 which is read-only memory) is unsafe: the caller vouches for it. A
@@ -1538,8 +1539,12 @@ unreachable code". Both are safe; their effect is
 `v[a..b]` on std's `Vec` and `Buf` are `v.as_slice()[i]` (and so on):
 checked, a place to assign without `mut` (as a slice's element is); the
 slice is valid until the Vec grows or is freed. A `HashMap` is not
-indexed (`m.get(k)` is an Option: Rust's `m[k]` panics). A pointer to a
-Vec indexes the pointer, as before (`unsafe`).
+indexed (`m.get(k)` is an Option: Rust's `m[k]` panics). Through a
+borrow of a Vec, a Buf or a slice (a pointer parameter, `&v`), `p[i]` and
+`p[a..b]` index the pointee (`p.as_slice()[i]`, `(*p)[i]`), checked and
+safe, as `p.get(i)` is. On a raw pointer they stay pointer arithmetic
+(`unsafe`; the error names `(*p)[i]`, the element, instead of an `unsafe`
+block).
 
 **Through a pointer.** `p.0` on a `*(A, B)` is `(*p).0`, as `p.x` on a
 `*S` is `(*p).x`: safe when `p` is a borrow (a parameter, `&x`),

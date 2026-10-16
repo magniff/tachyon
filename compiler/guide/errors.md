@@ -664,7 +664,9 @@ fn first(p: *i64) -> i64 { p[1] }
 ```err
 error[unsafe] indexing a raw pointer is unsafe
 ```
-A pointer is one value; for many, take a slice `[i64]`.
+A pointer is one value; for many, take a slice `[i64]`. A pointer
+parameter to a Vec, a Buf or a slice (`v: *Vec<i64>`) indexes what it
+points to, safely; another pointer to one says to write `(*p)[i]`.
 
 ```tach
 fn read(x: *i64) -> i64 { *x }

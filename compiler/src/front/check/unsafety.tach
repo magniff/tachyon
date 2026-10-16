@@ -20,7 +20,11 @@
 // a warning in 0.9). `--fix-unsafe` wraps them in unsafe blocks
 // (fixunsafe.tach).
 
-use crate::base::diag::report_error_once;
+use crate::base::SRC;
+use crate::base::diag::{
+    ERR_KIND, err_begin, err_end_soft, err_help, err_str, err_try_fmt, error_keyed,
+    report_error_once,
+};
 use crate::front::ambient::check_ambient_call;
 use crate::front::ast::{FN_UNSAFE, NODES, child};
 use crate::front::ast::NodeKind::{FieldAccess, Ident, TupleField, TyPtr, Unary};
@@ -28,7 +32,7 @@ use crate::front::check::{CONST_CONTEXT, LOCALS, Res};
 use crate::front::check::check_mode::check_expr;
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::lexer::Tok;
-use crate::front::types::FNS;
+use crate::front::types::{FNS, err_type};
 use crate::tools::fixunsafe::{FIX_UNSAFE, note_unsafe_site};
 
 pub static mut UNSAFE_DEPTH: i64 = 0;
@@ -78,6 +82,40 @@ pub fn unsafe_op(n: i64, key: i64, message: *u8) {
         report_error_once(NODES[n].start, key, c"unsafe", message,
             c"put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place)",
             "fix --only unsafe");
+    }
+}
+
+// (0.17) `p[i]` (`p[a..b]`) on a raw pointer to a Vec, a Buf or a slice
+// (pointee), outside unsafe code. It stays pointer arithmetic, the value
+// at that offset from p (statics such as BUFS are arrays), but is seldom
+// what was meant; so the error is not unsafe_op's, whose try: would wrap
+// the arithmetic in `unsafe`: it names the element, `(*p)[i]`.
+pub fn unsafe_view_index(n: i64, base: i64, index: i64, pointee: i64, slicing: bool) {
+    if UNSAFE_DEPTH > 0 || CONST_CONTEXT {
+        return;
+    }
+    unsafe {
+        let key = if slicing { U_SLICE } else { U_INDEX };
+        if error_keyed(NODES[n].start, key) {
+            return;
+        }
+        let saved = ERR_KIND;
+        ERR_KIND = c"unsafe";
+        err_begin(NODES[n].start);
+        err_str(if slicing { c"slicing a raw pointer to '" }
+            else { c"indexing a raw pointer to '" });
+        err_type(pointee);
+        err_str(c"' is unsafe pointer arithmetic over '");
+        err_type(pointee);
+        err_str(c"' values, not indexing the one it points to");
+        err_help(c"`(*p)[i]` indexes what p points to: safe through a borrow (a pointer parameter, `&v`), unsafe through a raw pointer, as `p.get(i)` is");
+        if NODES[base].end > NODES[base].start && NODES[index].end > NODES[index].start {
+            let b = SRC[NODES[base].start..NODES[base].end];
+            let i = SRC[NODES[index].start..NODES[index].end];
+            err_try_fmt(f"(*{b})[{i}]");
+        }
+        err_end_soft();
+        ERR_KIND = saved;
     }
 }
 
