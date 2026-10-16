@@ -1441,6 +1441,39 @@ the previous release, and nothing below uses 0.17's syntax until 0.17 ships.
 std's `stdsrc.tach` conflicts are resolved by rerunning embed.sh. Each task
 appends "Tn notes" here.
 
+**T1 and T5 notes (branch b18-contracts).**
+- *How clauses are made* (front/contracts/expand.tach): before the names
+  are collected, a function with a `requires` gets a companion
+  `f?pre(?site, <params>)` beside it (same module, impl, generics), and one
+  with an `ensures` has its body moved to `f?body`, f calling it and
+  checking `result` (`old(e)` are lets at entry). Being ordinary functions,
+  they are instantiated, lazy in std and inferred like any other; nothing
+  is cloned per instance by hand. A checked call of f becomes `{ let ?aI =
+  argI; f?pre(SITE, ..); f(..) }` (desugar.tach; simple reads are read
+  again, not bound). Both back ends lower `std::contract_check(COND, SITE,
+  CHECK[, holes])` as a branch per `&&` conjunct to rt.panic.
+- *Reports* (checks.tach): the integer operands of a comparison or call;
+  other values are not shown yet (no Debug on the failing path). `else
+  "m"` replaces the condition; `else f"..."` takes up to three integer
+  holes, evaluated only on failure, which keeps std's old messages byte for
+  byte. An ensures blames the clause's line, not the return's.
+- *Sites* (sites.tach): one per position, (line, file << 16 | column) in
+  rt.sites; rt.panic takes the site as a fifth argument and prints
+  `FILE:LINE:COL: ` first. `--no-positions` makes every site 0. The `note:
+  build with --trace` line is kept for now.
+- *Measured* (aarch64-macos, instructions retired, -O2, against
+  b18-phase0): bench within ±0.5% (sieve −1.2%); the -O2 self-compile
+  +0.5%; the compiler's binary +3.1% (code and the site table).
+- *Left for 0.18.1*: the checking entry for calls through fn values and
+  trait objects (they skip a requires today), hence no entry facts in the
+  callee and std's body checks kept; result facts in the caller; type
+  invariants and `contract.sealed`; `contract.old`'s kind rule (0.17),
+  `contract.violated` at compile time, `contract.impl-requires`, clauses on
+  trait methods; `macro.args`; `query effects --why` naming a clause; the
+  std body check behind `Vec::get`'s requires is not removed when the
+  length goes through `as_slice` (`sub len, 0` of another type stops the
+  ranges).
+
 **The gate gains:**
 - the level comparison over tests/run's programs as `tachyonc test` runs it;
 - a fuzz mode (`-K`) whose generated programs carry clauses (the outcome must
