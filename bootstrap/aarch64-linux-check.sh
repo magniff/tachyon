@@ -33,6 +33,10 @@
 #   --objcheck     also check the compiler's objects against cc -c
 #                  (tests/objcheck.sh)
 #   --debugger     also check debug information with gdb (tests/debug.sh)
+#   --valgrind     also run the compiler under valgrind's memcheck
+#                  (tests/valgrind.sh, 0.18.1)
+#   --only STEPS   run these checks of bootstrap/gate.sh instead (after
+#                  the fixpoint), e.g. --only valgrind
 #   --cpus N       the container's CPUs (default 8, at most docker's)
 #   --rebuild-image  rebuild the image even if its recipe is unchanged
 #
@@ -51,6 +55,8 @@ FUZZ=0
 ABI=0
 OBJCHECK=0
 DEBUGGER=0
+VALGRIND=0
+ONLY=""
 CPUS=8
 COMPILER=""
 REBUILD_IMAGE=0
@@ -70,6 +76,7 @@ for arg in "$@"; do
     case "$want" in
         cpus) CPUS=$arg; want=""; continue ;;
         compiler) COMPILER=$arg; want=""; continue ;;
+        only) ONLY=$arg; want=""; continue ;;
     esac
     case "$arg" in
         --worktree) WORKTREE=1; rest="$rest --worktree" ;;
@@ -79,12 +86,15 @@ for arg in "$@"; do
         --abi=*) ABI=${arg#--abi=} ;;
         --objcheck) OBJCHECK=1 ;;
         --debugger) DEBUGGER=1 ;;
+        --valgrind) VALGRIND=1 ;;
+        --only) want=only ;;
+        --only=*) ONLY=${arg#--only=} ;;
         --cpus) want=cpus ;;
         --cpus=*) CPUS=${arg#--cpus=} ;;
         --compiler) want=compiler ;;
         --compiler=*) COMPILER=${arg#--compiler=} ;;
         --rebuild-image) REBUILD_IMAGE=1 ;;
-        -h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) rest="$rest $(quote "$arg")" ;;
     esac
 done
@@ -121,7 +131,7 @@ ensure_image "$IMAGE" "$PLATFORM" "$ROOT/bootstrap/ci/linux-aarch64.Dockerfile"
 echo "==> on aarch64-linux, in the container ($CPUS CPUs)" >&2
 tar -C "$SNAP" -c -f - src tachyonc.o | docker run --rm -i --name "$CONTAINER" --cpus "$CPUS" --platform "$PLATFORM" \
     -e CPUS="$CPUS" -e ALL_LEVELS="$ALL_LEVELS" -e FUZZ="$FUZZ" -e ABI="$ABI" -e OBJCHECK="$OBJCHECK" \
-    -e DEBUGGER="$DEBUGGER" "$IMAGE" sh -c '
+    -e DEBUGGER="$DEBUGGER" -e VALGRIND="$VALGRIND" -e ONLY="$ONLY" "$IMAGE" sh -c '
     set -eu
     mkdir /work
     tar -x --no-same-owner -f - -C /work
@@ -166,6 +176,8 @@ tar -C "$SNAP" -c -f - src tachyonc.o | docker run --rm -i --name "$CONTAINER" -
     [ "$ABI" != 0 ] && steps="$steps,abi-*,layout"
     [ "$OBJCHECK" = 1 ] && steps="$steps,objcheck"
     [ "$DEBUGGER" = 1 ] && steps="$steps,debug"
+    [ "$VALGRIND" = 1 ] && steps="$steps,valgrind"
+    [ -z "$ONLY" ] || steps=$ONLY
     echo "==> the checks: $(echo "$steps" | tr "," " ")" >&2
     exec sh bootstrap/gate.sh --inside -c target/tachyonc -j "$CPUS" --only "$steps" \
         --fuzz "$([ "$FUZZ" = 0 ] && echo 1 || echo "$FUZZ")" --abi "$([ "$ABI" = 0 ] && echo 1 || echo "$ABI")"

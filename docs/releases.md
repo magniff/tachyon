@@ -1371,7 +1371,17 @@ in an example stops it with where the block was allocated and freed;
 added after examples/errors-and-results printed an error holding a view
 of memory it had freed; through `TACHYON_TEST_FLAGS=--check-alloc`, which
 a case whose output differs by design with the flag declines with `//
-NO-EXTRA-FLAGS: why`); and the two containers: `linux-x86_64`
+NO-EXTRA-FLAGS: why`); `valgrind` (0.18.1, `--release` only, in the
+`linux-aarch64` container, where valgrind is: `tests/valgrind.sh`, the
+compiler under memcheck, its -O2 self-compile at `-j4` and the
+compilations of the `opt_*`, `own_*` and `contract_*` cases and a few
+examples at -O0 and -O2; any invalid read or write or use of an
+uninitialised value fails it, leaks do not, as the compiler leaves its
+memory to the exit; added after two memory bugs of 0.17, an SLP table
+overflow and a read of the own pass's place -1, passed every macOS check
+and only valgrind showed them; about 2 minutes, beside the container's other steps; on its own:
+`bootstrap/aarch64-linux-check.sh --worktree --dev --compiler
+target/tachyonc --only valgrind`); and the two containers: `linux-x86_64`
 (`bootstrap/linux-check.sh`, which builds its own chain and so starts at
 once) and `linux-aarch64` (`bootstrap/aarch64-linux-check.sh --compiler`:
 the chain's compiler cross-compiles the tree). Inside each container the
