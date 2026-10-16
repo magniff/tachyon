@@ -724,19 +724,42 @@ pub fn is_context_literal(e: i64) -> bool {
 // types join to the wider one: an operand of a definite type is
 // synthesized first (widen::takes_context), and the narrower is widened;
 // an operand whose type comes from context (a literal, `None`) takes the
-// other's.
+// other's. (0.18.1) An operand that is a reference to a number or a bool
+// (a pattern's binding on a reference, `n + 1`; a closure's `&i64`) is
+// read through, as Rust's operators on `&i64` do.
 fn synth_operands(lhs: i64, rhs: i64) -> i64 {
     if literal_takes_rhs_type(lhs, rhs) || takes_context(lhs) && !takes_context(rhs) {
-        let rhs_ty = synth_expr(rhs);
+        let rhs_ty = read_through(rhs, synth_expr(rhs));
         check_expr(lhs, rhs_ty);
         return rhs_ty;
     }
-    let lhs_ty = synth_expr(lhs);
+    let lhs_ty = read_through(lhs, synth_expr(lhs));
     if is_integer(lhs_ty) && !takes_context(rhs) {
         return join_operands(lhs, lhs_ty, rhs);
     }
     check_expr(rhs, lhs_ty);
     lhs_ty
+}
+
+// (0.18.1) Operand e (of BINARY_NODE) of type ty: when it is `&T` of a
+// number or a bool, `*e` in its place; T, or ty.
+pub fn read_through(e: i64, ty: i64) -> i64 {
+    unsafe {
+        let b = BINARY_NODE;
+        if !is_ref(ty) || b <= 0 || !(is_numeric(TYPES[ty].a) || TYPES[ty].a == TY_BOOL) {
+            return ty;
+        }
+        let t = TYPES[ty].a;
+        let u = synthetic_unary(Tok::Star, e, t);
+        if NODES[b].b == e {
+            NODES[b].b = u;
+        } else if NODES[b].c == e {
+            NODES[b].c = u;
+        } else {
+            return ty;
+        }
+        t
+    }
 }
 
 fn synth_binary(n: i64) -> i64 {
@@ -958,9 +981,10 @@ fn synth_unary(n: i64) -> i64 {
 }
 
 // (0.18.1) `&e` of a value where no temporary is made for it
-// (check/temps.tach: something evaluated before it in its statement, or a
-// condition's other side): bind it first, `let t = e;`, then `&t`; the
-// try: is the statement so, when it is on one line.
+// (check/temps.tach: something evaluated before it in its statement):
+// bind it first, `let t = e;`, then `&t`; the try: is the statement so,
+// when it is on one line, with a name the statement does not use (`t`
+// may be the receiver).
 fn non_lvalue_error(n: i64, operand: i64) {
     unsafe {
         err_begin(NODES[n].start);
@@ -970,25 +994,53 @@ fn non_lvalue_error(n: i64, operand: i64) {
         let a = NODES[n].start;
         let b = NODES[n].end;
         if s > 0 && NODES[s].start <= a && b <= NODES[s].end {
+            let text = SRC[NODES[s].start..NODES[s].end];
             let mut one_line = true;
-            for i in NODES[s].start..NODES[s].end {
-                if SRC[i] == '\n' {
+            for i in 0..text.len() {
+                if text[i] == '\n' {
                     one_line = false;
                 }
             }
             if one_line {
+                let mut name: [u8] = "t";
+                if uses_word(text, "t") {
+                    name = "tmp";
+                    if uses_word(text, "tmp") {
+                        name = "tmp_ref";
+                    }
+                }
                 let t = buf_new();
-                buf_bytes(t, "let t = ");
+                buf_bytes(t, "let ");
+                buf_bytes(t, name);
+                buf_bytes(t, " = ");
                 buf_bytes(t, SRC[NODES[operand].start..NODES[operand].end]);
                 buf_bytes(t, "; ");
                 buf_bytes(t, SRC[NODES[s].start..a]);
-                buf_bytes(t, if (NODES[n].p & NODE_REF_MUT) != 0 { "&mut t" } else { "&t" });
+                buf_bytes(t, if (NODES[n].p & NODE_REF_MUT) != 0 { "&mut " } else { "&" });
+                buf_bytes(t, name);
                 buf_bytes(t, SRC[b..NODES[s].end]);
                 err_try_fmt(buf_slice(t));
             }
         }
         err_end();
     }
+}
+
+// Whether text has the identifier w (not inside a longer name).
+fn uses_word(text: [u8], w: [u8]) -> bool {
+    let mut i = 0;
+    while i + w.len() <= text.len() {
+        if text[i..i + w.len()] == w && (i == 0 || !is_word_byte(text[i - 1]))
+            && (i + w.len() == text.len() || !is_word_byte(text[i + w.len()])) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn is_word_byte(c: u8) -> bool {
+    c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
 }
 
 // `&f` or `*f` (node n) of a function value f (operand): a function's name

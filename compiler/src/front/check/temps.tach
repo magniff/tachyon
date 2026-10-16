@@ -168,7 +168,10 @@ fn visit(e: i64) {
         let k = NODES[e].kind;
         if k == NodeKind::Unary && NODES[e].op == Tok::Amp {
             let o = NODES[e].b;
-            if !is_value_expr(o) {
+            // (0.18.1: `&pool[a..b]`, a slice, where `&[u8]` is expected)
+            let slicing = NODES[o].kind == NodeKind::Index
+                && NODES[NODES[o].b].kind == NodeKind::Range && (NODES[e].p & NODE_REF_MUT) == 0;
+            if !is_value_expr(o) && !slicing {
                 visit(o);
                 return;
             }
@@ -200,7 +203,9 @@ fn visit(e: i64) {
         } else if k == NodeKind::Binary {
             visit(NODES[e].b);
             if NODES[e].op == Tok::AmpAmp || NODES[e].op == Tok::PipePipe {
-                // (its right side is evaluated or not)
+                // (its right side is evaluated or not: its temporaries in a
+                // block of its own, 0.18.1)
+                NODES[e].c = visit_sub(NODES[e].c);
                 IMPURE = true;
                 return;
             }
@@ -230,15 +235,55 @@ fn visit(e: i64) {
                 }
             }
         } else if k == NodeKind::If || k == NodeKind::Match {
-            // (the condition, the scrutinee; the rest is evaluated or not)
+            // (the condition, the scrutinee; the rest is evaluated or not:
+            // an arm's temporaries in a block of their own, 0.18.1)
             visit(NODES[e].a);
+            if k == NodeKind::Match {
+                for i in 0..NODES[e].count {
+                    let arm = child(e, i);
+                    NODES[arm].c = visit_sub(NODES[arm].c);
+                }
+            }
             IMPURE = true;
+        } else if k == NodeKind::Closure {
+            // (0.18.1: a body that is an expression, `|a, b| cmp(&f(a),
+            // &f(b))`: its temporaries in a block of their own)
+            NODES[e].a = visit_sub(NODES[e].a);
         } else if k == NodeKind::Assign {
             visit(NODES[e].c);
             IMPURE = true;
         } else if impure(e) {
             IMPURE = true;
         }
+    }
+}
+
+// (0.18.1) Expression e, evaluated or not with its statement (a
+// condition's other side, a match arm's value, a closure's body): its
+// temporaries go in a block made for it, `{ let f(x) = f(x); e }`; that
+// block, or e when it has none.
+fn visit_sub(e: i64) -> i64 {
+    unsafe {
+        if e == 0 || NODES[e].kind == NodeKind::Block {
+            return e;
+        }
+        let mark = LETS.count;
+        let saved = IMPURE;
+        IMPURE = false;
+        visit(e);
+        IMPURE = saved;
+        if LETS.count == mark {
+            return e;
+        }
+        let b = new_node(NodeKind::Block, NODES[e].start, NODES[e].end);
+        let m = list_begin();
+        for j in mark..LETS.count {
+            list_push(LETS.data[j]);
+        }
+        list_end(b, m);
+        NODES[b].a = e;
+        LETS.count = mark;
+        b
     }
 }
 
