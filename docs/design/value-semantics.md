@@ -877,7 +877,37 @@ Phase 0 fixed the interfaces below; T1–T6 build against them in parallel. A ta
 - **The skeleton alone is over the budget** (about 10% of the checker, above). V2's 8% now has to be met by T2 with a cheaper traversal, or V2 revisited.
 - **`&mut` moves (§2.1), but agents pass one reference local many times** (§"Pending: eval findings"). Passing a `&mut` local to a parameter must be an implicit reborrow (T2), or it reintroduces the `error[unsafe]` family as `own.moved`.
 - **`Default` for containers carries an allocator.** `std::take(&mut self.keys)` needs an empty `Vec<T, A>`; `Gpa` is zero-sized, an arena handle is not. T4 decides between `A: Default` (no `take` on arena containers) and a container-specific `take`.
-- **Kinds can be asked during type checking** (the `Copy` bound) before a closure's captures are known; `type_kind` memoizes by type id, so T1 must make sure closure kinds are computed after `finish_closure`, or not memoized before.
+- **Kinds can be asked during type checking** (the `Copy` bound) before a closure's captures are known; `type_kind` memoizes by type id, so T1 must make sure closure kinds are computed after `finish_closure`, or not memoized before. *(T1: moot. A closure's struct type is made inside `finish_closure`, after its capture modes are set, so no kind can be asked of it earlier.)*
+
+**T1 as built (branch c17-t1).** Drops, moves, and the move codes.
+- **Placing the drops** (front/own/drops.tach, called from check/body.tach and patterns/mod.tach):
+  - After a `let`, the checker inserts an implicit defer for each binding whose type has glue, and checks it where it stands.
+  - A body starts with one implicit defer per by-value parameter, except std's `forget`.
+  - A match by value wraps each arm's body in a block that starts with its owned bindings' drops.
+  - A match reached through a reference, an index or a static, and a `for` loop's element, bind by reference instead (`BYREF`): nothing is dropped, and moving such a binding is `own.move_out`. These are binding modes without `&T` binding types, which wait for reference type arguments (0.17.1).
+  - The binding of a `for` loop over `next()` is neither dropped nor by reference (`ARM_FOR_NEXT`) until T4 settles what iterators yield.
+  - A temporary discarded by `e;` becomes `{ let __own_tmp = e; }`.
+  - `p = rhs` on an owned place becomes `{ let __own_new = rhs; { let =o = p; p = __own_new; } }`. The `=o` read is flagged `ASSIGN_OLD`: it takes p's state, and the drop of the old value uses that state. The desugaring is skipped when the place is reached through a raw pointer (such a write drops nothing, as `ptr::write` does) or through an index (the old value leaks, which is safe).
+- **Glue** (glue.tach) is untyped AST that the checker checks in place, rather than generated functions:
+  - a Drop impl gives `x.drop()`, then the fields;
+  - an enum gives a `match` (`GLUE_MATCH`) whose bindings drop through the arm mechanism above;
+  - an array gives a counted `while` loop;
+  - a closure drops its captures only if it is a `move` closure.
+  
+  `has_glue(T)` is also what `needs_drop::<T>()` folds to: the instance's body is rewritten before it is checked. std's containers get glue only once T4 implements `Drop` for them.
+- **Elaboration.** check_own walks the functions with drops in every mode but `off`. In `report` without printing, their findings are discarded. Each top-level glue statement is an *entry* with a field path.
+  - At each exit, the walk records whether the entry's place is there, moved, or maybe moved.
+  - `finish_drops` keeps an entry, removes it, or wraps it in `if __own_flag { .. }`.
+  - A flag is a hidden bool, declared just before the defer. It is cleared where the place moves: the move's node becomes `{ __own_flag = false; <node> }`. It is set again after an assignment's old-value drop.
+- **`--values=off`** places no drops, which is 0.16's semantics.
+- **Kinds.** A struct or enum with a `Drop` impl is owned *and* takes its fields' view bits, so `own.drop_view` sees a view type with `Drop`.
+- **Node flags** taken: bits 56–62 (`GLUE_MATCH`, `ASSIGN_OLD`, `MATCH_BYREF`, `NO_DROP`, `ARM_DROPS_DONE`, `PARAM_DROPS_DONE`, `ARM_FOR_NEXT`).
+- **std.** `std::replace` moves the old value out and the new one in through a raw pointer. Otherwise the assignment desugaring would drop the value it returns.
+- **Not done (0.17.1):**
+  - owned temporaries other than `e;` (method receivers, `let _ = e`);
+  - by-value closure parameters;
+  - assignments through an index;
+  - the error for calling `x.drop()` directly.
 
 ## 8. Prototype results (§6, branch c17-proto, 2026-10-15)
 
