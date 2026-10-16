@@ -4,7 +4,7 @@
 // arithmetic operands are checked against it; everything else is
 // synthesized and compared with it.
 
-use crate::base::{buf_new, buf_slice, buf_uint};
+use crate::base::{buf_new, buf_slice, buf_uint, intern_c};
 use crate::base::diag::{ERR, err_begin, err_end, err_help, err_help_fmt, err_int, err_str, err_sym};
 use crate::front::ast::{NODES, NODE_REF_MUT, NodeKind, REPR_UNION, child, new_node};
 use crate::front::ast::NodeKind::{
@@ -30,14 +30,14 @@ use crate::front::convert::into_call;
 use crate::front::generics::{HINT_NODE, HINT_TY, check_arg, env_lookup};
 use crate::front::generics::instantiate::infer_struct_literal;
 use crate::front::lexer::{SUF_NONE, Tok};
-use crate::front::modules::CUR_MOD;
+use crate::front::modules::{CUR_MOD, STD_MODULE};
 use crate::front::modules::lookup::{
     B_ITEM, B_PRIVATE, access_error, binding_kind, binding_value, lookup_item, note_c_use,
     path_module,
 };
 use crate::front::patterns::check_match;
 use crate::front::types::{
-    REF_MUT, REF_SHARED, STRUCTS, SYM_ALIAS, SYM_STRUCT, TYPES, TY_ERROR, TY_NEVER, TyKind,
+    FNS, REF_MUT, REF_SHARED, STRUCTS, SYM_ALIAS, SYM_STRUCT, TYPES, TY_ERROR, TY_NEVER, TyKind,
     buf_type, err_type, find_field, int_max, is_float, is_integer, is_numeric, is_signed,
     struct_field, struct_type, type_elem,
 };
@@ -181,8 +181,25 @@ pub fn coerce_ref(n: i64, actual: i64, expected: i64) -> bool {
         let ak = TYPES[actual].kind;
         let ek = TYPES[expected].kind;
         if ak == TyKind::Slice && ek == TyKind::Slice {
-            return TYPES[actual].a == TYPES[expected].a && TYPES[actual].b == REF_MUT
-                && TYPES[expected].b == 0;
+            if TYPES[actual].a != TYPES[expected].a {
+                return false;
+            }
+            if TYPES[actual].b == REF_MUT && TYPES[expected].b == 0 {
+                return true;
+            }
+            // (0.17, the legacy slice rule, like the legacy `*T` parameters
+            // through 0.17) a `[T]` where `&mut [T]` is expected,
+            // `sort(a[..])`, `sort(v.as_slice())`, `sort(s)`: the exclusive
+            // view, as `&mut a[..]`, `v.as_mut_slice()`; the own pass takes
+            // the parameter's loan (a write through a read-only view is its
+            // own.readonly), `fix --values` writes the `&mut`
+            if TYPES[actual].b == 0 && TYPES[expected].b == REF_MUT {
+                if fresh_slice(n) && NODES[n].kind == NodeKind::Index {
+                    NODES[n].p |= NODE_REF_MUT;
+                }
+                return true;
+            }
+            return false;
         }
         if ak != TyKind::Ptr || TYPES[actual].b == 0 {
             return false;
@@ -214,6 +231,22 @@ pub fn coerce_ref(n: i64, actual: i64, expected: i64) -> bool {
             return true;
         }
         false
+    }
+}
+
+// (0.17) Whether n makes a slice of a place: `a[x..y]`, `v.as_slice()` (a
+// call of std's as_slice, once checked) (coerce_ref's legacy slice rule).
+fn fresh_slice(n: i64) -> bool {
+    unsafe {
+        if NODES[n].kind == NodeKind::Index {
+            return NODES[NODES[n].b].kind == NodeKind::Range;
+        }
+        if NODES[n].kind == NodeKind::MethodCall {
+            return NODES[n].count == 0 && NODES[n].b == intern_c(c"as_slice");
+        }
+        let f = NODES[n].x - 1;
+        NODES[n].kind == NodeKind::Call && f >= 0 && FNS[f].module == STD_MODULE
+            && NODES[FNS[f].node].a == intern_c(c"as_slice")
     }
 }
 

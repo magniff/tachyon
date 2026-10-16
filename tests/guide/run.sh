@@ -379,10 +379,10 @@ fi
 # std#every-item is not in it. Its first screen (what `| head -60`
 # shows) is the most used names, then the overview.
 size=$(wc -c <"$WORK/topic-std.md" | tr -d ' ')
-if [ "$size" -le 16500 ] \
+if [ "$size" -le 17500 ] \
     && head -60 "$WORK/topic-std.md" | grep -q '^## The most used$' \
     && head -60 "$WORK/topic-std.md" | grep -qF 'Vec::new_in(gpa) -> Vec<T>' \
-    && head -60 "$WORK/topic-std.md" | grep -q '^## Overview$' && grep -qF 'fn push(self: *Self, x: T)' "$WORK/topic-std.md" \
+    && head -60 "$WORK/topic-std.md" | grep -q '^## Overview$' && grep -qF 'fn push(self: &mut Self, x: T)' "$WORK/topic-std.md" \
     && grep -qF 'fn split_in<A: Allocator>(s: [u8], sep: u8, a: A) -> Vec<[u8], A>' "$WORK/topic-std.md" \
     && ! grep -q '^## Every item' "$WORK/topic-std.md" \
     && ! grep -qF 'fn __' "$WORK/topic-std.md" \
@@ -390,7 +390,7 @@ if [ "$size" -le 16500 ] \
     && grep -q '^## Every item with its comment$' "$WORK/std/every.md"; then
     result pass guide-std-index
 else
-    result FAIL guide-std-index "tachyonc guide std is $size bytes (16500 at most), or not the index (most used first)"
+    result FAIL guide-std-index "tachyonc guide std is $size bytes (17500 at most), or not the index (most used first)"
 fi
 
 # The guide by piece (0.15): --find prints the paragraphs about the
@@ -428,7 +428,7 @@ else
 fi
 "$COMPILER" guide --find vec::push >"$WORK/findm.out" 2>&1
 if grep -q '^impl<T, A: Allocator> Vec<T, A> {$' "$WORK/findm.out" \
-    && grep -qF '    fn push(self: *Vec<T, A>, x: T)' "$WORK/findm.out" \
+    && grep -qF '    fn push(self: &mut Vec<T, A>, x: T)' "$WORK/findm.out" \
     && ! grep -qF 'fn pop' "$WORK/findm.out"; then
     result pass guide-find-method
 else

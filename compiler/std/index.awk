@@ -27,6 +27,9 @@ BEGIN {
     TRIGGERS["Iterators (0.14)"] = "Iterator IntoIterator"
     TRIGGERS["Conversions (0.15)"] = "From Into main_error"
     TRIGGERS["Clone, Eq, Ord and Hash without an impl (0.15)"] = "Eq Ord Hash Clone clone cmp eq hash sort sort_by sort_stable HashMap"
+    # (0.17) Words std's own code uses that need a section too: `x.clone()`
+    # of a number (Vec::filled_in) is copy_clone
+    NEEDS["Clone, Eq, Ord and Hash without an impl (0.15)"] = "clone"
     s = 0
     start[0] = 0
     title[0] = ""
@@ -186,6 +189,8 @@ END {
             if (i == j) continue
             need = 0
             nd = split(keys_list[j], dw, " ")
+            for (k = 1; k <= nd && !need; k++) if ((i, dw[k]) in USES) need = 1
+            nd = split(NEEDS[title[j]], dw, " ")
             for (k = 1; k <= nd && !need; k++) if ((i, dw[k]) in USES) need = 1
             np = split(impls[j], ip, " ")
             for (k = 1; k + 1 <= np && !need; k += 2) {
