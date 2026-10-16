@@ -370,7 +370,7 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
             return status;
         }
         let f = DEFS[d].node;
-        let fqn = sym_text(DEFS[d].fqn);
+        let mut fqn = sym_text(DEFS[d].fqn);
         if pk(f) == NodeKind::ExternFn || NODES[f].y == 1 {
             let e = diag(c"error", c"refactor.extern");
             buf_bytes(e, fqn);
@@ -731,10 +731,36 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
                 return no_param(d, f, retype);
             }
             let ty = c_slice(opt(&opts, c"--type", true));
+            // (0.17: to a reference, without --default: the calls' `&x`
+            // become `&mut x`, a value `x` becomes `&x` or `&mut x`, a
+            // slice `v.as_slice()` or `a[..]` becomes `v.as_mut_slice()`
+            // or `&mut a[..]`)
+            let auto = ref_change(pb(pchild(f, k)), ty);
             for g in 0..group.count {
                 let p = pchild(DEFS[group.data[g]].node, k);
                 let t = pb(p);
                 edit_replace(pstart(t), pend(t), text_buf(ty));
+            }
+            let mut changed = 0;
+            if default == 0 as *u8 && auto != RC_NONE {
+                for i in 0..calls.count {
+                    let c = calls.data[i];
+                    list_of_node(c);
+                    let off = if pk(c) == NodeKind::MethodCall && self_param { 1 } else { 0 };
+                    let i0 = arg_for(f, c, k, off);
+                    if i0 < 0 {
+                        continue;
+                    }
+                    let mut v = pchild(c, i0);
+                    if pk(v) == NodeKind::NamedArg {
+                        v = pb(v);
+                    }
+                    let nb = ref_argument(auto, SRC[pstart(v)..pend(v)]);
+                    if nb >= 0 {
+                        edit_replace(pstart(v), pend(v), nb);
+                        changed += 1;
+                    }
+                }
             }
             // (--default: each call's argument becomes EXPR, 0.13)
             if default != 0 as *u8 {
@@ -761,6 +787,14 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
             buf_str(what, c" to ");
             buf_bytes(what, ty);
             buf_str(what, c" in ");
+            if changed > 0 {
+                buf_bytes(what, fqn);
+                buf_str(what, c", ");
+                put_count(what, changed, c"argument", c"arguments");
+                buf_str(what, c" in ");
+                put_count(what, calls.count, c"call", c"calls");
+                fqn = c_slice(c"");
+            }
         }
         buf_bytes(what, fqn);
         if group.count > 1 {
@@ -787,7 +821,7 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
 // --default EXPR for a call whose argument was `arg`: EXPR with `$NAME`
 // (the parameter's name) replaced by the argument, in parentheses unless
 // it is a name, a number or a path (0.13). A buffer.
-fn with_argument(expr: [u8], name: [u8], arg: [u8]) -> i64 {
+pub fn with_argument(expr: [u8], name: [u8], arg: [u8]) -> i64 {
     let out = buf_new();
     let mut plain = arg.len > 0;
     for i in 0..arg.len {
@@ -803,11 +837,25 @@ fn with_argument(expr: [u8], name: [u8], arg: [u8]) -> i64 {
         let ends = e >= expr.len || !(expr[e] == '_' || (expr[e] >= 'a' && expr[e] <= 'z')
             || (expr[e] >= 'A' && expr[e] <= 'Z') || (expr[e] >= '0' && expr[e] <= '9'));
         if expr[i] == '$' && e <= expr.len && bytes_eq(expr[i + 1..e], name) && ends {
-            if !plain {
+            // (0.17: `&$x` or `&mut $x` of an argument `&v` is `&v` or
+            // `&mut v`, not a reference to a reference)
+            let mut a = arg;
+            let mut p = plain;
+            let had = buf_slice(out);
+            if had.len > 0 && had[had.len - 1] == '&' || had.len >= 5
+                && bytes_eq(had[had.len - 5..had.len], "&mut ") {
+                if a.len > 5 && bytes_eq(a[0..5], "&mut ") {
+                    a = a[5..a.len];
+                } else if a.len > 1 && a[0] == '&' && a[1] != '&' {
+                    a = a[1..a.len];
+                }
+                p = plain_text(a);
+            }
+            if !p {
                 buf_byte(out, '(');
             }
-            buf_bytes(out, arg);
-            if !plain {
+            buf_bytes(out, a);
+            if !p {
                 buf_byte(out, ')');
             }
             i = e;
@@ -817,6 +865,114 @@ fn with_argument(expr: [u8], name: [u8], arg: [u8]) -> i64 {
         }
     }
     out
+}
+
+// How the calls' arguments change when a parameter of type `old` (a
+// parsed type node) becomes `ty` (0.17): RC_NONE, nothing; RC_MUT, `&x`
+// becomes `&mut x`; RC_REF, a value `x` becomes `&x`; RC_REF_MUT, `&mut
+// x`; RC_MUT_SLICE, a slice `v.as_slice()` or `a[..]` becomes
+// `v.as_mut_slice()` or `&mut a[..]`.
+const RC_NONE: i64 = 0;
+const RC_MUT: i64 = 1;
+const RC_REF: i64 = 2;
+const RC_REF_MUT: i64 = 3;
+const RC_MUT_SLICE: i64 = 4;
+
+fn ref_change(old: i64, ty: [u8]) -> i64 {
+    let to_mut = unsafe { starts(ty, c_slice(c"&mut ")) };
+    let to_ref = !to_mut && ty.len > 1 && ty[0] == '&' && ty[1] != '&';
+    if !to_mut && !to_ref {
+        return RC_NONE;
+    }
+    let mut rest = if to_mut { 5 } else { 1 };
+    while rest < ty.len && ty[rest] == ' ' {
+        rest += 1;
+    }
+    let slice = rest < ty.len && ty[rest] == '[' && find_byte(ty[rest..ty.len], ';') < 0;
+    if pk(old) == NodeKind::TyPtr {
+        return if to_mut { RC_MUT } else { RC_NONE };
+    }
+    if pk(old) == NodeKind::TySlice {
+        return if to_mut && slice { RC_MUT_SLICE } else { RC_NONE };
+    }
+    if to_mut { RC_REF_MUT } else { RC_REF }
+}
+
+fn starts(s: [u8], p: [u8]) -> bool {
+    s.len >= p.len && bytes_eq(s[0..p.len], p)
+}
+
+// The argument `arg` changed as `how` says (ref_change), a buffer; -1:
+// left as it is.
+fn ref_argument(how: i64, arg: [u8]) -> i64 {
+    unsafe {
+        let out = buf_new();
+        if how == RC_MUT {
+            if starts(arg, c_slice(c"&mut ")) || !starts(arg, c_slice(c"&"))
+                || starts(arg, c_slice(c"&&")) {
+                return -1;
+            }
+            buf_str(out, c"&mut ");
+            buf_bytes(out, arg[1..arg.len]);
+            return out;
+        }
+        if how == RC_MUT_SLICE {
+            let tail = c_slice(c".as_slice()");
+            if arg.len > tail.len && bytes_eq(arg[arg.len - tail.len..arg.len], tail) {
+                buf_bytes(out, arg[0..arg.len - tail.len]);
+                buf_str(out, c".as_mut_slice()");
+                return out;
+            }
+            if !starts(arg, c_slice(c"&")) && arg.len > 2 && arg[arg.len - 1] == ']'
+                && find_byte(arg, '.') >= 0 && find_dots(arg) {
+                buf_str(out, c"&mut ");
+                buf_bytes(out, arg);
+                return out;
+            }
+            return -1;
+        }
+        if how == RC_REF || how == RC_REF_MUT {
+            if starts(arg, c_slice(c"&")) {
+                return -1;
+            }
+            buf_str(out, if how == RC_REF { c"&" } else { c"&mut " });
+            if plain_text(arg) {
+                buf_bytes(out, arg);
+            } else {
+                buf_byte(out, '(');
+                buf_bytes(out, arg);
+                buf_byte(out, ')');
+            }
+            return out;
+        }
+        -1
+    }
+}
+
+// Whether arg holds `..` (a range: `a[i..j]`).
+fn find_dots(arg: [u8]) -> bool {
+    for i in 0..arg.len - 1 {
+        if arg[i] == '.' && arg[i + 1] == '.' {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether arg needs no parentheses after a prefix: a name, a path, a
+// field (`self.items`), a number.
+fn plain_text(arg: [u8]) -> bool {
+    if arg.len == 0 {
+        return false;
+    }
+    for i in 0..arg.len {
+        let c = arg[i];
+        if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+            || c == '.' || c == ':') {
+            return false;
+        }
+    }
+    true
 }
 
 // Whether `name` is written as an identifier in the body of f.

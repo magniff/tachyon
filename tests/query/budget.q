@@ -196,6 +196,7 @@ usage: tachyonc query def|show NAME... [--root ROOT] [--exact] [--with-comments]
        tachyonc query show MODULE::section TITLE
        tachyonc query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
        tachyonc query type FILE:LINE[:COL]...
+       tachyonc query own FILE:LINE:COL...   (0.17: each local's kind, moves and views there)
        tachyonc query stats [MODULE|FILE] [--over N] [--all]
        tachyonc query deps MODULE [--max-lines N]
        tachyonc query unused [MODULE] [--all]
