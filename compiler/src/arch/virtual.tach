@@ -12,11 +12,14 @@
 // A declaration has no body (the parser takes `;` after #[intrinsic]); a
 // `bits.*` intrinsic has std's function of its count as its body, which a
 // target without the instruction calls. Their sources are `<std::arch>`,
-// `<std::arch::aarch64>` and `<std::arch::x86_64>`.
+// `<std::arch::aarch64>` and `<std::arch::x86_64>`; each architecture's
+// `raw` submodule holds the pointer forms of its memory intrinsics, unsafe
+// (`raw::vld1q_u8(p: *u8)`, raw_declaration).
 
 use crate::arch::{
     ARCH_AARCH64, ARCH_EXT_FEATURES, ARCH_PORTABLE, ARCH_USED, ARCH_X86_64, FORM_BITS, INTRS,
-    INTR_COUNT, intr_param_is_const, intr_param_name, intr_ret_text, intrinsic_named,
+    INTR_COUNT, MEM_LOAD, MEM_STORE, intr_param_is_const, intr_param_name, intr_ret_text,
+    intrinsic_named,
 };
 use crate::arch::table::{load_insns, load_table, param_type_text};
 use crate::base::{
@@ -79,17 +82,23 @@ pub fn load_arch_modules() {
         ARCH_MODULE = add_module(arch, STD_MODULE, true);
         A64_MODULE = add_module(intern_c(c"aarch64"), ARCH_MODULE, true);
         X86_MODULE = add_module(intern_c(c"x86_64"), ARCH_MODULE, true);
-        let first = add_arch_source(c"<std::arch>", ARCH_MODULE, ARCH_PORTABLE, &wanted);
+        let raw = intern_c(c"raw");
+        let a64_raw = add_module(raw, A64_MODULE, true);
+        let x86_raw = add_module(raw, X86_MODULE, true);
+        let first = add_arch_source(c"<std::arch>", ARCH_MODULE, ARCH_PORTABLE, &wanted, false);
         ARCH_SRC_START = first;
-        add_arch_source(c"<std::arch::aarch64>", A64_MODULE, ARCH_AARCH64, &wanted);
-        add_arch_source(c"<std::arch::x86_64>", X86_MODULE, ARCH_X86_64, &wanted);
+        add_arch_source(c"<std::arch::aarch64>", A64_MODULE, ARCH_AARCH64, &wanted, false);
+        add_arch_source(c"<std::arch::x86_64>", X86_MODULE, ARCH_X86_64, &wanted, false);
+        add_arch_source(c"<std::arch::aarch64::raw>", a64_raw, ARCH_AARCH64, &wanted, true);
+        add_arch_source(c"<std::arch::x86_64::raw>", x86_raw, ARCH_X86_64, &wanted, true);
         ARCH_SRC_END = FILES[FILE_COUNT - 1].end;
     }
 }
 
 // Module m's source: its types and the declarations of the wanted
-// intrinsics of architecture `arch`, lexed; the start of its text.
-fn add_arch_source(path: *u8, m: i64, arch: i64, wanted: *IntVec) -> i64 {
+// intrinsics of architecture `arch` (raw: the pointer forms of the memory
+// ones, 0.19 T1), lexed; the start of its text.
+fn add_arch_source(path: *u8, m: i64, arch: i64, wanted: *IntVec, raw: bool) -> i64 {
     unsafe {
         let text = buf_new();
         if arch == ARCH_AARCH64 {
@@ -99,9 +108,14 @@ fn add_arch_source(path: *u8, m: i64, arch: i64, wanted: *IntVec) -> i64 {
         }
         for k in 0..(*wanted).count {
             let id = (*wanted).data[k];
-            if INTRS[id].arch == arch {
+            if INTRS[id].arch != arch {
+                continue;
+            }
+            if !raw {
                 declaration(text, id);
                 ARCH_EXT_FEATURES |= INTRS[id].features;
+            } else if INTRS[id].mem == MEM_LOAD || INTRS[id].mem == MEM_STORE {
+                raw_declaration(text, id);
             }
         }
         let start = add_source(path, text);
@@ -112,35 +126,47 @@ fn add_arch_source(path: *u8, m: i64, arch: i64, wanted: *IntVec) -> i64 {
 }
 
 // ACLE's vector types: aliases of the portable ones (poly lanes are
-// unsigned; p128 is v2u64, low lane first).
+// unsigned; p128 is v2u64, low lane first), and their tuples
+// (`uint8x16x2_t = (v16u8, v16u8)`, x3, x4: 0.19 T1).
 fn acle_types(text: i64) {
     unsafe {
         let widths: [i64; 4] = [8, 16, 32, 64];
-        for s in 0..3 {
-            let prefix = if s == 0 { c"int" } else if s == 1 { c"uint" } else { c"poly" };
-            let letter = if s == 0 { c"i" } else { c"u" };
+        for s in 0..4 {
+            let prefix = if s == 0 { c"int" } else if s == 1 { c"uint" } else if s == 2 { c"poly" }
+                else { c"float" };
+            let letter = if s == 0 { c"i" } else if s == 3 { c"f" } else { c"u" };
             for w in 0..4 {
                 let bits = widths[w];
-                if s == 2 && bits == 32 {
+                if (s == 2 && bits == 32) || (s == 3 && bits < 32) {
                     continue;
                 }
                 for half in 0..2 {
                     let lanes = (if half == 0 { 64 } else { 128 }) / bits;
-                    buf_str(text, c"pub type ");
-                    buf_str(text, prefix);
-                    buf_int(text, bits);
-                    buf_str(text, c"x");
-                    buf_int(text, lanes);
-                    buf_str(text, c"_t = v");
-                    buf_int(text, lanes);
-                    buf_str(text, letter);
-                    buf_int(text, bits);
-                    buf_str(text, c";\n");
+                    for count in 1..5 {
+                        buf_str(text, c"pub type ");
+                        buf_str(text, prefix);
+                        buf_int(text, bits);
+                        buf_str(text, c"x");
+                        buf_int(text, lanes);
+                        if count > 1 {
+                            buf_str(text, c"x");
+                            buf_int(text, count);
+                        }
+                        buf_str(text, if count > 1 { c"_t = (" } else { c"_t = " });
+                        for k in 0..count {
+                            if k > 0 {
+                                buf_str(text, c", ");
+                            }
+                            buf_str(text, c"v");
+                            buf_int(text, lanes);
+                            buf_str(text, letter);
+                            buf_int(text, bits);
+                        }
+                        buf_str(text, if count > 1 { c");\n" } else { c";\n" });
+                    }
                 }
             }
         }
-        buf_str(text, c"pub type float32x2_t = v2f32;\npub type float32x4_t = v4f32;\n");
-        buf_str(text, c"pub type float64x1_t = v1f64;\npub type float64x2_t = v2f64;\n");
         buf_str(text, c"pub type p8 = u8;\npub type p16 = u16;\npub type p64 = u64;\n");
         buf_str(text, c"pub type p128 = v2u64;\n");
     }
@@ -198,6 +224,53 @@ fn declaration(text: i64, id: i64) {
             buf_bytes(text, sym_text(intr_param_name(id, 0)));
             buf_str(text, c") }\n");
             return;
+        }
+        buf_str(text, c";\n");
+    }
+}
+
+// (0.19 T1) The pointer form of memory intrinsic id, for raw::NAME:
+// `#[intrinsic(ID)] pub unsafe fn NAME(p: *T, ...) -> RET;`, the slice and
+// its index replaced by a pointer: to the lanes' type (`*u8` for
+// `vld1q_u8`), or to the vector for Intel's integer forms
+// (`_mm_loadu_si128(p: *__m128i)`), as the vendors declare them. Lowering
+// and -O0 tell it by its parameter count (one fewer).
+fn raw_declaration(text: i64, id: i64) {
+    unsafe {
+        let s = INTRS[id].mem_param;
+        let slice = param_type_text(INTRS[id].params + s);
+        let elem = slice[1..slice.len - 1];
+        let vector = if INTRS[id].mem == MEM_LOAD { intr_ret_text(id) }
+            else { param_type_text(INTRS[id].params + s + 2) };
+        buf_str(text, c"#[intrinsic(");
+        buf_int(text, id);
+        buf_str(text, c")]\npub unsafe fn ");
+        buf_bytes(text, sym_text(INTRS[id].name));
+        buf_str(text, c"(");
+        let mut first = true;
+        for k in 0..INTRS[id].nparams {
+            if k == s + 1 {
+                continue;
+            }
+            if !first {
+                buf_str(text, c", ");
+            }
+            first = false;
+            if k == s {
+                buf_str(text, c"p: *");
+                buf_bytes(text, if INTRS[id].arch == ARCH_X86_64 && elem == "u8" { vector }
+                    else { elem });
+                continue;
+            }
+            buf_bytes(text, sym_text(intr_param_name(id, k)));
+            buf_str(text, c": ");
+            buf_bytes(text, param_type_text(INTRS[id].params + k));
+        }
+        buf_str(text, c")");
+        let ret = intr_ret_text(id);
+        if ret.len > 0 {
+            buf_str(text, c" -> ");
+            buf_bytes(text, ret);
         }
         buf_str(text, c";\n");
     }

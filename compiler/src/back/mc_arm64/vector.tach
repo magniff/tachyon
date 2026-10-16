@@ -1,7 +1,7 @@
 // AArch64 vector instructions (mc_arm64/mod.tach).
 
 use crate::back::mc_arm64::{ma_r, ma_rrr, ma_w};
-use crate::front::types::{is_float, type_size, vec_elem, vec_lanes};
+use crate::front::types::{is_float, is_signed, type_size, vec_elem, vec_lanes};
 use crate::gen0::target::{o, oi, on};
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{Cond, Op};
@@ -14,12 +14,13 @@ use crate::middle::ir::Op::{Add, And, Mul, Or, Sub, Xor};
 // lane in x16 and x17). v31 is the temporary.
 
 // The arrangement of vector type vt: 2d, 4s, 8h or 16b.
-// (0.19: by the lanes' size and the vector's: 1d, 2s, 4h, 8b for the
-// 64-bit vectors)
+// (0.19: by the lanes' size and the vector's: 2s, 4h, 8b for the 64-bit
+// vectors; a one-lane vector, v1i64 v1u64 v1f64, computes as 2d, there
+// being no 1d form of most instructions: its lane 1 is ignored)
 fn ma_arr(vt: i64) -> *u8 {
     let esize = type_size(vec_elem(vt));
     if type_size(vt) == 8 {
-        if esize == 8 { return c"1d"; }
+        if esize == 8 { return c"2d"; }
         if esize == 4 { return c"2s"; }
         if esize == 2 { return c"4h"; }
         return c"8b";
@@ -95,11 +96,22 @@ fn ma_vmov(mut cx: *FnCtx, d: i64, a: i64) {
     }
 }
 
-// x<r> = lane `lane` of v<a> (letter d: umov, else smov, sign-extended).
-fn ma_lane_to_x(mut cx: *FnCtx, r: i64, a: i64, letter: *u8, lane: i64) {
+// x<r> = lane `lane` of v<a>, a vector of type vt, extended by its lanes'
+// signedness: smov for signed lanes below 64 bits, umov (zero-extending
+// into x<r>) for unsigned ones (0.19), mov for 64-bit lanes.
+fn ma_lane_to_x(mut cx: *FnCtx, r: i64, a: i64, vt: i64, lane: i64) {
     unsafe {
-        o(cx, if *letter == 'd' { c"    mov " } else { c"    smov " });
-        ma_r(cx, r);
+        let letter = ma_elem_letter(vt);
+        if *letter == 'd' {
+            o(cx, c"    mov ");
+            ma_r(cx, r);
+        } else if is_signed(vec_elem(vt)) {
+            o(cx, c"    smov ");
+            ma_r(cx, r);
+        } else {
+            o(cx, c"    umov ");
+            ma_w(cx, r);
+        }
         o(cx, c", ");
         ma_vlane(cx, a, letter, lane);
         on(cx);
@@ -127,10 +139,10 @@ pub fn ma_vbin(mut cx: *FnCtx, op: Op, vt: i64, d: i64, a: i64, b: i64) {
                 d, a, b);
             return;
         }
-        if op == Mul && !float && vec_lanes(vt) == 2 {
-            for lane in 0..2 {
-                ma_lane_to_x(cx, 16, a, c"d", lane);
-                ma_lane_to_x(cx, 17, b, c"d", lane);
+        if op == Mul && !float && type_size(vec_elem(vt)) == 8 {
+            for lane in 0..vec_lanes(vt) {
+                ma_lane_to_x(cx, 16, a, vt, lane);
+                ma_lane_to_x(cx, 17, b, vt, lane);
                 ma_rrr(cx, c"mul", 16, 16, 17);
                 ma_x_to_lane(cx, 63, c"d", lane, 16);
             }
@@ -149,7 +161,8 @@ pub fn ma_vneg(mut cx: *FnCtx, vt: i64, d: i64, a: i64) {
     unsafe { ma_v2(cx, if is_float(vec_elem(vt)) { c"fneg" } else { c"neg" }, ma_arr(vt), d, a); }
 }
 
-// d = a <cond> b lanewise, -1 or 0 per lane; operands of vector type vt.
+// d = a <cond> b lanewise, all ones or 0 per lane; operands of vector type
+// vt (unsigned lanes compare unsigned: cmhi, cmhs, 0.19).
 pub fn ma_vcmp(mut cx: *FnCtx, cond: Cond, vt: i64, d: i64, a: i64, b: i64) {
     unsafe {
         let arr = ma_arr(vt);
@@ -161,8 +174,9 @@ pub fn ma_vcmp(mut cx: *FnCtx, cond: Cond, vt: i64, d: i64, a: i64, b: i64) {
             }
             return;
         }
-        let gt = if float { c"fcmgt" } else { c"cmgt" };
-        let ge = if float { c"fcmge" } else { c"cmge" };
+        let unsigned = !float && !is_signed(vec_elem(vt));
+        let gt = if float { c"fcmgt" } else if unsigned { c"cmhi" } else { c"cmgt" };
+        let ge = if float { c"fcmge" } else if unsigned { c"cmhs" } else { c"cmge" };
         if cond == Cond::Gt { ma_v3(cx, gt, arr, d, a, b); }
         else if cond == Cond::Ge { ma_v3(cx, ge, arr, d, a, b); }
         else if cond == Cond::Lt { ma_v3(cx, gt, arr, d, b, a); }
@@ -210,7 +224,7 @@ pub fn ma_vext(mut cx: *FnCtx, vt: i64, d: i64, a: i64, lane: i64) {
             on(cx);
             return;
         }
-        ma_lane_to_x(cx, d, a, letter, lane);
+        ma_lane_to_x(cx, d, a, vt, lane);
     }
 }
 
@@ -235,16 +249,22 @@ pub fn ma_vins(mut cx: *FnCtx, vt: i64, d: i64, a: i64, b: i64, lane: i64) {
     }
 }
 
-// d = the sum of a's lanes (floats pairwise).
+// d = the sum of a's lanes (floats pairwise; 0.19: the 64-bit vectors, a
+// two-lane one of 32-bit lanes through addv on its zero-extended copy).
 pub fn ma_vsum(mut cx: *FnCtx, vt: i64, d: i64, a: i64) {
     unsafe {
         let lanes = vec_lanes(vt);
+        let esize = type_size(vec_elem(vt));
+        if lanes == 1 {
+            ma_vext(cx, vt, d, a, 0);
+            return;
+        }
         if is_float(vec_elem(vt)) {
             if lanes == 2 {
-                o(cx, c"    faddp d");
+                o(cx, if esize == 8 { c"    faddp d" } else { c"    faddp s" });
                 oi(cx, d - 32);
                 o(cx, c", ");
-                ma_v(cx, a, c"2d");
+                ma_v(cx, a, if esize == 8 { c"2d" } else { c"2s" });
                 on(cx);
                 return;
             }
@@ -256,7 +276,7 @@ pub fn ma_vsum(mut cx: *FnCtx, vt: i64, d: i64, a: i64) {
             on(cx);
             return;
         }
-        if lanes == 2 {
+        if esize == 8 {
             o(cx, c"    addp d31, ");
             ma_v(cx, a, c"2d");
             o(cx, c"\n    fmov ");
@@ -265,12 +285,19 @@ pub fn ma_vsum(mut cx: *FnCtx, vt: i64, d: i64, a: i64) {
             return;
         }
         let letter = ma_elem_letter(vt);
-        o(cx, c"    addv ");
-        o(cx, letter);
-        o(cx, c"31, ");
-        ma_v(cx, a, ma_arr(vt));
+        if lanes == 2 {
+            // (no addv of .2s: v31's upper half is zeroed by the copy)
+            ma_v2(cx, c"mov", c"8b", 63, a);
+            o(cx, c"    addv s31, ");
+            ma_v(cx, 63, c"4s");
+        } else {
+            o(cx, c"    addv ");
+            o(cx, letter);
+            o(cx, c"31, ");
+            ma_v(cx, a, ma_arr(vt));
+        }
         on(cx);
-        ma_lane_to_x(cx, d, 63, letter, 0);
+        ma_lane_to_x(cx, d, 63, vt, 0);
     }
 }
 
