@@ -921,12 +921,12 @@ Phase 0 fixed the interfaces below; T1–T6 build against them in parallel. A ta
   - What `fix --values` cannot do: written slice locals (`let s = v.as_slice()` → `as_mut_slice()`: 45 of the eval solutions' 92 errors), `&x` written through (`&mut x`), handle copies (`clone()`, `take()`, `std::replace`), views of a dropped Buf (owned Bufs), two loans in one call (hoisting).
 - **Correct code that was rejected, fixed in T7:** a view a method makes of a `&mut` parameter (`sort(v.as_mut_slice())` twice) and a view bound by `if let` out of one are reborrows; a field read or write through a `&mut` keeps another field's view; Arena is a plain handle until 0.17.1 (it was owned with no Drop or Clone); `HashMap::get_mut`/`get_or_insert` give `&mut [V]` (their documented idiom was own.readonly) and `&mut [T]` binds as a type argument; std's `#[views]` pins bind the generic instances (they never applied: every std generic fell to the parametric floor); std's debug_list borrows.
 - **Unsound code that was accepted, fixed in T7:** `a + c` on an owned type did not move its operands (double free); a copy of an element from `get`/`last`/`key_at`/`value_at` (and `unwrap`) was dropped though the collection keeps it (double free): it is borrowed now, and moving it is own.move_out; a `&mut self` method through a `&T` was accepted (own.readonly now).
-- **Left open (0.17.1, or the user's call):**
-  - std's `Ord::cmp`, `Eq::eq`, `cmp_of`, `eq_of` take legacy `*Self`, which is exclusive: `a.cmp(&a)` and `x.cmp(&y)` with a live `&x` are own.conflict. `&Self` in the traits needs impls with `*Self` accepted (the signature check is exact).
-  - `<` and `==` on two `&T` compare addresses (as on `*T`), not values, so fix rule 4 (an owned parameter → `&T`) can change a comparison's meaning; Rust compares the values.
-  - a borrowed copy (`v.get(i)`) returned, put in a struct literal or assigned is not yet own.move_out; `v.as_slice()[0] = x` and `&mut s[..]` of a read-only `s` are not own.readonly.
-  - false positives: `for x in v.iter()` over a `Vec<[u8]>` views v rather than what its elements view; a `const` array of slices iterated is own.static; std bodies instantiated for owned T (`std::swap`, `fold`, `extend_from_slice`) report move-outs inside std with no call site; a closure parameter's call makes a legacy `self: *Self` store; a Vec made on an allocator copied out of `*p` views `*p`.
-  - fix --values: written slice locals; `&mut *c` for a `&T` local `c` (a write through a shared reference); a slice passed to C counted as written.
+- **Then, before 0.17.0 (the coordinator's list):** every copy of an owned value out of a reference, an index or a std accessor that is moved anywhere is own.move_out (err_own_copy_out); `==`/`<` on two references compare the referents (own_ref_compare); std's Eq, Ord and Hash take `&Self`, derive follows, and an impl's legacy `*Self` is taken as the trait's `&Self` (own_eq_ord_refs); std::swap is bit for bit; std's iterators hand closures borrowed copies; consts are not invalidated by `global` calls.
+- **Left open (0.17.1):**
+  - `extend_from_slice` on owned elements is own.move_out at the call; it should clone under a `T: Clone` bound.
+  - an element of a `Vec<[u8]>` from `iter()` views the Vec itself (XFAIL own_iter_elem_views): a declared `#[views(self)]` puts self at both levels.
+  - `v.as_slice()[0] = x` and `&mut s[..]` of a read-only `s` are not own.readonly; a closure parameter's call makes a legacy `self: *Self` store; a Vec made on an allocator copied out of `*p` views `*p`.
+  - fix --values: written slice locals; `&mut *c` for a `&T` local `c`; a slice passed to C counted as written.
 
 ## 8. Prototype results (§6, branch c17-proto, 2026-10-15)
 
