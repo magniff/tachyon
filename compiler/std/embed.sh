@@ -18,7 +18,8 @@ cd "$(dirname "$0")/../.."
 out=compiler/src/front/stdsrc.tach
 # (next to the output: writable in a sandbox that only allows the tree, and mv is a rename)
 tmp=$(mktemp "$out.XXXXXX")
-files="std iter io fmt convert clone alloc values"
+# (0.18: test.tach and nonnull.tach, lazy sections: T2 and T4 own them)
+files="std iter io fmt convert clone alloc values test nonnull"
 # (sed, not awk: awks differ on backslashes in replacements.)
 lines() {
     sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/        buf_str(out, c"/' -e 's/$/\\n");/'
