@@ -263,8 +263,10 @@ ok=0
 printf '%s\n' "$out" | head -1 | grep -q '^// std::trim' && ok=1
 check std_show_by_file "$ok" "$(printf '%s\n' "$out" | head -3)"
 out=$("$COMPILER" check --std-tree compiler/std 2>&1)
+rc=$?
 ok=0
-[ $? -eq 0 ] && [ -z "$out" ] && ok=1
+# (0.18.1: a clean check says so in one line)
+[ $rc -eq 0 ] && [ "$out" = "ok: 0 errors in compiler/src/main.tach" ] && ok=1
 check std_tree_checks "$ok" "$out"
 bad=""
 for kind in $("$COMPILER" query examples | cut -f1); do

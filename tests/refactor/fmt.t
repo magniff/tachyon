@@ -67,6 +67,7 @@ $ fmt --check
 ## The program is the same: only blanks changed.
 % "$COMPILER" main.tach -o prog && ./prog && echo ran
 ran
+ok: built prog
 $ undo
 undid formatted	2 files	+18 -13 lines
 $ fmt --check util.tach

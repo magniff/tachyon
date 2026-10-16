@@ -2,6 +2,7 @@
 ## (0.14): every tool works with no flags; the journal for undo and query
 ## diff is .tachyonc/edits next to the root.
 $ check
+ok: 0 errors in main.tach
 $ query def area
 crate::geom::area	geom.tach:8:8	fn	pub fn area(p: Point) -> i64	effects: none
 ## ---- renaming a local ----

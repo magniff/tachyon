@@ -62,6 +62,7 @@ pub fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
     v
 }
 #> $ tachyonc check
+ok: 0 errors in main.tach
 % git checkout -q calc.tach
 $ batch $T/inputs/batch-edit.txt >/dev/null
 [exit 1]

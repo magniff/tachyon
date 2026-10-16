@@ -12,3 +12,4 @@ fn main() -> i32 {
     util::twice(2) as i32
 }
 $ check
+ok: 0 errors in main.tach

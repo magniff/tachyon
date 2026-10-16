@@ -28,6 +28,7 @@ first 0
 7
 tools: 1
 a report nobody frees
+ok: built shop
 ```
 
 ## The bugs, built as usual
@@ -58,6 +59,7 @@ message, and nothing at all.
 
 ```console
 $ tachyonc --values=off --check-alloc main.tach -o shop-checked
+ok: built shop-checked
 ```
 
 **A handle copied, then freed through one copy.** A `Vec` is a handle

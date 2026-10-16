@@ -71,6 +71,7 @@ applied 4 blocks: replaced crate::shapes::area; added crate::shapes::perimeter; 
 33	    2 * (r.w + r.h)
 note edit.imports: added the imports the new text needs (fix --only imports)
 $ check
+ok: 0 errors in main.tach
 $ undo
 undid applied 4 blocks: replaced crate::shapes::area; added crate::shapes::perimeter; inserted after crate::describe; replaced crate::main	2 files	+13 -5 lines
 ## `new in MODULE`, `new before NAME`, `delete NAME`; from stdin.

@@ -1122,7 +1122,17 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   `$TACHYON_TEST_DEBOUNCE`; never again for a program whose tests took
   over 8 s) and its line follows: the counts, the newly failing cases
   with their differences, the fixed ones by name. TACHYON_CHECK_TESTS=0
-  leaves the tests out.
+  leaves the tests out. (0.18.1) Errors whose `try:` is `tachyonc fix
+  --suggested` (the compiler gives it only for an exact fix: a
+  did-you-mean name with one candidate, a missing `use` or `pub`, a
+  conversion) are fixed by the hook: it runs `fix --suggested --json
+  ROOT` (one checked, journaled edit), checks again, and prints a head
+  line (`tachyonc fix --suggested main.tach, run by the hook (tachyonc
+  undo takes it back; ...)`), a `fixed FILE:L:C: MESSAGE | FIX` line per
+  error it fixed, then the errors left. A refused fix leaves the report
+  as before, with its `try:`; TACHYON_HOOK_FIX=0 turns it off; the
+  record says `hook_fixed`. (The 0.18 eval: the `try:` was offered 43
+  times and run once.)
 - **turn-end.py** (Stop): when a root this session touched (or the
   current directory's) changed since its last clean check and test run,
   `check` (and the tests) once; errors or failures block the stop once,

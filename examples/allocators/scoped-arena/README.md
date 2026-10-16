@@ -38,6 +38,7 @@ ADD pears lots           -> not a number: lots
 FLY away                 -> unknown request: FLY away
 8 requests, 2 keys; scratch per request at most 104 bytes
 the keys' arena holds 11 bytes
+ok: built store
 ```
 
 No request frees anything by hand, and none leaks: `--check-alloc`
@@ -47,6 +48,7 @@ arena's block after its scope) has nothing to say.
 ```console
 $ tachyonc --check-alloc main.tach -o store-checked && ./store-checked < requests.txt | tail -1
 the keys' arena holds 11 bytes
+ok: built store-checked
 ```
 
 ## How it works

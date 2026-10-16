@@ -39,6 +39,7 @@ $ tachyonc main.tach -o words && ./words
   3 a
   3 mat
   2 on
+ok: built words
 ```
 
 ## The impls' effects

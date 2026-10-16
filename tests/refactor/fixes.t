@@ -73,6 +73,7 @@ error fix.bad-in: no file, module or item 'nowhere' in the program
 $ fix
 fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block	3 files	+4 -8 lines
 $ check
+ok: 0 errors in main.tach
 ## Nothing left to fix.
 $ fix
 note fix.none: nothing to fix

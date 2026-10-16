@@ -22,7 +22,9 @@ output on every sample, before any change:
 
 ```console
 $ tachyonc main.tach --no-positions -o before.s
+ok: wrote before.s
 $ tachyonc main.tach -o pack && for f in samples/*.txt; do ./pack < $f; done > before.out
+ok: built pack
 $ cat before.out
 in        0 bytes  adler32 00000001
 out       0 bytes  adler32 00000001  (0% of the input)
@@ -63,6 +65,7 @@ $ tachyonc refactor rename main::p out
 renamed local p to out in crate::main, 4 uses	main.tach	+4 -4 lines
 $ tachyonc main.tach --no-positions -o after.s && cmp before.s after.s && echo same assembly
 same assembly
+ok: wrote after.s
 ```
 
 `65521` deserves a name. The constant goes in first, then a rewrite
@@ -88,6 +91,7 @@ rewrote 2 sites in 1 file	adler.tach	+2 -2 lines
 11	        high = (high + low) % MOD_ADLER;
 $ tachyonc main.tach --no-positions -o after.s && cmp before.s after.s && echo same assembly
 same assembly
+ok: wrote after.s
 ```
 
 ## 2. A colleague's patch, put into shape
@@ -124,6 +128,7 @@ fn run_at(s: [u8], i: i64) -> i64 {
 }
 $ tachyonc main.tach --no-positions -o after.s && cmp before.s after.s && echo same assembly
 same assembly
+ok: wrote after.s
 $ tachyonc fmt --check && echo formatted
 formatted
 ```
@@ -157,8 +162,10 @@ evidence is the program's behaviour, on every sample:
 ```console
 $ tachyonc main.tach --no-positions -o after.s && cmp -s before.s after.s || echo the assembly differs
 the assembly differs
+ok: wrote after.s
 $ tachyonc main.tach -o pack && for f in samples/*.txt; do ./pack < $f; done | diff before.out - && echo same output
 same output
+ok: built pack
 ```
 
 ## 4. When the compiler is what changed

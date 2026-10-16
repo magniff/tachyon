@@ -296,6 +296,64 @@ try:
     case("hint: off with TACHYON_HINTS=0", (got.startswith("tachyonc check main.tach: 1 error"),
                                              "guide --find" in got), (True, False))
 
+    # (0.18.1) The exact fixes, applied: errors whose try: names `fix
+    # --suggested` make the hook run it (a fake: `fix` writes fixed.out's
+    # lines and a mark; check then prints after.out), check again, and say
+    # what it fixed (each error with its help) before what is left.
+    fdir3 = os.path.join(tmp, "fake3")
+    os.makedirs(fdir3)
+    fake3 = os.path.join(fdir3, "tachyonc")
+    write(fake3, "#!/bin/sh\nd='%s'\nif [ \"$1\" = fix ]; then echo \"$@\" >>\"$d/fix.calls\"; cat \"$d/fixed.out\"; "
+                 "[ -s \"$d/fixed.out\" ] && : >\"$d/mark\"; exit 0; fi\n"
+                 "if [ -f \"$d/mark\" ]; then cat \"$d/after.out\" >&2; [ -s \"$d/after.out\" ] && exit 1; exit 0; fi\n"
+                 "cat \"$d/check.out\" >&2\n[ -s \"$d/check.out\" ] && exit 1\nexit 0\n" % fdir3)
+    os.chmod(fake3, 0o755)
+    sug = "tachyonc fix --suggested main.tach"
+    typo = dict(diag("main.tach", 2, "undefined variable 'prinln'", help=["did you mean 'println'?"]), **{"try": [sug]})
+    nouse = dict(diag("main.tach", 3, "undefined variable 'is_digit'", help=["add `use std::is_digit;`"]), **{"try": [sug]})
+    other = diag("main.tach", 4, "expected '[u8]', got 'i64'")
+
+    def fake3_says(check, fixed, after):
+        for f in ("mark", "fix.calls"):
+            if os.path.exists(os.path.join(fdir3, f)):
+                os.remove(os.path.join(fdir3, f))
+        write(os.path.join(fdir3, "check.out"), "".join(json.dumps(d) + "\n" for d in check))
+        write(os.path.join(fdir3, "fixed.out"), "".join(json.dumps({"kind": "output", "fields": f}) + "\n" for f in fixed))
+        write(os.path.join(fdir3, "after.out"), "".join(json.dumps(d) + "\n" for d in after))
+
+    def fix_calls():
+        p = os.path.join(fdir3, "fix.calls")
+        return open(p).read().split("\n")[0] if os.path.exists(p) else ""
+    head = ("tachyonc fix --suggested main.tach, run by the hook (tachyonc undo takes it back; positions as before it; "
+            "main.tach changed: read it again before an Edit):")
+    fake3_says([typo, nouse, other], [["fixed 1 missing import, 1 suggested fix", "main.tach", "+3 -1 lines"]],
+               [dict(other, line=6)])
+    got = ctx_of(run(ev, fake3)[1])
+    case("hook fix: applied, then what is left", (fix_calls(), got),
+         ("fix --suggested --json main.tach",
+          head + "\nfixed main.tach:2:5: undefined variable 'prinln' | did you mean 'println'?"
+          "\nfixed main.tach:3:5: undefined variable 'is_digit' | add `use std::is_digit;`"
+          "\ntachyonc check main.tach: 1 error\nmain.tach:6:5: error[type error] expected '[u8]', got 'i64'"))
+    fake3_says([typo], [["fixed 1 suggested fix", "main.tach", "+1 -1 lines"]], [])
+    case("hook fix: all fixed, clean", ctx_of(run(ev, fake3)[1]),
+         head + "\nfixed main.tach:2:5: undefined variable 'prinln' | did you mean 'println'?\ntachyonc check main.tach: 0 errors")
+    fake3_says([other], [["fixed 1 suggested fix", "main.tach", "+1 -1 lines"]], [])
+    case("hook fix: not without an exact fix", (ctx_of(run(ev, fake3)[1]), fix_calls()),
+         ("tachyonc check main.tach: 1 error\nmain.tach:4:5: error[type error] expected '[u8]', got 'i64'", ""))
+    fake3_says([typo], [], [])
+    case("hook fix: refused or nothing done, named as before", ctx_of(run(ev, fake3)[1]),
+         "tachyonc check main.tach: 1 error\ntry: tachyonc fix --suggested main.tach   (the error: their exact fixes, "
+         "one checked edit)\nmain.tach:2:5: error[type error] undefined variable 'prinln' | help: did you mean 'println'?")
+    fake3_says([typo], [["fixed 1 suggested fix", "main.tach", "+1 -1 lines"]], [])
+    os.environ["TACHYON_HOOK_FIX"] = "0"
+    got = ctx_of(run(ev, fake3)[1])
+    del os.environ["TACHYON_HOOK_FIX"]
+    case("hook fix: TACHYON_HOOK_FIX=0 applies nothing", (fix_calls(), got.split("\n")[1]),
+         ("", "try: tachyonc fix --suggested main.tach   (the error: their exact fixes, one checked edit)"))
+    with open(log) as fh:
+        recs = [json.loads(x) for x in fh if x.strip()]
+    case("hook fix: logged", [r.get("hook_fixed") for r in recs if "hook_fixed" in r][:2], [2, 1])
+
     # (0.17) A worktree's file edited from a session in the main checkout:
     # the worktree's root and compiler, check run in the worktree (check
     # reads compiler/std from the directory it runs in), its paths from
@@ -376,6 +434,16 @@ try:
         st, out = run(ev2, real)
         case("real: the error", json.loads(out)["hookSpecificOutput"]["additionalContext"] if out else "",
              "tachyonc check main.tach: 1 error\nmain.tach:2:18: error[type error] undefined variable 'q'")
+        # (0.18.1) the hook applies the exact fix: the file is changed
+        write(os.path.join(prog, "main.tach"), "fn main() {\n    prinln(\"x\");\n    let y = 1 + \"a\";\n}\n")
+        got = ctx_of(run(ev2, real)[1])
+        with open(os.path.join(prog, "main.tach")) as fh:
+            now = fh.read()
+        case("real: the hook's exact fix", (got.split("\n")[1:], "println(\"x\")" in now),
+             (["fixed main.tach:2:5: undefined variable 'prinln' | did you mean 'println'?",
+               "tachyonc check main.tach: 1 error",
+               "main.tach:3:13: error[type error] expected '[u8]', got 'i64'"], True))
+        write(os.path.join(prog, "main.tach"), "fn main() {\n    let x: i64 = q;\n}\n")
         ms = []
         for _ in range(5):
             t0 = time.time()
