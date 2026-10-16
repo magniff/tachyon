@@ -1,0 +1,74 @@
+// Compute: a 256-bin histogram of 1M bytes with atomics, checked against
+// the CPU's.
+// EXPECT: histogram ok
+
+use gpu::{BindingType, BufferUsage, Reflection, ShaderSource};
+
+const MSL: [[u8]; 8] = [
+    "#include <metal_stdlib>",
+    "using namespace metal;",
+    "kernel void hist(device const uchar* xs [[buffer(0)]], device atomic_uint* bins [[buffer(1)]],",
+    "                 constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]]) {",
+    "    if (i >= n) { return; }",
+    "    atomic_fetch_add_explicit(&bins[xs[i]], 1u, memory_order_relaxed);",
+    "}",
+    "",
+];
+
+fn main(gpa: Gpa) -> i32 {
+    let inst = gpu::Instance::new_in(gpa);
+    let mut adapter = inst.adapter().unwrap();
+    defer adapter.free();
+    let (mut dev, mut queue) = adapter.device().unwrap();
+    defer dev.free();
+    defer queue.free();
+    let mut text = lines(MSL[..], gpa);
+    defer text.free();
+    let mut refl = Reflection::new_in(gpa);
+    defer refl.free();
+    refl.compute("main", "hist", 128);
+    refl.bind(0, 0, BindingType::ReadOnlyStorage, compute: 0);
+    refl.bind(0, 1, BindingType::Storage, compute: 1);
+    refl.bind(0, 2, BindingType::Uniform, compute: 2);
+    let src = ShaderSource { msl: text.as_slice(), reflection: refl };
+    let mut shader = dev.shader(&src).unwrap();
+    defer shader.free();
+    let mut pipe = dev.compute_pipeline(&shader, "main").unwrap();
+    defer pipe.free();
+
+    let n = 1 << 20;
+    let mut xs = std::Buf::new_in(gpa);
+    defer xs.free();
+    let mut want = [0; 256];
+    let mut s: u64 = 12345;
+    for _ in 0..n {
+        s = s * 6364136223846793005 + 1442695040888963407;
+        let b = (s >> 56) as u8;
+        xs.push(b);
+        want[b as i64] += 1;
+    }
+    let mut xb = dev.buffer_init(xs.as_slice(), BufferUsage::STORAGE);
+    defer xb.free();
+    let mut bins = dev.buffer(256 * 4, BufferUsage::STORAGE | BufferUsage::MAP_READ);
+    defer bins.free();
+    let params: [u32; 4] = [n as u32, 0, 0, 0];
+    let mut pb = dev.buffer_init(gpu::bytes_of_u32(params[..]), BufferUsage::UNIFORM);
+    defer pb.free();
+    let mut group = dev.bind_group(pipe.bind_layout(0),
+        [gpu::bind(0, &xb), gpu::bind(1, &bins), gpu::bind(2, &pb)][..]);
+    defer group.free();
+    let mut enc = dev.encoder();
+    enc.compute_pass(|pass| {
+        pass.set_pipeline(&pipe);
+        pass.set_bind_group(0, &group);
+        pass.dispatch(n / 128);
+    });
+    queue.submit(enc.finish());
+    let got = gpu::u32s(bins.map_read(&dev).unwrap());
+    let mut bad = 0;
+    for k in 0..256 {
+        if got[k] as i64 != want[k] { bad += 1; }
+    }
+    if bad == 0 { println("histogram ok"); } else { println(f"histogram: {bad} bins differ"); }
+    0
+}

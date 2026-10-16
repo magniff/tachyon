@@ -9,7 +9,8 @@
 # of the tree, and formatting changes no program, 0.13) and
 # tests/walkthrough/run.sh (the sessions of examples/tools/*/README.md,
 # 0.15, and of every examples/GROUP/NAME/README.md with one, 0.16) and
-# tests/own-try/run.sh (the own pass's try: lines run, 0.17). POSIX sh and awk only, so it runs the same on macOS and Linux.
+# tests/own-try/run.sh (the own pass's try: lines run, 0.17) and
+# tests/gpu/run.sh (std::gpu on Metal, 0.22, skipped off macOS). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-d FORMAT] [FILTER]
 #
@@ -647,6 +648,14 @@ esac
 case own-try in
     *"$FILTER"*) "$ROOT/tests/own-try/run.sh" -c "$COMPILER" >"$WORK/own-try.out" 2>&1 & ;;
 esac
+# (0.22) std::gpu and std::objc: tests/gpu/run.sh, Metal on macOS/arm64
+# (skipped elsewhere); category "gpu".
+case gpu in
+    *"$FILTER"*)
+        GPU_OPT=""
+        [ -n "$OPT" ] && GPU_OPT="-O ${OPT#-O}"
+        "$ROOT/tests/gpu/run.sh" -c "$COMPILER" $GPU_OPT >"$WORK/gpu.out" 2>&1 & ;;
+esac
 # (0.18.1) The agent hooks' cases (tools/agent-hooks/test-*.py, Python;
 # skipped without python3): category "hooks".
 case hooks in
@@ -907,6 +916,24 @@ case arch-enc in
             { echo "FAIL arch-enc:"; sed 's/^/    /' "$WORK/arch-enc.out"; } >>"$FAILURES"
         fi
         count=$((count + 1))
+        ;;
+esac
+
+# std::gpu's suite (run above); category "gpu".
+case gpu in
+    *"$FILTER"*)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "gpu pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "gpu fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/gpu.out"
+        if ! grep -q -E '^(pass|skip)' "$WORK/gpu.out"; then
+            echo "gpu fail" >>"$TALLY"
+            count=$((count + 1))
+            { echo "FAIL gpu: tests/gpu/run.sh reported nothing:"; sed 's/^/    /' "$WORK/gpu.out" | head -20; echo; } >>"$FAILURES"
+        fi
+        awk '/^FAIL/ { p = 1 } /^(pass|skip|gpu:)/ { p = 0 } p' "$WORK/gpu.out" >>"$FAILURES"
         ;;
 esac
 

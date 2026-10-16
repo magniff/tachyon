@@ -1,0 +1,81 @@
+// Compute: y = a * x + y over 1M floats, checked against the CPU.
+// EXPECT: saxpy 1048576 ok
+
+use gpu::{BindingType, BufferUsage, Reflection, ShaderSource};
+
+const MSL: [[u8]; 9] = [
+    "#include <metal_stdlib>",
+    "using namespace metal;",
+    "struct Params { float a; uint n; };",
+    "kernel void saxpy(constant Params& p [[buffer(0)]],",
+    "                  device const float* x [[buffer(1)]],",
+    "                  device float* y [[buffer(2)]],",
+    "                  uint i [[thread_position_in_grid]]) {",
+    "    if (i < p.n) { y[i] = p.a * x[i] + y[i]; }",
+    "}",
+];
+
+fn main(gpa: Gpa) -> i32 {
+    let inst = gpu::Instance::new_in(gpa);
+    let mut adapter = inst.adapter().unwrap();
+    defer adapter.free();
+    let (mut dev, mut queue) = adapter.device().unwrap();
+    defer dev.free();
+    defer queue.free();
+
+    let mut refl = Reflection::new_in(gpa);
+    defer refl.free();
+    refl.compute("main", "saxpy", 256);
+    refl.bind(0, 0, BindingType::Uniform, compute: 0);
+    refl.bind(0, 1, BindingType::ReadOnlyStorage, compute: 1);
+    refl.bind(0, 2, BindingType::Storage, compute: 2);
+    let mut text = lines(MSL[..], gpa);
+    defer text.free();
+    let src = ShaderSource { msl: text.as_slice(), reflection: refl };
+    let mut shader = dev.shader(&src).unwrap();
+    defer shader.free();
+    let mut pipe = dev.compute_pipeline(&shader, "main").unwrap();
+    defer pipe.free();
+
+    let n = 1 << 20;
+    let mut xs: Vec<f32> = Vec::new_in(gpa);
+    defer xs.free();
+    let mut ys: Vec<f32> = Vec::new_in(gpa);
+    defer ys.free();
+    for i in 0..n {
+        xs.push((i % 1000) as f32 * 0.5);
+        ys.push((i % 7) as f32);
+    }
+    let a: f32 = 3.0;
+    let params: [u32; 4] = [0x40400000, n as u32, 0, 0];
+    let mut pbuf = dev.buffer_init(gpu::bytes_of_u32(params[..]), BufferUsage::UNIFORM);
+    defer pbuf.free();
+    let mut xbuf = dev.buffer_init(gpu::bytes_of_f32(xs.as_slice()), BufferUsage::STORAGE);
+    defer xbuf.free();
+    let mut ybuf = dev.buffer_init(gpu::bytes_of_f32(ys.as_slice()),
+        BufferUsage::STORAGE | BufferUsage::COPY_SRC);
+    defer ybuf.free();
+    let mut out = dev.buffer(n * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    defer out.free();
+    let mut group = dev.bind_group(pipe.bind_layout(0),
+        [gpu::bind(0, &pbuf), gpu::bind(1, &xbuf), gpu::bind(2, &ybuf)][..]);
+    defer group.free();
+
+    let mut enc = dev.encoder();
+    enc.compute_pass(|pass| {
+        pass.set_pipeline(&pipe);
+        pass.set_bind_group(0, &group);
+        pass.dispatch((n + 255) / 256);
+    });
+    enc.copy_buffer(&ybuf, 0, &out, 0, n * 4);
+    queue.submit(enc.finish());
+
+    let got = gpu::f32s(out.map_read(&dev).unwrap());
+    let mut bad = 0;
+    for i in 0..n {
+        let want = a * xs.get(i) + ys.get(i);
+        if got[i] != want { bad += 1; }
+    }
+    if bad == 0 { println(f"saxpy {n} ok"); } else { println(f"saxpy {bad} wrong"); }
+    0
+}

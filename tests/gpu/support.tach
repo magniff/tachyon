@@ -1,0 +1,429 @@
+// Helpers for the GPU tests (tests/gpu/run.sh compiles each case with
+// this file and lib/root.tach): shader text as lines, the test scenes and
+// their CPU rasterizer (tests/gpu/refgen.tach writes the reference images
+// with it: a reference is never drawn by the GPU under test), PPM files,
+// image comparison.
+//
+// Shaders are arrays of lines joined at run time: tachyon has no
+// multi-line string literal or include_str yet (C3).
+
+import "stdio.h" as c;
+import "string.h" as c;
+use std::Buf;
+
+/// The lines joined with '\n' (the caller frees the Buf).
+pub fn lines(ls: [[u8]], gpa: Gpa) -> Buf {
+    let mut b = Buf::new_in(gpa);
+    for l in ls {
+        b.push_str(l);
+        b.push('\n');
+    }
+    b
+}
+
+// ---- scenes ----
+
+/// An axis-aligned rectangle of pixels [x0, x1) x [y0, y1), a flat color
+/// (RGBA8) and a depth.
+#[derive(Eq, Debug, Clone)]
+pub struct Rect {
+    pub x0: i64,
+    pub y0: i64,
+    pub x1: i64,
+    pub y1: i64,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+    pub z: f32,
+}
+
+pub fn rect(x0: i64, y0: i64, x1: i64, y1: i64, r: u8, g: u8, b: u8, a: u8 = 255, z: f32 = 0.5) -> Rect {
+    Rect { x0: x0, y0: y0, x1: x1, y1: y1, r: r, g: g, b: b, a: a, z: z }
+}
+
+pub const SIZE: i64 = 64;
+
+/// The clear color of the scenes: exact in RGBA8 (k / 255).
+pub const CLEAR: [u8; 4] = [32, 64, 96, 255];
+
+/// render_rects: opaque rectangles, later ones over earlier ones.
+pub fn scene_rects() -> [Rect; 6] {
+    [
+        rect(0, 0, 64, 8, 255, 0, 0),
+        rect(8, 8, 40, 40, 0, 255, 0),
+        rect(24, 24, 56, 56, 0, 0, 255),
+        rect(60, 0, 64, 64, 255, 255, 255),
+        rect(30, 2, 31, 63, 17, 34, 51),
+        rect(1, 50, 20, 51, 200, 100, 50),
+    ]
+}
+
+/// render_instanced: one quad, an instance per rectangle.
+pub fn scene_instanced() -> [Rect; 8] {
+    let mut out = [rect(0, 0, 1, 1, 0, 0, 0); 8];
+    for i in 0..8 {
+        let x = (i % 4) * 16;
+        let y = (i / 4) * 32;
+        out[i] = rect(x + 2, y + 2 + i, x + 14, y + 30, (i * 30) as u8, (255 - i * 20) as u8,
+            (i * 7 + 100) as u8);
+    }
+    out
+}
+
+/// render_depth: drawn in this order with depth test Less: the nearer
+/// (smaller z) wins wherever they overlap, whatever the order.
+pub fn scene_depth() -> [Rect; 4] {
+    [
+        rect(4, 4, 44, 44, 255, 0, 0, z: 0.25),
+        rect(20, 20, 60, 60, 0, 255, 0, z: 0.75),
+        rect(10, 30, 50, 40, 0, 0, 255, z: 0.5),
+        rect(0, 0, 64, 64, 255, 255, 0, z: 0.9),
+    ]
+}
+
+/// render_blend: translucent rectangles, source-over (straight alpha).
+pub fn scene_blend() -> [Rect; 3] {
+    [
+        rect(8, 8, 48, 48, 255, 0, 0, a: 128),
+        rect(16, 16, 56, 56, 0, 0, 255, a: 64),
+        rect(0, 28, 64, 36, 255, 255, 255, a: 200),
+    ]
+}
+
+fn to_unit(b: u8) -> f64 {
+    b as f64 / 255.0
+}
+
+fn to_byte(x: f64) -> u8 {
+    let y = x * 255.0 + 0.5;
+    if y <= 0.0 { 0 } else if y >= 255.0 { 255 } else { y as u8 }
+}
+
+/// A SIZE x SIZE RGBA8 image (rows of SIZE * 4 bytes) of rects over the
+/// clear color: opaque or blended (straight alpha, source over), with a
+/// depth test (Less) when `depth`.
+pub fn raster_rects(rects: [Rect], blend: bool, depth: bool, gpa: Gpa) -> Buf {
+    let mut img = Buf::new_in(gpa);
+    let mut zs: Vec<f32> = Vec::new_in(gpa);
+    for _ in 0..SIZE * SIZE {
+        for k in 0..4 { img.push(CLEAR[k]); }
+        zs.push(1.0);
+    }
+    let px = img.as_slice();
+    for r in rects {
+        for y in r.y0..r.y1 {
+            for x in r.x0..r.x1 {
+                let i = (y * SIZE + x) * 4;
+                if depth {
+                    if !(r.z < zs.get(y * SIZE + x)) { continue; }
+                    zs.set(y * SIZE + x, r.z);
+                }
+                if blend {
+                    let a = to_unit(r.a);
+                    px[i] = to_byte(to_unit(r.r) * a + to_unit(px[i]) * (1.0 - a));
+                    px[i + 1] = to_byte(to_unit(r.g) * a + to_unit(px[i + 1]) * (1.0 - a));
+                    px[i + 2] = to_byte(to_unit(r.b) * a + to_unit(px[i + 2]) * (1.0 - a));
+                    px[i + 3] = to_byte(a + to_unit(px[i + 3]) * (1.0 - a));
+                } else {
+                    px[i] = r.r;
+                    px[i + 1] = r.g;
+                    px[i + 2] = r.b;
+                    px[i + 3] = r.a;
+                }
+            }
+        }
+    }
+    zs.free();
+    img
+}
+
+/// render_textured: the 8x8 texture's texel (x, y).
+pub fn texel(x: i64, y: i64) -> [u8; 4] {
+    [(x * 32) as u8, (y * 32) as u8, ((x ^ y) * 16 + 15) as u8, 255]
+}
+
+/// The 8x8 texture, rows of 8 * 4 bytes.
+pub fn texture_8x8(gpa: Gpa) -> Buf {
+    let mut b = Buf::new_in(gpa);
+    for y in 0..8 {
+        for x in 0..8 {
+            let t = texel(x, y);
+            for k in 0..4 { b.push(t[k]); }
+        }
+    }
+    b
+}
+
+/// render_textured: the texture stretched over the whole image, nearest
+/// sampling (each texel covers 8 x 8 pixels).
+pub fn raster_textured(gpa: Gpa) -> Buf {
+    let mut img = Buf::new_in(gpa);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let t = texel(x / 8, y / 8);
+            for k in 0..4 { img.push(t[k]); }
+        }
+    }
+    img
+}
+
+/// render_triangle: a triangle with a color per vertex, interpolated;
+/// pixel centers inside by edge functions, the top-left rule for edges.
+/// The GPU's interpolation may differ in the last bit: compared with a
+/// tolerance.
+pub const TRI: [f64; 6] = [8.0, 4.0, 60.0, 30.0, 12.0, 58.0];
+pub const TRI_COLORS: [u8; 9] = [255, 0, 0, 0, 255, 0, 0, 0, 255];
+
+pub fn raster_triangle(gpa: Gpa) -> Buf {
+    let mut img = Buf::new_in(gpa);
+    for _ in 0..SIZE * SIZE {
+        for k in 0..4 { img.push(CLEAR[k]); }
+    }
+    let px = img.as_slice();
+    let (x0, y0, x1, y1, x2, y2) = (TRI[0], TRI[1], TRI[2], TRI[3], TRI[4], TRI[5]);
+    let area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let cx = x as f64 + 0.5;
+            let cy = y as f64 + 0.5;
+            let w0 = ((x2 - x1) * (cy - y1) - (y2 - y1) * (cx - x1)) / area;
+            let w1 = ((x0 - x2) * (cy - y2) - (y0 - y2) * (cx - x2)) / area;
+            let w2 = 1.0 - w0 - w1;
+            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 { continue; }
+            let i = (y * SIZE + x) * 4;
+            for k in 0..3 {
+                let v = to_unit(TRI_COLORS[k]) * w0 + to_unit(TRI_COLORS[3 + k]) * w1 + to_unit(
+                    TRI_COLORS[6 + k]) * w2;
+                px[i + k] = to_byte(v);
+            }
+            px[i + 3] = 255;
+        }
+    }
+    img
+}
+
+// ---- PPM ----
+
+/// Writes an RGBA8 image (rows `stride` bytes apart) as a binary PPM (P6,
+/// alpha dropped).
+pub fn write_ppm(path: [u8], px: [u8], w: i64, h: i64, stride: i64, gpa: Gpa) -> bool {
+    let mut b = Buf::new_in(gpa);
+    b.push_fmt(f"P6\n{w} {h}\n255\n");
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * stride + x * 4;
+            b.push(px[i]);
+            b.push(px[i + 1]);
+            b.push(px[i + 2]);
+        }
+    }
+    let mut name = Buf::new_in(gpa);
+    name.push_str(path);
+    name.push(0);
+    let data = b.as_slice();
+    // fopen, fwrite and fclose with a NUL-terminated name and a live Buf
+    let ok = unsafe {
+        let f = c::fopen(name.as_slice().ptr, c"wb");
+        if f == 0 as *c::FILE {
+            false
+        } else {
+            let n = c::fwrite(data.ptr, 1, data.len as u64, f);
+            c::fclose(f);
+            n == data.len as u64
+        }
+    };
+    b.free();
+    name.free();
+    ok
+}
+
+/// Reads a binary PPM written by write_ppm: (width, height, RGB bytes).
+pub fn read_ppm(path: [u8], gpa: Gpa) -> Option<(i64, i64, Buf)> {
+    let mut name = Buf::new_in(gpa);
+    name.push_str(path);
+    name.push(0);
+    let mut all = Buf::new_in(gpa);
+    // fopen/fread/fclose into a local array
+    let ok = unsafe {
+        let f = c::fopen(name.as_slice().ptr, c"rb");
+        if f == 0 as *c::FILE {
+            false
+        } else {
+            let mut chunk: [u8; 4096] = [0; 4096];
+            loop {
+                let n = c::fread(&chunk as *u8, 1, 4096, f) as i64;
+                if n <= 0 { break; }
+                all.push_str(chunk[0..n]);
+            }
+            c::fclose(f);
+            true
+        }
+    };
+    name.free();
+    if !ok {
+        all.free();
+        return None;
+    }
+    // "P6\n{w} {h}\n255\n"
+    let s = all.as_slice();
+    let mut i = 3;
+    let mut nums = [0; 3];
+    for k in 0..3 {
+        let mut v = 0;
+        while i < s.len && s[i] >= '0' && s[i] <= '9' {
+            v = v * 10 + (s[i] - '0') as i64;
+            i += 1;
+        }
+        nums[k] = v;
+        i += 1;
+    }
+    let mut rgb = Buf::new_in(gpa);
+    rgb.push_str(s[i..]);
+    all.free();
+    Some((nums[0], nums[1], rgb))
+}
+
+/// Compares an RGBA8 image (rows `stride` bytes apart) with a reference
+/// PPM: a pixel differs when a channel is off by more than `tol`; at most
+/// `max_bad` pixels may differ. Prints the first difference past them.
+pub fn check_image(px: [u8], w: i64, h: i64, stride: i64, reference: [u8], tol: i64, max_bad: i64,
+    gpa: Gpa) -> bool {
+    let (rw, rh, mut rgb) = match read_ppm(reference, gpa) {
+        Some(x) => x,
+        None => {
+            println(f"cannot read {reference}");
+            return false;
+        }
+    };
+    if rw != w || rh != h || rgb.len() != w * h * 3 {
+        println(f"{reference}: {rw}x{rh}, the image is {w}x{h}");
+        rgb.free();
+        return false;
+    }
+    let r = rgb.as_slice();
+    let mut bad = 0;
+    let mut first = true;
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * stride + x * 4;
+            let j = (y * w + x) * 3;
+            let mut off = false;
+            for k in 0..3 {
+                let d = px[i + k] as i64 - r[j + k] as i64;
+                if d > tol || d < -tol { off = true; }
+            }
+            if off {
+                bad += 1;
+                if first && bad > max_bad {
+                    first = false;
+                    println(
+                        f"pixel ({x}, {y}) is {px[i]} {px[i + 1]} {px[i + 2]}, the reference {r[j]} {r[j + 1]} {r[j + 2]}");
+                }
+            }
+        }
+    }
+    rgb.free();
+    if bad > max_bad {
+        println(f"{bad} pixels differ from {reference} (at most {max_bad} may)");
+        return false;
+    }
+    true
+}
+
+// ---- drawing the scenes on the GPU ----
+
+/// The shader of the rect scenes: pixel positions to clip space through a
+/// uniform holding the target size; a color and a depth per vertex.
+const RECT_MSL: [[u8]; 18] = [
+    "#include <metal_stdlib>",
+    "using namespace metal;",
+    "struct Globals { float2 size; };",
+    "struct VIn { float2 pos [[attribute(0)]]; float4 color [[attribute(1)]]; float z [[attribute(2)]]; };",
+    "struct VOut { float4 pos [[position]]; float4 color; };",
+    "vertex VOut vs_main(VIn in [[stage_in]], constant Globals& g [[buffer(0)]]) {",
+    "    VOut o;",
+    "    float2 n = in.pos / g.size * 2.0 - 1.0;",
+    "    o.pos = float4(n.x, -n.y, in.z, 1.0);",
+    "    o.color = in.color;",
+    "    return o;",
+    "}",
+    "fragment float4 fs_main(VOut in [[stage_in]]) {",
+    "    return in.color;",
+    "}",
+    "kernel void unused_kernel(device uint* x [[buffer(0)]], uint i [[thread_position_in_grid]]) {",
+    "    x[i] = i;",
+    "}",
+];
+
+/// The rect shader with its reflection, as the WGSL compiler will give it.
+pub fn rect_shader(dev: *gpu::Device, gpa: Gpa) -> gpu::Shader {
+    let mut text = lines(RECT_MSL[..], gpa);
+    let mut refl = gpu::Reflection::new_in(gpa);
+    refl.vertex("vs", "vs_main");
+    refl.fragment("fs", "fs_main");
+    refl.bind(0, 0, gpu::BindingType::Uniform, vertex: 0, min_size: 8);
+    refl.input(0, gpu::VertexFormat::Float32x2);
+    refl.input(1, gpu::VertexFormat::Unorm8x4);
+    refl.input(2, gpu::VertexFormat::Float32);
+    let src = gpu::ShaderSource { msl: text.as_slice(), reflection: refl };
+    let s = dev.shader(&src).unwrap();
+    refl.free();
+    text.free();
+    s
+}
+
+/// The rect shader's vertex buffer layout: 16 bytes a vertex.
+pub fn rect_layout() -> gpu::VertexLayout {
+    let mut l = gpu::VertexLayout::new(16);
+    l.attribute(0, gpu::VertexFormat::Float32x2, 0);
+    l.attribute(1, gpu::VertexFormat::Unorm8x4, 8);
+    l.attribute(2, gpu::VertexFormat::Float32, 12);
+    l
+}
+
+pub fn push_f32(b: *Buf, x: f32) {
+    let a = [x];
+    b.push_str(gpu::bytes_of_f32(a[..]));
+}
+
+/// Two triangles per rect, 16 bytes a vertex (rect_layout).
+pub fn rect_vertices(rects: [Rect], gpa: Gpa) -> Buf {
+    let mut b = Buf::new_in(gpa);
+    for r in rects {
+        let xs = [r.x0, r.x1, r.x0, r.x1, r.x1, r.x0];
+        let ys = [r.y0, r.y0, r.y1, r.y0, r.y1, r.y1];
+        for k in 0..6 {
+            push_f32(&b, xs[k] as f32);
+            push_f32(&b, ys[k] as f32);
+            b.push(r.r);
+            b.push(r.g);
+            b.push(r.b);
+            b.push(r.a);
+            push_f32(&b, r.z);
+        }
+    }
+    b
+}
+
+/// The uniform of the rect shader: the target size (padded to 16 bytes).
+pub fn globals(dev: *gpu::Device) -> gpu::Buffer {
+    let g: [f32; 4] = [SIZE as f32, SIZE as f32, 0.0, 0.0];
+    dev.buffer_init(gpu::bytes_of_f32(g[..]), gpu::BufferUsage::UNIFORM)
+}
+
+/// The scenes' clear color.
+pub fn clear_color() -> gpu::Color {
+    gpu::Color::rgba(CLEAR[0] as f64 / 255.0, CLEAR[1] as f64 / 255.0, CLEAR[2] as f64 / 255.0, 1.0)
+}
+
+/// A SIZE x SIZE render target that can be read back.
+pub fn target(dev: *gpu::Device) -> gpu::Texture {
+    dev.texture(SIZE, SIZE, gpu::Format::Rgba8Unorm,
+        usage: gpu::TextureUsage::RENDER_ATTACHMENT | gpu::TextureUsage::COPY_SRC)
+}
+
+/// A buffer for a SIZE x SIZE RGBA8 readback (rows of 256 bytes).
+pub fn readback(dev: *gpu::Device) -> gpu::Buffer {
+    dev.buffer(SIZE * 256, gpu::BufferUsage::MAP_READ | gpu::BufferUsage::COPY_DST)
+}
