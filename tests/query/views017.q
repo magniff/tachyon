@@ -9,9 +9,9 @@ crate::intern	views() stores(word) declared
 crate::count	views()
 $ views Vec::get Vec::as_slice Vec::push
 Vec<Tok>::get	views(*self) parametric
-Vec<Tok>::as_slice	views(self) parametric
-Vec<[u8]>::push	views() stores(x) inferred
-Vec<Tok>::push	views() stores(x) inferred
+Vec<Tok>::as_slice	views(self) declared
+Vec<[u8]>::push	views() stores(x) declared
+Vec<Tok>::push	views() stores(x) declared
 $ views crate --why
 crate::first_word	views(s) declared
   why: declared (#[views], #[stores]): callers use the declaration, and the body is checked against it
