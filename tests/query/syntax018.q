@@ -3,7 +3,7 @@
 ## an item shown with its clauses, a distinct type, test functions.
 $ items
 crate	syntax018/main.tach	14
-std	<std>	567
+std	<std>	591
 crate::tests	syntax018/main.tach	1
 $ show crate::push Stack Percent
 // crate::push	syntax018/main.tach:19-27	effects: panic

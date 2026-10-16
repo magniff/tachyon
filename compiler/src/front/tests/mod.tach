@@ -604,7 +604,11 @@ fn put_test_case(out: i64, t: Found, ps: *IntVec) -> bool {
             return true;
         }
         // a property, a fuzz target or a contract: the values, then the call
-        buf_bytes(out, "        std::run_property(gpa, \"");
+        if t.kind == TEST_FUZZ {
+            put_fuzz_words(out);
+        }
+        buf_bytes(out, if t.kind == TEST_FUZZ { "        std::run_fuzz_target(gpa, \"" }
+            else { "        std::run_property(gpa, \"" });
         buf_bytes(out, sym_text(t.label));
         buf_bytes(out, "\", |g: *std::Gen| {\n");
         let call = buf_new();
@@ -617,7 +621,12 @@ fn put_test_case(out: i64, t: Found, ps: *IntVec) -> bool {
             let b = (*ps).data[k + 2];
             let why = buf_new();
             let gen = buf_new();
-            if !gen_expr(gen, a, b, why) {
+            let bytes = t.kind == TEST_FUZZ && b == a + 3 && kind(a) == Tok::LBracket
+                && is_ident(a + 1, "u8");
+            if bytes {
+                // (a fuzz target's input, its bytes: std/fuzz.tach)
+                buf_bytes(gen, "std::gen_bytes(g)");
+            } else if !gen_expr(gen, a, b, why) {
                 let m = buf_new();
                 buf_bytes(m, "no generator for '");
                 buf_bytes(m, text_of(a, b));
@@ -687,6 +696,23 @@ fn put_test_case(out: i64, t: Found, ps: *IntVec) -> bool {
         buf_bytes(out, ";\n");
         buf_bytes(out, "        });\n");
         true
+    }
+}
+
+// A fuzz target's dictionary: the program's string constants (up to 64,
+// of 32 bytes at most), which mutations put in its inputs.
+fn put_fuzz_words(out: i64) {
+    unsafe {
+        let mut n = 0;
+        for i in 0..TOK_COUNT {
+            if n < 64 && kind(i) == Tok::Str && in_program(i) && TOKS[i].end - TOKS[i].start <= 34
+                && TOKS[i].end - TOKS[i].start > 2 {
+                buf_bytes(out, "        std::fuzz_word(");
+                buf_bytes(out, tok_text(i));
+                buf_bytes(out, ");\n");
+                n += 1;
+            }
+        }
     }
 }
 
@@ -945,6 +971,20 @@ fn put_fields(out: i64, j: i64, why: i64) -> bool {
 pub fn add_test_code() {
     unsafe {
         plant_miscompile();
+        if crate::middle::coverage::COVERAGE {
+            // (--coverage counts the IR's blocks: -O1 at least; std's
+            // counters in the program)
+            if crate::middle::opt::OPT_LEVEL < 1 {
+                crate::middle::opt::OPT_LEVEL = 1;
+            }
+            if !TEST_BUILD {
+                let anchor = buf_new();
+                buf_bytes(anchor,
+                    "pub fn __tachyon_coverage() -> [u8] {\n    std::coverage()\n}\n");
+                let start = add_source(c"<test>", anchor);
+                lex_range(start, FILES[FILE_COUNT - 1].end, last: false);
+            }
+        }
         if !TEST_BUILD {
             return;
         }

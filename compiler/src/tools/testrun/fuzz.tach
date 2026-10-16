@@ -1,0 +1,258 @@
+// `tachyonc fuzz NAME [ROOT.tach] [--time S]` (0.18, T3; docs/design/
+// contracts-verification.md §2.8): a #[fuzz] function (or a #[property])
+// run on inputs the test binary mutates, built with --coverage at -O1: an
+// input that reaches new code joins the corpus, .tachyonc/fuzz/NAME/
+// (corpus-HASH files, with tests/fuzz/NAME/'s inputs as seeds); a failing
+// one is shrunk, saved there as crash-HASH and reported as a property's
+// failure is. `tachyonc test` replays the crashes and tests/fuzz/NAME/
+// (--accept copies the crashes there).
+
+use crate::base::{
+    IntVec, STDOUT, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd, streq,
+};
+use crate::front::cpp::directives::file_exists;
+use crate::tools::proc::{absolute_path, make_dirs, run_capture};
+use crate::tools::query::{c_slice, ends_with_c, parse_count};
+use crate::tools::query::diagnostics::{
+    PROG, TOOL, diag, put_cword, try_begin, try_end, write_diags,
+};
+use crate::tools::testrun::{TIMEOUT, dir_of, join, line_end, put_cut, shown_path, starts, work_dir};
+use crate::tools::testrun::program::{
+    JOBS, add_job, argv_of, build, file_text, first_line, level_dir, list_tests, run_jobs,
+    runtime_line,
+};
+
+// The files in dir whose names start with prefix ("": all), as paths
+// (pushed to `out`, C strings).
+pub fn files_in(dir: *u8, prefix: [u8], out: *IntVec) {
+    unsafe {
+        if !file_exists(dir) {
+            return;
+        }
+        let w = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut words = w;
+        words.push(c"ls" as i64);
+        words.push(c"-1" as i64);
+        words.push(dir as i64);
+        let listing = buf_new();
+        if run_capture(argv_of(&words), listing) != 0 {
+            return;
+        }
+        let t = buf_slice(listing);
+        let mut i = 0;
+        while i < t.len {
+            let e = line_end(t, i);
+            let f = t[i..e];
+            i = e + 1;
+            if f.len > 0 && starts(f, prefix) {
+                (*out).push(join(dir, f) as i64);
+            }
+        }
+    }
+}
+
+// The directory of NAME's saved inputs: .tachyonc/fuzz/NAME next to the
+// program's root.
+pub fn fuzz_dir(src_dir: *u8, name: [u8]) -> *u8 {
+    let b = buf_new();
+    buf_bytes(b, ".tachyonc/fuzz/");
+    buf_bytes(b, name);
+    join(src_dir, buf_slice(b))
+}
+
+fn fuzz_usage(why: *u8, word: *u8) -> i64 {
+    unsafe {
+        let d = diag(c"error", c"fuzz.usage");
+        buf_str(d, why);
+        if word != 0 as *u8 {
+            buf_str(d, c" '");
+            buf_str(d, word);
+            buf_str(d, c"'");
+        }
+        buf_str(d, c"; usage: tachyonc fuzz NAME [ROOT.tach] [--time S]\n");
+        write_diags();
+        2
+    }
+}
+
+pub fn fuzz_command(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        PROG = argv[0];
+        TOOL = 0 as *u8;
+        let mut name = 0 as *u8;
+        let mut root = 0 as *u8;
+        let mut seconds = 10;
+        let mut i = 2;
+        while i < argc {
+            let a = argv[i];
+            if streq(a, c"--time") {
+                if i + 1 >= argc {
+                    return fuzz_usage(c"a number of seconds is needed after", a);
+                }
+                seconds = parse_count(argv[i + 1]);
+                if seconds <= 0 {
+                    return fuzz_usage(c"--time takes a number of seconds, not", argv[i + 1]);
+                }
+                i += 1;
+            } else if a[0] == '-' {
+                return fuzz_usage(c"unknown option", a);
+            } else if ends_with_c(a, c".tach") {
+                root = a;
+            } else if name == 0 as *u8 {
+                name = a;
+            } else {
+                return fuzz_usage(c"one target at a time; a second", a);
+            }
+            i += 1;
+        }
+        if name == 0 as *u8 {
+            return fuzz_usage(c"the #[fuzz] function to fuzz is needed", 0 as *u8);
+        }
+        if root == 0 as *u8 {
+            root = c"main.tach";
+        }
+        if !file_exists(root) {
+            let d = diag(c"error", c"test.no-root");
+            buf_str(d, c"no file '");
+            buf_str(d, root);
+            buf_str(d, c"' (name the program's root: tachyonc fuzz NAME path/to/main.tach)\n");
+            write_diags();
+            return 2;
+        }
+        let out = buf_new();
+        let root_abs = absolute_path(root);
+        let src_dir = dir_of(root_abs);
+        let work = work_dir(root_abs, src_dir);
+        let tbin = join(level_dir(work, c"-O1"), "fuzz");
+        if !build(root, src_dir, work, tbin, c"-O1", true, out, coverage: true) {
+            buf_write_fd(out, STDOUT);
+            return 1;
+        }
+        // the target
+        let mut kinds = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut positions = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        list_tests(tbin, &kinds, &names, &positions);
+        let target = c_slice(name);
+        let mut found = false;
+        for k in 0..names.count {
+            if buf_slice(names.data[k]) == target && kinds.data[k] != 1 {
+                found = true;
+            }
+        }
+        if !found {
+            let d = diag(c"error", c"fuzz.unknown");
+            buf_str(d, c"no #[fuzz] or #[property] function '");
+            buf_str(d, name);
+            buf_str(d, c"' in ");
+            buf_str(d, root);
+            let mut first = -1;
+            let mut n = 0;
+            for k in 0..names.count {
+                if kinds.data[k] == 3 || kinds.data[k] == 2 {
+                    buf_str(d, if n == 0 { c"; its targets: " } else { c", " });
+                    buf_bytes(d, buf_slice(names.data[k]));
+                    if first < 0 {
+                        first = k;
+                    }
+                    n += 1;
+                }
+            }
+            buf_str(d, c"\n");
+            if first >= 0 {
+                let t = try_begin(c"fuzz", buf_slice(names.data[first]), true);
+                put_cword(t, root);
+                try_end(t);
+            }
+            write_diags();
+            return 2;
+        }
+        // its inputs: the corpus so far, tests/fuzz/NAME/
+        let dir = fuzz_dir(src_dir, target);
+        make_dirs(dir);
+        let mut seeds = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        files_in(dir, "corpus-", &seeds);
+        let tb = buf_new();
+        buf_bytes(tb, "tests/fuzz/");
+        buf_bytes(tb, target);
+        files_in(join(src_dir, buf_slice(tb)), "", &seeds);
+        let w = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut words = w;
+        words.push(tbin as i64);
+        words.push(c"--tachyon-test" as i64);
+        words.push(name as i64);
+        words.push(c"--fuzz-time" as i64);
+        let sb = buf_new();
+        buf_int(sb, seconds);
+        words.push(crate::tools::proc::buf_cstr(sb) as i64);
+        words.push(c"--fuzz-dir" as i64);
+        words.push(shown_path(dir) as i64);
+        let mut k = 0;
+        while k < seeds.count && k < 200 {
+            words.push(c"--replay" as i64);
+            words.push(shown_path(seeds.data[k] as *u8) as i64);
+            k += 1;
+        }
+        TIMEOUT = seconds + 60;
+        let job = add_job(argv_of(&words), 0 as *u8, join(dir, "fuzz.out"), join(dir, "fuzz.err"));
+        run_jobs(job);
+        let got = file_text(JOBS[job].out);
+        let err = file_text(JOBS[job].err);
+        let status = JOBS[job].status;
+        let shown = shown_path(dir);
+        if status == 0 {
+            buf_bytes(out, "fuzz ");
+            buf_str(out, name);
+            buf_bytes(out, ": ");
+            let summary = runtime_line(got, "fuzz", 0);
+            buf_bytes(out, if summary.len > 0 { summary } else { "ran" });
+            buf_bytes(out, " in ");
+            buf_int(out, seconds);
+            buf_bytes(out, " s (");
+            buf_str(out, shown);
+            buf_bytes(out, "/); no failure\n");
+            buf_write_fd(out, STDOUT);
+            return 0;
+        }
+        buf_bytes(out, "FAIL ");
+        buf_str(out, name);
+        let prop = runtime_line(got, "property", 0);
+        if prop.len > 0 {
+            buf_bytes(out, " (fuzz, ");
+            buf_bytes(out, prop);
+            buf_bytes(out, ")");
+        }
+        buf_bytes(out, ": ");
+        if status == -1 {
+            buf_bytes(out, "no exit (a time limit)\n");
+        } else if err.len > 0 {
+            put_cut(out, "", first_line(err));
+        } else {
+            buf_bytes(out, "exit ");
+            buf_int(out, status);
+            buf_bytes(out, "\n");
+        }
+        let mut n = 0;
+        while runtime_line(got, "input", n).len > 0 {
+            put_cut(out, "  input: ", runtime_line(got, "input", n));
+            n += 1;
+        }
+        let saved = runtime_line(got, "saved", 0);
+        if saved.len > 0 {
+            buf_bytes(out, "  saved: ");
+            buf_bytes(out, saved);
+            buf_bytes(out, " (tachyonc test replays it; test --accept keeps it in tests/fuzz/");
+            buf_str(out, name);
+            buf_bytes(out, "/)\n");
+        }
+        buf_bytes(out, "  try: ");
+        buf_str(out, PROG);
+        buf_bytes(out, " test ");
+        buf_str(out, name);
+        buf_bytes(out, " ");
+        buf_str(out, root);
+        buf_bytes(out, "\n");
+        buf_write_fd(out, STDOUT);
+        1
+    }
+}
