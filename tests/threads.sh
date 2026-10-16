@@ -77,8 +77,11 @@ build() { # <file> <level> <env> <threads> <out>
         [ $kind = o ] && opt=-c
         # shellcheck disable=SC2086
         env $3 "$COMPILER" --target "$TARGET" "-O$2" "-j$4" $flags $opt "$1" -o "$5.$kind" \
-            >"$5.$kind.out" 2>&1
-        echo "exit $?" >>"$5.$kind.out"
+            >"$5.$kind.raw" 2>&1
+        rc=$?
+        # (the success line names the output file, which differs per build)
+        sed "s|$5\.$kind|OUT.$kind|g" "$5.$kind.raw" >"$5.$kind.out"
+        echo "exit $rc" >>"$5.$kind.out"
     done
 }
 
