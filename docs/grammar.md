@@ -1571,6 +1571,18 @@ pointee written as a Vec, a Buf or a slice (`*Vec<T>`) is indexed
 else is pointer arithmetic; through a borrow its error names `*p`, the
 value it points to (`try: *out = acc` for `out[0] = acc`).
 
+**std on values** (value semantics, T4). `v[i] = x`, `v[i] += x`,
+`v[i].f = x` and `&mut v[a..b]` go through `v.as_mut_slice()` (an
+exclusive view; reads through `v.as_slice()`). Until 0.18 a `[T]` is
+accepted where `&mut [T]` is wanted (`sort(v.as_slice())`, `sort(s)`),
+as a legacy `*T` parameter takes `&x`: the call takes the exclusive
+loan. A function or closure whose parameter is written `*T` satisfies an
+`Fn` bound's `&T` (`sort_by(|a: *T, b: *T| ..)`), and a function whose
+pointer parameters are all references is safe to use as a value. A
+struct or enum that owns nothing (no Vec, Buf, HashMap or Drop in it)
+is `Clone` without an impl, by copying, as numbers are. A method may
+take `self: &mut [T]`, called on a slice (`s.swap(i, j)`, `s.sort()`).
+
 **Through a pointer.** `p.0` on a `*(A, B)` is `(*p).0`, as `p.x` on a
 `*S` is `(*p).x`: safe when `p` is a borrow (a parameter, `&x`),
 `unsafe` on a raw pointer.

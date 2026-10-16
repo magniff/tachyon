@@ -14,7 +14,7 @@ Vec::new_in(gpa) -> Vec<T>       let mut v: Vec<i64> = Vec::new_in(gpa);
 v.len() -> i64                   Vec, Buf, HashMap; a slice: s.len or s.len()
 v.get(i: i64) -> T               checked; also v[i]; m.get(k) -> Option<V>
 b.push_str(s: [u8])
-v.free()                         Vec, Buf, HashMap: defer v.free();
+v.free()                         Vec, Buf, HashMap: defer v.free(); consumes v
 Buf::new_in(gpa) -> Buf          text you build (there is no String)
 o.unwrap() -> T                  Option, Result
 read_stdin_in(gpa) -> Result<Buf, IoError>    all of stdin
@@ -25,11 +25,11 @@ Scanner::new(text: [u8]) -> Scanner
 sc.next_int() -> Result<i64, ScanError>
 o.unwrap_or(x: T) -> T           Option, Result
 v.clear()                        Vec, Buf
-v.sort_by(|a, b| a.x - b.x)      Vec or slice; a, b: *T; < 0: a first
+v.sort_by(|a, b| a.x - b.x)      Vec or slice; a, b: &T; < 0: a first
 HashMap::new_in(gpa) -> HashMap<K, V>
 v.pop() -> Option<T>
 Vec::filled_in(n: i64, x: T, gpa) -> Vec<T>
-sort(s: [T])                     in place, by Ord
+sort(s: &mut [T])                in place, by Ord; also v.sort()
 m.slots(), m.key_at(i) -> Option<K>, m.value_at(i) -> Option<V>   iterate
 Vec::with_capacity_in(cap: i64, gpa) -> Vec<T>
 m.get_or_insert(k: K, d: V) -> [V]    m.get_or_insert(w, 0)[0] += 1;
@@ -43,7 +43,7 @@ is_digit(b: u8) -> bool          use std::{is_digit};
 read_line(&b) -> Result<bool, IoError>    Ok(false) at the end of input
 split_whitespace_in(s: [u8], gpa) -> Vec<[u8]>
 v.swap(i: i64, j: i64)
-sort_stable_by_in(s: [T], f, gpa)     use std::{sort_stable_by_in};
+sort_stable_by_in(s: &mut [T], f, gpa)
 o.is_some() -> bool              Option
 v.remove(i: i64) -> T            m.remove(k) -> Option<V>
 split_in(s: [u8], sep: u8, gpa) -> Vec<[u8]>
@@ -89,7 +89,10 @@ after creating the value with `defer x.free();`.
   until the map's next insert, remove or free, like `as_slice()`:
   `counts.get_or_insert(word, 0)[0] += 1;` counts.
 - `sort(s)` sorts a slice in place by `Ord` (an introsort: O(n log n),
-  not stable).
+  not stable); `v.sort()`, `s.sort()` too.
+- (0.17) `sort(&mut a[..])`, `sort(v.as_mut_slice())`; `v.free()`
+  consumes `v`; `v.take()` empties a container, keeping its allocator;
+  `std::take`, `std::replace`, `std::swap`; `v.iter_ref()` yields `&T`.
 
 ```tach
 fn main(gpa: Gpa) -> i32 {
@@ -182,8 +185,9 @@ last|
 ## The API
 
 Generated from std's source in this compiler: every public item a
-program uses, one line each. Methods take `self: *Self` (called as
-`v.push(x)` on a place) or `self: Self` (a copy). Each item with its
+program uses, one line each. Methods take `self: &Self` (reads),
+`self: &mut Self` (changes; called as `v.push(x)` on a place), `self:
+*Self` or `self: Self` (by value). Each item with its
 comment: `tachyonc guide std#every-item`; one item's source: `tachyonc
 query show std::Scanner::next_line`.
 

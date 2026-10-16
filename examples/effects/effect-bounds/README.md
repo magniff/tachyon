@@ -56,7 +56,7 @@ A generic function's effects are its instances': one per closure.
 $ tachyonc query effects crate::table
 map_values<closure(i64) -> i64 at main.tach:17:26>	none
 partition<closure(*Row) -> bool at main.tach:18:33>	panic
-sort_by_key<closure(*Row) -> i64 at main.tach:19:28>	panic
+sort_by_key<closure(*Row) -> i64 at main.tach:19:28>	none
 each<closure(*Row) -> () at main.tach:21:20>	io global panic
 ```
 

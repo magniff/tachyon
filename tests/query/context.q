@@ -12,7 +12,7 @@ fn report(items: *Vec<Item>) -> i64 {
     total(items)
 }
 // calls (3)
-std::Vec::len	../../compiler/std/std.tach:168:12	method	pub fn len(self: *Vec<T, A>) -> i64
+std::Vec::len	../../compiler/std/std.tach:157:12	method	pub fn len(self: &Vec<T, A>) -> i64
 crate::stock::restock	context/stock.tach:10:8	fn	pub fn restock(items: *Vec<Item>, i: i64, n: i64)
 crate::stock::total	context/stock.tach:19:8	fn	pub fn total(items: *Vec<Item>) -> i64
 // types (2)
@@ -32,8 +32,8 @@ pub fn restock(items: *Vec<Item>, i: i64, n: i64) {
     }
 }
 // calls (2)
-std::Vec::set	../../compiler/std/std.tach:270:12	method	pub fn set(self: *Vec<T, A>, i: i64, x: T)
-std::Vec::get	../../compiler/std/std.tach:266:12	method	pub fn get(self: *Vec<T, A>, i: i64) -> T
+std::Vec::set	../../compiler/std/std.tach:262:12	method	pub fn set(self: &mut Vec<T, A>, i: i64, x: T)
+std::Vec::get	../../compiler/std/std.tach:257:12	method	pub fn get(self: &Vec<T, A>, i: i64) -> T
 // types (2)
 crate::stock::Item	context/stock.tach:4:12	struct	pub struct Item { pub name: [u8], pub count: i64 }
 std::Vec	../../compiler/std/std.tach:142:12	struct	pub struct Vec<T, A: Allocator = Gpa> { ptr: *T, len: i64, cap: i64, alloc: A }
@@ -51,8 +51,8 @@ pub fn total(items: *Vec<Item>) -> i64 {
     t
 }
 // calls (2)
-std::Vec::len	../../compiler/std/std.tach:168:12	method	pub fn len(self: *Vec<T, A>) -> i64
-std::Vec::get	../../compiler/std/std.tach:266:12	method	pub fn get(self: *Vec<T, A>, i: i64) -> T
+std::Vec::len	../../compiler/std/std.tach:157:12	method	pub fn len(self: &Vec<T, A>) -> i64
+std::Vec::get	../../compiler/std/std.tach:257:12	method	pub fn get(self: &Vec<T, A>, i: i64) -> T
 // types (2)
 crate::stock::Item	context/stock.tach:4:12	struct	pub struct Item { pub name: [u8], pub count: i64 }
 std::Vec	../../compiler/std/std.tach:142:12	struct	pub struct Vec<T, A: Allocator = Gpa> { ptr: *T, len: i64, cap: i64, alloc: A }
@@ -103,7 +103,7 @@ fn report(items: *Vec<Item>) -> i64 {
     total(items)
 }
 // calls (3)
-std::Vec::len	../../compiler/std/std.tach:168:12	method	pub fn len(self: *Vec<T, A>) -> i64
+std::Vec::len	../../compiler/std/std.tach:157:12	method	pub fn len(self: &Vec<T, A>) -> i64
 crate::stock::restock	context/stock.tach:10:8	fn	pub fn restock(items: *Vec<Item>, i: i64, n: i64)
 note query.budget: over the budget of 120 tokens, left out: calls 1, types or uses 2, callers 2
 try: tachyonc query callers report

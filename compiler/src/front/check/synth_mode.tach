@@ -305,6 +305,33 @@ fn cast_node(e: i64, t: i64) -> i64 {
     }
 }
 
+// (0.17) The place a write goes to while it is checked: an assignment's
+// target, a `&mut`'s operand. `v[i]` on its path (through fields and
+// indexes) is `v.as_mut_slice()[i]`, any other `v.as_slice()[i]`.
+pub static mut MUT_PLACE: i64 = 0;
+
+// The method `v[i]` (index node n) on a Vec or a Buf calls: as_mut_slice
+// on MUT_PLACE's path, else as_slice.
+fn slice_method(n: i64) -> i64 {
+    unsafe {
+        let mut p = MUT_PLACE;
+        for _ in 0..1000 {
+            if p == 0 {
+                break;
+            }
+            if p == n {
+                return intern_c(c"as_mut_slice");
+            }
+            let k = NODES[p].kind;
+            if k != Index && k != FieldAccess && k != TupleField {
+                break;
+            }
+            p = NODES[p].a;
+        }
+        intern_c(c"as_slice")
+    }
+}
+
 fn synth_index(n: i64) -> i64 {
     unsafe {
         let mut base = NODES[n].a;
@@ -312,11 +339,12 @@ fn synth_index(n: i64) -> i64 {
         let mut base_kind = TYPES[base_ty].kind;
         if base_kind == TyKind::Struct && indexes_as_slice(base_ty) {
             // (0.17) `v[i]` (`v[a..b]`) on a Vec or a Buf is
-            // `v.as_slice()[i]`: checked, and a place to assign
+            // `v.as_slice()[i]`: checked, and a place to assign, through
+            // `v.as_mut_slice()` when it is written
             NODES[base].p |= NODE_CHECKED;
             let call = new_node(NodeKind::MethodCall, NODES[base].start, NODES[base].end);
             NODES[call].a = base;
-            NODES[call].b = intern_c(c"as_slice");
+            NODES[call].b = slice_method(n);
             let mark = list_begin();
             list_end(call, mark);
             NODES[n].a = call;
@@ -350,7 +378,7 @@ fn synth_index(n: i64) -> i64 {
                 // method called through the borrow, safely
                 let call = new_node(NodeKind::MethodCall, NODES[base].start, NODES[base].end);
                 NODES[call].a = base;
-                NODES[call].b = intern_c(c"as_slice");
+                NODES[call].b = slice_method(n);
                 let mark = list_begin();
                 list_end(call, mark);
                 NODES[base].p |= NODE_CHECKED;
@@ -812,8 +840,13 @@ fn synth_unary(n: i64) -> i64 {
         }
         // Tok::Amp: taking an address reads nothing (a union's field too).
         mark_no_read(operand);
-        let ty = synth_expr(operand);
         let mutable = (NODES[n].p & NODE_REF_MUT) != 0;
+        let outer_place = MUT_PLACE;
+        if mutable {
+            MUT_PLACE = operand;
+        }
+        let ty = synth_expr(operand);
+        MUT_PLACE = outer_place;
         if !is_place(operand) {
             if TYPES[ty].kind == TyKind::Slice {
                 // (0.17) `&s[a..b]`, `&mut a[..]`: a slice value is its own
