@@ -31,7 +31,7 @@
 // exit (a `return`, the tail) whose value brought it; `query views --why`
 // prints them, and a callee's summary when the value is a call.
 
-use crate::base::{IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str};
+use crate::base::{IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern_c};
 use crate::base::diag::{buf_position, put_short_positions};
 use crate::front::ast::{NODES, NodeKind, child};
 use crate::front::check::LOCALS;
@@ -110,6 +110,9 @@ pub fn holds(t: i64, e: i64) -> bool {
     }
 }
 
+static mut SYM_VEC_T: i64 = 0;
+static mut SYM_MAP_T: i64 = 0;
+
 fn holds_of(t: i64, e: i64) -> bool {
     unsafe {
         let k = TYPES[t].kind;
@@ -123,7 +126,12 @@ fn holds_of(t: i64, e: i64) -> bool {
                 return true;
             }
             if owned_base_type(t) {
-                if STRUCTS[s].targ_count == 0 {
+                let tpl = if STRUCTS[s].tmpl != 0 { STRUCTS[s].tmpl - 1 } else { s };
+                if SYM_VEC_T == 0 {
+                    SYM_VEC_T = intern_c(c"Vec");
+                    SYM_MAP_T = intern_c(c"HashMap");
+                }
+                if STRUCTS[tpl].name != SYM_VEC_T && STRUCTS[tpl].name != SYM_MAP_T {
                     // (Buf holds bytes; Arena anything)
                     return true;
                 }
@@ -867,6 +875,18 @@ fn put_short_pos(out: i64, pos: i64) {
     put_short_positions(out, buf_slice(tmp));
 }
 
+// The why of a parametric result (by its type, whatever the body does).
+fn put_parametric_why(out: i64, f: i64) {
+    unsafe {
+        let p = ret_parametric(f);
+        if p == 1 {
+            buf_str(out, c"  why: a generic result made of its type parameters: the T values its arguments hold (by its type)\n");
+        } else if p == 2 {
+            buf_str(out, c"  why: a generic result that views T storage: its arguments' storage, level by level (by its type)\n");
+        }
+    }
+}
+
 // The why of f's summary into out: a line for each source (`  why:
 // FILE:L:C 'SOURCE' ...`), indented. Nothing when f was not walked.
 pub fn views_why(out: i64, f: i64) {
@@ -879,7 +899,7 @@ pub fn views_why(out: i64, f: i64) {
         if at == 0 {
             if !summary_inferred(f) && view_fn(f) {
                 if ret_parametric(f) != 0 {
-                    buf_str(out, c"  why: a generic result made of its type parameters: the T values its arguments hold\n");
+                    put_parametric_why(out, f);
                 } else {
                     buf_str(out, c"  why: its body was not walked (it did not check): every parameter assumed\n");
                 }
@@ -888,12 +908,15 @@ pub fn views_why(out: i64, f: i64) {
         }
         let start = (at - 1) / 65536;
         let n = (at - 1) % 65536;
-        if ret_parametric(f) != 0 {
-            buf_str(out, c"  why: a generic result made of its type parameters: the T values its arguments hold\n");
-        }
+        put_parametric_why(out, f);
         let fin = summary_of(f);
+        let fin_p = fin.ret[S_L1_P] | fin.ret[S_L2_P];
+        let sto_p = fin.sto[S_L1_P] | fin.sto[S_L2_P];
+        // (a line per parameter as the text rounds it: shown[group * 2 +
+        // star], parameter bits)
+        let mut shown: [i64; 4] = [0, 0, 0, 0];
         for j in 0..n {
-            let o = (start + j) * 4;
+            let o = start + j * 4;
             let k = WHY_ALL.data[o];
             let i = WHY_ALL.data[o + 1];
             let e = WHY_ALL.data[o + 2];
@@ -909,11 +932,24 @@ pub fn views_why(out: i64, f: i64) {
             let star = k == S_L1_STAR || k == S_L2_STAR || k == 4 + S_L1_STAR
                 || k == 4 + S_L2_STAR;
             let level2 = k == S_L2_P || k == S_L2_STAR || k == 4 + S_L2_P || k == 4 + S_L2_STAR;
+            let group = if k >= 4 { 1 } else { 0 };
+            let p_bits = if k >= 4 { sto_p } else { fin_p };
+            let g = group * 2 + if star { 1 } else { 0 };
+            if star && (p_bits & (1 << i)) != 0 || (shown[g] & (1 << i)) != 0 {
+                continue;
+            }
+            shown[g] |= 1 << i;
             buf_str(out, c"  why: ");
             put_short_pos(out, NODES[e].start);
-            buf_str(out, c" '");
-            buf_node_source(out, e);
-            buf_str(out, c"'");
+            if e == NODES[FNS[f].node].c || k >= 4 {
+                buf_str(out, c" (when '");
+                buf_bytes(out, SYMS[FNS[f].display].text);
+                buf_str(out, c"' returns)");
+            } else {
+                buf_str(out, c" '");
+                buf_node_source(out, e);
+                buf_str(out, c"'");
+            }
             if k >= 4 {
                 buf_str(out, c": '");
                 if target >= 0 && target < FNS[f].param_count {
@@ -1046,14 +1082,14 @@ pub fn infer_summaries(all: bool) {
             if a == b {
                 continue;
             }
-            let recursive = b - a > 1 || order[a] < n && self_edge(order[a]);
+            // (iterated: a recursive component with a member whose
+            // summary is inferred and can carry views)
             let mut iterate = false;
-            if recursive {
-                for k in a..b {
-                    let f = order[k];
-                    if f < n && walkable(f) && view_fn(f) && FNS[f].views_decl == 0 {
-                        iterate = true;
-                    }
+            for k in a..b {
+                let f = order[k];
+                if f < n && FNS[f].views_decl == 0 && walkable(f) && view_fn(f)
+                    && (b - a > 1 || self_edge(f)) {
+                    iterate = true;
                 }
             }
             if !iterate {

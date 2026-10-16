@@ -22,6 +22,7 @@ tachyonc query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE]
 tachyonc query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
 tachyonc query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]   (0.16)
 tachyonc query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (0.16) the inferred effects
+tachyonc query views NAME...|MODULE [--why]   (0.17) what results and `&mut` parameters view
 tachyonc query items [MODULE|TYPE...] [--root ROOT] [--comments]
 tachyonc query show MODULE::section TITLE                   (0.13)
 tachyonc query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
@@ -146,6 +147,7 @@ One line of grammar per kind of line (`\t` is a TAB; `[...]` optional):
 | def | definition | `PATH \t FILE:LINE:COL \t KIND \t SIGNATURE [\t effects: SET]` |
 | show | header | `// PATH \t FILE:FIRST-LAST [\t effects: SET]`, then the source lines, verbatim |
 | effects (0.16) | function | `PATH \t SET`, then with `--why` its chain, indented two spaces |
+| views (0.17) | function | `PATH \t views(..) [stores(..)] HOW`, then with `--why` a line per source, indented two spaces |
 | show, > 5 matches | path | `PATH` (stdout), then `error query.ambiguous` |
 | refs, callers | file header | `# FILE` |
 | refs, callers | reference | `LINE:COL \t (def \| REFKIND \t ENCLOSING) [\t ->TARGET] \t SOURCE` |
@@ -531,6 +533,34 @@ is answered from it too.
 $ tachyonc query effects total --why alloc
 crate::total→alloc(Gpa) panic
   ...the chain...
+```
+
+## views (0.17)
+
+`views NAME...` prints each function's view summary
+(docs/design/value-semantics.md §2.4): which parameters its result
+points into, and what its `&mut` parameters may come to hold. `p` is
+what the argument p points into (the referent of `p: &T`, the storage of
+`p: [T]`), `*p` what the views p holds point into: `Vec::as_slice` is
+`views(self)`, a parser method returning a token's text `views(*self)`,
+`intern(names: &mut Vec<[u8]>, word: [u8])` `views() stores(word)`.
+After it, how it is known: `inferred` (from the body, callees first),
+`declared` (`#[views(..)]`, `#[stores(..)]`), `parametric` (a generic
+result made of its type parameters: by its type), `assumed` (a body that
+did not check: every parameter). A MODULE gives its functions whose
+summary is not `views()`.
+
+- `--why` adds, under each function's line, the `return` or tail that
+  makes each source, and the callee's summary when the value is a call.
+
+`def`, `show` and `context` add `views: SUMMARY` after the effects when
+it is not `views()`; `--print-views` prints every function's summary
+after checking, as `--print-effects` does.
+
+```
+$ tachyonc query views Parser --why
+crate::Parser::name→views(*self) inferred
+  why: parse.tach:4:83 't.text': views what 'self' holds
 ```
 
 ## context (0.15)
