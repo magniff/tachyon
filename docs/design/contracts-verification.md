@@ -1444,12 +1444,12 @@ appends "Tn notes" here.
 **T1 and T5 notes (branch b18-contracts).**
 - *How clauses are made* (front/contracts/expand.tach): before the names
   are collected, a function with a `requires` gets a companion
-  `f?pre(?site, <params>)` beside it (same module, impl, generics), and one
-  with an `ensures` has its body moved to `f?body`, f calling it and
+  `f$pre(?site, <params>)` beside it (same module, impl, generics), and one
+  with an `ensures` has its body moved to `f$body`, f calling it and
   checking `result` (`old(e)` are lets at entry). Being ordinary functions,
   they are instantiated, lazy in std and inferred like any other; nothing
   is cloned per instance by hand. A checked call of f becomes `{ let ?aI =
-  argI; f?pre(SITE, ..); f(..) }` (desugar.tach; simple reads are read
+  argI; f$pre(SITE, ..); f(..) }` (desugar.tach; simple reads are read
   again, not bound). Both back ends lower `std::contract_check(COND, SITE,
   CHECK[, holes])` as a branch per `&&` conjunct to rt.panic.
 - *Reports* (checks.tach): the integer operands of a comparison or call;
@@ -1801,9 +1801,9 @@ later by a `fix` migration or a flag.
 The four branches were built before 0.17's value semantics; merging them
 onto v0.17.0 settled these (each with a test):
 
-- **Requires checks read in place.** A call's `{ let ?aI = arg; f?pre(..);
-  f(..) }` passes the arguments to `f?pre` without a move (the own pass
-  reads them), `f?pre`'s owned parameters get no drops and borrow what
+- **Requires checks read in place.** A call's `{ let ?aI = arg; f$pre(..);
+  f(..) }` passes the arguments to `f$pre` without a move (the own pass
+  reads them), `f$pre`'s owned parameters get no drops and borrow what
   they bind (moving one is own.move_out), and the own pass sees through
   the block to the call (a borrowed copy, `v.get(i)` or its `.unwrap()`,
   keeps 0.17's meaning). tests/run/contract_values (--check-alloc).
