@@ -3,15 +3,17 @@ use crate::base::diag::error_at;
 use crate::front::ambient::AMBIENT_TRY;
 use crate::front::ast::{
     EFFECTS_DECL, EFFECTS_NO_ALLOC, EFFECTS_NO_IO, EFFECTS_NO_PANIC, EFFECTS_PURE, FN_AMBIENT,
-    FN_COLD, FN_EFFECT_DECL, FN_INLINE, FN_NO_INLINE, NODES, NodeKind, new_node,
+    FN_COLD, FN_EFFECT_DECL, FN_INLINE, FN_NO_INLINE, FN_VIEWS_DECL, NODES, NodeKind, list_begin,
+    list_end, list_push, new_node,
 };
 use crate::front::check::name_error;
 use crate::front::lexer::{STRS, TOKS};
-use crate::front::lexer::Tok::{Hash, LBracket, LParen, RBracket, RParen, Str};
+use crate::front::lexer::Tok::{Comma, Eof, Hash, LBracket, LParen, RBracket, RParen, Star, Str};
 use crate::front::parser::{
     P, advance, at, cur_start, eat, expect, expect_ident, prev_end, syntax_error,
 };
 use crate::front::parser::types::parse_effect_list;
+use crate::middle::lower::ssa::HMap;
 
 // The effect declarations parsed before the function being parsed (0.16):
 // the first EffectSet and the last (chained by b).
@@ -62,6 +64,11 @@ pub fn take_effect_decls(f: i64) {
         if f != 0 && AMBIENT_PENDING >= 0 {
             AMBIENT_TRY.put(NODES[f].start + 1, AMBIENT_PENDING + 1);
         }
+        if f != 0 && VIEWS_PENDING != 0 {
+            VIEWS_OF.put(f + 1, VIEWS_PENDING + 1);
+        }
+        VIEWS_PENDING = 0;
+        VIEWS_PENDING_LAST = 0;
         EFFECT_DECLS = 0;
         EFFECT_DECLS_LAST = 0;
         AMBIENT_PENDING = -1;
@@ -70,7 +77,64 @@ pub fn take_effect_decls(f: i64) {
 
 // Whether effect declarations wait for their function (0.16).
 pub fn has_effect_decls() -> bool {
-    unsafe { EFFECT_DECLS != 0 }
+    unsafe { EFFECT_DECLS != 0 || VIEWS_PENDING != 0 }
+}
+
+// (0.17) `#[views(a, *b)]`, `#[stores(c)]` before a function
+// (docs/design/value-semantics.md §2.4): the view summary it declares.
+// Each is an EffectSet node of form VIEWS_FORM or STORES_FORM whose list is
+// EffectItem nodes, a: the parameter's name, b: 1 for `*p`; chained by b.
+// take_effect_decls gives them to the function (VIEWS_OF).
+pub const VIEWS_FORM: i64 = 7;
+pub const STORES_FORM: i64 = 8;
+static mut VIEWS_PENDING: i64 = 0;
+static mut VIEWS_PENDING_LAST: i64 = 0;
+// Per function node + 1: its first views/stores node + 1.
+pub static mut VIEWS_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+pub fn parse_views_attribute(name: i64, pos: i64) -> bool {
+    unsafe {
+        let form = if name == intern_c(c"views") { VIEWS_FORM }
+            else if name == intern_c(c"stores") { STORES_FORM }
+            else { 0 };
+        if form == 0 {
+            return false;
+        }
+        let n = new_node(NodeKind::EffectSet, pos, 0);
+        NODES[n].c = form;
+        expect(LParen);
+        let mark = list_begin();
+        while !at(RParen) && !at(Eof) {
+            let item = new_node(NodeKind::EffectItem, cur_start(), 0);
+            if eat(Star) {
+                NODES[item].b = 1;
+            }
+            NODES[item].a = expect_ident();
+            NODES[item].end = prev_end();
+            list_push(item);
+            if !eat(Comma) {
+                break;
+            }
+        }
+        list_end(n, mark);
+        expect(RParen);
+        NODES[n].end = prev_end();
+        if VIEWS_PENDING == 0 {
+            VIEWS_PENDING = n;
+        } else {
+            NODES[VIEWS_PENDING_LAST].b = n;
+        }
+        VIEWS_PENDING_LAST = n;
+        true
+    }
+}
+
+// The first views/stores declaration of function node f, 0: none.
+pub fn views_of(f: i64) -> i64 {
+    unsafe {
+        let v = VIEWS_OF.get(f + 1);
+        if v == 0 { 0 } else { v - 1 }
+    }
 }
 
 // `#[inline]`, `#[inline(never)]` or `#[cold]` (0.6) after `#[` and the
@@ -82,6 +146,10 @@ pub fn parse_fn_attribute(name: i64, pos: i64) -> i64 {
     unsafe {
         if parse_effect_attribute(name, pos) {
             return FN_EFFECT_DECL;
+        }
+        // (0.17: a view summary, front/own/summary.tach)
+        if parse_views_attribute(name, pos) {
+            return FN_VIEWS_DECL;
         }
         // (0.16: std's `#[ambient("Vec::new_in(gpa)")]`, front/ambient.tach)
         if name == intern_c(c"ambient") {
@@ -127,7 +195,7 @@ pub fn parse_fn_attributes() -> i64 {
         if flag == 0 {
             unsafe {
                 name_error(pos, c"unknown attribute '", name,
-                    c"' before a function (expected inline, inline(never), cold, effects, pure, no_alloc, no_io or no_panic)");
+                    c"' before a function (expected inline, inline(never), cold, effects, pure, no_alloc, no_io, no_panic, views or stores)");
             }
         }
         flags |= flag;

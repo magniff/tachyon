@@ -1,0 +1,339 @@
+// View summaries (0.17, docs/design/value-semantics.md §2.4): for each
+// function, which parameter roots its result's views come from, level by
+// level, and what its `&mut` parameters' referents may come to hold.
+//
+// A mask has bit i for parameter i (at most 63 parameters are told apart;
+// the rest count as all). The result's masks, ret[k], and the stores'
+// masks, sto[k], are indexed by:
+// - S_L1_P: level 1 of the value comes from parameter p's own level (`p`:
+//   what the argument points into);
+// - S_L1_STAR: level 1 comes from what p's views point into (`*p`);
+// - S_L2_P, S_L2_STAR: the same for level 2.
+// The text form (`views(self)`, `views(*self)`, `stores(word)`) rounds the
+// masks up: a parameter is `p` when either level comes from `p`, `*p` when
+// either comes from `*p`.
+//
+// Phase 0: summary_of gives a declared summary (`#[views]`, `#[stores]`,
+// checked against the parameter names by validate_views_decls), else the
+// parametric floor for a generic result, else `top` (one region: every
+// level from every parameter). T3 infers the rest (summary_store) and
+// checks declarations against bodies (own.views).
+
+use crate::base::{SYMS, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, intern_c};
+use crate::base::diag::report_error_once;
+use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::own::kinds::is_view_type;
+use crate::front::parser::items::attrs::{STORES_FORM, VIEWS_FORM};
+use crate::front::types::{FNS, FN_COUNT, TYPES, TyKind, fn_param};
+
+pub const S_L1_P: i64 = 0;
+pub const S_L1_STAR: i64 = 1;
+pub const S_L2_P: i64 = 2;
+pub const S_L2_STAR: i64 = 3;
+
+pub struct ViewSummary { ret: [i64; 4], sto: [i64; 4], top: bool, declared: bool }
+
+pub fn empty_summary() -> ViewSummary {
+    ViewSummary { ret: [0, 0, 0, 0], sto: [0, 0, 0, 0], top: false, declared: false }
+}
+
+// Every level from every parameter, for the result and the stores: what
+// T2 assumes of a callee until T3 lands.
+pub fn top_summary() -> ViewSummary {
+    ViewSummary { ret: [-1, -1, -1, -1], sto: [-1, -1, -1, -1], top: true, declared: false }
+}
+
+// Inferred summaries (T3): per function, 8 masks and a state (0: none,
+// 1: inferred).
+static mut STORED: *i64 = 0 as *i64;
+static mut STORED_N: i64 = 0;
+
+// Records f's inferred summary (T3's driver).
+pub fn summary_store(f: i64, s: ViewSummary) {
+    unsafe {
+        if STORED_N < FN_COUNT {
+            let n = FN_COUNT + 64;
+            let a = crate::base::alloc_array::<i64>(n * 9);
+            for i in 0..STORED_N * 9 {
+                a[i] = STORED[i];
+            }
+            STORED = a;
+            STORED_N = n;
+        }
+        let o = f * 9;
+        for k in 0..4 {
+            STORED[o + k] = s.ret[k];
+            STORED[o + 4 + k] = s.sto[k];
+        }
+        STORED[o + 8] = 1;
+    }
+}
+
+// The summary callers of f use: its declaration, else what T3 inferred,
+// else the parametric floor of a generic result, else top.
+pub fn summary_of(f: i64) -> ViewSummary {
+    unsafe {
+        if f < 0 || f >= FN_COUNT {
+            return top_summary();
+        }
+        if FNS[f].views_decl != 0 {
+            return declared_summary(f);
+        }
+        if f < STORED_N && STORED[f * 9 + 8] != 0 {
+            let o = f * 9;
+            return ViewSummary {
+                ret: [STORED[o], STORED[o + 1], STORED[o + 2], STORED[o + 3]],
+                sto: [STORED[o + 4], STORED[o + 5], STORED[o + 6], STORED[o + 7]],
+                top: false, declared: false,
+            };
+        }
+        // (a result that holds no views, and no `&mut` parameter to store
+        // into: views() by its type)
+        if !is_view_type(FNS[f].ret) && !has_mut_ref_param(f) {
+            return empty_summary();
+        }
+        let p = ret_parametric(f);
+        if p == 1 {
+            // `T`, `Option<T>`: the T values the arguments hold
+            return ViewSummary { ret: [0, -1, 0, -1], sto: [0, 0, 0, 0], top: false,
+                declared: false };
+        }
+        if p == 2 {
+            // `[T]`: the arguments' storage of T, level by level
+            return ViewSummary { ret: [-1, 0, 0, -1], sto: [0, 0, 0, 0], top: false,
+                declared: false };
+        }
+        top_summary()
+    }
+}
+
+fn has_mut_ref_param(f: i64) -> bool {
+    unsafe {
+        for i in 0..FNS[f].param_count {
+            let t = fn_param(f, i);
+            if t > 0 && TYPES[t].kind == TyKind::Ptr && is_view_type(TYPES[t].a) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// Whether generic function instance f's result type is made of its type
+// parameters only (§2.4, parametric results): 0: not; 1: T values (`T`,
+// `Option<T>`, `(K, V)`); 2: views of T storage (`[T]`, `Option<[V]>`).
+pub fn ret_parametric(f: i64) -> i64 {
+    unsafe {
+        if f < 0 || FNS[f].tmpl == 0 {
+            return 0;
+        }
+        let tn = FNS[FNS[f].tmpl - 1].node;
+        if tn == 0 || NODES[tn].g == 0 || NODES[tn].b == 0 {
+            return 0;
+        }
+        params_only(NODES[tn].b)
+    }
+}
+
+fn params_only(t: i64) -> i64 {
+    unsafe {
+        let k = NODES[t].kind;
+        let mut r = 1;
+        if k == NodeKind::TyName {
+            let args = NODES[t].g;
+            if args == 0 {
+                return 1;
+            }
+            for i in 0..NODES[args].count {
+                let a = params_only(child(args, i));
+                if a == 0 {
+                    return 0;
+                }
+                if a > r {
+                    r = a;
+                }
+            }
+            return r;
+        }
+        if k == NodeKind::TyTuple {
+            for i in 0..NODES[t].count {
+                let a = params_only(child(t, i));
+                if a == 0 {
+                    return 0;
+                }
+                if a > r {
+                    r = a;
+                }
+            }
+            return r;
+        }
+        if k == NodeKind::TySlice || k == NodeKind::TyPtr {
+            if params_only(NODES[t].a) == 0 {
+                return 0;
+            }
+            return 2;
+        }
+        if k == NodeKind::TyUnit || k == NodeKind::TyNever { 1 } else { 0 }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Declarations
+
+// The parameter of f named sym, -1.
+fn param_named(f: i64, sym: i64) -> i64 {
+    unsafe {
+        let item = FNS[f].node;
+        for i in 0..NODES[item].count {
+            if NODES[child(item, i)].a == sym {
+                return i;
+            }
+        }
+        -1
+    }
+}
+
+// f's declared summary: `#[views(a, *b)]` puts a at S_L1_P and S_L2_P,
+// b at S_L1_STAR and S_L2_STAR (the rounded-up shapes); `#[stores(..)]`
+// the same for the stores. Names that are no parameter count for nothing
+// (validate_views_decls reports them).
+pub fn declared_summary(f: i64) -> ViewSummary {
+    unsafe {
+        let mut s = empty_summary();
+        s.declared = true;
+        let mut d = FNS[f].views_decl;
+        while d != 0 {
+            let stores = NODES[d].c == STORES_FORM;
+            for k in 0..NODES[d].count {
+                let item = child(d, k);
+                let i = param_named(f, NODES[item].a);
+                if i < 0 {
+                    continue;
+                }
+                let bit = if i >= 63 { -1 } else { 1 << i };
+                let (a, b) = if NODES[item].b != 0 { (S_L1_STAR, S_L2_STAR) }
+                    else { (S_L1_P, S_L2_P) };
+                if stores {
+                    s.sto[a] |= bit;
+                    s.sto[b] |= bit;
+                } else {
+                    s.ret[a] |= bit;
+                    s.ret[b] |= bit;
+                }
+            }
+            d = NODES[d].b;
+        }
+        s
+    }
+}
+
+// The declaration of #[views]/#[stores] of every function, against its
+// parameter names (check_own, in every mode).
+pub fn validate_views_decls() {
+    unsafe {
+        let views = intern_c(c"views");
+        for f in 0..FN_COUNT {
+            if FNS[f].tmpl != 0 {
+                continue;
+            }
+            let mut d = FNS[f].views_decl;
+            while d != 0 {
+                for k in 0..NODES[d].count {
+                    let item = child(d, k);
+                    if param_named(f, NODES[item].a) < 0 {
+                        let m = buf_new();
+                        buf_fmt(m,
+                            f"'{SYMS[FNS[f].display].text}' has no parameter '{SYMS[NODES[item].a].text}'");
+                        buf_byte(m, 0);
+                        report_error_once(NODES[item].start, views, c"own.views", buf_slice(m).ptr,
+                            c"#[views(...)] and #[stores(...)] name parameters (`self`, `p`) or what their views point into (`*p`)", "");
+                    }
+                }
+                d = NODES[d].b;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Text
+
+fn put_params(out: i64, f: i64, p_mask: i64, star_mask: i64) -> bool {
+    unsafe {
+        let item = FNS[f].node;
+        let mut first = true;
+        for i in 0..NODES[item].count {
+            let bit = if i >= 63 { -1 } else { 1 << i };
+            let name = NODES[child(item, i)].a;
+            if (p_mask & bit) != 0 {
+                if !first {
+                    buf_str(out, c", ");
+                }
+                buf_bytes(out, SYMS[name].text);
+                first = false;
+            }
+            if (star_mask & bit) != 0 {
+                if !first {
+                    buf_str(out, c", ");
+                }
+                buf_str(out, c"*");
+                buf_bytes(out, SYMS[name].text);
+                first = false;
+            }
+        }
+        !first
+    }
+}
+
+// Summary s of function f as text: `views(self)`, `views(*self)`,
+// `views(s, *t) stores(word)`, `views()`; a top summary is `views(...)`
+// with every parameter both ways.
+pub fn summary_text(out: i64, f: i64, s: ViewSummary) {
+    unsafe {
+        buf_str(out, c"views(");
+        put_params(out, f, s.ret[S_L1_P] | s.ret[S_L2_P], s.ret[S_L1_STAR] | s.ret[S_L2_STAR]);
+        buf_str(out, c")");
+        let p = s.sto[S_L1_P] | s.sto[S_L2_P];
+        let star = s.sto[S_L1_STAR] | s.sto[S_L2_STAR];
+        if (p | star) != 0 && has_mut_ref_param(f) {
+            buf_str(out, c" stores(");
+            put_params(out, f, p, star);
+            buf_str(out, c")");
+        }
+        if s.declared {
+            buf_str(out, c" declared");
+        } else if s.top {
+            buf_str(out, c" assumed");
+        }
+    }
+}
+
+// The declaration of f parsed into a summary (Phase 0's name in the
+// design: parse_views_attr).
+pub fn parse_views_attr(f: i64) -> ViewSummary {
+    declared_summary(f)
+}
+
+// ---------------------------------------------------------------------------
+// Collection (T3): the walk's results and `&mut` parameters' slots at the
+// exits make the summary walk_fn returns.
+
+static mut COL_F: i64 = -1;
+static mut COL_ROUND: i64 = 0;
+
+// The walk of f (round `round` of its SCC) begins.
+pub fn collect_begin(f: i64, round: i64) {
+    unsafe {
+        COL_F = f;
+        COL_ROUND = round;
+    }
+}
+
+// The function's result at node e, its origin v (-1: none).
+pub fn collect_result(e: i64, v: i64) {}
+
+// The walk of f ended: its summary. Phase 0: summary_of(f) (declared,
+// the parametric floor, or top); T3 builds it from what it collected.
+pub fn collect_end(f: i64) -> ViewSummary {
+    summary_of(f)
+}
