@@ -7,8 +7,11 @@
 // whose bit 63 says it is filled.
 
 use crate::arch::{ARCH_AARCH64, ARCH_USED, ARCH_X86_64, target_arch};
-use crate::base::{STDERR, buf_new, buf_str, buf_write_fd, die2, exit, streq};
-use crate::base::target::{ELF, X86};
+use crate::base::{
+    IntVec, STDERR, buf_bytes, buf_new, buf_slice, buf_str, buf_write_fd, die2, exit, fclose, fopen,
+    read_file, streq,
+};
+use crate::base::target::{ELF, T_X86_64_LINUX, T_X86_64_MACOS, X86};
 
 // AArch64 (the low 16 bits) ...
 pub const FT_NEON: i64 = 0;
@@ -288,6 +291,27 @@ pub fn arch_option(value: *u8) -> bool {
     }
 }
 
+// Whether the command line gave -C options (the tools' cache, which keys
+// on the target only, is then not used).
+pub fn arch_options_given() -> bool {
+    unsafe { CPU_OPTION != 0 as *u8 || FEATURE_OPTION_COUNT > 0 }
+}
+
+// The -C options given, pushed on args as the command line had them (`-C`,
+// `target-cpu=...`): what the tools forward to the commands they run.
+pub fn push_arch_args(args: &mut IntVec) {
+    unsafe {
+        if CPU_OPTION != 0 as *u8 {
+            (*args).push(c"-C" as i64);
+            (*args).push(&CPU_OPTION[-11] as i64);
+        }
+        for k in 0..FEATURE_OPTION_COUNT {
+            (*args).push(c"-C" as i64);
+            (*args).push(&FEATURE_OPTIONS[k][-15] as i64);
+        }
+    }
+}
+
 fn prefix_is(s: *u8, p: *u8) -> bool {
     unsafe {
         let mut i = 0;
@@ -332,13 +356,108 @@ pub fn build_features() -> i64 {
                 option_error(c"arch.cpu", c"unknown CPU for this target (expected generic, apple-m1..apple-m4, neoverse-n1, neoverse-v1, neoverse-n2, cortex-a72, cortex-a76 on aarch64; x86-64, x86-64-v2..v4, core2, haswell, skylake, znver2..znver4 on x86_64)", CPU_OPTION);
             }
         }
-        // (native: the compiling machine's, when it is the target's
-        // architecture; T2 reads it, the baseline until then)
+        if CPU_OPTION != 0 as *u8 && streq(CPU_OPTION, c"native") {
+            s = native_features();
+        }
         for k in 0..FEATURE_OPTION_COUNT {
             s = apply_feature_option(s, FEATURE_OPTIONS[k]);
         }
         BUILD_FEATURES = s;
         s
+    }
+}
+
+// `-C target-cpu=native`: the features of the machine compiling, read from
+// /proc/cpuinfo on Linux and sysctl on macOS (not std::arch: compiler/src
+// uses 0.19's features from 0.20), with the target's baseline under them.
+// An error (arch.cpu) when the target is another architecture.
+fn native_features() -> i64 {
+    unsafe {
+        let host_x86 = host_is_x86();
+        if host_x86 != X86 {
+            option_error(c"arch.cpu", c"-C target-cpu=native reads this machine, whose architecture is not the target's; name a CPU instead",
+                if host_x86 { c"x86_64" } else { c"aarch64" });
+        }
+        let text = buf_new();
+        if ELF {
+            let f = fopen(c"/proc/cpuinfo", c"rb");
+            if f != 0 as *u8 {
+                fclose(f);
+                read_file(c"/proc/cpuinfo", text);
+            }
+        } else {
+            let out = crate::front::cpp::cc::run_command(c"sysctl hw.optional machdep.cpu.features machdep.cpu.leaf7_features machdep.cpu.extfeatures 2>/dev/null");
+            buf_bytes(text, buf_slice(out));
+        }
+        let t = buf_slice(text);
+        let mut s = target_baseline();
+        if X86 {
+            let names: [*u8; 16] = [c" sse ", c" sse2 ", c" pni ", c" ssse3 ", c" sse4_1 ",
+                c" sse4_2 ", c" popcnt ", c" abm ", c" bmi1 ", c" bmi2 ", c" pclmulqdq ", c" aes ",
+                c" sha_ni ", c" avx ", c" avx2 ", c" fma "];
+            let mac: [*u8; 16] = [c" SSE ", c" SSE2 ", c" SSE3 ", c" SSSE3 ", c" SSE4.1 ",
+                c" SSE4.2 ", c" POPCNT ", c" LZCNT ", c" BMI1 ", c" BMI2 ", c" PCLMULQDQ ",
+                c" AES ", c" SHA ", c" AVX1.0 ", c" AVX2 ", c" FMA "];
+            let bits: [i64; 16] = [FT_SSE, FT_SSE2, FT_SSE3, FT_SSSE3, FT_SSE41, FT_SSE42,
+                FT_POPCNT, FT_LZCNT, FT_BMI1, FT_BMI2, FT_PCLMULQDQ, FT_X86_AES, FT_SHA, FT_AVX,
+                FT_AVX2, FT_FMA];
+            for k in 0..16 {
+                if word_in(t, if ELF { names[k] } else { mac[k] }) {
+                    s |= bit(bits[k]);
+                }
+            }
+        } else {
+            let names: [*u8; 10] = [c" crc32", c" aes", c" sha2", c" sha3", c" asimddp",
+                c" asimdrdm", c" atomics", c" fphp", c" i8mm", c" bf16"];
+            let mac: [*u8; 10] = [c"FEAT_CRC32: 1", c"FEAT_AES: 1", c"FEAT_SHA256: 1",
+                c"FEAT_SHA3: 1", c"FEAT_DotProd: 1", c"FEAT_RDM: 1", c"FEAT_LSE: 1",
+                c"FEAT_FP16: 1", c"FEAT_I8MM: 1", c"FEAT_BF16: 1"];
+            let bits: [i64; 10] = [FT_CRC, FT_A64_AES, FT_SHA2, FT_SHA3, FT_DOTPROD, FT_RDM, FT_LSE,
+                FT_FP16, FT_I8MM, FT_BF16];
+            for k in 0..10 {
+                if word_in(t, if ELF { names[k] } else { mac[k] }) {
+                    s |= bit(bits[k]);
+                }
+            }
+        }
+        implied(s)
+    }
+}
+
+// Whether `w` is in text; a word of /proc/cpuinfo's or sysctl's list (a
+// leading space in w, and a trailing one matching a line's end too).
+fn word_in(text: [u8], w: *u8) -> bool {
+    unsafe {
+        let mut n = 0;
+        while w[n] != 0 {
+            n += 1;
+        }
+        let trailing = w[n - 1] == ' ';
+        let mut i = 0;
+        while i + n <= text.len as i64 + if trailing { 1 } else { 0 } {
+            let mut k = 0;
+            while k < n {
+                let c = if i + k < text.len as i64 { text[i + k] } else { '\n' };
+                let want = w[k];
+                if !(c == want || want == ' ' && (c == '\n' || c == '\t' || c == ':')) {
+                    break;
+                }
+                k += 1;
+            }
+            if k == n {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+}
+
+// Whether this machine is an x86-64 (uname's machine field).
+fn host_is_x86() -> bool {
+    unsafe {
+        let t = crate::host_target();
+        t == T_X86_64_LINUX || t == T_X86_64_MACOS
     }
 }
 
@@ -373,7 +492,13 @@ fn apply_feature_option(set: i64, list: *u8) -> i64 {
                     option_error(c"arch.baseline",
                         c"-C target-feature cannot remove a feature the target's ABI needs", list);
                 }
-                s &= ~bit(b);
+                // (and what needs it: -sse4.1 takes sse4.2, avx, avx2 and
+                // fma with it)
+                for c in 0..FT_X86_64 + 1 {
+                    if has_bit(s, c) && has_bit(implied(bit(c)), b) {
+                        s &= ~bit(c);
+                    }
+                }
             }
             i = if list[end] == ',' { end + 1 } else { end };
         }

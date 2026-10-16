@@ -13,14 +13,30 @@
 // of has/detect branches), infer.tach (fn_needs over the SCCs), check.tach
 // (declarations, entries, arch.fn_pointer, multiversion clones), why.tach.
 
-use crate::arch::ARCH_USED;
-use crate::arch::features::{build_features, feature_name, feature_value, implied, parse_feature};
-use crate::base::{IntVec, buf_bytes, buf_new, buf_slice, buf_str};
+pub mod regions;
+pub mod infer;
+pub mod check;
+
+use crate::arch::{ARCH_AARCH64, ARCH_USED, ARCH_X86_64, target_arch};
+use crate::arch::features::{
+    build_features, feature_ambiguous, feature_bit_in, feature_name, feature_value, implied,
+    parse_feature,
+};
+use crate::base::{IntVec, alloc_array, buf_bytes, buf_new, buf_slice, buf_str};
 use crate::base::diag::{
     ERR_KIND, edit_distance, err_begin, err_end_soft, err_fix, err_fmt, err_help_fmt,
 };
-use crate::front::ast::NODES;
-use crate::front::lexer::str_at;
+use crate::front::ast::{NODES, NodeKind};
+use crate::front::effects::infer::body_walked;
+use crate::front::features::check::{check_requirements, declaration_of};
+use crate::front::features::infer::{
+    CALL_FIRST, DECLARED, DECLARED_MARK, NEEDS, NEEDS_COUNT, infer_needs, intrinsic_needs,
+};
+use crate::front::features::regions::{
+    CALLS, CALL_WIDTH, regions_reset, walk_function, walked_known,
+};
+use crate::front::lexer::{Tok, str_at};
+use crate::front::types::FN_COUNT;
 use crate::middle::lower::ssa::HMap;
 
 // The has()/detect() calls (the checker notes them, front/check/arch.tach):
@@ -88,22 +104,62 @@ pub fn feature_call_value(n: i64) -> i64 {
     }
 }
 
-// The features known at node n. Phase 0: the build's (T2: with the
-// enclosing function's declared ones and the guards n is under).
+// The features known at has()/detect() call n: the build's, the enclosing
+// function's declared ones and the guards n is under (regions.tach; the
+// build's when the pass did not reach n).
 pub fn known_at(n: i64) -> i64 {
     if n < 0 {
         return 0;
     }
-    build_features()
+    let k = walked_known(n);
+    if k >= 0 { k } else { build_features() }
 }
 
-// The features function f needs beyond what its callers know. Phase 0:
-// none (T2 infers them).
-pub fn fn_needs(f: i64) -> i64 {
-    if f < 0 {
-        return 0;
+// Whether `if c` has a constant condition made of has()/detect() calls
+// (`!`, `&&` and `||` of them): 1 or 0, its value (the other branch is
+// statically dead: lowering and gen0 generate only the live one); -1 when
+// it is not such a constant.
+pub fn static_condition(c: i64) -> i64 {
+    unsafe {
+        if !ARCH_USED || c == 0 {
+            return -1;
+        }
+        let kind = NODES[c].kind;
+        if kind == NodeKind::Call {
+            if feature_call_bit(c) < 0 {
+                return -1;
+            }
+            return feature_call_value(c);
+        }
+        if kind == NodeKind::Unary && NODES[c].op == Tok::Bang {
+            let v = static_condition(NODES[c].b);
+            return if v < 0 { -1 } else { 1 - v };
+        }
+        if kind == NodeKind::Binary
+            && (NODES[c].op == Tok::AmpAmp || NODES[c].op == Tok::PipePipe) {
+            let and = NODES[c].op == Tok::AmpAmp;
+            let l = static_condition(NODES[c].b);
+            if l == if and { 0 } else { 1 } {
+                return l;
+            }
+            if l < 0 {
+                return -1;
+            }
+            return static_condition(NODES[c].c);
+        }
+        -1
     }
-    0
+}
+
+// The features function f needs beyond the build's (inferred over the
+// calls, infer.tach; a declaration's set for a #[target_feature] function).
+pub fn fn_needs(f: i64) -> i64 {
+    unsafe {
+        if f < 0 || f >= NEEDS_COUNT {
+            return 0;
+        }
+        NEEDS[f]
+    }
 }
 
 // The features Fn node `node` declares with #[target_feature] (implied
@@ -154,7 +210,9 @@ fn trim(s: [u8]) -> [u8] {
 
 // ---- The pass ----
 
-// After the effects (check_program). Phase 0: the attributes' names.
+// After the effects (check_program): the attributes' names, then the walk
+// of every checked body (regions.tach), the requirements (infer.tach) and
+// their errors (check.tach).
 pub fn check_features() {
     unsafe {
         if !ARCH_USED {
@@ -165,7 +223,62 @@ pub fn check_features() {
             check_feature_string(str_at(FEATURE_ATTRS.data[i + 2]), FEATURE_ATTRS.data[i + 3]);
             i += FA_WIDTH;
         }
+        let n = FN_COUNT;
+        let build = build_features();
+        NEEDS = alloc_array::<i64>(n + 1);
+        DECLARED = alloc_array::<i64>(n + 1);
+        CALL_FIRST = alloc_array::<i64>(n + 2);
+        regions_reset();
+        for f in 0..n {
+            CALL_FIRST[f] = CALLS.count / CALL_WIDTH;
+            let own = intrinsic_needs(f, build);
+            if own >= 0 {
+                NEEDS[f] = own;
+                continue;
+            }
+            let attr = declaration_of(f);
+            let mut known = build;
+            let mut alt = 0;
+            if attr >= 0 {
+                let text = str_at(FEATURE_ATTRS.data[attr + 2]);
+                let declared = implied(features_of_string(text));
+                DECLARED[f] = declared | DECLARED_MARK;
+                NEEDS[f] = declared & ~build;
+                known = implied(build | declared);
+                alt = ambiguous_of_string(text);
+            }
+            if body_walked(f) {
+                walk_function(f, known, alt, if alt != 0 { -1 - attr } else { 0 });
+            }
+        }
+        CALL_FIRST[n] = CALLS.count / CALL_WIDTH;
+        NEEDS_COUNT = n;
+        infer_needs(n);
+        check_requirements(n);
     }
+}
+
+// The other architecture's reading of the unqualified names of both
+// architectures (`aes`) in a comma-separated list.
+fn ambiguous_of_string(text: [u8]) -> i64 {
+    let mut s = 0;
+    let mut i = 0;
+    let other = if target_arch() == ARCH_X86_64 { ARCH_AARCH64 } else { ARCH_X86_64 };
+    while i < text.len as i64 {
+        let mut j = i;
+        while j < text.len as i64 && text[j] != ',' {
+            j += 1;
+        }
+        let name = trim(text[i..j]);
+        if feature_ambiguous(name) {
+            let b = feature_bit_in(name, other);
+            if b >= 0 {
+                s |= 1 << b as u64;
+            }
+        }
+        i = j + 1;
+    }
+    s
 }
 
 // ---- The diagnostics ----
