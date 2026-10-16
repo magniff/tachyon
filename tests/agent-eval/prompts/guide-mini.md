@@ -38,10 +38,10 @@ allocator: pass `gpa` down from main as a parameter.
 
 As in Rust: `[u8]` and tuples compare and sort (`==`, `<`, `v.sort()`);
 `let (a, b) = f();`; `for b in s` yields bytes; `v[i] = x` through
-`&mut Vec`; `&&` short-circuits; `/` truncates; `if` is an expression;
-match guards; `{v[i]}` in f-strings; `for (k, x) in m.iter()`; `x?`,
-closures, traits, `#[derive(Debug, Eq, Ord)]`. Unlike Rust: no `let
-... else`; match a `&E` as `match *e`; `&f()` needs a `let`;
+`&mut Vec`; `&&` short-circuits; `if` is an expression; match guards;
+`match e` on a `&E` binds references (`E::A(x) => *x`); `let ...
+else`; `&f()`; `{v[i]}` in f-strings; `for (k, x) in m.iter()`; `x?`,
+closures, traits, `#[derive(Debug, Eq, Ord)]`. Unlike Rust:
 `sort_by(|a, b| *a - *b)` returns an `i64`; `usize` is `i64`; integers
 wrap; `as` narrows; no `dyn`, `Box`, `where`.
 

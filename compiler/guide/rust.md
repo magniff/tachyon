@@ -215,7 +215,7 @@ fn main() -> i32 {
 | `fn f(&self)`, `&mut self`, `self` | `fn f(self: &T)`, `fn f(self: &mut T)`, `fn f(self: T)`; `Self` works (`self: *T`, before 0.17: as `&mut T`) |
 | `'a: loop { break 'a; }` | `a: loop { break :a; }` |
 | `let x;` then assign | `let x = ...;` always |
-| `let Some(x) = o else { .. };` | `let x = match o { Some(x) => x, None => return 1 };` |
+| `let Some(x) = o else { .. };` | the same (0.18.1); the block must leave (`return`, `break`, `continue`, `panic`) |
 | `P { x, y }` shorthand, `..base` | the shorthand (0.15); no `..base` |
 | `where T: Ord` | `<T: Ord>` |
 | `pub(crate)`, `pub(super)` | `pub`, or nothing (private to the module and its children) |

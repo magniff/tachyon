@@ -86,7 +86,8 @@ Also: `usize` is `i64` (lengths, indices); integers wrap; `a as i32`
 narrows, widening is implicit; `x?`, closures, `impl Trait for T`, `T:
 Trait`, `#[derive(Eq, Debug)]` are Rust's; no `dyn`, `where`, `Box` (a
 `Vec` or `*T`); `&x` and `&mut x` are references (`&T`, `&mut T`,
-0.17), and `p.0`, `p.x` reach through a reference or a pointer. Arguments may have defaults and names: `fn f(a: i64, b: i64 =
+0.17), and `p.0`, `p.x` reach through a reference or a pointer; `match e` on
+`e: &E` binds references into it (`E::A(n) => *n`), as Rust does. Arguments may have defaults and names: `fn f(a: i64, b: i64 =
 2)`, `f(1, b: 3)`. The prelude (no `use`) has `Option`, `Result`, `Vec`,
 `Buf`, `HashMap`, `BinaryHeap` and `MinHeap` (priority queues: `pop` the largest, the smallest), `print`, `println`, `format_in`, `Gpa`, `read_line`,
 `read_stdin_in`, `Scanner`, `parse_int`, `trim`, `split_in`,
@@ -141,7 +142,8 @@ value (`Vec`, `Buf`, `HashMap`, a struct holding one) moves: after `let
 w = v;` or `f(v)`, `v` is dead (`own.moved`); take `v: &Vec<T>` (`&mut`
 to change it) and pass `&v` (`&mut v`), or `.clone()`. A reference kept
 in a local (`let p = &mut st;`) is passed on as `p`, any number of
-times. A slice of `v` is a view: take it again after `v` grows. std's most used items: `tachyonc guide std`; all, a line each:
+times. `&f(x)` makes a temporary that lives to the end of the block
+(0.18.1). A slice of `v` is a view: take it again after `v` grows. std's most used items: `tachyonc guide std`; all, a line each:
 `tachyonc guide std#the-api`; one name
 with its comment: `tachyonc guide --find split_in`.
 

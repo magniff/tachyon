@@ -184,6 +184,17 @@ or-pattern binds the same variables, with the same types. The patterns of
 `let` and `for` must match every value (no literals, ranges, alternatives,
 or variants of enums with several).
 
+Patterns on references (0.18.1, Rust's default binding modes): a pattern
+other than a binding or `_`, matched against a value of type `&T` or
+`&mut T` (T not itself a reference), matches the T the reference points
+to, and the bindings inside it are references into that T: `&U` for a
+field of type U, `&mut U` when every reference matched through is `&mut`.
+A field of slice type `[U]` binds a copy (a slice is a view already). A
+binding under a reference cannot be `mut`, nor an alternative of an
+or-pattern. `match e { E::A(n) => *n, E::B(v) => v.len(), E::C => 0 }`
+with `e: &E`; `match *e` matches a copy of the value (its owned fields
+bound so may be read, not changed or moved). There is no `&pat` pattern.
+
 ## Statements and blocks
 
 ```ebnf
@@ -1653,6 +1664,33 @@ attribute += "test" | "property" | "fuzz" | "cfg" "(" "test" ")" ;
 - Phase 0 checks a distinct type as a transparent alias (T4 makes it a
   type of its own) and ignores the invariants and clauses (T1 checks
   them).
+
+## Additions of 0.18.1
+
+```ebnf
+let_stmt += "let" pattern "=" expr "else" block ";" ;     (* let-else *)
+```
+
+- **let-else.** `let PAT = e else { ... };` binds PAT's variables for the
+  rest of the block when e matches; else the block runs and must not end
+  normally (`return`, `break`, `continue`, a call that never returns). It
+  is `let (a, b) = match e { PAT => (a, b), _ => { ... } };`, so a
+  binding is a name that starts with a lower-case letter or `_` (others
+  name constants and variants). The pattern takes no type.
+- **Patterns on references** (Rust's default binding modes): see
+  [Patterns](#patterns).
+- **Temporaries.** `&e` of a value (a call's result, a literal, an
+  operator's) takes a temporary: a local named by e's text, declared
+  before the statement and dropped at the end of the block (Rust's
+  lifetime extension for `let r = &f(x);`). It is made where nothing
+  evaluated before it in the statement (a call, an assignment, an index,
+  the other side of `&&`/`||`, a closure, a loop's condition) could tell
+  the difference; a literal of literals anywhere. Elsewhere `&e` is
+  `cannot take address of non-lvalue expression`, whose `try:` names the
+  value first. `&e` of a slice value is still the slice; where `&[T]` is
+  expected, the temporary's reference (`cmp_of(&a.text(), &b.text())`).
+- **An index** may be a reference to an integer (`keys[a]` with `a:
+  &i64`, a `sort_by` closure's parameter): it is read through.
 
 ## Importing C headers
 

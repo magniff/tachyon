@@ -39,6 +39,7 @@ pub mod args;
 mod sealed;
 pub mod variant_fields;
 pub mod distinct;
+mod temps;
 
 use crate::base::{
     BUFS, IntVec, SRC, _setjmp, buf_bytes, buf_fmt, buf_new, buf_slice, cstr, grow, intern_c,
@@ -66,7 +67,9 @@ use crate::front::check::resolve::{
 use crate::front::check::unsafety::{UNSAFE_DEPTH, WRAP_NODE, check_wrapped};
 use crate::front::consteval::const_value_of;
 use crate::front::generics::{CUR_INST, INST_QUEUE, TP_BASE, TP_NAMES, TP_TYPES};
-use crate::front::generics::instantiate::{UNIFY_SELF, UNIFY_SELF_TY, fn_instance};
+use crate::front::generics::instantiate::{
+    UNIFY_SELF, UNIFY_SELF_TY, fn_instance, node_field_a, node_field_b, node_field_c,
+};
 use crate::front::modules::{CUR_MOD, STD_MODULE, init_modules, module_of};
 use crate::front::modules::lookup::{collect_uses, resolve_all_uses, resolve_use_of};
 use crate::front::patterns::OR_MODE;
@@ -183,6 +186,50 @@ fn mismatch_help(n: i64, expected: i64, actual: i64) {
         // `tachyonc fix --suggested` makes; `&x` of a simple value only).
         let t = buf_new();
         let mut exact = true;
+        let bn = crate::front::check::distinct::BINARY_NODE;
+        if ek == TyKind::Ptr && TYPES[expected].b != 0 && TYPES[expected].a == actual
+            && (is_numeric(actual) || actual == TY_BOOL) && bn > 0
+            && NODES[bn].kind == NodeKind::Binary && (NODES[bn].b == n || NODES[bn].c == n) {
+            // (0.18.1) `n + 1` with `n: &i64` (a pattern's binding on a
+            // reference, a closure's parameter): the other operand is the
+            // reference, read through it
+            let other = if NODES[bn].b == n { NODES[bn].c } else { NODES[bn].b };
+            let ok = NODES[other].kind;
+            let plain = ok == NodeKind::Ident || ok == NodeKind::FieldAccess
+                || ok == NodeKind::TupleField || ok == NodeKind::Call || ok == NodeKind::Index;
+            err_help(c"the other operand is a reference: read through it with '*'");
+            buf_bytes(t, SRC[NODES[bn].start..NODES[other].start]);
+            buf_bytes(t, if plain { "*" } else { "*(" });
+            buf_bytes(t, SRC[NODES[other].start..NODES[other].end]);
+            buf_bytes(t, if plain { "" } else { ")" });
+            buf_bytes(t, SRC[NODES[other].end..NODES[bn].end]);
+            err_try_fmt(buf_slice(t));
+            err_fix(NODES[bn].start, NODES[bn].end, buf_slice(t));
+            return;
+        }
+        if ak == TyKind::Ptr && TYPES[actual].b != 0 && TYPES[actual].a == expected
+            && (is_numeric(expected) || expected == TY_BOOL)
+            && !(NODES[n].kind == NodeKind::Unary && NODES[n].op == Tok::Amp) {
+            // (0.18.1) `n` with `n: &i64` where an i64 is wanted (not
+            // `&k` itself: the value was meant, below)
+            err_help(c"it is a reference: read through it with '*'");
+            buf_fmt(t, f"*{open}{text}{close}");
+            err_try_fmt(buf_slice(t));
+            err_fix(NODES[n].start, NODES[n].end, buf_slice(t));
+            return;
+        }
+        let p = if is_numeric(expected) && is_numeric(actual) { cast_parent(WRAP_NODE, n) }
+            else { 0 };
+        if p != 0 {
+            // (0.18.1) `cr - 1 as i32`: the whole operation, converted
+            let c = NODES[p].c;
+            let ae = NODES[NODES[c].a].end;
+            err_help(c"'as' binds tighter than the operator ('a - (1 as T)'): convert the whole operation");
+            buf_fmt(t, f"({SRC[NODES[p].start..ae]}){SRC[ae..NODES[c].end]}");
+            err_try_fmt(buf_slice(t));
+            err_fix(NODES[p].start, NODES[c].end, buf_slice(t));
+            return;
+        }
         if is_numeric(expected) && is_numeric(actual) {
             err_help(c"only widening is implicit: convert explicitly");
             buf_fmt(t, f"{open}{text}{close} as ");
@@ -200,6 +247,16 @@ fn mismatch_help(n: i64, expected: i64, actual: i64) {
         } else if ek == TyKind::Slice && is_std_named(actual, c"Vec") {
             err_help(c"a Vec's elements are its slice");
             buf_fmt(t, f"{open}{text}{close}.as_slice()");
+        } else if ek == TyKind::Ptr && (k == NodeKind::PatVariant || k == NodeKind::PatTuple
+            || k == NodeKind::PatLit || k == NodeKind::PatRange || k == NodeKind::PatOr) {
+            // (0.18.1: a pattern on `&T` matches the T; a pattern is no
+            // place for `&`)
+            err_help(c"a pattern matches what one reference points to ('match e' on 'e: &E'); a raw pointer's value is 'match *p', in unsafe code");
+        } else if ek == TyKind::Ptr && TYPES[expected].a == actual && ak == TyKind::Slice
+            && NODES[n].start > 0 && SRC[NODES[n].start - 1] == '&' {
+            // (0.18.1: `&x.text()` here was the slice itself)
+            err_help(c"'&' of a slice value is the slice; for a '&[T]', name it first: 'let t = VALUE;' before the statement, then '&t'");
+            exact = false;
         } else if ek == TyKind::Ptr && TYPES[expected].a == actual {
             if TYPES[expected].b == REF_MUT {
                 // (0.17)
@@ -247,6 +304,53 @@ fn is_std_allocator(t: i64) -> bool {
     unsafe {
         is_std_named(t, c"Gpa") || is_std_named(t, c"Arena") || is_std_named(t, c"ScopedArena")
             || is_std_named(t, c"FixedBuf")
+    }
+}
+
+// (0.18.1) The binary operation in `root` whose left operand is n and
+// whose right one is a cast ending it, `cr - 1 as i32` (`as` binds
+// tighter: `cr - (1 as i32)`); 0 when there is none.
+fn cast_parent(root: i64, n: i64) -> i64 {
+    unsafe {
+        if root <= 0 {
+            return 0;
+        }
+        let k = NODES[root].kind;
+        if k == NodeKind::Binary && NODES[root].b == n {
+            let c = NODES[root].c;
+            let op = NODES[root].op;
+            if c > 0 && NODES[c].kind == NodeKind::Cast && NODES[c].end == NODES[root].end
+                && (op == Tok::Plus || op == Tok::Minus || op == Tok::Star || op == Tok::Slash
+                    || op == Tok::Percent || op == Tok::Amp || op == Tok::Pipe || op == Tok::Caret
+                    || op == Tok::Shl || op == Tok::Shr) {
+                return root;
+            }
+        }
+        if node_field_a(k) {
+            let r = cast_parent(NODES[root].a, n);
+            if r != 0 {
+                return r;
+            }
+        }
+        if node_field_b(k) {
+            let r = cast_parent(NODES[root].b, n);
+            if r != 0 {
+                return r;
+            }
+        }
+        if node_field_c(k) {
+            let r = cast_parent(NODES[root].c, n);
+            if r != 0 {
+                return r;
+            }
+        }
+        for i in 0..NODES[root].count {
+            let r = cast_parent(child(root, i), n);
+            if r != 0 {
+                return r;
+            }
+        }
+        0
     }
 }
 

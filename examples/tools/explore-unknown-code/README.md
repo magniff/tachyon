@@ -18,8 +18,16 @@ its output is checked against this file.
 
 ```console
 $ tachyonc main.tach -o transit && ./transit
-graph.tach:48:23: error[own.move_out] cannot move 'out' (Vec<Edge>) out of 'out': it is a copy of an element 'g.edges.get(from)' (46:19) reads, which the collection keeps | help: copy it ('.clone()'), or match (or loop over) a value the code owns | try: tachyonc edit patch graph.tach:48 --old 'g.edges.set(from, out);' --new 'g.edges.set(from, out.clone());'
-[exit 1]
+Airport -> Museum: 21 min
+  line A  Airport    -> Museum      16 min
+Airport -> Market: 25 min
+  line A  Airport    -> Central     12 min
+  line B  Central    -> Market       3 min
+Beach -> Stadium: 41 min
+  line C  Beach      -> Harbor      11 min
+  line B  Harbor     -> Stadium     20 min
+Airport -> Moon: no such station
+ok: built transit
 ```
 
 Every total is 5 minutes more than the legs add up to (10 when the trip
@@ -39,8 +47,6 @@ crate::graph	graph.tach	11
 crate::heap	heap.tach	7
 crate::network	network.tach	2
 crate::route	route.tach	7
-warning query.program-errors: 1 error in the program; results may be incomplete
-try: tachyonc --diagnostics=short main.tach -c -o /dev/null
 $ tachyonc query items route
 # crate::route	route.tach
 8	const	pub const TRANSFER_MINUTES: i64 = 5
@@ -50,8 +56,6 @@ $ tachyonc query items route
 30	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64
 34	fn	pub fn quickest(g: &Graph, from: i64, to: i64, gpa: Gpa) -> Option<Route>
 68	fn	fn legs_to(how: &Vec<Step>, from: i64, to: i64, gpa: Gpa) -> Vec<Leg>
-warning query.program-errors: 1 error in the program; results may be incomplete
-try: tachyonc --diagnostics=short main.tach -c -o /dev/null
 ```
 
 ## 2. The function that computes the total
@@ -103,7 +107,7 @@ crate::heap::new_heap	heap.tach:14:8	fn	pub fn new_heap(gpa: Gpa) -> MinHeap
 crate::heap::free_heap	heap.tach:63:8	fn	pub fn free_heap(h: &mut MinHeap)
 crate::heap::is_empty	heap.tach:18:8	fn	pub fn is_empty(h: &MinHeap) -> bool
 crate::heap::pop	heap.tach:35:8	fn	pub fn pop(h: &mut MinHeap) -> Option<Entry>
-crate::graph::edges_from	graph.tach:57:8	fn	pub fn edges_from(g: &Graph, i: i64) -> [Edge]
+crate::graph::edges_from	graph.tach:55:8	fn	pub fn edges_from(g: &Graph, i: i64) -> [Edge]
 std::Vec::filled_in	<std>:3900:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
 crate::heap::push	heap.tach:22:8	fn	pub fn push(h: &mut MinHeap, e: Entry)
 std::Option::unwrap	<std>:82:12	method	pub fn unwrap(self: Option<T>) -> T requires self.is_some() else "called unwrap on None"
@@ -111,8 +115,6 @@ std::Vec::set	<std>:264:12	method	pub fn set(self: &mut Vec<T, A>, i: i64, x: T)
 note query.budget: over the budget of 600 tokens, left out: calls 2, types or uses 9, callers 1
 try: tachyonc query callers quickest
 try: tachyonc query context quickest --budget 1800
-warning query.program-errors: 1 error in the program; results may be incomplete
-try: tachyonc --diagnostics=short main.tach -c -o /dev/null
 ```
 
 The total is `best.get(to)`, the sum of `ride_cost(...)` along the way.
@@ -129,8 +131,6 @@ fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64 {
 crate::route::TRANSFER_MINUTES	route.tach:8:11	const	pub const TRANSFER_MINUTES: i64 = 5
 // callers (1)
 route::quickest	route.tach:52:35	let cost = cur.cost + ride_cost(cur.line, e.minutes, e.line);
-warning query.program-errors: 1 error in the program; results may be incomplete
-try: tachyonc --diagnostics=short main.tach -c -o /dev/null
 ```
 
 `ride_cost` adds a transfer whenever the ride's line differs from the
@@ -148,8 +148,6 @@ $ tachyonc query refs Entry.line --kind init
 # route.tach
 42:47	init	route::quickest	push(&mut h, Entry { cost: 0, node: from, line: 0 });
 56:62	init	route::quickest	push(&mut h, Entry { cost: cost, node: e.to, line: e.line });
-warning query.program-errors: 1 error in the program; results may be incomplete
-try: tachyonc --diagnostics=short main.tach -c -o /dev/null
 ```
 
 The first state is `Entry { ..., line: 0 }`. A search of the comments
@@ -162,8 +160,6 @@ $ tachyonc query grep start --comments
 6:48	comment	heap::Entry.line	// the line the state arrived on; 0 at the start
 # route.tach
 29:46	comment	route::ride_cost	// What a ride on `e` costs, arriving at its start on `here_line`.
-warning query.program-errors: 1 error in the program; results may be incomplete
-try: tachyonc --diagnostics=short main.tach -c -o /dev/null
 ```
 
 And `query type` gives the type of the expression at a position (here
@@ -172,12 +168,8 @@ And `query type` gives the type of the expression at a position (here
 ```console
 $ tachyonc query type route.tach:46:13
 !	continue
-warning query.program-errors: 1 error in the program; results may be incomplete
-try: tachyonc --diagnostics=short main.tach -c -o /dev/null
 $ tachyonc query type route.tach:54:58
 ()	{ best.set(e.to, cost); how.set(e.to, Step { from: cur.node, line: e.line, minutes: e.minutes }); p…
-warning query.program-errors: 1 error in the program; results may be incomplete
-try: tachyonc --diagnostics=short main.tach -c -o /dev/null
 ```
 
 So at the start `cur.line` is 0, which is no line, and `ride_cost`
@@ -224,8 +216,6 @@ $ tachyonc query impact ride_cost
 crate::route::ride_cost	route.tach:30:4	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64	effects: none
 route.tach	1	0	route::quickest
 total	1	0	1 file
-warning query.program-errors: 1 error in the program; results may be incomplete
-try: tachyonc --diagnostics=short main.tach -c -o /dev/null
 ```
 
 One call, in the same module. The fix is one condition, changed by name:
@@ -236,8 +226,16 @@ patched crate::route::ride_cost	route.tach	+1 -1 lines
 // route.tach:31
 31	    if here_line != 0 && line != here_line { minutes + TRANSFER_MINUTES } else { minutes }
 $ tachyonc main.tach -o transit && ./transit
-graph.tach:48:23: error[own.move_out] cannot move 'out' (Vec<Edge>) out of 'out': it is a copy of an element 'g.edges.get(from)' (46:19) reads, which the collection keeps | help: copy it ('.clone()'), or match (or loop over) a value the code owns | try: tachyonc edit patch graph.tach:48 --old 'g.edges.set(from, out);' --new 'g.edges.set(from, out.clone());'
-[exit 1]
+Airport -> Museum: 16 min
+  line A  Airport    -> Museum      16 min
+Airport -> Market: 20 min
+  line A  Airport    -> Central     12 min
+  line B  Central    -> Market       3 min
+Beach -> Stadium: 36 min
+  line C  Beach      -> Harbor      11 min
+  line B  Harbor     -> Stadium     20 min
+Airport -> Moon: no such station
+ok: built transit
 ```
 
 Airport to Museum is 16 minutes, Airport to Market 20 (12, a change, 3).
