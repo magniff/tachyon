@@ -30,10 +30,11 @@ Tachyon has one pointer type, `*T`. A pointer known to be valid is a
 Everything else is raw: a local holding a pointer, a pointer field,
 `malloc`'s result, `c"..."` (read-only memory). Indexing a borrow is
 unsafe (a borrow is one value, not an array), except that `p[i]` on a
-borrow of a Vec, a Buf or a slice (`dist: *Vec<i64>`) is `(*p)[i]`: safe,
-checked. On a raw pointer to one it is pointer arithmetic: write `(*p)[i]`.
-`p[0]` on any other pointer is pointer arithmetic too: the value it
-points to is `*p` (`*out = acc`), safe through a borrow.
+pointer to a Vec, a Buf or a slice (`dist: *Vec<i64>`) is `(*p)[i]`, the
+element of the one it points to, checked: safe through a borrow, unsafe
+through a raw pointer, the same in both. `p[0]` on any other pointer is
+pointer arithmetic: the value it points to is `*p` (`*out = acc`), safe
+through a borrow.
 
 ```tach
 extern "C" {

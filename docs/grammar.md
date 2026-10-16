@@ -359,7 +359,8 @@ parameters). The unsafe operations, and what they promise:
   pointer: dereferencing it is safe.
 - Indexing a raw pointer, `p[i]` (unchecked by design: a pointer has no
   length), and slicing one, `p[lo..hi]` (the slice is only as valid as
-  the memory behind it).
+  the memory behind it). On a raw pointer to a Vec, a Buf or a slice they
+  index the pointee, checked (0.17), and are unsafe as `*p` is.
 - Casting an integer to a pointer (other than the literal `0`, a null
   pointer, which safe code cannot dereference). Pointer-to-pointer and
   pointer-to-integer casts are safe; tachyon has no pointer arithmetic
@@ -877,7 +878,7 @@ fn main() -> i32 {
 
 Dereferencing a borrow (`*p`, `p.f`, `p.m()`) is safe; indexing it
 (`p[i]`) is not (a borrow is one value, not an array), except that a
-borrow of a Vec, a Buf or a slice indexes its pointee (0.17). In exchange, a
+pointer to a Vec, a Buf or a slice indexes its pointee (0.17). In exchange, a
 call passing something other than a borrow to a pointer parameter (a
 pointer field, a local holding a pointer, `malloc`'s result, `c"..."`,
 which is read-only memory) is unsafe: the caller vouches for it. A
@@ -1539,14 +1540,19 @@ unreachable code". Both are safe; their effect is
 `v[a..b]` on std's `Vec` and `Buf` are `v.as_slice()[i]` (and so on):
 checked, a place to assign without `mut` (as a slice's element is); the
 slice is valid until the Vec grows or is freed. A `HashMap` is not
-indexed (`m.get(k)` is an Option: Rust's `m[k]` panics). Through a
-borrow of a Vec, a Buf or a slice (a pointer parameter, `&v`), `p[i]` and
-`p[a..b]` index the pointee (`p.as_slice()[i]`, `(*p)[i]`), checked and
-safe, as `p.get(i)` is. On a raw pointer they stay pointer arithmetic
-(`unsafe`; the error names `(*p)[i]`, the element, instead of an `unsafe`
-block). `p[0]` on a pointer to anything else is pointer arithmetic as
-well; through a borrow its error names `*p`, the value it points to
-(`try: *out = acc` for `out[0] = acc`).
+indexed (`m.get(k)` is an Option: Rust's `m[k]` panics). On any pointer
+to a Vec, a Buf or a slice, `p[i]`, `p[i] = x`, `&p[i]` and `p[a..b]`
+index the pointee (`p.as_slice()[i]`, `(*p)[i]`), checked, as `p.get(i)`
+is: the type decides what they mean. Whether the pointer is a borrow
+decides only safety: through a borrow (a pointer parameter, `&v`) they
+are safe; through a raw pointer (a `mut` parameter, a local, a field, a
+static) they read through it, so they are `unsafe` (the error's try: is
+`fix --only unsafe`, or `v[i]` for a local `let p = &v;`). Generic code
+over an array of `T` behind a `*T` (std's Vec) therefore does not write
+`p[i]`, which would index the pointee when `T` is a Vec: it takes the
+element's address (cast through `*u8`). `p[0]` on a pointer to anything
+else is pointer arithmetic; through a borrow its error names `*p`, the
+value it points to (`try: *out = acc` for `out[0] = acc`).
 
 **Through a pointer.** `p.0` on a `*(A, B)` is `(*p).0`, as `p.x` on a
 `*S` is `(*p).x`: safe when `p` is a borrow (a parameter, `&x`),

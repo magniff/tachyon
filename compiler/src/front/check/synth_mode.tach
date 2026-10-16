@@ -36,8 +36,8 @@ use crate::front::check::resolve::resolve_type;
 use crate::front::check::sealed::{check_field, len_reads_as_method};
 use crate::front::check::try_op::check_try;
 use crate::front::check::unsafety::{
-    NODE_NO_READ, U_DEREF, U_FIELD, U_INDEX, U_INT_PTR, U_SLICE, U_UNION, is_borrow, mark_no_read,
-    unsafe_index_zero, unsafe_op, unsafe_view_index,
+    NODE_NO_READ, UNSAFE_DEPTH, U_DEREF, U_FIELD, U_INDEX, U_INT_PTR, U_SLICE, U_UNION, is_borrow,
+    mark_no_read, unsafe_index_zero, unsafe_op, unsafe_view_index,
 };
 use crate::front::check::variant_fields::{enum_field_help, variant_literal};
 use crate::front::check::vectors::{synth_vecop, vector_binary};
@@ -324,15 +324,17 @@ fn synth_index(n: i64) -> i64 {
             base_kind = TYPES[base_ty].kind;
         }
         let index = NODES[n].b;
-        // (0.17) through a pointer to a Vec, a Buf or a slice
-        let mut raw_view = false;
+        // (0.17) through a pointer to a Vec, a Buf or a slice: the one it
+        // points to, checked; through a raw pointer, unsafe
         if base_kind == TyKind::Ptr && indexes_through(TYPES[base_ty].a) {
             let pointee = TYPES[base_ty].a;
-            if !is_borrow(base) {
-                // a raw pointer: pointer arithmetic, as before
-                raw_view = true;
+            let raw = !is_borrow(base);
+            if raw {
                 unsafe_view_index(n, base, index, pointee, NODES[index].kind == Range);
-            } else if TYPES[pointee].kind == TyKind::Slice {
+                // (reported: the method called through p below is not)
+                UNSAFE_DEPTH += 1;
+            }
+            if TYPES[pointee].kind == TyKind::Slice {
                 // a borrow: `p[i]` is `(*p)[i]`
                 let deref = synthetic_unary(Tok::Star, base, pointee);
                 NODES[n].a = deref;
@@ -352,6 +354,9 @@ fn synth_index(n: i64) -> i64 {
                 base = call;
                 base_ty = synth_expr(call);
                 base_kind = TYPES[base_ty].kind;
+            }
+            if raw {
+                UNSAFE_DEPTH -= 1;
             }
         }
         if base_kind != TyKind::Array && base_kind != TyKind::Ptr && base_kind != TyKind::Slice {
@@ -381,9 +386,7 @@ fn synth_index(n: i64) -> i64 {
         if base_kind == TyKind::Ptr {
             // (0.10: what --check-unsafe checks)
             NODES[n].p |= NODE_RAW;
-            if raw_view {
-                // reported by unsafe_view_index
-            } else if NODES[index].kind == Range {
+            if NODES[index].kind == Range {
                 unsafe_op(n, U_SLICE, c"slicing a raw pointer is unsafe");
             } else if NODES[index].kind == Int && NODES[index].a == 0 {
                 // (0.17) `p[0]`, meant as `*p`
@@ -419,8 +422,8 @@ fn indexes_as_slice(t: i64) -> bool {
     }
 }
 
-// (0.17) Whether `p[i]` on a borrow of type *t indexes the pointee: a
-// Vec, a Buf or a slice.
+// (0.17) Whether `p[i]` on a pointer of type *t indexes the pointee (a
+// Vec, a Buf or a slice), not memory from p.
 fn indexes_through(t: i64) -> bool {
     unsafe {
         TYPES[t].kind == TyKind::Slice
