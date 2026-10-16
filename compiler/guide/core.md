@@ -159,6 +159,12 @@ with its comment: `tachyonc guide --find split_in`.
 
 Every error has a `help:`; `tachyonc guide errors` has more.
 
+Tests and checks (0.18): `#[test] fn` and `#[property] fn p(v: Vec<i64>)`
+(inputs generated, shrunk) sit next to the code and `tachyonc test` runs
+them at -O0 and -O2; `requires`/`ensures` clauses and `assert_eq(a, b)`
+are checked at run time, a failure one line `FILE:L:C: message` (`guide
+testing`, `guide contracts`).
+
 ## The loop
 
 Write the program, then `tachyonc check` (a check hook, where there is

@@ -218,11 +218,12 @@ fn main() -> i32 {
 | `where T: Ord` | `<T: Ord>` |
 | `pub(crate)`, `pub(super)` | `pub`, or nothing (private to the module and its children) |
 | `fn` inside a `fn` | items only at module level |
-| `macro_rules!`, `println!`, `vec!`, `assert!` | none: `println(f"{x}")` (0.15) |
+| `macro_rules!`, `println!`, `vec!` | none: `println(f"{x}")` (0.15) |
 | default arguments (none in Rust) | `fn f(a: i64, b: i64 = 2)`, `f(1, b: 3)` (0.15) |
 | `impl<T> Trait for Vec<T>` | the same (one impl per trait and type) |
 | `dyn Trait`, `impl Trait` in argument position | generics: `fn f<T: Trait>(x: T)` |
-| `#[test]` | none yet (0.18); write a program and check its output |
+| `#[test]`, proptest, cargo-fuzz | `#[test]`, `#[property]`, `#[fuzz]`, run by `tachyonc test` and `tachyonc fuzz` (0.18; guide testing) |
+| `assert!`, `debug_assert!`, contracts crates | `assert(c)`, `assert_eq(a, b)`; `requires`/`ensures` clauses (0.18; guide contracts) |
 | `use a::b::*;` | `use a::b::{c, d};` |
 | `x as T` | the same; `bool as i64` works, an integer to an enum is checked |
 | `if let ... else if let ...`, `while let` | the same |

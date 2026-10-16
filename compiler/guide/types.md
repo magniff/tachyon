@@ -123,8 +123,9 @@ mixing it with T is `distinct.mix`, whose `try:` is the `as` to write
 Debug, Display and Clone (`Vec<NodeId>` sorts, prints, is a HashMap key)
 and T's literal patterns, but none of T's methods (`distinct.method`):
 `impl NodeId { .. }` adds its own. `type Id<T> = distinct i64;` makes
-`Id<Node>` and `Id<Edge>` two types. T is plain: numbers, bool,
-pointers, and structs, tuples and arrays of them (`distinct.kind`).
+`Id<Node>` and `Id<Edge>` two types. T is plain: numbers, bool, raw
+pointers, and structs, tuples and arrays of them; not owned (a Vec, a
+type with a Drop impl) nor a view (a slice, a `&T`) (`distinct.kind`).
 
 ```tach
 type NodeId = distinct i64;
