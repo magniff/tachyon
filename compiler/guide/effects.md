@@ -76,6 +76,6 @@ A broken declaration is one error with where the effect comes from:
 
 ```text
 sum.tach:3:1: error[effect] 'total' is #[no_alloc], but it allocates from Gpa: 'v.push(x)' at sum.tach:7:9 grows a Vec<i64>
-help: allocate in the caller and pass '*Vec<i64>' with room, or remove #[no_alloc]
+help: allocate in the caller and pass the memory in, or remove #[no_alloc]
 try: tachyonc query effects total --why alloc
 ```
