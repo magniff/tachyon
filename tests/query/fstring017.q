@@ -22,7 +22,7 @@ $ refs println push_fmt format_in --in fstring017/main.tach
 $ effects main --why io
 crate::main	alloc(Gpa) io global panic diverge
   'println(f"n = {n}")' at fstring017/main.tach:9:5 calls 'std::println'
-  'fmt_str(self, s)' at <std>:3046:9 calls 'std::fmt_str'
-  'fmt_str_fd(f.fd, s)' at <std>:2943:9 calls 'std::fmt_str_fd'
-  'fmt_flush()' at <std>:2959:9 calls 'std::fmt_flush'
-  'write(FMT_FD, rest.ptr, rest.len as u64)' at <std>:2880:26 calls C's 'write'
+  'fmt_str(self, s)' at <std>:3042:9 calls 'std::fmt_str'
+  'fmt_str_fd(f.fd, s)' at <std>:2939:9 calls 'std::fmt_str_fd'
+  'fmt_flush()' at <std>:2955:9 calls 'std::fmt_flush'
+  'write(FMT_FD, rest.ptr, rest.len as u64)' at <std>:2876:26 calls C's 'write'

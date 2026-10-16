@@ -6,13 +6,16 @@
 ## The summary first, then one line per failure (and its trace, input,
 ## try:).
 $ test --timeout 5
-test main.tach: 6 passed, 3 failed, 1 new snapshot (1 case, 5 #[test], 2 #[property], 1 contract; -O0 and -O2 agree)
-FAIL gap_needs_two: index out of bounds: index 1, length 1
+test main.tach: 7 passed, 4 failed, 1 new snapshot (1 case, 5 #[test], 4 #[property], 1 contract; -O0 and -O2 agree)
+FAIL gap_needs_two: checks.tach:14:8: index out of bounds: index 1, length 1
   trace: checks.tach:14 checks::gap_needs_two
 FAIL keeps_a_buffer: check-alloc: 1 block of Gpa not freed (14 bytes): block #2 (14 bytes), allocated at ./checks.tach:22:5
 FAIL bubble_sorts (property, case 11 of 100, shrunk in 8 steps): not sorted
   input: v = [1, 0]
   try: tachyonc test bubble_sorts --seed 0xf788dd27897d1fed main.tach
+FAIL forgets_its_input (property, case 4 of 100, shrunk in 1 step): check-alloc: 1 block of Gpa not freed by the case (32 bytes): block #11 (32 bytes), allocated at <test>:106:21
+  input: v = [0]
+  try: tachyonc test forgets_its_input --seed 0xaf47b961b6c073b main.tach
 (outputs: .tachyonc/test/O2/case-NAME.got, .err; test-NAME.got, .err)
 [exit 1]
 ## a property's failure again, from its seed
