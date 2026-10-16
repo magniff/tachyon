@@ -201,6 +201,7 @@ usage: tachyonc query def|show NAME... [--root ROOT] [--exact] [--with-comments]
        tachyonc query unused [MODULE] [--all]
        tachyonc query impact NAME
        tachyonc query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (alloc(Gpa) io global panic diverge unsafe)
+       tachyonc query views NAME...|MODULE [--why]   (what results and `&mut` parameters view: views(self), views(*self), stores(word))
        tachyonc query conflicts [FILE|DIR|FILE:LINE...] [--show]
        tachyonc query similar NAME... [--limit N]   (items like NAME to copy, nearest first)
        tachyonc query examples [KIND...]   (items to start from for an "add an X" change; tachyonc guide how)

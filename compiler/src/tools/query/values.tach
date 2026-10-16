@@ -8,15 +8,25 @@
 // (`query views`, `views:` on def/show/context), T6 the kinds (`query
 // own`); both read them from here.
 
-use crate::base::{IntVec, buf_bytes, buf_slice, buf_str};
+use crate::base::{
+    IntVec, STDOUT, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, buf_write_fd,
+};
 use crate::front::ast::NODES;
+use crate::front::modules::{C_MODULE, MODULES, STD_MODULE, module_count};
+use crate::front::own::infer::views_why;
 use crate::front::own::kinds::kind_word;
-use crate::front::own::summary::{summary_of, summary_text};
+use crate::front::own::summary::{
+    ret_parametric, summary_inferred, summary_of, summary_text, view_fn,
+};
 use crate::front::types::{
-    ENUMS, ENUM_COUNT, FNS, FN_COUNT, STRUCTS, STRUCT_COUNT, enum_type, struct_type,
+    ENUMS, ENUM_COUNT, FNS, FN_COUNT, STRUCTS, STRUCT_COUNT, TLISTS, TY_ERROR, enum_type,
+    struct_type,
 };
 use crate::tools::query::cache::RESTORED;
-use crate::tools::query::defs::{DEFS, K_ENUM, K_FN, K_IMPL_METHOD, K_METHOD, K_STRUCT, K_TRAIT_FN};
+use crate::tools::query::defs::{
+    DEFS, DEF_COUNT, K_ENUM, K_FN, K_IMPL_METHOD, K_METHOD, K_MOD, K_STRUCT, K_TRAIT_FN, MOD_DEF,
+};
+use crate::tools::query::diagnostics::diag;
 
 // (from the cache: per definition, where in C_OWN_BUF its kind text and
 // its summary text are: four positions)
@@ -69,23 +79,77 @@ pub fn def_kind_text(out: i64, d: i64) {
     }
 }
 
-// The view summary of function definition d (summary.tach's text), into
-// out; nothing for a function that is not checked, or generic.
+// The function of definition d (its FNS index), or -1.
+fn fn_of_def(d: i64) -> i64 {
+    unsafe {
+        let k = DEFS[d].kind;
+        if !(k == K_FN || k == K_METHOD || k == K_IMPL_METHOD || k == K_TRAIT_FN) {
+            return -1;
+        }
+        let f = NODES[DEFS[d].node].x - 1;
+        if f < 0 || f >= FN_COUNT { -1 } else { f }
+    }
+}
+
+// The summary of function f with how it is known: `views(*self)
+// inferred`, `views(s) declared`, `views(...) assumed`; `views()` alone
+// for a function whose type says it holds none.
+fn views_line_text(out: i64, f: i64) {
+    unsafe {
+        let s = summary_of(f);
+        summary_text(out, f, s);
+        if s.declared || s.top || !view_fn(f) {
+            return;
+        }
+        if ret_parametric(f) != 0 {
+            buf_str(out, c" parametric");
+        } else if summary_inferred(f) {
+            buf_str(out, c" inferred");
+        }
+    }
+}
+
+// The view summary of function definition d, into out; nothing for a
+// function that is not checked, is generic, or whose type says it holds
+// no views (def, show and context print it after the effects).
 pub fn def_views_text(out: i64, d: i64) {
     unsafe {
         if RESTORED {
             cached(out, d, 1);
             return;
         }
-        let k = DEFS[d].kind;
-        if !(k == K_FN || k == K_METHOD || k == K_IMPL_METHOD || k == K_TRAIT_FN) {
+        let f = fn_of_def(d);
+        if f < 0 || FNS[f].generic != 0 || !view_fn(f) {
             return;
         }
-        let f = NODES[DEFS[d].node].x - 1;
-        if f < 0 || f >= FN_COUNT || FNS[f].generic != 0 {
+        // (views() says nothing: shown by `query views` only)
+        let s = summary_of(f);
+        let mut any = s.declared || s.top;
+        for k in 0..4 {
+            if (s.ret[k] | s.sto[k]) != 0 {
+                any = true;
+            }
+        }
+        if !any {
             return;
         }
-        summary_text(out, f, summary_of(f));
+        views_line_text(out, f);
+    }
+}
+
+// ` views: SUMMARY` of definition d into out, for def, show and context:
+// whether it has one to show.
+pub fn put_def_views(out: i64, d: i64, sep: *u8) -> bool {
+    unsafe {
+        let text = buf_new();
+        def_views_text(text, d);
+        if buf_slice(text).len == 0 {
+            return false;
+        }
+        buf_str(out, sep);
+        buf_str(out, c"views: ");
+        buf_bytes(out, buf_slice(text));
+        true
     }
 }
 
@@ -93,4 +157,150 @@ pub fn def_views_text(out: i64, d: i64) {
 pub fn own_cache_texts(d: i64, kind: i64, views: i64) {
     def_kind_text(kind, d);
     def_views_text(views, d);
+}
+
+// ---------------------------------------------------------------------------
+// `query views NAME... | MODULE [--why]` (§2.9)
+
+// --why: under each summary, the exit that makes each source.
+pub static mut OPT_VIEWS_WHY: bool = false;
+
+fn views_line(out: i64, name: [u8], f: i64) {
+    unsafe {
+        buf_bytes(out, name);
+        buf_byte(out, '\t');
+        views_line_text(out, f);
+        buf_byte(out, '\n');
+        if OPT_VIEWS_WHY {
+            views_why(out, f);
+        }
+    }
+}
+
+// Whether instance g is one query mode made to check a template (a type
+// argument the error type).
+fn error_instance(g: i64) -> bool {
+    unsafe {
+        for i in 0..FNS[g].targ_count {
+            if TLISTS.data[FNS[g].targs + i] == TY_ERROR {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// The lines of definitions defs; with only_views, the functions whose
+// summary is not views() (a module's).
+fn views_of(defs: *IntVec, only_views: bool) -> i64 {
+    unsafe {
+        let out = buf_new();
+        let mut shown = 0;
+        for i in 0..(*defs).count {
+            let d = (*defs).data[i];
+            if RESTORED {
+                let text = buf_new();
+                cached(text, d, 1);
+                let k = DEFS[d].kind;
+                let is_fn = k == K_FN || k == K_METHOD || k == K_IMPL_METHOD || k == K_TRAIT_FN;
+                if buf_slice(text).len == 0 && only_views || !is_fn {
+                    continue;
+                }
+                buf_bytes(out, SYMS[DEFS[d].fqn].text);
+                buf_byte(out, '\t');
+                if buf_slice(text).len == 0 {
+                    buf_str(out, c"views()");
+                } else {
+                    buf_bytes(out, buf_slice(text));
+                }
+                buf_byte(out, '\n');
+                shown += 1;
+                continue;
+            }
+            let f = fn_of_def(d);
+            if f < 0 {
+                continue;
+            }
+            if FNS[f].generic == 0 {
+                if only_views && !view_fn(f) {
+                    continue;
+                }
+                views_line(out, SYMS[DEFS[d].fqn].text, f);
+                shown += 1;
+                continue;
+            }
+            for g in 0..FN_COUNT {
+                if FNS[g].tmpl == f + 1 && !error_instance(g) && (!only_views || view_fn(g)) {
+                    views_line(out, SYMS[FNS[g].display].text, g);
+                    shown += 1;
+                }
+            }
+        }
+        buf_write_fd(out, STDOUT);
+        if shown == 0 {
+            let e = diag(c"note", c"query.empty");
+            if only_views {
+                buf_str(e, c"no function returns or stores views (every summary is views())\n");
+            } else {
+                buf_str(e, c"no function among the names (or a generic one without instances)\n");
+            }
+        }
+        0
+    }
+}
+
+// `query views NAME...`: the summaries of the functions among `matches`
+// (a module's: those of its functions that are not views()).
+pub fn query_views(matches: *IntVec) -> i64 {
+    unsafe {
+        let mut defs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut module = false;
+        for i in 0..(*matches).count {
+            let d = (*matches).data[i];
+            if DEFS[d].kind == K_MOD {
+                for m in 0..module_count() {
+                    if m < MOD_DEF.count && MOD_DEF.data[m] == d {
+                        module_fns(m, &defs);
+                        module = true;
+                    }
+                }
+            } else {
+                defs.push(d);
+            }
+        }
+        views_of(&defs, module)
+    }
+}
+
+// `query views MODULE`: the functions of module m and of its modules
+// whose summary is not views().
+pub fn query_views_module(m: i64) -> i64 {
+    let mut defs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    module_fns(m, &defs);
+    views_of(&defs, true)
+}
+
+// The function definitions of module m and of its modules, into out, in
+// the order of DEFS.
+fn module_fns(m: i64, out: *IntVec) {
+    unsafe {
+        for d in 0..DEF_COUNT {
+            let k = DEFS[d].kind;
+            if !(k == K_FN || k == K_METHOD || k == K_IMPL_METHOD || k == K_TRAIT_FN) {
+                continue;
+            }
+            let mut x = DEFS[d].module;
+            if (x == STD_MODULE || x == C_MODULE) && x != m {
+                continue;
+            }
+            let mut steps = 0;
+            while x >= 0 && x != m && steps < 64 {
+                x = MODULES[x].parent;
+                steps += 1;
+            }
+            if x == m {
+                out.push(d);
+            }
+        }
+    }
 }
