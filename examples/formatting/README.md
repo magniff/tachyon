@@ -96,15 +96,15 @@ for i in at..at + 8 {
 }
 ```
 
-**Display by hand.** `Display` has one method, `fmt(self: *Self, f:
-*Fmt)`, which writes through the `Fmt` with `f.str`, `f.byte` and
+**Display by hand.** `Display` has one method, `fmt(self: &Self, f:
+&mut Fmt)`, which writes through the `Fmt` with `f.str`, `f.byte` and
 `f.write` (any Display value, an f-string included). Unlike Rust there is
 no `fmt::Result` to return. `Money` prints cents as dollars with
 thousands separators, using a zero-padded spec for each group:
 
 ```tach
 impl Display for Money {
-    fn fmt(self: *Money, f: *Fmt) {
+    fn fmt(self: &Money, f: &mut Fmt) {
         ...
         f.write(dollars / group);
         while group > 1 {
@@ -120,8 +120,8 @@ A width in the caller's spec applies to the whole of what the impl
 writes, so `{it.price:>10}` right-aligns `$15.99` in the table just as
 it would a number.
 
-**Debug by hand and derived.** `Debug` is `fmt_debug(self: *Self, f:
-*Fmt)`. `Sku` prints `#42` for people and `SKU-0042` for programmers.
+**Debug by hand and derived.** `Debug` is `fmt_debug(self: &Self, f:
+&mut Fmt)`. `Sku` prints `#42` for people and `SKU-0042` for programmers.
 `#[derive(Debug)]` writes Rust's text for a struct or enum, calling the
 fields' own Debug impls, which is how `Item`'s Debug shows
 `sku: SKU-0007` and `price: Money(1599)`:

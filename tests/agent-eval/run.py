@@ -10,6 +10,9 @@ the guide, with the tools, with both) against the same tasks in Rust.
     run.py analyze RUNDIR... [--write] [--check]      (0.17: each run's anatomy)
     run.py compare --baseline DIR... --new DIR... [--md FILE]   (0.17)
     run.py selfcheck --model M --kinds tach,rust,compiler [--offline]   (0.17)
+    run.py debrief RUNDIR... [--md FILE]   (0.18: the +debrief answers by theme)
+    run.py binaudit RUNDIR... [--expect TACHYONC]   (0.18: the binary each run used)
+    run.py costx --rust DIR[:COND]... --cell LABEL=DIR[:COND],... [--md FILE]   (0.18)
 
 README.md next to this file has the details."""
 
@@ -145,7 +148,35 @@ def main(argv):
     p.add_argument("--out", help="where selfcheck.json goes (default results/selfcheck-TIME)")
     p.add_argument("--ws-root")
 
+    p = sub.add_parser("debrief", help="(0.18) the +debrief answers: ratings, themes, "
+                       "codes, every answer per task")
+    p.add_argument("rundirs", nargs="+", metavar="RUNDIR")
+    p.add_argument("--md", help="write the report here")
+    p.add_argument("--quotes", type=int, default=3,
+                   help="quotes per theme and cell (default 3; 0: none)")
+
+    p = sub.add_parser("binaudit", help="(0.18) which compiler each program run used")
+    p.add_argument("rundirs", nargs="+", metavar="RUNDIR")
+    p.add_argument("--expect", help="the compiler (a path or its md5) every run must have used")
+
+    p = sub.add_parser("costx", help="(0.18) cells against Rust: cost x Rust, tier-free, "
+                       "turns, success, errors by family (own, contract, test, distinct)")
+    p.add_argument("--rust", nargs="+", required=True, metavar="DIR[:COND]")
+    p.add_argument("--cell", action="append", default=[], metavar="LABEL=DIR[:COND],...")
+    p.add_argument("--tasks", default="", help="task id prefixes, comma-separated")
+    p.add_argument("--models", default="", help="claude:haiku,claude:sonnet (default: all)")
+    p.add_argument("--md", help="write the report here")
+
     args = ap.parse_args(argv)
+    if args.cmd == "debrief":
+        from lib import debrief
+        return debrief.main(args)
+    if args.cmd == "binaudit":
+        from lib import binaudit
+        return binaudit.main(args)
+    if args.cmd == "costx":
+        from lib import costx
+        return costx.main(args)
     if args.cmd == "analyze":
         from lib import anatomy
         return anatomy.analyze_main(args)

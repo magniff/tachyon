@@ -130,7 +130,7 @@ say; with it, `self < other` works:
 struct BigUint { limbs: Vec<u32> }
 
 impl Ord for BigUint {
-    fn cmp(self: *BigUint, other: *BigUint) -> i64 {
+    fn cmp(self: &BigUint, other: &BigUint) -> i64 {
         let (a, b) = (self.limbs.as_slice(), other.limbs.as_slice());
         if a.len != b.len { return a.len - b.len; }
         ...
@@ -189,7 +189,7 @@ nine digits, with an f-string spec (`{x:09}`: zero-padded to 9):
 
 ```tach
 impl Display for BigUint {
-    fn fmt(self: *BigUint, f: *Fmt) {
+    fn fmt(self: &BigUint, f: &mut Fmt) {
         ...
         f.write(f"{s[s.len - 1]}");
         let mut i = s.len - 2;

@@ -91,7 +91,7 @@ character, and `{t}` uses `Token`'s own `Display`:
 
 ```tach
 impl Display for Error {
-    fn fmt(self: *Error, f: *Fmt) {
+    fn fmt(self: &Error, f: &mut Fmt) {
         match *self {
             BadChar(c) => f.write(f"unexpected character '{c:c}'"),
             Unexpected(t) => f.write(f"unexpected {t}"),

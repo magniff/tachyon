@@ -66,7 +66,7 @@ message is "out of memory", exit 101). `try_push` returns a `Result`
 instead:
 
 ```tach
-fn push(stack: *Vec<i64, FixedBuf>, x: i64) -> Result<(), CalcError> {
+fn push(stack: &mut Vec<i64, FixedBuf>, x: i64) -> Result<(), CalcError> {
     match stack.try_push(x) {
         Ok(()) => Ok(()),
         Err(AllocError::OutOfMemory) => Err(CalcError::TooDeep(stack.len())),
@@ -102,7 +102,7 @@ every allocation is from the `FixedBuf`. `eval` makes it a promise:
 
 ```tach
 #[effects(alloc(FixedBuf), panic)]
-fn eval(line: [u8], stack: *Vec<i64, FixedBuf>) -> Result<i64, CalcError> {
+fn eval(line: [u8], stack: &mut Vec<i64, FixedBuf>) -> Result<i64, CalcError> {
 ```
 
 The compiler checks the declaration against everything `eval` calls.

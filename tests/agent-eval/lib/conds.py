@@ -65,6 +65,13 @@ Modifiers, any order after the base:
 - `+readfirst` (0.17 iterations): prompts/readfirst.md after the guide:
   read the code in the directory first, follow its patterns, look up
   (`guide --find`, `guide TOPIC#SECTION`) only what the code does not show.
+- `+debrief` (0.18): after the task, the same session is asked
+  prompts/debrief.md (what confused it, which diagnostics helped or
+  misled, what it would change, three ratings out of 5) and the answer
+  goes to result.json's `debrief`, its cost apart from the task's
+  (lib/debrief.py). Any condition, `rust` and `compiler-plain` too (about
+  Rust, about tachyon and its tools); not with a Stop hook (+test,
+  +turn-end), which would act on the debrief's turn too. Claude only.
 
 `both+hook+test` is the rerun matrix's row D cell; `compiler-tools-core+test`
 the compiler one.
@@ -82,7 +89,8 @@ PROGRAM_BASES = ("bare", "guide", "tools", "both", "guide-core", "tools-core", "
                  "rust-pairs", "guide-mini", "guide-example", "rust")
 COMPILER_BASES = ("compiler-tools", "compiler-plain", "compiler-tools-core")
 BASES = PROGRAM_BASES + COMPILER_BASES
-MODS = ("hook", "test", "turn-end", "recite", "rewrite", "nohints", "note", "readfirst")
+MODS = ("hook", "test", "turn-end", "recite", "rewrite", "nohints", "note", "readfirst",
+        "debrief")
 # (E3, E5, E6) the modifiers settings-eval.json's `modifiers` defines: an
 # environment for every hook of the run, more hooks
 HOOK_MODS = ("rewrite", "nohints", "note")
@@ -138,10 +146,17 @@ class Cond:
         self.readfirst = "readfirst" in self.mods
         self.turn_end = "turn-end" in self.mods or self.test
         self.hook_mods = tuple(m for m in self.mods if m in HOOK_MODS)
-        if self.lang == "rust" and self.mods:
-            raise ValueError("condition %r: rust takes no modifiers" % name)
-        if self.compiler == "plain" and self.mods:
-            raise ValueError("condition %r: compiler-plain takes no modifiers (no hooks)" % name)
+        # (0.18) the debrief changes nothing in the task's run
+        self.debrief = "debrief" in self.mods
+        others = [m for m in self.mods if m != "debrief"]
+        if self.lang == "rust" and others:
+            raise ValueError("condition %r: rust takes no modifiers but +debrief" % name)
+        if self.compiler == "plain" and others:
+            raise ValueError("condition %r: compiler-plain takes no modifiers but +debrief "
+                             "(no hooks)" % name)
+        if self.debrief and self.turn_end:
+            raise ValueError("condition %r: +debrief with a Stop hook (+test, +turn-end) is "
+                             "not supported" % name)
         # the compiler-tools conditions: query-first and check hooks always
         self.query_hook = self.compiler in ("full", "core")
         if "rewrite" in self.mods and not self.query_hook:
@@ -179,6 +194,12 @@ class Cond:
 
     def __str__(self):
         return self.name
+
+
+def without_debrief(name):
+    """(0.18) The condition a +debrief cell is compared with: its name
+    without +debrief (the task's run is the same)."""
+    return "+".join(p for p in name.split("+") if p != "debrief")
 
 
 def parse(name):
