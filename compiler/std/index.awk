@@ -26,7 +26,7 @@ BEGIN {
     for (i = 1; i <= n; i++) LAZY[lz[i]] = 1
     TRIGGERS["Iterators (0.14)"] = "Iterator IntoIterator"
     TRIGGERS["Conversions (0.15)"] = "From Into main_error"
-    TRIGGERS["Clone, Eq, Ord and Hash without an impl (0.15)"] = "Eq Ord Hash Clone clone cmp eq hash sort sort_by sort_stable HashMap"
+    TRIGGERS["Clone, Eq, Ord and Hash without an impl (0.15)"] = "Eq Ord Hash Clone clone cmp eq hash sort sort_by sort_stable HashMap distinct NonNull"
     s = 0
     start[0] = 0
     title[0] = ""

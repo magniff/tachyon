@@ -1,0 +1,382 @@
+// Distinct types in the checker (0.18, docs/design/contracts-verification.md
+// §2.10; the types themselves are front/distinct.tach): the alias that
+// makes one, literals, operators, the methods it does not take from its
+// underlying type, and the erasure once the program checks.
+//
+// The rules are Go's defined types: `x as X` and `id as i64` convert for
+// free; a literal becomes X; X's operators are T's between two X (or an X
+// and a literal); X has none of T's methods, but the traits Eq, Ord, Hash,
+// Debug, Display and Clone when T has them (front/traits.tach, std's
+// distinct_* helpers).
+
+use crate::base::{SRC, SYMS, buf_fmt, buf_new, buf_slice, intern, intern_c};
+use crate::base::diag::{
+    ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_help_fmt, err_jump,
+    err_try_fmt,
+};
+use crate::front::ast::{NODES, NODE_CHECKED, NODE_COUNT, NodeKind, new_node};
+use crate::front::check::{LOCALS, LOCAL_COUNT, is_std_named};
+use crate::front::contracts::diag::{DISTINCT_KIND, DISTINCT_METHOD, DISTINCT_MIX};
+use crate::front::distinct::{
+    ANY_DISTINCT, NICHE_ALIASES, distinct_type, enum_niche, erase_list, erase_type,
+    is_distinct_type, is_niche_alias, strip_distinct,
+};
+use crate::front::lexer::{SUF_NONE, Tok};
+use crate::front::modules::{STD_MODULE, module_of};
+use crate::front::traits::{implements, std_trait};
+use crate::front::types::{
+    CONSTS, CONST_COUNT, ENUMS, ENUM_COUNT, FIELDS, FIELD_COUNT, FNS, FN_COUNT, STATICS,
+    STATIC_COUNT, STRUCTS, TSCRATCH, TYPES, TY_ERROR, TyKind, VARIANTS, VARIANT_COUNT, buf_type,
+    enum_variant, is_numeric, struct_field, type_count, type_elem, variant_field,
+};
+
+// The binary node whose operands are being checked (0: none): the
+// distinct.mix message names the whole operation.
+pub static mut BINARY_NODE: i64 = 0;
+
+// The type that `type X = distinct T` (alias node `alias`) names, T being
+// `base`, with the type arguments TSCRATCH[mark..] (popped).
+pub fn distinct_of(alias: i64, base: i64, mark: i64) -> i64 {
+    unsafe {
+        if base == TY_ERROR {
+            TSCRATCH.count = mark;
+            return base;
+        }
+        let bad = not_plain(base, 0);
+        if bad != 0 {
+            let saved = ERR_KIND;
+            ERR_KIND = DISTINCT_KIND;
+            err_begin(NODES[NODES[alias].b].start);
+            let b = buf_new();
+            buf_type(b, bad);
+            let what = if TYPES[bad].kind == TyKind::Slice { "views memory" }
+                else { "owns memory" };
+            err_fmt(f"a distinct type is over a plain type: '{buf_slice(b)}' {what}");
+            let name = SYMS[NODES[alias].a].text;
+            err_help_fmt(f"a distinct value is copied freely; for an owned or view type declare a struct of one field instead: 'struct {name} {{ v: {buf_slice(b)} }}'");
+            err_end_soft();
+            ERR_KIND = saved;
+        }
+        // (std's NonNull: the null niche, front/distinct.tach)
+        if module_of(alias) == STD_MODULE && SYMS[NODES[alias].a].text == "NonNull"
+            && !is_niche_alias(alias) {
+            NICHE_ALIASES.push(alias);
+        }
+        distinct_type(alias, base, mark)
+    }
+}
+
+// A type in t that is not plain (an owned or a view type: a slice, Vec,
+// Buf, HashMap, or a struct, enum, tuple or array holding one); 0.
+fn not_plain(t: i64, depth: i64) -> i64 {
+    unsafe {
+        if t <= 0 || depth > 16 {
+            return 0;
+        }
+        let kind = TYPES[t].kind;
+        if kind == TyKind::Slice {
+            return t;
+        }
+        if kind == TyKind::Struct {
+            if is_std_named(t, c"Vec") || is_std_named(t, c"Buf") || is_std_named(t, c"HashMap") {
+                return t;
+            }
+            let s = TYPES[t].a;
+            for i in 0..STRUCTS[s].field_count {
+                let bad = not_plain((*struct_field(s, i)).ty, depth + 1);
+                if bad != 0 {
+                    return bad;
+                }
+            }
+            return 0;
+        }
+        if kind == TyKind::Enum {
+            let e = TYPES[t].a;
+            for i in 0..ENUMS[e].variant_count {
+                let v = enum_variant(e, i);
+                for k in 0..VARIANTS[v].field_count {
+                    let bad = not_plain(variant_field(v, k), depth + 1);
+                    if bad != 0 {
+                        return bad;
+                    }
+                }
+            }
+            return 0;
+        }
+        if kind == TyKind::Tuple {
+            for i in 0..TYPES[t].count {
+                let bad = not_plain(type_elem(t, i), depth + 1);
+                if bad != 0 {
+                    return bad;
+                }
+            }
+            return 0;
+        }
+        if kind == TyKind::Array || kind == TyKind::Distinct {
+            return not_plain(TYPES[t].a, depth + 1);
+        }
+        0
+    }
+}
+
+// ---- Literals, operators, the methods ----
+
+// Whether literal n, checked against distinct type `expected` over a
+// number, was checked against that number: the one implicit conversion.
+pub fn distinct_literal(n: i64, expected: i64) -> bool {
+    if !is_distinct_type(expected) || !crate::front::check::synth_mode::is_context_literal(n) {
+        return false;
+    }
+    let base = strip_distinct(expected);
+    if !is_numeric(base) {
+        return false;
+    }
+    crate::front::check::check_mode::check_expr(n, base);
+    true
+}
+
+// Binary node n (operator op), whose operands are both of distinct type
+// ty: T's operator. Arithmetic and bitwise operators give a `ty`,
+// comparisons a bool.
+pub fn distinct_binary(n: i64, op: Tok, ty: i64) -> i64 {
+    unsafe {
+        let base = strip_distinct(ty);
+        let lhs = NODES[n].b;
+        let rhs = NODES[n].c;
+        if NODES[lhs].ty == ty {
+            NODES[lhs].ty = base;
+        }
+        if NODES[rhs].ty == ty {
+            NODES[rhs].ty = base;
+        }
+        let r = crate::front::check::synth_mode::binary_result(n, op, base);
+        let compares = op == Tok::EqEq || op == Tok::BangEq || op == Tok::Lt || op == Tok::Gt
+            || op == Tok::LtEq || op == Tok::GtEq;
+        if r == base && !compares { ty } else { r }
+    }
+}
+
+// A value of type `actual` where `expected` goes, one of them distinct
+// over the other's type (or both numbers): distinct.mix, with the
+// conversion (of the operand that is not distinct, in an operation).
+// Returns when it is some other mismatch.
+pub fn distinct_mismatch(n: i64, expected: i64, actual: i64) {
+    unsafe {
+        if !is_distinct_type(expected) && !is_distinct_type(actual) || expected == TY_ERROR
+            || actual == TY_ERROR || n == 0 || NODES[n].end <= NODES[n].start {
+            return;
+        }
+        let be = strip_distinct(expected);
+        let ba = strip_distinct(actual);
+        if be != ba && !(is_numeric(be) && is_numeric(ba)) {
+            return;
+        }
+        let saved = ERR_KIND;
+        ERR_KIND = DISTINCT_MIX;
+        let te = buf_new();
+        buf_type(te, expected);
+        let ta = buf_new();
+        buf_type(ta, actual);
+        let b = BINARY_NODE;
+        let in_binary = b != 0 && (NODES[b].b == n || NODES[b].c == n);
+        // What is converted, to what: in an operation, the operand that is
+        // not distinct, to the other's type.
+        let mut target = n;
+        let mut to = te;
+        if in_binary && is_distinct_type(actual) && !is_distinct_type(expected) {
+            target = if NODES[b].b == n { NODES[b].c } else { NODES[b].b };
+            to = ta;
+        }
+        let conv = conversion(target, buf_slice(to));
+        err_begin(NODES[n].start);
+        if in_binary {
+            let whole = SRC[NODES[b].start..NODES[b].end];
+            let left = NODES[b].b == n;
+            let lt = if left { buf_slice(ta) } else { buf_slice(te) };
+            let rt = if left { buf_slice(te) } else { buf_slice(ta) };
+            err_fmt(f"'{whole}' mixes '{lt}' and '{rt}'");
+            err_help(c"a distinct type's operators take two of it (or one and a literal): convert the other operand with 'as' (free)");
+            let before = SRC[NODES[b].start..NODES[target].start];
+            let after = SRC[NODES[target].end..NODES[b].end];
+            err_try_fmt(f"{before}{buf_slice(conv)}{after}");
+        } else {
+            let text = SRC[NODES[n].start..NODES[n].end];
+            err_fmt(f"'{text}' is '{buf_slice(ta)}' where '{buf_slice(te)}' goes");
+            err_help(
+                c"a distinct type and its underlying type do not mix: convert with 'as' (free)");
+            err_try_fmt(buf_slice(conv));
+        }
+        err_fix(NODES[target].start, NODES[target].end, buf_slice(conv));
+        err_end_soft();
+        ERR_KIND = saved;
+        err_jump()
+    }
+}
+
+// `x as T` for expression node n (in parentheses when an operator would
+// bind it), in a new buffer.
+fn conversion(n: i64, to: [u8]) -> i64 {
+    unsafe {
+        let text = SRC[NODES[n].start..NODES[n].end];
+        let k = NODES[n].kind;
+        let simple = !(k == NodeKind::Binary || k == NodeKind::Unary || k == NodeKind::Cast
+            || k == NodeKind::Range || k == NodeKind::If || k == NodeKind::Match
+            || k == NodeKind::Block || k == NodeKind::Closure);
+        let out = buf_new();
+        if simple {
+            buf_fmt(out, f"{text} as {to}");
+        } else {
+            buf_fmt(out, f"({text}) as {to}");
+        }
+        out
+    }
+}
+
+// `x.name(..)` (call n, receiver node `receiver`) where x is of distinct
+// type t, which has no method `name`: distinct.method when t's underlying
+// type has it. Returns otherwise.
+pub fn distinct_method_error(n: i64, receiver: i64, t: i64, name: i64) {
+    unsafe {
+        if !is_distinct_type(t) {
+            return;
+        }
+        let base = strip_distinct(t);
+        if crate::front::check::calls::method_of(base, name) < 0 {
+            return;
+        }
+        let saved = ERR_KIND;
+        ERR_KIND = DISTINCT_METHOD;
+        let tt = buf_new();
+        buf_type(tt, t);
+        let tb = buf_new();
+        buf_type(tb, base);
+        let text = SRC[NODES[receiver].start..NODES[receiver].end];
+        let mname = SYMS[name].text;
+        err_begin(NODES[n].start);
+        err_fmt(f"'{mname}' is a method of '{buf_slice(tb)}', not of '{buf_slice(tt)}'");
+        err_help(c"a distinct type has only the methods its own impl gives it: convert to call the underlying type's");
+        let conv = buf_new();
+        buf_fmt(conv, f"({text} as {buf_slice(tb)})");
+        err_try_fmt(f"{buf_slice(conv)}.{mname}(..)");
+        err_fix(NODES[receiver].start, NODES[receiver].end, buf_slice(conv));
+        err_end_soft();
+        ERR_KIND = saved;
+        err_jump()
+    }
+}
+
+// ---- The traits ----
+
+// Whether distinct type t has trait tr without an impl: Eq, Ord, Hash,
+// Debug, Display and Clone, when its underlying type has them.
+pub fn distinct_inherits(tr: i64, t: i64) -> bool {
+    unsafe {
+        let names: [*u8; 6] = [c"Eq", c"Ord", c"Hash", c"Debug", c"Display", c"Clone"];
+        for i in 0..6 {
+            if tr == std_trait(names[i]) {
+                return implements(tr, TYPES[t].a);
+            }
+        }
+        false
+    }
+}
+
+// std's function that `x.name(..)` calls, x of distinct type t without
+// an impl of the method's trait (0: none): distinct_eq, distinct_cmp,
+// distinct_hash, distinct_fmt, distinct_fmt_debug or distinct_clone
+// (std/clone.tach), with t and its underlying type as arguments.
+pub fn distinct_helper(t: i64, name: i64) -> i64 {
+    unsafe {
+        let text = SYMS[name].text;
+        let tr = if text == "eq" { c"Eq" } else if text == "cmp" { c"Ord" }
+            else if text == "hash" { c"Hash" } else if text == "fmt" { c"Display" }
+            else if text == "fmt_debug" { c"Debug" } else if text == "clone" { c"Clone" }
+            else { return 0; };
+        if !implements(std_trait(tr), TYPES[t].a) {
+            return 0;
+        }
+        let b = buf_new();
+        buf_fmt(b, f"distinct_{text}");
+        intern(buf_slice(b))
+    }
+}
+
+// The symbol prefix of the methods of generic distinct template tpl
+// (`impl<T> NonNull<T>`): its alias's symbol.
+pub fn distinct_tpl_symbol(tpl: i64) -> i64 {
+    unsafe {
+        let alias = tpl - crate::front::generics::TPL_DISTINCT;
+        crate::front::modules::item_symbol(module_of(alias), NODES[alias].a)
+    }
+}
+
+// ---- `p.is_null()` ----
+
+// `p.is_null()` (call n, p of raw pointer type, checked): becomes
+// `p as u64 == 0`; its type.
+pub fn null_test(n: i64) -> i64 {
+    unsafe {
+        let receiver = NODES[n].a;
+        let (start, end) = (NODES[n].start, NODES[n].end);
+        NODES[receiver].p |= NODE_CHECKED;
+        let u64_name = new_node(NodeKind::TyName, start, end);
+        NODES[u64_name].a = intern_c(c"u64");
+        let cast = new_node(NodeKind::Cast, start, end);
+        NODES[cast].a = receiver;
+        NODES[cast].b = u64_name;
+        let zero = new_node(NodeKind::Int, start, end);
+        NODES[zero].b = SUF_NONE;
+        let test = new_node(NodeKind::Binary, start, end);
+        NODES[test].op = Tok::EqEq;
+        NODES[test].b = cast;
+        NODES[test].c = zero;
+        let ty = crate::front::check::synth_mode::synth_expr(test);
+        NODES[n] = NODES[test];
+        ty
+    }
+}
+
+// ---- Erasure ----
+
+// Once the program checks: every distinct type replaced by its
+// underlying type where the code generators read types
+// (front/distinct.tach).
+pub fn erase_program_types() {
+    unsafe {
+        if !ANY_DISTINCT {
+            return;
+        }
+        // (the niche is decided while the variants' types are distinct)
+        for e in 0..ENUM_COUNT {
+            enum_niche(e);
+        }
+        let types = type_count();
+        for n in 0..NODE_COUNT {
+            let t = NODES[n].ty;
+            if t > 0 && t < types {
+                NODES[n].ty = erase_type(t);
+            }
+        }
+        for i in 0..FIELD_COUNT {
+            FIELDS[i].ty = erase_type(FIELDS[i].ty);
+        }
+        for f in 0..FN_COUNT {
+            FNS[f].ret = erase_type(FNS[f].ret);
+            FNS[f].self_ty = erase_type(FNS[f].self_ty);
+            FNS[f].params = erase_list(FNS[f].params, FNS[f].param_count);
+        }
+        for v in 0..VARIANT_COUNT {
+            VARIANTS[v].fields = erase_list(VARIANTS[v].fields, VARIANTS[v].field_count);
+            VARIANTS[v].shape = erase_type(VARIANTS[v].shape);
+        }
+        for i in 0..STATIC_COUNT {
+            STATICS[i].ty = erase_type(STATICS[i].ty);
+        }
+        for i in 0..CONST_COUNT {
+            CONSTS[i].ty = erase_type(CONSTS[i].ty);
+        }
+        for i in 0..LOCAL_COUNT {
+            LOCALS[i].ty = erase_type(LOCALS[i].ty);
+        }
+    }
+}

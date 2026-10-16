@@ -23,11 +23,15 @@ use crate::front::check::{
     CONST_CONTEXT, PROGRAM, SELF_TYPE_SYM, TRY_RESULT, Try, attempt, name_error,
     resolve_type_or_error, type_error, type_error_got,
 };
+use crate::front::check::distinct::distinct_tpl_symbol;
 use crate::front::check::resolve::{resolve_alias, resolve_type, type_name_key};
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::consteval::{const_eval, wrap_int};
+use crate::front::contracts::is_distinct;
 use crate::front::convert::{generic_trait_impl, impl_fn_symbol};
-use crate::front::generics::{TPL_NONE, TPL_SLICE, env_lookup, template_name, template_of_key};
+use crate::front::generics::{
+    TPL_DISTINCT, TPL_NONE, TPL_SLICE, env_lookup, template_name, template_of_key,
+};
 use crate::front::modules::{
     CUR_MOD, MODULES, child_module, file_of_pos, item_symbol, join_sym, module_of, qualify,
 };
@@ -572,6 +576,7 @@ pub fn collect_method(f: i64) {
         let gt = generic_trait_impl(impl_of_fn(f));
         if tpl != TPL_NONE && gt >= 0 {
             let base = if tpl == TPL_SLICE { intern_c(c"TS") }
+                else if tpl >= TPL_DISTINCT { distinct_tpl_symbol(tpl) }
                 else if tpl > 0 { STRUCTS[tpl - 1].sym } else { ENUMS[-tpl - 1].sym };
             FNS[f].name = impl_fn_symbol(method_symbol(base, name), gt);
             FNS[f].display = join_sym(template_name(tpl), c"::", name);
@@ -596,6 +601,7 @@ pub fn collect_method(f: i64) {
             GMETHODS[GMETHOD_COUNT] = MethodInfo { ty: tpl, name: name, f: f };
             GMETHOD_COUNT += 1;
             let base = if tpl == TPL_SLICE { intern_c(c"TS") }
+                else if tpl >= TPL_DISTINCT { distinct_tpl_symbol(tpl) }
                 else if tpl > 0 { STRUCTS[tpl - 1].sym } else { ENUMS[-tpl - 1].sym };
             FNS[f].name = method_symbol(base, name);
             FNS[f].display = join_sym(template_name(tpl), c"::", name);
@@ -608,7 +614,8 @@ pub fn collect_method(f: i64) {
         }
         let t = resolve_type(self_node);
         let kind = TYPES[t].kind;
-        if kind != TyKind::Struct && kind != TyKind::Enum && impl_of_fn(f) < 0 {
+        if kind != TyKind::Struct && kind != TyKind::Enum && kind != TyKind::Distinct
+            && impl_of_fn(f) < 0 {
             err_begin(NODES[item].start);
             err_str(c"impl blocks are only allowed for structs and enums, not '");
             err_type(t);
@@ -702,7 +709,8 @@ fn impl_template(item: i64) -> i64 {
         }
         let g = NODES[self_node].g;
         // (0.16: with a default type parameter, still every argument)
-        let full = if tpl > 0 { STRUCTS[tpl - 1].generic } else { ENUMS[-tpl - 1].generic };
+        let full = if tpl >= TPL_DISTINCT { NODES[NODES[tpl - TPL_DISTINCT].g].count }
+            else if tpl > 0 { STRUCTS[tpl - 1].generic } else { ENUMS[-tpl - 1].generic };
         if g != 0 && NODES[g].count < full && NODES[g].count == impl_count {
             impl_args_error(self_node, tpl, params);
         }
@@ -791,7 +799,13 @@ pub fn template_of_type_node(n: i64) -> i64 {
     if key < 0 {
         return TPL_NONE;
     }
-    template_of_key(key)
+    let tpl = template_of_key(key);
+    // (0.18: a generic distinct type, `impl<T> NonNull<T>`)
+    let alias = unsafe { SYM_ALIAS[key] };
+    if tpl == TPL_NONE && alias != 0 && unsafe { NODES[alias].g != 0 } && is_distinct(alias) {
+        return TPL_DISTINCT + alias;
+    }
+    tpl
 }
 
 pub static mut GMETHODS: *MethodInfo = 0 as *MethodInfo;
