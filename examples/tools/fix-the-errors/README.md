@@ -21,13 +21,13 @@ file, one per line, `FILE:LINE:COL: error[KIND] MESSAGE | help: ...`:
 
 ```console
 $ tachyonc check
-main.tach:8:38: error[type error] 'letter' is private | help: make it public: `pub fn letter` at grades.tach:21:1 | try: tachyonc fix --only pub main.tach
+main.tach:8:38: error[type error] 'letter' is private | help: make it public: `pub fn letter` at grades.tach:21:1 | try: tachyonc fix --suggested main.tach
 main.tach:9:14: error[type error] unresolved import 'roster::add_score'
 main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: *Roster, name: [u8])` (roster.tach:17)
 main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: *Roster, name: [u8])` (roster.tach:17)
 main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: *Roster, name: [u8])` (roster.tach:17)
-main.tach:33:23: error[type error] undefined variable 'I64_MIN' | help: add `use std::I64_MIN;` | try: tachyonc fix --only imports main.tach
-grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'?
+main.tach:33:23: error[type error] undefined variable 'I64_MIN' | help: add `use std::I64_MIN;` | try: tachyonc fix --suggested main.tach
+grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: tachyonc fix --suggested main.tach
 grades.tach:39:17: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: tachyonc fix --only unsafe main.tach
 roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
 [exit 1]
@@ -50,7 +50,10 @@ example:
 
 A missing `use` line, an item that must become `pub`, a C call outside
 `unsafe`: these have exactly one fix, and `fix` makes them all in one
-edit. `--dry-run` shows the diff first:
+edit. (An error whose `try:` is `tachyonc fix --suggested` has an exact
+fix the compiler knows, `totl` for `total` too: `fix --suggested` makes
+those, then prints the errors left; `totl` is fixed by hand below, to
+show `edit patch`.) `--dry-run` shows the diff first:
 
 ```console
 $ tachyonc fix --dry-run
@@ -73,7 +76,7 @@ main.tach:9:14: error[type error] unresolved import 'roster::add_score'
 main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: *Roster, name: [u8])` (roster.tach:17)
 main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: *Roster, name: [u8])` (roster.tach:17)
 main.tach:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: *Roster, name: [u8])` (roster.tach:17)
-grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'?
+grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: tachyonc fix --suggested main.tach
 roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
 [exit 1]
 ```

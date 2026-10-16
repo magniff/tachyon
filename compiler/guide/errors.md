@@ -9,6 +9,13 @@ the error is (`a as i32`, `std::trim(s)`, the missing match arms), a
 `use` line, or a `tachyonc` command to run (`tachyonc fix --only unsafe
 main.tach`, `tachyonc edit new-file util.tach main.tach`); VALUE in it
 is yours to fill in.
+An error whose fix the compiler knows exactly (0.18: a did-you-mean with
+one name that near, a conversion, a path from `crate::`, a Rust type or
+label respelled, a missing `use` or `pub`, a missing `gpa` argument)
+also has `try: tachyonc fix --suggested main.tach`: one command makes
+all of them, as one checked edit (`--dry-run` shows the diff, `tachyonc
+undo` takes it back, `--at FILE:LINE` fixes one line's), then prints the
+errors left. Run it instead of editing those lines by hand or with sed.
 KIND is `tokenizer error`, `parser error`, `module error`, `type error`
 or `unsafe`. Fix the first errors first: a parser error can hide
 type errors in the same function. `tachyonc query show FILE:LINE` prints
@@ -562,7 +569,8 @@ fn main() -> i32 { helper() as i32 }
 error[type error] undefined variable 'helper' | help: add `use crate::m::helper;`
 ```
 Add the `use` line the help names, or run the `try:` line, `tachyonc fix
---only imports main.tach`, which adds every missing one.
+--suggested main.tach`, which adds every missing one (and makes the
+other errors' exact fixes; `fix --only imports`: the imports alone).
 
 In a module other than the root, a path starts in that module; a `use`
 path may also start with a sibling module (0.17): `use table::Table;` in

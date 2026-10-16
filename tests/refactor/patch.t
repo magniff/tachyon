@@ -260,8 +260,8 @@ $ edit replace crate::use --dry-run < $T/inputs/use_alias.tach
 +++ b/main.tach
 @@ -4 +3,0 @@
 -use calc::{clamp, sum_to};
-main.tach:7:13: error[type error] undefined variable 'clamp' | help: add `use crate::calc::clamp;` | try: tachyonc fix --only imports main.tach  [in crate::main]
-main.tach:8:13: error[type error] undefined variable 'sum_to' | help: add `use crate::calc::sum_to;` | try: tachyonc fix --only imports main.tach  [in crate::main]
+main.tach:7:13: error[type error] undefined variable 'clamp' | help: add `use crate::calc::clamp;` | try: tachyonc fix --suggested main.tach  [in crate::main]
+main.tach:8:13: error[type error] undefined variable 'sum_to' | help: add `use crate::calc::sum_to;` | try: tachyonc fix --suggested main.tach  [in crate::main]
 warning edit.breaks: 2 new errors (2 in crate::main, which the edit does not change) (dry run)
 [exit 1]
 $ edit delete crate::header

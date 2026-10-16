@@ -138,7 +138,7 @@ $ refactor signature scale --type k i16 --default '$k as i16' --dry-run
 -pub fn scale(v: i64, k: i32) -> i64 {
 +pub fn scale(v: i64, k: i16) -> i64 {
 $ refactor signature scale --type k i16
-main.tach:11:36: error[type error] expected 'i16', got 'i32' | help: only widening is implicit: convert explicitly | try: n as i16  [in crate::main]
+main.tach:11:36: error[type error] expected 'i16', got 'i32' | help: only widening is implicit: convert explicitly | try: n as i16 | try: tachyonc fix --suggested main.tach  [in crate::main]
 error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::calc::scale no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: tachyonc refactor signature crate::calc::scale --type k i16 --default '$k as i16'
@@ -152,7 +152,7 @@ try: tachyonc refactor signature NAME --type x T --default EXPR
 [exit 2]
 ## fix --in MODULE: its child modules too.
 $ edit patch lib/inner.tach --old 'use crate::calc::clamp;' --new '' --no-check
-lib/inner.tach:4:5: error[type error] undefined variable 'clamp' | help: add `use crate::calc::clamp;` | try: tachyonc fix --only imports main.tach  [in crate::lib::inner::double]
+lib/inner.tach:4:5: error[type error] undefined variable 'clamp' | help: add `use crate::calc::clamp;` | try: tachyonc fix --suggested main.tach  [in crate::lib::inner::double]
 patched crate::lib::inner	lib/inner.tach	+0 -1 lines
 warning edit.breaks: 1 new error (1 in crate::lib::inner::double, which the edit does not change); written anyway (--no-check)
 try: tachyonc check

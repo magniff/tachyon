@@ -24,6 +24,12 @@ once each, with how many errors they answer:
     tachyonc check main.tach: 3 errors
     try: tachyonc fix --only unsafe main.tach   (3 of the errors)
 
+(0.18) `fix --suggested` first: the errors' exact fixes (a did-you-mean
+name, a conversion, a missing `use` or `pub`, ...), which the hook only
+names, never applies:
+
+    try: tachyonc fix --suggested main.tach   (2 of the errors: their exact fixes, one checked edit)
+
 and the compiler is run under the name the agent can type (`tachyonc` when
 it is the one on PATH, else its path from the event's directory), so the
 `try:` lines it prints run as they are.
@@ -258,17 +264,19 @@ def typed_name(compiler, cwd):
 
 
 FIX = re.compile(r"^\S*tachyonc\S* fix\b")
+SUGGESTED = re.compile(r" fix --suggested\b")
 
 
 def fix_commands(errors):
     """The `tachyonc fix ...` commands of the errors' try: lines, each with
-    how many errors name it, in order of first appearance."""
+    how many errors name it, in order of first appearance; (0.18) `fix
+    --suggested` (the errors' exact fixes) first."""
     seen = {}
     for d in errors:
         for t in d.get("try") or []:
             if FIX.match(t):
                 seen[t] = seen.get(t, 0) + 1
-    return list(seen.items())
+    return sorted(seen.items(), key=lambda kv: not SUGGESTED.search(kv[0]))
 
 
 def line_of(d, summarized=()):
@@ -291,8 +299,11 @@ def fix_lines(errors):
     head (with how many of the errors they answer), and the set of them."""
     n = len(errors)
     fixes = fix_commands(errors)
-    return ([f"try: {cmd}   ({'the error' if n == 1 else 'all of them' if k == n else f'{k} of the errors'})"
-             for cmd, k in fixes], {cmd for cmd, _ in fixes})
+    def which(cmd, k):
+        what = 'the error' if n == 1 else 'all of them' if k == n else f'{k} of the errors'
+        # (0.18) the hook applies nothing: the agent sees the fixes and runs them
+        return what + ": their exact fixes, one checked edit" if SUGGESTED.search(cmd) else what
+    return ([f"try: {cmd}   ({which(cmd, k)})" for cmd, k in fixes], {cmd for cmd, _ in fixes})
 
 
 def report(diags, root_shown, edited):

@@ -20,8 +20,9 @@ small queries.
    prints the lines on it.
 2. Fix each error: `tachyonc query show FILE:LINE` prints the item at
    the error's position; `tachyonc edit patch` changes a few lines of it.
-3. `tachyonc fix` for the mechanical ones (missing `use` lines, unsafe
-   blocks, `pub`).
+3. `tachyonc fix --suggested` when errors have `try: tachyonc fix
+   --suggested main.tach` (0.18): their exact fixes, one checked edit,
+   then the errors left; `tachyonc fix` for unsafe blocks.
 4. Build and run: `tachyonc main.tach -o prog && ./prog`.
 
 ## The program
@@ -107,6 +108,7 @@ an edit then `check`.
 | move items to a module | `tachyonc refactor move PATH --to MODULE` (made when missing) |
 | an idiom everywhere, typed | `tachyonc rewrite 'old($a)' 'new($a)' --dry-run` |
 | imports, unused, pub, unsafe | `tachyonc fix` (`--only imports,unused,pub,unsafe`, `--dry-run`) |
+| the errors' exact fixes (their `try: tachyonc fix --suggested`) | `tachyonc fix --suggested` (`--dry-run`, `--at FILE:LINE`) |
 
 Every edit is atomic: the edited program is checked first, and an edit
 that adds an error writes nothing and prints the errors, each tagged

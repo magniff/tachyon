@@ -100,7 +100,7 @@ $ refactor signature area --type p '*Point' --dry-run
 @@ -17 +17 @@
 -pub fn area(p: Point) -> i64 {
 +pub fn area(p: *Point) -> i64 {
-main.tach:16:18: error[type error] expected '*Point', got 'Point' | help: a pointer to it: its address | try: &p  [in crate::main]
+main.tach:16:18: error[type error] expected '*Point', got 'Point' | help: a pointer to it: its address | try: &p | try: tachyonc fix --suggested main.tach  [in crate::main]
 warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change) (dry run)
 [exit 1]
 ## Refused: a function used as a value, a missing default, an unknown
@@ -205,7 +205,7 @@ $ refactor field Point --rename y height --dry-run
 -        (self.x + self.y) * unit
 +        (self.x + self.height) * unit
 $ refactor field Point --type x i32
-geom.tach:47:27: error[type error] expected 'i32', got 'i64' | help: only widening is implicit: convert explicitly | try: k as i32  [in crate::geom::Point::scale]
+geom.tach:47:27: error[type error] expected 'i32', got 'i64' | help: only widening is implicit: convert explicitly | try: k as i32 | try: tachyonc fix --suggested main.tach  [in crate::geom::Point::scale]
 error edit.breaks: 1 new error (1 in crate::geom::Point::scale, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::geom::Point no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: tachyonc refactor field crate::geom::Point --type x i32

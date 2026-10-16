@@ -4,11 +4,11 @@
 // scope, or the `use` that would bring it).
 
 use crate::base::{
-    BUFS, IntVec, SYMS, SYM_COUNT, buf_bytes, buf_new, buf_slice, buf_str, free, intern,
+    BUFS, IntVec, SRC, SYMS, SYM_COUNT, buf_bytes, buf_new, buf_slice, buf_str, free, intern,
 };
 use crate::base::diag::{
-    ERR_HELP, edit_distance, err_begin, err_end, err_failed_name, err_help, err_help_sym, err_str,
-    err_sym, err_try, err_try_tool,
+    ERR_HELP, edit_distance, err_begin, err_end, err_failed_name, err_fix, err_fix_word,
+    err_fixable, err_help, err_help_sym, err_pos, err_str, err_sym, err_try, err_try_tool,
 };
 use crate::front::assoc::ensure_checked;
 use crate::front::ast::{FN_UNSAFE, NODES};
@@ -242,14 +242,19 @@ fn suggest_name(name: i64, value: bool, hint_std: bool) {
             err_help(c"::");
             err_help_sym(name);
             err_help(c";`");
-            err_try_tool("fix --only imports", true);
+            // (0.18: `fix --suggested` adds it, as `fix --only imports`)
+            err_fixable();
             return;
         }
-        let near = nearest_name(name, value);
+        let mut tie = false;
+        let near = nearest_name(name, value, &tie);
         if near >= 0 {
             err_help(c"did you mean '");
             err_help_sym(near);
             err_help(c"'?");
+            if !tie {
+                err_fix_word(err_pos(), SYMS[name].text, SYMS[near].text);
+            }
             return;
         }
         if value && rust_input_help(name) {
@@ -267,6 +272,9 @@ fn suggest_name(name: i64, value: bool, hint_std: bool) {
             err_help(c"did you mean '");
             err_help_sym(in_std.best);
             err_help(c"'?");
+            if !in_std.tie {
+                err_fix_word(err_pos(), SYMS[name].text, SYMS[in_std.best].text);
+            }
             return;
         }
         if in_std.best >= 0 {
@@ -275,6 +283,12 @@ fn suggest_name(name: i64, value: bool, hint_std: bool) {
             err_help(c"'? (`use std::");
             err_help_sym(in_std.best);
             err_help(c";`)");
+            if !in_std.tie {
+                let b = buf_new();
+                buf_str(b, c"std::");
+                buf_bytes(b, SYMS[in_std.best].text);
+                err_fix_word(err_pos(), SYMS[name].text, buf_slice(b));
+            }
             return;
         }
         if hint_std && CUR_MOD != STD_MODULE && SYMS[name].text.len > 2 {
@@ -391,15 +405,19 @@ fn rust_type_help(name: i64) -> bool {
         if text == "String" {
             err_help(c"text is `[u8]`, a slice of bytes (string literals are one); text you build is a `std::Buf` (`Buf::new_in(gpa)`, `b.push_str(s)`, `b.as_slice()` is its `[u8]`)");
             err_try(c"[u8]");
+            rust_type_fix(text, "[u8]");
         } else if text == "str" {
             err_help(c"`&str` and `str` are `[u8]`: a slice of bytes, as string literals are");
             err_try(c"[u8]");
+            rust_type_fix(text, "[u8]");
         } else if text == "char" {
             err_help(c"`u8`: text is bytes, and 'a' is a u8");
             err_try(c"u8");
+            rust_type_fix(text, "u8");
         } else if text == "usize" || text == "isize" {
             err_help(c"`i64`: lengths and indices are i64 (`s.len`, `v.len()`)");
             err_try(c"i64");
+            rust_type_fix(text, "i64");
         } else if text == "HashSet" || text == "BTreeSet" {
             err_help(
                 c"a set is a `std::HashMap<K, bool>` (`m.insert(k, true)`, `m.contains_key(k)`)");
@@ -422,6 +440,19 @@ fn rust_type_help(name: i64) -> bool {
             return false;
         }
         true
+    }
+}
+
+// (0.18) The fix of a Rust type that has one tachyon spelling: the name at
+// the error respelled, with the `&` before it (`&str`, `&String`: `[u8]`).
+fn rust_type_fix(old: [u8], new: [u8]) {
+    unsafe {
+        let pos = err_pos();
+        if pos > 0 && SRC[pos - 1] == '&' && SRC[pos..pos + old.len] == old {
+            err_fix(pos - 1, pos + old.len, new);
+        } else {
+            err_fix_word(pos, old, new);
+        }
     }
 }
 
@@ -455,7 +486,7 @@ fn name_in_scope(name: i64, value: bool) -> bool {
 }
 
 // The name in scope nearest to `name` (see name_distance), or -1.
-fn nearest_name(name: i64, value: bool) -> i64 {
+fn nearest_name(name: i64, value: bool, tie: *bool) -> i64 {
     unsafe {
         let mut near = near_to(name);
         for s in 0..SYM_COUNT {
@@ -463,6 +494,7 @@ fn nearest_name(name: i64, value: bool) -> i64 {
                 near.take(s);
             }
         }
+        *tie = near.tie;
         near.best
     }
 }
@@ -492,11 +524,11 @@ pub fn help_near_item(m: i64, name: i64) {
 const NEAR_NONE: i64 = 1000000;
 
 // The best candidate so far for an unknown name `want`, at distance d.
-pub struct Near { pub want: i64, pub best: i64, pub d: i64 }
+pub struct Near { pub want: i64, pub best: i64, pub d: i64, tie: bool }
 
 // No candidate yet for unknown name `want`.
 pub fn near_to(want: i64) -> Near {
-    Near { want: want, best: -1, d: NEAR_NONE }
+    Near { want: want, best: -1, d: NEAR_NONE, tie: false }
 }
 
 // (0.17) While NEAR_COLLECT: every candidate offered, near or not (an
@@ -603,14 +635,23 @@ impl Near {
                 return false;
             }
             let d = name_distance(SYMS[self.want].text, SYMS[cand].text);
-            d >= 0 && d < self.d
+            // (0.18: as near as the best: a tie, which take notes)
+            d >= 0 && (d < self.d || d == self.d && cand != self.best)
         }
     }
 
     pub fn take(self: *Near, cand: i64) {
         unsafe {
-            self.d = name_distance(SYMS[self.want].text, SYMS[cand].text);
+            let d = name_distance(SYMS[self.want].text, SYMS[cand].text);
+            if d == self.d {
+                // (0.18) another name as near as the best: the help keeps
+                // the first, and there is no fix
+                self.tie = self.tie || SYMS[cand].text != SYMS[self.best].text;
+                return;
+            }
+            self.d = d;
             self.best = cand;
+            self.tie = false;
         }
     }
 
@@ -642,6 +683,10 @@ impl Near {
                 err_help(c"did you mean '");
                 err_help_sym(self.best);
                 err_help(c"'?");
+                // (0.18) the only name that near: the fix renames it
+                if !self.tie {
+                    err_fix_word(err_pos(), SYMS[self.want].text, SYMS[self.best].text);
+                }
             }
         }
     }
