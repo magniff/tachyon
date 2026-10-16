@@ -9,6 +9,7 @@ $ query refs f
 4:8	call	twice	a::f() + x
 8:14	call	main	twice(a::f()) as i32
 $ check
+ok: 0 errors in main.tach
 ## A module's file appears where it is looked for first: another program.
 % printf '\npub fn f() -> i64 {\n    2\n}\n' > a.tach
 $ query def f
@@ -40,6 +41,7 @@ a.tach:3:5: error[type error] expected 'i64', got 'bool'
 [exit 1]
 % rm a.tach
 $ check
+ok: 0 errors in main.tach
 $ query show f
 // crate::a::f	a/mod.tach:1-3	effects: none
 pub fn f() -> i64 {
@@ -58,6 +60,7 @@ $ query refs twice
 3:4	def	fn twice(x: i64) -> i64 {
 8:5	call	main	twice(a::f()) as i32
 $ check
+ok: 0 errors in main.tach
 $ undo
 undid patched crate::twice	main.tach	+1 -1 lines
 $ query show twice

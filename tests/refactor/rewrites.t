@@ -1,5 +1,6 @@
 ## tachyonc rewrite (tests/refactor/rewrites/).
 $ check
+ok: 0 errors in main.tach
 ## A typed hole: only the calls whose $v the checker typed *IntVec.
 $ rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: *IntVec' --dry-run
 --- a/main.tach

@@ -2,6 +2,7 @@
 ## references and calls inside a closure's body, a captured local mapped
 ## back to the local it is, a closure's type never in NEW's signature.
 $ main.tach -o prog
+ok: built prog
 % ./prog; echo "exit $?"
 25
 exit 0
@@ -56,6 +57,7 @@ fn step(k: i64, mut total: i64) -> i64 {
     total
 }
 $ main.tach -o prog
+ok: built prog
 % ./prog
 25
 % "$COMPILER" undo | cut -f1
@@ -80,6 +82,7 @@ fn shift(y: i64, k: i64) -> i64 {
     z
 }
 $ main.tach -o prog
+ok: built prog
 % ./prog
 25
 % "$COMPILER" undo | cut -f1
@@ -113,6 +116,7 @@ fn main() -> i32 {
         z * 2
     }, 2);
 $ main.tach -o prog
+ok: built prog
 % ./prog
 25
 $ fmt --check

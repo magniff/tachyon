@@ -100,7 +100,8 @@ let Some(x) = o;
 ```err
 error[type error] refutable pattern in 'let'
 ```
-`let x = match o { Some(x) => x, None => return 1 };` (no `let else`).
+`let Some(x) = o else { return 1; };` (0.18.1, the else block must
+leave), or `let x = match o { Some(x) => x, None => 0 };`.
 
 ```tach
 let n = 5;
@@ -658,14 +659,19 @@ to a function taking `&mut P`.
 
 ```tach
 struct P { x: i64 }
-fn get(p: *P) -> i64 { p.x }
-fn main() -> i32 { get(&P { x: 1 }) as i32 }
+fn one() -> i64 { 1 }
+fn get(n: i64, p: &P) -> i64 { n + p.x }
+fn main() -> i32 { get(one(), &P { x: one() }) as i32 }
 ```
 ```err
 error[type error] cannot take address of non-lvalue expression
 ```
-`&` takes the address of a place (a variable, a field, an element):
-`let p = P { x: 1 }; get(&p)`.
+`&` takes the address of a place (a variable, a field, an element). Of
+a value, `&f(x)` or `&P { x: 1 }`, it takes a temporary (0.18.1), which
+lives to the end of the block, unless something evaluated before it in
+the statement (`one()` here, a call) could see the difference: then
+name it first, as the `try:` does: `let t = P { x: one() }; get(one(),
+&t)`.
 
 ```tach
 fn factorial(n: i64) -> i64 { if n < 2 { 1 } else { n * factorial(n - 1) } }
@@ -788,6 +794,24 @@ error[own.readonly] cannot write 'p.x': 'p' is '&P', a shared reference
 `p: &mut P`, and `&mut x` at the calls (`tachyonc refactor signature F
 --type p '&mut P'` changes both); a slice: `s: &mut [T]`, passed as
 `v.as_mut_slice()` or `&mut a[..]`. Old code: `tachyonc fix --values`.
+
+```text
+error[type error] expected 'i64', got '&i64' | help: it is a reference: read through it with '*' | try: *n
+error[type error] expected '&i64', got 'i64' | help: the other operand is a reference: read through it with '*' | try: 3 < *n
+```
+(0.18.1) A pattern on a reference (`match e` with `e: &E`) binds
+references, `n: &i64`, as a `sort_by` closure's parameters are: read
+them with `*n`; `fix --suggested` writes it. An index reads through one
+(`keys[n]`).
+
+```text
+error[own.readonly] changes 'v' (Vec<i64>), a copy the match on '*e' (3:11) binds: the change would not reach it, and could free memory it points to
+error[own.readonly] changes 'w' (Vec<i64>), a copy of an element 'vv.get(0)' reads: ...
+```
+(0.18.1) `match *e`, `v.get(i)` and a `for` loop's element give a copy
+of an owned value that stays where it is: read it, do not change it.
+Match the reference instead (`match e` with `e: &mut E` binds `v: &mut
+Vec<i64>`), or change the element in place (`vv[0].push(1)`).
 
 ## At run time
 

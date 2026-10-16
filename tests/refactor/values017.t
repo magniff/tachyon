@@ -8,6 +8,7 @@
 ## code, which the default --values=error rejects: it is built with the
 ## opt-out, 0.16's semantics.)
 $ --values=off main.tach -o prog
+ok: built prog
 % ./prog
 3 3 0 6 0 0 1 9 12
 $ fix --values
@@ -91,6 +92,7 @@ fn ranked(v: &mut Vec<Stats>) {
     sort_by(v.as_slice(), f);
 }
 $ main.tach -o prog
+ok: built prog
 % ./prog
 3 3 0 6 0 0 1 9 12
 $ fix --values

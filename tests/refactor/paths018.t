@@ -4,15 +4,22 @@
 ## ./main.tach, an absolute path, ../main.tach from elsewhere).
 % mkdir elsewhere
 $ main.tach -c -o a.o
+ok: wrote a.o
 $ ./main.tach -c -o b.o
+ok: wrote b.o
 % $COMPILER "$PWD/main.tach" -c -o c.o
+ok: wrote c.o
 % cd elsewhere && $COMPILER ../main.tach -c -o ../d.o
+ok: wrote ../d.o
 % cmp a.o b.o && cmp a.o c.o && cmp a.o d.o && echo identical
 identical
 ## The same with every option that writes positions or file names.
 $ main.tach -g --trace --check-alloc --check-unsafe -c -o ga.o
+ok: wrote ga.o
 % $COMPILER "$PWD/main.tach" -g --trace --check-alloc --check-unsafe -c -o gb.o
+ok: wrote gb.o
 % cd elsewhere && $COMPILER ../main.tach -g --trace --check-alloc --check-unsafe -c -o ../gc.o
+ok: wrote ../gc.o
 % cmp ga.o gb.o && cmp ga.o gc.o && echo identical
 identical
 ## The messages name the file from the root's directory, wherever the
@@ -20,6 +27,7 @@ identical
 % cd elsewhere && $COMPILER ../main.tach -o ../prog && ../prog; echo "exit $?"
 6
 exit 101
+ok: built ../prog
 main.tach:18:16: requires failed: 's.len() > 0' of 'median' (main.tach:6:5): s.len() = 0
 % cd elsewhere && ../prog x y; echo "exit $?"
 6

@@ -48,7 +48,7 @@ use crate::base::timer::{
     TIME_PASSES, T_CHECK, T_CODEGEN, T_IR_BYTES, T_ISEL, T_LOWER, T_OUTPUT, T_PARSE, timer_add,
     timer_now, timer_report,
 };
-use crate::front::ast::{DEFERS, DEFER_LOOPS, NODES, NodeKind, child, init_ast, kids};
+use crate::front::ast::{DEFERS, DEFER_LOOPS, NODES, NodeKind, PAT_DEREF, child, init_ast, kids};
 use crate::front::ast::NodeKind::{CStr, Defer, Fn, Let, PatBind, PatVariant, PatWild};
 use crate::front::cheader::{EMIT_HEADER, emit_c_header};
 use crate::front::check::{LOCALS, check_program};
@@ -81,6 +81,7 @@ use expr::gen_expr;
 use crate::base::diag::{ERR_KIND, flush_warnings};
 use crate::base::target::X86;
 use crate::front::effects::{PRINT_EFFECTS, print_effects};
+use crate::front::patterns::binds_ref;
 use crate::middle::effects_verify::{VERIFY_EFFECTS, verify_effects};
 use crate::middle::trace::trace_after_lowering;
 
@@ -226,7 +227,7 @@ pub fn compile_program(output: *u8) {
                         print_ir_func(ASM, fi);
                     }
                 }
-                buf_write_file(ASM, output);
+                write_dump(ASM, output);
                 return;
             }
             if EMIT_MIR {
@@ -239,7 +240,7 @@ pub fn compile_program(output: *u8) {
                         print_ir_func(ASM, fi);
                     }
                 }
-                buf_write_file(ASM, output);
+                write_dump(ASM, output);
                 return;
             }
         }
@@ -277,6 +278,18 @@ pub fn compile_program(output: *u8) {
         write_output(output);
         timer_add(T_OUTPUT, t);
         timer_report();
+    }
+}
+
+// (0.18.1) An --emit-ir or --emit-mir dump: to stdout when the output is
+// `-` (no -o given), else to the file.
+fn write_dump(b: i64, output: *u8) {
+    unsafe {
+        if output[0] == '-' && output[1] == 0 {
+            buf_write_fd(b, STDOUT);
+        } else {
+            buf_write_file(b, output);
+        }
     }
 }
 
@@ -599,8 +612,12 @@ fn bind(pattern: i64) {
         if NODES[pattern].count == 0 {
             return;
         }
+        if (NODES[pattern].p & PAT_DEREF) != 0 && !is_compound(ty) && !is_void(ty) {
+            // (0.18.1) the accumulator is a reference to a scalar
+            emit_load(ty, R_ACC);
+        }
         // A tuple, or the only variant of an enum: the accumulator is its
-        // address.
+        // address (0.18.1: a compound reference's too).
         push_x0();
         for i in 0..NODES[pattern].count {
             let mut elem_ty = 0;
@@ -614,7 +631,7 @@ fn bind(pattern: i64) {
             }
             emit_peek(R_ACC);
             emit_add_imm(R_ACC, offset);
-            if !is_compound(elem_ty) && !is_void(elem_ty) {
+            if !is_compound(elem_ty) && !is_void(elem_ty) && !binds_ref(child(pattern, i)) {
                 emit_load(elem_ty, R_ACC);
             }
             bind(child(pattern, i));

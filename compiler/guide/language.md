@@ -341,6 +341,45 @@ line per item: `tachyonc guide std#the-api`; each item with its comment:
 `tachyonc guide std#every-item`; one name: `tachyonc guide --find NAME`.
 @STD-API-FULL@
 
+A priority queue is a `BinaryHeap` (the largest first) or a `MinHeap`
+(the smallest first; Rust's `BinaryHeap<Reverse<T>>`), both in the
+prelude (`guide std#heaps-priority-queues`). Dijkstra's shortest paths
+with a MinHeap of (distance, node) pairs:
+
+```tach
+// Dijkstra: the shortest distances from node 0.
+fn main(gpa: Gpa) -> i32 {
+    let n = 5;
+    let mut adj: Vec<Vec<(i64, i64)>> = Vec::new_in(gpa);   // adj[u]: (to, weight)
+    for _ in 0..n {
+        adj.push(Vec::new_in(gpa));
+    }
+    for (u, v, w) in [(0, 1, 4), (0, 2, 1), (2, 1, 2), (1, 3, 1), (2, 3, 5)] {
+        adj[u].push((v, w));
+    }
+    let mut dist: Vec<i64> = Vec::filled_in(n, i64::MAX, gpa);
+    let mut heap: MinHeap<(i64, i64)> = MinHeap::new_in(gpa);  // (distance, node)
+    dist[0] = 0;
+    heap.push((0, 0));
+    while let Some((d, u)) = heap.pop() {      // the nearest first
+        if d > dist[u] {
+            continue;                          // stale: u was reached sooner
+        }
+        for (v, w) in adj[u].iter() {
+            if d + w < dist[v] {
+                dist[v] = d + w;
+                heap.push((d + w, v));
+            }
+        }
+    }
+    println(f"{dist[1]} {dist[2]} {dist[3]} {dist[4] == i64::MAX}");
+    0
+}
+```
+```out
+3 1 4 true
+```
+
 ## Input, output, arguments
 
 std prints and reads stdin: `read_stdin_in(gpa)` (all of it, a
@@ -415,7 +454,7 @@ and linking: `guide c-interop`.
 | `'for' iterates over ... got 'i64'` | a range: `for x in 0..n`; a Vec, a HashMap, `v.iter()` and ranges as values iterate too (0.14) |
 | `expected '[i64]', got '[i64; 3]'` | pass `a[..]` |
 | `expected 'i32', got 'i64'` | `x as i32`: only widening is implicit |
-| `cannot take address of non-lvalue expression` | `&` needs a place: `let p = P { x: 1 }; f(&p)` |
+| `cannot take address of non-lvalue expression` | `&f(x)` is a temporary (0.18.1) unless a call before it in the statement could see the order: name it, `let t = f(x);` then `&t` |
 | `non-exhaustive match: 'E::C' is not covered` | an arm, or `_ =>` |
 | `error[unsafe] calling a C function is unsafe` | `unsafe { ... }` |
 | `undefined variable 'helper' \| help: add 'use ...'` | add the `use` line the help names |

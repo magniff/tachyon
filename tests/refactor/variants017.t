@@ -36,5 +36,6 @@ fn main() -> i32 {
 $ refactor rename Cmd::Move Go
 renamed crate::Cmd::Move to Go	main.tach	+4 -4 lines
 $ check
+ok: 0 errors in main.tach
 $ query type main.tach:16:13
 Cmd	Cmd::Go { y: 2, x: 1 }

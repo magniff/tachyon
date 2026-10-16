@@ -4,6 +4,7 @@
 ## an impl of a trait that declares `&Self` (std's Ord, Eq; Display with
 ## `&mut Fmt`) is spelled so. The output is the same.
 $ --values=off main.tach -o prog
+ok: built prog
 % ./prog
 16 9 shape rect true 10 3 true false $7
 $ fix --values
@@ -68,6 +69,7 @@ fn main() {
         f"{total(&a)} {total(&r)} {a.name()} {r.name()} {a.same(&b)} {twice(&mut fx)} {twice(&mut lv)} {x < y} {x == y} {m}");
 }
 $ main.tach -o prog
+ok: built prog
 % ./prog
 16 9 shape rect true 10 3 true false $7
 $ fix --values

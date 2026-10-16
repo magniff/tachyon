@@ -1,5 +1,6 @@
 ## The tools' fixes of 0.17 (tests/refactor/tools017/).
 $ check
+ok: 0 errors in main.tach
 ## edit delete MODULE: its `mod` line and its file; undo brings both back.
 $ edit delete report
 deleted crate::report	2 files	+0 -5 lines

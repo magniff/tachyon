@@ -39,3 +39,5 @@ error fuzz.usage: the #[fuzz] function to fuzz is needed; usage: tachyonc fuzz N
 % "$COMPILER" main.tach -o plain && "$COMPILER" main.tach --coverage -o counted && ./plain && ./counted
 5
 5
+ok: built plain
+ok: built counted

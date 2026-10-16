@@ -102,9 +102,10 @@ printf '%s\n' $programs compiler/src/main.tach | awk -v w="$WORK/c" '{ print NR 
 compile_one() { # <n> <program>
     d="$WORK/c/$1"
     mkdir -p "$d"
-    "$COMPILER" --diagnostics=human -O2 -S "$ROOT/$2" -o "$d/a.s" >"$d/a.out" 2>&1
+    # (0.18.1: without the success line, which names the output)
+    TACHYON_OK=0 "$COMPILER" --diagnostics=human -O2 -S "$ROOT/$2" -o "$d/a.s" >"$d/a.out" 2>&1
     echo $? >"$d/a.rc"
-    "$COMPILER" --diagnostics=human -O2 -S "$COPY/$2" -o "$d/b.s" >"$d/b.out" 2>&1
+    TACHYON_OK=0 "$COMPILER" --diagnostics=human -O2 -S "$COPY/$2" -o "$d/b.s" >"$d/b.out" 2>&1
     echo $? >"$d/b.rc"
     # (0.17: try: lines start with the compiler as it was run, and name
     # positions as FILE:LINE and `the arm at line N`)

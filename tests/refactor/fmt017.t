@@ -23,3 +23,4 @@ fn main() {
     println(f"{b[0]} {ok} {q.r.x}");
 }
 $ check
+ok: 0 errors in main.tach

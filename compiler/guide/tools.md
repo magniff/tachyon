@@ -15,7 +15,7 @@ small queries.
 ## The loop
 
 1. Write the program; `tachyonc check` (the front end only: fast, every
-   error, one line each). Before writing a construct you are unsure of,
+   error, one line each; `ok: 0 errors in main.tach` when there is none). Before writing a construct you are unsure of,
    `tachyonc guide --find WORDS` or `tachyonc guide TOPIC#SECTION`
    prints the lines on it.
 2. Fix each error: `tachyonc query show FILE:LINE` prints the item at
@@ -23,7 +23,8 @@ small queries.
 3. `tachyonc fix --suggested` when errors have `try: tachyonc fix
    --suggested main.tach` (0.18): their exact fixes, one checked edit,
    then the errors left; `tachyonc fix` for unsafe blocks.
-4. Build and run: `tachyonc main.tach -o prog && ./prog`.
+4. Build and run: `tachyonc main.tach -o prog && ./prog` (a build that
+   works ends with `ok: built prog`).
 
 ## The program
 
@@ -180,4 +181,6 @@ Exit status: 0 done, 1 refused or failed (nothing written), 2 usage.
 aarch64-macos|aarch64-linux|x86_64-linux|x86_64-macos`, `-g` (debug line
 tables), `--trace` (0.17: a failure prints its line and callers),
 `--check-unsafe`, `--check-alloc` (0.16), `--emit-header`,
-`--emit-imports`, `-I DIR`, `--version`. `tachyonc guide TOPIC` for the language.
+`--emit-imports`, `-I DIR`, `--version`; `--emit-ir` and `--emit-mir`
+(the IR after the optimizer, after instruction selection) print to
+stdout, or to `-o FILE`. `tachyonc guide TOPIC` for the language.

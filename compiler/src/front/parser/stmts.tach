@@ -2,11 +2,11 @@
 // a block), with the recovery after a syntax error in a statement; and
 // the patterns of `let`, `match`, `if let` and `for`.
 
-use crate::base::_setjmp;
+use crate::base::{SYMS, _setjmp, alloc_array, free};
 use crate::base::diag::{RECOVER_DEPTH, error_at, recover_enter, recover_leave};
 use crate::front::ast::{
-    FIELD_SHORTHAND, NODES, NodeKind, PAT_FIELDS, PAT_PARENS, PAT_REST, SCRATCH, list_begin,
-    list_end, list_push, new_node,
+    ARM_LET_ELSE, ARM_SYNTHETIC, FIELD_SHORTHAND, NODES, NodeKind, PAT_FIELDS, PAT_PARENS, PAT_REST,
+    SCRATCH, child, list_begin, list_end, list_push, new_node,
 };
 use crate::front::lexer::{TOKS, Tok};
 use crate::front::lexer::Tok::{
@@ -165,9 +165,119 @@ fn parse_let() -> i64 {
         }
         expect(Eq);
         NODES[n].c = parse_expr();
+        if at(Tok::Else) {
+            let_else(n);
+        }
         expect(Semi);
         NODES[n].end = prev_end();
         n
+    }
+}
+
+// (0.18.1) `let PAT = e else { .. };` (n, at the `else`): `let (a, b) =
+// match e { PAT => (a, b), _ => { .. } };` with PAT's bindings (one: `let
+// a`; none: `let _`), the else block an arm that must not end normally
+// (ARM_LET_ELSE). A binding is a name that starts with a lower-case
+// letter or `_`, as Rust's; the nodes made have no text of their own.
+fn let_else(n: i64) {
+    unsafe {
+        let else_at = cur_start();
+        expect(Tok::Else);
+        if NODES[n].b != 0 {
+            error_at(else_at, c"a type on a 'let ... else' pattern is not supported: give the value its type ('e as T', or a typed 'let' before)");
+        }
+        if !at(LBrace) {
+            error_at(cur_start(),
+                c"'let ... else' takes a block: 'let Some(x) = e else { return; };'");
+        }
+        let block = parse_block();
+        let pat = NODES[n].a;
+        let init = NODES[n].c;
+        let at0 = NODES[pat].start;
+        let mark = list_begin();
+        let_else_bindings(pat);
+        let count = SCRATCH.count - mark;
+        let names = alloc_array::<i64>(count + 1);
+        for i in 0..count {
+            names[i] = SCRATCH.data[mark + i];
+        }
+        SCRATCH.count = mark;
+        // The value of the matching arm, and the outer pattern.
+        let mut value = 0;
+        let mut outer = 0;
+        if count == 0 {
+            value = new_node(NodeKind::Unit, at0, at0);
+            outer = new_node(NodeKind::PatWild, at0, at0);
+        } else if count == 1 {
+            value = new_node(NodeKind::Ident, at0, at0);
+            NODES[value].a = NODES[names[0]].a;
+            outer = new_node(NodeKind::PatBind, at0, at0);
+            NODES[outer].a = NODES[names[0]].a;
+            NODES[outer].b = NODES[names[0]].b;
+        } else {
+            value = new_node(NodeKind::Tuple, at0, at0);
+            outer = new_node(NodeKind::PatTuple, at0, at0);
+            let vm = list_begin();
+            for i in 0..count {
+                let id = new_node(NodeKind::Ident, at0, at0);
+                NODES[id].a = NODES[names[i]].a;
+                list_push(id);
+            }
+            list_end(value, vm);
+            let pm = list_begin();
+            for i in 0..count {
+                let b = new_node(NodeKind::PatBind, at0, at0);
+                NODES[b].a = NODES[names[i]].a;
+                NODES[b].b = NODES[names[i]].b;
+                list_push(b);
+            }
+            list_end(outer, pm);
+        }
+        free(names as *u8);
+        let arm = new_node(NodeKind::Arm, NODES[pat].start, NODES[pat].end);
+        NODES[arm].a = pat;
+        NODES[arm].c = value;
+        let other = new_node(NodeKind::Arm, else_at, NODES[block].end);
+        NODES[other].a = new_node(NodeKind::PatWild, else_at, else_at);
+        NODES[other].c = block;
+        NODES[other].p = ARM_LET_ELSE | ARM_SYNTHETIC;
+        let m = new_node(NodeKind::Match, NODES[init].start, NODES[block].end);
+        NODES[m].a = init;
+        let am = list_begin();
+        list_push(arm);
+        list_push(other);
+        list_end(m, am);
+        NODES[n].a = outer;
+        NODES[n].c = m;
+    }
+}
+
+// The bindings of let-else pattern p (PatBind nodes) onto SCRATCH: names
+// that start with a lower-case letter or `_` (the others name constants
+// and variants).
+fn let_else_bindings(p: i64) {
+    unsafe {
+        let k = NODES[p].kind;
+        if k == NodeKind::PatBind {
+            let t = SYMS[NODES[p].a].text;
+            if t.len > 0 && (t[0] >= 'a' && t[0] <= 'z' || t[0] == '_') {
+                list_push(p);
+            }
+            return;
+        }
+        if k == NodeKind::PatOr {
+            if NODES[p].count > 0 {
+                let_else_bindings(child(p, 0));
+            }
+            return;
+        }
+        if k == NodeKind::PatTuple || k == NodeKind::PatVariant {
+            for i in 0..NODES[p].count {
+                let c = child(p, i);
+                let_else_bindings(if NODES[c].kind == NodeKind::FieldInit { NODES[c].b }
+                    else { c });
+            }
+        }
     }
 }
 

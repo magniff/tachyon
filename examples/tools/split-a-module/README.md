@@ -28,6 +28,7 @@ sku  product          stock    price
 3    honey jar            0     8.25
 4    teapot               1    24.00
 takings: 99.58
+ok: built till
 ```
 
 ## 1. Too big, by how much
@@ -185,6 +186,7 @@ other files.)
 ```console
 $ tachyonc main.tach -o till && ./till | diff before.txt - && echo same receipts
 same receipts
+ok: built till
 $ tachyonc fmt --all --check && echo formatted
 formatted
 ```

@@ -202,11 +202,13 @@ applied 2 blocks: replaced crate::roster::enrol; inserted after crate::roster::e
 ```console
 $ tachyonc check && echo no errors
 no errors
+ok: 0 errors in main.tach
 $ tachyonc main.tach -o gradebook && ./gradebook
 Ada     95 A  swing  6, with honours
 Brook   75 C  swing 21
 Cyd     64 D  swing 17
 best: Ada (95); 3 students have 3 scores or more
+ok: built gradebook
 $ git diff --stat
  grades.tach |  6 +++---
  main.tach   |  1 +

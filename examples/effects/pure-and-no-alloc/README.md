@@ -29,6 +29,7 @@ score: 1936
 histogram: 8 0 0 1 1
 peak: Some(950), of none: None
 outliers: [300, 950]
+ok: built samples
 ```
 
 ## What each function may do

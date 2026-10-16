@@ -40,6 +40,7 @@ ada       41
 brian     12
 barbara   17
 3 of 5 rows kept, sorted by value
+ok: built table
 ```
 
 `main.tach` gives each operation a closure within its bound: `|v| v +
@@ -112,6 +113,7 @@ brian     12
 grace     90
 barbara   17
 2 of 5 rows kept, sorted by value
+ok: built table
 ```
 
 ## What the bound is not

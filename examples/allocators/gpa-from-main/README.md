@@ -26,6 +26,7 @@ carol      11.00
 dave       10.00
 6 orders, 3 items, total 28.65
 apples sold: 14
+ok: built orders
 skipped: bob apples one 120
 ```
 
@@ -150,6 +151,7 @@ $ tachyonc fix --only alloc016 old.tach
 fixed 2 allocations made explicit	old.tach	+5 -5 lines
 $ tachyonc old.tach -o old && ./old
 hello! explicit! allocation!
+ok: built old
 ```
 
 It compiles and runs, and frees what it allocated: since 0.17 `words`
@@ -159,6 +161,7 @@ finds nothing left:
 ```console
 $ tachyonc --check-alloc old.tach -o old && ./old
 hello! explicit! allocation!
+ok: built old
 ```
 
 A function that allocates and is not given an allocator cannot make
@@ -190,6 +193,7 @@ $ tachyonc refactor signature count --add 'gpa: Gpa = gpa' --fill-calls count.ta
 added parameter gpa: Gpa to crate::count, 1 call	count.tach	+2 -2 lines
 $ tachyonc count.tach -o count && ./count
 3
+ok: built count
 ```
 
 Nor can a `Gpa` be made, or kept in a static: `Gpa` is `#[sealed]`, so
@@ -227,6 +231,7 @@ line.
 
 ```console
 $ tachyonc --check-alloc main.tach -o orders-checked && ./orders-checked < orders.txt > /dev/null
+ok: built orders-checked
 skipped: bob apples one 120
 ```
 

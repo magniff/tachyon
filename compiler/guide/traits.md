@@ -55,7 +55,7 @@ impl Double for i64 { fn double(self: i64) -> i64 { self * 2 } }
 fn main(gpa: Gpa) -> i32 {
     let sq = Square { side: 3 };
     let r = Rect { w: 2, h: 5 };
-    report(&sq);                          // &place: a temporary has no address
+    report(&sq);                          // or report(&Square { side: 3 }): a temporary
     report(&r);
     let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
     if v > (V2 { x: 0, y: 0 }) { std::print_int(v.x * 10 + v.y); }

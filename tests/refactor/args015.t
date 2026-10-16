@@ -7,6 +7,7 @@
 ## writes a call with labels in the new order; inline puts in labelled
 ## arguments and defaults by parameter.
 $ check
+ok: 0 errors in main.tach
 $ refactor signature area --add 'scale: i64 = 2' --dry-run
 --- a/main.tach
 +++ b/main.tach
@@ -100,3 +101,4 @@ $ refactor signature area --reorder w,depth,h
 reordered the parameters of crate::area, 4 calls	main.tach	+2 -2 lines
 % "$COMPILER" main.tach -o prog && ./prog && echo ran
 ran
+ok: built prog

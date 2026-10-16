@@ -21,5 +21,6 @@ squares 16
 area 14
 7 0
 padded 0 4 9
+ok: built prog
 $ fix --only alloc016
 note fix.none: nothing to fix
