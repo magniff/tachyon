@@ -47,8 +47,205 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.14.0 | `v0.14.0` | 0.13.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | closures and iterators: closures (captures by value or by reference, `move`, `Fn`/`FnMut` bounds, a non-capturing closure is a `fn`, an escape check); associated types; an `Iterator` trait, `for` over anything iterable, ranges as values, std's sources, adapters and consumers, chains compiled to the hand-written loop; std reads stdin (`read_line`, `read_stdin`, `Scanner`), text helpers, values changed in place, an introsort; did-you-mean across the program and std, helps for Rust habits; the tools on a user's program; the agent eval (`tests/agent-eval/`) and its 0.13 baseline |
 | 0.15.0 | `v0.15.0` | 0.14.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | errors, conversions, less boilerplate: `?` on `Option` and `Result`, generic traits, `From`/`Into`, `main` returning `Result`, std's I/O on `Result` with typed errors (`fix --only std015` moves 0.14 code); lossless integer widening and joins, `i64::MAX`; f-strings over `Display` and `Debug`, generic `print`/`format`; `#[derive(Eq, Ord, Hash, Debug, Clone)]`; named and default arguments, field shorthand; `==` on `Vec`, `Buf`, `HashMap` by contents; std loaded by sections; if-conversion, vector masks and min/max reductions, split accumulators, `ldp`/`stp` (iterloop from 2.1 to about 1.05 times C); the tools for agents (`query context`, budgets, std from any program, `try`, `batch`, `edit apply`, merge conflicts, `--json`, the check hook); back end, gen0 and base on closures and iterators; algorithm and tool examples; six harder eval tasks |
 | 0.16.0 | `v0.16.0` | 0.15.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | effects and explicit allocation: inferred effect sets (`alloc(A)`, `io`, `global`, `panic`, `diverge`, `unsafe`) shown by `query effects` (`--why`, `--has`), `#[pure]`/`#[no_alloc]`/`#[no_io]`/`#[no_panic]`/`#[effects(..)]` and `effects(..)` bounds checked transitively (std's `Eq`/`Ord`/`Hash` pure), `--verify-effects`; allocation explicit (`fn main(gpa: Gpa)`, `Vec::new_in(gpa)`, `fix --only alloc016` moves 0.15 code), the `Allocator` trait, `Gpa`, arenas, `arena_scope`, `FixedBuf`, a `Fmt` that never allocates; `#[sealed]` std types, `#[scoped]` arenas; `--check-alloc` (use after free, double free, leaks, arena resets and scopes); pure calls numbered and hoisted, arena allocation without a call; link inputs on the command line (`x.c`, `-l`, `-L`); examples in folders with READMEs, C interop and language tours; the compiler's source on 0.15's features; compiler tasks in the agent eval |
+| 0.17.0 | `v0.17.0` | 0.16.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | memory safety by mutable value semantics: owned values (`Vec`, `Buf`, `HashMap`, `Drop` types, what holds one) move and are dropped at the end of their scope (`Drop`, generated drop glue, drop flags, `.clone()` explicit); references `&T`/`&mut T` and slices split into read-only `[T]` and exclusive `&mut [T]`, second-class: views checked so none outlives or is invalidated under what it views, with inferred view summaries (`views(..)`, `stores(..)`, `#[views]` pins), two-phase receivers and reborrows, no lifetime annotations; `--values=error` the default (`warn`, `report`, `off` for 0.17 only); noalias and read-only facts from reference parameters, NRVO, moves elided in loops; std on values (`Drop` for the containers, `&Self`/`&mut Self` receivers, sorts on `&mut [T]`, `Eq`/`Ord`/`Hash` on `&Self`); `fix --values` and the corpus migrated; `query own`, `query views`, `explain own.*`, tests/own-try; familiar forms (`&mut x`, `v[i]` on Vec and Buf, indexing through a pointer by its type, `p.0`, `len()`, `panic`/`unreachable`, a larger prelude, module paths in code resolved as `use` lines, struct-like enum variants); `fix --suggested`, the `&f` diagnostic; `--trace`, `probe`, `reduce`, `tachyonc test`, `guide debug`; compile speed (per-function IR and pipeline, -O1 leaf inlining, f-strings written in place) |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.17
+
+The design, its decisions, the prototype's measurements and each task's
+notes ("as built") are in docs/design/value-semantics.md; the language
+in docs/grammar.md, "Additions of 0.17: familiar forms" (references,
+moves and drops, std on values, the familiar forms); `tachyonc guide
+memory`, `guide views`, `guide debug`; the optimizer's side in
+docs/optimizer.md, "0.17: value semantics in the optimizer", "0.17:
+compile time" and "0.17: cheaper f-strings"; the eval iterations in
+docs/eval/0.17-iterations.md.
+
+- **Moves and drops**: a value of an owned type (a `Vec`, `Buf`,
+  `HashMap`, a type with `Drop`, a struct, tuple, enum or array holding
+  one) moves on `=`, a by-value argument, `return`, a struct literal's
+  field and a `move` capture; the source is dead until it is assigned
+  again. Values are dropped at the end of their scope, in reverse order,
+  on every exit (`return`, `break`, `continue`, `?`), as implicit defers
+  the checker places: `Drop` (`fn drop(self: &mut Self)`, in the
+  prelude) first, then generated drop glue (field by field, a `match`
+  for enums, a loop for arrays, a `move` closure's captures); a local
+  moved on some paths only carries a drop flag; assigning an owned place
+  drops its old value; a discarded owned temporary drops at the end of
+  its statement. `drop(x)`, `forget(x)` (leaks are safe), `needs_drop::<T>()`,
+  `std::take`, `std::replace`, `T: Copy` for plain types; there is no
+  `Copy` derive: what owns nothing copies, and is `Clone` without an
+  impl. A view type cannot implement `Drop` (`own.drop_view`). Errors:
+  `own.moved` (a use after a move), `own.move_out` (out of an index, a
+  reference, a static or a borrowed binding, including a copy of an
+  owned element out of `get`/`last`/`unwrap`: `try:` `x.take()`,
+  `.clone()`), `own.partial`.
+- **References and views**: `&T` and `&mut T` (`&x`, `&mut x`, both
+  tracked; `let r = &x; r.f` is safe), `&mut [T]` the exclusive slice
+  and `[T]` the read-only one. They are second-class: no lifetimes are
+  written, and the checker (`front/own`, on the typed AST, after effects)
+  keeps every view inside what it views: nothing writes, moves or drops a
+  place while a view or loan of it is used later (`own.conflict`: a push
+  while a slice of the Vec is live, a `for` over `v` pushing to `v`,
+  `f(&mut a, &a)`); no view outlives its owner (`own.escape`); writes
+  through `&T` and `[T]` are `own.readonly`; statics hold only views of
+  constant data and are invalidated by `global` calls (`own.static`).
+  Origins have two levels (what a value views, and what the views it
+  holds view), so a `Vec<[u8]>` of tokens is not a view of itself;
+  `&mut self` receivers are two-phase (`v.push(v.len())`); a `&mut` local
+  passed on is an implicit reborrow; liveness is implicit (a view not
+  used again is no conflict); disjoint fields do not overlap. `==` and
+  `<` on two references compare the values (raw `*T` compare addresses).
+  A non-`mut` `*T` parameter of a safe function is checked as `&mut T`
+  through 0.17 (the legacy rule the compiler's own source relies on),
+  and a `[T]` is accepted where `&mut [T]` is wanted, taking the
+  exclusive loan.
+- **Inferred view summaries**: each function has one, as it has effects:
+  which parameters its result points into (`views(s)`, `views(self)`,
+  `views(*self)`: carries the views `self` holds) and what its `&mut`
+  parameters may come to hold (`stores(word)`), computed callees first
+  over the effects' components (a recursive component to a fixed point),
+  generic results parametric in their type arguments, filtered by type,
+  indirect calls the join of the functions of their type whose address is
+  taken. `#[views(..)]` and `#[stores(..)]` pin one (`own.views` when the
+  body exceeds it). They are why a parser that keeps views of its input
+  checks clean: the first design's one region per signature rejected 3.4%
+  of the eval's functions; summaries reject none of them.
+- **`--values`**: `error` is the default (moves, drops, views and
+  exclusivity are errors, and the optimizer uses them); `warn` and
+  `report` keep 0.16's semantics (no drops) and warn or list; `off` turns
+  the pass off. The opt-outs are for 0.17 only.
+- **The optimizer** (docs/optimizer.md): under `--values=error` a `&mut
+  T`/`&mut [T]` parameter shares no memory with another reference
+  parameter or a static, a `&T`/`[T]` one nothing written through it is
+  read-only, and a reference parameter passed to no call is not written
+  by calls; gvn, licm, slp and the vectorizer use it (`--no-noalias`,
+  `--vec-stats`): the vectorizer's run-time overlap tests go (stencil 4
+  to 0, matmul 2 to 0, 18% and 21% fewer lines), and a kernel of 8
+  streams past the 16-pair limit vectorizes, 2.06 times faster. NRVO
+  builds a returned local in the caller's result; a move in a loop is a
+  copy elided. Drop glue and std's `drop` impls are `#[inline]`, so the
+  drops cost what the hand-written frees did.
+- **std on values**: `Vec`, `Buf` and `HashMap` implement `Drop`
+  (elements dropped when they need it); `free(self)` consumes (`defer
+  v.free()` stays legal and is no longer needed); `v.take()` empties and
+  keeps the allocator; read-only methods take `&Self`, changing ones
+  `&mut Self`; `as_mut_slice`, `s.swap(i, j)`, `v.sort()`, `s.sort()`,
+  `iter_ref`; `sort`, `sort_by` and the stable sorts take `&mut [T]` and
+  move elements as bits (owned elements sort; sort's code 2386 to 1887
+  lines); `Vec::filled_in` clones; `HashMap::get_mut` and
+  `get_or_insert` give `&mut [V]`; `Eq`, `Ord` and `Hash` take `&Self`
+  (derive follows; a 0.16 impl's `*Self` is taken as `&Self`); Scanner,
+  the iterators, split, trim and Fmt are views with pinned summaries.
+- **`tachyonc fix --values`**: a `*T` parameter becomes `&mut T` when
+  the function writes through it (transitively, to a fixed point over
+  the program) else `&T`, and its calls' `&x` `&mut x`; a written slice
+  parameter `&mut [T]` (`v.as_mut_slice()`, `&mut a[..]` at the calls);
+  an owned parameter only read `&T` with `&v` at the calls; `defer
+  x.free()` deleted. It moved 108 of the 380 tests/run programs, 30 of
+  the 39 agent-eval programs, 35 of the 43 examples and 11 of the 20
+  bench programs; the rest by hand (written slice locals, handle copies,
+  bigint's operators, ledger's two `get_mut`). Every tests/run and
+  example case prints what it printed, every bench program gives the
+  same output, check-tasks grades every solution as before, and
+  `--check-alloc` reports fewer leaks (drops free what programs leaked).
+- **For agents**: every `own.*` diagnostic is one line with both
+  positions, a `help:` with the replacement text and `try:` lines that
+  run as they are (`edit patch`, `refactor signature --type v '&Vec<T>'`,
+  `query own`); tests/own-try runs each `try:` of 15 situations (§2.9's
+  six, the rarer conflicts, the agents' patterns that must not be
+  rejected) and checks the program after it. `tachyonc query own
+  FILE:LINE:COL` (each local's kind, where it moved, the views it holds,
+  what invalidated them), `query views NAME|TYPE|MODULE [--why]`,
+  `views:` in `def`, `show` and `context`, `--print-views`, `explain
+  own.*` (every code with its fix), `refactor signature --type` and
+  `refactor field --type` to references, `fmt` on `&&T`.
+- **Familiar forms** (the night of 10-15's agent-efficiency work,
+  measured in docs/eval/0.17-iterations.md; grammar.md "Additions of
+  0.17: familiar forms"): `&mut x`; a larger prelude (`Buf`, `HashMap`,
+  `read_line`, `Scanner`, `trim`, `sort`, `sort_by`, the stable sorts,
+  `parse_int`, `Fmt`, `panic`, `unreachable`, ...; std loaded only where
+  one is used); `panic(msg)` and `unreachable()`, safe, exit 101; `v[i]`,
+  `v[i] = x`, `v[a..b]` on Vec and Buf, checked; `p[i]` on any pointer
+  to a Vec, Buf or slice indexes the pointee, decided by the type as
+  written (safe through a borrow, `unsafe` through a raw pointer, whose
+  error names `(*p)[i]`; `p[0]` on a `*i64` names `*p`); `p.0` through a
+  pointer; `s.len()` on slices and `a.len()` on arrays, `v.len` read as
+  `v.len()`; module paths in code (`lexer::next(..)`, `lexer::Tok { ..
+  }`, patterns) resolved as `use` lines are, beside the module then at
+  the root, `ambiguous module` with both `crate::` paths when they
+  differ; struct-like enum variants (`E::V { a, b }`, in patterns too);
+  `b.push_str(f"..")`; constant range bounds in patterns; Rust labels get
+  their tachyon spelling as `try:`.
+- **Diagnostics with their fix**: name and API errors carry exact `try:`
+  lines (imports, std's function forms, Rust's types, missing match arms
+  to paste, argument lists, conversions); `tachyonc fix --suggested`
+  applies every error's recorded fix as one checked, undoable edit
+  (`--at FILE:LINE`, `--dry-run`); `let f = &factorial;` is "a
+  function's name is already a pointer to it" with `try: factorial`
+  (issue #1), `(*g)(4)` on a fn value `try: g`.
+- **Debugging tools**: `--trace` (a shadow stack: a failed check, a
+  panic, SIGSEGV, SIGALRM, SIGINT print the frames with the statement
+  each runs; about 25% slower when on, nothing when off); `tachyonc probe
+  FILE:LINE EXPR...` (values at a line as the program runs, from copies
+  of the files); `tachyonc reduce FILE --until CMD` (line-based delta
+  debugging); `tachyonc test` (a program's `tests/NAME.in`/`.out` cases,
+  a compact summary within a token budget; in the tachyon tree, failures
+  marked new or failing too); `guide debug` (a five-step recipe).
+- **The tools for agents**: a 2k-token core guide, example-first, and a
+  tiered AGENTS.md; `guide how` recipes, `query similar`, `query
+  examples`; std edited by name (`edit patch std::trim`) with std
+  re-embedded; the hooks rewrite a read of `.tach` source into its query
+  instead of blocking it, a Stop hook checks every program a session
+  touched, the check hook reports new errors as a delta and runs `tachyonc
+  test`; edit, refactor and rewrite fixes from the shortfalls agents
+  recorded in 0.15 and 0.16.
+- **Compile speed** (docs/optimizer.md, "0.17: compile time"): a profile
+  of the self-compile and its hot spots fixed (the returns-twice scan
+  from 32% of -O2 to 1.7%, block layout, dominators, call pieces, fixed
+  intervals, the assembler's parsing); the IR's ids local to each
+  function and a per-function pipeline (each function lowered,
+  optimized, emitted and freed before the next: the prerequisite for
+  per-function arenas and threads in 0.18); -O1 inlines small leaf
+  functions; an f-string passed straight to `print`, `println`,
+  `format_in` or `push_fmt` is written in place, without a closure, an
+  `Interp` instance or a generic instance. Measured in "Benchmarks",
+  0.17 (docs/roadmap.md).
+- **The own pass's cost**: 6.3% of the type checker on the compiler's
+  source, after the checker records what the pass's fast path needs (the
+  checker itself 2% slower for it): about 8.5% over 0.16's checker in
+  all, against the 8% budget. Accepted for 0.17.0; recovering it is a
+  0.17.1 item.
+- **The agent eval**: ten small iterations after the 0.17 validation
+  round (docs/eval/0.17-iterations.md): a ~600-token guide with a
+  read-the-code-first line, the familiar forms (Sonnet's name errors
+  0.57 to 0.14 a run), the query-first hook's rewrites (blocks 21 to 8
+  per 16 runs), indexing through `*Vec` (Sonnet on task 03 from 3.6-4.7
+  to 2.1 times Rust's cost); refuted: a worked program in the prompt.
+  Against Rust, Sonnet is at 1.4 to 1.9 times the cost on these tasks,
+  Haiku at 1.7 to 2.3.
+- **Tested on aarch64 only**, as 0.15 and 0.16 (`gate.sh --with-x86`).
+- **Breaking** (`tachyonc fix --values` moves 0.16 code; what it cannot
+  is an error with the place and `try:` lines):
+  - owned values move: a use after `let w = v`, after passing `v` by
+    value, is `own.moved` (`&v`, `.clone()`); a copy of an owned element
+    out of a Vec, a reference or an accessor is `own.move_out`
+    (`take()`, `clone()`);
+  - views are checked: a slice or reference used after its owner was
+    written, moved or dropped, returned out of the function owning its
+    memory, or two loans of one place in a call, are errors; `--values=warn`
+    is the one-release opt-out;
+  - `&x` is a tracked reference, not a raw `*T` (`let p: *T = &x;` for a
+    raw one); `&x` where `&mut T` is wanted is an error naming `&mut x`;
+  - slices are read-only: writing through a `[T]` parameter is
+    `own.readonly` (`&mut [T]`, `v.as_mut_slice()`);
+  - std: `free` consumes; sorts take `&mut [T]`; `Eq`/`Ord`/`Hash` take
+    `&Self`; `HashMap::get_mut` gives `Option<&mut [V]>`;
+  - `p[i]` on a raw `*Vec<T>`, `*Buf` or `*[T]` indexes the pointee (it
+    was pointer arithmetic), in `unsafe`;
+  - the prelude gains the names above (a program's own `trim`, `sort` or
+    `panic` still hides std's); `views`, `stores` are attributes.
 
 ### What's new in 0.16
 

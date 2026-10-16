@@ -902,6 +902,73 @@ run (off from 0.15). Benchmarks and compile times in "Benchmarks", 0.16.
   f-string passed straight to print/format/push_fmt into direct `Fmt`
   calls, and let -O1 inline small leaf functions
 
+Done (0.17.0). The design (docs/design/value-semantics.md), a prototype
+measured on 7,413 functions (branch c17-proto, §8), Revision 1 after it,
+the user's decisions (U1–U4: Rust's spelling `&T`/`&mut T`, slices split
+into read-only `[T]` and exclusive `&mut [T]`, errors in 0.17.0 with
+`--values=warn` as a one-release opt-out; V1–V3: inferred view
+summaries, an 8% budget for the pass, warnings for summary-only
+conflicts had summaries slipped, which they did not), a Phase 0
+contract, then seven tasks: moves and drops (T1: implicit defers, drop
+glue, drop flags, `own.moved`/`move_out`/`partial`/`drop_view`); views
+and exclusivity (T2: two-level origins, reborrows, two-phase receivers,
+`own.conflict`/`escape`/`static`/`readonly`, the fast path over 4,450 of
+6,586 functions); inferred view summaries (T3: over the effects'
+components, parametric generics, the type filter, `#[views]`/`#[stores]`,
+`query views`); std on values (T4); the optimizer (T5: noalias and
+read-only facts from reference parameters, NRVO, moves elided in loops);
+the tools (T6: `query own`, `explain own.*`, `fix --values`,
+tests/own-try); the migration (T7: `fix --values` over tests, examples,
+bench and the eval, `--values=error` the default). Also in 0.17, in
+parallel: compile speed, part 1 (the profile, function-local IR ids, the
+per-function pipeline, -O1 leaf inlining, f-strings written in place);
+the night of 10-15's agent-efficiency work (the familiar forms, `fix
+--suggested`, the debugging tools, the 2k core guide, the hooks;
+docs/eval/0.17-iterations.md); the `&factorial` diagnostic (issue #1);
+struct-like enum variants. Decided at integration: implicit drops only
+under `--values=error`; the own pass's cost at about 8.5% of 0.16's
+checker (the pass 6.3% of the checker, the checker 2% slower for the
+record that makes it so) against the 8% budget, accepted for 0.17.0.
+Not done: the compiler's source on effect annotations (0.16), with the
+compiler's move to value semantics in 0.18.
+
+Moved to 0.17.1:
+- the own pass's cost back under the 8% budget (at least 0.5%: a cheaper
+  per-function record, or std's instances skipped);
+- projections: `-> &T`, `-> &mut T`, references as type arguments,
+  `HashMap::get_mut -> Option<&mut V>`, `iter_mut`, `&T` binding types
+  (a `for` over `next()`, a match through a reference); `&&mut T` parsed;
+- written-static sets in effects and summaries naming statics
+  (`views(TYPES)`), stores into statics through calls, `&S` passed to a
+  `global` function;
+- arena handles as references (`Vec<T, &Arena>`, safe `reset` and
+  `free_all`, `Drop` for Arena, `fix --only alloc017`; U3), `FixedBuf`
+  views, allocators named by value in effects (`alloc(a)`, 0.16's U2);
+- the drops T1 left: owned temporaries other than `e;` (method
+  receivers, `let _ = e`, f-string holes: leaks, safe), by-value closure
+  parameters, an assignment through an index (leaks the old value, safe),
+  the error for calling `x.drop()`;
+- the checks T7 left: `extend_from_slice` on owned elements (clone under
+  `T: Clone`), a `Vec<[u8]>` element from `iter()` viewing the Vec
+  (XFAIL own_iter_elem_views), `v.as_slice()[0] = x` and `&mut s[..]` of
+  a read-only `s` as own.readonly, a closure parameter's call as a legacy
+  `self: *Self` store, a Vec made on an allocator copied out of `*p`;
+  why-chains through locals and matches, the type filter on stores,
+  `query own`'s state gaps, closures/escape.tach folded into the own pass;
+- `fix --values`: written slice locals (`as_mut_slice()`, 45 of the eval
+  solutions' 92 errors), `&mut *c` for a `&T` local, a slice passed to C;
+- the optimizer: noalias scopes through inlining (per-instruction tags),
+  a moved argument passed by the caller's slot without its copy;
+- `*T` parameters deprecated (a warning) ahead of 0.18 making them raw,
+  and per-target `stores`, if the evals ask for it;
+- a small focused eval of 0.17's value rules: of the 0.16-era eval
+  solutions as agents wrote them, 14 of 18 are rejected under the new
+  default (written `[T]` in 9 tasks, handle moves, views of leaked Bufs,
+  ledger's two `get_mut`, legacy `*T` conflicts);
+- open for the user, V4 (design §7): what `mut p: *T` parameters mean
+  under references (raw as today, a rebindable `&mut T`, rejected in safe
+  code, or 0.18's all-raw rule).
+
 ## 0.18: contracts and verification in the language
 
 - `requires` / `ensures` / `invariant`: checked at run time (a violation

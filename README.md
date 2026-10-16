@@ -245,17 +245,20 @@ checks every release; `-g` writes DWARF line tables.
 ## Status
 
 Tachyon is at 0.x: the language is not stable, and minor releases may
-break programs (with a `tachyonc fix` migration from 0.14 on). Release
-0.12 reorganizes the compiler's own source into folders by phase, no
-file over 1,000 lines, with the compiler's own refactoring commands,
-proven output-identical by `same-output`. Next:
+break programs (with a `tachyonc fix` migration from 0.14 on). The
+current release is 0.17.0: memory safety by mutable value semantics
+(owned values move and are dropped at the end of their scope, references
+and slices are checked with inferred view summaries and no lifetime
+annotations, `tachyonc fix --values` migrates 0.16 code), on 0.16's
+effects and explicit allocators. See [docs/releases.md](docs/releases.md)
+for every release. Next:
 
-- **0.13**: the tools, improved from what 0.12's reorganization recorded
-- **0.14**: the agent eval as a release gate; closures and iterators
-- **0.15**: `?` on `Result`/`Option`, lossless widening, `From`/`Into`, `derive`, interpolation
-- **0.16**: inferred, declarable effects (`#[pure]`, `#[no_alloc]`); explicit allocators
-- **0.17**: memory safety by mutable value semantics (moves, destructors)
-- **0.18**: contracts (`requires`, `ensures`), `test` blocks, property and fuzz tests
+- **0.17.1**: references as results and type arguments, arena handles as
+  references, the rest of 0.17's value-semantics items
+- **0.18**: contracts (`requires`, `ensures`), `test` blocks, property and fuzz tests;
+  the compiler's own source on value semantics and arenas; code generation on threads
+- **0.19 to 0.23**: `std::arch` intrinsics, collections, text and I/O,
+  concurrency, GPU support, windows and a terminal emulator on std
 
 **Toward 1.0.** 1.0 is not a feature milestone. It ships when the
 surface language has been reworked against real programs, the tools
