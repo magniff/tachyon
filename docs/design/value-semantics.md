@@ -323,7 +323,7 @@ fn rehash(self: &mut Table) {
 ```text
 table.tach:2:15: error[own.move_out] cannot move 'self.keys' (Vec<Entry>) out of '*self': 'rehash' borrows 'self'
   help: take it out and leave an empty Vec in its place, or iterate over it by reference
-  try: tachyonc edit patch table.tach:2 --old 'self.keys' --new 'std::take(&mut self.keys)'
+  try: tachyonc edit patch table.tach:2 --old 'self.keys' --new 'self.keys.take()'
 ```
 
 **3. A view used after its owner changed** (G1: the 3 intended tests, the 35 reports of index_order, std_self_append).

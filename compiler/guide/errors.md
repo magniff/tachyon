@@ -761,7 +761,8 @@ signature total --type v '&Vec<i64>' --default '&$v'` changes both.
 ```text
 error[own.move_out] cannot move 'self.keys' (Vec<Entry>) out of '*self': 'rehash' borrows 'self'
 ```
-`let old = std::take(&mut self.keys);` (leaves an empty Vec), or loop
+`let old = self.keys.take();` (leaves an empty Vec on the same
+allocator; `std::take(&mut x)` for a `Default` value), or loop
 over `self.keys` by reference.
 
 ```text

@@ -36,6 +36,7 @@ use crate::front::ast::{
 };
 use crate::front::check::{LOCALS, Res};
 use crate::front::lexer::Tok;
+use crate::front::modules::STD_MODULE;
 use crate::front::own::{calls, fast, moves, views};
 use crate::front::own::kinds::{
     P_MUT, P_MUT_VIEW, P_RAW, P_SHARED, P_VALUE, P_VIEW, is_owned_type, is_view_type, param_mode,
@@ -418,6 +419,11 @@ fn eval_list(n: i64, ctx: i64, dst: i64) {
     }
 }
 
+// The call whose value may be a borrowed copy (drops::borrowed_call)
+// without an error: a `let`'s or a `match`'s, a raw or C argument, the
+// receiver of `unwrap` and the like (eval_let, eval_match, eval_call).
+static mut BORROW_OK: i64 = 0;
+
 // Evaluates expression n (0: none); ctx says whether its value is moved;
 // dst (an origin value, or -1) gets the views it holds.
 pub fn eval(n: i64, ctx: i64, dst: i64) {
@@ -469,7 +475,16 @@ pub fn eval(n: i64, ctx: i64, dst: i64) {
                 }
             }
             NodeKind::Assign => eval_assign(n),
-            NodeKind::Call => eval_call(n, dst),
+            NodeKind::Call => {
+                let ok = BORROW_OK == n;
+                eval_call(n, dst);
+                if ctx == CX_MOVE && !ok && FNS[CUR_F].module != STD_MODULE
+                    && crate::front::own::drops::borrowed_call(n) {
+                    // (a copy of an element a collection keeps, moved:
+                    // returned, stored, passed by value)
+                    crate::front::own::moves::borrowed_move(n);
+                }
+            }
             NodeKind::Block => eval_block(n, ctx, dst),
             NodeKind::If => {
                 eval(NODES[n].a, CX_READ, -1);
@@ -560,12 +575,30 @@ fn eval_place_value(n: i64, ctx: i64, dst: i64) {
             return;
         }
         if !is_place_expr(n) {
-            // (a field of a call's result: the value's)
+            // (a field of a call's result: the value's; an element of a
+            // collection a call views, `v[i]` of a Vec (`v.as_slice()[i]`),
+            // or what a call's reference points to, moved: own.move_out)
+            // (a raw pointer's `p[i]`, `*p`: unsafe code's bitwise read)
+            if ctx == CX_MOVE && is_owned_type(t) && (NODES[n].p & NODE_RAW) == 0 {
+                let k = NODES[n].kind;
+                if k == NodeKind::Index {
+                    crate::front::own::moves::move_out_value(n, MO_INDEX);
+                } else if k == NodeKind::Unary
+                    || k == NodeKind::FieldAccess && NODES[n].y == 1 {
+                    crate::front::own::moves::move_out_value(n, MO_DEREF);
+                }
+            }
             eval(NODES[n].a, ctx, dst);
             return;
         }
         let p = place_of(n);
         if p < 0 {
+            // (`v[i]` of a Vec through a reference: no place, a copy of an
+            // element the Vec keeps)
+            if ctx == CX_MOVE && is_owned_type(t) && NODES[n].kind == NodeKind::Index
+                && (NODES[n].p & NODE_RAW) == 0 {
+                crate::front::own::moves::move_out_value(n, MO_INDEX);
+            }
             return;
         }
         if ctx == CX_MOVE && is_owned_type(t) {
@@ -667,6 +700,7 @@ fn eval_match(n: i64, ctx: i64, dst: i64) {
             }
         }
         let v = new_ov();
+        BORROW_OK = NODES[n].a;
         eval(NODES[n].a, if moves { CX_MOVE } else { CX_READ }, v);
         let entry = new_state();
         copy_state(entry, CUR);
@@ -868,6 +902,12 @@ fn eval_let(s: i64) {
             return;
         }
         let v = new_ov();
+        // (not the assignment desugaring's `let __own_new = rhs;`: what it
+        // binds is stored)
+        if !(pat != 0 && NODES[pat].kind == NodeKind::PatBind
+            && SYMS[NODES[pat].a].text == "__own_new") {
+            BORROW_OK = init;
+        }
         eval(init, ctx, v);
         bind(pat, v);
         POOL_TOP = v;
@@ -971,13 +1011,14 @@ fn eval_call(n: i64, dst: i64) {
                 ev_read(pl, arg);
                 pend_push(PK_RAW, -1, o, arg, mode);
             } else {
-                eval(arg, CX_MOVE, o);
-                if mode == P_VALUE && !c_callee && crate::front::own::drops::drops_on()
-                    && crate::front::own::drops::borrowed_call(arg)
-                    && !crate::front::own::drops::borrowed_call(n) {
-                    // (`out.push(v.get(i))`: a copy the collection keeps)
-                    crate::front::own::moves::borrowed_move(arg);
+                // (a borrowed copy, `v.get(i)`, moves only into a raw or
+                // C parameter, or as the receiver of `unwrap` and the like:
+                // `out.push(v.get(i))` is own.move_out, eval)
+                if mode != P_VALUE || c_callee
+                    || i == 0 && crate::front::own::drops::borrowed_call(n) {
+                    BORROW_OK = arg;
                 }
+                eval(arg, CX_MOVE, o);
                 let mut kind = PK_NONE;
                 if c_callee || mode == P_RAW {
                     kind = PK_RAW;
