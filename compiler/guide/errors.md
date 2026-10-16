@@ -100,7 +100,8 @@ let Some(x) = o;
 ```err
 error[type error] refutable pattern in 'let'
 ```
-`let x = match o { Some(x) => x, None => return 1 };` (no `let else`).
+`let Some(x) = o else { return 1; };` (0.18.1, the else block must
+leave), or `let x = match o { Some(x) => x, None => 0 };`.
 
 ```tach
 let n = 5;

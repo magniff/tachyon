@@ -1665,6 +1665,33 @@ attribute += "test" | "property" | "fuzz" | "cfg" "(" "test" ")" ;
   type of its own) and ignores the invariants and clauses (T1 checks
   them).
 
+## Additions of 0.18.1
+
+```ebnf
+let_stmt += "let" pattern "=" expr "else" block ";" ;     (* let-else *)
+```
+
+- **let-else.** `let PAT = e else { ... };` binds PAT's variables for the
+  rest of the block when e matches; else the block runs and must not end
+  normally (`return`, `break`, `continue`, a call that never returns). It
+  is `let (a, b) = match e { PAT => (a, b), _ => { ... } };`, so a
+  binding is a name that starts with a lower-case letter or `_` (others
+  name constants and variants). The pattern takes no type.
+- **Patterns on references** (Rust's default binding modes): see
+  [Patterns](#patterns).
+- **Temporaries.** `&e` of a value (a call's result, a literal, an
+  operator's) takes a temporary: a local named by e's text, declared
+  before the statement and dropped at the end of the block (Rust's
+  lifetime extension for `let r = &f(x);`). It is made where nothing
+  evaluated before it in the statement (a call, an assignment, an index,
+  the other side of `&&`/`||`, a closure, a loop's condition) could tell
+  the difference; a literal of literals anywhere. Elsewhere `&e` is
+  `cannot take address of non-lvalue expression`, whose `try:` names the
+  value first. `&e` of a slice value is still the slice; where `&[T]` is
+  expected, the temporary's reference (`cmp_of(&a.text(), &b.text())`).
+- **An index** may be a reference to an integer (`keys[a]` with `a:
+  &i64`, a `sort_by` closure's parameter): it is read through.
+
 ## Importing C headers
 
 `import "stdio.h" as c;` *(0.4; `as`: 0.5, required since 0.8)* reads a C
