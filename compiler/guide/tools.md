@@ -181,4 +181,6 @@ Exit status: 0 done, 1 refused or failed (nothing written), 2 usage.
 aarch64-macos|aarch64-linux|x86_64-linux|x86_64-macos`, `-g` (debug line
 tables), `--trace` (0.17: a failure prints its line and callers),
 `--check-unsafe`, `--check-alloc` (0.16), `--emit-header`,
-`--emit-imports`, `-I DIR`, `--version`. `tachyonc guide TOPIC` for the language.
+`--emit-imports`, `-I DIR`, `--version`; `--emit-ir` and `--emit-mir`
+(the IR after the optimizer, after instruction selection) print to
+stdout, or to `-o FILE`. `tachyonc guide TOPIC` for the language.
