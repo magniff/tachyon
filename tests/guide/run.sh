@@ -296,7 +296,8 @@ else
 fi
 cut -f 1 "$WORK/list" >"$WORK/topics"
 while IFS= read -r t; do
-    if "$COMPILER" guide "$t" >"$WORK/topic-$t.md" 2>"$WORK/topic-$t.err" && [ -s "$WORK/topic-$t.md" ] \
+    # (0.18.1: --whole, a topic past its first page, as --all prints it)
+    if "$COMPILER" guide "$t" --whole >"$WORK/topic-$t.md" 2>"$WORK/topic-$t.err" && [ -s "$WORK/topic-$t.md" ] \
         && [ ! -s "$WORK/topic-$t.err" ]; then
         split_blocks "$WORK/topic-$t.md" "$t"
     else
@@ -377,25 +378,34 @@ else
     result FAIL guide-std "query items std failed:" "$(cat "$WORK/std/items")"
 fi
 
-# (0.17) `guide std` itself is the index: a line per item, the receiver
+# (0.17) `guide std` whole is the index: a line per item, the receiver
 # as `Self`, no comments, nothing of std's own workings, within about
 # 4k tokens (under the 30000 characters an agent's shell shows whole;
-# 0.18: 18500 bytes, for the assertions, Arbitrary and Gen, NonNull);
-# std#every-item is not in it. Its first screen (what `| head -60`
-# shows) is the most used names, then the overview.
+# 0.18: 18500 bytes, for the assertions, Arbitrary and Gen, NonNull;
+# 0.18.1: 20000, its first page longer and no longer read by default);
+# std#every-item is not in it. (0.18.1) `guide std` alone is its first
+# page: the most used names and where the rest is (std#the-api), 4500
+# bytes at most (the 0.18 eval's agents read all 18k of it before
+# writing a line).
+"$COMPILER" guide std >"$WORK/std-page.md" 2>&1
 size=$(wc -c <"$WORK/topic-std.md" | tr -d ' ')
-if [ "$size" -le 18500 ] \
-    && head -60 "$WORK/topic-std.md" | grep -q '^## The most used$' \
-    && head -60 "$WORK/topic-std.md" | grep -qF 'Vec::new_in(gpa) -> Vec<T>' \
-    && head -60 "$WORK/topic-std.md" | grep -q '^## Overview$' && grep -qF 'fn push(self: &mut Self, x: T)' "$WORK/topic-std.md" \
+page=$(wc -c <"$WORK/std-page.md" | tr -d ' ')
+if [ "$size" -le 20000 ] && [ "$page" -le 4500 ] \
+    && head -1 "$WORK/std-page.md" | grep -q '^# std$' \
+    && grep -q '^## The most used$' "$WORK/std-page.md" \
+    && grep -qF 'Vec::new_in(gpa) -> Vec<T>' "$WORK/std-page.md" \
+    && grep -qF 'tachyonc guide std#the-api' "$WORK/std-page.md" \
+    && ! grep -q '^## Overview$' "$WORK/std-page.md" && ! grep -q '@PAGE-END@' "$WORK/std-page.md" "$WORK/topic-std.md" \
+    && grep -q '^## Overview$' "$WORK/topic-std.md" && grep -qF 'fn push(self: &mut Self, x: T)' "$WORK/topic-std.md" \
     && grep -qF 'fn split_in<A: Allocator>(s: [u8], sep: u8, a: A) -> Vec<[u8], A>' "$WORK/topic-std.md" \
+    && "$COMPILER" guide 'std#the-api' 2>&1 | grep -qF 'fn push(self: &mut Self, x: T)' \
     && ! grep -q '^## Every item' "$WORK/topic-std.md" \
     && ! grep -qF 'fn __' "$WORK/topic-std.md" \
     && ! grep -qF 'live_blocks' "$WORK/topic-std.md" \
     && grep -q '^## Every item with its comment$' "$WORK/std/every.md"; then
     result pass guide-std-index
 else
-    result FAIL guide-std-index "tachyonc guide std is $size bytes (18500 at most), or not the index (most used first)"
+    result FAIL guide-std-index "tachyonc guide std --whole is $size bytes (20000 at most), its first page $page (4500 at most), or not the index (most used first, then std#the-api)"
 fi
 
 # The guide by piece (0.15): --find prints the paragraphs about the
