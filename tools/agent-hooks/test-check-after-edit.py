@@ -165,6 +165,16 @@ try:
           "try: tachyonc fix --only alloc016 main.tach   (1 of the errors)"])
     case("report: one fix for all", hook.report(u, "main.tach", None).split("\n")[1],
          "try: tachyonc fix --only unsafe main.tach   (all of them)")
+    # (0.18) `fix --suggested` first, named once, never run by the hook
+    sg = [dict(diag("main.tach", i, "undefined variable 'totl'"),
+               **{"try": ["tachyonc fix --suggested main.tach"]}) for i in (3, 8)]
+    lines = hook.report(u + sg + [diag("main.tach", 9, "bad")], "main.tach", None).split("\n")
+    case("report: fix --suggested first", lines[:3],
+         ["tachyonc check main.tach: 5 errors",
+          "try: tachyonc fix --suggested main.tach   (2 of the errors: their exact fixes, one checked edit)",
+          "try: tachyonc fix --only unsafe main.tach   (2 of the errors)"])
+    case("report: fix --suggested not on its errors", lines[5],
+         "main.tach:3:5: error[type error] undefined variable 'totl'")
     case("report: other try lines stay on their error", hook.fix_commands(
         [dict(diag("m.tach", 1, "x"), **{"try": ["use std::HashMap;", "target/tools/tachyonc fix --only imports m.tach"]})]),
          [("target/tools/tachyonc fix --only imports m.tach", 1)])

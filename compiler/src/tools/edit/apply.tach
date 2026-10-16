@@ -16,7 +16,7 @@ use crate::tools::edit::{
     REMOVED, SHOW, TARGET_NAME, edit_new_file, gone_path, move_files, new_texts, remove_empty_dirs,
     sorted_edits,
 };
-use crate::tools::edit::breaks::report_breaks;
+use crate::tools::edit::breaks::{on_changed_line, report_breaks};
 use crate::tools::edit::diff::{diff_moved, diff_texts, shown_path};
 use crate::tools::edit::undo::journal;
 use crate::tools::proc::{
@@ -108,6 +108,7 @@ fn check_edited(root: *u8, added: *IntVec) -> bool {
         if status != 0 && status != 1 {
             return false;
         }
+        EDITED_ERRORS = out;
         let mut now = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         error_lines(buf_slice(out), &now);
         let used = crate::base::alloc_array::<bool>(old.count / 2 + 1);
@@ -160,6 +161,38 @@ fn check_run(root: *u8, edited: bool, out: i64) -> i64 {
         args.push(root as i64);
         args.push(0);
         run_capture(args.data as **u8, out)
+    }
+}
+
+// (0.18) `fix --suggested`: new errors on no line the edit wrote do not
+// refuse it (the fixes let the checker reach them); the edited program's
+// errors are printed after the summary (EDITED_ERRORS: check's output on
+// the edited program, a buffer).
+pub static mut LEFT_OK: bool = false;
+static mut EDITED_ERRORS: i64 = -1;
+
+// The errors left in the edited program, one per line, then `note
+// fix.left`; nothing when it checks clean.
+fn errors_left() {
+    unsafe {
+        if EDITED_ERRORS < 0 {
+            return;
+        }
+        let mut lines = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        error_lines(buf_slice(EDITED_ERRORS), &lines);
+        let n = lines.count / 2;
+        if n == 0 {
+            return;
+        }
+        let out = buf_new();
+        for i in 0..n {
+            buf_bytes(out, buf_slice(lines.data[2 * i + 1]));
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDOUT);
+        let d = diag(c"note", c"fix.left");
+        buf_int(d, n);
+        buf_str(d, if n == 1 { c" error left (above)\n" } else { c" errors left (above)\n" });
     }
 }
 
@@ -460,6 +493,19 @@ pub fn finish_edit(what: [u8], root: *u8) -> i64 {
             }
             imports_note(rounds);
         }
+        // (0.18: fix --suggested) new errors only on lines the edit did
+        // not write: the fixes let the checker reach them
+        if LEFT_OK && checked && added.count > 0 && !NO_CHECK {
+            let mut caused = 0;
+            for i in 0..added.count {
+                if on_changed_line(buf_slice(added.data[i])) {
+                    caused += 1;
+                }
+            }
+            if caused == 0 {
+                added.count = 0;
+            }
+        }
         if !checked {
             let d = diag(c"warning", c"edit.unchecked");
             buf_str(d, c"the edited program could not be checked (");
@@ -509,6 +555,9 @@ pub fn finish_edit(what: [u8], root: *u8) -> i64 {
         buf_write_fd(summary, STDOUT);
         if SHOW {
             show_changes(buf_slice(diff));
+        }
+        if LEFT_OK && checked {
+            errors_left();
         }
         if ok { 0 } else { 1 }
     }

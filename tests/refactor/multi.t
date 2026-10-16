@@ -147,7 +147,7 @@ try: tachyonc refactor rename crate::shapes::area surface
 try: tachyonc edit replace area --no-check
 [exit 1]
 $ edit patch area < $T/inputs/multi_area_bool.pairs
-main.tach:16:18: error[type error] expected 'bool', got 'i64' | help: a condition is a bool: compare (`x != 0`); bitwise not is `~x` | try: describe(kind(r)) != 0  [in crate::main]
+main.tach:16:18: error[type error] expected 'bool', got 'i64' | help: a condition is a bool: compare (`x != 0`); bitwise not is `~x` | try: describe(kind(r)) != 0 | try: tachyonc fix --suggested main.tach  [in crate::main]
 error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
 note edit.together: change crate::main in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
 try: tachyonc query show crate::main
@@ -170,7 +170,7 @@ try: tachyonc query show crate::main
 try: tachyonc edit patch scale --old 'scale(r: Rect, k: i64)' --new 'scale(k: i64, r: Rect)' --no-check
 [exit 1]
 $ edit patch scale --old 'k: i64' --new 'k: i32'
-main.tach:15:40: error[type error] expected 'i32', got 'i64' | help: only widening is implicit: convert explicitly | try: k as i32  [in crate::main]
+main.tach:15:40: error[type error] expected 'i32', got 'i64' | help: only widening is implicit: convert explicitly | try: k as i32 | try: tachyonc fix --suggested main.tach  [in crate::main]
 error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::shapes::scale no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: tachyonc refactor signature crate::shapes::scale --type k i32 --default '$k as i32'
@@ -179,7 +179,7 @@ try: tachyonc query show crate::main
 try: tachyonc edit patch scale --old 'k: i64' --new 'k: i32' --no-check
 [exit 1]
 $ edit patch scale --old 'k: i64' --new 'k: i32' --old 'r.w * k, h: r.h * k' --new 'r.w * k as i64, h: r.h * k as i64'
-main.tach:15:40: error[type error] expected 'i32', got 'i64' | help: only widening is implicit: convert explicitly | try: k as i32  [in crate::main]
+main.tach:15:40: error[type error] expected 'i32', got 'i64' | help: only widening is implicit: convert explicitly | try: k as i32 | try: tachyonc fix --suggested main.tach  [in crate::main]
 error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::shapes::scale no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
 try: tachyonc refactor signature crate::shapes::scale --type k i32 --default '$k as i32'

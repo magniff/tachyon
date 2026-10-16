@@ -35,7 +35,7 @@ $ edit patch main::extern --old 'puts' --new 'fputs' --dry-run
 @@ -15 +15 @@
 -    fn puts(s: *u8) -> i32;
 +    fn fputs(s: *u8) -> i32;
-main.tach:23:9: error[type error] undefined variable 'puts' | help: did you mean 'fputs'?  [in crate::main]
+main.tach:23:9: error[type error] undefined variable 'puts' | help: did you mean 'fputs'? | try: tachyonc fix --suggested main.tach  [in crate::main]
 warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change) (dry run)
 [exit 1]
 $ edit patch calc::extern --old 'a' --new 'b'

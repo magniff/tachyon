@@ -4,13 +4,13 @@
 // and paths (`a::b::c`) resolved to what they name.
 
 use crate::base::{
-    BUFS, FILES, IntVec, SRC, SYMS, SYM_COUNT, alloc_array, buf_bytes, buf_new, buf_slice, buf_str,
-    grow, intern_c, sym_table, sym_text,
+    BUFS, FILES, IntVec, SRC, SYMS, SYM_COUNT, alloc_array, buf_bytes, buf_fmt, buf_new, buf_slice,
+    buf_str, grow, intern_c, sym_table, sym_text,
 };
 use crate::base::diag::{
-    ERR_HELP, buf_position, err_begin, err_end, err_end_soft, err_failed_name, err_fmt, err_help,
-    err_help_fmt, err_help_sym, err_str, err_sym, err_try, err_try_fmt, err_try_tool, error_at,
-    fail_name,
+    ERR_HELP, buf_position, err_begin, err_end, err_end_soft, err_failed_name, err_fix, err_fixable,
+    err_fmt, err_help, err_help_fmt, err_help_sym, err_str, err_sym, err_try, err_try_fmt,
+    err_try_tool, error_at, fail_name, fix_at_ok,
 };
 use crate::front::ast::{NODES, NodeKind, child};
 use crate::front::check::{PROGRAM, SELF_SYM, Try, attempt, name_error};
@@ -367,7 +367,8 @@ fn help_make_public(key: i64, name: i64) {
         }
         err_help(c"` at ");
         buf_position(ERR_HELP, start);
-        err_try_tool("fix --only pub", true);
+        // (0.18: `fix --suggested` adds it, as `fix --only pub`)
+        err_fixable();
     }
 }
 
@@ -390,7 +391,10 @@ fn child_module_key(key: i64) -> bool {
 // The error for a binding that cannot be used: private, or (0.6) brought
 // by two `*` imports.
 pub fn access_error(b: i64, pos: i64, name: i64) -> ! {
-    note_private(b);
+    // (0.18: `fix --suggested --at FILE:LINE`, the error at that line)
+    if fix_at_ok(pos) {
+        note_private(b);
+    }
     if b == B_AMBIGUOUS {
         unsafe {
             name_error(pos, c"'", name, c"' is ambiguous: more than one '*' import brings it (import it by name, or write its path)");
@@ -912,8 +916,11 @@ fn use_line_try(entry: i64, path: i64, prefix: [u8]) {
         while e > at && SRC[e - 1] != ';' {
             e -= 1;
         }
-        buf_bytes(t, SRC[at..if e > at { e } else { NODES[node].end }]);
+        let stop = if e > at { e } else { NODES[node].end };
+        buf_bytes(t, SRC[at..stop]);
         err_try_fmt(buf_slice(t));
+        // (0.18) the fix: the line so written
+        err_fix(NODES[node].start, stop, buf_slice(t));
     }
 }
 
@@ -957,6 +964,10 @@ fn help_unknown_module(m: i64, name: i64, path: i64, entry: i64) {
                 // (a type or a literal's path: the module imported, as
                 // module_as_path_error's for an expression)
                 err_try_fmt(f"use {buf_slice(full)}::{sym_text(name)};");
+                // (0.18) the fix: the path from the crate's root
+                buf_str(full, c"::");
+                buf_bytes(full, SYMS[name].text);
+                path_fix(if path > 0 { NODES[path].start } else { -1 }, name, buf_slice(full));
             }
             return;
         }
@@ -989,7 +1000,23 @@ pub fn module_as_path_error(m: i64, name: i64, at: i64) {
         err_help_fmt(
             f"'{sym_text(name)}' is the module crate::{key}; a path starts in the module it is written in: import it, or write `crate::{key}::...`");
         err_try_fmt(f"use crate::{key};");
+        // (0.18) the fix: the path from the crate's root
+        let full = buf_new();
+        buf_fmt(full, f"crate::{key}");
+        path_fix(at, name, buf_slice(full));
         err_end()
+    }
+}
+
+// (0.18) The fix of a path whose first segment, module `name` at `at`
+// (-1: unknown), is written from the crate's root: `full` in its place.
+fn path_fix(at: i64, name: i64, full: [u8]) {
+    unsafe {
+        let text = SYMS[name].text;
+        if at < 0 || SRC[at..at + text.len] != text || SRC[at + text.len] != ':' {
+            return;
+        }
+        err_fix(at, at + text.len, full);
     }
 }
 
