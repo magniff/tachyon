@@ -31,6 +31,11 @@
 // process's), --stats, --verify-ir, the IR printers.
 
 use crate::host_target;
+use crate::back::codecache::{
+    CC_ON, R_STATIC, cc_component_begin, cc_component_end, cc_emit_begin, cc_emit_end, cc_note,
+    cc_of, cc_phase, cc_scalar_begin, cc_scalar_cleanup_end, cc_scalar_end,
+    cc_scalar_simplify_begin,
+};
 use crate::back::dwarf::DEBUG_INFO;
 use crate::back::emit::function::emit_task;
 use crate::back::emit::stats::STATS;
@@ -54,7 +59,7 @@ use crate::middle::ipo::infer_component_attrs;
 use crate::middle::ir::{FN_IR, IRFUNCS, IRFUNC_COUNT, Op, ir_enter, ir_release};
 use crate::middle::ir::verify::{PRINT_AFTER_ALL, VERIFY_IR};
 use crate::middle::opt::{
-    PER_FUNCTION, cleanup_function, optimize_component_function, simplify_function,
+    OPT_LEVEL, PER_FUNCTION, cleanup_function, optimize_component_function, simplify_function,
 };
 use crate::middle::threads::{
     POOL_CONTEXTS, POOL_CTX, POOL_THREADS, pool_run, pool_run_joined, pool_start, pool_stop,
@@ -221,7 +226,7 @@ const CHUNKS: i64 = 1024;
 // Per IR function: the constant data made while it was optimized (its
 // own task writes it).
 static mut FN_CONSTS: *ConstList = 0 as *ConstList;
-const OWNER_SHIFT: i64 = 20;
+pub const OWNER_SHIFT: i64 = 20;
 
 // The id of constant data `bytes` made by function fi's pipeline: in
 // serial code its id (gen0::add_const_data); in a task a placeholder,
@@ -277,6 +282,30 @@ pub fn const_data_bytes(id: i64) -> [u8] {
             return str_at(id);
         }
         let p = pending(id);
+        (*p).data[0..(*p).len]
+    }
+}
+
+// (0.18.1, back::codecache) The alignment of constant data `id` a task
+// made (a placeholder).
+pub fn const_data_align(id: i64) -> i64 {
+    unsafe { (*pending(id)).align }
+}
+
+// (back::codecache) The constant data function fi's tasks made so far
+// (its own task, or a phase after).
+pub fn const_data_count(fi: i64) -> i64 {
+    unsafe { FN_CONSTS[fi].count }
+}
+
+// (back::codecache) Function fi's k-th constant data: its bytes, and its
+// phase, rank and alignment in *phase, *rank, *align.
+pub fn const_data_entry(fi: i64, k: i64, phase: *i64, rank: *i64, align: *i64) -> [u8] {
+    unsafe {
+        let p = &FN_CONSTS[fi].chunks[k / CHUNK][k % CHUNK];
+        *phase = (*p).phase;
+        *rank = (*p).rank;
+        *align = (*p).align;
         (*p).data[0..(*p).len]
     }
 }
@@ -383,6 +412,10 @@ static mut ITEMS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 pub fn run_task(mut cx: *FnCtx, kind: i64, task: i64) {
     unsafe {
         if FRESH_CONTEXTS {
+            // (the code cache's state, kept: fnctx_new_with)
+            if CC_ON {
+                cc_of(cx);
+            }
             cx = fresh_context(cx);
         }
         begin_task(cx);
@@ -391,23 +424,43 @@ pub fn run_task(mut cx: *FnCtx, kind: i64, task: i64) {
         } else {
             let fi = ITEMS.data[task];
             cx.task_rank = task;
+            // (0.18.1: -O2's cleanup and scalar pipeline from the code cache;
+            // -O1's cleanup alone costs less than its entry)
+            let scalar = CC_ON && OPT_LEVEL >= 2;
             if kind == K_CLEANUP {
                 cx.task_phase = P_CLEANUP;
-                ir_enter(cx, fi);
-                cleanup_function(cx, fi);
+                if !scalar || !cc_scalar_begin(cx, fi, task) {
+                    ir_enter(cx, fi);
+                    cleanup_function(cx, fi);
+                    if scalar {
+                        cc_scalar_cleanup_end(cx, fi);
+                    }
+                }
             } else if kind == K_SIMPLIFY {
                 cx.task_phase = P_SIMPLIFY;
-                ir_enter(cx, fi);
-                simplify_function(cx, fi);
+                if !scalar || !cc_scalar_simplify_begin(cx, fi, task) {
+                    ir_enter(cx, fi);
+                    simplify_function(cx, fi);
+                    if scalar {
+                        cc_scalar_end(cx, fi);
+                    }
+                }
             } else {
-                emit_task(cx, fi, task);
-                let t = &FN_TEXT[fi];
-                let out = buf_slice(cx.asm);
-                (*t).len = out.len as i64;
-                (*t).data = alloc_zeroed((*t).len + 1);
-                memcpy((*t).data, out.ptr, out.len as u64);
-                (*t).labels = cx.label_count;
-                buf_clear(cx.asm);
+                // (0.18.1: its text from the code cache, back::codecache)
+                let cached = CC_ON && FN_LIVE[fi] != 0;
+                if !cached || !cc_emit_begin(cx, fi, task) {
+                    emit_task(cx, fi, task);
+                    let t = &FN_TEXT[fi];
+                    let out = buf_slice(cx.asm);
+                    (*t).len = out.len as i64;
+                    (*t).data = alloc_zeroed((*t).len + 1);
+                    memcpy((*t).data, out.ptr, out.len as u64);
+                    (*t).labels = cx.label_count;
+                    buf_clear(cx.asm);
+                    if cached {
+                        cc_emit_end(cx, fi, task);
+                    }
+                }
             }
         }
         ir_release(cx);
@@ -536,6 +589,7 @@ fn run_functions(mut cx: *FnCtx, kind: i64, first: i64, end: i64) {
 // Every live function's cleanup (-O1, -O2).
 pub fn cleanup_all(mut cx: *FnCtx) {
     unsafe {
+        cc_phase(K_CLEANUP);
         ITEMS.count = 0;
         for fi in 0..IRFUNC_COUNT {
             if FN_LIVE[fi] != 0 {
@@ -584,8 +638,8 @@ static mut COMP_LEVEL: *i64 = 0 as *i64;
 static mut LEVEL_COUNT: i64 = 0;
 // Per component: what its inlining added to the program's size, and the
 // callees it inlined (one entry per call); its task writes them.
-static mut COMP_GROWTH: *i64 = 0 as *i64;
-static mut COMP_INLINED: *IntVec = 0 as *IntVec;
+pub static mut COMP_GROWTH: *i64 = 0 as *i64;
+pub static mut COMP_INLINED: *IntVec = 0 as *IntVec;
 
 // Builds the components and their levels (main thread).
 fn build_components(mut cx: *FnCtx) {
@@ -674,6 +728,7 @@ fn callees_and_addresses(mut cx: *FnCtx, fi: i64, out: *IntVec) {
 pub fn optimize_components(mut cx: *FnCtx) {
     unsafe {
         build_components(cx);
+        cc_phase(K_COMPONENT);
         // The components of each level, in SCC_ORDER.
         let mut by_level = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let start = alloc_array::<i64>(LEVEL_COUNT + 2);
@@ -725,6 +780,11 @@ fn run_component(mut cx: *FnCtx, c: i64) {
         cx.task_phase = P_COMPONENT;
         let start = COMP_START[c];
         let end = COMP_END[c];
+        // (0.18.1: its outputs from the code cache, back::codecache)
+        if CC_ON && cc_component_begin(cx, c, start, end) {
+            cx.cur_comp = -1;
+            return;
+        }
         for i in start..end {
             cx.task_rank = i;
             optimize_component_function(cx, SCC_ORDER.data[i]);
@@ -737,6 +797,9 @@ fn run_component(mut cx: *FnCtx, c: i64) {
         for m in 0..cx.comp_dec.count {
             COMP_INLINED[c].push(cx.comp_dec.data[m]);
         }
+        if CC_ON {
+            cc_component_end(cx, c, start, end);
+        }
         cx.cur_comp = -1;
     }
 }
@@ -747,6 +810,8 @@ fn run_component(mut cx: *FnCtx, c: i64) {
 // (FN_ATTRS_DONE, which in the phase says only which happen to be done).
 pub fn fn_facts_ready(mut cx: *FnCtx, g: i64, done: bool) -> bool {
     unsafe {
+        // (0.18.1: what the task saw of g, for the code cache)
+        cc_note(cx, R_STATIC, g);
         if cx.cur_comp < 0 {
             return done;
         }
@@ -755,11 +820,22 @@ pub fn fn_facts_ready(mut cx: *FnCtx, g: i64, done: bool) -> bool {
     }
 }
 
+// (back::codecache) The component of IR function g in the bottom-up
+// phase (-1: none, or another phase).
+pub fn comp_of(g: i64) -> i64 {
+    unsafe {
+        if COMP_OF == 0 as *i64 {
+            return -1;
+        }
+        COMP_OF[g]
+    }
+}
+
 // ---- Emission ----
 
 // Per IR function: its text (emit_task's), its local labels.
-struct FnText { data: *u8, len: i64, labels: i64 }
-static mut FN_TEXT: *FnText = 0 as *FnText;
+pub struct FnText { data: *u8, len: i64, labels: i64, relocs: *i64, nrelocs: i64 }
+pub static mut FN_TEXT: *FnText = 0 as *FnText;
 
 // Emits the functions in `order` (IR functions, program order): those
 // before `split` first, then the rest (-O1's small leaves, which the
@@ -773,6 +849,7 @@ pub fn emit_functions(mut cx: *FnCtx, order: *IntVec, split: i64) {
             ITEMS.push((*order).data[i]);
         }
         JOIN_CX = cx;
+        cc_phase(K_EMIT);
         emit_range(cx, 0, split);
         emit_range(cx, split, ITEMS.count);
         phase_time(c"emission, join and assembly");
@@ -814,16 +891,19 @@ pub fn join_task(i: i64) -> bool {
             number_consts(fi);
         }
         if (*t).len > 0 {
-            if !consts_numbered((*t).data, (*t).len) {
+            if !consts_numbered(t) {
                 return false;
             }
-            join_text(JOIN_CX, (*t).data, (*t).len);
+            join_text(JOIN_CX, t);
             JOIN_CX.label_count += (*t).labels;
             asm_flush(JOIN_CX);
         }
         free((*t).data);
+        free((*t).relocs as *u8);
         (*t).data = 0 as *u8;
         (*t).len = 0;
+        (*t).relocs = 0 as *i64;
+        (*t).nrelocs = 0;
         true
     }
 }
@@ -840,9 +920,12 @@ fn number_consts(fi: i64) {
     }
 }
 
-// Whether every constant a text names (str.\x02<n>) has its id.
-fn consts_numbered(text: *u8, len: i64) -> bool {
+// Whether every constant a text names (str.\x02<n>, or str.\x03<i> with
+// the code cache: its relocs[i]) has its id.
+fn consts_numbered(t: *FnText) -> bool {
     unsafe {
+        let text = (*t).data;
+        let len = (*t).len;
         let mut at = next_marker(text, 0, len, 2);
         while at < len {
             let mut j = at + 1;
@@ -856,20 +939,32 @@ fn consts_numbered(text: *u8, len: i64) -> bool {
             }
             at = next_marker(text, j, len, 2);
         }
+        for i in 0..(*t).nrelocs {
+            if const_data_id((*t).relocs[i]) < 0 {
+                return false;
+            }
+        }
         true
     }
 }
 
 // Appends a task's text to cx's assembly: L\x01<n> becomes L<n + the
-// labels before>, str.\x02<n> the constant's id.
-fn join_text(mut cx: *FnCtx, text: *u8, len: i64) {
+// labels before>, str.\x02<n> the constant's id, str.\x03<i> (with the
+// code cache) the id of the text's string or constant i.
+fn join_text(mut cx: *FnCtx, t: *FnText) {
     unsafe {
+        let text = (*t).data;
+        let len = (*t).len;
         let base = cx.label_count;
         let mut i = 0;
         let mut one = next_marker(text, 0, len, 1);
         let mut two = next_marker(text, 0, len, 2);
+        let mut three = if (*t).nrelocs > 0 { next_marker(text, 0, len, 3) } else { len };
         while i < len {
-            let at = if one < two { one } else { two };
+            let mut at = if one < two { one } else { two };
+            if three < at {
+                at = three;
+            }
             if at >= len {
                 buf_bytes(cx.asm, text[i..len]);
                 return;
@@ -884,6 +979,16 @@ fn join_text(mut cx: *FnCtx, text: *u8, len: i64) {
             if text[at] == 1 {
                 buf_int(cx.asm, base + n);
                 one = next_marker(text, j, len, 1);
+            } else if text[at] == 3 {
+                if n >= (*t).nrelocs {
+                    die(c"internal error: a text names a string it has not");
+                }
+                let id = const_data_id((*t).relocs[n]);
+                if id < 0 {
+                    die(c"internal error: constant data without an id");
+                }
+                buf_int(cx.asm, id);
+                three = next_marker(text, j, len, 3);
             } else {
                 let id = const_data_id(-(n + 1));
                 if id < 0 {
