@@ -2365,11 +2365,33 @@ used ones (32 MB at least). When the directory's packs pass
 `$TACHYON_CACHE_LIMIT` MB (1024), the least recently used go. A build
 that used every entry and made none only marks the pack used.
 
-**Off:** `--no-cache` or `--cache=off`; at -O0; with -g, `--trace`,
+**Run-time numbers.** A check's site (front/contracts/sites.tach) and
+its kind past the four fixed ones (an enum's, a contract's message) are
+numbers the run-time helper reads, made in the front end's order: an
+edit that added a check anywhere moved every later one, and the code of
+every later function with a check changed. They are RTID values in the
+IR (`middle::ir::ir_rtid`, a contract's site literal too: `INT_SITE`),
+named by their function and place (`FN_RTIDS`), which no edit elsewhere
+changes; emission writes a load of one as the line `\x04REG,INDEX`, and
+the join writes the load (`m_load_imm`) of the program's number for it,
+given in the order the join meets them (`gen0::target::rt_output`);
+`emit_runtime` writes the tables in that order. -O0 keeps the front end's
+numbers.
+
+**Off:** `--no-cache` or `--cache=off`, or `$TACHYON_CODE_CACHE=off` (the
+tools' cache as it is); a program whose live functions have fewer than
+8000 instructions as lowered, unless `--cache=on` (a 7-line program with
+std has 1405: its build at -O1 takes 6 ms, the cache's start, the
+compiler's hash and the pack, 4 ms more; examples/calc, 3321, 7.3 ms
+and 8.0; examples/closures-iterators, 8230, 10.6 and 10.5 at -O1, 36 and
+13 at -O2); at -O0; with -g, `--trace`,
 `--time-passes`, `--stats`, the IR and register printers and checkers,
 profiles, `--check-alloc`, `--check-unsafe`, `--coverage`,
 `--verify-effects`, `--print-checks`, `--emit-ir`, `--emit-mir`,
-`--vec-stats`, and any option the cache does not know.
+`--vec-stats`, and any option the cache does not know. tests/run.sh
+runs without it (`TACHYON_CODE_CACHE=off` unless set), and so do the
+gate's steps but `incremental` and `suite-O2` (a smoke row, its cache in
+the run's directory, removed after).
 `$TACHYON_CACHE_STATS` prints each kind's hits and misses (new, a read
 changed, unreadable, not cacheable); `$TACHYON_CACHE_WHY` (with `-j1`)
 each miss and the read that changed; `$TACHYON_CACHE_CHECK` reads every
@@ -2378,7 +2400,8 @@ component entry back as it is made and compares the IR.
 **The same bytes.** `tests/incremental.sh` (the gate's `incremental`
 step, also in `--quick`): the compiler's own source (10 seeded edits and
 the 6 most recent commits to compiler/src of at most 60 lines that still
-undo, each undone and redone), the examples and bench (4 edits each), at
+undo, each undone and redone), the examples and bench (4 edits each, with
+`--cache=on`), at
 -O1 and -O2, with -j1 and -j8: a cold build with the cache must be the
 object a build without it makes, then after each edit the rebuild with
 the cache must be the clean build's object, then the tree put back
@@ -2386,7 +2409,8 @@ the cache must be the clean build's object, then the tree put back
 a `let x = N;` made N + 1 (a function's code), a new `let` of a new
 string (every later string and symbol id moves), a comment line (every
 later check's position in the file), a new function (every later
-function id). `tests/threads.sh` runs without the cache (-jN would take
+function id), a new `let` indexing an array (a new check: every later
+check's site). `tests/threads.sh` runs without the cache (-jN would take
 -j1's outputs).
 
 **Measured** (aarch64-macos, the compiler's self-compile `-c`, best of
@@ -2410,23 +2434,29 @@ assembly, the data) are about 360 ms: the design's goal (at most 0.4 s
 after one edit) needs the front end's (out of T8's scope) and the
 assembler's per function. The suite runs 6% slower with the cache on
 (its programs are small; the compiler's own builds write 76 MB packs),
-and its packs take about 450 MB.
+and its packs took about 450 MB; it now runs without the cache.
 
 The 12 most recent commits to compiler/src that undo cleanly, undone one
-at a time (-O2 -j8, 6549 scalar, 6111 component and 5247 emission
-tasks): 7 rebuild in 0.51 to 0.56 s with 1 to 32 tasks of each kind
-missing; 4 add or remove a run-time check, which renumbers the checks
-after it (0.18's site ids, in lowering order, a constant in the code:
-std's functions, lowered last, always), and about 415 components miss
-(0.56 to 0.67 s); 1 changes a struct's fields, and every entry misses
-(0.90 s, a cold build).
+at a time (-O2 -j8, 6553 scalar, 6115 component and 5256 emission
+tasks): 11 rebuild with 0 to 34 tasks of a kind missing; 1 changes a
+struct's fields, and every entry misses (a cold build). Before the
+run-time numbers were RTID values, the 4 of them that add or remove a
+check missed about 415 components each (every later function with a
+check, std's always).
+
+The serial parts of the -O2 -j8 rebuild with nothing changed (ms, load
+6 to 8): the front end 140 (parsing 27, checking 104, effects 6, own 10;
+std's is checked lazily: a 7-line program's front end takes 1.5), lowering
+55, interprocedural constants and the components 60, dead functions 40,
+the join 16 and the assembler 87 (the main thread, beside the emission's
+tasks), the data and the output 27: about 425 of the 580. The next steps
+for rebuild latency: per-function assembly (T7's, whose bytes the cache
+would keep instead of the text: the 87), the front end's own
+incrementality (the 195 of parsing, checking and lowering), and the call
+graph's counts kept between phases (dead functions recounts every
+call).
 
 **What is left.**
-- *Site ids.* A check's site id is a global number in the code; an edit
-  that adds one moves every later one, and the functions holding them
-  (std's, and every function that inlined one) miss. Numbering a
-  function's sites from 1 in its own text and putting the ids at the
-  join (as constant data) would keep them.
 - *Types.* An edit that adds, removes or changes a type (a new tuple, a
   closure, a struct's fields) misses everything: the key holds every
   type's id and description. A type's id is its place in creation

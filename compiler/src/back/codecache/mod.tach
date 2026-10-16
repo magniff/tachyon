@@ -40,7 +40,7 @@ use crate::back::codecache::pack::{
 use crate::back::codecache::snapshot::{
     ByteBuf, IRCopy, Ids, Reader, Rel, bb_new, decode_ir, encode_ir, free_copy, get_bytes,
     get_count, get_s, get_u, ids_free, put_bytes, put_s, put_u, rel_add_source, rel_clear, rel_fn,
-    rel_new, rel_saddr, rel_str_source,
+    rel_new, rel_rtid, rel_saddr, rel_str_source,
 };
 use crate::back::dwarf::DEBUG_INFO;
 use crate::back::emit::stats::STATS;
@@ -104,6 +104,16 @@ extern "C" {
 pub static mut CC_FLAG: i64 = 0;
 // Whether this compilation uses the cache (cc_begin).
 pub static mut CC_ON: bool = false;
+
+// The size of the program's code below which the cache is off without
+// --cache=on: its live functions' instructions as lowered. A 7-line
+// program with std has 1405 (a build at -O1 6 ms, the cache's start 4 ms
+// more: the compiler's hash, the pack); examples/calc 3321 (-O1 7.3 ms,
+// 8.0 with the cache), examples/closures-iterators 8230 (-O1 10.6 ms,
+// 10.5; -O2 36 ms, 13); the compiler 716164.
+const MIN_INSTS: i64 = 8000;
+// The size of this program's, for $TACHYON_CACHE_STATS.
+static mut PROGRAM_INSTS: i64 = 0;
 // The command line's hash (cc_args), and whether it has an option the
 // cache does not know (then it is off).
 static mut ARGS_H: u64 = 0;
@@ -220,7 +230,12 @@ pub fn cc_args(argc: i64, argv: **u8) {
 // change the IR outside the tasks' view, and a directory for it.
 fn cc_wanted() -> bool {
     unsafe {
-        CC_FLAG >= 0 && !ARGS_UNKNOWN && OPT_LEVEL >= 1 && !DEBUG_INFO && !TIME_PASSES && STATS == 0
+        let env = getenv(c"TACHYON_CODE_CACHE");
+        // ($TACHYON_CODE_CACHE=off: the code cache off, the tools' cache as
+        // it is; tests/run.sh's default)
+        let off = env != 0 as *u8 && streq(env, c"off");
+        CC_FLAG >= 0 && !off && !ARGS_UNKNOWN && OPT_LEVEL >= 1 && !DEBUG_INFO && !TIME_PASSES
+            && STATS == 0
             && !VERIFY_IR && !PRINT_AFTER_ALL && !PRINT_REGALLOC && !VERIFY_REGALLOC
             && PRINT_CHECKS == 0 as *u8 && !EMIT_IR && !EMIT_MIR && !PRINT_ATTRS && !TRACE
             && PROFILE_USE == 0 as *u8 && PROFILE_GENERATE == 0 as *u8 && !CHECK_ALLOC_MODE
@@ -326,7 +341,16 @@ const SLOTS_PER_FN: i64 = 3;
 pub fn cc_begin() {
     unsafe {
         CC_ON = false;
-        if !cc_wanted() || IRFUNC_COUNT == 0 {
+        // A program whose code is small compiles in less than the cache takes
+        // to start (the compiler's hash, the pack): without it, unless
+        // --cache=on.
+        PROGRAM_INSTS = 0;
+        for fi in 0..IRFUNC_COUNT {
+            if FN_LIVE[fi] != 0 {
+                PROGRAM_INSTS += IRFUNCS[fi].t.inst_count;
+            }
+        }
+        if (PROGRAM_INSTS < MIN_INSTS && CC_FLAG <= 0) || !cc_wanted() || IRFUNC_COUNT == 0 {
             return;
         }
         let dir = cache_dir();
@@ -505,7 +529,7 @@ fn report() {
         if getenv(c"TACHYON_CACHE_STATS") != 0 as *u8 {
             let b = crate::base::buf_new();
             let kinds = [c"scalar", c"components", c"emission"];
-            crate::base::buf_str(b, c"code cache:");
+            crate::base::buf_fmt(b, f"code cache ({PROGRAM_INSTS} instructions):");
             for k in 0..3 {
                 let o = 6 * k;
                 crate::base::buf_fmt(b,
@@ -1004,6 +1028,24 @@ fn put_tables(cc: *CcCtx, b: *ByteBuf) {
             put_s(b, FN_NAMEH[f]);
             put_s(b, if FN_AMBIG[f] { f } else { -1 });
         }
+        // (RTID values: a function of the task by its place, another by its
+        // symbol; the place among its values)
+        put_u(b, (*rel).rtids.count as u64);
+        for i in 0..(*rel).rtids.count {
+            let v = (*rel).rtids.data[i];
+            let owner = v >> 20;
+            let mut member = -1;
+            for j in 0..(*cc).members.count {
+                if (*cc).members.data[j] == owner {
+                    member = j;
+                }
+            }
+            put_s(b, member);
+            if member < 0 {
+                put_s(b, ir_nameh(owner));
+            }
+            put_u(b, (v & 1048575) as u64);
+        }
     }
 }
 
@@ -1105,6 +1147,19 @@ fn get_tables(cc: *CcCtx, r: *Reader, irs: *IntVec, ids: *Ids) -> bool {
                 return false;
             }
             (*ids).fns[i] = f;
+        }
+        let nt = get_count(r);
+        (*ids).rtids = alloc_array::<i64>(nt + 1);
+        (*ids).nrtids = nt;
+        for i in 0..nt {
+            let member = get_s(r);
+            let owner = if member >= 0 && member < m { member_fn(cc, member) }
+                else if member < 0 { ir_of_name(get_s(r)) } else { -1 };
+            let k = get_u(r) as i64;
+            if owner < 0 || k < 0 || k > 1048575 {
+                return false;
+            }
+            (*ids).rtids[i] = (owner << 20) | k;
         }
         !(*r).bad
     }
@@ -1254,7 +1309,7 @@ fn check_component(mut cx: *FnCtx, cc: *CcCtx, start: i64, end: i64) {
         get_u(&r);
         let mut irs = read_irs(cc);
         let mut ids = Ids { strs: 0 as *i64, nstrs: 0, consts: 0 as *i64, nconsts: 0,
-            syms: 0 as *i64, nsyms: 0, fns: 0 as *i64, nfns: 0 };
+            syms: 0 as *i64, nsyms: 0, fns: 0 as *i64, nfns: 0, rtids: 0 as *i64, nrtids: 0 };
         let name = crate::base::sym_name(FNS[IRFUNCS[SCC_ORDER.data[start]].f].name);
         if !get_tables(cc, &r, &irs, &ids) {
             eprintln(f"code cache check: {crate::base::cstr(name)}: tables do not read back");
@@ -1358,7 +1413,7 @@ fn component_hit(mut cx: *FnCtx, cc: *CcCtx, e: i64, c: i64, start: i64, end: i6
         let mut irs = (*cc).reads;
         (*cc).reads = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut ids = Ids { strs: 0 as *i64, nstrs: 0, consts: 0 as *i64, nconsts: 0,
-            syms: 0 as *i64, nsyms: 0, fns: 0 as *i64, nfns: 0 };
+            syms: 0 as *i64, nsyms: 0, fns: 0 as *i64, nfns: 0, rtids: 0 as *i64, nrtids: 0 };
         let mut result = OUT_BAD;
         if get_tables(cc, &r, &irs, &ids) {
             result = component_install(cx, cc, &r, &ids, c, start, end);
@@ -1679,6 +1734,10 @@ pub fn cc_emit_end(mut cx: *FnCtx, fi: i64, task: i64) {
             put_u(out, rel_saddr(&(*cc).rel, (*cc).relocs.data[i]) as u64);
         }
         put_consts(out, fi, (*cc).consts_before.data[0], 0);
+        put_u(out, (*t).nrtids as u64);
+        for i in 0..(*t).nrtids {
+            put_u(out, rel_rtid(&(*cc).rel, (*t).rtids[i]) as u64);
+        }
         free(irs.data as *u8);
         if !store(cc, E_EMIT, fi) {
             OUT_EMIT[fi] = OUT_POISON;
@@ -1700,7 +1759,7 @@ fn emit_hit(mut cx: *FnCtx, cc: *CcCtx, e: i64, fi: i64, task: i64) -> i64 {
         let mut irs = (*cc).reads;
         (*cc).reads = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut ids = Ids { strs: 0 as *i64, nstrs: 0, consts: 0 as *i64, nconsts: 0,
-            syms: 0 as *i64, nsyms: 0, fns: 0 as *i64, nfns: 0 };
+            syms: 0 as *i64, nsyms: 0, fns: 0 as *i64, nfns: 0, rtids: 0 as *i64, nrtids: 0 };
         let mut result = OUT_BAD;
         if get_tables(cc, &r, &irs, &ids) {
             result = emit_install(cx, &r, &ids, fi, task);
@@ -1737,8 +1796,16 @@ fn emit_install(mut cx: *FnCtx, r: *Reader, ids: *Ids, fi: i64, task: i64) -> i6
             let mut n = 0;
             get_bytes(r, &n);
         }
-        if (*r).bad {
+        // (its RTID values, after: the text's loads of them)
+        let nt = get_count(r);
+        let rtids = alloc_array::<i64>(nt + 1);
+        for k in 0..nt {
+            rtids[k] = crate::back::codecache::snapshot::ids_at((*ids).rtids, (*ids).nrtids,
+                get_u(r) as i64, &bad);
+        }
+        if (*r).bad || bad {
             free(relocs as *u8);
+            free(rtids as *u8);
             return OUT_BAD;
         }
         (*r).at = nc_at;
@@ -1763,6 +1830,8 @@ fn emit_install(mut cx: *FnCtx, r: *Reader, ids: *Ids, fi: i64, task: i64) -> i6
         (*t).labels = labels;
         (*t).relocs = relocs;
         (*t).nrelocs = nr;
+        (*t).rtids = rtids;
+        (*t).nrtids = nt;
         crate::middle::ir::ir_free_func(cx, fi);
         OUT_HIT
     }
@@ -1922,7 +1991,7 @@ fn scalar_hit(mut cx: *FnCtx, cc: *CcCtx, e: i64, fi: i64, task: i64) -> i64 {
         let mut irs = (*cc).reads;
         (*cc).reads = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let mut ids = Ids { strs: 0 as *i64, nstrs: 0, consts: 0 as *i64, nconsts: 0,
-            syms: 0 as *i64, nsyms: 0, fns: 0 as *i64, nfns: 0 };
+            syms: 0 as *i64, nsyms: 0, fns: 0 as *i64, nfns: 0, rtids: 0 as *i64, nrtids: 0 };
         let mut result = OUT_BAD;
         if get_tables(cc, &r, &irs, &ids) {
             let copy = alloc_zeroed(size_of(IRCopy)) as *IRCopy;

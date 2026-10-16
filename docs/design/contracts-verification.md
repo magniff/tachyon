@@ -1859,12 +1859,12 @@ Built as §4.4 says, on T7's tasks, with these differences
   inlining budget and a callee's calls left are recorded as their
   answers. `tests/threads_writes.sh` checks that every static task code
   touches is covered.
-- **Found:** 0.18's run-time check sites are numbered globally, in
-  lowering order, and the number is a constant in the code: an edit that
-  adds a check makes every later function with one miss (std's
-  functions always). Measured on the 12 most recent commits to
-  compiler/src: 7 rebuild with a few misses, 4 with about 415 of 6111
-  components missing, 1 (a struct changed) from nothing.
+- **Found:** 0.18's run-time check sites (and kinds past the fixed ones)
+  were numbered globally, in lowering order, a constant in the code: an
+  edit that added a check made every later function with one miss. They
+  are RTID values now, numbered at the join; of the 12 most recent
+  commits to compiler/src, 11 rebuild with at most 34 tasks of a kind
+  missing, 1 (a struct changed) from nothing.
 - **Goals:** the -O2 self-compile with nothing changed in 0.47 s at -j8
   (the goal 0.3 s), after one function's edit 0.53 s (0.4 s): the
   serial parts left (front end, lowering, interprocedural constants,

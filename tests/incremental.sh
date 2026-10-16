@@ -14,7 +14,9 @@
 #   line     a comment line: every later function of the file has its
 #            checks' positions (their strings) changed;
 #   function a new function at the end of a file: every later function's
-#            id moves.
+#            id moves;
+#   check    a new `let` indexing an array before a statement: a new
+#            run-time check, every later check's site moves.
 #
 # Then the tree is put back and built once more (the first build's
 # entries, kept). The compiler's source also takes real edits: recent
@@ -86,7 +88,8 @@ edit() { # <tree> <n> <seed>
             nc = 0
             while ((getline f < list) > 0) files[nf++] = f
             kinds[0] = "literal"; kinds[1] = "string"; kinds[2] = "line"; kinds[3] = "function"
-            kind = kinds[(n + seed) % 4]
+            kinds[4] = "check"
+            kind = kinds[(n + seed) % 5]
             # the lines an edit of this kind may take, over every file (a
             # literal edit with none is a line edit)
             nl = 0
@@ -120,6 +123,9 @@ edit() { # <tree> <n> <seed>
                         sub(/ = [0-9]+;$/, " = " (num + 1) ";", line)
                     } else if (kind == "string") {
                         print indent "let incr_s" n ": [u8] = \"incremental edit " n "\";" > out
+                    } else if (kind == "check") {
+                        print indent "let incr_a" n ": [i64; 2] = [" n ", 1];" > out
+                        print indent "let incr_c" n " = incr_a" n "[" n " % 2];" > out
                     } else {
                         print indent "// incremental edit " n > out
                     }
@@ -139,10 +145,11 @@ edit() { # <tree> <n> <seed>
 build() { # <tree> <root> <level> <threads> <out> <cache> <directives>
     flags=""
     [ -f "$7/flags" ] && flags=$(sed "s|@ROOT@|$ROOT|g" "$7/flags")
-    no=""
+    no=--cache=on
     [ "$6" = yes ] || no=--no-cache
     # shellcheck disable=SC2086
-    (cd "$1" && TACHYON_CACHE="$1.cache" TACHYON_CACHE_SYNC=1 TACHYON_CACHE_TRACE="$1.trace" \
+    (cd "$1" && TACHYON_CODE_CACHE=on TACHYON_CACHE="$1.cache" TACHYON_CACHE_SYNC=1 \
+        TACHYON_CACHE_TRACE="$1.trace" \
         "$COMPILER" --target "$TARGET" "-O$3" "-j$4" $flags $no -c "$2" -o "$5") >"$5.out" 2>&1
 }
 

@@ -180,8 +180,8 @@ Exit status: 0 done, 1 refused or failed (nothing written), 2 usage.
 the threads -O1 and -O2 compile on; the output is the same whatever N),
 `--no-cache` (0.18.1: -O1 and -O2 keep each function's optimized code in
 `target/tachyonc-cache/`, as the tools' cache, and a rebuild reuses what
-an edit did not change, the same bytes; `--no-cache` or
-`TACHYON_CACHE=off` goes without),
+an edit did not change, the same bytes, for a program past about 8000
+IR instructions or with `--cache=on`; `--no-cache` goes without),
 `--target aarch64-macos|aarch64-linux|x86_64-linux|x86_64-macos`, `-g` (debug line
 tables), `--trace` (0.17: a failure prints its line and callers),
 `--check-unsafe`, `--check-alloc` (0.16), `--emit-header`,

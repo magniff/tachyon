@@ -113,6 +113,12 @@ pub enum Op {
     // bits of its first lane are used for both). AArch64's umlal; made by
     // the vectorizer for `out[j] += k * (b[j] as u64)` (bigint kernels).
     VMacW = 54,
+    // (0.18.1) RTID: a number only the run-time helper reads (a check's
+    // site, or its kind past the fixed ones), the program's numbering of
+    // which is made at the join, in the order of the code (code generation's
+    // own). imm: (function << 20) | k, the function's k-th (FN_RTIDS): the
+    // same in every build of the function, whatever was added elsewhere.
+    RtId = 55,
 }
 
 // The comparison of a CMP instruction (and of the -O0 code generator's
@@ -670,6 +676,53 @@ pub fn ir_offset(mut cx: *FnCtx, addr: i64, offset: i64) -> i64 {
     ir_binary(cx, Add, TY_U64, addr, ir_const(cx, offset, TY_U64))
 }
 
+// (0.18.1) The classes of RTID values: a check's site, a check's kind.
+pub const RT_SITE: i64 = 1;
+pub const RT_KIND: i64 = 2;
+
+// Per IR function: its RTID values, each (class << 56) | the front end's
+// number (a site of front/contracts/sites.tach, a kind of
+// gen0::target::ENUM_PANICS + 4), made when it is lowered.
+pub static mut FN_RTIDS: *IntVec = 0 as *IntVec;
+static mut FN_RTIDS_CAP: i64 = 0;
+
+// A value of class `class` and number `value` for the function being
+// lowered (an RTID instruction of type ty).
+pub fn ir_rtid(mut cx: *FnCtx, class: i64, value: i64, ty: i64) -> i64 {
+    unsafe {
+        let fi = cx.irf;
+        if fi >= FN_RTIDS_CAP {
+            let cap = if FN_RTIDS_CAP < 64 { 64 } else { FN_RTIDS_CAP * 2 } + fi;
+            let n = alloc_array::<IntVec>(cap);
+            for i in 0..FN_RTIDS_CAP {
+                n[i] = FN_RTIDS[i];
+            }
+            free(FN_RTIDS as *u8);
+            FN_RTIDS = n;
+            FN_RTIDS_CAP = cap;
+        }
+        let tagged = (class << 56) | value;
+        let list = &FN_RTIDS[fi];
+        let mut k = 0;
+        while k < (*list).count && (*list).data[k] != tagged {
+            k += 1;
+        }
+        if k == (*list).count {
+            (*list).push(tagged);
+        }
+        emit_ir(cx, Op::RtId, ty, 0, 0, (fi << 20) | k)
+    }
+}
+
+// The class and the front end's number of RTID imm `imm`.
+pub fn rtid_class(imm: i64) -> i64 {
+    unsafe { FN_RTIDS[imm >> 20].data[imm & 1048575] >> 56 }
+}
+
+pub fn rtid_value(imm: i64) -> i64 {
+    unsafe { FN_RTIDS[imm >> 20].data[imm & 1048575] & ((1 << 56) - 1) }
+}
+
 impl Op {
     #[inline]
     fn is_call(self: Op) -> bool {
@@ -687,6 +740,7 @@ impl Op {
     // instead of being kept in a register.
     fn is_remat(self: Op) -> bool {
         self == Const || self == Op::Slot || self == GAddr || self == SAddr || self == FAddr
+            || self == Op::RtId
     }
 
     // The operations computed from their operands alone (no memory, no
@@ -804,6 +858,7 @@ impl Op {
             GAddr => c"gaddr",
             SAddr => c"saddr",
             FAddr => c"faddr",
+            Op::RtId => c"rtid",
             Phi => c"phi",
             Add => c"add",
             Sub => c"sub",

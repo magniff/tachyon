@@ -314,6 +314,7 @@ middle::ipo::FREE_SYM	IR: a symbol by its text
 middle::ipo::MALLOC_SYM	IR: a symbol by its text
 middle::ir::FN_IR	IR: fn_canon (whether it has IR)
 middle::ir::IRFUNCS	IR: the task'"'"'s own; read: R_IR, another'"'"'s
+middle::ir::FN_RTIDS	IR: an RTID value by its function and place, its class (the number is the join'"'"'s)
 middle::ir::IRFUNC_COUNT	own
 middle::ir::IR_CALL_LOCS	off: --trace
 middle::ir::IR_EXPR_LOC	off: -g and --trace (IR_LOCS)

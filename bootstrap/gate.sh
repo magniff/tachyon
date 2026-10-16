@@ -59,6 +59,11 @@
 set -u
 LC_ALL=C
 export LC_ALL
+# (0.18.1) The steps build without the code cache (back::codecache), but
+# the incremental step and the suite at -O2 (a smoke row: its cache in the
+# run's directory, removed after).
+TACHYON_CODE_CACHE=off
+export TACHYON_CODE_CACHE
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 MODE=default
@@ -282,6 +287,11 @@ run_step() {
         chain)
             sh "$ROOT/bootstrap/bootstrap.sh" --dev --no-head-tests --history "$HISTORY" </dev/null \
                 && cp "$ROOT/target/tachyonc" "$C" ;;
+        suite-O2)
+            TACHYON_CODE_CACHE=on TACHYON_CACHE="$RUN/code-cache" sh "$ROOT/tests/run.sh" -c "$C" -O 2
+            st=$?
+            rm -rf "$RUN/code-cache"
+            return $st ;;
         suite-O*) sh "$ROOT/tests/run.sh" -c "$C" -O "${1#suite-O}" ;;
         fuzz-plain) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" ;;
         fuzz-loops) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -l ;;
