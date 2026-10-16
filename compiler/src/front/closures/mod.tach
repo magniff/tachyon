@@ -27,11 +27,12 @@ pub mod escape;
 pub mod scoped;
 
 use crate::base::{
-    FILES, FILE_COUNT, IntVec, SRC, SYMS, alloc_array, alloc_zeroed, buf_byte, buf_bytes, buf_int,
-    buf_new, buf_slice, buf_str, free, grow, intern, intern_c,
+    FILES, FILE_COUNT, IntVec, SRC, SYMS, alloc_array, alloc_zeroed, buf_byte, buf_bytes, buf_fmt,
+    buf_int, buf_new, buf_slice, buf_str, free, grow, intern, intern_c,
 };
 use crate::base::diag::{
-    ERR_HELP, err_begin, err_end, err_help, err_help_sym, err_int, err_str, err_sym,
+    ERR_HELP, err_begin, err_end, err_fix, err_help, err_help_sym, err_int, err_str, err_sym,
+    err_try_fmt,
 };
 use crate::front::ast::{
     CLOSURE_MOVE, FN_CLOSURE, NODES, NODE_CAPTURE, NodeKind, child, list_begin, list_end, list_push,
@@ -43,7 +44,7 @@ use crate::front::check::{
 };
 use crate::front::check::collect::{add_fn, new_struct};
 use crate::front::check::resolve::resolve_type;
-use crate::front::check::unsafety::{U_FN_VALUE, U_PTR_ARG, is_borrow, unsafe_op};
+use crate::front::check::unsafety::{U_FN_VALUE, unsafe_op};
 use crate::front::closures::escape::{ANY_BORROW, check_scope_exit, type_borrow};
 use crate::front::closures::fn_bounds::legacy_ref_param;
 use crate::front::generics::check_arg;
@@ -51,8 +52,8 @@ use crate::front::lexer::Tok;
 use crate::front::modules::CUR_MOD;
 use crate::front::parser::UNDERSCORE;
 use crate::front::types::{
-    FIELDS, FIELD_CAP, FIELD_COUNT, FNS, FN_COUNT, FieldInfo, STRUCTS, TLISTS, TSCRATCH, TYPES,
-    TY_ERROR, TY_NEVER, TY_UNIT, TyKind, buf_type, err_type, is_pointer, make_type, ptr_to,
+    FIELDS, FIELD_CAP, FIELD_COUNT, FNS, FN_COUNT, FieldInfo, REF_MUT, STRUCTS, TLISTS, TSCRATCH,
+    TYPES, TY_ERROR, TY_NEVER, TY_UNIT, TyKind, buf_type, err_type, is_pointer, make_type, ptr_to,
     struct_type, type_elem, type_size,
 };
 
@@ -167,8 +168,7 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64) -> i64 {
             if NODES[param].b != 0 {
                 t = resolve_type(NODES[param].b);
                 if legacy_ref_param(wanted, t) {
-                    // (0.17: `|a: *T, b: *T|` where `&T` is wanted)
-                    t = wanted;
+                    raw_closure_param(NODES[param].b, wanted, t);
                 }
                 if wanted != 0 && wanted != t && wanted != TY_ERROR && t != TY_ERROR {
                     mismatch_error(NODES[param].b, wanted, t);
@@ -231,7 +231,6 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64) -> i64 {
                 }
                 let mutable = NODES[param].c != 0;
                 NODES[param].x = define_local(NODES[param].a, tys[i], mutable, true);
-                LOCALS[NODES[param].x].borrow = !mutable && is_pointer(tys[i]);
                 continue;
             }
             let start = NODES[param].start;
@@ -283,6 +282,31 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64) -> i64 {
         free(params as *u8);
         free(tys as *u8);
         CLOSURES[id].sig
+    }
+}
+
+// (0.18.1, V4) A closure's parameter written `*T` (type node `ty`) where
+// the bound wants `&T` or `&mut T`: until 0.18.1 the reference, now a raw
+// pointer. The try: is the annotation as a reference (`fix --suggested`).
+fn raw_closure_param(ty: i64, wanted: i64, t: i64) {
+    unsafe {
+        err_begin(NODES[ty].start);
+        err_str(c"closure parameter of type '");
+        err_type(t);
+        err_str(c"' where '");
+        err_type(wanted);
+        err_str(c"' is wanted");
+        err_help(c"a `*T` is a raw pointer (0.18.1), not a reference: write the parameter's type as the bound's");
+        let rest = SRC[NODES[ty].start + 1..NODES[ty].end];
+        let text = buf_new();
+        if TYPES[wanted].b == REF_MUT {
+            buf_fmt(text, f"&mut {rest}");
+        } else {
+            buf_fmt(text, f"&{rest}");
+        }
+        err_try_fmt(f"{buf_slice(text)}");
+        err_fix(NODES[ty].start, NODES[ty].end, buf_slice(text));
+        err_end();
     }
 }
 
@@ -836,11 +860,6 @@ pub fn closure_call(n: i64, ty: i64) -> i64 {
             let arg = child(n, i);
             let param_ty = type_elem(sig, i);
             check_arg(arg, param_ty);
-            let param = child(node, i);
-            if is_pointer(param_ty) && NODES[param].d == 0 && NODES[param].c == 0
-                && !is_borrow(arg) {
-                unsafe_op(arg, U_PTR_ARG, c"passing a raw pointer to a closure's pointer parameter is unsafe (the closure dereferences it as a borrow): pass `&place` or a pointer parameter");
-            }
             list_push(arg);
         }
         list_end(n, mark);
