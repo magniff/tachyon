@@ -5,7 +5,7 @@
 $ type fstring017/main.tach:9:13
 Interp<closure(*Fmt) -> () at fstring017/main.tach:9:13>	f"n = {n}"
 $ type fstring017/main.tach:10:10
-Interp<closure(*Fmt) -> () at fstring017/main.tach:10:10>	f"n = {n}"
+Interp<closure(&mut Fmt) -> () at fstring017/main.tach:10:10>	f"n = {n}"
 $ type fstring017/main.tach:9:20
 i64	n
 $ type fstring017/main.tach:12:16

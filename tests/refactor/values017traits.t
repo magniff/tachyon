@@ -1,14 +1,13 @@
 ## (0.17) fix --values on trait methods: a method of the program's trait
 ## changes in the declaration and in every impl together (`&mut Self` when
 ## one impl writes: Counter::tick), and the calls follow (bump, twice);
-## an impl of a trait that declares `&Self` (std's Ord, Eq) is spelled so;
-## Display's `*Self, *Fmt` is std's declaration and stays. The output is
-## the same.
+## an impl of a trait that declares `&Self` (std's Ord, Eq; Display with
+## `&mut Fmt`) is spelled so. The output is the same.
 $ --values=off main.tach -o prog
 % ./prog
 16 9 shape rect true 10 3 true false $7
 $ fix --values
-fixed 8 parameters to &mut T, 16 parameters to &T, 4 arguments	main.tach	+23 -22 lines
+fixed 9 parameters to &mut T, 17 parameters to &T, 4 arguments	main.tach	+24 -23 lines
 % cat main.tach
 trait Shape {
     fn area(self: &Self) -> i64;
@@ -45,9 +44,9 @@ struct Key { k: i64 }
 impl Ord for Key { fn cmp(self: &Key, other: &Key) -> i64 { self.k - other.k } }
 impl Eq for Key { fn eq(self: &Key, other: &Key) -> bool { self.k == other.k } }
 
-// Kept: Display declares `*Self` and `*Fmt`.
+// Display declares `&Self` and `&mut Fmt` (0.18): spelled so too.
 struct Money { c: i64 }
-impl Display for Money { fn fmt(self: *Money, f: *Fmt) { f.write(f"${self.c}"); } }
+impl Display for Money { fn fmt(self: &Money, f: &mut Fmt) { f.write(f"${self.c}"); } }
 
 fn total<T: Shape>(s: &T) -> i64 { s.area() }
 fn bump<T: Shape>(s: &mut T) { s.grow(1); }

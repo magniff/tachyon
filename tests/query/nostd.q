@@ -16,7 +16,7 @@ pub fn print_int(v: i64) {
     // (decimal only: not Fmt::int, whose hex and binary every program
     // using print_int would compile)
     let negative = v < 0;
-    fmt_decimal(&f, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative);
+    fmt_decimal(&mut f, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative);
     f.flush();
 }
 $ text std:1-2
