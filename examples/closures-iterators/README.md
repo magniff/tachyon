@@ -78,7 +78,6 @@ value, a copy; `move |..|` copies everything.)
 
 ```tach
 let mut entries: Vec<Entry> = Vec::new_in(gpa);
-defer entries.free();
 let mut bad = 0;
 Lines::new(input.as_slice())
     .filter(|l| l.len > 0 && l[0] != '#')
@@ -132,7 +131,6 @@ sorts descending:
 
 ```tach
 let mut slow = all.iter().filter(is_slow).collect_in(gpa);
-defer slow.free();
 slow.sort_by(|a, b| b.millis.cmp(&a.millis)); // slowest first
 for (rank, e) in slow.iter().enumerate().take(3) {
     println(f"  {rank + 1}. {e.millis:>4} ms  {e.service:<5} {e.path}");
@@ -147,7 +145,6 @@ pairs are then collected and sorted by count, then by name:
 ```tach
 for e in all { per_service.get_or_insert(e.service, 0)[0] += 1; }
 let mut ranked = per_service.iter().collect_in(gpa);
-defer ranked.free();
 ranked.sort_by(|a, b| {
     let (name_a, n_a) = *a; // a and b point into the Vec: *([u8], i64)
     let (name_b, n_b) = *b;

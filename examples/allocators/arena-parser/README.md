@@ -52,23 +52,29 @@ allocator as a value (`a: A`) and passing it to each `Vec` it makes:
 
 ```tach
 fn parse<A: Allocator>(src: [u8], a: A) -> Result<(Node<A>, i64), ParseError>
-fn parse_expr<A: Allocator>(p: *Parser<A>, t: Tok) -> Result<Node<A>, ParseError>
+fn parse_expr<A: Allocator>(p: &mut Parser<A>, t: Tok) -> Result<Node<A>, ParseError>
 ```
 
 The caller chooses. On `Gpa`, `parse(text, gpa)` returns a
-`Node<Gpa>`, which the caller frees list by list (`free_tree`, a walk
-over the whole tree). In an arena:
+`Node<Gpa>`, which is dropped list by list when the caller is done with
+it (the drop glue of `Node` and `Vec`: a walk over the whole tree). In
+an arena:
 
 ```tach
 values[1] = arena_scope(gpa, |a| {
     let (tree, _) = parse(text, a).unwrap();
-    eval(&tree)
+    let v = eval(&tree);
+    std::forget(tree);
+    v
 });
 ```
 
 `arena_scope(gpa, f)` makes an arena (its memory from `gpa`), calls `f`
-with it (an `a: ScopedArena`), and frees all of it when `f` returns. No
-`free_tree`: nothing in the tree is freed one by one. The tree cannot
+with it (an `a: ScopedArena`), and frees all of it when `f` returns.
+Dropping the tree would walk it to free each list, which on an arena
+frees nothing: `std::forget(tree)` skips the walk, and the scope's end
+frees the memory (a forgotten value is a leak only on an allocator
+that frees block by block). The tree cannot
 outlive the scope either: returning it, or anything holding a
 `ScopedArena`, is a compile error (see [scoped-arena](../scoped-arena/));
 here only the `i64` value leaves.
@@ -78,8 +84,8 @@ once, and `arena.scope(|a| ...)` per round, which rewinds the arena at
 its end but keeps its memory for the next round (instead of giving it
 back to `Gpa` and asking again). `unsafe { arena.free_all() }` gives it
 back at the end: unsafe because nothing stops a view into the arena
-from being used after it (the gap 0.17 closes; a scope has no such
-hole).
+from being used after it (0.17.1's arena references close that; a scope
+has no such hole).
 
 ## Arena-friendly allocation
 
@@ -91,15 +97,17 @@ child straight onto its parent's `Vec`, and in the arena most of the
 memory it used held dead copies.
 
 So the children of the lists being parsed wait on one shared stack, and
-when a list's `)` comes, its children are copied into a `Vec` of exactly
+when a list's `)` comes, its children are moved into a `Vec` of exactly
 their number:
 
 ```tach
 Tok::Close => {
-    let waiting = p.stack.as_slice()[base..];
-    let mut kids: Vec<Node<A>, A> = Vec::with_capacity_in(waiting.len, p.a);
-    kids.extend_from_slice(waiting);
-    p.stack.truncate(base);
+    // moved off the stack, in order
+    let n = p.stack.len() - base;
+    let mut kids: Vec<Node<A>, A> = Vec::with_capacity_in(n, p.a);
+    for _ in 0..n {
+        kids.push(p.stack.remove(base));
+    }
 ```
 
 One allocation of the right size per list, on either allocator: the
@@ -109,7 +117,8 @@ comparison is the allocator's cost, not a different algorithm.
 
 - **Freeing**: 3 ms for 134,180 `free` calls and the walk that finds
   them, against nothing measurable: the arena's chunks go back in one
-  call each. This is the arena's real win, and it grows with the tree.
+  call each (and the forgotten tree is not walked). This is the arena's
+  real win, and it grows with the tree.
 - **Parsing**: no faster. Allocating is a small part of it (without
   any allocation the parse takes 6.0 ms; macOS's `malloc` for small
   blocks is about 12 ns), and a bump saves little of that small part.
@@ -125,13 +134,11 @@ comparison is the allocator's cost, not a different algorithm.
 ## What the effects say
 
 ```console
-$ tachyonc query effects parse eval free_tree
+$ tachyonc query effects parse eval
 parse<Gpa>	alloc(Gpa) panic diverge
 parse<ScopedArena>	alloc(ScopedArena) panic diverge
-eval<Gpa>	panic diverge
-eval<ScopedArena>	panic diverge
-free_tree<Gpa>	alloc(Gpa) diverge
-free_tree<ScopedArena>	alloc(ScopedArena) diverge
+eval<Gpa>	diverge
+eval<ScopedArena>	diverge
 ```
 
 Each generic function has one line per instance: `parse<ScopedArena>`
@@ -143,10 +150,12 @@ declared `#[no_alloc]`, and the compiler checked it for both trees.
 
 On `Gpa`, a parse error halfway (`(+ 1 (* 2 3)`, an unclosed list)
 returns with lists already built: the finished children waiting on the
-stack. The first version leaked them, and `--check-alloc` listed the two
-blocks at exit; `parse` now frees what waits on the stack before it
-returns an error. In an arena the scope's end frees them with the rest,
-so there is nothing to forget. (`--check-alloc` gives each block pages
+stack. A 0.16 version leaked them, and `--check-alloc` listed the two
+blocks at exit; it had to free what waited on the stack before
+returning the error. Since 0.17 the stack and what it holds are dropped
+on every exit of `parse`, the early return of `?` included, so there is
+nothing to remember; in an arena the scope's end frees them with the
+rest. (`--check-alloc` gives each block pages
 of its own: the whole program takes about 7 seconds under it, most of
 them in the kernel.)
 

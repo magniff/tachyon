@@ -70,10 +70,10 @@ enum ValueError { NotANumber(ParseIntError), NotABool, OutOfRange(i64, i64, i64)
 enum ConfigError {
     Read(IoError),
     NoEquals(i64),
-    UnknownKey(i64, [u8]),
-    Duplicate(i64, [u8]),
-    BadValue(i64, [u8], ValueError),
-    Missing([u8]),
+    UnknownKey(i64, Buf),
+    Duplicate(i64, Buf),
+    BadValue(i64, Buf, ValueError),
+    Missing(Buf),
 }
 ```
 
@@ -127,9 +127,9 @@ Ok(Config {
 let eq = line.iter().position(|b| b == '=').ok_or(ConfigError::NoEquals(number))?;
 ```
 
-**`defer` runs on every exit.** `parse_config` allocates a `HashMap` and
-frees it with `defer`; each `?` that returns early runs the `defer`
-first, so no path leaks it.
+**Drops run on every exit.** `parse_config` allocates a `HashMap`, which
+is dropped when the function returns; each `?` that returns early drops
+it too, so no path leaks it.
 
 **Display for people, Debug for programmers.** `impl Display` writes
 the messages printed for the rejected samples (`{e}`); the derived Debug
@@ -143,23 +143,22 @@ exits with 1, as Rust does:
 ```tach
 fn main(gpa: Gpa) -> Result<(), ConfigError> {
     show_rejections(gpa);
-    let mut input = read_stdin_in(gpa)?; // IoError -> ConfigError through From
+    let input = read_stdin_in(gpa)?; // IoError -> ConfigError through From
     let config = parse_config(input.as_slice(), gpa)?;
     ...
-    input.free(); // (config.name is a view of it: used above, not after)
     Ok(())
 }
 ```
 
-**An error that holds views.** `UnknownKey` and `Duplicate` carry the
-key as a `[u8]`, a view of `input`, and `main` prints its error *after*
-it returns. So `input` is freed on the success path only, not with
-`defer` (which runs before main returns): on the error path it outlives
-main, and the program ends right after. With `defer input.free()` the
-message would read freed memory; `tachyonc --check-alloc main.tach`
-stops such a program at the read (`use after free: ... freed at
-main.tach:165:11`), and lists the input as not freed on the error path
-instead. (0.17's values close this gap: a view cannot outlive its owner.)
+**An error that owns its text.** `UnknownKey` and the others carry the
+key as a `Buf`, a copy, not a `[u8]` view of `input`: `main` prints its
+error *after* it returns, and `input` is dropped when main returns. A
+view there would outlive its owner, which the compiler rejects
+(`own.escape`: main returns a view of `input`, which is dropped when main
+returns); before 0.17 the program had to leak `input` on the
+error path instead. An owned field (the `Buf`, not a view of it) is what
+`tachyonc explain own.escape` suggests for a value that must outlive its
+source.
 
 ## Language features
 
@@ -167,7 +166,7 @@ instead. (0.17's values close this gap: a view cannot outlive its owner.)
 - `Option`/`Result` methods (`map`, `map_err`, `ok_or`, `unwrap_or`): `tachyonc guide std`
 - `#[derive(Debug)]`, `impl Display`, `{x:<26?}`: `tachyonc guide formatting`
 - closures given to `map_err`, `position`, `any`: `tachyonc guide closures`
-- `defer`, `HashMap`, `Scanner`, `trim`: `tachyonc guide std`, `tachyonc guide memory`
+- drops, `HashMap`, `Scanner`, `trim`: `tachyonc guide std`, `tachyonc guide memory`
 - a `type` alias (`type Fields = HashMap<[u8], Field>;`): `tachyonc guide generics`
 
 ## Going further

@@ -43,8 +43,9 @@ The test suite runs every one and compares its output
   can be checked byte for byte.
 - **Timing on stderr.** `import "time.h" as c;` and C's
   `timespec_get`; stdout holds only results.
-- **Explicit memory.** Vectors and maps are freed with `defer x.free();`
-  right after they are made (`tachyonc guide memory`).
+- **Memory without `free`.** Vectors and maps are dropped at the end of
+  their scope, or moved to an owner that outlives it (`tachyonc guide
+  memory`).
 - **Checked indexing.** Every slice access is bounds-checked; the C
   references check nothing, and the times above include the checks.
 
@@ -63,6 +64,6 @@ and how the example avoids it:
 - The `u32 x u32 -> u64` multiply-accumulate loop is not vectorized
   (`bigint`'s schoolbook kernel is 1.7x behind clang's).
 - Register shuffling in hash-probe loops (`lru-cache`, 1.5x behind C).
-- Fields of a struct updated through `self: *T` in a hot loop stay in
+- Fields of a struct updated through `self: &mut T` in a hot loop stay in
   memory (`huffman`'s encoder keeps its bit buffer in locals: 8.7 ms
   instead of 11 ms).

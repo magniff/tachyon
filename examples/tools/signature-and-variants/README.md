@@ -34,7 +34,7 @@ day 7: #2 cannot read 'lend 7'
 ### Reorder
 
 `transfer(l, amount, from, to)` reads badly at its calls:
-`transfer(&l, 1000, 2, 1)`. Its calls, by kind:
+`transfer(&mut l, 1000, 2, 1)`. Its calls, by kind:
 
 ```console
 $ tachyonc query refs transfer --kind call
@@ -42,7 +42,7 @@ $ tachyonc query refs transfer --kind call
 75:35	call	ledger::apply	Event::Transfer(to, n) => transfer(l, n, who, to),
 81:13	call	ledger::apply	transfer(l, b * permille / 1000, 0, who)
 # main.tach
-46:5	call	main	transfer(&l, 1000, 2, 1);
+45:5	call	main	transfer(&mut l, 1000, 2, 1);
 ```
 
 `--reorder` takes every parameter once. Forget one and the error lists
@@ -54,10 +54,10 @@ error refactor.usage: --reorder lists each parameter once: (l, amount, from, to)
 [exit 2]
 $ tachyonc refactor signature transfer --reorder l,from,to,amount --show
 reordered the parameters of crate::ledger::transfer, 3 calls	2 files	+4 -4 lines
-// main.tach:46
-46	    transfer(&l, 2, 1, 1000);
+// main.tach:45
+45	    transfer(&mut l, 2, 1, 1000);
 // ledger.tach:49
-49	pub fn transfer(l: *Ledger, from: i64, to: i64, amount: i64) -> bool {
+49	pub fn transfer(l: &mut Ledger, from: i64, to: i64, amount: i64) -> bool {
 // ledger.tach:75
 75	        Event::Transfer(to, n) => transfer(l, who, to, n),
 // ledger.tach:81
@@ -79,10 +79,10 @@ try: tachyonc query show ledger.tach:71
 [exit 1]
 $ tachyonc refactor signature apply --remove day --show
 removed parameter day of crate::ledger::apply, 1 call	2 files	+2 -2 lines
-// main.tach:37
-37	                let ok = apply(&l, who, e);
+// main.tach:36
+36	                let ok = apply(&mut l, who, e);
 // ledger.tach:65
-65	pub fn apply(l: *Ledger, who: i64, e: Event) -> bool {
+65	pub fn apply(l: &mut Ledger, who: i64, e: Event) -> bool {
 ```
 
 ### Add, with a default
@@ -200,10 +200,10 @@ $ tachyonc edit insert --in event::parse --before 'None' --show <<'EOF'
 > }
 > EOF
 inserted in crate::event::parse	event.tach	+3 -0 lines
-// event.tach:35-37
-35	    if w.len == 2 && w[0] == "fee" {
-36	        return Some(Event::Fee(number(w[1])));
-37	    }
+// event.tach:34-36
+34	    if w.len == 2 && w[0] == "fee" {
+35	        return Some(Event::Fee(number(w[1])));
+36	    }
 $ tachyonc edit insert --in main --after '(1, "withdraw 99999"),' <<'EOF'
 > (1, "fee 250"),
 > (2, "fee 250"),
@@ -211,7 +211,7 @@ $ tachyonc edit insert --in main --after '(1, "withdraw 99999"),' <<'EOF'
 inserted in crate::main	main.tach	+2 -0 lines
 $ tachyonc edit insert --after ledger::transfer <<'EOF'
 > // A fee from account `who` to the house, counted in its fees_paid.
-> fn charge(l: *Ledger, who: i64, n: i64) -> bool {
+> fn charge(l: &mut Ledger, who: i64, n: i64) -> bool {
 >     if !transfer(l, who, 0, n) {
 >         return false;
 >     }

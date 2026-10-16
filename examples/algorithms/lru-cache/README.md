@@ -71,16 +71,15 @@ struct LruCache<K: Hash + Eq, V> {
 }
 ```
 
-**The list operations** take a slice of the nodes and write through it
-(`n[prev].next = next` changes the node in the `Vec`). An `i32` indexes
-a slice directly:
+**The list operations** write the nodes in place through the `Vec`
+(`self.nodes[prev].next = next` changes the node where it is). An `i32`
+indexes it directly:
 
 ```tach
-fn unlink(self: *LruCache<K, V>, i: i32) {
-    let n = self.nodes.as_slice();
-    let (prev, next) = (n[i].prev, n[i].next);
-    if prev == NIL { self.head = next; } else { n[prev].next = next; }
-    if next == NIL { self.tail = prev; } else { n[next].prev = prev; }
+fn unlink(self: &mut LruCache<K, V>, i: i32) {
+    let (prev, next) = (self.nodes[i].prev, self.nodes[i].next);
+    if prev == NIL { self.head = next; } else { self.nodes[prev].next = next; }
+    if next == NIL { self.tail = prev; } else { self.nodes[next].prev = prev; }
 }
 ```
 
@@ -88,7 +87,7 @@ fn unlink(self: *LruCache<K, V>, i: i32) {
 miss and returns early:
 
 ```tach
-fn get(self: *LruCache<K, V>, key: K) -> Option<V> {
+fn get(self: &mut LruCache<K, V>, key: K) -> Option<V> {
     let i = match self.slots.get(key) {
         Some(i) => i,
         None => {

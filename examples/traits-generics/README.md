@@ -101,7 +101,9 @@ each use with a new type compiles a copy for that type
 
 ```tach
 fn total_area<T: Shape>(shapes: [T]) -> f64 {
-    shapes.iter().map(|s| s.area()).fold(0.0, |a, b| a + b)
+    let mut total = 0.0;
+    for s in shapes { total += s.area(); } // s: each element in place
+    total
 }
 
 fn largest<T: Ord>(xs: [T]) -> Option<T> { ... }
@@ -186,10 +188,12 @@ pub fn total<T: Into<Meters>>(lengths: [T]) -> Meters {
 }
 ```
 
-**Clone copies deeply.** `Polygon` holds a `Vec`, which is a handle:
-copying the struct copies the pointer. The derived `clone` copies the
-vector's contents, so changing the clone leaves the original as it was
-(each is freed with its own `defer`).
+**Clone copies deeply.** `Polygon` holds a `Vec`, which owns its points:
+assigning or passing the struct moves it (the old name cannot be used
+again). The derived `clone` copies the vector's contents, so changing
+the clone leaves the original as it was; each is freed when it goes out
+of scope. `main` puts a clone of the triangle into the `shapes` array,
+because it uses the triangle afterwards.
 
 **Modules.** `main.tach` loads the library with `mod geometry;` and
 `mod units;` and imports by name (`use geometry::{Shape, Vec2, ...}`);

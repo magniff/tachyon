@@ -61,16 +61,13 @@ unsafe fn zeroed_stat() -> c::stat {
 // getenv's NULL becomes None.
 fn env(name: [u8], gpa: Gpa) -> Option<Buf> {
     let mut cname = cstring(name, gpa);
-    defer cname.free();
     let p = unsafe { c::getenv(cname.as_slice().ptr) };
     if p == 0 as *u8 { None } else { Some(unsafe { owned(p, gpa) }) }
 }
 
 fn set_env(name: [u8], value: [u8], gpa: Gpa) {
     let mut cname = cstring(name, gpa);
-    defer cname.free();
     let mut cvalue = cstring(value, gpa);
-    defer cvalue.free();
     unsafe { c::setenv(cname.as_slice().ptr, cvalue.as_slice().ptr, 1); }
 }
 
@@ -99,9 +96,8 @@ fn environment(gpa: Gpa) {
 // ---- time ----------------------------------------------------------------------
 
 // strftime into a stack buffer; the text as a Buf.
-fn format_time(format: [u8], t: *c::tm, gpa: Gpa) -> Buf {
+fn format_time(format: [u8], t: &mut c::tm, gpa: Gpa) -> Buf {
     let mut cformat = cstring(format, gpa);
-    defer cformat.free();
     let mut out: [u8; 128] = [0; 128];
     let n = unsafe { c::strftime(&out as *u8, 128, cformat.as_slice().ptr, t) };
     let mut b = Buf::new_in(gpa);
@@ -119,8 +115,7 @@ fn show_in_zone(zone: [u8], when: i64, gpa: Gpa) {
     use_zone(zone, gpa);
     // localtime returns a pointer to a static struct tm: copy it out.
     let parts: c::tm = unsafe { *c::localtime(&when) };
-    let mut text = format_time("%Y-%m-%d %H:%M:%S %z", &parts, gpa);
-    defer text.free();
+    let mut text = format_time("%Y-%m-%d %H:%M:%S %z", &mut parts, gpa);
     let offset = parts.tm_gmtoff;
     let sign = if offset < 0 { "-" } else { "+" };
     let minutes = if offset < 0 { -offset / 60 } else { offset / 60 };
@@ -132,8 +127,7 @@ fn time_demo(gpa: Gpa) {
     // A fixed moment, so the output is the same on every run.
     let when: i64 = 1234567890;
     let mut utc: c::tm = unsafe { *c::gmtime(&when) };
-    let mut long = format_time("%A, %d %B %Y, %H:%M:%S UTC", &utc, gpa);
-    defer long.free();
+    let mut long = format_time("%A, %d %B %Y, %H:%M:%S UTC", &mut utc, gpa);
     println(f"{when} is {long.as_slice()}");
     println(
         f"  struct tm: year {utc.tm_year + 1900}, month {utc.tm_mon + 1}, day {utc.tm_yday + 1} of the year, weekday {utc.tm_wday}");
@@ -144,8 +138,7 @@ fn time_demo(gpa: Gpa) {
     use_zone("UTC0", gpa);
     utc.tm_mday += 100;
     let later = unsafe { c::mktime(&utc) };
-    let mut date = format_time("%Y-%m-%d, a %A", &utc, gpa);
-    defer date.free();
+    let mut date = format_time("%Y-%m-%d, a %A", &mut utc, gpa);
     println(f"100 days later: {date.as_slice()} ({later - when} seconds later)");
 }
 
@@ -158,7 +151,7 @@ fn is_dir(mode: u32) -> bool {
 }
 
 // "drwxr-xr-x", as ls prints it.
-fn mode_text(mode: u32, out: *Buf) {
+fn mode_text(mode: u32, out: &mut Buf) {
     out.push(if is_dir(mode) { 'd' } else { '-' });
     let letters = "rwxrwxrwx";
     for i in 0..9 {
@@ -168,10 +161,9 @@ fn mode_text(mode: u32, out: *Buf) {
 }
 
 // The entries of `dir` but . and .., sorted by name, with their sizes and
-// modes; None if it cannot be opened. Free them with free_entries.
+// modes; None if it cannot be opened.
 fn list(dir: [u8], gpa: Gpa) -> Option<Vec<Entry>> {
     let mut cdir = cstring(dir, gpa);
-    defer cdir.free();
     let d = unsafe { c::opendir(cdir.as_slice().ptr) };
     if d == 0 as *c::DIR {
         return None;
@@ -187,9 +179,7 @@ fn list(dir: [u8], gpa: Gpa) -> Option<Vec<Entry>> {
         let name_ptr = unsafe { &ent.d_name as *u8 };
         let name = unsafe { owned(name_ptr, gpa) };
         if name.as_slice() == "." || name.as_slice() == ".." {
-            let mut name = name;
-            name.free();
-            continue;
+            continue; // (name is dropped)
         }
         entries.push(Entry { name: name, size: 0, mode: 0 });
     }
@@ -200,34 +190,22 @@ fn list(dir: [u8], gpa: Gpa) -> Option<Vec<Entry>> {
         x.cmp(&y)
     });
     for i in 0..entries.len() {
-        let mut e = entries.get(i);
-        let mut path = c_path(dir, e.name.as_slice(), gpa);
-        defer path.free();
+        let path = c_path(dir, entries[i].name.as_slice(), gpa);
         let mut st: c::stat = unsafe { zeroed_stat() };
         if unsafe { c::stat(path.as_slice().ptr, &st) } == 0 {
-            e.size = st.st_size;
-            e.mode = st.st_mode; // u16 on macOS, u32 on Linux: it widens
+            entries[i].size = st.st_size;
+            entries[i].mode = st.st_mode; // u16 on macOS, u32 on Linux: it widens
         }
-        entries.set(i, e);
     }
     Some(entries)
 }
 
-fn free_entries(entries: *Vec<Entry>) {
-    for i in 0..entries.len() {
-        let mut e = entries.get(i);
-        e.name.free();
-    }
-    entries.free();
-}
-
-fn print_listing(title: [u8], entries: *Vec<Entry>, gpa: Gpa) {
+fn print_listing(title: [u8], entries: &Vec<Entry>, gpa: Gpa) {
     println(f"{title}: {entries.len()} entries");
     let mut line = Buf::new_in(gpa);
-    defer line.free();
-    for e in entries.iter() {
+    for e in entries.as_slice() {
         line.clear();
-        mode_text(e.mode, &line);
+        mode_text(e.mode, &mut line);
         // (a directory's size is the file system's business: 64 on
         // APFS, 4096 on ext4)
         if is_dir(e.mode) {
@@ -237,7 +215,10 @@ fn print_listing(title: [u8], entries: *Vec<Entry>, gpa: Gpa) {
         }
         println(line.as_slice());
     }
-    let bytes = entries.iter().filter(|e| !is_dir(e.mode)).map(|e| e.size).sum();
+    let mut bytes = 0;
+    for e in entries.as_slice() {
+        if !is_dir(e.mode) { bytes += e.size; }
+    }
     println(f"total {bytes} bytes in files");
 }
 
@@ -245,7 +226,6 @@ fn print_listing(title: [u8], entries: *Vec<Entry>, gpa: Gpa) {
 // permissions `mode` (not left to the umask); false if it cannot.
 fn write_file(dir: [u8], name: [u8], text: [u8], mode: u16, gpa: Gpa) -> bool {
     let mut cpath = c_path(dir, name, gpa);
-    defer cpath.free();
     let f = unsafe { c::fopen(cpath.as_slice().ptr, c"w") };
     if f == 0 as *c::FILE {
         return false;
@@ -266,7 +246,6 @@ fn files_demo(gpa: Gpa) {
     println("== files");
     // mkdtemp replaces the XXXXXX in place: the template must be ours.
     let mut template = cstring("/tmp/c-libc-tour.XXXXXX", gpa);
-    defer template.free();
     if unsafe { c::mkdtemp(template.as_slice().ptr) } == 0 as *u8 {
         println("mkdtemp failed");
         return;
@@ -276,7 +255,6 @@ fn files_demo(gpa: Gpa) {
         && write_file(dir, "data.csv", "a,b\n1,2\n3,4\n", RW_R__R__, gpa)
         && write_file(dir, "empty", "", RW_R__R__, gpa);
     let mut sub = c_path(dir, "subdir", gpa);
-    defer sub.free();
     unsafe {
         c::mkdir(sub.as_slice().ptr, RWXR_XR_X);
         c::chmod(sub.as_slice().ptr, RWXR_XR_X); // mkdir's mode is masked by the umask
@@ -285,18 +263,15 @@ fn files_demo(gpa: Gpa) {
 
     match list(dir, gpa) {
         Some(entries) => {
-            let mut entries = entries;
             print_listing("the directory", &entries, gpa);
             // clean up: files with unlink, directories with rmdir
-            for e in entries.iter() {
+            for e in entries.as_slice() {
                 let mut path = c_path(dir, e.name.as_slice(), gpa);
-                defer path.free();
                 unsafe {
                     if is_dir(e.mode) { c::rmdir(path.as_slice().ptr); }
                     else { c::unlink(path.as_slice().ptr); }
                 }
             }
-            free_entries(&entries);
         }
         None => println("cannot list it"),
     }
@@ -307,14 +282,9 @@ fn files_demo(gpa: Gpa) {
 fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
     if argc > 1 {
         for k in 1..argc as i64 {
-            let mut dir = unsafe { owned(argv[k], gpa) };
-            defer dir.free();
+            let dir = unsafe { owned(argv[k], gpa) };
             match list(dir.as_slice(), gpa) {
-                Some(entries) => {
-                    let mut entries = entries;
-                    print_listing(dir.as_slice(), &entries, gpa);
-                    free_entries(&entries);
-                }
+                Some(entries) => print_listing(dir.as_slice(), &entries, gpa),
                 None => eprintln(f"cannot open {dir.as_slice()}"),
             }
         }

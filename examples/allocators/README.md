@@ -27,9 +27,9 @@ allocators` runs them).
 
 | allocator | made by | frees | for |
 |---|---|---|---|
-| `Gpa` | the runtime: `fn main(gpa: Gpa)` | each block, `v.free()` | anything whose lifetime is its own |
+| `Gpa` | the runtime: `fn main(gpa: Gpa)` | each block, when its owner is dropped | anything whose lifetime is its own |
 | `ScopedArena` | `arena_scope(gpa, \|a\| ...)`, `arena.scope(\|a\| ...)` | everything at the scope's end | temporaries of one task: a request, a frame, a parse |
-| `Arena` | `Arena::new_in(gpa)` | everything at once: `reset`, `free_all` (unsafe in 0.16) | data that lives together for longer than a call |
+| `Arena` | `Arena::new_in(gpa)` | everything at once: `reset`, `free_all` (unsafe) | data that lives together for longer than a call |
 | `FixedBuf` | `FixedBuf::new(mem[..])` over memory you own | `reset` (unsafe) | no heap, or a hard budget |
 
 `tachyonc guide allocators` is the reference; `tachyonc guide effects`

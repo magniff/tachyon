@@ -3,11 +3,15 @@
 Five memory bugs, each in a function of its own, chosen by the
 program's argument: `copy`, `push`, `scope`, `twice`, `leak`. With no
 argument the program runs the correct version of each. All five
-compile in tachyon 0.16; the first four are undefined behaviour, which
-safe tachyon code otherwise never has: this is the one gap 0.16 leaves
-open, and 0.17 closes. Until then, `tachyonc --check-alloc` builds the
-program with a checking allocator that stops at each of them with the
-block, where it was allocated and where it was freed.
+compiled in tachyon 0.16; the first four are undefined behaviour, the
+one gap 0.16 left open. 0.17 closes it: they are compile errors now
+(the last section). The program is 0.16 code, so the sessions build it
+with `--values=off`, 0.16's semantics (no moves, no drops, no view
+checks), to show what `tachyonc --check-alloc` does with such bugs: it
+builds the program with a checking allocator that stops at each of them
+with the block, where it was allocated and where it was freed. It still
+matters in 0.17 for leaks, for unsafe code and for code built with
+`--values=off`.
 
 Every command below is run by `tests/walkthrough/run.sh` in a copy of
 this directory, and its output is checked against this file;
@@ -17,7 +21,7 @@ and with each bug.
 ## The correct version
 
 ```console
-$ tachyonc main.tach -o shop && ./shop
+$ tachyonc --values=off main.tach -o shop && ./shop
 fruit: 7
 fruit: 7
 first 0
@@ -53,7 +57,7 @@ message, and nothing at all.
 ## The bugs, built with `--check-alloc`
 
 ```console
-$ tachyonc --check-alloc main.tach -o shop-checked
+$ tachyonc --values=off --check-alloc main.tach -o shop-checked
 ```
 
 **A handle copied, then freed through one copy.** A `Vec` is a handle
@@ -141,30 +145,38 @@ production builds.
 
 ## How 0.17 makes these compile errors
 
-0.17 brings mutable value semantics (docs/roadmap.md, "0.17"):
+0.17 brings mutable value semantics, and they are on by default: the
+program as it is does not compile: the first four bugs are errors.
 
-- **Values move.** `let shelf = Shelf { counts: counts }` moves
+```console
+$ tachyonc check main.tach
+main.tach:27:9: error[own.moved] 'counts' is used here after it moved at 22:48 | help: use it before the move, pass a copy where it moves ('.clone()'), or take it by reference ('&') | try: tachyonc edit patch main.tach:22 --old 'let shelf = Shelf { name: "fruit", counts: counts };' --new 'let shelf = Shelf { name: "fruit", counts: counts.clone() };'
+main.tach:42:5: error[own.conflict] 'v.push(40)' may change 'v' while 'first' (main.tach:41:9) views it; 'first' is used at main.tach:47:26 | help: use the view before the change, keep an index instead of a view, or keep a copy | try: tachyonc edit patch slice_after_push --old 'v.as_slice()' --new 'v.clone()' | try: tachyonc query own main.tach:47:26
+main.tach:66:13: error[own.escape] 'closure(ScopedArena) -> [i64] at main.tach:63:34' returns a view of 'v', which is dropped when 'closure(ScopedArena) -> [i64] at main.tach:63:34' returns | help: return the owner itself; a caller that wants a view takes '.as_slice()' of it | try: tachyonc edit patch closure(ScopedArena) -> [i64] at main.tach:63:34 --old '-> [i64]' --new '-> Vec<i64, ScopedArena>' --old 'v.as_slice()' --new 'v'
+main.tach:78:5: error[own.moved] 'counts' is used here after it moved at 76:52 | help: use it before the move, pass a copy where it moves ('.clone()'), or take it by reference ('&') | try: tachyonc edit patch main.tach:76 --old 'let mut shelf = Shelf { name: "tools", counts: counts };' --new 'let mut shelf = Shelf { name: "tools", counts: counts.clone() };'
+[exit 1]
+```
+
+- **Values move.** `Shelf { name: "fruit", counts: counts }` moves
   `counts` into the struct; using `counts` afterwards, to free it or
-  anything else, is a compile error. One owner, so no `copy` bug and no
-  `twice` bug: the owner is freed once, at the end of its scope (a
-  destructor replaces `free` and most `defer`s), and `.clone()` is the
+  anything else, is `own.moved`. One owner, so no `copy` bug and no
+  `twice` bug: the owner is dropped once, at the end of its scope (a
+  `Drop` impl replaces `free` and most `defer`s), and `.clone()` is the
   explicit way to get a second, independent copy.
-- **References are second-class.** A view (`&x`, a slice) may be passed
-  down a call chain but never stored, returned or captured by an
-  escaping closure; so a slice cannot outlive the `Vec` it views, a
-  `push` cannot run while a view of the Vec is live, and an arena's
-  data cannot leave its scope even as a view. No `push` bug and no
-  `scope` bug.
-- **Leaks** stay possible (they are safe), and destructors make them
-  rare; `--check-alloc` keeps listing them.
+- **Views cannot outlive or be invalidated under their owner.** A slice
+  of the Vec is live until its last use, and a `push` while it is live
+  is `own.conflict`; a view returned from the arena's scope, of a Vec
+  dropped there, is `own.escape`. No `push` bug and no `scope` bug.
+- **Leaks** stay possible (they are safe), and drops make them rare;
+  `--check-alloc` keeps listing them.
 
-`tachyonc fix --values` is planned to migrate the common patterns
-(manual `free` to destructors, stored slices to owned copies or
-indexes), with exact diagnostics for the rest.
+`tachyonc fix --values` migrates the common patterns (`defer x.free()`
+removed where the value drops, parameters to references), with exact
+diagnostics for the rest (`tachyonc guide memory`).
 
 ## Read more
 
 - `tachyonc guide allocators`, section "--check-alloc".
-- `tachyonc guide memory`: handles, `defer`, views and their lifetime.
+- `tachyonc guide memory`: moves, drops, views and their lifetime.
 - [gpa-from-main](../gpa-from-main/) and
   [arena-parser](../arena-parser/): leaks found by `--check-alloc`.

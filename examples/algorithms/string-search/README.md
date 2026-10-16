@@ -66,9 +66,9 @@ counting compiles to a loop with an increment, no call per match.
 
 ```tach
 trait Searcher {
-    fn each_match<F: FnMut(i64)>(self: *Self, text: [u8], found: F);
+    fn each_match<F: FnMut(i64)>(self: &Self, text: [u8], found: F);
 
-    fn count(self: *Self, text: [u8]) -> i64 {
+    fn count(self: &Self, text: [u8]) -> i64 {
         let mut n = 0;
         self.each_match(text, |_| { n += 1; });   // `let mut n`: captured by reference
         n

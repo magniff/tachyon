@@ -47,17 +47,19 @@ of bytes, and `finish` pads the message and returns the digest as a
 struct Md5 { state: [u32; 4], block: [u8; 64], used: i64, total: u64 }
 
 impl Md5 {
-    fn update(self: *Md5, data: [u8]) { ... }
-    fn finish(self: *Md5) -> [u8; 16] { ... }
+    fn update(self: &mut Md5, data: [u8]) { ... }
+    fn finish(self: &mut Md5) -> [u8; 16] { ... }
 }
 ```
 
-Methods take `self: *Md5`, a pointer, to change the state in place;
-`hash.update(...)` passes `&hash` itself.
+Methods take `self: &mut Md5`, an exclusive reference, to change the
+state in place; `hash.update(...)` passes `&mut hash` itself.
 
 **Slices of an array.** `compress` gets each block as a slice,
 `data[at..at + 64]`, a view (pointer and length) into the bytes read: no
-copy. Indexing and slicing are bounds-checked.
+copy. Indexing and slicing are bounds-checked. The pending block is the
+exception: `self.compress(self.block[..])` would view `self` while the
+call changes it, so `update` copies the 64 bytes first.
 
 **Reading through C.** The file is read 64 KB at a time with the C
 library's `read`, declared by hand; `defer` closes the file whatever

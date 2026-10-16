@@ -91,7 +91,6 @@ builds each line in a `Buf`:
 
 ```tach
 let mut line = format_in(f"{at:04x}  ", gpa); // format: a new Buf to keep
-defer line.free();
 for i in at..at + 8 {
     if i < end { line.push_fmt(f"{bytes[i]:02x} "); } else { line.push_str("   "); }
 }

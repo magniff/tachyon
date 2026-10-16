@@ -39,9 +39,7 @@ all (see [fixed-buffer](../fixed-buffer/)).
 ```tach
 fn main(gpa: Gpa) -> i32 {
     let mut input = read_stdin_in(gpa).unwrap();
-    defer input.free();
     let mut orders = parse_orders(input.as_slice(), gpa);
-    defer orders.free();
 ```
 
 Each standard-library function that allocates has an `_in` form taking
@@ -54,7 +52,6 @@ that allocates takes it the same way and passes it on:
 fn parse_orders(text: [u8], gpa: Gpa) -> Vec<Order> {
     let mut orders: Vec<Order> = Vec::new_in(gpa);
     let mut lines = split_in(text, '\n', gpa);
-    defer lines.free();
 ```
 
 There are four kinds of function in `main.tach`, by what they are given:
@@ -63,12 +60,12 @@ There are four kinds of function in `main.tach`, by what they are given:
 |---|---|---|
 | `parse_orders` | `(text: [u8], gpa: Gpa) -> Vec<Order>` | from the `gpa` it is passed |
 | `total` | `(orders: [Order]) -> i64` | never: a slice and no allocator |
-| `by_customer` | `(orders: *Vec<Order>) -> HashMap<[u8], i64>` | from the allocator the Vec holds: `orders.allocator()` |
+| `by_customer` | `(orders: &Vec<Order>) -> HashMap<[u8], i64>` | from the allocator the Vec holds: `orders.allocator()` |
 | `count_items` | `<A: Allocator>(orders: [Order], a: A) -> HashMap<[u8], i64, A>` | from whichever allocator the caller picks |
 
 A container keeps its allocator: `Vec<T>` is short for `Vec<T, Gpa>`
 (and costs three words, as before: a `Gpa` takes no bytes), and its
-`push`, `clone` and `free` use the allocator it holds. That is why
+`push`, `clone` and drop use the allocator it holds. That is why
 `by_customer` needs no allocator parameter: it makes its map on the one
 the orders' Vec was made with. And it is why `total`, which takes a
 slice, cannot allocate: a slice is a view, it holds no allocator.
@@ -155,15 +152,13 @@ $ tachyonc old.tach -o old && ./old
 hello! explicit! allocation!
 ```
 
-It compiles and runs; it also frees nothing, which went unnoticed in
-0.15 and is listed by `--check-alloc` (below) now:
+It compiles and runs, and frees what it allocated: since 0.17 `words`
+and `b` are dropped at the end of `main`, so `--check-alloc` (below)
+finds nothing left:
 
 ```console
 $ tachyonc --check-alloc old.tach -o old && ./old
 hello! explicit! allocation!
-check-alloc: 2 blocks of Gpa not freed (104 bytes):
-  block #1 (64 bytes), allocated at old.tach:16:28
-  block #5 (40 bytes), allocated at old.tach:9:9
 ```
 
 A function that allocates and is not given an allocator cannot make
@@ -172,8 +167,7 @@ one: `gpa` is a name like any other, and here it is not in scope.
 ```console
 $ cat > count.tach <<'EOF'
 > fn count(text: [u8]) -> i64 {
->     let mut words = std::split_whitespace_in(text, gpa);
->     defer words.free();
+>     let words = std::split_whitespace_in(text, gpa);
 >     words.len()
 > }
 >
@@ -183,7 +177,7 @@ $ cat > count.tach <<'EOF'
 > }
 > EOF
 $ tachyonc check count.tach
-count.tach:2:52: error[type error] undefined variable 'gpa'
+count.tach:2:48: error[type error] undefined variable 'gpa'
 [exit 1]
 ```
 
@@ -224,8 +218,8 @@ captures, the containers it was handed) **or reaches through statics**
 
 ## Checking the frees
 
-Every container here is freed with `defer x.free()` right after it is
-made. `--check-alloc` builds the program with a checking `Gpa` that
+Every container here is dropped at the end of its scope: no `free` is
+written. `--check-alloc` builds the program with a checking `Gpa` that
 lists, at exit, every block still allocated (and stops at a use after
 free or a double free: see [check-alloc](../check-alloc/)). It lists
 nothing here: stdout is as before, and stderr has only the skipped
