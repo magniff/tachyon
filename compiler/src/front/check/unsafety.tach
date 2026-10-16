@@ -20,20 +20,23 @@
 // a warning in 0.9). `--fix-unsafe` wraps them in unsafe blocks
 // (fixunsafe.tach).
 
-use crate::base::{SRC, buf_fmt, buf_new, buf_slice};
+use crate::base::{SRC, buf_fmt, buf_new, buf_slice, intern_c};
 use crate::base::diag::{
     ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_help_fmt, err_str,
     err_try_fmt, err_try_tool, error_keyed, report_error_once,
 };
 use crate::front::ambient::check_ambient_call;
-use crate::front::ast::{FN_UNSAFE, NODES, child};
-use crate::front::ast::NodeKind::{FieldAccess, Ident, TupleField, TyPtr, Unary};
+use crate::front::ast::{FN_UNSAFE, NODES, NodeKind, child};
+use crate::front::ast::NodeKind::{
+    Cast, FieldAccess, Ident, TupleField, TyName, TyPtr, TySlice, Unary,
+};
 use crate::front::check::{CONST_CONTEXT, LOCALS, Res};
 use crate::front::check::assign::ASSIGNING;
 use crate::front::check::check_mode::check_expr;
 use crate::front::check::synth_mode::synth_expr;
+use crate::front::generics::env_lookup;
 use crate::front::lexer::Tok;
-use crate::front::types::{FNS, TY_BOOL, err_type, is_numeric};
+use crate::front::types::{FNS, STRUCTS, TYPES, TY_BOOL, TyKind, err_type, is_numeric};
 use crate::tools::fixunsafe::{FIX_UNSAFE, note_unsafe_site};
 
 pub static mut UNSAFE_DEPTH: i64 = 0;
@@ -260,6 +263,88 @@ pub fn is_borrow(e: i64) -> bool {
         }
         if kind == Ident && NODES[e].res == Res::Local && NODES[e].y >= 0 {
             return LOCALS[NODES[e].y].borrow;
+        }
+        false
+    }
+}
+
+// (0.17, decided 2026-10-16) What type node t, as written, makes of a
+// type parameter: 1 for `*P`, 2 for `[P]`, 0 otherwise. P is one of the
+// parameters of Generics node `params`, or, for `params` -1, one in scope.
+pub fn written_param(t: i64, params: i64) -> i64 {
+    unsafe {
+        if t == 0 || (NODES[t].kind != TyPtr && NODES[t].kind != TySlice) {
+            return 0;
+        }
+        let inner = NODES[t].a;
+        if inner == 0 || NODES[inner].kind != TyName || NODES[inner].g != 0
+            || NODES[inner].count != 0 {
+            return 0;
+        }
+        let name = NODES[inner].a;
+        let mut found = false;
+        if params < 0 {
+            found = env_lookup(name) != 0;
+        } else if params > 0 {
+            for i in 0..NODES[params].count {
+                if NODES[child(params, i)].a == name {
+                    found = true;
+                }
+            }
+        }
+        if !found {
+            0
+        } else if NODES[t].kind == TyPtr {
+            1
+        } else {
+            2
+        }
+    }
+}
+
+// (0.17, decided 2026-10-16) Whether pointer expression e (checked) points,
+// as written, to a type parameter: a local or parameter `p: *T` (or one
+// initialized from such an expression), a field declared `*T` in a generic
+// struct, `x as *T`, the `ptr` of a local `s: [T]`. Then `p[i]` is pointer
+// arithmetic for every T, a Vec's too: a generic body means one thing in
+// every instance.
+pub fn pointee_is_param(e: i64) -> bool {
+    unsafe {
+        let kind = NODES[e].kind;
+        if kind == Ident && NODES[e].res == Res::Local && NODES[e].y >= 0 {
+            return LOCALS[NODES[e].y].twritten == 1;
+        }
+        if kind == Cast {
+            return written_param(NODES[e].b, -1) == 1;
+        }
+        if kind != FieldAccess {
+            return false;
+        }
+        let base = NODES[e].a;
+        let mut bt = NODES[base].ty;
+        if bt <= 0 {
+            return false;
+        }
+        if TYPES[bt].kind == TyKind::Slice {
+            return NODES[e].b == intern_c(c"ptr") && NODES[base].kind == Ident
+                && NODES[base].res == Res::Local && NODES[base].y >= 0
+                && LOCALS[NODES[base].y].twritten == 2;
+        }
+        if TYPES[bt].kind == TyKind::Ptr {
+            bt = TYPES[bt].a;
+        }
+        if TYPES[bt].kind != TyKind::Struct {
+            return false;
+        }
+        let item = STRUCTS[TYPES[bt].a].node;
+        if item <= 0 || NODES[item].kind != NodeKind::Struct {
+            return false;
+        }
+        for i in 0..NODES[item].count {
+            let field = child(item, i);
+            if NODES[field].a == NODES[e].b {
+                return written_param(NODES[field].b, NODES[item].g) == 1;
+            }
         }
         false
     }

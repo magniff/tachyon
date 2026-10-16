@@ -1547,10 +1547,14 @@ is: the type decides what they mean. Whether the pointer is a borrow
 decides only safety: through a borrow (a pointer parameter, `&v`) they
 are safe; through a raw pointer (a `mut` parameter, a local, a field, a
 static) they read through it, so they are `unsafe` (the error's try: is
-`fix --only unsafe`, or `v[i]` for a local `let p = &v;`). Generic code
-over an array of `T` behind a `*T` (std's Vec) therefore does not write
-`p[i]`, which would index the pointee when `T` is a Vec: it takes the
-element's address (cast through `*u8`). `p[0]` on a pointer to anything
+`fix --only unsafe`, or `v[i]` for a local `let p = &v;`). The type is
+the one written in the source, not an instance's: where p points, as
+written, to a type parameter (`p: *T`, a field `*T` of a generic struct,
+`x as *T`, the `ptr` of an `s: [T]`, a local from one of these), `p[i]`
+is pointer arithmetic for every `T`, a Vec too, so a generic body means
+one thing in every instance (std's Vec indexes its `ptr: *T` so); only a
+pointee written as a Vec, a Buf or a slice (`*Vec<T>`) is indexed
+(decided 2026-10-16, for the user's review). `p[0]` on a pointer to anything
 else is pointer arithmetic; through a borrow its error names `*p`, the
 value it points to (`try: *out = acc` for `out[0] = acc`).
 
