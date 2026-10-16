@@ -25,6 +25,24 @@ hook.log = lambda gd, record: LOGGED.append({**hook.IDENT, **record})
 hook.query_ready = lambda gd, cwd: True
 hook.git_dir = lambda cwd: "/nonexistent"
 
+# (0.18.1) The tree these cases run in is their checkout even when it has
+# no .git of its own: a release's tree as bootstrap.sh extracts it (`git
+# archive`, under the target/ of another checkout or of none), where the
+# hook would otherwise take every file for a scratch copy.
+TREE = os.path.dirname(os.path.dirname(HERE))
+_checkout_of = hook.checkout_of
+
+
+def checkout_of(cwd):
+    top, gd = _checkout_of(cwd)
+    d = os.path.abspath(cwd or os.getcwd())
+    if (d + "/").startswith(TREE + "/"):
+        return TREE, gd
+    return top, gd
+
+
+hook.checkout_of = checkout_of
+
 
 OUT = [""]
 
