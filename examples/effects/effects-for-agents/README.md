@@ -98,9 +98,9 @@ main.tach:10:40: error[type error] expected 'Arena', got 'Gpa'  [in crate::main]
 markup.tach:11:25: error[type error] expected 'Gpa', got 'Arena'  [edited: crate::markup::lines]
 markup.tach:31:5: error[type error] expected 'Buf', got 'Buf<Arena>'  [edited: crate::markup::slug]
 markup.tach:56:44: error[type error] expected 'Gpa', got 'Arena'  [edited: crate::markup::headings]
-markup.tach:75:25: error[type error] expected '*Buf', got '*Buf<Arena>'  [edited: crate::markup::render]
-markup.tach:90:28: error[type error] expected '*Buf', got '*Buf<Arena>'  [edited: crate::markup::render]
-markup.tach:100:23: error[type error] expected '*Buf', got '*Buf<Arena>'  [edited: crate::markup::render]
+markup.tach:75:25: error[type error] expected '*Buf', got '&Buf<Arena>'  [edited: crate::markup::render]
+markup.tach:90:28: error[type error] expected '*Buf', got '&Buf<Arena>'  [edited: crate::markup::render]
+markup.tach:100:23: error[type error] expected '*Buf', got '&Buf<Arena>'  [edited: crate::markup::render]
 markup.tach:107:5: error[type error] expected 'Buf', got 'Buf<Arena>'  [edited: crate::markup::render]
 warning edit.breaks: 8 new errors (7 in the edited text, 1 in crate::main, which the edit does not change) (dry run)
 ```

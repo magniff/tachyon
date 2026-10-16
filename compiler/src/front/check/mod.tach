@@ -72,8 +72,8 @@ use crate::front::traits::{
     init_traits, trait_named,
 };
 use crate::front::types::{
-    ENUMS, FNS, FN_COUNT, STRUCTS, TLISTS, TSCRATCH, TYPES, TY_BOOL, TY_ERROR, TY_I64, TY_U8,
-    TyKind, buf_type, err_type, is_integer, is_numeric, type_elem,
+    ENUMS, FNS, FN_COUNT, REF_MUT, REF_SHARED, STRUCTS, TLISTS, TSCRATCH, TYPES, TY_BOOL, TY_ERROR,
+    TY_I64, TY_U8, TyKind, buf_type, err_type, is_integer, is_numeric, is_ref, type_elem,
 };
 use crate::tools::fiximports::report_legacy_imports;
 use crate::tools::query::command_line::QUERY;
@@ -89,6 +89,7 @@ use crate::front::derive::{check_derives, expand_derives};
 use crate::front::effects::EFFECTS_WANTED;
 use crate::front::effects::check::{check_effects, effects_declared};
 use crate::front::effects::infer::{infer_effects, note_body_failed};
+use crate::front::lexer::Tok;
 
 // What an identifier names.
 pub enum Res { None, Local, Const, Static, Fn }
@@ -187,9 +188,27 @@ fn mismatch_help(n: i64, expected: i64, actual: i64) {
             err_help(c"a Vec's elements are its slice");
             buf_fmt(t, f"{open}{text}{close}.as_slice()");
         } else if ek == TyKind::Ptr && TYPES[expected].a == actual {
-            err_help(c"a pointer to it: its address");
-            buf_fmt(t, f"&{text}");
+            if TYPES[expected].b == REF_MUT {
+                // (0.17)
+                err_help(c"an exclusive reference to it");
+                buf_fmt(t, f"&mut {text}");
+            } else {
+                err_help(c"a pointer to it: its address");
+                buf_fmt(t, f"&{text}");
+            }
             exact = simple;
+        } else if ek == TyKind::Ptr && ak == TyKind::Ptr && TYPES[expected].a == TYPES[actual].a
+            && TYPES[expected].b == REF_MUT && TYPES[actual].b == REF_SHARED && k == NodeKind::Unary
+            && NODES[n].op == Tok::Amp {
+            // (0.17) `&x` where `&mut T` is expected
+            err_help(
+                c"the parameter is `&mut`: the callee may change it; pass an exclusive reference");
+            let operand = NODES[n].b;
+            buf_fmt(t, f"&mut {SRC[NODES[operand].start..NODES[operand].end]}");
+        } else if ek == TyKind::Ptr && ak == TyKind::Ptr && TYPES[expected].a == TYPES[actual].a
+            && TYPES[expected].b != 0 && TYPES[actual].b == 0 {
+            // (0.17) a raw pointer where a reference is expected
+            err_help(c"a raw pointer is not a reference: nothing checks what it points to; pass `&place`, or, in unsafe code, `&*p`");
         }
         if BUFS[t].len > 0 {
             err_try_fmt(buf_slice(t));
@@ -249,7 +268,9 @@ pub fn define_local(name: i64, ty: i64, mutable: bool, is_param: bool) -> i64 {
         LOCALS = grow(LOCALS, LOCAL_COUNT, &LOCAL_CAP);
         let id = LOCAL_COUNT;
         LOCALS[id] = Local {
-            name: name, ty: ty, mutable: mutable, is_param: is_param, offset: 0, borrow: false,
+            name: name, ty: ty, mutable: mutable, is_param: is_param, offset: 0,
+            // (0.17: a reference is a borrow)
+            borrow: ty > 0 && is_ref(ty),
             tparam: 0,
         };
         LOCAL_COUNT += 1;

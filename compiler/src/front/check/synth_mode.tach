@@ -10,8 +10,8 @@ use crate::base::diag::{
     err_try_fmt,
 };
 use crate::front::ast::{
-    NODES, NODE_CHECKED, NODE_RAW, NodeKind, REPR_UNION, child, list_begin, list_end, list_push,
-    new_node,
+    NODES, NODE_CHECKED, NODE_RAW, NODE_REF_MUT, NodeKind, REPR_UNION, child, list_begin, list_end,
+    list_push, new_node,
 };
 use crate::front::ast::NodeKind::{
     Arm, Array, Assign, Binary, Block, Bool, Break, CStr, Call, Cast, Char, Closure, Continue,
@@ -52,11 +52,12 @@ use crate::front::modules::STD_MODULE;
 use crate::front::patterns::check_match;
 use crate::front::traits::{binary_op_trait, has_impl, negation_call, operator_call, std_trait};
 use crate::front::types::{
-    ENUMS, STRUCTS, TSCRATCH, TYPES, TY_BOOL, TY_ERROR, TY_F32, TY_F64, TY_I16, TY_I32, TY_I64,
-    TY_I8, TY_NEVER, TY_STRING, TY_U16, TY_U32, TY_U64, TY_U8, TY_U8_PTR, TY_UNIT, TyKind, VARIANTS,
-    array_of, enum_variant, err_type, find_field, find_method, int_bits, int_max, is_compound,
-    is_fieldless_enum, is_integer, is_numeric, is_pointer, is_signed, is_vector, make_type,
-    primitive_name, ptr_to, slice_of, struct_field, type_align, type_elem, type_size,
+    ENUMS, REF_MUT, REF_SHARED, STRUCTS, TSCRATCH, TYPES, TY_BOOL, TY_ERROR, TY_F32, TY_F64, TY_I16,
+    TY_I32, TY_I64, TY_I8, TY_NEVER, TY_STRING, TY_U16, TY_U32, TY_U64, TY_U8, TY_U8_PTR, TY_UNIT,
+    TyKind, VARIANTS, array_of, enum_variant, err_type, find_field, find_method, int_bits, int_max,
+    is_compound, is_fieldless_enum, is_integer, is_numeric, is_pointer, is_signed, is_vector,
+    make_type, mut_slice_of, primitive_name, ptr_to, ref_to, slice_of, struct_field, type_align,
+    type_elem, type_size,
 };
 use crate::gen0::target::enum_panic_kind;
 
@@ -800,10 +801,45 @@ fn synth_unary(n: i64) -> i64 {
         // Tok::Amp: taking an address reads nothing (a union's field too).
         mark_no_read(operand);
         let ty = synth_expr(operand);
+        let mutable = (NODES[n].p & NODE_REF_MUT) != 0;
         if !is_place(operand) {
+            if TYPES[ty].kind == TyKind::Slice {
+                // (0.17) `&s[a..b]`, `&mut a[..]`: a slice value is its own
+                // view; `&mut` makes it the exclusive `&mut [T]`
+                let flags = NODES[n].p;
+                NODES[n] = NODES[operand];
+                NODES[n].p |= flags & NODE_REF_MUT;
+                return if mutable { mut_slice_of(TYPES[ty].a) } else { ty };
+            }
             type_error(n, c"cannot take address of non-lvalue expression");
         }
-        ptr_to(ty)
+        // (0.17) `&place` is a reference, `&mut place` an exclusive one
+        // (docs/design/value-semantics.md §2.3); a place reached through a
+        // raw pointer gives a raw pointer, as before; `&*p` (unsafe) makes
+        // one a reference.
+        if reached_through_raw(operand)
+            && !(NODES[operand].kind == Unary && NODES[operand].op == Tok::Star) {
+            return ptr_to(ty);
+        }
+        ref_to(ty, if mutable { REF_MUT } else { REF_SHARED })
+    }
+}
+
+// (0.17) Whether place expression e (checked) is reached through a raw
+// pointer: a dereference, a field or an index of one.
+fn reached_through_raw(e: i64) -> bool {
+    unsafe {
+        if (NODES[e].p & NODE_RAW) != 0 {
+            return true;
+        }
+        let k = NODES[e].kind;
+        if k == FieldAccess || k == TupleField || k == Index {
+            return reached_through_raw(NODES[e].a);
+        }
+        if k == Unary && NODES[e].op == Tok::Star {
+            return reached_through_raw(NODES[e].b);
+        }
+        false
     }
 }
 
