@@ -8,9 +8,10 @@ use crate::base::intern_c;
 use crate::base::diag::{err_begin, err_end_soft, err_help, err_help_sym, err_str, err_sym};
 use crate::front::ast::{NODES, NODE_IMPLICIT, STRUCT_SEALED, child};
 use crate::front::check::collect::find_generic_method;
+use crate::front::check::unsafety::NODE_NO_READ;
 use crate::front::modules::{MODULES, STD_MODULE, is_within, module_of};
 use crate::front::parser::items::ITEM_PUBLIC;
-use crate::front::types::{STRUCTS, find_method, struct_type};
+use crate::front::types::{STRUCTS, find_field, find_method, struct_type};
 
 // Whether node n, of struct s, is code outside the module sealing s.
 fn sealed_away(n: i64, s: i64) -> bool {
@@ -64,8 +65,10 @@ pub fn check_field(n: i64, s: i64) {
         err_sym(name);
         err_str(c"' is private to");
         err_module(s);
-        if find_method(struct_type(s), name) >= 0
-            || (STRUCTS[s].tmpl != 0 && find_generic_method(STRUCTS[s].tmpl, name) >= 0) {
+        // (a read of a method's name; a write, `v.len = n`, `&v.len`, has
+        // no method to call)
+        if (NODES[n].p & NODE_NO_READ) == 0 && (find_method(struct_type(s), name) >= 0
+            || (STRUCTS[s].tmpl != 0 && find_generic_method(STRUCTS[s].tmpl, name) >= 0)) {
             err_help(c"call its method: '.");
             err_help_sym(name);
             err_help(c"()'");
@@ -75,6 +78,26 @@ pub fn check_field(n: i64, s: i64) {
             err_help(c"' (its fields change only through them: `.len()`, `.as_slice()`, ...)");
         }
         err_end_soft();
+    }
+}
+
+// (0.17) Whether `x.len` on std's struct s, at node n, reads as `x.len()`:
+// s has a `len` method and no `len` field n can see (Vec's is sealed, a
+// Buf has none), so both spellings mean the length.
+pub fn len_reads_as_method(n: i64, s: i64) -> bool {
+    unsafe {
+        let t = template_of(s);
+        if STD_MODULE < 0 || STRUCTS[t].module != STD_MODULE {
+            return false;
+        }
+        let name = intern_c(c"len");
+        let field = find_field(s, name);
+        if field >= 0 && (!sealed_away(n, s)
+            || (NODES[child(STRUCTS[t].node, field)].p & ITEM_PUBLIC) != 0) {
+            return false;
+        }
+        find_method(struct_type(s), name) >= 0
+            || (STRUCTS[s].tmpl != 0 && find_generic_method(STRUCTS[s].tmpl, name) >= 0)
     }
 }
 

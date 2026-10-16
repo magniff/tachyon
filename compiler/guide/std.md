@@ -60,7 +60,8 @@ prelude names need no import: `Option`, `Some`, `None`, `Result`, `Ok`,
 `Ord`, `Hash`, `Iterator`, `Display`, `Debug`, `Clone`, `From`, `Into`,
 and (0.17) `Buf`, `HashMap`, `read_line`, `read_stdin_in`, `Scanner`,
 `parse_int`, `trim`, `split_in`, `split_whitespace_in`, `sort`,
-`sort_by`, `cmp_of`, `eq_of`, `Fmt`, `panic(msg)` and `unreachable()`.
+`sort_by`, `sort_stable`, `sort_stable_by` (and their `_in` forms),
+`cmp_of`, `eq_of`, `Fmt`, `panic(msg)` and `unreachable()`.
 Anything else is used by path (`std::print_int(n)`) or imported by name
 (`use std::{IoError, is_digit};`).
 

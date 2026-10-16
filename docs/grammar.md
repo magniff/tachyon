@@ -1520,7 +1520,8 @@ is [design/value-semantics.md](design/value-semantics.md)'s.)
 
 **The prelude** gains `Buf`, `HashMap`, `read_line`, `read_stdin_in`,
 `Scanner`, `parse_int`, `trim`, `split_in`, `split_whitespace_in`,
-`sort`, `sort_by`, `cmp_of`, `eq_of`, `Fmt`, `panic` and `unreachable`
+`sort`, `sort_by`, the stable sorts (`sort_stable`, `sort_stable_by`,
+`sort_stable_in`, `sort_stable_by_in`), `cmp_of`, `eq_of`, `Fmt`, `panic` and `unreachable`
 (and `read_stdin`, `split`, `split_whitespace`, whose use is the error
 naming their `_in` form). As before it comes last (a program's own
 `trim` hides it), and std is loaded only for a program that uses one of
@@ -1546,7 +1547,10 @@ Vec indexes the pointer, as before (`unsafe`).
 
 **`len()`.** `s.len()` on a slice is its field `s.len`; `a.len()` on
 an array (a variable, constant, static or a field of one) is its
-length, an `i64`. The field stays.
+length, an `i64`. The field stays. The other way round, `a.len` on such
+an array is its length, and `v.len` on std's `Vec`, `Buf` and `HashMap`
+(whose `len` field is sealed, or which have none) is `v.len()`: a read
+only; `v.len = n` and `&v.len` are still errors.
 
 **Paths.** A `use` path's first segment that is not `crate`, `self`,
 `super`, `std` nor a name of the module it is written in is looked up
@@ -1557,7 +1561,8 @@ are modules and differ (`crate::a::lexer` beside `crate::a::parser`, and
 `crate::lexer`), it is an error, `ambiguous module`, whose `try:` lines
 are the two `crate::` paths. Paths in expressions are unchanged: a
 sibling there is `crate::lexer::next(..)` or imported (`use
-crate::lexer;`; the error `unknown module 'lexer'` names that line).
+crate::lexer;`; the error `unknown module 'lexer'` names that line, in
+an expression, a type or a struct literal's path).
 `use m::{self, X};` is not supported: its error's `try:` is `use m;`.
 
 ## Importing C headers

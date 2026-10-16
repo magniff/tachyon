@@ -24,7 +24,7 @@ use crate::front::check::assign::{check_assign, is_place};
 use crate::front::check::body::{
     check_block, check_break, check_for, check_loop, check_return, check_while, find_loop, synth_if,
 };
-use crate::front::check::calls::{synth_method, synthetic_unary};
+use crate::front::check::calls::{is_plain_place, synth_method, synthetic_unary};
 use crate::front::check::calls::paths::{synth_call, synth_path};
 use crate::front::check::check_mode::{check_expr, check_struct_fields, int_range_help};
 use crate::front::check::equality::{eq_unsupported, structural_eq};
@@ -32,7 +32,7 @@ use crate::front::check::interp::check_interp;
 use crate::front::check::iterate::range_value;
 use crate::front::check::names::{NODE_RESOLVED, near_to, synth_name};
 use crate::front::check::resolve::resolve_type;
-use crate::front::check::sealed::check_field;
+use crate::front::check::sealed::{check_field, len_reads_as_method};
 use crate::front::check::try_op::check_try;
 use crate::front::check::unsafety::{
     NODE_NO_READ, U_DEREF, U_FIELD, U_INDEX, U_INT_PTR, U_SLICE, U_UNION, is_borrow, mark_no_read,
@@ -417,6 +417,19 @@ fn synth_field(n: i64) -> i64 {
             err_str(c"'");
             err_end();
         }
+        // (0.17) `v.len` on std's Vec, Buf or HashMap (its field sealed, or
+        // none) reads as `v.len()`, and `a.len` on an array place as
+        // `a.len()`: both spellings are the length. A write (`v.len = n`,
+        // `&v.len`) stays the sealed field's error.
+        if name == intern_c(c"len") && (NODES[n].p & NODE_NO_READ) == 0
+            && len_is_method(n, base_ty) {
+            NODES[NODES[n].a].p |= NODE_CHECKED;
+            NODES[n].kind = MethodCall;
+            NODES[n].x = 0;
+            NODES[n].list = 0;
+            NODES[n].count = 0;
+            return synth_method(n);
+        }
         if TYPES[base_ty].kind == TyKind::Ptr && TYPES[TYPES[base_ty].a].kind == TyKind::Struct {
             NODES[n].y = 1;
             base_ty = TYPES[base_ty].a;
@@ -459,6 +472,21 @@ fn synth_field(n: i64) -> i64 {
             unsafe_op(n, U_UNION, c"reading a field of a union is unsafe");
         }
         (*struct_field(s, field)).ty
+    }
+}
+
+// (0.17) Whether `x.len` (node n, x of type t) is read as `x.len()`: an
+// array place, or std's Vec, Buf, HashMap (or a pointer to one).
+fn len_is_method(n: i64, t: i64) -> bool {
+    unsafe {
+        if TYPES[t].kind == TyKind::Array {
+            return is_plain_place(NODES[n].a);
+        }
+        let mut st = t;
+        if TYPES[st].kind == TyKind::Ptr {
+            st = TYPES[st].a;
+        }
+        TYPES[st].kind == TyKind::Struct && len_reads_as_method(n, TYPES[st].a)
     }
 }
 
