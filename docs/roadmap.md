@@ -1112,6 +1112,36 @@ Moved to 0.18.1:
   "Benchmarks", 0.18);
 - 0.17.1's list (above) stands.
 
+Done (0.18.1). Code generation on threads (T7: `-j N`, the per-function
+state in `FnCtx`, byte-identical output for every N, tests/threads.sh)
+and incremental rebuilds (T8: the code cache, tests/incremental.sh); V4
+(every `*T` raw; compiler/src and std on references); two use-after-free
+holes in safe code closed (a changed copy of a borrowed owned value, a
+reference into a Vec across a push); the contracts' evidence in
+generated code with two range fixes, `x % n` ranges and entry facts;
+the 0.18 eval's polish (BinaryHeap/MinHeap, binding modes on references,
+`&f()` temporaries, let-else, `ok:` lines, the check hook applying
+fixes, one `len()`); a valgrind row in the gate and a lock on the
+bootstrap cache. The release gate's record is in "Benchmarks", 0.18.1.
+
+Moved to 0.18.2 or 0.19:
+- the compiler's source on arenas (design §4.1, §4.2: the front end's
+  tables as `Vec<T, Comp>`, the syntax tree's arena released after
+  lowering, per-function IR arenas);
+- incrementality in the front end, and per-function assembly (the -O2
+  -j8 rebuild's serial parts: front end 127 ms, lowering 51,
+  interprocedural constants 49, dead functions 36);
+- contracts: the checking entry for indirect calls (they skip a
+  requires; their callees assume nothing), a `len >= 0` invariant and
+  offsets (`i + 4 <= len` against `i + k < len`, window's +24%), a min
+  as a loop bound, rotated loops, non-negative while-loop indices, `query
+  checks crate`;
+- the Allocator trait's `self: *Self` on references (0.18.0 builds
+  compiler/src, so 0.19);
+- `HashMap::get_or_insert -> &mut V` and the other reference results
+  (0.17.1's projections);
+- the items of 0.18.1's list above not named here, and 0.17.1's.
+
 ## After 0.18: a standard library, and a real program on it
 
 Planned with the user on 2026-10-14, to start once 0.18 has shipped. The
