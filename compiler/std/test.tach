@@ -1,0 +1,756 @@
+// ---- Testing (0.18) ----
+
+// What `#[property]` tests and `#[fuzz]` targets draw their values from,
+// and the runtime of a test build (docs/design/contracts-verification.md
+// §2.6, §2.7, 0.18 T2). `tachyonc test` builds the program with
+// `--test-build`: the compiler (front/tests) writes a `main` that runs the
+// test its arguments name, and a generator for each property's
+// parameters, built from their types (an `impl Arbitrary` where there is
+// one). A value is drawn from a choice sequence of u64s, and smaller
+// choices make simpler values (0: 0, false, empty, None, the first
+// variant): a failing case is shrunk by shortening and lowering its
+// sequence, then replaying it. Generators take `&mut Gen` (0.17).
+
+// A type's own generator, used in place of the structural one.
+pub trait Arbitrary {
+    fn arbitrary(g: &mut Gen) -> Self;
+}
+
+pub struct Gen {
+    choices: *u64, count: i64, at: i64, size: i64, gpa: Gpa, depth: i64,
+    showing: bool, report: i32, raw: bool,
+}
+
+impl Gen {
+    // An integer: 0, -1, 1, -2, 2, ... as the choice grows (the edges,
+    // i64::MIN and i64::MAX, are the largest choices).
+    pub fn int(self: &mut Gen) -> i64 {
+        let c = self.draw();
+        ((c >> 1) as i64) ^ -((c & 1) as i64)
+    }
+
+    // An integer in lo..=hi (lo first).
+    pub fn int_in(self: &mut Gen, lo: i64, hi: i64) -> i64 {
+        let c = self.draw();
+        if hi <= lo {
+            return lo;
+        }
+        let span = (hi - lo) as u64 + 1;
+        if span == 0 {
+            return lo + c as i64;
+        }
+        lo + (c % span) as i64
+    }
+
+    // One of 0..n.
+    pub fn choose(self: &mut Gen, n: i64) -> i64 {
+        let c = self.draw();
+        if n <= 1 { 0 } else { (c % n as u64) as i64 }
+    }
+
+    pub fn bool(self: &mut Gen) -> bool {
+        self.draw() % 2 == 1
+    }
+
+    // The size this case may grow to (it grows with the case number).
+    pub fn size(self: &mut Gen) -> i64 {
+        self.size
+    }
+
+    // A text byte: letters and digits first, then spaces, punctuation,
+    // newlines and the rest.
+    pub fn text_byte(self: &mut Gen) -> u8 {
+        let c = self.draw();
+        let common = "abcdefghijklmnopqrstuvwxyz0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ\n.,-_:;()+*/=";
+        if c < 200 {
+            return common[(c % common.len as u64) as i64];
+        }
+        (c % 256) as u8
+    }
+}
+
+// x's `{:?}` text against tests/snapshots/MODULE__TEST__N.snap: a missing
+// file is written (a new snapshot, the test passes), a different one
+// fails with its first differing line; `tachyonc test --accept` writes
+// the current text.
+pub fn assert_snapshot<T: Debug>(x: T) {
+    let gpa = Gpa {};
+    TEST_SNAP_COUNT += 1;
+    let mut text = format_in(f"{x:?}", gpa);
+    text.push('\n');
+    let mut path = Buf::new_in(gpa);
+    let mut shown = Buf::new_in(gpa);
+    if TEST_SNAPSHOTS != 0 as *u8 {
+        unsafe { path.push_cstr(TEST_SNAPSHOTS) };
+        path.push('/');
+    } else {
+        path.push_str("tests/");
+    }
+    shown.push_str("tests/");
+    path.push_str("snapshots");
+    // (the tests directory, then its snapshots/)
+    let mut dir = Buf::new_in(gpa);
+    let at = path.len() - 10;
+    dir.push_str(path.as_slice()[0..at]);
+    dir.push(0);
+    unsafe { mkdir(dir.as_slice().ptr, 493) };
+    dir.clear();
+    dir.push_str(path.as_slice());
+    dir.push(0);
+    unsafe { mkdir(dir.as_slice().ptr, 493) };
+    dir.free();
+    let mut file = Buf::new_in(gpa);
+    file.push_str("/");
+    let module = TEST_MODULE;
+    let mut i = 0;
+    while i < module.len {
+        if module[i] == ':' {
+            file.push_str("__");
+            i += 2;
+        } else {
+            file.push(module[i]);
+            i += 1;
+        }
+    }
+    if module.len > 0 {
+        file.push_str("__");
+    }
+    file.push_str(TEST_NAME);
+    file.push_str("__");
+    file.push_int(TEST_SNAP_COUNT);
+    file.push_str(".snap");
+    path.push_str(file.as_slice());
+    shown.push_str("snapshots");
+    shown.push_str(file.as_slice());
+    path.push(0);
+    let cpath = path.as_slice().ptr;
+    let mut old = Buf::new_in(gpa);
+    let had = unsafe { test_read_file(cpath, &old) };
+    if had && old.as_slice() == text.as_slice() {
+    } else if !had || TEST_ACCEPT {
+        if !unsafe { test_write_file(cpath, text.as_slice()) } {
+            eprintln(f"snapshot {shown.as_slice()}: cannot write {path.as_slice()}");
+            unsafe { exit(101) };
+        }
+        println(
+            f"tachyon-test: snapshot {if had { "accepted" } else { "new" }} {shown.as_slice()}");
+    } else {
+        let mut k = 0;
+        while test_line(old.as_slice(), k) == test_line(text.as_slice(), k) {
+            k += 1;
+        }
+        eprintln(
+            f"snapshot differs: {shown.as_slice()} line {k + 1}: '{test_line(old.as_slice(), k)}' expected, got '{test_line(text.as_slice(), k)}'");
+        unsafe { exit(101) };
+    }
+    text.free();
+    path.free();
+    shown.free();
+    file.free();
+    old.free();
+}
+
+// ---- The test runtime's implementation (0.18) ----
+
+// A test build's main (front/tests makes it) runs one test: a #[test]
+// in the process, a property's cases each in a child process; the
+// generators of the types a property takes; snapshots' files.
+
+extern "C" {
+    #[effects(io)]
+    fn fork() -> i32;
+    #[effects(io)]
+    fn waitpid(pid: i32, status: *i32, options: i32) -> i32;
+    #[effects(io)]
+    fn pipe(fds: *i32) -> i32;
+    #[effects(io)]
+    fn dup2(from: i32, to: i32) -> i32;
+    #[effects(io)]
+    fn close(fd: i32) -> i32;
+    #[effects(io)]
+    fn open(path: *u8, flags: i32) -> i32;
+    #[effects(io)]
+    fn creat(path: *u8, mode: u32) -> i32;
+    #[effects(io)]
+    fn mkdir(path: *u8, mode: u32) -> i32;
+    #[link_name = "atexit"]
+    #[effects(io)]
+    fn test_atexit(f: extern "C" fn()) -> i32;
+    #[link_name = "_exit"]
+    #[effects(io, diverge)]
+    fn test_exit_now(code: i32) -> !;
+}
+
+impl Gen {
+    // The next choice: 0 past the end of the sequence (the simplest).
+    pub fn draw(self: &mut Gen) -> u64 {
+        let k = self.at;
+        self.at += 1;
+        if k >= self.count {
+            return 0;
+        }
+        unsafe { self.choices[k] }
+    }
+
+    // Whether a collection of `len` elements gets one more.
+    pub fn more(self: &mut Gen, len: i64) -> bool {
+        if len >= self.size || self.depth > 4 {
+            return false;
+        }
+        self.draw() % 4 != 0
+    }
+
+    // How deep a recursive type's generator is.
+    pub fn depth(self: &mut Gen) -> i64 {
+        self.depth
+    }
+
+    // The allocator generated containers use.
+    pub fn gpa(self: &mut Gen) -> Gpa {
+        self.gpa
+    }
+
+    // Whether this run is the replay of a failure (its inputs printed).
+    pub fn showing(self: &mut Gen) -> bool {
+        self.showing
+    }
+
+    // The choices used so far, told to the runner (the generators are
+    // done; the property runs next).
+    pub fn generated(self: &mut Gen) {
+        if self.report >= 0 {
+            let mut used = self.at;
+            unsafe { write(self.report, &used as *u8, 8) };
+            unsafe { close(self.report) };
+            self.report = -1;
+        }
+    }
+
+    // A recursive type's generator goes one level down (shallower values
+    // past a depth).
+    pub fn enter(self: &mut Gen) {
+        self.depth += 1;
+    }
+
+    pub fn leave(self: &mut Gen) {
+        self.depth -= 1;
+    }
+}
+
+// The generator of T: its `impl Arbitrary` (std's for the numbers and
+// bool, the compiler's for a test's structs and enums).
+pub fn arbitrary_of<T: Arbitrary>(g: &mut Gen) -> T {
+    T::arbitrary(g)
+}
+
+pub fn gen_vec<T, F: Fn(&mut Gen) -> T>(g: &mut Gen, f: F) -> Vec<T> {
+    let mut v: Vec<T> = Vec::new_in(g.gpa);
+    g.enter();
+    while g.more(v.len()) {
+        v.push(f(g));
+    }
+    g.leave();
+    v
+}
+
+pub fn gen_option<T, F: Fn(&mut Gen) -> T>(g: &mut Gen, f: F) -> Option<T> {
+    if g.draw() % 2 == 0 { Option::None } else { Option::Some(f(g)) }
+}
+
+pub fn gen_result<T, E, F: Fn(&mut Gen) -> T,
+    G: Fn(&mut Gen) -> E>(g: &mut Gen, f: F, e: G) -> Result<T, E> {
+    if g.draw() % 2 == 0 { Result::Ok(f(g)) } else { Result::Err(e(g)) }
+}
+
+pub fn gen_text(g: &mut Gen) -> Vec<u8> {
+    let mut v: Vec<u8> = Vec::new_in(g.gpa);
+    while g.more(v.len()) {
+        v.push(g.text_byte());
+    }
+    v
+}
+
+pub fn gen_buf(g: &mut Gen) -> Buf {
+    let mut b = Buf::new_in(g.gpa);
+    while g.more(b.len()) {
+        b.push(g.text_byte());
+    }
+    b
+}
+
+pub fn gen_f64(g: &mut Gen) -> f64 {
+    let c = g.draw();
+    if c < 6 {
+        let edges = [0.0, 1.0, -1.0, -0.0, 1.0 / 0.0, -1.0 / 0.0];
+        return edges[c as i64];
+    }
+    let n = ((c >> 1) as i64) ^ -((c & 1) as i64);
+    (n as f64) / 8.0
+}
+
+impl Arbitrary for i64 {
+    fn arbitrary(g: &mut Gen) -> i64 { g.int() }
+}
+
+impl Arbitrary for i32 {
+    fn arbitrary(g: &mut Gen) -> i32 { g.int() as i32 }
+}
+
+impl Arbitrary for i16 {
+    fn arbitrary(g: &mut Gen) -> i16 { g.int() as i16 }
+}
+
+impl Arbitrary for i8 {
+    fn arbitrary(g: &mut Gen) -> i8 { g.int() as i8 }
+}
+
+impl Arbitrary for u64 {
+    fn arbitrary(g: &mut Gen) -> u64 { g.draw() }
+}
+
+impl Arbitrary for u32 {
+    fn arbitrary(g: &mut Gen) -> u32 { g.draw() as u32 }
+}
+
+impl Arbitrary for u16 {
+    fn arbitrary(g: &mut Gen) -> u16 { g.draw() as u16 }
+}
+
+impl Arbitrary for u8 {
+    fn arbitrary(g: &mut Gen) -> u8 { g.draw() as u8 }
+}
+
+impl Arbitrary for bool {
+    fn arbitrary(g: &mut Gen) -> bool { g.bool() }
+}
+
+impl Arbitrary for f64 {
+    fn arbitrary(g: &mut Gen) -> f64 { gen_f64(g) }
+}
+
+// What `tachyonc test` passes to a test binary: `--tachyon-test NAME`
+// (else `--tachyon-list`), `--cases N`, `--seed S`, `--snapshots DIR`,
+// `--accept`.
+static mut TEST_CASES: i64 = 100;
+static mut TEST_SEED: u64 = 0;
+static mut TEST_SEED_SET: bool = false;
+static mut TEST_SNAPSHOTS: *u8 = 0 as *u8;
+static mut TEST_ACCEPT: bool = false;
+static mut TEST_MODULE: [u8] = "";
+static mut TEST_NAME: [u8] = "";
+static mut TEST_SNAP_COUNT: i64 = 0;
+// (fuzzing, std/fuzz.tach) `--fuzz-time S`, `--fuzz-dir DIR`, `--replay
+// FILE` (repeated); whether the choices are an input's bytes.
+static mut TEST_FUZZ_TIME: i64 = 0;
+static mut TEST_FUZZ_DIR: *u8 = 0 as *u8;
+static mut TEST_REPLAY: [*u8; 256] = [0 as *u8; 256];
+static mut TEST_REPLAYS: i64 = 0;
+static mut TEST_RAW: bool = false;
+
+// The exit status of a property case whose `requires` failed (discarded).
+const TEST_DISCARD: i32 = 77;
+
+unsafe fn test_arg(p: *u8) -> [u8] {
+    p[0..strlen(p) as i64]
+}
+
+fn test_number(s: [u8]) -> u64 {
+    let mut n: u64 = 0;
+    let mut i = 0;
+    let mut base: u64 = 10;
+    if s.len > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+        base = 16;
+        i = 2;
+    }
+    while i < s.len {
+        let c = s[i];
+        let d = if c >= '0' && c <= '9' { (c - '0') as u64 }
+            else if c >= 'a' && c <= 'f' { (c - 'a') as u64 + 10 }
+            else if c >= 'A' && c <= 'F' { (c - 'A') as u64 + 10 }
+            else { 99 };
+        if d >= base {
+            break;
+        }
+        n = n * base + d;
+        i += 1;
+    }
+    n
+}
+
+// A test binary's arguments: the test to run (empty: list them).
+pub fn test_args(argc: i32, argv: **u8) -> [u8] {
+    let mut name: [u8] = "";
+    let mut i = 1;
+    while i < argc as i64 {
+        let a = unsafe { test_arg(argv[i]) };
+        let has_value = i + 1 < argc as i64;
+        if a == "--tachyon-test" && has_value {
+            name = unsafe { test_arg(argv[i + 1]) };
+            i += 1;
+        } else if a == "--cases" && has_value {
+            TEST_CASES = test_number(unsafe { test_arg(argv[i + 1]) }) as i64;
+            i += 1;
+        } else if a == "--seed" && has_value {
+            TEST_SEED = test_number(unsafe { test_arg(argv[i + 1]) });
+            TEST_SEED_SET = true;
+            i += 1;
+        } else if a == "--snapshots" && has_value {
+            TEST_SNAPSHOTS = unsafe { argv[i + 1] };
+            i += 1;
+        } else if a == "--accept" {
+            TEST_ACCEPT = true;
+        } else if a == "--fuzz-time" && has_value {
+            TEST_FUZZ_TIME = test_number(unsafe { test_arg(argv[i + 1]) }) as i64;
+            i += 1;
+        } else if a == "--fuzz-dir" && has_value {
+            TEST_FUZZ_DIR = unsafe { argv[i + 1] };
+            i += 1;
+        } else if a == "--replay" && has_value {
+            if TEST_REPLAYS < 256 {
+                TEST_REPLAY[TEST_REPLAYS] = unsafe { argv[i + 1] };
+                TEST_REPLAYS += 1;
+            }
+            i += 1;
+        }
+        i += 1;
+    }
+    name
+}
+
+// A test of module `module` (its path, `a::tests`) starts.
+pub fn test_begin(module: [u8], name: [u8], gpa: Gpa) {
+    TEST_MODULE = module;
+    TEST_NAME = name;
+    TEST_SNAP_COUNT = 0;
+    // (an allocation first: --check-alloc's handler at exit is then
+    // registered before test_at_exit, which runs before it)
+    let mut first: Vec<u8> = Vec::new_in(gpa);
+    first.push(0);
+    first.free();
+    test_running();
+}
+
+// A test that ends the process (a failed check) ends it at once: the
+// leaks it leaves are not listed after its failure (exit 101).
+static mut TEST_RUNNING: bool = false;
+static mut TEST_HANDLER: bool = false;
+
+static mut TEST_EXIT_CODE: i32 = 101;
+
+extern "C" fn test_at_exit() {
+    if TEST_RUNNING {
+        unsafe { test_exit_now(TEST_EXIT_CODE) };
+    }
+}
+
+// This process ends with `code`, before --check-alloc lists what it
+// leaves allocated (a runner's, not the test's).
+fn test_exit(code: i32) -> ! {
+    test_running();
+    TEST_EXIT_CODE = code;
+    unsafe { exit(code) }
+}
+
+fn test_running() {
+    if !TEST_HANDLER {
+        unsafe { test_atexit(test_at_exit) };
+        TEST_HANDLER = true;
+    }
+    TEST_RUNNING = true;
+}
+
+// A #[test] returned.
+pub fn test_done() {
+    TEST_RUNNING = false;
+}
+
+// A test left blocks allocated (with --check-alloc, which test builds
+// use; they are listed): it fails.
+pub fn test_leaked() -> ! {
+    unsafe { exit(101) }
+}
+
+// A `#[test]` that returned Err(e): the error, exit 101.
+pub fn test_err<E: Debug>(e: E) -> ! {
+    eprintln(f"test returned Err({e:?})");
+    unsafe { exit(101) }
+}
+
+pub fn test_unknown(name: [u8]) -> i32 {
+    eprintln(f"no test '{name}' in this program (--tachyon-list lists them)");
+    2
+}
+
+// A property case whose `requires` does not hold: not a failure.
+pub fn test_discard() -> ! {
+    unsafe { test_exit_now(TEST_DISCARD) }
+}
+
+// The line that begins an input's value, when a failure is replayed.
+pub fn test_input(name: [u8]) {
+    print(f"tachyon-test: input {name} = ");
+}
+
+pub fn test_input_end() {
+    println("");
+}
+
+// The choices of a case (splitmix64 from the state): mostly small, some
+// edges, some anything.
+fn test_next(state: *u64) -> u64 {
+    *state = *state + 0x9e3779b97f4a7c15;
+    let mut z = *state;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111eb;
+    z ^ (z >> 31)
+}
+
+fn test_choice(state: *u64, size: i64) -> u64 {
+    let r = test_next(state);
+    let pick = r % 20;
+    if pick == 0 {
+        // (the edges: i64::MIN, i64::MAX, u64::MAX, a byte's)
+        let e = test_next(state) % 5;
+        return if e == 0 { 0xffffffffffffffff } else if e == 1 { 0xfffffffffffffffe }
+            else if e == 2 { 255 } else if e == 3 { 256 } else { 0x8000000000000000 };
+    }
+    if pick < 3 {
+        return test_next(state);
+    }
+    test_next(state) % (2 * size as u64 + 4)
+}
+
+fn test_seed_of(name: [u8]) -> u64 {
+    if TEST_SEED_SET {
+        return TEST_SEED;
+    }
+    let mut h: u64 = 14695981039346656037;
+    for i in 0..name.len {
+        h = (h ^ name[i] as u64) * 1099511628211;
+    }
+    h
+}
+
+struct CaseRun { status: i32, used: i64 }
+
+// Runs one case in a child process: its exit status (0 passed,
+// TEST_DISCARD discarded, else failed) and the choices it used.
+fn test_case<F: Fn(&mut Gen)>(f: F, gpa: Gpa, choices: *Vec<u64>, size: i64, quiet: bool) -> CaseRun {
+    let mut fds = [0 as i32, 0 as i32];
+    if unsafe { pipe(&fds[0]) } != 0 {
+        eprintln("tachyon-test: cannot make a pipe");
+        unsafe { exit(2) };
+    }
+    let pid = unsafe { fork() };
+    if pid == 0 {
+        unsafe { close(fds[0]) };
+        if quiet {
+            let null = unsafe { open(c"/dev/null", 1) };
+            unsafe { dup2(null, 1) };
+            unsafe { dup2(null, 2) };
+        }
+        test_running();
+        let s = choices.as_slice();
+        let mut g = Gen {
+            choices: s.ptr, count: s.len, at: 0, size: size, gpa: gpa, depth: 0,
+            showing: !quiet, report: fds[1], raw: TEST_RAW,
+        };
+        // (0.18 with 0.17's drops: the case's values are dropped by now, so
+        // a block it allocated and left is a leak; --check-alloc)
+        let mark = check_alloc_mark();
+        f(&mut g);
+        if check_alloc_leaks_since(mark) > 0 {
+            unsafe { test_exit_now(101) };
+        }
+        unsafe { test_exit_now(0) };
+    }
+    unsafe { close(fds[1]) };
+    let mut used: i64 = -1;
+    let n = unsafe { read(fds[0], &used as *u8, 8) };
+    unsafe { close(fds[0]) };
+    let mut status = 0 as i32;
+    unsafe { waitpid(pid, &status, 0) };
+    let s = status as i64;
+    let code = if (s & 127) == 0 { ((s >> 8) & 255) as i32 } else { 128 + (s & 127) as i32 };
+    CaseRun { status: code, used: if n == 8 && used >= 0 { used } else { choices.len() } }
+}
+
+fn test_fails(r: CaseRun) -> bool {
+    r.status != 0 && r.status != TEST_DISCARD
+}
+
+// Candidate `c` replaces `best` when it fails too (cut to what it used).
+fn test_try<F: Fn(&mut Gen)>(f: F, gpa: Gpa, best: *Vec<u64>, c: *Vec<u64>, size: i64, steps: *i64) -> bool {
+    let r = test_case(f, gpa, c, size, true);
+    if !test_fails(r) {
+        return false;
+    }
+    *steps = *steps + 1;
+    best.clear();
+    let n = if r.used < c.len() { r.used } else { c.len() };
+    for i in 0..n {
+        best.push(c.get(i));
+    }
+    true
+}
+
+// The failing choices `best` made smaller: chunks deleted, choices set to
+// zero, halved, lowered by one, neighbours put in order; to a fixpoint (or
+// 2000 candidates).
+fn test_shrink<F: Fn(&mut Gen)>(f: F, gpa: Gpa, best: *Vec<u64>, size: i64) -> i64 {
+    let mut steps = 0;
+    let mut tries = 0;
+    let mut c: Vec<u64> = Vec::new_in(gpa);
+    let mut changed = true;
+    while changed && tries < 2000 {
+        changed = false;
+        for k in [8, 4, 2, 1] {
+            let mut i = best.len() - k;
+            while i >= 0 && tries < 2000 {
+                c.clear();
+                for j in 0..best.len() {
+                    if j < i || j >= i + k {
+                        c.push(best.get(j));
+                    }
+                }
+                tries += 1;
+                if test_try(f, gpa, best, &c, size, &steps) {
+                    changed = true;
+                }
+                i -= 1;
+                if i > best.len() - k {
+                    i = best.len() - k;
+                }
+            }
+        }
+        let mut i = 0;
+        while i < best.len() && tries < 2000 {
+            // lowered: to 0, else the smallest that still fails, by halves
+            let mut lo: u64 = 0;
+            let mut first = true;
+            while i < best.len() && best.get(i) > lo && tries < 2000 {
+                let v = best.get(i);
+                let w = if first { 0 } else { lo + (v - lo) / 2 };
+                first = false;
+                c.clear();
+                for j in 0..best.len() {
+                    c.push(if j == i { w } else { best.get(j) });
+                }
+                tries += 1;
+                if test_try(f, gpa, best, &c, size, &steps) {
+                    changed = true;
+                } else if w == lo {
+                    lo = w + 1;
+                } else {
+                    lo = w;
+                }
+            }
+            if i + 1 < best.len() && best.get(i) > best.get(i + 1) {
+                c.clear();
+                for j in 0..best.len() {
+                    c.push(if j == i { best.get(i + 1) } else if j == i + 1 { best.get(i) }
+                        else { best.get(j) });
+                }
+                tries += 1;
+                if test_try(f, gpa, best, &c, size, &steps) {
+                    changed = true;
+                }
+            }
+            i += 1;
+        }
+    }
+    c.free();
+    steps
+}
+
+// A property: TEST_CASES cases (the first all zeros: the simplest
+// values), each in a child process; the first failure is shrunk, then
+// replayed with its inputs printed; exit 1. `tachyon-test:` lines on
+// stdout tell `tachyonc test` the case and the steps.
+pub fn run_property<F: Fn(&mut Gen)>(gpa: Gpa, name: [u8], f: F) {
+    // (the cases run in children; this process ends normally)
+    test_done();
+    let seed = test_seed_of(name);
+    let cases = if TEST_CASES > 0 { TEST_CASES } else { 1 };
+    let mut state = seed;
+    let mut choices: Vec<u64> = Vec::new_in(gpa);
+    let mut discarded = 0;
+    for case in 0..cases {
+        // (sizes grow over 100 cases, whatever --cases: -O0 runs the first
+        // 20 of -O2's)
+        let size = 1 + (if case < 100 { case } else { 99 }) * 30 / 100;
+        choices.clear();
+        if case > 0 {
+            for _ in 0..512 {
+                choices.push(test_choice(&state, size));
+            }
+        }
+        let r = test_case(f, gpa, &choices, size, true);
+        if r.status == TEST_DISCARD {
+            discarded += 1;
+            continue;
+        }
+        if r.status != 0 {
+            choices.truncate(if r.used < choices.len() { r.used } else { choices.len() });
+            let steps = test_shrink(f, gpa, &choices, size);
+            println(
+                f"tachyon-test: property case {case + 1} of {cases}, shrunk in {steps} {if steps == 1 { "step" } else { "steps" }}, seed {seed:x}");
+            test_case(f, gpa, &choices, size, false);
+            test_exit(1);
+        }
+    }
+    if discarded * 10 > cases * 9 {
+        println(f"tachyon-test: discarded {discarded} of {cases}");
+        eprintln(
+            f"the generator rarely satisfies the requires: {discarded} of {cases} cases discarded (write an impl Arbitrary for the parameter's type)");
+        test_exit(1);
+    }
+    choices.free();
+}
+
+// (snapshots)
+
+unsafe fn test_read_file(path: *u8, b: *Buf) -> bool {
+    let fd = open(path, 0);
+    if fd < 0 {
+        return false;
+    }
+    let mut chunk = [0 as u8; 4096];
+    loop {
+        let n = unsafe { read(fd, &chunk[0], 4096) };
+        if n <= 0 {
+            break;
+        }
+        b.push_str(chunk[0..n]);
+    }
+    unsafe { close(fd) };
+    true
+}
+
+unsafe fn test_write_file(path: *u8, text: [u8]) -> bool {
+    let fd = creat(path, 420);
+    if fd < 0 {
+        return false;
+    }
+    unsafe { write(fd, text.ptr, text.len as u64) };
+    unsafe { close(fd) };
+    true
+}
+
+// The line `k` (from 0) of s, and whether there is one.
+fn test_line(s: [u8], k: i64) -> [u8] {
+    let mut at = 0;
+    let mut line = 0;
+    while at <= s.len {
+        let mut e = at;
+        while e < s.len && s[e] != '\n' {
+            e += 1;
+        }
+        if line == k {
+            return s[at..e];
+        }
+        line += 1;
+        at = e + 1;
+    }
+    ""
+}

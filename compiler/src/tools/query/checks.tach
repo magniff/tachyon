@@ -1,0 +1,267 @@
+// `tachyonc query checks FN|MODULE` and `--print-checks[=NAME]` (0.18 T5,
+// design §2.14): the run-time checks left in each function once it is
+// optimized (-O2 unless a level is given), one line each, `FILE:LINE:COL
+// FN KIND left`, and those the optimizer removed (`removed`: the range
+// analysis proved them, with the dominating conditions, the loop bounds
+// or a clause's check), so that a performance task sees what its loop
+// still checks without reading the assembly.
+//
+// A check is one call of the run-time helper (rt.panic) in the IR: its
+// kind (an index, a slice range, an enum value, a contract or assertion)
+// and its site (front/contracts/sites.tach). The lowering notes every
+// check it makes (note_check); the ones not found after the optimizer
+// were removed.
+
+use crate::base::{
+    FILES, IntVec, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
+    buf_write_fd, streq, strlen,
+};
+use crate::front::contracts::sites::{SITE_COL, SITE_FILE, SITE_LINE, site_count};
+use crate::front::types::FNS;
+use crate::gen0::target::{PANIC_RANGE_UNSIGNED, kind_is_enum, rt_panic_sym};
+use crate::middle::ctx::{FnCtx, main_cx};
+use crate::middle::inline::FN_LIVE;
+use crate::middle::ir::{IRFUNCS, IRFUNC_COUNT, Op, ir_enter};
+
+// `--print-checks` (0: off; "": every function; else the name a function's
+// display must have, or start with followed by `::`).
+pub static mut PRINT_CHECKS: *u8 = 0 as *u8;
+
+// The checks the lowering made: (IR function, site, kind) each.
+static mut NOTED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+extern "C" {
+    fn system(command: *u8) -> i32;
+}
+
+// A check made in the IR function being lowered (rt_panic_call).
+pub fn note_check(fi: i64, site: i64, kind: i64) {
+    unsafe {
+        if PRINT_CHECKS == 0 as *u8 {
+            return;
+        }
+        NOTED.push(fi);
+        NOTED.push(site);
+        NOTED.push(kind);
+    }
+}
+
+// The checks the range analysis removed: (IR function, site, kind) each.
+static mut REMOVED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Block b, a branch's successor that the range analysis found never taken:
+// the check failing there, if it is one, noted as removed.
+pub fn note_removed(mut cx: *FnCtx, b: i64) {
+    unsafe {
+        let mut v = cx.blocks[b].first;
+        while v != 0 {
+            if cx.insts[v].op == Op::CallC && cx.insts[v].imm == rt_panic_sym()
+                && cx.insts[v].nargs >= 5 {
+                let k = cx.args.data[cx.insts[v].args];
+                let s = cx.args.data[cx.insts[v].args + 4];
+                REMOVED.push(cx.irf);
+                REMOVED.push(if cx.insts[s].op == Op::Const { cx.insts[s].imm } else { 0 });
+                REMOVED.push(if cx.insts[k].op == Op::Const { cx.insts[k].imm } else { -1 });
+                return;
+            }
+            v = cx.insts[v].next;
+        }
+    }
+}
+
+fn kind_name(kind: i64) -> *u8 {
+    if kind < 0 {
+        c"check"
+    } else if kind < 2 {
+        c"index"
+    } else if kind <= PANIC_RANGE_UNSIGNED {
+        c"slice"
+    } else if kind_is_enum(kind) {
+        c"enum"
+    } else {
+        c"contract"
+    }
+}
+
+// Whether function f (a FNS index) is one --print-checks asks for.
+fn wanted(f: i64) -> bool {
+    unsafe {
+        let want = PRINT_CHECKS;
+        if want[0] == 0 {
+            return true;
+        }
+        let name = SYMS[FNS[f].display].text;
+        let n = strlen(want) as i64;
+        if name.len < n {
+            return false;
+        }
+        for i in 0..n {
+            if name[i] != want[i] {
+                return false;
+            }
+        }
+        name.len == n || name[n] == ':' || name[n] == '<' || name[n] == '$'
+    }
+}
+
+fn put_site(out: i64, site: i64) {
+    unsafe {
+        if site <= 0 || site >= site_count() {
+            buf_str(out, c"?");
+            return;
+        }
+        let path = FILES[SITE_FILE.data[site]].path;
+        buf_str(out, if path[0] == '.' && path[1] == '/' { &path[2] } else { path });
+        buf_byte(out, ':');
+        buf_int(out, SITE_LINE.data[site]);
+        buf_byte(out, ':');
+        buf_int(out, SITE_COL.data[site]);
+    }
+}
+
+// The checks of the optimized program's functions, printed (after
+// optimize_program, before the code is emitted).
+pub fn print_checks() {
+    unsafe {
+        let cx = main_cx();
+        let out = buf_new();
+        let mut left = 0;
+        let mut removed = 0;
+        let mut seen = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for fi in 0..IRFUNC_COUNT {
+            let f = IRFUNCS[fi].f;
+            if FN_LIVE[fi] == 0 || !wanted(f) {
+                continue;
+            }
+            ir_enter(cx, fi);
+            seen.count = 0;
+            for i in 0..IRFUNCS[fi].blocks.count {
+                let b = IRFUNCS[fi].blocks.data[i];
+                if cx.blocks[b].removed != 0 {
+                    continue;
+                }
+                let mut v = cx.blocks[b].first;
+                while v != 0 {
+                    if cx.insts[v].op == Op::CallC && cx.insts[v].imm == rt_panic_sym()
+                        && cx.insts[v].nargs >= 5 {
+                        let k = cx.args.data[cx.insts[v].args];
+                        let s = cx.args.data[cx.insts[v].args + 4];
+                        let kind = if cx.insts[k].op == Op::Const { cx.insts[k].imm } else { -1 };
+                        let site = if cx.insts[s].op == Op::Const { cx.insts[s].imm } else { 0 };
+                        put_site(out, site);
+                        buf_fmt_fn(out, f, kind_name(kind), c"left");
+                        seen.push(site);
+                        left += 1;
+                    }
+                    v = cx.insts[v].next;
+                }
+            }
+            // Removed by the range analysis (here, or in a function inlined
+            // here), then the others made here and gone.
+            let mut j = 0;
+            while j < REMOVED.count {
+                if REMOVED.data[j] == fi {
+                    put_site(out, REMOVED.data[j + 1]);
+                    buf_fmt_fn(out, f, kind_name(REMOVED.data[j + 2]), c"removed (ranges)");
+                    seen.push(REMOVED.data[j + 1]);
+                    removed += 1;
+                }
+                j += 3;
+            }
+            j = 0;
+            while j < NOTED.count {
+                if NOTED.data[j] == fi && NOTED.data[j + 1] > 0
+                    && !(0..seen.count).any(|q| seen.data[q] == NOTED.data[j + 1]) {
+                    put_site(out, NOTED.data[j + 1]);
+                    buf_fmt_fn(out, f, kind_name(NOTED.data[j + 2]), c"removed");
+                    removed += 1;
+                }
+                j += 3;
+            }
+        }
+        buf_str(out, c"checks: ");
+        buf_int(out, left);
+        buf_str(out, c" left, ");
+        buf_int(out, removed);
+        buf_str(out, c" removed\n");
+        buf_write_fd(out, STDOUT);
+    }
+}
+
+// `\tFN\tKIND\tSTATE\n`
+fn buf_fmt_fn(out: i64, f: i64, kind: *u8, state: *u8) {
+    unsafe {
+        buf_byte(out, '\t');
+        buf_bytes(out, SYMS[FNS[f].display].text);
+        buf_byte(out, '\t');
+        buf_str(out, kind);
+        buf_byte(out, '\t');
+        buf_str(out, state);
+        buf_byte(out, '\n');
+    }
+}
+
+// `tachyonc query checks NAME [-O N] [ROOT]`: the program compiled (not
+// written) with --print-checks=NAME. Its exit status.
+pub fn run_query_checks(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        let cmd = buf_new();
+        let mut name = 0 as *u8;
+        let mut root = 0 as *u8;
+        let mut level = c"-O2";
+        let mut i = 3;
+        while i < argc {
+            let a = argv[i];
+            let n = strlen(a) as i64;
+            if streq(a, c"-O") && i + 1 < argc {
+                level = if streq(argv[i + 1], c"1") { c"-O1" } else { c"-O2" };
+                i += 2;
+                continue;
+            }
+            if a[0] == '-' && a[1] == 'O' {
+                level = a;
+            } else if n > 5 && streq(&a[n - 5], c".tach") {
+                root = a;
+            } else if streq(a, c"--root") && i + 1 < argc {
+                root = argv[i + 1];
+                i += 1;
+            } else if name == 0 as *u8 {
+                name = a;
+            }
+            i += 1;
+        }
+        root = crate::tools::query::find_root(root);
+        if name == 0 as *u8 || root == 0 as *u8 {
+            buf_str(cmd, c"error query.usage: tachyonc query checks FN|MODULE [-O N] [ROOT]\n");
+            buf_write_fd(cmd, 2);
+            return 2;
+        }
+        quote(cmd, argv[0]);
+        buf_byte(cmd, ' ');
+        buf_str(cmd, level);
+        buf_str(cmd, c" --print-checks=");
+        quote(cmd, name);
+        buf_byte(cmd, ' ');
+        quote(cmd, root);
+        buf_str(cmd, c" -o /dev/null");
+        buf_byte(cmd, 0);
+        let status = system(buf_slice(cmd).ptr);
+        if status == 0 { 0 } else { 1 }
+    }
+}
+
+fn quote(out: i64, s: *u8) {
+    unsafe {
+        buf_byte(out, '\'');
+        let mut k = 0;
+        while s[k] != 0 {
+            if s[k] == '\'' {
+                buf_str(out, c"'\\''");
+            } else {
+                buf_byte(out, s[k]);
+            }
+            k += 1;
+        }
+        buf_byte(out, '\'');
+    }
+}

@@ -1,0 +1,202 @@
+// Distinct types (0.18, docs/design/contracts-verification.md §2.10):
+// `type X = distinct T` is a type of its own with T's representation.
+//
+// A distinct type is a type of kind Distinct: `a` the underlying type T
+// (itself maybe distinct), `b` the alias's node, and as its elements the
+// type arguments of a generic alias (`Id<Node>` and `Id<Edge>` differ).
+// The checker keeps it apart from T; once the program checks,
+// erase_types() writes T in its place everywhere the code generators
+// look, so that they never see one (`Vec<NodeId>` stays an instance of
+// its own, with i64 elements).
+//
+// The null niche (§2.11): an enum of two variants, one without fields
+// and one whose only field is a `#[niche_null]` distinct type (std's
+// NonNull<T>), is that one pointer, the variant without fields the null
+// one: `Option<NonNull<T>>` is 8 bytes and is C's nullable pointer.
+
+use crate::base::{IntVec, buf_byte, buf_str, sym_name};
+use crate::front::ast::NODES;
+use crate::front::types::{
+    ENUMS, TLISTS, TSCRATCH, TYPES, TyKind, VARIANTS, array_of, enum_variant, make_type, ptr_to,
+    slice_of, type_elem,
+};
+
+// The aliases marked #[niche_null] (their nodes).
+pub static mut NICHE_ALIASES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Whether a distinct type was ever made (erase_types has work).
+pub static mut ANY_DISTINCT: bool = false;
+
+// What erase_type found for each type id + 1 (0: not yet).
+static mut ERASED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Per enum: 0 not known yet, 1 no niche, 2 the null niche.
+static mut NICHE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The distinct type of alias node `alias` over `base`, with the type
+// arguments TSCRATCH[mark..] (popped).
+pub fn distinct_type(alias: i64, base: i64, mark: i64) -> i64 {
+    ANY_DISTINCT = true;
+    make_type(TyKind::Distinct, base, alias, mark)
+}
+
+pub fn is_distinct_type(t: i64) -> bool {
+    unsafe { t > 0 && TYPES[t].kind == TyKind::Distinct }
+}
+
+// The type under every `distinct` of t (t itself when it is not one).
+pub fn strip_distinct(t: i64) -> i64 {
+    unsafe {
+        let mut u = t;
+        while u > 0 && TYPES[u].kind == TyKind::Distinct {
+            u = TYPES[u].a;
+        }
+        u
+    }
+}
+
+// The alias node of distinct type t.
+pub fn distinct_alias(t: i64) -> i64 {
+    unsafe { TYPES[t].b }
+}
+
+// `NodeId`, `Id<Node>`: how messages name distinct type t.
+pub fn buf_distinct(out: i64, t: i64) {
+    unsafe {
+        buf_str(out, sym_name(NODES[TYPES[t].b].a));
+        if TYPES[t].count > 0 {
+            buf_byte(out, '<');
+            for i in 0..TYPES[t].count {
+                if i > 0 {
+                    buf_str(out, c", ");
+                }
+                crate::front::types::buf_type(out, type_elem(t, i));
+            }
+            buf_byte(out, '>');
+        }
+    }
+}
+
+// Whether alias node `alias` is #[niche_null].
+pub fn is_niche_alias(alias: i64) -> bool {
+    unsafe {
+        for i in 0..NICHE_ALIASES.count {
+            if NICHE_ALIASES.data[i] == alias {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// ---- Erasure ----
+
+// t with every distinct type in it replaced by its underlying type.
+// Structs and enums are kept (their fields are erased in place).
+pub fn erase_type(t: i64) -> i64 {
+    unsafe {
+        if t <= 0 || !ANY_DISTINCT {
+            return t;
+        }
+        if t + 1 < ERASED.count && ERASED.data[t + 1] != 0 {
+            return ERASED.data[t + 1];
+        }
+        let kind = TYPES[t].kind;
+        let mut r = t;
+        if kind == TyKind::Distinct {
+            r = erase_type(TYPES[t].a);
+        } else if kind == TyKind::Ptr {
+            r = ptr_to(erase_type(TYPES[t].a));
+        } else if kind == TyKind::Slice {
+            r = slice_of(erase_type(TYPES[t].a));
+        } else if kind == TyKind::Array {
+            r = array_of(erase_type(TYPES[t].a), TYPES[t].b);
+        } else if kind == TyKind::Tuple || kind == TyKind::Fn {
+            let count = TYPES[t].count;
+            let mark = TSCRATCH.count;
+            for i in 0..count {
+                let e = erase_type(type_elem(t, i));
+                TSCRATCH.push(e);
+            }
+            let a = if kind == TyKind::Fn { erase_type(TYPES[t].a) } else { TYPES[t].a };
+            r = make_type(kind, a, TYPES[t].b, mark);
+        }
+        while ERASED.count <= t + 1 {
+            ERASED.push(0);
+        }
+        ERASED.data[t + 1] = r;
+        r
+    }
+}
+
+// The list TLISTS[list..list + count] erased: `list` itself when nothing
+// in it changes, else a copy at the end of TLISTS (a list may be shared
+// with an interned type's elements, which must not change).
+pub fn erase_list(list: i64, count: i64) -> i64 {
+    unsafe {
+        let mut changed = false;
+        for i in 0..count {
+            if erase_type(TLISTS.data[list + i]) != TLISTS.data[list + i] {
+                changed = true;
+            }
+        }
+        if !changed {
+            return list;
+        }
+        let copy = TLISTS.count;
+        for i in 0..count {
+            let e = erase_type(TLISTS.data[list + i]);
+            TLISTS.push(e);
+        }
+        copy
+    }
+}
+
+// ---- The null niche ----
+
+// Whether enum e has the null niche (decided from its variants' types
+// while they are still distinct, then remembered).
+pub fn enum_niche(e: i64) -> bool {
+    unsafe {
+        while NICHE.count <= e {
+            NICHE.push(0);
+        }
+        if NICHE.data[e] == 0 {
+            NICHE.data[e] = if niche_shape(e) { 2 } else { 1 };
+        }
+        NICHE.data[e] == 2
+    }
+}
+
+fn niche_shape(e: i64) -> bool {
+    unsafe {
+        if !ANY_DISTINCT || ENUMS[e].variant_count != 2 || ENUMS[e].repr != 0 {
+            return false;
+        }
+        let v0 = enum_variant(e, 0);
+        let v1 = enum_variant(e, 1);
+        let (empty, full) = if VARIANTS[v0].field_count == 0 { (v0, v1) } else { (v1, v0) };
+        if VARIANTS[empty].field_count != 0 || VARIANTS[full].field_count != 1 {
+            return false;
+        }
+        let f = TLISTS.data[VARIANTS[full].fields];
+        is_distinct_type(f) && is_niche_alias(TYPES[f].b)
+            && TYPES[strip_distinct(f)].kind == TyKind::Ptr
+    }
+}
+
+// The variant of niche enum e that holds the pointer.
+pub fn niche_full_variant(e: i64) -> i64 {
+    unsafe {
+        let v0 = enum_variant(e, 0);
+        if VARIANTS[v0].field_count == 1 { v0 } else { enum_variant(e, 1) }
+    }
+}
+
+// Whether variant v is the one that holds the pointer of a niche enum.
+pub fn is_niche_full(v: i64) -> bool {
+    unsafe {
+        let e = VARIANTS[v].enum_id;
+        enum_niche(e) && VARIANTS[v].field_count == 1
+    }
+}

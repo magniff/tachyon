@@ -6,7 +6,7 @@ associated type:
 ```text
 trait Iterator {
     type Item;
-    fn next(self: *Self) -> Option<Self::Item>;
+    fn next(self: &mut Self) -> Option<Self::Item>;
     // and, written once in std: map filter enumerate zip take
     // fold for_each count sum min max collect
 }
@@ -81,7 +81,7 @@ struct Countdown { n: i64 }
 
 impl Iterator for Countdown {
     type Item = i64;
-    fn next(self: *Countdown) -> Option<i64> {
+    fn next(self: &mut Countdown) -> Option<i64> {
         if self.n == 0 { return None; }
         self.n -= 1;
         Some(self.n + 1)

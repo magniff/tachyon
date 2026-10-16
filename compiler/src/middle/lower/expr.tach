@@ -12,6 +12,8 @@ use crate::front::ast::NodeKind::{
 };
 use crate::front::check::{Res, type_error};
 use crate::front::consteval::{const_value, f64_of_bits, float_const, wrap_int};
+use crate::front::contracts::sites::site_of;
+use crate::front::distinct::enum_niche;
 use crate::front::lexer::{Tok, str_at};
 use crate::front::parser::exprs::is_comparison;
 use crate::front::types::{
@@ -127,7 +129,7 @@ fn lower_expr_inner(mut cx: *FnCtx, n: i64) -> i64 {
             EnumPanic => {
                 let operand = NODES[n].a;
                 let value = lower_cast(cx, lower_operand(cx, operand), NODES[operand].ty, TY_I64);
-                lower_panic(cx, NODES[n].x, value);
+                lower_panic(cx, NODES[n].x, value, site_of(n, 0));
                 0
             }
             Return => {
@@ -261,14 +263,14 @@ pub fn lower_addr(mut cx: *FnCtx, n: i64) -> i64 {
                 } else if is_slice(base_ty) {
                     let length = ir_load(cx, TY_U64, addr, 8);
                     lower_check(cx, ir_cmp(cx, Cond::Lt, TY_U64, index, length),
-                        panic_kind(NODES[NODES[n].b].ty, false), index, length, 0);
+                        panic_kind(NODES[NODES[n].b].ty, false), index, length, 0, site_of(n, 0));
                     addr = ir_load(cx, TY_U64, addr, 0);
                 } else if TYPES[base_ty].kind == TyKind::Array {
                     // Checked (0.7), against the constant length: SCCP and
                     // the value ranges remove what they prove.
                     let length = ir_const(cx, TYPES[base_ty].b, TY_U64);
                     lower_check(cx, ir_cmp(cx, Cond::Lt, TY_U64, index, length),
-                        panic_kind(NODES[NODES[n].b].ty, false), index, length, 0);
+                        panic_kind(NODES[NODES[n].b].ty, false), index, length, 0, site_of(n, 0));
                 }
                 let mut scaled = index;
                 if elem_size != 1 {
@@ -421,6 +423,15 @@ fn lower_variant(mut cx: *FnCtx, n: i64) -> i64 {
             return ir_const(cx, discr, tag);
         }
         let base = ir_slot_addr(cx, new_slot_for(cx, ty));
+        // (0.18: the null niche: the pointer, or null)
+        if enum_niche(TYPES[ty].a) {
+            if NODES[n].count == 1 {
+                store_value(cx, base, 0, lower_expr(cx, child(n, 0)), variant_field(v, 0));
+            } else {
+                ir_store(cx, TY_U64, base, ir_const(cx, 0, TY_U64), 0);
+            }
+            return base;
+        }
         for j in 0..NODES[n].count {
             let i = field_order(n, j);
             let value = lower_expr(cx, child(n, i));
@@ -480,8 +491,9 @@ fn lower_slicing(mut cx: *FnCtx, n: i64) -> i64 {
             let kind = panic_kind(bound_ty, true);
             lower_check(cx,
                 ir_cmp(cx, if inclusive { Cond::Lt } else { Cond::Le }, TY_U64, hi, length), kind,
-                lo, end, length);
-            lower_check(cx, ir_cmp(cx, Cond::Le, TY_U64, lo, end), kind, lo, end, length);
+                lo, end, length, site_of(n, 0));
+            lower_check(cx, ir_cmp(cx, Cond::Le, TY_U64, lo, end), kind, lo, end, length,
+                site_of(n, 0));
         }
         let mut scaled = lo;
         if elem_size != 1 {

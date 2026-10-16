@@ -35,7 +35,7 @@ const FIRST_CONSTRUCTED: i64 = 14;
 // list=elements, Struct a=struct, Fn list=params a=result b=1 for
 // `extern "C" fn` (C's convention), Enum a=enum, Slice a=elem, Vector
 // (0.10) a=lane type b=lanes.
-pub enum TyKind { None, Prim, Ptr, Array, Tuple, Struct, Fn, Enum, Slice, Vector }
+pub enum TyKind { None, Prim, Ptr, Array, Tuple, Struct, Fn, Enum, Slice, Vector, Distinct }
 
 // `size` is -1 until computed.
 pub struct Type { kind: TyKind, a: i64, b: i64, list: i64, count: i64, size: i64, align: i64 }
@@ -93,6 +93,11 @@ pub fn make_type(kind: TyKind, a: i64, b: i64, mark: i64) -> i64 {
         TSCRATCH.count = mark;
         add_type(kind, a, b, list, count)
     }
+}
+
+// The number of types made so far (ids are below it).
+pub fn type_count() -> i64 {
+    TYPE_COUNT
 }
 
 fn same_elems(t: i64, mark: i64) -> bool {
@@ -347,6 +352,7 @@ pub fn is_compound(t: i64) -> bool {
         let kind = TYPES[t].kind;
         kind == Array || kind == Tuple || kind == Struct || kind == Slice || kind == Vector
             || (kind == Enum && ENUMS[TYPES[t].a].has_fields)
+            || (kind == TyKind::Distinct && is_compound(TYPES[t].a))
     }
 }
 
@@ -431,6 +437,8 @@ pub fn buf_type(out: i64, t: i64) {
             buf_str(out, sym_name(STRUCTS[TYPES[t].a].name));
         } else if kind == Enum {
             buf_str(out, sym_name(ENUMS[TYPES[t].a].name));
+        } else if kind == TyKind::Distinct {
+            crate::front::distinct::buf_distinct(out, t);
         } else if kind == Slice {
             if TYPES[t].b == REF_MUT {
                 buf_str(out, c"&mut ");
@@ -709,6 +717,10 @@ pub fn variant_field(v: i64, i: i64) -> i64 {
 pub fn variant_field_offset(v: i64, i: i64) -> i64 {
     unsafe {
         let e = VARIANTS[v].enum_id;
+        // (0.18: the null niche holds only the pointer)
+        if crate::front::distinct::enum_niche(e) {
+            return 0;
+        }
         if (ENUMS[e].repr & REPR_C) != 0 {
             compute_layout(enum_type(e));
             return ENUMS[e].payload + tuple_offset(VARIANTS[v].shape, i);
@@ -767,6 +779,13 @@ pub fn compute_layout(t: i64) {
         } else if kind == Vector {
             size = 16;
             align = 16;
+        } else if kind == TyKind::Distinct {
+            size = type_size(TYPES[t].a);
+            align = type_align(TYPES[t].a);
+        } else if kind == Enum && crate::front::distinct::enum_niche(TYPES[t].a) {
+            // (0.18: the null niche, one pointer: front/distinct.tach)
+            size = 8;
+            align = 8;
         } else if kind == Enum {
             let e = TYPES[t].a;
             size = type_size(ENUMS[e].tag);
@@ -848,7 +867,7 @@ pub fn compute_layout(t: i64) {
             size = align_to(offset, align);
         }
         if size > 0 && kind != Array && kind != Tuple && kind != Struct && kind != Enum
-            && kind != Slice {
+            && kind != Slice && kind != TyKind::Distinct {
             align = size;
         }
         TYPES[t].size = size;
@@ -893,6 +912,14 @@ pub fn is_ffi_safe(t: i64) -> bool {
         }
         if kind == Fn {
             return TYPES[t].b != 0;
+        }
+        // (0.18: a distinct type passes as its underlying type; the null
+        // niche, `Option<NonNull<T>>`, as a pointer)
+        if kind == TyKind::Distinct {
+            return is_ffi_safe(TYPES[t].a);
+        }
+        if kind == Enum && crate::front::distinct::enum_niche(TYPES[t].a) {
+            return true;
         }
         if kind == Struct {
             let s = TYPES[t].a;

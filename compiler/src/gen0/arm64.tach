@@ -743,20 +743,29 @@ pub fn a64_call_indirect(mut cx: *FnCtx) {
 
 // ---- Run-time checks ----
 
-pub fn a64_panic(mut cx: *FnCtx, kind: i64) {
+// (0.18) site: the check's site (front/contracts/sites.tach), 0 for none,
+// in x4.
+pub fn a64_panic(mut cx: *FnCtx, kind: i64, site: i64) {
     unsafe {
         ins(cx, c"mov x3, x9");
         ins(cx, c"mov x2, x1");
         ins(cx, c"mov x1, x0");
         ins_i(cx, c"mov x0, #", kind, c"");
+        if site >= 0 {
+            a64_load_imm(cx, 4, site as u64);
+        }
         o(cx, c"    bl ");
         emit_symbol_ref(cx, function_prefix(), rt_panic_sym());
     }
     on(cx);
 }
 
-// rt.panic(kind, a, b, c): dprintf(2, message[kind], a, b, c); (--trace)
-// __trace::dump(); exit(101).
+// rt.panic(kind, a, b, c, site): (0.18) when site is not 0,
+// dprintf(2, "%s:%u:%u: ", file, line, column) from the site tables;
+// then dprintf(2, message[kind], a, b, c); (--trace) __trace::dump();
+// exit(101). The messages are a table of 32-bit offsets from
+// rt.messages, the sites one of (line, file << 16 | column) pairs and the
+// files one of offsets from rt.files (emit_runtime).
 // Apple's arm64 ABI passes the variadic arguments on the stack, AAPCS64 in
 // registers.
 pub fn a64_runtime(mut cx: *FnCtx) {
@@ -766,8 +775,37 @@ pub fn a64_runtime(mut cx: *FnCtx) {
         o(cx, c":\n");
         ins(cx, c"stp x29, x30, [sp, #-16]!");
         ins(cx, c"mov x29, sp");
+        ins(cx, c"sub sp, sp, #64");
+        ins(cx, c"stp x0, x1, [sp, #32]");
+        ins(cx, c"stp x2, x3, [sp, #48]");
+        o(cx, c"    cbz x4, ");
+        o(cx, local_prefix());
+        o(cx, c"rt.nosite\n");
+        a64_rt_addr(cx, 8, c"rt.sites");
+        ins(cx, c"add x9, x8, x4, lsl #3");
+        ins(cx, c"ldr w11, [x9]");
+        ins(cx, c"ldr w12, [x9, #4]");
+        ins(cx, c"ubfx x10, x12, #16, #16");
+        ins(cx, c"ubfx x12, x12, #0, #16");
+        a64_rt_addr(cx, 8, c"rt.files");
+        ins(cx, c"ldrsw x13, [x8, x10, lsl #2]");
+        ins(cx, c"add x13, x8, x13");
         if APPLE_A64 {
-            ins(cx, c"sub sp, sp, #32");
+            ins(cx, c"stp x13, x11, [sp]");
+            ins(cx, c"str x12, [sp, #16]");
+        } else {
+            ins(cx, c"mov x2, x13");
+            ins(cx, c"mov x3, x11");
+            ins(cx, c"mov x4, x12");
+        }
+        a64_rt_addr(cx, 1, c"rt.at");
+        ins(cx, c"mov w0, #2");
+        a64_call_c(cx, c"dprintf");
+        o(cx, local_prefix());
+        o(cx, c"rt.nosite:\n");
+        ins(cx, c"ldp x0, x1, [sp, #32]");
+        ins(cx, c"ldp x2, x3, [sp, #48]");
+        if APPLE_A64 {
             ins(cx, c"stp x1, x2, [sp]");
             ins(cx, c"str x3, [sp, #16]");
         } else {
@@ -775,18 +813,9 @@ pub fn a64_runtime(mut cx: *FnCtx) {
             ins(cx, c"mov x3, x2");
             ins(cx, c"mov x2, x1");
         }
-        o(cx, c"    adrp x8, ");
-        a64_modifier_before(cx, A64_PAGE);
-        o(cx, local_prefix());
-        o(cx, c"rt.messages");
-        a64_modifier_after(cx, A64_PAGE);
-        o(cx, c"\n    add x8, x8, ");
-        a64_modifier_before(cx, A64_PAGEOFF);
-        o(cx, local_prefix());
-        o(cx, c"rt.messages");
-        a64_modifier_after(cx, A64_PAGEOFF);
-        on(cx);
-        ins(cx, c"add x1, x8, x0, lsl #7");
+        a64_rt_addr(cx, 8, c"rt.messages");
+        ins(cx, c"ldrsw x9, [x8, x0, lsl #2]");
+        ins(cx, c"add x1, x8, x9");
         ins(cx, c"mov w0, #2");
         a64_call_c(cx, c"dprintf");
         // (0.17) --trace: the frames.
@@ -798,5 +827,28 @@ pub fn a64_runtime(mut cx: *FnCtx) {
         }
         ins(cx, c"mov w0, #101");
         a64_call_c(cx, c"exit");
+    }
+}
+
+// (0.18) x`reg` = the address of the run-time helper's local label `name`.
+fn a64_rt_addr(mut cx: *FnCtx, reg: i64, name: *u8) {
+    unsafe {
+        o(cx, c"    adrp x");
+        oi(cx, reg);
+        o(cx, c", ");
+        a64_modifier_before(cx, A64_PAGE);
+        o(cx, local_prefix());
+        o(cx, name);
+        a64_modifier_after(cx, A64_PAGE);
+        o(cx, c"\n    add x");
+        oi(cx, reg);
+        o(cx, c", x");
+        oi(cx, reg);
+        o(cx, c", ");
+        a64_modifier_before(cx, A64_PAGEOFF);
+        o(cx, local_prefix());
+        o(cx, name);
+        a64_modifier_after(cx, A64_PAGEOFF);
+        on(cx);
     }
 }

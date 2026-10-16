@@ -199,7 +199,10 @@ check_block() {
         echo "pass $name" >"$d/result"
         return
     fi
-    if ! "$COMPILER" --deny-warnings --diagnostics=short "$d/prog.tach" -o "$d/prog" >"$d/compile.out" 2>&1; then
+    # (0.18: from its directory, as main.tach: a failed check's position
+    # reads `main.tach:LINE:COL`, as the guide shows it)
+    cp "$d/prog.tach" "$d/main.tach"
+    if ! (cd "$d" && "$COMPILER" --deny-warnings --diagnostics=short main.tach -o prog) >"$d/compile.out" 2>&1; then
         { echo "FAIL $name: does not compile"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
         return
     fi
@@ -357,7 +360,8 @@ mkdir -p "$WORK/std"
 "$COMPILER" guide 'std#every-item' >"$WORK/std/every.md" 2>&1
 printf 'fn main(gpa: Gpa) -> i32 {\n    let v: Vec<i64> = Vec::new_in(gpa);\n    0\n}\n' >"$WORK/std/main.tach"
 if (cd "$WORK/std" && "$COMPILER" query items std --root main.tach) >"$WORK/std/items" 2>&1; then
-    awk -F '\t' '$3 ~ /^pub / { s = $3; sub(/^pub /, "", s); print s }' "$WORK/std/items" >"$WORK/std/want"
+    # (0.18: the index's signatures leave std's clauses out)
+    awk -F '\t' '$3 ~ /^pub / { s = $3; sub(/^pub /, "", s); sub(/ (debug )?(requires|ensures) .*$/, "", s); print s }' "$WORK/std/items" >"$WORK/std/want"
     : >"$WORK/std/missing"
     while IFS= read -r sig; do
         grep -qF -- "$sig" "$WORK/std/every.md" || echo "$sig" >>"$WORK/std/missing"
@@ -375,11 +379,12 @@ fi
 
 # (0.17) `guide std` itself is the index: a line per item, the receiver
 # as `Self`, no comments, nothing of std's own workings, within about
-# 4k tokens (under the 30000 characters an agent's shell shows whole);
+# 4k tokens (under the 30000 characters an agent's shell shows whole;
+# 0.18: 18500 bytes, for the assertions, Arbitrary and Gen, NonNull);
 # std#every-item is not in it. Its first screen (what `| head -60`
 # shows) is the most used names, then the overview.
 size=$(wc -c <"$WORK/topic-std.md" | tr -d ' ')
-if [ "$size" -le 17500 ] \
+if [ "$size" -le 18500 ] \
     && head -60 "$WORK/topic-std.md" | grep -q '^## The most used$' \
     && head -60 "$WORK/topic-std.md" | grep -qF 'Vec::new_in(gpa) -> Vec<T>' \
     && head -60 "$WORK/topic-std.md" | grep -q '^## Overview$' && grep -qF 'fn push(self: &mut Self, x: T)' "$WORK/topic-std.md" \
@@ -390,7 +395,7 @@ if [ "$size" -le 17500 ] \
     && grep -q '^## Every item with its comment$' "$WORK/std/every.md"; then
     result pass guide-std-index
 else
-    result FAIL guide-std-index "tachyonc guide std is $size bytes (17500 at most), or not the index (most used first)"
+    result FAIL guide-std-index "tachyonc guide std is $size bytes (18500 at most), or not the index (most used first)"
 fi
 
 # The guide by piece (0.15): --find prints the paragraphs about the
@@ -510,8 +515,7 @@ try_case tuple '(i64, bool) = (1, true)' '(1, true)'
 try_case unit '' 'let x = 3;'
 try_case error "snippet:2:5: error[type error] expected 'i64', got '[u8]'" 'let a = 1;
 a + "b"'
-try_case panic 'index out of bounds: index 3, length 0
-note: build with --trace for the line and its callers
+try_case panic 'snippet:1:37: index out of bounds: index 3, length 0
 exit 101' 'let v: Vec<i64> = Vec::new_in(gpa); v.get(3)'
 printf 'struct P { x: i64 }\n\nlet p = P { x: 4 };\np.x * 10\n' >"$WORK/snip.tach"
 try_case file 'i64 = 40' --file "$WORK/snip.tach"

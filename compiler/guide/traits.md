@@ -33,8 +33,8 @@ fn report<T: Shape>(s: &T) {
 }
 
 // Operators: + - * / and unary - through Add Sub Mul Div Neg,
-// == through Eq, < <= > >= through Ord's cmp. std's traits take
-// `self: *Self` (a reference, as a `*T` parameter is), so their impls do.
+// == through Eq, < <= > >= through Ord's cmp. Eq and Ord take
+// `self: &Self`, so their impls do (Display, Debug, Iterator: `*Self`).
 struct V2 { x: i64, y: i64 }
 
 impl Add for V2 {
@@ -107,7 +107,7 @@ struct Countdown { n: i64 }
 
 impl Iterator for Countdown {           // std's trait, in the prelude
     type Item = i64;
-    fn next(self: *Countdown) -> Option<i64> {
+    fn next(self: &mut Countdown) -> Option<i64> {
         if self.n == 0 { return None; }
         self.n -= 1;
         Some(self.n + 1)

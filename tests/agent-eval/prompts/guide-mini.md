@@ -22,7 +22,7 @@ fn main(gpa: Gpa) -> i32 {                // Rust: fn main()   gpa: the allocato
     let n = sc.next_int().unwrap_or(0);
     let mut v: Vec<i64> = Vec::new_in(gpa);   // Rust: Vec::new()   allocating takes an allocator
     v.push(n);
-    v.set(0, v.get(0) + 1);                   // Rust: v[0] += 1
+    v[0] += 1;                                // as Rust: checked; v.get(0), v.set(0, x) too
     let s: [u8] = "hi";                       // Rust: &str, String: text is [u8]; 'a' is a u8
     let k = s.len + v.len();                  // a slice's .len is a field; Vec's .len() a method
     let mut m: HashMap<[u8], i64> = HashMap::new_in(gpa);

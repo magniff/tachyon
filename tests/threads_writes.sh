@@ -77,6 +77,7 @@ base::SYM_CAP	the same
 front::types::TYPES	compute_layout: every layout is made before a phase (prepare_layouts)
 front::types::ENUMS	compute_layout, the same
 front::types::FIELDS	compute_layout (the fields'"'"' offsets), the same
+front::distinct::NICHE	enum_niche: every enum'"'"'s is made before a phase (prepare_layouts)
 front::types::TYPE_CAP	make_type: only on abi'"'"'s serial branches (task_phase 0)
 front::types::TYPE_COUNT	make_type: only on abi'"'"'s serial branches (task_phase 0)
 front::types::TLISTS	make_type, the same
@@ -95,6 +96,12 @@ back::dwarf::FILES_USED	-g
 back::dwarf::DBG_FNS	-g
 back::dwarf::DBG_PREFIX	-g
 back::dwarf::DBG_POS	-g
+base::CWD	-g (dbg_loc'"'"'s paths, out_path)
+base::OUT_PATHS	-g
+base::ROOT_DIR	-g
+base::ROOT_LEX	-g
+base::ROOT_LEX_ABS	-g
+tools::query::checks::REMOVED	query checks (--print-checks), which runs on one thread
 back::emit::stats::ST_ALL	--stats, which runs on one thread
 base::timer::T_TOTALS	--time-passes, which runs on one thread (timer_add writes only then)
 base::BUFS	a task writes its context'"'"'s buffers'"'"' entries; none is made in a task (buf_new: below)

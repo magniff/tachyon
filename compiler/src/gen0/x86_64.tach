@@ -908,19 +908,25 @@ pub fn x64_call_indirect(mut cx: *FnCtx) {
 
 // ---- Run-time checks ----
 
-pub fn x64_panic(mut cx: *FnCtx, kind: i64) {
+// (0.18) site: the check's site, 0 for none, in r8.
+pub fn x64_panic(mut cx: *FnCtx, kind: i64, site: i64) {
     unsafe {
         ins(cx, c"movq %rcx, %rdx");
         ins(cx, c"movq %rax, %rsi");
         ins(cx, c"movq %r11, %rcx");
         ins_i(cx, c"movl $", kind, c", %edi");
+        if site >= 0 {
+            ins_i(cx, c"movq $", site, c", %r8");
+        }
         o(cx, c"    call ");
         x64_symbol(cx, function_prefix(), rt_panic_sym());
     }
     on(cx);
 }
 
-// rt.panic(kind, a, b, c): dprintf(2, message[kind], a, b, c); exit(101).
+// rt.panic(kind, a, b, c, site): (0.18) when site is not 0,
+// dprintf(2, "%s:%u:%u: ", file, line, column) from the site tables
+// (see a64_runtime); then dprintf(2, message[kind], a, b, c); exit(101).
 pub fn x64_runtime(mut cx: *FnCtx) {
     unsafe {
         o(cx, c"\n.p2align 4\n");
@@ -928,14 +934,44 @@ pub fn x64_runtime(mut cx: *FnCtx) {
         o(cx, c":\n");
         ins(cx, c"pushq %rbp");
         ins(cx, c"movq %rsp, %rbp");
+        ins(cx, c"pushq %rdi");
+        ins(cx, c"pushq %rsi");
+        ins(cx, c"pushq %rdx");
+        ins(cx, c"pushq %rcx");
+        ins(cx, c"testq %r8, %r8");
+        o(cx, c"    je ");
+        o(cx, local_prefix());
+        o(cx, c"rt.nosite\n");
+        x64_rt_addr(cx, c"rt.sites", c"%r9");
+        ins(cx, c"movl (%r9,%r8,8), %edx");
+        ins(cx, c"movl 4(%r9,%r8,8), %r10d");
+        ins(cx, c"movl %r10d, %r11d");
+        ins(cx, c"shrl $16, %r11d");
+        ins(cx, c"andl $65535, %r10d");
+        ins(cx, c"movl %r10d, %r8d");
+        x64_rt_addr(cx, c"rt.files", c"%r9");
+        ins(cx, c"movslq (%r9,%r11,4), %rsi");
+        ins(cx, c"addq %r9, %rsi");
+        ins(cx, c"movl %edx, %ecx");
+        ins(cx, c"movq %rsi, %rdx");
+        x64_rt_addr(cx, c"rt.at", c"%rsi");
+        ins(cx, c"movl $2, %edi");
+        ins(cx, c"xorl %eax, %eax");
+        o(cx, c"    call ");
+        o(cx, global_prefix());
+        o(cx, if ELF { c"dprintf@PLT\n" } else { c"dprintf\n" });
+        o(cx, local_prefix());
+        o(cx, c"rt.nosite:\n");
+        ins(cx, c"popq %rcx");
+        ins(cx, c"popq %rdx");
+        ins(cx, c"popq %rsi");
+        ins(cx, c"popq %rdi");
         ins(cx, c"movq %rcx, %r8");
         ins(cx, c"movq %rdx, %rcx");
         ins(cx, c"movq %rsi, %rdx");
-        ins(cx, c"shlq $7, %rdi");
-        o(cx, c"    leaq ");
-        o(cx, local_prefix());
-        o(cx, c"rt.messages(%rip), %rsi\n");
-        ins(cx, c"addq %rdi, %rsi");
+        x64_rt_addr(cx, c"rt.messages", c"%rsi");
+        ins(cx, c"movslq (%rsi,%rdi,4), %rax");
+        ins(cx, c"addq %rax, %rsi");
         ins(cx, c"movl $2, %edi");
         ins(cx, c"xorl %eax, %eax");
         o(cx, c"    call ");
@@ -952,5 +988,17 @@ pub fn x64_runtime(mut cx: *FnCtx) {
         o(cx, c"    call ");
         o(cx, global_prefix());
         o(cx, if ELF { c"exit@PLT\n" } else { c"exit\n" });
+    }
+}
+
+// (0.18) `reg` = the address of the run-time helper's local label `name`.
+fn x64_rt_addr(mut cx: *FnCtx, name: *u8, reg: *u8) {
+    unsafe {
+        o(cx, c"    leaq ");
+        o(cx, local_prefix());
+        o(cx, name);
+        o(cx, c"(%rip), ");
+        o(cx, reg);
+        on(cx);
     }
 }

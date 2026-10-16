@@ -16,7 +16,7 @@ pub fn print_int(v: i64) {
     // (decimal only: not Fmt::int, whose hex and binary every program
     // using print_int would compile)
     let negative = v < 0;
-    fmt_decimal(&f, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative);
+    fmt_decimal(&mut f, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative);
     f.flush();
 }
 $ text std:1-2
@@ -25,7 +25,7 @@ $ text std:1-2
 2	// (compiler/std/embed.sh makes compiler/src/front/stdsrc.tach from this file
 $ grep 'pub fn read_line' --in std
 # <std>
-2235:1	code	std	pub fn read_line<A: Allocator>(line: *Buf<A>) -> Result<bool, IoError> {
+2262:1	code	std	pub fn read_line<A: Allocator>(line: *Buf<A>) -> Result<bool, IoError> {
 $ def no_such_name
 error query.no-match: no definition 'no_such_name'
 try: tachyonc query items

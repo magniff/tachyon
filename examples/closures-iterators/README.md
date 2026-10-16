@@ -59,7 +59,7 @@ struct Lines { text: [u8], pos: i64 }
 impl Iterator for Lines {
     type Item = [u8];
 
-    fn next(self: *Lines) -> Option<[u8]> {
+    fn next(self: &mut Lines) -> Option<[u8]> {
         if self.pos >= self.text.len { return None; }
         let start = self.pos;
         while self.pos < self.text.len && self.text[self.pos] != '\n' { self.pos += 1; }

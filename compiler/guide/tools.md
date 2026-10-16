@@ -40,12 +40,12 @@ and its callers (instead of `show`, then `def`, then `refs`):
 ```text
 $ tachyonc query context parse_item
 // crate::parse_item  main.tach:5-9  effects: panic
-fn parse_item(sc: *Scanner) -> Option<Item> {
+fn parse_item(sc: &mut Scanner) -> Option<Item> {
     let name = sc.next_token()?;
     ...
 }
 // calls (3)
-std::Scanner::next_token  <std>:2184:12  method  pub fn next_token(self: *Scanner) -> Option<[u8]>
+std::Scanner::next_token  <std>:2184:12  method  pub fn next_token(self: &mut Scanner) -> Option<[u8]>
 ...
 // types (3)
 crate::Item  main.tach:3:8  struct  struct Item { name: [u8], qty: i64 }

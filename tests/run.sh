@@ -80,6 +80,10 @@
 #                        files (with -I for its CHEADER) and FLAGS on its
 #                        command line, `-o prog`; no -lm added (tachyonc
 #                        links libm when the program calls into it)
+#   // REQUIRES: clang    (0.18) the case runs only where the C compiler
+#                        ($CC, which C imports read) is clang: what it
+#                        tests is clang's (`_Nonnull`); elsewhere it is
+#                        skipped, counted apart
 #   // NO-EXTRA-FLAGS: why (0.16) the case is built without
 #                        $TACHYON_TEST_FLAGS (its output differs by design
 #                        with them)
@@ -103,6 +107,9 @@ export LC_ALL
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 COMPILER="$ROOT/target/tachyonc"
 CC=${CC:-cc}
+# (0.18) Whether the C compiler is clang, for `// REQUIRES: clang`.
+CC_IS_CLANG=0
+"$CC" --version 2>/dev/null | grep -qi clang && CC_IS_CLANG=1
 TARGET=""
 OPT=""
 TIMEOUT=${TACHYON_TEST_TIMEOUT:-20}
@@ -516,6 +523,10 @@ cpu_count() {
 run_case() {
     file=$1
     dir=$2
+    if grep -qw clang "$dir/requires" && [ $CC_IS_CLANG -eq 0 ]; then
+        echo skip >"$dir/status"
+        return
+    fi
     if check_case "$file" "$dir"; then
         if [ -s "$dir/xfail" ]; then echo xpass; else echo pass; fi
     elif [ -s "$dir/xfail" ]; then
@@ -787,6 +798,8 @@ awk '
             printf "  %-10s %5d %6d %5d\n", c, n[c, "pass"], n[c, "xfail"], n[c, "fail"]
         }
         printf "  %-10s %5d %6d %5d\n", "total", total["pass"], total["xfail"], total["fail"]
+        if (total["skip"] > 0)
+            printf "  (%d skipped: their REQUIRES does not hold here)\n", total["skip"]
     }
 ' "$TALLY"
 if grep -q ' fail$' "$TALLY"; then

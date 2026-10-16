@@ -507,10 +507,10 @@ fn main() -> i32 { let p = P { x: 1 }; println(f"{p}"); 0 }
 ```err
 'P' does not implement Display
 ```
-Implement it (`impl Display for P { fn fmt(self: *P, f: *std::Fmt) {
+Implement it (`impl Display for P { fn fmt(self: &P, f: &mut std::Fmt) {
 f.write(f"P({self.x})"); } }`), or print with `{p:?}` and
 `#[derive(Debug)]`. Rust's `fn fmt(&self, f: &mut Formatter) ->
-fmt::Result` is `fn fmt(self: *P, f: *Fmt)`, with nothing to return.
+fmt::Result` is `fn fmt(self: &P, f: &mut Fmt)`, with nothing to return.
 
 ```tach
 fn main() -> i32 { let x = 1; println(f"{f"{x}"}"); 0 }
@@ -814,6 +814,5 @@ fn main() -> i32 {
 ```
 ```out (exit 101)
 5
-invalid value 3 for enum Level
-note: build with --trace for the line and its callers
+main.tach:7:13: invalid value 3 for enum Level
 ```

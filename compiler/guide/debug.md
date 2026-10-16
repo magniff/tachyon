@@ -48,7 +48,7 @@ without calls shows its own line.
 `--trace` builds at -O1 or -O2 (with -O0, at -O1). It costs a few
 instructions per call and per loop iteration: the compiler runs about
 25% slower when built with it, and its binary is larger. Without
-`--trace`, a failure prints its message and a note:
+`--trace`, a failure is one line, its position and message:
 
 ```tach
 fn main() -> i32 {
@@ -59,8 +59,7 @@ fn main() -> i32 {
 }
 ```
 ```out (exit 101)
-index out of bounds: index 3, length 3
-note: build with --trace for the line and its callers
+main.tach:4:20: index out of bounds: index 3, length 3
 ```
 
 `tachyonc test` builds with `--trace` (`--no-trace` turns it off). A

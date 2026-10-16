@@ -1071,8 +1071,8 @@ tests/refactor/testcmd.t has a transcript.
   before inlining, so the frames are the source's at every level (with
   -O0: -O1). The cost: about 25% on the compiler's own run time, a
   larger binary (the site strings); none without the flag. Without it,
-  a failure's message is followed by `note: build with --trace for the
-  line and its callers`.
+  a failure is one line, `FILE:LINE:COL: message` (0.18; 0.17 added a
+  note on --trace).
 - `tachyonc probe FILE:LINE [EXPR...]... [--count FILE:LINE] [--max N]
   [--input FILE] [--timeout S] [-O N] [--root ROOT] [-- ARGS]`
   (tools/probe/): the line's statement found in the front end's tree

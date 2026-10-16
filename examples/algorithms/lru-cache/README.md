@@ -127,7 +127,7 @@ Item = (K, V)`. Everything iterators have comes with it: `show` uses
 ```tach
 impl<K, V> Iterator for LruIter<K, V> {
     type Item = (K, V);
-    fn next(self: *LruIter<K, V>) -> Option<(K, V)> {
+    fn next(self: &mut LruIter<K, V>) -> Option<(K, V)> {
         if self.at == NIL { return None; }
         let n = self.nodes[self.at];
         self.at = n.next;
