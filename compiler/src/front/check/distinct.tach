@@ -14,7 +14,9 @@ use crate::base::diag::{
     ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_help_fmt, err_jump,
     err_try_fmt,
 };
-use crate::front::ast::{NODES, NODE_CHECKED, NODE_COUNT, NodeKind, new_node};
+use crate::front::ast::{
+    NODES, NODE_CHECKED, NODE_COUNT, NodeKind, list_begin, list_end, list_push, new_node,
+};
 use crate::front::check::{LOCALS, LOCAL_COUNT, is_std_named};
 use crate::front::contracts::diag::{DISTINCT_KIND, DISTINCT_METHOD, DISTINCT_MIX};
 use crate::front::distinct::{
@@ -29,6 +31,7 @@ use crate::front::types::{
     STATIC_COUNT, STRUCTS, TSCRATCH, TYPES, TY_ERROR, TyKind, VARIANTS, VARIANT_COUNT, buf_type,
     enum_variant, is_numeric, struct_field, type_count, type_elem, variant_field,
 };
+use crate::gen0::target::enum_panic_kind;
 
 // The binary node whose operands are being checked (0: none): the
 // distinct.mix message names the whole operation.
@@ -333,6 +336,72 @@ pub fn null_test(n: i64) -> i64 {
         let ty = crate::front::check::synth_mode::synth_expr(test);
         NODES[n] = NODES[test];
         ty
+    }
+}
+
+// ---- `p as NonNull<T>`, checked ----
+
+// `p as NonNull<T>` (cast n, p a raw pointer, checked, to type `to`): a
+// null p is a run-time failure, as `n as E` of a value E lacks is; the
+// niche would read `Some(p)` back as None otherwise. It becomes
+//     { let ==nn = p; if ==nn as u64 == 0 { <panic> } ==nn }
+pub fn nonnull_cast(n: i64, operand: i64, to: i64) -> i64 {
+    unsafe {
+        let (start, end) = (NODES[n].start, NODES[n].end);
+        let name = intern_c(c"==nn");
+        NODES[operand].p |= NODE_CHECKED;
+        let bind = new_node(NodeKind::PatBind, start, end);
+        NODES[bind].a = name;
+        let let_p = new_node(NodeKind::Let, start, end);
+        NODES[let_p].a = bind;
+        NODES[let_p].c = operand;
+        let u64_name = new_node(NodeKind::TyName, start, end);
+        NODES[u64_name].a = intern_c(c"u64");
+        let cast = new_node(NodeKind::Cast, start, end);
+        NODES[cast].a = local_ident(name, n);
+        NODES[cast].b = u64_name;
+        let zero = new_node(NodeKind::Int, start, end);
+        NODES[zero].b = SUF_NONE;
+        let test = new_node(NodeKind::Binary, start, end);
+        NODES[test].op = Tok::EqEq;
+        NODES[test].b = cast;
+        NODES[test].c = zero;
+        let panic = new_node(NodeKind::EnumPanic, start, end);
+        NODES[panic].a = local_ident(name, n);
+        NODES[panic].x = enum_panic_kind(-1);
+        let then = new_node(NodeKind::Block, start, end);
+        let tmark = list_begin();
+        list_push(expr_stmt(panic));
+        list_end(then, tmark);
+        let check = new_node(NodeKind::If, start, end);
+        NODES[check].a = test;
+        NODES[check].b = then;
+        let block = new_node(NodeKind::Block, start, end);
+        let mark = list_begin();
+        list_push(let_p);
+        list_push(expr_stmt(check));
+        list_end(block, mark);
+        NODES[block].a = local_ident(name, n);
+        crate::front::check::synth_mode::synth_expr(block);
+        NODES[n] = NODES[block];
+        to
+    }
+}
+
+fn local_ident(name: i64, at: i64) -> i64 {
+    unsafe {
+        let n = new_node(NodeKind::Ident, NODES[at].start, NODES[at].end);
+        NODES[n].a = name;
+        n
+    }
+}
+
+fn expr_stmt(e: i64) -> i64 {
+    unsafe {
+        let s = new_node(NodeKind::ExprStmt, NODES[e].start, NODES[e].end);
+        NODES[s].a = e;
+        NODES[s].b = 1;
+        s
     }
 }
 

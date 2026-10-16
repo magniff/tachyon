@@ -1463,8 +1463,17 @@ appends "Tn notes" here.
   not by a `#[niche_null]` attribute: the parser takes no attributes on
   aliases yet. An enum has it with two variants, one without fields and
   one holding only a NonNull (`enum_niche`).
-- Left to T1 (the invariant): `q as NonNull<T>` and a NonNull from C are
-  not checked for null yet; `NonNull::new` checks.
+- `q as NonNull<T>` from a raw pointer is checked (chosen over making it
+  `unsafe`: §2.10 says `as` into a type with an invariant checks it, as
+  `n as E` does). It becomes `{ let p = q; if p as u64 == 0 { <panic> }
+  p }`, failing with `null pointer made NonNull` (exit 101), a gen0
+  runtime message (kind enum_panic_kind(-1)), so T5's sites give it a
+  position and the range analysis may remove it. Without it, safe code
+  could make a null NonNull whose `Some` reads back as None. T1's
+  general invariant check may take it over.
+- A `_Nonnull` result of a C function is not checked: the call is
+  unsafe, and its caller vouches for what C returns (as for every other
+  promise of a C signature).
 - Field access through a distinct struct type is not offered (convert
   with `as`); `!` on a distinct bool is not either.
 - Found on the way: an `extern "C" fn`'s result type `X<Y<Z>>` was a

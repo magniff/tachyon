@@ -143,11 +143,13 @@ fn main() {
 ```
 
 `std::NonNull<T>` is std's `distinct *T` that is never null:
-`NonNull::new(p)` is `Some` unless p is null, `p.as_ptr()` (or
-`p as *T`) is the raw pointer, and dereferencing stays `unsafe`.
+`NonNull::new(p)` is `Some` unless p is null, `p as NonNull<T>` is
+checked (a null p exits 101: `null pointer made NonNull`), `p.as_ptr()`
+(or `p as *T`) is the raw pointer, and dereferencing stays `unsafe`.
 `Option<NonNull<T>>` is one pointer, `None` the null one, so it is the
 field type of a nullable link and C's nullable pointer in an `extern
-"C"` signature; a C header's `_Nonnull` pointers import as NonNull. Any
+"C"` signature; a C header's `_Nonnull` pointers import as NonNull (a
+result is C's promise, which the unsafe call vouches for). Any
 `*T` has `p.is_null()`.
 
 ```tach
