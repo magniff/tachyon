@@ -4,10 +4,14 @@
 ## A method #[derive] makes: the attribute answers (0.15).
 $ items
 crate	syntax015/main.tach	6
-std	<std>	529
+std	<std>	558
 std::ops	<std>	5
 std::iter	<std>	67
-std::slice	<std>	15
+std::slice	<std>	37
+std::slice::unstable	<std>	16
+std::slice::stable	<std>	22
+std::slice::search	<std>	4
+std::slice::algo	<std>	12
 std::collections	<std>	2
 std::collections::hash_map	<std>	26
 std::io	<std>	7
@@ -16,6 +20,9 @@ std::num	<std>	83
 std::num::tables	<std>	4
 std::convert	<std>	2
 std::clone	<std>	1
+std::random	<std>	17
+std::sys	<std>	192
+std::time	<std>	40
 $ show main
 // crate::main	syntax015/main.tach:25-31	effects: io global panic
 fn main() -> Option<i64> {

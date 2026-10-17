@@ -3,11 +3,15 @@
 ## an item shown with its clauses, a distinct type, test functions.
 $ items
 crate	syntax018/main.tach	14
-std	<std>	529
+std	<std>	558
 crate::tests	syntax018/main.tach	1
 std::ops	<std>	5
 std::iter	<std>	67
-std::slice	<std>	15
+std::slice	<std>	37
+std::slice::unstable	<std>	16
+std::slice::stable	<std>	22
+std::slice::search	<std>	4
+std::slice::algo	<std>	12
 std::collections	<std>	2
 std::collections::hash_map	<std>	26
 std::io	<std>	7
@@ -16,6 +20,9 @@ std::num	<std>	83
 std::num::tables	<std>	4
 std::convert	<std>	2
 std::clone	<std>	1
+std::random	<std>	17
+std::sys	<std>	192
+std::time	<std>	40
 $ show crate::push Stack Percent
 // crate::push	syntax018/main.tach:19-27	effects: panic
 fn push(s: &mut Stack, x: i64)

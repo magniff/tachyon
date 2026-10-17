@@ -1,0 +1,202 @@
+// std::slice::algo: reverse, rotations, fill, dedup, retain, selection, heap sifts (0.20).
+
+use std::{Clone, Eq};
+use super::{reverse_raw, rotate_raw, swap_at};
+
+// ---- Slice algorithms (0.20) ----
+
+// Rust's slice algorithms as functions over slices (0.20;
+// docs/design/collections-text-io.md §2.4.1 and §2.4.6, task A1): reverse,
+// rotations, fill, dedup and retain (which compact a slice and return its
+// new length, for Vec's methods to truncate to), selection of the k-th
+// element, and the sift functions of a binary max-heap. Comparators take
+// `*T`, and those returning a sign follow sort_by's convention until std
+// has Ordering.
+//
+// Unsafe code: reverse and rotate work through the slice's own pointer
+// and length (the kernels of Sort kernels); selection runs the unstable
+// sort's kernels on s.ptr and s.len, whose contract they keep.
+
+// Reverses s in place. Rust's `reverse`.
+pub fn reverse<T>(s: &mut [T]) {
+    // (s.ptr and s.len are one slice's)
+    unsafe {
+        reverse_raw(s.ptr, s.len);
+    }
+}
+
+// Rotates s in place so that s[k] comes first and s[0..k] goes to the end
+// (k <= s.len, checked). Rust's `rotate_left`.
+pub fn rotate_left<T>(s: &mut [T], k: i64) {
+    let n = s.len;
+    // (the check: s[k..] panics when k > n)
+    let _ = &s[k..];
+    unsafe {
+        rotate_raw(s.ptr, n, k);
+    }
+}
+
+// Rotates s in place so that its last k elements come first (k <= s.len,
+// checked). Rust's `rotate_right`.
+pub fn rotate_right<T>(s: &mut [T], k: i64) {
+    let n = s.len;
+    let _ = &s[k..];
+    unsafe {
+        rotate_raw(s.ptr, n, n - k);
+    }
+}
+
+// Sets every element of s to a clone of x. Rust's `fill`.
+pub fn fill<T: Clone>(s: &mut [T], x: T) {
+    for i in 0..s.len {
+        s[i] = x.clone();
+    }
+}
+
+// Removes the elements of s for which same(e, kept) is true, kept being
+// the last element kept before e, keeping the order of the rest at the
+// front of s; returns how many are kept (s[n..] holds the others, in
+// some order: Vec's `dedup_by` drops them). Rust's `dedup_by`.
+pub fn dedup_by<T, F: FnMut(&T, &T) -> bool>(s: &mut [T], same: F) -> i64 {
+    let mut g = same;
+    let n = s.len;
+    if n < 2 {
+        return n;
+    }
+    let mut w = 1;
+    for r in 1..n {
+        if !g(&s[r], &s[w - 1]) {
+            if r != w {
+                swap_at(s, w, r);
+            }
+            w += 1;
+        }
+    }
+    w
+}
+
+// dedup_by with ==: consecutive equal elements kept once.
+pub fn dedup<T: Eq>(s: &mut [T]) -> i64 {
+    dedup_by(s, |a: &T, b: &T| *a == *b)
+}
+
+// dedup_by on the key f gives each element.
+pub fn dedup_by_key<T, K: Eq, F: FnMut(&T) -> K>(s: &mut [T], f: F) -> i64 {
+    let mut g = f;
+    dedup_by(s, |a: &T, b: &T| g(a) == g(b))
+}
+
+// Keeps the elements of s for which keep is true at the front of s, in
+// their order, and returns how many (s[n..] holds the others, in some
+// order); keep sees each element once, in order. Rust's `retain` (Vec's
+// drops the others).
+pub fn retain_by<T, F: FnMut(&T) -> bool>(s: &mut [T], keep: F) -> i64 {
+    let mut g = keep;
+    let mut w = 0;
+    for r in 0..s.len {
+        if g(&s[r]) {
+            if r != w {
+                swap_at(s, w, r);
+            }
+            w += 1;
+        }
+    }
+    w
+}
+
+// Binary max-heap helpers (for BinaryHeap, 0.20): s[0..end] is a heap
+// when no element is less than its children, s[2i + 1] and s[2i + 2],
+// by is_less. The element moves as bits through s's pointer (any T, owned
+// ones too); pos < end <= s.len, checked.
+
+// Moves s[pos] up toward s[start] while it is greater than its parent;
+// returns where it stops. Rust's BinaryHeap::sift_up.
+pub fn heap_sift_up_less<T,
+    F: FnMut(&T, &T) -> bool>(s: &mut [T], start: i64, pos: i64, is_less: F) -> i64 {
+    let _ = &s[pos];
+    // (pos < s.len; every index below is at most pos)
+    unsafe { heap_sift_up_raw(s.ptr, start, pos, is_less) }
+}
+
+unsafe fn heap_sift_up_raw<T,
+    F: FnMut(&T, &T) -> bool>(p: *T, start: i64, pos: i64, is_less: F) -> i64 {
+    let mut f = is_less;
+    let x = p[pos];
+    let mut at = pos;
+    // (at at least halves each round)
+    for _ in 0..64 {
+        if at <= start {
+            break;
+        }
+        let parent = (at - 1) / 2;
+        if !f(&*(&p[parent]), &x) {
+            break;
+        }
+        p[at] = p[parent];
+        at = parent;
+    }
+    p[at] = x;
+    at
+}
+
+// Moves s[pos] down the heap s[0..end] while a child is greater, taking
+// the greater child each time (the right one when they are equal, as
+// Rust); returns where it stops. Rust's BinaryHeap::sift_down_range.
+pub fn heap_sift_down_less<T,
+    F: FnMut(&T, &T) -> bool>(s: &mut [T], pos: i64, end: i64, is_less: F) -> i64 {
+    let _ = &s[pos];
+    let _ = &s[end - 1];
+    let mut f = is_less;
+    // (pos < end <= s.len: every index below is under end)
+    unsafe {
+        let p = s.ptr;
+        let x = p[pos];
+        let mut at = pos;
+        // (at at least doubles each round)
+        for _ in 0..64 {
+            let mut child = 2 * at + 1;
+            if child >= end {
+                break;
+            }
+            if child + 1 < end && !f(&*(&p[child + 1]), &*(&p[child])) {
+                child += 1;
+            }
+            if !f(&x, &*(&p[child])) {
+                break;
+            }
+            p[at] = p[child];
+            at = child;
+        }
+        p[at] = x;
+        at
+    }
+}
+
+// Moves s[pos] all the way down the heap s[0..end] along the greater
+// children, then up to where it belongs: fewer comparisons when it
+// belongs low, as after a pop moves the last element to the root. Rust's
+// BinaryHeap::sift_down_to_bottom.
+pub fn heap_sift_down_to_bottom_less<T, F: FnMut(&T, &T) -> bool>(s: &mut [T], pos: i64, end: i64,
+    is_less: F) {
+    let _ = &s[pos];
+    let _ = &s[end - 1];
+    let mut f = is_less;
+    unsafe {
+        let p = s.ptr;
+        let x = p[pos];
+        let mut at = pos;
+        for _ in 0..64 {
+            let mut child = 2 * at + 1;
+            if child >= end {
+                break;
+            }
+            if child + 1 < end && !f(&*(&p[child + 1]), &*(&p[child])) {
+                child += 1;
+            }
+            p[at] = p[child];
+            at = child;
+        }
+        p[at] = x;
+        heap_sift_up_raw(p, pos, at, f);
+    }
+}

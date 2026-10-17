@@ -1,0 +1,78 @@
+// EXPECT: size 24x80 tty true master tty true
+// EXPECT: raw set, size now 30x100
+// EXPECT: child said: hi|30 100|
+// EXPECT: child exit 0
+// EXPECT: poll timeout 0 nonblocking read WouldBlock
+// 0.20 (A7): std's OS layer on terminals, what 0.23's terminal needs: a
+// pseudo-terminal (posix_openpt) of a size, the child in a new session
+// with the terminal as its controlling one (fork, setsid, TIOCSCTTY, dup2,
+// execve), TIOCSWINSZ/TIOCGWINSZ, termios raw mode, poll and O_NONBLOCK.
+use std::sys::{
+    SYS_POLLIN, SysErrorKind, SysPollFd, SysWinsize, sys_close, sys_errno_kind, sys_exit_code,
+    sys_fork_exec_pty, sys_get_winsize, sys_isatty, sys_make_raw, sys_openpty, sys_pipe, sys_poll,
+    sys_read, sys_set_nonblocking, sys_set_winsize, sys_tcgetattr, sys_tcsetattr, sys_waitpid,
+};
+
+fn main(gpa: Gpa) -> i32 {
+    let pty = sys_openpty(SysWinsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 }).unwrap();
+    let m = pty.0;
+    let t = pty.1;
+    let ws = sys_get_winsize(t).unwrap();
+    println(f"size {ws.ws_row}x{ws.ws_col} tty {sys_isatty(t)} master tty {sys_isatty(m)}");
+
+    let mut tio = sys_tcgetattr(t).unwrap();
+    sys_make_raw(&mut tio);
+    sys_tcsetattr(t, &tio).unwrap();
+    sys_set_winsize(m, SysWinsize { ws_row: 30, ws_col: 100, ws_xpixel: 0, ws_ypixel: 0 }).unwrap();
+    let ws2 = sys_get_winsize(t).unwrap();
+    println(f"raw set, size now {ws2.ws_row}x{ws2.ws_col}");
+
+    let argv: [*u8; 4] = [c"/bin/sh", c"-c", c"echo hi; stty size", 0 as *u8];
+    let envp: [*u8; 2] = [c"PATH=/usr/bin:/bin", 0 as *u8];
+    let pid = unsafe { sys_fork_exec_pty(t, c"/bin/sh", argv[..], envp[..]) }.unwrap();
+    sys_close(t).unwrap();
+
+    // Read until the child closes its end (EOF, or EIO on Linux).
+    let mut out = Buf::new_in(gpa);
+    defer out.free();
+    let mut buf = [0u8; 4096];
+    let mut fds: [SysPollFd; 1] = [SysPollFd { fd: m, events: SYS_POLLIN, revents: 0 }];
+    for _ in 0..1000 {
+        let ready = sys_poll(fds[..], 5000).unwrap();
+        if ready == 0 {
+            println("timeout");
+            break;
+        }
+        match sys_read(m, &mut buf[..]) {
+            Ok(0) => break,
+            Ok(n) => out.push_str(buf[0..n]),
+            Err(_) => break,
+        }
+    }
+    print("child said: ");
+    for c in out.as_slice() {
+        if c == '\n' {
+            print("|");
+        } else if c != '\r' {
+            let one: [u8; 1] = [c];
+            print(one[..]);
+        }
+    }
+    println("");
+    let w = sys_waitpid(pid, false).unwrap();
+    println(f"child exit {sys_exit_code(w.1).unwrap()}");
+    sys_close(m).unwrap();
+
+    let p = sys_pipe().unwrap();
+    let mut pf: [SysPollFd; 1] = [SysPollFd { fd: p.0, events: SYS_POLLIN, revents: 0 }];
+    let n = sys_poll(pf[..], 0).unwrap();
+    sys_set_nonblocking(p.0, true).unwrap();
+    let k = match sys_read(p.0, &mut buf[..]) {
+        Ok(_) => SysErrorKind::Other,
+        Err(e) => sys_errno_kind(e),
+    };
+    println(f"poll timeout {n} nonblocking read {k:?}");
+    sys_close(p.0).unwrap();
+    sys_close(p.1).unwrap();
+    0
+}

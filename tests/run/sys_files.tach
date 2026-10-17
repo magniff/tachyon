@@ -1,0 +1,184 @@
+// EXPECT: wrote 12 size 12 file true dir false
+// EXPECT: pread world pos 12 end 12
+// EXPECT: pwrite hello WORLD truncated 5 fsync ok
+// EXPECT: renamed true old gone NotFound
+// EXPECT: lstat dir true
+// EXPECT: entries . .. a.txt b.txt sub
+// EXPECT: kinds file file dir
+// EXPECT: cwd ends in dir true back true
+// EXPECT: mkdir again AlreadyExists rmdir full DirectoryNotEmpty
+// EXPECT: nul InvalidInput long InvalidInput
+// EXPECT: removed true
+// EXPECT: dup2 ok isatty false
+// 0.20 (A7): std's OS layer on files and directories: open, read, write,
+// pread, pwrite, lseek, ftruncate, fsync, fstat, stat, lstat, rename,
+// unlink, mkdir, rmdir, opendir/readdir_into/closedir, getcwd, chdir, and
+// the errors as errno kinds, in a fresh directory under /tmp.
+use std::sys::{
+    FileStat, SYS_DT_DIR, SYS_DT_REG, SYS_DT_UNKNOWN, SYS_O_CREAT, SYS_O_RDONLY, SYS_O_RDWR,
+    SYS_O_TRUNC, SYS_O_WRONLY, SYS_SEEK_CUR, SYS_SEEK_END, SysDir, SysErrorKind, sys_chdir,
+    sys_close, sys_closedir, sys_dup, sys_dup2, sys_errno_kind, sys_fstat, sys_fsync, sys_ftruncate,
+    sys_getcwd_into, sys_getpid, sys_isatty, sys_lseek, sys_lstat, sys_mkdir, sys_open, sys_opendir,
+    sys_pread, sys_pwrite, sys_readdir_into, sys_rename, sys_rmdir, sys_stat, sys_unlink, sys_write,
+};
+
+fn kind(r: Result<(), i32>) -> SysErrorKind {
+    match r {
+        Ok(()) => SysErrorKind::Other,
+        Err(e) => sys_errno_kind(e),
+    }
+}
+
+fn kind_name(k: SysErrorKind) -> [u8] {
+    match k {
+        SysErrorKind::NotFound => "NotFound",
+        SysErrorKind::AlreadyExists => "AlreadyExists",
+        SysErrorKind::DirectoryNotEmpty => "DirectoryNotEmpty",
+        SysErrorKind::InvalidInput => "InvalidInput",
+        _ => "other",
+    }
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let mut dir = Buf::new_in(gpa);
+    defer dir.free();
+    dir.push_str("/tmp/tachyon_sys_files_");
+    dir.push_int(sys_getpid() as i64);
+    let d = dir.as_slice();
+    sys_mkdir(d, 0x1ed).unwrap();
+    let mut pa = Buf::new_in(gpa);
+    defer pa.free();
+    pa.push_str(d);
+    pa.push_str("/a.txt");
+    let a = pa.as_slice();
+
+    let fd = sys_open(a, SYS_O_RDWR | SYS_O_CREAT | SYS_O_TRUNC, 0x1a4).unwrap();
+    let n = sys_write(fd, "hello world\n").unwrap();
+    let st = sys_fstat(fd).unwrap();
+    println(f"wrote {n} size {st.size} file {st.is_file()} dir {st.is_dir()}");
+
+    let mut buf = [0u8; 32];
+    let k = sys_pread(fd, &mut buf[0..5], 6).unwrap();
+    let pos = sys_lseek(fd, 0, SYS_SEEK_CUR).unwrap();
+    let end = sys_lseek(fd, 0, SYS_SEEK_END).unwrap();
+    println(f"pread {buf[0..k]} pos {pos} end {end}");
+
+    sys_pwrite(fd, "WORLD", 6).unwrap();
+    let k2 = sys_pread(fd, &mut buf[..], 0).unwrap();
+    print(f"pwrite {buf[0..k2 - 1]}");
+    sys_ftruncate(fd, 5).unwrap();
+    let st2 = sys_fstat(fd).unwrap();
+    sys_fsync(fd).unwrap();
+    println(f" truncated {st2.size} fsync ok");
+    sys_close(fd).unwrap();
+
+    let mut pb = Buf::new_in(gpa);
+    defer pb.free();
+    pb.push_str(d);
+    pb.push_str("/b.txt");
+    let b = pb.as_slice();
+    sys_rename(a, b).unwrap();
+    let st3 = sys_stat(b).unwrap();
+    println(f"renamed {st3.size == 5} old gone {kind_name(kind(sys_stat(a).map_unit()))}");
+    let fd2 = sys_open(a, SYS_O_WRONLY | SYS_O_CREAT, 0x1a4).unwrap();
+    sys_close(fd2).unwrap();
+
+    let mut ps = Buf::new_in(gpa);
+    defer ps.free();
+    ps.push_str(d);
+    ps.push_str("/sub");
+    let sub = ps.as_slice();
+    sys_mkdir(sub, 0x1ed).unwrap();
+    println(f"lstat dir {sys_lstat(sub).unwrap().is_dir()}");
+
+    // the entries, sorted by name
+    let mut names: Vec<Buf> = Vec::new_in(gpa);
+    let mut dh = sys_opendir(d).unwrap();
+    let mut name = [0u8; 256];
+    let mut kinds = Buf::new_in(gpa);
+    defer kinds.free();
+    for _ in 0..100 {
+        match sys_readdir_into(&mut dh, &mut name).unwrap() {
+            None => break,
+            Some(e) => {
+                let mut nb = Buf::new_in(gpa);
+                nb.push_str(name[0..e.name_len]);
+                if e.kind != SYS_DT_UNKNOWN && name[0] != '.' {
+                    let ks = if e.kind == SYS_DT_DIR { "dir" }
+                        else if e.kind == SYS_DT_REG { "file" } else { "?" };
+                    nb.push(' ');
+                    nb.push_str(ks);
+                }
+                names.push(nb);
+            }
+        }
+    }
+    sys_closedir(&mut dh).unwrap();
+    names.sort_by(|x: &Buf, y: &Buf| {
+        let xs = x.as_slice();
+        let ys = y.as_slice();
+        xs.cmp(&ys)
+    });
+    print("entries");
+    for i in 0..names.len() {
+        let s = names[i].as_slice();
+        let mut j = 0;
+        for c in 0..s.len {
+            if s[c] == ' ' { break; }
+            j += 1;
+        }
+        print(f" {s[0..j]}");
+        if j < s.len {
+            kinds.push(' ');
+            kinds.push_str(s[j + 1..s.len]);
+        }
+    }
+    println("");
+    println(f"kinds{kinds.as_slice()}");
+    for i in 0..names.len() { names[i].free(); }
+    names.free();
+
+    let mut cwd = [0u8; 4096];
+    let old_len = sys_getcwd_into(&mut cwd[..]).unwrap();
+    let mut old = Buf::new_in(gpa);
+    defer old.free();
+    old.push_str(cwd[0..old_len]);
+    sys_chdir(sub).unwrap();
+    let nl = sys_getcwd_into(&mut cwd[..]).unwrap();
+    let here = cwd[0..nl];
+    let ends = nl >= 4 && here[nl - 4..nl] == "/sub";
+    sys_chdir(old.as_slice()).unwrap();
+    let back = sys_getcwd_into(&mut cwd[..]).unwrap();
+    println(f"cwd ends in dir {ends} back {cwd[0..back] == old.as_slice()}");
+
+    println(
+        f"mkdir again {kind_name(kind(sys_mkdir(sub, 0x1ed)))} rmdir full {kind_name(kind(sys_rmdir(d)))}");
+    let long = ['a'; 5000];
+    println(
+        f"nul {kind_name(kind(sys_unlink("/tmp/x\x00y")))} long {kind_name(kind(sys_unlink(long[..])))}");
+
+    sys_unlink(a).unwrap();
+    sys_unlink(b).unwrap();
+    sys_rmdir(sub).unwrap();
+    sys_rmdir(d).unwrap();
+    println(f"removed {kind(sys_stat(d).map_unit()) == SysErrorKind::NotFound}");
+
+    let fd3 = sys_open("/dev/null", SYS_O_RDONLY, 0).unwrap();
+    let fd4 = sys_dup(fd3).unwrap();
+    let r = sys_dup2(fd3, fd4).unwrap();
+    println(f"dup2 {if r == fd4 { "ok" } else { "bad" }} isatty {sys_isatty(fd3)}");
+    sys_close(fd3).unwrap();
+    sys_close(fd4).unwrap();
+    0
+}
+
+trait MapUnit { fn map_unit(self: Self) -> Result<(), i32>; }
+
+impl MapUnit for Result<FileStat, i32> {
+    fn map_unit(self: Result<FileStat, i32>) -> Result<(), i32> {
+        match self {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
