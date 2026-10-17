@@ -24,6 +24,7 @@ tachyonc query callees FN... [--transitive] [--writes TABLE] [--count] [--limit 
 tachyonc query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (0.16) the inferred effects
 tachyonc query views NAME...|MODULE [--why]   (0.17) what results and `&mut` parameters view
 tachyonc query features NAME... [--why FEATURE] [-C OPTION]   (0.19) what a function needs of the CPU
+tachyonc query arch WORDS... [--feature F] [--arch A] [--equiv NAME]   (0.19) the intrinsic tables (also `intrinsics`; no program read)
 tachyonc query items [MODULE|TYPE...] [--root ROOT] [--comments]
 tachyonc query show MODULE::section TITLE                   (0.13)
 tachyonc query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
@@ -562,6 +563,69 @@ $ tachyonc query features twice --why crc -C target-cpu=generic
 crate::twice	crc (inferred)
   features019/main.tach:11:5: calls 'hw'
   features019/main.tach:7:5: calls 'std::arch::aarch64::__crc32cd', which needs crc
+```
+
+### features: on def, show and context
+
+`def`, `show` and `context` print `features: crc (inferred)` (or
+`(declared)`) after `effects:` on a function's first line when it needs
+something beyond the build's features; nothing when it needs nothing
+(the requirement of `query features`, cached with the effects).
+
+## arch (0.19)
+
+`arch WORDS...` (also spelled `intrinsics`) searches the intrinsic
+tables (`compiler/arch/*.def`, docs/design/arch.md §2.1) without reading
+a program: one intrinsic a line, `MODULE::NAME \t FEATURES \t
+INSTRUCTION \t DOC`, the module below `std::arch` (`aarch64::`,
+`x86_64::`, none for the portable ones), the instruction the table's
+template (`<d>` the result, `<a>` parameter a).
+
+- A WORD matches (any case) the name, a feature, the instruction, the
+  doc, the semantics or the equivalent, weighed in that order; the best
+  first, the tables' order among equals. Every WORD must match; when no
+  intrinsic matches them all, those matching the most are printed with
+  `note query.partial`. A few plain words also match the tables'
+  spellings: `subtract` is `sub`, `multiply` `mul`, `search`, `find`,
+  `equal` and `compare` a `== b`, `popcount` `1 bits`, `byte` `u8`,
+  `checksum` `crc`.
+- `--feature F` keeps the intrinsics that need F (alone: lists them);
+  `--arch aarch64|x86_64|portable` one table.
+- `--equiv NAME` prints NAME's line, its `equivalent:` column (the
+  other architecture's intrinsic, or a recipe), the lines of the
+  intrinsics that names, and those whose equivalent names NAME.
+- Nothing matches: `error query.no-match` and `try: tachyonc guide
+  arch#recipes` (exit 1). The answer is cut at `--budget` as any.
+
+```
+$ tachyonc query arch saturating subtract u8
+aarch64::vqsubq_u8→neon→uqsub <d>.16b, <a>.16b, <b>.16b→lanewise a - b, saturating at 0 and 255
+aarch64::vqsub_u8→neon→uqsub <d>.8b, <a>.8b, <b>.8b→lanewise a - b, saturating at 0 and 255
+$ tachyonc query arch --equiv _mm_movemask_epi8
+x86_64::_mm_movemask_epi8→sse2→pmovmskb <a>, <d:w>→the 16 bytes' top bits as a 16-bit mask
+equivalent: aarch64: (recipe) vshrn_n_u16(vreinterpretq_u16_u8(m), 4)
+aarch64::vshrn_n_u16→neon→shrn <d>.8b, <a>.8h, #<n>→each lane shifted right by n, narrowed ...
+aarch64::vreinterpretq_u16_u8→neon→-→the same bits as 8 u16 lanes
+```
+
+### An intrinsic in def, show and context
+
+A NAME that is an intrinsic (`vqtbl1q_u8`, `_mm_movemask_epi8`, or any
+`std::arch::...` path) is declared for the question, whether or not the
+program names it, and the program is read with std (with no program,
+std alone). Its first line carries `features:` and `instruction:` from
+the table; `show` and `context` add its doc, what it computes, its
+equivalent and its `use` line:
+
+```
+$ tachyonc query show vqtbl1q_u8
+// std::arch::aarch64::vqtbl1q_u8→<std::arch::aarch64>:109-110→effects: none→features: neon→instruction: tbl <d>.16b, {<t>.16b}, <idx>.16b
+// a table lookup: lane k is t[idx[k]], 0 when idx[k] >= 16
+// computes: r[k] = if idx[k] < 16 { t[idx[k]] } else { 0 }
+// equivalent: x86_64: _mm_shuffle_epi8 (zeroes when bit 7 is set instead)
+// use std::arch::aarch64::vqtbl1q_u8;
+#[intrinsic(1404)]
+pub fn vqtbl1q_u8(t: uint8x16_t, idx: uint8x16_t) -> uint8x16_t;
 ```
 
 ## views (0.17)

@@ -1705,7 +1705,9 @@ let_stmt += "let" pattern "=" expr "else" block ";" ;     (* let-else *)
   to, not the reference: it may be returned or kept after the binding's
   scope when that is alive.
 
-## Additions of 0.19: vector types and std::arch's types
+## Additions of 0.19: vector types, std::arch, target features
+
+The design is docs/design/arch.md; `tachyonc guide arch` teaches it.
 
 ### More vector types
 
@@ -1779,6 +1781,67 @@ An intrinsic is a function of `std::arch`, `std::arch::aarch64` or
   `std::arch::x86_64::raw::_mm_loadu_si128(p: *__m128i)`.
 - `is_x86_feature_detected!("f")` and its AArch64 twin are
   `std::arch::detect("f")` (`arch.rust_form`).
+- **The portable module `std::arch`** holds `has`, `detect` and the bit
+  operations every target has an instruction for (`count_ones`; std's
+  `count_ones`, `leading_zeros` and `trailing_zeros` are one instruction
+  where the target has it).
+- **The modules are virtual**: their declarations are made from the
+  intrinsic tables (`compiler/arch/*.def`) for the names a program uses,
+  so a program that names none pays nothing. `tachyonc query show NAME`
+  prints one's declaration with its features, instruction, what it
+  computes and its other architecture's equivalent; `tachyonc query
+  arch WORDS` searches the tables (docs/query.md).
+- **Effects.** A register intrinsic has none; a checked memory form is
+  `panic`; a `raw` form is `unsafe`; `has` and `detect` have none. So
+  `#[pure]` functions may use them.
+
+### Target features
+
+Every intrinsic needs target features (`neon`, `crc`, `sha2`, `avx2`,
+...; the lists are in `tachyonc explain arch.feature_name`). A call is
+legal only where its features are *known*:
+
+- **The build's features**: the target's baseline (aarch64-macos:
+  `apple-m1`, which has neon, fp, crc, aes, sha2, sha3, dotprod, rdm,
+  lse, fp16; aarch64-linux: `generic`, neon and fp; x86_64-linux:
+  `x86-64`, sse and sse2; x86_64-macos: `core2`, up to ssse3), changed by
+  `-C target-cpu=NAME|native` and `-C target-feature=+f,-g` on every
+  command that checks. A feature implies what it needs (`avx2` implies
+  `avx`, ... `sse2`; `sha3` implies `sha2` and `neon`). Removing one the
+  ABI needs (`-neon`, `-fp`, `-sse2`) is `arch.baseline`; an unknown CPU
+  `arch.cpu`.
+- **A declaration**: `#[target_feature(enable = "crc,aes")]` on the
+  enclosing function. Its body is checked against it (`arch.declared`),
+  and its callers must know what it declares.
+- **A guard**: the then branch of `if G`, where G is
+  `std::arch::detect("f")` or `std::arch::has("f")` or a `&&` of them;
+  the else branch of `if !G`; the rest of a block after `if !G { ... }`
+  whose block diverges (`return`, `break`, `continue`, a panic); the
+  rest of a block after `assert(G)`. `||`, a negation elsewhere and a
+  `bool` kept in a local give nothing.
+
+`std::arch::has("f")` is the constant answer of that known set at its
+point (never inferred). Both take the feature's name as a string
+literal (`arch.feature_literal`); an unknown name is `arch.feature_name`.
+`aes` names both architectures' feature: unqualified it is the target's,
+and `aarch64.aes` / `x86_64.aes` name one (`arch.feature_ambiguous`
+where the reading matters).
+
+**Requirements are inferred**, as effects are: a function needs what its
+calls need beyond what is known at each call, generic instances and
+closures each their own. A declaration pins a function's requirement.
+Where nothing above can know a feature, a requirement is an error
+(`arch.feature`, at the call that brings it in, with the intrinsic):
+`main`, an `extern "C"` function, a test or property, and a function
+taken as a plain `fn` value (`arch.fn_pointer`; a closure passed as
+itself is followed, and a `#[multiversion]` function's address may be
+taken).
+
+**Another architecture's intrinsics** type-check everywhere. Their
+features are never known, so `has` and `detect` of them are the constant
+`false`, a branch under them is dead (checked, never generated), and a
+call of one outside such a branch is `arch.feature`. One source holds
+both architectures' code; there is no `cfg`.
 
 ### Run-time detection and `#[multiversion]` (0.19)
 
