@@ -25,14 +25,14 @@ use crate::front::consteval::const_eval;
 use crate::front::features::{feature_call_bit, feature_call_value};
 use crate::front::lexer::Tok;
 use crate::front::types::{
-    FNS, SYM_PRIMITIVE, TYPES, TY_U64, is_compound, is_vector, is_void, type_size,
+    FNS, SYM_PRIMITIVE, TYPES, TY_U64, is_compound, is_float, is_vector, is_void, type_size,
 };
 use crate::gen0::gen::{alloc_slot, fn_symbol_prefix, load_reg_from_frame, store_reg_to_frame};
 use crate::gen0::gen::expr::gen_expr;
 use crate::gen0::gen::vector::{gen_vector_address, gen_vector_to_slot};
 use crate::gen0::target::{
     R_ACC, R_ADDR, R_SECOND, emit_call, emit_copy, emit_frame_addr, emit_int_binary, emit_load_imm,
-    emit_normalize, ins, o, oi, on,
+    emit_normalize, emit_store, ins, o, oi, on,
 };
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{Cond, Op};
@@ -123,6 +123,13 @@ pub fn gen_intrinsic(mut cx: *FnCtx, n: i64, f: i64, id: i64) -> bool {
                 imms[k] = const_eval(e);
             } else if is_vector(NODES[e].ty) {
                 slots[k] = gen_vector_to_slot(cx, e);
+            } else if is_float(NODES[e].ty) {
+                // (a float in the float accumulator, d0/xmm0)
+                let slot = alloc_slot(8, 8);
+                gen_expr(cx, e);
+                emit_frame_addr(cx, R_ADDR, slot);
+                emit_store(cx, NODES[e].ty, R_ACC, R_ADDR);
+                slots[k] = slot;
             } else {
                 // (the canonical 64 bits)
                 let slot = alloc_slot(8, 8);
@@ -138,12 +145,13 @@ pub fn gen_intrinsic(mut cx: *FnCtx, n: i64, f: i64, id: i64) -> bool {
                 continue;
             }
             let ty = NODES[e].ty;
-            regs[k] = if is_vector(ty) { VREG + k } else { k };
+            regs[k] = if is_vector(ty) || is_float(ty) { VREG + k } else { k };
             emit_frame_addr(cx, R_ADDR, slots[k]);
             load_register(cx, regs[k], ty);
         }
         let vector_result = is_vector(ret);
-        let d = if vector_result { VREG } else { 0 };
+        // (a float result in v0: the float accumulator's d0/s0)
+        let d = if vector_result || is_float(ret) { VREG } else { 0 };
         let work = if INTRS[id].work != 0 { SYM_PRIMITIVE[INTRS[id].work] } else { ret };
         if form == FORM_INTR {
             if X86 { mx_intr(cx, id, d, regs[..], imms[..]); }
@@ -172,7 +180,7 @@ pub fn gen_intrinsic(mut cx: *FnCtx, n: i64, f: i64, id: i64) -> bool {
             emit_frame_addr(cx, R_ADDR, r);
             store_register(cx, VREG, ret);
             emit_frame_addr(cx, R_ACC, r);
-        } else if !is_void(ret) {
+        } else if !is_void(ret) && !is_float(ret) {
             emit_normalize(cx, ret);
         }
         true
@@ -200,7 +208,7 @@ fn load_register(mut cx: *FnCtx, r: i64, ty: i64) {
         }
         o(cx, c"    ldr ");
         if r >= 32 {
-            o(cx, if size == 16 { c"q" } else { c"d" });
+            o(cx, if size == 16 { c"q" } else if size == 4 { c"s" } else { c"d" });
             oi(cx, r - 32);
         } else {
             o(cx, c"x");

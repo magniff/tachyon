@@ -1,65 +1,260 @@
 // The intrinsics' AArch64 instructions (0.19, docs/design/arch.md §5.3):
-// a mnemonic the encoder's own chain does not know is looked up in
-// compiler/arch/insn_a64.def (arch/table.tach), whose line gives its
-// encoding class and fixed bits; the class adds the registers, the
-// arrangement and the immediates. compiler/arch/README.md lists the
-// classes:
+// a mnemonic is looked up in compiler/arch/insn_a64.def (arch/table.tach)
+// before the encoder's own chain when its operands are vector registers,
+// and when the chain does not know it otherwise. A mnemonic may have
+// several lines (`cmeq` against a register is the chain's, against #0 a
+// line here): the first line whose class fits the operands encodes it;
+// none fits, the chain does. The line gives the encoding class and the
+// fixed bits; the class adds the registers, the arrangement and the
+// immediates. compiler/arch/README.md lists the classes:
 //
-//   same3   Vd.T, Vn.T, Vm.T             Q, size, Rm, Rn, Rd
-//   across  <V>d, Vn.T                   Q, size, Rn, Rd
-//   umov    Wd|Xd, Vn.Ts[i]              Q (for .d), imm5, Rn, Rd
+//   same3   Vd.T, Vn.T, Vm.T             Q, size (from Vd), Rm, Rn, Rd
+//   same3f  Vd.T, Vn.T, Vm.T (float)     Q, sz (bit 22), Rm, Rn, Rd
+//   diff3   Vd.Ta, Vn.Tb, Vm.Tb          Q, size from the narrowest arrangement
+//   misc2   Vd.T, Vn.T [, #0]            Q, size from the narrowest arrangement
+//   misc2f  Vd.T, Vn.T [, #0.0] (float)  Q from the narrowest, sz from the widest
+//   across  <V>d, Vn.T                   Q, size (from Vn), Rn, Rd
+//   acrossf <V>d, Vn.T (float)           Q (from Vn), Rn, Rd
+//   umov    Wd|Xd, Vn.Ts[i]              Q (for Xd), imm5, Rn, Rd
 //   tbl     Vd.T, {Vn.16b..}, Vm.T       Q, Rm, len - 1, Rn, Rd
 //   ext     Vd.T, Vn.T, Vm.T, #index     Q, Rm, imm4, Rn, Rd
-//   shrn    Vd.Tb, Vn.Ta, #shift         Q, immh:immb = 2 * esize - shift, Rn, Rd
-//   crc     Wd, Wn, Wm|Xm                Rm, Rn, Rd
-//
-// (T4 moves the vector instructions of the chain here and adds the other
-// classes: two-register misc, modified immediate, shift by immediate,
-// copy, vector by element, the crypto ones.)
+//   shrn    Vd.T, Vn.T, #shift           right shifts, narrowing ones too: Q,
+//                                        immh:immb = 2 * esize - shift (the narrowest)
+//   shl     Vd.T, Vn.T, #shift           left shifts, widening ones too: Q,
+//                                        immh:immb = esize + shift (the narrowest)
+//   elem    Vd.T, Vn.T, Vm.Ts[i]         Q (from Vd), size, H:L:M, Rm, Rn, Rd
+//   fpair   <V>d, Vn.T (float pairwise)  sz (from Vn), Rn, Rd
+//   rr      Rd, Rn (any registers)       Rn, Rd (crypto two-register)
+//   rrr     Rd, Rn, Rm                   Rm, Rn, Rd (crypto three-register;
+//   crc                                  crc is the same)
+//   rrrr    Vd, Vn, Vm, Va               Rm, Ra, Rn, Rd (SHA-3's eor3, bcax)
+//   xar     Vd, Vn, Vm, #imm6            Rm, imm6, Rn, Rd
 
 use crate::arch::table::{insn_hex, insn_named, insn_text};
-use crate::back::enc_arm64::{C_X, OPS, imm5, need, r, word};
-use crate::back::objfile::assemble::asm_error;
+use crate::back::enc_arm64::{
+    AOp, C_B, C_D, C_H, C_S, C_V, C_VL, C_X, K_IMM, K_LIST, K_REG, OPS, imm5, need, r, word,
+};
+use crate::back::objfile::assemble::{OP_COUNT, asm_error};
 use crate::middle::ctx::FnCtx;
 
-// The instruction of mnemonic `name` with the operands parsed;
-// false when the table has no such mnemonic.
+// The instruction of mnemonic `name` with the operands parsed; false when
+// the table has no line of it whose class fits them.
 pub fn a64_table_instruction(mut cx: *FnCtx, name: [u8]) -> bool {
     unsafe {
-        let k = insn_named(name);
+        let mut k = insn_named(name);
         if k < 0 {
             return false;
         }
-        let class = insn_text(k, 1);
-        let bits = insn_hex(k, 2);
+        // (a mnemonic's lines are consecutive; the name map gives the first)
+        while insn_text(k, 0) == name {
+            let class = insn_text(k, 1);
+            if fits(class) {
+                encode(cx, class, insn_hex(k, 2));
+                return true;
+            }
+            k += 1;
+        }
+        false
+    }
+}
+
+// Whether the operands are `regs` registers (or lists), then `imms`
+// immediates.
+fn shape(regs: i64, imms: i64) -> bool {
+    unsafe {
+        if OP_COUNT != regs + imms {
+            return false;
+        }
+        for k in 0..OP_COUNT {
+            let kind = OPS[k].kind;
+            if k < regs && kind != K_REG && kind != K_LIST {
+                return false;
+            }
+            if k >= regs && kind != K_IMM {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// Whether class `class` encodes the operands: their kinds, and a vector
+// class's first operand a vector (`Vd.T`), a scalar class's (`...s`) a
+// SIMD scalar (b h s d).
+fn fits(class: [u8]) -> bool {
+    unsafe {
+        let c0 = OPS[0].cls;
+        let vector = c0 == C_V;
+        let scalar = c0 == C_B || c0 == C_H || c0 == C_S || c0 == C_D;
+        if class == "same3" || class == "same3f" || class == "diff3" {
+            // (a third operand by element, `umlal v0.2d, v1.2s, v2.s[1]`, is
+            // the chain's)
+            return vector && shape(3, 0) && OPS[2].cls == C_V;
+        }
+        if class == "elem" {
+            return vector && shape(3, 0) && OPS[2].cls == C_VL;
+        }
+        if class == "tbl" {
+            return vector && shape(3, 0) && OPS[1].kind == K_LIST;
+        }
+        if class == "rrr" || class == "crc" {
+            return shape(3, 0);
+        }
+        if class == "same3s" {
+            return scalar && shape(3, 0);
+        }
+        if class == "misc2" || class == "misc2f" {
+            return vector && (shape(2, 0) || shape(2, 1));
+        }
+        if class == "misc2s" || class == "misc2fs" {
+            return scalar && (shape(2, 0) || shape(2, 1));
+        }
+        if class == "across" || class == "acrossf" || class == "umov" || class == "rr" {
+            return shape(2, 0);
+        }
+        if class == "shrn" || class == "shl" {
+            return vector && shape(2, 1);
+        }
+        if class == "shrns" || class == "shls" {
+            return scalar && shape(2, 1);
+        }
+        if class == "ext" {
+            return vector && shape(3, 1);
+        }
+        if class == "xar" {
+            return shape(3, 1);
+        }
+        if class == "fpair" {
+            return scalar && shape(2, 0);
+        }
+        if class == "rrrr" {
+            return shape(4, 0);
+        }
+        false
+    }
+}
+
+// The vector operand, among the first n, of the narrowest arrangement
+// (the smallest element; the first of equals): the one that gives Q and
+// size to a long, wide or narrowing instruction.
+fn narrowest(n: i64) -> AOp {
+    unsafe {
+        let mut best = OPS[0];
+        for k in 1..n {
+            let o = OPS[k];
+            if o.cls == C_V && (best.cls != C_V || o.imm < best.imm) {
+                best = o;
+            }
+        }
+        best
+    }
+}
+
+// The widest element size (0 b to 4 q) among the first n operands.
+fn widest(n: i64) -> i64 {
+    unsafe {
+        let mut w = 0;
+        for k in 0..n {
+            if OPS[k].cls == C_V && OPS[k].imm > w {
+                w = OPS[k].imm;
+            }
+        }
+        w
+    }
+}
+
+// The size field (0 b to 3 d) of a SIMD scalar register class.
+fn ssize(cls: i64) -> i64 {
+    if cls == C_B { 0 } else if cls == C_H { 1 } else if cls == C_S { 2 } else { 3 }
+}
+
+fn encode(mut cx: *FnCtx, class: [u8], bits: i64) {
+    unsafe {
         let o0 = OPS[0];
         let o1 = OPS[1];
+        let c0 = o0.cls;
         if class == "same3" {
-            need(cx, 3);
             word(bits | o0.shift << 30 | o0.imm << 22 | r(2) << 16 | r(1) << 5 | r(0));
+        } else if class == "same3f" {
+            let sz = if o0.imm == 3 { 1 << 22 } else { 0 };
+            word(bits | o0.shift << 30 | sz | r(2) << 16 | r(1) << 5 | r(0));
+        } else if class == "diff3" {
+            let n = narrowest(3);
+            word(bits | n.shift << 30 | (n.imm & 3) << 22 | r(2) << 16 | r(1) << 5 | r(0));
+        } else if class == "misc2" {
+            let n = narrowest(2);
+            word(bits | n.shift << 30 | n.imm << 22 | r(1) << 5 | r(0));
+        } else if class == "misc2f" {
+            let n = narrowest(2);
+            let sz = if widest(2) == 3 { 1 << 22 } else { 0 };
+            word(bits | n.shift << 30 | sz | r(1) << 5 | r(0));
         } else if class == "across" {
-            need(cx, 2);
             word(bits | o1.shift << 30 | o1.imm << 22 | r(1) << 5 | r(0));
+        } else if class == "acrossf" {
+            word(bits | o1.shift << 30 | r(1) << 5 | r(0));
         } else if class == "umov" {
-            need(cx, 2);
             let q = if o0.cls == C_X { 1 << 30 } else { 0 };
             word(bits | q | imm5(o1.imm, o1.amount) << 16 | r(1) << 5 | r(0));
         } else if class == "tbl" {
-            need(cx, 3);
             word(bits | o0.shift << 30 | r(2) << 16 | (o1.amount - 1) << 13 | r(1) << 5 | r(0));
         } else if class == "ext" {
-            need(cx, 4);
             word(bits | o0.shift << 30 | r(2) << 16 | (OPS[3].imm & 15) << 11 | r(1) << 5 | r(0));
-        } else if class == "shrn" {
-            need(cx, 3);
-            let esize = 8 << o0.imm as u64;
-            word(bits | o0.shift << 30 | (2 * esize - OPS[2].imm) << 16 | r(1) << 5 | r(0));
-        } else if class == "crc" {
-            need(cx, 3);
+        } else if class == "shrn" || class == "shl" {
+            let n = narrowest(2);
+            let esize = 8 << n.imm as u64;
+            let shift = OPS[2].imm;
+            if shift < 0 || shift > (if class == "shl" { esize - 1 } else { esize }) {
+                asm_error(cx, c"shift amount out of range");
+            }
+            let immhb = if class == "shl" { esize + shift } else { 2 * esize - shift };
+            word(bits | n.shift << 30 | immhb << 16 | r(1) << 5 | r(0));
+        } else if class == "elem" {
+            // (by element: Vm.Ts[i]; h: index H:L:M with Rm in v0-v15; s:
+            // H:L; d: H)
+            let e = OPS[2];
+            if e.cls != C_VL {
+                asm_error(cx, c"expected an element operand");
+            }
+            let i = e.amount;
+            let mut hlm = 0;
+            if e.imm == 1 {
+                if e.reg > 15 {
+                    asm_error(cx, c"by-element operand of 16-bit lanes must be v0-v15");
+                }
+                hlm = (i >> 2) << 11 | ((i >> 1) & 1) << 21 | (i & 1) << 20;
+            } else if e.imm == 2 {
+                hlm = (i >> 1) << 11 | (i & 1) << 21;
+            } else {
+                hlm = (i & 1) << 11;
+            }
+            word(bits | o0.shift << 30 | e.imm << 22 | hlm | (e.reg & 31) << 16 | r(1) << 5 | r(0));
+        } else if class == "same3s" {
+            word(bits | ssize(c0) << 22 | r(2) << 16 | r(1) << 5 | r(0));
+        } else if class == "misc2s" {
+            word(bits | ssize(c0) << 22 | r(1) << 5 | r(0));
+        } else if class == "misc2fs" {
+            word(bits | (if c0 == C_D { 1 << 22 } else { 0 }) | r(1) << 5 | r(0));
+        } else if class == "shrns" || class == "shls" {
+            let esize = 8 << ssize(c0) as u64;
+            let shift = OPS[2].imm;
+            if shift < 0 || shift > (if class == "shls" { esize - 1 } else { esize }) {
+                asm_error(cx, c"shift amount out of range");
+            }
+            let immhb = if class == "shls" { esize + shift } else { 2 * esize - shift };
+            word(bits | immhb << 16 | r(1) << 5 | r(0));
+        } else if class == "fpair" {
+            // (fmaxp Sd, Vn.2s; Dd, Vn.2d: sz from the vector)
+            word(bits | (if o1.imm == 3 { 1 << 22 } else { 0 }) | r(1) << 5 | r(0));
+        } else if class == "rr" {
+            word(bits | r(1) << 5 | r(0));
+        } else if class == "rrr" || class == "crc" {
             word(bits | r(2) << 16 | r(1) << 5 | r(0));
+        } else if class == "rrrr" {
+            word(bits | r(2) << 16 | r(3) << 10 | r(1) << 5 | r(0));
+        } else if class == "xar" {
+            word(bits | r(2) << 16 | (OPS[3].imm & 63) << 10 | r(1) << 5 | r(0));
         } else {
             asm_error(cx, c"internal error: an instruction class the encoder does not know");
         }
-        true
     }
 }
