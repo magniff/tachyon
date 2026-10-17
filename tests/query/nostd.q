@@ -8,7 +8,7 @@ $ def read_line twice
 std::io::read_line	../../compiler/std/io.tach:30:8	fn	pub fn read_line<A: Allocator>(line: &mut Buf<A>) -> Result<bool, IoError>
 crate::twice	nostd/main.tach:4:4	fn	fn twice(x: i64) -> i64	effects: none
 $ show std::print_int
-// std::fmt::print_int	../../compiler/std/fmt.tach:30-38	effects: io global panic
+// std::fmt::print_int	../../compiler/std/fmt.tach:31-39	effects: io global panic
 // use std::print_int;
 #[inline(never)]
 pub fn print_int(v: i64) {
@@ -25,7 +25,7 @@ $ text std:1-2
 2	// (compiler/std/embed.sh makes compiler/src/front/stdsrc.tach from this file
 $ grep 'pub fn read_line' --in std
 # <std>
-6172:1	code	std::io	pub fn read_line<A: Allocator>(line: &mut Buf<A>) -> Result<bool, IoError> {
+6152:1	code	std::io	pub fn read_line<A: Allocator>(line: &mut Buf<A>) -> Result<bool, IoError> {
 $ def no_such_name
 error query.no-match: no definition 'no_such_name'
 try: tachyonc query items

@@ -7,15 +7,16 @@ $ def trim
 crate::trim	prelude017/main.tach:6:4	fn	fn trim(x: i64) -> i64	effects: none
 $ items prelude017/uses.tach
 crate	prelude017/uses.tach	1
-std	<std>	533
+std	<std>	529
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	15
 std::collections	<std>	2
 std::collections::hash_map	<std>	26
 std::io	<std>	7
-std::fmt	<std>	73
-std::num	<std>	15
+std::fmt	<std>	80
+std::num	<std>	83
+std::num::tables	<std>	4
 std::convert	<std>	2
 std::clone	<std>	1
 $ def trim prelude017/uses.tach
