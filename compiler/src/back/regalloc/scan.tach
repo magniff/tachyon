@@ -10,7 +10,7 @@ use crate::back::regalloc::intervals::{
 };
 use crate::base::{IntVec, die, free};
 use crate::base::target::X86;
-use crate::front::types::{in_fregs, is_vector, max_i64};
+use crate::front::types::{in_fregs, is_vector, max_i64, type_size};
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::Op::Phi;
 
@@ -760,26 +760,33 @@ fn assign_spill_slots(mut cx: *FnCtx) {
         }
         // slot_end[i]: where the lifetime of the value in slot i ends. A
         // vector (0.10) takes two slots, the first of them even (the spill
-        // area is then 16-aligned).
+        // area is then 16-aligned); a 256-bit one (0.19, x86-64's ymm) four,
+        // the first a multiple of four.
         let mut slot_end = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         cx.spill_vectors = false;
         for i in 0..n {
             let t = spilled.data[i];
             let s = value_start(cx, t);
-            let wide = is_vector(cx.insts[cx.ra_vals.data[t]].ty);
-            let step = if wide { 2 } else { 1 };
+            let ty = cx.insts[cx.ra_vals.data[t]].ty;
+            let wide = is_vector(ty);
+            let step = if !wide { 1 } else if type_size(ty) == 32 { 4 } else { 2 };
             let mut slot = -1;
             let mut k = 0;
             while k + step <= slot_end.count {
-                if slot_end.data[k] <= s && (!wide || slot_end.data[k + 1] <= s)
-                    && !cx.returns_twice {
+                let mut free = !cx.returns_twice;
+                for j in 0..step {
+                    if slot_end.data[k + j] > s {
+                        free = false;
+                    }
+                }
+                if free {
                     slot = k;
                     break;
                 }
                 k += step;
             }
             if slot < 0 {
-                if wide && slot_end.count % 2 == 1 {
+                while slot_end.count % step != 0 {
                     slot_end.push(0);
                 }
                 slot = slot_end.count;
@@ -787,9 +794,10 @@ fn assign_spill_slots(mut cx: *FnCtx) {
                     slot_end.push(0);
                 }
             }
-            slot_end.data[slot] = value_end(cx, t);
+            for j in 0..step {
+                slot_end.data[slot + j] = value_end(cx, t);
+            }
             if wide {
-                slot_end.data[slot + 1] = value_end(cx, t);
                 cx.spill_vectors = true;
             }
             cx.rv_slot[t] = slot;

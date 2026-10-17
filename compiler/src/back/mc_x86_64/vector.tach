@@ -1,7 +1,7 @@
 // x86-64 vector instructions (mc_x86_64/mod.tach).
 
 use crate::back::mc_x86_64::{mx_r, mx_rr, mx_rs};
-use crate::front::types::{is_float, type_size, vec_elem, vec_lanes};
+use crate::front::types::{is_float, is_signed, type_size, vec_elem, vec_lanes};
 use crate::gen0::target::{o, oi, on};
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{Cond, Op};
@@ -21,13 +21,20 @@ const X15: i64 = 47;
 
 const X14: i64 = 46;
 
-// The suffix of the integer instructions for vt's lanes: q, d, w or b.
+// The suffix of the integer instructions for vt's lanes: q, d, w or b
+// (0.19: by the lanes' size, a 64-bit vector's lanes being in the low
+// half of its register).
 fn mx_lane_suffix(vt: i64) -> *u8 {
-    let lanes = vec_lanes(vt);
-    if lanes == 2 { return c"q"; }
-    if lanes == 4 { return c"d"; }
-    if lanes == 8 { return c"w"; }
+    let size = type_size(vec_elem(vt));
+    if size == 8 { return c"q"; }
+    if size == 4 { return c"d"; }
+    if size == 2 { return c"w"; }
     c"b"
+}
+
+// The suffix of the float instructions for vt's lanes: pd or ps.
+fn mx_float_suffix(vt: i64) -> *u8 {
+    if type_size(vec_elem(vt)) == 8 { c"pd" } else { c"ps" }
 }
 
 // "    <mnemonic><suffix> %a, %b\n"
@@ -96,10 +103,20 @@ fn mx_from_red(mut cx: *FnCtx, r: i64, offset: i64) {
     }
 }
 
-// Integer register r = the lane of type elem at offset (sign-extended).
+// Integer register r = the lane of type elem at offset, canonical:
+// sign-extended, or zero-extended for an unsigned lane (0.19).
 fn mx_lane_load(mut cx: *FnCtx, elem: i64, offset: i64, r: i64) {
     unsafe {
         let size = type_size(elem);
+        if !is_signed(elem) && size < 8 {
+            o(cx, if size == 1 { c"    movzbq " } else if size == 2 { c"    movzwq " }
+                else { c"    movl " });
+            mx_red(cx, offset);
+            o(cx, c", ");
+            if size == 4 { mx_rs(cx, r, 4); } else { mx_r(cx, r); }
+            on(cx);
+            return;
+        }
         o(cx, if size == 1 { c"    movsbq " } else if size == 2 { c"    movswq " }
             else if size == 4 { c"    movslq " } else { c"    movq " });
         mx_red(cx, offset);
@@ -122,11 +139,13 @@ fn mx_lane_store(mut cx: *FnCtx, elem: i64, r: i64, offset: i64) {
 }
 
 // d = a <op> b lane by lane in r10 and r11 through the red zone: a
-// multiplication (op Mul), or a 64-bit comparison (op Sub, cond).
+// multiplication (op Mul), or a 64-bit comparison (op Sub, cond; unsigned
+// lanes compare unsigned, 0.19).
 fn mx_vlanes(mut cx: *FnCtx, op: Op, cond: Cond, vt: i64, d: i64, a: i64, b: i64) {
     unsafe {
         let elem = vec_elem(vt);
         let size = type_size(elem);
+        let signed = is_signed(elem);
         mx_to_red(cx, a, -32);
         mx_to_red(cx, b, -16);
         for lane in 0..vec_lanes(vt) {
@@ -138,8 +157,10 @@ fn mx_vlanes(mut cx: *FnCtx, op: Op, cond: Cond, vt: i64, d: i64, a: i64, b: i64
             } else {
                 o(cx, c"    xorl %r11d, %r11d\n    cmpq ");
                 mx_red(cx, -16 + lane * size);
-                o(cx, if cond == Cond::Gt { c", %r10\n    setg %r11b\n" }
-                    else { c", %r10\n    setl %r11b\n" });
+                o(cx, if cond == Cond::Gt { if signed { c", %r10\n    setg %r11b\n" }
+                    else { c", %r10\n    seta %r11b\n" } }
+                    else if signed { c", %r10\n    setl %r11b\n" }
+                    else { c", %r10\n    setb %r11b\n" });
                 o(cx, c"    negq %r11\n");
                 mx_lane_store(cx, elem, 11, -32 + lane * size);
             }
@@ -151,7 +172,7 @@ fn mx_vlanes(mut cx: *FnCtx, op: Op, cond: Cond, vt: i64, d: i64, a: i64, b: i64
 pub fn mx_vbin(mut cx: *FnCtx, op: Op, vt: i64, d: i64, a: i64, b: i64) {
     unsafe {
         let float = is_float(vec_elem(vt));
-        let fs = if vec_lanes(vt) == 2 { c"pd" } else { c"ps" };
+        let fs = mx_float_suffix(vt);
         let is = mx_lane_suffix(vt);
         if op == And { mx_v2op(cx, c"pand", c"", true, d, a, b); }
         else if op == Or { mx_v2op(cx, c"por", c"", true, d, a, b); }
@@ -168,7 +189,7 @@ pub fn mx_vbin(mut cx: *FnCtx, op: Op, vt: i64, d: i64, a: i64, b: i64) {
         }
         else if op == Div { mx_v2op(cx, c"div", fs, false, d, a, b); }
         else if float { mx_v2op(cx, c"mul", fs, true, d, a, b); }
-        else if vec_lanes(vt) == 8 { mx_v2op(cx, c"pmullw", c"", true, d, a, b); }
+        else if type_size(vec_elem(vt)) == 2 { mx_v2op(cx, c"pmullw", c"", true, d, a, b); }
         else { mx_vlanes(cx, Mul, Cond::Eq, vt, d, a, b); }
     }
 }
@@ -183,7 +204,7 @@ pub fn mx_vneg(mut cx: *FnCtx, vt: i64, d: i64, a: i64) {
         if is_float(vec_elem(vt)) {
             // The sign bits, flipped.
             mx_ones(cx);
-            o(cx, if vec_lanes(vt) == 2 { c"    psllq $63, %xmm14\n" }
+            o(cx, if type_size(vec_elem(vt)) == 8 { c"    psllq $63, %xmm14\n" }
                 else { c"    pslld $31, %xmm14\n" });
             mx_vmov(cx, d, a);
             mx_rr(cx, c"xorps", X14, d);
@@ -203,10 +224,11 @@ fn mx_vnot(mut cx: *FnCtx, d: i64) {
 
 pub fn mx_vcmp(mut cx: *FnCtx, cond: Cond, vt: i64, d: i64, a: i64, b: i64) {
     unsafe {
-        let lanes = vec_lanes(vt);
-        if is_float(vec_elem(vt)) {
+        let elem = vec_elem(vt);
+        let wide = type_size(elem) == 8;
+        if is_float(elem) {
             // cmpps/cmppd predicates: 0 eq, 1 lt, 2 le, 4 neq (true on NaN).
-            let fs = if lanes == 2 { c"pd" } else { c"ps" };
+            let fs = mx_float_suffix(vt);
             let mut x = a;
             let mut y = b;
             let mut pred = 0;
@@ -232,7 +254,7 @@ pub fn mx_vcmp(mut cx: *FnCtx, cond: Cond, vt: i64, d: i64, a: i64, b: i64) {
         }
         let is = mx_lane_suffix(vt);
         if cond == Cond::Eq || cond == Cond::Ne {
-            if lanes == 2 {
+            if wide {
                 // Both 32-bit halves equal.
                 mx_v2op(cx, c"pcmpeqd", c"", true, d, a, b);
                 o(cx, c"    pshufd $177, ");
@@ -251,10 +273,21 @@ pub fn mx_vcmp(mut cx: *FnCtx, cond: Cond, vt: i64, d: i64, a: i64, b: i64) {
         let swap = cond == Cond::Lt || cond == Cond::Ge;
         let x = if swap { b } else { a };
         let y = if swap { a } else { b };
-        if lanes == 2 {
+        if wide {
             mx_vlanes(cx, Sub, Cond::Gt, vt, d, x, y);
-        } else {
+        } else if is_signed(elem) {
             mx_v2op(cx, c"pcmpgt", is, false, d, x, y);
+        } else {
+            // (0.19) unsigned: signed after flipping the sign bits (xmm14)
+            o(cx, if type_size(elem) == 1 { c"    movl $0x80808080, %r10d\n" }
+                else if type_size(elem) == 2 { c"    movl $0x80008000, %r10d\n" }
+                else { c"    movl $0x80000000, %r10d\n" });
+            o(cx, c"    movd %r10d, %xmm14\n    pshufd $0, %xmm14, %xmm14\n");
+            mx_vmov(cx, X15, x);
+            mx_rr(cx, c"pxor", X14, X15);
+            mx_rr(cx, c"pxor", y, X14);
+            mx_rr2(cx, c"pcmpgt", is, X14, X15);
+            mx_vmov(cx, d, X15);
         }
         if cond == Cond::Le || cond == Cond::Ge {
             mx_vnot(cx, d);
@@ -264,10 +297,10 @@ pub fn mx_vcmp(mut cx: *FnCtx, cond: Cond, vt: i64, d: i64, a: i64, b: i64) {
 
 pub fn mx_vsplat(mut cx: *FnCtx, vt: i64, d: i64, a: i64) {
     unsafe {
-        let lanes = vec_lanes(vt);
+        let size = type_size(vec_elem(vt));
         if is_float(vec_elem(vt)) {
             mx_vmov(cx, d, a);
-            if lanes == 2 {
+            if size == 8 {
                 mx_rr(cx, c"unpcklpd", d, d);
             } else {
                 o(cx, c"    shufps $0, ");
@@ -278,7 +311,7 @@ pub fn mx_vsplat(mut cx: *FnCtx, vt: i64, d: i64, a: i64) {
             }
             return;
         }
-        if lanes == 2 {
+        if size == 8 {
             mx_rr(cx, c"movq", a, d);
             mx_rr(cx, c"punpcklqdq", d, d);
             return;
@@ -288,10 +321,10 @@ pub fn mx_vsplat(mut cx: *FnCtx, vt: i64, d: i64, a: i64) {
         o(cx, c", ");
         mx_r(cx, d);
         on(cx);
-        if lanes == 16 {
+        if size == 1 {
             mx_rr(cx, c"punpcklbw", d, d);
         }
-        if lanes >= 8 {
+        if size <= 2 {
             mx_rr(cx, c"punpcklwd", d, d);
         }
         o(cx, c"    pshufd $0, ");
@@ -345,14 +378,18 @@ pub fn mx_vsum(mut cx: *FnCtx, vt: i64, d: i64, a: i64) {
         mx_to_red(cx, a, -16);
         if is_float(elem) {
             let m = if size == 4 { c"ss " } else { c"sd " };
-            // Pairwise: (l0 + l1) for two lanes, (l0 + l1) + (l2 + l3) for four.
+            // Pairwise: (l0 + l1) for two lanes, (l0 + l1) + (l2 + l3) for
+            // four (0.19: l0 for one).
             o(cx, c"    mov");
             o(cx, m);
             mx_red(cx, -16);
-            o(cx, c", %xmm15\n    add");
-            o(cx, m);
-            mx_red(cx, -16 + size);
             o(cx, c", %xmm15\n");
+            if lanes > 1 {
+                o(cx, c"    add");
+                o(cx, m);
+                mx_red(cx, -16 + size);
+                o(cx, c", %xmm15\n");
+            }
             if lanes == 4 {
                 o(cx, c"    mov");
                 o(cx, m);
@@ -372,7 +409,15 @@ pub fn mx_vsum(mut cx: *FnCtx, vt: i64, d: i64, a: i64) {
             mx_lane_load(cx, elem, -16 + lane * size, 11);
             o(cx, c"    addq %r11, %r10\n");
         }
-        // Canonical: sign-extended from the lane width.
+        // Canonical: sign-extended from the lane width (zero-extended for
+        // unsigned lanes, 0.19).
+        if !is_signed(elem) && size < 8 {
+            o(cx, if size == 1 { c"    movzbq %r10b, " } else if size == 2 { c"    movzwq %r10w, " }
+                else { c"    movl %r10d, " });
+            if size == 4 { mx_rs(cx, d, 4); } else { mx_r(cx, d); }
+            on(cx);
+            return;
+        }
         o(cx, if size == 1 { c"    movsbq %r10b, " } else if size == 2 { c"    movswq %r10w, " }
             else if size == 4 { c"    movslq %r10d, " } else { c"    movq %r10, " });
         mx_r(cx, d);

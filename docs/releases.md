@@ -50,8 +50,79 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.17.0 | `v0.17.0` | 0.16.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | memory safety by mutable value semantics: owned values (`Vec`, `Buf`, `HashMap`, `Drop` types, what holds one) move and are dropped at the end of their scope (`Drop`, generated drop glue, drop flags, `.clone()` explicit); references `&T`/`&mut T` and slices split into read-only `[T]` and exclusive `&mut [T]`, second-class: views checked so none outlives or is invalidated under what it views, with inferred view summaries (`views(..)`, `stores(..)`, `#[views]` pins), two-phase receivers and reborrows, no lifetime annotations; `--values=error` the default (`warn`, `report`, `off` for 0.17 only); noalias and read-only facts from reference parameters, NRVO, moves elided in loops; std on values (`Drop` for the containers, `&Self`/`&mut Self` receivers, sorts on `&mut [T]`, `Eq`/`Ord`/`Hash` on `&Self`); `fix --values` and the corpus migrated; `query own`, `query views`, `explain own.*`, tests/own-try; familiar forms (`&mut x`, `v[i]` on Vec and Buf, indexing through a pointer by its type, `p.0`, `len()`, `panic`/`unreachable`, a larger prelude, module paths in code resolved as `use` lines, struct-like enum variants); `fix --suggested`, the `&f` diagnostic; `--trace`, `probe`, `reduce`, `tachyonc test`, `guide debug`; compile speed (per-function IR and pipeline, -O1 leaf inlining, f-strings written in place: the compiler compiles itself 14% faster at -O0, 37% at -O2, in a third less memory) |
 | 0.18.0 | `v0.18.0` | 0.17.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | contracts and verification in the language: `requires`/`ensures` (`result`, `old(..)`, `else` messages, `debug` clauses), checked at run time, a requires at the call so the caller is blamed, pure conditions (`contract.effect`); std's own clauses (`unwrap`, `Vec::get`, ...); `assert`, `assert_eq`, `assert_ne`, `debug_assert`; every run-time check one line `FILE:LINE:COL: message` with the condition and its values; `query checks` (the checks the optimizer proved away and those left), `--no-positions`; `#[test]`, `#[cfg(test)]` modules, `assert_snapshot`, `#[property]` with inputs generated from the types and shrunk, contracts tested as properties, `#[fuzz]` with block coverage (`--coverage`, `tachyonc fuzz`), leaks failing a test; `tachyonc test` builds at -O0 and -O2 and compares them; `reduce` over programs (`--differs`, `--fails`, `--test`); `type X = distinct T`, `std::NonNull<T>` with the null niche (`Option<NonNull<T>>` is a pointer, FFI-safe, `_Nonnull` imported) and a checked `as NonNull<T>`; std's `Display`, `Debug`, `Iterator`, `Clone` on references, `fix --values` over traits; the agent eval's `+debrief` |
 | 0.18.1 | `v0.18.1` | 0.18.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | two use-after-free holes in safe code closed (a changed copy of a borrowed owned value; a reference into a Vec across a push); functions compiled in parallel (`-j N`, the same bytes at any N; the -O2 self-compile 2.13 s to 0.72 s at -j8) and incremental rebuilds from a code cache (a one-function edit 0.53 s, byte-identical to clean); V4: every `*T` raw, borrowing only `&`/`&mut`, the compiler and std on references; contracts in generated code (range fixes, `x % n` ranges, entry facts: the contracts bench 25% fewer instructions than without clauses); BinaryHeap/MinHeap, binding modes on references, `&f()` temporaries, let-else and the 0.18 eval's polish; a valgrind row and threads/incremental steps in the gate, a lock on the bootstrap cache |
+| 0.19.0 | `v0.19.0` | 0.18.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | CPU intrinsics and target features: `std::arch` with over 1,775 AArch64 intrinsics (NEON, crc, sha2, sha512, sha3, aes, pmull, dotprod, float), each checked lane by lane against a scalar reference, and 484 x86-64 intrinsics (SSE to AVX2, FMA, BMI, AES-NI, SHA, PCLMULQDQ) encoded as cc does but not run; unsigned, 64-bit and 256-bit vector types; target features inferred like effects, `has`/`detect` guards, foreign architectures constant false, `-C target-cpu`/`target-feature`; run-time detection and `#[multiversion]`; intrinsics pure to the optimizer, never hoisted above their guard, vectors in vector registers; `query arch`, `guide arch`, examples/arch, the fuzzer's arch mode, `tachyonc assemble` |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.19
+
+The design, its decisions (D1-D20) and each task's notes ("as built")
+are in docs/design/arch.md; the language in docs/grammar.md, "Additions
+of 0.19"; `tachyonc guide arch`; examples/arch.
+
+- **`std::arch`**: CPU intrinsics under their vendor names, read from
+  tables (`compiler/arch/*.def`: signature, features, instruction,
+  encoding, folds, semantics, doc), declared on use (std's text does not
+  grow). **AArch64: 1,775+ intrinsics**, NEON integer and float, crc,
+  sha2, sha512, sha3, aes, pmull, dotprod; each is checked lane by lane
+  against a scalar reference generated from its semantics, with constant
+  and run-time inputs at every level (`arch-gen`), crypto by known
+  answers, and objcheck agrees with cc on aarch64-macos and
+  aarch64-linux. **x86-64: 484 intrinsics** (SSE to SSE4.2, AVX, AVX2,
+  FMA, POPCNT, LZCNT, BMI1/2, AES-NI, SHA, PCLMULQDQ), encoded byte for
+  byte as cc does (`tachyonc assemble`, tests/arch/enc.sh: 7,777
+  instructions) and compiled for x86_64-linux and x86_64-macos, but
+  **never executed**: x86 testing is off by the user's instruction, and
+  docs/design/arch.md ("T5 as built") lists what runs once it returns.
+  Memory forms take slices and are checked (`vld1q_u8(s, i)`), the raw
+  pointer forms are in `raw::` and `unsafe`.
+- **Vector types**: unsigned, 64-bit and 256-bit portable vectors (30 in
+  all) with 0.10's operations and `T::from_bits`; NEON's types are their
+  aliases, x86's `__m*` opaque; 256-bit vectors run on AArch64 as pairs.
+- **Target features, inferred like effects**: a function needs the
+  features of the intrinsics it calls, over the call graph;
+  `#[target_feature(enable = ..)]` pins one; a call is legal where the
+  callee's needs are known (the build's features, a declaration, or a
+  flow-sensitive `has("x")`/`detect("x")` guard: the then-branch, `&&`,
+  after `if !G { diverge }`, `assert(G)`); another architecture's
+  features are constant false (its branches checked, never generated),
+  which replaces `cfg`. `-C target-cpu=NAME|native`, `-C
+  target-feature=+x,-y`; baselines apple-m1 on macOS (crc, aes, sha2,
+  sha3, dotprod always there), Armv8.0 on Linux. `arch.*` diagnostics
+  with `try:` lines.
+- **Run-time detection**: `detect("sha2")` reads one cached word (sysctl
+  on macOS, getauxval on Linux, cpuid and xgetbv on x86-64), filled
+  before main or on first use in a library; `#[multiversion("sha3",
+  "dotprod")]` makes a version per feature set behind a chain of detects;
+  `TACHYON_ARCH_DISABLE` clears bits, and the suite runs every program
+  that detects a second time with every feature off.
+- **The optimizer**: intrinsics with an exact generic equivalent become
+  the generic vector op; the others are pure `Intr` ops, numbered by GVN,
+  moved by LICM (never above their guard), folded on constants; vectors
+  are passed in vector registers in tachyon's convention (a call of a
+  SIMD helper from 12 instructions to 2; a loop over one 2.12 G to 0.94
+  G instructions).
+- **Two undefined-behaviour bugs found and fixed before the release**:
+  LICM hoisted a `crc32` guarded by `detect` above the detect (it would
+  run on a CPU without crc), and could do the same with a 256-bit load;
+  the guard rule now covers every instruction that needs a feature.
+- **Tools**: `query arch WORDS [--feature F] [--equiv NAME]` searches the
+  tables; `query def/show` of an intrinsic give its features,
+  instruction, semantics and equivalent, and functions show `features:`;
+  `query features --why`; `guide arch` with task recipes; 13 `explain`
+  entries; the fuzzer's arch mode (`-A`); `tachyonc assemble`.
+- **examples/arch**: bytesearch (NEON, as fast as libc's memchr: 0.12 s
+  against a scalar 1.87 s) and crc32 (the crc instructions, as fast as
+  clang's: 0.09 s against 2.21 s), with walkthroughs. Next, built with
+  v0.19.0: examples/sha256sum on the sha2 instructions, against the
+  system's sha256sum, openssl and coreutils.
+- **Caught by the release gate, fixed before the tag**: on
+  aarch64-linux at -O2, a program whose `main` takes a Gpa and reads
+  argv crashed (examples/arch/crc32): main's feature word was filled
+  before its parameters were taken, so the init (getauxval, inlined)
+  overwrote argc and argv; it now goes after them
+  (tests/run/arch_detect_main_args).
+- **Tested on aarch64 only**, as 0.15 to 0.18.1 (`gate.sh --with-x86`).
 
 ### What's new in 0.18.1
 
@@ -1427,7 +1498,8 @@ The steps: `chain` (`bootstrap.sh --dev --no-head-tests`: the releases,
 then the working tree, built and checked for its fixpoint); then, at
 once, `suite-O0`, `suite-O1`, `suite-O2`; `fuzz-plain`, `fuzz-loops`,
 `fuzz-generics`, `fuzz-pressure`, `fuzz-calls`, `fuzz-lang06`,
-`fuzz-vector`, `fuzz-div`, `fuzz-range` and `fuzz-seed` (the seed as a
+`fuzz-vector`, `fuzz-div`, `fuzz-range`, `fuzz-arch` (0.19: the
+intrinsics, `tests/fuzz/run.sh -A`) and `fuzz-seed` (the seed as a
 third oracle); `abi-plain`, `abi-import`, `abi-header`; `objcheck`;
 `layout` (`tests/cimport/layout.sh` on the system headers); `debug`
 (`tests/debug.sh`); `stress-grow` (0.14, not in `--quick`: the compiler

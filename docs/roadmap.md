@@ -1208,6 +1208,46 @@ no-UB rule. It comes before the standard library build-out, which uses it
 - the tools: `query` shows an intrinsic's instruction and feature;
   `guide arch`; `explain` for the feature errors
 
+Done (0.19.0). The design (docs/design/arch.md, decisions D1-D20 taken as
+recommended), a phase 0 and eight tasks: vector types (T1), the feature
+analysis (T2), detection and `#[multiversion]` (T3), the AArch64
+intrinsics (T4: 1,743 in the table at its merge, more with T6's
+leftovers), x86-64 (T5: 484, encoded and compile-tested, never run), the
+optimizer and the vector convention (T6), the test generator and the
+fuzzer's arch mode (T7), the tools, guide and examples (T8). Found and
+fixed before the release: LICM hoisting a guarded intrinsic, and a
+256-bit load, above its `detect` (undefined behaviour on a CPU without
+the feature).
+
+The release gate (`gate.sh --release --no-x86`, 13:03 wall, every step
+passing; x86_64 not run, by instruction): the chain (built by 0.18.1),
+the suite at -O0/1/2 (1584 tests, 3 XFAIL), fuzz in every mode,
+ABI, objcheck 2232 of 2232 and the x86-64 intrinsics' objcheck 240 of
+240 (compiled, not run), layouts, lldb, threads (2380), incremental
+(160 series, 92% hits), stress-grow, examples-checkalloc (91);
+aarch64-linux (fixpoint, the suite at every level, 1257, fuzz, ABI,
+objcheck 2232, gdb, valgrind 237 clean). Its first run found
+examples/arch/crc32 crashing on aarch64-linux at -O2: main's feature
+word was filled before its parameters were taken, and the inlined
+getauxval init overwrote argc and argv (fixed,
+tests/run/arch_detect_main_args).
+
+Moved to 0.19.x or later (docs/design/arch.md, "as built"):
+- AArch64 breadth: `vqtbl2q`/`vqtbx2q`, the float forms whose
+  references are not exact yet (`vsqrtq`, `vfmaq_f64`, `vmaxnmq`,
+  `vrecpe` and the like), `vbslq_f32`/`f64`, unfused `vmlaq` on floats,
+  the f64 64-bit forms, the x3/x4 tuple forms;
+- x86-64: running it (when x86 testing returns), gathers and masked
+  forms, the string compares, `_mulx_u64`, float-scalar intrinsics,
+  `_mm_set_epi*`, alignment checks of the aligned forms;
+- the optimizer: `ld1r` fusion, `VConst` literal pools, `Rot`/`BSwap`
+  and the vectorizer's portable bit ops, float and x86 folds,
+  `Op::IntrMem`; a library's `detect` made pure (hoisted);
+- tools: `query arch --features`, examples/arch's utf8 and swissprobe,
+  bench pairs, tests/arch-try;
+- examples/sha256sum, written with v0.19.0 (as fast as the system's
+  sha256sum, openssl and coreutils).
+
 ## 0.20: collections, text and I/O
 
 - collections, each allocator-aware (0.16), with value semantics (0.17),
@@ -2180,3 +2220,51 @@ and the queries do 7% more: their phases (parse, check, effects, own)
 are within 2 ms of 0.18.0's, and the difference is in the command
 around them, a 0.18.2 item. The small program at -O0 pays 6 M
 instructions more (std's new sections).
+
+### 0.19
+
+aarch64-macos (`gate.sh --only bench`, fastest of 5, ms, load falling
+from 13 to 3; "0.18.1" is v0.18.1's build in the same run):
+
+| program | 0.18.1 | 0.19 -O2 | cc -O2 |
+|---|---|---|---|
+| arena_trees | 33 | 33 | 40 |
+| binarytrees | 173 | 156 | 171 |
+| collatz | 292 | 291 | 291 |
+| contracts | 148 | 149 | - |
+| fannkuch | 119 | 118 | 141 |
+| heap | 207 | 206 | 200 |
+| interp | 43 | 43 | 40 |
+| iterchain | 189 | 190 | 183 |
+| iterloop | 190 | 191 | 183 |
+| json | 104 | 105 | 93 |
+| mandelbrot | 164 | 163 | 158 |
+| matmul | 18 | 18 | 43 |
+| nbody | 31 | 31 | 28 |
+| sieve | 58 | 57 | 66 |
+| sort | 56 | 56 | 53 |
+| stencil | 8 | 8 | 8 |
+| wordcount | 84 | 84 | 69 |
+| geomean vs cc -O2 | 0.958 | 0.951 | 1 |
+
+The pairs 0.995, 1.000, 1.000. Instructions retired: every program
+within 0.06% of v0.18.1's (bench uses no intrinsic; examples/arch has
+the intrinsics' timings: bytesearch 0.12 s = libc memchr, crc32 0.09 s
+= clang).
+
+Compile time (best of 5 alternating, wall, load 2.5 to 3; instructions
+retired; 0.19's source in a copy outside the tree; no cache):
+
+| | 0.18.1 | 0.19 |
+|---|---|---|
+| the compiler to an object, -O0 | 347 ms / 8.84 G | 373 ms / 9.33 G |
+| -O1 | 438 ms | 450 ms |
+| -O2 (-j8; -j1 instructions) | 834 ms / 39.65 G | 855 ms / 40.21 G |
+| `tachyonc check` | 209 ms / 4.11 G | 220 ms / 4.27 G |
+| a small std program, -O0 / -O2 | 4.1 / 6.2 ms | 4.2 / 6.3 ms |
+
+The -O0 self-compile does 5.5% more instructions: the feature analysis
+over the call graph (check +4 ms) and the assembler's larger encoder
+(data and output 141 to 157 ms, the AArch64 and x86-64 instruction
+tables); -O2 1.4%, check 3.7%. A program without intrinsics pays only
+the analysis.

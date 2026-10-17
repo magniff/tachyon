@@ -65,6 +65,12 @@
 #                        ASM(T)'s line; checked only when testing T
 #   // ASM-NOT(T): text  no line containing text between the neighbouring
 #                        ASM(T)s' lines
+#   // CROSS: T          (0.19) the case is also compiled for target T (at the
+#                        suite's level, to an object: the compiler's own
+#                        assembler; then -S at the CHECK-OPT level, matched
+#                        against its ASM(T) and ASM-NOT(T) lines), nothing of
+#                        it run: x86-64's intrinsics are checked so on an arm
+#                        host. Skipped when T is the target tested.
 #   // FIXIMPORTS: why   (0.8) a copy of the case (its directory, for a
 #                        main.tach) is rewritten by tachyonc --fix-imports,
 #                        which must then find nothing more to do; the copy
@@ -259,6 +265,11 @@ run_program() {
     dir=$1
     (
         cd "$dir" || exit 1
+        # (0.19: RUN_ENV, a variable for the run: TACHYON_ARCH_DISABLE)
+        if [ -n "${RUN_ENV:-}" ]; then
+            # shellcheck disable=SC2046
+            exec env "$RUN_ENV" ./prog $(cat args) <stdin >stdout 2>stderr
+        fi
         # shellcheck disable=SC2046
         exec ./prog $(cat args) <stdin >stdout 2>stderr
     ) &
@@ -332,6 +343,9 @@ check_case() {
     if [ -s "$dir/asms" ] && ! check_asm "$source" "$dir"; then
         return 1
     fi
+    if [ -s "$dir/cross" ] && ! check_cross "$source" "$dir"; then
+        return 1
+    fi
     if [ -s "$dir/checks" ] && ! check_ir "$source" "$dir"; then
         return 1
     fi
@@ -399,6 +413,23 @@ check_case() {
             return 1
         fi
     done <"$dir/stderrs"
+    # (0.19) A program that may test the CPU at run time (std::arch::detect,
+    # #[multiversion]) runs again with every optional feature disabled:
+    # its fallback paths must print the same (docs/design/arch.md §2.5).
+    if grep -q -E 'detect\(|#\[multiversion' "$source"; then
+        RUN_ENV=TACHYON_ARCH_DISABLE=all
+        run_program "$dir"
+        RUN_ENV=
+        trimmed "$dir/stdout" >"$dir/actual"
+        if ! cmp -s "$dir/actual" "$dir/wanted" || [ "$RC" -ne "$expected_exit" ]; then
+            {
+                echo "with TACHYON_ARCH_DISABLE=all (the fallback paths): exit code $RC, stdout"
+                echo "--- expected"; cat "$dir/wanted"; echo
+                echo "--- actual"; cat "$dir/actual"; echo
+            } >"$dir/why"
+            return 1
+        fi
+    fi
     return 0
 }
 
@@ -486,6 +517,27 @@ check_asm() {
     return 1
 }
 
+# CROSS (0.19): case $1 compiled for the CROSS target, to an object at the
+# suite's level and to assembly at the CHECK level, the assembly matched
+# against its ASM lines for that target; nothing run.
+check_cross() {
+    cross=$(cat "$2/cross")
+    # shellcheck disable=SC2086
+    if ! "$COMPILER" --target "$cross" $OPT $FLAGS "$1" -c -o "$2/cross.o" >"$2/compile.out" 2>&1; then
+        { echo "compile for $cross failed:"; cat "$2/compile.out"; } >"$2/why"
+        return 1
+    fi
+    # shellcheck disable=SC2086
+    if ! "$COMPILER" --target "$cross" "-O$(cat "$2/checkopt")" $FLAGS "$1" -S -o "$2/cross.s" >"$2/compile.out" 2>&1; then
+        { echo "compile for $cross (-S) failed:"; cat "$2/compile.out"; } >"$2/why"
+        return 1
+    fi
+    [ -s "$2/crossasms" ] || return 0
+    match_checks "$2/cross.s" "$2/crossasms" "$2/check.out" && return 0
+    { cat "$2/check.out"; echo "--- assembly for $cross:"; cat "$2/cross.s"; } >"$2/why"
+    return 1
+}
+
 # Matches the checks in file $2 (+text: a line containing text, after the
 # previous one; -text: none until the next) against the lines of $1;
 # writes what failed to $3.
@@ -545,6 +597,10 @@ run_case() {
 if [ -x "$ROOT/compiler/std/embed.sh" ] && ! "$ROOT/compiler/std/embed.sh" -c; then
     exit 1
 fi
+# (0.19) The intrinsic tables, compiler/arch/*.def, as tables.tach has them.
+if [ -x "$ROOT/compiler/arch/embed.sh" ] && ! "$ROOT/compiler/arch/embed.sh" -c; then
+    exit 1
+fi
 
 # The optimizer's rewrite rules, on random values (0.9).
 if "$COMPILER" --check-rules >"$WORK/rules.out" 2>&1; then :; else
@@ -599,6 +655,22 @@ case hooks in
         else
             : >"$WORK/hooks.out"
         fi ;;
+esac
+# (0.19) std::arch's generated programs (tests/arch/gen.sh): every
+# intrinsic against its reference, at run time and folded, at this
+# level (without -O: at -O0 and -O2).
+case arch-gen in
+    *"$FILTER"*)
+        arch_levels=${OPT#-O}
+        [ -n "$arch_levels" ] || arch_levels=0,2
+        "$ROOT/tests/arch/gen.sh" -c "$COMPILER" -o "$WORK/arch-gen" -O "$arch_levels" --check >"$WORK/arch-gen.out" 2>&1 & ;;
+esac
+# (0.19 T5) The x86-64 encoder against cc's assembler, byte for byte
+# (tests/arch/enc.sh: every instruction of insn_x86.def, extreme registers,
+# both widths, memory forms).
+case arch-enc in
+    *"$FILTER"*)
+        "$ROOT/tests/arch/enc.sh" -c "$COMPILER" -o "$WORK/arch-enc" >"$WORK/arch-enc.out" 2>&1 & ;;
 esac
 
 # The slots: JOBS of them in a FIFO of our own, or the shared ones of
@@ -804,6 +876,36 @@ case own-try in
             count=$((count + 1))
         fi
         grep '^FAIL' "$WORK/own-try.out" >>"$FAILURES"
+        ;;
+esac
+
+# std::arch's generated programs (0.19): tests/arch/gen.sh (run above);
+# category "arch-gen".
+case arch-gen in
+    *"$FILTER"*)
+        wait
+        if grep -q '^gen: ok' "$WORK/arch-gen.out"; then
+            echo "arch-gen pass" >>"$TALLY"
+        else
+            echo "arch-gen fail" >>"$TALLY"
+            { echo "FAIL arch-gen:"; sed 's/^/    /' "$WORK/arch-gen.out"; } >>"$FAILURES"
+        fi
+        count=$((count + 1))
+        ;;
+esac
+
+# The x86-64 encodings (0.19 T5): tests/arch/enc.sh (run above); category
+# "arch-enc".
+case arch-enc in
+    *"$FILTER"*)
+        wait
+        if grep -q '^enc: ok' "$WORK/arch-enc.out"; then
+            echo "arch-enc pass" >>"$TALLY"
+        else
+            echo "arch-enc fail" >>"$TALLY"
+            { echo "FAIL arch-enc:"; sed 's/^/    /' "$WORK/arch-enc.out"; } >>"$FAILURES"
+        fi
+        count=$((count + 1))
         ;;
 esac
 

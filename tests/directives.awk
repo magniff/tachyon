@@ -40,6 +40,11 @@
     else if (key == "LINK") link = 1
     else if (key == "NO-EXTRA-FLAGS") noextra = 1
     else if (key == "REQUIRES") requires = requires " " value
+    else if (key == "CROSS") cross = value
+    # (0.19: every ASM line, for the CROSS target's)
+    if (substr(key, 1, 4) == "ASM(" || substr(key, 1, 8) == "ASM-NOT(") {
+        allkey[nall] = key; allval[nall] = value; nall++
+    }
 }
 END {
     printf "%s", args > (dir "/args")
@@ -65,4 +70,13 @@ END {
     printf "%d", link > (dir "/link")
     printf "%d", noextra > (dir "/noextra")
     printf "%s", requires > (dir "/requires")
+    # (0.19: the CROSS target and its ASM lines)
+    crossasms = ""
+    if (cross != "" && cross != target)
+        for (i = 0; i < nall; i++) {
+            if (allkey[i] == "ASM(" cross ")") crossasms = crossasms "+" allval[i] "\n"
+            else if (allkey[i] == "ASM-NOT(" cross ")") crossasms = crossasms "-" allval[i] "\n"
+        }
+    printf "%s", (cross == target ? "" : cross) > (dir "/cross")
+    printf "%s", crossasms > (dir "/crossasms")
 }

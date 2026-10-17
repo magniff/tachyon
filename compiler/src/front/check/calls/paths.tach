@@ -6,9 +6,10 @@ use crate::base::diag::{
     err_sym, err_try_tool, error_at,
 };
 use crate::front::assoc::ensure_checked;
-use crate::front::ast::{CALL_FIELDS, NODES, VK_LOAD, VK_NEW, VK_SPLAT, child};
+use crate::front::ast::{CALL_FIELDS, FN_INTRINSIC, NODES, VK_NEW, child};
 use crate::front::ast::NodeKind::{Ident, Path, VariantLit};
 use crate::front::check::{Res, SELF_SYM, SELF_TYPE, SELF_TYPE_SYM, lookup_local, name_error};
+use crate::front::check::arch::{check_intrinsic_call, check_raw_form};
 use crate::front::check::args::{arity_help, normalize_args};
 use crate::front::check::calls::{method_of, offer_template_methods, path_member_error};
 use crate::front::check::check_mode::check_expr;
@@ -22,7 +23,7 @@ use crate::front::check::resolve::{resolve_key, resolve_named};
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::check::unsafety::{U_C_CALL, check_call_safety, unsafe_op};
 use crate::front::check::variant_fields::{has_named_fields, positional_error};
-use crate::front::check::vectors::{make_vecop, sym_is_c};
+use crate::front::check::vectors::{make_vecop, sym_is_c, vector_assoc_call};
 use crate::front::check::widen::int_limit;
 use crate::front::closures::{closure_call, closure_of_type};
 use crate::front::contracts::is_distinct;
@@ -169,6 +170,10 @@ pub fn check_direct_call(n: i64, f: i64) -> i64 {
         let params = FNS[f].param_count;
         let variadic = FNS[f].variadic;
         let arity_ok = if variadic { count >= params } else { count == params };
+        // (0.19: `vld1q_u8(p)`, a memory intrinsic called with a pointer)
+        if !arity_ok && (NODES[FNS[f].node].p & FN_INTRINSIC) != 0 && check_raw_form(n, f) {
+            return FNS[f].ret;
+        }
         if !arity_ok {
             err_begin(NODES[n].start);
             err_str(c"function '");
@@ -189,6 +194,10 @@ pub fn check_direct_call(n: i64, f: i64) -> i64 {
             check_arg(child(n, i), fn_param(f, i));
         }
         check_call_safety(n, f, 0);
+        // (0.19: std::arch's immediates and feature names)
+        if (NODES[FNS[f].node].p & FN_INTRINSIC) != 0 {
+            check_intrinsic_call(n, f);
+        }
         for i in params..count {
             let arg = child(n, i);
             let ty = synth_expr(arg);
@@ -464,30 +473,13 @@ fn synth_path_call(n: i64, callee: i64) -> i64 {
         if NODES[callee].count == 0 && NODES[callee].y == 0 && env_lookup(NODES[callee].a) == 0
             && is_vector(SYM_PRIMITIVE[NODES[callee].a]) {
             // `v4f32::splat(x)`, `v4f32::load(s, i)` (0.10).
-            let vt = SYM_PRIMITIVE[NODES[callee].a];
-            let member = NODES[callee].b;
-            if NODES[callee].g != 0 {
-                name_error(NODES[callee].start, c"'", NODES[callee].a,
-                    c"' takes no type arguments");
-            }
-            if sym_is_c(member, c"splat") {
-                return make_vecop(n, 0, VK_SPLAT, vt);
-            }
-            if sym_is_c(member, c"load") {
-                return make_vecop(n, 0, VK_LOAD, vt);
-            }
-            err_begin(NODES[callee].start);
-            err_str(c"no associated function '");
-            err_sym(member);
-            err_failed_name(member);
-            err_str(c"' for vector type '");
-            err_type(vt);
-            err_str(c"'");
-            err_help(c"vector types have `splat(x)` and `load(slice, index)`");
-            err_end();
-            return vt;
+            return vector_assoc_call(n, callee, SYM_PRIMITIVE[NODES[callee].a]);
         }
         let mut t = path_target(callee);
+        if t > 0 && is_vector(t) {
+            // (0.19) through an alias: `uint8x16_t::from_bits(v)`
+            return vector_assoc_call(n, callee, t);
+        }
         if t == -2 {
             // `m::f(args)`: a call of an item of a module.
             return synth_call(n);

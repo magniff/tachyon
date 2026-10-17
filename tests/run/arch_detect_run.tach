@@ -1,0 +1,84 @@
+// FLAGS: -C target-cpu=generic
+// EXPECT: crc32c 3808858755 3808858755
+// EXPECT: consistent true
+// EXPECT: sum 36 36
+// (0.19 T3) std::arch::detect at run time: built for a generic Armv8.0, so
+// crc, aes, sha2, sha3, dotprod and i8mm are tested on the running CPU
+// (sysctl on macOS, getauxval on Linux, once, before main). The answers
+// are the machine's, so the case prints what does not depend on them:
+// CRC-32C by the instruction or by bits, the same; the word's
+// implications (sha3 => sha2, ...) hold. tests/run.sh runs it again with
+// TACHYON_ARCH_DISABLE=all: every detect false, the fallbacks, the same
+// output. #[multiversion]: a crc version and the baseline one, dispatched
+// once per call; its address can be taken.
+use std::arch::{detect, has};
+use std::arch::aarch64::__crc32cd;
+
+fn crc_bits(c0: u32, x: u64) -> u32 {
+    let mut c = c0 ^ x as u32;
+    let rest = x >> 32;
+    for k in 0..64 {
+        if k == 32 {
+            c ^= rest as u32;
+        }
+        c = if (c & 1) != 0 { (c >> 1) ^ 0x82f63b78 } else { c >> 1 };
+    }
+    c
+}
+
+#[multiversion("crc")]
+fn crc_word(c: u32, x: u64) -> u32 {
+    if has("crc") { __crc32cd(c, x) } else { crc_bits(c, x) }
+}
+
+fn crc_byte(c0: u32, b: u8) -> u32 {
+    let mut c = c0 ^ b as u32;
+    for _ in 0..8 {
+        c = if (c & 1) != 0 { (c >> 1) ^ 0x82f63b78 } else { c >> 1 };
+    }
+    c
+}
+
+fn crc32c(s: [u8], word: fn(u32, u64) -> u32) -> u32 {
+    let mut c: u32 = 0xffffffff;
+    let mut i = 0;
+    while i + 8 <= s.len as i64 {
+        let mut x: u64 = 0;
+        for k in 0..8 {
+            x |= (s[i + k] as u64) << (8 * k) as u64;
+        }
+        c = word(c, x);
+        i += 8;
+    }
+    while i < s.len as i64 {
+        c = crc_byte(c, s[i]);
+        i += 1;
+    }
+    ~c
+}
+
+// The loop's test is the same on every iteration (LICM, unswitching).
+fn sum(s: [u8]) -> i64 {
+    let mut n = 0;
+    for i in 0..s.len as i64 {
+        if detect("dotprod") {
+            n += s[i] as i64 - '0' as i64;
+        } else {
+            n += (s[i] - '0') as i64;
+        }
+    }
+    n
+}
+
+fn main() {
+    let direct = crc32c("123456789", crc_word);
+    let through = crc32c("123456789", |c: u32, x: u64| -> u32 {
+        if detect("crc") { crc_word(c, x) } else { crc_bits(c, x) }
+    });
+    println(f"crc32c {direct} {through}");
+    let a64 = has("aarch64");
+    let consistent = (!detect("sha3") || detect("sha2")) && (!detect("sha2") || !a64 || has("neon"))
+        && (!detect("avx2") || detect("avx")) && (!detect("fma") || detect("avx"));
+    println(f"consistent {consistent}");
+    println(f"sum {sum("12345678")} {sum("87654321")}");
+}

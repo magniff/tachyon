@@ -1,0 +1,127 @@
+// References of the x86-64 float intrinsics whose semantics is prose
+// (tests/arch/gen.sh): square roots, rounding, the conversions to i32 and
+// AVX's 32 comparison predicates. Lanes come as f64 (an f32 lane exactly);
+// the program rounds an f32 result. x86-64 is compiled, not run, in 0.19:
+// these run once x86 testing returns.
+
+// x rounded toward zero, with -0.0 kept (|x| < 2^52, not NaN).
+fn x86_trunc(x: f64) -> f64 {
+    let t = (x as i64) as f64;
+    if t == 0.0 && (x < 0.0 || 1.0 / x < 0.0) { -0.0 } else { t }
+}
+
+// x rounded to an integral value by mode m: 0 nearest even, 1 down, 2 up,
+// 3 toward zero (NaN, infinities and |x| >= 2^52 are their own).
+fn x86_round(x: f64, m: i64) -> f64 {
+    if x != x || x >= 4503599627370496.0 || x <= -4503599627370496.0 {
+        return x;
+    }
+    let t = x86_trunc(x);
+    let f = x - t;
+    let mut r = t;
+    if m == 1 {
+        if f < 0.0 { r = t - 1.0; }
+    } else if m == 2 {
+        if f > 0.0 { r = t + 1.0; }
+    } else if m == 0 {
+        let half = if f < 0.0 { -f } else { f };
+        let away = if x < 0.0 { t - 1.0 } else { t + 1.0 };
+        if half > 0.5 {
+            r = away;
+        } else if half == 0.5 {
+            // (ties to the even neighbour)
+            let ti = t as i64;
+            if ti % 2 != 0 { r = away; }
+        }
+    }
+    if r == 0.0 && (x < 0.0 || 1.0 / x < 0.0) { -0.0 } else { r }
+}
+
+// The rounding control of ROUNDPS: bit 2 set means the current mode
+// (round to nearest even); bit 3 only suppresses the inexact exception.
+fn x86_round_mode(rounding: i64) -> i64 {
+    if (rounding & 4) != 0 { 0 } else { rounding & 3 }
+}
+
+fn ref__mm_round_ps(a: [f64], rounding: i64, k: i64) -> f64 {
+    x86_round(a[k], x86_round_mode(rounding))
+}
+
+fn ref__mm_round_pd(a: [f64], rounding: i64, k: i64) -> f64 {
+    x86_round(a[k], x86_round_mode(rounding))
+}
+
+fn ref__mm_floor_ps(a: [f64], k: i64) -> f64 { x86_round(a[k], 1) }
+
+fn ref__mm_floor_pd(a: [f64], k: i64) -> f64 { x86_round(a[k], 1) }
+
+fn ref__mm_ceil_ps(a: [f64], k: i64) -> f64 { x86_round(a[k], 2) }
+
+fn ref__mm_ceil_pd(a: [f64], k: i64) -> f64 { x86_round(a[k], 2) }
+
+// CVTTPS2DQ, CVTPS2DQ: 0x80000000 (the integer indefinite) for NaN and
+// out of range.
+fn x86_to_i32(x: f64) -> i64 {
+    if x != x || x >= 2147483648.0 || x < -2147483648.0 { -2147483648 } else { x as i64 }
+}
+
+fn ref__mm_cvttps_epi32(a: [f64], k: i64) -> i64 { x86_to_i32(x86_round(a[k], 3)) }
+
+fn ref__mm_cvtps_epi32(a: [f64], k: i64) -> i64 { x86_to_i32(x86_round(a[k], 0)) }
+
+// The square root by Newton's method, scaled by powers of 4 (exact) into
+// [1, 4): within an ulp of the correctly rounded f64 root (the f32 lanes'
+// rounding of it is then exact but for halfway cases, which a square root
+// never is). NOTE (docs/design/arch.md, "T5 as built": the never-run list):
+// the f64 lanes may differ from SQRTPD in the last bit; to check when x86
+// runs.
+fn x86_sqrt(x: f64) -> f64 {
+    if x != x || x < 0.0 { return 0.0 / 0.0; }
+    if x == 0.0 || x > 1.7976931348623157e308 { return x; }
+    let mut m = x;
+    let mut scale = 1.0;
+    while m >= 4.0 { m = m / 4.0; scale = scale * 2.0; }
+    while m < 1.0 { m = m * 4.0; scale = scale / 2.0; }
+    let mut y = (m + 1.0) / 2.0;
+    for i in 0..8 { y = (y + m / y) / 2.0; }
+    y * scale
+}
+
+fn ref__mm_sqrt_ps(a: [f64], k: i64) -> f64 { x86_sqrt(a[k]) }
+
+fn ref__mm_sqrt_pd(a: [f64], k: i64) -> f64 { x86_sqrt(a[k]) }
+
+fn ref__mm256_sqrt_ps(a: [f64], k: i64) -> f64 { x86_sqrt(a[k]) }
+
+fn ref__mm256_sqrt_pd(a: [f64], k: i64) -> f64 { x86_sqrt(a[k]) }
+
+// VCMPPS's predicates (_CMP_EQ_OQ = 0 ... _CMP_TRUE_US = 31; 16-31 are
+// 0-15 with the other signalling behaviour, the same results).
+fn x86_cmp(a: f64, b: f64, imm8: i64) -> bool {
+    let u = a != a || b != b;
+    let p = imm8 & 15;
+    if p == 0 { return !u && a == b; }
+    if p == 1 { return !u && a < b; }
+    if p == 2 { return !u && a <= b; }
+    if p == 3 { return u; }
+    if p == 4 { return u || a != b; }
+    if p == 5 { return u || !(a < b); }
+    if p == 6 { return u || !(a <= b); }
+    if p == 7 { return !u; }
+    if p == 8 { return u || a == b; }
+    if p == 9 { return u || a < b; }
+    if p == 10 { return u || a <= b; }
+    if p == 11 { return false; }
+    if p == 12 { return !u && a != b; }
+    if p == 13 { return !u && a >= b; }
+    if p == 14 { return !u && a > b; }
+    true
+}
+
+fn ref__mm256_cmp_ps(a: [f64], b: [f64], imm8: i64, k: i64) -> i64 {
+    if x86_cmp(a[k], b[k], imm8) { -1 } else { 0 }
+}
+
+fn ref__mm256_cmp_pd(a: [f64], b: [f64], imm8: i64, k: i64) -> i64 {
+    if x86_cmp(a[k], b[k], imm8) { -1 } else { 0 }
+}

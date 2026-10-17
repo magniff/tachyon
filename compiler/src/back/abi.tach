@@ -34,9 +34,9 @@ use crate::front::ast::{REPR_C, REPR_PACKED};
 use crate::front::distinct::enum_niche;
 use crate::front::types::{
     ENUMS, FNS, STRUCTS, TYPES, TY_F32, TY_F64, TY_U16, TY_U32, TY_U64, TY_U8, TyKind, VARIANTS,
-    align_to, enum_variant, field_offset, is_compound, is_float, is_void, max_i64, scalar_type,
-    struct_field, tuple_offset, type_align, type_elem, type_size, variant_field,
-    variant_field_offset,
+    align_to, enum_variant, field_offset, in_fregs, is_compound, is_float, is_vector, is_void,
+    max_i64, scalar_type, struct_field, tuple_offset, type_align, type_elem, type_size,
+    variant_field, variant_field_offset, vector_half,
 };
 use crate::gen0::gen::MAIN_SYM;
 use crate::middle::ctx::FnCtx;
@@ -159,6 +159,16 @@ pub fn abi_leaves(mut cx: *FnCtx, ty: i64, offset: i64) {
     unsafe {
         let kind = TYPES[ty].kind;
         if kind == TyKind::Vector {
+            if cx.leaves_whole_vectors && type_size(ty) == 32 {
+                // (0.19: a 256-bit vector is two 128-bit halves,
+                // middle/lower/vector.tach)
+                let half = vector_half(ty);
+                cx.abi_leaves.push(offset);
+                cx.abi_leaves.push(half);
+                cx.abi_leaves.push(offset + 16);
+                cx.abi_leaves.push(half);
+                return;
+            }
             if cx.leaves_whole_vectors {
                 cx.abi_leaves.push(offset);
                 cx.abi_leaves.push(ty);
@@ -420,20 +430,20 @@ pub fn return_piece_reg(mut cx: *FnCtx, i: i64) -> i64 {
 
 // The register returning piece i of an aggregate result: x0, x1 / rax, rdx
 // for integers (0, 1: the argument-register numbering of the machine
-// layer is not used here), v0-v3 / xmm0, xmm1 for floats; as (is_float,
-// index) in `float`.
+// layer is not used here), v0-v3 / xmm0, xmm1 for floats and (0.19, the
+// tachyon convention) vectors; as (is_float, index) in `float`.
 fn return_piece_index(mut cx: *FnCtx, i: i64, float: &mut bool) -> i64 {
     unsafe {
         let mut ints = 0;
         let mut floats = 0;
         for k in 0..i {
-            if is_float(cx.abi_piece_ty[k]) {
+            if in_fregs(cx.abi_piece_ty[k]) {
                 floats += 1;
             } else {
                 ints += 1;
             }
         }
-        *float = is_float(cx.abi_piece_ty[i]);
+        *float = in_fregs(cx.abi_piece_ty[i]);
         if *float { floats } else { ints }
     }
 }
@@ -457,7 +467,9 @@ fn return_piece_index(mut cx: *FnCtx, i: i64, float: &mut bool) -> i64 {
 // d16-d23; x86-64: rdi, rsi, rdx, rcx, r8, r9, rax and xmm0-xmm13), or else
 // in the next 8-byte slot of the stack area. An aggregate (struct, tuple,
 // array, enum with fields, slice) of at most four scalar leaves that do not
-// overlap is its leaves; another one of at most 32 bytes is its 8-byte
+// overlap is its leaves; (0.19) a vector is one leaf (a 256-bit one two
+// 128-bit halves), passed in the float registers whole, a vector register,
+// or in a stack slot of its size, at a multiple of it; another one of at most 32 bytes is its 8-byte
 // chunks (read as integers); a larger one is a pointer to the caller's
 // copy. Results: up to four pieces in x0-x3 / rax, rdx, rcx, rsi and d0-d3
 // / xmm0-xmm3; a larger aggregate through a result pointer passed as the
@@ -494,8 +506,19 @@ pub fn conv_returns_through_pointer(mut cx: *FnCtx, c: bool, ret: i64) -> bool {
         return false;
     }
     unsafe { cx.abi_leaves.count = 0; }
-    abi_leaves(cx, ret, 0);
+    tabi_leaves(cx, ret);
     !leaves_as_pieces(cx) && type_size(ret) > 32
+}
+
+// The leaves of `ty` under the tachyon convention: (0.19) a vector is one
+// leaf, in a vector register; a 256-bit one two.
+fn tabi_leaves(mut cx: *FnCtx, ty: i64) {
+    unsafe {
+        let saved = cx.leaves_whole_vectors;
+        cx.leaves_whole_vectors = true;
+        abi_leaves(cx, ty, 0);
+        cx.leaves_whole_vectors = saved;
+    }
 }
 
 // The tachyon convention's classification (see above).
@@ -506,7 +529,7 @@ pub fn tabi_classify(mut cx: *FnCtx, ty: i64) -> AbiClass {
             return AbiClass::Scalar;
         }
         cx.abi_leaves.count = 0;
-        abi_leaves(cx, ty, 0);
+        tabi_leaves(cx, ty);
         if leaves_as_pieces(cx) {
             let mut i = 0;
             while i < cx.abi_leaves.count {

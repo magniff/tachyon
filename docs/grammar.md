@@ -1044,7 +1044,8 @@ one; a local of that name shadows the constructor). A vector is a value:
 it is copied by `=`, passed and returned like a struct; lane `i` lives
 at byte `i × size_of(lane)` (`[T; N]`'s layout), and a vector in memory
 may be read lane by lane through a pointer. Integer lanes are signed;
-there are no unsigned vector types.
+there are no unsigned vector types (0.19 adds them, and 64- and 256-bit
+vectors: [below](#additions-of-019-vector-types-and-stdarchs-types)).
 
 **Making vectors.**
 
@@ -1703,6 +1704,174 @@ let_stmt += "let" pattern "=" expr "else" block ";" ;     (* let-else *)
   reference local or a pattern's reference binding views what it points
   to, not the reference: it may be returned or kept after the binding's
   scope when that is alive.
+
+## Additions of 0.19: vector types, std::arch, target features
+
+The design is docs/design/arch.md; `tachyonc guide arch` teaches it.
+
+### More vector types
+
+0.10's six vector types become thirty: unsigned lanes, and 64-bit and
+256-bit vectors. Each is aligned to its size, and its names are reserved
+as 0.10's are.
+
+| size | signed | unsigned | float |
+|---|---|---|---|
+| 8 bytes | `v8i8 v4i16 v2i32 v1i64` | `v8u8 v4u16 v2u32 v1u64` | `v2f32 v1f64` |
+| 16 bytes | `v16i8 v8i16 v4i32 v2i64` | `v16u8 v8u16 v4u32 v2u64` | `v4f32 v2f64` |
+| 32 bytes | `v32i8 v16i16 v8i32 v4i64` | `v32u8 v16u16 v8u32 v4u64` | `v8f32 v4f64` |
+
+Every 0.10 operation applies to every one of them, with these rules:
+
+- **Unsigned lanes** wrap at their width and compare unsigned. A mask of
+  an unsigned vector is the vector itself, each lane all ones (`MAX`) or
+  `0`. `-a` on unsigned lanes is `0 - a`, wrapping.
+- **The mask of a float vector** is the signed vector of its lanes'
+  width (`v8i32` for `v8f32`, `v1i64` for `v1f64`).
+- **Float sums** stay pairwise: the sum of the first half's lanes plus
+  the sum of the second half's, so `((l0 + l1) + (l2 + l3)) + ((l4 + l5)
+  + (l6 + l7))` for eight lanes.
+- **Placement.** A 64-bit vector lives in the low half of a vector
+  register. A 256-bit vector is computed as its two 128-bit halves on
+  every target in 0.19 (no function uses 256-bit registers yet), so the
+  same program runs everywhere.
+
+**`T::from_bits(v)`** reinterprets the bytes of a vector `v` of the same
+size as vector type `T` (lane `i` of `T` is the bytes at `i × size_of`
+its lane). It costs no instruction. A size mismatch is a type error, and
+a type error between two vectors of the same size suggests it.
+
+### std::arch's types
+
+`std::arch::aarch64` and `std::arch::x86_64` name the vendors' vector
+types (docs/design/arch.md).
+
+- **ACLE's types are aliases** of the vector types: `int8x16_t = v16i8`,
+  `uint8x16_t = v16u8`, `uint16x4_t = v4u16`, `float32x4_t = v4f32`,
+  `float64x1_t = v1f64`, and so on for every lane type and both sizes.
+  The polynomial types are unsigned (`poly8x16_t = v16u8`, `poly64x2_t =
+  v2u64`, `p8 = u8`, `p64 = u64`, `p128 = v2u64`). Each has its tuples:
+  `uint8x16x2_t = (v16u8, v16u8)`, `...x3_t`, `...x4_t`. Through an
+  alias, a vector type's associated functions apply as they are:
+  `uint8x16_t::from_bits(v)`, `uint8x16_t::splat(0)`.
+- **Intel's types are distinct and opaque:** `__m128i`, `__m128`,
+  `__m128d` (16 bytes), `__m256i`, `__m256`, `__m256d` (32 bytes). They
+  have no operators, no lanes, no `splat` or `load`: their intrinsics
+  make, read and combine them, and `T::from_bits(v)` converts them both
+  ways (`v16u8::from_bits(m)`, `__m128i::from_bits(v)`).
+
+### Intrinsics
+
+An intrinsic is a function of `std::arch`, `std::arch::aarch64` or
+`std::arch::x86_64`, under its vendor's name, called as any function.
+
+- **Immediates are arguments.** A shift count, lane number or shuffle
+  mask is an `i64` argument in the vendor's position, which must be a
+  constant expression (literals, constants, operators and casts of them)
+  in the range the intrinsic gives (`arch.const_arg`):
+  `vextq_u8(a, b, 3)`. Rust's `vextq_u8::<3>(a, b)` is an error
+  (`arch.rust_form`) whose `try:` line writes this form.
+- **Memory intrinsics take a slice and an index**, checked as
+  `v.load(s, i)` is: `vld1q_u8(s, i)`, `vst1q_u8(s, i, v)`,
+  `_mm_loadu_si128(s, i)`. Given a pointer instead (C's and Rust's
+  signature) the call is an error (`arch.raw_form`) naming both forms.
+- **The pointer forms** are in the `raw` submodule of each architecture's
+  module, with the vendor's signature, `unsafe`:
+  `std::arch::aarch64::raw::vld1q_u8(p: *u8)`,
+  `std::arch::x86_64::raw::_mm_loadu_si128(p: *__m128i)`.
+- `is_x86_feature_detected!("f")` and its AArch64 twin are
+  `std::arch::detect("f")` (`arch.rust_form`).
+- **The portable module `std::arch`** holds `has`, `detect` and the bit
+  operations every target has an instruction for (`count_ones`; std's
+  `count_ones`, `leading_zeros` and `trailing_zeros` are one instruction
+  where the target has it).
+- **The modules are virtual**: their declarations are made from the
+  intrinsic tables (`compiler/arch/*.def`) for the names a program uses,
+  so a program that names none pays nothing. `tachyonc query show NAME`
+  prints one's declaration with its features, instruction, what it
+  computes and its other architecture's equivalent; `tachyonc query
+  arch WORDS` searches the tables (docs/query.md).
+- **Effects.** A register intrinsic has none; a checked memory form is
+  `panic`; a `raw` form is `unsafe`; `has` and `detect` have none. So
+  `#[pure]` functions may use them.
+
+### Target features
+
+Every intrinsic needs target features (`neon`, `crc`, `sha2`, `avx2`,
+...; the lists are in `tachyonc explain arch.feature_name`). A call is
+legal only where its features are *known*:
+
+- **The build's features**: the target's baseline (aarch64-macos:
+  `apple-m1`, which has neon, fp, crc, aes, sha2, sha3, dotprod, rdm,
+  lse, fp16; aarch64-linux: `generic`, neon and fp; x86_64-linux:
+  `x86-64`, sse and sse2; x86_64-macos: `core2`, up to ssse3), changed by
+  `-C target-cpu=NAME|native` and `-C target-feature=+f,-g` on every
+  command that checks. A feature implies what it needs (`avx2` implies
+  `avx`, ... `sse2`; `sha3` implies `sha2` and `neon`). Removing one the
+  ABI needs (`-neon`, `-fp`, `-sse2`) is `arch.baseline`; an unknown CPU
+  `arch.cpu`.
+- **A declaration**: `#[target_feature(enable = "crc,aes")]` on the
+  enclosing function. Its body is checked against it (`arch.declared`),
+  and its callers must know what it declares.
+- **A guard**: the then branch of `if G`, where G is
+  `std::arch::detect("f")` or `std::arch::has("f")` or a `&&` of them;
+  the else branch of `if !G`; the rest of a block after `if !G { ... }`
+  whose block diverges (`return`, `break`, `continue`, a panic); the
+  rest of a block after `assert(G)`. `||`, a negation elsewhere and a
+  `bool` kept in a local give nothing.
+
+`std::arch::has("f")` is the constant answer of that known set at its
+point (never inferred). Both take the feature's name as a string
+literal (`arch.feature_literal`); an unknown name is `arch.feature_name`.
+`aes` names both architectures' feature: unqualified it is the target's,
+and `aarch64.aes` / `x86_64.aes` name one (`arch.feature_ambiguous`
+where the reading matters).
+
+**Requirements are inferred**, as effects are: a function needs what its
+calls need beyond what is known at each call, generic instances and
+closures each their own. A declaration pins a function's requirement.
+Where nothing above can know a feature, a requirement is an error
+(`arch.feature`, at the call that brings it in, with the intrinsic):
+`main`, an `extern "C"` function, a test or property, and a function
+taken as a plain `fn` value (`arch.fn_pointer`; a closure passed as
+itself is followed, and a `#[multiversion]` function's address may be
+taken).
+
+**Another architecture's intrinsics** type-check everywhere. Their
+features are never known, so `has` and `detect` of them are the constant
+`false`, a branch under them is dead (checked, never generated), and a
+call of one outside such a branch is `arch.feature`. One source holds
+both architectures' code; there is no `cfg`.
+
+### Run-time detection and `#[multiversion]` (0.19)
+
+- **`std::arch::detect("f")`** is a constant where f is known (the
+  build's features, a `#[target_feature]` declaration, a guard around
+  it) or of another architecture; otherwise it tests one bit of a word
+  std fills once: on AArch64 macOS from `sysctl` (`hw.optional.arm.FEAT_*`,
+  only for what the build does not assume), on AArch64 Linux from
+  `getauxval(AT_HWCAP)` and `AT_HWCAP2`, on x86-64 from `cpuid` and
+  `xgetbv` (the avx family only when the system saves the ymm registers).
+  A program's `main` fills the word before its first statement; code
+  entered from C with no tachyon `main` fills it at its first detect.
+  The test is pure: repeated tests merge, and one in a loop is hoisted
+  out of it.
+- **`TACHYON_ARCH_DISABLE=crc,aes`** (or `all`) in the environment of a
+  running program clears those features from the word (and the features
+  that need them: sha3 with sha2), so its detects take the fallback
+  paths. It only clears: no setting makes a missing instruction run.
+  `tests/run.sh` runs every case that uses `detect` or `#[multiversion]`
+  a second time with `all`, and expects the same output.
+- **`#[multiversion("f", "g,h", ...)]`** on a function compiles its body
+  once per listed set of the target's architecture, each version knowing
+  that set (`has("f")` is true in it), plus the baseline version, and
+  makes the function a dispatcher: the first listed set the CPU has
+  (`detect`) picks its version, else the baseline. A set of another
+  architecture makes no version; one the build already has ends the list.
+  The dispatcher needs only the baseline, so its address may be taken.
+  An intrinsic call that a version lacks the feature for is an error
+  (`arch.multiversion`, naming that version): put it under
+  `if std::arch::has("f")`.
 
 ## Importing C headers
 

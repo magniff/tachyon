@@ -3,7 +3,7 @@
 // all lane by lane with the scalar operations.
 
 use crate::front::ast::{
-    NODES, VK_LANE, VK_LOAD, VK_NEW, VK_SPLAT, VK_STORE, VK_SUM, VK_WITH, child,
+    NODES, VK_FROM_BITS, VK_LANE, VK_LOAD, VK_NEW, VK_SPLAT, VK_STORE, VK_SUM, VK_WITH, child,
 };
 use crate::front::contracts::sites::site_of;
 use crate::front::lexer::Tok;
@@ -36,11 +36,13 @@ fn lane_size(vt: i64) -> i64 {
 }
 
 // Evaluates vector expression e into a new slot; returns its offset.
-fn gen_vector_to_slot(mut cx: *FnCtx, e: i64) -> i64 {
-    let slot = alloc_slot(16, 16);
+pub fn gen_vector_to_slot(mut cx: *FnCtx, e: i64) -> i64 {
+    // (0.19: its size, 8, 16 or 32 bytes)
+    let size = unsafe { type_size(NODES[e].ty) };
+    let slot = alloc_slot(size, 16);
     gen_expr(cx, e);
     emit_frame_addr(cx, R_SECOND, slot);
-    emit_copy(cx, 16);
+    emit_copy(cx, size);
     slot
 }
 
@@ -89,7 +91,7 @@ pub fn gen_vector_binary(mut cx: *FnCtx, op: Tok, lhs: i64, rhs: i64, result_vt:
     let vt = unsafe { NODES[lhs].ty };
     let a = gen_vector_to_slot(cx, lhs);
     let b = gen_vector_to_slot(cx, rhs);
-    let r = alloc_slot(16, 16);
+    let r = alloc_slot(type_size(result_vt), 16);
     let elem = vec_elem(vt);
     let result_elem = vec_elem(result_vt);
     for i in 0..vec_lanes(vt) {
@@ -113,9 +115,11 @@ pub fn gen_vector_negate(mut cx: *FnCtx, operand: i64, vt: i64) {
 // `target <op>= value` on a vector: the value is in the accumulator (its
 // address).
 pub fn gen_vector_assign(mut cx: *FnCtx, op: Tok, target: i64, vt: i64) {
-    let b = alloc_slot(16, 16);
+    // (0.19: the vector's size, 8, 16 or 32 bytes)
+    let vsize = type_size(vt);
+    let b = alloc_slot(vsize, 16);
     emit_frame_addr(cx, R_SECOND, b);
-    emit_copy(cx, 16);
+    emit_copy(cx, vsize);
     let addr = alloc_slot(8, 8);
     gen_addr(cx, target);
     store_reg_to_frame(cx, R_ACC, addr);
@@ -142,7 +146,7 @@ pub fn gen_vector_assign(mut cx: *FnCtx, op: Tok, target: i64, vt: i64) {
 // The memory of a vector load or store, `s` (a slice or an array), and its
 // index: slots holding the address of the first lane, after checking
 // that the lanes are in bounds (a range i..i + lanes of s).
-fn gen_vector_address(mut cx: *FnCtx, s: i64, index: i64, lanes: i64, elem: i64) -> i64 {
+pub fn gen_vector_address(mut cx: *FnCtx, s: i64, index: i64, lanes: i64, elem: i64) -> i64 {
     unsafe {
         let s_ty = NODES[s].ty;
         let ptr = alloc_slot(8, 8);
@@ -231,8 +235,14 @@ pub fn gen_vecop(mut cx: *FnCtx, n: i64) {
             gen_aggregate(cx, n);
             return;
         }
+        if kind == VK_FROM_BITS {
+            // (0.19) the same bytes, of another type
+            let bits = gen_vector_to_slot(cx, child(n, 0));
+            emit_frame_addr(cx, R_ACC, bits);
+            return;
+        }
         if kind == VK_SPLAT {
-            let r = alloc_slot(16, 16);
+            let r = alloc_slot(type_size(vt), 16);
             gen_expr(cx, child(n, 0));
             for i in 0..lanes {
                 store_lane(cx, r, elem, i);
@@ -242,7 +252,7 @@ pub fn gen_vecop(mut cx: *FnCtx, n: i64) {
         }
         if kind == VK_LOAD {
             let ptr = gen_vector_address(cx, child(n, 0), child(n, 1), lanes, elem);
-            let r = alloc_slot(16, 16);
+            let r = alloc_slot(type_size(vt), 16);
             for i in 0..lanes {
                 load_reg_from_frame(cx, R_ACC, ptr);
                 emit_add_imm(cx, R_ACC, i * type_size(elem));

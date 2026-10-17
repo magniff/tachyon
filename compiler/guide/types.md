@@ -16,7 +16,7 @@
 | `S`, `E`, `S<T>` | structs, enums, unions, their instances |
 | `type X = distinct T` | a type of its own with T's representation (0.18) |
 | `std::NonNull<T>` | a `*T` that is never null; `Option<NonNull<T>>` is one pointer |
-| `v2f64 v4f32 v2i64 v4i32 v8i16 v16i8` | SIMD vectors of 16 bytes |
+| `v16u8 v8i16 v4f32 v2f64 ...` | SIMD vectors: 8, 16 or 32 bytes of signed, unsigned or float lanes (0.19: `guide arch`) |
 
 ## Numbers
 
@@ -217,6 +217,18 @@ make vectors; `+ - *` work lane by lane on all six types, `/` on float
 vectors, `& | ^` on integer ones; comparisons give a mask
 (`m.select(a, b)`); `v.lane(i)`, `v.with_lane(i, x)`, `v.sum()`,
 `v.store(s, i)`. They are not FFI-safe.
+
+| bytes | signed | unsigned (0.19) | float |
+|---|---|---|---|
+| 8 (0.19) | `v8i8 v4i16 v2i32 v1i64` | `v8u8 v4u16 v2u32 v1u64` | `v2f32 v1f64` |
+| 16 | `v16i8 v8i16 v4i32 v2i64` | `v16u8 v8u16 v4u32 v2u64` | `v4f32 v2f64` |
+| 32 (0.19) | `v32i8 v16i16 v8i32 v4i64` | `v32u8 v16u16 v8u32 v4u64` | `v8f32 v4f64` |
+
+An unsigned vector compares unsigned, and its mask is itself (a lane all
+ones or 0); 32-byte vectors are two registers where the CPU has no wider
+ones. `T::from_bits(v)` reinterprets a vector of the same size, with no
+instruction. The CPU's own instructions on them (NEON, SSE, AVX2, CRC,
+AES, SHA) are `std::arch`'s: `tachyonc guide arch`.
 
 ```tach
 let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0];

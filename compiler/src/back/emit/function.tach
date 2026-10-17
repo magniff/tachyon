@@ -31,7 +31,7 @@ use crate::base::timer::{T_CODEGEN, T_ISEL, T_SCALAR, timer_add, timer_now};
 use crate::front::ast::NODES;
 use crate::front::types::{
     FNS, TY_BOOL, TY_F64, TY_U64, TY_U8, align_to, fn_param, int_bits, is_compound, is_integer,
-    is_void, max_i64, scalar_type, type_align,
+    is_vector, is_void, max_i64, scalar_type, type_align, type_size,
 };
 use crate::gen0::arm64::{a64_align_down, a64_epilogue, a64_frame_reserve};
 use crate::gen0::gen::{fn_is_global, fn_symbol_prefix};
@@ -269,6 +269,7 @@ pub fn gen_ir_function(mut cx: *FnCtx, fi: i64) {
             check_allocation(cx, fi);
         }
         layout_frame(cx, fi);
+        cx.ymm_used = X86 && holds_ymm(cx, fi);
         shrink_wrap(cx, fi);
         cx.short_branches = function_size(cx, fi) <= 800;
         find_trivial_jumps(cx);
@@ -317,6 +318,89 @@ pub fn gen_ir_function(mut cx: *FnCtx, fi: i64) {
         }
         buf_bytes(cx.asm, buf_slice(cx.code));
         dbg_function_end(cx);
+    }
+}
+
+// (0.19) Whether function fi computes a 256-bit value (x86-64: in a ymm
+// register; only AVX instructions make one). If so, where AVX is proven
+// (cx.ymm_in, cx.ymm_ret): vzeroupper is an AVX instruction, so it goes
+// only where every path ran one that wrote a ymm register (a must
+// analysis over the blocks); elsewhere the upper halves stay as they are,
+// which costs a transition at worst, never an instruction the CPU lacks.
+fn holds_ymm(mut cx: *FnCtx, fi: i64) -> bool {
+    unsafe {
+        let n = cx.order.count;
+        let mut defs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut any = false;
+        for k in 0..n {
+            let d = if block_writes_ymm(cx, cx.order.data[k], 0) { 1 } else { 0 };
+            defs.push(d);
+            any = any || d != 0;
+        }
+        cx.ymm_in.count = 0;
+        if !any {
+            free(defs.data as *u8);
+            return false;
+        }
+        for k in 0..n {
+            cx.ymm_in.push(if k == 0 { 0 } else { 1 });
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for k in 1..n {
+                let b = cx.order.data[k];
+                let mut v = if cx.blocks[b].preds.count == 0 { 0 } else { 1 };
+                for i in 0..cx.blocks[b].preds.count {
+                    let p = cx.blocks[cx.blocks[b].preds.data[i]].order;
+                    if p < 0 || p >= n || (cx.ymm_in.data[p] == 0 && defs.data[p] == 0) {
+                        v = 0;
+                    }
+                }
+                if v != cx.ymm_in.data[k] {
+                    cx.ymm_in.data[k] = v;
+                    changed = true;
+                }
+            }
+        }
+        cx.ymm_ret = true;
+        for k in 0..n {
+            let b = cx.order.data[k];
+            if cx.blocks[b].term == Term::Ret && cx.ymm_in.data[k] == 0 && defs.data[k] == 0 {
+                cx.ymm_ret = false;
+            }
+        }
+        free(defs.data as *u8);
+        true
+    }
+}
+
+// Whether block b writes a ymm register before instruction `before` (0:
+// anywhere in it).
+fn block_writes_ymm(mut cx: *FnCtx, b: i64, before: i64) -> bool {
+    unsafe {
+        let mut v = cx.blocks[b].first;
+        while v != 0 && v != before {
+            let ty = cx.insts[v].ty;
+            if ty != 0 && is_vector(ty) && type_size(ty) == 32 {
+                return true;
+            }
+            v = cx.insts[v].next;
+        }
+        false
+    }
+}
+
+// (0.19) Whether AVX is proven at instruction v (holds_ymm): a vzeroupper
+// may go there.
+pub fn ymm_proven_at(mut cx: *FnCtx, v: i64) -> bool {
+    unsafe {
+        if !cx.ymm_used {
+            return false;
+        }
+        let b = cx.insts[v].block;
+        let k = cx.blocks[b].order;
+        (k >= 0 && k < cx.ymm_in.count && cx.ymm_in.data[k] != 0) || block_writes_ymm(cx, b, v)
     }
 }
 
@@ -410,6 +494,10 @@ pub fn emit_loc(mut cx: *FnCtx, v: i64) {
 
 fn emit_ir_epilogue(mut cx: *FnCtx) {
     unsafe {
+        if cx.ymm_used && cx.ymm_ret {
+            // (0.19: no dirty upper ymm state leaves the function)
+            ins(cx, c"vzeroupper");
+        }
         if !cx.cur_in_frame {
             ins(cx, c"ret");
             return;
@@ -430,6 +518,9 @@ fn emit_ir_epilogue(mut cx: *FnCtx) {
 pub fn emit_return(mut cx: *FnCtx) {
     unsafe {
         if !cx.cur_in_frame {
+            if cx.ymm_used && cx.ymm_ret {
+                ins(cx, c"vzeroupper");
+            }
             unsafe { ins(cx, c"ret"); }
             return;
         }

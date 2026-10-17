@@ -1,0 +1,300 @@
+// References of the AArch64 crypto intrinsics (tests/arch/gen.sh): SHA-1,
+// SHA-256 and SHA-512's round and schedule steps, SHA-3's xar, AES's
+// rounds and the carry-less multiplies, as Arm's pseudocode defines the
+// instructions. 32-bit lanes come as i64, 64-bit ones as u64; each
+// computes the whole result and returns lane k.
+
+fn a64c_m32(x: i64) -> i64 {
+    x & 0xffffffff
+}
+
+fn a64c_ror32(x: i64, n: i64) -> i64 {
+    let v = x & 0xffffffff;
+    ((v >> n) | (v << (32 - n))) & 0xffffffff
+}
+
+fn a64c_rol32(x: i64, n: i64) -> i64 {
+    a64c_ror32(x, 32 - n)
+}
+
+fn a64c_ror64(x: u64, n: i64) -> u64 {
+    if n == 0 { x } else { (x >> (n as u64)) | (x << ((64 - n) as u64)) }
+}
+
+fn a64c_ch(x: i64, y: i64, z: i64) -> i64 {
+    ((y ^ z) & x) ^ z
+}
+
+fn a64c_maj(x: i64, y: i64, z: i64) -> i64 {
+    (x & y) | ((x | y) & z)
+}
+
+// ---- SHA-1 ----
+
+// Four rounds (f: 0 choose, 1 parity, 2 majority) of abcd x and e y.
+fn a64c_sha1(f: i64, x0: [i64], e0: i64, w: [i64], k: i64) -> i64 {
+    let mut x: [i64; 4] = [x0[0], x0[1], x0[2], x0[3]];
+    let mut y = e0 & 0xffffffff;
+    for e in 0..4 {
+        let t = if f == 0 { a64c_ch(x[1], x[2], x[3]) } else if f == 1 { x[1] ^ x[2] ^ x[3] }
+            else { a64c_maj(x[1], x[2], x[3]) };
+        y = a64c_m32(y + a64c_rol32(x[0], 5) + t + w[e]);
+        x[1] = a64c_rol32(x[1], 30);
+        // (Y:X rotated left by 32 bits)
+        let top = x[3];
+        x[3] = x[2];
+        x[2] = x[1];
+        x[1] = x[0];
+        x[0] = y;
+        y = top;
+    }
+    x[k]
+}
+
+fn ref_vsha1cq_u32(hash_abcd: [i64], hash_e: i64, wk: [i64], k: i64) -> i64 {
+    a64c_sha1(0, hash_abcd, hash_e, wk, k)
+}
+
+fn ref_vsha1pq_u32(hash_abcd: [i64], hash_e: i64, wk: [i64], k: i64) -> i64 {
+    a64c_sha1(1, hash_abcd, hash_e, wk, k)
+}
+
+fn ref_vsha1mq_u32(hash_abcd: [i64], hash_e: i64, wk: [i64], k: i64) -> i64 {
+    a64c_sha1(2, hash_abcd, hash_e, wk, k)
+}
+
+fn ref_vsha1h_u32(hash_e: i64) -> i64 {
+    a64c_rol32(hash_e, 30)
+}
+
+fn ref_vsha1su0q_u32(w0_3: [i64], w4_7: [i64], w8_11: [i64], k: i64) -> i64 {
+    let t: [i64; 4] = [w0_3[2], w0_3[3], w4_7[0], w4_7[1]];
+    t[k] ^ w0_3[k] ^ w8_11[k]
+}
+
+fn ref_vsha1su1q_u32(tw0_3: [i64], w12_15: [i64], k: i64) -> i64 {
+    let t: [i64; 4] = [tw0_3[0] ^ w12_15[1], tw0_3[1] ^ w12_15[2], tw0_3[2] ^ w12_15[3], tw0_3[3]];
+    if k < 3 { a64c_rol32(t[k], 1) } else { a64c_rol32(t[3], 1) ^ a64c_rol32(t[0], 2) }
+}
+
+// ---- SHA-256 ----
+
+fn a64c_s0(x: i64) -> i64 {
+    a64c_ror32(x, 2) ^ a64c_ror32(x, 13) ^ a64c_ror32(x, 22)
+}
+
+fn a64c_s1(x: i64) -> i64 {
+    a64c_ror32(x, 6) ^ a64c_ror32(x, 11) ^ a64c_ror32(x, 25)
+}
+
+// Four rounds of abcd x and efgh y; lane k of x (part1) or y.
+fn a64c_sha256(x0: [i64], y0: [i64], w: [i64], part1: bool, k: i64) -> i64 {
+    let mut x: [i64; 4] = [x0[0], x0[1], x0[2], x0[3]];
+    let mut y: [i64; 4] = [y0[0], y0[1], y0[2], y0[3]];
+    for e in 0..4 {
+        let chs = a64c_ch(y[0], y[1], y[2]);
+        let maj = a64c_maj(x[0], x[1], x[2]);
+        let t = a64c_m32(y[3] + a64c_s1(y[0]) + chs + w[e]);
+        x[3] = a64c_m32(t + x[3]);
+        y[3] = a64c_m32(t + a64c_s0(x[0]) + maj);
+        // (Y:X rotated left by 32 bits)
+        let xt = x[3];
+        let yt = y[3];
+        x[3] = x[2];
+        x[2] = x[1];
+        x[1] = x[0];
+        x[0] = yt;
+        y[3] = y[2];
+        y[2] = y[1];
+        y[1] = y[0];
+        y[0] = xt;
+    }
+    if part1 { x[k] } else { y[k] }
+}
+
+fn ref_vsha256hq_u32(hash_abcd: [i64], hash_efgh: [i64], wk: [i64], k: i64) -> i64 {
+    a64c_sha256(hash_abcd, hash_efgh, wk, true, k)
+}
+
+fn ref_vsha256h2q_u32(hash_efgh: [i64], hash_abcd: [i64], wk: [i64], k: i64) -> i64 {
+    a64c_sha256(hash_abcd, hash_efgh, wk, false, k)
+}
+
+fn ref_vsha256su0q_u32(w0_3: [i64], w4_7: [i64], k: i64) -> i64 {
+    let t: [i64; 4] = [w0_3[1], w0_3[2], w0_3[3], w4_7[0]];
+    let x = t[k];
+    a64c_m32((a64c_ror32(x, 7) ^ a64c_ror32(x, 18) ^ (x >> 3)) + w0_3[k])
+}
+
+fn a64c_sig1(x: i64) -> i64 {
+    a64c_ror32(x, 17) ^ a64c_ror32(x, 19) ^ (x >> 10)
+}
+
+fn ref_vsha256su1q_u32(tw0_3: [i64], w8_11: [i64], w12_15: [i64], k: i64) -> i64 {
+    let t: [i64; 4] = [w8_11[1], w8_11[2], w8_11[3], w12_15[0]];
+    let r0 = a64c_m32(a64c_sig1(w12_15[2]) + tw0_3[0] + t[0]);
+    let r1 = a64c_m32(a64c_sig1(w12_15[3]) + tw0_3[1] + t[1]);
+    if k == 0 { return r0; }
+    if k == 1 { return r1; }
+    if k == 2 { return a64c_m32(a64c_sig1(r0) + tw0_3[2] + t[2]); }
+    a64c_m32(a64c_sig1(r1) + tw0_3[3] + t[3])
+}
+
+// ---- SHA-512 ----
+
+fn ref_vsha512hq_u64(sum_ab: [u64], hash_c_: [u64], hash_ab: [u64], k: i64) -> u64 {
+    let x = hash_c_;
+    let y = hash_ab;
+    let w = sum_ab;
+    let ms1 = a64c_ror64(y[1], 14) ^ a64c_ror64(y[1], 18) ^ a64c_ror64(y[1], 41);
+    let mut hi = (y[1] & x[0]) ^ (~y[1] & x[1]);
+    hi = hi + ms1 + w[1];
+    let tmp = hi + y[0];
+    let ms2 = a64c_ror64(tmp, 14) ^ a64c_ror64(tmp, 18) ^ a64c_ror64(tmp, 41);
+    let mut lo = (tmp & y[1]) ^ (~tmp & x[0]);
+    lo = lo + ms2 + w[0];
+    if k == 0 { lo } else { hi }
+}
+
+fn ref_vsha512h2q_u64(sum_ab: [u64], hash_c_: [u64], hash_ab: [u64], k: i64) -> u64 {
+    let x = hash_c_;
+    let y = hash_ab;
+    let w = sum_ab;
+    let ns0 = a64c_ror64(y[0], 28) ^ a64c_ror64(y[0], 34) ^ a64c_ror64(y[0], 39);
+    let mut hi = (x[0] & y[1]) ^ (x[0] & y[0]) ^ (y[1] & y[0]);
+    hi = hi + ns0 + w[1];
+    let ns1 = a64c_ror64(hi, 28) ^ a64c_ror64(hi, 34) ^ a64c_ror64(hi, 39);
+    let mut lo = (hi & y[0]) ^ (hi & y[1]) ^ (y[1] & y[0]);
+    lo = lo + ns1 + w[0];
+    if k == 0 { lo } else { hi }
+}
+
+fn a64c_sig0_512(x: u64) -> u64 {
+    a64c_ror64(x, 1) ^ a64c_ror64(x, 8) ^ (x >> 7)
+}
+
+fn a64c_sig1_512(x: u64) -> u64 {
+    a64c_ror64(x, 19) ^ a64c_ror64(x, 61) ^ (x >> 6)
+}
+
+fn ref_vsha512su0q_u64(w0_1: [u64], w2_: [u64], k: i64) -> u64 {
+    if k == 1 { w0_1[1] + a64c_sig0_512(w2_[0]) } else { w0_1[0] + a64c_sig0_512(w0_1[1]) }
+}
+
+fn ref_vsha512su1q_u64(s01_s02: [u64], w14_15: [u64], w9_10: [u64], k: i64) -> u64 {
+    s01_s02[k] + a64c_sig1_512(w14_15[k]) + w9_10[k]
+}
+
+// ---- SHA-3 ----
+
+fn ref_vxarq_u64(a: [u64], b: [u64], imm6: i64, k: i64) -> u64 {
+    a64c_ror64(a[k] ^ b[k], imm6)
+}
+
+// ---- AES ----
+
+// The product in GF(2^8), AES's polynomial.
+fn a64c_gmul(a: i64, b: i64) -> i64 {
+    let mut x = a & 255;
+    let mut y = b & 255;
+    let mut p = 0;
+    for _ in 0..8 {
+        if (y & 1) != 0 { p = p ^ x; }
+        x = x << 1;
+        if (x & 256) != 0 { x = x ^ 0x11b; }
+        y = y >> 1;
+    }
+    p
+}
+
+// x^254: the inverse (0 for 0).
+fn a64c_ginv(x: i64) -> i64 {
+    let mut r = 1;
+    let mut b = x & 255;
+    let mut e = 254;
+    while e > 0 {
+        if (e & 1) != 0 { r = a64c_gmul(r, b); }
+        b = a64c_gmul(b, b);
+        e = e >> 1;
+    }
+    r
+}
+
+fn a64c_rol8(x: i64, n: i64) -> i64 {
+    ((x << n) | (x >> (8 - n))) & 255
+}
+
+fn a64c_sbox(x: i64) -> i64 {
+    let i = a64c_ginv(x);
+    i ^ a64c_rol8(i, 1) ^ a64c_rol8(i, 2) ^ a64c_rol8(i, 3) ^ a64c_rol8(i, 4) ^ 0x63
+}
+
+fn a64c_inv_sbox(x: i64) -> i64 {
+    let s = x & 255;
+    a64c_ginv(a64c_rol8(s, 1) ^ a64c_rol8(s, 3) ^ a64c_rol8(s, 6) ^ 0x05)
+}
+
+// Byte k of SubBytes(ShiftRows(data ^ key)) (or the inverses): the
+// state's byte r + 4c is row r, column c.
+fn a64c_aes_round(data: [i64], key: [i64], inverse: bool, k: i64) -> i64 {
+    let r = k % 4;
+    let c = k / 4;
+    let from = if inverse { r + 4 * ((c + 4 - r) % 4) } else { r + 4 * ((c + r) % 4) };
+    let x = (data[from] ^ key[from]) & 255;
+    if inverse { a64c_inv_sbox(x) } else { a64c_sbox(x) }
+}
+
+fn ref_vaeseq_u8(data: [i64], key: [i64], k: i64) -> i64 {
+    a64c_aes_round(data, key, false, k)
+}
+
+fn ref_vaesdq_u8(data: [i64], key: [i64], k: i64) -> i64 {
+    a64c_aes_round(data, key, true, k)
+}
+
+// Byte k of (Inv)MixColumns: row r of column c from the coefficients
+// m (2 3 1 1, or 14 11 13 9) rotated right by r.
+fn a64c_mix(data: [i64], m: [i64; 4], k: i64) -> i64 {
+    let r = k % 4;
+    let c = k / 4;
+    let mut x = 0;
+    for j in 0..4 {
+        x = x ^ a64c_gmul(m[(j + 4 - r) % 4], data[4 * c + j]);
+    }
+    x
+}
+
+fn ref_vaesmcq_u8(data: [i64], k: i64) -> i64 {
+    a64c_mix(data, [2, 3, 1, 1], k)
+}
+
+fn ref_vaesimcq_u8(data: [i64], k: i64) -> i64 {
+    a64c_mix(data, [14, 11, 13, 9], k)
+}
+
+// ---- Carry-less multiply ----
+
+// Half `half` (0 low, 1 high) of the 128-bit carry-less product a * b.
+fn a64c_clmul(a: u64, b: u64, half: i64) -> u64 {
+    let mut lo: u64 = 0;
+    let mut hi: u64 = 0;
+    for j in 0..64 {
+        if ((b >> (j as u64)) & 1u64) != 0 {
+            lo = lo ^ (a << (j as u64));
+            if j > 0 { hi = hi ^ (a >> ((64 - j) as u64)); }
+        }
+    }
+    if half == 0 { lo } else { hi }
+}
+
+fn ref_vmull_p64(a: u64, b: u64, k: i64) -> u64 {
+    a64c_clmul(a, b, k)
+}
+
+fn ref_vmull_high_p64(a: [u64], b: [u64], k: i64) -> u64 {
+    a64c_clmul(a[1], b[1], k)
+}
+
+fn ref_vmull_p8(a: [i64], b: [i64], k: i64) -> i64 {
+    a64c_clmul((a[k] & 255) as u64, (b[k] & 255) as u64, 0) as i64
+}

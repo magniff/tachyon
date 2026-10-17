@@ -1,0 +1,533 @@
+// Target features (0.19, docs/design/arch.md §2.4): their names and bits,
+// the implications between them, the CPUs and the targets' baselines, and
+// the build's options `-C target-cpu=NAME` and `-C target-feature=+x,-y`.
+//
+// A feature set is an i64, a bit per feature (FEATURE_BITS below). The bits
+// are also those of the run-time word std::arch's detection fills (T3),
+// whose bit 63 says it is filled.
+
+use crate::arch::{ARCH_AARCH64, ARCH_USED, ARCH_X86_64, target_arch};
+use crate::base::{
+    IntVec, STDERR, buf_bytes, buf_new, buf_slice, buf_str, buf_write_fd, die2, exit, fclose, fopen,
+    read_file, streq,
+};
+use crate::base::target::{ELF, T_X86_64_LINUX, T_X86_64_MACOS, X86};
+
+// AArch64 (the low 16 bits) ...
+pub const FT_NEON: i64 = 0;
+pub const FT_FP: i64 = 1;
+pub const FT_CRC: i64 = 2;
+pub const FT_A64_AES: i64 = 3;
+pub const FT_SHA2: i64 = 4;
+pub const FT_SHA3: i64 = 5;
+pub const FT_DOTPROD: i64 = 6;
+pub const FT_RDM: i64 = 7;
+pub const FT_LSE: i64 = 8;
+pub const FT_FP16: i64 = 9;
+pub const FT_I8MM: i64 = 10;
+pub const FT_BF16: i64 = 11;
+pub const FT_AARCH64: i64 = 15;
+// ... x86-64 (bits 16 to 32).
+pub const FT_SSE: i64 = 16;
+pub const FT_SSE2: i64 = 17;
+pub const FT_SSE3: i64 = 18;
+pub const FT_SSSE3: i64 = 19;
+pub const FT_SSE41: i64 = 20;
+pub const FT_SSE42: i64 = 21;
+pub const FT_POPCNT: i64 = 22;
+pub const FT_LZCNT: i64 = 23;
+pub const FT_BMI1: i64 = 24;
+pub const FT_BMI2: i64 = 25;
+pub const FT_PCLMULQDQ: i64 = 26;
+pub const FT_X86_AES: i64 = 27;
+pub const FT_SHA: i64 = 28;
+pub const FT_AVX: i64 = 29;
+pub const FT_AVX2: i64 = 30;
+pub const FT_FMA: i64 = 31;
+pub const FT_X86_64: i64 = 32;
+
+// The bits of each architecture's features (the architecture's own bit
+// included).
+pub const A64_FEATURES: i64 = 0xffff;
+pub const X86_FEATURES: i64 = 0x1ffff0000;
+
+// The names, by bit ("" for none). AArch64's `asimd` is `neon`.
+pub fn feature_name(bit: i64) -> [u8] {
+    if bit == FT_NEON { return "neon"; }
+    if bit == FT_FP { return "fp"; }
+    if bit == FT_CRC { return "crc"; }
+    if bit == FT_A64_AES { return "aes"; }
+    if bit == FT_SHA2 { return "sha2"; }
+    if bit == FT_SHA3 { return "sha3"; }
+    if bit == FT_DOTPROD { return "dotprod"; }
+    if bit == FT_RDM { return "rdm"; }
+    if bit == FT_LSE { return "lse"; }
+    if bit == FT_FP16 { return "fp16"; }
+    if bit == FT_I8MM { return "i8mm"; }
+    if bit == FT_BF16 { return "bf16"; }
+    if bit == FT_AARCH64 { return "aarch64"; }
+    if bit == FT_SSE { return "sse"; }
+    if bit == FT_SSE2 { return "sse2"; }
+    if bit == FT_SSE3 { return "sse3"; }
+    if bit == FT_SSSE3 { return "ssse3"; }
+    if bit == FT_SSE41 { return "sse4.1"; }
+    if bit == FT_SSE42 { return "sse4.2"; }
+    if bit == FT_POPCNT { return "popcnt"; }
+    if bit == FT_LZCNT { return "lzcnt"; }
+    if bit == FT_BMI1 { return "bmi1"; }
+    if bit == FT_BMI2 { return "bmi2"; }
+    if bit == FT_PCLMULQDQ { return "pclmulqdq"; }
+    if bit == FT_X86_AES { return "aes"; }
+    if bit == FT_SHA { return "sha"; }
+    if bit == FT_AVX { return "avx"; }
+    if bit == FT_AVX2 { return "avx2"; }
+    if bit == FT_FMA { return "fma"; }
+    if bit == FT_X86_64 { return "x86_64"; }
+    ""
+}
+
+fn same(a: [u8], b: [u8]) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    for i in 0..a.len as i64 {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    true
+}
+
+// The bit of feature `name` of architecture `arch` (ARCH_*), or -1.
+pub fn feature_bit_in(name: [u8], arch: i64) -> i64 {
+    if same(name, "asimd") && arch != ARCH_X86_64 {
+        return FT_NEON;
+    }
+    let lo = if arch == ARCH_X86_64 { FT_SSE } else { 0 };
+    let hi = if arch == ARCH_AARCH64 { FT_AARCH64 } else { FT_X86_64 };
+    for bit in lo..hi + 1 {
+        if same(name, feature_name(bit)) {
+            return bit;
+        }
+    }
+    -1
+}
+
+// The bit of feature `name` as a program writes it (`has("crc")`): a name
+// of one architecture names that one's; `x86_64.aes` and `aarch64.aes`
+// are qualified; an unqualified name of both (`aes`) is the target's
+// (feature_ambiguous says whether it is one). -1 for none.
+pub fn parse_feature(name: [u8]) -> i64 {
+    let mut dot = 0;
+    while dot < name.len as i64 && name[dot] != '.' {
+        dot += 1;
+    }
+    if dot < name.len as i64 {
+        let arch_name = name[0..dot];
+        let rest = name[dot + 1..name.len as i64];
+        if same(arch_name, "x86_64") {
+            return feature_bit_in(rest, ARCH_X86_64);
+        }
+        if same(arch_name, "aarch64") {
+            return feature_bit_in(rest, ARCH_AARCH64);
+        }
+        // (sse4.1, sse4.2: a dot of their own)
+    }
+    let own = feature_bit_in(name, target_arch());
+    if own >= 0 {
+        return own;
+    }
+    feature_bit_in(name, if target_arch() == ARCH_X86_64 { ARCH_AARCH64 } else { ARCH_X86_64 })
+}
+
+// Whether `name` names a feature of both architectures (`aes`).
+pub fn feature_ambiguous(name: [u8]) -> bool {
+    feature_bit_in(name, ARCH_AARCH64) >= 0 && feature_bit_in(name, ARCH_X86_64) >= 0
+}
+
+// The set with what its features imply: avx2 => avx => sse4.2 => sse4.1
+// => ssse3 => sse3 => sse2 => sse, fma => avx, sha3 => sha2 => neon => fp,
+// every feature => its architecture.
+pub fn implied(set: i64) -> i64 {
+    let mut s = set;
+    let mut before = -1;
+    while before != s {
+        before = s;
+        if has_bit(s, FT_AVX2) { s |= bit(FT_AVX); }
+        if has_bit(s, FT_FMA) { s |= bit(FT_AVX); }
+        if has_bit(s, FT_AVX) { s |= bit(FT_SSE42); }
+        if has_bit(s, FT_SSE42) { s |= bit(FT_SSE41); }
+        if has_bit(s, FT_SSE41) { s |= bit(FT_SSSE3); }
+        if has_bit(s, FT_SSSE3) { s |= bit(FT_SSE3); }
+        if has_bit(s, FT_SSE3) { s |= bit(FT_SSE2); }
+        if has_bit(s, FT_SSE2) { s |= bit(FT_SSE); }
+        if has_bit(s, FT_SHA3) { s |= bit(FT_SHA2); }
+        if has_bit(s, FT_SHA2) || has_bit(s, FT_A64_AES) || has_bit(s, FT_DOTPROD)
+            || has_bit(s, FT_RDM) || has_bit(s, FT_FP16) || has_bit(s, FT_I8MM)
+            || has_bit(s, FT_BF16) {
+            s |= bit(FT_NEON);
+        }
+        if has_bit(s, FT_NEON) { s |= bit(FT_FP); }
+        if (s & A64_FEATURES & ~bit(FT_AARCH64)) != 0 { s |= bit(FT_AARCH64); }
+        if (s & X86_FEATURES & ~bit(FT_X86_64)) != 0 { s |= bit(FT_X86_64); }
+    }
+    s
+}
+
+pub fn bit(b: i64) -> i64 {
+    1 << b as u64
+}
+
+pub fn has_bit(set: i64, b: i64) -> bool {
+    (set >> b as u64 & 1) != 0
+}
+
+fn set_of(bits: [i64]) -> i64 {
+    let mut s = 0;
+    for i in 0..bits.len as i64 {
+        s |= bit(bits[i]);
+    }
+    implied(s)
+}
+
+// The features of CPU `name` (`-C target-cpu`), or -1 for an unknown name.
+pub fn cpu_features(name: *u8) -> i64 {
+    unsafe {
+        if streq(name, c"generic") {
+            return if X86 { set_of([FT_SSE2][..]) } else { set_of([FT_NEON][..]) };
+        }
+        let m1: [i64; 9] = [FT_NEON, FT_CRC, FT_A64_AES, FT_SHA2, FT_SHA3, FT_DOTPROD, FT_RDM,
+            FT_LSE, FT_FP16];
+        if streq(name, c"apple-m1") || streq(name, c"apple-m2") || streq(name, c"apple-m3")
+            || streq(name, c"apple-m4") {
+            let mut s = set_of(m1[..]);
+            if !streq(name, c"apple-m1") {
+                s |= bit(FT_I8MM) | bit(FT_BF16);
+            }
+            return s;
+        }
+        if streq(name, c"cortex-a72") {
+            return set_of([FT_NEON, FT_CRC, FT_A64_AES, FT_SHA2][..]);
+        }
+        if streq(name, c"cortex-a76") || streq(name, c"neoverse-n1") {
+            return set_of([FT_NEON, FT_CRC, FT_A64_AES, FT_SHA2, FT_DOTPROD, FT_RDM, FT_LSE,
+                FT_FP16][..]);
+        }
+        if streq(name, c"neoverse-v1") || streq(name, c"neoverse-n2") {
+            return set_of([FT_NEON, FT_CRC, FT_A64_AES, FT_SHA2, FT_SHA3, FT_DOTPROD, FT_RDM,
+                FT_LSE, FT_FP16, FT_I8MM, FT_BF16][..]);
+        }
+        if streq(name, c"x86-64") {
+            return set_of([FT_SSE2][..]);
+        }
+        if streq(name, c"core2") {
+            return set_of([FT_SSSE3][..]);
+        }
+        if streq(name, c"x86-64-v2") {
+            return set_of([FT_SSE42, FT_POPCNT][..]);
+        }
+        if streq(name, c"x86-64-v3") || streq(name, c"x86-64-v4") || streq(name, c"haswell")
+            || streq(name, c"skylake") || streq(name, c"znver2") || streq(name, c"znver3")
+            || streq(name, c"znver4") {
+            let mut s = set_of([FT_AVX2, FT_FMA, FT_POPCNT, FT_LZCNT, FT_BMI1, FT_BMI2,
+                FT_PCLMULQDQ, FT_X86_AES][..]);
+            if streq(name, c"znver2") || streq(name, c"znver3") || streq(name, c"znver4") {
+                s |= bit(FT_SHA);
+            }
+            return s;
+        }
+        -1
+    }
+}
+
+// The target's baseline (`-C target-cpu`'s default): apple-m1 on
+// aarch64-macos, generic Armv8.0 on aarch64-linux, x86-64 (v1) on
+// x86_64-linux, core2 on x86_64-macos.
+pub fn target_baseline() -> i64 {
+    unsafe {
+        if X86 {
+            return cpu_features(if ELF { c"x86-64" } else { c"core2" });
+        }
+        cpu_features(if ELF { c"generic" } else { c"apple-m1" })
+    }
+}
+
+// The features the target's ABI needs, which `-C target-feature` cannot
+// remove (arch.baseline).
+pub fn abi_features() -> i64 {
+    unsafe { if X86 { set_of([FT_SSE2][..]) } else { set_of([FT_NEON][..]) } }
+}
+
+// ---- The build's features ----
+//
+// `-C target-cpu=NAME|native` and `-C target-feature=+x,-y` (main.tach,
+// arch_option) are kept as given and applied once the target is known
+// (build_features).
+
+static mut CPU_OPTION: *u8 = 0 as *u8;
+static mut FEATURE_OPTIONS: [*u8; 16] = [0 as *u8; 16];
+static mut FEATURE_OPTION_COUNT: i64 = 0;
+static mut BUILD_FEATURES: i64 = -1;
+
+// The value of `-C` (`target-cpu=...`, `target-feature=...`); false when
+// it is neither.
+pub fn arch_option(value: *u8) -> bool {
+    unsafe {
+        if prefix_is(value, c"target-cpu=") {
+            CPU_OPTION = &value[11];
+            ARCH_USED = true;
+            return true;
+        }
+        if prefix_is(value, c"target-feature=") {
+            if FEATURE_OPTION_COUNT == 16 {
+                die2(c"too many -C target-feature options: ", value);
+            }
+            FEATURE_OPTIONS[FEATURE_OPTION_COUNT] = &value[15];
+            FEATURE_OPTION_COUNT += 1;
+            ARCH_USED = true;
+            return true;
+        }
+        false
+    }
+}
+
+// Whether the command line gave -C options (the tools' cache, which keys
+// on the target only, is then not used).
+pub fn arch_options_given() -> bool {
+    unsafe { CPU_OPTION != 0 as *u8 || FEATURE_OPTION_COUNT > 0 }
+}
+
+// The -C options given, pushed on args as the command line had them (`-C`,
+// `target-cpu=...`): what the tools forward to the commands they run.
+pub fn push_arch_args(args: &mut IntVec) {
+    unsafe {
+        if CPU_OPTION != 0 as *u8 {
+            (*args).push(c"-C" as i64);
+            (*args).push(&CPU_OPTION[-11] as i64);
+        }
+        for k in 0..FEATURE_OPTION_COUNT {
+            (*args).push(c"-C" as i64);
+            (*args).push(&FEATURE_OPTIONS[k][-15] as i64);
+        }
+    }
+}
+
+fn prefix_is(s: *u8, p: *u8) -> bool {
+    unsafe {
+        let mut i = 0;
+        while p[i] != 0 {
+            if s[i] != p[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+}
+
+// A command line error of -C: `error[CODE] MESSAGE: DETAIL`, and exit 1.
+fn option_error(code: *u8, message: *u8, detail: *u8) -> ! {
+    unsafe {
+        let b = buf_new();
+        buf_str(b, c"error[");
+        buf_str(b, code);
+        buf_str(b, c"] ");
+        buf_str(b, message);
+        buf_str(b, c": ");
+        buf_str(b, detail);
+        buf_str(b, c"\n");
+        buf_write_fd(b, STDERR);
+        exit(1)
+    }
+}
+
+// The features every function of the build knows: the CPU's (the
+// baseline's by default), then -C target-feature's additions and
+// removals. Errors are fatal (they are the command line's).
+pub fn build_features() -> i64 {
+    unsafe {
+        if BUILD_FEATURES >= 0 {
+            return BUILD_FEATURES;
+        }
+        let mut s = target_baseline();
+        if CPU_OPTION != 0 as *u8 && !streq(CPU_OPTION, c"native") {
+            s = cpu_features(CPU_OPTION);
+            if s < 0 || (s & own_features()) == 0 {
+                option_error(c"arch.cpu", c"unknown CPU for this target (expected generic, apple-m1..apple-m4, neoverse-n1, neoverse-v1, neoverse-n2, cortex-a72, cortex-a76 on aarch64; x86-64, x86-64-v2..v4, core2, haswell, skylake, znver2..znver4 on x86_64)", CPU_OPTION);
+            }
+        }
+        if CPU_OPTION != 0 as *u8 && streq(CPU_OPTION, c"native") {
+            s = native_features();
+        }
+        for k in 0..FEATURE_OPTION_COUNT {
+            s = apply_feature_option(s, FEATURE_OPTIONS[k]);
+        }
+        BUILD_FEATURES = s;
+        s
+    }
+}
+
+// (0.19 T6) The build's features once build_features() has made them (main
+// does, before code generation's tasks), without making them: what a task
+// reads.
+pub fn made_build_features() -> i64 {
+    unsafe { BUILD_FEATURES }
+}
+
+// `-C target-cpu=native`: the features of the machine compiling, read from
+// /proc/cpuinfo on Linux and sysctl on macOS (not std::arch: compiler/src
+// uses 0.19's features from 0.20), with the target's baseline under them.
+// An error (arch.cpu) when the target is another architecture.
+fn native_features() -> i64 {
+    unsafe {
+        let host_x86 = host_is_x86();
+        if host_x86 != X86 {
+            option_error(c"arch.cpu", c"-C target-cpu=native reads this machine, whose architecture is not the target's; name a CPU instead",
+                if host_x86 { c"x86_64" } else { c"aarch64" });
+        }
+        let text = buf_new();
+        if ELF {
+            let f = fopen(c"/proc/cpuinfo", c"rb");
+            if f != 0 as *u8 {
+                fclose(f);
+                read_file(c"/proc/cpuinfo", text);
+            }
+        } else {
+            let out = crate::front::cpp::cc::run_command(c"sysctl hw.optional machdep.cpu.features machdep.cpu.leaf7_features machdep.cpu.extfeatures 2>/dev/null");
+            buf_bytes(text, buf_slice(out));
+        }
+        let t = buf_slice(text);
+        let mut s = target_baseline();
+        if X86 {
+            let names: [*u8; 16] = [c" sse ", c" sse2 ", c" pni ", c" ssse3 ", c" sse4_1 ",
+                c" sse4_2 ", c" popcnt ", c" abm ", c" bmi1 ", c" bmi2 ", c" pclmulqdq ", c" aes ",
+                c" sha_ni ", c" avx ", c" avx2 ", c" fma "];
+            let mac: [*u8; 16] = [c" SSE ", c" SSE2 ", c" SSE3 ", c" SSSE3 ", c" SSE4.1 ",
+                c" SSE4.2 ", c" POPCNT ", c" LZCNT ", c" BMI1 ", c" BMI2 ", c" PCLMULQDQ ",
+                c" AES ", c" SHA ", c" AVX1.0 ", c" AVX2 ", c" FMA "];
+            let bits: [i64; 16] = [FT_SSE, FT_SSE2, FT_SSE3, FT_SSSE3, FT_SSE41, FT_SSE42,
+                FT_POPCNT, FT_LZCNT, FT_BMI1, FT_BMI2, FT_PCLMULQDQ, FT_X86_AES, FT_SHA, FT_AVX,
+                FT_AVX2, FT_FMA];
+            for k in 0..16 {
+                if word_in(t, if ELF { names[k] } else { mac[k] }) {
+                    s |= bit(bits[k]);
+                }
+            }
+        } else {
+            let names: [*u8; 10] = [c" crc32", c" aes", c" sha2", c" sha3", c" asimddp",
+                c" asimdrdm", c" atomics", c" fphp", c" i8mm", c" bf16"];
+            let mac: [*u8; 10] = [c"FEAT_CRC32: 1", c"FEAT_AES: 1", c"FEAT_SHA256: 1",
+                c"FEAT_SHA3: 1", c"FEAT_DotProd: 1", c"FEAT_RDM: 1", c"FEAT_LSE: 1",
+                c"FEAT_FP16: 1", c"FEAT_I8MM: 1", c"FEAT_BF16: 1"];
+            let bits: [i64; 10] = [FT_CRC, FT_A64_AES, FT_SHA2, FT_SHA3, FT_DOTPROD, FT_RDM, FT_LSE,
+                FT_FP16, FT_I8MM, FT_BF16];
+            for k in 0..10 {
+                if word_in(t, if ELF { names[k] } else { mac[k] }) {
+                    s |= bit(bits[k]);
+                }
+            }
+        }
+        implied(s)
+    }
+}
+
+// Whether `w` is in text; a word of /proc/cpuinfo's or sysctl's list (a
+// leading space in w, and a trailing one matching a line's end too).
+fn word_in(text: [u8], w: *u8) -> bool {
+    unsafe {
+        let mut n = 0;
+        while w[n] != 0 {
+            n += 1;
+        }
+        let trailing = w[n - 1] == ' ';
+        let mut i = 0;
+        while i + n <= text.len as i64 + if trailing { 1 } else { 0 } {
+            let mut k = 0;
+            while k < n {
+                let c = if i + k < text.len as i64 { text[i + k] } else { '\n' };
+                let want = w[k];
+                if !(c == want || want == ' ' && (c == '\n' || c == '\t' || c == ':')) {
+                    break;
+                }
+                k += 1;
+            }
+            if k == n {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+}
+
+// Whether this machine is an x86-64 (uname's machine field).
+fn host_is_x86() -> bool {
+    unsafe {
+        let t = crate::host_target();
+        t == T_X86_64_LINUX || t == T_X86_64_MACOS
+    }
+}
+
+// The features of the target's architecture.
+pub fn own_features() -> i64 {
+    if target_arch() == ARCH_X86_64 { X86_FEATURES } else { A64_FEATURES }
+}
+
+fn apply_feature_option(set: i64, list: *u8) -> i64 {
+    unsafe {
+        let mut s = set;
+        let mut i = 0;
+        while list[i] != 0 {
+            let sign = list[i];
+            if sign != '+' && sign != '-' {
+                option_error(c"arch.feature_name",
+                    c"-C target-feature takes +NAME and -NAME, comma-separated", list);
+            }
+            let start = i + 1;
+            let mut end = start;
+            while list[end] != 0 && list[end] != ',' {
+                end += 1;
+            }
+            let b = parse_feature(list[start..end]);
+            if b < 0 {
+                option_error(c"arch.feature_name", c"unknown feature in -C target-feature", list);
+            }
+            if sign == '+' {
+                s = implied(s | bit(b));
+            } else {
+                if has_bit(abi_features(), b) {
+                    option_error(c"arch.baseline",
+                        c"-C target-feature cannot remove a feature the target's ABI needs", list);
+                }
+                // (and what needs it: -sse4.1 takes sse4.2, avx, avx2 and
+                // fma with it)
+                for c in 0..FT_X86_64 + 1 {
+                    if has_bit(s, c) && has_bit(implied(bit(c)), b) {
+                        s &= ~bit(c);
+                    }
+                }
+            }
+            i = if list[end] == ',' { end + 1 } else { end };
+        }
+        s
+    }
+}
+
+// Whether feature `b` belongs to another architecture than the target's:
+// never known, has() and detect() of it are false.
+pub fn feature_is_foreign(b: i64) -> bool {
+    !has_bit(own_features(), b)
+}
+
+// The constant value of `has(name)` / `detect(name)` where `known` is the
+// set known at that point: 1 true, 0 false, -1 not a constant (a detect
+// of a feature of this architecture that is not known: tested at run time).
+pub fn feature_value(b: i64, known: i64, detect: bool) -> i64 {
+    if feature_is_foreign(b) {
+        return 0;
+    }
+    if has_bit(known, b) {
+        return 1;
+    }
+    if detect { -1 } else { 0 }
+}

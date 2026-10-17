@@ -39,8 +39,11 @@
 #
 # Steps: chain; suite-O0, suite-O1, suite-O2; fuzz-plain, fuzz-loops,
 # fuzz-generics, fuzz-pressure, fuzz-calls, fuzz-lang06, fuzz-vector,
-# fuzz-div, fuzz-range, fuzz-seed (against the Rust seed); abi-plain,
+# fuzz-div, fuzz-range, fuzz-arch (0.19: intrinsics), fuzz-seed
+# (against the Rust seed); abi-plain,
 # abi-import, abi-header; objcheck; layout (tests/cimport/layout.sh); debug (tests/debug.sh);
+# objcheck-x86-arch (0.19: the std::arch cases for x86_64-macos, compiled
+# and assembled both ways, nothing run);
 # threads (tests/threads.sh: the same output at -j1 and -j8, 0.18.1);
 # incremental (tests/incremental.sh: rebuilds with the code cache after
 # edits the same as clean builds, 0.18.1);
@@ -169,15 +172,15 @@ esac
 [ -z "$FUZZ_N" ] || { FZ=$FUZZ_N; XFZ=$FUZZ_N; AFZ=$FUZZ_N; }
 [ -z "$ABI_N" ] || { AB=$ABI_N; XAB=$ABI_N; AAB=$ABI_N; }
 
-FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-seed"
+FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-seed"
 ABI_STEPS="abi-plain abi-import abi-header"
-HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck layout debug threads incremental stress-grow examples-checkalloc"
+HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc"
 LINUX_STEPS="linux-x86_64 linux-aarch64"
 # (steps only --only names: valgrind runs in the linux-aarch64 container)
 OTHER_STEPS="valgrind"
 [ "$X86" = 1 ] || LINUX_STEPS="linux-aarch64"
 case "$MODE" in
-    quick) STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental" ;;
+    quick) STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch" ;;
     *) STEPS="$HOST_STEPS"; [ $LINUX -eq 1 ] && STEPS="$STEPS $LINUX_STEPS" ;;
 esac
 if [ -n "$ONLY" ]; then
@@ -306,6 +309,7 @@ run_step() {
         fuzz-vector) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -V ;;
         fuzz-div) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -D ;;
         fuzz-range) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -R ;;
+        fuzz-arch) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -A ;;
         fuzz-seed)
             seed=$(find_seed)
             if [ -z "$seed" ]; then
@@ -317,6 +321,9 @@ run_step() {
         abi-import) sh "$ROOT/tests/abi/run.sh" -c "$C" -n "$AB" -k "$k" -i ;;
         abi-header) sh "$ROOT/tests/abi/run.sh" -c "$C" -n "$AB" -k "$k" -H ;;
         objcheck) sh "$ROOT/tests/objcheck.sh" -c "$C" ;;
+        # (0.19: x86-64's intrinsics are encoded and checked against cc on
+        # any host; no x86 CPU needed, so --no-x86 keeps it)
+        objcheck-x86-arch) sh "$ROOT/tests/objcheck.sh" -c "$C" -t x86_64-macos arch_ ;;
         layout)
             (cd "$ROOT" && sh tests/cimport/layout.sh -c "$C" stdio.h stdlib.h string.h math.h \
                 time.h fcntl.h unistd.h signal.h sys/stat.h sys/time.h sys/socket.h \
@@ -509,8 +516,8 @@ note_of() {
     case "$1" in
         chain) awk '/^  head / { sub(/^  head +/, ""); print; exit }' "$l" ;;
         suite-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed\n", $2, $3, $4 }' "$l" ;;
-        fuzz-*|abi-*|objcheck|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind)
-            grep -E '^(fuzz|abi|objcheck|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind):' "$l" | tail -1 ;;
+        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind)
+            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind):' "$l" | tail -1 ;;
         linux-*) grep '^gate-row' "$l" | awk -F'\t' '$3 != "pass" && $3 != "skip" { bad = bad " " $2 } END { n = NR; print n " steps in the container" (bad == "" ? "" : "; failed:" bad) }' ;;
         bench) grep '^geomean' "$l" | tail -1 ;;
     esac
@@ -550,7 +557,7 @@ for s in $([ $CHAIN -eq 1 ] && echo chain) $STEPS $([ $BENCH -eq 1 ] && echo ben
     [ -f "$l" ] || { echo "    not run (the chain failed)"; continue; }
     case "$s" in
         suite-*|examples-checkalloc) awk '/^tests for / { exit } { print }' "$l" | head -60 ;;
-        fuzz-*|abi-*|objcheck|threads|incremental) grep -E '^FAIL' "$l" | head -20; [ -d "$RUN/failures/$s" ] && echo "    kept in $RUN/failures/$s" ;;
+        fuzz-*|abi-*|objcheck|objcheck-*|threads|incremental) grep -E '^FAIL' "$l" | head -20; [ -d "$RUN/failures/$s" ] && echo "    kept in $RUN/failures/$s" ;;
         linux-*) awk '/^--- / { p = 1 } p' "$l" | head -80; grep -q '^--- ' "$l" || tail -30 "$l" ;;
         *) tail -30 "$l" ;;
     esac

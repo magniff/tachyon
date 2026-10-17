@@ -1,0 +1,364 @@
+// Vector constant folding (0.19 T6, docs/design/arch.md §5.2): 0.10's
+// vector operations and std::arch's intrinsics (INTR, by the table's
+// `fold` column) on constant operands, computing what the instruction
+// computes. A constant vector is a VSPLAT of a constant (seen through
+// CONVs between vector types of the same lane width); a fold whose result
+// is one is a VSPLAT again, a scalar one a constant. Integer lanes only:
+// float lanes are left to the instructions (NaNs, rounding). x86-64's
+// intrinsics (opaque types) are not folded.
+//
+// The folds are tested against the tables' references with constant
+// arguments by tests/arch/gen.sh, at -O2.
+
+use crate::arch::{ARCH_X86_64, F_FOLD, INTRS, intr_imm, intr_text};
+use crate::front::consteval::wrap_int;
+use crate::front::types::{
+    TYPES, TY_U32, int_bits, is_float, is_integer, is_signed, is_vector, type_size,
+};
+use crate::middle::ctx::FnCtx;
+use crate::middle::fold::{const_before, fold_compare};
+use crate::middle::ir::{Cond, Op, ir_replace};
+
+// The constant every lane of vector value x holds, as a value of lane type
+// `elem`; false when x is not such a splat (or its lanes are floats, or
+// of another width).
+pub fn splat_constant(mut cx: *FnCtx, x: i64, elem: i64, value: &mut i64) -> bool {
+    unsafe {
+        if !is_integer(elem) {
+            return false;
+        }
+        let mut w = x;
+        let mut depth = 0;
+        while cx.insts[w].op == Op::Conv && depth < 4 {
+            let from = cx.insts[w].imm2;
+            let to = cx.insts[w].ty;
+            if !is_vector(from) || !is_vector(to) {
+                return false;
+            }
+            if type_size(TYPES[from].a) != type_size(TYPES[to].a) {
+                return false;
+            }
+            w = cx.insts[w].a;
+            depth += 1;
+        }
+        if cx.insts[w].op != Op::VSplat || !is_vector(cx.insts[w].ty) {
+            return false;
+        }
+        let e = TYPES[cx.insts[w].ty].a;
+        let s = cx.insts[w].a;
+        if !is_integer(e) || type_size(e) != type_size(elem) || cx.insts[s].op != Op::Const {
+            return false;
+        }
+        *value = wrap_int(cx.insts[s].imm, elem);
+        true
+    }
+}
+
+// Makes v (of a vector type) the splat of `value`.
+fn become_splat(mut cx: *FnCtx, v: i64, value: i64) -> bool {
+    unsafe {
+        let elem = TYPES[cx.insts[v].ty].a;
+        let c = const_before(cx, v, wrap_int(value, elem), elem);
+        cx.insts[v].op = Op::VSplat;
+        cx.insts[v].cond = Cond::Eq;
+        cx.insts[v].a = c;
+        cx.insts[v].b = 0;
+        cx.insts[v].c = 0;
+        cx.insts[v].imm = 0;
+        cx.insts[v].imm2 = 0;
+    }
+    true
+}
+
+// Makes v (of a scalar type) the constant `value`.
+fn become_const(mut cx: *FnCtx, v: i64, value: i64) -> bool {
+    unsafe {
+        if !is_integer(cx.insts[v].ty) {
+            return false;
+        }
+        cx.insts[v].op = Op::Const;
+        cx.insts[v].cond = Cond::Eq;
+        cx.insts[v].imm = wrap_int(value, cx.insts[v].ty);
+        cx.insts[v].a = 0;
+        cx.insts[v].b = 0;
+        cx.insts[v].c = 0;
+        cx.insts[v].imm2 = 0;
+    }
+    true
+}
+
+// A lane whose bits are all ones (a mask's true), of lane type elem.
+fn ones(elem: i64) -> i64 {
+    wrap_int(-1, elem)
+}
+
+// x's bits within `bits` bits, as an unsigned value.
+fn lane_bits(x: i64, bits: i64) -> u64 {
+    if bits == 64 { x as u64 } else { (x as u64) & ((1 << bits as u64) - 1) }
+}
+
+fn count_leading_zeros(x: i64, bits: i64) -> i64 {
+    let u = lane_bits(x, bits);
+    let mut n = 0;
+    let mut k = bits - 1;
+    while k >= 0 && ((u >> k as u64) & 1) == 0 {
+        n += 1;
+        k -= 1;
+    }
+    n
+}
+
+// The bits after the top one equal to it.
+fn count_leading_signs(x: i64, bits: i64) -> i64 {
+    let u = lane_bits(x, bits);
+    let top = (u >> (bits - 1) as u64) & 1;
+    let mut n = 0;
+    let mut k = bits - 2;
+    while k >= 0 && ((u >> k as u64) & 1) == top {
+        n += 1;
+        k -= 1;
+    }
+    n
+}
+
+fn count_ones(x: i64, bits: i64) -> i64 {
+    let u = lane_bits(x, bits);
+    let mut n = 0;
+    for k in 0..bits {
+        n += ((u >> k as u64) & 1) as i64;
+    }
+    n
+}
+
+fn reverse_bits(x: i64, bits: i64) -> i64 {
+    let u = lane_bits(x, bits);
+    let mut r: u64 = 0;
+    for k in 0..bits {
+        r |= ((u >> k as u64) & 1) << (bits - 1 - k) as u64;
+    }
+    r as i64
+}
+
+// x >> n as the lane type's shift does (an arithmetic shift for a signed
+// lane; n up to the lane's width).
+fn shift_right(x: i64, n: i64, bits: i64, signed: bool) -> i64 {
+    if signed {
+        return x >> (if n > 63 { 63 } else { n }) as u64;
+    }
+    if n >= 64 {
+        return 0;
+    }
+    (lane_bits(x, bits) >> n as u64) as i64
+}
+
+// CRC-32 (reflected, no inversion) of crc and the `bytes` low bytes of
+// data, little-endian, with polynomial poly (reflected).
+fn crc32(crc: i64, data: i64, bytes: i64, poly: u64) -> i64 {
+    let mut c = lane_bits(crc, 32);
+    for k in 0..bytes {
+        c ^= ((data as u64) >> (8 * k) as u64) & 255;
+        for _ in 0..8 {
+            c = if (c & 1) != 0 { (c >> 1) ^ poly } else { c >> 1 };
+        }
+    }
+    c as i64
+}
+
+// Folds vector operation (or INTR) v when its operands are constant;
+// whether it changed. From instcombine.
+pub fn fold_vector(mut cx: *FnCtx, v: i64) -> bool {
+    unsafe {
+        let op = cx.insts[v].op;
+        if op == Op::Intr {
+            return fold_intr(cx, v);
+        }
+        let ty = cx.insts[v].ty;
+        let a = cx.insts[v].a;
+        if op == Op::VExt || op == Op::VSum {
+            let vt = cx.insts[a].ty;
+            let mut x = 0;
+            if !is_vector(vt) || !splat_constant(cx, a, TYPES[vt].a, &mut x) {
+                return false;
+            }
+            return become_const(cx, v, if op == Op::VExt { x } else { x * TYPES[vt].b });
+        }
+        if !is_vector(ty) {
+            return false;
+        }
+        let elem = TYPES[ty].a;
+        if op == Op::VSel {
+            // (a bitwise select: an all-zeros or all-ones mask picks one)
+            let mt = cx.insts[a].ty;
+            let mut m = 0;
+            if !is_vector(mt) || !splat_constant(cx, a, TYPES[mt].a, &mut m) {
+                return false;
+            }
+            if m == 0 && cx.insts[cx.insts[v].c].ty == ty {
+                ir_replace(cx, v, cx.insts[v].c);
+                return true;
+            }
+            if m == ones(TYPES[mt].a) && cx.insts[cx.insts[v].b].ty == ty {
+                ir_replace(cx, v, cx.insts[v].b);
+                return true;
+            }
+            let mut x = 0;
+            let mut y = 0;
+            if type_size(TYPES[mt].a) == type_size(elem)
+                && splat_constant(cx, cx.insts[v].b, elem, &mut x)
+                && splat_constant(cx, cx.insts[v].c, elem, &mut y) {
+                return become_splat(cx, v, (x & m) | (y & ~m));
+            }
+            return false;
+        }
+        let mut x = 0;
+        if !splat_constant(cx, a, elem, &mut x) {
+            return false;
+        }
+        if op == Op::VNeg {
+            return become_splat(cx, v, 0 - x);
+        }
+        if op == Op::VIns {
+            let b = cx.insts[v].b;
+            if cx.insts[b].op == Op::Const && wrap_int(cx.insts[b].imm, elem) == x {
+                return become_splat(cx, v, x);
+            }
+            return false;
+        }
+        let mut y = 0;
+        if cx.insts[v].b == 0 || !splat_constant(cx, cx.insts[v].b, elem, &mut y) {
+            return false;
+        }
+        if op == Op::VCmp {
+            let t = fold_compare(cx.insts[v].cond, elem, x, y);
+            return become_splat(cx, v, if t { ones(elem) } else { 0 });
+        }
+        if op == Op::VBin {
+            let raw = cx.insts[v].imm;
+            let bop = raw as Op;
+            return match bop {
+                Op::Add => become_splat(cx, v, x + y),
+                Op::Sub => become_splat(cx, v, x - y),
+                Op::Mul => become_splat(cx, v, x * y),
+                Op::And => become_splat(cx, v, x & y),
+                Op::Or => become_splat(cx, v, x | y),
+                Op::Xor => become_splat(cx, v, x ^ y),
+                _ => false,
+            };
+        }
+        false
+    }
+}
+
+// An INTR on constant operands, by its fold class.
+fn fold_intr(mut cx: *FnCtx, v: i64) -> bool {
+    unsafe {
+        let id = cx.insts[v].imm;
+        if INTRS[id].arch == ARCH_X86_64 {
+            return false;
+        }
+        let cls = intr_text(id, F_FOLD);
+        let ty = cx.insts[v].ty;
+        let a = cx.insts[v].a;
+        let b = cx.insts[v].b;
+        let c = cx.insts[v].c;
+        if cls.len >= 4 && cls[0..4] == "crc." {
+            if a == 0 || b == 0 || cx.insts[a].op != Op::Const || cx.insts[b].op != Op::Const {
+                return false;
+            }
+            let poly: u64 = if cls[4] == 'c' { 0x82f63b78 } else { 0xedb88320 };
+            let bytes = type_size(cx.insts[b].ty);
+            return become_const(cx, v, crc32(cx.insts[a].imm, cx.insts[b].imm, bytes, poly));
+        }
+        if a == 0 || !is_vector(cx.insts[a].ty) {
+            return false;
+        }
+        let ein = TYPES[cx.insts[a].ty].a;
+        let mut x = 0;
+        if !splat_constant(cx, a, ein, &mut x) {
+            return false;
+        }
+        let n = intr_imm(cx.insts[v].imm2, 0);
+        // Lanes moved, not changed.
+        if cls == "across.max" || cls == "across.min" || cls == "lane" {
+            return become_const(cx, v, x);
+        }
+        if !is_vector(ty) || !is_integer(TYPES[ty].a) {
+            return false;
+        }
+        let same_width = type_size(TYPES[ty].a) == type_size(ein);
+        if cls == "splat.lane" || cls == "perm.rev" || cls == "perm.low" || cls == "perm.high" {
+            return same_width && become_splat(cx, v, x);
+        }
+        if !same_width {
+            return false;
+        }
+        let bits = int_bits(ein);
+        let signed = is_signed(ein);
+        let narrow = bits < 64;
+        let lo = if signed { 0 - (1 << (bits - 1) as u64) } else { 0 };
+        let hi = if signed { (1 << (bits - 1) as u64) - 1 } else { (1 << bits as u64) - 1 };
+        let mask = ones(TYPES[ty].a);
+        // One operand.
+        if cls == "lanes.not" { return become_splat(cx, v, ~x); }
+        if cls == "lanes.neg" { return become_splat(cx, v, 0 - x); }
+        if cls == "lanes.abs" { return become_splat(cx, v, if x < 0 { 0 - x } else { x }); }
+        if cls == "lanes.qabs" && narrow {
+            let r = if x < 0 { 0 - x } else { x };
+            return become_splat(cx, v, if r > hi { hi } else { r });
+        }
+        if cls == "lanes.qneg" && narrow {
+            let r = 0 - x;
+            return become_splat(cx, v, if r > hi { hi } else { r });
+        }
+        if cls == "lanes.eqz" { return become_splat(cx, v, if x == 0 { mask } else { 0 }); }
+        if cls == "lanes.gez" { return become_splat(cx, v, if x >= 0 { mask } else { 0 }); }
+        if cls == "lanes.gtz" { return become_splat(cx, v, if x > 0 { mask } else { 0 }); }
+        if cls == "lanes.lez" { return become_splat(cx, v, if x <= 0 { mask } else { 0 }); }
+        if cls == "lanes.ltz" { return become_splat(cx, v, if x < 0 { mask } else { 0 }); }
+        if cls == "lanes.clz" { return become_splat(cx, v, count_leading_zeros(x, bits)); }
+        if cls == "lanes.cls" { return become_splat(cx, v, count_leading_signs(x, bits)); }
+        if cls == "lanes.cnt" { return become_splat(cx, v, count_ones(x, bits)); }
+        if cls == "lanes.rbit" { return become_splat(cx, v, reverse_bits(x, bits)); }
+        if cls == "lanes.shl" { return become_splat(cx, v, x << n as u64); }
+        if cls == "lanes.shr" { return become_splat(cx, v, shift_right(x, n, bits, signed)); }
+        if cls == "lanes.rshr" && narrow {
+            return become_splat(cx, v, (x + (1 << (n - 1) as u64)) >> n as u64);
+        }
+        // Two operands of the same lane width.
+        let mut y = 0;
+        if b == 0 || !is_vector(cx.insts[b].ty) || !splat_constant(cx, b, ein, &mut y) {
+            return false;
+        }
+        if cls == "perm.zip1" || cls == "perm.zip2" || cls == "perm.uzp1" || cls == "perm.uzp2"
+            || cls == "perm.trn1" || cls == "perm.trn2" || cls == "perm.ext"
+            || cls == "perm.combine" {
+            return x == y && become_splat(cx, v, x);
+        }
+        if cls == "lanes.bic" { return become_splat(cx, v, x & ~y); }
+        if cls == "lanes.orn" { return become_splat(cx, v, x | ~y); }
+        if cls == "lanes.tst" { return become_splat(cx, v, if (x & y) != 0 { mask } else { 0 }); }
+        if cls == "lanes.sra" { return become_splat(cx, v, x + shift_right(y, n, bits, signed)); }
+        if narrow {
+            if cls == "lanes.qadd_u" || cls == "lanes.qadd_s" || cls == "lanes.qsub_u"
+                || cls == "lanes.qsub_s" {
+                let add = cls == "lanes.qadd_u" || cls == "lanes.qadd_s";
+                let r = if add { x + y } else { x - y };
+                return become_splat(cx, v, if r < lo { lo } else if r > hi { hi } else { r });
+            }
+            if cls == "lanes.min" { return become_splat(cx, v, if x < y { x } else { y }); }
+            if cls == "lanes.max" { return become_splat(cx, v, if x > y { x } else { y }); }
+            if cls == "lanes.abd" { return become_splat(cx, v, if x > y { x - y } else { y - x }); }
+            if cls == "lanes.hadd" { return become_splat(cx, v, (x + y) >> 1); }
+            if cls == "lanes.rhadd" { return become_splat(cx, v, (x + y + 1) >> 1); }
+            if cls == "lanes.hsub" { return become_splat(cx, v, (x - y) >> 1); }
+        }
+        // Three.
+        let mut z = 0;
+        if c == 0 || !is_vector(cx.insts[c].ty) || !splat_constant(cx, c, ein, &mut z) {
+            return false;
+        }
+        if cls == "lanes.mla" { return become_splat(cx, v, x + y * z); }
+        if cls == "lanes.mls" { return become_splat(cx, v, x - y * z); }
+        false
+    }
+}

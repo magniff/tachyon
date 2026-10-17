@@ -1,0 +1,130 @@
+// AArch64 intrinsics (0.19, docs/design/arch.md §5.3): an INTR is its
+// table's instruction template (arch/template.tach) with its registers;
+// -O0 writes the same with fixed ones (gen0/gen/arch.tach).
+
+use crate::arch::{ARCH_EXT_FEATURES, F_INSN, INTRS, intr_text, intr_tied};
+use crate::arch::features::{
+    FT_A64_AES, FT_BF16, FT_CRC, FT_DOTPROD, FT_FP16, FT_I8MM, FT_RDM, FT_SHA2, FT_SHA3,
+    feature_name, has_bit,
+};
+use crate::arch::template::{
+    SLOT_D, SLOT_T, SLOT_U, TP_END, TP_NEXT, TP_SLOT, TP_TEXT, TPiece, template_piece,
+    template_slot,
+};
+use crate::back::mc_arm64::ma_mov;
+use crate::base::{buf_bytes, buf_str};
+use crate::front::types::{TY_I64, TY_V16I8};
+use crate::gen0::target::{o, oi, on};
+use crate::middle::ctx::FnCtx;
+
+// The instruction temporaries: v31, and x17 for a general register.
+const VTEMP: i64 = 63;
+const XTEMP: i64 = 17;
+
+// (0.19 T4) The second vector temporary, v30 (`<u>`): the allocator never
+// gives out v30 or v31.
+const VTEMP2: i64 = 62;
+
+// The features whose instructions the assemblers accept only after an
+// `.arch_extension` (GNU as for a generic Armv8.0 target): the ones the
+// program's intrinsics need (ARCH_EXT_FEATURES, set by the front end), at
+// the top of the output (emit_file_header; the compiler's assembler
+// ignores the directive). Nothing per function: emission keeps no state
+// across functions (threads, the code cache).
+pub fn ma_arch_extensions(out: i64) {
+    unsafe {
+        // (GNU as accepts the Armv8.2 extensions, sha3 and dotprod among
+        // them, only on an Armv8.2 base; it adds nothing else)
+        let v82 = has_bit(ARCH_EXT_FEATURES, FT_SHA3) || has_bit(ARCH_EXT_FEATURES, FT_DOTPROD)
+            || has_bit(ARCH_EXT_FEATURES, FT_RDM) || has_bit(ARCH_EXT_FEATURES, FT_FP16)
+            || has_bit(ARCH_EXT_FEATURES, FT_I8MM) || has_bit(ARCH_EXT_FEATURES, FT_BF16);
+        if v82 {
+            buf_str(out, c"    .arch armv8.2-a\n");
+        }
+        let list: [i64; 9] = [FT_CRC, FT_A64_AES, FT_SHA2, FT_SHA3, FT_DOTPROD, FT_RDM, FT_FP16,
+            FT_I8MM, FT_BF16];
+        for i in 0..9 {
+            let b = list[i];
+            if has_bit(ARCH_EXT_FEATURES, b) {
+                buf_str(out, c"    .arch_extension ");
+                buf_bytes(out, feature_name(b));
+                buf_str(out, c"\n");
+            }
+        }
+    }
+}
+
+// Register r with modifier m: v<n> (or b/h/s/d/q<n>) for a vector
+// register (32 + n), x<n> (w<n>) for a general one.
+fn ma_reg(mut cx: *FnCtx, r: i64, m: u8) {
+    unsafe {
+        if r >= 32 {
+            if m == 'b' { o(cx, c"b"); } else if m == 'h' { o(cx, c"h"); }
+            else if m == 's' { o(cx, c"s"); } else if m == 'd' { o(cx, c"d"); }
+            else if m == 'q' { o(cx, c"q"); } else { o(cx, c"v"); }
+            oi(cx, r - 32);
+        } else {
+            o(cx, if m == 'w' { c"w" } else { c"x" });
+            oi(cx, r);
+        }
+    }
+}
+
+// The move of a register of r's file.
+fn ma_move(mut cx: *FnCtx, d: i64, s: i64) {
+    unsafe { ma_mov(cx, d, s, if d >= 32 { TY_V16I8 } else { TY_I64 }); }
+}
+
+// Intrinsic id into register d (-1: no result) from the registers ops[k]
+// of its parameters (-1 for an immediate, whose value is imms[k]). A tied
+// result (the instruction overwrites a parameter's register) starts as a
+// copy of that parameter, in v31 (x17) when d is another operand's.
+pub fn ma_intr(mut cx: *FnCtx, id: i64, d: i64, ops: [i64], imms: [i64]) {
+    unsafe {
+        let tied = intr_tied(id);
+        let mut dd = d;
+        if tied >= 0 && ops[tied] != d {
+            for k in 0..INTRS[id].nparams {
+                if k != tied && ops[k] == d {
+                    dd = if d >= 32 { VTEMP } else { XTEMP };
+                }
+            }
+            ma_move(cx, dd, ops[tied]);
+        }
+        let text = intr_text(id, F_INSN);
+        let mut p = TPiece { kind: 0, start: 0, end: 0, name: 0, modifier: 0 };
+        let mut at = 0;
+        o(cx, c"    ");
+        loop {
+            at = template_piece(text, at, &p);
+            if p.kind == TP_END {
+                break;
+            }
+            if p.kind == TP_TEXT {
+                buf_bytes(cx.code, text[p.start..p.end]);
+            } else if p.kind == TP_NEXT {
+                on(cx);
+                o(cx, c"    ");
+            } else if p.kind == TP_SLOT {
+                let s = template_slot(id, p.name);
+                if s == SLOT_D {
+                    ma_reg(cx, dd, p.modifier);
+                } else if s == SLOT_T {
+                    ma_reg(cx, VTEMP, p.modifier);
+                } else if s == SLOT_U {
+                    ma_reg(cx, VTEMP2, p.modifier);
+                } else if ops[s] < 0 {
+                    // (`<n:2>`: an immediate scaled, ext's lane count as bytes)
+                    let m = p.modifier;
+                    oi(cx, if m >= '1' && m <= '9' { imms[s] * (m - '0') as i64 } else { imms[s] });
+                } else {
+                    ma_reg(cx, ops[s], p.modifier);
+                }
+            }
+        }
+        on(cx);
+        if dd != d {
+            ma_move(cx, d, dd);
+        }
+    }
+}

@@ -7,12 +7,14 @@
 // replacement turns those slots into values.
 
 use crate::front::ast::{
-    NODES, VK_LANE, VK_LOAD, VK_NEW, VK_SELECT, VK_SPLAT, VK_STORE, VK_SUM, child,
+    NODES, VK_FROM_BITS, VK_LANE, VK_LOAD, VK_NEW, VK_SELECT, VK_SPLAT, VK_STORE, VK_SUM, child,
 };
 use crate::front::contracts::sites::site_of;
 use crate::front::lexer::Tok;
 use crate::front::parser::exprs::is_comparison;
-use crate::front::types::{TYPES, TY_I64, TY_U64, is_slice, type_size, vec_elem, vec_lanes};
+use crate::front::types::{
+    TYPES, TY_I64, TY_U64, is_float, is_slice, type_size, vec_elem, vec_lanes, vector_half,
+};
 use crate::gen0::target::{PANIC_INDEX_SIGNED, PANIC_RANGE_SIGNED};
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{
@@ -57,7 +59,7 @@ pub fn vector_operator(mut cx: *FnCtx, token: Tok, vt: i64, result_ty: i64, a: i
 
 // The first element's address and the length of the slice or array of
 // type ty at `value` (its address), read when called.
-fn lower_elements(mut cx: *FnCtx, ty: i64, value: i64, len: &mut i64) -> i64 {
+pub fn lower_elements(mut cx: *FnCtx, ty: i64, value: i64, len: &mut i64) -> i64 {
     unsafe {
         if is_slice(ty) {
             *len = ir_load(cx, TY_U64, value, 8);
@@ -97,10 +99,11 @@ fn lower_lane_index(mut cx: *FnCtx, index: i64, vt: i64) -> i64 {
     idx
 }
 
-// The constant value of IR value v (-1 when not a constant).
-fn const_lane(mut cx: *FnCtx, v: i64) -> i64 {
+// The constant value of IR value v when it is a lane of a vector of
+// `lanes` lanes (-1 when not a constant).
+fn const_lane(mut cx: *FnCtx, v: i64, lanes: i64) -> i64 {
     unsafe {
-        if cx.insts[v].op == Op::Const && cx.insts[v].imm >= 0 && cx.insts[v].imm < 16 {
+        if cx.insts[v].op == Op::Const && cx.insts[v].imm >= 0 && cx.insts[v].imm < lanes {
             return cx.insts[v].imm;
         }
         -1
@@ -111,6 +114,9 @@ pub fn lower_vecop(mut cx: *FnCtx, n: i64) -> i64 {
     unsafe {
         let kind = NODES[n].x;
         let vt = NODES[n].y;
+        if is_wide(vt) {
+            return lower_wide_vecop(cx, n);
+        }
         let elem = vec_elem(vt);
         let lanes = vec_lanes(vt);
         let esize = type_size(elem);
@@ -124,6 +130,13 @@ pub fn lower_vecop(mut cx: *FnCtx, n: i64) -> i64 {
                 }
             }
             return vec_result(cx, v, vt);
+        }
+        if kind == VK_FROM_BITS {
+            // (0.19) a register-preserving conversion (the allocator gives
+            // the result its operand's register)
+            let e = child(n, 0);
+            let a = vec_operand(cx, e);
+            return vec_result(cx, vec_cast(cx, a, NODES[e].ty, vt), vt);
         }
         if kind == VK_LOAD {
             let addr = lower_vector_address(cx, child(n, 0), child(n, 1), vt);
@@ -142,12 +155,10 @@ pub fn lower_vecop(mut cx: *FnCtx, n: i64) -> i64 {
             let x = vec_operand(cx, child(n, 0));
             let y = vec_operand(cx, child(n, 1));
             let ty = NODES[child(n, 0)].ty;
-            let v = emit_ir(cx, Op::VSel, ty, a, x, 0);
-            cx.insts[v].c = y;
-            return vec_result(cx, v, ty);
+            return vec_result(cx, vec_select(cx, ty, a, x, y), ty);
         }
         let idx = lower_lane_index(cx, child(n, 0), vt);
-        let lane = const_lane(cx, idx);
+        let lane = const_lane(cx, idx, lanes);
         if kind == VK_LANE {
             if lane >= 0 {
                 return emit_ir(cx, Op::VExt, ir_type(elem), a, 0, lane);
@@ -163,6 +174,214 @@ pub fn lower_vecop(mut cx: *FnCtx, n: i64) -> i64 {
             return vec_result(cx, emit_ir(cx, Op::VIns, vt, a, x, lane), vt);
         }
         let base = vec_result(cx, a, vt);
+        let at = ir_binary(cx, Op::Add, TY_U64, base,
+            ir_binary(cx, Op::Mul, TY_U64, idx, ir_const(cx, esize, TY_U64)));
+        ir_store(cx, ir_type(elem), at, x, 0);
+        base
+    }
+}
+
+// Vector value a of type `from` as type `to` (the same size): the value
+// itself, or a register-preserving Conv.
+fn vec_cast(mut cx: *FnCtx, a: i64, from: i64, to: i64) -> i64 {
+    if from == to {
+        return a;
+    }
+    let c = emit_ir(cx, Op::Conv, to, a, 0, 0);
+    unsafe { cx.insts[c].imm2 = from; }
+    c
+}
+
+// (mask m) select x or y, vectors of type ty.
+fn vec_select(mut cx: *FnCtx, ty: i64, m: i64, x: i64, y: i64) -> i64 {
+    let v = emit_ir(cx, Op::VSel, ty, m, x, 0);
+    unsafe { cx.insts[v].c = y; }
+    v
+}
+
+// ---- 256-bit vectors (0.19) ----
+//
+// No function has 256-bit registers yet (none on AArch64; on x86-64 the
+// avx ones are T5's), so lowering legalizes a 256-bit vector into its two
+// 128-bit halves (vector_half): every operation is two, on the halves at
+// offsets 0 and 16, and its value is two SSA values (scalar replacement
+// takes a 256-bit slot as two leaves, back/abi.tach). The back ends never
+// see a 256-bit type.
+
+pub fn is_wide(vt: i64) -> bool {
+    type_size(vt) == 32
+}
+
+// The halves of 256-bit vector expression e: the low one, the high one in
+// *hi (both read before anything after e is evaluated).
+fn wide_operand(mut cx: *FnCtx, e: i64, hi: &mut i64) -> i64 {
+    unsafe {
+        let addr = lower_operand(cx, e);
+        let half = vector_half(NODES[e].ty);
+        let lo = ir_load(cx, half, addr, 0);
+        *hi = ir_load(cx, half, addr, 16);
+        lo
+    }
+}
+
+// The address of a new slot holding the 256-bit vector of halves lo, hi.
+fn wide_result(mut cx: *FnCtx, lo: i64, hi: i64, vt: i64) -> i64 {
+    let base = ir_slot_addr(cx, new_slot_for(cx, vt));
+    let half = vector_half(vt);
+    ir_store(cx, half, base, lo, 0);
+    ir_store(cx, half, base, hi, 16);
+    base
+}
+
+// lhs <token> rhs on vector expressions (of any width): the address of the
+// result, of type result_ty.
+pub fn lower_vector_binary(mut cx: *FnCtx, token: Tok, lhs: i64, rhs: i64, result_ty: i64)
+    -> i64 {
+    unsafe {
+        let vt = NODES[lhs].ty;
+        if !is_wide(vt) {
+            let a = vec_operand(cx, lhs);
+            let b = vec_operand(cx, rhs);
+            return vec_result(cx, vector_operator(cx, token, vt, result_ty, a, b), result_ty);
+        }
+        let mut ah = 0;
+        let mut bh = 0;
+        let al = wide_operand(cx, lhs, &mut ah);
+        let bl = wide_operand(cx, rhs, &mut bh);
+        let half = vector_half(vt);
+        let rhalf = vector_half(result_ty);
+        let lo = vector_operator(cx, token, half, rhalf, al, bl);
+        let hi = vector_operator(cx, token, half, rhalf, ah, bh);
+        wide_result(cx, lo, hi, result_ty)
+    }
+}
+
+// -operand, a vector of type ty: the address of the result.
+pub fn lower_vector_negate(mut cx: *FnCtx, operand: i64, ty: i64) -> i64 {
+    if !is_wide(ty) {
+        let a = vec_operand(cx, operand);
+        return vec_result(cx, emit_ir(cx, Op::VNeg, ty, a, 0, 0), ty);
+    }
+    let mut hi = 0;
+    let lo = wide_operand(cx, operand, &mut hi);
+    let half = vector_half(ty);
+    wide_result(cx, emit_ir(cx, Op::VNeg, half, lo, 0, 0), emit_ir(cx, Op::VNeg, half, hi, 0, 0),
+        ty)
+}
+
+// The value of `value`, the right side of a compound assignment to a
+// vector (a 256-bit one's high half in *hi).
+pub fn vector_assign_value(mut cx: *FnCtx, value: i64, hi: &mut i64) -> i64 {
+    unsafe {
+        if is_wide(NODES[value].ty) {
+            return wide_operand(cx, value, hi);
+        }
+    }
+    vec_operand(cx, value)
+}
+
+// The vector at addr (of type ty) <token>= v (hi: a 256-bit one's high
+// half).
+pub fn vector_assign_store(mut cx: *FnCtx, token: Tok, ty: i64, addr: i64, v: i64, hi: i64) {
+    if !is_wide(ty) {
+        let old = ir_load(cx, ty, addr, 0);
+        ir_store(cx, ty, addr, vector_operator(cx, token, ty, ty, old, v), 0);
+        return;
+    }
+    let half = vector_half(ty);
+    for k in 0..2 {
+        let old = ir_load(cx, half, addr, 16 * k);
+        ir_store(cx, half, addr, vector_operator(cx, token, half, half, old, if k == 0 { v }
+            else { hi }), 16 * k);
+    }
+}
+
+// A VecOp on a 256-bit vector type: its operations on the halves.
+fn lower_wide_vecop(mut cx: *FnCtx, n: i64) -> i64 {
+    unsafe {
+        let kind = NODES[n].x;
+        let vt = NODES[n].y;
+        let half = vector_half(vt);
+        let elem = vec_elem(vt);
+        let lanes = vec_lanes(vt);
+        let hl = lanes / 2;
+        let esize = type_size(elem);
+        if kind == VK_NEW || kind == VK_SPLAT {
+            let first = lower_operand(cx, child(n, 0));
+            let mut lo = emit_ir(cx, Op::VSplat, half, first, 0, 0);
+            if kind == VK_SPLAT {
+                return wide_result(cx, lo, lo, vt);
+            }
+            for i in 1..hl {
+                lo = emit_ir(cx, Op::VIns, half, lo, lower_operand(cx, child(n, i)), i);
+            }
+            let next = lower_operand(cx, child(n, hl));
+            let mut hi = emit_ir(cx, Op::VSplat, half, next, 0, 0);
+            for i in hl + 1..lanes {
+                hi = emit_ir(cx, Op::VIns, half, hi, lower_operand(cx, child(n, i)), i - hl);
+            }
+            return wide_result(cx, lo, hi, vt);
+        }
+        if kind == VK_FROM_BITS {
+            let e = child(n, 0);
+            let mut hi = 0;
+            let lo = wide_operand(cx, e, &mut hi);
+            let from = vector_half(NODES[e].ty);
+            return wide_result(cx, vec_cast(cx, lo, from, half), vec_cast(cx, hi, from, half), vt);
+        }
+        if kind == VK_LOAD {
+            let addr = lower_vector_address(cx, child(n, 0), child(n, 1), vt);
+            return wide_result(cx, ir_load(cx, half, addr, 0), ir_load(cx, half, addr, 16), vt);
+        }
+        let mut ah = 0;
+        let al = wide_operand(cx, NODES[n].a, &mut ah);
+        if kind == VK_STORE {
+            let addr = lower_vector_address(cx, child(n, 0), child(n, 1), vt);
+            ir_store(cx, half, addr, al, 0);
+            ir_store(cx, half, addr, ah, 16);
+            return 0;
+        }
+        if kind == VK_SUM {
+            if is_float(elem) {
+                // (pairwise, as -O0 sums: the low half's sum plus the high's)
+                let a = emit_ir(cx, Op::VSum, ir_type(elem), al, 0, 0);
+                let b = emit_ir(cx, Op::VSum, ir_type(elem), ah, 0, 0);
+                return ir_binary(cx, Op::Add, ir_type(elem), a, b);
+            }
+            let both = emit_ir(cx, Op::VBin, half, al, ah, Op::Add as i64);
+            return emit_ir(cx, Op::VSum, ir_type(elem), both, 0, 0);
+        }
+        if kind == VK_SELECT {
+            let ty = NODES[child(n, 0)].ty;
+            let mut xh = 0;
+            let mut yh = 0;
+            let xl = wide_operand(cx, child(n, 0), &mut xh);
+            let yl = wide_operand(cx, child(n, 1), &mut yh);
+            let th = vector_half(ty);
+            return wide_result(cx, vec_select(cx, th, al, xl, yl), vec_select(cx, th, ah, xh, yh),
+                ty);
+        }
+        let idx = lower_lane_index(cx, child(n, 0), vt);
+        let lane = const_lane(cx, idx, lanes);
+        if kind == VK_LANE {
+            if lane >= 0 {
+                return emit_ir(cx, Op::VExt, ir_type(elem), if lane < hl { al } else { ah }, 0,
+                    lane % hl);
+            }
+            let base = wide_result(cx, al, ah, vt);
+            let at = ir_binary(cx, Op::Add, TY_U64, base,
+                ir_binary(cx, Op::Mul, TY_U64, idx, ir_const(cx, esize, TY_U64)));
+            return ir_load(cx, ir_type(elem), at, 0);
+        }
+        // VK_WITH
+        let x = lower_operand(cx, child(n, 1));
+        if lane >= 0 {
+            if lane < hl {
+                return wide_result(cx, emit_ir(cx, Op::VIns, half, al, x, lane), ah, vt);
+            }
+            return wide_result(cx, al, emit_ir(cx, Op::VIns, half, ah, x, lane - hl), vt);
+        }
+        let base = wide_result(cx, al, ah, vt);
         let at = ir_binary(cx, Op::Add, TY_U64, base,
             ir_binary(cx, Op::Mul, TY_U64, idx, ir_const(cx, esize, TY_U64)));
         ir_store(cx, ir_type(elem), at, x, 0);

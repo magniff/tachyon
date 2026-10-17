@@ -1,0 +1,109 @@
+// EXPECT: find 3 15 -1
+// EXPECT: qsub 0 0 0 0 0 0 0 0 3 6 9 12 15 18 21 24
+// EXPECT: add+eq 1 4 6 10 13 16 19 22 25 28 31 34 37 40 43 46
+// EXPECT: ext 10 13 16 19 22 25 28 31 34 37 40 43 46 1 4 7
+// EXPECT: tbl 13 22 31 40 1 0 0 0 0 0 0 0 0 0 0 0
+// EXPECT: max 46 0
+// EXPECT: crc 3641114083 3641114083
+// EXPECT: ones 16
+// EXPECT: has true false false
+// (0.19 Phase 0) std::arch's AArch64 seed intrinsics, at every level: each
+// is one instruction (the ASM lines), the loads' and stores' checks are
+// those of v.load(s, i), detect() of a feature that is not known takes
+// the fallback (the same answer).
+// CHECK-OPT: 2
+// ASM(aarch64-macos): crc32cx w
+// ASM(aarch64-macos): cmeq v
+// ASM(aarch64-macos): shrn v
+// ASM(aarch64-macos): uqsub v
+// ASM(aarch64-macos): ext v
+// ASM(aarch64-macos): tbl v
+// ASM(aarch64-macos): umaxv b31
+// ASM(aarch64-linux): cmeq v
+// ASM(aarch64-linux): shrn v
+// ASM(aarch64-linux): uqsub v
+// ASM(aarch64-linux): ext v
+// ASM(aarch64-linux): tbl v
+// ASM(aarch64-linux): umaxv b31
+use std::arch::{count_ones, detect, has};
+use std::arch::aarch64::{
+    __crc32cd, uint8x16_t, vaddq_u8, vceqq_u8, vdupq_n_u8, vextq_u8, vget_lane_u64, vld1q_u8,
+    vmaxvq_u8, vqsubq_u8, vqtbl1q_u8, vreinterpretq_u16_u8, vshrn_n_u16, vst1q_u8,
+};
+
+// The first i with s[i] == b among s[0..16], or -1: the NEON movemask
+// (four bits per byte).
+fn find16(s: [u8], b: u8) -> i64 {
+    let eq = vceqq_u8(vld1q_u8(s, 0), vdupq_n_u8(b));
+    let mask = vget_lane_u64(v1u64::from_bits(vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)), 0);
+    if mask == 0 {
+        return -1;
+    }
+    let mut n = 0;
+    let mut m = mask;
+    while (m & 1) == 0 {
+        m = m >> 1;
+        n += 1;
+    }
+    n / 4
+}
+
+fn show(label: [u8], v: uint8x16_t) {
+    let mut out: [u8; 16] = [0; 16];
+    vst1q_u8(out[..], 0, v);
+    print(f"{label}");
+    for i in 0..16 {
+        print(f" {out[i]}");
+    }
+    println("");
+}
+
+// CRC-32C, a byte at a time (the fallback).
+fn crc32c_bytes(crc: u32, x: u64) -> u32 {
+    let mut c = crc;
+    for k in 0..8 {
+        c = c ^ ((x >> (8 * k) as u64) & 0xff) as u32;
+        for _ in 0..8 {
+            c = if (c & 1) != 0 { (c >> 1) ^ 0x82f63b78 } else { c >> 1 };
+        }
+    }
+    c
+}
+
+// (0.19 T6: not inlined, and called with two sets of arguments, so that
+// the crc is not folded: the instruction is what is checked)
+#[inline(never)]
+fn crc_step(crc: u32, x: u64) -> u32 {
+    if detect("crc") {
+        return __crc32cd(crc, x);
+    }
+    crc32c_bytes(crc, x)
+}
+
+fn main() {
+    // (another architecture compiles the rest, never runs it)
+    if !has("neon") {
+        println("not aarch64");
+        return;
+    }
+    let mut buf: [u8; 16] = [0; 16];
+    for i in 0..16 {
+        buf[i] = (i * 3 + 1) as u8;
+    }
+    let s = buf[..];
+    println(f"find {find16(s, 10)} {find16(s, 46)} {find16(s, 2)}");
+    let a = vld1q_u8(s, 0);
+    show("qsub", vqsubq_u8(a, vdupq_n_u8(22)));
+    show("add+eq", vaddq_u8(a, vceqq_u8(vdupq_n_u8(2), vqsubq_u8(vdupq_n_u8(9), a))));
+    show("ext", vextq_u8(a, a, 3));
+    show("tbl", vqtbl1q_u8(vextq_u8(a, a, 3), vld1q_u8(s, 0)));
+    println(f"max {vmaxvq_u8(a)} {vmaxvq_u8(vdupq_n_u8(0))}");
+    let zero = crc_step(0, 0);
+    println(
+        f"crc {crc_step(0xffffffff, 0x0102030405060708) + zero} {crc32c_bytes(0xffffffff, 0x0102030405060708)}");
+    println(f"ones {count_ones(0xff00ff)}");
+    let neon = has("neon");
+    let avx2 = has("avx2");
+    let aes = detect("x86_64.aes");
+    println(f"has {neon} {avx2} {aes}");
+}

@@ -1,0 +1,303 @@
+// The virtual modules std::arch, std::arch::aarch64 and std::arch::x86_64
+// (0.19, docs/design/arch.md §2.1). When a program names `arch` (and std),
+// the loader (front/modules: load_modules) calls load_arch_modules, which
+// makes the three modules with a source each: the vendor types of the
+// architecture's module (ACLE's as aliases of the portable vectors,
+// Intel's __m128i ... as aliases of distinct opaque types), and one
+// declaration per intrinsic the program's tokens name, nothing else:
+//
+//     #[intrinsic(ID)]
+//     pub fn vqsubq_u8(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t;
+//
+// A declaration has no body (the parser takes `;` after #[intrinsic]); a
+// `bits.*` intrinsic has std's function of its count as its body, which a
+// target without the instruction calls. Their sources are `<std::arch>`,
+// `<std::arch::aarch64>` and `<std::arch::x86_64>`; each architecture's
+// `raw` submodule holds the pointer forms of its memory intrinsics, unsafe
+// (`raw::vld1q_u8(p: *u8)`, raw_declaration).
+
+use crate::arch::{
+    ARCH_AARCH64, ARCH_EXT_FEATURES, ARCH_PORTABLE, ARCH_USED, ARCH_X86_64, FORM_BITS, INTRS,
+    INTR_COUNT, MEM_LOAD, MEM_STORE, intr_param_is_const, intr_param_name, intr_ret_text,
+    intrinsic_named,
+};
+use crate::arch::table::{load_insns, load_table, param_type_text};
+use crate::base::{
+    FILES, FILE_COUNT, IntVec, add_source, buf_bytes, buf_int, buf_new, buf_str, intern_c, sym_text,
+};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok, lex_range};
+use crate::front::modules::{STD_MODULE, add_module};
+use crate::middle::ir::{BITS_LEADING, BITS_ONES};
+
+// The sources' text range in SRC, for the parser's #[intrinsic] (accepted
+// only there): [ARCH_SRC_START, ARCH_SRC_END).
+pub static mut ARCH_SRC_START: i64 = -1;
+pub static mut ARCH_SRC_END: i64 = -1;
+// The modules (-1 before they are made).
+pub static mut ARCH_MODULE: i64 = -1;
+pub static mut A64_MODULE: i64 = -1;
+pub static mut X86_MODULE: i64 = -1;
+// (T8) Intrinsics a query names (tools/query/intrinsics.tach), as C
+// strings (interned here, after the program's keywords): declared
+// even when the program does not name them, so `query show vqsubq_u8`
+// finds one.
+pub static mut QUERY_WANTED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Whether position pos is in a virtual module's source.
+pub fn in_arch_source(pos: i64) -> bool {
+    unsafe { ARCH_SRC_START >= 0 && pos >= ARCH_SRC_START && pos < ARCH_SRC_END }
+}
+
+// The modules, when the program names `arch` and std; once.
+pub fn load_arch_modules() {
+    unsafe {
+        if STD_MODULE < 0 || ARCH_MODULE >= 0 {
+            return;
+        }
+        let arch = intern_c(c"arch");
+        // (0.19 T3: #[multiversion] needs std::arch::detect for its dispatcher)
+        let multiversion = intern_c(c"multiversion");
+        let mut named = false;
+        let mut versions = false;
+        for i in 0..TOK_COUNT {
+            if TOKS[i].kind == Tok::Ident && TOKS[i].value as i64 == multiversion && i >= 2
+                && TOKS[i - 1].kind == Tok::LBracket && TOKS[i - 2].kind == Tok::Hash {
+                versions = true;
+                named = true;
+            }
+            if TOKS[i].value as i64 == arch && TOKS[i].kind == Tok::Ident {
+                named = true;
+            }
+        }
+        if !named && QUERY_WANTED.count == 0 {
+            return;
+        }
+        ARCH_USED = true;
+        load_table();
+        // (the assemblers' tables too: read-only once codegen starts)
+        load_insns();
+        // The intrinsics the tokens name, each once.
+        let mut wanted = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut seen = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for _ in 0..INTR_COUNT {
+            seen.push(0);
+        }
+        for i in 0..TOK_COUNT {
+            if TOKS[i].kind == Tok::Ident {
+                let id = intrinsic_named(TOKS[i].value as i64);
+                if id >= 0 && seen.data[id] == 0 {
+                    seen.data[id] = 1;
+                    wanted.push(id);
+                }
+            }
+        }
+        for k in 0..QUERY_WANTED.count {
+            let id = intrinsic_named(intern_c(QUERY_WANTED.data[k] as *u8));
+            if id >= 0 && seen.data[id] == 0 {
+                seen.data[id] = 1;
+                wanted.push(id);
+            }
+        }
+        if versions {
+            let id = intrinsic_named(intern_c(c"detect"));
+            if id >= 0 && seen.data[id] == 0 {
+                seen.data[id] = 1;
+                wanted.push(id);
+            }
+        }
+        ARCH_MODULE = add_module(arch, STD_MODULE, true);
+        A64_MODULE = add_module(intern_c(c"aarch64"), ARCH_MODULE, true);
+        X86_MODULE = add_module(intern_c(c"x86_64"), ARCH_MODULE, true);
+        let raw = intern_c(c"raw");
+        let a64_raw = add_module(raw, A64_MODULE, true);
+        let x86_raw = add_module(raw, X86_MODULE, true);
+        let first = add_arch_source(c"<std::arch>", ARCH_MODULE, ARCH_PORTABLE, &wanted, false);
+        ARCH_SRC_START = first;
+        add_arch_source(c"<std::arch::aarch64>", A64_MODULE, ARCH_AARCH64, &wanted, false);
+        add_arch_source(c"<std::arch::x86_64>", X86_MODULE, ARCH_X86_64, &wanted, false);
+        add_arch_source(c"<std::arch::aarch64::raw>", a64_raw, ARCH_AARCH64, &wanted, true);
+        add_arch_source(c"<std::arch::x86_64::raw>", x86_raw, ARCH_X86_64, &wanted, true);
+        ARCH_SRC_END = FILES[FILE_COUNT - 1].end;
+    }
+}
+
+// Module m's source: its types and the declarations of the wanted
+// intrinsics of architecture `arch` (raw: the pointer forms of the memory
+// ones, 0.19 T1), lexed; the start of its text.
+fn add_arch_source(path: *u8, m: i64, arch: i64, wanted: *IntVec, raw: bool) -> i64 {
+    unsafe {
+        let text = buf_new();
+        if arch == ARCH_AARCH64 {
+            acle_types(text);
+        } else if arch == ARCH_X86_64 {
+            intel_types(text);
+        }
+        for k in 0..(*wanted).count {
+            let id = (*wanted).data[k];
+            if INTRS[id].arch != arch {
+                continue;
+            }
+            if !raw {
+                declaration(text, id);
+                ARCH_EXT_FEATURES |= INTRS[id].features;
+            } else if INTRS[id].mem == MEM_LOAD || INTRS[id].mem == MEM_STORE {
+                raw_declaration(text, id);
+            }
+        }
+        let start = add_source(path, text);
+        FILES[FILE_COUNT - 1].module = m;
+        lex_range(start, FILES[FILE_COUNT - 1].end, last: false);
+        start
+    }
+}
+
+// ACLE's vector types: aliases of the portable ones (poly lanes are
+// unsigned; p128 is v2u64, low lane first), and their tuples
+// (`uint8x16x2_t = (v16u8, v16u8)`, x3, x4: 0.19 T1).
+fn acle_types(text: i64) {
+    unsafe {
+        let widths: [i64; 4] = [8, 16, 32, 64];
+        for s in 0..4 {
+            let prefix = if s == 0 { c"int" } else if s == 1 { c"uint" } else if s == 2 { c"poly" }
+                else { c"float" };
+            let letter = if s == 0 { c"i" } else if s == 3 { c"f" } else { c"u" };
+            for w in 0..4 {
+                let bits = widths[w];
+                if (s == 2 && bits == 32) || (s == 3 && bits < 32) {
+                    continue;
+                }
+                for half in 0..2 {
+                    let lanes = (if half == 0 { 64 } else { 128 }) / bits;
+                    for count in 1..5 {
+                        buf_str(text, c"pub type ");
+                        buf_str(text, prefix);
+                        buf_int(text, bits);
+                        buf_str(text, c"x");
+                        buf_int(text, lanes);
+                        if count > 1 {
+                            buf_str(text, c"x");
+                            buf_int(text, count);
+                        }
+                        buf_str(text, if count > 1 { c"_t = (" } else { c"_t = " });
+                        for k in 0..count {
+                            if k > 0 {
+                                buf_str(text, c", ");
+                            }
+                            buf_str(text, c"v");
+                            buf_int(text, lanes);
+                            buf_str(text, letter);
+                            buf_int(text, bits);
+                        }
+                        buf_str(text, if count > 1 { c");\n" } else { c";\n" });
+                    }
+                }
+            }
+        }
+        buf_str(text, c"pub type p8 = u8;\npub type p16 = u16;\npub type p64 = u64;\n");
+        buf_str(text, c"pub type p128 = v2u64;\n");
+    }
+}
+
+// Intel's vector types: distinct opaque types of 16 and 32 bytes, with no
+// operators and no lanes (front/types.tach: their names are not
+// spellable but here).
+fn intel_types(text: i64) {
+    unsafe {
+        let names: [*u8; 6] = [c"__m128i", c"__m128", c"__m128d", c"__m256i", c"__m256",
+            c"__m256d"];
+        for i in 0..6 {
+            buf_str(text, c"pub type ");
+            buf_str(text, names[i]);
+            buf_str(text, c" = __tachyon");
+            buf_str(text, names[i]);
+            buf_str(text, c";\n");
+        }
+    }
+}
+
+// `#[intrinsic(ID)] pub fn NAME(PARAMS) -> RET;` (an immediate is an i64;
+// a bits.* intrinsic has std's function as its body).
+fn declaration(text: i64, id: i64) {
+    unsafe {
+        buf_str(text, c"#[intrinsic(");
+        buf_int(text, id);
+        buf_str(text, c")]\npub fn ");
+        buf_bytes(text, sym_text(INTRS[id].name));
+        buf_str(text, c"(");
+        for k in 0..INTRS[id].nparams {
+            if k > 0 {
+                buf_str(text, c", ");
+            }
+            buf_bytes(text, sym_text(intr_param_name(id, k)));
+            buf_str(text, c": ");
+            if intr_param_is_const(id, k) {
+                buf_str(text, c"i64");
+            } else {
+                buf_bytes(text, param_type_text(INTRS[id].params + k));
+            }
+        }
+        buf_str(text, c")");
+        let ret = intr_ret_text(id);
+        if ret.len > 0 {
+            buf_str(text, c" -> ");
+            buf_bytes(text, ret);
+        }
+        if INTRS[id].form == FORM_BITS {
+            let f = INTRS[id].form_arg;
+            buf_str(text, if f == BITS_ONES { c" { super::count_ones(" }
+                else if f == BITS_LEADING { c" { super::leading_zeros(" }
+                else { c" { super::trailing_zeros(" });
+            buf_bytes(text, sym_text(intr_param_name(id, 0)));
+            buf_str(text, c") }\n");
+            return;
+        }
+        buf_str(text, c";\n");
+    }
+}
+
+// (0.19 T1) The pointer form of memory intrinsic id, for raw::NAME:
+// `#[intrinsic(ID)] pub unsafe fn NAME(p: *T, ...) -> RET;`, the slice and
+// its index replaced by a pointer: to the lanes' type (`*u8` for
+// `vld1q_u8`), or to the vector for Intel's integer forms
+// (`_mm_loadu_si128(p: *__m128i)`), as the vendors declare them. Lowering
+// and -O0 tell it by its parameter count (one fewer).
+fn raw_declaration(text: i64, id: i64) {
+    unsafe {
+        let s = INTRS[id].mem_param;
+        let slice = param_type_text(INTRS[id].params + s);
+        let elem = slice[1..slice.len - 1];
+        let vector = if INTRS[id].mem == MEM_LOAD { intr_ret_text(id) }
+            else { param_type_text(INTRS[id].params + s + 2) };
+        buf_str(text, c"#[intrinsic(");
+        buf_int(text, id);
+        buf_str(text, c")]\npub unsafe fn ");
+        buf_bytes(text, sym_text(INTRS[id].name));
+        buf_str(text, c"(");
+        let mut first = true;
+        for k in 0..INTRS[id].nparams {
+            if k == s + 1 {
+                continue;
+            }
+            if !first {
+                buf_str(text, c", ");
+            }
+            first = false;
+            if k == s {
+                buf_str(text, c"p: *");
+                buf_bytes(text, if INTRS[id].arch == ARCH_X86_64 && elem == "u8" { vector }
+                    else { elem });
+                continue;
+            }
+            buf_bytes(text, sym_text(intr_param_name(id, k)));
+            buf_str(text, c": ");
+            buf_bytes(text, param_type_text(INTRS[id].params + k));
+        }
+        buf_str(text, c")");
+        let ret = intr_ret_text(id);
+        if ret.len > 0 {
+            buf_str(text, c" -> ");
+            buf_bytes(text, ret);
+        }
+        buf_str(text, c";\n");
+    }
+}
