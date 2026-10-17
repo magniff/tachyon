@@ -366,6 +366,24 @@ def instructions():
                             ("uqrshrn", 1, 19, "shrn"), ("sshll", 0, 20, "shl"),
                             ("ushll", 1, 20, "shl")]:
         insn(mn, cls, shimm(u, opc), "%s Vd.T, Vn.T, #shift" % mn)
+    # dot products, widening, the high-half narrowing forms
+    insn("sdot", "same3", 0x0e809400, "sdot Vd.4s, Vn.16b, Vm.16b")
+    insn("sdot", "elem", 0x0f80e000, "sdot Vd.4s, Vn.16b, Vm.4b[i]")
+    insn("udot", "same3", 0x2e809400, "udot Vd.4s, Vn.16b, Vm.16b")
+    insn("udot", "elem", 0x2f80e000, "udot Vd.4s, Vn.16b, Vm.4b[i]")
+    for mn, opc in [("addl", 0), ("addw", 1), ("subl", 2), ("subw", 3), ("mlal", 8), ("mlsl", 10), ("mull", 12)]:
+        for u, pre in [(0, "s"), (1, "u")]:
+            for two in ["", "2"]:
+                if pre + mn + two == "umlal":
+                    # (the chain's umlal by element stays the chain's: diff3
+                    # wants a vector third operand)
+                    pass
+                insn(pre + mn + two, "diff3", diff3(u, opc), "%s Vd.Ta, Vn.Tb, Vm.Tb" % (pre + mn + two))
+    for mn, u in [("sshll2", 0), ("ushll2", 1)]:
+        insn(mn, "shl", shimm(u, 20), "%s Vd.Ta, Vn.Tb, #shift" % mn)
+    for mn, u, opc in [("shrn2", 0, 16), ("rshrn2", 0, 17), ("sqshrn2", 0, 18), ("uqshrn2", 1, 18),
+                       ("sqshrun2", 1, 16)]:
+        insn(mn, "shrn", shimm(u, opc), "%s Vd.Tb, Vn.Ta, #shift" % mn)
     # crypto
     for mn, cls, b in [("aese", "rr", 0x4e284800), ("aesd", "rr", 0x4e285800), ("aesmc", "rr", 0x4e286800),
                        ("aesimc", "rr", 0x4e287800), ("sha1c", "rrr", 0x5e000000), ("sha1p", "rrr", 0x5e001000),
@@ -933,8 +951,188 @@ def crypto():
          "the carry-less product of a[k] and b[k], 16 bits", None, "lanewise carry-less multiply, 8 x 8 -> 16 bits")
 
 
+def dotprod():
+    section("Dot products")
+    for t in ["u32", "s32"]:
+        src = "u8" if t == "u32" else "s8"
+        mn = "udot" if t == "u32" else "sdot"
+        for q in [True, False]:
+            acc, v = vv(t, q), vv(src, q)
+            line(name("vdot{q}_{t}", t, q), "dotprod", "(acc: %s, a: %s, b: %s) -> %s" % (acc, v, v, acc), "intr",
+                 "%s <d>.%s, <a>.%s, <b>.%s" % (mn, arr(t, q), arr(src, q), arr(src, q)), "pure tied=acc", None,
+                 "dot", "r[k] = acc[k] + a[4 * k] * b[4 * k] + a[4 * k + 1] * b[4 * k + 1] + a[4 * k + 2] * b[4 * k + 2]"
+                 " + a[4 * k + 3] * b[4 * k + 3]", None,
+                 "each 32-bit lane of acc plus the dot product of its four bytes of a and b")
+        for q in [True, False]:
+            for bq in [True, False]:
+                acc, v = vv(t, q), vv(src, q)
+                bt = vv(src, bq)
+                n = 4 if bq else 2
+                nm = "vdot%s_lane%s_%s" % ("q" if q else "", "q" if bq else "", t)
+                line(nm, "dotprod", "(acc: %s, a: %s, b: %s, lane: const 0..=%d) -> %s" % (acc, v, bt, n - 1, acc),
+                     "intr", "%s <d>.%s, <a>.%s, <b>.4b[<lane>]" % (mn, arr(t, q), arr(src, q)), "pure tied=acc",
+                     None, "dot", "r[k] = acc[k] + a[4 * k] * b[4 * lane] + a[4 * k + 1] * b[4 * lane + 1]"
+                     " + a[4 * k + 2] * b[4 * lane + 2] + a[4 * k + 3] * b[4 * lane + 3]", None,
+                     "each 32-bit lane of acc plus the dot product of its four bytes of a and b's group `lane`")
+
+
+def widening():
+    section("Widening")
+
+    def wcast(e, t):
+        # (a 64-bit unsigned result from narrower lanes: in u64)
+        return "((%s) as u64)" % e if dom(widen(t)) == "u64" else e
+
+    for op, sign, mnb in [("addl", "+", "addl"), ("subl", "-", "subl")]:
+        for t in I6:
+            w = widen(t)
+            mn = ("s" if kind(t) == "s" else "u") + mnb
+            line("v%s_%s" % (op, t), "neon", "(a: %s, b: %s) -> %s" % (vv(t, False), vv(t, False), vv(w, True)), "intr",
+                 "%s <d>.%s, <a>.%s, <b>.%s" % (mn, arr(w, True), arr(t, False), arr(t, False)), "pure", None,
+                 "lanes.%s" % op, "r[k] = a[k] %s b[k]" % sign, None, "lanewise a %s b, widened" % sign)
+            n = lanes(w, True)
+            line("v%s_high_%s" % (op, t), "neon", "(a: %s, b: %s) -> %s" % (vv(t, True), vv(t, True), vv(w, True)), "intr",
+                 "%s2 <d>.%s, <a>.%s, <b>.%s" % (mn, arr(w, True), arr(t, True), arr(t, True)), "pure", None,
+                 "lanes.%s" % op, "r[k] = a[k + %d] %s b[k + %d]" % (n, sign, n), None,
+                 "lanewise a %s b of the high halves, widened" % sign)
+    for op, sign, mnb in [("addw", "+", "addw"), ("subw", "-", "subw")]:
+        for t in I6:
+            w = widen(t)
+            mn = ("s" if kind(t) == "s" else "u") + mnb
+            line("v%s_%s" % (op, t), "neon", "(a: %s, b: %s) -> %s" % (vv(w, True), vv(t, False), vv(w, True)), "intr",
+                 "%s <d>.%s, <a>.%s, <b>.%s" % (mn, arr(w, True), arr(w, True), arr(t, False)), "pure", None,
+                 "lanes.%s" % op, "r[k] = a[k] %s %s" % (sign, wcast("b[k]", t)), None,
+                 "lanewise a %s b, b widened" % sign)
+    for t in I6:
+        w = widen(t)
+        mn = ("s" if kind(t) == "s" else "u") + "mull"
+        line("vmull_%s" % t, "neon", "(a: %s, b: %s) -> %s" % (vv(t, False), vv(t, False), vv(w, True)), "intr",
+             "%s <d>.%s, <a>.%s, <b>.%s" % (mn, arr(w, True), arr(t, False), arr(t, False)), "pure commutative", None,
+             "lanes.mull", "r[k] = a[k] * b[k]", None, "lanewise a * b, widened (exact)")
+        n = lanes(w, True)
+        line("vmull_high_%s" % t, "neon", "(a: %s, b: %s) -> %s" % (vv(t, True), vv(t, True), vv(w, True)), "intr",
+             "%s2 <d>.%s, <a>.%s, <b>.%s" % (mn, arr(w, True), arr(t, True), arr(t, True)), "pure commutative", None,
+             "lanes.mull", "r[k] = a[k + %d] * b[k + %d]" % (n, n), None, "lanewise a * b of the high halves, widened")
+    for op, sign in [("mlal", "+"), ("mlsl", "-")]:
+        for t in I6:
+            w = widen(t)
+            mn = ("s" if kind(t) == "s" else "u") + op
+            line("v%s_%s" % (op, t), "neon",
+                 "(a: %s, b: %s, c: %s) -> %s" % (vv(w, True), vv(t, False), vv(t, False), vv(w, True)), "intr",
+                 "%s <d>.%s, <b>.%s, <c>.%s" % (mn, arr(w, True), arr(t, False), arr(t, False)), "pure tied=a", None,
+                 "lanes.%s" % op, "r[k] = a[k] %s %s" % (sign, wcast("b[k] * c[k]", t)), None,
+                 "lanewise a %s b * c, the product widened" % sign)
+            n = lanes(w, True)
+            line("v%s_high_%s" % (op, t), "neon",
+                 "(a: %s, b: %s, c: %s) -> %s" % (vv(w, True), vv(t, True), vv(t, True), vv(w, True)), "intr",
+                 "%s2 <d>.%s, <b>.%s, <c>.%s" % (mn, arr(w, True), arr(t, True), arr(t, True)), "pure tied=a", None,
+                 "lanes.%s" % op, "r[k] = a[k] %s %s" % (sign, wcast("b[k + %d] * c[k + %d]" % (n, n), t)), None,
+                 "lanewise a %s b * c of the high halves, widened" % sign)
+    for t, q in qd(I6):
+        w = widen(t)
+        mn = ("s" if kind(t) == "s" else "u") + "addlp"
+        line(name("vpaddl{q}_{t}", t, q), "neon", "(a: %s) -> %s" % (vv(t, q), vv(w, q)), "intr",
+             "%s <d>.%s, <a>.%s" % (mn, arr(w, q), arr(t, q)), "pure", None, "pairwise.addl",
+             "r[k] = a[2 * k] + a[2 * k + 1]", None, "the sums of adjacent pairs of lanes, widened")
+    for t, q in qd(I6):
+        w = widen(t)
+        mn = ("s" if kind(t) == "s" else "u") + "adalp"
+        line(name("vpadal{q}_{t}", t, q), "neon", "(a: %s, b: %s) -> %s" % (vv(w, q), vv(t, q), vv(w, q)), "intr",
+             "%s <d>.%s, <b>.%s" % (mn, arr(w, q), arr(t, q)), "pure tied=a", None, "pairwise.adal",
+             "r[k] = a[k] + %s" % wcast("(b[2 * k] + b[2 * k + 1])", t), None,
+             "a plus the sums of adjacent pairs of b's lanes, widened")
+    for t in I6:
+        w = widen(t)
+        mn = ("s" if kind(t) == "s" else "u") + "shll"
+        line("vmovl_%s" % t, "neon", "(a: %s) -> %s" % (vv(t, False), vv(w, True)), "intr",
+             "%s <d>.%s, <a>.%s, #0" % (mn, arr(w, True), arr(t, False)), "pure", None, "lanes.movl", "r[k] = a[k]",
+             None, "each lane widened")
+        n = lanes(w, True)
+        line("vmovl_high_%s" % t, "neon", "(a: %s) -> %s" % (vv(t, True), vv(w, True)), "intr",
+             "%s2 <d>.%s, <a>.%s, #0" % (mn, arr(w, True), arr(t, True)), "pure", None, "lanes.movl",
+             "r[k] = a[k + %d]" % n, None, "each lane of the high half widened")
+        line("vshll_n_%s" % t, "neon", "(a: %s, n: const 0..=%d) -> %s" % (vv(t, False), bits(t) - 1, vv(w, True)), "intr",
+             "%s <d>.%s, <a>.%s, #<n>" % (mn, arr(w, True), arr(t, False)), "pure", None, "lanes.shll",
+             "r[k] = %s" % ("(a[k] as u64) << (n as u64)" if dom(w) == "u64" else "a[k] << n"), None,
+             "each lane widened, then shifted left by n (n < the lane's bits)")
+    section("Narrowing, high halves")
+    for op, mn_s, mn_u, types, sem_of in [
+            ("movn", "xtn", "xtn", ["s16", "u16", "s32", "u32", "s64", "u64"], None),
+            ("qmovn", "sqxtn", "uqxtn", ["s16", "u16", "s32", "u32", "s64", "u64"], None),
+            ("qmovun", "sqxtun", "sqxtun", ["s16", "s32", "s64"], None)]:
+        for t in types:
+            nt = narrow(t) if op != "qmovun" else "u%d" % (bits(t) // 2)
+            mn = (mn_s if kind(t) == "s" else mn_u) + "2"
+            n = lanes(nt, False)
+            line("v%s_high_%s" % (op, t), "neon", "(lo: %s, a: %s) -> %s" % (vv(nt, False), vv(t, True), vv(nt, True)),
+                 "intr", "%s <d>.%s, <a>.%s" % (mn, arr(nt, True), arr(t, True)), "pure tied=lo", None,
+                 "lanes.%s" % op, high_sem(op, t, nt), None,
+                 "lo, then a narrowed as v%s_%s does, as the high half" % (op, t))
+    for op, mn_s, mn_u, types in [("shrn", "shrn", "shrn", ["s16", "u16", "s32", "u32", "s64", "u64"]),
+                                  ("rshrn", "rshrn", "rshrn", ["s16", "u16", "s32", "u32", "s64", "u64"]),
+                                  ("qshrn", "sqshrn", "uqshrn", ["s16", "u16", "s32", "u32", "s64", "u64"]),
+                                  ("qshrun", "sqshrun", "sqshrun", ["s16", "s32", "s64"])]:
+        for t in types:
+            nt = narrow(t) if op != "qshrun" else "u%d" % (bits(t) // 2)
+            mn = (mn_s if kind(t) == "s" else mn_u) + "2"
+            line("v%s_high_n_%s" % (op, t), "neon",
+                 "(lo: %s, a: %s, n: const 1..=%d) -> %s" % (vv(nt, False), vv(t, True), bits(t) // 2, vv(nt, True)),
+                 "intr", "%s <d>.%s, <a>.%s, #<n>" % (mn, arr(nt, True), arr(t, True)), "pure tied=lo", None,
+                 "lanes.%s" % op, high_sem(op, t, nt), None,
+                 "lo, then a shifted and narrowed as v%s_n_%s does, as the high half" % (op, t))
+
+
+def high_sem(op, t, nt):
+    """lo, then a's lanes narrowed by op (movn qmovn qmovun shrn rshrn
+    qshrn qshrun): the semantics of a `_high` narrowing intrinsic."""
+    n = lanes(nt, False)
+    x = "a[k - %d]" % n
+    u64 = dom(t) == "u64"
+    sh = "(%s >> (n as u64))" % x if u64 else "(%s >> n)" % x
+    if op == "movn":
+        e = x
+    elif op == "qmovn":
+        e = "clamp(%s, %s, %s)" % (x, tmin(nt), tmax(nt)) if kind(t) == "s" else "min(%s, %s%s)" % (x, tmax(nt), "u64" if u64 else "")
+    elif op == "qmovun":
+        e = "clamp(%s, 0, %s)" % (x, tmax(nt))
+    elif op == "shrn":
+        e = sh
+    elif op == "rshrn":
+        e = ("(%s + ((%s >> ((n - 1) as u64)) & 1u64))" % (sh, x) if u64
+             else "((%s + (1 << (n - 1))) >> n)" % x)
+    elif op == "qshrn":
+        e = "clamp(%s, %s, %s)" % (sh, tmin(nt), tmax(nt)) if kind(t) == "s" else "min(%s, %s%s)" % (sh, tmax(nt), "u64" if u64 else "")
+    else:
+        e = "clamp(%s, 0, %s)" % (sh, tmax(nt))
+    if u64:
+        e = "(%s as i64)" % e
+    return "r[k] = if k < %d { lo[k] } else { %s }" % (n, e)
+
+
+def lanes_dup_shift():
+    section("Lane duplicates, shifts by vector")
+    for t, q in qd(A + ["p8"]):
+        for src_q in [False, True]:
+            n = lanes(t, src_q)
+            nm = "vdup%s_lane%s_%s" % ("q" if q else "", "q" if src_q else "", t)
+            if bits(t) == 64 and not q:
+                insn = "mov <d:d>, <a>.d[<lane>]"
+            else:
+                insn = "dup <d>.%s, <a>.%s[<lane>]" % (arr(t, q), letter(t))
+            line(nm, "neon", "(a: %s, lane: const 0..=%d) -> %s" % (vv(t, src_q), n - 1, vv(t, q)), "intr", insn,
+                 "pure", None, "splat.lane", "r[k] = a[lane]", None, "every lane a[lane]")
+    for t, q in qd(I):
+        mn = "sshl" if kind(t) == "s" else "ushl"
+        st = vv("s" + t[1:], q)
+        line(name("vshl{q}_{t}", t, q), "neon", "(a: %s, b: %s) -> %s" % (vv(t, q), st, vv(t, q)), "intr",
+             "%s <d>.%s, <a>.%s, <b>.%s" % (mn, arr(t, q), arr(t, q), arr(t, q)), "pure", None, "lanes.shlv",
+             "a[k] shifted left by b[k]'s low byte, signed (right when negative)", None,
+             "lanewise a << b, by the signed low byte of b: right (%s) when negative" %
+             ("arithmetic" if kind(t) == "s" else "logical"))
+
+
 FAMILIES = [loads_stores, build_lanes, casts, arithmetic, compare, logic, shifts, horizontal, narrowing,
-            permutes, bit_ops, crc, crypto]
+            permutes, bit_ops, crc, crypto, dotprod, widening, lanes_dup_shift]
 
 
 def def_text():
@@ -953,7 +1151,7 @@ def def_text():
 
 # The mnemonics used with SIMD scalar operands (64-bit lanes of a 64-bit
 # vector): a sibling line of the scalar class, the vector bits | 0x50000000.
-SCALAR_MNS = set("""sqadd uqadd sqsub uqsub cmtst cmgt cmhi cmge cmhs cmeq cmle cmlt neg abs sqabs
+SCALAR_MNS = set("""sqadd uqadd sqsub uqsub sshl ushl cmtst cmgt cmhi cmge cmhs cmeq cmle cmlt neg abs sqabs
     sqneg fcmeq fcmgt fcmge fcmlt fcmle sshr ushr ssra usra srshr urshr srsra ursra sri shl sli
     sqshlu sqshl uqshl""".split())
 SCALAR_CLASS = {"same3": "same3s", "misc2": "misc2s", "misc2f": "misc2fs", "shrn": "shrns", "shl": "shls"}
