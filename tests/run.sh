@@ -665,6 +665,13 @@ case arch-gen in
         [ -n "$arch_levels" ] || arch_levels=0,2
         "$ROOT/tests/arch/gen.sh" -c "$COMPILER" -o "$WORK/arch-gen" -O "$arch_levels" --check >"$WORK/arch-gen.out" 2>&1 & ;;
 esac
+# (0.19 T5) The x86-64 encoder against cc's assembler, byte for byte
+# (tests/arch/enc.sh: every instruction of insn_x86.def, extreme registers,
+# both widths, memory forms).
+case arch-enc in
+    *"$FILTER"*)
+        "$ROOT/tests/arch/enc.sh" -c "$COMPILER" -o "$WORK/arch-enc" >"$WORK/arch-enc.out" 2>&1 & ;;
+esac
 
 # The slots: JOBS of them in a FIFO of our own, or the shared ones of
 # $TACHYON_JOBSERVER (see above).
@@ -882,6 +889,21 @@ case arch-gen in
         else
             echo "arch-gen fail" >>"$TALLY"
             { echo "FAIL arch-gen:"; sed 's/^/    /' "$WORK/arch-gen.out"; } >>"$FAILURES"
+        fi
+        count=$((count + 1))
+        ;;
+esac
+
+# The x86-64 encodings (0.19 T5): tests/arch/enc.sh (run above); category
+# "arch-enc".
+case arch-enc in
+    *"$FILTER"*)
+        wait
+        if grep -q '^enc: ok' "$WORK/arch-enc.out"; then
+            echo "arch-enc pass" >>"$TALLY"
+        else
+            echo "arch-enc fail" >>"$TALLY"
+            { echo "FAIL arch-enc:"; sed 's/^/    /' "$WORK/arch-enc.out"; } >>"$FAILURES"
         fi
         count=$((count + 1))
         ;;
