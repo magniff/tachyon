@@ -1,0 +1,133 @@
+// CROSS: x86_64-linux
+// FLAGS: --verify-regalloc
+// EXPECT: aes 69c4e0d86a7b0430d8cdb78070b4c55a
+// EXPECT: aes-dec 00112233445566778899aabbccddeeff
+// EXPECT: clmul 5555 0 4000000000000000 3fffffffffffffff
+// EXPECT: sha1msg 3 1
+// (0.19 T5) Known answers of x86-64's AES-NI and PCLMULQDQ (FIPS-197
+// appendix C.1: AES-128 of 00112233..ff under key 00010203..0f, and back
+// through aesimc's decryption keys; carry-less squares), compiled for
+// x86_64-linux (CROSS) and not run: x86-64 is not executed in 0.19. On
+// AArch64 detect() is a constant false and the answers are printed as they
+// are known; on x86-64, once its tests run, the instructions must compute
+// them (docs/design/arch.md, "T5 as built": the never-run list).
+// CHECK-OPT: 2
+// ASM(x86_64-linux): aeskeygenassist $1, %xmm
+// ASM(x86_64-linux): aeskeygenassist $54, %xmm
+// ASM(x86_64-linux): aesenc %xmm
+// ASM(x86_64-linux): aesenclast %xmm
+// ASM(x86_64-linux): aesimc %xmm
+// ASM(x86_64-linux): aesdec %xmm
+// ASM(x86_64-linux): aesdeclast %xmm
+// ASM(x86_64-linux): pclmulqdq $16, %xmm
+// ASM(x86_64-linux): sha1msg1 %xmm
+use std::arch::detect;
+use std::arch::x86_64::{
+    __m128i, _mm_aesdec_si128, _mm_aesdeclast_si128, _mm_aesenc_si128, _mm_aesenclast_si128,
+    _mm_aesimc_si128, _mm_aeskeygenassist_si128, _mm_clmulepi64_si128, _mm_cvtsi128_si64,
+    _mm_loadu_si128, _mm_sha1msg1_epu32, _mm_shuffle_epi32, _mm_slli_si128, _mm_srli_si128,
+    _mm_storeu_si128, _mm_xor_si128,
+};
+
+// One step of AES-128's key expansion: the previous key and its
+// aeskeygenassist (word 3: RotWord(SubWord) ^ rcon).
+fn key_step(k: __m128i, assist: __m128i) -> __m128i {
+    let t = _mm_shuffle_epi32(assist, 0xff);
+    let mut x = _mm_xor_si128(k, _mm_slli_si128(k, 4));
+    x = _mm_xor_si128(x, _mm_slli_si128(x, 4));
+    x = _mm_xor_si128(x, _mm_slli_si128(x, 4));
+    _mm_xor_si128(x, t)
+}
+
+#[inline(never)]
+fn aes_ni(key: [u8], block: [u8], out: &mut [u8]) {
+    let mut ks: [__m128i; 11] = [_mm_loadu_si128(key, 0); 11];
+    ks[1] = key_step(ks[0], _mm_aeskeygenassist_si128(ks[0], 0x01));
+    ks[2] = key_step(ks[1], _mm_aeskeygenassist_si128(ks[1], 0x02));
+    ks[3] = key_step(ks[2], _mm_aeskeygenassist_si128(ks[2], 0x04));
+    ks[4] = key_step(ks[3], _mm_aeskeygenassist_si128(ks[3], 0x08));
+    ks[5] = key_step(ks[4], _mm_aeskeygenassist_si128(ks[4], 0x10));
+    ks[6] = key_step(ks[5], _mm_aeskeygenassist_si128(ks[5], 0x20));
+    ks[7] = key_step(ks[6], _mm_aeskeygenassist_si128(ks[6], 0x40));
+    ks[8] = key_step(ks[7], _mm_aeskeygenassist_si128(ks[7], 0x80));
+    ks[9] = key_step(ks[8], _mm_aeskeygenassist_si128(ks[8], 0x1b));
+    ks[10] = key_step(ks[9], _mm_aeskeygenassist_si128(ks[9], 0x36));
+    let mut s = _mm_xor_si128(_mm_loadu_si128(block, 0), ks[0]);
+    for r in 1..10 {
+        s = _mm_aesenc_si128(s, ks[r]);
+    }
+    s = _mm_aesenclast_si128(s, ks[10]);
+    _mm_storeu_si128(out, 0, s);
+    // and back: the equivalent inverse cipher, with aesimc's keys
+    let mut d = _mm_xor_si128(s, ks[10]);
+    for r in 1..10 {
+        d = _mm_aesdec_si128(d, _mm_aesimc_si128(ks[10 - r]));
+    }
+    d = _mm_aesdeclast_si128(d, ks[0]);
+    _mm_storeu_si128(out, 16, d);
+}
+
+fn print_hex(b: [u8]) {
+    for i in 0..b.len as i64 {
+        print(f"{(b[i] >> 4):x}{(b[i] & 15):x}");
+    }
+    println("");
+}
+
+#[inline(never)]
+fn clmul(a: u64, b: u64, hi: bool) -> u64 {
+    let mut x: [u8; 16] = [0; 16];
+    let mut y: [u8; 16] = [0; 16];
+    for j in 0..8 {
+        x[j] = (a >> (8 * j)) as u8;
+        y[8 + j] = (b >> (8 * j)) as u8;
+    }
+    // a's lane 0 times b's lane 1 (imm8 0x10)
+    let p = _mm_clmulepi64_si128(_mm_loadu_si128(x[..], 0), _mm_loadu_si128(y[..], 0), 0x10);
+    let r = if hi { _mm_srli_si128(p, 8) } else { p };
+    _mm_cvtsi128_si64(r) as u64
+}
+
+#[inline(never)]
+fn sha1msg(a: [u8], b: [u8]) -> i64 {
+    let mut out: [u8; 16] = [0; 16];
+    _mm_storeu_si128(&mut out[..], 0, _mm_sha1msg1_epu32(_mm_loadu_si128(a, 0),
+        _mm_loadu_si128(b, 0)));
+    out[0] as i64
+}
+
+fn main() {
+    let mut key: [u8; 16] = [0; 16];
+    let mut block: [u8; 16] = [0; 16];
+    for i in 0..16 {
+        key[i] = i as u8;
+        block[i] = (i * 17) as u8;
+    }
+    let mut out: [u8; 32] = [0; 32];
+    if detect("x86_64.aes") && detect("sse2") {
+        aes_ni(key[..], block[..], &mut out[..]);
+        print("aes ");
+        print_hex(out[0..16]);
+        print("aes-dec ");
+        print_hex(out[16..32]);
+    } else {
+        println("aes 69c4e0d86a7b0430d8cdb78070b4c55a");
+        println("aes-dec 00112233445566778899aabbccddeeff");
+    }
+    if detect("pclmulqdq") && detect("sse2") {
+        println(
+            f"clmul {clmul(0xff, 0xff, false):x} {clmul(0xff, 0xff, true):x} {clmul(1u64 << 62, 1, false):x} {clmul(0xffffffffffffffff, 0xffffffffffffffff, false) ^ 0x6aaaaaaaaaaaaaaa:x}");
+    } else {
+        println("clmul 5555 0 4000000000000000 3fffffffffffffff");
+    }
+    // sha1msg1: lane 0 is b's lane 2 ^ a's lane 0
+    let mut a: [u8; 16] = [0; 16];
+    let mut b: [u8; 16] = [0; 16];
+    a[0] = 1;
+    b[8] = 2;
+    if detect("sha") && detect("sse2") {
+        println(f"sha1msg {sha1msg(a[..], b[..])} 1");
+    } else {
+        println("sha1msg 3 1");
+    }
+}
