@@ -1,0 +1,127 @@
+// std::collections::hash_set: HashSet (0.20), a set of T on the Swiss
+// table (RawTable), as HashMap is.
+
+use std::{Allocator, Ambient, Drop, Eq, Gpa, Hash, Iterator, Option};
+use super::raw_table::{RawIter, RawTable};
+
+// ---- HashSet (0.20) ----
+
+// A set of values of T: `insert` adds one (false when it was there),
+// `contains`, `remove`; `iter()` gives them in slot order, the same in
+// every run.
+#[sealed]
+pub struct HashSet<T: Hash + Eq, A: Allocator = Gpa> {
+    table: RawTable<T, A>,
+}
+
+// The hash of an element.
+#[inline]
+fn elem_hash<T: Hash>(x: &T) -> u64 {
+    x.hash()
+}
+
+impl<T: Hash + Eq, A: Allocator> HashSet<T, A> {
+    // An empty set on allocator a.
+    pub fn new_in(a: A) -> HashSet<T, A> {
+        HashSet { table: RawTable::new_in(a) }
+    }
+
+    // An empty set on allocator a with room for n values.
+    pub fn with_capacity_in(n: i64, a: A) -> HashSet<T, A> {
+        HashSet { table: RawTable::with_capacity_in(n, a) }
+    }
+
+    #[inline]
+    pub fn len(self: &HashSet<T, A>) -> i64 {
+        self.table.len()
+    }
+
+    #[inline]
+    pub fn is_empty(self: &HashSet<T, A>) -> bool {
+        self.table.len() == 0
+    }
+
+    pub fn contains(self: &HashSet<T, A>, x: T) -> bool {
+        self.table.find(x.hash(), |e: &T| *e == x) >= 0
+    }
+
+    // Adds x; false when the set had it already (x is dropped then).
+    #[stores(x)]
+    pub fn insert(self: &mut HashSet<T, A>, x: T) -> bool {
+        let h = x.hash();
+        self.table.reserve(1, |e: &T| elem_hash(e));
+        let r = self.table.find_or_find_insert_slot(h, |e: &T| *e == x);
+        if r >= 0 {
+            return false;
+        }
+        self.table.insert_in_slot(h, ~r, x);
+        true
+    }
+
+    // Removes x; false when the set did not have it.
+    pub fn remove(self: &mut HashSet<T, A>, x: T) -> bool {
+        let i = self.table.find(x.hash(), |e: &T| *e == x);
+        if i < 0 {
+            return false;
+        }
+        self.table.erase(i);
+        true
+    }
+
+    // The values, in slot order, until the set changes.
+    #[views(self)]
+    pub fn iter(self: &HashSet<T, A>) -> HashSetIter<T> {
+        let data = if self.table.len() == 0 { 0 as *T } else { self.table.bucket_ptr() };
+        HashSetIter { it: self.table.iter(), data: data, left: self.table.len() }
+    }
+
+    // Removes every value; keeps the memory.
+    pub fn clear(self: &mut HashSet<T, A>) {
+        self.table.clear();
+    }
+
+    // Drops the values and gives the memory back; the set is empty.
+    pub fn free(self: &mut HashSet<T, A>) {
+        self.table.free();
+    }
+
+    pub fn allocator(self: &HashSet<T, A>) -> A {
+        self.table.allocator()
+    }
+}
+
+impl<T: Hash + Eq, A: Allocator> Drop for HashSet<T, A> {
+    #[inline]
+    fn drop(self: &mut HashSet<T, A>) {
+        self.table.free();
+    }
+}
+
+impl<T: Hash + Eq, A: Allocator + Ambient> HashSet<T, A> {
+    #[ambient("HashSet::new_in(gpa)")]
+    pub fn new() -> HashSet<T, A> {
+        HashSet::new_in(A::ambient())
+    }
+}
+
+// `s.iter()`: the values (copies), a view of the set.
+pub struct HashSetIter<T> { it: RawIter, data: *T, left: i64 }
+
+impl<T> Iterator for HashSetIter<T> {
+    type Item = T;
+
+    #[inline]
+    fn next(self: &mut HashSetIter<T>) -> Option<T> {
+        let i = self.it.next_index();
+        if i < 0 {
+            return Option::None;
+        }
+        self.left -= 1;
+        Option::Some(unsafe { self.data[i] })
+    }
+
+    #[inline]
+    fn exact_len(self: &HashSetIter<T>) -> i64 {
+        self.left
+    }
+}

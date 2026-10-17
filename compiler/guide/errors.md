@@ -31,7 +31,7 @@ let s: String = String::new();
 error[type error] unknown type 'String' | help: text is `[u8]`, a slice of bytes (string literals are one); text you build is a `std::Buf` (`Buf::new_in(gpa)`, `b.push_str(s)`, `b.as_slice()` is its `[u8]`) | try: [u8]
 ```
 The `try:` is the type to write. Also `str` (`[u8]`), `char` (`u8`),
-`Box`, `Rc` (`*T`), `HashSet` (`HashMap<K, bool>`), `BTreeMap`,
+`Box`, `Rc` (`*T`), `BTreeMap`,
 `VecDeque`, `RefCell`.
 
 ```tach

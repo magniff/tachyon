@@ -20,6 +20,7 @@ Vec<Tok>::push	views() stores(x) declared
 Vec<u8>::push	views()
 Vec<u64>::push	views()
 Vec<Vec<u64>>::push	views()
+Vec<i64>::push	views()
 $ views crate --why
 crate::first_word	views(s) declared
   why: declared (#[views], #[stores]): callers use the declaration, and the body is checked against it

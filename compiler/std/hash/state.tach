@@ -1,0 +1,132 @@
+// std::hash::state: the hasher builders (0.20).
+// The BuildHashers of std::hash: what a table hashes its keys with.
+// FixedState is the default: the same hashes in every run and on every
+// target, so a map iterates in the same order everywhere (tests,
+// same-output, -O0 against -O2). RandomState seeds foldhash per process,
+// which makes the hashes, and the order, change from run to run; it is
+// not proof against an attacker who sees outputs. SipHashState keys
+// SipHash-1-3 with random keys: for keys an attacker chooses. Each has
+// `build_hasher` (BuildHasher's) and `hash_u64` and `hash_bytes`, the hash
+// of a u64 and of a [u8] as Hash writes them (length first, as Rust's
+// [u8]).
+
+use std::panic;
+use std::sys::sys_getentropy;
+use super::fold::{
+    FOLD_ARBITRARY3, FoldHasher, FoldSeeds, fold_hash_bytes, fold_hash_bytes_fixed, fold_mul,
+};
+use super::sip::SipHasher13;
+
+// ---- Hasher builders (0.20 implementation) ----
+
+// 8 random bytes from the system (std::sys's getentropy).
+fn hash_entropy() -> u64 {
+    let mut b = [0u8; 8];
+    if sys_getentropy(&mut b[..]).is_err() {
+        unsafe { panic(c"hash: the system gives no random bytes") }
+    }
+    let mut x = 0u64;
+    for i in 0..8 {
+        x |= (b[i] as u64) << (8 * i) as u64;
+    }
+    x
+}
+
+// foldhash with fixed seeds: the default.
+pub struct FixedState {
+    seed: u64,
+}
+
+impl FixedState {
+    // foldhash's FixedState::default().
+    #[inline]
+    pub fn new() -> FixedState {
+        FixedState { seed: FOLD_ARBITRARY3 }
+    }
+
+    // foldhash's FixedState::with_seed(seed): another fixed state.
+    #[inline]
+    pub fn with_seed(seed: u64) -> FixedState {
+        FixedState { seed: seed ^ FOLD_ARBITRARY3 }
+    }
+
+    #[inline]
+    pub fn build_hasher(self: &FixedState) -> FoldHasher {
+        FoldHasher::with_seeds(self.seed, FoldSeeds::fixed())
+    }
+
+    // The hash of the u64 x: `write_u64(x)`, `finish()`.
+    #[inline]
+    pub fn hash_u64(self: &FixedState, x: u64) -> u64 {
+        fold_mul(x ^ self.seed, FoldSeeds::fixed().s0)
+    }
+
+    // The hash of the bytes s: `write_u64(s.len)`, `write(s)`, `finish()`.
+    #[inline]
+    pub fn hash_bytes(self: &FixedState, s: [u8]) -> u64 {
+        fold_hash_bytes_fixed(self.seed, s)
+    }
+}
+
+// foldhash with random seeds, drawn when it is made (io).
+pub struct RandomState {
+    seed: u64,
+    seeds: FoldSeeds,
+}
+
+impl RandomState {
+    pub fn new() -> RandomState {
+        RandomState { seed: hash_entropy(), seeds: FoldSeeds::from_u64(hash_entropy()) }
+    }
+
+    #[inline]
+    pub fn build_hasher(self: &RandomState) -> FoldHasher {
+        FoldHasher::with_seeds(self.seed, self.seeds)
+    }
+
+    #[inline]
+    pub fn hash_u64(self: &RandomState, x: u64) -> u64 {
+        fold_mul(x ^ self.seed, self.seeds.s0)
+    }
+
+    #[inline]
+    pub fn hash_bytes(self: &RandomState, s: [u8]) -> u64 {
+        fold_hash_bytes(self.seed, &self.seeds, s)
+    }
+}
+
+// SipHash-1-3 keyed by two u64s.
+pub struct SipHashState {
+    k0: u64,
+    k1: u64,
+}
+
+impl SipHashState {
+    // Random keys (io): Rust's RandomState.
+    pub fn new() -> SipHashState {
+        SipHashState { k0: hash_entropy(), k1: hash_entropy() }
+    }
+
+    // The given keys: the same hashes in every run.
+    pub fn with_keys(k0: u64, k1: u64) -> SipHashState {
+        SipHashState { k0: k0, k1: k1 }
+    }
+
+    #[inline]
+    pub fn build_hasher(self: &SipHashState) -> SipHasher13 {
+        SipHasher13::new_with_keys(self.k0, self.k1)
+    }
+
+    pub fn hash_u64(self: &SipHashState, x: u64) -> u64 {
+        let mut h = self.build_hasher();
+        h.write_u64(x);
+        h.finish()
+    }
+
+    pub fn hash_bytes(self: &SipHashState, s: [u8]) -> u64 {
+        let mut h = self.build_hasher();
+        h.write_u64(s.len as u64);
+        h.write(s);
+        h.finish()
+    }
+}

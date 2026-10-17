@@ -1,7 +1,7 @@
 // std::iter: the Iterator trait, its adapters and its sources (0.20: from flat/iter.tach).
 
 use std::{Allocator, Eq, Gpa, Hash, Option, Vec};
-use std::collections::{HashMap, SLOT_FULL};
+use std::collections::{HashMap, RawIter};
 use std::slice::{swap_at, swap_raw};
 
 pub trait Iterator {
@@ -610,22 +610,22 @@ impl<T> Iterator for SliceRefIter<T> {
 }
 
 // `m.iter()`: (key, value) in slot order, until the map changes. (0.17) A
-// view of the map: `states` is its slots' states.
-pub struct HashMapIter<K, V> { keys: *K, values: *V, states: [u8], pos: i64, left: i64 }
+// view of the map: (0.20) its table's iterator, a view of its control
+// bytes, and its buckets.
+pub struct HashMapIter<K, V> { it: RawIter, data: *(K, V), left: i64 }
 
 impl<K, V> Iterator for HashMapIter<K, V> {
     type Item = (K, V);
 
     #[inline]
     fn next(self: &mut HashMapIter<K, V>) -> Option<(K, V)> {
-        for i in self.pos..self.states.len {
-            self.pos = i + 1;
-            if unsafe { self.states.ptr[i] } == SLOT_FULL {
-                self.left -= 1;
-                return Option::Some((unsafe { self.keys[i] }, unsafe { self.values[i] }));
-            }
+        let i = self.it.next_index();
+        if i < 0 {
+            return Option::None;
         }
-        Option::None
+        self.left -= 1;
+        let e = unsafe { &self.data[i] };
+        Option::Some((unsafe { (*e).0 }, unsafe { (*e).1 }))
     }
 
     #[inline]
@@ -637,10 +637,11 @@ impl<K, V> Iterator for HashMapIter<K, V> {
     fn fold<B, F: FnMut(B, (K, V)) -> B>(self: HashMapIter<K, V>, init: B, f: F) -> B {
         let mut g = f;
         let mut acc = init;
-        for i in self.pos..self.states.len {
-            if unsafe { self.states.ptr[i] } == SLOT_FULL {
-                acc = g(acc, (unsafe { self.keys[i] }, unsafe { self.values[i] }));
-            }
+        let mut it = self.it;
+        for _ in 0..self.left {
+            let i = it.next_index();
+            let e = unsafe { &self.data[i] };
+            acc = g(acc, (unsafe { (*e).0 }, unsafe { (*e).1 }));
         }
         acc
     }
@@ -700,10 +701,9 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
     #[inline]
     #[views(self)]
     pub fn iter(self: &HashMap<K, V, A>) -> HashMapIter<K, V> {
-        HashMapIter {
-            keys: self.keys, values: self.values, states: unsafe { self.states[0..self.cap] },
-            pos: 0, left: self.len,
-        }
+        let t = self.raw_table();
+        let data = if t.len() == 0 { 0 as *(K, V) } else { t.bucket_ptr() };
+        HashMapIter { it: t.iter(), data: data, left: t.len() }
     }
 
     #[inline]
