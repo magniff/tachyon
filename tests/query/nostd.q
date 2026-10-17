@@ -2,13 +2,13 @@
 ## the program does not define, its source by `std`, grep in it, a
 ## show with the `use` line a program needs.
 $ def std::read_line Vec::push
-std::read_line	../../compiler/std/io.tach:39:8	fn	pub fn read_line<A: Allocator>(line: &mut Buf<A>) -> Result<bool, IoError>
+std::read_line	../../compiler/std/flat/io.tach:39:8	fn	pub fn read_line<A: Allocator>(line: &mut Buf<A>) -> Result<bool, IoError>
 std::Vec::push	../../compiler/std/std.tach:238:12	method	pub fn push(self: &mut Vec<T, A>, x: T)
 $ def read_line twice
-std::read_line	../../compiler/std/io.tach:39:8	fn	pub fn read_line<A: Allocator>(line: &mut Buf<A>) -> Result<bool, IoError>
+std::read_line	../../compiler/std/flat/io.tach:39:8	fn	pub fn read_line<A: Allocator>(line: &mut Buf<A>) -> Result<bool, IoError>
 crate::twice	nostd/main.tach:4:4	fn	fn twice(x: i64) -> i64	effects: none
 $ show std::print_int
-// std::print_int	../../compiler/std/fmt.tach:43-51	effects: io global panic
+// std::print_int	../../compiler/std/flat/fmt.tach:43-51	effects: io global panic
 // use std::print_int;
 #[inline(never)]
 pub fn print_int(v: i64) {

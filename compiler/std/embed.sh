@@ -5,10 +5,12 @@
 #
 # std is a crate of its own (0.20): its root module is compiler/std/std.tach
 # and the files appended to it, in this order (ROOT_FILES, those of them
-# that exist): iter.tach (0.14), io.tach, fmt.tach, convert.tach and
-# clone.tach (0.15), alloc.tach (0.16), values.tach (0.17), test.tach,
-# nonnull.tach, fuzz.tach (0.18), collections.tach (0.18.1), arch.tach
-# (0.19): the files of the one module std was before 0.20. A `mod NAME;` line of the root's files is the module std::NAME,
+# that exist): flat/iter.tach (0.14), flat/io.tach, flat/fmt.tach,
+# flat/convert.tach and flat/clone.tach (0.15), flat/alloc.tach (0.16),
+# flat/values.tach (0.17), flat/test.tach, flat/nonnull.tach, flat/fuzz.tach
+# (0.18), flat/collections.tach (0.18.1), flat/arch.tach (0.19): the files
+# of the one module std was before 0.20, in flat/ so that std's modules
+# can have their names. A `mod NAME;` line of the root's files is the module std::NAME,
 # in compiler/std/NAME.tach or NAME/mod.tach, and so on down (a module in
 # a.tach has its children in a/, as in any program). The built-in text is
 # the root's files, then each module as `mod NAME { ... }` after its
@@ -35,7 +37,7 @@ tmp=$(mktemp "$out.XXXXXX")
 work=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-embed.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 # std's root module: these files (front/stdtree.tach: std_tree_file).
-ROOT_FILES="std iter io fmt convert clone alloc values test nonnull fuzz collections arch"
+ROOT_FILES="std flat/iter flat/io flat/fmt flat/convert flat/clone flat/alloc flat/values flat/test flat/nonnull flat/fuzz flat/collections flat/arch"
 dir=compiler/std
 text=$work/text
 map=$work/map
