@@ -265,6 +265,11 @@ run_program() {
     dir=$1
     (
         cd "$dir" || exit 1
+        # (0.19: RUN_ENV, a variable for the run: TACHYON_ARCH_DISABLE)
+        if [ -n "${RUN_ENV:-}" ]; then
+            # shellcheck disable=SC2046
+            exec env "$RUN_ENV" ./prog $(cat args) <stdin >stdout 2>stderr
+        fi
         # shellcheck disable=SC2046
         exec ./prog $(cat args) <stdin >stdout 2>stderr
     ) &
@@ -408,6 +413,23 @@ check_case() {
             return 1
         fi
     done <"$dir/stderrs"
+    # (0.19) A program that may test the CPU at run time (std::arch::detect,
+    # #[multiversion]) runs again with every optional feature disabled:
+    # its fallback paths must print the same (docs/design/arch.md §2.5).
+    if grep -q -E 'detect\(|#\[multiversion' "$source"; then
+        RUN_ENV=TACHYON_ARCH_DISABLE=all
+        run_program "$dir"
+        RUN_ENV=
+        trimmed "$dir/stdout" >"$dir/actual"
+        if ! cmp -s "$dir/actual" "$dir/wanted" || [ "$RC" -ne "$expected_exit" ]; then
+            {
+                echo "with TACHYON_ARCH_DISABLE=all (the fallback paths): exit code $RC, stdout"
+                echo "--- expected"; cat "$dir/wanted"; echo
+                echo "--- actual"; cat "$dir/actual"; echo
+            } >"$dir/why"
+            return 1
+        fi
+    fi
     return 0
 }
 
