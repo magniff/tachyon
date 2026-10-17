@@ -1,0 +1,224 @@
+// std::random: a pseudo-random generator (0.20).
+
+use std::panic_str;
+use std::num::mul_high;
+use std::slice::swap_at;
+
+// ---- Random numbers (0.20) ----
+
+// A pseudo-random generator (docs/design/collections-text-io.md §2.6.3,
+// D12, task A7): xoshiro256++ (Blackman and Vigna), 32 bytes of state,
+// with rand 0.9's names. Seeding from a number is pure and the same on
+// every target (`Xoshiro256pp::seed_from_u64`: splitmix64, as rand_xoshiro
+// seeds it, so the outputs match that crate's); seeding from the system's
+// entropy is io (`from_entropy`). Ranges use Lemire's nearly divisionless
+// method: no bias, a division only in about 1 of 2^64/n draws, and the
+// product's high half one umulh (std::num::mul_high).
+
+extern "C" {
+    #[effects(io)]
+    fn getentropy(buf: *u8, len: u64) -> i32;
+}
+
+pub struct Xoshiro256pp {
+    s0: u64,
+    s1: u64,
+    s2: u64,
+    s3: u64,
+}
+
+// One step of splitmix64 on *state: the next output.
+pub fn splitmix64_next(state: &mut u64) -> u64 {
+    *state = *state + 0x9e3779b97f4a7c15u64;
+    let mut z = *state;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9u64;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebu64;
+    z ^ (z >> 31)
+}
+
+impl Xoshiro256pp {
+    // The generator seeded from n through splitmix64 (rand_xoshiro's
+    // seed_from_u64): pure, the same everywhere.
+    pub fn seed_from_u64(n: u64) -> Xoshiro256pp {
+        let mut st = n;
+        let a = splitmix64_next(&mut st);
+        let b = splitmix64_next(&mut st);
+        let c = splitmix64_next(&mut st);
+        let d = splitmix64_next(&mut st);
+        Xoshiro256pp { s0: a, s1: b, s2: c, s3: d }
+    }
+
+    // The generator with this state (not all zero: an all-zero state is
+    // replaced by seed_from_u64(0)'s, as rand_xoshiro does).
+    pub fn from_state(s: [u64; 4]) -> Xoshiro256pp {
+        if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 {
+            return Xoshiro256pp::seed_from_u64(0);
+        }
+        Xoshiro256pp { s0: s[0], s1: s[1], s2: s[2], s3: s[3] }
+    }
+
+    // The generator seeded from the system's entropy (getentropy); panics
+    // when the system has none to give.
+    pub fn from_entropy() -> Xoshiro256pp {
+        let mut b = [0u8; 32];
+        let mut s: [u64; 4] = [0, 0, 0, 0];
+        if !fill_bytes_os(&mut b[..]) {
+            panic_str("from_entropy: the system gave no entropy");
+        }
+        for i in 0..32 {
+            s[i / 8] = s[i / 8] | ((b[i] as u64) << ((i % 8) * 8) as u64);
+        }
+        Xoshiro256pp::from_state(s)
+    }
+
+    // The next 64 random bits.
+    #[inline]
+    pub fn next_u64(self: &mut Xoshiro256pp) -> u64 {
+        let s0 = self.s0;
+        let s3 = self.s3;
+        let sum = s0 + s3;
+        let result = ((sum << 23) | (sum >> 41)) + s0;
+        let t = self.s1 << 17;
+        let s2 = self.s2 ^ s0;
+        let s3b = s3 ^ self.s1;
+        let s1 = self.s1 ^ s2;
+        let s0b = s0 ^ s3b;
+        self.s0 = s0b;
+        self.s1 = s1;
+        self.s2 = s2 ^ t;
+        self.s3 = (s3b << 45) | (s3b >> 19);
+        result
+    }
+
+    // The next 32 random bits (the high half of next_u64, as rand_xoshiro).
+    pub fn next_u32(self: &mut Xoshiro256pp) -> u32 {
+        (self.next_u64() >> 32) as u32
+    }
+
+    // A uniform u64 in [lo, hi); panics when the range is empty.
+    pub fn random_range_u64(self: &mut Xoshiro256pp, lo: u64, hi: u64) -> u64 {
+        if lo >= hi {
+            panic_str("cannot sample empty range");
+        }
+        lo + self.below_u64(hi - lo)
+    }
+
+    // A uniform i64 in [lo, hi); panics when the range is empty.
+    pub fn random_range_i64(self: &mut Xoshiro256pp, lo: i64, hi: i64) -> i64 {
+        if lo >= hi {
+            panic_str("cannot sample empty range");
+        }
+        let n = (hi as u64) - (lo as u64);
+        ((lo as u64) + self.below_u64(n)) as i64
+    }
+
+    // A uniform u64 in [0, n), n > 0: Lemire's method. A draw is rejected
+    // with probability under n / 2^64; after 128 rejections in a row (less
+    // likely than 2^-128) the last one is taken.
+    #[inline]
+    pub fn below_u64(self: &mut Xoshiro256pp, n: u64) -> u64 {
+        let mut x = self.next_u64();
+        let mut lo = x * n;
+        if lo < n {
+            let t = (0u64 - n) % n;
+            for _ in 0..128 {
+                if lo >= t {
+                    break;
+                }
+                x = self.next_u64();
+                lo = x * n;
+            }
+        }
+        mul_high(x, n)
+    }
+
+    // A uniform f64 in [0, 1): 53 random bits.
+    pub fn unit_f64(self: &mut Xoshiro256pp) -> f64 {
+        (self.next_u64() >> 11) as f64 * 0.00000000000000011102230246251565
+    }
+
+    // true with probability p (0 <= p <= 1; panics otherwise).
+    pub fn random_bool(self: &mut Xoshiro256pp, p: f64) -> bool {
+        if !(p >= 0.0 && p <= 1.0) {
+            panic_str("random_bool: p is not in [0, 1]");
+        }
+        if p == 1.0 {
+            return true;
+        }
+        // (p * 2^64 < 2^64)
+        let cut = (p * 18446744073709551616.0) as u64;
+        self.next_u64() < cut
+    }
+
+    // Fills buf with random bytes: each next_u64's bytes, least
+    // significant first.
+    pub fn fill_bytes(self: &mut Xoshiro256pp, buf: &mut [u8]) {
+        let mut i = 0;
+        for _ in 0..(buf.len + 7) / 8 {
+            let mut x = self.next_u64();
+            for _ in 0..8 {
+                if i >= buf.len {
+                    break;
+                }
+                buf[i] = x as u8;
+                x = x >> 8;
+                i += 1;
+            }
+        }
+    }
+
+    // Moves the generator 2^128 steps ahead (xoshiro's jump): for 2^128
+    // non-overlapping sequences.
+    pub fn jump(self: &mut Xoshiro256pp) {
+        let jump: [u64; 4] = [0x180ec6d33cfd0abau64, 0xd5a61266f0c9392cu64,
+            0xa9582618e03fc9aau64, 0x39abdc4529b1661cu64];
+        let mut a = 0u64;
+        let mut b = 0u64;
+        let mut c = 0u64;
+        let mut d = 0u64;
+        for i in 0..4 {
+            for bit in 0..64 {
+                if (jump[i] & (1u64 << bit as u64)) != 0 {
+                    a = a ^ self.s0;
+                    b = b ^ self.s1;
+                    c = c ^ self.s2;
+                    d = d ^ self.s3;
+                }
+                self.next_u64();
+            }
+        }
+        self.s0 = a;
+        self.s1 = b;
+        self.s2 = c;
+        self.s3 = d;
+    }
+}
+
+// Shuffles s uniformly (Fisher–Yates, from the end, as rand's shuffle).
+pub fn shuffle<T>(s: &mut [T], rng: &mut Xoshiro256pp) {
+    let n = s.len;
+    for k in 0..n {
+        let i = n - 1 - k;
+        if i == 0 {
+            break;
+        }
+        let j = rng.below_u64((i + 1) as u64) as i64;
+        swap_at(s, i, j);
+    }
+}
+
+// Fills buf with random bytes from the system (getentropy, 256 bytes a
+// call); false when the system fails. Rust's getrandom.
+pub fn fill_bytes_os(buf: &mut [u8]) -> bool {
+    let mut at = 0;
+    for _ in 0..(buf.len + 255) / 256 {
+        let n = if buf.len - at < 256 { buf.len - at } else { 256 };
+        let rest = &mut buf[at..at + n];
+        // (rest's pointer and length: getentropy writes n <= 256 bytes there)
+        if unsafe { getentropy(rest.ptr, n as u64) } != 0 {
+            return false;
+        }
+        at += n;
+    }
+    true
+}

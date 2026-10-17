@@ -1,0 +1,152 @@
+// EXPECT: x1234 41943041 58720359 3588806011781223 3591011842654386 9228616714210784205 9973669472204895162
+// EXPECT: splitmix 6457827717110365317 3203168211198807973 9817491932198370423 4593380528125082431 16408922859458223821
+// EXPECT: seed42 15021278609987233951 5881210131331364753 18149643915985481100 12933668939759105464
+// EXPECT: jump 118857652418012005 2358633787429415496
+// EXPECT: zero state true
+// EXPECT: ranges in bounds true counts fair true i64 true full true
+// EXPECT: wide true unit true bool true true
+// EXPECT: fill true shuffle permutation true moved true
+// EXPECT: entropy differ true
+// 0.20 (A7): std::random's xoshiro256++ against the reference vectors of
+// its C code (Blackman and Vigna's, as rand_xoshiro tests them) and
+// splitmix64's; Lemire's ranges in bounds and fair over seeded draws;
+// std::num::wide_mul (one umulh at -O2) against known products.
+use std::num::wide_mul;
+use std::random::{Xoshiro256pp, fill_bytes_os, shuffle, splitmix64_next};
+
+fn main() -> i32 {
+    let state: [u64; 4] = [1, 2, 3, 4];
+    let mut g = Xoshiro256pp::from_state(state);
+    print("x1234");
+    for _ in 0..6 {
+        print(f" {g.next_u64()}");
+    }
+    println("");
+    let mut sm = 1234567u64;
+    print("splitmix");
+    for _ in 0..5 {
+        print(f" {splitmix64_next(&mut sm)}");
+    }
+    println("");
+    let mut h = Xoshiro256pp::seed_from_u64(42);
+    print("seed42");
+    for _ in 0..4 {
+        print(f" {h.next_u64()}");
+    }
+    println("");
+    h.jump();
+    println(f"jump {h.next_u64()} {h.next_u64()}");
+    let zs: [u64; 4] = [0, 0, 0, 0];
+    let mut z = Xoshiro256pp::from_state(zs);
+    let mut z0 = Xoshiro256pp::seed_from_u64(0);
+    println(f"zero state {z.next_u64() == z0.next_u64()}");
+
+    // Ranges: in bounds for many seeds and sizes, and fair on [0, 7).
+    let mut inb = true;
+    let mut counts = [0i64; 7];
+    let mut ok_i = true;
+    let mut full = true;
+    for seed in 0..20 {
+        let mut q = Xoshiro256pp::seed_from_u64(seed as u64 * 7919 + 1);
+        for k in 1..200 {
+            let lo = (k * 37) as u64;
+            let hi = lo + k as u64 * k as u64 * 1000003;
+            let v = q.random_range_u64(lo, hi);
+            if v < lo || v >= hi {
+                inb = false;
+            }
+            let w = q.random_range_i64(-(k as i64) * 5, k as i64);
+            if w < -(k as i64) * 5 || w >= k as i64 {
+                ok_i = false;
+            }
+        }
+        for _ in 0..3500 {
+            counts[q.random_range_u64(0, 7) as i64] += 1;
+        }
+        let big = q.random_range_u64(0, 18446744073709551615);
+        if big == 18446744073709551615 {
+            full = false;
+        }
+    }
+    let mut fair = true;
+    for i in 0..7 {
+        // 70000 draws: 10000 expected each, sd about 93
+        if counts[i] < 9500 || counts[i] > 10500 {
+            fair = false;
+        }
+    }
+    println(f"ranges in bounds {inb} counts fair {fair} i64 {ok_i} full {full}");
+
+    let wm = wide_mul(18446744073709551615, 18446744073709551615);
+    let wm2 = wide_mul(0x123456789abcdefu64, 0xfedcba9876543210u64);
+    // 0x123456789abcdef * 0xfedcba9876543210 = 0x121fa00ad77d742_2236d88fe5618cf0
+    let wide = wm.0 == 18446744073709551614 && wm.1 == 1 && wm2.0 == 0x121fa00ad77d742u64
+        && wm2.1 == 0x2236d88fe5618cf0u64;
+    let mut u = Xoshiro256pp::seed_from_u64(3);
+    let mut unit = true;
+    let mut sum = 0.0;
+    for _ in 0..100000 {
+        let v = u.unit_f64();
+        if v < 0.0 || v >= 1.0 {
+            unit = false;
+        }
+        sum += v;
+    }
+    if sum < 49000.0 || sum > 51000.0 {
+        unit = false;
+    }
+    let mut never = true;
+    let mut always = true;
+    for _ in 0..1000 {
+        if u.random_bool(0.0) {
+            never = false;
+        }
+        if !u.random_bool(1.0) {
+            always = false;
+        }
+    }
+    println(f"wide {wide} unit {unit} bool {never} {always}");
+
+    let mut fb = [0u8; 13];
+    let mut fr = Xoshiro256pp::seed_from_u64(42);
+    fr.fill_bytes(&mut fb[..]);
+    let first = 15021278609987233951u64;
+    let mut fill = true;
+    for i in 0..8 {
+        if fb[i] != (first >> (i * 8) as u64) as u8 {
+            fill = false;
+        }
+    }
+    let second = 5881210131331364753u64;
+    for i in 8..13 {
+        if fb[i] != (second >> ((i - 8) * 8) as u64) as u8 {
+            fill = false;
+        }
+    }
+    let mut perm = [0i64; 100];
+    for i in 0..100 {
+        perm[i] = i;
+    }
+    shuffle(&mut perm[..], &mut fr);
+    let mut seen = [false; 100];
+    let mut is_perm = true;
+    let mut moved = 0;
+    for i in 0..100 {
+        if seen[perm[i]] {
+            is_perm = false;
+        }
+        seen[perm[i]] = true;
+        if perm[i] != i {
+            moved += 1;
+        }
+    }
+    println(f"fill {fill} shuffle permutation {is_perm} moved {moved > 80}");
+
+    let mut e1 = [0u8; 300];
+    let mut e2 = [0u8; 300];
+    let ok = fill_bytes_os(&mut e1[..]) && fill_bytes_os(&mut e2[..]);
+    let mut r1 = Xoshiro256pp::from_entropy();
+    let mut r2 = Xoshiro256pp::from_entropy();
+    println(f"entropy differ {ok && e1[..] != e2[..] && r1.next_u64() != r2.next_u64()}");
+    0
+}

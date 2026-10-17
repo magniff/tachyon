@@ -23,6 +23,10 @@
 # implementation, gpa.tach (std_gpa_source here), and std::CHECK_ALLOC;
 # with --check-alloc, the checking Gpa, alloc_check.tach
 # (std_check_gpa_source), and its index (std_check_index).
+# (0.20) After them, the target's system: sys/macos.tach or sys/linux.tach
+# (std_sys_source), the same length to the byte so that one index holds
+# for both (checked here): std::TARGET_OS and what differs between the C
+# libraries, for std::sys.
 # Run it after changing any of them; tests/run.sh checks they agree.
 # (0.17: `tachyonc edit` of a std item, or of one of these files, runs it.)
 # (0.15) It also writes std_index, the sections' index (index.awk), and
@@ -39,6 +43,12 @@ trap 'rm -rf "$work"' EXIT
 # std's root module: these files (front/stdtree.tach: std_tree_file).
 ROOT_FILES="std flat/iter flat/io flat/fmt flat/convert flat/clone flat/alloc flat/values flat/test flat/nonnull flat/fuzz flat/collections flat/arch"
 dir=compiler/std
+# (0.20) The two systems' tails are one index's text: the same length.
+if [ "$(wc -c <compiler/std/sys/macos.tach)" != "$(wc -c <compiler/std/sys/linux.tach)" ]; then
+    rm -f "$tmp"
+    echo "compiler/std/sys/macos.tach and sys/linux.tach differ in length: pad a comment" >&2
+    exit 1
+fi
 text=$work/text
 map=$work/map
 : >"$text"
@@ -124,6 +134,23 @@ index() {
     echo "    }"
     echo "}"
     echo ""
+    echo "// (0.20) The end of std's text, after std::CHECK_ALLOC: the target's"
+    echo "// system, sys/linux.tach or sys/macos.tach (front/stdalloc.tach), the"
+    echo "// same length, std_sys_len bytes, so that one index holds for both."
+    echo "pub fn std_sys_source(out: i64, linux: bool) {"
+    echo "    unsafe {"
+    echo "        if linux {"
+    lines <compiler/std/sys/linux.tach | sed 's/^/    /'
+    echo "        } else {"
+    lines <compiler/std/sys/macos.tach | sed 's/^/    /'
+    echo "        }"
+    echo "    }"
+    echo "}"
+    echo ""
+    echo "pub fn std_sys_len() -> i64 {"
+    echo "    $(wc -c <compiler/std/sys/macos.tach | tr -d ' ')"
+    echo "}"
+    echo ""
     echo "// (0.15) The index of std's sections (compiler/std/index.awk): what"
     echo "// each defines and needs, so that a program's loader lexes only the"
     echo "// sections it can reach (front/modules: load_std_sections)."
@@ -132,7 +159,7 @@ index() {
     # (0.16: over std_source's whole text, std_alloc_tail's included: Gpa's
     # implementation and CHECK_ALLOC as without --check-alloc)
     { cat "$text"; cat compiler/std/gpa.tach
-        echo "pub const CHECK_ALLOC: bool = false;"; } | index
+        echo "pub const CHECK_ALLOC: bool = false;"; cat compiler/std/sys/macos.tach; } | index
     echo "    }"
     echo "}"
     echo ""
@@ -143,7 +170,7 @@ index() {
     echo "    unsafe {"
     { cat "$text"; cat compiler/std/alloc_check.tach
         echo "pub const CHECK_ALLOC: bool = true;"
-        echo "const CHECK_ALLOC_OS: i64 = 0;"; } | index
+        echo "const CHECK_ALLOC_OS: i64 = 0;"; cat compiler/std/sys/macos.tach; } | index
     echo "    }"
     echo "}"
     echo ""
