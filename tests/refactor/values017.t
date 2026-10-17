@@ -13,7 +13,7 @@
 ## by `fix --suggested`; what the fix keeps raw is wrapped in `unsafe` by
 ## `fix --only unsafe`, the second try: of the error.)
 $ fix --values
-fixed 5 parameters to &mut T, 3 parameters to &T, 1 slice parameter to &mut [T], 3 owned parameters to &T (only read), 8 arguments	main.tach	+20 -20 lines
+fixed 2 suggested fixes, 5 parameters to &mut T, 3 parameters to &T, 1 slice parameter to &mut [T], 3 owned parameters to &T (only read), 8 arguments	main.tach	+22 -22 lines
 % cat main.tach
 struct Stats { count: i64, sum: i64 }
 struct Inv { items: Vec<i64>, name: Buf }
@@ -88,9 +88,9 @@ fn set_via(pp: **i64, v: i64) {
 fn by_rank(a: *Stats, b: *Stats) -> i64 { a.sum - b.sum }
 
 fn ranked(v: &mut Vec<Stats>) {
-    sort_by(v.as_slice(), |a: *Stats, b: *Stats| a.count - b.count);
+    sort_by(v.as_slice(), |a: &Stats, b: *Stats| a.count - b.count);
     let f = unsafe { by_rank };
-    sort_by(v.as_slice(), f);
+    sort_by(v.as_mut_slice(), f);
 }
 $ fix --suggested
 fixed 2 suggested fixes	main.tach	+1 -1 lines

@@ -480,7 +480,8 @@ to `map` is legal because it is under the guard.
   as 0.10's `v16u8::load(s, i)` does:
   - `vld1q_u8(s: [u8], i: i64) -> uint8x16_t`, checked `0 <= i && i +
     16 <= s.len`;
-  - `vst1q_u8(s: [u8], i: i64, v: uint8x16_t)`;
+  - `vst1q_u8(s: &mut [u8], i: i64, v: uint8x16_t)` (0.19.1: every store
+    form's slice is `&mut [T]`, made so by the declaration generator);
   - `_mm_loadu_si128(s: [u8], i: i64) -> __m128i`. The x86 forms take
     the slice of their element type: `[u8]` for `si128`, `[f32]` for
     `ps`.

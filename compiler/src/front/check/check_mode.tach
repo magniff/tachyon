@@ -4,15 +4,21 @@
 // arithmetic operands are checked against it; everything else is
 // synthesized and compared with it.
 
-use crate::base::{buf_new, buf_slice, buf_uint, intern_c};
-use crate::base::diag::{ERR, err_begin, err_end, err_help, err_help_fmt, err_int, err_str, err_sym};
+use crate::base::{
+    BUFS, IntVec, SRC, SYMS, buf_bytes, buf_new, buf_slice, buf_str, buf_uint, intern_c,
+};
+use crate::base::diag::{
+    ERR, ERR_KIND, err_begin, err_end, err_end_soft, err_fix, err_fmt, err_help, err_help_fmt,
+    err_int, err_str, err_sym, err_try_fmt, err_try_tool,
+};
 use crate::front::ast::{NODES, NODE_REF_MUT, NodeKind, REPR_UNION, child, new_node};
 use crate::front::ast::NodeKind::{
     Array, Binary, Block, Char, Closure, Float, If, Int, Loop, Match, Range, Repeat, StructLit,
     Tuple, Unary,
 };
 use crate::front::check::{
-    Res, SELF_TYPE, SELF_TYPE_SYM, mismatch_error, name_error, type_error_got,
+    CUR_FN, LOCALS, Res, SELF_TYPE, SELF_TYPE_SYM, lookup_local, mismatch_error, name_error,
+    type_error_got,
 };
 use crate::front::check::args::check_shorthands;
 use crate::front::check::assign::is_place;
@@ -36,7 +42,7 @@ use crate::front::convert::into_call;
 use crate::front::distinct::strip_distinct;
 use crate::front::generics::{HINT_NODE, HINT_TY, check_arg, env_lookup};
 use crate::front::generics::instantiate::infer_struct_literal;
-use crate::front::lexer::{SUF_NONE, Tok};
+use crate::front::lexer::{SUF_NONE, Tok, is_ident_byte};
 use crate::front::modules::{CUR_MOD, STD_MODULE};
 use crate::front::modules::lookup::{
     B_ITEM, B_PRIVATE, access_error, binding_kind, binding_value, lookup_item, note_c_use,
@@ -214,16 +220,12 @@ pub fn coerce_ref(n: i64, actual: i64, expected: i64) -> bool {
             if TYPES[actual].b == REF_MUT && TYPES[expected].b == 0 {
                 return true;
             }
-            // (0.17, the legacy slice rule, like the legacy `*T` parameters
-            // through 0.17) a `[T]` where `&mut [T]` is expected,
-            // `sort(a[..])`, `sort(v.as_slice())`, `sort(s)`: the exclusive
-            // view, as `&mut a[..]`, `v.as_mut_slice()`; the own pass takes
-            // the parameter's loan (a write through a read-only view is its
-            // own.readonly), `fix --values` writes the `&mut`
+            // A `[T]` where `&mut [T]` is expected (`sort(a[..])`,
+            // `sort(v.as_slice())`, `sort(s)`): own.readonly (0.19.1; 0.17's
+            // legacy slice rule took it as the exclusive view), the call
+            // checked as if it were one
             if TYPES[actual].b == 0 && TYPES[expected].b == REF_MUT {
-                if fresh_slice(n) && NODES[n].kind == NodeKind::Index {
-                    NODES[n].p |= NODE_REF_MUT;
-                }
+                readonly_slice_arg(n, actual);
                 return true;
             }
             return false;
@@ -284,6 +286,94 @@ pub fn coerce_ref(n: i64, actual: i64, expected: i64) -> bool {
             return true;
         }
         false
+    }
+}
+
+// (0.19.1) own.readonly: `[T]` value n (a read-only view) where `&mut [T]`
+// is expected, a parameter the callee writes through (`sort(v.as_slice())`,
+// `vst1q_u8(out[..], ...)`): the view must be exclusive. The fix, exact
+// where it is one (`fix --suggested`): `&mut a[..]`, `v.as_mut_slice()`;
+// a `[T]` parameter passed on is retyped (`refactor signature`).
+fn readonly_slice_arg(n: i64, actual: i64) {
+    unsafe {
+        let text = SRC[NODES[n].start..NODES[n].end];
+        let saved = ERR_KIND;
+        ERR_KIND = c"own.readonly";
+        err_begin(NODES[n].start);
+        err_fmt(f"'{text}', a '");
+        err_type(actual);
+        err_str(c"', is read-only where '&mut [");
+        err_type(TYPES[actual].a);
+        err_str(c"]' is expected: the callee writes through it");
+        err_help(
+            c"pass an exclusive view: '&mut a[..]', 'v.as_mut_slice()', or a '&mut [T]' parameter");
+        let new = buf_new();
+        // `sort(v.as_slice())`, `sort(a[..])`: the method, `v.sort()`
+        let s = NODES[n].start;
+        let e = NODES[n].end;
+        let whole = if text.len > 11 && text[text.len - 11..text.len] == ".as_slice()" { 11 }
+            else if text.len > 4 && text[text.len - 4..text.len] == "[..]" { 4 } else { 0 };
+        if whole > 0 && s >= 5 && SRC[s - 5..s] == "sort(" && SRC[e] == ')'
+            && (s == 5 || !is_ident_byte(SRC[s - 6]) && SRC[s - 6] != '.' && SRC[s - 6] != ':') {
+            let call = buf_new();
+            buf_bytes(call, text[0..text.len - whole]);
+            buf_str(call, c".sort()");
+            err_try_fmt(buf_slice(call));
+            err_fix(s - 5, e + 1, buf_slice(call));
+        } else if NODES[n].kind == NodeKind::Index && fresh_slice(n) {
+            buf_str(new, c"&mut ");
+            buf_bytes(new, text);
+        } else if text.len > 11 && text[text.len - 11..text.len] == ".as_slice()" {
+            buf_bytes(new, text[0..text.len - 10]);
+            buf_str(new, c"as_mut_slice()");
+        }
+        if BUFS[new].len > 0 {
+            err_try_fmt(buf_slice(new));
+            err_fix(NODES[n].start, NODES[n].end, buf_slice(new));
+        } else if NODES[n].kind == NodeKind::Ident && CUR_FN >= 0 {
+            let l = lookup_local(NODES[n].a);
+            if l.is_some() && LOCALS[l.unwrap()].is_param {
+                let a = buf_new();
+                buf_str(a, c"refactor signature ");
+                // (a generic function's template: its name without `<...>`)
+                let name = SYMS[FNS[CUR_FN].display].text;
+                let mut cut = 0;
+                while cut < name.len && name[cut] != '<' {
+                    cut += 1;
+                }
+                buf_bytes(a, name[0..cut]);
+                buf_str(a, c" --type ");
+                buf_bytes(a, text);
+                // (the parameter's type as written: `[T]` in a generic one)
+                let fnode = FNS[CUR_FN].node;
+                let mut written = 0;
+                for i in 0..NODES[fnode].count {
+                    let p = child(fnode, i);
+                    if NODES[p].kind == NodeKind::Param && NODES[p].a == NODES[n].a
+                        && NODES[p].b > 0 {
+                        written = NODES[p].b;
+                    }
+                }
+                if written == 0 {
+                    // (a closure's parameter: no signature to retype)
+                    err_end_soft();
+                    ERR_KIND = saved;
+                    return;
+                }
+                buf_str(a, c" '&mut ");
+                if written > 0 {
+                    buf_bytes(a, SRC[NODES[written].start..NODES[written].end]);
+                } else {
+                    buf_str(a, c"[");
+                    buf_type(a, TYPES[actual].a);
+                    buf_str(a, c"]");
+                }
+                buf_str(a, c"'");
+                err_try_tool(buf_slice(a), false);
+            }
+        }
+        err_end_soft();
+        ERR_KIND = saved;
     }
 }
 

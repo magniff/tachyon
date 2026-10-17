@@ -1248,6 +1248,12 @@ Moved to 0.19.x or later (docs/design/arch.md, "as built"):
 - examples/sha256sum, written with v0.19.0 (as fast as the system's
   sha256sum, openssl and coreutils).
 
+Done (0.19.1). Two soundness fixes (the store intrinsics' destination
+`&mut [T]`; 0.17's transitional read-only-slice rule removed, with the
+corpus migrated) and examples/arch/sha256sum, written with v0.19.0:
+faster than the system's sha256sum and OpenSSL on the M5, about 5 times
+coreutils' in the linux/arm64 container.
+
 ## 0.20: collections, text and I/O
 
 - collections, each allocator-aware (0.16), with value semantics (0.17),
@@ -2268,3 +2274,14 @@ over the call graph (check +4 ms) and the assembler's larger encoder
 (data and output 141 to 157 ms, the AArch64 and x86-64 instruction
 tables); -O2 1.4%, check 3.7%. A program without intrinsics pays only
 the analysis.
+
+### 0.19.1
+
+The release gate (`gate.sh --release --no-x86`, 14:05 wall, every step
+passing; the suite 1593 tests, aarch64-linux 1266 and valgrind 237
+clean). Bench (fastest of 5, load falling from 16 to 2): geomean 0.951
+of cc -O2, v0.19.0 0.954 in the same run; the pairs 0.995, 1.000,
+1.000; instructions retired within 0.15% of v0.19.0's for every
+program. Compile time in instructions, against v0.19.0 on 0.19.1's
+source: the self-compile 9.35 G to 9.36 G at -O0, 40.26 G to 40.27 G at
+-O2 (-j1), check 4.33 G both, a small program 65 M both.

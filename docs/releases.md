@@ -51,8 +51,35 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.18.0 | `v0.18.0` | 0.17.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | contracts and verification in the language: `requires`/`ensures` (`result`, `old(..)`, `else` messages, `debug` clauses), checked at run time, a requires at the call so the caller is blamed, pure conditions (`contract.effect`); std's own clauses (`unwrap`, `Vec::get`, ...); `assert`, `assert_eq`, `assert_ne`, `debug_assert`; every run-time check one line `FILE:LINE:COL: message` with the condition and its values; `query checks` (the checks the optimizer proved away and those left), `--no-positions`; `#[test]`, `#[cfg(test)]` modules, `assert_snapshot`, `#[property]` with inputs generated from the types and shrunk, contracts tested as properties, `#[fuzz]` with block coverage (`--coverage`, `tachyonc fuzz`), leaks failing a test; `tachyonc test` builds at -O0 and -O2 and compares them; `reduce` over programs (`--differs`, `--fails`, `--test`); `type X = distinct T`, `std::NonNull<T>` with the null niche (`Option<NonNull<T>>` is a pointer, FFI-safe, `_Nonnull` imported) and a checked `as NonNull<T>`; std's `Display`, `Debug`, `Iterator`, `Clone` on references, `fix --values` over traits; the agent eval's `+debrief` |
 | 0.18.1 | `v0.18.1` | 0.18.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | two use-after-free holes in safe code closed (a changed copy of a borrowed owned value; a reference into a Vec across a push); functions compiled in parallel (`-j N`, the same bytes at any N; the -O2 self-compile 2.13 s to 0.72 s at -j8) and incremental rebuilds from a code cache (a one-function edit 0.53 s, byte-identical to clean); V4: every `*T` raw, borrowing only `&`/`&mut`, the compiler and std on references; contracts in generated code (range fixes, `x % n` ranges, entry facts: the contracts bench 25% fewer instructions than without clauses); BinaryHeap/MinHeap, binding modes on references, `&f()` temporaries, let-else and the 0.18 eval's polish; a valgrind row and threads/incremental steps in the gate, a lock on the bootstrap cache |
 | 0.19.0 | `v0.19.0` | 0.18.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | CPU intrinsics and target features: `std::arch` with over 1,775 AArch64 intrinsics (NEON, crc, sha2, sha512, sha3, aes, pmull, dotprod, float), each checked lane by lane against a scalar reference, and 484 x86-64 intrinsics (SSE to AVX2, FMA, BMI, AES-NI, SHA, PCLMULQDQ) encoded as cc does but not run; unsigned, 64-bit and 256-bit vector types; target features inferred like effects, `has`/`detect` guards, foreign architectures constant false, `-C target-cpu`/`target-feature`; run-time detection and `#[multiversion]`; intrinsics pure to the optimizer, never hoisted above their guard, vectors in vector registers; `query arch`, `guide arch`, examples/arch, the fuzzer's arch mode, `tachyonc assemble` |
+| 0.19.1 | `v0.19.1` | 0.19.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | two soundness fixes: the store intrinsics' destination is `&mut [T]` (a store through a read-only view, or while a view of the buffer is used, is an error), and 0.17's transitional rule accepting a read-only `[T]` where `&mut [T]` is wanted is gone (`fix --values` migrates); examples/arch/sha256sum, coreutils-compatible on the SHA-256 instructions, faster than macOS's sha256sum and OpenSSL, about 5 times coreutils' on Linux |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.19.1
+
+- **Two soundness fixes** (code 0.19.0 accepted could write through a
+  shared view):
+  - the store intrinsics (`vst1q_*`, `vst1_*`, `vst2q_*`,
+    `_mm_storeu_*`, `_mm256_storeu_*`) took their destination as a
+    read-only `[T]`; it is `&mut [T]` now: a `[T]` there is
+    own.readonly with its fix (`&mut a[..]`, `v.as_mut_slice()`), and a
+    store into a buffer while a view of it is used is own.conflict;
+  - 0.17's transitional rule that accepted a read-only `[T]` where
+    `&mut [T]` is wanted (`sort(v.as_slice())`) is removed: such an
+    argument is own.readonly, with the fix (`v.sort()`,
+    `v.as_mut_slice()`, `&mut a[..]`, or `refactor signature F --type s
+    '&mut [T]'`); `fix --values` ends with these fixes, and 51 call sites
+    of the corpus moved.
+- **examples/arch/sha256sum**: coreutils' `sha256sum` (output, `-c`,
+  `--tag`, escapes, messages, exit codes) on the ARMv8 SHA-256
+  instructions behind `detect("sha2")`, with a portable fallback. On an
+  M5: 1 GiB in 0.352 s (3.05 GB/s) against macOS's sha256sum 0.428 s and
+  OpenSSL 4.0.3's 0.399 s; 10,000 small files 0.119 s against 0.227 s.
+  In the linux/arm64 container: 0.381 s against coreutils' 1.799 s and
+  OpenSSL 3.0's 0.407 s. Built with v0.19.0's features.
+- **Breaking**: a read-only `[T]` passed where `&mut [T]` is wanted, and
+  a store intrinsic given one, are errors (`fix --values`, or the
+  `try:` lines).
 
 ### What's new in 0.19
 
