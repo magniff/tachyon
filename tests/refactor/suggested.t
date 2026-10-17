@@ -13,7 +13,7 @@ main.tach:22:13: error[type error] undefined variable 'totl' | help: did you mea
 main.tach:24:19: error[type error] expected '[i64]', got '[i64; 3]' | help: an array is not a slice: take one of all of it | try: [1, 2, 3][..] | try: tachyonc fix --suggested main.tach
 main.tach:28:13: error[type error] no method 'trim' on type '[u8]' | help: 'trim' is no method: std's function `trim` takes the value as its first argument | try: trim("  x ") | try: tachyonc fix --suggested main.tach
 main.tach:29:13: error[type error] allocation is explicit: pass an allocator (try: format_in(x, gpa)) | help: this function's `gpa` is the allocator to pass | try: tachyonc fix --only alloc016 main.tach | try: tachyonc fix --suggested main.tach
-main.tach:30:15: error[type error] undefined variable 'I64_MIN' | help: add `use std::I64_MIN;` | try: tachyonc fix --suggested main.tach
+main.tach:30:15: error[type error] undefined variable 'I64_MIN' | help: add `use std::num::I64_MIN;` | try: tachyonc fix --suggested main.tach
 main.tach:31:13: error[type error] 'describe' is private | help: make it public: `pub fn describe` at text.tach:3:1 | try: tachyonc fix --suggested main.tach
 main.tach:32:13: error[type error] function 'table::make' expects 2 arguments, got 1 | help: its signature: `fn make(width: i64, gpa: Gpa) -> Table` (table.tach:3) | try: table::make(3, gpa) | try: tachyonc fix --suggested main.tach
 main.tach:34:5: error[type error] no method 'push_string' on type 'Buf' | help: did you mean 'push_str'? | try: tachyonc query items Buf main.tach | try: tachyonc fix --suggested main.tach
@@ -28,7 +28,7 @@ $ fix --suggested --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -0,0 +1,3 @@
-+use std::I64_MIN;
++use std::num::I64_MIN;
 +use text::wrap;
 +
 @@ -22,4 +25,4 @@
@@ -91,7 +91,7 @@ $ fix --suggested --in text.tach --dry-run
 $ fix --suggested --show
 fixed 2 missing imports, 1 pub, 15 suggested fixes	2 files	+17 -14 lines
 // main.tach:1-3
-1	use std::I64_MIN;
+1	use std::num::I64_MIN;
 2	use text::wrap;
 3	
 // main.tach:25-28

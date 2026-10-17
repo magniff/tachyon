@@ -92,7 +92,7 @@ crate::score	io global panic
   'smoothed(s, i, gain)' at main.tach:39:14 calls 'smoothed'
   'scaled(s[i], gain)' at main.tach:29:6 calls 'scaled'
   'clamp(x * gain / 10, 0, 1000)' at main.tach:23:5 calls 'clamp'
-  'println(f"clamp {x}")' at main.tach:12:5 calls 'std::println'
+  'println(f"clamp {x}")' at main.tach:12:5 calls 'std::fmt::println'
 warning query.program-errors: 1 error in the program; results may be incomplete
 try: tachyonc --diagnostics=short main.tach -c -o /dev/null
 $ tachyonc undo

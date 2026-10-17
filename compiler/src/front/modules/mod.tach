@@ -216,6 +216,12 @@ pub fn is_within(inner: i64, outer: i64) -> bool {
     false
 }
 
+// (0.20) Whether module m is std or one of its modules (std is a tree:
+// std::iter, std::collections::hash_map).
+pub fn within_std(m: i64) -> bool {
+    unsafe { STD_MODULE >= 0 && m >= 0 && is_within(m, STD_MODULE) }
+}
+
 // ---- Loading ----
 
 // `mod name;` in the files read so far (and in the files they load): the
@@ -224,33 +230,14 @@ pub fn load_modules() {
     unsafe {
         init_modules();
         load_std_if_named();
-        // One pass over the tokens, in the order of the files (a module's file
-        // and its tokens are appended when it is loaded, so its own `mod`
-        // items come later in the pass).
-        let mut i = 0;
-        while i + 2 < TOK_COUNT {
-            if TOKS[i].kind == Tok::Mod && TOKS[i + 1].kind == Tok::Ident
-                && TOKS[i + 2].kind == Tok::Semi {
-                let f = file_of(TOKS[i].start);
-                // (after an error, on with the next one: 0.10)
-                if module_at(TOKS[i].start) != FILES[f].module {
-                    error_at_soft(TOKS[i].start, c"'mod name;' cannot be inside an inline module (a module's file is found from its file's module)");
-                    fail_name(TOKS[i + 1].value as i64);
-                } else {
-                    load_module(f, i);
-                }
-            }
-            if TOKS[i].kind == Tok::Mod && TOKS[i + 1].kind == Tok::Ident
-                && TOKS[i + 2].kind == Tok::LBrace {
-                add_inline_module(i);
-            }
-            i += 1;
-        }
+        scan_modules(0);
         // (0.18: a test build's code, front/tests)
         crate::front::tests::add_test_code();
         // Named only in a module's file (fixed in 0.6: 0.5 looked at the files
-        // of the command line alone).
+        // of the command line alone; 0.20: then std's modules).
+        let before = TOK_COUNT;
         load_std_if_named();
+        scan_modules(before);
         // (0.19: std::arch's virtual modules, when the program names them)
         load_arch_modules();
         // (0.10: --check-unsafe's runtime)
@@ -279,6 +266,36 @@ pub fn load_modules() {
             TRACE_MODULE = add_module(intern_c(c"__trace"), 0, public: false);
             FILES[FILE_COUNT - 1].module = TRACE_MODULE;
             lex_range(start, FILES[FILE_COUNT - 1].end, last: false);
+        }
+    }
+}
+
+// One pass over the tokens from token i, in the order of the files (a
+// module's file and its tokens are appended when it is loaded, so its own
+// `mod` items come later in the pass).
+fn scan_modules(from: i64) {
+    unsafe {
+        let mut i = from;
+        while i + 2 < TOK_COUNT {
+            if TOKS[i].kind == Tok::Mod && TOKS[i + 1].kind == Tok::Ident
+                && TOKS[i + 2].kind == Tok::Semi {
+                let f = file_of(TOKS[i].start);
+                // (after an error, on with the next one: 0.10)
+                if f == STD_FILE && STD_TREE == 0 as *u8 {
+                    // (0.20) std's built-in text: its modules are there, as
+                    // `mod name { }` after their parent's text (embed.sh)
+                } else if module_at(TOKS[i].start) != FILES[f].module {
+                    error_at_soft(TOKS[i].start, c"'mod name;' cannot be inside an inline module (a module's file is found from its file's module)");
+                    fail_name(TOKS[i + 1].value as i64);
+                } else {
+                    load_module(f, i);
+                }
+            }
+            if TOKS[i].kind == Tok::Mod && TOKS[i + 1].kind == Tok::Ident
+                && TOKS[i + 2].kind == Tok::LBrace {
+                add_inline_module(i);
+            }
+            i += 1;
         }
     }
 }
@@ -547,7 +564,8 @@ fn missing_module_help(f: i64, name: i64) {
     unsafe {
         let flat = module_candidate(f, name, nested: false);
         let shown = if flat[0] == '.' && flat[1] == '/' { &flat[2] } else { flat };
-        if FILES[f].module > 0 && !streq(path_base(FILES[f].path), c"mod.tach") {
+        if FILES[f].module > 0 && FILES[f].module != STD_MODULE
+            && !streq(path_base(FILES[f].path), c"mod.tach") {
             let side = buf_new();
             buf_fmt(side, f"{cstr(path_dir(FILES[f].path))}/{sym_text(name)}.tach");
             buf_byte(side, 0);
@@ -575,16 +593,17 @@ fn missing_module_help(f: i64, name: i64) {
     }
 }
 
-// Where `mod name;` in file f looks: next to the file for a root file or a
-// `mod.tach`, else in the directory named after the file (`a.tach`: `a/`);
-// as `name.tach`, or `name/mod.tach` when `nested`.
+// Where `mod name;` in file f looks: next to the file for a root file, one
+// of std's root files (0.20: std is a crate of its own; compiler/std/NAME.tach
+// is std::NAME) or a `mod.tach`, else in the directory named after the file
+// (`a.tach`: `a/`); as `name.tach`, or `name/mod.tach` when `nested`.
 fn module_candidate(f: i64, name: i64, nested: bool) -> *u8 {
     unsafe {
         let path = FILES[f].path;
         let out = buf_new();
         buf_fmt(out, f"{cstr(path_dir(path))}/");
         let base = path_base(path);
-        if FILES[f].module > 0 && !streq(base, c"mod.tach") {
+        if FILES[f].module > 0 && FILES[f].module != STD_MODULE && !streq(base, c"mod.tach") {
             let n = strlen(base) as i64;
             let stem = if n > 5 && streq(&base[n - 5], c".tach") { n - 5 } else { n };
             buf_fmt(out, f"{base[0..stem]}/");

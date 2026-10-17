@@ -72,7 +72,7 @@ $ tachyonc edit patch main --old '|v| v + bonus' --new '|v| {
 >         println(f"{v}");
 >         v + bonus
 >     }'
-main.tach:17:5: error[effect] the closure for 'F' of 'table::map_values' does io ('println(f"{v}")' at main.tach:18:9 calls 'std::println'); 'F: Fn(i64) -> i64 + effects(panic)' allows panic only | help: do only what the bound allows in the closure, or allow 'io' in the bound  [edited: crate::main]
+main.tach:17:5: error[effect] the closure for 'F' of 'table::map_values' does io ('println(f"{v}")' at main.tach:18:9 calls 'std::fmt::println'); 'F: Fn(i64) -> i64 + effects(panic)' allows panic only | help: do only what the bound allows in the closure, or allow 'io' in the bound  [edited: crate::main]
 error edit.breaks: 1 new error; nothing written
 try: tachyonc edit patch main --old '|v| v + bonus' --new '|v| {
         println(f"{v}");

@@ -12,17 +12,17 @@ $ type fstring017/main.tach:12:16
 Interp<closure(*Fmt) -> () at fstring017/main.tach:12:16>	f"[{n}]"
 $ refs println push_fmt format_in --in fstring017/main.tach
 # fstring017/main.tach
-1:30	use	crate	->std::format_in	use std::{Buf, Display, Gpa, format_in, println};
-1:41	use	crate	->std::println	use std::{Buf, Display, Gpa, format_in, println};
-4:5	call	show	->std::println	println(x);
-9:5	call	main	->std::println	println(f"n = {n}");
+1:30	use	crate	->std::fmt::format_in	use std::{Buf, Display, Gpa, format_in, println};
+1:41	use	crate	->std::fmt::println	use std::{Buf, Display, Gpa, format_in, println};
+4:5	call	show	->std::fmt::println	println(x);
+9:5	call	main	->std::fmt::println	println(f"n = {n}");
 12:7	call	main	->std::Buf::push_fmt	b.push_fmt(f"[{n}]");
-13:13	call	main	->std::format_in	let t = format_in(f"{n}!", gpa);
-14:5	call	main	->std::println	println(t.as_slice());
+13:13	call	main	->std::fmt::format_in	let t = format_in(f"{n}!", gpa);
+14:5	call	main	->std::fmt::println	println(t.as_slice());
 $ effects main --why io
 crate::main	alloc(Gpa) io global panic diverge
-  'println(f"n = {n}")' at fstring017/main.tach:9:5 calls 'std::println'
-  'fmt_str(self, s)' at <std>:3042:9 calls 'std::fmt_str'
-  'fmt_str_fd(f.fd, s)' at <std>:2939:9 calls 'std::fmt_str_fd'
-  'fmt_flush()' at <std>:2955:9 calls 'std::fmt_flush'
-  'write(FMT_FD, rest.ptr, rest.len as u64)' at <std>:2876:26 calls C's 'write'
+  'println(f"n = {n}")' at fstring017/main.tach:9:5 calls 'std::fmt::println'
+  'fmt_str(self, s)' at <std>:6603:9 calls 'std::fmt::fmt_str'
+  'fmt_str_fd(f.fd, s)' at <std>:6500:9 calls 'std::fmt::fmt_str_fd'
+  'fmt_flush()' at <std>:6516:9 calls 'std::fmt::fmt_flush'
+  'write(FMT_FD, rest.ptr, rest.len as u64)' at <std>:6437:26 calls C's 'write'

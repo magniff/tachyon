@@ -1,0 +1,318 @@
+// std::slice: sorting (0.20: from std.tach).
+
+use std::{Allocator, Gpa, Ord, Vec};
+
+// ---- Sorting (0.9) ----
+
+// Sorts s in place, smallest first; not stable (equal elements may change
+// order). An introsort: quicksort around the median of three, insertion
+// sort for short runs, heapsort where the quicksort goes too deep, so
+// O(n log n) comparisons at worst. A `cmp` that is not a total order
+// leaves s in some order, never out of bounds. (0.16: its loops are
+// counted, and the ranges left to sort are on a stack, not recursion: it
+// does not have the effect diverge.) (0.17) `sort(&mut a[..])`,
+// `sort(v.as_mut_slice())`, `v.sort()`; the elements move as bits, so any
+// T: Ord sorts, owned ones too.
+pub fn sort<T: Ord>(s: &mut [T]) {
+    let mut depth = 0;
+    for k in 0..64 {
+        if (s.len >> k) <= 1 {
+            break;
+        }
+        depth += 2;
+    }
+    unsafe {
+        quicksort::<T>(s.ptr, 0, s.len, depth);
+    }
+}
+
+impl<T: Ord, A: Allocator> Vec<T, A> {
+    // Sorts it in place, smallest first (0.17; see sort).
+    #[inline]
+    pub fn sort(self: &mut Vec<T, A>) {
+        sort(self.as_mut_slice());
+    }
+}
+
+impl<T: Ord>[T] {
+    // Sorts it in place, smallest first (0.17; see sort).
+    #[inline]
+    pub fn sort(self: &mut [T]) {
+        sort(self);
+    }
+}
+
+// Short runs are sorted by insertion.
+const SORT_SMALL: i64 = 24;
+
+// Sorts p[lo..hi]; below `depth` more partitions, by heapsort. Each
+// partition puts its pivot in place, sorts the shorter side next and
+// keeps the longer for later (at most 64 kept: each is at least twice as
+// long as the one sorted next). (0.17) Unsafe: p has hi elements; every
+// index below stays in lo..hi by the loops' counts.
+// (not inlined into sort's caller: its loops keep their registers)
+#[inline(never)]
+unsafe fn quicksort<T: Ord>(p: *T, lo: i64, hi: i64, depth: i64) {
+    let mut lo = lo;
+    let mut hi = hi;
+    let mut depth = depth;
+    let mut kept_lo: [i64; 64] = [0; 64];
+    let mut kept_hi: [i64; 64] = [0; 64];
+    let mut kept_depth: [i64; 64] = [0; 64];
+    let mut kept = 0;
+    // (each round places a pivot or finishes a range: 2n + 1 at most)
+    for _ in 0..2 * (hi - lo) + 1 {
+        if hi - lo <= SORT_SMALL || depth == 0 {
+            if hi - lo <= SORT_SMALL {
+                insertion_sort::<T>(p, lo, hi);
+            } else {
+                heapsort::<T>(&p[lo], hi - lo);
+            }
+            if kept == 0 {
+                return;
+            }
+            kept -= 1;
+            lo = kept_lo[kept];
+            hi = kept_hi[kept];
+            depth = kept_depth[kept];
+            continue;
+        }
+        depth -= 1;
+        // The median of the first, middle and last elements, at lo.
+        let mid = lo + (hi - lo) / 2;
+        if p[mid] < p[lo] {
+            swap_raw::<T>(p, mid, lo);
+        }
+        if p[hi - 1] < p[mid] {
+            swap_raw::<T>(p, hi - 1, mid);
+            if p[mid] < p[lo] {
+                swap_raw::<T>(p, mid, lo);
+            }
+        }
+        swap_raw::<T>(p, lo, mid);
+        // Hoare's partition: p[lo..q] <= pivot <= p[q + 1..hi]. Equal
+        // elements stop both scans, so many equal keys split evenly.
+        let pivot = p[lo];
+        let mut i = lo;
+        let mut j = hi;
+        // (i < hi and lo < j <= hi - 1 by the scans' counts)
+        for _ in lo..hi {
+            i += 1;
+            for _ in i..hi {
+                if !(p[i] < pivot) {
+                    break;
+                }
+                i += 1;
+            }
+            j -= 1;
+            for _ in lo..j {
+                if !(pivot < p[j]) {
+                    break;
+                }
+                j -= 1;
+            }
+            if i >= j {
+                break;
+            }
+            swap_raw::<T>(p, i, j);
+        }
+        swap_raw::<T>(p, lo, j);
+        // The shorter side next, the longer kept.
+        if kept == 64 {
+            // (not reached: see above)
+            heapsort::<T>(&p[lo], hi - lo);
+            hi = lo;
+            continue;
+        }
+        kept_depth[kept] = depth;
+        if j - lo < hi - j - 1 {
+            kept_lo[kept] = j + 1;
+            kept_hi[kept] = hi;
+            hi = j;
+        } else {
+            kept_lo[kept] = lo;
+            kept_hi[kept] = j;
+            lo = j + 1;
+        }
+        kept += 1;
+    }
+}
+
+// Unsafe: p has hi elements.
+unsafe fn insertion_sort<T: Ord>(p: *T, lo: i64, hi: i64) {
+    for i in lo + 1..hi {
+        let x = p[i];
+        let mut at = lo;
+        for d in 0..i - lo {
+            let j = i - d;
+            if !(x < p[j - 1]) {
+                at = j;
+                break;
+            }
+            p[j] = p[j - 1];
+        }
+        p[at] = x;
+    }
+}
+
+// Exchanges s[i] and s[j] (checked), as bits: any T, owned ones too.
+#[inline]
+pub fn swap_at<T>(s: &mut [T], i: i64, j: i64) {
+    let a: *T = &s[i];
+    let b: *T = &s[j];
+    unsafe {
+        let t = *a;
+        *a = *b;
+        *b = t;
+    }
+}
+
+// Exchanges p[i] and p[j], as bits. Unsafe: both are in p's elements.
+#[inline]
+pub unsafe fn swap_raw<T>(p: *T, i: i64, j: i64) {
+    let t = p[i];
+    p[i] = p[j];
+    p[j] = t;
+}
+
+// Unsafe: p has n elements.
+unsafe fn heapsort<T: Ord>(p: *T, n: i64) {
+    for k in 0..n / 2 {
+        sift_down::<T>(p, n / 2 - 1 - k, n);
+    }
+    for k in 1..n {
+        let end = n - k;
+        swap_raw::<T>(p, 0, end);
+        sift_down::<T>(p, 0, end);
+    }
+}
+
+// (the root's index at least doubles each round: 64 at most) Unsafe: p
+// has `end` elements.
+unsafe fn sift_down<T: Ord>(p: *T, start: i64, end: i64) {
+    let mut root = start;
+    for _ in 0..64 {
+        let mut child = 2 * root + 1;
+        if child >= end {
+            return;
+        }
+        if child + 1 < end && p[child] < p[child + 1] {
+            child += 1;
+        }
+        if !(p[root] < p[child]) {
+            return;
+        }
+        swap_raw::<T>(p, root, child);
+        root = child;
+    }
+}
+
+// ---- Stable sort (0.15) ----
+
+// Sorts s in place, smallest first, keeping equal elements in the order
+// they had (0.15), with a buffer from allocator a (0.16):
+// `sort_stable_by_in` with `|a, b| a.cmp(b)`.
+pub fn sort_stable_in<T: Ord, A: Allocator>(s: &mut [T], a: A) {
+    sort_stable_by_in(s, |x: &T, y: &T| x.cmp(y), a);
+}
+
+#[ambient("sort_stable_in(s, gpa)")]
+pub fn sort_stable<T: Ord>(s: &mut [T]) {
+    sort_stable_in(s, Gpa::ambient());
+}
+
+#[ambient("sort_stable_by_in(s, f, gpa)")]
+pub fn sort_stable_by<T, F: FnMut(&T, &T) -> i64>(s: &mut [T], f: F) {
+    sort_stable_by_in(s, f, Gpa::ambient());
+}
+
+// The runs sort_stable_by sorts by insertion before merging them.
+const STABLE_RUN: i64 = 16;
+
+// Sorts s in place by f (as sort_by: f(a, b) negative when *a goes before
+// *b), keeping equal elements in the order they had (0.15). A merge sort:
+// runs of 16 sorted by insertion, then merged in pairs through a buffer of
+// s.len elements from allocator a (0.16), so O(n log n) comparisons. A
+// `f` that is not a total order leaves s in some order, never out of
+// bounds. (0.17) The elements move as bits, between s and the buffer
+// through raw pointers (the buffer's elements are never its own: its
+// length stays 0).
+pub fn sort_stable_by_in<T, F: FnMut(&T, &T) -> i64, A: Allocator>(s: &mut [T], f: F, a: A) {
+    let mut g = f;
+    let n = s.len;
+    let p = s.ptr;
+    unsafe {
+        for r in 0..(n + STABLE_RUN - 1) / STABLE_RUN {
+            let lo = r * STABLE_RUN;
+            let hi = if lo + STABLE_RUN < n { lo + STABLE_RUN } else { n };
+            for i in lo + 1..hi {
+                let x = p[i];
+                let mut j = i;
+                for _ in lo..i {
+                    if !(g(&x, &*(&p[j - 1])) < 0) {
+                        break;
+                    }
+                    p[j] = p[j - 1];
+                    j -= 1;
+                }
+                p[j] = x;
+            }
+        }
+    }
+    if n <= STABLE_RUN {
+        return;
+    }
+    let mut buf: Vec<T, A> = Vec::with_capacity_in(n, a);
+    // (every element of `to` is written before it is read)
+    let mut from = p;
+    let mut to = buf.ptr;
+    let mut width = STABLE_RUN;
+    unsafe {
+        // (the width doubles each round: 62 at most)
+        for _ in 0..62 {
+            if width >= n {
+                break;
+            }
+            for q in 0..(n + 2 * width - 1) / (2 * width) {
+                let lo = q * 2 * width;
+                let mid = if lo + width < n { lo + width } else { n };
+                let hi = if mid + width < n { mid + width } else { n };
+                let mut i = lo;
+                let mut j = mid;
+                let mut k = lo;
+                for _ in lo..hi {
+                    if i >= mid || j >= hi {
+                        break;
+                    }
+                    // (the left run's element first when they are equal)
+                    if g(&*(&from[j]), &*(&from[i])) < 0 {
+                        to[k] = from[j];
+                        j += 1;
+                    } else {
+                        to[k] = from[i];
+                        i += 1;
+                    }
+                    k += 1;
+                }
+                for ii in i..mid {
+                    to[k] = from[ii];
+                    k += 1;
+                }
+                for jj in j..hi {
+                    to[k] = from[jj];
+                    k += 1;
+                }
+            }
+            let t = from;
+            from = to;
+            to = t;
+            width *= 2;
+        }
+        if from != p {
+            for i in 0..n {
+                p[i] = from[i];
+            }
+        }
+    }
+    buf.free();
+}
