@@ -25,7 +25,7 @@ use crate::gen0::gen::MAIN_SYM;
 use crate::gen0::target::global_prefix;
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{
-    Cond, IRFUNCS, IRFUNC_COUNT, Op, ir_append, ir_enter, ir_insert_before, ir_make,
+    Cond, IRFUNCS, IRFUNC_COUNT, Op, ir_append, ir_enter, ir_insert_before, ir_make, ir_unlink,
 };
 
 // The symbol of std's word (ARCH_FEATURES) once main fills it (0: no
@@ -106,6 +106,17 @@ pub fn arch_after_lowering(mut cx: *FnCtx) {
                 while v != 0 {
                     let next = cx.insts[v].next;
                     if cx.insts[v].op == Op::CpuFeat {
+                        // (not before a parameter: the call would clobber
+                        // its register before it is taken)
+                        if b == IRFUNCS[fi].entry && param_after(cx, v) {
+                            let at = body_start(cx, b);
+                            ir_unlink(cx, v);
+                            if at == 0 {
+                                ir_append(cx, b, v);
+                            } else {
+                                ir_insert_before(cx, at, v);
+                            }
+                        }
                         let w = call_of(cx, word, 0);
                         ir_insert_before(cx, v, w);
                         bit_test(cx, v, w);
@@ -153,14 +164,35 @@ fn call_of(mut cx: *FnCtx, f: i64, arg: i64) -> i64 {
     }
 }
 
-// The first instruction of block b after its phis and parameters (0: none).
+// The instruction after block b's last phi or parameter (0: none). Not the
+// first other one: lowering may put an instruction before the parameters
+// (main's Gpa), and a call there would clobber their registers before
+// they are taken.
 fn body_start(mut cx: *FnCtx, b: i64) -> i64 {
     unsafe {
+        let mut after = cx.blocks[b].first;
         let mut v = cx.blocks[b].first;
-        while v != 0 && (cx.insts[v].op == Op::Phi || cx.insts[v].op == Op::Param) {
+        while v != 0 {
+            if cx.insts[v].op == Op::Phi || cx.insts[v].op == Op::Param {
+                after = cx.insts[v].next;
+            }
             v = cx.insts[v].next;
         }
-        v
+        after
+    }
+}
+
+// Whether a parameter comes after instruction v in its block.
+fn param_after(mut cx: *FnCtx, v: i64) -> bool {
+    unsafe {
+        let mut u = cx.insts[v].next;
+        while u != 0 {
+            if cx.insts[u].op == Op::Param {
+                return true;
+            }
+            u = cx.insts[u].next;
+        }
+        false
     }
 }
 

@@ -5,8 +5,9 @@
 
 unsigned crc_checked(void);
 int words_agree(void);
+int twice(int x);
 
 int main(void) {
-    printf("crc %u, agree %d\n", crc_checked(), words_agree());
+    printf("crc %u, agree %d, twice %d\n", crc_checked(), words_agree(), twice(21));
     return 0;
 }
