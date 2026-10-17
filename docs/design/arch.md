@@ -1560,6 +1560,39 @@ the `AE_*` codes.
   instructions: unfused), and the `f64` 64-bit forms of the float
   family (scalar FP encodings).
 
+**T6 as built (branch a19-t6).**
+- **Guards in the optimizer.** An `Intr` needing a feature outside its
+  function's whole-body set (the build's, `made_build_features()`, and
+  `fn_needs(f)`) is under a guard: LICM hoists it only when `runs_first`
+  holds (`middle/licm.tach`, `intr_guarded`). Inlined intrinsics are
+  judged in the caller. `ifconv` and isel's selects never speculate an
+  `Intr` (it is not `is_pure`); GVN only replaces by dominating copies.
+  `NEEDS` and `BUILD_FEATURES` are on threads_writes.sh's READ list.
+- **Exact equivalents.** New forms `vneg`, `vins`, `vsel`, `vsum`,
+  `vbin.div` and `load.dup` (`FORM_VNEG`..`FORM_LOAD_DUP`, 13-17):
+  vnegq/vnegq_f, vsetq_lane, vbslq, vaddvq, vdivq lower to VNEG, VINS,
+  VSEL (bitwise), VSUM, VBIN div; one 64-bit lane keeps `intr`. -O0 writes
+  the table's instruction for them (an independent check of -O2).
+- **Folding** (`middle/fold/arch.tach`, from instcombine): constant
+  vectors are VSPLATs of constants; the generic ops and the fold classes
+  listed in that file fold to a VSPLAT or a constant; integer lanes,
+  AArch64 and portable intrinsics. `VConst` (non-splat constants, the
+  literal pools) is not made yet.
+- **Calling convention** (`back/abi.tach` `tabi_leaves`,
+  `back/emit/machine.tach` `t_arg_location`): a vector is one leaf in a
+  float/vector register (256-bit: two), past them a stack slot of its
+  size at a multiple of it. C's convention is untouched. bench/ compiles
+  to the same code.
+- **T4's leftovers.** `vld1q_dup`/`vld1_dup` (28, `load.dup`: checked
+  scalar load, VSPLAT; -O0 `ld1r`, encoder class `ldst`); `vld2q`/`vst2q`
+  (22, `intr.mem`): two vector loads and uzp1/uzp2 (stores: zip1/zip2,
+  two stores), the permutes' ids in `IntrInfo.part1/part2` (`link_parts`,
+  when the table is parsed); -O0 writes `ld2`/`st2` on v30/v31. `Op::IntrMem`
+  is still unused.
+- Not done: isel's `ld1r` fusion of `Load`+`VSplat` at -O1/-O2 (two
+  instructions), `VConst` and the literal pools, `Rot`/`BSwap` and the
+  vectorizer's portable bit ops, float folds, x86's folds.
+
 ## 8. Open questions
 
 - **O1. Latency and throughput in `query show`.** Useful for choosing

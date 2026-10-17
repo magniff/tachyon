@@ -210,6 +210,27 @@ def loads_stores():
              "v's %d lanes into s[i..i + %d] (checked)" % (lanes(t, q), lanes(t, q)))
 
 
+def pairs():
+    section("Loads and stores of two registers, interleaved")
+    for t in A + ["p8"]:
+        el = scalar(t).replace("p", "u")
+        n = lanes(t, True)
+        tup = vv(t, True)[:-2] + "x2_t"
+        line(name("vld2q_{t}", t, True), "neon", "(s: [%s], i: i64) -> %s" % (el, tup), "intr.mem",
+             "ld2 {<u>.%s, <t>.%s}, [<s>]" % (arr(t, True), arr(t, True)), "-", "load(s, 32)", "-",
+             "r[k] = if k < %d { s[i + 2 * k] } else { s[i + 2 * (k - %d) + 1] }" % (n, n), None,
+             "the %d lanes s[i..i + %d] deinterleaved: the even ones, then the odd ones (checked)"
+             % (2 * n, 2 * n))
+    for t in A + ["p8"]:
+        el = scalar(t).replace("p", "u")
+        n = lanes(t, True)
+        tup = vv(t, True)[:-2] + "x2_t"
+        line(name("vst2q_{t}", t, True), "neon", "(s: [%s], i: i64, v: %s)" % (el, tup), "intr.mem",
+             "st2 {<u>.%s, <t>.%s}, [<s>]" % (arr(t, True), arr(t, True)), "-", "store(s, 32)", "-",
+             "s[i + k] = if k %% 2 == 0 { v[k / 2] } else { v[%d + k / 2] }" % n, None,
+             "v's two vectors interleaved into s[i..i + %d] (checked)" % (2 * n))
+
+
 def build_lanes():
     section("Build, lanes, halves")
     for base in ["vdup{q}_n_{t}", "vmov{q}_n_{t}"]:
@@ -330,6 +351,8 @@ def instructions():
     insn("crc32cx", "crc", 0x9ac05c00, "crc32cx Wd, Wn, Xm")
     # (T6) loads and stores of a register list at [Xn]: Q and size from the list
     insn("ld1r", "ldst", 0x0d40c000, "ld1r {Vt.T}, [Xn]")
+    insn("ld2", "ldst", 0x0c408000, "ld2 {Vt.T, Vt2.T}, [Xn]")
+    insn("st2", "ldst", 0x0c008000, "st2 {Vt.T, Vt2.T}, [Xn]")
     # three same, integer
     for mn, u, opc in [("shadd", 0, 0), ("uhadd", 1, 0), ("sqadd", 0, 1), ("uqadd", 1, 1),
                        ("srhadd", 0, 2), ("urhadd", 1, 2), ("shsub", 0, 4), ("uhsub", 1, 4),
@@ -1255,7 +1278,7 @@ def floats():
                  "across.f" + op[:-1], "%s of a's lanes (pairs first)" % op[:-1], None, doc)
 
 
-FAMILIES = [loads_stores, build_lanes, casts, arithmetic, compare, logic, shifts, horizontal, narrowing,
+FAMILIES = [loads_stores, pairs, build_lanes, casts, arithmetic, compare, logic, shifts, horizontal, narrowing,
             permutes, bit_ops, crc, crypto, dotprod, widening, lanes_dup_shift, floats]
 
 
