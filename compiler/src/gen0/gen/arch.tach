@@ -11,8 +11,9 @@
 // independent oracle for them.)
 
 use crate::arch::{
-    FORM_BITS, FORM_CAST, FORM_FEAT, FORM_INTR, FORM_LOAD, FORM_STORE, FORM_VBIN, FORM_VCMP,
-    FORM_VEXT, FORM_VSPLAT, INTRS, intr_param_is_const, intrinsic_is_foreign,
+    FORM_BITS, FORM_CAST, FORM_FEAT, FORM_INTR, FORM_LOAD, FORM_LOAD_DUP, FORM_STORE, FORM_VBIN,
+    FORM_VCMP, FORM_VEXT, FORM_VINS, FORM_VNEG, FORM_VSEL, FORM_VSPLAT, FORM_VSUM, INTRS,
+    intr_param_is_const, intrinsic_is_foreign,
 };
 use crate::back::mc_arm64::arch::ma_intr;
 use crate::back::mc_arm64::vector::{ma_vbin, ma_vcmp, ma_vext, ma_vsplat};
@@ -107,6 +108,31 @@ pub fn gen_intrinsic(mut cx: *FnCtx, n: i64, f: i64, id: i64) -> bool {
             }
             return true;
         }
+        if form == FORM_LOAD_DUP {
+            // (T6) the element's checked address (or the raw:: pointer) in the
+            // first register, then the instruction (ld1r)
+            let s = INTRS[id].mem_param;
+            let arg = child(n, s);
+            let mut ptr = 0;
+            if FNS[f].param_count < INTRS[id].nparams {
+                ptr = alloc_slot(8, 8);
+                gen_expr(cx, arg);
+                store_reg_to_frame(cx, R_ACC, ptr);
+            } else {
+                ptr = gen_vector_address(cx, arg, child(n, s + 1), 1, TYPES[NODES[arg].ty].a);
+            }
+            load_reg_from_frame(cx, R_ACC, ptr);
+            let mut regs: [i64; 8] = [-1; 8];
+            let imms: [i64; 8] = [0; 8];
+            regs[s] = R_ACC;
+            if X86 { mx_intr(cx, id, VREG, regs[..], imms[..]); }
+            else { ma_intr(cx, id, VREG, regs[..], imms[..]); }
+            let r = alloc_slot(type_size(ret), 16);
+            emit_frame_addr(cx, R_ADDR, r);
+            store_register(cx, VREG, ret);
+            emit_frame_addr(cx, R_ACC, r);
+            return true;
+        }
         if form == FORM_CAST {
             let v = gen_vector_to_slot(cx, child(n, 0));
             emit_frame_addr(cx, R_ACC, v);
@@ -153,7 +179,10 @@ pub fn gen_intrinsic(mut cx: *FnCtx, n: i64, f: i64, id: i64) -> bool {
         // (a float result in v0: the float accumulator's d0/s0)
         let d = if vector_result || is_float(ret) { VREG } else { 0 };
         let work = if INTRS[id].work != 0 { SYM_PRIMITIVE[INTRS[id].work] } else { ret };
-        if form == FORM_INTR {
+        // (T6: the forms of an exact generic operation are their instruction
+        // here, so that -O0 checks the operation -O1 and -O2 make)
+        if form == FORM_INTR || form == FORM_VNEG || form == FORM_VINS || form == FORM_VSEL
+            || form == FORM_VSUM {
             if X86 { mx_intr(cx, id, d, regs[..], imms[..]); }
             else { ma_intr(cx, id, d, regs[..], imms[..]); }
         } else if form == FORM_VSPLAT {
