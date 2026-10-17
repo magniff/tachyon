@@ -8,6 +8,13 @@
 // the fallback and the oracle (tests/run/std_utf8_simd.tach).
 
 use std::{Display, Fmt, Iterator, Option, Result};
+use std::arch::aarch64::{
+    uint8x16_t, vaddlvq_u8, vandq_u8, vceqq_u8, vcgtq_u8, vcltq_u8, vdupq_n_u8, veorq_u8, vextq_u8,
+    vget_lane_u64, vget_low_u16, vget_low_u8, vld1q_u8, vmaxvq_u8, vmovl_high_u16, vmovl_high_u8,
+    vmovl_u16, vmovl_u8, vorrq_u8, vqsubq_u8, vqtbl1q_u8, vreinterpret_u64_u8, vreinterpretq_u16_u8,
+    vshrn_n_u16, vshrq_n_u8, vst1q_u32, vsubq_u8,
+};
+use std::arch::detect;
 use std::num::{count_ones, trailing_zeros};
 
 // ---- UTF-8 (0.20) ----
@@ -154,7 +161,7 @@ fn utf8_subpart(v: [u8], i: i64) -> (i64, bool) {
 // Whether v is UTF-8, as Rust's `str::from_utf8`: Ok, or where and why
 // not. ASCII goes 16 bytes a step (two aligned words).
 #[pure]
-pub fn validate_utf8(v: [u8]) -> Result<(), Utf8Error> {
+pub fn validate_utf8_scalar(v: [u8]) -> Result<(), Utf8Error> {
     let len = v.len;
     let blocks_end = if len >= 16 { len - 15 } else { 0 };
     let align = utf8_align(v);
@@ -208,7 +215,7 @@ pub fn is_utf8(v: [u8]) -> bool {
 
 // The length of v's longest prefix of ASCII bytes (below 0x80).
 #[pure]
-pub fn ascii_prefix_len(v: [u8]) -> i64 {
+pub fn ascii_prefix_len_scalar(v: [u8]) -> i64 {
     let len = v.len;
     let mut i = 0;
     let head = utf8_align(v);
@@ -234,7 +241,7 @@ pub fn ascii_prefix_len(v: [u8]) -> i64 {
 // The length of v's longest prefix of printable ASCII, 0x20 to 0x7E: the
 // bytes a terminal puts on the screen one cell each without a lookup.
 #[pure]
-pub fn ascii_printable_prefix_len(v: [u8]) -> i64 {
+pub fn ascii_printable_prefix_len_scalar(v: [u8]) -> i64 {
     let len = v.len;
     let mut i = 0;
     let head = utf8_align(v);
@@ -271,7 +278,7 @@ pub fn ascii_printable_prefix_len(v: [u8]) -> i64 {
 // The number of code points of UTF-8 text v: its bytes that are not
 // continuation bytes, counted a word at a time (Rust's `chars().count()`).
 #[pure]
-pub fn count_chars(v: [u8]) -> i64 {
+pub fn count_chars_scalar(v: [u8]) -> i64 {
     let len = v.len;
     let mut i = 0;
     let mut n = 0;
@@ -383,34 +390,51 @@ pub fn decode_at(v: [u8], i: i64) -> u64 {
 // The code point at v[*pos] of any bytes, moving pos past what it read:
 // the scalar value of a well-formed sequence, or U+FFFD for an ill-formed
 // one, which covers its maximal subpart (as Rust's `from_utf8_lossy`,
-// WHATWG's decoder and terminals). *pos must be below v.len.
+// WHATWG's decoder and terminals). *pos must be below v.len. Each length
+// of a well-formed sequence is checked and decoded in one place.
 #[pure]
+#[inline]
 pub fn lossy_next(v: [u8], pos: &mut i64) -> u32 {
     let i = *pos;
     let first = v[i];
-    if first < 128 {
+    if first < 0x80 {
         *pos = i + 1;
         return first as u32;
     }
-    let w = utf8_char_width(first);
     let len = v.len;
-    let ok = if w == 2 {
-        i + 1 < len && utf8_is_cont(v[i + 1])
-    } else if w == 3 {
-        i + 2 < len && utf8_second_ok(first, v[i + 1]) && utf8_is_cont(v[i + 2])
-    } else if w == 4 {
-        i + 3 < len && utf8_second_ok(first, v[i + 1]) && utf8_is_cont(v[i + 2])
-            && utf8_is_cont(v[i + 3])
-    } else {
-        false
-    };
-    if ok {
-        next_code_point(v, pos).unwrap()
-    } else {
-        let (n, _) = utf8_subpart(v, i);
-        *pos = i + n;
-        0xfffd
+    if first < 0xe0 {
+        if first >= 0xc2 && i + 1 < len {
+            let b1 = v[i + 1];
+            if (b1 & 0xc0) == 0x80 {
+                *pos = i + 2;
+                return (((first & 0x1f) as u32) << 6) | (b1 & 0x3f) as u32;
+            }
+        }
+    } else if first < 0xf0 {
+        if i + 2 < len {
+            let b1 = v[i + 1];
+            let b2 = v[i + 2];
+            let second = if first == 0xe0 { b1 >= 0xa0 } else if first == 0xed { b1 < 0xa0 }
+                else { true };
+            if second && (b1 & 0xc0) == 0x80 && (b2 & 0xc0) == 0x80 {
+                *pos = i + 3;
+                return (((first & 0x0f) as u32) << 12) | (((b1 & 0x3f) as u32) << 6)
+                    | (b2 & 0x3f) as u32;
+            }
+        }
+    } else if first < 0xf5 && i + 3 < len {
+        let b1 = v[i + 1];
+        let b2 = v[i + 2];
+        let b3 = v[i + 3];
+        if utf8_second_ok(first, b1) && (b2 & 0xc0) == 0x80 && (b3 & 0xc0) == 0x80 {
+            *pos = i + 4;
+            return (((first & 0x07) as u32) << 18) | (((b1 & 0x3f) as u32) << 12)
+                | (((b2 & 0x3f) as u32) << 6) | (b3 & 0x3f) as u32;
+        }
     }
+    let (n, _) = utf8_subpart(v, i);
+    *pos = i + n;
+    0xfffd
 }
 
 // The UTF-8 bytes of code point cp into out[0..n]; n, 1 to 4. A surrogate
@@ -465,7 +489,7 @@ pub fn utf8_len(cp: u32) -> i64 {
 // keeps it for the next buffer; at the true end, lossy_next decodes it.
 // ASCII is widened 8 bytes a step.
 #[pure]
-pub fn decode_into(v: [u8], out: &mut [u32]) -> (i64, i64) {
+pub fn decode_into_scalar(v: [u8], out: &mut [u32]) -> (i64, i64) {
     let len = v.len;
     let cap = out.len;
     let align = utf8_align(v);
@@ -669,8 +693,31 @@ impl Iterator for CodePoints {
         let mut acc = init;
         let s = self.s[0..self.back];
         let mut i = self.front;
-        while let Some(c) = next_code_point(s, &mut i) {
-            acc = g(acc, c);
+        // (next_code_point, inline, without its Option)
+        while i < s.len {
+            let x = s[i];
+            if x < 0x80 {
+                acc = g(acc, x as u32);
+                i += 1;
+                continue;
+            }
+            let init = (x & 0x1f) as u32;
+            let y = s[i + 1];
+            let mut ch = (init << 6) | (y & 0x3f) as u32;
+            if x >= 0xe0 {
+                let z = s[i + 2];
+                let y_z = (((y & 0x3f) as u32) << 6) | (z & 0x3f) as u32;
+                ch = (init << 12) | y_z;
+                if x >= 0xf0 {
+                    ch = ((init & 7) << 18) | (y_z << 6) | (s[i + 3] & 0x3f) as u32;
+                    i += 4;
+                } else {
+                    i += 3;
+                }
+            } else {
+                i += 2;
+            }
+            acc = g(acc, ch);
         }
         acc
     }
@@ -690,4 +737,363 @@ impl CodePoints {
     pub fn offset(self: &CodePoints) -> i64 {
         self.front
     }
+}
+
+// ---- UTF-8 with NEON (0.20) ----
+//
+// The bulk routines, dispatched: on AArch64 (`detect("neon")`, folded to
+// true there) 16 bytes a step with NEON, the design's D2; elsewhere, and
+// for the last bytes, the scalar code above, which is also the oracle the
+// NEON versions are tested against (tests/run/std_utf8_simd.tach).
+//
+// Validation is Keiser and Lemire's ("Validating UTF-8 in less than one
+// instruction per byte", 2021; simdjson's lookup4): three table lookups
+// on the nibbles of each byte and the one before it give the errors of
+// every two-byte window, and a saturating subtraction checks the third
+// and fourth bytes of the longer forms. It says only whether a block is
+// valid: where it is not, the scalar code finds the error and reports it
+// as Rust does, from the start of the sequence the block begins in.
+
+// The error classes of Keiser and Lemire's tables, a bit each.
+const UTF8_TOO_SHORT: u8 = 1;
+const UTF8_TOO_LONG: u8 = 2;
+const UTF8_OVERLONG_3: u8 = 4;
+const UTF8_TOO_LARGE: u8 = 8;
+const UTF8_SURROGATE: u8 = 16;
+const UTF8_OVERLONG_2: u8 = 32;
+const UTF8_TOO_LARGE_1000: u8 = 64;
+const UTF8_OVERLONG_4: u8 = 64;
+const UTF8_TWO_CONTS: u8 = 128;
+const UTF8_CARRY: u8 = UTF8_TOO_SHORT | UTF8_TOO_LONG | UTF8_TWO_CONTS;
+
+// By the high nibble of the first byte of a pair.
+const UTF8_KL_BYTE1_HIGH: [u8; 16] = [
+    UTF8_TOO_LONG, UTF8_TOO_LONG, UTF8_TOO_LONG, UTF8_TOO_LONG, UTF8_TOO_LONG, UTF8_TOO_LONG,
+    UTF8_TOO_LONG, UTF8_TOO_LONG, UTF8_TWO_CONTS, UTF8_TWO_CONTS, UTF8_TWO_CONTS, UTF8_TWO_CONTS,
+    UTF8_TOO_SHORT | UTF8_OVERLONG_2, UTF8_TOO_SHORT,
+    UTF8_TOO_SHORT | UTF8_OVERLONG_3 | UTF8_SURROGATE,
+    UTF8_TOO_SHORT | UTF8_TOO_LARGE | UTF8_TOO_LARGE_1000 | UTF8_OVERLONG_4,
+];
+
+// By the low nibble of the first byte of a pair.
+const UTF8_KL_BYTE1_LOW: [u8; 16] = [
+    UTF8_CARRY | UTF8_OVERLONG_3 | UTF8_OVERLONG_2 | UTF8_OVERLONG_4, UTF8_CARRY | UTF8_OVERLONG_2,
+    UTF8_CARRY, UTF8_CARRY, UTF8_CARRY | UTF8_TOO_LARGE,
+    UTF8_CARRY | UTF8_TOO_LARGE | UTF8_TOO_LARGE_1000,
+    UTF8_CARRY | UTF8_TOO_LARGE | UTF8_TOO_LARGE_1000,
+    UTF8_CARRY | UTF8_TOO_LARGE | UTF8_TOO_LARGE_1000,
+    UTF8_CARRY | UTF8_TOO_LARGE | UTF8_TOO_LARGE_1000,
+    UTF8_CARRY | UTF8_TOO_LARGE | UTF8_TOO_LARGE_1000,
+    UTF8_CARRY | UTF8_TOO_LARGE | UTF8_TOO_LARGE_1000,
+    UTF8_CARRY | UTF8_TOO_LARGE | UTF8_TOO_LARGE_1000,
+    UTF8_CARRY | UTF8_TOO_LARGE | UTF8_TOO_LARGE_1000,
+    UTF8_CARRY | UTF8_TOO_LARGE | UTF8_TOO_LARGE_1000 | UTF8_SURROGATE,
+    UTF8_CARRY | UTF8_TOO_LARGE | UTF8_TOO_LARGE_1000,
+    UTF8_CARRY | UTF8_TOO_LARGE | UTF8_TOO_LARGE_1000,
+];
+
+// By the high nibble of the second byte of a pair.
+const UTF8_KL_BYTE2_HIGH: [u8; 16] = [
+    UTF8_TOO_SHORT, UTF8_TOO_SHORT, UTF8_TOO_SHORT, UTF8_TOO_SHORT, UTF8_TOO_SHORT,
+    UTF8_TOO_SHORT, UTF8_TOO_SHORT, UTF8_TOO_SHORT,
+    UTF8_TOO_LONG | UTF8_OVERLONG_2 | UTF8_TWO_CONTS | UTF8_OVERLONG_3 | UTF8_TOO_LARGE_1000
+        | UTF8_OVERLONG_4,
+    UTF8_TOO_LONG | UTF8_OVERLONG_2 | UTF8_TWO_CONTS | UTF8_OVERLONG_3 | UTF8_TOO_LARGE,
+    UTF8_TOO_LONG | UTF8_OVERLONG_2 | UTF8_TWO_CONTS | UTF8_SURROGATE | UTF8_TOO_LARGE,
+    UTF8_TOO_LONG | UTF8_OVERLONG_2 | UTF8_TWO_CONTS | UTF8_SURROGATE | UTF8_TOO_LARGE,
+    UTF8_TOO_SHORT, UTF8_TOO_SHORT, UTF8_TOO_SHORT, UTF8_TOO_SHORT,
+];
+
+// The errors of the 16 bytes cur, prev the 16 before them.
+#[inline]
+fn utf8_kl_errors(prev: uint8x16_t, cur: uint8x16_t, t1h: uint8x16_t, t1l: uint8x16_t,
+    t2h: uint8x16_t) -> uint8x16_t {
+    let prev1 = vextq_u8(prev, cur, 15);
+    let b1h = vqtbl1q_u8(t1h, vshrq_n_u8(prev1, 4));
+    let b1l = vqtbl1q_u8(t1l, vandq_u8(prev1, vdupq_n_u8(0x0f)));
+    let b2h = vqtbl1q_u8(t2h, vshrq_n_u8(cur, 4));
+    let special = vandq_u8(vandq_u8(b1h, b1l), b2h);
+    // (the third and fourth bytes of 3- and 4-byte forms must continue)
+    let third = vqsubq_u8(vextq_u8(prev, cur, 14), vdupq_n_u8(0xe0 - 0x80));
+    let fourth = vqsubq_u8(vextq_u8(prev, cur, 13), vdupq_n_u8(0xf0 - 0x80));
+    let must = vandq_u8(vorrq_u8(third, fourth), vdupq_n_u8(0x80));
+    veorq_u8(must, special)
+}
+
+// The length of a prefix of v that is UTF-8 and ends at a char boundary,
+// found 64 bytes a step: the scalar code checks the rest, from where this
+// stops (3 bytes before the end of the last block, or before the block
+// with an error, backed up to the start of the sequence there).
+fn utf8_validate_neon(v: [u8]) -> i64 {
+    let t1h = vld1q_u8(UTF8_KL_BYTE1_HIGH[..], 0);
+    let t1l = vld1q_u8(UTF8_KL_BYTE1_LOW[..], 0);
+    let t2h = vld1q_u8(UTF8_KL_BYTE2_HIGH[..], 0);
+    let zero = vdupq_n_u8(0);
+    let mut prev = zero;
+    let mut i = 0;
+    while i + 64 <= v.len {
+        let a = vld1q_u8(v, i);
+        let b = vld1q_u8(v, i + 16);
+        let c = vld1q_u8(v, i + 32);
+        let d = vld1q_u8(v, i + 48);
+        let any = vorrq_u8(vorrq_u8(a, b), vorrq_u8(c, d));
+        if vmaxvq_u8(any) < 0x80 {
+            // (ASCII: an error only when the bytes before end in the middle
+            // of a sequence)
+            if vmaxvq_u8(vqsubq_u8(prev, utf8_incomplete_max())) != 0 {
+                break;
+            }
+        } else {
+            let e = vorrq_u8(vorrq_u8(utf8_kl_errors(prev, a, t1h, t1l, t2h),
+                utf8_kl_errors(a, b, t1h, t1l, t2h)), vorrq_u8(utf8_kl_errors(b, c, t1h, t1l, t2h),
+                utf8_kl_errors(c, d, t1h, t1l, t2h)));
+            if vmaxvq_u8(e) != 0 {
+                break;
+            }
+        }
+        prev = d;
+        i += 64;
+    }
+    while i + 16 <= v.len {
+        let a = vld1q_u8(v, i);
+        if vmaxvq_u8(utf8_kl_errors(prev, a, t1h, t1l, t2h)) != 0 {
+            break;
+        }
+        prev = a;
+        i += 16;
+    }
+    // (the pairs checked so far end before i: a sequence that starts at
+    // i - 3 or later may be wrong; back to the start of the one there,
+    // over at most 3 continuation bytes, all valid before it)
+    let mut j = if i > 3 { i - 3 } else { 0 };
+    let mut k = 0;
+    while j > 0 && k < 3 && utf8_is_cont(v[j]) {
+        j -= 1;
+        k += 1;
+    }
+    j
+}
+
+// The largest last bytes a block may have and end with its sequences
+// whole: below 0xF0, 0xE0 and 0xC0 in its last three.
+#[inline]
+fn utf8_incomplete_max() -> uint8x16_t {
+    vld1q_u8(UTF8_INCOMPLETE_MAX[..], 0)
+}
+
+const UTF8_INCOMPLETE_MAX: [u8; 16] = [255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 0xef, 0xdf, 0xbf];
+
+// Whether v is UTF-8, as Rust's `str::from_utf8`: Ok, or where and why
+// not (Rust's Utf8Error). NEON on AArch64, 64 bytes a step on ASCII.
+#[pure]
+pub fn validate_utf8(v: [u8]) -> Result<(), Utf8Error> {
+    let mut start = 0;
+    if detect("neon") {
+        start = utf8_validate_neon(v);
+        if start == v.len {
+            return Ok(());
+        }
+    }
+    match validate_utf8_scalar(v[start..v.len]) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(Utf8Error { valid_up_to: e.valid_up_to + start, error_len: e.error_len }),
+    }
+}
+
+// The bit mask of the bytes where m (a compare's result) is set: 4 bits a
+// byte, so trailing_zeros(mask) / 4 is the first.
+#[inline]
+fn utf8_mask4(m: uint8x16_t) -> u64 {
+    vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(m), 4)), 0)
+}
+
+// The length of v's longest prefix of ASCII bytes (below 0x80).
+#[pure]
+pub fn ascii_prefix_len(v: [u8]) -> i64 {
+    let mut i = 0;
+    if detect("neon") {
+        let top = vdupq_n_u8(0x7f);
+        while i + 32 <= v.len {
+            let a = vld1q_u8(v, i);
+            let b = vld1q_u8(v, i + 16);
+            if vmaxvq_u8(vorrq_u8(a, b)) >= 0x80 {
+                break;
+            }
+            i += 32;
+        }
+        while i + 16 <= v.len {
+            let m = vcgtq_u8(vld1q_u8(v, i), top);
+            if vmaxvq_u8(m) != 0 {
+                return i + trailing_zeros(utf8_mask4(m)) / 4;
+            }
+            i += 16;
+        }
+    }
+    i + ascii_prefix_len_scalar(v[i..v.len])
+}
+
+// The length of v's longest prefix of printable ASCII, 0x20 to 0x7E: the
+// bytes a terminal puts on the screen one cell each without a lookup.
+#[pure]
+pub fn ascii_printable_prefix_len(v: [u8]) -> i64 {
+    let mut i = 0;
+    if detect("neon") {
+        let lo = vdupq_n_u8(0x20);
+        let hi = vdupq_n_u8(0x7e);
+        while i + 16 <= v.len {
+            let x = vld1q_u8(v, i);
+            let bad = vorrq_u8(vcltq_u8(x, lo), vcgtq_u8(x, hi));
+            if vmaxvq_u8(bad) != 0 {
+                return i + trailing_zeros(utf8_mask4(bad)) / 4;
+            }
+            i += 16;
+        }
+    }
+    i + ascii_printable_prefix_len_scalar(v[i..v.len])
+}
+
+// The number of code points of UTF-8 text v: its bytes that are not
+// continuation bytes (Rust's `chars().count()`), 16 a step.
+#[pure]
+pub fn count_chars(v: [u8]) -> i64 {
+    let mut i = 0;
+    let mut conts = 0;
+    if detect("neon") {
+        let mask = vdupq_n_u8(0xc0);
+        let cont = vdupq_n_u8(0x80);
+        while i + 16 <= v.len {
+            // (a lane counts its continuation bytes, 255 steps at most)
+            let mut acc = vdupq_n_u8(0);
+            let mut steps = 0;
+            while steps < 255 && i + 16 <= v.len {
+                let m = vceqq_u8(vandq_u8(vld1q_u8(v, i), mask), cont);
+                acc = vsubq_u8(acc, m);
+                i += 16;
+                steps += 1;
+            }
+            conts += vaddlvq_u8(acc) as i64;
+        }
+    }
+    (i - conts) + count_chars_scalar(v[i..v.len])
+}
+
+// Decodes any bytes v into code points out, lossily (U+FFFD per maximal
+// subpart, as lossy_next): (bytes consumed, code points produced). It
+// stops when out is full, and before an incomplete sequence at the end of
+// v, which more bytes could complete: a stream's decoder (Utf8Decoder)
+// keeps it for the next buffer; at the true end, lossy_next decodes it.
+// ASCII is widened 16 bytes a step with NEON.
+#[pure]
+pub fn decode_into(v: [u8], out: &mut [u32]) -> (i64, i64) {
+    let mut i = 0;
+    let mut n = 0;
+    loop {
+        if detect("neon") {
+            while i + 16 <= v.len && n + 16 <= out.len {
+                let x = vld1q_u8(v, i);
+                if vmaxvq_u8(x) >= 0x80 {
+                    break;
+                }
+                let lo = vmovl_u8(vget_low_u8(x));
+                let hi = vmovl_high_u8(x);
+                vst1q_u32(out, n, vmovl_u16(vget_low_u16(lo)));
+                vst1q_u32(out, n + 4, vmovl_high_u16(lo));
+                vst1q_u32(out, n + 8, vmovl_u16(vget_low_u16(hi)));
+                vst1q_u32(out, n + 12, vmovl_high_u16(hi));
+                i += 16;
+                n += 16;
+            }
+        }
+        if i >= v.len || n >= out.len {
+            return (i, n);
+        }
+        // (then the scalar code, up to the next 16 ASCII bytes; all the
+        // rest when the NEON loop could not take those: too little room)
+        let mut stop = if detect("neon") { utf8_next_ascii_run(v, i) } else { v.len };
+        if stop == i {
+            stop = v.len;
+        } else if stop < v.len {
+            // (with the run's first byte: a sequence cut short before it
+            // is then a U+FFFD, not one left for the next buffer)
+            stop += 1;
+        }
+        let (c, m) = decode_into_scalar(v[i..stop], &mut out[n..out.len]);
+        i += c;
+        n += m;
+        if i < stop || stop == v.len {
+            return (i, n);
+        }
+    }
+}
+
+// Where the next 16 ASCII bytes start in v at or after i (v.len when
+// none): the scalar decoding stops there for the NEON loop.
+fn utf8_next_ascii_run(v: [u8], i: i64) -> i64 {
+    let mut k = i;
+    let mut run = 0;
+    while k < v.len {
+        if v[k] < 0x80 {
+            run += 1;
+            if run == 16 {
+                // (back to its start, on a char boundary: ASCII is one)
+                return k - 15;
+            }
+        } else {
+            run = 0;
+        }
+        k += 1;
+    }
+    v.len
+}
+
+// The index of the first byte b in s, or None: memchr's, 16 bytes a step.
+#[pure]
+pub fn memchr(b: u8, s: [u8]) -> Option<i64> {
+    let mut i = 0;
+    if detect("neon") {
+        let needle = vdupq_n_u8(b);
+        while i + 16 <= s.len {
+            let m = vceqq_u8(vld1q_u8(s, i), needle);
+            if vmaxvq_u8(m) != 0 {
+                return Some(i + trailing_zeros(utf8_mask4(m)) / 4);
+            }
+            i += 16;
+        }
+    }
+    while i < s.len {
+        if s[i] == b {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+// The index of the last byte b in s, or None: memrchr's, 16 bytes a step.
+#[pure]
+pub fn memrchr(b: u8, s: [u8]) -> Option<i64> {
+    let mut e = s.len;
+    if detect("neon") {
+        let needle = vdupq_n_u8(b);
+        while e >= 16 {
+            let m = vceqq_u8(vld1q_u8(s, e - 16), needle);
+            if vmaxvq_u8(m) != 0 {
+                return Some(e - 16 + (63 - leading_zeros_u64(utf8_mask4(m))) / 4);
+            }
+            e -= 16;
+        }
+    }
+    while e > 0 {
+        e -= 1;
+        if s[e] == b {
+            return Some(e);
+        }
+    }
+    None
+}
+
+#[inline]
+fn leading_zeros_u64(x: u64) -> i64 {
+    std::num::leading_zeros(x)
 }

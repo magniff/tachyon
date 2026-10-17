@@ -1,0 +1,86 @@
+// bench/std term_feed (0.20 A4, A5, D2): the 0.23 terminal's inner loop
+// over text (the design's §3, "The terminal budget"), on the `cat` of
+// source files, CJK and an emoji-heavy chat (text_gen.tach). A run of
+// printable ASCII goes 16 bytes a step (ascii_printable_prefix_len), each
+// of its bytes a cluster one column wide; any other code point is decoded,
+// steps the grapheme state and joins or ends the cluster, whose width is
+// the per-grapheme rule's (ClusterWidth); a control ends the cluster.
+// The same result as feeding every code point through GraphemeState and
+// ClusterWidth one at a time (tests/run/std_term_feed.tach). The result:
+// cells + clusters << 20 + controls << 40. Rust: printable-ASCII runs,
+// then graphemes(true) and UnicodeWidthStr::width over each non-ASCII run
+// (another rule: no checksum); C: mbrtowc and wcwidth per code point.
+mod text_gen;
+
+use std::str::{ascii_printable_prefix_len, lossy_next};
+use std::unicode::{ClusterWidth, GraphemeState, props};
+
+fn feed(s: [u8]) -> u64 {
+    let len = s.len;
+    let mut cells = 0;
+    let mut clusters = 0;
+    let mut controls = 0;
+    let mut st = GraphemeState::new();
+    let mut cw = ClusterWidth::start(0x20, props(0x20), false);
+    let mut open = false;
+    let mut i = 0;
+    while i < len {
+        let b = s[i];
+        if b >= 0x20 && b < 0x7f {
+            let n = ascii_printable_prefix_len(s[i..len]);
+            let p = props(b as u32);
+            if st.push_props(p) {
+                if open {
+                    cells += cw.width();
+                    clusters += 1;
+                }
+                cw = ClusterWidth::start(b as u32, p, false);
+                open = true;
+            } else {
+                cw.push(b as u32, p);
+            }
+            if n > 1 {
+                // (the bytes after the first each start a cluster of 1)
+                cells += cw.width() + n - 2;
+                clusters += n - 1;
+                let last = s[i + n - 1] as u32;
+                let q = props(last);
+                st.push_props(q);
+                cw = ClusterWidth::start(last, q, false);
+            }
+            i += n;
+        } else if b < 0x80 {
+            // a control: it ends the cluster, and the state starts over
+            if open {
+                cells += cw.width();
+                clusters += 1;
+                open = false;
+            }
+            controls += 1;
+            st = GraphemeState::new();
+            i += 1;
+        } else {
+            let cp = lossy_next(s, &mut i);
+            let p = props(cp);
+            if st.push_props(p) {
+                if open {
+                    cells += cw.width();
+                    clusters += 1;
+                }
+                cw = ClusterWidth::start(cp, p, false);
+                open = true;
+            } else {
+                cw.push(cp, p);
+            }
+        }
+    }
+    if open {
+        cells += cw.width();
+        clusters += 1;
+    }
+    cells as u64 + ((clusters as u64) << 20) + ((controls as u64) << 40)
+}
+
+fn main(gpa: Gpa) -> i32 {
+    text_gen::run("term_feed", [0, 2, 3][..], |s| feed(s), gpa)
+}
