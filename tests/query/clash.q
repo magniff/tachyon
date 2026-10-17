@@ -60,6 +60,7 @@ std::Buf::len	../../compiler/std/std.tach:491:12	method	pub fn len(self: &Buf<A>
 std::BinaryHeap::len	../../compiler/std/flat/collections.tach:192:12	method	pub fn len(self: &BinaryHeap<T, A>) -> i64
 std::MinHeap::len	../../compiler/std/flat/collections.tach:288:12	method	pub fn len(self: &MinHeap<T, A>) -> i64
 std::collections::hash_map::HashMap::len	../../compiler/std/collections/hash_map.tach:37:12	method	pub fn len(self: &HashMap<K, V, A>) -> i64
+std::collections::hash_set::HashSet::len	../../compiler/std/collections/hash_set.tach:35:12	method	pub fn len(self: &HashSet<T, A>) -> i64
 std::collections::raw_table::RawTable::len	../../compiler/std/collections/raw_table.tach:136:12	method	pub fn len(self: &Self) -> i64
 $ refs V2::len
 # clash/geom.tach

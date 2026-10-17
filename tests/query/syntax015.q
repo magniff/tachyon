@@ -8,8 +8,9 @@ std	<std>	529
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	15
-std::collections	<std>	6
+std::collections	<std>	8
 std::collections::hash_map	<std>	27
+std::collections::hash_set	<std>	18
 std::collections::raw_table	<std>	46
 std::collections::group	<std>	19
 std::io	<std>	7

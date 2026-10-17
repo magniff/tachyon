@@ -50,8 +50,9 @@ crate::route	route.tach	7
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	15
-std::collections	<std>	6
+std::collections	<std>	8
 std::collections::hash_map	<std>	27
+std::collections::hash_set	<std>	18
 std::collections::raw_table	<std>	46
 std::collections::group	<std>	19
 std::io	<std>	7
@@ -125,7 +126,7 @@ crate::heap::free_heap	heap.tach:63:8	fn	pub fn free_heap(h: &mut MinHeap)
 crate::heap::is_empty	heap.tach:18:8	fn	pub fn is_empty(h: &MinHeap) -> bool
 crate::heap::pop	heap.tach:35:8	fn	pub fn pop(h: &mut MinHeap) -> Option<Entry>
 crate::graph::edges_from	graph.tach:55:8	fn	pub fn edges_from(g: &Graph, i: i64) -> [Edge]
-std::Vec::filled_in	<std>:1494:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
+std::Vec::filled_in	<std>:1474:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
 crate::heap::push	heap.tach:22:8	fn	pub fn push(h: &mut MinHeap, e: Entry)
 std::Option::unwrap	<std>:114:12	method	pub fn unwrap(self: Option<T>) -> T requires self.is_some() else "called unwrap on None"
 std::Vec::set	<std>:296:12	method	pub fn set(self: &mut Vec<T, A>, i: i64, x: T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"

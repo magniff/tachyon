@@ -52,8 +52,9 @@ done with them (`guide std#overview`).
 An allocator (`gpa`, from `fn main(gpa: Gpa)`, passed down as a
 parameter) goes only to constructors and `_in` functions; methods
 (`push`, `insert`, `clone`, `sort`) use the container's own. Not in
-std: `String` (text is `[u8]` and `Buf`), `HashSet` (`HashMap<K,
-bool>`), `Box`.
+std: `String` (text is `[u8]` and `Buf`), `Box`. (0.20)
+`std::collections::HashSet`: `insert` (false if present), `contains`,
+`remove`, `iter()`.
 
 @PAGE-END@ More, a section at a time: `tachyonc guide std#the-api` (every item, a line each), `std#overview` (ownership, views, HashMap), `std#input` (reading stdin), `std#heaps` (priority queues); one item: `tachyonc guide --find NAME`; all of it: `tachyonc guide std --whole`.
 
@@ -75,7 +76,7 @@ Anything else is used by path (`std::print_int(n)`) or imported by name
 
 What a Rust programmer will miss: there is no `String` (use `[u8]` and
 `Buf`), no file reading (call C; iterators: `tachyonc guide
-iterators`), no `HashSet` (a `HashMap<K, bool>`). A `Vec` (and a `Buf`) indexes as
+iterators`). A `Vec` (and a `Buf`) indexes as
 its slice: `v[i]`, `v[i] = x`, `v[a..b]` (0.17), checked. Formatting is 0.15's f-strings,
 `println(f"{x:>4}")` (`tachyonc guide formatting`); errors are enums in a
 `Result` (`tachyonc guide conversions`). A `Vec`, `Buf` or `HashMap` is
