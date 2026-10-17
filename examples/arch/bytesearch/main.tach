@@ -1,0 +1,154 @@
+// A byte search (memchr): where a byte first occurs in a buffer, 64 bytes
+// an iteration with NEON compares on AArch64 (16 at a time with SSE2 on
+// x86-64), against the portable loop. `./bytesearch` checks that they
+// agree on every length, offset and position up to 300 bytes;
+// `./bytesearch simd` and `./bytesearch portable` scan 8 GiB with one of
+// them, for timing (README.md).
+import "string.h" as c;
+
+use std::arch::aarch64::{
+    vceqq_u8, vdupq_n_u8, vget_lane_u64, vld1q_u8, vmaxvq_u8, vorrq_u8, vreinterpret_u64_u8,
+    vreinterpretq_u16_u8, vshrn_n_u16,
+};
+use std::arch::detect;
+use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8};
+use std::trailing_zeros;
+
+// The first i >= from with s[i] == b, or -1, a byte at a time.
+fn find_byte_portable(s: [u8], b: u8, from: i64) -> i64 {
+    let mut i = from;
+    while i < s.len {
+        if s[i] == b {
+            return i;
+        }
+        i += 1;
+    }
+    -1
+}
+
+// The same with NEON. Four compares are or-ed and tested at once
+// (`vmaxvq_u8`: any lane set); the 16-byte loop then finds which byte, by
+// the movemask AArch64 lacks: `vshrn_n_u16(.., 4)` narrows the mask to 4
+// bits a byte, read as one u64.
+fn find_byte_neon(s: [u8], b: u8, from: i64) -> i64 {
+    let needle = vdupq_n_u8(b);
+    let mut i = from;
+    while i + 64 <= s.len {
+        let e0 = vceqq_u8(vld1q_u8(s, i), needle);
+        let e1 = vceqq_u8(vld1q_u8(s, i + 16), needle);
+        let e2 = vceqq_u8(vld1q_u8(s, i + 32), needle);
+        let e3 = vceqq_u8(vld1q_u8(s, i + 48), needle);
+        if vmaxvq_u8(vorrq_u8(vorrq_u8(e0, e1), vorrq_u8(e2, e3))) != 0 {
+            break;
+        }
+        i += 64;
+    }
+    while i + 16 <= s.len {
+        let eq = vceqq_u8(vld1q_u8(s, i), needle);
+        let m = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)), 0);
+        if m != 0 {
+            return i + trailing_zeros(m) / 4;
+        }
+        i += 16;
+    }
+    find_byte_portable(s, b, i)
+}
+
+// The same with SSE2: one bit a byte from `_mm_movemask_epi8`. On an
+// AArch64 build it is checked and never generated.
+fn find_byte_sse2(s: [u8], b: u8, from: i64) -> i64 {
+    let needle = _mm_set1_epi8(b as i8);
+    let mut i = from;
+    while i + 16 <= s.len {
+        let m = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(s, i), needle));
+        if m != 0 {
+            return i + trailing_zeros(m as u64);
+        }
+        i += 16;
+    }
+    find_byte_portable(s, b, i)
+}
+
+// The first i with s[i] == b, or -1: by the CPU's SIMD when it has it.
+// Each detect is a constant here (neon is AArch64's baseline, sse2
+// x86-64's), so the build keeps one branch.
+fn find_byte(s: [u8], b: u8) -> i64 {
+    if detect("neon") {
+        find_byte_neon(s, b, 0)
+    } else if detect("sse2") {
+        find_byte_sse2(s, b, 0)
+    } else {
+        find_byte_portable(s, b, 0)
+    }
+}
+
+// Pseudo-random letters a..y (xorshift), no 'z'.
+fn letters(v: &mut Vec<u8>, n: i64) {
+    let mut x: u64 = 0x9e3779b97f4a7c15;
+    for _ in 0..n {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        v.push('a' + (x % 25) as u8);
+    }
+}
+
+// Every length and offset up to 300, a 'z' at every position (and none):
+// the two searches agree.
+fn check(gpa: Gpa) {
+    let mut v: Vec<u8> = Vec::with_capacity_in(320, gpa);
+    letters(&mut v, 320);
+    let s = v.as_slice();
+    let mut searches = 0;
+    let mut wrong = 0;
+    for off in 0..16 {
+        for len in 0..300 {
+            let part = s[off..off + len];
+            for b in "aqyz" {
+                searches += 1;
+                if find_byte(part, b) != find_byte_portable(part, b, 0) {
+                    wrong += 1;
+                }
+            }
+        }
+    }
+    let mut z: Vec<u8> = Vec::with_capacity_in(300, gpa);
+    letters(&mut z, 300);
+    for at in 0..300 {
+        z.as_slice()[at] = 'z';
+        searches += 1;
+        if find_byte(z.as_slice(), 'z') != at {
+            wrong += 1;
+        }
+        z.as_slice()[at] = 'a';
+    }
+    println(f"{searches} searches, {wrong} wrong");
+    println(f"first 'q' at {find_byte(s, 'q')}, first 'z' at {find_byte(s, 'z')}");
+}
+
+// 8192 scans of 1 MiB for its last byte, with `find` or the portable loop.
+fn bench(gpa: Gpa, simd: bool) {
+    let n = 1 << 20;
+    let mut v: Vec<u8> = Vec::with_capacity_in(n, gpa);
+    letters(&mut v, n - 1);
+    v.push('z');
+    let s = v.as_slice();
+    let mut total = 0;
+    for r in 0..8192 {
+        // (from a different start each time: no scan is the one before)
+        let part = s[r % 16..s.len];
+        total += r % 16 + if simd { find_byte(part, 'z') }
+            else { find_byte_portable(part, 'z', 0) };
+    }
+    println(f"found at {total / 8192}, 8192 times");
+}
+
+fn main(gpa: Gpa, argc: i64, argv: **u8) -> i32 {
+    let mode = if argc > 1 { unsafe { argv[1][0..c::strlen(argv[1]) as i64] } } else { "" };
+    if mode == "simd" || mode == "portable" {
+        bench(gpa, mode == "simd");
+    } else {
+        check(gpa);
+    }
+    0
+}
