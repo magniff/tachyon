@@ -3,7 +3,7 @@
 ## an item shown with its clauses, a distinct type, test functions.
 $ items
 crate	syntax018/main.tach	14
-std	<std>	558
+std	<std>	562
 crate::tests	syntax018/main.tach	1
 std::ops	<std>	5
 std::iter	<std>	67
@@ -23,6 +23,9 @@ std::clone	<std>	1
 std::random	<std>	17
 std::sys	<std>	192
 std::time	<std>	40
+std::str	<std>	40
+std::unicode	<std>	74
+std::unicode::tables	<std>	27
 $ show crate::push Stack Percent
 // crate::push	syntax018/main.tach:19-27	effects: panic
 fn push(s: &mut Stack, x: i64)

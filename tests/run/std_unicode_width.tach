@@ -1,0 +1,133 @@
+// std's display width (0.20, compiler/std/unicode/width.tach): every
+// fully-qualified emoji sequence of Unicode's emoji-test.txt is one
+// grapheme cluster 2 columns wide; unicode-width's documented cases per
+// code point; clusters by the per-grapheme rule; whole texts both ways.
+// ARGS: @ROOT@/tests/std/unicode/emoji-test.txt
+import "stdio.h" as c;
+
+use std::trim;
+use std::str::encode_utf8;
+use std::unicode::{
+    UNICODE_VERSION, char_width, char_width_cjk, cluster_width, count_graphemes, str_width,
+    str_width_chars,
+};
+
+fn read_all(path: *u8, gpa: Gpa) -> Buf {
+    let mut text = Buf::new_in(gpa);
+    let f = unsafe { c::fopen(path, c"rb") };
+    if f == 0 as *c::FILE {
+        return text;
+    }
+    let mut chunk = [0u8; 65536];
+    loop {
+        let n = unsafe { c::fread(&chunk[0], 1, 65536, f) } as i64;
+        if n <= 0 {
+            break;
+        }
+        text.push_str(chunk[0..n]);
+    }
+    unsafe { c::fclose(f); }
+    text
+}
+
+fn hex(s: [u8]) -> u32 {
+    let mut v: u32 = 0;
+    for i in 0..s.len {
+        let b = s[i];
+        let d = if b >= '0' && b <= '9' { (b - '0') as u32 } else { (b - 'A') as u32 + 10 };
+        v = v * 16 + d;
+    }
+    v
+}
+
+fn cw(s: [u8]) -> i64 {
+    cluster_width(s)
+}
+
+fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
+    let (major, minor, update) = UNICODE_VERSION;
+    println(f"Unicode {major}.{minor}.{update}");
+    // unicode-width's per code point cases
+    let cps: [u32; 16] = [0x61, 0x0, 0x7f, 0x9f, 0xa0, 0xad, 0x300, 0x1100, 0x1160, 0x115f,
+        0x17d8, 0x1f1e6, 0x2460, 0x3b1, 0x4e16, 0xff48];
+    for k in 0..16 {
+        print(
+            f"{if k > 0 { " " } else { "" }}{cps[k]:x}:{char_width(cps[k])}/{char_width_cjk(cps[k])}");
+    }
+    println("");
+    // clusters
+    println(
+        f"{cw("👨‍👩‍👧")} {cw("❤️")} {cw("❤")} {cw("#️⃣")} {cw("#")} {cw("🇫🇷")} {cw("🇫")} {cw("⌚")} {cw("⌚︎")} {cw("👍🏽")} {cw("☝🏽")} {cw("é")} {cw("각")} {cw("\u{301}")} {cw("🈚︎")}");
+    println(
+        f"{str_width("héllo, 世界! 👨‍👩‍👧 🇫🇷")} {str_width_chars("héllo, 世界! 👨‍👩‍👧 🇫🇷")} {str_width("①②", cjk: true)} {str_width_chars("a\tb\n")}");
+
+    // emoji-test.txt: `CPS ; fully-qualified # ...`
+    if argc < 2 {
+        return 2;
+    }
+    let text = unsafe { read_all(argv[1], gpa) };
+    let t = text.as_slice();
+    let mut utf8 = Buf::new_in(gpa);
+    let mut full = 0;
+    let mut other = 0;
+    let mut other_one = 0;
+    let mut bad = 0;
+    let mut from = 0;
+    for i in 0..t.len + 1 {
+        if i < t.len && t[i] != '\n' {
+            continue;
+        }
+        let line = t[from..i];
+        from = i + 1;
+        if line.len == 0 || line[0] == '#' {
+            continue;
+        }
+        let mut semi = 0;
+        while semi < line.len && line[semi] != ';' {
+            semi += 1;
+        }
+        let mut hash = semi;
+        while hash < line.len && line[hash] != '#' {
+            hash += 1;
+        }
+        let status = trim(line[semi + 1..hash]);
+        utf8.clear();
+        let field = trim(line[0..semi]);
+        let mut k = 0;
+        let mut e = [0u8; 4];
+        while k < field.len {
+            let mut end = k;
+            while end < field.len && field[end] != ' ' {
+                end += 1;
+            }
+            let n = encode_utf8(hex(field[k..end]), &mut e);
+            utf8.push_str(e[0..n]);
+            k = end + 1;
+        }
+        let s = utf8.as_slice();
+        if status == "fully-qualified" {
+            full += 1;
+            if count_graphemes(s) != 1 || cluster_width(s) != 2 || str_width(s) != 2 {
+                bad += 1;
+                if bad <= 10 {
+                    println(
+                        f"not one 2-wide cluster: {field} ({count_graphemes(s)} clusters, width {cluster_width(s)})");
+                }
+            }
+        } else {
+            other += 1;
+            if count_graphemes(s) == 1 {
+                other_one += 1;
+            }
+        }
+    }
+    println(
+        f"fully-qualified: {full}, {bad} not one 2-wide cluster; others: {other}, {other_one} one cluster");
+    0
+}
+
+// EXPECT: Unicode 18.0.0
+// EXPECT: 61:1/1 0:-1/-1 7f:-1/-1 9f:-1/-1 a0:1/1 ad:0/0 300:0/0 1100:2/2 1160:0/0 115f:2/2 17d8:3/3 1f1e6:1/1 2460:1/2 3b1:1/1 4e16:2/2 ff48:2/2
+// EXPECT: 2 2 1 2 1 2 1 2 1 2 2 1 2 0 2
+// EXPECT: 18 22 4 2
+// EXPECT: fully-qualified: 3963, 0 not one 2-wide cluster; others: 1281, 1281 one cluster

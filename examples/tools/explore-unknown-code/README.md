@@ -42,7 +42,7 @@ generated header:
 ```console
 $ tachyonc query items
 crate	main.tach	6
-std	<std>	558
+std	<std>	562
 crate::graph	graph.tach	11
 crate::heap	heap.tach	7
 crate::network	network.tach	2
@@ -65,6 +65,9 @@ std::clone	<std>	1
 std::random	<std>	17
 std::sys	<std>	192
 std::time	<std>	40
+std::str	<std>	40
+std::unicode	<std>	74
+std::unicode::tables	<std>	27
 $ tachyonc query items route
 # crate::route	route.tach
 8	const	pub const TRANSFER_MINUTES: i64 = 5
@@ -126,10 +129,10 @@ crate::heap::free_heap	heap.tach:63:8	fn	pub fn free_heap(h: &mut MinHeap)
 crate::heap::is_empty	heap.tach:18:8	fn	pub fn is_empty(h: &MinHeap) -> bool
 crate::heap::pop	heap.tach:35:8	fn	pub fn pop(h: &mut MinHeap) -> Option<Entry>
 crate::graph::edges_from	graph.tach:55:8	fn	pub fn edges_from(g: &Graph, i: i64) -> [Edge]
-std::Vec::filled_in	<std>:1509:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
+std::Vec::filled_in	<std>:1511:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
 crate::heap::push	heap.tach:22:8	fn	pub fn push(h: &mut MinHeap, e: Entry)
-std::Option::unwrap	<std>:116:12	method	pub fn unwrap(self: Option<T>) -> T requires self.is_some() else "called unwrap on None"
-std::Vec::set	<std>:298:12	method	pub fn set(self: &mut Vec<T, A>, i: i64, x: T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
+std::Vec::set	<std>:300:12	method	pub fn set(self: &mut Vec<T, A>, i: i64, x: T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
+std::Option::unwrap	<std>:118:12	method	pub fn unwrap(self: Option<T>) -> T requires self.is_some() else "called unwrap on None"
 note query.budget: over the budget of 600 tokens, left out: calls 2, types or uses 9, callers 1
 try: tachyonc query callers quickest
 try: tachyonc query context quickest --budget 1800
