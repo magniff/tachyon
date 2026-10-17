@@ -81,6 +81,7 @@ tools` the ones a program needs.
 | the type of an expression | `target/tachyonc query type FILE:LINE:COL` |
 | each local's kind, moves and views at a position (0.17) | `target/tachyonc query own FILE:LINE:COL` |
 | what a function may do (allocate, io, panic, loop forever) | `target/tachyonc query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
+| the CPU intrinsic for a task, its instruction and feature; what a function needs of the CPU (0.19) | `target/tachyonc query arch WORDS` (`--feature crc`, `--equiv NAME`); `query show vqtbl1q_u8`; `query features NAME --why crc` |
 | where it is defined, its signature | `target/tachyonc query def NAME` |
 | what a module contains; a type's methods | `target/tachyonc query items MODULE`; `query items TYPE` |
 | the item at a compiler error's position | `target/tachyonc query show FILE:LINE` (`--with-comments`: its section comment too) |
