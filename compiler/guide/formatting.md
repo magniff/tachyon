@@ -20,12 +20,13 @@ those three bytes (a literal holding `{name}` of a local passed to
   string literals work in it (`{m.get("k"):?}`); f-strings do not nest.
 - The holes are evaluated where the f-string is written, once, left to
   right; the value holds copies, so it can be stored and printed later.
-- The spec after `:` is `[<|>][0][width][.precision][?|x|X|b|c]`: `<`
-  and `>` align (numbers go right by default, text left), `0` pads with
-  zeros, `.N` gives a float N decimals, `?` is Debug, `x`/`X` hex, `b`
-  binary, `c` a `u8` as its byte (a `u8` is a number otherwise).
+- The spec after `:` is `[<|>][0][width][.precision][?|x|X|b|c|e|E]`:
+  `<` and `>` align (numbers go right by default, text left), `0` pads
+  with zeros, `.N` gives a float N decimals, `?` is Debug, `x`/`X` hex,
+  `b` binary, `c` a `u8` as its byte (a `u8` is a number otherwise),
+  `e`/`E` a float with an exponent (0.20: `1.5e3`).
 - Floats print the shortest text that reads back as the same value
-  (`2.5`, `0.1`).
+  (`2.5`, `0.1`), byte for byte as Rust prints them (#numbers).
 - (0.17) Passed straight to `print`, `println`, `eprint`, `eprintln`,
   `format_in` or `b.push_fmt`, an f-string is written in place: no
   closure, no `Interp`, no copy of the function, at every `-O` level.
@@ -78,6 +79,41 @@ fn main() -> i32 {
 Printing writes through a static 4 KB buffer, one `write` per call, no
 heap. Rust's `println!("{}", x)` is `println(f"{x}")`, `format!` is
 `format_in(f"...", gpa)`; there are no macros.
+
+## Numbers
+
+(0.20) A float's `{}`, `{:?}`, `{:e}` and `{:E}` are Rust's text, byte for
+byte: the shortest digits that read back as the value (Schubfach), `{}`
+never with an exponent, `{:?}` with one below 1e-4 and from 1e16 on.
+`std::num` reads text back, as Rust's `s.parse()` does, and writes it
+without a Fmt:
+
+| call | is |
+|---|---|
+| `parse_f64(s) -> Result<f64, ParseFloatError>`, `parse_f32` | Rust's `f64::from_str`: `-1.5e3`, `.5`, `inf`, `NaN`; no spaces; correctly rounded |
+| `parse_i64_radix(s, 16) -> Result<i64, ParseIntError>`, `parse_u64_radix` | Rust's `from_str_radix` (radix 2 to 36) |
+| `write_f64(v, FloatFmt::Debug, out) -> i64`, `write_f32` | the text into `out` (`FLOAT_TEXT_MAX` bytes always fit): its length |
+| `fmt_u64(v, &mut out) -> i64`, `fmt_i64` | the digits at the end of a `[u8; 20]`: where they start |
+| `f64_to_bits(v)`, `f64_from_bits(u)`, `f32_...` | the IEEE bits (Rust's `to_bits`) |
+
+```tach
+use std::num::{FloatFmt, parse_f64, parse_i64_radix, write_f64};
+
+fn main() -> i32 {
+    let x = parse_f64("0.1").unwrap() + parse_f64("2e-1").unwrap();
+    println(f"{x} {x:?} {x:e} {1e16:?} {1e-7} {0.1f32}");
+    let mut out: [u8; 32] = [0; 32];
+    let n = write_f64(1234.5, FloatFmt::LowerExp, out[..]);
+    println(out[0..n]);
+    println(f"{parse_i64_radix("-ff", 16):?} {parse_f64("1,5").is_err()}");
+    0
+}
+```
+```out
+0.30000000000000004 0.30000000000000004 3.0000000000000004e-1 1e16 0.0000001 0.1
+1.2345e3
+Ok(-255) true
+```
 
 ## Display and Debug
 

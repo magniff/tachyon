@@ -29,7 +29,7 @@
 # section not read imports nothing: front/modules/lookup).
 
 BEGIN {
-    n = split("Stable sort (0.15)|HashMap|Debug of HashMap (0.15)|== on HashMap (0.15)|Iterators (0.14)|Adapters|Sources|Text (0.14)|Errors of reading and parsing (0.15)|Integer limits (0.15)|Bits (0.16)|Conversions (0.15)|Clone and hashing (0.15)|Clone, Eq, Ord and Hash without an impl (0.15)|Arenas (0.16)|FixedBuf (0.16)|HashMap's room (0.16)|Slices (0.16)|Gpa's leak checks (0.16)|The checking allocator's hooks for arenas (0.16)|Panic and unreachable, the prelude's (0.17)|Testing (0.18)|Non-null pointers (0.18)|The test runtime's implementation (0.18)|The fuzzer's implementation (0.18)|Heaps (0.18.1)|More of Vec and Range (0.18.1)|Run-time CPU features (0.19)|CPU features on macOS (0.19)|CPU features on Linux (0.19)|CPU features on x86-64 (0.19)|std::iter|std::convert|std::clone", lz, "|")
+    n = split("Stable sort (0.15)|HashMap|Debug of HashMap (0.15)|== on HashMap (0.15)|Iterators (0.14)|Adapters|Sources|Text (0.14)|Errors of reading and parsing (0.15)|Integer limits (0.15)|Bits (0.16)|Conversions (0.15)|Clone and hashing (0.15)|Clone, Eq, Ord and Hash without an impl (0.15)|Arenas (0.16)|FixedBuf (0.16)|HashMap's room (0.16)|Slices (0.16)|Gpa's leak checks (0.16)|The checking allocator's hooks for arenas (0.16)|Panic and unreachable, the prelude's (0.17)|Testing (0.18)|Non-null pointers (0.18)|The test runtime's implementation (0.18)|The fuzzer's implementation (0.18)|Heaps (0.18.1)|More of Vec and Range (0.18.1)|Run-time CPU features (0.19)|CPU features on macOS (0.19)|CPU features on Linux (0.19)|CPU features on x86-64 (0.19)|std::iter|std::convert|std::clone|Numbers: bits and wide products (0.20)|Numbers: digits (0.20)|Numbers: integer text (0.20)|Numbers: the shortest digits of a float (0.20)|Numbers: float text (0.20)|Numbers: float parsing (0.20)|Numbers: float parsing's slow path (0.20)|Numbers: powers of ten (0.20)|Numbers: the slow path's digits of 5^s (0.20)|Display and Debug of floats (0.20)", lz, "|")
     for (i = 1; i <= n; i++) LAZY[lz[i]] = 1
     TRIGGERS["Iterators (0.14)"] = "Iterator IntoIterator"
     # (0.20: the Iterator trait in std::iter, before its first banner)
@@ -205,7 +205,7 @@ END {
         out = ""
         for (k = 1; k + 1 <= np; k += 2) {
             ty = ip[k + 1]
-            if (!(ty in DEFINED)) ty = "*"
+            if (!(ty in DEFINED) && ty != "f64" && ty != "f32") ty = "*"
             out = out " " ip[k] " " ty
         }
         impls[i] = out

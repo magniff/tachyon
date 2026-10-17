@@ -42,7 +42,7 @@ generated header:
 ```console
 $ tachyonc query items
 crate	main.tach	6
-std	<std>	533
+std	<std>	529
 crate::graph	graph.tach	11
 crate::heap	heap.tach	7
 crate::network	network.tach	2
@@ -53,8 +53,9 @@ std::slice	<std>	15
 std::collections	<std>	2
 std::collections::hash_map	<std>	26
 std::io	<std>	7
-std::fmt	<std>	73
-std::num	<std>	15
+std::fmt	<std>	80
+std::num	<std>	83
+std::num::tables	<std>	4
 std::convert	<std>	2
 std::clone	<std>	1
 $ tachyonc query items route
@@ -118,7 +119,7 @@ crate::heap::free_heap	heap.tach:63:8	fn	pub fn free_heap(h: &mut MinHeap)
 crate::heap::is_empty	heap.tach:18:8	fn	pub fn is_empty(h: &MinHeap) -> bool
 crate::heap::pop	heap.tach:35:8	fn	pub fn pop(h: &mut MinHeap) -> Option<Entry>
 crate::graph::edges_from	graph.tach:55:8	fn	pub fn edges_from(g: &Graph, i: i64) -> [Edge]
-std::Vec::filled_in	<std>:1553:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
+std::Vec::filled_in	<std>:1506:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
 crate::heap::push	heap.tach:22:8	fn	pub fn push(h: &mut MinHeap, e: Entry)
 std::Option::unwrap	<std>:113:12	method	pub fn unwrap(self: Option<T>) -> T requires self.is_some() else "called unwrap on None"
 std::Vec::set	<std>:295:12	method	pub fn set(self: &mut Vec<T, A>, i: i64, x: T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
@@ -198,11 +199,11 @@ $ tachyonc guide --find 'spec width align' --budget 900 | head -11
   string literals work in it (`{m.get("k"):?}`); f-strings do not nest.
 - The holes are evaluated where the f-string is written, once, left to
   right; the value holds copies, so it can be stored and printed later.
-- The spec after `:` is `[<|>][0][width][.precision][?|x|X|b|c]`: `<`
-  and `>` align (numbers go right by default, text left), `0` pads with
-  zeros, `.N` gives a float N decimals, `?` is Debug, `x`/`X` hex, `b`
-  binary, `c` a `u8` as its byte (a `u8` is a number otherwise).
-- Floats print the shortest text that reads back as the same value
+- The spec after `:` is `[<|>][0][width][.precision][?|x|X|b|c|e|E]`:
+  `<` and `>` align (numbers go right by default, text left), `0` pads
+  with zeros, `.N` gives a float N decimals, `?` is Debug, `x`/`X` hex,
+  `b` binary, `c` a `u8` as its byte (a `u8` is a number otherwise),
+  `e`/`E` a float with an exponent (0.20: `1.5e3`).
 ```
 
 And the fix's condition, tried on a snippet before it goes in (`try`

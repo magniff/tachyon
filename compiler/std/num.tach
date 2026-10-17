@@ -1,4 +1,12 @@
-// std::num: integer limits and bits (0.20: from flat/io.tach).
+// std::num: integer limits and bits (0.20: from flat/io.tach), and number
+// conversion (0.20): integers to and from text, the shortest digits of a
+// float, float text in Rust's formats, float parsing. The tables are
+// std::num::tables', made by tools/numtables/gen.tach.
+
+use std::{Debug, Display, Fmt, ParseIntError, decimal_len, panic_str};
+use tables::{LSHIFT_TABLE, POW10_128, POW10_MIN, POW5_DIGITS};
+
+pub mod tables;
 
 // ---- Integer limits (0.15) ----
 
@@ -46,4 +54,1358 @@ pub fn leading_zeros(x: u64) -> i64 {
 // 1 << trailing_zeros(x) is x & -x, its lowest set bit.
 pub fn trailing_zeros(x: u64) -> i64 {
     count_ones(~x & (x - 1))
+}
+
+// ---- Numbers: bits and wide products (0.20) ----
+
+// Number conversion (0.20, docs/design/collections-text-io.md §2.5.5):
+// integers to and from text, the shortest digits of a float (Schubfach),
+// float text in Rust's formats, and float parsing (Rust's dec2flt: Clinger's
+// fast path, Eisel and Lemire, the simple-decimal fallback). The tables are
+// numtables.tach's, made by tools/numtables/gen.tach. Every routine is a
+// function of its arguments and those immutable tables, and allocates
+// nothing.
+//
+// unsafe: only the bit casts below (a union read: both fields are 8 (or 4)
+// plain bytes, and every bit pattern is a valid f64 and u64).
+
+#[repr(C)]
+union NumF64Bits { f: f64, u: u64 }
+
+#[repr(C)]
+union NumF32Bits { f: f32, u: u32 }
+
+// v's IEEE 754 bits (Rust's f64::to_bits).
+#[inline]
+pub fn f64_to_bits(v: f64) -> u64 {
+    let b = NumF64Bits { f: v };
+    // (see the header: any bits are a valid u64)
+    unsafe { b.u }
+}
+
+// The f64 with these IEEE 754 bits (Rust's f64::from_bits).
+#[inline]
+pub fn f64_from_bits(u: u64) -> f64 {
+    let b = NumF64Bits { u: u };
+    // (see the header: any bits are a valid f64)
+    unsafe { b.f }
+}
+
+// v's IEEE 754 bits (Rust's f32::to_bits).
+#[inline]
+pub fn f32_to_bits(v: f32) -> u32 {
+    let b = NumF32Bits { f: v };
+    // (see the header: any bits are a valid u32)
+    unsafe { b.u }
+}
+
+// The f32 with these IEEE 754 bits (Rust's f32::from_bits).
+#[inline]
+pub fn f32_from_bits(u: u32) -> f32 {
+    let b = NumF32Bits { u: u };
+    // (see the header: any bits are a valid f32)
+    unsafe { b.f }
+}
+
+// The high 64 bits of the 128-bit product a * b.
+#[inline]
+pub fn mul_hi(a: u64, b: u64) -> u64 {
+    let a0 = a & 0xffffffff;
+    let a1 = a >> 32;
+    let b0 = b & 0xffffffff;
+    let b1 = b >> 32;
+    let p01 = a0 * b1;
+    let p10 = a1 * b0;
+    let mid = ((a0 * b0) >> 32) + (p01 & 0xffffffff) + (p10 & 0xffffffff);
+    a1 * b1 + (p01 >> 32) + (p10 >> 32) + (mid >> 32)
+}
+
+// The 128-bit product a * b as (high, low) (Rust: (a as u128) * (b as u128)).
+#[inline]
+pub fn wide_mul(a: u64, b: u64) -> (u64, u64) {
+    (mul_hi(a, b), a * b)
+}
+
+// ---- Numbers: digits (0.20) ----
+
+// The digit pairs "00" to "99".
+const NUM_PAIRS: [u8] = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
+
+// x's decimal digits in out[at..at + n], n its number of digits
+// (decimal_len(x)), two at a time from the end.
+#[inline]
+fn num_put_digits(out: [u8], at: i64, n: i64, x: u64) {
+    let mut i = at + n;
+    let mut v = x;
+    for _ in 0..5 {
+        if !(v >= 10000) {
+            break;
+        }
+        let q = v / 10000;
+        let r = v - q * 10000;
+        let hi = (r / 100) as i64 * 2;
+        let lo = (r % 100) as i64 * 2;
+        out[i - 4] = NUM_PAIRS[hi];
+        out[i - 3] = NUM_PAIRS[hi + 1];
+        out[i - 2] = NUM_PAIRS[lo];
+        out[i - 1] = NUM_PAIRS[lo + 1];
+        i -= 4;
+        v = q;
+    }
+    if v >= 100 {
+        let q = v / 100;
+        let r = (v - q * 100) as i64 * 2;
+        out[i - 2] = NUM_PAIRS[r];
+        out[i - 1] = NUM_PAIRS[r + 1];
+        i -= 2;
+        v = q;
+    }
+    if v >= 10 {
+        let r = v as i64 * 2;
+        out[i - 2] = NUM_PAIRS[r];
+        out[i - 1] = NUM_PAIRS[r + 1];
+    } else {
+        out[i - 1] = '0' + v as u8;
+    }
+}
+
+// s[i..i + 8] as a little-endian u64 (i + 8 <= s.len).
+#[inline]
+fn num_load8(s: [u8], i: i64) -> u64 {
+    if i < 0 || i + 8 > s.len {
+        panic_str("num_load8: out of the slice");
+    }
+    // (unsafe: s[i..i + 8] is in the slice, checked above; an 8-byte load
+    // at any address is defined on AArch64 and x86-64, both little-endian,
+    // and the compiler assumes no alignment of a *u64 read)
+    unsafe { *(&s.ptr[i] as *u64) }
+}
+
+// Whether the 8 bytes of v are ASCII digits.
+#[inline]
+fn num_is_8digits(v: u64) -> bool {
+    (((v + 0x4646464646464646) | (v - 0x3030303030303030)) & 0x8080808080808080) == 0
+}
+
+// The number the 8 ASCII digits of v spell, the first in the lowest byte
+// (SWAR: pairs, then fours, then the eight).
+#[inline]
+fn num_parse_8digits(v: u64) -> u64 {
+    let x = v - 0x3030303030303030;
+    let y = x * 10 + (x >> 8);
+    (((y & 0x000000ff000000ff) * 0x000f424000000064)
+        + (((y >> 16) & 0x000000ff000000ff) * 0x0000271000000001)) >> 32
+}
+
+// ---- Numbers: integer text (0.20) ----
+
+// v's decimal digits at the end of out, out[start..20]: the start (Rust's
+// itoa; Display of a u64 is that text).
+pub fn fmt_u64(v: u64, out: &mut [u8; 20]) -> i64 {
+    let n = decimal_len(v);
+    num_put_digits((*out)[..], 20 - n, n, v);
+    20 - n
+}
+
+// v in decimal at the end of out, after a '-' when negative: the start.
+pub fn fmt_i64(v: i64, out: &mut [u8; 20]) -> i64 {
+    let negative = v < 0;
+    let u = if negative { (-(v + 1)) as u64 + 1 } else { v as u64 };
+    let n = decimal_len(u);
+    num_put_digits((*out)[..], 20 - n, n, u);
+    if negative {
+        (*out)[19 - n] = '-';
+        return 19 - n;
+    }
+    20 - n
+}
+
+// The value of byte c as a digit of radix (2 to 36): 0-9, then a-z or
+// A-Z; radix or more when it is none.
+#[inline]
+fn num_digit_value(c: u8, radix: u32) -> u32 {
+    let d = (c - '0') as u32;
+    if radix <= 10 || d < 10 {
+        return d;
+    }
+    let l = ((c | 0x20) - 'a') as u32;
+    if l < 26 { l + 10 } else { 36 }
+}
+
+// The first byte of s[i..] that is no digit of radix, as the error (an
+// overflow when there is none).
+fn num_overflow_or_digit(s: [u8], i: i64, radix: u32) -> ParseIntError {
+    for k in i..s.len {
+        if num_digit_value(s[k], radix) >= radix {
+            return ParseIntError::InvalidDigit(k);
+        }
+    }
+    ParseIntError::Overflow
+}
+
+// The digits s[i..] in radix, as a u64 that may be at most `max`; Err as
+// parse_int reports them: the first byte that is no digit, else Overflow.
+#[inline]
+fn num_parse_digits_u64(s: [u8], start: i64, radix: u32, max: u64) -> Result<u64, ParseIntError> {
+    let mut i = start;
+    let len = s.len;
+    let mut v: u64 = 0;
+    if radix == 10 && len - i <= 18 {
+        // (at most 18 digits: no overflow; 8 at a time)
+        for _ in 0..s.len + 1 {
+            if !(i + 8 <= len) {
+                break;
+            }
+            let w = num_load8(s, i);
+            if !num_is_8digits(w) {
+                break;
+            }
+            v = v * 100000000 + num_parse_8digits(w);
+            i += 8;
+        }
+        for _ in 0..s.len + 1 {
+            if !(i < len) {
+                break;
+            }
+            let d = s[i] - '0';
+            if d >= 10 {
+                return Result::Err(ParseIntError::InvalidDigit(i));
+            }
+            v = v * 10 + d as u64;
+            i += 1;
+        }
+        if v > max {
+            return Result::Err(ParseIntError::Overflow);
+        }
+        return Result::Ok(v);
+    }
+    let r = radix as u64;
+    let limit = max / r;
+    for _ in 0..s.len + 1 {
+        if !(i < len) {
+            break;
+        }
+        let d = num_digit_value(s[i], radix);
+        if d >= radix {
+            return Result::Err(ParseIntError::InvalidDigit(i));
+        }
+        if v > limit || v * r > max - d as u64 {
+            return Result::Err(num_overflow_or_digit(s, i, radix));
+        }
+        v = v * r + d as u64;
+        i += 1;
+    }
+    Result::Ok(v)
+}
+
+fn num_check_radix(radix: u32) {
+    if radix < 2 || radix > 36 {
+        panic_str("from_str_radix_int: must lie in the range `[2, 36]`");
+    }
+}
+
+// s as a u64 in radix (2 to 36; else a panic): Rust's u64::from_str_radix:
+// an optional '+', then digits (0-9, a-z or A-Z), nothing else. Err: Empty;
+// InvalidDigit(i), the index of the first byte that is no digit (a lone
+// '+' too); Overflow.
+pub fn parse_u64_radix(s: [u8], radix: u32) -> Result<u64, ParseIntError> {
+    num_check_radix(radix);
+    if s.len == 0 {
+        return Result::Err(ParseIntError::Empty);
+    }
+    let start = if s[0] == '+' { 1 } else { 0 };
+    if start == s.len {
+        return Result::Err(ParseIntError::InvalidDigit(0));
+    }
+    num_parse_digits_u64(s, start, radix, 0xffffffffffffffff)
+}
+
+// s as an i64 in radix (2 to 36; else a panic): Rust's i64::from_str_radix:
+// an optional '+' or '-', then digits, nothing else; errors as
+// parse_u64_radix's (Overflow on either side).
+pub fn parse_i64_radix(s: [u8], radix: u32) -> Result<i64, ParseIntError> {
+    num_check_radix(radix);
+    if s.len == 0 {
+        return Result::Err(ParseIntError::Empty);
+    }
+    let negative = s[0] == '-';
+    let start = if negative || s[0] == '+' { 1 } else { 0 };
+    if start == s.len {
+        return Result::Err(ParseIntError::InvalidDigit(0));
+    }
+    num_parse_i64_from(s, start, radix, negative)
+}
+
+// parse_i64_radix after the sign (s[start..] not empty).
+#[inline]
+fn num_parse_i64_from(s: [u8], start: i64, radix: u32, negative: bool) -> Result<i64,
+    ParseIntError> {
+    let max: u64 = if negative { 0x8000000000000000 } else { 0x7fffffffffffffff };
+    match num_parse_digits_u64(s, start, radix, max) {
+        Result::Ok(u) => Result::Ok(if negative { (0 - u) as i64 } else { u as i64 }),
+        Result::Err(e) => Result::Err(e),
+    }
+}
+
+// ---- Numbers: the shortest digits of a float (0.20) ----
+
+// Schubfach (Giulietti, "The Schubfach way to render doubles", 2020; the
+// layout of Bolz's C++ port): the shortest decimal d * 10^k in v's rounding
+// interval, the closest to v of those (ties to an even d). Rust's Display
+// and Debug write the same digits (Grisu with Dragon4's fallback finds
+// them too).
+
+// g * cp / 2^128 rounded to odd (g = (ghi, glo), 128 bits).
+#[inline]
+fn num_round_to_odd64(ghi: u64, glo: u64, cp: u64) -> u64 {
+    let x1 = mul_hi(glo, cp);
+    let y1 = mul_hi(ghi, cp);
+    let y0 = ghi * cp;
+    let z = y0 + x1;
+    let hi = if z < x1 { y1 + 1 } else { y1 };
+    if z > 1 { hi | 1 } else { hi }
+}
+
+// The shortest decimal of a positive finite double given as its fields
+// (significand bits f, biased exponent e): (d, k), d possibly with
+// trailing zeros.
+fn num_schubfach64(f: u64, e: i64) -> (u64, i64) {
+    let mut c = f;
+    let mut q: i64 = -1074;
+    if e != 0 {
+        c = f | 0x10000000000000;
+        q = e - 1075;
+        // (an integer: itself)
+        if q <= 0 && q > -53 && (c & ((1 << (-q) as u64) - 1)) == 0 {
+            return (c >> (-q) as u64, 0);
+        }
+    }
+    let even = (c & 1) == 0;
+    let closer = f == 0 && e > 1;
+    let cbl = if closer { 4 * c - 1 } else { 4 * c - 2 };
+    let cb = 4 * c;
+    let cbr = 4 * c + 2;
+    // k = floor(log10(2^q)), or floor(log10(3/4 2^q)) when the lower
+    // boundary is closer; h = q + floor(log2(10^-k)) + 1, from 1 to 4
+    let k = (q * 1262611 - (if closer { 524031 } else { 0 })) >> 22;
+    let h = (q + ((-k * 1741647) >> 19) + 1) as u64;
+    let at = 2 * (-k - POW10_MIN);
+    let ghi0 = POW10_128[at];
+    let glo = POW10_128[at + 1] + 1;
+    let ghi = if glo == 0 { ghi0 + 1 } else { ghi0 };
+    let vbl = num_round_to_odd64(ghi, glo, cbl << h);
+    let vb = num_round_to_odd64(ghi, glo, cb << h);
+    let vbr = num_round_to_odd64(ghi, glo, cbr << h);
+    let lower = if even { vbl } else { vbl + 1 };
+    let upper = if even { vbr } else { vbr - 1 };
+    let s = vb / 4;
+    if s >= 10 {
+        // (one digit fewer: at most one of u' and w' is inside)
+        let sp = s / 10;
+        let up_inside = lower <= 40 * sp;
+        let wp_inside = 40 * sp + 40 <= upper;
+        if up_inside != wp_inside {
+            return (if wp_inside { sp + 1 } else { sp }, k + 1);
+        }
+    }
+    let u_inside = lower <= 4 * s;
+    let w_inside = 4 * s + 4 <= upper;
+    if u_inside != w_inside {
+        return (if w_inside { s + 1 } else { s }, k);
+    }
+    // (vb, odd when inexact, equals mid only on an exact tie: up, as Rust's
+    // Grisu and Dragon4 round it, where Schubfach's paper rounds to even)
+    let mid = 4 * s + 2;
+    (if vb >= mid { s + 1 } else { s }, k)
+}
+
+// g * cp / 2^64 rounded to odd (g 64 bits, cp less than 2^32).
+#[inline]
+fn num_round_to_odd32(g: u64, cp: u64) -> u64 {
+    let b01 = cp * (g & 0xffffffff);
+    let b11 = cp * (g >> 32);
+    let hi = b11 + (b01 >> 32);
+    let y1 = hi >> 32;
+    if (hi & 0xffffffff) > 1 { y1 | 1 } else { y1 }
+}
+
+// num_schubfach64 for a float (f: 23 bits, e: 8).
+fn num_schubfach32(f: u64, e: i64) -> (u64, i64) {
+    let mut c = f;
+    let mut q: i64 = -149;
+    if e != 0 {
+        c = f | 0x800000;
+        q = e - 150;
+        if q <= 0 && q > -24 && (c & ((1 << (-q) as u64) - 1)) == 0 {
+            return (c >> (-q) as u64, 0);
+        }
+    }
+    let even = (c & 1) == 0;
+    let closer = f == 0 && e > 1;
+    let cbl = if closer { 4 * c - 1 } else { 4 * c - 2 };
+    let cb = 4 * c;
+    let cbr = 4 * c + 2;
+    let k = (q * 1262611 - (if closer { 524031 } else { 0 })) >> 22;
+    let h = (q + ((-k * 1741647) >> 19) + 1) as u64;
+    let g = POW10_128[2 * (-k - POW10_MIN)] + 1;
+    let vbl = num_round_to_odd32(g, cbl << h);
+    let vb = num_round_to_odd32(g, cb << h);
+    let vbr = num_round_to_odd32(g, cbr << h);
+    let lower = if even { vbl } else { vbl + 1 };
+    let upper = if even { vbr } else { vbr - 1 };
+    let s = vb / 4;
+    if s >= 10 {
+        let sp = s / 10;
+        let up_inside = lower <= 40 * sp;
+        let wp_inside = 40 * sp + 40 <= upper;
+        if up_inside != wp_inside {
+            return (if wp_inside { sp + 1 } else { sp }, k + 1);
+        }
+    }
+    let u_inside = lower <= 4 * s;
+    let w_inside = 4 * s + 4 <= upper;
+    if u_inside != w_inside {
+        return (if w_inside { s + 1 } else { s }, k);
+    }
+    // (vb, odd when inexact, equals mid only on an exact tie: up, as Rust's
+    // Grisu and Dragon4 round it, where Schubfach's paper rounds to even)
+    let mid = 4 * s + 2;
+    (if vb >= mid { s + 1 } else { s }, k)
+}
+
+// (d, k) without d's trailing zeros (d != 0).
+#[inline]
+fn num_trim_zeros(d: u64, k: i64) -> (u64, i64) {
+    let mut x = d;
+    let mut e = k;
+    for _ in 0..20 {
+        if !(x % 10 == 0) {
+            break;
+        }
+        x = x / 10;
+        e += 1;
+    }
+    (x, e)
+}
+
+// The shortest decimal of |v|, finite: (d, k), |v| reads back from d *
+// 10^k, d without trailing zeros (0 for a zero: (0, 0)). Those are the
+// digits Rust prints. Not finite: (0, 0).
+pub fn f64_shortest(v: f64) -> (u64, i32) {
+    let bits = f64_to_bits(v);
+    let f = bits & 0xfffffffffffff;
+    let e = ((bits >> 52) & 0x7ff) as i64;
+    if e == 0x7ff || (e == 0 && f == 0) {
+        return (0, 0);
+    }
+    let (d, k) = num_schubfach64(f, e);
+    let (d2, k2) = num_trim_zeros(d, k);
+    (d2, k2 as i32)
+}
+
+// f64_shortest for an f32: the shortest digits that read back as v as an f32.
+pub fn f32_shortest(v: f32) -> (u64, i32) {
+    let bits = f32_to_bits(v) as u64;
+    let f = bits & 0x7fffff;
+    let e = ((bits >> 23) & 0xff) as i64;
+    if e == 0xff || (e == 0 && f == 0) {
+        return (0, 0);
+    }
+    let (d, k) = num_schubfach32(f, e);
+    let (d2, k2) = num_trim_zeros(d, k);
+    (d2, k2 as i32)
+}
+
+// ---- Numbers: float text (0.20) ----
+
+// How write_f64 and write_f32 lay a float out, as Rust's formats do:
+// Display (`{}`) never with an exponent (`1e16` is `10000000000000000`,
+// `1e-7` is `0.0000001`); Debug (`{:?}`): `1.0`, and an exponent below
+// 1e-4 and from 1e16 on (`1e16`, `1e-7`); LowerExp (`{:e}`): `1.5e3`,
+// `0e0`; UpperExp (`{:E}`): `1.5E3`. All with the shortest digits that
+// read back as the value; `NaN`, `inf`, `-inf`.
+pub enum FloatFmt { Display, Debug, LowerExp, UpperExp }
+
+// The longest text write_f64 writes: 330 bytes (a sign, `0.`, 323 zeros
+// and digits; Display of the smallest subnormal).
+pub const FLOAT_TEXT_MAX: i64 = 330;
+
+// The text of (a '-' when negative) d * 10^k in mode, d without trailing
+// zeros (0: zero), into out[0..len] when it fits: len.
+fn num_float_text(out: [u8], negative: bool, d: u64, k: i64, mode: FloatFmt) -> i64 {
+    let n = decimal_len(d);
+    let e = k + n - 1;
+    let i = if negative { 1 } else { 0 };
+    let debug = mode == FloatFmt::Debug;
+    if mode == FloatFmt::LowerExp || mode == FloatFmt::UpperExp
+        || (debug && d != 0 && (e < -4 || e >= 16)) {
+        // d[.ddd]e[-]x
+        let ae = if e < 0 { -e } else { e };
+        let elen = decimal_len(ae as u64);
+        let point = if n > 1 { 1 } else { 0 };
+        let minus = if e < 0 { 1 } else { 0 };
+        let len = i + n + point + 1 + minus + elen;
+        if len > out.len {
+            return len;
+        }
+        if negative {
+            out[0] = '-';
+        }
+        num_put_digits(out, i + 1, n, d);
+        out[i] = out[i + 1];
+        let mut j = i + 1;
+        if n > 1 {
+            out[i + 1] = '.';
+            j = i + n + 1;
+        }
+        out[j] = if mode == FloatFmt::UpperExp { 'E' } else { 'e' };
+        if e < 0 {
+            out[j + 1] = '-';
+        }
+        num_put_digits(out, j + 1 + minus, elen, ae as u64);
+        return len;
+    }
+    if e < 0 {
+        // 0.000ddd
+        let zeros = -e - 1;
+        let len = i + 2 + zeros + n;
+        if len > out.len {
+            return len;
+        }
+        if negative {
+            out[0] = '-';
+        }
+        out[i] = '0';
+        out[i + 1] = '.';
+        for z in 0..zeros {
+            out[i + 2 + z] = '0';
+        }
+        num_put_digits(out, i + 2 + zeros, n, d);
+        return len;
+    }
+    if k >= 0 {
+        // ddd000 (Debug: ddd000.0)
+        let len = i + n + k + (if debug { 2 } else { 0 });
+        if len > out.len {
+            return len;
+        }
+        if negative {
+            out[0] = '-';
+        }
+        num_put_digits(out, i, n, d);
+        for z in 0..k {
+            out[i + n + z] = '0';
+        }
+        if debug {
+            out[i + n + k] = '.';
+            out[i + n + k + 1] = '0';
+        }
+        return len;
+    }
+    // dd.ddd: the digits one further, then the integer part moved back
+    let len = i + n + 1;
+    if len > out.len {
+        return len;
+    }
+    if negative {
+        out[0] = '-';
+    }
+    num_put_digits(out, i + 1, n, d);
+    for j in i..i + e + 1 {
+        out[j] = out[j + 1];
+    }
+    out[i + e + 1] = '.';
+    len
+}
+
+// The text of NaN or an infinity in out, when it fits: its length.
+fn num_float_special(out: [u8], nan: bool, negative: bool) -> i64 {
+    let t = if nan { "NaN" } else if negative { "-inf" } else { "inf" };
+    if t.len <= out.len {
+        for j in 0..t.len {
+            out[j] = t[j];
+        }
+    }
+    t.len
+}
+
+// v's text in mode (FloatFmt) into out when it fits (FLOAT_TEXT_MAX bytes
+// always do): its length. As Rust's `{}`, `{:?}`, `{:e}`, `{:E}`.
+pub fn write_f64(v: f64, mode: FloatFmt, out: [u8]) -> i64 {
+    let bits = f64_to_bits(v);
+    let negative = (bits >> 63) != 0;
+    let f = bits & 0xfffffffffffff;
+    let e = ((bits >> 52) & 0x7ff) as i64;
+    if e == 0x7ff {
+        return num_float_special(out, f != 0, negative);
+    }
+    if e == 0 && f == 0 {
+        return num_float_text(out, negative, 0, 0, mode);
+    }
+    let (d, k) = num_schubfach64(f, e);
+    let (d2, k2) = num_trim_zeros(d, k);
+    num_float_text(out, negative, d2, k2, mode)
+}
+
+// write_f64 for an f32: its own shortest digits (0.1f32 is `0.1`).
+pub fn write_f32(v: f32, mode: FloatFmt, out: [u8]) -> i64 {
+    let bits = f32_to_bits(v) as u64;
+    let negative = (bits >> 31) != 0;
+    let f = bits & 0x7fffff;
+    let e = ((bits >> 23) & 0xff) as i64;
+    if e == 0xff {
+        return num_float_special(out, f != 0, negative);
+    }
+    if e == 0 && f == 0 {
+        return num_float_text(out, negative, 0, 0, mode);
+    }
+    let (d, k) = num_schubfach32(f, e);
+    let (d2, k2) = num_trim_zeros(d, k);
+    num_float_text(out, negative, d2, k2, mode)
+}
+
+// ---- Numbers: float parsing (0.20) ----
+
+// Why parse_f64 failed (Rust's ParseFloatError): the text is empty, or it
+// is no float.
+pub enum ParseFloatError { Empty, Invalid }
+
+impl Display for ParseFloatError {
+    fn fmt(self: &ParseFloatError, f: &mut Fmt) {
+        match *self {
+            ParseFloatError::Empty => f.str("cannot parse float from empty string"),
+            ParseFloatError::Invalid => f.str("invalid float literal"),
+        }
+    }
+}
+
+impl Debug for ParseFloatError {
+    fn fmt_debug(self: &ParseFloatError, f: &mut Fmt) {
+        match *self {
+            ParseFloatError::Empty => f.str("Empty"),
+            ParseFloatError::Invalid => f.str("Invalid"),
+        }
+    }
+}
+
+// s as the nearest f64 (ties to even): Rust's f64::from_str. An optional
+// '+' or '-', then digits with an optional '.' (`1.`, `.5`; at least one
+// digit), then an optional exponent (`e` or `E`, an optional sign,
+// digits); or `inf`, `infinity`, `nan` in any case. Nothing else: no
+// spaces, no `_`, no hex. Too large is an infinity, too small a zero.
+pub fn parse_f64(s: [u8]) -> Result<f64, ParseFloatError> {
+    match num_dec2flt(s, false) {
+        Result::Ok(bits) => Result::Ok(f64_from_bits(bits)),
+        Result::Err(e) => Result::Err(e),
+    }
+}
+
+// parse_f64 for an f32: rounded once, to the nearest f32 (not through f64).
+pub fn parse_f32(s: [u8]) -> Result<f32, ParseFloatError> {
+    match num_dec2flt(s, true) {
+        Result::Ok(bits) => Result::Ok(f32_from_bits(bits as u32)),
+        Result::Err(e) => Result::Err(e),
+    }
+}
+
+// The decimal a text spells: mantissa * 10^exponent, the mantissa its
+// first 19 significant digits when there are more (many_digits).
+struct NumDecimalParts { mantissa: u64, exponent: i64, many_digits: bool }
+
+const NUM_MIN_19DIGIT: u64 = 1000000000000000000;
+
+// The digits at s[i..] appended to *m (wrapping), 8 at a time while they
+// last: the index after them.
+#[inline]
+fn num_take_digits(s: [u8], start: i64, m: &mut u64) -> i64 {
+    let mut i = start;
+    let len = s.len;
+    let mut v = *m;
+    for _ in 0..s.len + 1 {
+        if !(i + 8 <= len) {
+            break;
+        }
+        let w = num_load8(s, i);
+        if !num_is_8digits(w) {
+            break;
+        }
+        v = v * 100000000 + num_parse_8digits(w);
+        i += 8;
+    }
+    for _ in 0..s.len + 1 {
+        if !(i < len) {
+            break;
+        }
+        let d = s[i] - '0';
+        if d >= 10 {
+            break;
+        }
+        v = v * 10 + d as u64;
+        i += 1;
+    }
+    *m = v;
+    i
+}
+
+// num_take_digits until *m has 19 digits.
+fn num_take_19digits(s: [u8], start: i64, m: &mut u64) -> i64 {
+    let mut i = start;
+    let mut v = *m;
+    for _ in 0..s.len + 1 {
+        if !(v < NUM_MIN_19DIGIT && i < s.len) {
+            break;
+        }
+        let d = s[i] - '0';
+        if d >= 10 {
+            break;
+        }
+        v = v * 10 + d as u64;
+        i += 1;
+    }
+    *m = v;
+    i
+}
+
+// s (without its sign) as a decimal (Rust's parse_number); false when it
+// is not one.
+fn num_parse_number(s: [u8], out: &mut NumDecimalParts) -> bool {
+    let len = s.len;
+    let mut mantissa: u64 = 0;
+    let mut i = num_take_digits(s, 0, &mut mantissa);
+    let int_end = i;
+    let mut n_digits = i;
+    let mut exponent: i64 = 0;
+    if i < len && s[i] == '.' {
+        i += 1;
+        let before = i;
+        i = num_take_digits(s, i, &mut mantissa);
+        n_digits += i - before;
+        exponent = before - i;
+    }
+    if n_digits == 0 {
+        return false;
+    }
+    let mut exp_number: i64 = 0;
+    if i < len && (s[i] == 'e' || s[i] == 'E') {
+        i += 1;
+        let mut negative = false;
+        if i < len && (s[i] == '-' || s[i] == '+') {
+            negative = s[i] == '-';
+            i += 1;
+        }
+        if i >= len || s[i] - '0' >= 10 {
+            return false;
+        }
+        for _ in 0..s.len + 1 {
+            if !(i < len && s[i] - '0' < 10) {
+                break;
+            }
+            if exp_number < 0x10000 {
+                exp_number = 10 * exp_number + (s[i] - '0') as i64;
+            }
+            i += 1;
+        }
+        if negative {
+            exp_number = -exp_number;
+        }
+        exponent += exp_number;
+    }
+    if i != len {
+        return false;
+    }
+    out.mantissa = mantissa;
+    out.exponent = exponent;
+    out.many_digits = false;
+    if n_digits <= 19 {
+        return true;
+    }
+    // More than 19 digits, but maybe leading zeros
+    n_digits -= 19;
+    let mut p = 0;
+    for _ in 0..s.len + 1 {
+        if !(p < len && (s[p] == '.' || s[p] == '0')) {
+            break;
+        }
+        if s[p] == '0' {
+            n_digits -= 1;
+        }
+        p += 1;
+    }
+    if n_digits > 0 {
+        // 19 significant digits, then the exponent of what follows them
+        out.many_digits = true;
+        let mut m: u64 = 0;
+        let mut j = num_take_19digits(s, 0, &mut m);
+        if m >= NUM_MIN_19DIGIT {
+            out.exponent = int_end - j + exp_number;
+        } else {
+            // (stopped at the point)
+            j += 1;
+            let before = j;
+            j = num_take_19digits(s, j, &mut m);
+            out.exponent = before - j + exp_number;
+        }
+        out.mantissa = m;
+    }
+    true
+}
+
+// `inf`, `infinity` or `nan` in any case: (true, their bits); (false, 0)
+// when s is none.
+fn num_parse_inf_nan(s: [u8], negative: bool, single: bool) -> (bool, u64) {
+    let mut r: u64 = 0;
+    if s.len == 8 {
+        r = num_load8(s, 0);
+    } else if s.len == 3 {
+        r = (s[0] as u64) | ((s[1] as u64) << 8) | ((s[2] as u64) << 16);
+    } else {
+        return (false, 0);
+    }
+    // (upper case: bit 5 cleared; only a letter maps to a letter)
+    r = r & 0xdfdfdfdfdfdfdfdf;
+    let inf = (s.len == 3 && r == 0x464e49) || (s.len == 8 && r == 0x5954494e49464e49);
+    let nan = s.len == 3 && r == 0x4e414e;
+    if !inf && !nan {
+        return (false, 0);
+    }
+    let mut bits: u64 = if single { 0x7f800000 } else { 0x7ff0000000000000 };
+    if nan {
+        bits = if single { 0x7fc00000 } else { 0x7ff8000000000000 };
+    }
+    if negative {
+        bits |= if single { 0x80000000 } else { 0x8000000000000000 };
+    }
+    (true, bits)
+}
+
+// The exact powers of ten of f64 (10^0 to 10^22) and f32 (to 10^10), and
+// of u64 for the disguised fast path.
+const NUM_F64_POW10: [f64; 23] = [1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+    1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22];
+const NUM_F32_POW10: [f32; 11] = [1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10];
+const NUM_U64_POW10: [u64; 16] = [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000,
+    100000000, 1000000000, 10000000000, 100000000000, 1000000000000, 10000000000000,
+    100000000000000, 1000000000000000];
+
+// Clinger's fast path (with Rust's disguised one): the exact float of m *
+// 10^e when m and 10^e are exact floats, as bits; -1 when it does not
+// apply.
+#[inline]
+fn num_fast_path(m: u64, e: i64, single: bool) -> i64 {
+    let max_exp = if single { 10 } else { 22 };
+    let max_disguised = if single { 17 } else { 37 };
+    let max_mantissa: u64 = if single { 2 << 23 } else { 2 << 52 };
+    if e < -max_exp || e > max_disguised || m > max_mantissa {
+        return -1;
+    }
+    let mut mm = m;
+    let mut ee = e;
+    if e > max_exp {
+        // (m * 10^(e - max_exp) still exact)
+        let p = NUM_U64_POW10[e - max_exp];
+        if mul_hi(mm, p) != 0 {
+            return -1;
+        }
+        mm = mm * p;
+        if mm > max_mantissa {
+            return -1;
+        }
+        ee = max_exp;
+    }
+    if single {
+        let x = mm as f32;
+        let v = if ee < 0 { x / NUM_F32_POW10[-ee] } else { x * NUM_F32_POW10[ee] };
+        return f32_to_bits(v) as i64;
+    }
+    let x = mm as f64;
+    let v = if ee < 0 { x / NUM_F64_POW10[-ee] } else { x * NUM_F64_POW10[ee] };
+    f64_to_bits(v) as i64
+}
+
+// The table's 128-bit 5^q (normalized; Rust's POWER_OF_FIVE_128) for q from
+// -342 to 308: (high, low).
+#[inline]
+fn num_lemire_power(q: i64) -> (u64, u64) {
+    let at = 2 * (q - POW10_MIN);
+    let hi = POW10_128[at];
+    let lo = POW10_128[at + 1];
+    if q >= -27 && q <= -1 {
+        // (rounded up there)
+        let lo1 = lo + 1;
+        return (if lo1 == 0 { hi + 1 } else { hi }, lo1);
+    }
+    (hi, lo)
+}
+
+// A float's fields, (significand bits, biased exponent); a negative
+// exponent: Eisel-Lemire could not decide.
+struct NumBiasedFp { f: u64, e: i64 }
+
+// Eisel and Lemire (Rust's compute_float): w * 10^q rounded to a float of
+// mbits significand bits (52 or 23).
+fn num_compute_float(q: i64, w0: u64, single: bool) -> NumBiasedFp {
+    let mbits: i64 = if single { 23 } else { 52 };
+    let min_exponent: i64 = if single { -127 } else { -1023 };
+    let inf_power: i64 = if single { 0xff } else { 0x7ff };
+    let smallest: i64 = if single { -65 } else { -342 };
+    let largest: i64 = if single { 38 } else { 308 };
+    let min_round_even: i64 = if single { -17 } else { -4 };
+    let max_round_even: i64 = if single { 10 } else { 23 };
+    if w0 == 0 || q < smallest {
+        return NumBiasedFp { f: 0, e: 0 };
+    }
+    if q > largest {
+        return NumBiasedFp { f: 0, e: inf_power };
+    }
+    let lz = leading_zeros(w0);
+    let w = w0 << lz as u64;
+    // w * 5^q, approximately (compute_product_approx, precision mbits + 3)
+    let (hi5, lo5) = num_lemire_power(q);
+    let mask: u64 = 0xffffffffffffffff >> (mbits + 3) as u64;
+    let mut first_hi = mul_hi(w, hi5);
+    let mut first_lo = w * hi5;
+    if (first_hi & mask) == mask {
+        let second_hi = mul_hi(w, lo5);
+        first_lo = first_lo + second_hi;
+        if second_hi > first_lo {
+            first_hi += 1;
+        }
+    }
+    let lo = first_lo;
+    let hi = first_hi;
+    if lo == 0xffffffffffffffff && (q < -27 || q > 55) {
+        return NumBiasedFp { f: 0, e: -1 };
+    }
+    let upperbit = (hi >> 63) as i64;
+    let shift = (upperbit + 64 - mbits - 3) as u64;
+    let mut mantissa = hi >> shift;
+    let mut power2 = (((q * (152170 + 65536)) >> 16) + 63) + upperbit - lz - min_exponent;
+    if power2 <= 0 {
+        if -power2 + 1 >= 64 {
+            return NumBiasedFp { f: 0, e: 0 };
+        }
+        // a subnormal
+        mantissa = mantissa >> (-power2 + 1) as u64;
+        mantissa += mantissa & 1;
+        mantissa = mantissa >> 1;
+        let e = if mantissa >= (1 << mbits as u64) { 1 } else { 0 };
+        return NumBiasedFp { f: mantissa, e: e };
+    }
+    // (exactly halfway, between two floats: to even)
+    if lo <= 1 && q >= min_round_even && q <= max_round_even && (mantissa & 3) == 1
+        && (mantissa << shift) == hi {
+        mantissa &= ~1;
+    }
+    mantissa += mantissa & 1;
+    mantissa = mantissa >> 1;
+    if mantissa >= (2 << mbits as u64) {
+        mantissa = 1 << mbits as u64;
+        power2 += 1;
+    }
+    mantissa &= ~(1 << mbits as u64);
+    if power2 >= inf_power {
+        return NumBiasedFp { f: 0, e: inf_power };
+    }
+    NumBiasedFp { f: mantissa, e: power2 }
+}
+
+// s as a float's bits (single: an f32's), or the error (Rust's dec2flt).
+fn num_dec2flt(s: [u8], single: bool) -> Result<u64, ParseFloatError> {
+    if s.len == 0 {
+        return Result::Err(ParseFloatError::Empty);
+    }
+    let negative = s[0] == '-';
+    let t = if negative || s[0] == '+' { s[1..] } else { s };
+    if t.len == 0 {
+        return Result::Err(ParseFloatError::Invalid);
+    }
+    let sign: u64 = if !negative { 0 } else if single { 0x80000000 } else { 0x8000000000000000 };
+    let mut num = NumDecimalParts { mantissa: 0, exponent: 0, many_digits: false };
+    if !num_parse_number(t, &mut num) {
+        let (ok, special) = num_parse_inf_nan(t, negative, single);
+        if !ok {
+            return Result::Err(ParseFloatError::Invalid);
+        }
+        return Result::Ok(special);
+    }
+    if !num.many_digits {
+        let fast = num_fast_path(num.mantissa, num.exponent, single);
+        if fast >= 0 {
+            return Result::Ok(fast as u64 | sign);
+        }
+    }
+    let mut fp = num_compute_float(num.exponent, num.mantissa, single);
+    if num.many_digits && fp.e >= 0 {
+        // (the digits after the 19th could round it up)
+        let up = num_compute_float(num.exponent, num.mantissa + 1, single);
+        if up.f != fp.f || up.e != fp.e {
+            fp.e = -1;
+        }
+    }
+    if fp.e < 0 {
+        fp = num_slow_path(t, single);
+    }
+    let mbits: u64 = if single { 23 } else { 52 };
+    Result::Ok((fp.f | ((fp.e as u64) << mbits)) | sign)
+}
+
+// ---- Numbers: float parsing's slow path (0.20) ----
+
+// The simple-decimal algorithm (Nigel Tao's; Rust's decimal.rs and
+// slow.rs) for the inputs Eisel and Lemire cannot round: the decimal's
+// first 768 digits, shifted by powers of two to [1/2, 1], then rounded.
+
+const NUM_DEC_MAX_DIGITS: i64 = 768;
+const NUM_DEC_POINT_RANGE: i64 = 2047;
+
+// A decimal 0.d1d2d3... * 10^decimal_point (digits 0 to 9, not ASCII);
+// truncated: digits were dropped after the 768th.
+struct NumDecimal { num_digits: i64, decimal_point: i64, truncated: bool, digits: [u8; 768] }
+
+fn num_dec_add_digit(d: &mut NumDecimal, digit: u8) {
+    if d.num_digits < NUM_DEC_MAX_DIGITS {
+        d.digits[d.num_digits] = digit;
+    }
+    d.num_digits += 1;
+}
+
+fn num_dec_trim(d: &mut NumDecimal) {
+    for _ in 0..NUM_DEC_MAX_DIGITS + 1 {
+        if !(d.num_digits != 0 && d.digits[d.num_digits - 1] == 0) {
+            break;
+        }
+        d.num_digits -= 1;
+    }
+}
+
+// The integer part, rounded to nearest (ties to even), at most 2^64 - 1.
+fn num_dec_round(d: &mut NumDecimal) -> u64 {
+    if d.num_digits == 0 || d.decimal_point < 0 {
+        return 0;
+    }
+    if d.decimal_point > 18 {
+        return 0xffffffffffffffff;
+    }
+    let dp = d.decimal_point;
+    let mut n: u64 = 0;
+    for i in 0..dp {
+        n = n * 10;
+        if i < d.num_digits {
+            n += d.digits[i] as u64;
+        }
+    }
+    let mut round_up = false;
+    if dp < d.num_digits {
+        round_up = d.digits[dp] >= 5;
+        if d.digits[dp] == 5 && dp + 1 == d.num_digits {
+            round_up = d.truncated || (dp != 0 && (d.digits[dp - 1] & 1) != 0);
+        }
+    }
+    if round_up {
+        n += 1;
+    }
+    n
+}
+
+// How many digits shifting left by `shift` adds (Rust's
+// number_of_digits_decimal_left_shift).
+fn num_dec_new_digits(d: &mut NumDecimal, shift: i64) -> i64 {
+    let s = shift & 63;
+    let x_a = LSHIFT_TABLE[s] as i64;
+    let x_b = LSHIFT_TABLE[s + 1] as i64;
+    let num_new_digits = x_a >> 11;
+    let pow5_a = 0x7ff & x_a;
+    let pow5_b = 0x7ff & x_b;
+    for i in 0..pow5_b - pow5_a {
+        let p5 = POW5_DIGITS[pow5_a + i] - '0';
+        if i >= d.num_digits {
+            return num_new_digits - 1;
+        }
+        if d.digits[i] == p5 {
+            continue;
+        }
+        if d.digits[i] < p5 {
+            return num_new_digits - 1;
+        }
+        return num_new_digits;
+    }
+    num_new_digits
+}
+
+// d * 2^shift (shift at most 60).
+fn num_dec_left_shift(d: &mut NumDecimal, shift: i64) {
+    if d.num_digits == 0 {
+        return;
+    }
+    let num_new_digits = num_dec_new_digits(&mut *d, shift);
+    let mut read_index = d.num_digits;
+    let mut write_index = d.num_digits + num_new_digits;
+    let mut n: u64 = 0;
+    for _ in 0..NUM_DEC_MAX_DIGITS + 1 {
+        if !(read_index != 0) {
+            break;
+        }
+        read_index -= 1;
+        write_index -= 1;
+        n += (d.digits[read_index] as u64) << shift as u64;
+        let quotient = n / 10;
+        let remainder = n - 10 * quotient;
+        if write_index < NUM_DEC_MAX_DIGITS {
+            d.digits[write_index] = remainder as u8;
+        } else if remainder > 0 {
+            d.truncated = true;
+        }
+        n = quotient;
+    }
+    for _ in 0..20 {
+        if !(n > 0) {
+            break;
+        }
+        write_index -= 1;
+        let quotient = n / 10;
+        let remainder = n - 10 * quotient;
+        if write_index < NUM_DEC_MAX_DIGITS {
+            d.digits[write_index] = remainder as u8;
+        } else if remainder > 0 {
+            d.truncated = true;
+        }
+        n = quotient;
+    }
+    d.num_digits += num_new_digits;
+    if d.num_digits > NUM_DEC_MAX_DIGITS {
+        d.num_digits = NUM_DEC_MAX_DIGITS;
+    }
+    d.decimal_point += num_new_digits;
+    num_dec_trim(&mut *d);
+}
+
+// d / 2^shift (shift at most 60).
+fn num_dec_right_shift(d: &mut NumDecimal, shift: i64) {
+    let sh = shift as u64;
+    let mut read_index = 0;
+    let mut write_index = 0;
+    let mut n: u64 = 0;
+    for _ in 0..NUM_DEC_MAX_DIGITS + 40 {
+        if !((n >> sh) == 0) {
+            break;
+        }
+        if read_index < d.num_digits {
+            n = 10 * n + d.digits[read_index] as u64;
+            read_index += 1;
+        } else if n == 0 {
+            return;
+        } else {
+            for _ in 0..20 {
+                if !((n >> sh) == 0) {
+                    break;
+                }
+                n = n * 10;
+                read_index += 1;
+            }
+            break;
+        }
+    }
+    d.decimal_point -= read_index - 1;
+    if d.decimal_point < -NUM_DEC_POINT_RANGE {
+        d.num_digits = 0;
+        d.decimal_point = 0;
+        d.truncated = false;
+        return;
+    }
+    let mask: u64 = (1 << sh) - 1;
+    for _ in 0..NUM_DEC_MAX_DIGITS + 1 {
+        if !(read_index < d.num_digits) {
+            break;
+        }
+        let new_digit = (n >> sh) as u8;
+        n = 10 * (n & mask) + d.digits[read_index] as u64;
+        read_index += 1;
+        d.digits[write_index] = new_digit;
+        write_index += 1;
+    }
+    for _ in 0..200 {
+        if !(n > 0) {
+            break;
+        }
+        let new_digit = (n >> sh) as u8;
+        n = 10 * (n & mask);
+        if write_index < NUM_DEC_MAX_DIGITS {
+            d.digits[write_index] = new_digit;
+            write_index += 1;
+        } else if new_digit > 0 {
+            d.truncated = true;
+        }
+    }
+    d.num_digits = write_index;
+    num_dec_trim(&mut *d);
+}
+
+// s, a valid float text without its sign, as a NumDecimal (Rust's
+// parse_decimal).
+fn num_parse_decimal(s: [u8], d: &mut NumDecimal) {
+    let len = s.len;
+    let mut i = 0;
+    for _ in 0..s.len + 1 {
+        if !(i < len && s[i] == '0') {
+            break;
+        }
+        i += 1;
+    }
+    for _ in 0..s.len + 1 {
+        if !(i < len && s[i] - '0' < 10) {
+            break;
+        }
+        num_dec_add_digit(&mut *d, s[i] - '0');
+        i += 1;
+    }
+    if i < len && s[i] == '.' {
+        i += 1;
+        let first = i;
+        if d.num_digits == 0 {
+            for _ in 0..s.len + 1 {
+                if !(i < len && s[i] == '0') {
+                    break;
+                }
+                i += 1;
+            }
+        }
+        for _ in 0..s.len + 1 {
+            if !(i < len && s[i] - '0' < 10) {
+                break;
+            }
+            num_dec_add_digit(&mut *d, s[i] - '0');
+            i += 1;
+        }
+        d.decimal_point = first - i;
+    }
+    if d.num_digits != 0 {
+        // (trailing zeros are no digits)
+        let mut zeros = 0;
+        let mut j = i;
+        for _ in 0..s.len + 1 {
+            if !(j > 0) {
+                break;
+            }
+            j -= 1;
+            let c = s[j];
+            if c == '0' {
+                zeros += 1;
+            } else if c != '.' {
+                break;
+            }
+        }
+        d.decimal_point += zeros;
+        d.num_digits -= zeros;
+        d.decimal_point += d.num_digits;
+        if d.num_digits > NUM_DEC_MAX_DIGITS {
+            d.truncated = true;
+            d.num_digits = NUM_DEC_MAX_DIGITS;
+        }
+    }
+    if i < len && (s[i] == 'e' || s[i] == 'E') {
+        i += 1;
+        let mut negative = false;
+        if i < len && (s[i] == '-' || s[i] == '+') {
+            negative = s[i] == '-';
+            i += 1;
+        }
+        let mut exp_num: i64 = 0;
+        for _ in 0..s.len + 1 {
+            if !(i < len && s[i] - '0' < 10) {
+                break;
+            }
+            if exp_num < 0x10000 {
+                exp_num = 10 * exp_num + (s[i] - '0') as i64;
+            }
+            i += 1;
+        }
+        d.decimal_point += if negative { -exp_num } else { exp_num };
+    }
+}
+
+// The shift that moves a decimal point of n toward 0 (Rust's get_shift).
+fn num_dec_shift(n: i64) -> i64 {
+    let powers = [0, 3, 6, 9, 13, 16, 19, 23, 26, 29, 33, 36, 39, 43, 46, 49, 53, 56, 59];
+    if n < 19 { powers[n] } else { 60 }
+}
+
+// s (without its sign) rounded to a float (Rust's parse_long_mantissa).
+fn num_slow_path(s: [u8], single: bool) -> NumBiasedFp {
+    let mbits: i64 = if single { 23 } else { 52 };
+    let min_exponent: i64 = if single { -127 } else { -1023 };
+    let inf_power: i64 = if single { 0xff } else { 0x7ff };
+    let mut d = NumDecimal { num_digits: 0, decimal_point: 0, truncated: false, digits: [0; 768] };
+    num_parse_decimal(s, &mut d);
+    if d.num_digits == 0 || d.decimal_point < -324 {
+        return NumBiasedFp { f: 0, e: 0 };
+    }
+    if d.decimal_point >= 310 {
+        return NumBiasedFp { f: 0, e: inf_power };
+    }
+    let mut exp2: i64 = 0;
+    // to (1/2, 1]
+    for _ in 0..1000 {
+        if !(d.decimal_point > 0) {
+            break;
+        }
+        let shift = num_dec_shift(d.decimal_point);
+        num_dec_right_shift(&mut d, shift);
+        if d.decimal_point < -NUM_DEC_POINT_RANGE {
+            return NumBiasedFp { f: 0, e: 0 };
+        }
+        exp2 += shift;
+    }
+    for _ in 0..1000 {
+        if !(d.decimal_point <= 0) {
+            break;
+        }
+        let mut shift = 0;
+        if d.decimal_point == 0 {
+            let first = d.digits[0];
+            if first >= 5 {
+                break;
+            }
+            shift = if first == 0 || first == 1 { 2 } else { 1 };
+        } else {
+            shift = num_dec_shift(-d.decimal_point);
+        }
+        num_dec_left_shift(&mut d, shift);
+        if d.decimal_point > NUM_DEC_POINT_RANGE {
+            return NumBiasedFp { f: 0, e: inf_power };
+        }
+        exp2 -= shift;
+    }
+    // [1/2, 1] to [1, 2]
+    exp2 -= 1;
+    for _ in 0..1000 {
+        if !(min_exponent + 1 > exp2) {
+            break;
+        }
+        let mut n = min_exponent + 1 - exp2;
+        if n > 60 {
+            n = 60;
+        }
+        num_dec_right_shift(&mut d, n);
+        exp2 += n;
+    }
+    if exp2 - min_exponent >= inf_power {
+        return NumBiasedFp { f: 0, e: inf_power };
+    }
+    num_dec_left_shift(&mut d, mbits + 1);
+    let mut mantissa = num_dec_round(&mut d);
+    if mantissa >= (1 << (mbits + 1) as u64) {
+        // (rounded up to the carry bit)
+        num_dec_right_shift(&mut d, 1);
+        exp2 += 1;
+        mantissa = num_dec_round(&mut d);
+        if exp2 - min_exponent >= inf_power {
+            return NumBiasedFp { f: 0, e: inf_power };
+        }
+    }
+    let mut power2 = exp2 - min_exponent;
+    if mantissa < (1 << mbits as u64) {
+        power2 -= 1;
+    }
+    mantissa &= (1 << mbits as u64) - 1;
+    NumBiasedFp { f: mantissa, e: power2 }
 }

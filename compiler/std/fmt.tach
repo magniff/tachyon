@@ -1,6 +1,7 @@
 // std::fmt: printing, Display and Debug, and Fmt, the formatter (0.20: from flat/fmt.tach).
 
 use std::{Allocator, Buf, Gpa, Vec, decimal_len, memcpy, put_decimal, strlen, write};
+use std::num::{FloatFmt, write_f32, write_f64};
 
 extern "C" {
     #[effects()]
@@ -494,12 +495,6 @@ impl Fmt {
         }
         fmt_decimal(self, v, false);
     }
-
-    // v as Display writes it: the shortest decimal that reads back as v,
-    // never with an exponent; with a precision, that many decimals.
-    pub fn float(self: &mut Fmt, v: f64) {
-        fmt_float(self, v, false, false);
-    }
 }
 
 // Fmt::int and Fmt::uint with a spec of a decimal: u, after a '-' when
@@ -631,140 +626,6 @@ fn fmt_pad(f: &mut Fmt) {
     }
 }
 
-// v in decimal (single: an f32's value): the shortest digits that read
-// back as v (15 to 17 of them, 6 to 9 for an f32), never with an exponent
-// for Display; Debug as Rust writes it (`1.0`, `1e16`, `1e-7`). With a
-// precision, that many decimals (C's %.Nf).
-#[inline(never)]
-pub fn fmt_float(f: &mut Fmt, v: f64, single: bool, debug: bool) {
-    if f.flags != 0 {
-        fmt_number_start(f);
-    }
-    if v != v {
-        f.str("NaN");
-        return;
-    }
-    if v - v != 0.0 {
-        f.str(if v > 0.0 { "inf" } else { "-inf" });
-        return;
-    }
-    let mut tmp: [u8; 64] = [0; 64];
-    if f.prec >= 0 {
-        let n = unsafe { snprintf(&tmp[0], 64, c"%.*f", f.prec as i32, v) } as i64;
-        if n < 64 {
-            f.str(tmp[0..n]);
-        } else {
-            fmt_fixed_long(f, v);
-        }
-        return;
-    }
-    let mut digits = if single { 6 } else { 15 };
-    let last = if single { 9 } else { 17 };
-    let mut n = 0;
-    // (from 6 or 15 digits to 9 or 17)
-    for _ in 0..4 {
-        n = unsafe { snprintf(&tmp[0], 64, c"%.*e", (digits - 1) as i32, v) } as i64;
-        if digits == last {
-            break;
-        }
-        let same = if single {
-            let back = unsafe { strtof(&tmp[0], 0 as **u8) };
-            back == v as f32
-        } else {
-            let back = unsafe { strtod(&tmp[0], 0 as **u8) };
-            back == v
-        };
-        if same {
-            break;
-        }
-        digits += 1;
-    }
-    // tmp: [-]d[.ddd]e(+|-)dd: the digits (without the point) and the
-    // exponent of the first.
-    let mut i = 0;
-    let negative = tmp[0] == '-';
-    if negative {
-        i = 1;
-    }
-    let mut ds: [u8; 24] = [0; 24];
-    let mut k = 0;
-    for _ in i..n {
-        if tmp[i] == 'e' {
-            break;
-        }
-        if tmp[i] != '.' {
-            ds[k] = tmp[i];
-            k += 1;
-        }
-        i += 1;
-    }
-    for _ in 1..k {
-        if ds[k - 1] != '0' {
-            break;
-        }
-        k -= 1;
-    }
-    i += 1;
-    let exp_negative = tmp[i] == '-';
-    i += 1;
-    let mut exp = 0;
-    for _ in i..n {
-        exp = exp * 10 + (tmp[i] - '0') as i64;
-        i += 1;
-    }
-    if exp_negative {
-        exp = -exp;
-    }
-    if negative {
-        f.byte('-');
-    }
-    if debug && (exp < -4 || exp >= 16) {
-        f.byte(ds[0]);
-        if k > 1 {
-            f.byte('.');
-            f.str(ds[1..k]);
-        }
-        f.byte('e');
-        f.int(exp);
-        return;
-    }
-    if exp < 0 {
-        f.str("0.");
-        for z in 0..-exp - 1 {
-            f.byte('0');
-        }
-        f.str(ds[0..k]);
-        return;
-    }
-    if k <= exp + 1 {
-        f.str(ds[0..k]);
-        for z in 0..exp + 1 - k {
-            f.byte('0');
-        }
-        if debug {
-            f.str(".0");
-        }
-        return;
-    }
-    f.str(ds[0..exp + 1]);
-    f.byte('.');
-    f.str(ds[exp + 1..k]);
-}
-
-// v with f's precision, of 64 bytes or more: C's %.*f into a buffer on
-// the stack (a double has at most 309 digits before the point and 1074
-// after it: from 1100 decimals on they are zeros, written after).
-#[inline(never)]
-fn fmt_fixed_long(f: &mut Fmt, v: f64) {
-    let prec = if f.prec > 1100 { 1100 } else { f.prec };
-    let mut tmp: [u8; 1424] = [0; 1424];
-    let n = unsafe { snprintf(&tmp[0], 1424, c"%.*f", prec as i32, v) } as i64;
-    f.str(tmp[0..if n < 1424 { n } else { 1423 }]);
-    for _ in prec..f.prec {
-        f.byte('0');
-    }
-}
-
 // Text in quotes, escaped as Rust's Debug of a str does.
 #[inline(never)]
 pub fn fmt_quoted(f: &mut Fmt, s: [u8]) {
@@ -890,5 +751,131 @@ fn fmt_hole(f: &mut Fmt, u: u64, negative: bool, w: i64, flags: i64) {
                 p[pad] = '0';
             }
         }
+    }
+}
+
+// ---- Display and Debug of floats (0.20) ----
+
+// (A section of its own, read only by programs that have floats: a float
+// literal, `f64` or `f32`, an `import` (front/modules/stdsections.tach);
+// with it the shortest digits and the powers of ten.)
+
+impl Display for f64 {
+    #[inline]
+    fn fmt(self: &f64, f: &mut Fmt) { fmt_float(f, *self, false, false); }
+}
+
+impl Debug for f64 {
+    #[inline]
+    fn fmt_debug(self: &f64, f: &mut Fmt) { fmt_float(f, *self, false, true); }
+}
+
+impl Display for f32 {
+    #[inline]
+    fn fmt(self: &f32, f: &mut Fmt) { fmt_float(f, *self as f64, true, false); }
+}
+
+impl Debug for f32 {
+    #[inline]
+    fn fmt_debug(self: &f32, f: &mut Fmt) { fmt_float(f, *self as f64, true, true); }
+}
+
+impl Fmt {
+    // v as Display writes it: the shortest decimal that reads back as v,
+    // never with an exponent; with a precision, that many decimals.
+    pub fn float(self: &mut Fmt, v: f64) {
+        fmt_float(self, v, false, false);
+    }
+}
+
+// (0.20) `{:e}`, `{:E}` (with FMT_UPPER; fmt.tach's FMT_ flags): a
+// float's exponent form (fmt_float).
+const FMT_EXP: i64 = 512;
+
+// v in decimal (single: an f32's value): the shortest digits that read
+// back as v (Schubfach, 0.20), never with an exponent for Display; Debug
+// as Rust writes it (`1.0`, `1e16`, `1e-7`); `{:e}`, `{:E}` (FMT_EXP) as
+// Rust's LowerExp and UpperExp (`1.5e3`). With a precision, that many
+// decimals (C's %.Nf; with `e`, %.Ne in Rust's layout).
+#[inline(never)]
+fn fmt_float(f: &mut Fmt, v: f64, single: bool, debug: bool) {
+    if f.flags != 0 {
+        fmt_number_start(f);
+    }
+    if f.prec >= 0 && v == v && v - v == 0.0 {
+        fmt_float_prec(f, v);
+        return;
+    }
+    let mut mode = if debug { FloatFmt::Debug } else { FloatFmt::Display };
+    if (f.flags & FMT_EXP) != 0 {
+        mode = if (f.flags & FMT_UPPER) != 0 { FloatFmt::UpperExp } else { FloatFmt::LowerExp };
+    }
+    let mut tmp: [u8; 48] = [0; 48];
+    let n = if single { write_f32(v as f32, mode, tmp[..]) } else { write_f64(v, mode, tmp[..]) };
+    if n <= 48 {
+        f.str(tmp[0..n]);
+    } else {
+        fmt_float_long(f, v, single, mode);
+    }
+}
+
+// fmt_float's text of more than 48 bytes (Display of 1e300).
+#[inline(never)]
+fn fmt_float_long(f: &mut Fmt, v: f64, single: bool, mode: FloatFmt) {
+    let mut tmp: [u8; 336] = [0; 336];
+    let n = if single { write_f32(v as f32, mode, tmp[..]) } else { write_f64(v, mode, tmp[..]) };
+    f.str(tmp[0..n]);
+}
+
+// fmt_float with a precision, v finite: C's %.*f (FMT_EXP: %.*e, its
+// exponent then written as Rust's, `1.50e3`).
+#[inline(never)]
+fn fmt_float_prec(f: &mut Fmt, v: f64) {
+    if (f.flags & FMT_EXP) == 0 {
+        let mut tmp: [u8; 64] = [0; 64];
+        let n = unsafe { snprintf(&tmp[0], 64, c"%.*f", f.prec as i32, v) } as i64;
+        if n < 64 {
+            f.str(tmp[0..n]);
+        } else {
+            fmt_fixed_long(f, v);
+        }
+        return;
+    }
+    // (a double's exact digits end before the 770th: zeros after 1100)
+    let prec = if f.prec > 1100 { 1100 } else { f.prec };
+    let mut tmp: [u8; 1200] = [0; 1200];
+    let n = unsafe { snprintf(&tmp[0], 1200, c"%.*e", prec as i32, v) } as i64;
+    let mut i = 0;
+    while i < n && tmp[i] != 'e' {
+        i += 1;
+    }
+    f.str(tmp[0..i]);
+    for _ in prec..f.prec {
+        f.byte('0');
+    }
+    f.byte(if (f.flags & FMT_UPPER) != 0 { 'E' } else { 'e' });
+    // e+05 is 5, e-05 is -5
+    let mut j = i + 1;
+    if j < n && tmp[j] == '-' {
+        f.byte('-');
+    }
+    j += 1;
+    while j + 1 < n && tmp[j] == '0' {
+        j += 1;
+    }
+    f.str(tmp[j..n]);
+}
+
+// v with f's precision, of 64 bytes or more: C's %.*f into a buffer on
+// the stack (a double has at most 309 digits before the point and 1074
+// after it: from 1100 decimals on they are zeros, written after).
+#[inline(never)]
+fn fmt_fixed_long(f: &mut Fmt, v: f64) {
+    let prec = if f.prec > 1100 { 1100 } else { f.prec };
+    let mut tmp: [u8; 1424] = [0; 1424];
+    let n = unsafe { snprintf(&tmp[0], 1424, c"%.*f", prec as i32, v) } as i64;
+    f.str(tmp[0..if n < 1424 { n } else { 1423 }]);
+    for _ in prec..f.prec {
+        f.byte('0');
     }
 }
