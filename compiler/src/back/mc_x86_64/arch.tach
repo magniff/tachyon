@@ -3,7 +3,7 @@
 // registers; -O0 writes the same with fixed ones (gen0/gen/arch.tach).
 // (Compile-tested: objcheck and the CROSS cases; not run in 0.19.)
 
-use crate::arch::{F_INSN, INTRS, intr_text, intr_tied};
+use crate::arch::{F_INSN, INTRS, intr_ret_text, intr_text, intr_tied};
 use crate::arch::template::{
     SLOT_D, SLOT_T, TP_END, TP_NEXT, TP_SLOT, TP_TEXT, TPiece, template_piece, template_slot,
 };
@@ -17,26 +17,49 @@ use crate::middle::ctx::FnCtx;
 const XTEMP: i64 = 47;
 const RTEMP: i64 = 11;
 
-// Register r with modifier m: %xmm<n> (32 + n), a general register's
-// 64-bit name (`w`: 32-bit, `h`: 16-bit, `b`: 8-bit).
+// Register r with modifier m: a vector register's %xmm<n> (32 + n; `y`:
+// %ymm<n>, the 256-bit view), a general register's 64-bit name (`w`:
+// 32-bit, `h`: 16-bit, `b`: 8-bit).
 fn mx_reg(mut cx: *FnCtx, r: i64, m: u8) {
     unsafe {
-        let size = if m == 'w' { 4 } else if m == 'h' { 2 } else if m == 'b' { 1 } else { 8 };
+        let size = if m == 'y' { 32 } else if m == 'w' { 4 } else if m == 'h' { 2 }
+            else if m == 'b' {
+                1
+            } else { 8 };
         mx_rs(cx, r, size);
     }
 }
 
-fn mx_move(mut cx: *FnCtx, d: i64, s: i64) {
-    unsafe { mx_mov(cx, d, s, if d >= 32 { TY_V16I8 } else { TY_I64 }); }
+// d = s, a whole register: a vector one's 256 bits when `wide`.
+fn mx_move(mut cx: *FnCtx, d: i64, s: i64, wide: bool) {
+    unsafe {
+        if d >= 32 && wide {
+            o(cx, c"    vmovdqa ");
+            mx_rs(cx, s, 32);
+            o(cx, c", ");
+            mx_rs(cx, d, 32);
+            on(cx);
+            return;
+        }
+        mx_mov(cx, d, s, if d >= 32 { TY_V16I8 } else { TY_I64 });
+    }
 }
 
 // Intrinsic id into register d (-1: no result) from the registers ops[k]
 // of its parameters (-1 for an immediate, whose value is imms[k]). SSE's
 // two-operand forms are tied: the result starts as a copy of the tied
-// parameter, in xmm15 (r11) when d is another operand's.
+// parameter, in xmm15 (r11) when d is another operand's (all 256 bits of
+// it when the result is a 256-bit vector: FMA's accumulator).
 pub fn mx_intr(mut cx: *FnCtx, id: i64, d: i64, ops: [i64], imms: [i64]) {
     unsafe {
+        let text = intr_text(id, F_INSN);
+        let fixed = xmm0_param(id, text);
+        if fixed >= 0 {
+            mx_intr_xmm0(cx, id, d, ops, imms, fixed);
+            return;
+        }
         let tied = intr_tied(id);
+        let wide = intr_ret_text(id).len >= 6 && intr_ret_text(id)[0..6] == "__m256";
         let mut dd = d;
         if tied >= 0 && ops[tied] != d {
             for k in 0..INTRS[id].nparams {
@@ -44,9 +67,19 @@ pub fn mx_intr(mut cx: *FnCtx, id: i64, d: i64, ops: [i64], imms: [i64]) {
                     dd = if d >= 32 { XTEMP } else { RTEMP };
                 }
             }
-            mx_move(cx, dd, ops[tied]);
+            mx_move(cx, dd, ops[tied], wide);
         }
-        let text = intr_text(id, F_INSN);
+        mx_template(cx, id, text, dd, ops, imms);
+        if dd != d {
+            mx_move(cx, d, dd, wide);
+        }
+    }
+}
+
+// The template of intrinsic id with result register dd and the operands'
+// registers ops (immediates imms); `<NAME:0>` is %xmm0.
+fn mx_template(mut cx: *FnCtx, id: i64, text: [u8], dd: i64, ops: [i64], imms: [i64]) {
+    unsafe {
         let mut p = TPiece { kind: 0, start: 0, end: 0, name: 0, modifier: 0 };
         let mut at = 0;
         o(cx, c"    ");
@@ -62,7 +95,9 @@ pub fn mx_intr(mut cx: *FnCtx, id: i64, d: i64, ops: [i64], imms: [i64]) {
                 o(cx, c"    ");
             } else if p.kind == TP_SLOT {
                 let s = template_slot(id, p.name);
-                if s == SLOT_D {
+                if p.modifier == '0' {
+                    o(cx, c"%xmm0");
+                } else if s == SLOT_D {
                     mx_reg(cx, dd, p.modifier);
                 } else if s == SLOT_T {
                     mx_reg(cx, XTEMP, p.modifier);
@@ -74,8 +109,49 @@ pub fn mx_intr(mut cx: *FnCtx, id: i64, d: i64, ops: [i64], imms: [i64]) {
             }
         }
         on(cx);
-        if dd != d {
-            mx_move(cx, d, dd);
+    }
+}
+
+// (0.19 T5) The parameter the instruction reads in xmm0, `<NAME:0>` in
+// its template (SSE4.1's blendv, sha256rnds2), or -1.
+fn xmm0_param(id: i64, text: [u8]) -> i64 {
+    unsafe {
+        let mut p = TPiece { kind: 0, start: 0, end: 0, name: 0, modifier: 0 };
+        let mut at = 0;
+        loop {
+            at = template_piece(text, at, &p);
+            if p.kind == TP_END {
+                return -1;
+            }
+            if p.kind == TP_SLOT && p.modifier == '0' {
+                return template_slot(id, p.name);
+            }
+        }
+    }
+}
+
+// An intrinsic whose instruction reads parameter `fixed` in xmm0: xmm0 is
+// saved in xmm14 (never allocated) around it and restored, the operands
+// that were in xmm0 read from the copy, the result made in xmm15 (tied: a
+// copy of the tied parameter first) and moved to d last, so d may be
+// xmm0. Five moves; AVX's forms (vpblendvb ...) take the mask anywhere.
+fn mx_intr_xmm0(mut cx: *FnCtx, id: i64, d: i64, ops: [i64], imms: [i64], fixed: i64) {
+    unsafe {
+        let saved = XTEMP - 1;
+        let mut regs: [i64; 8] = [-1; 8];
+        for k in 0..INTRS[id].nparams {
+            regs[k] = if ops[k] == 32 { saved } else { ops[k] };
+        }
+        mx_move(cx, saved, 32, false);
+        let tied = intr_tied(id);
+        if tied >= 0 {
+            mx_move(cx, XTEMP, regs[tied], false);
+        }
+        mx_move(cx, 32, regs[fixed], false);
+        mx_template(cx, id, intr_text(id, F_INSN), XTEMP, regs[..], imms);
+        mx_move(cx, 32, saved, false);
+        if d >= 0 {
+            mx_move(cx, d, XTEMP, false);
         }
     }
 }
