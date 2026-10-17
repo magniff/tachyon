@@ -15,7 +15,7 @@ main.tach:13:31: error[unsafe] indexing a raw pointer is unsafe | help: `p[0]` i
 main.tach:22:31: error[type error] closure parameter of type '*i64' where '&i64' is wanted | help: a `*T` is a raw pointer (0.18.1), not a reference: write the parameter's type as the bound's | try: &i64 | try: tachyonc fix --suggested main.tach
 [exit 1]
 $ fix --values
-fixed 1 parameter to &mut T, 3 parameters to &T, 2 arguments	main.tach	+5 -5 lines
+fixed 1 suggested fix, 1 parameter to &mut T, 3 parameters to &T, 2 arguments	main.tach	+6 -6 lines
 $ fix --suggested
 fixed 2 suggested fixes	main.tach	+1 -1 lines
 main.tach:13:31: error[unsafe] indexing a raw pointer is unsafe | help: `p[0]` is pointer arithmetic; the value p points to is `*p` (`*p = x` writes it), unsafe as well through a raw pointer (not a borrow: a `*T` parameter, a local, a field), so put it in an `unsafe { ... }` block (the try: line wraps every such place) | try: tachyonc fix --only unsafe main.tach
@@ -44,7 +44,7 @@ fn main(gpa: Gpa) {
     let mut v: Vec<i64> = Vec::new_in(gpa);
     v.push(3);
     v.push(1);
-    sort_by(v.as_slice(), |x: &i64, y: &i64| *x - *y);
+    sort_by(v.as_mut_slice(), |x: &i64, y: &i64| *x - *y);
     let k = Key { k: 1 };
     let j = Key { k: 2 };
     println(f"{mean(&a)} {v[0]} {k < j} {first_byte(c"hi")}");
