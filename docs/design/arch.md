@@ -1462,6 +1462,46 @@ the `AE_*` codes.
   is bitwise), `tests/run/opt_arch_*` beyond the seed, the container's
   `TACHYON_ARCH_DISABLE` double runs (T3), the `#[property]` conversion.
 
+**T4 as built (branch a19-t4).**
+- `aarch64.def` holds 1,743 intrinsics. The regular families are
+  written by `tools/arch/a64_families.py --write` between the `# ====
+  generated` markers of `aarch64.def` and `insn_a64.def` (one Python
+  function per family; lines outside the markers are kept). Every one
+  has its semantics or a `fn ref_NAME` (`tests/arch/ref/a64_lanes.tach`,
+  `a64_crypto.tach`, `a64_float.tach`, and `crc.tach`'s other seven) and
+  passes `arch-gen`; `tests/objcheck.sh arch_` agrees with `cc -c` on
+  aarch64-macos and aarch64-linux.
+- **Encoder.** For vector and SIMD scalar operands the table is read
+  before the chain, and a mnemonic may have several (consecutive) lines:
+  the first whose class fits the operands encodes them; none fits, the
+  chain does (`arch/table.tach`'s name map keeps a mnemonic's first
+  line). Classes added: `same3f diff3 misc2 misc2f acrossf shl elem
+  fpair rr rrr rrrr xar` and the scalar `same3s misc2s misc2fs shrns
+  shls` (compiler/arch/README.md); operands `.1q`, `.4b[i]`, `#0.0`.
+- **One 64-bit lane.** A 64-bit vector of one 64-bit lane has no `.1d`
+  arrangement in most instructions: its intrinsics use the SIMD scalar
+  forms (`sqadd d0, d1, d2`); the generator rewrites `<a>.1d` to `<a:d>`.
+- **Templates.** `<n:2>` scales an immediate (ext of 16-bit lanes);
+  `<u>` is a second temporary, v30 (the allocator gives out neither v30
+  nor v31): a scalar that sha1c, pmull's p64 or the like wants in the
+  vector file is moved there (`fmov`), the only intrinsics of more than
+  one instruction besides the horizontal ones (`umaxv` then `umov`).
+- **`.arch armv8.2-a`** precedes the `.arch_extension` lines when the
+  program uses sha3, dotprod, rdm, fp16, i8mm or bf16: GNU as accepts
+  those extensions only on an Armv8.2 base.
+- -O0 keeps float scalar operands and results in vector registers (v0-v2).
+- Fixed: a 64-bit vector of constant lanes (a folded load of a constant
+  8-byte array) was materialized into a general register numbered 48
+  and up (`back/emit/operands.tach`, `materialize`).
+- Not done (left of §2.3.1): `vld1q_dup` (the `load.dup` form, T6's),
+  `vld2q`/`vst2q` (`intr.mem` is not lowered yet), `vqtbl2q`/`vqtbx2q`
+  (tuple operands: the v30/v31 pair), the float forms whose references
+  are not exact yet (`vsqrtq`, `vfmaq_f64`/`vfmsq_f64`, `vmaxnmq`/
+  `vminnmq`: signaling NaNs in the random inputs, `vrecpe`/`vrecps`/
+  `vrsqrte`/`vrsqrts`), `vbslq_f32`/`f64`, `vmlaq`/`vmlsq` on floats (two
+  instructions: unfused), and the `f64` 64-bit forms of the float
+  family (scalar FP encodings).
+
 ## 8. Open questions
 
 - **O1. Latency and throughput in `query show`.** Useful for choosing
