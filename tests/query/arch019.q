@@ -59,7 +59,7 @@ try: tachyonc query arch 'saturating subtract'
 ## table's features and instruction on the first line; show adds its doc,
 ## what it computes, its equivalent and its `use` line.
 $ show vqtbl1q_u8
-// std::arch::aarch64::vqtbl1q_u8	<std::arch::aarch64>:109-110	effects: none	features: neon	instruction: tbl <d>.16b, {<t>.16b}, <idx>.16b
+// std::arch::aarch64::vqtbl1q_u8	<std::arch::aarch64>:121-122	effects: none	features: neon	instruction: tbl <d>.16b, {<t>.16b}, <idx>.16b
 // a table lookup: lane k is t[idx[k]], 0 when idx[k] >= 16
 // computes: r[k] = if idx[k] < 16 { t[idx[k]] } else { 0 }
 // equivalent: x86_64: _mm_shuffle_epi8 (zeroes when bit 7 is set instead)
@@ -68,10 +68,10 @@ $ show vqtbl1q_u8
 #[intrinsic(1404)]
 pub fn vqtbl1q_u8(t: uint8x16_t, idx: uint8x16_t) -> uint8x16_t;
 $ def std::arch::aarch64::__crc32cd _mm_movemask_epi8
-std::arch::aarch64::__crc32cd	<std::arch::aarch64>:110:8	fn	pub fn __crc32cd(crc: u32, data: u64) -> u32	effects: none	features: crc	instruction: crc32cx <d:w>, <crc:w>, <data:x>
+std::arch::aarch64::__crc32cd	<std::arch::aarch64>:122:8	fn	pub fn __crc32cd(crc: u32, data: u64) -> u32	effects: none	features: crc	instruction: crc32cx <d:w>, <crc:w>, <data:x>
 std::arch::x86_64::_mm_movemask_epi8	<std::arch::x86_64>:8:8	fn	pub fn _mm_movemask_epi8(a: __m128i) -> i32	effects: none	features: sse2	instruction: pmovmskb <a>, <d:w>
 $ show std::arch::detect
-// std::arch::detect	<std::arch>:3-4	effects: none	features: none	instruction: none
+// std::arch::detect	<std::arch>:5-6	effects: none	features: none	instruction: none
 // true when the running CPU has the feature: a constant when known or foreign, else one cached bit test
 // computes: r = whether the CPU running the program has `feature`
 // use std::arch::detect;
@@ -79,7 +79,7 @@ $ show std::arch::detect
 #[intrinsic(2)]
 pub fn detect(feature: [u8]) -> bool;
 $ context vdotq_u32 --budget 120
-// std::arch::aarch64::vdotq_u32	<std::arch::aarch64>:109-110	effects: none	features: dotprod	instruction: udot <d>.4s, <a>.16b, <b>.16b
+// std::arch::aarch64::vdotq_u32	<std::arch::aarch64>:121-122	effects: none	features: dotprod	instruction: udot <d>.4s, <a>.16b, <b>.16b
 // each 32-bit lane of acc plus the dot product of its four bytes of a and b
 // computes: r[k] = acc[k] + a[4 * k] * b[4 * k] + a[4 * k + 1] * b[4 * k + 1] + a[4 * k + 2] * b[4 * k + 2] + a[4 * k + 3] * b[4 * k + 3]
 // use std::arch::aarch64::vdotq_u32;

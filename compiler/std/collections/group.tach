@@ -4,13 +4,16 @@
 // DELETED (0x80) or FULL (0x00-0x7f: the top 7 bits of the hash, its
 // tag). A Group is GROUP control bytes; a BitMask is the result of a
 // match, the top bit of each byte that matched (0x80 lanes, the lowest
-// byte the first bucket). This is the scalar version, SWAR on a u64
-// (hashbrown's generic.rs); 0.19's NEON version (task D1) implements
-// these same functions on uint8x8_t. GROUP is 8 on every target and in
-// every version, so a table's layout, and its iteration order, is the
-// same everywhere.
+// byte the first bucket). SWAR on a u64 (hashbrown's generic.rs), with
+// match_tag a NEON compare on AArch64 (0.20 D1). GROUP is 8 on every
+// target and in every version, so a table's layout, and its iteration
+// order, is the same everywhere.
 
 use std::{leading_zeros, trailing_zeros};
+use std::arch::has;
+use std::arch::aarch64::{
+    vceq_u8, vdup_n_u64, vdup_n_u8, vget_lane_u64, vreinterpret_u64_u8, vreinterpret_u8_u64,
+};
 
 // ---- Swiss-table groups (0.20 implementation) ----
 
@@ -50,11 +53,26 @@ pub unsafe fn group_store(ctrl: *u8, pos: i64, g: Group) {
     *(&ctrl[pos] as *u64) = g;
 }
 
-// The buckets of g whose control byte is tag (a FULL byte). May report
-// a false positive, always a FULL byte above a true match, which the
-// caller's key comparison rejects.
+// The buckets of g whose control byte is tag (a FULL byte). (0.20 D1) On
+// AArch64 one NEON compare (cmeq on the 8 bytes): exact. Elsewhere
+// match_tag_swar, which may also report false positives; either way the
+// table's layout is the same (a match only decides which keys are
+// compared).
 #[inline]
 pub fn match_tag(g: Group, tag: u8) -> BitMask {
+    if has("neon") {
+        let v = vreinterpret_u8_u64(vdup_n_u64(g));
+        let eq = vceq_u8(v, vdup_n_u8(tag));
+        return vget_lane_u64(vreinterpret_u64_u8(eq), 0) & GROUP_MSB;
+    }
+    match_tag_swar(g, tag)
+}
+
+// match_tag in SWAR on a u64 (hashbrown's generic.rs): may report a false
+// positive, always a FULL byte above a true match, which the caller's key
+// comparison rejects.
+#[inline]
+pub fn match_tag_swar(g: Group, tag: u8) -> BitMask {
     let cmp = g ^ (tag as u64 * GROUP_LSB);
     (cmp - GROUP_LSB) & ~cmp & GROUP_MSB
 }
