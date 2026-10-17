@@ -6,10 +6,11 @@
 
 use crate::arch::{
     ARCH_AARCH64, ARCH_PORTABLE, ARCH_X86_64, FEAT_DETECT, FEAT_HAS, FIELD_COUNT, FORM_BITS,
-    FORM_CAST, FORM_FEAT, FORM_HINT, FORM_INTR, FORM_INTR_MEM, FORM_LOAD, FORM_STORE, FORM_VBIN,
-    FORM_VCMP, FORM_VEXT, FORM_VSPLAT, F_FEATURES, F_FLAGS, F_FORM, F_MEMORY, F_NAME, F_SIGNATURE,
-    IF_COMMUTATIVE, IF_PURE, IF_TIED_SHIFT, INTRS, INTR_BY_NAME, INTR_COUNT, IntrInfo, MEM_LOAD,
-    MEM_NONE, MEM_RAW, MEM_STORE, TABLE_BUF, init_name_table,
+    FORM_CAST, FORM_FEAT, FORM_HINT, FORM_INTR, FORM_INTR_MEM, FORM_LOAD, FORM_LOAD_DUP, FORM_STORE,
+    FORM_VBIN, FORM_VCMP, FORM_VEXT, FORM_VINS, FORM_VNEG, FORM_VSEL, FORM_VSPLAT, FORM_VSUM,
+    F_FEATURES, F_FLAGS, F_FORM, F_MEMORY, F_NAME, F_SIGNATURE, IF_COMMUTATIVE, IF_PURE,
+    IF_TIED_SHIFT, INTRS, INTR_BY_NAME, INTR_COUNT, IntrInfo, MEM_LOAD, MEM_NONE, MEM_RAW,
+    MEM_STORE, TABLE_BUF, init_name_table, intr_text,
 };
 use crate::arch::features::feature_bit_in;
 use crate::arch::tables::{insn_a64_source, insn_x86_source, intrinsics_source};
@@ -166,6 +167,53 @@ pub fn load_table() {
             }
             a = b + 1;
         }
+        for id in 0..INTR_COUNT {
+            if INTRS[id].form == FORM_INTR_MEM {
+                link_parts(id);
+            }
+        }
+    }
+}
+
+// (T6) The two permutes an `intr.mem` intrinsic is made of at -O1 and -O2:
+// vld2q_T (a deinterleaving load) is two vector loads, then vuzp1q_T and
+// vuzp2q_T; vst2q_T is vzip1q_T and vzip2q_T, then two vector stores.
+// Their ids in part1 and part2 (made while the table is parsed: no symbol
+// is made later).
+fn link_parts(id: i64) {
+    unsafe {
+        let name = intr_text(id, F_NAME);
+        let load = name.len > 6 && name[0..6] == "vld2q_";
+        let store = name.len > 6 && name[0..6] == "vst2q_";
+        if !load && !store {
+            bad(c"internal error: arch table: an intr.mem intrinsic lowering does not know");
+        }
+        let mut tmp: [u8; 48] = [0; 48];
+        let rest = name.len - 6;
+        if rest > 40 {
+            bad(c"internal error: arch table: a name too long");
+        }
+        for k in 0..2 {
+            let head = if load { "vuzp" } else { "vzip" };
+            for j in 0..4 {
+                tmp[j] = head[j];
+            }
+            tmp[4] = if k == 0 { '1' } else { '2' };
+            tmp[5] = 'q';
+            tmp[6] = '_';
+            for j in 0..rest {
+                tmp[7 + j] = name[6 + j];
+            }
+            let part = INTR_BY_NAME[intern(tmp[0..7 + rest])] - 1;
+            if part < 0 {
+                bad(c"internal error: arch table: an intr.mem intrinsic without its permutes");
+            }
+            if k == 0 {
+                INTRS[id].part1 = part;
+            } else {
+                INTRS[id].part2 = part;
+            }
+        }
     }
 }
 
@@ -191,7 +239,7 @@ fn parse_intrinsic(a: i64, b: i64, arch: i64) {
             name, arch, features: 0, form: 0, form_arg: 0, work: 0,
             params: PARAMS.count / PARAM_WIDTH,
             nparams: 0, ret_start: 0, ret_end: 0, consts: 0, flags: 0, mem: MEM_NONE, mem_param: -1,
-            mem_bytes: 0, fields: base,
+            mem_bytes: 0, fields: base, part1: -1, part2: -1,
         };
         if INTR_BY_NAME[name] != 0 {
             bad(c"internal error: arch table: an intrinsic named twice");
@@ -325,6 +373,11 @@ fn parse_form(id: i64, a: i64, b: i64) {
         else if is(a, e, "vsplat") { form = FORM_VSPLAT; }
         else if is(a, e, "vext") { form = FORM_VEXT; }
         else if is(a, e, "hint") { form = FORM_HINT; }
+        else if is(a, e, "vneg") { form = FORM_VNEG; }
+        else if is(a, e, "vins") { form = FORM_VINS; }
+        else if is(a, e, "vsel") { form = FORM_VSEL; }
+        else if is(a, e, "vsum") { form = FORM_VSUM; }
+        else if is(a, e, "load.dup") { form = FORM_LOAD_DUP; }
         else if is(a, dot, "vbin") {
             form = FORM_VBIN;
             arg = if is(arg_start, e, "add") { Op::Add as i64 }
@@ -333,6 +386,7 @@ fn parse_form(id: i64, a: i64, b: i64) {
                 else if is(arg_start, e, "and") { Op::And as i64 }
                 else if is(arg_start, e, "or") { Op::Or as i64 }
                 else if is(arg_start, e, "xor") { Op::Xor as i64 }
+                else if is(arg_start, e, "div") { Op::Div as i64 }
                 else { bad(c"internal error: arch table: an unknown vbin") };
         } else if is(a, dot, "vcmp") {
             form = FORM_VCMP;

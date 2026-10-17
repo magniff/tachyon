@@ -173,6 +173,12 @@ def vv(t, q):
     return vtype(t, q)
 
 
+def generic(form, t, q):
+    """(T6) 0.10's operation `form` where the intrinsic is exactly it, else
+    `intr`: a 64-bit vector of one 64-bit lane has no generic arrangement."""
+    return "intr" if bits(t) == 64 and not q else form
+
+
 # ---- The families ----
 
 def loads_stores():
@@ -187,6 +193,14 @@ def loads_stores():
              "the %d lanes s[i..i + %d] as a vector (checked: 0 <= i, i + %d <= s.len)"
              % (lanes(t, q), lanes(t, q), lanes(t, q)))
     for t, q in qd(A + ["p8", "p64"]):
+        el = scalar(t).replace("p", "u")
+        line(name("vld1{q}_dup_{t}", t, q), "neon", "(s: [%s], i: i64) -> %s" % (el, vv(t, q)),
+             "load.dup", "ld1r {<d>.%s}, [<s>]" % arr(t, q) if bits(t) < 64 or q else "ldr <d:d>, [<s>]", "-", "load(s, %d)" % (bits(t) // 8), "-",
+             "r[k] = s[i]", x86({8: "_mm_set1_epi8", 16: "_mm_set1_epi16", 32: "_mm_set1_epi32",
+                                 64: "_mm_set1_epi64x"}[bits(t)] if kind(t) not in "f"
+                                else ("_mm_set1_ps" if bits(t) == 32 else "_mm_set1_pd")),
+             "every lane s[i] (checked: 0 <= i < s.len)")
+    for t, q in qd(A + ["p8", "p64"]):
         n = 16 if q else 8
         reg = "q" if q else "d"
         el = scalar(t).replace("p", "u")
@@ -194,6 +208,27 @@ def loads_stores():
              "str <v:%s>, [<s>]" % reg, "-", "store(s, %d)" % n, "-",
              "s[i + k] = v[k]", x86("_mm_storeu_si128" if q else "_mm_storel_epi64"),
              "v's %d lanes into s[i..i + %d] (checked)" % (lanes(t, q), lanes(t, q)))
+
+
+def pairs():
+    section("Loads and stores of two registers, interleaved")
+    for t in A + ["p8"]:
+        el = scalar(t).replace("p", "u")
+        n = lanes(t, True)
+        tup = vv(t, True)[:-2] + "x2_t"
+        line(name("vld2q_{t}", t, True), "neon", "(s: [%s], i: i64) -> %s" % (el, tup), "intr.mem",
+             "ld2 {<u>.%s, <t>.%s}, [<s>]" % (arr(t, True), arr(t, True)), "-", "load(s, 32)", "-",
+             "r[k] = if k < %d { s[i + 2 * k] } else { s[i + 2 * (k - %d) + 1] }" % (n, n), None,
+             "the %d lanes s[i..i + %d] deinterleaved: the even ones, then the odd ones (checked)"
+             % (2 * n, 2 * n))
+    for t in A + ["p8"]:
+        el = scalar(t).replace("p", "u")
+        n = lanes(t, True)
+        tup = vv(t, True)[:-2] + "x2_t"
+        line(name("vst2q_{t}", t, True), "neon", "(s: [%s], i: i64, v: %s)" % (el, tup), "intr.mem",
+             "st2 {<u>.%s, <t>.%s}, [<s>]" % (arr(t, True), arr(t, True)), "-", "store(s, 32)", "-",
+             "s[i + k] = if k %% 2 == 0 { v[k / 2] } else { v[%d + k / 2] }" % n, None,
+             "v's two vectors interleaved into s[i..i + %d] (checked)" % (2 * n))
 
 
 def build_lanes():
@@ -231,7 +266,7 @@ def build_lanes():
             insn = "mov <d>.%s[<lane>], <x:%s>" % (letter(t), "x" if bits(t) == 64 else "w")
         line(name("vset{q}_lane_{t}", t, q), "neon",
              "(x: %s, v: %s, lane: const 0..=%d) -> %s" % (scalar(t), vv(t, q), n - 1, vv(t, q)),
-             "intr", insn, "pure tied=v", None, "lane.set",
+             generic("vins", t, q), insn, "pure tied=v", None, "lane.set",
              "r[k] = if k == lane { x } else { v[k] }", None, "v with lane `lane` replaced by x")
     for t in A + ["p8"]:
         n = lanes(t, False)
@@ -314,6 +349,10 @@ def instructions():
     insn("ext", "ext", 0x2e000000, "ext Vd.T, Vn.T, Vm.T, #index")
     insn("shrn", "shrn", shimm(0, 0b10000), "shrn Vd.Tb, Vn.Ta, #shift")
     insn("crc32cx", "crc", 0x9ac05c00, "crc32cx Wd, Wn, Xm")
+    # (T6) loads and stores of a register list at [Xn]: Q and size from the list
+    insn("ld1r", "ldst", 0x0d40c000, "ld1r {Vt.T}, [Xn]")
+    insn("ld2", "ldst", 0x0c408000, "ld2 {Vt.T, Vt2.T}, [Xn]")
+    insn("st2", "ldst", 0x0c008000, "st2 {Vt.T, Vt2.T}, [Xn]")
     # three same, integer
     for mn, u, opc in [("shadd", 0, 0), ("uhadd", 1, 0), ("sqadd", 0, 1), ("uqadd", 1, 1),
                        ("srhadd", 0, 2), ("urhadd", 1, 2), ("shsub", 0, 4), ("uhsub", 1, 4),
@@ -506,7 +545,7 @@ def arithmetic():
                  "r[k] = if k < %d { %s } else { %s }" % (n // 2, e, e2), None,
                  "pairwise %s of adjacent lanes: a's pairs, then b's" % (fn or "sum"))
     for t, q in qd(SI):
-        line(name("vneg{q}_{t}", t, q), "neon", "(a: %s) -> %s" % (vv(t, q), vv(t, q)), "intr",
+        line(name("vneg{q}_{t}", t, q), "neon", "(a: %s) -> %s" % (vv(t, q), vv(t, q)), generic("vneg", t, q),
              "neg <d>.%s, <a>.%s" % (arr(t, q), arr(t, q)), "pure", None, "lanes.neg", "r[k] = -a[k]",
              None, "lanewise -a, wrapping")
     for t, q in qd(SI):
@@ -588,7 +627,7 @@ def logic():
     for t, q in qd(I + ["p8"]):
         a = "16b" if q else "8b"
         line(name("vbsl{q}_{t}", t, q), "neon",
-             "(a: %s, b: %s, c: %s) -> %s" % (vv(utype(t), q), vv(t, q), vv(t, q), vv(t, q)), "intr",
+             "(a: %s, b: %s, c: %s) -> %s" % (vv(utype(t), q), vv(t, q), vv(t, q), vv(t, q)), generic("vsel", t, q),
              "bsl <d>.%s, <b>.%s, <c>.%s" % (a, a, a), "pure tied=a", None, "lanes.bsl",
              "r[k] = (b[k] & (a[k] as i64)) | (c[k] & ~(a[k] as i64))" if t == "s64"
              else "r[k] = (b[k] & a[k]) | (c[k] & ~a[k])", None,
@@ -687,7 +726,7 @@ def horizontal():
             insn = "addp <t>.2s, <a>.2s, <a>.2s; " + mv
         else:
             insn = "addv <t:%s>, <a>.%s; %s" % (letter(t), arr(t, q), mv)
-        line(name("vaddv{q}_{t}", t, q), "neon", "(a: %s) -> %s" % (vv(t, q), scalar(t)), "intr", insn, "pure", None,
+        line(name("vaddv{q}_{t}", t, q), "neon", "(a: %s) -> %s" % (vv(t, q), scalar(t)), "vsum", insn, "pure", None,
              "across.add", "r = sum over k of a[k]", None, "the sum of the lanes, wrapping")
     for op, fn in [("max", "max"), ("min", "min")]:
         for t, q in qd(I6):
@@ -1150,20 +1189,20 @@ def floats():
     section("Float")
     fq = [("f32", True), ("f64", True), ("f32", False)]
 
-    def bin3(nm, mn, sem, doc, flags="pure"):
+    def bin3(nm, mn, sem, doc, flags="pure", form="intr"):
         for t, q in fq:
-            line(name(nm, t, q), "neon", "(a: %s, b: %s) -> %s" % (vv(t, q), vv(t, q), vv(t, q)), "intr",
+            line(name(nm, t, q), "neon", "(a: %s, b: %s) -> %s" % (vv(t, q), vv(t, q), vv(t, q)), form,
                  "%s <d>.%s, <a>.%s, <b>.%s" % (mn, arr(t, q), arr(t, q), arr(t, q)), flags, None,
                  "lanes.f" + mn[1:], sem, None, doc)
 
-    def un2(nm, mn, sem, doc):
+    def un2(nm, mn, sem, doc, form="intr"):
         for t, q in fq:
-            line(name(nm, t, q), "neon", "(a: %s) -> %s" % (vv(t, q), vv(t, q)), "intr",
+            line(name(nm, t, q), "neon", "(a: %s) -> %s" % (vv(t, q), vv(t, q)), form,
                  "%s <d>.%s, <a>.%s" % (mn, arr(t, q), arr(t, q)), "pure", None, "lanes.f" + mn[1:], sem, None, doc)
 
     un2("vabs{q}_{t}", "fabs", "|a[k]|", "lanewise |a| (the sign bit cleared)")
-    un2("vneg{q}_{t}", "fneg", "r[k] = -a[k]", "lanewise -a (the sign bit flipped)")
-    bin3("vdiv{q}_{t}", "fdiv", "r[k] = a[k] / b[k]", "lanewise a / b")
+    un2("vneg{q}_{t}", "fneg", "r[k] = -a[k]", "lanewise -a (the sign bit flipped)", form="vneg")
+    bin3("vdiv{q}_{t}", "fdiv", "r[k] = a[k] / b[k]", "lanewise a / b", form="vbin.div")
     bin3("vmax{q}_{t}", "fmax", "max(a[k], b[k]), NaN when either is, max(-0, +0) = +0",
          "lanewise max(a, b): NaN when either is NaN", "pure commutative")
     bin3("vmin{q}_{t}", "fmin", "min(a[k], b[k]), NaN when either is, min(-0, +0) = -0",
@@ -1239,7 +1278,7 @@ def floats():
                  "across.f" + op[:-1], "%s of a's lanes (pairs first)" % op[:-1], None, doc)
 
 
-FAMILIES = [loads_stores, build_lanes, casts, arithmetic, compare, logic, shifts, horizontal, narrowing,
+FAMILIES = [loads_stores, pairs, build_lanes, casts, arithmetic, compare, logic, shifts, horizontal, narrowing,
             permutes, bit_ops, crc, crypto, dotprod, widening, lanes_dup_shift, floats]
 
 

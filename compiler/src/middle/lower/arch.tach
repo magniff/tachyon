@@ -19,8 +19,9 @@
 // front end is done).
 
 use crate::arch::{
-    FORM_BITS, FORM_CAST, FORM_FEAT, FORM_INTR, FORM_LOAD, FORM_STORE, FORM_VBIN, FORM_VCMP,
-    FORM_VEXT, FORM_VSPLAT, INTRS, intr_param_is_const, intr_with_imm, intrinsic_is_foreign,
+    FORM_BITS, FORM_CAST, FORM_FEAT, FORM_INTR, FORM_INTR_MEM, FORM_LOAD, FORM_LOAD_DUP, FORM_STORE,
+    FORM_VBIN, FORM_VCMP, FORM_VEXT, FORM_VINS, FORM_VNEG, FORM_VSEL, FORM_VSPLAT, FORM_VSUM, INTRS,
+    MEM_LOAD, intr_param_is_const, intr_with_imm, intrinsic_is_foreign,
 };
 use crate::base::die;
 use crate::base::target::X86;
@@ -29,7 +30,8 @@ use crate::front::consteval::const_eval;
 use crate::front::contracts::sites::site_of;
 use crate::front::features::{feature_call_bit, feature_call_value};
 use crate::front::types::{
-    FNS, SYM_PRIMITIVE, TYPES, TY_BOOL, TY_I64, TY_U64, is_compound, is_vector, is_void, type_size,
+    FNS, SYM_PRIMITIVE, TYPES, TY_BOOL, TY_I64, TY_U64, is_compound, is_vector, is_void,
+    tuple_offset, type_elem, type_size,
 };
 use crate::gen0::target::PANIC_RANGE_SIGNED;
 use crate::middle::ctx::FnCtx;
@@ -99,6 +101,46 @@ pub fn lower_intrinsic(mut cx: *FnCtx, n: i64, f: i64, id: i64) -> i64 {
             ir_store(cx, NODES[v_arg].ty, addr, v, 0);
             return 0;
         }
+        if form == FORM_LOAD_DUP {
+            // (T6) one element, checked (or at a raw:: pointer), splat
+            let elem = TYPES[ret].a;
+            let mut addr = 0;
+            if FNS[f].param_count < INTRS[id].nparams {
+                addr = lower_operand(cx, child(n, INTRS[id].mem_param));
+            } else {
+                addr = memory_address(cx, n, id);
+            }
+            let x = ir_load(cx, elem, addr, 0);
+            return vec_result(cx, emit_ir(cx, Op::VSplat, ret, x, 0, 0), ret);
+        }
+        if form == FORM_INTR_MEM {
+            return lower_pair_memory(cx, n, f, id);
+        }
+        if form == FORM_VNEG {
+            let v = emit_ir(cx, Op::VNeg, ret, vec_operand(cx, child(n, 0)), 0, 0);
+            return vec_result(cx, v, ret);
+        }
+        if form == FORM_VSUM {
+            return emit_ir(cx, Op::VSum, ir_type(ret), vec_operand(cx, child(n, 0)), 0, 0);
+        }
+        if form == FORM_VINS {
+            // (x, v, lane)
+            let ex = child(n, 0);
+            let x = need_value(cx, lower_operand(cx, ex), NODES[ex].ty);
+            let v = vec_operand(cx, child(n, 1));
+            let lane = const_eval(child(n, 2));
+            return vec_result(cx, emit_ir(cx, Op::VIns, ret, v, x, lane), ret);
+        }
+        if form == FORM_VSEL {
+            // (mask a, b, c): b's bits where a's are set, c's elsewhere
+            let em = child(n, 0);
+            let m = as_type(cx, vec_operand(cx, em), NODES[em].ty, ret);
+            let b = vec_operand(cx, child(n, 1));
+            let c = vec_operand(cx, child(n, 2));
+            let v = emit_ir(cx, Op::VSel, ret, m, b, 0);
+            cx.insts[v].c = c;
+            return vec_result(cx, v, ret);
+        }
         if form == FORM_CAST {
             let e = child(n, 0);
             let v = vec_operand(cx, e);
@@ -166,6 +208,65 @@ pub fn lower_intrinsic(mut cx: *FnCtx, n: i64, f: i64, id: i64) -> i64 {
         }
         v
     }
+}
+
+// (T6) An `intr.mem` intrinsic, vld2q_T or vst2q_T: two registers loaded
+// from 32 bytes and deinterleaved (two vector loads, then the uzp1/uzp2
+// permutes), or interleaved and stored (zip1/zip2, two vector stores):
+// the instructions' count of the hardware's ld2/st2 and its moves, every
+// one visible to the optimizer. -O0 writes ld2/st2 (gen0/gen/arch.tach).
+fn lower_pair_memory(mut cx: *FnCtx, n: i64, f: i64, id: i64) -> i64 {
+    unsafe {
+        let p1 = INTRS[id].part1;
+        let p2 = INTRS[id].part2;
+        if p1 < 0 || p2 < 0 {
+            die(c"internal error: an intr.mem intrinsic without its permutes");
+        }
+        let raw = FNS[f].param_count < INTRS[id].nparams;
+        let s = INTRS[id].mem_param;
+        if INTRS[id].mem == MEM_LOAD {
+            let ret = FNS[f].ret;
+            let vt = type_elem(ret, 0);
+            let addr = if raw { lower_operand(cx, child(n, s)) } else { memory_address(cx, n, id) };
+            let lo = ir_load(cx, vt, addr, 0);
+            let hi = ir_load(cx, vt, addr, type_size(vt));
+            let r0 = emit_ir(cx, Op::Intr, vt, lo, hi, p1);
+            let r1 = emit_ir(cx, Op::Intr, vt, lo, hi, p2);
+            let slot = ir_slot_addr(cx, new_slot_for(cx, ret));
+            ir_store(cx, vt, slot, r0, 0);
+            ir_store(cx, vt, slot, r1, tuple_offset(ret, 1));
+            return slot;
+        }
+        // (s, i, then the pair: the arguments' order, as a store)
+        let v_arg = child(n, if raw { s + 1 } else { s + 2 });
+        let tt = NODES[v_arg].ty;
+        let vt = type_elem(tt, 0);
+        if raw {
+            let addr = lower_operand(cx, child(n, s));
+            let pair = lower_operand(cx, v_arg);
+            let a = ir_load(cx, vt, pair, 0);
+            let b = ir_load(cx, vt, pair, tuple_offset(tt, 1));
+            store_pair(cx, vt, addr, a, b, p1, p2);
+            return 0;
+        }
+        let value = lower_operand(cx, child(n, s));
+        let idx = lower_operand(cx, child(n, s + 1));
+        let pair = lower_operand(cx, v_arg);
+        let a = ir_load(cx, vt, pair, 0);
+        let b = ir_load(cx, vt, pair, tuple_offset(tt, 1));
+        let addr = checked_address(cx, NODES[child(n, s)].ty, value, idx, INTRS[id].mem_bytes,
+            site_of(child(n, s + 1), 0));
+        store_pair(cx, vt, addr, a, b, p1, p2);
+        0
+    }
+}
+
+// zip1(a, b) and zip2(a, b) (intrinsics p1, p2) at addr and after it.
+fn store_pair(mut cx: *FnCtx, vt: i64, addr: i64, a: i64, b: i64, p1: i64, p2: i64) {
+    let z0 = emit_ir(cx, Op::Intr, vt, a, b, p1);
+    let z1 = emit_ir(cx, Op::Intr, vt, a, b, p2);
+    ir_store(cx, vt, addr, z0, 0);
+    ir_store(cx, vt, addr, z1, type_size(vt));
 }
 
 // The type a generic form computes in: the table's `work` (x86's
