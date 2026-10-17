@@ -12,10 +12,12 @@ std::slice::unstable	<std>	16
 std::slice::stable	<std>	22
 std::slice::search	<std>	4
 std::slice::algo	<std>	12
-std::collections	<std>	8
+std::collections	<std>	12
 std::collections::hash_map	<std>	27
 std::collections::hash_set	<std>	18
 std::collections::raw_table	<std>	46
+std::collections::btree_node	<std>	56
+std::collections::btree_map	<std>	45
 std::collections::group	<std>	19
 std::io	<std>	7
 std::fmt	<std>	80

@@ -54,10 +54,12 @@ std::slice::unstable	<std>	16
 std::slice::stable	<std>	22
 std::slice::search	<std>	4
 std::slice::algo	<std>	12
-std::collections	<std>	8
+std::collections	<std>	12
 std::collections::hash_map	<std>	27
 std::collections::hash_set	<std>	18
 std::collections::raw_table	<std>	46
+std::collections::btree_node	<std>	56
+std::collections::btree_map	<std>	45
 std::collections::group	<std>	19
 std::io	<std>	7
 std::fmt	<std>	80
@@ -135,8 +137,8 @@ crate::heap::pop	heap.tach:35:8	fn	pub fn pop(h: &mut MinHeap) -> Option<Entry>
 crate::graph::edges_from	graph.tach:55:8	fn	pub fn edges_from(g: &Graph, i: i64) -> [Edge]
 std::Vec::filled_in	<std>:1477:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
 crate::heap::push	heap.tach:22:8	fn	pub fn push(h: &mut MinHeap, e: Entry)
-std::Option::unwrap	<std>:117:12	method	pub fn unwrap(self: Option<T>) -> T requires self.is_some() else "called unwrap on None"
 std::Vec::set	<std>:299:12	method	pub fn set(self: &mut Vec<T, A>, i: i64, x: T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
+std::Option::unwrap	<std>:117:12	method	pub fn unwrap(self: Option<T>) -> T requires self.is_some() else "called unwrap on None"
 note query.budget: over the budget of 600 tokens, left out: calls 2, types or uses 9, callers 1
 try: tachyonc query callers quickest
 try: tachyonc query context quickest --budget 1800
