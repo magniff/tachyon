@@ -246,7 +246,7 @@ checks every release; `-g` writes DWARF line tables.
 
 Tachyon is at 0.x: the language is not stable, and minor releases may
 break programs (with a `tachyonc fix` migration from 0.14 on). The
-current release is 0.19.0: CPU intrinsics and target features
+current release is 0.19.1: CPU intrinsics and target features
 (`std::arch`, checked lane by lane, with run-time detection);
 contracts (`requires`, `ensures`, checked at run time, the caller blamed), tests, properties and fuzzing in the
 language, distinct types and `NonNull`; functions compiled in parallel
