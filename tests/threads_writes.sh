@@ -169,6 +169,9 @@ arch::INTR_COUNT	key: the same
 arch::TABLE_BUF	key: the same
 arch::table::FIELDS	key: the same
 arch::table::PARAMS	key: the same
+arch::features::BUILD_FEATURES	key: the build'"'"'s features, made by main before the tasks (build_features), are in the options hash
+front::features::infer::NEEDS	IR: made by the front end before the tasks; read by LICM (intr_guarded) for the features of an INTR it may hoist, which follow from the function'"'"'s guards and calls: a guard or a declared set changes the IR (has/detect folded), an unguarded call'"'"'s needs are inferred whatever the declaration, an inlined callee'"'"'s INTRs are in the IR
+front::features::infer::NEEDS_COUNT	IR: the same
 back::codecache::CC_ON	own
 back::codecache::CHECK	own (testing)
 back::codecache::ENV	own: the key'"'"'s program hash
