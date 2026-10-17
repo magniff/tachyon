@@ -246,18 +246,18 @@ checks every release; `-g` writes DWARF line tables.
 
 Tachyon is at 0.x: the language is not stable, and minor releases may
 break programs (with a `tachyonc fix` migration from 0.14 on). The
-current release is 0.18.1: contracts (`requires`, `ensures`, checked at
-run time, the caller blamed), tests, properties and fuzzing in the
+current release is 0.19.0: CPU intrinsics and target features
+(`std::arch`, checked lane by lane, with run-time detection);
+contracts (`requires`, `ensures`, checked at run time, the caller blamed), tests, properties and fuzzing in the
 language, distinct types and `NonNull`; functions compiled in parallel
 (`-j N`) and incremental rebuilds; every `*T` raw, borrowing by `&` and
 `&mut`; on 0.17's memory safety by mutable value semantics and 0.16's
 effects and explicit allocators. See [docs/releases.md](docs/releases.md)
 for every release. Next:
 
-- **0.19**: CPU intrinsics and target features (`std::arch`); the
-  compiler's source on arenas; references as results and type arguments
-- **0.20 to 0.23**: collections, text and I/O,
-  concurrency, GPU support, windows and a terminal emulator on std
+- **0.20**: collections, text and I/O; the compiler's source on arenas;
+  references as results and type arguments
+- **0.21 to 0.23**: concurrency, GPU support, windows and a terminal emulator on std
 
 **Toward 1.0.** 1.0 is not a feature milestone. It ships when the
 surface language has been reworked against real programs, the tools

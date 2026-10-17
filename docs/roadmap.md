@@ -1208,6 +1208,33 @@ no-UB rule. It comes before the standard library build-out, which uses it
 - the tools: `query` shows an intrinsic's instruction and feature;
   `guide arch`; `explain` for the feature errors
 
+Done (0.19.0). The design (docs/design/arch.md, decisions D1-D20 taken as
+recommended), a phase 0 and eight tasks: vector types (T1), the feature
+analysis (T2), detection and `#[multiversion]` (T3), the AArch64
+intrinsics (T4: 1,743 in the table at its merge, more with T6's
+leftovers), x86-64 (T5: 484, encoded and compile-tested, never run), the
+optimizer and the vector convention (T6), the test generator and the
+fuzzer's arch mode (T7), the tools, guide and examples (T8). Found and
+fixed before the release: LICM hoisting a guarded intrinsic, and a
+256-bit load, above its `detect` (undefined behaviour on a CPU without
+the feature).
+
+Moved to 0.19.x or later (docs/design/arch.md, "as built"):
+- AArch64 breadth: `vqtbl2q`/`vqtbx2q`, the float forms whose
+  references are not exact yet (`vsqrtq`, `vfmaq_f64`, `vmaxnmq`,
+  `vrecpe` and the like), `vbslq_f32`/`f64`, unfused `vmlaq` on floats,
+  the f64 64-bit forms, the x3/x4 tuple forms;
+- x86-64: running it (when x86 testing returns), gathers and masked
+  forms, the string compares, `_mulx_u64`, float-scalar intrinsics,
+  `_mm_set_epi*`, alignment checks of the aligned forms;
+- the optimizer: `ld1r` fusion, `VConst` literal pools, `Rot`/`BSwap`
+  and the vectorizer's portable bit ops, float and x86 folds,
+  `Op::IntrMem`; a library's `detect` made pure (hoisted);
+- tools: `query arch --features`, examples/arch's utf8 and swissprobe,
+  bench pairs, tests/arch-try;
+- examples/sha256sum, written with v0.19.0 (as fast as the system's
+  sha256sum, openssl and coreutils).
+
 ## 0.20: collections, text and I/O
 
 - collections, each allocator-aware (0.16), with value semantics (0.17),
