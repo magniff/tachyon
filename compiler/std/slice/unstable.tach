@@ -1,0 +1,396 @@
+// std::slice::unstable: the unstable sort, ipnsort (0.20).
+
+use std::{Ord, forget};
+use super::{
+    SortStackBuf, choose_pivot_raw, existing_run_raw, insertion_sort_raw, reverse_raw,
+    small_sort_network_raw, small_sort_raw, sort_stack_cap,
+};
+
+// ---- Sort, unstable (0.20) ----
+
+// The unstable sort (0.20; docs/design/collections-text-io.md §2.4.6),
+// after Rust's ipnsort: a slice that is one run, ascending or strictly
+// descending, costs n - 1 comparisons; otherwise a quicksort with the
+// small sort (Sort kernels) up to 32 elements, a branchless cyclic Lomuto
+// partition, the median of three as the pivot (a recursive pseudo-median
+// from 64 elements), heapsort below a depth of 2·log2(n), and a partition
+// that puts the elements equal to the pivot in place at once when the
+// pivot is no greater than the one before it, so that input with k
+// distinct values costs O(n log k).
+//
+// Unsafe code: the kernels work on a raw pointer `v` and a length `n`
+// taken from one slice (`s.ptr`, `s.len`, by the safe entry points). Each
+// index they form lies in 0..n by the loop bounds noted at it, whatever
+// the comparator answers: a comparator that is not a total order leaves
+// the slice a permutation of what it held, in some order, and never reads
+// or writes outside it. Elements are plain values (no destructors), so
+// copying one out and writing it back is a move. No loop is uncounted and
+// nothing recurses: the sorts do not have the effect diverge.
+
+// Slices up to this long are sorted by the small sort.
+const SORT_UNSTABLE_SMALL: i64 = 32;
+
+// Sorts s in place, smallest first; not stable (equal elements may change
+// order). Rust's `sort_unstable`.
+pub fn sort_unstable<T: Ord>(s: &mut [T]) {
+    sort_unstable_less(s, |a: &T, b: &T| *a < *b);
+}
+
+// Sorts s in place by f (`f(a, b)` negative, zero or positive as *a goes
+// before, with or after *b); not stable.
+pub fn sort_unstable_by<T, F: FnMut(&T, &T) -> i64>(s: &mut [T], f: F) {
+    let mut g = f;
+    sort_unstable_less(s, |a: &T, b: &T| g(a, b) < 0);
+}
+
+// Sorts s in place by the key f gives each element, smallest first; not
+// stable. f runs on both sides of every comparison.
+pub fn sort_unstable_by_key<T, K: Ord, F: FnMut(&T) -> K>(s: &mut [T], f: F) {
+    let mut g = f;
+    sort_unstable_less(s, |a: &T, b: &T| g(a) < g(b));
+}
+
+// Sorts s in place by is_less (`is_less(a, b)`: *a goes strictly before
+// *b); not stable. The core the other unstable sorts call.
+pub fn sort_unstable_less<T, F: FnMut(&T, &T) -> bool>(s: &mut [T], is_less: F) {
+    let n = s.len;
+    if n < 2 {
+        return;
+    }
+    // (s.ptr and s.len are one slice's)
+    unsafe {
+        ipnsort_raw(s.ptr, n, is_less);
+    }
+}
+
+// v[0..n], n >= 2.
+unsafe fn ipnsort_raw<T, F: FnMut(&T, &T) -> bool>(v: *T, n: i64, is_less: F) {
+    let mut f = is_less;
+    if n <= SORT_UNSTABLE_SMALL {
+        let mut buf: SortStackBuf = SortStackBuf { words: [0; 512] };
+        if sort_stack_cap::<T>() >= n + 16 {
+            small_sort_raw(v, n, &buf as *T, f);
+        } else {
+            insertion_sort_raw(v, n, 1, f);
+        }
+        return;
+    }
+    let (run, desc) = existing_run_raw(v, n, f);
+    if run == n {
+        if desc {
+            reverse_raw(v, n);
+        }
+        return;
+    }
+    // 2·log2(n) levels of partitions before heapsort
+    let mut limit = 0;
+    for k in 1..63 {
+        if (n >> k) == 0 {
+            break;
+        }
+        limit += 2;
+    }
+    quicksort_raw(v, n, limit, f);
+}
+
+// Sorts v[0..n] by heapsort: O(n log n) whatever the input.
+unsafe fn heapsort_raw<T, F: FnMut(&T, &T) -> bool>(v: *T, n: i64, is_less: F) {
+    let mut f = is_less;
+    for k in 0..n / 2 {
+        sift_down_raw(v, n / 2 - 1 - k, n, f);
+    }
+    for k in 1..n {
+        let end = n - k;
+        let t = v[0];
+        v[0] = v[end];
+        v[end] = t;
+        sift_down_raw(v, 0, end, f);
+    }
+}
+
+// Moves v[node] down the max-heap v[0..end] (node < end).
+// (the node's index at least doubles each round: 64 at most)
+unsafe fn sift_down_raw<T, F: FnMut(&T, &T) -> bool>(v: *T, node: i64, end: i64, is_less: F) {
+    let mut f = is_less;
+    let mut at = node;
+    for _ in 0..64 {
+        let mut child = 2 * at + 1;
+        if child >= end {
+            return;
+        }
+        if child + 1 < end {
+            child += f(&*(&v[child]), &*(&v[child + 1])) as i64;
+        }
+        if !f(&*(&v[at]), &*(&v[child])) {
+            return;
+        }
+        let t = v[at];
+        v[at] = v[child];
+        v[child] = t;
+        at = child;
+    }
+}
+
+// The quicksort of v[0..n] (n > SORT_UNSTABLE_SMALL). The ranges left to
+// sort are kept on a stack, not recursion: the shorter side of each
+// partition is sorted next and the longer kept, so at most log2(n) <= 63
+// are kept at once. A range's ancestor pivot, when it has one, is the
+// element just before it (it was placed by the partition that made the
+// range).
+unsafe fn quicksort_raw<T, F: FnMut(&T, &T) -> bool>(v: *T, n: i64, limit0: i64, is_less: F) {
+    let mut f = is_less;
+    // (the small sort.s scratch)
+    let mut buf: SortStackBuf = SortStackBuf { words: [0; 512] };
+    let sp = &buf as *T;
+    let cap = sort_stack_cap::<T>();
+    let mut kept_lo: [i64; 64] = [0; 64];
+    let mut kept_hi: [i64; 64] = [0; 64];
+    let mut kept_limit: [i64; 64] = [0; 64];
+    let mut kept_anc: [bool; 64] = [false; 64];
+    let mut kept = 0;
+    let mut lo = 0;
+    let mut hi = n;
+    let mut limit = limit0;
+    let mut anc = false;
+    // (each round places a pivot or finishes a range: 2n + 1 at most)
+    for _ in 0..2 * n + 2 {
+        let len = hi - lo;
+        if len <= SORT_UNSTABLE_SMALL || limit == 0 {
+            if len <= SORT_UNSTABLE_SMALL {
+                // (size_of is a constant: one of the two is compiled)
+                if len < 2 {
+                    // (nothing to sort; v[lo] may be past the end)
+                } else if cap < len + 16 {
+                    insertion_sort_raw(&v[lo], len, 1, f);
+                } else if size_of(T) <= 8 {
+                    small_sort_network_raw(&v[lo], len, sp, f);
+                } else {
+                    small_sort_raw(&v[lo], len, sp, f);
+                }
+            } else {
+                heapsort_raw(&v[lo], len, f);
+            }
+            if kept == 0 {
+                return;
+            }
+            kept -= 1;
+            lo = kept_lo[kept];
+            hi = kept_hi[kept];
+            limit = kept_limit[kept];
+            anc = kept_anc[kept];
+            continue;
+        }
+        limit -= 1;
+        let w: *T = &v[lo];
+        let p = choose_pivot_raw(w, len, f);
+        // A pivot no greater than the ancestor (which is no greater than
+        // anything here) equals it: the elements equal to it go left, in
+        // place, and only the greater ones are left to sort.
+        if anc && !f(&*(&v[lo - 1]), &*(&w[p])) {
+            let num_le = partition_raw(w, len, p, |a: &T, b: &T| !f(b, a));
+            lo += num_le + 1;
+            anc = false;
+            continue;
+        }
+        let num_lt = partition_raw(w, len, p, f);
+        let mid = lo + num_lt;
+        if kept == 64 {
+            // (not reached: see above)
+            heapsort_raw(w, len, f);
+            hi = lo;
+            continue;
+        }
+        // [lo, mid) keeps the ancestor; [mid + 1, hi) has v[mid]
+        kept_limit[kept] = limit;
+        if mid - lo < hi - mid - 1 {
+            kept_lo[kept] = mid + 1;
+            kept_hi[kept] = hi;
+            kept_anc[kept] = true;
+            hi = mid;
+        } else {
+            kept_lo[kept] = lo;
+            kept_hi[kept] = mid;
+            kept_anc[kept] = anc;
+            lo = mid + 1;
+            anc = true;
+        }
+        kept += 1;
+    }
+}
+
+// Partitions v[0..len] around v[p] (len >= 1): the elements for which
+// is_less(x, pivot) first, then the pivot, then the others. Returns the
+// pivot's new index, the number of the first kind.
+unsafe fn partition_raw<T,
+    F: FnMut(&T, &T) -> bool>(v: *T, len: i64, p: i64, is_less: F) -> i64 {
+    let t = v[0];
+    v[0] = v[p];
+    v[p] = t;
+    let pivot = v[0];
+    let num_lt = lomuto_cyclic_raw(&v[1], len - 1, &pivot, is_less);
+    // (a copy of the element at v[0]: not dropped here)
+    forget(pivot);
+    let u = v[0];
+    v[0] = v[num_lt];
+    v[num_lt] = u;
+    num_lt
+}
+
+// The branchless cyclic Lomuto partition of v[0..len] around *pivot
+// (ipnsort's): v[0] is lifted out, leaving a gap; each step moves the
+// element at the boundary into the gap and the next element onto the
+// boundary, which advances when that element is less than the pivot.
+// No branch depends on the comparison. Returns how many are less.
+// (num_lt <= gap < right < len throughout; not inlined: the loop gets
+// the registers to itself)
+#[inline(never)]
+unsafe fn lomuto_cyclic_raw<T, F: FnMut(&T, &T) -> bool>(v: *T, len: i64, pivot_at: *T,
+    is_less: F) -> i64 {
+    let mut f = is_less;
+    if len == 0 {
+        return 0;
+    }
+    // (a local copy: the stores below cannot change it, so it stays in a
+    // register)
+    let pv = *pivot_at;
+    let pivot = &pv;
+    let lifted = v[0];
+    // The gap is always just before `right` (v[0] at first).
+    let mut num_lt = 0;
+    let mut right = 1;
+    // Four steps a round, through a pointer to the first (its loads and
+    // stores at fixed offsets), then the rest.
+    for _ in 0..(len - 1) / 4 {
+        let src: *T = &v[right];
+        let x0 = src[0];
+        let l0 = f(&x0, pivot);
+        let at0 = num_lt;
+        num_lt += l0 as i64;
+        src[-1] = v[at0];
+        v[at0] = x0;
+        let x1 = src[1];
+        let l1 = f(&x1, pivot);
+        let at1 = num_lt;
+        num_lt += l1 as i64;
+        src[0] = v[at1];
+        v[at1] = x1;
+        let x2 = src[2];
+        let l2 = f(&x2, pivot);
+        let at2 = num_lt;
+        num_lt += l2 as i64;
+        src[1] = v[at2];
+        v[at2] = x2;
+        let x3 = src[3];
+        let l3 = f(&x3, pivot);
+        let at3 = num_lt;
+        num_lt += l3 as i64;
+        src[2] = v[at3];
+        v[at3] = x3;
+        right += 4;
+    }
+    for _ in right..len {
+        let x = v[right];
+        let lt = f(&x, pivot);
+        let at = num_lt;
+        num_lt += lt as i64;
+        v[right - 1] = v[at];
+        v[at] = x;
+        right += 1;
+    }
+    // The lifted element closes the gap, v[len - 1].
+    let lt = f(&lifted, pivot);
+    v[len - 1] = v[num_lt];
+    v[num_lt] = lifted;
+    // (pv copies the pivot, which stays where it is: not dropped here)
+    forget(pv);
+    num_lt + lt as i64
+}
+
+// Reorders s so that s[k] is the element a sort would put there, those
+// before it no greater and those after no less (k < s.len, checked). Not
+// stable. Rust's `select_nth_unstable`.
+pub fn select_nth_unstable<T: Ord>(s: &mut [T], k: i64) {
+    select_nth_unstable_less(s, k, |a: &T, b: &T| *a < *b);
+}
+
+// select_nth_unstable by f, a comparator returning a sign (sort_by's).
+pub fn select_nth_unstable_by<T, F: FnMut(&T, &T) -> i64>(s: &mut [T], k: i64, f: F) {
+    let mut g = f;
+    select_nth_unstable_less(s, k, |a: &T, b: &T| g(a, b) < 0);
+}
+
+// select_nth_unstable on the key f gives each element.
+pub fn select_nth_unstable_by_key<T, K: Ord, F: FnMut(&T) -> K>(s: &mut [T], k: i64, f: F) {
+    let mut g = f;
+    select_nth_unstable_less(s, k, |a: &T, b: &T| g(a) < g(b));
+}
+
+// select_nth_unstable by is_less: introselect, Rust's (the unstable sort's
+// pivots and partition on the side holding k, insertion sort from 16
+// elements down); after 16 poor pivots, the unstable sort of what is left
+// (O(n log n) at worst, where Rust's median of medians is O(n)).
+pub fn select_nth_unstable_less<T, F: FnMut(&T, &T) -> bool>(s: &mut [T], k: i64, is_less: F) {
+    let n = s.len;
+    // (the check: s[k] panics unless 0 <= k < n)
+    let _ = &s[k];
+    // (s.ptr and s.len are one slice's, k < n)
+    unsafe {
+        select_raw(s.ptr, n, k, is_less);
+    }
+}
+
+unsafe fn select_raw<T, F: FnMut(&T, &T) -> bool>(v: *T, n: i64, k: i64, is_less: F) {
+    let mut f = is_less;
+    if k == 0 || k == n - 1 {
+        // The least (or greatest) to its end, in one pass.
+        let mut at = 0;
+        for i in 1..n {
+            let better = if k == 0 { f(&*(&v[i]), &*(&v[at])) } else { !f(&*(&v[i]), &*(&v[at])) };
+            at = if better { i } else { at };
+        }
+        let t = v[at];
+        v[at] = v[k];
+        v[k] = t;
+        return;
+    }
+    let mut lo = 0;
+    let mut hi = n;
+    let mut limit = 16;
+    let mut anc = false;
+    // (each round shrinks the range by its pivot at least)
+    for _ in 0..n + 1 {
+        let len = hi - lo;
+        if len <= 16 {
+            if len >= 2 {
+                insertion_sort_raw(&v[lo], len, 1, f);
+            }
+            return;
+        }
+        if limit == 0 {
+            ipnsort_raw(&v[lo], len, f);
+            return;
+        }
+        limit -= 1;
+        let w: *T = &v[lo];
+        let p = choose_pivot_raw(w, len, f);
+        if anc && !f(&*(&v[lo - 1]), &*(&w[p])) {
+            // all of w[0..=num_le] equal the pivot
+            let num_le = partition_raw(w, len, p, |a: &T, b: &T| !f(b, a));
+            if lo + num_le >= k {
+                return;
+            }
+            lo += num_le + 1;
+            anc = false;
+            continue;
+        }
+        let mid = lo + partition_raw(w, len, p, f);
+        if mid < k {
+            lo = mid + 1;
+            anc = true;
+        } else if mid > k {
+            hi = mid;
+        } else {
+            return;
+        }
+    }
+}

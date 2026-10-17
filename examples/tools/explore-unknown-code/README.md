@@ -49,7 +49,11 @@ crate::network	network.tach	2
 crate::route	route.tach	7
 std::ops	<std>	5
 std::iter	<std>	67
-std::slice	<std>	15
+std::slice	<std>	37
+std::slice::unstable	<std>	16
+std::slice::stable	<std>	22
+std::slice::search	<std>	4
+std::slice::algo	<std>	12
 std::collections	<std>	2
 std::collections::hash_map	<std>	26
 std::io	<std>	7
