@@ -366,6 +366,21 @@ def instructions():
                             ("uqrshrn", 1, 19, "shrn"), ("sshll", 0, 20, "shl"),
                             ("ushll", 1, 20, "shl")]:
         insn(mn, cls, shimm(u, opc), "%s Vd.T, Vn.T, #shift" % mn)
+    # float
+    for mn, u, a, opc in [("fmax", 0, 0, 30), ("fmin", 0, 1, 30), ("fabd", 1, 1, 26), ("fmaxp", 1, 0, 30),
+                          ("fminp", 1, 1, 30), ("fmla", 0, 0, 25), ("fmls", 0, 1, 25)]:
+        insn(mn, "same3f", same3f(u, a, opc), "%s Vd.T, Vn.T, Vm.T" % mn)
+    for mn, u, a, opc in [("fabs", 0, 1, 15), ("frintn", 0, 0, 24), ("frintm", 0, 0, 25), ("frintp", 0, 1, 24),
+                          ("frintz", 0, 1, 25), ("frinta", 1, 0, 24), ("fcvtzs", 0, 1, 27), ("fcvtzu", 1, 1, 27),
+                          ("scvtf", 0, 0, 29), ("ucvtf", 1, 0, 29), ("fcvtl", 0, 0, 23), ("fcvtn", 0, 0, 22)]:
+        insn(mn, "misc2f", misc2f(u, a, opc), "%s Vd.T, Vn.T" % mn)
+    insn("fmaxv", "acrossf", 0x2e30f800, "fmaxv Sd, Vn.4s")
+    insn("fminv", "acrossf", 0x2eb0f800, "fminv Sd, Vn.4s")
+    insn("fmul", "elem", 0x0f809000, "fmul Vd.T, Vn.T, Vm.Ts[i]")
+    # (pairwise to a scalar: fmaxp/fminp/faddp Sd, Vn.2s; Dd, Vn.2d)
+    insn("fmaxp", "fpair", 0x7e30f800, "fmaxp <V>d, Vn.T")
+    insn("fminp", "fpair", 0x7eb0f800, "fminp <V>d, Vn.T")
+    insn("faddp", "fpair", 0x7e30d800, "faddp <V>d, Vn.T")
     # dot products, widening, the high-half narrowing forms
     insn("sdot", "same3", 0x0e809400, "sdot Vd.4s, Vn.16b, Vm.16b")
     insn("sdot", "elem", 0x0f80e000, "sdot Vd.4s, Vn.16b, Vm.4b[i]")
@@ -1131,8 +1146,101 @@ def lanes_dup_shift():
              ("arithmetic" if kind(t) == "s" else "logical"))
 
 
+def floats():
+    section("Float")
+    fq = [("f32", True), ("f64", True), ("f32", False)]
+
+    def bin3(nm, mn, sem, doc, flags="pure"):
+        for t, q in fq:
+            line(name(nm, t, q), "neon", "(a: %s, b: %s) -> %s" % (vv(t, q), vv(t, q), vv(t, q)), "intr",
+                 "%s <d>.%s, <a>.%s, <b>.%s" % (mn, arr(t, q), arr(t, q), arr(t, q)), flags, None,
+                 "lanes.f" + mn[1:], sem, None, doc)
+
+    def un2(nm, mn, sem, doc):
+        for t, q in fq:
+            line(name(nm, t, q), "neon", "(a: %s) -> %s" % (vv(t, q), vv(t, q)), "intr",
+                 "%s <d>.%s, <a>.%s" % (mn, arr(t, q), arr(t, q)), "pure", None, "lanes.f" + mn[1:], sem, None, doc)
+
+    un2("vabs{q}_{t}", "fabs", "|a[k]|", "lanewise |a| (the sign bit cleared)")
+    un2("vneg{q}_{t}", "fneg", "r[k] = -a[k]", "lanewise -a (the sign bit flipped)")
+    bin3("vdiv{q}_{t}", "fdiv", "r[k] = a[k] / b[k]", "lanewise a / b")
+    bin3("vmax{q}_{t}", "fmax", "max(a[k], b[k]), NaN when either is, max(-0, +0) = +0",
+         "lanewise max(a, b): NaN when either is NaN", "pure commutative")
+    bin3("vmin{q}_{t}", "fmin", "min(a[k], b[k]), NaN when either is, min(-0, +0) = -0",
+         "lanewise min(a, b): NaN when either is NaN", "pure commutative")
+    bin3("vabd{q}_{t}", "fabd", "|a[k] - b[k]|", "lanewise |a - b|", "pure commutative")
+    for op, mn in [("padd", "faddp"), ("pmax", "fmaxp"), ("pmin", "fminp")]:
+        for t, q in fq:
+            n = lanes(t, q)
+            if op == "padd":
+                sem = "r[k] = if k < %d { a[2 * k] + a[2 * k + 1] } else { b[2 * k - %d] + b[2 * k - %d] }" % (n // 2, n, n - 1)
+            else:
+                sem = "pairwise %s of adjacent lanes (as vmax/vmin): a's pairs, then b's" % op[1:]
+            line(name("v%s{q}_{t}" % op, t, q), "neon", "(a: %s, b: %s) -> %s" % (vv(t, q), vv(t, q), vv(t, q)),
+                 "intr", "%s <d>.%s, <a>.%s, <b>.%s" % (mn, arr(t, q), arr(t, q), arr(t, q)), "pure", None,
+                 "pairwise.f" + op[1:], sem, None, "pairwise %s of adjacent lanes: a's pairs, then b's" % op[1:])
+    for op, mn, s in [("fma", "fmla", "+"), ("fms", "fmls", "-")]:
+        for t, q in [("f32", True), ("f32", False)]:
+            line(name("v%s{q}_{t}" % op, t, q), "neon",
+                 "(a: %s, b: %s, c: %s) -> %s" % (vv(t, q), vv(t, q), vv(t, q), vv(t, q)), "intr",
+                 "%s <d>.%s, <b>.%s, <c>.%s" % (mn, arr(t, q), arr(t, q), arr(t, q)), "pure tied=a", None,
+                 "lanes." + op, "a[k] %s b[k] * c[k], rounded once" % s, None, "lanewise a %s b * c, fused (one rounding)" % s)
+    for op, mn, doc in [("rndn", "frintn", "to nearest, ties to even"), ("rndm", "frintm", "toward -inf (floor)"),
+                        ("rndp", "frintp", "toward +inf (ceil)"), ("rnd", "frintz", "toward zero (trunc)"),
+                        ("rnda", "frinta", "to nearest, ties away from zero")]:
+        un2("v%s{q}_{t}" % op, mn, "a[k] rounded to an integral value %s" % doc, "lanewise round %s" % doc)
+    for nm, src, dst, mn in [("vcvtq_s32_f32", "f32", "s32", "fcvtzs"), ("vcvtq_u32_f32", "f32", "u32", "fcvtzu"),
+                             ("vcvtq_s64_f64", "f64", "s64", "fcvtzs"), ("vcvtq_u64_f64", "f64", "u64", "fcvtzu"),
+                             ("vcvt_s32_f32", "f32", "s32", "fcvtzs"), ("vcvt_u32_f32", "f32", "u32", "fcvtzu"),
+                             ("vcvtq_f32_s32", "s32", "f32", "scvtf"), ("vcvtq_f32_u32", "u32", "f32", "ucvtf"),
+                             ("vcvtq_f64_s64", "s64", "f64", "scvtf"), ("vcvtq_f64_u64", "u64", "f64", "ucvtf"),
+                             ("vcvt_f32_s32", "s32", "f32", "scvtf"), ("vcvt_f32_u32", "u32", "f32", "ucvtf")]:
+        q = nm.startswith("vcvtq")
+        if kind(dst) == "f":
+            sem = "r[k] = a[k] as f64"
+            doc = "each lane converted, rounding to nearest"
+        else:
+            sem = {"s32": "r[k] = a[k] as i32", "s64": "r[k] = a[k] as i64",
+                   "u32": "r[k] = min(max(a[k], 0.0), 4294967295.0) as u32",
+                   "u64": "r[k] = if a[k] >= 18446744073709551616.0 { 0xffffffffffffffffu64 } else { max(a[k], 0.0) as u64 }"}[dst]
+            doc = "each lane converted toward zero, saturating (NaN is 0)"
+        line(nm, "neon", "(a: %s) -> %s" % (vv(src, q), vv(dst, q)), "intr",
+             "%s <d>.%s, <a>.%s" % (mn, arr(dst, q), arr(src, q)), "pure", None, "cvt", sem, None, doc)
+    line("vcvt_f64_f32", "neon", "(a: float32x2_t) -> float64x2_t", "intr", "fcvtl <d>.2d, <a>.2s", "pure", None,
+         "cvt", "r[k] = a[k]", None, "each lane widened to f64 (exact)")
+    line("vcvt_f32_f64", "neon", "(a: float64x2_t) -> float32x2_t", "intr", "fcvtn <d>.2s, <a>.2d", "pure", None,
+         "cvt", "r[k] = a[k]", None, "each lane narrowed to f32, rounding to nearest")
+    for t, q in fq:
+        n = lanes(t, q)
+        line(name("vmul{q}_n_{t}", t, q), "neon", "(a: %s, b: %s) -> %s" % (vv(t, q), scalar(t), vv(t, q)), "intr",
+             "fmul <d>.%s, <a>.%s, <b>.%s[0]" % (arr(t, q), arr(t, q), letter(t)), "pure", None, "lanes.fmul",
+             "r[k] = a[k] * b", None, "every lane times b")
+        for vq in [True, False]:
+            m = lanes(t, vq)
+            if t == "f64" and not vq:
+                continue
+            line(name("vmul{q}_lane%s_{t}" % ("q" if vq else ""), t, q), "neon",
+                 "(a: %s, v: %s, lane: const 0..=%d) -> %s" % (vv(t, q), vv(t, vq), m - 1, vv(t, q)), "intr",
+                 "fmul <d>.%s, <a>.%s, <v>.%s[<lane>]" % (arr(t, q), arr(t, q), letter(t)), "pure", None,
+                 "lanes.fmul", "r[k] = a[k] * v[lane]", None, "every lane times v[lane]")
+    for op, mn32, mn64, doc in [("maxv", "fmaxv", "fmaxp", "the largest lane (NaN when any is)"),
+                                ("minv", "fminv", "fminp", "the smallest lane (NaN when any is)"),
+                                ("addv", None, "faddp", "the sum of the lanes, pairwise")]:
+        for t, q in fq:
+            if t == "f64":
+                insn = "%s <d:d>, <a>.2d" % mn64
+            elif op == "addv":
+                insn = ("faddp <t>.4s, <a>.4s, <a>.4s; faddp <d:s>, <t>.2s" if q else "faddp <d:s>, <a>.2s")
+            elif q:
+                insn = "%s <d:s>, <a>.4s" % mn32
+            else:
+                insn = "%sp <d:s>, <a>.2s" % mn32[:-1]
+            line(name("v%s{q}_{t}" % op, t, q), "neon", "(a: %s) -> %s" % (vv(t, q), t), "intr", insn, "pure", None,
+                 "across.f" + op[:-1], "%s of a's lanes (pairs first)" % op[:-1], None, doc)
+
+
 FAMILIES = [loads_stores, build_lanes, casts, arithmetic, compare, logic, shifts, horizontal, narrowing,
-            permutes, bit_ops, crc, crypto, dotprod, widening, lanes_dup_shift]
+            permutes, bit_ops, crc, crypto, dotprod, widening, lanes_dup_shift, floats]
 
 
 def def_text():

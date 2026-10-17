@@ -119,6 +119,7 @@ chain's). The classes (`back/enc_arm64/simd.tach`):
 | `shl` | `Vd.T, Vn.T, #shift`: left shifts, widening ones too | Q, immh:immb = esize + shift (esize of the narrowest) |
 | `elem` | `Vd.T, Vn.T, Vm.Ts[i]` (also `Vm.4b[i]`) | Q, size, H:L:M, Rm, Rn, Rd |
 | `same3s`, `misc2s`, `misc2fs`, `shrns`, `shls` | the scalar forms, `<V>d, <V>n, ...` (`sqadd d0, d1, d2`: a 64-bit vector of one 64-bit lane) | as the vector class, size from the register's letter; bits are the vector bits \| 0x50000000 |
+| `fpair` | `<V>d, Vn.T` (float pairwise to a scalar: `fmaxp s0, v1.2s`) | sz (from Vn), Rn, Rd |
 | `rr` | `Rd, Rn` (any registers: crypto) | Rn, Rd |
 | `rrr`, `crc` | `Rd, Rn, Rm` | Rm, Rn, Rd |
 | `rrrr` | `Vd, Vn, Vm, Va` (`eor3`, `bcax`) | Rm, Ra, Rn, Rd |
