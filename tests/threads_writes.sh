@@ -163,6 +163,7 @@ base::STRESS_GROW	read by asm_thread_start before the thread starts (stress_grow
 # hash::ir_hash; off: a mode the cache is off in, cc_wanted; own: the
 # cache's, or the task's context's).
 READ='arch::ARCH_USED	key: a program naming std::arch has its intrinsics in its IR and the build features in the options hash (made by the front end, before the tasks)
+back::isel::arch::ARCH_WORD_SYM	IR: set before the tasks (arch_after_lowering); a function reaches instruction selection with a CPUFEAT, which ir_hash covers, only in a program whose main fills std::ARCH_FEATURES, and the symbol is the same in every build
 arch::INTRS	key: the intrinsic tables are part of the compiler (its identity), parsed by the front end before the tasks, read-only after
 arch::INTR_COUNT	key: the same
 arch::TABLE_BUF	key: the same

@@ -1,17 +1,190 @@
-// The late expansion of CPUFEAT (0.19, docs/design/arch.md §2.5), just
-// before instruction selection: what the optimizer kept of
-// std::arch::detect (pure, numbered by GVN, hoisted by LICM, unswitched)
-// becomes the test of the run-time feature word.
+// The run-time feature word of std::arch::detect (0.19, docs/design/arch.md
+// §2.5): who fills it, and the late expansion of CPUFEAT.
 //
-// Phase 0 (a stub, T3 owns it): every CPUFEAT is the constant false, so a
-// detect of a feature that is not known takes the fallback path. T3 makes
-// it a load of the cached word, a bit test, and the cold call of
-// std::arch::init_features when the word is 0.
+// - A program with `main`: right after lowering (arch_after_lowering), main
+//   starts with a call of std's arch_init_macos / arch_init_linux
+//   (compiler/std/arch.tach), which fills the word before anything else
+//   runs; gen0 does the same at -O0 (gen0/gen/arch.tach). Each CPUFEAT the
+//   optimizer kept of a detect (pure: numbered by GVN, hoisted by LICM,
+//   unswitched) becomes, just before instruction selection
+//   (expand_cpu_features), a load of the word and a bit test: no call and
+//   no branch, nothing clobbered.
+// - Code with no `main` (a library entered from C): nothing runs before
+//   it, so each CPUFEAT becomes, right after lowering, a call of std's
+//   arch_word_macos / arch_word_linux (the word, filled at the first call)
+//   and the bit test. Not hoisted (a call), but taken only by libraries.
+// The word's soundness without atomics: compiler/std/arch.tach.
 
+use crate::arch::ARCH_USED;
+use crate::arch::features::build_features;
+use crate::base::{buf_fmt, buf_str, cstr, intern_c};
+use crate::base::target::{ELF, X86};
+use crate::front::ast::NODES;
+use crate::front::types::{FNS, STATICS, SYM_FN, SYM_STATIC, TY_BOOL, TY_U64};
+use crate::gen0::gen::MAIN_SYM;
+use crate::gen0::target::global_prefix;
 use crate::middle::ctx::FnCtx;
-use crate::middle::ir::{IRFUNCS, Op};
+use crate::middle::ir::{
+    Cond, IRFUNCS, IRFUNC_COUNT, Op, ir_append, ir_enter, ir_insert_before, ir_make,
+};
 
-// The CPUFEATs of function fi (the current one).
+// The symbol of std's word (ARCH_FEATURES) once main fills it (0: no
+// CPUFEAT reaches instruction selection). Set by arch_after_lowering,
+// before code generation's tasks, and read by them: the CPUFEATs it
+// expands are in the code cache's IR hash, and the symbol is the same in
+// every build (tests/threads_writes.sh READ).
+pub static mut ARCH_WORD_SYM: i64 = 0;
+
+// std's function of this target's system: arch_init_* or arch_word_*
+// (-1 when std's detection section is not loaded).
+pub fn arch_std_fn(init: bool) -> i64 {
+    unsafe {
+        let name = if init {
+            if X86 { c"std::arch_init_x86" } else if ELF { c"std::arch_init_linux" }
+            else { c"std::arch_init_macos" }
+        } else {
+            if X86 { c"std::arch_word_x86" } else if ELF { c"std::arch_word_linux" }
+            else { c"std::arch_word_macos" }
+        };
+        SYM_FN[intern_c(name)] - 1
+    }
+}
+
+// After lowering (-O1, -O2): main fills the word first, or, with no main,
+// every CPUFEAT calls std for it.
+pub fn arch_after_lowering(mut cx: *FnCtx) {
+    unsafe {
+        ARCH_WORD_SYM = 0;
+        if !ARCH_USED {
+            return;
+        }
+        let init = arch_std_fn(true);
+        let word = arch_std_fn(false);
+        let s = SYM_STATIC[intern_c(c"std::ARCH_FEATURES")];
+        if init < 0 || word < 0 || s == 0 {
+            return;
+        }
+        let mut main = -1;
+        let mut any = false;
+        for fi in 0..IRFUNC_COUNT {
+            if FNS[IRFUNCS[fi].f].name == MAIN_SYM {
+                main = fi;
+            }
+            if !any && has_cpu_feature(cx, fi) {
+                any = true;
+            }
+        }
+        if !any {
+            return;
+        }
+        if main >= 0 {
+            ARCH_WORD_SYM = NODES[STATICS[s - 1].node].a;
+            ir_enter(cx, main);
+            let entry = IRFUNCS[main].entry;
+            // (its argument: the build's features, which it need not ask for)
+            let known = ir_make(cx, Op::Const, TY_U64, 0, 0, build_features());
+            let call = call_of(cx, init, known);
+            let at = body_start(cx, entry);
+            if at == 0 {
+                ir_append(cx, entry, known);
+                ir_append(cx, entry, call);
+            } else {
+                ir_insert_before(cx, at, known);
+                ir_insert_before(cx, at, call);
+            }
+            return;
+        }
+        for fi in 0..IRFUNC_COUNT {
+            if !has_cpu_feature(cx, fi) {
+                continue;
+            }
+            for b in IRFUNCS[fi].blocks.items() {
+                if cx.blocks[b].removed != 0 {
+                    continue;
+                }
+                let mut v = cx.blocks[b].first;
+                while v != 0 {
+                    let next = cx.insts[v].next;
+                    if cx.insts[v].op == Op::CpuFeat {
+                        let w = call_of(cx, word, 0);
+                        ir_insert_before(cx, v, w);
+                        bit_test(cx, v, w);
+                    }
+                    v = next;
+                }
+            }
+        }
+    }
+}
+
+// Whether function fi has a CPUFEAT (and is entered).
+fn has_cpu_feature(mut cx: *FnCtx, fi: i64) -> bool {
+    unsafe {
+        ir_enter(cx, fi);
+        for b in IRFUNCS[fi].blocks.items() {
+            if cx.blocks[b].removed != 0 {
+                continue;
+            }
+            let mut v = cx.blocks[b].first;
+            while v != 0 {
+                if cx.insts[v].op == Op::CpuFeat {
+                    return true;
+                }
+                v = cx.insts[v].next;
+            }
+        }
+        false
+    }
+}
+
+// A call of std's function f (a u64; its argument `arg`, a u64, or none
+// when 0), not yet in a block.
+fn call_of(mut cx: *FnCtx, f: i64, arg: i64) -> i64 {
+    unsafe {
+        let call = ir_make(cx, Op::Call, TY_U64, 0, 0, f);
+        cx.insts[call].args = cx.args.count;
+        cx.insts[call].nargs = 0;
+        if arg != 0 {
+            cx.args.push(arg);
+            cx.argty.push(TY_U64);
+            cx.insts[call].nargs = 1;
+        }
+        call
+    }
+}
+
+// The first instruction of block b after its phis and parameters (0: none).
+fn body_start(mut cx: *FnCtx, b: i64) -> i64 {
+    unsafe {
+        let mut v = cx.blocks[b].first;
+        while v != 0 && (cx.insts[v].op == Op::Phi || cx.insts[v].op == Op::Param) {
+            v = cx.insts[v].next;
+        }
+        v
+    }
+}
+
+// CPUFEAT v becomes `(w & 1 << bit) != 0` (instructions before it).
+fn bit_test(mut cx: *FnCtx, v: i64, w: i64) {
+    unsafe {
+        let mask = ir_make(cx, Op::Const, TY_U64, 0, 0, 1 << cx.insts[v].imm);
+        ir_insert_before(cx, v, mask);
+        let and = ir_make(cx, Op::And, TY_U64, w, mask, 0);
+        ir_insert_before(cx, v, and);
+        let zero = ir_make(cx, Op::Const, TY_U64, 0, 0, 0);
+        ir_insert_before(cx, v, zero);
+        cx.insts[v].op = Op::Cmp;
+        cx.insts[v].ty = TY_BOOL;
+        cx.insts[v].a = and;
+        cx.insts[v].b = zero;
+        cx.insts[v].imm = 0;
+        cx.insts[v].cond = Cond::Ne;
+        cx.insts[v].imm2 = TY_U64;
+    }
+}
+
+// The CPUFEATs of function fi (the current one): a load of the word and a
+// bit test each (false when no main fills the word: none is left then).
 pub fn expand_cpu_features(mut cx: *FnCtx, fi: i64) {
     unsafe {
         for b in IRFUNCS[fi].blocks.items() {
@@ -20,12 +193,39 @@ pub fn expand_cpu_features(mut cx: *FnCtx, fi: i64) {
             }
             let mut v = cx.blocks[b].first;
             while v != 0 {
+                let next = cx.insts[v].next;
                 if cx.insts[v].op == Op::CpuFeat {
-                    cx.insts[v].op = Op::Const;
-                    cx.insts[v].imm = 0;
+                    if ARCH_WORD_SYM == 0 {
+                        cx.insts[v].op = Op::Const;
+                        cx.insts[v].imm = 0;
+                    } else {
+                        let g = ir_make(cx, Op::GAddr, TY_U64, 0, 0, ARCH_WORD_SYM);
+                        ir_insert_before(cx, v, g);
+                        let w = ir_make(cx, Op::Load, TY_U64, g, 0, 0);
+                        ir_insert_before(cx, v, w);
+                        bit_test(cx, v, w);
+                    }
                 }
-                v = cx.insts[v].next;
+                v = next;
             }
         }
+    }
+}
+
+// x86-64's run-time helpers of std's detection (compiler/std/arch.tach,
+// its x86-64 section), when it is loaded: tachyon_arch_cpuid(leaf, sub,
+// out: *u32) writes eax, ebx, ecx, edx; tachyon_arch_xgetbv(index) returns
+// edx:eax. (cpuid and xgetbv as bytes: no other code uses them.)
+pub fn emit_arch_runtime(mut cx: *FnCtx) {
+    unsafe {
+        if !X86 || !ARCH_USED || arch_std_fn(true) < 0 {
+            return;
+        }
+        let gp = cstr(global_prefix());
+        buf_fmt(cx.asm, f"\n.p2align 4\n.globl {gp}tachyon_arch_cpuid\n{gp}tachyon_arch_cpuid:\n");
+        buf_str(cx.asm, c"    pushq %rbx\n    movq %rdx, %r8\n    movl %edi, %eax\n    movl %esi, %ecx\n    .byte 15, 162\n    movl %eax, (%r8)\n    movl %ebx, 4(%r8)\n    movl %ecx, 8(%r8)\n    movl %edx, 12(%r8)\n    popq %rbx\n    ret\n");
+        buf_fmt(cx.asm,
+            f"\n.p2align 4\n.globl {gp}tachyon_arch_xgetbv\n{gp}tachyon_arch_xgetbv:\n");
+        buf_str(cx.asm, c"    movl %edi, %ecx\n    .byte 15, 1, 208\n    shlq $32, %rdx\n    movl %eax, %eax\n    orq %rdx, %rax\n    ret\n");
     }
 }

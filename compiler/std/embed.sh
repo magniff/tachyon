@@ -20,7 +20,7 @@ out=compiler/src/front/stdsrc.tach
 tmp=$(mktemp "$out.XXXXXX")
 # (0.18: test.tach, nonnull.tach and fuzz.tach, lazy sections: T2, T4 and T3 own them)
 # (0.18.1: collections.tach, the heaps and more of Vec, lazy sections too)
-files="std iter io fmt convert clone alloc values test nonnull fuzz collections"
+files="std iter io fmt convert clone alloc values test nonnull fuzz collections arch"
 # (sed, not awk: awks differ on backslashes in replacements.)
 lines() {
     sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/        buf_str(out, c"/' -e 's/$/\\n");/'
