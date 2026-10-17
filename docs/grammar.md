@@ -1775,6 +1775,10 @@ An intrinsic is a function of `std::arch`, `std::arch::aarch64` or
   `v.load(s, i)` is: `vld1q_u8(s, i)`, `vst1q_u8(s, i, v)`,
   `_mm_loadu_si128(s, i)`. Given a pointer instead (C's and Rust's
   signature) the call is an error (`arch.raw_form`) naming both forms.
+  (0.19.1) A store writes its slice, so the slice is `&mut [T]`
+  (`vst1q_u8(&mut out[..], i, v)`, `v.as_mut_slice()`, a `&mut [T]`
+  parameter): a read-only `[T]` there is `own.readonly`, and the store is
+  an exclusive loan for the own pass.
 - **The pointer forms** are in the `raw` submodule of each architecture's
   module, with the vendor's signature, `unsafe`:
   `std::arch::aarch64::raw::vld1q_u8(p: *u8)`,

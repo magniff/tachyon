@@ -219,7 +219,10 @@ fn main() {
 The vendor's name is the safe form: it takes a slice and an index,
 `vld1q_u8(s, i)` (16 bytes from `s[i]`), `vst1q_u8(s, i, v)`,
 `_mm_loadu_si128(s, i)`, and checks `0 <= i` and `i + 16 <= s.len` as
-`s[i]` does (`panic` in its effects). Range analysis removes the check
+`s[i]` does (`panic` in its effects). A store writes, so its slice is
+`&mut [T]`: `vst1q_u8(&mut out[..], i, v)`, `v.as_mut_slice()`, or a
+`&mut [T]` parameter; a read-only `[T]` there is `own.readonly`, whose
+`try:` line makes the view exclusive. Range analysis removes the check
 in counted loops (`while i + 16 <= s.len`), so the loop body is the bare
 load. Aligned forms (`_mm_load_si128`) check the alignment too and stop
 with `misaligned access` instead of faulting (`arch.misaligned`).
@@ -329,7 +332,7 @@ fn words(block: [u8], i: i64) -> uint32x4_t {
 }
 
 // One 64-byte block into the state (a, b, c, d, e, f, g, h).
-fn compress(state: [u32], block: [u8]) {
+fn compress(state: &mut [u32], block: [u8]) {
     let mut abcd = vld1q_u32(state, 0);
     let mut efgh = vld1q_u32(state, 4);
     let (abcd0, efgh0) = (abcd, efgh);
@@ -367,7 +370,7 @@ fn main() {
         println("no sha2 on this CPU: use a portable SHA-256");
         return;
     }
-    compress(state[..], block[..]);
+    compress(&mut state[..], block[..]);
     for k in 0..8 {
         print(f"{state[k]:08x}");
     }
