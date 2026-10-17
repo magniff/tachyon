@@ -1,8 +1,7 @@
 // The explanations of std::arch's diagnostic codes (0.19,
 // docs/design/arch.md §2.9), for `tachyonc explain CODE` and `explain
-// arch`. arch.raw_form, arch.rust_form and arch.multiversion describe
-// errors still to come (their examples are the design's); the others
-// follow the compiler's messages.
+// arch`. Each example is the compiler's message as `check` prints it (the
+// cases in tests/run/arch_err_*.tach and arch_feat_errors.tach).
 
 use crate::tools::explain::Explain;
 
@@ -13,39 +12,54 @@ pub static ARCH_TABLE: [Explain; 13] = [
         code: "arch.baseline", severity: "error (compiler, exit 1)",
         means: "`-C target-feature=-NAME` removes a feature the target's ABI needs (neon or fp on \
             AArch64, sse2 on x86-64): the calling convention passes floats and vectors in those \
-            registers.",
-        fix: "Drop the removal; to build for an older CPU, choose it with `-C target-cpu=NAME`.",
+            registers, so no function could be compiled without them.",
+        fix: "Drop the removal. To build for an older CPU, choose it with `-C \
+            target-cpu=NAME` (`generic` is Armv8.0 with SIMD); to test a fallback branch, run \
+            the program with TACHYON_ARCH_DISABLE=crc,aes,... (detect() then answers false; it \
+            can only clear features, never add one).",
         example: "error[arch.baseline] -C target-feature cannot remove a feature the target's ABI \
             needs: -neon",
     },
     Explain {
         code: "arch.const_arg", severity: "error (compiler)",
-        means: "An intrinsic's immediate (a shift count, a lane, an `ext` position) is not a \
-            constant, or is out of the range its instruction encodes; `query show NAME` gives \
-            the range.",
-        fix: "Pass a literal or a `const` in the range; to choose at run time, branch on the \
-            value and call the intrinsic with a constant in each branch.",
-        example: "utf8.tach:21:20: error[arch.const_arg] 'vextq_u8' takes n in 0..=15; got 16",
+        means: "An intrinsic's immediate (a shift count, a lane, an `ext` position, a mask) is \
+            not a constant, or is out of the range its instruction encodes. Tachyon has no const \
+            generics: immediates are ordinary arguments, after the others, that must be \
+            constant expressions; `tachyonc query show NAME` gives each one's range.",
+        fix: "Pass a literal or a `const` in the range. To choose at run time, branch on the \
+            value and call the intrinsic with a constant in each branch (`if n == 3 { \
+            vshrq_n_u8(v, 3) } else { ... }`).",
+        example: "utf8.tach:30:28: error[arch.const_arg] 'vshrn_n_u16' takes n as a constant in \
+            1..=8: its instruction encodes it | help: write a literal or a `const`; to choose at \
+            run time, branch on the value (`if n == 3 { f(a, 3) } else { ... }`)",
     },
     Explain {
         code: "arch.cpu", severity: "error (compiler, exit 1)",
-        means: "`-C target-cpu=NAME` names no CPU of the target's architecture, or `native` when \
-            the target is another architecture than the compiling machine's.",
+        means: "`-C target-cpu=NAME` names no CPU of the target's architecture, or is `native` \
+            when the target is another architecture than the compiling machine's (native reads \
+            this machine's features).",
         fix: "Use a listed name: generic, apple-m1..apple-m4, neoverse-n1, neoverse-v1, \
             neoverse-n2, cortex-a72, cortex-a76 on aarch64; x86-64, x86-64-v2..v4, core2, \
-            haswell, skylake, znver2..znver4 on x86_64.",
-        example: "error[arch.cpu] unknown CPU for this target (...): apple-m9",
+            haswell, skylake, znver2..znver4 on x86_64. `tachyonc guide arch#features` lists \
+            each target's baseline.",
+        example: "error[arch.cpu] unknown CPU for this target (expected generic, apple-m1..apple-m4, \
+            neoverse-n1, neoverse-v1, neoverse-n2, cortex-a72, cortex-a76 on aarch64; x86-64, \
+            x86-64-v2..v4, core2, haswell, skylake, znver2..znver4 on x86_64): apple-m9",
     },
     Explain {
         code: "arch.declared", severity: "error (compiler)",
         means: "A function's #[target_feature(enable = \"...\")] is smaller than what its body \
             needs: a call in it needs a feature it does not declare, and no guard there knows \
             it. A declaration is the function's whole requirement (its callers know what it \
-            declares, nothing more), so its body is checked against it.",
-        fix: "Add the feature to the declaration (the try: line), or guard the call with \
-            `if std::arch::detect(\"f\") { ... }`.",
-        example: "crc.tach:9:9: error[arch.declared] 'fold' is #[target_feature(enable = \"neon\")], \
-            but '__crc32cd' needs crc | try: tachyonc edit patch crc.tach:7 --old '\"neon\"' --new \
+            declares, nothing more), so its body is checked against it, as #[effects] pins a \
+            function's effects.",
+        fix: "Add the feature to the declaration (the try: line), or test the CPU around the \
+            call with `if std::arch::detect(\"f\") { ... } else { ... }`. Most functions need \
+            no declaration at all: requirements are inferred.",
+        example: "crc.tach:68:5: error[arch.declared] 'too_small' is #[target_feature(enable = \
+            \"neon\")], but 'hw' (from '__crc32cd' at crc.tach:27:5) needs crc | help: a \
+            declaration is the function's whole requirement: add the feature to it, or test the \
+            CPU around the call | try: tachyonc edit patch crc.tach:66 --old '\"neon\"' --new \
             '\"neon,crc\"' crc.tach",
     },
     Explain {
@@ -64,43 +78,53 @@ pub static ARCH_TABLE: [Explain; 13] = [
         fix: "Wrap the call in a detect() branch with a fallback (the first try: line, when a \
             function of the same signature is named like the callee with `_portable`, \
             `_scalar`, `_fallback` or as its stem), declare #[target_feature] on the caller, \
-            or build for CPUs that have it (`-C target-feature=+avx2`). `tachyonc query \
-            features NAME --why FEATURE` prints the calls that bring a feature in.",
-        example: "sum.tach:14:13: error[arch.feature] 'sum_avx2' needs avx2 (from \
-            '_mm256_add_epi32' at sum.tach:5:17), which 'main' does not know here: \
-            x86_64-linux's baseline is sse2 | try: tachyonc edit patch sum.tach:14 --old 'let t \
-            = sum_avx2(s);' --new 'let t = if std::arch::detect(\"avx2\") { sum_avx2(s) } else \
-            { sum_scalar(s) };' sum.tach",
+            or build for CPUs that have it (`-C target-feature=+crc`). `tachyonc query \
+            features NAME --why FEATURE` prints the calls that bring a feature in; `tachyonc \
+            guide arch#guards` shows the forms a guard takes.",
+        example: "crc.tach:97:13: error[arch.feature] 'hw' needs crc (from '__crc32cd' at \
+            crc.tach:27:5), which 'main' does not know here: the build's features are neon | \
+            help: test the CPU and keep a fallback, declare #[target_feature] on the caller, or \
+            build only for CPUs that have it | try: tachyonc edit patch crc.tach:97 --old 'let f \
+            = hw(1, 2);' --new 'let f = if std::arch::detect(\"crc\") { hw(1, 2) } else { \
+            hw_portable(1, 2) };' crc.tach | try: tachyonc -C target-feature=+crc -o crc \
+            crc.tach | try: tachyonc query features hw --why crc crc.tach",
     },
     Explain {
         code: "arch.feature_ambiguous", severity: "error (compiler)",
         means: "An unqualified feature name of both architectures (`aes`) means the target's, but \
-            it guards or enables the other architecture's intrinsics.",
-        fix: "Qualify it: `x86_64.aes` or `aarch64.aes`.",
-        example: "aes.tach:5:9: error[arch.feature_ambiguous] 'aes' means aarch64.aes on \
-            aarch64-macos, but '_mm_aesenc_si128' needs x86_64.aes | try: tachyonc edit patch \
-            aes.tach:4 --old '\"aes\"' --new '\"x86_64.aes\"' aes.tach",
+            it guards or enables the other architecture's intrinsics: on x86_64 `has(\"aes\")` \
+            is x86's AES-NI, so it does not make `vaeseq_u8` callable.",
+        fix: "Qualify it: `aarch64.aes` or `x86_64.aes` (the try: line).",
+        example: "aes.tach:13:16: error[arch.feature_ambiguous] 'aes' means x86_64.aes on \
+            x86_64-linux, but 'vaeseq_u8' needs aarch64.aes | help: a feature of both \
+            architectures is the target's unless qualified: write `aarch64.aes` or \
+            `x86_64.aes` | try: tachyonc edit patch aes.tach:12 --old '\"aes\"' --new \
+            '\"aarch64.aes\"' aes.tach",
     },
     Explain {
         code: "arch.feature_literal", severity: "error (compiler)",
         means: "std::arch::has or detect is given something else than a string literal: the \
-            feature must be known where the program is compiled (has is a constant; detect one \
-            cached bit).",
-        fix: "Write the feature's name in the call: `std::arch::has(\"neon\")`; to choose by a \
+            feature must be known where the program is compiled (has is a constant of the \
+            build; detect one cached bit of the running CPU).",
+        fix: "Write the feature's name in the call: `std::arch::has(\"neon\")`. To choose by a \
             value, branch on it around literal calls.",
-        example: "fast.tach:4:24: error[arch.feature_literal] 'has' takes the feature's name as a \
-            string literal: its answer is a constant of the build or one cached bit",
+        example: "fast.tach:32:17: error[arch.feature_literal] 'has' takes the feature's name as \
+            a string literal: its answer is a constant of the build or one cached bit | help: \
+            write the name: `std::arch::has(\"neon\")`; `tachyonc explain arch.feature_name` \
+            lists them",
     },
     Explain {
         code: "arch.feature_name", severity: "error (compiler)",
         means: "A name in has(\"...\"), detect(\"...\"), #[target_feature], #[multiversion] or \
             -C target-feature is no target feature of either architecture.",
-        fix: "Use the name the help suggests (`fix --suggested` writes it); the features are \
-            neon, fp, crc, aes, sha2, sha3, dotprod, rdm, lse, fp16, i8mm, bf16 (AArch64) and \
-            sse ... sse4.2, popcnt, lzcnt, bmi1, bmi2, pclmulqdq, aes, sha, avx, avx2, fma \
-            (x86-64).",
-        example: "fast.tach:4:24: error[arch.feature_name] unknown target feature 'avx-2' | help: \
-            did you mean 'avx2'?",
+        fix: "Use the name the help suggests (`fix --suggested` writes it). The features are \
+            neon (or asimd), fp, crc, aes, sha2, sha3, dotprod, rdm, lse, fp16, i8mm, bf16 and \
+            aarch64 (AArch64); sse, sse2, sse3, ssse3, sse4.1, sse4.2, popcnt, lzcnt, bmi1, \
+            bmi2, pclmulqdq, aes, sha, avx, avx2, fma and x86_64 (x86-64). `aarch64.aes` and \
+            `x86_64.aes` name one architecture's aes.",
+        example: "fast.tach:33:20: error[arch.feature_name] unknown target feature 'avx-2' | help: \
+            did you mean 'avx2'? `tachyonc explain arch.feature_name` lists them | try: \
+            tachyonc fix --suggested fast.tach",
     },
     Explain {
         code: "arch.fn_pointer", severity: "error (compiler)",
@@ -108,50 +132,68 @@ pub static ARCH_TABLE: [Explain; 13] = [
             value (or a closure that does is coerced to a `fn` type): the value's callers \
             cannot be followed, so where it runs cannot be checked. A closure passed as itself \
             (to a generic function, an iterator adapter) is followed: the instance it makes \
-            needs its features, and the call of that instance is checked.",
-        fix: "Call the function directly under a detect() guard, or pass a closure (`|x| \
-            sum_avx2(x)`) to a generic function, called where the features are known.",
-        example: "tbl.tach:12:20: error[arch.fn_pointer] 'sum_avx2' needs avx2 (from \
-            '_mm256_add_epi32' at tbl.tach:5:17): a `fn` value of it escapes the feature \
-            analysis, so its callers could call it where x86_64-linux's baseline is sse2",
+            needs its features, and the call of that instance is checked. A #[multiversion] \
+            function's address can always be taken: its dispatcher needs only the baseline.",
+        fix: "Call the function directly under a detect() guard, pass a closure (`|x| \
+            sum_neon(x)`) to a generic function called where the features are known, or make \
+            the function #[multiversion(\"f\")] with a has(\"f\") branch inside.",
+        example: "crc.tach:96:13: error[arch.fn_pointer] 'hw' needs crc (from '__crc32cd' at \
+            crc.tach:27:5): a `fn` value of it escapes the feature analysis, so its callers \
+            could call it where the build's features are neon | help: call it directly, under \
+            a detect() guard, or pass a closure made under the guard (`|x| f(x)`), which the \
+            analysis follows",
     },
     Explain {
         code: "arch.misaligned", severity: "panic (run time, exit 101)",
         means: "An aligned memory intrinsic (`_mm_load_si128`, `_mm_store_si128`, \
             `_mm256_load_*`) was given an address that is not a multiple of its size; the \
-            program stops instead of faulting.",
-        fix: "Use the unaligned form (`_mm_loadu_si128`), or align the data (a #[repr(C, \
-            align(16))] struct, an index that is a multiple of 16 bytes).",
+            program stops instead of faulting. (The AArch64 loads and stores have no alignment \
+            rule.)",
+        fix: "Use the unaligned form (`_mm_loadu_si128`), or align the data (a #[repr(C, align(16))] struct, an index that is a multiple of \
+            16 bytes).",
         example: "misaligned access: address % 16 = 8",
     },
     Explain {
         code: "arch.multiversion", severity: "error (compiler)",
-        means: "In a #[multiversion] function, a call only some clones can make (it needs a \
-            feature of one of the listed sets) is not under has(\"f\"), so the other clones \
-            cannot be compiled.",
-        fix: "Put the call under `if std::arch::has(\"f\") { ... } else { ... }`: has is a \
-            constant in each clone.",
-        example: "dot.tach:6:13: error[arch.multiversion] '_mm256_madd_epi16' needs avx2, which \
-            the baseline version of #[multiversion] 'dot_u8' lacks",
+        means: "In a #[multiversion(\"f\", ...)] function, a call only some versions can make \
+            (it needs a feature of one of the listed sets) is not under has(\"f\"). The \
+            compiler makes one version per listed set the build lacks, plus the baseline one, \
+            from the same body, and has() is a constant in each, so the call must be in a \
+            branch the other versions drop.",
+        fix: "Put the call under `if std::arch::has(\"f\") { ... } else { ... }`, the portable \
+            code in the else branch.",
+        example: "step.tach:12:5: error[arch.multiversion] '__crc32cd' needs crc, which the \
+            baseline version of #[multiversion] 'step' lacks | help: every version compiles the \
+            same body: test the feature around the call, `if std::arch::has(\"crc\") { ... } \
+            else { ... }`, true only in the versions that have it",
     },
     Explain {
         code: "arch.raw_form", severity: "error (compiler)",
-        means: "A memory intrinsic is given a pointer, as in C or Rust: the safe form takes a \
-            slice and an index and checks them; the pointer form is in the `raw` submodule and \
-            is unsafe.",
-        fix: "Pass the slice and the index (`vld1q_u8(s, i)`), or call \
-            `std::arch::aarch64::raw::vld1q_u8(p)` in unsafe code.",
-        example: "scan.tach:3:13: error[arch.raw_form] 'vld1q_u8(p)' passes a pointer: the safe \
-            form takes a slice and an index ('vld1q_u8(s, i)')",
+        means: "A memory intrinsic is given a pointer, as in C or Rust (`vld1q_u8(p)`, \
+            `vld1q_u8(&s[4])`): the safe form takes a slice and an index and checks that the \
+            bytes are in the slice (the check is removed where the compiler proves it, as in \
+            counted loops); the pointer form is in the `raw` submodule and is unsafe.",
+        fix: "Pass the slice and the index (the try: line writes them when the pointer is \
+            `&s[i]`), or call `std::arch::aarch64::raw::vld1q_u8(p)` in an unsafe block when \
+            porting code that only has a pointer.",
+        example: "scan.tach:33:22: error[arch.raw_form] 'vld1q_u8(&s[4])' passes a pointer: the \
+            safe form takes a slice and an index ('vld1q_u8(s, i)'), the pointer form is \
+            'std::arch::aarch64::raw::vld1q_u8' (unsafe) | try: tachyonc edit patch scan.tach:33 \
+            --old 'vld1q_u8(&s[4])' --new 'vld1q_u8(s, 4)'",
     },
     Explain {
         code: "arch.rust_form", severity: "error (compiler)",
-        means: "A Rust spelling of an intrinsic: an immediate as a const generic \
-            (`vshrq_n_u8::<3>(v)`), or `is_x86_feature_detected!(\"avx2\")`.",
-        fix: "Pass the immediate as an argument (`vshrq_n_u8(v, 3)`); test a feature with \
-            `std::arch::detect(\"avx2\")`.",
-        example: "scan.tach:8:17: error[arch.rust_form] 'vshrq_n_u8::<3>(v)': tachyon passes an \
-            intrinsic's immediates as arguments | try: tachyonc edit patch scan.tach:8 --old \
-            'vshrq_n_u8::<3>(v)' --new 'vshrq_n_u8(v, 3)'",
+        means: "A Rust spelling: an immediate as a const generic (`vextq_u8::<3>(a, b)`, \
+            `vshrq_n_u8::<3>(v)`), or `is_x86_feature_detected!(\"avx2\")` / \
+            `is_aarch64_feature_detected!(\"crc\")`. Tachyon has no const generics and no \
+            macros; the intrinsics' names are the vendors' all the same.",
+        fix: "Pass the immediate as the last argument (`vextq_u8(a, b, 3)`); test a feature \
+            with `std::arch::detect(\"avx2\")`, or `has(\"avx2\")` for the build's constant. \
+            The try: line is the edit.",
+        example: "scan.tach:12:5: error[arch.rust_form] 'vextq_u8::<3>(v, v)': tachyon has no \
+            const generics; an intrinsic's immediates are arguments, after the others | help: \
+            write the constant as the last argument; it must be a constant in the intrinsic's \
+            range (`tachyonc query show NAME` gives it) | try: tachyonc edit patch scan.tach:12 \
+            --old 'vextq_u8::<3>(v, v)' --new 'vextq_u8(v, v, 3)'",
     },
 ];

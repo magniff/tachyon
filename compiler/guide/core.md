@@ -170,6 +170,9 @@ them at -O0 and -O2; `requires`/`ensures` clauses and `assert_eq(a, b)`
 are checked at run time, a failure one line `FILE:L:C: message` (`guide
 testing`, `guide contracts`).
 
+SIMD and CPU intrinsics (0.19): `std::arch`, the vendors' names (`vaddq_u8`,
+`__crc32cd`) checked against the CPU: `tachyonc guide arch`; `query arch WORDS`.
+
 ## The loop
 
 Write the program, then `tachyonc check` (a check hook, where there is
