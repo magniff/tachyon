@@ -6,16 +6,20 @@
 // needs it (front/features/check.tach's source_of). `-C target-cpu=` and
 // `-C target-feature=` change the build's features, so what is needed.
 
+use crate::arch::{F_DOC, F_EQUIV, F_FEATURES, F_INSN, F_SEMANTICS, intr_text, intrinsic_of_fn};
 use crate::arch::features::{has_bit, own_features, parse_feature};
-use crate::base::{IntVec, STDOUT, SYMS, buf_byte, buf_bytes, buf_new, buf_str, buf_write_fd};
+use crate::base::{
+    IntVec, STDOUT, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, buf_write_fd,
+};
 use crate::front::ast::NODES;
 use crate::front::features::check::{put_features, put_pos, source_of, top_features};
 use crate::front::features::infer::{DECLARED, DECLARED_MARK, NEEDS, NEEDS_COUNT};
 use crate::front::modules::STD_MODULE;
 use crate::front::types::{FNS, FN_COUNT, TLISTS, TY_ERROR};
+use crate::tools::query::cache::RESTORED;
 use crate::tools::query::defs::{DEFS, K_FN, K_IMPL_METHOD, K_METHOD, K_TRAIT_FN};
 use crate::tools::query::diagnostics::diag;
-use crate::tools::query::effects::OPT_WHY;
+use crate::tools::query::effects::{OPT_WHY, cached_text};
 
 fn fn_of_def(d: i64) -> i64 {
     unsafe {
@@ -38,6 +42,98 @@ fn error_instance(g: i64) -> bool {
             }
         }
         false
+    }
+}
+
+// The text of d's `features:` for def, show and context (0.19, T8): what
+// a function needs beyond the build's features, `avx2 (inferred)` or
+// `crc (declared)`; nothing for a function that needs nothing, a generic
+// one, or an intrinsic (put_def_features prints the table's line).
+pub fn def_features_text(out: i64, d: i64) {
+    unsafe {
+        if RESTORED {
+            cached_text(out, d, 2);
+            return;
+        }
+        let f = fn_of_def(d);
+        if f < 0 || f >= NEEDS_COUNT || FNS[f].generic != 0 || intrinsic_of_fn(f) >= 0 {
+            return;
+        }
+        let needs = NEEDS[f];
+        if needs == 0 {
+            return;
+        }
+        put_features(out, needs, c", ", c"");
+        buf_str(out, if DECLARED[f] != 0 { c" (declared)" } else { c" (inferred)" });
+    }
+}
+
+// The intrinsic definition d declares, or -1.
+pub fn def_intrinsic(d: i64) -> i64 {
+    unsafe {
+        if RESTORED {
+            return -1;
+        }
+        let f = fn_of_def(d);
+        if f < 0 { -1 } else { intrinsic_of_fn(f) }
+    }
+}
+
+// ` features: SET` of definition d into out, for def, show and context;
+// an intrinsic's: `features: neon<sep>instruction: TEMPLATE` (the
+// table's). Whether there was one.
+pub fn put_def_features(out: i64, d: i64, sep: *u8) -> bool {
+    unsafe {
+        let id = def_intrinsic(d);
+        if id >= 0 {
+            buf_str(out, sep);
+            buf_str(out, c"features: ");
+            let f = intr_text(id, F_FEATURES);
+            buf_bytes(out, if f == "-" { "none" } else { f });
+            buf_str(out, sep);
+            buf_str(out, c"instruction: ");
+            let i = intr_text(id, F_INSN);
+            buf_bytes(out, if i == "-" { "none" } else { i });
+            return true;
+        }
+        let text = buf_new();
+        def_features_text(text, d);
+        if buf_slice(text).len == 0 {
+            return false;
+        }
+        buf_str(out, sep);
+        buf_str(out, c"features: ");
+        buf_bytes(out, buf_slice(text));
+        true
+    }
+}
+
+// An intrinsic's notes under show's and context's first line: its doc,
+// what it computes, the other architecture's equivalent, its `use` line.
+pub fn put_intrinsic_notes(out: i64, d: i64) {
+    unsafe {
+        let id = def_intrinsic(d);
+        if id < 0 {
+            return;
+        }
+        buf_str(out, c"// ");
+        buf_bytes(out, intr_text(id, F_DOC));
+        buf_byte(out, '\n');
+        let s = intr_text(id, F_SEMANTICS);
+        if s != "-" {
+            buf_str(out, c"// computes: ");
+            buf_bytes(out, s);
+            buf_byte(out, '\n');
+        }
+        let e = intr_text(id, F_EQUIV);
+        if e != "-" {
+            buf_str(out, c"// equivalent: ");
+            buf_bytes(out, e);
+            buf_byte(out, '\n');
+        }
+        buf_str(out, c"// use ");
+        buf_bytes(out, SYMS[DEFS[d].fqn].text);
+        buf_str(out, c";\n");
     }
 }
 
