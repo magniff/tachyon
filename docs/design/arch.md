@@ -1462,6 +1462,59 @@ the `AE_*` codes.
   is bitwise), `tests/run/opt_arch_*` beyond the seed, the container's
   `TACHYON_ARCH_DISABLE` double runs (T3), the `#[property]` conversion.
 
+**T3 as built (branch a19-t3).**
+- **std's word** is `compiler/std/arch.tach`, four lazy sections: the
+  portable part (`ARCH_FEATURES`, `TACHYON_ARCH_DISABLE`, the
+  implications' consistency: sha3 without sha2 is cleared), then one per
+  source: macOS (sysctl `hw.optional.arm.FEAT_*`), Linux (`getauxval`),
+  x86-64 (`cpuid`, `xgetbv`). No `cfg`: the compiler names the target's
+  section (`arch_init_macos|linux|x86`, `arch_word_*`; the loader's
+  `know_program`, so `set_target` now runs before the modules load), and
+  only that one is lexed. std's code names no `std::arch` item (a query
+  loading all of std would otherwise load the virtual modules). Each init
+  takes the build's features (`known`), which it does not ask the system
+  about, so a default macOS build reads two sysctls (i8mm, bf16).
+- **Who fills it.** A program with `main`: main's first call
+  (`arch_after_lowering`, after lowering, `back/isel/arch.tach`; gen0's
+  `gen_function` at -O0), only when a CPUFEAT survived lowering (-O0: a
+  detect not folded). Then each CPUFEAT becomes, just before isel, a load
+  and a bit test: no cold path is needed, nothing is clobbered, the
+  optimizer saw a pure op. With no `main` (a library), each CPUFEAT
+  becomes after lowering a call of `arch_word_*` (filled at the first
+  call) and the bit test. **Change:** no `cbz` to a cold block; the
+  library form is an ordinary call, not hoisted (left for later: making
+  it pure needs keeping `arch_word_*` alive past dead-function removal).
+  -O0 calls `arch_word_*` at every detect.
+- **Soundness without atomics** (the comment at the top of std's
+  section): one write before main, while single-threaded; in a library,
+  an idempotent race on one aligned word that every writer fills with
+  the same value, which the hardware never tears and the back end never
+  splits; relaxed atomics in 0.21's terms.
+- **x86-64** (compile-only): `tachyon_arch_cpuid` and
+  `tachyon_arch_xgetbv`, global helpers the compiler writes after the
+  run-time helpers (`emit_arch_runtime`), `cpuid`/`xgetbv` as `.byte`s:
+  no table intrinsic, no register-class change (T5's regalloc stays as
+  it is).
+- **`#[multiversion]`** (`front/features/multiversion.tach`): before
+  the contracts, each listed set of the target's architecture that the
+  build lacks makes a version `f$mvK` (a copy of the AST, `FN_DERIVED`,
+  declaring the set through a `FA_TARGET_FEATURE` entry); the first set
+  the build has ends the list; the function's body becomes `if
+  detect(..) { f$mv0(..) } else if .. else { <its body> }` (its body is
+  the baseline version). The dispatcher is pinned (`DECLARED_MARK`, no
+  needs), so callers and `arch.fn_pointer` see the baseline; calls a
+  version cannot make are `arch.multiversion` (once per position).
+  Methods and generic functions use the contracts' call form
+  (`Self::f$mvK`, the type parameters written).
+- **The double runs**: `tests/run.sh` runs every run case whose source
+  names `detect(` or `#[multiversion` a second time with
+  `TACHYON_ARCH_DISABLE=all` and expects the same output and exit code,
+  on every host (the container's suite included).
+- Tests: `arch_detect_run` (CRC-32C by detect and by a multiversioned
+  function, through a `fn` value and a closure; the word's implications;
+  a detect in a loop), `arch_detect_lib` (a C main, no tachyon main),
+  `arch_err_multiversion`.
+
 ## 8. Open questions
 
 - **O1. Latency and throughput in `query show`.** Useful for choosing

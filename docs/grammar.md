@@ -1780,6 +1780,36 @@ An intrinsic is a function of `std::arch`, `std::arch::aarch64` or
 - `is_x86_feature_detected!("f")` and its AArch64 twin are
   `std::arch::detect("f")` (`arch.rust_form`).
 
+### Run-time detection and `#[multiversion]` (0.19)
+
+- **`std::arch::detect("f")`** is a constant where f is known (the
+  build's features, a `#[target_feature]` declaration, a guard around
+  it) or of another architecture; otherwise it tests one bit of a word
+  std fills once: on AArch64 macOS from `sysctl` (`hw.optional.arm.FEAT_*`,
+  only for what the build does not assume), on AArch64 Linux from
+  `getauxval(AT_HWCAP)` and `AT_HWCAP2`, on x86-64 from `cpuid` and
+  `xgetbv` (the avx family only when the system saves the ymm registers).
+  A program's `main` fills the word before its first statement; code
+  entered from C with no tachyon `main` fills it at its first detect.
+  The test is pure: repeated tests merge, and one in a loop is hoisted
+  out of it.
+- **`TACHYON_ARCH_DISABLE=crc,aes`** (or `all`) in the environment of a
+  running program clears those features from the word (and the features
+  that need them: sha3 with sha2), so its detects take the fallback
+  paths. It only clears: no setting makes a missing instruction run.
+  `tests/run.sh` runs every case that uses `detect` or `#[multiversion]`
+  a second time with `all`, and expects the same output.
+- **`#[multiversion("f", "g,h", ...)]`** on a function compiles its body
+  once per listed set of the target's architecture, each version knowing
+  that set (`has("f")` is true in it), plus the baseline version, and
+  makes the function a dispatcher: the first listed set the CPU has
+  (`detect`) picks its version, else the baseline. A set of another
+  architecture makes no version; one the build already has ends the list.
+  The dispatcher needs only the baseline, so its address may be taken.
+  An intrinsic call that a version lacks the feature for is an error
+  (`arch.multiversion`, naming that version): put it under
+  `if std::arch::has("f")`.
+
 ## Importing C headers
 
 `import "stdio.h" as c;` *(0.4; `as`: 0.5, required since 0.8)* reads a C
