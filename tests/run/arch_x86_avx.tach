@@ -1,0 +1,150 @@
+// CROSS: x86_64-linux
+// FLAGS: --verify-regalloc
+// EXPECT: mix 85 85
+// EXPECT: fma 7 -5 13 1
+// EXPECT: shift 64 104 32 128
+// (0.19 T5) AVX and AVX2 in registers: sixteen 256-bit values live at once
+// (more than the allocator's 14 vector registers: ymm spills in 32-byte
+// slots, checked by --verify-regalloc), the 256-bit casts (bytes copied as
+// two halves: a cast needs no AVX), FMA's tied accumulator in a ymm
+// register, the blend whose mask is the immediate's top nibble, shifts and
+// cross-lane permutes. Compiled for x86_64-linux (CROSS), not run: x86-64
+// is not executed in 0.19; on AArch64 the scalar fallbacks print the same.
+// CHECK-OPT: 2
+// ASM(x86_64-linux): vpaddb %ymm
+// ASM(x86_64-linux): (%rsp), %ymm
+// ASM(x86_64-linux): vpxor %ymm
+// ASM(x86_64-linux): vpmovmskb %ymm
+// ASM(x86_64-linux): vzeroupper
+// ASM(x86_64-linux): vfmadd213ps %ymm
+// ASM(x86_64-linux): vpblendvb %ymm
+// ASM(x86_64-linux): vpsllw $3, %ymm
+// ASM(x86_64-linux): vpermq $27, %ymm
+// ASM(x86_64-linux): vperm2i128 $1, %ymm
+use std::arch::detect;
+use std::arch::x86_64::{
+    __m256, __m256i, _mm256_add_epi8, _mm256_blendv_epi8, _mm256_castps_si256, _mm256_castsi256_ps,
+    _mm256_castsi256_si128, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_loadu_si256,
+    _mm256_movemask_epi8, _mm256_permute2x128_si256, _mm256_permute4x64_epi64, _mm256_slli_epi16,
+    _mm256_storeu_ps, _mm256_storeu_si256, _mm256_xor_si256, _mm_movemask_epi8,
+};
+
+// Sixteen loads live together, then t_k = a_k + a_(15 - k) and their xor:
+// the top bits, and the low half's through the casts.
+#[inline(never)]
+fn mix_avx2(s: [u8]) -> (i64, i64) {
+    let a0 = _mm256_loadu_si256(s, 0);
+    let a1 = _mm256_loadu_si256(s, 1);
+    let a2 = _mm256_loadu_si256(s, 2);
+    let a3 = _mm256_loadu_si256(s, 3);
+    let a4 = _mm256_loadu_si256(s, 4);
+    let a5 = _mm256_loadu_si256(s, 5);
+    let a6 = _mm256_loadu_si256(s, 6);
+    let a7 = _mm256_loadu_si256(s, 7);
+    let a8 = _mm256_loadu_si256(s, 8);
+    let a9 = _mm256_loadu_si256(s, 9);
+    let a10 = _mm256_loadu_si256(s, 10);
+    let a11 = _mm256_loadu_si256(s, 11);
+    let a12 = _mm256_loadu_si256(s, 12);
+    let a13 = _mm256_loadu_si256(s, 13);
+    let a14 = _mm256_loadu_si256(s, 14);
+    let a15 = _mm256_loadu_si256(s, 15);
+    let t0 = _mm256_add_epi8(a0, a15);
+    let t1 = _mm256_add_epi8(a1, a14);
+    let t2 = _mm256_add_epi8(a2, a13);
+    let t3 = _mm256_add_epi8(a3, a12);
+    let t4 = _mm256_add_epi8(a4, a11);
+    let t5 = _mm256_add_epi8(a5, a10);
+    let t6 = _mm256_add_epi8(a6, a9);
+    let t7 = _mm256_add_epi8(a7, a8);
+    let u = _mm256_xor_si256(_mm256_xor_si256(_mm256_xor_si256(t0, t1), _mm256_xor_si256(t2, t3)),
+        _mm256_xor_si256(_mm256_xor_si256(t4, t5), _mm256_xor_si256(t6, t7)));
+    let back = _mm256_castps_si256(_mm256_castsi256_ps(u));
+    (_mm256_movemask_epi8(u) as i64 & 0xffffffff, _mm_movemask_epi8(_mm256_castsi256_si128(back))
+        as i64)
+}
+
+fn mix_scalar(s: [u8]) -> (i64, i64) {
+    let mut m: i64 = 0;
+    for p in 0..32 {
+        let mut v: i64 = 0;
+        for k in 0..8 {
+            v = v ^ ((s[k + p] as i64 + s[15 - k + p] as i64) & 255);
+        }
+        m = m | ((v >> 7) << p);
+    }
+    (m, m & 0xffff)
+}
+
+#[inline(never)]
+fn fma_avx(a: [f32], b: [f32], c: [f32], out: &mut [f32]) {
+    _mm256_storeu_ps(out, 0, _mm256_fmadd_ps(_mm256_loadu_ps(a, 0), _mm256_loadu_ps(b, 0),
+        _mm256_loadu_ps(c, 0)));
+}
+
+// Blend by the mask's top bits, shift each 16-bit lane left by 3, reverse
+// the 64-bit lanes, swap the 128-bit halves.
+#[inline(never)]
+fn shuffle_avx2(a: [u8], b: [u8], m: [u8], out: &mut [u8]) {
+    let x = _mm256_blendv_epi8(_mm256_loadu_si256(a, 0), _mm256_loadu_si256(b, 0),
+        _mm256_loadu_si256(m, 0));
+    let y = _mm256_slli_epi16(x, 3);
+    let z = _mm256_permute4x64_epi64(y, 0x1b);
+    _mm256_storeu_si256(out, 0, _mm256_permute2x128_si256(z, z, 1));
+}
+
+fn shuffle_scalar(a: [u8], b: [u8], m: [u8], out: &mut [u8]) {
+    let mut x: [u8; 32] = [0; 32];
+    for k in 0..32 {
+        x[k] = if m[k] >= 128 { b[k] } else { a[k] };
+    }
+    let mut y: [u8; 32] = [0; 32];
+    for k in 0..16 {
+        let w = ((x[2 * k] as i64 | (x[2 * k + 1] as i64) << 8) << 3) & 0xffff;
+        y[2 * k] = w as u8;
+        y[2 * k + 1] = (w >> 8) as u8;
+    }
+    // (lanes 3 2 1 0 of y, then the halves swapped: 1 0 3 2)
+    let order: [i64; 4] = [1, 0, 3, 2];
+    for q in 0..4 {
+        for j in 0..8 {
+            out[8 * q + j] = y[8 * order[q] + j];
+        }
+    }
+}
+
+fn main() {
+    let mut buf: [u8; 64] = [0; 64];
+    for i in 0..64 {
+        buf[i] = (i * i * 7 + i * 13 + 5) as u8;
+    }
+    let (m, lo) = if detect("avx2") { mix_avx2(buf[..]) } else { mix_scalar(buf[..]) };
+    println(f"mix {m} {lo}");
+    let a: [f32; 8] = [2.0, -3.0, 4.0, 0.5, 1.0, 1.0, 1.0, 1.0];
+    let b: [f32; 8] = [3.0, 2.0, 3.0, 2.0, 1.0, 1.0, 1.0, 1.0];
+    let c: [f32; 8] = [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let mut r: [f32; 8] = [0.0; 8];
+    if detect("fma") && detect("avx") {
+        fma_avx(a[..], b[..], c[..], &mut r[..]);
+    } else {
+        for k in 0..8 {
+            r[k] = a[k] * b[k] + c[k];
+        }
+    }
+    println(f"fma {r[0] as i64} {r[1] as i64} {r[2] as i64} {r[3] as i64}");
+    let mut x: [u8; 32] = [0; 32];
+    let mut y: [u8; 32] = [0; 32];
+    let mut mk: [u8; 32] = [0; 32];
+    for k in 0..32 {
+        x[k] = k as u8;
+        y[k] = (k + 100) as u8;
+        mk[k] = if k % 3 == 0 { 0x80 } else { 0 };
+    }
+    let mut out: [u8; 32] = [0; 32];
+    if detect("avx2") {
+        shuffle_avx2(x[..], y[..], mk[..], &mut out[..]);
+    } else {
+        shuffle_scalar(x[..], y[..], mk[..], &mut out[..]);
+    }
+    println(f"shift {out[0]} {out[1]} {out[8]} {out[24]}");
+}

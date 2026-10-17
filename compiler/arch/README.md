@@ -138,8 +138,39 @@ table lacks:
 
 `prefix` is the mandatory prefix (`66`, `f2`, `f3`, `-`), `map` the
 opcode map (`0f`, `0f38`, `0f3a`), `opcode` the byte, in hexadecimal;
-`flags` `w` for REX.W, else `-`. Classes: `sse` (`op src, dst`: ModRM reg
-is dst) and `ssei` (`op $imm8, src, dst`). VEX (AVX) is T5's.
+`flags`, space-separated (`-`: none): `w` REX.W (VEX.W1 in a VEX class),
+`o16` the 0x66 operand-size prefix, `/N` the ModRM.reg digit, `i=XX` a
+shift's immediate form (opcode XX with the digit), `c` commutative and
+`cmp` commutative for the symmetric predicates (the sources are swapped,
+as LLVM's assembler does, when only the second is r8-r15: the two-byte
+VEX prefix then holds). The classes (operands in AT&T order):
+
+| class | operands | ModRM reg, r/m, VEX.vvvv |
+|---|---|---|
+| `sse` | `src, dst` | dst, src, - |
+| `ssei` | `$imm8, src, dst` | dst, src, - |
+| `sser` | `src, dst` | src, dst, - (a register written to r/m) |
+| `sseir` | `$imm8, src, dst` | src, dst, - (`pextrb`) |
+| `shift` | `$imm8\|%xmm, dst` | dst, count; the immediate: the digit, dst |
+| `sse0` | `%xmm0, src, dst` | dst, src (xmm0 implicit: `pblendvb`, `sha256rnds2`) |
+| `vex` | `src2, src1, dst` | dst, src2, src1 |
+| `vexv` | `src1, src2, dst` | dst, src2, src1 (`bextr`, `bzhi`) |
+| `vex2`, `vex2r` | `src, dst` | dst, src (`vex2r`: src, dst); no vvvv |
+| `vexi`, `vex2i`, `vex2ir` | `$imm8, ...` | as `vex`, `vex2`, `vex2r` |
+| `vexshift` | `$imm8\|%xmm, src, dst` | count form as `vex`; the immediate: the digit, src, dst |
+| `vex4` | `mask, src2, src1, dst` | as `vex`; the mask in the immediate's top nibble |
+| `vexd` | `src, dst` | the digit, src, dst (`blsr`) |
+
+VEX.L is 1 when an operand is a ymm register. The encoder's own table
+also has `vmovdqu`, `vmovdqa` and `vzeroupper` (the back end writes them
+for 256-bit values). On x86-64 a template writes `<NAME:y>` for a vector
+register's 256-bit view (`%ymm3`), and `<NAME:0>` for an operand the
+instruction reads in xmm0 (printed `%xmm0`; the machine layer saves xmm0
+around it). The families of `x86_64.def` and every line of
+`insn_x86.def` are written by `tools/arch/x86_families.py --write`
+(between the `# ==== generated` markers), with `tests/arch/enc_x86.s`,
+the corpus `tests/arch/enc.sh` assembles with the compiler and with cc
+and compares byte for byte.
 
 ## Adding an intrinsic
 

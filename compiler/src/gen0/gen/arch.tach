@@ -222,6 +222,12 @@ pub fn gen_intrinsic(mut cx: *FnCtx, n: i64, f: i64, id: i64) -> bool {
             load_register(cx, regs[k], ty);
         }
         let vector_result = is_vector(ret);
+        let mut wide = type_size(ret) == 32;
+        for k in 0..count {
+            if !intr_param_is_const(id, k) && type_size(NODES[child(n, k)].ty) == 32 {
+                wide = true;
+            }
+        }
         // (a float result in v0: the float accumulator's d0/s0)
         let d = if vector_result || is_float(ret) { VREG } else { 0 };
         let work = if INTRS[id].work != 0 { SYM_PRIMITIVE[INTRS[id].work] } else { ret };
@@ -231,6 +237,12 @@ pub fn gen_intrinsic(mut cx: *FnCtx, n: i64, f: i64, id: i64) -> bool {
             || form == FORM_VSUM {
             if X86 { mx_intr(cx, id, d, regs[..], imms[..]); }
             else { ma_intr(cx, id, d, regs[..], imms[..]); }
+            if X86 && wide && !vector_result {
+                // (0.19: -O0 keeps no value in a register: the ymm state is
+                // clean after each 256-bit intrinsic; a 256-bit result is
+                // stored first)
+                ins(cx, c"vzeroupper");
+            }
         } else if form == FORM_VSPLAT {
             if X86 { mx_vsplat(cx, work, d, regs[0]); } else { ma_vsplat(cx, work, d, regs[0]); }
         } else if form == FORM_VEXT {
@@ -267,6 +279,13 @@ pub fn gen_intrinsic(mut cx: *FnCtx, n: i64, f: i64, id: i64) -> bool {
 fn load_register(mut cx: *FnCtx, r: i64, ty: i64) {
     unsafe {
         let size = type_size(ty);
+        if X86 && size == 32 {
+            // (0.19: AVX's 256-bit registers)
+            o(cx, c"    vmovdqu (%r11), %ymm");
+            oi(cx, r - 32);
+            on(cx);
+            return;
+        }
         if X86 {
             o(cx, if r
                 >= 32 {
@@ -298,6 +317,14 @@ fn load_register(mut cx: *FnCtx, r: i64, ty: i64) {
 fn store_register(mut cx: *FnCtx, r: i64, ty: i64) {
     unsafe {
         let size = type_size(ty);
+        if X86 && size == 32 {
+            o(cx, c"    vmovdqu %ymm");
+            oi(cx, r - 32);
+            o(cx, c", (%r11)");
+            on(cx);
+            ins(cx, c"vzeroupper");
+            return;
+        }
         if X86 {
             o(cx, if size == 16 { c"    movups %xmm" } else { c"    movsd %xmm" });
             oi(cx, r - 32);

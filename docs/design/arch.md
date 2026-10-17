@@ -1462,6 +1462,88 @@ the `AE_*` codes.
   is bitwise), `tests/run/opt_arch_*` beyond the seed, the container's
   `TACHYON_ARCH_DISABLE` double runs (T3), the `#[property]` conversion.
 
+**T5 as built (branch a19-t5).** x86-64, compile-tested only.
+- `x86_64.def` holds 484 intrinsics, written with every line of
+  `insn_x86.def` (368 instructions) by `tools/arch/x86_families.py
+  --write` between the `# ==== generated` markers: sse 20, sse2 127, sse3
+  8, ssse3 16, sse4.1 47, sse4.2 5, popcnt 2, lzcnt 2, bmi1 12, bmi2 6,
+  pclmulqdq 1, aes 6, sha 7, avx 71, avx2 138, fma 16. Each has its
+  semantics or a `fn ref_NAME` (`tests/arch/ref/x86_bits.tach`,
+  `x86_float.tach`, `x86_crypto.tach`); `arch-gen` compiles all 33
+  programs at -O0 and -O2 for x86_64-linux and x86_64-macos, and
+  `objcheck -t x86_64-macos arch_` agrees with cc on all 184 compilations.
+- **Encoder.** VEX (two- and three-byte prefixes, L, W, vvvv) in
+  `enc_x86`'s table classes (compiler/arch/README.md: `sse ssei sser sseir
+  shift sse0 vex vexv vex2 vex2r vexi vex2i vex2ir vexshift vex4 vexd`);
+  ymm registers; `vmovdqu`, `vmovdqa`, `vzeroupper` in its own table; the
+  operand swaps LLVM's assembler makes for the short VEX prefix
+  (commutative operations, symmetric `vcmpps` predicates, register moves).
+  **`tachyonc assemble [--target T] FILE.s -o FILE.o`** (a developer's
+  tool, `tools/assemble.tach`) runs the compiler's assembler on a file;
+  **`tests/arch/enc.sh`** (category `arch-enc` of tests/run.sh) assembles
+  `tests/arch/enc_x86.s` (7,777 instructions: every line of `insn_x86.def`
+  and the back end's AVX moves, low and high registers, both widths, eight
+  addressing forms) with it and with cc for x86_64-macos and x86_64-linux:
+  byte for byte the same.
+- **256-bit values** live in ymm registers (the same numbers as xmm):
+  `mx_load`/`mx_store` write `vmovdqu`, `mx_mov` `vmovdqa`, spill slots
+  are 32 bytes (four 8-byte slots, `assign_spill_slots`). Only AVX
+  instructions make one: an intrinsic's result, its operands' loads, and
+  the `load`/`store` forms; a 256-bit `cast` copies its bytes as two
+  halves (`lower_intrinsic`), since a cast needs no feature. T1's
+  legalization of the portable 256-bit types is unchanged.
+- **vzeroupper** is an AVX instruction, so it goes only where AVX is
+  proven: before a call or return that every path reaches through an
+  instruction writing a ymm register (a must analysis over the blocks,
+  `holds_ymm`, FnCtx `ymm_in`/`ymm_ret`); no ymm value is live across a
+  call (they are spilled), so it destroys nothing. At -O0 one follows each
+  256-bit intrinsic.
+- **Templates.** `<NAME:y>` is the ymm view; `<NAME:0>` an operand read in
+  xmm0 (SSE4.1's `pblendvb`/`blendvps`/`blendvpd`, `sha256rnds2`): the
+  machine layer saves xmm0 in xmm14 around it (`mx_intr_xmm0`, five moves).
+  A tied 256-bit result (FMA) is moved whole.
+- Tests: `tests/run/arch_x86_core.tach` (byte search with SSE2 and AVX2,
+  pshufb/palignr/psubusb/ptest, CRC-32C, POPCNT, pblendvb),
+  `arch_x86_kat.tach` (FIPS-197 C.1 through aeskeygenassist, aesenc,
+  aesdec with aesimc's keys; carry-less squares; sha1msg1),
+  `arch_x86_avx.tach` (sixteen live ymm values: spills; FMA; vpblendvb,
+  shifts, permutes): `CROSS: x86_64-linux` with ASM lines, run on AArch64
+  (the fallbacks print the answers).
+- Not done (of §2.3.2): gathers and masked loads/stores (`intr.mem` is not
+  lowered), the string compares (`pcmpistri`/`pcmpestri`: implicit ecx,
+  eax, edx), `_mulx_u64`, `_mm256_zeroupper` (the `hint` form is T6's),
+  intrinsics with float scalars (`_mm_set1_ps`, `_mm_cvtss_f32`: -O0's
+  float operands are T4's change to `gen0/gen/arch.tach`), `_mm_set_epi*`
+  (more than three operands), `_mm_loadl_epi64`/`storel` (8 of a 16-byte
+  vector), `lddqu`, `_mm_dp_ps`, `mpsadbw`, `pause`/`prefetch` (T6's
+  hints), VEX forms of the generic 128-bit operations in AVX functions,
+  the AVX2 vectorizer (O3). The aligned forms (`_mm_load_si128`, ...) load
+  unaligned: no alignment check yet, and never a fault.
+- **Encoded but never run** (to run when x86 testing returns; nothing
+  needs changing to run them, only the gate's x86 switch):
+  - every intrinsic of `x86_64.def` (the `arch_x86_*` programs of
+    `tests/arch/gen.sh`, built for x86 and not run);
+  - the x86 paths of `arch_seed_x86`, `arch_x86_core`, `arch_x86_kat`
+    (AES, PCLMULQDQ, SHA known answers), `arch_x86_avx`;
+  - the ymm back end: 32-byte spills and reloads, `vmovdqa` moves of
+    256-bit values (tied FMA results, parallel moves), the vzeroupper
+    placement, -O0's vzeroupper, the 256-bit casts through halves;
+  - the xmm0 save/restore of `pblendvb`/`blendvps`/`blendvpd`/
+    `sha256rnds2`; the AVX `set1` sequences (`movd`, `punpcklbw`,
+    `pshuflw`, `pshufd`, `vinsertf128`); `ptest`/`vptest` with `setcc`.
+  - Known risks to check then: the f64 square-root reference (Newton's
+    method) may be an ulp off; the FMA references are unfused (computed in
+    f64): exact references are needed before the f64 (and rare f32) FMA
+    cases can pass; LICM hoists loop-invariant loads and `Intr`s without
+    `runs_first` (T6's no-speculation rule must cover a 256-bit load,
+    `vmovdqu`, as it covers a guarded `Intr`, or a load hoisted above its
+    `detect` runs on a CPU without AVX).
+- **Changes for others.** FnCtx gains `ymm_used`, `ymm_in`, `ymm_ret`
+  (per function, emission only). `emit_call_inst` (T6's file) writes the
+  vzeroupper after the arguments' moves (one line). The store intrinsics
+  keep Phase 0's `[u8]` slice (a read-only view under 0.17's rules: the
+  migration to `&mut [T]` is D13's generator commit, for both tables).
+
 **T3 as built (branch a19-t3).**
 - **std's word** is `compiler/std/arch.tach`, four lazy sections: the
   portable part (`ARCH_FEATURES`, `TACHYON_ARCH_DISABLE`, the

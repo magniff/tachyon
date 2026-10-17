@@ -1,0 +1,258 @@
+// CROSS: x86_64-linux
+// FLAGS: --verify-regalloc
+// EXPECT: find 37 -1 0 63
+// EXPECT: find2 37 5
+// EXPECT: classify 136 255 0 7
+// EXPECT: crc e3069283 2dbb5c68
+// EXPECT: popcnt 32 64 0 3
+// EXPECT: blend 0 254 2 251
+// (0.19 T5) std::arch::x86_64's core families, what std 0.20 needs on
+// x86-64 (docs/design/arch.md §2.3.4): byte search with SSE2 and AVX2
+// (compare, move mask), table lookups (pshufb, palignr, saturating
+// subtraction, ptest), CRC-32C and POPCNT; compiled for x86_64-linux
+// (CROSS: assembly and object, nothing run: x86-64 is not executed in
+// 0.19), each intrinsic one instruction (the ASM lines). On AArch64 the
+// detect() branches are dead and the portable fallbacks print the same;
+// on x86-64 (once its tests run) the vector paths must print it too.
+// AVX code: 256-bit values in ymm registers, vzeroupper before calls and
+// returns only where AVX is proven (after a ymm write on every path).
+// CHECK-OPT: 2
+// ASM(x86_64-linux): vpcmpeqb %ymm
+// ASM(x86_64-linux): vpmovmskb %ymm
+// ASM(x86_64-linux): vzeroupper
+// ASM(x86_64-linux): ret
+// ASM(x86_64-linux): pcmpeqb %xmm
+// ASM(x86_64-linux): pmovmskb %xmm
+// ASM(x86_64-linux): pshufb %xmm
+// ASM(x86_64-linux): palignr $15, %xmm
+// ASM(x86_64-linux): psubusb %xmm
+// ASM(x86_64-linux): ptest %xmm
+// ASM(x86_64-linux): crc32b %
+// ASM(x86_64-linux): crc32q %
+// ASM(x86_64-linux): popcntq %
+// ASM(x86_64-linux): pblendvb %xmm0, %xmm
+use std::arch::detect;
+use std::arch::x86_64::{
+    __m128i, __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
+    _mm_alignr_epi8, _mm_blendv_epi8, _mm_cmpeq_epi8, _mm_crc32_u64, _mm_crc32_u8, _mm_loadu_si128,
+    _mm_movemask_epi8, _mm_set1_epi8, _mm_shuffle_epi8, _mm_storeu_si128, _mm_subs_epu8,
+    _mm_testz_si128, _popcnt64,
+};
+
+fn first_bit(m: i64) -> i64 {
+    if m == 0 {
+        return -1;
+    }
+    let mut n = 0;
+    while (m >> n) & 1 == 0 {
+        n += 1;
+    }
+    n
+}
+
+// The first i with s[i] == b among s[0..64], 32 bytes at a time.
+#[inline(never)]
+fn find_avx2(s: [u8], b: u8) -> i64 {
+    let needle = _mm256_set1_epi8(b as i8);
+    let mut i = 0;
+    while i < 64 {
+        let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(s, i), needle));
+        if m != 0 {
+            return i + first_bit(m as i64 & 0xffffffff);
+        }
+        i += 32;
+    }
+    -1
+}
+
+// The same, 16 bytes at a time (SSE2, the x86-64 baseline).
+#[inline(never)]
+fn find_sse2(s: [u8], b: u8) -> i64 {
+    let needle = _mm_set1_epi8(b as i8);
+    let mut i = 0;
+    while i < 64 {
+        let m = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(s, i), needle));
+        if m != 0 {
+            return i + first_bit(m as i64);
+        }
+        i += 16;
+    }
+    -1
+}
+
+fn find_scalar(s: [u8], b: u8) -> i64 {
+    for i in 0..64 {
+        if s[i] == b {
+            return i;
+        }
+    }
+    -1
+}
+
+fn find(s: [u8], b: u8) -> i64 {
+    if detect("avx2") {
+        return find_avx2(s, b);
+    }
+    if detect("sse2") {
+        return find_sse2(s, b);
+    }
+    find_scalar(s, b)
+}
+
+// A nibble table lookup (UTF-8 validation's step): byte k of the result is
+// table[s[k] >> 4]; then the previous block's last byte before this one's
+// (palignr), how far each byte exceeds 0xf0 (saturating), and whether any
+// does (ptest).
+#[inline(never)]
+fn classify_ssse3(s: [u8], out: &mut [u8]) -> i64 {
+    let mut t: [u8; 16] = [0; 16];
+    for k in 0..16 {
+        t[k] = (k * 17) as u8;
+    }
+    let table = _mm_loadu_si128(t[..], 0);
+    let cur = _mm_loadu_si128(s, 16);
+    let prev = _mm_loadu_si128(s, 0);
+    let mut hi: [u8; 16] = [0; 16];
+    for k in 0..16 {
+        hi[k] = s[16 + k] >> 4;
+    }
+    let looked = _mm_shuffle_epi8(table, _mm_loadu_si128(hi[..], 0));
+    _mm_storeu_si128(out, 0, looked);
+    let shifted = _mm_alignr_epi8(cur, prev, 15);
+    let over = _mm_subs_epu8(shifted, _mm_set1_epi8(0xf0u8 as i8));
+    _mm_storeu_si128(out, 16, over);
+    if _mm_testz_si128(over, over) != 0 { 0 } else { 1 }
+}
+
+fn classify_scalar(s: [u8], out: &mut [u8]) -> i64 {
+    let mut any = 0;
+    for k in 0..16 {
+        out[k] = ((s[16 + k] >> 4) as i64 * 17) as u8;
+        let b = if k == 0 { s[15] } else { s[16 + k - 1] };
+        out[16 + k] = if b > 0xf0 { b - 0xf0 } else { 0 };
+        if out[16 + k] != 0 {
+            any = 1;
+        }
+    }
+    any
+}
+
+fn classify(s: [u8], out: &mut [u8]) -> i64 {
+    if detect("ssse3") && detect("sse4.1") {
+        return classify_ssse3(s, out);
+    }
+    classify_scalar(s, out)
+}
+
+// CRC-32C of s, a byte at a time and 8 bytes at a time.
+#[inline(never)]
+fn crc_bytes_sse42(s: [u8]) -> u32 {
+    let mut c: u32 = 0xffffffff;
+    for i in 0..s.len as i64 {
+        c = _mm_crc32_u8(c, s[i]);
+    }
+    c ^ 0xffffffff
+}
+
+#[inline(never)]
+fn crc_words_sse42(s: [u8]) -> u64 {
+    let mut c: u64 = 0xffffffff;
+    let mut i = 0;
+    while i + 8 <= s.len as i64 {
+        let mut w: u64 = 0;
+        for j in 0..8 {
+            w = w | ((s[i + j] as u64) << (8 * j));
+        }
+        c = _mm_crc32_u64(c, w);
+        i += 8;
+    }
+    c ^ 0xffffffff
+}
+
+fn crc_scalar(s: [u8], n: i64) -> u64 {
+    let mut c: u64 = 0xffffffff;
+    for i in 0..n {
+        c = c ^ (s[i] as u64);
+        for b in 0..8 {
+            c = if c & 1 != 0 { (c >> 1) ^ 0x82f63b78 } else { c >> 1 };
+        }
+    }
+    c ^ 0xffffffff
+}
+
+fn crc(s: [u8], words: bool) -> u64 {
+    if detect("sse4.2") {
+        return if words { crc_words_sse42(s) } else { crc_bytes_sse42(s) as u64 };
+    }
+    crc_scalar(s, if words { s.len as i64 / 8 * 8 } else { s.len as i64 })
+}
+
+#[inline(never)]
+fn ones_popcnt(x: i64) -> i64 {
+    _popcnt64(x) as i64
+}
+
+fn ones(x: i64) -> i64 {
+    if detect("popcnt") {
+        return ones_popcnt(x);
+    }
+    let mut n = 0;
+    for b in 0..64 {
+        n += (x >> b) & 1;
+    }
+    n
+}
+
+// SSE4.1's blendv: its mask is read in xmm0, whatever holds xmm0 around it.
+#[inline(never)]
+fn blend_sse41(a: [u8], b: [u8], m: [u8], out: &mut [u8]) {
+    _mm_storeu_si128(out, 0, _mm_blendv_epi8(_mm_loadu_si128(a, 0), _mm_loadu_si128(b, 0),
+        _mm_loadu_si128(m, 0)));
+}
+
+fn blend(a: [u8], b: [u8], m: [u8], out: &mut [u8]) {
+    if detect("sse4.1") {
+        blend_sse41(a, b, m, out);
+        return;
+    }
+    for k in 0..16 {
+        out[k] = if m[k] >= 128 { b[k] } else { a[k] };
+    }
+}
+
+fn main() {
+    let mut buf: [u8; 64] = [0; 64];
+    for i in 0..64 {
+        buf[i] = (i * 7 % 64 + 1) as u8;
+    }
+    let s = buf[..];
+    println(f"find {find(s, 4)} {find(s, 200)} {find(s, 1)} {find(s, 58)}");
+    println(f"find2 {find_scalar(s, 4)} {find(s, 36)}");
+    let mut text: [u8; 32] = [0; 32];
+    for k in 0..32 {
+        text[k] = (k * 8 + 7) as u8;
+    }
+    let mut out: [u8; 32] = [0; 32];
+    let any = classify(text[..], &mut out[..]);
+    println(f"classify {out[0]} {out[15]} {out[16]} {any + 6}");
+    let digits = "123456789";
+    let mut d: [u8; 16] = [0; 16];
+    for i in 0..9 {
+        d[i] = digits[i];
+    }
+    let c1 = crc(d[0..9], false);
+    let c8 = crc(d[0..16], true);
+    println(f"crc {c1:x} {c8:x}");
+    println(f"popcnt {ones(0xffffffff)} {ones(-1)} {ones(0)} {ones(0x700)}");
+    let mut a: [u8; 16] = [0; 16];
+    let mut b: [u8; 16] = [0; 16];
+    let mut m: [u8; 16] = [0; 16];
+    for k in 0..16 {
+        a[k] = k as u8;
+        b[k] = (255 - k) as u8;
+        m[k] = if k % 2 == 1 { 0x80 } else { 0x7f };
+    }
+    let mut r: [u8; 16] = [0; 16];
+    blend(a[..], b[..], m[..], &mut r[..]);
+    println(f"blend {r[0]} {r[1]} {r[2]} {r[3] - 1}");
+}
