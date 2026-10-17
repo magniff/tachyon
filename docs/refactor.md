@@ -37,7 +37,12 @@ tachyonc query impact NAME
 ```
 
 The editing commands (edit, fix) also take `--dry-run`, `--no-check`, `--show`,
-`--exact`, `--root ROOT` and `--target T`. ROOT is found as for query
+`--exact`, `--root ROOT` and `--target T`, and (0.19) `-C
+target-cpu=CPU` and `-C target-feature=+x,-y`: an edit is checked with
+the build's features it is given, so one that removes a
+`detect("crc")` guard is refused on a `generic` build
+(`arch.feature`) and accepted where crc is in the baseline
+(examples/arch/crc32/README.md shows it). ROOT is found as for query
 (`--root`, a last argument ending in `.tach`, `$TACHYON_ROOT`,
 `./main.tach`, `./compiler/src/main.tach`).
 
@@ -632,7 +637,10 @@ IR and tokens), in sh.
 ## Planning queries
 
 For deciding how to change a program, from the same front end as the
-other queries. An item's lines are its text's (its comments to its last
+other queries. (0.19: for SIMD code, `query arch WORDS` finds the
+intrinsic for a task and `--equiv NAME` the other architecture's,
+`query features NAME --why F` what brings a CPU feature into a function:
+[query.md](query.md#arch-019).) An item's lines are its text's (its comments to its last
 line, as `query show` prints it).
 
 ### query stats

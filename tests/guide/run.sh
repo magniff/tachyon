@@ -286,7 +286,7 @@ if ! "$COMPILER" guide --list >"$WORK/list" 2>&1; then
     result FAIL guide-list "tachyonc guide --list failed:" "$(cat "$WORK/list")"
 fi
 missing=""
-for t in core language rust syntax types std errors unsafe c-interop modules generics traits closures iterators conversions formatting memory views tools; do
+for t in core language rust syntax types std errors unsafe c-interop arch modules generics traits closures iterators conversions formatting memory views tools; do
     awk -F '\t' -v t="$t" '$1 == t { found = 1 } END { exit !found }' "$WORK/list" || missing="$missing $t"
 done
 if [ -n "$missing" ]; then
@@ -449,6 +449,17 @@ if grep -q '^impl<T, A: Allocator> Vec<T, A> {$' "$WORK/findm.out" \
     result pass guide-find-method
 else
     result FAIL guide-find-method "$(head -8 "$WORK/findm.out")"
+fi
+# (0.19) The vendor names and plain words of std::arch land on guide arch.
+missed=""
+for w in simd neon avx2 intrinsic crc32 popcount 'byte search' sha256; do
+    "$COMPILER" guide --find "$w" 2>/dev/null | head -1 >"$WORK/findarch.out"
+    grep -q '^# arch#' "$WORK/findarch.out" || missed="$missed '$w' ($(cat "$WORK/findarch.out"))"
+done
+if [ -z "$missed" ]; then
+    result pass guide-find-arch
+else
+    result FAIL guide-find-arch "not first on guide arch:$missed"
 fi
 "$COMPILER" guide --find xyzzy frobnicate >"$WORK/nofind.out" 2>&1
 rc=$?

@@ -36,7 +36,8 @@ with its input and checks its output (`tests/run.sh example` runs them
 all). `algorithms/` groups ten examples, one folder each; `tools/` holds
 walkthroughs of the compiler's tools (query, edit, refactor);
 `allocators/` and `effects/` show 0.16's explicit allocation and
-effects. The READMEs of `tools/`, `allocators/` and `effects/` are
+effects, `arch/` 0.19's intrinsics. The READMEs of `tools/`,
+`allocators/`, `effects/` and `arch/` are
 sessions: `tests/walkthrough/run.sh` runs their commands and checks
 that they print what the README says, errors and traps included.
 
@@ -64,4 +65,5 @@ that they print what the README says, errors and traps included.
 | [algorithms](algorithms/) | ten classic algorithms with READMEs, timings and C comparisons | `tachyonc examples/algorithms/NAME/main.tach -o NAME && ./NAME` |
 | [allocators](allocators/) | five examples of explicit allocation (0.16): `fn main(gpa: Gpa)`, a parser on an arena, per-request scratch with `arena_scope`, no heap with `FixedBuf`, memory bugs caught by `--check-alloc` | see each README |
 | [effects](effects/) | four examples of effects (0.16): `#[pure]`/`#[no_alloc]`/`#[no_panic]`, effect bounds on closures, `Hash`/`Eq`/`Ord` purity, an agent moving a module onto an arena with `query effects` | see each README |
+| [arch](arch/) | two examples of CPU intrinsics (0.19): a NEON byte search as fast as libc's `memchr`, CRC-32 by the crc instructions behind `detect("crc")` with a table fallback, each timed against its portable version | see each README |
 | [tools](tools/) | the agent toolset in action: eight tested walkthroughs (rename, split, rewrite, explore, fix errors, prove unchanged, conflicts) | see each README |
