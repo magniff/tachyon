@@ -64,11 +64,11 @@ use crate::front::types::{
 };
 use crate::gen0::target::{
     DATA, DEPTH, R_ACC, R_ADDR, R_RESULT, R_SECOND, arg_location, data_align, data_bytes,
-    data_label, data_section, data_string, emit_add_imm, emit_copy, emit_epilogue, emit_file_header,
-    emit_file_trailer, emit_frame_addr, emit_frame_reserve, emit_function_start, emit_label,
-    emit_load, emit_load_imm, emit_load_param, emit_load_reg, emit_move_to_second, emit_peek,
-    emit_runtime, emit_store, first_int_arg, function_prefix, global_prefix, local_prefix,
-    new_label, pop_d, pop_x, push_x0, static_prefix,
+    data_label, data_section, data_string, emit_add_imm, emit_call, emit_copy, emit_epilogue,
+    emit_file_header, emit_file_trailer, emit_frame_addr, emit_frame_reserve, emit_function_start,
+    emit_label, emit_load, emit_load_imm, emit_load_param, emit_load_reg, emit_move_to_second,
+    emit_peek, emit_runtime, emit_store, first_int_arg, function_prefix, global_prefix, ins,
+    local_prefix, new_label, pop_d, pop_x, push_x0, static_prefix,
 };
 use crate::middle::inline::FN_LIVE;
 use crate::middle::ir::{IRFUNC_COUNT, ir_enter, ir_tables_bytes};
@@ -210,6 +210,8 @@ pub fn compile_program(mut cx: *FnCtx, output: *u8) {
             crate::middle::coverage::coverage_after_lowering(cx);
             // (0.17: --trace's frames)
             trace_after_lowering(cx);
+            // (0.19: std::arch::detect's word: main fills it)
+            crate::back::isel::arch::arch_after_lowering(cx);
             flush_warnings();
             timer_add(T_LOWER, t);
             phase_time(c"lowering");
@@ -286,6 +288,8 @@ pub fn compile_program(mut cx: *FnCtx, output: *u8) {
         timer_add(T_CODEGEN, t);
         t = timer_now();
         emit_runtime(cx);
+        // (0.19: x86-64's cpuid and xgetbv, for std::arch::detect)
+        crate::back::isel::arch::emit_arch_runtime(cx);
         dbg_text_end(cx);
         gen_data();
         buf_bytes(cx.asm, buf_slice(DATA));
@@ -397,6 +401,19 @@ fn gen_function(mut cx: *FnCtx, item: i64) {
             emit_store(cx, TY_U64, R_RESULT, R_ADDR);
         }
         gen_params(cx, item, f);
+        // (0.19 T3) std::arch::detect's word, filled before main's body
+        if FNS[f].name == MAIN_SYM && crate::arch::ARCH_USED
+            && crate::front::features::any_runtime_detect() {
+            let init = crate::back::isel::arch::arch_std_fn(true);
+            if init >= 0 {
+                // (its argument: the build's features)
+                emit_load_imm(cx, R_ACC, crate::arch::features::build_features() as u64);
+                if X86 {
+                    ins(cx, c"movq %rax, %rdi");
+                }
+                emit_call(cx, fn_symbol_prefix(init), FNS[init].name, false, false, 0);
+            }
+        }
         let body = NODES[item].c;
         gen_block(cx, body);
         if NODES[body].ty != TY_NEVER {
