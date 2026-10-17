@@ -94,6 +94,11 @@ dropped (freed) at the end of its scope (0.17): no `free` calls.
   returns a copy of the value in an `Option`. Iterate with
   `for i in 0..m.slots()` and `key_at(i)`/`value_at(i)`, in slot order
   (not the order of insertion).
+- (0.20) A `HashMap` is a Swiss table (hashbrown's design), and std's
+  hashes are foldhash with fixed seeds (`std::hash::FixedState`): the
+  slot order is the same in every run and on every target. Not proof
+  against keys an attacker chooses: `std::hash::SipHashState::new()`
+  hashes with SipHash-1-3 and random keys, as Rust's default does.
 - To change a value in place, `get_mut(k)` and `get_or_insert(k, d)`
   give a writable view of one element (`&mut [V]`; `a[0]` is the value),
   safe to use until the map's next insert, remove or free, like
@@ -131,7 +136,7 @@ fn main(gpa: Gpa) -> i32 {
 }
 ```
 ```out
-c=10 a=3 b=1
+b=1 a=3 c=10
 3 has b
 ```
 

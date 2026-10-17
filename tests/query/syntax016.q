@@ -7,14 +7,20 @@ std	<std>	529
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	15
-std::collections	<std>	2
-std::collections::hash_map	<std>	26
+std::collections	<std>	6
+std::collections::hash_map	<std>	27
+std::collections::raw_table	<std>	46
+std::collections::group	<std>	19
 std::io	<std>	7
 std::fmt	<std>	80
 std::num	<std>	83
 std::num::tables	<std>	4
 std::convert	<std>	2
 std::clone	<std>	1
+std::hash	<std>	6
+std::hash::fold	<std>	26
+std::hash::sip	<std>	14
+std::hash::state	<std>	19
 $ show apply grow
 // crate::apply	syntax016/main.tach:31-35
 #[no_alloc]
@@ -40,4 +46,4 @@ apply<closure(i64) -> i64 at syntax016/main.tach:47:32>	none
 crate::grow	alloc(Gpa) panic
 crate::main	alloc(Gpa) io global panic unsafe
 $ def Vec::new_in
-std::Vec::new_in	../../compiler/std/std.tach:177:12	method	pub fn new_in(a: A) -> Vec<T, A>
+std::Vec::new_in	../../compiler/std/std.tach:178:12	method	pub fn new_in(a: A) -> Vec<T, A>

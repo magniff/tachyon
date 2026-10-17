@@ -50,14 +50,20 @@ crate::route	route.tach	7
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	15
-std::collections	<std>	2
-std::collections::hash_map	<std>	26
+std::collections	<std>	6
+std::collections::hash_map	<std>	27
+std::collections::raw_table	<std>	46
+std::collections::group	<std>	19
 std::io	<std>	7
 std::fmt	<std>	80
 std::num	<std>	83
 std::num::tables	<std>	4
 std::convert	<std>	2
 std::clone	<std>	1
+std::hash	<std>	6
+std::hash::fold	<std>	26
+std::hash::sip	<std>	14
+std::hash::state	<std>	19
 $ tachyonc query items route
 # crate::route	route.tach
 8	const	pub const TRANSFER_MINUTES: i64 = 5
@@ -119,10 +125,10 @@ crate::heap::free_heap	heap.tach:63:8	fn	pub fn free_heap(h: &mut MinHeap)
 crate::heap::is_empty	heap.tach:18:8	fn	pub fn is_empty(h: &MinHeap) -> bool
 crate::heap::pop	heap.tach:35:8	fn	pub fn pop(h: &mut MinHeap) -> Option<Entry>
 crate::graph::edges_from	graph.tach:55:8	fn	pub fn edges_from(g: &Graph, i: i64) -> [Edge]
-std::Vec::filled_in	<std>:1506:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
+std::Vec::filled_in	<std>:1494:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
 crate::heap::push	heap.tach:22:8	fn	pub fn push(h: &mut MinHeap, e: Entry)
-std::Option::unwrap	<std>:113:12	method	pub fn unwrap(self: Option<T>) -> T requires self.is_some() else "called unwrap on None"
-std::Vec::set	<std>:295:12	method	pub fn set(self: &mut Vec<T, A>, i: i64, x: T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
+std::Option::unwrap	<std>:114:12	method	pub fn unwrap(self: Option<T>) -> T requires self.is_some() else "called unwrap on None"
+std::Vec::set	<std>:296:12	method	pub fn set(self: &mut Vec<T, A>, i: i64, x: T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
 note query.budget: over the budget of 600 tokens, left out: calls 2, types or uses 9, callers 1
 try: tachyonc query callers quickest
 try: tachyonc query context quickest --budget 1800

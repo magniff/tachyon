@@ -8,14 +8,20 @@ crate::tests	syntax018/main.tach	1
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	15
-std::collections	<std>	2
-std::collections::hash_map	<std>	26
+std::collections	<std>	6
+std::collections::hash_map	<std>	27
+std::collections::raw_table	<std>	46
+std::collections::group	<std>	19
 std::io	<std>	7
 std::fmt	<std>	80
 std::num	<std>	83
 std::num::tables	<std>	4
 std::convert	<std>	2
 std::clone	<std>	1
+std::hash	<std>	6
+std::hash::fold	<std>	26
+std::hash::sip	<std>	14
+std::hash::state	<std>	19
 $ show crate::push Stack Percent
 // crate::push	syntax018/main.tach:19-27	effects: panic
 fn push(s: &mut Stack, x: i64)

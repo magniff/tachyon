@@ -29,6 +29,7 @@ pub mod fmt;
 pub mod num;
 pub mod convert;
 pub mod clone;
+pub mod hash;
 
 pub use clone::Clone;
 pub use collections::HashMap;
@@ -649,12 +650,11 @@ pub trait Eq { #[pure] fn eq(self: &Self, other: &Self) -> bool; }
 pub trait Ord { #[pure] fn cmp(self: &Self, other: &Self) -> i64; }
 pub trait Hash { #[pure] fn hash(self: &Self) -> u64; }
 
-// A 64-bit mix of x (splitmix64's finalizer): the hash of the integers.
+// The hash of the integers (0.20): FixedState's, foldhash with fixed
+// seeds, one folded multiply (std::hash).
+#[inline]
 pub fn hash_u64(x: u64) -> u64 {
-    let mut z = x + 0x9e3779b97f4a7c15u64;
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9u64;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebu64;
-    z ^ (z >> 31)
+    hash::fold_hash_u64_fixed(x)
 }
 
 impl Eq for i8 {
@@ -784,15 +784,35 @@ impl Hash for bool {
 }
 
 // Byte strings: compared by bytes, ordered lexicographically, hashed with
-// FNV-1a.
+// foldhash (0.20; FNV-1a before).
 impl Eq for [u8] {
     fn eq(self: &Self, other: &Self) -> bool {
         let a = *self;
         let b = *other;
-        if a.len != b.len {
+        let n = a.len;
+        if n != b.len {
             return false;
         }
-        for i in 0..a.len {
+        if n >= 8 {
+            // (0.20) 8 bytes at a time, the last 8 overlapping: every read is
+            // within both slices
+            unsafe {
+                for k in 0..(n - 1) / 8 {
+                    if *(&a.ptr[8 * k] as *u64) != *(&b.ptr[8 * k] as *u64) {
+                        return false;
+                    }
+                }
+                return *(&a.ptr[n - 8] as *u64) == *(&b.ptr[n - 8] as *u64);
+            }
+        }
+        if n >= 4 {
+            // (the first 4 bytes and the last 4, overlapping)
+            unsafe {
+                return *(&a.ptr[0] as *u32) == *(&b.ptr[0] as *u32)
+                    && *(&a.ptr[n - 4] as *u32) == *(&b.ptr[n - 4] as *u32);
+            }
+        }
+        for i in 0..n {
             if a[i] != b[i] {
                 return false;
             }
@@ -816,41 +836,10 @@ impl Ord for [u8] {
 }
 
 impl Hash for [u8] {
+    #[inline]
     fn hash(self: &Self) -> u64 {
-        let mut h = 14695981039346656037u64;
-        for b in *self {
-            h = (h ^ b as u64) * 1099511628211u64;
-        }
-        h
-    }
-}
-
-// ---- HashMap's room (0.16) ----
-
-impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
-    // Its allocator (0.16): a copy of the handle.
-    pub fn allocator(self: &HashMap<K, V, A>) -> A {
-        self.alloc
-    }
-
-    // An empty map on allocator a with room for n entries (0.16).
-    pub fn with_capacity_in(n: i64, a: A) -> HashMap<K, V, A> {
-        let mut m: HashMap<K, V, A> = HashMap::new_in(a);
-        if n > 0 {
-            if n > ALLOC_LIMIT / 8 {
-                out_of_memory();
-            }
-            // (slots: a power of two, 8 at least, n at most 3/4 of them)
-            let mut cap = 8;
-            for _ in 0..62 {
-                if n * 4 <= cap * 3 {
-                    break;
-                }
-                cap *= 2;
-            }
-            m.rehash_to(cap);
-        }
-        m
+        // (0.20: FixedState's, foldhash: the length, then the bytes)
+        hash::fold_hash_bytes_fixed(0x082efa98ec4e6c89, *self)
     }
 }
 

@@ -1,0 +1,247 @@
+// (0.20) RawTable, the Swiss table, against models: random operations
+// from seeded generators (insert or update, insert without looking,
+// remove, look up, reserve, iterate, clear) on maps of keys below K, the
+// model an array; churn around a steady size, so that tombstones pile up
+// and the table rehashes in place, against the list of present keys; a
+// weak hash (13 tags, every probe starting near the end and wrapping
+// around) for long probe sequences; a table whose probes all wrap,
+// rehashed in place (displaced elements swapped). `check` verifies the
+// invariants (tags, the control bytes' copy, items, growth_left, every
+// element found by its hash) as it goes. Then foldhash's probe lengths on
+// sequential keys. Any failure prints a FAIL line.
+// EXPECT: checksum 10111871430835930257
+// EXPECT: probes ok
+use std::collections::RawTable;
+use std::hash::{FixedState, SipHashState};
+
+fn xorshift(x: &mut u64) -> u64 {
+    let mut v = *x;
+    v ^= v << 13;
+    v ^= v >> 7;
+    v ^= v << 17;
+    *x = v;
+    v
+}
+
+// The hash of key k: foldhash, or a weak one (many equal tags, long
+// probe sequences, tombstones) when `weak`.
+fn key_hash(k: u64, weak: bool) -> u64 {
+    if weak {
+        // (13 tags; starts at the last buckets, so probes wrap around)
+        ((k % 13) << 57) | (0x00fffffffffffffcu64 - (k % 2) * 8)
+    } else {
+        FixedState::new().hash_u64(k)
+    }
+}
+
+// One run: `ops` operations, keys below `keys`; returns a checksum.
+fn run(seed: u64, ops: i64, keys: i64, weak: bool, gpa: Gpa) -> u64 {
+    let mut rng = seed;
+    let mut t: RawTable<(u64, i64)> = RawTable::new_in(gpa);
+    let mut model: Vec<i64> = Vec::filled_in(keys, -1, gpa);
+    let mut count = 0;
+    let mut sum = 0u64;
+    for step in 0..ops {
+        let r = xorshift(&mut rng) % 100;
+        let k = xorshift(&mut rng) % keys as u64;
+        let h = key_hash(k, weak);
+        let hasher = |e: &(u64, i64)| key_hash(e.0, weak);
+        if r < 40 {
+            // insert or update
+            let v = step;
+            t.reserve(1, hasher);
+            let i = t.find_or_find_insert_slot(h, |e: &(u64, i64)| e.0 == k);
+            if i >= 0 {
+                if model.get(k as i64) < 0 { println("FAIL: found a key not in the model"); }
+                t.write(i, (k, v));
+            } else {
+                if model.get(k as i64) >= 0 { println("FAIL: missed a key of the model"); }
+                t.insert_in_slot(h, ~i, (k, v));
+                count += 1;
+            }
+            model.set(k as i64, v);
+        } else if r < 50 {
+            // insert without looking, when absent
+            if model.get(k as i64) < 0 {
+                t.insert(h, (k, step), hasher);
+                model.set(k as i64, step);
+                count += 1;
+            }
+        } else if r < 80 {
+            // remove
+            let i = t.find(h, |e: &(u64, i64)| e.0 == k);
+            if (i >= 0) != (model.get(k as i64) >= 0) { println("FAIL: find disagrees (remove)"); }
+            if i >= 0 {
+                let e = t.take(i);
+                if e.1 != model.get(k as i64) || e.0 != k { println("FAIL: took a wrong element"); }
+                model.set(k as i64, -1);
+                count -= 1;
+            }
+        } else if r < 97 {
+            // look up
+            let i = t.find(h, |e: &(u64, i64)| e.0 == k);
+            let want = model.get(k as i64);
+            if i < 0 {
+                if want >= 0 { println("FAIL: a key of the model not found"); }
+            } else {
+                let e = *t.get(i);
+                if e.1 != want { println("FAIL: a wrong value"); }
+                sum += e.1 as u64;
+            }
+        } else if r < 98 {
+            t.reserve((xorshift(&mut rng) % 64) as i64, hasher);
+        } else if r < 99 {
+            // the whole table, by iteration
+            let mut n = 0;
+            let mut s = 0;
+            for i in t.iter() {
+                let e = *t.get(i);
+                if model.get(e.0 as i64)
+                    != e.1 { println("FAIL: iteration gives a wrong element"); }
+                n += 1;
+                s += e.1;
+            }
+            if n != count { println("FAIL: iteration count"); }
+            sum += s as u64;
+        } else if xorshift(&mut rng) % 20 == 0 {
+            t.clear();
+            for j in 0..keys { model.set(j, -1); }
+            count = 0;
+        }
+        if t.len() != count { println("FAIL: len"); }
+        if step % 997 == 0 {
+            let c = t.check(hasher);
+            if c.len > 0 { println(f"FAIL: {c}"); }
+        }
+    }
+    let c = t.check(|e: &(u64, i64)| key_hash(e.0, weak));
+    if c.len > 0 { println(f"FAIL: {c}"); }
+    sum += t.len() as u64;
+    t.free();
+    model.free();
+    sum
+}
+
+fn churn(seed: u64, ops: i64, size: i64, weak: bool, gpa: Gpa) -> u64 {
+    let mut rng = seed;
+    let mut t: RawTable<u64> = RawTable::new_in(gpa);
+    let mut present: Vec<u64> = Vec::new_in(gpa);
+    let mut sum = 0u64;
+    for step in 0..ops {
+        let hasher = |e: &u64| key_hash(*e, weak);
+        if present.len() < size || xorshift(&mut rng) % 2 == 0 {
+            let k = xorshift(&mut rng) >> 8;
+            let h = key_hash(k, weak);
+            t.reserve(1, hasher);
+            let i = t.find_or_find_insert_slot(h, |e: &u64| *e == k);
+            if i < 0 {
+                t.insert_in_slot(h, ~i, k);
+                present.push(k);
+            }
+        } else {
+            let j = (xorshift(&mut rng) % present.len() as u64) as i64;
+            let k = present.get(j);
+            let i = t.find(key_hash(k, weak), |e: &u64| *e == k);
+            if i < 0 { println("FAIL: churn lost a key"); }
+            sum += t.take(i);
+            present.swap(j, present.len() - 1);
+            present.pop();
+        }
+        if t.len() != present.len() { println("FAIL: churn len"); }
+        if step % 4999 == 0 {
+            let c = t.check(hasher);
+            if c.len > 0 { println(f"FAIL: {c}"); }
+            for k in present.iter() {
+                if t.find(key_hash(k, weak), |e: &u64| *e == k)
+                    < 0 { println("FAIL: churn: a present key not found"); }
+            }
+        }
+    }
+    let c = t.check(|e: &u64| key_hash(*e, weak));
+    if c.len > 0 { println(f"FAIL: {c}"); }
+    t.free();
+    present.free();
+    sum
+}
+
+// A table filled with keys of one probe start near its end (the probes
+// wrap around), then half removed (tombstones) and one inserted: the
+// table rehashes in place, swapping displaced elements.
+fn wrap_hash(k: u64) -> u64 {
+    ((k % 97) << 57) | 0x00fffffffffffffcu64
+}
+
+fn wrap_scenario(gpa: Gpa) -> u64 {
+    let mut t: RawTable<u64> = RawTable::new_in(gpa);
+    let hasher = |e: &u64| wrap_hash(*e);
+    for k in 0..28 {
+        t.insert(wrap_hash(k as u64), k as u64, hasher);
+    }
+    let before = t.buckets();
+    for k in 0..28 {
+        if k % 2 == 0 || k == 27 {
+            let i = t.find(wrap_hash(k as u64), |e: &u64| *e == k as u64);
+            t.erase(i);
+        }
+    }
+    t.reserve(1, hasher);
+    let s = t.find_or_find_insert_slot(wrap_hash(100), |e: &u64| *e == 100);
+    t.insert_in_slot(wrap_hash(100), ~s, 100);
+    let c = t.check(hasher);
+    if c.len > 0 { println(f"FAIL: {c}"); }
+    let mut sum = 0u64;
+    for k in 0..28 {
+        let i = t.find(wrap_hash(k as u64), |e: &u64| *e == k as u64);
+        if (i >= 0) != (k % 2 == 1 && k != 27) { println("FAIL: wrap scenario"); }
+        if i >= 0 { sum += *t.get(i); }
+    }
+    if t.buckets() != before
+        || t.len() != 14 { println(f"FAIL: wrap: {before} {t.buckets()} {t.len()}"); }
+    t.free();
+    sum
+}
+
+// foldhash on sequential keys probes about as far as SipHash, a
+// pseudorandom function, does on the same keys (200000 keys in 262144
+// buckets: about one in ten elements is past its first group).
+fn probes(gpa: Gpa) {
+    let fs = FixedState::new();
+    let ss = SipHashState::with_keys(1, 2);
+    let mut t: RawTable<u64> = RawTable::new_in(gpa);
+    let mut u: RawTable<u64> = RawTable::new_in(gpa);
+    for k in 0..200000 {
+        t.insert(fs.hash_u64(k as u64), k as u64, |e: &u64| fs.hash_u64(*e));
+        u.insert(ss.hash_u64(k as u64), k as u64, |e: &u64| ss.hash_u64(*e));
+    }
+    let f = t.probe_stats(|e: &u64| fs.hash_u64(*e));
+    let s = u.probe_stats(|e: &u64| ss.hash_u64(*e));
+    if f.total * 4 > s.total * 5 || f.max > s.max + 2 || f.total * 8 > t.len() {
+        println(
+            f"FAIL: probes: foldhash {f.total} (at most {f.max}), SipHash {s.total} (at most {s.max})");
+    } else {
+        println("probes ok");
+    }
+    t.free();
+    u.free();
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let mut total = 0u64;
+    let configs = [(1, 20000, 8), (2, 20000, 40), (3, 50000, 300), (4, 50000, 5000), (5, 20000, 50),
+        (6, 20000, 1000)];
+    for c in configs {
+        total += run(0x9e3779b97f4a7c15u64 + c.0 as u64, c.1, c.2, false, gpa);
+        total += run(0x2545f4914f6cdd1du64 + c.0 as u64, c.1, c.2, true, gpa);
+    }
+    total += churn(11, 200000, 3, false, gpa);
+    total += churn(12, 200000, 50, false, gpa);
+    total += churn(13, 200000, 1000, false, gpa);
+    total += churn(14, 100000, 300, true, gpa);
+    total += churn(15, 100000, 6, true, gpa);
+    total += churn(16, 100000, 13, true, gpa);
+    total += churn(17, 100000, 20, true, gpa);
+    total += wrap_scenario(gpa);
+    println(f"checksum {total}");
+    probes(gpa);
+    0
+}

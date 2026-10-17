@@ -237,7 +237,7 @@ check default_root "$ok" "$out"
 # std where there is no program (0.15): its API by `items std` (no
 # private item), an item by a name std defines.
 mkdir -p "$WORK/empty"
-out=$(cd "$WORK/empty" && "$COMPILER" query items std 2>&1)
+out=$(cd "$WORK/empty" && "$COMPILER" query items std --budget 40000 2>&1)
 ok=0
 [ "$(printf '%s\n' "$out" | wc -l)" -ge 100 ] && printf '%s\n' "$out" | head -1 | grep -q "^# std${TAB}<std>\$" \
     && printf '%s\n' "$out" | grep -q "${TAB}pub fn read_line<A: Allocator>(line: \&mut Buf<A>) -> Result<bool, IoError>\$" \
