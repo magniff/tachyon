@@ -4,6 +4,8 @@
 $ arch 'saturating subtract' u8
 aarch64::vqsubq_u8	neon	uqsub <d>.16b, <a>.16b, <b>.16b	lanewise a - b, saturating at 0 and 255
 aarch64::vqsub_u8	neon	uqsub <d>.8b, <a>.8b, <b>.8b	lanewise a - b, saturating at 0 and 255
+x86_64::_mm_subs_epu8	sse2	psubusb <b>, <d>	lanewise a - b, saturating
+x86_64::_mm256_subs_epu8	avx2	vpsubusb <b:y>, <a:y>, <d:y>	lanewise a - b, saturating
 $ arch --feature crc
 aarch64::__crc32b	crc	crc32b <d:w>, <crc:w>, <data:w>	one step of CRC-32 over 1 byte
 aarch64::__crc32h	crc	crc32h <d:w>, <crc:w>, <data:w>	one step of CRC-32 over 2 bytes
@@ -32,9 +34,11 @@ x86_64::_mm_movemask_epi8	sse2	pmovmskb <a>, <d:w>	the 16 bytes' top bits as a 1
 equivalent: aarch64: (recipe) vshrn_n_u16(vreinterpretq_u16_u8(m), 4)
 aarch64::vshrn_n_u16	neon	shrn <d>.8b, <a>.8h, #<n>	each lane shifted right by n, narrowed to its low half (the NEON movemask: n = 4 gives 4 bits per byte)
 aarch64::vreinterpretq_u16_u8	neon	-	the same bits as 8 u16 lanes
+x86_64::_mm256_movemask_epi8	avx2	vpmovmskb <a:y>, <d:w>	the 32 bytes' top bits as a 32-bit mask
 $ arch --equiv vqsubq_u8
 aarch64::vqsubq_u8	neon	uqsub <d>.16b, <a>.16b, <b>.16b	lanewise a - b, saturating at 0 and 255
 equivalent: x86_64: _mm_subs_epu8
+x86_64::_mm_subs_epu8	sse2	psubusb <b>, <d>	lanewise a - b, saturating
 $ arch no-such-word
 error query.no-match: no intrinsic matches no-such-word
 try: tachyonc guide arch#recipes

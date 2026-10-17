@@ -52,6 +52,7 @@ x86_64::_mm_movemask_epi8	sse2	pmovmskb <a>, <d:w>	the 16 bytes' top bits as a 1
 equivalent: aarch64: (recipe) vshrn_n_u16(vreinterpretq_u16_u8(m), 4)
 aarch64::vshrn_n_u16	neon	shrn <d>.8b, <a>.8h, #<n>	each lane shifted right by n, narrowed to its low half (the NEON movemask: n = 4 gives 4 bits per byte)
 aarch64::vreinterpretq_u16_u8	neon	-	the same bits as 8 u16 lanes
+x86_64::_mm256_movemask_epi8	avx2	vpmovmskb <a:y>, <d:w>	the 32 bytes' top bits as a 32-bit mask
 ```
 
 `def` says what each version needs beyond the build's features: the
