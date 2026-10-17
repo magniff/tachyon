@@ -116,6 +116,12 @@ of 0.19"; `tachyonc guide arch`; examples/arch.
   clang's: 0.09 s against 2.21 s), with walkthroughs. Next, built with
   v0.19.0: examples/sha256sum on the sha2 instructions, against the
   system's sha256sum, openssl and coreutils.
+- **Caught by the release gate, fixed before the tag**: on
+  aarch64-linux at -O2, a program whose `main` takes a Gpa and reads
+  argv crashed (examples/arch/crc32): main's feature word was filled
+  before its parameters were taken, so the init (getauxval, inlined)
+  overwrote argc and argv; it now goes after them
+  (tests/run/arch_detect_main_args).
 - **Tested on aarch64 only**, as 0.15 to 0.18.1 (`gate.sh --with-x86`).
 
 ### What's new in 0.18.1
