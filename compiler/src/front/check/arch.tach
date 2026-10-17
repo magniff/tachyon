@@ -1,9 +1,7 @@
 // Calls of std::arch's intrinsics (0.19, docs/design/arch.md §2.1, §2.9):
 // after a call of a virtual declaration is checked as any call
 // (check_direct_call), its immediates are checked against the table's
-// ranges, has()/detect() take a known feature's name as a literal, and a
-// store's slice is exclusive (`&mut [T]`, own.readonly for a `[T]`,
-// 0.19.1).
+// ranges, has()/detect() take a known feature's name as a literal,.
 // Spellings from Rust and C are named with their tachyon form
 // (arch.rust_form: `vshrq_n_u8::<3>(v)` and `is_x86_feature_detected!`,
 // from the parser; arch.raw_form: a memory intrinsic given a pointer).
@@ -14,15 +12,11 @@ use crate::arch::{
 };
 use crate::arch::features::parse_feature;
 use crate::base::{
-    BUFS, FILES, FILE_COUNT, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
-    sym_text,
+    FILES, FILE_COUNT, SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, sym_text,
 };
-use crate::base::diag::{
-    ERR_KIND, err_begin, err_end, err_end_soft, err_fmt, err_help, err_str, err_try_tool,
-};
+use crate::base::diag::{err_begin, err_end, err_fmt, err_help, err_str, err_try_tool};
 use crate::front::ast::{NODES, NodeKind, child};
-use crate::front::check::{CUR_FN, LOCALS, Res, lookup_local};
-use crate::front::check::check_mode::LEGACY_SLICES;
+use crate::front::check::Res;
 use crate::front::check::synth_mode::synth_expr;
 use crate::front::consteval::const_eval;
 use crate::front::features::{
@@ -30,9 +24,7 @@ use crate::front::features::{
     note_feature_call, unknown_feature,
 };
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok, str_at};
-use crate::front::types::{
-    FNS, TYPES, TyKind, buf_type, err_type, is_mut_slice, is_pointer, slice_of,
-};
+use crate::front::types::{FNS, is_pointer};
 
 // Call n of function f, a declaration of std::arch's (FN_INTRINSIC).
 pub fn check_intrinsic_call(n: i64, f: i64) {
@@ -44,9 +36,6 @@ pub fn check_intrinsic_call(n: i64, f: i64) {
         if INTRS[id].form == FORM_FEAT {
             check_feature_call(n, id);
             return;
-        }
-        if INTRS[id].mem == MEM_STORE {
-            check_store_slice(n, id, INTRS[id].mem_param);
         }
         for k in 0..INTRS[id].nparams {
             if intr_param_is_const(id, k) {
@@ -130,71 +119,6 @@ fn check_immediate(n: i64, f: i64, id: i64, k: i64) {
             err_fmt(f"'{fname}' takes {pname} in {lo}..={hi}; got {value}");
             arch_error_end();
         }
-    }
-}
-
-// (0.19.1) The slice of store form id's call n (argument k): it is written,
-// so it must be exclusive, `&mut [T]` (`&mut a[..]`, `v.as_mut_slice()`, a
-// `&mut [T]` parameter); a read-only `[T]` is own.readonly, as a write
-// through it is, with the edit that makes it one.
-fn check_store_slice(n: i64, id: i64, k: i64) {
-    unsafe {
-        let arg = child(n, k);
-        let mut legacy = false;
-        let mut i = LEGACY_SLICES.count - 1;
-        while i >= 0 && !legacy {
-            legacy = LEGACY_SLICES.data[i] == arg;
-            i -= 1;
-        }
-        if !legacy {
-            return;
-        }
-        let ty = slice_of(TYPES[NODES[arg].ty].a);
-        let name = sym_text(INTRS[id].name);
-        let text = node_text(arg);
-        let saved = ERR_KIND;
-        ERR_KIND = c"own.readonly";
-        err_begin(NODES[arg].start);
-        err_fmt(f"'{name}' writes into '{text}', a '");
-        err_type(ty);
-        err_fmt(f"', which is read-only: its slice parameter is '&mut [");
-        err_type(TYPES[ty].a);
-        err_str(c"]'");
-        err_help(
-            c"pass an exclusive view: '&mut a[..]', 'v.as_mut_slice()', or a '&mut [T]' parameter");
-        // The edit: `&mut a[..]`, `v.as_mut_slice()`; a parameter retyped.
-        let kind = NODES[arg].kind;
-        let new = buf_new();
-        if kind == NodeKind::Index {
-            buf_str(new, c"&mut ");
-            buf_bytes(new, text);
-        } else if text.len > 11 && text[text.len - 11..text.len] == ".as_slice()" {
-            buf_bytes(new, text[0..text.len - 10]);
-            buf_str(new, c"as_mut_slice()");
-        }
-        if BUFS[new].len > 0 {
-            let call = node_text(n);
-            let full = buf_new();
-            buf_bytes(full, SRC[NODES[n].start..NODES[arg].start]);
-            buf_bytes(full, buf_slice(new));
-            buf_bytes(full, SRC[NODES[arg].end..NODES[n].end]);
-            try_patch_at(NODES[n].start, call, buf_slice(full));
-        } else if kind == NodeKind::Ident && CUR_FN >= 0 {
-            let l = lookup_local(NODES[arg].a);
-            if l.is_some() && LOCALS[l.unwrap()].is_param {
-                let a = buf_new();
-                buf_str(a, c"refactor signature ");
-                buf_bytes(a, SYMS[FNS[CUR_FN].display].text);
-                buf_str(a, c" --type ");
-                buf_bytes(a, text);
-                buf_str(a, c" '&mut [");
-                buf_type(a, TYPES[ty].a);
-                buf_str(a, c"]'");
-                err_try_tool(buf_slice(a), false);
-            }
-        }
-        err_end_soft();
-        ERR_KIND = saved;
     }
 }
 

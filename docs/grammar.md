@@ -1600,9 +1600,11 @@ value it points to (`try: *out = acc` for `out[0] = acc`).
 
 **std on values** (value semantics, T4). `v[i] = x`, `v[i] += x`,
 `v[i].f = x` and `&mut v[a..b]` go through `v.as_mut_slice()` (an
-exclusive view; reads through `v.as_slice()`). Until 0.18 a `[T]` is
-accepted where `&mut [T]` is wanted (`sort(v.as_slice())`, `sort(s)`):
-the call takes the exclusive loan. A closure parameter annotated `*T`
+exclusive view; reads through `v.as_slice()`). A `[T]` where `&mut [T]`
+is wanted (`sort(v.as_slice())`, `sort(s)`) is `own.readonly` (0.19.1;
+0.17's transitional rule took it as the exclusive loan): pass
+`v.as_mut_slice()`, `&mut a[..]`, or `v.sort()`; `fix --suggested` and
+`fix --values` write them. A closure parameter annotated `*T`
 where the bound wants `&T` is an error (0.18.1; `fix --suggested`
 writes `&T`); a function with pointer parameters is a value like any. A
 struct or enum that owns nothing (no Vec, Buf, HashMap or Drop in it)
