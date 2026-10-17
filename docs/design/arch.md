@@ -1593,6 +1593,32 @@ the `AE_*` codes.
   instructions), `VConst` and the literal pools, `Rot`/`BSwap` and the
   vectorizer's portable bit ops, float folds, x86's folds.
 
+**T8 as built (branch a19-t8).**
+- `query arch WORDS... [--feature F] [--arch A] [--equiv NAME]` (also
+  `query intrinsics`; tools/query/intrinsics.tach): the tables without a
+  program; words are positional (the design's `--find`), `--feature`
+  stands for `query items --feature`; `query arch --features` (the
+  baseline listing) is not done.
+- def/show/context of an intrinsic: the query's names are declared for
+  it through `arch::virtual::QUERY_WANTED` (C strings, interned in
+  `load_arch_modules`: interning before the program's keywords broke the
+  lexer); `features:`/`instruction:` on the first line, doc, semantics,
+  equivalent and `use` line under it. `features: X (inferred|declared)`
+  on functions; query cache version 7.
+- `guide arch` (examples run by tests/guide, guide-find-arch); `guide
+  --find` weighs a topic's summary words. The x86 rows of the recipes
+  table name Intel's intrinsics; a note there says the table has the
+  seeds until T5 merges (T5: update it, and refresh tests/query/arch019.q,
+  whose `#[intrinsic(N)]` lines and x86 positions move with the tables).
+- explain: the 13 entries from the compiler's own lines; `query.partial`.
+- examples/arch/bytesearch and crc32 with walkthroughs and timings (M1:
+  0.12 s = libc memchr vs 1.87 s; 0.09 s = clang vs 2.21 s). Not done:
+  utf8, swissprobe, bench/ pairs, tests/arch-try.
+- Found: range analysis keeps the checks of `vld1q_u8(s, i + 16/32/48)`
+  under `while i + 64 <= s.len`; arch.feature's try at `main` wraps the
+  call (skipping it) when the guard was removed lower down; indexing a
+  `&[u32; 256]` says "indexing a raw pointer is unsafe".
+
 ## 8. Open questions
 
 - **O1. Latency and throughput in `query show`.** Useful for choosing
