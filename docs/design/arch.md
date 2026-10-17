@@ -1490,6 +1490,11 @@ the `AE_*` codes.
   program uses sha3, dotprod, rdm, fp16, i8mm or bf16: GNU as accepts
   those extensions only on an Armv8.2 base.
 - -O0 keeps float scalar operands and results in vector registers (v0-v2).
+- A function that needs another architecture's features is lowered as
+  `unreachable` (`middle/lower/mod.tach`, `lower_function`, as §2.4
+  says): its calls are dead or errors, and lowering such a body, never
+  called, could overflow the stack in SSA construction
+  (tests/run/arch_foreign_body).
 - Fixed: a 64-bit vector of constant lanes (a folded load of a constant
   8-byte array) was materialized into a general register numbered 48
   and up (`back/emit/operands.tach`, `materialize`).
