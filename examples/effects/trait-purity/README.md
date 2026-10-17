@@ -97,7 +97,7 @@ A debugging print in `eq`:
 ```console
 $ tachyonc edit patch Word::eq --old '        if self.text.len() != other.text.len() {' --new '        println(f"comparing {self.text} and {other.text}");
 >         if self.text.len() != other.text.len() {'
-main.tach:30:5: error[effect] 'Word::eq' implements 'Eq::eq', which is #[pure], but it does io: 'println(f"comparing {self.text} and {other.t..' at main.tach:31:9 calls 'std::println' | help: return the data and let the caller print it, or remove #[pure] (the trait's) | try: tachyonc query effects Word::eq --why io  [edited: <crate::Word as Eq>::eq]
+main.tach:30:5: error[effect] 'Word::eq' implements 'Eq::eq', which is #[pure], but it does io: 'println(f"comparing {self.text} and {other.t..' at main.tach:31:9 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[pure] (the trait's) | try: tachyonc query effects Word::eq --why io  [edited: <crate::Word as Eq>::eq]
 error edit.breaks: 1 new error; nothing written
 try: tachyonc edit patch Word::eq --old '        if self.text.len() != other.text.len() {' --new '        println(f"comparing {self.text} and {other.text}");
         if self.text.len() != other.text.len() {' --no-check

@@ -35,15 +35,16 @@ The `try:` is the type to write. Also `str` (`[u8]`), `char` (`u8`),
 `VecDeque`, `RefCell`.
 
 ```tach
-use std::collections::HashMap;
+use std::cmp::max;
 ```
 ```err
-error[type error] no 'collections' in module 'std' | help: tachyon's std is one module, without 'collections': its items are `std::NAME` | try: use std::HashMap;
+error[type error] no 'cmp' in module 'std' | help: tachyon's std has no such module: std's items are all `std::NAME` too
 ```
-std has no submodules: `use std::{IoError, is_digit};` (`HashMap`,
+std has a few of Rust's modules (0.20: `std::collections::HashMap`,
+`std::fmt::Display`, `std::io::read_line`, `std::iter`, `std::ops`,
+`std::slice`, `std::num`, `std::convert`, `std::clone`), and every item is
+`std::NAME` as well: `use std::{IoError, is_digit};` (`HashMap`,
 `read_line` and std's most used names are in the prelude: no `use`).
-`use std::io;` gets what reads stdin (`read_line`, `read_stdin_in`,
-`Scanner`).
 
 ```tach
 fn main() -> i32 { let s = "  a "; let t = s.trim(); 0 }

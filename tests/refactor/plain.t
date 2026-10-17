@@ -142,7 +142,7 @@ $ refactor rename main.tach:13:26 surface --dry-run
 +// The `surface` of p: x times y.
 +pub fn surface(p: Point) -> i64 {
 $ refactor rename main.tach:31:14 show
-error edit.not-source: std::print_int is not in a file of the program
+error edit.not-source: std::fmt::print_int is not in a file of the program
 [exit 1]
 ## ---- the mentions in comments ----
 ## A field: only `Item.qty`, `Item::qty` mentions, not the parameter's
