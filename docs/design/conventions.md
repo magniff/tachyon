@@ -1660,6 +1660,14 @@ pm-examples, pm-transcripts, merged in).
   are 0.20's to run) and the tests and guide lines that name them: the
   step left before 0.24.
 - **C3** (81575ae4): `var`, `inout`, `sink` keywords.
+- **Mixed only in the migrations**: `--syntax=mixed` is refused
+  (syntax.mixed_removed); `fix --only conventions`, `fix --values` and
+  `--only std015|alloc016` set the mode themselves, and their children
+  inherit it through TACHYON_SYNTAX=mixed:PID (honored only by a child of
+  PID). No build, check, run, try or query reads 0.19's spelling.
+- **`.vl`** (for 0.24's name): sources are `.tach` or `.vl` everywhere,
+  `x.tach` and `x.vl` both is an error, and every TACHYON_X is read as
+  VOLE_X too (VOLE_ wins); tests/refactor/vole021.
 - Suite with C3's compiler: 1660 passed, 2 xfail, 0 failed. The
   bootstrap from v0.20.0 (releases.toml's 0.20.0 entry, then `bootstrap.sh
   --dev`) is the check left once the tag exists.
