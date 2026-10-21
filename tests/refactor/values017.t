@@ -12,7 +12,7 @@
 ## recorded here before 0.18.1: `3 3 0 6 0 0 1 9 12`. A closure's `*T` annotation is respelled
 ## by `fix --suggested`; what the fix keeps raw is wrapped in `unsafe` by
 ## `fix --only unsafe`, the second try: of the error.)
-$ fix --values --syntax=mixed
+$ fix --values
 fixed 6 suggested fixes, 5 parameters to &mut T, 5 parameters to &T, 1 slice parameter to &mut [T], 3 owned parameters to &T (only read), 10 arguments	main.tach	+23 -23 lines
 % cat main.tach
 struct Stats { count: i64, sum: i64 }
@@ -93,17 +93,20 @@ fn ranked(v: &mut Vec<Stats>) {
     // value with `*Stats` parameters cannot be: called from a closure)
     sort_by(v.as_mut_slice(), |a: &Stats, b: &Stats| by_rank(&*a, &*b));
 }
-$ fix --suggested --syntax=mixed
+$ fix --suggested
+main.tach:77:68: error[type error] cannot deref non-pointer type 'Stats'  [edited: crate::ranked]
+error edit.breaks: 1 new error; nothing written
+try: tachyonc fix --suggested --no-check
+[exit 1]
+$ fix --only unsafe
 note fix.none: nothing to fix
-$ fix --only unsafe --syntax=mixed
+$ fix --values
 note fix.none: nothing to fix
-$ fix --values --syntax=mixed
+$ fix --only values --dry-run
 note fix.none: nothing to fix
-$ fix --only values --dry-run --syntax=mixed
-note fix.none: nothing to fix
-## (0.20) Then 0.20's spelling, `fix --only conventions` (its 0.19 input
-## read --syntax=mixed): the chain 0.16 -> 0.19 -> 0.20 prints what 0.16 did.
-$ fix --only conventions --syntax=mixed
+## (0.20) Then 0.20's spelling, `fix --only conventions` (the migration reads
+## 0.19's spelling itself), before the fixes that read 0.20's.
+$ fix --only conventions
 fixed 11 parameters to let, 5 parameters to inout, 1 parameter to sink, 2 receivers, 7 '&mut e's to '&e', 7 '&e's to a let, 2 '*r's of accesses, 10 'let mut's / 'mut x's to var	main.tach	+35 -35 lines
 $ main.tach -o prog
 ok: built prog

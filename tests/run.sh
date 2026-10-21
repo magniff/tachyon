@@ -610,18 +610,15 @@ fi
 if [ -x "$ROOT/compiler/arch/embed.sh" ] && ! "$ROOT/compiler/arch/embed.sh" -c; then
     exit 1
 fi
-# (0.20, docs/design/conventions.md §9.3) The bootstrap's pragma, a root's
-# first line `// tachyon-syntax: 0.19` (the crate is read in 0.19's
-# spelling), only in compiler/src/main.tach and the legacy mode's own
-# tests (tests/run/conv_legacy*).
-LEGACY_FILES=$(find "$ROOT/compiler" "$ROOT/tests" "$ROOT/examples" "$ROOT/bench" \
-    -name '*.tach' -type f -exec awk 'FNR == 1 && /^\/\/ tachyon-syntax: 0\.19/ { print FILENAME }' {} + \
-    2>/dev/null | grep -v -e "^$ROOT/compiler/src/main.tach\$" -e "^$ROOT/tests/run/conv_legacy")
-if [ -n "$LEGACY_FILES" ]; then
-    echo "error: the bootstrap's pragma '// tachyon-syntax: 0.19' is only for compiler/src/main.tach (docs/design/conventions.md §9.3):" >&2
-    echo "$LEGACY_FILES" >&2
-    exit 1
-fi
+
+# (0.21) Every TACHYON_X the compiler reads (a c"TACHYON_X" literal) is
+# also read as VOLE_X, the name from 0.24: it is in base::ENV_NAMES.
+for v in $(grep -rhoE 'c"TACHYON_[A-Z0-9_]+"' "$ROOT/compiler/src" | sed 's/^c"TACHYON_//; s/"$//' | sort -u); do
+    if ! grep -q "c\"$v\"" "$ROOT/compiler/src/base/mod.tach"; then
+        echo "error: TACHYON_$v is read by the compiler but not as VOLE_$v: add \"$v\" to ENV_NAMES (compiler/src/base/mod.tach)" >&2
+        exit 1
+    fi
+done
 
 # The optimizer's rewrite rules, on random values (0.9).
 if "$COMPILER" --check-rules >"$WORK/rules.out" 2>&1; then :; else

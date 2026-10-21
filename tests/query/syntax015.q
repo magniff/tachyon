@@ -4,7 +4,7 @@
 ## A method #[derive] makes: the attribute answers (0.15).
 $ items
 crate	syntax015/main.tach	6
-std	<std>	581
+std	<std>	588
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	37
@@ -22,7 +22,7 @@ std::collections::group	<std>	20
 std::io	<std>	12
 std::io::error	<std>	17
 std::io::buffered	<std>	37
-std::fmt	<std>	82
+std::fmt	<std>	94
 std::num	<std>	83
 std::num::tables	<std>	4
 std::convert	<std>	2
@@ -37,6 +37,10 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
+std::sync	<std>	29
+std::sync::atomic	<std>	48
+std::sync::mpsc	<std>	24
+std::thread	<std>	43
 std::objc	<std>	50
 std::objc::foundation	<std>	67
 std::gpu	<std>	140
@@ -69,10 +73,6 @@ std::path	<std>	34
 std::fs	<std>	59
 std::env	<std>	21
 std::process	<std>	36
-std::window	<std>	48
-std::window::cocoa	<std>	115
-std::window::keys	<std>	27
-std::window::objc	<std>	88
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6

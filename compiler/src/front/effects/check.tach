@@ -28,10 +28,11 @@ use crate::front::check::{SELF_TYPE, TRY_RESULT, Try, attempt};
 use crate::front::closures::{CLOSURES, closure_of_type};
 use crate::front::effects::{
     ALLOCATORS, ALLOC_ANY, EFFECT_BOUNDS, EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO,
-    EFF_PANIC, EFF_RAW_DIVERGE, EFF_RAW_PANIC, EFF_UNKNOWN, EFF_UNSAFE, EFF_VISIBLE, Effects,
-    allocator_bit, effects_none, effects_subset, effects_text, fn_effects,
+    EFF_PANIC, EFF_RAW_DIVERGE, EFF_RAW_GLOBAL, EFF_RAW_PANIC, EFF_SYNC, EFF_THREAD, EFF_TLS,
+    EFF_UNKNOWN, EFF_UNSAFE, EFF_VISIBLE, Effects, allocator_bit, effects_none, effects_subset,
+    effects_text, fn_effects,
 };
-use crate::front::effects::builtin::{c_symbol, known_c_effects};
+use crate::front::effects::builtin::{c_symbol, is_errno_symbol, known_c_effects};
 use crate::front::effects::infer::{E_CALL, NODE_FX, body_walked, dispatch_of, template_of, through};
 use crate::front::effects::why::{effect_name, effect_phrase, step_text};
 use crate::front::generics::{CUR_INST, env_enter, env_leave};
@@ -42,13 +43,13 @@ use crate::front::traits::{
 use crate::front::types::{FNS, FN_COUNT, TYPES, TY_ERROR, TyKind, buf_type};
 
 // The effect names, in display order, and their bits (alloc: 0).
-const NAME_COUNT: i64 = 6;
+const NAME_COUNT: i64 = 9;
 
 // The `effects(...)` bounds met by check_bounds (note_effect_bound), a
 // record of BOUND_WORDS each: the bound, the type, the position, the
 // parameter (its TyName), the item's name, the allowed set (bits,
 // allocs), the instance being checked then.
-static mut BOUNDS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var BOUNDS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 const BOUND_WORDS: i64 = 8;
 
 // The bit of effect name sym (EFF_*; -1 for alloc, 0 unknown).
@@ -60,7 +61,8 @@ fn effect_bit(sym: i64) -> i64 {
         }
         if text == "io" { EFF_IO } else if text == "global" { EFF_GLOBAL }
         else if text == "panic" { EFF_PANIC } else if text == "diverge" { EFF_DIVERGE }
-        else if text == "unsafe" { EFF_UNSAFE } else { 0 }
+        else if text == "unsafe" { EFF_UNSAFE } else if text == "tls" { EFF_TLS }
+        else if text == "thread" { EFF_THREAD } else if text == "sync" { EFF_SYNC } else { 0 }
     }
 }
 
@@ -104,7 +106,7 @@ fn set_bound(set: i64, quiet: bool) -> Effects {
         if form == EFFECTS_NO_PANIC {
             return Effects { bits: EFF_VISIBLE & ~EFF_PANIC, allocs: ALLOC_ANY };
         }
-        let mut e = effects_none();
+        var e = effects_none();
         for i in 0..NODES[set].count {
             let item = child(set, i);
             let bit = effect_bit(NODES[item].a);
@@ -140,8 +142,8 @@ fn set_bound(set: i64, quiet: bool) -> Effects {
 // The bound of the declaration chain starting at `set` (see set_bound).
 fn chain_bound(set: i64, quiet: bool) -> Effects {
     unsafe {
-        let mut e = everything();
-        let mut s = set;
+        var e = everything();
+        var s = set;
         while s != 0 {
             e = intersect(e, set_bound(s, quiet));
             s = NODES[s].b;
@@ -178,17 +180,17 @@ fn leave_context(saved: i64) {
 // builtin table's (EFF_UNKNOWN: unknown C, see infer.tach).
 pub fn extern_effects(f: i64) -> Effects {
     unsafe {
-        let mut e = known_c_effects(c_symbol(f));
+        var e = known_c_effects(c_symbol(f));
         let decl = FNS[f].effect_decl;
         if decl == 0 {
             return e;
         }
         e.bits &= ~EFF_UNKNOWN;
         let saved = enter_context(f, FNS[f].module);
-        let mut listed = false;
-        let mut exact = everything();
-        let mut limit = everything();
-        let mut s = decl;
+        var listed = false;
+        var exact = everything();
+        var limit = everything();
+        var s = decl;
         while s != 0 {
             if NODES[s].c == EFFECTS_DECL {
                 listed = true;
@@ -209,6 +211,10 @@ pub fn extern_effects(f: i64) -> Effects {
         }
         if (e.bits & EFF_DIVERGE) != 0 {
             e.bits |= EFF_RAW_DIVERGE;
+        }
+        // (0.21: C's global state, but errno, is not thread-safe)
+        if (e.bits & EFF_GLOBAL) != 0 && !is_errno_symbol(c_symbol(f)) {
+            e.bits |= EFF_RAW_GLOBAL;
         }
         e
     }
@@ -323,7 +329,7 @@ fn validate_fn(f: i64, allocator: i64) {
     unsafe {
         let node = FNS[f].node;
         validate_bounds(node);
-        let mut s = FNS[f].effect_decl;
+        var s = FNS[f].effect_decl;
         while s != 0 {
             validate_names(s);
             validate_allocators(f, node, s, allocator);
@@ -367,7 +373,7 @@ fn validate_traits() {
                     continue;
                 }
                 validate_bounds(tf);
-                let mut s = NODES[tf].z;
+                var s = NODES[tf].z;
                 while s != 0 {
                     validate_names(s);
                     validate_allocators(-1, tf, s, -1);
@@ -411,10 +417,12 @@ fn validate_names(s: i64) {
 
 // The effect name nearest to `name` (a typo or a longer word), or null.
 fn nearest_effect(name: [u8]) -> *u8 {
-    let names: [*u8; 6] = [c"alloc", c"io", c"global", c"panic", c"diverge", c"unsafe"];
-    let texts: [[u8]; 6] = ["alloc", "io", "global", "panic", "diverge", "unsafe"];
-    let mut best = -1;
-    let mut best_d = 3;
+    let names: [*u8; 9] = [c"alloc", c"io", c"global", c"panic", c"diverge", c"unsafe", c"tls",
+        c"thread", c"sync"];
+    let texts: [[u8]; 9] = ["alloc", "io", "global", "panic", "diverge", "unsafe", "tls",
+        "thread", "sync"];
+    var best = -1;
+    var best_d = 3;
     for i in 0..NAME_COUNT {
         let t = texts[i];
         let prefix = t.len >= 2 && name.len > t.len && name[0..t.len] == t;
@@ -447,7 +455,7 @@ fn validate_allocators(f: i64, node: i64, s: i64, allocator: i64) {
                     err_str(c"' is a parameter");
                     let pt = NODES[param].b;
                     if pt != 0 {
-                        let mut ty = pt;
+                        var ty = pt;
                         if NODES[ty].kind == NodeKind::TyPtr {
                             ty = NODES[ty].a;
                         }
@@ -525,7 +533,7 @@ fn first_excess(e: Effects, bound: Effects) -> (i64, i64) {
 // alloc) (quietly resolved in the context set), or `set`.
 fn violated_set(set: i64, bit: i64, alloc: i64) -> i64 {
     unsafe {
-        let mut s = set;
+        var s = set;
         while s != 0 {
             let b = set_bound(s, true);
             let allowed = if bit != 0 { (b.bits & bit) != 0 }
@@ -647,7 +655,7 @@ pub fn note_effect_bound(bound: i64, ty: i64, pos: i64, param: i64, what: i64) {
         if ty <= 0 || ty == TY_ERROR {
             return;
         }
-        let mut i = 0;
+        var i = 0;
         while i < BOUNDS.count {
             if BOUNDS.data[i] == bound && BOUNDS.data[i + 1] == ty && BOUNDS.data[i + 2] == pos {
                 return;
@@ -689,7 +697,7 @@ fn callable_effects(ty: i64) -> (Effects, i64) {
 
 fn check_noted_bounds() {
     unsafe {
-        let mut i = 0;
+        var i = 0;
         while i < BOUNDS.count {
             let ty = BOUNDS.data[i + 1];
             let (e, f) = callable_effects(ty);
@@ -735,7 +743,7 @@ fn bound_error(i: i64, e: Effects, allowed: Effects, f: i64) {
         err_str(c"; '");
         let bounds = NODES[param].h;
         let last = child(bounds, NODES[bounds].count - 1);
-        let mut end = NODES[last].end;
+        var end = NODES[last].end;
         if end < NODES[bound].end {
             end = NODES[bound].end;
         }

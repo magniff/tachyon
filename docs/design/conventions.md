@@ -1638,3 +1638,36 @@ pm-examples, pm-transcripts, merged in).
   non-copyable type other than a closure literal (`gl(make())`) errors;
   the own.move_out try for an operator impl suggests `std::take(&self)` of
   a let receiver.
+  `fix --only conventions` (found migrating compiler/src, 0.21 C1): it
+  drops the `&` of a raw address inside an f-string hole (`f"{cstr(if c
+  { &sp[2] } else { sp })}"` became `sp[2]`), and it writes an impl's
+  `self: &T` as `self` where std's trait now declares `inout self`
+  (`Iterator::at`); both fixed by hand in compiler/src.
+
+## 0.21 on c20-convM (branch c21-srcM)
+
+- **C1** (09c21885): compiler/src in 0.20's spelling (`fix --only
+  conventions` with TACHYON_SYNTAX=mixed for the steps before it: the
+  raw-pointer retypes of 13 parameters indexed as pointers; the 24
+  `var`/`inout`/`sink` identifiers renamed; the two hand fixes above).
+  c20-convM's compiler checks it clean, builds it, the fixpoint holds,
+  and same-output against it differs only in argv[0].
+- **C2** (df382ed2): the legacy mode removed (the pragma is
+  `syntax.legacy_removed`), and the messages that spoke 0.19's spelling
+  for the legacy crate. The mixed mode stays: `fix --only conventions`,
+  `fix --values`, `--only std015|alloc016` and their tests read 0.19's
+  spelling with it. Removing it means removing those migrations (they
+  are 0.20's to run) and the tests and guide lines that name them: the
+  step left before 0.24.
+- **C3** (81575ae4): `var`, `inout`, `sink` keywords.
+- **Mixed only in the migrations**: `--syntax=mixed` is refused
+  (syntax.mixed_removed); `fix --only conventions`, `fix --values` and
+  `--only std015|alloc016` set the mode themselves, and their children
+  inherit it through TACHYON_SYNTAX=mixed:PID (honored only by a child of
+  PID). No build, check, run, try or query reads 0.19's spelling.
+- **`.vl`** (for 0.24's name): sources are `.tach` or `.vl` everywhere,
+  `x.tach` and `x.vl` both is an error, and every TACHYON_X is read as
+  VOLE_X too (VOLE_ wins); tests/refactor/vole021.
+- Suite with C3's compiler: 1660 passed, 2 xfail, 0 failed. The
+  bootstrap from v0.20.0 (releases.toml's 0.20.0 entry, then `bootstrap.sh
+  --dev`) is the check left once the tag exists.

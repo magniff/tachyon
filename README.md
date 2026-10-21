@@ -247,16 +247,14 @@ checks every release; `-g` writes DWARF line tables.
 
 Tachyon is at 0.x: the language is not stable, and minor releases may
 break programs (with a `tachyonc fix` migration from 0.14 on). The
-current release is 0.20.0: parameter conventions in Hylo's spelling
-(`let` by default, `inout` with `&x` at the call, `sink`, `var`),
-std's collections, text and I/O (String and str, Unicode, a Swiss-table
-HashMap, BTreeMap), and a language server; on 0.19's CPU intrinsics,
-0.18's contracts and tests, 0.17's mutable value semantics and 0.16's
-effects and explicit allocators. See [docs/releases.md](docs/releases.md)
+current release is 0.21.0: threads with what crosses them checked
+(std::thread, std::sync), the compiler's own source in Hylo-style
+parameter conventions (`let`, `inout`, `sink`, `var`) with Rust's
+borrowing spellings rejected; on 0.20's collections, text and I/O, 0.19's
+CPU intrinsics, 0.18's contracts and tests, 0.17's mutable value
+semantics and 0.16's effects and explicit allocators. See [docs/releases.md](docs/releases.md)
 for every release. Next:
 
-- **0.21**: concurrency, atomics and synchronization; the compiler's
-  source in 0.20's spelling
 - **0.22 to 0.23**: GPU support, windows and a terminal emulator on std
 
 **Toward 1.0.** 1.0 is not a feature milestone. It ships when the

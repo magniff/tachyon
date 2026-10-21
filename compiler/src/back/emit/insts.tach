@@ -12,17 +12,20 @@ use crate::back::emit::operands::{
     const_of, float_operand, int_operand, materialize, operand_reg, result_done, result_reg,
     use_any,
 };
+use crate::back::mc_arm64::atomic::{ma_atomic, ma_fence};
 use crate::back::mc_arm64::ops::{
     ma_bits, ma_cmp_imm, ma_fmath, ma_madd, ma_mulh, ma_select, ma_shop, ma_ubfx,
 };
 use crate::back::mc_arm64::vector::{
     ma_vbin, ma_vcmp, ma_vext, ma_vins, ma_vmacw, ma_vneg, ma_vsel, ma_vsplat, ma_vsum,
 };
+use crate::back::mc_x86_64::atomic::{mx_atomic, mx_fence};
 use crate::back::mc_x86_64::ops::{mx_cmp_imm, mx_mulh, mx_select, mx_sqrt};
 use crate::back::mc_x86_64::vector::{
     mx_vbin, mx_vcmp, mx_vext, mx_vins, mx_vneg, mx_vsel, mx_vsplat, mx_vsum,
 };
 use crate::back::regalloc::USE_NONE;
+use crate::back::regalloc::locations::vloc;
 use crate::back::regalloc::prepare::{is_zero_operand, use_kind};
 use crate::base::{BUFS, die};
 use crate::base::target::X86;
@@ -36,7 +39,7 @@ use crate::middle::ir::Op::{
 
 // ---- Instructions ----
 
-pub fn emit_inst(mut cx: *FnCtx, v: i64) {
+pub fn emit_inst(cx: sink *FnCtx, v: i64) {
     unsafe {
         let op = cx.insts[v].op;
         if op.is_remat() {
@@ -76,6 +79,14 @@ pub fn emit_inst(mut cx: *FnCtx, v: i64) {
             let r = result_reg(cx, v);
             ma_bits(cx, cx.insts[v].imm, r, a);
             result_done(cx, v, r);
+        } else if op == Op::Atomic {
+            emit_atomic(cx, v);
+        } else if op == Op::Fence {
+            if !X86 {
+                ma_fence(cx, cx.insts[v].imm);
+            } else {
+                mx_fence(cx, cx.insts[v].imm);
+            }
         } else if op == Load {
             emit_load_inst(cx, v);
         } else if op == Store {
@@ -130,14 +141,41 @@ pub fn emit_inst(mut cx: *FnCtx, v: i64) {
     }
 }
 
+// (0.21) An ATOMIC (mc_arm64/atomic.tach, mc_x86_64/atomic.tach): its
+// operands only read, its result (when used) written last.
+fn emit_atomic(cx: sink *FnCtx, v: i64) {
+    unsafe {
+        let a = operand_reg(cx, cx.insts[v].a);
+        let b = if cx.insts[v].b != 0 { operand_reg(cx, cx.insts[v].b) } else { -1 };
+        let c = if cx.insts[v].c != 0 { operand_reg(cx, cx.insts[v].c) } else { -1 };
+        var d = -1;
+        if cx.insts[v].ty != 0 {
+            let loc = unsafe { vloc(cx, v, cx.cur_pos + 2) };
+            if loc >= 0 && loc < 64 {
+                d = loc;
+            }
+        }
+        let kind = cx.insts[v].imm & 255;
+        let order = (cx.insts[v].imm >> 8) & 15;
+        if X86 {
+            mx_atomic(cx, kind, order, cx.insts[v].imm2, d, a, b, c);
+        } else {
+            ma_atomic(cx, kind, order, cx.insts[v].imm2, d, a, b, c);
+        }
+        if d >= 0 {
+            result_done(cx, v, d);
+        }
+    }
+}
+
 // LOADX, STOREX and LEA: base + (index << scale) + offset (the base a frame
 // slot from sp on x86-64).
-fn emit_indexed(mut cx: *FnCtx, v: i64) {
+fn emit_indexed(cx: sink *FnCtx, v: i64) {
     unsafe {
         let op = cx.insts[v].op;
-        let mut offset = cx.insts[v].imm;
+        var offset = cx.insts[v].imm;
         let base_value = cx.insts[v].a;
-        let mut base = 0;
+        var base = 0;
         if cx.insts[base_value].op == Slot {
             offset += cx.slots[cx.insts[base_value].imm].offset;
             base = reg_sp();
@@ -164,7 +202,7 @@ fn emit_indexed(mut cx: *FnCtx, v: i64) {
 }
 
 // A vector operation (0.10).
-fn emit_vector(mut cx: *FnCtx, v: i64) {
+fn emit_vector(cx: sink *FnCtx, v: i64) {
     unsafe {
         let op = cx.insts[v].op;
         if op == Op::Intr || op == Op::VConst || op == Op::CpuFeat {
@@ -210,7 +248,7 @@ fn emit_vector(mut cx: *FnCtx, v: i64) {
 
 // SELECT: the comparison (or test) of its last operands, then a conditional
 // select of its first two.
-fn emit_select(mut cx: *FnCtx, v: i64) {
+fn emit_select(cx: sink *FnCtx, v: i64) {
     unsafe {
         let lhs = operand_reg(cx, ir_arg(cx, v, 0));
         let rhs = if ir_arg(cx, v, 1) != 0 { operand_reg(cx, ir_arg(cx, v, 1)) } else { -1 };
@@ -249,7 +287,7 @@ fn emit_select(mut cx: *FnCtx, v: i64) {
     }
 }
 
-fn emit_binary(mut cx: *FnCtx, v: i64) {
+fn emit_binary(cx: sink *FnCtx, v: i64) {
     unsafe {
         let op = cx.insts[v].op;
         let ty = cx.insts[v].ty;
@@ -263,8 +301,8 @@ fn emit_binary(mut cx: *FnCtx, v: i64) {
         }
         let a = int_operand(cx, cx.insts[v].a);
         let r = result_reg(cx, v);
-        let mut imm = 0;
-        if use_kind(cx, v, 1) == USE_NONE && const_of(cx, cx.insts[v].b, &mut imm) {
+        var imm = 0;
+        if use_kind(cx, v, 1) == USE_NONE && const_of(cx, cx.insts[v].b, &imm) {
             if !m_int_op_imm(cx, op, ty, r, a, imm) {
                 die(c"internal error: an immediate operand that does not fit");
             }
@@ -273,7 +311,7 @@ fn emit_binary(mut cx: *FnCtx, v: i64) {
         }
         let b = int_operand(cx, cx.insts[v].b);
         if op == Div || op == Rem {
-            let is_const = const_of(cx, cx.insts[v].b, &mut imm);
+            let is_const = const_of(cx, cx.insts[v].b, &imm);
             m_div(cx, op, ty, r, a, b, imm, is_const);
         } else {
             m_int_op(cx, op, ty, r, a, b);
@@ -285,44 +323,44 @@ fn emit_binary(mut cx: *FnCtx, v: i64) {
 // The base register and offset of a memory access to `addr` + `offset`
 // (an operand needed in a register): frame slots are addressed from sp
 // directly.
-fn mem_base(mut cx: *FnCtx, addr: i64, offset: i64, out_offset: &mut i64) -> i64 {
+fn mem_base(cx: sink *FnCtx, addr: i64, offset: i64, out_offset: inout i64) -> i64 {
     unsafe {
         if cx.insts[addr].op == Slot {
-            *out_offset = cx.slots[cx.insts[addr].imm].offset + offset;
+            out_offset = cx.slots[cx.insts[addr].imm].offset + offset;
             return reg_sp();
         }
-        *out_offset = offset;
+        out_offset = offset;
         int_operand(cx, addr)
     }
 }
 
 // The same for an address used at `pos` where it may be anywhere (loaded
 // into the parallel moves' temporary then).
-pub fn mem_base_any(mut cx: *FnCtx, addr: i64, offset: i64, pos: i64, out_offset: &mut i64) -> i64 {
+pub fn mem_base_any(cx: sink *FnCtx, addr: i64, offset: i64, pos: i64, out_offset: inout i64) -> i64 {
     unsafe {
         if cx.insts[addr].op == Slot {
-            *out_offset = cx.slots[cx.insts[addr].imm].offset + offset;
+            out_offset = cx.slots[cx.insts[addr].imm].offset + offset;
             return reg_sp();
         }
-        *out_offset = offset;
+        out_offset = offset;
         use_any(cx, addr, pos, reg_move_temp(float: false))
     }
 }
 
-fn emit_load_inst(mut cx: *FnCtx, v: i64) {
+fn emit_load_inst(cx: sink *FnCtx, v: i64) {
     unsafe {
-        let mut offset = 0;
-        let base = mem_base(cx, cx.insts[v].a, cx.insts[v].imm, &mut offset);
+        var offset = 0;
+        let base = mem_base(cx, cx.insts[v].a, cx.insts[v].imm, &offset);
         let r = result_reg(cx, v);
         m_load(cx, cx.insts[v].ty, r, base, offset);
         result_done(cx, v, r);
     }
 }
 
-fn emit_store_inst(mut cx: *FnCtx, v: i64) {
+fn emit_store_inst(cx: sink *FnCtx, v: i64) {
     unsafe {
-        let mut offset = 0;
-        let base = mem_base(cx, cx.insts[v].a, cx.insts[v].imm, &mut offset);
+        var offset = 0;
+        let base = mem_base(cx, cx.insts[v].a, cx.insts[v].imm, &offset);
         let value = cx.insts[v].b;
         let r = operand_reg(cx, value);
         m_store(cx, cx.insts[v].imm2, r, base, offset);

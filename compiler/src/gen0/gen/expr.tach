@@ -4,6 +4,7 @@
 // slicing, and assignment; match, if and loops are in control.tach,
 // vectors in vector.tach, calls in call.tach.
 
+use crate::base::target::X86;
 use crate::front::ast::{NODES, NodeKind, child, defer_loop_depth, field_order};
 use crate::front::ast::NodeKind::{
     Array, Assign, Binary, Bool, Break, CStr, Call, Cast, Char, Continue, EnumPanic, FieldAccess,
@@ -16,6 +17,7 @@ use crate::front::contracts::sites::site_of;
 use crate::front::distinct::enum_niche;
 use crate::front::lexer::{Tok, str_at};
 use crate::front::parser::exprs::is_comparison;
+use crate::front::threadlocal::{is_thread_local, tls_addr_fn};
 use crate::front::types::{
     ENUMS, FNS, STATICS, SYM_STATIC, TYPES, TY_BOOL, TY_NEVER, TY_U64, TY_UNIT, TyKind, VARIANTS,
     field_offset, is_compound, is_float, is_signed, is_slice, is_vector, is_void, struct_field,
@@ -31,14 +33,14 @@ use crate::gen0::gen::control::{gen_for, gen_if, gen_loop, gen_match, jump_out_t
 use crate::gen0::gen::vector::{gen_vecop, gen_vector_assign, gen_vector_binary, gen_vector_negate};
 use crate::gen0::target::{
     DEPTH, PANIC_INDEX_SIGNED, PANIC_INDEX_UNSIGNED, PANIC_RANGE_SIGNED, PANIC_RANGE_UNSIGNED,
-    R_ACC, R_ADDR, R_LOOP_COUNT, R_LOOP_PTR, R_SECOND, emit_add_imm, emit_bitnot, emit_compare,
-    emit_compare_jump, emit_copy, emit_decrement, emit_drop_temps, emit_extern_symbol_addr,
-    emit_float_binary, emit_float_to_float, emit_float_to_int, emit_frame_addr, emit_index_addr,
-    emit_int_binary, emit_int_to_float, emit_jump, emit_jump_if_nonzero, emit_jump_if_zero,
-    emit_jump_unless_zero_result, emit_label, emit_load, emit_load_float, emit_load_imm,
-    emit_load_reg, emit_local_symbol_addr, emit_move_to_second, emit_negate, emit_normalize,
-    emit_not_bool, emit_panic, emit_peek, emit_peek_at, emit_store, emit_store_offset,
-    emit_string_addr, new_label, pop_d, pop_x, push_value, push_x0,
+    R_ACC, R_ADDR, R_LOOP_COUNT, R_LOOP_PTR, R_SECOND, emit_add_imm, emit_bitnot, emit_call,
+    emit_compare, emit_compare_jump, emit_copy, emit_decrement, emit_drop_temps,
+    emit_extern_symbol_addr, emit_float_binary, emit_float_to_float, emit_float_to_int,
+    emit_frame_addr, emit_index_addr, emit_int_binary, emit_int_to_float, emit_jump,
+    emit_jump_if_nonzero, emit_jump_if_zero, emit_jump_unless_zero_result, emit_label, emit_load,
+    emit_load_float, emit_load_imm, emit_load_reg, emit_local_symbol_addr, emit_move_to_second,
+    emit_negate, emit_normalize, emit_not_bool, emit_panic, emit_peek, emit_peek_at, emit_store,
+    emit_store_offset, emit_string_addr, ins, new_label, pop_d, pop_x, push_value, push_x0,
 };
 use crate::middle::ctx::FnCtx;
 use crate::middle::ir::{Cond, cond_of_token};
@@ -47,7 +49,7 @@ use crate::middle::ir::{Cond, cond_of_token};
 
 // R_ACC (or `reg` with the machine layer) = the address of static `name`:
 // through the GOT when C defines it.
-pub fn emit_static_addr(mut cx: *FnCtx, name: i64) {
+pub fn emit_static_addr(cx: sink *FnCtx, name: i64) {
     unsafe {
         let s = SYM_STATIC[name] - 1;
         let linkage = STATICS[s].linkage;
@@ -56,10 +58,21 @@ pub fn emit_static_addr(mut cx: *FnCtx, name: i64) {
         } else {
             emit_local_symbol_addr(cx, static_symbol_prefix(s), name);
         }
+        // (0.21) A thread-local: this thread's copy, std::thread::__tls_addr(
+        // its initial value, size) (front/threadlocal.tach).
+        if is_thread_local(s) {
+            let f = tls_addr_fn();
+            emit_load_imm(cx, R_SECOND, type_size(STATICS[s].ty) as u64);
+            if X86 {
+                ins(cx, c"movq %rax, %rdi");
+                ins(cx, c"movq %rcx, %rsi");
+            }
+            emit_call(cx, fn_symbol_prefix(f), FNS[f].name, false, false, 0);
+        }
     }
 }
 
-pub fn gen_expr(mut cx: *FnCtx, n: i64) {
+pub fn gen_expr(cx: sink *FnCtx, n: i64) {
     unsafe {
         let ty = NODES[n].ty;
         match NODES[n].kind {
@@ -111,7 +124,7 @@ pub fn gen_expr(mut cx: *FnCtx, n: i64) {
                 emit_jump(cx, RETURN_LABEL);
             }
             Break => {
-                let mut ty = TY_UNIT;
+                var ty = TY_UNIT;
                 if NODES[n].b != 0 {
                     gen_expr(cx, NODES[n].b);
                     ty = NODES[NODES[n].b].ty;
@@ -129,7 +142,7 @@ pub fn gen_expr(mut cx: *FnCtx, n: i64) {
 }
 
 // A string literal is a (pointer, length) tuple.
-fn gen_string(mut cx: *FnCtx, n: i64) {
+fn gen_string(cx: sink *FnCtx, n: i64) {
     unsafe {
         let slot = alloc_slot(16, 8);
         emit_string_addr(cx, NODES[n].a);
@@ -141,7 +154,7 @@ fn gen_string(mut cx: *FnCtx, n: i64) {
     }
 }
 
-fn gen_ident(mut cx: *FnCtx, n: i64) {
+fn gen_ident(cx: sink *FnCtx, n: i64) {
     unsafe {
         let ty = NODES[n].ty;
         let resolution = NODES[n].res;
@@ -165,7 +178,7 @@ fn gen_ident(mut cx: *FnCtx, n: i64) {
     }
 }
 
-fn gen_fn_address(mut cx: *FnCtx, f: i64) {
+fn gen_fn_address(cx: sink *FnCtx, f: i64) {
     unsafe {
         if FNS[f].is_extern {
             emit_extern_symbol_addr(cx, FNS[f].name);
@@ -176,7 +189,7 @@ fn gen_fn_address(mut cx: *FnCtx, f: i64) {
 }
 
 // The accumulator = the address of a place (or of a compound value).
-pub fn gen_addr(mut cx: *FnCtx, n: i64) {
+pub fn gen_addr(cx: sink *FnCtx, n: i64) {
     unsafe {
         match NODES[n].kind {
             Ident if NODES[n].res
@@ -238,7 +251,7 @@ pub fn pointer_place(n: i64) -> bool {
     }
 }
 
-fn gen_index_addr(mut cx: *FnCtx, n: i64) {
+fn gen_index_addr(cx: sink *FnCtx, n: i64) {
     unsafe {
         let base = NODES[n].a;
         let base_ty = NODES[base].ty;
@@ -287,7 +300,7 @@ fn gen_index_addr(mut cx: *FnCtx, n: i64) {
 
 // ---- Operators ----
 
-fn gen_binary(mut cx: *FnCtx, n: i64) {
+fn gen_binary(cx: sink *FnCtx, n: i64) {
     unsafe {
         let op = NODES[n].op;
         let lhs = NODES[n].b;
@@ -318,7 +331,7 @@ fn gen_binary(mut cx: *FnCtx, n: i64) {
 }
 
 // Accumulator = accumulator <op> second operand.
-fn gen_operator(mut cx: *FnCtx, op: Tok, operand_ty: i64, result_ty: i64) {
+fn gen_operator(cx: sink *FnCtx, op: Tok, operand_ty: i64, result_ty: i64) {
     if is_comparison(op) {
         emit_compare(cx, cond_of_token(op), operand_ty);
     } else if is_float(operand_ty) {
@@ -328,7 +341,7 @@ fn gen_operator(mut cx: *FnCtx, op: Tok, operand_ty: i64, result_ty: i64) {
     }
 }
 
-fn gen_unary(mut cx: *FnCtx, n: i64) {
+fn gen_unary(cx: sink *FnCtx, n: i64) {
     unsafe {
         let op = NODES[n].op;
         let operand = NODES[n].b;
@@ -355,7 +368,7 @@ fn gen_unary(mut cx: *FnCtx, n: i64) {
     }
 }
 
-fn gen_cast(mut cx: *FnCtx, from: i64, to: i64) {
+fn gen_cast(cx: sink *FnCtx, from: i64, to: i64) {
     if from == TY_NEVER || from == to {
         return;
     }
@@ -375,16 +388,16 @@ fn gen_cast(mut cx: *FnCtx, from: i64, to: i64) {
 // ---- Aggregates ----
 
 // A struct, tuple or array literal, built in a new frame slot.
-pub fn gen_aggregate(mut cx: *FnCtx, n: i64) {
+pub fn gen_aggregate(cx: sink *FnCtx, n: i64) {
     unsafe {
         let ty = NODES[n].ty;
         let kind = NODES[n].kind;
         let slot = alloc_slot_for(ty);
         for i in 0..NODES[n].count {
             let elem = child(n, i);
-            let mut value = elem;
-            let mut offset = 0;
-            let mut elem_ty = 0;
+            var value = elem;
+            var offset = 0;
+            var elem_ty = 0;
             if kind == StructLit {
                 let s = TYPES[ty].a;
                 value = NODES[elem].b;
@@ -405,7 +418,7 @@ pub fn gen_aggregate(mut cx: *FnCtx, n: i64) {
 }
 
 // `[value; count]`: the value is evaluated once.
-fn gen_repeat(mut cx: *FnCtx, n: i64) {
+fn gen_repeat(cx: sink *FnCtx, n: i64) {
     unsafe {
         let ty = NODES[n].ty;
         let elem_ty = TYPES[ty].a;
@@ -454,7 +467,7 @@ fn gen_repeat(mut cx: *FnCtx, n: i64) {
 // ---- Enums and slices ----
 
 // `E::V(...)`: a fieldless enum's tag, or a new value in a frame slot.
-fn gen_variant(mut cx: *FnCtx, n: i64) {
+fn gen_variant(cx: sink *FnCtx, n: i64) {
     unsafe {
         let ty = NODES[n].ty;
         let v = NODES[n].a;
@@ -489,7 +502,7 @@ fn gen_variant(mut cx: *FnCtx, n: i64) {
 // `a[lo..hi]` (and the other ranges) of an array, a slice or a pointer: a
 // new slice in a frame slot. Arrays and slices are checked: lo <= hi <=
 // the length (lo <= hi + 1 and hi < the length for `..=`).
-fn gen_slicing(mut cx: *FnCtx, n: i64) {
+fn gen_slicing(cx: sink *FnCtx, n: i64) {
     unsafe {
         let base = NODES[n].a;
         let base_ty = NODES[base].ty;
@@ -513,7 +526,7 @@ fn gen_slicing(mut cx: *FnCtx, n: i64) {
             gen_expr(cx, base);
         }
         store_reg_to_frame(cx, R_ACC, slot);
-        let mut bound_ty = TY_U64;
+        var bound_ty = TY_U64;
         if low != 0 {
             gen_expr(cx, low);
             bound_ty = NODES[low].ty;
@@ -606,7 +619,7 @@ pub fn arith_op_of_assign(op: Tok) -> Tok {
 
 // The right-hand side is evaluated first, then the target's address; a
 // compound assignment then reads the old value.
-fn gen_assign(mut cx: *FnCtx, n: i64) {
+fn gen_assign(cx: sink *FnCtx, n: i64) {
     unsafe {
         let op = NODES[n].op;
         let target = NODES[n].b;

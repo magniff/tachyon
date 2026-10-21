@@ -32,7 +32,7 @@ use crate::tools::edit::undo::run_undo;
 use crate::tools::edit::wrap::run_wrap;
 use crate::tools::patch::run_patch;
 use crate::tools::proc::read_stdin;
-use crate::tools::query::{c_slice, ends_with_c, file_named, resolve_name, root_or_diag};
+use crate::tools::query::{c_slice, file_named, resolve_name, root_or_diag};
 use crate::tools::query::cache::{cache_on, cache_restore, cache_save};
 use crate::tools::query::command_line::{PARSED, QUERY, front_end, index_program, load_program};
 use crate::tools::query::defs::{
@@ -69,9 +69,9 @@ fn usage(message: *u8) -> i64 {
 // The options the editing commands share: --dry-run, --no-check, --show,
 // --exact, --root R, --target T, --std-tree DIR. Whether a[i] is one (*i moves past its
 // value).
-pub fn take_edit_option(argc: i64, argv: **u8, i: &mut i64, root: **u8) -> bool {
+pub fn take_edit_option(argc: i64, argv: **u8, i: inout i64, root: **u8) -> bool {
     unsafe {
-        let a = argv[*i];
+        let a = argv[i];
         if streq(a, c"--dry-run") {
             DRY_RUN = true;
         } else if streq(a, c"--show") {
@@ -82,23 +82,23 @@ pub fn take_edit_option(argc: i64, argv: **u8, i: &mut i64, root: **u8) -> bool 
             NO_CHECK = true;
         } else if streq(a, c"--exact") {
             OPT_EXACT = true;
-        } else if streq(a, c"-C") && *i + 1 < argc
-            && crate::arch::features::arch_option(argv[*i + 1]) {
+        } else if streq(a, c"-C") && i + 1 < argc
+            && crate::arch::features::arch_option(argv[i + 1]) {
             // (0.19: -C target-cpu=, -C target-feature=: which calls are
             // legal)
-            *i += 1;
+            i += 1;
         } else if (streq(a, c"--root") || streq(a, c"--target") || streq(a, c"--std-tree"))
-            && *i + 1 < argc {
+            && i + 1 < argc {
             if streq(a, c"--root") {
-                *root = argv[*i + 1];
+                *root = argv[i + 1];
             } else if streq(a, c"--std-tree") {
                 // (0.17: std from its files, stdtree.tach; stdedit.tach)
-                STD_TREE = argv[*i + 1];
+                STD_TREE = argv[i + 1];
             } else {
-                TARGET_NAME = argv[*i + 1];
+                TARGET_NAME = argv[i + 1];
                 TARGET = target_of_name(TARGET_NAME);
             }
-            *i += 1;
+            i += 1;
         } else {
             return false;
         }
@@ -157,18 +157,18 @@ fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
             buf_str(d, c"' (patch, apply, replace, insert, delete, wrap, new-file, resolve)\n");
             return 2;
         }
-        let mut after = false;
-        let mut before = false;
-        let mut root = 0 as *u8;
-        let mut names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let mut i = 3;
+        var after = false;
+        var before = false;
+        var root = 0 as *u8;
+        var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var i = 3;
         while i < argc {
             let a = argv[i];
             if streq(a, c"--after") {
                 after = true;
             } else if streq(a, c"--before") {
                 before = true;
-            } else if take_edit_option(argc, argv, &mut i, &root) {
+            } else if take_edit_option(argc, argv, &i, &root) {
             } else if a[0] == '-' && a[1] == '-' {
                 let d = diag(c"error", c"edit.usage");
                 buf_str(d, c"unknown option '");
@@ -180,7 +180,8 @@ fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
             }
             i += 1;
         }
-        if names.count == 2 && root == 0 as *u8 && ends_with_c(names.data[1] as *u8, c".tach") {
+        if names.count == 2 && root == 0 as *u8
+            && crate::base::is_source_path(names.data[1] as *u8) {
             root = names.data[1] as *u8;
             names.count = 1;
         }
@@ -214,19 +215,19 @@ fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
             return 1;
         }
         // A module's use lines or header comment (0.12).
-        let mut rf = 0;
-        let mut rk = 0;
-        let mut spans = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let r = region_target(name, what, &mut rf, &mut rk, &mut spans);
+        var rf = 0;
+        var rk = 0;
+        var spans = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let r = region_target(name, what, &rf, &rk, &spans);
         if r == 1 {
             return 1;
         }
         let how = if replace { 'r' } else if insert { if after { 'a' } else { 'b' } } else { 'd' };
         if r == 0 {
-            return edit_region(rf, rk, &spans, how, input, root);
+            return edit_region(rf, rk, spans, how, input, root);
         }
         // (0.17) `edit replace FILE.tach < text`: the whole file.
-        if replace && ends_with_c(names.data[0] as *u8, c".tach") {
+        if replace && crate::base::is_source_path(names.data[0] as *u8) {
             let f = file_named(name);
             if f >= 0 && FILES[f].path[0] != '<' {
                 let text = buf_new();
@@ -241,13 +242,13 @@ fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
                 return apply_edit(buf_slice(summary), root);
             }
         }
-        let mut matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        if !resolve_name(what, name, &mut matches) {
+        var matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        if !resolve_name(what, name, &matches) {
             return 1;
         }
-        source_only(&mut matches);
+        source_only(&matches);
         if matches.count > 1 {
-            ambiguous(what, name, &matches);
+            ambiguous(what, name, matches);
             return 1;
         }
         let d = matches.data[0];
@@ -284,7 +285,7 @@ pub fn item_edit(how: u8, d: i64, input: i64, summary: i64) -> bool {
         let head = item_head(d);
         let tail = item_tail(d);
         let member = DEFS[d].kind == K_FIELD || DEFS[d].kind == K_VARIANT;
-        let mut added = true;
+        var added = true;
         if how == 'r' {
             let text = item_text(buf_slice(input), if whole { indent_of(head) } else { SRC[0..0] });
             if whole {
@@ -308,7 +309,7 @@ pub fn item_edit(how: u8, d: i64, input: i64, summary: i64) -> bool {
             let text = item_text(buf_slice(input), indent_of(head));
             // (0.17: a one-line const or static next to one joins its run)
             let t = buf_slice(text);
-            let mut lines = 0;
+            var lines = 0;
             for i in 0..t.len {
                 if t[i] == '\n' && i + 1 < t.len {
                     lines += 1;
@@ -349,11 +350,11 @@ pub fn item_edit(how: u8, d: i64, input: i64, summary: i64) -> bool {
 // (0.17) Whether text t (an item's) is a const or a static.
 fn const_or_static(t: [u8]) -> bool {
     unsafe {
-        let mut i = 0;
+        var i = 0;
         while i < t.len && (t[i] == ' ' || t[i] == '\t') {
             i += 1;
         }
-        let mut s = t[i..t.len];
+        var s = t[i..t.len];
         if s.len > 4 && bytes_eq(s[0..4], c_slice(c"pub ")) {
             s = s[4..s.len];
         }
@@ -368,14 +369,14 @@ fn delete_item(d: i64, whole: bool, head: i64, tail: i64) -> bool {
         let f = file_of_pos(head);
         if !whole {
             // Its bytes, and the `, ` after it (or the `,` before it).
-            let mut a = head;
-            let mut b = tail;
+            var a = head;
+            var b = tail;
             if SRC[tail - 1] != ',' {
-                let mut n = tail;
+                var n = tail;
                 while n < FILES[f].end && (SRC[n] == ' ' || SRC[n] == '\t') {
                     n += 1;
                 }
-                let mut p = head;
+                var p = head;
                 while p > FILES[f].start && (SRC[p - 1] == ' ' || SRC[p - 1] == '\t') {
                     p -= 1;
                 }
@@ -418,7 +419,7 @@ fn delete_item(d: i64, whole: bool, head: i64, tail: i64) -> bool {
 // replace (the first region becomes TEXT, the others go; with none, TEXT
 // goes at the top of the file, after its header for use lines), 'a' or
 // 'b' insert (after the last use line, before the first), 'd' delete.
-fn edit_region(f: i64, kind: i64, spans: &IntVec, how: u8, input: i64, root: *u8) -> i64 {
+fn edit_region(f: i64, kind: i64, spans: IntVec, how: u8, input: i64, root: *u8) -> i64 {
     let summary = buf_new();
     let status = region_edit(f, kind, spans, how, input, summary);
     if status >= 0 {
@@ -429,9 +430,9 @@ fn edit_region(f: i64, kind: i64, spans: &IntVec, how: u8, input: i64, root: *u8
 
 // The edit of edit_region, its words in summary (`replaced crate::m::use`):
 // -1 when it is made, else the exit status (after the diagnostic).
-pub fn region_edit(f: i64, kind: i64, spans: &IntVec, how: u8, input: i64, summary: i64) -> i64 {
+pub fn region_edit(f: i64, kind: i64, spans: IntVec, how: u8, input: i64, summary: i64) -> i64 {
     unsafe {
-        let n = (*spans).count;
+        let n = spans.count;
         let text = if how == 'd' { buf_new() } else { item_text(buf_slice(input), SRC[0..0]) };
         if (how == 'a' || how == 'b') && kind == 2 {
             let e = diag(c"error", c"edit.layout");
@@ -447,15 +448,15 @@ pub fn region_edit(f: i64, kind: i64, spans: &IntVec, how: u8, input: i64, summa
             return 0;
         }
         if how == 'd' {
-            let mut k = 0;
+            var k = 0;
             while k < n {
-                delete_lines((*spans).data[k], (*spans).data[k + 1]);
+                delete_lines(spans.data[k], spans.data[k + 1]);
                 k += 2;
             }
             buf_str(summary, c"deleted ");
         } else if n == 0 {
             // (none yet: at the top, after the header for use lines)
-            let mut at = FILES[f].start;
+            var at = FILES[f].start;
             if kind != 2 {
                 while at < FILES[f].end && (blank_line(at) || comment_at(at)) {
                     at = after_line(at);
@@ -463,8 +464,8 @@ pub fn region_edit(f: i64, kind: i64, spans: &IntVec, how: u8, input: i64, summa
             }
             if kind == 3 {
                 // (extern blocks: after the use lines)
-                let mut uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-                region_spans(f, 1, &mut uses);
+                var uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                region_spans(f, 1, &uses);
                 if uses.count > 0 {
                     at = FILES[f].start;
                     for _ in 0..uses.data[uses.count - 1] + 1 {
@@ -481,17 +482,17 @@ pub fn region_edit(f: i64, kind: i64, spans: &IntVec, how: u8, input: i64, summa
             edit_replace(at, at, out);
             buf_str(summary, if how == 'r' { c"replaced " } else { c"inserted " });
         } else if how == 'r' {
-            edit_replace((*spans).data[0], line_end((*spans).data[1] - 1), text);
-            let mut k = 2;
+            edit_replace(spans.data[0], line_end(spans.data[1] - 1), text);
+            var k = 2;
             while k < n {
-                delete_lines((*spans).data[k], (*spans).data[k + 1]);
+                delete_lines(spans.data[k], spans.data[k + 1]);
                 k += 2;
             }
             buf_str(summary, c"replaced ");
         } else {
             let out = buf_new();
             if how == 'a' {
-                let at = line_end((*spans).data[n - 1] - 1);
+                let at = line_end(spans.data[n - 1] - 1);
                 buf_byte(out, '\n');
                 buf_bytes(out, buf_slice(text));
                 edit_replace(at, at, out);
@@ -499,7 +500,7 @@ pub fn region_edit(f: i64, kind: i64, spans: &IntVec, how: u8, input: i64, summa
             } else {
                 buf_bytes(out, buf_slice(text));
                 buf_byte(out, '\n');
-                edit_replace((*spans).data[0], (*spans).data[0], out);
+                edit_replace(spans.data[0], spans.data[0], out);
                 buf_str(summary, c"inserted before ");
             }
         }
@@ -513,7 +514,7 @@ pub fn region_edit(f: i64, kind: i64, spans: &IntVec, how: u8, input: i64, summa
 // Whether the line at pos is a comment (blanks before `//`).
 fn comment_at(pos: i64) -> bool {
     unsafe {
-        let mut p = pos;
+        var p = pos;
         while SRC[p] == ' ' || SRC[p] == '\t' {
             p += 1;
         }
@@ -528,8 +529,8 @@ fn comment_at(pos: i64) -> bool {
 pub fn delete_lines(first: i64, tail: i64) -> bool {
     unsafe {
         let f = file_of_pos(first);
-        let mut a = first;
-        let mut b = after_line(tail - 1);
+        var a = first;
+        var b = after_line(tail - 1);
         let prev = if a > FILES[f].start { line_start(a - 1) } else { -1 };
         let prev_blank = prev >= 0 && blank_line(prev);
         let opens = prev >= 0 && !prev_blank && ends_with_brace(prev, a - 1);
@@ -545,7 +546,7 @@ pub fn delete_lines(first: i64, tail: i64) -> bool {
 // Whether the line from..to ends with `{` (blanks aside).
 fn ends_with_brace(from: i64, to: i64) -> bool {
     unsafe {
-        let mut e = to;
+        var e = to;
         while e > from && (SRC[e - 1] == ' ' || SRC[e - 1] == '\t' || SRC[e - 1] == '\r') {
             e -= 1;
         }
@@ -556,7 +557,7 @@ fn ends_with_brace(from: i64, to: i64) -> bool {
 // Whether the line at pos starts with `}` (blanks aside).
 fn starts_with_brace(pos: i64) -> bool {
     unsafe {
-        let mut p = pos;
+        var p = pos;
         while SRC[p] == ' ' || SRC[p] == '\t' {
             p += 1;
         }
@@ -566,27 +567,27 @@ fn starts_with_brace(pos: i64) -> bool {
 
 // Leaves out of matches the definitions that are not in a file of the
 // program (std's, the C headers'), unless all are.
-pub fn source_only(matches: &mut IntVec) {
+pub fn source_only(matches: inout IntVec) {
     unsafe {
-        let mut kept = 0;
-        for i in 0..(*matches).count {
-            let d = (*matches).data[i];
+        var kept = 0;
+        for i in 0..matches.count {
+            let d = matches.data[i];
             if FILES[file_of_pos(DEFS[d].start)].path[0] != '<' {
-                (*matches).data[kept] = d;
+                matches.data[kept] = d;
                 kept += 1;
             }
         }
         if kept > 0 {
-            (*matches).count = kept;
+            matches.count = kept;
         }
     }
 }
 
 // NAME matches several definitions: refused, with the first three paths
 // (and the query listing them all, when there are more).
-pub fn ambiguous(what: *u8, name: [u8], matches: &IntVec) {
+pub fn ambiguous(what: *u8, name: [u8], matches: IntVec) {
     unsafe {
-        let n = (*matches).count;
+        let n = matches.count;
         let d = diag(c"error", c"query.ambiguous");
         buf_int(d, n);
         buf_str(d, c" definitions match '");
@@ -597,7 +598,7 @@ pub fn ambiguous(what: *u8, name: [u8], matches: &IntVec) {
                 break;
             }
             // (0.17: the command as run, the name replaced)
-            let fqn = SYMS[DEFS[(*matches).data[i]].fqn].text;
+            let fqn = SYMS[DEFS[matches.data[i]].fqn].text;
             if !try_replaced(name, fqn) {
                 try_end(try_begin(what, fqn, true));
             }
@@ -613,8 +614,8 @@ pub fn ambiguous(what: *u8, name: [u8], matches: &IntVec) {
 pub fn run_undo_command(argc: i64, argv: **u8) -> i64 {
     unsafe {
         PROG = argv[0];
-        let mut force = false;
-        let mut from = 0 as *u8;
+        var force = false;
+        var from = 0 as *u8;
         for i in 2..argc {
             if streq(argv[i], c"--force") {
                 force = true;
@@ -636,8 +637,8 @@ pub fn run_check(argc: i64, argv: **u8) -> i64 {
     unsafe {
         PROG = argv[0];
         DIAG_SHORT = true;
-        let mut root = 0 as *u8;
-        let mut i = 2;
+        var root = 0 as *u8;
+        var i = 2;
         while i < argc {
             let a = argv[i];
             if streq(a, c"--overlay") && i + 2 < argc {
@@ -648,7 +649,7 @@ pub fn run_check(argc: i64, argv: **u8) -> i64 {
             }
             if streq(a, c"--diagnostics=human") || streq(a, c"--diagnostics=short") {
                 DIAG_SHORT = streq(a, c"--diagnostics=short");
-            } else if take_edit_option(argc, argv, &mut i, &root) {
+            } else if take_edit_option(argc, argv, &i, &root) {
             } else if a[0] == '-' {
                 let d = diag(c"error", c"check.usage");
                 buf_str(d, c"unknown option '");

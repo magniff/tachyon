@@ -137,8 +137,9 @@ layout; `#[repr(C, packed)]` packs a struct (or union) without padding,
 `#[repr(C, align(N))]` raises its alignment to N (a power of two up to
 4096; above 16 since 0.5, with stack frames realigned where needed);
 `#[repr(u8)]` (any integer type) sets the tag type of an enum. Functions
-take `#[inline]`, `#[inline(never)]` and `#[cold]` (0.6). Any other
-attribute is an error.
+take `#[inline]`, `#[inline(never)]` and `#[cold]` (0.6). A `static var`
+takes `#[thread_local]` (0.21): each thread has its own copy, made from
+the initializer (`guide threads`). Any other attribute is an error.
 
 ## Types
 
