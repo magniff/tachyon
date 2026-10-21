@@ -42,7 +42,7 @@ generated header:
 ```console
 $ tachyonc query items
 crate	main.tach	6
-std	<std>	590
+std	<std>	592
 crate::graph	graph.tach	11
 crate::heap	heap.tach	7
 crate::network	network.tach	2
@@ -119,6 +119,7 @@ std::window	<std>	48
 std::window::cocoa	<std>	115
 std::window::keys	<std>	27
 std::window::objc	<std>	88
+std::cli	<std>	71
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6
