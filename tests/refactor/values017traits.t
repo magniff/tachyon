@@ -72,7 +72,7 @@ note fix.none: nothing to fix
 $ main.tach -o prog --syntax=mixed
 main.tach:33:20: error[type error] 'cmp' does not have the signature trait 'Ord' declares: expected 'fn(Key, Key) -> i64'
 main.tach:34:19: error[type error] 'eq' does not have the signature trait 'Eq' declares: expected 'fn(Key, Key) -> bool'
-main.tach:38:26: error[type error] 'fmt' does not have the signature trait 'Display' declares: expected 'fn(Money, &mut Fmt) -> ()'
+main.tach:38:26: error[type error] 'fmt' does not have the signature trait 'Display' declares: expected 'fn(Money, inout Fmt) -> ()'
 [exit 1]
 % ./prog
 tests/refactor/run.sh: line 91: ./prog: No such file or directory

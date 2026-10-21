@@ -16,9 +16,9 @@ t      Tok       view  views nothing (static data)
 n      i64       plain
 $ own own017/main.tach:5:23
 own017/main.tach:5:23 in crate::total
-v  &Vec<i64>  view
-s  i64        plain
-x  i64        plain
+v  let Vec<i64>  view
+s  i64           plain
+x  i64           plain
 $ own own017/main.tach:1
 error query.no-match: own017/main.tach:1 is in no function the checker saw
 try: tachyonc query show own017/main.tach:1

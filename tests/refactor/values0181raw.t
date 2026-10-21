@@ -36,10 +36,10 @@ main.tach:41:5: error[conv.rust] 'let mut' is Rust's spelling; a mutable binding
 main.tach:47:5: error[conv.rust] 'let mut' is Rust's spelling; a mutable binding is 'var x' | try: tachyonc edit patch main.tach:47 --old 'let mut' --new 'var' | try: tachyonc fix --suggested main.tach
 main.tach:48:9: error[conv.rust] '&mut st' is Rust's spelling; an inout argument (the callee may change it) is marked '&x' | try: tachyonc edit patch main.tach:48 --old '&mut st' --new '&st' | try: tachyonc fix --suggested main.tach
 main.tach:48:9: error[conv.marker_extra] '&' marks an argument the callee may change; 'st' is taken let or sink here (read, or moved): pass 'st' | try: tachyonc edit patch main.tach:48 --old '&mut st' --new 'st' | try: tachyonc fix --suggested main.tach
-main.tach:48:14: error[type error] expected '&&mut Stats', got 'Stats'
+main.tach:48:14: error[type error] expected 'let inout Stats', got 'Stats'
 main.tach:49:9: error[conv.rust] '&mut st' is Rust's spelling; an inout argument (the callee may change it) is marked '&x' | try: tachyonc edit patch main.tach:49 --old '&mut st' --new '&st' | try: tachyonc fix --suggested main.tach
 main.tach:49:9: error[conv.marker_extra] '&' marks an argument the callee may change; 'st' is taken let or sink here (read, or moved): pass 'st' | try: tachyonc edit patch main.tach:49 --old '&mut st' --new 'st' | try: tachyonc fix --suggested main.tach
-main.tach:49:14: error[type error] expected '&&mut Stats', got 'Stats'
+main.tach:49:14: error[type error] expected 'let inout Stats', got 'Stats'
 main.tach:50:5: error[conv.rust] 'let mut' is Rust's spelling; a mutable binding is 'var x' | try: tachyonc edit patch main.tach:50 --old 'let mut' --new 'var' | try: tachyonc fix --suggested main.tach
 main.tach:58:70: error[conv.marker_extra] '&' marks an argument the callee may change; 'st' is taken let or sink here (read, or moved): pass 'st' | try: tachyonc edit patch main.tach:58 --old '&st' --new 'st' | try: tachyonc fix --suggested main.tach
 [exit 1]

@@ -265,134 +265,134 @@ $ items sys
 # crate::sys	clash/main.tach
 10	struct	pub struct SockaddrIn
 # std::sys	<std>
-13315	const	pub const SYS_EPERM: i32 = 1
-13316	const	pub const SYS_ENOENT: i32 = 2
-13317	const	pub const SYS_ESRCH: i32 = 3
-13318	const	pub const SYS_EINTR: i32 = 4
-13319	const	pub const SYS_EIO: i32 = 5
-13320	const	pub const SYS_EBADF: i32 = 9
-13321	const	pub const SYS_ECHILD: i32 = 10
-13322	const	pub const SYS_ENOMEM: i32 = 12
-13323	const	pub const SYS_EACCES: i32 = 13
-13324	const	pub const SYS_EEXIST: i32 = 17
-13325	const	pub const SYS_EXDEV: i32 = 18
-13326	const	pub const SYS_ENOTDIR: i32 = 20
-13327	const	pub const SYS_EISDIR: i32 = 21
-13328	const	pub const SYS_EINVAL: i32 = 22
-13329	const	pub const SYS_ENOSPC: i32 = 28
-13330	const	pub const SYS_EROFS: i32 = 30
-13331	const	pub const SYS_EPIPE: i32 = 32
-13336	enum	pub enum SysErrorKind
-13357	fn	pub fn sys_errno() -> i32
-13363	fn	pub fn sys_set_errno(e: i32)
-13369	fn	pub fn sys_errno_kind(e: i32) -> SysErrorKind
-13403	fn	pub fn sys_strerror_into(e: i32, out: inout [u8]) -> i64
-13416	fn	pub unsafe fn sys_cstr_view(p: *u8) -> [u8]
-13443	struct	pub struct SysPath
-13450	fn	pub fn sys_cpath(path: [u8]) -> Result<SysPath, i32>
-13465	impl	impl SysPath
-13467	method	pub fn ptr(self) -> *u8
-13540	const	pub const SYS_O_RDONLY: i32 = 0
-13541	const	pub const SYS_O_WRONLY: i32 = 1
-13542	const	pub const SYS_O_RDWR: i32 = 2
-13543	const	pub const SYS_SEEK_SET: i32 = 0
-13544	const	pub const SYS_SEEK_CUR: i32 = 1
-13545	const	pub const SYS_SEEK_END: i32 = 2
-13555	fn	pub fn sys_open(path: [u8], flags: i32, mode: i32) -> Result<i32, i32>
-13562	fn	pub fn sys_close(fd: i32) -> Result<(), i32>
-13567	fn	pub fn sys_read(fd: i32, buf: inout [u8]) -> Result<i64, i32>
-13573	fn	pub fn sys_write(fd: i32, buf: [u8]) -> Result<i64, i32>
-13579	fn	pub fn sys_pread(fd: i32, buf: inout [u8], off: i64) -> Result<i64, i32>
-13585	fn	pub fn sys_pwrite(fd: i32, buf: [u8], off: i64) -> Result<i64, i32>
-13591	fn	pub fn sys_lseek(fd: i32, off: i64, whence: i32) -> Result<i64, i32>
-13595	fn	pub fn sys_ftruncate(fd: i32, len: i64) -> Result<(), i32>
-13599	fn	pub fn sys_fsync(fd: i32) -> Result<(), i32>
-13603	fn	pub fn sys_mkdir(path: [u8], mode: i32) -> Result<(), i32>
-13608	fn	pub fn sys_rmdir(path: [u8]) -> Result<(), i32>
-13613	fn	pub fn sys_unlink(path: [u8]) -> Result<(), i32>
-13618	fn	pub fn sys_rename(from: [u8], to: [u8]) -> Result<(), i32>
-13624	fn	pub fn sys_dup(fd: i32) -> Result<i32, i32>
-13630	fn	pub fn sys_dup2(fd: i32, to: i32) -> Result<i32, i32>
-13635	fn	pub fn sys_pipe() -> Result<(i32, i32), i32>
-13645	fn	pub fn sys_set_nonblocking(fd: i32, on: bool) -> Result<(), i32>
-13655	fn	pub fn sys_set_cloexec(fd: i32, on: bool) -> Result<(), i32>
-13665	fn	pub fn sys_isatty(fd: i32) -> bool
-13673	struct	pub struct FileStat
-13692	const	pub const SYS_S_IFMT: u32 = 0xf000
-13693	const	pub const SYS_S_IFDIR: u32 = 0x4000
-13694	const	pub const SYS_S_IFREG: u32 = 0x8000
-13695	const	pub const SYS_S_IFLNK: u32 = 0xa000
-13697	impl	impl FileStat
-13698	method	pub fn is_dir(self) -> bool
-13702	method	pub fn is_file(self) -> bool
-13706	method	pub fn is_symlink(self) -> bool
-13711	method	pub fn permissions(self) -> u32
-13718	struct	pub struct StatMacos
-13745	struct	pub struct StatLinux
-13819	fn	pub fn sys_fstat(fd: i32) -> Result<FileStat, i32>
-13827	fn	pub fn sys_stat(path: [u8]) -> Result<FileStat, i32>
-13836	fn	pub fn sys_lstat(path: [u8]) -> Result<FileStat, i32>
-13866	struct	pub struct DirentMacos
-13877	struct	pub struct DirentLinux
-13886	struct	pub struct SysDir
-13894	struct	pub struct SysDirEntry
-13900	const	pub const SYS_DT_UNKNOWN: u8 = 0
-13901	const	pub const SYS_DT_FIFO: u8 = 1
-13902	const	pub const SYS_DT_CHR: u8 = 2
-13903	const	pub const SYS_DT_DIR: u8 = 4
-13904	const	pub const SYS_DT_BLK: u8 = 6
-13905	const	pub const SYS_DT_REG: u8 = 8
-13906	const	pub const SYS_DT_LNK: u8 = 10
-13907	const	pub const SYS_DT_SOCK: u8 = 12
-13909	fn	pub fn sys_opendir(path: [u8]) -> Result<SysDir, i32>
-13920	fn	pub fn sys_readdir_into(dir: inout SysDir, name: inout [u8; 256]) -> Result<Option<SysDirEntry>, i32>
-13960	fn	pub fn sys_closedir(dir: inout SysDir) -> Result<(), i32>
-13972	fn	pub fn sys_getcwd_into(buf: inout [u8]) -> Result<i64, i32>
-13988	fn	pub fn sys_chdir(path: [u8]) -> Result<(), i32>
-14009	fn	pub fn sys_environ() -> **u8
-14014	fn	pub fn sys_env_count() -> i64
-14029	fn	pub fn sys_env_at(i: i64) -> [u8]
-14039	fn	pub fn sys_getenv(name: [u8]) -> Option<[u8]>
-14056	fn	pub unsafe fn sys_setenv(name: [u8], value: [u8]) -> Result<(), i32>
-14063	fn	pub unsafe fn sys_unsetenv(name: [u8]) -> Result<(), i32>
-14097	const	pub const SYS_SIGHUP: i32 = 1
-14098	const	pub const SYS_SIGINT: i32 = 2
-14099	const	pub const SYS_SIGKILL: i32 = 9
-14100	const	pub const SYS_SIGTERM: i32 = 15
-14105	struct	pub struct SysSpawnActions
-14111	fn	pub fn sys_spawn_actions() -> Result<SysSpawnActions, i32>
-14122	impl	impl SysSpawnActions
-14124	method	pub fn dup2(inout self, fd: i32, to: i32) -> Result<(), i32>
-14134	method	pub fn close(inout self, fd: i32) -> Result<(), i32>
-14143	method	pub fn free(inout self)
-14159	fn	pub unsafe fn sys_spawn(prog: *u8, argv: [*u8], envp: [*u8], actions: *SysSpawnActions) -> Result<i32, i32>
-14183	fn	pub fn sys_waitpid(pid: i32, nohang: bool) -> Result<(i32, i32), i32>
-14193	fn	pub fn sys_exit_code(status: i32) -> Option<i32>
-14198	fn	pub fn sys_exit_signal(status: i32) -> Option<i32>
-14203	fn	pub fn sys_kill(pid: i32, sig: i32) -> Result<(), i32>
-14207	fn	pub fn sys_getpid() -> i32
-14258	struct	pub struct SysWinsize
-14267	struct	pub struct SysTermios
-14274	struct	pub struct SysPollFd
-14280	const	pub const SYS_POLLIN: i16 = 1
-14281	const	pub const SYS_POLLPRI: i16 = 2
-14282	const	pub const SYS_POLLOUT: i16 = 4
-14283	const	pub const SYS_POLLERR: i16 = 8
-14284	const	pub const SYS_POLLHUP: i16 = 16
-14285	const	pub const SYS_POLLNVAL: i16 = 32
-14291	fn	pub fn sys_openpty(size: SysWinsize) -> Result<(i32, i32), i32>
-14331	fn	pub unsafe fn sys_fork_exec_pty(tty: i32, path: *u8, argv: [*u8], envp: [*u8]) -> Result<i32, i32>
-14362	fn	pub fn sys_set_winsize(fd: i32, size: SysWinsize) -> Result<(), i32>
-14369	fn	pub fn sys_get_winsize(fd: i32) -> Result<SysWinsize, i32>
-14377	fn	pub fn sys_tcgetattr(fd: i32) -> Result<SysTermios, i32>
-14385	fn	pub fn sys_tcsetattr(fd: i32, t: SysTermios) -> Result<(), i32>
-14392	fn	pub fn sys_make_raw(t: inout SysTermios)
-14399	fn	pub fn sys_poll(fds: [SysPollFd], timeout_ms: i32) -> Result<i64, i32>
-14421	struct	pub struct SysTimespec
-14426	const	pub const SYS_CLOCK_REALTIME: i32 = 0
-14430	fn	pub fn sys_clock_gettime(clock: i32) -> (i64, i64)
-14440	fn	pub fn sys_nanosleep(secs: i64, nanos: i64, left: inout SysTimespec) -> Result<(), i32>
-14447	fn	pub fn sys_getentropy(buf: inout [u8]) -> Result<(), i32>
+13313	const	pub const SYS_EPERM: i32 = 1
+13314	const	pub const SYS_ENOENT: i32 = 2
+13315	const	pub const SYS_ESRCH: i32 = 3
+13316	const	pub const SYS_EINTR: i32 = 4
+13317	const	pub const SYS_EIO: i32 = 5
+13318	const	pub const SYS_EBADF: i32 = 9
+13319	const	pub const SYS_ECHILD: i32 = 10
+13320	const	pub const SYS_ENOMEM: i32 = 12
+13321	const	pub const SYS_EACCES: i32 = 13
+13322	const	pub const SYS_EEXIST: i32 = 17
+13323	const	pub const SYS_EXDEV: i32 = 18
+13324	const	pub const SYS_ENOTDIR: i32 = 20
+13325	const	pub const SYS_EISDIR: i32 = 21
+13326	const	pub const SYS_EINVAL: i32 = 22
+13327	const	pub const SYS_ENOSPC: i32 = 28
+13328	const	pub const SYS_EROFS: i32 = 30
+13329	const	pub const SYS_EPIPE: i32 = 32
+13334	enum	pub enum SysErrorKind
+13355	fn	pub fn sys_errno() -> i32
+13361	fn	pub fn sys_set_errno(e: i32)
+13367	fn	pub fn sys_errno_kind(e: i32) -> SysErrorKind
+13401	fn	pub fn sys_strerror_into(e: i32, out: inout [u8]) -> i64
+13414	fn	pub unsafe fn sys_cstr_view(p: *u8) -> [u8]
+13441	struct	pub struct SysPath
+13448	fn	pub fn sys_cpath(path: [u8]) -> Result<SysPath, i32>
+13463	impl	impl SysPath
+13465	method	pub fn ptr(self) -> *u8
+13538	const	pub const SYS_O_RDONLY: i32 = 0
+13539	const	pub const SYS_O_WRONLY: i32 = 1
+13540	const	pub const SYS_O_RDWR: i32 = 2
+13541	const	pub const SYS_SEEK_SET: i32 = 0
+13542	const	pub const SYS_SEEK_CUR: i32 = 1
+13543	const	pub const SYS_SEEK_END: i32 = 2
+13553	fn	pub fn sys_open(path: [u8], flags: i32, mode: i32) -> Result<i32, i32>
+13560	fn	pub fn sys_close(fd: i32) -> Result<(), i32>
+13565	fn	pub fn sys_read(fd: i32, buf: inout [u8]) -> Result<i64, i32>
+13571	fn	pub fn sys_write(fd: i32, buf: [u8]) -> Result<i64, i32>
+13577	fn	pub fn sys_pread(fd: i32, buf: inout [u8], off: i64) -> Result<i64, i32>
+13583	fn	pub fn sys_pwrite(fd: i32, buf: [u8], off: i64) -> Result<i64, i32>
+13589	fn	pub fn sys_lseek(fd: i32, off: i64, whence: i32) -> Result<i64, i32>
+13593	fn	pub fn sys_ftruncate(fd: i32, len: i64) -> Result<(), i32>
+13597	fn	pub fn sys_fsync(fd: i32) -> Result<(), i32>
+13601	fn	pub fn sys_mkdir(path: [u8], mode: i32) -> Result<(), i32>
+13606	fn	pub fn sys_rmdir(path: [u8]) -> Result<(), i32>
+13611	fn	pub fn sys_unlink(path: [u8]) -> Result<(), i32>
+13616	fn	pub fn sys_rename(from: [u8], to: [u8]) -> Result<(), i32>
+13622	fn	pub fn sys_dup(fd: i32) -> Result<i32, i32>
+13628	fn	pub fn sys_dup2(fd: i32, to: i32) -> Result<i32, i32>
+13633	fn	pub fn sys_pipe() -> Result<(i32, i32), i32>
+13643	fn	pub fn sys_set_nonblocking(fd: i32, on: bool) -> Result<(), i32>
+13653	fn	pub fn sys_set_cloexec(fd: i32, on: bool) -> Result<(), i32>
+13663	fn	pub fn sys_isatty(fd: i32) -> bool
+13671	struct	pub struct FileStat
+13690	const	pub const SYS_S_IFMT: u32 = 0xf000
+13691	const	pub const SYS_S_IFDIR: u32 = 0x4000
+13692	const	pub const SYS_S_IFREG: u32 = 0x8000
+13693	const	pub const SYS_S_IFLNK: u32 = 0xa000
+13695	impl	impl FileStat
+13696	method	pub fn is_dir(self) -> bool
+13700	method	pub fn is_file(self) -> bool
+13704	method	pub fn is_symlink(self) -> bool
+13709	method	pub fn permissions(self) -> u32
+13716	struct	pub struct StatMacos
+13743	struct	pub struct StatLinux
+13817	fn	pub fn sys_fstat(fd: i32) -> Result<FileStat, i32>
+13825	fn	pub fn sys_stat(path: [u8]) -> Result<FileStat, i32>
+13834	fn	pub fn sys_lstat(path: [u8]) -> Result<FileStat, i32>
+13864	struct	pub struct DirentMacos
+13875	struct	pub struct DirentLinux
+13884	struct	pub struct SysDir
+13892	struct	pub struct SysDirEntry
+13898	const	pub const SYS_DT_UNKNOWN: u8 = 0
+13899	const	pub const SYS_DT_FIFO: u8 = 1
+13900	const	pub const SYS_DT_CHR: u8 = 2
+13901	const	pub const SYS_DT_DIR: u8 = 4
+13902	const	pub const SYS_DT_BLK: u8 = 6
+13903	const	pub const SYS_DT_REG: u8 = 8
+13904	const	pub const SYS_DT_LNK: u8 = 10
+13905	const	pub const SYS_DT_SOCK: u8 = 12
+13907	fn	pub fn sys_opendir(path: [u8]) -> Result<SysDir, i32>
+13918	fn	pub fn sys_readdir_into(dir: inout SysDir, name: inout [u8; 256]) -> Result<Option<SysDirEntry>, i32>
+13958	fn	pub fn sys_closedir(dir: inout SysDir) -> Result<(), i32>
+13970	fn	pub fn sys_getcwd_into(buf: inout [u8]) -> Result<i64, i32>
+13986	fn	pub fn sys_chdir(path: [u8]) -> Result<(), i32>
+14007	fn	pub fn sys_environ() -> **u8
+14012	fn	pub fn sys_env_count() -> i64
+14027	fn	pub fn sys_env_at(i: i64) -> [u8]
+14037	fn	pub fn sys_getenv(name: [u8]) -> Option<[u8]>
+14054	fn	pub unsafe fn sys_setenv(name: [u8], value: [u8]) -> Result<(), i32>
+14061	fn	pub unsafe fn sys_unsetenv(name: [u8]) -> Result<(), i32>
+14095	const	pub const SYS_SIGHUP: i32 = 1
+14096	const	pub const SYS_SIGINT: i32 = 2
+14097	const	pub const SYS_SIGKILL: i32 = 9
+14098	const	pub const SYS_SIGTERM: i32 = 15
+14103	struct	pub struct SysSpawnActions
+14109	fn	pub fn sys_spawn_actions() -> Result<SysSpawnActions, i32>
+14120	impl	impl SysSpawnActions
+14122	method	pub fn dup2(inout self, fd: i32, to: i32) -> Result<(), i32>
+14132	method	pub fn close(inout self, fd: i32) -> Result<(), i32>
+14141	method	pub fn free(inout self)
+14157	fn	pub unsafe fn sys_spawn(prog: *u8, argv: [*u8], envp: [*u8], actions: *SysSpawnActions) -> Result<i32, i32>
+14181	fn	pub fn sys_waitpid(pid: i32, nohang: bool) -> Result<(i32, i32), i32>
+14191	fn	pub fn sys_exit_code(status: i32) -> Option<i32>
+14196	fn	pub fn sys_exit_signal(status: i32) -> Option<i32>
+14201	fn	pub fn sys_kill(pid: i32, sig: i32) -> Result<(), i32>
+14205	fn	pub fn sys_getpid() -> i32
+14256	struct	pub struct SysWinsize
+14265	struct	pub struct SysTermios
+14272	struct	pub struct SysPollFd
+14278	const	pub const SYS_POLLIN: i16 = 1
+14279	const	pub const SYS_POLLPRI: i16 = 2
+14280	const	pub const SYS_POLLOUT: i16 = 4
+14281	const	pub const SYS_POLLERR: i16 = 8
+14282	const	pub const SYS_POLLHUP: i16 = 16
+14283	const	pub const SYS_POLLNVAL: i16 = 32
+14289	fn	pub fn sys_openpty(size: SysWinsize) -> Result<(i32, i32), i32>
+14329	fn	pub unsafe fn sys_fork_exec_pty(tty: i32, path: *u8, argv: [*u8], envp: [*u8]) -> Result<i32, i32>
+14360	fn	pub fn sys_set_winsize(fd: i32, size: SysWinsize) -> Result<(), i32>
+14367	fn	pub fn sys_get_winsize(fd: i32) -> Result<SysWinsize, i32>
+14375	fn	pub fn sys_tcgetattr(fd: i32) -> Result<SysTermios, i32>
+14383	fn	pub fn sys_tcsetattr(fd: i32, t: SysTermios) -> Result<(), i32>
+14390	fn	pub fn sys_make_raw(t: inout SysTermios)
+14397	fn	pub fn sys_poll(fds: [SysPollFd], timeout_ms: i32) -> Result<i64, i32>
+14419	struct	pub struct SysTimespec
+14424	const	pub const SYS_CLOCK_REALTIME: i32 = 0
+14428	fn	pub fn sys_clock_gettime(clock: i32) -> (i64, i64)
+14438	fn	pub fn sys_nanosleep(secs: i64, nanos: i64, left: inout SysTimespec) -> Result<(), i32>
+14445	fn	pub fn sys_getentropy(buf: inout [u8]) -> Result<(), i32>
 $ def helpr
 error query.no-match: no definition 'helpr'
 try: tachyonc query def crate::a::helper

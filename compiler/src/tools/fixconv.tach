@@ -673,6 +673,10 @@ fn edit_call(c: i64) {
             } else if TYPES[t].kind == TyKind::Ptr {
                 // (to a raw `*T`: `&e` converts to it, as it is)
                 AMP_SEEN.put(arg + 1, 1);
+            } else {
+                // (Phase M: to a value, which 0.18.1 read through it, or a
+                // slice, which it is: the value itself)
+                edit_amp(arg, true);
             }
         }
     }
@@ -765,6 +769,22 @@ fn edit_let(n: i64) {
         }
         if init > 0 && is_amp(init) && (NODES[init].p & NODE_REF_MUT) == 0 {
             AMP_SEEN.put(init + 1, 1);
+            // (Phase M: `let r = &e;` of a temporary, a copyable value or a
+            // part (an element, a field) is `let r = e;`: it owns the
+            // temporary, copies the value, borrows the part (D13); a whole
+            // owned local would move, which is left to hand)
+            let e = NODES[init].b;
+            let et = if e > 0 { NODES[e].ty } else { 0 };
+            let whole_local = e > 0 && NODES[e].kind == NodeKind::Ident;
+            if !CONV_SPELLING && e > 0 && SRC[NODES[init].start + 1] != '&' && is_ref_type(t)
+                && (!whole_local || et > 0 && crate::front::conv::copyable(et)) {
+                put(NODES[init].start, skip_ws(NODES[init].start + 1), "", CC_UNMARKED);
+                if ann > 0 && NODES[ann].kind == NodeKind::TyPtr && SRC[NODES[ann].start] == '&' {
+                    TYPE_DONE.put(ann + 1, 1);
+                    put(NODES[ann].start, NODES[NODES[ann].a].start, "", -1);
+                }
+                return;
+            }
             left(s, CL_SHARED_LOCAL);
         }
     }
@@ -980,7 +1000,12 @@ fn let_param_at(c: i64, i: i64) -> bool {
             return false;
         }
         let p = crate::front::conv::param_node(f, i);
-        p > 0 && crate::front::conv::param_conv(p) == crate::front::conv::CONV_LET
+        if p <= 0 || crate::front::conv::param_conv(p) != crate::front::conv::CONV_LET {
+            return false;
+        }
+        // (a raw `*T` written: `&e` is its address)
+        let tn = NODES[p].b;
+        !(tn > 0 && NODES[tn].kind == NodeKind::TyPtr && (NODES[tn].p & NODE_REF) == 0)
     }
 }
 
@@ -989,6 +1014,25 @@ fn let_param_at(c: i64, i: i64) -> bool {
 // value, so its address is written `&x`.
 fn raw_addresses() {
     unsafe {
+        // (a reference parameter given to a C function, variadic too: its
+        // address, `&p`)
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind != NodeKind::Call || NODES[n].x <= 0 || NODES[n].x - 1 >= FN_COUNT
+                || !FNS[NODES[n].x - 1].is_extern {
+                continue;
+            }
+            for i in 0..NODES[n].count {
+                let e = arg_value(child(n, i));
+                if e <= 0 || NODES[e].kind != NodeKind::Ident || !editable(NODES[e].start)
+                    || raw_ref(e) {
+                    continue;
+                }
+                let f = enclosing_fn(NODES[e].start);
+                if f > 0 && ref_param_named(f, NODES[e].a) > 0 {
+                    put(NODES[e].start, NODES[e].start, "&", CC_MARKER);
+                }
+            }
+        }
         // (`p as *T` of a reference parameter: `&p as *T`)
         for n in 1..NODE_COUNT {
             if NODES[n].kind != NodeKind::Cast || NODES[n].a <= 0 {
@@ -1030,6 +1074,37 @@ fn stripped_amps() {
                 put(s, skip_ws(s + 1), "", CC_UNMARKED);
             }
         }
+    }
+}
+
+// Whether position pos is inside an f-string's hole.
+fn in_hole(pos: i64) -> bool {
+    unsafe {
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind == NodeKind::InterpHole {
+                let e = NODES[n].a;
+                if e > 0 && NODES[e].start <= pos && pos < NODES[e].end {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+// Whether `&e` node n is the scrutinee of a match, e of a copyable type.
+fn copied_scrutinee(n: i64) -> bool {
+    unsafe {
+        let e = NODES[n].b;
+        if e <= 0 || NODES[e].ty <= 0 || !crate::front::conv::copyable(NODES[e].ty) {
+            return false;
+        }
+        for m in 1..NODE_COUNT {
+            if NODES[m].kind == NodeKind::Match && NODES[m].a == n {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -1254,7 +1329,14 @@ pub fn conventions_edits() -> i64 {
                         edit_amp(n, false);
                     }
                 } else if !CONV_SPELLING && SRC[NODES[n].start + 1] != '&' {
-                    left(NODES[n].start, CL_AMP);
+                    if in_hole(NODES[n].start) || copied_scrutinee(n) {
+                        // (Phase M: a shared `&e` in an f-string's hole (a
+                        // read: the checker checks a copy of the hole), or
+                        // the `match &e` of a copyable value: `e`)
+                        put(NODES[n].start, skip_ws(NODES[n].start + 1), "", CC_UNMARKED);
+                    } else {
+                        left(NODES[n].start, CL_AMP);
+                    }
                 }
             }
         }
