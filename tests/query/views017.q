@@ -24,8 +24,8 @@ Vec<Vec<u64>>::push	views()
 Vec<i64>::push	views()
 Vec<u32>::push	views()
 Vec<(i64, u32)>::push	views()
-Vec<str>::push	views()
-Vec<Path>::push	views()
+Vec<str>::push	views() stores(x) declared
+Vec<Path>::push	views() stores(x) declared
 Vec<Result<DirEntry, Error>>::push	views()
 $ views crate --why
 crate::first_word	views(s) declared
