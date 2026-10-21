@@ -17,9 +17,10 @@ use crate::base::{
     FILES, FILE_COUNT, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
 };
 use crate::base::diag::buf_tool_command;
-use crate::front::ast::{FN_CLOSURE, NODES, NodeKind};
+use crate::front::ast::{FN_CLOSURE, NODES, NODE_CAPTURE, NodeKind};
 use crate::front::check::LOCALS;
 use crate::front::closures::{CLOSURES, CLOSURE_COUNT};
+use crate::front::lexer::Tok;
 use crate::front::modules::{STD_MODULE, within_std};
 use crate::front::own::diag::{
     OWN_MOVED, OWN_MOVE_OUT, OWN_PARTIAL, OWN_READONLY, own_begin, own_bytes, own_end, own_help,
@@ -79,6 +80,16 @@ pub fn on_move(p: i64, n: i64, how: i64) {
             check_moved(p, n);
             return;
         }
+        let cap = captured_use(n);
+        if cap > 0 {
+            // (0.20: a closure's capture, reached through its env. A sink
+            // closure's own one moves out under its flag; any other is
+            // still its owner's, or the closure may run again)
+            if cap != n || !sink_capture_move(n) {
+                move_out(p, n, MO_CAPTURED);
+            }
+            return;
+        }
         if how != 0 {
             if PO_RAW {
                 return;
@@ -97,6 +108,58 @@ pub fn on_move(p: i64, n: i64, how: i64) {
         set_bit(dmoved_bits(), p);
         PL_MOVED_BY[p] = n;
         note_move(p, n);
+    }
+}
+
+// (0.20) How move_out says a capture was moved inside its closure.
+const MO_CAPTURED: i64 = -2;
+
+// The capture of a closure that place expression n reaches through the
+// closure's env (closures::rewrite_use: NODE_CAPTURE), or 0.
+fn captured_use(n: i64) -> i64 {
+    unsafe {
+        let mut e = n;
+        while e > 0 {
+            if (NODES[e].p & NODE_CAPTURE) != 0 {
+                return e;
+            }
+            let k = NODES[e].kind;
+            if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+                e = NODES[e].a;
+            } else if k == NodeKind::Unary && NODES[e].op == Tok::Star {
+                e = NODES[e].b;
+            } else {
+                return 0;
+            }
+        }
+        0
+    }
+}
+
+// Capture use n (`(*env).x`) moved in the body of the closure walked: when
+// it is a sink closure's own capture with a flag (closures::finish_closure),
+// the move is kept (drops::capture_move) and allowed.
+fn sink_capture_move(n: i64) -> bool {
+    unsafe {
+        if NODES[n].kind != NodeKind::FieldAccess {
+            return false;
+        }
+        let mut id = -1;
+        for i in 0..CLOSURE_COUNT {
+            if CLOSURES[i].f == CUR_F {
+                id = i;
+            }
+        }
+        if id < 0 || (NODES[CLOSURES[id].node].c & crate::front::ast::CLOSURE_MOVE) == 0 {
+            return false;
+        }
+        let s = CLOSURES[id].env_struct;
+        let flag = crate::front::own::glue::flag_field(s, NODES[n].b);
+        if flag == 0 {
+            return false;
+        }
+        crate::front::own::drops::capture_move(n, flag, s);
+        true
     }
 }
 
@@ -249,6 +312,8 @@ fn move_out(p: i64, n: i64, how: i64) {
             own_str(c"out of a static");
         } else if how == MO_DEREF {
             own_str(c"out of a reference: what it points to keeps its value");
+        } else if how == MO_CAPTURED {
+            own_str(c"out of the closure that captures it: the closure may be called again, and its drop, or its owner's, drops it");
         } else {
             let root = root_of(p);
             let mut at = BYREF.get(PL_RID[root] + 1) - 1;
@@ -294,6 +359,9 @@ fn move_out(p: i64, n: i64, how: i64) {
             try_wrap(n, c"", c".clone()");
         } else if how == -1 {
             own_help(c"copy it ('.clone()'), or match (or loop over) a value the code owns");
+            try_wrap(n, c"", c".clone()");
+        } else if how == MO_CAPTURED {
+            own_help(c"use a copy inside the closure ('.clone()'), or move the value out where the closure is made, not in its body");
             try_wrap(n, c"", c".clone()");
         } else {
             own_help(if !crate::front::conv::strict_at(NODES[n].start) {

@@ -1946,6 +1946,31 @@ match_expr += "match" "&" expr "{" arms "}" ;           (* binds inout accesses 
   another file does. std and the compiler's generated sources are read
   mixed until Phase M migrates them.
 
+## Additions of 0.20: `str`
+
+`str` is std's view of UTF-8 text (`std::string::str`, in the prelude):
+`type str = distinct [u8]`, the one distinct type over a view (and
+`std::path::Path`, over the bytes of a path). Its representation is a
+`[u8]`'s, and the own pass checks it as the view it is. The compiler
+gives it these rules (docs/design/collections-text-io.md §2.3, L3):
+
+- `&str` (and `&mut str`) in a type is `str`, as `&[T]` is `[T]`.
+- A string literal is a `str` where one goes, when its bytes are UTF-8
+  (one with `\x80`..`\xff` escapes that break it stays `[u8]`: the error
+  is `str::from_utf8(..)?`); elsewhere it is a `[u8]`, as before. A
+  literal receiver has `str`'s methods: `"a,b".split(',')`.
+- A `str` goes where a `[u8]` does, for free; `b as str` of bytes is an
+  error outside std (`str::from_utf8(b)?` checks them).
+- `s[i]` is byte i (a `u8`), `s[a..b]` a `str` (byte offsets; not
+  checked at char boundaries in 0.20).
+- `&s` of a String (or a PathBuf) goes where a `str` (a Path) or `[u8]`
+  does, and `&v` of a Vec or a Buf where its slice does: Rust's deref
+  coercions, as `s.as_str()`, `s.as_bytes()`, `v.as_slice()`. A String
+  has its `str`'s methods (`s.trim()` is `s.as_str().trim()`), a PathBuf
+  its Path's.
+- `str` has `[u8]`'s Eq, Ord, Hash, Display, Debug and Clone, and the
+  methods of `impl str` (std::string): none of `[u8]`'s.
+
 ## Importing C headers
 
 `import "stdio.h" as c;` *(0.4; `as`: 0.5, required since 0.8)* reads a C
