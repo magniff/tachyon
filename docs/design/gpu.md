@@ -1052,6 +1052,14 @@ tree. Their essential lines:
   runtime-sized array reads zero (the length is 0), never out of range.
   tests/run/std_gpu_wgsl_reflect.tach checks the reflection and the
   words; tests/wgsl/metalrun binds the buffer exactly so.
+  *Done on g22-metalb-v20:* `shader::Reflection` has `sizes` (`size_binding(g,
+  b)`) and `EntryPoint.sizes_slot` (`sizes_slot(name, stage, slot)`); a
+  bind group records its buffers' bytes, a pipeline each stage's sizes and
+  slot, and a pass gives the words (wgsl::sizes_words's rule, computed
+  from shader::Reflection's own `sizes`) through the hal's new
+  `compute_set_bytes` / `render_set_bytes` before each dispatch and draw
+  (tests/gpu/cases/compute_sizes). Converting a `wgsl::Reflection` to a
+  `shader::Reflection` is still to write.
 
 ## 0.22.0 as built: std::gpu on Metal
 

@@ -310,14 +310,20 @@ impl Device {
                     entries.push(ShaderEntry {
                         name: Buf::from_in(e.name, self.gpa),
                         native: Buf::from_in(e.native, self.gpa), stage: e.stage,
-                        workgroup: e.workgroup
+                        workgroup: e.workgroup, sizes_slot: e.sizes_slot
                     });
                 }
+                assert(src.reflection.sizes.len() <= MAX_SIZES,
+                    "gpu.limits: at most 16 runtime-sized bindings (the sizes buffer)");
+                var sizes: Vec<[i64; 2]> = Vec::new_in(self.gpa);
+                sizes.extend_from_slice(src.reflection.sizes.as_slice());
                 var bindings: Vec<Binding> = Vec::new_in(self.gpa);
                 bindings.extend_from_slice(src.reflection.bindings.as_slice());
                 var inputs: Vec<VertexInput> = Vec::new_in(self.gpa);
                 inputs.extend_from_slice(src.reflection.inputs.as_slice());
-                Ok(Shader { raw: s, entries: entries, bindings: bindings, inputs: inputs })
+                Ok(Shader {
+                    raw: s, entries: entries, bindings: bindings, inputs: inputs, sizes: sizes
+                })
             }
             None => Err(Error::Shader(err)),
         }
@@ -347,7 +353,11 @@ impl Device {
         var err = Buf::new_in(self.gpa);
         match N::create_compute_pipeline(self.raw, shader.raw, e, &err) {
             Some(p) => {
-                var out = ComputePipeline { raw: p, layouts: Layouts::new(), workgroup: wg };
+                assert(e.sizes_slot < 31, "gpu.limits: the sizes buffer's slot is below 31");
+                var out = ComputePipeline {
+                    raw: p, layouts: Layouts::new(), workgroup: wg,
+                    sizes: StageSizes::of(shader, e.sizes_slot)
+                };
                 out.layouts.merge_stage(shader.bindings.as_slice(), ShaderStage::COMPUTE);
                 Ok(out)
             }
@@ -422,7 +432,15 @@ impl Device {
         match N::create_render_pipeline(self.raw, desc.vertex.raw, vs, desc.fragment.raw, fs,
             desc.has_fs, st, &err) {
             Some(p) => {
-                var out = RenderPipeline { raw: p, layouts: Layouts::new(), state: st };
+                // (the sizes buffer's slot stays below the vertex buffers: 30 - i)
+                assert(vs.sizes_slot < 31 - st.buffer_count && fs.sizes_slot < 31,
+                    "gpu.limits: the sizes buffer's slot is below the vertex buffers' (30 - i)");
+                var out = RenderPipeline {
+                    raw: p, layouts: Layouts::new(), state: st,
+                    vs_sizes: StageSizes::of(desc.vertex, vs.sizes_slot),
+                    fs_sizes: if desc.has_fs { StageSizes::of(desc.fragment, fs.sizes_slot) }
+                        else { StageSizes::none() }
+                };
                 out.layouts.merge_stage(desc.vertex.bindings.as_slice(), ShaderStage::VERTEX);
                 if desc.has_fs {
                     out.layouts.merge_stage(desc.fragment.bindings.as_slice(),
@@ -441,6 +459,7 @@ impl Device {
         else "gpu.layout: a bind group has one entry for each binding of its layout"
         {
         var g = N::bind_group_new(self.raw);
+        var bytes = GroupBytes::new();
         for k in 0..layout.count {
             let b = layout.entries[k];
             var found = 0;
@@ -463,6 +482,11 @@ impl Device {
                         let n = if size < 0 { buf.size - offset } else { size };
                         assert(offset >= 0 && n >= b.min_size && offset + n <= buf.size, "gpu.range: a binding reaches past its buffer, or is smaller than the shader's");
                         N::bind_group_buffer(&g, b, buf.raw, offset, n);
+                        assert(bytes.count < MAX_SIZES,
+                            "gpu.limits: at most 16 buffers in a bind group");
+                        bytes.binding[bytes.count] = b.binding;
+                        bytes.bytes[bytes.count] = n;
+                        bytes.count += 1;
                     }
                     Resource::Texture(v) => {
                         assert(b.ty.is_texture(),
@@ -484,7 +508,7 @@ impl Device {
             }
             assert(found == 1, "gpu.layout: each binding of the layout is given once");
         }
-        BindGroup { raw: g, key: layout.key }
+        BindGroup { raw: g, key: layout.key, bytes: bytes }
     }
 
     /// A command encoder.
@@ -655,6 +679,7 @@ pub struct ShaderEntry {
     pub native: Buf,
     pub stage: u32,
     pub workgroup: [i64; 3],
+    pub sizes_slot: i64,
 }
 
 pub struct Shader {
@@ -662,6 +687,7 @@ pub struct Shader {
     pub entries: Vec<ShaderEntry>,
     pub bindings: Vec<Binding>,
     pub inputs: Vec<VertexInput>,
+    pub sizes: Vec<[i64; 2]>,
 }
 
 impl Shader {
@@ -673,7 +699,7 @@ impl Shader {
                 return Some(EntryPoint {
                     name: self.entries[i].name.as_slice(),
                     native: self.entries[i].native.as_slice(), stage: self.entries[i].stage,
-                    workgroup: self.entries[i].workgroup
+                    workgroup: self.entries[i].workgroup, sizes_slot: self.entries[i].sizes_slot
                 });
             }
         }
@@ -786,6 +812,68 @@ pub fn bind_sampler(binding: i64, s: Sampler) -> BindEntry {
 pub struct BindGroup {
     pub raw: backend::BindGroup,
     pub key: u64,
+    bytes: GroupBytes,
+}
+
+// ---- GPU: the sizes buffer (0.22) ----
+
+// The most runtime-sized bindings a stage reads (the sizes buffer's
+// words), and the most buffers a bind group records the bytes of.
+const MAX_SIZES: i64 = 16;
+
+/// A bind group's buffers: each one's binding and the bytes it exposes
+/// (its size minus the offset, or the binding's size).
+#[derive(Clone)]
+struct GroupBytes {
+    count: i64,
+    binding: [i64; 16],
+    bytes: [i64; 16],
+}
+
+impl GroupBytes {
+    fn new() -> GroupBytes { GroupBytes { count: 0, binding: [0; 16], bytes: [0; 16] } }
+}
+
+/// What one stage of a pipeline reads in its sizes buffer: the slot (-1:
+/// none) and the (group, binding) of each word (shader::Reflection's sizes).
+#[derive(Clone)]
+struct StageSizes {
+    slot: i64,
+    count: i64,
+    at: [[i64; 2]; 16],
+}
+
+impl StageSizes {
+    fn none() -> StageSizes { StageSizes { slot: -1, count: 0, at: [[0, 0]; 16] } }
+
+    fn of(shader: Shader, slot: i64) -> StageSizes {
+        var out = StageSizes::none();
+        if slot < 0 { return out; }
+        out.slot = slot;
+        out.count = shader.sizes.len();
+        for i in 0..out.count {
+            out.at[i] = shader.sizes[i];
+        }
+        out
+    }
+
+    /// The words (wgsl::sizes_words's rule): the bytes bound at each
+    /// (group, binding), 0 when nothing is bound there, at most u32's
+    /// largest; how many.
+    fn words(self, groups: [GroupBytes; 4], out: inout [u32; 16]) -> i64 {
+        for i in 0..self.count {
+            let g = self.at[i][0];
+            let b = self.at[i][1];
+            var n = 0;
+            if g >= 0 && g < MAX_BIND_GROUPS {
+                for k in 0..groups[g].count {
+                    if groups[g].binding[k] == b { n = groups[g].bytes[k]; }
+                }
+            }
+            out[i] = if n < 0 { 0 } else if n > 4294967295 { 4294967295u32 } else { n as u32 };
+        }
+        self.count
+    }
 }
 
 // ---- GPU: pipelines (0.22) ----
@@ -794,6 +882,7 @@ pub struct ComputePipeline {
     pub raw: backend::ComputePipeline,
     pub layouts: Layouts,
     pub workgroup: [i64; 3],
+    sizes: StageSizes,
 }
 
 impl ComputePipeline {
@@ -809,6 +898,8 @@ pub struct RenderPipeline {
     pub raw: backend::RenderPipeline,
     pub layouts: Layouts,
     pub state: PipelineState,
+    vs_sizes: StageSizes,
+    fs_sizes: StageSizes,
 }
 
 impl RenderPipeline {
@@ -945,16 +1036,21 @@ pub struct ComputePass {
     raw: backend::ComputeEncoder,
     binds: Bindings,
     max_groups: i64,
+    // the sizes buffer: the pipeline's, and the bound groups' bytes
+    sizes: StageSizes,
+    groups: [GroupBytes; 4],
 }
 
 impl ComputePass {
     pub fn set_pipeline(inout self, p: ComputePipeline) {
         self.binds.set_pipeline(p.layouts);
+        self.sizes = p.sizes;
         N::compute_set_pipeline(&self.raw, p.raw);
     }
 
     pub fn set_bind_group(inout self, i: i64, g: BindGroup) {
         self.binds.set_group(i, g.key);
+        self.groups[i] = g.bytes;
         N::compute_set_bind_group(&self.raw, g.raw);
     }
 
@@ -965,6 +1061,11 @@ impl ComputePass {
         {
         self.binds.ready();
         if x == 0 || y == 0 || z == 0 { return; }
+        if self.sizes.slot >= 0 {
+            var words: [u32; 16] = [0; 16];
+            let n = self.sizes.words(self.groups, &words);
+            N::compute_set_bytes(&self.raw, bytes_of_u32(words[0..n]), self.sizes.slot);
+        }
         N::dispatch(&self.raw, x, y, z);
     }
 }
@@ -1024,6 +1125,10 @@ pub struct RenderPass {
     strides: [i64; 8],
     steps: [StepMode; 8],
     buffer_count: i64,
+    // the sizes buffers: the pipeline's per stage, the bound groups' bytes
+    vs_sizes: StageSizes,
+    fs_sizes: StageSizes,
+    groups: [GroupBytes; 4],
 }
 
 impl RenderPass {
@@ -1037,6 +1142,8 @@ impl RenderPass {
             None => {}
         }
         self.binds.set_pipeline(p.layouts);
+        self.vs_sizes = p.vs_sizes;
+        self.fs_sizes = p.fs_sizes;
         self.buffer_count = st.buffer_count;
         for i in 0..st.buffer_count {
             self.strides[i] = st.buffers[i].stride;
@@ -1047,7 +1154,23 @@ impl RenderPass {
 
     pub fn set_bind_group(inout self, i: i64, g: BindGroup) {
         self.binds.set_group(i, g.key);
+        self.groups[i] = g.bytes;
         N::render_set_bind_group(&self.raw, g.raw);
+    }
+
+    // Before a draw: each stage's sizes buffer, when it reads one.
+    fn set_sizes(inout self) {
+        var words: [u32; 16] = [0; 16];
+        if self.vs_sizes.slot >= 0 {
+            let n = self.vs_sizes.words(self.groups, &words);
+            N::render_set_bytes(&self.raw, ShaderStage::VERTEX, bytes_of_u32(words[0..n]),
+                self.vs_sizes.slot);
+        }
+        if self.fs_sizes.slot >= 0 {
+            let n = self.fs_sizes.words(self.groups, &words);
+            N::render_set_bytes(&self.raw, ShaderStage::FRAGMENT, bytes_of_u32(words[0..n]),
+                self.fs_sizes.slot);
+        }
     }
 
     pub fn set_vertex_buffer(inout self, slot: i64, buf: Buffer, offset: i64 = 0)
@@ -1113,6 +1236,7 @@ impl RenderPass {
         self.binds.ready();
         self.check_buffers(vertices.end, instances.end);
         if vertices.end == vertices.start || instances.end == instances.start { return; }
+        self.set_sizes();
         N::draw(&self.raw, vertices.start, vertices.end - vertices.start, instances.start,
             instances.end - instances.start);
     }
@@ -1132,6 +1256,7 @@ impl RenderPass {
         // shaders' accesses are checked instead (design §2.6)
         self.check_buffers(0, instances.end);
         if indices.end == indices.start || instances.end == instances.start { return; }
+        self.set_sizes();
         N::draw_indexed(&self.raw, indices.start, indices.end - indices.start, base_vertex,
             instances.start, instances.end - instances.start);
     }
@@ -1145,7 +1270,8 @@ impl Encoder {
         {
         var pass = ComputePass {
             raw: N::begin_compute(&self.raw), binds: Bindings::new(),
-            max_groups: self.limits.max_compute_workgroups_per_dimension
+            max_groups: self.limits.max_compute_workgroups_per_dimension,
+            sizes: StageSizes::none(), groups: [GroupBytes::new(); 4]
         };
         f(&pass);
         N::end_compute(&pass.raw);
@@ -1190,6 +1316,9 @@ impl Encoder {
             strides: [0; 8],
             steps: [StepMode::Vertex; 8],
             buffer_count: 0,
+            vs_sizes: StageSizes::none(),
+            fs_sizes: StageSizes::none(),
+            groups: [GroupBytes::new(); 4],
         };
         f(&pass);
         N::end_render(&pass.raw);
