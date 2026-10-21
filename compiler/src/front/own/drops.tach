@@ -1372,6 +1372,9 @@ static var SYM_TDROP: i64 = 0;
 // The statements made for the unit being visited (its prelude).
 static var PRELUDE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
+// (0.24) Whether the expression visit_temps is visiting is borrowed by its parent (`&e`).
+static var TEMP_BORROW: bool = false;
+
 // Whether pattern p binds local l.
 fn binds(p: i64, l: i64) -> bool {
     unsafe {
@@ -1606,7 +1609,10 @@ fn visit_temps(e: i64) {
             return;
         }
         if k == NodeKind::Unary {
+            // (`&make().v`: the field is borrowed, not moved)
+            TEMP_BORROW = NODES[e].op == Tok::Amp;
             visit_temps(NODES[e].b);
+            TEMP_BORROW = false;
             if NODES[e].op == Tok::Amp && is_temp(NODES[e].b) {
                 // (`&value`: a receiver, a let argument; the block gives
                 // the address, as `&` did)
@@ -1618,8 +1624,15 @@ fn visit_temps(e: i64) {
             return;
         }
         if k == NodeKind::FieldAccess {
+            let borrowed = TEMP_BORROW;
+            TEMP_BORROW = borrowed && NODES[NODES[e].a].kind == NodeKind::FieldAccess;
             visit_temps(NODES[e].a);
-            if NODES[e].y != 1 && is_temp(NODES[e].a) {
+            TEMP_BORROW = false;
+            // (0.24: an owned field moved out, `let x = make().v;`, is not
+            // read through the temporary's address, which would drop it
+            // again with the temporary: it moves out of the value, own.partial
+            // when its type implements Drop)
+            if NODES[e].y != 1 && is_temp(NODES[e].a) && (borrowed || !is_owned_type(NODES[e].ty)) {
                 // (`make().id`: read through the address)
                 NODES[e].a = temp_ptr(NODES[e].a);
                 NODES[e].y = 1;
