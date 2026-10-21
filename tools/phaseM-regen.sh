@@ -44,10 +44,7 @@ case "$COMPILER" in /*) ;; *) COMPILER="$(pwd)/$COMPILER" ;; esac
 cd "$ROOT" || exit 2
 
 # FILE  why it is held
-HELD='tests/refactor/v4raw.t fix --values leaves impl Ord cmp(self: *Key) and a closure |x: *i64| for 0.20 std
-tests/refactor/values017.t fix --values / --suggested leave a closure |a: *Stats| against FnMut(Stats, Stats)
-tests/refactor/values017traits.t fix --values leaves impls of Ord, Eq, Display with *T for 0.20 std
-tests/refactor/suggested.t fix --suggested refused: wrap(s) a String where [u8] is wanted (std 0.20 String)'
+HELD='tests/refactor/values017.t a function value with *T parameters (by_count) against 0.20 std's FnMut(Stats, Stats): fix --values leaves it raw (0.20.1)'
 
 LOG=$(mktemp -d "${TMPDIR:-/tmp}/phaseM-regen.XXXXXX")
 echo "phaseM-regen: logs in $LOG"

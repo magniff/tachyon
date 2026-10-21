@@ -8,7 +8,7 @@
 ## recorded here before 0.18.1: `16 9 shape rect true 10 3 true false $7`. What the fix keeps raw is wrapped in
 ## `unsafe` by `fix --only unsafe`, the second try: of the error.)
 $ fix --values --syntax=mixed
-fixed 8 parameters to &mut T, 12 parameters to &T, 2 arguments	main.tach	+19 -19 lines
+fixed 9 parameters to &mut T, 17 parameters to &T, 2 arguments	main.tach	+22 -22 lines
 % cat main.tach
 trait Shape {
     fn area(self: &Self) -> i64;
@@ -42,12 +42,12 @@ impl Counter for Live { fn tick(self: &mut Live) -> i64 { self.n += 1; self.n } 
 
 // std's Ord and Eq declare `&Self`: their impls are spelled so.
 struct Key { k: i64 }
-impl Ord for Key { fn cmp(self: *Key, other: *Key) -> i64 { self.k - other.k } }
-impl Eq for Key { fn eq(self: *Key, other: *Key) -> bool { self.k == other.k } }
+impl Ord for Key { fn cmp(self: &Key, other: &Key) -> i64 { self.k - other.k } }
+impl Eq for Key { fn eq(self: &Key, other: &Key) -> bool { self.k == other.k } }
 
 // Display declares `&Self` and `&mut Fmt` (0.18): spelled so too.
 struct Money { c: i64 }
-impl Display for Money { fn fmt(self: *Money, f: *Fmt) { f.write(f"${self.c}"); } }
+impl Display for Money { fn fmt(self: &Money, f: &mut Fmt) { f.write(f"${self.c}"); } }
 
 fn total<T: Shape>(s: &T) -> i64 { s.area() }
 fn bump<T: Shape>(s: &mut T) { s.grow(1); }
@@ -74,7 +74,7 @@ note fix.none: nothing to fix
 ## (0.20) Then 0.20's spelling, `fix --only conventions` (its 0.19 input
 ## read --syntax=mixed): the chain 0.16 -> 0.19 -> 0.20 prints what 0.16 did.
 $ fix --only conventions --syntax=mixed
-fixed 4 parameters to let, 2 parameters to inout, 14 receivers, 2 '&mut e's to '&e', 3 '&e's to a let, 4 'let mut's / 'mut x's to var	main.tach	+25 -24 lines
+fixed 6 parameters to let, 3 parameters to inout, 17 receivers, 2 '&mut e's to '&e', 3 '&e's to a let, 4 'let mut's / 'mut x's to var	main.tach	+28 -27 lines
 $ main.tach -o prog
 ok: built prog
 % ./prog
