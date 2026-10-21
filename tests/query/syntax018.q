@@ -3,7 +3,7 @@
 ## an item shown with its clauses, a distinct type, test functions.
 $ items
 crate	syntax018/main.tach	14
-std	<std>	564
+std	<std>	571
 crate::tests	syntax018/main.tach	1
 std::ops	<std>	5
 std::iter	<std>	67
@@ -20,7 +20,7 @@ std::collections::btree_node	<std>	56
 std::collections::btree_map	<std>	45
 std::collections::group	<std>	20
 std::io	<std>	7
-std::fmt	<std>	80
+std::fmt	<std>	92
 std::num	<std>	83
 std::num::tables	<std>	4
 std::convert	<std>	2
@@ -35,8 +35,10 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
-std::sync	<std>	2
-std::sync::atomic	<std>	47
+std::sync	<std>	20
+std::sync::atomic	<std>	48
+std::sync::mpsc	<std>	24
+std::thread	<std>	43
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6

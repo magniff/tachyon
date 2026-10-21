@@ -42,7 +42,7 @@ generated header:
 ```console
 $ tachyonc query items
 crate	main.tach	6
-std	<std>	564
+std	<std>	571
 crate::graph	graph.tach	11
 crate::heap	heap.tach	7
 crate::network	network.tach	2
@@ -62,7 +62,7 @@ std::collections::btree_node	<std>	56
 std::collections::btree_map	<std>	45
 std::collections::group	<std>	20
 std::io	<std>	7
-std::fmt	<std>	80
+std::fmt	<std>	92
 std::num	<std>	83
 std::num::tables	<std>	4
 std::convert	<std>	2
@@ -77,8 +77,10 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
-std::sync	<std>	2
-std::sync::atomic	<std>	47
+std::sync	<std>	20
+std::sync::atomic	<std>	48
+std::sync::mpsc	<std>	24
+std::thread	<std>	43
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6
@@ -145,10 +147,10 @@ crate::heap::free_heap	heap.tach:63:8	fn	pub fn free_heap(h: &mut MinHeap)
 crate::heap::is_empty	heap.tach:18:8	fn	pub fn is_empty(h: &MinHeap) -> bool
 crate::heap::pop	heap.tach:35:8	fn	pub fn pop(h: &mut MinHeap) -> Option<Entry>
 crate::graph::edges_from	graph.tach:55:8	fn	pub fn edges_from(g: &Graph, i: i64) -> [Edge]
-std::Vec::filled_in	<std>:1480:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
+std::Vec::filled_in	<std>:1482:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
 crate::heap::push	heap.tach:22:8	fn	pub fn push(h: &mut MinHeap, e: Entry)
-std::Vec::set	<std>:302:12	method	pub fn set(self: &mut Vec<T, A>, i: i64, x: T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
-std::Option::unwrap	<std>:120:12	method	pub fn unwrap(self: Option<T>) -> T requires self.is_some() else "called unwrap on None"
+std::Vec::set	<std>:304:12	method	pub fn set(self: &mut Vec<T, A>, i: i64, x: T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
+std::Option::unwrap	<std>:122:12	method	pub fn unwrap(self: Option<T>) -> T requires self.is_some() else "called unwrap on None"
 note query.budget: over the budget of 600 tokens, left out: calls 2, types or uses 9, callers 1
 try: tachyonc query callers quickest
 try: tachyonc query context quickest --budget 1800
