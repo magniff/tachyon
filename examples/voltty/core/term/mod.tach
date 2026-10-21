@@ -111,6 +111,10 @@ pub struct Term {
     // The extra of the cursor's template, made when first written.
     tmpl_extra: i64,
     tmpl_extra_ok: bool,
+    // Widths of recent characters (a direct-mapped cache over std's
+    // three-level table): the code point at each slot, its width.
+    wcache_key: [u32; 256],
+    wcache_w: [i8; 256],
     // The last character printed, for REP.
     preceding: u32,
     has_preceding: bool,
@@ -156,6 +160,8 @@ impl Term {
             extras: Extras::new_in(gpa),
             tmpl_extra: 0,
             tmpl_extra_ok: false,
+            wcache_key: [0xFFFFFFFF; 256],
+            wcache_w: [0; 256],
             preceding: 0,
             has_preceding: false,
             cell_width: 0,
@@ -311,6 +317,8 @@ impl Term {
 
     // ---- the cursor's template and the extras ----
 
+    #[inline]
+
     fn tmpl_extra_id(self: &mut Term) -> i64 {
         if !self.tmpl_extra_ok {
             let c = self.grid.cursor;
@@ -330,6 +338,8 @@ impl Term {
     pub fn tmpl_changed(self: &mut Term) {
         self.tmpl_extra_ok = false;
     }
+
+    #[inline]
 
     fn collect_if_due(self: &mut Term) {
         if self.extras.wants_collect() {
@@ -430,12 +440,25 @@ impl Term {
         self.grid.cursor.needs_wrap = false;
     }
 
-    // Alacritty's `Term::input`: one character.
-    pub fn input(self: &mut Term, c: u32) {
+    // The columns `c` takes: std::unicode's width (3 counts as 2), or -1.
+    #[inline]
+    fn width(self: &mut Term, c: u32) -> i64 {
+        let k = (c & 255) as i64;
+        if self.wcache_key[k] == c {
+            return self.wcache_w[k] as i64;
+        }
         let mut w = char_width(c);
         if w > 2 {
             w = 2;
         }
+        self.wcache_key[k] = c;
+        self.wcache_w[k] = w as i8;
+        w
+    }
+
+    // Alacritty's `Term::input`: one character.
+    pub fn input(self: &mut Term, c: u32) {
+        let w = self.width(c);
         if w < 0 {
             return;
         }
@@ -461,6 +484,30 @@ impl Term {
             self.wrapline();
         }
         let cols = self.grid.cols;
+        // The common case in one go: not inserting, a character the
+        // charsets leave alone, its cells free of wide characters, room on
+        // the line.
+        let col = self.grid.cursor.col;
+        if (self.mode & INSERT) == 0 && c >= 0x80 && col + w < cols {
+            let line = self.grid.cursor.line;
+            let b = self.grid.start(line) + col;
+            let f0 = self.grid.cells[b].flags;
+            let f1 = self.grid.cells[b + w - 1].flags;
+            if ((f0 | f1) & (WIDE_CHAR | WIDE_CHAR_SPACER)) == 0 {
+                let x = self.tmpl_extra_id();
+                let cur = self.grid.cursor;
+                if w == 1 {
+                    self.grid.cells[b] = make(c, cur.fg, cur.bg, cur.flags, x);
+                } else {
+                    self.grid.cells[b] = make(c, cur.fg, cur.bg, cur.flags | WIDE_CHAR, x);
+                    self.grid.cells[b + 1] = make(32, cur.fg, cur.bg, cur.flags | WIDE_CHAR_SPACER, x);
+                }
+                self.grid.touch(line, col + w);
+                self.grid.damage_line(line, col, col + w - 1);
+                self.grid.cursor.col = col + w;
+                return;
+            }
+        }
         if (self.mode & INSERT) != 0 && self.grid.cursor.col + w < cols {
             let line = self.grid.cursor.line;
             let start = self.grid.cursor.col;
@@ -512,6 +559,26 @@ impl Term {
     // DEC graphics charset: then it is done byte by byte.
     fn ascii_run(self: &mut Term, run: [u8]) {
         let n = run.len;
+        if n == 1 && (self.mode & INSERT) == 0 && !self.grid.cursor.needs_wrap
+            && self.grid.cursor.charsets[self.active_charset] == 0 {
+            // One byte (after a cursor motion, say): written directly.
+            let line = self.grid.cursor.line;
+            let col = self.grid.cursor.col;
+            let i = self.grid.start(line) + col;
+            if (self.grid.cells[i].flags & (WIDE_CHAR | WIDE_CHAR_SPACER)) == 0 {
+                let x = self.tmpl_extra_id();
+                let cur = self.grid.cursor;
+                self.grid.cells[i] = make(run[0] as u32, cur.fg, cur.bg, cur.flags, x);
+                self.grid.touch(line, col + 1);
+                self.grid.damage_line(line, col, col);
+                if col + 1 < self.grid.cols {
+                    self.grid.cursor.col = col + 1;
+                } else {
+                    self.grid.cursor.needs_wrap = true;
+                }
+                return;
+            }
+        }
         if (self.mode & INSERT) != 0 || self.grid.cursor.charsets[self.active_charset] != 0 {
             for b in run {
                 self.input(b as u32);
@@ -577,6 +644,8 @@ impl Term {
 
     // ---- the cursor and the lines ----
 
+    #[inline]
+
     pub fn linefeed(self: &mut Term) {
         let next = self.grid.cursor.line + 1;
         if next == self.region_bot {
@@ -585,6 +654,8 @@ impl Term {
             self.grid.cursor.line += 1;
         }
     }
+
+    #[inline]
 
     pub fn carriage_return(self: &mut Term) {
         self.grid.cursor.col = 0;
@@ -772,10 +843,69 @@ impl Term {
 }
 
 impl Perform for Term {
+    #[inline]
     fn print(self: &mut Term, c: u32) {
         self.preceding = c;
         self.has_preceding = true;
         self.input(c);
+    }
+
+    // The fast path of `input` for each, the cursor and the row in locals
+    // while nothing unusual comes.
+    fn print_chars(self: &mut Term, run: [u32]) {
+        self.preceding = run[run.len - 1];
+        self.has_preceding = true;
+        let cols = self.grid.cols;
+        let mut k = 0;
+        while k < run.len {
+            if (self.mode & INSERT) != 0 || self.grid.cursor.needs_wrap {
+                self.input(run[k]);
+                k += 1;
+                continue;
+            }
+            let x = self.tmpl_extra_id();
+            let cur = self.grid.cursor;
+            let line = cur.line;
+            let start = cur.col;
+            let mut col = start;
+            let b = self.grid.start(line);
+            let a1 = make(32, cur.fg, cur.bg, cur.flags, x);
+            let wide = cur.flags | WIDE_CHAR;
+            let spacer = make(32, cur.fg, cur.bg, cur.flags | WIDE_CHAR_SPACER, x);
+            while k < run.len {
+                let c = run[k];
+                let w = self.width(c);
+                if w <= 0 || col + w >= cols {
+                    break;
+                }
+                let f = self.grid.cells[b + col].flags | self.grid.cells[b + col + w - 1].flags;
+                if (f & (WIDE_CHAR | WIDE_CHAR_SPACER)) != 0 {
+                    break;
+                }
+                if w == 1 {
+                    let mut cell = a1;
+                    cell.set_char(c);
+                    self.grid.cells[b + col] = cell;
+                } else {
+                    let mut cell = a1;
+                    cell.set_char(c);
+                    cell.flags = wide;
+                    self.grid.cells[b + col] = cell;
+                    self.grid.cells[b + col + 1] = spacer;
+                }
+                col += w;
+                k += 1;
+            }
+            if col > start {
+                self.grid.touch(line, col);
+                self.grid.damage_line(line, start, col - 1);
+                self.grid.cursor.col = col;
+            }
+            if k < run.len {
+                self.input(run[k]);
+                k += 1;
+            }
+        }
     }
 
     fn print_ascii(self: &mut Term, run: [u8]) {

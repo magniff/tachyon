@@ -32,6 +32,13 @@ pub trait Perform {
     // A run of printable ASCII (0x20..0x7E), at least one byte.
     fn print_ascii(self: &mut Self, run: [u8]);
 
+    // A run of characters (U+00A0 and up): `print` of each by default.
+    fn print_chars(self: &mut Self, run: [u32]) {
+        for c in run {
+            self.print(c);
+        }
+    }
+
     // A C0 or C1 control.
     fn execute(self: &mut Self, b: u8);
 
@@ -164,6 +171,13 @@ impl Parser {
             if self.state == GROUND {
                 i = self.ground(p, bytes, i);
             } else {
+                if self.state == CSI_PARAM || self.state == CSI_ENTRY {
+                    let j = self.csi_params(bytes, i);
+                    if j > i {
+                        i = j;
+                        continue;
+                    }
+                }
                 self.change_state(p, bytes[i]);
                 i += 1;
             }
@@ -181,6 +195,13 @@ impl Parser {
             if self.state == GROUND {
                 i = self.ground(p, bytes, i);
             } else {
+                if self.state == CSI_PARAM || self.state == CSI_ENTRY {
+                    let j = self.csi_params(bytes, i);
+                    if j > i {
+                        i = j;
+                        continue;
+                    }
+                }
                 self.change_state(p, bytes[i]);
                 i += 1;
             }
@@ -222,14 +243,59 @@ impl Parser {
                 p.print(0x7F);
                 i += 1;
             } else {
-                i = self.ground_utf8(p, bytes, i);
+                i = self.ground_text(p, bytes, i);
             }
+        }
+        i
+    }
+
+    // From a byte of 0x80 and up: the run of complete, valid sequences
+    // there that are not C1 controls, decoded and handed over in batches
+    // (`print_chars`); then anything else as `ground_utf8` does.
+    fn ground_text<P: Perform>(self: &mut Parser, p: &mut P, bytes: [u8], from: i64) -> i64 {
+        let n = bytes.len;
+        let mut i = from;
+        let mut buf: [u32; 64] = [0; 64];
+        let mut k = 0;
+        while i < n {
+            let lead = bytes[i];
+            let len = utf8::seq_len(lead);
+            if len == 0 || i + len > n {
+                break;
+            }
+            if !utf8::continues(lead, 1, bytes[i + 1]) {
+                break;
+            }
+            if len > 2 && !utf8::continues(lead, 2, bytes[i + 2]) {
+                break;
+            }
+            if len > 3 && !utf8::continues(lead, 3, bytes[i + 3]) {
+                break;
+            }
+            let c = utf8::decode(bytes[i..i + len], len);
+            if c <= 0x9F {
+                break;
+            }
+            buf[k] = c;
+            k += 1;
+            i += len;
+            if k == 64 {
+                p.print_chars(buf[0..64]);
+                k = 0;
+            }
+        }
+        if k > 0 {
+            p.print_chars(buf[0..k]);
+        }
+        if i < n && bytes[i] >= 0x80 {
+            return self.ground_utf8(p, bytes, i);
         }
         i
     }
 
     // A byte of 0x80 and up in the ground state: one UTF-8 sequence, an
     // invalid one, or the start of one cut by the end of `bytes`.
+#[inline]
     fn ground_utf8<P: Perform>(self: &mut Parser, p: &mut P, bytes: [u8], i: i64) -> i64 {
         let lead = bytes[i];
         let len = utf8::seq_len(lead);
@@ -301,10 +367,32 @@ impl Parser {
         to_copy
     }
 
+    // In CSI_ENTRY or CSI_PARAM: the digits and `;` from `from`, as
+    // `csi_entry` and `csi_param` take them one by one; where it stopped.
+    #[inline]
+    fn csi_params(self: &mut Parser, bytes: [u8], from: i64) -> i64 {
+        let mut i = from;
+        while i < bytes.len {
+            let b = bytes[i];
+            if b >= '0' && b <= '9' {
+                self.param_digit(b);
+            } else if b == ';' {
+                self.next_param();
+            } else {
+                break;
+            }
+            self.state = CSI_PARAM;
+            i += 1;
+        }
+        i
+    }
+
+    #[inline]
     fn intermediates(self: &mut Parser) -> [u8] {
         self.intermediates[0..self.intermediate_len]
     }
 
+    #[inline]
     fn reset_params(self: &mut Parser) {
         self.intermediate_len = 0;
         self.ignoring = false;
@@ -312,6 +400,7 @@ impl Parser {
         self.params.clear();
     }
 
+    #[inline]
     fn collect(self: &mut Parser, b: u8) {
         if self.intermediate_len == MAX_INTERMEDIATES {
             self.ignoring = true;
@@ -322,6 +411,7 @@ impl Parser {
     }
 
     // `:`: the next sub-parameter.
+    #[inline]
     fn subparam(self: &mut Parser) {
         if self.params.is_full() {
             self.ignoring = true;
@@ -332,6 +422,7 @@ impl Parser {
     }
 
     // `;`: the next parameter.
+    #[inline]
     fn next_param(self: &mut Parser) {
         if self.params.is_full() {
             self.ignoring = true;
@@ -342,6 +433,7 @@ impl Parser {
     }
 
     // A digit of the current parameter, saturating at 65535.
+    #[inline]
     fn param_digit(self: &mut Parser, b: u8) {
         if self.params.is_full() {
             self.ignoring = true;
