@@ -878,6 +878,17 @@ suite, with `--regen` the transcripts regenerated; and what is left,
 `git grep -i tachyon` counted by file (target/rename-vole/leftovers.txt).
 `--dry-run` prints each step's plan.
 
+The dry run of 2026-10-21 (on release-0.21 and these tools, in a scratch
+worktree): 1753 files renamed, 6358 mentions; 1149 programs built the
+same; the renamed suite passed but 7 cases (1653 of 1662), each a value
+computed from the word itself (`c"tachyon"[6]`, the padding of
+`{name:>9}`, a hash of "tachyon", "7 bytes"): their expectations are
+changed by hand in 0.24, or their sample word kept. `git grep -i
+tachyon` then finds 28 files, all kept on purpose: the seed, the eval
+and tool-gap records, the notes and bootstrap entries of the releases up
+to 0.23, the cache formats' magic words (`tachyong`, `tachyonq`), the
+rename's own test and the script.
+
 ## Diagnostics
 
 | code | severity | exit | when | try |
