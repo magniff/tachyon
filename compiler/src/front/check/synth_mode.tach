@@ -10,8 +10,8 @@ use crate::base::diag::{
     err_int, err_str, err_sym, err_try_fmt,
 };
 use crate::front::ast::{
-    NODES, NODE_CHECKED, NODE_RAW, NODE_REF_MUT, NodeKind, REPR_UNION, child, list_begin, list_end,
-    list_push, new_node,
+    CONV_NEW, NODES, NODE_CHECKED, NODE_RAW, NODE_REF_MUT, NodeKind, REPR_UNION, child, list_begin,
+    list_end, list_push, new_node,
 };
 use crate::front::ast::NodeKind::{
     Arm, Array, Assign, Binary, Block, Bool, Break, CStr, Call, Cast, Char, Closure, Continue,
@@ -19,7 +19,7 @@ use crate::front::ast::NodeKind::{
     PatLit, Path, Range, Repeat, Return, Str, StructLit, Tuple, TupleField, TyArray, TyFn, TyName,
     TyNever, TyPtr, TySlice, TyTuple, TyUnit, Unary, Unit, VariantLit, VecOp, While,
 };
-use crate::front::check::{Res, is_std_named, lookup_local, type_error, type_error_got};
+use crate::front::check::{LOCALS, Res, is_std_named, lookup_local, type_error, type_error_got};
 use crate::front::check::args::misplaced_named_arg;
 use crate::front::check::assign::{check_assign, is_place};
 use crate::front::check::body::{
@@ -918,6 +918,9 @@ fn synth_unary(n: i64) -> i64 {
             return ty;
         }
         if op == Tok::Star {
+            if star_on_access(n, operand) {
+                return synth_expr(n);
+            }
             let ty = synth_expr(operand);
             // (0.17, issue #1: `(*f)(10)` on a fn value, C's habit: the
             // value is called as it is)
@@ -978,6 +981,30 @@ fn synth_unary(n: i64) -> i64 {
             return ptr_to(ty);
         }
         ref_to(ty, if mutable { REF_MUT } else { REF_SHARED })
+    }
+}
+
+// (0.20) `*x` where x is an access (a let or inout parameter, an `inout`
+// local): conv.rust, `*` is for raw pointers; n becomes x, the value.
+fn star_on_access(n: i64, operand: i64) -> bool {
+    unsafe {
+        if NODES[operand].kind != NodeKind::Ident || (NODES[operand].p & CONV_NEW) != 0 {
+            return false;
+        }
+        let l = lookup_local(NODES[operand].a);
+        if l.is_none() || !LOCALS[l.unwrap()].access {
+            return false;
+        }
+        let text = SRC[NODES[operand].start..NODES[operand].end];
+        let b = buf_new();
+        buf_bytes(b, "'");
+        buf_bytes(b, text);
+        buf_bytes(b, "' is an access, used as its value: '");
+        buf_bytes(b, text);
+        buf_bytes(b, "' (`*` is for raw pointers)");
+        crate::front::conv::rust_spelling(NODES[n].start, NODES[operand].end, buf_slice(b), text);
+        NODES[n] = NODES[operand];
+        true
     }
 }
 

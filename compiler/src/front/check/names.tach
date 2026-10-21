@@ -11,7 +11,7 @@ use crate::base::diag::{
     err_fixable, err_help, err_help_sym, err_pos, err_str, err_sym, err_try,
 };
 use crate::front::assoc::ensure_checked;
-use crate::front::ast::{FN_UNSAFE, NODES};
+use crate::front::ast::{CONV_NEW, FN_UNSAFE, NODES, NodeKind, new_node};
 use crate::front::ast::NodeKind::{CStr, Path, Str};
 use crate::front::check::{CHECK_UNCHECKED, LOCALS, Res, lookup_local, name_error};
 use crate::front::check::synth_mode::synth_expr;
@@ -20,6 +20,7 @@ use crate::front::cimport::c_import_skip_reason;
 use crate::front::closures::note_local_use;
 use crate::front::generics::{TPL_NONE, env_lookup, instance_of, targ_count_error, template_of_key};
 use crate::front::generics::instantiate::{fn_instance, push_written_targs};
+use crate::front::lexer::Tok;
 use crate::front::modules::{
     CUR_MOD, C_MODULE, MODULES, STD_MODULE, item_key_if_known, module_count,
 };
@@ -51,6 +52,11 @@ pub fn synth_name(n: i64) -> i64 {
                     NODES[n].res = Res::Local;
                     NODES[n].y = local;
                     note_local_use(n, local);
+                    if LOCALS[local].access && (NODES[n].p & CONV_NEW) == 0 {
+                        // (0.20) an access is used as the value it designates:
+                        // `x` is `*x` (`&x`: `&*x`, a reborrow), conventions.md D12
+                        return access_use(n);
+                    }
                     return LOCALS[local].ty;
                 }
                 Option::None => {}
@@ -154,6 +160,25 @@ pub fn synth_name(n: i64) -> i64 {
             name_error(NODES[n].start, c"'", name, c"' is a type, not a value");
         }
         unknown_name_error(NODES[n].start, c"undefined variable '", name)
+    }
+}
+
+// (0.20) Ident n, a use of an access local (front/check: Local.access),
+// becomes `*n`: the place it designates. (The Ident inside is flagged
+// CONV_NEW, so that it is the reference.)
+fn access_use(n: i64) -> i64 {
+    unsafe {
+        let inner = new_node(NodeKind::Ident, NODES[n].start, NODES[n].end);
+        NODES[inner] = NODES[n];
+        NODES[inner].p |= CONV_NEW;
+        NODES[n].kind = NodeKind::Unary;
+        NODES[n].op = Tok::Star;
+        NODES[n].a = 0;
+        NODES[n].b = inner;
+        NODES[n].count = 0;
+        NODES[n].list = 0;
+        NODES[n].p = NODES[n].p & NODE_RESOLVED;
+        synth_expr(n)
     }
 }
 
