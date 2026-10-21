@@ -41,6 +41,7 @@
     else if (key == "NO-EXTRA-FLAGS") noextra = 1
     else if (key == "REQUIRES") requires = requires " " value
     else if (key == "CROSS") cross = value
+    else if (key == "TIMEOUT") tmult = value + 0
     # (0.19: every ASM line, for the CROSS target's)
     if (substr(key, 1, 4) == "ASM(" || substr(key, 1, 8) == "ASM-NOT(") {
         allkey[nall] = key; allval[nall] = value; nall++
@@ -70,6 +71,7 @@ END {
     printf "%d", link > (dir "/link")
     printf "%d", noextra > (dir "/noextra")
     printf "%s", requires > (dir "/requires")
+    printf "%d", (tmult > 0 ? tmult : 1) > (dir "/timeout")
     # (0.19: the CROSS target and its ASM lines)
     crossasms = ""
     if (cross != "" && cross != target)

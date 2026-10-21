@@ -67,6 +67,8 @@
 #                        ASM(T)'s line; checked only when testing T
 #   // ASM-NOT(T): text  no line containing text between the neighbouring
 #                        ASM(T)s' lines
+#   // TIMEOUT: n why   (0.22) the case may run n times the time limit (a
+#                        long one at -O0, under the gate's load)
 #   // CROSS: T          (0.19) the case is also compiled for target T (at the
 #                        suite's level, to an object: the compiler's own
 #                        assembler; then -S at the CHECK-OPT level, matched
@@ -276,7 +278,9 @@ run_program() {
         exec ./prog $(sed "s|@ROOT@|$ROOT|g" args) <stdin >stdout 2>stderr
     ) &
     pid=$!
-    (sleep "$TIMEOUT" && kill -9 "$pid" 2>/dev/null) >/dev/null 2>&1 &
+    # (0.22: a case's TIMEOUT directive multiplies the limit)
+    limit=$((TIMEOUT * $(cat "$dir/timeout" 2>/dev/null || echo 1)))
+    (sleep "$limit" && kill -9 "$pid" 2>/dev/null) >/dev/null 2>&1 &
     watchdog=$!
     wait "$pid"
     RC=$?
