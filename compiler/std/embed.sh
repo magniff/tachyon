@@ -1,7 +1,8 @@
 #!/bin/sh
 # Makes compiler/src/front/stdsrc.tach from std's files: the standard
 # library's source, built into the compiler as a function that writes it
-# to a buffer (string literals cannot span lines, so one call per line).
+# to a buffer (string literals cannot span lines: a call for each few
+# lines, 0.21).
 #
 # std is a crate of its own (0.20): its root module is compiler/std/std.tach
 # and the files appended to it, in this order (ROOT_FILES, those of them
@@ -95,8 +96,16 @@ walk std "" $ROOT_FILES
 wc -c <"$text" | tr -d ' ' >>"$map"
 
 # (sed, not awk: awks differ on backslashes in replacements.)
+# (0.21) Up to about 2000 bytes of lines in one call: a program's std is
+# 20 thousand lines, and a call for each cost more than reading it.
 lines() {
-    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/        buf_str(out, c"/' -e 's/$/\\n");/'
+    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' |
+        LC_ALL=C awk '{
+            if (n > 0 && n + length($0) > 2000) { print "        buf_str(out, c\"" acc "\");"; acc = ""; n = 0 }
+            acc = acc $0 "\\n"
+            n += length($0) + 2
+        }
+        END { if (n > 0) print "        buf_str(out, c\"" acc "\");" }'
 }
 # The index of std's text on stdin (index.awk), as lines of code.
 index() {
