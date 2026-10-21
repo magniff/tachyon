@@ -11,20 +11,20 @@ so a function's signature says whether it allocates.
 
 ```tach
 fn squares(n: i64, gpa: Gpa) -> Vec<i64> {   // allocates: takes the allocator
-    let mut v: Vec<i64> = Vec::with_capacity_in(n, gpa);
+    var v: Vec<i64> = Vec::with_capacity_in(n, gpa);
     for i in 0..n { v.push(i * i); }
     v
 }
 
-fn total(v: &Vec<i64>) -> i64 {              // grows nothing: no allocator
+fn total(v: Vec<i64>) -> i64 {               // grows nothing: no allocator
     v.iter().sum()
 }
 
 fn main(gpa: Gpa) -> i32 {                    // or main(argc, argv, gpa)
-    let mut v = squares(4, gpa);
+    var v = squares(4, gpa);
     v.push(100);                              // the Vec's own allocator
-    let mut b = Buf::new_in(gpa);
-    b.push_int(total(&v));
+    var b = Buf::new_in(gpa);
+    b.push_int(total(v));
     let words: Vec<i64> = (1..4).map(|x| x * 10).collect_in(gpa);
     println(f"{b.as_slice()} {words:?}");
     0
@@ -34,7 +34,9 @@ fn main(gpa: Gpa) -> i32 {                    // or main(argc, argv, gpa)
 114 [10, 20, 30]
 ```
 
-`Gpa` is a zero-sized value, copied freely; only `main` gets one (std's
+`Gpa` is a zero-sized value, copied freely: an allocator is passed as a
+let parameter (`gpa: Gpa`, no convention to write), and every container
+made from it shares it. Only `main` gets one (std's
 types are `#[sealed]`: no `Gpa {}` outside std). Each 0.15 form that
 allocated has an `_in` form taking the allocator last: `Vec::new_in(a)`,
 `with_capacity_in(n, a)`, `filled_in(n, x, a)`, `Buf::new_in(a)`,
@@ -65,11 +67,12 @@ parameter's default) is an error naming where it allocates: keep a
 `Vec<T, A: Allocator = Gpa>`, `Buf<A = Gpa>`, `HashMap<K, V, A = Gpa>`:
 the allocator is a type parameter with a default, so `Vec<i64>` is
 `Vec<i64, Gpa>` (and `Vec<i64>` costs what it did: `Gpa` takes no
-bytes). Code generic over the allocator names it; code that only reads
-takes a slice:
+bytes). Code generic over the allocator names it, and changes the
+container through an `inout` parameter (called with `&v`); code that
+only reads takes a slice:
 
 ```tach
-fn fill<A: Allocator>(v: &mut Vec<i64, A>, n: i64) {
+fn fill<A: Allocator>(v: inout Vec<i64, A>, n: i64) {
     for i in 0..n { v.push(i); }
 }
 
@@ -78,8 +81,8 @@ fn sum(s: [i64]) -> i64 {                     // any Vec's as_slice()
 }
 
 fn main(gpa: Gpa) -> i32 {
-    let mut v: Vec<i64> = Vec::new_in(gpa);
-    fill(&mut v, 5);
+    var v: Vec<i64> = Vec::new_in(gpa);
+    fill(&v, 5);
     println(sum(v.as_slice()));
     0
 }
@@ -105,7 +108,7 @@ not drop yet: `unsafe { a.free_all(); }` returns its memory, 0.17),
 ```tach
 fn longest(words: [[u8]], gpa: Gpa) -> i64 {
     arena_scope(gpa, |a| {
-        let mut lens: Vec<i64, ScopedArena> = Vec::new_in(a);
+        var lens: Vec<i64, ScopedArena> = Vec::new_in(a);
         for w in words { lens.push(w.len()); }
         lens.iter().max().unwrap_or(0)        // an i64 leaves, the Vec does not
     })

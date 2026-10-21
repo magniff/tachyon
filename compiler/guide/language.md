@@ -1,13 +1,15 @@
-# The language, the long form (tachyon 0.17)
+# The language, the long form (tachyon 0.20)
 
-Tachyon is a compiled systems language. Its syntax is close to Rust's,
-its model close to C's: structs, enums with exhaustive `match`, traits
-and generics (monomorphized), modules, checked slices, raw pointers,
-`unsafe`, exact C interop. There is no borrow checker, no lifetimes, no
-destructors, no macros. Closures and iterators are new in 0.14; `?`,
-f-strings, widening, `#[derive]`, named and default arguments in 0.15;
-explicit allocation and effects in 0.16. Safe code has no undefined
-behaviour. This text matches this compiler;
+Tachyon is a compiled systems language of values: structs, enums with
+exhaustive `match`, traits and generics (monomorphized), modules,
+checked slices, `unsafe` raw pointers, exact C interop. A value has one
+owner and is dropped at the end of its scope; a function says what it
+does with each parameter, `let` (the default: it reads it), `inout`
+(it changes it: the caller writes `&x`) or `sink` (it takes it), and
+the compiler checks that no two accesses of a value conflict. There
+are no lifetimes to write and no macros. Nothing allocates without an
+allocator, and every function's effects are known (0.16). Safe code
+has no undefined behaviour. This text matches this compiler;
 `tachyonc guide` is the short core of this text, `tachyonc guide TOPIC`
 the detail (topics at the end); `tachyonc guide --full` prints this
 topic with std's API in its place.
@@ -40,14 +42,15 @@ on the command line make one program; `mod name;` loads `name.tach`.
 | Rust | tachyon |
 |---|---|
 | `String`, `&str` | `[u8]`, a byte slice: `"text"` is a `[u8]`; build text with `std::Buf`; `c"text"` is a NUL-terminated `*u8` for C |
-| `&T`, `&mut T`, `Box<T>` | `&T`, `&mut T` (0.17): `&x`, `&mut x`, checked and safe; no lifetimes; `*T` is the raw pointer: dereferencing it needs `unsafe`, parameter or not (0.18.1); no `Box` |
-| `fn f(&self)`, `fn f(&mut self)` | `fn f(self: &T)`, `fn f(self: &mut T)` (0.17); `fn f(self: T)` takes the value (an owned one moves) |
+| `x: &T`, `x: &mut T`, `x: T` | conventions (0.20): `x: T` (let: read; called `f(v)`), `x: inout T` (called `f(&v)`), `x: sink T` (taken; an owned argument moves); no lifetimes; `*T` is the raw pointer: dereferencing it needs `unsafe`; no `Box` (`guide rust`: the whole mapping) |
+| `fn f(&self)`, `fn f(&mut self)`, `fn f(self)` | `fn f(self)`, `fn f(inout self)`, `fn f(sink self)` |
+| `let mut x`, `move \|\|` | `var x`, `sink \|\|`; `inout r = &x;` keeps an access, used as `x` itself (no `*r`) |
 | `use m::*;` | not allowed: `use m::{a, b};`, or the path `m::a` |
 | `println!("{}", x)`, `format!` | no macros: `println(f"x = {x:>4} {v:?}")`, `format_in(f"..", gpa)` (a `Buf`) (`guide formatting`) |
 | `Vec::new()`, a global allocator | `Vec::new_in(gpa)`: nothing allocates without an allocator; `gpa` comes from `fn main(gpa: Gpa)`, passed down as a parameter (0.16, `guide allocators`) |
 | `Box<T>`, arenas | a `Vec`; `arena_scope(gpa, \|a\| ..)` frees all it allocated at its end; `--check-alloc` traps a use after free |
 | `const fn`, purity | `#[pure]`, `#[no_alloc]`: checked declarations; `tachyonc query effects f` (0.16, `guide effects`) |
-| `v[i]` on a `Vec` | the same (0.17): `v[i]`, `v[i] = x`, `v[a..b]` index its slice, checked, also through a reference (`v: &mut Vec<i64>`); `v.get(i)`, `v.set(i, x)` too |
+| `v[i]` on a `Vec` | the same (0.17): `v[i]`, `v[i] = x`, `v[a..b]` index its slice, checked, also through an access (`v: inout Vec<i64>`); `v.get(i)`, `v.set(i, x)` too |
 | closures, `.iter().map()` | the same (0.14): `v.iter().map(\|x\| x * k).sum()`; `F: Fn(i64) -> i64` bounds; no `dyn Fn`, `iter_mut` (`guide closures`, `guide iterators`) |
 | `x?` | the same on `Option` and `Result` (0.15); `impl From<E> for F` converts the error; `main` may return `Result<(), E>` (`guide conversions`) |
 | `impl Trait for T`, `T: Trait` | the same; `type Item;` associated types (0.14); `#[derive(Eq, Ord, Hash, Debug, Clone)]` (0.15); no `dyn`, `where`, supertraits |
@@ -83,12 +86,12 @@ let s = "bytes";          // [u8]: s.len() (an i64), s[0], s[1..3]
 let p = c"for C";         // *u8, NUL-terminated
 let t = (1, "two");       // a tuple: t.0, t.1
 let arr = [0; 8];         // [i64; 8]; also [1, 2, 3]; arr[i] is checked
-let mut n = a as i32;     // `as` converts numbers; nothing converts implicitly
+var n = a as i32;         // `as` converts numbers; nothing converts implicitly
 n += c as i32 + b as i32 + e as i32;
 ```
 
-Bindings are immutable unless `mut`. Shadowing (`let x = x + 1;`) is
-allowed. `const N: i64 = 10;` and `static mut COUNT: i64 = 0;` are items
+`let` bindings are immutable, `var` ones mutable. Shadowing (`let x = x
++ 1;`) is allowed. `const N: i64 = 10;` and `static var COUNT: i64 = 0;` are items
 (statics are safe to use: there are no threads). Integers wrap, `x / 0 ==
 0`, `x % 0 == x`; indexing, slicing, `unwrap` and casts to enums are
 checked (a message, exit 101): `guide types`.
@@ -105,12 +108,12 @@ fn greet(name: [u8], times: i64 = 1, sep: [u8] = " ") {   // defaults (0.15)
 }
 
 fn main() -> i32 {
-    let mut total = 0;
+    var total = 0;
     for i in 0..10 {              // 0..10 and 0..=9: ranges exist only in `for`
         if i % 2 == 0 { continue; }
         total += i;
     }
-    let mut k = 0;
+    var k = 0;
     while k < 3 { k += 1; }
     let found = loop {            // loop's value comes from `break value`
         k += 1;
@@ -134,6 +137,50 @@ hi ann hi bob! hi bob! positive
 The last expression of a block, without `;`, is its value; `if`, `match`,
 `loop` and blocks are expressions. There are no nested functions.
 
+## Parameters: let, inout, sink
+
+```tach
+struct Account { balance: i64, log: Vec<i64> }
+
+fn transfer(from: inout Account, to: inout Account, amount: i64) -> bool {
+    if from.balance < amount { return false; }
+    from.balance -= amount;
+    to.balance += amount;
+    from.log.push(-amount);
+    to.log.push(amount);
+    true
+}
+
+fn report(a: Account, out: inout i64) { out += a.balance; }   // an access is its value
+
+fn keep(all: inout Vec<Account>, a: sink Account) { all.push(a); }
+
+fn main(gpa: Gpa) {
+    var a = Account { balance: 100, log: Vec::new_in(gpa) };
+    var b = Account { balance: 5, log: Vec::new_in(gpa) };
+    transfer(&a, &b, 30);                 // the call shows what changes
+    var sum = 0;
+    report(a, &sum);
+    report(b, &sum);
+    var all: Vec<Account> = Vec::new_in(gpa);
+    keep(&all, a);                        // a moves: dead from here
+    println(f"{sum} {all[0].log.len()} {b.balance}");
+}
+```
+```out
+105 1 35
+```
+
+- `let` (nothing written) reads: a plain value (`i64`, `Point`) is
+  copied, an owned one (`Vec`, a struct with one) is borrowed for the
+  call, so the caller keeps it. `inout` changes the caller's place,
+  exclusively: `transfer(&a, &a, 1)` is `own.conflict`. `sink` takes the
+  value: the callee owns it, may change it, and drops it.
+- Inside the function every parameter is used as the value: `out +=
+  a.balance`, `from.log.push(x)`; there is no `*`.
+- `inout r = &a;` is a local access to `a`, passed on as `f(&r)`; `let`
+  and `var` locals own their value (`guide memory`).
+
 ## Structs, enums, match, methods
 
 ```tach
@@ -143,8 +190,8 @@ enum Shape { Circle(Point, i64), Rect { min: Point, max: Point }, Empty }
 
 impl Point {
     fn new(x: i64, y: i64) -> Point { Point { x: x, y: y } }   // Point::new(1, 2)
-    fn shift(self: &mut Point, dx: i64) { self.x += dx; }       // writes through self
-    fn sum(self: Point) -> i64 { self.x + self.y }              // a copy
+    fn shift(inout self, dx: i64) { self.x += dx; }             // writes through self
+    fn sum(self) -> i64 { self.x + self.y }                     // a copy
 }
 
 fn area(s: Shape) -> i64 {
@@ -156,8 +203,8 @@ fn area(s: Shape) -> i64 {
 }
 
 fn main() -> i32 {
-    let mut p = Point::new(1, 2);
-    p.shift(10);                          // passes &mut p
+    var p = Point::new(1, 2);
+    p.shift(10);                          // lends p inout: p is a var
     let shapes = [Shape::Rect { min: Point::new(0, 0), max: p }, Shape::Circle(p, 2),
         Shape::Empty];
     for s in shapes {
@@ -194,14 +241,14 @@ by field; `[u8]` compares by bytes, a `Vec` or `HashMap` by contents.
 
 ```tach
 trait Area {
-    fn area(self: &Self) -> i64;
-    fn twice(self: &Self) -> i64 { 2 * self.area() }   // a default method
+    fn area(self) -> i64;
+    fn twice(self) -> i64 { 2 * self.area() }          // a default method
 }
 
 struct Square { side: i64 }
 
 impl Area for Square {
-    fn area(self: &Square) -> i64 { self.side * self.side }
+    fn area(self) -> i64 { self.side * self.side }
 }
 
 fn total<T: Area>(items: [T]) -> i64 {    // bounds: T: A + B
@@ -211,7 +258,7 @@ fn total<T: Area>(items: [T]) -> i64 {    // bounds: T: A + B
 struct Pair<T> { a: T, b: T }
 
 impl<T: Ord> Pair<T> {
-    fn max(self: &Pair<T>) -> T { if self.a > self.b { self.a } else { self.b } }
+    fn max(self) -> T { if self.a > self.b { self.a } else { self.b } }
 }
 
 fn main() -> i32 {
@@ -243,13 +290,13 @@ re-exports. A missing import's error says which `use` line to add, and
 
 ```tach
 fn sum(xs: [i64]) -> i64 {
-    let mut t = 0;
+    var t = 0;
     for i in 0..xs.len() { t += xs[i]; }    // indices are i64; checked
     t
 }
 
 fn main() -> i32 {
-    let mut a = [5, 1, 4];
+    var a = [5, 1, 4];
     a[1] = 2;
     std::print_int(sum(a[..]) + sum(a[1..]));   // a[lo..hi], a[..hi], a[lo..]
     println("");
@@ -270,8 +317,8 @@ main.tach:16:20: index out of bounds: index 4, length 4
 
 An array `[T; N]` is a value (copied by `=`; `a.len()` is N); a slice
 `[T]` is a pointer and a length (`.len()`; `.ptr` for C) viewing an
-array, a `Vec` or memory. A `[T]` is read-only; `&mut [T]`
-(`&mut a[..]`, `v.as_mut_slice()`) writes its elements (0.17).
+array, a `Vec` or memory. A `[T]` is read-only; `inout [T]`
+(`&a[..]`, `v.as_mut_slice()`) writes its elements.
 
 ## std: Vec, HashMap, Buf; allocation
 
@@ -281,7 +328,7 @@ fn evens(n: i64, gpa: Gpa) -> Vec<i64> {  // it allocates: it takes an allocator
 }
 
 fn main(gpa: Gpa) -> i32 {                 // the program's allocator
-    let mut v: Vec<i64> = Vec::new_in(gpa);  // dropped (freed) when main returns
+    var v: Vec<i64> = Vec::new_in(gpa);      // dropped (freed) when main returns
     v.push(30);
     v.push(10);
     v.push(20);
@@ -293,7 +340,7 @@ fn main(gpa: Gpa) -> i32 {                 // the program's allocator
     std::print_int(last.unwrap_or(-1));
     println("");
 
-    let mut m: HashMap<[u8], i64> = HashMap::new_in(gpa);
+    var m: HashMap<[u8], i64> = HashMap::new_in(gpa);
     m.insert("a", 1);
     m.insert("b", 2);
     match m.get("a") { Some(x) => std::print_int(x), None => print("none") }
@@ -301,7 +348,7 @@ fn main(gpa: Gpa) -> i32 {                 // the program's allocator
     for (k, _) in m.iter() { print(k); }   // (K, V) pairs, in slot order
     println("");
 
-    let mut b = Buf::new_in(gpa);          // text builder
+    var b = Buf::new_in(gpa);              // text builder
     let e = evens(4, gpa);
     b.push_str("n=");
     b.push_int(m.len() + e.len());
@@ -332,9 +379,9 @@ diverge unsafe`): `tachyonc query effects f --why io` shows where;
 `guide allocators`).
 
 `Vec`, `Buf` and `HashMap` own their contents: `let w = v;` or passing
-one by value moves it (`.clone()` copies). Pass `&v` to a `&Vec<T>`
-parameter to read it, `&mut v` to a `&mut Vec<T>` one to let a function
-push. A slice from `as_slice` views the vector: using it after the
+one to a `sink` parameter moves it (`.clone()` copies). Pass `v` to a
+`v: Vec<T>` (let) parameter to read it, `&v` to a `v: inout Vec<T>` one
+to let a function push. A slice from `as_slice` views the vector: using it after the
 vector grew or was dropped is an error (`guide views`). std's API,
 made from its source in this compiler, a
 line per item: `tachyonc guide std#the-api`; each item with its comment:
@@ -350,15 +397,15 @@ with a MinHeap of (distance, node) pairs:
 // Dijkstra: the shortest distances from node 0.
 fn main(gpa: Gpa) -> i32 {
     let n = 5;
-    let mut adj: Vec<Vec<(i64, i64)>> = Vec::new_in(gpa);   // adj[u]: (to, weight)
+    var adj: Vec<Vec<(i64, i64)>> = Vec::new_in(gpa);       // adj[u]: (to, weight)
     for _ in 0..n {
         adj.push(Vec::new_in(gpa));
     }
     for (u, v, w) in [(0, 1, 4), (0, 2, 1), (2, 1, 2), (1, 3, 1), (2, 3, 5)] {
         adj[u].push((v, w));
     }
-    let mut dist: Vec<i64> = Vec::filled_in(n, i64::MAX, gpa);
-    let mut heap: MinHeap<(i64, i64)> = MinHeap::new_in(gpa);  // (distance, node)
+    var dist: Vec<i64> = Vec::filled_in(n, i64::MAX, gpa);
+    var heap: MinHeap<(i64, i64)> = MinHeap::new_in(gpa);      // (distance, node)
     dist[0] = 0;
     heap.push((0, 0));
     while let Some((d, u)) = heap.pop() {      // the nearest first
@@ -383,7 +430,7 @@ fn main(gpa: Gpa) -> i32 {
 ## Input, output, arguments
 
 std prints and reads stdin: `read_stdin_in(gpa)` (all of it, a
-`Result<Buf, IoError>`), `read_line(&mut buf)` (the next line, without its
+`Result<Buf, IoError>`), `read_line(&buf)` (the next line, without its
 `'\n'`; `Ok(false)` at the end), `Scanner` (tokens, numbers, lines of a
 text), `parse_int` (a `Result`), `split_in`, `trim` (`guide conversions`:
 Option means absent, Result failed). Files go through C (`fopen`):
@@ -393,8 +440,8 @@ import "string.h" as c;
 
 fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
     let input = read_stdin_in(gpa).unwrap(); // all of stdin, a Buf
-    let mut sc = Scanner::new(input.as_slice());
-    let mut total = 0;
+    var sc = Scanner::new(input.as_slice());
+    var total = 0;
     while let Ok(n) = sc.next_int() {     // Err(ScanError::End) at the end
         total += n;
     }
@@ -432,10 +479,11 @@ fn main() -> i32 {
 ```
 
 Unsafe operations: calling C or an `unsafe fn`, dereferencing (`*p`,
-`p.f`) or indexing (`p[i]`) a raw pointer, reading a union field. A
-reference (`&T`, `&mut T`) is safe to read and write through wherever
-it is kept; every `*T` is raw, a parameter too (0.18.1: `mut` or not;
-`fix --values` makes a parameter a reference).
+`p.f`) or indexing (`p[i]`) a raw pointer, reading a union field. An
+access (a let or inout parameter, an `inout` local, a `let T` / `inout
+T` field) is safe to read and write through wherever it is kept; every
+`*T` is raw, a parameter too (`fix --values` makes a parameter an
+access).
 `tachyonc fix --only unsafe` wraps what needs it; `#[repr(C)]`, callbacks
 and linking: `guide c-interop`.
 
@@ -444,17 +492,20 @@ and linking: `guide c-interop`.
 | error (short form) | fix |
 |---|---|
 | `unknown type 'String'` (or `char`, `Box`) | `[u8]`, `u8`, `*T` or `Vec<T>` |
-| `expected type, got '&'`; `expected identifier, got '&'` | `[u8]` for `&str`; `self: &T`, `self: &mut T` or `self: *T` |
+| `expected type, got '&'`; `expected identifier, got '&'` | `[u8]` for `&str`; `self`, `inout self` or `sink self` for `&self`, `&mut self`, `self` |
+| `conv.rust: '&mut T' is Rust's spelling` (`let mut`, `&mut x`, `move`) | the `try:` line's form: `inout T`, `var`, `&x`, `sink`; `tachyonc fix --suggested` |
+| `conv.marker: 'v' is lent inout here` | `f(&v)`: an inout argument is marked |
+| `conv.marker_extra: '&' marks an argument the callee may change` | `f(v)`: a let or sink argument is not |
+| `own.readonly: writes through 'v' ... read-only (let)` | take it `v: inout T`, called `f(&v)` |
 | `cannot infer the type of closure parameter 'x'` | `\|x: i64\| ...`, or pass it where an `Fn` bound or `fn` type gives it |
 | `'?' needs 'f' to return Option or Result` | `fn f(..) -> Option<T>` or `-> Result<T, E>` |
 | `'println!' is a macro call` | no macros: `println(f"{x}")` |
-| `cannot assign to immutable variable 'x'` | `let mut x` |
+| `cannot assign to immutable variable 'x'` | `var x` |
 | `cannot index type 'HashMap<K, V>'` | `m.get(k)` (an Option), `m.insert(k, v)` |
 | `allocation is explicit: pass an allocator (try: Vec::new_in(gpa))` | `fn main(gpa: Gpa)`, `gpa` passed down; `tachyonc fix --only alloc016` |
 | `'for' iterates over ... got 'i64'` | a range: `for x in 0..n`; a Vec, a HashMap, `v.iter()` and ranges as values iterate too (0.14) |
 | `expected '[i64]', got '[i64; 3]'` | pass `a[..]` |
 | `expected 'i32', got 'i64'` | `x as i32`: only widening is implicit |
-| `cannot take address of non-lvalue expression` | `&f(x)` is a temporary (0.18.1) unless a call before it in the statement could see the order: name it, `let t = f(x);` then `&t` |
 | `non-exhaustive match: 'E::C' is not covered` | an arm, or `_ =>` |
 | `error[unsafe] calling a C function is unsafe` | `unsafe { ... }` |
 | `undefined variable 'helper' \| help: add 'use ...'` | add the `use` line the help names |

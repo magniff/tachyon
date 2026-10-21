@@ -9,23 +9,23 @@ type's methods. Dispatch is static: a trait is not a type.
 use std::hash_u64;
 
 trait Shape {
-    fn area(self: &Self) -> i64;
-    fn name(self: &Self) -> [u8] { "shape" }   // a default
+    fn area(self) -> i64;
+    fn name(self) -> [u8] { "shape" }          // a default
 }
 
 struct Square { side: i64 }
 struct Rect { w: i64, h: i64 }
 
 impl Shape for Square {
-    fn area(self: &Square) -> i64 { self.side * self.side }
-    fn name(self: &Square) -> [u8] { "square" }
+    fn area(self) -> i64 { self.side * self.side }
+    fn name(self) -> [u8] { "square" }
 }
 
 impl Shape for Rect {
-    fn area(self: &Rect) -> i64 { self.w * self.h }
+    fn area(self) -> i64 { self.w * self.h }
 }
 
-fn report<T: Shape>(s: &T) {
+fn report<T: Shape>(s: T) {
     print(s.name());
     print(" ");
     std::print_int(s.area());
@@ -33,33 +33,33 @@ fn report<T: Shape>(s: &T) {
 }
 
 // Operators: + - * / and unary - through Add Sub Mul Div Neg,
-// == through Eq, < <= > >= through Ord's cmp. Eq and Ord take
-// `self: &Self`, so their impls do (Display, Debug, Iterator: `*Self`).
+// == through Eq, < <= > >= through Ord's cmp. All take their operands
+// let (`self`, `o: V2`): `a + b` reads a and b, an owned one too.
 struct V2 { x: i64, y: i64 }
 
 impl Add for V2 {
-    fn add(self: V2, o: V2) -> V2 { V2 { x: self.x + o.x, y: self.y + o.y } }
+    fn add(self, o: V2) -> V2 { V2 { x: self.x + o.x, y: self.y + o.y } }
 }
 
 impl Ord for V2 {
-    fn cmp(self: &V2, o: &V2) -> i64 { (self.x + self.y) - (o.x + o.y) }
+    fn cmp(self, o: V2) -> i64 { (self.x + self.y) - (o.x + o.y) }
 }
 
 impl Hash for V2 {
-    fn hash(self: &V2) -> u64 { hash_u64((self.x * 31 + self.y) as u64) }
+    fn hash(self) -> u64 { hash_u64((self.x * 31 + self.y) as u64) }
 }
 
-trait Double { fn double(self: Self) -> Self; }
-impl Double for i64 { fn double(self: i64) -> i64 { self * 2 } }
+trait Double { fn double(self) -> Self; }
+impl Double for i64 { fn double(self) -> i64 { self * 2 } }
 
 fn main(gpa: Gpa) -> i32 {
     let sq = Square { side: 3 };
     let r = Rect { w: 2, h: 5 };
-    report(&sq);                          // or report(&Square { side: 3 }): a temporary
-    report(&r);
+    report(sq);                           // or report(Square { side: 3 }): a temporary
+    report(r);
     let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
     if v > (V2 { x: 0, y: 0 }) { std::print_int(v.x * 10 + v.y); }
-    let mut seen: HashMap<V2, bool> = HashMap::new_in(gpa);   // a struct key: Hash + Eq
+    var seen: HashMap<V2, bool> = HashMap::new_in(gpa);       // a struct key: Hash + Eq
     seen.insert(v, true);
     if seen.contains(V2 { x: 4, y: 6 }) { print(" found "); }
     std::print_int(21.double());
@@ -82,8 +82,12 @@ shape 10
   arrays, slices whose parts have `==`; a `[u8]` by bytes); an
   `impl Eq` replaces structural `==`, also for a part.
   `Ord`: numbers, pointers, fieldless enums have it.
-- Methods are called `x.m()` or `Type::m(&x)`; a trait's function
-  without `self` is called `Type::f()`.
+- A trait writes its receivers as impls do: `fn eq(self, other: Self)
+  -> bool`, `fn next(inout self) -> Option<Self::Item>`, `fn fmt(self, f:
+  inout Fmt)`, `fn clone(self) -> Self`; an impl takes them the same way.
+- Methods are called `x.m()`, which lends `x` as the receiver says (an
+  `inout self` method needs a `var`), or `Type::m(x)` (`Type::m(&x)` for
+  `inout self`); a trait's function without `self` is called `Type::f()`.
 - A default function is checked, and compiled, only for the impls
   that use it (in a non-generic impl).
 - Not there: `dyn Trait` (use generics, or an enum of the cases),
@@ -107,24 +111,23 @@ struct Countdown { n: i64 }
 
 impl Iterator for Countdown {           // std's trait, in the prelude
     type Item = i64;
-    fn next(self: &mut Countdown) -> Option<i64> {
+    fn next(inout self) -> Option<i64> {
         if self.n == 0 { return None; }
         self.n -= 1;
         Some(self.n + 1)
     }
 }
 
-fn first<I: Iterator>(it: I) -> Option<I::Item> {
-    let mut it = it;
-    it.next()
+fn first<I: Iterator>(it: sink I) -> Option<I::Item> {
+    it.next()                           // a sink parameter is the callee's: mutable
 }
 
-fn total<I: Iterator<Item = i64>>(it: I) -> i64 {
+fn total<I: Iterator<Item = i64>>(it: sink I) -> i64 {
     it.sum()                            // a default of Iterator
 }
 
 impl<T> [T] {
-    fn second(self: [T]) -> T { self[1] }
+    fn second(self) -> T { self[1] }
 }
 
 fn main() -> i32 {

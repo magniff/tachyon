@@ -6,7 +6,7 @@ associated type:
 ```text
 trait Iterator {
     type Item;
-    fn next(self: &mut Self) -> Option<Self::Item>;
+    fn next(inout self) -> Option<Self::Item>;
     // and, written once in std: map filter enumerate zip take
     // fold for_each count sum min max collect
 }
@@ -18,7 +18,7 @@ same machine code at -O2, vectorized where the loop would be).
 
 ```tach
 fn main(gpa: Gpa) -> i32 {
-    let mut v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64> = Vec::new_in(gpa);
     for i in 1..=6 { v.push(i); }
     std::print_int(v.iter().filter(|x| x % 2 == 0).map(|x| x * x).sum());
     print(" ");
@@ -32,8 +32,8 @@ fn main(gpa: Gpa) -> i32 {
     }
     std::print_int(v.iter().zip(v.iter()).fold(0, |acc, (a, b)| acc + a * b));
     println("");
-    let mut w = v.iter().map(|x| 7 - x).collect_in(gpa);   // a Vec<i64>
-    w.sort_by(|a, b| a.cmp(b));                         // a, b: &i64
+    var w = v.iter().map(|x| 7 - x).collect_in(gpa);       // a Vec<i64>
+    w.sort_by(|a, b| a.cmp(b));                         // a, b: let i64
     for x in w { std::print_int(x); }
     println("");
     0
@@ -56,8 +56,9 @@ fn main(gpa: Gpa) -> i32 {
 
 `for x in E` takes a range, a slice or an array as before, an iterator,
 or anything with an `iter` method (`for x in v`, `for (k, n) in m`);
-items are copies, as `for x in slice` gives. To change elements, loop
-over the indices: `for i in 0..v.len() { v.set(i, v.get(i) * 2); }`.
+items are let: a copy of a plain element, a read-only access to an owned
+one. To change elements, loop over the indices: `for i in 0..v.len() {
+v[i] *= 2; }`.
 
 ## Adapters and consumers
 
@@ -68,11 +69,11 @@ over the indices: `for i in 0..v.len() { v.set(i, v.get(i) * 2); }`.
   `0 as Item`), `min()` and `max()` (an `Option`), `collect()` (a `Vec`
   of the items, dropped with its scope; there is no other target, and no
   `collect::<Vec<_>>()`).
-- `sort_by(s, |a, b| ...)` sorts in place by a comparison of `&T`s
+- `sort_by(&s, |a, b| ...)` sorts in place by a comparison of two let `T`s
   returning negative, zero or positive (`a.cmp(b)`; `b.cmp(a)`
   descending); also `v.sort_by(...)` and `s.sort_by(...)`.
-- An adapter takes its iterator by value, so a chain is one value; to
-  call `next` yourself, keep the iterator in a `let mut`.
+- An adapter takes its iterator `sink`, so a chain is one value; to
+  call `next` yourself (`inout self`), keep the iterator in a `var`.
 
 ## Your own iterator
 
@@ -81,19 +82,18 @@ struct Countdown { n: i64 }
 
 impl Iterator for Countdown {
     type Item = i64;
-    fn next(self: &mut Countdown) -> Option<i64> {
+    fn next(inout self) -> Option<i64> {
         if self.n == 0 { return None; }
         self.n -= 1;
         Some(self.n + 1)
     }
 }
 
-fn first<I: Iterator>(it: I) -> Option<I::Item> {
-    let mut it = it;
-    it.next()
+fn first<I: Iterator>(it: sink I) -> Option<I::Item> {
+    it.next()                           // a sink parameter is the callee's: mutable
 }
 
-fn total<I: Iterator<Item = i64>>(it: I) -> i64 {
+fn total<I: Iterator<Item = i64>>(it: sink I) -> i64 {
     it.sum()
 }
 
@@ -121,6 +121,6 @@ fn main() -> i32 {
 - `exact_len()` (items left, or -1) and `at(k)` are hooks that let `zip`
   and `enumerate` run as a counted loop; leave them out.
 
-Not there: `iter_mut` (use indices and `set`), `rev`, `step_by`,
+Not there: `iter_mut` (use indices: `v[i] += 1`), `rev`, `step_by`,
 `chain`, `flat_map`, `peekable`, `collect` into other types, `dyn
 Iterator`, returning an iterator built from a closure (0.15).

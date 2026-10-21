@@ -29,7 +29,7 @@ product cannot overflow `i32` first (C's bug, avoided).
 
 ```tach
 fn total(xs: [i32]) -> i64 {
-    let mut t: i64 = 0;
+    var t: i64 = 0;
     for x in xs { t += x; }              // each i32 widens
     t
 }
@@ -182,7 +182,7 @@ with an error enum means failure. std's input (0.15):
 
 | function | returns | at the end, on failure |
 |---|---|---|
-| `read_line(&mut buf)` | `Result<bool, IoError>` | `Ok(false)` at the end; `Err(IoError::Read)` |
+| `read_line(&buf)` | `Result<bool, IoError>` | `Ok(false)` at the end; `Err(IoError::Read)` |
 | `read_stdin_in(gpa)` | `Result<Buf, IoError>` | `Err(IoError::Read)` |
 | `parse_int(s)` | `Result<i64, ParseIntError>` | `Empty`, `InvalidDigit(at)` (the byte's index), `Overflow` |
 | `sc.next_int()` | `Result<i64, ScanError>` | `ScanError::End`, `ScanError::Parse(e)` |
@@ -197,8 +197,8 @@ use std::ScanError;
 
 fn main(gpa: Gpa) -> i32 {
     let input = read_stdin_in(gpa).unwrap();
-    let mut sc = Scanner::new(input.as_slice());
-    let mut sum = 0;
+    var sc = Scanner::new(input.as_slice());
+    var sum = 0;
     loop {
         match sc.next_int() {
             Ok(n) => sum += n,

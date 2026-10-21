@@ -183,7 +183,7 @@ check_block() {
     d=$1
     name=$(cat "$d/name")
     if [ -f "$d/err" ]; then
-        "$COMPILER" --deny-warnings --diagnostics=short "$d/prog.tach" -o "$d/prog" >"$d/compile.out" 2>&1
+        "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short "$d/prog.tach" -o "$d/prog" >"$d/compile.out" 2>&1
         rc=$?
         if [ $rc -ne 1 ]; then
             { echo "FAIL $name: expected a compile error (exit 1), got exit $rc"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
@@ -202,7 +202,7 @@ check_block() {
     # (0.18: from its directory, as main.tach: a failed check's position
     # reads `main.tach:LINE:COL`, as the guide shows it)
     cp "$d/prog.tach" "$d/main.tach"
-    if ! (cd "$d" && "$COMPILER" --deny-warnings --diagnostics=short main.tach -o prog) >"$d/compile.out" 2>&1; then
+    if ! (cd "$d" && "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short main.tach -o prog) >"$d/compile.out" 2>&1; then
         { echo "FAIL $name: does not compile"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
         return
     fi
@@ -415,7 +415,7 @@ fi
 "$COMPILER" guide --find read a line >"$WORK/find.out" 2>"$WORK/find.err"
 rc=$?
 if [ $rc -eq 0 ] && head -1 "$WORK/find.out" | grep -q '^# std#input$' \
-    && grep -q 'read_line(&mut buf)' "$WORK/find.out" \
+    && grep -q 'read_line(&buf)' "$WORK/find.out" \
     && [ "$(wc -c <"$WORK/find.out" | tr -d ' ')" -le 4000 ]; then
     result pass guide-find
 else
@@ -460,6 +460,23 @@ if [ -z "$missed" ]; then
     result pass guide-find-arch
 else
     result FAIL guide-find-arch "not first on guide arch:$missed"
+fi
+# (0.20) The words of the parameter conventions, and Rust's for them,
+# land on the sections that teach them.
+missed=""
+# (a Rust spelling: memory's conventions or rust's mapping of them)
+for pair in 'inout:memory#conventions' 'sink:memory#conventions' 'borrow:memory#conventions' \
+    'mutable reference:(memory#conventions|rust#parameters)' '&mut:(memory#conventions|rust#parameters)' \
+    'let mut:(memory#conventions|rust#parameters)' 'move closure:closures#sink-closures'; do
+    w=${pair%%:*}
+    want=${pair#*:}
+    "$COMPILER" guide --find $w 2>/dev/null | head -1 >"$WORK/findconv.out"
+    grep -Eq "^# $want" "$WORK/findconv.out" || missed="$missed '$w' ($(cat "$WORK/findconv.out"))"
+done
+if [ -z "$missed" ]; then
+    result pass guide-find-conventions
+else
+    result FAIL guide-find-conventions "not first on its section:$missed"
 fi
 "$COMPILER" guide --find xyzzy frobnicate >"$WORK/nofind.out" 2>&1
 rc=$?

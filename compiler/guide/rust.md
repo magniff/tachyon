@@ -1,8 +1,9 @@
 # Rust -> tachyon
 
 What a Rust programmer reaches for, and what tachyon has instead.
-Tachyon looks like Rust, so the Rust habit compiles to an error more
-often than to something else; each error names the fix.
+Tachyon is not Rust: its values are passed by convention (`let`,
+`inout`, `sink`), not by reference. A Rust habit compiles to an error
+more often than to something else, and each error names the fix.
 
 ## Text
 
@@ -21,10 +22,10 @@ often than to something else; each error names the fix.
 
 ```tach
 fn main(gpa: Gpa) -> i32 {
-    let mut b = Buf::new_in(gpa);              // freed at the end of main
+    var b = Buf::new_in(gpa);                  // freed at the end of main
     b.push_str("sum=");
     let parts = split_in("40,2", ',', gpa);
-    let mut sum = 0;
+    var sum = 0;
     for p in parts.as_slice() {
         sum += parse_int(p).unwrap_or(0);
     }
@@ -39,47 +40,64 @@ sum=42
 not a number
 ```
 
-## References, ownership, memory
+## Parameters, ownership, memory
+
+Tachyon has no references to store: a parameter's convention says what
+the function does with its argument, and the argument is used as the
+value itself.
 
 | Rust | tachyon |
 |---|---|
-| `&T`, `&mut T`, `&x`, `&mut x` | the same (0.17): checked, no lifetimes written; `&mut x` at the call when the parameter is `&mut T` |
-| `&self`, `&mut self` | `self: &Self`, `self: &mut Self` (written out); calls reference the receiver: `v.push(1)` |
-| `*r`, `r.field` | the same; fields and methods reach through a reference |
-| moves, `Clone`, `Copy` | the same: an owned value (`Vec`, `Buf`, `HashMap`, a struct holding one) moves; `.clone()` copies; plain values copy (no `Copy` derive) |
-| `Drop`, RAII | the same: dropped at the end of the scope, last first; `impl Drop for T { fn drop(self: &mut T) }`; `drop(x)` |
-| `&str`, `&[T]`, `&mut [T]` | `[u8]`, `[T]` (read-only), `&mut [T]` (writable) |
+| `x: &T`, `f(&x)` | `x: T` (let, the default: read-only), `f(x)` |
+| `x: &mut T`, `f(&mut x)` | `x: inout T`, `f(&x)`: `&` marks only an inout argument |
+| `x: T` (the callee owns it) | `x: sink T`, `f(x)` (moves; a plain value is copied) |
+| `mut x: T` | `x: sink T` (a sink parameter is the callee's, so mutable) |
+| `&self`, `&mut self`, `self`, `mut self` | `self`, `inout self`, `sink self`; calls lend the receiver: `v.push(1)` |
+| `let mut x` | `var x` (also `var` in patterns: `Some(var n)`) |
+| `let r = &mut x;` | `inout r = &x;`, passed on as `f(&r)` |
+| `let r = &x; f(r)` | `f(x)`: a let argument needs no reference |
+| `*r = v`, `*n + 1`, `(*p).f` | `r = v`, `n + 1`, `p.f`: an access is used as its value (`*` is only for raw pointers) |
+| `&T` / `&mut T` fields | `let T` / `inout T` fields: `struct P { q: inout Query }`, built with `q: &q` |
+| `&str`, `&[T]`, `&mut [T]` | `[u8]`, `[T]` (read-only), `inout [T]` (writable) |
+| `move \|\| ..` | `sink \|\| ..` |
+| `static mut` | `static var` |
+| `match &mut x { .. }` | `match &x { .. }`: binds inout accesses |
+| moves, `Clone`, `Copy` | the same idea: an owned value (`Vec`, `Buf`, `HashMap`, a struct holding one) moves; `.clone()` copies; plain values copy (no `Copy` derive) |
+| `Drop`, RAII | dropped at the end of the scope, last first; `impl Drop for T { fn drop(inout self) }`; `drop(x)` |
 | lifetimes `'a`, `fn f<'a>(x: &'a str) -> &'a str` | none: each function's view summary is inferred (`query views NAME`); `#[views(s)]` pins one (`guide views`) |
 | the borrow checker | the own pass: `own.moved`, `own.conflict`, `own.escape`... each with `try:` lines (`tachyonc explain own.conflict`) |
 | `Box<T>`, `Rc<T>`, `Arc<T>` | none: a `Vec<T>`, an index, or `malloc` in `unsafe` |
 | `Vec::new()`, the global allocator | `Vec::new_in(gpa)`: allocation is explicit (0.16); `gpa: Gpa` comes from `fn main(gpa: Gpa)` and is passed down; `arena_scope(gpa, \|a\| ..)` (`guide allocators`) |
-| `Option<&T>` | `Option<T>` of a copy, an index, or a one-element view `[T]` (references as type arguments: 0.17.1) |
-| `&mut v[i]`, `m.get_mut(&k)` | `v[i].f = x`; `m.get_mut(k)`: an `Option<[V]>`, a view of one element (`a[0].f += 1`) |
+| `Option<&T>` | `Option<T>` of a copy, an index, or a one-element view `[T]` |
+| `&mut v[i]`, `m.get_mut(&k)` | `&v[i]` to an inout parameter, `v[i].f = x`; `m.get_mut(k)`: an `Option<[V]>`, a view of one element (`a[0].f += 1`) |
 | `*m.entry(k).or_insert(0) += 1` | `m.get_or_insert(k, 0)[0] += 1` |
-| `std::mem::take`, `replace` | `std::take(&mut x)`, `std::replace(&mut x, v)` |
+| `std::mem::take(&mut x)`, `replace` | `std::take(&x)`, `std::replace(&x, v)` |
 | `Mutex`, threads | none in tachyon (C's threads are C's business) |
 
-Pass a container to a function that changes it as `&mut`, one that reads
-it as `&`; return a new one by value (the caller owns it):
+Each Rust spelling above is the error `conv.rust`, whose `try:` line
+writes the tachyon form (`tachyonc fix --only conventions` rewrites a
+whole program). Pass a container to a function that changes it as
+`&v` to an `inout` parameter, to one that reads it as `v`; return a new
+one by value (the caller owns it):
 
 ```tach
-fn fill(v: &mut Vec<i64>, n: i64) {      // v.push works through the reference
+fn fill(v: inout Vec<i64>, n: i64) {     // v.push changes the caller's Vec
     for i in 0..n { v.push(i * i); }
 }
 
-fn sum(v: &Vec<i64>) -> i64 {
-    let mut s = 0;
+fn sum(v: Vec<i64>) -> i64 {             // let: reads it in place
+    var s = 0;
     for x in v { s += x; }
     s
 }
 
 fn main(gpa: Gpa) -> i32 {
-    let mut v: Vec<i64> = Vec::new_in(gpa);
-    fill(&mut v, 4);
-    let r = &mut v;                      // a reference in a local: passed on twice
-    fill(r, 1);
-    fill(r, 1);
-    std::print_int(v.len() + sum(&v));
+    var v: Vec<i64> = Vec::new_in(gpa);
+    fill(&v, 4);
+    inout r = &v;                        // an inout access in a local: passed on twice
+    fill(&r, 1);
+    fill(&r, 1);
+    std::print_int(v.len() + sum(v));
     println("");
     0
 }
@@ -89,9 +107,8 @@ fn main(gpa: Gpa) -> i32 {
 ```
 
 `*T` is Rust's `*mut T` / `*const T`: dereferencing it needs `unsafe`,
-a parameter too (0.18.1). Before 0.17, `*T` was the one pointer type and
-`&x` its address; `tachyonc fix --values` rewrites such code to
-references.
+a parameter too (0.18.1); `&x` passed where a `*T` is wanted gives its
+address.
 
 ## Errors and Option
 
@@ -143,42 +160,42 @@ too big: 500
 |---|---|
 | `for x in v.iter()`, `for x in &v` | the same (0.14), and `for x in v`: a copy of each element |
 | `for (i, x) in s.iter().enumerate()` | the same (0.14) |
-| `for x in v.iter_mut() { *x += 1 }` | `for i in 0..s.len() { s[i] += 1; }` |
+| `for x in v.iter_mut() { *x += 1 }` | `for i in 0..v.len() { v[i] += 1; }` |
 | `.map()`, `.filter()`, `.sum()`, `.collect()` | the same (0.14); `collect_in(gpa)` makes a `Vec` only (`guide iterators`) |
-| `\|x\| x + 1`, `move \|\|` | the same (0.14); a `let mut` is captured by reference, the rest by value (`guide closures`) |
+| `\|x\| x + 1`, `move \|\|` | `\|x\| x + 1`, `sink \|\|` (takes what it captures); a `var` is captured inout, the rest by let access or copy (`guide closures`) |
 | `impl Fn(i64) -> i64`, `Box<dyn Fn>` | a generic parameter `F: Fn(i64) -> i64`; none as a result |
 | `(0..n).rev()` | the same (0.18.1) |
 | `.step_by(2)` | `while` with `i += 2` |
-| `sort()`, `sort_by(\|a, b\| ...)` | `std::sort(s)` (`T: Ord`; not stable); `v.sort_by(\|a, b\| b.cmp(a))` (0.14; `a`, `b`: `&T`) |
+| `sort()`, `sort_by(\|a, b\| ...)` | `std::sort(s)` (`T: Ord`; not stable); `v.sort_by(\|a, b\| b.cmp(a))` (0.14; `a`, `b`: let `T`) |
 | `v.sort_by_key(\|x\| x.k)`, `v.retain(..)`, `v.contains(&x)`, `v.first()` | the same on a `Vec` (0.18.1; `sort_by_key` is stable); `contains(x)` takes x by value |
 | `BinaryHeap<T>`; a min-heap `BinaryHeap<Reverse<T>>` | `BinaryHeap<T>`; `MinHeap<T>`, no `Reverse` (0.18.1, `guide std#heaps-priority-queues`) |
 
 A function value is `fn(A) -> R`, a plain function, no environment.
-Its parameters may be references (`fn(&mut Sum, i64)`, 0.17); a
+Its parameters have conventions (`fn(inout Sum, i64)`); a
 function with `*T` parameters is a value like any other (an `unsafe fn`
 as a value is unsafe):
 
 ```tach
 struct Sum { total: i64 }
 
-fn add(s: &mut Sum, x: i64) { s.total += x; }
+fn add(s: inout Sum, x: i64) { s.total += x; }
 
-fn each(xs: [i64], f: fn(&mut Sum, i64), s: &mut Sum) {
-    for x in xs { f(s, x); }
+fn each(xs: [i64], f: fn(inout Sum, i64), s: inout Sum) {
+    for x in xs { f(&s, x); }
 }
 
 fn square(x: i64) -> i64 { x * x }
 
 fn map_sum(xs: [i64], f: fn(i64) -> i64) -> i64 {
-    let mut t = 0;
+    var t = 0;
     for x in xs { t += f(x); }
     t
 }
 
 fn main() -> i32 {
-    let mut s = Sum { total: 0 };
+    var s = Sum { total: 0 };
     let xs = [1, 2, 3];
-    each(xs[..], add, &mut s);
+    each(xs[..], add, &s);
     std::print_int(s.total + map_sum(xs[..], square));
     println("");
     0
@@ -204,7 +221,7 @@ fn main() -> i32 {
 | `!` (never) | `!`: `fn fail() -> ! { ... }` |
 | `#[derive(PartialEq, Eq)]` | `==` is structural for structs, enums, tuples, arrays; `Vec`, `Buf`, `HashMap` by contents (0.15); `#[derive(Eq)]` checks it |
 | `#[derive(Clone, Copy, Debug, Default, Hash)]` | `#[derive(Clone, Debug, Hash, Ord)]` (0.15); every value copies, no `Copy`, no `Default` |
-| `impl Display`, `{:?}` | `impl Display for T { fn fmt(self: &T, f: &mut Fmt) {..} }`, `{x:?}` (0.15, `guide formatting`) |
+| `impl Display`, `{:?}` | `impl Display for T { fn fmt(self, f: inout Fmt) {..} }`, `{x:?}` (0.15, `guide formatting`) |
 | `impl From<A> for B`, `.into()` | the same (0.15, `guide conversions`) |
 | `type A = B;` | the same (`type Pair<T> = (T, T);` too) |
 | `const fn` | none; `const` items take constant expressions |
@@ -213,7 +230,8 @@ fn main() -> i32 {
 
 | Rust | tachyon |
 |---|---|
-| `fn f(&self)`, `&mut self`, `self` | `fn f(self: &T)`, `fn f(self: &mut T)`, `fn f(self: T)`; `Self` works (`self: *T` is the raw pointer, 0.18.1) |
+| `fn f(&self)`, `&mut self`, `self` | `fn f(self)`, `fn f(inout self)`, `fn f(sink self)`; `Self` works (`self: *T` is the raw pointer, 0.18.1) |
+| `let mut x = 0;` | `var x = 0;` |
 | `'a: loop { break 'a; }` | `a: loop { break :a; }` |
 | `let x;` then assign | `let x = ...;` always |
 | `let Some(x) = o else { .. };` | the same (0.18.1); the block must leave (`return`, `break`, `continue`, `panic`) |
@@ -241,7 +259,7 @@ fn main() -> i32 {
 | `extern crate`, Cargo dependencies | none: one program from its files; C through headers |
 | `pub use` | the same |
 | `std::collections::HashMap` | `std::HashMap` |
-| `std::io::stdin().read_line(&mut s)` | `std::read_line(&mut buf)`: the line without its `'\n'`; `Ok(false)` at the end of input |
+| `std::io::stdin().read_line(&mut s)` | `std::read_line(&buf)`: the line without its `'\n'`; `Ok(false)` at the end of input |
 | `io::read_to_string(io::stdin())` | `std::read_stdin_in(gpa)`, a `Result<Buf, IoError>`; `std::Scanner` for its tokens, numbers and lines |
 | `std::env::args()` | `fn main(argc: i32, argv: **u8) -> i32` |
 

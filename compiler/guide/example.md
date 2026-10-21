@@ -21,16 +21,16 @@ use store::Store;
 
 fn main(gpa: Gpa) -> i32 {
     let input = read_stdin_in(gpa).unwrap();    // all of stdin, a Buf
-    let mut store = Store::new(gpa);            // it allocates: give it gpa
-    let mut sc = Scanner::new(input.as_slice());
-    let mut line_no = 0;
+    var store = Store::new(gpa);                // it allocates: give it gpa
+    var sc = Scanner::new(input.as_slice());
+    var line_no = 0;
     while let Some(raw) = sc.next_line() {      // a line, without its '\n'
         line_no += 1;
         let line = trim(cut_comment(raw));      // views into input: no copies
         if line.len() == 0 {
             continue;
         }
-        if let Err(e) = run(&mut store, line, gpa) { // run may change store
+        if let Err(e) = run(&store, line, gpa) {    // &: run may change store
             println(f"line {line_no}: {e}");    // Error has Display
         }
     }
@@ -38,7 +38,7 @@ fn main(gpa: Gpa) -> i32 {
 }                                               // store, then input, dropped (freed)
 
 // One line: parsed, then applied; `?` passes the first Err up.
-fn run(store: &mut Store, line: [u8], gpa: Gpa) -> Result<(), Error> {
+fn run(store: inout Store, line: [u8], gpa: Gpa) -> Result<(), Error> {
     let cmd = parse(line, gpa)?;
     store.apply(cmd)
 }
@@ -79,8 +79,8 @@ pub enum Error {
 
 // What `{e}` in an f-string prints.
 impl Display for Error {
-    fn fmt(self: &Error, f: &mut Fmt) {
-        match *self {
+    fn fmt(self, f: inout Fmt) {
+        match self {
             Error::Unknown(w) => f.write(f"unknown command {w}"),
             Error::Arity(w, n) => f.write(f"{w} takes {n - 1} arguments"),
             Error::BadNumber(w) => f.write(f"not a number: {w}"),
@@ -142,7 +142,7 @@ impl Store {
 
     // No free: a Store drops its fields (items, then index) when it is dropped.
 
-    pub fn apply(self: &mut Store, cmd: Command) -> Result<(), Error> {
+    pub fn apply(inout self, cmd: Command) -> Result<(), Error> {
         match cmd {
             Command::Add(item) => match self.index.get(item.name) {
                 Some(i) => {
@@ -168,15 +168,15 @@ impl Store {
     }
 
     // The items by value, highest first, ties by name; then the total.
-    fn report(self: &Store) {
+    fn report(self) {
         let gpa = self.items.allocator();       // a Vec's allocator, to allocate with
-        let mut order = self.items.clone();     // a copy (in that allocator)
-        order.sort_by(|a, b| {                  // a, b: &Item; < 0: a goes first
-            let d = value(*b) - value(*a);
-            if d != 0 { d } else { cmp_of(&a.name, &b.name) }   // cmp_of takes references
+        var order = self.items.clone();         // a copy (in that allocator)
+        order.sort_by(|a, b| {                  // a, b: let Item; < 0: a goes first
+            let d = b.count * b.price - a.count * a.price;
+            if d != 0 { d } else { cmp_of(a.name, b.name) }
         });
-        let mut out = Buf::new_in(gpa);         // Rust's String
-        let mut total = 0;
+        var out = Buf::new_in(gpa);             // Rust's String
+        var total = 0;
         for it in order {
             out.push_fmt(f"{it.name:<5}{it.count:>3} x {it.price:>2} = {value(it)}\n");
             total += value(it);
@@ -230,20 +230,24 @@ total 129
   here `input`, until `main` returns. Text is compared with `==` and `<`;
   `match` has no string patterns.
 - Enum variants are tuple-like or struct-like; patterns as in Rust, with
-  guards (`Ok(n) if n >= 0`), `if let`, `while let`. Matching a
-  reference matches what it points to: `match self` binds references
-  into it (0.18.1, `n: &i64`, read as `*n`), `match *self` copies.
+  guards (`Ok(n) if n >= 0`), `if let`, `while let`. `match self` on a
+  let `self` binds let accesses into it, used as their values (`w`,
+  `n - 1`).
 - `#[derive(Eq, Ord, Hash, Debug, Clone)]` (no `PartialEq`, no `Copy`
   derive: a struct of numbers and views, as `Item`, copies; one holding a
   `Vec`, `Buf` or `HashMap`, as `Store`, moves). `Display` is written by
-  hand, with `f.write(f"..")`; its `self: &Self` is a reference.
+  hand, with `f.write(f"..")`: `fn fmt(self, f: inout Fmt)`.
 - Nothing allocates without an allocator. `main` gets `gpa` and passes
   it down. A function that allocates takes `gpa: Gpa`; one holding a
   `Vec` can use `v.allocator()`. Nothing is freed by hand: a value is
   dropped at the end of its scope (`tachyonc guide memory`).
-- `self: &T` and `self: &mut T` are `&self` and `&mut self`; `&x` and
-  `&mut x` give `&T` and `&mut T`; fields are reached through them with `.`.
-- Comparators return an `i64` (negative: `a` first) and take
-  references: `sort_by(|a, b| ..)`, `cmp_of(&x, &y)`.
+- Parameters are let by default: read-only, borrowed for the call
+  (`value(it)`, `report(self)`). One that changes its argument says
+  `inout`, and the call marks it: `run(store: inout Store, ..)` is
+  called `run(&store, ..)`; `apply(inout self)` is called
+  `store.apply(cmd)` on a `var store`. A `sink` parameter takes the
+  value. Bindings: `let` (fixed), `var` (changes).
+- Comparators return an `i64` (negative: `a` first) and take their
+  elements let: `sort_by(|a, b| ..)`, `cmp_of(a, b)`.
 - `Buf` is Rust's `String`: `push_str`, `push_int`, `push_fmt(f"..")`,
   `as_slice()`.
