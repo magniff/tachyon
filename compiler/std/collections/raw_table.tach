@@ -1,0 +1,743 @@
+// std::collections::raw_table: RawTable<T, A>, the Swiss table (0.20),
+// the engine of HashMap and HashSet, hashbrown's design. It stores
+// elements of T in buckets and never hashes: the caller gives each
+// operation the element's hash and closures, `eq` (is this the element?)
+// and `hasher` (an element's hash, to move it when the table grows), so
+// one table serves maps and sets and its code is made once per element
+// type.
+//
+// Layout: one allocation from A, the buckets (`buckets` elements of T)
+// then, 8-aligned, the control bytes (group.tach): `buckets + GROUP` of
+// them, the last GROUP a copy of the first (so a group read at any bucket
+// is in bounds). `buckets` is a power of two, 4 at least; a table that has
+// never allocated has bucket_mask 0 and no control bytes (a constant
+// constructor: a static may hold one); its methods check that first. A
+// hash's low bits pick the first group probed (h1), its top 7 its tag (ctrl_tag);
+// probing goes over groups by triangular steps (stride GROUP, 2 GROUP, ...),
+// which visit every group of a power-of-two table. At most 7/8 of the
+// buckets are FULL (all but one below 8 buckets): a search always ends at
+// an EMPTY byte.
+//
+// Elements are owned by the table: `erase`, `clear` and the drop drop
+// them, `take` moves one out, `get` and `get_mut` are views of one.
+//
+// Safety: every unsafe block below reads or writes a control byte below
+// buckets + GROUP or a bucket below `buckets` of the live allocation, or
+// an element in a FULL bucket (initialized). Raw writes drop nothing
+// (ptr::write), raw reads move out (ptr::read). An index a caller gives
+// is checked (`erase`, `take`, `get`, `insert_in_slot`, ...); the
+// iterator is a view of the control bytes.
+
+use std::{
+    ALLOC_LIMIT, Allocator, Drop, Gpa, Iterator, Option, drop, leading_zeros, needs_drop,
+    out_of_memory, panic,
+};
+use super::group::{
+    BitMask, CTRL_DELETED, CTRL_EMPTY, GROUP, bitmask_leading, bitmask_lowest,
+    bitmask_remove_lowest, bitmask_trailing, convert_special_to_empty_and_full_to_deleted, ctrl_tag,
+    group_load, group_store, match_empty, match_empty_or_deleted, match_full, match_tag,
+};
+
+// ---- Swiss table (0.20 implementation) ----
+
+#[sealed]
+pub struct RawTable<T, A: Allocator = Gpa> {
+    // the control bytes (buckets + GROUP)
+    ctrl: *u8,
+    // the buckets
+    data: *T,
+    // buckets - 1 (0: not allocated)
+    bucket_mask: i64,
+    // insertions left before the table grows: EMPTY buckets that may
+    // still be filled under the load factor
+    growth_left: i64,
+    // FULL buckets
+    items: i64,
+    alloc: A,
+}
+
+// The iterator over a table's FULL buckets, in bucket order (`iter()`):
+// their indices. A view of the table's control bytes.
+pub struct RawIter {
+    ctrl: [u8],
+    // the group being read and its FULL buckets not yet given
+    pos: i64,
+    bits: BitMask,
+}
+
+// How far elements are from where their search starts (`probe_stats`):
+// groups probed past the first, in total and at most.
+pub struct ProbeStats {
+    pub total: i64,
+    pub max: i64,
+}
+
+// The elements a table of bucket_mask + 1 buckets may hold: 7/8 of them,
+// all but one below 8.
+#[inline]
+fn raw_capacity(bucket_mask: i64) -> i64 {
+    if bucket_mask < 8 {
+        bucket_mask
+    } else {
+        ((bucket_mask + 1) / 8) * 7
+    }
+}
+
+// The buckets for cap elements (cap > 0): a power of two, 4 at least.
+fn raw_buckets_for(cap: i64) -> i64 {
+    if cap < 4 {
+        return 4;
+    }
+    if cap < 8 {
+        return 8;
+    }
+    if cap < 15 {
+        return 16;
+    }
+    if cap > ALLOC_LIMIT / 8 {
+        out_of_memory();
+    }
+    let adjusted = cap * 8 / 7;
+    // (the next power of two)
+    1 << (64 - leading_zeros((adjusted - 1) as u64))
+}
+
+// Sets n control bytes at ctrl to EMPTY; the caller guarantees that they
+// are writable.
+unsafe fn raw_fill_empty(ctrl: *u8, n: i64) {
+    for g in 0..n / GROUP {
+        group_store(ctrl, g * GROUP, 0xffffffffffffffffu64);
+    }
+    for k in n / GROUP * GROUP..n {
+        ctrl[k] = CTRL_EMPTY;
+    }
+}
+
+impl<T, A: Allocator> RawTable<T, A> {
+    // An empty table on allocator a; it allocates at the first insertion.
+    pub fn new_in(a: A) -> RawTable<T, A> {
+        RawTable {
+            ctrl: 0 as *u8, data: 0 as *T, bucket_mask: 0, growth_left: 0,
+            items: 0, alloc: a
+        }
+    }
+
+    // An empty table on allocator a with room for n elements.
+    pub fn with_capacity_in(n: i64, a: A) -> RawTable<T, A> {
+        let mut t: RawTable<T, A> = RawTable::new_in(a);
+        if n > 0 {
+            t.alloc_buckets(raw_buckets_for(n));
+        }
+        t
+    }
+
+    // The elements in the table.
+    #[inline]
+    pub fn len(self: &Self) -> i64 {
+        self.items
+    }
+
+    #[inline]
+    pub fn is_empty(self: &Self) -> bool {
+        self.items == 0
+    }
+
+    // The elements it holds before it grows.
+    pub fn capacity(self: &Self) -> i64 {
+        self.items + self.growth_left
+    }
+
+    // The buckets (1 before the first allocation).
+    #[inline]
+    pub fn buckets(self: &Self) -> i64 {
+        self.bucket_mask + 1
+    }
+
+    pub fn allocator(self: &Self) -> A {
+        self.alloc
+    }
+
+    // The allocation's size and alignment for `buckets` buckets, and where
+    // its control bytes start.
+    fn raw_layout(buckets: i64) -> (i64, i64, i64) {
+        let size = size_of(T);
+        if size > 0 && buckets > (ALLOC_LIMIT - 2 * GROUP) / size {
+            out_of_memory();
+        }
+        let ctrl_at = (buckets * size + GROUP - 1) & ~(GROUP - 1);
+        let align = if align_of(T) > GROUP { align_of(T) } else { GROUP };
+        (ctrl_at + buckets + GROUP, align, ctrl_at)
+    }
+
+    // Allocates `buckets` empty buckets for an empty table.
+    fn alloc_buckets(self: &mut Self, buckets: i64) {
+        let (size, align, ctrl_at) = RawTable::<T, A>::raw_layout(buckets);
+        unsafe {
+            let p = self.alloc.alloc(size, align);
+            self.data = p as *T;
+            self.ctrl = &p[ctrl_at];
+            raw_fill_empty(self.ctrl, buckets + GROUP);
+        }
+        self.bucket_mask = buckets - 1;
+        self.growth_left = raw_capacity(buckets - 1);
+        self.items = 0;
+    }
+
+    // Is bucket i FULL? (false for an i out of range)
+    #[inline]
+    pub fn is_full(self: &Self, i: i64) -> bool {
+        if i < 0 || i > self.bucket_mask || self.bucket_mask == 0 {
+            return false;
+        }
+        unsafe { self.ctrl[i] & 0x80 == 0 }
+    }
+
+    // Stops the program unless bucket i is FULL.
+    #[inline]
+    fn check_full(self: &Self, i: i64) {
+        if !self.is_full(i) {
+            unsafe { panic(c"RawTable: the bucket is not full") }
+        }
+    }
+
+    // The FULL bucket holding the element for which eq is true, among
+    // those whose hash is `hash`, or -1.
+    #[inline]
+    pub fn find<F: FnMut(&T) -> bool>(self: &Self, hash: u64, mut eq: F) -> i64 {
+        let mask = self.bucket_mask;
+        if mask == 0 {
+            return -1;
+        }
+        let tag = ctrl_tag(hash);
+        let mut pos = hash as i64 & mask;
+        let mut stride = 0;
+        // (triangular steps visit every group: the loop ends by then)
+        for _ in 0..(mask >> 3) + 1 {
+            let g = unsafe { group_load(self.ctrl, pos) };
+            let mut m = match_tag(g, tag);
+            for _ in 0..GROUP {
+                if m == 0 {
+                    break;
+                }
+                let i = (pos + bitmask_lowest(m)) & mask;
+                if unsafe { eq(&*(&self.data[i])) } {
+                    return i;
+                }
+                m = bitmask_remove_lowest(m);
+            }
+            if match_empty(g) != 0 {
+                return -1;
+            }
+            stride += GROUP;
+            pos = (pos + stride) & mask;
+        }
+        -1
+    }
+
+    // One probe for an insertion of a possibly present element, after
+    // `reserve(1, hasher)`: the FULL bucket holding the element for which
+    // eq is true (>= 0), else `~slot` (< 0), the bucket to give
+    // `insert_in_slot`, which holds until the table changes.
+    #[inline]
+    pub fn find_or_find_insert_slot<F: FnMut(&T) -> bool>(self: &Self, hash: u64, mut eq: F) -> i64 {
+        let mask = self.bucket_mask;
+        if mask == 0 {
+            // (no buckets: insert_in_slot refuses it, reserve first)
+            return ~0;
+        }
+        let tag = ctrl_tag(hash);
+        let mut pos = hash as i64 & mask;
+        let mut stride = 0;
+        let mut slot = -1;
+        for _ in 0..(mask >> 3) + 1 {
+            let g = unsafe { group_load(self.ctrl, pos) };
+            let mut m = match_tag(g, tag);
+            for _ in 0..GROUP {
+                if m == 0 {
+                    break;
+                }
+                let i = (pos + bitmask_lowest(m)) & mask;
+                if unsafe { eq(&*(&self.data[i])) } {
+                    return i;
+                }
+                m = bitmask_remove_lowest(m);
+            }
+            if slot < 0 {
+                let e = match_empty_or_deleted(g);
+                if e != 0 {
+                    slot = (pos + bitmask_lowest(e)) & mask;
+                }
+            }
+            if match_empty(g) != 0 {
+                return ~self.fix_insert_slot(slot);
+            }
+            stride += GROUP;
+            pos = (pos + stride) & mask;
+        }
+        // (an EMPTY byte is always reached first: the load factor)
+        ~self.fix_insert_slot(slot)
+    }
+
+    // Puts x, whose hash is `hash`, in bucket `slot`, the `~result` of
+    // find_or_find_insert_slot with no change to the table since; returns
+    // slot.
+    #[inline]
+    pub fn insert_in_slot(self: &mut Self, hash: u64, slot: i64, x: T) -> i64 {
+        if slot < 0 || slot > self.bucket_mask || self.bucket_mask == 0 {
+            unsafe { panic(c"RawTable::insert_in_slot: no such bucket") }
+        }
+        let old = unsafe { self.ctrl[slot] };
+        // (a FULL bucket, or an EMPTY one with no growth left, is no slot)
+        if old & 0x80 == 0 || (old == CTRL_EMPTY && self.growth_left == 0) {
+            unsafe { panic(c"RawTable::insert_in_slot: not a free slot") }
+        }
+        self.record_insert(slot, old, hash);
+        unsafe {
+            self.data[slot] = x;
+        }
+        slot
+    }
+
+    // Inserts x, whose hash is `hash`, without looking for an equal
+    // element; returns its bucket. hasher(e) is the hash of element e,
+    // for those the table moves when it grows.
+    pub fn insert<H: FnMut(&T) -> u64>(self: &mut Self, hash: u64, x: T, hasher: H) -> i64 {
+        let mut i = if self.bucket_mask == 0 { -1 } else { self.find_insert_slot(hash) };
+        if i < 0 || (self.growth_left == 0 && unsafe { self.ctrl[i] } == CTRL_EMPTY) {
+            self.reserve_rehash(1, hasher);
+            i = self.find_insert_slot(hash);
+        }
+        let old = unsafe { self.ctrl[i] };
+        self.record_insert(i, old, hash);
+        unsafe {
+            self.data[i] = x;
+        }
+        i
+    }
+
+    #[inline]
+    fn record_insert(self: &mut Self, i: i64, old: u8, hash: u64) {
+        // (an EMPTY byte has its low bit set, a DELETED one not)
+        self.growth_left -= (old & 1) as i64;
+        self.set_ctrl(i, ctrl_tag(hash));
+        self.items += 1;
+    }
+
+    // The first EMPTY or DELETED bucket of hash's probe sequence.
+    #[inline]
+    fn find_insert_slot(self: &Self, hash: u64) -> i64 {
+        let mask = self.bucket_mask;
+        let mut pos = hash as i64 & mask;
+        let mut stride = 0;
+        for _ in 0..(mask >> 3) + 1 {
+            let e = match_empty_or_deleted(unsafe { group_load(self.ctrl, pos) });
+            if e != 0 {
+                return self.fix_insert_slot((pos + bitmask_lowest(e)) & mask);
+            }
+            stride += GROUP;
+            pos = (pos + stride) & mask;
+        }
+        unsafe { panic(c"RawTable: no free bucket") }
+    }
+
+    // In a table of fewer buckets than GROUP, a group read past the last
+    // bucket sees the EMPTY bytes after it, which stand for the FULL
+    // buckets of the group's start: then the slot is the first free one
+    // from bucket 0.
+    #[inline]
+    fn fix_insert_slot(self: &Self, i: i64) -> i64 {
+        if unsafe { self.ctrl[i] } & 0x80 == 0 {
+            return bitmask_lowest(match_empty_or_deleted(unsafe { group_load(self.ctrl, 0) }));
+        }
+        i
+    }
+
+    // Sets bucket i's control byte, and its copy past the end.
+    #[inline]
+    fn set_ctrl(self: &mut Self, i: i64, c: u8) {
+        let mirror = ((i - GROUP) & self.bucket_mask) + GROUP;
+        unsafe {
+            self.ctrl[i] = c;
+            self.ctrl[mirror] = c;
+        }
+    }
+
+    // The element in FULL bucket i (checked): a view of it.
+    #[inline]
+    #[views(self)]
+    pub fn get(self: &Self, i: i64) -> &T {
+        self.check_full(i);
+        unsafe { &*(&self.data[i]) }
+    }
+
+    // The element in FULL bucket i (checked), to change in place (its hash
+    // must stay the same).
+    #[inline]
+    #[views(self)]
+    pub fn get_mut(self: &mut Self, i: i64) -> &mut T {
+        self.check_full(i);
+        unsafe { &mut *(&self.data[i]) }
+    }
+
+    // A raw pointer to bucket i's element, unchecked: the caller
+    // guarantees that i is FULL (a result of find).
+    #[inline]
+    pub unsafe fn bucket_unchecked(self: &Self, i: i64) -> *T {
+        &self.data[i]
+    }
+
+    // A raw pointer to FULL bucket i's element (checked), valid until the
+    // table changes: for code that keeps it past a view's rules.
+    #[inline]
+    pub fn bucket(self: &Self, i: i64) -> *T {
+        self.check_full(i);
+        unsafe { &self.data[i] }
+    }
+
+    // The buckets' memory (null before the first allocation): raw, for
+    // iterators that pair it with `iter()`'s indices.
+    #[inline]
+    pub fn bucket_ptr(self: &Self) -> *T {
+        self.data
+    }
+
+    // Replaces the element in FULL bucket i (checked) with x, which must
+    // have the same hash; the old one is dropped.
+    #[inline]
+    pub fn write(self: &mut Self, i: i64, x: T) {
+        self.check_full(i);
+        unsafe {
+            if needs_drop::<T>() {
+                drop(self.data[i]);
+            }
+            self.data[i] = x;
+        }
+    }
+
+    // Removes the element in FULL bucket i (checked) and returns it. Its
+    // control byte becomes EMPTY when no search can have gone past it (an
+    // EMPTY byte within GROUP buckets on both sides spans no full group),
+    // else DELETED.
+    pub fn take(self: &mut Self, i: i64) -> T {
+        self.check_full(i);
+        let mask = self.bucket_mask;
+        let before = (i - GROUP) & mask;
+        let empty_before = match_empty(unsafe { group_load(self.ctrl, before) });
+        let empty_after = match_empty(unsafe { group_load(self.ctrl, i) });
+        if bitmask_leading(empty_before) + bitmask_trailing(empty_after) >= GROUP {
+            self.set_ctrl(i, CTRL_DELETED);
+        } else {
+            self.growth_left += 1;
+            self.set_ctrl(i, CTRL_EMPTY);
+        }
+        self.items -= 1;
+        unsafe { self.data[i] }
+    }
+
+    // Removes and drops the element in FULL bucket i (checked).
+    pub fn erase(self: &mut Self, i: i64) {
+        let x = self.take(i);
+        drop(x);
+    }
+
+    // Room for n more elements without growing; hasher as for insert.
+    #[inline]
+    pub fn reserve<H: FnMut(&T) -> u64>(self: &mut Self, n: i64, hasher: H) {
+        if n > self.growth_left {
+            self.reserve_rehash(n, hasher);
+        }
+    }
+
+    // Makes room for n more elements: rehashes in place when that frees
+    // enough (at most half the capacity is in use), else moves to a table
+    // of twice the room at least.
+    #[cold]
+    fn reserve_rehash<H: FnMut(&T) -> u64>(self: &mut Self, n: i64, hasher: H) {
+        if n > ALLOC_LIMIT / 16 - self.items {
+            out_of_memory();
+        }
+        let new_items = self.items + n;
+        let full = raw_capacity(self.bucket_mask);
+        if new_items <= full / 2 {
+            self.rehash_in_place(hasher);
+        } else {
+            self.resize(if new_items > full + 1 { new_items } else { full + 1 }, hasher);
+        }
+    }
+
+    // Moves every element to a new allocation with room for cap.
+    fn resize<H: FnMut(&T) -> u64>(self: &mut Self, cap: i64, mut hasher: H) {
+        let old_ctrl = self.ctrl;
+        let old_data = self.data;
+        let old_mask = self.bucket_mask;
+        let items = self.items;
+        self.alloc_buckets(raw_buckets_for(cap));
+        if old_mask != 0 {
+            for g in 0..(old_mask >> 3) + 1 {
+                let pos = g * GROUP;
+                let mut m = match_full(unsafe { group_load(old_ctrl, pos) });
+                for _ in 0..GROUP {
+                    if m == 0 {
+                        break;
+                    }
+                    let i = pos + bitmask_lowest(m);
+                    m = bitmask_remove_lowest(m);
+                    let hash = unsafe { hasher(&*(&old_data[i])) };
+                    let j = self.find_insert_slot(hash);
+                    self.set_ctrl(j, ctrl_tag(hash));
+                    unsafe {
+                        self.data[j] = old_data[i];
+                    }
+                }
+            }
+            let (size, align, _) = RawTable::<T, A>::raw_layout(old_mask + 1);
+            unsafe {
+                self.alloc.free(old_data as *u8, size, align);
+            }
+        }
+        self.items = items;
+        self.growth_left -= items;
+    }
+
+    // Rehashes in place, turning the DELETED buckets back into EMPTY ones
+    // (hashbrown's algorithm): FULL bytes become DELETED, EMPTY and DELETED
+    // become EMPTY, then each element marked DELETED is moved to the first
+    // free bucket of its probe sequence, swapping with an element there
+    // still to be moved.
+    fn rehash_in_place<H: FnMut(&T) -> u64>(self: &mut Self, mut hasher: H) {
+        let buckets = self.bucket_mask + 1;
+        for g in 0..(buckets + GROUP - 1) / GROUP {
+            let i = g * GROUP;
+            unsafe {
+                group_store(self.ctrl, i,
+                    convert_special_to_empty_and_full_to_deleted(group_load(self.ctrl, i)));
+            }
+        }
+        // (the copy past the end)
+        if buckets < GROUP {
+            for k in 0..buckets {
+                unsafe {
+                    self.ctrl[GROUP + k] = self.ctrl[k];
+                }
+            }
+        } else {
+            unsafe {
+                group_store(self.ctrl, buckets, group_load(self.ctrl, 0));
+            }
+        }
+        for i in 0..buckets {
+            if unsafe { self.ctrl[i] } != CTRL_DELETED {
+                continue;
+            }
+            // (each round places one element for good: buckets rounds at most)
+            for _ in 0..buckets {
+                let hash = unsafe { hasher(&*(&self.data[i])) };
+                let j = self.find_insert_slot(hash);
+                // (in the same group as its probe's start: it stays)
+                let start = hash as i64 & self.bucket_mask;
+                if ((i - start) & self.bucket_mask) / GROUP
+                    == ((j - start) & self.bucket_mask) / GROUP {
+                    self.set_ctrl(i, ctrl_tag(hash));
+                    break;
+                }
+                let prev = unsafe { self.ctrl[j] };
+                self.set_ctrl(j, ctrl_tag(hash));
+                if prev == CTRL_EMPTY {
+                    self.set_ctrl(i, CTRL_EMPTY);
+                    unsafe {
+                        self.data[j] = self.data[i];
+                    }
+                    break;
+                }
+                // (j held an element still to move: swap, go on with it)
+                unsafe {
+                    let x = self.data[j];
+                    self.data[j] = self.data[i];
+                    self.data[i] = x;
+                }
+            }
+        }
+        self.growth_left = raw_capacity(self.bucket_mask) - self.items;
+    }
+
+    // Drops every element.
+    fn drop_elements(self: &mut Self) {
+        if needs_drop::<T>() && self.items > 0 {
+            for g in 0..(self.bucket_mask >> 3) + 1 {
+                let pos = g * GROUP;
+                let mut m = match_full(unsafe { group_load(self.ctrl, pos) });
+                for _ in 0..GROUP {
+                    if m == 0 {
+                        break;
+                    }
+                    let i = pos + bitmask_lowest(m);
+                    m = bitmask_remove_lowest(m);
+                    unsafe {
+                        drop(self.data[i]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Removes (and drops) every element; keeps the memory.
+    pub fn clear(self: &mut Self) {
+        if self.bucket_mask == 0 {
+            return;
+        }
+        self.drop_elements();
+        unsafe {
+            raw_fill_empty(self.ctrl, self.bucket_mask + 1 + GROUP);
+        }
+        self.items = 0;
+        self.growth_left = raw_capacity(self.bucket_mask);
+    }
+
+    // The FULL buckets, in bucket order.
+    #[views(self)]
+    pub fn iter(self: &Self) -> RawIter {
+        if self.bucket_mask == 0 {
+            return RawIter { ctrl: "", pos: 0, bits: 0 };
+        }
+        let ctrl = unsafe { self.ctrl[0..self.bucket_mask + 1 + GROUP] };
+        RawIter { ctrl: ctrl, pos: 0, bits: match_full(unsafe { group_load(ctrl.ptr, 0) }) }
+    }
+
+    // Drops the elements and gives the memory back; the table is empty,
+    // and may be used again.
+    pub fn free(self: &mut Self) {
+        self.drop_elements();
+        if self.bucket_mask != 0 {
+            let (size, align, _) = RawTable::<T, A>::raw_layout(self.bucket_mask + 1);
+            unsafe {
+                self.alloc.free(self.data as *u8, size, align);
+            }
+            self.ctrl = 0 as *u8;
+            self.data = 0 as *T;
+            self.bucket_mask = 0;
+        }
+        self.growth_left = 0;
+        self.items = 0;
+    }
+
+    // (tests) How far the elements are from where their search starts,
+    // in groups; hasher as for insert.
+    pub fn probe_stats<H: FnMut(&T) -> u64>(self: &Self, mut hasher: H) -> ProbeStats {
+        let mut stats = ProbeStats { total: 0, max: 0 };
+        let mask = self.bucket_mask;
+        for i in self.iter() {
+            let hash = unsafe { hasher(&*(&self.data[i])) };
+            let mut pos = hash as i64 & mask;
+            let mut stride = 0;
+            let mut steps = 0;
+            for _ in 0..(mask >> 3) + 1 {
+                if ((i - pos) & mask) < GROUP {
+                    break;
+                }
+                stride += GROUP;
+                pos = (pos + stride) & mask;
+                steps += 1;
+            }
+            stats.total += steps;
+            if steps > stats.max {
+                stats.max = steps;
+            }
+        }
+        stats
+    }
+
+    // (tests) The table's invariants, with every element found again by
+    // its hash: "" when they hold, else the first broken.
+    pub fn check<H: FnMut(&T) -> u64>(self: &Self, mut hasher: H) -> [u8] {
+        let buckets = self.bucket_mask + 1;
+        if self.bucket_mask == 0 {
+            if self.items != 0 || self.growth_left != 0 {
+                return "an unallocated table holds elements";
+            }
+            return "";
+        }
+        let mut full = 0;
+        let mut deleted = 0;
+        for i in 0..buckets {
+            let c = unsafe { self.ctrl[i] };
+            if c & 0x80 == 0 {
+                full += 1;
+                let hash = unsafe { hasher(&*(&self.data[i])) };
+                if ctrl_tag(hash) != c {
+                    return "a control byte is not its element's tag";
+                }
+                // (the search for it, by bucket: found, not passed)
+                let at = unsafe { &self.data[i] as *T } as i64;
+                if self.find(hash, |p: &T| p as *T as i64 == at) != i {
+                    return "an element is not found by its hash";
+                }
+            } else if c == CTRL_DELETED {
+                deleted += 1;
+            } else if c != CTRL_EMPTY {
+                return "a control byte is neither FULL, EMPTY nor DELETED";
+            }
+        }
+        for k in 0..GROUP {
+            let mirror = if buckets < GROUP {
+                if k < buckets { unsafe { self.ctrl[k] } } else { CTRL_EMPTY }
+            } else {
+                unsafe { self.ctrl[k] }
+            };
+            let at = if buckets < GROUP { if k < buckets { GROUP + k } else { k } }
+                else { buckets + k };
+            if unsafe { self.ctrl[at] } != mirror {
+                return "the control bytes past the end are not a copy";
+            }
+        }
+        if full != self.items {
+            return "items is not the number of FULL buckets";
+        }
+        if self.growth_left != raw_capacity(self.bucket_mask) - full - deleted {
+            return "growth_left is not the capacity left";
+        }
+        if self.growth_left < 0 {
+            return "more elements than the capacity";
+        }
+        ""
+    }
+}
+
+// The table's drop: its elements' drops, then its memory given back.
+impl<T, A: Allocator> Drop for RawTable<T, A> {
+    #[inline]
+    fn drop(self: &mut RawTable<T, A>) {
+        self.free();
+    }
+}
+
+impl RawIter {
+    // The next FULL bucket, or -1 at the end.
+    #[inline]
+    pub fn next_index(self: &mut RawIter) -> i64 {
+        // (at most the groups left)
+        for _ in 0..self.ctrl.len / GROUP + 1 {
+            if self.bits != 0 {
+                let i = self.pos + bitmask_lowest(self.bits);
+                self.bits = bitmask_remove_lowest(self.bits);
+                return i;
+            }
+            self.pos += GROUP;
+            // (ctrl has buckets + GROUP bytes: a group starts before buckets)
+            if self.pos + GROUP >= self.ctrl.len {
+                return -1;
+            }
+            self.bits = match_full(unsafe { group_load(self.ctrl.ptr, self.pos) });
+        }
+        -1
+    }
+}
+
+impl Iterator for RawIter {
+    type Item = i64;
+
+    #[inline]
+    fn next(self: &mut RawIter) -> Option<i64> {
+        let i = self.next_index();
+        if i < 0 { Option::None } else { Option::Some(i) }
+    }
+}

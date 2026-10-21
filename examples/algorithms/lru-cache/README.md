@@ -164,9 +164,9 @@ get b -> None
 put c=30 -> updates c, evicts nothing
   [c=30, d=4, a=1]
 Stats { hits: 1, misses: 1, evictions: 1 }
-capacity   1000: hit rate 45.84%, 2165200 evictions, sum 1957768245
-capacity  10000: hit rate 63.95%, 1432094 evictions, sum 1957768245
-capacity 100000: hit rate 82.32%,  607309 evictions, sum 1957768245
+capacity   1000: hit rate 45.84%, 2165200 evictions, sum 2031579725
+capacity  10000: hit rate 63.95%, 1432094 evictions, sum 2031579725
+capacity 100000: hit rate 82.32%,  607309 evictions, sum 2031579725
 ```
 
 and on stderr `lru: 12000000 requests in 230 ms` (the time varies).

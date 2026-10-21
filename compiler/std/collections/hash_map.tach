@@ -1,60 +1,52 @@
-// std::collections::hash_map: HashMap.
+// std::collections::hash_map: HashMap (0.20: on the Swiss table).
 
-use std::{
-    ALLOC_LIMIT, Allocator, Ambient, Drop, Eq, Gpa, Hash, Option, alloc_bytes, drop, needs_drop,
-    out_of_memory, replace,
-};
+use std::{ALLOC_LIMIT, Allocator, Ambient, Drop, Eq, Gpa, Hash, Option, out_of_memory, replace};
+use super::raw_table::RawTable;
 
 // ---- HashMap ----
 
-// A hash table (open addressing, linear probing) from K to V. Slots are
-// numbered 0..slots(); `key_at(i)` and `value_at(i)` give an occupied
-// slot's entry (None for a free one), which is how the map is iterated.
+// A hash table from K to V: hashbrown's Swiss table (RawTable), its
+// entries (key, value) pairs in buckets, matched 8 control bytes at a
+// time; keys hashed by their Hash impl (std's: foldhash with fixed seeds,
+// so a map iterates in the same order in every run and on every target).
+// Slots are numbered 0..slots(); `key_at(i)` and `value_at(i)` give an
+// occupied slot's entry (None for a free one); `iter()` is the same in
+// slot order.
 #[sealed]
 pub struct HashMap<K: Hash + Eq, V, A: Allocator = Gpa> {
-    keys: *K, values: *V, states: *u8, cap: i64, len: i64, used: i64, alloc: A,
+    table: RawTable<(K, V), A>,
 }
 
-// Slot states.
-const SLOT_FREE: u8 = 0;
+// (0.20: the old table's slot state of an entry; kept for code that names
+// it)
 pub const SLOT_FULL: u8 = 1;
-const SLOT_GONE: u8 = 2;
+
+// The hash of an entry's key.
+#[inline]
+fn entry_hash<K: Hash, V>(e: &(K, V)) -> u64 {
+    e.0.hash()
+}
 
 impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
     // An empty map on allocator a (0.16).
     pub fn new_in(a: A) -> HashMap<K, V, A> {
-        HashMap {
-            keys: 0 as *K, values: 0 as *V, states: 0 as *u8, cap: 0, len: 0, used: 0, alloc: a
-        }
+        HashMap { table: RawTable::new_in(a) }
     }
 
+    #[inline]
     pub fn len(self: &HashMap<K, V, A>) -> i64 {
-        self.len
+        self.table.len()
     }
 
+    #[inline]
     pub fn is_empty(self: &HashMap<K, V, A>) -> bool {
-        self.len == 0
+        self.table.len() == 0
     }
 
     // The slot holding `key`, or -1.
+    #[inline]
     fn slot_of(self: &HashMap<K, V, A>, key: &K) -> i64 {
-        if self.cap == 0 {
-            return -1;
-        }
-        let mask = self.cap - 1;
-        let mut i = (key.hash() & mask as u64) as i64;
-        // (a quarter of the slots at least are free: one ends the search)
-        for _ in 0..self.cap {
-            let state = unsafe { self.states[i] };
-            if state == SLOT_FREE {
-                return -1;
-            }
-            if state == SLOT_FULL && unsafe { self.keys[i] } == *key {
-                return i;
-            }
-            i = (i + 1) & mask;
-        }
-        -1
+        self.table.find(key.hash(), |e: &(K, V)| e.0 == *key)
     }
 
     pub fn contains(self: &HashMap<K, V, A>, key: K) -> bool {
@@ -62,14 +54,18 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
     }
 
     // The same as `contains` (Rust's name).
+    #[inline]
     pub fn contains_key(self: &HashMap<K, V, A>, key: K) -> bool {
         self.slot_of(&key) >= 0
     }
 
     // A copy of the value of `key`, if it has one (`get_mut` changes it).
+    #[inline]
     pub fn get(self: &HashMap<K, V, A>, key: K) -> Option<V> {
         let i = self.slot_of(&key);
-        if i < 0 { Option::None } else { Option::Some(unsafe { self.values[i] }) }
+        // (i from find: FULL)
+        if i < 0 { Option::None }
+        else { Option::Some(unsafe { (*self.table.bucket_unchecked(i)).1 }) }
     }
 
     // The value of `key` in place, as a writable view of one element, if
@@ -79,7 +75,11 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
     #[views(self)]
     pub fn get_mut(self: &mut HashMap<K, V, A>, key: K) -> Option<&mut [V]> {
         let i = self.slot_of(&key);
-        if i < 0 { Option::None } else { Option::Some(unsafe { &mut self.values[i..i + 1] }) }
+        if i < 0 {
+            return Option::None;
+        }
+        let p = unsafe { &(*self.table.bucket_unchecked(i)).1 as *V };
+        Option::Some(unsafe { &mut p[0..1] })
     }
 
     // The value of `key` in place (a writable view of one element, as `get_mut`),
@@ -88,183 +88,112 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
     #[views(self)]
     #[stores(key, default)]
     pub fn get_or_insert(self: &mut HashMap<K, V, A>, key: K, default: V) -> &mut [V] {
-        let mut i = self.slot_of(&key);
-        if i < 0 {
-            i = self.insert_new(key, default);
-        }
-        unsafe { &mut self.values[i..i + 1] }
+        let h = key.hash();
+        self.table.reserve(1, |e: &(K, V)| entry_hash(e));
+        let r = self.table.find_or_find_insert_slot(h, |e: &(K, V)| e.0 == key);
+        let i = if r >= 0 { r } else { self.table.insert_in_slot(h, ~r, (key, default)) };
+        // (i found or just filled: FULL)
+        let p = unsafe { &(*self.table.bucket_unchecked(i)).1 as *V };
+        unsafe { &mut p[0..1] }
     }
 
     // Sets the value of `key`; returns its old value, if it had one.
     #[stores(key, value)]
     pub fn insert(self: &mut HashMap<K, V, A>, key: K, value: V) -> Option<V> {
-        let i = self.slot_of(&key);
-        if i >= 0 {
-            let old = unsafe { self.values[i] };
+        let h = key.hash();
+        self.table.reserve(1, |e: &(K, V)| entry_hash(e));
+        let r = self.table.find_or_find_insert_slot(h, |e: &(K, V)| e.0 == key);
+        if r >= 0 {
+            // (the old value moves out, the new one in: neither is dropped)
+            let p = unsafe { self.table.bucket_unchecked(r) };
+            let old = unsafe { (*p).1 };
             unsafe {
-                self.values[i] = value;
+                (*p).1 = value;
             }
             return Option::Some(old);
         }
-        self.insert_new(key, value);
+        self.table.insert_in_slot(h, ~r, (key, value));
         Option::None
     }
 
-    // Adds `key`, which the map does not have; returns its slot.
-    fn insert_new(self: &mut HashMap<K, V, A>, key: K, value: V) -> i64 {
-        if (self.used + 1) * 4 > self.cap * 3 {
-            self.rehash();
-        }
-        let mask = self.cap - 1;
-        let mut j = (key.hash() & mask as u64) as i64;
-        for _ in 0..self.cap {
-            if unsafe { self.states[j] } != SLOT_FULL {
-                break;
-            }
-            j = (j + 1) & mask;
-        }
-        unsafe {
-            if self.states[j] == SLOT_FREE {
-                self.used += 1;
-            }
-            self.states[j] = SLOT_FULL;
-            self.keys[j] = key;
-            self.values[j] = value;
-        }
-        self.len += 1;
-        j
-    }
-
-    // Removes `key`; returns its value, if it had one.
+    // Removes `key`; returns its value, if it had one (the stored key is
+    // dropped).
     pub fn remove(self: &mut HashMap<K, V, A>, key: K) -> Option<V> {
         let i = self.slot_of(&key);
         if i < 0 {
             return Option::None;
         }
-        self.len -= 1;
-        unsafe {
-            self.states[i] = SLOT_GONE;
-            // (0.17: the key goes with its entry)
-            if needs_drop::<K>() {
-                drop(self.keys[i]);
-            }
-            Option::Some(self.values[i])
-        }
+        let e = self.table.take(i);
+        Option::Some(e.1)
     }
 
+    // The slots: what `key_at` and `value_at` take.
+    #[inline]
     pub fn slots(self: &HashMap<K, V, A>) -> i64 {
-        self.cap
+        if self.table.len() == 0 { 0 } else { self.table.buckets() }
     }
 
     pub fn key_at(self: &HashMap<K, V, A>, i: i64) -> Option<K> {
-        if i < 0 || i >= self.cap || unsafe { self.states[i] } != SLOT_FULL {
+        if !self.table.is_full(i) {
             return Option::None;
         }
-        Option::Some(unsafe { self.keys[i] })
+        Option::Some(unsafe { (*self.table.bucket(i)).0 })
     }
 
     pub fn value_at(self: &HashMap<K, V, A>, i: i64) -> Option<V> {
-        if i < 0 || i >= self.cap || unsafe { self.states[i] } != SLOT_FULL {
+        if !self.table.is_full(i) {
             return Option::None;
         }
-        Option::Some(unsafe { self.values[i] })
+        Option::Some(unsafe { (*self.table.bucket(i)).1 })
     }
 
-    // Twice the room (at least 8 slots), the entries moved over and the
-    // removed ones dropped.
-    fn rehash(self: &mut HashMap<K, V, A>) {
-        self.rehash_to(if self.cap == 0 { 8 } else { self.cap * 2 });
-    }
-
-    // The entries moved to `cap` slots (a power of two, more than 4/3 of
-    // len), the removed ones dropped.
-    fn rehash_to(self: &mut HashMap<K, V, A>, cap: i64) {
-        let old_cap = self.cap;
-        let old_keys = self.keys;
-        let old_values = self.values;
-        let old_states = self.states;
-        let key_bytes = alloc_bytes(cap, size_of(K));
-        let value_bytes = alloc_bytes(cap, size_of(V));
-        if key_bytes < 0 || value_bytes < 0 || cap > ALLOC_LIMIT {
-            out_of_memory();
-        }
-        unsafe {
-            self.keys = self.alloc.try_alloc(key_bytes, align_of(K)) as *K;
-            self.values = self.alloc.try_alloc(value_bytes, align_of(V)) as *V;
-            self.states = self.alloc.try_alloc(cap, 1);
-            if self.keys == 0 as *K || self.values == 0 as *V || self.states == 0 as *u8 {
-                out_of_memory();
-            }
-            for i in 0..cap {
-                self.states[i] = SLOT_FREE;
-            }
-        }
-        self.cap = cap;
-        self.used = self.len;
-        let mask = cap - 1;
-        for i in 0..old_cap {
-            if unsafe { old_states[i] } != SLOT_FULL {
-                continue;
-            }
-            let key = unsafe { old_keys[i] };
-            let mut j = (key.hash() & mask as u64) as i64;
-            unsafe {
-                for _ in 0..cap {
-                    if self.states[j] != SLOT_FULL {
-                        break;
-                    }
-                    j = (j + 1) & mask;
-                }
-                self.states[j] = SLOT_FULL;
-                self.keys[j] = key;
-                self.values[j] = old_values[i];
-            }
-        }
-        if old_cap > 0 {
-            unsafe {
-                self.alloc.free(old_keys as *u8, old_cap * size_of(K), align_of(K));
-                self.alloc.free(old_values as *u8, old_cap * size_of(V), align_of(V));
-                self.alloc.free(old_states, old_cap, 1);
-            }
-        }
+    // (std's iterators) The table.
+    #[inline]
+    #[views(self)]
+    pub fn raw_table(self: &HashMap<K, V, A>) -> &RawTable<(K, V), A> {
+        &self.table
     }
 
     // Its entries dropped and its memory given back; it is left empty, to
     // use again (0.17: a map is dropped at the end of its scope without
     // it).
     pub fn free(self: &mut HashMap<K, V, A>) {
-        self.release();
+        self.table.free();
+    }
+
+    // Removes every entry; keeps the memory.
+    pub fn clear(self: &mut HashMap<K, V, A>) {
+        self.table.clear();
     }
 
     // Its entries, in a map on the same allocator; it is left empty (0.17:
     // `std::take` for a container, which keeps its allocator).
     pub fn take(self: &mut HashMap<K, V, A>) -> HashMap<K, V, A> {
-        let empty: HashMap<K, V, A> = HashMap::new_in(self.alloc);
+        let empty: HashMap<K, V, A> = HashMap::new_in(self.table.allocator());
         replace(self, empty)
     }
 
-    // The entries dropped and the memory given back: empty, with no memory
-    // (0.17: drop and free).
-    #[inline]
-    fn release(self: &mut HashMap<K, V, A>) {
-        if self.cap > 0 {
-            unsafe {
-                if needs_drop::<K>() || needs_drop::<V>() {
-                    for i in 0..self.cap {
-                        if self.states[i] == SLOT_FULL {
-                            drop(self.keys[i]);
-                            drop(self.values[i]);
-                        }
-                    }
-                }
-                self.alloc.free(self.keys as *u8, self.cap * size_of(K), align_of(K));
-                self.alloc.free(self.values as *u8, self.cap * size_of(V), align_of(V));
-                self.alloc.free(self.states, self.cap, 1);
-            }
+    // Its allocator (0.16): a copy of the handle.
+    pub fn allocator(self: &HashMap<K, V, A>) -> A {
+        self.table.allocator()
+    }
+
+    // An empty map on allocator a with room for n entries (0.16).
+    pub fn with_capacity_in(n: i64, a: A) -> HashMap<K, V, A> {
+        if n > ALLOC_LIMIT / 16 {
+            out_of_memory();
         }
-        self.cap = 0;
-        self.len = 0;
-        self.used = 0;
+        HashMap { table: RawTable::with_capacity_in(n, a) }
+    }
+
+    // The entries it holds before it grows.
+    pub fn capacity(self: &HashMap<K, V, A>) -> i64 {
+        self.table.capacity()
+    }
+
+    // Room for n more entries without growing.
+    pub fn reserve(self: &mut HashMap<K, V, A>, n: i64) {
+        self.table.reserve(n, |e: &(K, V)| entry_hash(e));
     }
 }
 
@@ -272,7 +201,7 @@ impl<K: Hash + Eq, V, A: Allocator> HashMap<K, V, A> {
 impl<K: Hash + Eq, V, A: Allocator> Drop for HashMap<K, V, A> {
     #[inline]
     fn drop(self: &mut HashMap<K, V, A>) {
-        self.release();
+        self.table.free();
     }
 }
 
