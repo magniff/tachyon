@@ -1,0 +1,75 @@
+// Compute: a 128 x 128 matrix product, a 2D dispatch of 16 x 16
+// workgroups, checked against the CPU within float rounding.
+// EXPECT: matmul ok
+
+use std::gpu::{BindingType, BufferUsage, Reflection, ShaderSource};
+
+const MSL: [[u8]; 13] = [
+    "#include <metal_stdlib>",
+    "using namespace metal;",
+    "kernel void matmul(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]],",
+    "                   device float* c [[buffer(2)]], constant uint& n [[buffer(3)]],",
+    "                   uint2 p [[thread_position_in_grid]]) {",
+    "    if (p.x >= n || p.y >= n) { return; }",
+    "    float acc = 0.0;",
+    "    for (uint k = 0; k < n; k++) {",
+    "        acc += a[p.y * n + k] * b[k * n + p.x];",
+    "    }",
+    "    c[p.y * n + p.x] = acc;",
+    "}",
+    "",
+];
+
+fn main(gpa: Gpa) -> i32 {
+    let inst = std::gpu::Instance::new_in(gpa);
+    let adapter = inst.adapter().unwrap();
+    let (dev, var queue) = adapter.device().unwrap();
+    var text = lines(MSL[..], gpa);
+    var refl = Reflection::new_in(gpa);
+    refl.compute("main", "matmul", 16, 16);
+    refl.bind(0, 0, BindingType::ReadOnlyStorage, compute: 0);
+    refl.bind(0, 1, BindingType::ReadOnlyStorage, compute: 1);
+    refl.bind(0, 2, BindingType::Storage, compute: 2);
+    refl.bind(0, 3, BindingType::Uniform, compute: 3);
+    let src = ShaderSource::msl(text.as_slice(), refl);
+    var shader = dev.shader(src).unwrap();
+    var pipe = dev.compute_pipeline(shader, "main").unwrap();
+
+    let n = 128;
+    var a: Vec<f32> = Vec::new_in(gpa);
+    var b: Vec<f32> = Vec::new_in(gpa);
+    for i in 0..n * n {
+        a.push(((i * 37) % 17) as f32 * 0.25 - 2.0);
+        b.push(((i * 11) % 13) as f32 * 0.5 - 3.0);
+    }
+    var ab = dev.buffer_init(std::gpu::bytes_of_f32(a.as_slice()), BufferUsage::STORAGE);
+    var bb = dev.buffer_init(std::gpu::bytes_of_f32(b.as_slice()), BufferUsage::STORAGE);
+    var cb = dev.buffer(n * n * 4, BufferUsage::STORAGE | BufferUsage::MAP_READ);
+    let params: [u32; 4] = [n as u32, 0, 0, 0];
+    var pb = dev.buffer_init(std::gpu::bytes_of_u32(params[..]), BufferUsage::UNIFORM);
+    var group = dev.bind_group(pipe.bind_layout(0),
+        [std::gpu::bind(0, ab), std::gpu::bind(1, bb), std::gpu::bind(2, cb),
+            std::gpu::bind(3, pb)][..]);
+    var enc = dev.encoder();
+    enc.compute_pass(|pass| {
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, group);
+        pass.dispatch(n / 16, n / 16);
+    });
+    queue.submit(enc.finish());
+    let got = std::gpu::f32s(cb.map_read(dev));
+    let av = a.as_slice();
+    let bv = b.as_slice();
+    var bad = 0;
+    for y in 0..n {
+        for x in 0..n {
+            var acc: f32 = 0.0;
+            for k in 0..n { acc += av[y * n + k] * bv[k * n + x]; }
+            let d = got[y * n + x] - acc;
+            let mag = if acc < 0.0 { -acc } else { acc };
+            if d > 0.001 * mag + 0.001 || d < -(0.001 * mag + 0.001) { bad += 1; }
+        }
+    }
+    if bad == 0 { println("matmul ok"); } else { println(f"matmul: {bad} elements differ"); }
+    0
+}

@@ -1,0 +1,231 @@
+// ---- Shader compiler implementation, translate (0.22) ----
+// The translator's entry: WGSL source to an output (the IR as text, MSL,
+// SPIR-V), on an arena of its own (docs/design/gpu.md §2.10: everything a
+// translation allocates is freed when it ends; no io, no globals).
+
+use front::new_front;
+use std::{Buf, Gpa, ScopedArena, Vec, arena_scope};
+
+pub const TARGET_CHECK: i64 = 0;
+pub const TARGET_IR: i64 = 1;
+pub const TARGET_MSL: i64 = 2;
+pub const TARGET_SPIRV: i64 = 3;
+
+pub struct Options {
+    target: i64,
+    // bench only: no bounds checks (the cost of the checks is measured
+    // against this; never shipped)
+    no_checks: bool,
+    // drop checks proven unneeded by a dominating loop condition
+    prove: bool,
+}
+
+pub fn options(target: i64) -> Options { Options { target: target, no_checks: false, prove: true } }
+
+// ---- Shader compiler implementation, translate: Reflection (0.22) ----
+
+// What a binding holds (WebGPU's binding types).
+pub const BK_UNIFORM: u8 = 0;
+pub const BK_STORAGE: u8 = 1;
+pub const BK_READ_ONLY_STORAGE: u8 = 2;
+pub const BK_TEXTURE: u8 = 3;
+pub const BK_STORAGE_TEXTURE: u8 = 4;
+pub const BK_SAMPLER: u8 = 5;
+pub const BK_COMPARISON_SAMPLER: u8 = 6;
+
+// One `@group(g) @binding(b)`: its kind, the smallest buffer it accepts
+// (a runtime-sized array counts one element), and, for the target, its
+// slot in each stage (vertex, fragment, compute; -1: not used there).
+pub struct BindingInfo {
+    group: i64, binding: i64, kind: u8, min_size: i64, slots: [i64; 3], global: i64
+}
+
+// An entry point: its WGSL name, its name in the output, its stage
+// (ir::STAGE_*), a compute entry's workgroup size, and the slot of the
+// sizes buffer it needs (-1: none; Metal only).
+pub struct EntryInfo {
+    name: Buf, target_name: Buf, stage: u8, workgroup: [i64; 3], sizes_slot: i64
+}
+
+// A vertex entry's input at @location(n): its scalar (ir::SK_*) and
+// component count, as WebGPU's vertex formats (`float32x3`: f32, 3).
+pub struct InputInfo { location: i64, scalar: u8, components: i64 }
+
+// A translated module's interface, in (group, binding) order; `sizes`
+// lists the runtime-sized storage bindings (indices into `bindings`) in
+// the order of the sizes buffer.
+pub struct Reflection {
+    entries: Vec<EntryInfo>, bindings: Vec<BindingInfo>, inputs: Vec<InputInfo>, sizes: Vec<i64>
+}
+
+pub fn new_reflection(gpa: Gpa) -> Reflection {
+    Reflection {
+        entries: Vec::new_in(gpa), bindings: Vec::new_in(gpa), inputs: Vec::new_in(gpa),
+        sizes: Vec::new_in(gpa)
+    }
+}
+
+// The target-neutral part of the reflection, from the IR.
+pub fn reflect(m: ir::Module, a: ScopedArena, refl: inout Reflection, gpa: Gpa) {
+    refl.entries.clear();
+    refl.bindings.clear();
+    refl.inputs.clear();
+    refl.sizes.clear();
+    for e in 0..m.entries.len() {
+        let en = m.entries[e];
+        var name = Buf::new_in(gpa);
+        name.push_str(en.name);
+        refl.entries.push(EntryInfo {
+            name: name, target_name: Buf::new_in(gpa), stage: en.stage, workgroup: en.wg,
+            sizes_slot: -1
+        });
+        if en.stage == ir::STAGE_VERTEX {
+            let f = m.functions[en.func];
+            for k in 0..f.params.len() {
+                let pt = m.types[f.params[k].ty];
+                if pt.kind == ir::TK_STRUCT && f.params[k].binding.kind == ir::BIND_NONE {
+                    for j in pt.mstart..pt.mstart + pt.mcount {
+                        let mem = m.members[j];
+                        if mem.binding.kind == ir::BIND_LOCATION {
+                            refl.inputs.push(InputInfo {
+                                location: mem.binding.value, scalar: m.types[mem.ty].scalar,
+                                components: m.width_of(mem.ty)
+                            });
+                        }
+                    }
+                } else if f.params[k].binding.kind == ir::BIND_LOCATION {
+                    refl.inputs.push(InputInfo {
+                        location: f.params[k].binding.value, scalar: pt.scalar,
+                        components: m.width_of(f.params[k].ty)
+                    });
+                }
+            }
+        }
+    }
+    let order = msl::binding_order(m, a);
+    for k in 0..order.len() {
+        let g = order[k];
+        let gl = m.globals[g];
+        if gl.group < 0 {
+            continue;
+        }
+        let t = m.types[gl.ty];
+        let kind = if gl.space == ir::SP_UNIFORM {
+            BK_UNIFORM
+        } else if gl.space == ir::SP_STORAGE {
+            if gl.access == ir::ACC_RW { BK_STORAGE } else { BK_READ_ONLY_STORAGE }
+        } else if t.kind == ir::TK_TEXTURE {
+            if t.n == ir::TEX_STORAGE_2D { BK_STORAGE_TEXTURE } else { BK_TEXTURE }
+        } else if t.n == 1 {
+            BK_COMPARISON_SAMPLER
+        } else {
+            BK_SAMPLER
+        };
+        let min = if gl.space == ir::SP_UNIFORM || gl.space == ir::SP_STORAGE { t.size } else { 0 };
+        if gl.space == ir::SP_STORAGE && m.is_runtime_sized(gl.ty) {
+            refl.sizes.push(refl.bindings.len());
+        }
+        refl.bindings.push(BindingInfo {
+            group: gl.group, binding: gl.binding, kind: kind, min_size: min, slots: [-1, -1, -1],
+            global: g
+        });
+    }
+}
+
+// The sizes buffer (Metal; the bounds checks of runtime-sized arrays): an
+// entry point whose `sizes_slot` is >= 0 reads one u32 per binding of
+// `refl.sizes`, in that order, the bytes the buffer bound there exposes
+// (its size minus the binding's offset, or the binding's size when one is
+// given), and the backend gives them with setBytes(words, 4 * len,
+// sizes_slot) before each dispatch or draw, in that entry's stage. `bound`
+// says it for a (group, binding), 0 when nothing is bound. A runtime-sized
+// array then has (bytes - its offset in the binding) / stride elements;
+// past them a load reads zero and a store is skipped.
+pub fn sizes_words<F: FnMut(i64, i64) -> i64>(refl: Reflection, bound: F, out: inout Vec<u32>) {
+    var f = bound;
+    out.clear();
+    for i in 0..refl.sizes.len() {
+        let b = refl.bindings[refl.sizes[i]];
+        let n = f(b.group, b.binding);
+        out.push(if n < 0 { 0 } else if n > 4294967295 { 4294967295u32 } else { n as u32 });
+    }
+}
+
+// A shader the translator rejects: its first error.
+pub struct ShaderError { code: [u8], pos: i64, line: i64, col: i64, msg: Buf, help: Buf }
+
+pub fn new_error(gpa: Gpa) -> ShaderError {
+    ShaderError { code: "", pos: 0, line: 0, col: 0, msg: Buf::new_in(gpa), help: Buf::new_in(gpa) }
+}
+
+impl ShaderError {
+    pub fn free(inout self) {
+        self.msg.free();
+        self.help.free();
+    }
+}
+
+// The 1-based line and column of byte `pos`.
+pub fn line_col(src: [u8], pos: i64) -> (i64, i64) {
+    var line = 1;
+    var col = 1;
+    let end = if pos < src.len { pos } else { src.len };
+    for i in 0..end {
+        if src[i] == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+pub fn fill_error(fr: front::Front, err: inout ShaderError) {
+    err.code = fr.err_code;
+    err.pos = fr.err_pos;
+    let (l, c) = line_col(fr.src, fr.err_pos);
+    err.line = l;
+    err.col = c;
+    err.msg.clear();
+    err.msg.push_str(fr.emsg.as_slice());
+    err.help.clear();
+    err.help.push_str(fr.ehelp.as_slice());
+}
+
+// Translates src; the output is appended to `out` (SPIR-V: its words,
+// little-endian). False, with err filled, when the shader is rejected.
+pub fn translate(src: [u8], opts: Options, out: inout Buf, refl: inout Reflection,
+    err: inout ShaderError, gpa: Gpa) -> bool {
+    // (0.20: the closure reaches out, refl and err through their addresses:
+    // a closure given to arena_scope's let F cannot capture an inout
+    // parameter yet; they outlive it)
+    let po = &out as *Buf;
+    let pr = &refl as *Reflection;
+    let pe = &err as *ShaderError;
+    arena_scope(gpa, |a| -> bool {
+        var fr = new_front(src, a);
+        fr.module();
+        if !fr.failed {
+            uniformity::check(fr);
+        }
+        if fr.failed {
+            unsafe { fill_error(fr, &*pe); }
+            return false;
+        }
+        if !opts.no_checks {
+            bounds::insert_checks(&fr.m, a, opts.prove);
+        } else {
+            bounds::insert_no_checks(&fr.m);
+        }
+        unsafe { reflect(fr.m, a, &*pr, gpa); }
+        if opts.target == TARGET_IR {
+            unsafe { dump::dump(fr.m, &*po); }
+        } else if opts.target == TARGET_MSL {
+            unsafe { msl::write(fr.m, a, &*po, &*pr); }
+        } else if opts.target == TARGET_SPIRV {
+            unsafe { spirv::write(fr.m, a, &*po); }
+        }
+        true
+    })
+}

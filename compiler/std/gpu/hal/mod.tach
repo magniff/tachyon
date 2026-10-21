@@ -1,0 +1,210 @@
+// std::gpu::hal (0.22, docs/design/gpu.md §2.1, §2.8): the backend
+// interface. A backend implements `Api` (devices, memory, compute,
+// copies, submission) and, when it can draw, `Render<Self>` (render
+// pipelines, passes, surfaces). A compute-only backend (CUDA, a CPU
+// fallback) implements `Api` alone and reports `render: false` in its
+// Caps; the public API checks the caps before any render call, so no
+// backend writes stubs. Metal (hal::metal) implements both; Vulkan (G3)
+// will. The design's "CUDA readiness" section lists what a new backend
+// needs.
+//
+// The rules of the hal:
+// - Everything is static: no `dyn`; the public API names the backend of
+//   the build (`std::gpu::Native`).
+// - The hal validates nothing: std::gpu checks its contracts first.
+// - Every hal type is an owned value: dropping it releases what it holds
+//   (a resource dropped while the GPU still uses it stays alive until the
+//   work that uses it is done: the backend's business).
+// - Memory is not assumed shared: buffers are reached by map_read,
+//   map_write and unmap, which a discrete-memory backend implements with
+//   staging copies; `Caps::unified_memory` is information only.
+// - A function returning Option fails with None when the driver refuses
+//   (out of memory, a shader or pipeline it rejects); its `err` Buf, when
+//   it takes one, gets the driver's message.
+
+pub mod metal;
+
+use std::gpu::shader::{Binding, EntryPoint, ShaderKind, ShaderSource};
+use std::gpu::types::{Color, Format, IndexFormat, Load, PipelineState, SamplerDesc, TextureDesc};
+
+// ---- The GPU backend interface (0.22) ----
+
+/// What a backend (and its device) can do.
+#[derive(Eq, Debug, Clone)]
+pub struct Caps {
+    /// Compute pipelines and dispatches.
+    pub compute: bool,
+    /// Render pipelines and passes (the backend implements Render).
+    pub render: bool,
+    /// Surfaces: presenting to windows.
+    pub surfaces: bool,
+    /// Textures and samplers bound to shaders (sampled and storage).
+    pub textures: bool,
+    /// Host and device share memory (mapping copies nothing). Information
+    /// only: the API behaves the same either way.
+    pub unified_memory: bool,
+    /// The form of shaders the backend takes (the shader compiler's
+    /// target).
+    pub shader_kind: ShaderKind,
+}
+
+/// A window system's handle for a surface (what std::window gives).
+#[derive(Eq)]
+pub enum RawSurface {
+    /// A CAMetalLayer (macOS): the layer's pointer.
+    MetalLayer(*u8),
+    /// No window: a surface whose frames are offscreen textures.
+    Headless,
+}
+
+// (0.20: by hand: a derived Clone of a raw pointer field calls clone_of::<*u8>,
+// which does not compile yet)
+impl Clone for RawSurface {
+    fn clone(self) -> RawSurface {
+        match self {
+            RawSurface::MetalLayer(p) => RawSurface::MetalLayer(p),
+            RawSurface::Headless => RawSurface::Headless,
+        }
+    }
+}
+
+pub trait Api {
+    type Adapter;
+    type Device;
+    type Queue;
+    type Buffer;
+    type Texture;
+    type TextureView;
+    type Sampler;
+    type Shader;
+    type ComputePipeline;
+    type BindGroup;
+    type CommandBuffer;
+    type ComputeEncoder;
+
+    // ---- adapters and devices ----
+    fn adapters<A: Allocator>(out: inout Vec<Self::Adapter, A>);
+    fn default_adapter() -> Option<Self::Adapter>;
+    fn adapter_name<A: Allocator>(a: Self::Adapter, out: inout Buf<A>);
+    fn adapter_low_power(a: Self::Adapter) -> bool;
+    fn open(a: Self::Adapter) -> Option<(Self::Device, Self::Queue)>;
+    fn caps(d: Self::Device) -> Caps;
+    /// Waits for everything submitted to the device.
+    fn device_wait_idle(d: Self::Device);
+
+    // ---- memory and resources ----
+    /// A buffer of size bytes holding init (zeros past it).
+    fn create_buffer(d: Self::Device, size: i64, init: [u8]) -> Option<Self::Buffer>;
+    /// The buffer's bytes as the GPU left them (the caller waited).
+    fn map_read(d: Self::Device, b: inout Self::Buffer) -> [u8];
+    /// The buffer's bytes to write; they reach the GPU at unmap.
+    fn map_write(d: Self::Device, b: inout Self::Buffer) -> inout [u8];
+    fn unmap(d: Self::Device, b: inout Self::Buffer);
+    fn create_texture(d: Self::Device, desc: TextureDesc) -> Option<Self::Texture>;
+    /// A view of t, of t's own format or another of the same size.
+    fn create_view(t: Self::Texture, format: Format, same_format: bool) -> Option<Self::TextureView>;
+    fn create_sampler(d: Self::Device, desc: SamplerDesc) -> Option<Self::Sampler>;
+    fn create_shader<A: Allocator>(d: Self::Device, src: ShaderSource, err: inout Buf<A>) -> Option<Self::Shader>;
+
+    fn create_compute_pipeline<A: Allocator>(d: Self::Device, s: Self::Shader, entry: EntryPoint,
+        err: inout Buf<A>) -> Option<Self::ComputePipeline>;
+
+    // ---- bind groups: resources at the slots their bindings name ----
+    fn bind_group_new(d: Self::Device) -> Self::BindGroup;
+
+    fn bind_group_buffer(g: inout Self::BindGroup, b: Binding, buf: Self::Buffer, offset: i64,
+        size: i64);
+
+    fn bind_group_texture(g: inout Self::BindGroup, b: Binding, v: Self::TextureView);
+    fn bind_group_sampler(g: inout Self::BindGroup, b: Binding, s: Self::Sampler);
+
+    // ---- recording ----
+    fn begin(d: Self::Device) -> Self::CommandBuffer;
+
+    fn copy_buffer(cb: inout Self::CommandBuffer, src: Self::Buffer, src_offset: i64,
+        dst: Self::Buffer, dst_offset: i64, size: i64);
+
+    fn copy_texture_to_buffer(cb: inout Self::CommandBuffer, src: Self::Texture, layer: i64, x: i64,
+        y: i64, w: i64, h: i64, dst: Self::Buffer, offset: i64, bytes_per_row: i64);
+
+    fn copy_buffer_to_texture(cb: inout Self::CommandBuffer, src: Self::Buffer, offset: i64,
+        bytes_per_row: i64, dst: Self::Texture, layer: i64, x: i64, y: i64, w: i64, h: i64);
+
+    fn begin_compute(cb: inout Self::CommandBuffer) -> Self::ComputeEncoder;
+    fn compute_set_pipeline(e: inout Self::ComputeEncoder, p: Self::ComputePipeline);
+    fn compute_set_bind_group(e: inout Self::ComputeEncoder, g: Self::BindGroup);
+    fn dispatch(e: inout Self::ComputeEncoder, x: i64, y: i64, z: i64);
+    /// (0.22) Small data at a native slot of the compute stage, copied now
+    /// (Metal's setBytes): the sizes buffer.
+    fn compute_set_bytes(e: inout Self::ComputeEncoder, bytes: [u8], slot: i64);
+    fn end_compute(e: inout Self::ComputeEncoder);
+
+    // ---- submission ----
+    /// Submits cb (it is empty afterwards).
+    fn submit(q: inout Self::Queue, cb: inout Self::CommandBuffer);
+    /// Writes data at offset, ordered after the work submitted before and
+    /// before the work submitted next.
+    fn write_buffer(q: inout Self::Queue, b: Self::Buffer, offset: i64, data: [u8]);
+
+    fn write_texture(q: inout Self::Queue, t: Self::Texture, layer: i64, x: i64, y: i64, w: i64,
+        h: i64, data: [u8], bytes_per_row: i64);
+
+    /// Waits for everything submitted to q; false if a submission failed.
+    fn queue_wait_idle(q: inout Self::Queue) -> bool;
+}
+
+/// What a backend that draws adds (its Caps say `render: true`).
+pub trait Render<B: Api> {
+    type RenderPipeline;
+    type RenderEncoder;
+    type PassDesc;
+    type Surface;
+    type Frame;
+
+    fn create_render_pipeline(d: B::Device, vs: B::Shader, vs_entry: EntryPoint, fs: B::Shader,
+        fs_entry: EntryPoint, has_fs: bool, state: PipelineState,
+        err: inout Buf) -> Option<Self::RenderPipeline>;
+
+    fn pass_new() -> Self::PassDesc;
+
+    fn pass_color(p: inout Self::PassDesc, i: i64, v: B::TextureView, load: Load, clear: Color,
+        store: bool);
+
+    fn pass_depth(p: inout Self::PassDesc, v: B::TextureView, load: Load, clear: f64, store: bool);
+    fn begin_render(cb: inout B::CommandBuffer, p: Self::PassDesc) -> Self::RenderEncoder;
+    fn render_set_pipeline(e: inout Self::RenderEncoder, p: Self::RenderPipeline);
+    fn render_set_bind_group(e: inout Self::RenderEncoder, g: B::BindGroup);
+    fn render_set_vertex_buffer(e: inout Self::RenderEncoder, slot: i64, b: B::Buffer, offset: i64);
+
+    fn render_set_index_buffer(e: inout Self::RenderEncoder, b: B::Buffer, format: IndexFormat,
+        offset: i64);
+
+    fn render_set_viewport(e: inout Self::RenderEncoder, x: f32, y: f32, w: f32, h: f32,
+        min_depth: f32, max_depth: f32);
+
+    fn render_set_scissor(e: inout Self::RenderEncoder, x: i64, y: i64, w: i64, h: i64);
+    fn render_set_blend_constant(e: inout Self::RenderEncoder, c: Color);
+
+    fn draw(e: inout Self::RenderEncoder, first_vertex: i64, vertices: i64, first_instance: i64,
+        instances: i64);
+
+    fn draw_indexed(e: inout Self::RenderEncoder, first_index: i64, indices: i64, base_vertex: i64,
+        first_instance: i64, instances: i64);
+
+    /// (0.22) Small data at a native slot of the vertex or fragment stage
+    /// (ShaderStage::VERTEX, FRAGMENT), copied now: the sizes buffer.
+    fn render_set_bytes(e: inout Self::RenderEncoder, stage: u32, bytes: [u8], slot: i64);
+    fn end_render(e: inout Self::RenderEncoder);
+
+    // ---- surfaces ----
+    fn create_surface(d: B::Device, raw: RawSurface) -> Option<Self::Surface>;
+
+    fn configure(s: inout Self::Surface, d: B::Device, width: i64, height: i64, format: Format,
+        vsync: bool);
+
+    /// The next frame and its texture; None when the surface has none to
+    /// give (outdated, or no drawable within the timeout).
+    fn next_frame(s: inout Self::Surface) -> Option<(Self::Frame, B::Texture)>;
+    /// Shows the frame after the work submitted to q so far.
+    fn present(q: inout B::Queue, f: Self::Frame);
+}

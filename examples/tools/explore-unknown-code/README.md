@@ -42,7 +42,7 @@ generated header:
 ```console
 $ tachyonc query items
 crate	main.tach	6
-std	<std>	584
+std	<std>	579
 crate::graph	graph.tach	11
 crate::heap	heap.tach	7
 crate::network	network.tach	2
@@ -64,7 +64,7 @@ std::collections::group	<std>	20
 std::io	<std>	12
 std::io::error	<std>	17
 std::io::buffered	<std>	37
-std::fmt	<std>	94
+std::fmt	<std>	82
 std::num	<std>	83
 std::num::tables	<std>	4
 std::convert	<std>	2
@@ -79,10 +79,33 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
-std::sync	<std>	29
-std::sync::atomic	<std>	48
-std::sync::mpsc	<std>	24
-std::thread	<std>	43
+std::objc	<std>	50
+std::objc::foundation	<std>	67
+std::gpu	<std>	140
+std::gpu::hal	<std>	7
+std::gpu::hal::metal	<std>	109
+std::gpu::hal::metal::bindings	<std>	776
+std::gpu::shader	<std>	25
+std::gpu::types	<std>	51
+std::gpu::types::BufferUsage	<std>	9
+std::gpu::types::TextureUsage	<std>	5
+std::gpu::types::ShaderStage	<std>	3
+std::gpu::wgsl	<std>	30
+std::gpu::wgsl::ir	<std>	267
+std::gpu::wgsl::names	<std>	238
+std::gpu::wgsl::lex	<std>	61
+std::gpu::wgsl::front	<std>	95
+std::gpu::wgsl::expr	<std>	39
+std::gpu::wgsl::builtins	<std>	35
+std::gpu::wgsl::entry	<std>	8
+std::gpu::wgsl::bounds	<std>	10
+std::gpu::wgsl::uniformity	<std>	1
+std::gpu::wgsl::msl	<std>	81
+std::gpu::wgsl::spirv	<std>	1
+std::gpu::wgsl::interp	<std>	89
+std::gpu::wgsl::dump	<std>	12
+std::gpu::wgsl::job	<std>	13
+std::gpu::wgsl::api	<std>	26
 std::string	<std>	153
 std::path	<std>	34
 std::fs	<std>	59
@@ -154,10 +177,10 @@ crate::heap::free_heap	heap.tach:63:8	fn	pub fn free_heap(h: inout MinHeap)
 crate::heap::is_empty	heap.tach:18:8	fn	pub fn is_empty(h: MinHeap) -> bool
 crate::heap::pop	heap.tach:35:8	fn	pub fn pop(h: inout MinHeap) -> Option<Entry>
 crate::graph::edges_from	graph.tach:55:8	fn	pub fn edges_from(g: Graph, i: i64) -> [Edge]
-std::Vec::filled_in	<std>:1488:12	method	pub fn filled_in(n: i64, x: sink T, a: sink A) -> Vec<T, A>
 crate::heap::push	heap.tach:22:8	fn	pub fn push(h: inout MinHeap, e: Entry)
-std::Vec::set	<std>:309:12	method	pub fn set(inout self, i: i64, x: sink T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
-std::Option::unwrap	<std>:127:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
+std::Vec::set	<std>:307:12	method	pub fn set(inout self, i: i64, x: sink T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
+std::Vec::filled_in	<std>:1486:12	method	pub fn filled_in(n: i64, x: sink T, a: sink A) -> Vec<T, A>
+std::Option::unwrap	<std>:125:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
 // callers (1)
 plan	main.tach:20:11	match quickest(g, a, b, gpa) {
 note query.budget: over the budget of 600 tokens, left out: calls 2, types or uses 9

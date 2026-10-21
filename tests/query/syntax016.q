@@ -3,7 +3,7 @@
 ## minimal `query effects`.
 $ items
 crate	syntax016/main.tach	10
-std	<std>	584
+std	<std>	579
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	37
@@ -21,7 +21,7 @@ std::collections::group	<std>	20
 std::io	<std>	12
 std::io::error	<std>	17
 std::io::buffered	<std>	37
-std::fmt	<std>	94
+std::fmt	<std>	82
 std::num	<std>	83
 std::num::tables	<std>	4
 std::convert	<std>	2
@@ -36,10 +36,33 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
-std::sync	<std>	29
-std::sync::atomic	<std>	48
-std::sync::mpsc	<std>	24
-std::thread	<std>	43
+std::objc	<std>	50
+std::objc::foundation	<std>	67
+std::gpu	<std>	140
+std::gpu::hal	<std>	7
+std::gpu::hal::metal	<std>	109
+std::gpu::hal::metal::bindings	<std>	776
+std::gpu::shader	<std>	25
+std::gpu::types	<std>	51
+std::gpu::types::BufferUsage	<std>	9
+std::gpu::types::TextureUsage	<std>	5
+std::gpu::types::ShaderStage	<std>	3
+std::gpu::wgsl	<std>	30
+std::gpu::wgsl::ir	<std>	267
+std::gpu::wgsl::names	<std>	238
+std::gpu::wgsl::lex	<std>	61
+std::gpu::wgsl::front	<std>	95
+std::gpu::wgsl::expr	<std>	39
+std::gpu::wgsl::builtins	<std>	35
+std::gpu::wgsl::entry	<std>	8
+std::gpu::wgsl::bounds	<std>	10
+std::gpu::wgsl::uniformity	<std>	1
+std::gpu::wgsl::msl	<std>	81
+std::gpu::wgsl::spirv	<std>	1
+std::gpu::wgsl::interp	<std>	89
+std::gpu::wgsl::dump	<std>	12
+std::gpu::wgsl::job	<std>	13
+std::gpu::wgsl::api	<std>	26
 std::string	<std>	153
 std::path	<std>	34
 std::fs	<std>	59
@@ -75,4 +98,4 @@ apply<closure(i64) -> i64 at syntax016/main.tach:47:32>	none
 crate::grow	alloc(Gpa) panic
 crate::main	alloc(Gpa) io global panic unsafe
 $ def Vec::new_in
-std::Vec::new_in	../../compiler/std/std.tach:191:12	method	pub fn new_in(a: sink A) -> Vec<T, A>
+std::Vec::new_in	../../compiler/std/std.tach:189:12	method	pub fn new_in(a: sink A) -> Vec<T, A>

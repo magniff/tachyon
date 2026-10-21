@@ -1,0 +1,67 @@
+// std::gpu::wgsl's reflection as std::gpu (g22-metalb) takes it: per
+// stage slots in (group, binding) order over what the stage uses, MSL
+// names, workgroup sizes, vertex inputs, and the sizes buffer: its slot per
+// entry point and its words, from what is bound (sizes_words).
+use std::gpu::wgsl;
+
+const SRC: [u8] = "struct P { n: u32, scale: f32 }\n\
+    @group(0) @binding(0) var<uniform> p: P;\n\
+    @group(0) @binding(2) var<storage, read> xs: array<f32>;\n\
+    @group(1) @binding(0) var<storage, read_write> ys: array<f32>;\n\
+    @group(0) @binding(1) var tex: texture_2d<f32>;\n\
+    @group(0) @binding(3) var smp: sampler;\n\
+    struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }\n\
+    @vertex fn vs(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>) -> VOut {\n\
+    return VOut(vec4<f32>(pos * p.scale, 0.0, 1.0), uv);\n\
+    }\n\
+    @fragment fn fs(v: VOut) -> @location(0) vec4<f32> {\n\
+    return textureSample(tex, smp, v.uv) * xs[0];\n\
+    }\n\
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    if id.x < p.n { ys[id.x] = xs[id.x] * p.scale; }\n\
+    }";
+
+const KINDS: [[u8]; 7] = ["Uniform", "Storage", "ReadOnlyStorage", "Texture", "StorageTexture",
+    "Sampler", "ComparisonSampler"];
+
+fn main(gpa: Gpa) -> i32 {
+    var out = Buf::new_in(gpa);
+    var refl = wgsl::new_reflection(gpa);
+    var err = wgsl::new_error(gpa);
+    if !wgsl::translate(SRC, wgsl::options(wgsl::TARGET_MSL), &out, &refl, &err, gpa) {
+        println(f"{err.line}:{err.col}: {err.code}: {err.msg.as_slice()}");
+        return 1;
+    }
+    for i in 0..refl.entries.len() {
+        let e = refl.entries[i];
+        println(
+            f"entry {e.name.as_slice()} native {e.target_name.as_slice()} stage {e.stage} workgroup {e.workgroup[0]} sizes_slot {e.sizes_slot}");
+    }
+    for i in 0..refl.bindings.len() {
+        let b = refl.bindings[i];
+        println(
+            f"bind({b.group}, {b.binding}, {KINDS[b.kind as i64]}, vertex: {b.slots[0]}, fragment: {b.slots[1]}, compute: {b.slots[2]}, min_size: {b.min_size})");
+    }
+    for i in 0..refl.inputs.len() {
+        let v = refl.inputs[i];
+        println(f"input {v.location} scalar {v.scalar} x{v.components}");
+    }
+    // xs bound with 4096 bytes at offset 16, ys with 1024
+    var words: Vec<u32> = Vec::new_in(gpa);
+    wgsl::sizes_words(refl,
+        |g, b| if g == 0 && b == 2 { 4096 - 16 } else if g == 1 && b == 0 { 1024 } else { 0 },
+        &words);
+    println(f"sizes {words:?}");
+    0
+}
+// EXPECT: entry vs native vs stage 0 workgroup 0 sizes_slot -1
+// EXPECT: entry fs native fs stage 1 workgroup 0 sizes_slot 1
+// EXPECT: entry main native main_ stage 2 workgroup 64 sizes_slot 3
+// EXPECT: bind(0, 0, Uniform, vertex: 0, fragment: -1, compute: 0, min_size: 8)
+// EXPECT: bind(0, 1, Texture, vertex: -1, fragment: 0, compute: -1, min_size: 0)
+// EXPECT: bind(0, 2, ReadOnlyStorage, vertex: -1, fragment: 0, compute: 1, min_size: 4)
+// EXPECT: bind(0, 3, Sampler, vertex: -1, fragment: 0, compute: -1, min_size: 0)
+// EXPECT: bind(1, 0, Storage, vertex: -1, fragment: -1, compute: 2, min_size: 4)
+// EXPECT: input 0 scalar 3 x2
+// EXPECT: input 1 scalar 3 x2
+// EXPECT: sizes [4080, 1024]
