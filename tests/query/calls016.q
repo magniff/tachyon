@@ -21,7 +21,7 @@ $ callees main
 1	call	apply	calls016/main.tach:21
 1	call	sum	calls016/main.tach:11
 1	ref	twice	calls016/main.tach:25
-1	call	std::fmt::print_int	<std>:10045
+1	call	std::fmt::print_int	<std>:10669
 ## main reaches a borrow of TABLE (put takes it by pointer) and a write of
 ## a field of it; sum reaches neither.
 $ callees main --writes TABLE
@@ -31,7 +31,7 @@ $ callees main --writes table::Table.count
 # calls016/table.tach
 15:14	write	main > add_and_sum > table::grow > table::put	(*t).count += 1;
 $ callees sum --writes TABLE
-note query.empty: sum reaches no write or borrow of table::TABLE (75 functions reached by calls and functions named as values)
+note query.empty: sum reaches no write or borrow of table::TABLE (179 functions reached by calls and functions named as values)
 $ callees sum --writes TABLE --count
 0
 ## query refs of a local (0.16): FN::local, or FILE:LINE:COL at its

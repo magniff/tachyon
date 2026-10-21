@@ -1278,6 +1278,50 @@ coreutils' in the linux/arm64 container.
 - benchmarks against Rust's std and C on the same operations (a bench/
   pair each); a property test per collection against a model (0.18)
 
+Done (0.20.0). Parameter conventions (docs/design/conventions.md: Phase
+0, T1 the semantics, T2 the tools, Phase M the migration and the flip),
+std as a module tree with a benchmark harness against Rust and C
+(bench/std), the collections (Swiss-table HashMap and HashSet, BTreeMap
+and BTreeSet, ipnsort and driftsort, slice algorithms), text (String,
+str, std::unicode, number formatting and parsing), I/O and the system
+(io, fs, path, env, process, time, random, sys), owned temporaries
+dropped at the statement's end, and `tachyonc lsp`
+(docs/design/collections-text-io.md for std's parts).
+
+The release gate (`gate.sh --release --no-x86`, 22:15 wall at load up
+to 38, rerun of suite-O0 and stress-grow 10:47): the chain (built by
+0.19.1), the suite at -O0/1/2 (1661 tests, 2 XFAIL), fuzz in every
+mode, ABI, objcheck 2388 and the x86 intrinsics' 240, layouts, lldb,
+threads (2530), incremental (160 series, 93% hits), stress-grow,
+examples-checkalloc (95); aarch64-linux (fixpoint, the suite at every
+level, 1334, fuzz, ABI, objcheck 2388, gdb, valgrind 245 clean). Its
+first run found, fixed before the tag: std's SysPath::ptr and
+DirEntry::file_name handing out a copied `let` receiver's storage
+(wrong output at -O0: std_io, sys_files, sys_process); bench/matmul and
+bench/wordcount (a migration to `inout f64` read as raw pointers; a
+checksum on std's Hash, now foldhash); the LSP transcripts' version.
+example_algorithms-lru-cache at -O0 timed out once under load 38 (4.8 s
+alone) and passed on the rerun.
+
+Moved to 0.20.1 or 0.21:
+- `fn(T)` and `fn(let T)` one type; std's consuming bounds then
+  `Fn(sink T)`;
+- a closure's by-value parameter dropped (a leak since 0.19);
+- a generic `let` parameter given an rvalue of a non-copyable type
+  other than a closure literal;
+- `fix --only conventions`: the `&` of an inout argument in an
+  f-string hole, `Iterator::at`'s convention in impls;
+- `query def` of std's statics' symbols (`tachyon.static.std.X`);
+- the own pass over std's own functions (two -O0 wrong-output bugs of
+  std slipped through without it before the tag);
+- compile time: a small std program does about 270 M more instructions
+  than with 0.19.1 (hello world 47 M to 317 M, a few ms), outside the
+  timed phases: std's text, much larger as a module tree, built for every
+  compilation; `check` of the compiler 13% more;
+- the rest of collections-text-io.md not yet done (VecDeque, a
+  small-vector and a bitset, property tests against models), and
+  compiler/src on 0.20's spelling (0.21's first commit).
+
 ## 0.21: concurrency, atomics and synchronization
 
 - threads: `spawn`/`join`, scoped threads that may borrow the parent's
@@ -2285,3 +2329,45 @@ of cc -O2, v0.19.0 0.954 in the same run; the pairs 0.995, 1.000,
 program. Compile time in instructions, against v0.19.0 on 0.19.1's
 source: the self-compile 9.35 G to 9.36 G at -O0, 40.26 G to 40.27 G at
 -O2 (-j1), check 4.33 G both, a small program 65 M both.
+
+### 0.20
+
+aarch64-macos (`gate.sh --only bench`, fastest of 5, ms, load 8 falling
+to 3: times move by several percent; 0.19.1 cannot build the programs in
+0.20's spelling, so it is compared by instructions retired, its own
+source against 0.20's, one run each):
+
+| program | 0.20 -O2 | cc -O2 | instructions 0.19.1 / 0.20 |
+|---|---|---|---|
+| binarytrees | 163 | 177 | 5102 / 5106 M |
+| collatz | 327 | 329 | 3041 / 3040 M |
+| fannkuch | 122 | 144 | 1292 / 1292 M |
+| heap | 212 | 207 | 1780 / 1762 M |
+| iterchain | 190 | 184 | 4491 / 4491 M |
+| json | 107 | 96 | 1523 / 1507 M |
+| matmul | 19 | 46 | 249 / 248 M |
+| sieve | 66 | 71 | 475 / 471 M |
+| sort | 19 | 56 | 416 / 361 M (-13%, ipnsort) |
+| wordcount | 79 | 72 | 1594 / 1721 M (+8%: foldhash and the Swiss table's probing; faster in time) |
+| geomean vs cc -O2 | 0.889 | 1 | |
+
+The pairs: iterchain/iterloop 0.974, fmtloop/fmtints 0.957,
+purecall/purecall_hoisted 1.000.
+
+bench/std (`bench/std/run.sh -r 3`, tachyon's time over the baseline's;
+Rust with the same hash where marked): hash_u64 0.98 (rust:fold), 0.62
+(Rust's default), 0.61 (C); hash_str 1.07, 0.81, 0.81; hash_churn 1.05,
+0.69, 0.73; btree_u64 0.86 (Rust), 1.00 (C); sort_unstable 1.16 (Rust),
+0.20 (qsort); sort_stable 1.17, 0.22 (mergesort); fmt_f64 0.80, 0.22
+(`%.17g`); fmt_f64_prec 1.85; parse_f64 1.35, 1.16 (strtod); fmt_int
+0.85, 0.55; parse_int 1.19, 1.06; chars 0.95; graphemes 0.28 (Rust's
+unicode-segmentation-free scan); width 0.93 (Rust str), 0.17 (wcwidth);
+term_feed 0.58, 0.46; str_ops 1.29, 1.16; read_lines 0.67 (allocating),
+1.03 (reused String), 0.94 (getline); rng 1.00; spawn 1.00; UTF-8
+validation about 15 GB/s on non-ASCII, 50-60 GB/s on ASCII. Above their
+targets: str_ops, parse_int, parse_f64 (0.20.1 work).
+
+Compile time (instructions retired, 0.20's source in a copy, no cache):
+the self-compile 10.88 G to 11.55 G at -O0 (+6.2%), 43.24 G to 43.80 G
+at -O2 -j1 (+1.3%); `check` 4.84 G to 5.49 G (+13.5%); a hello world 47 M
+to 317 M (std's text, above).

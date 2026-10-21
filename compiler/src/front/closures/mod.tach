@@ -31,8 +31,8 @@ use crate::base::{
     buf_int, buf_new, buf_slice, buf_str, free, grow, intern, intern_c,
 };
 use crate::base::diag::{
-    ERR_HELP, err_begin, err_end, err_fix, err_help, err_help_sym, err_int, err_str, err_sym,
-    err_try_fmt,
+    ERR_HELP, err_begin, err_end, err_end_soft, err_fix, err_help, err_help_sym, err_int, err_str,
+    err_sym, err_try_fmt,
 };
 use crate::front::ast::{
     CLOSURE_MOVE, CONV_NEW, FN_CLOSURE, NODES, NODE_CAPTURE, NodeKind, child, list_begin, list_end,
@@ -161,6 +161,14 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64) -> i64 {
         }
         let count = NODES[n].count;
         let tys = alloc_array::<i64>(count + 1);
+        // (0.20, §9.3) a 0.19 closure's `&T` parameter where 0.20's bound
+        // gives the T itself (a let parameter of a copyable T): the closure
+        // takes the T, and its parameter is `&` of it (a let at the body's
+        // start), as 0.19's body reads it
+        let shim = alloc_array::<i64>(count + 1);
+        for i in 0..count {
+            shim[i] = 0;
+        }
         for i in 0..count {
             let param = child(n, i);
             let wanted = if mark + i < TSCRATCH.count { TSCRATCH.data[mark + i] } else { 0 };
@@ -170,8 +178,19 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64) -> i64 {
                 // (0.20) a closure's parameter written `a: T` in a 0.20 file,
                 // or `a: let T`: let, a copy or a reference by T
                 t = crate::front::conv::closure_param_type(param, t);
+                if wanted > 0 && t > 0 && wanted != t && TYPES[t].kind == TyKind::Ptr
+                    && TYPES[t].a == wanted && TYPES[wanted].kind != TyKind::Ptr
+                    && !crate::front::conv::strict_at(NODES[param].start) {
+                    if TYPES[t].b == 0 {
+                        // (`*T`: the V4 error, its try: `&T`)
+                        raw_closure_param(NODES[param].b, t, t);
+                    }
+                    shim[i] = 1;
+                    t = wanted;
+                }
                 if legacy_ref_param(wanted, t) {
                     raw_closure_param(NODES[param].b, wanted, t);
+                    t = wanted;
                 }
                 if wanted != 0 && wanted != t && wanted != TY_ERROR && t != TY_ERROR {
                     mismatch_error(NODES[param].b, wanted, t);
@@ -226,7 +245,7 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64) -> i64 {
         let mut has_lets = false;
         for i in 0..count {
             let param = child(n, i);
-            if NODES[param].d == 0 {
+            if NODES[param].d == 0 && shim[i] == 0 {
                 params[i] = param;
                 if NODES[param].a == UNDERSCORE {
                     NODES[param].x = -1;
@@ -255,10 +274,20 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64) -> i64 {
             NODES[hidden].a = name;
             NODES[hidden].x = define_local(name, tys[i], false, true);
             params[i] = hidden;
-            let init = new_node(NodeKind::Ident, start, end);
+            let mut init = new_node(NodeKind::Ident, start, end);
             NODES[init].a = name;
+            let mut pattern = NODES[param].d;
+            if shim[i] != 0 {
+                // (`let x = &{param};`)
+                let amp = new_node(NodeKind::Unary, start, end);
+                NODES[amp].op = Tok::Amp;
+                NODES[amp].b = init;
+                init = amp;
+                pattern = new_node(NodeKind::PatBind, start, end);
+                NODES[pattern].a = NODES[param].a;
+            }
             let binding = new_node(NodeKind::Let, start, end);
-            NODES[binding].a = NODES[param].d;
+            NODES[binding].a = pattern;
             NODES[binding].c = init;
             list_push(binding);
             has_lets = true;
@@ -292,6 +321,7 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64) -> i64 {
         finish_closure(id, fn_body, params, tys, result);
         free(params as *u8);
         free(tys as *u8);
+        free(shim as *u8);
         CLOSURES[id].sig
     }
 }
@@ -305,7 +335,8 @@ fn raw_closure_param(ty: i64, wanted: i64, t: i64) {
         err_str(c"closure parameter of type '");
         err_type(t);
         err_str(c"' where '");
-        err_type(wanted);
+        // (wanted == t: the bound gives the value, which `&T` reads, 0.20)
+        err_type(if wanted == t { TYPES[t].a } else { wanted });
         err_str(c"' is wanted");
         err_help(c"a `*T` is a raw pointer (0.18.1), not a reference: write the parameter's type as the bound's");
         let rest = SRC[NODES[ty].start + 1..NODES[ty].end];
@@ -317,7 +348,8 @@ fn raw_closure_param(ty: i64, wanted: i64, t: i64) {
         }
         err_try_fmt(f"{buf_slice(text)}");
         err_fix(NODES[ty].start, NODES[ty].end, buf_slice(text));
-        err_end();
+        // (soft: every parameter of the closure gets its fix in one run)
+        err_end_soft();
     }
 }
 

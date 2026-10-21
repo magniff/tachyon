@@ -87,13 +87,13 @@ schoolbook kernel's inner loop is a multiply-add on a `u64` column; the
 ```tach
 for row in i..end {
     let ai: u64 = a[row];
-    let out = &mut acc[row..row + b.len];
-    for j in 0..b.len { out[j] += ai * b[j]; }
+    inout out = &acc[row..row + b.len()];
+    for j in 0..b.len() { out[j] += ai * b[j]; }
 }
 ```
 
-`out` is a writable slice of the accumulator (`&mut`: a plain `[T]` is
-read-only): indexing it is checked against its length once per row,
+`out` is a writable slice of the accumulator (an `inout` access: a
+plain `[T]` is read-only): indexing it is checked against its length once per row,
 outside the inner loop.
 
 **Karatsuba** writes `z0` and `z2` straight into the two halves of the
@@ -101,11 +101,11 @@ result, then makes `p`, subtracts them from it, and adds what is left in
 the middle:
 
 ```tach
-let m = a.len / 2;                  // b.len > m: both halves are there
+let m = a.len() / 2;                // b.len > m: both halves are there
 let (a0, a1) = (a[..m], a[m..]);
 let (b0, b1) = (b[..m], b[m..]);
-mul_karatsuba(a0, b0, &mut r[..2 * m]);  // z0, in place
-mul_karatsuba(a1, b1, &mut r[2 * m..]);  // z2, in place
+mul_karatsuba(a0, b0, &r[..2 * m], gpa);  // z0, in place
+mul_karatsuba(a1, b1, &r[2 * m..], gpa);  // z2, in place
 let sa = sum_of(a0, a1, gpa);
 let sb = sum_of(b0, b1, gpa);
 ...
@@ -130,55 +130,56 @@ say; with it, `self < other` works:
 struct BigUint { limbs: Vec<u32> }
 
 impl Ord for BigUint {
-    fn cmp(self: &BigUint, other: &BigUint) -> i64 {
+    fn cmp(self, other: BigUint) -> i64 {
         let (a, b) = (self.limbs.as_slice(), other.limbs.as_slice());
-        if a.len != b.len { return a.len - b.len; }
+        if a.len() != b.len() { return a.len() - b.len(); }
         ...
     }
 }
 ```
 
-**The arithmetic** is three methods that borrow their operands and
-return a new number, `a.plus(&b)`, `a.minus(&b)` and `a.times(&b)`. A
+**The arithmetic** is three methods that read their operands (`let`,
+the default) and return a new number, `a.plus(b)`, `a.minus(b)` and
+`a.times(b)`. A
 method takes no allocator, so the result is allocated where the left
 operand's limbs are: a `Vec` carries its allocator
 (`self.limbs.allocator()`). A number from a `u64` has no operand to ask,
 so it is `BigUint::from_u64(x, gpa)` rather than `From<u64>`:
 
 ```tach
-fn times(self: &BigUint, other: &BigUint) -> BigUint {
+fn times(self, other: BigUint) -> BigUint {
     // (the result is allocated where self's limbs are)
     let gpa = self.limbs.allocator();
-    let mut r = Vec::filled_in(self.limbs.len() + other.limbs.len(), 0u32, gpa);
+    var r = Vec::filled_in(self.limbs.len() + other.limbs.len(), 0u32, gpa);
     mul_karatsuba(self.limbs.as_slice(), other.limbs.as_slice(), r.as_mut_slice(), gpa);
     BigUint::from_limbs(r)
 }
 ```
 
 **The operators** are the prelude's `Add`, `Sub` and `Mul`, on top of
-them. Their traits take the operands by value (`self: Self`), so `a * b`
-moves `a` and `b` into the call, which drops them: right for temporaries,
-as in the product tree's `product(lo, mid, gpa) * product(mid + 1, hi, gpa)`,
-wrong for a number used again, which calls the borrowing method instead:
+them. Their traits take both operands `let` (0.20), so `a * b` reads `a`
+and `b` as `a.times(b)` does, and both can be used again; a temporary, as
+in the product tree's `product(lo, mid, gpa) * product(mid + 1, hi, gpa)`,
+is dropped after the call:
 
 ```tach
 impl Mul for BigUint {
-    fn mul(self: BigUint, other: BigUint) -> BigUint { self.times(&other) }
+    fn mul(self, other: BigUint) -> BigUint { self.times(other) }
 }
 ```
 
 **Who frees what.** Nobody, by hand: a `BigUint` owns its limbs, and
 each one is dropped at the end of its scope (or when it is moved into a
-callee, which drops it). Fast doubling makes six numbers per step and
+`sink` parameter, whose callee drops it). Fast doubling makes six numbers per step and
 keeps two, with no `free` in sight:
 
 ```tach
-let twice = b.plus(&b);
-let diff = twice.minus(&a);
-let sq_a = a.times(&a);
-let sq_b = b.times(&b);
-let even = a.times(&diff);          // F(2k)
-let odd = sq_a.plus(&sq_b);         // F(2k + 1)
+let twice = b.plus(b);
+let diff = twice.minus(a);
+let sq_a = a.times(a);
+let sq_b = b.times(b);
+let even = a.times(diff);           // F(2k)
+let odd = sq_a.plus(sq_b);          // F(2k + 1)
 ...
 a = even;                           // the old a is dropped here
 b = odd;
@@ -189,10 +190,10 @@ nine digits, with an f-string spec (`{x:09}`: zero-padded to 9):
 
 ```tach
 impl Display for BigUint {
-    fn fmt(self: &BigUint, f: &mut Fmt) {
+    fn fmt(self, f: inout Fmt) {
         ...
-        f.write(f"{s[s.len - 1]}");
-        let mut i = s.len - 2;
+        f.write(f"{s[s.len() - 1]}");
+        var i = s.len() - 2;
         while i >= 0 {
             f.write(f"{s[i]:09}");
             i -= 1;
@@ -277,14 +278,14 @@ another 10%.
 
 | feature | where | guide |
 |---|---|---|
-| operator traits `Add`, `Sub`, `Mul` (by value); `Ord` by hand gives `<` | `impl ... for BigUint` | `tachyonc guide traits` |
-| `&BigUint` parameters, `&mut [u32]` for slices that are written | `plus`/`minus`/`times`, the kernels | `tachyonc guide memory`, `guide views` |
+| operator traits `Add`, `Sub`, `Mul` (operands `let`); `Ord` by hand gives `<` | `impl ... for BigUint` | `tachyonc guide traits` |
+| `let` parameters (the default), `inout [u32]` for slices that are written | `plus`/`minus`/`times`, the kernels | `tachyonc guide memory`, `guide views` |
 | `#[derive(Eq, Clone, Debug)]`, `{x:?}` | `BigUint` | `tachyonc guide formatting` |
 | `impl Display`, `f.write(f"...")`, `{x:09}` | `Display for BigUint` | `tachyonc guide formatting` |
 | a `Vec` carries its allocator: `self.limbs.allocator()` | `BigUint::times` | `tachyonc guide allocators` |
 | widening: `u32` limbs into `u64` arithmetic | the kernels | `tachyonc guide conversions` |
 | slices as views, sub-slices `a[..m]`, written through | the kernels | `tachyonc guide types`, `guide memory` |
-| drops: every number freed at the end of its scope, moves into calls | everywhere | `tachyonc guide memory` |
+| drops: every number freed at the end of its scope | everywhere | `tachyonc guide memory` |
 | closures and iterators: `map`, `sum`, `fold` | `digit_sum`, `main` | `tachyonc guide iterators`, `guide closures` |
 | `unsafe { std::panic(c"...") }` for a broken precondition | `BigUint::minus` | `tachyonc guide unsafe` |
 | a C header: `import "time.h" as c;` | `now_ns` | `tachyonc guide c-interop` |

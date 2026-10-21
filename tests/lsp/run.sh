@@ -128,7 +128,8 @@ run_session() {
 # newline), the directory and compiler written back as placeholders.
 unframe() {
     tr -d '\r' <"$WORK/out" | sed 's/Content-Length: [0-9]*$//' | sed '/^$/d' \
-        | sed "s|$2|@DIR@|g; s|$COMPILER|tachyonc|g"
+        | sed "s|$2|@DIR@|g; s|$COMPILER|tachyonc|g" \
+        | sed 's/"serverInfo":{"name":"tachyonc","version":"[0-9.]*"}/"serverInfo":{"name":"tachyonc","version":"@VERSION@"}/'
 }
 
 # The transcript of session $1: its `##` and `>` lines, each request's

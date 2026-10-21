@@ -3,7 +3,7 @@
 ## minimal `query effects`.
 $ items
 crate	syntax016/main.tach	10
-std	<std>	564
+std	<std>	579
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	37
@@ -18,14 +18,16 @@ std::collections::raw_table	<std>	46
 std::collections::btree_node	<std>	56
 std::collections::btree_map	<std>	45
 std::collections::group	<std>	20
-std::io	<std>	7
-std::fmt	<std>	80
+std::io	<std>	12
+std::io::error	<std>	17
+std::io::buffered	<std>	37
+std::fmt	<std>	82
 std::num	<std>	83
 std::num::tables	<std>	4
 std::convert	<std>	2
 std::clone	<std>	1
 std::random	<std>	17
-std::sys	<std>	192
+std::sys	<std>	191
 std::time	<std>	40
 std::hash	<std>	6
 std::hash::fold	<std>	26
@@ -34,7 +36,17 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
-std::gpu	<std>	2
+std::objc	<std>	50
+std::objc::foundation	<std>	67
+std::gpu	<std>	139
+std::gpu::hal	<std>	7
+std::gpu::hal::metal	<std>	109
+std::gpu::hal::metal::bindings	<std>	776
+std::gpu::shader	<std>	21
+std::gpu::types	<std>	50
+std::gpu::types::BufferUsage	<std>	9
+std::gpu::types::TextureUsage	<std>	5
+std::gpu::types::ShaderStage	<std>	3
 std::gpu::wgsl	<std>	30
 std::gpu::wgsl::ir	<std>	267
 std::gpu::wgsl::names	<std>	238
@@ -51,6 +63,11 @@ std::gpu::wgsl::interp	<std>	89
 std::gpu::wgsl::dump	<std>	12
 std::gpu::wgsl::job	<std>	13
 std::gpu::wgsl::api	<std>	26
+std::string	<std>	153
+std::path	<std>	34
+std::fs	<std>	59
+std::env	<std>	21
+std::process	<std>	36
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6
@@ -81,4 +98,4 @@ apply<closure(i64) -> i64 at syntax016/main.tach:47:32>	none
 crate::grow	alloc(Gpa) panic
 crate::main	alloc(Gpa) io global panic unsafe
 $ def Vec::new_in
-std::Vec::new_in	../../compiler/std/std.tach:183:12	method	pub fn new_in(a: sink A) -> Vec<T, A>
+std::Vec::new_in	../../compiler/std/std.tach:189:12	method	pub fn new_in(a: sink A) -> Vec<T, A>

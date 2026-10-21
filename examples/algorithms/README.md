@@ -17,7 +17,7 @@ the two compare.
 | [huffman](huffman/) | Huffman coding: canonical codes, bit packing, table decoder | O(n + k log k) | `#[derive(Eq, Ord, Debug)]`, generic `MinHeap`, `?`, `main -> Result`, named and default args, `zip`/`fold`/`position` | 500 MB/s encode | within 1.2x |
 | [lru-cache](lru-cache/) | LRU cache: `HashMap` + list linked by indices | O(1) per request | generic struct, `HashMap`, custom `Iterator`, `#[derive(Debug, Clone)]` | 230 ms, 12M requests | 155 ms |
 | [bigint](bigint/) | big integers: schoolbook and Karatsuba multiplication, fast-doubling Fibonacci | O(n^1.585) multiply | `impl Add/Sub/Mul`, `Ord`, `Display`, `From<u64>`/`.into()`, `#[derive(Eq, Clone, Debug)]` | F(10^6) in 44 ms | 24 ms |
-| [quickselect](quickselect/) | quickselect, median of medians (BFPRT) | O(n) expected; O(n) worst | generic over `T: Ord`, re-slicing views, tuple returns, closures capturing a `let mut`, `collect` | 26 ms, 2M values | 24 ms |
+| [quickselect](quickselect/) | quickselect, median of medians (BFPRT) | O(n) expected; O(n) worst | generic over `T: Ord`, re-slicing views, tuple returns, closures capturing a `var`, `collect` | 26 ms, 2M values | 24 ms |
 | [sudoku](sudoku/) | backtracking over bitmasks, most-constrained cell first | exponential; ~50 ns per node | fixed arrays in structs, `Result` + `#[derive(Debug)]` errors, default and named arguments | 90 ms, 1.9M nodes | 90 ms |
 | [nqueens](nqueens/) | n-queens counting with bitmasks and mirror symmetry | exponential; O(1) per node | unsigned bit tricks, recursion, `const` arrays, `if` in f-strings | 71 ms, n = 1..14 | 70 ms |
 
@@ -64,6 +64,6 @@ and how the example avoids it:
 - The `u32 x u32 -> u64` multiply-accumulate loop is not vectorized
   (`bigint`'s schoolbook kernel is 1.7x behind clang's).
 - Register shuffling in hash-probe loops (`lru-cache`, 1.5x behind C).
-- Fields of a struct updated through `self: &mut T` in a hot loop stay in
+- Fields of a struct updated through `inout self` in a hot loop stay in
   memory (`huffman`'s encoder keeps its bit buffer in locals: 8.7 ms
   instead of 11 ms).

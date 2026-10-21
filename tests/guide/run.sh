@@ -341,8 +341,8 @@ fi
 # --full (0.17) is the long form, topic language, with std's API in it.
 "$COMPILER" guide --full >"$WORK/full.md" 2>&1
 if [ "$(head -1 "$WORK/full.md")" = "$(head -1 "$WORK/topic-language.md")" ]; then
-    if grep -qF 'fn new_in(a: A) -> Vec<T, A>' "$WORK/full.md" \
-        && ! grep -qF 'fn new_in(a: A) -> Vec<T, A>' "$WORK/topic-language.md" \
+    if grep -qF 'fn new_in(a: sink A) -> Vec<T, A>' "$WORK/full.md" \
+        && ! grep -qF 'fn new_in(a: sink A) -> Vec<T, A>' "$WORK/topic-language.md" \
         && ! grep -q '@STD-API' "$WORK/full.md" "$WORK/topic-language.md"; then
         result pass guide-full
     else
@@ -413,9 +413,9 @@ if [ "$size" -le 21000 ] && [ "$page" -le 4500 ] \
     && grep -qF 'Vec::new_in(gpa) -> Vec<T>' "$WORK/std-page.md" \
     && grep -qF 'tachyonc guide std#the-api' "$WORK/std-page.md" && grep -qF 'MinHeap::new_in(gpa)' "$WORK/std-page.md" \
     && ! grep -q '^## Overview$' "$WORK/std-page.md" && ! grep -q '@PAGE-END@' "$WORK/std-page.md" "$WORK/topic-std.md" \
-    && grep -q '^## Overview$' "$WORK/topic-std.md" && grep -qF 'fn push(self: &mut Self, x: T)' "$WORK/topic-std.md" \
-    && grep -qF 'fn split_in<A: Allocator>(s: [u8], sep: u8, a: A) -> Vec<[u8], A>' "$WORK/topic-std.md" \
-    && "$COMPILER" guide 'std#the-api' 2>&1 | grep -qF 'fn push(self: &mut Self, x: T)' \
+    && grep -q '^## Overview$' "$WORK/topic-std.md" && grep -qF 'fn push(inout self, x: sink T)' "$WORK/topic-std.md" \
+    && grep -qF 'fn split_in<A: Allocator>(s: [u8], sep: u8, a: sink A) -> Vec<[u8], A>' "$WORK/topic-std.md" \
+    && "$COMPILER" guide 'std#the-api' 2>&1 | grep -qF 'fn push(inout self, x: sink T)' \
     && ! grep -q '^## Every item' "$WORK/topic-std.md" \
     && ! grep -qF 'fn __' "$WORK/topic-std.md" \
     && ! grep -qF 'live_blocks' "$WORK/topic-std.md" \
@@ -451,7 +451,7 @@ fi
 "$COMPILER" guide --find split_in >"$WORK/finditem.out" 2>"$WORK/finditem.err"
 rc=$?
 if [ $rc -eq 0 ] && head -1 "$WORK/finditem.out" | grep -q '^# std#every-item$' \
-    && grep -qF 'fn split_in<A: Allocator>(s: [u8], sep: u8, a: A) -> Vec<[u8], A>' "$WORK/finditem.out" \
+    && grep -qF 'fn split_in<A: Allocator>(s: [u8], sep: u8, a: sink A) -> Vec<[u8], A>' "$WORK/finditem.out" \
     && grep -q '^// The parts of s' "$WORK/finditem.out" \
     && [ "$(wc -c <"$WORK/finditem.out" | tr -d ' ')" -le 4000 ]; then
     result pass guide-find-item
@@ -460,7 +460,7 @@ else
 fi
 "$COMPILER" guide --find vec::push >"$WORK/findm.out" 2>&1
 if grep -q '^impl<T, A: Allocator> Vec<T, A> {$' "$WORK/findm.out" \
-    && grep -qF '    fn push(self: &mut Vec<T, A>, x: T)' "$WORK/findm.out" \
+    && grep -qF '    fn push(inout self, x: sink T)' "$WORK/findm.out" \
     && ! grep -qF 'fn pop' "$WORK/findm.out"; then
     result pass guide-find-method
 else
@@ -562,7 +562,7 @@ try_case() { # <name> <expected output> <snippet...>
 }
 try_case int 'i64 = 3' '1 + 2'
 try_case std 'Option<i64> = Some(42)' 'parse_int("42").ok()'
-try_case vec 'Vec<i64> = [4, 5]' 'let mut v: Vec<i64> = Vec::new_in(gpa); v.push(4); v.push(5); v'
+try_case vec 'Vec<i64> = [4, 5]' 'var v: Vec<i64> = Vec::new_in(gpa); v.push(4); v.push(5); v'
 try_case output "hi
 [u8] = \"abc\"" 'println("hi"); "abc"'
 try_case item 'i64 = 49' 'fn sq(x: i64) -> i64 { x * x } sq(7)'
@@ -574,7 +574,7 @@ try_case panic 'snippet:1:37: index out of bounds: index 3, length 0
 exit 101' 'let v: Vec<i64> = Vec::new_in(gpa); v.get(3)'
 printf 'struct P { x: i64 }\n\nlet p = P { x: 4 };\np.x * 10\n' >"$WORK/snip.tach"
 try_case file 'i64 = 40' --file "$WORK/snip.tach"
-got=$(printf '7\n' | "$COMPILER" try 'let mut b = Buf::new_in(gpa); read_line(&mut b).unwrap(); parse_int(b.as_slice()).ok()' 2>&1)
+got=$(printf '7\n' | "$COMPILER" try 'var b = Buf::new_in(gpa); read_line(&b).unwrap(); parse_int(b.as_slice()).ok()' 2>&1)
 if [ "$got" = 'Option<i64> = Some(7)' ]; then result pass try-stdin; else result FAIL try-stdin "$got"; fi
 "$COMPILER" try >"$WORK/try.out" 2>&1
 rc=$?

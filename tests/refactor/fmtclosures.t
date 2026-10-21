@@ -33,8 +33,13 @@ $ fmt --dry-run main.tach
 +        .enumerate()
 +        .map(|(i, x)| i * x)
 +        .sum();
+@@ -25 +31,3 @@
+-    let f = sink |left: i64, right: i64| -> i64 { let m = left * right; m + total + some_long_name_here + 1 };
++    let f = sink |left: i64, right: i64| -> i64 {
++        let m = left * right; m + total + some_long_name_here + 1
++    };
 $ fmt
-formatted	main.tach	+11 -5 lines
+formatted	main.tach	+14 -6 lines
 % cat main.tach
 // Closures and iterator chains laid out by hand, for `tachyonc fmt` (0.14).
 fn apply<F: Fn(i64) -> i64>(f: F, x: i64) -> i64 { f(x) }

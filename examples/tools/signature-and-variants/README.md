@@ -35,15 +35,15 @@ ok: built bank
 ### Reorder
 
 `transfer(l, amount, from, to)` reads badly at its calls:
-`transfer(&mut l, 1000, 2, 1)`. Its calls, by kind:
+`transfer(&l, 1000, 2, 1)`. Its calls, by kind:
 
 ```console
 $ tachyonc query refs transfer --kind call
 # ledger.tach
-75:35	call	ledger::apply	Event::Transfer(to, n) => transfer(l, n, who, to),
-81:13	call	ledger::apply	transfer(l, b * permille / 1000, 0, who)
+75:35	call	ledger::apply	Event::Transfer(to, n) => transfer(&l, n, who, to),
+81:13	call	ledger::apply	transfer(&l, b * permille / 1000, 0, who)
 # main.tach
-45:5	call	main	transfer(&mut l, 1000, 2, 1);
+45:5	call	main	transfer(&l, 1000, 2, 1);
 ```
 
 `--reorder` takes every parameter once. Forget one and the error lists
@@ -56,13 +56,13 @@ error refactor.usage: --reorder lists each parameter once: (l, amount, from, to)
 $ tachyonc refactor signature transfer --reorder l,from,to,amount --show
 reordered the parameters of crate::ledger::transfer, 3 calls	2 files	+4 -4 lines
 // main.tach:45
-45	    transfer(&mut l, 2, 1, 1000);
+45	    transfer(&l, 2, 1, 1000);
 // ledger.tach:49
-49	pub fn transfer(l: &mut Ledger, from: i64, to: i64, amount: i64) -> bool {
+49	pub fn transfer(l: inout Ledger, from: i64, to: i64, amount: i64) -> bool {
 // ledger.tach:75
-75	        Event::Transfer(to, n) => transfer(l, who, to, n),
+75	        Event::Transfer(to, n) => transfer(&l, who, to, n),
 // ledger.tach:81
-81	            transfer(l, 0, who, b * permille / 1000)
+81	            transfer(&l, 0, who, b * permille / 1000)
 ```
 
 The three calls were rewritten with it, including the one inside a
@@ -75,15 +75,15 @@ used is refused, with the place that uses it:
 
 ```console
 $ tachyonc refactor signature apply --remove who
-error refactor.used: parameter who is used in crate::ledger::apply at ledger.tach:71:23
+error refactor.used: parameter who is used in crate::ledger::apply at ledger.tach:71:24
 try: tachyonc query show ledger.tach:71
 [exit 1]
 $ tachyonc refactor signature apply --remove day --show
 removed parameter day of crate::ledger::apply, 1 call	2 files	+2 -2 lines
 // main.tach:36
-36	                let ok = apply(&mut l, who, e);
+36	                let ok = apply(&l, who, e);
 // ledger.tach:65
-65	pub fn apply(l: &mut Ledger, who: i64, e: Event) -> bool {
+65	pub fn apply(l: inout Ledger, who: i64, e: Event) -> bool {
 ```
 
 ### Add, with a default
@@ -212,12 +212,12 @@ $ tachyonc edit insert --in main --after '(1, "withdraw 99999"),' <<'EOF'
 inserted in crate::main	main.tach	+2 -0 lines
 $ tachyonc edit insert --after ledger::transfer <<'EOF'
 > // A fee from account `who` to the house, counted in its fees_paid.
-> fn charge(l: &mut Ledger, who: i64, n: i64) -> bool {
->     if !transfer(l, who, 0, n) {
+> fn charge(l: inout Ledger, who: i64, n: i64) -> bool {
+>     if !transfer(&l, who, 0, n) {
 >         return false;
 >     }
 >     if let Some(i) = index_of(l, who) {
->         let mut a = l.accounts.get(i);
+>         var a = l.accounts.get(i);
 >         a.fees_paid += n;
 >         l.accounts.set(i, a);
 >     }
@@ -232,10 +232,10 @@ one `edit patch` with a target per item (`--in NAME` starts the next
 target's pairs), checked and written as one edit:
 
 ```console
-$ tachyonc edit patch ledger::apply --old 'Event::Fee(_) => false' --new 'Event::Fee(n) => charge(l, who, n)' --in report::describe --old 'Event::Fee(_) => format_in("a fee", gpa)' --new 'Event::Fee(n) => format_in(f"fee of {n}", gpa)' --in report::summary --old 'may go to -{a.overdraft}' --new 'may go to -{a.overdraft}, fees {a.fees_paid}' --show
+$ tachyonc edit patch ledger::apply --old 'Event::Fee(_) => false' --new 'Event::Fee(n) => charge(&l, who, n)' --in report::describe --old 'Event::Fee(_) => format_in("a fee", gpa)' --new 'Event::Fee(n) => format_in(f"fee of {n}", gpa)' --in report::summary --old 'may go to -{a.overdraft}' --new 'may go to -{a.overdraft}, fees {a.fees_paid}' --show
 patched crate::report::describe, crate::report::summary, crate::ledger::apply	2 files	+4 -3 lines
 // ledger.tach:96
-96	        Event::Fee(n) => charge(l, who, n),
+96	        Event::Fee(n) => charge(&l, who, n),
 // report.tach:13
 13	        Event::Fee(n) => format_in(f"fee of {n}", gpa),
 // report.tach:27-28
@@ -272,7 +272,7 @@ $ git diff --stat
 ## Why not by hand
 
 - A reordered parameter is the change a text edit gets silently wrong:
-  `transfer(l, n, who, to)` and `transfer(l, who, to, n)` both compile,
+  `transfer(&l, n, who, to)` and `transfer(&l, who, to, n)` both compile,
   with every amount and account id swapped. The tool moves each call's
   arguments with the parameters, by position or by label.
 - A removed parameter is checked against its uses first; a removed

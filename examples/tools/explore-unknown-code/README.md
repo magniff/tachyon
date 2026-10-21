@@ -42,7 +42,7 @@ generated header:
 ```console
 $ tachyonc query items
 crate	main.tach	6
-std	<std>	575
+std	<std>	579
 crate::graph	graph.tach	11
 crate::heap	heap.tach	7
 crate::network	network.tach	2
@@ -70,7 +70,7 @@ std::num::tables	<std>	4
 std::convert	<std>	2
 std::clone	<std>	1
 std::random	<std>	17
-std::sys	<std>	192
+std::sys	<std>	191
 std::time	<std>	40
 std::hash	<std>	6
 std::hash::fold	<std>	26
@@ -79,6 +79,33 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
+std::objc	<std>	50
+std::objc::foundation	<std>	67
+std::gpu	<std>	139
+std::gpu::hal	<std>	7
+std::gpu::hal::metal	<std>	109
+std::gpu::hal::metal::bindings	<std>	776
+std::gpu::shader	<std>	21
+std::gpu::types	<std>	50
+std::gpu::types::BufferUsage	<std>	9
+std::gpu::types::TextureUsage	<std>	5
+std::gpu::types::ShaderStage	<std>	3
+std::gpu::wgsl	<std>	30
+std::gpu::wgsl::ir	<std>	267
+std::gpu::wgsl::names	<std>	238
+std::gpu::wgsl::lex	<std>	61
+std::gpu::wgsl::front	<std>	95
+std::gpu::wgsl::expr	<std>	39
+std::gpu::wgsl::builtins	<std>	35
+std::gpu::wgsl::entry	<std>	8
+std::gpu::wgsl::bounds	<std>	10
+std::gpu::wgsl::uniformity	<std>	1
+std::gpu::wgsl::msl	<std>	81
+std::gpu::wgsl::spirv	<std>	1
+std::gpu::wgsl::interp	<std>	89
+std::gpu::wgsl::dump	<std>	12
+std::gpu::wgsl::job	<std>	13
+std::gpu::wgsl::api	<std>	26
 std::string	<std>	153
 std::path	<std>	34
 std::fs	<std>	59
@@ -96,8 +123,8 @@ $ tachyonc query items route
 17	struct	pub struct Route
 23	struct	struct Step
 30	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64
-34	fn	pub fn quickest(g: &Graph, from: i64, to: i64, gpa: Gpa) -> Option<Route>
-68	fn	fn legs_to(how: &Vec<Step>, from: i64, to: i64, gpa: Gpa) -> Vec<Leg>
+34	fn	pub fn quickest(g: Graph, from: i64, to: i64, gpa: Gpa) -> Option<Route>
+68	fn	fn legs_to(how: Vec<Step>, from: i64, to: i64, gpa: Gpa) -> Vec<Leg>
 ```
 
 ## 2. The function that computes the total
@@ -110,17 +137,17 @@ fit is counted, with the commands that print it:
 ```console
 $ tachyonc query context quickest --budget 600
 // crate::route::quickest	route.tach:34-64	effects: alloc(Gpa) panic diverge
-pub fn quickest(g: &Graph, from: i64, to: i64, gpa: Gpa) -> Option<Route> {
+pub fn quickest(g: Graph, from: i64, to: i64, gpa: Gpa) -> Option<Route> {
     let n = size(g);
-    let mut best: Vec<i64> = Vec::filled_in(n, i64::MAX, gpa);
-    let mut how: Vec<Step> = Vec::filled_in(n, Step { from: -1, line: 0, minutes: 0 }, gpa);
-    let mut h = new_heap(gpa);
-    defer free_heap(&mut h);
+    var best: Vec<i64> = Vec::filled_in(n, i64::MAX, gpa);
+    var how: Vec<Step> = Vec::filled_in(n, Step { from: -1, line: 0, minutes: 0 }, gpa);
+    var h = new_heap(gpa);
+    defer free_heap(&h);
 
     best.set(from, 0);
-    push(&mut h, Entry { cost: 0, node: from, line: 0 });
-    while !is_empty(&h) {
-        let cur = pop(&mut h).unwrap();
+    push(&h, Entry { cost: 0, node: from, line: 0 });
+    while !is_empty(h) {
+        let cur = pop(&h).unwrap();
         if cur.cost > best.get(cur.node) {
             continue;
         }
@@ -132,30 +159,31 @@ pub fn quickest(g: &Graph, from: i64, to: i64, gpa: Gpa) -> Option<Route> {
             if cost < best.get(e.to) {
                 best.set(e.to, cost);
                 how.set(e.to, Step { from: cur.node, line: e.line, minutes: e.minutes });
-                push(&mut h, Entry { cost: cost, node: e.to, line: e.line });
+                push(&h, Entry { cost: cost, node: e.to, line: e.line });
             }
         }
     }
     if best.get(to) == i64::MAX {
         return None;
     }
-    Some(Route { legs: legs_to(&how, from, to, gpa), total: best.get(to) })
+    Some(Route { legs: legs_to(how, from, to, gpa), total: best.get(to) })
 }
 // calls (14)
 crate::route::ride_cost	route.tach:30:4	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64
-crate::route::legs_to	route.tach:68:4	fn	fn legs_to(how: &Vec<Step>, from: i64, to: i64, gpa: Gpa) -> Vec<Leg>
-crate::graph::size	graph.tach:21:8	fn	pub fn size(g: &Graph) -> i64
+crate::route::legs_to	route.tach:68:4	fn	fn legs_to(how: Vec<Step>, from: i64, to: i64, gpa: Gpa) -> Vec<Leg>
+crate::graph::size	graph.tach:21:8	fn	pub fn size(g: Graph) -> i64
 crate::heap::new_heap	heap.tach:14:8	fn	pub fn new_heap(gpa: Gpa) -> MinHeap
-crate::heap::free_heap	heap.tach:63:8	fn	pub fn free_heap(h: &mut MinHeap)
-crate::heap::is_empty	heap.tach:18:8	fn	pub fn is_empty(h: &MinHeap) -> bool
-crate::heap::pop	heap.tach:35:8	fn	pub fn pop(h: &mut MinHeap) -> Option<Entry>
-crate::graph::edges_from	graph.tach:55:8	fn	pub fn edges_from(g: &Graph, i: i64) -> [Edge]
-std::Vec::filled_in	<std>:1484:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
-crate::heap::push	heap.tach:22:8	fn	pub fn push(h: &mut MinHeap, e: Entry)
-std::Vec::set	<std>:306:12	method	pub fn set(self: &mut Vec<T, A>, i: i64, x: T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
-std::Option::unwrap	<std>:124:12	method	pub fn unwrap(self: Option<T>) -> T requires self.is_some() else "called unwrap on None"
-note query.budget: over the budget of 600 tokens, left out: calls 2, types or uses 9, callers 1
-try: tachyonc query callers quickest
+crate::heap::free_heap	heap.tach:63:8	fn	pub fn free_heap(h: inout MinHeap)
+crate::heap::is_empty	heap.tach:18:8	fn	pub fn is_empty(h: MinHeap) -> bool
+crate::heap::pop	heap.tach:35:8	fn	pub fn pop(h: inout MinHeap) -> Option<Entry>
+crate::graph::edges_from	graph.tach:55:8	fn	pub fn edges_from(g: Graph, i: i64) -> [Edge]
+crate::heap::push	heap.tach:22:8	fn	pub fn push(h: inout MinHeap, e: Entry)
+std::Vec::set	<std>:307:12	method	pub fn set(inout self, i: i64, x: sink T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
+std::Vec::filled_in	<std>:1486:12	method	pub fn filled_in(n: i64, x: sink T, a: sink A) -> Vec<T, A>
+std::Option::unwrap	<std>:125:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
+// callers (1)
+plan	main.tach:20:11	match quickest(g, a, b, gpa) {
+note query.budget: over the budget of 600 tokens, left out: calls 2, types or uses 9
 try: tachyonc query context quickest --budget 1800
 ```
 
@@ -188,8 +216,8 @@ function. `--kind` keeps some kinds:
 ```console
 $ tachyonc query refs Entry.line --kind init
 # route.tach
-42:47	init	route::quickest	push(&mut h, Entry { cost: 0, node: from, line: 0 });
-56:62	init	route::quickest	push(&mut h, Entry { cost: cost, node: e.to, line: e.line });
+42:43	init	route::quickest	push(&h, Entry { cost: 0, node: from, line: 0 });
+56:58	init	route::quickest	push(&h, Entry { cost: cost, node: e.to, line: e.line });
 ```
 
 The first state is `Entry { ..., line: 0 }`. A search of the comments

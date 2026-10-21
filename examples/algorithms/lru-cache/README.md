@@ -76,7 +76,7 @@ struct LruCache<K: Hash + Eq, V> {
 indexes it directly:
 
 ```tach
-fn unlink(self: &mut LruCache<K, V>, i: i32) {
+fn unlink(inout self, i: i32) {
     let (prev, next) = (self.nodes[i].prev, self.nodes[i].next);
     if prev == NIL { self.head = next; } else { self.nodes[prev].next = next; }
     if next == NIL { self.tail = prev; } else { self.nodes[next].prev = prev; }
@@ -87,7 +87,7 @@ fn unlink(self: &mut LruCache<K, V>, i: i32) {
 miss and returns early:
 
 ```tach
-fn get(self: &mut LruCache<K, V>, key: K) -> Option<V> {
+fn get(inout self, key: sink K) -> Option<V> {
     let i = match self.slots.get(key) {
         Some(i) => i,
         None => {
@@ -110,11 +110,10 @@ full, it recycles the tail's slot:
 ```tach
 let i = self.tail;
 self.unlink(i);
-let n = self.nodes.as_slice();
-let old = (n[i].key, n[i].value);
+let old = (self.nodes[i].key, self.nodes[i].value);
 self.slots.remove(old.0);
-n[i].key = key;
-n[i].value = value;
+self.nodes[i].key = key;
+self.nodes[i].value = value;
 self.slots.insert(key, i);
 self.push_front(i);
 ```
@@ -127,7 +126,7 @@ Item = (K, V)`. Everything iterators have comes with it: `show` uses
 ```tach
 impl<K, V> Iterator for LruIter<K, V> {
     type Item = (K, V);
-    fn next(self: &mut LruIter<K, V>) -> Option<(K, V)> {
+    fn next(inout self) -> Option<(K, V)> {
         if self.at == NIL { return None; }
         let n = self.nodes[self.at];
         self.at = n.next;

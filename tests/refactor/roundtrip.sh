@@ -64,7 +64,7 @@ items() {
         $2 != "method" && $2 != "field" && $2 != "variant" {
         k = $2; t = $3; name = "-"
         if (k == "fn" || k == "const" || k == "static" || k == "struct" || k == "enum" || k == "trait") {
-            sub(/^pub /, "", t); sub(/^(fn|const|static mut|static|struct|enum|trait) /, "", t)
+            sub(/^pub /, "", t); sub(/^(fn|const|static mut|static var|static|struct|enum|trait) /, "", t)
             match(t, /^[A-Za-z_][A-Za-z0-9_]*/); name = substr(t, 1, RLENGTH)
         } else { k = "-" }
         print k, name, $1

@@ -76,17 +76,17 @@ compare-and-swaps; the partition is Hoare's, with `loop` and `while`
 standing in for C's `do ... while`:
 
 ```tach
-fn quickselect<T: Ord>(s: [T], k: i64) -> T {
-    let mut lo = 0;
-    let mut hi = s.len - 1;
+fn quickselect<T: Ord>(s: inout [T], k: i64) -> T {
+    var lo = 0;
+    var hi = s.len() - 1;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         if s[mid] < s[lo] { swap(s, mid, lo); }
         if s[hi] < s[lo] { swap(s, hi, lo); }
         if s[hi] < s[mid] { swap(s, hi, mid); }
         let pivot = s[mid];
-        let mut i = lo - 1;
-        let mut j = hi + 1;
+        var i = lo - 1;
+        var j = hi + 1;
         loop {
             i += 1;
             while s[i] < pivot { i += 1; }
@@ -102,29 +102,30 @@ fn quickselect<T: Ord>(s: [T], k: i64) -> T {
 ```
 
 `<` on a `T: Ord` is `cmp`; for `i64` it compiles to one compare
-instruction. A slice parameter is a view, so `swap(s, i, j)` writes the
-caller's values.
+instruction. `s` is an `inout [T]`, a writable view, so `swap(s, i, j)`
+writes the caller's values.
 
 **Median of medians** keeps its window as a slice and narrows it by
-re-slicing, `w = w[..lt]` or `w = w[gt..]`: no index bookkeeping. The
+re-slicing, `w = &w[..lt]` or `w = &w[gt..]` (`&`: the view stays
+writable): no index bookkeeping. The
 groups' medians are swapped to the front, and the recursive call
 selects their median in place:
 
 ```tach
-let groups = w.len / 5;
+let groups = w.len() / 5;
 for g in 0..groups {             // each group's median to the front
     let a = 5 * g;
-    insertion_sort(w[a..a + 5]);
+    insertion_sort(&w[a..a + 5]);
     swap(w, g, a + 2);
 }
-let pivot = median_of_medians(w[..groups], groups / 2);
+let pivot = median_of_medians(&w[..groups], groups / 2);
 let (lt, gt) = partition3(w, pivot);
 if k < lt {
-    w = w[..lt];
+    w = &w[..lt];
 } else if k < gt {
     return pivot;
 } else {
-    w = w[gt..];
+    w = &w[gt..];
     k -= gt;
 }
 ```
@@ -134,20 +135,20 @@ and returns a tuple, destructured by the `let`. Separating the values
 equal to the pivot guarantees progress when many values are equal.
 
 **The driver** runs the three methods through one generic function,
-which takes the selection as a closure, `F: FnMut([i64], i64) -> i64`,
+which takes the selection as a closure, `F: FnMut(inout [i64], i64) -> i64`,
 and collects the seven answers with an iterator:
 
 ```tach
-let found = ks.iter().map(|k| select(work.as_slice(), k)).collect_in(gpa);
+let found = ks.iter().map(|k| select(work.as_mut_slice(), k)).collect_in(gpa);
 ```
 
 The sorting "method" is a closure too; it sorts on its first call and
-then only reads. Its flag is a `let mut` outside the closure, captured
-by reference:
+then only reads. Its flag is a `var` outside the closure, which the
+closure captures and changes in place:
 
 ```tach
-let mut sorted = false;
-let mut by_sort = ranks("sort", data.as_slice(), ks[..], |s, k| {
+var sorted = false;
+var by_sort = ranks("sort", data.as_slice(), ks[..], |s, k| {
     if !sorted {
         std::sort(s);
         sorted = true;
@@ -216,9 +217,9 @@ of the hand-specialized C, with every index checked. `std::sort` beats
 | feature | where | guide |
 |---|---|---|
 | generic functions with a bound: `<T: Ord>`, `<` through `cmp` | `quickselect`, `median_of_medians`, `partition3` | `tachyonc guide generics`, `guide traits` |
-| slices as views, written through, re-sliced: `w = w[gt..]` | `median_of_medians` | `tachyonc guide types`, `guide memory` |
+| `inout [T]` views, written through, re-sliced: `w = &w[gt..]` | `median_of_medians` | `tachyonc guide types`, `guide memory` |
 | tuples returned and destructured, in a `Vec` and in `for` | `partition3`, `main` | `tachyonc guide syntax` |
-| closures as `FnMut` arguments, a `let mut` captured by reference | `ranks`, `main` | `tachyonc guide closures` |
+| closures as `FnMut` arguments, a `var` captured and changed | `ranks`, `main` | `tachyonc guide closures` |
 | iterators: ranges as values, `map`, `collect`, `enumerate` | `ranks`, `main` | `tachyonc guide iterators` |
 | `clone()` of a `Vec`, `==` / `!=` on `Vec` contents | `check_median`, `main` | `tachyonc guide formatting`, `guide std` |
 | `defer` in a loop body | `main` | `tachyonc guide memory` |

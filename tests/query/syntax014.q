@@ -15,7 +15,9 @@ fn main() -> i64 {
 }
 warning query.program-errors: 1 error in the program; results may be incomplete
 try: tachyonc --diagnostics=short syntax014/main.tach -c -o /dev/null
-$ grep 'move' --code
-note query.empty: 0 hits
+$ grep 'sink' --code
+# syntax014/main.tach
+20:62	code	apply	fn apply<F: Fn(i64) -> i64, I: Source<Item = i64>>(f: F, it: sink I) -> I::Item {
+27:16	code	main	let pair = sink |(a, b): (i64, i64), _, var c| -> i64 { a + b + c };
 warning query.program-errors: 1 error in the program; results may be incomplete
 try: tachyonc --diagnostics=short syntax014/main.tach -c -o /dev/null
