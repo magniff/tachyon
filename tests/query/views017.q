@@ -22,6 +22,10 @@ Vec<Binding>::as_slice	views(self) declared
 Vec<VertexInput>::as_slice	views(self) declared
 Vec<ShaderEntry>::as_slice	views(self) declared
 Vec<EntryPoint>::as_slice	views(self) declared
+Vec<EntryInfo>::as_slice	views(self) declared
+Vec<BindingInfo>::as_slice	views(self) declared
+Vec<InputInfo>::as_slice	views(self) declared
+Vec<i64>::as_slice	views(self) declared
 Vec<Type, ScopedArena>::as_slice	views(self) declared
 Vec<StructMember, ScopedArena>::as_slice	views(self) declared
 Vec<i64, ScopedArena>::as_slice	views(self) declared
@@ -43,8 +47,6 @@ Vec<Fact, ScopedArena>::as_slice	views(self) declared
 Vec<Vec<bool, ScopedArena>, ScopedArena>::as_slice	views(self) declared
 Vec<bool, ScopedArena>::as_slice	views(self) declared
 Vec<Nm, ScopedArena>::as_slice	views(self) declared
-Vec<EntryInfo>::as_slice	views(self) declared
-Vec<BindingInfo>::as_slice	views(self) declared
 Vec<JobBuffer, ScopedArena>::as_slice	views(self) declared
 Vec<u32, ScopedArena>::as_slice	views(self) declared
 Vec<JobTexture, ScopedArena>::as_slice	views(self) declared
@@ -53,7 +55,6 @@ Vec<Vec<u32, ScopedArena>, ScopedArena>::as_slice	views(self) declared
 Vec<Frame, ScopedArena>::as_slice	views(self) declared
 Vec<Inv, ScopedArena>::as_slice	views(self) declared
 Vec<Ctl, ScopedArena>::as_slice	views(self) declared
-Vec<i64>::as_slice	views(self) declared
 Vec<u8>::as_slice	views(self) declared
 Vec<Vec<u64>>::as_slice	views(self) declared
 Vec<Adapter, ScopedArena>::as_slice	views(self) declared

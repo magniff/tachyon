@@ -22,7 +22,7 @@ end of its scope, and dropping a resource the GPU still uses is safe
 | `Device`, `Queue` | `inst.adapter()?.device()?` | everything below; `queue.submit(cmds)` |
 | `Buffer` | `dev.buffer(size, usage)`, `dev.buffer_init(bytes, usage)` | bind groups, copies, `map_read(dev)`, `map_write(dev)` + `unmap(dev)` |
 | `Texture`, `TextureView` | `dev.texture(w, h, format, usage: ..)`, `tex.view()` | bind groups, render passes, copies |
-| `Shader` | `dev.shader(src)?`, `src` a `ShaderSource::msl(code, reflection)` | pipelines |
+| `Shader` | `dev.shader_wgsl(wgsl)?` (WGSL text), or `dev.shader(src)?` with `src` a `ShaderSource::msl(code, reflection)` | pipelines |
 | `ComputePipeline`, `RenderPipeline` | `dev.compute_pipeline(shader, "main")?`, `dev.render_pipeline(desc)?` | passes; `pipe.bind_layout(0)` |
 | `BindGroup` | `dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, buf)][..])` | `pass.set_bind_group(0, g)` |
 | `Encoder`, `Commands` | `dev.encoder()`, `enc.finish()` | `enc.compute_pass(\|pass\| ..)`, `enc.render_pass(desc, \|pass\| ..)`, copies |
@@ -31,8 +31,11 @@ A mapped buffer is a view (`guide views`): `let b = buf.map_read(dev);`
 waits for the GPU and views the buffer, which cannot be used while `b`
 is. Shaders come from the shader compiler as a `ShaderSource`: the code
 for the device's `caps().shader_kind` (MSL on Metal) and its
-`Reflection` (entry points, bindings and their native slots); a program
-can write both by hand, as below.
+`Reflection` (entry points, bindings and their native slots).
+`dev.shader_wgsl(text)` does it all: `std::gpu::wgsl` translates the
+WGSL and its reflection feeds the pipelines (a rejected shader is a
+`gpu::Error::Shader` with its `LINE:COL: error wgsl.CODE` line); a
+program can also write both by hand, as below.
 
 ## Compute
 
@@ -60,6 +63,45 @@ fn main(gpa: Gpa) -> Result<(), gpu::Error> {
         pass.set_pipeline(pipe);
         pass.set_bind_group(0, group);
         pass.dispatch(1); // one workgroup of 64
+    });
+    queue.submit(enc.finish());
+    let squares = gpu::u32s(buf.map_read(dev));
+    println(f"{squares[3]} {squares[63]}");
+    Ok(())
+}
+```
+```out
+9 3969
+```
+
+The same kernel in WGSL: `@group(g) @binding(b)` are the bind groups'
+numbers, and a runtime-sized array is bounds-checked against the buffer
+bound there.
+
+```tach
+use std::gpu;
+use std::gpu::BufferUsage;
+
+const SQUARE: [u8] = "@group(0) @binding(0) var<storage, read_write> xs: array<u32>;\n\
+    @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    xs[id.x] = xs[id.x] * xs[id.x];\n\
+    }";
+
+fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+    let inst = gpu::Instance::new_in(gpa);
+    let (dev, var queue) = inst.adapter()?.device()?;
+    let shader = dev.shader_wgsl(SQUARE)?;
+    let pipe = dev.compute_pipeline(shader, "main")?;
+    var xs: Vec<u32> = Vec::new_in(gpa);
+    for i in 0..64 { xs.push(i as u32); }
+    var buf = dev.buffer_init(gpu::bytes_of_u32(xs.as_slice()),
+        BufferUsage::STORAGE | BufferUsage::MAP_READ);
+    let group = dev.bind_group(pipe.bind_layout(0), [gpu::bind(0, buf)][..]);
+    var enc = dev.encoder();
+    enc.compute_pass(|pass| {
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, group);
+        pass.dispatch(1);
     });
     queue.submit(enc.finish());
     let squares = gpu::u32s(buf.map_read(dev));

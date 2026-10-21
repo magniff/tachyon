@@ -1,0 +1,121 @@
+// WGSL straight into pipelines: dev.shader_wgsl translates with
+// std::gpu::wgsl and converts its reflection (shader::from_wgsl). A
+// compute shader over runtime-sized arrays (its sizes buffer bounds the
+// writes), the rect scene drawn by a WGSL render shader whose vec4<f32>
+// input is fed by Unorm8x4 (compared exactly with the CPU's image), and a
+// rejected shader's error.
+// EXPECT: compute ok 0 1 4 9 16 25 36 0
+// EXPECT: rects ok
+// EXPECT: error 3:12: error wgsl.name
+// EXPECT: reflection vs vs fs fs inputs 3 bindings 1
+
+use std::gpu::{BufferUsage, Format, PassDesc};
+
+const COMPUTE: [u8] = "@group(0) @binding(0) var<storage, read> xs: array<u32>;\n\
+    @group(0) @binding(1) var<storage, read_write> ys: array<u32>;\n\
+    @compute @workgroup_size(8) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n\
+    ys[id.x] = xs[id.x] * xs[id.x];\n\
+    }";
+
+const RECTS: [u8] = "struct G { size: vec2<f32> }\n\
+    @group(0) @binding(0) var<uniform> g: G;\n\
+    struct VOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> }\n\
+    @vertex fn vs(@location(0) pos: vec2<f32>, @location(1) color: vec4<f32>,\n\
+    @location(2) z: f32) -> VOut {\n\
+    let n = pos / g.size * 2.0 - 1.0;\n\
+    return VOut(vec4<f32>(n.x, -n.y, z, 1.0), color);\n\
+    }\n\
+    @fragment fn fs(v: VOut) -> @location(0) vec4<f32> { return v.color; }";
+
+const BAD: [u8] = "@fragment\nfn fs() -> @location(0) vec4<f32> {\n    return colour;\n}";
+
+fn compute(dev: std::gpu::Device, queue: inout std::gpu::Queue, gpa: Gpa) {
+    let shader = dev.shader_wgsl(COMPUTE).unwrap();
+    let pipe = dev.compute_pipeline(shader, "main").unwrap();
+    var xs: Vec<u32> = Vec::new_in(gpa);
+    for i in 0..8 {
+        xs.push(i as u32);
+    }
+    let xb = dev.buffer_init(std::gpu::bytes_of_u32(xs.as_slice()), BufferUsage::STORAGE);
+    // ys holds 7 of the 8 invocations' writes: the last is skipped
+    var yb = dev.buffer(8 * 4, BufferUsage::STORAGE | BufferUsage::MAP_READ);
+    let group = dev.bind_group(pipe.bind_layout(0),
+        [std::gpu::bind(0, xb), std::gpu::bind_range(1, yb, 0, 7 * 4)][..]);
+    var enc = dev.encoder();
+    enc.compute_pass(|pass| {
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, group);
+        pass.dispatch(1);
+    });
+    queue.submit(enc.finish());
+    let ys = std::gpu::u32s(yb.map_read(dev));
+    print("compute ok");
+    for i in 0..8 {
+        let want = if i == 7 { 0 } else { xs[i] * xs[i] };
+        if ys[i] != want {
+            println(f" ys[{i}] = {ys[i]}, want {want}");
+            return;
+        }
+        print(f" {ys[i]}");
+    }
+    println("");
+}
+
+fn rects(dev: std::gpu::Device, queue: inout std::gpu::Queue, gpa: Gpa) {
+    let shader = dev.shader_wgsl(RECTS).unwrap();
+    var desc = std::gpu::RenderDesc::new(shader, "vs", "fs", Format::Rgba8Unorm);
+    desc.vertex_buffer(rect_layout());
+    let pipe = dev.render_pipeline(desc).unwrap();
+    let scene = scene_rects();
+    var verts = rect_vertices(scene[..], gpa);
+    let vb = dev.buffer_init(verts.as_slice(), BufferUsage::VERTEX);
+    let g = globals(dev);
+    let group = dev.bind_group(pipe.bind_layout(0), [std::gpu::bind(0, g)][..]);
+    let tex = target(dev);
+    let view = tex.view();
+    var rb = readback(dev);
+    let n = 6 * 6;
+    var enc = dev.encoder();
+    enc.render_pass(PassDesc::color(view, clear: clear_color()), |pass| {
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, group);
+        pass.set_vertex_buffer(0, vb);
+        pass.draw(0..n, 0..1);
+    });
+    enc.copy_texture_to_buffer(tex, rb, 256);
+    queue.submit(enc.finish());
+    let px = rb.map_read(dev);
+    if check_image(px, SIZE, SIZE, 256, "tests/gpu/ref/rects.ppm", 0, 0, gpa) {
+        println("rects ok");
+    }
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let inst = std::gpu::Instance::new_in(gpa);
+    let adapter = inst.adapter().unwrap();
+    let (dev, var queue) = adapter.device().unwrap();
+    compute(dev, &queue, gpa);
+    rects(dev, &queue, gpa);
+    match dev.shader_wgsl(BAD) {
+        Ok(_) => println("compiled?"),
+        Err(e) => {
+            let text = format_in(f"{e}", gpa);
+            let msg = text.as_slice();
+            let at = "gpu: the shader did not compile: ".len();
+            println(f"error {msg[at..at + 21]}");
+        }
+    }
+    // the reflection as std::gpu keeps it
+    var code = std::Buf::new_in(gpa);
+    var refl = std::gpu::wgsl::new_reflection(gpa);
+    var err = std::gpu::wgsl::new_error(gpa);
+    let _ = std::gpu::wgsl::translate(RECTS,
+        std::gpu::wgsl::options(std::gpu::wgsl::TARGET_MSL), &code, &refl, &err, gpa);
+    let r = std::gpu::shader::from_wgsl(refl, gpa).unwrap();
+    print("reflection");
+    for e in r.entries.iter() {
+        print(f" {e.name} {e.native}");
+    }
+    println(f" inputs {r.inputs.len()} bindings {r.bindings.len()}");
+    0
+}
