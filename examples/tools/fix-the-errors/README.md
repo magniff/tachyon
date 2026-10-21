@@ -60,7 +60,7 @@ $ tachyonc fix --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -9,0 +10 @@
-+use std::num::I64_MIN;
++use std::I64_MIN;
 --- a/grades.tach
 +++ b/grades.tach
 @@ -21 +21 @@

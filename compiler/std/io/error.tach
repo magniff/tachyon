@@ -1,0 +1,184 @@
+// std::io::error (0.20, docs/design/collections-text-io.md §2.6.2, task
+// B6): io::Error, Rust's shape without its Box (a kind, the OS's errno or
+// 0, and a static message of std's), ErrorKind, and io::Result<T>.
+
+use std::{Debug, Display, Eq, Fmt, From, Option};
+use std::str::Utf8Error;
+use std::sys::{SysErrorKind, sys_errno, sys_errno_kind, sys_strerror_into};
+
+// ---- I/O errors (0.20) ----
+
+// The kinds of io::Error (Rust's names; those std can produce).
+#[derive(Eq, Debug, Clone)]
+pub enum ErrorKind {
+    NotFound,
+    PermissionDenied,
+    AlreadyExists,
+    WouldBlock,
+    InvalidInput,
+    InvalidData,
+    TimedOut,
+    WriteZero,
+    Interrupted,
+    UnexpectedEof,
+    BrokenPipe,
+    NotADirectory,
+    IsADirectory,
+    DirectoryNotEmpty,
+    Unsupported,
+    OutOfMemory,
+    Other,
+}
+
+impl ErrorKind {
+    // Rust's description of the kind ("entity not found", ...).
+    pub fn as_str(self) -> [u8] {
+        match self {
+            ErrorKind::NotFound => "entity not found",
+            ErrorKind::PermissionDenied => "permission denied",
+            ErrorKind::AlreadyExists => "entity already exists",
+            ErrorKind::WouldBlock => "operation would block",
+            ErrorKind::InvalidInput => "invalid input parameter",
+            ErrorKind::InvalidData => "invalid data",
+            ErrorKind::TimedOut => "timed out",
+            ErrorKind::WriteZero => "write zero",
+            ErrorKind::Interrupted => "operation interrupted",
+            ErrorKind::UnexpectedEof => "unexpected end of file",
+            ErrorKind::BrokenPipe => "broken pipe",
+            ErrorKind::NotADirectory => "not a directory",
+            ErrorKind::IsADirectory => "is a directory",
+            ErrorKind::DirectoryNotEmpty => "directory not empty",
+            ErrorKind::Unsupported => "unsupported",
+            ErrorKind::OutOfMemory => "out of memory",
+            ErrorKind::Other => "other error",
+        }
+    }
+}
+
+impl Display for ErrorKind {
+    fn fmt(self, f: inout Fmt) {
+        f.str(self.as_str());
+    }
+}
+
+fn kind_of_sys(k: SysErrorKind) -> ErrorKind {
+    match k {
+        SysErrorKind::NotFound => ErrorKind::NotFound,
+        SysErrorKind::PermissionDenied => ErrorKind::PermissionDenied,
+        SysErrorKind::AlreadyExists => ErrorKind::AlreadyExists,
+        SysErrorKind::WouldBlock => ErrorKind::WouldBlock,
+        SysErrorKind::InvalidInput => ErrorKind::InvalidInput,
+        SysErrorKind::InvalidData => ErrorKind::InvalidData,
+        SysErrorKind::TimedOut => ErrorKind::TimedOut,
+        SysErrorKind::WriteZero => ErrorKind::WriteZero,
+        SysErrorKind::Interrupted => ErrorKind::Interrupted,
+        SysErrorKind::UnexpectedEof => ErrorKind::UnexpectedEof,
+        SysErrorKind::BrokenPipe => ErrorKind::BrokenPipe,
+        SysErrorKind::NotADirectory => ErrorKind::NotADirectory,
+        SysErrorKind::IsADirectory => ErrorKind::IsADirectory,
+        SysErrorKind::DirectoryNotEmpty => ErrorKind::DirectoryNotEmpty,
+        SysErrorKind::Unsupported => ErrorKind::Unsupported,
+        SysErrorKind::OutOfMemory => ErrorKind::OutOfMemory,
+        SysErrorKind::Other => ErrorKind::Other,
+    }
+}
+
+// An I/O error: its kind, the OS's error number (0: none) and std's
+// message for it (a C string of std's, or null). Display: the OS's text
+// and `(os error N)`, as Rust's; else the message, else the kind's text.
+#[derive(Eq, Clone)]
+pub struct Error { kind: ErrorKind, code: i32, msg: *u8 }
+
+// `Result<T, io::Error>`: what std's I/O functions return (`?` passes the
+// error on).
+pub type Result<T> = std::Result<T, Error>;
+
+impl Error {
+    // The error of errno e.
+    pub fn from_raw_os_error(e: i32) -> Error {
+        Error { kind: kind_of_sys(sys_errno_kind(e)), code: e, msg: 0 as *u8 }
+    }
+
+    // The error errno says now.
+    pub fn last_os_error() -> Error {
+        Error::from_raw_os_error(sys_errno())
+    }
+
+    // An error of kind k with no OS error (Rust's `Error::from(kind)`).
+    pub fn new(k: ErrorKind) -> Error {
+        Error { kind: k, code: 0, msg: 0 as *u8 }
+    }
+
+    pub fn kind(self) -> ErrorKind {
+        self.kind
+    }
+
+    // The OS's error number, when there is one.
+    pub fn raw_os_error(self) -> Option<i32> {
+        if self.code != 0 { Option::Some(self.code) } else { Option::None }
+    }
+}
+
+// std's own error, with a static message.
+pub fn __io_error(k: ErrorKind, msg: *u8) -> Error {
+    Error { kind: k, code: 0, msg: msg }
+}
+
+impl Display for Error {
+    fn fmt(self, f: inout Fmt) {
+        if self.code != 0 {
+            var buf: [u8; 128] = [0; 128];
+            let n = sys_strerror_into(self.code, &buf[..]);
+            f.str(buf[..n]);
+            f.str(" (os error ");
+            f.int(self.code as i64);
+            f.str(")");
+        } else if self.msg != 0 as *u8 {
+            // (a C string literal of std's: NUL-ended, static)
+            f.str(unsafe { std::sys::sys_cstr_view(self.msg) });
+        } else {
+            f.str(self.kind.as_str());
+        }
+    }
+}
+
+impl Debug for Error {
+    fn fmt_debug(self, f: inout Fmt) {
+        if self.code != 0 {
+            f.str("Os { code: ");
+            f.int(self.code as i64);
+            f.str(", kind: ");
+            self.kind.fmt_debug(&f);
+            f.str(", message: \"");
+            var buf: [u8; 128] = [0; 128];
+            let n = sys_strerror_into(self.code, &buf[..]);
+            f.str(buf[..n]);
+            f.str("\" }");
+        } else {
+            f.str("Custom { kind: ");
+            self.kind.fmt_debug(&f);
+            f.str(", error: \"");
+            self.fmt(&f);
+            f.str("\" }");
+        }
+    }
+}
+
+impl From<ErrorKind> for Error {
+    fn from(k: ErrorKind) -> Error {
+        Error::new(k)
+    }
+}
+
+// (text that is not UTF-8, read where a String goes: InvalidData)
+impl From<Utf8Error> for Error {
+    fn from(e: Utf8Error) -> Error {
+        __io_error(ErrorKind::InvalidData, c"stream did not contain valid UTF-8")
+    }
+}
+
+// The error of a sys call's errno.
+#[inline]
+pub fn __os_error(e: i32) -> Error {
+    Error::from_raw_os_error(e)
+}

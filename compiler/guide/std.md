@@ -52,7 +52,8 @@ done with them (`guide std#overview`).
 An allocator (`gpa`, from `fn main(gpa: Gpa)`, passed down as a
 parameter) goes only to constructors and `_in` functions; methods
 (`push`, `insert`, `clone`, `sort`) use the container's own. Not in
-std: `String` (text is `[u8]` and `Buf`), `Box`. (0.20)
+std: `Box`. (0.20) Text: `str`, `String` and Rust's methods (`guide
+text`); files, env, processes: `guide io`. (0.20)
 `std::collections::HashSet`: `insert` (false if present), `contains`,
 `remove`, `iter()`. `BTreeMap<K, V>` and `BTreeSet<T>`
 (`std::BTreeMap`, `K: Ord`) keep their keys in order: `iter()` and
