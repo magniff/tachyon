@@ -1,0 +1,88 @@
+// The workloads of the parse + grid benchmark (bench/run.sh), after
+// vtebench's: `workloads KIND MIB > FILE` writes MIB MiB of
+//   ascii    printable ASCII lines of 0 to 119 bytes, ended `\r\n` (a cat)
+//   sgr      dense cells: every cell its own true-colour foreground and
+//            256-colour background (vtebench dense_cells)
+//   cjk      lines of wide CJK characters, some with combining marks
+//   region   a scroll region of lines 2 to 39, text scrolling inside it
+//            (vtebench scrolling_in_region)
+//   motion   the cursor moved to random cells, a character at each
+//            (vtebench cursor_motion)
+// The same seed every time: both terminals parse the same bytes.
+
+struct Rng {
+    s: u64,
+}
+
+impl Rng {
+    fn below(inout self, n: i64) -> i64 {
+        self.s = self.s * 6364136223846793005 + 1442695040888963407;
+        ((self.s >> 33) % (n as u64)) as i64
+    }
+}
+
+fn arg(argv: **u8, i: i64) -> [u8] {
+    // SAFETY: argv[i] is a NUL-terminated string from the C runtime.
+    unsafe { std::sys::sys_cstr_view(argv[i]) }
+}
+
+fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
+    if argc < 3 {
+        eprintln("usage: workloads ascii|sgr|cjk|region|motion MIB");
+        return 2;
+    }
+    let kind = arg(argv, 1);
+    let size = parse_int(arg(argv, 2)).unwrap_or(1) * 1048576;
+    var r = Rng { s: 42 };
+    var b = Buf::new_in(gpa);
+    let cjk = ["中", "文", "字", "日", "本", "語", "한", "국", "어", "漢"];
+    if kind == "region" {
+        b.push_str("\x1b[2;39r");
+    }
+    while b.len() < size {
+        if kind == "ascii" {
+            let n = r.below(120);
+            for _ in 0..n {
+                b.push((0x20 + r.below(95)) as u8);
+            }
+            b.push_str("\r\n");
+        } else if kind == "sgr" {
+            for _ in 0..120 {
+                b.push_str(
+                    f"\x1b[38;2;{r.below(256)};{r.below(256)};{r.below(256)};48;5;{r.below(256)}m");
+                b.push((0x21 + r.below(94)) as u8);
+            }
+            b.push_str("\x1b[0m\r\n");
+        } else if kind == "cjk" {
+            for k in 0..r.below(60) {
+                b.push_str(cjk[r.below(10)]);
+                if k % 17 == 3 {
+                    b.push_str("\xcc\x81");
+                }
+            }
+            b.push_str("\r\n");
+        } else if kind == "region" {
+            b.push_str("\x1b[39;1H");
+            let n = r.below(120);
+            for _ in 0..n {
+                b.push((0x20 + r.below(95)) as u8);
+            }
+            b.push('\n');
+        } else if kind == "motion" {
+            b.push_str(f"\x1b[{r.below(40) + 1};{r.below(120) + 1}H");
+            b.push((0x21 + r.below(94)) as u8);
+        } else {
+            eprintln(f"workloads: unknown kind {kind}");
+            return 2;
+        }
+    }
+    var at = 0;
+    let s = b.as_slice();
+    while at < s.len() {
+        match std::sys::sys_write(1, s[at..]) {
+            Ok(n) => at += n,
+            Err(_) => return 1,
+        }
+    }
+    0
+}

@@ -1,0 +1,261 @@
+// The dump: the terminal's state as text, in the format of
+// examples/voltty/core/oracle/FORMAT.md, which the oracle prints for
+// alacritty_terminal. Two dumps are equal when the terminals are.
+
+use crate::vt::utf8;
+use std::Buf;
+use super::{SHAPE_BEAM, SHAPE_BLOCK, SHAPE_UNDERLINE, Term, push_hex2};
+use super::cell::{
+    COLOR_INDEXED, COLOR_NAMED, COLOR_RGB, Cell, DEFAULT_BG, DEFAULT_FG, TAG_MASK, VALUE_MASK,
+};
+use super::grid::{Cursor, NO_COLOR};
+
+impl Term {
+    // Appends the dump to `out`; the replies and clipboard stores since the
+    // last dump are printed and cleared.
+    pub fn dump(inout self, out: inout Buf) {
+        let lines = self.grid.lines;
+        let cols = self.grid.cols;
+        out.push_str(f"size {lines} {cols}\n");
+        let c = self.grid.cursor;
+        out.push_str(f"cursor {c.line} {c.col} {c.needs_wrap as i64}\n");
+        var shape = SHAPE_BLOCK;
+        var blink = false;
+        if self.style_set {
+            shape = self.style_shape;
+            blink = self.style_blink;
+        }
+        let name = if shape == SHAPE_UNDERLINE { "underline" }
+            else if shape == SHAPE_BEAM { "beam" } else { "block" };
+        out.push_str(f"style {name} {blink as i64}\nmode ");
+        push_hex(&out, self.mode as i64);
+        out.push('\n');
+        if self.has_shown_title {
+            out.push_str("title ");
+            escape_bytes(&out, self.shown_title.as_slice());
+            out.push('\n');
+        } else {
+            out.push_str("title -\n");
+        }
+        out.push_str("tmpl ");
+        self.cursor_attrs(&out, c);
+        out.push_str("\ncharsets ");
+        charsets(&out, c);
+        let s = self.grid.saved;
+        out.push_str(f"\nsaved {s.line} {s.col} {s.needs_wrap as i64} ");
+        self.cursor_attrs(&out, s);
+        out.push(' ');
+        charsets(&out, s);
+        out.push('\n');
+        for i in 0..self.colors.len() {
+            let v = self.colors[i];
+            if v >= 0 {
+                out.push_str(f"color {i} #");
+                push_hex2(&out, (v >> 16) & 0xFF, false);
+                push_hex2(&out, (v >> 8) & 0xFF, false);
+                push_hex2(&out, v & 0xFF, false);
+                out.push('\n');
+            }
+        }
+        if self.reply.len() > 0 {
+            out.push_str("reply ");
+            escape_bytes(&out, self.reply.as_slice());
+            out.push('\n');
+            self.reply.clear();
+        }
+        for i in 0..self.clip_kind.len() {
+            out.push_str("clip ");
+            out.push(self.clip_kind[i]);
+            out.push(' ');
+            escape_bytes(&out, self.clip_text[i].as_slice());
+            out.push('\n');
+        }
+        self.clear_clips();
+        let hist = self.grid.hist();
+        out.push_str(f"history {hist}\n");
+        var a = Buf::new_in(self.gpa_of());
+        var b = Buf::new_in(self.gpa_of());
+        var l = -hist;
+        while l < lines {
+            let r = self.grid.row(l);
+            var end = cols;
+            while end > 0 && self.is_blank(r[end - 1]) {
+                end -= 1;
+            }
+            out.push_str(f"row {l} ");
+            for x in 0..end {
+                escape_char(&out, r[x].c());
+                let id = r[x].extra_id();
+                if self.extras.has_zw(id) {
+                    for z in self.extras.zw(id) {
+                        out.push_str("\\+{");
+                        push_hex(&out, z as i64);
+                        out.push('}');
+                    }
+                }
+            }
+            out.push('\n');
+            var x = 0;
+            while x < cols {
+                a.clear();
+                self.cell_attrs(&a, r[x]);
+                if a.as_slice() == "n256 n257 0 - -" {
+                    x += 1;
+                    continue;
+                }
+                var y = x + 1;
+                while y < cols {
+                    b.clear();
+                    self.cell_attrs(&b, r[y]);
+                    if b.as_slice() != a.as_slice() {
+                        break;
+                    }
+                    y += 1;
+                }
+                out.push_str(f"attr {l} {x}-{y - 1} ");
+                out.push_str(a.as_slice());
+                out.push('\n');
+                x = y;
+            }
+            l += 1;
+        }
+        a.free();
+        b.free();
+        out.push_str("end\n");
+    }
+
+    fn is_blank(self, c: Cell) -> bool {
+        if c.c() != 32 || c.fg != DEFAULT_FG || c.bg != DEFAULT_BG || c.flags != 0 {
+            return false;
+        }
+        let id = c.extra_id();
+        id == 0
+            || !self.extras.has_zw(id) && self.extras.ul(id) == NO_COLOR
+            && self.extras.link(id) == 0
+    }
+
+    // `fg bg flags ul link`.
+    fn cell_attrs(self, out: inout Buf, c: Cell) {
+        push_color(&out, c.fg);
+        out.push(' ');
+        push_color(&out, c.bg);
+        out.push(' ');
+        push_hex(&out, c.flags as i64);
+        out.push(' ');
+        let id = c.extra_id();
+        var ul = NO_COLOR;
+        var link = 0;
+        if id != 0 {
+            ul = self.extras.ul(id);
+            link = self.extras.link(id);
+        }
+        if ul == NO_COLOR {
+            out.push('-');
+        } else {
+            push_color(&out, ul);
+        }
+        out.push(' ');
+        self.push_link(&out, link);
+    }
+
+    fn cursor_attrs(inout self, out: inout Buf, c: Cursor) {
+        push_color(&out, c.fg);
+        out.push(' ');
+        push_color(&out, c.bg);
+        out.push(' ');
+        push_hex(&out, c.flags as i64);
+        out.push(' ');
+        if c.ul == NO_COLOR {
+            out.push('-');
+        } else {
+            push_color(&out, c.ul);
+        }
+        out.push(' ');
+        self.push_link(&out, c.link);
+    }
+
+    fn push_link(self, out: inout Buf, link: i64) {
+        if link == 0 {
+            out.push('-');
+            return;
+        }
+        if self.extras.links[link].auto_id {
+            out.push('*');
+        } else {
+            escape_bytes(&out, self.extras.links[link].id.as_slice());
+        }
+        out.push('|');
+        escape_bytes(&out, self.extras.links[link].uri.as_slice());
+    }
+}
+
+fn charsets(out: inout Buf, c: Cursor) {
+    for k in 0..4 {
+        out.push(if c.charsets[k] == 1 { 'g' } else { 'a' });
+    }
+}
+
+fn push_color(out: inout Buf, c: u32) {
+    let tag = c & TAG_MASK;
+    let v = (c & VALUE_MASK) as i64;
+    if tag == COLOR_NAMED {
+        out.push('n');
+        out.push_int(v);
+    } else if tag == COLOR_INDEXED {
+        out.push('i');
+        out.push_int(v);
+    } else {
+        out.push('#');
+        push_hex2(&out, (v >> 16) & 0xFF, false);
+        push_hex2(&out, (v >> 8) & 0xFF, false);
+        push_hex2(&out, v & 0xFF, false);
+    }
+}
+
+pub fn push_hex(out: inout Buf, v: i64) {
+    let digits = "0123456789abcdef";
+    if v == 0 {
+        out.push('0');
+        return;
+    }
+    var tmp: [u8; 16] = [0; 16];
+    var n = 0;
+    var x = v;
+    while x > 0 {
+        tmp[n] = digits[x & 15];
+        x = x >> 4;
+        n += 1;
+    }
+    while n > 0 {
+        n -= 1;
+        out.push(tmp[n]);
+    }
+}
+
+// A cell's character: printable ASCII as itself (but `\`), U+00A0 and up
+// as UTF-8, the rest `\u{X}`.
+fn escape_char(out: inout Buf, c: u32) {
+    if c >= 0x20 && c < 0x7F && c != 0x5C {
+        out.push(c as u8);
+    } else if c >= 0xA0 {
+        var tmp: [u8; 4] = [0; 4];
+        let n = utf8::encode(c, &tmp[..], 0);
+        out.push_str(tmp[0..n]);
+    } else {
+        out.push_str("\\u{");
+        push_hex(&out, c as i64);
+        out.push('}');
+    }
+}
+
+// Bytes: printable ASCII as itself (but `\`), the rest `\xNN`.
+pub fn escape_bytes(out: inout Buf, s: [u8]) {
+    for b in s {
+        if b >= 0x20 && b < 0x7F && b != 0x5C {
+            out.push(b);
+        } else {
+            out.push_str("\\x");
+            push_hex2(&out, b as i64, false);
+        }
+    }
+}
