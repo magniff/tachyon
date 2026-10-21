@@ -3,7 +3,7 @@
 // flight (the staging path), map_write, a buffer-to-buffer copy.
 // EXPECT: offsets ok
 
-use gpu::{BindingType, BufferUsage, Reflection, ShaderSource};
+use std::gpu::{BindingType, BufferUsage, Reflection, ShaderSource};
 
 const MSL: [[u8]; 11] = [
     "#include <metal_stdlib>",
@@ -20,57 +20,45 @@ const MSL: [[u8]; 11] = [
 ];
 
 fn main(gpa: Gpa) -> i32 {
-    let inst = gpu::Instance::new_in(gpa);
-    let mut adapter = inst.adapter().unwrap();
-    defer adapter.free();
-    let (mut dev, mut queue) = adapter.device().unwrap();
-    defer dev.free();
-    defer queue.free();
+    let inst = std::gpu::Instance::new_in(gpa);
+    let adapter = inst.adapter().unwrap();
+    let (dev, mut queue) = adapter.device().unwrap();
     let mut text = lines(MSL[..], gpa);
-    defer text.free();
     let mut refl = Reflection::new_in(gpa);
-    defer refl.free();
     refl.compute("add", "add", 64);
     refl.compute("twice", "twice", 64);
     refl.bind(0, 0, BindingType::Storage, compute: 0);
     refl.bind(1, 0, BindingType::Uniform, compute: 1);
-    let src = ShaderSource { msl: text.as_slice(), reflection: refl };
+    let src = ShaderSource::msl(text.as_slice(), refl);
     let mut shader = dev.shader(&src).unwrap();
-    defer shader.free();
     let mut add = dev.compute_pipeline(&shader, "add").unwrap();
-    defer add.free();
     let mut twice = dev.compute_pipeline(&shader, "twice").unwrap();
-    defer twice.free();
 
     // four regions of 64 u32s, 256 bytes apart
     let mut data = dev.buffer(4 * 256,
         BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::COPY_SRC);
-    defer data.free();
     let mut init: Vec<u32> = Vec::new_in(gpa);
-    defer init.free();
     for i in 0..256 { init.push(i as u32); }
-    queue.write_buffer(&data, 0, gpu::bytes_of_u32(init.as_slice()));
+    queue.write_buffer(&data, 0, std::gpu::bytes_of_u32(init.as_slice()));
     let mut params = dev.buffer(4 * 256, BufferUsage::UNIFORM | BufferUsage::MAP_WRITE);
-    defer params.free();
-    let p = gpu::u32s(params.map_write(&dev).unwrap());
+    let p = std::gpu::u32s_mut(params.map_write(&dev));
     for k in 0..4 { p[k * 64] = (k + 1) as u32 * 1000; }
+    params.unmap(&dev);
 
-    let mut groups: Vec<gpu::BindGroup> = Vec::new_in(gpa);
-    let mut pgroups: Vec<gpu::BindGroup> = Vec::new_in(gpa);
+    let mut groups: Vec<std::gpu::BindGroup> = Vec::new_in(gpa);
+    let mut pgroups: Vec<std::gpu::BindGroup> = Vec::new_in(gpa);
     for k in 0..4 {
         groups.push(dev.bind_group(add.bind_layout(0),
-            [gpu::bind_range(0, &data, k * 256, 256)][..]));
+            [std::gpu::bind_range(0, &data, k * 256, 256)][..]));
         pgroups.push(dev.bind_group(add.bind_layout(1),
-            [gpu::bind_range(0, &params, k * 256, 16)][..]));
+            [std::gpu::bind_range(0, &params, k * 256, 16)][..]));
     }
     let mut enc = dev.encoder();
     enc.compute_pass(|pass| {
         for k in 0..4 {
             pass.set_pipeline(&add);
-            let g = groups.get(k);
-            let pg = pgroups.get(k);
-            pass.set_bind_group(0, &g);
-            pass.set_bind_group(1, &pg);
+            pass.set_bind_group(0, &groups[k]);
+            pass.set_bind_group(1, &pgroups[k]);
             pass.dispatch(1);
             if k % 2 == 1 {
                 pass.set_pipeline(&twice);
@@ -81,16 +69,14 @@ fn main(gpa: Gpa) -> i32 {
     queue.submit(enc.finish());
     // in flight or not, this lands after the submission above
     let mut extra: Vec<u32> = Vec::new_in(gpa);
-    defer extra.free();
     for _ in 0..64 { extra.push(7); }
-    queue.write_buffer(&data, 3 * 256, gpu::bytes_of_u32(extra.as_slice()));
+    queue.write_buffer(&data, 3 * 256, std::gpu::bytes_of_u32(extra.as_slice()));
     let mut out = dev.buffer(4 * 256, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
-    defer out.free();
     let mut enc2 = dev.encoder();
     enc2.copy_buffer(&data, 0, &out, 0, 4 * 256);
     queue.submit(enc2.finish());
     queue.wait_idle().unwrap();
-    let got = gpu::u32s(out.map_read(&dev).unwrap());
+    let got = std::gpu::u32s(out.map_read(&dev));
     let mut bad = 0;
     for i in 0..256 {
         let k = i / 64;
@@ -99,14 +85,6 @@ fn main(gpa: Gpa) -> i32 {
         if k == 3 { want = 7; }
         if got[i] != want { bad += 1; }
     }
-    for k in 0..4 {
-        let mut g = groups.get(k);
-        g.free();
-        let mut pg = pgroups.get(k);
-        pg.free();
-    }
-    groups.free();
-    pgroups.free();
     if bad == 0 { println("offsets ok"); } else { println(f"offsets: {bad} wrong"); }
     0
 }

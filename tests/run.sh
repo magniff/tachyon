@@ -92,6 +92,8 @@
 #                        ($CC, which C imports read) is clang: what it
 #                        tests is clang's (`_Nonnull`); elsewhere it is
 #                        skipped, counted apart
+#   // REQUIRES: metal    (0.22) the case runs only on aarch64-macos (std::gpu
+#                        on Metal); elsewhere it is skipped, counted apart
 #   // NO-EXTRA-FLAGS: why (0.16) the case is built without
 #                        $TACHYON_TEST_FLAGS (its output differs by design
 #                        with them)
@@ -583,6 +585,10 @@ run_case() {
     file=$1
     dir=$2
     if grep -qw clang "$dir/requires" && [ $CC_IS_CLANG -eq 0 ]; then
+        echo skip >"$dir/status"
+        return
+    fi
+    if grep -qw metal "$dir/requires" && [ "$TARGET" != aarch64-macos ]; then
         echo skip >"$dir/status"
         return
     fi

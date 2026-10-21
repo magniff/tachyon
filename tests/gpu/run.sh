@@ -1,12 +1,14 @@
 #!/bin/sh
-# The GPU library's tests (0.22, docs/design/gpu.md §4), headless:
+# The tests of std::gpu and std::objc (0.22, docs/design/gpu.md §4),
+# headless:
 #
 # - every tests/gpu/cases/*.tach is compiled with tests/gpu/support.tach
-#   and lib/root.tach, linked with Metal, Foundation and libobjc (by hand:
-#   tachyonc takes no -framework yet, C4), run under Metal's API and
-#   shader validation (MTL_DEBUG_LAYER, MTL_SHADER_VALIDATION), checked,
-#   and run again under `leaks --atExit`, which must find nothing;
-# - objcgen: every table of lib/objc/tables is regenerated and compared
+#   and `-l objc` (std::objc opens the frameworks at run time), run under
+#   Metal's API and shader validation (MTL_DEBUG_LAYER,
+#   MTL_SHADER_VALIDATION), checked, and run again under `leaks --atExit`,
+#   which must find nothing;
+# - objcgen: every table of compiler/std/objc/tables is regenerated and
+#   compared
 #   with its checked-in module, checked against the Objective-C runtime
 #   (--check) and its constants and structs against the SDK's headers
 #   (--c-check, clang -fsyntax-only);
@@ -63,18 +65,16 @@ fi
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-gpu.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT INT TERM
-FRAMEWORKS="-framework Metal -framework Foundation -lobjc"
+LINK="-l objc"
 
 # The tools: objcgen and refgen.
 mkdir -p "$WORK/tools"
 TOOLS_OK=1
-if ! "$COMPILER" $OPT "$ROOT/tools/objcgen/main.tach" -o "$WORK/tools/objcgen.o" >"$WORK/tools/objcgen.log" 2>&1 ||
-   ! $CC -arch arm64 "$WORK/tools/objcgen.o" -o "$WORK/tools/objcgen" -lobjc >>"$WORK/tools/objcgen.log" 2>&1; then
+if ! "$COMPILER" $OPT "$ROOT/tools/objcgen/main.tach" $LINK -o "$WORK/tools/objcgen" >"$WORK/tools/objcgen.log" 2>&1; then
     TOOLS_OK=0
 fi
 REFGEN_OK=1
-if ! "$COMPILER" $OPT "$ROOT/tests/gpu/refgen.tach" "$ROOT/tests/gpu/support.tach" "$ROOT/lib/root.tach" -o "$WORK/tools/refgen.o" >"$WORK/tools/refgen.log" 2>&1 ||
-   ! $CC -arch arm64 "$WORK/tools/refgen.o" -o "$WORK/tools/refgen" $FRAMEWORKS >>"$WORK/tools/refgen.log" 2>&1; then
+if ! "$COMPILER" $OPT "$ROOT/tests/gpu/refgen.tach" "$ROOT/tests/gpu/support.tach" $LINK -o "$WORK/tools/refgen" >"$WORK/tools/refgen.log" 2>&1; then
     REFGEN_OK=0
 fi
 
@@ -90,13 +90,8 @@ run_case() {
     mkdir -p "$dir"
     why="$dir/why"
     : >"$why"
-    if ! "$COMPILER" $OPT --deny-warnings "$file" "$ROOT/tests/gpu/support.tach" "$ROOT/lib/root.tach" -o "$dir/prog.o" >"$dir/build" 2>&1; then
-        { echo "compile failed:"; sed 's/^/    /' "$dir/build" | head -20; } >>"$why"
-        echo fail >"$dir/status"
-        return
-    fi
-    if ! $CC -arch arm64 "$dir/prog.o" -o "$dir/prog" $FRAMEWORKS >"$dir/link" 2>&1; then
-        { echo "link failed:"; sed 's/^/    /' "$dir/link" | head -20; } >>"$why"
+    if ! "$COMPILER" $OPT --deny-warnings "$file" "$ROOT/tests/gpu/support.tach" $LINK -o "$dir/prog" >"$dir/build" 2>&1; then
+        { echo "build failed:"; sed 's/^/    /' "$dir/build" | head -20; } >>"$why"
         echo fail >"$dir/status"
         return
     fi
@@ -172,7 +167,7 @@ done <"$WORK/cases"
 # objcgen: generation, the runtime check, the header check.
 case objcgen in
 *"$FILTER"*)
-    for t in "$ROOT"/lib/objc/tables/*.objc; do
+    for t in "$ROOT"/compiler/std/objc/tables/*.objc; do
         tn=$(basename "$t" .objc)
         why="$WORK/objcgen-$tn.why"
         : >"$why"
@@ -181,15 +176,15 @@ case objcgen in
         else
             out=$(sed -n 's/^# Generated into \([^ ]*\) .*/\1/p' "$t" | head -1)
             [ -n "$out" ] || out=$(sed -n 's/^# \{0,1\}.*generated into \([^ ]*\) by.*/\1/p' "$t" | head -1)
-            (cd "$ROOT" && "$WORK/tools/objcgen" "lib/objc/tables/$tn.objc") >"$WORK/gen-$tn.tach" 2>>"$why"
+            (cd "$ROOT" && "$WORK/tools/objcgen" "compiler/std/objc/tables/$tn.objc") >"$WORK/gen-$tn.tach" 2>>"$why"
             if [ -z "$out" ]; then
                 echo "the table names no 'Generated into PATH' line" >>"$why"
             elif ! cmp -s "$WORK/gen-$tn.tach" "$ROOT/$out"; then
-                echo "$out is not what objcgen makes of lib/objc/tables/$tn.objc (regenerate it)" >>"$why"
+                echo "$out is not what objcgen makes of compiler/std/objc/tables/$tn.objc (regenerate it, then compiler/std/embed.sh)" >>"$why"
             fi
-            (cd "$ROOT" && "$WORK/tools/objcgen" --check "lib/objc/tables/$tn.objc") >/dev/null 2>"$WORK/check-$tn.err" ||
+            (cd "$ROOT" && "$WORK/tools/objcgen" --check "compiler/std/objc/tables/$tn.objc") >/dev/null 2>"$WORK/check-$tn.err" ||
                 { echo "objcgen --check:"; sed 's/^/    /' "$WORK/check-$tn.err"; } >>"$why"
-            (cd "$ROOT" && "$WORK/tools/objcgen" --c-check "lib/objc/tables/$tn.objc") >"$WORK/c-check-$tn.m" 2>>"$why"
+            (cd "$ROOT" && "$WORK/tools/objcgen" --c-check "compiler/std/objc/tables/$tn.objc") >"$WORK/c-check-$tn.m" 2>>"$why"
             clang -fsyntax-only -x objective-c "$WORK/c-check-$tn.m" >"$WORK/c-check-$tn.err" 2>&1 ||
                 { echo "objcgen --c-check (clang):"; grep 'error' "$WORK/c-check-$tn.err" | sed 's/^/    /' | head -10; } >>"$why"
         fi

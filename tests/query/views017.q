@@ -7,19 +7,32 @@ crate::pick	views(toks) declared
 crate::text_of	views(*toks) declared
 crate::intern	views() stores(word) declared
 crate::count	views()
+<std::objc::Ref as NSArrayMethods>::count	views()
 $ views Vec::get Vec::as_slice Vec::push
 Vec<Tok>::get	views(*self) parametric
 Vec<u64>::get	views()
 Vec<Vec<u64>>::get	views()
 Vec<Tok>::as_slice	views(self) declared
 Vec<u64>::as_slice	views(self) declared
+Vec<Adapter>::as_slice	views(self) declared
+Vec<Binding>::as_slice	views(self) declared
+Vec<VertexInput>::as_slice	views(self) declared
 Vec<u8>::as_slice	views(self) declared
 Vec<Vec<u64>>::as_slice	views(self) declared
+Vec<Adapter>::as_slice	views(self) declared
+Vec<EntryPoint>::as_slice	views(self) declared
+Vec<ShaderEntry>::as_slice	views(self) declared
 Vec<[u8]>::push	views() stores(x) declared
 Vec<Tok>::push	views() stores(x) declared
 Vec<u8>::push	views()
 Vec<u64>::push	views()
 Vec<Vec<u64>>::push	views()
+Vec<Adapter>::push	views()
+Vec<ShaderEntry>::push	views()
+Vec<Adapter>::push	views()
+Vec<EntryPoint>::push	views() stores(x) declared
+Vec<Binding>::push	views()
+Vec<VertexInput>::push	views()
 Vec<i64>::push	views()
 Vec<u32>::push	views()
 $ views crate --why
@@ -36,6 +49,8 @@ crate::pick	views017/main.tach:16:4	fn	fn pick(toks: &Vec<Tok>, counts: &Vec<i64
 crate::intern	views017/main.tach:27:4	fn	fn intern(names: &mut Vec<[u8]>, word: [u8])	effects: alloc(Gpa) panic	views: views() stores(word) declared
 crate::count	views017/main.tach:31:4	fn	fn count(toks: &Vec<Tok>) -> i64	effects: none
 std::iter::Iterator::count	../../compiler/std/iter.tach:73:8	trait-method	fn count(self: Self) -> i64
+std::objc::foundation::NSArrayMethods::count	../../compiler/std/objc/foundation.tach:304:8	trait-method	fn count(self: Self) -> u64
+<std::objc::Ref as NSArrayMethods>::count	../../compiler/std/objc/foundation.tach:310:8	method	fn count(self: Ref<NSArray>) -> u64	effects: alloc(extern) io global panic diverge unsafe
 $ views nothing_here
 error query.no-match: no definition 'nothing_here'
 try: tachyonc query items

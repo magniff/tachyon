@@ -3,7 +3,7 @@
 ## minimal `query effects`.
 $ items
 crate	syntax016/main.tach	10
-std	<std>	562
+std	<std>	566
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	37
@@ -34,6 +34,17 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
+std::objc	<std>	50
+std::objc::foundation	<std>	67
+std::gpu	<std>	129
+std::gpu::hal	<std>	6
+std::gpu::hal::metal	<std>	107
+std::gpu::hal::metal::bindings	<std>	776
+std::gpu::shader	<std>	18
+std::gpu::types	<std>	50
+std::gpu::types::BufferUsage	<std>	9
+std::gpu::types::TextureUsage	<std>	5
+std::gpu::types::ShaderStage	<std>	3
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6
@@ -64,4 +75,4 @@ apply<closure(i64) -> i64 at syntax016/main.tach:47:32>	none
 crate::grow	alloc(Gpa) panic
 crate::main	alloc(Gpa) io global panic unsafe
 $ def Vec::new_in
-std::Vec::new_in	../../compiler/std/std.tach:183:12	method	pub fn new_in(a: A) -> Vec<T, A>
+std::Vec::new_in	../../compiler/std/std.tach:185:12	method	pub fn new_in(a: A) -> Vec<T, A>
