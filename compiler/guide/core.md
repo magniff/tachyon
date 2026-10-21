@@ -156,7 +156,8 @@ with its comment: `tachyonc guide --find split_in`.
 | `non-exhaustive match: 'E::B' is not covered` | an arm for it, or `_ =>` |
 | `calling a C function is unsafe` | `unsafe { ... }`; `tachyonc fix --only unsafe` adds them |
 | `dereference of a raw pointer is unsafe: 'p' is a '*T' parameter` | a borrow is `p: &T` (`&mut T`): `tachyonc fix --values`; or `unsafe { ... }` |
-| `no 'cmp' in module 'std'`; `unknown type 'String'` | every std item is `std::name` (its most used names need no `use`); text is `[u8]`, built in a `Buf` |
+| `no 'cmp' in module 'std'` | every std item is `std::name` (its most used names need no `use`) |
+| `expected 'String', got '[u8]'` | `String::from_in("..", gpa)`: a String owns its text; a parameter `s: &str` takes literals and `&string` |
 | `allocation is explicit: pass an allocator` | `Vec::new_in(gpa)`, `gpa` from `fn main(gpa: Gpa)` passed down |
 | `expected '&mut P', got '&P'` | `&mut x` at the call |
 | `own.moved: 'v' is used here after it moved into 'f(v)'` | `f(&v)` with `v: &Vec<T>`, or `f(v.clone())` (the `try:`) |
