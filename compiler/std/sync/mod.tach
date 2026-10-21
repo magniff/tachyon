@@ -1,0 +1,207 @@
+// std::sync: atomics, locks and channels (0.21; docs/design/concurrency.md).
+
+pub mod atomic;
+pub mod mpsc;
+
+use std::{sys_futex_wait, sys_futex_wake};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+// ---- Locks (0.21) ----
+
+// The lock under Mutex and the channels (§2.6): a 32-bit word, 0 unlocked,
+// 1 locked, 2 locked with waiters (U. Drepper, "Futexes are tricky",
+// mutex 3); the waiters sleep on the word (std's sys_futex_wait: futex on
+// Linux, __ulock on macOS). Acquire on lock, release on unlock.
+pub struct RawLock { state: AtomicU32 }
+
+impl RawLock {
+    #[inline]
+    pub fn new() -> RawLock { RawLock { state: AtomicU32::new(0) } }
+
+    // Waits until the lock is free, and takes it.
+    #[inline]
+    pub fn lock(self) {
+        if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            self.lock_contended();
+        }
+    }
+
+    // Takes the lock when it is free; whether it did.
+    #[inline]
+    pub fn try_lock(self) -> bool {
+        self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
+    }
+
+    fn lock_contended(self) {
+        // A short spin first: the holder may be about to let go.
+        for _ in 0..100 {
+            if self.state.load(Ordering::Relaxed) == 0
+                && self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                return;
+            }
+        }
+        while self.state.swap(2, Ordering::Acquire) != 0 {
+            unsafe { sys_futex_wait(self.state.as_ptr(), 2); }
+        }
+    }
+
+    // Lets the lock go (the caller holds it), waking a waiter.
+    #[inline]
+    pub fn unlock(self) {
+        if self.state.swap(0, Ordering::Release) == 2 {
+            unsafe { sys_futex_wake(self.state.as_ptr(), false); }
+        }
+    }
+}
+
+// Data behind a lock: only the thread holding it reaches the data. `with`
+// locks, runs the closure on the data and unlocks; `lock` gives a guard
+// that unlocks when it is dropped. No poisoning: a panic stops the program.
+//
+//     let m = Mutex::new(0);
+//     m.with(|n| *n += 1);
+pub struct Mutex<T> { raw: RawLock, data: T }
+
+impl<T> Mutex<T> {
+    #[inline]
+    pub fn new(v: sink T) -> Mutex<T> { Mutex { raw: RawLock::new(), data: v } }
+
+    // The data, when nothing else can reach the mutex.
+    pub fn into_inner(sink self) -> T {
+        let m = self;
+        m.data
+    }
+
+    // Locks, runs f on the data, unlocks; f's result.
+    pub fn with<R, F: FnMut(inout T) -> R>(self, f: F) -> R {
+        self.raw.lock();
+        var g = f;
+        let p = &self.data as *T;
+        let r = g(unsafe { &*p });
+        self.raw.unlock();
+        r
+    }
+
+    // with, when the lock is free now: Some(f's result), else None.
+    pub fn try_with<R, F: FnMut(inout T) -> R>(self, f: F) -> Option<R> {
+        if !self.raw.try_lock() {
+            return None;
+        }
+        var g = f;
+        let p = &self.data as *T;
+        let r = g(unsafe { &*p });
+        self.raw.unlock();
+        Some(r)
+    }
+
+    // Locks; the guard unlocks when it is dropped. The caller keeps the
+    // guard inside the mutex's life (0.21.0 does not check it yet: the
+    // guard holds a raw pointer).
+    pub unsafe fn lock(self) -> MutexGuard<T> {
+        self.raw.lock();
+        MutexGuard { m: &self as *Mutex<T> }
+    }
+}
+
+// A held lock (Mutex::lock): `with` runs a closure on the data, `as_ptr`
+// gives its address; dropping the guard unlocks.
+pub struct MutexGuard<T> { m: *Mutex<T> }
+
+impl<T> MutexGuard<T> {
+    // Runs f on the data; f's result.
+    pub fn with<R, F: FnMut(inout T) -> R>(inout self, f: F) -> R {
+        var g = f;
+        unsafe {
+            let p = &(*self.m).data as *T;
+            g(&*p)
+        }
+    }
+
+    // A raw pointer to the data, valid while the guard is.
+    pub fn as_ptr(self) -> *T {
+        unsafe { &(*self.m).data as *T }
+    }
+}
+
+impl<T> Drop for MutexGuard<T> {
+    fn drop(inout self) {
+        unsafe { (*self.m).raw.unlock(); }
+    }
+}
+
+// Runs a function once, whatever the threads calling it (`static INIT:
+// Once = Once::NEW;` is not written yet: `Once { state: AtomicU32 { v: 0
+// } }`). The first call_once runs f; the others wait until it is done.
+pub struct Once { state: AtomicU32 }
+
+impl Once {
+    #[inline]
+    pub fn new() -> Once { Once { state: AtomicU32::new(0) } }
+
+    // Runs f unless a call_once of this Once ran (or is running) already;
+    // returns when it is done.
+    pub fn call_once<F: FnMut()>(self, f: F) {
+        if self.state.load(Ordering::Acquire) == 2 {
+            return;
+        }
+        if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire).is_ok() {
+            var g = f;
+            g();
+            self.state.store(2, Ordering::Release);
+            unsafe { sys_futex_wake(self.state.as_ptr(), true); }
+            return;
+        }
+        while self.state.load(Ordering::Acquire) != 2 {
+            unsafe { sys_futex_wait(self.state.as_ptr(), 1); }
+        }
+    }
+
+    // Whether a call_once has finished.
+    pub fn is_completed(self) -> bool {
+        self.state.load(Ordering::Acquire) == 2
+    }
+}
+
+// Waiting for a condition on a Mutex's data: `wait_then(&m, ready, then)`
+// locks m, sleeps (unlocked) until `ready(data)` holds, then runs
+// `then(data)` under the lock; a thread that changes the data notifies
+// (`notify_one`, `notify_all`). Spurious wakeups are allowed: `ready` is
+// asked again each time.
+pub struct Condvar { seq: AtomicU32 }
+
+impl Condvar {
+    #[inline]
+    pub fn new() -> Condvar { Condvar { seq: AtomicU32::new(0) } }
+
+    pub fn wait_then<T, R, P: FnMut(inout T) -> bool, G: FnMut(inout T) -> R>(self,
+        m: Mutex<T>, ready: P, then: G) -> R {
+        var ok = ready;
+        var run = then;
+        let p = &m.data as *T;
+        m.raw.lock();
+        loop {
+            if ok(unsafe { &*p }) {
+                break;
+            }
+            let seen = self.seq.load(Ordering::Acquire);
+            m.raw.unlock();
+            unsafe { sys_futex_wait(self.seq.as_ptr(), seen); }
+            m.raw.lock();
+        }
+        let r = run(unsafe { &*p });
+        m.raw.unlock();
+        r
+    }
+
+    // Wakes one waiting thread.
+    pub fn notify_one(self) {
+        self.seq.fetch_add(1, Ordering::Release);
+        unsafe { sys_futex_wake(self.seq.as_ptr(), false); }
+    }
+
+    // Wakes every waiting thread.
+    pub fn notify_all(self) {
+        self.seq.fetch_add(1, Ordering::Release);
+        unsafe { sys_futex_wake(self.seq.as_ptr(), true); }
+    }
+}

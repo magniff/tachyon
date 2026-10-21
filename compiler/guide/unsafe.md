@@ -109,4 +109,6 @@ defined:
   with where the block was allocated and freed;
   bad frees and leaks are reported too (`tachyonc guide memory`). With
   `--check-unsafe`, raw accesses are checked against those blocks.
-- Statics, `static var` included, are safe: tachyon has no threads.
+- Statics, `static var` included, are safe: a `static var` is for the
+  main thread, and code another thread runs may not reach one
+  (`sync.global`, `guide threads`).

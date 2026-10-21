@@ -42,7 +42,7 @@ generated header:
 ```console
 $ tachyonc query items
 crate	main.tach	6
-std	<std>	575
+std	<std>	584
 crate::graph	graph.tach	11
 crate::heap	heap.tach	7
 crate::network	network.tach	2
@@ -64,7 +64,7 @@ std::collections::group	<std>	20
 std::io	<std>	12
 std::io::error	<std>	17
 std::io::buffered	<std>	37
-std::fmt	<std>	82
+std::fmt	<std>	94
 std::num	<std>	83
 std::num::tables	<std>	4
 std::convert	<std>	2
@@ -79,6 +79,10 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
+std::sync	<std>	29
+std::sync::atomic	<std>	48
+std::sync::mpsc	<std>	24
+std::thread	<std>	43
 std::string	<std>	153
 std::path	<std>	34
 std::fs	<std>	59
@@ -150,10 +154,10 @@ crate::heap::free_heap	heap.tach:63:8	fn	pub fn free_heap(h: inout MinHeap)
 crate::heap::is_empty	heap.tach:18:8	fn	pub fn is_empty(h: MinHeap) -> bool
 crate::heap::pop	heap.tach:35:8	fn	pub fn pop(h: inout MinHeap) -> Option<Entry>
 crate::graph::edges_from	graph.tach:55:8	fn	pub fn edges_from(g: Graph, i: i64) -> [Edge]
-std::Vec::filled_in	<std>:1485:12	method	pub fn filled_in(n: i64, x: sink T, a: sink A) -> Vec<T, A>
+std::Vec::filled_in	<std>:1488:12	method	pub fn filled_in(n: i64, x: sink T, a: sink A) -> Vec<T, A>
 crate::heap::push	heap.tach:22:8	fn	pub fn push(h: inout MinHeap, e: Entry)
-std::Vec::set	<std>:306:12	method	pub fn set(inout self, i: i64, x: sink T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
-std::Option::unwrap	<std>:124:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
+std::Vec::set	<std>:309:12	method	pub fn set(inout self, i: i64, x: sink T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
+std::Option::unwrap	<std>:127:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
 // callers (1)
 plan	main.tach:20:11	match quickest(g, a, b, gpa) {
 note query.budget: over the budget of 600 tokens, left out: calls 2, types or uses 9

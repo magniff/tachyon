@@ -7,10 +7,10 @@
 // diverge`, and the callbacks C may call (infer.tach). It replaces
 // middle's PURE_LIBM (whose functions are here, none).
 
-use crate::base::intern_c;
+use crate::base::{SYMS, intern_c};
 use crate::front::effects::{
-    EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_RAW_DIVERGE, EFF_RAW_PANIC,
-    EFF_UNKNOWN, Effects, effects_none,
+    EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_RAW_DIVERGE, EFF_RAW_GLOBAL,
+    EFF_RAW_PANIC, EFF_SYNC, EFF_THREAD, EFF_UNKNOWN, Effects, effects_none,
 };
 use crate::front::types::FNS;
 use crate::gen0::target::LINK_NAMES;
@@ -23,11 +23,15 @@ pub const C_ALLOC: i64 = 2;
 pub const C_IO: i64 = 3;
 pub const C_GLOBAL: i64 = 4;
 pub const C_EXIT: i64 = 5;
+// (0.21) Blocking on, or synchronizing with, another thread: sync; starting
+// a thread: thread, sync and alloc(extern) (its stack).
+pub const C_SYNC: i64 = 6;
+pub const C_THREAD: i64 = 7;
 
 // symbol + 1 -> class.
-static mut TABLE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var TABLE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
 
-fn add(names: &mut [*u8], class: i64) {
+fn add(names: inout [*u8], class: i64) {
     unsafe {
         for i in 0..names.len {
             TABLE.put(intern_c(names[i]) + 1, class);
@@ -45,7 +49,7 @@ fn fill_table() {
         c"powf", c"hypot", c"hypotf", c"fmin", c"fminf", c"fmax", c"fmaxf", c"copysign",
         c"copysignf", c"nearbyint", c"rint", c"lround", c"llround", c"fma",
     ];
-    add(&mut libm[..], C_NONE);
+    add(&libm[..], C_NONE);
     let text: [*u8; 44] = [
         c"memcpy", c"memmove", c"memset", c"memcmp", c"memchr", c"strlen", c"strnlen", c"strcmp",
         c"strncmp", c"strchr", c"strrchr", c"strstr", c"strcpy", c"strncpy", c"strcat",
@@ -54,12 +58,12 @@ fn fill_table() {
         c"llabs", c"isalpha", c"isdigit", c"isalnum", c"isspace", c"isupper", c"islower",
         c"isxdigit", c"ispunct", c"toupper", c"tolower", c"snprintf", c"sprintf",
     ];
-    add(&mut text[..], C_NONE);
+    add(&text[..], C_NONE);
     let alloc: [*u8; 9] = [
         c"malloc", c"calloc", c"realloc", c"free", c"strdup", c"strndup", c"posix_memalign",
         c"aligned_alloc", c"reallocarray",
     ];
-    add(&mut alloc[..], C_ALLOC);
+    add(&alloc[..], C_ALLOC);
     let io: [*u8; 50] = [
         c"write", c"read", c"open", c"close", c"lseek", c"pread", c"pwrite", c"fsync", c"printf",
         c"fprintf", c"dprintf", c"vprintf", c"vfprintf", c"puts", c"fputs", c"putchar", c"fputc",
@@ -69,12 +73,24 @@ fn fill_table() {
         c"fstat", c"isatty", c"pipe", c"dup", c"dup2", c"clock", c"time", c"gettimeofday",
         c"clock_gettime",
     ];
-    add(&mut io[..], C_IO);
+    add(&io[..], C_IO);
     let global: [*u8; 6] = [c"getenv", c"rand", c"srand", c"__error", c"__errno_location",
         c"errno"];
-    add(&mut global[..], C_GLOBAL);
+    add(&global[..], C_GLOBAL);
     let exits: [*u8; 4] = [c"exit", c"_exit", c"_Exit", c"abort"];
-    add(&mut exits[..], C_EXIT);
+    add(&exits[..], C_EXIT);
+    let sync: [*u8; 24] = [
+        c"pthread_join", c"pthread_detach", c"pthread_mutex_lock", c"pthread_mutex_unlock",
+        c"pthread_mutex_trylock", c"pthread_mutex_init", c"pthread_mutex_destroy",
+        c"pthread_cond_wait", c"pthread_cond_signal", c"pthread_cond_broadcast",
+        c"pthread_cond_init", c"pthread_cond_destroy", c"pthread_once", c"sched_yield",
+        c"__ulock_wait", c"__ulock_wait2", c"__ulock_wake", c"os_unfair_lock_lock",
+        c"os_unfair_lock_unlock", c"os_sync_wait_on_address", c"os_sync_wake_by_address_any",
+        c"os_sync_wake_by_address_all", c"sem_wait", c"sem_post",
+    ];
+    add(&sync[..], C_SYNC);
+    let thread: [*u8; 1] = [c"pthread_create"];
+    add(&thread[..], C_THREAD);
 }
 
 // The class of the C function with symbol sym (C_UNKNOWN_CLASS: not in
@@ -100,7 +116,7 @@ pub fn c_symbol(f: i64) -> i64 {
 pub fn unknown_c_effects() -> Effects {
     Effects {
         bits: EFF_ALLOC_EXTERN | EFF_IO | EFF_GLOBAL | EFF_PANIC | EFF_DIVERGE | EFF_RAW_PANIC
-            | EFF_RAW_DIVERGE, allocs: 0,
+            | EFF_RAW_DIVERGE | EFF_RAW_GLOBAL, allocs: 0,
     }
 }
 
@@ -108,18 +124,31 @@ pub fn unknown_c_effects() -> Effects {
 // it is not in the table (unknown C: unknown_c_effects).
 pub fn known_c_effects(sym: i64) -> Effects {
     let class = c_class(sym);
-    let mut e = effects_none();
+    var e = effects_none();
     if class == C_ALLOC {
         e.bits = EFF_ALLOC_EXTERN;
     } else if class == C_IO {
         e.bits = EFF_IO;
     } else if class == C_GLOBAL {
-        e.bits = EFF_GLOBAL;
+        e.bits = EFF_GLOBAL | (if is_errno_symbol(sym) { 0 } else { EFF_RAW_GLOBAL });
     } else if class == C_EXIT {
         e.bits = EFF_IO | EFF_DIVERGE | EFF_RAW_DIVERGE;
+    } else if class == C_SYNC {
+        e.bits = EFF_SYNC;
+    } else if class == C_THREAD {
+        e.bits = EFF_THREAD | EFF_SYNC | EFF_ALLOC_EXTERN;
     } else if class == C_UNKNOWN_CLASS {
         e = unknown_c_effects();
         e.bits |= EFF_UNKNOWN;
     }
     e
+}
+
+// (0.21) Whether sym is C's errno (its address): per thread, so global but
+// not EFF_RAW_GLOBAL.
+pub fn is_errno_symbol(sym: i64) -> bool {
+    unsafe {
+        let t = SYMS[sym].text;
+        t == "__error" || t == "__errno_location" || t == "errno"
+    }
 }

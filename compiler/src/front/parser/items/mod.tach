@@ -39,6 +39,7 @@ use crate::front::parser::items::attrs::{
 use crate::front::parser::items::params::parse_params;
 use crate::front::parser::stmts::parse_block;
 use crate::front::parser::types::{is_int_type_name, parse_bound, parse_type};
+use crate::front::threadlocal::STATIC_THREAD_LOCAL;
 
 // One item (or the several items of an impl or extern block), pushed to
 // the program's list.
@@ -126,9 +127,9 @@ fn parse_impl(public: bool) {
         let impl_start = cur_start();
         expect(Impl);
         let params = parse_generic_params(false);
-        let mut self_type = parse_type();
+        var self_type = parse_type();
         // `impl Trait for Type` (0.9): any type.
-        let mut trait_name = 0;
+        var trait_name = 0;
         if eat(For) {
             trait_name = self_type;
             if NODES[trait_name].kind != NodeKind::TyName {
@@ -222,7 +223,7 @@ fn parse_assoc_type(in_impl: bool) -> i64 {
 fn take_assoc_types(from: i64, pos: i64) -> i64 {
     unsafe {
         let end = SCRATCH.count;
-        let mut found = false;
+        var found = false;
         for i in from..end {
             if NODES[SCRATCH.data[i]].kind == NodeKind::AssocType {
                 found = true;
@@ -239,7 +240,7 @@ fn take_assoc_types(from: i64, pos: i64) -> i64 {
             }
         }
         list_end(holder, mark);
-        let mut w = from;
+        var w = from;
         for i in from..end {
             let x = SCRATCH.data[i];
             if NODES[x].kind != NodeKind::AssocType {
@@ -544,7 +545,7 @@ fn parse_use(public: bool) {
         let path = new_node(NodeKind::Path, cur_start(), 0);
         let segments = list_begin();
         let mark = list_begin();
-        let mut last = 0;
+        var last = 0;
         loop {
             let seg = new_node(NodeKind::Ident, cur_start(), 0);
             NODES[seg].a = expect_ident();
@@ -628,17 +629,19 @@ fn parse_import(public: bool) {
 // `pub` may come before the attributes or (0.6) after them.
 fn parse_attributed_item(public: bool) -> i64 {
     unsafe {
-        let mut flags = 0;
-        let mut fn_flags = 0;
-        let mut repr = false;
-        let mut align = 0;
-        let mut pack = 0;
-        let mut int_type = 0;
+        var flags = 0;
+        var fn_flags = 0;
+        var repr = false;
+        var align = 0;
+        var pack = 0;
+        var int_type = 0;
         let at_start = cur_start();
-        let mut derives = 0;
-        let mut derive_mark = 0;
+        var derives = 0;
+        var derive_mark = 0;
         // (0.16: #[sealed], #[scoped])
-        let mut struct_flags = 0;
+        var struct_flags = 0;
+        // (0.21: #[thread_local])
+        var thread_local = false;
         take_effect_decls(0);
         while at(Hash) {
             let attr_pos = cur_start();
@@ -674,6 +677,11 @@ fn parse_attributed_item(public: bool) -> i64 {
                 expect(RParen);
                 expect(RBracket);
                 NODES[derives].end = prev_end();
+                continue;
+            }
+            if name == intern_c(c"thread_local") {
+                thread_local = true;
+                expect(RBracket);
                 continue;
             }
             if name == intern_c(c"sealed") || name == intern_c(c"scoped") {
@@ -746,6 +754,18 @@ fn parse_attributed_item(public: bool) -> i64 {
             }
         }
         let item_public = eat(Pub) || public;
+        if thread_local {
+            if fn_flags != 0 || repr || derives != 0 || struct_flags != 0 {
+                error_at(at_start, c"#[thread_local] takes no other attribute");
+            }
+            let item = parse_item();
+            if NODES[item].kind != NodeKind::Static || NODES[item].d == 0 {
+                error_at(at_start, c"#[thread_local] goes before a `static mut`");
+            }
+            NODES[item].p |= STATIC_THREAD_LOCAL;
+            mark_public(item, item_public);
+            return item;
+        }
         if fn_flags != 0 {
             if repr {
                 error_at(at_start, c"#[repr(...)] and function attributes cannot be combined");

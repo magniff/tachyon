@@ -7,7 +7,9 @@
 
 mod operands;
 mod simd;
+mod atomic;
 
+use crate::back::enc_arm64::atomic::a64_atomic;
 use crate::back::enc_arm64::operands::parse_operand;
 use crate::back::enc_arm64::simd::a64_table_instruction;
 use crate::back::objfile::{
@@ -60,10 +62,10 @@ struct AOp {
     sym: i64, modifier: i64, shift: i64, pre: bool
 }
 
-static mut OPS: *AOp = 0 as *AOp;
+static var OPS: *AOp = 0 as *AOp;
 
 // Mnemonic codes, by name.
-static mut MN: NameMap = NameMap {
+static var MN: NameMap = NameMap {
     ptrs: 0 as *i64, lens: 0 as *i64, vals: 0 as *i64, size: 0, count: 0
 };
 
@@ -172,7 +174,7 @@ const A_UMOV: i64 = 96;
 const A_ROR: i64 = 97;
 
 fn def(name: *u8, code: i64) {
-    unsafe { name_put(&mut MN, c_bytes(name), code); }
+    unsafe { name_put(&MN, c_bytes(name), code); }
 }
 
 pub fn init_a64() {
@@ -209,12 +211,12 @@ pub fn init_a64() {
 }
 
 #[inline]
-fn tchar(mut cx: *FnCtx, i: i64) -> u8 {
+fn tchar(cx: sink *FnCtx, i: i64) -> u8 {
     unsafe { ATEXT[i] }
 }
 
 // A condition code at [a, b), or -1.
-fn cond_code(mut cx: *FnCtx, a: i64, b: i64) -> i64 {
+fn cond_code(cx: sink *FnCtx, a: i64, b: i64) -> i64 {
     if b - a != 2 {
         return -1;
     }
@@ -251,7 +253,7 @@ fn r(k: i64) -> i64 {
     unsafe { OPS[k].reg }
 }
 
-fn need(mut cx: *FnCtx, n: i64) {
+fn need(cx: sink *FnCtx, n: i64) {
     if OP_COUNT != n {
         unsafe { asm_error(cx, c"wrong number of operands"); }
     }
@@ -273,7 +275,7 @@ fn ftype(k: i64) -> i64 {
 // A logical immediate (bitmask) for a register of `width` bits: the
 // N:immr:imms fields at bit 10, or -1 when the value is not one.
 fn logical_imm(value: i64, width: i64) -> i64 {
-    let mut v = value;
+    var v = value;
     if width == 32 {
         v = v & 0xffffffff;
         v = v | (v << 32);
@@ -282,7 +284,7 @@ fn logical_imm(value: i64, width: i64) -> i64 {
         return -1;
     }
     // The smallest repeating element.
-    let mut size = 64;
+    var size = 64;
     while size > 2 {
         let half = size / 2;
         let mask = (1 << half) - 1;
@@ -296,7 +298,7 @@ fn logical_imm(value: i64, width: i64) -> i64 {
     // elem must be a rotated run of ones: count them and find the rotation.
     let ones = (0..size).filter(|i| ((elem >> i) & 1) != 0).count();
     let run = if ones == 64 { -1 } else { (1 << ones) - 1 };
-    let mut rot = -1;
+    var rot = -1;
     for rr in 0..size {
         // rotate `run` right by rr within size bits
         let rotated = if rr == 0 { run } else { ((run >> rr) | (run << (size - rr))) & mask };
@@ -314,7 +316,7 @@ fn logical_imm(value: i64, width: i64) -> i64 {
     (n << 22) | (immr << 16) | ((imms & 0x3f) << 10)
 }
 
-fn cond_of(mut cx: *FnCtx, k: i64) -> i64 {
+fn cond_of(cx: sink *FnCtx, k: i64) -> i64 {
     unsafe {
         if OPS[k].kind != K_COND {
             asm_error(cx, c"expected a condition");
@@ -326,17 +328,17 @@ fn cond_of(mut cx: *FnCtx, k: i64) -> i64 {
 // ---- Instructions ----
 
 // add/sub/adds/subs: op 0 add, 1 sub; s: set flags. rd may be 31 (cmp).
-fn addsub(mut cx: *FnCtx, op: i64, s: i64, rd: i64, rn_k: i64, m_k: i64) {
+fn addsub(cx: sink *FnCtx, op: i64, s: i64, rd: i64, rn_k: i64, m_k: i64) {
     unsafe {
         let x = sf(rn_k);
         if is_imm(m_k) {
-            let mut imm = OPS[m_k].imm;
-            let mut o = op;
+            var imm = OPS[m_k].imm;
+            var o = op;
             if imm < 0 {
                 imm = 0 - imm;
                 o = 1 - o;
             }
-            let mut sh = 0;
+            var sh = 0;
             if m_k + 1 < OP_COUNT && OPS[m_k + 1].kind == K_SHIFT {
                 if OPS[m_k + 1].amount == 12 {
                     sh = 1;
@@ -365,8 +367,8 @@ fn addsub(mut cx: *FnCtx, op: i64, s: i64, rd: i64, rn_k: i64, m_k: i64) {
             word(x | op << 30 | s << 29 | 0x0b200000 | r(m_k) << 16 | 3 << 13 | r(rn_k) << 5 | rd);
             return;
         }
-        let mut shift = 0;
-        let mut amount = 0;
+        var shift = 0;
+        var amount = 0;
         if m_k + 1 < OP_COUNT && OPS[m_k + 1].kind == K_SHIFT {
             shift = OPS[m_k + 1].shift;
             amount = OPS[m_k + 1].amount;
@@ -377,7 +379,7 @@ fn addsub(mut cx: *FnCtx, op: i64, s: i64, rd: i64, rn_k: i64, m_k: i64) {
 }
 
 // and/orr/eor/ands: opc 0 and, 1 orr, 2 eor, 3 ands.
-fn logical(mut cx: *FnCtx, opc: i64, rd: i64, rn_k: i64, m_k: i64) {
+fn logical(cx: sink *FnCtx, opc: i64, rd: i64, rn_k: i64, m_k: i64) {
     unsafe {
         let x = sf(rn_k);
         if is_imm(m_k) {
@@ -388,8 +390,8 @@ fn logical(mut cx: *FnCtx, opc: i64, rd: i64, rn_k: i64, m_k: i64) {
             word(x | opc << 29 | 0x12000000 | enc | r(rn_k) << 5 | rd);
             return;
         }
-        let mut shift = 0;
-        let mut amount = 0;
+        var shift = 0;
+        var amount = 0;
         if m_k + 1 < OP_COUNT && OPS[m_k + 1].kind == K_SHIFT {
             shift = OPS[m_k + 1].shift;
             amount = OPS[m_k + 1].amount;
@@ -400,7 +402,7 @@ fn logical(mut cx: *FnCtx, opc: i64, rd: i64, rn_k: i64, m_k: i64) {
 }
 
 // mov of an immediate: movz, movn, or orr with a logical immediate.
-fn mov_imm(mut cx: *FnCtx, k_rd: i64, value: i64) {
+fn mov_imm(cx: sink *FnCtx, k_rd: i64, value: i64) {
     let x = sf(k_rd);
     let width = if x != 0 { 64 } else { 32 };
     let v = if width == 32 { value & 0xffffffff } else { value };
@@ -430,7 +432,7 @@ fn mov_imm(mut cx: *FnCtx, k_rd: i64, value: i64) {
 // Loads and stores of one register. size: log2 bytes; `unscaled`: the
 // opcode of the unscaled-offset form (ldur...), from which the others
 // derive.
-fn load_store(mut cx: *FnCtx, unscaled: i64, size: i64) {
+fn load_store(cx: sink *FnCtx, unscaled: i64, size: i64) {
     unsafe {
         need(cx, if OP_COUNT == 3 { 3 } else { 2 });
         let rt = r(0);
@@ -496,8 +498,8 @@ fn pair(load: bool) {
         let l = if load { 1 << 22 } else { 0 };
         let scale = if cls == C_Q { 16 } else if cls == C_X || cls == C_D { 8 } else { 4 };
         let m = OPS[2];
-        let mut mode = 2;
-        let mut off = m.imm;
+        var mode = 2;
+        var off = m.imm;
         if OP_COUNT == 4 {
             mode = 1;
             off = OPS[3].imm;
@@ -538,7 +540,7 @@ fn is_simd(k: i64) -> bool {
 }
 
 // Advanced SIMD (0.10): the forms vector code uses (mc_arm64.tach).
-fn a64_simd(mut cx: *FnCtx, code: i64) {
+fn a64_simd(cx: sink *FnCtx, code: i64) {
     unsafe {
         let o0 = OPS[0];
         let o1 = OPS[1];
@@ -628,7 +630,7 @@ fn a64_simd(mut cx: *FnCtx, code: i64) {
     }
 }
 
-pub fn a64_instruction(mut cx: *FnCtx, a: i64, b: i64) {
+pub fn a64_instruction(cx: sink *FnCtx, a: i64, b: i64) {
     unsafe {
         for k in 0..OP_COUNT {
             parse_operand(cx, k);
@@ -666,6 +668,10 @@ pub fn a64_instruction(mut cx: *FnCtx, a: i64, b: i64) {
             return;
         }
         if code == 0 {
+            // (0.21: the atomics, enc_arm64/atomic.tach)
+            if a64_atomic(cx, t[a..b]) {
+                return;
+            }
             asm_error(cx, c"unknown instruction");
             return;
         }
@@ -853,5 +859,5 @@ pub fn a64_instruction(mut cx: *FnCtx, a: i64, b: i64) {
 
 // The code of mnemonic t (0: none).
 fn mnemonic(t: [u8]) -> i64 {
-    unsafe { name_get(&MN, t) }
+    unsafe { name_get(MN, t) }
 }

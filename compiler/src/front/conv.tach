@@ -2,25 +2,24 @@
 // "Phase 0 contract"): which spelling a file is read in, Rust's spellings
 // recognized with their 0.20 form, and what a parameter's convention is.
 //
-// A file is read in one of three ways:
-// - mixed (the default until Phase M): 0.19's spelling and 0.20's both,
+// A file is read in one of two ways:
+// - 0.20 (the default; `--syntax=0.20`): 0.20's spelling only; Rust's
+//   (`&T`, `&mut x`, `let mut`, `static mut`, `mut x:`, `move ||`) is
+//   `conv.rust`, and `&x` is the inout marker;
+// - mixed (`--syntax=mixed`, for the migrations, `fix --only
+//   conventions` and the older ones): 0.19's spelling and 0.20's both,
 //   each with its meaning; `&x` is a shared reference, except where an
-//   exclusive one is wanted (the inout marker, check_mode: inout_marker);
-// - 0.20 (`--syntax=0.20`, the default from Phase M): 0.20's spelling
-//   only; Rust's (`&T`, `&mut x`, `let mut`, `static mut`, `mut x:`, `move
-//   ||`) is `conv.rust`, and `&x` is the inout marker;
-// - 0.19 (legacy): the crate whose root's first line is LEGACY_MARKER,
-//   compiler/src during 0.20 (the bootstrap, §9.3): 0.19's spelling only,
-//   0.20's is `syntax.legacy`. tests/run.sh checks that no other file
-//   carries the line (but the legacy mode's own tests, conv_legacy_*).
-// std and the compiler's generated sources (`<check>`, ...) are read
-// mixed whatever the root says, until Phase M migrates them.
+//   exclusive one is wanted (the inout marker, check_mode: inout_marker).
+// std is 0.20 code; the compiler's generated sources (`<check>`, ...)
+// keep 0.19's meanings (generated_at). (0.21) The legacy mode, 0.19's
+// spelling only for compiler/src during 0.20, is gone: its root pragma
+// LEGACY_MARKER is syntax.legacy_removed.
 
 use crate::base::{
     FILES, FILE_COUNT, SRC, SYMS, buf_bytes, buf_int, buf_new, buf_slice, buf_str, streq,
 };
 use crate::base::diag::{
-    ERR_KIND, err_begin, err_end, err_end_soft, err_fix, err_fmt, err_help, err_try_tool,
+    ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_try_tool,
 };
 use crate::front::ast::{
     CONV_INOUT, CONV_NEW, CONV_SINK, NODES, NODE_RAW, NODE_REF, NODE_REF_MUT, NodeKind, child,
@@ -32,15 +31,14 @@ use crate::front::types::{
     FNS, REF_MUT, REF_SHARED, STRUCTS, TYPES, TY_ERROR, TyKind, ref_to, struct_field, type_elem,
 };
 
-// The first line that makes a crate legacy (its root file's first bytes).
+// The bootstrap's pragma of 0.20 (its root file's first bytes): from 0.21
+// an error, syntax.legacy_removed.
 pub const LEGACY_MARKER: [u8] = "// tachyon-syntax: 0.19";
 
 // `--syntax=0.20` (main's arguments, every command): 0.20's spelling only,
 // the default from Phase M; `--syntax=mixed` reads 0.19's too (an opt-out
 // for code not yet migrated by `tachyonc fix --only conventions`).
-pub static mut STRICT: bool = true;
-// The root file starts with LEGACY_MARKER (set by conv_setup).
-pub static mut LEGACY_ROOT: bool = false;
+pub static var STRICT: bool = true;
 
 // A parameter's convention (param_conv): CONV_LEGACY is a parameter
 // written in 0.19's spelling (by value, `&T`, `&mut T`, `*T`: its type
@@ -63,59 +61,73 @@ pub const CODE_MARKER: *u8 = c"conv.marker";
 pub const CODE_MARKER_EXTRA: *u8 = c"conv.marker_extra";
 pub const CODE_PLACE: *u8 = c"conv.place";
 pub const CODE_EXTERN: *u8 = c"conv.extern";
-pub const CODE_LEGACY: *u8 = c"syntax.legacy";
 pub const CODE_LEGACY_REMOVED: *u8 = c"syntax.legacy_removed";
 
-// `--syntax=0.20` / `--syntax=mixed`: sets the mode; false when arg is not
-// that option.
+// `--syntax=0.20`: the default, accepted; `--syntax=mixed` is refused
+// (0.21): 0.19's spelling is read only by the migrations, inside `fix`
+// (set_mixed). False when arg is not that option.
 pub fn syntax_option(arg: *u8) -> bool {
     unsafe {
         if streq(arg, c"--syntax=0.20") {
             STRICT = true;
             // (the children, `tachyonc try`'s, read as this one does)
             conv_setenv(c"TACHYON_SYNTAX", c"0.20", 1);
-        } else if streq(arg, c"--syntax=mixed") {
-            set_mixed();
-        } else {
-            return false;
+            return true;
         }
-        true
+        if streq(arg, c"--syntax=mixed") {
+            crate::base::die(c"syntax.mixed_removed: no build, check or run reads 0.19's spelling (0.21): Rust's spellings are conv.rust errors, each with its fix (tachyonc fix --suggested); `tachyonc fix --only conventions` migrates 0.19 code");
+        }
+        false
     }
 }
 
 extern "C" {
     #[link_name = "setenv"]
     fn conv_setenv(name: *u8, value: *u8, overwrite: i32) -> i32;
+    #[link_name = "getpid"]
+    fn conv_getpid() -> i32;
+    #[link_name = "getppid"]
+    fn conv_getppid() -> i32;
+    #[link_name = "atol"]
+    fn conv_atol(s: *u8) -> i64;
 }
 
-// The program is read mixed (0.19's spelling too): a migration's (`fix
-// --values`, `--only conventions`), whose child processes (the checks of
-// the edit) inherit it through TACHYON_SYNTAX.
+// The program is read mixed (0.19's spelling too): only by a migration
+// (`fix --only conventions`, `--values`, `--only std015|alloc016`), whose
+// child processes (the checks of its edits, its later rounds) inherit it
+// through TACHYON_SYNTAX=mixed:PID, honored only by a child of process
+// PID (syntax_from_env): no build, check or run of a user's reads it.
 pub fn set_mixed() {
     unsafe {
         STRICT = false;
-        conv_setenv(c"TACHYON_SYNTAX", c"mixed", 1);
+        let b = buf_new();
+        buf_bytes(b, "mixed:");
+        buf_int(b, conv_getpid() as i64);
+        buf_bytes(b, "\0");
+        conv_setenv(c"TACHYON_SYNTAX", buf_slice(b).ptr, 1);
     }
 }
 
-// At start (main): TACHYON_SYNTAX=mixed (a migration's child) or 0.20.
+// At start (main): TACHYON_SYNTAX=mixed:PID, where PID is this process's
+// parent (a migration's child: set_mixed, which it passes on to its own
+// children); any other value is the default, 0.20's spelling.
 pub fn syntax_from_env() {
     unsafe {
         let v = crate::base::getenv(c"TACHYON_SYNTAX");
-        if v != 0 as *u8 {
-            if streq(v, c"mixed") {
-                STRICT = false;
-            } else if streq(v, c"0.20") {
-                STRICT = true;
-            }
+        if v == 0 as *u8 {
+            return;
+        }
+        if v[0] == 'm' && v[1] == 'i' && v[2] == 'x' && v[3] == 'e' && v[4] == 'd' && v[5] == ':'
+            && conv_atol(&v[6]) == conv_getppid() as i64 {
+            set_mixed();
         }
     }
 }
 
-// Before parsing: whether the root (the first file) is legacy.
+// Before parsing: a root that starts with the 0.20 bootstrap's pragma is
+// syntax.legacy_removed (0.21: the legacy mode is gone).
 pub fn conv_setup() {
     unsafe {
-        LEGACY_ROOT = false;
         CACHE_FILE = -1;
         if FILE_COUNT == 0 {
             return;
@@ -123,16 +135,19 @@ pub fn conv_setup() {
         let s = FILES[0].start;
         let n = LEGACY_MARKER.len;
         if FILES[0].end - s >= n && SRC[s..s + n] == LEGACY_MARKER {
-            LEGACY_ROOT = true;
+            conv_error(CODE_LEGACY_REMOVED, s, s + n,
+                "this compiler reads only 0.20's spelling: '// tachyon-syntax: 0.19' was the bootstrap's pragma of 0.20",
+                "migrate the crate with `tachyonc fix --only conventions`, then delete the line",
+                "");
         }
     }
 }
 
-static mut CACHE_FILE: i64 = -1;
-static mut CACHE_START: i64 = 0;
-static mut CACHE_END: i64 = 0;
-static mut CACHE_USER: bool = false;
-static mut CACHE_STD: bool = false;
+static var CACHE_FILE: i64 = -1;
+static var CACHE_START: i64 = 0;
+static var CACHE_END: i64 = 0;
+static var CACHE_USER: bool = false;
+static var CACHE_STD: bool = false;
 
 // Whether pos is in a file of the program's own crate (not std's, not a
 // generated source).
@@ -155,11 +170,6 @@ fn user_at(pos: i64) -> bool {
     }
 }
 
-// Read in 0.19's spelling only (the bootstrap's crate).
-pub fn legacy_at(pos: i64) -> bool {
-    unsafe { LEGACY_ROOT && user_at(pos) }
-}
-
 // Read in 0.20's spelling only.
 pub fn strict_at(pos: i64) -> bool {
     unsafe {
@@ -170,7 +180,7 @@ pub fn strict_at(pos: i64) -> bool {
         // (a std tree read from disk in a mixed run, `fix --only conventions
         // --std-tree DIR` migrating std's files: mixed, as the program)
         CACHE_STD && (STRICT || crate::front::stdtree::STD_TREE == 0 as *u8)
-            || STRICT && !LEGACY_ROOT && user
+            || STRICT && user
     }
 }
 
@@ -217,7 +227,7 @@ pub fn try_patch(pos: i64, old: [u8], new: [u8]) {
         if path[0] == '<' || unquotable(old) || unquotable(new) {
             return;
         }
-        let mut line = 1;
+        var line = 1;
         for i in FILES[f].start..pos {
             if SRC[i] == '\n' {
                 line += 1;
@@ -246,7 +256,7 @@ fn unquotable(s: [u8]) -> bool {
     false
 }
 
-// A coded error of this front (`conv.*`, `syntax.legacy`), soft: parsing
+// A coded error of this front (`conv.*`, `syntax.legacy_removed`), soft: parsing
 // goes on. SRC[start..end) is replaced by `new` (the try: line, and `fix
 // --suggested`) when `new` is not empty.
 pub fn conv_error(code: *u8, start: i64, end: i64, message: [u8], help: [u8], new: [u8]) {
@@ -319,16 +329,6 @@ pub fn env_var_error(n: i64, module: [u8], member: [u8]) {
     }
 }
 
-// `syntax.legacy`: 0.20's spelling in a crate read in 0.19's.
-pub fn legacy_error(start: i64, end: i64, what: [u8]) {
-    let b = buf_new();
-    buf_bytes(b, what);
-    buf_bytes(b, " is 0.20's spelling, and this crate is read in 0.19's: its root's first line is '// tachyon-syntax: 0.19' (tachyon's own source until 0.21)");
-    conv_error(c"syntax.legacy", start, end, buf_slice(b),
-        "write it as 0.19 did (`&mut T`, `let mut`, `mut self: T`): v0.19.1 compiles this crate",
-        "");
-}
-
 // ---- Conventions ----
 
 // The convention of Param node p (CONV_LEGACY, CONV_LET, CONV_IN_OUT,
@@ -357,7 +357,7 @@ pub fn param_node(f: i64, i: i64) -> i64 {
         if fnode <= 0 {
             return 0;
         }
-        let mut k = 0;
+        var k = 0;
         for j in 0..NODES[fnode].count {
             let p = child(fnode, j);
             if NODES[p].kind == NodeKind::Param {
@@ -624,13 +624,13 @@ pub fn legacy_let_args(n: i64, f: i64, first_param: i64) {
 }
 
 // The positions of the `&`s legacy_let_args dropped.
-pub static mut LET_STRIPPED: crate::base::IntVec = crate::base::IntVec {
+pub static var LET_STRIPPED: crate::base::IntVec = crate::base::IntVec {
     data: 0 as *i64, count: 0, cap: 0
 };
 
 // (0.20) The `&` of each `&e[a..b]` the checker dropped (a slice is its own
 // view), with the slicing's start: pairs, for `fix --only conventions`.
-pub static mut SLICE_AMPS: crate::base::IntVec = crate::base::IntVec {
+pub static var SLICE_AMPS: crate::base::IntVec = crate::base::IntVec {
     data: 0 as *i64, count: 0, cap: 0
 };
 

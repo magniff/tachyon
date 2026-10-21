@@ -1,0 +1,286 @@
+// std::sync::atomic: Atomic<T>, its orderings and fences (0.21).
+
+// ---- Atomics (0.21) ----
+
+// Atomic<T> and its orderings (docs/design/concurrency.md §2.2): C++20's
+// memory model, without Consume. `Atomic<T>` holds a T that threads read
+// and write at once without a data race, through its methods; T is an
+// integer of 1, 2, 4 or 8 bytes, a bool or a raw pointer. Rust's names are
+// aliases: AtomicI64 is Atomic<i64>.
+//
+//     static mut HITS: AtomicI64 = AtomicI64 { v: 0 };   // (std::sync::atomic)
+//     HITS.fetch_add(1, Ordering::Relaxed);
+//
+// An ordering an operation cannot have (a load with Release) is made
+// SeqCst, and so is one that is not a constant after inlining; weak
+// compare-exchange is the strong one. Integers wrap.
+
+pub enum Ordering { Relaxed, Acquire, Release, AcqRel, SeqCst }
+
+// The intrinsics the lowering makes ATOMIC and FENCE instructions of
+// (middle/lower/atomic.tach, gen0/gen/atomic.tach): `order` is 0
+// Relaxed ... 4 SeqCst, a literal (else SeqCst). The caller promises that
+// p is valid and aligned to T's size, and that no non-atomic access of
+// *p races with this one. Their bodies are never compiled.
+pub unsafe fn atomic_load<T>(p: *T, order: i64) -> T { unreachable() }
+pub unsafe fn atomic_store<T>(p: *T, v: T, order: i64) { unreachable() }
+pub unsafe fn atomic_swap<T>(p: *T, v: T, order: i64) -> T { unreachable() }
+
+// The old value; *p becomes `new` when it was `expected`.
+pub unsafe fn atomic_cas<T>(p: *T, expected: T, new: T, order: i64) -> T {
+    unreachable()
+}
+
+pub unsafe fn atomic_add<T>(p: *T, v: T, order: i64) -> T { unreachable() }
+pub unsafe fn atomic_sub<T>(p: *T, v: T, order: i64) -> T { unreachable() }
+pub unsafe fn atomic_and<T>(p: *T, v: T, order: i64) -> T { unreachable() }
+pub unsafe fn atomic_nand<T>(p: *T, v: T, order: i64) -> T { unreachable() }
+pub unsafe fn atomic_or<T>(p: *T, v: T, order: i64) -> T { unreachable() }
+pub unsafe fn atomic_xor<T>(p: *T, v: T, order: i64) -> T { unreachable() }
+// Signed or unsigned as T is.
+pub unsafe fn atomic_max<T>(p: *T, v: T, order: i64) -> T { unreachable() }
+pub unsafe fn atomic_min<T>(p: *T, v: T, order: i64) -> T { unreachable() }
+pub unsafe fn atomic_fence(order: i64) { unreachable() }
+pub unsafe fn atomic_compiler_fence(order: i64) { unreachable() }
+
+// The ordering of a compare-exchange: one for both outcomes, at least as
+// strong as each.
+#[inline]
+fn cas_order(success: Ordering, failure: Ordering) -> i64 {
+    let s = success as i64;
+    let f = failure as i64;
+    if s == 4 || f == 4 {
+        return 4;
+    }
+    if f == 1 && (s == 0 || s == 2) {
+        return if s == 0 { 1 } else { 3 };
+    }
+    s
+}
+
+pub struct Atomic<T> { v: T }
+
+pub type AtomicI8 = Atomic<i8>;
+pub type AtomicI16 = Atomic<i16>;
+pub type AtomicI32 = Atomic<i32>;
+pub type AtomicI64 = Atomic<i64>;
+pub type AtomicU8 = Atomic<u8>;
+pub type AtomicU16 = Atomic<u16>;
+pub type AtomicU32 = Atomic<u32>;
+pub type AtomicU64 = Atomic<u64>;
+pub type AtomicIsize = Atomic<isize>;
+pub type AtomicUsize = Atomic<usize>;
+pub type AtomicBool = Atomic<bool>;
+pub type AtomicPtr<T> = Atomic<*T>;
+
+// An atomic is owned (move-only): a copy of one other threads use would
+// read it non-atomically.
+impl<T> Drop for Atomic<T> {
+    #[inline]
+    fn drop(inout self) {}
+}
+
+impl<T> Atomic<T> {
+    #[inline]
+    pub fn new(v: sink T) -> Atomic<T> { Atomic { v: v } }
+
+    // The value, when nothing else can reach the atomic.
+    #[inline]
+    pub fn into_inner(sink self) -> T {
+        let a = self;
+        unsafe { atomic_load(&a.v as *T, 0) }
+    }
+
+    // The value's address (accesses through it must not race with atomic ones).
+    #[inline]
+    pub fn as_ptr(self) -> *T { &self.v as *T }
+
+    #[inline]
+    pub fn load(self, order: Ordering) -> T {
+        unsafe {
+            match order {
+                Ordering::Relaxed => atomic_load(&self.v as *T, 0),
+                Ordering::Acquire => atomic_load(&self.v as *T, 1),
+                _ => atomic_load(&self.v as *T, 4),
+            }
+        }
+    }
+
+    #[inline]
+    pub fn store(self, v: T, order: Ordering) {
+        unsafe {
+            match order {
+                Ordering::Relaxed => atomic_store(&self.v as *T, v, 0),
+                Ordering::Release => atomic_store(&self.v as *T, v, 2),
+                _ => atomic_store(&self.v as *T, v, 4),
+            }
+        }
+    }
+
+    #[inline]
+    pub fn swap(self, v: T, order: Ordering) -> T {
+        unsafe {
+            match order {
+                Ordering::Relaxed => atomic_swap(&self.v as *T, v, 0),
+                Ordering::Acquire => atomic_swap(&self.v as *T, v, 1),
+                Ordering::Release => atomic_swap(&self.v as *T, v, 2),
+                Ordering::AcqRel => atomic_swap(&self.v as *T, v, 3),
+                Ordering::SeqCst => atomic_swap(&self.v as *T, v, 4),
+            }
+        }
+    }
+
+    // Ok(the old value) when it was `current` (and is now `new`), else
+    // Err(the value found).
+    #[inline]
+    pub fn compare_exchange(self, current: T, new: T, success: Ordering,
+        failure: Ordering) -> Result<T, T> {
+        let order = cas_order(success, failure);
+        let old = unsafe {
+            if order == 0 {
+                atomic_cas(&self.v as *T, current, new, 0)
+            } else if order == 1 {
+                atomic_cas(&self.v as *T, current, new, 1)
+            } else if order == 2 {
+                atomic_cas(&self.v as *T, current, new, 2)
+            } else if order == 3 {
+                atomic_cas(&self.v as *T, current, new, 3)
+            } else {
+                atomic_cas(&self.v as *T, current, new, 4)
+            }
+        };
+        if old == current { Ok(old) } else { Err(old) }
+    }
+
+    // compare_exchange (it never fails spuriously here).
+    #[inline]
+    pub fn compare_exchange_weak(self, current: T, new: T, success: Ordering,
+        failure: Ordering) -> Result<T, T> {
+        self.compare_exchange(current, new, success, failure)
+    }
+
+    #[inline]
+    pub fn fetch_add(self, v: T, order: Ordering) -> T {
+        unsafe {
+            match order {
+                Ordering::Relaxed => atomic_add(&self.v as *T, v, 0),
+                Ordering::Acquire => atomic_add(&self.v as *T, v, 1),
+                Ordering::Release => atomic_add(&self.v as *T, v, 2),
+                Ordering::AcqRel => atomic_add(&self.v as *T, v, 3),
+                Ordering::SeqCst => atomic_add(&self.v as *T, v, 4),
+            }
+        }
+    }
+
+    #[inline]
+    pub fn fetch_sub(self, v: T, order: Ordering) -> T {
+        unsafe {
+            match order {
+                Ordering::Relaxed => atomic_sub(&self.v as *T, v, 0),
+                Ordering::Acquire => atomic_sub(&self.v as *T, v, 1),
+                Ordering::Release => atomic_sub(&self.v as *T, v, 2),
+                Ordering::AcqRel => atomic_sub(&self.v as *T, v, 3),
+                Ordering::SeqCst => atomic_sub(&self.v as *T, v, 4),
+            }
+        }
+    }
+
+    #[inline]
+    pub fn fetch_and(self, v: T, order: Ordering) -> T {
+        unsafe {
+            match order {
+                Ordering::Relaxed => atomic_and(&self.v as *T, v, 0),
+                Ordering::Acquire => atomic_and(&self.v as *T, v, 1),
+                Ordering::Release => atomic_and(&self.v as *T, v, 2),
+                Ordering::AcqRel => atomic_and(&self.v as *T, v, 3),
+                Ordering::SeqCst => atomic_and(&self.v as *T, v, 4),
+            }
+        }
+    }
+
+    // !(old & v) (integers only).
+    #[inline]
+    pub fn fetch_nand(self, v: T, order: Ordering) -> T {
+        unsafe {
+            match order {
+                Ordering::Relaxed => atomic_nand(&self.v as *T, v, 0),
+                Ordering::Acquire => atomic_nand(&self.v as *T, v, 1),
+                Ordering::Release => atomic_nand(&self.v as *T, v, 2),
+                Ordering::AcqRel => atomic_nand(&self.v as *T, v, 3),
+                Ordering::SeqCst => atomic_nand(&self.v as *T, v, 4),
+            }
+        }
+    }
+
+    #[inline]
+    pub fn fetch_or(self, v: T, order: Ordering) -> T {
+        unsafe {
+            match order {
+                Ordering::Relaxed => atomic_or(&self.v as *T, v, 0),
+                Ordering::Acquire => atomic_or(&self.v as *T, v, 1),
+                Ordering::Release => atomic_or(&self.v as *T, v, 2),
+                Ordering::AcqRel => atomic_or(&self.v as *T, v, 3),
+                Ordering::SeqCst => atomic_or(&self.v as *T, v, 4),
+            }
+        }
+    }
+
+    #[inline]
+    pub fn fetch_xor(self, v: T, order: Ordering) -> T {
+        unsafe {
+            match order {
+                Ordering::Relaxed => atomic_xor(&self.v as *T, v, 0),
+                Ordering::Acquire => atomic_xor(&self.v as *T, v, 1),
+                Ordering::Release => atomic_xor(&self.v as *T, v, 2),
+                Ordering::AcqRel => atomic_xor(&self.v as *T, v, 3),
+                Ordering::SeqCst => atomic_xor(&self.v as *T, v, 4),
+            }
+        }
+    }
+
+    #[inline]
+    pub fn fetch_max(self, v: T, order: Ordering) -> T {
+        unsafe {
+            match order {
+                Ordering::Relaxed => atomic_max(&self.v as *T, v, 0),
+                Ordering::Acquire => atomic_max(&self.v as *T, v, 1),
+                Ordering::Release => atomic_max(&self.v as *T, v, 2),
+                Ordering::AcqRel => atomic_max(&self.v as *T, v, 3),
+                Ordering::SeqCst => atomic_max(&self.v as *T, v, 4),
+            }
+        }
+    }
+
+    #[inline]
+    pub fn fetch_min(self, v: T, order: Ordering) -> T {
+        unsafe {
+            match order {
+                Ordering::Relaxed => atomic_min(&self.v as *T, v, 0),
+                Ordering::Acquire => atomic_min(&self.v as *T, v, 1),
+                Ordering::Release => atomic_min(&self.v as *T, v, 2),
+                Ordering::AcqRel => atomic_min(&self.v as *T, v, 3),
+                Ordering::SeqCst => atomic_min(&self.v as *T, v, 4),
+            }
+        }
+    }
+}
+
+// A memory fence: Acquire, Release, AcqRel or SeqCst (Relaxed is SeqCst).
+#[inline]
+pub fn fence(order: Ordering) {
+    unsafe {
+        match order {
+            Ordering::Acquire => atomic_fence(1),
+            Ordering::Release => atomic_fence(2),
+            Ordering::AcqRel => atomic_fence(3),
+            _ => atomic_fence(4),
+        }
+    }
+}
+
+// A fence for the compiler only (no instruction): memory accesses are not
+// moved across it. For signal handlers.
+#[inline]
+pub fn compiler_fence(order: Ordering) {
+    unsafe { atomic_compiler_fence(order as i64); }
+}

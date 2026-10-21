@@ -1340,6 +1340,16 @@ Moved to 0.20.1 or 0.21:
   tests (in the manner of loom) and a race-detecting build mode; the
   fuzzer gains threads
 
+Done (0.21.0). Threads (std::thread's safe spawn and scope, std::sync's
+atomics, Mutex, RawLock, Once, Condvar and channels, `#[thread_local]`,
+the thread, sync and tls effects, Send and Sync from the types, atomics
+on AArch64 as LSE or exclusive pairs and as barriers in the optimizer),
+the compiler's source in 0.20's conventions, the 0.19 spelling removed,
+`.vl` sources and `VOLE_*` variables accepted. Moved to 0.21.1: the
+small-program compile regression of 0.20 (being investigated), the
+0.20.1 list of docs/design/conventions.md, `Mutex::lock`'s guard made
+safe (Drop on view types), x86-64 atomics run.
+
 ## 0.22: GPU support
 
 - a native `gpu` library: wgpu's model (instance, adapter, device, queue,
@@ -2371,3 +2381,19 @@ Compile time (instructions retired, 0.20's source in a copy, no cache):
 the self-compile 10.88 G to 11.55 G at -O0 (+6.2%), 43.24 G to 43.80 G
 at -O2 -j1 (+1.3%); `check` 4.84 G to 5.49 G (+13.5%); a hello world 47 M
 to 317 M (std's text, above).
+
+### 0.21
+
+The release gate (`gate.sh --release --no-x86`, 26:10 wall at load up
+to 30; suite-O0 and stress-grow rerun, 13:06): every step passing, the
+suite 1687 (2 XFAIL), aarch64-linux 1360, threads 2602, incremental 160
+series, valgrind 247 clean. example_algorithms-lru-cache at -O0 timed
+out once under load (as at 0.20.0) and passed on the rerun.
+
+Bench (load 9 to 27: times are not the measure): geomean 0.845 of cc
+-O2, v0.20.0's build 0.957 in the same run; instructions retired against
+v0.20.0's build of the same programs: every program within 0.1% but
+sieve (+0.9%). Compile time in instructions (0.21's source, no cache):
+the self-compile 11.83 G to 11.89 G at -O0, 45.04 G to 45.51 G at -O2
+-j1 (+1.0%), check 5.68 G to 5.70 G; a hello world 327 M to 336 M (0.20's
+regression, under investigation for 0.21.1).
