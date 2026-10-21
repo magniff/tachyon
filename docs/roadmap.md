@@ -1367,6 +1367,18 @@ safe (Drop on view types), x86-64 atomics run.
 - tested headless: compute kernels against CPU results, render passes
   read back and compared with reference images
 
+Done (0.22.0). std::gpu on wgpu's model with the Metal backend over
+std::objc (resources as values with destructors, the validation rules
+as contracts, the per-frame functions allocation-free, tested headless
+against CPU results and reference images), std::gpu::wgsl (WGSL to MSL
+with reflection, an interpreter as the oracle, faster than naga on the
+bench's corpus), std's section index fixed (a hello world 357 M to 96 M
+instructions) with a compile-cost gate row, std own-checked. Moved to
+0.22.1 or later: SPIR-V and the Vulkan backend, D3D12 and CUDA (one
+backend per build until generic structs over associated types work),
+the let-as-borrow rule, the closure by-value parameter leak, the own
+pass's reading of `Buf<ScopedArena>`.
+
 ## 0.23: windows and input in std, and a terminal emulator
 
 - a `window` library in std, in the manner of winit: an event loop,
