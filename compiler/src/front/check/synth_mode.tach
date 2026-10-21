@@ -48,12 +48,14 @@ use crate::front::check::widen::{join_operands, takes_context};
 use crate::front::closures::check_closure;
 use crate::front::consteval::eval_array_len;
 use crate::front::contracts::desugar::desugar_call;
-use crate::front::distinct::{is_distinct_type, is_niche_alias, strip_distinct};
+use crate::front::distinct::{
+    STR_TYPE, is_distinct_type, is_niche_alias, is_view_distinct, strip_distinct,
+};
 use crate::front::lexer::{
     SUF_F32, SUF_I16, SUF_I32, SUF_I64, SUF_I8, SUF_ISIZE, SUF_NONE, SUF_U16, SUF_U32, SUF_U64,
     SUF_U8, SUF_USIZE, Tok,
 };
-use crate::front::modules::{STD_MODULE, within_std};
+use crate::front::modules::{CUR_MOD, STD_MODULE, within_std};
 use crate::front::patterns::check_match;
 use crate::front::traits::{binary_op_trait, has_impl, negation_call, operator_call, std_trait};
 use crate::front::types::{
@@ -231,6 +233,10 @@ fn synth_cast(n: i64) -> i64 {
             if is_distinct_type(to_ty) && is_niche_alias(TYPES[to_ty].b) && from == from_ty {
                 return nonnull_cast(n, operand, to_ty);
             }
+            // (0.20) bytes become std's `str` only checked, outside std
+            if to_ty == STR_TYPE && from == from_ty && !within_std(CUR_MOD) {
+                bytes_as_str_error(n, operand);
+            }
             NODES[n] = NODES[operand];
             return to_ty;
         }
@@ -251,6 +257,19 @@ fn synth_cast(n: i64) -> i64 {
             unsafe_op(n, U_INT_PTR, c"casting an integer to a pointer is unsafe");
         }
         to_ty
+    }
+}
+
+// (0.20) `b as str` of bytes outside std: an error, a `str` being UTF-8
+// (str::from_utf8 checks it).
+fn bytes_as_str_error(n: i64, operand: i64) {
+    unsafe {
+        let text = SRC[NODES[operand].start..NODES[operand].end];
+        err_begin(NODES[n].start);
+        err_str(c"'as str' does not check that bytes are UTF-8");
+        err_help(c"a `str` is UTF-8: bytes become one through `str::from_utf8(b)` (a Result, Utf8Error when they are not); `String::from_utf8_lossy_in(b, gpa)` replaces what is not");
+        err_try_fmt(f"str::from_utf8({text})?");
+        err_end_soft();
     }
 }
 
@@ -417,6 +436,14 @@ fn synth_index(n: i64) -> i64 {
                 UNSAFE_DEPTH -= 1;
             }
         }
+        // (0.20) std's `str`: indexed as its bytes' slice (`s[i]` a u8), and
+        // a range of it is a `str` (`s[1..]`)
+        let mut text = 0;
+        if is_view_distinct(base_ty) {
+            text = base_ty;
+            base_ty = TYPES[base_ty].a;
+            base_kind = TyKind::Slice;
+        }
         if base_kind != TyKind::Array && base_kind != TyKind::Ptr && base_kind != TyKind::Slice {
             err_begin(NODES[base].start);
             err_str(c"cannot index type '");
@@ -464,6 +491,9 @@ fn synth_index(n: i64) -> i64 {
                 type_error(index, c"slicing a pointer needs an end: 'p[lo..hi]'");
             }
             NODES[index].ty = TY_UNIT;
+            if text != 0 {
+                return text;
+            }
             return slice_of(TYPES[base_ty].a);
         }
         check_index_type(index);
