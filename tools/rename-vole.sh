@@ -15,7 +15,9 @@
 #   4. every other file (md, sh, py, toml, json, yml, transcripts): the
 #      same words (rewrite --text --no-sources), [head]'s interface first,
 #      paths with the name moved (--move-paths);
-#   5. the generated sources made again: std's text, the guide's;
+#   5. the sources laid out again (fmt --all: the lines the words made
+#      shorter or longer), the generated ones made again: std's text,
+#      the guide's;
 #   6. the renamed compiler built (target/volec) and checked; with --test,
 #      its suite; with --regen, the transcripts regenerated first;
 #   7. what is left: `git grep -i tachyon`, counted by file
@@ -32,7 +34,7 @@
 #   --dry-run    each step's plan (the tools' --dry-run); nothing changes
 #   --test       after the build, the suite (tests/run.sh) with target/volec
 #   --regen      before the suite, the transcripts made again (refactor's,
-#                query's: -u); review their diff
+#                query's, the walkthroughs': -u); review their diff
 #   --force      run in a tree with changes (else it must be clean)
 #
 # Each step is one edit of the journal: `tachyonc undo` (`volec undo` after
@@ -149,7 +151,10 @@ if [ -n "$DRY" ]; then
     exit 0
 fi
 
-step "5. the generated sources made again"
+step "5. the sources laid out again, the generated ones made again"
+# (a line the words made shorter or longer: fmt lays it out as it would)
+run fmt --all
+
 sh compiler/std/embed.sh || { echo "rename-vole: compiler/std/embed.sh failed" >&2; exit 1; }
 sh compiler/guide/embed.sh || { echo "rename-vole: compiler/guide/embed.sh failed" >&2; exit 1; }
 
@@ -163,7 +168,8 @@ target/volec compiler/src/main.vl -o "$OUT/volec2.o" && cc -o "$OUT/volec2" "$OU
 if [ $REGEN -eq 1 ]; then
     sh tests/refactor/run.sh -c target/volec -u >"$OUT/regen-refactor.log" 2>&1
     sh tests/query/run.sh -c target/volec -u >"$OUT/regen-query.log" 2>&1
-    echo "(transcripts regenerated: review git diff -- tests/refactor tests/query)" >&2
+    sh tests/walkthrough/run.sh -c target/volec -u >"$OUT/regen-walkthrough.log" 2>&1
+    echo "(transcripts regenerated: review git diff -- tests/refactor tests/query examples)" >&2
 fi
 if [ $TEST -eq 1 ]; then
     sh tests/run.sh -c target/volec >"$OUT/tests.log" 2>&1

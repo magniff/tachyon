@@ -361,7 +361,7 @@ def is_program_source(full):
     if base == "main.tach":
         return True
     d = os.path.dirname(full)
-    stem = base[:-5]
+    stem = os.path.splitext(base)[0]
     if base == "mod.tach":
         stem, d = os.path.basename(d), os.path.dirname(d)
     decl = re.compile(r"^\s*(?:pub\s+)?mod\s+%s\s*;" % re.escape(stem), re.M)
@@ -408,7 +408,7 @@ def module_of(full):
         rel = None
         for _ in range(6):
             if os.path.exists(os.path.join(d, "main.tach")):
-                rel = os.path.relpath(full, d)[:-5]
+                rel = os.path.splitext(os.path.relpath(full, d))[0]
                 break
             d = os.path.dirname(d)
         if rel is None:
