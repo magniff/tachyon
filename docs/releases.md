@@ -133,7 +133,9 @@ docs/grammar.md, "Additions of 0.20"; the server in docs/lsp.md.
   convention in some impls; `query def` does not take back the
   symbols of std's statics (`tachyon.static.std.X`); std's own
   functions are not checked by the own pass (how the -O0 bugs above
-  slipped through).
+  slipped through); a small std program compiles with about 270 M
+  more instructions than with 0.19.1 (std's text built whole), and
+  `check` of the compiler does 13% more.
 
 ### What's new in 0.19.1
 
