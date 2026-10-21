@@ -151,7 +151,7 @@ std::string::String::push	../../compiler/std/string.tach:1204:12	method	pub fn p
 std::path::PathBuf::push	../../compiler/std/path.tach:250:12	method	pub fn push(inout self, p: [u8])
 $ refs Vec::push --count
 2	crate::myvec::Vec::push
-159	std::Vec::push
+161	std::Vec::push
 $ callers crate::myvec::Vec::push
 # clash/main.tach
 40:10	call	main	mine.push(v.len());

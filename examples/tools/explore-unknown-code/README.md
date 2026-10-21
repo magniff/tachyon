@@ -81,12 +81,12 @@ std::unicode	<std>	74
 std::unicode::tables	<std>	27
 std::objc	<std>	50
 std::objc::foundation	<std>	67
-std::gpu	<std>	139
+std::gpu	<std>	140
 std::gpu::hal	<std>	7
 std::gpu::hal::metal	<std>	109
 std::gpu::hal::metal::bindings	<std>	776
-std::gpu::shader	<std>	21
-std::gpu::types	<std>	50
+std::gpu::shader	<std>	25
+std::gpu::types	<std>	51
 std::gpu::types::BufferUsage	<std>	9
 std::gpu::types::TextureUsage	<std>	5
 std::gpu::types::ShaderStage	<std>	3

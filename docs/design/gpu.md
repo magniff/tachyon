@@ -1058,8 +1058,13 @@ tree. Their essential lines:
   slot, and a pass gives the words (wgsl::sizes_words's rule, computed
   from shader::Reflection's own `sizes`) through the hal's new
   `compute_set_bytes` / `render_set_bytes` before each dispatch and draw
-  (tests/gpu/cases/compute_sizes). Converting a `wgsl::Reflection` to a
-  `shader::Reflection` is still to write.
+  (tests/gpu/cases/compute_sizes). `shader::from_wgsl` converts a
+  `wgsl::Reflection` to a `shader::Reflection` (an input of vec3<u32> or
+  vec2..4<i32>, which VertexFormat lacks, is an error), and
+  `Device::shader_wgsl(text)` translates and creates the module in one
+  call; a vertex attribute feeds an input of the same shader type
+  (`VertexFormat::shader_type`: Unorm8x4 feeds a vec4<f32>)
+  (tests/gpu/cases/wgsl_pipeline).
 
 ## 0.22.0 as built: std::gpu on Metal
 

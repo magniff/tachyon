@@ -330,6 +330,39 @@ impl Device {
         }
     }
 
+    /// A shader module from WGSL source: std::gpu::wgsl translates it for
+    /// this device (MSL on Metal), and its reflection (entry points,
+    /// bindings and their slots, vertex inputs, the sizes buffer) feeds
+    /// pipeline creation as dev.shader's does. A rejected shader is
+    /// Error::Shader with the compiler's `LINE:COL: error wgsl.CODE: ...`.
+    pub fn shader_wgsl(self, src: [u8]) -> Result<Shader, Error> {
+        if self.caps.shader_kind != ShaderKind::Msl {
+            return Err(Error::Shader(Buf::from_in(
+                "std::gpu::wgsl writes no code for this device's ShaderKind yet", self.gpa)));
+        }
+        var code = Buf::new_in(self.gpa);
+        var refl = wgsl::new_reflection(self.gpa);
+        var err = wgsl::new_error(self.gpa);
+        if !wgsl::translate(src, wgsl::options(wgsl::TARGET_MSL), &code, &refl, &err, self.gpa) {
+            var m = format_in(f"{err.line}:{err.col}: error {err.code}: {err.msg.as_slice()}",
+                self.gpa);
+            if err.help.len() > 0 {
+                m.push_str(" (help: ");
+                m.push_str(err.help.as_slice());
+                m.push_str(")");
+            }
+            return Err(Error::Shader(m));
+        }
+        match shader::from_wgsl(refl, self.gpa) {
+            Ok(r) => {
+                // (0.20: a temporary passed to a let parameter is rejected)
+                let s = ShaderSource::msl(code.as_slice(), r);
+                self.shader(s)
+            }
+            Err(m) => Err(Error::Shader(m)),
+        }
+    }
+
     /// A compute pipeline for the entry point `entry` of the shader; its
     /// bind layouts come from the shader's reflection.
     pub fn compute_pipeline(self, shader: Shader, entry: [u8]) -> Result<ComputePipeline,
@@ -413,7 +446,8 @@ impl Device {
                 for k in 0..l.count {
                     if l.attributes[k].location == inp.location {
                         fed = true;
-                        assert(l.attributes[k].format == inp.format, "gpu.format: a vertex attribute's format differs from the shader's input");
+                        assert(l.attributes[k].format.shader_type() == inp.format.shader_type(),
+                            "gpu.format: a vertex attribute's format differs from the shader's input");
                     }
                 }
             }

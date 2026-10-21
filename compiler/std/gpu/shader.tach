@@ -14,6 +14,8 @@
 // in that stage; vertex buffers at Metal's 30 downward (vertex buffer i
 // at 30 - i).
 
+use std::Buf;
+use std::gpu::wgsl;
 use std::gpu::types::{ShaderStage, VertexFormat};
 
 /// A (group, binding) pair.
@@ -197,4 +199,91 @@ impl ShaderSource {
     pub fn msl(code: [u8], reflection: sink Reflection) -> ShaderSource {
         ShaderSource { kind: ShaderKind::Msl, code: code, reflection: reflection }
     }
+}
+
+// ---- GPU shaders: from std::gpu::wgsl (0.22) ----
+
+/// The VertexFormat of a WGSL vertex input of scalar `scalar`
+/// (wgsl::ir::SK_*) and `components` components; None where VertexFormat
+/// has no variant (vec3<u32>, vec2..4<i32>, bool). An input of f32s is
+/// also fed by Unorm8x4 (VertexFormat::shader_type).
+pub fn wgsl_vertex_format(scalar: u8, components: i64) -> Option<VertexFormat> {
+    if scalar == wgsl::ir::SK_F32 {
+        if components == 1 { return Some(VertexFormat::Float32); }
+        if components == 2 { return Some(VertexFormat::Float32x2); }
+        if components == 3 { return Some(VertexFormat::Float32x3); }
+        if components == 4 { return Some(VertexFormat::Float32x4); }
+    } else if scalar == wgsl::ir::SK_U32 {
+        if components == 1 { return Some(VertexFormat::Uint32); }
+        if components == 2 { return Some(VertexFormat::Uint32x2); }
+        if components == 4 { return Some(VertexFormat::Uint32x4); }
+    } else if scalar == wgsl::ir::SK_I32 {
+        if components == 1 { return Some(VertexFormat::Sint32); }
+    }
+    None
+}
+
+/// The ShaderStage bit of a wgsl::ir::STAGE_*.
+fn wgsl_stage(stage: u8) -> u32 {
+    if stage == wgsl::ir::STAGE_VERTEX {
+        ShaderStage::VERTEX
+    } else if stage == wgsl::ir::STAGE_FRAGMENT {
+        ShaderStage::FRAGMENT
+    } else {
+        ShaderStage::COMPUTE
+    }
+}
+
+/// The BindingType of a wgsl::BK_* (the same order).
+fn wgsl_binding_type(kind: u8) -> BindingType {
+    match kind {
+        0 => BindingType::Uniform,
+        1 => BindingType::Storage,
+        2 => BindingType::ReadOnlyStorage,
+        3 => BindingType::Texture,
+        4 => BindingType::StorageTexture,
+        5 => BindingType::Sampler,
+        _ => BindingType::ComparisonSampler,
+    }
+}
+
+/// The reflection pipeline creation takes, from the WGSL compiler's
+/// (docs/design/gpu.md, "Merging with std::gpu"): the entry points (WGSL
+/// name, name in the translated code, stage, workgroup size, sizes buffer
+/// slot), the bindings (kind, slot per stage, minimum size), the vertex
+/// inputs, and the sizes buffer's layout. Its names view `refl`'s, which
+/// must outlive it. Err: the message for a vertex input no VertexFormat
+/// holds.
+pub fn from_wgsl(refl: wgsl::Reflection, gpa: Gpa) -> Result<Reflection, Buf> {
+    var out = Reflection::new_in(gpa);
+    for i in 0..refl.entries.len() {
+        // (the names view refl.entries[i] itself, not a copy of it)
+        out.entries.push(EntryPoint {
+            name: refl.entries[i].name.as_slice(), native: refl.entries[i].target_name.as_slice(),
+            stage: wgsl_stage(refl.entries[i].stage), workgroup: refl.entries[i].workgroup,
+            sizes_slot: refl.entries[i].sizes_slot
+        });
+    }
+    for i in 0..refl.bindings.len() {
+        let b = refl.bindings[i];
+        out.bindings.push(Binding {
+            group: b.group, binding: b.binding, ty: wgsl_binding_type(b.kind),
+            slot_vertex: b.slots[0], slot_fragment: b.slots[1], slot_compute: b.slots[2],
+            min_size: b.min_size
+        });
+    }
+    for i in 0..refl.inputs.len() {
+        let v = refl.inputs[i];
+        match wgsl_vertex_format(v.scalar, v.components) {
+            Some(f) => out.input(v.location, f),
+            None => return Err(format_in(
+                f"gpu: the vertex input at @location({v.location}) has no VertexFormat (f32 x1..4, u32 x1, x2, x4, i32 x1)",
+                gpa)),
+        }
+    }
+    for i in 0..refl.sizes.len() {
+        let b = refl.bindings[refl.sizes[i]];
+        out.size_binding(b.group, b.binding);
+    }
+    Ok(out)
 }
