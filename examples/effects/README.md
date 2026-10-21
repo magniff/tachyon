@@ -8,7 +8,7 @@ body calls, closures and generic instances included:
 |---|---|
 | `alloc(Gpa)`, `alloc(Arena)`, ... | allocating from that allocator type (`alloc(extern)`: C's `malloc`) |
 | `io` | a C function that reads or writes: `write`, `read`, stdio |
-| `global` | reading or writing a `static mut` |
+| `global` | reading or writing a `static var` |
 | `panic` | a checked index, `unwrap`, std's panic |
 | `diverge` | `while`, `loop`, recursion: it may not return |
 | `unsafe` | unsafe operations in its own body |
