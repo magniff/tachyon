@@ -1403,6 +1403,16 @@ pass's reading of `Buf<ScopedArena>`.
 - what writing it reveals feeds the surface-language rework of "Toward
   1.0"
 
+Done (0.23.0). std::window on Cocoa (winit's objects with events
+pulled, behind a gate), voltty in examples/voltty (a core checked
+against alacritty_terminal by an oracle and a fuzzer, Core Text glyphs
+in an atlas, one instanced draw per frame on std::gpu with its shader
+compiled by std::gpu::wgsl, damage tracking, a shell on a pty), and the
+rename tools for 0.24. Moved to 0.23.1 or later: Wayland and X11,
+selection and copy, the scrollback view and configuration, the
+measurements against Alacritty's input latency and memory, fonts through
+FreeType and a rasterizer in the language (after 0.24).
+
 ## After 0.23: the specification
 
 Decided with the user on 2026-10-16: once 0.23 has shipped, the whole
