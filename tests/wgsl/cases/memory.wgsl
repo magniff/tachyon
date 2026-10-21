@@ -26,7 +26,7 @@ struct Items {
 fn main() {
     var arr = array<u32, 4>(10u, 20u, 30u, 40u);
     let big = src[0] | 8u;
-    let neg = -1;
+    let neg = i32(src[0] & 0u) - 1;
     out[0] = arr[big];
     out[1] = arr[neg];
     arr[big] = 99u;

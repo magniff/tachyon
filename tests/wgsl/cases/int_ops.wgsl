@@ -95,7 +95,7 @@ fn main() {
     puti(v.x);
     puti(v.y);
     puti(v.z);
-    let w = vec2<u32>(one, inp[2]) << vec2<u32>(33u, 31u);
+    let w = vec2<u32>(one, inp[2]) << vec2<u32>(big, 31u);
     put(w.x);
     put(w.y);
     put(n);
