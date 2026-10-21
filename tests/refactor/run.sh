@@ -247,7 +247,7 @@ check module_path_without_crate "$ok" "$out"
 # compiler's errors (ERR_KIND) and warnings and keyed errors (their
 # third argument); and every entry is such a code.
 {
-    grep -rhoE 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax)\.[a-z0-9_-]+"' \
+    grep -rhoE 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax|extension)\.[a-z0-9_-]+"' \
         compiler/src
     grep -rhoE 'ERR_KIND = c"[^"]*"' compiler/src
     grep -rhoE 'report_(warning|error_once)\([^,]*, [^,]*, c"[^"]*"' compiler/src

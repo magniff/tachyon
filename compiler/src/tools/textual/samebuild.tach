@@ -1,0 +1,287 @@
+// The build before and after a rename of files (0.21, `refactor
+// extension`): each program compiled to assembly (-S) before the edit and
+// after it, up to N compilations at once, and compared byte for byte:
+// the assembly, what the compiler printed, its exit status. The paths of
+// the renamed files are the one thing allowed to differ: in what was
+// printed, and in the assembly's table of source files (each `.byte` line
+// under an `Lrt.fN:` label, which panics name their file by), where OLD
+// at the end of a path is read as NEW.
+
+use crate::base::{IntVec, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str};
+use crate::tools::proc::{
+    buf_cstr, make_dirs, read_file_if, same_bytes, spawn_to_file, wait_any, write_file_if,
+};
+use crate::tools::query::diagnostics::PROG;
+
+// `DIR/N.EXT`.
+fn job_file(dir: *u8, n: i64, ext: *u8) -> *u8 {
+    unsafe {
+        let b = buf_new();
+        buf_str(b, dir);
+        buf_byte(b, '/');
+        buf_int(b, n);
+        buf_str(b, ext);
+        buf_cstr(b)
+    }
+}
+
+// Compiles each of `roots` (C strings) into DIR/N.s, what it printed into
+// DIR/N.out and its exit status into DIR/N.status, `jobs` at once; false
+// when DIR cannot be made.
+pub fn compile_all(roots: IntVec, dir: *u8, jobs: i64) -> bool {
+    unsafe {
+        if !make_dirs(dir) {
+            return false;
+        }
+        let n = roots.count;
+        let pids = crate::base::alloc_array::<i64>(n + 1);
+        let status = crate::base::alloc_array::<i64>(n + 1);
+        var next = 0;
+        var running = 0;
+        while next < n || running > 0 {
+            while next < n && running < jobs {
+                let args = crate::base::alloc_array::<*u8>(7);
+                args[0] = PROG;
+                args[1] = roots.data[next] as *u8;
+                args[2] = c"-S";
+                args[3] = c"-o";
+                args[4] = job_file(dir, next, c".s");
+                args[5] = c"--diagnostics=human";
+                args[6] = 0 as *u8;
+                let pid = spawn_to_file(args, job_file(dir, next, c".out"));
+                pids[next] = pid;
+                status[next] = if pid < 0 { 127 } else { -1 };
+                if pid >= 0 {
+                    running += 1;
+                }
+                next += 1;
+            }
+            if running == 0 {
+                break;
+            }
+            var st = 0;
+            let pid = wait_any(&st);
+            if pid < 0 {
+                break;
+            }
+            for j in 0..next {
+                if pids[j] == pid && status[j] < 0 {
+                    status[j] = st;
+                    running -= 1;
+                    break;
+                }
+            }
+        }
+        for j in 0..n {
+            let b = buf_new();
+            buf_int(b, status[j]);
+            write_file_if(job_file(dir, j, c".status"), buf_slice(b));
+        }
+        true
+    }
+}
+
+fn is_alnum(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
+// t with each OLD that ends a word (no letter or digit after it) read as
+// NEW, into buffer out.
+fn put_renamed(out: i64, t: [u8], old: [u8], new: [u8]) {
+    var i = 0;
+    var at = 0;
+    while i + old.len <= t.len {
+        if t[i] == old[0] && same_bytes(t[i..i + old.len], old)
+            && (i + old.len == t.len || !is_alnum(t[i + old.len])) {
+            buf_bytes(out, t[at..i]);
+            buf_bytes(out, new);
+            i += old.len;
+            at = i;
+        } else {
+            i += 1;
+        }
+    }
+    buf_bytes(out, t[at..t.len]);
+}
+
+// Whether line l (trimmed) is a label of the source files' table.
+fn file_label(l: [u8]) -> bool {
+    var i = 0;
+    while i < l.len && (l[i] == ' ' || l[i] == '\t') {
+        i += 1;
+    }
+    if i < l.len && l[i] == '.' {
+        i += 1;
+    }
+    l.len - i > 6 && l[i] == 'L' && l[i + 1] == 'r' && l[i + 2] == 't' && l[i + 3] == '.'
+        && l[i + 4] == 'f' && l[l.len - 1] == ':'
+}
+
+// The bytes of a `.byte A,B,C` line, into buffer out; false when l is
+// none.
+fn byte_line(l: [u8], out: i64) -> bool {
+    var i = 0;
+    while i < l.len && (l[i] == ' ' || l[i] == '\t') {
+        i += 1;
+    }
+    if l.len - i < 6 || !same_bytes(l[i..i + 6], ".byte ") {
+        return false;
+    }
+    i += 6;
+    var v = 0;
+    var digits = 0;
+    while i <= l.len {
+        if i < l.len && l[i] >= '0' && l[i] <= '9' {
+            v = v * 10 + (l[i] - '0') as i64;
+            digits += 1;
+        } else if i == l.len || l[i] == ',' {
+            if digits == 0 {
+                return false;
+            }
+            buf_byte(out, v as u8);
+            v = 0;
+            digits = 0;
+        } else if l[i] != ' ' {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+// The assembly `t` from before the rename as it would be after it: the
+// file table's paths renamed, into a new buffer.
+fn renamed_asm(t: [u8], old: [u8], new: [u8]) -> i64 {
+    let out = buf_new();
+    var i = 0;
+    var after_label = false;
+    while i < t.len {
+        var e = i;
+        while e < t.len && t[e] != '\n' {
+            e += 1;
+        }
+        let l = t[i..e];
+        let bytes = buf_new();
+        if after_label && byte_line(l, bytes) {
+            let path = buf_new();
+            put_renamed(path, buf_slice(bytes), old, new);
+            buf_str(out, c"    .byte ");
+            let p = buf_slice(path);
+            for k in 0..p.len {
+                if k > 0 {
+                    buf_byte(out, ',');
+                }
+                buf_int(out, p[k] as i64);
+            }
+        } else {
+            buf_bytes(out, l);
+        }
+        after_label = file_label(l);
+        if e < t.len {
+            buf_byte(out, '\n');
+        }
+        i = e + 1;
+    }
+    out
+}
+
+fn read_or_empty(path: *u8) -> i64 {
+    let b = buf_new();
+    read_file_if(path, b);
+    b
+}
+
+// Compilation n before (in dir `before`) and after (`after`): 0 the same,
+// paths aside; else 1, and `why` says what differs (`exit status`,
+// `printed`, or `assembly, line L`).
+pub fn compare_one(before: *u8, after: *u8, n: i64, old: [u8], new: [u8], why: i64) -> i64 {
+    unsafe {
+        let sb = read_or_empty(job_file(before, n, c".status"));
+        let sa = read_or_empty(job_file(after, n, c".status"));
+        if !same_bytes(buf_slice(sb), buf_slice(sa)) {
+            buf_str(why, c"exit status ");
+            buf_bytes(why, buf_slice(sb));
+            buf_str(why, c" before, ");
+            buf_bytes(why, buf_slice(sa));
+            buf_str(why, c" after");
+            return 1;
+        }
+        let ob = read_or_empty(job_file(before, n, c".out"));
+        let oa = read_or_empty(job_file(after, n, c".out"));
+        let ob2 = buf_new();
+        put_renamed(ob2, buf_slice(ob), old, new);
+        if !same_bytes(buf_slice(ob2), buf_slice(oa)) {
+            buf_str(why, c"what the compiler printed");
+            return 1;
+        }
+        let ab = read_or_empty(job_file(before, n, c".s"));
+        let aa = read_or_empty(job_file(after, n, c".s"));
+        let ab2 = renamed_asm(buf_slice(ab), old, new);
+        let x = buf_slice(ab2);
+        let y = buf_slice(aa);
+        if same_bytes(x, y) {
+            return 0;
+        }
+        var line = 1;
+        var k = 0;
+        while k < x.len && k < y.len && x[k] == y[k] {
+            if x[k] == '\n' {
+                line += 1;
+            }
+            k += 1;
+        }
+        buf_str(why, c"assembly, line ");
+        buf_int(why, line);
+        1
+    }
+}
+
+// Whether the text of file p has a `mod` item (a module tree's root).
+pub fn has_mod_lines(t: [u8]) -> bool {
+    var i = 0;
+    while i + 4 < t.len {
+        if i == 0 || t[i - 1] == '\n' {
+            var j = i;
+            if j + 4 < t.len && t[j] == 'p' && t[j + 1] == 'u' && t[j + 2] == 'b' && t[j + 3] == ' ' {
+                j += 4;
+            }
+            if j + 4 < t.len && t[j] == 'm' && t[j + 1] == 'o' && t[j + 2] == 'd' && t[j + 3] == ' ' {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+// The number of processors (4 when it cannot be told).
+pub fn processors() -> i64 {
+    unsafe {
+        let args = crate::base::alloc_array::<*u8>(3);
+        args[0] = c"getconf";
+        args[1] = c"_NPROCESSORS_ONLN";
+        args[2] = 0 as *u8;
+        let out = buf_new();
+        if crate::tools::proc::run_capture(args, out) != 0 {
+            return 4;
+        }
+        let t = buf_slice(out);
+        var n = 0;
+        var i = 0;
+        while i < t.len && t[i] >= '0' && t[i] <= '9' {
+            n = n * 10 + (t[i] - '0') as i64;
+            i += 1;
+        }
+        if n < 1 { 4 } else { n }
+    }
+}
+
+// Removes DIR and its N.s, N.out, N.status files (n of each).
+pub fn clean(dir: *u8, n: i64) {
+    for j in 0..n {
+        crate::tools::proc::remove_file(job_file(dir, j, c".s"));
+        crate::tools::proc::remove_file(job_file(dir, j, c".out"));
+        crate::tools::proc::remove_file(job_file(dir, j, c".status"));
+    }
+    crate::tools::proc::remove_dir(dir);
+}
