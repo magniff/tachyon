@@ -1,0 +1,188 @@
+// std's per-code-point Unicode data (0.20, compiler/std/unicode/) against
+// Rust's, for every scalar value: char_width and char_width_cjk against
+// unicode-width 0.2.2's `width` and `width_cjk`, the class predicates
+// against Rust std's char methods, to_lower and to_upper against
+// char::to_lowercase and to_uppercase (tests/std/unicode/reference-rust.txt,
+// printed by the oracle in tests/std/oracle/unicode/). Rust is at Unicode
+// 17.0: the code points new in 18.0 (tests/std/unicode/new-in-18.txt) are
+// left out, and the few whose data 18.0 changed are the differences
+// expected below: four lowercase letters whose uppercase letters are new in
+// 18.0 (U+A7DD, U+A7E2, U+AB6C, U+AB6D).
+// ARGS: @ROOT@/tests/std/unicode/reference-rust.txt @ROOT@/tests/std/unicode/new-in-18.txt
+import "stdio.h" as c;
+
+use std::unicode::{
+    char_width, char_width_cjk, is_alphabetic, is_control, is_lowercase, is_numeric, is_uppercase,
+    is_whitespace, to_lower, to_upper,
+};
+
+fn read_all(path: *u8, gpa: Gpa) -> Buf {
+    let mut text = Buf::new_in(gpa);
+    let f = unsafe { c::fopen(path, c"rb") };
+    if f == 0 as *c::FILE {
+        return text;
+    }
+    let mut chunk = [0u8; 65536];
+    loop {
+        let n = unsafe { c::fread(&chunk[0], 1, 65536, f) } as i64;
+        if n <= 0 {
+            break;
+        }
+        text.push_str(chunk[0..n]);
+    }
+    unsafe { c::fclose(f); }
+    text
+}
+
+// The words of a line, as numbers: hex, or a decimal with a sign.
+fn numbers(line: [u8], out: &mut Vec<i64>) {
+    out.clear();
+    let mut k = 0;
+    while k < line.len {
+        while k < line.len && line[k] == ' ' {
+            k += 1;
+        }
+        let mut e = k;
+        while e < line.len && line[e] != ' ' {
+            e += 1;
+        }
+        if e > k {
+            let w = line[k..e];
+            let mut v = 0;
+            let neg = w[0] == '-';
+            for i in (if neg { 1 } else { 0 })..w.len {
+                let b = w[i];
+                let d = if b >= '0' && b <= '9' { (b - '0') as i64 }
+                    else if b >= 'A' && b <= 'F' { (b - 'A') as i64 + 10 }
+                    else { (b - 'a') as i64 + 10 };
+                v = v * 16 + d;
+            }
+            out.push(if neg { -v } else { v });
+        }
+        k = e;
+    }
+}
+
+fn each_line<F: FnMut([u8])>(t: [u8], f: F) {
+    let mut g = f;
+    let mut from = 0;
+    for i in 0..t.len + 1 {
+        if i == t.len || t[i] == '\n' {
+            let line = t[from..i];
+            from = i + 1;
+            if line.len > 0 && line[0] != '#' {
+                g(line);
+            }
+        }
+    }
+}
+
+fn flags(cp: u32) -> i64 {
+    let mut v = 0;
+    if is_alphabetic(cp) { v |= 1; }
+    if is_numeric(cp) { v |= 2; }
+    if is_whitespace(cp) { v |= 4; }
+    if is_lowercase(cp) { v |= 8; }
+    if is_uppercase(cp) { v |= 16; }
+    if is_control(cp) { v |= 32; }
+    v
+}
+
+fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
+    if argc < 3 {
+        return 2;
+    }
+    let reference = unsafe { read_all(argv[1], gpa) };
+    let new18 = unsafe { read_all(argv[2], gpa) };
+    let n = 0x110000;
+    let mut skip: Vec<bool> = Vec::filled_in(n, false, gpa);
+    let mut nums: Vec<i64> = Vec::new_in(gpa);
+    let mut new_count = 0;
+    each_line(new18.as_slice(), |line| {
+        numbers(line, &mut nums);
+        for cp in nums[0]..nums[1] + 1 {
+            skip[cp] = true;
+            new_count += 1;
+        }
+    });
+    for cp in 0xd800..0xe000 {
+        skip[cp] = true;
+    }
+    // (Rust's mappings: 0 where it has none)
+    let mut lower: Vec<i64> = Vec::filled_in(n * 3, 0, gpa);
+    let mut upper: Vec<i64> = Vec::filled_in(n * 3, 0, gpa);
+    let mut checked = 0;
+    let mut wrong = 0;
+    let mut shown = 0;
+    each_line(reference.as_slice(), |line| {
+        numbers(line[1..line.len], &mut nums);
+        let kind = line[0];
+        if kind == 'w' || kind == 'p' {
+            for cp in nums[0]..nums[1] + 1 {
+                if skip[cp] {
+                    continue;
+                }
+                checked += 1;
+                let c = cp as u32;
+                let ok = if kind == 'w' {
+                    char_width(c) == nums[2] && char_width_cjk(c) == nums[3]
+                } else {
+                    flags(c) == nums[2]
+                };
+                if !ok {
+                    wrong += 1;
+                    if shown < 20 {
+                        shown += 1;
+                        if kind == 'w' {
+                            println(
+                                f"U+{cp:04X}: width {char_width(c)} {char_width_cjk(c)}, Rust {nums[2]} {nums[3]}");
+                        } else {
+                            println(f"U+{cp:04X}: classes {flags(c)}, Rust {nums[2]}");
+                        }
+                    }
+                }
+            }
+        } else if kind == 'l' || kind == 'u' {
+            for k in 1..nums.len() {
+                if kind == 'l' {
+                    lower[nums[0] * 3 + k - 1] = nums[k];
+                } else {
+                    upper[nums[0] * 3 + k - 1] = nums[k];
+                }
+            }
+        }
+    });
+    let mut cases = 0;
+    for cp in 0..n {
+        if skip[cp] {
+            continue;
+        }
+        let c = cp as u32;
+        for which in 0..2 {
+            let m = if which == 0 { &lower } else { &upper };
+            let mut want = [m[cp * 3], m[cp * 3 + 1], m[cp * 3 + 2]];
+            if want[0] == 0 {
+                want[0] = cp;
+            }
+            let got = if which == 0 { to_lower(c) } else { to_upper(c) };
+            cases += 1;
+            if got[0] as i64 != want[0] || got[1] as i64 != want[1] || got[2] as i64 != want[2] {
+                wrong += 1;
+                if shown < 20 {
+                    shown += 1;
+                    println(
+                        f"U+{cp:04X}: case {which} {got[0]:x} {got[1]:x} {got[2]:x}, Rust {want[0]:x} {want[1]:x} {want[2]:x}");
+                }
+            }
+        }
+    }
+    println(
+        f"{checked} widths and classes, {cases} case mappings, {new_count} new in 18.0 left out, {wrong} differ");
+    0
+}
+
+// EXPECT: U+0277: case 1 a7dd 0 0, Rust 277 0 0
+// EXPECT: U+027C: case 1 a7e2 0 0, Rust 27c 0 0
+// EXPECT: U+AB4B: case 1 ab6c 0 0, Rust ab4b 0 0
+// EXPECT: U+AB4C: case 1 ab6d 0 0, Rust ab4c 0 0
+// EXPECT: 2198114 widths and classes, 2198114 case mappings, 13007 new in 18.0 left out, 4 differ

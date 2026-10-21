@@ -68,9 +68,18 @@ for name in $NAMES; do
     if ! "$COMPILER" -O2 "$src.tach" -o "$WORK/$name.t" >"$WORK/$name.t.log" 2>&1; then
         echo "FAIL $name: tachyonc: $(tail -3 "$WORK/$name.t.log")"; failed=1; continue
     fi
-    "$CC" -O2 -o "$WORK/$name.c" "$src.c" >"$WORK/$name.c.log" 2>&1 \
-        || { echo "FAIL $name: cc: $(tail -3 "$WORK/$name.c.log")"; failed=1; continue; }
-    if [ $HAVE_RUST = 1 ]; then
+    # (0.20: a benchmark with no C baseline has no NAME.c)
+    if [ -f "$src.c" ]; then
+        "$CC" -O2 -o "$WORK/$name.c" "$src.c" >"$WORK/$name.c.log" 2>&1 \
+            || { echo "FAIL $name: cc: $(tail -3 "$WORK/$name.c.log")"; failed=1; continue; }
+    fi
+    if [ $HAVE_RUST = 1 ] && head -1 "$src.rs" | grep -q '^// cargo: '; then
+        # (0.20) a Rust half with crates: a bin of unicode-rs/, built offline
+        (cd "$HERE/unicode-rs" && CARGO_TARGET_DIR="$WORK/cargo" cargo build --release --offline \
+            --quiet --bin "$name" && cp "$WORK/cargo/release/$name" "$WORK/$name.r") \
+            >"$WORK/$name.r.log" 2>&1 \
+            || { echo "FAIL $name: cargo: $(tail -3 "$WORK/$name.r.log")"; failed=1; continue; }
+    elif [ $HAVE_RUST = 1 ]; then
         (cd "$HERE" && rustc -C opt-level=3 -C codegen-units=1 -C panic=abort "$name.rs" \
             -o "$WORK/$name.r") >"$WORK/$name.r.log" 2>&1 \
             || { echo "FAIL $name: rustc: $(tail -3 "$WORK/$name.r.log")"; failed=1; continue; }

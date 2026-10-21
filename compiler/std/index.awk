@@ -29,8 +29,18 @@
 # section not read imports nothing: front/modules/lookup).
 
 BEGIN {
-    n = split("Stable sort (0.15)|HashMap|Debug of HashMap (0.15)|== on HashMap (0.15)|Iterators (0.14)|Adapters|Sources|Text (0.14)|Errors of reading and parsing (0.15)|Integer limits (0.15)|Bits (0.16)|Conversions (0.15)|Clone and hashing (0.15)|Clone, Eq, Ord and Hash without an impl (0.15)|Arenas (0.16)|FixedBuf (0.16)|HashMap's room (0.16)|Slices (0.16)|Gpa's leak checks (0.16)|The checking allocator's hooks for arenas (0.16)|Panic and unreachable, the prelude's (0.17)|Testing (0.18)|Non-null pointers (0.18)|The test runtime's implementation (0.18)|The fuzzer's implementation (0.18)|Heaps (0.18.1)|More of Vec and Range (0.18.1)|Run-time CPU features (0.19)|CPU features on macOS (0.19)|CPU features on Linux (0.19)|CPU features on x86-64 (0.19)|std::iter|std::convert|std::clone|Numbers: bits and wide products (0.20)|Numbers: digits (0.20)|Numbers: integer text (0.20)|Numbers: the shortest digits of a float (0.20)|Numbers: float text (0.20)|Numbers: float parsing (0.20)|Numbers: float parsing's slow path (0.20)|Numbers: powers of ten (0.20)|Numbers: the slow path's digits of 5^s (0.20)|Display and Debug of floats (0.20)|Sorting (0.9)|Sort kernels (0.20)|Sort, unstable (0.20)|Sort, stable (0.20)|Slice searches (0.20)|Slice algorithms (0.20)|Random numbers (0.20)|The target's system (0.20)|Duration (0.20)|Clocks (0.20)|Sys: errors (0.20)|Sys: paths (0.20)|Sys: files (0.20)|Sys: file status (0.20)|Sys: directories (0.20)|Sys: the environment (0.20)|Sys: processes (0.20)|Sys: terminals (0.20)|Sys: clocks and entropy (0.20)", lz, "|")
+    n = split("Stable sort (0.15)|HashMap|Debug of HashMap (0.15)|== on HashMap (0.15)|Iterators (0.14)|Adapters|Sources|Text (0.14)|Errors of reading and parsing (0.15)|Integer limits (0.15)|Bits (0.16)|Conversions (0.15)|Clone and hashing (0.15)|Clone, Eq, Ord and Hash without an impl (0.15)|Arenas (0.16)|FixedBuf (0.16)|HashMap's room (0.16)|Slices (0.16)|Gpa's leak checks (0.16)|The checking allocator's hooks for arenas (0.16)|Panic and unreachable, the prelude's (0.17)|Testing (0.18)|Non-null pointers (0.18)|The test runtime's implementation (0.18)|The fuzzer's implementation (0.18)|Heaps (0.18.1)|More of Vec and Range (0.18.1)|Run-time CPU features (0.19)|CPU features on macOS (0.19)|CPU features on Linux (0.19)|CPU features on x86-64 (0.19)|std::iter|std::convert|std::clone|Numbers: bits and wide products (0.20)|Numbers: digits (0.20)|Numbers: integer text (0.20)|Numbers: the shortest digits of a float (0.20)|Numbers: float text (0.20)|Numbers: float parsing (0.20)|Numbers: float parsing's slow path (0.20)|Numbers: powers of ten (0.20)|Numbers: the slow path's digits of 5^s (0.20)|Display and Debug of floats (0.20)|Sorting (0.9)|Sort kernels (0.20)|Sort, unstable (0.20)|Sort, stable (0.20)|Slice searches (0.20)|Slice algorithms (0.20)|Random numbers (0.20)|The target's system (0.20)|Duration (0.20)|Clocks (0.20)|Sys: errors (0.20)|Sys: paths (0.20)|Sys: files (0.20)|Sys: file status (0.20)|Sys: directories (0.20)|Sys: the environment (0.20)|Sys: processes (0.20)|Sys: terminals (0.20)|Sys: clocks and entropy (0.20)|UTF-8 (0.20)|UTF-8 with NEON (0.20)|Unicode tables: properties (0.20)|Unicode tables: classes (0.20)|Unicode tables: case (0.20)|Unicode properties (0.20)|Grapheme clusters (0.20)|Display width (0.20)|Unicode classes and case (0.20)", lz, "|")
     for (i = 1; i <= n; i++) LAZY[lz[i]] = 1
+    # (0.20) GATES: modules whose items no program reaches without naming
+    # the module (no re-export outside it): a word of one of their lazy
+    # sections asks for it only from a program that also names the module's
+    # gate word, written first in the section's words as `+WORD` (the
+    # loader: front/modules/stdsections.tach), so that a program's own
+    # `props` or `to_lower` loads no Unicode table.
+    GATES["std::str"] = "str"
+    GATES["std::unicode"] = "unicode"
+    GATES["std::unicode::tables"] = "unicode"
+    nmod = 0
     TRIGGERS["Iterators (0.14)"] = "Iterator IntoIterator"
     # (0.20: the Iterator trait in std::iter, before its first banner)
     TRIGGERS["std::iter"] = "Iterator IntoIterator"
@@ -126,6 +136,7 @@ function new_section(t) {
     s++
     start[s] = pos
     title[s] = t
+    gate[s] = nmod > 0 && (modstack[nmod] in GATES) ? GATES[modstack[nmod]] : ""
 }
 
 {
@@ -135,6 +146,9 @@ function new_section(t) {
         t = line
         sub(/^\/\/ ---- /, "", t)
         sub(/ ----$/, "", t)
+        # (the module a section is in: `mod std::a`, `end mod std::a`)
+        if (t ~ /^mod std::/) modstack[++nmod] = substr(t, 5)
+        else if (t ~ /^end mod std::/ && nmod > 0) nmod--
         new_section(t)
     } else if (title[s] ~ /^mod / && line ~ /^[^ \t\/}]/ && line !~ /^(pub )?(mod|use) /) {
         # (0.20) A module's items before its first banner: a section of
@@ -248,6 +262,7 @@ END {
             }
         }
         if (title[i] in TRIGGERS) words = words " " TRIGGERS[title[i]]
+        if (!core[i] && gate[i] != "") words = " +" gate[i] words
         printf "%d %d %d|%s|%s|%s|%s\n", start[i], end_[i], core[i], substr(words, 2), substr(keys_list[i], 2), substr(impls[i], 2), substr(deps[i], 2)
     }
     # (the titles, for a reader of the index: not read by the compiler)

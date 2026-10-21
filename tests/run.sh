@@ -37,7 +37,8 @@
 # a case takes a line before it starts and puts it back when done.
 #
 # Directives, in `//` comments of the case file:
-#   // ARGS: a b c       command-line arguments (whitespace separated)
+#   // ARGS: a b c       command-line arguments (whitespace separated; 0.20:
+#                        @ROOT@ stands for the root of the tree)
 #   // STDIN: text       stdin, one directive per line, joined with '\n'
 #   // EXPECT: text      expected stdout, one directive per line
 #   // EXIT: 3           expected exit code (default 0)
@@ -271,7 +272,7 @@ run_program() {
             exec env "$RUN_ENV" ./prog $(cat args) <stdin >stdout 2>stderr
         fi
         # shellcheck disable=SC2046
-        exec ./prog $(cat args) <stdin >stdout 2>stderr
+        exec ./prog $(sed "s|@ROOT@|$ROOT|g" args) <stdin >stdout 2>stderr
     ) &
     pid=$!
     (sleep "$TIMEOUT" && kill -9 "$pid" 2>/dev/null) >/dev/null 2>&1 &

@@ -1,0 +1,859 @@
+// The generator of std's Unicode tables (0.20, task A5 of
+// docs/design/collections-text-io.md): reads the Unicode Character
+// Database files that tools/unicode/fetch.sh downloads (the version and
+// the files' SHA-256 pinned in tools/unicode/ucd.lock) and writes
+// compiler/std/unicode/tables.tach. With --check it writes nothing and
+// fails when the checked-in file is not what it would write.
+//
+// usage: gen [--check] UCD_DIR [OUT]   (tools/unicode/gen.sh runs it)
+//
+// The tables, each a byte string (the cheapest text for the lexer):
+//
+// - props(cp), a u16 per code point: the grapheme class (Grapheme_Cluster_
+//   Break, with Extended_Pictographic as a class of its own), the width
+//   class, Indic_Conjunct_Break, Emoji_Presentation, Emoji,
+//   Emoji_Modifier and White_Space (the bits: compiler/std/unicode/
+//   props.tach). A three-stage trie: cp >> S1 picks a block of stage 2,
+//   (cp >> S2) & M2 an entry of it, which picks a leaf; a leaf entry is an
+//   index into PROPS_VALUES. The shifts are the ones that make the bytes
+//   fewest.
+// - classes(cp), a byte: Alphabetic, Numeric (General_Category N*),
+//   White_Space, Lowercase, Uppercase, Control (Cc): Rust's char methods.
+//   The same kind of trie, with the byte itself in the leaves.
+// - the case mappings: Rust's char::to_lowercase and to_uppercase
+//   (UnicodeData's simple mappings, then SpecialCasing's unconditional
+//   ones), sorted (cp, mapping) entries of 6 bytes for a binary search.
+//
+// The width class of a code point is unicode-width 0.2's width of a char
+// (its rules, in order): controls (C0, DEL, C1) have none; U+2D7F is 1;
+// U+115F and U+17A4 are 2; U+17D8 is 3; Default_Ignorable_Code_Point,
+// Grapheme_Extend, Hangul_Syllable_Type V and T, U+0605, U+070F, U+0890,
+// U+0891, U+08E2, Prepend that is not Prepended_Concatenation_Mark, and
+// U+A8FA are 0; East_Asian_Width W and F are 2; East_Asian_Width A,
+// Line_Break AI, a canonical decomposition to an A character and U+0338,
+// and U+0387, when not a letter (L*) nor Sk, are "ambiguous": 1, or 2 in
+// a CJK context; the rest are 1.
+import "stdio.h" as c;
+
+use std::{HashMap, parse_int, trim};
+
+const N: i64 = 0x110000;
+
+// The grapheme classes (props bits 0-3).
+const G_OTHER: u8 = 0;
+const G_CR: u8 = 1;
+const G_LF: u8 = 2;
+const G_CONTROL: u8 = 3;
+const G_EXTEND: u8 = 4;
+const G_ZWJ: u8 = 5;
+const G_RI: u8 = 6;
+const G_PREPEND: u8 = 7;
+const G_SPACING_MARK: u8 = 8;
+const G_L: u8 = 9;
+const G_V: u8 = 10;
+const G_T: u8 = 11;
+const G_LV: u8 = 12;
+const G_LVT: u8 = 13;
+const G_EXT_PICT: u8 = 14;
+
+// The width classes (props bits 4-6).
+const W_ZERO: u16 = 0;
+const W_ONE: u16 = 1;
+const W_TWO: u16 = 2;
+const W_THREE: u16 = 3;
+const W_AMBIGUOUS: u16 = 4;
+const W_CONTROL: u16 = 5;
+
+// Boolean properties, a bit each in FLAGS.
+const F_DI: u32 = 1;
+const F_GRAPHEME_EXTEND: u32 = 2;
+const F_HANGUL_VT: u32 = 4;
+const F_PCM: u32 = 8;
+const F_LB_AI: u32 = 16;
+const F_EXT_PICT: u32 = 32;
+const F_EMOJI: u32 = 64;
+const F_EPRES: u32 = 128;
+const F_EMOD: u32 = 256;
+const F_WHITE_SPACE: u32 = 512;
+const F_ALPHABETIC: u32 = 1024;
+const F_LOWERCASE: u32 = 2048;
+const F_UPPERCASE: u32 = 4096;
+const F_DECOMP_AMBIGUOUS: u32 = 8192;
+
+// East_Asian_Width values.
+const EAW_N: u8 = 0;
+const EAW_A: u8 = 1;
+const EAW_W: u8 = 2;
+const EAW_F: u8 = 3;
+const EAW_NA: u8 = 4;
+const EAW_H: u8 = 5;
+
+// General categories, as far as the rules need them.
+const GC_OTHER: u8 = 0;
+const GC_LETTER: u8 = 1;
+const GC_SK: u8 = 2;
+const GC_NUMBER: u8 = 3;
+const GC_CC: u8 = 4;
+
+struct Ucd {
+    gcb: Vec<u8>,
+    eaw: Vec<u8>,
+    gc: Vec<u8>,
+    incb: Vec<u8>,
+    flags: Vec<u32>,
+    lower: Vec<u32>,
+    upper: Vec<u32>,
+    // (the multi-code-point mappings: index k of lower_multi when lower[cp]
+    // is MULTI | k; three code points each, 0 for none)
+    lower_multi: Vec<u32>,
+    upper_multi: Vec<u32>,
+}
+
+const MULTI: u32 = 0x800000;
+
+// ---- Reading the files ----
+
+fn read_file(dir: [u8], name: [u8], gpa: Gpa) -> Option<Buf> {
+    let mut path = Buf::new_in(gpa);
+    path.push_str(dir);
+    path.push('/');
+    path.push_str(name);
+    path.push(0);
+    let f = unsafe { c::fopen(path.as_slice().ptr, c"rb") };
+    if f == 0 as *c::FILE {
+        eprintln(f"gen: cannot read {dir}/{name} (run tools/unicode/fetch.sh)");
+        return None;
+    }
+    let mut text = Buf::new_in(gpa);
+    let mut chunk = [0u8; 65536];
+    loop {
+        let n = unsafe { c::fread(&chunk[0], 1, 65536, f) } as i64;
+        if n <= 0 {
+            break;
+        }
+        text.push_str(chunk[0..n]);
+    }
+    unsafe { c::fclose(f); }
+    Some(text)
+}
+
+fn hex_digit(b: u8) -> i64 {
+    if b >= '0' && b <= '9' {
+        (b - '0') as i64
+    } else if b >= 'A' && b <= 'F' {
+        (b - 'A') as i64 + 10
+    } else if b >= 'a' && b <= 'f' {
+        (b - 'a') as i64 + 10
+    } else {
+        -1
+    }
+}
+
+fn hex(s: [u8]) -> i64 {
+    let t = trim(s);
+    let mut v = 0;
+    for i in 0..t.len {
+        let d = hex_digit(t[i]);
+        if d < 0 {
+            return -1;
+        }
+        v = v * 16 + d;
+    }
+    if t.len == 0 { -1 } else { v }
+}
+
+// `0041..005A` or `0041`: the first and last code point.
+fn range(s: [u8]) -> (i64, i64) {
+    let t = trim(s);
+    for i in 0..t.len - 1 {
+        if t[i] == '.' && t[i + 1] == '.' {
+            return (hex(t[0..i]), hex(t[i + 2..t.len]));
+        }
+    }
+    let v = hex(t);
+    (v, v)
+}
+
+// The fields of a data line (split at ';', trimmed), without its comment;
+// none for a comment or a blank line. `# @missing: R; V` lines are data
+// lines when missing is true.
+fn fields(line: [u8], missing: bool, out: &mut Vec<[u8]>) {
+    out.clear();
+    let mut s = line;
+    let tag = "# @missing:";
+    if missing {
+        if s.len < tag.len || s[0..tag.len] != tag {
+            return;
+        }
+        s = s[tag.len..s.len];
+    }
+    let mut end = s.len;
+    for i in 0..s.len {
+        if s[i] == '#' {
+            end = i;
+            break;
+        }
+    }
+    s = s[0..end];
+    if trim(s).len == 0 {
+        return;
+    }
+    let mut from = 0;
+    for i in 0..s.len + 1 {
+        if i == s.len || s[i] == ';' {
+            out.push(trim(s[from..i]));
+            from = i + 1;
+        }
+    }
+}
+
+// Calls f(first, last, fields) for each data line of text (the @missing
+// lines first, when there are).
+fn each_line<F: FnMut(i64, i64, [[u8]])>(text: [u8], f: F, gpa: Gpa) {
+    let mut g = f;
+    let mut fs: Vec<[u8]> = Vec::new_in(gpa);
+    defer fs.free();
+    for pass in 0..2 {
+        let mut from = 0;
+        for i in 0..text.len + 1 {
+            if i == text.len || text[i] == '\n' {
+                let line = text[from..i];
+                from = i + 1;
+                fields(line, pass == 0, &mut fs);
+                if fs.len() >= 2 {
+                    let (a, b) = range(fs[0]);
+                    if a >= 0 && b >= a && b < N {
+                        g(a, b, fs.as_slice());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn set_flag(u: &mut Ucd, a: i64, b: i64, bit: u32) {
+    for cp in a..b + 1 {
+        u.flags[cp] = u.flags[cp] | bit;
+    }
+}
+
+fn gcb_class(v: [u8]) -> i64 {
+    if v == "Other" { G_OTHER as i64 }
+    else if v == "CR" { G_CR as i64 }
+    else if v == "LF" { G_LF as i64 }
+    else if v == "Control" { G_CONTROL as i64 }
+    else if v == "Extend" { G_EXTEND as i64 }
+    else if v == "ZWJ" { G_ZWJ as i64 }
+    else if v == "Regional_Indicator" { G_RI as i64 }
+    else if v == "Prepend" { G_PREPEND as i64 }
+    else if v == "SpacingMark" { G_SPACING_MARK as i64 }
+    else if v == "L" { G_L as i64 }
+    else if v == "V" { G_V as i64 }
+    else if v == "T" { G_T as i64 }
+    else if v == "LV" { G_LV as i64 }
+    else if v == "LVT" { G_LVT as i64 }
+    else { -1 }
+}
+
+fn eaw_value(v: [u8]) -> i64 {
+    if v == "N" { EAW_N as i64 }
+    else if v == "A" { EAW_A as i64 }
+    else if v == "W" { EAW_W as i64 }
+    else if v == "F" { EAW_F as i64 }
+    else if v == "Na" { EAW_NA as i64 }
+    else if v == "H" { EAW_H as i64 }
+    else { -1 }
+}
+
+fn gc_value(v: [u8]) -> u8 {
+    if v.len == 2 && v[0] == 'L' {
+        GC_LETTER
+    } else if v == "Sk" {
+        GC_SK
+    } else if v.len == 2 && v[0] == 'N' {
+        GC_NUMBER
+    } else if v == "Cc" {
+        GC_CC
+    } else {
+        GC_OTHER
+    }
+}
+
+// The code points of a mapping field (`0053 0073`) into m[0..3]; how many.
+fn mapping(s: [u8], m: &mut [u32; 3]) -> i64 {
+    let mut n = 0;
+    let mut from = 0;
+    let t = trim(s);
+    for i in 0..t.len + 1 {
+        if i == t.len || t[i] == ' ' {
+            if i > from && n < 3 {
+                (*m)[n] = hex(t[from..i]) as u32;
+                n += 1;
+            }
+            from = i + 1;
+        }
+    }
+    n
+}
+
+fn load(dir: [u8], gpa: Gpa) -> Option<Ucd> {
+    let mut u = Ucd {
+        gcb: Vec::filled_in(N, 0u8, gpa),
+        eaw: Vec::filled_in(N, 0u8, gpa),
+        gc: Vec::filled_in(N, 0u8, gpa),
+        incb: Vec::filled_in(N, 0u8, gpa),
+        flags: Vec::filled_in(N, 0u32, gpa),
+        lower: Vec::filled_in(N, 0u32, gpa),
+        upper: Vec::filled_in(N, 0u32, gpa),
+        lower_multi: Vec::new_in(gpa),
+        upper_multi: Vec::new_in(gpa),
+    };
+    let mut bad = 0;
+
+    let t = read_file(dir, "GraphemeBreakProperty.txt", gpa)?;
+    each_line(t.as_slice(), |a, b, f| {
+        let g = gcb_class(f[1]);
+        if g < 0 { bad += 1; }
+        for cp in a..b + 1 { u.gcb[cp] = g as u8; }
+    }, gpa);
+
+    let t = read_file(dir, "EastAsianWidth.txt", gpa)?;
+    each_line(t.as_slice(), |a, b, f| {
+        let w = eaw_value(f[1]);
+        if w < 0 { bad += 1; }
+        for cp in a..b + 1 { u.eaw[cp] = w as u8; }
+    }, gpa);
+
+    let t = read_file(dir, "DerivedCoreProperties.txt", gpa)?;
+    each_line(t.as_slice(), |a, b, f| {
+        let p = f[1];
+        if p == "Default_Ignorable_Code_Point" { set_flag(&mut u, a, b, F_DI); }
+        else if p == "Grapheme_Extend" { set_flag(&mut u, a, b, F_GRAPHEME_EXTEND); }
+        else if p == "Alphabetic" { set_flag(&mut u, a, b, F_ALPHABETIC); }
+        else if p == "Lowercase" { set_flag(&mut u, a, b, F_LOWERCASE); }
+        else if p == "Uppercase" { set_flag(&mut u, a, b, F_UPPERCASE); }
+        else if p == "InCB" && f.len >= 3 {
+            let v: u8 = if f[2] == "Linker" { 1 } else if f[2] == "Consonant" { 2 }
+                else if f[2] == "Extend" { 3 } else { 0 };
+            for cp in a..b + 1 { u.incb[cp] = v; }
+        }
+    }, gpa);
+
+    let t = read_file(dir, "PropList.txt", gpa)?;
+    each_line(t.as_slice(), |a, b, f| {
+        if f[1] == "White_Space" { set_flag(&mut u, a, b, F_WHITE_SPACE); }
+        else if f[1] == "Prepended_Concatenation_Mark" { set_flag(&mut u, a, b, F_PCM); }
+    }, gpa);
+
+    let t = read_file(dir, "HangulSyllableType.txt", gpa)?;
+    each_line(t.as_slice(), |a, b, f| {
+        if f[1] == "V" || f[1] == "T" { set_flag(&mut u, a, b, F_HANGUL_VT); }
+    }, gpa);
+
+    let t = read_file(dir, "LineBreak.txt", gpa)?;
+    each_line(t.as_slice(), |a, b, f| {
+        if f[1] == "AI" { set_flag(&mut u, a, b, F_LB_AI); }
+    }, gpa);
+
+    let t = read_file(dir, "emoji-data.txt", gpa)?;
+    each_line(t.as_slice(), |a, b, f| {
+        let p = f[1];
+        if p == "Extended_Pictographic" { set_flag(&mut u, a, b, F_EXT_PICT); }
+        else if p == "Emoji" { set_flag(&mut u, a, b, F_EMOJI); }
+        else if p == "Emoji_Presentation" { set_flag(&mut u, a, b, F_EPRES); }
+        else if p == "Emoji_Modifier" { set_flag(&mut u, a, b, F_EMOD); }
+    }, gpa);
+
+    // UnicodeData.txt: the general category, the simple case mappings, the
+    // canonical decompositions; `<..., First>` and `<..., Last>` lines
+    // bound a range.
+    let t = read_file(dir, "UnicodeData.txt", gpa)?;
+    let mut first = -1;
+    let mut decomp: Vec<(i64, i64)> = Vec::new_in(gpa);
+    each_line(t.as_slice(), |a, b, f| {
+        if f.len < 14 { bad += 1; return; }
+        let name = f[1];
+        let g = gc_value(f[2]);
+        let is_first = name.len > 7 && name[name.len - 7..name.len] == ", First>";
+        let is_last = name.len > 6 && name[name.len - 6..name.len] == ", Last>";
+        if is_first {
+            first = a;
+            return;
+        }
+        let lo = if is_last && first >= 0 { first } else { a };
+        for cp in lo..b + 1 { u.gc[cp] = g; }
+        first = -1;
+        if f[12].len > 0 { u.upper[a] = hex(f[12]) as u32; }
+        if f[13].len > 0 { u.lower[a] = hex(f[13]) as u32; }
+        // `X 0338`, without a <tag>: a canonical decomposition
+        let d = f[5];
+        if d.len == 9 && d[4] == ' ' && d[5..9] == "0338" {
+            decomp.push((a, hex(d[0..4])));
+        }
+    }, gpa);
+    for k in 0..decomp.len() {
+        let (cp, base) = decomp[k];
+        if u.eaw[base] == EAW_A {
+            set_flag(&mut u, cp, cp, F_DECOMP_AMBIGUOUS);
+        }
+    }
+
+    // SpecialCasing.txt: its unconditional mappings (four fields) replace
+    // the simple ones.
+    let t = read_file(dir, "SpecialCasing.txt", gpa)?;
+    each_line(t.as_slice(), |a, b, f| {
+        if f.len < 4 || (f.len >= 5 && f[4].len > 0) {
+            return;
+        }
+        let mut m = [0u32; 3];
+        let n = mapping(f[1], &mut m);
+        if n > 1 {
+            u.lower[a] = MULTI | (u.lower_multi.len() / 3) as u32;
+            for k in 0..3 { u.lower_multi.push(m[k]); }
+        } else if n == 1 && m[0] != a as u32 {
+            u.lower[a] = m[0];
+        }
+        let mut m = [0u32; 3];
+        let n = mapping(f[3], &mut m);
+        if n > 1 {
+            u.upper[a] = MULTI | (u.upper_multi.len() / 3) as u32;
+            for k in 0..3 { u.upper_multi.push(m[k]); }
+        } else if n == 1 && m[0] != a as u32 {
+            u.upper[a] = m[0];
+        }
+    }, gpa);
+    if bad > 0 {
+        eprintln(f"gen: {bad} lines with values this generator does not know");
+        return None;
+    }
+    Some(u)
+}
+
+// ---- The properties of a code point ----
+
+// unicode-width 0.2's width of a char (the rules at the top).
+fn width_class(u: &Ucd, cp: i64) -> u16 {
+    let fl = u.flags[cp];
+    if cp < 0x20 || (cp >= 0x7f && cp < 0xa0) {
+        return W_CONTROL;
+    }
+    if cp == 0x2d7f {
+        return W_ONE;
+    }
+    if cp == 0x115f || cp == 0x17a4 {
+        return W_TWO;
+    }
+    if cp == 0x17d8 {
+        return W_THREE;
+    }
+    let zero_pcm = cp == 0x605 || cp == 0x70f || cp == 0x890 || cp == 0x891 || cp == 0x8e2;
+    if (fl & (F_DI | F_GRAPHEME_EXTEND | F_HANGUL_VT)) != 0 || zero_pcm
+        || (u.gcb[cp] == G_PREPEND && (fl & F_PCM) == 0) || cp == 0xa8fa {
+        return W_ZERO;
+    }
+    let e = u.eaw[cp];
+    if e == EAW_W || e == EAW_F {
+        return W_TWO;
+    }
+    let ambiguous = e == EAW_A || (fl & (F_LB_AI | F_DECOMP_AMBIGUOUS)) != 0 || cp == 0x387;
+    let g = u.gc[cp];
+    if ambiguous && g != GC_LETTER && g != GC_SK {
+        return W_AMBIGUOUS;
+    }
+    W_ONE
+}
+
+// The u16 of props(cp) (the layout: compiler/std/unicode/props.tach).
+fn props_value(u: &Ucd, cp: i64) -> u16 {
+    let fl = u.flags[cp];
+    let mut g = u.gcb[cp] as u16;
+    if (fl & F_EXT_PICT) != 0 {
+        g = G_EXT_PICT as u16;
+    }
+    let mut v = g | (width_class(u, cp) << 4) | ((u.incb[cp] as u16) << 7);
+    if (fl & F_EPRES) != 0 { v = v | 0x200; }
+    if (fl & F_EMOJI) != 0 { v = v | 0x400; }
+    if (fl & F_EMOD) != 0 { v = v | 0x800; }
+    if (fl & F_WHITE_SPACE) != 0 { v = v | 0x1000; }
+    v
+}
+
+// The byte of classes(cp): Rust's is_alphabetic 1, is_numeric 2,
+// is_whitespace 4, is_lowercase 8, is_uppercase 16, is_control 32.
+fn class_value(u: &Ucd, cp: i64) -> u8 {
+    let fl = u.flags[cp];
+    let mut v: u8 = 0;
+    if (fl & F_ALPHABETIC) != 0 { v = v | 1; }
+    if u.gc[cp] == GC_NUMBER { v = v | 2; }
+    if (fl & F_WHITE_SPACE) != 0 { v = v | 4; }
+    if (fl & F_LOWERCASE) != 0 { v = v | 8; }
+    if (fl & F_UPPERCASE) != 0 { v = v | 16; }
+    if u.gc[cp] == GC_CC { v = v | 32; }
+    v
+}
+
+// ---- Tries ----
+
+// A three-stage trie of byte values: s1[cp >> (b2 + b3)] is a block of
+// stage 2 (entries of w2 bytes, little-endian), whose entry
+// (cp >> b3) & (2^b2 - 1) is a leaf, whose byte cp & (2^b3 - 1) is the
+// value. Stage 1's entries are w1 bytes.
+struct Trie { b2: i64, b3: i64, w1: i64, w2: i64, s1: Vec<u8>, s2: Vec<u8>, leaves: Vec<u8> }
+
+impl Trie {
+    fn size(self: &Trie) -> i64 {
+        self.s1.len() + self.s2.len() + self.leaves.len()
+    }
+
+    fn free(self: &mut Trie) {
+        self.s1.free();
+        self.s2.free();
+        self.leaves.free();
+    }
+}
+
+fn put_entry(out: &mut Vec<u8>, v: i64, w: i64) {
+    out.push((v & 0xff) as u8);
+    if w == 2 {
+        out.push((v >> 8) as u8);
+    }
+}
+
+// The blocks of `items` of `size` bytes each, deduplicated: their ids
+// (in order of first appearance) into ids, the distinct blocks into out.
+fn dedup(items: [u8], size: i64, ids: &mut Vec<i64>, out: &mut Vec<u8>, gpa: Gpa) {
+    let mut seen: HashMap<[u8], i64> = HashMap::new_in(gpa);
+    let n = items.len / size;
+    for k in 0..n {
+        let block = items[k * size..(k + 1) * size];
+        match seen.get(block) {
+            Some(id) => ids.push(id),
+            None => {
+                let id = out.len() / size;
+                seen.insert(block, id);
+                out.extend_from_slice(block);
+                ids.push(id);
+            }
+        }
+    }
+}
+
+fn build_trie(values: [u8], b2: i64, b3: i64, gpa: Gpa) -> Trie {
+    let mut leaves: Vec<u8> = Vec::new_in(gpa);
+    let mut leaf_ids: Vec<i64> = Vec::new_in(gpa);
+    dedup(values, 1 << b3, &mut leaf_ids, &mut leaves, gpa);
+    let nleaves = leaves.len() >> b3;
+    let w2 = if nleaves <= 256 { 1 } else { 2 };
+    // (stage 2's blocks as bytes, to deduplicate them the same way)
+    let mut mids: Vec<u8> = Vec::new_in(gpa);
+    for k in 0..leaf_ids.len() {
+        put_entry(&mut mids, leaf_ids[k], w2);
+    }
+    let mut s2: Vec<u8> = Vec::new_in(gpa);
+    let mut mid_ids: Vec<i64> = Vec::new_in(gpa);
+    dedup(mids.as_slice(), (1 << b2) * w2, &mut mid_ids, &mut s2, gpa);
+    let nmids = s2.len() / ((1 << b2) * w2);
+    let w1 = if nmids <= 256 { 1 } else { 2 };
+    let mut s1: Vec<u8> = Vec::new_in(gpa);
+    for k in 0..mid_ids.len() {
+        put_entry(&mut s1, mid_ids[k], w1);
+    }
+    Trie { b2: b2, b3: b3, w1: w1, w2: w2, s1: s1, s2: s2, leaves: leaves }
+}
+
+// The smallest trie of values over every split of the bits.
+fn best_trie(values: [u8], gpa: Gpa) -> Trie {
+    let mut best = build_trie(values, 6, 5, gpa);
+    for b3 in 3..9 {
+        for b2 in 2..9 {
+            if b2 + b3 > 14 {
+                continue;
+            }
+            let mut t = build_trie(values, b2, b3, gpa);
+            // (one byte per entry where it ties: fewer loads)
+            if t.size() < best.size()
+                || (t.size() == best.size() && t.w1 + t.w2 < best.w1 + best.w2) {
+                best.free();
+                best = t;
+            } else {
+                t.free();
+            }
+        }
+    }
+    best
+}
+
+// The value of cp in t, as the lookup in std does it (the self-check).
+fn trie_get(t: &Trie, cp: i64) -> i64 {
+    let i1 = cp >> (t.b2 + t.b3);
+    let mut m = t.s1[i1 * t.w1] as i64;
+    if t.w1 == 2 { m = m | ((t.s1[i1 * 2 + 1] as i64) << 8); }
+    let i2 = (m << t.b2) | ((cp >> t.b3) & ((1 << t.b2) - 1));
+    let mut l = t.s2[i2 * t.w2] as i64;
+    if t.w2 == 2 { l = l | ((t.s2[i2 * 2 + 1] as i64) << 8); }
+    t.leaves[(l << t.b3) | (cp & ((1 << t.b3) - 1))] as i64
+}
+
+// ---- Writing ----
+
+const HEX: [u8] = "0123456789abcdef";
+
+// What the tables' bytes are written plus (put_bytes).
+const TABLE_BIAS: u8 = 0x21;
+
+// `pub const NAME: [u8] = "..";`, 32 bytes a line (continued with `\`).
+// Each byte b is written as b + TABLE_BIAS (wrapping): the small numbers
+// the tables mostly hold become punctuation and digits, one each, rather
+// than four-character escapes (std's text is copied into every compile,
+// so its size costs every program).
+fn put_bytes(out: &mut Buf, name: [u8], suffix: [u8], b: [u8]) {
+    out.push_fmt(f"pub const {name}{suffix}: [u8] = \"");
+    for i in 0..b.len {
+        if i > 0 && i % 32 == 0 {
+            out.push_str("\\\n    ");
+        }
+        let c = b[i] + TABLE_BIAS;
+        // (punctuation and digits only: no letter, so that std's index,
+        // which reads the text line by line, finds no word in a table, and
+        // no space, which a `\` line continuation would skip)
+        if c >= 0x21 && c <= 0x40 && c != '"' {
+            out.push(c);
+        } else {
+            out.push_str("\\x");
+            out.push(HEX[(c >> 4) as i64]);
+            out.push(HEX[(c & 15) as i64]);
+        }
+    }
+    out.push_str("\";\n");
+}
+
+fn put_trie(out: &mut Buf, name: [u8], t: &Trie) {
+    out.push_fmt(f"pub const {name}_SHIFT2: i64 = {t.b3};\n");
+    out.push_fmt(f"pub const {name}_SHIFT1: i64 = {t.b2 + t.b3};\n");
+    out.push_fmt(f"pub const {name}_MASK2: i64 = {(1 << t.b2) - 1};\n");
+    out.push_fmt(f"pub const {name}_MASK3: i64 = {(1 << t.b3) - 1};\n");
+    out.push_fmt(f"pub const {name}_WIDE1: bool = {t.w1 == 2};\n");
+    out.push_fmt(f"pub const {name}_WIDE2: bool = {t.w2 == 2};\n");
+    put_bytes(out, name, "_S1", t.s1.as_slice());
+    put_bytes(out, name, "_S2", t.s2.as_slice());
+    put_bytes(out, name, "_LEAVES", t.leaves.as_slice());
+}
+
+// The case table: (cp, mapping) entries of 3 + 3 bytes, sorted; a mapping
+// with MULTI set is an index into the multi table (3 code points of 3
+// bytes each).
+fn put_case(out: &mut Buf, name: [u8], map: &Vec<u32>, multi: &Vec<u32>, gpa: Gpa) -> i64 {
+    let mut b: Vec<u8> = Vec::new_in(gpa);
+    defer b.free();
+    let mut n = 0;
+    for cp in 0..N {
+        let m = map[cp];
+        if m != 0 && m != cp as u32 {
+            for v in [cp as u32, m] {
+                b.push((v & 0xff) as u8);
+                b.push(((v >> 8) & 0xff) as u8);
+                b.push((v >> 16) as u8);
+            }
+            n += 1;
+        }
+    }
+    put_bytes(out, name, "_TABLE", b.as_slice());
+    b.clear();
+    for k in 0..multi.len() {
+        let v = multi[k];
+        b.push((v & 0xff) as u8);
+        b.push(((v >> 8) & 0xff) as u8);
+        b.push((v >> 16) as u8);
+    }
+    put_bytes(out, name, "_MULTI", b.as_slice());
+    n
+}
+
+fn generate(u: &Ucd, version: [u8], out: &mut Buf, gpa: Gpa) -> bool {
+    // props: distinct values, then a trie of their indices
+    let mut index: HashMap<u16, i64> = HashMap::new_in(gpa);
+    defer index.free();
+    let mut distinct: Vec<u16> = Vec::new_in(gpa);
+    defer distinct.free();
+    let mut idx: Vec<u8> = Vec::with_capacity_in(N, gpa);
+    defer idx.free();
+    let mut bad = 0;
+    for cp in 0..N {
+        let fl = u.flags[cp];
+        if (fl & F_EXT_PICT) != 0 && u.gcb[cp] != G_OTHER {
+            eprintln(
+                f"gen: U+{cp:X} is Extended_Pictographic and Grapheme_Cluster_Break {u.gcb[cp]}");
+            bad += 1;
+        }
+        let v = props_value(u, cp);
+        let k = match index.get(v) {
+            Some(k) => k,
+            None => {
+                let k = distinct.len();
+                distinct.push(v);
+                index.insert(v, k);
+                k
+            }
+        };
+        idx.push(k as u8);
+    }
+    if distinct.len() > 256 || bad > 0 {
+        eprintln(f"gen: {distinct.len()} distinct property values (256 at most), {bad} conflicts");
+        return false;
+    }
+    let mut props = best_trie(idx.as_slice(), gpa);
+    defer props.free();
+    let mut classes_v: Vec<u8> = Vec::with_capacity_in(N, gpa);
+    defer classes_v.free();
+    for cp in 0..N {
+        classes_v.push(class_value(u, cp));
+    }
+    let mut classes = best_trie(classes_v.as_slice(), gpa);
+    defer classes.free();
+    for cp in 0..N {
+        if distinct[trie_get(&props, cp)] != props_value(u, cp)
+            || trie_get(&classes, cp) != classes_v[cp] as i64 {
+            eprintln(f"gen: the trie is wrong at U+{cp:X}");
+            return false;
+        }
+    }
+
+    let vs = version;
+    out.push_str("// std::unicode::tables (0.20): generated by tools/unicode/gen.tach from the\n");
+    out.push_fmt(f"// Unicode Character Database {vs} (tools/unicode/ucd.lock): do not edit;\n");
+    out.push_str("// tools/unicode/gen.sh remakes it, `gen.sh --check` checks it. The lookups\n");
+    out.push_str("// and the bits: std::unicode (unicode/mod.tach).\n");
+    out.push_str("\n// ---- Unicode tables: properties (0.20) ----\n\n");
+    out.push_str("// Every byte of the byte-string tables below is written plus TABLE_BIAS\n");
+    out.push_str("// (wrapping), so that small numbers are one printable character each: a\n");
+    out.push_str("// lookup subtracts it (std::unicode: table_byte).\n");
+    out.push_str("pub const TABLE_BIAS: u8 = 33;\n\n");
+    // (the version's three numbers)
+    let mut parts = [0i64; 3];
+    let mut k = 0;
+    let mut from = 0;
+    for i in 0..vs.len + 1 {
+        if i == vs.len || vs[i] == '.' {
+            if k < 3 {
+                parts[k] = parse_int(vs[from..i]).unwrap_or(0);
+            }
+            k += 1;
+            from = i + 1;
+        }
+    }
+    out.push_str("// The version of Unicode these tables are of (Rust's char::UNICODE_VERSION).\n");
+    out.push_fmt(
+        f"pub static UNICODE_VERSION: (u8, u8, u8) = ({parts[0]}, {parts[1]}, {parts[2]});\n\n");
+    out.push_fmt(
+        f"// props(cp): {props.size()} bytes of trie, {distinct.len()} distinct values.\n");
+    out.push_fmt(f"pub const PROPS_VALUES: [u16; {distinct.len()}] = [");
+    for i in 0..distinct.len() {
+        if i % 12 == 0 {
+            out.push_str("\n   ");
+        }
+        out.push_fmt(f" {distinct[i]},");
+    }
+    out.push_str("\n];\n");
+    put_trie(out, "PROPS", &props);
+    // (each table its own section of std: a program loads the ones it uses)
+    out.push_str("\n// ---- Unicode tables: classes (0.20) ----\n\n");
+    out.push_fmt(f"// classes(cp): {classes.size()} bytes of trie.\n");
+    put_trie(out, "CLASSES", &classes);
+    out.push_str("\n// ---- Unicode tables: case (0.20) ----\n\n");
+    out.push_str("// The case mappings.\n");
+    let nl = put_case(out, "LOWER", &u.lower, &u.lower_multi, gpa);
+    let nu = put_case(out, "UPPER", &u.upper, &u.upper_multi, gpa);
+    out.push_fmt(f"pub const LOWER_COUNT: i64 = {nl};\n");
+    out.push_fmt(f"pub const UPPER_COUNT: i64 = {nu};\n");
+    eprintln(
+        f"gen: props {props.size()} bytes (shifts {props.b2 + props.b3}, {props.b3}; {distinct.len()} values), classes {classes.size()} bytes, case {nl} + {nu} entries");
+    true
+}
+
+// The version on the lock's first line (`version 18.0.0`).
+fn lock_version(root: [u8], gpa: Gpa) -> Option<Buf> {
+    let t = read_file(root, "tools/unicode/ucd.lock", gpa)?;
+    let s = t.as_slice();
+    let tag = "version ";
+    if s.len < tag.len || s[0..tag.len] != tag {
+        return None;
+    }
+    let mut e = tag.len;
+    while e < s.len && s[e] != '\n' {
+        e += 1;
+    }
+    let mut v = Buf::new_in(gpa);
+    v.push_str(s[tag.len..e]);
+    Some(v)
+}
+
+fn arg(argv: **u8, k: i64) -> [u8] {
+    unsafe {
+        let p = argv[k];
+        let mut n = 0;
+        while p[n] != 0 {
+            n += 1;
+        }
+        p[0..n]
+    }
+}
+
+fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
+    let mut k = 1;
+    let mut check = false;
+    if k < argc as i64 && arg(argv, k) == "--check" {
+        check = true;
+        k += 1;
+    }
+    if k >= argc as i64 {
+        eprintln("usage: gen [--check] UCD_DIR [ROOT]");
+        return 2;
+    }
+    let dir = arg(argv, k);
+    let root = if k + 1 < argc as i64 { arg(argv, k + 1) } else { "." };
+    let version = match lock_version(root, gpa) {
+        Some(v) => v,
+        None => {
+            eprintln(f"gen: no version in {root}/tools/unicode/ucd.lock");
+            return 1;
+        }
+    };
+    let mut u = match load(dir, gpa) {
+        Some(u) => u,
+        None => return 1,
+    };
+    let mut out = Buf::new_in(gpa);
+    if !generate(&u, version.as_slice(), &mut out, gpa) {
+        return 1;
+    }
+    let name = "compiler/std/unicode/tables.tach";
+    if check {
+        let old = match read_file(root, name, gpa) {
+            Some(b) => b,
+            None => return 1,
+        };
+        if old.as_slice() != out.as_slice() {
+            eprintln(
+                f"error unicode.stale: {name} is not what tools/unicode/gen.tach makes from Unicode {version.as_slice()}");
+            eprintln("try: tools/unicode/gen.sh");
+            return 1;
+        }
+        return 0;
+    }
+    let mut path = Buf::new_in(gpa);
+    path.push_str(root);
+    path.push('/');
+    path.push_str(name);
+    path.push(0);
+    let f = unsafe { c::fopen(path.as_slice().ptr, c"wb") };
+    if f == 0 as *c::FILE {
+        eprintln(f"gen: cannot write {root}/{name}");
+        return 1;
+    }
+    let s = out.as_slice();
+    unsafe {
+        c::fwrite(s.ptr, 1, s.len as u64, f);
+        c::fclose(f);
+    }
+    0
+}
