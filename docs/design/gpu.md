@@ -997,16 +997,15 @@ tree. Their essential lines:
   struct in x0/x1. The type strings were identical for the protocol and
   for the concrete class `AGXG17GDevice`.
 
-## As built: the shader compiler (std::gpu::shader, branch g22-shaderb)
+## As built: the shader compiler (std::gpu::wgsl, branch g22-shaderb)
 
-- **Where.** `std::gpu::shader` (compiler/std/gpu/shader/), in std's
+- **Where.** `std::gpu::wgsl` (compiler/std/gpu/wgsl/), in std's
   embedded tree behind a closed gate (compiler/std/index.awk: its sections
   are read only by a program naming `gpu`); `tools/wgslc` is its command
-  line (`check ir msl reflect run metal-job bench explain`). The design's
-  `std::gpu::wgsl` name became `shader`: the IR is target-neutral (no
-  Metal slots or names in ir.tach), so other front ends and back ends
+  line (`check ir msl reflect run metal-job bench explain`). The IR is
+  target-neutral (no Metal slots or names in ir.tach), so other back ends
   (SPIR-V, PTX) share it.
-- **API.** `shader::translate(src, options(TARGET_MSL), &mut out, &mut
+- **API.** `wgsl::translate(src, options(TARGET_MSL), &mut out, &mut
   refl, &mut err, gpa) -> bool`; `Reflection` has the entry points (MSL
   names, workgroup sizes), the bindings in (group, binding) order (kind,
   min size, a slot per stage: buffers, textures and samplers each from 0
@@ -1023,3 +1022,33 @@ tree. Their essential lines:
   (uniformity.tach is a stub; WGSL's rule is not checked yet), the shader
   fuzzer, `@size`/`@align`, override constants, sampling in the
   interpreter.
+
+### Merging with std::gpu (branch g22-metalb)
+
+- **Names.** The compiler is `std::gpu::wgsl` (g22-metalb's
+  `std::gpu::shader` keeps ShaderSource and Reflection). At the merge,
+  compiler/std/gpu/mod.tach is g22-metalb's plus `pub mod wgsl;`; the
+  closed gate of index.awk is for std::gpu::wgsl and its submodules
+  (drop `GATES["std::gpu"]` if std::gpu's own sections are to stay as
+  g22-metalb has them).
+- **Reflection.** `wgsl::Reflection` to `shader::Reflection`: an
+  `EntryInfo` is an `EntryPoint` (name, `target_name` as `native`,
+  stage 0/1/2 as ShaderStage::VERTEX/FRAGMENT/COMPUTE, workgroup); a
+  `BindingInfo` is a `Binding` (`kind` BK_* in BindingType's order,
+  `slots[0..3]` as slot_vertex/slot_fragment/slot_compute, min_size); an
+  `InputInfo` (scalar SK_*, components) is a VertexFormat (f32 x2:
+  Float32x2). The slots follow g22-metalb's rule already.
+- **The sizes buffer.** Two fields to add to `shader::Reflection`:
+  `sizes`, the (group, binding) of each runtime-sized storage binding in
+  the buffer's order, and each entry's `sizes_slot` (-1: none). Before
+  each dispatch or draw, after the bind groups are set, for each stage
+  whose entry has `sizes_slot >= 0`: `wgsl::sizes_words(&refl, |g, b|
+  bytes bound at (g, b), &mut words)`, then `setBytes:length:atIndex:`
+  (compute), `setVertexBytes:`/`setFragmentBytes:` (render) with `words`
+  at `sizes_slot`. The bytes bound are the buffer's size minus the
+  binding's offset, or the binding's size when it gives one. The slot is
+  the stage's first after its buffers, so it must stay below the vertex
+  buffers (30 - i): a gpu.limits contract. Without it, an index of a
+  runtime-sized array reads zero (the length is 0), never out of range.
+  tests/run/std_gpu_wgsl_reflect.tach checks the reflection and the
+  words; tests/wgsl/metalrun binds the buffer exactly so.

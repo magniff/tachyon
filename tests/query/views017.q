@@ -6,8 +6,8 @@ crate::first_word	views(s) declared
 crate::pick	views(toks) declared
 crate::text_of	views(*toks) declared
 crate::intern	views() stores(word) declared
-std::gpu::shader::ir::Module::intern	views() inferred
-std::gpu::shader::msl::W::intern	views() inferred
+std::gpu::wgsl::ir::Module::intern	views() inferred
+std::gpu::wgsl::msl::W::intern	views() inferred
 crate::count	views()
 $ views Vec::get Vec::as_slice Vec::push
 Vec<Tok>::get	views(*self) parametric
@@ -46,6 +46,7 @@ Vec<Vec<u32, ScopedArena>, ScopedArena>::as_slice	views(self) declared
 Vec<Frame, ScopedArena>::as_slice	views(self) declared
 Vec<Inv, ScopedArena>::as_slice	views(self) declared
 Vec<Ctl, ScopedArena>::as_slice	views(self) declared
+Vec<i64>::as_slice	views(self) declared
 Vec<u8>::as_slice	views(self) declared
 Vec<Vec<u64>>::as_slice	views(self) declared
 Vec<[u8]>::push	views() stores(x) declared
@@ -99,8 +100,8 @@ crate::intern	views() stores(word) declared
 $ def pick intern count
 crate::pick	views017/main.tach:16:4	fn	fn pick(toks: &Vec<Tok>, counts: &Vec<i64>) -> [Tok]	effects: none	views: views(toks) declared
 crate::intern	views017/main.tach:27:4	fn	fn intern(names: &mut Vec<[u8]>, word: [u8])	effects: alloc(Gpa) panic	views: views() stores(word) declared
-std::gpu::shader::ir::Module::intern	../../compiler/std/gpu/shader/ir.tach:528:12	method	pub fn intern(self: &mut Module, kind: u8, sk: u8, n: i64, mm: i64, base: i64, space: u8, access: u8) -> i64	effects: alloc(ScopedArena) panic
-std::gpu::shader::msl::W::intern	../../compiler/std/gpu/shader/msl.tach:242:8	method	fn intern(self: &mut W, s: [u8]) -> Nm	effects: alloc(ScopedArena) panic
+std::gpu::wgsl::ir::Module::intern	../../compiler/std/gpu/wgsl/ir.tach:528:12	method	pub fn intern(self: &mut Module, kind: u8, sk: u8, n: i64, mm: i64, base: i64, space: u8, access: u8) -> i64	effects: alloc(ScopedArena) panic
+std::gpu::wgsl::msl::W::intern	../../compiler/std/gpu/wgsl/msl.tach:242:8	method	fn intern(self: &mut W, s: [u8]) -> Nm	effects: alloc(ScopedArena) panic
 crate::count	views017/main.tach:31:4	fn	fn count(toks: &Vec<Tok>) -> i64	effects: none
 std::iter::Iterator::count	../../compiler/std/iter.tach:73:8	trait-method	fn count(self: Self) -> i64
 $ views nothing_here

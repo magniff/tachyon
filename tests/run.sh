@@ -913,7 +913,7 @@ case arch-enc in
         ;;
 esac
 
-# The shader compiler (0.22, std::gpu::shader): tests/wgsl/run.sh (run
+# The shader compiler (0.22, std::gpu::wgsl): tests/wgsl/run.sh (run
 # above), its cases on the interpreter, on Metal (macOS) and through
 # spirv-val where it is installed; category "wgsl".
 case wgsl in

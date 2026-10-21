@@ -32,7 +32,7 @@ $ def --exact helper
 error query.no-match: no definition 'helper'
 try: tachyonc query def crate::a::helper
 try: tachyonc query def crate::b::helper
-try: tachyonc query def std::gpu::shader::msl::helpers
+try: tachyonc query def std::gpu::wgsl::msl::helpers
 [exit 1]
 $ def --exact crate::a::helper
 crate::a::helper	clash/a.tach:2:8	fn	pub fn helper() -> i64	effects: none
@@ -398,7 +398,7 @@ $ def helpr
 error query.no-match: no definition 'helpr'
 try: tachyonc query def crate::a::helper
 try: tachyonc query def crate::b::helper
-try: tachyonc query def std::gpu::shader::front::Front::help
+try: tachyonc query def std::gpu::wgsl::api::ShaderError.help
 [exit 1]
 $ refs MyVec
 # clash/main.tach

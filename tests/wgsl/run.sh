@@ -1,5 +1,5 @@
 #!/bin/sh
-# The shader compiler's tests (std::gpu::shader, compiler/std/gpu/shader; docs/design/gpu.md §4): every
+# The shader compiler's tests (std::gpu::wgsl, compiler/std/gpu/wgsl; docs/design/gpu.md §4): every
 # tests/wgsl/cases/*.wgsl is translated by wgslc and checked:
 #
 #   // ERROR: text     the translation fails with an error containing text
@@ -156,7 +156,7 @@ for f in "$HERE"/cases/*.wgsl; do
 done
 # every wgsl.* code the compiler reports has an explanation
 why=""
-for code in $(cat "$ROOT"/compiler/std/gpu/shader/*.tach | grep -o '"wgsl\.[a-z]*"' | tr -d '"' | sort -u); do
+for code in $(cat "$ROOT"/compiler/std/gpu/wgsl/*.tach | grep -o '"wgsl\.[a-z]*"' | tr -d '"' | sort -u); do
     "$W" explain "$code" >/dev/null 2>&1 || why="$why $code"
 done
 if [ -n "$why" ]; then
