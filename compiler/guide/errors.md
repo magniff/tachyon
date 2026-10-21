@@ -71,10 +71,10 @@ struct P { x: i64 }
 impl P { fn get(&self) -> i64 { self.x } }
 ```
 ```err
-error[parser error] expected identifier, got '&' | help: write the type of self: `self: &Self` for `&self`, `self: &mut Self` for `&mut self`, or `self: Self` (a copy)
+error[parser error] expected identifier, got '&' | help: `self` for `&self`, `inout self` for `&mut self`, `sink self` for `self` (0.19: `self: &Self`, `self: &mut Self`, `self: Self`)
 ```
-`fn get(self: &P) -> i64` (`self: *P` still works); `fn get(self)` is
-an error too: write `self: P` for a copy.
+`fn get(self) -> i64` (0.20's conventions; 0.19's `self: &P` still
+works, and `self: *P` is the raw pointer).
 
 ```tach
 println!("{}", 1);
@@ -755,14 +755,13 @@ safe).
 ```tach
 struct P { x: i64 }
 fn bump(p: &mut P) { p.x += 1; }
-fn main() -> i32 { let mut q = P { x: 1 }; bump(&q); q.x as i32 }
+fn main() -> i32 { let mut q = P { x: 1 }; bump(q); q.x as i32 }
 ```
 ```err
-error[type error] expected '&mut P', got '&P'
+error[type error] expected '&mut P', got 'P'
 ```
-The parameter is `&mut P`: write `bump(&mut q)` (the `try:`; `tachyonc
-fix --suggested` makes it). `&q` to a `*P` parameter (before 0.17's
-spelling) is accepted.
+The parameter is `&mut P` (0.20: `p: inout P`): mark the argument,
+`bump(&q)` (0.20's inout marker; `&mut q` in 0.19's spelling).
 
 ```tach
 fn first(a: &i64) -> i64 { a[0] }

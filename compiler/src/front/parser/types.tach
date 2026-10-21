@@ -2,23 +2,27 @@
 // function types; and the type arguments after a name (`Vec<T>`,
 // `f::<T>`), splitting the `>` off `>>`.
 
-use crate::base::{SYMS, intern_c};
+use crate::base::{SRC, SYMS, buf_bytes, buf_new, buf_slice, intern_c};
 use crate::base::diag::{err_begin, err_end, err_str, error_at};
 use crate::front::ast::{
-    EFFECTS_BOUND, NODES, NODE_REF, NODE_REF_MUT, NodeKind, SCRATCH, list_begin, list_end,
+    CONV_NEW, EFFECTS_BOUND, NODES, NODE_REF, NODE_REF_MUT, NodeKind, SCRATCH, list_begin, list_end,
     list_push, new_node,
+};
+use crate::front::conv::{
+    conv_error, legacy_at, legacy_error, rust_spelling, starts_type, strict_at, word_at,
 };
 use crate::front::effects::EFFECT_BOUNDS;
 use crate::front::lexer::{TOKS, str_at};
 use crate::front::lexer::Tok::{
     Amp, AmpAmp, Arrow, Bang, ColonColon, Comma, Ellipsis, Eof, Eq, Extern, Fn, Gt, GtEq, Ident,
-    LBracket, LParen, Lt, Mut, RBracket, RParen, Reserved, Semi, Shr, ShrEq, Star, Str, Unsafe,
+    LBracket, LParen, Let, Lt, Mut, RBracket, RParen, Reserved, Semi, Shr, ShrEq, Star, Str, Unsafe,
 };
 use crate::front::parser::{
     NO_STRUCT, P, advance, at, cur, cur_start, eat, expect, expect_ident, help_ampersand_type,
     prev_end, reserved_error, syntax_error, tok_kind, with_no_struct,
 };
 use crate::front::parser::exprs::parse_expr;
+use crate::front::parser::items::params::PARAM_TYPE;
 
 // `<A, B>` type arguments (after a type's name, or `::` in an
 // expression); the `>` of `>>` (and of `>=`, `>>=`) is split off.
@@ -228,6 +232,19 @@ pub fn parse_type() -> i64 {
     unsafe {
         let start = cur_start();
         let kind = cur();
+        // (0.20) accesses `let T`, `inout T` (conventions.md §6); `sink T`
+        // outside a parameter
+        if kind == Let || word_at(P, "inout") && starts_type(tok_kind(1)) {
+            return parse_access_type(start, kind != Let);
+        }
+        if word_at(P, "sink") && starts_type(tok_kind(1)) {
+            advance();
+            let inner = parse_type();
+            conv_error(c"conv.sink_type", start, NODES[inner].start,
+                "'sink' is a parameter's convention: a field or a result of type T owns its value already",
+                "", "");
+            return inner;
+        }
         if kind == Ident {
             let n = parse_type_name(start);
             // (a primitive type takes no type arguments: `x as i64 < n`
@@ -284,12 +301,18 @@ pub fn parse_type() -> i64 {
                 if mutable {
                     NODES[inner].p |= NODE_REF_MUT;
                 }
+                if strict_at(start) {
+                    rust_reference_type(start, inner, mutable);
+                }
                 NODES[inner].start = start;
                 return inner;
             }
             let n = new_node(NodeKind::TyPtr, start, prev_end());
             NODES[n].a = inner;
             NODES[n].p |= if mutable { NODE_REF | NODE_REF_MUT } else { NODE_REF };
+            if strict_at(start) {
+                rust_reference_type(start, inner, mutable);
+            }
             return n;
         }
         if kind == AmpAmp {
@@ -311,6 +334,59 @@ pub fn parse_type() -> i64 {
             err_end();
         }
         syntax_error(c"expected type")
+    }
+}
+
+// (0.20) `let T` (shared) or `inout T` (exclusive), at `let` / `inout`: an
+// access, the reference `&T` / `&mut T` flagged CONV_NEW (`inout [T]`: the
+// exclusive slice; `let [T]` is `[T]`). In a crate read in 0.19's spelling
+// it is syntax.legacy.
+fn parse_access_type(start: i64, inout: bool) -> i64 {
+    unsafe {
+        advance();
+        if legacy_at(start) {
+            legacy_error(start, prev_end(), if inout { "'inout T'" } else { "'let T'" });
+        }
+        let inner = parse_type();
+        if NODES[inner].kind == NodeKind::TySlice {
+            if inout {
+                NODES[inner].p |= NODE_REF_MUT;
+            }
+            NODES[inner].p |= CONV_NEW;
+            NODES[inner].start = start;
+            return inner;
+        }
+        let n = new_node(NodeKind::TyPtr, start, prev_end());
+        NODES[n].a = inner;
+        NODES[n].p |= CONV_NEW | if inout { NODE_REF | NODE_REF_MUT } else { NODE_REF };
+        n
+    }
+}
+
+// (0.20) conv.rust for Rust's `&T` / `&mut T` at start (inner: T's node):
+// in a parameter `T` (let, the default) / `inout T`, elsewhere `let T` /
+// `inout T`; `&[T]` is `[T]`, `&mut [T]` `inout [T]`.
+fn rust_reference_type(start: i64, inner: i64, mutable: bool) {
+    unsafe {
+        let text = SRC[NODES[inner].start..NODES[inner].end];
+        let slice = NODES[inner].kind == NodeKind::TySlice;
+        let new = buf_new();
+        if mutable {
+            buf_bytes(new, "inout ");
+        } else if !PARAM_TYPE && !slice {
+            buf_bytes(new, "let ");
+        }
+        buf_bytes(new, text);
+        let what = if mutable {
+            "an exclusive access is 'inout T' (a parameter 'x: inout T', called with '&x')"
+        } else if slice {
+            "a slice is a read-only view already: '[T]'"
+        } else if PARAM_TYPE {
+            "a parameter is borrowed read-only by default (let): 'x: T', called with 'x'"
+        } else {
+            "a shared access is 'let T'"
+        };
+        rust_spelling(start, NODES[inner].end, what, buf_slice(new));
     }
 }
 
@@ -374,6 +450,11 @@ fn parse_fn_type_rest(start: i64) -> i64 {
             if at(Ellipsis) {
                 error_at(cur_start(),
                     c"function pointer types cannot be variadic; call variadic functions directly");
+            }
+            // (0.20) `fn(sink T)`: a by-value parameter (its convention is
+            // not a type: the function type is `fn(T)` until T1)
+            if word_at(P, "sink") && starts_type(tok_kind(1)) && !legacy_at(cur_start()) {
+                advance();
             }
             list_push(parse_type());
             if !eat(Comma) {

@@ -1879,6 +1879,46 @@ both architectures' code; there is no `cfg`.
   (`arch.multiversion`, naming that version): put it under
   `if std::arch::has("f")`.
 
+## Additions of 0.20: parameter conventions (Phase 0)
+
+The design is [design/conventions.md](design/conventions.md): the
+memory model's spelling becomes tachyon's own, `let` / `inout` / `sink`,
+with 0.17's semantics. Phase 0 reads the new spelling next to the old
+one; the checker's rules (transparent accesses, the call markers'
+errors), the tools, and the migration of std and the tests come with the
+tasks named there.
+
+```ebnf
+param       = self_param | [ "mut" ] ident ":" [ "sink" ] type [ "=" expr ] ;
+self_param  = [ "inout" | "sink" ] "self" ;              (* or self ":" type, as before *)
+type       += "let" type | "inout" type ;                (* an access: `&T`, `&mut T`; `inout [T]`: `&mut [T]` *)
+fn_type    += "fn" "(" [ [ "sink" ] type { "," [ "sink" ] type } ] ")" [ "->" type ] ;
+stmt       += "var" pattern [ ":" type ] "=" expr ";"   (* let mut *)
+            | "inout" ident [ ":" type ] "=" expr ";" ;  (* let x = &mut place *)
+single     += "var" ident ;                             (* mut ident *)
+static_decl = "static" [ "mut" | "var" ] ident ":" type "=" expr ";" ;
+closure    += "sink" closure ;                          (* move *)
+```
+
+- `inout`, `sink` and `var` are words only where these rules put them;
+  elsewhere they are identifiers (`let var = 1; var(a, b)`), until 0.21
+  makes them keywords. `set` is not a convention: `x: set T` is
+  `conv.set`, and `sink T` outside a parameter `conv.sink_type`.
+- Until T1, an access is the reference it was: `x: inout T` is `x: &mut
+  T`, `x: let T` and `self` are `&T` / `&Self`, `x: sink T` is a mutable
+  by-value `T`, `inout r = &x;` is `let r = &mut x;`. `&x` is the inout
+  marker: where an exclusive reference is wanted it is one (`fill(&v)`
+  for `v: inout Vec<i64>`, or `&mut Vec<i64>`); elsewhere it is shared,
+  as before.
+- **Modes.** A file is read *mixed* (both spellings; the default until
+  Phase M), in *0.20's* spelling (`--syntax=0.20`: Rust's spellings are
+  `conv.rust`, each with its 0.20 form in a `try:` line, and `&x` is
+  always exclusive), or in *0.19's* (a crate whose root's first line is
+  `// tachyon-syntax: 0.19`: 0.20's spelling is `syntax.legacy`). Only
+  compiler/src/main.tach carries that line, during 0.20, so that v0.19.1
+  can build it; tests/run.sh fails if another file does. std and the
+  compiler's generated sources are read mixed.
+
 ## Importing C headers
 
 `import "stdio.h" as c;` *(0.4; `as`: 0.5, required since 0.8)* reads a C
