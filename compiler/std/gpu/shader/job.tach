@@ -1,3 +1,4 @@
+// ---- Shader compiler implementation, job (0.22) ----
 // Jobs: a compute dispatch with its buffers, run by the interpreter
 // (`wgslc run`) or turned into the input of tests/wgsl/metalrun
 // (`wgslc metal-job`), whose output has the same form, so the two compare
@@ -9,9 +10,13 @@
 //
 // Words are decimal or 0x hex; missing words are zero. The output is each
 // buffer, in the job's order: `buffer G B`, then its words in hex.
+
 use front::new_front;
 use interp::new_interp;
 use ir::{Module, STAGE_COMPUTE, V};
+use std::{Allocator, Buf, Option, Scanner, ScopedArena, Vec, parse_int, split_whitespace_in};
+use std::Option::{None, Some};
+use std::Result::{Err, Ok};
 use translate::{fill_error, new_error};
 
 pub struct JobBuffer { group: i64, binding: i64, bytes: i64, words: V<u32> }
@@ -84,7 +89,7 @@ fn fill_words<B: Allocator>(v: &mut V<u32>, words: &Vec<[u8], ScopedArena>, from
         match parse_word(words[k]) {
             Some(x) => v[k - from] = x,
             None => {
-                err.push_str(f"not a word: '{words[k]}'");
+                err.push_fmt(f"not a word: '{words[k]}'");
                 return false;
             }
         }
@@ -151,7 +156,7 @@ pub fn parse_job<B: Allocator>(text: [u8], a: ScopedArena, err: &mut Buf<B>) -> 
             let n = if fm == "rgba8unorm" { w * h } else if fm == "r8unorm" { (w * h + 3) / 4 }
                 else if fm == "rgba32float" || fm == "rgba32uint" { 4 * w * h } else { -1 };
             if n < 0 || w <= 0 || h <= 0 {
-                err.push_str(f"a texture is FORMAT W H with a format of rgba8unorm, r8unorm, rgba32float, rgba32uint: {line}");
+                err.push_fmt(f"a texture is FORMAT W H with a format of rgba8unorm, r8unorm, rgba32float, rgba32uint: {line}");
                 return None;
             }
             let mut t = JobTexture {
@@ -165,7 +170,7 @@ pub fn parse_job<B: Allocator>(text: [u8], a: ScopedArena, err: &mut Buf<B>) -> 
         } else if kw == "buffer" && words.len() >= 4 {
             let bytes = parse_int(words[3]).unwrap_or(0);
             if bytes <= 0 || bytes % 4 != 0 {
-                err.push_str(f"a buffer's size is a positive multiple of 4: {line}");
+                err.push_fmt(f"a buffer's size is a positive multiple of 4: {line}");
                 return None;
             }
             let mut b = JobBuffer {
@@ -188,7 +193,7 @@ pub fn parse_job<B: Allocator>(text: [u8], a: ScopedArena, err: &mut Buf<B>) -> 
                     match parse_word(words[k]) {
                         Some(w) => b.words[k - 4] = w,
                         None => {
-                            err.push_str(f"not a word: '{words[k]}'");
+                            err.push_fmt(f"not a word: '{words[k]}'");
                             return None;
                         }
                     }
@@ -196,7 +201,7 @@ pub fn parse_job<B: Allocator>(text: [u8], a: ScopedArena, err: &mut Buf<B>) -> 
             }
             job.buffers.push(b);
         } else {
-            err.push_str(f"cannot read this job line: {line}");
+            err.push_fmt(f"cannot read this job line: {line}");
             return None;
         }
     }
@@ -234,9 +239,9 @@ pub fn find_global(m: &Module, g: i64, b: i64) -> i64 {
 }
 
 pub fn print_words<A: Allocator>(group: i64, w: &V<u32>, out: &mut Buf<A>) {
-    out.push_str(f"buffer {group} 0\n");
+    out.push_fmt(f"buffer {group} 0\n");
     for k in 0..w.len() {
-        out.push_str(f"{w[k]:08x}");
+        out.push_fmt(f"{w[k]:08x}");
         out.push(if k % 8 == 7 || k == w.len() - 1 { '\n' } else { ' ' });
     }
 }
@@ -245,135 +250,11 @@ pub fn print_words<A: Allocator>(group: i64, w: &V<u32>, out: &mut Buf<A>) {
 pub fn print_buffers<A: Allocator>(job: &Job, words: &V<V<u32>>, idx: &V<i64>, out: &mut Buf<A>) {
     for i in 0..job.buffers.len() {
         let b = &job.buffers[i];
-        out.push_str(f"buffer {b.group} {b.binding}\n");
+        out.push_fmt(f"buffer {b.group} {b.binding}\n");
         let w = &words[idx[i]];
         for k in 0..w.len() {
-            out.push_str(f"{w[k]:08x}");
+            out.push_fmt(f"{w[k]:08x}");
             out.push(if k % 8 == 7 || k == w.len() - 1 { '\n' } else { ' ' });
         }
     }
-}
-
-pub fn command(interp: bool, file: [u8], job_path: [u8], gpa: Gpa) -> i32 {
-    let src = match crate::read_file(file, gpa) {
-        Some(b) => b,
-        None => {
-            eprintln(f"error wgslc.read: cannot read '{file}'");
-            return 2;
-        }
-    };
-    let compile_only = !interp && job_path == "-";
-    let jtext = if compile_only { Some(Buf::new_in(gpa)) } else { crate::read_file(job_path, gpa) };
-    let jtext = match jtext {
-        Some(b) => b,
-        None => {
-            eprintln(f"error wgslc.read: cannot read '{job_path}'");
-            return 2;
-        }
-    };
-    let mut out = Buf::new_in(gpa);
-    defer out.free();
-    let mut err = new_error(gpa);
-    defer err.free();
-    let status = arena_scope(gpa, |a| -> i64 {
-        let mut fr = new_front(src.as_slice(), a);
-        fr.module();
-        if !fr.failed {
-            uniformity::check(&mut fr);
-        }
-        if fr.failed {
-            fill_error(&fr, &mut err);
-            return 1;
-        }
-        bounds::insert_checks(&mut fr.m, a, true);
-        if compile_only {
-            msl::metal_compile_job(&fr.m, a, &mut out);
-            return 0;
-        }
-        let mut jerr = Buf::new_in(a);
-        let job = match parse_job(jtext.as_slice(), a, &mut jerr) {
-            Some(j) => j,
-            None => {
-                out.push_str(f"error wgslc.job: {jerr.as_slice()}\n");
-                return 3;
-            }
-        };
-        let ei = if job.call_n >= 0 { find_any_entry(&fr.m, job.entry) }
-            else { find_entry(&fr.m, job.entry) };
-        if ei < 0 {
-            out.push_str("error wgslc.job: no such compute entry point\n");
-            return 3;
-        }
-        for i in 0..job.buffers.len() {
-            let b = &job.buffers[i];
-            if find_global(&fr.m, b.group, b.binding) < 0 {
-                out.push_str(
-                    f"error wgslc.job: nothing is bound at @group({b.group}) @binding({b.binding})\n");
-                return 3;
-            }
-        }
-        if interp {
-            let mut it = new_interp(&fr.m, a);
-            for i in 0..job.buffers.len() {
-                let b = &job.buffers[i];
-                let g = find_global(&fr.m, b.group, b.binding);
-                it.set_buffer(g, b.words.as_slice());
-            }
-            for i in 0..job.textures.len() {
-                let t = &job.textures[i];
-                let g = find_global(&fr.m, t.group, t.binding);
-                if g < 0 {
-                    out.push_str(
-                        f"error wgslc.job: no texture at @group({t.group}) @binding({t.binding})\n");
-                    return 3;
-                }
-                let tx = texels(t, a);
-                it.set_texture(g, t.w, t.h, tx.as_slice());
-            }
-            if job.call_n >= 0 {
-                let fh = fr.m.entries[ei].func;
-                let in_stride = ir::record_offsets(&fr.m, fh, a)[fr.m.functions[fh].params.len()];
-                let rt = fr.m.functions[fh].result;
-                let out_stride = if rt >= 0 { ir::stride_of(&fr.m, rt) } else { 4 };
-                let mut res: V<u32> = Vec::new_in(a);
-                if !it.call(&fr.m, ei, job.input.as_slice(), in_stride, job.call_n, &mut res,
-                    out_stride) {
-                    out.push_str(f"error wgslc.interp: {it.err.as_slice()}\n");
-                    return 4;
-                }
-                let mut idx: V<i64> = Vec::new_in(a);
-                for i in 0..job.buffers.len() {
-                    let b = &job.buffers[i];
-                    idx.push(find_global(&fr.m, b.group, b.binding));
-                }
-                print_buffers(&job, &it.bufs, &idx, &mut out);
-                print_words(-1, &job.input, &mut out);
-                print_words(-2, &res, &mut out);
-                return 0;
-            }
-            if !it.dispatch(&fr.m, ei, job.groups) {
-                out.push_str(f"error wgslc.interp: {it.err.as_slice()}\n");
-                return 4;
-            }
-            let mut idx: V<i64> = Vec::new_in(a);
-            for i in 0..job.buffers.len() {
-                let b = &job.buffers[i];
-                idx.push(find_global(&fr.m, b.group, b.binding));
-            }
-            print_buffers(&job, &it.bufs, &idx, &mut out);
-            return 0;
-        }
-        msl::metal_job(&fr.m, a, ei, &job, &mut out);
-        0
-    });
-    if status == 1 {
-        crate::print_error(file, &mut err);
-        return 1;
-    }
-    if status != 0 {
-        eprint(out.as_slice());
-        return status as i32;
-    }
-    print(out.as_slice());
-    0
 }

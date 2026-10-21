@@ -22,7 +22,7 @@ pub fn print_int(v: i64) {
 $ text std:1-2
 // std:1-2
 1	// The standard library (0.5): the module `std`, built into the compiler
-2	// (compiler/std/embed.sh makes compiler/src/front/stdsrc.tach from this file
+2	// (compiler/std/embed.sh makes compiler/src/front/stdsrc.tach from this file,
 $ grep 'pub fn read_line' --in std
 # <std>
 9957:1	code	std::io	pub fn read_line<A: Allocator>(line: &mut Buf<A>) -> Result<bool, IoError> {

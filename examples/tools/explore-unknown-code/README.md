@@ -42,7 +42,7 @@ generated header:
 ```console
 $ tachyonc query items
 crate	main.tach	6
-std	<std>	562
+std	<std>	564
 crate::graph	graph.tach	11
 crate::heap	heap.tach	7
 crate::network	network.tach	2
@@ -77,6 +77,23 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
+std::gpu	<std>	2
+std::gpu::shader	<std>	30
+std::gpu::shader::ir	<std>	267
+std::gpu::shader::names	<std>	238
+std::gpu::shader::lex	<std>	61
+std::gpu::shader::front	<std>	95
+std::gpu::shader::expr	<std>	38
+std::gpu::shader::builtins	<std>	35
+std::gpu::shader::entry	<std>	8
+std::gpu::shader::bounds	<std>	10
+std::gpu::shader::uniformity	<std>	1
+std::gpu::shader::msl	<std>	81
+std::gpu::shader::spirv	<std>	1
+std::gpu::shader::interp	<std>	89
+std::gpu::shader::dump	<std>	12
+std::gpu::shader::job	<std>	13
+std::gpu::shader::translate	<std>	25
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6
@@ -143,10 +160,10 @@ crate::heap::free_heap	heap.tach:63:8	fn	pub fn free_heap(h: &mut MinHeap)
 crate::heap::is_empty	heap.tach:18:8	fn	pub fn is_empty(h: &MinHeap) -> bool
 crate::heap::pop	heap.tach:35:8	fn	pub fn pop(h: &mut MinHeap) -> Option<Entry>
 crate::graph::edges_from	graph.tach:55:8	fn	pub fn edges_from(g: &Graph, i: i64) -> [Edge]
-std::Vec::filled_in	<std>:1479:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
 crate::heap::push	heap.tach:22:8	fn	pub fn push(h: &mut MinHeap, e: Entry)
 std::Vec::set	<std>:301:12	method	pub fn set(self: &mut Vec<T, A>, i: i64, x: T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
 std::Option::unwrap	<std>:119:12	method	pub fn unwrap(self: Option<T>) -> T requires self.is_some() else "called unwrap on None"
+std::Vec::filled_in	<std>:1479:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
 note query.budget: over the budget of 600 tokens, left out: calls 2, types or uses 9, callers 1
 try: tachyonc query callers quickest
 try: tachyonc query context quickest --budget 1800

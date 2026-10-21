@@ -1,3 +1,4 @@
+// ---- Shader compiler implementation, front (0.22) ----
 // The WGSL front end: parsing, name resolution and type checking in one
 // pass from tokens to IR (docs/design/gpu.md §2.10), with no syntax tree
 // in between.
@@ -10,14 +11,16 @@
 //   constant (abstract numbers included) not yet in the IR.
 // - The first error stops the translation: it is recorded, and from then
 //   on every token reads as the end of the file, so the parse unwinds.
+
 use ir::{
     ACC_READ, ACC_RW, ACC_WRITE, BIND_BUILTIN, BIND_LOCATION, BIND_NONE, Binding, E_ARG,
     E_CALL_RESULT, E_GLOBAL, E_LOCAL, Entry, Function, Global, INTERP_FLAT, INTERP_LINEAR,
-    INTERP_PERSPECTIVE, Local, Member, Module, Param, SK_BOOL, SK_F32, SK_I32, SK_U32, SP_FUNCTION,
+    INTERP_PERSPECTIVE, Local, Module, Param, SK_BOOL, SK_F32, SK_I32, SK_U32, SP_FUNCTION,
     SP_HANDLE, SP_PRIVATE, SP_STORAGE, SP_UNIFORM, SP_WORKGROUP, STAGE_COMPUTE, STAGE_FRAGMENT,
     STAGE_VERTEX, S_BLOCK, S_BREAK, S_CALL, S_CONTINUE, S_EMIT, S_IF, S_KILL, S_LOOP, S_RETURN,
-    S_STORE, S_SWITCH, TK_ARRAY, TK_ATOMIC, TK_MATRIX, TK_POINTER, TK_SAMPLER, TK_SCALAR, TK_STRUCT,
-    TK_TEXTURE, TK_VECTOR, T_BOOL, T_F32, T_I32, T_U32, V, new_function, no_binding,
+    S_STORE, S_SWITCH, StructMember, TK_ARRAY, TK_ATOMIC, TK_MATRIX, TK_POINTER, TK_SAMPLER,
+    TK_SCALAR, TK_STRUCT, TK_TEXTURE, TK_VECTOR, T_BOOL, T_F32, T_I32, T_U32, V, new_function,
+    no_binding,
 };
 use lex::{
     T_ARROW, T_AT, T_COLON, T_COMMA, T_EOF, T_EQ, T_GT, T_IDENT, T_LBRACE, T_LBRACKET, T_LPAREN,
@@ -31,8 +34,9 @@ use names::{
     K_LET, K_LINEAR, K_LOCATION, K_LOOP, K_MUST_USE, K_OVERRIDE, K_PERSPECTIVE, K_REQUIRES,
     K_RETURN, K_SAMPLE, K_SIZE, K_STRUCT, K_SWITCH, K_VAR, K_VERTEX, K_WHILE, K_WORKGROUP_SIZE,
 };
+use std::{Buf, ScopedArena, Vec};
 
-// ---- Values ----
+// ---- Shader compiler implementation, front: Values (0.22) ----
 
 // an IR expression's value
 pub const VK_VALUE: u8 = 0;
@@ -58,7 +62,7 @@ pub fn cfloat(sk: u8, ty: i64, v: f64) -> Val {
     Val { k: VK_CONST, sk: sk, e: -1, ty: ty, iv: 0, fv: v }
 }
 
-// ---- Declarations ----
+// ---- Shader compiler implementation, front: Declarations (0.22) ----
 
 pub const D_FN: u8 = 0;
 pub const D_STRUCT: u8 = 1;
@@ -279,9 +283,9 @@ impl Front {
         }
         let got = self.kind();
         if self.err(self.pos(), "wgsl.syntax") {
-            self.emsg.push_str(f"expected {token_text(k)}, got ");
+            self.emsg.push_fmt(f"expected {token_text(k)}, got ");
             if got == T_IDENT {
-                self.emsg.push_str(f"'{self.text(self.p)}'");
+                self.emsg.push_fmt(f"'{self.text(self.p)}'");
             } else {
                 self.emsg.push_str(token_text(got));
             }
@@ -374,7 +378,7 @@ impl Front {
                 self.p += 1;
                 let what = self.text(self.p);
                 if self.err(at, "wgsl.unsupported") {
-                    self.emsg.push_str(
+                    self.emsg.push_fmt(
                         f"'{what}' is not in the WGSL subset of this release (no extensions)");
                     self.help("remove the directive; f16 and the other extensions come later");
                 }
@@ -415,7 +419,7 @@ impl Front {
                     self.emsg.push_str(
                         "expected a declaration ('fn', 'struct', 'var', 'const', 'alias'), got ");
                     if self.kind() == T_IDENT {
-                        self.emsg.push_str(f"'{self.text(self.p)}'");
+                        self.emsg.push_fmt(f"'{self.text(self.p)}'");
                     } else {
                         self.emsg.push_str(token_text(self.kind()));
                     }
@@ -431,7 +435,7 @@ impl Front {
             if sym >= 0 {
                 if self.decl_of[sym] >= 0 {
                     if self.err(at, "wgsl.redefined") {
-                        self.emsg.push_str(
+                        self.emsg.push_fmt(
                             f"'{self.name_of(sym)}' is declared twice at module scope");
                     }
                     return;
@@ -529,7 +533,7 @@ impl Front {
             if self.tk.kinds[i] == lex::T_BAD {
                 self.p = i;
                 if self.err(self.pos(), "wgsl.syntax") {
-                    self.emsg.push_str(f"unexpected character '{self.text(i)}'");
+                    self.emsg.push_fmt(f"unexpected character '{self.text(i)}'");
                 }
                 return;
             }
@@ -652,7 +656,7 @@ impl Front {
                 if b >= names::K_POSITION && b <= names::K_NUM_WORKGROUPS {
                     at.builtin = b - names::K_POSITION;
                 } else if self.err(bp, "wgsl.attr") {
-                    self.emsg.push_str(f"unknown builtin value '{self.name_of(b)}'");
+                    self.emsg.push_fmt(f"unknown builtin value '{self.name_of(b)}'");
                 }
             } else if s == K_INTERPOLATE {
                 self.expect(T_LPAREN);
@@ -681,11 +685,11 @@ impl Front {
             } else if s == K_MUST_USE {
             } else if s == K_INVARIANT || s == K_ALIGN || s == K_SIZE || s == K_ID {
                 if self.err(apos, "wgsl.unsupported") {
-                    self.emsg.push_str(
+                    self.emsg.push_fmt(
                         f"'@{self.name_of(s)}' is not in the WGSL subset of this release");
                 }
             } else if self.err(apos, "wgsl.attr") {
-                self.emsg.push_str(f"unknown attribute '@{self.name_of(s)}'");
+                self.emsg.push_fmt(f"unknown attribute '@{self.name_of(s)}'");
             }
         }
         at
@@ -712,7 +716,7 @@ impl Front {
         if dd.state == DS_BUSY {
             self.p = dd.tok;
             if self.err(self.pos(), "wgsl.cycle") {
-                self.emsg.push_str(f"'{self.name_of(dd.sym)}' refers to itself");
+                self.emsg.push_fmt(f"'{self.name_of(dd.sym)}' refers to itself");
             }
             return T_I32;
         }
@@ -735,7 +739,7 @@ impl Front {
 
     fn struct_body(self: &mut Front, sym: i64) -> i64 {
         self.expect(T_LBRACE);
-        let mut list: V<Member> = Vec::new_in(self.a);
+        let mut list: V<StructMember> = Vec::new_in(self.a);
         while self.kind() != T_RBRACE && self.kind() != T_EOF {
             let at = self.parse_attrs();
             let mpos = self.pos();
@@ -746,7 +750,7 @@ impl Front {
             for i in 0..list.len() {
                 if list[i].name == self.name_of(ms) {
                     if self.err(mpos, "wgsl.redefined") {
-                        self.emsg.push_str(f"member '{self.name_of(ms)}' is declared twice");
+                        self.emsg.push_fmt(f"member '{self.name_of(ms)}' is declared twice");
                     }
                 }
             }
@@ -761,7 +765,7 @@ impl Front {
                     self.ty_str(ty);
                 }
             }
-            list.push(Member {
+            list.push(StructMember {
                 name: self.name_of(ms), ty: ty, offset: 0, binding: self.binding_of(at)
             });
             if !self.eat(T_COMMA) {
@@ -978,7 +982,7 @@ impl Front {
         }
         if s >= names::K_TEXTURE_1D && s <= names::K_TEXTURE_STORAGE_2D_ARRAY {
             if self.err(at, "wgsl.unsupported") {
-                self.emsg.push_str(
+                self.emsg.push_fmt(
                     f"'{self.name_of(s)}' is not in the WGSL subset of this release");
                 self.help("2D textures are: texture_2d, texture_2d_array, texture_depth_2d, texture_storage_2d");
             }
@@ -991,12 +995,12 @@ impl Front {
                 return self.resolve_type_decl(d);
             }
             if self.err(at, "wgsl.type") {
-                self.emsg.push_str(f"'{self.name_of(s)}' is not a type");
+                self.emsg.push_fmt(f"'{self.name_of(s)}' is not a type");
             }
             return T_I32;
         }
         if self.err(at, "wgsl.name") {
-            self.emsg.push_str(f"unknown type '{self.name_of(s)}'");
+            self.emsg.push_fmt(f"unknown type '{self.name_of(s)}'");
             self.help("the types are bool, i32, u32, f32, vecN<T>, matCxR<f32>, array<T, N>, atomic<T>, structs");
         }
         T_I32
@@ -1017,7 +1021,7 @@ impl Front {
             SP_STORAGE
         } else {
             if self.err(at, "wgsl.syntax") {
-                self.emsg.push_str(f"unknown address space '{self.name_of(s)}'");
+                self.emsg.push_fmt(f"unknown address space '{self.name_of(s)}'");
                 self.help("the address spaces are function, private, workgroup, uniform, storage");
             }
             SP_PRIVATE
@@ -1035,7 +1039,7 @@ impl Front {
             ACC_RW
         } else {
             if self.err(at, "wgsl.syntax") {
-                self.emsg.push_str(f"unknown access mode '{self.name_of(s)}'");
+                self.emsg.push_fmt(f"unknown access mode '{self.name_of(s)}'");
             }
             ACC_READ
         }
@@ -1136,7 +1140,7 @@ impl Front {
             let o = self.m.globals[i];
             if o.group >= 0 && o.group == at.group && o.binding == at.binding {
                 if self.err(npos, "wgsl.binding") {
-                    self.emsg.push_str(
+                    self.emsg.push_fmt(
                         f"@group({at.group}) @binding({at.binding}) is also '{o.name}'");
                 }
             }
@@ -1189,7 +1193,7 @@ impl Front {
                     self.emsg.push_str(
                         "in a uniform buffer an array's stride is a multiple of 16; ");
                     self.ty_str(t);
-                    self.emsg.push_str(f" has {ty.stride}");
+                    self.emsg.push_fmt(f" has {ty.stride}");
                     self.help("use vec4 elements, or a storage buffer");
                 }
             }
@@ -1204,7 +1208,7 @@ impl Front {
                     if self.m.members[i].offset - prev_end < 0
                         || self.m.members[i].offset % 16 != 0 {
                         if self.err(pos, "wgsl.layout") {
-                            self.emsg.push_str(
+                            self.emsg.push_fmt(
                                 f"in a uniform buffer the struct member '{self.m.members[i].name}' must start at a multiple of 16");
                         }
                     }
@@ -1224,7 +1228,7 @@ impl Front {
         if dd.state == DS_BUSY {
             self.p = dd.tok;
             if self.err(self.pos(), "wgsl.cycle") {
-                self.emsg.push_str(f"'{self.name_of(dd.sym)}' refers to itself");
+                self.emsg.push_fmt(f"'{self.name_of(dd.sym)}' refers to itself");
             }
             return cint(ir::SK_AINT, -1, 0);
         }
@@ -1316,7 +1320,7 @@ impl Front {
             for i in 0..params.len() {
                 if params[i].name == self.name_of(ps) {
                     if self.err(ppos, "wgsl.redefined") {
-                        self.emsg.push_str(f"parameter '{self.name_of(ps)}' is declared twice");
+                        self.emsg.push_fmt(f"parameter '{self.name_of(ps)}' is declared twice");
                     }
                 }
             }
@@ -1417,7 +1421,7 @@ impl Front {
         self.flush();
         if self.f.result >= 0 && !self.block_returns(base) {
             if self.err(end, "wgsl.return") {
-                self.emsg.push_str(
+                self.emsg.push_fmt(
                     f"function '{self.f.name}' can reach its end without returning a value");
                 self.help("end it with a 'return'");
             }
@@ -1807,7 +1811,7 @@ impl Front {
         let pt = self.m.types[lhs.ty];
         if pt.access & ACC_WRITE == 0 {
             if self.err(at, "wgsl.access") {
-                self.emsg.push_str(
+                self.emsg.push_fmt(
                     f"cannot write to a read-only {ir::space_name(pt.space)} variable");
                 if pt.space == SP_STORAGE {
                     self.help("declare it 'var<storage, read_write>'");
@@ -2161,7 +2165,7 @@ impl Front {
                         for i in 0..seen.len() {
                             if seen[i] == c.iv {
                                 if self.err(vp, "wgsl.switch") {
-                                    self.emsg.push_str(f"case {c.iv} appears twice");
+                                    self.emsg.push_fmt(f"case {c.iv} appears twice");
                                 }
                             }
                         }

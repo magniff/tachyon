@@ -644,6 +644,9 @@ esac
 case walkthrough in
     *"$FILTER"*) "$ROOT/tests/walkthrough/run.sh" -c "$COMPILER" >"$WORK/walkthrough.out" 2>&1 & ;;
 esac
+case wgsl in
+    *"$FILTER"*) "$ROOT/tests/wgsl/run.sh" -c "$COMPILER" >"$WORK/wgsl.out" 2>&1 & ;;
+esac
 case own-try in
     *"$FILTER"*) "$ROOT/tests/own-try/run.sh" -c "$COMPILER" >"$WORK/own-try.out" 2>&1 & ;;
 esac
@@ -907,6 +910,25 @@ case arch-enc in
             { echo "FAIL arch-enc:"; sed 's/^/    /' "$WORK/arch-enc.out"; } >>"$FAILURES"
         fi
         count=$((count + 1))
+        ;;
+esac
+
+# The shader compiler (0.22, std::gpu::shader): tests/wgsl/run.sh (run
+# above), its cases on the interpreter, on Metal (macOS) and through
+# spirv-val where it is installed; category "wgsl".
+case wgsl in
+    *"$FILTER"*)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "wgsl pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "wgsl fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/wgsl.out"
+        if ! grep -q '^pass' "$WORK/wgsl.out"; then
+            echo "wgsl fail" >>"$TALLY"
+            count=$((count + 1))
+        fi
+        awk '/^FAIL/ { p = 1 } /^(pass|skip)/ { p = 0 } p' "$WORK/wgsl.out" >>"$FAILURES"
         ;;
 esac
 

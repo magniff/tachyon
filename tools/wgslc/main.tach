@@ -10,26 +10,18 @@
 //   wgslc bench [-n N] [--target msl|spv|ir] [--no-checks] FILE...
 //   wgslc explain CODE           what a wgsl.* diagnostic means
 //
-// The library is the module tree under this file: lex, front (with expr,
-// builtins, entry), ir, bounds, uniformity, msl, spirv, interp, dump,
-// translate. With C2 (std submodules) it moves to compiler/std/gpu/wgsl/
-// and `translate` becomes `std::gpu::wgsl::translate`.
-mod builtins;
-mod bounds;
-mod dump;
-mod entry;
+// The compiler is std::gpu::shader (compiler/std/gpu/shader/); this is
+// its command line, and the runner of the tests' jobs.
 mod explain;
-mod expr;
-mod front;
-mod interp;
-mod ir;
-mod job;
-mod lex;
-mod msl;
-mod names;
-mod spirv;
-mod translate;
-mod uniformity;
+
+use std::gpu::shader::{bounds, entry, interp, ir, job, msl, translate, uniformity};
+use std::gpu::shader::front::new_front;
+use std::gpu::shader::interp::new_interp;
+use std::gpu::shader::ir::V;
+use std::gpu::shader::job::{
+    Job, find_any_entry, find_entry, find_global, parse_job, print_buffers, print_words, texels,
+};
+use std::gpu::shader::translate::fill_error;
 
 use translate::{
     Options, ShaderError, TARGET_CHECK, TARGET_IR, TARGET_MSL, TARGET_SPIRV, new_error, options,
@@ -244,7 +236,7 @@ fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
         if argc < 4 {
             return usage();
         }
-        return job::command(cmd == "run", arg(argv, 2), arg(argv, 3), gpa);
+        return command(cmd == "run", arg(argv, 2), arg(argv, 3), gpa);
     }
     if cmd == "bench" {
         return bench(argc, argv, gpa);
@@ -398,5 +390,131 @@ fn bench(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
             f"{files[k]}\t{src.len()} bytes in\t{bytes} bytes out\tmedian {med / 1000}.{(med % 1000) / 100} us");
     }
     println(f"total (sum of medians)\t{total / 1000}.{(total % 1000) / 100} us");
+    0
+}
+
+// Runs a job: on the interpreter, or (metal-job) as the input of
+// tests/wgsl/metalrun.
+pub fn command(interp: bool, file: [u8], job_path: [u8], gpa: Gpa) -> i32 {
+    let src = match read_file(file, gpa) {
+        Some(b) => b,
+        None => {
+            eprintln(f"error wgslc.read: cannot read '{file}'");
+            return 2;
+        }
+    };
+    let compile_only = !interp && job_path == "-";
+    let jtext = if compile_only { Some(Buf::new_in(gpa)) } else { read_file(job_path, gpa) };
+    let jtext = match jtext {
+        Some(b) => b,
+        None => {
+            eprintln(f"error wgslc.read: cannot read '{job_path}'");
+            return 2;
+        }
+    };
+    let mut out = Buf::new_in(gpa);
+    defer out.free();
+    let mut err = new_error(gpa);
+    defer err.free();
+    let status = arena_scope(gpa, |a| -> i64 {
+        let mut fr = new_front(src.as_slice(), a);
+        fr.module();
+        if !fr.failed {
+            uniformity::check(&mut fr);
+        }
+        if fr.failed {
+            fill_error(&fr, &mut err);
+            return 1;
+        }
+        bounds::insert_checks(&mut fr.m, a, true);
+        if compile_only {
+            msl::metal_compile_job(&fr.m, a, &mut out);
+            return 0;
+        }
+        let mut jerr = Buf::new_in(a);
+        let job = match parse_job(jtext.as_slice(), a, &mut jerr) {
+            Some(j) => j,
+            None => {
+                out.push_str(f"error wgslc.job: {jerr.as_slice()}\n");
+                return 3;
+            }
+        };
+        let ei = if job.call_n >= 0 { find_any_entry(&fr.m, job.entry) }
+            else { find_entry(&fr.m, job.entry) };
+        if ei < 0 {
+            out.push_str("error wgslc.job: no such compute entry point\n");
+            return 3;
+        }
+        for i in 0..job.buffers.len() {
+            let b = &job.buffers[i];
+            if find_global(&fr.m, b.group, b.binding) < 0 {
+                out.push_str(
+                    f"error wgslc.job: nothing is bound at @group({b.group}) @binding({b.binding})\n");
+                return 3;
+            }
+        }
+        if interp {
+            let mut it = new_interp(&fr.m, a);
+            for i in 0..job.buffers.len() {
+                let b = &job.buffers[i];
+                let g = find_global(&fr.m, b.group, b.binding);
+                it.set_buffer(g, b.words.as_slice());
+            }
+            for i in 0..job.textures.len() {
+                let t = &job.textures[i];
+                let g = find_global(&fr.m, t.group, t.binding);
+                if g < 0 {
+                    out.push_str(
+                        f"error wgslc.job: no texture at @group({t.group}) @binding({t.binding})\n");
+                    return 3;
+                }
+                let tx = texels(t, a);
+                it.set_texture(g, t.w, t.h, tx.as_slice());
+            }
+            if job.call_n >= 0 {
+                let fh = fr.m.entries[ei].func;
+                let in_stride = ir::record_offsets(&fr.m, fh, a)[fr.m.functions[fh].params.len()];
+                let rt = fr.m.functions[fh].result;
+                let out_stride = if rt >= 0 { ir::stride_of(&fr.m, rt) } else { 4 };
+                let mut res: V<u32> = Vec::new_in(a);
+                if !it.call(&fr.m, ei, job.input.as_slice(), in_stride, job.call_n, &mut res,
+                    out_stride) {
+                    out.push_str(f"error wgslc.interp: {it.err.as_slice()}\n");
+                    return 4;
+                }
+                let mut idx: V<i64> = Vec::new_in(a);
+                for i in 0..job.buffers.len() {
+                    let b = &job.buffers[i];
+                    idx.push(find_global(&fr.m, b.group, b.binding));
+                }
+                print_buffers(&job, &it.bufs, &idx, &mut out);
+                print_words(-1, &job.input, &mut out);
+                print_words(-2, &res, &mut out);
+                return 0;
+            }
+            if !it.dispatch(&fr.m, ei, job.groups) {
+                out.push_str(f"error wgslc.interp: {it.err.as_slice()}\n");
+                return 4;
+            }
+            let mut idx: V<i64> = Vec::new_in(a);
+            for i in 0..job.buffers.len() {
+                let b = &job.buffers[i];
+                idx.push(find_global(&fr.m, b.group, b.binding));
+            }
+            print_buffers(&job, &it.bufs, &idx, &mut out);
+            return 0;
+        }
+        msl::metal_job(&fr.m, a, ei, &job, &mut out);
+        0
+    });
+    if status == 1 {
+        print_error(file, &mut err);
+        return 1;
+    }
+    if status != 0 {
+        eprint(out.as_slice());
+        return status as i32;
+    }
+    print(out.as_slice());
     0
 }

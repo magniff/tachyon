@@ -7,7 +7,7 @@ $ def trim
 crate::trim	prelude017/main.tach:6:4	fn	fn trim(x: i64) -> i64	effects: none
 $ items prelude017/uses.tach
 crate	prelude017/uses.tach	1
-std	<std>	562
+std	<std>	564
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	37
@@ -38,6 +38,23 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
+std::gpu	<std>	2
+std::gpu::shader	<std>	30
+std::gpu::shader::ir	<std>	267
+std::gpu::shader::names	<std>	238
+std::gpu::shader::lex	<std>	61
+std::gpu::shader::front	<std>	95
+std::gpu::shader::expr	<std>	38
+std::gpu::shader::builtins	<std>	35
+std::gpu::shader::entry	<std>	8
+std::gpu::shader::bounds	<std>	10
+std::gpu::shader::uniformity	<std>	1
+std::gpu::shader::msl	<std>	81
+std::gpu::shader::spirv	<std>	1
+std::gpu::shader::interp	<std>	89
+std::gpu::shader::dump	<std>	12
+std::gpu::shader::job	<std>	13
+std::gpu::shader::translate	<std>	25
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6

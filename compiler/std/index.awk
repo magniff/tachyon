@@ -29,7 +29,7 @@
 # section not read imports nothing: front/modules/lookup).
 
 BEGIN {
-    n = split("Stable sort (0.15)|HashMap|Debug of HashMap (0.15)|== on HashMap (0.15)|Iterators (0.14)|Adapters|Sources|Text (0.14)|Errors of reading and parsing (0.15)|Integer limits (0.15)|Bits (0.16)|Conversions (0.15)|Clone and hashing (0.15)|Clone, Eq, Ord and Hash without an impl (0.15)|Arenas (0.16)|FixedBuf (0.16)|HashMap's room (0.16)|Slices (0.16)|Gpa's leak checks (0.16)|The checking allocator's hooks for arenas (0.16)|Panic and unreachable, the prelude's (0.17)|Testing (0.18)|Non-null pointers (0.18)|The test runtime's implementation (0.18)|The fuzzer's implementation (0.18)|Heaps (0.18.1)|More of Vec and Range (0.18.1)|Run-time CPU features (0.19)|CPU features on macOS (0.19)|CPU features on Linux (0.19)|CPU features on x86-64 (0.19)|std::iter|std::convert|std::clone|Numbers: bits and wide products (0.20)|Numbers: digits (0.20)|Numbers: integer text (0.20)|Numbers: the shortest digits of a float (0.20)|Numbers: float text (0.20)|Numbers: float parsing (0.20)|Numbers: float parsing's slow path (0.20)|Numbers: powers of ten (0.20)|Numbers: the slow path's digits of 5^s (0.20)|Display and Debug of floats (0.20)|Sorting (0.9)|Sort kernels (0.20)|Sort, unstable (0.20)|Sort, stable (0.20)|Slice searches (0.20)|Slice algorithms (0.20)|Random numbers (0.20)|The target's system (0.20)|Duration (0.20)|Clocks (0.20)|Sys: errors (0.20)|Sys: paths (0.20)|Sys: files (0.20)|Sys: file status (0.20)|Sys: directories (0.20)|Sys: the environment (0.20)|Sys: processes (0.20)|Sys: terminals (0.20)|Sys: clocks and entropy (0.20)|UTF-8 (0.20)|UTF-8 with NEON (0.20)|Unicode tables: properties (0.20)|Unicode tables: classes (0.20)|Unicode tables: case (0.20)|Unicode properties (0.20)|Grapheme clusters (0.20)|Display width (0.20)|Unicode classes and case (0.20)", lz, "|")
+    n = split("Stable sort (0.15)|HashMap|Debug of HashMap (0.15)|== on HashMap (0.15)|Iterators (0.14)|Adapters|Sources|Text (0.14)|Errors of reading and parsing (0.15)|Integer limits (0.15)|Bits (0.16)|Conversions (0.15)|Clone and hashing (0.15)|Clone, Eq, Ord and Hash without an impl (0.15)|Arenas (0.16)|FixedBuf (0.16)|HashMap's room (0.16)|Slices (0.16)|Gpa's leak checks (0.16)|The checking allocator's hooks for arenas (0.16)|Panic and unreachable, the prelude's (0.17)|Testing (0.18)|Non-null pointers (0.18)|The test runtime's implementation (0.18)|The fuzzer's implementation (0.18)|Heaps (0.18.1)|More of Vec and Range (0.18.1)|Run-time CPU features (0.19)|CPU features on macOS (0.19)|CPU features on Linux (0.19)|CPU features on x86-64 (0.19)|std::iter|std::convert|std::clone|Numbers: bits and wide products (0.20)|Numbers: digits (0.20)|Numbers: integer text (0.20)|Numbers: the shortest digits of a float (0.20)|Numbers: float text (0.20)|Numbers: float parsing (0.20)|Numbers: float parsing's slow path (0.20)|Numbers: powers of ten (0.20)|Numbers: the slow path's digits of 5^s (0.20)|Display and Debug of floats (0.20)|Sorting (0.9)|Sort kernels (0.20)|Sort, unstable (0.20)|Sort, stable (0.20)|Slice searches (0.20)|Slice algorithms (0.20)|Random numbers (0.20)|The target's system (0.20)|Duration (0.20)|Clocks (0.20)|Sys: errors (0.20)|Sys: paths (0.20)|Sys: files (0.20)|Sys: file status (0.20)|Sys: directories (0.20)|Sys: the environment (0.20)|Sys: processes (0.20)|Sys: terminals (0.20)|Sys: clocks and entropy (0.20)|UTF-8 (0.20)|UTF-8 with NEON (0.20)|Unicode tables: properties (0.20)|Unicode tables: classes (0.20)|Unicode tables: case (0.20)|Unicode properties (0.20)|Grapheme clusters (0.20)|Display width (0.20)|Unicode classes and case (0.20)|Shader compiler implementation, bounds (0.22)|Shader compiler implementation, builtins (0.22)|Shader compiler implementation, dump (0.22)|Shader compiler implementation, entry (0.22)|Shader compiler implementation, expr (0.22)|Shader compiler implementation, front (0.22)|Shader compiler implementation, front: Values (0.22)|Shader compiler implementation, front: Declarations (0.22)|Shader compiler implementation, interp (0.22)|Shader compiler implementation, ir (0.22)|Shader compiler implementation, ir: Scalars (0.22)|Shader compiler implementation, ir: Types (0.22)|Shader compiler implementation, ir: Expressions (0.22)|Shader compiler implementation, ir: Statements (0.22)|Shader compiler implementation, ir: Fixed type handles (0.22)|Shader compiler implementation, ir: Building functions (0.22)|Shader compiler implementation, job (0.22)|Shader compiler implementation, lex (0.22)|Shader compiler implementation, msl (0.22)|Shader compiler implementation, msl: Analysis (0.22)|Shader compiler implementation, msl: Functions (0.22)|Shader compiler implementation, msl: Expressions (0.22)|Shader compiler implementation, msl: Statements (0.22)|Shader compiler implementation, msl: Functions and entry points (0.22)|Shader compiler implementation, msl: Test kernels (0.22)|Shader compiler implementation, msl: Jobs for tests/wgsl/metalrun (0.22)|Shader compiler implementation, names (0.22)|Shader compiler implementation, spirv (0.22)|Shader compiler implementation, translate (0.22)|Shader compiler implementation, translate: Reflection (0.22)|Shader compiler implementation, uniformity (0.22)", lz, "|")
     for (i = 1; i <= n; i++) LAZY[lz[i]] = 1
     # (0.20) GATES: modules whose items no program reaches without naming
     # the module (no re-export outside it): a word of one of their lazy
@@ -40,6 +40,26 @@ BEGIN {
     GATES["std::str"] = "str"
     GATES["std::unicode"] = "unicode"
     GATES["std::unicode::tables"] = "unicode"
+    # (0.22) std::gpu: read only by a program that names `gpu`; closed:
+    # no other module of std uses it
+    CLOSED["gpu"] = 1
+    GATES["std::gpu"] = "gpu"
+    GATES["std::gpu::shader"] = "gpu"
+    GATES["std::gpu::shader::bounds"] = "gpu"
+    GATES["std::gpu::shader::builtins"] = "gpu"
+    GATES["std::gpu::shader::dump"] = "gpu"
+    GATES["std::gpu::shader::entry"] = "gpu"
+    GATES["std::gpu::shader::expr"] = "gpu"
+    GATES["std::gpu::shader::front"] = "gpu"
+    GATES["std::gpu::shader::interp"] = "gpu"
+    GATES["std::gpu::shader::ir"] = "gpu"
+    GATES["std::gpu::shader::job"] = "gpu"
+    GATES["std::gpu::shader::lex"] = "gpu"
+    GATES["std::gpu::shader::msl"] = "gpu"
+    GATES["std::gpu::shader::names"] = "gpu"
+    GATES["std::gpu::shader::spirv"] = "gpu"
+    GATES["std::gpu::shader::translate"] = "gpu"
+    GATES["std::gpu::shader::uniformity"] = "gpu"
     nmod = 0
     TRIGGERS["Iterators (0.14)"] = "Iterator IntoIterator"
     # (0.20: the Iterator trait in std::iter, before its first banner)
@@ -228,6 +248,10 @@ END {
     for (i = 0; i <= count; i++) {
         for (j = 0; j <= count; j++) {
             if (i == j) continue
+            # (0.22) a closed gate's sections are needed only from inside
+            # it: a word elsewhere in std that matches one of its items
+            # (`Block`, `expr`) is not a use of it
+            if ((gate[j] in CLOSED) && gate[i] != gate[j]) continue
             need = 0
             nd = split(keys_list[j], dw, " ")
             for (k = 1; k <= nd && !need; k++) if ((i, dw[k]) in USES) need = 1
@@ -250,7 +274,13 @@ END {
         for (i = 0; i <= count; i++) {
             if (!core[i]) continue
             nd = split(deps[i], dd, " ")
-            for (k = 1; k <= nd; k++) if (!core[dd[k]]) { core[dd[k]] = 1; changed = 1 }
+            for (k = 1; k <= nd; k++) {
+                # (0.22) inside a gated module (its `mod` lines and use
+                # lines are core) a lazy section stays lazy: the loader
+                # reads it, and what it needs, when a program reaches it
+                if (gate[dd[k]] != "" && gate[i] == gate[dd[k]]) continue
+                if (!core[dd[k]]) { core[dd[k]] = 1; changed = 1 }
+            }
         }
     }
     for (i = 0; i <= count; i++) {
@@ -263,7 +293,24 @@ END {
         }
         if (title[i] in TRIGGERS) words = words " " TRIGGERS[title[i]]
         if (!core[i] && gate[i] != "") words = " +" gate[i] words
-        printf "%d %d %d|%s|%s|%s|%s\n", start[i], end_[i], core[i], substr(words, 2), substr(keys_list[i], 2), substr(impls[i], 2), substr(deps[i], 2)
+        items = keys_list[i]
+        # (0.22) a core section inside a gated module (its `mod` line and
+        # use lines) does not need the module's lazy sections: the loader
+        # would read them for every program
+        if (core[i] && gate[i] != "") {
+            nd = split(deps[i], dd, " ")
+            deps[i] = ""
+            for (k = 1; k <= nd; k++) if (core[dd[k]] || gate[dd[k]] != gate[i]) deps[i] = deps[i] " " dd[k]
+        }
+        # (0.22) a closed gate's lazy sections are all read by a program
+        # naming the gate and by no other, so their only word is the gate:
+        # every program's loader then reads a few words of them, not
+        # thousands (the index is read whole for each program)
+        if (!core[i] && (gate[i] in CLOSED)) {
+            words = " +" gate[i] " " gate[i]
+            items = ""
+        }
+        printf "%d %d %d|%s|%s|%s|%s\n", start[i], end_[i], core[i], substr(words, 2), substr(items, 2), substr(impls[i], 2), substr(deps[i], 2)
     }
     # (the titles, for a reader of the index: not read by the compiler)
     for (i = 0; i <= count; i++) printf "# %d %s%s\n", i, title[i], core[i] ? "" : " (lazy)"

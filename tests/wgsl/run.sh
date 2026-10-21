@@ -1,5 +1,5 @@
 #!/bin/sh
-# The shader compiler's tests (lib/wgsl, docs/design/gpu.md §4): every
+# The shader compiler's tests (std::gpu::shader, compiler/std/gpu/shader; docs/design/gpu.md §4): every
 # tests/wgsl/cases/*.wgsl is translated by wgslc and checked:
 #
 #   // ERROR: text     the translation fails with an error containing text
@@ -35,8 +35,8 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/wgsl.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 
 fail=0
-# The compiler: wgslc, from lib/wgsl.
-if ! "$COMPILER" "$ROOT/lib/wgsl/main.tach" -o "$WORK/wgslc" >"$WORK/build.out" 2>&1; then
+# The command line: wgslc, tools/wgslc.
+if ! "$COMPILER" "$ROOT/tools/wgslc/main.tach" -o "$WORK/wgslc" >"$WORK/build.out" 2>&1; then
     echo "FAIL wgsl_build:"
     sed 's/^/    /' "$WORK/build.out"
     exit 1
@@ -154,6 +154,18 @@ for f in "$HERE"/cases/*.wgsl; do
         echo "pass wgsl_$name"
     fi
 done
+# every wgsl.* code the compiler reports has an explanation
+why=""
+for code in $(cat "$ROOT"/compiler/std/gpu/shader/*.tach | grep -o '"wgsl\.[a-z]*"' | tr -d '"' | sort -u); do
+    "$W" explain "$code" >/dev/null 2>&1 || why="$why $code"
+done
+if [ -n "$why" ]; then
+    echo "FAIL wgsl_explain:"
+    echo "    no 'wgslc explain' for:$why"
+    fail=1
+else
+    echo "pass wgsl_explain"
+fi
 [ -n "$METAL" ] || echo "skip wgsl_metal (no Metal on this host)"
 [ -n "$SPIRV_VAL" ] || echo "skip wgsl_spirv_val (no spirv-val on this host)"
 exit $fail
