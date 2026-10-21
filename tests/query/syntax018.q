@@ -3,7 +3,7 @@
 ## an item shown with its clauses, a distinct type, test functions.
 $ items
 crate	syntax018/main.tach	14
-std	<std>	590
+std	<std>	592
 crate::tests	syntax018/main.tach	1
 std::ops	<std>	5
 std::iter	<std>	67
@@ -77,6 +77,7 @@ std::window	<std>	48
 std::window::cocoa	<std>	115
 std::window::keys	<std>	27
 std::window::objc	<std>	88
+std::cli	<std>	71
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6
