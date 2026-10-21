@@ -67,6 +67,8 @@
 #                        ASM(T)'s line; checked only when testing T
 #   // ASM-NOT(T): text  no line containing text between the neighbouring
 #                        ASM(T)s' lines
+#   // TIMEOUT: n why   (0.22) the case may run n times the time limit (a
+#                        long one at -O0, under the gate's load)
 #   // CROSS: T          (0.19) the case is also compiled for target T (at the
 #                        suite's level, to an object: the compiler's own
 #                        assembler; then -S at the CHECK-OPT level, matched
@@ -278,7 +280,9 @@ run_program() {
         exec ./prog $(sed "s|@ROOT@|$ROOT|g" args) <stdin >stdout 2>stderr
     ) &
     pid=$!
-    (sleep "$TIMEOUT" && kill -9 "$pid" 2>/dev/null) >/dev/null 2>&1 &
+    # (0.22: a case's TIMEOUT directive multiplies the limit)
+    limit=$((TIMEOUT * $(cat "$dir/timeout" 2>/dev/null || echo 1)))
+    (sleep "$limit" && kill -9 "$pid" 2>/dev/null) >/dev/null 2>&1 &
     watchdog=$!
     wait "$pid"
     RC=$?
@@ -666,6 +670,10 @@ esac
 case own-try in
     *"$FILTER"*) "$ROOT/tests/own-try/run.sh" -c "$COMPILER" >"$WORK/own-try.out" 2>&1 & ;;
 esac
+# (0.22) std through the own pass (tests/std/own.sh): category "std-own".
+case std-own in
+    *"$FILTER"*) sh "$ROOT/tests/std/own.sh" -c "$COMPILER" >"$WORK/std-own.out" 2>&1 & ;;
+esac
 # (0.24) The language server's sessions (tests/lsp/run.sh): category "lsp".
 case lsp in
     *"$FILTER"*) "$ROOT/tests/lsp/run.sh" -c "$COMPILER" >"$WORK/lsp.out" 2>&1 & ;;
@@ -926,6 +934,19 @@ case own-try in
             count=$((count + 1))
         fi
         grep '^FAIL' "$WORK/own-try.out" >>"$FAILURES"
+        ;;
+esac
+# std's own functions through the own pass (0.22, run above): one case,
+# "std-own"; its findings must be in tests/std/own.allowed.
+case std-own in
+    *"$FILTER"*)
+        if grep -q '^pass std-own' "$WORK/std-own.out"; then
+            echo "std-own pass" >>"$TALLY"
+        else
+            echo "std-own fail" >>"$TALLY"
+            { echo "FAIL std-own:"; sed 's/^/    /' "$WORK/std-own.out"; } >>"$FAILURES"
+        fi
+        count=$((count + 1))
         ;;
 esac
 
