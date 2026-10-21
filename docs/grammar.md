@@ -1879,45 +1879,72 @@ both architectures' code; there is no `cfg`.
   (`arch.multiversion`, naming that version): put it under
   `if std::arch::has("f")`.
 
-## Additions of 0.20: parameter conventions (Phase 0)
+## Additions of 0.20: parameter conventions
 
 The design is [design/conventions.md](design/conventions.md): the
-memory model's spelling becomes tachyon's own, `let` / `inout` / `sink`,
-with 0.17's semantics. Phase 0 reads the new spelling next to the old
-one; the checker's rules (transparent accesses, the call markers'
-errors), the tools, and the migration of std and the tests come with the
-tasks named there.
+memory model's spelling becomes tachyon's own, `let` / `inout` /
+`sink`, with 0.17's semantics. `tachyonc guide memory` teaches it;
+`tachyonc guide rust` maps Rust's spellings onto it.
 
 ```ebnf
-param       = self_param | [ "mut" ] ident ":" [ "sink" ] type [ "=" expr ] ;
-self_param  = [ "inout" | "sink" ] "self" ;              (* or self ":" type, as before *)
-type       += "let" type | "inout" type ;                (* an access: `&T`, `&mut T`; `inout [T]`: `&mut [T]` *)
-fn_type    += "fn" "(" [ [ "sink" ] type { "," [ "sink" ] type } ] ")" [ "->" type ] ;
-stmt       += "var" pattern [ ":" type ] "=" expr ";"   (* let mut *)
-            | "inout" ident [ ":" type ] "=" expr ";" ;  (* let x = &mut place *)
-single     += "var" ident ;                             (* mut ident *)
-static_decl = "static" [ "mut" | "var" ] ident ":" type "=" expr ";" ;
-closure    += "sink" closure ;                          (* move *)
+param       = self_param | ident ":" [ convention ] type [ "=" expr ] ;
+self_param  = [ "inout" | "sink" ] "self" | "self" ":" [ convention ] type ;
+convention  = "let" | "inout" | "sink" ;               (* let is the default; fmt does not write it *)
+type       += "let" type | "inout" type ;              (* an access: a field, a result, a type argument, a fn type *)
+fn_type     = "fn" "(" [ [ convention ] type { "," [ convention ] type } ] ")" [ "->" type ] ;
+stmt       += "var" pattern [ ":" type ] "=" expr ";"
+            | "inout" ident [ ":" type ] "=" expr ";" ;  (* expr: "&" place, or an inout access *)
+single     += "var" ident ;                             (* replaces "mut" ident *)
+fpat        = [ "var" ] ident | ident ":" pattern ;
+static_decl = "static" [ "var" ] ident ":" type "=" expr ";" ;
+prefix     += "&" pratt(25) ;                           (* an inout access of a place; no "&" "mut" *)
+closure     = [ "sink" ] "|" params "|" expr ;          (* replaces "move" *)
+match_expr += "match" "&" expr "{" arms "}" ;           (* binds inout accesses *)
 ```
 
-- `inout`, `sink` and `var` are words only where these rules put them;
-  elsewhere they are identifiers (`let var = 1; var(a, b)`), until 0.21
-  makes them keywords. `set` is not a convention: `x: set T` is
-  `conv.set`, and `sink T` outside a parameter `conv.sink_type`.
-- Until T1, an access is the reference it was: `x: inout T` is `x: &mut
-  T`, `x: let T` and `self` are `&T` / `&Self`, `x: sink T` is a mutable
-  by-value `T`, `inout r = &x;` is `let r = &mut x;`. `&x` is the inout
-  marker: where an exclusive reference is wanted it is one (`fill(&v)`
-  for `v: inout Vec<i64>`, or `&mut Vec<i64>`); elsewhere it is shared,
-  as before.
+- **Conventions.** A `let` parameter (the default) is read-only: a copy
+  of a plain or copyable value, otherwise a borrow for the call (a
+  temporary argument lives to the end of the statement). An `inout`
+  parameter is an exclusive access, and its argument is marked `&place`
+  (`conv.marker` without it, `conv.marker_extra` on a let or sink
+  argument, `conv.place` on a temporary). A `sink` parameter owns its
+  value and is mutable; an owned argument moves into it. Receivers are
+  `self`, `inout self` and `sink self` and are lent without `&`.
+  Defaults are allowed on let and sink parameters. In `extern "C"`
+  signatures `inout` and `sink` are `conv.extern`.
+- **Accesses are used as their values.** A let or inout parameter, an
+  `inout x = &place;` local, a `let x = part;` that borrows, and an
+  access field (`q: inout Query`) are read, written (`x = v`, `x += 1`)
+  and called through as the value they designate; `&x` passes one on.
+  `*` is only for raw pointers: `*x` on an access is `conv.rust`. An
+  access cannot be re-pointed.
+- **Bindings.** `let x = e` owns a temporary or a whole local it takes
+  (which moves) and borrows a part it cannot take (an element, a field
+  through an access); `var x = e` is mutable and always owns (a part is
+  `own.move_out`).
+- **Types.** `[T]` is a let access to elements; `inout [T]` is the
+  exclusive writable slice. A struct with an access field is a view; one
+  with an `inout` field is move-only.
+- **Words.** `var`, `inout` and `sink` are words only where these rules
+  put them; elsewhere they are identifiers (`let var = 1; var(a, b)`),
+  until 0.21 makes them keywords. `set` is not a convention: `x: set T`
+  is `conv.set`, and `sink T` outside a parameter `conv.sink_type`.
+  Rust's spellings (`&T`, `&mut T`, `&mut x`, `&self`, `let mut`, `mut
+  x`, `static mut`, `move`, `*r` on an access) are `conv.rust`, each
+  with the new form in a `try:` line; `tachyonc fix --only conventions`
+  rewrites a program.
+- Not yet: results that are accesses (`-> let T`, `-> inout T`,
+  `Option<inout V>`) and `for inout x in &v`; until they land,
+  `get_or_insert(k, v)` and `get_mut(k)` give one-element views
+  (`[0] += 1`).
 - **Modes.** A file is read *mixed* (both spellings; the default until
   Phase M), in *0.20's* spelling (`--syntax=0.20`: Rust's spellings are
-  `conv.rust`, each with its 0.20 form in a `try:` line, and `&x` is
-  always exclusive), or in *0.19's* (a crate whose root's first line is
-  `// tachyon-syntax: 0.19`: 0.20's spelling is `syntax.legacy`). Only
-  compiler/src/main.tach carries that line, during 0.20, so that v0.19.1
-  can build it; tests/run.sh fails if another file does. std and the
-  compiler's generated sources are read mixed.
+  `conv.rust`, and `&x` is always exclusive), or in *0.19's* (a crate
+  whose root's first line is `// tachyon-syntax: 0.19`: 0.20's spelling
+  is `syntax.legacy`). Only compiler/src/main.tach carries that line,
+  during 0.20, so that v0.19.1 can build it; tests/run.sh fails if
+  another file does. std and the compiler's generated sources are read
+  mixed until Phase M migrates them.
 
 ## Importing C headers
 
