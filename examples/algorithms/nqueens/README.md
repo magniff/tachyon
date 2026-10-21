@@ -54,8 +54,8 @@ operators are C's, and `~` is the integer NOT (`!` is for `bool`):
 ```tach
 fn count(all: u64, cols: u64, left: u64, right: u64) -> i64 {
     if cols == all { return 1; }
-    let mut free = all & ~(cols | left | right);
-    let mut total = 0;
+    var free = all & ~(cols | left | right);
+    var total = 0;
     while free != 0 {
         let bit = free & (0 - free);          // the lowest free column
         free ^= bit;
@@ -83,12 +83,12 @@ if n % 2 == 1 { ... the middle column, once ... }
 
 **One board** comes from `first`, the same search writing each row's
 column into a slice and stopping at the first complete board. An array
-`[0; 8]` is passed as `queens[..]`, a slice that the function writes
-through:
+`[0; 8]` is passed as `&queens[..]`, a slice that the function writes
+through (an `inout [i64]` parameter, so the call marks it with `&`):
 
 ```tach
-let mut queens = [0; 8];
-if first(8, 0, 0, 0, 0, queens[..]) { ... draw(queens[..]); }
+var queens = [0; 8];
+if first(8, 0, 0, 0, 0, &queens[..]) { ... draw(queens[..]); }
 ```
 
 `draw` uses `if` as an expression inside the call:

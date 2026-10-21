@@ -38,7 +38,7 @@ line, `error CODE: message`, then `try:` lines: commands to run as they
 are, for example
 
 ```text
-error patch.no-match: OLD 1 is not in crate::largest; nearest, line 52: let mut best = 0;
+error patch.no-match: OLD 1 is not in crate::largest; nearest, line 52: var best = 0;
 try: tachyonc query show main.tach:52
 ```
 

@@ -8,9 +8,9 @@ counts are sorted by a hand-written `Ord`.
 std declares the methods of these three traits `#[pure]`:
 
 ```tach
-pub trait Eq { #[pure] fn eq(self: &Self, other: &Self) -> bool; }
-pub trait Ord { #[pure] fn cmp(self: &Self, other: &Self) -> i64; }
-pub trait Hash { #[pure] fn hash(self: &Self) -> u64; }
+pub trait Eq { #[pure] fn eq(self, other: Self) -> bool; }
+pub trait Ord { #[pure] fn cmp(self, other: Self) -> i64; }
+pub trait Hash { #[pure] fn hash(self) -> u64; }
 ```
 
 A declaration on a trait's method binds every impl of it, the program's

@@ -5,10 +5,10 @@ operations take closures, and each closure parameter's bound says what
 the closure may do, with `+ effects(...)` after the `Fn` type:
 
 ```tach
-pub fn map_values<F: Fn(i64) -> i64 + effects(panic)>(rows: &mut [Row], f: F)
-pub fn partition<F: Fn(&Row) -> bool + effects()>(rows: &mut [Row], keep: F) -> i64
-pub fn sort_by_key<F: Fn(&Row) -> i64 + effects(panic)>(rows: &mut [Row], key: F)
-pub fn each<F: FnMut(&Row)>(rows: [Row], f: F)
+pub fn map_values<F: Fn(i64) -> i64 + effects(panic)>(rows: inout [Row], f: F)
+pub fn partition<F: Fn(let Row) -> bool + effects()>(rows: inout [Row], keep: F) -> i64
+pub fn sort_by_key<F: Fn(let Row) -> i64 + effects(panic)>(rows: inout [Row], key: F)
+pub fn each<F: FnMut(let Row)>(rows: [Row], f: F)
 ```
 
 A library that calls your closure decides how often, and in which

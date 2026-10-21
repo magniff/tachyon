@@ -69,7 +69,7 @@ place. `for (from, _) in edges` destructures each pair; an `i32` indexes
 a slice directly:
 
 ```tach
-let mut start = Vec::filled_in(n + 1, 0, gpa);
+var start = Vec::filled_in(n + 1, 0, gpa);
 let s = start.as_slice();
 for (from, _) in edges { s[from + 1] += 1; }
 for v in 0..n { s[v + 1] += s[v]; }
@@ -83,7 +83,7 @@ number of nodes it could not place. The output `Vec` is also the
 queue: the nodes before `head` are done, the ones after it wait:
 
 ```tach
-let mut head = 0;
+var head = 0;
 while head < order.len() {
     let v = order.get(head);
     head += 1;
@@ -119,7 +119,7 @@ parse and once (inside `order`) on the sort:
 enum PlanError { Syntax([u8]), Cycle(Vec<[u8]>) }
 
 fn plan_order(lines: [[u8]], gpa: Gpa) -> Result<Vec<[u8]>, PlanError> {
-    let mut plan = Plan::parse(lines, gpa)?;
+    var plan = Plan::parse(lines, gpa)?;
     defer plan.free();
     plan.order(gpa) // the names are views of `lines`, not of the plan
 }
@@ -127,10 +127,11 @@ fn plan_order(lines: [[u8]], gpa: Gpa) -> Result<Vec<[u8]>, PlanError> {
 
 The sort's error is a `Cycle` of node numbers; `order` turns it into a
 `PlanError::Cycle` of task names with `map_err` and a closure that
-captures the plan, then `?` returns it:
+captures the plan (`order` and `named` only read it: `self`, a `let`
+receiver), then `?` returns it:
 
 ```tach
-let mut order = sort(&g, gpa).map_err(|c| self.named(c, gpa))?;
+var order = sort(g, gpa).map_err(|c| self.named(c, gpa))?;
 Ok(order.iter().map(|v| self.names.get(v)).collect_in(gpa))
 ```
 

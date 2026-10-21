@@ -42,9 +42,9 @@ ok: built wordstat
 ## 1. A deprecated helper becomes a method
 
 `buf_add(&$b, $s)` matches any call of `buf_add` with two arguments,
-the first lent inout (`&`), and `$b.push_str($s)` puts each argument's
-exact text back where its hole is. `--dry-run` prints the diff without
-writing it:
+the first lent inout (`&b`), and `$b.push_str($s)` puts each argument's
+exact text back where its hole is (a method call lends its receiver
+itself, so the `&` goes). `--dry-run` prints the diff without writing it:
 
 ```console
 $ tachyonc rewrite 'buf_add(&$b, $s)' '$b.push_str($s)' --dry-run | head -12

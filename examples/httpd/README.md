@@ -108,10 +108,10 @@ if let Some(n) = length {
 frees each buffer when its block ends, whichever `return` is taken:
 
 ```tach
-fn handle_request(fd: i32, system: System, root: [u8]) {
+fn handle_request(fd: i32, system: System, root: [u8], gpa: Gpa) {
     defer unsafe { close(fd) };
     ...
-    let mut path = Path::join(root, url);
+    var path = Path::join(root, url, gpa);
     defer path.free();
 ```
 
@@ -122,7 +122,7 @@ extension) are ordinary safe code over slices, with `match` on bytes and
 ## Language features
 
 - `extern "C"` declarations, `#[repr(C)]` structs, raw pointers: `tachyonc guide c-interop`
-- `unsafe` blocks, borrows: `tachyonc guide unsafe`
+- `unsafe` blocks, raw pointers: `tachyonc guide unsafe`
 - inline modules (`mod sys { ... }`), `pub`, `use super::`: `tachyonc guide modules`
 - `defer`, `Buf`: `tachyonc guide memory`
 - `Result`, `Option`, `if let`: `tachyonc guide conversions`

@@ -35,7 +35,7 @@ ok: built bank
 ### Reorder
 
 `transfer(l, amount, from, to)` reads badly at its calls:
-`transfer(&mut l, 1000, 2, 1)`. Its calls, by kind:
+`transfer(&l, 1000, 2, 1)`. Its calls, by kind:
 
 ```console
 $ tachyonc query refs transfer --kind call
@@ -272,7 +272,7 @@ $ git diff --stat
 ## Why not by hand
 
 - A reordered parameter is the change a text edit gets silently wrong:
-  `transfer(l, n, who, to)` and `transfer(l, who, to, n)` both compile,
+  `transfer(&l, n, who, to)` and `transfer(&l, who, to, n)` both compile,
   with every amount and account id swapped. The tool moves each call's
   arguments with the parameters, by position or by label.
 - A removed parameter is checked against its uses first; a removed

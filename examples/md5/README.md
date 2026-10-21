@@ -47,13 +47,13 @@ of bytes, and `finish` pads the message and returns the digest as a
 struct Md5 { state: [u32; 4], block: [u8; 64], used: i64, total: u64 }
 
 impl Md5 {
-    fn update(self: &mut Md5, data: [u8]) { ... }
-    fn finish(self: &mut Md5) -> [u8; 16] { ... }
+    fn update(inout self, data: [u8]) { ... }
+    fn finish(inout self) -> [u8; 16] { ... }
 }
 ```
 
-Methods take `self: &mut Md5`, an exclusive reference, to change the
-state in place; `hash.update(...)` passes `&mut hash` itself.
+Methods take `inout self`, an exclusive access, to change the state in
+place; `hash.update(...)` lends `hash` itself.
 
 **Slices of an array.** `compress` gets each block as a slice,
 `data[at..at + 64]`, a view (pointer and length) into the bytes read: no

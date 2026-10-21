@@ -60,8 +60,8 @@ once, so the grammar reads as it would without errors:
 
 ```tach
 // term: unary (('*' | '/' | '%') unary)*
-fn term(self: &mut Parser) -> Result<i64, Error> {
-    let mut value = self.unary()?;
+fn term(inout self) -> Result<i64, Error> {
+    var value = self.unary()?;
     loop {
         let op = self.peek();
         match op {
@@ -91,8 +91,8 @@ character, and `{t}` uses `Token`'s own `Display`:
 
 ```tach
 impl Display for Error {
-    fn fmt(self: &Error, f: &mut Fmt) {
-        match *self {
+    fn fmt(self, f: inout Fmt) {
+        match self {
             BadChar(c) => f.write(f"unexpected character '{c:c}'"),
             Unexpected(t) => f.write(f"unexpected {t}"),
             DivideByZero => f.str("division by zero"),

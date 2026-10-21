@@ -258,6 +258,16 @@ pub fn coerce_ref(n: i64, actual: i64, expected: i64) -> bool {
             wrap_unary(n, Tok::Amp, expected);
             return true;
         }
+        if ek == TyKind::Ptr && TYPES[expected].b == REF_SHARED && TYPES[expected].a == actual
+            && NODES[n].kind == NodeKind::Closure
+            && (NODES[n].c & crate::front::ast::CLOSURE_MOVE) == 0 {
+            // (0.20) a closure, made here, given to a let parameter that
+            // borrows it (one that captures an inout access, so is no copy):
+            // its environment is the caller's, lent for the call; it owns
+            // nothing (it captures by reference), so nothing drops
+            wrap_unary(n, Tok::Amp, expected);
+            return true;
+        }
         if ek == TyKind::Ptr && TYPES[expected].b == REF_MUT && TYPES[expected].a == actual
             && NODES[n].start == NODES[n].end && crate::front::check::assign::is_place(n) {
             // (0.20) a place the checker passes on where an exclusive
@@ -313,6 +323,9 @@ pub fn coerce_ref(n: i64, actual: i64, expected: i64) -> bool {
                 // `&s`: s itself
                 let operand = NODES[n].b;
                 let flags = NODES[n].p;
+                // (0.20: the `&`, for `fix --only conventions`)
+                crate::front::conv::SLICE_AMPS.push(NODES[n].start);
+                crate::front::conv::SLICE_AMPS.push(NODES[operand].start);
                 NODES[n] = NODES[operand];
                 NODES[n].p |= flags & NODE_REF_MUT;
             } else {
@@ -456,11 +469,16 @@ fn readonly_slice_arg(n: i64, actual: i64) {
         err_begin(NODES[n].start);
         err_fmt(f"'{text}', a '");
         err_type(actual);
-        err_str(c"', is read-only where '&mut [");
+        let legacy = crate::front::conv::LEGACY_ROOT;
+        err_str(if legacy { c"', is read-only where '&mut [" }
+            else { c"', is read-only where 'inout [" });
         err_type(TYPES[actual].a);
         err_str(c"]' is expected: the callee writes through it");
-        err_help(
-            c"pass an exclusive view: '&mut a[..]', 'v.as_mut_slice()', or a '&mut [T]' parameter");
+        err_help(if legacy {
+            c"pass an exclusive view: '&mut a[..]', 'v.as_mut_slice()', or a '&mut [T]' parameter"
+        } else {
+            c"pass it inout: '&a[..]', '&v', or an 'inout [T]' parameter passed on as '&s'"
+        });
         let new = buf_new();
         // `sort(v.as_slice())`, `sort(a[..])`: the method, `v.sort()`
         let s = NODES[n].start;
@@ -475,7 +493,7 @@ fn readonly_slice_arg(n: i64, actual: i64) {
             err_try_fmt(buf_slice(call));
             err_fix(s - 5, e + 1, buf_slice(call));
         } else if NODES[n].kind == NodeKind::Index && fresh_slice(n) {
-            buf_str(new, c"&mut ");
+            buf_str(new, if legacy { c"&mut " } else { c"&" });
             buf_bytes(new, text);
         } else if text.len > 11 && text[text.len - 11..text.len] == ".as_slice()" {
             buf_bytes(new, text[0..text.len - 10]);
@@ -514,7 +532,7 @@ fn readonly_slice_arg(n: i64, actual: i64) {
                     ERR_KIND = saved;
                     return;
                 }
-                buf_str(a, c" '&mut ");
+                buf_str(a, if legacy { c" '&mut " } else { c" 'inout " });
                 if written > 0 {
                     buf_bytes(a, SRC[NODES[written].start..NODES[written].end]);
                 } else {
