@@ -9,7 +9,8 @@
 # of the tree, and formatting changes no program, 0.13) and
 # tests/walkthrough/run.sh (the sessions of examples/tools/*/README.md,
 # 0.15, and of every examples/GROUP/NAME/README.md with one, 0.16) and
-# tests/own-try/run.sh (the own pass's try: lines run, 0.17). POSIX sh and awk only, so it runs the same on macOS and Linux.
+# tests/own-try/run.sh (the own pass's try: lines run, 0.17) and
+# tests/lsp/run.sh (`tachyonc lsp`'s sessions, 0.24). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-d FORMAT] [FILTER]
 #
@@ -602,6 +603,18 @@ fi
 if [ -x "$ROOT/compiler/arch/embed.sh" ] && ! "$ROOT/compiler/arch/embed.sh" -c; then
     exit 1
 fi
+# (0.20, docs/design/conventions.md §9.3) The bootstrap's pragma, a root's
+# first line `// tachyon-syntax: 0.19` (the crate is read in 0.19's
+# spelling), only in compiler/src/main.tach and the legacy mode's own
+# tests (tests/run/conv_legacy*).
+LEGACY_FILES=$(find "$ROOT/compiler" "$ROOT/tests" "$ROOT/examples" "$ROOT/bench" \
+    -name '*.tach' -type f -exec awk 'FNR == 1 && /^\/\/ tachyon-syntax: 0\.19/ { print FILENAME }' {} + \
+    2>/dev/null | grep -v -e "^$ROOT/compiler/src/main.tach\$" -e "^$ROOT/tests/run/conv_legacy")
+if [ -n "$LEGACY_FILES" ]; then
+    echo "error: the bootstrap's pragma '// tachyon-syntax: 0.19' is only for compiler/src/main.tach (docs/design/conventions.md §9.3):" >&2
+    echo "$LEGACY_FILES" >&2
+    exit 1
+fi
 
 # The optimizer's rewrite rules, on random values (0.9).
 if "$COMPILER" --check-rules >"$WORK/rules.out" 2>&1; then :; else
@@ -646,6 +659,10 @@ case walkthrough in
 esac
 case own-try in
     *"$FILTER"*) "$ROOT/tests/own-try/run.sh" -c "$COMPILER" >"$WORK/own-try.out" 2>&1 & ;;
+esac
+# (0.24) The language server's sessions (tests/lsp/run.sh): category "lsp".
+case lsp in
+    *"$FILTER"*) "$ROOT/tests/lsp/run.sh" -c "$COMPILER" >"$WORK/lsp.out" 2>&1 & ;;
 esac
 # (0.18.1) The agent hooks' cases (tools/agent-hooks/test-*.py, Python;
 # skipped without python3): category "hooks".
@@ -732,6 +749,24 @@ case query in
             count=$((count + 1))
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/query.out" >>"$FAILURES"
+        ;;
+esac
+
+# `tachyonc lsp` (0.24): tests/lsp/run.sh (run above), its sessions and
+# its check on the compiler's own source; category "lsp".
+case lsp in
+    *"$FILTER"*)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "lsp pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "lsp fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/lsp.out"
+        if ! grep -q '^pass' "$WORK/lsp.out"; then
+            echo "lsp fail" >>"$TALLY"
+            count=$((count + 1))
+        fi
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/lsp.out" >>"$FAILURES"
         ;;
 esac
 

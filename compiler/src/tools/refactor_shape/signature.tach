@@ -325,7 +325,7 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
         let mut opts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         let example = c"NAME --add 'x: i64 = 0' --dry-run";
         let options =
-            c"--add=1 --at=1 --remove=1 --rename-param=2 --reorder=1 --type=2 --default=1 --fill-calls=0";
+            c"--add=1 --at=1 --remove=1 --rename-param=2 --reorder=1 --type=2 --default=1 --fill-calls=0 --convention=2";
         if !take_args(argc, argv, options, &root, &mut words, &mut opts) {
             return 2;
         }
@@ -339,11 +339,25 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
         let rename = opt(&opts, c"--rename-param", false);
         let reorder = opt(&opts, c"--reorder", false);
         let retype = opt(&opts, c"--type", false);
+        // (0.20) `--convention x let|inout|sink`
+        let convention = opt(&opts, c"--convention", false);
         let actions = (add != 0 as *u8) as i64 + (remove != 0 as *u8) as i64 + (rename != 0 as *u8) as i64
-            + (reorder != 0 as *u8) as i64 + (retype != 0 as *u8) as i64;
+            + (reorder != 0 as *u8) as i64 + (retype != 0 as *u8) as i64
+            + (convention != 0 as *u8) as i64;
         if actions != 1 {
-            return usage_error(c"one of --add, --remove, --rename-param, --reorder, --type",
+            return usage_error(
+                c"one of --add, --remove, --rename-param, --reorder, --type, --convention",
                 example);
+        }
+        let mut conv = 0;
+        if convention != 0 as *u8 {
+            let w = opt(&opts, c"--convention", true);
+            conv = if streq(w, c"let") { 1 } else if streq(w, c"inout") { 2 }
+                else if streq(w, c"sink") { 3 } else { 0 };
+            if conv == 0 {
+                return usage_error(c"--convention takes a parameter and let, inout or sink",
+                    c"NAME --convention x inout");
+            }
         }
         if at != 0 as *u8 && add == 0 as *u8 {
             return usage_error(c"--at goes with --add", example);
@@ -724,6 +738,26 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
                 buf_str(e, c")\n");
             }
             buf_str(what, c"reordered the parameters of ");
+        } else if convention != 0 as *u8 {
+            let pname = intern(c_slice(convention));
+            let k = param_index(f, pname);
+            if k < 0 {
+                return no_param(d, f, convention);
+            }
+            let changed = convention_edits(&group, &calls, f, k, conv, self_param);
+            buf_str(what, c"made parameter ");
+            buf_bytes(what, sym_text(pname));
+            buf_str(what, c" ");
+            buf_str(what, opt(&opts, c"--convention", true));
+            buf_str(what, c" in ");
+            if changed > 0 {
+                buf_bytes(what, fqn);
+                buf_str(what, c", ");
+                put_count(what, changed, c"argument", c"arguments");
+                buf_str(what, c" in ");
+                put_count(what, calls.count, c"call", c"calls");
+                fqn = c_slice(c"");
+            }
         } else {
             let pname = intern(c_slice(retype));
             let k = param_index(f, pname);
@@ -739,7 +773,17 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
             for g in 0..group.count {
                 let p = pchild(DEFS[group.data[g]].node, k);
                 let t = pb(p);
-                edit_replace(pstart(t), pend(t), text_buf(ty));
+                // (0.20: `x: sink T`, whose `sink` is before the type node)
+                let mut ts = pstart(t);
+                if (crate::tools::rewrite::parsed::pflags(p) & crate::front::ast::CONV_SINK) != 0 {
+                    while ts > pstart(p) && SRC[ts - 1] != ':' {
+                        ts -= 1;
+                    }
+                    while SRC[ts] == ' ' {
+                        ts += 1;
+                    }
+                }
+                edit_replace(ts, pend(t), text_buf(ty));
             }
             let mut changed = 0;
             if default == 0 as *u8 && auto != RC_NONE {
@@ -801,7 +845,8 @@ fn signature_inner(argc: i64, argv: **u8) -> i64 {
             buf_str(what, c" and ");
             put_count(what, group.count - 1, c"other definition", c"other definitions");
         }
-        if rename == 0 as *u8 && (retype == 0 as *u8 || default != 0 as *u8) {
+        if rename == 0 as *u8 && convention == 0 as *u8
+            && (retype == 0 as *u8 || default != 0 as *u8) {
             buf_str(what, c", ");
             put_count(what, calls.count, c"call", c"calls");
         }
@@ -879,12 +924,13 @@ const RC_REF_MUT: i64 = 3;
 const RC_MUT_SLICE: i64 = 4;
 
 fn ref_change(old: i64, ty: [u8]) -> i64 {
-    let to_mut = unsafe { starts(ty, c_slice(c"&mut ")) };
+    // (0.20: `inout T` is `&mut T`, and its calls are marked `&x`)
+    let to_mut = unsafe { starts(ty, c_slice(c"&mut ")) || starts(ty, c_slice(c"inout ")) };
     let to_ref = !to_mut && ty.len > 1 && ty[0] == '&' && ty[1] != '&';
     if !to_mut && !to_ref {
         return RC_NONE;
     }
-    let mut rest = if to_mut { 5 } else { 1 };
+    let mut rest = if ty[0] == 'i' { 6 } else if to_mut { 5 } else { 1 };
     while rest < ty.len && ty[rest] == ' ' {
         rest += 1;
     }
@@ -907,6 +953,24 @@ fn starts(s: [u8], p: [u8]) -> bool {
 fn ref_argument(how: i64, arg: [u8]) -> i64 {
     unsafe {
         let out = buf_new();
+        // (0.20: the inout marker is `&x`, but in the crate read in 0.19's
+        // spelling)
+        let marker = if crate::front::conv::LEGACY_ROOT { c"&mut " } else { c"&" };
+        if how == RC_MUT && !crate::front::conv::LEGACY_ROOT {
+            // (a let argument, `x`, becomes `&x`; `&x` is the marker already)
+            if starts(arg, c_slice(c"&")) {
+                return -1;
+            }
+            buf_str(out, c"&");
+            if plain_text(arg) {
+                buf_bytes(out, arg);
+            } else {
+                buf_byte(out, '(');
+                buf_bytes(out, arg);
+                buf_byte(out, ')');
+            }
+            return out;
+        }
         if how == RC_MUT {
             if starts(arg, c_slice(c"&mut ")) || !starts(arg, c_slice(c"&"))
                 || starts(arg, c_slice(c"&&")) {
@@ -925,7 +989,7 @@ fn ref_argument(how: i64, arg: [u8]) -> i64 {
             }
             if !starts(arg, c_slice(c"&")) && arg.len > 2 && arg[arg.len - 1] == ']'
                 && find_byte(arg, '.') >= 0 && find_dots(arg) {
-                buf_str(out, c"&mut ");
+                buf_str(out, marker);
                 buf_bytes(out, arg);
                 return out;
             }
@@ -935,7 +999,7 @@ fn ref_argument(how: i64, arg: [u8]) -> i64 {
             if starts(arg, c_slice(c"&")) {
                 return -1;
             }
-            buf_str(out, if how == RC_REF { c"&" } else { c"&mut " });
+            buf_str(out, if how == RC_REF { c"&" } else { marker });
             if plain_text(arg) {
                 buf_bytes(out, arg);
             } else {
@@ -947,6 +1011,141 @@ fn ref_argument(how: i64, arg: [u8]) -> i64 {
         }
         -1
     }
+}
+
+// (0.20) `--convention x let|inout|sink` (docs/design/conventions.md §10.1):
+// parameter k of each function of the group takes convention conv (1 let,
+// 2 inout, 3 sink), written in the crate's spelling (0.19's in the legacy
+// one: `&T`, `&mut T`, `T`); the calls' arguments get `&` for inout and
+// lose it for let and sink (`&mut x` / `&x` / `x` in 0.19's). The number
+// of arguments changed.
+fn convention_edits(group: &IntVec, calls: &IntVec, f: i64, k: i64, conv: i64,
+    self_param: bool) -> i64 {
+    unsafe {
+        let legacy = crate::front::conv::LEGACY_ROOT;
+        for g in 0..group.count {
+            let gf = DEFS[group.data[g]].node;
+            let p = pchild(gf, k);
+            let t = pb(p);
+            if t <= 0 {
+                continue;
+            }
+            let out = buf_new();
+            let receiver = k == 0 && self_param;
+            if receiver && !legacy {
+                buf_str(out,
+                    if conv == 2 { c"inout self" } else if conv == 3 { c"sink self" }
+                    else { c"self" });
+            } else {
+                buf_bytes(out, sym_text(pa(p)));
+                buf_str(out, c": ");
+                if legacy {
+                    buf_str(out,
+                        if conv == 2 { c"&mut " }
+                        else if conv == 1 && pk(t) != NodeKind::TySlice { c"&" } else { c"" });
+                } else {
+                    // (a let in a file read mixed is written: `x: T` is 0.19's by-value
+                    // parameter there)
+                    let mixed = !crate::front::conv::strict_at(pstart(p));
+                    buf_str(out,
+                        if conv == 2 { c"inout " } else if conv == 3 { c"sink " }
+                        else if mixed && pk(t) != NodeKind::TySlice { c"let " } else { c"" });
+                }
+                buf_bytes(out, base_type_text(t));
+            }
+            edit_replace(pstart(p), pend(t), out);
+        }
+        let mut changed = 0;
+        for i in 0..calls.count {
+            let c = calls.data[i];
+            list_of_node(c);
+            let off = if pk(c) == NodeKind::MethodCall && self_param { 1 } else { 0 };
+            if k < off {
+                // (the receiver of `x.m()`: lent by the checker)
+                continue;
+            }
+            let i0 = arg_for(f, c, k, off);
+            if i0 < 0 {
+                continue;
+            }
+            let mut v = pchild(c, i0);
+            if pk(v) == NodeKind::NamedArg {
+                v = pb(v);
+            }
+            let arg = SRC[pstart(v)..pend(v)];
+            let bare = strip_marker(arg);
+            let nb = buf_new();
+            if conv == 2 {
+                buf_str(nb, if legacy { c"&mut " } else { c"&" });
+                if plain_text(bare) || no_blank(bare) {
+                    buf_bytes(nb, bare);
+                } else {
+                    buf_byte(nb, '(');
+                    buf_bytes(nb, bare);
+                    buf_byte(nb, ')');
+                }
+            } else if conv == 1 && legacy && pk(pb(pchild(f, k))) != NodeKind::TySlice {
+                buf_str(nb, c"&");
+                buf_bytes(nb, bare);
+            } else {
+                buf_bytes(nb, bare);
+            }
+            if !bytes_eq(buf_slice(nb), arg) {
+                edit_replace(pstart(v), pend(v), nb);
+                changed += 1;
+            }
+        }
+        changed
+    }
+}
+
+// The text of type node t without its access: `T` of `&T`, `&mut T`,
+// `let T`, `inout T`; `[T]` of `&[T]`, `inout [T]`.
+fn base_type_text(t: i64) -> [u8] {
+    unsafe {
+        let s = SRC[pstart(t)..pend(t)];
+        if pk(t) == NodeKind::TyPtr && SRC[pstart(t)] != '*' && pa(t) > 0 {
+            return SRC[pstart(pa(t))..pend(pa(t))];
+        }
+        if pk(t) == NodeKind::TySlice {
+            let open = find_byte(s, '[');
+            if open > 0 {
+                return s[open..s.len];
+            }
+        }
+        s
+    }
+}
+
+// arg without a leading `&mut ` or `&`.
+fn strip_marker(arg: [u8]) -> [u8] {
+    unsafe {
+        if starts(arg, c_slice(c"&&")) || !starts(arg, c_slice(c"&")) {
+            return arg;
+        }
+        let mut i = 1;
+        if starts(arg[1..arg.len], c_slice(c"mut ")) {
+            i = 5;
+        }
+        while i < arg.len && arg[i] == ' ' {
+            i += 1;
+        }
+        arg[i..arg.len]
+    }
+}
+
+fn no_blank(s: [u8]) -> bool {
+    if s.len == 0 {
+        return false;
+    }
+    for i in 0..s.len {
+        let c = s[i];
+        if c == ' ' || c == '+' || c == '-' || c == '*' || c == '/' || c == '<' || c == '>'
+            || c == '=' || c == '|' || c == '&' || c == '%' || c == '^' {
+            return false;
+        }
+    }
+    true
 }
 
 // Whether arg holds `..` (a range: `a[i..j]`).

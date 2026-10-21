@@ -1,0 +1,296 @@
+// (0.20) Parameter conventions, the front (docs/design/conventions.md,
+// "Phase 0 contract"): which spelling a file is read in, Rust's spellings
+// recognized with their 0.20 form, and what a parameter's convention is.
+//
+// A file is read in one of three ways:
+// - mixed (the default until Phase M): 0.19's spelling and 0.20's both,
+//   each with its meaning; `&x` is a shared reference, except where an
+//   exclusive one is wanted (the inout marker, check_mode: inout_marker);
+// - 0.20 (`--syntax=0.20`, the default from Phase M): 0.20's spelling
+//   only; Rust's (`&T`, `&mut x`, `let mut`, `static mut`, `mut x:`, `move
+//   ||`) is `conv.rust`, and `&x` is the inout marker;
+// - 0.19 (legacy): the crate whose root's first line is LEGACY_MARKER,
+//   compiler/src during 0.20 (the bootstrap, §9.3): 0.19's spelling only,
+//   0.20's is `syntax.legacy`. tests/run.sh checks that no other file
+//   carries the line (but the legacy mode's own tests, conv_legacy_*).
+// std and the compiler's generated sources (`<check>`, ...) are read
+// mixed whatever the root says, until Phase M migrates them.
+
+use crate::base::{
+    FILES, FILE_COUNT, SRC, SYMS, buf_bytes, buf_int, buf_new, buf_slice, buf_str, streq,
+};
+use crate::base::diag::{
+    ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_try_tool,
+};
+use crate::front::ast::{CONV_INOUT, CONV_NEW, CONV_SINK, NODES, NODE_REF_MUT, NodeKind, child};
+use crate::front::lexer::{TOKS, Tok};
+use crate::front::modules::{file_of_pos, within_std};
+use crate::front::types::FNS;
+
+// The first line that makes a crate legacy (its root file's first bytes).
+pub const LEGACY_MARKER: [u8] = "// tachyon-syntax: 0.19";
+
+// `--syntax=0.20` (main's arguments, every command): 0.20's spelling only.
+pub static mut STRICT: bool = false;
+// The root file starts with LEGACY_MARKER (set by conv_setup).
+pub static mut LEGACY_ROOT: bool = false;
+
+// A parameter's convention (param_conv): CONV_LEGACY is a parameter
+// written in 0.19's spelling (by value, `&T`, `&mut T`, `*T`: its type
+// says how it is taken).
+pub const CONV_LEGACY: i64 = 0;
+pub const CONV_LET: i64 = 1;
+pub const CONV_IN_OUT: i64 = 2;
+pub const CONV_SINK_K: i64 = 3;
+
+// The codes (conventions.md §10.1; tools/explain/conv_table.tach). Phase
+// 0 reports the parser's: CODE_RUST, CODE_SET, CODE_SINK_TYPE,
+// CODE_LEGACY; T1 the checker's: CODE_MARKER (an inout argument without
+// `&`), CODE_MARKER_EXTRA (`&` on a let or sink argument), CODE_PLACE (`&`
+// of a temporary), CODE_EXTERN (`inout`/`sink` in an extern "C"
+// signature); 0.21 CODE_LEGACY_REMOVED.
+pub const CODE_RUST: *u8 = c"conv.rust";
+pub const CODE_SET: *u8 = c"conv.set";
+pub const CODE_SINK_TYPE: *u8 = c"conv.sink_type";
+pub const CODE_MARKER: *u8 = c"conv.marker";
+pub const CODE_MARKER_EXTRA: *u8 = c"conv.marker_extra";
+pub const CODE_PLACE: *u8 = c"conv.place";
+pub const CODE_EXTERN: *u8 = c"conv.extern";
+pub const CODE_LEGACY: *u8 = c"syntax.legacy";
+pub const CODE_LEGACY_REMOVED: *u8 = c"syntax.legacy_removed";
+
+// `--syntax=0.20` / `--syntax=mixed`: sets the mode; false when arg is not
+// that option.
+pub fn syntax_option(arg: *u8) -> bool {
+    unsafe {
+        if streq(arg, c"--syntax=0.20") {
+            STRICT = true;
+        } else if streq(arg, c"--syntax=mixed") {
+            STRICT = false;
+        } else {
+            return false;
+        }
+        true
+    }
+}
+
+// Before parsing: whether the root (the first file) is legacy.
+pub fn conv_setup() {
+    unsafe {
+        LEGACY_ROOT = false;
+        CACHE_FILE = -1;
+        if FILE_COUNT == 0 {
+            return;
+        }
+        let s = FILES[0].start;
+        let n = LEGACY_MARKER.len;
+        if FILES[0].end - s >= n && SRC[s..s + n] == LEGACY_MARKER {
+            LEGACY_ROOT = true;
+        }
+    }
+}
+
+static mut CACHE_FILE: i64 = -1;
+static mut CACHE_START: i64 = 0;
+static mut CACHE_END: i64 = 0;
+static mut CACHE_USER: bool = false;
+
+// Whether pos is in a file of the program's own crate (not std's, not a
+// generated source).
+fn user_at(pos: i64) -> bool {
+    unsafe {
+        if CACHE_FILE >= 0 && pos >= CACHE_START && pos < CACHE_END {
+            return CACHE_USER;
+        }
+        let f = file_of_pos(pos);
+        CACHE_FILE = f;
+        CACHE_START = FILES[f].start;
+        CACHE_END = FILES[f].end;
+        CACHE_USER = FILES[f].path[0] != '<' && !within_std(FILES[f].module);
+        CACHE_USER
+    }
+}
+
+// Read in 0.19's spelling only (the bootstrap's crate).
+pub fn legacy_at(pos: i64) -> bool {
+    unsafe { LEGACY_ROOT && user_at(pos) }
+}
+
+// Read in 0.20's spelling only.
+pub fn strict_at(pos: i64) -> bool {
+    unsafe { STRICT && !LEGACY_ROOT && user_at(pos) }
+}
+
+// Whether token i is the identifier `word` (`inout`, `sink`, `var`: words
+// of 0.20 that are not keywords until 0.21, conventions.md D27).
+pub fn word_at(i: i64, word: [u8]) -> bool {
+    unsafe { TOKS[i].kind == Tok::Ident && SYMS[TOKS[i].value as i64].text == word }
+}
+
+// Whether token kind k can start a type.
+pub fn starts_type(k: Tok) -> bool {
+    k == Tok::Ident || k == Tok::Star || k == Tok::LParen || k == Tok::LBracket || k == Tok::Fn
+        || k == Tok::Amp || k == Tok::AmpAmp || k == Tok::Bang || k == Tok::Extern
+        || k == Tok::Let
+}
+
+// ---- Diagnostics ----
+
+// `try: tachyonc edit patch FILE:LINE --old 'OLD' --new 'NEW'` for the
+// error at pos; none in a generated source or for text a shell word
+// cannot hold.
+pub fn try_patch(pos: i64, old: [u8], new: [u8]) {
+    unsafe {
+        let f = file_of_pos(pos);
+        let path = FILES[f].path;
+        if path[0] == '<' || unquotable(old) || unquotable(new) {
+            return;
+        }
+        let mut line = 1;
+        for i in FILES[f].start..pos {
+            if SRC[i] == '\n' {
+                line += 1;
+            }
+        }
+        let a = buf_new();
+        buf_str(a, c"edit patch ");
+        buf_str(a, if path[0] == '.' && path[1] == '/' { &path[2] } else { path });
+        buf_bytes(a, ":");
+        buf_int(a, line);
+        buf_bytes(a, " --old '");
+        buf_bytes(a, old);
+        buf_bytes(a, "' --new '");
+        buf_bytes(a, new);
+        buf_bytes(a, "'");
+        err_try_tool(buf_slice(a), false);
+    }
+}
+
+fn unquotable(s: [u8]) -> bool {
+    for i in 0..s.len {
+        if s[i] == '\'' || s[i] == '\n' {
+            return true;
+        }
+    }
+    false
+}
+
+// A coded error of this front (`conv.*`, `syntax.legacy`), soft: parsing
+// goes on. SRC[start..end) is replaced by `new` (the try: line, and `fix
+// --suggested`) when `new` is not empty.
+pub fn conv_error(code: *u8, start: i64, end: i64, message: [u8], help: [u8], new: [u8]) {
+    unsafe {
+        let saved = ERR_KIND;
+        ERR_KIND = code;
+        err_begin(start);
+        err_fmt(message);
+        if help.len > 0 {
+            let h = buf_new();
+            buf_bytes(h, help);
+            buf_bytes(h, "\0");
+            err_help(buf_slice(h).ptr);
+        }
+        if new.len > 0 && end > start {
+            let old = SRC[start..end];
+            // the whole line's text around it, so that --old is unique
+            try_patch(start, old, new);
+            err_fix(start, end, new);
+        }
+        err_end_soft();
+        ERR_KIND = saved;
+    }
+}
+
+// `conv.rust`: Rust's spelling at SRC[start..end), whose 0.20 form is new
+// (`what` says what the 0.20 form is).
+pub fn rust_spelling(start: i64, end: i64, what: [u8], new: [u8]) {
+    let b = buf_new();
+    unsafe {
+        buf_bytes(b, "'");
+        buf_bytes(b, SRC[start..end]);
+        buf_bytes(b, "' is Rust's spelling; ");
+        buf_bytes(b, what);
+    }
+    conv_error(c"conv.rust", start, end, buf_slice(b), "", new);
+}
+
+// `syntax.legacy`: 0.20's spelling in a crate read in 0.19's.
+pub fn legacy_error(start: i64, end: i64, what: [u8]) {
+    let b = buf_new();
+    buf_bytes(b, what);
+    buf_bytes(b, " is 0.20's spelling, and this crate is read in 0.19's: its root's first line is '// tachyon-syntax: 0.19' (tachyon's own source until 0.21)");
+    conv_error(c"syntax.legacy", start, end, buf_slice(b),
+        "write it as 0.19 did (`&mut T`, `let mut`, `mut self: T`): v0.19.1 compiles this crate",
+        "");
+}
+
+// ---- Conventions ----
+
+// The convention of Param node p (CONV_LEGACY, CONV_LET, CONV_IN_OUT,
+// CONV_SINK_K).
+pub fn param_conv(p: i64) -> i64 {
+    unsafe {
+        let f = NODES[p].p;
+        if (f & CONV_NEW) == 0 {
+            return CONV_LEGACY;
+        }
+        if (f & CONV_INOUT) != 0 {
+            return CONV_IN_OUT;
+        }
+        if (f & CONV_SINK) != 0 { CONV_SINK_K } else { CONV_LET }
+    }
+}
+
+// The Param node of function f's parameter i (0 for none: an extern's, a
+// synthesized function's).
+pub fn param_node(f: i64, i: i64) -> i64 {
+    unsafe {
+        if f < 0 || i < 0 {
+            return 0;
+        }
+        let fnode = FNS[f].node;
+        if fnode <= 0 {
+            return 0;
+        }
+        let mut k = 0;
+        for j in 0..NODES[fnode].count {
+            let p = child(fnode, j);
+            if NODES[p].kind == NodeKind::Param {
+                if k == i {
+                    return p;
+                }
+                k += 1;
+            }
+        }
+        0
+    }
+}
+
+// The convention of function f's parameter i.
+pub fn fn_param_conv(f: i64, i: i64) -> i64 {
+    let p = param_node(f, i);
+    if p == 0 { CONV_LEGACY } else { param_conv(p) }
+}
+
+// The convention's word: "" (legacy), "let", "inout", "sink".
+pub fn conv_word(c: i64) -> [u8] {
+    if c == CONV_LET {
+        "let"
+    } else if c == CONV_IN_OUT {
+        "inout"
+    } else if c == CONV_SINK_K {
+        "sink"
+    } else {
+        ""
+    }
+}
+
+// Whether Unary `&` node n is an inout marker of a file read in 0.20's
+// spelling or mixed (CONV_NEW), not yet exclusive: where an exclusive
+// reference is expected it becomes one (check_mode: check_expr).
+pub fn inout_marker(n: i64) -> bool {
+    unsafe {
+        NODES[n].kind == NodeKind::Unary && NODES[n].op == Tok::Amp
+            && (NODES[n].p & CONV_NEW) != 0 && (NODES[n].p & NODE_REF_MUT) == 0
+    }
+}
