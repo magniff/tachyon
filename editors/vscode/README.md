@@ -1,7 +1,6 @@
 # Vole for Visual Studio Code
 
-Language support for **vole** (the language called tachyon until 0.24):
-syntax highlighting for `.vl` files (and `.tach` during the rename), and
+Language support for **vole**: syntax highlighting for `.vl` files, and
 diagnostics, go to definition, references, hover and document symbols
 from the compiler's language server, `volec lsp`.
 
@@ -33,7 +32,6 @@ The extension makes no network requests and collects no telemetry.
 | setting | default | |
 |---|---|---|
 | `vole.server.path` | `volec` | the compiler: a name looked up on PATH, or a path (relative to the first workspace folder) |
-| `vole.server.fallbackPath` | `tachyonc` | tried when `vole.server.path` is not found; in the compiler's own repository, `target/tools/tachyonc` |
 | `vole.server.args` | `["lsp"]` | the arguments that start the server |
 | `vole.server.enabled` | `true` | `false` keeps highlighting only |
 | `vole.trace.server` | `off` | `messages` or `verbose` logs the protocol to the Vole output |

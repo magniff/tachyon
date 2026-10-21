@@ -163,9 +163,10 @@ std::objc::Pool::push	../../compiler/std/objc/mod.tach:211:12	method	pub fn push
 std::string::String::push	../../compiler/std/string.tach:1204:12	method	pub fn push(inout self, cp: u32)
 std::path::PathBuf::push	../../compiler/std/path.tach:250:12	method	pub fn push(inout self, p: [u8])
 std::window::cocoa::push	../../compiler/std/window/cocoa.tach:199:4	fn	fn push(e: Event)	effects: alloc(Gpa, extern) io global panic diverge unsafe
+std::cli::Matches::push	../../compiler/std/cli.tach:766:8	method	fn push(inout self, s: i64, text: str)
 $ refs Vec::push --count
 2	crate::myvec::Vec::push
-166	std::Vec::push
+178	std::Vec::push
 $ callers crate::myvec::Vec::push
 # clash/main.tach
 40:10	call	main	mine.push(v.len());
@@ -428,7 +429,7 @@ $ def helpr
 error query.no-match: no definition 'helpr'
 try: tachyonc query def crate::a::helper
 try: tachyonc query def crate::b::helper
-try: tachyonc query def std::gpu::wgsl::api::ShaderError.help
+try: tachyonc query def std::cli::Arg.help
 [exit 1]
 $ refs MyVec
 # clash/main.tach

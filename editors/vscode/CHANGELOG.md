@@ -2,9 +2,9 @@
 
 ## 0.24.0 (unreleased)
 
-The first version, for vole 0.24 (the language called tachyon before).
+The first version, for vole 0.24.
 
-- TextMate grammar for `.vl` (and `.tach`): the parameter conventions
+- TextMate grammar for `.vl`: the parameter conventions
   `let`, `inout`, `sink`, `var` beside the older spelling, contracts,
   types, numbers with suffixes, strings, `c"..."`, `b"..."`, f-strings
   with holes and format specs, chars, nested block comments, attributes,
@@ -12,6 +12,6 @@ The first version, for vole 0.24 (the language called tachyon before).
   vscode-tmgrammar-test.
 - Language configuration: comments, brackets, auto-closing, indentation.
 - Language client for `volec lsp` (diagnostics, go to definition,
-  references, hover, document symbols), with `vole.server.path` and the
-  `vole.server.fallbackPath` (`tachyonc`) used until the rename.
+  references, hover, document symbols), the compiler from
+  `vole.server.path`.
 - The vole icon.

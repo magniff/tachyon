@@ -1,10 +1,8 @@
 // The vole extension: starts `volec lsp` as a language server over stdio.
 //
 // The server gives diagnostics, go to definition, references, hover and
-// document symbols. The compiler is found from the settings:
-// vole.server.path (default `volec`, looked up on PATH), then
-// vole.server.fallbackPath (default `tachyonc`, the compiler's name until
-// the rename in 0.24). Nothing here talks to the network or collects
+// document symbols. The compiler is vole.server.path (default `volec`,
+// looked up on PATH). Nothing here talks to the network or collects
 // telemetry.
 
 import * as fs from "fs";
@@ -55,9 +53,8 @@ async function startClient(_context: vscode.ExtensionContext): Promise<void> {
   const compiler = findCompiler(config);
   if (!compiler) {
     const primary = config.get<string>("server.path", "volec");
-    const fallback = config.get<string>("server.fallbackPath", "tachyonc");
     const msg =
-      `Vole: no compiler found (tried "${primary}" and "${fallback}"). ` +
+      `Vole: no compiler found (tried "${primary}"). ` +
       `Set vole.server.path to the volec binary; syntax highlighting works without it.`;
     log(msg);
     const choice = await vscode.window.showWarningMessage(msg, "Open Settings");
@@ -80,7 +77,7 @@ async function startClient(_context: vscode.ExtensionContext): Promise<void> {
     ],
     outputChannel: output,
     synchronize: {
-      fileEvents: vscode.workspace.createFileSystemWatcher("**/*.{vl,tach}"),
+      fileEvents: vscode.workspace.createFileSystemWatcher("**/*.vl"),
     },
   };
 
@@ -110,19 +107,13 @@ async function stopClient(): Promise<void> {
   }
 }
 
-// The first of server.path and server.fallbackPath that names a runnable
-// file: a path with a separator is taken as it is (relative to the first
-// workspace folder), a bare name is looked up on PATH.
+// server.path when it names a runnable file: a path with a separator is
+// taken as it is (relative to the first workspace folder), a bare name is
+// looked up on PATH.
 function findCompiler(config: vscode.WorkspaceConfiguration): string | undefined {
-  const candidates = [
-    config.get<string>("server.path", "volec"),
-    config.get<string>("server.fallbackPath", "tachyonc"),
-  ].filter((c): c is string => typeof c === "string" && c.trim() !== "");
-  for (const c of candidates) {
-    const found = resolveExecutable(expandHome(c.trim()));
-    if (found) return found;
-  }
-  return undefined;
+  const c = config.get<string>("server.path", "volec");
+  if (typeof c !== "string" || c.trim() === "") return undefined;
+  return resolveExecutable(expandHome(c.trim()));
 }
 
 function resolveExecutable(name: string): string | undefined {

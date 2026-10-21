@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/assets/vole-logo.png" alt="The vole logo" width="160"></p>
+
 # The Tachyon Programming Language
 
 Tachyon is a compiled systems language designed from the ground up to be
