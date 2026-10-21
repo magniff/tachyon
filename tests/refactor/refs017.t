@@ -82,5 +82,5 @@ $ refactor signature add --type v '&mut Vec<i64>' --default '&mut $v' --dry-run 
 -    add(&v, 1);
 +    add(&mut v, 1);
 $ check --syntax=mixed
-main.tach:18:5: error[own.readonly] writes through 's', a '[i64]', which is read-only | help: take the slice as '&mut [T]' ('v.as_mut_slice()', '&mut a[..]') to write its elements | try: tachyonc refactor signature fill --type s '&mut [i64]'
+main.tach:18:5: error[own.readonly] writes through 's', a '[i64]', which is read-only | help: take the slice inout ('s: inout [T]', called with '&v' or '&a[..]') to write its elements | try: tachyonc refactor signature fill --type s 'inout [i64]'
 [exit 1]

@@ -44,13 +44,10 @@ case "$COMPILER" in /*) ;; *) COMPILER="$(pwd)/$COMPILER" ;; esac
 cd "$ROOT" || exit 2
 
 # FILE  why it is held
-HELD='tests/refactor/testlang.t std::gen_vec calls f(g) for an inout g: the tests do not build
-tests/refactor/v4raw.t fix --values leaves impl Ord cmp(self: *Key) and a closure |x: *i64| for 0.20 std
+HELD='tests/refactor/v4raw.t fix --values leaves impl Ord cmp(self: *Key) and a closure |x: *i64| for 0.20 std
 tests/refactor/values017.t fix --values / --suggested leave a closure |a: *Stats| against FnMut(Stats, Stats)
 tests/refactor/values017traits.t fix --values leaves impls of Ord, Eq, Display with *T for 0.20 std
-tests/refactor/suggested.t fix --suggested refused: wrap(s) a String where [u8] is wanted (std 0.20 String)
-tests/refactor/symbols018.t <std>:22283 static mut in std (linux targets): no linux build
-examples/allocators/gpa-from-main/README.md main.tach:81 cmp(&b.0): the migration kept a marker on a let argument'
+tests/refactor/suggested.t fix --suggested refused: wrap(s) a String where [u8] is wanted (std 0.20 String)'
 
 LOG=$(mktemp -d "${TMPDIR:-/tmp}/phaseM-regen.XXXXXX")
 echo "phaseM-regen: logs in $LOG"
