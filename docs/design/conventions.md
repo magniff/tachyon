@@ -1511,8 +1511,31 @@ gate with the rehearsal (§9.3 step 7).
   own.move_out, the immutable-assignment help) name let, inout and sink.
   Their `try:` lines use `refactor signature --type v 'inout T'`. T2's
   `--convention` replaces that once it lands.
+- **Access fields** (`q: inout Query`, `cfg: let Config`, declared with
+  CONV_NEW) are transparent too. `synth_field` makes `p.q` into `*p.q`,
+  so `h.p.q = 10` and `h.n = 7` write the place the field designates.
+  The owned-assignment desugaring (drops.tach `copy_place`) keeps the
+  flag that marks the reference under an access's `*`. Before this,
+  `x = v` in an instance with an owned T made `**x`. `star_on_access`
+  reports only a `*` written in the source.
+- **own.moved names the sink parameter** that took the value: "'v' is
+  used here after it moved into 'keep(sink v)' at 16:18" (walk.tach
+  records owned arguments, moves.tach `moved_into`). A by-value
+  parameter in 0.19's spelling keeps the old message.
 - **Not done:**
-  - transparent access *fields* (`q: inout Query` is reached through
-    auto-deref as before; assigning `p.q = v` does not write through);
   - projections' bodies (T3);
-  - own.moved does not yet name the sink parameter it moved into.
+  - a `try:` that changes a sink parameter to let (T2's `refactor
+    signature --convention`).
+- **The lost explain entries** (a T1 dev compiler, built from the
+  working tree, listed 201 codes instead of 210) could not be
+  reproduced:
+  - from the committed tree at 6899a467, 3 builds with `--no-cache` and
+    2 with the code cache gave 210 entries, and builds with the same
+    output name are byte-identical;
+  - a cache filled by the Phase 0 tree and then the T1 diff also gave
+    210.
+
+  The code cache keys a function on its IR hash, which includes the
+  folded `CONV_COUNT`. The likeliest cause is a build made while the
+  tree was mid-edit (one `edit patch --pairs` had failed just before),
+  not the cache.

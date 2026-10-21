@@ -22,7 +22,7 @@ use crate::front::check::LOCALS;
 use crate::front::closures::{CLOSURES, CLOSURE_COUNT};
 use crate::front::modules::{STD_MODULE, within_std};
 use crate::front::own::diag::{
-    OWN_MOVED, OWN_MOVE_OUT, OWN_PARTIAL, OWN_READONLY, own_begin, own_end, own_help,
+    OWN_MOVED, OWN_MOVE_OUT, OWN_PARTIAL, OWN_READONLY, own_begin, own_bytes, own_end, own_help,
     own_help_bytes, own_str, own_sym, own_try, own_type,
 };
 use crate::front::own::drops::{
@@ -160,6 +160,7 @@ fn check_moved(p: i64, n: i64) {
                 else { c" is used here after it may have moved" });
         }
         if by > 0 {
+            moved_into(by);
             own_str(c" at ");
             line_col(NODES[by].start);
         }
@@ -175,6 +176,53 @@ fn check_moved(p: i64, n: i64) {
             try_wrap(by, c"", c".clone()");
         }
         own_end();
+    }
+}
+
+// (0.20) The calls owned arguments move into: argument node + 1 -> call
+// node * 256 + the parameter's index (walk.tach: eval_call), so that
+// own.moved names the parameter that took the value.
+pub static mut MOVE_CALL: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+pub fn note_move_arg(arg: i64, call: i64, i: i64) {
+    unsafe {
+        if i < 256 {
+            MOVE_CALL.put(arg + 1, call * 256 + i);
+        }
+    }
+}
+
+// ` into 'f(sink x)'` (or `'f(x)'` for a by-value parameter in 0.19's
+// spelling) for the move at node by, when it is an argument.
+fn moved_into(by: i64) {
+    unsafe {
+        let v = MOVE_CALL.get(by + 1);
+        if v <= 0 {
+            return;
+        }
+        let call = v / 256;
+        let i = v % 256;
+        let f = NODES[call].x - 1;
+        if f < 0 {
+            return;
+        }
+        let p = crate::front::conv::param_node(f, i);
+        // (a parameter written `sink`: one in 0.19's spelling keeps the
+        // message it had)
+        if p <= 0 || crate::front::conv::param_conv(p) != crate::front::conv::CONV_SINK_K {
+            return;
+        }
+        let name = SYMS[FNS[if FNS[f].tmpl > 0 { FNS[f].tmpl - 1 } else { f }].display].text;
+        let mut cut = 0;
+        while cut < name.len && name[cut] != '<' {
+            cut += 1;
+        }
+        own_str(c" into '");
+        own_bytes(name[0..cut]);
+        own_str(c"(");
+        own_str(c"sink ");
+        own_bytes(SYMS[NODES[p].a].text);
+        own_str(c")'");
     }
 }
 
