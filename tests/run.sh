@@ -604,6 +604,15 @@ if [ -x "$ROOT/compiler/arch/embed.sh" ] && ! "$ROOT/compiler/arch/embed.sh" -c;
     exit 1
 fi
 
+# (0.21) Every TACHYON_X the compiler reads (a c"TACHYON_X" literal) is
+# also read as VOLE_X, the name from 0.24: it is in base::ENV_NAMES.
+for v in $(grep -rhoE 'c"TACHYON_[A-Z0-9_]+"' "$ROOT/compiler/src" | sed 's/^c"TACHYON_//; s/"$//' | sort -u); do
+    if ! grep -q "c\"$v\"" "$ROOT/compiler/src/base/mod.tach"; then
+        echo "error: TACHYON_$v is read by the compiler but not as VOLE_$v: add \"$v\" to ENV_NAMES (compiler/src/base/mod.tach)" >&2
+        exit 1
+    fi
+done
+
 # The optimizer's rewrite rules, on random values (0.9).
 if "$COMPILER" --check-rules >"$WORK/rules.out" 2>&1; then :; else
     grep -q 'rewrite rules' "$WORK/rules.out" && { cat "$WORK/rules.out"; exit 1; }
