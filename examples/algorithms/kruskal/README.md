@@ -67,9 +67,9 @@ struct Edge { w: i64, u: i32, v: i32 }
 only what differs from the defaults:
 
 ```tach
-fn random_edges(n: i64, m: i64, max_weight: i64 = 1_000_000, seed: u64 = 7) -> Vec<Edge>
+fn random_edges(n: i64, m: i64, gpa: Gpa, max_weight: i64 = 1_000_000, seed: u64 = 7) -> Vec<Edge>
 ...
-let mut edges = random_edges(n, 1_000_000, gpa);
+var edges = random_edges(n, 1_000_000, gpa);
 ```
 
 **The union-find** keeps two `Vec<i32>` (4 bytes a node: better for the
@@ -88,9 +88,9 @@ goes. Indexing a slice with an `i32` works directly (any integer type
 indexes):
 
 ```tach
-fn find(self: &mut UnionFind, x: i64) -> i64 {
-    let p = self.parent.as_slice();
-    let mut x = x;
+fn find(inout self, x: i64) -> i64 {
+    let p = self.parent.as_mut_slice();
+    var x = x;
     while p[x] as i64 != x {
         let g = p[p[x]];
         p[x] = g;
@@ -107,7 +107,7 @@ has no tuple assignment, so `let (ra, rb) = if ... { (y, x) } else {
 ```tach
 let (x, y) = (self.find(a), self.find(b));
 if x == y { return false; }
-let size = self.size.as_slice();
+let size = self.size.as_mut_slice();
 let (ra, rb) = if size[x] < size[y] { (y, x) } else { (x, y) };
 self.parent.set(rb, ra as i32);
 size[ra] += size[rb];
@@ -122,11 +122,11 @@ taken (a spanning tree has no room for more). The `i32` fields of the
 edge widen to the `i64` parameters of `unite` by themselves:
 
 ```tach
-fn kruskal(n: i64, edges: [Edge], gpa: Gpa) -> (Vec<Edge>, i64) {
+fn kruskal(n: i64, edges: inout [Edge], gpa: Gpa) -> (Vec<Edge>, i64) {
     std::sort(edges);
-    let mut uf = UnionFind::new(n, gpa);
+    var uf = UnionFind::new(n, gpa);
     defer uf.free();
-    let mut tree: Vec<Edge> = Vec::with_capacity_in(n - 1, gpa);
+    var tree: Vec<Edge> = Vec::with_capacity_in(n - 1, gpa);
     for e in edges {
         if uf.unite(e.u, e.v) {
             tree.push(e);
@@ -190,7 +190,7 @@ one of the ~20 million comparisons.
 | ranges as iterators, `map`, `collect`, `sum`, `max` | `UnionFind::new`, `main` | `tachyonc guide iterators`, `guide closures` |
 | tuples: returned, destructured, a tuple-valued `if` | `kruskal`, `unite`, `main` | `tachyonc guide syntax` |
 | widening (`i32` fields to `i64` parameters) | `kruskal` | `tachyonc guide conversions` |
-| `Vec::filled`, `as_slice`, slices written through | `UnionFind` | `tachyonc guide std`, `guide memory` |
+| `Vec::filled`, `as_mut_slice`, slices written through | `UnionFind` | `tachyonc guide std`, `guide memory` |
 | `defer` to free | everywhere | `tachyonc guide memory` |
 | f-strings: `{w:>2}`, `{e:?}` | `main` | `tachyonc guide formatting` |
 | a C header: `import "time.h" as c;` | `now_ns` | `tachyonc guide c-interop` |
@@ -202,5 +202,5 @@ one of the ~20 million comparisons.
 - Replace path halving by full path compression (a second loop that
   points every node on the path at the root) and time both.
 - Stop when `uf.sets == k` to split the nodes into `k` clusters.
-- Sort with `edges.sort_by(|a, b| b.w.cmp(&a.w))` to get a maximum
+- Sort with `edges.sort_by(|a, b| b.w.cmp(a.w))` to get a maximum
   spanning tree.

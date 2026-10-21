@@ -53,7 +53,7 @@ allocator as a value (`a: A`) and passing it to each `Vec` it makes:
 
 ```tach
 fn parse<A: Allocator>(src: [u8], a: A) -> Result<(Node<A>, i64), ParseError>
-fn parse_expr<A: Allocator>(p: &mut Parser<A>, t: Tok) -> Result<Node<A>, ParseError>
+fn parse_expr<A: Allocator>(p: inout Parser<A>, t: Tok) -> Result<Node<A>, ParseError>
 ```
 
 The caller chooses. On `Gpa`, `parse(text, gpa)` returns a
@@ -64,7 +64,7 @@ an arena:
 ```tach
 values[1] = arena_scope(gpa, |a| {
     let (tree, _) = parse(text, a).unwrap();
-    let v = eval(&tree);
+    let v = eval(tree);
     std::forget(tree);
     v
 });
@@ -105,7 +105,7 @@ their number:
 Tok::Close => {
     // moved off the stack, in order
     let n = p.stack.len() - base;
-    let mut kids: Vec<Node<A>, A> = Vec::with_capacity_in(n, p.a);
+    var kids: Vec<Node<A>, A> = Vec::with_capacity_in(n, p.a);
     for _ in 0..n {
         kids.push(p.stack.remove(base));
     }

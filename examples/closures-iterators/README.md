@@ -59,10 +59,10 @@ struct Lines { text: [u8], pos: i64 }
 impl Iterator for Lines {
     type Item = [u8];
 
-    fn next(self: &mut Lines) -> Option<[u8]> {
-        if self.pos >= self.text.len { return None; }
+    fn next(inout self) -> Option<[u8]> {
+        if self.pos >= self.text.len() { return None; }
         let start = self.pos;
-        while self.pos < self.text.len && self.text[self.pos] != '\n' { self.pos += 1; }
+        while self.pos < self.text.len() && self.text[self.pos] != '\n' { self.pos += 1; }
         let line = self.text[start..self.pos];
         self.pos += 1; // past the '\n'
         Some(line)
@@ -72,15 +72,15 @@ impl Iterator for Lines {
 
 **Closures that change their surroundings.** Parsing is a `filter` and a
 `for_each`. The second closure pushes onto `entries` and counts `bad`
-lines: both are `let mut`, so the closure captures them *by reference*
-and its changes are seen after the chain. (A plain `let` is captured by
-value, a copy; `move |..|` copies everything.)
+lines: both are `var`, so the closure captures them *inout* and its
+changes are seen after the chain. (A plain `let` is captured by a let
+access, read only; `sink |..|` takes what it captures.)
 
 ```tach
-let mut entries: Vec<Entry> = Vec::new_in(gpa);
-let mut bad = 0;
+var entries: Vec<Entry> = Vec::new_in(gpa);
+var bad = 0;
 Lines::new(input.as_slice())
-    .filter(|l| l.len > 0 && l[0] != '#')
+    .filter(|l| l.len() > 0 && l[0] != '#')
     .for_each(|l| {
         match parse_entry(l, gpa) {
             Some(e) => entries.push(e),
@@ -126,12 +126,13 @@ annotated: `let is_slow = |e: Entry| e.millis > limit;`.
 
 **collect, sort_by, enumerate, take.** `collect()` makes a `Vec` of the
 items (freed with `defer`); `sort_by` sorts it in place by a comparison
-of two pointers returning negative, zero or positive, so `b.cmp(a)`
+of two elements (let: read in place) returning negative, zero or
+positive, so `b.cmp(a)`
 sorts descending:
 
 ```tach
-let mut slow = all.iter().filter(is_slow).collect_in(gpa);
-slow.sort_by(|a, b| b.millis.cmp(&a.millis)); // slowest first
+var slow = all.iter().filter(is_slow).collect_in(gpa);
+slow.sort_by(|a, b| b.millis.cmp(a.millis)); // slowest first
 for (rank, e) in slow.iter().enumerate().take(3) {
     println(f"  {rank + 1}. {e.millis:>4} ms  {e.service:<5} {e.path}");
 }
@@ -144,11 +145,11 @@ pairs are then collected and sorted by count, then by name:
 
 ```tach
 for e in all { per_service.get_or_insert(e.service, 0)[0] += 1; }
-let mut ranked = per_service.iter().collect_in(gpa);
+var ranked = per_service.iter().collect_in(gpa);
 ranked.sort_by(|a, b| {
-    let (name_a, n_a) = *a; // a and b point into the Vec: *([u8], i64)
-    let (name_b, n_b) = *b;
-    if n_a != n_b { n_b - n_a } else { name_a.cmp(&name_b) }
+    let (name_a, n_a) = a; // a and b read the Vec's elements in place (let)
+    let (name_b, n_b) = b;
+    if n_a != n_b { n_b - n_a } else { name_a.cmp(name_b) }
 });
 ```
 
@@ -157,7 +158,7 @@ zipping the entries with `all[1..]` pairs each request with the next.
 
 ## Language features
 
-- closures, captures by value and by reference, `Fn`/`FnMut` bounds: `tachyonc guide closures`
+- closures, captures (a `var` inout, the rest let), `sink ||`, `Fn`/`FnMut` bounds: `tachyonc guide closures`
 - `Iterator`, `type Item`, adapters and consumers, `sort_by`: `tachyonc guide iterators`
 - `Option` and `?`, `.ok()`: `tachyonc guide conversions`
 - `HashMap`, `split_whitespace`, `parse_int`, `read_stdin`: `tachyonc guide std`
@@ -173,6 +174,5 @@ What Rust has that tachyon does not (yet), and what to write instead:
   an iterator of your own like `Lines`.
 - `collect::<HashMap<..>>()`: `collect` always makes a `Vec`; fill a map
   with a `for` loop.
-- `a.1` on a pointer to a tuple: write `(*a).1` or destructure `*a`.
 - Returning a closure or an iterator built from one (`impl Fn`,
   `impl Iterator`): pass closures *in* through generic parameters.
