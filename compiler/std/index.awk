@@ -31,6 +31,10 @@
 BEGIN {
     n = split("Stable sort (0.15)|HashMap|Debug of HashMap (0.15)|== on HashMap (0.15)|Iterators (0.14)|Adapters|Sources|Text (0.14)|Errors of reading and parsing (0.15)|Integer limits (0.15)|Bits (0.16)|Conversions (0.15)|Clone and hashing (0.15)|Clone, Eq, Ord and Hash without an impl (0.15)|Arenas (0.16)|FixedBuf (0.16)|HashMap's room (0.16)|Slices (0.16)|Gpa's leak checks (0.16)|The checking allocator's hooks for arenas (0.16)|Panic and unreachable, the prelude's (0.17)|Testing (0.18)|Non-null pointers (0.18)|The test runtime's implementation (0.18)|The fuzzer's implementation (0.18)|Heaps (0.18.1)|More of Vec and Range (0.18.1)|Run-time CPU features (0.19)|CPU features on macOS (0.19)|CPU features on Linux (0.19)|CPU features on x86-64 (0.19)|std::iter|std::convert|std::clone|Numbers: bits and wide products (0.20)|Numbers: digits (0.20)|Numbers: integer text (0.20)|Numbers: the shortest digits of a float (0.20)|Numbers: float text (0.20)|Numbers: float parsing (0.20)|Numbers: float parsing's slow path (0.20)|Numbers: powers of ten (0.20)|Numbers: the slow path's digits of 5^s (0.20)|Display and Debug of floats (0.20)|Sorting (0.9)|Sort kernels (0.20)|Sort, unstable (0.20)|Sort, stable (0.20)|Slice searches (0.20)|Slice algorithms (0.20)|Random numbers (0.20)|The target's system (0.20)|Duration (0.20)|Clocks (0.20)|Sys: errors (0.20)|Sys: paths (0.20)|Sys: files (0.20)|Sys: file status (0.20)|Sys: directories (0.20)|Sys: the environment (0.20)|Sys: processes (0.20)|Sys: terminals (0.20)|Sys: clocks and entropy (0.20)|UTF-8 (0.20)|UTF-8 with NEON (0.20)|Unicode tables: properties (0.20)|Unicode tables: classes (0.20)|Unicode tables: case (0.20)|Unicode properties (0.20)|Grapheme clusters (0.20)|Display width (0.20)|Unicode classes and case (0.20)", lz, "|")
     for (i = 1; i <= n; i++) LAZY[lz[i]] = 1
+    # (0.22) std::objc and std::gpu: every section lazy, behind the gates
+    # below, so that a program that uses neither reads none of them.
+    n = split("std::objc|Objective-C objects (0.22)|Autorelease pools, selectors, classes, frameworks (0.22)|Strings and exceptions (0.22)|std::objc::foundation|std::gpu|GPU: errors (0.22)|GPU: instance, adapters, devices (0.22)|GPU: buffers, textures, samplers, shaders (0.22)|GPU: bind layouts and groups (0.22)|GPU: pipelines (0.22)|GPU: encoders and passes (0.22)|GPU: surfaces and frames (0.22)|GPU: bytes (0.22)|std::gpu::types|GPU types: flags, formats, descriptors (0.22)|std::gpu::shader|GPU shaders: sources and reflection (0.22)|std::gpu::hal|The GPU backend interface (0.22)|std::gpu::hal::metal|GPU on Metal: devices, memory, resources (0.22)|GPU on Metal: conversions (0.22)|GPU on Metal: recording helpers (0.22)|GPU on Metal: hal::Api (0.22)|GPU on Metal: hal::Render (0.22)|std::gpu::hal::metal::bindings", lz, "|")
+    for (i = 1; i <= n; i++) LAZY[lz[i]] = 1
     # (0.20) GATES: modules whose items no program reaches without naming
     # the module (no re-export outside it): a word of one of their lazy
     # sections asks for it only from a program that also names the module's
@@ -40,6 +44,14 @@ BEGIN {
     GATES["std::str"] = "str"
     GATES["std::unicode"] = "unicode"
     GATES["std::unicode::tables"] = "unicode"
+    GATES["std::objc"] = "objc"
+    GATES["std::objc::foundation"] = "objc"
+    GATES["std::gpu"] = "gpu"
+    GATES["std::gpu::types"] = "gpu"
+    GATES["std::gpu::shader"] = "gpu"
+    GATES["std::gpu::hal"] = "gpu"
+    GATES["std::gpu::hal::metal"] = "gpu"
+    GATES["std::gpu::hal::metal::bindings"] = "gpu"
     nmod = 0
     TRIGGERS["Iterators (0.14)"] = "Iterator IntoIterator"
     # (0.20: the Iterator trait in std::iter, before its first banner)
@@ -179,6 +191,12 @@ function new_section(t) {
     }
     if (code ~ /^}/) cur_type = ""
     key = code !~ /^[ \t]/
+    # (0.22) In std::objc and std::gpu, the C functions of an `extern "C"`
+    # block are items too: the sections that call them need the block's
+    # section (their modules are lazy throughout).
+    if (line ~ /^extern "C" \{/) in_extern = 1
+    else if (code ~ /^}/) in_extern = 0
+    else if (in_extern && nmod > 0 && modstack[nmod] ~ /^std::(objc|gpu)/) key = 1
     # (`for x in it` with no range needs the iterators; `?`, From)
     if (match(code, /(^|[^A-Za-z0-9_])for [^{]* in [^{]*/)) {
         f = substr(code, RSTART, RLENGTH)
@@ -228,6 +246,10 @@ END {
     for (i = 0; i <= count; i++) {
         for (j = 0; j <= count; j++) {
             if (i == j) continue
+            # (0.22) A gated module's section is needed only by sections of
+            # gated modules: its words are common ones (Error, Buffer, Id),
+            # which the rest of std uses for its own items.
+            if ((gate[j] == "objc" || gate[j] == "gpu") && gate[i] != "objc" && gate[i] != "gpu") continue
             need = 0
             nd = split(keys_list[j], dw, " ")
             for (k = 1; k <= nd && !need; k++) if ((i, dw[k]) in USES) need = 1

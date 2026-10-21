@@ -1,0 +1,167 @@
+// std::gpu::shader (0.22): what pipeline creation takes from the shader
+// compiler (docs/design/gpu.md §2.10): a module translated for one
+// backend, its code and its reflection. The WGSL compiler
+// (std::gpu::wgsl) produces a ShaderSource for the backend's ShaderKind
+// (`dev.caps().shader_kind`); programs that bring their own shaders write
+// both by hand.
+//
+// The reflection carries the native slots the writer chose, per stage
+// (Metal's [[buffer(n)]], [[texture(n)]], [[sampler(n)]]; a CUDA kernel's
+// parameter index): the hal binds what it is told and assumes no
+// numbering rule. The rule the MSL writer follows, so that compatible
+// layouts get the same slots: per stage, buffers, textures and samplers
+// each numbered from 0 in (group, binding) order over the bindings visible
+// in that stage; vertex buffers at Metal's 30 downward (vertex buffer i
+// at 30 - i).
+
+use std::gpu::types::{ShaderStage, VertexFormat};
+
+// ---- GPU shaders: sources and reflection (0.22) ----
+
+/// The form of a translated shader.
+#[derive(Eq, Debug, Clone)]
+pub enum ShaderKind {
+    /// Metal Shading Language text (3.0), compiled by the driver.
+    Msl,
+    /// SPIR-V words (Vulkan).
+    Spirv,
+    /// PTX text (CUDA).
+    Ptx,
+}
+
+/// What a binding holds.
+#[derive(Eq, Debug, Clone)]
+pub enum BindingType {
+    Uniform,
+    Storage,
+    ReadOnlyStorage,
+    Texture,
+    StorageTexture,
+    Sampler,
+    ComparisonSampler,
+}
+
+impl BindingType {
+    #[pure]
+    pub fn is_buffer(self: BindingType) -> bool {
+        match self {
+            BindingType::Uniform | BindingType::Storage | BindingType::ReadOnlyStorage => true,
+            _ => false,
+        }
+    }
+
+    #[pure]
+    pub fn is_texture(self: BindingType) -> bool {
+        self == BindingType::Texture || self == BindingType::StorageTexture
+    }
+
+    #[pure]
+    pub fn is_sampler(self: BindingType) -> bool {
+        self == BindingType::Sampler || self == BindingType::ComparisonSampler
+    }
+}
+
+/// One `@group(g) @binding(b)` of a shader, with its native slot in each
+/// stage (-1: not used there).
+#[derive(Eq, Debug, Clone)]
+pub struct Binding {
+    pub group: i64,
+    pub binding: i64,
+    pub ty: BindingType,
+    pub slot_vertex: i64,
+    pub slot_fragment: i64,
+    pub slot_compute: i64,
+    pub min_size: i64,
+}
+
+impl Binding {
+    #[pure]
+    pub fn visibility(self: &Binding) -> u32 {
+        let mut v: u32 = 0;
+        if self.slot_vertex >= 0 { v = v | ShaderStage::VERTEX; }
+        if self.slot_fragment >= 0 { v = v | ShaderStage::FRAGMENT; }
+        if self.slot_compute >= 0 { v = v | ShaderStage::COMPUTE; }
+        v
+    }
+}
+
+/// An entry point: its WGSL name, its name in the translated code (MSL
+/// reserves some, `main` among them), its stage, and a compute entry's
+/// workgroup size.
+#[derive(Eq)]
+pub struct EntryPoint {
+    pub name: [u8],
+    pub native: [u8],
+    pub stage: u32,
+    pub workgroup: [i64; 3],
+}
+
+/// A vertex entry point's input at `@location(n)`.
+#[derive(Eq, Debug, Clone)]
+pub struct VertexInput {
+    pub location: i64,
+    pub format: VertexFormat,
+}
+
+/// A translated module's interface. Its names view the compiler's output
+/// (or the program's text); Device::shader copies what it keeps.
+pub struct Reflection {
+    pub entries: Vec<EntryPoint>,
+    pub bindings: Vec<Binding>,
+    pub inputs: Vec<VertexInput>,
+}
+
+impl Reflection {
+    pub fn new_in(gpa: Gpa) -> Reflection {
+        Reflection {
+            entries: Vec::new_in(gpa), bindings: Vec::new_in(gpa), inputs: Vec::new_in(gpa)
+        }
+    }
+
+    /// A compute entry point with its workgroup size.
+    pub fn compute(self: &mut Reflection, name: [u8], native: [u8], x: i64, y: i64 = 1, z: i64 = 1) {
+        self.entries.push(EntryPoint {
+            name: name, native: native, stage: ShaderStage::COMPUTE, workgroup: [x, y, z]
+        });
+    }
+
+    pub fn vertex(self: &mut Reflection, name: [u8], native: [u8]) {
+        self.entries.push(EntryPoint {
+            name: name, native: native, stage: ShaderStage::VERTEX, workgroup: [0, 0, 0]
+        });
+    }
+
+    pub fn fragment(self: &mut Reflection, name: [u8], native: [u8]) {
+        self.entries.push(EntryPoint {
+            name: name, native: native, stage: ShaderStage::FRAGMENT, workgroup: [0, 0, 0]
+        });
+    }
+
+    /// A binding and its slots (-1 where a stage does not use it).
+    pub fn bind(self: &mut Reflection, group: i64, binding: i64, ty: BindingType, vertex: i64 = -1,
+        fragment: i64 = -1, compute: i64 = -1, min_size: i64 = 0) {
+        self.bindings.push(Binding {
+            group: group, binding: binding, ty: ty, slot_vertex: vertex, slot_fragment: fragment,
+            slot_compute: compute, min_size: min_size
+        });
+    }
+
+    pub fn input(self: &mut Reflection, location: i64, format: VertexFormat) {
+        self.inputs.push(VertexInput { location: location, format: format });
+    }
+}
+
+/// A module translated for one backend: its code (text or words, as
+/// bytes) and its reflection; the shader compiler's output.
+pub struct ShaderSource {
+    pub kind: ShaderKind,
+    pub code: [u8],
+    pub reflection: Reflection,
+}
+
+impl ShaderSource {
+    /// MSL text and its reflection.
+    pub fn msl(code: [u8], reflection: Reflection) -> ShaderSource {
+        ShaderSource { kind: ShaderKind::Msl, code: code, reflection: reflection }
+    }
+}

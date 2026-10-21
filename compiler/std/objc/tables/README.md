@@ -9,8 +9,8 @@ corruption (docs/design/gpu.md, §2.9 and R1).
 
 | table | generated module |
 |---|---|
-| `foundation.objc` | `lib/objc/foundation.tach` (`objc::foundation`) |
-| `metal.objc` | `lib/gpu/metal/sys.tach` (`gpu::metal::sys`) |
+| `foundation.objc` | `compiler/std/objc/foundation.tach` (`std::objc::foundation`) |
+| `metal.objc` | `compiler/std/gpu/hal/metal/bindings.tach` (`std::gpu::hal::metal::bindings`) |
 
 ```sh
 cc=cc; tachyonc tools/objcgen/main.tach -o objcgen.o && $cc objcgen.o -o objcgen -lobjc
