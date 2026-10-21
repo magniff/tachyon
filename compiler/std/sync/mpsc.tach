@@ -1,0 +1,238 @@
+// std::sync::mpsc: channels between threads (0.21).
+
+use std::sync::RawLock;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::{Clone, Debug, Display, Fmt, Option, Result, Vec, out_of_memory, sys_futex_wait,
+    sys_futex_wake};
+
+// ---- Channels (0.21) ----
+
+// A channel (docs/design/concurrency.md §2.7): values sent through any of
+// its Senders come out of its Receiver in the order they were sent. Rust's
+// signatures: `send` fails (giving the value back) when the receiver is
+// gone, `recv` fails when every sender is gone and nothing is left. The
+// queue is two Vecs from the allocator given (an inbox the senders push
+// to, an outbox the receiver pops, refilled from the inbox reversed); the
+// shared state is a lock, counts and a word the receiver sleeps on (the
+// number of sends and sender drops so far), from C's allocator.
+//
+//     let (tx, rx) = mpsc::channel_in(gpa);
+//     tx.send(7).unwrap();
+//     let x = rx.recv().unwrap();
+
+struct Chan<T> {
+    lock: RawLock,
+    inbox: Vec<T>,
+    outbox: Vec<T>,
+    senders: AtomicU32,
+    receiving: AtomicU32,
+    // Bumped (release) by each send and each last sender's drop.
+    seq: AtomicU32,
+    // The Senders and the Receiver alive: the last one frees the channel.
+    refs: AtomicU32,
+}
+
+extern "C" {
+    #[link_name = "malloc"]
+    fn chan_c_malloc(n: u64) -> *u8;
+    #[link_name = "free"]
+    fn chan_c_free(p: *u8);
+}
+
+// The sending end; clone it for more senders.
+pub struct Sender<T> { c: *Chan<T> }
+
+// The receiving end.
+pub struct Receiver<T> { c: *Chan<T> }
+
+// send's error: the receiver is gone; the value comes back.
+pub struct SendError<T> { value: T }
+
+impl<T> SendError<T> {
+    // The value that was not sent.
+    pub fn into_inner(self: SendError<T>) -> T {
+        let e = self;
+        e.value
+    }
+}
+
+impl<T> Debug for SendError<T> {
+    fn fmt_debug(self: &SendError<T>, f: &mut Fmt) {
+        f.str("SendError(..)");
+    }
+}
+
+impl<T> Display for SendError<T> {
+    fn fmt(self: &SendError<T>, f: &mut Fmt) {
+        f.str("sending on a channel whose receiver is gone");
+    }
+}
+
+// recv's error: every sender is gone and the channel is empty.
+pub struct RecvError {}
+
+impl Debug for RecvError {
+    fn fmt_debug(self: &RecvError, f: &mut Fmt) {
+        f.str("RecvError");
+    }
+}
+
+impl Display for RecvError {
+    fn fmt(self: &RecvError, f: &mut Fmt) {
+        f.str("receiving on a channel whose senders are gone");
+    }
+}
+
+// A channel; its two ends. The queue grows from gpa.
+pub fn channel_in<T>(gpa: Gpa) -> (Sender<T>, Receiver<T>) {
+    unsafe {
+        let c = chan_c_malloc(size_of(Chan<T>) as u64) as *Chan<T>;
+        if c == 0 as *Chan<T> {
+            out_of_memory();
+        }
+        *c = Chan {
+            lock: RawLock::new(), inbox: Vec::new_in(gpa), outbox: Vec::new_in(gpa),
+            senders: AtomicU32::new(1), receiving: AtomicU32::new(1), seq: AtomicU32::new(0),
+            refs: AtomicU32::new(2),
+        };
+        (Sender { c: c }, Receiver { c: c })
+    }
+}
+
+// One end let go: the last one drops what is left and frees the channel.
+unsafe fn chan_release<T>(c: *Chan<T>) {
+    if (*c).refs.fetch_sub(1, Ordering::AcqRel) == 1 {
+        let gone = *c;
+        chan_c_free(c as *u8);
+        drop(gone);
+    }
+}
+
+impl<T> Sender<T> {
+    // Sends x; Err(x back) when the receiver is gone.
+    pub fn send(self: &Sender<T>, x: T) -> Result<(), SendError<T>> {
+        unsafe {
+            let c = self.c;
+            (*c).lock.lock();
+            if (*c).receiving.load(Ordering::Relaxed) == 0 {
+                (*c).lock.unlock();
+                return Err(SendError { value: x });
+            }
+            (*c).inbox.push(x);
+            (*c).lock.unlock();
+            (*c).seq.fetch_add(1, Ordering::Release);
+            sys_futex_wake((*c).seq.as_ptr(), false);
+            Ok(())
+        }
+    }
+}
+
+impl<T> Clone for Sender<T> {
+    fn clone(self: &Sender<T>) -> Sender<T> {
+        unsafe {
+            (*self.c).senders.fetch_add(1, Ordering::Relaxed);
+            (*self.c).refs.fetch_add(1, Ordering::Relaxed);
+        }
+        Sender { c: self.c }
+    }
+}
+
+impl<T> Drop for Sender<T> {
+    fn drop(self: &mut Sender<T>) {
+        unsafe {
+            let c = self.c;
+            if (*c).senders.fetch_sub(1, Ordering::AcqRel) == 1 {
+                // (the last one: a waiting receiver learns it)
+                (*c).lock.lock();
+                (*c).seq.fetch_add(1, Ordering::Release);
+                (*c).lock.unlock();
+                sys_futex_wake((*c).seq.as_ptr(), true);
+            }
+            chan_release(c);
+        }
+    }
+}
+
+impl<T> Receiver<T> {
+    // The next value, waiting for one; Err when every sender is gone and
+    // nothing is left.
+    pub fn recv(self: &Receiver<T>) -> Result<T, RecvError> {
+        unsafe {
+            let c = self.c;
+            loop {
+                (*c).lock.lock();
+                match chan_pop(c) {
+                    Some(x) => {
+                        (*c).lock.unlock();
+                        return Ok(x);
+                    }
+                    None => {}
+                }
+                if (*c).senders.load(Ordering::Acquire) == 0 {
+                    (*c).lock.unlock();
+                    return Err(RecvError {});
+                }
+                let seen = (*c).seq.load(Ordering::Acquire);
+                (*c).lock.unlock();
+                sys_futex_wait((*c).seq.as_ptr(), seen);
+            }
+        }
+    }
+
+    // The next value if there is one now.
+    pub fn try_recv(self: &Receiver<T>) -> Option<T> {
+        unsafe {
+            let c = self.c;
+            (*c).lock.lock();
+            let x = chan_pop(c);
+            (*c).lock.unlock();
+            x
+        }
+    }
+
+    // The values, until every sender is gone: `for x in rx.iter()`.
+    pub fn iter(self: &Receiver<T>) -> RecvIter<T> {
+        RecvIter { c: self.c }
+    }
+}
+
+// The next value of the queue (the lock held).
+unsafe fn chan_pop<T>(c: *Chan<T>) -> Option<T> {
+    if (*c).outbox.is_empty() {
+        loop {
+            match (*c).inbox.pop() {
+                Some(x) => (*c).outbox.push(x),
+                None => break,
+            }
+        }
+    }
+    (*c).outbox.pop()
+}
+
+impl<T> Drop for Receiver<T> {
+    fn drop(self: &mut Receiver<T>) {
+        unsafe {
+            let c = self.c;
+            (*c).lock.lock();
+            (*c).receiving.store(0, Ordering::Relaxed);
+            (*c).lock.unlock();
+            chan_release(c);
+        }
+    }
+}
+
+// Receiver::iter's iterator: recv until it fails.
+pub struct RecvIter<T> { c: *Chan<T> }
+
+impl<T> Iterator for RecvIter<T> {
+    type Item = T;
+    fn next(self: &mut RecvIter<T>) -> Option<T> {
+        let r = Receiver { c: self.c };
+        let x = r.recv();
+        std::forget(r);
+        match x {
+            Ok(v) => Some(v),
+            Err(_) => None,
+        }
+    }
+}
