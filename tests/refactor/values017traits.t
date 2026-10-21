@@ -69,13 +69,13 @@ fn main() {
 }
 $ fix --only unsafe --syntax=mixed
 note fix.none: nothing to fix
-$ main.tach -o prog --syntax=mixed
-main.tach:33:20: error[type error] 'cmp' does not have the signature trait 'Ord' declares: expected 'fn(Key, Key) -> i64'
-main.tach:34:19: error[type error] 'eq' does not have the signature trait 'Eq' declares: expected 'fn(Key, Key) -> bool'
-main.tach:38:26: error[type error] 'fmt' does not have the signature trait 'Display' declares: expected 'fn(Money, inout Fmt) -> ()'
-[exit 1]
-% ./prog
-tests/refactor/run.sh: line 91: ./prog: No such file or directory
-[exit 127]
 $ fix --values --syntax=mixed
 note fix.none: nothing to fix
+## (0.20) Then 0.20's spelling, `fix --only conventions` (its 0.19 input
+## read --syntax=mixed): the chain 0.16 -> 0.19 -> 0.20 prints what 0.16 did.
+$ fix --only conventions --syntax=mixed
+fixed 4 parameters to let, 2 parameters to inout, 14 receivers, 2 '&mut e's to '&e', 3 '&e's to a let, 4 'let mut's / 'mut x's to var	main.tach	+25 -24 lines
+$ main.tach -o prog
+ok: built prog
+% ./prog
+16 9 shape rect true 10 3 true false $7

@@ -2,10 +2,27 @@
 $ check
 ok: 0 errors in main.tach
 ## A typed hole: only the calls whose $v the checker typed *IntVec.
-$ rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec' --dry-run
-note rewrite.none: nothing matches 'grow($v, $n)'
-note rewrite.types: 5 sites match but for --where; first: $v is inout IntVec at main.tach:10:10
-try: tachyonc rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: inout IntVec' --dry-run
+$ rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: inout IntVec' --dry-run
+--- a/main.tach
++++ b/main.tach
+@@ -4 +3,0 @@
+-use crate::vecs::{ByteVec, IntVec, grow, grow_bytes};
+@@ -5,0 +5 @@
++use crate::vecs::{ByteVec, IntVec, grow_bytes};
+@@ -10 +10 @@
+-    grow(&v, 10);
++    (&v).reserve(10);
+@@ -25,2 +25,2 @@
+-    grow(&p, n);
+-    grow(&p, n * 2);
++    (&p).reserve(n);
++    (&p).reserve(n * 2);
+@@ -31,2 +31,2 @@
+-    grow(&v, 2);
+-    grow(&v, 2);
++    (&v).reserve(2);
++    (&v).reserve(2);
+note rewrite.imports: removed 1 import the rewrite left unused
 ## No site has that type: what the sites have, and the command for it.
 $ rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: IntVec'
 note rewrite.none: nothing matches 'grow($v, $n)'

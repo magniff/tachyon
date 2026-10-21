@@ -20,8 +20,16 @@ fn main() -> i32 {
 12
 ## --fails TEXT: its build or run prints TEXT
 $ reduce crash.tach --fails 'index out of bounds'
-error reduce.not-failing: crash.tach: its build and run do not print the text as it is (nothing to keep)
-[exit 1]
+reduced crash.tach: 21 lines to 9 in 35 runs; written to crash.min.tach
+fn last(v: [i64]) -> i64 {
+    v[v.len]
+}
+
+fn main() -> i32 {
+    let b = [4, 5];
+    println(f"{last(b[..])}");
+    0
+}
 ## nothing to keep
 $ reduce main.tach --differs
 error reduce.not-failing: main.tach: -O0 and -O2 agree on it as it is (nothing to keep)

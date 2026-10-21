@@ -1,14 +1,22 @@
 ## Edit precision (0.13, tests/refactor/precision/).
 ## edit patch: OLD's lines may end (or start) inside a line, in a block too.
 $ edit patch sum_to --dry-run < $T/inputs/partial.patch
-error patch.no-match: OLD 2 is not in crate::calc::sum_to (its line 1 is not); nearest, line 16: var total = 0;
-try: tachyonc query show calc.tach:16
-[exit 1]
+--- a/calc.tach
++++ b/calc.tach
+@@ -16 +16 @@
+-    var total = 0;
++    var total = 0 * n;
+@@ -18,0 +19 @@
++        // (a term)
 ## --pairs FILE: the blocks from a file, no stdin, no shell quoting.
 $ edit patch sum_to --dry-run --pairs $T/inputs/partial.patch
-error patch.no-match: OLD 2 is not in crate::calc::sum_to (its line 1 is not); nearest, line 16: var total = 0;
-try: tachyonc query show calc.tach:16
-[exit 1]
+--- a/calc.tach
++++ b/calc.tach
+@@ -16 +16 @@
+-    var total = 0;
++    var total = 0 * n;
+@@ -18,0 +19 @@
++        // (a term)
 $ edit patch sum_to --pairs nothing.patch
 error edit.no-text: cannot read --pairs nothing.patch
 [exit 2]

@@ -67,9 +67,10 @@ calc.tach:6:16: error[type error] expected 'i64', got 'bool'  [edited: crate::ca
 error edit.breaks: 1 new error; nothing written
 try: tachyonc edit patch clamp --old 'return lo;' --new 'return true;' --no-check
 [exit 1]
-$ edit patch sum_to --old 'let mut' --new 'let' --old 'mut total' --new 'total'
-error patch.no-match: OLD 1 is not in crate::calc::sum_to; nearest, line 19: total = total + i;
-try: tachyonc edit patch sum_to --old 'l = t' --new let --old 'mut total' --new total
+$ edit patch sum_to --old 'var' --new 'let' --old 'var total' --new 'let total'
+error patch.ambiguous: OLD 1 occurs 2 times in crate::calc::sum_to, lines 16, 17; give more of the text around it, or --nth N (--all: every one)
+try: tachyonc edit patch sum_to --old 'var total = n * 0;' --new 'let total = n * 0;' --old 'var total' --new 'let total'
+try: tachyonc edit patch sum_to --old 'var i = 1;' --new 'let i = 1;' --old 'var total' --new 'let total'
 [exit 1]
 % git diff --stat
  calc.tach | 6 +++---
@@ -206,9 +207,10 @@ index 92630d6..5ce629b 100644
      total
 $ undo
 undid inserted in crate::calc::sum_to	calc.tach	+3 -0 lines
-$ edit insert --in sum_to --before 'mut' < $T/inputs/stmt.tach
-error patch.no-match: ANCHOR is not in crate::calc::sum_to; nearest, line 15: pub fn sum_to(n: i64) -> i64 {
-try: tachyonc edit insert --in sum_to --before m_t < text.tach
+$ edit insert --in sum_to --before 'var' < $T/inputs/stmt.tach
+error patch.ambiguous: ANCHOR occurs 2 times in crate::calc::sum_to, lines 16, 17; give more of the text around it, or --nth N
+try: tachyonc edit insert --in sum_to --before 'var total = 0;' < text.tach
+try: tachyonc edit insert --in sum_to --before 'var i = 1;' < text.tach
 [exit 1]
 ## (0.13: an anchor that is a whole line somewhere names that line)
 $ edit insert --in sum_to --before 'total' --dry-run < $T/inputs/stmt.tach
