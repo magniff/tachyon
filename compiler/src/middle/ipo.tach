@@ -14,7 +14,7 @@ use crate::base::{
 };
 use crate::front::effects::{
     EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_RAW_DIVERGE, EFF_RAW_PANIC,
-    EFF_UNKNOWN, Effects, fn_effects,
+    EFF_SYNC, EFF_THREAD, EFF_TLS, EFF_UNKNOWN, Effects, fn_effects,
 };
 use crate::front::effects::builtin::known_c_effects;
 use crate::front::types::{FNS, TLISTS, TYPES, TY_BOOL, TY_U64, TY_U8, is_float, is_integer};
@@ -33,6 +33,7 @@ use crate::middle::ir::{
 use crate::middle::ir::Op::{
     Add, Call, CallC, CallI, Cmp, Const, Copy, FAddr, Load, Param, SAddr, Store,
 };
+use crate::middle::ir::atomic::is_barrier;
 use crate::middle::ir::cfg::{succ, succ_count};
 use crate::middle::ir::verify::verify_func;
 use crate::middle::opt::{resolve_all, simplify_function};
@@ -136,7 +137,9 @@ fn effects_attrs(e: Effects, readnone_ok: bool) -> i64 {
     if (e.bits & (EFF_PANIC | EFF_RAW_PANIC)) == 0 {
         attrs = attrs | ATTR_NOPANIC;
     }
-    if readnone_ok && e.allocs == 0 && (e.bits & (EFF_IO | EFF_GLOBAL | EFF_ALLOC_EXTERN)) == 0 {
+    // (0.21: sync, thread and tls read and write memory other threads see)
+    let memory = EFF_IO | EFF_GLOBAL | EFF_ALLOC_EXTERN | EFF_SYNC | EFF_THREAD | EFF_TLS;
+    if readnone_ok && e.allocs == 0 && (e.bits & memory) == 0 {
         attrs = attrs | ATTR_READNONE | ATTR_READONLY;
     }
     attrs
@@ -244,6 +247,10 @@ fn compute_attrs(cx: sink *FnCtx, fi: i64) -> i64 {
                     if reads_shared(cx, copy_src(cx, v)) {
                         attrs = attrs & ~ATTR_READNONE;
                     }
+                } else if is_barrier(cx, v) {
+                    // (0.21) An atomic or a fence: shared memory read and
+                    // written, other threads synchronized with.
+                    attrs = attrs & ~(ATTR_READNONE | ATTR_READONLY);
                 } else if op.is_call() {
                     var known = call_attrs(cx, v);
                     if op == Call {

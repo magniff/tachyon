@@ -37,7 +37,7 @@
 // local source or call that brings a given effect.
 
 use crate::arch::{INTRS, intrinsic_effect_bits, intrinsic_of_fn};
-use crate::base::{IntVec, alloc_array, intern_c};
+use crate::base::{IntVec, SYMS, alloc_array, intern_c};
 use crate::base::timer::{T_CHECK, T_EFFECTS, timer_now, timer_sub};
 use crate::front::ast::{
     FN_BODY_FAILED, FN_SIG_FAILED, FN_UNSAFE, NODES, NODE_IN_BOUNDS, NODE_RAW, NodeKind, REPR_UNION,
@@ -47,19 +47,21 @@ use crate::front::check::{LOCALS, Res};
 use crate::front::check::unsafety::{NODE_NO_READ, is_borrow, is_borrow_param};
 use crate::front::closures::{CLOSURES, CLOSURE_COUNT};
 use crate::front::effects::{
-    ALLOC_ANY, EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_PANIC, EFF_RAW_DIVERGE, EFF_RAW_PANIC,
-    EFF_UNKNOWN, EFF_UNSAFE, Effects, FN_EFFECTS, FN_EFFECTS_COUNT, allocator_bit, effects_none,
-    effects_top,
+    ALLOC_ANY, EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_RAW_DIVERGE,
+    EFF_RAW_GLOBAL, EFF_RAW_PANIC, EFF_SYNC, EFF_TLS, EFF_UNKNOWN, EFF_UNSAFE, Effects, FN_EFFECTS,
+    FN_EFFECTS_COUNT, allocator_bit, effects_none, effects_top,
 };
 use crate::front::effects::builtin::unknown_c_effects;
 use crate::front::effects::check::extern_effects;
 use crate::front::modules::{STD_MODULE, qualify, within_std};
 use crate::front::modules::lookup::std_item_key;
+use crate::front::threadlocal::is_thread_local;
 use crate::front::traits::{IMPLS, impl_of_fn, std_trait};
 use crate::front::types::{
     FNS, FN_COUNT, STATICS, STRUCTS, SYM_STRUCT, TLISTS, TYPES, TY_ERROR, TyKind, struct_type,
     vec_lanes,
 };
+use crate::middle::lower::atomic::atomic_intrinsic;
 use crate::middle::lower::ssa::HMap;
 
 // The kinds of edges (above).
@@ -354,6 +356,17 @@ fn node_locals(f: i64) -> Effects {
             return Effects { bits: if raw { EFF_UNSAFE } else { intrinsic_effect_bits(intr) },
                 allocs: 0 };
         }
+        // (0.21: std's atomic intrinsics synchronize, and their bodies
+        // are never compiled; unsafe stays with their callers)
+        if atomic_intrinsic(f) >= 0 {
+            return Effects { bits: EFF_SYNC | EFF_UNSAFE, allocs: 0 };
+        }
+        // (0.21: the lock std's printing holds once threads run is part of
+        // its io, as waiting for a pipe is, over its statics (global):
+        // printing stays `io global panic`)
+        if is_print_lock(f) {
+            return Effects { bits: EFF_IO | EFF_GLOBAL, allocs: 0 };
+        }
         if is_top(f) {
             return effects_top();
         }
@@ -374,6 +387,19 @@ fn node_locals(f: i64) -> Effects {
         LOOPS.count = 0;
         walk(NODES[FNS[f].node].c);
         ACC
+    }
+}
+
+// (0.21) Whether f is one of std::fmt's print lock functions
+// (print_acquire, print_release and their _held parts).
+fn is_print_lock(f: i64) -> bool {
+    unsafe {
+        if !within_std(FNS[f].module) {
+            return false;
+        }
+        let text = SYMS[FNS[f].name].text;
+        text == "std.fmt.print_acquire" || text == "std.fmt.print_release"
+            || text == "std.fmt.print_acquire_held" || text == "std.fmt.print_release_held"
     }
 }
 
@@ -618,8 +644,10 @@ fn walk_ident(n: i64) {
         let res = NODES[n].res;
         if res == Res::Static {
             let s = NODES[n].y;
-            if s >= 0 && (STATICS[s].mutable || STATICS[s].linkage != 0) {
-                local(n, EFF_GLOBAL, 0);
+            if is_thread_local(s) {
+                local(n, EFF_TLS, 0);
+            } else if s >= 0 && (STATICS[s].mutable || STATICS[s].linkage != 0) {
+                local(n, EFF_GLOBAL | (if guarded_static(s) { 0 } else { EFF_RAW_GLOBAL }), 0);
             }
             return;
         }
@@ -637,6 +665,16 @@ fn walk_ident(n: i64) {
         if (FNS[f].attrs & FN_UNSAFE) != 0 {
             local(n, EFF_UNSAFE, 0);
         }
+    }
+}
+
+// (0.21) Whether static s is one of std's statics a lock guards once
+// threads run (std::fmt's print buffer, std::thread's thread-local keys):
+// global, not EFF_RAW_GLOBAL.
+fn guarded_static(s: i64) -> bool {
+    unsafe {
+        let t = SYMS[NODES[STATICS[s].node].a].text;
+        t.len > 8 && t[0..8] == "std.fmt." || t.len > 11 && t[0..11] == "std.thread."
     }
 }
 

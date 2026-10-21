@@ -24,6 +24,7 @@ use crate::middle::ir::{
 use crate::middle::ir::Op::{
     Add, And, CallC, Cmp, Const, Conv, Copy, GAddr, Load, Mul, Or, Phi, SAddr, Slot, Store, Xor,
 };
+use crate::middle::ir::atomic::is_barrier;
 use crate::middle::opt::{compute_dominators, resolve_all};
 use crate::middle::sroa::constant_load;
 
@@ -847,6 +848,20 @@ fn memory_step(cx: sink *FnCtx, v: i64) -> bool {
                 avail_kill_call(cx);
             }
         }
+        if is_barrier(cx, v) {
+            // (0.21) An atomic or a fence reads and writes all shared memory
+            // (docs/design/concurrency.md §4.2, O1): no store before it is
+            // dead, no value is forwarded across it.
+            var i = 0;
+            while i < cx.pending.count {
+                if !is_private_slot(cx, cx.pending.data[i]) {
+                    list_remove(&cx.pending, i, 4);
+                } else {
+                    i += 4;
+                }
+            }
+            avail_kill_call(cx);
+        }
         false
     }
 }
@@ -866,7 +881,7 @@ pub fn apply_block_kills(cx: sink *FnCtx, b: i64) {
                 var offset = 0;
                 let base = address_base(cx, ir_val(cx, copy_dst(cx, v)), &offset);
                 avail_kill(cx, base, offset, copy_size(cx, v));
-            } else if op.is_call() && call_writes(cx, v) {
+            } else if op.is_call() && call_writes(cx, v) || is_barrier(cx, v) {
                 avail_kill_call(cx);
             }
             v = cx.insts[v].next;
@@ -1103,7 +1118,7 @@ fn writes_for_calls(cx: sink *FnCtx, v: i64) -> bool {
             var offset = 0;
             return !is_private_slot(cx, address_base(cx, copy_dst(cx, v), &offset));
         }
-        op.is_call() && call_writes(cx, v)
+        op.is_call() && call_writes(cx, v) || is_barrier(cx, v)
     }
 }
 
