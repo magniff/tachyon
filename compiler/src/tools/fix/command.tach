@@ -9,6 +9,7 @@ use crate::base::{
 use crate::base::diag::{FIX_AT_FILE, FIX_AT_LINE, SUGGESTED};
 use crate::front::ambient::AMBIENT_GPA;
 use crate::front::ast::{KEEP_PARSED, NODES};
+use crate::front::conv::STRICT;
 use crate::front::generics::{TPL_NONE, template_of_key};
 use crate::front::modules::{
     C_MODULE, MODULES, STD_MODULE, item_key_if_known, module_count, within_std,
@@ -20,11 +21,16 @@ use crate::front::types::{
 };
 use crate::tools::edit::{TARGET, TARGET_NAME, edit_count};
 use crate::tools::edit::apply::{
-    LEFT_OK, STRICT_ALLOC, copy_rewritten, finish_edit, overlay_args, prepare_edit, set_command,
-    write_round,
+    CHECK_STRICT, LEFT_OK, STRICT_ALLOC, copy_rewritten, finish_edit, overlay_args, prepare_edit,
+    set_command, write_round,
 };
 use crate::tools::edit::cli::take_edit_option;
 use crate::tools::fix::{missing_use_edits, pub_edits, suggested_edits, unused_import_edits};
+use crate::tools::fixconv::{
+    CC_DEREF, CC_INOUT_LOCAL, CC_MARKER, CC_PARAM_INOUT, CC_PARAM_LET, CC_PARAM_SINK, CC_RECEIVER,
+    CC_SINK_CLOSURE, CC_STATIC, CC_TYPE, CC_UNMARKED, CC_VAR, CONV_COUNTS, CONV_LIST_LEFT,
+    CONV_SPELLING, conventions_edits, conventions_report,
+};
 use crate::tools::fiximports::{FIX_IMPORTS, fix_imports_edits};
 use crate::tools::fixstd015::std015_edits;
 use crate::tools::fixunsafe::{FIX_UNSAFE, WHOLE_BODIES, fix_unsafe_edits};
@@ -56,6 +62,10 @@ const F_ALLOC016: i64 = 128;
 const F_SUGGESTED: i64 = 256;
 // (0.17: --values, fixvalues.tach)
 const F_VALUES: i64 = 512;
+// (0.20: `--only conventions`, fixconv.tach; `conventions-spelling`: the
+// part the checker of Phase 0 means as 0.19 did)
+const F_CONV: i64 = 1024;
+const F_CONV_SPELLING: i64 = 2048;
 const F_SUGGESTS: i64 = F_IMPORTS | F_PUB | F_SUGGESTED;
 const F_ALL: i64 = 15;
 
@@ -368,6 +378,11 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
                 i += 2;
                 continue;
             }
+            if streq(a, c"--list-left") {
+                CONV_LIST_LEFT = true;
+                i += 1;
+                continue;
+            }
             if streq(a, c"--tidy-edited") {
                 TIDY_EDITED = true;
                 i += 1;
@@ -414,10 +429,12 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
                         else if word_is(w, c"std015") { F_STD015 }
                         else if word_is(w, c"alloc016") { F_ALLOC016 }
                         else if word_is(w, c"values") { F_VALUES }
+                        else if word_is(w, c"conventions") { F_CONV }
+                        else if word_is(w, c"conventions-spelling") { F_CONV_SPELLING }
                         else if word_is(w, c"suggested") { F_SUGGESTS } else { 0 };
                     if bit == 0 {
                         let d = diag(c"error", c"fix.usage");
-                        buf_str(d, c"--only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015, alloc016 or values, not '");
+                        buf_str(d, c"--only takes imports, unused, pub, unsafe, suggested, tidy-imports, reexports, std015, alloc016, values, conventions or conventions-spelling, not '");
                         buf_bytes(d, w);
                         buf_str(d, c"'\n");
                         return 2;
@@ -479,6 +496,14 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
             AMBIENT_GPA = true;
             STRICT_ALLOC = true;
         }
+        // (0.20: conventions reads the program as 0.19 meant it, mixed; the
+        // edited one is checked in 0.20's spelling, but by
+        // conventions-spelling's, which keeps 0.19's meaning)
+        if (only & (F_CONV | F_CONV_SPELLING)) != 0 {
+            CONV_SPELLING = (only & F_CONV) == 0;
+            CHECK_STRICT = !CONV_SPELLING;
+            STRICT = false;
+        }
         if !load_program(root, TARGET) {
             // (0.18) a program that does not parse: its errors' exact
             // fixes alone (a Rust label respelled)
@@ -508,6 +533,10 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
         let explicit = if (only & F_ALLOC016) != 0 { alloc016_edits() } else { 0 };
         let exact = if (only & F_SUGGESTED) != 0 { suggested_edits() } else { 0 };
         let valued = if (only & F_VALUES) != 0 { values_edits() } else { 0 };
+        let conv = if (only & (F_CONV | F_CONV_SPELLING)) != 0 { conventions_edits() } else { 0 };
+        if (only & (F_CONV | F_CONV_SPELLING)) != 0 {
+            conventions_report();
+        }
         let mut counts = [imports, wild, unused, public, wrapped, through, dropped, tidied,
             migrated, explicit, exact];
         if round {
@@ -543,7 +572,8 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
         // More rounds, on the edited program: a fix may let the checker
         // see more (the next unknown name of a statement). (--values: its
         // own fixed point, one round)
-        for _ in 0..if only == F_VALUES { 0 } else { 4 } {
+        let one_round = only == F_VALUES || only == F_CONV || only == F_CONV_SPELLING;
+        for _ in 0..if one_round { 0 } else { 4 } {
             if !more_round(root, only_arg, suggested, at, &mut counts) {
                 break;
             }
@@ -577,6 +607,23 @@ fn run_fix_inner(argc: i64, argv: **u8, alias: i64) -> i64 {
             put_count(what, VALUES_COUNTS[4], c"argument", c"arguments");
             put_count(what, VALUES_COUNTS[5], c"defer x.free() (dropped now)",
                 c"defer x.free()s (dropped now)");
+        }
+        if conv > 0 {
+            put_count(what, CONV_COUNTS[CC_PARAM_LET], c"parameter to let", c"parameters to let");
+            put_count(what, CONV_COUNTS[CC_PARAM_INOUT], c"parameter to inout",
+                c"parameters to inout");
+            put_count(what, CONV_COUNTS[CC_PARAM_SINK], c"parameter to sink",
+                c"parameters to sink");
+            put_count(what, CONV_COUNTS[CC_RECEIVER], c"receiver", c"receivers");
+            put_count(what, CONV_COUNTS[CC_MARKER], c"'&mut e' to '&e'", c"'&mut e's to '&e'");
+            put_count(what, CONV_COUNTS[CC_UNMARKED], c"'&e' to a let", c"'&e's to a let");
+            put_count(what, CONV_COUNTS[CC_DEREF], c"'*r' of an access", c"'*r's of accesses");
+            put_count(what, CONV_COUNTS[CC_VAR], c"'let mut' / 'mut x' to var",
+                c"'let mut's / 'mut x's to var");
+            put_count(what, CONV_COUNTS[CC_INOUT_LOCAL], c"inout local", c"inout locals");
+            put_count(what, CONV_COUNTS[CC_STATIC], c"static var", c"static vars");
+            put_count(what, CONV_COUNTS[CC_SINK_CLOSURE], c"sink closure", c"sink closures");
+            put_count(what, CONV_COUNTS[CC_TYPE], c"access type", c"access types");
         }
         let status = finish_edit(buf_slice(what), root);
         if AMBIGUOUS || ALLOC016_LEFT > 0 { 1 } else { status }

@@ -1471,3 +1471,54 @@ gate with the rehearsal (§9.3 step 7).
 - **The legacy crate is the whole root crate.** A test of the mode is a
   root of its own (tests/run/conv_legacy*): the pragma is read from
   file 0 only.
+
+## T2: the tools (2026-10-21, branch c20-conv-t2)
+
+**Built.** `fix --only conventions` (tools/fixconv.tach; §9.2 rules 1 to
+8, rule 8 reported), in two stages: `--only conventions-spelling`
+rewrites only what Phase 0's checker means as 0.19 did (`x: &T` → `x:
+let T`, `&e` to it and `*r` kept), so its result checks and runs as
+before; `--only conventions` finishes it (`x: T`, `&e` → `e`, `*r` → `r`,
+`&r` for an access passed on) and checks the result with
+`--syntax=0.20`. What needs a decision is `fix.conv_left` (`--list-left`
+prints each place). `refactor signature --convention x let|inout|sink`,
+`--type x 'inout T'`; extract-function in the crate's spelling
+(fixconv::put_type_conv, the tools' one printer); fmt's short receivers
+and, with `--syntax=0.20`, no written `let` in a parameter list.
+
+**The migration, measured** (scratch copies, not committed):
+
+| corpus | rewrites (spelling stage, then the rest) | left to hand |
+|---|---|---|
+| tests/run, tests/std, examples (816 roots) | 2,377 `var`, 596 `&mut e` → `&e`, 402 receivers, 305 inout / 296 let / 150 sink parameters, 65 `static var`, 15 inout locals, 12 access types, 4 `sink ||`; then 365 `&e` → `e`, 251 `*r` → `r` | 55 `let r = &e;`, 27 `&e`, 2 guessed, 1 `&&` |
+| compiler/std | 589 `var`, 473 receivers, 180 inout / 160 let / 138 sink, 150 access types, 46 `&mut e`, 27 `static var`; then 254 `&e` → `e`, 300 `*r`, 129 `&mut e` (generic bodies) | 26 `let r = &e;`, 125 `&e` (mostly generic bodies no instance checks) |
+| compiler/src (the 0.21 rehearsal, pragma removed) | 4,994 `var`, 1,501 `static var`, 1,446 sink, 898 `&mut e`, 357 inout, 223 let, 15 receivers; then 1,177 `*r`, 415 `&e` → `e`, 373 `&mut e` | 27 `let r = &e;`, 41 `&e`, 23 identifiers `var`/`inout`/`sink` |
+| guide blocks (142; 71 are err blocks) | 87 `var`, 26 receivers, 12 inout, 9 sink, 9 `&mut e`; then 8, 6 `&e` → `e`, 2 `*r` | 1 `&e`; 3 multi-file blocks by hand |
+
+- The spelling stage keeps every output: the suite passes on the
+  migrated tests/examples but for the err-tests and walkthroughs whose
+  text names the old spelling. compiler/src after it builds (mixed),
+  reaches the fixpoint, and `same-output` against the compiler before
+  it differs only in the compiler's path in try: lines.
+- After the full stage nothing is `conv.rust` in tests and examples;
+  83 of 512 checking roots, and compiler/src (45 `cannot assign to
+  immutable variable`, 5 `expected '&T', got 'T'`), fail in 0.20 mode
+  only for what T1 brings: writes through an access, a place given to a
+  let parameter, impls of std's traits matching across modes.
+
+**For T1 and the lead.**
+- std's same-code after the spelling stage differs in 85 of 2,493
+  compilations (HashMap insert, get_or_insert): a `sink` parameter is a
+  mutable binding, so a closure captures it by reference where 0.19
+  copied the immutable `key: K`. Outputs are the same; capturing a sink
+  binding the body never writes by copy would make the code the same.
+- `inout self` is `&mut Self`: for `impl [T]` that is not `&mut [T]`
+  (`sort(self)` cannot infer), so fix keeps the long form `self: inout
+  [T]` there; the parser's self_receiver could make the slice's form.
+- In mixed files Phase 0 makes `&x` exclusive only where a `&mut` is
+  expected of a non-generic callee: to a generic one (`read_line(&mut
+  b)`, `std::take`) `&x` stays shared, so the spelling stage keeps
+  `&mut x` there; the full stage (0.20 mode) rewrites it.
+- `PARAM_TYPE` stays true inside a parameter's nested types, so the
+  parser's conv.rust fix of `p: Option<&T>` is `Option<T>`, not
+  `Option<let T>`.
