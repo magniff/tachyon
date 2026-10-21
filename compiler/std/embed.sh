@@ -33,7 +33,8 @@
 # (0.15) It also writes std_index, the sections' index (index.awk), and
 # (0.20) std_files, where each file's text starts in std's text.
 #
-# usage: compiler/std/embed.sh [-c]   (-c: only check, exit 1 if stale)
+# usage: compiler/std/embed.sh [-c | --core]   (-c: only check, exit 1 if
+# stale; --core: the sections every program reads, and why)
 set -eu
 cd "$(dirname "$0")/../.."
 out=compiler/src/front/stdsrc.tach
@@ -94,6 +95,16 @@ walk() (
 # shellcheck disable=SC2086
 walk std "" $ROOT_FILES
 wc -c <"$text" | tr -d ' ' >>"$map"
+
+# (0.21.1) --core: the sections every program reads (index.awk's core),
+# each with why (the section and the name that need it), and their total.
+if [ "${1:-}" = "--core" ]; then
+    rm -f "$tmp"
+    { cat "$text"; cat compiler/std/gpa.tach
+        echo "pub const CHECK_ALLOC: bool = false;"; cat compiler/std/sys/macos.tach; } |
+        LC_ALL=C awk -v why=1 -f compiler/std/index.awk
+    exit 0
+fi
 
 # (sed, not awk: awks differ on backslashes in replacements.)
 # (0.21) Up to about 2000 bytes of lines in one call: a program's std is
