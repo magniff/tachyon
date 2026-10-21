@@ -3,7 +3,7 @@
 ## from a program read for a text already replaced; the last one is
 ## answered, after one reading, with the change's errors.
 > {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
-< {"jsonrpc":"2.0","id":1,"result":{"capabilities":{"positionEncoding":"utf-16","textDocumentSync":{"openClose":true,"change":1,"save":{"includeText":true}},"definitionProvider":true,"referencesProvider":true,"hoverProvider":true,"documentSymbolProvider":true},"serverInfo":{"name":"tachyonc","version":"0.19.1"}}}
+< {"jsonrpc":"2.0","id":1,"result":{"capabilities":{"positionEncoding":"utf-16","textDocumentSync":{"openClose":true,"change":1,"save":{"includeText":true}},"definitionProvider":true,"referencesProvider":true,"hoverProvider":true,"documentSymbolProvider":true},"serverInfo":{"name":"tachyonc","version":"@VERSION@"}}}
 > @open main.tach
 > {"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.tach"},"position":{"line":7,"character":12}}}
 < {"jsonrpc":"2.0","id":2,"error":{"code":-32801,"message":"content modified"}}
