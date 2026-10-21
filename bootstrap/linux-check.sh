@@ -172,11 +172,13 @@ tar -C "$SNAP" -c -f - src | docker run --rm -i --name "$CONTAINER" --cpus "$CPU
         # The newest release built here, in the order of releases.toml (tags
         # never sorted as text: v0.10.0 comes after v0.9.0).
         previous=""
-        for tag in $(sh bootstrap/release-tags.sh); do
-            for p in "$boot"/"$tag"-*/tachyonc; do
+        # (0.21: each release by its compiler's name, bin)
+        sh bootstrap/release-tags.sh --bins >/tmp/release-bins
+        while read -r tag bin; do
+            for p in "$boot"/"$tag"-*/"$bin"; do
                 [ -x "$p" ] && previous=$p
             done
-        done
+        done </tmp/release-bins
         seed=$(ls -d "$boot"/seed-*/target/release/tachyon 2>/dev/null | head -1) || true
         bench/run.sh ${previous:+-p "$previous"} ${seed:+-s "$seed"} -r 3 || status=1
     fi
