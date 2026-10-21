@@ -381,16 +381,16 @@ END {
             # std's modules (0.20) define the same names for other things
             # (std::io's Result, std::fs's write, std::env's get)
             nd = split(keys_list[j], dw, " ")
-            for (k = 1; k <= nd && !need; k++) if ((i, dw[k]) in USES && sees(i, dw[k], j)) need = 1
+            for (k = 1; k <= nd && !need; k++) if ((i, dw[k]) in USES && sees(i, dw[k], j)) { need = 1; reason = "the name " dw[k] }
             nd = split(NEEDS[title[j]], dw, " ")
-            for (k = 1; k <= nd && !need; k++) if ((i, dw[k]) in USES) need = 1
+            for (k = 1; k <= nd && !need; k++) if ((i, dw[k]) in USES) { need = 1; reason = "the name " dw[k] " (NEEDS)" }
             np = split(impls[j], ip, " ")
             for (k = 1; k + 1 <= np && !need; k += 2) {
                 tr = ip[k]
                 ty = ip[k + 1]
-                if (((i, tr) in USES || (i, tr) in DEFS) && (ty == "*" || (i, ty) in USES || (i, ty) in DEFS)) need = 1
+                if (((i, tr) in USES || (i, tr) in DEFS) && (ty == "*" || (i, ty) in USES || (i, ty) in DEFS)) { need = 1; reason = "impl " tr " for " ty }
             }
-            if (need) deps[i] = deps[i] " " j
+            if (need) { deps[i] = deps[i] " " j; why_[i, j] = reason }
         }
         core[i] = !(title[i] in LAZY)
     }
@@ -406,7 +406,7 @@ END {
                 # use lines are core) a lazy section stays lazy: the loader
                 # reads it, and what it needs, when a program reaches it
                 if ((gate[i] in CLOSED) && gate[i] == gate[dd[k]]) continue
-                if (!core[dd[k]]) { core[dd[k]] = 1; changed = 1 }
+                if (!core[dd[k]]) { core[dd[k]] = 1; changed = 1; coreby[dd[k]] = i }
             }
         }
     }
@@ -442,6 +442,21 @@ END {
             sec_impls = ""
         }
         printf "%d %d %d|%s|%s|%s|%s\n", start[i], end_[i], core[i], substr(words, 2), substr(items, 2), substr(sec_impls, 2), substr(deps[i], 2)
+    }
+    # (0.21.1) `-v why=1` (embed.sh --core): the core sections, each with
+    # why it is read by every program, instead of the index
+    if (why) {
+        nc = 0; bytes = 0
+        for (i = 0; i <= count; i++) {
+            if (!core[i]) continue
+            nc++; bytes += end_[i] - start[i]
+            if (i in coreby) r = "needed by " coreby[i] " [" title[coreby[i]] "] for " why_[coreby[i], i]
+            else r = "core itself (not in index.awk's LAZY)"
+            t = title[i] == "" ? "(std's head)" : title[i]
+            printf "%d\t%d\t%s\t%s\n", i, end_[i] - start[i], t, r
+        }
+        printf "core: %d of %d sections, %d bytes\n", nc, count + 1, bytes
+        exit
     }
     # (the titles, for a reader of the index: not read by the compiler)
     for (i = 0; i <= count; i++) printf "# %d %s%s\n", i, title[i], core[i] ? "" : " (lazy)"

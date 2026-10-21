@@ -1689,7 +1689,18 @@ memory to the exit; added after two memory bugs of 0.17, an SLP table
 overflow and a read of the own pass's place -1, passed every macOS check
 and only valgrind showed them; about 2 minutes, beside the container's other steps; on its own:
 `bootstrap/aarch64-linux-check.sh --worktree --dev --compiler
-target/tachyonc --only valgrind`); and the two containers: `linux-x86_64`
+target/tachyonc --only valgrind`); `compile-cost` (0.21.1, in `--quick`
+too, a few seconds: `tests/compile_cost.sh`, the instructions retired,
+from `/usr/bin/time -l`, the fewest of three runs, of building a hello
+world and tests/cost/std_heavy.tach and of `check` of a copy of
+compiler/src, with this compiler and with the newest release built here
+that is not this commit; it fails when a build costs more than 1.5 times
+the release's or `check` more than 1.15 times, and prints the three
+numbers with their ratios; added after 0.20's std made a hello world 5.5
+times dearer unnoticed: std's index made 660 KB of std core;
+`compiler/std/embed.sh --core` lists the core sections, each with the
+section and the name that pull it in, and `tests/std/core_sections.sh`,
+run by the suite, bounds their bytes); and the two containers: `linux-x86_64`
 (`bootstrap/linux-check.sh`, which builds its own chain and so starts at
 once) and `linux-aarch64` (`bootstrap/aarch64-linux-check.sh --compiler`:
 the chain's compiler cross-compiles the tree). Inside each container the
