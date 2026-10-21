@@ -1,0 +1,63 @@
+// Compute: a sum of 1M u32s by threadgroup memory and an atomic, checked
+// against the CPU's sum.
+// EXPECT: reduce ok
+
+use std::gpu::{BindingType, BufferUsage, Reflection, ShaderSource};
+
+const MSL: [[u8]; 15] = [
+    "#include <metal_stdlib>",
+    "using namespace metal;",
+    "kernel void reduce(device const uint* xs [[buffer(0)]], device atomic_uint* total [[buffer(1)]],",
+    "                   constant uint& n [[buffer(2)]],",
+    "                   uint i [[thread_position_in_grid]], uint l [[thread_position_in_threadgroup]]) {",
+    "    threadgroup uint tmp[256];",
+    "    tmp[l] = i < n ? xs[i] : 0;",
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+    "    for (uint s = 128; s > 0; s >>= 1) {",
+    "        if (l < s) { tmp[l] += tmp[l + s]; }",
+    "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+    "    }",
+    "    if (l == 0) { atomic_fetch_add_explicit(total, tmp[0], memory_order_relaxed); }",
+    "}",
+    "",
+];
+
+fn main(gpa: Gpa) -> i32 {
+    let inst = std::gpu::Instance::new_in(gpa);
+    let adapter = inst.adapter().unwrap();
+    let (dev, var queue) = adapter.device().unwrap();
+    var text = lines(MSL[..], gpa);
+    var refl = Reflection::new_in(gpa);
+    refl.compute("main", "reduce", 256);
+    refl.bind(0, 0, BindingType::ReadOnlyStorage, compute: 0);
+    refl.bind(0, 1, BindingType::Storage, compute: 1);
+    refl.bind(0, 2, BindingType::Uniform, compute: 2);
+    let src = ShaderSource::msl(text.as_slice(), refl);
+    var shader = dev.shader(src).unwrap();
+    var pipe = dev.compute_pipeline(shader, "main").unwrap();
+
+    let n = 1000003;
+    var xs: Vec<u32> = Vec::new_in(gpa);
+    var want: u32 = 0;
+    for i in 0..n {
+        let v = ((i * 7919) % 101) as u32;
+        xs.push(v);
+        want += v;
+    }
+    var xb = dev.buffer_init(std::gpu::bytes_of_u32(xs.as_slice()), BufferUsage::STORAGE);
+    var total = dev.buffer(4, BufferUsage::STORAGE | BufferUsage::MAP_READ);
+    let params: [u32; 4] = [n as u32, 0, 0, 0];
+    var pb = dev.buffer_init(std::gpu::bytes_of_u32(params[..]), BufferUsage::UNIFORM);
+    var group = dev.bind_group(pipe.bind_layout(0),
+        [std::gpu::bind(0, xb), std::gpu::bind(1, total), std::gpu::bind(2, pb)][..]);
+    var enc = dev.encoder();
+    enc.compute_pass(|pass| {
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, group);
+        pass.dispatch((n + 255) / 256);
+    });
+    queue.submit(enc.finish());
+    let got = std::gpu::u32s(total.map_read(dev))[0];
+    if got == want { println("reduce ok"); } else { println(f"reduce: {got}, the CPU {want}"); }
+    0
+}

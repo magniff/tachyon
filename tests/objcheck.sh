@@ -172,6 +172,10 @@ check() { # <file> <level> <dir> [-g]
     # The case's FLAGS (0.17: --values=off, --check-alloc, ...), as
     # tests/run.sh builds it.
     flags=$(case_flags "$f")
+    # (-l and -L are for the link: kept out of -c and -S, given to both
+    # links, as for examples/gpu's `-l objc`.)
+    libs=$(echo " $flags" | grep -o -- ' -[lL] *[^ -][^ ]*' | tr '\n' ' ')
+    flags=$(echo " $flags" | sed 's/ -[lL] *[^ -][^ ]*//g')
     # (--check-unsafe needs the IR: -O1 for -O0, as tests/run.sh does.)
     case "$o:$flags" in 0:*--check-unsafe*) o=1 ;; esac
     # shellcheck disable=SC2086
@@ -181,9 +185,9 @@ check() { # <file> <level> <dir> [-g]
     # shellcheck disable=SC2086
     cc_run $LINK_FLAGS -c "$d/prog.s" -o "$d/cc.o" >"$d/out" 2>&1 || { echo "FAIL $f -O$o: cc -c"; return; }
     # shellcheck disable=SC2086
-    cc_run $LINK_FLAGS -o "$d/ours" "$d/ours.o" -lm >"$d/out" 2>&1 || { echo "FAIL $f -O$o: linking ours: $(head -c 300 "$d/out")"; return; }
+    cc_run $LINK_FLAGS -o "$d/ours" "$d/ours.o" $libs -lm >"$d/out" 2>&1 || { echo "FAIL $f -O$o: linking ours: $(head -c 300 "$d/out")"; return; }
     # shellcheck disable=SC2086
-    cc_run $LINK_FLAGS -o "$d/cc" "$d/cc.o" -lm >"$d/out" 2>&1 || { echo "FAIL $f -O$o: linking cc's"; return; }
+    cc_run $LINK_FLAGS -o "$d/cc" "$d/cc.o" $libs -lm >"$d/out" 2>&1 || { echo "FAIL $f -O$o: linking cc's"; return; }
     code "$d/ours" >"$d/ours.code"
     code "$d/cc" >"$d/cc.code"
     if ! cmp -s "$d/ours.code" "$d/cc.code"; then
@@ -240,6 +244,8 @@ for f in tests/run/*.tach tests/run/*/main.tach examples/*/main.tach examples/*/
     case_directives "$f" "$dd"
     [ -s "$dd/xfail" ] && continue
     grep -qw clang "$dd/requires" 2>/dev/null && ! "$CC" --version 2>/dev/null | grep -qi clang && continue
+    # (0.22) std::gpu's examples need Metal: macOS only.
+    case "$TARGET" in *-macos) ;; *) grep -qw metal "$dd/requires" 2>/dev/null && continue ;; esac
     echo "$f" >>"$list"
 done
 # (0.19) The intrinsics' generated programs (tests/arch/gen.sh), of the

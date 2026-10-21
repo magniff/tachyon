@@ -54,8 +54,63 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.19.1 | `v0.19.1` | 0.19.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | two soundness fixes: the store intrinsics' destination is `&mut [T]` (a store through a read-only view, or while a view of the buffer is used, is an error), and 0.17's transitional rule accepting a read-only `[T]` where `&mut [T]` is wanted is gone (`fix --values` migrates); examples/arch/sha256sum, coreutils-compatible on the SHA-256 instructions, faster than macOS's sha256sum and OpenSSL, about 5 times coreutils' on Linux |
 | 0.20.0 | `v0.20.0` | 0.19.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | parameter conventions in Hylo's spelling, the default syntax: `let` (the default), `inout` with `&x` at the call, `sink`, `var`, accesses used as their values; Rust's spellings `conv.rust` errors with a `try:`, `fix --only conventions` migrates, std, tests, examples, bench and the eval on it (compiler/src on the 0.19 pragma until 0.21); std as a module tree; HashMap/HashSet on a Swiss table (foldhash, SipHash-1-3), BTreeMap/BTreeSet, ipnsort and driftsort; `String` and `str`, std::unicode (UTF-8, graphemes, width, case, Unicode 18), number formatting and parsing; std::io, fs, path, env, process, time, random; owned temporaries dropped at the statement's end; `tachyonc lsp` |
 | 0.21.0 | `v0.21.0` | 0.20.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | concurrency: safe `std::thread::spawn` and `scope` with what crosses threads checked (Send and Sync from the types), `std::sync` (atomics with every ordering, Mutex, RawLock, Once, Condvar, mpsc channels), `#[thread_local]`, effects `thread`, `sync`, `tls`, atomics as barriers in the optimizer; the compiler's source in 0.20's conventions, the 0.19 spelling removed (`var`, `inout`, `sink` keywords; the mixed reading only inside fix's migrations); `.vl` sources and `VOLE_*` variables accepted |
+| 0.22.0 | `v0.22.0` | 0.21.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | GPU: `std::gpu`, a wgpu-like API native-first with the Metal backend (device, queue, buffers, textures, samplers, bind groups, compute and render pipelines, command encoders, headless surfaces) over `std::objc`, the sizes of runtime-sized arrays bound per dispatch and draw; `std::gpu::wgsl`, a WGSL compiler to MSL with reflection, `Device::shader_wgsl`; std's section index fixed (a hello world 357 M to 96 M instructions) and a compile-cost gate row; std own-checked; `f(x?)` into a `let` parameter kept alive through the call; `fn(T)` is `fn(let T)` |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.22
+
+GPU support in std, native-first, on wgpu's model; the design is
+docs/design/gpu.md (with "0.22.0 as built"), the guide
+`tachyonc guide gpu`, the examples examples/gpu/{compute,triangle}.
+
+- **std::gpu**: instance, adapter, device, queue, buffers, textures,
+  samplers, bind groups, compute and render pipelines, command encoders
+  and headless surfaces, on wgpu's model but with tachyon's values:
+  resources dropped by their destructors, allocation through allocators,
+  the validation rules as `gpu.*` contracts. The Metal backend
+  (`std::gpu::hal::metal`, behind `hal::Api`) on macOS, built on
+  **std::objc** (typed `objc_msgSend` bindings generated from tables by
+  tools/objcgen, checked against the runtime); link with `-l objc`.
+  Runtime-sized arrays' bounds go in a sizes buffer given per dispatch
+  and draw. The per-frame functions allocate nothing (tests/gpu checks
+  it). Encoding 10,000 draws: 266 µs against Objective-C's 256 µs
+  (1.04x) and wgpu 30's 498 µs.
+- **std::gpu::wgsl**: a WGSL shader compiler written in tachyon (front
+  end, IR, uniformity analysis, an interpreter as the oracle, MSL with
+  bounds checks and WGSL's float-to-int bounds), with reflection (the
+  bindings, per-stage slots, workgroup sizes). `Device::shader_wgsl(text)`
+  and `shader::from_wgsl` go straight into a pipeline; tools/wgslc is
+  the command line. On the bench's corpus it translates in 2.9 ms where
+  naga 29 takes 8.3 ms.
+- **Compile speed**: std's section index lists no impls behind a closed
+  gate, so a small program reads 144 KB of std instead of 660 KB: a
+  hello world 357 M to 96 M instructions (0.27x), a std-heavy program
+  0.96x, check of the compiler 1.01x. A new gate row, `compile-cost`, fails at 1.5x (small
+  programs) or 1.15x (the compiler) of the previous release; a test
+  bounds std's core size.
+- **Soundness**: `f(x?)` into a `let` parameter freed the value before
+  the call; it is kept through it. std goes through the own pass
+  (tests/std/own.sh, its known findings in tests/std/own.allowed);
+  std::num's digit writers take their buffers `inout`.
+- **Fixes**: `check` no longer overflows its stack on an unimported
+  `AtomicI64` or `Ordering` in a scope's closure; `fn(T)` is the same
+  type as `fn(let T)` (std's consuming bounds say `sink`); fmt keeps
+  `Vec<[i64; 2]>` and the lines after it; tests/run.sh's `TIMEOUT`
+  directive (lru-cache at -O0).
+- **Tested on aarch64 only**, as since 0.15 (`gate.sh --with-x86`); the
+  GPU tests run where Metal is (`REQUIRES: metal`).
+- **Known issues**, for 0.22.1: the let-as-borrow rule; a closure's
+  by-value parameters leak (dropping them double-frees HashMap
+  iteration items); `gl(make())`; `std::take(&self)`'s try; a generic
+  struct over an associated type is not yet supported, so a build has
+  one GPU backend; the own pass reads a `Buf<ScopedArena>` as viewing
+  what is pushed into it (six allowed findings in std::gpu::wgsl::msl);
+  std's core, read by every program, is 144 KB (printing's lock pulls
+  in 0.21's atomics and locks, std::gpu's gate keeps its `mod` sections
+  core), its bound 160 KB until it is under 128 KB again;
+  the Vulkan, D3D12 and CUDA backends are not written (designed in
+  docs/design/gpu.md).
 
 ### What's new in 0.21
 
@@ -1689,7 +1744,18 @@ memory to the exit; added after two memory bugs of 0.17, an SLP table
 overflow and a read of the own pass's place -1, passed every macOS check
 and only valgrind showed them; about 2 minutes, beside the container's other steps; on its own:
 `bootstrap/aarch64-linux-check.sh --worktree --dev --compiler
-target/tachyonc --only valgrind`); and the two containers: `linux-x86_64`
+target/tachyonc --only valgrind`); `compile-cost` (0.21.1, in `--quick`
+too, a few seconds: `tests/compile_cost.sh`, the instructions retired,
+from `/usr/bin/time -l`, the fewest of three runs, of building a hello
+world and tests/cost/std_heavy.tach and of `check` of a copy of
+compiler/src, with this compiler and with the newest release built here
+that is not this commit; it fails when a build costs more than 1.5 times
+the release's or `check` more than 1.15 times, and prints the three
+numbers with their ratios; added after 0.20's std made a hello world 5.5
+times dearer unnoticed: std's index made 660 KB of std core;
+`compiler/std/embed.sh --core` lists the core sections, each with the
+section and the name that pull it in, and `tests/std/core_sections.sh`,
+run by the suite, bounds their bytes); and the two containers: `linux-x86_64`
 (`bootstrap/linux-check.sh`, which builds its own chain and so starts at
 once) and `linux-aarch64` (`bootstrap/aarch64-linux-check.sh --compiler`:
 the chain's compiler cross-compiles the tree). Inside each container the

@@ -1,0 +1,260 @@
+// ---- Shader compiler implementation, job (0.22) ----
+// Jobs: a compute dispatch with its buffers, run by the interpreter
+// (`wgslc run`) or turned into the input of tests/wgsl/metalrun
+// (`wgslc metal-job`), whose output has the same form, so the two compare
+// as text. A job file:
+//
+//   entry NAME                  the entry point (default: the first compute one)
+//   dispatch X Y Z              workgroups
+//   buffer G B BYTES [random SEED | WORD...]   a binding's size and contents
+//
+// Words are decimal or 0x hex; missing words are zero. The output is each
+// buffer, in the job's order: `buffer G B`, then its words in hex.
+
+use api::{fill_error, new_error};
+use front::new_front;
+use interp::new_interp;
+use ir::{Module, STAGE_COMPUTE, V};
+use std::{Allocator, Buf, Option, Scanner, ScopedArena, Vec, parse_int, split_whitespace_in};
+use std::Option::{None, Some};
+use std::Result::{Err, Ok};
+
+pub struct JobBuffer { group: i64, binding: i64, bytes: i64, words: V<u32> }
+
+// A texture: its format (`rgba8unorm`, `r8unorm`, `rgba32float`,
+// `rgba32uint`) and texels as words (rgba8unorm: one a texel; r8unorm:
+// four texels a word; the 32-bit formats: four words a texel).
+pub struct JobTexture { group: i64, binding: i64, format: [u8], w: i64, h: i64, words: V<u32> }
+
+// call_n >= 0: a call job (`call ENTRY N`): the entry runs once per input
+// record (`input BYTES ...`), its results printed as `buffer -2 0`.
+pub struct Job {
+    entry: [u8], groups: [i64; 3], buffers: V<JobBuffer>, call_n: i64, input: V<u32>,
+    textures: V<JobTexture>
+}
+
+fn xorshift(s: inout u32) -> u32 {
+    var x = s;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 17);
+    x = x ^ (x << 5);
+    s = x;
+    x
+}
+
+// A job word: decimal, 0x hex, or a float with a point (its f32 bits).
+fn parse_word(t: [u8]) -> Option<u32> {
+    for i in 0..t.len {
+        if t[i] == '.' {
+            return match std::num::parse_f64(t) {
+                Ok(v) => Some(ir::f32_bits(v as f32)),
+                Err(_) => None,
+            };
+        }
+    }
+    if t.len > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X') {
+        var v: u64 = 0;
+        for i in 2..t.len {
+            let c = t[i];
+            let d = if c >= '0' && c <= '9' { c - '0' }
+                else if c >= 'a' && c <= 'f' { c - 'a' + 10 }
+                else if c >= 'A' && c <= 'F' { c - 'A' + 10 } else { return None; };
+            v = v * 16 + d as u64;
+        }
+        return Some(v as u32);
+    }
+    match parse_int(t) {
+        Ok(v) => Some(v as u32),
+        Err(_) => None,
+    }
+}
+
+// words[from ..]: `random SEED` or the words themselves.
+fn fill_words<B: Allocator>(v: inout V<u32>, words: Vec<[u8], ScopedArena>, from: i64,
+    err: inout Buf<B>) -> bool {
+    if words.len() >= from + 2 && words[from] == "random" {
+        var s = parse_word(words[from + 1]).unwrap_or(1);
+        if s == 0 {
+            s = 1;
+        }
+        for k in 0..v.len() {
+            v[k] = xorshift(&s);
+        }
+        return true;
+    }
+    for k in from..words.len() {
+        if k - from >= v.len() {
+            break;
+        }
+        match parse_word(words[k]) {
+            Some(x) => v[k - from] = x,
+            None => {
+                err.push_fmt(f"not a word: '{words[k]}'");
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// A job texture's texels as the interpreter holds them: four words each,
+// f32 bits for the unorm and float formats (unorm: n / 255).
+pub fn texels(t: JobTexture, a: ScopedArena) -> V<u32> {
+    let n = t.w * t.h;
+    var v: V<u32> = Vec::filled_in(4 * n, 0u32, a);
+    for i in 0..n {
+        if t.format == "rgba8unorm" {
+            let x = t.words[i];
+            for c in 0..4 {
+                let b = (x >> (8 * c) as u32) & 255;
+                v[4 * i + c] = ir::f32_bits(b as f32 / 255.0);
+            }
+        } else if t.format == "r8unorm" {
+            let b = (t.words[i / 4] >> (8 * (i % 4)) as u32) & 255;
+            v[4 * i] = ir::f32_bits(b as f32 / 255.0);
+            v[4 * i + 3] = ir::f32_bits(1.0);
+        } else {
+            for c in 0..4 {
+                v[4 * i + c] = t.words[4 * i + c];
+            }
+        }
+    }
+    v
+}
+
+pub fn parse_job<B: Allocator>(text: [u8], a: ScopedArena, err: inout Buf<B>) -> Option<Job> {
+    var job = Job {
+        entry: "", groups: [1, 1, 1], buffers: Vec::new_in(a), call_n: -1, input: Vec::new_in(a),
+        textures: Vec::new_in(a)
+    };
+    var sc = Scanner::new(text);
+    while let Some(line) = sc.next_line() {
+        let words = split_whitespace_in(line, a);
+        if words.len() == 0 || words[0][0] == '#' {
+            continue;
+        }
+        let kw = words[0];
+        if kw == "entry" && words.len() == 2 {
+            job.entry = words[1];
+        } else if kw == "dispatch" && words.len() == 4 {
+            for k in 0..3 {
+                job.groups[k] = parse_int(words[k + 1]).unwrap_or(1);
+            }
+        } else if kw == "call" && words.len() == 3 {
+            job.entry = words[1];
+            job.call_n = parse_int(words[2]).unwrap_or(0);
+        } else if kw == "input" && words.len() >= 2 {
+            let bytes = parse_int(words[1]).unwrap_or(0);
+            job.input = Vec::filled_in(bytes / 4, 0u32, a);
+            if !fill_words(&job.input, words, 2, &err) {
+                return None;
+            }
+        } else if kw == "texture" && words.len() >= 6 {
+            let w = parse_int(words[4]).unwrap_or(0);
+            let h = parse_int(words[5]).unwrap_or(0);
+            let fm = words[3];
+            let n = if fm == "rgba8unorm" { w * h } else if fm == "r8unorm" { (w * h + 3) / 4 }
+                else if fm == "rgba32float" || fm == "rgba32uint" { 4 * w * h } else { -1 };
+            if n < 0 || w <= 0 || h <= 0 {
+                err.push_fmt(f"a texture is FORMAT W H with a format of rgba8unorm, r8unorm, rgba32float, rgba32uint: {line}");
+                return None;
+            }
+            var t = JobTexture {
+                group: parse_int(words[1]).unwrap_or(0), binding: parse_int(words[2]).unwrap_or(0),
+                format: fm, w: w, h: h, words: Vec::filled_in(n, 0u32, a)
+            };
+            if !fill_words(&t.words, words, 6, &err) {
+                return None;
+            }
+            job.textures.push(t);
+        } else if kw == "buffer" && words.len() >= 4 {
+            let bytes = parse_int(words[3]).unwrap_or(0);
+            if bytes <= 0 || bytes % 4 != 0 {
+                err.push_fmt(f"a buffer's size is a positive multiple of 4: {line}");
+                return None;
+            }
+            var b = JobBuffer {
+                group: parse_int(words[1]).unwrap_or(0), binding: parse_int(words[2]).unwrap_or(0),
+                bytes: bytes, words: Vec::filled_in(bytes / 4, 0u32, a)
+            };
+            if words.len() >= 6 && words[4] == "random" {
+                var s = parse_word(words[5]).unwrap_or(1);
+                if s == 0 {
+                    s = 1;
+                }
+                for k in 0..bytes / 4 {
+                    b.words[k] = xorshift(&s);
+                }
+            } else {
+                for k in 4..words.len() {
+                    if k - 4 >= bytes / 4 {
+                        break;
+                    }
+                    match parse_word(words[k]) {
+                        Some(w) => b.words[k - 4] = w,
+                        None => {
+                            err.push_fmt(f"not a word: '{words[k]}'");
+                            return None;
+                        }
+                    }
+                }
+            }
+            job.buffers.push(b);
+        } else {
+            err.push_fmt(f"cannot read this job line: {line}");
+            return None;
+        }
+    }
+    Some(job)
+}
+
+// The entry point a job names (or the first compute one), or -1.
+pub fn find_entry(m: Module, name: [u8]) -> i64 {
+    for e in 0..m.entries.len() {
+        if m.entries[e].stage == STAGE_COMPUTE && (name.len == 0 || m.entries[e].name == name) {
+            return e;
+        }
+    }
+    -1
+}
+
+// The entry point of any stage named `name`, or -1.
+pub fn find_any_entry(m: Module, name: [u8]) -> i64 {
+    for e in 0..m.entries.len() {
+        if m.entries[e].name == name {
+            return e;
+        }
+    }
+    -1
+}
+
+// The global bound at (group, binding), or -1.
+pub fn find_global(m: Module, g: i64, b: i64) -> i64 {
+    for i in 0..m.globals.len() {
+        if m.globals[i].group == g && m.globals[i].binding == b {
+            return i;
+        }
+    }
+    -1
+}
+
+pub fn print_words<A: Allocator>(group: i64, w: V<u32>, out: inout Buf<A>) {
+    out.push_fmt(f"buffer {group} 0\n");
+    for k in 0..w.len() {
+        out.push_fmt(f"{w[k]:08x}");
+        out.push(if k % 8 == 7 || k == w.len() - 1 { '\n' } else { ' ' });
+    }
+}
+
+// Each job buffer's words: words[idx[i]] for the job's i-th buffer.
+pub fn print_buffers<A: Allocator>(job: Job, words: V<V<u32>>, idx: V<i64>, out: inout Buf<A>) {
+    for i in 0..job.buffers.len() {
+        let b = job.buffers[i];
+        out.push_fmt(f"buffer {b.group} {b.binding}\n");
+        let w = words[idx[i]];
+        for k in 0..w.len() {
+            out.push_fmt(f"{w[k]:08x}");
+            out.push(if k % 8 == 7 || k == w.len() - 1 { '\n' } else { ' ' });
+        }
+    }
+}

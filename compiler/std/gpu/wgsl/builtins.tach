@@ -1,0 +1,1212 @@
+// ---- Shader compiler implementation, builtins (0.22) ----
+// Calls: user functions, value constructors (`vec3<f32>(...)`, `S(...)`,
+// inferred `vec3(...)` and `array(...)`), and WGSL's builtin functions
+// with their overloads.
+
+use front::{Front, VK_CONST, VK_REF, VK_VALUE, VK_VOID, Val, cint, val};
+use ir::{
+    ACC_RW, AT_ADD, AT_AND, AT_CMPXCHG, AT_EXCHANGE, AT_LOAD, AT_MAX, AT_MIN, AT_OR, AT_STORE,
+    AT_SUB, AT_XOR, BARRIER_STORAGE, BARRIER_WORKGROUP, E_ARRAY_LENGTH, E_ATOMIC_RESULT, E_BITCAST,
+    E_COMPOSE, E_CONVERT, E_DERIVATIVE, E_GLOBAL, E_IMAGE_LOAD, E_IMAGE_QUERY, E_IMAGE_SAMPLE,
+    E_MATH, E_SELECT, E_SPLAT, E_WG_UNIFORM_RESULT, E_ZERO, IMG_SAMPLE, IMG_SAMPLE_BIAS,
+    IMG_SAMPLE_COMPARE, IMG_SAMPLE_COMPARE_LEVEL, IMG_SAMPLE_LEVEL, IQ_LAYERS, IQ_LEVELS, IQ_SIZE,
+    MF_ALL, MF_ANY, MF_CROSS, MF_DETERMINANT, MF_DISTANCE, MF_DOT, MF_EXTRACT_BITS, MF_INSERT_BITS,
+    MF_LDEXP, MF_LENGTH, MF_TRANSPOSE, SK_AFLOAT, SK_AINT, SK_BOOL, SK_F32, SK_I32, SK_U32,
+    SP_HANDLE, SP_STORAGE, SP_WORKGROUP, STAGE_COMPUTE, STAGE_FRAGMENT, S_ATOMIC, S_BARRIER,
+    S_IMAGE_STORE, S_WG_UNIFORM_LOAD, StructMember, TEX_2D_ARRAY, TEX_DEPTH_2D, TEX_STORAGE_2D,
+    TK_ARRAY, TK_ATOMIC, TK_MATRIX, TK_POINTER, TK_SAMPLER, TK_SCALAR, TK_STRUCT, TK_TEXTURE,
+    TK_VECTOR, T_BOOL, T_F32, T_I32, T_U32, mat_ty, vec_ty,
+};
+use lex::{T_COMMA, T_EOF, T_LPAREN, T_LT, T_RPAREN};
+use names::{
+    K_ARRAY, K_ARRAY_LENGTH, K_ATOMIC_ADD, K_ATOMIC_AND, K_ATOMIC_COMPARE_EXCHANGE_WEAK,
+    K_ATOMIC_EXCHANGE, K_ATOMIC_LOAD, K_ATOMIC_MAX, K_ATOMIC_MIN, K_ATOMIC_OR, K_ATOMIC_STORE,
+    K_ATOMIC_SUB, K_ATOMIC_XOR, K_BITCAST, K_DPDX, K_FWIDTH_FINE, K_MAT2X2, K_MAT4X4, K_MATH_FIRST,
+    K_MATH_LAST, K_SELECT, K_STORAGE_BARRIER, K_TEXTURE_DIMENSIONS, K_TEXTURE_LOAD,
+    K_TEXTURE_NUM_LAYERS, K_TEXTURE_NUM_LEVELS, K_TEXTURE_SAMPLE, K_TEXTURE_SAMPLE_BIAS,
+    K_TEXTURE_SAMPLE_COMPARE, K_TEXTURE_SAMPLE_COMPARE_LEVEL, K_TEXTURE_SAMPLE_LEVEL,
+    K_TEXTURE_STORE, K_VEC2, K_VEC4, K_WORKGROUP_BARRIER, K_WORKGROUP_UNIFORM_LOAD,
+};
+
+impl Front {
+    // The arguments of a call, from its `(`: pushed on astack (positions
+    // on apos); returns their first index. `hint`: each argument's
+    // expected type, or -1.
+    fn args(inout self, hint: i64) -> i64 {
+        let base = self.astack.len();
+        self.expect(T_LPAREN);
+        while self.kind() != T_RPAREN && self.kind() != T_EOF {
+            let p = self.pos();
+            let v = self.parse_expr_hint(hint);
+            self.apos.push(p);
+            self.astack.push(v);
+            if !self.eat(T_COMMA) {
+                break;
+            }
+        }
+        self.expect(T_RPAREN);
+        self.last_call_end = self.p;
+        base
+    }
+
+    fn drop_args(inout self, base: i64) {
+        self.astack.truncate(base);
+        self.apos.truncate(base);
+    }
+
+    fn arg_count_error(inout self, at: i64, name: [u8], want: [u8], got: i64) {
+        if self.err(at, "wgsl.call") {
+            self.emsg.push_fmt(f"'{name}' takes {want}, got {got}");
+        }
+    }
+
+    // ---- User functions ----
+
+    pub fn user_call(inout self, fh: i64, at: i64) -> Val {
+        // the function being lowered has its signature in self.f
+        let nparams = if fh == self.fh { self.f.params.len() }
+            else { self.m.functions[fh].params.len() };
+        let base = self.estack.len();
+        self.expect(T_LPAREN);
+        var n = 0;
+        while self.kind() != T_RPAREN && self.kind() != T_EOF {
+            let ap = self.pos();
+            let hint = if n < nparams { self.param_ty(fh, n) } else { -1 };
+            let v = self.parse_expr_hint(hint);
+            if n < nparams {
+                let pt = self.param_ty(fh, n);
+                var ok = true;
+                if self.m.types[pt].kind == TK_POINTER && v.k == VK_REF {
+                    ok = false;
+                    if self.err(ap, "wgsl.type") {
+                        self.emsg.push_str("expected a pointer, got a reference");
+                        self.help("pass its address: &x");
+                    }
+                }
+                if ok {
+                    let e = self.materialize(v, pt, ap);
+                    self.estack.push(e);
+                }
+            }
+            n += 1;
+            if !self.eat(T_COMMA) {
+                break;
+            }
+        }
+        self.expect(T_RPAREN);
+        if n != nparams {
+            if self.err(at, "wgsl.call") {
+                self.emsg.push('\'');
+                if fh == self.fh {
+                    self.emsg.push_str(self.f.name);
+                } else {
+                    self.emsg.push_str(self.m.functions[fh].name);
+                }
+                self.emsg.push_fmt(f"' takes {nparams} argument");
+                if nparams != 1 {
+                    self.emsg.push('s');
+                }
+                self.emsg.push_fmt(f", got {n}");
+            }
+            self.estack.truncate(base);
+            return Val { k: VK_VOID, sk: 0, e: -1, ty: -1, iv: 0, fv: 0.0 };
+        }
+        let start = self.f.args.len();
+        for i in base..self.estack.len() {
+            self.f.args.push(self.estack[i]);
+        }
+        self.estack.truncate(base);
+        let r = self.call_stmt(fh, start, n);
+        self.last_call_end = self.p;
+        r
+    }
+
+    fn param_ty(self, fh: i64, i: i64) -> i64 {
+        if fh == self.fh {
+            self.f.params[i].ty
+        } else {
+            self.m.functions[fh].params[i].ty
+        }
+    }
+
+    // ---- Constructors ----
+
+    // `T(args)` for a known type T, from the `(`.
+    pub fn construct(inout self, ty: i64, at: i64) -> Val {
+        if self.kind() != T_LPAREN {
+            if self.err(self.pos(), "wgsl.syntax") {
+                self.emsg.push_str("a type here is a constructor: '");
+                self.ty_str(ty);
+                self.emsg.push_str("(...)'");
+            }
+            return cint(SK_AINT, -1, 0);
+        }
+        let t = self.m.types[ty];
+        let hint = if t.kind == TK_VECTOR || t.kind == TK_MATRIX {
+            t.scalar as i64
+        } else if t.kind == TK_ARRAY {
+            t.base
+        } else {
+            -1
+        };
+        let base = self.args(hint);
+        let n = self.astack.len() - base;
+        let r = self.construct_from(ty, base, n, at);
+        self.drop_args(base);
+        r
+    }
+
+    fn construct_from(inout self, ty: i64, base: i64, n: i64, at: i64) -> Val {
+        let t = self.m.types[ty];
+        if n == 0 {
+            if !self.storable(ty) || self.m.has_atomic(ty) || self.m.is_runtime_sized(ty) {
+                if self.err(at, "wgsl.type") {
+                    self.emsg.push_str("cannot construct ");
+                    self.ty_str(ty);
+                }
+                return cint(SK_AINT, -1, 0);
+            }
+            if t.kind == TK_SCALAR {
+                return if t.scalar == SK_F32 { front::cfloat(SK_F32, ty, 0.0) }
+                    else { cint(t.scalar, ty, 0) };
+            }
+            let e = self.f.expr(E_ZERO, ty, 0, 0, 0);
+            return val(e, ty);
+        }
+        if t.kind == TK_SCALAR {
+            if n != 1 {
+                self.arg_count_error(at, "a scalar constructor", "one argument", n);
+                return cint(SK_AINT, -1, 0);
+            }
+            return self.convert_value(self.astack[base], ty, self.apos[base]);
+        }
+        if t.kind == TK_VECTOR {
+            return self.construct_vector(t.scalar, t.n, base, n, at);
+        }
+        if t.kind == TK_MATRIX {
+            return self.construct_matrix(t.n, t.m, base, n, at);
+        }
+        if t.kind == TK_ARRAY {
+            if t.n == 0 {
+                self.fail(at, "wgsl.type", "a runtime-sized array cannot be constructed");
+                return cint(SK_AINT, -1, 0);
+            }
+            if n != t.n {
+                if self.err(at, "wgsl.call") {
+                    self.emsg.push_fmt(f"this array has {t.n} elements, got {n}");
+                }
+                return cint(SK_AINT, -1, 0);
+            }
+            return self.compose_args(ty, t.base, base, n);
+        }
+        if t.kind == TK_STRUCT {
+            if n != t.mcount {
+                if self.err(at, "wgsl.call") {
+                    self.emsg.push_fmt(f"'{t.name}' has {t.mcount} members, got {n} arguments");
+                }
+                return cint(SK_AINT, -1, 0);
+            }
+            let start = self.estack.len();
+            for i in 0..n {
+                let mt = self.m.members[t.mstart + i].ty;
+                let e = self.materialize(self.astack[base + i], mt, self.apos[base + i]);
+                self.estack.push(e);
+            }
+            return self.compose_from_estack(ty, start);
+        }
+        if self.err(at, "wgsl.type") {
+            self.emsg.push_str("cannot construct ");
+            self.ty_str(ty);
+        }
+        cint(SK_AINT, -1, 0)
+    }
+
+    fn compose_args(inout self, ty: i64, el: i64, base: i64, n: i64) -> Val {
+        let start = self.estack.len();
+        for i in 0..n {
+            let e = self.materialize(self.astack[base + i], el, self.apos[base + i]);
+            self.estack.push(e);
+        }
+        self.compose_from_estack(ty, start)
+    }
+
+    fn compose_from_estack(inout self, ty: i64, start: i64) -> Val {
+        let a = self.f.args.len();
+        for i in start..self.estack.len() {
+            self.f.args.push(self.estack[i]);
+        }
+        let n = self.estack.len() - start;
+        self.estack.truncate(start);
+        let e = self.f.expr(E_COMPOSE, ty, a, n, 0);
+        val(e, ty)
+    }
+
+    // A value conversion `T(v)`: scalar to scalar, or vector to vector of
+    // the same width.
+    fn convert_value(inout self, v0: Val, ty: i64, at: i64) -> Val {
+        let v = self.value(v0, at);
+        let t = self.m.types[ty];
+        if v.k == VK_CONST {
+            if t.kind == TK_SCALAR {
+                return self.const_cast(v, t.scalar, at, true);
+            }
+            return self.convert_to(v, ty, at);
+        }
+        if self.failed {
+            return v;
+        }
+        let vt = self.m.types[v.ty];
+        if v.ty == ty {
+            return v;
+        }
+        let w = self.m.width_of(v.ty);
+        if w == 0 || w != self.m.width_of(ty) {
+            if self.err(at, "wgsl.type") {
+                self.emsg.push_str("cannot convert ");
+                self.val_str(v);
+                self.emsg.push_str(" to ");
+                self.ty_str(ty);
+            }
+            return v;
+        }
+        let _ = vt;
+        let e = self.f.expr(E_CONVERT, ty, v.e, 0, 0);
+        val(e, ty)
+    }
+
+    // The scalar kind of a value's components (abstract kinds included).
+    fn comp_kind(self, v: Val) -> u8 {
+        if v.k == VK_CONST {
+            return v.sk;
+        }
+        let t = self.concrete_type_of(v);
+        self.m.types[t].scalar
+    }
+
+    // The concrete scalar the arguments base .. base + n share: a
+    // concrete argument's, else (all abstract) the hint's, else f32 when
+    // one is a float, else `dflt`.
+    fn common_scalar(self, base: i64, n: i64, hint_sk: i64, dflt: u8) -> u8 {
+        var any_float = false;
+        for i in base..base + n {
+            let v = self.astack[i];
+            if v.k == VK_CONST && v.ty < 0 {
+                if v.sk == SK_AFLOAT {
+                    any_float = true;
+                }
+                continue;
+            }
+            return self.comp_kind(v);
+        }
+        if hint_sk >= 0 && hint_sk <= 3 {
+            let h = hint_sk as u8;
+            if !(any_float && h != SK_F32) {
+                return h;
+            }
+        }
+        if any_float { SK_F32 } else { dflt }
+    }
+
+    fn construct_vector(inout self, sk: u8, n: i64, base: i64, count: i64, at: i64) -> Val {
+        let ty = vec_ty(sk, n);
+        if count == 1 {
+            let v = self.value(self.astack[base], self.apos[base]);
+            let w = if v.k == VK_CONST { 1 } else { self.m.width_of(v.ty) };
+            if w == 1 {
+                let e = self.materialize(v, sk as i64, self.apos[base]);
+                let s = self.f.expr(E_SPLAT, ty, e, 0, 0);
+                return val(s, ty);
+            }
+            if w == n {
+                return self.convert_value(v, ty, self.apos[base]);
+            }
+        }
+        let start = self.estack.len();
+        var total = 0;
+        for i in base..base + count {
+            let v = self.value(self.astack[i], self.apos[i]);
+            if v.k == VK_CONST {
+                let e = self.materialize(v, sk as i64, self.apos[i]);
+                self.estack.push(e);
+                total += 1;
+                continue;
+            }
+            let vt = self.m.types[v.ty];
+            if vt.kind == TK_SCALAR {
+                let e = self.materialize(v, sk as i64, self.apos[i]);
+                self.estack.push(e);
+                total += 1;
+            } else if vt.kind == TK_VECTOR {
+                let e = self.materialize(v, vec_ty(sk, vt.n), self.apos[i]);
+                self.estack.push(e);
+                total += vt.n;
+            } else {
+                if self.err(self.apos[i], "wgsl.type") {
+                    self.emsg.push_str("a vector is made of scalars and vectors, not ");
+                    self.val_str(v);
+                }
+                self.estack.truncate(start);
+                return cint(SK_AINT, -1, 0);
+            }
+        }
+        if total != n {
+            if self.err(at, "wgsl.call") {
+                self.emsg.push_fmt(f"a vec{n} needs {n} components, got {total}");
+            }
+            self.estack.truncate(start);
+            return cint(SK_AINT, -1, 0);
+        }
+        self.compose_from_estack(ty, start)
+    }
+
+    fn construct_matrix(inout self, c: i64, r: i64, base: i64, count: i64, at: i64) -> Val {
+        let ty = mat_ty(c, r);
+        let col = vec_ty(SK_F32, r);
+        if count == 1 {
+            let v = self.value(self.astack[base], self.apos[base]);
+            if v.k == VK_VALUE && v.ty == ty {
+                return v;
+            }
+        }
+        let start = self.estack.len();
+        if count == c {
+            for i in base..base + count {
+                let e = self.materialize(self.astack[i], col, self.apos[i]);
+                self.estack.push(e);
+            }
+            return self.compose_from_estack(ty, start);
+        }
+        if count == c * r {
+            for k in 0..c {
+                let cs = self.estack.len();
+                for j in 0..r {
+                    let i = base + k * r + j;
+                    let e = self.materialize(self.astack[i], T_F32, self.apos[i]);
+                    self.estack.push(e);
+                }
+                let colv = self.compose_from_estack(col, cs);
+                self.estack.push(colv.e);
+            }
+            return self.compose_from_estack(ty, start);
+        }
+        if self.err(at, "wgsl.call") {
+            self.emsg.push_fmt(
+                f"a mat{c}x{r} is made of {c} columns or {c * r} scalars, got {count} arguments");
+        }
+        cint(SK_AINT, -1, 0)
+    }
+
+    // ---- Builtins ----
+
+    pub fn builtin_primary(inout self, s: i64, at: i64, hint: i64) -> Val {
+        // inferred constructors
+        if s >= K_VEC2 && s <= K_VEC4 && self.kind_at(self.p + 1) == T_LPAREN {
+            self.p += 1;
+            let n = s - K_VEC2 + 2;
+            let hs = if hint >= 0 { self.m.types[hint].scalar as i64 } else { -1 };
+            let hk = if hint >= 0 { self.m.types[hint].kind } else { 255 };
+            let base = self.args(if hk == TK_VECTOR || hk == TK_SCALAR { hs } else { -1 });
+            let cnt = self.astack.len() - base;
+            let sk = self.common_scalar(base, cnt,
+                if hk == TK_VECTOR || hk == TK_SCALAR { hs } else { -1 }, SK_I32);
+            let r = if cnt == 0 { self.construct_from(vec_ty(sk, n), base, 0, at) }
+                else { self.construct_vector(sk, n, base, cnt, at) };
+            self.drop_args(base);
+            return r;
+        }
+        if s >= K_MAT2X2 && s <= K_MAT4X4 && self.kind_at(self.p + 1) == T_LPAREN {
+            self.p += 1;
+            let i = s - K_MAT2X2;
+            let base = self.args(T_F32);
+            let cnt = self.astack.len() - base;
+            let r = if cnt == 0 {
+                self.construct_from(mat_ty(i / 3 + 2, i % 3 + 2), base, 0, at)
+            } else {
+                self.construct_matrix(i / 3 + 2, i % 3 + 2, base, cnt, at)
+            };
+            self.drop_args(base);
+            return r;
+        }
+        if s == K_ARRAY && self.kind_at(self.p + 1) == T_LPAREN {
+            self.p += 1;
+            let he = if hint >= 0 && self.m.types[hint].kind == TK_ARRAY { self.m.types[hint].base }
+                else { -1 };
+            let base = self.args(he);
+            let cnt = self.astack.len() - base;
+            if cnt == 0 {
+                self.fail(at, "wgsl.call",
+                    "'array()' needs its elements, or a type: 'array<f32, 4>()'");
+                self.drop_args(base);
+                return cint(SK_AINT, -1, 0);
+            }
+            // the element type: a concrete element's, else the hint's, else the default
+            var el = -1;
+            for i in base..base + cnt {
+                let v = self.astack[i];
+                if !(v.k == VK_CONST && v.ty < 0) {
+                    el = self.concrete_type_of(v);
+                    break;
+                }
+            }
+            if el < 0 {
+                el = if he >= 0 { he } else { self.concrete_type_of(self.astack[base]) };
+            }
+            let ty = self.m.array_ty(el, cnt);
+            let r = self.compose_args(ty, el, base, cnt);
+            self.drop_args(base);
+            return r;
+        }
+        if self.is_type_name(s) {
+            let ty = self.parse_type();
+            return self.construct(ty, at);
+        }
+        self.p += 1;
+        if self.kind() != T_LPAREN {
+            if s == K_BITCAST && self.kind() == T_LT {
+                self.p += 1;
+                let ty = self.parse_type();
+                self.expect_gt();
+                return self.bitcast(ty, at);
+            }
+            if self.err(at, "wgsl.name") {
+                self.emsg.push_fmt(f"unknown name '{self.name_of(s)}'");
+            }
+            return cint(SK_AINT, -1, 0);
+        }
+        if s >= K_MATH_FIRST && s <= K_MATH_LAST {
+            return self.math(s - K_MATH_FIRST, s, at);
+        }
+        if s == K_SELECT {
+            return self.select(at);
+        }
+        if s == K_ARRAY_LENGTH {
+            return self.array_length(at);
+        }
+        if s >= K_ATOMIC_LOAD && s <= K_ATOMIC_COMPARE_EXCHANGE_WEAK {
+            return self.atomic(s, at);
+        }
+        if s == K_WORKGROUP_BARRIER || s == K_STORAGE_BARRIER {
+            let base = self.args(-1);
+            let n = self.astack.len() - base;
+            self.drop_args(base);
+            if n != 0 {
+                self.arg_count_error(at, self.name_of(s), "no arguments", n);
+            }
+            if self.stage != STAGE_COMPUTE as i64 && self.stage != 255 {
+                self.fail(at, "wgsl.stage", "barriers are for compute shaders");
+            }
+            self.push_stmt(S_BARRIER,
+                if s == K_WORKGROUP_BARRIER { BARRIER_WORKGROUP } else { BARRIER_STORAGE }, 0, 0,
+                0);
+            return Val { k: VK_VOID, sk: 0, e: -1, ty: -1, iv: 0, fv: 0.0 };
+        }
+        if s == K_WORKGROUP_UNIFORM_LOAD {
+            let base = self.args(-1);
+            let n = self.astack.len() - base;
+            if n != 1 {
+                self.drop_args(base);
+                self.arg_count_error(at, "workgroupUniformLoad", "one pointer", n);
+                return cint(SK_AINT, -1, 0);
+            }
+            let p = self.value(self.astack[base], self.apos[base]);
+            self.drop_args(base);
+            let pt = if p.k == VK_VALUE { self.m.types[p.ty] } else { self.m.types[T_I32] };
+            if pt.kind != TK_POINTER || pt.space != SP_WORKGROUP || self.m.has_atomic(pt.base) {
+                self.fail(at, "wgsl.type",
+                    "workgroupUniformLoad takes a pointer to workgroup memory (not an atomic): &x");
+                return cint(SK_AINT, -1, 0);
+            }
+            let r = self.unemitted(E_WG_UNIFORM_RESULT, pt.base);
+            self.push_stmt(S_WG_UNIFORM_LOAD, p.e, r, 0, 0);
+            return val(r, pt.base);
+        }
+        if s >= K_DPDX && s <= K_FWIDTH_FINE {
+            let k = (s - K_DPDX) % 3;
+            let base = self.args(-1);
+            let n = self.astack.len() - base;
+            if n != 1 {
+                self.drop_args(base);
+                self.arg_count_error(at, self.name_of(s), "one argument", n);
+                return cint(SK_AINT, -1, 0);
+            }
+            if self.stage != STAGE_FRAGMENT as i64 && self.stage != 255 {
+                self.fail(at, "wgsl.stage", "derivatives are for fragment shaders");
+            }
+            let ty = self.float_type(self.astack[base], self.apos[base]);
+            let e0 = self.materialize(self.astack[base], ty, self.apos[base]);
+            self.drop_args(base);
+            let e = self.f.expr(E_DERIVATIVE, ty, k, e0, 0);
+            return val(e, ty);
+        }
+        if s >= K_TEXTURE_SAMPLE && s <= K_TEXTURE_NUM_LAYERS {
+            return self.texture_call(s, at);
+        }
+        if self.err(at, "wgsl.name") {
+            self.emsg.push_fmt(f"unknown function '{self.name_of(s)}'");
+        }
+        cint(SK_AINT, -1, 0)
+    }
+
+    // An f32 scalar or vector type for v (abstract numbers become f32).
+    fn float_type(inout self, v: Val, at: i64) -> i64 {
+        if v.k == VK_CONST && v.ty < 0 {
+            return T_F32;
+        }
+        let t = self.concrete_type_of(v);
+        let tt = self.m.types[t];
+        if (tt.kind != TK_SCALAR && tt.kind != TK_VECTOR) || tt.scalar != SK_F32 {
+            if self.err(at, "wgsl.type") {
+                self.emsg.push_str("expected f32 or vecN<f32>, got ");
+                self.val_str(v);
+                if tt.scalar == SK_I32 || tt.scalar == SK_U32 {
+                    self.help("convert it: f32(...)");
+                }
+            }
+            return T_F32;
+        }
+        t
+    }
+
+    fn bitcast(inout self, ty: i64, at: i64) -> Val {
+        let base = self.args(-1);
+        let n = self.astack.len() - base;
+        if n != 1 {
+            self.drop_args(base);
+            self.arg_count_error(at, "bitcast", "one argument", n);
+            return cint(SK_AINT, -1, 0);
+        }
+        var v = self.value(self.astack[base], self.apos[base]);
+        let ap = self.apos[base];
+        self.drop_args(base);
+        if v.k == VK_CONST && v.ty < 0 {
+            v = if v.sk == SK_AINT && v.iv > 2147483647 { self.const_cast(v, SK_U32, ap, false) }
+                else {
+                    self.const_cast(v, if v.sk == SK_AINT { SK_I32 } else { SK_F32 }, ap, false)
+                };
+        }
+        let vt = self.concrete_type_of(v);
+        let w = self.m.width_of(vt);
+        let tw = self.m.width_of(ty);
+        if w == 0 || w != tw || self.m.types[vt].scalar == SK_BOOL
+            || self.m.types[ty].scalar == SK_BOOL {
+            if self.err(at, "wgsl.type") {
+                self.emsg.push_str(
+                    "bitcast converts between 32-bit numbers and vectors of them of one width; got ");
+                self.val_str(v);
+                self.emsg.push_str(" to ");
+                self.ty_str(ty);
+            }
+            return v;
+        }
+        let e0 = self.materialize(v, vt, ap);
+        if vt == ty {
+            return val(e0, ty);
+        }
+        let e = self.f.expr(E_BITCAST, ty, e0, 0, 0);
+        val(e, ty)
+    }
+
+    fn select(inout self, at: i64) -> Val {
+        let base = self.args(-1);
+        let n = self.astack.len() - base;
+        if n != 3 {
+            self.drop_args(base);
+            self.arg_count_error(at, "select", "3 arguments (if false, if true, condition)", n);
+            return cint(SK_AINT, -1, 0);
+        }
+        let sk = self.common_scalar(base, 2, -1, SK_I32);
+        var ty = -1;
+        for i in base..base + 2 {
+            let v = self.astack[i];
+            if !(v.k == VK_CONST && v.ty < 0) {
+                ty = self.concrete_type_of(v);
+                break;
+            }
+        }
+        if ty < 0 {
+            ty = sk as i64;
+        }
+        let tt = self.m.types[ty];
+        if tt.kind != TK_SCALAR && tt.kind != TK_VECTOR {
+            self.drop_args(base);
+            self.fail(at, "wgsl.type", "select chooses between scalars or vectors");
+            return cint(SK_AINT, -1, 0);
+        }
+        let f = self.materialize(self.astack[base], ty, self.apos[base]);
+        let t = self.materialize(self.astack[base + 1], ty, self.apos[base + 1]);
+        let cv = self.value(self.astack[base + 2], self.apos[base + 2]);
+        let ct = self.concrete_type_of(cv);
+        let w = self.m.width_of(ty);
+        if ct != T_BOOL && ct != vec_ty(SK_BOOL, w) {
+            if self.err(self.apos[base + 2], "wgsl.type") {
+                self.emsg.push_str(
+                    "select's condition is a bool (or a vector of bool as wide as the values), not ");
+                self.val_str(cv);
+            }
+        }
+        let c = self.materialize(cv, ct, self.apos[base + 2]);
+        self.drop_args(base);
+        let e = self.f.expr(E_SELECT, ty, c, t, f);
+        val(e, ty)
+    }
+
+    fn array_length(inout self, at: i64) -> Val {
+        let base = self.args(-1);
+        let n = self.astack.len() - base;
+        if n != 1 {
+            self.drop_args(base);
+            self.arg_count_error(at, "arrayLength", "one pointer", n);
+            return cint(SK_AINT, -1, 0);
+        }
+        let p = self.astack[base];
+        self.drop_args(base);
+        let ok = p.k == VK_VALUE && self.m.types[p.ty].kind == TK_POINTER
+            && self.m.types[p.ty].space == SP_STORAGE;
+        if ok {
+            let pe = self.f.exprs[p.e];
+            let pointee = self.m.pointee(p.ty);
+            let t = self.m.types[pointee];
+            if t.kind == TK_ARRAY && t.n == 0 {
+                if pe.op == E_GLOBAL {
+                    let e = self.f.expr(E_ARRAY_LENGTH, T_U32, pe.a, -1, 0);
+                    self.f.exprs[e].d = t.stride;
+                    return val(e, T_U32);
+                }
+                if pe.op == ir::E_ACCESS_INDEX && self.f.exprs[pe.a].op == E_GLOBAL {
+                    let g = self.f.exprs[pe.a].a;
+                    let st = self.m.types[self.m.globals[g].ty];
+                    let off = self.m.members[st.mstart + pe.b].offset;
+                    let e = self.f.expr(E_ARRAY_LENGTH, T_U32, g, pe.b, off);
+                    self.f.exprs[e].d = t.stride;
+                    return val(e, T_U32);
+                }
+            }
+        }
+        if self.err(at, "wgsl.type") {
+            self.emsg.push_str("arrayLength takes a pointer to a runtime-sized array in a storage buffer: arrayLength(&buf) or arrayLength(&buf.items)");
+        }
+        cint(SK_AINT, -1, 0)
+    }
+
+    fn atomic(inout self, s: i64, at: i64) -> Val {
+        let base = self.args(-1);
+        let n = self.astack.len() - base;
+        let want = if s == K_ATOMIC_LOAD { 1 } else if s == K_ATOMIC_COMPARE_EXCHANGE_WEAK { 3 }
+            else { 2 };
+        if n != want {
+            self.drop_args(base);
+            if self.err(at, "wgsl.call") {
+                self.emsg.push_fmt(f"'{self.name_of(s)}' takes {want} argument");
+                if want != 1 {
+                    self.emsg.push('s');
+                }
+                self.emsg.push_fmt(f", got {n}");
+            }
+            return cint(SK_AINT, -1, 0);
+        }
+        let p = self.astack[base];
+        let pt = if p.k == VK_VALUE && p.ty >= 0 { self.m.types[p.ty] }
+            else { self.m.types[T_I32] };
+        if pt.kind != TK_POINTER || self.m.types[pt.base].kind != TK_ATOMIC {
+            self.drop_args(base);
+            if self.err(self.apos[base], "wgsl.type") {
+                self.emsg.push_fmt(f"'{self.name_of(s)}' takes a pointer to an atomic, got ");
+                self.val_str(p);
+                if p.k == VK_REF {
+                    self.help("pass its address: &x");
+                }
+            }
+            return cint(SK_AINT, -1, 0);
+        }
+        let sk = self.m.types[pt.base].scalar;
+        let st = sk as i64;
+        let fun = if s == K_ATOMIC_LOAD {
+            AT_LOAD
+        } else if s == K_ATOMIC_STORE {
+            AT_STORE
+        } else if s == K_ATOMIC_ADD {
+            AT_ADD
+        } else if s == K_ATOMIC_SUB {
+            AT_SUB
+        } else if s == K_ATOMIC_MAX {
+            AT_MAX
+        } else if s == K_ATOMIC_MIN {
+            AT_MIN
+        } else if s == K_ATOMIC_AND {
+            AT_AND
+        } else if s == K_ATOMIC_OR {
+            AT_OR
+        } else if s == K_ATOMIC_XOR {
+            AT_XOR
+        } else if s == K_ATOMIC_EXCHANGE {
+            AT_EXCHANGE
+        } else {
+            AT_CMPXCHG
+        };
+        var v = -1;
+        var cmp = -1;
+        if fun == AT_CMPXCHG {
+            cmp = self.materialize(self.astack[base + 1], st, self.apos[base + 1]);
+            v = self.materialize(self.astack[base + 2], st, self.apos[base + 2]);
+        } else if fun != AT_LOAD {
+            v = self.materialize(self.astack[base + 1], st, self.apos[base + 1]);
+        }
+        self.drop_args(base);
+        if fun == AT_STORE {
+            let s0 = self.push_stmt(S_ATOMIC, p.e, fun, v, -1);
+            self.f.stmts[s0].e = -1;
+            return Val { k: VK_VOID, sk: 0, e: -1, ty: -1, iv: 0, fv: 0.0 };
+        }
+        let rty = if fun == AT_CMPXCHG { self.cmpxchg_type(sk) } else { st };
+        let r = self.unemitted(E_ATOMIC_RESULT, rty);
+        let s0 = self.push_stmt(S_ATOMIC, p.e, fun, v, r);
+        self.f.stmts[s0].e = cmp;
+        val(r, rty)
+    }
+
+    // __atomic_compare_exchange_result<T>: { old_value: T, exchanged: bool }
+    pub fn cmpxchg_type(inout self, sk: u8) -> i64 {
+        let i = if sk == SK_I32 { 0 } else { 1 };
+        if self.cmpxchg_ty[i] >= 0 {
+            return self.cmpxchg_ty[i];
+        }
+        let start = self.m.members.len();
+        self.m.members.push(StructMember {
+            name: "old_value", ty: sk as i64, offset: 0, binding: ir::no_binding()
+        });
+        self.m.members.push(StructMember {
+            name: "exchanged", ty: T_BOOL, offset: 0, binding: ir::no_binding()
+        });
+        let name = if sk == SK_I32 { "__atomic_compare_exchange_result_i32" }
+            else { "__atomic_compare_exchange_result_u32" };
+        let h = self.m.struct_ty(name, start, 2);
+        self.cmpxchg_ty[i] = h;
+        h
+    }
+
+    // ---- Math ----
+
+    fn math(inout self, fun: i64, s: i64, at: i64) -> Val {
+        let base = self.args(-1);
+        let n = self.astack.len() - base;
+        let name = self.name_of(s);
+        let want = math_arity(fun);
+        if n != want {
+            self.drop_args(base);
+            if self.err(at, "wgsl.call") {
+                self.emsg.push_fmt(f"'{name}' takes {want} argument");
+                if want != 1 {
+                    self.emsg.push('s');
+                }
+                self.emsg.push_fmt(f", got {n}");
+            }
+            return cint(SK_AINT, -1, 0);
+        }
+        let r = self.math_typed(fun, name, base, n, at);
+        self.drop_args(base);
+        r
+    }
+
+    fn math_fail(inout self, at: i64, name: [u8], what: [u8], base: i64, n: i64) -> Val {
+        if self.err(at, "wgsl.type") {
+            self.emsg.push_fmt(f"'{name}' takes {what}; got ");
+            for i in base..base + n {
+                if i > base {
+                    self.emsg.push_str(", ");
+                }
+                self.val_str(self.astack[i]);
+            }
+        }
+        cint(SK_AINT, -1, 0)
+    }
+
+    // The common type of args[base .. base + n] (abstract ones take the
+    // others' scalar; all abstract: f32 when `float`, else by their kind).
+    fn common_type(self, base: i64, n: i64, float: bool) -> i64 {
+        for i in base..base + n {
+            let v = self.astack[i];
+            if !(v.k == VK_CONST && v.ty < 0) {
+                return self.concrete_type_of(v);
+            }
+        }
+        var any_float = float;
+        for i in base..base + n {
+            if self.astack[i].sk == SK_AFLOAT {
+                any_float = true;
+            }
+        }
+        if any_float { T_F32 } else { T_I32 }
+    }
+
+    fn math_typed(inout self, fun: i64, name: [u8], base: i64, n: i64, at: i64) -> Val {
+        let float_only = is_float_fun(fun);
+        if fun == MF_ALL || fun == MF_ANY {
+            let v = self.value(self.astack[base], self.apos[base]);
+            let t = self.concrete_type_of(v);
+            if self.m.types[t].scalar != SK_BOOL || self.m.width_of(t) == 0 {
+                return self.math_fail(at, name, "a bool or a vector of bool", base, n);
+            }
+            if t == T_BOOL {
+                return v;
+            }
+            let e0 = self.materialize(v, t, self.apos[base]);
+            return self.math_expr(fun, T_BOOL, [e0, 0, 0, 0], 1);
+        }
+        if fun >= ir::MF_PACK4X8UNORM && fun <= ir::MF_UNPACK2X16FLOAT
+            || fun >= ir::MF_PACK4X8SNORM {
+            return self.packing(fun, name, base, at);
+        }
+        if fun == MF_LDEXP {
+            let t = self.float_type(self.astack[base], self.apos[base]);
+            let w = self.m.width_of(t);
+            let e0 = self.materialize(self.astack[base], t, self.apos[base]);
+            let e1 = self.materialize(self.astack[base + 1], vec_ty(SK_I32, w),
+                self.apos[base + 1]);
+            return self.math_expr(fun, t, [e0, e1, 0, 0], 2);
+        }
+        if fun == MF_EXTRACT_BITS || fun == MF_INSERT_BITS {
+            let k = if fun == MF_EXTRACT_BITS { 1 } else { 2 };
+            let t = self.common_type(base, k, false);
+            let sk = self.m.types[t].scalar;
+            if (sk != SK_I32 && sk != SK_U32) || self.m.width_of(t) == 0 {
+                return self.math_fail(at, name, "i32 or u32 values and u32 offset and count", base,
+                    n);
+            }
+            var es: [i64; 4] = [0; 4];
+            for i in 0..k {
+                es[i] = self.materialize(self.astack[base + i], t, self.apos[base + i]);
+            }
+            es[k] = self.materialize(self.astack[base + k], T_U32, self.apos[base + k]);
+            es[k + 1] = self.materialize(self.astack[base + k + 1], T_U32, self.apos[base + k + 1]);
+            return self.math_expr(fun, t, es, k + 2);
+        }
+        if fun == ir::MF_MIX {
+            // mix(a, b, t): t is the same type, or a scalar
+            let t = self.common_type(base, 2, true);
+            if self.m.types[t].scalar != SK_F32 || self.m.width_of(t) == 0 {
+                return self.math_fail(at, name, "f32 values", base, n);
+            }
+            let e0 = self.materialize(self.astack[base], t, self.apos[base]);
+            let e1 = self.materialize(self.astack[base + 1], t, self.apos[base + 1]);
+            let tv = self.value(self.astack[base + 2], self.apos[base + 2]);
+            let tt = if tv.k == VK_CONST { T_F32 } else { tv.ty };
+            var e2 = self.materialize(tv, if tt == T_F32 { T_F32 } else { t },
+                self.apos[base + 2]);
+            if tt == T_F32 && t != T_F32 {
+                e2 = self.f.expr(E_SPLAT, t, e2, 0, 0);
+            }
+            return self.math_expr(fun, t, [e0, e1, e2, 0], 3);
+        }
+        let t = self.common_type(base, n, float_only);
+        let tt = self.m.types[t];
+        let sk = tt.scalar;
+        if fun == MF_DETERMINANT || fun == MF_TRANSPOSE {
+            if tt.kind != TK_MATRIX || (fun == MF_DETERMINANT && tt.n != tt.m) {
+                return self.math_fail(at, name,
+                    if fun == MF_DETERMINANT { "a square matrix" } else { "a matrix" }, base, n);
+            }
+            let e0 = self.materialize(self.astack[base], t, self.apos[base]);
+            let rt = if fun == MF_DETERMINANT { T_F32 } else { mat_ty(tt.m, tt.n) };
+            return self.math_expr(fun, rt, [e0, 0, 0, 0], 1);
+        }
+        let w = self.m.width_of(t);
+        if w == 0 || sk == SK_BOOL {
+            return self.math_fail(at, name,
+                if float_only { "f32 or vecN<f32>" } else { "numbers or vectors of them" }, base,
+                n);
+        }
+        if float_only && sk != SK_F32 {
+            let r = self.math_fail(at, name, "f32 or vecN<f32>", base, n);
+            self.help("convert it: f32(...)");
+            return r;
+        }
+        if is_int_fun(fun) && sk == SK_F32 {
+            return self.math_fail(at, name, "i32 or u32 (or vectors of them)", base, n);
+        }
+        if fun == ir::MF_SIGN && sk == SK_U32 {
+            return self.math_fail(at, name, "i32 or f32 (or vectors of them)", base, n);
+        }
+        let vector_only = fun == MF_CROSS || fun == ir::MF_NORMALIZE || fun == ir::MF_REFLECT
+            || fun == ir::MF_FACE_FORWARD || fun == MF_DOT || fun == MF_DISTANCE && false;
+        if vector_only && w == 1 {
+            return self.math_fail(at, name, "vectors", base, n);
+        }
+        if fun == MF_CROSS && (w != 3 || sk != SK_F32) {
+            return self.math_fail(at, name, "two vec3<f32>", base, n);
+        }
+        var es: [i64; 4] = [0; 4];
+        for i in 0..n {
+            es[i] = self.materialize(self.astack[base + i], t, self.apos[base + i]);
+        }
+        let rt = if fun == MF_LENGTH || fun == MF_DISTANCE || fun == MF_DOT { sk as i64 }
+            else { t };
+        // constants fold when they are scalars of the simple kind
+        self.math_expr(fun, rt, es, n)
+    }
+
+    fn math_expr(inout self, fun: i64, ty: i64, es: [i64; 4], n: i64) -> Val {
+        let a = self.f.args.len();
+        for i in 0..n {
+            self.f.args.push(es[i]);
+        }
+        let e = self.f.expr(E_MATH, ty, fun, a, n);
+        val(e, ty)
+    }
+
+    fn packing(inout self, fun: i64, name: [u8], base: i64, at: i64) -> Val {
+        let unpack = fun == ir::MF_UNPACK4X8UNORM || fun == ir::MF_UNPACK2X16FLOAT
+            || fun == ir::MF_UNPACK4X8SNORM || fun == ir::MF_UNPACK2X16UNORM
+            || fun == ir::MF_UNPACK2X16SNORM;
+        let four = fun == ir::MF_PACK4X8UNORM || fun == ir::MF_UNPACK4X8UNORM
+            || fun == ir::MF_PACK4X8SNORM || fun == ir::MF_UNPACK4X8SNORM;
+        let vt = vec_ty(SK_F32, if four { 4 } else { 2 });
+        if unpack {
+            let e0 = self.materialize(self.astack[base], T_U32, self.apos[base]);
+            return self.math_expr(fun, vt, [e0, 0, 0, 0], 1);
+        }
+        let v = self.value(self.astack[base], self.apos[base]);
+        if self.concrete_type_of(v) != vt {
+            return self.math_fail(at, name, if four { "a vec4<f32>" } else { "a vec2<f32>" }, base,
+                1);
+        }
+        let e0 = self.materialize(v, vt, self.apos[base]);
+        self.math_expr(fun, T_U32, [e0, 0, 0, 0], 1)
+    }
+
+    // ---- Textures ----
+
+    fn texture_arg(inout self, i: i64, sampler: bool) -> i64 {
+        let v = self.astack[i];
+        let want = if sampler { TK_SAMPLER } else { TK_TEXTURE };
+        if v.k != VK_VALUE || self.m.types[v.ty].kind != want {
+            if self.err(self.apos[i], "wgsl.type") {
+                self.emsg.push_str(if sampler { "expected a sampler, got " }
+                    else { "expected a texture, got " });
+                self.val_str(v);
+            }
+            return -1;
+        }
+        v.e
+    }
+
+    fn texture_call(inout self, s: i64, at: i64) -> Val {
+        let base = self.args(-1);
+        let n = self.astack.len() - base;
+        let r = self.texture_typed(s, base, n, at);
+        self.drop_args(base);
+        r
+    }
+
+    fn texture_typed(inout self, s: i64, base: i64, n: i64, at: i64) -> Val {
+        let name = self.name_of(s);
+        if n < 1 {
+            self.arg_count_error(at, name, "a texture first", n);
+            return cint(SK_AINT, -1, 0);
+        }
+        let te = self.texture_arg(base, false);
+        if te < 0 {
+            return cint(SK_AINT, -1, 0);
+        }
+        let tt = self.m.types[self.f.exprs[te].ty];
+        let arrayed = tt.n == TEX_2D_ARRAY;
+        let depth = tt.n == TEX_DEPTH_2D;
+        let storage = tt.n == TEX_STORAGE_2D;
+        let texel = if depth { T_F32 } else { vec_ty(tt.scalar, 4) };
+        if s == K_TEXTURE_DIMENSIONS || s == K_TEXTURE_NUM_LEVELS || s == K_TEXTURE_NUM_LAYERS {
+            if s == K_TEXTURE_NUM_LAYERS && !arrayed {
+                self.fail(at, "wgsl.type", "textureNumLayers takes an array texture");
+                return cint(SK_AINT, -1, 0);
+            }
+            if s == K_TEXTURE_NUM_LEVELS && storage {
+                self.fail(at, "wgsl.type", "a storage texture has one level");
+                return cint(SK_AINT, -1, 0);
+            }
+            var lvl = -1;
+            if s == K_TEXTURE_DIMENSIONS && n == 2 && !storage {
+                let lt = self.int_arg_type(base + 1);
+                lvl = self.materialize(self.astack[base + 1], lt, self.apos[base + 1]);
+            } else if n != 1 {
+                self.arg_count_error(at, name, "the texture (and for textureDimensions a level)",
+                    n);
+                return cint(SK_AINT, -1, 0);
+            }
+            let q = if s == K_TEXTURE_DIMENSIONS { IQ_SIZE }
+                else if s == K_TEXTURE_NUM_LEVELS { IQ_LEVELS } else { IQ_LAYERS };
+            let rt = if q == IQ_SIZE { vec_ty(SK_U32, 2) } else { T_U32 };
+            let e = self.f.expr(E_IMAGE_QUERY, rt, te, q, lvl);
+            return val(e, rt);
+        }
+        if s == K_TEXTURE_STORE {
+            if !storage {
+                self.fail(at, "wgsl.type", "textureStore writes a texture_storage_2d");
+                return cint(SK_AINT, -1, 0);
+            }
+            if n != 3 {
+                self.arg_count_error(at, name, "3 arguments (texture, coordinates, value)", n);
+                return cint(SK_AINT, -1, 0);
+            }
+            let ct = self.coords_type(base + 1);
+            let ce = self.materialize(self.astack[base + 1], ct, self.apos[base + 1]);
+            let ve = self.materialize(self.astack[base + 2], texel, self.apos[base + 2]);
+            self.push_stmt(S_IMAGE_STORE, te, ce, ve, -1);
+            return Val { k: VK_VOID, sk: 0, e: -1, ty: -1, iv: 0, fv: 0.0 };
+        }
+        if s == K_TEXTURE_LOAD {
+            if storage {
+                self.fail(at, "wgsl.unsupported",
+                    "storage textures are write-only in this release");
+                return cint(SK_AINT, -1, 0);
+            }
+            let want = if arrayed { 4 } else { 3 };
+            if n != want {
+                self.arg_count_error(at, name,
+                    if arrayed { "4 arguments (texture, coordinates, layer, level)" }
+                    else { "3 arguments (texture, coordinates, level)" }, n);
+                return cint(SK_AINT, -1, 0);
+            }
+            let ct = self.coords_type(base + 1);
+            let a = self.f.args.len();
+            let ce = self.materialize(self.astack[base + 1], ct, self.apos[base + 1]);
+            var extra: [i64; 2] = [0; 2];
+            for i in 2..n {
+                let it = self.int_arg_type(base + i);
+                extra[i - 2] = self.materialize(self.astack[base + i], it, self.apos[base + i]);
+            }
+            let a2 = self.f.args.len();
+            let _ = a;
+            self.f.args.push(ce);
+            for i in 2..n {
+                self.f.args.push(extra[i - 2]);
+            }
+            let e = self.f.expr(E_IMAGE_LOAD, texel, te, 0, a2);
+            self.f.exprs[e].d = n - 1;
+            return val(e, texel);
+        }
+        // the sampling functions
+        if storage {
+            self.fail(at, "wgsl.type", "a storage texture cannot be sampled");
+            return cint(SK_AINT, -1, 0);
+        }
+        let kind = if s == K_TEXTURE_SAMPLE {
+            IMG_SAMPLE
+        } else if s == K_TEXTURE_SAMPLE_BIAS {
+            IMG_SAMPLE_BIAS
+        } else if s == K_TEXTURE_SAMPLE_LEVEL {
+            IMG_SAMPLE_LEVEL
+        } else if s == K_TEXTURE_SAMPLE_COMPARE {
+            IMG_SAMPLE_COMPARE
+        } else {
+            IMG_SAMPLE_COMPARE_LEVEL
+        };
+        let compare = kind == IMG_SAMPLE_COMPARE || kind == IMG_SAMPLE_COMPARE_LEVEL;
+        if compare != depth && (compare || kind == IMG_SAMPLE_BIAS) {
+            self.fail(at, "wgsl.type",
+                if compare { "textureSampleCompare takes a texture_depth_2d" }
+                else { "textureSampleBias takes a texture_2d<f32>" });
+            return cint(SK_AINT, -1, 0);
+        }
+        if !depth && tt.scalar != SK_F32 {
+            self.fail(at, "wgsl.type",
+                "only f32 textures are sampled; use textureLoad for i32 and u32");
+            return cint(SK_AINT, -1, 0);
+        }
+        if (kind == IMG_SAMPLE || kind == IMG_SAMPLE_BIAS || kind == IMG_SAMPLE_COMPARE)
+            && self.stage != STAGE_FRAGMENT as i64 && self.stage != 255 {
+            if self.err(at, "wgsl.stage") {
+                self.emsg.push_fmt(f"'{name}' computes derivatives: it is for fragment shaders");
+                self.help("use textureSampleLevel elsewhere");
+            }
+        }
+        let has_aux = kind != IMG_SAMPLE;
+        let want = 3 + (if arrayed { 1 } else { 0 }) + (if has_aux { 1 } else { 0 });
+        if n != want {
+            self.arg_count_error(at, name, "a texture, a sampler, coordinates, then a layer for an array texture and the bias, level or depth reference", n);
+            return cint(SK_AINT, -1, 0);
+        }
+        let se = self.texture_arg(base + 1, true);
+        if se < 0 {
+            return cint(SK_AINT, -1, 0);
+        }
+        let sm = self.m.types[self.f.exprs[se].ty];
+        if (sm.n == 1) != compare {
+            self.fail(self.apos[base + 1], "wgsl.type",
+                if compare { "comparisons take a sampler_comparison" }
+                else { "this takes a sampler, not a sampler_comparison" });
+            return cint(SK_AINT, -1, 0);
+        }
+        var es: [i64; 3] = [0; 3];
+        es[0] = self.materialize(self.astack[base + 2], vec_ty(SK_F32, 2), self.apos[base + 2]);
+        var k = 1;
+        if arrayed {
+            let it = self.int_arg_type(base + 3);
+            es[1] = self.materialize(self.astack[base + 3], it, self.apos[base + 3]);
+            k = 2;
+        }
+        if has_aux {
+            let ai = base + n - 1;
+            let at2 = if kind == IMG_SAMPLE_LEVEL && depth { self.int_arg_type(ai) } else { T_F32 };
+            es[k] = self.materialize(self.astack[ai], at2, self.apos[ai]);
+            k += 1;
+        }
+        let a = self.f.args.len();
+        for i in 0..k {
+            self.f.args.push(es[i]);
+        }
+        let e = self.f.expr(E_IMAGE_SAMPLE, texel, te, se, a);
+        self.f.exprs[e].d = kind | (k << 8);
+        val(e, texel)
+    }
+
+    // vec2<i32> or vec2<u32>, as the argument has it.
+    fn coords_type(inout self, i: i64) -> i64 {
+        let v = self.astack[i];
+        let t = self.concrete_type_of(v);
+        if t == vec_ty(SK_U32, 2) || t == vec_ty(SK_I32, 2) {
+            return t;
+        }
+        if self.err(self.apos[i], "wgsl.type") {
+            self.emsg.push_str("texel coordinates are a vec2<i32> or vec2<u32>, not ");
+            self.val_str(v);
+        }
+        vec_ty(SK_I32, 2)
+    }
+
+    fn int_arg_type(inout self, i: i64) -> i64 {
+        let v = self.astack[i];
+        let t = self.concrete_type_of(v);
+        if t == T_U32 || t == T_I32 {
+            return t;
+        }
+        if self.err(self.apos[i], "wgsl.type") {
+            self.emsg.push_str("expected an i32 or a u32, got ");
+            self.val_str(v);
+        }
+        T_I32
+    }
+}
+
+fn math_arity(fun: i64) -> i64 {
+    if fun == ir::MF_MIN || fun == ir::MF_MAX || fun == ir::MF_POW || fun == ir::MF_ATAN2
+        || fun == ir::MF_STEP || fun == MF_DISTANCE || fun == MF_DOT || fun == MF_CROSS
+        || fun == ir::MF_REFLECT || fun == MF_LDEXP {
+        2
+    }
+    else if fun == ir::MF_CLAMP || fun == ir::MF_MIX || fun == ir::MF_SMOOTHSTEP
+        || fun == ir::MF_FMA || fun == ir::MF_FACE_FORWARD || fun == MF_EXTRACT_BITS {
+        3
+    } else if fun == MF_INSERT_BITS {
+        4
+    } else {
+        1
+    }
+}
+
+fn is_float_fun(fun: i64) -> bool {
+    (fun >= ir::MF_FLOOR && fun <= ir::MF_FMA) || fun == MF_LENGTH || fun == MF_DISTANCE
+        || fun == MF_CROSS || fun == ir::MF_NORMALIZE || fun == ir::MF_REFLECT
+        || fun == ir::MF_DEGREES || fun == ir::MF_RADIANS || fun == ir::MF_SATURATE
+        || fun == ir::MF_ASINH || fun == ir::MF_ACOSH || fun == ir::MF_ATANH
+        || fun == ir::MF_FACE_FORWARD
+}
+
+fn is_int_fun(fun: i64) -> bool { fun >= ir::MF_COUNT_ONE_BITS && fun <= MF_INSERT_BITS }

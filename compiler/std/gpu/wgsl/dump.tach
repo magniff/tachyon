@@ -1,0 +1,305 @@
+// ---- Shader compiler implementation, dump (0.22) ----
+// The IR as text: `wgslc ir FILE`, and the front end's golden tests.
+
+use ir::{
+    E_ACCESS, E_ACCESS_INDEX, E_ARG, E_ARRAY_LENGTH, E_ATOMIC_RESULT, E_BINARY, E_BITCAST,
+    E_CALL_RESULT, E_COMPOSE, E_CONVERT, E_DERIVATIVE, E_GLOBAL, E_IMAGE_LOAD, E_IMAGE_QUERY,
+    E_IMAGE_SAMPLE, E_LITERAL, E_LOAD, E_LOCAL, E_MATH, E_SELECT, E_SPLAT, E_SWIZZLE, E_UNARY,
+    E_WG_UNIFORM_RESULT, E_ZERO, Function, Module, SK_BOOL, SK_F32, SK_I32, S_ATOMIC, S_BARRIER,
+    S_BLOCK, S_BREAK, S_CALL, S_CONTINUE, S_EMIT, S_IF, S_IMAGE_STORE, S_KILL, S_LOOP, S_RETURN,
+    S_STORE, S_SWITCH, S_WG_UNIFORM_LOAD, bits_f32,
+};
+use std::{Allocator, Buf};
+
+const UN: [[u8]; 3] = ["neg", "not", "bitnot"];
+const BIN: [[u8]; 18] = ["add", "sub", "mul", "div", "mod", "eq", "ne", "lt", "le", "gt", "ge",
+    "and", "or", "xor", "shl", "shr", "land", "lor"];
+const ATOM: [[u8]; 11] = ["add", "sub", "and", "or", "xor", "min", "max", "exchange", "load",
+    "store", "cmpxchg"];
+const CK: [[u8]; 4] = ["pending", "none", "clamp", "rzsw"];
+
+pub fn dump<A: Allocator>(m: Module, b: inout Buf<A>) {
+    for t in ir::T_FIXED_COUNT..m.types.len() {
+        let ty = m.types[t];
+        if ty.kind == ir::TK_STRUCT {
+            b.push_fmt(f"struct {ty.name} (size {ty.size}, align {ty.align}) {{");
+            for i in ty.mstart..ty.mstart + ty.mcount {
+                let mem = m.members[i];
+                b.push_fmt(f" {mem.name}: ");
+                m.type_name(mem.ty, &b);
+                b.push_fmt(f" @{mem.offset};");
+            }
+            b.push_str(" }\n");
+        }
+    }
+    for g in 0..m.globals.len() {
+        let gl = m.globals[g];
+        b.push_fmt(f"global {g} {gl.name}: {ir::space_name(gl.space)}");
+        if gl.space == ir::SP_STORAGE {
+            b.push_str(if gl.access == ir::ACC_RW { " read_write" } else { " read" });
+        }
+        b.push(' ');
+        m.type_name(gl.ty, &b);
+        if gl.group >= 0 {
+            b.push_fmt(f" @group({gl.group}) @binding({gl.binding})");
+        }
+        if gl.init >= 0 {
+            b.push_str(" = ");
+            expr_text(m, m.consts, gl.init, &b);
+        }
+        b.push('\n');
+    }
+    for e in 0..m.entries.len() {
+        let en = m.entries[e];
+        b.push_fmt(f"entry {entry::stage_name(en.stage)} {en.name} = fn {en.func}");
+        if en.stage == ir::STAGE_COMPUTE {
+            b.push_fmt(f" workgroup_size({en.wg[0]}, {en.wg[1]}, {en.wg[2]})");
+        }
+        b.push('\n');
+    }
+    for i in 0..m.functions.len() {
+        dump_fn(m, i, &b);
+    }
+}
+
+fn binding_text<A: Allocator>(bd: ir::Binding, b: inout Buf<A>) {
+    if bd.kind == ir::BIND_BUILTIN {
+        b.push_fmt(f" @builtin({entry::builtin_name(bd.value)})");
+    } else if bd.kind == ir::BIND_LOCATION {
+        b.push_fmt(f" @location({bd.value})");
+        if bd.interp == ir::INTERP_FLAT {
+            b.push_str(" @interpolate(flat)");
+        }
+    }
+}
+
+fn dump_fn<A: Allocator>(m: Module, h: i64, b: inout Buf<A>) {
+    let f = m.functions[h];
+    b.push_fmt(f"fn {h} {f.name}(");
+    for i in 0..f.params.len() {
+        if i > 0 {
+            b.push_str(", ");
+        }
+        b.push_fmt(f"{f.params[i].name}: ");
+        m.type_name(f.params[i].ty, &b);
+        binding_text(f.params[i].binding, &b);
+    }
+    b.push_str(") -> ");
+    m.type_name(f.result, &b);
+    binding_text(f.result_binding, &b);
+    b.push('\n');
+    for i in 0..f.locals.len() {
+        b.push_fmt(f"  local {i} {f.locals[i].name}: ");
+        m.type_name(f.locals[i].ty, &b);
+        b.push('\n');
+    }
+    for e in 0..f.exprs.len() {
+        b.push_fmt(f"  e{e}: ");
+        m.type_name(f.exprs[e].ty, &b);
+        b.push_str(" = ");
+        expr_text(m, f, e, &b);
+        if f.names[e].len > 0 {
+            b.push_fmt(f"  // {f.names[e]}");
+        }
+        b.push('\n');
+    }
+    if f.body >= 0 {
+        block_text(m, f, f.body, 1, &b);
+    }
+}
+
+fn indent<A: Allocator>(n: i64, b: inout Buf<A>) {
+    for _ in 0..n {
+        b.push_str("  ");
+    }
+}
+
+fn block_text<A: Allocator>(m: Module, f: Function, blk: i64, depth: i64, b: inout Buf<A>) {
+    let bl = f.blocks[blk];
+    for i in bl.start..bl.start + bl.count {
+        stmt_text(m, f, f.items[i], depth, &b);
+    }
+}
+
+fn stmt_text<A: Allocator>(m: Module, f: Function, s: i64, depth: i64, b: inout Buf<A>) {
+    let st = f.stmts[s];
+    indent(depth, &b);
+    if st.op == S_EMIT {
+        b.push_fmt(f"emit e{st.a}..e{st.b}\n");
+    } else if st.op == S_BLOCK {
+        b.push_str("block\n");
+        block_text(m, f, st.a, depth + 1, &b);
+    } else if st.op == S_IF {
+        b.push_fmt(f"if e{st.a}\n");
+        block_text(m, f, st.b, depth + 1, &b);
+        if f.blocks[st.c].count > 0 {
+            indent(depth, &b);
+            b.push_str("else\n");
+            block_text(m, f, st.c, depth + 1, &b);
+        }
+    } else if st.op == S_SWITCH {
+        b.push_fmt(f"switch e{st.a}\n");
+        for i in st.b..st.b + st.c {
+            let c = f.cases[i];
+            indent(depth, &b);
+            b.push_str("case");
+            for k in c.vstart..c.vstart + c.vcount {
+                b.push_fmt(f" {f.vals[k]}");
+            }
+            if c.is_default {
+                b.push_str(" default");
+            }
+            b.push('\n');
+            block_text(m, f, c.body, depth + 1, &b);
+        }
+    } else if st.op == S_LOOP {
+        b.push_str("loop\n");
+        block_text(m, f, st.a, depth + 1, &b);
+        if f.blocks[st.b].count > 0 || st.c >= 0 {
+            indent(depth, &b);
+            b.push_str("continuing\n");
+            block_text(m, f, st.b, depth + 1, &b);
+            if st.c >= 0 {
+                indent(depth + 1, &b);
+                b.push_fmt(f"break if e{st.c}\n");
+            }
+        }
+    } else if st.op == S_BREAK {
+        b.push_str("break\n");
+    } else if st.op == S_CONTINUE {
+        b.push_str("continue\n");
+    } else if st.op == S_RETURN {
+        if st.a >= 0 {
+            b.push_fmt(f"return e{st.a}\n");
+        } else {
+            b.push_str("return\n");
+        }
+    } else if st.op == S_KILL {
+        b.push_str("discard\n");
+    } else if st.op == S_BARRIER {
+        b.push_str(if st.a == ir::BARRIER_WORKGROUP { "barrier workgroup\n" }
+            else { "barrier storage\n" });
+    } else if st.op == S_STORE {
+        b.push_fmt(f"store e{st.a} <- e{st.b}\n");
+    } else if st.op == S_CALL {
+        if st.d >= 0 {
+            b.push_fmt(f"e{st.d} = ");
+        }
+        b.push_fmt(f"call fn {st.a}(");
+        for i in st.b..st.b + st.c {
+            if i > st.b {
+                b.push_str(", ");
+            }
+            b.push_fmt(f"e{f.args[i]}");
+        }
+        b.push_str(")\n");
+    } else if st.op == S_ATOMIC {
+        if st.d >= 0 {
+            b.push_fmt(f"e{st.d} = ");
+        }
+        b.push_fmt(f"atomic {ATOM[st.b]} e{st.a}");
+        if st.e >= 0 {
+            b.push_fmt(f" cmp e{st.e}");
+        }
+        if st.c >= 0 {
+            b.push_fmt(f" e{st.c}");
+        }
+        b.push('\n');
+    } else if st.op == S_IMAGE_STORE {
+        b.push_fmt(f"image_store e{st.a} at e{st.b} <- e{st.c}\n");
+    } else if st.op == S_WG_UNIFORM_LOAD {
+        b.push_fmt(f"e{st.b} = workgroup_uniform_load e{st.a}\n");
+    }
+}
+
+pub fn expr_text<A: Allocator>(m: Module, f: Function, e: i64, b: inout Buf<A>) {
+    let x = f.exprs[e];
+    let op = x.op;
+    if op == E_LITERAL {
+        let sk = m.types[x.ty].scalar;
+        if sk == SK_BOOL {
+            b.push_str(if x.a != 0 { "true" } else { "false" });
+        } else if sk == SK_F32 {
+            b.push_fmt(f"{bits_f32(x.a as u32)}");
+        } else if sk == SK_I32 {
+            b.push_fmt(f"{x.a as u32 as i32}i");
+        } else {
+            b.push_fmt(f"{x.a}u");
+        }
+    } else if op == E_ZERO {
+        b.push_str("zero");
+    } else if op == E_COMPOSE {
+        b.push_str("compose(");
+        args_text(f, x.a, x.b, &b);
+        b.push(')');
+    } else if op == E_SPLAT {
+        b.push_fmt(f"splat(e{x.a})");
+    } else if op == E_SWIZZLE {
+        b.push_fmt(f"e{x.a}.");
+        for i in 0..x.c {
+            b.push("xyzw"[(x.b >> (2 * i)) & 3]);
+        }
+    } else if op == E_ACCESS {
+        b.push_fmt(f"e{x.a}[e{x.b}] check {CK[x.c]}");
+        if x.c == ir::CK_CLAMP {
+            b.push_fmt(f" {x.d}");
+        }
+    } else if op == E_ACCESS_INDEX {
+        b.push_fmt(f"e{x.a}.{x.b}");
+    } else if op == E_ARG {
+        b.push_fmt(f"arg {x.a}");
+    } else if op == E_GLOBAL {
+        b.push_fmt(f"global {x.a}");
+    } else if op == E_LOCAL {
+        b.push_fmt(f"local {x.a}");
+    } else if op == E_LOAD {
+        b.push_fmt(f"load e{x.a}");
+    } else if op == E_UNARY {
+        b.push_fmt(f"{UN[x.a]} e{x.b}");
+    } else if op == E_BINARY {
+        b.push_fmt(f"{BIN[x.a]} e{x.b} e{x.c}");
+    } else if op == E_SELECT {
+        b.push_fmt(f"select e{x.a} ? e{x.b} : e{x.c}");
+    } else if op == E_MATH {
+        b.push_str(names::PREDECLARED[names::K_MATH_FIRST + x.a]);
+        b.push('(');
+        args_text(f, x.b, x.c, &b);
+        b.push(')');
+    } else if op == E_CONVERT {
+        b.push_fmt(f"convert e{x.a}");
+    } else if op == E_BITCAST {
+        b.push_fmt(f"bitcast e{x.a}");
+    } else if op == E_CALL_RESULT {
+        b.push_str("call result");
+    } else if op == E_ATOMIC_RESULT {
+        b.push_str("atomic result");
+    } else if op == E_WG_UNIFORM_RESULT {
+        b.push_str("workgroup uniform load result");
+    } else if op == E_ARRAY_LENGTH {
+        b.push_fmt(f"array_length global {x.a} member {x.b} offset {x.c} stride {x.d}");
+    } else if op == E_DERIVATIVE {
+        b.push_fmt(f"derivative {x.a} e{x.b}");
+    } else if op == E_IMAGE_SAMPLE {
+        b.push_fmt(f"sample {x.d & 255} e{x.a} e{x.b} (");
+        args_text(f, x.c, x.d >> 8, &b);
+        b.push(')');
+    } else if op == E_IMAGE_LOAD {
+        b.push_fmt(f"image_load e{x.a} (");
+        args_text(f, x.c, x.d, &b);
+        b.push(')');
+    } else if op == E_IMAGE_QUERY {
+        b.push_fmt(f"image_query {x.b} e{x.a}");
+        if x.c >= 0 {
+            b.push_fmt(f" level e{x.c}");
+        }
+    }
+}
+
+fn args_text<A: Allocator>(f: Function, start: i64, n: i64, b: inout Buf<A>) {
+    for i in start..start + n {
+        if i > start {
+            b.push_str(", ");
+        }
+        b.push_fmt(f"e{f.args[i]}");
+    }
+}

@@ -1,0 +1,289 @@
+// std::gpu::shader (0.22): what pipeline creation takes from the shader
+// compiler (docs/design/gpu.md §2.10): a module translated for one
+// backend, its code and its reflection. The WGSL compiler
+// (std::gpu::wgsl) produces a ShaderSource for the backend's ShaderKind
+// (`dev.caps().shader_kind`); programs that bring their own shaders write
+// both by hand.
+//
+// The reflection carries the native slots the writer chose, per stage
+// (Metal's [[buffer(n)]], [[texture(n)]], [[sampler(n)]]; a CUDA kernel's
+// parameter index): the hal binds what it is told and assumes no
+// numbering rule. The rule the MSL writer follows, so that compatible
+// layouts get the same slots: per stage, buffers, textures and samplers
+// each numbered from 0 in (group, binding) order over the bindings visible
+// in that stage; vertex buffers at Metal's 30 downward (vertex buffer i
+// at 30 - i).
+
+use std::Buf;
+use std::gpu::wgsl;
+use std::gpu::types::{ShaderStage, VertexFormat};
+
+/// A (group, binding) pair.
+pub type GroupBinding = [i64; 2];
+
+// ---- GPU shaders: sources and reflection (0.22) ----
+
+/// The form of a translated shader.
+#[derive(Eq, Debug, Clone)]
+pub enum ShaderKind {
+    /// Metal Shading Language text (3.0), compiled by the driver.
+    Msl,
+    /// SPIR-V words (Vulkan).
+    Spirv,
+    /// PTX text (CUDA).
+    Ptx,
+}
+
+/// What a binding holds.
+#[derive(Eq, Debug, Clone)]
+pub enum BindingType {
+    Uniform,
+    Storage,
+    ReadOnlyStorage,
+    Texture,
+    StorageTexture,
+    Sampler,
+    ComparisonSampler,
+}
+
+impl BindingType {
+    #[pure]
+    pub fn is_buffer(self) -> bool {
+        match self {
+            BindingType::Uniform | BindingType::Storage | BindingType::ReadOnlyStorage => true,
+            _ => false,
+        }
+    }
+
+    #[pure]
+    pub fn is_texture(self) -> bool {
+        self == BindingType::Texture || self == BindingType::StorageTexture
+    }
+
+    #[pure]
+    pub fn is_sampler(self) -> bool {
+        self == BindingType::Sampler || self == BindingType::ComparisonSampler
+    }
+}
+
+/// One `@group(g) @binding(b)` of a shader, with its native slot in each
+/// stage (-1: not used there).
+#[derive(Eq, Debug, Clone)]
+pub struct Binding {
+    pub group: i64,
+    pub binding: i64,
+    pub ty: BindingType,
+    pub slot_vertex: i64,
+    pub slot_fragment: i64,
+    pub slot_compute: i64,
+    pub min_size: i64,
+}
+
+impl Binding {
+    #[pure]
+    pub fn visibility(self) -> u32 {
+        var v: u32 = 0;
+        if self.slot_vertex >= 0 { v = v | ShaderStage::VERTEX; }
+        if self.slot_fragment >= 0 { v = v | ShaderStage::FRAGMENT; }
+        if self.slot_compute >= 0 { v = v | ShaderStage::COMPUTE; }
+        v
+    }
+}
+
+/// An entry point: its WGSL name, its name in the translated code (MSL
+/// reserves some, `main` among them), its stage, a compute entry's
+/// workgroup size, and the native slot where it reads the sizes buffer
+/// (-1: it reads none; Reflection::sizes).
+#[derive(Eq)]
+pub struct EntryPoint {
+    pub name: [u8],
+    pub native: [u8],
+    pub stage: u32,
+    pub workgroup: [i64; 3],
+    pub sizes_slot: i64,
+}
+
+/// A vertex entry point's input at `@location(n)`.
+#[derive(Eq, Debug, Clone)]
+pub struct VertexInput {
+    pub location: i64,
+    pub format: VertexFormat,
+}
+
+/// A translated module's interface. Its names view the compiler's output
+/// (or the program's text); Device::shader copies what it keeps.
+///
+/// `sizes` is the sizes buffer's layout (Metal; the bounds checks of
+/// runtime-sized arrays, docs/design/gpu.md "The sizes buffer"): the
+/// (group, binding) of each runtime-sized storage binding, one u32 each in
+/// this order, the bytes the buffer bound there exposes. Before each
+/// dispatch or draw, std::gpu gives it (setBytes) at the `sizes_slot` of
+/// each stage's entry point that has one; the rule is wgsl::sizes_words's.
+pub struct Reflection {
+    pub entries: Vec<EntryPoint>,
+    pub bindings: Vec<Binding>,
+    pub inputs: Vec<VertexInput>,
+    pub sizes: Vec<GroupBinding>,
+}
+
+impl Reflection {
+    pub fn new_in(gpa: Gpa) -> Reflection {
+        Reflection {
+            entries: Vec::new_in(gpa), bindings: Vec::new_in(gpa), inputs: Vec::new_in(gpa),
+            sizes: Vec::new_in(gpa)
+        }
+    }
+
+    /// A compute entry point with its workgroup size.
+    pub fn compute(inout self, name: [u8], native: [u8], x: i64, y: i64 = 1, z: i64 = 1) {
+        self.entries.push(EntryPoint {
+            name: name, native: native, stage: ShaderStage::COMPUTE, workgroup: [x, y, z],
+            sizes_slot: -1
+        });
+    }
+
+    pub fn vertex(inout self, name: [u8], native: [u8]) {
+        self.entries.push(EntryPoint {
+            name: name, native: native, stage: ShaderStage::VERTEX, workgroup: [0, 0, 0],
+            sizes_slot: -1
+        });
+    }
+
+    pub fn fragment(inout self, name: [u8], native: [u8]) {
+        self.entries.push(EntryPoint {
+            name: name, native: native, stage: ShaderStage::FRAGMENT, workgroup: [0, 0, 0],
+            sizes_slot: -1
+        });
+    }
+
+    /// A binding and its slots (-1 where a stage does not use it).
+    pub fn bind(inout self, group: i64, binding: i64, ty: BindingType, vertex: i64 = -1,
+        fragment: i64 = -1, compute: i64 = -1, min_size: i64 = 0) {
+        self.bindings.push(Binding {
+            group: group, binding: binding, ty: ty, slot_vertex: vertex, slot_fragment: fragment,
+            slot_compute: compute, min_size: min_size
+        });
+    }
+
+    pub fn input(inout self, location: i64, format: VertexFormat) {
+        self.inputs.push(VertexInput { location: location, format: format });
+    }
+
+    /// The next word of the sizes buffer: the bytes bound at (group,
+    /// binding), a runtime-sized storage binding.
+    pub fn size_binding(inout self, group: i64, binding: i64) {
+        self.sizes.push([group, binding]);
+    }
+
+    /// The native slot where entry point `name` of `stage` reads the sizes
+    /// buffer (MSL: a `constant uint*` at [[buffer(slot)]]).
+    pub fn sizes_slot(inout self, name: [u8], stage: u32, slot: i64) {
+        for i in 0..self.entries.len() {
+            if self.entries[i].name == name && self.entries[i].stage == stage {
+                self.entries[i].sizes_slot = slot;
+            }
+        }
+    }
+}
+
+/// A module translated for one backend: its code (text or words, as
+/// bytes) and its reflection; the shader compiler's output.
+pub struct ShaderSource {
+    pub kind: ShaderKind,
+    pub code: [u8],
+    pub reflection: Reflection,
+}
+
+impl ShaderSource {
+    /// MSL text and its reflection.
+    pub fn msl(code: [u8], reflection: sink Reflection) -> ShaderSource {
+        ShaderSource { kind: ShaderKind::Msl, code: code, reflection: reflection }
+    }
+}
+
+// ---- GPU shaders: from std::gpu::wgsl (0.22) ----
+
+/// The VertexFormat of a WGSL vertex input of scalar `scalar`
+/// (wgsl::ir::SK_*) and `components` components; None where VertexFormat
+/// has no variant (vec3<u32>, vec2..4<i32>, bool). An input of f32s is
+/// also fed by Unorm8x4 (VertexFormat::shader_type).
+pub fn wgsl_vertex_format(scalar: u8, components: i64) -> Option<VertexFormat> {
+    if scalar == wgsl::ir::SK_F32 {
+        if components == 1 { return Some(VertexFormat::Float32); }
+        if components == 2 { return Some(VertexFormat::Float32x2); }
+        if components == 3 { return Some(VertexFormat::Float32x3); }
+        if components == 4 { return Some(VertexFormat::Float32x4); }
+    } else if scalar == wgsl::ir::SK_U32 {
+        if components == 1 { return Some(VertexFormat::Uint32); }
+        if components == 2 { return Some(VertexFormat::Uint32x2); }
+        if components == 4 { return Some(VertexFormat::Uint32x4); }
+    } else if scalar == wgsl::ir::SK_I32 {
+        if components == 1 { return Some(VertexFormat::Sint32); }
+    }
+    None
+}
+
+/// The ShaderStage bit of a wgsl::ir::STAGE_*.
+fn wgsl_stage(stage: u8) -> u32 {
+    if stage == wgsl::ir::STAGE_VERTEX {
+        ShaderStage::VERTEX
+    } else if stage == wgsl::ir::STAGE_FRAGMENT {
+        ShaderStage::FRAGMENT
+    } else {
+        ShaderStage::COMPUTE
+    }
+}
+
+/// The BindingType of a wgsl::BK_* (the same order).
+fn wgsl_binding_type(kind: u8) -> BindingType {
+    match kind {
+        0 => BindingType::Uniform,
+        1 => BindingType::Storage,
+        2 => BindingType::ReadOnlyStorage,
+        3 => BindingType::Texture,
+        4 => BindingType::StorageTexture,
+        5 => BindingType::Sampler,
+        _ => BindingType::ComparisonSampler,
+    }
+}
+
+/// The reflection pipeline creation takes, from the WGSL compiler's
+/// (docs/design/gpu.md, "Merging with std::gpu"): the entry points (WGSL
+/// name, name in the translated code, stage, workgroup size, sizes buffer
+/// slot), the bindings (kind, slot per stage, minimum size), the vertex
+/// inputs, and the sizes buffer's layout. Its names view `refl`'s, which
+/// must outlive it. Err: the message for a vertex input no VertexFormat
+/// holds.
+pub fn from_wgsl(refl: wgsl::Reflection, gpa: Gpa) -> Result<Reflection, Buf> {
+    var out = Reflection::new_in(gpa);
+    for i in 0..refl.entries.len() {
+        // (the names view refl.entries[i] itself, not a copy of it)
+        out.entries.push(EntryPoint {
+            name: refl.entries[i].name.as_slice(), native: refl.entries[i].target_name.as_slice(),
+            stage: wgsl_stage(refl.entries[i].stage), workgroup: refl.entries[i].workgroup,
+            sizes_slot: refl.entries[i].sizes_slot
+        });
+    }
+    for i in 0..refl.bindings.len() {
+        let b = refl.bindings[i];
+        out.bindings.push(Binding {
+            group: b.group, binding: b.binding, ty: wgsl_binding_type(b.kind),
+            slot_vertex: b.slots[0], slot_fragment: b.slots[1], slot_compute: b.slots[2],
+            min_size: b.min_size
+        });
+    }
+    for i in 0..refl.inputs.len() {
+        let v = refl.inputs[i];
+        match wgsl_vertex_format(v.scalar, v.components) {
+            Some(f) => out.input(v.location, f),
+            None => return Err(format_in(
+                f"gpu: the vertex input at @location({v.location}) has no VertexFormat (f32 x1..4, u32 x1, x2, x4, i32 x1)",
+                gpa)),
+        }
+    }
+    for i in 0..refl.sizes.len() {
+        let b = refl.bindings[refl.sizes[i]];
+        out.size_binding(b.group, b.binding);
+    }
+    Ok(out)
+}

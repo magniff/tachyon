@@ -3,7 +3,7 @@
 ## show with the `use` line a program needs.
 $ def std::read_line Vec::push
 std::io::read_line	../../compiler/std/io.tach:40:8	fn	pub fn read_line<A: Allocator>(line: inout Buf<A>) -> std::Result<bool, IoError>
-std::Vec::push	../../compiler/std/std.tach:283:12	method	pub fn push(inout self, x: sink T)
+std::Vec::push	../../compiler/std/std.tach:284:12	method	pub fn push(inout self, x: sink T)
 $ def read_line twice
 std::io::read_line	../../compiler/std/io.tach:40:8	fn	pub fn read_line<A: Allocator>(line: inout Buf<A>) -> std::Result<bool, IoError>
 std::io::buffered::BufReader::read_line	../../compiler/std/io/buffered.tach:152:12	method	pub fn read_line<A: Allocator>(inout self, s: inout String<A>) -> Result<i64>
@@ -25,11 +25,11 @@ pub fn print_int(v: i64) {
 $ text std:1-2
 // std:1-2
 1	// The standard library (0.5): the module `std`, built into the compiler
-2	// (compiler/std/embed.sh makes compiler/src/front/stdsrc.tach from this file
+2	// (compiler/std/embed.sh makes compiler/src/front/stdsrc.tach from this file,
 $ grep 'pub fn read_line' --in std
 # <std>
-9983:1	code	std::io	pub fn read_line<A: Allocator>(line: inout Buf<A>) -> std::Result<bool, IoError> {
-10390:5	code	std::io::buffered	pub fn read_line<A: Allocator>(inout self, s: inout String<A>) -> Result<i64> {
+9984:1	code	std::io	pub fn read_line<A: Allocator>(line: inout Buf<A>) -> std::Result<bool, IoError> {
+10391:5	code	std::io::buffered	pub fn read_line<A: Allocator>(inout self, s: inout String<A>) -> Result<i64> {
 $ def no_such_name
 error query.no-match: no definition 'no_such_name'
 try: tachyonc query items

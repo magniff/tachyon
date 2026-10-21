@@ -19,6 +19,7 @@ crate::at	panic
 crate::part	panic
 crate::whole	none
 crate::color	panic
+std::gpu::PassDesc::color	none
 crate::sum	none
 crate::same	panic
 crate::spin	diverge

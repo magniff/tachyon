@@ -1,0 +1,208 @@
+// ---- Shader compiler implementation, entry (0.22) ----
+// Entry-point interfaces: what each stage's parameters and result may be
+// bound to, and with which types (WGSL §"Entry Point Declaration").
+
+use front::Front;
+use ir::{
+    BIND_BUILTIN, BIND_LOCATION, BIND_NONE, BI_FRAG_DEPTH, BI_FRONT_FACING, BI_GLOBAL_INVOCATION_ID,
+    BI_INSTANCE_INDEX, BI_LOCAL_INVOCATION_ID, BI_LOCAL_INVOCATION_INDEX, BI_NUM_WORKGROUPS,
+    BI_POSITION, BI_SAMPLE_INDEX, BI_SAMPLE_MASK, BI_VERTEX_INDEX, BI_WORKGROUP_ID, Binding,
+    INTERP_FLAT, SK_BOOL, SK_F32, SK_U32, STAGE_COMPUTE, STAGE_FRAGMENT, STAGE_VERTEX, TK_SCALAR,
+    TK_STRUCT, TK_VECTOR, T_BOOL, T_F32, T_U32, V, vec_ty,
+};
+use std::Vec;
+
+pub fn builtin_name(b: i64) -> [u8] {
+    if b == BI_POSITION {
+        "position"
+    } else if b == BI_VERTEX_INDEX {
+        "vertex_index"
+    } else if b == BI_INSTANCE_INDEX {
+        "instance_index"
+    } else if b == BI_FRONT_FACING {
+        "front_facing"
+    } else if b == BI_FRAG_DEPTH {
+        "frag_depth"
+    } else if b == BI_SAMPLE_INDEX {
+        "sample_index"
+    } else if b == BI_SAMPLE_MASK {
+        "sample_mask"
+    } else if b == BI_LOCAL_INVOCATION_ID {
+        "local_invocation_id"
+    } else if b == BI_LOCAL_INVOCATION_INDEX {
+        "local_invocation_index"
+    } else if b == BI_GLOBAL_INVOCATION_ID {
+        "global_invocation_id"
+    } else if b == BI_WORKGROUP_ID {
+        "workgroup_id"
+    } else {
+        "num_workgroups"
+    }
+}
+
+// The type a builtin has.
+pub fn builtin_type(b: i64) -> i64 {
+    if b == BI_POSITION {
+        vec_ty(SK_F32, 4)
+    } else if b == BI_FRONT_FACING {
+        T_BOOL
+    } else if b == BI_FRAG_DEPTH {
+        T_F32
+    }
+    else if b == BI_LOCAL_INVOCATION_ID || b == BI_GLOBAL_INVOCATION_ID || b == BI_WORKGROUP_ID
+        || b == BI_NUM_WORKGROUPS {
+        vec_ty(SK_U32, 3)
+    } else {
+        T_U32
+    }
+}
+
+// Whether builtin b may be an input (or, `output`, an output) of stage.
+fn builtin_allowed(b: i64, stage: u8, output: bool) -> bool {
+    if stage == STAGE_COMPUTE {
+        return !output && b >= BI_LOCAL_INVOCATION_ID;
+    }
+    if stage == STAGE_VERTEX {
+        if output {
+            return b == BI_POSITION;
+        }
+        return b == BI_VERTEX_INDEX || b == BI_INSTANCE_INDEX;
+    }
+    if output {
+        return b == BI_FRAG_DEPTH || b == BI_SAMPLE_MASK;
+    }
+    b == BI_POSITION || b == BI_FRONT_FACING || b == BI_SAMPLE_INDEX || b == BI_SAMPLE_MASK
+}
+
+struct Seen { locs: V<i64>, builtins: V<i64>, position: bool }
+
+fn check_binding(fr: inout Front, b: Binding, ty: i64, stage: u8, output: bool, what: [u8],
+    seen: inout Seen) {
+    let at = fr.m.functions[fr.m.entries[fr.m.entries.len() - 1].func].pos;
+    if b.kind == BIND_NONE {
+        if fr.err(at, "wgsl.entry") {
+            fr.emsg.push_fmt(f"{what} of an entry point needs '@location(N)' or '@builtin(NAME)'");
+        }
+        return;
+    }
+    if b.kind == BIND_BUILTIN {
+        if !builtin_allowed(b.value, stage, output) {
+            let io = if output { "output" } else { "input" };
+            if fr.err(at, "wgsl.entry") {
+                fr.emsg.push_fmt(
+                    f"'@builtin({builtin_name(b.value)})' is not an {io} of a {stage_name(stage)} shader");
+            }
+            return;
+        }
+        if builtin_type(b.value) != ty {
+            if fr.err(at, "wgsl.entry") {
+                fr.emsg.push_fmt(f"'@builtin({builtin_name(b.value)})' has type ");
+                fr.ty_str(builtin_type(b.value));
+                fr.emsg.push_str(", not ");
+                fr.ty_str(ty);
+            }
+            return;
+        }
+        for i in 0..seen.builtins.len() {
+            if seen.builtins[i] == b.value {
+                if fr.err(at, "wgsl.entry") {
+                    fr.emsg.push_fmt(f"'@builtin({builtin_name(b.value)})' appears twice");
+                }
+                return;
+            }
+        }
+        seen.builtins.push(b.value);
+        if b.value == BI_POSITION {
+            seen.position = true;
+        }
+        return;
+    }
+    // a location
+    if stage == STAGE_COMPUTE {
+        if fr.err(at, "wgsl.entry") {
+            fr.emsg.push_str("a compute shader has no '@location' inputs");
+        }
+        return;
+    }
+    let t = fr.m.types[ty];
+    if (t.kind != TK_SCALAR && t.kind != TK_VECTOR) || t.scalar == SK_BOOL {
+        if fr.err(at, "wgsl.entry") {
+            fr.emsg.push_fmt(f"'@location({b.value})' holds a number or a vector of numbers, not ");
+            fr.ty_str(ty);
+        }
+        return;
+    }
+    let interpolated = (stage == STAGE_VERTEX && output) || (stage == STAGE_FRAGMENT && !output);
+    if interpolated && t.scalar != SK_F32 && b.interp != INTERP_FLAT {
+        if fr.err(at, "wgsl.entry") {
+            fr.emsg.push_fmt(
+                f"'@location({b.value})' is an integer: it needs '@interpolate(flat)'");
+        }
+        return;
+    }
+    for i in 0..seen.locs.len() {
+        if seen.locs[i] == b.value {
+            if fr.err(at, "wgsl.entry") {
+                fr.emsg.push_fmt(f"'@location({b.value})' appears twice");
+            }
+            return;
+        }
+    }
+    seen.locs.push(b.value);
+}
+
+pub fn stage_name(s: u8) -> [u8] {
+    if s == STAGE_VERTEX {
+        "vertex"
+    } else if s == STAGE_FRAGMENT {
+        "fragment"
+    } else {
+        "compute"
+    }
+}
+
+// A parameter or result: a bound value, or a struct of bound members.
+fn check_io(fr: inout Front, b: Binding, ty: i64, stage: u8, output: bool, what: [u8],
+    seen: inout Seen) {
+    let t = fr.m.types[ty];
+    if t.kind == TK_STRUCT && b.kind == BIND_NONE {
+        for i in t.mstart..t.mstart + t.mcount {
+            let mem = fr.m.members[i];
+            if fr.m.types[mem.ty].kind == TK_STRUCT {
+                let at = fr.m.functions[fr.m.entries[fr.m.entries.len() - 1].func].pos;
+                fr.fail(at, "wgsl.entry", "an entry point's IO struct cannot nest structs");
+                return;
+            }
+            check_binding(&fr, mem.binding, mem.ty, stage, output, "a member of an IO struct",
+                &seen);
+        }
+        return;
+    }
+    check_binding(&fr, b, ty, stage, output, what, &seen);
+}
+
+pub fn check_interface(fr: inout Front, ei: i64) {
+    let stage = fr.m.entries[ei].stage;
+    let fh = fr.m.entries[ei].func;
+    let pos = fr.m.functions[fh].pos;
+    var ins = Seen { locs: Vec::new_in(fr.a), builtins: Vec::new_in(fr.a), position: false };
+    for i in 0..fr.m.functions[fh].params.len() {
+        let b = fr.m.functions[fh].params[i].binding;
+        let t = fr.m.functions[fh].params[i].ty;
+        check_io(&fr, b, t, stage, false, "a parameter", &ins);
+    }
+    var outs = Seen { locs: Vec::new_in(fr.a), builtins: Vec::new_in(fr.a), position: false };
+    let result = fr.m.functions[fh].result;
+    if result >= 0 {
+        if stage == STAGE_COMPUTE {
+            fr.fail(pos, "wgsl.entry", "a compute shader returns nothing");
+            return;
+        }
+        let rb = fr.m.functions[fh].result_binding;
+        check_io(&fr, rb, result, stage, true, "the result", &outs);
+    }
+    if stage == STAGE_VERTEX && !outs.position && !fr.failed {
+        fr.fail(pos, "wgsl.entry", "a vertex shader returns '@builtin(position)' (a vec4<f32>)");
+        fr.help("for example: fn vs(...) -> @builtin(position) vec4<f32>");
+    }
+}

@@ -1,0 +1,84 @@
+// A triangle rendered into a texture, read back and printed as text: one
+// character per pixel, after the channel that dominates it.
+
+use std::gpu;
+use std::gpu::{
+    BufferUsage, Format, PassDesc, Reflection, ShaderSource, TextureUsage, VertexFormat,
+    VertexLayout,
+};
+
+const W: i64 = 48;
+const H: i64 = 20;
+
+const MSL: [[u8]; 13] = [
+    "#include <metal_stdlib>",
+    "using namespace metal;",
+    "struct VIn { float2 pos [[attribute(0)]]; float3 color [[attribute(1)]]; };",
+    "struct VOut { float4 pos [[position]]; float3 color; };",
+    "vertex VOut vs_main(VIn in [[stage_in]]) {",
+    "    VOut o;",
+    "    o.pos = float4(in.pos, 0.5, 1.0);",
+    "    o.color = in.color;",
+    "    return o;",
+    "}",
+    "fragment float4 fs_main(VOut in [[stage_in]]) { return float4(in.color, 1.0); }",
+    "",
+    "",
+];
+
+fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+    let inst = gpu::Instance::new_in(gpa);
+    let adapter = inst.adapter()?;
+    let (dev, var queue) = adapter.device()?;
+
+    var text = Buf::new_in(gpa);
+    for l in MSL {
+        text.push_str(l);
+        text.push('\n');
+    }
+    var refl = Reflection::new_in(gpa);
+    refl.vertex("vs", "vs_main");
+    refl.fragment("fs", "fs_main");
+    refl.input(0, VertexFormat::Float32x2);
+    refl.input(1, VertexFormat::Float32x3);
+    let src = ShaderSource::msl(text.as_slice(), refl);
+    let shader = dev.shader(src)?;
+
+    // x, y in clip space, then r, g, b
+    let verts: [f32; 15] = [0.0, 0.9, 1.0, 0.0, 0.0, -0.9, -0.9, 0.0, 1.0, 0.0, 0.9, -0.9, 0.0, 0.0,
+        1.0];
+    let vb = dev.buffer_init(gpu::bytes_of_f32(verts[..]), BufferUsage::VERTEX);
+    var layout = VertexLayout::new(20);
+    layout.attribute(0, VertexFormat::Float32x2, 0);
+    layout.attribute(1, VertexFormat::Float32x3, 8);
+    var desc = gpu::RenderDesc::new(shader, "vs", "fs", Format::Rgba8Unorm);
+    desc.vertex_buffer(layout);
+    let pipe = dev.render_pipeline(desc)?;
+
+    let target = dev.texture(W, H, Format::Rgba8Unorm,
+        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC);
+    let view = target.view();
+    var pixels = dev.buffer(256 * H, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var enc = dev.encoder();
+    enc.render_pass(PassDesc::color(view), |pass| {
+        pass.set_pipeline(pipe);
+        &pass.set_vertex_buffer(0, vb);
+        &pass.draw(0..3, 0..1);
+    });
+    enc.copy_texture_to_buffer(target, pixels, 256);
+    queue.submit(enc.finish());
+
+    let px = pixels.map_read(dev);
+    for y in 0..H {
+        var line = Buf::new_in(gpa);
+        for x in 0..W {
+            let i = y * 256 + x * 4;
+            let (r, g, b) = (px[i], px[i + 1], px[i + 2]);
+            let c = if r as i64 + g as i64 + b as i64 == 0 { '.' } else if r >= g && r >= b { 'R' }
+                else if g >= b { 'G' } else { 'B' };
+            line.push(c);
+        }
+        println(line.as_slice());
+    }
+    Ok(())
+}

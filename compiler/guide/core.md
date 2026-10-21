@@ -183,6 +183,7 @@ testing`, `guide contracts`).
 
 SIMD and CPU intrinsics (0.19): `std::arch`, the vendors' names (`vaddq_u8`,
 `__crc32cd`) checked against the CPU: `tachyonc guide arch`; `query arch WORDS`.
+GPU compute and rendering (0.22): `std::gpu`, wgpu's objects on Metal, `-l objc`: `tachyonc guide gpu`.
 
 ## The loop
 

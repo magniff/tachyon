@@ -1671,3 +1671,41 @@ pm-examples, pm-transcripts, merged in).
 - Suite with C3's compiler: 1660 passed, 2 xfail, 0 failed. The
   bootstrap from v0.20.0 (releases.toml's 0.20.0 entry, then `bootstrap.sh
   --dev`) is the check left once the tag exists.
+
+## 0.22 (branch c22-fixes), and what is left for 0.22.1
+
+Done in 0.22: `fn(T)` is `fn(let T)` (a plain parameter of a function
+type or an Fn bound is let; std's consuming bounds say `sink`: Option and
+Result's map, and_then, map_err, unwrap_or_else, Iterator::map, for_each,
+every fold's accumulator and item); `f(x?)` keeps the value `?` makes
+through the call; std is own-checked (tests/std/own.sh, its known
+patterns in tests/std/own.allowed).
+
+### 0.22.1
+
+- **The let-as-borrow rule** (decided, as recommended; the user may
+  overrule it). Following Hylo, `let` is semantically a borrow; copying a
+  copyable argument is an optimization, taken only when no view of the
+  parameter escapes. A function that returns a view of a let parameter,
+  or stores one (into an inout parameter or a field), takes it by
+  reference. The plan: decide it from the signature before the body is
+  checked (a result or an inout/sink parameter whose type can hold a view,
+  and a let parameter whose type has storage a view can point into: an
+  array, a struct holding one), in resolve_signature and fn_type_param
+  alike, per instance; then restore `DirEntry::file_name(self)` and make
+  voltty's `Text::as_slice(self) -> [u8]` legal. Not started.
+- A closure's by-value parameter is not dropped (a leak, as in 0.19.1).
+  Dropping it is a two-line change (front/own/drops, as param_drops does
+  for a function), but iterators that yield bitwise copies of borrowed
+  elements (HashMapIter, Keys, Values: `(*e).0`, `(*e).1`) pass them to
+  `sink` fold and map closures, which would then free the map's elements:
+  those items must become views first.
+- A generic let parameter given an rvalue of a non-copyable type other
+  than a closure literal (`gl(make())`) errors; an `x?` argument naming
+  the receiver's variable, or after an impure argument, is not made a
+  temporary.
+- own.move_out's try for an operator impl suggests `std::take(&self)` of a
+  let receiver.
+- tests/std/own.allowed's eight patterns: fmt's rooms as `inout [u8]`
+  results, `-> let T` results in the own pass (T3), the sort closures'
+  summaries.
