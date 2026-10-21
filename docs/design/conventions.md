@@ -1471,3 +1471,48 @@ gate with the rehearsal (§9.3 step 7).
 - **The legacy crate is the whole root crate.** A test of the mode is a
   root of its own (tests/run/conv_legacy*): the pragma is read from
   file 0 only.
+
+## T1 as built (branch c20-conv-t1)
+
+- **Accesses** (Local.access). These are:
+  - a let parameter that borrows;
+  - an inout parameter, a receiver `self` / `inout self` that is a
+    reference;
+  - an `inout x = &e;` local;
+  - a `let x = part;` that borrows;
+  - in a 0.20 file, a pattern binding made through a reference (`match
+    &x`).
+
+  Each use is rewritten to `*x` in `synth_name`. So `x = v` writes
+  through, `&x` reborrows, methods and fields reach the value, and `*x`
+  written on one is conv.rust.
+- **let parameters** (`conv::param_type`, applied in
+  `resolve_signature`, so per instance) take a copy of a copyable value:
+  no Drop, no Vec, Buf or HashMap, and no exclusive access in it.
+  Anything else is taken as `&T`. In a 0.20 file an unwritten convention
+  is let; in a mixed file it keeps 0.19's by-value meaning.
+- **Temporaries.** A value passed to a let parameter that borrows
+  (`total(make())`) becomes a temporary of the statement. temps.tach
+  does this for calls of non-generic functions named by an identifier;
+  method calls and generic callees do not get it yet.
+- **`let x = part;`** in a 0.20 file borrows (D13) when the part is an
+  element, a dereference, or a field reached through one. `var x =
+  part` stays `own.move_out`.
+- **Markers.** `conv.marker` (an inout argument without `&`) and
+  `conv.marker_extra` (`&` where a let or sink parameter is wanted) are
+  reported in 0.20 files only. Mixed files keep 0.19's messages, so
+  nothing written in the old spelling changes until Phase M.
+- **Traits.** A trait's let parameters go through `param_type` with the
+  impl's Self. An impl's borrowing let parameter meets a trait's
+  by-value one (`conv::let_for_value`). An arithmetic operator (and `-a`)
+  whose impl takes its operands let reads them instead of moving them.
+- **`conv.extern`** reports `inout` or `sink` in a C signature.
+- **The diagnostics' words** in 0.20 files (own.readonly, own.moved,
+  own.move_out, the immutable-assignment help) name let, inout and sink.
+  Their `try:` lines use `refactor signature --type v 'inout T'`. T2's
+  `--convention` replaces that once it lands.
+- **Not done:**
+  - transparent access *fields* (`q: inout Query` is reached through
+    auto-deref as before; assigning `p.q = v` does not write through);
+  - projections' bodies (T3);
+  - own.moved does not yet name the sink parameter it moved into.
