@@ -150,10 +150,10 @@ crate::heap::free_heap	heap.tach:63:8	fn	pub fn free_heap(h: inout MinHeap)
 crate::heap::is_empty	heap.tach:18:8	fn	pub fn is_empty(h: MinHeap) -> bool
 crate::heap::pop	heap.tach:35:8	fn	pub fn pop(h: inout MinHeap) -> Option<Entry>
 crate::graph::edges_from	graph.tach:55:8	fn	pub fn edges_from(g: Graph, i: i64) -> [Edge]
-std::Vec::filled_in	<std>:1480:12	method	pub fn filled_in(n: i64, x: sink T, a: sink A) -> Vec<T, A>
+std::Vec::filled_in	<std>:1485:12	method	pub fn filled_in(n: i64, x: sink T, a: sink A) -> Vec<T, A>
 crate::heap::push	heap.tach:22:8	fn	pub fn push(h: inout MinHeap, e: Entry)
-std::Vec::set	<std>:301:12	method	pub fn set(inout self, i: i64, x: sink T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
-std::Option::unwrap	<std>:119:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
+std::Vec::set	<std>:306:12	method	pub fn set(inout self, i: i64, x: sink T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
+std::Option::unwrap	<std>:124:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
 // callers (1)
 plan	main.tach:20:11	match quickest(g, a, b, gpa) {
 note query.budget: over the budget of 600 tokens, left out: calls 2, types or uses 9

@@ -7,6 +7,7 @@ crate::pick	views(toks) declared
 crate::text_of	views(*toks) declared
 crate::intern	views() stores(word) declared
 crate::count	views()
+<std::string::Chars as Iterator>::count	views()
 $ views Vec::get Vec::as_slice Vec::push
 Vec<Tok>::get	views(*self) parametric
 Vec<u64>::get	views()
@@ -22,6 +23,10 @@ Vec<u64>::push	views()
 Vec<Vec<u64>>::push	views()
 Vec<i64>::push	views()
 Vec<u32>::push	views()
+Vec<(i64, u32)>::push	views()
+Vec<str>::push	views()
+Vec<Path>::push	views()
+Vec<Result<DirEntry, Error>>::push	views()
 $ views crate --why
 crate::first_word	views(s) declared
   why: declared (#[views], #[stores]): callers use the declaration, and the body is checked against it
@@ -36,6 +41,7 @@ crate::pick	views017/main.tach:16:4	fn	fn pick(toks: Vec<Tok>, counts: Vec<i64>)
 crate::intern	views017/main.tach:27:4	fn	fn intern(names: inout Vec<[u8]>, word: [u8])	effects: alloc(Gpa) panic	views: views() stores(word) declared
 crate::count	views017/main.tach:31:4	fn	fn count(toks: Vec<Tok>) -> i64	effects: none
 std::iter::Iterator::count	../../compiler/std/iter.tach:73:8	trait-method	fn count(self) -> i64
+<std::string::Chars as Iterator>::count	../../compiler/std/string.tach:753:8	method	fn count(self) -> i64	effects: panic diverge
 $ views nothing_here
 error query.no-match: no definition 'nothing_here'
 try: tachyonc query items
