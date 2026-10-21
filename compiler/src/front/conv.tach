@@ -25,7 +25,10 @@ use crate::base::diag::{
 use crate::front::ast::{CONV_INOUT, CONV_NEW, CONV_SINK, NODES, NODE_REF_MUT, NodeKind, child};
 use crate::front::lexer::{TOKS, Tok};
 use crate::front::modules::{file_of_pos, within_std};
-use crate::front::types::FNS;
+use crate::front::own::kinds::{K_OWNED, type_kind};
+use crate::front::types::{
+    FNS, REF_MUT, REF_SHARED, STRUCTS, TYPES, TY_ERROR, TyKind, ref_to, struct_field, type_elem,
+};
 
 // The first line that makes a crate legacy (its root file's first bytes).
 pub const LEGACY_MARKER: [u8] = "// tachyon-syntax: 0.19";
@@ -292,5 +295,201 @@ pub fn inout_marker(n: i64) -> bool {
     unsafe {
         NODES[n].kind == NodeKind::Unary && NODES[n].op == Tok::Amp
             && (NODES[n].p & CONV_NEW) != 0 && (NODES[n].p & NODE_REF_MUT) == 0
+    }
+}
+
+// ---- T1: what a convention means ----
+
+// Whether a value of type t is copied, not borrowed, by a let parameter:
+// it owns nothing (no Drop, no Vec, Buf or HashMap in it) and holds no
+// exclusive access (`&mut T`, `inout [T]`), conventions.md §2.2.
+pub fn copyable(t: i64) -> bool {
+    (type_kind(t) & K_OWNED) == 0 && !holds_mut(t, 0)
+}
+
+fn holds_mut(t: i64, depth: i64) -> bool {
+    unsafe {
+        if t <= 0 || depth > 8 {
+            return false;
+        }
+        let k = TYPES[t].kind;
+        if k == TyKind::Ptr || k == TyKind::Slice {
+            return TYPES[t].b == REF_MUT;
+        }
+        if k == TyKind::Struct {
+            let s = TYPES[t].a;
+            for i in 0..STRUCTS[s].field_count {
+                if holds_mut((*struct_field(s, i)).ty, depth + 1) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if k == TyKind::Tuple {
+            for i in 0..TYPES[t].count {
+                if holds_mut(type_elem(t, i), depth + 1) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if k == TyKind::Array {
+            return holds_mut(TYPES[t].a, depth + 1);
+        }
+        false
+    }
+}
+
+// The type parameter p (a Param node) has, from the type its node resolved
+// to: a let parameter (conventions.md §2.2) takes a copy of a copyable
+// value and a shared reference to any other (`&T`, an access: used as
+// the value, front/check/names: synth_name); `let [T]` is the slice. Per
+// instance: a generic function's instances resolve their signatures.
+pub fn param_type(p: i64, ty: i64) -> i64 {
+    unsafe {
+        if ty <= 0 || ty == TY_ERROR {
+            return ty;
+        }
+        let c = param_conv(p);
+        if c == CONV_IN_OUT && TYPES[ty].kind == TyKind::Ptr && TYPES[ty].b == REF_MUT
+            && TYPES[TYPES[ty].a].kind == TyKind::Slice {
+            // (`inout self` in `impl [T]`, `x: inout T` with T a slice: the
+            // exclusive slice `inout [T]`, not a reference to a slice)
+            return crate::front::types::mut_slice_of(TYPES[TYPES[ty].a].a);
+        }
+        if c != CONV_LET {
+            return ty;
+        }
+        let t = NODES[p].b;
+        let written = t > 0 && NODES[t].kind == NodeKind::TyPtr && (NODES[t].p & CONV_NEW) != 0;
+        let base = if written { TYPES[ty].a } else { ty };
+        if base <= 0 || TYPES[base].kind == TyKind::Slice || copyable(base) {
+            return base;
+        }
+        ref_to(base, REF_SHARED)
+    }
+}
+
+// Whether Param p is an access (a let parameter that borrows, or an inout
+// one) of type ty: its uses are the value it designates.
+pub fn param_is_access(p: i64, ty: i64) -> bool {
+    unsafe {
+        let c = param_conv(p);
+        (c == CONV_LET || c == CONV_IN_OUT) && ty > 0 && TYPES[ty].kind == TyKind::Ptr
+            && TYPES[ty].b != 0
+    }
+}
+
+// (0.20) Whether an impl's parameter p, of type it, meets its trait's
+// type tt: a let parameter (`self`, `other: Self` written in 0.20's
+// spelling) that borrows (`&T`) where the trait takes T by value, as the
+// operator traits do (`fn add(self, other: Self) -> Self` for an owned
+// Self, conventions.md D11): the calls borrow instead of moving.
+pub fn let_for_value(p: i64, it: i64, tt: i64) -> bool {
+    unsafe {
+        p > 0 && param_conv(p) == CONV_LET && it > 0 && TYPES[it].kind == TyKind::Ptr
+            && TYPES[it].b == REF_SHARED && TYPES[it].a == tt
+    }
+}
+
+// (0.20) Whether an impl's let parameter p, a copy of type it, meets its
+// trait's shared reference tt (`&T`, a trait in 0.19's spelling, or one
+// whose instance the impl copies): the impl takes the trait's `&T`, used
+// as the value (check_function makes it an access).
+pub fn let_copy_for_ref(p: i64, it: i64, tt: i64) -> bool {
+    unsafe {
+        p > 0 && param_conv(p) == CONV_LET && tt > 0 && TYPES[tt].kind == TyKind::Ptr
+            && TYPES[tt].b == REF_SHARED && TYPES[tt].a == it
+    }
+}
+
+// (0.20) conv.extern: Param p of a C function (`extern "C"`, declared or
+// defined here) written `inout` or `sink`: C takes values and pointers.
+pub fn extern_conv(p: i64) {
+    unsafe {
+        let c = param_conv(p);
+        if c != CONV_IN_OUT && c != CONV_SINK_K {
+            return;
+        }
+        let msg = buf_new();
+        buf_bytes(msg, "a C function takes values and raw pointers, not '");
+        buf_bytes(msg, conv_word(c));
+        buf_bytes(msg, "': write '");
+        buf_bytes(msg, SYMS[NODES[p].a].text);
+        buf_bytes(msg,
+            if c == CONV_IN_OUT { ": *T'; the call passes '&x' (it converts)" } else { ": T'" });
+        conv_error(CODE_EXTERN, NODES[p].start, NODES[p].end, buf_slice(msg), "", "");
+    }
+}
+
+// (0.20) Whether field i of struct s is declared an access (`q: inout
+// Query`, `cfg: let Config`): its uses are the value it designates, as an
+// access local's are (front/check/synth_mode: synth_field).
+pub fn field_is_access(s: i64, i: i64) -> bool {
+    unsafe {
+        let node = STRUCTS[s].node;
+        if node <= 0 || STRUCTS[s].closure != 0 || i < 0 || i >= NODES[node].count {
+            return false;
+        }
+        let f = child(node, i);
+        let t = NODES[f].b;
+        NODES[f].kind == NodeKind::Field && t > 0 && NODES[t].kind == NodeKind::TyPtr
+            && (NODES[t].p & CONV_NEW) != 0
+    }
+}
+
+// (0.20) conv.marker at value n: a place passed where an exclusive
+// reference is wanted (an inout parameter, an inout field), without `&`.
+pub fn marker_error(n: i64) {
+    unsafe {
+        let s = NODES[n].start;
+        let text = SRC[s..NODES[n].end];
+        let msg = buf_new();
+        buf_bytes(msg, "'");
+        buf_bytes(msg, text);
+        buf_bytes(msg, "' is lent inout here (the callee may change it): mark it '&");
+        buf_bytes(msg, text);
+        buf_bytes(msg, "'");
+        // (the --old text with the byte before it, `(v` or ` v`, so that it
+        // is one place on its line)
+        let new = buf_new();
+        buf_bytes(new, SRC[s - 1..s]);
+        buf_bytes(new, "&");
+        buf_bytes(new, text);
+        conv_error(CODE_MARKER, s - 1, NODES[n].end, buf_slice(msg),
+            "an inout parameter takes '&place'; when the callee never changes it, take it let: 'tachyonc refactor signature F --convention x let'",
+            buf_slice(new));
+    }
+}
+
+// (0.20) conv.marker_extra at `&e` n of a file read in 0.20's spelling,
+// where `expected` takes no exclusive access (a let parameter, by copy or
+// shared, a sink one, a shared slice): the `&` is dropped (n becomes e),
+// and the error says so.
+pub fn extra_marker(n: i64, expected: i64) {
+    unsafe {
+        if expected <= 0 || NODES[n].kind != NodeKind::Unary || NODES[n].op != Tok::Amp
+            || (NODES[n].p & CONV_NEW) == 0 || !strict_at(NODES[n].start) {
+            return;
+        }
+        let k = TYPES[expected].kind;
+        let shared = k == TyKind::Ptr && TYPES[expected].b == REF_SHARED
+            || k == TyKind::Slice && TYPES[expected].b == 0
+            || k == TyKind::Prim && expected != TY_ERROR
+            || k == TyKind::Struct || k == TyKind::Enum || k == TyKind::Tuple;
+        if !shared {
+            return;
+        }
+        let operand = NODES[n].b;
+        let inner = SRC[NODES[operand].start..NODES[operand].end];
+        let msg = buf_new();
+        buf_bytes(msg, "'&' marks an argument the callee may change; '");
+        buf_bytes(msg, inner);
+        buf_bytes(msg, "' is taken let or sink here (read, or moved): pass '");
+        buf_bytes(msg, inner);
+        buf_bytes(msg, "'");
+        conv_error(CODE_MARKER_EXTRA, NODES[n].start, NODES[operand].end, buf_slice(msg), "",
+            inner);
+        NODES[n] = NODES[operand];
     }
 }

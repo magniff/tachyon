@@ -1472,6 +1472,74 @@ gate with the rehearsal (§9.3 step 7).
   root of its own (tests/run/conv_legacy*): the pragma is read from
   file 0 only.
 
+## T1 as built (branch c20-conv-t1)
+
+- **Accesses** (Local.access). These are:
+  - a let parameter that borrows;
+  - an inout parameter, a receiver `self` / `inout self` that is a
+    reference;
+  - an `inout x = &e;` local;
+  - a `let x = part;` that borrows;
+  - in a 0.20 file, a pattern binding made through a reference (`match
+    &x`).
+
+  Each use is rewritten to `*x` in `synth_name`. So `x = v` writes
+  through, `&x` reborrows, methods and fields reach the value, and `*x`
+  written on one is conv.rust.
+- **let parameters** (`conv::param_type`, applied in
+  `resolve_signature`, so per instance) take a copy of a copyable value:
+  no Drop, no Vec, Buf or HashMap, and no exclusive access in it.
+  Anything else is taken as `&T`. In a 0.20 file an unwritten convention
+  is let; in a mixed file it keeps 0.19's by-value meaning.
+- **Temporaries.** A value passed to a let parameter that borrows
+  (`total(make())`) becomes a temporary of the statement. temps.tach
+  does this for calls of non-generic functions named by an identifier;
+  method calls and generic callees do not get it yet.
+- **`let x = part;`** in a 0.20 file borrows (D13) when the part is an
+  element, a dereference, or a field reached through one. `var x =
+  part` stays `own.move_out`.
+- **Markers.** `conv.marker` (an inout argument without `&`) and
+  `conv.marker_extra` (`&` where a let or sink parameter is wanted) are
+  reported in 0.20 files only. Mixed files keep 0.19's messages, so
+  nothing written in the old spelling changes until Phase M.
+- **Traits.** A trait's let parameters go through `param_type` with the
+  impl's Self. An impl's borrowing let parameter meets a trait's
+  by-value one (`conv::let_for_value`). An arithmetic operator (and `-a`)
+  whose impl takes its operands let reads them instead of moving them.
+- **`conv.extern`** reports `inout` or `sink` in a C signature.
+- **The diagnostics' words** in 0.20 files (own.readonly, own.moved,
+  own.move_out, the immutable-assignment help) name let, inout and sink.
+  Their `try:` lines use `refactor signature --type v 'inout T'`. T2's
+  `--convention` replaces that once it lands.
+- **Access fields** (`q: inout Query`, `cfg: let Config`, declared with
+  CONV_NEW) are transparent too. `synth_field` makes `p.q` into `*p.q`,
+  so `h.p.q = 10` and `h.n = 7` write the place the field designates.
+  The owned-assignment desugaring (drops.tach `copy_place`) keeps the
+  flag that marks the reference under an access's `*`. Before this,
+  `x = v` in an instance with an owned T made `**x`. `star_on_access`
+  reports only a `*` written in the source.
+- **own.moved names the sink parameter** that took the value: "'v' is
+  used here after it moved into 'keep(sink v)' at 16:18" (walk.tach
+  records owned arguments, moves.tach `moved_into`). A by-value
+  parameter in 0.19's spelling keeps the old message.
+- **Not done:**
+  - projections' bodies (T3);
+  - a `try:` that changes a sink parameter to let (T2's `refactor
+    signature --convention`).
+- **The lost explain entries** (a T1 dev compiler, built from the
+  working tree, listed 201 codes instead of 210) could not be
+  reproduced:
+  - from the committed tree at 6899a467, 3 builds with `--no-cache` and
+    2 with the code cache gave 210 entries, and builds with the same
+    output name are byte-identical;
+  - a cache filled by the Phase 0 tree and then the T1 diff also gave
+    210.
+
+  The code cache keys a function on its IR hash, which includes the
+  folded `CONV_COUNT`. The likeliest cause is a build made while the
+  tree was mid-edit (one `edit patch --pairs` had failed just before),
+  not the cache.
+
 ## T2: the tools (2026-10-21, branch c20-conv-t2)
 
 **Built.** `fix --only conventions` (tools/fixconv.tach; §9.2 rules 1 to

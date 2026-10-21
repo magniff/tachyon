@@ -35,8 +35,8 @@ use crate::base::diag::{
     err_try_fmt,
 };
 use crate::front::ast::{
-    CLOSURE_MOVE, FN_CLOSURE, NODES, NODE_CAPTURE, NodeKind, child, list_begin, list_end, list_push,
-    new_node,
+    CLOSURE_MOVE, CONV_NEW, FN_CLOSURE, NODES, NODE_CAPTURE, NodeKind, child, list_begin, list_end,
+    list_push, new_node,
 };
 use crate::front::check::{
     CONST_CONTEXT, CUR_FN, DEFER_LOOP_BASE, LOCALS, LOCAL_COUNT, LOOP_BASE, LOOP_STACK, RETURN_TYPE,
@@ -53,8 +53,8 @@ use crate::front::modules::CUR_MOD;
 use crate::front::parser::UNDERSCORE;
 use crate::front::types::{
     FIELDS, FIELD_CAP, FIELD_COUNT, FNS, FN_COUNT, FieldInfo, REF_MUT, STRUCTS, TLISTS, TSCRATCH,
-    TYPES, TY_ERROR, TY_NEVER, TY_UNIT, TyKind, buf_type, err_type, is_pointer, make_type, ptr_to,
-    struct_type, type_elem, type_size,
+    TYPES, TY_ERROR, TY_NEVER, TY_UNIT, TyKind, buf_type, err_type, is_pointer, is_ref, make_type,
+    ptr_to, struct_type, type_elem, type_size,
 };
 
 // A closure: its Closure node, its function (FNS index), its env struct
@@ -231,6 +231,10 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64) -> i64 {
                 }
                 let mutable = NODES[param].c != 0;
                 NODES[param].x = define_local(NODES[param].a, tys[i], mutable, true);
+                // (0.20) `|s: inout Sum|`: an access
+                let tn = NODES[param].b;
+                LOCALS[NODES[param].x].access = tn > 0 && (NODES[tn].p & CONV_NEW) != 0
+                    && tys[i] > 0 && is_ref(tys[i]);
                 continue;
             }
             let start = NODES[param].start;
@@ -658,7 +662,10 @@ fn captured_by_ref(id: i64, local: i64) -> bool {
         if (NODES[CLOSURES[id].node].c & CLOSURE_MOVE) != 0 {
             return false;
         }
-        if LOCALS[local].mutable {
+        // (0.20: a sink parameter is mutable, but captured as a let is, by
+        // value, until the closure writes it: note_local_write, and
+        // upgrade_captures for one whose address it takes)
+        if LOCALS[local].mutable && !LOCALS[local].sink {
             return true;
         }
         let t = LOCALS[local].ty;
@@ -674,6 +681,17 @@ pub fn note_local_write(local: i64) {
             let id = CLOSURE_STACK.data[i];
             if local < CLOSURES[id].mark {
                 CLOSURES[id].writes = true;
+                if LOCALS[local].sink {
+                    // (0.20: a sink parameter written: by reference)
+                    let mut k = CLOSURES[id].caps;
+                    while k < CAPS.count {
+                        if CAPS.data[k] == local
+                            && (NODES[CLOSURES[id].node].c & CLOSURE_MOVE) == 0 {
+                            CAPS.data[k + 1] = 1;
+                        }
+                        k += 2;
+                    }
+                }
                 if CLOSURES[id].write_local < 0 {
                     CLOSURES[id].write_local = local;
                 }

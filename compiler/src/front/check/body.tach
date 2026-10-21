@@ -8,7 +8,10 @@ use crate::base::diag::{
     ERR_HELP, RECOVER_DEPTH, err_begin, err_end, err_help, err_str, err_sym, recover_enter,
     recover_leave,
 };
-use crate::front::ast::{BLOCK_UNSAFE, DEFER_IMPLICIT, FN_LAZY, FN_UNSAFE, NODES, NodeKind, child};
+use crate::front::ast::{
+    BLOCK_UNSAFE, CONV_INOUT, CONV_NEW, DEFER_IMPLICIT, FN_LAZY, FN_UNSAFE, NODES, NODE_CHECKED,
+    NodeKind, child, new_node,
+};
 use crate::front::ast::NodeKind::{Block, Defer, Ident, If, Let, Loop, PatTuple, Path, Range, While};
 use crate::front::check::{
     CUR_FN, DEFER_LOOP_BASE, ENV, LOCALS, LOCAL_COUNT, LOOP_BASE, LOOP_STACK, RETURN_TYPE, SCOPES,
@@ -38,8 +41,8 @@ use crate::front::parser::UNDERSCORE;
 use crate::front::patterns::{check_irrefutable, check_pattern};
 use crate::front::traits::bounded_param_of_type;
 use crate::front::types::{
-    FNS, TY_BOOL, TY_ERROR, TY_I64, TY_NEVER, TY_UNIT, buf_type, err_type, fn_param, is_integer,
-    is_numeric,
+    FNS, REF_MUT, TYPES, TY_BOOL, TY_ERROR, TY_I64, TY_NEVER, TY_UNIT, TyKind, buf_type, err_type,
+    fn_param, is_integer, is_numeric,
 };
 
 // ---- Functions ----
@@ -85,6 +88,12 @@ pub fn check_function(item: i64) {
                 LOCALS[NODES[param].x].borrow = is_borrow_param(param);
                 LOCALS[NODES[param].x].tparam = bounded_param_of_type(NODES[param].b);
                 LOCALS[NODES[param].x].twritten = written_param(NODES[param].b, -1);
+                // (0.20) a let or inout parameter that is a reference: used as
+                // the value it designates (front/conv, names: synth_name)
+                LOCALS[NODES[param].x].access =
+                    crate::front::conv::param_is_access(param, fn_param(f, i));
+                LOCALS[NODES[param].x].sink =
+                    crate::front::conv::param_conv(param) == crate::front::conv::CONV_SINK_K;
             } else {
                 NODES[param].x = -1;
             }
@@ -228,10 +237,33 @@ fn check_let(stmt: i64) -> bool {
             binding_ty = synth_expr(init);
             actual = binding_ty;
         }
+        let borrowed = NODES[stmt].b == 0 && let_part(stmt, init, binding_ty);
+        if borrowed {
+            binding_ty = synth_expr(init);
+            actual = binding_ty;
+        }
         check_pattern(NODES[stmt].a, binding_ty);
+        if borrowed && NODES[NODES[stmt].a].x >= 0 {
+            LOCALS[NODES[NODES[stmt].a].x].access = true;
+        }
         check_irrefutable(NODES[stmt].a, c"let");
-        // (0.17) `let p = &v;`: v, for an error indexing through p
         let pat = NODES[stmt].a;
+        // (0.20) `inout x = &place;`: x is an exclusive access, used as the
+        // value it designates (front/conv)
+        if (NODES[stmt].p & CONV_INOUT) != 0 && NODES[pat].kind == NodeKind::PatBind
+            && NODES[pat].x >= 0 {
+            if binding_ty > 0 && TYPES[binding_ty].kind == TyKind::Ptr
+                && TYPES[binding_ty].b == REF_MUT {
+                LOCALS[NODES[pat].x].access = true;
+            } else if binding_ty > 0 && binding_ty != TY_ERROR
+                && !(TYPES[binding_ty].kind == TyKind::Slice && TYPES[binding_ty].b == REF_MUT) {
+                crate::front::conv::conv_error(crate::front::conv::CODE_PLACE, NODES[init].start,
+                    NODES[init].end,
+                    "an inout binding is an exclusive access of a place: 'inout x = &place;'",
+                    "lend the place with '&', or bind a copy with 'var x = ..'", "");
+            }
+        }
+        // (0.17) `let p = &v;`: v, for an error indexing through p
         if NODES[pat].kind == NodeKind::PatBind && NODES[pat].b == 0
             && NODES[init].kind == NodeKind::Unary && NODES[init].op == Tok::Amp {
             LOCALS[NODES[pat].x].init = NODES[init].b;
@@ -244,6 +276,55 @@ fn check_let(stmt: i64) -> bool {
             } else if pointee_is_param(init) { 1 } else { 0 };
         }
         actual == TY_NEVER
+    }
+}
+
+// (0.20, conventions.md D13) `let x = part;` in a 0.20 file, where part is
+// a place of an owned (or move-only) value that the function cannot take:
+// an element (`rows[0]`), a field reached through an access or a pointer,
+// a let parameter. 0.19 rejected it (own.move_out); here x borrows it: init
+// becomes `&part`, and x an access (the caller sets Local.access). Whatever
+// the function owns (a local, a sink parameter, their fields) still moves.
+fn let_part(stmt: i64, init: i64, ty: i64) -> bool {
+    unsafe {
+        let pat = NODES[stmt].a;
+        if NODES[pat].kind != NodeKind::PatBind || NODES[pat].b != 0 || ty <= 0
+            || ty == TY_ERROR || (NODES[stmt].p & CONV_NEW) != 0
+            || !crate::front::conv::strict_at(NODES[stmt].start)
+            || crate::front::conv::copyable(ty) || !borrowed_place(init) {
+            return false;
+        }
+        let inner = new_node(NodeKind::None, NODES[init].start, NODES[init].end);
+        NODES[inner] = NODES[init];
+        NODES[inner].p |= NODE_CHECKED;
+        NODES[inner].ty = ty;
+        NODES[init].kind = NodeKind::Unary;
+        NODES[init].op = Tok::Amp;
+        NODES[init].a = 0;
+        NODES[init].b = inner;
+        NODES[init].count = 0;
+        NODES[init].list = 0;
+        NODES[init].p = 0;
+        true
+    }
+}
+
+// Whether checked expression e is a place the function does not own: an
+// index, a dereference (an access's use), a field of one, or of a field
+// reached through a pointer.
+fn borrowed_place(e: i64) -> bool {
+    unsafe {
+        let k = NODES[e].kind;
+        if k == NodeKind::Index || k == NodeKind::Unary && NODES[e].op == Tok::Star {
+            return true;
+        }
+        if k == NodeKind::FieldAccess {
+            return NODES[e].y == 1 || borrowed_place(NODES[e].a);
+        }
+        if k == NodeKind::TupleField {
+            return borrowed_place(NODES[e].a);
+        }
+        false
     }
 }
 
