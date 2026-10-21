@@ -1348,3 +1348,126 @@ Each was decided here; the section that argues it is in brackets.
 - Whether `inout` arguments to a C function should take a shared loan
   when the C type is `const T*`. The importer knows `const`, and this
   design takes an exclusive loan always.
+
+## Phase 0 contract (2026-10-21, branch c20-conv0)
+
+Phase 0 is the interface commit. T1 to T4 build against it in parallel.
+A task changes only the files it owns. A change to a fixed signature, to
+the AST flags below, or to the modes' rules goes through the lead.
+
+### What Phase 0 contains
+
+**The modes** (front/conv.tach). A file is read in one of three ways:
+
+- **mixed**, the default until Phase M: both spellings, each with its
+  meaning.
+- **0.20**, set by `--syntax=0.20`, which every command takes (main's
+  arguments, like `--values=`; the code cache keys on it). Rust's
+  spellings are `conv.rust`, and `&x` is always exclusive. M makes this
+  the default.
+- **0.19 (legacy)**: the crate whose root starts with `LEGACY_MARKER`,
+  `// tachyon-syntax: 0.19`. 0.20's forms are `syntax.legacy`, and
+  `var`, `inout` and `sink` are plain identifiers.
+  compiler/src/main.tach carries the line now. tests/run.sh fails when
+  any other .tach under compiler/, tests/, examples/ or bench/ carries
+  it, except tests/run/conv_legacy* (the mode's own tests).
+
+std and the generated sources (`<check>`, `<profile>`, `<trace>`) are
+always read mixed, until M migrates them. The helpers are
+`conv_setup()` (called by `parse_program`), `legacy_at(pos)`,
+`strict_at(pos)`, `syntax_option(arg)`, `word_at(i, word)` and
+`starts_type(k)`.
+
+**The parser** (front/parser/{items/params, types, stmts, exprs, mod,
+foreign, items/mod}.tach) reads these forms:
+
+| form | the AST it makes (until T1: what 0.19 would have made) |
+|---|---|
+| `x: inout T` | Param flagged CONV_NEW, CONV_INOUT; type TyPtr with NODE_REF, NODE_REF_MUT and CONV_NEW (`inout [T]`: TySlice with NODE_REF_MUT and CONV_NEW) |
+| `x: let T` | Param flagged CONV_NEW; type TyPtr with NODE_REF and CONV_NEW (`let [T]`: the TySlice, CONV_NEW) |
+| `x: sink T` | Param flagged CONV_NEW, CONV_SINK; type T as written; `c = 1` (mutable) |
+| `self`, `inout self`, `sink self` | Param `self` typed `let Self` / `inout Self` (TyPtr over TyName `Self`) / `Self` with `c = 1`; flags as above |
+| `x: T` in a 0.20 file | Param flagged CONV_NEW: let (still by value until T1's `let_of`) |
+| `let T`, `inout T` in any type position (fields, results, type arguments, fn types, annotations) | the TyPtr / TySlice above (`parse_access_type`) |
+| `fn(sink T)` | the parameter type T (the convention is dropped until T1) |
+| `&e` | Unary `&` flagged CONV_NEW in mixed and 0.20 files, plus NODE_REF_MUT in 0.20 files; `check_expr` adds NODE_REF_MUT to a CONV_NEW `&` wherever `&mut T` or `&mut [T]` is expected (the inout marker, `inout_marker(n)`) |
+| `var PAT = e;` | Let flagged CONV_NEW; every binding of PAT mutable (PatBind `b = 1`) |
+| `inout x [: T] = e;` | Let flagged CONV_NEW, CONV_INOUT; an `&e` initializer gets NODE_REF_MUT; an annotation T becomes `inout T` |
+| `var x` in a pattern | PatBind `b = 1` |
+| `static var X` | Static `d = 1`, flagged CONV_NEW |
+| `sink \|..\|` | Closure `c = CLOSURE_MOVE`, flagged CONV_NEW, CONV_SINK |
+
+Rust's spellings in a 0.20 file each give one `conv.rust` error, soft,
+with an `edit patch` try: line and a `fix --suggested` fix:
+
+- `&T` / `&mut T` / `&[T]` / `&mut [T]`, written `T` in a parameter and
+  `let T` elsewhere;
+- `&mut e`;
+- `let mut`, and `mut x` in a pattern;
+- `mut x: T`;
+- `static mut`;
+- `move`.
+
+The other errors: `x: set T` is `conv.set`, and `sink T` outside a
+parameter is `conv.sink_type`. The receiver help (`&self` and
+`fmt(&self, ..)`) now names `self`, `inout self` and `sink self`.
+
+**The fixed interface** (front/conv.tach, front/ast.tach):
+
+| name | contract |
+|---|---|
+| `CONV_NEW`, `CONV_INOUT`, `CONV_SINK` (ast.tach: bits 54, 55, 49 of `p`) | as in the table above; a node without CONV_NEW was written in 0.19's spelling |
+| `param_conv(p)`, `fn_param_conv(f, i)`, `param_node(f, i)` | CONV_LEGACY (0.19's spelling: the type says how it is taken), CONV_LET, CONV_IN_OUT, CONV_SINK_K |
+| `conv_word(c)` | "", "let", "inout", "sink" (for messages and printers) |
+| `inout_marker(n)` | a CONV_NEW `&` that is not yet exclusive |
+| `conv_error(code, start, end, message, help, new)`, `rust_spelling(start, end, what, new)`, `legacy_error(start, end, what)`, `try_patch(pos, old, new)` | the diagnostics' helpers: soft, coded, with try: and fix |
+| `CODE_RUST`, `CODE_SET`, `CODE_SINK_TYPE`, `CODE_LEGACY` (reported); `CODE_MARKER`, `CODE_MARKER_EXTRA`, `CODE_PLACE`, `CODE_EXTERN` (T1's); `CODE_LEGACY_REMOVED` (0.21) | the codes; each has its `explain` entry in tools/explain/conv_table.tach, and tests/refactor's self_explain covers the `conv.` and `syntax.` prefixes |
+| `PARAM_TYPE` (parser/items/params.tach) | true while a parameter's type is parsed |
+| `mark_param_conv(n)` | a Param flagged from its type node |
+
+**fmt** keeps a space after `inout` and `sink` before `[` or `(` in a
+type position, and after a statement's `var` before `(`. It reads `sink
+|x|` as a closure.
+
+**Tests:**
+
+- tests/run: `conv_params` (mixed: every form), `conv_strict`
+  (`--syntax=0.20`), `conv_words` (the words as identifiers),
+  `conv_legacy_ok` and `conv_legacy_errors` (the 0.19 mode),
+  `err_conv_rust` (each Rust spelling, ERROR-COUNT 10), `err_conv_words`
+  (`set`, `sink T`);
+- changed for the marker: `err_own_refs` loses the `&x` to `&mut T`
+  error, own-try `ref_mut_arg` now checks clean, and guide errors.md's
+  two blocks are updated.
+
+### The tasks
+
+| task | owns | fills | must not change |
+|---|---|---|---|
+| **T1 checking** | front/check/** (calls, check_mode's coercions, assign, body, names, iterate), front/patterns, front/closures, front/traits.tach, front/own/{kinds `param_mode`, moves, views, calls}, the own diagnostics' words | `let_of`: a let parameter of a plain or copyable type is a copy, otherwise `&T`, per instance; transparency of access bindings (implicit `*`, writes through, `&r` reborrows; `*r` on an access is `conv.rust`); `conv.marker`, `conv.marker_extra`, `conv.place`, `conv.extern`; let parameters read-only (`own.readonly` in the new words); `let x = part` borrows; sink bindings; `fn(sink T)` / `fn(inout T)` in function types (conventions in `TyKind::Fn`); trait and impl matching across modes (§9.3 rows 6–7, the Allocator rule); `match &e`; the receiver of `sink self` moves; the own pass's messages in the new vocabulary (§10.1) and tests/own-try | the parser, front/conv.tach's signatures, the AST flags |
+| **T2 tools** | tools/** (new tools/fixconv.tach; fixvalues, fix/, refactor_shape, edit, fmt/, query/, rewrite) | one mode-aware printer of conventions; `fix --only conventions` (§9.2 rules 1–8); `refactor signature --convention`; `refactor field --type 'inout T'`; extract-function and `fix --values` emitting 0.20's spelling in mixed and 0.20 crates and 0.19's in the legacy one; fmt writing `self` / `inout self` and dropping a written `let`; query def/show/context/own in the new words | front/**, explain's codes |
+| **T3 returned parts** | front/types.tach (accesses as type arguments: no `decay_ref` for a CONV_NEW access), front/own/summary.tach and the result side of views.tach, front/check/iterate.tach's `for inout`, compiler/std's collection APIs, after M | `-> let T` and `-> inout T` (they parse now; the body's `&place` and the summaries are T3's), `Option<let T>` / `Option<inout T>`, `for inout x in &v` (parser: T3 adds it in stmts.tach's `for`, after asking the lead), `get_mut`, `get_or_insert`, `last_mut`, `as_mut_slice -> inout [T]`; `fix` rule 9 | the parser's other forms, `param_conv` |
+| **T4 guide and docs** | compiler/guide/*.md (and `compiler/guide/embed.sh`), docs/grammar.md (the 0.20 section, then the EBNF of §13 at M), tests/agent-eval/prompts/*.md, the text of conv_table.tach's entries | the guide in 0.20's spelling, landing with M.4 (until then each example compiles mixed); rust.md's table (§10.2); guide-mini and guide-core | the code |
+
+**Merge order:** Phase 0 → T1 and T2 (T2 merges after T1) → M.1–M.4,
+where the default becomes `--syntax=0.20` and T4 lands → T3 → the R
+gate with the rehearsal (§9.3 step 7).
+
+### Found while building Phase 0
+
+- **The marker changes one accepted error into acceptance.** In mixed
+  files, `&x` where `&mut T` is wanted was "expected '&mut P', got
+  '&P'" (`try: &mut x`); now it is the exclusive loan. This is D7. No
+  accepted program changes meaning. compiler/src is legacy, so it is
+  not affected.
+- **`var`, `inout` and `sink` are contextual until 0.21.** The corpus
+  has 49 `var` identifiers in tests and 56 in compiler/src. `var` starts
+  a binding only before `IDENT =` / `IDENT :`, or before `( .. )`
+  followed by `=` or `:`, so `var(a, b);` stays a call. `sink` starts a
+  closure only before `|` or `||`. D27's keywords wait for M's renames.
+- **Until T1 an access is a reference.** So `x: inout i64` needs `*x =
+  v`, and `inout r = &v; f(&r)` is `&&mut`, both until transparency. The
+  Phase 0 tests write only what holds either way.
+- **The legacy crate is the whole root crate.** A test of the mode is a
+  root of its own (tests/run/conv_legacy*): the pragma is read from
+  file 0 only.
