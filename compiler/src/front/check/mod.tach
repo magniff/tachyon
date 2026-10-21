@@ -96,6 +96,7 @@ use crate::front::closures::{CLOSURE_FNS, CLOSURE_STACK};
 use crate::front::contracts::check_contracts;
 use crate::front::convert::main_result_wrapper;
 use crate::front::derive::{check_derives, expand_derives};
+use crate::front::distinct::is_view_distinct;
 use crate::front::effects::EFFECTS_WANTED;
 use crate::front::effects::check::{check_effects, effects_declared};
 use crate::front::effects::infer::{infer_effects, note_body_failed};
@@ -194,6 +195,26 @@ fn mismatch_help(n: i64, expected: i64, actual: i64) {
         let close: [u8] = if simple { "" } else { ")" };
         let ek = TYPES[expected].kind;
         let ak = TYPES[actual].kind;
+        // (0.20) text: a String from a `str` or bytes, a `str` from a String
+        let bytes = ak == TyKind::Slice && TYPES[actual].a == TY_U8;
+        if ek == TyKind::Struct && is_std_named(expected, c"String")
+            && (bytes || is_view_distinct(actual)) {
+            err_help(c"a String owns its text, on an allocator: `String::from_in(s, gpa)`; a `str` is a view of one (`&str` parameters take both)");
+            err_try_fmt(f"String::from_in({text}, gpa)");
+            return;
+        }
+        if ak == TyKind::Struct && is_std_named(actual, c"String")
+            && (is_view_distinct(expected) || ek == TyKind::Slice && TYPES[expected].a == TY_U8) {
+            if crate::front::conv::LEGACY_ROOT {
+                err_help(c"a String goes where a `str` does as a reference, `&s` (Rust's deref), or `s.as_str()`");
+            } else {
+                err_help(c"a String goes where a `str` does as itself, `s` (Rust's `&s`), or `s.as_str()`");
+                err_try_fmt(f"({text}).as_str()");
+                return;
+            }
+            err_try_fmt(f"&{text}");
+            return;
+        }
         // The conversion, written in place of the value (0.18: the fix
         // `tachyonc fix --suggested` makes; `&x` of a simple value only).
         let t = buf_new();
@@ -533,6 +554,8 @@ pub fn check_program(program: i64) {
         // (0.18 with 0.17: a distinct type over a Drop type, known now)
         crate::front::check::distinct::check_distinct_kinds();
         exit_if_errors();
+        // (0.20: std's `str` becomes `[u8]`, a view the own pass checks)
+        crate::front::check::distinct::erase_view_distincts();
         // (0.17: value semantics, front/own; --values)
         check_own();
         exit_if_errors();

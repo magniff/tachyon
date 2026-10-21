@@ -41,7 +41,7 @@ on the command line make one program; `mod name;` loads `name.tach`.
 
 | Rust | tachyon |
 |---|---|
-| `String`, `&str` | `[u8]`, a byte slice: `"text"` is a `[u8]`; build text with `std::Buf`; `c"text"` is a NUL-terminated `*u8` for C |
+| `String`, `&str` | the same (0.20): `str` (UTF-8 text, a view; `&str` is `str`) and `String` (owned, `String::new_in(gpa)`); bytes are `[u8]`; `c"text"` is a NUL-terminated `*u8` for C |
 | `x: &T`, `x: &mut T`, `x: T` | conventions (0.20): `x: T` (let: read; called `f(v)`), `x: inout T` (called `f(&v)`), `x: sink T` (taken; an owned argument moves); no lifetimes; `*T` is the raw pointer: dereferencing it needs `unsafe`; no `Box` (`guide rust`: the whole mapping) |
 | `fn f(&self)`, `fn f(&mut self)`, `fn f(self)` | `fn f(self)`, `fn f(inout self)`, `fn f(sink self)` |
 | `let mut x`, `move \|\|` | `var x`, `sink \|\|`; `inout r = &x;` keeps an access, used as `x` itself (no `*r`) |
@@ -492,8 +492,8 @@ and linking: `guide c-interop`.
 
 | error (short form) | fix |
 |---|---|
-| `unknown type 'String'` (or `char`, `Box`) | `[u8]`, `u8`, `*T` or `Vec<T>` |
-| `expected type, got '&'`; `expected identifier, got '&'` | `[u8]` for `&str`; `self`, `inout self` or `sink self` for `&self`, `&mut self`, `self` |
+| `unknown type 'char'` (or `Box`) | `u8` (or a `u32` code point), `*T` or `Vec<T>` |
+| `expected type, got '&'`; `expected identifier, got '&'` | `str` for `&str`; `self`, `inout self` or `sink self` for `&self`, `&mut self`, `self` |
 | `conv.rust: '&mut T' is Rust's spelling` (`let mut`, `&mut x`, `move`) | the `try:` line's form: `inout T`, `var`, `&x`, `sink`; `tachyonc fix --suggested` |
 | `conv.marker: 'v' is lent inout here` | `f(&v)`: an inout argument is marked |
 | `conv.marker_extra: '&' marks an argument the callee may change` | `f(v)`: a let or sink argument is not |

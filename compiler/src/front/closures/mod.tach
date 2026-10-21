@@ -53,8 +53,8 @@ use crate::front::modules::CUR_MOD;
 use crate::front::parser::UNDERSCORE;
 use crate::front::types::{
     FIELDS, FIELD_CAP, FIELD_COUNT, FNS, FN_COUNT, FieldInfo, REF_MUT, STRUCTS, TLISTS, TSCRATCH,
-    TYPES, TY_ERROR, TY_NEVER, TY_UNIT, TyKind, buf_type, err_type, is_pointer, is_ref, make_type,
-    ptr_to, struct_type, type_elem, type_size,
+    TYPES, TY_BOOL, TY_ERROR, TY_NEVER, TY_UNIT, TyKind, buf_type, err_type, is_pointer, is_ref,
+    make_type, ptr_to, struct_type, type_elem, type_size,
 };
 
 // A closure: its Closure node, its function (FNS index), its env struct
@@ -434,6 +434,24 @@ fn finish_closure(id: i64, fn_body: i64, params: *i64, tys: *i64, result: i64) {
                 borrow = b;
             }
         }
+        // (0.20) A sink closure's owned capture has a flag, true while the
+        // closure holds it: its body may move it out once (then its drop
+        // skips it, and a second move is a run-time failure), front/own.
+        if is_move {
+            for j in 0..capture_count {
+                let local = CAPTURE_LIST.data[CLOSURES[id].captures + 2 * j];
+                if CAPTURE_LIST.data[CLOSURES[id].captures + 2 * j + 1] == 0
+                    && crate::front::own::glue::has_glue(LOCALS[local].ty) {
+                    FIELDS = grow(FIELDS, FIELD_COUNT, &FIELD_CAP);
+                    FIELDS[FIELD_COUNT] = FieldInfo {
+                        name: crate::front::own::glue::live_flag(LOCALS[local].name), ty: TY_BOOL,
+                        offset: 0,
+                    };
+                    FIELD_COUNT += 1;
+                    STRUCTS[s].field_count += 1;
+                }
+            }
+        }
         let ty = struct_type(s);
         CLOSURES[id].env_struct = s;
         CLOSURES[id].ty = ty;
@@ -480,6 +498,18 @@ fn finish_closure(id: i64, fn_body: i64, params: *i64, tys: *i64, result: i64) {
             NODES[init].ty = (*struct_field_of(s, j)).ty;
             list_push(init);
             note_local_use(ident, local);
+        }
+        for j in capture_count..STRUCTS[s].field_count {
+            // (the flags: true)
+            let flag = new_node(NodeKind::Bool, start, end);
+            NODES[flag].a = 1;
+            NODES[flag].ty = TY_BOOL;
+            let init = new_node(NodeKind::FieldInit, start, end);
+            NODES[init].a = (*struct_field_of(s, j)).name;
+            NODES[init].b = flag;
+            NODES[init].x = j;
+            NODES[init].ty = TY_BOOL;
+            list_push(init);
         }
         list_end(lit, inits);
         NODES[lit].ty = ty;

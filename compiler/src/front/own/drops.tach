@@ -392,6 +392,14 @@ pub fn after_stmt(block: i64, mark: i64, i: i64, stmt: i64) {
         let k = NODES[stmt].kind;
         if k == NodeKind::Let {
             let_drops(block, i, stmt);
+            // (0.20: its temporaries, to the end of the statement; to the
+            // end of the block when the binding may view them)
+            let init = NODES[stmt].c;
+            if init != 0 && is_view_type(NODES[init].ty) {
+                temps_before(init, i);
+            } else {
+                NODES[stmt].c = unit_value(init);
+            }
         } else if k == NodeKind::ExprStmt {
             let e = NODES[stmt].a;
             if e == 0 {
@@ -401,9 +409,14 @@ pub fn after_stmt(block: i64, mark: i64, i: i64, stmt: i64) {
                 let b = assign_drops(e);
                 if b != 0 {
                     NODES[stmt].a = b;
+                } else {
+                    NODES[stmt].a = unit_value(e);
                 }
             } else if NODES[stmt].b != 0 && has_glue(NODES[e].ty) && !is_place(e) {
                 NODES[stmt].a = temporary(e);
+            } else {
+                // (0.20: its temporaries, to the end of the statement)
+                NODES[stmt].a = unit_value(e);
             }
         }
     }
@@ -413,13 +426,18 @@ pub fn after_stmt(block: i64, mark: i64, i: i64, stmt: i64) {
 pub fn after_tail(block: i64, mark: i64) {
     unsafe {
         let tail = NODES[block].a;
-        if mark < 0 || tail == 0 || NODES[tail].kind != NodeKind::Assign {
+        if mark < 0 || tail == 0 {
             return;
         }
-        let b = assign_drops(tail);
-        if b != 0 {
-            NODES[block].a = b;
+        if NODES[tail].kind == NodeKind::Assign {
+            let b = assign_drops(tail);
+            if b != 0 {
+                NODES[block].a = b;
+                return;
+            }
         }
+        // (0.20: its temporaries, to the end of the block)
+        temps_before(tail, NODES[block].count);
     }
 }
 
@@ -430,12 +448,24 @@ pub fn block_end(block: i64, mark: i64) {
             return;
         }
         let m = list_begin();
-        let mut j = mark;
-        for i in 0..NODES[block].count {
-            list_push(child(block, i));
-            while j < INS.count && INS.data[j] == i {
-                list_push(INS.data[j + 1]);
+        let n = NODES[block].count;
+        for i in 0..n + 1 {
+            let mut j = mark;
+            while j < INS.count {
+                if INS.data[j] == BEFORE + i {
+                    list_push(INS.data[j + 1]);
+                }
                 j += 2;
+            }
+            if i < n {
+                list_push(child(block, i));
+                j = mark;
+                while j < INS.count {
+                    if INS.data[j] == i {
+                        list_push(INS.data[j + 1]);
+                    }
+                    j += 2;
+                }
             }
         }
         list_end(block, m);
@@ -1162,6 +1192,12 @@ fn flag_for(l: i64, path: i64) -> i64 {
 // flag; own.drop_view.
 pub fn finish_drops() {
     unsafe {
+        // (0.20: the moves of sink closures' captures)
+        let mut c = 0;
+        while c < CAP_MOVES.count {
+            wrap_capture_move(CAP_MOVES.data[c], CAP_MOVES.data[c + 1], CAP_MOVES.data[c + 2]);
+            c += 3;
+        }
         let mut i = 0;
         while i < DROP_VIEWS.count {
             let item = DROP_VIEWS.data[i];
@@ -1225,3 +1261,499 @@ pub fn finish_drops() {
         }
     }
 }
+
+// (0.20) The moves of sink closures' captures in their bodies: the use
+// node, its flag's name, the env struct (finish_drops wraps each once).
+static mut CAP_MOVES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut CAP_DONE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+pub fn capture_move(n: i64, flag: i64, s: i64) {
+    unsafe {
+        if CAP_DONE.get(n + 1) != 0 {
+            return;
+        }
+        CAP_DONE.put(n + 1, 1);
+        CAP_MOVES.push(n);
+        CAP_MOVES.push(flag);
+        CAP_MOVES.push(s);
+    }
+}
+
+// Capture use n (`(*env).x`, typed) becomes `{ if !(*env).__live_x {
+// <failure> } (*env).__live_x = false; (*env).x }`: the first move takes
+// the value, the closure's drop then skips it, a second move (the closure
+// called again) stops the program.
+fn wrap_capture_move(n: i64, flag: i64, s: i64) {
+    unsafe {
+        let mut fi = -1;
+        for i in 0..STRUCTS[s].field_count {
+            if (*struct_field(s, i)).name == flag {
+                fi = i;
+            }
+        }
+        if fi < 0 {
+            return;
+        }
+        let env = NODES[n].a;
+        let copy = new_node(NodeKind::None, 0, 0);
+        NODES[copy] = NODES[n];
+        let f1 = t_node(NodeKind::FieldAccess, n, TY_BOOL);
+        NODES[f1].a = env;
+        NODES[f1].b = flag;
+        NODES[f1].x = fi;
+        NODES[f1].y = 1;
+        let not = t_node(NodeKind::Unary, n, TY_BOOL);
+        NODES[not].op = Tok::Bang;
+        NODES[not].b = f1;
+        let zero = t_node(NodeKind::Int, n, crate::front::types::TY_I64);
+        NODES[zero].b = crate::front::lexer::SUF_I64;
+        let fail = t_node(NodeKind::EnumPanic, n, crate::front::types::TY_NEVER);
+        NODES[fail].a = zero;
+        NODES[fail].x = crate::gen0::target::message_kind(
+            crate::front::contracts::checks::fixed_message(
+                "a sink closure moved its captured value out a second time: it was called again\n"));
+        let fs = t_node(NodeKind::ExprStmt, n, TY_UNIT);
+        NODES[fs].a = fail;
+        let then = t_node(NodeKind::Block, n, TY_UNIT);
+        let m1 = list_begin();
+        list_push(fs);
+        list_end(then, m1);
+        let test = t_node(NodeKind::If, n, TY_UNIT);
+        NODES[test].a = not;
+        NODES[test].b = then;
+        let ts = t_node(NodeKind::ExprStmt, n, TY_UNIT);
+        NODES[ts].a = test;
+        let f2 = t_node(NodeKind::FieldAccess, n, TY_BOOL);
+        NODES[f2] = NODES[f1];
+        let asg = t_node(NodeKind::Assign, n, TY_UNIT);
+        NODES[asg].op = Tok::Eq;
+        NODES[asg].b = f2;
+        NODES[asg].c = t_bool(false, n);
+        let st = t_node(NodeKind::ExprStmt, n, TY_UNIT);
+        NODES[st].a = asg;
+        let ty = NODES[n].ty;
+        let (start, end) = (NODES[n].start, NODES[n].end);
+        NODES[n] = NODES[t_node(NodeKind::Block, n, ty)];
+        NODES[n].start = start;
+        NODES[n].end = end;
+        let m2 = list_begin();
+        list_push(ts);
+        list_push(st);
+        list_end(n, m2);
+        NODES[n].a = copy;
+        NODES[n].p |= BLOCK_DROPS_DONE;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Statement temporaries (0.20)
+//
+// An owned value made by an expression and used without being moved (a
+// receiver, `f()?.read()`, `make().len()`; a field read out of it,
+// `make().id`; an argument a `let` parameter borrows) lives until its
+// statement ends and is dropped then, after every use: Rust's rule. Its
+// statement gets, in front of it, `var __own_tp: *T = 0 as *T; var
+// __own_tf = false; defer { if __own_tf { unsafe { let __own_drop =
+// *__own_tp; } } }` (the drop is __own_drop's), and the value becomes
+// `{ var __own_tv = value; __own_tp = &__own_tv; __own_tf = true; __own_tp }`
+// where it is made, in the evaluation order: a `?` or a branch that leaves
+// the statement before it is made drops nothing. The value moves into
+// __own_tv, so a `?`'s or a block's value is no longer dropped at the end
+// of its arm (which made `f()?.m()` use a closed File). An expression
+// statement's temporaries drop at its end (it becomes a block); a `let`'s,
+// a tail's, at the end of their block (the `let` may keep a view of them),
+// a `while` condition's at the end of each test. The nodes are made typed:
+// they are not checked again.
+
+static mut SYM_TP: i64 = 0;
+static mut SYM_TF: i64 = 0;
+static mut SYM_TV: i64 = 0;
+static mut SYM_TDROP: i64 = 0;
+// The statements made for the unit being visited (its prelude).
+static mut PRELUDE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Whether pattern p binds local l.
+fn binds(p: i64, l: i64) -> bool {
+    unsafe {
+        let mark = list_begin();
+        push_bindings(p);
+        let mut found = false;
+        for i in mark..SCRATCH.count {
+            if NODES[SCRATCH.data[i]].x == l {
+                found = true;
+            }
+        }
+        SCRATCH.count = mark;
+        found
+    }
+}
+
+// Whether value expression e (a branch's, an arm's: pat its pattern, or
+// 0) is new: made by e, or a local that dies with it.
+fn fresh_value(e: i64, pat: i64) -> bool {
+    unsafe {
+        if e == 0 {
+            return false;
+        }
+        if NODES[e].ty == crate::front::types::TY_NEVER {
+            return true;
+        }
+        let k = NODES[e].kind;
+        if k == NodeKind::Block {
+            let t = NODES[e].a;
+            if t == 0 {
+                return false;
+            }
+            if fresh_value(t, pat) {
+                return true;
+            }
+            if NODES[t].kind == NodeKind::Ident && NODES[t].res == Res::Local && NODES[t].y >= 0 {
+                let l = NODES[t].y;
+                for i in 0..NODES[e].count {
+                    let s = child(e, i);
+                    if NODES[s].kind == NodeKind::Let && NODES[s].a != 0 && binds(NODES[s].a, l) {
+                        return BYREF.get(l + 1) == 0;
+                    }
+                }
+            }
+            return false;
+        }
+        if k == NodeKind::Ident {
+            return pat != 0 && NODES[e].res == Res::Local && NODES[e].y >= 0
+                && binds(pat, NODES[e].y) && BYREF.get(NODES[e].y + 1) == 0;
+        }
+        fresh(e)
+    }
+}
+
+// Whether expression e makes a new owned value (not a place's, not a copy
+// a collection keeps: borrowed_call).
+fn fresh(e: i64) -> bool {
+    unsafe {
+        let k = NODES[e].kind;
+        if k == NodeKind::Call {
+            return !borrowed_call(e) && !parametric_copy(e);
+        }
+        if k == NodeKind::MethodCall || k == NodeKind::StructLit || k == NodeKind::Tuple
+            || k == NodeKind::Array || k == NodeKind::VariantLit || k == NodeKind::Repeat
+            || k == NodeKind::Try || k == NodeKind::Interp {
+            return true;
+        }
+        if k == NodeKind::Block {
+            return fresh_value(e, 0);
+        }
+        if k == NodeKind::If {
+            return NODES[e].c != 0 && fresh_value(NODES[e].b, 0) && fresh_value(NODES[e].c, 0);
+        }
+        if k == NodeKind::Match {
+            if NODES[e].count == 0 {
+                return false;
+            }
+            for i in 0..NODES[e].count {
+                let arm = child(e, i);
+                if !fresh_value(NODES[arm].c, NODES[arm].a) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        false
+    }
+}
+
+// Whether call e may give a copy of a value its arguments keep: a generic
+// result made of its type parameters (summary::ret_parametric) from a
+// callee that neither consumes nor changes an argument (`second<T>(p: *T)
+// -> T { p[1] }` reads one through a raw pointer; `unwrap(sink self)`,
+// std's `pop(inout self)` give one up; outside std a function that
+// changes an argument may still return a copy through a raw pointer).
+fn parametric_copy(e: i64) -> bool {
+    unsafe {
+        let f = NODES[e].x - 1;
+        if f < 0 || crate::front::own::summary::ret_parametric(f) == 0 {
+            return false;
+        }
+        for i in 0..FNS[f].param_count {
+            let m = crate::front::own::kinds::param_mode(f, i);
+            let t = fn_param(f, i);
+            // (an owned argument consumed, or one changed in place)
+            if m == crate::front::own::kinds::P_VALUE && is_owned_type(t)
+                || within_std(FNS[f].module) && m == crate::front::own::kinds::P_MUT && t > 0
+                && TYPES[t].b == REF_MUT
+                && is_owned_type(TYPES[t].a) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// Whether e is a temporary to keep to the end of the statement: new,
+// owned, with a drop.
+fn is_temp(e: i64) -> bool {
+    unsafe { e != 0 && NODES[e].ty > 0 && has_glue(NODES[e].ty) && fresh(e) }
+}
+
+fn t_let(l: i64, init: i64, at: i64) -> i64 {
+    unsafe {
+        let pat = t_node(NodeKind::PatBind, at, LOCALS[l].ty);
+        NODES[pat].a = LOCALS[l].name;
+        NODES[pat].b = 1;
+        NODES[pat].x = l;
+        let st = t_node(NodeKind::Let, at, TY_UNIT);
+        NODES[st].a = pat;
+        NODES[st].c = init;
+        NODES[st].p |= NO_DROP;
+        st
+    }
+}
+
+fn t_block(mark: i64, tail: i64, at: i64, ty: i64) -> i64 {
+    let b = t_node(NodeKind::Block, at, ty);
+    list_end(b, mark);
+    unsafe {
+        NODES[b].a = tail;
+        NODES[b].p |= BLOCK_DROPS_DONE;
+    }
+    b
+}
+
+// Temporary e (checked): its prelude onto PRELUDE; the typed block (of
+// type *T) that makes it and gives its address.
+fn temp_ptr(e: i64) -> i64 {
+    unsafe {
+        let t = NODES[e].ty;
+        let pt = crate::front::types::ptr_to(t);
+        let tp = define_local(SYM_TP, pt, true, false);
+        let tf = define_local(SYM_TF, TY_BOOL, true, false);
+        // var __own_tp: *T = 0 as *T; var __own_tf = false;
+        let zero = t_node(NodeKind::Int, e, crate::front::types::TY_I64);
+        NODES[zero].b = crate::front::lexer::SUF_I64;
+        let null = t_node(NodeKind::Cast, e, pt);
+        NODES[null].a = zero;
+        PRELUDE.push(t_let(tp, null, e));
+        PRELUDE.push(t_let(tf, t_bool(false, e), e));
+        // defer { if __own_tf { unsafe { let __own_drop = *__own_tp; } } }
+        let dl = define_local(SYM_TDROP, t, false, false);
+        let deref = t_node(NodeKind::Unary, e, t);
+        NODES[deref].op = Tok::Star;
+        NODES[deref].b = t_ident(tp, e);
+        NODES[deref].p |= NODE_RAW;
+        let dlet = t_let(dl, deref, e);
+        NODES[dlet].p &= ~NO_DROP;
+        NODES[NODES[dlet].a].b = 0;
+        let inner = t_node(NodeKind::Block, e, TY_UNIT);
+        NODES[inner].p |= crate::front::ast::BLOCK_UNSAFE | BLOCK_DROPS_DONE;
+        let d = new_defer(NODES[dlet].a, DK_LOCAL, inner, true);
+        let m1 = list_begin();
+        list_push(dlet);
+        if d != 0 {
+            list_push(d);
+        }
+        list_end(inner, m1);
+        let cond = t_node(NodeKind::If, e, TY_UNIT);
+        NODES[cond].a = t_ident(tf, e);
+        NODES[cond].b = inner;
+        let cs = t_node(NodeKind::ExprStmt, e, TY_UNIT);
+        NODES[cs].a = cond;
+        let body = t_node(NodeKind::Block, e, TY_UNIT);
+        NODES[body].p |= BLOCK_DROPS_DONE;
+        let m2 = list_begin();
+        list_push(cs);
+        list_end(body, m2);
+        let df = t_node(NodeKind::Defer, e, TY_UNIT);
+        NODES[df].a = body;
+        PRELUDE.push(df);
+        // { var __own_tv = e; __own_tp = &__own_tv; __own_tf = true; __own_tp }
+        let tv = define_local(SYM_TV, t, true, false);
+        let m3 = list_begin();
+        list_push(t_let(tv, e, e));
+        let amp = t_node(NodeKind::Unary, e, pt);
+        NODES[amp].op = Tok::Amp;
+        NODES[amp].b = t_ident(tv, e);
+        let asg = t_node(NodeKind::Assign, e, TY_UNIT);
+        NODES[asg].op = Tok::Eq;
+        NODES[asg].b = t_ident(tp, e);
+        NODES[asg].c = amp;
+        let ast = t_node(NodeKind::ExprStmt, e, TY_UNIT);
+        NODES[ast].a = asg;
+        list_push(ast);
+        list_push(t_set(tf, true, e));
+        t_block(m3, t_ident(tp, e), e, pt)
+    }
+}
+
+// Visits expression e (checked) after its parts, in the positions
+// evaluated with its statement: the temporaries it uses without moving
+// them are kept (temp_ptr). Blocks were visited as they were checked;
+// closures' bodies are their own; a `while`'s condition is its own unit.
+fn visit_temps(e: i64) {
+    unsafe {
+        if e == 0 {
+            return;
+        }
+        let k = NODES[e].kind;
+        if k == NodeKind::Block || k == NodeKind::Closure || k == NodeKind::Loop
+            || k == NodeKind::Defer || k == NodeKind::Let {
+            return;
+        }
+        if k == NodeKind::While {
+            NODES[e].b = unit_value(NODES[e].b);
+            return;
+        }
+        if k == NodeKind::For {
+            visit_temps(NODES[e].c);
+            return;
+        }
+        if k == NodeKind::Unary {
+            visit_temps(NODES[e].b);
+            if NODES[e].op == Tok::Amp && is_temp(NODES[e].b) {
+                // (`&value`: a receiver, a let argument; the block gives
+                // the address, as `&` did)
+                let ty = NODES[e].ty;
+                let b = temp_ptr(NODES[e].b);
+                NODES[e] = NODES[b];
+                NODES[e].ty = ty;
+            }
+            return;
+        }
+        if k == NodeKind::FieldAccess {
+            visit_temps(NODES[e].a);
+            if NODES[e].y != 1 && is_temp(NODES[e].a) {
+                // (`make().id`: read through the address)
+                NODES[e].a = temp_ptr(NODES[e].a);
+                NODES[e].y = 1;
+                NODES[e].p |= NODE_RAW;
+            }
+            return;
+        }
+        if k == NodeKind::Binary || k == NodeKind::Assign || k == NodeKind::Index
+            || k == NodeKind::Range || k == NodeKind::If {
+            if k == NodeKind::If {
+                visit_temps(NODES[e].a);
+                visit_temps(NODES[e].b);
+                visit_temps(NODES[e].c);
+                return;
+            }
+            if k == NodeKind::Index || k == NodeKind::Range {
+                visit_temps(NODES[e].a);
+                visit_temps(NODES[e].b);
+                return;
+            }
+            visit_temps(NODES[e].b);
+            visit_temps(NODES[e].c);
+            return;
+        }
+        if k == NodeKind::Cast || k == NodeKind::TupleField || k == NodeKind::Return
+            || k == NodeKind::Repeat || k == NodeKind::EnumPanic {
+            visit_temps(NODES[e].a);
+            return;
+        }
+        if k == NodeKind::Break || k == NodeKind::FieldInit || k == NodeKind::NamedArg {
+            visit_temps(NODES[e].b);
+            return;
+        }
+        if k == NodeKind::Try {
+            visit_temps(NODES[e].y);
+            return;
+        }
+        if k == NodeKind::Interp {
+            // (the holes, then what the f-string became)
+            for i in 0..NODES[e].count {
+                let h = child(e, i);
+                if NODES[h].kind == NodeKind::InterpHole {
+                    visit_temps(NODES[h].a);
+                }
+            }
+            let y = NODES[e].y;
+            if y > 0 && NODES[y].kind == NodeKind::Block {
+                // (a call written in place, check/interp.tach direct_call:
+                // its holes are the values of its `let`s)
+                for i in 0..NODES[y].count {
+                    let s = child(y, i);
+                    if NODES[s].kind == NodeKind::Let {
+                        visit_temps(NODES[s].c);
+                    }
+                }
+            } else {
+                visit_temps(y);
+            }
+            return;
+        }
+        if k == NodeKind::Match {
+            visit_temps(NODES[e].a);
+            for i in 0..NODES[e].count {
+                let arm = child(e, i);
+                visit_temps(NODES[arm].b);
+                visit_temps(NODES[arm].c);
+            }
+            return;
+        }
+        if k == NodeKind::Call || k == NodeKind::MethodCall || k == NodeKind::VecOp {
+            if k == NodeKind::MethodCall || k == NodeKind::VecOp || NODES[e].x == 0 {
+                visit_temps(NODES[e].a);
+            }
+            for i in 0..NODES[e].count {
+                visit_temps(child(e, i));
+            }
+            return;
+        }
+        if k == NodeKind::Tuple || k == NodeKind::Array || k == NodeKind::StructLit
+            || k == NodeKind::VariantLit {
+            for i in 0..NODES[e].count {
+                visit_temps(child(e, i));
+            }
+        }
+    }
+}
+
+fn temps_syms() {
+    unsafe {
+        if SYM_TP == 0 {
+            SYM_TP = intern_c(c"__own_tp");
+            SYM_TF = intern_c(c"__own_tf");
+            SYM_TV = intern_c(c"__own_tv");
+            SYM_TDROP = intern_c(c"__own_drop");
+        }
+    }
+}
+
+// Expression e (checked), a unit of its own (a `while` condition): its
+// temporaries drop when it is evaluated, `{ prelude; e }`.
+fn unit_value(e: i64) -> i64 {
+    unsafe {
+        if e == 0 || !drops_on() {
+            return e;
+        }
+        temps_syms();
+        let mark = PRELUDE.count;
+        visit_temps(e);
+        if PRELUDE.count == mark {
+            return e;
+        }
+        let m = list_begin();
+        for j in mark..PRELUDE.count {
+            list_push(PRELUDE.data[j]);
+        }
+        PRELUDE.count = mark;
+        t_block(m, e, e, NODES[e].ty)
+    }
+}
+
+// The temporaries of expression e (checked), a statement's of block (before
+// its statement i: BEFORE + i): their preludes go in front of it.
+fn temps_before(e: i64, i: i64) {
+    unsafe {
+        temps_syms();
+        let mark = PRELUDE.count;
+        visit_temps(e);
+        for j in mark..PRELUDE.count {
+            INS.push(BEFORE + i);
+            INS.push(PRELUDE.data[j]);
+        }
+        PRELUDE.count = mark;
+    }
+}
+
+// An INS index meaning "before statement i".
+const BEFORE: i64 = 1 << 40;

@@ -149,11 +149,13 @@ read_line(&b).unwrap() { ... }` (without the `'\n'`). An owned value
 (`Vec`, `Buf`, `HashMap`, a struct holding one) moves into a `sink`
 parameter, a `let w = v;`, a struct field or a `return`: `v` is dead
 after it (`own.moved`); pass it to a let parameter to lend it, or pass
-`v.clone()`. A plain value (numbers, structs of them) is copied. A
-slice of `v` is a view: take it again after `v` grows. std's most used
-items: `tachyonc guide std`; all, a line each: `tachyonc guide
-std#the-api`; one name with its comment: `tachyonc guide --find
-split_in`.
+`v.clone()`. A plain value (numbers, structs of them) is copied. `&f(x)`
+makes a temporary that lives to the end of the block (0.18.1); any other
+owned temporary used without being moved (`f()?.read()`,
+`make().len()`) is dropped at the end of its statement (0.20). A slice
+of `v` is a view: take it again after `v` grows. std's most used items:
+`tachyonc guide std`; all, a line each: `tachyonc guide std#the-api`;
+one name with its comment: `tachyonc guide --find split_in`.
 
 ## The first errors and their fixes
 
@@ -167,7 +169,8 @@ split_in`.
 | `own.conflict: ... while 'first' views them` | use the view before the change, or take it again after (`guide views`) |
 | `non-exhaustive match: 'E::B' is not covered` | an arm for it, or `_ =>` |
 | `calling a C function is unsafe` | `unsafe { ... }`; `tachyonc fix --only unsafe` adds them |
-| `no 'cmp' in module 'std'`; `unknown type 'String'` | every std item is `std::name` (its most used names need no `use`); text is `[u8]`, built in a `Buf` |
+| `no 'cmp' in module 'std'` | every std item is `std::name` (its most used names need no `use`) |
+| `expected 'String', got '[u8]'` | `String::from_in("..", gpa)`: a String owns its text; a parameter `s: str` takes literals and a String's `&s` |
 | `allocation is explicit: pass an allocator` | `Vec::new_in(gpa)`, `gpa` from `fn main(gpa: Gpa)` passed down |
 
 Every error has a `help:`; `tachyonc guide errors` has more.
