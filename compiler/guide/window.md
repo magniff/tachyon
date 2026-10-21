@@ -8,15 +8,15 @@ and X11 come in 0.23.1 behind the same API.
 use std::window::{App, Event, WindowDesc};
 
 fn main(gpa: Gpa) -> i32 {
-    let mut app = App::new_in(gpa).unwrap();          // Err(NoDisplay) under ssh
+    var app = App::new_in(gpa).unwrap();              // Err(NoDisplay) under ssh
     let desc = WindowDesc::new("demo", 800, 600);     // logical points
-    let mut win = app.window(&desc).unwrap();
+    var win = app.window(desc).unwrap();
     win.request_frame();
     loop {
         match app.wait().unwrap() {                   // blocks; nothing busy-waits
-            Event::Frame(_) => draw(&win),            // once per request_frame
+            Event::Frame(_) => draw(win),             // once per request_frame
             Event::Key(k) => if k.pressed && !k.ime { on_key(k) },
-            Event::Text(t) => typed(t.as_slice()),    // UTF-8, inline bytes
+            Event::Text(t) => typed(t.bytes[0..t.len as i64]),  // UTF-8, inline
             Event::Resize(_, s) => resize(s.w, s.h, s.scale),   // physical pixels
             Event::Readable(fd) => read_more(fd),     // a watched fd (app.watch)
             Event::Close(_) | Event::Quit => break,
@@ -35,7 +35,7 @@ fn main(gpa: Gpa) -> i32 {
   `Cursor` (enter, leave), `Focus`, `Readable`, `Close`, `Quit`.
 - **Calls**: `app.wait()`, `poll()`, `wait_timeout(ms)`; `app.watch(fd)`;
   `app.clipboard_get_in(gpa)`, `clipboard_set(text)`;
-  `app.on_live_resize(f, ctx)` (macOS runs its own loop while a window
+  `app.on_live_resize(f, ctx)` (`ctx` a raw `*u8`; macOS runs its own loop while a window
   edge is dragged: `f` is called there and may `poll` and draw).
   `win.request_frame()`, `size()`, `raw_surface()` (the CAMetalLayer),
   `set_title`, `set_cursor`, `hide_cursor_while_typing`,
