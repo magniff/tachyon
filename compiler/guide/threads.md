@@ -3,7 +3,7 @@
 Threads, atomics, locks and channels (0.21; the design is
 docs/design/concurrency.md). Safe code cannot make a data race: what
 crosses threads is checked where a thread starts, from the types (Rust's
-`Send` and `Sync`, inferred) and the effects (no `static mut` on another
+`Send` and `Sync`, inferred) and the effects (no `static var` on another
 thread). The errors are `sync.*` (`tachyonc explain sync.global`).
 
 ## Atomics
@@ -16,7 +16,7 @@ pointers, with Rust's names as aliases (`AtomicI64`, `AtomicU32`,
 `fetch_max`, `fetch_min`, `into_inner`, and `fence(order)`. The orderings
 are C++'s (`Ordering::Relaxed`, `Acquire`, `Release`, `AcqRel`,
 `SeqCst`); one an operation cannot have (a load with `Release`) is made
-`SeqCst`. An atomic is move-only. A static one needs no `mut` (and so has
+`SeqCst`. An atomic is move-only. A static one needs no `var` (and so has
 no `global`): `static HITS: AtomicI64 = AtomicI64 { v: 0 };`.
 
 ```tach
@@ -40,30 +40,30 @@ atomic or a fence, and invents no store to memory another thread may see.
 
 ## Threads
 
-`std::thread::spawn(move || ...)` runs the closure on a new thread; its
+`std::thread::spawn(sink || ...)` runs the closure on a new thread; its
 handle's `join()` waits and gives the result (a panic in any thread stops
-the program, so there is no `Result` to unwrap). The closure is a `move`
+the program, so there is no `Result` to unwrap). The closure is a `sink`
 one: the thread may outlive the caller, so it takes owned values (a Vec
 moves in), no views (`sync.borrow_escapes`) and no raw pointers
 (`sync.not_send`). `thread::scope(|s| ...)` joins every thread started
-with `s.spawn` before it returns, so those may borrow the caller's values
-and views; while the scope runs its closure changes nothing it borrows
-(`sync.scope_write`), and a scoped thread only looks at what it borrows
+with `s.spawn` before it returns, so those may use the caller's values
+and views; while the scope runs its closure changes nothing they use
+(`sync.scope_write`), and a scoped thread only reads what it is given
 (`sync.scope_shared_write`: return results through `join`, or use a Mutex
-or an atomic). No thread may reach a `static mut` (`sync.global`; `query
+or an atomic). No thread may reach a `static var` (`sync.global`; `query
 effects FILE:LINE --why global` shows the chain); printing is fine.
 
 ```tach
 use std::thread;
 
 fn sum(s: [i64]) -> i64 {
-    let mut t = 0;
+    var t = 0;
     for x in s { t += x; }
     t
 }
 
 fn main(gpa: Gpa) {
-    let mut v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64> = Vec::new_in(gpa);
     for i in 0..1000 { v.push(i); }
     let s = v.as_slice();
     let total = thread::scope(|sc| {
@@ -71,7 +71,7 @@ fn main(gpa: Gpa) {
         let b = sc.spawn(|| sum(s[500..]));
         a.join() + b.join()
     });
-    let h = thread::spawn(move || v.len());
+    let h = thread::spawn(sink || v.len());
     println(f"{total} {h.join()}");
 }
 ```
@@ -87,12 +87,11 @@ never interleaves.
 
 `std::sync::Mutex<T>` owns its data: `m.with(|data| ...)` locks, runs the
 closure and unlocks (`try_with` when the lock is free now), the way to
-reach the data in 0.21.0. Scoped threads borrow the Mutex (and an atomic)
-and share it. `m.lock()` gives a guard that unlocks when dropped, but it is
+reach the data in 0.21.0. Scoped threads share the Mutex (and an atomic). `m.lock()` gives a guard that unlocks when dropped, but it is
 `unsafe` and internal until a type holding a view may implement Drop
 (0.21.x): nothing keeps the guard inside the mutex's life yet. `Once`'s
 `call_once(f)` runs f once whatever the threads; `Condvar`'s
-`wait_then(&m, ready, then)` sleeps until `ready(data)`, then runs `then`
+`wait_then(m, ready, then)` sleeps until `ready(data)`, then runs `then`
 under the lock (`notify_one`, `notify_all`). There is no poisoning.
 
 `std::sync::mpsc::channel_in(gpa)` gives a `Sender` (clone it for more
@@ -108,19 +107,19 @@ fn main(gpa: Gpa) {
     let count = Mutex::new(0);
     let total = thread::scope(|s| {
         let (tx, rx) = mpsc::channel_in::<i64>(gpa);
-        s.spawn(move || {
+        s.spawn(sink || {
             for i in 1..=10 { tx.send(i).unwrap(); }
             0
         });
         s.spawn(|| {
-            for _ in 0..10 { count.with(|n| *n += 1); }
+            for _ in 0..10 { count.with(|n| n += 1); }
             0
         });
-        let mut sum = 0;
+        var sum = 0;
         for x in rx.iter() { sum += x; }
         sum
     });
-    println(f"{total} {count.with(|n| *n)}");
+    println(f"{total} {count.with(|n| n)}");
 }
 ```
 ```out
@@ -131,7 +130,7 @@ The locks wait on a futex (Linux) or `__ulock` (macOS).
 
 ## Thread-locals
 
-`#[thread_local] static mut X: T = INIT;` gives each thread its own `X`,
+`#[thread_local] static var X: T = INIT;` gives each thread its own `X`,
 made from `INIT` when the thread first uses it. Using one is safe; its
 effect is `tls`, not `global`. A thread-local's drop does not run.
 
@@ -139,7 +138,7 @@ effect is `tls`, not `global`. A thread-local's drop does not run.
 use std::thread;
 
 #[thread_local]
-static mut CALLS: i64 = 0;
+static var CALLS: i64 = 0;
 
 fn work() -> i64 {
     for _ in 0..3 { CALLS += 1; }
@@ -147,7 +146,7 @@ fn work() -> i64 {
 }
 
 fn main() {
-    let h = thread::spawn(move || work());
+    let h = thread::spawn(sink || work());
     CALLS = 100;
     println(f"{h.join()} {CALLS}");
 }
