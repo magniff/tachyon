@@ -1,0 +1,91 @@
+// Collatz on the GPU: for every n below N, the number of steps of
+// n -> n/2 or 3n+1 to reach 1, computed by a compute shader (one
+// invocation per n) and checked against the CPU. The shader is MSL
+// written by hand with its reflection, as the WGSL compiler will hand
+// them to dev.shader.
+
+use std::gpu;
+use std::gpu::{BindingType, BufferUsage, Reflection, ShaderSource};
+
+const N: i64 = 1 << 20;
+
+// MSL, one line per string (no multi-line string literals yet).
+const MSL: [[u8]; 17] = [
+    "#include <metal_stdlib>",
+    "using namespace metal;",
+    "struct Params { uint n; };",
+    "kernel void collatz(constant Params& p [[buffer(0)]],",
+    "                    device uint* steps [[buffer(1)]],",
+    "                    uint i [[thread_position_in_grid]]) {",
+    "    if (i >= p.n) { return; }",
+    "    ulong x = i + 1;",
+    "    uint k = 0;",
+    "    while (x != 1) {",
+    "        x = (x & 1) ? 3 * x + 1 : x >> 1;",
+    "        k++;",
+    "    }",
+    "    steps[i] = k;",
+    "}",
+    "",
+    "",
+];
+
+fn steps(n: i64) -> u32 {
+    let mut x = n as u64;
+    let mut k: u32 = 0;
+    while x != 1 {
+        x = if x & 1 == 1 { 3 * x + 1 } else { x >> 1 };
+        k += 1;
+    }
+    k
+}
+
+fn main(gpa: Gpa) -> Result<(), gpu::Error> {
+    let inst = gpu::Instance::new_in(gpa);
+    let adapter = inst.adapter()?;
+    let (dev, mut queue) = adapter.device()?;
+
+    let mut text = Buf::new_in(gpa);
+    for l in MSL {
+        text.push_str(l);
+        text.push('\n');
+    }
+    // what the shader declares: an entry point of 256-wide workgroups,
+    // a uniform and a storage buffer, at Metal's [[buffer(0)]] and (1)
+    let mut refl = Reflection::new_in(gpa);
+    refl.compute("main", "collatz", 256);
+    refl.bind(0, 0, BindingType::Uniform, compute: 0);
+    refl.bind(0, 1, BindingType::Storage, compute: 1);
+    let shader = dev.shader(&ShaderSource::msl(text.as_slice(), refl))?;
+    let pipe = dev.compute_pipeline(&shader, "main")?;
+
+    let params: [u32; 4] = [N as u32, 0, 0, 0];
+    let uniform = dev.buffer_init(gpu::bytes_of_u32(params[..]), BufferUsage::UNIFORM);
+    let out = dev.buffer(N * 4, BufferUsage::STORAGE | BufferUsage::COPY_SRC);
+    let mut host = dev.buffer(N * 4, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    let group = dev.bind_group(pipe.bind_layout(0),
+        [gpu::bind(0, &uniform), gpu::bind(1, &out)][..]);
+
+    let mut enc = dev.encoder();
+    enc.compute_pass(|pass| {
+        pass.set_pipeline(&pipe);
+        pass.set_bind_group(0, &group);
+        pass.dispatch((N + 255) / 256);
+    });
+    enc.copy_buffer(&out, 0, &host, 0, N * 4);
+    queue.submit(enc.finish());
+
+    let got = gpu::u32s(host.map_read(&dev));
+    let mut wrong = 0;
+    let mut longest = 0;
+    let mut total: i64 = 0;
+    for i in 0..N {
+        if got[i] != steps(i + 1) { wrong += 1; }
+        if got[i] > got[longest] { longest = i; }
+        total += got[i] as i64;
+    }
+    println(f"{N} numbers, {wrong} wrong");
+    println(f"longest below {N}: {longest + 1}, {got[longest]} steps");
+    println(f"steps in all: {total}");
+    Ok(())
+}

@@ -1,0 +1,1072 @@
+// std::gpu::hal::metal (0.22, docs/design/gpu.md §2.8): hal::Api and
+// hal::Render for Metal, through std::objc and the generated bindings
+// (bindings.tach, from compiler/std/objc/tables/metal.objc: every method
+// checked against the runtime, every constant and struct against the
+// SDK's headers).
+//
+// - Metal is opened at run time (objc::framework): a program links only
+//   libobjc (`-l objc`).
+// - Buffers are MTLResourceStorageModeShared (Apple silicon: unified
+//   memory, mapping copies nothing); textures are Private and reached by
+//   blits.
+// - Commands are encoded straight into Metal's encoders. Command buffers
+//   retain what they use (Metal's default), so dropping a resource while
+//   the GPU uses it is safe; unretained command buffers with submission
+//   tracking are a later optimization (design §2.3).
+// - Nothing runs off the main thread (§2.11): the CPU waits with
+//   waitUntilCompleted, never a completion handler.
+// - Objects Metal returns autoreleased (command buffers, encoders,
+//   drawables, errors) are retained inside an autorelease pool scoped to
+//   the call.
+
+pub mod bindings;
+
+use bindings::{
+    CAMetalDrawable, CAMetalDrawableMethods, CAMetalLayer, CAMetalLayerMethods, CGSize,
+    MTLBlitCommandEncoder, MTLBlitCommandEncoderMethods, MTLBuffer, MTLBufferMethods, MTLClearColor,
+    MTLCommandBuffer, MTLCommandBufferMethods, MTLCommandEncoderMethods, MTLCommandQueue,
+    MTLCommandQueueMethods, MTLCompileOptions, MTLCompileOptionsMethods, MTLComputeCommandEncoder,
+    MTLComputeCommandEncoderMethods, MTLComputePipelineState, MTLDepthStencilDescriptor,
+    MTLDepthStencilDescriptorMethods, MTLDepthStencilState, MTLDevice, MTLDeviceMethods,
+    MTLFunction, MTLLibrary, MTLLibraryMethods, MTLOrigin, MTLRenderCommandEncoder,
+    MTLRenderCommandEncoderMethods, MTLRenderPassAttachmentDescriptorMethods,
+    MTLRenderPassColorAttachmentDescriptorArrayMethods,
+    MTLRenderPassColorAttachmentDescriptorMethods, MTLRenderPassDepthAttachmentDescriptorMethods,
+    MTLRenderPassDescriptor, MTLRenderPassDescriptorMethods,
+    MTLRenderPipelineColorAttachmentDescriptorArrayMethods,
+    MTLRenderPipelineColorAttachmentDescriptorMethods, MTLRenderPipelineDescriptor,
+    MTLRenderPipelineDescriptorMethods, MTLRenderPipelineState, MTLSamplerDescriptor,
+    MTLSamplerDescriptorMethods, MTLSamplerState, MTLScissorRect, MTLSize, MTLTexture,
+    MTLTextureDescriptor, MTLTextureDescriptorMethods, MTLTextureMethods,
+    MTLVertexAttributeDescriptorArrayMethods, MTLVertexAttributeDescriptorMethods,
+    MTLVertexBufferLayoutDescriptorArrayMethods, MTLVertexBufferLayoutDescriptorMethods,
+    MTLVertexDescriptor, MTLVertexDescriptorMethods, MTLViewport,
+};
+use std::gpu::hal::{Api, Caps, RawSurface, Render};
+use std::gpu::shader::{Binding, EntryPoint, ShaderKind, ShaderSource};
+use std::gpu::types::{
+    AddressMode, BlendFactor, BlendOp, Color, Compare, Cull, Filter, Format, FrontFace, IndexFormat,
+    Load, PipelineState, SamplerDesc, StepMode, TextureDesc, TextureUsage, Topology, VertexFormat,
+};
+use std::objc::{Id, Ref};
+use std::objc::foundation::{NSArray, NSArrayMethods, NSError, NSErrorMethods};
+
+extern "C" {
+    fn memcpy(dst: *u8, src: *u8, n: u64) -> *u8;
+    fn objc_retain(o: *u8) -> *u8;
+    fn objc_release(o: *u8);
+}
+
+// ---- GPU on Metal: devices, memory, resources (0.22) ----
+
+/// The Metal implementation of hal::Api and hal::Render.
+pub struct Metal {}
+
+pub struct Adapter {
+    pub dev: Id<MTLDevice>,
+}
+
+pub struct Device {
+    pub dev: Id<MTLDevice>,
+    pub queue: Id<MTLCommandQueue>,
+}
+
+pub struct Queue {
+    pub q: Id<MTLCommandQueue>,
+    pub last: Id<MTLCommandBuffer>,
+}
+
+pub struct Buffer {
+    pub raw: Id<MTLBuffer>,
+    pub ptr: *u8,
+    pub size: i64,
+}
+
+pub struct Texture {
+    pub raw: Id<MTLTexture>,
+}
+
+pub struct TextureView {
+    pub raw: Id<MTLTexture>,
+}
+
+pub struct Sampler {
+    pub raw: Id<MTLSamplerState>,
+}
+
+pub struct Shader {
+    pub lib: Id<MTLLibrary>,
+}
+
+pub struct ComputePipeline {
+    pub raw: Id<MTLComputePipelineState>,
+    pub workgroup: MTLSize,
+}
+
+pub struct RenderPipeline {
+    pub raw: Id<MTLRenderPipelineState>,
+    pub depth: Id<MTLDepthStencilState>,
+    pub primitive: u64,
+    pub cull: u64,
+    pub winding: u64,
+}
+
+/// One resource of a bind group, with its slot in each stage (-1: none).
+/// `obj` is retained by the group.
+pub struct Bound {
+    pub kind: i64,
+    pub vs: i64,
+    pub fs: i64,
+    pub cs: i64,
+    pub obj: *u8,
+    pub offset: u64,
+}
+
+const BIND_BUFFER: i64 = 0;
+const BIND_TEXTURE: i64 = 1;
+const BIND_SAMPLER: i64 = 2;
+pub const MAX_BOUND: i64 = 16;
+
+/// A bind group: its resources (retained: the group keeps them alive) and
+/// where they go, in a fixed array (no allocation).
+pub struct BindGroup {
+    pub items: [Bound; 16],
+    pub count: i64,
+}
+
+impl Drop for BindGroup {
+    fn drop(self: &mut BindGroup) {
+        for i in 0..self.count {
+            // each object was retained once when bound
+            unsafe { objc_release(self.items[i].obj); }
+        }
+        self.count = 0;
+    }
+}
+
+pub struct CommandBuffer {
+    pub cb: Id<MTLCommandBuffer>,
+    pub blit: Id<MTLBlitCommandEncoder>,
+}
+
+impl Drop for CommandBuffer {
+    fn drop(self: &mut CommandBuffer) {
+        end_blit(self);
+    }
+}
+
+pub struct ComputeEncoder {
+    pub enc: Id<MTLComputeCommandEncoder>,
+    pub workgroup: MTLSize,
+}
+
+impl Drop for ComputeEncoder {
+    fn drop(self: &mut ComputeEncoder) {
+        if !self.enc.is_nil() { self.enc.r().end_encoding(); }
+    }
+}
+
+pub struct RenderEncoder {
+    pub enc: Id<MTLRenderCommandEncoder>,
+    pub primitive: u64,
+    pub index: Id<MTLBuffer>,
+    pub index_type: u64,
+    pub index_size: i64,
+    pub index_offset: i64,
+}
+
+impl Drop for RenderEncoder {
+    fn drop(self: &mut RenderEncoder) {
+        if !self.enc.is_nil() { self.enc.r().end_encoding(); }
+    }
+}
+
+pub struct PassDesc {
+    pub raw: Id<MTLRenderPassDescriptor>,
+}
+
+pub struct Surface {
+    pub layer: Id<CAMetalLayer>,
+}
+
+pub struct Frame {
+    pub drawable: Id<CAMetalDrawable>,
+}
+
+// ---- GPU on Metal: conversions (0.22) ----
+
+#[pure]
+pub fn pixel_format(f: Format) -> u64 {
+    match f {
+        Format::R8Unorm => bindings::MTLPixelFormatR8Unorm,
+        Format::R8Uint => bindings::MTLPixelFormatR8Uint,
+        Format::Rg8Unorm => bindings::MTLPixelFormatRG8Unorm,
+        Format::R16Float => bindings::MTLPixelFormatR16Float,
+        Format::R32Uint => bindings::MTLPixelFormatR32Uint,
+        Format::R32Sint => bindings::MTLPixelFormatR32Sint,
+        Format::R32Float => bindings::MTLPixelFormatR32Float,
+        Format::Rg16Float => bindings::MTLPixelFormatRG16Float,
+        Format::Rgba8Unorm => bindings::MTLPixelFormatRGBA8Unorm,
+        Format::Rgba8UnormSrgb => bindings::MTLPixelFormatRGBA8Unorm_sRGB,
+        Format::Rgba8Uint => bindings::MTLPixelFormatRGBA8Uint,
+        Format::Bgra8Unorm => bindings::MTLPixelFormatBGRA8Unorm,
+        Format::Bgra8UnormSrgb => bindings::MTLPixelFormatBGRA8Unorm_sRGB,
+        Format::Rg32Float => bindings::MTLPixelFormatRG32Float,
+        Format::Rgba16Float => bindings::MTLPixelFormatRGBA16Float,
+        Format::Rgba32Uint => bindings::MTLPixelFormatRGBA32Uint,
+        Format::Rgba32Float => bindings::MTLPixelFormatRGBA32Float,
+        Format::Depth32Float => bindings::MTLPixelFormatDepth32Float,
+    }
+}
+
+#[pure]
+fn vertex_format(f: VertexFormat) -> u64 {
+    match f {
+        VertexFormat::Float32 => bindings::MTLVertexFormatFloat,
+        VertexFormat::Float32x2 => bindings::MTLVertexFormatFloat2,
+        VertexFormat::Float32x3 => bindings::MTLVertexFormatFloat3,
+        VertexFormat::Float32x4 => bindings::MTLVertexFormatFloat4,
+        VertexFormat::Uint32 => bindings::MTLVertexFormatUInt,
+        VertexFormat::Uint32x2 => bindings::MTLVertexFormatUInt2,
+        VertexFormat::Uint32x4 => bindings::MTLVertexFormatUInt4,
+        VertexFormat::Sint32 => bindings::MTLVertexFormatInt,
+        VertexFormat::Unorm8x4 => bindings::MTLVertexFormatUChar4Normalized,
+    }
+}
+
+#[pure]
+fn compare_function(c: Compare) -> u64 {
+    match c {
+        Compare::Never => bindings::MTLCompareFunctionNever,
+        Compare::Less => bindings::MTLCompareFunctionLess,
+        Compare::Equal => bindings::MTLCompareFunctionEqual,
+        Compare::LessEqual => bindings::MTLCompareFunctionLessEqual,
+        Compare::Greater => bindings::MTLCompareFunctionGreater,
+        Compare::NotEqual => bindings::MTLCompareFunctionNotEqual,
+        Compare::GreaterEqual => bindings::MTLCompareFunctionGreaterEqual,
+        Compare::Always => bindings::MTLCompareFunctionAlways,
+    }
+}
+
+#[pure]
+fn blend_factor(f: BlendFactor) -> u64 {
+    match f {
+        BlendFactor::Zero => bindings::MTLBlendFactorZero,
+        BlendFactor::One => bindings::MTLBlendFactorOne,
+        BlendFactor::Src => bindings::MTLBlendFactorSourceColor,
+        BlendFactor::OneMinusSrc => bindings::MTLBlendFactorOneMinusSourceColor,
+        BlendFactor::SrcAlpha => bindings::MTLBlendFactorSourceAlpha,
+        BlendFactor::OneMinusSrcAlpha => bindings::MTLBlendFactorOneMinusSourceAlpha,
+        BlendFactor::Dst => bindings::MTLBlendFactorDestinationColor,
+        BlendFactor::OneMinusDst => bindings::MTLBlendFactorOneMinusDestinationColor,
+        BlendFactor::DstAlpha => bindings::MTLBlendFactorDestinationAlpha,
+        BlendFactor::OneMinusDstAlpha => bindings::MTLBlendFactorOneMinusDestinationAlpha,
+    }
+}
+
+#[pure]
+fn blend_op(o: BlendOp) -> u64 {
+    match o {
+        BlendOp::Add => bindings::MTLBlendOperationAdd,
+        BlendOp::Subtract => bindings::MTLBlendOperationSubtract,
+        BlendOp::ReverseSubtract => bindings::MTLBlendOperationReverseSubtract,
+        BlendOp::Min => bindings::MTLBlendOperationMin,
+        BlendOp::Max => bindings::MTLBlendOperationMax,
+    }
+}
+
+#[pure]
+fn filter(f: Filter) -> u64 {
+    match f {
+        Filter::Nearest => bindings::MTLSamplerMinMagFilterNearest,
+        Filter::Linear => bindings::MTLSamplerMinMagFilterLinear,
+    }
+}
+
+#[pure]
+fn address_mode(a: AddressMode) -> u64 {
+    match a {
+        AddressMode::ClampToEdge => bindings::MTLSamplerAddressModeClampToEdge,
+        AddressMode::Repeat => bindings::MTLSamplerAddressModeRepeat,
+        AddressMode::MirrorRepeat => bindings::MTLSamplerAddressModeMirrorRepeat,
+    }
+}
+
+#[pure]
+fn load_action(l: Load) -> u64 {
+    match l {
+        Load::Clear => bindings::MTLLoadActionClear,
+        Load::Keep => bindings::MTLLoadActionLoad,
+        Load::DontCare => bindings::MTLLoadActionDontCare,
+    }
+}
+
+/// The Metal buffer index of vertex buffer `slot` (30 downward, design
+/// §2.8, so that they never meet the shader's own buffers).
+#[pure]
+pub fn vertex_buffer_index(slot: i64) -> u64 {
+    (30 - slot) as u64
+}
+
+fn size3(x: i64, y: i64, z: i64) -> MTLSize {
+    MTLSize { width: x as u64, height: y as u64, depth: z as u64 }
+}
+
+fn origin3(x: i64, y: i64, z: i64) -> MTLOrigin {
+    MTLOrigin { x: x as u64, y: y as u64, z: z as u64 }
+}
+
+/// Appends an NSError's description (or `what` when there is none).
+fn push_error<A: Allocator>(err: &mut Buf<A>, e: Option<Ref<NSError>>, what: [u8]) {
+    match e {
+        Some(r) => std::objc::push_ns_string(err, r.localized_description()),
+        None => err.push_str(what),
+    }
+}
+
+fn function<A: Allocator>(s: &Shader, e: &EntryPoint, err: &mut Buf<A>) -> Option<Id<MTLFunction>> {
+    let name = std::objc::ns_string(e.native);
+    let f = s.lib.r().new_function_with_name(name.r());
+    if f.is_none() {
+        err.push_str("no function '");
+        err.push_str(e.native);
+        err.push_str("' in the MSL (entry point '");
+        err.push_str(e.name);
+        err.push_str("')");
+    }
+    f
+}
+
+#[repr(C)]
+union CFn0 {
+    p: *u8,
+    f: extern "C" fn() -> *u8,
+}
+
+/// Calls a C function `*u8 f(void)` of an opened framework (Metal's device
+/// functions; nil when it is not there).
+fn call_c0(name: *u8) -> *u8 {
+    // name is a NUL-terminated literal; a symbol of that name is the
+    // function `id f(void)` Metal declares
+    unsafe {
+        let p = std::objc::symbol(name);
+        if p.is_null() { return 0 as *u8; }
+        let f = CFn0 { p: p }.f;
+        f()
+    }
+}
+
+static mut OPENED: bool = false;
+
+fn open_frameworks() -> bool {
+    if !OPENED {
+        std::objc::init();
+        OPENED = std::objc::framework("Metal");
+        std::objc::framework("QuartzCore");
+    }
+    OPENED
+}
+
+// ---- GPU on Metal: recording helpers (0.22) ----
+
+fn begin_on(q: Ref<MTLCommandQueue>) -> CommandBuffer {
+    let cb = std::objc::pool(|| match q.command_buffer() {
+        Some(c) => c.retain(),
+        None => Id::<MTLCommandBuffer>::nil(),
+    });
+    CommandBuffer { cb: cb, blit: Id::<MTLBlitCommandEncoder>::nil() }
+}
+
+fn end_blit(cb: &mut CommandBuffer) {
+    if !cb.blit.is_nil() {
+        cb.blit.r().end_encoding();
+        cb.blit = Id::<MTLBlitCommandEncoder>::nil();
+    }
+}
+
+fn blit(cb: &mut CommandBuffer) -> Ref<MTLBlitCommandEncoder> {
+    if cb.blit.is_nil() {
+        let raw = cb.cb.r();
+        cb.blit = std::objc::pool(|| match raw.blit_command_encoder() {
+            Some(e) => e.retain(),
+            None => Id::<MTLBlitCommandEncoder>::nil(),
+        });
+    }
+    cb.blit.r()
+}
+
+fn bound(kind: i64, b: &Binding, obj: *u8, offset: u64) -> Bound {
+    // the group keeps the object: one retain, released by its drop
+    unsafe { objc_retain(obj); }
+    Bound {
+        kind: kind, vs: b.slot_vertex, fs: b.slot_fragment, cs: b.slot_compute, obj: obj,
+        offset: offset
+    }
+}
+
+fn apply_compute(e: Ref<MTLComputeCommandEncoder>, b: &Bound) {
+    if b.cs < 0 { return; }
+    let slot = b.cs as u64;
+    // obj is the retained object of the kind `kind` names
+    unsafe {
+        if b.kind == BIND_BUFFER {
+            e.set_buffer_offset_at_index(Some(Ref::<MTLBuffer>::from_global(b.obj)), b.offset,
+                slot);
+        } else if b.kind == BIND_TEXTURE {
+            e.set_texture_at_index(Some(Ref::<MTLTexture>::from_global(b.obj)), slot);
+        } else {
+            e.set_sampler_state_at_index(Some(Ref::<MTLSamplerState>::from_global(b.obj)), slot);
+        }
+    }
+}
+
+fn apply_render(e: Ref<MTLRenderCommandEncoder>, b: &Bound) {
+    // obj is the retained object of the kind `kind` names
+    unsafe {
+        if b.kind == BIND_BUFFER {
+            let r = Some(Ref::<MTLBuffer>::from_global(b.obj));
+            if b.vs >= 0 { e.set_vertex_buffer_offset_at_index(r, b.offset, b.vs as u64); }
+            if b.fs >= 0 { e.set_fragment_buffer_offset_at_index(r, b.offset, b.fs as u64); }
+        } else if b.kind == BIND_TEXTURE {
+            let r = Some(Ref::<MTLTexture>::from_global(b.obj));
+            if b.vs >= 0 { e.set_vertex_texture_at_index(r, b.vs as u64); }
+            if b.fs >= 0 { e.set_fragment_texture_at_index(r, b.fs as u64); }
+        } else {
+            let r = Some(Ref::<MTLSamplerState>::from_global(b.obj));
+            if b.vs >= 0 { e.set_vertex_sampler_state_at_index(r, b.vs as u64); }
+            if b.fs >= 0 { e.set_fragment_sampler_state_at_index(r, b.fs as u64); }
+        }
+    }
+}
+
+// ---- GPU on Metal: hal::Api (0.22) ----
+
+impl Api for Metal {
+    type Adapter = Adapter;
+    type Device = Device;
+    type Queue = Queue;
+    type Buffer = Buffer;
+    type Texture = Texture;
+    type TextureView = TextureView;
+    type Sampler = Sampler;
+    type Shader = Shader;
+    type ComputePipeline = ComputePipeline;
+    type BindGroup = BindGroup;
+    type CommandBuffer = CommandBuffer;
+    type ComputeEncoder = ComputeEncoder;
+
+    fn adapters<A: Allocator>(out: &mut Vec<Adapter, A>) {
+        if !open_frameworks() { return; }
+        // MTLCopyAllDevices returns a +1 NSArray of id<MTLDevice>
+        let all = unsafe { Id::<NSArray>::from_owned_or_nil(call_c0(c"MTLCopyAllDevices")) };
+        let n = all.r().count();
+        for i in 0..n {
+            // the array's elements are MTLDevices, kept by the array
+            let d = unsafe { all.r().object_at_index(i).cast::<MTLDevice>() };
+            out.push(Adapter { dev: d.retain() });
+        }
+    }
+
+    fn default_adapter() -> Option<Adapter> {
+        if !open_frameworks() { return None; }
+        // MTLCreateSystemDefaultDevice returns a +1 id<MTLDevice> or nil
+        match unsafe { Id::<MTLDevice>::from_owned(call_c0(c"MTLCreateSystemDefaultDevice")) } {
+            Some(d) => Some(Adapter { dev: d }),
+            None => None,
+        }
+    }
+
+    fn adapter_name<A: Allocator>(a: &Adapter, out: &mut Buf<A>) {
+        let _pool = std::objc::Pool::push();
+        std::objc::push_ns_string(out, a.dev.r().name());
+    }
+
+    fn adapter_low_power(a: &Adapter) -> bool {
+        a.dev.r().is_low_power()
+    }
+
+    fn open(a: &Adapter) -> Option<(Device, Queue)> {
+        let q = match a.dev.r().new_command_queue() {
+            Some(q) => q,
+            None => return None,
+        };
+        let dev = Device { dev: a.dev.clone(), queue: q.clone() };
+        Some((dev, Queue { q: q, last: Id::<MTLCommandBuffer>::nil() }))
+    }
+
+    fn caps(d: &Device) -> Caps {
+        Caps {
+            compute: true,
+            render: true,
+            surfaces: true,
+            textures: true,
+            unified_memory: d.dev.r().has_unified_memory(),
+            shader_kind: ShaderKind::Msl,
+        }
+    }
+
+    fn device_wait_idle(d: &Device) {
+        // an empty command buffer completes after everything committed
+        // before it on the same queue
+        let q = d.queue.r();
+        std::objc::pool(|| match q.command_buffer() {
+            Some(cb) => {
+                cb.commit();
+                cb.wait_until_completed();
+            }
+            None => {}
+        });
+    }
+
+    fn create_buffer(d: &Device, size: i64, init: [u8]) -> Option<Buffer> {
+        let n = if size < 4 { 4 } else { size };
+        match d.dev
+            .r()
+            .new_buffer_with_length_options(n as u64, bindings::MTLResourceStorageModeShared) {
+            Some(b) => {
+                let p = b.r().contents();
+                if init.len() > 0 {
+                    // contents is the buffer's n bytes of shared memory;
+                    // init.len() <= size is the caller's contract
+                    unsafe { memcpy(p, init.ptr, init.len() as u64); }
+                }
+                Some(Buffer { raw: b, ptr: p, size: size })
+            }
+            None => None,
+        }
+    }
+
+    #[views(b)]
+    fn map_read(d: &Device, b: &mut Buffer) -> [u8] {
+        // shared memory: contents is valid for size bytes while b lives
+        unsafe { b.ptr[0..b.size] }
+    }
+
+    #[views(b)]
+    fn map_write(d: &Device, b: &mut Buffer) -> &mut [u8] {
+        // as map_read
+        unsafe { &mut b.ptr[0..b.size] }
+    }
+
+    fn unmap(d: &Device, b: &mut Buffer) {}
+
+    fn create_texture(d: &Device, desc: &TextureDesc) -> Option<Texture> {
+        let td = MTLTextureDescriptor::new();
+        let t = td.r();
+        t.set_texture_type(if desc.layers > 1 { bindings::MTLTextureType2DArray }
+            else { bindings::MTLTextureType2D });
+        t.set_pixel_format(pixel_format(desc.format));
+        t.set_width(desc.width as u64);
+        t.set_height(desc.height as u64);
+        t.set_array_length(desc.layers as u64);
+        t.set_mipmap_level_count(desc.mips as u64);
+        let mut usage: u64 = bindings::MTLTextureUsagePixelFormatView;
+        if desc.usage & TextureUsage::TEXTURE_BINDING
+            != 0 { usage = usage | bindings::MTLTextureUsageShaderRead; }
+        if desc.usage & TextureUsage::STORAGE_BINDING != 0 {
+            usage = usage | bindings::MTLTextureUsageShaderRead
+                | bindings::MTLTextureUsageShaderWrite;
+        }
+        if desc.usage & TextureUsage::RENDER_ATTACHMENT
+            != 0 { usage = usage | bindings::MTLTextureUsageRenderTarget; }
+        t.set_usage(usage);
+        t.set_storage_mode(bindings::MTLStorageModePrivate);
+        match d.dev.r().new_texture_with_descriptor(t) {
+            Some(x) => Some(Texture { raw: x }),
+            None => None,
+        }
+    }
+
+    fn create_view(t: &Texture, format: Format, same_format: bool) -> Option<TextureView> {
+        if same_format {
+            return Some(TextureView { raw: t.raw.clone() });
+        }
+        match t.raw.r().new_texture_view_with_pixel_format(pixel_format(format)) {
+            Some(v) => Some(TextureView { raw: v }),
+            None => None,
+        }
+    }
+
+    fn create_sampler(d: &Device, desc: &SamplerDesc) -> Option<Sampler> {
+        let sd = MTLSamplerDescriptor::new();
+        let s = sd.r();
+        s.set_min_filter(filter(desc.min));
+        s.set_mag_filter(filter(desc.mag));
+        s.set_mip_filter(if desc.mip == Filter::Linear { bindings::MTLSamplerMipFilterLinear }
+            else { bindings::MTLSamplerMipFilterNearest });
+        s.set_s_address_mode(address_mode(desc.address_u));
+        s.set_t_address_mode(address_mode(desc.address_v));
+        s.set_r_address_mode(address_mode(desc.address_w));
+        s.set_lod_min_clamp(desc.lod_min);
+        s.set_lod_max_clamp(desc.lod_max);
+        s.set_max_anisotropy(desc.anisotropy as u64);
+        match desc.compare {
+            Some(c) => s.set_compare_function(compare_function(c)),
+            None => {}
+        }
+        match d.dev.r().new_sampler_state_with_descriptor(s) {
+            Some(x) => Some(Sampler { raw: x }),
+            None => None,
+        }
+    }
+
+    fn create_shader<A: Allocator>(d: &Device, src: &ShaderSource, err: &mut Buf<A>) -> Option<Shader> {
+        if src.kind != ShaderKind::Msl {
+            err.push_str("Metal takes MSL (ShaderKind::Msl)");
+            return None;
+        }
+        let _pool = std::objc::Pool::push();
+        let opts = MTLCompileOptions::new();
+        opts.r().set_language_version(bindings::MTLLanguageVersion3_0);
+        let source = std::objc::ns_string(src.code);
+        let mut e: *u8 = 0 as *u8;
+        // the error out-parameter is a local; Metal stores an autoreleased
+        // NSError (or nothing) there, alive until _pool drops
+        let lib = unsafe {
+            d.dev
+                .r()
+                .new_library_with_source_options_error(source.r(), Some(opts.r()), &mut e as *u8)
+        };
+        match lib {
+            Some(l) => Some(Shader { lib: l }),
+            None => {
+                push_error(err, unsafe { Ref::<NSError>::from_global_opt(e) },
+                    "the MSL did not compile");
+                None
+            }
+        }
+    }
+
+    fn create_compute_pipeline<A: Allocator>(d: &Device, s: &Shader, entry: &EntryPoint,
+        err: &mut Buf<A>) -> Option<ComputePipeline> {
+        let f = match function(s, entry, err) {
+            Some(f) => f,
+            None => return None,
+        };
+        let wg = size3(entry.workgroup[0], entry.workgroup[1], entry.workgroup[2]);
+        let _pool = std::objc::Pool::push();
+        let mut e: *u8 = 0 as *u8;
+        // the error out-parameter is a local (see create_shader)
+        match unsafe {
+            d.dev.r().new_compute_pipeline_state_with_function_error(f.r(), &mut e as *u8)
+        } {
+            Some(p) => Some(ComputePipeline { raw: p, workgroup: wg }),
+            None => {
+                push_error(err, unsafe { Ref::<NSError>::from_global_opt(e) },
+                    "Metal rejected the compute pipeline");
+                None
+            }
+        }
+    }
+
+    fn bind_group_new(d: &Device) -> BindGroup {
+        let empty = Bound { kind: BIND_BUFFER, vs: -1, fs: -1, cs: -1, obj: 0 as *u8, offset: 0 };
+        BindGroup { items: [empty; 16], count: 0 }
+    }
+
+    fn bind_group_buffer(g: &mut BindGroup, b: &Binding, buf: &Buffer, offset: i64, size: i64) {
+        g.items[g.count] = bound(BIND_BUFFER, b, buf.raw.ptr, offset as u64);
+        g.count += 1;
+    }
+
+    fn bind_group_texture(g: &mut BindGroup, b: &Binding, v: &TextureView) {
+        g.items[g.count] = bound(BIND_TEXTURE, b, v.raw.ptr, 0);
+        g.count += 1;
+    }
+
+    fn bind_group_sampler(g: &mut BindGroup, b: &Binding, s: &Sampler) {
+        g.items[g.count] = bound(BIND_SAMPLER, b, s.raw.ptr, 0);
+        g.count += 1;
+    }
+
+    fn begin(d: &Device) -> CommandBuffer {
+        begin_on(d.queue.r())
+    }
+
+    fn copy_buffer(cb: &mut CommandBuffer, src: &Buffer, src_offset: i64, dst: &Buffer,
+        dst_offset: i64, size: i64) {
+        blit(cb).copy_from_buffer_source_offset_to_buffer_destination_offset_size(src.raw.r(),
+            src_offset as u64, dst.raw.r(), dst_offset as u64, size as u64);
+    }
+
+    fn copy_texture_to_buffer(cb: &mut CommandBuffer, src: &Texture, layer: i64, x: i64, y: i64,
+        w: i64, h: i64, dst: &Buffer, offset: i64, bytes_per_row: i64) {
+        blit(cb).copy_texture_to_buffer(src.raw.r(), layer as u64, 0, origin3(x, y, 0),
+            size3(w, h, 1), dst.raw.r(), offset as u64, bytes_per_row as u64,
+            (bytes_per_row * h) as u64);
+    }
+
+    fn copy_buffer_to_texture(cb: &mut CommandBuffer, src: &Buffer, offset: i64, bytes_per_row: i64,
+        dst: &Texture, layer: i64, x: i64, y: i64, w: i64, h: i64) {
+        blit(cb).copy_buffer_to_texture(src.raw.r(), offset as u64, bytes_per_row as u64,
+            (bytes_per_row * h) as u64, size3(w, h, 1), dst.raw.r(), layer as u64, 0,
+            origin3(x, y, 0));
+    }
+
+    fn begin_compute(cb: &mut CommandBuffer) -> ComputeEncoder {
+        end_blit(cb);
+        let raw = cb.cb.r();
+        let e = std::objc::pool(|| match raw.compute_command_encoder() {
+            Some(e) => e.retain(),
+            None => Id::<MTLComputeCommandEncoder>::nil(),
+        });
+        ComputeEncoder { enc: e, workgroup: size3(1, 1, 1) }
+    }
+
+    fn compute_set_pipeline(e: &mut ComputeEncoder, p: &ComputePipeline) {
+        e.enc.r().set_compute_pipeline_state(p.raw.r());
+        e.workgroup = p.workgroup;
+    }
+
+    fn compute_set_bind_group(e: &mut ComputeEncoder, g: &BindGroup) {
+        let enc = e.enc.r();
+        for i in 0..g.count {
+            apply_compute(enc, &g.items[i]);
+        }
+    }
+
+    fn dispatch(e: &mut ComputeEncoder, x: i64, y: i64, z: i64) {
+        e.enc.r().dispatch_threadgroups_threads_per_threadgroup(size3(x, y, z), e.workgroup);
+    }
+
+    fn end_compute(e: &mut ComputeEncoder) {
+        e.enc.r().end_encoding();
+        e.enc = Id::<MTLComputeCommandEncoder>::nil();
+    }
+
+    fn submit(q: &mut Queue, cb: &mut CommandBuffer) {
+        end_blit(cb);
+        cb.cb.r().commit();
+        q.last = std::replace(&mut cb.cb, Id::<MTLCommandBuffer>::nil());
+    }
+
+    fn write_buffer(q: &mut Queue, b: &Buffer, offset: i64, data: [u8]) {
+        if data.len() == 0 { return; }
+        let idle = q.last.is_nil()
+            || q.last.r().status() >= bindings::MTLCommandBufferStatusCompleted;
+        if idle {
+            // no submitted work can be reading the buffer: write its shared
+            // memory directly (offset + data.len() <= size is the caller's
+            // contract)
+            unsafe { memcpy(b.ptr[offset..offset + data.len()].ptr, data.ptr, data.len() as u64); }
+            return;
+        }
+        // in flight: a staging copy, ordered on the queue
+        let dev = q.q.r().device();
+        // data.ptr points to data.len() readable bytes
+        let staging = match unsafe {
+            dev.new_buffer_with_bytes_length_options(data.ptr, data.len() as u64,
+                bindings::MTLResourceStorageModeShared)
+        } {
+            Some(s) => s,
+            None => return,
+        };
+        let mut cb = begin_on(q.q.r());
+        blit(&mut cb).copy_from_buffer_source_offset_to_buffer_destination_offset_size(staging.r(),
+            0, b.raw.r(), offset as u64, data.len() as u64);
+        Metal::submit(q, &mut cb);
+    }
+
+    fn write_texture(q: &mut Queue, t: &Texture, layer: i64, x: i64, y: i64, w: i64, h: i64,
+        data: [u8], bytes_per_row: i64) {
+        let dev = q.q.r().device();
+        // data holds bytes_per_row * h bytes (the caller's contract)
+        let staging = match unsafe {
+            dev.new_buffer_with_bytes_length_options(data.ptr, data.len() as u64,
+                bindings::MTLResourceStorageModeShared)
+        } {
+            Some(s) => s,
+            None => return,
+        };
+        let mut cb = begin_on(q.q.r());
+        blit(&mut cb).copy_buffer_to_texture(staging.r(), 0, bytes_per_row as u64,
+            (bytes_per_row * h) as u64, size3(w, h, 1), t.raw.r(), layer as u64, 0,
+            origin3(x, y, 0));
+        Metal::submit(q, &mut cb);
+    }
+
+    fn queue_wait_idle(q: &mut Queue) -> bool {
+        if q.last.is_nil() { return true; }
+        let last = q.last.r();
+        last.wait_until_completed();
+        last.status() == bindings::MTLCommandBufferStatusCompleted
+    }
+}
+
+// ---- GPU on Metal: hal::Render (0.22) ----
+
+impl Render<Metal> for Metal {
+    type RenderPipeline = RenderPipeline;
+    type RenderEncoder = RenderEncoder;
+    type PassDesc = PassDesc;
+    type Surface = Surface;
+    type Frame = Frame;
+
+    fn create_render_pipeline(d: &Device, vs: &Shader, vs_entry: &EntryPoint, fs: &Shader,
+        fs_entry: &EntryPoint, has_fs: bool, state: &PipelineState,
+        err: &mut Buf) -> Option<RenderPipeline> {
+        let vf = match function(vs, vs_entry, err) {
+            Some(f) => f,
+            None => return None,
+        };
+        let mut ff = Id::<MTLFunction>::nil();
+        if has_fs {
+            ff = match function(fs, fs_entry, err) {
+                Some(f) => f,
+                None => return None,
+            };
+        }
+        let pd = MTLRenderPipelineDescriptor::new();
+        let p = pd.r();
+        p.set_vertex_function(Some(vf.r()));
+        if has_fs { p.set_fragment_function(Some(ff.r())); }
+        let colors = p.color_attachments();
+        for i in 0..state.target_count {
+            let t = state.targets[i];
+            let c = colors.object_at_indexed_subscript(i as u64);
+            c.set_pixel_format(pixel_format(t.format));
+            c.set_write_mask(t.write_mask as u64);
+            match t.blend {
+                Some(b) => {
+                    c.set_blending_enabled(true);
+                    c.set_source_rgb_blend_factor(blend_factor(b.color.src));
+                    c.set_destination_rgb_blend_factor(blend_factor(b.color.dst));
+                    c.set_rgb_blend_operation(blend_op(b.color.op));
+                    c.set_source_alpha_blend_factor(blend_factor(b.alpha.src));
+                    c.set_destination_alpha_blend_factor(blend_factor(b.alpha.dst));
+                    c.set_alpha_blend_operation(blend_op(b.alpha.op));
+                }
+                None => c.set_blending_enabled(false),
+            }
+        }
+        let vd = MTLVertexDescriptor::new();
+        if state.buffer_count > 0 {
+            let attrs = vd.r().attributes();
+            let layouts = vd.r().layouts();
+            for i in 0..state.buffer_count {
+                let l = state.buffers[i];
+                let index = vertex_buffer_index(i);
+                let lay = layouts.object_at_indexed_subscript(index);
+                lay.set_stride(l.stride as u64);
+                lay.set_step_function(if l.step
+                    == StepMode::Instance { bindings::MTLVertexStepFunctionPerInstance }
+                    else { bindings::MTLVertexStepFunctionPerVertex });
+                lay.set_step_rate(1);
+                for k in 0..l.count {
+                    let a = l.attributes[k];
+                    let ad = attrs.object_at_indexed_subscript(a.location as u64);
+                    ad.set_format(vertex_format(a.format));
+                    ad.set_offset(a.offset as u64);
+                    ad.set_buffer_index(index);
+                }
+            }
+            p.set_vertex_descriptor(Some(vd.r()));
+        }
+        let mut depth = Id::<MTLDepthStencilState>::nil();
+        match state.depth {
+            Some(ds) => {
+                p.set_depth_attachment_pixel_format(pixel_format(ds.format));
+                let dd = MTLDepthStencilDescriptor::new();
+                dd.r().set_depth_compare_function(compare_function(ds.compare));
+                dd.r().set_depth_write_enabled(ds.write);
+                match d.dev.r().new_depth_stencil_state_with_descriptor(dd.r()) {
+                    Some(s) => { depth = s; }
+                    None => {}
+                }
+            }
+            None => {}
+        }
+        let _pool = std::objc::Pool::push();
+        let mut e: *u8 = 0 as *u8;
+        // the error out-parameter is a local (see create_shader)
+        match unsafe { d.dev.r().new_render_pipeline_state_with_descriptor_error(p, &mut e as *u8) } {
+            Some(raw) => {
+                let primitive = match state.topology {
+                    Topology::PointList => bindings::MTLPrimitiveTypePoint,
+                    Topology::LineList => bindings::MTLPrimitiveTypeLine,
+                    Topology::LineStrip => bindings::MTLPrimitiveTypeLineStrip,
+                    Topology::TriangleList => bindings::MTLPrimitiveTypeTriangle,
+                    Topology::TriangleStrip => bindings::MTLPrimitiveTypeTriangleStrip,
+                };
+                let cull = match state.cull {
+                    Cull::None => bindings::MTLCullModeNone,
+                    Cull::Front => bindings::MTLCullModeFront,
+                    Cull::Back => bindings::MTLCullModeBack,
+                };
+                // WebGPU's clip space has y up, as Metal's: counter-clockwise
+                // is the same winding in both
+                let winding = if state.front_face
+                    == FrontFace::Ccw { bindings::MTLWindingCounterClockwise }
+                    else { bindings::MTLWindingClockwise };
+                Some(RenderPipeline {
+                    raw: raw, depth: depth, primitive: primitive, cull: cull, winding: winding
+                })
+            }
+            None => {
+                push_error(err, unsafe { Ref::<NSError>::from_global_opt(e) },
+                    "Metal rejected the render pipeline");
+                None
+            }
+        }
+    }
+
+    fn pass_new() -> PassDesc {
+        PassDesc { raw: MTLRenderPassDescriptor::new() }
+    }
+
+    fn pass_color(p: &mut PassDesc, i: i64, v: &TextureView, load: Load, clear: Color, store: bool) {
+        let a = p.raw.r().color_attachments().object_at_indexed_subscript(i as u64);
+        a.set_texture(Some(v.raw.r()));
+        a.set_load_action(load_action(load));
+        a.set_clear_color(MTLClearColor {
+            red: clear.r, green: clear.g, blue: clear.b, alpha: clear.a
+        });
+        a.set_store_action(if store { bindings::MTLStoreActionStore }
+            else { bindings::MTLStoreActionDontCare });
+    }
+
+    fn pass_depth(p: &mut PassDesc, v: &TextureView, load: Load, clear: f64, store: bool) {
+        let a = p.raw.r().depth_attachment();
+        a.set_texture(Some(v.raw.r()));
+        a.set_load_action(load_action(load));
+        a.set_clear_depth(clear);
+        a.set_store_action(if store { bindings::MTLStoreActionStore }
+            else { bindings::MTLStoreActionDontCare });
+    }
+
+    fn begin_render(cb: &mut CommandBuffer, p: &PassDesc) -> RenderEncoder {
+        end_blit(cb);
+        let raw = cb.cb.r();
+        let desc = p.raw.r();
+        let e = std::objc::pool(|| match raw.render_command_encoder_with_descriptor(desc) {
+            Some(e) => e.retain(),
+            None => Id::<MTLRenderCommandEncoder>::nil(),
+        });
+        RenderEncoder {
+            enc: e, primitive: bindings::MTLPrimitiveTypeTriangle, index: Id::<MTLBuffer>::nil(),
+            index_type: 0, index_size: 2, index_offset: 0
+        }
+    }
+
+    fn render_set_pipeline(e: &mut RenderEncoder, p: &RenderPipeline) {
+        let enc = e.enc.r();
+        enc.set_render_pipeline_state(p.raw.r());
+        enc.set_cull_mode(p.cull);
+        enc.set_front_facing_winding(p.winding);
+        if !p.depth.is_nil() {
+            enc.set_depth_stencil_state(Some(p.depth.r()));
+        }
+        e.primitive = p.primitive;
+    }
+
+    fn render_set_bind_group(e: &mut RenderEncoder, g: &BindGroup) {
+        let enc = e.enc.r();
+        for i in 0..g.count {
+            apply_render(enc, &g.items[i]);
+        }
+    }
+
+    fn render_set_vertex_buffer(e: &mut RenderEncoder, slot: i64, b: &Buffer, offset: i64) {
+        e.enc
+            .r()
+            .set_vertex_buffer_offset_at_index(Some(b.raw.r()), offset as u64,
+                vertex_buffer_index(slot));
+    }
+
+    fn render_set_index_buffer(e: &mut RenderEncoder, b: &Buffer, format: IndexFormat, offset: i64) {
+        e.index = b.raw.clone();
+        e.index_type = if format == IndexFormat::Uint32 { bindings::MTLIndexTypeUInt32 }
+            else { bindings::MTLIndexTypeUInt16 };
+        e.index_size = format.size();
+        e.index_offset = offset;
+    }
+
+    fn render_set_viewport(e: &mut RenderEncoder, x: f32, y: f32, w: f32, h: f32, min_depth: f32,
+        max_depth: f32) {
+        e.enc
+            .r()
+            .set_viewport(MTLViewport {
+                originX: x as f64, originY: y as f64, width: w as f64, height: h as f64,
+                znear: min_depth as f64, zfar: max_depth as f64
+            });
+    }
+
+    fn render_set_scissor(e: &mut RenderEncoder, x: i64, y: i64, w: i64, h: i64) {
+        e.enc
+            .r()
+            .set_scissor_rect(MTLScissorRect {
+                x: x as u64, y: y as u64, width: w as u64, height: h as u64
+            });
+    }
+
+    fn render_set_blend_constant(e: &mut RenderEncoder, c: Color) {
+        e.enc
+            .r()
+            .set_blend_color_red_green_blue_alpha(c.r as f32, c.g as f32, c.b as f32, c.a as f32);
+    }
+
+    fn draw(e: &mut RenderEncoder, first_vertex: i64, vertices: i64, first_instance: i64,
+        instances: i64) {
+        e.enc
+            .r()
+            .draw_primitives_vertex_start_vertex_count_instance_count_base_instance(e.primitive,
+                first_vertex as u64, vertices as u64, instances as u64, first_instance as u64);
+    }
+
+    fn draw_indexed(e: &mut RenderEncoder, first_index: i64, indices: i64, base_vertex: i64,
+        first_instance: i64, instances: i64) {
+        let offset = e.index_offset + first_index * e.index_size;
+        e.enc.r().draw_indexed_primitives_index_count_index_type_index_buffer_index_buffer_offset_instance_count_base_vertex_base_instance(e.primitive, indices as u64, e.index_type, e.index.r(), offset as u64, instances as u64, base_vertex, first_instance as u64);
+    }
+
+    fn end_render(e: &mut RenderEncoder) {
+        e.enc.r().end_encoding();
+        e.enc = Id::<MTLRenderCommandEncoder>::nil();
+    }
+
+    fn create_surface(d: &Device, raw: RawSurface) -> Option<Surface> {
+        if !open_frameworks() { return None; }
+        let layer = match raw {
+            // the window library's CAMetalLayer, kept by a retain
+            RawSurface::MetalLayer(p) => {
+                let r = unsafe { Ref::<CAMetalLayer>::from_global(p) };
+                r.retain()
+            }
+            // an unattached layer: its drawables are offscreen
+            RawSurface::Headless => std::objc::pool(|| CAMetalLayer::layer().retain()),
+        };
+        if layer.is_nil() { return None; }
+        layer.r().set_device(Some(d.dev.r()));
+        Some(Surface { layer: layer })
+    }
+
+    fn configure(s: &mut Surface, d: &Device, width: i64, height: i64, format: Format, vsync: bool) {
+        let l = s.layer.r();
+        l.set_device(Some(d.dev.r()));
+        l.set_pixel_format(pixel_format(format));
+        l.set_drawable_size(CGSize { width: width as f64, height: height as f64 });
+        l.set_framebuffer_only(false);
+        l.set_maximum_drawable_count(3);
+        l.set_display_sync_enabled(vsync);
+    }
+
+    fn next_frame(s: &mut Surface) -> Option<(Frame, Texture)> {
+        let l = s.layer.r();
+        let _pool = std::objc::Pool::push();
+        match l.next_drawable() {
+            Some(dr) => {
+                let tex = dr.texture().retain();
+                Some((Frame { drawable: dr.retain() }, Texture { raw: tex }))
+            }
+            None => None,
+        }
+    }
+
+    fn present(q: &mut Queue, f: Frame) {
+        let mut cb = begin_on(q.q.r());
+        // a CAMetalDrawable is an MTLDrawable (the protocols' relation)
+        let d = unsafe { f.drawable.r().cast::<bindings::MTLDrawable>() };
+        cb.cb.r().present_drawable(d);
+        Metal::submit(q, &mut cb);
+    }
+}

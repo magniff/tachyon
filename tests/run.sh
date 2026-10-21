@@ -10,7 +10,7 @@
 # tests/walkthrough/run.sh (the sessions of examples/tools/*/README.md,
 # 0.15, and of every examples/GROUP/NAME/README.md with one, 0.16) and
 # tests/own-try/run.sh (the own pass's try: lines run, 0.17) and
-# tests/lsp/run.sh (`tachyonc lsp`'s sessions, 0.24). POSIX sh and awk only, so it runs the same on macOS and Linux.
+# tests/lsp/run.sh (`tachyonc lsp`'s sessions, 0.24) and tests/gpu/run.sh (std::gpu on Metal, 0.22, skipped off macOS). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-d FORMAT] [FILTER]
 #
@@ -92,6 +92,8 @@
 #                        ($CC, which C imports read) is clang: what it
 #                        tests is clang's (`_Nonnull`); elsewhere it is
 #                        skipped, counted apart
+#   // REQUIRES: metal    (0.22) the case runs only on aarch64-macos (std::gpu
+#                        on Metal); elsewhere it is skipped, counted apart
 #   // NO-EXTRA-FLAGS: why (0.16) the case is built without
 #                        $TACHYON_TEST_FLAGS (its output differs by design
 #                        with them)
@@ -586,6 +588,10 @@ run_case() {
         echo skip >"$dir/status"
         return
     fi
+    if grep -qw metal "$dir/requires" && [ "$TARGET" != aarch64-macos ]; then
+        echo skip >"$dir/status"
+        return
+    fi
     if check_case "$file" "$dir"; then
         if [ -s "$dir/xfail" ]; then echo xpass; else echo pass; fi
     elif [ -s "$dir/xfail" ]; then
@@ -666,6 +672,14 @@ esac
 # (0.24) The language server's sessions (tests/lsp/run.sh): category "lsp".
 case lsp in
     *"$FILTER"*) "$ROOT/tests/lsp/run.sh" -c "$COMPILER" >"$WORK/lsp.out" 2>&1 & ;;
+esac
+# (0.22) std::gpu and std::objc: tests/gpu/run.sh, Metal on macOS/arm64
+# (skipped elsewhere); category "gpu".
+case gpu in
+    *"$FILTER"*)
+        GPU_OPT=""
+        [ -n "$OPT" ] && GPU_OPT="-O ${OPT#-O}"
+        "$ROOT/tests/gpu/run.sh" -c "$COMPILER" $GPU_OPT >"$WORK/gpu.out" 2>&1 & ;;
 esac
 # (0.18.1) The agent hooks' cases (tools/agent-hooks/test-*.py, Python;
 # skipped without python3): category "hooks".
@@ -964,6 +978,23 @@ case wgsl in
             count=$((count + 1))
         fi
         awk '/^FAIL/ { p = 1 } /^(pass|skip)/ { p = 0 } p' "$WORK/wgsl.out" >>"$FAILURES"
+        ;;
+esac
+# std::gpu's suite (run above); category "gpu".
+case gpu in
+    *"$FILTER"*)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "gpu pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "gpu fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/gpu.out"
+        if ! grep -q -E '^(pass|skip)' "$WORK/gpu.out"; then
+            echo "gpu fail" >>"$TALLY"
+            count=$((count + 1))
+            { echo "FAIL gpu: tests/gpu/run.sh reported nothing:"; sed 's/^/    /' "$WORK/gpu.out" | head -20; echo; } >>"$FAILURES"
+        fi
+        awk '/^FAIL/ { p = 1 } /^(pass|skip|gpu:)/ { p = 0 } p' "$WORK/gpu.out" >>"$FAILURES"
         ;;
 esac
 
