@@ -1,0 +1,134 @@
+// A grid for the tests: a plain array of cells with damage, implementing
+// the renderer's `CellGrid` the way the terminal's grid does (ring
+// scrolls counted, the lines that scroll in damaged).
+
+use crate::render::input::{
+    Cell, CellGrid, DEFAULT_BG, DEFAULT_FG, WIDE_CHAR, WIDE_CHAR_SPACER, cell,
+};
+
+pub struct TestGrid {
+    pub lines: i64,
+    pub cols: i64,
+    // Line l is at ring position (base + l) mod lines.
+    pub base: i64,
+    pub cells: Vec<Cell>,
+    pub dirty: Vec<bool>,
+    pub all: bool,
+    pub scrolled: i64,
+}
+
+impl TestGrid {
+    pub fn new_in(lines: i64, cols: i64, gpa: Gpa) -> TestGrid {
+        let mut g = TestGrid {
+            lines: lines,
+            cols: cols,
+            base: 0,
+            cells: Vec::new_in(gpa),
+            dirty: Vec::filled_in(lines, true, gpa),
+            all: true,
+            scrolled: 0,
+        };
+        for _ in 0..lines * cols {
+            g.cells.push(cell(32, DEFAULT_FG, DEFAULT_BG, 0));
+        }
+        g
+    }
+
+    pub fn free(self: &mut TestGrid) {
+        self.cells.free();
+        self.dirty.free();
+    }
+
+    fn at(self: &TestGrid, l: i64, x: i64) -> i64 {
+        ((self.base + l) % self.lines) * self.cols + x
+    }
+
+    pub fn set(self: &mut TestGrid, l: i64, x: i64, c: Cell) {
+        let i = self.at(l, x);
+        self.cells[i] = c;
+        self.dirty[l] = true;
+    }
+
+    // Writes ASCII text (and UTF-8: one code point per cell, wide ones
+    // taking two) from (l, x) with the given colours and flags.
+    pub fn text(self: &TestGrid, l: i64, x0: i64, s: [u8], fg: u32, bg: u32, flags: u16) -> i64 {
+        let mut x = x0;
+        let mut i = 0;
+        while i < s.len && x < self.cols {
+            let b = s[i] as u32;
+            let mut c = b;
+            let mut n = 1;
+            if b >= 0xF0 {
+                c = ((b & 7) << 18) | ((s[i + 1] as u32 & 63) << 12) | ((s[i + 2] as u32 & 63) << 6)
+                    | (s[i + 3] as u32 & 63);
+                n = 4;
+            } else if b >= 0xE0 {
+                c = ((b & 15) << 12) | ((s[i + 1] as u32 & 63) << 6) | (s[i + 2] as u32 & 63);
+                n = 3;
+            } else if b >= 0xC0 {
+                c = ((b & 31) << 6) | (s[i + 1] as u32 & 63);
+                n = 2;
+            }
+            i += n;
+            let wide = c >= 0x1100 && (c < 0x2000 || c >= 0x2E80);
+            if wide && x + 1 < self.cols {
+                self.set(l, x, cell(c, fg, bg, flags | WIDE_CHAR));
+                self.set(l, x + 1, cell(32, fg, bg, flags | WIDE_CHAR_SPACER));
+                x += 2;
+            } else {
+                self.set(l, x, cell(c, fg, bg, flags));
+                x += 1;
+            }
+        }
+        x
+    }
+
+    // Scrolls the whole screen up by n: the ring's base moves, the n
+    // lines that come in at the bottom are blank and damaged.
+    pub fn scroll(self: &mut TestGrid, n: i64) {
+        self.base = (self.base + n) % self.lines;
+        self.scrolled += n;
+        for l in self.lines - n..self.lines {
+            for x in 0..self.cols {
+                let i = self.at(l, x);
+                self.cells[i] = cell(32, DEFAULT_FG, DEFAULT_BG, 0);
+            }
+            self.dirty[l] = true;
+        }
+    }
+}
+
+impl CellGrid for TestGrid {
+    fn lines(self: &TestGrid) -> i64 {
+        self.lines
+    }
+
+    fn cols(self: &TestGrid) -> i64 {
+        self.cols
+    }
+
+    fn row(self: &TestGrid, l: i64) -> [Cell] {
+        let s = ((self.base + l) % self.lines) * self.cols;
+        self.cells[s..s + self.cols]
+    }
+
+    fn damaged(self: &TestGrid, l: i64) -> bool {
+        self.dirty[l]
+    }
+
+    fn damage_all(self: &TestGrid) -> bool {
+        self.all
+    }
+
+    fn scrolled(self: &TestGrid) -> i64 {
+        self.scrolled
+    }
+
+    fn reset_damage(self: &mut TestGrid) {
+        for l in 0..self.lines {
+            self.dirty[l] = false;
+        }
+        self.all = false;
+        self.scrolled = 0;
+    }
+}

@@ -1,0 +1,210 @@
+// The reference renderer: the shader's rules (render/shader.tach) run
+// on the CPU over the renderer's own instances, uniforms and atlas, so a
+// GPU image can be checked pixel by pixel against an image the GPU under
+// test did not make (gpu.md §4, "How images are compared"). Every rule
+// here is the twin of one in the shader; the arithmetic is the same f32
+// arithmetic, so the two agree within one unit per channel (Metal's
+// fast-math division and its float-to-unorm rounding).
+
+use crate::render::renderer::{Inst, Renderer, Uniforms};
+
+// The atlas pages read back from the GPU.
+pub struct Pages {
+    pub cov: Vec<u8>,
+    pub cov_w: i64,
+    pub color: Vec<u8>,
+    pub color_w: i64,
+}
+
+pub fn read_pages(r: &Renderer, gpa: Gpa) -> Pages {
+    let mut p = Pages {
+        cov: Vec::new_in(gpa), cov_w: r.atlas.cov.w, color: Vec::new_in(gpa),
+        color_w: r.atlas.color.w
+    };
+    r.atlas.cov.read(&mut p.cov);
+    r.atlas.color.read(&mut p.color);
+    p
+}
+
+impl Pages {
+    pub fn free(self: &mut Pages) {
+        self.cov.free();
+        self.color.free();
+    }
+}
+
+fn chan(c: u32, shift: u32) -> f32 {
+    ((c >> shift) & 255) as f32 / 255.0
+}
+
+fn unorm(v: f32) -> u8 {
+    let x = v * 255.0 + 0.5;
+    if x <= 0.0 {
+        return 0;
+    }
+    if x >= 255.0 {
+        return 255;
+    }
+    x as u8
+}
+
+fn imin(a: i64, b: i64) -> i64 {
+    if a < b { a } else { b }
+}
+
+fn imax(a: i64, b: i64) -> i64 {
+    if a > b { a } else { b }
+}
+
+// The shader's `deco`.
+fn deco(fl: u32, x: i64, y: i64, u: &Uniforms) -> f32 {
+    let t = u.ul_thick as i64;
+    let ul = u.ul_pos as i64;
+    let ch = u.ch as i64;
+    let cw = u.cw as i64;
+    let s = fl & 7;
+    let mut on = false;
+    if s == 1 {
+        on = y >= ul && y < ul + t;
+    } else if s == 2 {
+        let a = imin(ul, ch - 3 * t);
+        on = (y >= a && y < a + t) || (y >= a + 2 * t && y < a + 3 * t);
+    } else if s == 3 {
+        let h = imax(cw / 2, 1);
+        let ph = x % cw;
+        let tri = if ph < h { ph } else { cw - ph };
+        let top = imin(ul - t + tri * 2 * t / h, ch - t);
+        on = y >= top && y < top + t;
+    } else if s == 4 {
+        on = y >= ul && y < ul + t && (x / t) % 2 == 0;
+    } else if s == 5 {
+        on = y >= ul && y < ul + t && x % (6 * t) < 4 * t;
+    }
+    if (fl & 8) != 0 {
+        let sp = u.strike_pos as i64;
+        on = on || (y >= sp && y < sp + t);
+    }
+    if on { 1.0 } else { 0.0 }
+}
+
+// Renders the renderer's current frame (its ring, uniforms and atlas)
+// into `out`: w × h RGBA8 pixels, as the GPU would into an RGBA8 target.
+pub fn render(r: &Renderer, p: &Pages, w: i64, h: i64, out: &Vec<u8>) {
+    let u = r.uniforms(w, h);
+    out.clear();
+    let bgc = r.palette[257];
+    let cw = u.cw as i64;
+    let ch = u.ch as i64;
+    let cols = u.cols as i64;
+    let lines = u.lines as i64;
+    let px0 = u.pad_x as i64;
+    let py0 = u.pad_y as i64;
+    for py in 0..h {
+        for px in 0..w {
+            let gx = px - px0;
+            let gy = py - py0;
+            if gx < 0 || gy < 0 || gx >= cols * cw || gy >= lines * ch {
+                out.push(unorm(chan(bgc, 16)));
+                out.push(unorm(chan(bgc, 8)));
+                out.push(unorm(chan(bgc, 0)));
+                out.push(255);
+                continue;
+            }
+            let col = gx / cw;
+            let line = gy / ch;
+            let slot = (line + u.top as i64) % lines;
+            let inst: Inst = r.master[slot * cols + col];
+            let y = gy - line * ch;
+            let x = gx - col * cw + if (inst.flags & 16) != 0 { cw } else { 0 };
+            let mut fg = inst.fg;
+            let mut bg = inst.bg;
+            let idx = (line * cols + col) as u32;
+            if idx >= u.sel_lo && idx < u.sel_hi {
+                let t = fg;
+                fg = bg;
+                bg = t;
+            }
+            let at = line as u32 == u.cur_line && col as u32 == u.cur_col;
+            if at && u.cur_shape == 1 {
+                fg = bg;
+                bg = u.cur_color;
+            }
+            let mut c: f32 = 0.0;
+            let mut k: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+            if inst.glyph != 0 {
+                let e = r.atlas.entry(inst.glyph as i64);
+                let tx = x - e[4];
+                let ty = y - e[5];
+                if tx >= 0 && ty >= 0 && tx < e[2] && ty < e[3] {
+                    if e[6] == 0 {
+                        c = p.cov[(e[1] + ty) * p.cov_w + e[0] + tx] as f32 / 255.0;
+                    } else {
+                        let o = ((e[1] + ty) * p.color_w + e[0] + tx) * 4;
+                        for q in 0..4 {
+                            k[q] = p.color[o + q] as f32 / 255.0;
+                        }
+                    }
+                }
+            }
+            let f: [f32; 3] = [chan(fg, 16), chan(fg, 8), chan(fg, 0)];
+            let b: [f32; 3] = [chan(bg, 16), chan(bg, 8), chan(bg, 0)];
+            let d = deco(inst.flags, x, y, &u);
+            let mut o: [f32; 3] = [0.0, 0.0, 0.0];
+            for q in 0..3 {
+                let mut v = k[q] + b[q] * (1.0 - k[3]);
+                v = v + (f[q] - v) * c;
+                v = v + (f[q] - v) * d;
+                o[q] = v;
+            }
+            if at {
+                let t = u.ul_thick as i64;
+                let mut m = false;
+                if u.cur_shape == 2 {
+                    m = x < t;
+                } else if u.cur_shape == 3 {
+                    m = y >= ch - t;
+                } else if u.cur_shape == 4 {
+                    m = x < t || x >= cw - t || y < t || y >= ch - t;
+                }
+                if m {
+                    o = [chan(u.cur_color, 16), chan(u.cur_color, 8), chan(u.cur_color, 0)];
+                }
+            }
+            out.push(unorm(o[0]));
+            out.push(unorm(o[1]));
+            out.push(unorm(o[2]));
+            out.push(255);
+        }
+    }
+}
+
+// How two RGBA8 images differ: the largest channel difference and the
+// number of pixels differing by more than `tol`.
+pub fn compare(a: [u8], b: [u8], tol: i64) -> (i64, i64) {
+    let mut worst = 0;
+    let mut bad = 0;
+    if a.len != b.len {
+        return (256, a.len / 4);
+    }
+    let mut i = 0;
+    while i < a.len {
+        let mut px_bad = false;
+        for q in 0..4 {
+            let mut d = a[i + q] as i64 - b[i + q] as i64;
+            if d < 0 {
+                d = -d;
+            }
+            if d > worst {
+                worst = d;
+            }
+            if d > tol {
+                px_bad = true;
+            }
+        }
+        if px_bad {
+            bad += 1;
+        }
+        i += 4;
+    }
+    (worst, bad)
+}
