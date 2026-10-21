@@ -59,6 +59,7 @@ case "$COMPILER" in
 esac
 [ -x "$COMPILER" ] || { echo "guide/run.sh: no compiler at $COMPILER" >&2; exit 2; }
 
+HOST="$(uname -s)-$(uname -m)"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-guide.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
@@ -202,7 +203,22 @@ check_block() {
     # (0.18: from its directory, as main.tach: a failed check's position
     # reads `main.tach:LINE:COL`, as the guide shows it)
     cp "$d/prog.tach" "$d/main.tach"
-    if ! (cd "$d" && "$COMPILER" --deny-warnings --diagnostics=short main.tach -o prog) >"$d/compile.out" 2>&1; then
+    # (0.22) A program of std::gpu or std::objc links libobjc and runs on
+    # macOS/arm64 (Metal); elsewhere it is compiled to an object only.
+    link=""
+    if grep -q 'std::gpu\|std::objc' "$d/main.tach"; then
+        if [ "$HOST" = Darwin-arm64 ]; then
+            link="-l objc"
+        else
+            if (cd "$d" && "$COMPILER" --deny-warnings --diagnostics=short main.tach -o prog.o) >"$d/compile.out" 2>&1; then
+                echo "pass $name" >"$d/result"
+            else
+                { echo "FAIL $name: does not compile"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
+            fi
+            return
+        fi
+    fi
+    if ! (cd "$d" && "$COMPILER" --deny-warnings --diagnostics=short main.tach $link -o prog) >"$d/compile.out" 2>&1; then
         { echo "FAIL $name: does not compile"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
         return
     fi
@@ -286,7 +302,7 @@ if ! "$COMPILER" guide --list >"$WORK/list" 2>&1; then
     result FAIL guide-list "tachyonc guide --list failed:" "$(cat "$WORK/list")"
 fi
 missing=""
-for t in core language rust syntax types std errors unsafe c-interop arch modules generics traits closures iterators conversions formatting memory views tools; do
+for t in core language rust syntax types std errors unsafe c-interop arch modules generics traits closures iterators conversions formatting memory views tools gpu; do
     awk -F '\t' -v t="$t" '$1 == t { found = 1 } END { exit !found }' "$WORK/list" || missing="$missing $t"
 done
 if [ -n "$missing" ]; then
