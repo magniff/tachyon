@@ -61,6 +61,20 @@ def candidates(event, st):
     return roots
 
 
+def expects_errors(root):
+    """A test case that is meant to fail to compile (`// ERROR:` or
+    `// ERROR-COUNT:` directives, under a tests/ directory): its errors are
+    the test, not unchecked changes."""
+    if os.sep + "tests" + os.sep not in root:
+        return False
+    try:
+        with open(root) as fh:
+            head = fh.read(4096)
+    except OSError:
+        return False
+    return "// ERROR" in head
+
+
 def needs_check(event, st, root, start):
     """Whether root's sources changed since the last clean check (and test
     run) of this session, and the turn-end hook has not reported on them."""
@@ -91,6 +105,8 @@ def main():
     start = cae.hs.session_start(event)
     reports = []
     for root in candidates(event, st):
+        if expects_errors(root):
+            continue
         need, fp = needs_check(event, st, root, start)
         if not need:
             continue
