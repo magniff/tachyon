@@ -92,7 +92,7 @@ without a Fmt:
 |---|---|
 | `parse_f64(s) -> Result<f64, ParseFloatError>`, `parse_f32` | Rust's `f64::from_str`: `-1.5e3`, `.5`, `inf`, `NaN`; no spaces; correctly rounded |
 | `parse_i64_radix(s, 16) -> Result<i64, ParseIntError>`, `parse_u64_radix` | Rust's `from_str_radix` (radix 2 to 36) |
-| `write_f64(v, FloatFmt::Debug, out) -> i64`, `write_f32` | the text into `out` (`FLOAT_TEXT_MAX` bytes always fit): its length |
+| `write_f64(v, FloatFmt::Debug, &out) -> i64`, `write_f32` | the text into `out` (an `inout [u8]`) (`FLOAT_TEXT_MAX` bytes always fit): its length |
 | `fmt_u64(v, &out) -> i64`, `fmt_i64` | the digits at the end of a `[u8; 20]`: where they start |
 | `f64_to_bits(v)`, `f64_from_bits(u)`, `f32_...` | the IEEE bits (Rust's `to_bits`) |
 
@@ -103,7 +103,7 @@ fn main() -> i32 {
     let x = parse_f64("0.1").unwrap() + parse_f64("2e-1").unwrap();
     println(f"{x} {x:?} {x:e} {1e16:?} {1e-7} {0.1f32}");
     var out: [u8; 32] = [0; 32];
-    let n = write_f64(1234.5, FloatFmt::LowerExp, out[..]);
+    let n = write_f64(1234.5, FloatFmt::LowerExp, &out[..]);
     println(out[0..n]);
     println(f"{parse_i64_radix("-ff", 16):?} {parse_f64("1,5").is_err()}");
     0
