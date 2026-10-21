@@ -1278,6 +1278,31 @@ coreutils' in the linux/arm64 container.
 - benchmarks against Rust's std and C on the same operations (a bench/
   pair each); a property test per collection against a model (0.18)
 
+Done (0.20.0). Parameter conventions (docs/design/conventions.md: Phase
+0, T1 the semantics, T2 the tools, Phase M the migration and the flip),
+std as a module tree with a benchmark harness against Rust and C
+(bench/std), the collections (Swiss-table HashMap and HashSet, BTreeMap
+and BTreeSet, ipnsort and driftsort, slice algorithms), text (String,
+str, std::unicode, number formatting and parsing), I/O and the system
+(io, fs, path, env, process, time, random, sys), owned temporaries
+dropped at the statement's end, and `tachyonc lsp`
+(docs/design/collections-text-io.md for std's parts).
+
+Moved to 0.20.1 or 0.21:
+- `fn(T)` and `fn(let T)` one type; std's consuming bounds then
+  `Fn(sink T)`;
+- a closure's by-value parameter dropped (a leak since 0.19);
+- a generic `let` parameter given an rvalue of a non-copyable type
+  other than a closure literal;
+- `fix --only conventions`: the `&` of an inout argument in an
+  f-string hole, `Iterator::at`'s convention in impls;
+- `query def` of std's statics' symbols (`tachyon.static.std.X`);
+- the own pass over std's own functions (two -O0 wrong-output bugs of
+  std slipped through without it before the tag);
+- the rest of collections-text-io.md not yet done (VecDeque, a
+  small-vector and a bitset, property tests against models), and
+  compiler/src on 0.20's spelling (0.21's first commit).
+
 ## 0.21: concurrency, atomics and synchronization
 
 - threads: `spawn`/`join`, scoped threads that may borrow the parent's

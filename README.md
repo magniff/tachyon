@@ -18,12 +18,12 @@ struct Point { x: f64, y: f64 }
 enum Shape { Circle(Point, f64), Rect(Point, Point), Empty }
 
 trait Area {
-    fn area(self: &Self) -> f64;
+    fn area(self) -> f64;
 }
 
 impl Area for Shape {
-    fn area(self: &Shape) -> f64 {
-        match *self {
+    fn area(self) -> f64 {
+        match self {
             Shape::Circle(_, r) => 3.14159 * r * r,
             Shape::Rect(a, b) => (b.x - a.x) * (b.y - a.y),
             Shape::Empty => 0.0,
@@ -32,7 +32,7 @@ impl Area for Shape {
 }
 
 fn total<T: Area>(items: [T]) -> f64 {
-    let mut sum = 0.0;
+    var sum = 0.0;
     for s in items {
         sum += s.area();
     }
@@ -43,21 +43,22 @@ fn main() -> i32 {
     let o = Point { x: 0.0, y: 0.0 };
     let shapes = [Shape::Circle(o, 1.0), Shape::Rect(o, Point { x: 2.0, y: 3.5 }), Shape::Empty];
     let rest = shapes[1..];
-    unsafe { c::printf(c"%.2f %.2f %lu\n", total(shapes[0..]), total(rest), rest.len); }
+    unsafe { c::printf(c"%.2f %.2f %lu\n", total(shapes[0..]), total(rest), rest.len()); }
     0
 }
 ```
 
 ```
-$ target/tachyonc shapes.tach -o shapes.s && cc -o shapes shapes.s && ./shapes
+$ target/tachyonc shapes.tach -o shapes && ./shapes
 10.14 7.00 2
 ```
 
 Structs, enums with exhaustive `match`, traits with bounded generics
 (monomorphized, statically dispatched), checked slices, and a C header
 imported into its own namespace. Calling C is an `unsafe` operation;
-everything else here is safe. Bindings are immutable unless `mut`. The
-full grammar is in [docs/grammar.md](docs/grammar.md).
+everything else here is safe. Parameters are borrowed read-only (`let`,
+the default; `inout` and `sink` are written), and bindings are immutable
+unless declared `var`. The full grammar is in [docs/grammar.md](docs/grammar.md).
 
 ## Built for agents
 
@@ -246,18 +247,17 @@ checks every release; `-g` writes DWARF line tables.
 
 Tachyon is at 0.x: the language is not stable, and minor releases may
 break programs (with a `tachyonc fix` migration from 0.14 on). The
-current release is 0.19.1: CPU intrinsics and target features
-(`std::arch`, checked lane by lane, with run-time detection);
-contracts (`requires`, `ensures`, checked at run time, the caller blamed), tests, properties and fuzzing in the
-language, distinct types and `NonNull`; functions compiled in parallel
-(`-j N`) and incremental rebuilds; every `*T` raw, borrowing by `&` and
-`&mut`; on 0.17's memory safety by mutable value semantics and 0.16's
+current release is 0.20.0: parameter conventions in Hylo's spelling
+(`let` by default, `inout` with `&x` at the call, `sink`, `var`),
+std's collections, text and I/O (String and str, Unicode, a Swiss-table
+HashMap, BTreeMap), and a language server; on 0.19's CPU intrinsics,
+0.18's contracts and tests, 0.17's mutable value semantics and 0.16's
 effects and explicit allocators. See [docs/releases.md](docs/releases.md)
 for every release. Next:
 
-- **0.20**: collections, text and I/O; the compiler's source on arenas;
-  references as results and type arguments
-- **0.21 to 0.23**: concurrency, GPU support, windows and a terminal emulator on std
+- **0.21**: concurrency, atomics and synchronization; the compiler's
+  source in 0.20's spelling
+- **0.22 to 0.23**: GPU support, windows and a terminal emulator on std
 
 **Toward 1.0.** 1.0 is not a feature milestone. It ships when the
 surface language has been reworked against real programs, the tools
