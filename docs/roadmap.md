@@ -1403,6 +1403,16 @@ pass's reading of `Buf<ScopedArena>`.
 - what writing it reveals feeds the surface-language rework of "Toward
   1.0"
 
+Done (0.23.0). std::window on Cocoa (winit's objects with events
+pulled, behind a gate), voltty in examples/voltty (a core checked
+against alacritty_terminal by an oracle and a fuzzer, Core Text glyphs
+in an atlas, one instanced draw per frame on std::gpu with its shader
+compiled by std::gpu::wgsl, damage tracking, a shell on a pty), and the
+rename tools for 0.24. Moved to 0.23.1 or later: Wayland and X11,
+selection and copy, the scrollback view and configuration, the
+measurements against Alacritty's input latency and memory, fonts through
+FreeType and a rasterizer in the language (after 0.24).
+
 ## After 0.23: the specification
 
 Decided with the user on 2026-10-16: once 0.23 has shipped, the whole
@@ -2429,3 +2439,25 @@ v0.21.0's build of the same programs: every program within 0.5% but sort
 (+1.0%) and wordcount (-1.0%), the outputs the same. The self-compile
 (0.22's source, no cache): 11.11 G to 11.17 G at -O0 (+0.6%), 43.38 G to
 43.47 G at -O2 -j1 (+0.2%), 814 MB to 811 MB.
+
+### 0.23
+
+The release gate (`gate.sh --release --no-x86`, 30:53 wall at load up
+to 50): every step passing but three, rerun (21:22): stress-grow's
+voltty_render_font_ascii_time (a timing case, 95 glyphs in 105 ms under
+load) and examples-checkalloc's arena-parser (its time limit) passed on
+the rerun; in the container objcheck linked voltty's app, which needs
+Core Text (tests/objcheck.sh now keeps it to macOS), and tests/fmt's
+`compiles` found std_gpu_wgsl_reflect's assembly different once (the
+same on the rerun and, cross-compiled, here in four builds). The suite
+1846 (6 XFAIL), aarch64-linux 1404, threads 2638, incremental 160
+series, objcheck 2460, voltty-fuzz 337 scripts against the oracle,
+valgrind 249 clean. compile-cost against v0.22.0: a hello world 94.0 M
+instructions (1.00x), std_heavy 1.00x, check of the compiler 5.62 G
+(1.00x).
+
+Bench (load 5 to 25): geomean 0.849 of cc -O2, v0.22.0's build 0.904 in
+the same run; instructions retired against v0.22.0's build of the same
+programs: every program within 0.1%, the outputs the same. The
+self-compile (0.23's source, no cache): 11.30 G to 11.36 G at -O0
+(+0.5%), 44.56 G to 44.49 G at -O2 -j1 (-0.2%), 834 MB to 813 MB.

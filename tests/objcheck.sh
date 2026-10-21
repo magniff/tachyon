@@ -246,6 +246,8 @@ for f in tests/run/*.tach tests/run/*/main.tach examples/*/main.tach examples/*/
     grep -qw clang "$dd/requires" 2>/dev/null && ! "$CC" --version 2>/dev/null | grep -qi clang && continue
     # (0.22) std::gpu's examples need Metal: macOS only.
     case "$TARGET" in *-macos) ;; *) grep -qw metal "$dd/requires" 2>/dev/null && continue ;; esac
+    # (0.23) voltty's app (Core Text, Cocoa through std::window): macOS only.
+    case "$TARGET:$f" in *-macos:*) ;; *:examples/voltty/app/*) continue ;; esac
     echo "$f" >>"$list"
 done
 # (0.19) The intrinsics' generated programs (tests/arch/gen.sh), of the
