@@ -40,7 +40,7 @@ std::gpu::shader::ir	<std>	267
 std::gpu::shader::names	<std>	238
 std::gpu::shader::lex	<std>	61
 std::gpu::shader::front	<std>	95
-std::gpu::shader::expr	<std>	38
+std::gpu::shader::expr	<std>	39
 std::gpu::shader::builtins	<std>	35
 std::gpu::shader::entry	<std>	8
 std::gpu::shader::bounds	<std>	10
