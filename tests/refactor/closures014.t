@@ -51,7 +51,7 @@ fn main() -> i32 {
     0
 }
 
-fn step(k: i64, mut total: i64) -> i64 {
+fn step(k: i64, total: sink i64) -> i64 {
     let add = |x: i64| double(x) + k;
     total += apply(add, 1);
     total

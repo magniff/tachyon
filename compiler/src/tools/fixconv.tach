@@ -330,6 +330,37 @@ fn fn_of(n: i64) -> i64 {
     unsafe { FN_OF_NODE.get(n + 1) - 1 }
 }
 
+// The functions declared in a trait (key node + 1).
+static mut TRAIT_FNS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// Whether function node n is a method: in an impl (d: the impl's type
+// name), or a trait's.
+fn is_method(n: i64) -> bool {
+    unsafe { NODES[n].d != 0 || TRAIT_FNS.get(n + 1) != 0 }
+}
+
+// Whether type node tn (or what a `&` of it points to) names a type
+// parameter of function node n's own (not its impl's): `fn copy_clone<T>(self:
+// &T)`, a function std binds to a trait, whose `self` is no receiver.
+fn own_type_param(n: i64, tn: i64) -> bool {
+    unsafe {
+        let mut t = tn;
+        if NODES[t].kind == NodeKind::TyPtr {
+            t = NODES[t].a;
+        }
+        let g = NODES[n].g;
+        if t <= 0 || NODES[t].kind != NodeKind::TyName || g <= 0 {
+            return false;
+        }
+        for i in NODES[g].a..NODES[g].count {
+            if NODES[child(g, i)].a == NODES[t].a {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 // The declaration (a Fn node) of the program's trait function that node
 // n (function f) implements, or 0.
 fn trait_decl(f: i64, n: i64) -> i64 {
@@ -429,7 +460,11 @@ fn edit_param(n: i64, i: i64, p: i64, closure: bool) {
         let tk = NODES[tn].kind;
         let ts = NODES[tn].start;
         let mutable = NODES[p].c != 0;
-        if NODES[p].a == SYM_SELF && !closure {
+        // (a method's receiver: not a free function's `self: &T` parameter, nor
+        // a slice's, `self: &mut [T]` (`inout self` is `&mut Self` until T1;
+        // the long form `self: inout [T]` keeps the slice))
+        if NODES[p].a == SYM_SELF && !closure && is_method(n) && tk != NodeKind::TySlice
+            && !own_type_param(n, tn) {
             TYPE_DONE.put(tn + 1, 1);
             let end = NODES[tn].end;
             if tk == NodeKind::TyPtr && (NODES[tn].p & NODE_REF) != 0 && SRC[ts] == '&' {
@@ -860,6 +895,13 @@ pub fn conventions_edits() -> i64 {
                 }
             }
         }
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind == NodeKind::Trait {
+                for j in 0..NODES[n].count {
+                    TRAIT_FNS.put(child(n, j) + 1, 1);
+                }
+            }
+        }
         // The signatures, first (their type nodes are theirs).
         for n in 1..NODE_COUNT {
             let k = NODES[n].kind;
@@ -973,5 +1015,56 @@ pub fn conventions_report() {
             crate::base::buf_write_fd(out, crate::base::STDERR);
             i += 2;
         }
+    }
+}
+
+// ---- The tools' printer of conventions (T2.a) ----
+
+// Whether the tools write 0.20's spelling: in any crate but the legacy one
+// (compiler/src during 0.20), which is written in 0.19's.
+pub fn new_spelling() -> bool {
+    unsafe { !crate::front::conv::LEGACY_ROOT }
+}
+
+// Type t as a tool writes it, into out: in 0.20's spelling an access is
+// `inout T` / `let T` (`T` alone as a parameter's, param), `&mut [T]`
+// `inout [T]`; in the legacy crate as the checker prints it (`&T`).
+pub fn put_type_conv(out: i64, t: i64, param: bool) {
+    let b = buf_new();
+    crate::front::types::buf_type(b, t);
+    if !new_spelling() {
+        buf_bytes(out, crate::base::buf_slice(b));
+        return;
+    }
+    put_type_text_conv(out, crate::base::buf_slice(b), param);
+}
+
+// A type's text in 0.19's spelling respelled in 0.20's (put_type_conv).
+pub fn put_type_text_conv(out: i64, s: [u8], param: bool) {
+    let mut i = 0;
+    while i < s.len {
+        if s[i] == '&' && i + 1 < s.len && s[i + 1] == '&' {
+            buf_bytes(out, if i == 0 && param { "let " } else { "let let " });
+            i += 2;
+            continue;
+        }
+        if s[i] == '&' {
+            let mut j = i + 1;
+            let mutable = j + 3 < s.len && s[j] == 'm' && s[j + 1] == 'u' && s[j + 2] == 't'
+                && s[j + 3] == ' ';
+            if mutable {
+                j += 4;
+            }
+            let slice = j < s.len && s[j] == '[';
+            if mutable {
+                buf_bytes(out, "inout ");
+            } else if !(i == 0 && param) && !slice {
+                buf_bytes(out, "let ");
+            }
+            i = j;
+            continue;
+        }
+        buf_bytes(out, s[i..i + 1]);
+        i += 1;
     }
 }
