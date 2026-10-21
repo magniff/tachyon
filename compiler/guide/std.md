@@ -54,7 +54,11 @@ parameter) goes only to constructors and `_in` functions; methods
 (`push`, `insert`, `clone`, `sort`) use the container's own. Not in
 std: `String` (text is `[u8]` and `Buf`), `Box`. (0.20)
 `std::collections::HashSet`: `insert` (false if present), `contains`,
-`remove`, `iter()`.
+`remove`, `iter()`. `BTreeMap<K, V>` and `BTreeSet<T>`
+(`std::BTreeMap`, `K: Ord`) keep their keys in order: `iter()` and
+`range(lo, hi)` (`[lo, hi)`; `range_inclusive`) go from the smallest,
+`next_back()` from the largest; `first_key_value`, `pop_first`,
+`pop_last`.
 
 @PAGE-END@ More, a section at a time: `tachyonc guide std#the-api` (every item, a line each), `std#overview` (ownership, views, HashMap), `std#input` (reading stdin), `std#heaps` (priority queues); one item: `tachyonc guide --find NAME`; all of it: `tachyonc guide std --whole`.
 
