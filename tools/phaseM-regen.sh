@@ -44,7 +44,7 @@ case "$COMPILER" in /*) ;; *) COMPILER="$(pwd)/$COMPILER" ;; esac
 cd "$ROOT" || exit 2
 
 # FILE  why it is held
-HELD='tests/refactor/values017.t a function value with *T parameters (by_count) against 0.20 std, FnMut(Stats, Stats): fix --values leaves it raw (0.20.1)'
+HELD=''
 
 LOG=$(mktemp -d "${TMPDIR:-/tmp}/phaseM-regen.XXXXXX")
 echo "phaseM-regen: logs in $LOG"

@@ -13,7 +13,7 @@
 ## by `fix --suggested`; what the fix keeps raw is wrapped in `unsafe` by
 ## `fix --only unsafe`, the second try: of the error.)
 $ fix --values --syntax=mixed
-fixed 5 parameters to &mut T, 3 parameters to &T, 1 slice parameter to &mut [T], 3 owned parameters to &T (only read), 8 arguments	main.tach	+20 -20 lines
+fixed 6 suggested fixes, 5 parameters to &mut T, 5 parameters to &T, 1 slice parameter to &mut [T], 3 owned parameters to &T (only read), 10 arguments	main.tach	+23 -23 lines
 % cat main.tach
 struct Stats { count: i64, sum: i64 }
 struct Inv { items: Vec<i64>, name: Buf }
@@ -85,17 +85,18 @@ fn set_via(pp: **i64, v: i64) {
     unsafe { **pp = v; }
 }
 
-fn by_rank(a: *Stats, b: *Stats) -> i64 { a.sum - b.sum }
+fn by_rank(a: &Stats, b: &Stats) -> i64 { a.sum - b.sum }
 
 fn ranked(v: &mut Vec<Stats>) {
-    sort_by(v.as_slice(), |a: *Stats, b: *Stats| a.count - b.count);
-    let f = unsafe { by_rank };
-    sort_by(v.as_slice(), f);
+    sort_by(v.as_mut_slice(), |a: &Stats, b: &Stats| a.count - b.count);
+    // (0.20: std's bound takes a copyable Stats itself, which a function
+    // value with `*Stats` parameters cannot be: called from a closure)
+    sort_by(v.as_mut_slice(), |a: &Stats, b: &Stats| by_rank(&*a, &*b));
 }
 $ fix --suggested --syntax=mixed
 note fix.none: nothing to fix
 $ fix --only unsafe --syntax=mixed
-fixed 1 unsafe block	main.tach	+1 -1 lines
+note fix.none: nothing to fix
 $ fix --values --syntax=mixed
 note fix.none: nothing to fix
 $ fix --only values --dry-run --syntax=mixed
@@ -103,7 +104,7 @@ note fix.none: nothing to fix
 ## (0.20) Then 0.20's spelling, `fix --only conventions` (its 0.19 input
 ## read --syntax=mixed): the chain 0.16 -> 0.19 -> 0.20 prints what 0.16 did.
 $ fix --only conventions --syntax=mixed
-fixed 5 parameters to let, 5 parameters to inout, 1 parameter to sink, 2 receivers, 7 '&mut e's to '&e', 5 '&e's to a let, 10 'let mut's / 'mut x's to var	main.tach	+32 -32 lines
+fixed 11 parameters to let, 5 parameters to inout, 1 parameter to sink, 2 receivers, 7 '&mut e's to '&e', 7 '&e's to a let, 2 '*r's of accesses, 10 'let mut's / 'mut x's to var	main.tach	+35 -35 lines
 $ main.tach -o prog
 ok: built prog
 % ./prog
