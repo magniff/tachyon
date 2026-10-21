@@ -1,0 +1,520 @@
+// wgslc: the WGSL shader compiler of docs/design/gpu.md §2.10 (0.22's
+// G4-G7), as a command-line program while std has no submodules.
+//
+//   wgslc check FILE...          the first error of each file, one line each
+//   wgslc ir FILE                the IR, as text
+//   wgslc msl FILE [-o OUT]      Metal Shading Language 3.0
+//   wgslc spv FILE -o OUT        SPIR-V 1.3 (binary)
+//   wgslc run FILE JOB           run a compute job on the CPU interpreter
+//   wgslc metal-job FILE JOB     the job for tests/wgsl/metalrun (MSL + slots)
+//   wgslc bench [-n N] [--target msl|spv|ir] [--no-checks] FILE...
+//   wgslc explain CODE           what a wgsl.* diagnostic means
+//
+// The compiler is std::gpu::wgsl (compiler/std/gpu/wgsl/); this is
+// its command line, and the runner of the tests' jobs.
+mod explain;
+
+use std::gpu::wgsl::{api, bounds, entry, interp, ir, job, msl, uniformity};
+use std::gpu::wgsl::api::fill_error;
+use std::gpu::wgsl::front::new_front;
+use std::gpu::wgsl::interp::new_interp;
+use std::gpu::wgsl::ir::V;
+use std::gpu::wgsl::job::{
+    Job, find_any_entry, find_entry, find_global, parse_job, print_buffers, print_words, texels,
+};
+
+use api::{
+    Options, ShaderError, TARGET_CHECK, TARGET_IR, TARGET_MSL, TARGET_SPIRV, new_error, options,
+};
+
+import "stdio.h" as c;
+import "string.h" as c;
+import "time.h" as c;
+
+fn usage() -> i32 {
+    eprintln("usage: wgslc check|ir|msl|spv FILE [-o OUT] | run FILE JOB | metal-job FILE JOB | bench [-n N] [--target msl|spv|ir] [--no-checks] FILE... | explain CODE");
+    2
+}
+
+// The bytes of a C string (an argv element).
+fn arg(argv: **u8, i: i64) -> [u8] { unsafe { argv[i][0..c::strlen(argv[i]) as i64] } }
+
+// The whole file, or None when it cannot be read.
+pub fn read_file(path: [u8], gpa: Gpa) -> Option<Buf> {
+    let mut cpath = Buf::new_in(gpa);
+    cpath.push_str(path);
+    cpath.push(0);
+    // stdio: a C boundary
+    let f = unsafe { c::fopen(cpath.as_slice().ptr, c"rb") };
+    if f == 0 as *c::FILE {
+        return None;
+    }
+    let mut b = Buf::new_in(gpa);
+    let mut chunk: [u8; 65536] = [0; 65536];
+    loop {
+        let n = unsafe { c::fread(&chunk[0], 1, 65536, f) } as i64;
+        if n <= 0 {
+            break;
+        }
+        b.push_str(chunk[0..n]);
+    }
+    unsafe { c::fclose(f) };
+    Some(b)
+}
+
+pub fn write_file(path: [u8], data: [u8], gpa: Gpa) -> bool {
+    let mut cpath = Buf::new_in(gpa);
+    cpath.push_str(path);
+    cpath.push(0);
+    let f = unsafe { c::fopen(cpath.as_slice().ptr, c"wb") };
+    if f == 0 as *c::FILE {
+        return false;
+    }
+    unsafe {
+        c::fwrite(data.ptr, 1, data.len as u64, f);
+        c::fclose(f);
+    }
+    true
+}
+
+// file:line:col: error CODE: message, then help: when there is one
+pub fn print_error(file: [u8], err: &ShaderError) {
+    eprintln(f"{file}:{err.line}:{err.col}: error {err.code}: {err.msg.as_slice()}");
+    if err.help.len() > 0 {
+        eprintln(f"help: {err.help.as_slice()}");
+    }
+    eprintln(f"try: wgslc explain {err.code}");
+}
+
+const REFLECT_TOO: bool = false;
+
+const KINDS: [[u8]; 7] = ["uniform", "storage", "read-only-storage", "texture", "storage-texture",
+    "sampler", "comparison-sampler"];
+
+pub fn print_reflection(refl: &api::Reflection, out: &mut Buf) {
+    for i in 0..refl.entries.len() {
+        let e = &refl.entries[i];
+        out.push_str(
+            f"entry {entry::stage_name(e.stage)} {e.name.as_slice()} msl {e.target_name.as_slice()}");
+        if e.stage == ir::STAGE_COMPUTE {
+            out.push_str(f" workgroup {e.workgroup[0]} {e.workgroup[1]} {e.workgroup[2]}");
+        }
+        if e.sizes_slot >= 0 {
+            out.push_str(f" sizes-slot {e.sizes_slot}");
+        }
+        out.push('\n');
+    }
+    for i in 0..refl.bindings.len() {
+        let b = &refl.bindings[i];
+        out.push_str(
+            f"binding {b.group} {b.binding} {KINDS[b.kind as i64]} min-size {b.min_size} slots {b.slots[0]} {b.slots[1]} {b.slots[2]}\n");
+    }
+    for i in 0..refl.inputs.len() {
+        let v = &refl.inputs[i];
+        out.push_str(f"input {v.location} {ir::scalar_name(v.scalar)} x{v.components}\n");
+    }
+    for i in 0..refl.sizes.len() {
+        let b = &refl.bindings[refl.sizes[i]];
+        out.push_str(f"sizes {i} = binding {b.group} {b.binding}\n");
+    }
+}
+
+fn now_ns() -> i64 {
+    let mut ts = c::timespec { tv_sec: 0, tv_nsec: 0 };
+    // C11's clock (a C boundary)
+    unsafe { c::timespec_get(&ts, c::TIME_UTC) };
+    ts.tv_sec * 1000000000 + ts.tv_nsec
+}
+
+fn translate_file(path: [u8], opts: Options, out: &mut Buf, gpa: Gpa) -> bool {
+    let src = match read_file(path, gpa) {
+        Some(b) => b,
+        None => {
+            eprintln(f"error wgslc.read: cannot read '{path}'");
+            return false;
+        }
+    };
+    let mut err = new_error(gpa);
+    defer err.free();
+    let mut refl = api::new_reflection(gpa);
+    let ok = api::translate(src.as_slice(), opts, out, &mut refl, &mut err, gpa);
+    if ok && opts.target == TARGET_MSL && REFLECT_TOO {
+        print_reflection(&refl, out);
+    }
+    if !ok {
+        print_error(path, &mut err);
+    }
+    ok
+}
+
+fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
+    if argc < 3 {
+        if argc == 2 && arg(argv, 1) == "--help" {
+            usage();
+            return 0;
+        }
+        return usage();
+    }
+    let cmd = arg(argv, 1);
+    if cmd == "explain" {
+        return explain::explain(arg(argv, 2));
+    }
+    if cmd == "check" {
+        let mut status = 0;
+        for i in 2..argc as i64 {
+            let mut out = Buf::new_in(gpa);
+            if !translate_file(arg(argv, i), options(TARGET_CHECK), &mut out, gpa) {
+                status = 1;
+            }
+        }
+        return status as i32;
+    }
+    if cmd == "reflect" {
+        // the MSL's reflection, as text (the MSL itself is not printed)
+        let mut out = Buf::new_in(gpa);
+        let mut refl = api::new_reflection(gpa);
+        let src = match read_file(arg(argv, 2), gpa) {
+            Some(b) => b,
+            None => {
+                eprintln(f"error wgslc.read: cannot read '{arg(argv, 2)}'");
+                return 2;
+            }
+        };
+        let mut err = new_error(gpa);
+        if !api::translate(src.as_slice(), options(TARGET_MSL), &mut out, &mut refl, &mut err,
+            gpa) {
+            print_error(arg(argv, 2), &err);
+            return 1;
+        }
+        let mut text = Buf::new_in(gpa);
+        print_reflection(&refl, &mut text);
+        print(text.as_slice());
+        return 0;
+    }
+    if cmd == "ir" || cmd == "msl" || cmd == "spv" {
+        let target = if cmd == "ir" { TARGET_IR } else if cmd == "msl" { TARGET_MSL }
+            else { TARGET_SPIRV };
+        let mut file: [u8] = "";
+        let mut outp: [u8] = "";
+        let mut opts = options(target);
+        let mut i = 2;
+        while i < argc as i64 {
+            let a = arg(argv, i);
+            if a == "-o" && i + 1 < argc as i64 {
+                outp = arg(argv, i + 1);
+                i += 2;
+                continue;
+            }
+            if a == "--no-checks" {
+                opts.no_checks = true;
+            } else if a == "--no-prove" {
+                opts.prove = false;
+            } else {
+                file = a;
+            }
+            i += 1;
+        }
+        let mut out = Buf::new_in(gpa);
+        if !translate_file(file, opts, &mut out, gpa) {
+            return 1;
+        }
+        if outp.len == 0 {
+            if target == TARGET_SPIRV {
+                eprintln("error wgslc.output: SPIR-V is binary: give '-o FILE'");
+                return 2;
+            }
+            print(out.as_slice());
+            return 0;
+        }
+        if !write_file(outp, out.as_slice(), gpa) {
+            eprintln(f"error wgslc.write: cannot write '{outp}'");
+            return 1;
+        }
+        return 0;
+    }
+    if cmd == "run" || cmd == "metal-job" {
+        if argc < 4 {
+            return usage();
+        }
+        return command(cmd == "run", arg(argv, 2), arg(argv, 3), gpa);
+    }
+    if cmd == "bench" {
+        return bench(argc, argv, gpa);
+    }
+    if cmd == "compare" && argc >= 4 {
+        let mut ulp = 0;
+        if argc >= 6 && arg(argv, 4) == "--ulp" {
+            ulp = parse_int(arg(argv, 5)).unwrap_or(0);
+        }
+        return compare(arg(argv, 2), arg(argv, 3), ulp, gpa);
+    }
+    usage()
+}
+
+// Two outputs of `run` (or metalrun): the same words, or (ulp > 0) words
+// that as f32 are within ulp units in the last place. Prints the first
+// differences.
+fn compare(a: [u8], b: [u8], ulp: i64, gpa: Gpa) -> i32 {
+    let ta = match read_file(a, gpa) {
+        Some(t) => t,
+        None => {
+            eprintln(f"error wgslc.read: cannot read '{a}'");
+            return 2;
+        }
+    };
+    let tb = match read_file(b, gpa) {
+        Some(t) => t,
+        None => {
+            eprintln(f"error wgslc.read: cannot read '{b}'");
+            return 2;
+        }
+    };
+    let wa = split_whitespace_in(ta.as_slice(), gpa);
+    let wb = split_whitespace_in(tb.as_slice(), gpa);
+    if wa.len() != wb.len() {
+        eprintln(f"outputs differ in length: {wa.len()} and {wb.len()} words");
+        return 1;
+    }
+    let mut bad = 0;
+    let mut buffer: [u8] = "";
+    let mut index = 0;
+    let mut i = 0;
+    while i < wa.len() {
+        if wa[i] == "buffer" {
+            buffer = wa[i + 2];
+            index = 0;
+            i += 3;
+            continue;
+        }
+        if wa[i] != wb[i] {
+            let x = parse_hex(wa[i]);
+            let y = parse_hex(wb[i]);
+            if ulp == 0 || x < 0 || y < 0 || ulp_distance(x, y) > ulp {
+                if bad < 10 {
+                    eprintln(f"binding {buffer} word {index}: {wa[i]} and {wb[i]}");
+                }
+                bad += 1;
+            }
+        }
+        index += 1;
+        i += 1;
+    }
+    if bad > 0 {
+        eprintln(f"{bad} words differ");
+        return 1;
+    }
+    0
+}
+
+fn parse_hex(s: [u8]) -> i64 {
+    let mut v = 0;
+    for i in 0..s.len {
+        let c = s[i];
+        let d = if c >= '0' && c <= '9' { c - '0' } else if c >= 'a' && c <= 'f' { c - 'a' + 10 }
+            else { return -1; };
+        v = v * 16 + d as i64;
+    }
+    v
+}
+
+// The distance of two f32 bit patterns in units in the last place (NaNs
+// equal each other only).
+fn ulp_distance(x: i64, y: i64) -> i64 {
+    let xn = (x & 0x7f800000) == 0x7f800000 && (x & 0x7fffff) != 0;
+    let yn = (y & 0x7f800000) == 0x7f800000 && (y & 0x7fffff) != 0;
+    if xn || yn {
+        return if xn && yn { 0 } else { 1 << 40 };
+    }
+    // as a line of integers: negative floats below positive ones
+    let ox = if x >= 0x80000000 { 0x80000000 - x } else { x };
+    let oy = if y >= 0x80000000 { 0x80000000 - y } else { y };
+    if ox > oy { ox - oy } else { oy - ox }
+}
+
+// Translates each file N times; prints the median time per file.
+fn bench(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
+    let mut n = 200;
+    let mut opts = options(TARGET_MSL);
+    let mut files: Vec<[u8]> = Vec::new_in(gpa);
+    let mut i = 2;
+    while i < argc as i64 {
+        let a = arg(argv, i);
+        if a == "-n" && i + 1 < argc as i64 {
+            n = parse_int(arg(argv, i + 1)).unwrap_or(200);
+            i += 2;
+            continue;
+        }
+        if a == "--target" && i + 1 < argc as i64 {
+            let t = arg(argv, i + 1);
+            opts.target = if t == "spv" { TARGET_SPIRV } else if t == "ir" { TARGET_CHECK }
+                else { TARGET_MSL };
+            i += 2;
+            continue;
+        }
+        if a == "--no-checks" {
+            opts.no_checks = true;
+        } else {
+            files.push(a);
+        }
+        i += 1;
+    }
+    let mut total = 0;
+    for k in 0..files.len() {
+        let src = match read_file(files[k], gpa) {
+            Some(b) => b,
+            None => {
+                eprintln(f"error wgslc.read: cannot read '{files[k]}'");
+                return 1;
+            }
+        };
+        let mut times: Vec<i64> = Vec::new_in(gpa);
+        let mut out = Buf::new_in(gpa);
+        let mut err = new_error(gpa);
+        defer err.free();
+        let mut bytes = 0;
+        for _ in 0..n {
+            out.clear();
+            let t0 = now_ns();
+            let mut refl = api::new_reflection(gpa);
+            if !api::translate(src.as_slice(), opts, &mut out, &mut refl, &mut err, gpa) {
+                print_error(files[k], &mut err);
+                return 1;
+            }
+            times.push(now_ns() - t0);
+            bytes = out.len();
+        }
+        times.sort();
+        let med = times[times.len() / 2];
+        total += med;
+        println(
+            f"{files[k]}\t{src.len()} bytes in\t{bytes} bytes out\tmedian {med / 1000}.{(med % 1000) / 100} us");
+    }
+    println(f"total (sum of medians)\t{total / 1000}.{(total % 1000) / 100} us");
+    0
+}
+
+// Runs a job: on the interpreter, or (metal-job) as the input of
+// tests/wgsl/metalrun.
+pub fn command(interp: bool, file: [u8], job_path: [u8], gpa: Gpa) -> i32 {
+    let src = match read_file(file, gpa) {
+        Some(b) => b,
+        None => {
+            eprintln(f"error wgslc.read: cannot read '{file}'");
+            return 2;
+        }
+    };
+    let compile_only = !interp && job_path == "-";
+    let jtext = if compile_only { Some(Buf::new_in(gpa)) } else { read_file(job_path, gpa) };
+    let jtext = match jtext {
+        Some(b) => b,
+        None => {
+            eprintln(f"error wgslc.read: cannot read '{job_path}'");
+            return 2;
+        }
+    };
+    let mut out = Buf::new_in(gpa);
+    defer out.free();
+    let mut err = new_error(gpa);
+    defer err.free();
+    let status = arena_scope(gpa, |a| -> i64 {
+        let mut fr = new_front(src.as_slice(), a);
+        fr.module();
+        if !fr.failed {
+            uniformity::check(&mut fr);
+        }
+        if fr.failed {
+            fill_error(&fr, &mut err);
+            return 1;
+        }
+        bounds::insert_checks(&mut fr.m, a, true);
+        if compile_only {
+            msl::metal_compile_job(&fr.m, a, &mut out);
+            return 0;
+        }
+        let mut jerr = Buf::new_in(a);
+        let job = match parse_job(jtext.as_slice(), a, &mut jerr) {
+            Some(j) => j,
+            None => {
+                out.push_str(f"error wgslc.job: {jerr.as_slice()}\n");
+                return 3;
+            }
+        };
+        let ei = if job.call_n >= 0 { find_any_entry(&fr.m, job.entry) }
+            else { find_entry(&fr.m, job.entry) };
+        if ei < 0 {
+            out.push_str("error wgslc.job: no such compute entry point\n");
+            return 3;
+        }
+        for i in 0..job.buffers.len() {
+            let b = &job.buffers[i];
+            if find_global(&fr.m, b.group, b.binding) < 0 {
+                out.push_str(
+                    f"error wgslc.job: nothing is bound at @group({b.group}) @binding({b.binding})\n");
+                return 3;
+            }
+        }
+        if interp {
+            let mut it = new_interp(&fr.m, a);
+            for i in 0..job.buffers.len() {
+                let b = &job.buffers[i];
+                let g = find_global(&fr.m, b.group, b.binding);
+                it.set_buffer(g, b.words.as_slice());
+            }
+            for i in 0..job.textures.len() {
+                let t = &job.textures[i];
+                let g = find_global(&fr.m, t.group, t.binding);
+                if g < 0 {
+                    out.push_str(
+                        f"error wgslc.job: no texture at @group({t.group}) @binding({t.binding})\n");
+                    return 3;
+                }
+                let tx = texels(t, a);
+                it.set_texture(g, t.w, t.h, tx.as_slice());
+            }
+            if job.call_n >= 0 {
+                let fh = fr.m.entries[ei].func;
+                let in_stride = ir::record_offsets(&fr.m, fh, a)[fr.m.functions[fh].params.len()];
+                let rt = fr.m.functions[fh].result;
+                let out_stride = if rt >= 0 { ir::stride_of(&fr.m, rt) } else { 4 };
+                let mut res: V<u32> = Vec::new_in(a);
+                if !it.call(&fr.m, ei, job.input.as_slice(), in_stride, job.call_n, &mut res,
+                    out_stride) {
+                    out.push_str(f"error wgslc.interp: {it.err.as_slice()}\n");
+                    return 4;
+                }
+                let mut idx: V<i64> = Vec::new_in(a);
+                for i in 0..job.buffers.len() {
+                    let b = &job.buffers[i];
+                    idx.push(find_global(&fr.m, b.group, b.binding));
+                }
+                print_buffers(&job, &it.bufs, &idx, &mut out);
+                print_words(-1, &job.input, &mut out);
+                print_words(-2, &res, &mut out);
+                return 0;
+            }
+            if !it.dispatch(&fr.m, ei, job.groups) {
+                out.push_str(f"error wgslc.interp: {it.err.as_slice()}\n");
+                return 4;
+            }
+            let mut idx: V<i64> = Vec::new_in(a);
+            for i in 0..job.buffers.len() {
+                let b = &job.buffers[i];
+                idx.push(find_global(&fr.m, b.group, b.binding));
+            }
+            print_buffers(&job, &it.bufs, &idx, &mut out);
+            return 0;
+        }
+        msl::metal_job(&fr.m, a, ei, &job, &mut out);
+        0
+    });
+    if status == 1 {
+        print_error(file, &mut err);
+        return 1;
+    }
+    if status != 0 {
+        eprint(out.as_slice());
+        return status as i32;
+    }
+    print(out.as_slice());
+    0
+}

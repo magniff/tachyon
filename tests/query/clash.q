@@ -32,6 +32,7 @@ $ def --exact helper
 error query.no-match: no definition 'helper'
 try: tachyonc query def crate::a::helper
 try: tachyonc query def crate::b::helper
+try: tachyonc query def std::gpu::wgsl::msl::helpers
 [exit 1]
 $ def --exact crate::a::helper
 crate::a::helper	clash/a.tach:2:8	fn	pub fn helper() -> i64	effects: none
@@ -142,7 +143,7 @@ std::unicode::GraphemeState::push	../../compiler/std/unicode/mod.tach:167:12	met
 std::unicode::ClusterWidth::push	../../compiler/std/unicode/mod.tach:396:12	method	pub fn push(inout self, cp: u32, p: u16)	effects: none
 $ refs Vec::push --count
 2	crate::myvec::Vec::push
-25	std::Vec::push
+141	std::Vec::push
 $ callers crate::myvec::Vec::push
 # clash/main.tach
 40:10	call	main	mine.push(v.len());
@@ -397,6 +398,7 @@ $ def helpr
 error query.no-match: no definition 'helpr'
 try: tachyonc query def crate::a::helper
 try: tachyonc query def crate::b::helper
+try: tachyonc query def std::gpu::wgsl::api::ShaderError.help
 [exit 1]
 $ refs MyVec
 # clash/main.tach

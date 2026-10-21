@@ -1,0 +1,1391 @@
+// ---- Shader compiler implementation, expr (0.22) ----
+// Expressions: WGSL's grammar, the Load Rule, abstract numbers and their
+// conversions, constant folding, operators and their types, indexing and
+// member access. Calls and constructors are in builtins.tach.
+
+use front::{
+    Front, ScopeEntry, VK_CONST, VK_REF, VK_TYPE, VK_VALUE, VK_VOID, Val, cfloat, cint, val,
+};
+use ir::{
+    E_ACCESS, E_ACCESS_INDEX, E_BINARY, E_CONVERT, E_LITERAL, E_LOAD, E_SPLAT, E_SWIZZLE, E_UNARY,
+    E_ZERO, OP_ADD, OP_AND, OP_DIV, OP_EQ, OP_GE, OP_GT, OP_LAND, OP_LE, OP_LOR, OP_LT, OP_MOD,
+    OP_MUL, OP_NE, OP_OR, OP_SHL, OP_SHR, OP_SUB, OP_XOR, SK_AFLOAT, SK_AINT, SK_BOOL, SK_F32,
+    SK_I32, SK_U32, SP_FUNCTION, S_IF, S_STORE, TK_ARRAY, TK_MATRIX, TK_POINTER, TK_SCALAR,
+    TK_STRUCT, TK_VECTOR, T_BOOL, T_F32, T_I32, T_U32, UN_BITNOT, UN_NEG, UN_NOT, f32_bits, mat_ty,
+    vec_ty,
+};
+use lex::{
+    T_AMP, T_ANDAND, T_BANG, T_CARET, T_DOT, T_EQEQ, T_FLOAT, T_GE, T_GT, T_IDENT, T_INT,
+    T_LBRACKET, T_LE, T_LPAREN, T_LT, T_MINUS, T_NE, T_OROR, T_PERCENT, T_PIPE, T_PLUS, T_RBRACKET,
+    T_RPAREN, T_SHL, T_SHR, T_SLASH, T_STAR, T_TILDE,
+};
+use names::{K_FALSE, K_TRUE};
+
+const I32_MIN: i64 = -2147483648;
+const I32_MAX: i64 = 2147483647;
+const U32_MAX: i64 = 4294967295;
+const F32_MAX: f64 = 340282346638528859811704183484516925440.0;
+
+impl Front {
+    pub fn parse_expr(inout self) -> Val { self.parse_expr_hint(-1) }
+
+    // An expression; `hint` (a type or -1) is the type the context
+    // expects, which an inferred constructor of abstract numbers takes.
+    pub fn parse_expr_hint(inout self, hint: i64) -> Val {
+        let saved = self.hint;
+        self.hint = hint;
+        let at = self.pos();
+        let l = self.parse_relational();
+        let k = self.kind();
+        if k != T_ANDAND && k != T_OROR {
+            self.hint = saved;
+            return l;
+        }
+        var acc = l;
+        while self.kind() == k {
+            let op_at = self.pos();
+            self.p += 1;
+            acc = self.short_circuit(k == T_ANDAND, acc, op_at);
+        }
+        let k2 = self.kind();
+        if k2 == T_ANDAND || k2 == T_OROR {
+            self.fail(self.pos(), "wgsl.syntax", "mixing '&&' and '||' needs parentheses");
+        }
+        let _ = at;
+        self.hint = saved;
+        acc
+    }
+
+    // `l && r` or `l || r`: r is evaluated only when needed. Without
+    // effects in r this is a plain operator; else it is an `if` writing a
+    // temporary variable.
+    fn short_circuit(inout self, and: bool, l: Val, at: i64) -> Val {
+        let lc = self.concrete_type_of(l);
+        if lc != T_BOOL {
+            self.bad_operands(if and { "&&" } else { "||" }, l, l, at);
+            return cint(SK_BOOL, T_BOOL, 0);
+        }
+        if l.k == VK_CONST {
+            // a constant left side decides
+            let r = self.parse_relational();
+            if self.concrete_type_of(r) != T_BOOL {
+                self.bad_operands(if and { "&&" } else { "||" }, l, r, at);
+                return l;
+            }
+            if and && l.iv == 0 {
+                return l;
+            }
+            if !and && l.iv != 0 {
+                return l;
+            }
+            return self.value(r, at);
+        }
+        let le = self.materialize(l, T_BOOL, at);
+        self.flush();
+        let before = self.pending.len();
+        let rp = self.pos();
+        let r = self.parse_relational();
+        if self.concrete_type_of(r) != T_BOOL {
+            self.bad_operands(if and { "&&" } else { "||" }, l, r, at);
+            return l;
+        }
+        let re = self.materialize(r, T_BOOL, rp);
+        if self.pending.len() == before {
+            let e = self.f.expr(E_BINARY, T_BOOL, if and { OP_LAND } else { OP_LOR }, le, re);
+            return val(e, T_BOOL);
+        }
+        // r made statements (calls): t = l; if (l == and) { r's statements; t = r }
+        self.flush();
+        let lt = self.f.locals.len();
+        self.f.locals.push(ir::Local { name: "", ty: T_BOOL });
+        let pty = self.m.ptr_ty(T_BOOL, SP_FUNCTION, ir::ACC_RW);
+        let tv = self.f.expr(ir::E_LOCAL, pty, lt, 0, 0);
+        let st = self.f.stmt(S_STORE, tv, re, 0, 0);
+        self.pending.push(st);
+        let inner = self.f.block_of(&self.pending, before);
+        let empty = self.f.empty_block();
+        let st0 = self.f.stmt(S_STORE, tv, le, 0, 0);
+        self.pending.push(st0);
+        if and {
+            self.push_stmt(S_IF, le, inner, empty, 0);
+        } else {
+            self.push_stmt(S_IF, le, empty, inner, 0);
+        }
+        let e = self.f.expr(E_LOAD, T_BOOL, tv, 0, 0);
+        val(e, T_BOOL)
+    }
+
+    fn parse_relational(inout self) -> Val {
+        let l = self.parse_shift();
+        let k = self.kind();
+        var op = -1;
+        if k == T_LT {
+            op = OP_LT;
+        } else if k == T_LE {
+            op = OP_LE;
+        } else if k == T_GT {
+            op = OP_GT;
+        } else if k == T_GE {
+            op = OP_GE;
+        } else if k == T_EQEQ {
+            op = OP_EQ;
+        } else if k == T_NE {
+            op = OP_NE;
+        }
+        if op < 0 {
+            return l;
+        }
+        let at = self.pos();
+        self.p += 1;
+        let r = self.parse_shift();
+        let v = self.binary(op, l, r, at);
+        let k2 = self.kind();
+        if k2 == T_LT || k2 == T_LE || k2 == T_GT || k2 == T_GE || k2 == T_EQEQ || k2 == T_NE {
+            self.fail(self.pos(), "wgsl.syntax", "comparisons do not chain: 'a < b && b < c'");
+        }
+        v
+    }
+
+    // A shift, a bitwise expression, or an additive one.
+    pub fn parse_shift(inout self) -> Val {
+        let u = self.parse_unary();
+        let k = self.kind();
+        if k == T_SHL || k == T_SHR {
+            let at = self.pos();
+            self.p += 1;
+            let r = self.parse_unary();
+            return self.binary(if k == T_SHL { OP_SHL } else { OP_SHR }, u, r, at);
+        }
+        if k == T_AMP || k == T_PIPE || k == T_CARET {
+            let op = if k == T_AMP { OP_AND } else if k == T_PIPE { OP_OR } else { OP_XOR };
+            var acc = u;
+            while self.kind() == k {
+                let at = self.pos();
+                self.p += 1;
+                let r = self.parse_unary();
+                acc = self.binary(op, acc, r, at);
+            }
+            let k2 = self.kind();
+            if k2 == T_AMP || k2 == T_PIPE || k2 == T_CARET || k2 == T_PLUS || k2 == T_MINUS
+                || k2 == T_STAR || k2 == T_SLASH || k2 == T_PERCENT {
+                self.fail(self.pos(), "wgsl.syntax",
+                    "mixing bitwise operators with other operators needs parentheses");
+            }
+            return acc;
+        }
+        var l = self.parse_mult_from(u);
+        while self.kind() == T_PLUS || self.kind() == T_MINUS {
+            let op = if self.kind() == T_PLUS { OP_ADD } else { OP_SUB };
+            let at = self.pos();
+            self.p += 1;
+            let r0 = self.parse_unary();
+            let r = self.parse_mult_from(r0);
+            l = self.binary(op, l, r, at);
+        }
+        let k3 = self.kind();
+        if k3 == T_AMP || k3 == T_PIPE || k3 == T_CARET || k3 == T_SHL || k3 == T_SHR {
+            self.fail(self.pos(), "wgsl.syntax",
+                "mixing bitwise or shift operators with arithmetic needs parentheses");
+        }
+        l
+    }
+
+    fn parse_mult_from(inout self, u: Val) -> Val {
+        var l = u;
+        loop {
+            let k = self.kind();
+            let op = if k == T_STAR {
+                OP_MUL
+            } else if k == T_SLASH {
+                OP_DIV
+            } else if k == T_PERCENT {
+                OP_MOD
+            } else {
+                return l;
+            };
+            let at = self.pos();
+            self.p += 1;
+            let r = self.parse_unary();
+            l = self.binary(op, l, r, at);
+        }
+    }
+
+    // A statement's left side or call: a unary expression; remembers
+    // whether it ended in a user call.
+    pub fn parse_unary_for_stmt(inout self) -> Val {
+        self.last_call_end = -1;
+        let v = self.parse_unary();
+        if self.last_call_end != self.p {
+            self.last_was_call = false;
+        } else {
+            self.last_was_call = true;
+        }
+        v
+    }
+
+    pub fn parse_unary(inout self) -> Val {
+        let at = self.pos();
+        let k = self.kind();
+        if k == T_MINUS {
+            self.p += 1;
+            let v = self.parse_unary();
+            return self.unary(UN_NEG, v, at);
+        }
+        if k == T_BANG {
+            self.p += 1;
+            let v = self.parse_unary();
+            return self.unary(UN_NOT, v, at);
+        }
+        if k == T_TILDE {
+            self.p += 1;
+            let v = self.parse_unary();
+            return self.unary(UN_BITNOT, v, at);
+        }
+        if k == T_STAR {
+            self.p += 1;
+            let v = self.parse_unary();
+            let pv = self.value(v, at);
+            if pv.k != VK_VALUE || self.m.types[pv.ty].kind != TK_POINTER {
+                if self.err(at, "wgsl.type") {
+                    self.emsg.push_str("'*' dereferences a pointer, not ");
+                    self.val_str(v);
+                }
+                return cint(SK_AINT, -1, 0);
+            }
+            return Val { k: VK_REF, sk: 0, e: pv.e, ty: pv.ty, iv: 0, fv: 0.0 };
+        }
+        if k == T_AMP {
+            self.p += 1;
+            let v = self.parse_unary();
+            if v.k != VK_REF {
+                if self.err(at, "wgsl.type") {
+                    self.emsg.push_str("'&' takes the address of a variable (or a member or element of one), not of ");
+                    self.val_str(v);
+                }
+                return cint(SK_AINT, -1, 0);
+            }
+            if self.m.types[self.f.exprs[v.e].ty].kind == TK_POINTER
+                && self.f.exprs[v.e].op == ir::E_ACCESS_INDEX && self.is_vector_component(v.e) {
+                self.fail(at, "wgsl.type", "cannot take the address of a vector component");
+            }
+            return val(v.e, v.ty);
+        }
+        let p = self.parse_primary();
+        self.parse_postfix(p)
+    }
+
+    fn is_vector_component(self, e: i64) -> bool {
+        let base = self.f.exprs[e].a;
+        let bt = self.m.pointee(self.f.exprs[base].ty);
+        bt >= 0 && self.m.types[bt].kind == TK_VECTOR
+    }
+
+    fn parse_postfix(inout self, v0: Val) -> Val {
+        var v = v0;
+        loop {
+            let k = self.kind();
+            if k == T_LBRACKET {
+                let at = self.pos();
+                self.p += 1;
+                let ip = self.pos();
+                let i = self.parse_expr();
+                self.expect(T_RBRACKET);
+                v = self.index(v, i, at, ip);
+            } else if k == T_DOT {
+                self.p += 1;
+                let at = self.pos();
+                if self.kind() != T_IDENT {
+                    self.expect(T_IDENT);
+                    return v;
+                }
+                let name = self.text(self.p);
+                self.p += 1;
+                v = self.member(v, name, at);
+            } else {
+                return v;
+            }
+        }
+    }
+
+    // ---- Primaries ----
+
+    fn parse_primary(inout self) -> Val {
+        let at = self.pos();
+        let k = self.kind();
+        let hint = self.hint;
+        self.hint = -1;
+        if k == T_INT {
+            return self.int_literal(self.p);
+        }
+        if k == T_FLOAT {
+            return self.float_literal(self.p);
+        }
+        if k == T_LPAREN {
+            self.p += 1;
+            let v = self.parse_expr_hint(hint);
+            self.expect(T_RPAREN);
+            return v;
+        }
+        if k != T_IDENT {
+            if self.err(at, "wgsl.syntax") {
+                self.emsg.push_str("expected an expression, got ");
+                self.emsg.push_str(lex::token_text(k));
+            }
+            return cint(SK_AINT, -1, 0);
+        }
+        let s = self.tk.syms[self.p];
+        if s == K_TRUE || s == K_FALSE {
+            self.p += 1;
+            return cint(SK_BOOL, T_BOOL, if s == K_TRUE { 1 } else { 0 });
+        }
+        // local names
+        let li = self.lookup_name(s);
+        if li >= 0 {
+            self.p += 1;
+            let ent = self.scopes[li];
+            if self.kind() == T_LPAREN {
+                if self.err(at, "wgsl.call") {
+                    self.emsg.push_fmt(f"'{self.name_of(s)}' is a value, not a function");
+                }
+            }
+            return ent.v;
+        }
+        // module-scope names
+        if self.decl_of[s] >= 0 {
+            let d = self.decl_of[s];
+            let kind = self.decls[d].kind;
+            if kind == front::D_CONST {
+                self.p += 1;
+                if self.decls[d].has_cv {
+                    return self.decls[d].cv;
+                }
+                let saved = self.p;
+                let v = self.const_value(d);
+                self.p = saved;
+                return v;
+            }
+            if kind == front::D_VAR {
+                self.p += 1;
+                let g = self.decls[d].h;
+                if g < 0 {
+                    // a global used by another module-scope declaration
+                    if self.err(at, "wgsl.name") {
+                        self.emsg.push_fmt(
+                            f"'{self.name_of(s)}' is a variable; a module-scope declaration cannot use it");
+                    }
+                    return cint(SK_AINT, -1, 0);
+                }
+                if self.fh < 0 {
+                    if self.err(at, "wgsl.type") {
+                        self.emsg.push_fmt(
+                            f"'{self.name_of(s)}' is a variable; a constant expression cannot read it");
+                    }
+                    return cint(SK_AINT, -1, 0);
+                }
+                let e = self.global_expr(g);
+                let ty = self.f.exprs[e].ty;
+                if self.m.globals[g].space == ir::SP_HANDLE {
+                    return val(e, ty);
+                }
+                return Val { k: VK_REF, sk: 0, e: e, ty: ty, iv: 0, fv: 0.0 };
+            }
+            if kind == front::D_FN {
+                self.p += 1;
+                if self.kind() != T_LPAREN {
+                    if self.err(at, "wgsl.type") {
+                        self.emsg.push_fmt(
+                            f"'{self.name_of(s)}' is a function: call it, '{self.name_of(s)}(...)'");
+                    }
+                    return cint(SK_AINT, -1, 0);
+                }
+                return self.user_call(self.decls[d].h, at);
+            }
+            // a struct or alias: a constructor
+            let ty = self.parse_type();
+            return self.construct(ty, at);
+        }
+        self.builtin_primary(s, at, hint)
+    }
+
+    pub fn lookup_name(self, s: i64) -> i64 {
+        var i = self.scopes.len() - 1;
+        while i >= self.scope_floor {
+            if self.scopes[i].sym == s {
+                return i;
+            }
+            i -= 1;
+        }
+        -1
+    }
+
+    // ---- Literals ----
+
+    fn int_literal(inout self, t: i64) -> Val {
+        let s = self.text(t);
+        let at = self.pos();
+        self.p += 1;
+        var end = s.len;
+        let last = s[end - 1];
+        var sk = SK_AINT;
+        if last == 'i' {
+            sk = SK_I32;
+            end -= 1;
+        } else if last == 'u' {
+            sk = SK_U32;
+            end -= 1;
+        }
+        var v: i64 = 0;
+        var overflow = false;
+        if end > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+            for i in 2..end {
+                let c = s[i];
+                let d = if c >= '0' && c <= '9' { c - '0' }
+                    else if c >= 'a' && c <= 'f' { c - 'a' + 10 } else { c - 'A' + 10 };
+                if v > 576460752303423487 {
+                    overflow = true;
+                }
+                v = v * 16 + d as i64;
+            }
+        } else {
+            if end > 1 && s[0] == '0' {
+                self.fail(at, "wgsl.syntax", "a decimal integer does not start with 0");
+                return cint(SK_AINT, -1, 0);
+            }
+            for i in 0..end {
+                let d = (s[i] - '0') as i64;
+                if v > 922337203685477580 || (v == 922337203685477580 && d > 7) {
+                    overflow = true;
+                }
+                v = v * 10 + d;
+            }
+        }
+        if overflow {
+            self.fail(at, "wgsl.const", "this integer does not fit in 64 bits");
+            return cint(SK_AINT, -1, 0);
+        }
+        if sk == SK_I32 && v > I32_MAX {
+            self.fail(at, "wgsl.const", "this i32 literal is above 2147483647");
+            self.help("negate a smaller literal, or use an abstract integer: -2147483648");
+            return cint(SK_I32, T_I32, 0);
+        }
+        if sk == SK_U32 && v > U32_MAX {
+            self.fail(at, "wgsl.const", "this u32 literal is above 4294967295");
+            return cint(SK_U32, T_U32, 0);
+        }
+        let ty = if sk == SK_I32 { T_I32 } else if sk == SK_U32 { T_U32 } else { -1 };
+        cint(sk, ty, v)
+    }
+
+    fn float_literal(inout self, t: i64) -> Val {
+        let s = self.text(t);
+        let at = self.pos();
+        self.p += 1;
+        var end = s.len;
+        var sk = SK_AFLOAT;
+        let last = s[end - 1];
+        let hex = s.len > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X');
+        if last == 'h' {
+            self.fail(at, "wgsl.unsupported",
+                "'f16' literals are not in the WGSL subset of this release");
+            return cfloat(SK_F32, T_F32, 0.0);
+        }
+        if last == 'f' && !hex {
+            sk = SK_F32;
+            end -= 1;
+        } else if last == 'f' && hex && s.len > 2 {
+            // hex floats end in f only after an exponent
+            var has_p = false;
+            for i in 0..s.len {
+                if s[i] == 'p' || s[i] == 'P' {
+                    has_p = true;
+                }
+            }
+            if has_p {
+                sk = SK_F32;
+                end -= 1;
+            }
+        }
+        let v = if hex { hex_float(s[0..end]) }
+            else { std::num::parse_f64(s[0..end]).unwrap_or(0.0) };
+        if sk == SK_F32 {
+            let f = v as f32;
+            if f as f64 > F32_MAX || -(f as f64) > F32_MAX {
+                self.fail(at, "wgsl.const", "this f32 literal is out of range");
+            }
+            return cfloat(SK_F32, T_F32, f as f64);
+        }
+        cfloat(SK_AFLOAT, -1, v)
+    }
+
+    // ---- The Load Rule and conversions ----
+
+    // A value: a reference is read (E_LOAD).
+    pub fn value(inout self, v: Val, at: i64) -> Val {
+        if v.k == VK_REF {
+            let t = self.m.pointee(v.ty);
+            if self.m.has_atomic(t) {
+                self.fail(at, "wgsl.type", "an atomic is read with atomicLoad");
+                return cint(SK_AINT, -1, 0);
+            }
+            if self.m.is_runtime_sized(t) {
+                self.fail(at, "wgsl.type", "a runtime-sized array cannot be read whole; index it");
+                return cint(SK_AINT, -1, 0);
+            }
+            let e = self.f.expr(E_LOAD, t, v.e, 0, 0);
+            return val(e, t);
+        }
+        if v.k == VK_VOID {
+            self.fail(at, "wgsl.type", "this call has no result to use");
+            return cint(SK_AINT, -1, 0);
+        }
+        if v.k == VK_TYPE {
+            self.fail(at, "wgsl.type", "a type is not a value");
+            return cint(SK_AINT, -1, 0);
+        }
+        v
+    }
+
+    // The type v has once concrete (abstract ints become i32, floats f32).
+    pub fn concrete_type_of(self, v: Val) -> i64 {
+        if v.k == VK_CONST {
+            if v.ty >= 0 {
+                return v.ty;
+            }
+            return if v.sk == SK_AFLOAT { T_F32 } else { T_I32 };
+        }
+        if v.k == VK_REF {
+            return self.m.pointee(v.ty);
+        }
+        if v.k == VK_VOID || v.e < 0 && v.ty < 0 {
+            return T_I32;
+        }
+        v.ty
+    }
+
+    // v as type ty: abstract constants convert, references load; any
+    // other difference is an error.
+    pub fn convert_to(inout self, v0: Val, ty: i64, at: i64) -> Val {
+        let v = self.value(v0, at);
+        if self.failed {
+            return if v.k == VK_CONST { v } else { self.dummy(ty) };
+        }
+        if v.k == VK_CONST {
+            if v.ty == ty {
+                return v;
+            }
+            let t = self.m.types[ty];
+            if v.ty < 0 && t.kind == TK_SCALAR {
+                return self.const_cast(v, t.scalar, at, false);
+            }
+            self.mismatch(ty, v, at);
+            return v;
+        }
+        if v.ty != ty {
+            self.mismatch(ty, v, at);
+        }
+        v
+    }
+
+    pub fn mismatch(inout self, want: i64, got: Val, at: i64) {
+        if self.err(at, "wgsl.type") {
+            self.emsg.push_str("expected ");
+            self.ty_str(want);
+            self.emsg.push_str(", got ");
+            self.val_str(got);
+            let gt = self.concrete_type_of(got);
+            if gt >= 0 && self.m.types[gt].kind == TK_SCALAR
+                && self.m.types[want].kind == TK_SCALAR {
+                self.tmp.clear();
+                self.m.type_name(want, &self.tmp);
+                self.ehelp.push_fmt(f"convert it: {self.tmp.as_slice()}(...)");
+            }
+        }
+    }
+
+    // A dummy value of type ty, after an error.
+    pub fn dummy(inout self, ty: i64) -> Val {
+        let e = self.f.expr(E_ZERO, ty, 0, 0, 0);
+        val(e, ty)
+    }
+
+    // v as an IR expression of type ty.
+    pub fn materialize(inout self, v0: Val, ty: i64, at: i64) -> i64 {
+        let v = self.convert_to(v0, ty, at);
+        if self.failed {
+            return self.f.expr(E_ZERO, ty, 0, 0, 0);
+        }
+        if v.k == VK_CONST {
+            return self.literal(v, ty);
+        }
+        v.e
+    }
+
+    // v (a value of any concrete type) as an IR expression, its type
+    // concrete.
+    pub fn emit_val(inout self, v: Val, at: i64) -> i64 {
+        let t = self.concrete_type_of(v);
+        self.materialize(v, t, at)
+    }
+
+    pub fn literal(inout self, v: Val, ty: i64) -> i64 {
+        let sk = self.m.types[ty].scalar;
+        let bits = if sk == SK_F32 { f32_bits(v.fv as f32) as i64 } else { v.iv & 4294967295 };
+        self.f.expr(E_LITERAL, ty, bits, 0, 0)
+    }
+
+    // A constant as scalar kind `to`: an automatic conversion of an
+    // abstract number (`explicit` false), or a value constructor's.
+    pub fn const_cast(inout self, v: Val, to: u8, at: i64, explicit: bool) -> Val {
+        let ty = to as i64;
+        let from = v.sk;
+        if from == to {
+            return Val { k: VK_CONST, sk: to, e: -1, ty: ty, iv: v.iv, fv: v.fv };
+        }
+        let is_float = from == SK_F32 || from == SK_AFLOAT;
+        if !explicit {
+            let ok = (from == SK_AINT && (to == SK_I32 || to == SK_U32 || to == SK_F32))
+                || (from == SK_AFLOAT && to == SK_F32);
+            if !ok {
+                if self.err(at, "wgsl.type") {
+                    self.emsg.push_fmt(
+                        f"expected {ir::scalar_name(to)}, got {ir::scalar_name(from)}");
+                    if from == SK_AFLOAT && (to == SK_I32 || to == SK_U32) {
+                        self.ehelp.push_fmt(f"convert it: {ir::scalar_name(to)}(...)");
+                    }
+                }
+                return cint(to, ty, 0);
+            }
+        }
+        if to == SK_BOOL {
+            let nz = if is_float { v.fv != 0.0 } else { v.iv != 0 };
+            return cint(SK_BOOL, T_BOOL, if nz { 1 } else { 0 });
+        }
+        if to == SK_F32 || to == SK_AFLOAT {
+            let x = if is_float { v.fv } else { v.iv as f64 };
+            if to == SK_F32 {
+                if x > F32_MAX || x < -F32_MAX {
+                    self.fail(at, "wgsl.const", "this value is out of f32's range");
+                }
+                return cfloat(SK_F32, T_F32, (x as f32) as f64);
+            }
+            return cfloat(SK_AFLOAT, -1, x);
+        }
+        // to an integer
+        var x = v.iv;
+        if is_float {
+            if explicit {
+                // value conversion: truncate, then saturate
+                let f = v.fv;
+                if to == SK_I32 {
+                    x = if f != f { 0 } else if f <= -2147483648.0 { I32_MIN }
+                        else if f >= 2147483520.0 { 2147483520 } else { f as i64 };
+                } else {
+                    x = if f != f { 0 } else if f <= 0.0 { 0 }
+                        else if f >= 4294967040.0 { 4294967040 } else { f as i64 };
+                }
+                return cint(to, ty, x);
+            }
+        }
+        if from == SK_BOOL {
+            return cint(to, ty, x);
+        }
+        if explicit && from != SK_AINT {
+            // between i32 and u32: the bits
+            if to == SK_U32 {
+                x = x & U32_MAX;
+            } else {
+                x = (x & U32_MAX) as i32 as i64;
+            }
+            return cint(to, ty, x);
+        }
+        if to == SK_I32 && (x < I32_MIN || x > I32_MAX) {
+            if self.err(at, "wgsl.const") {
+                self.emsg.push_fmt(f"{x} does not fit in an i32");
+            }
+        } else if to == SK_U32 && (x < 0 || x > U32_MAX) {
+            if self.err(at, "wgsl.const") {
+                self.emsg.push_fmt(f"{x} does not fit in a u32");
+                if x < 0 {
+                    self.help("a u32 is never negative; use an i32, or bitcast<u32>(...)");
+                }
+            }
+        }
+        cint(to, ty, x)
+    }
+
+    // ---- Operators ----
+
+    pub fn bad_operands(inout self, op: [u8], l: Val, r: Val, at: i64) {
+        if self.err(at, "wgsl.type") {
+            self.emsg.push_fmt(f"'{op}' cannot take ");
+            self.val_str(l);
+            self.emsg.push_str(" and ");
+            self.val_str(r);
+        }
+    }
+
+    pub fn unary(inout self, op: i64, v0: Val, at: i64) -> Val {
+        let v = self.value(v0, at);
+        if self.failed {
+            return v;
+        }
+        let t = self.concrete_type_of(v);
+        let tt = self.m.types[t];
+        let sk = if v.k == VK_CONST { v.sk } else { tt.scalar };
+        let numeric = tt.kind == TK_SCALAR || tt.kind == TK_VECTOR;
+        if op == UN_NEG {
+            if !(numeric || tt.kind == TK_MATRIX) || sk == SK_BOOL || sk == SK_U32 {
+                if self.err(at, "wgsl.type") {
+                    self.emsg.push_str("'-' cannot take ");
+                    self.val_str(v);
+                    if sk == SK_U32 {
+                        self.help("a u32 is never negative: 0u - x wraps, or use an i32");
+                    }
+                }
+                return v;
+            }
+            if v.k == VK_CONST {
+                if sk == SK_AFLOAT || sk == SK_F32 {
+                    return cfloat(sk, v.ty, -v.fv);
+                }
+                if sk == SK_I32 && v.iv == I32_MIN {
+                    self.fail(at, "wgsl.const", "-(-2147483648i) does not fit in an i32");
+                }
+                return cint(sk, v.ty, -v.iv);
+            }
+            if tt.kind == TK_MATRIX {
+                self.fail(at, "wgsl.unsupported",
+                    "negating a matrix is not in this release; multiply by -1.0");
+                return v;
+            }
+        } else if op == UN_NOT {
+            if !numeric || sk != SK_BOOL {
+                if self.err(at, "wgsl.type") {
+                    self.emsg.push_str("'!' takes a bool, not ");
+                    self.val_str(v);
+                    if sk == SK_I32 || sk == SK_U32 {
+                        self.help("'~' is the bitwise not of an integer");
+                    }
+                }
+                return v;
+            }
+            if v.k == VK_CONST {
+                return cint(SK_BOOL, T_BOOL, if v.iv == 0 { 1 } else { 0 });
+            }
+        } else {
+            if !numeric || !(sk == SK_I32 || sk == SK_U32 || sk == SK_AINT) {
+                if self.err(at, "wgsl.type") {
+                    self.emsg.push_str("'~' takes an integer, not ");
+                    self.val_str(v);
+                }
+                return v;
+            }
+            if v.k == VK_CONST {
+                let x = ~v.iv;
+                return cint(sk, v.ty, if sk == SK_U32 { x & U32_MAX } else { x });
+            }
+        }
+        let e = self.f.expr(E_UNARY, t, op, v.e, 0);
+        val(e, t)
+    }
+
+    pub fn op_text(self, op: i64) -> [u8] {
+        if op == OP_ADD {
+            "+"
+        } else if op == OP_SUB {
+            "-"
+        } else if op == OP_MUL {
+            "*"
+        } else if op == OP_DIV {
+            "/"
+        } else if op == OP_MOD {
+            "%"
+        } else if op == OP_EQ {
+            "=="
+        } else if op == OP_NE {
+            "!="
+        } else if op == OP_LT {
+            "<"
+        } else if op == OP_LE {
+            "<="
+        } else if op == OP_GT {
+            ">"
+        } else if op == OP_GE {
+            ">="
+        } else if op == OP_AND {
+            "&"
+        } else if op == OP_OR {
+            "|"
+        } else if op == OP_XOR {
+            "^"
+        } else if op == OP_SHL {
+            "<<"
+        } else {
+            ">>"
+        }
+    }
+
+    // Whether e is a constant (a literal, or a vector of literals) with a
+    // lane of n or more (unsigned).
+    fn const_lanes_at_least(self, e: i64, n: i64) -> bool {
+        let x = self.f.exprs[e];
+        if x.op == E_LITERAL {
+            return x.a >= n;
+        }
+        if x.op == E_SPLAT {
+            return self.const_lanes_at_least(x.a, n);
+        }
+        if x.op == ir::E_COMPOSE {
+            for i in x.a..x.a + x.b {
+                if self.const_lanes_at_least(self.f.args[i], n) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn binary(inout self, op: i64, l0: Val, r0: Val, at: i64) -> Val {
+        var l = self.value(l0, at);
+        var r = self.value(r0, at);
+        if self.failed {
+            return l;
+        }
+        if l.k == VK_CONST && r.k == VK_CONST {
+            return self.fold(op, l, r, at);
+        }
+        let shift = op == OP_SHL || op == OP_SHR;
+        // the abstract side takes the other side's scalar
+        if shift {
+            let rt0 = if r.k == VK_CONST { -1 } else { r.ty };
+            if r.k == VK_CONST {
+                if r.ty < 0 || r.sk == SK_U32 {
+                    r = self.const_cast(r, SK_U32, at, false);
+                }
+            }
+            if l.k == VK_CONST && l.ty < 0 {
+                let rk = self.m.types[self.concrete_type_of(r)];
+                let _ = rk;
+                l = self.const_cast(l, SK_I32, at, false);
+            }
+            let _ = rt0;
+        } else if l.k == VK_CONST && l.ty < 0 {
+            let rs = self.m.types[r.ty].scalar;
+            l = self.const_cast(l, rs, at, false);
+        } else if r.k == VK_CONST && r.ty < 0 {
+            let ls = self.m.types[l.ty].scalar;
+            r = self.const_cast(r, ls, at, false);
+        }
+        if self.failed {
+            return l;
+        }
+        let lt = self.concrete_type_of(l);
+        let rt = self.concrete_type_of(r);
+        let a = self.m.types[lt];
+        let b = self.m.types[rt];
+        let ln = if a.kind == TK_SCALAR { 1 } else if a.kind == TK_VECTOR { a.n } else { 0 };
+        let rn = if b.kind == TK_SCALAR { 1 } else if b.kind == TK_VECTOR { b.n } else { 0 };
+        // matrices
+        if a.kind == TK_MATRIX || b.kind == TK_MATRIX {
+            return self.matrix_op(op, l, r, lt, rt, at);
+        }
+        if ln == 0 || rn == 0 {
+            self.bad_operands(self.op_text(op), l, r, at);
+            return l;
+        }
+        let sk = a.scalar;
+        if shift {
+            if (sk != SK_I32 && sk != SK_U32) || b.scalar != SK_U32 || (ln != rn && rn != 1)
+                || (rn != 1 && ln == 1) {
+                if self.err(at, "wgsl.type") {
+                    self.emsg.push_fmt(
+                        f"'{self.op_text(op)}' shifts an integer by a u32 (of the same width); got ");
+                    self.val_str(l);
+                    self.emsg.push_str(" and ");
+                    self.val_str(r);
+                    if b.scalar == SK_I32 {
+                        self.help("convert the amount: u32(...)");
+                    }
+                }
+                return l;
+            }
+            let le = self.materialize(l, lt, at);
+            var re = self.materialize(r, rt, at);
+            if ln != rn {
+                re = self.f.expr(E_SPLAT, vec_ty(SK_U32, ln), re, 0, 0);
+            }
+            if (r.k == VK_CONST && r.iv >= 32) || self.const_lanes_at_least(re, 32) {
+                self.fail(at, "wgsl.const", "a constant shift amount is below 32");
+            }
+            let e = self.f.expr(E_BINARY, lt, op, le, re);
+            return val(e, lt);
+        }
+        if sk != b.scalar {
+            self.bad_operands(self.op_text(op), l, r, at);
+            if (sk == SK_I32 && b.scalar == SK_U32) || (sk == SK_U32 && b.scalar == SK_I32) {
+                self.help("convert one side: u32(...) or i32(...)");
+            } else if sk == SK_F32 || b.scalar == SK_F32 {
+                self.help("convert one side: f32(...)");
+            }
+            return l;
+        }
+        let arith = op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_DIV || op == OP_MOD;
+        let cmp = op >= OP_EQ && op <= OP_GE;
+        let bits = op == OP_AND || op == OP_OR || op == OP_XOR;
+        if ln != rn && !(arith && (ln == 1 || rn == 1)) {
+            self.bad_operands(self.op_text(op), l, r, at);
+            return l;
+        }
+        if arith && sk == SK_BOOL {
+            self.bad_operands(self.op_text(op), l, r, at);
+            return l;
+        }
+        if bits && sk == SK_F32 {
+            self.bad_operands(self.op_text(op), l, r, at);
+            return l;
+        }
+        if cmp && sk == SK_BOOL && op != OP_EQ && op != OP_NE {
+            self.bad_operands(self.op_text(op), l, r, at);
+            return l;
+        }
+        let n = if ln > rn { ln } else { rn };
+        let vt = vec_ty(sk, n);
+        var le = self.materialize(l, lt, at);
+        var re = self.materialize(r, rt, at);
+        if ln < n {
+            le = self.f.expr(E_SPLAT, vt, le, 0, 0);
+        }
+        if rn < n {
+            re = self.f.expr(E_SPLAT, vt, re, 0, 0);
+        }
+        let ty = if cmp { vec_ty(SK_BOOL, n) } else { vt };
+        let e = self.f.expr(E_BINARY, ty, op, le, re);
+        val(e, ty)
+    }
+
+    fn matrix_op(inout self, op: i64, l: Val, r: Val, lt: i64, rt: i64, at: i64) -> Val {
+        let a = self.m.types[lt];
+        let b = self.m.types[rt];
+        var ty = -1;
+        if op == OP_ADD || op == OP_SUB {
+            if lt == rt {
+                ty = lt;
+            }
+        } else if op == OP_MUL {
+            if a.kind == TK_MATRIX && b.kind == TK_SCALAR && b.scalar == SK_F32 {
+                ty = lt;
+            } else if a.kind == TK_SCALAR && a.scalar == SK_F32 && b.kind == TK_MATRIX {
+                ty = rt;
+            }
+            else if a.kind == TK_MATRIX && b.kind == TK_VECTOR && b.scalar == SK_F32 && b.n == a.n {
+                ty = vec_ty(SK_F32, a.m);
+            }
+            else if a.kind == TK_VECTOR && a.scalar == SK_F32 && b.kind == TK_MATRIX && a.n == b.m {
+                ty = vec_ty(SK_F32, b.n);
+            } else if a.kind == TK_MATRIX && b.kind == TK_MATRIX && a.n == b.m {
+                ty = mat_ty(b.n, a.m);
+            }
+        }
+        if ty < 0 {
+            self.bad_operands(self.op_text(op), l, r, at);
+            return l;
+        }
+        let le = self.materialize(l, lt, at);
+        let re = self.materialize(r, rt, at);
+        let e = self.f.expr(E_BINARY, ty, op, le, re);
+        val(e, ty)
+    }
+
+    // Both sides constant scalars: the result, computed as WGSL's
+    // constant evaluation does (errors where it overflows or divides by
+    // zero).
+    fn fold(inout self, op: i64, l0: Val, r0: Val, at: i64) -> Val {
+        var l = l0;
+        var r = r0;
+        let shift = op == OP_SHL || op == OP_SHR;
+        // the common kind
+        if shift {
+            if r.sk == SK_AINT {
+                r = self.const_cast(r, SK_U32, at, false);
+            }
+            if r.sk != SK_U32 {
+                self.bad_operands(self.op_text(op), l, r, at);
+                return l;
+            }
+        } else if l.sk != r.sk {
+            if l.ty < 0 && r.ty < 0 {
+                // abstract int and abstract float: float
+                if l.sk == SK_AINT {
+                    l = cfloat(SK_AFLOAT, -1, l.iv as f64);
+                } else {
+                    r = cfloat(SK_AFLOAT, -1, r.iv as f64);
+                }
+            } else if l.ty < 0 {
+                l = self.const_cast(l, r.sk, at, false);
+            } else if r.ty < 0 {
+                r = self.const_cast(r, l.sk, at, false);
+            } else {
+                self.bad_operands(self.op_text(op), l, r, at);
+                return l;
+            }
+        }
+        if self.failed {
+            return l;
+        }
+        let sk = l.sk;
+        let ty = l.ty;
+        if op == OP_LAND || op == OP_LOR {
+            let x = if op == OP_LAND { l.iv != 0 && r.iv != 0 } else { l.iv != 0 || r.iv != 0 };
+            return cint(SK_BOOL, T_BOOL, if x { 1 } else { 0 });
+        }
+        if op >= OP_EQ && op <= OP_GE {
+            var c = 0;
+            if sk == SK_F32 || sk == SK_AFLOAT {
+                let x = l.fv;
+                let y = r.fv;
+                c = if op == OP_EQ { (x == y) as i64 } else if op == OP_NE { (x != y) as i64 }
+                    else if op == OP_LT { (x < y) as i64 } else if op == OP_LE { (x <= y) as i64 }
+                    else if op == OP_GT { (x > y) as i64 } else { (x >= y) as i64 };
+            } else {
+                if sk == SK_BOOL && op != OP_EQ && op != OP_NE {
+                    self.bad_operands(self.op_text(op), l, r, at);
+                    return l;
+                }
+                let x = l.iv;
+                let y = r.iv;
+                c = if op == OP_EQ { (x == y) as i64 } else if op == OP_NE { (x != y) as i64 }
+                    else if op == OP_LT { (x < y) as i64 } else if op == OP_LE { (x <= y) as i64 }
+                    else if op == OP_GT { (x > y) as i64 } else { (x >= y) as i64 };
+            }
+            return cint(SK_BOOL, T_BOOL, c);
+        }
+        if sk == SK_BOOL {
+            if op == OP_AND || op == OP_OR || op == OP_XOR {
+                let x = if op == OP_AND { l.iv & r.iv } else if op == OP_OR { l.iv | r.iv }
+                    else { l.iv ^ r.iv };
+                return cint(SK_BOOL, T_BOOL, x);
+            }
+            self.bad_operands(self.op_text(op), l, r, at);
+            return l;
+        }
+        if sk == SK_F32 || sk == SK_AFLOAT {
+            if op == OP_AND || op == OP_OR || op == OP_XOR || shift {
+                self.bad_operands(self.op_text(op), l, r, at);
+                return l;
+            }
+            let x = l.fv;
+            let y = r.fv;
+            var z = 0.0;
+            if sk == SK_F32 {
+                let a = x as f32;
+                let b = y as f32;
+                let zz = if op == OP_ADD { a + b } else if op == OP_SUB { a - b }
+                    else if op == OP_MUL { a * b } else if op == OP_DIV { a / b }
+                    else { a - b * trunc32(a / b) };
+                z = zz as f64;
+            } else {
+                z = if op == OP_ADD { x + y } else if op == OP_SUB { x - y }
+                    else if op == OP_MUL { x * y } else if op == OP_DIV { x / y }
+                    else { x - y * trunc64(x / y) };
+            }
+            if z != z || z > 1.7976931348623157e308 || z < -1.7976931348623157e308
+                || (sk == SK_F32 && (z > F32_MAX || z < -F32_MAX)) {
+                self.fail(at, "wgsl.const",
+                    "this constant expression overflows or is not a number");
+            }
+            return cfloat(sk, ty, z);
+        }
+        // integers: i32, u32, abstract (i64)
+        let x = l.iv;
+        let y = r.iv;
+        var z: i64 = 0;
+        if op == OP_ADD {
+            z = x + y;
+            if sk == SK_AINT && ((x > 0 && y > 0 && z < 0) || (x < 0 && y < 0 && z >= 0)) {
+                self.fail(at, "wgsl.const", "this constant overflows 64 bits");
+            }
+        } else if op == OP_SUB {
+            z = x - y;
+            if sk == SK_AINT && ((x >= 0 && y < 0 && z < 0) || (x < 0 && y > 0 && z >= 0)) {
+                self.fail(at, "wgsl.const", "this constant overflows 64 bits");
+            }
+        } else if op == OP_MUL {
+            z = x * y;
+            if sk == SK_AINT && x != 0
+                && (z / x != y || (x == -1 && y == -9223372036854775807 - 1)) {
+                self.fail(at, "wgsl.const", "this constant overflows 64 bits");
+            }
+        } else if op == OP_DIV || op == OP_MOD {
+            if y == 0 {
+                self.fail(at, "wgsl.const", "a constant expression divides by zero");
+                return l;
+            }
+            z = if op == OP_DIV { x / y } else { x % y };
+        } else if op == OP_AND {
+            z = x & y;
+        } else if op == OP_OR {
+            z = x | y;
+        } else if op == OP_XOR {
+            z = x ^ y;
+        } else if op == OP_SHL || op == OP_SHR {
+            let width = if sk == SK_AINT { 64 } else { 32 };
+            if y >= width {
+                self.fail(at, "wgsl.const",
+                    "a constant shift amount is below the width of the shifted type");
+                return l;
+            }
+            if op == OP_SHL {
+                z = x << y;
+            } else if sk == SK_U32 {
+                z = (x & U32_MAX) >> y;
+            } else {
+                z = x >> y;
+            }
+        }
+        if sk == SK_I32 {
+            if op == OP_SHL {
+                z = (z & U32_MAX) as i32 as i64;
+            } else if z < I32_MIN || z > I32_MAX {
+                self.fail(at, "wgsl.const", "this constant expression overflows an i32");
+            }
+        } else if sk == SK_U32 {
+            if op == OP_SHL {
+                z = z & U32_MAX;
+            } else if z < 0 || z > U32_MAX {
+                self.fail(at, "wgsl.const", "this constant expression overflows a u32");
+            }
+        }
+        cint(sk, ty, z)
+    }
+
+    // ---- Indexing and members ----
+
+    fn index(inout self, base: Val, i0: Val, at: i64, ip: i64) -> Val {
+        if self.failed {
+            return base;
+        }
+        let i = self.value(i0, ip);
+        let it = self.concrete_type_of(i);
+        if it != T_I32 && it != T_U32 {
+            if self.err(ip, "wgsl.type") {
+                self.emsg.push_str("an index is an i32 or a u32, not ");
+                self.val_str(i);
+            }
+            return base;
+        }
+        let is_ref = base.k == VK_REF;
+        let bv = if is_ref { base } else { self.value(base, at) };
+        if bv.k == VK_CONST {
+            self.fail(at, "wgsl.type", "a scalar cannot be indexed");
+            return base;
+        }
+        let bt = if is_ref { self.m.pointee(bv.ty) } else { bv.ty };
+        let t = self.m.types[bt];
+        if t.kind != TK_ARRAY && t.kind != TK_VECTOR && t.kind != TK_MATRIX {
+            if self.err(at, "wgsl.type") {
+                self.emsg.push_str("cannot index ");
+                self.val_str(bv);
+                if t.kind == TK_POINTER {
+                    self.help("dereference the pointer first: (*p)[i]");
+                }
+            }
+            return base;
+        }
+        let el = self.m.elem_of(bt);
+        let n = self.m.index_len(bt);
+        let rty = if is_ref {
+            let pt = self.m.types[bv.ty];
+            self.m.ptr_ty(el, pt.space, pt.access)
+        } else {
+            el
+        };
+        if i.k == VK_CONST && n > 0 {
+            if i.iv < 0 || i.iv >= n {
+                if self.err(ip, "wgsl.index") {
+                    self.emsg.push_fmt(f"index {i.iv} is out of range: the length is {n}");
+                }
+                return base;
+            }
+            let e = self.f.expr(E_ACCESS_INDEX, rty, bv.e, i.iv, 0);
+            return Val {
+                k: if is_ref { VK_REF } else { VK_VALUE }, sk: 0, e: e, ty: rty, iv: 0, fv: 0.0
+            };
+        }
+        let ie = self.materialize(i, it, ip);
+        let e = self.f.expr(E_ACCESS, rty, bv.e, ie, ir::CK_PENDING);
+        Val { k: if is_ref { VK_REF } else { VK_VALUE }, sk: 0, e: e, ty: rty, iv: 0, fv: 0.0 }
+    }
+
+    fn member(inout self, base: Val, name: [u8], at: i64) -> Val {
+        if self.failed {
+            return base;
+        }
+        let is_ref = base.k == VK_REF;
+        let bv = if is_ref { base } else { self.value(base, at) };
+        if bv.k == VK_CONST {
+            if self.err(at, "wgsl.type") {
+                self.emsg.push_fmt(f"a scalar has no member '{name}'");
+            }
+            return base;
+        }
+        let bt = if is_ref { self.m.pointee(bv.ty) } else { bv.ty };
+        let t = self.m.types[bt];
+        if t.kind == TK_STRUCT {
+            for i in 0..t.mcount {
+                let mem = self.m.members[t.mstart + i];
+                if mem.name == name {
+                    let rty = if is_ref {
+                        let pt = self.m.types[bv.ty];
+                        self.m.ptr_ty(mem.ty, pt.space, pt.access)
+                    } else {
+                        mem.ty
+                    };
+                    let e = self.f.expr(E_ACCESS_INDEX, rty, bv.e, i, 0);
+                    return Val {
+                        k: if is_ref { VK_REF } else { VK_VALUE }, sk: 0, e: e, ty: rty, iv: 0,
+                        fv: 0.0
+                    };
+                }
+            }
+            if self.err(at, "wgsl.member") {
+                self.emsg.push_fmt(f"'{t.name}' has no member '{name}'");
+                self.ehelp.push_str("its members are ");
+                for i in 0..t.mcount {
+                    if i > 0 {
+                        self.ehelp.push_str(", ");
+                    }
+                    self.ehelp.push_str(self.m.members[t.mstart + i].name);
+                }
+            }
+            return base;
+        }
+        if t.kind == TK_VECTOR {
+            var pat = 0;
+            let n = name.len;
+            var set = -1;
+            if n > 4 {
+                self.fail(at, "wgsl.member", "a swizzle has at most 4 components");
+                return base;
+            }
+            for i in 0..n {
+                let c = name[i];
+                let (comp, s) = if c == 'x' {
+                    (0, 0)
+                } else if c == 'y' {
+                    (1, 0)
+                } else if c == 'z' {
+                    (2, 0)
+                } else if c == 'w' {
+                    (3, 0)
+                } else if c == 'r' {
+                    (0, 1)
+                } else if c == 'g' {
+                    (1, 1)
+                } else if c == 'b' {
+                    (2, 1)
+                } else if c == 'a' {
+                    (3, 1)
+                } else {
+                    (-1, -1)
+                };
+                if comp < 0 || comp >= t.n || (set >= 0 && s != set) {
+                    if self.err(at, "wgsl.member") {
+                        self.emsg.push_fmt(f"'.{name}' is not a component of a vec{t.n}");
+                        self.help("components are x y z w (or r g b a), not mixed");
+                    }
+                    return base;
+                }
+                set = s;
+                pat = pat | (comp << (2 * i));
+            }
+            if n == 1 {
+                let rty = if is_ref {
+                    let pt = self.m.types[bv.ty];
+                    self.m.ptr_ty(t.scalar as i64, pt.space, pt.access)
+                } else {
+                    t.scalar as i64
+                };
+                let e = self.f.expr(E_ACCESS_INDEX, rty, bv.e, pat, 0);
+                return Val {
+                    k: if is_ref { VK_REF } else { VK_VALUE }, sk: 0, e: e, ty: rty, iv: 0, fv: 0.0
+                };
+            }
+            let v = self.value(bv, at);
+            let rty = vec_ty(t.scalar, n);
+            let e = self.f.expr(E_SWIZZLE, rty, v.e, pat, n);
+            return val(e, rty);
+        }
+        if self.err(at, "wgsl.member") {
+            self.emsg.push_fmt(f"'.{name}': ");
+            self.val_str(bv);
+            self.emsg.push_str(" has no members");
+            if t.kind == TK_POINTER {
+                self.help("dereference the pointer first: (*p).member");
+            }
+        }
+        base
+    }
+}
+
+fn trunc32(x: f32) -> f32 {
+    if x != x || x > 8388608.0 || x < -8388608.0 {
+        return x;
+    }
+    (x as i64) as f32
+}
+
+fn trunc64(x: f64) -> f64 {
+    if x != x || x > 4503599627370496.0 || x < -4503599627370496.0 {
+        return x;
+    }
+    (x as i64) as f64
+}
+
+// A hexadecimal float literal's value, `0x1.8p3` (WGSL's: mantissa digits,
+// an optional point, `p` and a decimal exponent of two), exact while the
+// mantissa fits in 53 bits.
+fn hex_float(s: [u8]) -> f64 {
+    var man: f64 = 0.0;
+    var e: i64 = 0;
+    var i = 2;
+    var after_point = false;
+    while i < s.len && s[i] != 'p' && s[i] != 'P' {
+        let c = s[i];
+        if c == '.' {
+            after_point = true;
+        } else {
+            let d = if c >= '0' && c <= '9' { c - '0' }
+                else if c >= 'a' && c <= 'f' { c - 'a' + 10 } else { c - 'A' + 10 };
+            man = man * 16.0 + d as f64;
+            if after_point {
+                e -= 4;
+            }
+        }
+        i += 1;
+    }
+    if i < s.len {
+        i += 1;
+        var neg = false;
+        if i < s.len && (s[i] == '+' || s[i] == '-') {
+            neg = s[i] == '-';
+            i += 1;
+        }
+        var x: i64 = 0;
+        while i < s.len && s[i] >= '0' && s[i] <= '9' && x < 100000 {
+            x = x * 10 + (s[i] - '0') as i64;
+            i += 1;
+        }
+        e += if neg { -x } else { x };
+    }
+    // times 2^e, by exact steps
+    var v = man;
+    while e > 0 && v < 1.0e300 {
+        v = v * 2.0;
+        e -= 1;
+    }
+    while e < 0 && v != 0.0 {
+        v = v * 0.5;
+        e += 1;
+    }
+    v
+}
