@@ -42,7 +42,7 @@ generated header:
 ```console
 $ tachyonc query items
 crate	main.tach	6
-std	<std>	564
+std	<std>	575
 crate::graph	graph.tach	11
 crate::heap	heap.tach	7
 crate::network	network.tach	2
@@ -61,8 +61,10 @@ std::collections::raw_table	<std>	46
 std::collections::btree_node	<std>	56
 std::collections::btree_map	<std>	45
 std::collections::group	<std>	20
-std::io	<std>	7
-std::fmt	<std>	80
+std::io	<std>	12
+std::io::error	<std>	17
+std::io::buffered	<std>	37
+std::fmt	<std>	82
 std::num	<std>	83
 std::num::tables	<std>	4
 std::convert	<std>	2
@@ -77,23 +79,11 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
-std::gpu	<std>	2
-std::gpu::wgsl	<std>	30
-std::gpu::wgsl::ir	<std>	267
-std::gpu::wgsl::names	<std>	238
-std::gpu::wgsl::lex	<std>	61
-std::gpu::wgsl::front	<std>	95
-std::gpu::wgsl::expr	<std>	39
-std::gpu::wgsl::builtins	<std>	35
-std::gpu::wgsl::entry	<std>	8
-std::gpu::wgsl::bounds	<std>	10
-std::gpu::wgsl::uniformity	<std>	1
-std::gpu::wgsl::msl	<std>	81
-std::gpu::wgsl::spirv	<std>	1
-std::gpu::wgsl::interp	<std>	89
-std::gpu::wgsl::dump	<std>	12
-std::gpu::wgsl::job	<std>	13
-std::gpu::wgsl::api	<std>	26
+std::string	<std>	153
+std::path	<std>	34
+std::fs	<std>	59
+std::env	<std>	21
+std::process	<std>	36
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6
@@ -160,10 +150,10 @@ crate::heap::free_heap	heap.tach:63:8	fn	pub fn free_heap(h: &mut MinHeap)
 crate::heap::is_empty	heap.tach:18:8	fn	pub fn is_empty(h: &MinHeap) -> bool
 crate::heap::pop	heap.tach:35:8	fn	pub fn pop(h: &mut MinHeap) -> Option<Entry>
 crate::graph::edges_from	graph.tach:55:8	fn	pub fn edges_from(g: &Graph, i: i64) -> [Edge]
+std::Vec::filled_in	<std>:1484:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
 crate::heap::push	heap.tach:22:8	fn	pub fn push(h: &mut MinHeap, e: Entry)
-std::Vec::set	<std>:301:12	method	pub fn set(self: &mut Vec<T, A>, i: i64, x: T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
-std::Option::unwrap	<std>:119:12	method	pub fn unwrap(self: Option<T>) -> T requires self.is_some() else "called unwrap on None"
-std::Vec::filled_in	<std>:1479:12	method	pub fn filled_in(n: i64, x: T, a: A) -> Vec<T, A>
+std::Vec::set	<std>:306:12	method	pub fn set(self: &mut Vec<T, A>, i: i64, x: T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
+std::Option::unwrap	<std>:124:12	method	pub fn unwrap(self: Option<T>) -> T requires self.is_some() else "called unwrap on None"
 note query.budget: over the budget of 600 tokens, left out: calls 2, types or uses 9, callers 1
 try: tachyonc query callers quickest
 try: tachyonc query context quickest --budget 1800

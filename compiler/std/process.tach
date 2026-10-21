@@ -1,0 +1,369 @@
+// std::process (0.20, docs/design/collections-text-io.md §2.6.3, task
+// B6): running programs, with Rust's names, through posix_spawnp
+// (std::sys). A Command keeps its program and up to 32 arguments as
+// views, inline, and builds argv on the stack when it runs (each argument
+// and the program's name up to 4 KB in all: InvalidInput beyond), so
+// `Command::new(p)` allocates nothing; `output_in(gpa)` puts what the
+// child writes in Vecs on gpa. `c.arg(x)` changes c in place (Rust's
+// `&mut Command`): `let mut c = Command::new("ls"); c.arg("-l");
+// let out = c.output_in(gpa)?;`.
+
+use std::{Allocator, Display, Fmt, Option, Vec};
+use std::io::error::{Error, ErrorKind, Result, __io_error, __os_error};
+use std::sys::{
+    SYS_EINTR, SYS_O_RDWR, SYS_POLLHUP, SYS_POLLIN, SysPollFd, SysSpawnActions, sys_close,
+    sys_exit_code, sys_exit_signal, sys_kill, sys_open, sys_pipe, sys_poll, sys_read, sys_spawn,
+    sys_spawn_actions, sys_waitpid,
+};
+
+// ---- Processes (0.20) ----
+
+const MAX_ARGS: i64 = 32;
+const ARG_TEXT: i64 = 4096;
+
+// What a child's stdin, stdout or stderr is: this process's (inherit),
+// /dev/null (null), or a pipe to this process (piped: output_in's).
+#[derive(Eq, Debug, Clone)]
+pub enum Stdio { Inherit, Null, Piped }
+
+impl Stdio {
+    pub fn inherit() -> Stdio { Stdio::Inherit }
+    pub fn null() -> Stdio { Stdio::Null }
+    pub fn piped() -> Stdio { Stdio::Piped }
+}
+
+// A program to run, its arguments and its streams.
+pub struct Command {
+    prog: [u8],
+    args: [[u8]; 32],
+    count: i64,
+    stdin: Stdio,
+    stdout: Stdio,
+    stderr: Stdio,
+}
+
+// How a child ended: its exit code, or the signal that ended it.
+#[derive(Eq, Debug, Clone)]
+pub struct ExitStatus { status: i32 }
+
+impl ExitStatus {
+    // Whether it exited with 0.
+    pub fn success(self) -> bool {
+        match sys_exit_code(self.status) {
+            Option::Some(c) => c == 0,
+            Option::None => false,
+        }
+    }
+
+    // Its exit code (None when a signal ended it).
+    pub fn code(self) -> Option<i32> {
+        sys_exit_code(self.status)
+    }
+
+    // The signal that ended it.
+    pub fn signal(self) -> Option<i32> {
+        sys_exit_signal(self.status)
+    }
+}
+
+impl Display for ExitStatus {
+    fn fmt(self, f: inout Fmt) {
+        match sys_exit_code(self.status) {
+            Option::Some(c) => {
+                f.str("exit status: ");
+                f.int(c as i64);
+            }
+            Option::None => {
+                f.str("signal: ");
+                f.int(self.status as i64 & 0x7f);
+            }
+        }
+    }
+}
+
+// What output_in returns: how the child ended, and what it wrote.
+pub struct Output<A: Allocator> {
+    pub status: ExitStatus, pub stdout: Vec<u8, A>, pub stderr: Vec<u8, A>
+}
+
+// A running child: wait for it (dropping it does not).
+pub struct Child { pid: i32, done: bool, status: i32 }
+
+impl Child {
+    pub fn id(self) -> i32 {
+        self.pid
+    }
+
+    // Waits for it to end.
+    pub fn wait(inout self) -> Result<ExitStatus> {
+        if self.done {
+            return Ok(ExitStatus { status: self.status });
+        }
+        let st = wait_pid(self.pid)?;
+        self.done = true;
+        self.status = st;
+        Ok(ExitStatus { status: st })
+    }
+
+    // How it ended, if it has: None while it runs.
+    pub fn try_wait(inout self) -> Result<Option<ExitStatus>> {
+        if self.done {
+            return Ok(Option::Some(ExitStatus { status: self.status }));
+        }
+        match sys_waitpid(self.pid, true) {
+            Ok((p, st)) => {
+                if p == 0 {
+                    return Ok(Option::None);
+                }
+                self.done = true;
+                self.status = st;
+                Ok(Option::Some(ExitStatus { status: st }))
+            }
+            Err(e) => Err(__os_error(e)),
+        }
+    }
+
+    // Sends it SIGKILL.
+    pub fn kill(inout self) -> Result<()> {
+        match sys_kill(self.pid, 9) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(__os_error(e)),
+        }
+    }
+}
+
+// Waits for pid (again when a signal interrupts): its status.
+fn wait_pid(pid: i32) -> Result<i32> {
+    loop {
+        match sys_waitpid(pid, false) {
+            Ok((_, st)) => return Ok(st),
+            Err(e) => {
+                if e != SYS_EINTR {
+                    return Err(__os_error(e));
+                }
+            }
+        }
+    }
+}
+
+// The NUL-ended copies of a command's program and arguments, and argv.
+struct Argv { text: [u8; 4096], ptrs: [*u8; 34] }
+
+impl Command {
+    // Runs prog: a path, or a name looked up in PATH.
+    pub fn new(prog: [u8]) -> Command {
+        Command { prog: prog, args: [""; 32], count: 0, stdin: Stdio::Inherit,
+            stdout: Stdio::Inherit, stderr: Stdio::Inherit }
+    }
+
+    // Adds an argument (up to 32).
+    pub fn arg(inout self, a: [u8]) {
+        if self.count >= MAX_ARGS {
+            std::panic_str("Command::arg: more than 32 arguments");
+        }
+        self.args[self.count] = a;
+        self.count += 1;
+    }
+
+    // Adds each of list.
+    pub fn args(inout self, list: [[u8]]) {
+        for a in list {
+            self.arg(a);
+        }
+    }
+
+    pub fn stdin(inout self, s: Stdio) {
+        self.stdin = s;
+    }
+
+    pub fn stdout(inout self, s: Stdio) {
+        self.stdout = s;
+    }
+
+    pub fn stderr(inout self, s: Stdio) {
+        self.stderr = s;
+    }
+
+    // argv for C, in out: InvalidInput when it does not fit or holds a NUL.
+    fn build_argv(self, out: inout Argv) -> Result<()> {
+        var at = 0;
+        for k in 0..self.count + 1 {
+            let s = if k == 0 { self.prog } else { self.args[k - 1] };
+            if at + s.len + 1 > ARG_TEXT {
+                return Err(__io_error(ErrorKind::InvalidInput, c"arguments over 4096 bytes"));
+            }
+            for i in 0..s.len {
+                if s[i] == 0 {
+                    return Err(__io_error(ErrorKind::InvalidInput, c"an argument holds a NUL"));
+                }
+                out.text[at + i] = s[i];
+            }
+            out.text[at + s.len] = 0;
+            // (text is out's: it lives as long as ptrs does)
+            out.ptrs[k] = &out.text[at] as *u8;
+            at += s.len + 1;
+        }
+        out.ptrs[self.count + 1] = 0 as *u8;
+        Ok(())
+    }
+
+    // Starts it with the streams as set (piped ones are not supported
+    // here: output_in pipes stdout and stderr).
+    pub fn spawn(self) -> Result<Child> {
+        var acts = os(sys_spawn_actions())?;
+        var null: i32 = -1;
+        let r = self.spawn_with(&acts, &null, -1, -1);
+        acts.free();
+        if null >= 0 {
+            let _ = sys_close(null);
+        }
+        let pid = r?;
+        Ok(Child { pid: pid, done: false, status: 0 })
+    }
+
+    // Runs it, waits for it: how it ended.
+    pub fn status(self) -> Result<ExitStatus> {
+        var c = self.spawn()?;
+        c.wait()
+    }
+
+    // Runs it with stdout and stderr piped to this process (stdin
+    // inherited), and waits: how it ended and what it wrote, in Vecs on a.
+    pub fn output_in<A: Allocator>(self, a: sink A) -> Result<Output<A>> {
+        let (out_r, out_w) = os(sys_pipe())?;
+        let (err_r, err_w) = match sys_pipe() {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = sys_close(out_r);
+                let _ = sys_close(out_w);
+                return Err(__os_error(e));
+            }
+        };
+        var acts = os(sys_spawn_actions())?;
+        var null: i32 = -1;
+        let r = self.spawn_with(&acts, &null, out_w, err_w);
+        acts.free();
+        let _ = sys_close(out_w);
+        let _ = sys_close(err_w);
+        if null >= 0 {
+            let _ = sys_close(null);
+        }
+        let pid = match r {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = sys_close(out_r);
+                let _ = sys_close(err_r);
+                return Err(e);
+            }
+        };
+        var stdout: Vec<u8, A> = Vec::new_in(a);
+        var stderr: Vec<u8, A> = Vec::new_in(a);
+        let got = drain_two(out_r, err_r, &stdout, &stderr);
+        let _ = sys_close(out_r);
+        let _ = sys_close(err_r);
+        let st = wait_pid(pid)?;
+        got?;
+        Ok(Output { status: ExitStatus { status: st }, stdout: stdout, stderr: stderr })
+    }
+
+    // Spawns it with the file actions for its streams in acts (out_w,
+    // err_w: pipes for stdout and stderr, or -1); /dev/null, when one is
+    // Null, opened into *null.
+    fn spawn_with(self, acts: inout SysSpawnActions, null: inout i32, out_w: i32,
+        err_w: i32) -> Result<i32> {
+        let wants_null = self.stdin == Stdio::Null || self.stdout == Stdio::Null
+            || self.stderr == Stdio::Null;
+        if wants_null {
+            let fd = os(sys_open("/dev/null", SYS_O_RDWR, 0))?;
+            null = fd;
+        }
+        let nfd = null;
+        if self.stdin == Stdio::Null {
+            os(acts.dup2(nfd, 0))?;
+        }
+        if out_w >= 0 {
+            os(acts.dup2(out_w, 1))?;
+        } else if self.stdout == Stdio::Null {
+            os(acts.dup2(nfd, 1))?;
+        }
+        if err_w >= 0 {
+            os(acts.dup2(err_w, 2))?;
+        } else if self.stderr == Stdio::Null {
+            os(acts.dup2(nfd, 2))?;
+        }
+        var argv = Argv { text: [0; 4096], ptrs: [0 as *u8; 34] };
+        self.build_argv(&argv)?;
+        let envp: [*u8; 0] = [];
+        // (argv's strings are NUL-ended and its pointers end with null:
+        // build_argv; prog is ptrs[0])
+        let r = unsafe { sys_spawn(argv.ptrs[0], argv.ptrs[..self.count + 2], envp[..], &acts) };
+        os(r)
+    }
+}
+
+// The Result of a sys call, its errno an io::Error.
+#[inline]
+fn os<T>(r: sink std::Result<T, i32>) -> Result<T> {
+    match r {
+        Ok(v) => Ok(v),
+        Err(e) => Err(__os_error(e)),
+    }
+}
+
+// Reads the pipes a and b to their ends, into va and vb (poll: neither
+// child stream blocks the other).
+fn drain_two<A: Allocator>(a: i32, b: i32, va: inout Vec<u8, A>, vb: inout Vec<u8, A>)
+    -> Result<()> {
+    var open_a = true;
+    var open_b = true;
+    while open_a || open_b {
+        var fds: [SysPollFd; 2] = [
+            SysPollFd { fd: if open_a { a } else { -1 }, events: SYS_POLLIN, revents: 0 },
+            SysPollFd { fd: if open_b { b } else { -1 }, events: SYS_POLLIN, revents: 0 },
+        ];
+        match sys_poll(fds[..], -1) {
+            Ok(_) => {}
+            Err(e) => {
+                if e == SYS_EINTR {
+                    continue;
+                }
+                return Err(__os_error(e));
+            }
+        }
+        if open_a && fds[0].revents != 0 {
+            open_a = read_some(a, &va)?;
+        }
+        if open_b && fds[1].revents != 0 {
+            open_b = read_some(b, &vb)?;
+        }
+    }
+    Ok(())
+}
+
+// Reads what fd has into v: false at its end.
+fn read_some<A: Allocator>(fd: i32, v: inout Vec<u8, A>) -> Result<bool> {
+    if v.cap - v.len < 4096 {
+        v.reserve(if v.cap < 8192 { 8192 } else { v.cap });
+    }
+    // (v's room: its capacity past its length)
+    let room = unsafe { v.ptr[v.len..v.cap] };
+    match sys_read(fd, &room) {
+        Ok(n) => {
+            v.len += n;
+            Ok(n > 0)
+        }
+        Err(e) => if e == SYS_EINTR { Ok(true) } else { Err(__os_error(e)) },
+    }
+}
+
+// Ends this process with code (Rust's `std::process::exit`); what print
+// buffered is written out first.
+pub fn exit(code: i32) -> ! {
+    std::fmt::__flush_print();
+    unsafe { std::exit(code) }
+}
+
+// This process's id.
+pub fn id() -> i32 {
+    std::sys::sys_getpid()
+}

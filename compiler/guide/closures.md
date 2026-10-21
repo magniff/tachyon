@@ -77,6 +77,13 @@ way to keep a closure that outlives the block of what it uses: the
 move closure of other languages (`move ||` is `conv.rust`, with `sink
 ||` in its `try:` line).
 
+An owned value a closure captures without `sink` still belongs to its
+variable, so the body may not move it (`drop(x)`, passing it to a sink
+parameter): that is `own.move_out`; use `x.clone()` inside. A `sink`
+(`move`) closure owns its captures and may move one out: its drop then
+skips that one. Called again after such a move, it stops the program
+(exit 101), since no closure is `FnOnce` yet.
+
 ```tach
 fn call<F: FnMut() -> i64>(f: sink F) -> i64 { f() }
 

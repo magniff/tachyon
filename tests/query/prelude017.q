@@ -7,7 +7,7 @@ $ def trim
 crate::trim	prelude017/main.tach:6:4	fn	fn trim(x: i64) -> i64	effects: none
 $ items prelude017/uses.tach
 crate	prelude017/uses.tach	1
-std	<std>	564
+std	<std>	575
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	37
@@ -22,8 +22,10 @@ std::collections::raw_table	<std>	46
 std::collections::btree_node	<std>	56
 std::collections::btree_map	<std>	45
 std::collections::group	<std>	20
-std::io	<std>	7
-std::fmt	<std>	80
+std::io	<std>	12
+std::io::error	<std>	17
+std::io::buffered	<std>	37
+std::fmt	<std>	82
 std::num	<std>	83
 std::num::tables	<std>	4
 std::convert	<std>	2
@@ -38,23 +40,11 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
-std::gpu	<std>	2
-std::gpu::wgsl	<std>	30
-std::gpu::wgsl::ir	<std>	267
-std::gpu::wgsl::names	<std>	238
-std::gpu::wgsl::lex	<std>	61
-std::gpu::wgsl::front	<std>	95
-std::gpu::wgsl::expr	<std>	39
-std::gpu::wgsl::builtins	<std>	35
-std::gpu::wgsl::entry	<std>	8
-std::gpu::wgsl::bounds	<std>	10
-std::gpu::wgsl::uniformity	<std>	1
-std::gpu::wgsl::msl	<std>	81
-std::gpu::wgsl::spirv	<std>	1
-std::gpu::wgsl::interp	<std>	89
-std::gpu::wgsl::dump	<std>	12
-std::gpu::wgsl::job	<std>	13
-std::gpu::wgsl::api	<std>	26
+std::string	<std>	153
+std::path	<std>	34
+std::fs	<std>	59
+std::env	<std>	21
+std::process	<std>	36
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6
@@ -62,3 +52,4 @@ std::arch::aarch64::raw	<std::arch::aarch64::raw>	110
 std::arch::x86_64::raw	<std::arch::x86_64::raw>	6
 $ def trim prelude017/uses.tach
 std::trim	../../compiler/std/flat/io.tach:28:8	fn	pub fn trim(s: [u8]) -> [u8]	effects: panic	views: views(s) declared
+str::trim	../../compiler/std/string.tach:436:12	method	pub fn trim(self: str) -> str	effects: panic diverge	views: views(self) inferred

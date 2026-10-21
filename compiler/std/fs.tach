@@ -1,0 +1,470 @@
+// std::fs (0.20, docs/design/collections-text-io.md §2.6.3, task B6):
+// files and directories with Rust's names. A path is any `[u8]`: a
+// literal, a `str`, a Path, `&s` of a String or PathBuf. It reaches C as a
+// NUL-ended copy on the stack (std::sys: InvalidInput when it is longer
+// than the system's PATH_MAX or holds a NUL), so nothing here allocates
+// but what returns a Vec or a String, on the allocator given.
+
+use std::{Allocator, Drop, Iterator, Option, Vec};
+use std::io::buffered::{Read, Write};
+use std::io::error::{Error, ErrorKind, Result, __io_error, __os_error};
+use std::path::{Path, PathBuf};
+use std::str::validate_utf8;
+use std::string::{String, str};
+use std::sys::{
+    FileStat, SYS_DT_DIR, SYS_DT_LNK, SYS_DT_REG, SYS_DT_UNKNOWN, SYS_EEXIST, SYS_O_APPEND,
+    SYS_O_CLOEXEC, SYS_O_CREAT, SYS_O_EXCL, SYS_O_RDONLY, SYS_O_RDWR, SYS_O_TRUNC, SYS_O_WRONLY,
+    SYS_SEEK_CUR, SYS_SEEK_END, SYS_SEEK_SET, SysDir, sys_close, sys_closedir, sys_fstat, sys_fsync,
+    sys_ftruncate, sys_lseek, sys_lstat, sys_mkdir, sys_open, sys_opendir, sys_read,
+    sys_readdir_into, sys_rename, sys_rmdir, sys_stat, sys_unlink, sys_write,
+};
+
+// ---- Files (0.20) ----
+
+// An open file; dropping it closes it.
+pub struct File { fd: i32 }
+
+impl Drop for File {
+    fn drop(inout self) {
+        if self.fd >= 0 {
+            let _ = sys_close(self.fd);
+            self.fd = -1;
+        }
+    }
+}
+
+// The Result of a sys call, its errno an io::Error.
+#[inline]
+fn os<T>(r: sink std::Result<T, i32>) -> Result<T> {
+    match r {
+        Ok(v) => Ok(v),
+        Err(e) => Err(__os_error(e)),
+    }
+}
+
+impl File {
+    // Opens path for reading.
+    pub fn open(path: [u8]) -> Result<File> {
+        let fd = os(sys_open(path, SYS_O_RDONLY | SYS_O_CLOEXEC, 0))?;
+        Ok(File { fd: fd })
+    }
+
+    // Opens path for writing: made if it is not there, emptied if it is.
+    pub fn create(path: [u8]) -> Result<File> {
+        let fd = os(sys_open(path, SYS_O_WRONLY | SYS_O_CREAT | SYS_O_TRUNC | SYS_O_CLOEXEC,
+            0x1b6))?;
+        Ok(File { fd: fd })
+    }
+
+    // Makes path and opens it for writing: AlreadyExists when it is there.
+    pub fn create_new(path: [u8]) -> Result<File> {
+        let fd = os(sys_open(path, SYS_O_WRONLY | SYS_O_CREAT | SYS_O_EXCL | SYS_O_CLOEXEC,
+            0x1b6))?;
+        Ok(File { fd: fd })
+    }
+
+    // The options to open a file with: `OpenOptions::new().append(true)`.
+    pub fn options() -> OpenOptions {
+        OpenOptions::new()
+    }
+
+    // Its file descriptor.
+    pub fn as_raw_fd(self) -> i32 {
+        self.fd
+    }
+
+    pub fn metadata(self) -> Result<Metadata> {
+        let st = os(sys_fstat(self.fd))?;
+        Ok(Metadata { st: st })
+    }
+
+    // Its length becomes n (cut, or zeros after).
+    pub fn set_len(self, n: i64) -> Result<()> {
+        os(sys_ftruncate(self.fd, n))
+    }
+
+    // Writes what the system holds of it to the disk.
+    pub fn sync_all(self) -> Result<()> {
+        os(sys_fsync(self.fd))
+    }
+
+    // Moves the position: to `off` from the start (Rust's
+    // `seek(SeekFrom::Start(off))`); the new position.
+    pub fn seek(inout self, pos: SeekFrom) -> Result<i64> {
+        let r = match pos {
+            SeekFrom::Start(o) => sys_lseek(self.fd, o, SYS_SEEK_SET),
+            SeekFrom::End(o) => sys_lseek(self.fd, o, SYS_SEEK_END),
+            SeekFrom::Current(o) => sys_lseek(self.fd, o, SYS_SEEK_CUR),
+        };
+        os(r)
+    }
+}
+
+// Where File::seek moves to.
+#[derive(Eq, Debug, Clone)]
+pub enum SeekFrom { Start(i64), End(i64), Current(i64) }
+
+impl Read for File {
+    fn read(inout self, buf: inout [u8]) -> Result<i64> {
+        os(sys_read(self.fd, buf))
+    }
+}
+
+impl Write for File {
+    fn write(inout self, buf: [u8]) -> Result<i64> {
+        os(sys_write(self.fd, buf))
+    }
+
+    fn flush(inout self) -> Result<()> {
+        Ok(())
+    }
+}
+
+// How File::open... opens a file (Rust's OpenOptions):
+// `OpenOptions::new().append(true).create(true).open(p)?`.
+#[derive(Eq, Debug, Clone)]
+pub struct OpenOptions {
+    read: bool, write: bool, append: bool, truncate: bool, create: bool, create_new: bool,
+    mode: i32,
+}
+
+impl OpenOptions {
+    pub fn new() -> OpenOptions {
+        OpenOptions { read: false, write: false, append: false, truncate: false, create: false,
+            create_new: false, mode: 0x1b6 }
+    }
+
+    pub fn read(self, on: bool) -> OpenOptions {
+        var o = self;
+        o.read = on;
+        o
+    }
+
+    pub fn write(self, on: bool) -> OpenOptions {
+        var o = self;
+        o.write = on;
+        o
+    }
+
+    pub fn append(self, on: bool) -> OpenOptions {
+        var o = self;
+        o.append = on;
+        o
+    }
+
+    pub fn truncate(self, on: bool) -> OpenOptions {
+        var o = self;
+        o.truncate = on;
+        o
+    }
+
+    pub fn create(self, on: bool) -> OpenOptions {
+        var o = self;
+        o.create = on;
+        o
+    }
+
+    pub fn create_new(self, on: bool) -> OpenOptions {
+        var o = self;
+        o.create_new = on;
+        o
+    }
+
+    // The permission bits a file it makes gets (0x1b6 before the umask).
+    pub fn mode(self, bits: i32) -> OpenOptions {
+        var o = self;
+        o.mode = bits;
+        o
+    }
+
+    pub fn open(self, path: [u8]) -> Result<File> {
+        let writes = self.write || self.append;
+        var flags = if self.read && writes { SYS_O_RDWR } else if writes { SYS_O_WRONLY }
+            else { SYS_O_RDONLY };
+        if self.append {
+            flags |= SYS_O_APPEND;
+        }
+        if self.truncate {
+            flags |= SYS_O_TRUNC;
+        }
+        if self.create_new {
+            flags |= SYS_O_CREAT | SYS_O_EXCL;
+        } else if self.create {
+            flags |= SYS_O_CREAT;
+        }
+        let fd = os(sys_open(path, flags | SYS_O_CLOEXEC, self.mode))?;
+        Ok(File { fd: fd })
+    }
+}
+
+// What stat says of a file.
+#[derive(Eq, Debug)]
+pub struct Metadata { st: FileStat }
+
+impl Metadata {
+    // The size in bytes.
+    pub fn len(self) -> i64 {
+        self.st.size
+    }
+
+    pub fn is_dir(self) -> bool {
+        self.st.is_dir()
+    }
+
+    pub fn is_file(self) -> bool {
+        self.st.is_file()
+    }
+
+    pub fn is_symlink(self) -> bool {
+        self.st.is_symlink()
+    }
+
+    // The permission bits (0x1ed: 0o755, ...).
+    pub fn mode(self) -> u32 {
+        self.st.permissions()
+    }
+
+    // When it was last changed: since the Unix epoch.
+    pub fn modified(self) -> std::time::Duration {
+        std::time::Duration::new(self.st.mtime_sec as u64, self.st.mtime_nsec as u32)
+    }
+}
+
+// ---- Whole files (0.20) ----
+
+// The bytes of the file at path, in a new Vec on allocator a.
+pub fn read_in<A: Allocator>(path: [u8], a: sink A) -> Result<Vec<u8, A>> {
+    var f = File::open(path)?;
+    let size = match f.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => 0,
+    };
+    var v: Vec<u8, A> = Vec::with_capacity_in(size + 1, a);
+    f.read_to_end(&v)?;
+    Ok(v)
+}
+
+// The text of the file at path, in a new String on allocator a
+// (InvalidData when it is not UTF-8).
+pub fn read_to_string_in<A: Allocator>(path: [u8], a: sink A) -> Result<String<A>> {
+    let v = read_in(path, a)?;
+    match String::from_utf8(v) {
+        Ok(s) => Ok(s),
+        Err(_) => Err(__io_error(ErrorKind::InvalidData, c"stream did not contain valid UTF-8")),
+    }
+}
+
+// The file at path holds data: made, or emptied first.
+pub fn write(path: [u8], data: [u8]) -> Result<()> {
+    var f = File::create(path)?;
+    f.write_all(data)
+}
+
+// data at the end of the file at path (made when it is not there).
+pub fn append(path: [u8], data: [u8]) -> Result<()> {
+    var f = OpenOptions::new().append(true).create(true).open(path)?;
+    f.write_all(data)
+}
+
+// Copies the file at `from` to `to` (made, or emptied): the bytes copied.
+pub fn copy(from: [u8], to: [u8]) -> Result<i64> {
+    var src = File::open(from)?;
+    var dst = File::create(to)?;
+    var buf: [u8; 65536] = [0; 65536];
+    var total = 0;
+    loop {
+        let n = src.read(&buf[..])?;
+        if n == 0 {
+            return Ok(total);
+        }
+        dst.write_all(buf[..n])?;
+        total += n;
+    }
+}
+
+// What stat says of the file at path (through a symlink).
+pub fn metadata(path: [u8]) -> Result<Metadata> {
+    let st = os(sys_stat(path))?;
+    Ok(Metadata { st: st })
+}
+
+// As metadata, of a symlink itself.
+pub fn symlink_metadata(path: [u8]) -> Result<Metadata> {
+    let st = os(sys_lstat(path))?;
+    Ok(Metadata { st: st })
+}
+
+// Whether something is at path.
+pub fn exists(path: [u8]) -> bool {
+    match sys_stat(path) {
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
+pub fn remove_file(path: [u8]) -> Result<()> {
+    os(sys_unlink(path))
+}
+
+// Removes the empty directory at path.
+pub fn remove_dir(path: [u8]) -> Result<()> {
+    os(sys_rmdir(path))
+}
+
+pub fn rename(from: [u8], to: [u8]) -> Result<()> {
+    os(sys_rename(from, to))
+}
+
+pub fn create_dir(path: [u8]) -> Result<()> {
+    os(sys_mkdir(path, 0x1ff))
+}
+
+// Makes the directory at path and the ones above it that are missing
+// (Ok when it is there).
+pub fn create_dir_all(path: [u8]) -> Result<()> {
+    if path.len == 0 {
+        return Ok(());
+    }
+    match sys_mkdir(path, 0x1ff) {
+        Ok(_) => return Ok(()),
+        Err(e) => {
+            if e == SYS_EEXIST {
+                return if is_dir_at(path) { Ok(()) } else { Err(__os_error(e)) };
+            }
+        }
+    }
+    // (the parents first, then this one)
+    var end = path.len;
+    while end > 0 && path[end - 1] == '/' {
+        end -= 1;
+    }
+    var k = end;
+    while k > 0 && path[k - 1] != '/' {
+        k -= 1;
+    }
+    if k > 1 {
+        create_dir_all(path[..k - 1])?;
+    }
+    match sys_mkdir(path, 0x1ff) {
+        Ok(_) => Ok(()),
+        Err(e) => if e == SYS_EEXIST && is_dir_at(path) { Ok(()) } else { Err(__os_error(e)) },
+    }
+}
+
+fn is_dir_at(path: [u8]) -> bool {
+    match sys_stat(path) {
+        Ok(st) => st.is_dir(),
+        Err(_) => false,
+    }
+}
+
+// Removes the directory at path and all it holds (symlinks are removed,
+// not followed).
+pub fn remove_dir_all(path: [u8]) -> Result<()> {
+    var stack: [u8; 4096] = [0; 4096];
+    if path.len >= 4096 {
+        return Err(__io_error(ErrorKind::InvalidInput, c"path too long"));
+    }
+    for i in 0..path.len {
+        stack[i] = path[i];
+    }
+    remove_tree(&stack, path.len)
+}
+
+// Removes the tree at buf[..n], which it extends with each entry's name.
+fn remove_tree(buf: inout [u8; 4096], n: i64) -> Result<()> {
+    let st = os(sys_lstat(buf[..n]))?;
+    if !st.is_dir() {
+        return os(sys_unlink(buf[..n]));
+    }
+    var dir = read_dir(buf[..n])?;
+    loop {
+        let e = match dir.next() {
+            Option::Some(r) => r?,
+            Option::None => break,
+        };
+        let name = e.name[..e.len];
+        if n + 1 + name.len >= 4096 {
+            return Err(__io_error(ErrorKind::InvalidInput, c"path too long"));
+        }
+        buf[n] = '/';
+        for i in 0..name.len {
+            buf[n + 1 + i] = name[i];
+        }
+        remove_tree(&buf, n + 1 + name.len)?;
+    }
+    os(sys_rmdir(buf[..n]))
+}
+
+// ---- Directories (0.20) ----
+
+// The entries of the directory at path ("." and ".." left out), in the
+// order the file system gives them.
+pub fn read_dir(path: [u8]) -> Result<ReadDir> {
+    let d = os(sys_opendir(path))?;
+    Ok(ReadDir { dir: d })
+}
+
+// `fs::read_dir(p)?`: each item an io::Result<DirEntry>. Dropping it
+// closes the directory.
+pub struct ReadDir { dir: SysDir }
+
+impl Drop for ReadDir {
+    fn drop(inout self) {
+        let _ = sys_closedir(&self.dir);
+    }
+}
+
+impl Iterator for ReadDir {
+    type Item = Result<DirEntry>;
+
+    fn next(inout self) -> Option<Result<DirEntry>> {
+        loop {
+            var e = DirEntry { name: [0; 256], len: 0, kind: 0 };
+            match sys_readdir_into(&self.dir, &e.name) {
+                Ok(Option::Some(x)) => {
+                    e.len = x.name_len;
+                    e.kind = x.kind;
+                    let nm = e.name[..e.len];
+                    if nm == "." || nm == ".." {
+                        continue;
+                    }
+                    return Option::Some(Ok(e));
+                }
+                Ok(Option::None) => return Option::None,
+                Err(err) => return Option::Some(Err(__os_error(err))),
+            }
+        }
+    }
+}
+
+// A directory's entry: its name (inline, up to 256 bytes) and kind.
+pub struct DirEntry { name: [u8; 256], len: i64, kind: u8 }
+
+impl DirEntry {
+    // Its name, a view of the entry.
+    pub fn file_name(self) -> Path {
+        self.name[..self.len] as Path
+    }
+
+    // dir's path with the name after it, on allocator a.
+    pub fn path_in<A: Allocator>(self, dir: [u8], a: sink A) -> PathBuf<A> {
+        var p: PathBuf<A> = PathBuf::from_in(dir, a);
+        p.push(self.name[..self.len]);
+        p
+    }
+
+    // Whether the file system says it is a directory (false when it does
+    // not say: fs::metadata knows).
+    pub fn is_dir(self) -> bool {
+        self.kind == SYS_DT_DIR
+    }
+
+    pub fn is_file(self) -> bool {
+        self.kind == SYS_DT_REG
+    }
+
+    pub fn is_symlink(self) -> bool {
+        self.kind == SYS_DT_LNK
+    }
+}
