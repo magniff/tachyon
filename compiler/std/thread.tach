@@ -13,15 +13,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 // stack (8 MiB) and its start record come from C's allocator:
 // `alloc(extern)`.
 //
-// 0.21.0 checks nothing about what crosses threads yet (the Send and Sync
-// rules of §2.4 come with 0.21.1), so `spawn` and `scope` are `unsafe fn`.
-// Their contract: what the closure captures and returns may move to
-// another thread (no raw pointer or view that the spawning thread still
-// uses, unless through std::sync's types or an atomic); the closure reaches
-// no `static mut` (query effects: no `global`); a scoped thread's views of
-// the caller's values are not written by the caller until the scope ends.
+// What crosses threads is checked where they start (front/threads.tach,
+// `sync.*` diagnostics): spawn takes a `move` closure whose captures and
+// result are Send and hold no view, and that reaches no `static mut`;
+// scope's closure changes nothing it borrows from the caller while its
+// threads read it, and a scoped thread only reads what it borrows.
 //
-//     let h = unsafe { thread::spawn(move || work(input)) };
+//     let h = thread::spawn(move || work(input));
 //     let r = h.join();
 
 extern "C" {
@@ -133,32 +131,34 @@ impl<R> Drop for JoinHandle<R> {
 const THREAD_STACK: u64 = 8388608;
 
 // Starts a thread running f; its handle.
-pub unsafe fn spawn<F: FnMut() -> R, R>(f: F) -> JoinHandle<R> {
-    std::fmt::print_threads_started();
-    let out = thread_c_malloc(size_of(Out<R>) as u64) as *Out<R>;
-    if out == 0 as *Out<R> {
-        out_of_memory();
+pub fn spawn<F: FnMut() -> R, R>(f: F) -> JoinHandle<R> {
+    unsafe {
+        std::fmt::print_threads_started();
+        let out = thread_c_malloc(size_of(Out<R>) as u64) as *Out<R>;
+        if out == 0 as *Out<R> {
+            out_of_memory();
+        }
+        *out = Out { refs: AtomicU32::new(2), result: None };
+        let q = thread_c_malloc(size_of(Packet<F, R>) as u64) as *Packet<F, R>;
+        let s = thread_c_malloc(size_of(Start) as u64) as *Start;
+        if q == 0 as *Packet<F, R> || s == 0 as *Start {
+            out_of_memory();
+        }
+        *q = Packet { f: f, out: out };
+        *s = Start { run: thread_run::<F, R>, data: q as *u8 };
+        // (pthread_attr_t: 64 bytes on macOS and Linux; room for more)
+        let mut attr: [u64; 16] = [0; 16];
+        let a = &mut attr as *u8;
+        thread_c_attr_init(a);
+        thread_c_attr_setstacksize(a, THREAD_STACK);
+        let mut t: u64 = 0;
+        let rc = thread_c_create(&mut t, a, thread_start, s as *u8);
+        thread_c_attr_destroy(a);
+        if rc != 0 {
+            panic_str("thread::spawn: the system could not start a thread");
+        }
+        JoinHandle { t: t, out: out }
     }
-    *out = Out { refs: AtomicU32::new(2), result: None };
-    let q = thread_c_malloc(size_of(Packet<F, R>) as u64) as *Packet<F, R>;
-    let s = thread_c_malloc(size_of(Start) as u64) as *Start;
-    if q == 0 as *Packet<F, R> || s == 0 as *Start {
-        out_of_memory();
-    }
-    *q = Packet { f: f, out: out };
-    *s = Start { run: thread_run::<F, R>, data: q as *u8 };
-    // (pthread_attr_t: 64 bytes on macOS and Linux; room for more)
-    let mut attr: [u64; 16] = [0; 16];
-    let a = &mut attr as *u8;
-    thread_c_attr_init(a);
-    thread_c_attr_setstacksize(a, THREAD_STACK);
-    let mut t: u64 = 0;
-    let rc = thread_c_create(&mut t, a, thread_start, s as *u8);
-    thread_c_attr_destroy(a);
-    if rc != 0 {
-        panic_str("thread::spawn: the system could not start a thread");
-    }
-    JoinHandle { t: t, out: out }
 }
 
 // The threads a `scope` started, joined when it ends: a list.
@@ -206,36 +206,40 @@ impl<R> ScopedJoinHandle<R> {
 
 impl Scope {
     // Starts a thread running f, joined at the latest when the scope ends.
-    pub unsafe fn spawn<F: FnMut() -> R, R>(self: &mut Scope, f: F) -> ScopedJoinHandle<R> {
-        let slot = thread_c_malloc(size_of(ScopeHandle<R>) as u64) as *ScopeHandle<R>;
-        if slot == 0 as *ScopeHandle<R> {
-            out_of_memory();
+    pub fn spawn<F: FnMut() -> R, R>(self: &mut Scope, f: F) -> ScopedJoinHandle<R> {
+        unsafe {
+            let slot = thread_c_malloc(size_of(ScopeHandle<R>) as u64) as *ScopeHandle<R>;
+            if slot == 0 as *ScopeHandle<R> {
+                out_of_memory();
+            }
+            let node = thread_c_malloc(size_of(ScopeJoin) as u64) as *ScopeJoin;
+            if node == 0 as *ScopeJoin {
+                out_of_memory();
+            }
+            *slot = ScopeHandle { h: Some(spawn(f)), done: false };
+            *node = ScopeJoin { join: scope_join::<R>, handle: slot as *u8, next: self.first };
+            self.first = node;
+            ScopedJoinHandle { slot: slot }
         }
-        let node = thread_c_malloc(size_of(ScopeJoin) as u64) as *ScopeJoin;
-        if node == 0 as *ScopeJoin {
-            out_of_memory();
-        }
-        *slot = ScopeHandle { h: Some(spawn(f)), done: false };
-        *node = ScopeJoin { join: scope_join::<R>, handle: slot as *u8, next: self.first };
-        self.first = node;
-        ScopedJoinHandle { slot: slot }
     }
 }
 
 // Runs f with a scope; every thread started in it is joined before scope
 // returns f's result.
-pub unsafe fn scope<F: FnMut(&mut Scope) -> R, R>(f: F) -> R {
-    let mut s = Scope { first: 0 as *ScopeJoin };
-    let mut g = f;
-    let r = g(&mut s);
-    let mut n = s.first;
-    while n != 0 as *ScopeJoin {
-        let next = (*n).next;
-        ((*n).join)((*n).handle);
-        thread_c_free(n as *u8);
-        n = next;
+pub fn scope<F: FnMut(&mut Scope) -> R, R>(f: F) -> R {
+    unsafe {
+        let mut s = Scope { first: 0 as *ScopeJoin };
+        let mut g = f;
+        let r = g(&mut s);
+        let mut n = s.first;
+        while n != 0 as *ScopeJoin {
+            let next = (*n).next;
+            ((*n).join)((*n).handle);
+            thread_c_free(n as *u8);
+            n = next;
+        }
+        r
     }
-    r
 }
 
 // Lets another thread run.
