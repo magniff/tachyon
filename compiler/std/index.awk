@@ -35,6 +35,12 @@ BEGIN {
     # below, so that a program that uses neither reads none of them.
     n = split("std::objc|Objective-C objects (0.22)|Autorelease pools, selectors, classes, frameworks (0.22)|Strings and exceptions (0.22)|std::objc::foundation|std::gpu|GPU: errors (0.22)|GPU: the sizes buffer (0.22)|GPU: instance, adapters, devices (0.22)|GPU: buffers, textures, samplers, shaders (0.22)|GPU: bind layouts and groups (0.22)|GPU: pipelines (0.22)|GPU: encoders and passes (0.22)|GPU: surfaces and frames (0.22)|GPU: bytes (0.22)|std::gpu::types|GPU types: flags, formats, descriptors (0.22)|std::gpu::shader|GPU shaders: sources and reflection (0.22)|GPU shaders: from std::gpu::wgsl (0.22)|std::gpu::hal|The GPU backend interface (0.22)|std::gpu::hal::metal|GPU on Metal: devices, memory, resources (0.22)|GPU on Metal: conversions (0.22)|GPU on Metal: recording helpers (0.22)|GPU on Metal: hal::Api (0.22)|GPU on Metal: hal::Render (0.22)|std::gpu::hal::metal::bindings", lz, "|")
     for (i = 1; i <= n; i++) LAZY[lz[i]] = 1
+    # (0.23) std::window: every section lazy, behind the window gate, so
+    # that a program that does not name it reads none of it (its Cocoa
+    # callbacks would otherwise be in every program: the effects of every
+    # C call include what a callback may do)
+    n = split("std::window|Windows and input (0.23)|std::window::keys|Keys (0.23)|std::window::objc|The Objective-C layer (0.23)|std::window::cocoa|The Cocoa backend (0.23)|the view's methods (IMPs) (0.23)|NSTextInputClient (0.23)|the window delegate (0.23)|watched file descriptors (0.23)|classes (0.23)", lz, "|")
+    for (i = 1; i <= n; i++) LAZY[lz[i]] = 1
     # (0.20) GATES: modules whose items no program reaches without naming
     # the module (no re-export outside it): a word of one of their lazy
     # sections asks for it only from a program that also names the module's
@@ -71,6 +77,12 @@ BEGIN {
     GATES["std::gpu::hal"] = "gpu"
     GATES["std::gpu::hal::metal"] = "gpu"
     GATES["std::gpu::hal::metal::bindings"] = "gpu"
+    # (0.23) std::window: read only by a program that names `window`
+    CLOSED["window"] = 1
+    GATES["std::window"] = "window"
+    GATES["std::window::keys"] = "window"
+    GATES["std::window::objc"] = "window"
+    GATES["std::window::cocoa"] = "window"
     nmod = 0
     TRIGGERS["Iterators (0.14)"] = "Iterator IntoIterator"
     # (0.20: the Iterator trait in std::iter, before its first banner)
