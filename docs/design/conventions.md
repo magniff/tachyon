@@ -1590,3 +1590,46 @@ and, with `--syntax=0.20`, no written `let` in a parameter list.
 - `PARAM_TYPE` stays true inside a parameter's nested types, so the
   parser's conv.rust fix of `p: Option<&T>` is `Option<T>`, not
   `Option<let T>`.
+
+## Phase M as built (branch c20-convM)
+
+The migration and the flip, with helpers for the corpus (pm-tests,
+pm-examples, pm-transcripts, merged in).
+
+- **The flip.** User code is read in 0.20's spelling by default
+  (`--syntax=0.20`); `--syntax=mixed` (and TACHYON_SYNTAX=mixed, which a
+  migration sets for the checks it runs) reads both; the root pragma
+  `// tachyon-syntax: 0.19` is compiler/src's until 0.21. std is 0.20 code
+  whatever the program's mode, except a std tree read from disk in a mixed
+  run (`fix --only conventions --std-tree compiler/std`: std migrating).
+- **fix --only conventions** works on the checked program, and in a merge
+  on the files a branch brought: `--in A,B,...` limits it. Rules added
+  while migrating: `let p = &e` used as a raw pointer (cast, indexed as an
+  address, written through, its own address taken) is `let p = &e as *T`;
+  a reference parameter cast or indexed as an address is `*T`; `for x in
+  &v` is `for x in v`; `&v[a..b]` the checker reads as the slice is
+  `v[a..b]` (`let s = &mut v[..]` is `inout s = &v[..]`); `&mut x` to a
+  let parameter is `x`; `match &part`, `match &r`, `match &copy` drop the
+  `&`; `(*p).f` whose node starts at the parenthesis; `let (a, b) = &e` of
+  a copy; closure bodies of generic calls by the parameters' names.
+  Generic std code that no instance reaches is not seen by it: an inout
+  parameter passed on through a function value (`f(g)`) needed its `&` by
+  hand.
+- **Semantics settled while migrating.** `match e` of an access matches
+  through it, and `match part` of a non-copyable part it cannot take
+  borrows it (D13 for a match): the bindings are accesses. A view taken
+  through an access (`&*r`: an inout local, a pattern's binding) is a view
+  of what the access designates. A String or PathBuf place goes where its
+  view goes, `f(s)` (as a Vec where its slice goes). A closure literal
+  given to a let parameter that borrows it is lent from the caller's
+  frame. `Iterator::at` takes `inout self` (its default advanced a copy).
+  An assignment through an access drops the old value (its `let =o` is no
+  D13 borrow). A let parameter of a plain type is a copy, so tests about
+  the address or the aliasing of a `&T` parameter now use `*T`.
+- **std::env::get / get_in** replace `var` / `var_in` (`var` is a word,
+  a keyword from 0.21); `env::var(..)` is conv.rust with `try: env::get`.
+- **Left for 0.20.1.** A closure's by-value parameter is not dropped
+  (0.19.1 leaks too); a generic let parameter given an rvalue of a
+  non-copyable type other than a closure literal (`gl(make())`) errors;
+  the own.move_out try for an operator impl suggests `std::take(&self)` of
+  a let receiver.
