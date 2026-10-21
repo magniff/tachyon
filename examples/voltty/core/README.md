@@ -40,16 +40,18 @@ where it differs from the older tables of alacritty_terminal.
 ## Throughput
 
 `bench/run.sh`: the same bytes through each, in 64 KiB chunks, to a
-120x40 terminal with 10,000 lines of scrollback, the best of three
-rounds, on an Apple-silicon Mac with a load average around 10:
+120x40 terminal with 10,000 lines of scrollback, the two in turns, the
+best of five rounds, on a busy Apple-silicon Mac (load average 31). The
+ratio is voltty's throughput over alacritty_terminal's: above 1, voltty
+is faster.
 
 | workload | voltty | alacritty_terminal | ratio |
 |---|---|---|---|
-| ascii (cat of a text) | 471 MiB/s | 218 MiB/s | 2.16x |
-| sgr (every cell coloured) | 497 MiB/s | 347 MiB/s | 1.43x |
-| cjk (wide characters, combining marks) | 294 MiB/s | 233 MiB/s | 1.26x |
-| region (scrolling in a region) | 415 MiB/s | 205 MiB/s | 2.02x |
-| motion (cursor moves) | 374 MiB/s | 338 MiB/s | 1.11x |
+| ascii (cat of a text) | 386 MiB/s | 149 MiB/s | 2.59x |
+| sgr (every cell coloured) | 396 MiB/s | 305 MiB/s | 1.30x |
+| cjk (wide characters, combining marks) | 232 MiB/s | 144 MiB/s | 1.61x |
+| region (scrolling in a region) | 376 MiB/s | 138 MiB/s | 2.72x |
+| motion (cursor moves) | 316 MiB/s | 239 MiB/s | 1.32x |
 
 ## Alacritty's quirks, kept
 
