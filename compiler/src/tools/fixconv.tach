@@ -1,0 +1,977 @@
+// `tachyonc fix --only conventions` (0.20, docs/design/conventions.md §9.2):
+// a program in 0.19's spelling rewritten in 0.20's, whole-program and by
+// types: what the checker resolved (each call's callee, each expression's
+// type) decides each rewrite, not the text.
+//
+// - Rule 1, parameters: `x: &T` → `x: T` (let, the default), `x: &mut T` →
+//   `x: inout T`, `x: &[T]` → `x: [T]`, `x: &mut [T]` → `x: inout [T]`.
+// - Rule 2, receivers: `self: &Self` → `self`, `self: &mut Self` → `inout
+//   self`, `self: Self` → `sink self` (an owned Self; `self` for a plain
+//   one), `mut self: T` → `sink self`.
+// - Rule 3, by-value parameters: an owned or move-only one (holding a Vec,
+//   a Buf, a `&mut`; or a type parameter, which an instance may make owned)
+//   → `x: sink T`, as 0.19 moved it; `mut x: T` → `x: sink T`; a plain or
+//   copyable one stays (let copies it). A method of a program's trait
+//   follows the trait's declaration, so that they match.
+// - Rule 4, call sites: `&mut e` → `&e`; `&e` given to a shared reference
+//   parameter (let now) or a `&T` field → `e`; `&e` to a raw `*T` stays.
+// - Rule 5: `*r` on a reference (an access now, used as its value) → `r`,
+//   `(*p).f` → `p.f`.
+// - Rule 6, locals: `let mut` → `var`, `let r = &mut e;` → `inout r = &e;`
+//   (a local of type `&mut T` from a call: `inout r = e;`).
+// - Rule 7: `static mut` → `static var`, `mut x` in a pattern → `var x`,
+//   `move ||` → `sink ||`, `&T` / `&mut T` elsewhere (fields, results, type
+//   arguments, annotations) → `let T` / `inout T`, `&[T]` → `[T]`.
+// Left to hand, and reported (`--list-left` prints each): `let r = &e;` (a
+// shared reference local), a reference local that is re-pointed (`let mut
+// r = &..`), an `&e` with no let parameter or field to take it, `&&T`,
+// by-value owned parameters of function types and closures, identifiers
+// named `var`, `inout` or `sink` (D27: keywords in 0.21).
+//
+// `--only conventions-spelling` makes only the rewrites whose meaning the
+// checker of Phase 0 already gives (the new forms are 0.19's references
+// underneath until T1): rules 1 to 4 and 6, 7 with `x: &T` → `x: let T`
+// and a plain `self: T` and the `&e` given to let parameters left as they
+// are, and no rule 5. Its result checks, and runs, as the program did; a
+// later `fix --only conventions` finishes it.
+//
+// std is never rewritten, but under `--std-tree DIR` (its files then).
+
+use crate::base::{FILES, SRC, SYMS, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern};
+use crate::front::ast::{
+    CLOSURE_MOVE, CONV_NEW, FIELD_SHORTHAND, NODES, NODE_COUNT, NODE_REF, NODE_REF_MUT, NodeKind,
+    child,
+};
+use crate::front::lexer::Tok;
+use crate::front::modules::file_of_pos;
+use crate::front::own::kinds::{K_OWNED, type_kind};
+use crate::front::traits::{IMPLS, impl_of_fn, trait_fn};
+use crate::front::types::{
+    FNS, FN_COUNT, REF_MUT, REF_SHARED, STRUCTS, TYPES, TyKind, fn_param, struct_field, type_elem,
+};
+use crate::middle::lower::ssa::HMap;
+use crate::tools::edit::edit_replace;
+use crate::tools::query::diagnostics::diag;
+
+// What was rewritten (fix's summary).
+pub const CC_PARAM_LET: i64 = 0;
+pub const CC_PARAM_INOUT: i64 = 1;
+pub const CC_PARAM_SINK: i64 = 2;
+pub const CC_RECEIVER: i64 = 3;
+pub const CC_MARKER: i64 = 4;
+pub const CC_UNMARKED: i64 = 5;
+pub const CC_DEREF: i64 = 6;
+pub const CC_VAR: i64 = 7;
+pub const CC_INOUT_LOCAL: i64 = 8;
+pub const CC_STATIC: i64 = 9;
+pub const CC_SINK_CLOSURE: i64 = 10;
+pub const CC_TYPE: i64 = 11;
+pub const CC_COUNT: i64 = 12;
+pub static mut CONV_COUNTS: [i64; 12] = [0; 12];
+
+// What is left to hand (reported).
+const CL_SHARED_LOCAL: i64 = 0;
+const CL_REPOINTED: i64 = 1;
+const CL_AMP: i64 = 2;
+const CL_AMPAMP: i64 = 3;
+const CL_FN_TYPE: i64 = 4;
+const CL_WORD: i64 = 5;
+const CL_GUESSED: i64 = 6;
+const CL_COUNT: i64 = 7;
+pub static mut CONV_LEFT: [i64; 7] = [0; 7];
+static mut LEFT_AT: crate::base::IntVec = crate::base::IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// `--only conventions-spelling` (no rewrite that needs T1's checking).
+pub static mut CONV_SPELLING: bool = false;
+// `--list-left`: each place left to hand, a line.
+pub static mut CONV_LIST_LEFT: bool = false;
+
+// The edits made, by their start (an instance's nodes are its template's,
+// copied: one edit per place).
+static mut DONE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// Type nodes rewritten (or left) by a rule before the type rule sees them.
+static mut TYPE_DONE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// Function nodes to FNS indexes + 1 (non-generic functions and templates).
+static mut FN_OF_NODE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// The sink decisions of trait declarations' parameters: key node*64+i+1,
+// value 1 (let) or 2 (sink).
+static mut DECIDED: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static mut SYM_SELF: i64 = -1;
+
+// ---- Text ----
+
+fn editable(pos: i64) -> bool {
+    unsafe { pos >= 0 && FILES[file_of_pos(pos)].path[0] != '<' }
+}
+
+fn is_ws(c: u8) -> bool {
+    c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+fn ident_char(c: u8) -> bool {
+    c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_'
+}
+
+fn skip_ws(p: i64) -> i64 {
+    unsafe {
+        let mut q = p;
+        while is_ws(SRC[q]) {
+            q += 1;
+        }
+        q
+    }
+}
+
+// Whether the word w is at p (not a prefix of a longer identifier).
+fn word_here(p: i64, w: [u8]) -> bool {
+    unsafe {
+        for i in 0..w.len {
+            if SRC[p + i] != w[i] {
+                return false;
+            }
+        }
+        !ident_char(SRC[p + w.len])
+    }
+}
+
+// The end of `mut` and the blanks after it at p, or p.
+fn after_mut(p: i64) -> i64 {
+    if word_here(p, "mut") { skip_ws(p + 3) } else { p }
+}
+
+// SRC[a..b) replaced by text, once per place; whether it was made.
+fn put(a: i64, b: i64, text: [u8], what: i64) -> bool {
+    unsafe {
+        if !editable(a) || DONE.get(a + 1) != 0 {
+            return false;
+        }
+        let t = buf_new();
+        buf_bytes(t, text);
+        if !edit_replace(a, b, t) {
+            return false;
+        }
+        DONE.put(a + 1, 1);
+        if what >= 0 {
+            CONV_COUNTS[what] += 1;
+        }
+        true
+    }
+}
+
+fn left(pos: i64, what: i64) {
+    unsafe {
+        if !editable(pos) || DONE.get(pos + 1) != 0 {
+            return;
+        }
+        DONE.put(pos + 1, 2);
+        CONV_LEFT[what] += 1;
+        LEFT_AT.push(pos);
+        LEFT_AT.push(what);
+    }
+}
+
+// ---- Types ----
+
+// Whether type t holds an exclusive reference (a move-only view).
+fn holds_mut(t: i64, depth: i64) -> bool {
+    unsafe {
+        if t <= 0 || depth > 6 {
+            return false;
+        }
+        let k = TYPES[t].kind;
+        if k == TyKind::Ptr {
+            return TYPES[t].b == REF_MUT;
+        }
+        if k == TyKind::Slice {
+            return TYPES[t].b == REF_MUT;
+        }
+        if k == TyKind::Tuple {
+            for i in 0..TYPES[t].count {
+                if holds_mut(type_elem(t, i), depth + 1) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if k == TyKind::Array {
+            return holds_mut(TYPES[t].a, depth + 1);
+        }
+        if k == TyKind::Struct {
+            let s = TYPES[t].a;
+            for i in 0..STRUCTS[s].field_count {
+                if holds_mut((*struct_field(s, i)).ty, depth + 1) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+// Whether a by-value parameter of type t is taken sink: owned or
+// move-only.
+fn sink_type(t: i64) -> bool {
+    t > 0 && ((type_kind(t) & K_OWNED) != 0 || holds_mut(t, 0))
+}
+
+fn is_ref_type(t: i64) -> bool {
+    unsafe { t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b != 0 }
+}
+
+fn is_shared_ref(t: i64) -> bool {
+    unsafe { t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == REF_SHARED }
+}
+
+// Whether name is one of generics node g's parameters.
+fn generic_name(g: i64, name: i64) -> bool {
+    unsafe {
+        if g <= 0 {
+            return false;
+        }
+        for i in 0..NODES[g].count {
+            if NODES[child(g, i)].a == name {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// Whether type parameter name of generics node g is bounded by `Fn(..)` or
+// `FnMut(..)`: a closure, called and not kept (most are views, which a let
+// copies), so taken let.
+fn fn_bounded(g: i64, name: i64) -> bool {
+    unsafe {
+        if g <= 0 {
+            return false;
+        }
+        for i in 0..NODES[g].count {
+            let p = child(g, i);
+            let h = NODES[p].h;
+            if NODES[p].a != name || h <= 0 || NODES[h].kind != NodeKind::Generics {
+                continue;
+            }
+            for j in 0..NODES[h].count {
+                let b = child(h, j);
+                if NODES[b].kind == NodeKind::TyFn && NODES[b].d >= 2 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+fn std_owned_name(name: i64) -> bool {
+    unsafe {
+        let s = SYMS[name].text;
+        s == "Vec" || s == "Buf" || s == "HashMap" || s == "HashSet" || s == "String"
+            || s == "Box" || s == "Rc" || s == "Arc" || s == "Arena" || s == "BTreeMap"
+            || s == "Deque" || s == "VecDeque"
+    }
+}
+
+// By its text: whether type node tn of a parameter of function node fnode
+// is taken sink (a type parameter, `Self` of a trait or a generic impl, an
+// owned std container), with the trait's Self unknown when self_unknown.
+fn sink_by_name(tn: i64, fnode: i64, self_unknown: bool, depth: i64) -> bool {
+    unsafe {
+        if tn <= 0 || depth > 8 {
+            return false;
+        }
+        let k = NODES[tn].kind;
+        if k == NodeKind::TyPtr || k == NodeKind::TySlice || k == NodeKind::TyFn {
+            return false;
+        }
+        if k == NodeKind::TyTuple {
+            for i in 0..NODES[tn].count {
+                if sink_by_name(child(tn, i), fnode, self_unknown, depth + 1) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if k == NodeKind::TyArray {
+            return sink_by_name(NODES[tn].a, fnode, self_unknown, depth + 1);
+        }
+        if k != NodeKind::TyName {
+            return false;
+        }
+        let name = NODES[tn].a;
+        if name == SYM_SELF && NODES[tn].list == 0 {
+            if self_unknown {
+                return true;
+            }
+            let h = NODES[fnode].h;
+            return h > 0 && h != tn && sink_by_name(h, fnode, false, depth + 1);
+        }
+        if NODES[tn].list == 0 && generic_name(NODES[fnode].g, name) {
+            return !fn_bounded(NODES[fnode].g, name);
+        }
+        if std_owned_name(name) {
+            return true;
+        }
+        let g = NODES[tn].g;
+        if g > 0 {
+            for i in 0..NODES[g].count {
+                if sink_by_name(child(g, i), fnode, self_unknown, depth + 1) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+// ---- The parameters' decisions ----
+
+// The FNS index of function node n, or -1 (a trait's declaration).
+fn fn_of(n: i64) -> i64 {
+    unsafe { FN_OF_NODE.get(n + 1) - 1 }
+}
+
+// The declaration (a Fn node) of the program's trait function that node
+// n (function f) implements, or 0.
+fn trait_decl(f: i64, n: i64) -> i64 {
+    unsafe {
+        if f < 0 {
+            return 0;
+        }
+        let im = impl_of_fn(f);
+        if im < 0 || IMPLS[im].tr < 0 {
+            return 0;
+        }
+        let d = trait_fn(IMPLS[im].tr, NODES[n].a);
+        if d > 0 && d != n && editable(NODES[d].start) { d } else { 0 }
+    }
+}
+
+// Whether by-value parameter i (Param node p) of function node n is
+// taken sink.
+fn param_sinks(n: i64, i: i64, p: i64) -> bool {
+    unsafe {
+        let f = fn_of(n);
+        let d = trait_decl(f, n);
+        if d > 0 && i < NODES[d].count {
+            return param_sinks(d, i, child(d, i));
+        }
+        let key = n * 64 + i + 1;
+        let known = DECIDED.get(key);
+        if known != 0 {
+            return known == 2;
+        }
+        let tn = NODES[p].b;
+        let mut sinks = false;
+        if f >= 0 && FNS[f].generic == 0 && i < FNS[f].param_count {
+            sinks = sink_type(fn_param(f, i));
+        } else {
+            // (a template, or a trait's declaration: by the text, and by
+            // the instances the program makes)
+            sinks = sink_by_name(tn, n, f < 0, 0);
+            let mut instances = 0;
+            let closure = NODES[tn].kind == NodeKind::TyName && NODES[tn].list == 0
+                && fn_bounded(NODES[n].g, NODES[tn].a);
+            if f >= 0 && !closure {
+                for g in 0..FN_COUNT {
+                    if FNS[g].tmpl == f + 1 && i < FNS[g].param_count {
+                        instances += 1;
+                        if sink_type(fn_param(g, i)) {
+                            sinks = true;
+                        }
+                    }
+                }
+            }
+            if !sinks && instances == 0 && f >= 0 && NODES[tn].kind == NodeKind::TyName
+                && !generic_name(NODES[n].g, NODES[tn].a) {
+                left(NODES[tn].start, CL_GUESSED);
+            }
+        }
+        DECIDED.put(key, if sinks { 2 } else { 1 });
+        sinks
+    }
+}
+
+// ---- Rules 1 to 3: signatures ----
+
+// Function node n's parameters (its list's Param nodes).
+fn edit_signature(n: i64, closure: bool) {
+    unsafe {
+        let mut i = 0;
+        for j in 0..NODES[n].count {
+            let p = child(n, j);
+            if NODES[p].kind != NodeKind::Param {
+                continue;
+            }
+            edit_param(n, i, p, closure);
+            i += 1;
+        }
+    }
+}
+
+fn edit_param(n: i64, i: i64, p: i64, closure: bool) {
+    unsafe {
+        let tn = NODES[p].b;
+        if tn <= 0 || !editable(NODES[p].start) {
+            return;
+        }
+        if (NODES[p].p & CONV_NEW) != 0 {
+            // (`x: let T`, conventions-spelling's, is `x: T`: let is the
+            // default)
+            let ts = NODES[tn].start;
+            if !CONV_SPELLING && !closure && NODES[tn].kind == NodeKind::TyPtr
+                && (NODES[tn].p & NODE_REF_MUT) == 0 && word_here(ts, "let") {
+                TYPE_DONE.put(tn + 1, 1);
+                put(ts, skip_ws(ts + 3), "", CC_PARAM_LET);
+            }
+            return;
+        }
+        let ps = NODES[p].start;
+        let tk = NODES[tn].kind;
+        let ts = NODES[tn].start;
+        let mutable = NODES[p].c != 0;
+        if NODES[p].a == SYM_SELF && !closure {
+            TYPE_DONE.put(tn + 1, 1);
+            let end = NODES[tn].end;
+            if tk == NodeKind::TyPtr && (NODES[tn].p & NODE_REF) != 0 && SRC[ts] == '&' {
+                if SRC[ts + 1] == '&' {
+                    left(ts, CL_AMPAMP);
+                    return;
+                }
+                let mut_ref = (NODES[tn].p & NODE_REF_MUT) != 0;
+                put(ps, end, if mut_ref { "inout self" } else { "self" }, CC_RECEIVER);
+            } else if tk == NodeKind::TySlice && SRC[ts] == '&' {
+                let mut_ref = (NODES[tn].p & NODE_REF_MUT) != 0;
+                put(ps, end, if mut_ref { "inout self" } else { "self" }, CC_RECEIVER);
+            } else if tk == NodeKind::TyPtr {
+                // (`self: *Self`: raw, as it is)
+            } else if mutable || param_sinks(n, i, p) {
+                put(ps, end, "sink self", CC_RECEIVER);
+            } else if !CONV_SPELLING {
+                put(ps, end, "self", CC_RECEIVER);
+            }
+            return;
+        }
+        if tk == NodeKind::TyPtr && (NODES[tn].p & NODE_REF) != 0 && SRC[ts] == '&' {
+            TYPE_DONE.put(tn + 1, 1);
+            if SRC[ts + 1] == '&' {
+                left(ts, CL_AMPAMP);
+                return;
+            }
+            let inner = NODES[NODES[tn].a].start;
+            if (NODES[tn].p & NODE_REF_MUT) != 0 {
+                put(ts, inner, "inout ", CC_PARAM_INOUT);
+            } else {
+                put(ts, inner, if CONV_SPELLING { "let " } else { "" }, CC_PARAM_LET);
+            }
+            return;
+        }
+        if tk == NodeKind::TySlice && SRC[ts] == '&' {
+            TYPE_DONE.put(tn + 1, 1);
+            let inner = skip_ws(after_mut(skip_ws(ts + 1)));
+            if (NODES[tn].p & NODE_REF_MUT) != 0 {
+                put(ts, inner, "inout ", CC_PARAM_INOUT);
+            } else {
+                put(ts, inner, "", CC_PARAM_LET);
+            }
+            return;
+        }
+        if tk == NodeKind::TyPtr || tk == NodeKind::TySlice {
+            // (`mut p: *T`: a raw pointer the callee changes, `p: sink *T`)
+            if mutable && word_here(ps, "mut") && put(ps, skip_ws(ps + 3), "", -1) {
+                put(ts, ts, "sink ", CC_PARAM_SINK);
+            }
+            return;
+        }
+        if mutable && word_here(ps, "mut") {
+            if put(ps, skip_ws(ps + 3), "", -1) {
+                put(ts, ts, "sink ", CC_PARAM_SINK);
+            }
+            return;
+        }
+        if closure {
+            // (a closure's by-value owned parameter: its type is not known
+            // here)
+            if sink_by_name(tn, n, false, 0) {
+                left(ts, CL_FN_TYPE);
+            }
+            return;
+        }
+        if param_sinks(n, i, p) {
+            put(ts, ts, "sink ", CC_PARAM_SINK);
+        }
+    }
+}
+
+// ---- Rule 4: `&` ----
+
+// The type parameter i of the function that call node c calls takes, or
+// 0 (not known).
+fn arg_param_type(c: i64, i: i64) -> i64 {
+    unsafe {
+        let f = NODES[c].x - 1;
+        if f >= 0 && f < FN_COUNT {
+            if i < FNS[f].param_count {
+                return fn_param(f, i);
+            }
+            return 0;
+        }
+        // (a call of a function value: its type's parameters)
+        let callee = NODES[c].a;
+        let t = if callee > 0 { NODES[callee].ty } else { 0 };
+        if t > 0 && TYPES[t].kind == TyKind::Fn && i < TYPES[t].count {
+            return type_elem(t, i);
+        }
+        0
+    }
+}
+
+// The argument node of NamedArg a, or a.
+fn arg_value(a: i64) -> i64 {
+    unsafe { if NODES[a].kind == NodeKind::NamedArg { NODES[a].b } else { a } }
+}
+
+// The edits of `&e` nodes given to calls and to fields; AMP_SEEN marks
+// the `&` nodes handled.
+static mut AMP_SEEN: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// Whether n is a `&e` (in a file of the program, `&` flags CONV_NEW in any
+// spelling: the text tells `&mut e` from `&e`, amp_mut).
+fn is_amp(n: i64) -> bool {
+    unsafe {
+        NODES[n].kind == NodeKind::Unary && NODES[n].op == Tok::Amp && SRC[NODES[n].start] == '&'
+    }
+}
+
+// Whether `&` node n is written `&mut e`.
+fn amp_mut(n: i64) -> bool {
+    unsafe { word_here(skip_ws(NODES[n].start + 1), "mut") }
+}
+
+// `&mut e` → `&e`; `&e` → `e` when given to a let (with drop).
+fn edit_amp(n: i64, drop: bool) {
+    unsafe {
+        let s = NODES[n].start;
+        AMP_SEEN.put(n + 1, 1);
+        if SRC[s + 1] == '&' {
+            left(s, CL_AMPAMP);
+            return;
+        }
+        if amp_mut(n) {
+            let e = skip_ws(after_mut(skip_ws(s + 1)));
+            put(s, e, "&", CC_MARKER);
+            return;
+        }
+        if drop && !CONV_SPELLING && (NODES[n].p & NODE_REF_MUT) == 0 {
+            put(s, skip_ws(s + 1), "", CC_UNMARKED);
+        }
+    }
+}
+
+fn edit_call(c: i64) {
+    unsafe {
+        for i in 0..NODES[c].count {
+            let arg = arg_value(child(c, i));
+            if arg <= 0 {
+                continue;
+            }
+            // (a method's receiver, `x.m()`, is lent by the checker)
+            if i == 0 && NODES[arg].start == NODES[c].start {
+                continue;
+            }
+            let t = arg_param_type(c, i);
+            if t <= 0 {
+                continue;
+            }
+            if !is_amp(arg) {
+                // (an exclusive reference passed on, `g(r)`: a named access
+                // is used as its place, so it is lent again, `g(&r)`)
+                if TYPES[t].kind == TyKind::Ptr && TYPES[t].b == REF_MUT {
+                    reborrow(arg);
+                }
+                continue;
+            }
+            if (NODES[arg].p & NODE_REF_MUT) != 0 {
+                // (conventions-spelling: not to an instance of a generic
+                // function, where Phase 0 does not make `&x` exclusive)
+                let f = NODES[c].x - 1;
+                if CONV_SPELLING && (f < 0 || f >= FN_COUNT || FNS[f].tmpl > 0) {
+                    AMP_SEEN.put(arg + 1, 1);
+                    continue;
+                }
+                edit_amp(arg, false);
+            } else if is_shared_ref(t) {
+                edit_amp(arg, true);
+            } else if TYPES[t].kind == TyKind::Ptr {
+                // (to a raw `*T`: `&e` converts to it, as it is)
+                AMP_SEEN.put(arg + 1, 1);
+            }
+        }
+    }
+}
+
+// Rule 4: a place of type `&mut T` (an inout binding, parameter or
+// field) given where `&mut T` is wanted: `&` lends it on.
+fn reborrow(arg: i64) {
+    unsafe {
+        let k = NODES[arg].kind;
+        if CONV_SPELLING || !(k == NodeKind::Ident || k == NodeKind::FieldAccess)
+            || NODES[arg].ty <= 0 || TYPES[NODES[arg].ty].kind != TyKind::Ptr
+            || TYPES[NODES[arg].ty].b != REF_MUT {
+            return;
+        }
+        let s = NODES[arg].start;
+        if SRC[s] == '&' || SRC[s] == '*' {
+            return;
+        }
+        put(s, s, "&", CC_MARKER);
+    }
+}
+
+fn edit_struct_lit(n: i64) {
+    unsafe {
+        for i in 0..NODES[n].count {
+            let fi = child(n, i);
+            if NODES[fi].kind != NodeKind::FieldInit {
+                continue;
+            }
+            let v = NODES[fi].b;
+            if v > 0 && is_amp(v) {
+                edit_amp(v, (NODES[v].p & NODE_REF_MUT) == 0 && is_shared_ref(NODES[v].ty));
+            } else if v > 0 && !CONV_SPELLING && NODES[v].ty > 0
+                && TYPES[NODES[v].ty].kind == TyKind::Ptr && TYPES[NODES[v].ty].b == REF_MUT {
+                if (NODES[fi].p & FIELD_SHORTHAND) != 0 && NODES[v].kind == NodeKind::Ident {
+                    // `S { q }` → `S { q: &q }`
+                    let name = SYMS[NODES[v].a].text;
+                    let t = buf_new();
+                    buf_bytes(t, name);
+                    buf_bytes(t, ": &");
+                    buf_bytes(t, name);
+                    put(NODES[v].start, NODES[v].end, buf_slice(t), CC_MARKER);
+                } else {
+                    reborrow(v);
+                }
+            }
+        }
+    }
+}
+
+// ---- Rule 6: locals ----
+
+fn edit_let(n: i64) {
+    unsafe {
+        let s = NODES[n].start;
+        if (NODES[n].p & CONV_NEW) != 0 || !word_here(s, "let") {
+            return;
+        }
+        let pat = NODES[n].a;
+        let init = NODES[n].c;
+        let ann = NODES[n].b;
+        if pat <= 0 || NODES[pat].kind != NodeKind::PatBind {
+            return;
+        }
+        let ps = NODES[pat].start;
+        let t = if init > 0 { NODES[init].ty } else { 0 };
+        if NODES[pat].b != 0 {
+            if word_here(ps, "mut") && put(s, skip_ws(ps + 3), "var ", CC_VAR) {
+                DONE.put(ps + 1, 1);
+            }
+            if is_ref_type(t) {
+                left(NODES[pat].start + 1, CL_REPOINTED);
+            }
+            return;
+        }
+        if init > 0 && is_amp(init) && (NODES[init].p & NODE_REF_MUT) != 0
+            || init > 0 && t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == REF_MUT
+            && !is_amp(init) {
+            if put(s, s + 3, "inout", CC_INOUT_LOCAL) {
+                if ann > 0 && NODES[ann].kind == NodeKind::TyPtr && SRC[NODES[ann].start] == '&' {
+                    TYPE_DONE.put(ann + 1, 1);
+                    put(NODES[ann].start, NODES[NODES[ann].a].start, "", -1);
+                }
+                if is_amp(init) {
+                    edit_amp(init, false);
+                }
+            }
+            return;
+        }
+        if init > 0 && is_amp(init) && (NODES[init].p & NODE_REF_MUT) == 0 {
+            AMP_SEEN.put(init + 1, 1);
+            left(s, CL_SHARED_LOCAL);
+        }
+    }
+}
+
+// ---- The walk ----
+
+fn edit_node(n: i64) {
+    unsafe {
+        let k = NODES[n].kind;
+        let s = NODES[n].start;
+        if !editable(s) {
+            return;
+        }
+        if k == NodeKind::Call {
+            edit_call(n);
+        } else if k == NodeKind::StructLit {
+            edit_struct_lit(n);
+        } else if k == NodeKind::Let {
+            edit_let(n);
+        } else if k == NodeKind::PatBind {
+            if NODES[n].b != 0 && word_here(s, "mut") {
+                put(s, s + 3, "var", CC_VAR);
+            }
+        } else if k == NodeKind::Static {
+            if NODES[n].d != 0 && (NODES[n].p & CONV_NEW) == 0 {
+                let mut q = s;
+                while q < NODES[n].end && !word_here(q, "static") {
+                    q += 1;
+                }
+                let m = skip_ws(q + 6);
+                if q < NODES[n].end && word_here(m, "mut") {
+                    put(m, m + 3, "var", CC_STATIC);
+                }
+            }
+        } else if k == NodeKind::Closure {
+            if (NODES[n].c & CLOSURE_MOVE) != 0 && (NODES[n].p & CONV_NEW) == 0
+                && word_here(s, "move") {
+                put(s, s + 4, "sink", CC_SINK_CLOSURE);
+            }
+        } else if k == NodeKind::Unary && NODES[n].op == Tok::Star && !CONV_SPELLING {
+            edit_deref(n);
+        }
+    }
+}
+
+// Rule 5: `*r` on a reference.
+fn edit_deref(n: i64) {
+    unsafe {
+        let s = NODES[n].start;
+        let operand = NODES[n].b;
+        if SRC[s] != '*' || operand <= 0 || !is_ref_type(NODES[operand].ty) {
+            return;
+        }
+        let os = NODES[operand].start;
+        let oe = NODES[operand].end;
+        // (`(*p).f`: the parentheses go too)
+        let mut a = s - 1;
+        while a > 0 && is_ws(SRC[a]) {
+            a -= 1;
+        }
+        let close = skip_ws(oe);
+        if SRC[a] == '(' && SRC[close] == ')' && (SRC[close + 1] == '.' || SRC[close + 1] == '[') {
+            if put(a, os, "", CC_DEREF) {
+                put(close, close + 1, "", -1);
+            }
+            return;
+        }
+        put(s, os, "", CC_DEREF);
+    }
+}
+
+// The type rule (rule 7): every `&T` / `&mut T` / `&[T]` / `&mut [T]` type
+// node the signatures' rules did not take.
+fn edit_type(n: i64) {
+    unsafe {
+        let k = NODES[n].kind;
+        let s = NODES[n].start;
+        if k != NodeKind::TyPtr && k != NodeKind::TySlice || (NODES[n].p & CONV_NEW) != 0
+            || SRC[s] != '&' || TYPE_DONE.get(n + 1) != 0 || !editable(s) {
+            return;
+        }
+        if SRC[s + 1] == '&' {
+            left(s, CL_AMPAMP);
+            return;
+        }
+        let mut_ref = (NODES[n].p & NODE_REF_MUT) != 0;
+        if k == NodeKind::TySlice {
+            let inner = skip_ws(after_mut(skip_ws(s + 1)));
+            put(s, inner, if mut_ref { "inout " } else { "" }, CC_TYPE);
+            return;
+        }
+        if (NODES[n].p & NODE_REF) == 0 {
+            return;
+        }
+        put(s, NODES[NODES[n].a].start, if mut_ref { "inout " } else { "let " }, CC_TYPE);
+    }
+}
+
+// The parameter types of a function type node (TyFn): `fn(&T)` → `fn(T)`.
+fn edit_fn_type(n: i64) {
+    unsafe {
+        if !editable(NODES[n].start) {
+            return;
+        }
+        for i in 0..NODES[n].count {
+            let tn = child(n, i);
+            let k = NODES[tn].kind;
+            let s = NODES[tn].start;
+            if (k == NodeKind::TyPtr || k == NodeKind::TySlice) && SRC[s] == '&'
+                && (NODES[tn].p & CONV_NEW) == 0 && SRC[s + 1] != '&'
+                && (NODES[tn].p & NODE_REF_MUT) == 0 && (k == NodeKind::TySlice
+                    || (NODES[tn].p & NODE_REF) != 0) {
+                TYPE_DONE.put(tn + 1, 1);
+                let inner = if k == NodeKind::TySlice { skip_ws(s + 1) }
+                    else { NODES[NODES[tn].a].start };
+                put(s, inner, if CONV_SPELLING && k == NodeKind::TyPtr { "let " } else { "" },
+                    CC_PARAM_LET);
+            } else if k == NodeKind::TyPtr && (NODES[tn].p & CONV_NEW) != 0 && !CONV_SPELLING
+                && (NODES[tn].p & NODE_REF_MUT) == 0 && word_here(s, "let") {
+                // (`fn(let T)`, conventions-spelling's: `fn(T)`)
+                put(s, skip_ws(s + 3), "", CC_PARAM_LET);
+            } else if k == NodeKind::TyName && sink_by_name(tn, n, false, 0) {
+                left(s, CL_FN_TYPE);
+            }
+        }
+    }
+}
+
+// Identifiers that are 0.20's words (D27: renamed by hand for 0.21).
+fn find_words() {
+    unsafe {
+        let var = intern("var");
+        let inout = intern("inout");
+        let sink = intern("sink");
+        for n in 1..NODE_COUNT {
+            let k = NODES[n].kind;
+            if k != NodeKind::PatBind && k != NodeKind::Param && k != NodeKind::Field
+                && k != NodeKind::Fn {
+                continue;
+            }
+            let a = NODES[n].a;
+            if (a == var || a == inout || a == sink) && (NODES[n].p & CONV_NEW) == 0 {
+                left(NODES[n].start, CL_WORD);
+            }
+        }
+    }
+}
+
+// The edits of `fix --only conventions`; the number of rewrites.
+pub fn conventions_edits() -> i64 {
+    unsafe {
+        SYM_SELF = intern("self");
+        let mut clones = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for f in 0..FN_COUNT {
+            let node = FNS[f].node;
+            if node > 0 && NODES[node].kind == NodeKind::Fn {
+                if FNS[f].tmpl == 0 {
+                    FN_OF_NODE.put(node + 1, f + 1);
+                } else {
+                    clones.put(node + 1, 1);
+                }
+            }
+        }
+        // The signatures, first (their type nodes are theirs).
+        for n in 1..NODE_COUNT {
+            let k = NODES[n].kind;
+            if k == NodeKind::Fn && editable(NODES[n].start) && NODES[n].y == 0
+                && clones.get(n + 1) == 0 {
+                edit_signature(n, false);
+            } else if k == NodeKind::Closure && editable(NODES[n].start) {
+                edit_signature(n, true);
+            } else if k == NodeKind::TyFn && NODES[n].d == 0 {
+                edit_fn_type(n);
+            }
+        }
+        for n in 1..NODE_COUNT {
+            edit_node(n);
+        }
+        for n in 1..NODE_COUNT {
+            edit_type(n);
+        }
+        // `&mut e` anywhere else; `&e` left
+        for n in 1..NODE_COUNT {
+            if is_amp(n) && AMP_SEEN.get(n + 1) == 0 && editable(NODES[n].start) {
+                if (NODES[n].p & NODE_REF_MUT) != 0 {
+                    if !CONV_SPELLING {
+                        edit_amp(n, false);
+                    }
+                } else if !CONV_SPELLING && SRC[NODES[n].start + 1] != '&' {
+                    left(NODES[n].start, CL_AMP);
+                }
+            }
+        }
+        // (`&mut a[..]`, `&mut v[i]`: the checker makes the `&` of a slicing
+        // or an element another node, which starts at it)
+        for n in 1..NODE_COUNT {
+            let k = NODES[n].kind;
+            let s = NODES[n].start;
+            if CONV_SPELLING || k == NodeKind::TyPtr || k == NodeKind::TySlice
+                || k == NodeKind::Param || k == NodeKind::Field || k == NodeKind::TyFn
+                || k == NodeKind::TyName || s <= 0 || !editable(s) || SRC[s] != '&'
+                || SRC[s + 1] == '&' || !word_here(skip_ws(s + 1), "mut") {
+                continue;
+            }
+            put(s, skip_ws(after_mut(skip_ws(s + 1))), "&", CC_MARKER);
+        }
+        find_words();
+        let mut total = 0;
+        for i in 0..CC_COUNT {
+            total += CONV_COUNTS[i];
+        }
+        total
+    }
+}
+
+fn left_word(what: i64) -> *u8 {
+    if what == CL_SHARED_LOCAL {
+        c"a shared reference local ('let r = &e;'): use 'e' itself, or a let parameter"
+    } else if what == CL_REPOINTED {
+        c"a reference local that may be re-pointed ('let mut r = &..'): an access cannot be; use an index or a new binding"
+    } else if what == CL_AMP {
+        c"'&e' with no let parameter or field to take it: drop it to read, or write 'inout r = &e;'"
+    } else if what == CL_AMPAMP {
+        c"'&&': a reference to a reference"
+    } else if what == CL_FN_TYPE {
+        c"a by-value owned parameter of a function type or closure: 'sink T' if it is consumed"
+    } else if what == CL_WORD {
+        c"an identifier named 'var', 'inout' or 'sink' (keywords from 0.21): rename it"
+    } else {
+        c"a template's by-value parameter of a type the program never instantiates it with: let assumed; 'sink T' if it is consumed"
+    }
+}
+
+// The notes of what was left to hand: a count of each, and with
+// --list-left each place.
+pub fn conventions_report() {
+    unsafe {
+        for w in 0..CL_COUNT {
+            if CONV_LEFT[w] == 0 {
+                continue;
+            }
+            let d = diag(c"note", c"fix.conv_left");
+            buf_int(d, CONV_LEFT[w]);
+            buf_str(d, c" left to hand: ");
+            buf_str(d, left_word(w));
+            buf_str(d, c"\n");
+        }
+        if !CONV_LIST_LEFT {
+            return;
+        }
+        let mut i = 0;
+        while i < LEFT_AT.count {
+            let pos = LEFT_AT.data[i];
+            let f = file_of_pos(pos);
+            let mut line = 1;
+            let mut col = 1;
+            for q in FILES[f].start..pos {
+                if SRC[q] == '\n' {
+                    line += 1;
+                    col = 1;
+                } else {
+                    col += 1;
+                }
+            }
+            let out = buf_new();
+            buf_str(out, FILES[f].path);
+            buf_str(out, c":");
+            buf_int(out, line);
+            buf_str(out, c":");
+            buf_int(out, col);
+            buf_str(out, c": ");
+            buf_str(out, left_word(LEFT_AT.data[i + 1]));
+            buf_str(out, c"\n");
+            crate::base::buf_write_fd(out, crate::base::STDERR);
+            i += 2;
+        }
+    }
+}
