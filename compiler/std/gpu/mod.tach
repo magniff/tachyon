@@ -114,24 +114,36 @@ impl Instance {
 
     /// Every adapter of the system.
     pub fn adapters(self: &Instance) -> Vec<Adapter> {
-        let mut raw: Vec<backend::Adapter> = Vec::new_in(self.gpa);
-        N::adapters(&mut raw);
-        let mut out: Vec<Adapter> = Vec::new_in(self.gpa);
-        while raw.len() > 0 {
-            let a = raw.remove(0);
-            out.push(Adapter { raw: a, gpa: self.gpa });
-        }
+        let gpa = self.gpa;
+        let mut out: Vec<Adapter> = Vec::new_in(gpa);
+        // the backend's list is scratch: an arena, freed at once
+        arena_scope(gpa, |a| {
+            let mut raw: Vec<backend::Adapter, ScopedArena> = Vec::new_in(a);
+            N::adapters(&mut raw);
+            for r in raw.iter() {
+                out.push(Adapter { raw: backend::Adapter { dev: r.dev.clone() }, gpa: gpa });
+            }
+        });
         out
     }
 
     /// An adapter: the low-power one when asked and there is one.
     pub fn adapter(self: &Instance, power: Power = Power::High) -> Result<Adapter, Error> {
         if power == Power::Low {
-            let mut all = self.adapters();
-            for i in 0..all.len() {
-                if N::adapter_low_power(&all[i].raw) {
-                    return Ok(all.remove(i));
+            let found = arena_scope(self.gpa, |a| {
+                let mut raw: Vec<backend::Adapter, ScopedArena> = Vec::new_in(a);
+                N::adapters(&mut raw);
+                let mut f: Option<backend::Adapter> = None;
+                for r in raw.iter() {
+                    if f.is_none() && N::adapter_low_power(r) {
+                        f = Some(backend::Adapter { dev: r.dev.clone() });
+                    }
                 }
+                f
+            });
+            match found {
+                Some(a) => return Ok(Adapter { raw: a, gpa: self.gpa }),
+                None => {}
             }
         }
         match N::default_adapter() {

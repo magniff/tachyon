@@ -193,6 +193,36 @@ case objcgen in
     ;;
 esac
 
+# (design §2.4, D9) Encoding and submitting allocate nothing from Gpa:
+# `query effects --has alloc(Gpa)` over the per-frame functions prints
+# nothing (their scratch is fixed arrays; creation is what allocates).
+case noalloc in
+*"$FILTER"*)
+    why="$WORK/noalloc.why"
+    : >"$why"
+    printf 'use std::gpu;\nfn main(gpa: Gpa) {\n    let _i = gpu::Instance::new_in(gpa);\n}\n' >"$WORK/noalloc.tach"
+    for f in std::gpu::Device::encoder std::gpu::Device::bind_group std::gpu::Encoder::compute_pass std::gpu::Encoder::render_pass \
+             std::gpu::Encoder::copy_buffer std::gpu::Encoder::copy_texture_to_buffer std::gpu::Encoder::finish \
+             std::gpu::ComputePass::set_pipeline std::gpu::ComputePass::set_bind_group std::gpu::ComputePass::dispatch \
+             std::gpu::RenderPass::set_pipeline std::gpu::RenderPass::set_bind_group std::gpu::RenderPass::set_vertex_buffer \
+             std::gpu::RenderPass::draw std::gpu::RenderPass::draw_indexed std::gpu::Queue::submit std::gpu::Queue::write_buffer \
+             std::gpu::Buffer::map_read std::gpu::Surface::frame std::gpu::Frame::present; do
+        out=$("$COMPILER" query effects --has 'alloc(Gpa)' "$f" --root "$WORK/noalloc.tach" 2>&1)
+        case "$out" in
+            *query.empty*) ;;
+            *) echo "$f allocates from Gpa: $out" >>"$why" ;;
+        esac
+    done
+    # (and the query sees what does allocate: shader creation copies names)
+    out=$("$COMPILER" query effects --has 'alloc(Gpa)' std::gpu::Device::shader --root "$WORK/noalloc.tach" 2>&1)
+    case "$out" in
+        *"std::gpu::Device::shader"*) ;;
+        *) echo "query effects did not find Device::shader's allocation: $out" >>"$why" ;;
+    esac
+    if [ -s "$why" ]; then report noalloc fail "$why"; else report noalloc pass "$why"; fi
+    ;;
+esac
+
 # The reference images.
 case refgen in
 *"$FILTER"*)

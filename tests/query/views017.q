@@ -14,12 +14,11 @@ Vec<u64>::get	views()
 Vec<Vec<u64>>::get	views()
 Vec<Tok>::as_slice	views(self) declared
 Vec<u64>::as_slice	views(self) declared
-Vec<Adapter>::as_slice	views(self) declared
 Vec<Binding>::as_slice	views(self) declared
 Vec<VertexInput>::as_slice	views(self) declared
 Vec<u8>::as_slice	views(self) declared
 Vec<Vec<u64>>::as_slice	views(self) declared
-Vec<Adapter>::as_slice	views(self) declared
+Vec<Adapter, ScopedArena>::as_slice	views(self) declared
 Vec<EntryPoint>::as_slice	views(self) declared
 Vec<ShaderEntry>::as_slice	views(self) declared
 Vec<[u8]>::push	views() stores(x) declared
@@ -29,10 +28,10 @@ Vec<u64>::push	views()
 Vec<Vec<u64>>::push	views()
 Vec<Adapter>::push	views()
 Vec<ShaderEntry>::push	views()
-Vec<Adapter>::push	views()
 Vec<EntryPoint>::push	views() stores(x) declared
 Vec<Binding>::push	views()
 Vec<VertexInput>::push	views()
+Vec<Adapter, ScopedArena>::push	views() stores(x) declared
 Vec<i64>::push	views()
 Vec<u32>::push	views()
 $ views crate --why
