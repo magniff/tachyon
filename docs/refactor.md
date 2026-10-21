@@ -796,6 +796,88 @@ of the last one checks the program, and prints its errors with `warning
 conflict.check` (the resolve is written: the sides chosen may not fit
 together, as both sides' `use` lines importing a name twice).
 
+## Renaming the language: rewrite --text, refactor extension (0.21)
+
+0.24 renames tachyon to vole: `tachyonc` becomes `volec`, `.tach`
+becomes `.vl`, `TACHYON_X` becomes `VOLE_X`, `_tachyon.` becomes
+`_vole.`. The compiler does it, with two tools that edit a whole tree,
+and tools/rename-vole.sh runs them in order. They change the files git
+tracks (`git ls-files`, from the current directory), are one edit each
+for `undo`, and take `--dry-run` and `--diff`.
+
+```
+tachyonc rewrite --text OLD NEW [--files GLOB]... [--word] [--case] [--regex]
+    [--comments] [--strings] [--code] [--no-sources] [--move-paths]
+    [--exclude SPEC]... [--exclude-from FILE] [--check ROOT]... [--dry-run] [--diff]
+tachyonc refactor extension OLD NEW [ROOT | DIR | --all]...
+    [--exclude SPEC]... [--exclude-from FILE] [--dry-run] [--diff] [--no-check] [-j N]
+tachyonc query grep --ignore-case --strings --comments TEXT
+```
+
+`rewrite --text` replaces OLD in any text file: markdown, scripts,
+toml, json, the transcripts, and vole sources. `--word`: OLD is not part
+of a longer word of letters and digits (`_`, `.`, `-` end a word, so
+TACHYON_ROOT and `_tachyon.` have the word tachyon, `tachyonc` has not).
+`--case`: OLD in any case, and NEW in the case of each match (`tachyon`,
+`Tachyon`, `TACHYON` become `vole`, `Vole`, `VOLE`; a mixed case is
+noted). `--regex`: OLD is rewrite's regular expression (`^ $ . * + ?
+[a-z] \d \w`), within a line. In a vole source, `--comments`,
+`--strings` (an f-string's text too) and `--code` take only the matches
+there, as the lexer reads the file, and only sources; `--no-sources` the
+other files only. `--move-paths` also moves a file whose path has OLD
+(`tools/agent-hooks/tachyonc_cmd.py` to `volec_cmd.py`), as `git mv`
+does. `--check ROOT` checks the program before and after (the new texts
+read in place of the files): a new error writes nothing. The output is a
+line per file (`PATH<TAB>N matches`, `NEW <- OLD` for a moved one, the
+lines kept), the totals, and notes on what was left: in excluded files
+(`rewrite.excluded`), in kept lines or other places (`rewrite.kept`), in
+sources that do not lex (`rewrite.not-lexed`).
+
+`refactor extension .tach .vl` renames sources: a program's (ROOT: the
+root and its modules), a directory's, or the tree's (`--all`), as `git
+mv` renames them (the index's entries move in one `git update-index`).
+`mod` needs no change: it finds either extension. The mentions of their
+paths change in every file git tracks: in scripts, test runners and
+fixtures, docs, and a source's comments (its directives: `// STDERR:
+main.tach:3: ...`). With ROOT or DIR, a mention changes when it names a
+renamed file (from the mentioning file's directory, from here, or by the
+end of its path when that ends one file's path only); with `--all`,
+every one (`*.tach` too). A string literal is never changed (a path in a
+string is what the program does): they are counted
+(`extension.strings`), with the `rewrite --text --strings` that changes
+them. Then every program renamed (ROOT; with DIR and `--all` each root
+among the files: a `main` with `mod` items, or a file with no such root
+above it) is compiled to assembly before and after, `-j N` at once: the
+assembly, the output and the exit status must be the same, but for the
+renamed paths in what was printed and in the assembly's table of source
+files (the `.byte` line under each `Lrt.fN:`), or the rename is undone
+(`extension.differs`; both builds are left in target/extension-check).
+
+The exclusions (both tools; `--exclude SPEC`, or a file of them, one a
+line, with `--exclude-from`): `GLOB` is a whole file (`*` any bytes, `/`
+too; `DIR/` everything under it); `GLOB:/RE/` the lines RE matches;
+`GLOB:/A/,/B/` each range of lines from one A matches to the line before
+the next one B matches. tools/rename-vole.keep keeps the history: the
+seed, the records of past releases, the release notes and the bootstrap
+entries of the releases up to 0.23 (they are built as tachyonc and
+.tach: bootstrap/releases.toml's `bin` and `ext`).
+
+`undo` takes a moved file back to its place (the journal's
+`TO<TAB>3<TAB>FROM` lines), after restoring its text; `query diff` shows
+`moved FROM -> TO`.
+
+tools/rename-vole.sh does the rename, in order: `refactor extension .tach
+.vl --all`; the identifiers with tachyon (`query grep --code
+--ignore-case`: none, else it stops for `refactor rename`); the
+sources' strings and comments (`tachyonc` to `volec`, `tachyon` to
+`vole`, `.tach` to `.vl` in strings, `--check compiler/src/main.vl`);
+the other files ([head]'s interface `volec-0.24` first, then the words,
+paths moved); std's and the guide's generated sources made again; the
+renamed compiler built (target/volec) and checked; with `--test` its
+suite, with `--regen` the transcripts regenerated; and what is left,
+`git grep -i tachyon` counted by file (target/rename-vole/leftovers.txt).
+`--dry-run` prints each step's plan.
+
 ## Diagnostics
 
 | code | severity | exit | when | try |
@@ -835,6 +917,14 @@ together, as both sides' `use` lines importing a name twice).
 | `same-output.target` | note | | OLD has no such target | |
 | `query.over` | note | 0 | stats: files over --over | `query deps` of the largest |
 | `query.ambiguous` | error | 1 | NAME names several definitions (edit) | the paths |
+| `rewrite.breaks` | error | 1 | (0.21) `rewrite --text --check ROOT`: the new texts give the program new errors; nothing written | `--dry-run --diff` |
+| `rewrite.exclude`, `rewrite.usage`, `extension.usage` | error | 2 | (0.21) a malformed exclusion, usage | the corrected command |
+| `rewrite.excluded`, `rewrite.kept`, `rewrite.mixed-case` | note | 0 | (0.21) matches left in excluded files, kept lines or other places; matches in a mixed case | |
+| `rewrite.not-lexed` | warning | 0 | (0.21) sources with a match that do not lex: no place known, nothing taken | `--files` them without places |
+| `rewrite.exists`, `extension.exists` | error | 1 | (0.21) a file's new path is taken; nothing moved | |
+| `rewrite.git`, `rewrite.no-git`, `extension.no-git` | error | 1, 2 | (0.21) git update-index failed; no git checkout | |
+| `extension.differs` | error | 1 | (0.21) a renamed program builds differently; the rename is undone | target/extension-check |
+| `extension.strings`, `extension.unresolved`, `extension.excluded`, `extension.untracked` | note | 0 | (0.21) mentions left in string literals, mentions naming no file (or several), excluded, files git does not track | `rewrite --text OLD NEW --word --strings` |
 
 Problems with ROOT are query's (`query.no-root`, `query.bad-root`), for
 every command.

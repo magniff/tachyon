@@ -27,7 +27,7 @@ tachyonc query features NAME... [--why FEATURE] [-C OPTION]   (0.19) what a func
 tachyonc query arch WORDS... [--feature F] [--arch A] [--equiv NAME]   (0.19) the intrinsic tables (also `intrinsics`; no program read)
 tachyonc query items [MODULE|TYPE...] [--root ROOT] [--comments]
 tachyonc query show MODULE::section TITLE                   (0.13)
-tachyonc query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
+tachyonc query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--ignore-case] [--count] [--limit N] [--all]
 tachyonc query type FILE:LINE[:COL]...                      (0.13)
 tachyonc query own FILE:LINE:COL...                         (0.17)
 tachyonc query stats [MODULE|FILE] [--over N] [--all]      (refactor.md)
@@ -76,7 +76,7 @@ tools` the ones a program needs.
 | the source of a function, type, method | `target/tachyonc query show NAME` |
 | where something is used | `target/tachyonc query refs NAME` (`--count`, `--in FILE\|MODULE`, `--kind write,call,...`; a local: `FN::x` or `FILE:LINE:COL`) |
 | what a function calls, all it reaches; can it change a table | `target/tachyonc query callees FN` (`--transitive`; `--writes TABLE`: the writes and borrows it reaches, with the call chain) |
-| text that is not a name (a message, a comment), with its item | `target/tachyonc query grep TEXT` (`--comments`, `--strings`, `--code`, `--word`, `--in`) |
+| text that is not a name (a message, a comment), with its item | `target/tachyonc query grep TEXT` (`--comments`, `--strings`, `--code`, `--word`, `--ignore-case`, `--in`) |
 | a module's section banners; one section | `target/tachyonc query items MODULE --comments`, `query show MODULE::section TITLE` |
 | the type of an expression | `target/tachyonc query type FILE:LINE:COL` |
 | each local's kind, moves and views at a position (0.17) | `target/tachyonc query own FILE:LINE:COL` |
@@ -103,6 +103,7 @@ tools` the ones a program needs.
 | move lines of a function into a new one, parameters and result computed | `target/tachyonc refactor extract-function FN --lines A-B --to NEW` |
 | put a small function's body where it is called (and delete it) | `target/tachyonc refactor inline FN` (`--at FILE:LINE`: one call) |
 | replace an idiom everywhere, typed | `target/tachyonc rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec' --dry-run` (`--list`: the sites and their holes; `--subst 'P' 'R'`: inside the holes' code; `--where '$v: name ~ RE'`; `--in FN\|MODULE\|FILE`, repeated) |
+| text in any file git tracks (md, sh, toml, sources' comments or strings), one edit; sources renamed to another extension, mentions too, the build compared (0.21, for 0.24's rename) | `target/tachyonc rewrite --text OLD NEW --word --case [--files GLOB] [--comments\|--strings\|--no-sources] [--exclude SPEC] --dry-run --diff`; `target/tachyonc refactor extension .tach .vl ROOT\|DIR\|--all --dry-run` (docs/refactor.md, "Renaming the language") |
 | rename anything (a module: its file too), with every reference | `target/tachyonc refactor rename PATH NEW` (a local or parameter: `FILE:LINE:COL` or `FN::x`, shadowing respected) |
 | move items to another module, imports and `pub` fixed | `target/tachyonc refactor move PATH... --to MODULE` (`--after\|--before ITEM`: where; a MODULE that does not exist is made) |
 | make a module; move one (file, folder, paths) | `target/tachyonc refactor new-module crate::a::b`, `refactor move-module crate::a crate::x::a` |

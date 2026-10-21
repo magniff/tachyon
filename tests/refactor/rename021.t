@@ -75,12 +75,21 @@ vole-run.sh <- tachyon-run.sh	0 matches
 rewrote 0 matches in 1 file, 1 moved
 % git status --short
 R  tachyon-run.sh -> vole-run.sh
+% test -x vole-run.sh && echo executable
+executable
 $ query diff
 # rewrote --text tachyon vole	1 files	0 matches
 moved WORK/tachyon-run.sh -> WORK/vole-run.sh
 $ undo
 undid rewrote --text tachyon vole	1 files	0 matches
 % git status --short
+% test -x tachyon-run.sh && echo executable
+executable
+## The files that are no vole source only.
+$ rewrite --text tachyonc volec --word --no-sources --dry-run
+docs/notes.md	1 match
+tachyon-run.sh	2 matches
+would rewrite 3 matches in 2 files
 ## A check that finds a new error writes nothing.
 $ rewrite --text 'shapes::rect' 'shapes::nope' --code --check main.tach
 geo/mod.tach:2:38: error[type error] no 'nope' in module 'geo::shapes'
@@ -121,6 +130,8 @@ R  geo/mod.tach -> geo/mod.vl
 RM geo/shapes.tach -> geo/shapes.vl
 RM main.tach -> main.vl
  M tachyon-run.sh
+% test -x tachyon-run.sh && echo executable
+executable
 % cat tachyon-run.sh docs/notes.md
 #!/bin/sh
 # Builds main.vl with tachyonc; every *.vl here.
@@ -138,6 +149,8 @@ main.tach says Tachyon
 ok: built prog
 $ undo
 undid renamed 3 files .tach -> .vl	9 mentions in 4 files
+% test -x tachyon-run.sh && echo executable
+executable
 % git status --short
 ?? prog
 ## Mistakes.

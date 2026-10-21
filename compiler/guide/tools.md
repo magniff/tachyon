@@ -109,6 +109,8 @@ an edit then `check`.
 | a variant, with every match | `tachyonc refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match) |
 | move items to a module | `tachyonc refactor move PATH --to MODULE` (made when missing) |
 | an idiom everywhere, typed | `tachyonc rewrite 'old($a)' 'new($a)' --dry-run` |
+| a word in every file git tracks (docs, scripts, a source's comments or strings) | `tachyonc rewrite --text OLD NEW --word --case --dry-run --diff` (`--files GLOB`, `--comments`, `--strings`, `--no-sources`, `--exclude SPEC`, `--check ROOT`) |
+| sources to another extension, with the mentions of their paths | `tachyonc refactor extension .tach .vl ROOT\|DIR\|--all --dry-run` (git mv; the build compared before and after) |
 | imports, unused, pub, unsafe | `tachyonc fix` (`--only imports,unused,pub,unsafe`, `--dry-run`) |
 | 0.19's spelling to 0.20's (`&T` to `T`, `&mut T` to `inout T`, `let mut` to `var`, receivers, `&mut v` to `&v`, `*r` to `r`) | `tachyonc fix --only conventions` (`--dry-run`) |
 | `*T` and by-value parameters of 0.16 code to accesses, with every call (0.17) | `tachyonc fix --values` (`--dry-run`) |

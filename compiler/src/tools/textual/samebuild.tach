@@ -3,9 +3,11 @@
 // after it, up to N compilations at once, and compared byte for byte:
 // the assembly, what the compiler printed, its exit status. The paths of
 // the renamed files are the one thing allowed to differ: in what was
-// printed, and in the assembly's table of source files (each `.byte` line
-// under an `Lrt.fN:` label, which panics name their file by), where OLD
-// at the end of a path is read as NEW.
+// printed, and in the assembly's data strings (the table of source files
+// under `Lrt.files`, which panics name their file by; the messages of
+// contracts and asserts, `x.tach:15:5`): a data string of the build before
+// is the same when it is, or when it is with OLD at the end of a path read
+// as NEW. Anything else that differs (a length in code) does.
 
 use crate::base::{IntVec, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str};
 use crate::tools::proc::{
@@ -91,30 +93,17 @@ fn put_renamed(out: i64, t: [u8], old: [u8], new: [u8]) {
     var i = 0;
     var at = 0;
     while i + old.len <= t.len {
-        if t[i] == old[0] && same_bytes(t[i..i + old.len], old)
-            && (i + old.len == t.len || !is_alnum(t[i + old.len])) {
+        let e = i + old.len;
+        if t[i] == old[0] && same_bytes(t[i..e], old) && (e == t.len || !is_alnum(t[e])) {
             buf_bytes(out, t[at..i]);
             buf_bytes(out, new);
-            i += old.len;
+            i = e;
             at = i;
         } else {
             i += 1;
         }
     }
     buf_bytes(out, t[at..t.len]);
-}
-
-// Whether line l (trimmed) is a label of the source files' table.
-fn file_label(l: [u8]) -> bool {
-    var i = 0;
-    while i < l.len && (l[i] == ' ' || l[i] == '\t') {
-        i += 1;
-    }
-    if i < l.len && l[i] == '.' {
-        i += 1;
-    }
-    l.len - i > 6 && l[i] == 'L' && l[i + 1] == 'r' && l[i + 2] == 't' && l[i + 3] == '.'
-        && l[i + 4] == 'f' && l[l.len - 1] == ':'
 }
 
 // The bytes of a `.byte A,B,C` line, into buffer out; false when l is
@@ -149,40 +138,82 @@ fn byte_line(l: [u8], out: i64) -> bool {
     true
 }
 
-// The assembly `t` from before the rename as it would be after it: the
-// file table's paths renamed, into a new buffer.
-fn renamed_asm(t: [u8], old: [u8], new: [u8]) -> i64 {
-    let out = buf_new();
-    var i = 0;
-    var after_label = false;
-    while i < t.len {
-        var e = i;
-        while e < t.len && t[e] != '\n' {
-            e += 1;
-        }
-        let l = t[i..e];
-        let bytes = buf_new();
-        if after_label && byte_line(l, bytes) {
-            let path = buf_new();
-            put_renamed(path, buf_slice(bytes), old, new);
-            buf_str(out, c"    .byte ");
-            let p = buf_slice(path);
-            for k in 0..p.len {
-                if k > 0 {
-                    buf_byte(out, ',');
-                }
-                buf_int(out, p[k] as i64);
+// The items of assembly t: each line, but a run of `.byte` lines (a data
+// string, in lines of 16) is one item, its bytes; into texts (buffers),
+// with whether each is data, and its first line.
+fn asm_items(t: [u8], texts: inout IntVec, data: inout IntVec, lines: inout IntVec) {
+    unsafe {
+        var i = 0;
+        var line = 1;
+        var run = -1;
+        while i < t.len {
+            var e = i;
+            while e < t.len && t[e] != '\n' {
+                e += 1;
             }
-        } else {
-            buf_bytes(out, l);
+            let bytes = buf_new();
+            if byte_line(t[i..e], bytes) {
+                if run >= 0 {
+                    buf_bytes(texts.data[run], buf_slice(bytes));
+                } else {
+                    run = texts.count;
+                    texts.push(bytes);
+                    data.push(1);
+                    lines.push(line);
+                }
+            } else {
+                run = -1;
+                let b = buf_new();
+                buf_bytes(b, t[i..e]);
+                texts.push(b);
+                data.push(0);
+                lines.push(line);
+            }
+            line += 1;
+            i = e + 1;
         }
-        after_label = file_label(l);
-        if e < t.len {
-            buf_byte(out, '\n');
-        }
-        i = e + 1;
     }
-    out
+}
+
+// Whether the assembly before the rename (b) and after it (a) are the
+// same, item by item, a data string also when its renamed paths are all
+// that differ (OLD at the end of a path read as NEW: the source files'
+// table, the places messages name); -1 then, else the line of a where
+// they first differ.
+fn same_asm(b: [u8], a: [u8], old: [u8], new: [u8]) -> i64 {
+    unsafe {
+        var bt = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var bd = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var bl = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var at = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var ad = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var al = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        asm_items(b, &bt, &bd, &bl);
+        asm_items(a, &at, &ad, &al);
+        let n = if bt.count < at.count { bt.count } else { at.count };
+        for k in 0..n {
+            let x = buf_slice(bt.data[k]);
+            let y = buf_slice(at.data[k]);
+            if bd.data[k] != ad.data[k] {
+                return al.data[k];
+            }
+            if same_bytes(x, y) {
+                continue;
+            }
+            if bd.data[k] == 1 {
+                let r = buf_new();
+                put_renamed(r, x, old, new);
+                if same_bytes(buf_slice(r), y) {
+                    continue;
+                }
+            }
+            return al.data[k];
+        }
+        if bt.count != at.count {
+            return if n < al.count { al.data[n] } else { al.count + 1 };
+        }
+        -1
+    }
 }
 
 fn read_or_empty(path: *u8) -> i64 {
@@ -216,19 +247,9 @@ pub fn compare_one(before: *u8, after: *u8, n: i64, old: [u8], new: [u8], why: i
         }
         let ab = read_or_empty(job_file(before, n, c".s"));
         let aa = read_or_empty(job_file(after, n, c".s"));
-        let ab2 = renamed_asm(buf_slice(ab), old, new);
-        let x = buf_slice(ab2);
-        let y = buf_slice(aa);
-        if same_bytes(x, y) {
+        let line = same_asm(buf_slice(ab), buf_slice(aa), old, new);
+        if line < 0 {
             return 0;
-        }
-        var line = 1;
-        var k = 0;
-        while k < x.len && k < y.len && x[k] == y[k] {
-            if x[k] == '\n' {
-                line += 1;
-            }
-            k += 1;
         }
         buf_str(why, c"assembly, line ");
         buf_int(why, line);
