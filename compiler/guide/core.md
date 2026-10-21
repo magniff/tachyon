@@ -145,7 +145,9 @@ w = v;` or `f(v)`, `v` is dead (`own.moved`); take `v: &Vec<T>` (`&mut`
 to change it) and pass `&v` (`&mut v`), or `.clone()`. A reference kept
 in a local (`let p = &mut st;`) is passed on as `p`, any number of
 times. `&f(x)` makes a temporary that lives to the end of the block
-(0.18.1). A slice of `v` is a view: take it again after `v` grows. std's most used items: `tachyonc guide std`; all, a line each:
+(0.18.1); any other owned temporary used without being moved
+(`f()?.read()`, `make().len()`) is dropped at the end of its statement
+(0.20). A slice of `v` is a view: take it again after `v` grows. std's most used items: `tachyonc guide std`; all, a line each:
 `tachyonc guide std#the-api`; one name
 with its comment: `tachyonc guide --find split_in`.
 
