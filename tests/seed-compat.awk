@@ -11,6 +11,16 @@
 # Used to give the seed the benchmarks and the random programs. Unsafe
 # blocks (0.9) become plain blocks, `unsafe fn` plain functions.
 { gsub(/unsafe \{/, "{"); gsub(/unsafe fn /, "fn ") }
+# (0.20) The seed reads 0.19's spelling: `var x` is `let mut x`, `static
+# var` `static mut`, a `p: sink T` parameter `mut p: T`.
+{
+    gsub(/static var /, "static mut ")
+    gsub(/(^|[^A-Za-z0-9_])var /, "&@@VAR@@"); gsub(/var @@VAR@@/, "let mut ")
+    while (match($0, /[A-Za-z_][A-Za-z0-9_]*: sink /)) {
+        name = substr($0, RSTART, RLENGTH - 7)
+        $0 = substr($0, 1, RSTART - 1) "mut " name ": " substr($0, RSTART + RLENGTH)
+    }
+}
 /^extern "C" \{ *fn .*; *\}$/ {
     sub(/^extern "C" \{ */, "extern ")
     sub(/ *\}$/, "")

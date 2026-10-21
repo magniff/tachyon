@@ -1628,7 +1628,12 @@ pm-examples, pm-transcripts, merged in).
   the address or the aliasing of a `&T` parameter now use `*T`.
 - **std::env::get / get_in** replace `var` / `var_in` (`var` is a word,
   a keyword from 0.21); `env::var(..)` is conv.rust with `try: env::get`.
-- **Left for 0.20.1.** A closure's by-value parameter is not dropped
+- **Left for 0.20.1.** `fn(T)` and `fn(let T)` are different types in
+  the checker (front/conv::fn_type_param: a plain `T` in a function type
+  or an `Fn` bound is the value, as the migration wrote 0.19's by-value
+  ones), while §2.5 makes `let` the default there; fmt keeps the `let` of
+  a function type until they are one type (std's consuming bounds become
+  `Fn(sink T)` then). A closure's by-value parameter is not dropped
   (0.19.1 leaks too); a generic let parameter given an rvalue of a
   non-copyable type other than a closure literal (`gl(make())`) errors;
   the own.move_out try for an operator impl suggests `std::take(&self)` of
