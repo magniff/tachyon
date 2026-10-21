@@ -35,8 +35,6 @@ use ir::{
     UN_NOT, V, bits_f32,
 };
 
-pub const SIZES_SLOT: i64 = 30;
-
 const RESERVED: [[u8]; 103] = [
     "main", "kernel", "vertex", "fragment", "device", "constant", "thread", "threadgroup",
     "threadgroup_imageblock", "ray_data", "object_data", "metal", "using", "namespace",
@@ -59,40 +57,101 @@ const MATH_NAMES: [[u8]; 39] = [
     "dot", "cross", "normalize", "reflect", "determinant", "transpose",
 ];
 
-// Where an entry point's resources are bound.
+// Where the resources are bound. Per stage (vertex, fragment, compute),
+// buffers, textures and samplers each take slots from 0 in (group,
+// binding) order over the bindings the stage's entry points use; the
+// Metal hal binds what the reflection says. The sizes buffer (the byte
+// sizes of the runtime-sized storage buffers, for bounds checks) takes the
+// stage's next buffer slot; it has one u32 per runtime-sized storage
+// binding of the module, in (group, binding) order.
 pub struct Slots {
-    // per global: its buffer, texture or sampler slot, or -1
+    // slot[stage * globals + g], or -1
     slot: V<i64>,
-    // per global: its index in the sizes buffer (runtime-sized storage), or -1
+    // per global: its index in the sizes buffer, or -1
     size_index: V<i64>,
     sizes_count: i64,
+    // per stage: the sizes buffer's slot, or -1 when the stage needs none
+    sizes_slot: [i64; 3],
 }
 
-pub fn slots(m: &Module, a: ScopedArena) -> Slots {
-    let mut s = Slots { slot: Vec::new_in(a), size_index: Vec::new_in(a), sizes_count: 0 };
-    let mut nb = 0;
-    let mut nt = 0;
-    let mut ns = 0;
+// The globals in (group, binding) order (the others after, as declared).
+pub fn binding_order(m: &Module, a: ScopedArena) -> V<i64> {
+    let mut order: V<i64> = Vec::new_in(a);
     for g in 0..m.globals.len() {
-        let gl = m.globals[g];
-        let k = m.types[gl.ty].kind;
-        if gl.space == SP_UNIFORM || gl.space == SP_STORAGE {
-            s.slot.push(nb);
-            nb += 1;
-        } else if k == TK_TEXTURE {
-            s.slot.push(nt);
-            nt += 1;
-        } else if k == TK_SAMPLER {
-            s.slot.push(ns);
-            ns += 1;
-        } else {
-            s.slot.push(-1);
+        order.push(g);
+    }
+    // an insertion sort: modules have few bindings
+    for i in 1..order.len() {
+        let mut j = i;
+        while j > 0 && binding_key(m, order[j - 1]) > binding_key(m, order[j]) {
+            order.swap(j - 1, j);
+            j -= 1;
         }
-        if gl.space == SP_STORAGE && m.is_runtime_sized(gl.ty) {
-            s.size_index.push(s.sizes_count);
+    }
+    order
+}
+
+fn binding_key(m: &Module, g: i64) -> i64 {
+    let gl = m.globals[g];
+    if gl.group < 0 {
+        return 9223372036854775807 - (m.globals.len() - g);
+    }
+    gl.group * 1048576 + gl.binding
+}
+
+pub fn slots(m: &Module, uses: &V<V<bool>>, a: ScopedArena) -> Slots {
+    let ng = m.globals.len();
+    let mut s = Slots {
+        slot: Vec::filled_in(3 * ng, -1, a), size_index: Vec::filled_in(ng, -1, a), sizes_count: 0,
+        sizes_slot: [-1, -1, -1]
+    };
+    let order = binding_order(m, a);
+    for k in 0..order.len() {
+        let g = order[k];
+        if m.globals[g].space == SP_STORAGE && m.is_runtime_sized(m.globals[g].ty) {
+            s.size_index[g] = s.sizes_count;
             s.sizes_count += 1;
-        } else {
-            s.size_index.push(-1);
+        }
+    }
+    for st in 0..3 {
+        let mut visible: V<bool> = Vec::filled_in(ng, false, a);
+        for e in 0..m.entries.len() {
+            if m.entries[e].stage as i64 == st {
+                let h = m.entries[e].func;
+                for g in 0..ng {
+                    if uses[h][g] {
+                        visible[g] = true;
+                    }
+                }
+            }
+        }
+        let mut nb = 0;
+        let mut nt = 0;
+        let mut ns = 0;
+        let mut sized = false;
+        for k in 0..order.len() {
+            let g = order[k];
+            if !visible[g] {
+                continue;
+            }
+            let gl = m.globals[g];
+            let kind = m.types[gl.ty].kind;
+            if gl.space == SP_UNIFORM || gl.space == SP_STORAGE {
+                s.slot[st * ng + g] = nb;
+                nb += 1;
+                if s.size_index[g] >= 0 {
+                    sized = true;
+                }
+            } else if kind == TK_TEXTURE {
+                s.slot[st * ng + g] = nt;
+                nt += 1;
+            } else if kind == TK_SAMPLER {
+                s.slot[st * ng + g] = ns;
+                ns += 1;
+            }
+        }
+        if sized {
+            s.sizes_slot[st] = nb;
         }
     }
     s
@@ -463,10 +522,12 @@ fn needs_sizes(w: &W, m: &Module, h: i64) -> bool {
     false
 }
 
-pub fn write(m: &Module, a: ScopedArena, out: &mut Buf) {
+// The module as MSL; the reflection's Metal names and slots too.
+pub fn write(m: &Module, a: ScopedArena, out: &mut Buf, refl: &mut translate::Reflection) {
     let mut w = new_writer(m, a);
     let order = call_order(m, a);
     w.uses = global_uses(m, &order, a);
+    w.sl = slots(m, &w.uses, a);
     for oi in 0..order.len() {
         let h = order[oi];
         let mut is_entry = false;
@@ -483,6 +544,19 @@ pub fn write(m: &Module, a: ScopedArena, out: &mut Buf) {
         write_entry(&mut w, m, e);
     }
     finish(&mut w, out);
+    // the Metal side of the reflection
+    for e in 0..refl.entries.len() {
+        refl.entries[e].target_name.clear();
+        refl.entries[e].target_name.push_str(nm(&w.pool, w.fnames[m.entries[e].func]));
+        refl.entries[e].sizes_slot = w.sl.sizes_slot[m.entries[e].stage as i64];
+    }
+    let ng = m.globals.len();
+    for b in 0..refl.bindings.len() {
+        let g = refl.bindings[b].global;
+        for st in 0..3 {
+            refl.bindings[b].slots[st] = w.sl.slot[st * ng + g];
+        }
+    }
 }
 
 fn new_writer(m: &Module, a: ScopedArena) -> W {
@@ -498,7 +572,10 @@ fn new_writer(m: &Module, a: ScopedArena) -> W {
         need_flb: false,
         need_ftb: false,
         need_cmpxchg: Vec::new_in(a),
-        sl: slots(m, a),
+        sl: Slots {
+            slot: Vec::new_in(a), size_index: Vec::new_in(a), sizes_count: 0,
+            sizes_slot: [-1, -1, -1]
+        },
         uses: Vec::new_in(a),
         fnames: Vec::new_in(a),
         gnames: Vec::new_in(a),
@@ -1551,7 +1628,8 @@ impl W {
         } else if op == S_RETURN {
             self.ret(m, f, st.a);
         } else if op == S_KILL {
-            self.p("metal::discard_fragment();");
+            self.p(if self.stage == TEST_KERNEL { "return;" }
+                else { "metal::discard_fragment();" });
         } else if op == S_BARRIER {
             self.p(if st.a
                 == BARRIER_WORKGROUP {
@@ -1696,9 +1774,16 @@ impl W {
         self.p(")");
     }
 
-    fn ret(self: &W, m: &Module, f: &Function, e: i64) {
+    fn ret(self: &mut W, m: &Module, f: &Function, e: i64) {
         if e < 0 {
             self.p("return;");
+            return;
+        }
+        if self.stage == TEST_KERNEL {
+            // a test kernel: the result into its output record
+            self.p("{ _w_out[_w_tid] = ");
+            self.val(m, f, e);
+            self.p("; return; }");
             return;
         }
         if self.stage == 255 || self.stage == STAGE_COMPUTE as i64 {
@@ -2108,7 +2193,7 @@ fn write_entry(w: &mut W, m: &Module, ei: i64) {
         }
         first = false;
         let tk = m.types[gl.ty].kind;
-        let slot = w.sl.slot[g];
+        let slot = w.sl.slot[en.stage as i64 * m.globals.len() + g];
         if gl.space == SP_HANDLE {
             let _n16 = w.ty(m, gl.ty);
             w.out.push_str(
@@ -2127,7 +2212,7 @@ fn write_entry(w: &mut W, m: &Module, ei: i64) {
         if !first {
             w.p(", ");
         }
-        w.out.push_str(f"constant uint* _w_sizes [[buffer({SIZES_SLOT})]]");
+        w.out.push_str(f"constant uint* _w_sizes [[buffer({w.sl.sizes_slot[en.stage as i64]})]]");
     }
     w.p(") {");
     w.indent = 1;
@@ -2244,12 +2329,138 @@ fn write_const(w: &mut W, m: &Module, e: i64) {
     w.enames = saved_names;
 }
 
+// ---- Test kernels ----
+
+// The stage of a test kernel being written.
+const TEST_KERNEL: i64 = 254;
+
+// Entry point ei (a vertex or fragment one) as a kernel, `NAME_w_test`:
+// invocation i reads its parameters from input record i (their record
+// offsets: ir::record_offsets) and writes its result into output record
+// i, so its body runs on Metal as the interpreter runs it alone. Its
+// slots: buffers from 0 in (group, binding) order, then the input, the
+// output and the sizes buffer; textures and samplers from 0.
+fn write_test_kernel(w: &mut W, m: &Module, ei: i64) -> [i64; 3] {
+    let en = m.entries[ei];
+    let h = en.func;
+    let f = &m.functions[h];
+    start_fn(w, m, h);
+    w.stage = TEST_KERNEL;
+    w.ret_ty = f.result;
+    let ename = w.fnames[h];
+    let offs = ir::record_offsets(m, h, w.a);
+    // the input record
+    let mut rec = Buf::new_in(w.a);
+    rec.push_str(nm(&w.pool, ename));
+    rec.push_str("_w_In");
+    let rn = w.intern(rec.as_slice());
+    let mut b = Buf::new_in(w.a);
+    b.push_str("struct ");
+    b.push_str(nm(&w.pool, rn));
+    b.push_str(" {\n");
+    let mut off = 0;
+    for k in 0..f.params.len() {
+        if offs[k] > off {
+            b.push_str(f"    char _pad{k}[{offs[k] - off}];\n");
+        }
+        let mt = w.member_ty(m, f.params[k].ty);
+        b.push_str(f"    {nm(&w.pool, mt)} p{k};\n");
+        off = offs[k] + m.types[f.params[k].ty].size;
+    }
+    let stride = offs[f.params.len()];
+    if stride > off {
+        b.push_str(f"    char _padend[{stride - off}];\n");
+    }
+    b.push_str("};\n");
+    copy_into(&mut w.types_out, b.as_slice());
+    let rt = if f.result >= 0 { w.ty(m, f.result) } else { w.intern("uint") };
+    w.out.push_str(
+        f"\nkernel void {nm(&w.pool, ename)}_w_test(uint _w_tid [[threadgroup_position_in_grid]]");
+    let order = binding_order(m, w.a);
+    let mut nb = 0;
+    let mut nt = 0;
+    let mut ns = 0;
+    for k in 0..order.len() {
+        let g = order[k];
+        if !w.uses[h][g] {
+            continue;
+        }
+        let gl = m.globals[g];
+        if gl.space == SP_PRIVATE || gl.space == SP_WORKGROUP {
+            continue;
+        }
+        w.p(", ");
+        let kind = m.types[gl.ty].kind;
+        if gl.space == SP_HANDLE {
+            let tn = w.ty(m, gl.ty);
+            let tex = kind == TK_TEXTURE;
+            let slot = if tex { nt } else { ns };
+            w.out.push_str(
+                f"{nm(&w.pool, tn)} {nm(&w.pool, w.gnames[g])} [[{if tex { "texture" } else { "sampler" }}({slot})]]");
+            if tex {
+                nt += 1;
+            } else {
+                ns += 1;
+            }
+        } else if kind == TK_ARRAY && m.types[gl.ty].n == 0 {
+            let tn = w.ty(m, m.types[gl.ty].base);
+            w.out.push_str(
+                f"{W::space(gl.space, gl.access)} {nm(&w.pool, tn)}* {nm(&w.pool, w.gnames[g])} [[buffer({nb})]]");
+            nb += 1;
+        } else {
+            let tn = w.ty(m, gl.ty);
+            w.out.push_str(
+                f"{W::space(gl.space, gl.access)} {nm(&w.pool, tn)}& {nm(&w.pool, w.gnames[g])} [[buffer({nb})]]");
+            nb += 1;
+        }
+    }
+    w.out.push_str(
+        f", const device {nm(&w.pool, rn)}* _w_in [[buffer({nb})]], device {nm(&w.pool, rt)}* _w_out [[buffer({nb + 1})]]");
+    let mut sizes = -1;
+    if needs_sizes(w, m, h) {
+        sizes = nb + 2;
+        w.out.push_str(f", constant uint* _w_sizes [[buffer({sizes})]]");
+    }
+    w.p(") {");
+    w.indent = 1;
+    for g in 0..m.globals.len() {
+        if w.uses[h][g] && m.globals[g].space == SP_PRIVATE {
+            let gl = m.globals[g];
+            w.line();
+            let tn = w.ty(m, gl.ty);
+            w.out.push_str(f"{nm(&w.pool, tn)} {nm(&w.pool, w.gnames[g])} = ");
+            if gl.init >= 0 {
+                write_const(w, m, gl.init);
+            } else {
+                w.out.push_str(f"{nm(&w.pool, tn)} {{}}");
+            }
+            w.p(";");
+        }
+    }
+    for k in 0..f.params.len() {
+        let ae = arg_expr(f, k);
+        if ae < 0 {
+            continue;
+        }
+        w.line();
+        let tn = w.ty(m, f.params[k].ty);
+        w.out.push_str(f"{nm(&w.pool, tn)} {nm(&w.pool, w.enames[ae])} = _w_in[_w_tid].p{k};");
+    }
+    declare_locals(w, m, f);
+    w.block(m, f, f.body);
+    w.indent = 0;
+    w.p("\n}\n");
+    w.stage = 255;
+    [nb, nb + 1, sizes]
+}
+
 // ---- Jobs for tests/wgsl/metalrun ----
 
 // The MSL text of the module, for a job.
 fn module_text(m: &Module, a: ScopedArena, w: &mut W) -> Buf<ScopedArena> {
     let order = call_order(m, a);
     w.uses = global_uses(m, &order, a);
+    w.sl = slots(m, &w.uses, a);
     for oi in 0..order.len() {
         let h = order[oi];
         let mut is_entry = false;
@@ -2287,6 +2498,10 @@ pub fn metal_compile_job<A: Allocator>(m: &Module, a: ScopedArena, out: &mut Buf
 // name, workgroup size, dispatch, and each buffer's slot and words.
 pub fn metal_job<A: Allocator>(m: &Module, a: ScopedArena, ei: i64, job: &job::Job,
     out: &mut Buf<A>) {
+    if job.call_n >= 0 {
+        metal_call_job(m, a, ei, job, out);
+        return;
+    }
     let mut w = new_writer(m, a);
     let text = module_text(m, a, &mut w);
     let en = m.entries[ei];
@@ -2302,14 +2517,15 @@ pub fn metal_job<A: Allocator>(m: &Module, a: ScopedArena, ei: i64, job: &job::J
         if w.sl.size_index[g] >= 0 {
             sizes[w.sl.size_index[g]] = b.bytes;
         }
-        out.push_str(f"buffer {b.group} {b.binding} {w.sl.slot[g]} {b.bytes}");
+        out.push_str(
+            f"buffer {b.group} {b.binding} {w.sl.slot[2 * m.globals.len() + g]} {b.bytes}");
         for k in 0..b.words.len() {
             out.push_str(f" {b.words[k]}");
         }
         out.push('\n');
     }
-    if w.sl.sizes_count > 0 {
-        out.push_str(f"sizes {SIZES_SLOT} {sizes.len()}");
+    if w.sl.sizes_slot[2] >= 0 {
+        out.push_str(f"sizes {w.sl.sizes_slot[2]} {sizes.len()}");
         for k in 0..sizes.len() {
             out.push_str(f" {sizes[k]}");
         }
@@ -2330,4 +2546,95 @@ fn finish_into(w: &W, out: &mut Buf<ScopedArena>) {
     copy_into(out, w.types_out.as_slice());
     copy_into(out, w.out.as_slice());
     tmp = h;
+}
+
+// A call job: the module's MSL plus entry ei's test kernel, run once per
+// input record (one thread per threadgroup), its resources at the
+// kernel's slots.
+fn metal_call_job<A: Allocator>(m: &Module, a: ScopedArena, ei: i64, job: &job::Job,
+    out: &mut Buf<A>) {
+    let mut w = new_writer(m, a);
+    let order = call_order(m, a);
+    w.uses = global_uses(m, &order, a);
+    w.sl = slots(m, &w.uses, a);
+    for oi in 0..order.len() {
+        let h = order[oi];
+        let mut is_entry = false;
+        for e in 0..m.entries.len() {
+            if m.entries[e].func == h {
+                is_entry = true;
+            }
+        }
+        if !is_entry {
+            write_fn(&mut w, m, h);
+        }
+    }
+    for e in 0..m.entries.len() {
+        write_entry(&mut w, m, e);
+    }
+    let io = write_test_kernel(&mut w, m, ei);
+    let mut text = Buf::new_in(a);
+    finish_into(&w, &mut text);
+    let h = m.entries[ei].func;
+    out.push_str(f"msl {text.len()}\n");
+    out.push_str(text.as_slice());
+    out.push_str(
+        f"\nentry {nm(&w.pool, w.fnames[h])}_w_test\ntg 1 1 1\ndispatch {job.call_n} 1 1\n");
+    // the kernel's slots: (group, binding) order over what it uses
+    let border = binding_order(m, a);
+    let ng = m.globals.len();
+    let mut kslot: V<i64> = Vec::filled_in(ng, -1, a);
+    let mut nb = 0;
+    let mut nt = 0;
+    for k in 0..border.len() {
+        let g = border[k];
+        if !w.uses[h][g] {
+            continue;
+        }
+        let gl = m.globals[g];
+        if gl.space == ir::SP_UNIFORM || gl.space == SP_STORAGE {
+            kslot[g] = nb;
+            nb += 1;
+        } else if m.types[gl.ty].kind == TK_TEXTURE {
+            kslot[g] = nt;
+            nt += 1;
+        }
+    }
+    let mut sizes: V<i64> = Vec::filled_in(w.sl.sizes_count, 0, a);
+    for i in 0..job.buffers.len() {
+        let b = &job.buffers[i];
+        let g = job::find_global(m, b.group, b.binding);
+        if w.sl.size_index[g] >= 0 {
+            sizes[w.sl.size_index[g]] = b.bytes;
+        }
+        out.push_str(f"buffer {b.group} {b.binding} {kslot[g]} {b.bytes}");
+        for j in 0..b.words.len() {
+            out.push_str(f" {b.words[j]}");
+        }
+        out.push('\n');
+    }
+    for i in 0..job.textures.len() {
+        let t = &job.textures[i];
+        let g = job::find_global(m, t.group, t.binding);
+        out.push_str(f"texture {kslot[g]} {t.format} {t.w} {t.h}");
+        for j in 0..t.words.len() {
+            out.push_str(f" {t.words[j]}");
+        }
+        out.push('\n');
+    }
+    let f = &m.functions[h];
+    let in_stride = ir::record_offsets(m, h, a)[f.params.len()];
+    let out_stride = if f.result >= 0 { ir::stride_of(m, f.result) } else { 4 };
+    out.push_str(f"buffer -1 0 {io[0]} {job.call_n * in_stride}");
+    for j in 0..job.input.len() {
+        out.push_str(f" {job.input[j]}");
+    }
+    out.push_str(f"\nbuffer -2 0 {io[1]} {job.call_n * out_stride}\n");
+    if io[2] >= 0 {
+        out.push_str(f"sizes {io[2]} {sizes.len()}");
+        for k in 0..sizes.len() {
+            out.push_str(f" {sizes[k]}");
+        }
+        out.push('\n');
+    }
 }

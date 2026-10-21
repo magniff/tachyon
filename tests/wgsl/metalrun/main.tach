@@ -17,6 +17,9 @@ import "string.h" as c;
 #[repr(C)]
 struct MTLSize { w: u64, h: u64, d: u64 }
 
+#[repr(C)]
+struct MTLRegion { x: u64, y: u64, z: u64, w: u64, h: u64, d: u64 }
+
 extern "C" {
     fn MTLCreateSystemDefaultDevice() -> *u8;
     fn sel_registerName(name: *u8) -> *u8;
@@ -45,6 +48,12 @@ extern "C" {
     fn msg_set_bytes(o: *u8, s: *u8, p: *u8, len: u64, index: u64);
     #[link_name = "objc_msgSend"]
     fn msg_dispatch(o: *u8, s: *u8, grid: MTLSize, tg: MTLSize);
+    #[link_name = "objc_msgSend"]
+    fn msg_tex_desc(o: *u8, s: *u8, format: u64, w: u64, h: u64, mipmapped: bool) -> *u8;
+    #[link_name = "objc_msgSend"]
+    fn msg_replace(o: *u8, s: *u8, region: MTLRegion, level: u64, bytes: *u8, bpr: u64);
+    #[link_name = "objc_msgSend"]
+    fn msg_set_texture(o: *u8, s: *u8, t: *u8, index: u64);
 }
 
 fn sel(name: *u8) -> *u8 { unsafe { sel_registerName(name) } }
@@ -63,6 +72,8 @@ fn describe(o: *u8) -> [u8] {
 
 struct Buffer { group: i64, binding: i64, slot: i64, bytes: i64, words: Vec<u32> }
 
+struct Texture { slot: i64, format: u64, bpp: i64, w: i64, h: i64, words: Vec<u32> }
+
 fn parse_u32(t: [u8]) -> u32 {
     let mut v: u64 = 0;
     for i in 0..t.len {
@@ -80,6 +91,7 @@ fn run(dev: *u8, queue: *u8, msl: [u8], rest: [u8], out: &mut Buf, gpa: Gpa) -> 
     let mut sizes: Vec<u32> = Vec::new_in(gpa);
     let mut sizes_slot: i64 = -1;
     let mut functions: Vec<[u8]> = Vec::new_in(gpa);
+    let mut textures: Vec<Texture> = Vec::new_in(gpa);
     let mut sc = Scanner::new(rest);
     while let Some(line) = sc.next_line() {
         let w = split_whitespace_in(line, gpa);
@@ -106,7 +118,24 @@ fn run(dev: *u8, queue: *u8, msl: [u8], rest: [u8], out: &mut Buf, gpa: Gpa) -> 
             for k in 5..w.len() {
                 b.words.push(parse_u32(w[k]));
             }
+            // missing words are zero
+            while b.words.len() * 4 < b.bytes {
+                b.words.push(0);
+            }
             bufs.push(b);
+        } else if w[0] == "texture" {
+            let fm = w[2];
+            let (format, bpp) = if fm == "rgba8unorm" { (70, 4) }
+                else if fm == "r8unorm" { (10, 1) } else if fm == "rgba32float" { (125, 16) }
+                else { (123, 16) };
+            let mut t = Texture {
+                slot: parse_int(w[1]).unwrap(), format: format as u64, bpp: bpp,
+                w: parse_int(w[3]).unwrap(), h: parse_int(w[4]).unwrap(), words: Vec::new_in(gpa)
+            };
+            for k in 5..w.len() {
+                t.words.push(parse_u32(w[k]));
+            }
+            textures.push(t);
         } else if w[0] == "functions" {
             for k in 1..w.len() {
                 functions.push(w[k]);
@@ -177,6 +206,21 @@ fn run(dev: *u8, queue: *u8, msl: [u8], rest: [u8], out: &mut Buf, gpa: Gpa) -> 
                 b.words.as_slice().ptr as *u8, b.bytes as u64, 0);
             msg_set_buffer(enc, sel(c"setBuffer:offset:atIndex:"), mb, 0, b.slot as u64);
             mtl.push(mb);
+        }
+        for i in 0..textures.len() {
+            let t = &textures[i];
+            let desc = msg_tex_desc(objc_getClass(c"MTLTextureDescriptor"),
+                sel(c"texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), t.format,
+                t.w as u64, t.h as u64, false);
+            let tex = msg_p(dev, sel(c"newTextureWithDescriptor:"), desc);
+            if tex == 0 as *u8 {
+                out.push_str("error metal.texture: cannot make a texture\n");
+                return false;
+            }
+            let region = MTLRegion { x: 0, y: 0, z: 0, w: t.w as u64, h: t.h as u64, d: 1 };
+            msg_replace(tex, sel(c"replaceRegion:mipmapLevel:withBytes:bytesPerRow:"), region, 0,
+                t.words.as_slice().ptr as *u8, (t.w * t.bpp) as u64);
+            msg_set_texture(enc, sel(c"setTexture:atIndex:"), tex, t.slot as u64);
         }
         if sizes_slot >= 0 {
             let n = if sizes.len() > 0 { sizes.len() } else { 1 };

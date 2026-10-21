@@ -24,7 +24,66 @@ use ir::{
     TK_STRUCT, TK_TEXTURE, TK_VECTOR, UN_BITNOT, UN_NEG, UN_NOT, V, bits_f32, f32_bits,
 };
 
-import "math.h" as cm;
+// The C library's f32 math (libm): a C boundary, so each call is in
+// `unsafe`; none has effects (no errno is read).
+extern "C" {
+    #[effects()]
+    fn acosf(x: f32) -> f32;
+    #[effects()]
+    fn acoshf(x: f32) -> f32;
+    #[effects()]
+    fn asinf(x: f32) -> f32;
+    #[effects()]
+    fn asinhf(x: f32) -> f32;
+    #[effects()]
+    fn atan2f(x: f32, y: f32) -> f32;
+    #[effects()]
+    fn atanf(x: f32) -> f32;
+    #[effects()]
+    fn atanhf(x: f32) -> f32;
+    #[effects()]
+    fn ceilf(x: f32) -> f32;
+    #[effects()]
+    fn cosf(x: f32) -> f32;
+    #[effects()]
+    fn coshf(x: f32) -> f32;
+    #[effects()]
+    fn exp2f(x: f32) -> f32;
+    #[effects()]
+    fn expf(x: f32) -> f32;
+    #[effects()]
+    fn floorf(x: f32) -> f32;
+    #[effects()]
+    fn fmaf(x: f32, y: f32, z: f32) -> f32;
+    #[effects()]
+    fn fmaxf(x: f32, y: f32) -> f32;
+    #[effects()]
+    fn fminf(x: f32, y: f32) -> f32;
+    #[effects()]
+    fn fmodf(x: f32, y: f32) -> f32;
+    #[effects()]
+    fn ldexpf(x: f32, e: i32) -> f32;
+    #[effects()]
+    fn log2f(x: f32) -> f32;
+    #[effects()]
+    fn logf(x: f32) -> f32;
+    #[effects()]
+    fn powf(x: f32, y: f32) -> f32;
+    #[effects()]
+    fn rintf(x: f32) -> f32;
+    #[effects()]
+    fn sinf(x: f32) -> f32;
+    #[effects()]
+    fn sinhf(x: f32) -> f32;
+    #[effects()]
+    fn sqrtf(x: f32) -> f32;
+    #[effects()]
+    fn tanf(x: f32) -> f32;
+    #[effects()]
+    fn tanhf(x: f32) -> f32;
+    #[effects()]
+    fn truncf(x: f32) -> f32;
+}
 
 // Pointer spaces (bits 48..55 of a pointer); bit 56: out of range (RZSW).
 const PS_FUNC: i64 = 1;
@@ -85,6 +144,11 @@ pub struct Interp {
     // builtins of the invocation being started
     wg_size: [i64; 3],
     groups: [i64; 3],
+    // per global: a texture's size and texels (4 words each: f32 bits for
+    // float textures, the integers for i32 and u32 ones), once set
+    tex_w: V<i64>,
+    tex_h: V<i64>,
+    texels: V<V<u32>>,
 }
 
 fn words_of(m: &Module, t: i64) -> i64 {
@@ -114,6 +178,9 @@ pub fn new_interp(m: &Module, a: ScopedArena) -> Interp {
         max_steps: 2000000000,
         wg_size: [1, 1, 1],
         groups: [1, 1, 1],
+        tex_w: Vec::new_in(a),
+        tex_h: Vec::new_in(a),
+        texels: Vec::new_in(a),
     };
     for h in 0..m.functions.len() {
         let f = &m.functions[h];
@@ -139,6 +206,9 @@ pub fn new_interp(m: &Module, a: ScopedArena) -> Interp {
     for g in 0..m.globals.len() {
         let gl = m.globals[g];
         it.bufs.push(Vec::new_in(a));
+        it.tex_w.push(0);
+        it.tex_h.push(0);
+        it.texels.push(Vec::new_in(a));
         if gl.space == SP_PRIVATE {
             it.goff.push(it.priv_words);
             it.priv_words += words_of(m, gl.ty);
@@ -247,6 +317,73 @@ impl Interp {
         let mut v: V<u32> = Vec::with_capacity_in(words.len, self.a);
         v.extend_from_slice(words);
         self.bufs[g] = v;
+    }
+
+    // A texture's texels: w x h, 4 words each (see `texels`).
+    pub fn set_texture(self: &mut Interp, g: i64, w: i64, h: i64, texels: [u32]) {
+        self.tex_w[g] = w;
+        self.tex_h[g] = h;
+        let mut v: V<u32> = Vec::with_capacity_in(texels.len, self.a);
+        v.extend_from_slice(texels);
+        self.texels[g] = v;
+    }
+
+    // Runs entry point ei once per input record (stride_in bytes each,
+    // its parameters at their record offsets, ir::record_offsets), the
+    // results in `out`, stride_out bytes each. Vertex and fragment entry
+    // points so run alone: their builtins come from the records too.
+    pub fn call(self: &mut Interp, m: &Module, ei: i64, input: [u32], stride_in: i64, n: i64,
+        out: &mut V<u32>, stride_out: i64) -> bool {
+        let fi = m.entries[ei].func;
+        let size = self.fns[fi].size;
+        let rw = if m.functions[fi].result >= 0 { words_of(m, m.functions[fi].result) } else { 0 };
+        let offs = ir::record_offsets(m, fi, self.a);
+        self.wg = Vec::filled_in(self.wg_words, 0u32, self.a);
+        for _ in 0..n * stride_out / 4 {
+            out.push(0);
+        }
+        for i in 0..n {
+            let mut inv = Inv {
+                mem: Vec::filled_in(size + rw, 0u32, self.a),
+                privm: Vec::filled_in(self.priv_words, 0u32, self.a),
+                frames: Vec::new_in(self.a),
+                ctl: Vec::new_in(self.a),
+                state: ST_RUN,
+                phase: 0,
+            };
+            for k in 0..self.priv_words {
+                inv.privm[k] = self.priv_init[k];
+            }
+            let fr = Frame { func: fi, base: 0, ctl_base: 0, ret: size };
+            inv.frames.push(fr);
+            self.enter(m, &mut inv, fr);
+            inv.ctl.push(Ctl { kind: CT_BLOCK, blk: m.functions[fi].body, pos: 0, s: -1 });
+            for k in 0..m.functions[fi].params.len() {
+                let e = self.fns[fi].arg_exprs[k];
+                if e < 0 {
+                    continue;
+                }
+                let w = words_of(m, m.functions[fi].params[k].ty);
+                let src = i * stride_in / 4 + offs[k] / 4;
+                for j in 0..w {
+                    if src + j < input.len {
+                        inv.mem[self.fns[fi].regs[e] + j] = input[src + j];
+                    }
+                }
+            }
+            self.run(m, &mut inv);
+            if self.failed {
+                return false;
+            }
+            if inv.state != ST_DONE {
+                self.fail("a barrier in an entry point run alone");
+                return false;
+            }
+            for j in 0..rw {
+                out[i * stride_out / 4 + j] = inv.mem[size + j];
+            }
+        }
+        true
     }
 
     // ---- Memory ----
@@ -720,7 +857,7 @@ impl Interp {
             return true;
         }
         if op == S_IMAGE_STORE {
-            self.fail("textures are not run by the interpreter yet");
+            self.fail("textureStore is not run by the interpreter");
             return false;
         }
         self.fail("unknown statement");
@@ -950,8 +1087,47 @@ impl Interp {
             }
             return;
         }
-        if op == E_IMAGE_SAMPLE || op == E_IMAGE_LOAD || op == E_IMAGE_QUERY {
-            self.fail("textures are not run by the interpreter yet");
+        if op == E_IMAGE_LOAD || op == E_IMAGE_QUERY {
+            let g = inv.mem[fr.base + self.fns[fr.func].regs[x.a]] as i64;
+            let tt = m.types[f.exprs[x.a].ty];
+            if tt.n == ir::TEX_2D_ARRAY {
+                self.fail("array textures are not run by the interpreter");
+                return;
+            }
+            let w = self.tex_w[g];
+            let h = self.tex_h[g];
+            if op == E_IMAGE_QUERY {
+                if x.b == ir::IQ_SIZE {
+                    inv.mem[dst] = w as u32;
+                    inv.mem[dst + 1] = h as u32;
+                } else {
+                    inv.mem[dst] = 1;
+                }
+                return;
+            }
+            // the coordinates clamped (as unsigned) into the one level
+            let c = fr.base + self.fns[fr.func].regs[f.args[x.c]];
+            let mut cx = inv.mem[c] as i64;
+            let mut cy = inv.mem[c + 1] as i64;
+            if cx > w - 1 {
+                cx = w - 1;
+            }
+            if cy > h - 1 {
+                cy = h - 1;
+            }
+            if w <= 0 || h <= 0 {
+                self.fail("a texture the job does not set is read");
+                return;
+            }
+            let t = (cy * w + cx) * 4;
+            let n = words_of(m, x.ty);
+            for k in 0..n {
+                inv.mem[dst + k] = self.texels[g][t + k];
+            }
+            return;
+        }
+        if op == E_IMAGE_SAMPLE {
+            self.fail("sampling is not run by the interpreter");
             return;
         }
         self.fail("unknown expression");
@@ -1103,7 +1279,7 @@ impl Interp {
                 }
                 acc = acc + v * v;
             }
-            let len = unsafe { cm::sqrtf(acc) };
+            let len = unsafe { sqrtf(acc) };
             if fun == ir::MF_NORMALIZE {
                 for k in 0..n {
                     inv.mem[dst + k] = ub(fl(inv.mem[a[0] + k]) / len);
@@ -1262,7 +1438,7 @@ fn clampf(x: f32, lo: f32, hi: f32) -> f32 { if x < lo { lo } else if x > hi { h
 
 fn maxf(a: f32, b: f32) -> f32 { if a > b { a } else { b } }
 
-fn round_even(x: f32) -> f32 { unsafe { cm::rintf(x) } }
+fn round_even(x: f32) -> f32 { unsafe { rintf(x) } }
 
 fn f32_to_f16(x: f32) -> u32 {
     let b = ub(x);
@@ -1397,7 +1573,7 @@ pub fn scalar_binary(op: i64, sk: u8, a: u32, b: u32) -> u32 {
         }
         if op == OP_MOD {
             // WGSL: x - y * trunc(x / y)
-            return ub(unsafe { cm::fmodf(x, y) });
+            return ub(unsafe { fmodf(x, y) });
         }
         let c = if op == OP_EQ { x == y } else if op == OP_NE { x != y }
             else if op == OP_LT { x < y } else if op == OP_LE { x <= y }
@@ -1573,63 +1749,63 @@ pub fn component_math(fun: i64, sk: u8, p: u32, q: u32, r: u32) -> u32 {
     let v: f32 = if fun == ir::MF_ABS {
         if x < 0.0 { -x } else if x == 0.0 { 0.0 } else { x }
     } else if fun == ir::MF_MIN {
-        unsafe { cm::fminf(x, y) }
+        unsafe { fminf(x, y) }
     } else if fun == ir::MF_MAX {
-        unsafe { cm::fmaxf(x, y) }
+        unsafe { fmaxf(x, y) }
     } else if fun == ir::MF_CLAMP {
-        unsafe { cm::fminf(cm::fmaxf(x, y), z) }
+        unsafe { fminf(fmaxf(x, y), z) }
     } else if fun == ir::MF_SIGN {
         if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }
     } else if fun == ir::MF_FLOOR {
-        unsafe { cm::floorf(x) }
+        unsafe { floorf(x) }
     } else if fun == ir::MF_CEIL {
-        unsafe { cm::ceilf(x) }
+        unsafe { ceilf(x) }
     } else if fun == ir::MF_ROUND {
-        unsafe { cm::rintf(x) }
+        unsafe { rintf(x) }
     } else if fun == ir::MF_FRACT {
-        x - unsafe { cm::floorf(x) }
+        x - unsafe { floorf(x) }
     } else if fun == ir::MF_TRUNC {
-        unsafe { cm::truncf(x) }
+        unsafe { truncf(x) }
     } else if fun == ir::MF_SQRT {
-        unsafe { cm::sqrtf(x) }
+        unsafe { sqrtf(x) }
     } else if fun == ir::MF_INVERSE_SQRT {
-        1.0 / unsafe { cm::sqrtf(x) }
+        1.0 / unsafe { sqrtf(x) }
     } else if fun == ir::MF_EXP {
-        unsafe { cm::expf(x) }
+        unsafe { expf(x) }
     } else if fun == ir::MF_EXP2 {
-        unsafe { cm::exp2f(x) }
+        unsafe { exp2f(x) }
     } else if fun == ir::MF_LOG {
-        unsafe { cm::logf(x) }
+        unsafe { logf(x) }
     } else if fun == ir::MF_LOG2 {
-        unsafe { cm::log2f(x) }
+        unsafe { log2f(x) }
     } else if fun == ir::MF_POW {
-        unsafe { cm::powf(x, y) }
+        unsafe { powf(x, y) }
     } else if fun == ir::MF_SIN {
-        unsafe { cm::sinf(x) }
+        unsafe { sinf(x) }
     } else if fun == ir::MF_COS {
-        unsafe { cm::cosf(x) }
+        unsafe { cosf(x) }
     } else if fun == ir::MF_TAN {
-        unsafe { cm::tanf(x) }
+        unsafe { tanf(x) }
     } else if fun == ir::MF_ASIN {
-        unsafe { cm::asinf(x) }
+        unsafe { asinf(x) }
     } else if fun == ir::MF_ACOS {
-        unsafe { cm::acosf(x) }
+        unsafe { acosf(x) }
     } else if fun == ir::MF_ATAN {
-        unsafe { cm::atanf(x) }
+        unsafe { atanf(x) }
     } else if fun == ir::MF_ATAN2 {
-        unsafe { cm::atan2f(x, y) }
+        unsafe { atan2f(x, y) }
     } else if fun == ir::MF_SINH {
-        unsafe { cm::sinhf(x) }
+        unsafe { sinhf(x) }
     } else if fun == ir::MF_COSH {
-        unsafe { cm::coshf(x) }
+        unsafe { coshf(x) }
     } else if fun == ir::MF_TANH {
-        unsafe { cm::tanhf(x) }
+        unsafe { tanhf(x) }
     } else if fun == ir::MF_ASINH {
-        unsafe { cm::asinhf(x) }
+        unsafe { asinhf(x) }
     } else if fun == ir::MF_ACOSH {
-        unsafe { cm::acoshf(x) }
+        unsafe { acoshf(x) }
     } else if fun == ir::MF_ATANH {
-        unsafe { cm::atanhf(x) }
+        unsafe { atanhf(x) }
     } else if fun == ir::MF_MIX {
         x * (1.0 - z) + y * z
     } else if fun == ir::MF_STEP {
@@ -1638,7 +1814,7 @@ pub fn component_math(fun: i64, sk: u8, p: u32, q: u32, r: u32) -> u32 {
         let t = clampf((z - x) / (y - x), 0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
     } else if fun == ir::MF_FMA {
-        unsafe { cm::fmaf(x, y, z) }
+        unsafe { fmaf(x, y, z) }
     } else if fun == ir::MF_DEGREES {
         x * 57.295779513082322865
     } else if fun == ir::MF_RADIANS {
@@ -1646,7 +1822,7 @@ pub fn component_math(fun: i64, sk: u8, p: u32, q: u32, r: u32) -> u32 {
     } else if fun == ir::MF_SATURATE {
         clampf(x, 0.0, 1.0)
     } else if fun == ir::MF_LDEXP {
-        unsafe { cm::ldexpf(x, q as i32) }
+        unsafe { ldexpf(x, q as i32) }
     } else {
         0.0
     };
