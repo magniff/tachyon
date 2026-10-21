@@ -657,6 +657,10 @@ esac
 case own-try in
     *"$FILTER"*) "$ROOT/tests/own-try/run.sh" -c "$COMPILER" >"$WORK/own-try.out" 2>&1 & ;;
 esac
+# (0.22) std through the own pass (tests/std/own.sh): category "std-own".
+case std-own in
+    *"$FILTER"*) sh "$ROOT/tests/std/own.sh" -c "$COMPILER" >"$WORK/std-own.out" 2>&1 & ;;
+esac
 # (0.24) The language server's sessions (tests/lsp/run.sh): category "lsp".
 case lsp in
     *"$FILTER"*) "$ROOT/tests/lsp/run.sh" -c "$COMPILER" >"$WORK/lsp.out" 2>&1 & ;;
@@ -909,6 +913,19 @@ case own-try in
             count=$((count + 1))
         fi
         grep '^FAIL' "$WORK/own-try.out" >>"$FAILURES"
+        ;;
+esac
+# std's own functions through the own pass (0.22, run above): one case,
+# "std-own"; its findings must be in tests/std/own.allowed.
+case std-own in
+    *"$FILTER"*)
+        if grep -q '^pass std-own' "$WORK/std-own.out"; then
+            echo "std-own pass" >>"$TALLY"
+        else
+            echo "std-own fail" >>"$TALLY"
+            { echo "FAIL std-own:"; sed 's/^/    /' "$WORK/std-own.out"; } >>"$FAILURES"
+        fi
+        count=$((count + 1))
         ;;
 esac
 
