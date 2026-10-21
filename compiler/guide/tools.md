@@ -175,6 +175,15 @@ try: tachyonc edit patch main --old 'print_int(total)' --new 'print_int(total + 
 
 Exit status: 0 done, 1 refused or failed (nothing written), 2 usage.
 
+## In an editor
+
+`tachyonc lsp` (0.24) is a language server over stdin and stdout: the
+same answers in an editor, unsaved edits included. Definition and
+references; hover with a function's signature, effects (declared or
+inferred, a line of why each) and features, or a local's type; the
+file's symbols; `check`'s errors as diagnostics, their `try:` lines
+attached. The root: the nearest `main.tach` (docs/lsp.md).
+
 ## Other compiler options
 
 `-O0`, `-O1`, `-O2` (the default; all behave the same), `-j N` (0.18.1:
