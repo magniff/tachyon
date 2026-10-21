@@ -1,0 +1,98 @@
+// bench/gpu: draws.tach's encoding through std::gpu::hal::metal directly,
+// below the public API: no contracts, no pass state. The difference from
+// draws.tach is what the API's checks cost (docs/design/gpu.md §5: under
+// 3%); bench/gpu/run.sh runs it with the others.
+
+use std::gpu;
+use std::gpu::{
+    BindingType, BufferUsage, Format, PassDesc, Reflection, ShaderSource, TextureUsage,
+    VertexFormat, VertexLayout,
+};
+use std::gpu::hal::{Api, Render};
+use std::gpu::hal::metal::Metal;
+use std::gpu::types::Load;
+
+extern "C" {
+    fn clock_gettime_nsec_np(clock: i32) -> u64;
+}
+
+const DRAWS: i64 = 10000;
+const GROUPS: i64 = 16;
+const ITERS: i64 = 60;
+
+const MSL: [[u8]; 10] = [
+    "#include <metal_stdlib>",
+    "using namespace metal;",
+    "struct Globals { float2 size; };",
+    "struct VIn { float2 pos [[attribute(0)]]; float4 color [[attribute(1)]]; };",
+    "struct VOut { float4 pos [[position]]; float4 color; };",
+    "vertex VOut vs_main(VIn in [[stage_in]], constant Globals& g [[buffer(0)]]) {",
+    "    VOut o; float2 n = in.pos / g.size * 2.0 - 1.0;",
+    "    o.pos = float4(n.x, -n.y, 0.5, 1.0); o.color = in.color; return o;",
+    "}",
+    "fragment float4 fs_main(VOut in [[stage_in]]) { return in.color; }",
+];
+
+fn now_us() -> f64 {
+    // CLOCK_MONOTONIC_RAW
+    let ns = unsafe { clock_gettime_nsec_np(4) };
+    ns as f64 / 1000.0
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let inst = gpu::Instance::new_in(gpa);
+    let adapter = inst.adapter().unwrap();
+    let (dev, mut queue) = adapter.device().unwrap();
+    let mut text = Buf::new_in(gpa);
+    for l in MSL {
+        text.push_str(l);
+        text.push('\n');
+    }
+    let mut refl = Reflection::new_in(gpa);
+    refl.vertex("vs", "vs_main");
+    refl.fragment("fs", "fs_main");
+    refl.bind(0, 0, BindingType::Uniform, vertex: 0);
+    refl.input(0, VertexFormat::Float32x2);
+    refl.input(1, VertexFormat::Unorm8x4);
+    let src = ShaderSource::msl(text.as_slice(), refl);
+    let mut shader = dev.shader(&src).unwrap();
+    let mut desc = gpu::RenderDesc::new(&shader, "vs", "fs", Format::Rgba8Unorm);
+    let mut layout = VertexLayout::new(12);
+    layout.attribute(0, VertexFormat::Float32x2, 0);
+    layout.attribute(1, VertexFormat::Unorm8x4, 8);
+    desc.vertex_buffer(layout);
+    let mut pipe = dev.render_pipeline(&desc).unwrap();
+    let mut tex = dev.texture(64, 64, Format::Rgba8Unorm, usage: TextureUsage::RENDER_ATTACHMENT);
+    let mut view = tex.view();
+    let mut verts = dev.buffer(6 * 12, BufferUsage::VERTEX);
+    let mut uni = dev.buffer(GROUPS * 256, BufferUsage::UNIFORM);
+    let mut groups: Vec<gpu::BindGroup> = Vec::new_in(gpa);
+    for k in 0..GROUPS {
+        groups.push(dev.bind_group(pipe.bind_layout(0),
+            [gpu::bind_range(0, &uni, k * 256, 16)][..]));
+    }
+    let mut times: Vec<f64> = Vec::new_in(gpa);
+    for _ in 0..ITERS {
+        let t0 = now_us();
+        let mut cb = Metal::begin(&dev.raw);
+        let mut p = Metal::pass_new();
+        Metal::pass_color(&mut p, 0, &view.raw, Load::Clear, gpu::Color::black(), true);
+        let mut e = Metal::begin_render(&mut cb, &p);
+        Metal::render_set_pipeline(&mut e, &pipe.raw);
+        Metal::render_set_vertex_buffer(&mut e, 0, &verts.raw, 0);
+        for i in 0..DRAWS {
+            if i % 10 == 0 {
+                Metal::render_set_bind_group(&mut e, &groups[(i / 10) % GROUPS].raw);
+            }
+            Metal::draw(&mut e, 0, 6, 0, 1);
+        }
+        Metal::end_render(&mut e);
+        let t1 = now_us();
+        Metal::submit(&mut queue.raw, &mut cb);
+        queue.wait_idle().unwrap();
+        times.push(t1 - t0);
+    }
+    times.sort_by(|a, b| if *a < *b { -1 } else if *a > *b { 1 } else { 0 });
+    println(f"tachyon-hal {DRAWS} draws: median {times[ITERS / 2]:.0} us, min {times[0]:.0} us");
+    0
+}
