@@ -68,11 +68,11 @@ stdin):
 $ tachyonc edit apply <<'EOF'
 > @@ new before Word
 > // How many times hash was called.
-> static mut HASHES: i64 = 0;
+> static var HASHES: i64 = 0;
 > @@ Word::hash
->     fn hash(self: &Word) -> u64 {
+>     fn hash(self) -> u64 {
 >         unsafe { HASHES += 1; }
->         let mut h = 0xcbf29ce484222325u64;
+>         var h = 0xcbf29ce484222325u64;
 >         for b in self.text {
 >             h = (h ^ lower(b) as u64) * 0x100000001b3u64;
 >         }

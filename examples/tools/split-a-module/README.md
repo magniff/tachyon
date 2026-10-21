@@ -144,14 +144,14 @@ $ tachyonc query items shop
 15	struct	pub struct Product
 23	struct	pub struct Store
 29	fn	pub fn new_store(gpa: Gpa) -> Store
-33	fn	pub fn add_product(st: &mut Store, sku: i64, name: [u8], price: i64, stock: i64)
-38	fn	pub fn find_sku(st: &Store, sku: i64) -> Option<i64>
-47	fn	pub fn product(st: &Store, sku: i64) -> Option<Product>
-54	fn	pub fn in_stock(st: &Store, sku: i64) -> i64
-62	fn	pub fn restock(st: &mut Store, sku: i64, n: i64) -> bool
-75	fn	fn take_stock(st: &mut Store, sku: i64, n: i64) -> i64
-88	fn	pub fn free_store(st: &mut Store)
-92	fn	pub fn print_stock(st: &Store, gpa: Gpa)
+33	fn	pub fn add_product(st: inout Store, sku: i64, name: [u8], price: i64, stock: i64)
+38	fn	pub fn find_sku(st: Store, sku: i64) -> Option<i64>
+47	fn	pub fn product(st: Store, sku: i64) -> Option<Product>
+54	fn	pub fn in_stock(st: Store, sku: i64) -> i64
+62	fn	pub fn restock(st: inout Store, sku: i64, n: i64) -> bool
+75	fn	fn take_stock(st: inout Store, sku: i64, n: i64) -> i64
+88	fn	pub fn free_store(st: inout Store)
+92	fn	pub fn print_stock(st: Store, gpa: Gpa)
 ```
 
 Code outside the module was changed too: `main.tach` imports from where
@@ -160,7 +160,7 @@ the items are now.
 ```console
 $ git diff main.tach
 diff --git a/main.tach b/main.tach
-index 1c2053b..d8aade5 100644
+index e5a4036..09c2d7c 100644
 --- a/main.tach
 +++ b/main.tach
 @@ -2,7 +2,10 @@

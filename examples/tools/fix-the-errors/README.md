@@ -23,13 +23,13 @@ file, one per line, `FILE:LINE:COL: error[KIND] MESSAGE | help: ...`:
 $ tachyonc check
 main.tach:8:38: error[type error] 'letter' is private | help: make it public: `pub fn letter` at grades.tach:21:1 | try: tachyonc fix --suggested main.tach
 main.tach:9:14: error[type error] unresolved import 'roster::add_score'
-main.tach:16:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: &mut Roster, name: [u8])` (roster.tach:17)
-main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: &mut Roster, name: [u8])` (roster.tach:17)
-main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: &mut Roster, name: [u8])` (roster.tach:17)
-main.tach:31:23: error[type error] undefined variable 'I64_MIN' | help: add `use std::num::I64_MIN;` | try: tachyonc fix --suggested main.tach
+main.tach:16:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.tach:17)
+main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.tach:17)
+main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.tach:17)
+main.tach:31:19: error[type error] undefined variable 'I64_MIN' | help: add `use std::num::I64_MIN;` | try: tachyonc fix --suggested main.tach
 grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: tachyonc fix --suggested main.tach
 grades.tach:39:17: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: tachyonc fix --only unsafe main.tach
-roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
+roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `var count`
 [exit 1]
 ```
 
@@ -73,11 +73,11 @@ $ tachyonc fix
 fixed 1 missing import, 1 pub, 1 unsafe block	2 files	+3 -2 lines
 $ tachyonc check
 main.tach:9:14: error[type error] unresolved import 'roster::add_score'
-main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: &mut Roster, name: [u8])` (roster.tach:17)
-main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: &mut Roster, name: [u8])` (roster.tach:17)
-main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: &mut Roster, name: [u8])` (roster.tach:17)
+main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.tach:17)
+main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.tach:17)
+main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.tach:17)
 grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: tachyonc fix --suggested main.tach
-roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `let mut count`
+roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `var count`
 [exit 1]
 ```
 
@@ -89,7 +89,7 @@ The item at an error's position is `query show FILE:LINE`:
 $ tachyonc query show roster.tach:26
 // crate::roster::with_scores	roster.tach:21-30
 // How many students have at least `n` scores.
-pub fn with_scores(r: &Roster, n: i64) -> i64 {
+pub fn with_scores(r: Roster, n: i64) -> i64 {
     let count = 0;
     for s in r.students.as_slice() {
         if s.scores.len() >= n {
@@ -106,10 +106,10 @@ try: tachyonc --diagnostics=short main.tach -c -o /dev/null
 `FILE:LINE` inside it; OLD must occur exactly once in that item:
 
 ```console
-$ tachyonc edit patch roster.tach:26 --old 'let count' --new 'let mut count' --show
+$ tachyonc edit patch roster.tach:26 --old 'let count' --new 'var count' --show
 patched crate::roster::with_scores	roster.tach	+1 -1 lines
 // roster.tach:23
-23	    let mut count = 0;
+23	    var count = 0;
 ```
 
 An OLD that is not there is refused, with the nearest line of the item
@@ -136,14 +136,14 @@ two-argument `enrol` and no `add_score`.
 ```console
 $ tachyonc check
 main.tach:9:14: error[type error] unresolved import 'roster::add_score'
-main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: &mut Roster, name: [u8])` (roster.tach:17)
-main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: &mut Roster, name: [u8])` (roster.tach:17)
-main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: &mut Roster, name: [u8])` (roster.tach:17)
+main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.tach:17)
+main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.tach:17)
+main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.tach:17)
 [exit 1]
 $ tachyonc query show roster::enrol
 // crate::roster::enrol	roster.tach:16-19	effects: alloc(Gpa) panic
 // A student with no scores yet.
-pub fn enrol(r: &mut Roster, name: [u8]) {
+pub fn enrol(r: inout Roster, name: [u8]) {
     r.students.push(Student { name: name, scores: Vec::new_in(r.students.allocator()) });
 }
 warning query.program-errors: 4 errors in the program; results may be incomplete
@@ -160,14 +160,14 @@ a valid input.)
 $ tachyonc edit apply --show <<'EOF'
 > @@ roster::enrol
 > // A student and their scores so far.
-> pub fn enrol(r: &mut Roster, name: [u8], scores: [i64]) {
->     let mut v: Vec<i64> = Vec::new_in(r.students.allocator());
+> pub fn enrol(r: inout Roster, name: [u8], scores: [i64]) {
+>     var v: Vec<i64> = Vec::new_in(r.students.allocator());
 >     v.extend_from_slice(scores);
 >     r.students.push(Student { name: name, scores: v });
 > }
 > @@ new after roster::enrol
 > // One more score for the student called `name`; false when there is none.
-> pub fn add_score(r: &mut Roster, name: [u8], score: i64) -> bool {
+> pub fn add_score(r: inout Roster, name: [u8], score: i64) -> bool {
 >     for i in 0..r.students.len() {
 >         if r.students[i].name == name {
 >             r.students[i].scores.push(score);
@@ -180,14 +180,14 @@ $ tachyonc edit apply --show <<'EOF'
 applied 2 blocks: replaced crate::roster::enrol; inserted after crate::roster::enrol	roster.tach	+16 -3 lines
 // roster.tach:16-31
 16	// A student and their scores so far.
-17	pub fn enrol(r: &mut Roster, name: [u8], scores: [i64]) {
-18	    let mut v: Vec<i64> = Vec::new_in(r.students.allocator());
+17	pub fn enrol(r: inout Roster, name: [u8], scores: [i64]) {
+18	    var v: Vec<i64> = Vec::new_in(r.students.allocator());
 19	    v.extend_from_slice(scores);
 20	    r.students.push(Student { name: name, scores: v });
 21	}
 22	
 23	// One more score for the student called `name`; false when there is none.
-24	pub fn add_score(r: &mut Roster, name: [u8], score: i64) -> bool {
+24	pub fn add_score(r: inout Roster, name: [u8], score: i64) -> bool {
 25	    for i in 0..r.students.len() {
 26	        if r.students[i].name == name {
 27	            r.students[i].scores.push(score);

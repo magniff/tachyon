@@ -3,7 +3,7 @@
 `wordstat` counts the lines and words of a text, its commonest words and
 a histogram of word lengths. It was written before std had
 `Buf::push_str` and iterators, so it calls helpers from `compat.tach`
-(`buf_add(b, s)`, `buf_add_int(b, n)`, `vec_at(v, i)`, each marked
+(`buf_add(&b, s)`, `buf_add_int(&b, n)`, `vec_at(v, i)`, each marked
 deprecated) and walks slices with index loops. Five files, about 260
 lines; `poem.txt` is the input.
 
@@ -41,29 +41,30 @@ ok: built wordstat
 
 ## 1. A deprecated helper becomes a method
 
-`buf_add($b, $s)` matches any call of `buf_add` with two arguments, and
-`$b.push_str($s)` puts each argument's exact text back where its hole
-is. `--dry-run` prints the diff without writing it:
+`buf_add(&$b, $s)` matches any call of `buf_add` with two arguments,
+the first lent inout (`&`), and `$b.push_str($s)` puts each argument's
+exact text back where its hole is. `--dry-run` prints the diff without
+writing it:
 
 ```console
-$ tachyonc rewrite 'buf_add($b, $s)' '$b.push_str($s)' --dry-run | head -12
+$ tachyonc rewrite 'buf_add(&$b, $s)' '$b.push_str($s)' --dry-run | head -12
 --- a/report.tach
 +++ b/report.tach
 @@ -3 +3 @@
 -use crate::compat::{buf_add, buf_add_int, vec_at};
 +use crate::compat::{buf_add_int, vec_at};
 @@ -9 +9 @@
--        buf_add(b, "#");
+-        buf_add(&b, "#");
 +        b.push_str("#");
 @@ -14 +14 @@
--    buf_add(b, "lines ");
+-    buf_add(&b, "lines ");
 +    b.push_str("lines ");
 @@ -16 +16 @@
 note rewrite.imports: removed 1 import the rewrite left unused
-$ tachyonc rewrite 'buf_add($b, $s)' '$b.push_str($s)'
+$ tachyonc rewrite 'buf_add(&$b, $s)' '$b.push_str($s)'
 rewrote 24 sites in 1 file	report.tach	+25 -25 lines
 note rewrite.imports: removed 1 import the rewrite left unused
-$ tachyonc rewrite 'buf_add_int($b, $n)' '$b.push_int($n)'
+$ tachyonc rewrite 'buf_add_int(&$b, $n)' '$b.push_int($n)'
 rewrote 10 sites in 1 file	report.tach	+11 -11 lines
 note rewrite.imports: removed 1 import the rewrite left unused
 $ tachyonc rewrite 'vec_at($v, $i)' '$v.get($i)' --show
@@ -115,11 +116,11 @@ the hole has two types at the sites, and each gets a command:
 
 ```console
 $ tachyonc rewrite '$v.len() == 0' '$v.is_empty()'
-report.tach:68:8: error[type error] no method 'is_empty' on type '&mut Buf' | help: no `is_empty`: `x.len() == 0` | try: tachyonc query items Buf main.tach  [edited: crate::report::finish]
+report.tach:68:8: error[type error] no method 'is_empty' on type 'Buf' | help: no `is_empty`: `x.len() == 0` | try: tachyonc query items Buf main.tach  [edited: crate::report::finish]
 error edit.breaks: 1 new error; nothing written
-note rewrite.where: $v has 2 types at the sites: Vec<[u8]> (1 site), &mutBuf (1 site); --where takes the ones the replacement fits
+note rewrite.where: $v has 2 types at the sites: Vec<[u8]> (1 site), Buf (1 site); --where takes the ones the replacement fits
 try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8]>'
-try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: &mutBuf'
+try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Buf'
 try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --no-check
 [exit 1]
 ```
@@ -132,8 +133,8 @@ $ tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8]>' --sho
 rewrote 1 site in 1 file	main.tach	+1 -1 lines
 // main.tach:17
 17	    if ws.is_empty() {
-note rewrite.types: 1 site matches but for --where; first: $v is &mut Buf at report.tach:68:8
-try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: &mut Buf' --dry-run
+note rewrite.types: 1 site matches but for --where; first: $v is Buf at report.tach:68:8
+try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Buf' --dry-run
 ```
 
 ## 4. Index loops become `for x in v`
@@ -166,8 +167,8 @@ $ tachyonc query show text.tach:42
 // crate::text::longest_line	text.tach:33-45	effects: none
 // The length of the longest line, and its index.
 pub fn longest_line(ls: [[u8]]) -> (i64, i64) {
-    let mut best = 0;
-    let mut at = 0;
+    var best = 0;
+    var at = 0;
     for i in 0..ls.len {
         let l = ls[i];
         if l.len > best {

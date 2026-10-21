@@ -155,7 +155,7 @@ enclosing one (`a.scope(|inner| ...)` makes a scope inside a scope):
 $ cat > capture.tach <<'EOF'
 > fn main(gpa: Gpa) -> i32 {
 >     let n = arena_scope(gpa, |outer| {
->         let mut seen: Vec<i64, ScopedArena> = Vec::new_in(outer);
+>         var seen: Vec<i64, ScopedArena> = Vec::new_in(outer);
 >         seen.push(1);
 >         outer.scope(|inner| {
 >             seen.push(2);

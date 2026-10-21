@@ -89,10 +89,10 @@ $ tachyonc refactor --script steps.txt --dry-run | grep ': error'
 main.tach:10:40: error[type error] expected 'Arena', got 'Gpa'  [in crate::main]
 markup.tach:11:25: error[type error] expected 'Gpa', got 'Arena'  [edited: crate::markup::lines]
 markup.tach:31:5: error[type error] expected 'Buf', got 'Buf<Arena>'  [edited: crate::markup::slug]
-markup.tach:56:44: error[type error] expected 'Gpa', got 'Arena'  [edited: crate::markup::headings]
-markup.tach:75:25: error[type error] expected '&mut Buf', got '&mut Buf<Arena>'  [edited: crate::markup::render]
-markup.tach:90:28: error[type error] expected '&mut Buf', got '&mut Buf<Arena>'  [edited: crate::markup::render]
-markup.tach:100:23: error[type error] expected '&mut Buf', got '&mut Buf<Arena>'  [edited: crate::markup::render]
+markup.tach:56:40: error[type error] expected 'Gpa', got 'Arena'  [edited: crate::markup::headings]
+markup.tach:75:25: error[type error] expected 'inout Buf', got 'inout Buf<Arena>'  [edited: crate::markup::render]
+markup.tach:90:28: error[type error] expected 'inout Buf', got 'inout Buf<Arena>'  [edited: crate::markup::render]
+markup.tach:100:23: error[type error] expected 'inout Buf', got 'inout Buf<Arena>'  [edited: crate::markup::render]
 markup.tach:107:5: error[type error] expected 'Buf', got 'Buf<Arena>'  [edited: crate::markup::render]
 warning edit.breaks: 8 new errors (7 in the edited text, 1 in crate::main, which the edit does not change) (dry run)
 ```
@@ -109,7 +109,7 @@ $ cat > steps.txt <<'EOF'
 > refactor signature markup::slug --type gpa Arena
 > refactor signature markup::headings --type gpa Arena
 > refactor signature markup::render --type gpa Arena
-> refactor signature markup::inline --type out '&mut Buf<Arena>'
+> refactor signature markup::inline --type out 'inout Buf<Arena>'
 > refactor field markup::Heading --type id 'Buf<Arena>'
 > edit patch markup::lines --old '-> Vec<[u8]>' --new '-> Vec<[u8], Arena>'
 > edit patch markup::slug --old '-> Buf' --new '-> Buf<Arena>'
@@ -127,7 +127,7 @@ $ cat > steps.txt <<'EOF'
 >     ];
 >     // One arena for every document: what render makes for a document
 >     // is freed at once, before the next one.
->     let mut arena = Arena::new_in(gpa);
+>     var arena = Arena::new_in(gpa);
 >     defer unsafe { arena.free_all() };
 >     for doc in docs {
 >         let html = markup::render(doc, arena);
@@ -145,7 +145,7 @@ changed parameter gpa to Arena in crate::markup::lines	markup.tach	+1 -1 lines
 changed parameter gpa to Arena in crate::markup::slug	markup.tach	+1 -1 lines
 changed parameter gpa to Arena in crate::markup::headings	markup.tach	+1 -1 lines
 changed parameter gpa to Arena in crate::markup::render	markup.tach	+1 -1 lines
-changed parameter out to &mut Buf<Arena> in crate::markup::inline	markup.tach	+1 -1 lines
+changed parameter out to inout Buf<Arena> in crate::markup::inline	markup.tach	+1 -1 lines
 changed field id to Buf<Arena> in crate::markup::Heading	markup.tach	+1 -1 lines
 patched crate::markup::lines	markup.tach	+1 -1 lines
 patched crate::markup::slug	markup.tach	+1 -1 lines
@@ -217,14 +217,14 @@ patched crate::markup::render	markup.tach	+1 -0 lines
 guards the whole module. A debugging print three calls down, in `slug`:
 
 ```console
-$ tachyonc edit patch markup::slug --old '    let mut dash = false;' --new '    eprintln(f"slug of {title}");
->     let mut dash = false;'
+$ tachyonc edit patch markup::slug --old '    var dash = false;' --new '    eprintln(f"slug of {title}");
+>     var dash = false;'
 markup.tach:68:5: error[effect] 'markup::render' is #[effects(alloc(Arena), panic)], but it does io: 'headings(ls.as_slice(), arena)' at markup.tach:71:14 calls 'markup::headings' | help: return the data and let the caller print it, or add 'io' to #[effects(alloc(Arena), panic)] | try: tachyonc query effects markup::render --why io  [in crate::markup::render]
 error edit.breaks: 1 new error (1 in crate::markup::render, which the edit does not change); nothing written
 note edit.together: change crate::markup::render in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
 try: tachyonc query show crate::markup::render
-try: tachyonc edit patch markup::slug --old '    let mut dash = false;' --new '    eprintln(f"slug of {title}");
-    let mut dash = false;' --no-check
+try: tachyonc edit patch markup::slug --old '    var dash = false;' --new '    eprintln(f"slug of {title}");
+    var dash = false;' --no-check
 [exit 1]
 ```
 

@@ -47,10 +47,11 @@ fn main(gpa: Gpa) {
     let j = Key { k: 2 };
     println(f"{mean(&a)} {v[0]} {k < j} {first_byte(c"hi")}");
 }
-$ main.tach -o prog --syntax=mixed
-main.tach:11:20: error[type error] 'cmp' does not have the signature trait 'Ord' declares: expected 'fn(Key, Key) -> i64'
-main.tach:22:31: error[type error] expected 'i64', got '*i64'
-[exit 1]
+## (0.20) Then 0.20's spelling, `fix --only conventions` (its 0.19 input
+## read --syntax=mixed): the chain 0.16 -> 0.19 -> 0.20 prints what 0.16 did.
+$ fix --only conventions --syntax=mixed
+fixed 1 parameter to let, 1 parameter to inout, 2 '&mut e's to '&e', 1 '&e' to a let, 2 'let mut's / 'mut x's to var	main.tach	+7 -7 lines
+$ main.tach -o prog
+ok: built prog
 % ./prog
-tests/refactor/run.sh: line 91: ./prog: No such file or directory
-[exit 127]
+5 1 true 104

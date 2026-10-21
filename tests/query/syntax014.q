@@ -15,7 +15,7 @@ fn main() -> i64 {
 }
 warning query.program-errors: 1 error in the program; results may be incomplete
 try: tachyonc --diagnostics=short syntax014/main.tach -c -o /dev/null
-$ grep 'move' --code
+$ grep 'sink' --code
 note query.empty: 0 hits
 warning query.program-errors: 1 error in the program; results may be incomplete
 try: tachyonc --diagnostics=short syntax014/main.tach -c -o /dev/null
