@@ -17,7 +17,7 @@ use crate::base::{
     FILES, FILE_COUNT, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
 };
 use crate::base::diag::buf_tool_command;
-use crate::front::ast::{FN_CLOSURE, NODES, NODE_CAPTURE, NodeKind};
+use crate::front::ast::{FN_CLOSURE, NODES, NODE_CAPTURE, NodeKind, child};
 use crate::front::check::LOCALS;
 use crate::front::closures::{CLOSURES, CLOSURE_COUNT};
 use crate::front::lexer::Tok;
@@ -36,7 +36,7 @@ use crate::front::own::state::{
     moved_bits, root_of, set_bit,
 };
 use crate::front::own::walk::{CUR_F, MO_DEREF, MO_INDEX, MO_STATIC, PO_DEREF, PO_INDEX, PO_RAW};
-use crate::front::types::{FNS, TYPES, TyKind};
+use crate::front::types::{FNS, STRUCTS, TLISTS, TYPES, TyKind};
 use crate::middle::lower::ssa::HMap;
 
 // The locals (+ 1) whose use after a move is reported already in this
@@ -334,6 +334,10 @@ fn move_out(p: i64, n: i64, how: i64) {
                 own_str(c" (");
                 line_col(NODES[at].start);
                 own_str(c") reads, which the collection keeps");
+            } else if at > 0 && NODES[at].kind == NodeKind::Closure {
+                own_str(c"out of ");
+                own_sym(LOCALS[PL_RID[root]].name);
+                own_str(c": the closure is given a borrowing iterator's item, a copy of an element the container keeps");
             } else if at > 0 && NODES[at].kind == NodeKind::Param {
                 own_str(c"out of ");
                 own_sym(LOCALS[PL_RID[root]].name);
@@ -489,6 +493,123 @@ pub fn bitwise_extend(n: i64) {
         own_str(c"): extend_from_slice copies them bit for bit, and the elements are owned");
         own_help(c"push clones: 'for x in s.iter() { v.push(x.clone()); }'");
         own_end();
+    }
+}
+
+// (0.24, a stopgap until a borrowing iterator's items are views) Call n of
+// std's f, in the program's code: when an argument (the receiver too) is
+// an iterator that yields, by a bitwise copy, the non-copyable elements of
+// a container it borrows (`w.iter()` of a Vec<Vec<i64>>, a HashMap's
+// iter, keys, values; or an adapter of one), and f may keep, return or
+// drop its items (collect, map, fold, for_each, next, find, extend...),
+// own.move_out: they would be owned twice. Building adapters that only
+// look at them (filter, take, zip...) and the counting and testing ones
+// (count, any, all, position) are allowed, and so is a `for` loop (its
+// items are borrowed).
+pub fn iter_item_copy(n: i64, f: i64) {
+    unsafe {
+        let name = fn_word(SYMS[FNS[f].display].text);
+        if name == "filter" || name == "skip" || name == "take" || name == "step_by"
+            || name == "rev" || name == "enumerate" || name == "zip" || name == "chain"
+            || name == "peekable" || name == "count" || name == "any" || name == "all"
+            || name == "position" || name == "len" || name == "exact_len" || name == "is_empty"
+            || name == "size_hint" || name == "as_slice" || name == "iter" || name == "iter_ref"
+            // (their closures borrow the items, check::calls::synth_method)
+            || (name == "map" || name == "for_each" || name == "filter_map")
+            && NODES[n].count == 2 && NODES[child(n, 1)].kind == NodeKind::Closure
+            || name == "fold" && NODES[n].count == 3
+            && NODES[child(n, 2)].kind == NodeKind::Closure {
+            return;
+        }
+        for i in 0..NODES[n].count {
+            let arg = child(n, i);
+            // (a `for` loop's own `next`: its items are borrowed)
+            var r = arg;
+            if NODES[r].kind == NodeKind::Unary && NODES[r].b > 0 {
+                r = NODES[r].b;
+            }
+            if NODES[r].kind == NodeKind::Ident && SYMS[NODES[r].a].text == "__for_seq" {
+                return;
+            }
+            var t = NODES[arg].ty;
+            if t > 0 && TYPES[t].kind == TyKind::Ptr {
+                t = TYPES[t].a;
+            }
+            if !copies_owned_items(t, 0) {
+                continue;
+            }
+            own_begin(arg, OWN_MOVE_OUT);
+            own_str(c"cannot take the items of ");
+            src_quoted(arg);
+            own_str(c": they are views of the elements of the container it iterates over, copied bit for bit, and '");
+            own_str(SYMS[FNS[f].display].text.ptr);
+            own_str(c"' may keep or drop them (each would be owned twice)");
+            own_help(c"take copies, `.iter_ref().map(|x| x.clone())` (a Vec or a slice), or push clones in a loop, `for x in v.iter() { out.push(x.clone()); }`");
+            own_end();
+            return;
+        }
+    }
+}
+
+// The name of function display name d without its type arguments:
+// `filter` of `SliceIter<Vec<i64>>::filter<closure(..) at f.tach:8:2>`.
+fn fn_word(d: [u8]) -> [u8] {
+    var depth = 0;
+    var from = 0;
+    var i = 0;
+    while i < d.len {
+        let c = d[i];
+        if c == '<' || c == '(' {
+            depth += 1;
+        } else if c == '>' && (i == 0 || d[i - 1] != '-') || c == ')' {
+            depth -= 1;
+        } else if depth == 0 && c == ':' && i + 1 < d.len && d[i + 1] == ':' {
+            from = i + 2;
+            i += 1;
+        }
+        i += 1;
+    }
+    var to = from;
+    while to < d.len && d[to] != '<' {
+        to += 1;
+    }
+    d[from..to]
+}
+
+// Whether a value of type t is an iterator (or an adapter of one, to depth
+// 4) that copies a borrowed container's non-copyable elements.
+pub fn copies_owned_items(t: i64, depth: i64) -> bool {
+    unsafe {
+        if t <= 0 || depth > 4 || TYPES[t].kind != TyKind::Struct {
+            return false;
+        }
+        let s = TYPES[t].a;
+        if !within_std(STRUCTS[s].module) || STRUCTS[s].targ_count == 0 {
+            return false;
+        }
+        let a0 = TLISTS.data[STRUCTS[s].targs];
+        let a1 = if STRUCTS[s].targ_count > 1 { TLISTS.data[STRUCTS[s].targs + 1] } else { 0 };
+        if crate::front::check::is_std_named(t, c"SliceIter")
+            || crate::front::check::is_std_named(t, c"Keys") {
+            return crate::front::own::glue::has_glue(a0);
+        }
+        if crate::front::check::is_std_named(t, c"Values") {
+            return crate::front::own::glue::has_glue(a1);
+        }
+        if crate::front::check::is_std_named(t, c"HashMapIter") {
+            return crate::front::own::glue::has_glue(a0) || crate::front::own::glue::has_glue(a1);
+        }
+        // (a map's items are its closure's results, made from borrowed ones)
+        if crate::front::check::is_std_named(t, c"Map")
+            || crate::front::check::is_std_named(t, c"FilterMap") {
+            return false;
+        }
+        for i in 0..STRUCTS[s].targ_count {
+            if copies_owned_items(TLISTS.data[STRUCTS[s].targs + i], depth + 1) {
+                return true;
+            }
+        }
+        false
     }
 }
 
