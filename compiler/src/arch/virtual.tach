@@ -28,6 +28,7 @@ use crate::base::{
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok, lex_range};
 use crate::front::modules::{STD_MODULE, add_module};
 use crate::middle::ir::{BITS_LEADING, BITS_ONES};
+use crate::middle::lower::ssa::HMap;
 
 // The sources' text range in SRC, for the parser's #[intrinsic] (accepted
 // only there): [ARCH_SRC_START, ARCH_SRC_END).
@@ -59,6 +60,7 @@ pub fn load_arch_modules() {
         let multiversion = intern_c(c"multiversion");
         var named = false;
         var versions = false;
+        var imported = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
         for i in 0..TOK_COUNT {
             if TOKS[i].kind == Tok::Ident && TOKS[i].value as i64 == multiversion && i >= 2
                 && TOKS[i - 1].kind == Tok::LBracket && TOKS[i - 2].kind == Tok::Hash {
@@ -66,10 +68,42 @@ pub fn load_arch_modules() {
                 named = true;
             }
             if TOKS[i].value as i64 == arch && TOKS[i].kind == Tok::Ident {
-                named = true;
+                if !in_use_line(i) {
+                    named = true;
+                } else {
+                    // (0.21) a `use std::arch::..` line of std's (std::str's,
+                    // std::collections::group's headers, always read): the
+                    // names it imports
+                    var j = i + 1;
+                    while j < TOK_COUNT && TOKS[j].kind != Tok::Semi {
+                        if TOKS[j].kind == Tok::Ident {
+                            imported.put(TOKS[j].value as i64 + 1, 1);
+                        }
+                        j += 1;
+                    }
+                }
+            }
+        }
+        // (0.21) std names the modules only when the sections read use what
+        // its `use` lines import: the tables cost more than a small
+        // program's compilation
+        if !named && imported.count > 0 {
+            for i in 0..TOK_COUNT {
+                if TOKS[i].kind == Tok::Ident && imported.get(TOKS[i].value as i64 + 1) != 0
+                    && !in_use_line(i) {
+                    named = true;
+                    break;
+                }
             }
         }
         if !named && QUERY_WANTED.count == 0 {
+            if imported.count > 0 {
+                // (0.21) the modules, empty, for std's `use` lines: an import of
+                // std's that finds nothing imports nothing (front/modules/lookup)
+                ARCH_MODULE = add_module(arch, STD_MODULE, true);
+                A64_MODULE = add_module(intern_c(c"aarch64"), ARCH_MODULE, true);
+                X86_MODULE = add_module(intern_c(c"x86_64"), ARCH_MODULE, true);
+            }
             return;
         }
         ARCH_USED = true;
