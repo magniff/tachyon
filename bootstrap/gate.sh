@@ -249,12 +249,16 @@ done
 TACHYON_JOBSERVER="$RUN/jobs"
 export TACHYON_JOBSERVER
 
+# (0.21, for 0.24's rename) The compiler's name and root at HEAD, from
+# bootstrap/releases.toml's [head].
+HEAD_BIN=$(sh "$ROOT/bootstrap/release-tags.sh" --head bin)
+HEAD_ROOT="$ROOT/$(sh "$ROOT/bootstrap/release-tags.sh" --head compiler)/$(sh "$ROOT/bootstrap/release-tags.sh" --head root)"
 if [ -n "$COMPILER" ]; then
     case "$COMPILER" in /*) ;; *) COMPILER="$(pwd)/$COMPILER" ;; esac
     [ -x "$COMPILER" ] || die "no compiler at $COMPILER"
-    cp "$COMPILER" "$RUN/tachyonc"
+    cp "$COMPILER" "$RUN/$HEAD_BIN"
 fi
-C="$RUN/tachyonc"
+C="$RUN/$HEAD_BIN"
 
 # The bootstrap caches: this checkout's, then the shared one (bootstrap.sh:
 # $TACHYON_BOOTSTRAP_CACHE, or the main checkout's in a linked worktree).
@@ -276,16 +280,17 @@ find_seed() {
 }
 
 # The newest release built here (for bench/run.sh -p), in the order of
-# releases.toml.
+# releases.toml; (0.21) each by its compiler's name.
 find_previous() {
     fp=""
-    for tag in $(sh "$ROOT/bootstrap/release-tags.sh"); do
+    sh "$ROOT/bootstrap/release-tags.sh" --bins >"$RUN/release-bins"
+    while read -r tag bin; do
         for b in $BOOT_CACHES; do
-            for p in "$b"/"$HOST"/"$tag"-*/tachyonc; do
+            for p in "$b"/"$HOST"/"$tag"-*/"$bin"; do
                 [ -x "$p" ] && { fp=$p; break 2; }
             done
         done
-    done
+    done <"$RUN/release-bins"
     echo "$fp"
 }
 
@@ -296,7 +301,7 @@ run_step() {
     case "$1" in
         chain)
             sh "$ROOT/bootstrap/bootstrap.sh" --dev --no-head-tests --history "$HISTORY" </dev/null \
-                && cp "$ROOT/target/tachyonc" "$C" ;;
+                && cp "$ROOT/target/$HEAD_BIN" "$C" ;;
         suite-O2)
             TACHYON_CODE_CACHE=on TACHYON_CACHE="$RUN/code-cache" sh "$ROOT/tests/run.sh" -c "$C" -O 2
             st=$?
@@ -343,8 +348,8 @@ run_step() {
             # passes at -O0 and -O2.
             o="$RUN/stress-grow"
             mkdir -p "$o"
-            "$C" "$ROOT/compiler/src/main.tach" -o "$o/plain.o" || return 1
-            TACHYON_STRESS_GROW=1 "$C" "$ROOT/compiler/src/main.tach" -o "$o/stress.o" || return 1
+            "$C" "$HEAD_ROOT" -o "$o/plain.o" || return 1
+            TACHYON_STRESS_GROW=1 "$C" "$HEAD_ROOT" -o "$o/stress.o" || return 1
             cmp -s "$o/plain.o" "$o/stress.o" \
                 || { echo "stress-grow: the self-compile differs: $o/plain.o $o/stress.o"; return 1; }
             for level in 0 2; do

@@ -215,17 +215,22 @@ trap 'exit 130' INT TERM
 
 # One line per entry, fields separated by '|' (hosts comma-separated):
 #   seed|<tag>|<dir>
-#   release|<version>|<tag>|<compiler>|<built_by>|<cli>|<tests>|<hosts>|<root>
-#   head|<compiler>|<cli>|<tests>|<hosts>|<root>
+#   release|<version>|<tag>|<compiler>|<built_by>|<cli>|<tests>|<hosts>|<root>|<bin>|<ext>
+#   head|<compiler>|<cli>|<tests>|<hosts>|<root>|<bin>|<ext>
+# (0.21, for 0.24's rename) <bin> is the compiler's name (`bin`), <ext>
+# its sources' extension (`ext`); without them an entry is a release
+# up to 0.23: tachyonc and .tach.
 [ -f "$MANIFEST" ] || die "missing $MANIFEST"
 awk '
     function flush() {
+        if (v["bin"] == "") v["bin"] = "tachyonc"   # (releases up to 0.23)
+        if (v["ext"] == "") v["ext"] = ".tach"      # (releases up to 0.23)
         if (section == "seed")
             print "seed|" v["tag"] "|" v["dir"]
         if (section == "release")
-            print "release|" v["version"] "|" v["tag"] "|" v["compiler"] "|" v["built_by"] "|" v["cli"] "|" v["tests"] "|" v["hosts"] "|" v["root"]
+            print "release|" v["version"] "|" v["tag"] "|" v["compiler"] "|" v["built_by"] "|" v["cli"] "|" v["tests"] "|" v["hosts"] "|" v["root"] "|" v["bin"] "|" v["ext"]
         if (section == "head")
-            print "head|" v["compiler"] "|" v["cli"] "|" v["tests"] "|" v["hosts"] "|" v["root"]
+            print "head|" v["compiler"] "|" v["cli"] "|" v["tests"] "|" v["hosts"] "|" v["root"] "|" v["bin"] "|" v["ext"]
         split("", v)
     }
     /^[ \t]*#/ || /^[ \t]*$/ { next }
@@ -251,7 +256,7 @@ grep -q '^head|' "$WORK/manifest" || die "$MANIFEST has no [head] section"
 IFS='|' read -r _ SEED_TAG SEED_DIR <<EOF
 $(grep '^seed|' "$WORK/manifest")
 EOF
-IFS='|' read -r _ HEAD_COMPILER HEAD_CLI HEAD_TESTS HEAD_HOSTS HEAD_ROOT <<EOF
+IFS='|' read -r _ HEAD_COMPILER HEAD_CLI HEAD_TESTS HEAD_HOSTS HEAD_ROOT HEAD_BIN HEAD_EXT <<EOF
 $(grep '^head|' "$WORK/manifest")
 EOF
 if [ -n "$UNTIL" ] && ! grep -q "^release|$UNTIL|" "$WORK/releases"; then
@@ -266,7 +271,7 @@ check_host() { # <what> <comma-separated hosts>
 }
 
 prev_version=""
-while IFS='|' read -r _ version _ _ _ _ _ hosts _; do
+while IFS='|' read -r _ version _ _ _ _ _ hosts _ _ _; do
     [ -z "$prev_version" ] || version_lt "$prev_version" "$version" \
         || die "$MANIFEST: release $version comes after $prev_version but is not newer (versions compare by number: 0.9.0 < 0.10.0)"
     prev_version=$version
@@ -357,18 +362,18 @@ extract() { # <commit> <dir>
 
 # Compiles the compiler in <src> into the executable <out> with the
 # compiler <bin>, invoked through interface <cli>, for the host: its root
-# file <root> (a module tree, from 0.6), or else all the .tach files of
-# <src> (one module).
+# file <root> (a module tree, from 0.6), or else all the files of <src>
+# with extension <ext> (one module; .tach then).
 # (POSIX sh has no local variables: each function uses its own prefix.)
-compile_with() { # <cli> <bin> <src> <root> <out>
-    cw_cli=$1 cw_bin=$2 cw_src=$3 cw_root=$4 cw_out=$5
+compile_with() { # <cli> <bin> <src> <root> <out> <ext>
+    cw_cli=$1 cw_bin=$2 cw_src=$3 cw_root=$4 cw_out=$5 cw_ext=${6:-.tach}
     if [ -n "$cw_root" ]; then
         set -- "$cw_src/$cw_root"
         [ -f "$1" ] || die "no root file $cw_root in $cw_src"
         [ "$cw_cli" != seed ] || die "the seed compiles one file: $cw_src is a module tree"
     else
-        set -- "$cw_src"/*.tach
-        [ -e "$1" ] || die "no .tach files in $cw_src"
+        set -- "$cw_src"/*"$cw_ext"
+        [ -e "$1" ] || die "no $cw_ext files in $cw_src"
     fi
     case "$cw_cli" in
         seed)
@@ -399,10 +404,10 @@ compile_with() { # <cli> <bin> <src> <root> <out>
             "$CC" $LINK_FLAGS -o "$cw_out" "$cw_out.o" -lm || die "$CC failed to link $cw_out.o"
             CW_EMITTED=o
             ;;
-        tachyonc-0.10)
+        tachyonc-0.10|volec-0.24)
             # As 0.7: the compiler's own source is in unsafe code (0.10
             # has no --allow-unsafe; unsafe operations outside unsafe code
-            # are errors).
+            # are errors). (0.24: the same interface, named volec.)
             "$cw_bin" --target "$HOST" "$@" -o "$cw_out.o" || die "$cw_bin failed to compile $cw_src"
             # shellcheck disable=SC2086
             "$CC" $LINK_FLAGS -o "$cw_out" "$cw_out.o" -lm || die "$CC failed to link $cw_out.o"
@@ -416,29 +421,31 @@ compile_with() { # <cli> <bin> <src> <root> <out>
 
 # Builds the compiler in <tree>/<compiler> with <builder>, checks the
 # fixpoint and, if <run_tests> is 1, runs the tree's test suite; leaves
-# <dir>/tachyonc and sets TEST_TOTAL.
-build_and_check() { # <name> <tree> <compiler> <root> <cli> <tests> <builder_cli> <builder_bin> <builder_name> <dir> <run_tests>
+# <dir>/<bin> (the compiler's name, from releases.toml) and sets
+# TEST_TOTAL.
+build_and_check() { # <name> <tree> <compiler> <root> <cli> <tests> <builder_cli> <builder_bin> <builder_name> <dir> <run_tests> <bin> <ext>
     bc_name=$1 bc_tree=$2 bc_src="$2/$3" bc_root=$4 bc_cli=$5 bc_tests=$6
     bc_builder_cli=$7 bc_builder_bin=$8 bc_builder_name=$9 bc_dir=${10} bc_run_tests=${11}
+    bc_bin=${12} bc_ext=${13}
     mkdir -p "$bc_dir"
     step "$bc_name: building with $bc_builder_name"
-    compile_with "$bc_builder_cli" "$bc_builder_bin" "$bc_src" "$bc_root" "$bc_dir/build1"
+    compile_with "$bc_builder_cli" "$bc_builder_bin" "$bc_src" "$bc_root" "$bc_dir/build1" "$bc_ext"
     step "$bc_name: building with itself, twice"
-    compile_with "$bc_cli" "$bc_dir/build1" "$bc_src" "$bc_root" "$bc_dir/build2"
-    compile_with "$bc_cli" "$bc_dir/build2" "$bc_src" "$bc_root" "$bc_dir/build3"
+    compile_with "$bc_cli" "$bc_dir/build1" "$bc_src" "$bc_root" "$bc_dir/build2" "$bc_ext"
+    compile_with "$bc_cli" "$bc_dir/build2" "$bc_src" "$bc_root" "$bc_dir/build3" "$bc_ext"
     cmp -s "$bc_dir/build2.$CW_EMITTED" "$bc_dir/build3.$CW_EMITTED" \
         || die "$bc_name: no fixpoint: $bc_dir/build2.$CW_EMITTED and build3.$CW_EMITTED differ (its output depends on how it was built)"
-    cp "$bc_dir/build2" "$bc_dir/tachyonc"
+    cp "$bc_dir/build2" "$bc_dir/$bc_bin"
     TEST_TOTAL="not run"
     [ "$bc_run_tests" = 1 ] || return 0
-    run_suite "$bc_name" "$bc_tree" "$bc_tests" "$bc_dir"
+    run_suite "$bc_name" "$bc_tree" "$bc_tests" "$bc_dir" "$bc_bin"
 }
 
-# Runs the test suite of the tree <tree> with <dir>/tachyonc; sets
+# Runs the test suite of the tree <tree> with <dir>/<bin>; sets
 # TEST_TOTAL.
-run_suite() { # <name> <tree> <tests> <dir>
+run_suite() { # <name> <tree> <tests> <dir> <bin>
     step "$1: running its test suite ($3)"
-    if ! (cd "$2" && "./$3" -c "$4/tachyonc" -t "$HOST") >"$4/tests.log" 2>&1; then
+    if ! (cd "$2" && "./$3" -c "$4/$5" -t "$HOST") >"$4/tests.log" 2>&1; then
         tail -40 "$4/tests.log" >&2
         die "$1: test suite failed (log: $4/tests.log)"
     fi
@@ -508,7 +515,7 @@ PREV_CLI=seed
 PREV_NAME=seed
 STOPPED=0
 
-while IFS='|' read -r _ version tag compiler built_by cli tests _ root; do
+while IFS='|' read -r _ version tag compiler built_by cli tests _ root bin ext; do
     [ "$built_by" = "$PREV_NAME" ] \
         || die "release $version is built by '$built_by', but the previous step is '$PREV_NAME'"
     commit=$(tag_commit "$tag")
@@ -543,8 +550,8 @@ while IFS='|' read -r _ version tag compiler built_by cli tests _ root; do
         elif [ -f "$dir/fixpoint" ] && [ $run_tests -eq 0 ]; then
             step "$version: $tag ($short), built by another run (cached)"
             TEST_TOTAL="not run (--history fast)"
-        elif [ -f "$dir/fixpoint" ] && [ -x "$dir/tachyonc" ] && [ -d "$dir/tree" ]; then
-            run_suite "$version" "$dir/tree" "$tests" "$dir" </dev/null
+        elif [ -f "$dir/fixpoint" ] && [ -x "$dir/$bin" ] && [ -d "$dir/tree" ]; then
+            run_suite "$version" "$dir/tree" "$tests" "$dir" "$bin" </dev/null
             echo "$TEST_TOTAL" >"$dir/ok.new"
             mv "$dir/ok.new" "$dir/ok"
         else
@@ -552,7 +559,7 @@ while IFS='|' read -r _ version tag compiler built_by cli tests _ root; do
             rm -rf "$dir.building"
             extract "$commit" "$dir.building/tree"
             build_and_check "$version" "$dir.building/tree" "$compiler" "$root" "$cli" "$tests" \
-                "$PREV_CLI" "$PREV_BIN" "$PREV_NAME" "$dir.building" "$run_tests" </dev/null
+                "$PREV_CLI" "$PREV_BIN" "$PREV_NAME" "$dir.building" "$run_tests" "$bin" "$ext" </dev/null
             : >"$dir.building/fixpoint"
             if [ $run_tests -eq 1 ]; then
                 echo "$TEST_TOTAL" >"$dir.building/ok"
@@ -564,7 +571,7 @@ while IFS='|' read -r _ version tag compiler built_by cli tests _ root; do
         unlock "$dir"
     fi
     note "$version    $tag $short, built by $PREV_NAME, fixpoint ok, tests: $TEST_TOTAL"
-    PREV_BIN="$dir/tachyonc"
+    PREV_BIN="$dir/$bin"
     PREV_CLI=$cli
     PREV_NAME=$version
     if [ "$version" = "$UNTIL" ]; then
@@ -591,20 +598,20 @@ if [ $STOPPED -eq 0 ]; then
         extract "$head_commit" "$head_tree"
     fi
     build_and_check head "$head_tree" "$HEAD_COMPILER" "$HEAD_ROOT" "$HEAD_CLI" "$HEAD_TESTS" \
-        "$PREV_CLI" "$PREV_BIN" "$PREV_NAME" "$head_dir" "$RUN_HEAD_TESTS"
+        "$PREV_CLI" "$PREV_BIN" "$PREV_NAME" "$head_dir" "$RUN_HEAD_TESTS" "$HEAD_BIN" "$HEAD_EXT"
     [ "$RUN_HEAD_TESTS" = 1 ] || TEST_TOTAL="left to the caller (--no-head-tests)"
     note "head     $head_desc, built by $PREV_NAME, fixpoint ok, tests: $TEST_TOTAL"
-    FINAL="$head_dir/tachyonc"
+    FINAL="$head_dir/$HEAD_BIN"
     mkdir -p "$ROOT/target"
-    cp "$FINAL" "$ROOT/target/tachyonc"
+    cp "$FINAL" "$ROOT/target/$HEAD_BIN"
     # (0.15) The tools binary: a compiler that passed its fixpoint and its
     # test suite, for querying and editing while target/tachyonc is under
     # test (an agent's own builds replace that one); replaced by rename, so
     # a query running at that moment keeps its file.
     if [ "$RUN_HEAD_TESTS" = 1 ]; then
         mkdir -p "$ROOT/target/tools"
-        cp "$FINAL" "$ROOT/target/tools/tachyonc.new"
-        mv -f "$ROOT/target/tools/tachyonc.new" "$ROOT/target/tools/tachyonc"
+        cp "$FINAL" "$ROOT/target/tools/$HEAD_BIN.new"
+        mv -f "$ROOT/target/tools/$HEAD_BIN.new" "$ROOT/target/tools/$HEAD_BIN"
     fi
 fi
 
@@ -616,11 +623,11 @@ if [ -n "$CROSS" ]; then
     step "head: cross-compiling itself for $CROSS"
     cross_dir="$LOCAL_CACHE/head/$CROSS"
     mkdir -p "$cross_dir" "$ROOT/target/$CROSS"
-    "$FINAL" --target "$CROSS" "$head_tree/$HEAD_COMPILER/$HEAD_ROOT" -o "$cross_dir/tachyonc.o" \
+    "$FINAL" --target "$CROSS" "$head_tree/$HEAD_COMPILER/$HEAD_ROOT" -o "$cross_dir/$HEAD_BIN.o" \
         || die "the cross-compilation for $CROSS failed"
-    cp "$cross_dir/tachyonc.o" "$ROOT/target/$CROSS/tachyonc.o"
-    note "$CROSS    cross-compiled by head: $ROOT/target/$CROSS/tachyonc.o (link it there: cc -o tachyonc tachyonc.o -lm)"
-    FINAL="$cross_dir/tachyonc.o"
+    cp "$cross_dir/$HEAD_BIN.o" "$ROOT/target/$CROSS/$HEAD_BIN.o"
+    note "$CROSS    cross-compiled by head: $ROOT/target/$CROSS/$HEAD_BIN.o (link it there: cc -o $HEAD_BIN $HEAD_BIN.o -lm)"
+    FINAL="$cross_dir/$HEAD_BIN.o"
 fi
 
 [ -z "$OUT" ] || cp "$FINAL" "$OUT"
@@ -629,9 +636,9 @@ echo
 echo "tachyon bootstrap on $HOST${CROSS:+, for $CROSS}:"
 cat "$SUMMARY"
 if [ -n "$CROSS" ]; then
-    echo "compiler for $CROSS: $ROOT/target/$CROSS/tachyonc.o${OUT:+, also $OUT}; for $HOST: $ROOT/target/tachyonc"
+    echo "compiler for $CROSS: $ROOT/target/$CROSS/$HEAD_BIN.o${OUT:+, also $OUT}; for $HOST: $ROOT/target/$HEAD_BIN"
 elif [ $STOPPED -eq 0 ]; then
-    echo "compiler: $ROOT/target/tachyonc ($("$FINAL" --version))${OUT:+, also $OUT}"
+    echo "compiler: $ROOT/target/$HEAD_BIN ($("$FINAL" --version))${OUT:+, also $OUT}"
 else
     echo "compiler: $FINAL ($("$FINAL" --version))${OUT:+, also $OUT}"
 fi

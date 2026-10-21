@@ -64,7 +64,7 @@ $ tachyonc query def find_byte_neon find_byte_sse2 find_byte
 crate::find_byte_neon	main.tach:33:4	fn	fn find_byte_neon(s: [u8], b: u8, from: i64) -> i64	effects: panic diverge
 crate::find_byte_sse2	main.tach:59:4	fn	fn find_byte_sse2(s: [u8], b: u8, from: i64) -> i64	effects: panic diverge	features: sse2 (inferred)
 crate::find_byte	main.tach:75:4	fn	fn find_byte(s: [u8], b: u8) -> i64	effects: panic diverge
-std::string::find_byte	<std>:40877:4	fn	fn find_byte(b: u8, s: [u8], from: i64) -> i64	effects: panic diverge
+std::string::find_byte	<std>:19427:4	fn	fn find_byte(b: u8, s: [u8], from: i64) -> i64	effects: panic diverge
 ```
 
 ## Timings

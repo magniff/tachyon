@@ -91,9 +91,9 @@ fn main() -> Option<i64> {
     println(f"p = {p:?}, x = {x:>4}, {{y}} = {y:08x}");
     Some(p.x)
 }
-$ grep 'f"' --code
+$ grep 'f"' --strings
 # syntax015/main.tach
-29:13	code	main	println(f"p = {p:?}, x = {x:>4}, {{y}} = {y:08x}");
+29:13	string	main	println(f"p = {p:?}, x = {x:>4}, {{y}} = {y:08x}");
 $ refs area
 # syntax015/main.tach
 13:4	def	fn area(w: i64, h: i64 = 1) -> i64 {
