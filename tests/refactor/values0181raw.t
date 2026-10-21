@@ -9,8 +9,13 @@
 ## longer builds; the output after it is the one 0.16's semantics gave,
 ## recorded here before 0.18.1: `true true 122 true true 5 1 <bc>`. What the fix keeps raw is wrapped in
 ## `unsafe` by `fix --only unsafe`, the second try: of the error.)
-$ fix --values --syntax=mixed
+$ fix --values
 fixed 1 parameter to &mut T, 1 parameter to &T, 2 arguments	main.tach	+4 -4 lines
+## (0.20) Then 0.20's spelling, `fix --only conventions` (the migration reads
+## 0.19's spelling itself), before the fixes that read 0.20's.
+$ fix --only conventions
+fixed 1 parameter to let, 1 parameter to inout, 2 '&mut e's to '&e', 1 '&e' to a let, 3 'let mut's / 'mut x's to var	main.tach	+8 -8 lines
+note fix.conv_left: 1 left to hand: '&e' with no let parameter or field to take it: drop it to read, or write 'inout r = &e;'
 % grep -n 'fn \|add(' main.tach
 2:    fn strlen(s: *u8) -> u64;
 3:    fn memcmp(a: *u8, b: *u8, n: u64) -> i32;
@@ -20,20 +25,15 @@ fixed 1 parameter to &mut T, 1 parameter to &T, 2 arguments	main.tach	+4 -4 line
 25:fn byte_at(s: *u8, i: i64) -> u8 {
 29:fn second(s: *u8) -> *u8 {
 33:fn pair(a: *u8, b: *u8) -> [*u8; 2] { [a, b] }
-37:fn add(s: &mut Stats, x: i64) { s.count += 1; s.sum += x; }
-38:fn mean(s: &Stats) -> i64 { if s.count == 0 { 0 } else { s.sum / s.count } }
+37:fn add(s: inout Stats, x: i64) { s.count += 1; s.sum += x; }
+38:fn mean(s: Stats) -> i64 { if s.count == 0 { 0 } else { s.sum / s.count } }
 39:fn npreds(v: *Vec<i64>) -> i64 { v.len() }
 40:fn show(t: [u8], gpa: Gpa) -> Buf {
 46:fn main(gpa: Gpa) {
-48:    add(&mut st, 4);
-49:    add(&mut st, 6);
-$ fix --only unsafe --syntax=mixed
+48:    add(&st, 4);
+49:    add(&st, 6);
+$ fix --only unsafe
 fixed 1 unsafe block	main.tach	+1 -1 lines
-## (0.20) Then 0.20's spelling, `fix --only conventions` (its 0.19 input
-## read --syntax=mixed): the chain 0.16 -> 0.19 -> 0.20 prints what 0.16 did.
-$ fix --only conventions --syntax=mixed
-fixed 1 parameter to let, 1 parameter to inout, 2 '&mut e's to '&e', 1 '&e' to a let, 3 'let mut's / 'mut x's to var	main.tach	+8 -8 lines
-note fix.conv_left: 1 left to hand: '&e' with no let parameter or field to take it: drop it to read, or write 'inout r = &e;'
 $ main.tach -o prog
 ok: built prog
 % ./prog
