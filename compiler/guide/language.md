@@ -39,7 +39,7 @@ on the command line make one program; `mod name;` loads `name.tach`.
 
 | Rust | tachyon |
 |---|---|
-| `String`, `&str` | `[u8]`, a byte slice: `"text"` is a `[u8]`; build text with `std::Buf`; `c"text"` is a NUL-terminated `*u8` for C |
+| `String`, `&str` | the same (0.20): `str` (UTF-8 text, a view; `&str` is `str`) and `String` (owned, `String::new_in(gpa)`); bytes are `[u8]`; `c"text"` is a NUL-terminated `*u8` for C |
 | `&T`, `&mut T`, `Box<T>` | `&T`, `&mut T` (0.17): `&x`, `&mut x`, checked and safe; no lifetimes; `*T` is the raw pointer: dereferencing it needs `unsafe`, parameter or not (0.18.1); no `Box` |
 | `fn f(&self)`, `fn f(&mut self)` | `fn f(self: &T)`, `fn f(self: &mut T)` (0.17); `fn f(self: T)` takes the value (an owned one moves) |
 | `use m::*;` | not allowed: `use m::{a, b};`, or the path `m::a` |
@@ -443,8 +443,8 @@ and linking: `guide c-interop`.
 
 | error (short form) | fix |
 |---|---|
-| `unknown type 'String'` (or `char`, `Box`) | `[u8]`, `u8`, `*T` or `Vec<T>` |
-| `expected type, got '&'`; `expected identifier, got '&'` | `[u8]` for `&str`; `self: &T`, `self: &mut T` or `self: *T` |
+| `unknown type 'char'` (or `Box`) | `u8` (or a `u32` code point), `*T` or `Vec<T>` |
+| `expected identifier, got '&'` | `self: &T`, `self: &mut T` or `self: *T` |
 | `cannot infer the type of closure parameter 'x'` | `\|x: i64\| ...`, or pass it where an `Fn` bound or `fn` type gives it |
 | `'?' needs 'f' to return Option or Result` | `fn f(..) -> Option<T>` or `-> Result<T, E>` |
 | `'println!' is a macro call` | no macros: `println(f"{x}")` |

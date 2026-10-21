@@ -1,0 +1,399 @@
+// std::io::buffered (0.20, docs/design/collections-text-io.md §2.6.3,
+// task B6): the Read and Write traits, BufReader and BufWriter with their
+// 8 KB buffers inline (`BufReader::new(f)` allocates nothing), the
+// standard streams, and writeln. What grows a Vec or a String (read_to_end,
+// read_line, lines_in) grows it on its own allocator.
+
+use std::{Allocator, Display, Drop, Iterator, Option, Vec};
+use std::io::error::{Error, ErrorKind, Result, __io_error, __os_error};
+use std::str::{memchr, validate_utf8};
+use std::string::String;
+use std::sys::{sys_read, sys_write};
+
+// ---- Reading and writing (0.20) ----
+
+// A source of bytes: a File, a BufReader, stdin(), a ChildStdout.
+pub trait Read {
+    // Reads up to buf.len bytes into buf: how many (0 at the end).
+    fn read(self: &mut Self, buf: &mut [u8]) -> Result<i64>;
+
+    // Fills buf, or UnexpectedEof.
+    fn read_exact(self: &mut Self, buf: &mut [u8]) -> Result<()> {
+        let mut at = 0;
+        while at < buf.len {
+            let n = self.read(&mut buf[at..])?;
+            if n == 0 {
+                return Err(__io_error(ErrorKind::UnexpectedEof, c"failed to fill whole buffer"));
+            }
+            at += n;
+        }
+        Ok(())
+    }
+
+    // Appends all that is left to v: how many bytes.
+    fn read_to_end<A: Allocator>(self: &mut Self, v: &mut Vec<u8, A>) -> Result<i64> {
+        let start = v.len;
+        loop {
+            if v.cap - v.len < 4096 {
+                v.reserve(if v.cap < 8192 { 8192 } else { v.cap });
+            }
+            // (v's room: its capacity past its length, written before it
+            // counts)
+            let room = unsafe { v.ptr[v.len..v.cap] };
+            let n = self.read(&mut room)?;
+            if n == 0 {
+                return Ok(v.len - start);
+            }
+            v.len += n;
+        }
+    }
+
+    // Appends all that is left to s, which must be UTF-8 (InvalidData, s
+    // as it was, when not): how many bytes.
+    fn read_to_string<A: Allocator>(self: &mut Self, s: &mut String<A>) -> Result<i64> {
+        let start = s.bytes.len;
+        let n = self.read_to_end(&mut s.bytes)?;
+        match validate_utf8(s.bytes.as_slice()[start..]) {
+            Ok(_) => Ok(n),
+            Err(_) => {
+                s.bytes.truncate(start);
+                Err(__io_error(ErrorKind::InvalidData, c"stream did not contain valid UTF-8"))
+            }
+        }
+    }
+}
+
+// A sink of bytes: a File, a BufWriter, stdout(), stderr().
+pub trait Write {
+    // Writes some of buf: how many bytes.
+    fn write(self: &mut Self, buf: [u8]) -> Result<i64>;
+
+    // Writes out what is buffered.
+    fn flush(self: &mut Self) -> Result<()>;
+
+    // Writes all of buf (WriteZero when the sink takes none).
+    fn write_all(self: &mut Self, buf: [u8]) -> Result<()> {
+        let mut at = 0;
+        while at < buf.len {
+            let n = self.write(buf[at..])?;
+            if n == 0 {
+                return Err(__io_error(ErrorKind::WriteZero, c"failed to write whole buffer"));
+            }
+            at += n;
+        }
+        Ok(())
+    }
+
+    // Writes x's Display: `w.write_fmt(f"{a} {b}\n")?` (writeln). Text of
+    // up to 4 KB per call (InvalidInput above: a BufWriter takes 8 KB).
+    fn write_fmt<T: Display>(self: &mut Self, x: T) -> Result<()> {
+        let mut tmp: [u8; 4096] = [0; 4096];
+        let n = std::fmt::__fmt_into_len(&mut tmp[..], x);
+        if n < 0 {
+            return Err(__io_error(ErrorKind::InvalidInput, c"formatted text over 4096 bytes"));
+        }
+        self.write_all(tmp[..n])
+    }
+}
+
+// Writes x's Display and a '\n' to w (Rust's `writeln!(w, ..)`):
+// `writeln(&mut out, f"{k} {v}")?`.
+pub fn writeln<W: Write, T: Display>(w: &mut W, x: T) -> Result<()> {
+    w.write_fmt(x)?;
+    w.write_all("\n")
+}
+
+// ---- Buffered reading and writing (0.20) ----
+
+const BUF_SIZE: i64 = 8192;
+
+// Reads its inner reader 8 KB at a time (the buffer is inline: `new`
+// allocates nothing); lines and read_line split what it holds.
+pub struct BufReader<R> { inner: R, buf: [u8; 8192], pos: i64, len: i64 }
+
+impl<R: Read> BufReader<R> {
+    pub fn new(inner: R) -> BufReader<R> {
+        BufReader { inner: inner, buf: [0; 8192], pos: 0, len: 0 }
+    }
+
+    // Appends the bytes up to and including the next `byte` (or the end)
+    // to v: how many (0 at the end).
+    pub fn read_until<A: Allocator>(self: &mut BufReader<R>, byte: u8, v: &mut Vec<u8, A>)
+        -> Result<i64> {
+        let mut total = 0;
+        loop {
+            if self.pos >= self.len {
+                self.pos = 0;
+                self.len = 0;
+                let n = self.inner.read(&mut self.buf[..])?;
+                if n == 0 {
+                    return Ok(total);
+                }
+                self.len = n;
+            }
+            let avail = self.buf[self.pos..self.len];
+            match memchr(byte, avail) {
+                Option::Some(k) => {
+                    push_bytes(v, avail[..k + 1]);
+                    self.pos += k + 1;
+                    return Ok(total + k + 1);
+                }
+                Option::None => {
+                    push_bytes(v, avail);
+                    total += avail.len;
+                    self.pos = self.len;
+                }
+            }
+        }
+    }
+
+    // Appends the next line to s, its '\n' included (Rust's read_line):
+    // how many bytes, 0 at the end. InvalidData when it is not UTF-8.
+    pub fn read_line<A: Allocator>(self: &mut BufReader<R>, s: &mut String<A>) -> Result<i64> {
+        let start = s.bytes.len;
+        let n = self.read_until('\n', &mut s.bytes)?;
+        match validate_utf8(s.bytes.as_slice()[start..]) {
+            Ok(_) => Ok(n),
+            Err(_) => {
+                s.bytes.truncate(start);
+                Err(__io_error(ErrorKind::InvalidData, c"stream did not contain valid UTF-8"))
+            }
+        }
+    }
+
+    // The lines, each a new String on allocator a without its '\n' (or
+    // "\r\n"): Rust's `lines()`, which allocates each one too.
+    pub fn lines_in<A: Allocator>(self: BufReader<R>, a: A) -> Lines<R, A> {
+        Lines { r: self, a: a }
+    }
+
+    // The reader inside (what is buffered is lost).
+    pub fn into_inner(self: BufReader<R>) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read> Read for BufReader<R> {
+    fn read(self: &mut BufReader<R>, buf: &mut [u8]) -> Result<i64> {
+        if self.pos >= self.len && buf.len >= BUF_SIZE {
+            return self.inner.read(buf);
+        }
+        let avail = self.fill_buf()?;
+        let n = if avail.len < buf.len { avail.len } else { buf.len };
+        for i in 0..n {
+            buf[i] = avail[i];
+        }
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+// A reader with a buffer (Rust's BufRead): BufReader. Its read_line,
+// read_until and lines_in are BufReader's own (no `use` needed).
+pub trait BufRead {
+    // The bytes buffered, read if there are none (empty at the end).
+    fn fill_buf(self: &mut Self) -> Result<[u8]>;
+    // Marks n of the buffered bytes read.
+    fn consume(self: &mut Self, n: i64);
+}
+
+impl<R: Read> BufRead for BufReader<R> {
+    fn fill_buf(self: &mut BufReader<R>) -> Result<[u8]> {
+        if self.pos >= self.len {
+            self.pos = 0;
+            self.len = 0;
+            let n = self.inner.read(&mut self.buf[..])?;
+            self.len = n;
+        }
+        Ok(self.buf[self.pos..self.len])
+    }
+
+    fn consume(self: &mut BufReader<R>, n: i64) {
+        self.pos = if self.pos + n < self.len { self.pos + n } else { self.len };
+    }
+}
+
+// Appends s to v with one memcpy; s is not a view of v (the reader's
+// buffer, or the room it reads into).
+#[inline]
+fn push_bytes<A: Allocator>(v: &mut Vec<u8, A>, s: [u8]) {
+    v.reserve(s.len);
+    // (after reserve, v.ptr[v.len..v.len + s.len] is v's room: memory v
+    // owns, apart from s's)
+    unsafe {
+        std::memcpy(&v.ptr[v.len], s.ptr, s.len as u64);
+    }
+    v.len += s.len;
+}
+
+// `r.lines_in(gpa)`: each line, a String.
+pub struct Lines<R, A> { r: BufReader<R>, a: A }
+
+impl<R: Read, A: Allocator> Iterator for Lines<R, A> {
+    type Item = Result<String<A>>;
+
+    fn next(self: &mut Lines<R, A>) -> Option<Result<String<A>>> {
+        let mut s: String<A> = String::new_in(self.a);
+        match self.r.read_line(&mut s) {
+            Ok(n) => {
+                if n == 0 {
+                    return Option::None;
+                }
+                let len = s.bytes.len;
+                if len > 0 && s.bytes.as_slice()[len - 1] == '\n' {
+                    s.bytes.truncate(len - 1);
+                    let len2 = s.bytes.len;
+                    if len2 > 0 && s.bytes.as_slice()[len2 - 1] == '\r' {
+                        s.bytes.truncate(len2 - 1);
+                    }
+                }
+                Option::Some(Ok(s))
+            }
+            Err(e) => Option::Some(Err(e)),
+        }
+    }
+}
+
+// Writes to its inner writer 8 KB at a time (inline; `new` allocates
+// nothing). Dropping it flushes it (errors lost there: flush first to see
+// them).
+pub struct BufWriter<W: Write> { inner: W, buf: [u8; 8192], len: i64 }
+
+impl<W: Write> BufWriter<W> {
+    pub fn new(inner: W) -> BufWriter<W> {
+        BufWriter { inner: inner, buf: [0; 8192], len: 0 }
+    }
+
+    fn flush_buf(self: &mut BufWriter<W>) -> Result<()> {
+        let n = self.len;
+        self.len = 0;
+        if n > 0 {
+            self.inner.write_all(self.buf[..n])?;
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for BufWriter<W> {
+    fn write(self: &mut BufWriter<W>, buf: [u8]) -> Result<i64> {
+        if self.len + buf.len > BUF_SIZE {
+            self.flush_buf()?;
+        }
+        if buf.len >= BUF_SIZE {
+            return self.inner.write(buf);
+        }
+        let at = self.len;
+        for i in 0..buf.len {
+            self.buf[at + i] = buf[i];
+        }
+        self.len = at + buf.len;
+        Ok(buf.len)
+    }
+
+    fn write_all(self: &mut BufWriter<W>, buf: [u8]) -> Result<()> {
+        if self.len + buf.len > BUF_SIZE {
+            self.flush_buf()?;
+        }
+        if buf.len >= BUF_SIZE {
+            return self.inner.write_all(buf);
+        }
+        let at = self.len;
+        for i in 0..buf.len {
+            self.buf[at + i] = buf[i];
+        }
+        self.len = at + buf.len;
+        Ok(())
+    }
+
+    fn flush(self: &mut BufWriter<W>) -> Result<()> {
+        self.flush_buf()?;
+        self.inner.flush()
+    }
+
+    // x's Display written into the buffer's room (up to 8 KB of text).
+    fn write_fmt<T: Display>(self: &mut BufWriter<W>, x: T) -> Result<()> {
+        let at = self.len;
+        let n = std::fmt::__fmt_into_len(&mut self.buf[at..], x);
+        if n >= 0 {
+            self.len = at + n;
+            return Ok(());
+        }
+        self.flush_buf()?;
+        let m = std::fmt::__fmt_into_len(&mut self.buf[..], x);
+        if m < 0 {
+            return Err(__io_error(ErrorKind::InvalidInput, c"formatted text over 8192 bytes"));
+        }
+        self.len = m;
+        Ok(())
+    }
+}
+
+impl<W: Write> Drop for BufWriter<W> {
+    fn drop(self: &mut BufWriter<W>) {
+        let _ = self.flush_buf();
+    }
+}
+
+// ---- The standard streams (0.20) ----
+
+// Standard output: print's buffer is written out before what is written
+// here, so the two keep their order.
+pub struct Stdout { fd: i32 }
+
+// Standard error.
+pub struct Stderr { fd: i32 }
+
+// Standard input: what read_line has buffered is read first.
+pub struct Stdin { fd: i32 }
+
+pub fn stdout() -> Stdout {
+    Stdout { fd: 1 }
+}
+
+pub fn stderr() -> Stderr {
+    Stderr { fd: 2 }
+}
+
+pub fn stdin() -> Stdin {
+    Stdin { fd: 0 }
+}
+
+// Writes some of buf to fd.
+fn fd_write(fd: i32, buf: [u8]) -> Result<i64> {
+    match sys_write(fd, buf) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(__os_error(e)),
+    }
+}
+
+impl Write for Stdout {
+    fn write(self: &mut Stdout, buf: [u8]) -> Result<i64> {
+        std::fmt::__flush_print();
+        fd_write(self.fd, buf)
+    }
+
+    fn flush(self: &mut Stdout) -> Result<()> {
+        std::fmt::__flush_print();
+        Ok(())
+    }
+}
+
+impl Write for Stderr {
+    fn write(self: &mut Stderr, buf: [u8]) -> Result<i64> {
+        fd_write(self.fd, buf)
+    }
+
+    fn flush(self: &mut Stderr) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl Read for Stdin {
+    fn read(self: &mut Stdin, buf: &mut [u8]) -> Result<i64> {
+        let n = std::io::__stdin_read(buf);
+        if n < 0 {
+            return Err(Error::last_os_error());
+        }
+        Ok(n)
+    }
+}
