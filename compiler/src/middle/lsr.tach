@@ -40,7 +40,7 @@ const UNSWITCH_MAX_SIZE: i64 = 48;
 // (v invariant: a stride known at run time only).
 const AF_SIZE: i64 = 8;
 
-fn af_set(af: &mut i64, k: i64, s: i64, b1: i64, c1: i64, b2: i64, c2: i64) {
+fn af_set(af: *i64, k: i64, s: i64, b1: i64, c1: i64, b2: i64, c2: i64) {
     unsafe {
         af[0] = k;
         af[1] = s;
@@ -84,7 +84,7 @@ fn af_add_term(af: *i64, b: i64, c: i64) -> bool {
 // af = x + m * y.
 fn af_combine(af: *i64, x: *i64, y: *i64, m: i64) -> bool {
     unsafe {
-        af_set(&mut *af, x[0] + m * y[0], x[1] + m * y[1], x[2], x[3], x[4], x[5]);
+        af_set(&*af, x[0] + m * y[0], x[1] + m * y[1], x[2], x[3], x[4], x[5]);
         if x[7] != 0 && y[7] != 0 && x[6] != y[6] {
             return false;
         }
@@ -106,11 +106,11 @@ fn af_scale(af: *i64, m: i64) {
 
 // The affine form of v in loop l over induction variable iv; *cost counts
 // the multiplications and shifts in it. False when it is not affine.
-fn affine_of(mut cx: *FnCtx, l: i64, iv: i64, v: i64, af: *i64, cost: &mut i64, depth: i64) -> bool {
+fn affine_of(cx: sink *FnCtx, l: i64, iv: i64, v: i64, af: *i64, cost: inout i64, depth: i64) -> bool {
     unsafe {
         let x = ir_val(cx, v);
         if x == iv {
-            af_set(&mut *af, 0, 1, 0, 0, 0, 0);
+            af_set(&*af, 0, 1, 0, 0, 0, 0);
             return true;
         }
         let ty = cx.insts[x].ty;
@@ -118,19 +118,19 @@ fn affine_of(mut cx: *FnCtx, l: i64, iv: i64, v: i64, af: *i64, cost: &mut i64, 
             return false;
         }
         if is_const(cx, x) {
-            af_set(&mut *af, cx.insts[x].imm, 0, 0, 0, 0, 0);
+            af_set(&*af, cx.insts[x].imm, 0, 0, 0, 0, 0);
             return true;
         }
         if invariant_in(cx, l, x) {
-            af_set(&mut *af, 0, 0, x, 1, 0, 0);
+            af_set(&*af, 0, 0, x, 1, 0, 0);
             return true;
         }
         let op = cx.insts[x].op;
-        let mut fa: [i64; 8] = [0; 8];
-        let mut fb: [i64; 8] = [0; 8];
+        var fa: [i64; 8] = [0; 8];
+        var fb: [i64; 8] = [0; 8];
         if op == Add || op == Sub {
-            if !affine_of(cx, l, iv, cx.insts[x].a, &fa[0], cost, depth + 1)
-                || !affine_of(cx, l, iv, cx.insts[x].b, &fb[0], cost, depth + 1) {
+            if !affine_of(cx, l, iv, cx.insts[x].a, &fa[0], &cost, depth + 1)
+                || !affine_of(cx, l, iv, cx.insts[x].b, &fb[0], &cost, depth + 1) {
                 return false;
             }
             return af_combine(af, &fa[0], &fb[0], if op == Add { 1 } else { -1 });
@@ -138,8 +138,8 @@ fn affine_of(mut cx: *FnCtx, l: i64, iv: i64, v: i64, af: *i64, cost: &mut i64, 
         if op == Mul || op == Shl {
             let b = ir_val(cx, cx.insts[x].b);
             let a = ir_val(cx, cx.insts[x].a);
-            let mut m = 0;
-            let mut operand = a;
+            var m = 0;
+            var operand = a;
             if op == Shl && is_const(cx, b) {
                 let k = cx.insts[b].imm & 63;
                 m = 1 << k as u64;
@@ -152,45 +152,45 @@ fn affine_of(mut cx: *FnCtx, l: i64, iv: i64, v: i64, af: *i64, cost: &mut i64, 
                 // By a stride known at run time: the operand must be k + s*i.
                 let stride = if invariant_in(cx, l, b) { b } else { a };
                 let other = if stride == b { a } else { b };
-                if !affine_of(cx, l, iv, other, af, cost, depth + 1) || af[2] != 0 || af[4] != 0
+                if !affine_of(cx, l, iv, other, af, &cost, depth + 1) || af[2] != 0 || af[4] != 0
                     || af[7] != 0 {
                     return false;
                 }
                 let k = af[0];
                 let sc = af[1];
-                af_set(&mut *af, 0, 0, stride, k, 0, 0);
+                af_set(&*af, 0, 0, stride, k, 0, 0);
                 af[6] = stride;
                 af[7] = sc;
-                *cost = *cost + 1;
+                cost = cost + 1;
                 return true;
             } else {
                 return false;
             }
-            if !affine_of(cx, l, iv, operand, af, cost, depth + 1) {
+            if !affine_of(cx, l, iv, operand, af, &cost, depth + 1) {
                 return false;
             }
             af_scale(af, m);
-            *cost = *cost + 1;
+            cost = cost + 1;
             return true;
         }
         if op == Conv && is_integer(cx.insts[x].imm2) && int_bits(cx.insts[x].imm2) == 64 {
-            return affine_of(cx, l, iv, cx.insts[x].a, af, cost, depth + 1);
+            return affine_of(cx, l, iv, cx.insts[x].a, af, &cost, depth + 1);
         }
         false
     }
 }
 
 // Appends c1*b1 + c2*b2 + k (as u64) to block b; returns the value.
-fn materialize_affine(mut cx: *FnCtx, b: i64, af: *i64, k: i64) -> i64 {
+fn materialize_affine(cx: sink *FnCtx, b: i64, af: *i64, k: i64) -> i64 {
     unsafe {
-        let mut value = append_const(cx, b, k, TY_U64);
+        var value = append_const(cx, b, k, TY_U64);
         for t in 0..2 {
             let base = af[2 + 2 * t];
             let c = af[3 + 2 * t];
             if base == 0 || c == 0 {
                 continue;
             }
-            let mut term = base;
+            var term = base;
             if c != 1 {
                 term = append_inst(cx, b, Mul, TY_U64, base, append_const(cx, b, c, TY_U64));
             }
@@ -201,7 +201,7 @@ fn materialize_affine(mut cx: *FnCtx, b: i64, af: *i64, k: i64) -> i64 {
 }
 
 // Strength reduction of the addresses in innermost loop l.
-fn reduce_loop(mut cx: *FnCtx, fi: i64, l: i64) -> bool {
+fn reduce_loop(cx: sink *FnCtx, fi: i64, l: i64) -> bool {
     unsafe {
         let h = loop_header(cx, l);
         let pre = loop_preheader(cx, l);
@@ -212,12 +212,12 @@ fn reduce_loop(mut cx: *FnCtx, fi: i64, l: i64) -> bool {
         ir_enter(cx, fi);
         // The induction variable: the first 64-bit header phi with a constant
         // step.
-        let mut iv = 0;
-        let mut step = 0;
-        let mut phi = cx.blocks[h].first;
+        var iv = 0;
+        var step = 0;
+        var phi = cx.blocks[h].first;
         while phi != 0 && cx.insts[phi].op == Phi {
-            let mut s = 0;
-            if int_bits(cx.insts[phi].ty) == 64 && iv_step(cx, l, phi, &mut s) && s != 0 {
+            var s = 0;
+            if int_bits(cx.insts[phi].ty) == 64 && iv_step(cx, l, phi, &s) && s != 0 {
                 iv = phi;
                 step = s;
                 break;
@@ -228,22 +228,22 @@ fn reduce_loop(mut cx: *FnCtx, fi: i64, l: i64) -> bool {
             return false;
         }
         // Candidates: (access, group, k); groups: their form (6 each).
-        let mut cands = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let mut groups = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var cands = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var groups = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..loop_size(cx, l) {
-            let mut v = cx.blocks[loop_block(cx, l, i)].first;
+            var v = cx.blocks[loop_block(cx, l, i)].first;
             while v != 0 {
                 let op = cx.insts[v].op;
                 if op == Load || op == Store {
                     let addr = ir_val(cx, cx.insts[v].a);
-                    let mut af: [i64; 8] = [0; 8];
-                    let mut cost = 0;
+                    var af: [i64; 8] = [0; 8];
+                    var cost = 0;
                     if !invariant_in(cx, l, addr) && addr != iv
-                        && affine_of(cx, l, iv, addr, &af[0], &mut cost, 0) && cost > 0
+                        && affine_of(cx, l, iv, addr, &af[0], &cost, 0) && cost > 0
                         && (af[1] != 0 || af[7] != 0) {
-                        let mut g = -1;
+                        var g = -1;
                         for k in 0..groups.count / AF_SIZE {
-                            let mut same = true;
+                            var same = true;
                             for m in 1..AF_SIZE {
                                 if groups.data[AF_SIZE * k + m] != af[m] {
                                     same = false;
@@ -274,11 +274,11 @@ fn reduce_loop(mut cx: *FnCtx, fi: i64, l: i64) -> bool {
         let latch_index = pred_index(cx, h, latch);
         let start = iv_start(cx, l, iv);
         for g in 0..ngroups {
-            let af = &groups.data[AF_SIZE * g];
+            let af = &groups.data[AF_SIZE * g] as *i64;
             let s = af[1];
             // The smallest k of the group is the pointer's.
-            let mut k0 = 0;
-            let mut first = true;
+            var k0 = 0;
+            var first = true;
             for c in 0..cands.count / 3 {
                 if cands.data[3 * c + 1] == g && (first || cands.data[3 * c + 2] < k0) {
                     k0 = cands.data[3 * c + 2];
@@ -288,7 +288,7 @@ fn reduce_loop(mut cx: *FnCtx, fi: i64, l: i64) -> bool {
             // Start: the form at the induction variable's start.
             let base = materialize_affine(cx, pre, af, k0);
             // The coefficient of the induction variable, s + m*v.
-            let mut coef = append_const(cx, pre, s, TY_U64);
+            var coef = append_const(cx, pre, s, TY_U64);
             if af[7] != 0 {
                 let sym = append_inst(cx, pre, Mul, TY_U64, af[6],
                     append_const(cx, pre, af[7], TY_U64));
@@ -315,7 +315,7 @@ fn reduce_loop(mut cx: *FnCtx, fi: i64, l: i64) -> bool {
                 }
                 let v = cands.data[3 * c];
                 let d = cands.data[3 * c + 2] - k0;
-                let mut addr = ptr;
+                var addr = ptr;
                 if d != 0 {
                     addr = op_before(cx, v, Add, TY_U64, ptr, const_before(cx, v, d, TY_U64));
                 }
@@ -332,14 +332,14 @@ fn reduce_loop(mut cx: *FnCtx, fi: i64, l: i64) -> bool {
 
 // Unswitches innermost loop l (canonical, in LCSSA form) on the first
 // branch of its blocks on an invariant condition. Returns whether it did.
-fn unswitch_loop(mut cx: *FnCtx, fi: i64, l: i64) -> bool {
+fn unswitch_loop(cx: sink *FnCtx, fi: i64, l: i64) -> bool {
     unsafe {
         let h = loop_header(cx, l);
         let pre = loop_preheader(cx, l);
         if pre == 0 || loop_latch(cx, l) == 0 || loop_inst_count(cx, l) > UNSWITCH_MAX_SIZE {
             return false;
         }
-        let mut at = 0;
+        var at = 0;
         for i in 0..loop_size(cx, l) {
             let b = loop_block(cx, l, i);
             if cx.blocks[b].term == Term::Branch && cx.blocks[b].s0 != cx.blocks[b].s1 {
@@ -356,12 +356,12 @@ fn unswitch_loop(mut cx: *FnCtx, fi: i64, l: i64) -> bool {
         let c = ir_val(cx, cx.blocks[at].cond);
         ir_enter(cx, fi);
         loop_exits(cx, l);
-        let mut exits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var exits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..cx.lp_list.count {
             exits.push(cx.lp_list.data[i]);
         }
         let stamp = mark_loop_blocks(cx, l);
-        let mut region = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var region = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for i in 0..cx.lp_list2.count {
             region.push(cx.lp_list2.data[i]);
         }
@@ -377,7 +377,7 @@ fn unswitch_loop(mut cx: *FnCtx, fi: i64, l: i64) -> bool {
                     continue;
                 }
                 let first = cx.lp_values.count;
-                let mut phi = cx.blocks[x].first;
+                var phi = cx.blocks[x].first;
                 while phi != 0 && cx.insts[phi].op == Phi {
                     cx.lp_values.push(clone_map(cx, ir_val(cx, ir_arg(cx, phi, k)), stamp));
                     phi = cx.insts[phi].next;
@@ -406,7 +406,7 @@ fn unswitch_loop(mut cx: *FnCtx, fi: i64, l: i64) -> bool {
 }
 
 // Whether small loop l branches on a condition defined outside it.
-fn has_invariant_branch(mut cx: *FnCtx, l: i64) -> bool {
+fn has_invariant_branch(cx: sink *FnCtx, l: i64) -> bool {
     unsafe {
         if loop_inst_count(cx, l) > UNSWITCH_MAX_SIZE {
             return false;
@@ -425,11 +425,11 @@ fn has_invariant_branch(mut cx: *FnCtx, l: i64) -> bool {
 }
 
 // Strength reduction and unswitching over the innermost loops of fi.
-pub fn reduce_and_unswitch(mut cx: *FnCtx, fi: i64) -> bool {
+pub fn reduce_and_unswitch(cx: sink *FnCtx, fi: i64) -> bool {
     unsafe {
-        let mut changed = false;
+        var changed = false;
         canonicalize_loops(cx, fi);
-        let mut headers = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var headers = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for l in 0..loop_count(cx) {
             if is_innermost(cx, l) && loop_header(cx, l) != IRFUNCS[fi].entry {
                 headers.push(loop_header(cx, l));
@@ -437,7 +437,7 @@ pub fn reduce_and_unswitch(mut cx: *FnCtx, fi: i64) -> bool {
         }
         // Unswitching, one loop at a time (the loops are found again after
         // each), at most 4 per function.
-        let mut unswitched = 0;
+        var unswitched = 0;
         for i in 0..headers.count {
             if unswitched >= 4 {
                 break;

@@ -9,8 +9,8 @@ use crate::front::ast::{
     NODE_REF_MUT, NodeKind, PAT_FIELDS, PAT_PARENS, PAT_REST, SCRATCH, child, list_begin, list_end,
     list_push, new_node,
 };
-use crate::front::conv::{legacy_at, legacy_error, rust_spelling, strict_at, word_at};
-use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::conv::{rust_spelling, strict_at};
+use crate::front::lexer::{TOKS, Tok};
 use crate::front::lexer::Tok::{
     Char, Colon, ColonColon, Comma, Const, Defer, DotDot, DotDotEq, Enum, Eof, Eq, Extern, False,
     Float, Fn, For, Ident, If, Impl, Import, Int, LBrace, LParen, Let, Loop, Match, Minus, Mut,
@@ -33,7 +33,7 @@ pub fn parse_block() -> i64 {
         let saved = with_no_struct(false);
         let block = new_node(NodeKind::Block, start, 0);
         let mark = list_begin();
-        let mut tail = 0;
+        var tail = 0;
         while !at(RBrace) && !at(Eof) {
             if eat(Semi) {
                 continue;
@@ -45,7 +45,7 @@ pub fn parse_block() -> i64 {
             let depth = RECOVER_DEPTH;
             let stmts = SCRATCH.count;
             let start = P;
-            let mut stmt = 0;
+            var stmt = 0;
             if _setjmp(recover_enter()) == 0 {
                 if tail != 0 {
                     syntax_error(c"expected ';' or '}' after expression");
@@ -157,27 +157,24 @@ fn parse_let() -> i64 {
         let start = cur_start();
         // (0.20) `var PAT = e;` (mutable bindings: `let mut`), `inout x = e;`
         // (an exclusive access: `let x = &mut place`), conventions.md §5.2
-        let var = at(Ident);
-        let inout = var && word_at(P, "inout");
+        let is_var = !at(Let);
+        let is_inout = at(Tok::Inout);
         advance();
         let n = new_node(NodeKind::Let, start, 0);
-        let mut let_mut = false;
-        if strict_at(start) && !var && at(Mut) && tok_kind(1) == Ident {
+        var let_mut = false;
+        if strict_at(start) && !is_var && at(Mut) && tok_kind(1) == Ident {
             // (`let mut x`: one error, for both words)
             rust_spelling(start, TOKS[P].end, "a mutable binding is 'var x'", "var");
             advance();
             let_mut = true;
         }
-        if var && legacy_at(start) {
-            legacy_error(start, TOKS[P - 1].end, if inout { "'inout x = ..'" } else { "'var x'" });
-        }
         NODES[n].a = parse_pattern();
         if let_mut {
             mark_mutable(NODES[n].a);
         }
-        if var {
+        if is_var {
             NODES[n].p |= CONV_NEW;
-            if inout {
+            if is_inout {
                 NODES[n].p |= CONV_INOUT;
             } else {
                 mark_mutable(NODES[n].a);
@@ -185,13 +182,13 @@ fn parse_let() -> i64 {
         }
         if eat(Colon) {
             NODES[n].b = parse_type();
-            if inout && NODES[NODES[n].b].kind != NodeKind::TySlice {
+            if is_inout && NODES[NODES[n].b].kind != NodeKind::TySlice {
                 // `inout x: T = ..`: x designates a T (until T1, `&mut T`)
                 let t = new_node(NodeKind::TyPtr, NODES[NODES[n].b].start, NODES[NODES[n].b].end);
                 NODES[t].a = NODES[n].b;
                 NODES[t].p |= CONV_NEW | NODE_REF | NODE_REF_MUT;
                 NODES[n].b = t;
-            } else if inout {
+            } else if is_inout {
                 NODES[NODES[n].b].p |= CONV_NEW | NODE_REF_MUT;
             }
         }
@@ -201,7 +198,7 @@ fn parse_let() -> i64 {
         }
         expect(Eq);
         NODES[n].c = parse_expr();
-        if inout {
+        if is_inout {
             let c = NODES[n].c;
             if NODES[c].kind == NodeKind::Unary && NODES[c].op == Tok::Amp {
                 // `inout x = &place`: the marker lends the place exclusively
@@ -239,42 +236,9 @@ fn mark_mutable(p: i64) {
 }
 
 // (0.20) Whether a statement starts here with `var PAT =` or `inout x =`
-// (`var` and `inout` are identifiers too: `var = 1;`, `var(a, b);`).
+// (keywords from 0.21).
 fn at_var_binding() -> bool {
-    unsafe {
-        if word_at(P, "inout") {
-            return tok_kind(1) == Ident && (tok_kind(2) == Eq || tok_kind(2) == Colon);
-        }
-        if !word_at(P, "var") {
-            return false;
-        }
-        let k = tok_kind(1);
-        if k == Ident {
-            return tok_kind(2) == Eq || tok_kind(2) == Colon;
-        }
-        if k != LParen {
-            return false;
-        }
-        // `var (a, b) = t;` and not a call `var(a, b);`: what follows the
-        // matching `)` is `=` or `:`
-        let mut depth = 0;
-        let mut i = P + 1;
-        while i < TOK_COUNT && TOKS[i].kind != Tok::Eof {
-            let t = TOKS[i].kind;
-            if t == LParen {
-                depth += 1;
-            } else if t == RParen {
-                depth -= 1;
-                if depth == 0 {
-                    return TOKS[i + 1].kind == Eq || TOKS[i + 1].kind == Colon;
-                }
-            } else if t == Semi || t == LBrace || t == RBrace {
-                return false;
-            }
-            i += 1;
-        }
-        false
-    }
+    at(Tok::Var) || at(Tok::Inout)
 }
 
 // (0.18.1) `let PAT = e else { .. };` (n, at the `else`): `let (a, b) =
@@ -306,8 +270,8 @@ fn let_else(n: i64) {
         }
         SCRATCH.count = mark;
         // The value of the matching arm, and the outer pattern.
-        let mut value = 0;
-        let mut outer = 0;
+        var value = 0;
+        var outer = 0;
         if count == 0 {
             value = new_node(NodeKind::Unit, at0, at0);
             outer = new_node(NodeKind::PatWild, at0, at0);
@@ -454,7 +418,11 @@ pub fn parse_single_pattern() -> i64 {
             advance();
             return new_node(NodeKind::PatWild, start, prev_end());
         }
-        if at(Mut) || word_at(P, "var") && tok_kind(1) == Ident && !legacy_at(start) {
+        if at(Tok::Inout) || at(Tok::Sink) {
+            // (0.21: keywords, no names)
+            crate::front::parser::convention_word_error();
+        }
+        if at(Mut) || at(Tok::Var) {
             // (0.20) `var x` (0.19: `mut x`; in 0.20's spelling conv.rust)
             if at(Mut) && strict_at(start) {
                 mut_binding(start);
@@ -533,9 +501,9 @@ fn parse_variant_pattern(start: i64) -> i64 {
     unsafe {
         let n = new_node(NodeKind::PatVariant, start, 0);
         let mark = list_begin();
-        let mut name = expect_ident();
+        var name = expect_ident();
         expect(ColonColon);
-        let mut member = expect_ident();
+        var member = expect_ident();
         while at(ColonColon) {
             advance();
             let seg = new_node(NodeKind::Ident, start, prev_end());
@@ -617,7 +585,7 @@ fn parse_pattern_fields(n: i64) {
                 mut_binding(start);
             }
             let mutable = eat(Mut)
-                || word_at(P, "var") && tok_kind(1) == Ident && !legacy_at(start) && eat(Ident);
+                || eat(Tok::Var);
             NODES[field].a = expect_binding_name();
             if !mutable && eat(Colon) {
                 NODES[field].b = parse_pattern();
@@ -659,7 +627,7 @@ fn parse_tuple_pattern(start: i64) -> i64 {
         expect(LParen);
         let n = new_node(NodeKind::PatTuple, start, 0);
         let mark = list_begin();
-        let mut trailing_comma = false;
+        var trailing_comma = false;
         while !at(RParen) && !at(Eof) {
             list_push(parse_pattern());
             trailing_comma = eat(Comma);
