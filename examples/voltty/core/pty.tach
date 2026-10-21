@@ -1,2 +1,375 @@
-// stub
-pub fn run_headless(lines: i64, cols: i64, cmd: [[u8]], gpa: Gpa) -> i32 { 0 }
+// The pty: a child program (the shell) on a pseudo-terminal, through
+// std::sys (posix_openpt, a fork that does only async-signal-safe work,
+// execve). The controller end is non-blocking: reads take what is there
+// (up to 64 KiB at a time), writes are queued and flushed as the child
+// reads them, so a large paste never blocks the caller. A resize sends
+// TIOCSWINSZ (the child gets SIGWINCH). Dropping the Pty closes the
+// controller and hangs the child up.
+//
+// The environment is built before the fork: the caller's, with
+// TERM=xterm-256color and COLORTERM=truecolor. The shell is $SHELL, else
+// /bin/sh, as a login shell (`-l`, the macOS convention).
+//
+// One thread before 0.21: the event loop polls the controller
+// (`wait_readable`, or its window's watched fds) and calls `read`.
+
+use std::Buf;
+use std::sys::{
+    SYS_EAGAIN, SYS_EINTR, SYS_EIO, SYS_POLLERR, SYS_POLLHUP, SYS_POLLIN, SYS_POLLOUT, SYS_SIGHUP, SysPollFd, SysWinsize, sys_close,
+    sys_env_at, sys_env_count, sys_exit_code, sys_fork_exec_pty, sys_getenv, sys_kill,
+    sys_openpty, sys_poll, sys_read, sys_set_nonblocking, sys_set_winsize, sys_stat, sys_waitpid,
+    sys_write,
+};
+use crate::term::Term;
+use crate::vt::Parser;
+
+pub struct Pty {
+    // The controller's descriptor.
+    pub fd: i32,
+    pub pid: i32,
+    // Bytes for the child not written yet.
+    queue: Buf,
+    // The child's exit code, once it exited (-1 before; 128 + signal).
+    pub status: i32,
+    pub closed: bool,
+    gpa: Gpa,
+}
+
+pub enum PtyError {
+    // openpty, fork or exec failed: the errno.
+    Sys(i32),
+    // The program was not found on $PATH.
+    NotFound,
+}
+
+fn winsize(lines: i64, cols: i64, pw: i64, ph: i64) -> SysWinsize {
+    SysWinsize { ws_row: lines as u16, ws_col: cols as u16, ws_xpixel: pw as u16, ws_ypixel: ph as u16 }
+}
+
+// The program's full path: as given when it has a `/`, else the first
+// entry of $PATH holding it.
+pub fn find_program(name: [u8], gpa: Gpa) -> Option<Buf> {
+    let mut b = Buf::new_in(gpa);
+    let mut has_slash = false;
+    for c in name {
+        if c == '/' {
+            has_slash = true;
+        }
+    }
+    if has_slash {
+        b.push_str(name);
+        return Some(b);
+    }
+    let path = sys_getenv("PATH").unwrap_or("/usr/bin:/bin");
+    let mut at = 0;
+    while at <= path.len {
+        let mut end = at;
+        while end < path.len && path[end] != ':' {
+            end += 1;
+        }
+        b.clear();
+        b.push_str(if end > at { path[at..end] } else { "." });
+        b.push('/');
+        b.push_str(name);
+        if let Ok(st) = sys_stat(b.as_slice()) {
+            if st.is_file() {
+                return Some(b);
+            }
+        }
+        at = end + 1;
+    }
+    None
+}
+
+// The user's shell: $SHELL, else /bin/sh.
+pub fn shell(gpa: Gpa) -> Buf {
+    let mut b = Buf::new_in(gpa);
+    b.push_str(sys_getenv("SHELL").unwrap_or("/bin/sh"));
+    b
+}
+
+impl Pty {
+    // `argv` (argv[0] the program, found on $PATH) on a new pty of the
+    // given size.
+    pub fn spawn(argv: [[u8]], lines: i64, cols: i64, gpa: Gpa) -> Result<Pty, PtyError> {
+        if argv.len == 0 {
+            return Err(PtyError::NotFound);
+        }
+        let path = match find_program(argv[0], gpa) {
+            Some(p) => p,
+            None => return Err(PtyError::NotFound),
+        };
+        // Every string NUL-ended in one buffer, then the pointers: all made
+        // before the fork.
+        let mut strings = Buf::new_in(gpa);
+        let mut starts: Vec<i64> = Vec::new_in(gpa);
+        strings.push_str(path.as_slice());
+        strings.push(0);
+        for a in argv {
+            starts.push(strings.len());
+            strings.push_str(a);
+            strings.push(0);
+        }
+        let nargs = starts.len();
+        for i in 0..sys_env_count() {
+            let e = sys_env_at(i);
+            if e.len >= 5 && e[0..5] == "TERM=" || e.len >= 10 && e[0..10] == "COLORTERM=" {
+                continue;
+            }
+            starts.push(strings.len());
+            strings.push_str(e);
+            strings.push(0);
+        }
+        starts.push(strings.len());
+        strings.push_str("TERM=xterm-256color");
+        strings.push(0);
+        starts.push(strings.len());
+        strings.push_str("COLORTERM=truecolor");
+        strings.push(0);
+        let base = strings.as_slice().ptr;
+        let mut av: Vec<*u8> = Vec::new_in(gpa);
+        let mut ev: Vec<*u8> = Vec::new_in(gpa);
+        for k in 0..starts.len() {
+            // SAFETY: an address inside `strings`, which does not change again
+            // before the child's execve; only C reads through it.
+            let p = unsafe { (base as i64 + starts[k]) as *u8 };
+            if k < nargs {
+                av.push(p);
+            } else {
+                ev.push(p);
+            }
+        }
+        av.push(0 as *u8);
+        ev.push(0 as *u8);
+        let (m, s) = match sys_openpty(winsize(lines, cols, 0, 0)) {
+            Ok(pair) => pair,
+            Err(e) => return Err(PtyError::Sys(e)),
+        };
+        // SAFETY: base (the path) and every pointer in av and ev before
+        // their nulls are NUL-ended strings in `strings`, alive until the
+        // call returns (the child execs or exits first).
+        let pid = unsafe { sys_fork_exec_pty(s, base, av.as_slice(), ev.as_slice()) };
+        let _ = sys_close(s);
+        match pid {
+            Ok(pid) => {
+                let _ = sys_set_nonblocking(m, true);
+                Ok(Pty { fd: m, pid: pid, queue: Buf::new_in(gpa), status: -1, closed: false, gpa: gpa })
+            }
+            Err(e) => {
+                let _ = sys_close(m);
+                Err(PtyError::Sys(e))
+            }
+        }
+    }
+
+    // The user's shell as a login shell.
+    pub fn spawn_shell(lines: i64, cols: i64, gpa: Gpa) -> Result<Pty, PtyError> {
+        let sh = shell(gpa);
+        let argv = [sh.as_slice(), "-l"];
+        Pty::spawn(argv[..], lines, cols, gpa)
+    }
+
+    // Reads what the child wrote: the bytes read (> 0), 0 once it closed
+    // its end (EOF; EIO on Linux), -1 when nothing is there yet.
+    pub fn read(self: &mut Pty, buf: &mut [u8]) -> i64 {
+        if self.closed {
+            return 0;
+        }
+        loop {
+            match sys_read(self.fd, buf) {
+                Ok(n) => {
+                    if n == 0 {
+                        self.closed = true;
+                    }
+                    return n;
+                }
+                Err(e) => {
+                    if e == SYS_EINTR {
+                        continue;
+                    }
+                    if e == SYS_EAGAIN {
+                        return -1;
+                    }
+                    if e == SYS_EIO {
+                        self.closed = true;
+                    }
+                    self.closed = true;
+                    return 0;
+                }
+            }
+        }
+    }
+
+    // Queues `bytes` for the child and writes what it takes now.
+    pub fn write(self: &mut Pty, bytes: [u8]) {
+        self.queue.push_str(bytes);
+        self.flush();
+    }
+
+    // Bytes still queued.
+    pub fn pending(self: &Pty) -> i64 {
+        self.queue.len()
+    }
+
+    // Writes queued bytes until the child stops taking them.
+    pub fn flush(self: &mut Pty) {
+        let mut done = 0;
+        let n = self.queue.len();
+        while done < n {
+            match sys_write(self.fd, self.queue.as_slice()[done..n]) {
+                Ok(k) => {
+                    if k <= 0 {
+                        break;
+                    }
+                    done += k;
+                }
+                Err(e) => {
+                    if e != SYS_EINTR {
+                        break;
+                    }
+                }
+            }
+        }
+        if done > 0 {
+            let mut rest = Buf::new_in(self.gpa);
+            rest.push_str(self.queue.as_slice()[done..n]);
+            self.queue = rest;
+        }
+    }
+
+    // The new size, in cells and pixels.
+    pub fn resize(self: &Pty, lines: i64, cols: i64, pw: i64, ph: i64) {
+        let _ = sys_set_winsize(self.fd, winsize(lines, cols, pw, ph));
+    }
+
+    // Waits up to `ms` (-1: no limit) for the child's output: whether
+    // there is some (or the end).
+    pub fn wait_readable(self: &Pty, ms: i32) -> bool {
+        let fds = [SysPollFd { fd: self.fd, events: SYS_POLLIN, revents: 0 }];
+        match sys_poll(fds[..], ms) {
+            Ok(n) => n > 0,
+            Err(_) => false,
+        }
+    }
+
+    // Waits up to `ms` for output to read, or (with bytes queued) for room
+    // to write them; writes what fits. Whether there is output.
+    pub fn wait_io(self: &mut Pty, ms: i32) -> bool {
+        let mut ev = SYS_POLLIN;
+        if self.queue.len() > 0 {
+            ev = ev | SYS_POLLOUT;
+        }
+        let fds = [SysPollFd { fd: self.fd, events: ev, revents: 0 }];
+        let ready = match sys_poll(fds[..], ms) {
+            Ok(n) => n > 0,
+            Err(_) => false,
+        };
+        if self.queue.len() > 0 {
+            self.flush();
+        }
+        ready && (fds[0].revents & (SYS_POLLIN | SYS_POLLHUP | SYS_POLLERR)) != 0
+    }
+
+    // Whether the child has exited (its status then in `status`).
+    pub fn exited(self: &mut Pty) -> bool {
+        self.reap(true)
+    }
+
+    // Waits for the child to exit: its status.
+    pub fn wait(self: &mut Pty) -> i32 {
+        while !self.reap(false) {}
+        self.status
+    }
+
+    fn reap(self: &mut Pty, nohang: bool) -> bool {
+        if self.status >= 0 {
+            return true;
+        }
+        match sys_waitpid(self.pid, nohang) {
+            Ok((pid, st)) => {
+                if pid == self.pid {
+                    self.status = match sys_exit_code(st) {
+                        Some(c) => c,
+                        None => 128,
+                    };
+                    return true;
+                }
+                false
+            }
+            Err(_) => {
+                self.status = 0;
+                true
+            }
+        }
+    }
+}
+
+impl Drop for Pty {
+    fn drop(self: &mut Pty) {
+        let _ = sys_close(self.fd);
+        if self.status < 0 {
+            let _ = sys_kill(self.pid, SYS_SIGHUP);
+            if let Ok(_) = sys_waitpid(self.pid, false) {}
+        }
+    }
+}
+
+// `voltty --run`: `cmd` on a pty of `lines` x `cols`, its output through
+// the terminal until it exits (10 s at most), `send` written to it once
+// it has written something (in pieces, as it reads them); then the dump. The terminal's replies
+// (DSR, DA) go back to the child, as a window's event loop sends them.
+pub fn run_headless(lines: i64, cols: i64, cmd: [[u8]], send: [u8], gpa: Gpa) -> i32 {
+    let mut pty = match Pty::spawn(cmd, lines, cols, gpa) {
+        Ok(p) => p,
+        Err(PtyError::NotFound) => {
+            eprintln("voltty: program not found");
+            return 127;
+        }
+        Err(PtyError::Sys(e)) => {
+            eprintln(f"voltty: pty: errno {e}");
+            return 1;
+        }
+    };
+    let mut term = Term::new_in(lines, cols, 1000, gpa);
+    let mut parser = Parser::new_in(1048576, gpa);
+    let mut buf: Vec<u8> = Vec::filled_in(65536, 0, gpa);
+    let mut sent = false;
+    let (t0, _) = std::sys::sys_clock_gettime(0);
+    loop {
+        if pty.wait_io(50) {
+            let n = pty.read(buf.as_mut_slice());
+            if n > 0 {
+                term.feed(&mut parser, buf.as_slice()[0..n]);
+                if !sent {
+                    // What is typed waits for the program's first output (a
+                    // prompt, or its `stty`'s end).
+                    pty.write(send);
+                    sent = true;
+                }
+                if term.reply.len() > 0 {
+                    pty.write(term.reply.as_slice());
+                    term.reply.clear();
+                }
+            } else if n == 0 {
+                break;
+            }
+        }
+        pty.flush();
+        if pty.exited() && !pty.wait_readable(0) {
+            break;
+        }
+        let (t, _) = std::sys::sys_clock_gettime(0);
+        if t - t0 > 10 {
+            eprintln("voltty: the program did not exit in 10 s");
+            let _ = sys_kill(pty.pid, SYS_SIGHUP);
+            break;
+        }
+    }
+    pty.wait();
+    let mut out = Buf::new_in(gpa);
+    term.stop_sync(&mut parser);
+    term.dump(&mut out);
+    print(out.as_slice());
+    println(f"exit {pty.status}");
+    0
+}
