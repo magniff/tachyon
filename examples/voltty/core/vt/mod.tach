@@ -1,0 +1,497 @@
+// The escape-sequence parser: Paul Williams' DEC/ANSI state machine
+// (vt100.net/emu/dec_ansi_parser) as vte 0.15 implements it, byte for
+// byte, so that the terminal behind it sees what Alacritty's does.
+//
+// It allocates nothing and does no I/O (`tachyonc query effects
+// vt::Parser::advance`): parameters live in fixed arrays (params.tach),
+// and OSC strings in a buffer the caller lends at `new` (1 MiB is
+// enough for OSC 52 clipboard payloads; a longer string is dropped).
+//
+// The fast path: in the ground state a run of printable ASCII is found
+// by a scan and handed to `Perform::print_ascii` whole, so the terminal
+// writes cells in bulk. The rest is vte's: C0 controls are executed,
+// UTF-8 is decoded as Rust's `from_utf8` decodes it (utf8.tach), C1
+// controls (raw or encoded) are executed, invalid input prints U+FFFD.
+//
+// 0.17: the `self: *T` methods become `&mut self`, and `Perform`'s too.
+// 0.19: the scan uses NEON compares (16 bytes at a time) under `has`.
+
+pub mod params;
+pub mod table;
+pub mod utf8;
+
+use params::Params;
+use std::str::ascii_printable_prefix_len;
+
+// What the parser hands its user, as vte's `Perform` (plus
+// `print_ascii`). The methods are generic-dispatched: `advance<P>` is
+// compiled once per terminal type, with no indirect calls.
+pub trait Perform {
+    // A character (a code point; not printable ASCII, which comes in runs).
+    fn print(self: &mut Self, c: u32);
+
+    // A run of printable ASCII (0x20..0x7E), at least one byte.
+    fn print_ascii(self: &mut Self, run: [u8]);
+
+    // A run of characters (U+00A0 and up): `print` of each by default.
+    fn print_chars(self: &mut Self, run: [u32]) {
+        for c in run {
+            self.print(c);
+        }
+    }
+
+    // A C0 or C1 control.
+    fn execute(self: &mut Self, b: u8);
+
+    fn csi_dispatch(self: &mut Self, params: &Params, intermediates: [u8], ignore: bool,
+        action: u8);
+
+    fn esc_dispatch(self: &mut Self, intermediates: [u8], ignore: bool, b: u8);
+
+    // An OSC string ended (by BEL when `bell`, else by ST, CAN or SUB).
+    fn osc_dispatch(self: &mut Self, osc: &Osc, bell: bool);
+
+    // A device control string: its header, its bytes, its end.
+    fn hook(self: &mut Self, params: &Params, intermediates: [u8], ignore: bool, action: u8) {}
+
+    fn put(self: &mut Self, b: u8) {}
+
+    fn unhook(self: &mut Self) {}
+
+    // `advance_until_terminated` stops once this is true (checked after
+    // every byte of a sequence): a synchronized update has begun.
+    fn terminated(self: &mut Self) -> bool {
+        false
+    }
+}
+
+pub const MAX_OSC_PARAMS: i64 = 16;
+
+// An OSC string: its bytes in the lent buffer, and up to 16 parameters
+// (split at `;`, as vte splits them).
+pub struct Osc {
+    buf: Vec<u8>,
+    pub len: i64,
+    starts: [i64; 16],
+    ends: [i64; 16],
+    pub count: i64,
+    // The string outgrew the buffer: it is dropped at its end.
+    overflow: bool,
+}
+
+impl Osc {
+    pub fn param(self: &Osc, i: i64) -> [u8] {
+        self.buf[self.starts[i]..self.ends[i]]
+    }
+
+    fn clear(self: &mut Osc) {
+        self.len = 0;
+        self.count = 0;
+        self.overflow = false;
+    }
+
+    fn put(self: &mut Osc, b: u8) {
+        if self.len == self.buf.len() {
+            self.overflow = true;
+            return;
+        }
+        self.buf[self.len] = b;
+        self.len += 1;
+    }
+
+    // A `;`: the parameter before it ends (vte's `action_osc_put_param`).
+    fn put_param(self: &mut Osc) {
+        let i = self.count;
+        if i == MAX_OSC_PARAMS {
+            return;
+        }
+        if i == 0 {
+            self.starts[0] = 0;
+        } else {
+            self.starts[i] = self.ends[i - 1];
+        }
+        self.ends[i] = self.len;
+        self.count += 1;
+    }
+}
+
+// The states, as vte's.
+pub const GROUND: u8 = 0;
+pub const ESCAPE: u8 = 1;
+pub const ESCAPE_INTERMEDIATE: u8 = 2;
+pub const CSI_ENTRY: u8 = 3;
+pub const CSI_PARAM: u8 = 4;
+pub const CSI_INTERMEDIATE: u8 = 5;
+pub const CSI_IGNORE: u8 = 6;
+pub const DCS_ENTRY: u8 = 7;
+pub const DCS_PARAM: u8 = 8;
+pub const DCS_INTERMEDIATE: u8 = 9;
+pub const DCS_IGNORE: u8 = 10;
+pub const DCS_PASSTHROUGH: u8 = 11;
+pub const OSC_STRING: u8 = 12;
+pub const SOS_PM_APC_STRING: u8 = 13;
+
+pub const MAX_INTERMEDIATES: i64 = 2;
+
+pub struct Parser {
+    pub state: u8,
+    intermediates: [u8; 2],
+    intermediate_len: i64,
+    params: Params,
+    param: u16,
+    pub osc: Osc,
+    ignoring: bool,
+    // A UTF-8 sequence cut by the end of the last `advance`.
+    partial: [u8; 4],
+    partial_len: i64,
+}
+
+impl Parser {
+    // OSC strings up to `osc_limit` bytes (allocated here, once).
+    pub fn new_in(osc_limit: i64, gpa: Gpa) -> Parser {
+        let osc_buffer: Vec<u8> = Vec::filled_in(osc_limit, 0, gpa);
+        Parser {
+            state: GROUND,
+            intermediates: [0; 2],
+            intermediate_len: 0,
+            params: Params::new(),
+            param: 0,
+            osc: Osc {
+                buf: osc_buffer, len: 0, starts: [0; 16], ends: [0; 16], count: 0, overflow: false
+            },
+            ignoring: false,
+            partial: [0; 4],
+            partial_len: 0,
+        }
+    }
+
+    // Feeds `bytes` to the state machine, calling `p` for every action.
+    pub fn advance<P: Perform>(self: &mut Parser, p: &mut P, bytes: [u8]) {
+        let mut i = 0;
+        if self.partial_len != 0 {
+            i = self.advance_partial(p, bytes);
+        }
+        while i < bytes.len {
+            if self.state == GROUND {
+                i = self.ground(p, bytes, i);
+            } else {
+                if self.state == CSI_PARAM || self.state == CSI_ENTRY {
+                    let j = self.csi_params(bytes, i);
+                    if j > i {
+                        i = j;
+                        continue;
+                    }
+                }
+                self.change_state(p, bytes[i]);
+                i += 1;
+            }
+        }
+    }
+
+    // `advance`, stopping after the byte that makes `p.terminated()`
+    // true; returns the bytes it took (vte's `advance_until_terminated`).
+    pub fn advance_until_terminated<P: Perform>(self: &mut Parser, p: &mut P, bytes: [u8]) -> i64 {
+        let mut i = 0;
+        if self.partial_len != 0 {
+            i = self.advance_partial(p, bytes);
+        }
+        while i < bytes.len && !p.terminated() {
+            if self.state == GROUND {
+                i = self.ground(p, bytes, i);
+            } else {
+                if self.state == CSI_PARAM || self.state == CSI_ENTRY {
+                    let j = self.csi_params(bytes, i);
+                    if j > i {
+                        i = j;
+                        continue;
+                    }
+                }
+                self.change_state(p, bytes[i]);
+                i += 1;
+            }
+        }
+        i
+    }
+
+    // The ground state from `bytes[i]`: until an ESC (consumed, the state
+    // becomes ESCAPE) or the end. Returns where it stopped.
+    fn ground<P: Perform>(self: &mut Parser, p: &mut P, bytes: [u8], from: i64) -> i64 {
+        let n = bytes.len;
+        let mut i = from;
+        while i < n {
+            // The printable ASCII run (std's scan: 16 bytes at a time).
+            let start = i;
+            i += ascii_printable_prefix_len(bytes[i..n]);
+            if i > start {
+                p.print_ascii(bytes[start..i]);
+                if i == n {
+                    return n;
+                }
+            }
+            let b = bytes[i];
+            if b == 0x1B {
+                self.state = ESCAPE;
+                self.reset_params();
+                return i + 1;
+            }
+            if b < 0x20 {
+                p.execute(b);
+                i += 1;
+            } else if b == 0x7F {
+                p.print(0x7F);
+                i += 1;
+            } else {
+                i = self.ground_text(p, bytes, i);
+            }
+        }
+        i
+    }
+
+    // From a byte of 0x80 and up: the run of complete, valid sequences
+    // there that are not C1 controls, decoded and handed over in batches
+    // (`print_chars`); then anything else as `ground_utf8` does.
+    fn ground_text<P: Perform>(self: &mut Parser, p: &mut P, bytes: [u8], from: i64) -> i64 {
+        let n = bytes.len;
+        let mut i = from;
+        let mut buf: [u32; 64] = [0; 64];
+        let mut k = 0;
+        while i < n {
+            let lead = bytes[i];
+            let len = utf8::seq_len(lead);
+            if len == 0 || i + len > n {
+                break;
+            }
+            if !utf8::continues(lead, 1, bytes[i + 1]) {
+                break;
+            }
+            if len > 2 && !utf8::continues(lead, 2, bytes[i + 2]) {
+                break;
+            }
+            if len > 3 && !utf8::continues(lead, 3, bytes[i + 3]) {
+                break;
+            }
+            let c = utf8::decode(bytes[i..i + len], len);
+            if c <= 0x9F {
+                break;
+            }
+            buf[k] = c;
+            k += 1;
+            i += len;
+            if k == 64 {
+                p.print_chars(buf[0..64]);
+                k = 0;
+            }
+        }
+        if k > 0 {
+            p.print_chars(buf[0..k]);
+        }
+        if i < n && bytes[i] >= 0x80 {
+            return self.ground_utf8(p, bytes, i);
+        }
+        i
+    }
+
+    // A byte of 0x80 and up in the ground state: one UTF-8 sequence, an
+    // invalid one, or the start of one cut by the end of `bytes`.
+    #[inline]
+    fn ground_utf8<P: Perform>(self: &mut Parser, p: &mut P, bytes: [u8], i: i64) -> i64 {
+        let lead = bytes[i];
+        let len = utf8::seq_len(lead);
+        if len == 0 {
+            // An error of length 1: a raw C1 control is executed.
+            if lead <= 0x9F {
+                p.execute(lead);
+            } else {
+                p.print(utf8::REPLACEMENT);
+            }
+            return i + 1;
+        }
+        let mut k = 1;
+        while k < len {
+            if i + k == bytes.len {
+                // Cut by the end: kept for the next `advance`.
+                for j in 0..k {
+                    self.partial[j] = bytes[i + j];
+                }
+                self.partial_len = k;
+                return bytes.len;
+            }
+            if !utf8::continues(lead, k, bytes[i + k]) {
+                p.print(utf8::REPLACEMENT);
+                return i + k;
+            }
+            k += 1;
+        }
+        let c = utf8::decode(bytes[i..i + len], len);
+        if c <= 0x9F {
+            p.execute(c as u8);
+        } else {
+            p.print(c);
+        }
+        i + len
+    }
+
+    // The bytes completing the sequence cut by the last `advance`: vte's
+    // `advance_partial_utf8` exactly. It validates the cut bytes and up to
+    // 4 in all, and prints the first character; when an invalid byte
+    // follows within the 4, it skips the valid ones before it (they are
+    // lost: vte 0.15's behaviour, kept so the oracle agrees).
+    fn advance_partial<P: Perform>(self: &mut Parser, p: &mut P, bytes: [u8]) -> i64 {
+        let old = self.partial_len;
+        let mut to_copy = 4 - old;
+        if bytes.len < to_copy {
+            to_copy = bytes.len;
+        }
+        for j in 0..to_copy {
+            self.partial[old + j] = bytes[j];
+        }
+        let n = old + to_copy;
+        let mut err = 0;
+        let valid = utf8::validate(self.partial[0..n], &mut err);
+        if err == 0 || valid > 0 {
+            // vte prints it, even a C1 control.
+            let len = utf8::char_len(self.partial[0]);
+            p.print(utf8::decode(self.partial[0..len], len));
+            self.partial_len = 0;
+            return if err == 0 { len - old } else { valid - old };
+        }
+        if err > 0 {
+            p.print(utf8::REPLACEMENT);
+            self.partial_len = 0;
+            return err - old;
+        }
+        // Still incomplete.
+        self.partial_len = n;
+        to_copy
+    }
+
+    // In CSI_ENTRY or CSI_PARAM: the digits and `;` from `from`, as
+    // `csi_entry` and `csi_param` take them one by one; where it stopped.
+    #[inline]
+    fn csi_params(self: &mut Parser, bytes: [u8], from: i64) -> i64 {
+        let mut i = from;
+        let mut v = self.param as i64;
+        let mut full = self.params.is_full();
+        while i < bytes.len {
+            let b = bytes[i];
+            if b >= '0' && b <= '9' {
+                // param_digit, the value in a local
+                if full {
+                    self.ignoring = true;
+                } else {
+                    v = v * 10 + (b - '0') as i64;
+                    if v > 65535 {
+                        v = 65535;
+                    }
+                }
+            } else if b == ';' {
+                self.param = v as u16;
+                self.next_param();
+                full = self.params.is_full();
+                v = self.param as i64;
+            } else {
+                break;
+            }
+            i += 1;
+        }
+        if i > from {
+            self.param = v as u16;
+            self.state = CSI_PARAM;
+        }
+        i
+    }
+
+    #[inline]
+    fn intermediates(self: &mut Parser) -> [u8] {
+        self.intermediates[0..self.intermediate_len]
+    }
+
+    #[inline]
+    fn reset_params(self: &mut Parser) {
+        self.intermediate_len = 0;
+        self.ignoring = false;
+        self.param = 0;
+        self.params.clear();
+    }
+
+    #[inline]
+    fn collect(self: &mut Parser, b: u8) {
+        if self.intermediate_len == MAX_INTERMEDIATES {
+            self.ignoring = true;
+        } else {
+            self.intermediates[self.intermediate_len] = b;
+            self.intermediate_len += 1;
+        }
+    }
+
+    // `:`: the next sub-parameter.
+    #[inline]
+    fn subparam(self: &mut Parser) {
+        if self.params.is_full() {
+            self.ignoring = true;
+        } else {
+            self.params.extend(self.param);
+            self.param = 0;
+        }
+    }
+
+    // `;`: the next parameter.
+    #[inline]
+    fn next_param(self: &mut Parser) {
+        if self.params.is_full() {
+            self.ignoring = true;
+        } else {
+            self.params.push(self.param);
+            self.param = 0;
+        }
+    }
+
+    // A digit of the current parameter, saturating at 65535.
+    #[inline]
+    fn param_digit(self: &mut Parser, b: u8) {
+        if self.params.is_full() {
+            self.ignoring = true;
+        } else {
+            let v = self.param as i64 * 10 + (b - '0') as i64;
+            self.param = if v > 65535 { 65535 } else { v as u16 };
+        }
+    }
+
+    fn csi_dispatch<P: Perform>(self: &mut Parser, p: &mut P, action: u8) {
+        if self.params.is_full() {
+            self.ignoring = true;
+        } else {
+            self.params.push(self.param);
+        }
+        p.csi_dispatch(&self.params, self.intermediates(), self.ignoring, action);
+        self.state = GROUND;
+    }
+
+    fn hook<P: Perform>(self: &mut Parser, p: &mut P, action: u8) {
+        if self.params.is_full() {
+            self.ignoring = true;
+        } else {
+            self.params.push(self.param);
+        }
+        p.hook(&self.params, self.intermediates(), self.ignoring, action);
+        self.state = DCS_PASSTHROUGH;
+    }
+
+    fn esc_dispatch<P: Perform>(self: &mut Parser, p: &mut P, b: u8) {
+        p.esc_dispatch(self.intermediates(), self.ignoring, b);
+        self.state = GROUND;
+    }
+
+    fn osc_start(self: &mut Parser) {
+        self.osc.clear();
+        self.state = OSC_STRING;
+    }
+
+    fn osc_end<P: Perform>(self: &mut Parser, p: &mut P, b: u8) {
+        self.osc.put_param();
+        if !self.osc.overflow {
+            p.osc_dispatch(&self.osc, b == 0x07);
+        }
+        self.osc.clear();
+    }
+}

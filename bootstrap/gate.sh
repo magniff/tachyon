@@ -49,6 +49,9 @@
 # edits the same as clean builds, 0.18.1);
 # stress-grow (the compiler with every table growth moving, 0.14);
 # examples-checkalloc (every example's test built with --check-alloc, 0.16);
+# voltty-fuzz (tests/voltty/run.sh -s 60: the terminal's core against
+# alacritty_terminal, 60 s of the differential fuzzer, 0.23; skipped
+# without cargo);
 # valgrind (tests/valgrind.sh: the compiler under memcheck, 0.18.1; run by
 # --release in the linux-aarch64 container, where valgrind is);
 # linux-x86_64 (bootstrap/linux-check.sh); linux-aarch64
@@ -174,13 +177,13 @@ esac
 
 FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-seed"
 ABI_STEPS="abi-plain abi-import abi-header"
-HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc"
+HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc voltty-fuzz"
 LINUX_STEPS="linux-x86_64 linux-aarch64"
 # (steps only --only names: valgrind runs in the linux-aarch64 container)
 OTHER_STEPS="valgrind"
 [ "$X86" = 1 ] || LINUX_STEPS="linux-aarch64"
 case "$MODE" in
-    quick) STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch" ;;
+    quick) STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz" ;;
     *) STEPS="$HOST_STEPS"; [ $LINUX -eq 1 ] && STEPS="$STEPS $LINUX_STEPS" ;;
 esac
 if [ -n "$ONLY" ]; then
@@ -331,6 +334,7 @@ run_step() {
         debug) sh "$ROOT/tests/debug.sh" -c "$C" ;;
         threads) sh "$ROOT/tests/threads_writes.sh" -c "$C" && sh "$ROOT/tests/threads.sh" -c "$C" ;;
         incremental) sh "$ROOT/tests/incremental.sh" -c "$C" ;;
+        voltty-fuzz) sh "$ROOT/tests/voltty/run.sh" -c "$C" -s 60 -k "$k" ;;
         stress-grow)
             # (0.14) The compiler with TACHYON_STRESS_GROW=1 (base::grow):
             # every growth of its tables moves them and poisons the old
@@ -518,6 +522,7 @@ note_of() {
         suite-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed\n", $2, $3, $4 }' "$l" ;;
         fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind)
             grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind):' "$l" | tail -1 ;;
+        voltty-fuzz) grep -E '^(pass|FAIL|skip) oracle' "$l" | tail -1 ;;
         linux-*) grep '^gate-row' "$l" | awk -F'\t' '$3 != "pass" && $3 != "skip" { bad = bad " " $2 } END { n = NR; print n " steps in the container" (bad == "" ? "" : "; failed:" bad) }' ;;
         bench) grep '^geomean' "$l" | tail -1 ;;
     esac
@@ -557,7 +562,7 @@ for s in $([ $CHAIN -eq 1 ] && echo chain) $STEPS $([ $BENCH -eq 1 ] && echo ben
     [ -f "$l" ] || { echo "    not run (the chain failed)"; continue; }
     case "$s" in
         suite-*|examples-checkalloc) awk '/^tests for / { exit } { print }' "$l" | head -60 ;;
-        fuzz-*|abi-*|objcheck|objcheck-*|threads|incremental) grep -E '^FAIL' "$l" | head -20; [ -d "$RUN/failures/$s" ] && echo "    kept in $RUN/failures/$s" ;;
+        fuzz-*|abi-*|objcheck|objcheck-*|threads|incremental|voltty-fuzz) grep -E '^FAIL' "$l" | head -20; [ -d "$RUN/failures/$s" ] && echo "    kept in $RUN/failures/$s" ;;
         linux-*) awk '/^--- / { p = 1 } p' "$l" | head -80; grep -q '^--- ' "$l" || tail -30 "$l" ;;
         *) tail -30 "$l" ;;
     esac

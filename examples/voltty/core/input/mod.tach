@@ -1,0 +1,548 @@
+// The input encoders: what a key, the mouse, a paste or a focus change
+// sends to the program, for the terminal's modes (term::mod's mode bits).
+// Pure functions: they append to a Buf and allocate through it only.
+//
+// The encodings are Alacritty 0.17's (alacritty/src/input: its default
+// bindings and `build_sequence`, without the kitty keyboard protocol),
+// with xterm's keypad application mode (DECKPAM), which Alacritty
+// ignores:
+//
+//   keys    xterm's: arrows, Home and End as CSI or SS3 by DECCKM; with
+//           modifiers `CSI 1;m X`; F1-F4 as SS3 P..S, F5-F20 `CSI n~`;
+//           Backspace DEL; Control with a letter C0, with @[\]^_ and space
+//           as xterm; Alt (Option, per side on macOS) as an ESC prefix
+//   mouse   modes 1000, 1002, 1003; X10 (up to 223), SGR (1006) and UTF-8
+//           (1005) coordinates; the wheel as buttons 64 and 65, or as
+//           arrow keys on the alternate screen (1007); Shift bypasses
+//   paste   bracketed (2004) with ESC and C1 bytes removed, else newlines
+//           as CR
+//   focus   CSI I and CSI O (1004)
+//
+// `run_table` reads a table of events (one per line) and prints the bytes
+// of each: tests/examples/voltty-keys.test.
+
+use crate::term::{
+    ALTERNATE_SCROLL, ALT_SCREEN, APP_CURSOR, APP_KEYPAD, BRACKETED_PASTE, FOCUS_IN_OUT, MOUSE_DRAG,
+    MOUSE_MODE, MOUSE_MOTION, SGR_MOUSE, UTF8_MOUSE,
+};
+use crate::term::dump::escape_bytes;
+use crate::vt::utf8;
+use std::Buf;
+
+// Modifiers, as the escape sequences count them (the parameter is 1 + these).
+pub const SHIFT: u8 = 1;
+pub const ALT: u8 = 2;
+pub const CTRL: u8 = 4;
+pub const SUPER: u8 = 8;
+
+// Named keys; 0 is a character key.
+pub const KEY_CHAR: i64 = 0;
+pub const KEY_UP: i64 = 1;
+pub const KEY_DOWN: i64 = 2;
+pub const KEY_RIGHT: i64 = 3;
+pub const KEY_LEFT: i64 = 4;
+pub const KEY_HOME: i64 = 5;
+pub const KEY_END: i64 = 6;
+pub const KEY_PAGE_UP: i64 = 7;
+pub const KEY_PAGE_DOWN: i64 = 8;
+pub const KEY_INSERT: i64 = 9;
+pub const KEY_DELETE: i64 = 10;
+pub const KEY_BACKSPACE: i64 = 11;
+pub const KEY_TAB: i64 = 12;
+pub const KEY_ENTER: i64 = 13;
+pub const KEY_ESCAPE: i64 = 14;
+// F1..F20 are KEY_F1 + 0..19.
+pub const KEY_F1: i64 = 100;
+
+// A key press: a named key, or the character the layout produced (with
+// Shift applied); `keypad` for the numeric keypad's keys.
+pub struct Key {
+    pub named: i64,
+    pub ch: u32,
+    pub mods: u8,
+    pub keypad: bool,
+}
+
+// The bytes a key sends. `alt_is_meta`: Alt (macOS's Option) sends ESC
+// first; when false the character the layout composed is sent as is.
+pub fn encode_key(k: Key, mode: u32, alt_is_meta: bool, out: &mut Buf) {
+    let mods = if alt_is_meta { k.mods } else { k.mods & ~ALT };
+    if k.named == KEY_CHAR {
+        if k.keypad && (mode & APP_KEYPAD) != 0 && keypad_app(k.ch, out) {
+            return;
+        }
+        encode_char(k.ch, mods, out);
+        return;
+    }
+    let n = k.named;
+    let plain = mods == 0;
+    // The keys whose bytes are fixed (Alacritty's bindings).
+    if n == KEY_BACKSPACE {
+        if (mods & ALT) != 0 {
+            out.push(0x1B);
+        }
+        out.push(if (mods & CTRL) != 0 { 0x08 } else { 0x7F });
+        return;
+    }
+    if n == KEY_TAB {
+        if (mods & SHIFT) != 0 {
+            if (mods & ALT) != 0 {
+                out.push(0x1B);
+            }
+            out.push_str("\x1b[Z");
+            return;
+        }
+        if (mods & ALT) != 0 {
+            out.push(0x1B);
+        }
+        out.push('\t');
+        return;
+    }
+    if n == KEY_ENTER {
+        if k.keypad && (mode & APP_KEYPAD) != 0 {
+            out.push_str("\x1bOM");
+            return;
+        }
+        if (mods & ALT) != 0 {
+            out.push(0x1B);
+        }
+        out.push(if k.keypad { '\n' } else { '\r' });
+        return;
+    }
+    if n == KEY_ESCAPE {
+        if (mods & ALT) != 0 {
+            out.push(0x1B);
+        }
+        out.push(0x1B);
+        return;
+    }
+    // Cursor keys: SS3 in application mode, without modifiers.
+    let cursor = n == KEY_UP || n == KEY_DOWN || n == KEY_RIGHT || n == KEY_LEFT || n == KEY_HOME
+        || n == KEY_END;
+    if cursor && plain && (mode & APP_CURSOR) != 0 {
+        out.push_str("\x1bO");
+        out.push(cursor_final(n));
+        return;
+    }
+    if n >= KEY_F1 && n < KEY_F1 + 4 && plain {
+        out.push_str("\x1bO");
+        out.push(('P' + (n - KEY_F1) as u8) as u8);
+        return;
+    }
+    // `CSI [base] [;mods] final`.
+    let mut fin: u8 = '~';
+    let mut base = -1;
+    if cursor {
+        fin = cursor_final(n);
+    } else if n >= KEY_F1 && n < KEY_F1 + 4 {
+        fin = ('P' + (n - KEY_F1) as u8) as u8;
+    } else if n == KEY_PAGE_UP {
+        base = 5;
+    } else if n == KEY_PAGE_DOWN {
+        base = 6;
+    } else if n == KEY_INSERT {
+        base = 2;
+    } else if n == KEY_DELETE {
+        base = 3;
+    } else if n >= KEY_F1 + 4 && n < KEY_F1 + 20 {
+        let codes: [i64; 16] = [15, 17, 18, 19, 20, 21, 23, 24, 25, 26, 28, 29, 31, 32, 33, 34];
+        base = codes[n - KEY_F1 - 4];
+    } else {
+        // Not a key with a sequence.
+        return;
+    }
+    out.push_str("\x1b[");
+    if base >= 0 {
+        out.push_int(base);
+    } else if mods != 0 {
+        out.push('1');
+    }
+    if mods != 0 {
+        out.push(';');
+        out.push_int(mods as i64 + 1);
+    }
+    out.push(fin);
+}
+
+fn cursor_final(n: i64) -> u8 {
+    if n == KEY_UP {
+        'A'
+    } else if n == KEY_DOWN {
+        'B'
+    } else if n == KEY_RIGHT {
+        'C'
+    } else if n == KEY_LEFT {
+        'D'
+    } else if n == KEY_HOME {
+        'H'
+    } else {
+        'F'
+    }
+}
+
+// xterm's keypad in application mode: `ESC O` and a letter.
+fn keypad_app(c: u32, out: &mut Buf) -> bool {
+    let mut f: u8 = 0;
+    if c >= '0' as u32 && c <= '9' as u32 {
+        f = 'p' + (c - '0' as u32) as u8;
+    } else if c == '+' as u32 {
+        f = 'k';
+    } else if c == '-' as u32 {
+        f = 'm';
+    } else if c == '*' as u32 {
+        f = 'j';
+    } else if c == '/' as u32 {
+        f = 'o';
+    } else if c == '.' as u32 {
+        f = 'n';
+    } else if c == '=' as u32 {
+        f = 'X';
+    } else if c == ',' as u32 {
+        f = 'l';
+    } else {
+        return false;
+    }
+    out.push_str("\x1bO");
+    out.push(f);
+    true
+}
+
+// A character key: Control maps to C0 as xterm does, Alt prefixes ESC.
+fn encode_char(c: u32, mods: u8, out: &mut Buf) {
+    let mut ch = c;
+    if (mods & CTRL) != 0 {
+        let k = ctrl_char(c);
+        if k >= 0 {
+            ch = k as u32;
+        }
+    }
+    if (mods & ALT) != 0 {
+        out.push(0x1B);
+    }
+    let mut tmp: [u8; 4] = [0; 4];
+    let n = utf8::encode(ch, &mut tmp[..], 0);
+    out.push_str(tmp[0..n]);
+}
+
+// The C0 control Control with `c` sends (xterm), or -1.
+pub fn ctrl_char(c: u32) -> i64 {
+    if c >= 'a' as u32 && c <= 'z' as u32 {
+        return (c - 'a' as u32 + 1) as i64;
+    }
+    if c >= 'A' as u32 && c <= 'Z' as u32 {
+        return (c - 'A' as u32 + 1) as i64;
+    }
+    if c == '@' as u32 || c == ' ' as u32 || c == '2' as u32 {
+        return 0;
+    }
+    if c == '[' as u32 || c == '3' as u32 {
+        return 0x1B;
+    }
+    if c == '\\' as u32 || c == '4' as u32 {
+        return 0x1C;
+    }
+    if c == ']' as u32 || c == '5' as u32 {
+        return 0x1D;
+    }
+    if c == '^' as u32 || c == '6' as u32 || c == '~' as u32 {
+        return 0x1E;
+    }
+    if c == '_' as u32 || c == '7' as u32 || c == '/' as u32 {
+        return 0x1F;
+    }
+    if c == '?' as u32 || c == '8' as u32 {
+        return 0x7F;
+    }
+    -1
+}
+
+// ---- the mouse ----
+
+// Buttons: 0 left, 1 middle, 2 right; the wheel 64 up, 65 down, 66 left,
+// 67 right.
+pub const WHEEL_UP: i64 = 64;
+pub const WHEEL_DOWN: i64 = 65;
+
+// A press, a release or a motion (with `button` held, or -1 for none) at
+// a cell of the screen. Returns whether it was reported (the mouse modes,
+// and Shift, which bypasses them for selection).
+pub fn encode_mouse(button: i64, pressed: bool, motion: bool, line: i64, col: i64, mods: u8,
+    mode: u32, out: &mut Buf) -> bool {
+    if (mode & MOUSE_MODE) == 0 || (mods & SHIFT) != 0 || line < 0 {
+        return false;
+    }
+    let mut code = button;
+    if motion {
+        // Drags in 1002 and 1003, bare motion in 1003 only.
+        if (mode & (MOUSE_MOTION | MOUSE_DRAG)) == 0 {
+            return false;
+        }
+        if button < 0 {
+            if (mode & MOUSE_MOTION) == 0 {
+                return false;
+            }
+            code = 35;
+        } else {
+            code = 32 + button;
+        }
+    }
+    let mut m = 0;
+    if (mods & SHIFT) != 0 {
+        m += 4;
+    }
+    if (mods & ALT) != 0 {
+        m += 8;
+    }
+    if (mods & CTRL) != 0 {
+        m += 16;
+    }
+    if (mode & SGR_MOUSE) != 0 {
+        out.push_str("\x1b[<");
+        out.push_int(code + m);
+        out.push(';');
+        out.push_int(col + 1);
+        out.push(';');
+        out.push_int(line + 1);
+        out.push(if pressed || motion { 'M' } else { 'm' });
+        return true;
+    }
+    if !pressed && !motion {
+        code = 3;
+    }
+    let utf8_mode = (mode & UTF8_MOUSE) != 0;
+    let max = if utf8_mode { 2015 } else { 223 };
+    if line >= max || col >= max {
+        return false;
+    }
+    out.push_str("\x1b[M");
+    out.push((32 + code + m) as u8);
+    mouse_pos(col, utf8_mode, out);
+    mouse_pos(line, utf8_mode, out);
+    true
+}
+
+fn mouse_pos(p: i64, utf8_mode: bool, out: &mut Buf) {
+    if utf8_mode && p >= 95 {
+        let v = 32 + 1 + p;
+        out.push((0xC0 + v / 64) as u8);
+        out.push((0x80 + (v & 63)) as u8);
+    } else {
+        out.push((32 + 1 + p) as u8);
+    }
+}
+
+// `lines` wheel steps: reported as buttons in the mouse modes, as arrow
+// keys on the alternate screen with 1007, else nothing (the window
+// scrolls the scrollback: false).
+pub fn encode_wheel(up: bool, lines: i64, line: i64, col: i64, mods: u8, mode: u32,
+    out: &mut Buf) -> bool {
+    if (mode & MOUSE_MODE) != 0 && (mods & SHIFT) == 0 {
+        for _ in 0..lines {
+            encode_mouse(if up { WHEEL_UP } else { WHEEL_DOWN }, true, false, line, col, mods,
+                mode, out);
+        }
+        return true;
+    }
+    if (mode & ALT_SCREEN) != 0 && (mode & ALTERNATE_SCROLL) != 0 && (mods & SHIFT) == 0 {
+        for _ in 0..lines {
+            out.push_str(if up { "\x1bOA" } else { "\x1bOB" });
+        }
+        return true;
+    }
+    false
+}
+
+pub fn encode_focus(focused: bool, mode: u32, out: &mut Buf) {
+    if (mode & FOCUS_IN_OUT) != 0 {
+        out.push_str(if focused { "\x1b[I" } else { "\x1b[O" });
+    }
+}
+
+// A paste: in bracketed mode between `CSI 200~` and `CSI 201~`, with every
+// ESC and C1 byte (raw or UTF-8 encoded) removed so the text cannot end
+// the bracket; otherwise with `\r\n` and `\n` as `\r`.
+pub fn encode_paste(text: [u8], mode: u32, out: &mut Buf) {
+    if (mode & BRACKETED_PASTE) != 0 {
+        out.push_str("\x1b[200~");
+        let mut i = 0;
+        while i < text.len {
+            let b = text[i];
+            if b == 0x1B || (b >= 0x80 && b <= 0x9F) {
+                i += 1;
+                continue;
+            }
+            if b == 0xC2 && i + 1 < text.len && text[i + 1] >= 0x80 && text[i + 1] <= 0x9F {
+                i += 2;
+                continue;
+            }
+            out.push(b);
+            i += 1;
+        }
+        out.push_str("\x1b[201~");
+        return;
+    }
+    let mut i = 0;
+    while i < text.len {
+        let b = text[i];
+        if b == '\r' && i + 1 < text.len && text[i + 1] == '\n' {
+            out.push('\r');
+            i += 2;
+        } else if b == '\n' {
+            out.push('\r');
+            i += 1;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+}
+
+// ---- the table ----
+
+fn mode_word(w: [u8]) -> u32 {
+    if w == "app_cursor" {
+        APP_CURSOR
+    } else if w == "app_keypad" {
+        APP_KEYPAD
+    } else if w == "click" {
+        crate::term::MOUSE_REPORT_CLICK
+    } else if w == "drag" {
+        MOUSE_DRAG
+    } else if w == "anymotion" {
+        MOUSE_MOTION
+    } else if w == "sgr" {
+        SGR_MOUSE
+    } else if w == "utf8" {
+        UTF8_MOUSE
+    } else if w == "bracketed" {
+        BRACKETED_PASTE
+    } else if w == "focus" {
+        FOCUS_IN_OUT
+    } else if w == "alt_screen" {
+        ALT_SCREEN | ALTERNATE_SCROLL
+    } else {
+        0
+    }
+}
+
+fn mod_word(w: [u8]) -> u8 {
+    if w == "shift" {
+        SHIFT
+    } else if w == "alt" {
+        ALT
+    } else if w == "ctrl" {
+        CTRL
+    } else if w == "super" {
+        SUPER
+    } else {
+        0
+    }
+}
+
+fn key_name(w: [u8]) -> i64 {
+    let names = ["", "Up", "Down", "Right", "Left", "Home", "End", "PageUp", "PageDown", "Insert",
+        "Delete", "Backspace", "Tab", "Enter", "Escape"];
+    for i in 1..names.len() {
+        if w == names[i] {
+            return i;
+        }
+    }
+    if w.len >= 2 && w[0] == 'F' {
+        let n = parse_int(w[1..]).unwrap_or(0);
+        if n >= 1 && n <= 20 {
+            return KEY_F1 + n - 1;
+        }
+    }
+    -1
+}
+
+// One event per line, then its bytes (escaped) on a line of their own:
+//   key NAME|CHAR [shift alt ctrl super] [keypad] [nometa] [modes]
+//   mouse BUTTON press|release|motion LINE COL [mods] [modes]
+//   (modes: app_cursor app_keypad click drag anymotion sgr utf8
+//   bracketed focus alt_screen)
+//   wheel up|down LINES [mods] [modes]
+//   paste TEXT [modes]          (TEXT with \n, \r, \e, \xNN escapes)
+//   focus in|out [modes]
+pub fn run_table(input: [u8], gpa: Gpa) -> i32 {
+    let mut out = Buf::new_in(gpa);
+    let mut bytes = Buf::new_in(gpa);
+    let mut at = 0;
+    while at < input.len {
+        let mut nl = at;
+        while nl < input.len && input[nl] != '\n' {
+            nl += 1;
+        }
+        let line = input[at..nl];
+        at = nl + 1;
+        if line.len == 0 || line[0] == '#' {
+            continue;
+        }
+        let words = split_in(line, ' ', gpa);
+        bytes.clear();
+        let mut mode: u32 = 0;
+        let mut mods: u8 = 0;
+        let mut keypad = false;
+        let mut meta = true;
+        // (the words after the event's own: mouse has four, the others one)
+        let first = if words[0] == "mouse" { 5 } else { 2 };
+        for i in first..words.len() {
+            mode = mode | mode_word(words[i]);
+            mods = mods | mod_word(words[i]);
+            if words[i] == "keypad" {
+                keypad = true;
+            }
+            if words[i] == "nometa" {
+                meta = false;
+            }
+        }
+        let kind = words[0];
+        let mut ok = true;
+        if kind == "key" && words.len() >= 2 {
+            let w = words[1];
+            let named = key_name(w);
+            if named > 0 {
+                encode_key(Key { named: named, ch: 0, mods: mods, keypad: keypad }, mode, meta,
+                    &mut bytes);
+            } else {
+                let mut err = 0;
+                utf8::validate(w, &mut err);
+                let n = utf8::char_len(w[0]);
+                let mut c = if n == 1 { w[0] as u32 } else { utf8::decode(w[0..n], n) };
+                if w == "space" {
+                    c = ' ' as u32;
+                }
+                encode_key(Key { named: KEY_CHAR, ch: c, mods: mods, keypad: keypad }, mode, meta,
+                    &mut bytes);
+            }
+        } else if kind == "mouse" && words.len() >= 5 {
+            let button = parse_int(words[1]).unwrap_or(-1);
+            let act = words[2];
+            let l = parse_int(words[3]).unwrap_or(0);
+            let c = parse_int(words[4]).unwrap_or(0);
+            ok = encode_mouse(button, act == "press", act == "motion", l, c, mods, mode,
+                &mut bytes);
+        } else if kind == "wheel" && words.len() >= 3 {
+            let n = parse_int(words[2]).unwrap_or(1);
+            ok = encode_wheel(words[1] == "up", n, 0, 0, mods, mode, &mut bytes);
+        } else if kind == "paste" && words.len() >= 2 {
+            let text = crate::unescape(words[1], gpa);
+            encode_paste(text.as_slice(), mode, &mut bytes);
+        } else if kind == "focus" && words.len() >= 2 {
+            encode_focus(words[1] == "in", mode, &mut bytes);
+        } else {
+            eprintln(f"voltty: bad table line: {line}");
+            return 2;
+        }
+        out.push_str(line);
+        out.push_str("\n  ");
+        if ok {
+            escape_bytes(&mut out, bytes.as_slice());
+        } else {
+            out.push_str("(not reported)");
+        }
+        out.push('\n');
+    }
+    print(out.as_slice());
+    0
+}

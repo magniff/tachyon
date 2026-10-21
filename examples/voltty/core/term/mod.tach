@@ -1,0 +1,1023 @@
+// The terminal state: two grids (primary with scrollback, alternate
+// without), the modes, tab stops, the scroll region, charsets, colours,
+// the title; it implements vt::Perform. Its behaviour is Alacritty's
+// (alacritty_terminal 0.26's `Term`), checked against it by the oracle
+// (examples/voltty/core/oracle, tests/voltty): the control functions are in
+// ops.tach, resize and reflow in reflow.tach, the dump in dump.tach.
+//
+// Pure: it allocates from the allocator given to `new_in` and does no
+// I/O. What it sends back to the program (DSR and DA replies) collects in
+// `reply`; the window's work (the title, the bell, the clipboard) in
+// fields the event loop reads and clears.
+//
+// 0.17: `impl Drop for Term` frees the grids; methods take `&mut self`.
+
+pub mod cell;
+pub mod dump;
+pub mod extra;
+pub mod grid;
+pub mod ops;
+pub mod reflow;
+
+use cell::{
+    Cell, DEFAULT_BG, DEFAULT_FG, LEADING_WIDE_CHAR_SPACER, WIDE_CHAR, WIDE_CHAR_SPACER, WRAPLINE,
+    make,
+};
+use crate::vt::{Osc, Parser, Perform};
+use crate::vt::params::Params;
+use extra::Extras;
+use grid::{Grid, NO_COLOR};
+use std::Buf;
+use std::unicode::char_width;
+
+// Alacritty's `TermMode` bits.
+pub const SHOW_CURSOR: u32 = 0x1;
+pub const APP_CURSOR: u32 = 0x2;
+pub const APP_KEYPAD: u32 = 0x4;
+pub const MOUSE_REPORT_CLICK: u32 = 0x8;
+pub const BRACKETED_PASTE: u32 = 0x10;
+pub const SGR_MOUSE: u32 = 0x20;
+pub const MOUSE_MOTION: u32 = 0x40;
+pub const LINE_WRAP: u32 = 0x80;
+pub const LINE_FEED_NEW_LINE: u32 = 0x100;
+pub const ORIGIN: u32 = 0x200;
+pub const INSERT: u32 = 0x400;
+pub const FOCUS_IN_OUT: u32 = 0x800;
+pub const ALT_SCREEN: u32 = 0x1000;
+pub const MOUSE_DRAG: u32 = 0x2000;
+pub const UTF8_MOUSE: u32 = 0x4000;
+pub const ALTERNATE_SCROLL: u32 = 0x8000;
+pub const URGENCY_HINTS: u32 = 0x20000;
+pub const MOUSE_MODE: u32 = 0x8 | 0x40 | 0x2000;
+pub const DEFAULT_MODE: u32 = 0x1 | 0x80 | 0x8000 | 0x20000;
+
+// Cursor shapes (DECSCUSR, OSC 50).
+pub const SHAPE_BLOCK: u8 = 0;
+pub const SHAPE_UNDERLINE: u8 = 1;
+pub const SHAPE_BEAM: u8 = 2;
+
+pub const COLOR_COUNT: i64 = 269;
+pub const SYNC_BUFFER_SIZE: i64 = 0x200000;
+pub const TITLE_STACK_MAX: i64 = 4096;
+
+pub struct Term {
+    pub grid: Grid,
+    // The other screen (Alacritty's `inactive_grid`).
+    pub inactive: Grid,
+    pub mode: u32,
+    pub active_charset: i64,
+    pub tabs: Vec<bool>,
+    // The scroll region, lines [region_top, region_bot).
+    pub region_top: i64,
+    pub region_bot: i64,
+    // OSC 4/10/11/12 colours: an RGB value, or -1 for the default.
+    pub colors: Vec<i64>,
+    // DECSCUSR's style, when set (Alacritty's `Option<CursorStyle>`).
+    pub style_set: bool,
+    pub style_shape: u8,
+    pub style_blink: bool,
+    // The title (OSC 0/2), and the one last reported to the window: RIS
+    // forgets the first without telling the second, as Alacritty.
+    pub title: Buf,
+    pub has_title: bool,
+    pub shown_title: Buf,
+    pub has_shown_title: bool,
+    pub title_changed: bool,
+    pub title_stack: Vec<Buf>,
+    pub title_stack_set: Vec<bool>,
+    // Bytes for the program (replies to DSR, DA, DECRQM, OSC queries).
+    pub reply: Buf,
+    // Colour queries, answered at the end of `feed` with the colours as
+    // they are then (as Alacritty's window answers them): the reply's
+    // length when asked, the colour index, the prefix, the terminator.
+    pending_at: Vec<i64>,
+    pending_index: Vec<i64>,
+    pending_prefix: Vec<i64>,
+    pending_st: Vec<bool>,
+    // OSC 52 stores: `c` or `s`, then the text.
+    pub clip_kind: Vec<u8>,
+    pub clip_text: Vec<Buf>,
+    pub bells: i64,
+    // A synchronized update (mode 2026, vte's): from `CSI ? 2026 h` the
+    // bytes wait in `sync_buf` until `CSI ? 2026 l`, 2 MiB, or the event
+    // loop's 150 ms (`stop_sync`); `sync_armed` is set each time the
+    // timeout is (re)started, for the event loop to note the time.
+    pub sync: bool,
+    pub sync_armed: bool,
+    sync_buf: Vec<u8>,
+    // The parser stops after the sequence that began one.
+    terminated: bool,
+    pub extras: Extras,
+    // The extra of the cursor's template, made when first written.
+    tmpl_extra: i64,
+    tmpl_extra_ok: bool,
+    // Widths of recent characters (a direct-mapped cache over std's
+    // three-level table): the code point at each slot, its width.
+    wcache_key: [u32; 256],
+    wcache_w: [i8; 256],
+    // The last character printed, for REP.
+    preceding: u32,
+    has_preceding: bool,
+    // The window's cell size in pixels, for CSI 14 t (0: no window).
+    pub cell_width: i64,
+    pub cell_height: i64,
+    gpa: Gpa,
+}
+
+impl Term {
+    pub fn new_in(lines: i64, cols: i64, history: i64, gpa: Gpa) -> Term {
+        let mut t = Term {
+            grid: Grid::new_in(lines, cols, history, gpa),
+            inactive: Grid::new_in(lines, cols, 0, gpa),
+            mode: DEFAULT_MODE,
+            active_charset: 0,
+            tabs: Vec::new_in(gpa),
+            region_top: 0,
+            region_bot: lines,
+            colors: Vec::new_in(gpa),
+            style_set: false,
+            style_shape: SHAPE_BLOCK,
+            style_blink: false,
+            title: Buf::new_in(gpa),
+            has_title: false,
+            shown_title: Buf::new_in(gpa),
+            has_shown_title: false,
+            title_changed: false,
+            title_stack: Vec::new_in(gpa),
+            title_stack_set: Vec::new_in(gpa),
+            reply: Buf::new_in(gpa),
+            pending_at: Vec::new_in(gpa),
+            pending_index: Vec::new_in(gpa),
+            pending_prefix: Vec::new_in(gpa),
+            pending_st: Vec::new_in(gpa),
+            clip_kind: Vec::new_in(gpa),
+            clip_text: Vec::new_in(gpa),
+            bells: 0,
+            sync: false,
+            sync_armed: false,
+            sync_buf: Vec::new_in(gpa),
+            terminated: false,
+            extras: Extras::new_in(gpa),
+            tmpl_extra: 0,
+            tmpl_extra_ok: false,
+            wcache_key: [0xFFFFFFFF; 256],
+            wcache_w: [0; 256],
+            preceding: 0,
+            has_preceding: false,
+            cell_width: 0,
+            cell_height: 0,
+            gpa: gpa,
+        };
+        for i in 0..cols {
+            t.tabs.push(i % 8 == 0);
+        }
+        for _ in 0..COLOR_COUNT {
+            t.colors.push(-1);
+        }
+        t
+    }
+
+    pub fn free(self: &mut Term) {
+        self.grid.free();
+        self.inactive.free();
+        self.tabs.free();
+        self.colors.free();
+        self.title.free();
+        self.shown_title.free();
+        for i in 0..self.title_stack.len() {
+            self.title_stack[i].free();
+        }
+        self.title_stack.free();
+        self.title_stack_set.free();
+        self.reply.free();
+        self.pending_at.free();
+        self.pending_index.free();
+        self.pending_prefix.free();
+        self.pending_st.free();
+        self.clear_clips();
+        self.clip_kind.free();
+        self.clip_text.free();
+        self.sync_buf.free();
+        self.extras.free();
+    }
+
+    pub fn clear_clips(self: &mut Term) {
+        for i in 0..self.clip_text.len() {
+            self.clip_text[i].free();
+        }
+        self.clip_kind.clear();
+        self.clip_text.clear();
+    }
+
+    pub fn lines(self: &mut Term) -> i64 {
+        self.grid.lines
+    }
+
+    pub fn cols(self: &mut Term) -> i64 {
+        self.grid.cols
+    }
+
+    // Feeds the program's output through `parser` (vte's
+    // `Processor::advance`, synchronized updates included), then answers
+    // the colour queries it asked.
+    pub fn feed(self: &mut Term, parser: &mut Parser, bytes: [u8]) {
+        let mut done = 0;
+        while done < bytes.len {
+            if self.sync {
+                done += self.advance_sync(parser, bytes[done..]);
+            } else {
+                self.terminated = false;
+                done += parser.advance_until_terminated(self, bytes[done..]);
+            }
+        }
+        if self.pending_at.len() > 0 {
+            self.answer_color_queries();
+        }
+    }
+
+    // Ends a synchronized update: the bytes held are parsed (the event
+    // loop calls it 150 ms after `sync_armed`; the dump calls it first).
+    pub fn stop_sync(self: &mut Term, parser: &mut Parser) {
+        if self.sync || self.sync_buf.len() > 0 {
+            self.stop_sync_at(parser, -1);
+            if self.pending_at.len() > 0 {
+                self.answer_color_queries();
+            }
+        }
+    }
+
+    // vte's `advance_sync`: bytes held, unless they would pass 2 MiB.
+    fn advance_sync(self: &mut Term, parser: &mut Parser, bytes: [u8]) -> i64 {
+        if self.sync_buf.len() + bytes.len >= SYNC_BUFFER_SIZE - 1 {
+            self.stop_sync_at(parser, -1);
+            self.terminated = false;
+            return parser.advance_until_terminated(self, bytes);
+        }
+        self.sync_buf.extend_from_slice(bytes);
+        self.advance_sync_csi(parser, bytes.len);
+        bytes.len
+    }
+
+    // vte's `advance_sync_csi`: a `CSI ? 2026 h` among the new bytes
+    // extends the update, a `CSI ? 2026 l` ends it (the last one found,
+    // searching back, decides).
+    fn advance_sync_csi(self: &mut Term, parser: &mut Parser, new_bytes: i64) {
+        let len = self.sync_buf.len();
+        let mut start = len - new_bytes - 7;
+        if start < 0 {
+            start = 0;
+        }
+        let mut end = len - 7;
+        if end < 0 {
+            end = 0;
+        }
+        let mut bsu = -1;
+        let mut k = end - 1;
+        while k >= start {
+            let buf = self.sync_buf.as_slice();
+            if buf[k] == 0x1B {
+                let esc = buf[k..k + 8];
+                if esc == "\x1b[?2026h" {
+                    self.sync_armed = true;
+                    bsu = k;
+                } else if esc == "\x1b[?2026l" {
+                    self.stop_sync_at(parser, bsu);
+                    return;
+                }
+            }
+            k -= 1;
+        }
+    }
+
+    // vte's `stop_sync_internal`: the held bytes parsed, up to `bsu` when
+    // a new update begins there (it stays held), else all of them.
+    fn stop_sync_at(self: &mut Term, parser: &mut Parser, bsu: i64) {
+        let held = self.sync_buf.take();
+        let upto = if bsu >= 0 { bsu } else { held.len() };
+        parser.advance(self, held.as_slice()[0..upto]);
+        let mut kept = held;
+        if bsu >= 0 {
+            let rest = kept.len() - bsu;
+            for i in 0..rest {
+                let b = kept[bsu + i];
+                kept[i] = b;
+            }
+            kept.truncate(rest);
+            self.sync_buf = kept;
+        } else {
+            kept.free();
+            self.sync = false;
+        }
+    }
+
+    // The cells of screen line `l` (0 at the top), for the renderer.
+    pub fn row(self: &Term, l: i64) -> [Cell] {
+        self.grid.row(l)
+    }
+
+    // ---- the cursor's template and the extras ----
+
+    #[inline]
+
+    fn tmpl_extra_id(self: &mut Term) -> i64 {
+        if !self.tmpl_extra_ok {
+            let c = self.grid.cursor;
+            if c.ul == NO_COLOR && c.link == 0 {
+                self.tmpl_extra = 0;
+            } else {
+                self.collect_if_due();
+                self.tmpl_extra = self.extras.make(c.ul, c.link, false);
+            }
+            self.tmpl_extra_ok = true;
+        }
+        self.tmpl_extra
+    }
+
+    // The template changed (its underline colour or hyperlink), or the
+    // cursor was restored or swapped.
+    pub fn tmpl_changed(self: &mut Term) {
+        self.tmpl_extra_ok = false;
+    }
+
+    #[inline]
+
+    fn collect_if_due(self: &mut Term) {
+        if self.extras.wants_collect() {
+            self.collect();
+        }
+    }
+
+    // Mark and sweep of the extras: every cell of both screens, the
+    // cursors' hyperlinks.
+    pub fn collect(self: &mut Term) {
+        self.extras.unmark();
+        mark_grid(&mut self.extras, &mut self.grid);
+        mark_grid(&mut self.extras, &mut self.inactive);
+        self.extras.sweep();
+        self.tmpl_extra_ok = false;
+    }
+
+    // The combining characters of the active screen's cell `i` (an index
+    // into its cells) are about to change: its own extra.
+    fn own_extra(self: &mut Term, i: i64) -> i64 {
+        let id = self.grid.cells[i].extra_id();
+        if id != 0 && self.extras.entries[id].owned {
+            return id;
+        }
+        self.collect_if_due();
+        let n = self.extras.own(id);
+        self.grid.cells[i].set_extra(n);
+        n
+    }
+
+    // Alacritty's `Cell::is_empty`.
+    pub fn cell_empty(self: &Term, c: Cell) -> bool {
+        grid::is_empty(c) && !self.extras.has_zw(c.extra_id())
+    }
+
+    // Alacritty's `Cell::clear_wide`, on the active screen's cell `i`.
+    fn clear_wide(self: &mut Term, i: i64) {
+        self.grid.cells[i].flags = self.grid.cells[i].flags & ~WIDE_CHAR;
+        if self.extras.has_zw(self.grid.cells[i].extra_id()) {
+            let id = self.own_extra(i);
+            self.extras.entries[id].zw.clear();
+        }
+        self.grid.cells[i].set_char(32);
+    }
+
+    // ---- printing ----
+
+    // Alacritty's `write_at_cursor`: the template's cell at the cursor,
+    // after undoing the wide character it overwrites.
+    fn write_at_cursor(self: &mut Term, c: u32) {
+        let mut ch = c;
+        if self.grid.cursor.charsets[self.active_charset] == 1 {
+            ch = dec_graphics(c);
+        }
+        let line = self.grid.cursor.line;
+        let col = self.grid.cursor.col;
+        let b = self.grid.start(line);
+        self.grid.touch(line, col + 1);
+        let old = self.grid.cells[b + col].flags;
+        if (old & (WIDE_CHAR | WIDE_CHAR_SPACER)) != 0 {
+            let last = self.grid.cols - 1;
+            if (old & WIDE_CHAR) != 0 && col < last {
+                let f = self.grid.cells[b + col + 1].flags;
+                self.grid.cells[b + col + 1].flags = f & ~WIDE_CHAR_SPACER;
+                self.grid.touch(line, col + 2);
+            } else if col > 0 {
+                self.clear_wide(b + col - 1);
+            }
+            if col <= 1 && line != self.grid.topmost() {
+                let a = self.grid.start(line - 1) + last;
+                let f = self.grid.cells[a].flags;
+                self.grid.cells[a].flags = f & ~LEADING_WIDE_CHAR_SPACER;
+                self.grid.touch(line - 1, last + 1);
+            }
+        }
+        let x = self.tmpl_extra_id();
+        let cur = self.grid.cursor;
+        self.grid.cells[b + col] = make(ch, cur.fg, cur.bg, cur.flags, x);
+        self.grid.damage_line(line, col, col);
+    }
+
+    // Alacritty's `wrapline`.
+    pub fn wrapline(self: &mut Term) {
+        if (self.mode & LINE_WRAP) == 0 {
+            return;
+        }
+        let line = self.grid.cursor.line;
+        let col = self.grid.cursor.col;
+        let i = self.grid.start(line) + col;
+        self.grid.cells[i].flags = self.grid.cells[i].flags | WRAPLINE;
+        self.grid.touch(line, col + 1);
+        if self.grid.cursor.line + 1 >= self.region_bot {
+            self.linefeed();
+        } else {
+            self.grid.cursor.line += 1;
+        }
+        self.grid.cursor.col = 0;
+        self.grid.cursor.needs_wrap = false;
+    }
+
+    // The columns `c` takes: std::unicode's width (3 counts as 2), or -1.
+    #[inline]
+    fn width(self: &mut Term, c: u32) -> i64 {
+        let k = (c & 255) as i64;
+        if self.wcache_key[k] == c {
+            return self.wcache_w[k] as i64;
+        }
+        let mut w = char_width(c);
+        if w > 2 {
+            w = 2;
+        }
+        self.wcache_key[k] = c;
+        self.wcache_w[k] = w as i8;
+        w
+    }
+
+    // Alacritty's `Term::input`: one character.
+    pub fn input(self: &mut Term, c: u32) {
+        let w = self.width(c);
+        if w < 0 {
+            return;
+        }
+        if w == 0 {
+            // Combining: onto the cell before the cursor (the wide
+            // character's first cell when it is a spacer).
+            let line = self.grid.cursor.line;
+            let mut col = self.grid.cursor.col;
+            if !self.grid.cursor.needs_wrap && col > 0 {
+                col -= 1;
+            }
+            let b = self.grid.start(line);
+            if (self.grid.cells[b + col].flags & WIDE_CHAR_SPACER) != 0 && col > 0 {
+                col -= 1;
+            }
+            let id = self.own_extra(b + col);
+            self.extras.push_zw(id, c);
+            self.grid.touch(line, col + 1);
+            self.grid.damage_line(line, col, col);
+            return;
+        }
+        if self.grid.cursor.needs_wrap {
+            self.wrapline();
+        }
+        let cols = self.grid.cols;
+        // The common case in one go: not inserting, a character the
+        // charsets leave alone, its cells free of wide characters, room on
+        // the line.
+        let col = self.grid.cursor.col;
+        if (self.mode & INSERT) == 0 && c >= 0x80 && col + w < cols {
+            let line = self.grid.cursor.line;
+            let b = self.grid.start(line) + col;
+            let f0 = self.grid.cells[b].flags;
+            let f1 = self.grid.cells[b + w - 1].flags;
+            if ((f0 | f1) & (WIDE_CHAR | WIDE_CHAR_SPACER)) == 0 {
+                let x = self.tmpl_extra_id();
+                let cur = self.grid.cursor;
+                if w == 1 {
+                    self.grid.cells[b] = make(c, cur.fg, cur.bg, cur.flags, x);
+                } else {
+                    self.grid.cells[b] = make(c, cur.fg, cur.bg, cur.flags | WIDE_CHAR, x);
+                    self.grid.cells[b + 1] = make(32, cur.fg, cur.bg, cur.flags | WIDE_CHAR_SPACER,
+                        x);
+                }
+                self.grid.touch(line, col + w);
+                self.grid.damage_line(line, col, col + w - 1);
+                self.grid.cursor.col = col + w;
+                return;
+            }
+        }
+        if (self.mode & INSERT) != 0 && self.grid.cursor.col + w < cols {
+            let line = self.grid.cursor.line;
+            let start = self.grid.cursor.col;
+            let r = self.grid.row_mut(line, cols);
+            let mut col = cols - w - 1;
+            while col >= start {
+                let t = r[col + w];
+                r[col + w] = r[col];
+                r[col] = t;
+                col -= 1;
+            }
+            self.grid.damage_line(line, start, cols - 1);
+        }
+        if w == 1 {
+            self.write_at_cursor(c);
+        } else {
+            if self.grid.cursor.col + 1 >= cols {
+                if (self.mode & LINE_WRAP) != 0 {
+                    // The wide character does not fit: a leading spacer, then
+                    // the next line.
+                    let f = self.grid.cursor.flags;
+                    self.grid.cursor.flags = f | LEADING_WIDE_CHAR_SPACER;
+                    self.write_at_cursor(32);
+                    self.grid.cursor.flags = f;
+                    self.wrapline();
+                } else {
+                    self.grid.cursor.needs_wrap = true;
+                    return;
+                }
+            }
+            let f = self.grid.cursor.flags;
+            self.grid.cursor.flags = f | WIDE_CHAR;
+            self.write_at_cursor(c);
+            self.grid.cursor.col += 1;
+            self.grid.cursor.flags = f | WIDE_CHAR_SPACER;
+            self.write_at_cursor(32);
+            self.grid.cursor.flags = f;
+        }
+        if self.grid.cursor.col + 1 < cols {
+            self.grid.cursor.col += 1;
+        } else {
+            self.grid.cursor.needs_wrap = true;
+        }
+    }
+
+    // A run of printable ASCII: the cells of each line written in one
+    // loop, with the template's attributes. What `input` would do byte by
+    // byte, unless a byte meets a wide character, the insert mode or the
+    // DEC graphics charset: then it is done byte by byte.
+    fn ascii_run(self: &mut Term, run: [u8]) {
+        let n = run.len;
+        if n == 1 && (self.mode & INSERT) == 0 && !self.grid.cursor.needs_wrap
+            && self.grid.cursor.charsets[self.active_charset] == 0 {
+            // One byte (after a cursor motion, say): written directly.
+            let line = self.grid.cursor.line;
+            let col = self.grid.cursor.col;
+            let i = self.grid.start(line) + col;
+            if (self.grid.cells[i].flags & (WIDE_CHAR | WIDE_CHAR_SPACER)) == 0 {
+                let x = self.tmpl_extra_id();
+                let cur = self.grid.cursor;
+                self.grid.cells[i] = make(run[0] as u32, cur.fg, cur.bg, cur.flags, x);
+                self.grid.touch(line, col + 1);
+                self.grid.damage_line(line, col, col);
+                if col + 1 < self.grid.cols {
+                    self.grid.cursor.col = col + 1;
+                } else {
+                    self.grid.cursor.needs_wrap = true;
+                }
+                return;
+            }
+        }
+        if (self.mode & INSERT) != 0 || self.grid.cursor.charsets[self.active_charset] != 0 {
+            for b in run {
+                self.input(b as u32);
+            }
+            return;
+        }
+        let x = self.tmpl_extra_id();
+        let hi = ((x >> 16) as u32) << 21;
+        let lo = (x & 0xFFFF) as u16;
+        let fg = self.grid.cursor.fg;
+        let bg = self.grid.cursor.bg;
+        let flags = self.grid.cursor.flags;
+        let cols = self.grid.cols;
+        let mut k = 0;
+        while k < n {
+            if self.grid.cursor.needs_wrap {
+                if (self.mode & LINE_WRAP) == 0 {
+                    for j in k..n {
+                        self.input(run[j] as u32);
+                    }
+                    return;
+                }
+                self.wrapline();
+            }
+            let line = self.grid.cursor.line;
+            let col = self.grid.cursor.col;
+            let mut m = cols - col;
+            if n - k < m {
+                m = n - k;
+            }
+            let r = self.grid.row_mut(line, 0);
+            let dst = &mut r[col..col + m];
+            let src = run[k..k + m];
+            let mut t = 0;
+            while t < m {
+                if (dst[t].flags & (WIDE_CHAR | WIDE_CHAR_SPACER)) != 0 {
+                    break;
+                }
+                dst[t] = Cell { ch: src[t] as u32 | hi, fg: fg, bg: bg, flags: flags, extra: lo };
+                t += 1;
+            }
+            if t > 0 {
+                self.grid.touch(line, col + t);
+                self.grid.damage_line(line, col, col + t - 1);
+            }
+            if t < m {
+                // A wide character: the rest byte by byte.
+                self.grid.cursor.col = col + t;
+                for j in k + t..n {
+                    self.input(run[j] as u32);
+                }
+                return;
+            }
+            if col + m < cols {
+                self.grid.cursor.col = col + m;
+            } else {
+                self.grid.cursor.col = cols - 1;
+                self.grid.cursor.needs_wrap = true;
+            }
+            k += m;
+        }
+    }
+
+    // ---- the cursor and the lines ----
+
+    #[inline]
+
+    pub fn linefeed(self: &mut Term) {
+        let next = self.grid.cursor.line + 1;
+        if next == self.region_bot {
+            self.scroll_up(1);
+        } else if next < self.grid.lines {
+            self.grid.cursor.line += 1;
+        }
+    }
+
+    #[inline]
+
+    pub fn carriage_return(self: &mut Term) {
+        self.grid.cursor.col = 0;
+        self.grid.cursor.needs_wrap = false;
+    }
+
+    pub fn backspace(self: &mut Term) {
+        if self.grid.cursor.col > 0 {
+            self.grid.cursor.col -= 1;
+            self.grid.cursor.needs_wrap = false;
+        }
+    }
+
+    pub fn put_tab(self: &mut Term, count: i64) {
+        if self.grid.cursor.needs_wrap {
+            self.wrapline();
+            return;
+        }
+        let cols = self.grid.cols;
+        let mut n = count;
+        while self.grid.cursor.col < cols && n != 0 {
+            n -= 1;
+            let line = self.grid.cursor.line;
+            let col = self.grid.cursor.col;
+            self.grid.touch(line, col + 1);
+            let i = self.grid.start(line) + col;
+            if self.grid.cells[i].c() == 32 {
+                self.grid.cells[i].set_char(9);
+            }
+            loop {
+                if self.grid.cursor.col + 1 == cols {
+                    break;
+                }
+                self.grid.cursor.col += 1;
+                if self.tabs[self.grid.cursor.col] {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Alacritty's `goto`: `line` in the scroll region's terms in origin
+    // mode.
+    pub fn goto(self: &mut Term, line: i64, col: i64) {
+        let mut off = 0;
+        let mut max = self.grid.lines - 1;
+        if (self.mode & ORIGIN) != 0 {
+            off = self.region_top;
+            max = self.region_bot - 1;
+        }
+        let mut l = line + off;
+        if l > max {
+            l = max;
+        }
+        if l < 0 {
+            l = 0;
+        }
+        self.grid.cursor.line = l;
+        let last = self.grid.cols - 1;
+        self.grid.cursor.col = if col > last { last } else { col };
+        self.grid.cursor.needs_wrap = false;
+    }
+
+    pub fn scroll_up(self: &mut Term, n: i64) {
+        let origin = self.region_top;
+        self.scroll_up_from(origin, n);
+    }
+
+    pub fn scroll_down(self: &mut Term, n: i64) {
+        let origin = self.region_top;
+        self.scroll_down_from(origin, n);
+    }
+
+    // Alacritty's `scroll_up_relative`.
+    pub fn scroll_up_from(self: &mut Term, origin: i64, n: i64) {
+        let mut k = n;
+        let size = self.region_bot - self.region_top;
+        if k > size {
+            k = size;
+        }
+        if k < 0 {
+            k = 0;
+        }
+        let bg = self.grid.cursor.bg;
+        self.grid.scroll_up(origin, self.region_bot, k, bg);
+    }
+
+    // Alacritty's `scroll_down_relative`.
+    pub fn scroll_down_from(self: &mut Term, origin: i64, n: i64) {
+        let mut k = n;
+        let size = self.region_bot - self.region_top;
+        if k > size {
+            k = size;
+        }
+        if k > self.region_bot - origin {
+            k = self.region_bot - origin;
+        }
+        if k < 0 {
+            k = 0;
+        }
+        let bg = self.grid.cursor.bg;
+        self.grid.scroll_down(origin, self.region_bot, k, bg);
+    }
+
+    // Alacritty's `swap_alt`: to the other screen and back.
+    pub fn swap_alt(self: &mut Term) {
+        if (self.mode & ALT_SCREEN) == 0 {
+            self.inactive.cursor = self.grid.cursor;
+            self.grid.saved = self.grid.cursor;
+            let bg = self.inactive.cursor.bg;
+            let n = self.inactive.lines;
+            self.inactive.reset_region(0, n, bg);
+        }
+        std::swap(&mut self.grid, &mut self.inactive);
+        self.mode = self.mode ^ ALT_SCREEN;
+        self.grid.damage_all = true;
+        self.tmpl_changed();
+    }
+
+    // ---- replies, the title, colours ----
+
+    pub fn set_title(self: &mut Term, s: [u8], has: bool) {
+        self.title.clear();
+        self.title.push_str(s);
+        self.has_title = has;
+        self.shown_title.clear();
+        self.shown_title.push_str(s);
+        self.has_shown_title = has;
+        self.title_changed = true;
+    }
+
+    pub fn ask_color(self: &mut Term, index: i64, prefix: i64, st: bool) {
+        self.pending_at.push(self.reply.len());
+        self.pending_index.push(index);
+        self.pending_prefix.push(prefix);
+        self.pending_st.push(st);
+    }
+
+    // `ESC ] prefix ; rgb:rrrr/gggg/bbbb` and the terminator, for each
+    // query, where it was asked among the other replies.
+    fn answer_color_queries(self: &mut Term) {
+        let mut out = Buf::new_in(self.gpa);
+        let old = self.reply.as_slice();
+        let mut at = 0;
+        for q in 0..self.pending_at.len() {
+            let pos = self.pending_at[q];
+            out.push_str(old[at..pos]);
+            at = pos;
+            let index = self.pending_index[q];
+            let rgb = self.color_of(index);
+            let prefix = self.pending_prefix[q];
+            out.push_str("\x1b]");
+            if prefix >= 0 {
+                out.push_str("4;");
+                out.push_int(prefix);
+            } else {
+                out.push_int(index - 256 + 10);
+            }
+            out.push_str(";rgb:");
+            push_hex2(&mut out, (rgb >> 16) & 0xFF, true);
+            out.push('/');
+            push_hex2(&mut out, (rgb >> 8) & 0xFF, true);
+            out.push('/');
+            push_hex2(&mut out, rgb & 0xFF, true);
+            if self.pending_st[q] {
+                out.push_str("\x1b\\");
+            } else {
+                out.push(7);
+            }
+        }
+        out.push_str(old[at..]);
+        self.reply.free();
+        self.reply = out;
+        self.pending_at.clear();
+        self.pending_index.clear();
+        self.pending_prefix.clear();
+        self.pending_st.clear();
+    }
+
+    // The colour `index` shows: set by OSC, else the default palette.
+    pub fn color_of(self: &mut Term, index: i64) -> i64 {
+        let c = self.colors[index];
+        if c >= 0 { c } else { default_color(index) }
+    }
+}
+
+impl Perform for Term {
+    #[inline]
+    fn print(self: &mut Term, c: u32) {
+        self.preceding = c;
+        self.has_preceding = true;
+        self.input(c);
+    }
+
+    // The fast path of `input` for each, the cursor and the row in locals
+    // while nothing unusual comes.
+    fn print_chars(self: &mut Term, run: [u32]) {
+        self.preceding = run[run.len - 1];
+        self.has_preceding = true;
+        let cols = self.grid.cols;
+        let mut k = 0;
+        while k < run.len {
+            if (self.mode & INSERT) != 0 || self.grid.cursor.needs_wrap {
+                self.input(run[k]);
+                k += 1;
+                continue;
+            }
+            let x = self.tmpl_extra_id();
+            let cur = self.grid.cursor;
+            let line = cur.line;
+            let start = cur.col;
+            let mut col = start;
+            let b = self.grid.start(line);
+            let a1 = make(32, cur.fg, cur.bg, cur.flags, x);
+            let wide = cur.flags | WIDE_CHAR;
+            let spacer = make(32, cur.fg, cur.bg, cur.flags | WIDE_CHAR_SPACER, x);
+            while k < run.len {
+                let c = run[k];
+                let w = self.width(c);
+                if w <= 0 || col + w >= cols {
+                    break;
+                }
+                let f = self.grid.cells[b + col].flags | self.grid.cells[b + col + w - 1].flags;
+                if (f & (WIDE_CHAR | WIDE_CHAR_SPACER)) != 0 {
+                    break;
+                }
+                if w == 1 {
+                    let mut cell = a1;
+                    cell.set_char(c);
+                    self.grid.cells[b + col] = cell;
+                } else {
+                    let mut cell = a1;
+                    cell.set_char(c);
+                    cell.flags = wide;
+                    self.grid.cells[b + col] = cell;
+                    self.grid.cells[b + col + 1] = spacer;
+                }
+                col += w;
+                k += 1;
+            }
+            if col > start {
+                self.grid.touch(line, col);
+                self.grid.damage_line(line, start, col - 1);
+                self.grid.cursor.col = col;
+            }
+            if k < run.len {
+                self.input(run[k]);
+                k += 1;
+            }
+        }
+    }
+
+    fn print_ascii(self: &mut Term, run: [u8]) {
+        self.preceding = run[run.len - 1] as u32;
+        self.has_preceding = true;
+        self.ascii_run(run);
+    }
+
+    fn execute(self: &mut Term, b: u8) {
+        ops::execute(self, b);
+    }
+
+    fn csi_dispatch(self: &mut Term, params: &Params, inter: [u8], ignore: bool, action: u8) {
+        ops::csi_dispatch(self, params, inter, ignore, action);
+    }
+
+    fn esc_dispatch(self: &mut Term, inter: [u8], ignore: bool, b: u8) {
+        ops::esc_dispatch(self, inter, b);
+    }
+
+    fn osc_dispatch(self: &mut Term, osc: &Osc, bell: bool) {
+        ops::osc_dispatch(self, osc, bell);
+    }
+
+    fn terminated(self: &mut Term) -> bool {
+        self.terminated
+    }
+}
+
+impl Term {
+    // REP: the last printed character again, `n` times.
+    pub fn repeat(self: &mut Term, n: i64) {
+        if !self.has_preceding {
+            return;
+        }
+        let c = self.preceding;
+        for _ in 0..n {
+            self.input(c);
+        }
+    }
+}
+
+fn mark_grid(x: &mut Extras, g: &mut Grid) {
+    let cells = g.cells.as_slice();
+    for i in 0..cells.len {
+        let id = cells[i].extra_id();
+        if id != 0 {
+            x.mark(id);
+        }
+    }
+    x.mark_link(g.cursor.link);
+    x.mark_link(g.saved.link);
+}
+
+// The DEC special graphics charset (`ESC ( 0`), as vte maps it.
+pub fn dec_graphics(c: u32) -> u32 {
+    if c < 0x5F || c > 0x7E {
+        return c;
+    }
+    let table: [u32; 32] = [
+        0x20, 0x25C6, 0x2592, 0x2409, 0x240C, 0x240D, 0x240A, 0xB0, 0xB1, 0x2424, 0x240B, 0x2518,
+        0x2510, 0x250C, 0x2514, 0x253C, 0x23BA, 0x23BB, 0x2500, 0x23BC, 0x23BD, 0x251C, 0x2524,
+        0x2534, 0x252C, 0x2502, 0x2264, 0x2265, 0x3C0, 0x2260, 0xA3, 0xB7,
+    ];
+    table[(c - 0x5F) as i64]
+}
+
+// The palette a colour query reports when no OSC set the colour:
+// Alacritty's default colours, the 6x6x6 cube, the grey ramp.
+pub fn default_color(index: i64) -> i64 {
+    let base: [i64; 16] = [
+        0x181818, 0xAC4242, 0x90A959, 0xF4BF75, 0x6A9FB5, 0xAA759F, 0x75B5AA, 0xD8D8D8, 0x6B6B6B,
+        0xC55555, 0xAAC474, 0xFECA88, 0x82B8C8, 0xC28CB8, 0x93D3C3, 0xF8F8F8,
+    ];
+    if index < 16 {
+        return base[index];
+    }
+    if index < 232 {
+        let i = index - 16;
+        let r = cube(i / 36);
+        let g = cube((i / 6) % 6);
+        let b = cube(i % 6);
+        return (r << 16) | (g << 8) | b;
+    }
+    if index < 256 {
+        let v = (index - 232) * 10 + 8;
+        return (v << 16) | (v << 8) | v;
+    }
+    if index == 257 {
+        return 0x181818;
+    }
+    0xD8D8D8
+}
+
+fn cube(v: i64) -> i64 {
+    if v == 0 { 0 } else { v * 40 + 55 }
+}
+
+// Two hex digits; twice when `twice` (`rgb:rrrr/...` repeats each byte).
+pub fn push_hex2(b: &mut Buf, v: i64, twice: bool) {
+    let digits = "0123456789abcdef";
+    b.push(digits[(v >> 4) & 15]);
+    b.push(digits[v & 15]);
+    if twice {
+        b.push(digits[(v >> 4) & 15]);
+        b.push(digits[v & 15]);
+    }
+}
+
+impl Term {
+    pub fn set_terminated(self: &mut Term) {
+        self.terminated = true;
+    }
+}

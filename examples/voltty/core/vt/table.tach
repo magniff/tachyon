@@ -1,0 +1,265 @@
+// The transitions out of every state but ground, byte by byte, as vte
+// 0.15's `advance_*` functions: the byte classes of Williams' diagram
+// (C0 controls, intermediates 0x20..0x2F, parameters 0x30..0x3F, finals
+// 0x40..0x7E, DEL), with CAN, SUB and ESC acting from anywhere.
+
+use super::{
+    CSI_ENTRY, CSI_IGNORE, CSI_INTERMEDIATE, CSI_PARAM, DCS_ENTRY, DCS_IGNORE, DCS_INTERMEDIATE,
+    DCS_PARAM, DCS_PASSTHROUGH, ESCAPE, ESCAPE_INTERMEDIATE, GROUND, OSC_STRING, Parser, Perform,
+    SOS_PM_APC_STRING,
+};
+
+// A C0 control executed inside a sequence: 0x00..0x17, 0x19, 0x1C..0x1F.
+#[inline]
+fn is_exec(b: u8) -> bool {
+    b < 0x18 || b == 0x19 || (b >= 0x1C && b < 0x20)
+}
+
+impl Parser {
+    #[inline]
+    pub fn change_state<P: Perform>(self: &mut Parser, p: &mut P, b: u8) {
+        let s = self.state;
+        if s == ESCAPE {
+            self.escape(p, b);
+        } else if s == CSI_ENTRY {
+            self.csi_entry(p, b);
+        } else if s == CSI_PARAM {
+            self.csi_param(p, b);
+        } else if s == CSI_INTERMEDIATE {
+            self.csi_intermediate(p, b);
+        } else if s == CSI_IGNORE {
+            self.csi_ignore(p, b);
+        } else if s == OSC_STRING {
+            self.osc_string(p, b);
+        } else if s == ESCAPE_INTERMEDIATE {
+            self.escape_intermediate(p, b);
+        } else if s == DCS_ENTRY {
+            self.dcs_entry(p, b);
+        } else if s == DCS_PARAM {
+            self.dcs_param(p, b);
+        } else if s == DCS_INTERMEDIATE {
+            self.dcs_intermediate(p, b);
+        } else if s == DCS_PASSTHROUGH {
+            self.dcs_passthrough(p, b);
+        } else {
+            // DCS_IGNORE, SOS_PM_APC_STRING
+            self.anywhere(p, b);
+        }
+    }
+
+    // CAN and SUB end any sequence (and are executed); ESC starts one.
+    fn anywhere<P: Perform>(self: &mut Parser, p: &mut P, b: u8) {
+        if b == 0x18 || b == 0x1A {
+            p.execute(b);
+            self.state = GROUND;
+        } else if b == 0x1B {
+            self.reset_params();
+            self.state = ESCAPE;
+        }
+    }
+
+    fn escape<P: Perform>(self: &mut Parser, p: &mut P, b: u8) {
+        if is_exec(b) {
+            p.execute(b);
+        } else if b >= 0x20 && b <= 0x2F {
+            self.collect(b);
+            self.state = ESCAPE_INTERMEDIATE;
+        } else if b == 0x50 {
+            // P: DCS
+            self.reset_params();
+            self.state = DCS_ENTRY;
+        } else if b == 0x5B {
+            // [: CSI
+            self.reset_params();
+            self.state = CSI_ENTRY;
+        } else if b == 0x5D {
+            // ]: OSC
+            self.osc_start();
+        } else if b == 0x58 || b == 0x5E || b == 0x5F {
+            // X, ^, _: SOS, PM, APC
+            self.state = SOS_PM_APC_STRING;
+        } else if b >= 0x30 && b <= 0x7E {
+            self.esc_dispatch(p, b);
+        } else if b == 0x18 || b == 0x1A {
+            p.execute(b);
+            self.state = GROUND;
+        }
+        // ESC, DEL and 0x80 and up: nothing
+    }
+
+    fn escape_intermediate<P: Perform>(self: &mut Parser, p: &mut P, b: u8) {
+        if is_exec(b) {
+            p.execute(b);
+        } else if b >= 0x20 && b <= 0x2F {
+            self.collect(b);
+        } else if b >= 0x30 && b <= 0x7E {
+            self.esc_dispatch(p, b);
+        } else if b != 0x7F {
+            self.anywhere(p, b);
+        }
+    }
+
+    fn csi_entry<P: Perform>(self: &mut Parser, p: &mut P, b: u8) {
+        if is_exec(b) {
+            p.execute(b);
+        } else if b >= 0x20 && b <= 0x2F {
+            self.collect(b);
+            self.state = CSI_INTERMEDIATE;
+        } else if b >= 0x30 && b <= 0x39 {
+            self.param_digit(b);
+            self.state = CSI_PARAM;
+        } else if b == 0x3A {
+            self.subparam();
+            self.state = CSI_PARAM;
+        } else if b == 0x3B {
+            self.next_param();
+            self.state = CSI_PARAM;
+        } else if b >= 0x3C && b <= 0x3F {
+            self.collect(b);
+            self.state = CSI_PARAM;
+        } else if b >= 0x40 && b <= 0x7E {
+            self.csi_dispatch(p, b);
+        } else {
+            self.anywhere(p, b);
+        }
+    }
+
+    fn csi_param<P: Perform>(self: &mut Parser, p: &mut P, b: u8) {
+        if b >= 0x30 && b <= 0x39 {
+            self.param_digit(b);
+        } else if b == 0x3B {
+            self.next_param();
+        } else if b >= 0x40 && b <= 0x7E {
+            self.csi_dispatch(p, b);
+        } else if is_exec(b) {
+            p.execute(b);
+        } else if b >= 0x20 && b <= 0x2F {
+            self.collect(b);
+            self.state = CSI_INTERMEDIATE;
+        } else if b == 0x3A {
+            self.subparam();
+        } else if b >= 0x3C && b <= 0x3F {
+            self.state = CSI_IGNORE;
+        } else if b != 0x7F {
+            self.anywhere(p, b);
+        }
+    }
+
+    fn csi_intermediate<P: Perform>(self: &mut Parser, p: &mut P, b: u8) {
+        if is_exec(b) {
+            p.execute(b);
+        } else if b >= 0x20 && b <= 0x2F {
+            self.collect(b);
+        } else if b >= 0x30 && b <= 0x3F {
+            self.state = CSI_IGNORE;
+        } else if b >= 0x40 && b <= 0x7E {
+            self.csi_dispatch(p, b);
+        } else {
+            // DEL included: vte sends it to `anywhere`, where it does nothing
+            self.anywhere(p, b);
+        }
+    }
+
+    fn csi_ignore<P: Perform>(self: &mut Parser, p: &mut P, b: u8) {
+        if is_exec(b) {
+            p.execute(b);
+        } else if b >= 0x40 && b <= 0x7E {
+            self.state = GROUND;
+        } else if b < 0x20 || b >= 0x80 {
+            self.anywhere(p, b);
+        }
+        // 0x20..0x3F and DEL: nothing
+    }
+
+    fn dcs_entry<P: Perform>(self: &mut Parser, p: &mut P, b: u8) {
+        if b >= 0x20 && b <= 0x2F {
+            self.collect(b);
+            self.state = DCS_INTERMEDIATE;
+        } else if b >= 0x30 && b <= 0x39 {
+            self.param_digit(b);
+            self.state = DCS_PARAM;
+        } else if b == 0x3A {
+            self.subparam();
+            self.state = DCS_PARAM;
+        } else if b == 0x3B {
+            self.next_param();
+            self.state = DCS_PARAM;
+        } else if b >= 0x3C && b <= 0x3F {
+            self.collect(b);
+            self.state = DCS_PARAM;
+        } else if b >= 0x40 && b <= 0x7E {
+            self.hook(p, b);
+        } else if !is_exec(b) && b != 0x7F {
+            self.anywhere(p, b);
+        }
+    }
+
+    fn dcs_param<P: Perform>(self: &mut Parser, p: &mut P, b: u8) {
+        if b >= 0x20 && b <= 0x2F {
+            self.collect(b);
+            self.state = DCS_INTERMEDIATE;
+        } else if b >= 0x30 && b <= 0x39 {
+            self.param_digit(b);
+        } else if b == 0x3A {
+            self.subparam();
+        } else if b == 0x3B {
+            self.next_param();
+        } else if b >= 0x3C && b <= 0x3F {
+            self.state = DCS_IGNORE;
+        } else if b >= 0x40 && b <= 0x7E {
+            self.hook(p, b);
+        } else if !is_exec(b) && b != 0x7F {
+            self.anywhere(p, b);
+        }
+    }
+
+    fn dcs_intermediate<P: Perform>(self: &mut Parser, p: &mut P, b: u8) {
+        if b >= 0x20 && b <= 0x2F {
+            self.collect(b);
+        } else if b >= 0x30 && b <= 0x3F {
+            self.state = DCS_IGNORE;
+        } else if b >= 0x40 && b <= 0x7E {
+            self.hook(p, b);
+        } else if !is_exec(b) && b != 0x7F {
+            self.anywhere(p, b);
+        }
+    }
+
+    fn dcs_passthrough<P: Perform>(self: &mut Parser, p: &mut P, b: u8) {
+        if b == 0x18 || b == 0x1A {
+            p.unhook();
+            p.execute(b);
+            self.state = GROUND;
+        } else if b == 0x1B {
+            p.unhook();
+            self.reset_params();
+            self.state = ESCAPE;
+        } else if b == 0x9C {
+            p.unhook();
+            self.state = GROUND;
+        } else if b < 0x7F {
+            p.put(b);
+        }
+        // DEL and the rest of 0x80 and up: nothing
+    }
+
+    fn osc_string<P: Perform>(self: &mut Parser, p: &mut P, b: u8) {
+        if b == 0x07 {
+            self.osc_end(p, b);
+            self.state = GROUND;
+        } else if b == 0x18 || b == 0x1A {
+            self.osc_end(p, b);
+            p.execute(b);
+            self.state = GROUND;
+        } else if b == 0x1B {
+            self.osc_end(p, b);
+            self.reset_params();
+            self.state = ESCAPE;
+        } else if b == 0x3B {
+            self.osc.put_param();
+        } else if b >= 0x20 {
+            self.osc.put(b);
+        }
+        // the other C0 controls: nothing
+    }
+}

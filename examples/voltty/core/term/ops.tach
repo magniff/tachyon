@@ -1,0 +1,1412 @@
+// The control functions: C0 controls, ESC, CSI and OSC sequences, as
+// vte 0.15's `ansi` module reads them and alacritty_terminal 0.26 acts on
+// them (its `Handler` impl for `Term`), quirks included: the oracle
+// (tests/voltty) holds the two to the same state.
+
+use crate::vt::Osc;
+use crate::vt::params::{ParamIter, Params};
+use std::Buf;
+use super::{
+    ALTERNATE_SCROLL, ALT_SCREEN, APP_CURSOR, APP_KEYPAD, BRACKETED_PASTE, DEFAULT_MODE,
+    FOCUS_IN_OUT, INSERT, LINE_FEED_NEW_LINE, LINE_WRAP, MOUSE_DRAG, MOUSE_MODE, MOUSE_MOTION,
+    MOUSE_REPORT_CLICK, ORIGIN, SGR_MOUSE, SHAPE_BEAM, SHAPE_BLOCK, SHAPE_UNDERLINE, SHOW_CURSOR,
+    TITLE_STACK_MAX, Term, URGENCY_HINTS, UTF8_MOUSE, push_hex2,
+};
+use super::cell::{
+    ALL_UNDERLINES, BOLD, Cell, DASHED_UNDERLINE, DEFAULT_BG, DEFAULT_FG, DIM, DOTTED_UNDERLINE,
+    DOUBLE_UNDERLINE, HIDDEN, INVERSE, ITALIC, STRIKEOUT, UNDERCURL, UNDERLINE, indexed, named, rgb,
+};
+use super::grid::NO_COLOR;
+
+// ---- C0 ----
+
+pub fn execute(t: &mut Term, b: u8) {
+    if b == 0x09 {
+        t.put_tab(1);
+    } else if b == 0x08 {
+        t.backspace();
+    } else if b == 0x0D {
+        t.carriage_return();
+    } else if b == 0x0A || b == 0x0B || b == 0x0C {
+        t.linefeed();
+    } else if b == 0x07 {
+        t.bells += 1;
+    } else if b == 0x0F {
+        t.active_charset = 0;
+    } else if b == 0x0E {
+        t.active_charset = 1;
+    }
+    // SUB and the rest: nothing
+}
+
+// ---- ESC ----
+
+pub fn esc_dispatch(t: &mut Term, inter: [u8], b: u8) {
+    if b == 'B' {
+        configure_charset(t, inter, 0);
+        return;
+    }
+    if b == '0' {
+        configure_charset(t, inter, 1);
+        return;
+    }
+    if inter.len == 1 && inter[0] == '#' && b == '8' {
+        decaln(t);
+        return;
+    }
+    if inter.len != 0 {
+        return;
+    }
+    if b == 'D' {
+        t.linefeed();
+    } else if b == 'E' {
+        t.linefeed();
+        t.carriage_return();
+    } else if b == 'H' {
+        let c = t.grid.cursor.col;
+        t.tabs[c] = true;
+    } else if b == 'M' {
+        reverse_index(t);
+    } else if b == 'Z' {
+        t.reply.push_str("\x1b[?6c");
+    } else if b == 'c' {
+        reset_state(t);
+    } else if b == '7' {
+        t.grid.saved = t.grid.cursor;
+    } else if b == '8' {
+        restore_cursor(t);
+    } else if b == '=' {
+        t.mode = t.mode | APP_KEYPAD;
+    } else if b == '>' {
+        t.mode = t.mode & ~APP_KEYPAD;
+    }
+}
+
+fn configure_charset(t: &mut Term, inter: [u8], set: u8) {
+    if inter.len != 1 {
+        return;
+    }
+    let c = inter[0];
+    let mut index = 0;
+    if c == '(' {
+        index = 0;
+    } else if c == ')' {
+        index = 1;
+    } else if c == '*' {
+        index = 2;
+    } else if c == '+' {
+        index = 3;
+    } else {
+        return;
+    }
+    t.grid.cursor.charsets[index] = set;
+}
+
+fn restore_cursor(t: &mut Term) {
+    t.grid.cursor = t.grid.saved;
+    t.tmpl_changed();
+}
+
+fn reverse_index(t: &mut Term) {
+    if t.grid.cursor.line == t.region_top {
+        t.scroll_down(1);
+    } else {
+        let l = t.grid.cursor.line - 1;
+        t.grid.cursor.line = if l < 0 { 0 } else { l };
+    }
+}
+
+fn decaln(t: &mut Term) {
+    let e = Cell { ch: 'E' as u32, fg: DEFAULT_FG, bg: DEFAULT_BG, flags: 0, extra: 0 };
+    for l in 0..t.grid.lines {
+        let cols = t.grid.cols;
+        let r = t.grid.row_mut(l, cols);
+        for i in 0..r.len {
+            r[i] = e;
+        }
+    }
+    t.grid.damage_all = true;
+}
+
+// RIS.
+fn reset_state(t: &mut Term) {
+    if (t.mode & ALT_SCREEN) != 0 {
+        std::swap(&mut t.grid, &mut t.inactive);
+    }
+    t.active_charset = 0;
+    t.style_set = false;
+    t.grid.reset();
+    t.inactive.reset();
+    t.region_top = 0;
+    t.region_bot = t.grid.lines;
+    for i in 0..t.tabs.len() {
+        t.tabs[i] = i % 8 == 0;
+    }
+    for i in 0..t.title_stack.len() {
+        t.title_stack[i].free();
+    }
+    t.title_stack.clear();
+    t.title_stack_set.clear();
+    t.title.clear();
+    t.has_title = false;
+    t.mode = DEFAULT_MODE;
+    t.tmpl_changed();
+}
+
+// ---- CSI ----
+
+pub fn csi_dispatch(t: &mut Term, p: &Params, inter: [u8], ignore: bool, action: u8) {
+    if ignore || inter.len > 2 {
+        return;
+    }
+    let mut it = ParamIter::new();
+    let none = inter.len == 0;
+    let q = inter.len == 1 && inter[0] == '?';
+    if none {
+        if action == 'm' {
+            sgr(t, p);
+            return;
+        }
+        if action == 'H' || action == 'f' {
+            let y = it.next_or(p, 1) as i64;
+            let x = it.next_or(p, 1) as i64;
+            t.goto(y - 1, x - 1);
+            return;
+        }
+        if action == '@' {
+            insert_blank(t, it.next_or(p, 1) as i64);
+        } else if action == 'A' {
+            let n = it.next_or(p, 1) as i64;
+            let c = t.grid.cursor.col;
+            t.goto(t.grid.cursor.line - n, c);
+        } else if action == 'B' || action == 'e' {
+            let n = it.next_or(p, 1) as i64;
+            let c = t.grid.cursor.col;
+            t.goto(t.grid.cursor.line + n, c);
+        } else if action == 'b' {
+            t.repeat(it.next_or(p, 1) as i64);
+        } else if action == 'C' || action == 'a' {
+            let n = it.next_or(p, 1) as i64;
+            let last = t.grid.cols - 1;
+            let c = t.grid.cursor.col + n;
+            t.grid.cursor.col = if c > last { last } else { c };
+            t.grid.cursor.needs_wrap = false;
+        } else if action == 'c' {
+            if it.next_or(p, 0) == 0 {
+                t.reply.push_str("\x1b[?6c");
+            }
+        } else if action == 'D' {
+            let n = it.next_or(p, 1) as i64;
+            let c = t.grid.cursor.col - n;
+            t.grid.cursor.col = if c < 0 { 0 } else { c };
+            t.grid.cursor.needs_wrap = false;
+        } else if action == 'd' {
+            let l = it.next_or(p, 1) as i64 - 1;
+            let c = t.grid.cursor.col;
+            t.goto(l, c);
+        } else if action == 'E' {
+            let n = it.next_or(p, 1) as i64;
+            t.goto(t.grid.cursor.line + n, 0);
+        } else if action == 'F' {
+            let n = it.next_or(p, 1) as i64;
+            t.goto(t.grid.cursor.line - n, 0);
+        } else if action == 'G' || action == '`' {
+            let c = it.next_or(p, 1) as i64 - 1;
+            let l = t.grid.cursor.line;
+            t.goto(l, c);
+        } else if action == 'g' {
+            let m = it.next_or(p, 0);
+            if m == 0 {
+                let c = t.grid.cursor.col;
+                t.tabs[c] = false;
+            } else if m == 3 {
+                for i in 0..t.tabs.len() {
+                    t.tabs[i] = false;
+                }
+            }
+        } else if action == 'h' || action == 'l' {
+            let mut g = it.next(p);
+            while g >= 0 {
+                set_mode(t, p.value(g), action == 'h');
+                g = it.next(p);
+            }
+        } else if action == 'I' {
+            forward_tabs(t, it.next_or(p, 1) as i64);
+        } else if action == 'J' {
+            let m = it.next_or(p, 0);
+            if m <= 3 {
+                clear_screen(t, m as i64);
+            }
+        } else if action == 'K' {
+            let m = it.next_or(p, 0);
+            if m <= 2 {
+                clear_line(t, m as i64);
+            }
+        } else if action == 'L' {
+            let n = it.next_or(p, 1) as i64;
+            let origin = t.grid.cursor.line;
+            if origin >= t.region_top && origin < t.region_bot {
+                t.scroll_down_from(origin, n);
+            }
+        } else if action == 'M' {
+            let origin = t.grid.cursor.line;
+            let mut n = it.next_or(p, 1) as i64;
+            if n > t.grid.lines - origin {
+                n = t.grid.lines - origin;
+            }
+            if n > 0 && origin >= t.region_top && origin < t.region_bot {
+                t.scroll_up_from(origin, n);
+            }
+        } else if action == 'n' {
+            device_status(t, it.next_or(p, 0) as i64);
+        } else if action == 'P' {
+            delete_chars(t, it.next_or(p, 1) as i64);
+        } else if action == 'r' {
+            let top = it.next_or(p, 1) as i64;
+            let g = it.next(p);
+            let mut bottom = t.grid.lines;
+            if g >= 0 && p.value(g) != 0 {
+                bottom = p.value(g) as i64;
+            }
+            set_scrolling_region(t, top, bottom);
+        } else if action == 'S' {
+            t.scroll_up(it.next_or(p, 1) as i64);
+        } else if action == 's' {
+            t.grid.saved = t.grid.cursor;
+        } else if action == 'T' {
+            t.scroll_down(it.next_or(p, 1) as i64);
+        } else if action == 't' {
+            window_op(t, it.next_or(p, 1) as i64);
+        } else if action == 'u' {
+            restore_cursor(t);
+        } else if action == 'X' {
+            erase_chars(t, it.next_or(p, 1) as i64);
+        } else if action == 'Z' {
+            backward_tabs(t, it.next_or(p, 1) as i64);
+        }
+        return;
+    }
+    if action == 'c' {
+        // DA with an intermediate: `>` is DA2.
+        if it.next_or(p, 0) == 0 && inter[0] == '>' {
+            // Alacritty's DA2: its version, 0.26.0, as 2600.
+            t.reply.push_str("\x1b[>0;2600;1c");
+        }
+        return;
+    }
+    if q {
+        if action == 'h' || action == 'l' {
+            let mut g = it.next(p);
+            while g >= 0 {
+                set_private_mode(t, p.value(g), action == 'h');
+                g = it.next(p);
+            }
+        } else if action == 'p' {
+            // never: DECRQM is `? Ps $ p`
+        }
+        return;
+    }
+    if inter.len == 1 && inter[0] == '$' && action == 'p' {
+        report_mode(t, it.next_or(p, 0) as i64);
+        return;
+    }
+    if inter.len == 2 && inter[0] == '?' && inter[1] == '$' && action == 'p' {
+        report_private_mode(t, it.next_or(p, 0) as i64);
+        return;
+    }
+    if inter.len == 1 && inter[0] == ' ' && action == 'q' {
+        let id = it.next_or(p, 0);
+        if id == 0 {
+            t.style_set = false;
+        } else if id <= 6 {
+            t.style_set = true;
+            t.style_shape = if id <= 2 { SHAPE_BLOCK } else if id <= 4 { SHAPE_UNDERLINE }
+                else { SHAPE_BEAM };
+            t.style_blink = id % 2 == 1;
+        }
+        return;
+    }
+}
+
+fn insert_blank(t: &mut Term, count: i64) {
+    let cols = t.grid.cols;
+    let col = t.grid.cursor.col;
+    let mut n = count;
+    if n > cols - col {
+        n = cols - col;
+    }
+    let dest = col + n;
+    let num = cols - dest;
+    let blank = Cell::blank(t.grid.cursor.bg);
+    let r = t.grid.row_mut(t.grid.cursor.line, cols);
+    let mut off = num - 1;
+    while off >= 0 {
+        let a = r[dest + off];
+        r[dest + off] = r[col + off];
+        r[col + off] = a;
+        off -= 1;
+    }
+    for i in col..dest {
+        r[i] = blank;
+    }
+    t.grid.damage_line(t.grid.cursor.line, 0, cols - 1);
+}
+
+fn delete_chars(t: &mut Term, count: i64) {
+    let cols = t.grid.cols;
+    let mut n = count;
+    if n > cols {
+        n = cols;
+    }
+    let start = t.grid.cursor.col;
+    let mut end = start + n;
+    if end > cols - 1 {
+        end = cols - 1;
+    }
+    let num = cols - end;
+    let blank = Cell::blank(t.grid.cursor.bg);
+    let r = t.grid.row_mut(t.grid.cursor.line, cols);
+    for off in 0..num {
+        let a = r[start + off];
+        r[start + off] = r[end + off];
+        r[end + off] = a;
+    }
+    for i in cols - n..cols {
+        r[i] = blank;
+    }
+    t.grid.damage_line(t.grid.cursor.line, 0, cols - 1);
+}
+
+fn erase_chars(t: &mut Term, count: i64) {
+    let cols = t.grid.cols;
+    let start = t.grid.cursor.col;
+    let mut end = start + count;
+    if end > cols {
+        end = cols;
+    }
+    let blank = Cell::blank(t.grid.cursor.bg);
+    let r = t.grid.row_mut(t.grid.cursor.line, end);
+    for i in start..end {
+        r[i] = blank;
+    }
+    t.grid.damage_line(t.grid.cursor.line, start, end);
+}
+
+fn clear_line(t: &mut Term, m: i64) {
+    let cols = t.grid.cols;
+    let col = t.grid.cursor.col;
+    let mut left = 0;
+    let mut right = cols;
+    if m == 0 {
+        if t.grid.cursor.needs_wrap {
+            return;
+        }
+        left = col;
+    } else if m == 1 {
+        right = col + 1;
+    }
+    let blank = Cell::blank(t.grid.cursor.bg);
+    let r = t.grid.row_mut(t.grid.cursor.line, right);
+    for i in left..right {
+        r[i] = blank;
+    }
+    t.grid.damage_line(t.grid.cursor.line, left, right - 1);
+}
+
+fn clear_screen(t: &mut Term, m: i64) {
+    let bg = t.grid.cursor.bg;
+    let line = t.grid.cursor.line;
+    let col = t.grid.cursor.col;
+    let cols = t.grid.cols;
+    let blank = Cell::blank(bg);
+    if m == 1 {
+        if line > 1 {
+            t.grid.reset_region(0, line, bg);
+        }
+        let mut end = col + 1;
+        if end > cols {
+            end = cols;
+        }
+        let r = t.grid.row_mut(line, end);
+        for i in 0..end {
+            r[i] = blank;
+        }
+    } else if m == 0 {
+        let r = t.grid.row_mut(line, cols);
+        for i in col..cols {
+            r[i] = blank;
+        }
+        if line < t.grid.lines - 1 {
+            t.grid.reset_region(line + 1, t.grid.lines, bg);
+        }
+    } else if m == 2 {
+        if (t.mode & ALT_SCREEN) != 0 {
+            t.grid.reset_region(0, t.grid.lines, bg);
+        } else {
+            let positions = viewport_positions(t);
+            t.grid.clear_viewport(positions, bg);
+        }
+    } else if t.grid.hist() > 0 {
+        t.grid.clear_history();
+    }
+    t.grid.damage_all = true;
+}
+
+// How many lines ED 2 pushes into the scrollback: up to the last cell not
+// empty (Alacritty walks back from the end of the screen; on an empty
+// screen without scrollback it stops at the first cell, so 1).
+fn viewport_positions(t: &mut Term) -> i64 {
+    let mut l = t.grid.lines - 1;
+    while l >= 0 {
+        let r = t.grid.row(l);
+        let mut i = r.len - 1;
+        while i >= 0 {
+            if !t.cell_empty(r[i]) {
+                return l + 1;
+            }
+            i -= 1;
+        }
+        l -= 1;
+    }
+    if t.grid.hist() > 0 { 0 } else { 1 }
+}
+
+fn forward_tabs(t: &mut Term, count: i64) {
+    let cols = t.grid.cols;
+    for _ in 0..count {
+        let mut col = t.grid.cursor.col;
+        if col == cols - 1 {
+            break;
+        }
+        for i in col + 1..cols {
+            col = i;
+            if t.tabs[i] {
+                break;
+            }
+        }
+        t.grid.cursor.col = col;
+    }
+}
+
+fn backward_tabs(t: &mut Term, count: i64) {
+    for _ in 0..count {
+        let mut col = t.grid.cursor.col;
+        if col == 0 {
+            break;
+        }
+        let mut i = col - 1;
+        while i >= 0 {
+            if t.tabs[i] {
+                col = i;
+                break;
+            }
+            i -= 1;
+        }
+        t.grid.cursor.col = col;
+    }
+}
+
+fn set_scrolling_region(t: &mut Term, top: i64, bottom: i64) {
+    if top >= bottom {
+        return;
+    }
+    let lines = t.grid.lines;
+    let start = top - 1;
+    t.region_top = if start < lines { start } else { lines };
+    t.region_bot = if bottom < lines { bottom } else { lines };
+    t.goto(0, 0);
+}
+
+fn device_status(t: &mut Term, arg: i64) {
+    if arg == 5 {
+        t.reply.push_str("\x1b[0n");
+    } else if arg == 6 {
+        t.reply.push_str("\x1b[");
+        t.reply.push_int(t.grid.cursor.line + 1);
+        t.reply.push(';');
+        t.reply.push_int(t.grid.cursor.col + 1);
+        t.reply.push('R');
+    }
+}
+
+fn window_op(t: &mut Term, op: i64) {
+    if op == 14 {
+        // The text area in pixels: only with a window.
+        if t.cell_width > 0 {
+            t.reply.push_str("\x1b[4;");
+            t.reply.push_int(t.grid.lines * t.cell_height);
+            t.reply.push(';');
+            t.reply.push_int(t.grid.cols * t.cell_width);
+            t.reply.push('t');
+        }
+    } else if op == 18 {
+        t.reply.push_str("\x1b[8;");
+        t.reply.push_int(t.grid.lines);
+        t.reply.push(';');
+        t.reply.push_int(t.grid.cols);
+        t.reply.push('t');
+    } else if op == 22 {
+        if t.title_stack.len() >= TITLE_STACK_MAX {
+            let mut first = t.title_stack.remove(0);
+            first.free();
+            t.title_stack_set.remove(0);
+        }
+        let mut copy = Buf::new_in(t.gpa_of());
+        copy.push_str(t.title.as_slice());
+        t.title_stack.push(copy);
+        t.title_stack_set.push(t.has_title);
+    } else if op == 23 {
+        if t.title_stack.len() > 0 {
+            let mut s = t.title_stack.pop().unwrap();
+            let set = t.title_stack_set.pop().unwrap();
+            t.set_title(s.as_slice(), set);
+            s.free();
+        }
+    }
+}
+
+// SM/RM 4 (insert) and 20 (newline).
+fn set_mode(t: &mut Term, m: u16, on: bool) {
+    let mut bit: u32 = 0;
+    if m == 4 {
+        bit = INSERT;
+    } else if m == 20 {
+        bit = LINE_FEED_NEW_LINE;
+    } else {
+        return;
+    }
+    if on {
+        t.mode = t.mode | bit;
+    } else {
+        t.mode = t.mode & ~bit;
+        if m == 4 {
+            t.grid.damage_all = true;
+        }
+    }
+}
+
+fn set_private_mode(t: &mut Term, m: u16, on: bool) {
+    if m == 1 {
+        set_bit(t, APP_CURSOR, on);
+    } else if m == 3 {
+        // DECCOLM: no 132 columns, but its other effects.
+        set_scrolling_region(t, 1, t.grid.lines);
+        let bg = t.grid.cursor.bg;
+        let n = t.grid.lines;
+        t.grid.reset_region(0, n, bg);
+    } else if m == 6 {
+        set_bit(t, ORIGIN, on);
+        if on {
+            t.goto(0, 0);
+        }
+    } else if m == 7 {
+        set_bit(t, LINE_WRAP, on);
+    } else if m == 12 {
+        if !t.style_set {
+            t.style_set = true;
+            t.style_shape = SHAPE_BLOCK;
+        }
+        t.style_blink = on;
+    } else if m == 25 {
+        set_bit(t, SHOW_CURSOR, on);
+    } else if m == 1000 {
+        if on {
+            t.mode = t.mode & ~MOUSE_MODE;
+        }
+        set_bit(t, MOUSE_REPORT_CLICK, on);
+    } else if m == 1002 {
+        if on {
+            t.mode = t.mode & ~MOUSE_MODE;
+        }
+        set_bit(t, MOUSE_DRAG, on);
+    } else if m == 1003 {
+        if on {
+            t.mode = t.mode & ~MOUSE_MODE;
+        }
+        set_bit(t, MOUSE_MOTION, on);
+    } else if m == 1004 {
+        set_bit(t, FOCUS_IN_OUT, on);
+    } else if m == 1005 {
+        if on {
+            t.mode = t.mode & ~SGR_MOUSE;
+        }
+        set_bit(t, UTF8_MOUSE, on);
+    } else if m == 1006 {
+        if on {
+            t.mode = t.mode & ~UTF8_MOUSE;
+        }
+        set_bit(t, SGR_MOUSE, on);
+    } else if m == 1007 {
+        set_bit(t, ALTERNATE_SCROLL, on);
+    } else if m == 1042 {
+        set_bit(t, URGENCY_HINTS, on);
+    } else if m == 1049 {
+        let alt = (t.mode & ALT_SCREEN) != 0;
+        if on != alt {
+            t.swap_alt();
+        }
+    } else if m == 2004 {
+        set_bit(t, BRACKETED_PASTE, on);
+    } else if m == 2026 {
+        // vte holds the bytes after `CSI ? 2026 h` (Term::feed); the end
+        // is found in them, not here.
+        if on {
+            t.sync = true;
+            t.sync_armed = true;
+            t.set_terminated();
+        }
+    }
+}
+
+fn set_bit(t: &mut Term, bit: u32, on: bool) {
+    if on {
+        t.mode = t.mode | bit;
+    } else {
+        t.mode = t.mode & ~bit;
+    }
+}
+
+// DECRQM's answer: 1 set, 2 reset, 0 not recognized.
+fn report_mode(t: &mut Term, m: i64) {
+    let mut state = 0;
+    if m == 4 {
+        state = if (t.mode & INSERT) != 0 { 1 } else { 2 };
+    } else if m == 20 {
+        state = if (t.mode & LINE_FEED_NEW_LINE) != 0 { 1 } else { 2 };
+    }
+    t.reply.push_str("\x1b[");
+    t.reply.push_int(m);
+    t.reply.push(';');
+    t.reply.push_int(state);
+    t.reply.push_str("$y");
+}
+
+fn report_private_mode(t: &mut Term, m: i64) {
+    let mut bit: u32 = 0;
+    let mut state = 0;
+    if m == 1 {
+        bit = APP_CURSOR;
+    } else if m == 6 {
+        bit = ORIGIN;
+    } else if m == 7 {
+        bit = LINE_WRAP;
+    } else if m == 12 {
+        if !t.style_set {
+            t.style_set = true;
+            t.style_shape = SHAPE_BLOCK;
+            t.style_blink = false;
+        }
+        state = if t.style_blink { 1 } else { 2 };
+    } else if m == 25 {
+        bit = SHOW_CURSOR;
+    } else if m == 1000 {
+        bit = MOUSE_REPORT_CLICK;
+    } else if m == 1002 {
+        bit = MOUSE_DRAG;
+    } else if m == 1003 {
+        bit = MOUSE_MOTION;
+    } else if m == 1004 {
+        bit = FOCUS_IN_OUT;
+    } else if m == 1005 {
+        bit = UTF8_MOUSE;
+    } else if m == 1006 {
+        bit = SGR_MOUSE;
+    } else if m == 1007 {
+        bit = ALTERNATE_SCROLL;
+    } else if m == 1042 {
+        bit = URGENCY_HINTS;
+    } else if m == 1049 {
+        bit = ALT_SCREEN;
+    } else if m == 2004 {
+        bit = BRACKETED_PASTE;
+    } else if m == 2026 {
+        state = 2;
+    }
+    if bit != 0 {
+        state = if (t.mode & bit) != 0 { 1 } else { 2 };
+    }
+    t.reply.push_str("\x1b[?");
+    t.reply.push_int(m);
+    t.reply.push(';');
+    t.reply.push_int(state);
+    t.reply.push_str("$y");
+}
+
+// ---- SGR ----
+
+fn sgr(t: &mut Term, p: &Params) {
+    let mut it = ParamIter::new();
+    let mut g = it.next(p);
+    while g >= 0 {
+        let n = p.group_len(g);
+        let v = p.value(g);
+        if n == 1 {
+            sgr_one(t, p, &mut it, v);
+        } else if v == 4 {
+            let s = p.value(g + 1);
+            if n == 2 && s == 0 {
+                t.grid.cursor.flags = t.grid.cursor.flags & ~ALL_UNDERLINES;
+            } else if n == 2 && s >= 2 && s <= 5 {
+                let u = if s == 2 { DOUBLE_UNDERLINE } else if s == 3 { UNDERCURL }
+                    else if s == 4 { DOTTED_UNDERLINE } else { DASHED_UNDERLINE };
+                t.grid.cursor.flags = (t.grid.cursor.flags & ~ALL_UNDERLINES) | u;
+            } else {
+                t.grid.cursor.flags = (t.grid.cursor.flags & ~ALL_UNDERLINES) | UNDERLINE;
+            }
+        } else if v == 38 || v == 48 || v == 58 {
+            let c = colon_color(p.group(g)[1..]);
+            if c != NO_COLOR {
+                set_color_attr(t, v, c);
+            }
+        }
+        g = it.next(p);
+    }
+}
+
+fn set_color_attr(t: &mut Term, which: u16, c: u32) {
+    if which == 38 {
+        t.grid.cursor.fg = c;
+    } else if which == 48 {
+        t.grid.cursor.bg = c;
+    } else {
+        t.grid.cursor.ul = c;
+        t.tmpl_changed();
+    }
+}
+
+// One SGR parameter without sub-parameters.
+fn sgr_one(t: &mut Term, p: &Params, it: &mut ParamIter, v: u16) {
+    if v == 0 {
+        t.grid.cursor.fg = DEFAULT_FG;
+        t.grid.cursor.bg = DEFAULT_BG;
+        t.grid.cursor.flags = 0;
+        if t.grid.cursor.ul != NO_COLOR {
+            t.grid.cursor.ul = NO_COLOR;
+            t.tmpl_changed();
+        }
+    } else if v == 1 {
+        add_flag(t, BOLD);
+    } else if v == 2 {
+        add_flag(t, DIM);
+    } else if v == 3 {
+        add_flag(t, ITALIC);
+    } else if v == 4 {
+        t.grid.cursor.flags = (t.grid.cursor.flags & ~ALL_UNDERLINES) | UNDERLINE;
+    } else if v == 7 {
+        add_flag(t, INVERSE);
+    } else if v == 8 {
+        add_flag(t, HIDDEN);
+    } else if v == 9 {
+        add_flag(t, STRIKEOUT);
+    } else if v == 21 {
+        del_flag(t, BOLD);
+    } else if v == 22 {
+        del_flag(t, BOLD | DIM);
+    } else if v == 23 {
+        del_flag(t, ITALIC);
+    } else if v == 24 {
+        del_flag(t, ALL_UNDERLINES);
+    } else if v == 27 {
+        del_flag(t, INVERSE);
+    } else if v == 28 {
+        del_flag(t, HIDDEN);
+    } else if v == 29 {
+        del_flag(t, STRIKEOUT);
+    } else if v >= 30 && v <= 37 {
+        t.grid.cursor.fg = named((v - 30) as u32);
+    } else if v == 38 || v == 48 || v == 58 {
+        let col = semicolon_color(p, it);
+        if col != NO_COLOR {
+            set_color_attr(t, v, col);
+        }
+    } else if v == 39 {
+        t.grid.cursor.fg = DEFAULT_FG;
+    } else if v >= 40 && v <= 47 {
+        t.grid.cursor.bg = named((v - 40) as u32);
+    } else if v == 49 {
+        t.grid.cursor.bg = DEFAULT_BG;
+    } else if v == 59 {
+        if t.grid.cursor.ul != NO_COLOR {
+            t.grid.cursor.ul = NO_COLOR;
+            t.tmpl_changed();
+        }
+    } else if v >= 90 && v <= 97 {
+        t.grid.cursor.fg = named((v - 90 + 8) as u32);
+    } else if v >= 100 && v <= 107 {
+        t.grid.cursor.bg = named((v - 100 + 8) as u32);
+    }
+}
+
+fn add_flag(t: &mut Term, f: u16) {
+    t.grid.cursor.flags = t.grid.cursor.flags | f;
+}
+
+fn del_flag(t: &mut Term, f: u16) {
+    t.grid.cursor.flags = t.grid.cursor.flags & ~f;
+}
+
+// `38;5;n` and `38;2;r;g;b`: the colour from the following parameters
+// (their first values), taken one by one up to the first that fails, as
+// vte's `parse_sgr_color`.
+fn semicolon_color(p: &Params, it: &mut ParamIter) -> u32 {
+    let g = it.next(p);
+    if g < 0 {
+        return NO_COLOR;
+    }
+    let kind = p.value(g);
+    if kind == 2 {
+        let mut c: [u32; 3] = [0; 3];
+        for k in 0..3 {
+            let h = it.next(p);
+            if h < 0 {
+                return NO_COLOR;
+            }
+            let v = p.value(h);
+            if v > 255 {
+                return NO_COLOR;
+            }
+            c[k] = v as u32;
+        }
+        return rgb(c[0], c[1], c[2]);
+    }
+    if kind == 5 {
+        let h = it.next(p);
+        if h < 0 {
+            return NO_COLOR;
+        }
+        let v = p.value(h);
+        if v > 255 {
+            return NO_COLOR;
+        }
+        return indexed(v as u32);
+    }
+    NO_COLOR
+}
+
+// `38:2::r:g:b`, `38:2:r:g:b`, `38:5:n`: vte's `handle_colon_rgb` on the
+// group after its first value.
+fn colon_color(s: [u16]) -> u32 {
+    // The kind, then the values (a colour space id skipped when there are
+    // more than four).
+    let start = if s.len > 4 { 2 } else { 1 };
+    let kind = s[0];
+    let rest = s[start..];
+    if kind == 2 {
+        if rest.len < 3 {
+            return NO_COLOR;
+        }
+        if rest[0] > 255 || rest[1] > 255 || rest[2] > 255 {
+            return NO_COLOR;
+        }
+        return rgb(rest[0] as u32, rest[1] as u32, rest[2] as u32);
+    }
+    if kind == 5 {
+        if rest.len < 1 || rest[0] > 255 {
+            return NO_COLOR;
+        }
+        return indexed(rest[0] as u32);
+    }
+    NO_COLOR
+}
+
+// ---- OSC ----
+
+pub fn osc_dispatch(t: &mut Term, o: &Osc, bell: bool) {
+    let n = o.count;
+    if n == 0 || o.param(0).len == 0 {
+        return;
+    }
+    let p0 = o.param(0);
+    if p0 == "0" || p0 == "2" {
+        if n >= 2 {
+            osc_title(t, o);
+        }
+    } else if p0 == "4" {
+        if n <= 1 || n % 2 == 0 {
+            return;
+        }
+        let mut k = 1;
+        while k < n {
+            let index = parse_number(o.param(k));
+            if index >= 0 {
+                let spec = o.param(k + 1);
+                let c = xparse_color(spec);
+                if c >= 0 {
+                    t.colors[index] = c;
+                    t.grid.damage_all = true;
+                } else if spec == "?" {
+                    t.ask_color(index, index, !bell);
+                }
+            }
+            k += 2;
+        }
+    } else if p0 == "8" && n > 2 {
+        osc_hyperlink(t, o);
+    } else if p0 == "10" || p0 == "11" || p0 == "12" {
+        if n < 2 {
+            return;
+        }
+        let mut code = parse_number(p0);
+        for k in 1..n {
+            let index = 256 + code - 10;
+            if index > 258 {
+                break;
+            }
+            let spec = o.param(k);
+            let c = xparse_color(spec);
+            if c >= 0 {
+                t.colors[index] = c;
+            } else if spec == "?" {
+                t.ask_color(index, -1, !bell);
+            }
+            code += 1;
+        }
+    } else if p0 == "50" {
+        if n >= 2 {
+            let s = o.param(1);
+            if s.len >= 13 && s[0..12] == "CursorShape=" {
+                let k = s[12];
+                let mut shape: u8 = 255;
+                if k == '0' {
+                    shape = SHAPE_BLOCK;
+                } else if k == '1' {
+                    shape = SHAPE_BEAM;
+                } else if k == '2' {
+                    shape = SHAPE_UNDERLINE;
+                }
+                if shape != 255 {
+                    if !t.style_set {
+                        t.style_set = true;
+                        t.style_blink = false;
+                    }
+                    t.style_shape = shape;
+                }
+            }
+        }
+    } else if p0 == "52" {
+        if n < 3 {
+            return;
+        }
+        let which = o.param(1);
+        let kind = if which.len > 0 { which[0] } else { 'c' };
+        let data = o.param(2);
+        if data == "?" {
+            // Loading the clipboard is off (Alacritty's default).
+            return;
+        }
+        if kind != 'c' && kind != 'p' && kind != 's' {
+            return;
+        }
+        osc_clipboard(t, if kind == 'c' { 'c' } else { 's' }, data);
+    } else if p0 == "104" {
+        if n == 1 || o.param(1).len == 0 {
+            for i in 0..256 {
+                t.colors[i] = -1;
+            }
+            return;
+        }
+        for k in 1..n {
+            let index = parse_number(o.param(k));
+            if index >= 0 {
+                t.colors[index] = -1;
+            }
+        }
+    } else if p0 == "110" {
+        t.colors[256] = -1;
+    } else if p0 == "111" {
+        t.colors[257] = -1;
+    } else if p0 == "112" {
+        t.colors[258] = -1;
+    }
+}
+
+// OSC 0/2: the parameters that are valid UTF-8, joined with `;`, trimmed
+// of white space (Rust's `str::trim`).
+fn osc_title(t: &mut Term, o: &Osc) {
+    let mut b = Buf::new_in(t.gpa_of());
+    let mut first = true;
+    for k in 1..o.count {
+        let s = o.param(k);
+        if valid_utf8(s) {
+            if !first {
+                b.push(';');
+            }
+            b.push_str(s);
+            first = false;
+        }
+    }
+    let s = trim_unicode(b.as_slice());
+    t.set_title(s, true);
+    b.free();
+}
+
+// OSC 8: `8 ; params ; uri`, the URI's `;` kept.
+fn osc_hyperlink(t: &mut Term, o: &Osc) {
+    let mut uri = Buf::new_in(t.gpa_of());
+    for k in 2..o.count {
+        if k > 2 {
+            uri.push(';');
+        }
+        let s = o.param(k);
+        if valid_utf8(s) {
+            uri.push_str(s);
+        }
+    }
+    if uri.len() == 0 {
+        if t.grid.cursor.link != 0 {
+            t.grid.cursor.link = 0;
+            t.tmpl_changed();
+        }
+        uri.free();
+        return;
+    }
+    // `id=` among the `:`-separated parameters.
+    let params = o.param(1);
+    let mut id_start = -1;
+    let mut id_end = -1;
+    let mut at = 0;
+    while at <= params.len {
+        let mut end = at;
+        while end < params.len && params[end] != ':' {
+            end += 1;
+        }
+        let kv = params[at..end];
+        if kv.len >= 3 && kv[0..3] == "id=" {
+            if valid_utf8(kv[3..]) {
+                id_start = at + 3;
+                id_end = end;
+            }
+            break;
+        }
+        at = end + 1;
+    }
+    let mut link = 0;
+    if id_start >= 0 {
+        link = t.extras.make_link(params[id_start..id_end], false, uri.as_slice());
+    } else {
+        link = t.extras.make_link("", true, uri.as_slice());
+    }
+    t.grid.cursor.link = link;
+    t.tmpl_changed();
+    uri.free();
+}
+
+fn osc_clipboard(t: &mut Term, kind: u8, data: [u8]) {
+    let mut out = Buf::new_in(t.gpa_of());
+    if base64_decode(data, &mut out) && valid_utf8(out.as_slice()) {
+        t.clip_kind.push(kind);
+        t.clip_text.push(out);
+    } else {
+        out.free();
+    }
+}
+
+// ---- parsing helpers, as vte's ----
+
+// A decimal 0..255 (vte's `parse_number`), or -1.
+pub fn parse_number(s: [u8]) -> i64 {
+    if s.len == 0 {
+        return -1;
+    }
+    let mut n = 0;
+    for c in s {
+        if c < '0' || c > '9' {
+            return -1;
+        }
+        n = n * 10 + (c - '0') as i64;
+        if n > 255 {
+            return -1;
+        }
+    }
+    n
+}
+
+// XParseColor's `#rgb` and `rgb:r/g/b` forms (vte's `xparse_color`): an
+// RGB value, or -1.
+pub fn xparse_color(s: [u8]) -> i64 {
+    if s.len > 0 && s[0] == '#' {
+        return legacy_color(s[1..]);
+    }
+    if s.len >= 4 && s[0..4] == "rgb:" {
+        return rgb_color(s[4..]);
+    }
+    -1
+}
+
+// `rgb:r/g/b`: exactly three parts split at `/`, each 1 to 4 hex digits
+// (`+` allowed first, as `from_str_radix` allows), scaled to 8 bits.
+fn rgb_color(s: [u8]) -> i64 {
+    if !valid_utf8(s) {
+        return -1;
+    }
+    let mut starts: [i64; 3] = [0; 3];
+    let mut ends: [i64; 3] = [0; 3];
+    let mut count = 0;
+    let mut at = 0;
+    loop {
+        let mut end = at;
+        while end < s.len && s[end] != '/' {
+            end += 1;
+        }
+        if count < 3 {
+            starts[count] = at;
+            ends[count] = end;
+        }
+        count += 1;
+        if end == s.len {
+            break;
+        }
+        at = end + 1;
+    }
+    if count != 3 {
+        return -1;
+    }
+    let mut out = 0;
+    for k in 0..3 {
+        let part = s[starts[k]..ends[k]];
+        if part.len > 4 {
+            return -1;
+        }
+        let v = radix16(part);
+        if v < 0 {
+            return -1;
+        }
+        let max = (1 << (4 * part.len)) - 1;
+        out = (out << 8) | ((255 * v / max) & 0xFF);
+    }
+    out
+}
+
+// `#` followed by three equal parts (the last one takes the rest), each
+// truncated or padded to two hex digits.
+fn legacy_color(s: [u8]) -> i64 {
+    let n = s.len / 3;
+    let a = legacy_part(s[0..n]);
+    let b = legacy_part(s[n..2 * n]);
+    let c = legacy_part(s[2 * n..]);
+    if a < 0 || b < 0 || c < 0 {
+        return -1;
+    }
+    (a << 16) | (b << 8) | c
+}
+
+fn legacy_part(s: [u8]) -> i64 {
+    let v = radix16_u64(s);
+    if v < 0 {
+        return -1;
+    }
+    // `(col << 4) >> (4 * (len - 1))` on a 64-bit usize (the shift taken
+    // mod 64, as a release build does), then `as u8`.
+    let col = (v as u64) << 4;
+    let mut shift = 0;
+    if s.len > 1 {
+        shift = 4 * (s.len - 1);
+    }
+    let r = col >> ((shift & 63) as u64);
+    (r & 0xFF) as i64
+}
+
+// `u32::from_str_radix(s, 16)`: an optional `+`, then hex digits; -1 when
+// empty, invalid or over u32.
+fn radix16(s: [u8]) -> i64 {
+    let mut d = s;
+    if d.len > 0 && d[0] == '+' {
+        d = d[1..];
+    }
+    if d.len == 0 {
+        return -1;
+    }
+    let mut v = 0;
+    for c in d {
+        let h = hex(c);
+        if h < 0 {
+            return -1;
+        }
+        v = v * 16 + h;
+        if v > 0xFFFFFFFF {
+            return -1;
+        }
+    }
+    v
+}
+
+// `usize::from_str_radix(s, 16)` (64 bits): -1 when invalid or over u64.
+// Over i64's range it is still a valid usize: kept as its bits in a
+// non-negative i64 by working on u64.
+fn radix16_u64(s: [u8]) -> i64 {
+    let mut d = s;
+    if d.len > 0 && d[0] == '+' {
+        d = d[1..];
+    }
+    if d.len == 0 {
+        return -1;
+    }
+    let mut v: u64 = 0;
+    for c in d {
+        let h = hex(c);
+        if h < 0 {
+            return -1;
+        }
+        if v > 0x0FFFFFFFFFFFFFFF {
+            return -1;
+        }
+        v = v * 16 + h as u64;
+    }
+    // Only the low 12 bits matter to the caller (col << 4 >> shift, as u8
+    // after shifts of at most 60): keep the value's low 60 bits.
+    (v & 0x0FFFFFFFFFFFFFFF) as i64
+}
+
+fn hex(c: u8) -> i64 {
+    if c >= '0' && c <= '9' {
+        (c - '0') as i64
+    } else if c >= 'a' && c <= 'f' {
+        (c - 'a') as i64 + 10
+    } else if c >= 'A' && c <= 'F' {
+        (c - 'A') as i64 + 10
+    } else {
+        -1
+    }
+}
+
+// Whether `s` is valid UTF-8 (Rust's rules: utf8.tach).
+pub fn valid_utf8(s: [u8]) -> bool {
+    let mut i = 0;
+    while i < s.len {
+        let b = s[i];
+        if b < 0x80 {
+            i += 1;
+            continue;
+        }
+        let n = crate::vt::utf8::seq_len(b);
+        if n == 0 || i + n > s.len {
+            return false;
+        }
+        for k in 1..n {
+            if !crate::vt::utf8::continues(b, k, s[i + k]) {
+                return false;
+            }
+        }
+        i += n;
+    }
+    true
+}
+
+// Rust's `str::trim`: Unicode White_Space at both ends.
+fn trim_unicode(s: [u8]) -> [u8] {
+    let mut a = 0;
+    let mut b = s.len;
+    while a < b {
+        let n = space_len(s, a);
+        if n == 0 {
+            break;
+        }
+        a += n;
+    }
+    while b > a {
+        // the start of the last character
+        let mut k = b - 1;
+        while k > a && (s[k] & 0xC0) == 0x80 {
+            k -= 1;
+        }
+        if space_len(s, k) != b - k {
+            break;
+        }
+        b = k;
+    }
+    s[a..b]
+}
+
+// The length of the White_Space character at `s[i]`, or 0.
+fn space_len(s: [u8], i: i64) -> i64 {
+    let b = s[i];
+    if b == 0x20 || (b >= 0x09 && b <= 0x0D) {
+        return 1;
+    }
+    if b < 0x80 {
+        return 0;
+    }
+    let n = crate::vt::utf8::seq_len(b);
+    if n == 0 || i + n > s.len {
+        return 0;
+    }
+    let c = crate::vt::utf8::decode(s[i..i + n], n);
+    if c == 0x85 || c == 0xA0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200A) || c == 0x2028
+        || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000 {
+        n
+    } else {
+        0
+    }
+}
+
+// Base64 with padding, strict (the `base64` crate's STANDARD engine:
+// canonical padding, no trailing bits); false when invalid.
+pub fn base64_decode(s: [u8], out: &mut Buf) -> bool {
+    if s.len % 4 != 0 {
+        return false;
+    }
+    let mut i = 0;
+    while i < s.len {
+        let mut v: [i64; 4] = [0; 4];
+        let mut pad = 0;
+        for k in 0..4 {
+            let c = s[i + k];
+            if c == '=' {
+                // Padding only in the last quantum, at its end.
+                if i + 4 != s.len || k < 2 {
+                    return false;
+                }
+                pad += 1;
+                v[k] = 0;
+            } else {
+                if pad > 0 {
+                    return false;
+                }
+                let d = b64(c);
+                if d < 0 {
+                    return false;
+                }
+                v[k] = d;
+            }
+        }
+        let bits = (v[0] << 18) | (v[1] << 12) | (v[2] << 6) | v[3];
+        out.push(((bits >> 16) & 0xFF) as u8);
+        if pad == 2 {
+            if (bits & 0xFFFF) != 0 {
+                return false;
+            }
+        } else if pad == 1 {
+            out.push(((bits >> 8) & 0xFF) as u8);
+            if (bits & 0xFF) != 0 {
+                return false;
+            }
+        } else {
+            out.push(((bits >> 8) & 0xFF) as u8);
+            out.push((bits & 0xFF) as u8);
+        }
+        i += 4;
+    }
+    true
+}
+
+fn b64(c: u8) -> i64 {
+    if c >= 'A' && c <= 'Z' {
+        (c - 'A') as i64
+    } else if c >= 'a' && c <= 'z' {
+        (c - 'a') as i64 + 26
+    } else if c >= '0' && c <= '9' {
+        (c - '0') as i64 + 52
+    } else if c == '+' {
+        62
+    } else if c == '/' {
+        63
+    } else {
+        -1
+    }
+}
+
+impl Term {
+    pub fn gpa_of(self: &mut Term) -> Gpa {
+        self.extras.gpa
+    }
+}

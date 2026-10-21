@@ -1,0 +1,474 @@
+// The grid: the screen and its scrollback, a ring of rows.
+//
+// The cells of every row are in one Vec, `cols` cells per slot; `inner`
+// is the ring of slots, as Alacritty's `Storage` is a ring of rows: line
+// L of the screen (0 at the top) is at ring index `zero + (lines - L -
+// 1)` (mod the ring's length), the scrollback above it. Scrolling the
+// whole screen turns the ring (`zero`): no cell is copied; scrolling a
+// region swaps slots. The ring grows 1000 rows at a time as the
+// scrollback does (Alacritty's MAX_CACHE_SIZE), so an idle terminal
+// holds only its screen.
+//
+// This is alacritty_terminal 0.26's `Storage` and `Grid` step by step,
+// rows kept beyond the scrollback and their `occ` included: a row's reset
+// clears only the cells written since the last one (unless its last
+// cell's background differs from the new one), which shows when a resize
+// has padded a row, and the oracle compares that too.
+//
+// Each grid has its cursor and saved cursor, as Alacritty's `Grid`.
+
+use super::cell::{
+    ALL_UNDERLINES, Cell, DEFAULT_BG, DEFAULT_FG, INVERSE, LEADING_WIDE_CHAR_SPACER, STRIKEOUT,
+    WIDE_CHAR_SPACER, WRAPLINE,
+};
+
+// The cursor, with the template cells are written with (Alacritty's
+// `Cursor<Cell>`): the template's underline colour and hyperlink are
+// kept here, and turned into an extra (extra.tach) when written.
+pub struct Cursor {
+    pub line: i64,
+    pub col: i64,
+    pub needs_wrap: bool,
+    pub fg: u32,
+    pub bg: u32,
+    pub flags: u16,
+    // The underline colour, or NO_COLOR.
+    pub ul: u32,
+    // The hyperlink (an index into the links table), or 0.
+    pub link: i64,
+    // G0..G3: 0 ASCII, 1 DEC special graphics.
+    pub charsets: [u8; 4],
+}
+
+pub const NO_COLOR: u32 = 0xFFFFFFFF;
+
+// Rows added to the ring at a time, and kept past the scrollback.
+pub const CACHE: i64 = 1000;
+
+pub fn default_cursor() -> Cursor {
+    Cursor {
+        line: 0,
+        col: 0,
+        needs_wrap: false,
+        fg: DEFAULT_FG,
+        bg: DEFAULT_BG,
+        flags: 0,
+        ul: NO_COLOR,
+        link: 0,
+        charsets: [0; 4],
+    }
+}
+
+pub struct Grid {
+    pub cells: Vec<Cell>,
+    // Per slot: the cells written since its last reset are [0, occ).
+    pub occ: Vec<i64>,
+    // Slots no row uses.
+    pub free_slots: Vec<i64>,
+    // The ring of slots (Alacritty's `Storage::inner`).
+    pub inner: Vec<i64>,
+    pub zero: i64,
+    // Scrollback and screen lines (Alacritty's `Storage::len`).
+    pub len: i64,
+    pub lines: i64,
+    pub cols: i64,
+    pub max_hist: i64,
+    pub cursor: Cursor,
+    pub saved: Cursor,
+    // Damage: per screen line, the first and last column changed (lo >
+    // hi: none); `all` when everything is.
+    pub damage_lo: Vec<i64>,
+    pub damage_hi: Vec<i64>,
+    pub damage_all: bool,
+    pub gpa: Gpa,
+}
+
+impl Grid {
+    pub fn new_in(lines: i64, cols: i64, max_hist: i64, gpa: Gpa) -> Grid {
+        let mut g = Grid {
+            cells: Vec::new_in(gpa),
+            occ: Vec::new_in(gpa),
+            free_slots: Vec::new_in(gpa),
+            inner: Vec::new_in(gpa),
+            zero: 0,
+            len: lines,
+            lines: lines,
+            cols: cols,
+            max_hist: max_hist,
+            cursor: default_cursor(),
+            saved: default_cursor(),
+            damage_lo: Vec::new_in(gpa),
+            damage_hi: Vec::new_in(gpa),
+            damage_all: true,
+            gpa: gpa,
+        };
+        g.cells.reserve(lines * cols);
+        for _ in 0..lines {
+            let s = g.new_slot();
+            g.inner.push(s);
+            g.damage_lo.push(0);
+            g.damage_hi.push(cols - 1);
+        }
+        g
+    }
+
+    pub fn free(self: &mut Grid) {
+        self.cells.free();
+        self.occ.free();
+        self.free_slots.free();
+        self.inner.free();
+        self.damage_lo.free();
+        self.damage_hi.free();
+    }
+
+    // A slot holding a new row (Alacritty's `Row::new`): default cells.
+    pub fn new_slot(self: &mut Grid) -> i64 {
+        if self.free_slots.len() > 0 {
+            let s = self.free_slots.pop().unwrap();
+            let base = s * self.cols;
+            let blank = Cell::blank(DEFAULT_BG);
+            for i in base..base + self.cols {
+                self.cells[i] = blank;
+            }
+            self.occ[s] = 0;
+            return s;
+        }
+        let s = self.occ.len();
+        for _ in 0..self.cols {
+            self.cells.push(Cell::blank(DEFAULT_BG));
+        }
+        self.occ.push(0);
+        s
+    }
+
+    #[inline]
+
+    pub fn hist(self: &Grid) -> i64 {
+        self.len - self.lines
+    }
+
+    // Alacritty's `topmost_line`.
+    #[inline]
+    pub fn topmost(self: &Grid) -> i64 {
+        self.lines - self.len
+    }
+
+    // The ring index of line `l` (`compute_index`).
+    #[inline]
+    pub fn index(self: &Grid, l: i64) -> i64 {
+        let z = self.zero + self.lines - l - 1;
+        let n = self.inner.len();
+        if z >= n { z - n } else { z }
+    }
+
+    // The slot of line `l` (-hist <= l < lines).
+    #[inline]
+    pub fn slot(self: &Grid, l: i64) -> i64 {
+        self.inner[self.index(l)]
+    }
+
+    // The cells of line `l`, to read.
+    #[inline]
+    pub fn row(self: &Grid, l: i64) -> [Cell] {
+        let start = self.slot(l) * self.cols;
+        self.cells.as_slice()[start..start + self.cols]
+    }
+
+    // Where line `l`'s cells start in `cells`.
+    #[inline]
+    pub fn start(self: &Grid, l: i64) -> i64 {
+        self.slot(l) * self.cols
+    }
+
+    // The cells of line `l`, to write; [0, upto) are marked written
+    // (Alacritty's `IndexMut` on a row keeps its `occ`).
+    pub fn row_mut(self: &mut Grid, l: i64, upto: i64) -> &mut [Cell] {
+        let s = self.slot(l);
+        if self.occ[s] < upto {
+            self.occ[s] = upto;
+        }
+        let start = s * self.cols;
+        let end = start + self.cols;
+        &mut self.cells.as_mut_slice()[start..end]
+    }
+
+    // The cells of line `l` up to `upto` are written (Alacritty's
+    // `IndexMut` on a row, which keeps its `occ`).
+    #[inline]
+    pub fn touch(self: &mut Grid, l: i64, upto: i64) {
+        let s = self.slot(l);
+        if self.occ[s] < upto {
+            self.occ[s] = upto;
+        }
+    }
+
+    #[inline]
+
+    pub fn damage_line(self: &mut Grid, l: i64, lo: i64, hi: i64) {
+        if l < 0 || l >= self.lines {
+            return;
+        }
+        if lo < self.damage_lo[l] {
+            self.damage_lo[l] = lo;
+        }
+        if hi > self.damage_hi[l] {
+            self.damage_hi[l] = hi;
+        }
+    }
+
+    pub fn reset_damage(self: &mut Grid) {
+        for l in 0..self.lines {
+            self.damage_lo[l] = self.cols;
+            self.damage_hi[l] = -1;
+        }
+        self.damage_all = false;
+    }
+
+    // Alacritty's `Row::reset` with a template of background `bg`: the
+    // written cells blank (all of them when the last cell's background is
+    // not `bg`).
+    #[inline]
+    pub fn reset_slot(self: &mut Grid, s: i64, bg: u32) {
+        let base = s * self.cols;
+        if self.cells[base + self.cols - 1].bg != bg {
+            self.occ[s] = self.cols;
+        }
+        let blank = Cell::blank(bg);
+        let end = base + self.occ[s];
+        let r = &mut self.cells.as_mut_slice()[base..end];
+        for i in 0..r.len {
+            r[i] = blank;
+        }
+        self.occ[s] = 0;
+    }
+
+    #[inline]
+
+    pub fn reset_row(self: &mut Grid, l: i64, bg: u32) {
+        let s = self.slot(l);
+        self.reset_slot(s, bg);
+    }
+
+    // ---- Alacritty's Storage ----
+
+    fn rezero(self: &mut Grid) {
+        if self.zero == 0 {
+            return;
+        }
+        let n = self.inner.len();
+        let mut v: Vec<i64> = Vec::with_capacity_in(n, self.gpa);
+        for k in 0..n {
+            let mut i = k + self.zero;
+            if i >= n {
+                i -= n;
+            }
+            v.push(self.inner[i]);
+        }
+        self.inner.free();
+        self.inner = v;
+        self.zero = 0;
+    }
+
+    // `Storage::initialize`: `additional` more lines, the ring growing by
+    // CACHE (or more) when it is full.
+    pub fn initialize(self: &mut Grid, additional: i64) {
+        if self.len + additional > self.inner.len() {
+            self.rezero();
+            let more = if additional > CACHE { additional } else { CACHE };
+            for _ in 0..more {
+                let s = self.new_slot();
+                self.inner.push(s);
+            }
+        }
+        self.len += additional;
+    }
+
+    // `Storage::shrink_lines`.
+    pub fn shrink_storage(self: &mut Grid, n: i64) {
+        self.len -= n;
+        if self.inner.len() > self.len + CACHE {
+            self.truncate();
+        }
+    }
+
+    // `Storage::truncate`: the rows past `len` go.
+    pub fn truncate(self: &mut Grid) {
+        self.rezero();
+        while self.inner.len() > self.len {
+            let s = self.inner.pop().unwrap();
+            self.free_slots.push(s);
+        }
+    }
+
+    // Turns the ring by `count` (|count| at most its length).
+    #[inline]
+    pub fn rotate(self: &mut Grid, count: i64) {
+        let n = self.inner.len();
+        let mut z = self.zero + count;
+        if z < 0 {
+            z += n;
+        } else if z >= n {
+            z -= n;
+        }
+        self.zero = z;
+    }
+
+    #[inline]
+    fn swap_lines(self: &mut Grid, a: i64, b: i64) {
+        let ia = self.index(a);
+        let ib = self.index(b);
+        self.inner.swap(ia, ib);
+    }
+
+    // ---- Alacritty's Grid ----
+
+    fn increase_scroll_limit(self: &mut Grid, count: i64) {
+        let mut n = count;
+        let room = self.max_hist - self.hist();
+        if n > room {
+            n = room;
+        }
+        if n > 0 {
+            self.initialize(n);
+        }
+    }
+
+    pub fn decrease_scroll_limit(self: &mut Grid, count: i64) {
+        let mut n = count;
+        if n > self.hist() {
+            n = self.hist();
+        }
+        if n > 0 {
+            self.shrink_storage(n);
+        }
+    }
+
+    // `Grid::scroll_up` over the lines [top, bot): `n` lines leave at the
+    // top (into the scrollback when `top` is 0), blank lines with the
+    // background `bg` come in at the bottom.
+    pub fn scroll_up(self: &mut Grid, top: i64, bot: i64, n: i64, bg: u32) {
+        self.damage_all = true;
+        if bot - top <= n && top != 0 {
+            for l in top..bot {
+                self.reset_row(l, bg);
+            }
+            return;
+        }
+        if top == 0 {
+            self.increase_scroll_limit(n);
+            self.rotate(-n);
+            // The lines below the region back into place.
+            let mut l = self.lines - 1;
+            while l >= bot {
+                self.swap_lines(l, l - n);
+                l -= 1;
+            }
+        } else {
+            // swap_lines(l, l + n) for each l, the ring indices kept here.
+            let len = self.inner.len();
+            let z = self.zero + self.lines - 1;
+            let v = self.inner.as_mut_slice();
+            for l in top..bot - n {
+                let mut a = z - l;
+                if a >= len {
+                    a -= len;
+                }
+                let mut b = z - l - n;
+                if b >= len {
+                    b -= len;
+                }
+                let t = v[a];
+                v[a] = v[b];
+                v[b] = t;
+            }
+        }
+        for l in bot - n..bot {
+            self.reset_row(l, bg);
+        }
+    }
+
+    // `Grid::scroll_down` over [top, bot): n blank lines come in at the
+    // top of the region, its last n lines are lost.
+    pub fn scroll_down(self: &mut Grid, top: i64, bot: i64, n: i64, bg: u32) {
+        self.damage_all = true;
+        if bot - top <= n {
+            for l in top..bot {
+                self.reset_row(l, bg);
+            }
+            return;
+        }
+        if self.max_hist == 0 {
+            // Without scrollback the whole ring turns: the fixed lines at
+            // the bottom first, then the rotation, then the fixed top ones.
+            for l in bot..self.lines {
+                self.swap_lines(l, l - n);
+            }
+            let len = self.inner.len();
+            self.zero = (self.zero + n) % len;
+            for l in 0..n {
+                self.reset_row(l, bg);
+            }
+            for l in 0..top {
+                self.swap_lines(l, l + n);
+            }
+        } else {
+            let mut l = bot - 1;
+            while l >= top + n {
+                self.swap_lines(l, l - n);
+                l -= 1;
+            }
+            let mut l = top + n - 1;
+            while l >= top {
+                self.reset_row(l, bg);
+                l -= 1;
+            }
+        }
+    }
+
+    // `Grid::reset_region`: lines [from, to) blank.
+    pub fn reset_region(self: &mut Grid, from: i64, to: i64, bg: u32) {
+        for l in from..to {
+            self.reset_row(l, bg);
+        }
+        self.damage_all = true;
+    }
+
+    // Removes the scrollback.
+    pub fn clear_history(self: &mut Grid) {
+        let h = self.hist();
+        self.shrink_storage(h);
+    }
+
+    // `Grid::clear_viewport` (ED 2 on the primary screen): `positions`
+    // lines (up to the last one not empty, found by the terminal, which
+    // sees the extras) go into the scrollback, the screen is blank.
+    pub fn clear_viewport(self: &mut Grid, positions: i64, bg: u32) {
+        self.scroll_up(0, self.lines, positions, bg);
+        for l in 0..self.lines - positions {
+            self.reset_row(l, bg);
+        }
+        self.damage_all = true;
+    }
+
+    // `Grid::reset` (RIS): no scrollback, default cursors, blank lines.
+    pub fn reset(self: &mut Grid) {
+        self.clear_history();
+        self.saved = default_cursor();
+        self.cursor = default_cursor();
+        for l in 0..self.lines {
+            self.reset_row(l, DEFAULT_BG);
+        }
+        self.damage_all = true;
+    }
+}
+
+// Alacritty's `GridCell::is_empty` for a cell (its extra checked apart:
+// a cell with combining characters is not empty; see Term::cell_empty).
+#[inline]
+pub fn is_empty(c: Cell) -> bool {
+    let ch = c.ch & 0x1FFFFF;
+    (ch == 32 || ch == 9) && c.bg == DEFAULT_BG && c.fg == DEFAULT_FG
+        && (c.flags
+            & (INVERSE | ALL_UNDERLINES | STRIKEOUT | WRAPLINE | WIDE_CHAR_SPACER
+                | LEADING_WIDE_CHAR_SPACER)) == 0
+}

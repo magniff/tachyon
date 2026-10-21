@@ -7,6 +7,7 @@
 # tests/refactor/run.sh (the refactoring tools, 0.11), tests/guide/run.sh
 # (`tachyonc guide`, 0.13), tests/fmt/run.sh (`tachyonc fmt --check`
 # of the tree, and formatting changes no program, 0.13) and
+# tests/voltty/run.sh (the terminal's core against its oracle, 0.23),
 # tests/walkthrough/run.sh (the sessions of examples/tools/*/README.md,
 # 0.15, and of every examples/GROUP/NAME/README.md with one, 0.16) and
 # tests/own-try/run.sh (the own pass's try: lines run, 0.17) and
@@ -657,6 +658,9 @@ esac
 case walkthrough in
     *"$FILTER"*) "$ROOT/tests/walkthrough/run.sh" -c "$COMPILER" >"$WORK/walkthrough.out" 2>&1 & ;;
 esac
+case voltty in
+    *"$FILTER"*) "$ROOT/tests/voltty/run.sh" -c "$COMPILER" -n 20 >"$WORK/voltty.out" 2>&1 & ;;
+esac
 case own-try in
     *"$FILTER"*) "$ROOT/tests/own-try/run.sh" -c "$COMPILER" >"$WORK/own-try.out" 2>&1 & ;;
 esac
@@ -942,6 +946,26 @@ case arch-enc in
             { echo "FAIL arch-enc:"; sed 's/^/    /' "$WORK/arch-enc.out"; } >>"$FAILURES"
         fi
         count=$((count + 1))
+        ;;
+esac
+
+# voltty, the terminal's core (0.23): tests/voltty/run.sh (run above), its
+# reduced cases and seeds against the oracle's recorded dumps, and 20
+# scripts of the differential fuzzer when cargo can build the oracle;
+# category "voltty".
+case voltty in
+    *"$FILTER"*)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "voltty pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "voltty fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/voltty.out"
+        if ! grep -q '^pass' "$WORK/voltty.out"; then
+            echo "voltty fail" >>"$TALLY"
+            count=$((count + 1))
+        fi
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/voltty.out" >>"$FAILURES"
         ;;
 esac
 
