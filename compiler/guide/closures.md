@@ -66,6 +66,13 @@ closure is still to be called, `x` is not changed another way
 (`own.conflict`, as in Rust). Change it after the closure's last call,
 or capture a snapshot with `move`.
 
+An owned value a closure captures without `sink` still belongs to its
+variable, so the body may not move it (`drop(x)`, passing it to a sink
+parameter): that is `own.move_out`; use `x.clone()` inside. A `sink`
+(`move`) closure owns its captures and may move one out: its drop then
+skips that one. Called again after such a move, it stops the program
+(exit 101), since no closure is `FnOnce` yet.
+
 ```tach
 fn call<F: FnMut() -> i64>(mut f: F) -> i64 {
     f()
