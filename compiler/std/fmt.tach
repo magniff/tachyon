@@ -2,6 +2,8 @@
 
 use std::{Allocator, Buf, Gpa, Vec, decimal_len, memcpy, put_decimal, strlen, write};
 use std::num::{FloatFmt, write_f32, write_f64};
+use std::sync::RawLock;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 extern "C" {
     #[effects()]
@@ -10,55 +12,138 @@ extern "C" {
     fn strtod(s: *u8, end: **u8) -> f64;
     #[effects()]
     fn strtof(s: *u8, end: **u8) -> f32;
+    #[link_name = "pthread_self"]
+    #[effects()]
+    fn fmt_c_thread_self() -> u64;
 }
 
 // ---- Printing ----
 
+// (0.21) Printing from several threads: once a thread was started
+// (std::thread::spawn sets FMT_THREADED), each print holds a lock while it
+// fills std's buffer and writes it, so lines do not mix and the buffer is
+// never shared. A print inside a print (a Display that prints) on the
+// thread holding it takes nothing more.
+static mut FMT_THREADED: AtomicU32 = AtomicU32 { v: 0 };
+static mut FMT_LOCK: RawLock = RawLock { state: AtomicU32 { v: 0 } };
+static mut FMT_OWNER: AtomicU64 = AtomicU64 { v: 0 };
+// The holder's prints in progress (prints inside prints).
+static mut FMT_DEPTH: i64 = 0;
+
+// Called before the first thread starts.
+pub fn print_threads_started() {
+    FMT_THREADED.store(1, Ordering::Release);
+}
+
+#[inline]
+fn print_acquire() {
+    if FMT_THREADED.load(Ordering::Relaxed) != 0 {
+        print_acquire_held();
+    }
+}
+
+#[inline(never)]
+fn print_acquire_held() {
+    let me = unsafe { fmt_c_thread_self() };
+    if FMT_OWNER.load(Ordering::Relaxed) != me {
+        FMT_LOCK.lock();
+        FMT_OWNER.store(me, Ordering::Relaxed);
+    }
+    FMT_DEPTH += 1;
+}
+
+#[inline]
+fn print_release() {
+    if FMT_THREADED.load(Ordering::Relaxed) != 0 {
+        print_release_held();
+    }
+}
+
+#[inline(never)]
+fn print_release_held() {
+    let me = unsafe { fmt_c_thread_self() };
+    if FMT_OWNER.load(Ordering::Relaxed) != me {
+        return;
+    }
+    FMT_DEPTH -= 1;
+    if FMT_DEPTH == 0 {
+        FMT_OWNER.store(0, Ordering::Relaxed);
+        FMT_LOCK.unlock();
+    }
+}
+
+// What `print(f"...")` and its kin compile to (front/check/interp.tach):
+// `let mut __out = std::__print_begin(1); WRITES; std::__print_end(&mut
+// __out);`. Not for programs to call.
+#[inline]
+pub fn __print_begin(fd: i32) -> Fmt {
+    print_acquire();
+    Fmt::to_fd(fd)
+}
+
+#[inline]
+pub fn __print_end(f: &mut Fmt) {
+    f.flush();
+    print_release();
+}
+
 // x's Display (`print("text")`, `print(f"{a} {b:?}")`): one `write`.
 pub fn print<T: Display>(x: T) {
+    print_acquire();
     let mut f = Fmt::to_fd(1);
     x.fmt(&mut f);
     f.flush();
+    print_release();
 }
 
 pub fn println<T: Display>(x: T) {
+    print_acquire();
     let mut f = Fmt::to_fd(1);
     x.fmt(&mut f);
     f.byte('\n');
     f.flush();
+    print_release();
 }
 
 #[inline(never)]
 pub fn print_int(v: i64) {
+    print_acquire();
     let mut f = Fmt::to_fd(1);
     // (decimal only: not Fmt::int, whose hex and binary every program
     // using print_int would compile)
     let negative = v < 0;
     fmt_decimal(&mut f, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative);
     f.flush();
+    print_release();
 }
 
 // A C string (up to its NUL).
 pub unsafe fn print_cstr(s: *u8) {
+    print_acquire();
     let mut f = Fmt::to_fd(1);
     f.str(s[0..strlen(s) as i64]);
     f.flush();
+    print_release();
 }
 
 // ---- Display, Debug and Fmt (0.15) ----
 
 // x's Display on stderr.
 pub fn eprint<T: Display>(x: T) {
+    print_acquire();
     let mut f = Fmt::to_fd(2);
     x.fmt(&mut f);
     f.flush();
+    print_release();
 }
 
 pub fn eprintln<T: Display>(x: T) {
+    print_acquire();
     let mut f = Fmt::to_fd(2);
     x.fmt(&mut f);
     f.byte('\n');
     f.flush();
+    print_release();
 }
 
 // x's Display in a new Buf on allocator a, of its length (the caller frees
