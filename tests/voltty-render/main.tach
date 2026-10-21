@@ -28,8 +28,8 @@ use render::input::{
     INVERSE, ITALIC, STRIKEOUT, UNDERCURL, UNDERLINE, cell, indexed, named, rgb,
 };
 use render::input::BOLD as F_BOLD;
-use render::metal::{Device, RGBA8_UNORM, STORAGE_SHARED, Texture, USAGE_RENDER_TARGET};
 use render::renderer::Renderer;
+use std::gpu::{Format, TextureUsage};
 
 extern "C" {
     fn getenv(name: *u8) -> *u8;
@@ -181,8 +181,8 @@ fn test_font(t: T) {
     }
 }
 
-fn test_atlas(t: T, dev: Device) {
-    var r = match Renderer::new_in(dev, "Menlo", 14.0, 2.0, RGBA8_UNORM, t.gpa) {
+fn test_atlas(t: T) {
+    var r = match Renderer::new_in("Menlo", 14.0, 2.0, Format::Rgba8Unorm, t.gpa) {
         Ok(r) => r,
         Err(e) => {
             t.check("atlas_renderer", false, e.as_slice());
@@ -190,16 +190,16 @@ fn test_atlas(t: T, dev: Device) {
         }
     };
     // Entries are stable, distinct, and do not overlap in their page.
-    let a1 = r.atlas.lookup(&r.font, 'a' as u32, REGULAR, 1);
-    let a2 = r.atlas.lookup(&r.font, 'a' as u32, REGULAR, 1);
-    let b1 = r.atlas.lookup(&r.font, 'a' as u32, BOLD, 1);
-    let sp = r.atlas.lookup(&r.font, ' ' as u32, REGULAR, 1);
+    let a1 = r.lookup('a' as u32, REGULAR, 1);
+    let a2 = r.lookup('a' as u32, REGULAR, 1);
+    let b1 = r.lookup('a' as u32, BOLD, 1);
+    let sp = r.lookup(' ' as u32, REGULAR, 1);
     t.check("atlas_cached", a1 > 0 && a1 == a2 && b1 != a1 && sp == 0,
         f"a {a1} {a2}, bold a {b1}, space {sp}");
     for c in 33..127 {
-        r.atlas.lookup(&r.font, c as u32, REGULAR, 1);
+        r.lookup(c as u32, REGULAR, 1);
     }
-    let e = r.atlas.lookup(&r.font, 0x1F600, REGULAR, 2);
+    let e = r.lookup(0x1F600, REGULAR, 2);
     let ee = r.atlas.entry(e);
     t.check("atlas_color_page", e > 0 && ee[6] == 1 && r.atlas.has_color_page(),
         f"emoji entry {e} kind {ee[6]}");
@@ -223,7 +223,7 @@ fn test_atlas(t: T, dev: Device) {
     var c: u32 = 0x4E00;
     var full = false;
     while c < 0x9FFF {
-        let x = r.atlas.lookup(&r.font, c, REGULAR, 2);
+        let x = r.lookup(c, REGULAR, 2);
         if x < 0 {
             full = true;
             break;
@@ -236,21 +236,25 @@ fn test_atlas(t: T, dev: Device) {
         f"full {full} after {count} entries ({c - 0x4E00} CJK)");
     println(f"bench atlas_fill: {count} wide glyphs in {ms} ms");
     r.atlas.clear();
-    let again = r.atlas.lookup(&r.font, 'a' as u32, REGULAR, 1);
+    let again = r.lookup('a' as u32, REGULAR, 1);
     t.check("atlas_clear", r.atlas.generation == gen + 1 && again == 1,
         f"after clear: entry {again}");
 }
 
 // ---- rendering -------------------------------------------------------------
 
+// A w × h render target the tests read back.
+fn target(r: Renderer, w: i64, h: i64) -> std::gpu::Texture {
+    r.dev.texture(w, h, Format::Rgba8Unorm,
+        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC)
+}
+
 // Renders the renderer's frame into a new w × h texture and reads it.
-fn gpu_frame(r: inout Renderer, dev: Device, w: i64, h: i64, out: inout Vec<u8>) {
-    var tex = dev.texture(w, h, RGBA8_UNORM, USAGE_RENDER_TARGET, STORAGE_SHARED);
-    var pass = r.encode(tex);
-    let s = pass.submit();
-    r.submitted(s);
-    r.wait_idle();
-    tex.read(&out);
+fn gpu_frame(r: inout Renderer, w: i64, h: i64, out: inout Vec<u8>) {
+    let tex = target(r, w, h);
+    let view = tex.view();
+    r.render(view);
+    r.read_texture(tex, &out);
 }
 
 // The font-independent scene: backgrounds of every colour form, every
@@ -281,8 +285,8 @@ fn golden_grid(g: inout TestGrid) {
     g.set(4, 4, cell(32, indexed(196), named(0), DIM | STRIKEOUT));
 }
 
-fn test_golden(t: T, dev: Device) {
-    var r = match Renderer::new_in(dev, "Menlo", 14.0, 2.0, RGBA8_UNORM, t.gpa) {
+fn test_golden(t: T) {
+    var r = match Renderer::new_in("Menlo", 14.0, 2.0, Format::Rgba8Unorm, t.gpa) {
         Ok(r) => r,
         Err(e) => {
             t.check("golden_renderer", false, e.as_slice());
@@ -306,7 +310,7 @@ fn test_golden(t: T, dev: Device) {
     var gpu: Vec<u8> = Vec::new_in(t.gpa);
     var cpu: Vec<u8> = Vec::new_in(t.gpa);
     var want: Vec<u8> = Vec::new_in(t.gpa);
-    var p = read_pages(r, t.gpa);
+    var p = read_pages(&r, t.gpa);
     // Each cursor shape on its own line 5..7 cell, the selection on line 6.
     let shapes: [i64; 4] = [CURSOR_BLOCK, CURSOR_BEAM, CURSOR_UNDERLINE, CURSOR_HOLLOW];
     let files: [[u8]; 4] = ["golden-block.ppm", "golden-beam.ppm", "golden-underline.ppm",
@@ -314,7 +318,7 @@ fn test_golden(t: T, dev: Device) {
     for i in 0..4 {
         r.set_cursor(CursorView { line: 5, col: 2 + i, shape: shapes[i] });
         r.set_selection(6 * 16 + 3, 7 * 16 + 5);
-        gpu_frame(&r, dev, w, h, &gpu);
+        gpu_frame(&r, w, h, &gpu);
         cpu::render(r, p, w, h, &cpu);
         let (worst, bad) = compare(gpu.as_slice(), cpu.as_slice(), 0);
         t.check(f"golden_gpu_cpu_{files[i]}", bad == 0, f"{bad} pixels differ, worst {worst}");
@@ -359,8 +363,8 @@ fn text_grid(g: inout TestGrid) {
     g.text(4, 0, "gjpqy_|", fg, bg, 0);
 }
 
-fn test_text(t: T, dev: Device) {
-    var r = match Renderer::new_in(dev, "Menlo", 14.0, 2.0, RGBA8_UNORM, t.gpa) {
+fn test_text(t: T) {
+    var r = match Renderer::new_in("Menlo", 14.0, 2.0, Format::Rgba8Unorm, t.gpa) {
         Ok(r) => r,
         Err(e) => {
             t.check("text_renderer", false, e.as_slice());
@@ -376,8 +380,8 @@ fn test_text(t: T, dev: Device) {
     let h = 6 * r.cell_h();
     var gpu: Vec<u8> = Vec::new_in(t.gpa);
     var cpu: Vec<u8> = Vec::new_in(t.gpa);
-    gpu_frame(&r, dev, w, h, &gpu);
-    var p = read_pages(r, t.gpa);
+    gpu_frame(&r, w, h, &gpu);
+    var p = read_pages(&r, t.gpa);
     cpu::render(r, p, w, h, &cpu);
     let (worst, bad) = compare(gpu.as_slice(), cpu.as_slice(), 1);
     t.check("text_gpu_cpu", bad == 0, f"{bad} pixels differ by more than 1, worst {worst}");
@@ -407,13 +411,13 @@ fn test_text(t: T, dev: Device) {
 
 // ---- damage ------------------------------------------------------------
 
-fn same_as_fresh(t: T, name: [u8], r: inout Renderer, g: inout TestGrid, dev: Device) {
+fn same_as_fresh(t: T, name: [u8], r: inout Renderer, g: inout TestGrid) {
     let w = g.cols * r.cell_w();
     let h = g.lines * r.cell_h();
     var a: Vec<u8> = Vec::new_in(t.gpa);
     var b: Vec<u8> = Vec::new_in(t.gpa);
-    gpu_frame(&r, dev, w, h, &a);
-    var fresh = match Renderer::new_in(dev, "Menlo", 14.0, 2.0, RGBA8_UNORM, t.gpa) {
+    gpu_frame(&r, w, h, &a);
+    var fresh = match Renderer::new_in("Menlo", 14.0, 2.0, Format::Rgba8Unorm, t.gpa) {
         Ok(f) => f,
         Err(_) => return,
     };
@@ -432,13 +436,13 @@ fn same_as_fresh(t: T, name: [u8], r: inout Renderer, g: inout TestGrid, dev: De
     g.scrolled = saved_scroll;
     fresh.set_cursor(r.cursor);
     fresh.set_selection(r.sel_lo, r.sel_hi);
-    gpu_frame(&fresh, dev, w, h, &b);
+    gpu_frame(&fresh, w, h, &b);
     let (worst, bad) = compare(a.as_slice(), b.as_slice(), 0);
     t.check(name, bad == 0, f"{bad} pixels differ from a full redraw, worst {worst}");
 }
 
-fn test_damage(t: T, dev: Device) {
-    var r = match Renderer::new_in(dev, "Menlo", 14.0, 2.0, RGBA8_UNORM, t.gpa) {
+fn test_damage(t: T) {
+    var r = match Renderer::new_in("Menlo", 14.0, 2.0, Format::Rgba8Unorm, t.gpa) {
         Ok(r) => r,
         Err(e) => {
             t.check("damage_renderer", false, e.as_slice());
@@ -454,7 +458,7 @@ fn test_damage(t: T, dev: Device) {
     let w = 30 * r.cell_w();
     let h = 12 * r.cell_h();
     var img: Vec<u8> = Vec::new_in(t.gpa);
-    gpu_frame(&r, dev, w, h, &img);
+    gpu_frame(&r, w, h, &img);
     t.check("damage_first_full", r.stats.rows_built == 12 && r.stats.rows_copied == 12,
         f"built {r.stats.rows_built}, copied {r.stats.rows_copied}");
 
@@ -469,7 +473,7 @@ fn test_damage(t: T, dev: Device) {
     r.update(&g);
     t.check("damage_one_line", r.dirty() && r.stats.rows_built == 13,
         f"built {r.stats.rows_built}");
-    same_as_fresh(t, "damage_one_line_image", &r, &g, dev);
+    same_as_fresh(t, "damage_one_line_image", &r, &g);
 
     // A cursor move rebuilds nothing.
     let built = r.stats.rows_built;
@@ -477,7 +481,7 @@ fn test_damage(t: T, dev: Device) {
     r.update(&g);
     t.check("damage_cursor", r.dirty() && r.stats.rows_built == built,
         f"built {r.stats.rows_built - built}");
-    same_as_fresh(t, "damage_cursor_image", &r, &g, dev);
+    same_as_fresh(t, "damage_cursor_image", &r, &g);
 
     // A whole-screen scroll by 3: the ring's top moves, the 3 lines that
     // came in are the only rows built.
@@ -487,17 +491,17 @@ fn test_damage(t: T, dev: Device) {
     r.update(&g);
     t.check("damage_scroll", r.stats.rows_built - built2 == 3 && r.top == 3,
         f"built {r.stats.rows_built - built2}, top {r.top}");
-    same_as_fresh(t, "damage_scroll_image", &r, &g, dev);
+    same_as_fresh(t, "damage_scroll_image", &r, &g);
 
     // Frames in flight: three buffers; each catches up on the rows it
     // lacks, and only those.
     let copied = r.stats.rows_copied;
     for _ in 0..3 {
-        gpu_frame(&r, dev, w, h, &img);
+        gpu_frame(&r, w, h, &img);
     }
     let per = r.stats.rows_copied - copied;
     t.check("damage_frames_in_flight", per <= 12 * 3, f"{per} rows copied over 3 frames");
-    same_as_fresh(t, "damage_settled_image", &r, &g, dev);
+    same_as_fresh(t, "damage_settled_image", &r, &g);
 
     // A selection change rebuilds nothing.
     let built3 = r.stats.rows_built;
@@ -505,7 +509,7 @@ fn test_damage(t: T, dev: Device) {
     r.update(&g);
     t.check("damage_selection", r.dirty() && r.stats.rows_built == built3,
         f"built {r.stats.rows_built - built3}");
-    same_as_fresh(t, "damage_selection_image", &r, &g, dev);
+    same_as_fresh(t, "damage_selection_image", &r, &g);
 }
 
 // ---- the bench -------------------------------------------------------------
@@ -515,8 +519,8 @@ fn median(v: inout Vec<i64>) -> i64 {
     v[v.len() / 2]
 }
 
-fn bench(t: T, dev: Device) {
-    var r = match Renderer::new_in(dev, "Menlo", 14.0, 2.0, RGBA8_UNORM, t.gpa) {
+fn bench(t: T) {
+    var r = match Renderer::new_in("Menlo", 14.0, 2.0, Format::Rgba8Unorm, t.gpa) {
         Ok(r) => r,
         Err(_) => return,
     };
@@ -536,33 +540,32 @@ fn bench(t: T, dev: Device) {
     r.update(&g);
     let w = cols * r.cell_w();
     let h = lines * r.cell_h();
-    var tex = dev.texture(w, h, RGBA8_UNORM, USAGE_RENDER_TARGET, STORAGE_SHARED);
+    let tex = target(r, w, h);
+    let view = tex.view();
     var full: Vec<i64> = Vec::new_in(t.gpa);
-    var gpu: Vec<i64> = Vec::new_in(t.gpa);
+    var walls: Vec<i64> = Vec::new_in(t.gpa);
     var scroll: Vec<i64> = Vec::new_in(t.gpa);
     // Allocations inside the timed part of each frame, after the first
-    // ten (warm-up: the frames' buffers, the glyphs' first use).
+    // ten (warm-up: the bind group, the glyphs' first use).
     var full_allocs = 0;
     var scroll_allocs = 0;
     for i in 0..200 {
-        // A full redraw: every row rebuilt and copied, the frame encoded.
+        // A full redraw: every row rebuilt and written, the frame encoded
+        // and submitted; then the time until the GPU is done with it.
         g.all = true;
         let a0 = count::allocs();
         let t0 = now_ns();
         r.update(&g);
-        var pass = r.encode(tex);
-        var s = pass.submit();
+        r.render(view);
         let dt = now_ns() - t0;
         if i >= 10 {
             full_allocs += count::allocs() - a0;
         }
         full.push(dt);
-        s.wait();
-        if i >= 10 {
-            gpu.push((s.gpu_seconds() * 1000000000.0) as i64);
-        }
-        r.submitted(s);
         r.wait_idle();
+        if i >= 10 {
+            walls.push(now_ns() - t0);
+        }
     }
     for i in 0..200 {
         // A one-line scroll: the ring's top moves, one row is rebuilt.
@@ -572,20 +575,19 @@ fn bench(t: T, dev: Device) {
         let a0 = count::allocs();
         let t0 = now_ns();
         r.update(&g);
-        var pass = r.encode(tex);
-        let s = pass.submit();
+        r.render(view);
         let dt = now_ns() - t0;
         if i >= 10 {
             scroll_allocs += count::allocs() - a0;
         }
         scroll.push(dt);
-        r.submitted(s);
         r.wait_idle();
     }
     let f = median(&full);
-    let gp = median(&gpu);
+    let wl = median(&walls);
     let sc = median(&scroll);
-    println(f"bench full_redraw_120x40: cpu {f / 1000} us (update + encode), gpu {gp / 1000} us");
+    println(f"bench full_redraw_120x40: cpu {f / 1000} us (update + encode)");
+    println(f"bench full_frame_wall: {wl / 1000} us (update, encode, submit, wait)");
     println(f"bench scroll_1_line_120x40: cpu {sc / 1000} us (update + encode)");
     println(
         f"bench allocations: {full_allocs} in 190 full redraws, {scroll_allocs} in 190 scrolls");
@@ -603,18 +605,15 @@ fn main(gpa: Gpa) -> i32 {
     };
     var t = T { failed: 0, gpa: gpa, write: write };
     test_font(t);
-    var dev = match Device::system() {
-        Some(d) => d,
-        None => {
-            println("skip render: no Metal device");
-            return 0;
-        }
-    };
-    test_atlas(t, dev);
-    test_golden(t, dev);
-    test_text(t, dev);
-    test_damage(t, dev);
-    bench(t, dev);
+    if std::gpu::Instance::new_in(gpa).adapter().is_err() {
+        println("skip render: no GPU");
+        return 0;
+    }
+    test_atlas(t);
+    test_golden(t);
+    test_text(t);
+    test_damage(t);
+    bench(t);
     let _ = CURSOR_HIDDEN;
     if t.failed > 0 { 1 } else { 0 }
 }

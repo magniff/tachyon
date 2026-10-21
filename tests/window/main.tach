@@ -4,8 +4,8 @@
 //   main test      the headless checks (key tables, modifiers, UTF-8 and
 //                  UTF-16 helpers), then, when a window server is there
 //                  (NEEDS: display), the Cocoa checks: a window, its first
-//                  size, frames on request and none without, the Metal
-//                  layer presenting the renderer's grid, keys and text
+//                  size, frames on request and none without, the window's
+//                  surface presenting the renderer's grid (std::gpu), keys and text
 //                  through interpretKeyEvents, the input method's
 //                  composition, the mouse, a resize, the clipboard (the
 //                  user's is restored), a watched pipe, close and Quit,
@@ -26,7 +26,6 @@ mod render;
 use render::input::{
     CURSOR_BEAM, CURSOR_BLOCK, Cell, CellGrid, CursorView, DEFAULT_BG, DEFAULT_FG, cell, named,
 };
-use render::metal::{BGRA8_UNORM, Device, Layer};
 use render::objc::{
     Point, Range, Rect, class, msg_b, msg_i, msg_p, msg_p_p, msg_p_u, msg_p_utudipiif,
     msg_p_utudipppbh, msg_r_gP, msg_v_p, msg_v_pg, msg_v_pgg, msg_v_z, nsstring, pool_pop,
@@ -34,6 +33,7 @@ use render::objc::{
 };
 use render::objc::Size as NsSize;
 use render::renderer::Renderer;
+use std::gpu::{Format, RawSurface, Surface};
 use std::window::{App, Button, Event, MouseAction, Window, WindowDesc, WindowId};
 use std::window::keys::{
     ALT_L, ALT_R, CAPS, CTRL_L, CTRL_R, KeyCode, Logical, Named, SHIFT_L, SHIFT_R, SUPER_L,
@@ -412,18 +412,30 @@ impl CellGrid for Screen {
     }
 }
 
-// Draws the screen into the window's next drawable and presents it.
-fn present(r: inout Renderer, s: inout Screen, layer: Layer) -> bool {
+// Draws the screen into the surface's next frame and presents it.
+fn present(r: inout Renderer, s: inout Screen, surf: inout Surface) -> bool {
     r.update(&s);
-    match layer.next() {
-        None => false,
-        Some(d) => {
-            var dr = d;
-            var pass = r.encode(dr.tex);
-            let sub = pass.present(dr);
-            r.submitted(sub);
+    match surf.frame() {
+        Err(_) => false,
+        Ok(f) => {
+            let view = f.texture.view();
+            r.render(view);
+            f.present(&r.queue);
             true
         }
+    }
+}
+
+// The window's surface on the renderer's device, w × h pixels.
+fn surface(r: Renderer, win: Window, w: i64, h: i64, gpa: Gpa) -> Option<Surface> {
+    let inst = std::gpu::Instance::new_in(gpa);
+    match inst.surface(r.dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(sf) => {
+            var surf = sf;
+            surf.configure(r.dev, w, h);
+            Some(surf)
+        }
+        Err(_) => None,
     }
 }
 
@@ -473,18 +485,16 @@ fn test_display(t: T, gpa: Gpa) {
     let none = wait_for(&app, 150, is_frame, &other);
     t.check("frame_not_unasked", none.is_none(), "a Frame without request_frame");
 
-    // The Metal layer presents the renderer's grid.
-    match Device::system() {
-        None => t.check("layer_present", false, "no Metal device"),
-        Some(d) => {
-            var dev = d;
-            let sz = win.size();
-            var layer = Layer { obj: win.raw_surface() };
-            layer.configure(dev, sz.w, sz.h);
-            match Renderer::new_in(dev, "Menlo", 13.0, sz.scale, BGRA8_UNORM, gpa) {
-                Err(e) => t.check("layer_present", false, e.as_slice()),
-                Ok(rr) => {
-                    var r = rr;
+    // The window's surface presents the renderer's grid (std::gpu).
+    let sz = win.size();
+    match Renderer::new_in("Menlo", 13.0, sz.scale, Format::Bgra8Unorm, gpa) {
+        Err(e) => t.check("layer_present", false, e.as_slice()),
+        Ok(rr) => {
+            var r = rr;
+            match surface(r, win, sz.w, sz.h, gpa) {
+                None => t.check("layer_present", false, "no surface for the window's layer"),
+                Some(sf) => {
+                    var surf = sf;
                     var s = Screen::new_in(sz.h / r.cell_h(), sz.w / r.cell_w(), gpa);
                     s.text(0, 0, "tachyon: std::window on Cocoa", named(2));
                     s.text(1, 0, "one instanced draw per frame", named(DEFAULT_FG));
@@ -493,7 +503,7 @@ fn test_display(t: T, gpa: Gpa) {
                     for _ in 0..3 {
                         win.request_frame();
                         if wait_for(&app, 1000, is_frame, &other).is_some()
-                            && present(&r, &s, layer) {
+                            && present(&r, &s, &surf) {
                             shown += 1;
                         }
                     }
@@ -517,7 +527,8 @@ fn test_display(t: T, gpa: Gpa) {
         _ => t.check("key_letter", false, "no Key"),
     }
     match wait_for(&app, 500, is_text, &other) {
-        Some(Event::Text(x)) => t.check("key_letter_text", x.bytes[0..x.len as i64] == "a", x.bytes[0..x.len as i64]),
+        Some(Event::Text(x)) => t.check("key_letter_text", x.bytes[0..x.len as i64] == "a",
+            x.bytes[0..x.len as i64]),
         _ => t.check("key_letter_text", false, "no Text"),
     }
     send_key(&win, true, 0x24, "\r", "\r", 0);
@@ -546,7 +557,8 @@ fn test_display(t: T, gpa: Gpa) {
     // Shift-letter text arrives as one more Key and Text.
     send_key(&win, true, 0x0E, "E", "e", 1 << 17);
     match wait_for(&app, 500, is_text, &other) {
-        Some(Event::Text(x)) => t.check("key_shift_text", x.bytes[0..x.len as i64] == "E", x.bytes[0..x.len as i64]),
+        Some(Event::Text(x)) => t.check("key_shift_text", x.bytes[0..x.len as i64] == "E",
+            x.bytes[0..x.len as i64]),
         _ => t.check("key_shift_text", false, "no Text"),
     }
 
@@ -588,7 +600,8 @@ fn test_display(t: T, gpa: Gpa) {
     for _ in 0..2 {
         match wait_for(&app, 500, is_any, &other) {
             Some(Event::Preedit(pe)) => ended = pe.len == 0,
-            Some(Event::Text(x)) => committed = x.bytes[0..x.len as i64] == "\xe6\x97\xa5\xe6\x9c\xac",
+            Some(Event::Text(x)) => committed = x.bytes[0..x.len as i64]
+                == "\xe6\x97\xa5\xe6\x9c\xac",
             _ => {}
         }
     }
@@ -736,14 +749,18 @@ fn demo(gpa: Gpa) -> i32 {
     };
     let desc = WindowDesc::new("tachyon", 720, 420);
     var win = app.window(desc).unwrap();
-    var dev = Device::system().unwrap();
     let sz = win.size();
-    var layer = Layer { obj: win.raw_surface() };
-    layer.configure(dev, sz.w, sz.h);
-    var r = match Renderer::new_in(dev, "Menlo", 14.0, sz.scale, BGRA8_UNORM, gpa) {
+    var r = match Renderer::new_in("Menlo", 14.0, sz.scale, Format::Bgra8Unorm, gpa) {
         Ok(r) => r,
         Err(e) => {
             println(e.as_slice());
+            return 1;
+        }
+    };
+    var surf = match surface(r, win, sz.w, sz.h, gpa) {
+        Some(sf) => sf,
+        None => {
+            println("no surface");
             return 1;
         }
     };
@@ -756,7 +773,7 @@ fn demo(gpa: Gpa) -> i32 {
     loop {
         match app.wait() {
             Ok(Event::Frame(_)) => {
-                present(&r, &s, layer);
+                present(&r, &s, &surf);
             }
             Ok(Event::Text(x)) => {
                 let b = x.bytes[0..x.len as i64];
@@ -784,7 +801,7 @@ fn demo(gpa: Gpa) -> i32 {
                 win.request_frame();
             }
             Ok(Event::Resize(_, z)) => {
-                layer.resize(z.w, z.h);
+                surf.configure(r.dev, z.w, z.h);
                 s.resize(z.h / r.cell_h(), z.w / r.cell_w(), gpa);
                 s.all = true;
                 win.request_frame();

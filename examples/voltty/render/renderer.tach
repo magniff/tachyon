@@ -1,28 +1,32 @@
 // The renderer (terminal.md §3.5, D10): one instanced draw per frame of
-// 16-byte instances, one per cell, with damage tracking.
+// 16-byte instances, one per cell, with damage tracking, on std::gpu with
+// cells.wgsl compiled by std::gpu::wgsl.
 //
 // - The instances live in a ring of rows that mirrors the grid's ring:
 //   slot s holds the line (s - top) mod lines. A whole-screen scroll of k
 //   lines moves `top` by k and rebuilds only the lines the grid reports
 //   damaged (the k that scrolled in): no other row is touched.
-// - `master` is the CPU copy of the ring. Each of the three frames in
-//   flight has its own GPU buffer of the ring and the version of every
-//   slot it holds; a frame copies only the slots whose version moved
-//   since that buffer was last drawn (one memcpy per row into shared
-//   memory: Apple silicon needs no staging).
-// - The uniforms (ring top, cursor, selection, metrics) are copied into
-//   each frame's command stream (setVertexBytes), so moving the cursor or
-//   the selection changes no instance.
+// - `master` is the CPU copy of the ring, `ver` the version of each of its
+//   slots. A frame writes the slots whose version moved since the last
+//   frame into the GPU's instance buffer, each run of adjacent ones in one
+//   `queue.write_buffer`: the queue orders a write after the frames
+//   already submitted (gpu.md §2.11), so a frame in flight keeps reading
+//   what it was given, and the CPU never waits for the GPU here.
+// - The uniforms (ring top, cursor, selection, metrics) are written per
+//   frame the same way, so moving the cursor or the selection changes no
+//   instance.
 // - A frame with nothing changed is not drawn (`dirty()` is false).
+// - One bind group (uniforms, instances, atlas table and pages), made
+//   again only when a buffer or page is replaced (a resize, the first
+//   colour glyph).
 //
 // Colours are resolved on the CPU when a row is built (palette, default
 // colours, dim, inverse, hidden); a palette change rebuilds every row.
-//
-// Before 0.21 the CPU never waits on a completion handler: a frame
-// buffer about to be reused waits for its last command buffer, which is
-// normally long done (gpu.md §2.11).
 
+use std::gpu;
+use std::gpu::{BufferUsage, Format, PassDesc, Topology};
 use super::atlas::Atlas;
+use super::cells::CELLS_WGSL;
 use super::font::Font;
 use super::font::BOLD as S_BOLD;
 use super::font::BOLD_ITALIC as S_BOLD_ITALIC;
@@ -34,9 +38,6 @@ use super::input::{
     DOUBLE_UNDERLINE, HIDDEN, INVERSE, ITALIC, LEADING_WIDE_CHAR_SPACER, STRIKEOUT, TAG_MASK,
     UNDERCURL, UNDERLINE, VALUE_MASK, WIDE_CHAR, WIDE_CHAR_SPACER,
 };
-use super::metal::{Buffer, Device, Pass, Pipeline, Submitted, Texture};
-use super::objc::ClearColor;
-use super::shader::msl;
 
 // One instance: the shader's `Inst`.
 pub struct Inst {
@@ -56,7 +57,7 @@ pub const I_UNDER_DASHED: u32 = 5;
 pub const I_STRIKE: u32 = 8;
 pub const I_RIGHT_HALF: u32 = 16;
 
-// The shader's `U`, 80 bytes.
+// The shader's `U`, 80 bytes (20 four-byte fields, no padding).
 pub struct Uniforms {
     pub cols: u32,
     pub lines: u32,
@@ -80,13 +81,7 @@ pub struct Uniforms {
     pub r1: u32,
 }
 
-const FRAMES: i64 = 3;
-
-struct FrameBuf {
-    buf: Buffer,
-    ver: Vec<u64>,
-    last: Option<Submitted>,
-}
+const UNIFORM_BYTES: i64 = 80;
 
 // Counters for the tests and the bench.
 pub struct Stats {
@@ -98,8 +93,18 @@ pub struct Stats {
 }
 
 pub struct Renderer {
-    dev: Device,
-    pipe: Pipeline,
+    // The device and its queue: the caller draws through them too (a
+    // surface's frames, the tests' readbacks).
+    pub dev: gpu::Device,
+    pub queue: gpu::Queue,
+    pipe: gpu::RenderPipeline,
+    pub format: Format,
+    ubuf: gpu::Buffer,
+    // lines × cols instances (16 bytes at least: a buffer is never empty)
+    ibuf: gpu::Buffer,
+    group: gpu::BindGroup,
+    // the atlas's `pages` the group was made with (-1: make it again)
+    group_pages: i64,
     pub font: Font,
     pub atlas: Atlas,
     pub lines: i64,
@@ -108,8 +113,8 @@ pub struct Renderer {
     pub master: Vec<Inst>,
     ver: Vec<u64>,
     next_ver: u64,
-    frames: Vec<FrameBuf>,
-    frame: i64,
+    // the version of each slot the instance buffer holds
+    gpu_ver: Vec<u64>,
     pub palette: Vec<u32>,
     pub cursor: CursorView,
     pub sel_lo: i64,
@@ -120,8 +125,6 @@ pub struct Renderer {
     changed: bool,
     // The next update rebuilds every row (a resize, a palette change).
     force_all: bool,
-    // The frame buffer `encode` used, for `submitted`.
-    pending: i64,
     pub stats: Stats,
     gpa: Gpa,
 }
@@ -169,40 +172,59 @@ pub fn dim(c: u32) -> u32 {
 }
 
 impl Renderer {
-    // A renderer drawing into targets of pixel `format` (BGRA8 for a
-    // CAMetalLayer, RGBA8 for the tests' textures). The error is Metal's
-    // compiler message, or the font's name.
-    pub fn new_in(dev: Device, font: [u8], points: f64, scale: f64, format: u64, gpa: Gpa) -> Result<Renderer, Buf> {
-        var err = Buf::new_in(gpa);
+    // A renderer on the system's GPU drawing into targets of `format`
+    // (Bgra8Unorm for a window's surface, Rgba8Unorm for the tests'
+    // textures). The error is the GPU's or the shader compiler's message,
+    // or the font's name.
+    pub fn new_in(font: [u8], points: f64, scale: f64, format: Format, gpa: Gpa) -> Result<Renderer,
+        Buf> {
         let f = match Font::new_in(font, points, scale, gpa) {
             Some(f) => f,
-            None => {
-                err.push_str("no font named ");
-                err.push_str(font);
-                return Err(err);
-            }
+            None => return Err(format_in(f"no font named {font}", gpa)),
         };
-        var src = Buf::new_in(gpa);
-        msl(&src);
-        let pipe = match dev.pipeline(src.as_slice(), "vs", "fs", format, &err) {
-            Some(p) => p,
-            None => return Err(err),
+        let inst = gpu::Instance::new_in(gpa);
+        let adapter = match inst.adapter() {
+            Ok(a) => a,
+            Err(e) => return Err(format_in(f"{e}", gpa)),
+        };
+        let (dev, queue) = match adapter.device() {
+            Ok(d) => d,
+            Err(e) => return Err(format_in(f"{e}", gpa)),
+        };
+        let shader = match dev.shader_wgsl(CELLS_WGSL) {
+            Ok(s) => s,
+            Err(e) => return Err(format_in(f"{e}", gpa)),
+        };
+        var desc = gpu::RenderDesc::new(shader, "vs", "fs", format);
+        desc.topology(Topology::TriangleStrip);
+        let pipe = match dev.render_pipeline(desc) {
+            Ok(p) => p,
+            Err(e) => return Err(format_in(f"{e}", gpa)),
         };
         var pal: Vec<u32> = Vec::new_in(gpa);
         default_palette(&pal);
-        var r = Renderer {
-            dev: dev.clone(),
+        let ubuf = dev.buffer(UNIFORM_BYTES, BufferUsage::UNIFORM | BufferUsage::COPY_DST);
+        let ibuf = dev.buffer(16, BufferUsage::STORAGE | BufferUsage::COPY_DST);
+        let atlas = Atlas::new_in(dev, gpa);
+        let group = make_group(dev, pipe, ubuf, ibuf, atlas);
+        Ok(Renderer {
+            dev: dev,
+            queue: queue,
             pipe: pipe,
+            format: format,
+            ubuf: ubuf,
+            ibuf: ibuf,
+            group: group,
+            group_pages: -1,
             font: f,
-            atlas: Atlas::new_in(dev, gpa),
+            atlas: atlas,
             lines: 0,
             cols: 0,
             top: 0,
             master: Vec::new_in(gpa),
             ver: Vec::new_in(gpa),
             next_ver: 1,
-            frames: Vec::new_in(gpa),
-            frame: 0,
+            gpu_ver: Vec::new_in(gpa),
             palette: pal,
             cursor: CursorView { line: 0, col: 0, shape: CURSOR_HIDDEN },
             sel_lo: 0,
@@ -211,28 +233,14 @@ impl Renderer {
             pad_y: 0,
             changed: true,
             force_all: true,
-            pending: 0,
             stats: Stats { rows_built: 0, rows_copied: 0, frames: 0, skipped: 0, atlas_clears: 0 },
             gpa: gpa,
-        };
-        for _ in 0..FRAMES {
-            r.frames.push(FrameBuf {
-                buf: dev.buffer(16),
-                ver: Vec::new_in(gpa),
-                last: None,
-            });
-        }
-        Ok(r)
+        })
     }
 
-    // Waits for every frame in flight.
+    // Waits until the GPU has finished every frame submitted.
     pub fn wait_idle(inout self) {
-        for i in 0..self.frames.len() {
-            match std::replace(&self.frames[i].last, None) {
-                Some(s) => s.wait(),
-                None => {}
-            }
-        }
+        let _ = self.queue.wait_idle();
     }
 
     // Cell size in pixels.
@@ -250,7 +258,6 @@ impl Renderer {
         if lines == self.lines && cols == self.cols {
             return;
         }
-        self.wait_idle();
         self.lines = lines;
         self.cols = cols;
         self.top = 0;
@@ -263,13 +270,14 @@ impl Renderer {
         for _ in 0..lines {
             self.ver.push(0);
         }
-        for i in 0..self.frames.len() {
-            self.frames[i].buf = self.dev.buffer(n * 16);
-            self.frames[i].ver.clear();
-            for _ in 0..lines {
-                self.frames[i].ver.push(0);
-            }
+        self.gpu_ver.clear();
+        for _ in 0..lines {
+            self.gpu_ver.push(0);
         }
+        // a new buffer: the frames in flight keep the old one alive
+        self.ibuf = self.dev.buffer(if n < 1 { 16 } else { n * 16 },
+            BufferUsage::STORAGE | BufferUsage::COPY_DST);
+        self.group_pages = -1;
         self.changed = true;
     }
 
@@ -411,10 +419,10 @@ impl Renderer {
                     var glyph: i64 = 0;
                     if (fl & LEADING_WIDE_CHAR_SPACER) == 0 && (fl & HIDDEN) == 0 && ch > 32 {
                         let cells = if (fl & WIDE_CHAR) != 0 { 2 } else { 1 };
-                        glyph = self.atlas.lookup(&self.font, ch, style, cells);
+                        glyph = self.atlas.lookup(&self.font, self.dev, ch, style, cells);
                         if glyph < 0 {
                             self.atlas.clear();
-                            glyph = self.atlas.lookup(&self.font, ch, style, cells);
+                            glyph = self.atlas.lookup(&self.font, self.dev, ch, style, cells);
                             if glyph < 0 {
                                 glyph = 0;
                             }
@@ -476,71 +484,89 @@ impl Renderer {
         }
     }
 
-    // Encodes the frame into `target` and returns its pass, not yet
-    // submitted (the caller presents or submits it). Copies the rows this
-    // frame's buffer lacks first.
-    pub fn encode(inout self, target: Texture) -> Pass {
-        let f = self.frame;
-        self.frame = (self.frame + 1) % FRAMES;
-        match std::replace(&self.frames[f].last, None) {
-            Some(s) => s.wait(),
-            None => {}
-        }
+    // Writes the slots the instance buffer lacks, a run of adjacent ones
+    // at a time, and the uniforms for a target of w × h pixels.
+    fn upload(inout self, w: i64, h: i64) {
         let row_bytes = self.cols * 16;
-        let n = self.lines * self.cols;
-        // SAFETY: the frame's buffer is shared memory of lines × cols
-        // instances (resize made it so), live while the renderer is; the
-        // GPU is not reading it: its last command buffer was waited for
-        // above.
-        let dst = unsafe { (self.frames[f].buf.ptr as *Inst)[0..n] };
-        let src = self.master.as_slice();
-        for s in 0..self.lines {
-            if self.frames[f].ver[s] != self.ver[s] {
-                // SAFETY: both rows are checked elements of slices of n
-                // instances, and row_bytes is one row of them.
-                unsafe {
-                    memcpy(&dst[s * self.cols] as *u8, &src[s * self.cols] as *u8,
-                        row_bytes as u64);
-                }
-                self.frames[f].ver[s] = self.ver[s];
-                self.stats.rows_copied += 1;
+        var s = 0;
+        while s < self.lines {
+            if self.gpu_ver[s] == self.ver[s] {
+                s += 1;
+                continue;
             }
+            var e = s;
+            while e < self.lines && self.gpu_ver[e] != self.ver[e] {
+                self.gpu_ver[e] = self.ver[e];
+                e += 1;
+            }
+            let src = self.master.as_slice();
+            // SAFETY: rows s..e of the ring are (e - s) * cols instances of
+            // 16 bytes inside `master` (lines × cols of them).
+            let bytes = unsafe {
+                (&src[s * self.cols] as *u8)[0..(e - s) * row_bytes]
+            };
+            self.queue.write_buffer(self.ibuf, s * row_bytes, bytes);
+            self.stats.rows_copied += e - s;
+            s = e;
         }
+        let u = self.uniforms(w, h);
+        self.queue.write_buffer(self.ubuf, 0, as_bytes_u(&u));
+    }
+
+    // The bind group, made again when a buffer or atlas page changed.
+    fn bind(inout self) {
+        if self.group_pages == self.atlas.pages {
+            return;
+        }
+        self.group = make_group(self.dev, self.pipe, self.ubuf, self.ibuf, self.atlas);
+        self.group_pages = self.atlas.pages;
+    }
+
+    // The atlas entry of `c` (Atlas::lookup on this renderer's font and
+    // queue).
+    pub fn lookup(inout self, c: u32, style: i64, cells: i64) -> i64 {
+        self.atlas.lookup(&self.font, self.dev, c, style, cells)
+    }
+
+    // A texture's texels into `out`, rows of width × texel bytes (it
+    // waits for the GPU): the tests' render targets; `read_page` reads an
+    // atlas page.
+    pub fn read_texture(inout self, tex: gpu::Texture, out: inout Vec<u8>) {
+        readback(self.dev, &self.queue, tex, &out);
+    }
+
+    pub fn read_page(inout self, color: bool, out: inout Vec<u8>) {
+        self.atlas.flush(&self.queue);
+        if color {
+            readback(self.dev, &self.queue, self.atlas.color, &out);
+        } else {
+            readback(self.dev, &self.queue, self.atlas.cov, &out);
+        }
+    }
+
+    // Draws the frame into `target` (a w × h view: a surface frame's
+    // texture, or a test's) and submits it; the caller presents a surface
+    // frame after. The rows the instance buffer lacks are written first.
+    pub fn render(inout self, target: gpu::TextureView) {
+        if self.lines == 0 || self.cols == 0 {
+            return;
+        }
+        self.atlas.flush(&self.queue);
+        self.upload(target.width, target.height);
+        self.bind();
         let bg = self.palette[DEFAULT_BG as i64];
-        let clear = ClearColor {
-            r: ((bg >> 16) & 255) as f64 / 255.0,
-            g: ((bg >> 8) & 255) as f64 / 255.0,
-            b: (bg & 255) as f64 / 255.0,
-            a: 1.0,
-        };
-        let u = self.uniforms(target.w, target.h);
-        var pass = self.dev.begin(target, clear, false);
-        pass.set_pipeline(self.pipe);
-        let ub = as_bytes_u(&u);
-        pass.vertex_bytes(ub, 0);
-        pass.fragment_bytes(ub, 0);
-        pass.vertex_buffer(self.frames[f].buf, 0, 1);
-        pass.vertex_buffer(self.atlas.entries, 0, 2);
-        pass.fragment_texture(self.atlas.cov, 0);
-        pass.fragment_texture(self.atlas.color, 1);
-        pass.draw_quads(self.lines * self.cols);
-        self.pending = f;
+        let clear = gpu::Color::rgba(((bg >> 16) & 255) as f64 / 255.0,
+            ((bg >> 8) & 255) as f64 / 255.0, (bg & 255) as f64 / 255.0, 1.0);
+        let n = self.lines * self.cols;
+        var enc = self.dev.encoder();
+        enc.render_pass(PassDesc::color(target, clear: clear), |pass| {
+            pass.set_pipeline(self.pipe);
+            pass.set_bind_group(0, self.group);
+            pass.draw(0..4, 0..n);
+        });
+        self.queue.submit(enc.finish());
         self.changed = false;
         self.stats.frames += 1;
-        pass
-    }
-
-    // Records the submitted command buffer of the frame `encode` made.
-    pub fn submitted(inout self, s: sink Submitted) {
-        let f = self.pending;
-        self.frames[f].last = Some(s);
-    }
-}
-
-// The frames in flight finish before the buffers they read are released.
-impl Drop for Renderer {
-    fn drop(inout self) {
-        self.wait_idle();
     }
 }
 
@@ -548,10 +574,44 @@ extern "C" {
     fn memcpy(dst: *u8, src: *u8, n: u64) -> *u8;
 }
 
+// tex's texels into out, rows of width × texel bytes, through a buffer
+// whose rows are 256-byte aligned (copy_texture_to_buffer's rule).
+fn readback(dev: gpu::Device, queue: inout gpu::Queue, tex: gpu::Texture, out: inout Vec<u8>) {
+    let w = tex.width();
+    let h = tex.height();
+    let tb = tex.format().size();
+    let row = w * tb;
+    let stride = (row + 255) / 256 * 256;
+    var buf = dev.buffer(stride * h, BufferUsage::MAP_READ | BufferUsage::COPY_DST);
+    var enc = dev.encoder();
+    enc.copy_texture_to_buffer(tex, buf, stride);
+    queue.submit(enc.finish());
+    let px = buf.map_read(dev);
+    out.clear();
+    for y in 0..h {
+        out.extend_from_slice(px[y * stride..y * stride + row]);
+    }
+}
+
+// The one bind group of cells.wgsl: the uniforms, the instances, the
+// atlas's table and pages.
+fn make_group(dev: gpu::Device, pipe: gpu::RenderPipeline, ubuf: gpu::Buffer, ibuf: gpu::Buffer,
+    atlas: Atlas) -> gpu::BindGroup {
+    // (0.20: a temporary passed to a let parameter is rejected: the views
+    // are named first)
+    let cov = atlas.cov.view();
+    let color = atlas.color.view();
+    let entries = [
+        gpu::bind(0, ubuf), gpu::bind(1, ibuf), gpu::bind(2, atlas.table),
+        gpu::bind_texture(3, cov), gpu::bind_texture(4, color),
+    ];
+    dev.bind_group(pipe.bind_layout(0), entries[..])
+}
+
 // The uniforms' bytes (a view of `u`, valid while it is).
 fn as_bytes_u(u: *Uniforms) -> [u8] {
     // SAFETY: Uniforms is 20 four-byte fields (80 bytes, no padding);
     // the slice views the caller's value for the duration of the call
-    // that copies it (setVertexBytes copies at once).
+    // that copies it (write_buffer copies at once).
     unsafe { (u as *u8)[0..80] }
 }

@@ -45,7 +45,7 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-window.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 
-if ! (cd "$ROOT" && "$COMPILER" -O2 tests/window/main.tach tests/window/frameworks.c -o "$WORK/prog") \
+if ! (cd "$ROOT" && "$COMPILER" -O2 tests/window/main.tach tests/window/frameworks.c -l objc -o "$WORK/prog") \
         >"$WORK/build.out" 2>&1; then
     echo "FAIL window_build:"
     head -20 "$WORK/build.out" | sed 's/^/    /'
