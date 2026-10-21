@@ -41,10 +41,10 @@ stack, and 160 bytes in the line.
 
 ```tach
 fn main() -> i32 {
-    let mut mem = [0u8; 512];
+    var mem = [0u8; 512];
     let fb = FixedBuf::new(mem[..]);
-    let mut line: Vec<u8, FixedBuf> = Vec::with_capacity_in(160, fb);
-    let mut stack: Vec<i64, FixedBuf> = Vec::new_in(fb);
+    var line: Vec<u8, FixedBuf> = Vec::with_capacity_in(160, fb);
+    var stack: Vec<i64, FixedBuf> = Vec::new_in(fb);
 ```
 
 `FixedBuf::new(mem[..])` makes an allocator over the array: it keeps
@@ -67,7 +67,7 @@ message is "out of memory", exit 101). `try_push` returns a `Result`
 instead:
 
 ```tach
-fn push(stack: &mut Vec<i64, FixedBuf>, x: i64) -> Result<(), CalcError> {
+fn push(stack: inout Vec<i64, FixedBuf>, x: i64) -> Result<(), CalcError> {
     match stack.try_push(x) {
         Ok(()) => Ok(()),
         Err(AllocError::OutOfMemory) => Err(CalcError::TooDeep(stack.len())),
@@ -103,7 +103,7 @@ every allocation is from the `FixedBuf`. `eval` makes it a promise:
 
 ```tach
 #[effects(alloc(FixedBuf), panic)]
-fn eval(line: [u8], stack: &mut Vec<i64, FixedBuf>) -> Result<i64, CalcError> {
+fn eval(line: [u8], stack: inout Vec<i64, FixedBuf>) -> Result<i64, CalcError> {
 ```
 
 The compiler checks the declaration against everything `eval` calls.

@@ -29,6 +29,7 @@ use crate::base::{IntVec, SRC, SYMS, buf_bytes, buf_new, buf_slice, buf_str};
 use crate::base::diag::{buf_position, buf_tool_command};
 use crate::front::ast::{NODES, NodeKind, child};
 use crate::front::check::{LOCALS, Res};
+use crate::front::lexer::Tok;
 use crate::front::modules::{STD_MODULE, within_std};
 use crate::front::own::diag::{
     OWN_CONFLICT, OWN_ESCAPE, OWN_READONLY, OWN_STATIC, own_begin, own_bytes, own_end, own_help,
@@ -640,7 +641,7 @@ fn report_invalid(s: i64, n: i64) {
             own_str(c" is used at ");
             own_pos(n);
             if how == H_READ {
-                own_help(c"a '&mut' borrow is the only way to its place while it is used: read through it, or end it (use it for the last time) before the read");
+                own_help(c"an inout access is the only way to its place while it is used: read through it, or end it (use it for the last time) before the read");
             } else {
                 own_help(c"use the view before the change, keep an index instead of a view, or keep a copy");
             }
@@ -885,6 +886,26 @@ pub fn on_borrow(p: i64, n: i64, kind: i64, raw: bool, dst: i64) {
             let d = child_place(p, DEREF_FIELD);
             set_bit(l1(dst), if d >= 0 { d } else { p });
             return;
+        }
+        // (0.20) `&*r` or `*r` of an access r (a use of it, names::
+        // access_use): a reborrow, as r passed on is: dst gets what r
+        // views, and the place r designates
+        let mut id = n;
+        if NODES[id].kind == NodeKind::Unary && NODES[id].op == Tok::Amp && NODES[id].b > 0 {
+            id = NODES[id].b;
+        }
+        if NODES[id].kind == NodeKind::Unary && NODES[id].op == Tok::Star && NODES[id].b > 0 {
+            let r = NODES[id].b;
+            if NODES[r].kind == NodeKind::Ident && NODES[r].res == Res::Local && NODES[r].y >= 0
+                && LOCALS[NODES[r].y].access {
+                let s = slot_of_local(NODES[r].y);
+                if s >= 0 && !LOCALS[NODES[r].y].is_param {
+                    // (a parameter's place lives for the call: `*r` stays a
+                    // place of its own, below)
+                    ov_or(dst, slot_off(CUR, s));
+                    return;
+                }
+            }
         }
         set_bit(l1(dst), p);
         let s = slot_of_place(p);
@@ -1159,10 +1180,14 @@ fn readonly(n: i64, l: i64, t: i64) {
         } else if words {
             own_str(c" (let: borrowed to be read)");
             own_help(c"take it inout ('x: inout T', called with '&x') to change it");
-        } else if TYPES[t].kind == TyKind::Slice {
+        } else if TYPES[t].kind == TyKind::Slice && crate::front::conv::LEGACY_ROOT {
             own_help(c"take the slice as '&mut [T]' ('v.as_mut_slice()', '&mut a[..]') to write its elements");
-        } else {
+        } else if crate::front::conv::LEGACY_ROOT {
             own_help(c"take it as '&mut T' ('&mut x' at the call) to write through it");
+        } else if TYPES[t].kind == TyKind::Slice {
+            own_help(c"take the slice inout ('s: inout [T]', called with '&v' or '&a[..]') to write its elements");
+        } else {
+            own_help(c"take it inout ('x: inout T', called with '&x') to write through it");
         }
         if LOCALS[l].is_param {
             // (the parameter retyped, with every call)
@@ -1171,7 +1196,8 @@ fn readonly(n: i64, l: i64, t: i64) {
             buf_bytes(a, SYMS[FNS[CUR_F].display].text);
             buf_str(a, c" --type ");
             buf_bytes(a, SYMS[LOCALS[l].name].text);
-            buf_str(a, if words { c" 'inout " } else { c" '&mut " });
+            buf_str(a,
+                if words || !crate::front::conv::LEGACY_ROOT { c" 'inout " } else { c" '&mut " });
             if TYPES[t].kind == TyKind::Slice {
                 buf_str(a, c"[");
                 crate::front::types::buf_type(a, TYPES[t].a);

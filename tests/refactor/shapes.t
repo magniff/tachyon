@@ -20,14 +20,14 @@ $ refactor signature Point::scale --add 'extra: i64 = 0' --at 1 --dry-run
 +++ b/main.tach
 @@ -14,2 +14,2 @@
 -    p.scale(2);
--    Point::scale(&mut p, 3);
+-    Point::scale(&p, 3);
 +    p.scale(0, 2);
-+    Point::scale(&mut p, 0, 3);
++    Point::scale(&p, 0, 3);
 --- a/geom.tach
 +++ b/geom.tach
 @@ -46 +46 @@
--    pub fn scale(self: &mut Point, k: i64) {
-+    pub fn scale(self: &mut Point, extra: i64, k: i64) {
+-    pub fn scale(inout self, k: i64) {
++    pub fn scale(inout self, extra: i64, k: i64) {
 note refactor.fill-calls: the calls get the value (a default is on trailing parameters only, and a later one has none)
 ## A trait's function: the trait, every impl, the calls (in a generic
 ## function's instances too).
@@ -35,19 +35,19 @@ $ refactor signature Shape::size --add 'bias: i64 = 0' --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -20 +20 @@
--    let s = total(&p) + total(&r) + p.size(3);
-+    let s = total(&p) + total(&r) + p.size(3, 0);
+-    let s = total(p) + total(r) + p.size(3);
++    let s = total(p) + total(r) + p.size(3, 0);
 --- a/geom.tach
 +++ b/geom.tach
 @@ -53 +53 @@
--    fn size(self: &Self, unit: i64) -> i64;
-+    fn size(self: &Self, unit: i64, bias: i64) -> i64;
+-    fn size(self, unit: i64) -> i64;
++    fn size(self, unit: i64, bias: i64) -> i64;
 @@ -57 +57 @@
--    fn size(self: &Point, unit: i64) -> i64 {
-+    fn size(self: &Point, unit: i64, bias: i64) -> i64 {
+-    fn size(self, unit: i64) -> i64 {
++    fn size(self, unit: i64, bias: i64) -> i64 {
 @@ -63 +63 @@
--    fn size(self: &Pair, unit: i64) -> i64 {
-+    fn size(self: &Pair, unit: i64, bias: i64) -> i64 {
+-    fn size(self, unit: i64) -> i64 {
++    fn size(self, unit: i64, bias: i64) -> i64 {
 @@ -69 +69 @@
 -    s.size(1) + s.size(2)
 +    s.size(1, 0) + s.size(2, 0)
@@ -74,17 +74,17 @@ $ refactor signature Point::size --rename-param unit u --dry-run
 --- a/geom.tach
 +++ b/geom.tach
 @@ -53 +53 @@
--    fn size(self: &Self, unit: i64) -> i64;
-+    fn size(self: &Self, u: i64) -> i64;
+-    fn size(self, unit: i64) -> i64;
++    fn size(self, u: i64) -> i64;
 @@ -57,2 +57,2 @@
--    fn size(self: &Point, unit: i64) -> i64 {
+-    fn size(self, unit: i64) -> i64 {
 -        (self.x + self.y) * unit
-+    fn size(self: &Point, u: i64) -> i64 {
++    fn size(self, u: i64) -> i64 {
 +        (self.x + self.y) * u
 @@ -63,2 +63,2 @@
--    fn size(self: &Pair, unit: i64) -> i64 {
+-    fn size(self, unit: i64) -> i64 {
 -        (self.a + self.b) as i64 * unit
-+    fn size(self: &Pair, u: i64) -> i64 {
++    fn size(self, u: i64) -> i64 {
 +        (self.a + self.b) as i64 * u
 $ refactor signature apply --reorder x,f --dry-run
 --- a/main.tach
@@ -175,8 +175,8 @@ $ refactor field Point --add 'z: i64 = 0' --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -12 +12 @@
--    let mut p = Point { x: 2, y: 3 };
-+    let mut p = Point { x: 2, y: 3, z: 0 };
+-    var p = Point { x: 2, y: 3 };
++    var p = Point { x: 2, y: 3, z: 0 };
 --- a/geom.tach
 +++ b/geom.tach
 @@ -6,0 +7 @@
@@ -188,8 +188,8 @@ $ refactor field Point --rename y height --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -12 +12 @@
--    let mut p = Point { x: 2, y: 3 };
-+    let mut p = Point { x: 2, height: 3 };
+-    var p = Point { x: 2, y: 3 };
++    var p = Point { x: 2, height: 3 };
 --- a/geom.tach
 +++ b/geom.tach
 @@ -6 +6 @@
@@ -354,8 +354,8 @@ replaced crate::geom::twice	geom.tach	+1 -1 lines
 --- a/main.tach
 +++ b/main.tach
 @@ -12 +12 @@
--    let mut p = Point { x: 2, y: 3 };
-+    let mut p = Point { x: 2, height: 3 };
+-    var p = Point { x: 2, y: 3 };
++    var p = Point { x: 2, height: 3 };
 @@ -16 +16 @@
 -    let a = area(p) + area(q);
 +    let a = area(p, 2) + area(q, 2);

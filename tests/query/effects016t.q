@@ -27,4 +27,4 @@ $ effects Pair syntax016/main.tach
 note query.empty: no function among the names
 [exit 1]
 $ def grow syntax016/main.tach
-crate::grow	syntax016/main.tach:38:4	fn	fn grow(v: &mut Vec<i64>)	effects: alloc(Gpa) panic
+crate::grow	syntax016/main.tach:38:4	fn	fn grow(v: inout Vec<i64>)	effects: alloc(Gpa) panic

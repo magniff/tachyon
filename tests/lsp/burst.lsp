@@ -13,7 +13,7 @@
 > @change main.tach main-broken
 > {"jsonrpc":"2.0","id":4,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.tach"},"position":{"line":9,"character":4}}}
 < {"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file://@DIR@/main.tach","diagnostics":[{"range":{"start":{"line":7,"character":12},"end":{"line":7,"character":16}},"severity":1,"code":"type error","source":"tachyonc","message":"undefined variable 'aera'\nhelp: did you mean 'area'?","relatedInformation":[{"location":{"uri":"file://@DIR@/main.tach","range":{"start":{"line":7,"character":12},"end":{"line":7,"character":16}}},"message":"try: tachyonc fix --suggested @DIR@/main.tach"}]}]}}
-< {"jsonrpc":"2.0","id":4,"result":{"uri":"file://@DIR@/main.tach","range":{"start":{"line":8,"character":12},"end":{"line":8,"character":13}}}}
+< {"jsonrpc":"2.0","id":4,"result":{"uri":"file://@DIR@/main.tach","range":{"start":{"line":8,"character":8},"end":{"line":8,"character":9}}}}
 > {"jsonrpc":"2.0","id":5,"method":"shutdown"}
 < {"jsonrpc":"2.0","id":5,"result":null}
 > {"jsonrpc":"2.0","method":"exit"}

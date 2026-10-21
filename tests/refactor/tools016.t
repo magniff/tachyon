@@ -21,7 +21,7 @@ ok: 0 errors in main.tach
 ## --nth N patches the Nth, --all every one; --nth past the last.
 $ edit patch clamp --old 'r = ' --new 'r = 0 + '
 error patch.ambiguous: OLD 1 occurs 3 times in crate::calc::clamp, lines 2, 4, 7; give more of the text around it, or --nth N (--all: every one)
-try: tachyonc edit patch clamp --old 'let mut r = v;' --new 'let mut r = 0 + v;'
+try: tachyonc edit patch clamp --old 'var r = v;' --new 'var r = 0 + v;'
 try: tachyonc edit patch clamp --old 'r = lo;' --new 'r = 0 + lo;'
 try: tachyonc edit patch clamp --old 'r = hi;' --new 'r = 0 + hi;'
 [exit 1]
@@ -146,7 +146,7 @@ $ query show total
 // crate::loops::total	loops.tach:5-22	effects: global panic
 pub fn total() -> i64 {
     let w = unsafe { V };
-    let mut t = 0;
+    var t = 0;
     for x2 in w.data.iter() {
         t += x2 * 2;
         if x2 > 2 {

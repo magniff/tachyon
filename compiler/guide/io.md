@@ -14,14 +14,14 @@ of a PathBuf. `File::open(p)?`, `File::create(p)?`,
 Display as Rust's: `No such file or directory (os error 2)`), and
 `io::Result<T>` goes with `?`. `BufReader::new(f)` and
 `BufWriter::new(f)` keep an 8 KB buffer inline (no allocation):
-`r.read_line(&mut s)?` appends a line, its `'\n'` included (0 at the
+`r.read_line(&s)?` appends a line, its `'\n'` included (0 at the
 end); `r.lines_in(gpa)` yields each line as a String;
-`writeln(&mut w, f"..")?` (Rust's `writeln!`; `use std::io::writeln`).
+`writeln(&w, f"..")?` (Rust's `writeln!`; `use std::io::writeln`).
 `Path::new(p)`: `file_name()`, `extension()`, `parent()`,
 `components()`, `join_in(q, gpa)` (a PathBuf). `env::args()` yields
-`str`s (`.collect_in(gpa)`), `env::var_in(name, gpa)` a
-`Result<String, VarError>`. `Command::new(p)`, then `c.arg(a)` (it
-changes `c`: `let mut c = ..`, no chaining), `c.output_in(gpa)?`
+`str`s (`.collect_in(gpa)`), `env::get_in(name, gpa)` a
+`Result<String, VarError>` (Rust's `env::var`). `Command::new(p)`, then `c.arg(a)` (it
+changes `c`: `var c = ..`, no chaining), `c.output_in(gpa)?`
 (`status`, `stdout`, `stderr`), `c.status()?`. A Rust `use std::io::{self,
 Write}` is two lines here: `use std::io;` and `use std::io::Write;`.
 
@@ -35,20 +35,20 @@ use std::process::Command;
 fn run(gpa: Gpa) -> io::Result<()> {
     let path = "/tmp/tachyon-guide-files.txt";
     {
-        let mut w = BufWriter::new(File::create(path)?);
+        var w = BufWriter::new(File::create(path)?);
         for i in 1..4 {
-            writeln(&mut w, f"line {i}")?;
+            writeln(&w, f"line {i}")?;
         }
     }
-    let mut r = BufReader::new(File::open(path)?);
-    let mut line = String::new_in(gpa);
-    let mut total = 0;
-    while r.read_line(&mut line)? > 0 {
+    var r = BufReader::new(File::open(path)?);
+    var line = String::new_in(gpa);
+    var total = 0;
+    while r.read_line(&line)? > 0 {
         total += 1;
     }
     println(f"{total} {line.lines().count()} {fs::metadata(path)?.len()}");
     fs::remove_file(path)?;
-    let mut c = Command::new("echo");
+    var c = Command::new("echo");
     c.arg("hi");
     let out = c.output_in(gpa)?;
     println(f"{out.status.success()} {out.stdout.len()}");

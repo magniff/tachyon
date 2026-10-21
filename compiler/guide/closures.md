@@ -12,7 +12,7 @@ fn apply<F: Fn(i64) -> i64>(f: F, x: i64) -> i64 {
     f(x)
 }
 
-fn repeat<F: FnMut(i64)>(n: i64, mut f: F) {
+fn repeat<F: FnMut(i64)>(n: i64, f: sink F) {
     for i in 0..n { f(i); }
 }
 
@@ -23,8 +23,8 @@ fn main() -> i32 {
     print(" ");
     std::print_int(apply(|x| x * 2, 21));    // here F's bound gives x: i64
     print(" ");
-    let mut total = 0;
-    repeat(4, |i| { total += i; });          // changes `total` (a `let mut`)
+    var total = 0;
+    repeat(4, |i| { total += i; });          // changes `total` (a `var`: captured inout)
     std::print_int(total);
     println("");
     0
@@ -40,8 +40,9 @@ fn main() -> i32 {
   with a result type, the body is a block. The body takes everything
   after the bars, as `return`'s value does: `|x| x + 1` is
   `|x| (x + 1)`.
-- Parameters are patterns: `|(a, b): (i64, i64)| a * b`, `|mut x|`,
-  `|_|`; not `|a | b|` (no or-pattern at the top).
+- Parameters are patterns: `|(a, b): (i64, i64)| a * b`, `|var x|`,
+  `|_|`; not `|a | b|` (no or-pattern at the top). They are let unless
+  annotated: `|s: inout Sum, x: i64| s.total += x`.
 - A parameter's type is the annotation, else the one the context
   expects (an `F: Fn(i64) -> bool` bound, an `fn(i64) -> bool`
   parameter). Without either it is an error: `cannot infer the type of
@@ -57,14 +58,24 @@ Decided per variable, so the meaning never depends on an analysis:
 
 | the variable | captured | the closure sees |
 |---|---|---|
-| `let x`, a parameter, a `for` variable | by value (a copy) | the value it had; nothing can change it |
-| `let mut x` | by reference | `x` itself: its assignments change `x` |
-| anything, with `move \|..\|` | by value | a snapshot; assignments change the closure's copy |
+| a plain `let x`, a parameter, a `for` variable | a copy | the value it had; nothing can change it |
+| an owned `let x` (a `Vec`, a `Buf`) | let (read-only access) | `x` itself, read only; no copy |
+| `var x` | inout | `x` itself: its assignments change `x` |
+| anything, in a `sink \|..\|` closure | taken: copied, an owned local moved in | a snapshot; assignments change the closure's own |
 
-A closure capturing `x` by reference is a view of `x` (0.17): while the
+A closure capturing `x` by access is a view of `x` (0.17): while the
 closure is still to be called, `x` is not changed another way
-(`own.conflict`, as in Rust). Change it after the closure's last call,
-or capture a snapshot with `move`.
+(`own.conflict`). Change it after the closure's last call, or capture a
+snapshot with `sink`.
+
+## sink closures
+
+`sink || body` takes what it captures, as a `sink` parameter does: a
+plain value is copied, an owned local moves into the closure (and is
+dead after it), and the closure may change its own copies. It is the
+way to keep a closure that outlives the block of what it uses: the
+move closure of other languages (`move ||` is `conv.rust`, with `sink
+||` in its `try:` line).
 
 An owned value a closure captures without `sink` still belongs to its
 variable, so the body may not move it (`drop(x)`, passing it to a sink
@@ -74,14 +85,31 @@ skips that one. Called again after such a move, it stops the program
 (exit 101), since no closure is `FnOnce` yet.
 
 ```tach
-fn call<F: FnMut() -> i64>(mut f: F) -> i64 {
+fn call<F: FnMut() -> i64>(f: sink F) -> i64 { f() }
+
+fn main(gpa: Gpa) -> i32 {
+    var v: Vec<i64> = Vec::new_in(gpa);
+    v.push(4);
+    let w = v.clone();
+    let count = || w.len();            // an owned let: read through an access
+    let keep = sink || v.len();        // v moves into the closure: dead here
+    println(f"{count()} {call(keep)} {w.len()}");
+    0
+}
+```
+```out
+1 1 1
+```
+
+```tach
+fn call<F: FnMut() -> i64>(f: sink F) -> i64 {
     f()
 }
 
 fn main() -> i32 {
-    let mut n = 1;
-    let snap = move || n;              // a copy of n, now
-    let bump = || { n += 10; n };      // by reference: changes n
+    var n = 1;
+    let snap = sink || n;              // a copy of n, now
+    let bump = || { n += 10; n };      // n captured inout: changes n
     let b = call(bump);                // 11
     n += 100;                          // bump is done with n
     println(f"{b} {call(snap)} {n}");
@@ -94,7 +122,7 @@ fn main() -> i32 {
 
 A closure that borrows a variable cannot leave that variable's block: a
 block's value, a `break` value, a `match` or `if let` arm's value. The
-error says to write `move`, or to declare the variable outside the
+fix is a `sink` closure, or the variable declared outside the
 block. There is nothing else a closure can escape through: closure
 types cannot be named, so no struct field, static or return type can
 hold one (outside generic parameters).
@@ -104,7 +132,10 @@ hold one (outside generic parameters).
 - `F: Fn(A, B) -> R` takes a closure with that signature that assigns
   no captured variable, or a plain function `fn(A, B) -> R`.
 - `F: FnMut(A, B) -> R` takes any closure with that signature, or a
-  plain function. Call `f` from a `mut f: F` parameter or a `let mut`.
+  plain function. Call `f` from a `f: sink F` parameter or a `var`.
+- A parameter's convention is part of the signature: `F: FnMut(inout
+  Sum, i64)` takes a closure `|s: inout Sum, x: i64| s.total += x`,
+  called as `f(&s, x)`; `fn(inout Sum, i64)` is the plain function type.
 - `-> R` may be left out: `FnMut(i64)` returns `()`. There is no
   `FnOnce`.
 - A closure that captures nothing is a plain function: it converts to
@@ -124,7 +155,7 @@ fn main() -> i32 {
     std::print_int(run(|x| x * x));       // captures nothing: a plain fn
     print(" ");
     let k = 3;
-    let mut c = Counter { step: |x: i64| x + k, n: 0 };
+    var c = Counter { step: |x: i64| x + k, n: 0 };
     c.n = (c.step)(c.n);
     c.n = (c.step)(c.n);
     std::print_int(c.n);

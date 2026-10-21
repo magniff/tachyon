@@ -98,7 +98,7 @@ direction:
 ```tach
 // tachyon -> C: copy the bytes and a 0 into a Buf; pass .as_slice().ptr
 fn cstring(s: [u8], gpa: Gpa) -> Buf {
-    let mut b = Buf::new_in(gpa);
+    var b = Buf::new_in(gpa);
     b.push_str(s);
     b.push(0);
     b
@@ -106,7 +106,7 @@ fn cstring(s: [u8], gpa: Gpa) -> Buf {
 
 // C -> tachyon: copy the C string into a Buf of our own
 unsafe fn owned(p: *u8, gpa: Gpa) -> Buf {
-    let mut b = Buf::new_in(gpa);
+    var b = Buf::new_in(gpa);
     b.push_cstr(p);
     b
 }
@@ -133,8 +133,8 @@ with Debug: `Some("hello from setenv")`.
 ### Time: struct tm, strftime, TZ
 
 ```tach
-let mut utc: c::tm = unsafe { *c::gmtime(&when) };
-let mut long = format_time("%A, %d %B %Y, %H:%M:%S UTC", &utc);
+var utc: c::tm = unsafe { *c::gmtime(&when) };
+var long = format_time("%A, %d %B %Y, %H:%M:%S UTC", &utc, gpa);
 ```
 
 `gmtime` and `localtime` return a pointer to a static `struct tm` inside
@@ -172,7 +172,7 @@ pointer. `defer` closes the directory on every way out of the function.
 `d_name` is a `char` array inside the struct: `&ent.d_name as *u8` is its
 address, a C string. `readdir` returns names in the file system's order,
 so the entries are sorted with a closure:
-`entries.sort_by(|a, b| { ... x.cmp(&y) })`.
+`entries.sort_by(|a, b| { ... x.cmp(y) })`.
 
 `stat` fills a `struct stat` the program has to provide. Its fields
 differ between systems, so it is not written out field by field but
@@ -186,7 +186,7 @@ unsafe fn zeroed_stat() -> c::stat {
     value
 }
 
-let mut st: c::stat = unsafe { zeroed_stat() };
+var st: c::stat = unsafe { zeroed_stat() };
 if unsafe { c::stat(path.as_slice().ptr, &st) } == 0 {
     e.size = st.st_size;
     e.mode = st.st_mode; // u16 on macOS, u32 on Linux: it widens

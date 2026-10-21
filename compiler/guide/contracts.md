@@ -11,22 +11,22 @@ release switch; `debug` clauses are the ones only test builds check.
 struct Stack { items: Vec<i64> }
 
 impl Stack {
-    fn top(self: &Stack, i: i64) -> i64
+    fn top(self, i: i64) -> i64
         requires 0 <= i && i < self.items.len() else f"no item {i}"
+        ensures result == self.items.get(i)
     {
         self.items.get(i)
     }
 
-    fn pop(self: &mut Stack) -> i64
+    fn pop(inout self) -> i64
         requires self.items.len() > 0 else "pop on an empty stack"
-        ensures self.items.len() == old(self.items.len()) - 1
     {
         self.items.pop().unwrap()
     }
 }
 
 fn main(gpa: Gpa) -> i32 {
-    let mut s = Stack { items: Vec::new_in(gpa) };
+    var s = Stack { items: Vec::new_in(gpa) };
     s.items.push(4);
     println(f"{s.top(0)} {s.pop()}");
     println(f"{s.pop()}");

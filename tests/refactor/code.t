@@ -33,9 +33,9 @@ pub fn sum_to(n: i64) -> i64 {
 }
 
 fn sums(n: i64) -> (i64, i64) {
-    let mut total = 0;
-    let mut squares = 0;
-    let mut i = 1;
+    var total = 0;
+    var squares = 0;
+    var i = 1;
     while i <= n {
         total += i;
         squares += i * i;
@@ -64,7 +64,7 @@ extracted lines 16-17 of crate::calc::Acc::mean into raw_mean() -> i64	calc.tach
 17	        m
 18	    }
 19	
-20	    fn raw_mean(self: &Acc) -> i64 {
+20	    fn raw_mean(self) -> i64 {
 $ main.tach -o prog
 ok: built prog
 % ./prog; echo "exit $?"
@@ -174,9 +174,9 @@ $ refactor inline sum_to --at main.tach:7 --dry-run
 @@ -7 +7,12 @@
 -    let s = sum_to(3) + mean_to(5) + first_big(10, 20) + quad(2) + bytes(4);
 +    let s = {
-+        let mut total = 0;
-+        let mut squares = 0;
-+        let mut i = 1;
++        var total = 0;
++        var squares = 0;
++        var i = 1;
 +        while i <= 3 {
 +            total += i;
 +            squares += i * i;

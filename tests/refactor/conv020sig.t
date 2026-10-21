@@ -37,7 +37,7 @@ fn bump(a: inout Acc, k: i64) { a.n += k; }
 
 fn peek(a: let Acc) -> i64 { a.n }
 
-fn eat(v: let Vec<i64>) -> i64 { v.len() }
+fn eat(v: Vec<i64>) -> i64 { v.len() }
 
 fn main(gpa: Gpa) {
     var a = Acc { n: 1 };

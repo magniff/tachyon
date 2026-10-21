@@ -4,9 +4,12 @@ Tachyon looks like Rust; what differs is shown below as pairs: each
 `// Rust:` comment is the Rust you would write, the line under it is the
 tachyon for it. Both programs compile and run as shown (`tachyonc
 main.tach -o prog && ./prog < in.txt`). There are no macros, no `String`
-(text is `[u8]`, built with `std::Buf`), no lifetimes to write (`&T`,
-`&mut T` and moves are checked as in Rust; values drop at scope end), and
-nothing allocates without the allocator `gpa` that `main` receives.
+(text is `[u8]`, built with `std::Buf`), no references or lifetimes to
+write: a parameter's convention says what the callee does with it (`x:
+T` reads it, the default; `x: inout T` changes it, called `f(&x)`; `x:
+sink T` takes it); moves are checked as in Rust and values drop at scope
+end; and nothing allocates without the allocator `gpa` that `main`
+receives.
 
 ```tach
 use std::{Buf, HashMap, Scanner, read_stdin_in, sort};
@@ -20,15 +23,15 @@ enum Cmd { Add([u8], i64), Show }
 
 // Rust: impl Item { fn total(&self, k: i64) -> i64 { ... } }
 impl Item {
-    fn total(self: &Item, k: i64) -> i64 { self.qty * k }
+    fn total(self, k: i64) -> i64 { self.qty * k }
     // Rust: fn bump(&mut self) { self.qty += 1; }
-    fn bump(self: &mut Item) { self.qty += 1; }
+    fn bump(inout self) { self.qty += 1; }
 }
 
 // Rust: fn parse(line: &str) -> Option<Cmd>
 fn parse(line: [u8]) -> Option<Cmd> {
     // Rust: let words: Vec<&str> = line.split_whitespace().collect();
-    let mut sc = Scanner::new(line);
+    var sc = Scanner::new(line);
     // Rust: match words[0] { "add" => ..., "show" => ..., _ => None }
     let w = sc.next_token()?;
     if w == "add" {
@@ -45,13 +48,13 @@ fn parse(line: [u8]) -> Option<Cmd> {
 fn main(gpa: Gpa) -> i32 {
     let input = read_stdin_in(gpa).unwrap();
     // Rust: let mut counts: HashMap<String, i64> = HashMap::new();
-    let mut counts: HashMap<[u8], i64> = HashMap::new_in(gpa);
+    var counts: HashMap<[u8], i64> = HashMap::new_in(gpa);
     // Rust: let mut items: Vec<Item> = Vec::new();
-    let mut items: Vec<Item> = Vec::new_in(gpa);
+    var items: Vec<Item> = Vec::new_in(gpa);
     // Rust: let mut out = String::new();
-    let mut out = Buf::new_in(gpa);
+    var out = Buf::new_in(gpa);
     // Rust: for line in s.lines() {
-    let mut sc = Scanner::new(input.as_slice());
+    var sc = Scanner::new(input.as_slice());
     while let Some(line) = sc.next_line() {
         match parse(line) {
             // Rust: Some(Cmd::Add { name, n }) => { *counts.entry(name).or_insert(0) += n; }
@@ -74,7 +77,7 @@ fn main(gpa: Gpa) -> i32 {
     // Rust: let total: i64 = items.iter().map(|it| it.qty).sum();
     let total: i64 = items.iter().map(|it| it.qty).sum();
     // Rust: let mut qs: Vec<i64> = ...; qs.sort();
-    let mut qs: Vec<i64> = items.iter().map(|it| it.qty).collect_in(gpa);
+    var qs: Vec<i64> = items.iter().map(|it| it.qty).collect_in(gpa);
     sort(qs.as_mut_slice());
     // Rust: if let Some(n) = counts.get("a") { ... }
     if let Some(n) = counts.get("a") { out.push_fmt(f"a: {n}\n"); }
@@ -104,7 +107,7 @@ extern "C" { fn abs(x: i32) -> i32; }
 enum Op { Push(i64), Pop, Neg }
 
 // Rust: fn apply(stack: &mut Vec<i64>, op: &Op) -> Result<(), String>
-fn apply(stack: &mut Vec<i64>, op: Op) -> Result<(), [u8]> {
+fn apply(stack: inout Vec<i64>, op: Op) -> Result<(), [u8]> {
     // Rust: match op { ... }  (every variant covered, or `_ =>`)
     match op {
         Op::Push(n) => stack.push(n),
@@ -128,13 +131,13 @@ fn first_word(s: [u8]) -> [u8] {
 }
 
 fn main(gpa: Gpa) -> i32 {
-    let mut st: Vec<i64> = Vec::new_in(gpa);
+    var st: Vec<i64> = Vec::new_in(gpa);
     // Rust: apply(&mut st, &Op::Push(5)).unwrap();
-    apply(&mut st, Op::Push(5)).unwrap();
-    apply(&mut st, Op::Neg).unwrap();
+    apply(&st, Op::Push(5)).unwrap();
+    apply(&st, Op::Neg).unwrap();
     // Rust: if let Err(e) = apply(...) { eprintln!("{}", e); }
-    if let Err(e) = apply(&mut st, Op::Pop) { println(f"error: {e}"); }
-    if let Err(e) = apply(&mut st, Op::Pop) { println(f"error: {e}"); }
+    if let Err(e) = apply(&st, Op::Pop) { println(f"error: {e}"); }
+    if let Err(e) = apply(&st, Op::Pop) { println(f"error: {e}"); }
     // Rust: let n: i64 = " 42 ".trim().parse().unwrap();
     let n = parse_int(trim(" 42 ")).unwrap();
     // Rust: let a = (-7i32).abs();  (no methods on numbers: C's, or write it)
@@ -166,9 +169,11 @@ More pairs, one line each:
 - `String::from("x")`, `&str` -> `"x"` (a `[u8]`); `s.len()` -> `s.len()`
   on a `[u8]`, a `Vec` or a `Buf`.
 - `v[i]` on a `Vec` -> `v.get(i)`, `v.set(i, x)`, `v.as_slice()[i]`.
-- `Box<T>`, `Rc<T>` -> a `Vec<T>` and indices; `&x`, `&mut x`, `&T`,
-  `&mut T` as in Rust (a reference is not returned: return an index or the
-  owner); `&mut v[..]` / `v.as_mut_slice()` to write a slice.
+- `Box<T>`, `Rc<T>` -> a `Vec<T>` and indices; `x: &T` -> `x: T`,
+  called `f(x)`; `x: &mut T` -> `x: inout T`, called `f(&x)`; `x: T`
+  (taken) -> `x: sink T`; `let mut` -> `var`; `*r = v` -> `r = v` (no
+  `*` on an access); nothing returns a reference: return an index or the
+  owner; `&v[..]` to an `inout [T]` / `v.as_mut_slice()` to write a slice.
 - `impl Display` / `{:?}` -> `#[derive(Debug)]` and `f"{x:?}"`; `println!`
   -> `println(f"...")`; `format!` -> `format_in(f"...", gpa)` (a `Buf`).
 - `panic!("m")` -> `unsafe { std::panic(c"m") }`; `process::exit(n)` ->

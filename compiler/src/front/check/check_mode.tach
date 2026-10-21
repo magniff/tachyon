@@ -229,6 +229,9 @@ pub fn coerce_ref(n: i64, actual: i64, expected: i64) -> bool {
         }
         let ak = TYPES[actual].kind;
         let ek = TYPES[expected].kind;
+        if ek == TyKind::Slice && elements_view(n, actual, expected) {
+            return true;
+        }
         if ak == TyKind::Slice && ek == TyKind::Slice {
             if TYPES[actual].a != TYPES[expected].a {
                 return false;
@@ -255,6 +258,34 @@ pub fn coerce_ref(n: i64, actual: i64, expected: i64) -> bool {
             wrap_unary(n, Tok::Amp, expected);
             return true;
         }
+        if ek == TyKind::Ptr && TYPES[expected].b == REF_SHARED && TYPES[expected].a == actual
+            && NODES[n].kind == NodeKind::Closure
+            && (NODES[n].c & crate::front::ast::CLOSURE_MOVE) == 0 {
+            // (0.20) a closure, made here, given to a let parameter that
+            // borrows it (one that captures an inout access, so is no copy):
+            // its environment is the caller's, lent for the call; it owns
+            // nothing (it captures by reference), so nothing drops
+            wrap_unary(n, Tok::Amp, expected);
+            return true;
+        }
+        if ek == TyKind::Ptr && TYPES[expected].b == REF_MUT && TYPES[expected].a == actual
+            && NODES[n].start == NODES[n].end && crate::front::check::assign::is_place(n) {
+            // (0.20) a place the checker passes on where an exclusive
+            // reference is wanted (a contract's companion given an inout
+            // parameter, which is the value it designates): lent again
+            wrap_unary(n, Tok::Amp, expected);
+            NODES[n].p |= NODE_REF_MUT;
+            return true;
+        }
+        if ek == TyKind::Ptr && TYPES[expected].b == REF_MUT && ak == TyKind::Ptr
+            && TYPES[actual].b == REF_SHARED && TYPES[actual].a == TYPES[expected].a
+            && crate::front::conv::inout_marker(n) {
+            // (0.20) the inout marker `&x` checked before its parameter was
+            // known (an argument of a generic function, inferred from):
+            // exclusive, the place checked again as one
+            NODES[n].p |= NODE_REF_MUT;
+            return crate::front::check::synth_mode::synth_expr(n) == expected;
+        }
         if ak != TyKind::Ptr || TYPES[actual].b == 0 {
             return false;
         }
@@ -277,6 +308,12 @@ pub fn coerce_ref(n: i64, actual: i64, expected: i64) -> bool {
             return true;
         }
         if ek == TyKind::Ptr && pointee_fits(pointee, TYPES[expected].a) {
+            if TYPES[expected].b == 0 {
+                // (0.20: a reference that converts to a raw pointer, for
+                // `fix --only conventions`: an access is its value, so its
+                // address is `&x` then)
+                RAW_FROM_REF.push(n);
+            }
             return TYPES[expected].b == 0 || TYPES[expected].b == REF_SHARED;
         }
         if ek == TyKind::Slice && TYPES[pointee].kind == TyKind::Slice
@@ -286,6 +323,9 @@ pub fn coerce_ref(n: i64, actual: i64, expected: i64) -> bool {
                 // `&s`: s itself
                 let operand = NODES[n].b;
                 let flags = NODES[n].p;
+                // (0.20: the `&`, for `fix --only conventions`)
+                crate::front::conv::SLICE_AMPS.push(NODES[n].start);
+                crate::front::conv::SLICE_AMPS.push(NODES[operand].start);
                 NODES[n] = NODES[operand];
                 NODES[n].p |= flags & NODE_REF_MUT;
             } else {
@@ -305,6 +345,59 @@ pub fn coerce_ref(n: i64, actual: i64, expected: i64) -> bool {
     }
 }
 
+// (0.20, conventions.md §6.1) A Vec, a Buf or an array where a slice of its
+// elements is wanted: `sort(&v)` for `s: inout [T]` is `sort(&v[..])`,
+// `sum(v)` for `s: [T]` is `sum(v[..])`. n (of type actual) becomes the
+// slicing, checked again.
+fn elements_view(n: i64, actual: i64, expected: i64) -> bool {
+    unsafe {
+        let mutable = TYPES[expected].b == REF_MUT;
+        let mut place = n;
+        let mut container = actual;
+        if mutable {
+            if NODES[n].kind != NodeKind::Unary || NODES[n].op != Tok::Amp
+                || (NODES[n].p & NODE_REF_MUT) == 0 || TYPES[actual].kind != TyKind::Ptr {
+                return false;
+            }
+            place = NODES[n].b;
+            container = TYPES[actual].a;
+        } else if !crate::front::check::assign::is_place(n) {
+            return false;
+        }
+        let elem = crate::front::conv::container_elem(container);
+        if elem <= 0 || elem != TYPES[expected].a {
+            return false;
+        }
+        let range = new_node(NodeKind::Range, NODES[place].start, NODES[place].start);
+        let inner = new_node(NodeKind::None, NODES[place].start, NODES[place].end);
+        NODES[inner] = NODES[place];
+        NODES[inner].p |= NODE_CHECKED;
+        NODES[inner].ty = container;
+        let index = if mutable { new_node(NodeKind::Index, NODES[place].start, NODES[place].end) }
+            else { place };
+        NODES[index].kind = NodeKind::Index;
+        NODES[index].a = inner;
+        NODES[index].b = range;
+        NODES[index].c = 0;
+        NODES[index].count = 0;
+        NODES[index].list = 0;
+        NODES[index].p = 0;
+        NODES[index].ty = 0;
+        if mutable {
+            NODES[n].b = index;
+            NODES[n].ty = 0;
+            NODES[n].p &= ~NODE_CHECKED;
+        }
+        crate::front::check::synth_mode::synth_expr(n) == expected
+    }
+}
+
+// (0.20) The values coerce_ref converted from a reference to a raw `*T`
+// (tools/fixconv: the address of an access is written `&x`).
+pub static mut RAW_FROM_REF: crate::base::IntVec = crate::base::IntVec {
+    data: 0 as *i64, count: 0, cap: 0
+};
+
 // (0.20, docs/design/collections-text-io.md §2.3 L3) Value n of type
 // `actual` where `expected` goes (they differ): whether text converts.
 // std's `str` where `[u8]` goes is the same view (free); `&s` of a
@@ -319,10 +412,16 @@ fn coerce_text(n: i64, actual: i64, expected: i64) -> bool {
         if is_view_distinct(actual) && TYPES[actual].a == expected {
             return true;
         }
-        if TYPES[actual].kind != TyKind::Ptr || TYPES[actual].b == 0 {
+        // (0.20, conventions.md §6.1, as a Vec where its slice goes: in a
+        // 0.20 file the owner itself, `f(s)` for `x: str`, a let argument
+        // that lends s; `&` marks an inout one)
+        let owner_place = TYPES[actual].kind == TyKind::Struct
+            && crate::front::conv::strict_at(NODES[n].start)
+            && crate::front::check::assign::is_place(n);
+        if !owner_place && (TYPES[actual].kind != TyKind::Ptr || TYPES[actual].b == 0) {
             return false;
         }
-        let pointee = TYPES[actual].a;
+        let pointee = if owner_place { actual } else { TYPES[actual].a };
         if pointee <= 0 || TYPES[pointee].kind != TyKind::Struct
             || !within_std(STRUCTS[TYPES[pointee].a].module) {
             return false;
@@ -370,11 +469,16 @@ fn readonly_slice_arg(n: i64, actual: i64) {
         err_begin(NODES[n].start);
         err_fmt(f"'{text}', a '");
         err_type(actual);
-        err_str(c"', is read-only where '&mut [");
+        let legacy = crate::front::conv::LEGACY_ROOT;
+        err_str(if legacy { c"', is read-only where '&mut [" }
+            else { c"', is read-only where 'inout [" });
         err_type(TYPES[actual].a);
         err_str(c"]' is expected: the callee writes through it");
-        err_help(
-            c"pass an exclusive view: '&mut a[..]', 'v.as_mut_slice()', or a '&mut [T]' parameter");
+        err_help(if legacy {
+            c"pass an exclusive view: '&mut a[..]', 'v.as_mut_slice()', or a '&mut [T]' parameter"
+        } else {
+            c"pass it inout: '&a[..]', '&v', or an 'inout [T]' parameter passed on as '&s'"
+        });
         let new = buf_new();
         // `sort(v.as_slice())`, `sort(a[..])`: the method, `v.sort()`
         let s = NODES[n].start;
@@ -389,7 +493,7 @@ fn readonly_slice_arg(n: i64, actual: i64) {
             err_try_fmt(buf_slice(call));
             err_fix(s - 5, e + 1, buf_slice(call));
         } else if NODES[n].kind == NodeKind::Index && fresh_slice(n) {
-            buf_str(new, c"&mut ");
+            buf_str(new, if legacy { c"&mut " } else { c"&" });
             buf_bytes(new, text);
         } else if text.len > 11 && text[text.len - 11..text.len] == ".as_slice()" {
             buf_bytes(new, text[0..text.len - 10]);
@@ -428,7 +532,7 @@ fn readonly_slice_arg(n: i64, actual: i64) {
                     ERR_KIND = saved;
                     return;
                 }
-                buf_str(a, c" '&mut ");
+                buf_str(a, if legacy { c" '&mut " } else { c" 'inout " });
                 if written > 0 {
                     buf_bytes(a, SRC[NODES[written].start..NODES[written].end]);
                 } else {

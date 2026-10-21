@@ -3,7 +3,7 @@
 ## `&v`; to `&mut [T]` from a slice, `a[..]` into `&mut a[..]`; --default
 ## `&$v` of an argument `&v` is `&v`, not `&(&v)`; refactor field --type
 ## with --default rewrites each literal's value.
-$ refactor signature add --type v '&mut Vec<i64>'
+$ refactor signature add --type v '&mut Vec<i64>' --syntax=mixed
 changed parameter v to &mut Vec<i64> in crate::add	main.tach	+1 -1 lines
 % cat main.tach
 struct Lexer { src: Buf, pos: i64 }
@@ -40,11 +40,11 @@ fn main(gpa: Gpa) {
     let lx = lexer(Buf::new_in(gpa));
     println(f"{n} {m} {a[0]} {lx.pos}");
 }
-$ refactor signature total --type v '&Vec<i64>'
+$ refactor signature total --type v '&Vec<i64>' --syntax=mixed
 changed parameter v to &Vec<i64> in crate::total, 2 arguments in 2 calls	main.tach	+3 -3 lines
-$ refactor signature fill --type s '&mut [i64]'
+$ refactor signature fill --type s '&mut [i64]' --syntax=mixed
 changed parameter s to &mut [i64] in crate::fill, 1 argument in 1 call	main.tach	+2 -2 lines
-$ query diff
+$ query diff --syntax=mixed
 # changed parameter s to &mut [i64] in crate::fill, 1 argument in 1 call	main.tach	+2 -2 lines
 --- a/main.tach
 +++ b/main.tach
@@ -54,7 +54,7 @@ $ query diff
 @@ -31 +31 @@
 -    fill(a[..]);
 +    fill(&a[..]);
-$ refactor field Lexer --type src '[u8]' --default '$src.as_slice()' --dry-run
+$ refactor field Lexer --type src '[u8]' --default '$src.as_slice()' --dry-run --syntax=mixed
 --- a/main.tach
 +++ b/main.tach
 @@ -1 +1 @@
@@ -66,13 +66,13 @@ $ refactor field Lexer --type src '[u8]' --default '$src.as_slice()' --dry-run
 main.tach:4:5: error[own.escape] 'lexer' returns a view of 'text', which is dropped when 'lexer' returns | help: return the owner itself; a caller that wants a view takes '.as_slice()' of it  [edited: crate::lexer]
 warning edit.breaks: 1 new error (dry run)
 [exit 1]
-$ undo
+$ undo --syntax=mixed
 undid changed parameter s to &mut [i64] in crate::fill, 1 argument in 1 call	main.tach	+2 -2 lines
-$ undo
+$ undo --syntax=mixed
 undid changed parameter v to &Vec<i64> in crate::total, 2 arguments in 2 calls	main.tach	+3 -3 lines
-$ undo
+$ undo --syntax=mixed
 undid changed parameter v to &mut Vec<i64> in crate::add	main.tach	+1 -1 lines
-$ refactor signature add --type v '&mut Vec<i64>' --default '&mut $v' --dry-run
+$ refactor signature add --type v '&mut Vec<i64>' --default '&mut $v' --dry-run --syntax=mixed
 --- a/main.tach
 +++ b/main.tach
 @@ -13 +13 @@
@@ -81,6 +81,6 @@ $ refactor signature add --type v '&mut Vec<i64>' --default '&mut $v' --dry-run
 @@ -25 +25 @@
 -    add(&v, 1);
 +    add(&mut v, 1);
-$ check
-main.tach:18:5: error[own.readonly] writes through 's', a '[i64]', which is read-only | help: take the slice as '&mut [T]' ('v.as_mut_slice()', '&mut a[..]') to write its elements | try: tachyonc refactor signature fill --type s '&mut [i64]'
+$ check --syntax=mixed
+main.tach:18:5: error[own.readonly] writes through 's', a '[i64]', which is read-only | help: take the slice inout ('s: inout [T]', called with '&v' or '&a[..]') to write its elements | try: tachyonc refactor signature fill --type s 'inout [i64]'
 [exit 1]

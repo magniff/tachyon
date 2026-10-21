@@ -61,10 +61,11 @@ method std has as a function (`trim`, `sort`, `parse` as `parse_int`,
 write; another unknown method, the type's nearest methods and `tachyonc
 query items TYPE`, which lists them all.
 
-`fn count(s: &str)` takes a `str` (0.20: `&str` is `str`, as `&[T]` is
-`[T]`), and a literal, a `str` or `&s` of a String goes there. `&T` and
-`&mut T` are references (0.17): `&x` and `&mut x` take them, and reading
-through one is safe; `*T` is the raw pointer.
+`fn count(s: str)` takes a `str` (0.20: Rust's `&str` is `str`, as
+`&[T]` is `[T]`), and a literal, a `str` or a String goes there. A
+parameter is read-only by default (let: `s: str`, `v: Vec<i64>`,
+nothing to write); `x: inout T` may change the caller's value, called
+with `&x`; `x: sink T` takes it. `*T` is the raw pointer.
 
 ```tach
 struct P { x: i64 }
@@ -73,8 +74,29 @@ impl P { fn get(&self) -> i64 { self.x } }
 ```err
 error[parser error] expected identifier, got '&' | help: `self` for `&self`, `inout self` for `&mut self`, `sink self` for `self` (0.19: `self: &Self`, `self: &mut Self`, `self: Self`)
 ```
-`fn get(self) -> i64` (0.20's conventions; 0.19's `self: &P` still
-works, and `self: *P` is the raw pointer).
+`fn get(self) -> i64`; `fn bump(inout self)` to change it, `fn
+finish(sink self)` to take it (`self: *P` is the raw pointer).
+
+```tach
+fn main() -> i32 { let mut x = 1; x += 1; x as i32 }
+```
+```err
+error[conv.rust] 'let mut' is Rust's spelling; a mutable binding is 'var x'
+```
+`var x = 1;`. Each of Rust's spellings is `conv.rust` with the
+replacement in its `try:` (`fix --suggested` makes them all): `&T` and
+`&mut T` in a type (`x: T`, `x: inout T`), `&mut x` (`&x`), `*r` on an
+access (`r`), `move ||` (`sink ||`), `static mut` (`static var`), `mut
+x: T` (`x: sink T`).
+
+```tach
+fn main() -> i32 { var x = 1; let r = &mut x; 0 }
+```
+```err
+error[conv.rust] '&mut x' is Rust's spelling; an inout argument (the callee may change it) is marked '&x'
+```
+`&x` lends `x` inout, to an `inout` parameter or an `inout r = &x;`
+local; nothing else takes `&`.
 
 ```tach
 println!("{}", 1);
@@ -143,7 +165,7 @@ error[type error] cannot derive 'PartialEq' (derivable: Eq, Ord, Hash, Debug, Cl
 and Eq, Ord its PartialOrd and Ord; there is no Copy (every type copies).
 
 ```tach
-fn f<T>(x: T) -> T where T: Ord { x }
+fn f<T>(x: sink T) -> T where T: Ord { x }
 ```
 ```err
 error[parser error] expected '{', got 'where'
@@ -168,8 +190,9 @@ let x = 1;
 x = 2;
 ```
 ```err
-error[type error] cannot assign to immutable variable 'x' | help: make it mutable: `let mut x`
+error[type error] cannot assign to immutable variable 'x' | help: make it mutable: `var x`
 ```
+`var x = 1;`: a `let` binding does not change.
 
 ```tach
 let a: i64 = 1;
@@ -316,7 +339,7 @@ error[type error] cannot access field 'code' on type 'Ev' | help: a variant's fi
 ## Slices, Vec, std
 
 ```tach
-let mut m: HashMap<i64, i64> = HashMap::new_in(gpa);
+var m: HashMap<i64, i64> = HashMap::new_in(gpa);
 let a = m[0];
 ```
 ```err
@@ -339,20 +362,15 @@ an `iter` method returning one (`tachyonc guide iterators`).
 A misspelt method, field or item gets the nearest name of its kind:
 
 ```tach
-fn main(gpa: Gpa) -> i32 { let mut b = Buf::new_in(gpa); b.push_string("x"); 0 }
+fn main(gpa: Gpa) -> i32 { var b = Buf::new_in(gpa); b.push_string("x"); 0 }
 ```
 ```err
 error[type error] no method 'push_string' on type 'Buf' | help: did you mean 'push_str'?
 ```
 
-```tach
-fn sum(s: [i64]) -> i64 { s[0] }
-fn main() -> i32 { let a = [1, 2, 3]; sum(a) as i32 }
-```
-```err
-error[type error] expected '[i64]', got '[i64; 3]'
-```
-`sum(a[..])`. An array's length is `a.len()`.
+An array, a Vec or a Buf goes where a slice of its elements does:
+`sum(a)` for `fn sum(s: [i64])` (0.20; `sum(&v)` for `s: inout [T]`).
+An array's length is `a.len()`.
 
 ```tach
 let e: IoError = IoError::Read;
@@ -370,7 +388,7 @@ fn main(gpa: Gpa) -> i32 { let m: HashMap<K, i64> = HashMap::new_in(gpa); 0 }
 ```err
 error[type error] the trait 'Hash' is not implemented for 'K' | help: required by the bound 'K: Hash' of 'HashMap'
 ```
-`impl Hash for K { fn hash(self: &K) -> u64 { std::hash_u64(self.a as u64) } }`.
+`impl Hash for K { fn hash(self) -> u64 { std::hash_u64(self.a as u64) } }`.
 
 ## Closures and iterators (0.14)
 
@@ -397,19 +415,20 @@ A closure that captures is no plain `fn`: `fn run<F: Fn(i64) -> i64>(f:
 F) -> i64`. One that captures nothing converts.
 
 ```tach
-fn apply<F: Fn(&i64) -> i64>(f: F) -> i64 { let x = 1; f(&x) }
+fn apply<F: Fn(i64) -> i64>(f: F) -> i64 { let x = 1; f(x) }
 fn main() -> i32 { apply(|a: *i64| 1); 0 }
 ```
 ```err
-error[type error] closure parameter of type '*i64' where '&i64' is wanted
+error[type error] expected 'i64', got '*i64'
 ```
-A `*T` is a raw pointer (0.18.1), not a reference: annotate `&i64` as the
-bound does, or leave the parameter untyped (`fix --suggested` writes it).
+A `*T` is a raw pointer, not a way to pass: a closure parameter is let
+as any other, so annotate the type the bound gives (`|a: i64|`), or
+leave it untyped.
 
 ```tach
 fn apply<F: Fn(i64)>(f: F) { f(1); }
 fn main() -> i32 {
-    let mut total = 0;
+    var total = 0;
     apply(|x| { total += x; });
     total as i32
 }
@@ -418,23 +437,23 @@ fn main() -> i32 {
 FnMut
 ```
 `Fn` takes closures that assign no captured variable: bound `F:
-FnMut(i64)` (and call it from a `mut f: F`).
+FnMut(i64)` (and take it `f: sink F`, which may be called).
 
 ```tach
 fn apply<F: Fn(i64) -> i64>(f: F) -> i64 { f(1) }
 fn main() -> i32 {
     let f = {
-        let mut j = 1;
+        var j = 1;
         |x: i64| x + j
     };
     apply(f) as i32
 }
 ```
 ```err
-write `move`
+which does not live outside this block
 ```
-The closure borrows `j` (a `let mut`), which ends with the block: `move
-|x: i64| x + j` takes a copy, or declare `j` before the block.
+The closure captures the `var j` inout, and `j` ends with the block:
+`sink |x: i64| x + j` takes a copy, or declare `j` before the block.
 
 ## ?, conversions, arguments, formatting, derive (0.15)
 
@@ -461,7 +480,7 @@ AppError { fn from(e: ParseIntError) -> AppError { ... } }`.
 
 ```tach
 struct M { m: i64 }
-impl Into<M> for i64 { fn into(self: i64) -> M { M { m: self } } }
+impl Into<M> for i64 { fn into(self) -> M { M { m: self } } }
 ```
 ```err
 From
@@ -519,10 +538,10 @@ fn main() -> i32 { let p = P { x: 1 }; println(f"{p}"); 0 }
 ```err
 'P' does not implement Display
 ```
-Implement it (`impl Display for P { fn fmt(self: &P, f: &mut std::Fmt) {
+Implement it (`impl Display for P { fn fmt(self, f: inout std::Fmt) {
 f.write(f"P({self.x})"); } }`), or print with `{p:?}` and
 `#[derive(Debug)]`. Rust's `fn fmt(&self, f: &mut Formatter) ->
-fmt::Result` is `fn fmt(self: &P, f: &mut Fmt)`, with nothing to return.
+fmt::Result` is `fn fmt(self, f: inout Fmt)`, with nothing to return.
 
 ```tach
 fn main() -> i32 { let x = 1; println(f"{f"{x}"}"); 0 }
@@ -536,7 +555,7 @@ hole (the spec follows): parenthesize, `{(|x: i64| x + 1)(n)}`.
 ## Generics and traits
 
 ```tach
-fn biggest<T>(a: T, b: T) -> T { if a > b { a } else { b } }
+fn biggest<T>(a: sink T, b: sink T) -> T { if a > b { a } else { b } }
 struct P { x: i64 }
 fn main() -> i32 { let p = biggest(P { x: 1 }, P { x: 2 }); 0 }
 ```
@@ -547,22 +566,22 @@ A generic body is checked per use; the note names the instance.
 Implement `Ord` for `P`, or bound `T: Ord` to say what it needs.
 
 ```tach
-trait A { fn a(self: &Self) -> i64; fn b(self: &Self) -> i64; }
+trait A { fn a(self) -> i64; fn b(self) -> i64; }
 struct S { }
-impl A for S { fn a(self: &S) -> i64 { 1 } }
+impl A for S { fn a(self) -> i64 { 1 } }
 ```
 ```err
 error[type error] the impl of trait 'A' is missing 'b' | help: it has no default: write it in the impl
 ```
 
 ```tach
-trait A { fn a(self: &Self) -> i64; }
+trait A { fn a(self) -> i64; }
 fn f(x: &dyn A) -> i64 { 0 }
 ```
 ```err
 error[parser error] 'dyn' is a reserved keyword
 ```
-No trait objects: `fn f<T: A>(x: &T)`, or an enum of the cases.
+No trait objects: `fn f<T: A>(x: T)`, or an enum of the cases.
 
 ```tach
 struct K { n: i64 }
@@ -570,10 +589,10 @@ impl Ord for K { fn cmp(self: *K, o: *K) -> i64 { 0 } }
 fn main() -> i32 { 0 }
 ```
 ```err
-error[type error] 'cmp' takes 'self' as a raw pointer where trait 'Ord' declares '&K'
+error[type error] 'cmp' does not have the signature trait 'Ord' declares: expected 'fn(K, K) -> i64'
 ```
-An impl spells the trait's references (`self: &K, o: &K`); `tachyonc fix
---values` respells every such impl.
+An impl takes what the trait declares, as let parameters: `fn cmp(self,
+o: K) -> i64` (`*K` is a raw pointer).
 
 ## Modules and imports
 
@@ -611,7 +630,7 @@ is next to a submodule's file belongs in the root.
 fn main() -> i32 { let text = read_to_string(); 0 }
 ```
 ```err
-error[type error] undefined variable 'read_to_string' | help: std reads stdin: `read_stdin_in(gpa)` (all of it, a Buf), `read_line(&mut buf)` (one line, Ok(false) at the end), `Scanner` (tokens)
+error[type error] undefined variable 'read_to_string' | help: std reads stdin: `read_stdin_in(gpa)` (all of it, a Buf)
 ```
 std's items outside the prelude get their `use` line (`add `use
 std::is_digit;``) or the nearest std name; an unknown function with neither points to `tachyonc
@@ -666,7 +685,7 @@ the `try:`, `tachyonc fix --only alloc016 main.tach`, threads main's
 ```tach
 struct P { x: i64 }
 fn main() -> i32 {
-    let mut p = P { x: 1 };
+    var p = P { x: 1 };
     let q: *P = &p;
     q.x = 9;
     0
@@ -675,25 +694,25 @@ fn main() -> i32 {
 ```err
 error[unsafe] access to a field through a raw pointer is unsafe
 ```
-A local declared `*P` holds a raw pointer. Use `p.x = 9;`, keep a
-reference (`let q = &mut p;`, 0.17: `q.x = 9` is safe), or pass `&mut p`
-to a function taking `&mut P`.
+A local declared `*P` holds a raw pointer. Use `p.x = 9;`, an inout
+local (`inout q = &p; q.x = 9;`, safe), or pass `&p` to a function
+taking `p: inout P`.
 
 ```tach
 struct P { x: i64 }
 fn one() -> i64 { 1 }
-fn get(n: i64, p: &P) -> i64 { n + p.x }
+fn get(n: i64, p: inout P) -> i64 { n + p.x }
 fn main() -> i32 { get(one(), &P { x: one() }) as i32 }
 ```
 ```err
 error[type error] cannot take address of non-lvalue expression
 ```
-`&` takes the address of a place (a variable, a field, an element). Of
-a value, `&f(x)` or `&P { x: 1 }`, it takes a temporary (0.18.1), which
-lives to the end of the block, unless something evaluated before it in
-the statement (`one()` here, a call) could see the difference: then
-name it first, as the `try:` does: `let t = P { x: one() }; get(one(),
-&t)`.
+`&` lends a place (a variable, a field, an element) inout. A let
+parameter takes a value as it is (`get(one(), P { x: 1 })` for `p: P`);
+for an inout one, `&f(x)` or `&P { x: 1 }` makes a temporary (0.18.1),
+unless something evaluated before it in the statement (`one()` here, a
+call) could see the difference: then name it first: `var t = P { x:
+one() }; get(one(), &t)`.
 
 ```tach
 fn factorial(n: i64) -> i64 { if n < 2 { 1 } else { n * factorial(n - 1) } }
@@ -712,12 +731,10 @@ fn first(p: *i64) -> i64 { p[1] }
 ```err
 error[unsafe] indexing a raw pointer is unsafe
 ```
-A pointer is one value; for many, take a slice `[i64]`. A reference to
-a Vec, a Buf or a slice (`v: &Vec<i64>`) indexes what it points to,
-checked and safe; through a `*T` it needs `unsafe` (`let p = &v;`: index
-`v`).
-`out[0] = acc` meant to write through the pointer: the error's try: is
-`*out = acc`, safe through a borrow.
+A pointer is one value; for many, take a slice `[i64]`. A Vec, Buf or
+slice parameter (`v: Vec<i64>`, `v: inout Vec<i64>`) indexes its
+elements, checked and safe; through a `*T` it needs `unsafe`. To write
+one number for the caller, take `out: inout i64` and write `out = acc`.
 
 ```tach
 fn read(x: *i64) -> i64 { *x }
@@ -725,9 +742,9 @@ fn read(x: *i64) -> i64 { *x }
 ```err
 error[unsafe] dereference of a raw pointer is unsafe: `x` is a `*T` parameter
 ```
-A `*T` parameter is a raw pointer (0.18.1), as in Rust. Make it a
-borrow, `x: &i64` (`&mut i64` when written through; `tachyonc fix
---values` changes such parameters with their calls), or vouch for it in
+A `*T` parameter is a raw pointer (0.18.1), as in Rust. Take it let,
+`x: i64` (`x: inout i64` when written through, called with `&n`;
+`tachyonc fix --values` changes such parameters with their calls), or vouch for it in
 `unsafe { *x }` (`fix --only unsafe`). The same for a field access, a
 method call and an index through it.
 
@@ -750,58 +767,84 @@ error[unsafe] calling an `unsafe fn` is unsafe
 `unsafe fn`; for literals use `print("x")`, `panic("x")` (the prelude's,
 safe).
 
-## Moves, references and views (0.17)
+## Conventions, moves and views (0.17, 0.20)
+
+A parameter is let (read-only, the default), `inout` (it may change
+the caller's value: the call marks it `&x`) or `sink` (it takes the
+value). The call must say what the parameter says:
 
 ```tach
 struct P { x: i64 }
-fn bump(p: &mut P) { p.x += 1; }
-fn main() -> i32 { let mut q = P { x: 1 }; bump(q); q.x as i32 }
+fn bump(p: inout P) { p.x += 1; }
+fn main() -> i32 { var q = P { x: 1 }; bump(q); q.x as i32 }
 ```
 ```err
-error[type error] expected '&mut P', got 'P'
+error[conv.marker] 'q' is lent inout here (the callee may change it): mark it '&q'
 ```
-The parameter is `&mut P` (0.20: `p: inout P`): mark the argument,
-`bump(&q)` (0.20's inout marker; `&mut q` in 0.19's spelling).
+`bump(&q)`: `&` shows at the call what may change. When the callee only
+reads, the help's `tachyonc refactor signature bump --convention p let`
+makes it a let parameter, with every call.
 
 ```tach
-fn first(a: &i64) -> i64 { a[0] }
+fn total(v: Vec<i64>) -> i64 { v.len() }
+fn main(gpa: Gpa) -> i32 { let v: Vec<i64> = Vec::new_in(gpa); total(&v) as i32 }
 ```
 ```err
-error[unsafe] indexing a pointer is unsafe pointer arithmetic
+error[conv.marker_extra] '&' marks an argument the callee may change; 'v' is taken let or sink here (read, or moved): pass 'v'
 ```
-`a` is one value, not an array: `*a` (and `*out = acc` to write one).
-`p[i]` on a reference to a Vec, Buf or slice is its element, checked.
+`total(v)`: a let parameter borrows `v` for the call, unmarked, and `v`
+stays the caller's.
+
+```tach
+fn fill(v: Vec<i64>) { v.push(1); }
+```
+```err
+error[own.readonly] writes through 'v'
+```
+A let parameter is read-only: take it `v: inout Vec<i64>` and call
+`fill(&v)` (the `try:`, `tachyonc refactor signature fill --convention
+v inout`, changes both); a slice to sort in place is `s: inout [T]`,
+passed as `&v` or `&a[..]`.
+
+```tach
+fn keep(v: sink Vec<i64>) -> i64 { v.len() }
+fn main(gpa: Gpa) -> i32 { let v: Vec<i64> = Vec::new_in(gpa); keep(v); v.len() as i32 }
+```
+```err
+error[own.moved] 'v' is used here after it moved into 'keep(sink v)'
+```
+A `sink` parameter takes the value; the caller's `v` is dead after the
+call. When `keep` only reads, make it let (`v: Vec<i64>`: nothing
+moves; `refactor signature keep --convention v let`); else pass
+`keep(v.clone())` or use `v` before. An owned value also moves with
+`let w = v;`, `return v` and into a struct literal.
 
 The own pass's errors (`own.*`) are one line each, with both positions,
 a `help:` with the fix and `try:` lines; `tachyonc explain own.CODE` has
 each in full, `tachyonc query own FILE:LINE:COL` the state of every
-local there. The common ones:
+local there.
 
-```text
-error[own.moved] 'v' is used here after it moved into 'total(v)' at 5:19
+```tach
+struct T { keys: Vec<i64> }
+impl T { fn rehash(inout self) { var old = self.keys; old.push(1); } }
 ```
-`total(v: Vec<i64>)` takes `v` (an owned value moves). When it only
-reads: `v: &Vec<i64>` and `total(&v)`; when it changes it: `&mut
-Vec<i64>` and `total(&mut v)` (a push through a by-value Vec was lost
-before 0.17); else `total(v.clone())`. The try: `tachyonc refactor
-signature total --type v '&Vec<i64>' --default '&$v'` changes both.
-
-```text
-error[own.move_out] cannot move 'self.keys' (Vec<Entry>) out of '*self': 'rehash' borrows 'self'
+```err
+error[own.move_out] cannot move 'self.keys' (Vec<i64>) out of a reference
 ```
-`let old = self.keys.take();` (leaves an empty Vec on the same
-allocator; `std::take(&mut x)` for a `Default` value), or loop
-over `self.keys` by reference.
+`var old = self.keys.take();` leaves an empty Vec on the same allocator
+(`std::take(&x)` for a `Default` value, `std::replace(&x, v)`); `let
+old = self.keys;` reads it where it is (a `let` of a part borrows it).
 
 ```text
 error[own.conflict] 'v.push(4)' may move v's elements while 'first' (4:17) views them; 'first' is used at 6:16
 error[own.conflict] 'v.push' may move v's elements while the 'for' at 7:1 iterates over them
-error[own.conflict] 'a' is borrowed mutably by argument 1 and read by argument 2
+error[own.conflict] 'a' is borrowed mutably by '&a' and mutably again by '&a' in the same call
 ```
-A view (a slice, `&x`, a `for` over `v`) is still used after `v`
-changes. Use it before the change, or take it again after; keep an
-index (`for i in 0..v.len() { let x = v[i]; ... }`); copy a plain value
-out first (`let x = v[0];`); `v.swap(i, j)` for two elements; `let n =
+A view (a slice, a let or inout access, a `for` over `v`) is still used
+after `v` changes, or one value is lent inout twice at once. Use the
+view before the change, or take it again after; keep an index (`for i
+in 0..v.len() { let x = v[i]; ... }`); copy a plain value out first
+(`let x = v[0];`); `v.swap(i, j)` for two elements; `let n =
 rng.next();` before `rng.big(n)`. `guide views` has the rules.
 
 ```text
@@ -811,31 +854,14 @@ Return the `Buf` (`-> Buf`, `b`), not `b.as_slice()`; the caller takes
 the view.
 
 ```text
-error[own.readonly] cannot write 'p.x': 'p' is '&P', a shared reference
-```
-`p: &mut P`, and `&mut x` at the calls (`tachyonc refactor signature F
---type p '&mut P'` changes both); a slice: `s: &mut [T]`, passed as
-`v.as_mut_slice()` or `&mut a[..]`. Old code: `tachyonc fix --values`.
-
-```text
-error[type error] expected '&Item', got 'Item'
-error[type error] expected 'Item', got '&Item' | help: it is a reference: read through it with '*' | try: *it
-```
-(0.18.1) A place passed where `&T` is expected is borrowed, as a
-receiver is (`f(it)` for `f(x: &Item)`); a reference to a number or a
-bool is read through where the value is wanted (`n + 1`, `3 < n`,
-`keys[n]`, `f(n)`). What is left: a value that is no place where `&T`
-is expected (`&f(x)` names it), and a reference to a struct where the
-struct is wanted (`*it`, or `.clone()` for an owned one).
-
-```text
-error[own.readonly] changes 'v' (Vec<i64>), a copy the match on '*e' (3:11) binds: the change would not reach it, and could free memory it points to
+error[own.readonly] changes 'v' (Vec<i64>), a copy the match on 'e' (2:26) binds: the change would not reach it, and could free memory it points to
 error[own.readonly] changes 'w' (Vec<i64>), a copy of an element 'vv.get(0)' reads: ...
 ```
-(0.18.1) `match *e`, `v.get(i)` and a `for` loop's element give a copy
+(0.18.1) `match e`, `v.get(i)` and a `for` loop's element give a copy
 of an owned value that stays where it is: read it, do not change it.
-Match the reference instead (`match e` with `e: &mut E` binds `v: &mut
-Vec<i64>`), or change the element in place (`vv[0].push(1)`).
+Match through an inout access instead (`match &e` binds `v` inout, for
+`e: inout E` or a `var e`), or change the element in place
+(`vv[0].push(1)`).
 
 ## At run time
 

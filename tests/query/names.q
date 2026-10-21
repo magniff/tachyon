@@ -10,19 +10,19 @@ pub fn helper() -> i64 {
 }
 // crate::geom::V2::len	clash/geom.tach:14-17	effects: none
     /// Its squared length.
-    pub fn len(self: &V2) -> i64 {
+    pub fn len(self) -> i64 {
         self.x * self.x + self.y * self.y
     }
 $ show clash/geom.tach:16 --root clash/main.tach
 // crate::geom::V2::len	clash/geom.tach:14-17	effects: none
     /// Its squared length.
-    pub fn len(self: &V2) -> i64 {
+    pub fn len(self) -> i64 {
         self.x * self.x + self.y * self.y
     }
 $ show geom.tach:16:9 clash/main.tach:33 --root clash/main.tach
 // crate::geom::V2::len	clash/geom.tach:14-17	effects: none
     /// Its squared length.
-    pub fn len(self: &V2) -> i64 {
+    pub fn len(self) -> i64 {
         self.x * self.x + self.y * self.y
     }
 // crate::main	clash/main.tach:30-52	effects: alloc(Gpa) io panic unsafe
@@ -33,9 +33,9 @@ fn main(gpa: Gpa) -> i32 {
     let s = sys::SockaddrIn { port: p.x };
     let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
     let sq = Square { side: 2 };
-    let mut std_vec: Vec<i64> = Vec::new_in(gpa);
+    var std_vec: Vec<i64> = Vec::new_in(gpa);
     std_vec.push(s.port);
-    let mut mine = MyVec { n: 0 };
+    var mine = MyVec { n: 0 };
     mine.push(v.len());
     mine.add(1);
     let shape = Shape::Circle(2);
@@ -43,7 +43,7 @@ fn main(gpa: Gpa) -> i32 {
         Shape::Circle(k) => k,
         Shape::Dot => 0,
     };
-    let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
+    let total = twice_generic(sq) + twice_generic(v) + sq.twice() + mine.len() + printf(r);
     unsafe {
         c::printf(c"%d\n", total as i32);
     }

@@ -30,7 +30,7 @@ through one function, which hashes whole 64-byte blocks and picks the
 instructions once a call:
 
 ```tach
-pub fn blocks(state: &mut [u32], data: [u8]) {
+pub fn blocks(state: inout [u32], data: [u8]) {
     if detect("sha2") {
         blocks_arm(state, data);
     } else if detect("sha") && detect("sse4.1") {
@@ -68,7 +68,7 @@ knows it only inside `if detect("sha2")`: remove the test and the
 program does not compile. `detect` reads one bit filled before `main`
 from the OS (macOS's sysctls, Linux's hwcaps). The loads take a slice
 and an index and are checked like `s[i]`; a store into the state needs
-`&mut [u32]`. Where sha2 is in the build's baseline (every Apple CPU:
+it writable, an `inout [u32]`. Where sha2 is in the build's baseline (every Apple CPU:
 `-C target-cpu=apple-m1`, the default on macOS), `detect("sha2")` is the
 constant `true` and the fallback is not generated; on Linux (`generic`:
 Armv8.0) it is a real test.

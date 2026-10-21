@@ -114,10 +114,10 @@ means: a default with `unwrap_or`, or an error with `ok_or`:
 ```tach
 Ok(Config {
     name: fields.get("name").map(|f| f.value).unwrap_or("unnamed"),
-    port: number(&fields, "port", 1, 65535)?.ok_or(ConfigError::Missing("port"))?,
-    workers: number(&fields, "workers", 1, 64)?.unwrap_or(1),
-    debug: flag(&fields, "debug")?.unwrap_or(false),
-    timeout_ms: number(&fields, "timeout_ms", 0, 60000)?.unwrap_or(1000),
+    port: number(fields, "port", 1, 65535)?.ok_or(ConfigError::Missing(Buf::from_in("port", gpa)))?,
+    workers: number(fields, "workers", 1, 64)?.unwrap_or(1),
+    debug: flag(fields, "debug")?.unwrap_or(false),
+    timeout_ms: number(fields, "timeout_ms", 0, 60000)?.unwrap_or(1000),
 })
 ```
 

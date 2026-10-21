@@ -78,9 +78,9 @@ $ refactor signature Box::grow --rename-param times n --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -17,2 +17,2 @@
--    fn grow(self: &mut Box, by: i64, times: i64 = 1) {
+-    fn grow(inout self, by: i64, times: i64 = 1) {
 -        self.w += by * times;
-+    fn grow(self: &mut Box, by: i64, n: i64 = 1) {
++    fn grow(inout self, by: i64, n: i64 = 1) {
 +        self.w += by * n;
 @@ -30 +30 @@
 -    x.grow(2, times: 3);

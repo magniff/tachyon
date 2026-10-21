@@ -11,7 +11,8 @@
 | `[T; N]` | an array, a value; `N` a constant expression |
 | `[T]` | a slice: `.len()` (an `i64`); `.ptr` (a `*T`) for C |
 | `*T` | a pointer (`*u8` is also C's `void *` and `char *`) |
-| `fn(A, B) -> R` | a plain function value |
+| `fn(A, inout B) -> R` | a plain function value; a parameter's convention is part of its type |
+| `let T`, `inout T` | an access, in a field (`q: inout Query`) or a function type (`guide memory`) |
 | `extern "C" fn(A) -> R` | a C function pointer, another type |
 | `S`, `E`, `S<T>` | structs, enums, unions, their instances |
 | `type X = distinct T` | a type of its own with T's representation (0.18) |
@@ -56,7 +57,7 @@ Floats are IEEE 754 without fast-math; `1.0 / 0.0` is infinity, and
 ## Arrays and slices
 
 ```tach
-let mut grid = [[0; 3]; 2];       // [[i64; 3]; 2]
+var grid = [[0; 3]; 2];           // [[i64; 3]; 2]
 grid[1][2] = 5;
 let copy = grid;                  // arrays are values: copied whole
 grid[0][0] = 1;
@@ -76,31 +77,31 @@ has its length too: `a.len()` (0.17), or slice it: `a[..].len()`. A function tak
 `a[..]`, not `a`. A slice of a raw pointer, `p[0..n]`, is unchecked and
 unsafe.
 
-## References and pointers
+## Accesses and pointers
 
-`&place` makes a shared reference `&T`, `&mut place` an exclusive one
-`&mut T` (0.17): both are checked (`tachyonc guide memory`), safe to read
-and write through, kept in locals and fields. `*r` is the value, `r.f`
-reaches a field (and `r.m()` calls a method) through it. A raw pointer
-`*T` (from C, from a reference where a `*T` is expected, `0 as *T` for
-null) is dereferenced only in `unsafe`. There is no pointer arithmetic:
-index a raw pointer (`p[i]`, `&p[i]`) in unsafe code, or cast through
-`i64`. On a reference to a Vec, a Buf or a slice, `p[i]` indexes the one
-it points to, checked: safe through a reference, `unsafe` through a raw
-pointer. A `*T` parameter is raw like any `*T` (0.18.1); `tachyonc fix --values`
-makes it a reference.
+An *access* is how a function reaches a value it does not own: a let
+parameter (read-only), an `x: inout T` parameter (exclusive, writes
+reach the caller, passed as `&place`), an `inout r = &place;` local, an
+access field (`q: inout Query`). All are checked (`tachyonc guide
+memory`), safe, and used as the value itself: `r.n += 5`, `r = v`, `n +
+1`, with no `*`. A raw pointer `*T` (from C, `&place` where a `*T` is
+expected, `0 as *T` for null) is dereferenced only in `unsafe`. There is
+no pointer arithmetic: index a raw pointer (`p[i]`, `&p[i]`) in unsafe
+code, or cast through `i64`. Through an access to a Vec, a Buf or a
+slice, `p[i]` is that element, checked; through a raw pointer it is
+`unsafe`.
 
 ```tach
 struct Counter { n: i64 }
 
-fn bump(c: &mut Counter) { c.n += 1; }   // a reference: safe
+fn bump(c: inout Counter) { c.n += 1; }  // an access: safe
 
 fn main() -> i32 {
-    let mut c = Counter { n: 0 };
-    bump(&mut c);
-    let r = &mut c;                      // a reference in a local: safe
+    var c = Counter { n: 0 };
+    bump(&c);
+    inout r = &c;                        // an inout local: safe
     r.n += 5;
-    let p: *Counter = &mut c;            // a raw pointer: unsafe
+    let p = &c as *Counter;              // a raw pointer: unsafe
     unsafe { p.n += 5; }
     std::print_int(c.n);
     println("");
@@ -125,14 +126,14 @@ and T's literal patterns, but none of T's methods (`distinct.method`):
 `impl NodeId { .. }` adds its own. `type Id<T> = distinct i64;` makes
 `Id<Node>` and `Id<Edge>` two types. T is plain: numbers, bool, raw
 pointers, and structs, tuples and arrays of them; not owned (a Vec, a
-type with a Drop impl) nor a view (a slice, a `&T`) (`distinct.kind`).
+type with a Drop impl) nor a view (a slice, an access field) (`distinct.kind`).
 
 ```tach
 type NodeId = distinct i64;
 type Meters = distinct f64;
 
 impl NodeId {
-    fn next(self: NodeId) -> NodeId { self + 1 }
+    fn next(self) -> NodeId { self + 1 }
 }
 
 fn main() {
@@ -169,8 +170,8 @@ struct Node { value: i64, next: Option<NonNull<Node>> }
 fn main() {
     let b = Node { value: 2, next: None };
     let a = Node { value: 1, next: NonNull::new(&b) };
-    let mut total = 0;
-    let mut cur = NonNull::new(&a);
+    var total = 0;
+    var cur = NonNull::new(&a);
     while let Some(p) = cur {
         unsafe {
             total += (*p.as_ptr()).value;

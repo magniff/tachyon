@@ -3,7 +3,7 @@
 ## where the program was.
 $ test --timeout 1
 test main.tach: 1 passed, 2 failed (3 cases; -O0 and -O2 agree)
-FAIL crash: exit 101 (expected 0): stats.tach:44:17: index out of bounds: index 0, length 0
+FAIL crash: exit 101 (expected 0): stats.tach:44:13: index out of bounds: index 0, length 0
   trace: stats.tach:44 stats::best < main.tach:25 main
 FAIL hang: no exit after 1 s (--timeout S): stopped by signal 14 (SIGALRM: a time limit)
   trace: stats.tach:56 stats::bar < main.tach:28 main
@@ -16,7 +16,7 @@ ok: built prog
 % ./prog < tests/crash.in; echo "exit $?"
 a best 7
 exit 101
-stats.tach:44:17: index out of bounds: index 0, length 0
+stats.tach:44:13: index out of bounds: index 0, length 0
 trace, innermost call first:
   stats.tach:44  stats::best
   main.tach:25  main
@@ -25,7 +25,7 @@ ok: built plain
 % ./plain < tests/crash.in; echo "exit $?"
 a best 7
 exit 101
-stats.tach:44:17: index out of bounds: index 0, length 0
+stats.tach:44:13: index out of bounds: index 0, length 0
 ## probe: values at a line, the source unchanged. Before the statement
 ## that begins the line; after a `let` (its names visible); in a loop's
 ## body each time round; at the start of a block that the line opens.
@@ -39,12 +39,12 @@ run: exit 0; stdout 4 lines (.tachyonc/probe/out)
   | a best 7
   | ###
 $ probe stats.tach:44 v --input tests/crash.in
-probe stats.tach:44 (after `let mut m = v[0];`): 1 time
+probe stats.tach:44 (after `var m = v[0];`): 1 time
   #1  v = [3, 7]
 run: exit 101; stdout 1 line (.tachyonc/probe/out)
   | a best 7
 stderr:
-  stats.tach:44:17: index out of bounds: index 0, length 0
+  stats.tach:44:13: index out of bounds: index 0, length 0
   trace, innermost call first:
     stats.tach:44  stats::best
     main.tach:25  main

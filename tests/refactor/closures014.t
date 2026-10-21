@@ -39,7 +39,7 @@ extracted lines 20-21 of crate::main into step(k, total) -> i64
 % sed -n '17,35p' main.tach
 fn main() -> i32 {
     let k = 3;
-    let mut total = 0;
+    var total = 0;
     total = step(k, total);
     total += apply(|y| {
         let z = y + k;
@@ -108,7 +108,7 @@ inlined crate::twice at 2 calls, deleted it
 % sed -n '13,21p' main.tach
 fn main() -> i32 {
     let k = 3;
-    let mut total = 0;
+    var total = 0;
     let add = |x: i64| x * 2 + k;
     total += apply(add, 1);
     total += apply(|y| {

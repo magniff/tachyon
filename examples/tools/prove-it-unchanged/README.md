@@ -49,7 +49,7 @@ longest run 20
 $ tachyonc refactor rename adler32::a low --show
 renamed local a to low in crate::adler::adler32, 4 uses	adler.tach	+4 -4 lines
 // adler.tach:4
-4	    let mut low: u64 = 1;
+4	    var low: u64 = 1;
 // adler.tach:7-8
 7	        low = (low + x as u64) % 65521;
 8	        b = (b + low) % 65521;
@@ -121,7 +121,7 @@ formatted	rle.tach	+4 -4 lines
 $ tachyonc query show run_at
 // crate::rle::run_at	rle.tach:4-9	effects: panic diverge
 fn run_at(s: [u8], i: i64) -> i64 {
-    let mut n = 1;
+    var n = 1;
     // a run ends at the end of s, at another byte, or at 255 (one count byte)
     while i + n < s.len && s[i + n] == s[i] && n < 255 { n += 1; }
     n

@@ -8,9 +8,9 @@ counts are sorted by a hand-written `Ord`.
 std declares the methods of these three traits `#[pure]`:
 
 ```tach
-pub trait Eq { #[pure] fn eq(self: &Self, other: &Self) -> bool; }
-pub trait Ord { #[pure] fn cmp(self: &Self, other: &Self) -> i64; }
-pub trait Hash { #[pure] fn hash(self: &Self) -> u64; }
+pub trait Eq { #[pure] fn eq(self, other: Self) -> bool; }
+pub trait Ord { #[pure] fn cmp(self, other: Self) -> i64; }
+pub trait Hash { #[pure] fn hash(self) -> u64; }
 ```
 
 A declaration on a trait's method binds every impl of it, the program's
@@ -68,11 +68,11 @@ stdin):
 $ tachyonc edit apply <<'EOF'
 > @@ new before Word
 > // How many times hash was called.
-> static mut HASHES: i64 = 0;
+> static var HASHES: i64 = 0;
 > @@ Word::hash
->     fn hash(self: &Word) -> u64 {
+>     fn hash(self) -> u64 {
 >         unsafe { HASHES += 1; }
->         let mut h = 0xcbf29ce484222325u64;
+>         var h = 0xcbf29ce484222325u64;
 >         for b in self.text {
 >             h = (h ^ lower(b) as u64) * 0x100000001b3u64;
 >         }

@@ -98,7 +98,7 @@ A path starting with `./` is relative to the importing file. The header's
 `c::Ring` with the same fields, so tachyon can read them directly:
 
 ```tach
-fn len(self: &Window) -> i64 {
+fn len(self) -> i64 {
     unsafe { (*self.ring).len as i64 }
 }
 ```
@@ -132,7 +132,7 @@ if (r->len == r->cap) {
 On the tachyon side:
 
 ```tach
-extern "C" static mut EVICTIONS: i64 = 0;
+extern "C" static var EVICTIONS: i64 = 0;
 
 extern "C" fn on_evict(value: i64) {
     println(f"    (dropped {value})");
@@ -171,8 +171,8 @@ extern "C" fn accumulate(value: i64, ctx: *u8) -> i32 {
     0 // keep going
 }
 
-fn stats(self: &mut Window) -> Stats {
-    let mut s = Stats { count: 0, sum: 0, min: i64::MAX, max: i64::MIN };
+fn stats(inout self) -> Stats {
+    var s = Stats { count: 0, sum: 0, min: i64::MAX, max: i64::MIN };
     unsafe { c::ring_each(self.ring, accumulate, &s as *u8); }
     s
 }
@@ -189,9 +189,9 @@ struct Window { ring: *c::Ring }
 
 impl Window {
     fn new(cap: i64) -> Option<Window> { ... }
-    fn push(self: &mut Window, value: i64) { unsafe { c::ring_push(self.ring, value); } }
-    fn get(self: &mut Window, i: i64) -> i64 { ... }   // checks i first
-    fn free(self: &mut Window) { ... }
+    fn push(inout self, value: i64) { unsafe { c::ring_push(self.ring, value); } }
+    fn get(inout self, i: i64) -> i64 { ... }   // checks i first
+    fn free(inout self) { ... }
 }
 ```
 
@@ -234,7 +234,7 @@ in C), printed in hex with `{x:08x}`.
 
 ## Language features
 
-- `import "./ring.h" as c`, `extern "C" fn`, `extern "C" static mut`,
+- `import "./ring.h" as c`, `extern "C" fn`, `extern "C" static var`,
   `--emit-header`, linking: `tachyonc guide c-interop`
 - `unsafe` blocks kept inside methods, raw pointers, casts of `*u8`:
   `tachyonc guide unsafe`

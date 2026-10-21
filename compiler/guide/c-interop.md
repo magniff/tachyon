@@ -84,7 +84,11 @@ Also `#[repr(C, align(N))]` and `#[repr(C, packed(N))]`. A `#[repr(C)]`
 enum with fields is C's struct of a tag and a union. Types in `extern
 "C"` signatures must be FFI-safe: numbers, `bool`, pointers, `extern
 "C" fn` pointers, `#[repr(C)]` types. Slices, tuples, plain structs and
-plain `fn` pointers are rejected with a hint.
+plain `fn` pointers are rejected with a hint. C has only values and
+pointers: its parameters are by value (let, the default), and `inout`
+or `sink` there is `conv.extern`. A C function that writes through a
+pointer takes `p: *T`, and the call passes `&x`, which converts (an
+exclusive loan of `x` for the call).
 
 ## C calling tachyon
 
@@ -102,7 +106,7 @@ extern "C" fn by_value(a: *u8, b: *u8) -> i32 {
 }
 
 fn main() -> i32 {
-    let mut a: [i32; 5] = [4, 2, 5, 1, 3];
+    var a: [i32; 5] = [4, 2, 5, 1, 3];
     unsafe { c::qsort(&a as *u8, 5, 4, by_value); }
     for x in a { std::print_int(x as i64); }
     println("");
@@ -113,7 +117,7 @@ fn main() -> i32 {
 12345
 ```
 
-`extern "C" static mut COUNT: i64 = 0;` defines a static C can use.
+`extern "C" static var COUNT: i64 = 0;` defines a static C can use.
 `tachyonc --emit-header prog.tach -o prog.h` writes the C header of a
 program's `extern "C"` functions and statics, with the `#[repr(C)]`
 types they use.
@@ -143,7 +147,7 @@ buffers):
 import "stdio.h" as c;
 
 fn main(gpa: Gpa) -> i32 {
-    let mut line = Buf::new_in(gpa);              // dropped (freed) at the end
+    var line = Buf::new_in(gpa);                  // dropped (freed) at the end
     loop {
         let ch = unsafe { c::getchar() };
         if ch < 0 || ch == '\n' as i32 { break; }

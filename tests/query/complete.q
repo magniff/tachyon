@@ -6,15 +6,15 @@ $ items crate shapes --comments
 # crate	complete/main.tach
 6	mod	mod shapes
 10-28	section	State
-12	static	static mut COUNT: i64 = 0
+12	static	static var COUNT: i64 = 0
 15	struct	pub struct Counter
 19	impl	impl Counter
 20	method	pub fn new() -> Self
-24	method	pub fn bump(self: &mut Counter) -> i64
+24	method	pub fn bump(inout self) -> i64
 30-56	section	Shapes
 32-32	comment	(the shapes come from shapes.tach)
 34	fn	fn make(k: i64) -> Shape
-42	fn	fn twice_area<T>(x: T, s: Shape) -> i64
+42	fn	fn twice_area<T>(x: sink T, s: Shape) -> i64
 47	fn	fn main() -> i32
 # crate::shapes	complete/shapes.tach
 3	enum	pub enum Shape
@@ -24,7 +24,7 @@ $ show main::section State
 // crate::section State	complete/main.tach:10-28
 // ---- State ----
 
-static mut COUNT: i64 = 0;
+static var COUNT: i64 = 0;
 
 // A counter: how many shapes were made.
 pub struct Counter {
@@ -36,7 +36,7 @@ impl Counter {
         Self { n: 0 }
     }
 
-    pub fn bump(self: &mut Counter) -> i64 {
+    pub fn bump(inout self) -> i64 {
         self.n += 1;
         self.n
     }
@@ -65,13 +65,13 @@ fn make(k: i64) -> Shape {
 }
 
 // Never instantiated: its references are found all the same.
-fn twice_area<T>(x: T, s: Shape) -> i64 {
+fn twice_area<T>(x: sink T, s: Shape) -> i64 {
     let c = Counter::new();
     area(s) + area(s) + unsafe { COUNT }
 }
 
 fn main() -> i32 {
-    let mut c = Counter::new();
+    var c = Counter::new();
     let s = make(0);
     let label = "area of the shape";
     let r = match s {
@@ -92,7 +92,7 @@ $ grep area
 # complete/main.tach
 8:21	code	crate	use shapes::{Shape, area_of as area};
 8:32	code	crate	use shapes::{Shape, area_of as area};
-42:10	code	twice_area	fn twice_area<T>(x: T, s: Shape) -> i64 {
+42:10	code	twice_area	fn twice_area<T>(x: sink T, s: Shape) -> i64 {
 44:5	code	twice_area	area(s) + area(s) + unsafe { COUNT }
 44:15	code	twice_area	area(s) + area(s) + unsafe { COUNT }
 50:18	string	main	let label = "area of the shape";
@@ -126,17 +126,17 @@ error query.no-match: complete/main.tach has no line 999
 [exit 1]
 $ refs Counter COUNT
 # complete/main.tach
-12:12	def	->COUNT	static mut COUNT: i64 = 0;
+12:12	def	->COUNT	static var COUNT: i64 = 0;
 15:12	def	->Counter	pub struct Counter {
 19:6	type	crate	->Counter	impl Counter {
 20:21	type	Counter::new	->Counter	pub fn new() -> Self {
 21:9	init	Counter::new	->Counter	Self { n: 0 }
-24:28	type	Counter::bump	->Counter	pub fn bump(self: &mut Counter) -> i64 {
+24:23	type	Counter::bump	->Counter	pub fn bump(inout self) -> i64 {
 36:9	write	make	->COUNT	COUNT = COUNT + 1;
 36:17	read	make	->COUNT	COUNT = COUNT + 1;
 43:13	type	twice_area	->Counter	let c = Counter::new();
 44:34	read	twice_area	->COUNT	area(s) + area(s) + unsafe { COUNT }
-48:17	type	main	->Counter	let mut c = Counter::new();
+48:13	type	main	->Counter	var c = Counter::new();
 $ refs Counter.n Shape::Square
 # complete/main.tach
 16:5	def	->Counter.n	n: i64,

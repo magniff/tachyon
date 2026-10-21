@@ -5,13 +5,13 @@
 % TACHYON_PLANT_MISCOMPILE=1 "$COMPILER" reduce main.tach --differs
 reduced main.tach: 428 lines to 12 in 307 runs; written to main.min.tach
 fn f17(x: i64) -> i64 {
-    let mut t = x;
+    var t = x;
     t = t + 12345;
     t
 }
 
 fn main() -> i32 {
-    let mut total = 0;
+    var total = 0;
     total += f17(total % 1000);
     println(f"{total}");
     0

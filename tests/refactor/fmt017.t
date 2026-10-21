@@ -1,7 +1,7 @@
 ## tachyonc fmt on the references of 0.17 (tests/refactor/fmt017/): `&T`,
 ## `&mut T`, `&mut [T]`, `&x`, `&mut x`, and `&&` as a prefix (a reference
 ## to a reference) tight to its operand, a binary `&&` spaced.
-$ fmt
+$ fmt --syntax=mixed
 formatted	main.tach	+7 -7 lines
 % cat main.tach
 struct P { x: i64 }
@@ -22,5 +22,5 @@ fn main() {
     let q = Q { r: &mut p, s: "x" };
     println(f"{b[0]} {ok} {q.r.x}");
 }
-$ check
+$ check --syntax=mixed
 ok: 0 errors in main.tach

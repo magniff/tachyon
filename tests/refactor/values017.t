@@ -12,8 +12,8 @@
 ## recorded here before 0.18.1: `3 3 0 6 0 0 1 9 12`. A closure's `*T` annotation is respelled
 ## by `fix --suggested`; what the fix keeps raw is wrapped in `unsafe` by
 ## `fix --only unsafe`, the second try: of the error.)
-$ fix --values
-fixed 2 suggested fixes, 5 parameters to &mut T, 3 parameters to &T, 1 slice parameter to &mut [T], 3 owned parameters to &T (only read), 8 arguments	main.tach	+22 -22 lines
+$ fix --values --syntax=mixed
+fixed 6 suggested fixes, 5 parameters to &mut T, 5 parameters to &T, 1 slice parameter to &mut [T], 3 owned parameters to &T (only read), 10 arguments	main.tach	+23 -23 lines
 % cat main.tach
 struct Stats { count: i64, sum: i64 }
 struct Inv { items: Vec<i64>, name: Buf }
@@ -85,25 +85,27 @@ fn set_via(pp: **i64, v: i64) {
     unsafe { **pp = v; }
 }
 
-fn by_rank(a: *Stats, b: *Stats) -> i64 { a.sum - b.sum }
+fn by_rank(a: &Stats, b: &Stats) -> i64 { a.sum - b.sum }
 
 fn ranked(v: &mut Vec<Stats>) {
-    sort_by(v.as_slice(), |a: &Stats, b: *Stats| a.count - b.count);
-    let f = unsafe { by_rank };
-    sort_by(v.as_mut_slice(), f);
+    sort_by(v.as_mut_slice(), |a: &Stats, b: &Stats| a.count - b.count);
+    // (0.20: std's bound takes a copyable Stats itself, which a function
+    // value with `*Stats` parameters cannot be: called from a closure)
+    sort_by(v.as_mut_slice(), |a: &Stats, b: &Stats| by_rank(&*a, &*b));
 }
-$ fix --suggested
-fixed 2 suggested fixes	main.tach	+1 -1 lines
-main.tach:71:43: error[unsafe] access to a field through a raw pointer is unsafe: `a` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `a` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: tachyonc fix --values main.tach | try: tachyonc fix --only unsafe main.tach
-main.tach:71:51: error[unsafe] access to a field through a raw pointer is unsafe: `b` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `b` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: tachyonc fix --values main.tach | try: tachyonc fix --only unsafe main.tach
-note fix.left: 2 errors left (above)
-$ fix --only unsafe
-fixed 1 unsafe block	main.tach	+1 -1 lines
+$ fix --suggested --syntax=mixed
+note fix.none: nothing to fix
+$ fix --only unsafe --syntax=mixed
+note fix.none: nothing to fix
+$ fix --values --syntax=mixed
+note fix.none: nothing to fix
+$ fix --only values --dry-run --syntax=mixed
+note fix.none: nothing to fix
+## (0.20) Then 0.20's spelling, `fix --only conventions` (its 0.19 input
+## read --syntax=mixed): the chain 0.16 -> 0.19 -> 0.20 prints what 0.16 did.
+$ fix --only conventions --syntax=mixed
+fixed 11 parameters to let, 5 parameters to inout, 1 parameter to sink, 2 receivers, 7 '&mut e's to '&e', 7 '&e's to a let, 2 '*r's of accesses, 10 'let mut's / 'mut x's to var	main.tach	+35 -35 lines
 $ main.tach -o prog
 ok: built prog
 % ./prog
 3 3 0 6 0 0 1 9 12
-$ fix --values
-note fix.none: nothing to fix
-$ fix --only values --dry-run
-note fix.none: nothing to fix

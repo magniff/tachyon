@@ -8,7 +8,7 @@ leave test items out; `check` and the queries see them.
 
 ```tach
 fn gap(v: [i64]) -> i64 {
-    let mut best = 0;
+    var best = 0;
     for i in 1..v.len() {
         if v[i] - v[i - 1] > best {
             best = v[i] - v[i - 1];
@@ -31,7 +31,7 @@ fn parses() -> Result<(), std::ParseIntError> {
 
 #[test]
 fn keeps_nothing(gpa: Gpa) {
-    let mut b = Buf::new_in(gpa);
+    var b = Buf::new_in(gpa);
     b.push_str("dropped at the end");
 }
 
@@ -76,7 +76,7 @@ fn clamp_stays_in(x: i64, lo: i64, hi: i64) {
 struct Small { n: i64 }
 
 impl std::Arbitrary for Small {
-    fn arbitrary(g: &mut std::Gen) -> Small {
+    fn arbitrary(g: inout std::Gen) -> Small {
         Small { n: g.int_in(0, 9) }
     }
 }

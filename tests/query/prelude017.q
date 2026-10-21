@@ -52,4 +52,4 @@ std::arch::aarch64::raw	<std::arch::aarch64::raw>	110
 std::arch::x86_64::raw	<std::arch::x86_64::raw>	6
 $ def trim prelude017/uses.tach
 std::trim	../../compiler/std/flat/io.tach:28:8	fn	pub fn trim(s: [u8]) -> [u8]	effects: panic	views: views(s) declared
-str::trim	../../compiler/std/string.tach:436:12	method	pub fn trim(self: str) -> str	effects: panic diverge	views: views(self) inferred
+str::trim	../../compiler/std/string.tach:436:12	method	pub fn trim(self) -> str	effects: panic diverge	views: views(self) inferred

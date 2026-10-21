@@ -85,13 +85,13 @@ instead.
 ### Out-parameters
 
 ```tach
-let mut exponent: i32 = 0;
+var exponent: i32 = 0;
 let mantissa = unsafe { c::frexp(48.0, &exponent) };
 println(f"frexp(48)    = {mantissa:.4} * 2^{exponent}");
 ```
 
 C functions that return two values write the second through a pointer
-(`int *exp`). `&exponent` is the address of a tachyon local: a *borrow*,
+(`int *exp`). `&exponent` is the address of a tachyon local, a `*i32`,
 valid for the call.
 
 ### Algorithms generic over the function
@@ -99,7 +99,7 @@ valid for the call.
 ```tach
 fn simpson<F: Fn(f64) -> f64>(f: F, a: f64, b: f64, n: i64) -> f64 {
     let h = (b - a) / n as f64;
-    let mut sum = f(a) + f(b);
+    var sum = f(a) + f(b);
     for i in 1..n {
         let x = a + i as f64 * h;
         sum += if i % 2 == 1 { 4.0 * f(x) } else { 2.0 * f(x) };
@@ -127,13 +127,14 @@ step).
 ```tach
 let x = 4.5;
 let integrand = |t: f64| unsafe { c::pow(t, x - 1.0) * c::exp(-t) };
-let mut gamma_calls = 0;
+var gamma_calls = 0;
 let gamma = adaptive(integrand, 0.0, 60.0, 1e-11, &gamma_calls);
 ```
 
-The closure captures `x` (a copy: `x` is not `mut`). `adaptive` splits an
+The closure captures `x` (read only: `x` is a `let`). `adaptive` splits an
 interval only where the two halves disagree with the whole, and counts
-its evaluations through a `*i64` parameter. The integral of
+its evaluations through an `inout i64` parameter (`&gamma_calls` at the
+call). The integral of
 `t^(x-1) e^-t` is the Gamma function, which libm's `tgamma` computes
 directly: the two agree to 1e-8 (the integral is cut at 60). The normal
 distribution's mass within two standard deviations is checked the same

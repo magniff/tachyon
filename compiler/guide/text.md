@@ -26,8 +26,8 @@ forms are errors naming them. Bytes become a `str` checked:
 `s.as_bytes()`, `s.into_bytes()`, `s.into_buf()`.
 
 ```tach
-fn initials(name: &str, gpa: Gpa) -> String {
-    let mut out = String::new_in(gpa);
+fn initials(name: str, gpa: Gpa) -> String {
+    var out = String::new_in(gpa);
     for w in name.split_whitespace() {
         out.push(w.chars().next().unwrap());
     }
