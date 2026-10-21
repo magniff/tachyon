@@ -1,0 +1,54 @@
+// (0.21) std's atomic intrinsics at -O0 (docs/design/concurrency.md §4.5):
+// each instance's body is the instruction sequence of the back ends
+// (mc_arm64/atomic.tach, mc_x86_64/atomic.tach) on the argument registers,
+// its result in the result register; its ordering SeqCst (the order
+// argument is a value here: strengthening is always allowed). The calls
+// stay calls, which no code generator moves memory accesses across.
+
+use crate::back::mc_arm64::atomic::{ma_atomic, ma_fence};
+use crate::back::mc_x86_64::atomic::{mx_atomic, mx_fence};
+use crate::base::target::X86;
+use crate::middle::ctx::FnCtx;
+use crate::middle::ir::ir_type;
+use crate::middle::ir::atomic::{ATOMIC_CAS, ATOMIC_LOAD, ATOMIC_STORE, ORD_SEQCST};
+use crate::middle::lower::atomic::{
+    INTR_COMPILER_FENCE, INTR_FENCE, atomic_intrinsic, atomic_value_type,
+};
+
+// Writes the body of function f when it is an atomic intrinsic (between
+// its prologue and epilogue); whether it was one.
+pub fn gen_atomic_body(mut cx: *FnCtx, f: i64) -> bool {
+    let code = atomic_intrinsic(f);
+    if code < 0 {
+        return false;
+    }
+    if code == INTR_COMPILER_FENCE {
+        return true;
+    }
+    if code == INTR_FENCE {
+        if X86 { mx_fence(cx, ORD_SEQCST); } else { ma_fence(cx, ORD_SEQCST); }
+        return true;
+    }
+    let ty = ir_type(atomic_value_type(f, code));
+    // The argument registers: x0 x1 x2, rdi rsi rdx; the result x0, rax.
+    let r0 = if X86 { 7 } else { 0 };
+    let r1 = if X86 { 6 } else { 1 };
+    let r2 = if X86 { 2 } else { 2 };
+    let d = if code == ATOMIC_STORE { -1 } else { 0 };
+    if code == ATOMIC_LOAD {
+        emit(cx, code, ty, d, r0, -1, -1);
+    } else if code == ATOMIC_CAS {
+        emit(cx, code, ty, d, r0, r2, r1);
+    } else {
+        emit(cx, code, ty, d, r0, r1, -1);
+    }
+    true
+}
+
+fn emit(mut cx: *FnCtx, code: i64, ty: i64, d: i64, a: i64, b: i64, c: i64) {
+    if X86 {
+        mx_atomic(cx, code, ORD_SEQCST, ty, d, a, b, c);
+    } else {
+        ma_atomic(cx, code, ORD_SEQCST, ty, d, a, b, c);
+    }
+}

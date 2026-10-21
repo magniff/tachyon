@@ -1,0 +1,95 @@
+// (0.21) The concurrency operations of the IR (docs/design/concurrency.md
+// §4.1): ATOMIC's kinds and orderings (its imm), FENCE's flag, and the one
+// barrier predicate the passes ask.
+//
+// The optimizer's rules (§4.2, O1-O4): an ATOMIC or FENCE reads and writes
+// all shared memory (whatever its ordering, in 0.21.0): nothing shared is
+// forwarded, merged, hoisted or sunk across one, and no atomic is removed,
+// merged or split. A pass that forgets the ops still sees them as
+// side effects (Op::has_side_effect), never as pure.
+
+use crate::middle::ctx::FnCtx;
+use crate::middle::ir::Op;
+
+// The kinds (imm & 255).
+pub const ATOMIC_LOAD: i64 = 0;
+pub const ATOMIC_STORE: i64 = 1;
+pub const ATOMIC_SWAP: i64 = 2;
+pub const ATOMIC_CAS: i64 = 3;
+pub const ATOMIC_ADD: i64 = 4;
+pub const ATOMIC_SUB: i64 = 5;
+pub const ATOMIC_AND: i64 = 6;
+pub const ATOMIC_NAND: i64 = 7;
+pub const ATOMIC_OR: i64 = 8;
+pub const ATOMIC_XOR: i64 = 9;
+pub const ATOMIC_SMAX: i64 = 10;
+pub const ATOMIC_SMIN: i64 = 11;
+pub const ATOMIC_UMAX: i64 = 12;
+pub const ATOMIC_UMIN: i64 = 13;
+
+// The orderings (imm >> 8 & 15 of an ATOMIC, imm & 15 of a FENCE), as
+// std's Ordering numbers them.
+pub const ORD_RELAXED: i64 = 0;
+pub const ORD_ACQUIRE: i64 = 1;
+pub const ORD_RELEASE: i64 = 2;
+pub const ORD_ACQREL: i64 = 3;
+pub const ORD_SEQCST: i64 = 4;
+
+// A FENCE that orders the compiler only (compiler_fence): no instruction.
+pub const FENCE_COMPILER: i64 = 256;
+
+pub fn atomic_kind(mut cx: *FnCtx, v: i64) -> i64 {
+    unsafe { cx.insts[v].imm & 255 }
+}
+
+pub fn atomic_order(mut cx: *FnCtx, v: i64) -> i64 {
+    unsafe { (cx.insts[v].imm >> 8) & 15 }
+}
+
+// Whether ordering o acquires (orders what follows it).
+pub fn order_acquires(o: i64) -> bool {
+    o == ORD_ACQUIRE || o == ORD_ACQREL || o == ORD_SEQCST
+}
+
+// Whether ordering o releases (orders what precedes it).
+pub fn order_releases(o: i64) -> bool {
+    o == ORD_RELEASE || o == ORD_ACQREL || o == ORD_SEQCST
+}
+
+// The ordering a kind can have nearest to o (stronger): a load cannot
+// release, a store cannot acquire.
+pub fn legal_order(kind: i64, o: i64) -> i64 {
+    if o < 0 || o > ORD_SEQCST {
+        return ORD_SEQCST;
+    }
+    if kind == ATOMIC_LOAD && (o == ORD_RELEASE || o == ORD_ACQREL) {
+        return ORD_SEQCST;
+    }
+    if kind == ATOMIC_STORE && (o == ORD_ACQUIRE || o == ORD_ACQREL) {
+        return ORD_SEQCST;
+    }
+    o
+}
+
+// Whether v is a barrier for shared memory (O1): an ATOMIC or a FENCE.
+// Calls are barriers through their attributes (ipo::call_writes): a
+// function with an atomic is neither READNONE nor READONLY.
+#[inline]
+pub fn is_barrier(mut cx: *FnCtx, v: i64) -> bool {
+    unsafe {
+        let op = cx.insts[v].op;
+        op == Op::Atomic || op == Op::Fence
+    }
+}
+
+// The name of kind k in printed IR (`atomic.add.relaxed`).
+pub fn kind_name(k: i64) -> *u8 {
+    let names: [*u8; 14] = [c"load", c"store", c"swap", c"cas", c"add", c"sub", c"and", c"nand",
+        c"or", c"xor", c"smax", c"smin", c"umax", c"umin"];
+    if k >= 0 && k < 14 { names[k] } else { c"?" }
+}
+
+pub fn order_name(o: i64) -> *u8 {
+    let names: [*u8; 5] = [c"relaxed", c"acquire", c"release", c"acqrel", c"seqcst"];
+    if o >= 0 && o < 5 { names[o] } else { c"?" }
+}

@@ -4,7 +4,7 @@
 ## A method #[derive] makes: the attribute answers (0.15).
 $ items
 crate	syntax015/main.tach	6
-std	<std>	562
+std	<std>	571
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	37
@@ -20,7 +20,7 @@ std::collections::btree_node	<std>	56
 std::collections::btree_map	<std>	45
 std::collections::group	<std>	20
 std::io	<std>	7
-std::fmt	<std>	80
+std::fmt	<std>	92
 std::num	<std>	83
 std::num::tables	<std>	4
 std::convert	<std>	2
@@ -35,6 +35,10 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
+std::sync	<std>	29
+std::sync::atomic	<std>	48
+std::sync::mpsc	<std>	24
+std::thread	<std>	43
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6

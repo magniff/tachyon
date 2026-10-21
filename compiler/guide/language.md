@@ -90,9 +90,10 @@ var n = a as i32;         // `as` converts numbers; nothing converts implicitly
 n += c as i32 + b as i32 + e as i32;
 ```
 
-`let` bindings are immutable, `var` ones mutable. Shadowing (`let x = x
-+ 1;`) is allowed. `const N: i64 = 10;` and `static var COUNT: i64 = 0;` are items
-(statics are safe to use: there are no threads). Integers wrap, `x / 0 ==
+`let` bindings are immutable, `var` ones mutable. Shadowing (`let x =
+x + 1;`) is allowed. `const N: i64 = 10;` and `static var COUNT: i64 = 0;`
+are items (statics are safe to use; with threads, a `static var` is for
+one thread: `guide threads`). Integers wrap, `x / 0 ==
 0`, `x % 0 == x`; indexing, slicing, `unwrap` and casts to enums are
 checked (a message, exit 101): `guide types`.
 

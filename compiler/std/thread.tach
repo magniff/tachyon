@@ -1,0 +1,361 @@
+// std::thread: threads of the operating system (0.21).
+
+use std::{Option, out_of_memory, panic_str};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+// ---- Threads (0.21) ----
+
+// Threads (docs/design/concurrency.md §2.3): `spawn` runs a closure on a
+// new thread and `join` waits for it and gives its result; `scope` runs a
+// closure that may start threads borrowing the caller's values, all of
+// them joined before it returns. A panic in any thread stops the program
+// (exit 101), so `join` returns the result itself, not a Result. A thread's
+// stack (8 MiB) and its start record come from C's allocator:
+// `alloc(extern)`.
+//
+// What crosses threads is checked where they start (front/threads.tach,
+// `sync.*` diagnostics): spawn takes a `move` closure whose captures and
+// result are Send and hold no view, and that reaches no `static mut`;
+// scope's closure changes nothing it borrows from the caller while its
+// threads read it, and a scoped thread only reads what it borrows.
+//
+//     let h = thread::spawn(move || work(input));
+//     let r = h.join();
+
+extern "C" {
+    #[link_name = "malloc"]
+    fn thread_c_malloc(n: u64) -> *u8;
+    #[link_name = "free"]
+    fn thread_c_free(p: *u8);
+    #[link_name = "pthread_create"]
+    fn thread_c_create(t: *u64, attr: *u8, f: extern "C" fn(*u8) -> *u8, arg: *u8) -> i32;
+    #[link_name = "pthread_join"]
+    fn thread_c_join(t: u64, ret: *u64) -> i32;
+    #[link_name = "pthread_detach"]
+    fn thread_c_detach(t: u64) -> i32;
+    #[link_name = "pthread_attr_init"]
+    #[effects(sync)]
+    fn thread_c_attr_init(a: *u8) -> i32;
+    #[link_name = "pthread_attr_setstacksize"]
+    #[effects(sync)]
+    fn thread_c_attr_setstacksize(a: *u8, size: u64) -> i32;
+    #[link_name = "pthread_attr_destroy"]
+    #[effects(sync)]
+    fn thread_c_attr_destroy(a: *u8) -> i32;
+    #[link_name = "sched_yield"]
+    fn thread_c_yield() -> i32;
+    #[link_name = "sysconf"]
+    #[effects()]
+    fn thread_c_sysconf(name: i32) -> i64;
+}
+
+// What a new thread starts from: run(data).
+struct Start { run: fn(*u8), data: *u8 }
+
+// The result's place, shared by the thread and its handle: `refs` is 2
+// until one of them is done with it; the last one frees it.
+struct Out<R> { refs: AtomicU32, result: Option<R> }
+
+// The closure, moved to the thread.
+struct Packet<F, R> { f: F, out: *Out<R> }
+
+// The thread's first frame (C's convention, the address pthread_create
+// takes).
+extern "C" fn thread_start(arg: *u8) -> *u8 {
+    unsafe {
+        let s = arg as *Start;
+        let run = (*s).run;
+        let data = (*s).data;
+        thread_c_free(arg);
+        run(data);
+    }
+    0 as *u8
+}
+
+// The thread's work: the closure called, its result published.
+fn thread_run<F: FnMut() -> R, R>(data: *u8) {
+    unsafe {
+        let q = data as *Packet<F, R>;
+        var p = *q;
+        thread_c_free(data);
+        let r = (p.f)();
+        let out = p.out;
+        (*out).result = Some(r);
+        if (*out).refs.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // (the handle is gone: nobody takes the result)
+            let gone = *out;
+            thread_c_free(out as *u8);
+            drop(gone);
+        }
+    }
+}
+
+// A running thread, joined by `join` or left to run (detached) when the
+// handle is dropped.
+pub struct JoinHandle<R> { t: u64, out: *Out<R> }
+
+impl<R> JoinHandle<R> {
+    // Waits for the thread to finish; its closure's result.
+    pub fn join(sink self) -> R {
+        unsafe {
+            var h = self;
+            thread_c_join(h.t, 0 as *u64);
+            let out = h.out;
+            h.out = 0 as *Out<R>;
+            let o = *out;
+            thread_c_free(out as *u8);
+            o.result.unwrap()
+        }
+    }
+}
+
+impl<R> Drop for JoinHandle<R> {
+    fn drop(inout self) {
+        unsafe {
+            if self.out == 0 as *Out<R> {
+                return;
+            }
+            thread_c_detach(self.t);
+            let out = self.out;
+            if (*out).refs.fetch_sub(1, Ordering::AcqRel) == 1 {
+                let done = *out;
+                thread_c_free(out as *u8);
+                drop(done);
+            }
+        }
+    }
+}
+
+// The stack of a new thread: 8 MiB (macOS's default for threads past the
+// first is 512 KiB).
+const THREAD_STACK: u64 = 8388608;
+
+// Starts a thread running f; its handle.
+pub fn spawn<F: FnMut() -> R, R>(f: sink F) -> JoinHandle<R> {
+    unsafe {
+        std::fmt::print_threads_started();
+        let out = thread_c_malloc(size_of(Out<R>) as u64) as *Out<R>;
+        if out == 0 as *Out<R> {
+            out_of_memory();
+        }
+        *out = Out { refs: AtomicU32::new(2), result: None };
+        let q = thread_c_malloc(size_of(Packet<F, R>) as u64) as *Packet<F, R>;
+        let s = thread_c_malloc(size_of(Start) as u64) as *Start;
+        if q == 0 as *Packet<F, R> || s == 0 as *Start {
+            out_of_memory();
+        }
+        *q = Packet { f: f, out: out };
+        *s = Start { run: thread_run::<F, R>, data: q as *u8 };
+        // (pthread_attr_t: 64 bytes on macOS and Linux; room for more)
+        var attr: [u64; 16] = [0; 16];
+        let a = &attr as *u8;
+        thread_c_attr_init(a);
+        thread_c_attr_setstacksize(a, THREAD_STACK);
+        var t: u64 = 0;
+        let rc = thread_c_create(&t, a, thread_start, s as *u8);
+        thread_c_attr_destroy(a);
+        if rc != 0 {
+            panic_str("thread::spawn: the system could not start a thread");
+        }
+        JoinHandle { t: t, out: out }
+    }
+}
+
+// The threads a `scope` started, joined when it ends: a list.
+pub struct Scope { first: *ScopeJoin }
+
+// A thread of a scope: its handle's join, erased, and the next one.
+struct ScopeJoin { join: fn(*u8), handle: *u8, next: *ScopeJoin }
+
+// A thread started in a scope: `join` gives its result; a thread not
+// joined by hand is joined when the scope ends.
+pub struct ScopedJoinHandle<R> { slot: *ScopeHandle<R> }
+
+struct ScopeHandle<R> { h: Option<JoinHandle<R>>, done: bool }
+
+fn scope_join<R>(p: *u8) {
+    unsafe {
+        let s = p as *ScopeHandle<R>;
+        if !(*s).done {
+            (*s).done = true;
+            let h = (*s).h;
+            (*s).h = None;
+            match h {
+                Some(handle) => drop(handle.join()),
+                None => {}
+            }
+        }
+        let gone = *s;
+        thread_c_free(p);
+        drop(gone);
+    }
+}
+
+impl<R> ScopedJoinHandle<R> {
+    // Waits for the thread; its result.
+    pub fn join(sink self) -> R {
+        unsafe {
+            let s = self.slot;
+            (*s).done = true;
+            let h = (*s).h;
+            (*s).h = None;
+            h.unwrap().join()
+        }
+    }
+}
+
+impl Scope {
+    // Starts a thread running f, joined at the latest when the scope ends.
+    pub fn spawn<F: FnMut() -> R, R>(inout self, f: sink F) -> ScopedJoinHandle<R> {
+        unsafe {
+            let slot = thread_c_malloc(size_of(ScopeHandle<R>) as u64) as *ScopeHandle<R>;
+            if slot == 0 as *ScopeHandle<R> {
+                out_of_memory();
+            }
+            let node = thread_c_malloc(size_of(ScopeJoin) as u64) as *ScopeJoin;
+            if node == 0 as *ScopeJoin {
+                out_of_memory();
+            }
+            *slot = ScopeHandle { h: Some(spawn(f)), done: false };
+            *node = ScopeJoin { join: scope_join::<R>, handle: slot as *u8, next: self.first };
+            self.first = node;
+            ScopedJoinHandle { slot: slot }
+        }
+    }
+}
+
+// Runs f with a scope; every thread started in it is joined before scope
+// returns f's result.
+pub fn scope<F: FnMut(inout Scope) -> R, R>(f: sink F) -> R {
+    unsafe {
+        var s = Scope { first: 0 as *ScopeJoin };
+        var g = f;
+        let r = g(&s);
+        var n = s.first;
+        while n != 0 as *ScopeJoin {
+            let next = (*n).next;
+            ((*n).join)((*n).handle);
+            thread_c_free(n as *u8);
+            n = next;
+        }
+        r
+    }
+}
+
+// Lets another thread run.
+pub fn yield_now() {
+    unsafe { thread_c_yield(); }
+}
+
+// How many threads can run at once (the CPUs online), at least 1.
+pub fn available_parallelism() -> i64 {
+    let n = unsafe { thread_c_sysconf(std::SYS_SC_NPROCESSORS_ONLN) };
+    if n < 1 { 1 } else { n }
+}
+
+// ---- Thread-locals (0.21) ----
+
+// `#[thread_local] static mut X: T = INIT;` (docs/design/concurrency.md
+// §2.3): each thread has its own X, made from INIT when the thread first
+// reaches it. 0.21.0 keeps them with the C library's thread-specific data:
+// the compiler makes every access of X `*__tls_addr(&X's initial value,
+// size)`, a key per thread-local (made once, kept in a table by the
+// initial value's address: looked up without a lock), the thread's copy
+// allocated from C at its first access and freed when the thread ends. A
+// thread-local's drop does not run.
+
+extern "C" {
+    #[link_name = "pthread_key_create"]
+    #[effects(sync)]
+    fn tls_c_key_create(key: *u64, destructor: extern "C" fn(*u8)) -> i32;
+    #[link_name = "pthread_getspecific"]
+    #[effects()]
+    fn tls_c_get(key: u64) -> *u8;
+    #[link_name = "pthread_setspecific"]
+    #[effects(sync)]
+    fn tls_c_set(key: u64, p: *u8) -> i32;
+    #[link_name = "memcpy"]
+    #[effects()]
+    fn tls_c_memcpy(d: *u8, s: *u8, n: u64) -> *u8;
+}
+
+// The key table: open addressing on the initial value's address; an
+// entry's key is published (release) before its address.
+const TLS_SLOTS: i64 = 1024;
+static var TLS_ADDRS: [u64; 1024] = [0; 1024];
+static var TLS_KEYS: [u64; 1024] = [0; 1024];
+static var TLS_LOCK: std::sync::RawLock = std::sync::RawLock {
+    state: AtomicU32 { v: 0 },
+};
+
+extern "C" fn tls_free(p: *u8) {
+    unsafe { thread_c_free(p); }
+}
+
+// This thread's copy of the thread-local whose initial value (size bytes)
+// is at template.
+pub unsafe fn __tls_addr(template: *u8, size: i64) -> *u8 {
+    let key = tls_key(template);
+    let p = tls_c_get(key);
+    if p != 0 as *u8 {
+        return p;
+    }
+    tls_first(key, template, size)
+}
+
+#[inline(never)]
+unsafe fn tls_first(key: u64, template: *u8, size: i64) -> *u8 {
+    let n = if size > 0 { size } else { 1 };
+    let p = thread_c_malloc(n as u64);
+    if p == 0 as *u8 {
+        out_of_memory();
+    }
+    tls_c_memcpy(p, template, size as u64);
+    tls_c_set(key, p);
+    p
+}
+
+unsafe fn tls_key(template: *u8) -> u64 {
+    let a = template as u64;
+    var i = ((a >> 4) * 0x9e3779b97f4a7c15 >> 54) as i64;
+    loop {
+        let seen = std::sync::atomic::atomic_load(&TLS_ADDRS[i] as *u64, 1);
+        if seen == a {
+            return std::sync::atomic::atomic_load(&TLS_KEYS[i] as *u64, 1) - 1;
+        }
+        if seen == 0 {
+            return tls_new_key(a);
+        }
+        i = (i + 1) % TLS_SLOTS;
+    }
+}
+
+#[inline(never)]
+unsafe fn tls_new_key(a: u64) -> u64 {
+    TLS_LOCK.lock();
+    var i = ((a >> 4) * 0x9e3779b97f4a7c15 >> 54) as i64;
+    var probes = 0;
+    loop {
+        let seen = std::sync::atomic::atomic_load(&TLS_ADDRS[i] as *u64, 1);
+        if seen == a {
+            TLS_LOCK.unlock();
+            return std::sync::atomic::atomic_load(&TLS_KEYS[i] as *u64, 1) - 1;
+        }
+        if seen == 0 {
+            break;
+        }
+        probes += 1;
+        if probes >= TLS_SLOTS {
+            panic_str("thread-locals: more than 1024");
+        }
+        i = (i + 1) % TLS_SLOTS;
+    }
+    var key: u64 = 0;
+    if tls_c_key_create(&key, tls_free) != 0 {
+        panic_str("thread-locals: the system has no key left");
+    }
+    std::sync::atomic::atomic_store(&TLS_KEYS[i] as *u64, key + 1, 2);
+    std::sync::atomic::atomic_store(&TLS_ADDRS[i] as *u64, a, 2);
+    TLS_LOCK.unlock();
+    key
+}

@@ -7,10 +7,10 @@
 // diverge`, and the callbacks C may call (infer.tach). It replaces
 // middle's PURE_LIBM (whose functions are here, none).
 
-use crate::base::intern_c;
+use crate::base::{SYMS, intern_c};
 use crate::front::effects::{
-    EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_RAW_DIVERGE, EFF_RAW_PANIC,
-    EFF_UNKNOWN, Effects, effects_none,
+    EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_RAW_DIVERGE, EFF_RAW_GLOBAL,
+    EFF_RAW_PANIC, EFF_SYNC, EFF_THREAD, EFF_UNKNOWN, Effects, effects_none,
 };
 use crate::front::types::FNS;
 use crate::gen0::target::LINK_NAMES;
@@ -23,6 +23,10 @@ pub const C_ALLOC: i64 = 2;
 pub const C_IO: i64 = 3;
 pub const C_GLOBAL: i64 = 4;
 pub const C_EXIT: i64 = 5;
+// (0.21) Blocking on, or synchronizing with, another thread: sync; starting
+// a thread: thread, sync and alloc(extern) (its stack).
+pub const C_SYNC: i64 = 6;
+pub const C_THREAD: i64 = 7;
 
 // symbol + 1 -> class.
 static mut TABLE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
@@ -75,6 +79,18 @@ fn fill_table() {
     add(&mut global[..], C_GLOBAL);
     let exits: [*u8; 4] = [c"exit", c"_exit", c"_Exit", c"abort"];
     add(&mut exits[..], C_EXIT);
+    let sync: [*u8; 24] = [
+        c"pthread_join", c"pthread_detach", c"pthread_mutex_lock", c"pthread_mutex_unlock",
+        c"pthread_mutex_trylock", c"pthread_mutex_init", c"pthread_mutex_destroy",
+        c"pthread_cond_wait", c"pthread_cond_signal", c"pthread_cond_broadcast",
+        c"pthread_cond_init", c"pthread_cond_destroy", c"pthread_once", c"sched_yield",
+        c"__ulock_wait", c"__ulock_wait2", c"__ulock_wake", c"os_unfair_lock_lock",
+        c"os_unfair_lock_unlock", c"os_sync_wait_on_address", c"os_sync_wake_by_address_any",
+        c"os_sync_wake_by_address_all", c"sem_wait", c"sem_post",
+    ];
+    add(&mut sync[..], C_SYNC);
+    let thread: [*u8; 1] = [c"pthread_create"];
+    add(&mut thread[..], C_THREAD);
 }
 
 // The class of the C function with symbol sym (C_UNKNOWN_CLASS: not in
@@ -100,7 +116,7 @@ pub fn c_symbol(f: i64) -> i64 {
 pub fn unknown_c_effects() -> Effects {
     Effects {
         bits: EFF_ALLOC_EXTERN | EFF_IO | EFF_GLOBAL | EFF_PANIC | EFF_DIVERGE | EFF_RAW_PANIC
-            | EFF_RAW_DIVERGE, allocs: 0,
+            | EFF_RAW_DIVERGE | EFF_RAW_GLOBAL, allocs: 0,
     }
 }
 
@@ -114,12 +130,25 @@ pub fn known_c_effects(sym: i64) -> Effects {
     } else if class == C_IO {
         e.bits = EFF_IO;
     } else if class == C_GLOBAL {
-        e.bits = EFF_GLOBAL;
+        e.bits = EFF_GLOBAL | (if is_errno_symbol(sym) { 0 } else { EFF_RAW_GLOBAL });
     } else if class == C_EXIT {
         e.bits = EFF_IO | EFF_DIVERGE | EFF_RAW_DIVERGE;
+    } else if class == C_SYNC {
+        e.bits = EFF_SYNC;
+    } else if class == C_THREAD {
+        e.bits = EFF_THREAD | EFF_SYNC | EFF_ALLOC_EXTERN;
     } else if class == C_UNKNOWN_CLASS {
         e = unknown_c_effects();
         e.bits |= EFF_UNKNOWN;
     }
     e
+}
+
+// (0.21) Whether sym is C's errno (its address): per thread, so global but
+// not EFF_RAW_GLOBAL.
+pub fn is_errno_symbol(sym: i64) -> bool {
+    unsafe {
+        let t = SYMS[sym].text;
+        t == "__error" || t == "__errno_location" || t == "errno"
+    }
 }

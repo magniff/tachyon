@@ -7,14 +7,15 @@ use crate::arch::intrinsic_of_fn;
 use crate::back::abi::{
     AbiClass, conv_classify, conv_returns_through_pointer, fn_type_uses_c, fn_uses_c, variadic_kind,
 };
-use crate::base::{IntVec, free, intern_c};
+use crate::base::{IntVec, die, free, intern_c};
 use crate::base::target::X86;
 use crate::front::ast::{NODES, NODE_RAW, child};
 use crate::front::contracts::checks::{CHECK_FN, check_message, check_values, conjuncts, operands};
 use crate::front::modules::{STD_MODULE, item_symbol, within_std};
+use crate::front::threadlocal::{symbol_is_thread_local, tls_addr_fn};
 use crate::front::types::{
-    FNS, TYPES, TY_F32, TY_F64, TY_I64, TY_U64, TY_U8_PTR, fn_param, int_bits, is_compound,
-    is_signed, is_void, scalar_type, type_elem, type_size,
+    FNS, STATICS, SYM_STATIC, TYPES, TY_F32, TY_F64, TY_I64, TY_U64, TY_U8_PTR, fn_param, int_bits,
+    is_compound, is_signed, is_void, scalar_type, type_elem, type_size,
 };
 use crate::gen0::target::{PANIC_USED, message_kind, rt_panic_sym};
 use crate::middle::checkalloc::site_before_call;
@@ -27,6 +28,7 @@ use crate::middle::ir::{
 use crate::middle::ir::cfg::ir_terminate;
 use crate::middle::lower::{is_fresh, lower_branch, lower_copy, new_slot_for, start_dead_block};
 use crate::middle::lower::arch::{NOT_LOWERED, lower_intrinsic};
+use crate::middle::lower::atomic::{atomic_intrinsic, lower_atomic_call};
 use crate::middle::lower::expr::{ir_conv, lower_expr, lower_operand, need_value};
 use crate::middle::lower::ssa::ir_seal;
 use crate::middle::profile::PROFILE_MODULE;
@@ -55,6 +57,29 @@ pub fn take_args(mut cx: *FnCtx, call: i64, mark: i64) {
             cx.argty.push(cx.ssa_stack.data[mark + 2 * i + 1]);
         }
         cx.ssa_stack.count = mark;
+    }
+}
+
+// (0.21) The address of static `sym` (its symbol): GADDR, or for a
+// thread-local this thread's copy, std::thread::__tls_addr(GADDR, size)
+// (front/threadlocal.tach).
+pub fn static_address(mut cx: *FnCtx, sym: i64) -> i64 {
+    unsafe {
+        let g = emit_ir(cx, Op::GAddr, TY_U64, 0, 0, sym);
+        if !symbol_is_thread_local(sym) {
+            return g;
+        }
+        let f = tls_addr_fn();
+        if f < 0 {
+            die(c"internal error: a thread-local without std::thread");
+        }
+        let size = type_size(STATICS[SYM_STATIC[sym] - 1].ty);
+        let mark = cx.ssa_stack.count;
+        push_arg(cx, g, TY_U64);
+        push_arg(cx, ir_const(cx, size, TY_I64), TY_I64);
+        let call = emit_ir(cx, Op::Call, TY_U64, 0, 0, f);
+        take_args(cx, call, mark);
+        call
     }
 }
 
@@ -120,6 +145,11 @@ pub fn lower_call(mut cx: *FnCtx, n: i64) -> i64 {
             let a = need_value(cx, lower_expr(cx, child(n, 0)), TY_U64);
             let b = need_value(cx, lower_expr(cx, child(n, 1)), TY_U64);
             return emit_ir(cx, Op::MulH, TY_U64, a, b, 0);
+        }
+        // (0.21: std's atomic intrinsics, ATOMIC and FENCE)
+        let akind = atomic_intrinsic(direct);
+        if akind >= 0 {
+            return lower_atomic_call(cx, n, direct, akind);
         }
         let mut param_count = 0;
         let mut ret = 0;
