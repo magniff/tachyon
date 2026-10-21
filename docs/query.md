@@ -1036,6 +1036,9 @@ must come from the cache when the first made it).
   edit did not change it ([optimizer.md](optimizer.md), "0.18.1:
   incremental rebuilds"); `--no-cache` goes without.
 
+(0.24) `tachyonc lsp`, the language server ([lsp.md](lsp.md)), reads the
+program once per edit and answers an editor from these same tables.
+
 ## Several commands in one call: batch (0.15)
 
 `tachyonc batch [FILE] [--root R] [--stop]` runs the commands of FILE

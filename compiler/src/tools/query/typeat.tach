@@ -207,89 +207,7 @@ pub fn query_type(arg: [u8]) -> i64 {
         // The innermost typed nodes holding pos (copies of one in each
         // instance of a generic function); without COL, the outermost
         // that starts on the line.
-        let mut best = 0;
-        let mut have = false;
-        let mut found = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        // (0.14: the closure's environment that a captured use reads,
-        // written nowhere: not shown)
-        let mut hidden = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-        for n in 1..NODE_COUNT {
-            if (NODES[n].p & NODE_CAPTURE) == 0 {
-                continue;
-            }
-            let mut q = n;
-            while q > 0
-                && (NODES[q].kind == NodeKind::Unary || NODES[q].kind == NodeKind::FieldAccess) {
-                if q != n {
-                    hidden.put(q + 1, 1);
-                }
-                q = if NODES[q].kind == NodeKind::Unary { NODES[q].b } else { NODES[q].a };
-            }
-            if q > 0 && q != n {
-                hidden.put(q + 1, 1);
-            }
-        }
-        // (0.14: what a closure is lowered to, its environment's literal
-        // or its function, has the closure's span: not shown)
-        let mut spans = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-        // (0.15: an f-string's spans, and its holes' expressions; the
-        // widened values, the copies an implicit cast holds, by type)
-        let mut fstrings = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let mut holes = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let mut exprs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        let mut widened = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
-        for n in 1..NODE_COUNT {
-            let k = NODES[n].kind;
-            if k == NodeKind::Closure {
-                spans.put(NODES[n].start + 1, NODES[n].end + 1);
-            } else if k == NodeKind::Interp {
-                fstrings.push(NODES[n].start);
-                fstrings.push(NODES[n].end);
-            } else if k == NodeKind::InterpHole && NODES[n].a > 0 {
-                holes.push(NODES[NODES[n].a].start);
-                holes.push(NODES[NODES[n].a].end);
-                exprs.push(NODES[n].a);
-            } else if k == NodeKind::Try && NODES[n].a > 0 {
-                // (a `?`: what it is checked as, but its operand)
-                fstrings.push(NODES[n].start);
-                fstrings.push(NODES[n].end);
-                holes.push(NODES[NODES[n].a].start);
-                holes.push(NODES[NODES[n].a].end);
-            } else if k == NodeKind::Cast && (NODES[n].p & NODE_IMPLICIT) != 0 && NODES[n].a > 0 {
-                widened.put(NODES[n].a + 1, NODES[n].ty);
-            }
-        }
-        for n in 1..NODE_COUNT {
-            if NODES[n].ty <= 0 || !typed_kind(NODES[n].kind) || hidden.get(n + 1) != 0 {
-                continue;
-            }
-            if NODES[n].kind != NodeKind::Closure && NODES[n].kind != NodeKind::Interp
-                && spans.get(NODES[n].start + 1) == NODES[n].end + 1 {
-                continue;
-            }
-            // (0.15: an implicit cast is shown as the value it widens; what
-            // the compiler writes for an f-string or a `?` is not shown)
-            if (NODES[n].kind == NodeKind::Cast && (NODES[n].p & NODE_IMPLICIT) != 0)
-                || made_by_compiler(n, &fstrings, &holes, &exprs) {
-                continue;
-            }
-            if col >= 1 && (NODES[n].start > pos || NODES[n].end <= pos) {
-                continue;
-            }
-            if col < 1 && (NODES[n].start < pos || NODES[n].start >= le) {
-                continue;
-            }
-            let size = if col >= 1 { NODES[n].end - NODES[n].start }
-                else { NODES[n].start - NODES[n].end };
-            if !have || size < best {
-                have = true;
-                best = size;
-                found.count = 0;
-            }
-            if size == best {
-                found.push(n);
-            }
-        }
+        let (found, mut widened) = typed_nodes_at(col, pos, le);
         if found.count == 0 {
             let d = diag(c"error", c"query.no-match");
             buf_str(d, c"no checked expression at ");
@@ -349,5 +267,123 @@ pub fn query_type(arg: [u8]) -> i64 {
         }
         buf_write_fd(out, STDOUT);
         0
+    }
+}
+
+// (0.24) The innermost typed nodes holding pos (col >= 1), else the
+// outermost starting on the line (pos..le), and the widened values: what
+// `query type` prints and the language server's hover shows.
+pub fn typed_nodes_at(col: i64, pos: i64, le: i64) -> (IntVec, HMap) {
+    let ix = typed_index();
+    (typed_nodes_in(&ix, col, pos, le), ix.widened)
+}
+
+// (0.24) What the search for typed nodes leaves out or shows otherwise,
+// whatever the position (the language server makes it once).
+pub struct TypedIndex {
+    // (0.14: the closure's environment that a captured use reads, written
+    // nowhere: not shown)
+    pub hidden: HMap,
+    // (0.14: what a closure is lowered to, its environment's literal or its
+    // function, has the closure's span: not shown)
+    pub spans: HMap,
+    // (0.15: an f-string's spans, and its holes' expressions; the widened
+    // values, the copies an implicit cast holds, by type)
+    pub fstrings: IntVec,
+    pub holes: IntVec,
+    pub exprs: IntVec,
+    pub widened: HMap,
+}
+
+pub fn typed_index() -> TypedIndex {
+    unsafe {
+        let mut ix = TypedIndex {
+            hidden: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
+            spans: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
+            fstrings: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            holes: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            exprs: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            widened: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
+        };
+        for n in 1..NODE_COUNT {
+            if (NODES[n].p & NODE_CAPTURE) == 0 {
+                continue;
+            }
+            let mut q = n;
+            while q > 0
+                && (NODES[q].kind == NodeKind::Unary || NODES[q].kind == NodeKind::FieldAccess) {
+                if q != n {
+                    ix.hidden.put(q + 1, 1);
+                }
+                q = if NODES[q].kind == NodeKind::Unary { NODES[q].b } else { NODES[q].a };
+            }
+            if q > 0 && q != n {
+                ix.hidden.put(q + 1, 1);
+            }
+        }
+        for n in 1..NODE_COUNT {
+            let k = NODES[n].kind;
+            if k == NodeKind::Closure {
+                ix.spans.put(NODES[n].start + 1, NODES[n].end + 1);
+            } else if k == NodeKind::Interp {
+                ix.fstrings.push(NODES[n].start);
+                ix.fstrings.push(NODES[n].end);
+            } else if k == NodeKind::InterpHole && NODES[n].a > 0 {
+                ix.holes.push(NODES[NODES[n].a].start);
+                ix.holes.push(NODES[NODES[n].a].end);
+                ix.exprs.push(NODES[n].a);
+            } else if k == NodeKind::Try && NODES[n].a > 0 {
+                // (a `?`: what it is checked as, but its operand)
+                ix.fstrings.push(NODES[n].start);
+                ix.fstrings.push(NODES[n].end);
+                ix.holes.push(NODES[NODES[n].a].start);
+                ix.holes.push(NODES[NODES[n].a].end);
+            } else if k == NodeKind::Cast && (NODES[n].p & NODE_IMPLICIT) != 0 && NODES[n].a > 0 {
+                ix.widened.put(NODES[n].a + 1, NODES[n].ty);
+            }
+        }
+        ix
+    }
+}
+
+// The search of typed_nodes_at, with the index made.
+pub fn typed_nodes_in(ix: &TypedIndex, col: i64, pos: i64, le: i64) -> IntVec {
+    unsafe {
+        let mut best = 0;
+        let mut have = false;
+        let mut found = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for n in 1..NODE_COUNT {
+            // (the position first: the rest looks up tables)
+            if col >= 1 && (NODES[n].start > pos || NODES[n].end <= pos) {
+                continue;
+            }
+            if col < 1 && (NODES[n].start < pos || NODES[n].start >= le) {
+                continue;
+            }
+            if NODES[n].ty <= 0 || !typed_kind(NODES[n].kind) || ix.hidden.get(n + 1) != 0 {
+                continue;
+            }
+            if NODES[n].kind != NodeKind::Closure && NODES[n].kind != NodeKind::Interp
+                && ix.spans.get(NODES[n].start + 1) == NODES[n].end + 1 {
+                continue;
+            }
+            // (0.15: an implicit cast is shown as the value it widens; what
+            // the compiler writes for an f-string or a `?` is not shown)
+            if (NODES[n].kind == NodeKind::Cast && (NODES[n].p & NODE_IMPLICIT) != 0)
+                || made_by_compiler(n, &ix.fstrings, &ix.holes, &ix.exprs) {
+                continue;
+            }
+            let size = if col >= 1 { NODES[n].end - NODES[n].start }
+                else { NODES[n].start - NODES[n].end };
+            if !have || size < best {
+                have = true;
+                best = size;
+                found.count = 0;
+            }
+            if size == best {
+                found.push(n);
+            }
+        }
+        found
     }
 }

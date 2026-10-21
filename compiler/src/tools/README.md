@@ -33,4 +33,5 @@ the edited program checked before anything is written, a journal for
 | `probe/` | `tachyonc probe` (0.17): a program run with values printed at lines, from copies of its files (`--overlay`): where each probe goes and the command line (`mod`), the code written in (`code`), the run and its report (`run`) |
 | `reduce.tach` | `tachyonc reduce` (0.17): a failing input made small, line by line |
 | `snippet.tach` | `tachyonc try` (0.15): a snippet compiled and run with std, its value printed |
+| `lsp/` | `tachyonc lsp` (0.24, [docs/lsp.md](../../../docs/lsp.md)): the language server; the server, its documents and its worker (`mod`), JSON read in place (`json`), the worker that reads the program once and answers definition, references, hover, symbols and diagnostics from the queries' tables (`answer`) |
 | `explain/` | `tachyonc explain CODE` (0.13): the table of every diagnostic code (`tools_table`, `refactor_table`) |

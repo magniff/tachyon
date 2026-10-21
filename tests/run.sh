@@ -9,7 +9,8 @@
 # of the tree, and formatting changes no program, 0.13) and
 # tests/walkthrough/run.sh (the sessions of examples/tools/*/README.md,
 # 0.15, and of every examples/GROUP/NAME/README.md with one, 0.16) and
-# tests/own-try/run.sh (the own pass's try: lines run, 0.17). POSIX sh and awk only, so it runs the same on macOS and Linux.
+# tests/own-try/run.sh (the own pass's try: lines run, 0.17) and
+# tests/lsp/run.sh (`tachyonc lsp`'s sessions, 0.24). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-d FORMAT] [FILTER]
 #
@@ -659,6 +660,10 @@ esac
 case own-try in
     *"$FILTER"*) "$ROOT/tests/own-try/run.sh" -c "$COMPILER" >"$WORK/own-try.out" 2>&1 & ;;
 esac
+# (0.24) The language server's sessions (tests/lsp/run.sh): category "lsp".
+case lsp in
+    *"$FILTER"*) "$ROOT/tests/lsp/run.sh" -c "$COMPILER" >"$WORK/lsp.out" 2>&1 & ;;
+esac
 # (0.18.1) The agent hooks' cases (tools/agent-hooks/test-*.py, Python;
 # skipped without python3): category "hooks".
 case hooks in
@@ -744,6 +749,24 @@ case query in
             count=$((count + 1))
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/query.out" >>"$FAILURES"
+        ;;
+esac
+
+# `tachyonc lsp` (0.24): tests/lsp/run.sh (run above), its sessions and
+# its check on the compiler's own source; category "lsp".
+case lsp in
+    *"$FILTER"*)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "lsp pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "lsp fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/lsp.out"
+        if ! grep -q '^pass' "$WORK/lsp.out"; then
+            echo "lsp fail" >>"$TALLY"
+            count=$((count + 1))
+        fi
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/lsp.out" >>"$FAILURES"
         ;;
 esac
 

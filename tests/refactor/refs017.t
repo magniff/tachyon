@@ -4,7 +4,7 @@
 ## `&$v` of an argument `&v` is `&v`, not `&(&v)`; refactor field --type
 ## with --default rewrites each literal's value.
 $ refactor signature add --type v '&mut Vec<i64>'
-changed parameter v to &mut Vec<i64> in crate::add, 1 argument in 2 calls	main.tach	+2 -2 lines
+changed parameter v to &mut Vec<i64> in crate::add	main.tach	+1 -1 lines
 % cat main.tach
 struct Lexer { src: Buf, pos: i64 }
 
@@ -30,7 +30,7 @@ struct Bag { items: Vec<i64> }
 
 fn main(gpa: Gpa) {
     let mut v: Vec<i64> = Vec::new_in(gpa);
-    add(&mut v, 1);
+    add(&v, 1);
     add(&mut v, 2);
     let n = total(v);
     let bag = Bag { items: Vec::new_in(gpa) };
@@ -53,7 +53,7 @@ $ query diff
 +fn fill(s: &mut [i64]) {
 @@ -31 +31 @@
 -    fill(a[..]);
-+    fill(&mut a[..]);
++    fill(&a[..]);
 $ refactor field Lexer --type src '[u8]' --default '$src.as_slice()' --dry-run
 --- a/main.tach
 +++ b/main.tach
@@ -71,7 +71,7 @@ undid changed parameter s to &mut [i64] in crate::fill, 1 argument in 1 call	mai
 $ undo
 undid changed parameter v to &Vec<i64> in crate::total, 2 arguments in 2 calls	main.tach	+3 -3 lines
 $ undo
-undid changed parameter v to &mut Vec<i64> in crate::add, 1 argument in 2 calls	main.tach	+2 -2 lines
+undid changed parameter v to &mut Vec<i64> in crate::add	main.tach	+1 -1 lines
 $ refactor signature add --type v '&mut Vec<i64>' --default '&mut $v' --dry-run
 --- a/main.tach
 +++ b/main.tach
