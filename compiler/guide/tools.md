@@ -41,12 +41,12 @@ and its callers (instead of `show`, then `def`, then `refs`):
 ```text
 $ tachyonc query context parse_item
 // crate::parse_item  main.tach:5-9  effects: panic
-fn parse_item(sc: &mut Scanner) -> Option<Item> {
+fn parse_item(sc: inout Scanner) -> Option<Item> {
     let name = sc.next_token()?;
     ...
 }
 // calls (3)
-std::Scanner::next_token  <std>:2184:12  method  pub fn next_token(self: &mut Scanner) -> Option<[u8]>
+std::Scanner::next_token  <std>:2184:12  method  pub fn next_token(inout self) -> Option<[u8]>
 ...
 // types (3)
 crate::Item  main.tach:3:8  struct  struct Item { name: [u8], qty: i64 }
@@ -104,13 +104,14 @@ an edit then `check`.
 | merge conflicts | `tachyonc query conflicts --show`, then `tachyonc edit resolve FILE:LINE --ours` (`--theirs`, `--both`, `< text`) |
 | rename anything, with every use | `tachyonc refactor rename PATH NEW` |
 | rename a local or parameter | `tachyonc refactor rename FILE:LINE:COL NEW` or `refactor rename FN::x NEW` (shadowing respected) |
-| a parameter, with every call | `tachyonc refactor signature FN --add 'x: i64 = 0'` (a default; `--fill-calls`: each call gets 0; `--remove`, `--rename-param`, `--reorder`, `--type`; `--type v '&mut T'`: the calls' `&v` become `&mut v`) |
+| a parameter, with every call | `tachyonc refactor signature FN --add 'x: i64 = 0'` (a default; `--fill-calls`: each call gets 0; `--remove`, `--rename-param`, `--reorder`, `--type`; `--convention v inout`: the calls pass `&v`, `--convention v let` or `sink`: `v`) |
 | a field, with every literal | `tachyonc refactor field STRUCT --add 'g: i64 = 0'` (`--type g T --default EXPR`) |
 | a variant, with every match | `tachyonc refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match) |
 | move items to a module | `tachyonc refactor move PATH --to MODULE` (made when missing) |
 | an idiom everywhere, typed | `tachyonc rewrite 'old($a)' 'new($a)' --dry-run` |
 | imports, unused, pub, unsafe | `tachyonc fix` (`--only imports,unused,pub,unsafe`, `--dry-run`) |
-| `*T` and by-value parameters to `&T`/`&mut T`, with every call (0.17) | `tachyonc fix --values` (`--dry-run`) |
+| 0.19's spelling to 0.20's (`&T` to `T`, `&mut T` to `inout T`, `let mut` to `var`, receivers, `&mut v` to `&v`, `*r` to `r`) | `tachyonc fix --only conventions` (`--dry-run`) |
+| `*T` and by-value parameters of 0.16 code to accesses, with every call (0.17) | `tachyonc fix --values` (`--dry-run`) |
 | the errors' exact fixes (their `try: tachyonc fix --suggested`) | `tachyonc fix --suggested` (`--dry-run`, `--at FILE:LINE`) |
 
 Every edit is atomic: the edited program is checked first, and an edit

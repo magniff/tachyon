@@ -10,32 +10,32 @@ struct Stack<T> { items: Vec<T> }
 
 impl<T> Stack<T> {
     fn new(gpa: Gpa) -> Stack<T> { Stack { items: Vec::new_in(gpa) } }
-    fn push(self: &mut Stack<T>, x: T) { self.items.push(x); }
-    fn pop(self: &mut Stack<T>) -> Option<T> { self.items.pop() }
+    fn push(inout self, x: sink T) { self.items.push(x); }
+    fn pop(inout self) -> Option<T> { self.items.pop() }
 }                                          // no free: a Stack drops its Vec
 
 impl Stack<i64> {                          // methods of one instance only
-    fn sum(self: &Stack<i64>) -> i64 {
-        let mut t = 0;
+    fn sum(self) -> i64 {
+        var t = 0;
         for x in self.items.as_slice() { t += x; }
         t
     }
 }
 
 fn largest<T: Ord>(s: [T]) -> T {          // a bound: T must implement Ord
-    let mut best = s[0];
+    var best = s[0];
     for x in s { if x > best { best = x; } }
     best
 }
 
-fn swap<T, U>(p: (T, U)) -> (U, T) { (p.1, p.0) }
+fn swap<T, U>(p: sink (T, U)) -> (U, T) { (p.1, p.0) }
 
 type Pair<T> = (T, T);
 
 fn sum_pair(p: Pair<i64>) -> i64 { p.0 + p.1 }
 
 fn main(gpa: Gpa) -> i32 {
-    let mut s: Stack<i64> = Stack::new(gpa);
+    var s: Stack<i64> = Stack::new(gpa);
     s.push(4);
     s.push(9);
     std::print_int(s.sum());
@@ -68,6 +68,10 @@ fn main(gpa: Gpa) -> i32 {
   every `T` that has `>`. An error inside an instance is reported with
   `note: in instantiation of 'f<P>' at ...`. With a bound, only the
   bound's functions may be called on `T`'s values.
+- A parameter's convention holds for every instance, and its cost is
+  the instance's: `x: T` (let) is a copy where `T` is plain and a
+  borrow where it is owned; `x: sink T` moves an owned `T`. A function
+  that keeps or returns its argument (`push`, `swap`) takes it `sink`.
 - `size_of(T)` and `align_of(T)` work on type parameters.
 - Not there: const generics (`[T; N]` with `N` a parameter), generic
   traits (`trait Conv<T>`), `where` clauses, variadic generics.

@@ -54,14 +54,14 @@ to stderr: 42-43
 ```
 
 ```tach
-fn next(c: &mut i64) -> i64 {
-    *c += 1;
-    *c
+fn next(c: inout i64) -> i64 {
+    c += 1;
+    c
 }
 
 fn main() -> i32 {
-    let mut c = 0;
-    let line = f"{next(&mut c)} {next(&mut c)}";     // evaluated here: 1, then 2
+    var c = 0;
+    let line = f"{next(&c)} {next(&c)}";             // evaluated here: 1, then 2
     c = 100;
     println(line);
     println(line);
@@ -93,7 +93,7 @@ without a Fmt:
 | `parse_f64(s) -> Result<f64, ParseFloatError>`, `parse_f32` | Rust's `f64::from_str`: `-1.5e3`, `.5`, `inf`, `NaN`; no spaces; correctly rounded |
 | `parse_i64_radix(s, 16) -> Result<i64, ParseIntError>`, `parse_u64_radix` | Rust's `from_str_radix` (radix 2 to 36) |
 | `write_f64(v, FloatFmt::Debug, out) -> i64`, `write_f32` | the text into `out` (`FLOAT_TEXT_MAX` bytes always fit): its length |
-| `fmt_u64(v, &mut out) -> i64`, `fmt_i64` | the digits at the end of a `[u8; 20]`: where they start |
+| `fmt_u64(v, &out) -> i64`, `fmt_i64` | the digits at the end of a `[u8; 20]`: where they start |
 | `f64_to_bits(v)`, `f64_from_bits(u)`, `f32_...` | the IEEE bits (Rust's `to_bits`) |
 
 ```tach
@@ -102,7 +102,7 @@ use std::num::{FloatFmt, parse_f64, parse_i64_radix, write_f64};
 fn main() -> i32 {
     let x = parse_f64("0.1").unwrap() + parse_f64("2e-1").unwrap();
     println(f"{x} {x:?} {x:e} {1e16:?} {1e-7} {0.1f32}");
-    let mut out: [u8; 32] = [0; 32];
+    var out: [u8; 32] = [0; 32];
     let n = write_f64(1234.5, FloatFmt::LowerExp, out[..]);
     println(out[0..n]);
     println(f"{parse_i64_radix("-ff", 16):?} {parse_f64("1,5").is_err()}");
@@ -118,15 +118,15 @@ Ok(-255) true
 ## Display and Debug
 
 ```text
-trait Display { fn fmt(self: &Self, f: &mut Fmt); }
-trait Debug { fn fmt_debug(self: &Self, f: &mut Fmt); }
+trait Display { fn fmt(self, f: inout Fmt); }
+trait Debug { fn fmt_debug(self, f: inout Fmt); }
 ```
 
 Write `impl Display for T` (no derive: the text is yours) with the
 methods of `std::Fmt`: `f.str(s)` (a `[u8]`), `f.byte(b)`, `f.write(x)`
-(any Display value, an f-string too), `f.display(&x)`, `f.debug(&x)`.
-Not Rust's `fn fmt(&self, f: &mut Formatter) -> fmt::Result`: there is
-no result to return. Display is in std for the numbers, `[u8]` and the
+(any Display value, an f-string too), `f.display(x)`, `f.debug(x)`.
+`self` is read (let), `f` is changed (inout); there is no result to
+return. Display is in std for the numbers, `[u8]` and the
 error enums; Debug for those (a `[u8]` quoted and
 escaped: `"a\n"`), `Vec<T>`, `Option`, `Result` and `HashMap` (`[1, 2]`,
 `Some(5)`, `{1: 2}`). A slice `[T]` has no Debug (it would clash with
@@ -140,19 +140,19 @@ struct Point { x: i64, y: i64 }
 enum Shape { Circle(i64), Rect(Point, Point), Line { from: Point, len: i64 }, Empty }
 
 impl Display for Point {
-    fn fmt(self: &Point, f: &mut Fmt) {
+    fn fmt(self, f: inout Fmt) {
         f.write(f"({self.x}, {self.y})");
     }
 }
 
 fn main(gpa: Gpa) -> i32 {
     let p = Point { x: 1, y: 2 };
-    let mut q = p.clone();
+    var q = p.clone();
     q.x = 5;
     println(f"{p} {q:?}");
     let shapes = [Shape::Circle(3), Shape::Rect(p, q), Shape::Line { from: p, len: 4 }, Shape::Empty];
     for s in shapes { println(f"{s:?}"); }
-    let mut v: Vec<i64> = Vec::new_in(gpa);
+    var v: Vec<i64> = Vec::new_in(gpa);
     v.push(1);
     v.push(2);
     println(f"{v:?} {v.last():?} {"hi":?}");
@@ -193,9 +193,9 @@ tuples of them) is a copy. `Clone` is in std for `Vec` (deep), `Buf`,
 struct Key { group: i64, id: i64 }
 
 fn main(gpa: Gpa) -> i32 {
-    let mut keys = [Key { group: 2, id: 1 }, Key { group: 1, id: 9 }, Key { group: 1, id: 3 }];
-    sort(&mut keys[..]);                     // by group, then id
-    let mut m: HashMap<Key, i64> = HashMap::new_in(gpa);
+    var keys = [Key { group: 2, id: 1 }, Key { group: 1, id: 9 }, Key { group: 1, id: 3 }];
+    sort(&keys[..]);                         // by group, then id
+    var m: HashMap<Key, i64> = HashMap::new_in(gpa);
     for k in keys { m.insert(k, k.id * 10); }
     let wanted = Key { group: 2, id: 1 };
     println(f"{keys[0]:?} {m.get(wanted):?}");
