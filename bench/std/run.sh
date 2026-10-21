@@ -8,6 +8,9 @@
 # cc -O2), checks the checksums agree, runs each RUNS times (the fastest
 # wall-clock time, whole program) and prints a row per comparison:
 # tachyon's time, the baseline's, their ratio and the target.
+# (0.20) A benchmark whose NAME.tach has a line `// bench-std: data` reads
+# a file: `NAME.t --make FILE` makes it once (untimed), and every program
+# then runs with FILE as its last argument (a `rust:ARG` row: ARG FILE).
 #
 # usage: bench/std/run.sh [-c COMPILER] [-r RUNS] [--gate] [NAME...]
 #
@@ -50,11 +53,14 @@ trap 'exit 130' INT TERM
 : >"$WORK/empty"
 
 failed=0
-# The fastest of RUNS runs of program $1 (its argument $2, if any), in
-# ms; its output in $WORK/$3.out.
+# The fastest of RUNS runs of program $1 (its arguments $2, if any: one,
+# or two separated by a space), in ms; its output in $WORK/$3.out.
 measure() {
     if [ -n "$2" ]; then
-        printf '#!/bin/sh\nexec "%s" "%s"\n' "$1" "$2" >"$WORK/$3.sh"
+        # shellcheck disable=SC2086
+        printf '#!/bin/sh\nexec "%s"' "$1" >"$WORK/$3.sh"
+        for a in $2; do printf ' "%s"' "$a" >>"$WORK/$3.sh"; done
+        printf '\n' >>"$WORK/$3.sh"
         chmod +x "$WORK/$3.sh"
         "$WORK/timer" "$RUNS" "$WORK/empty" "$WORK/$3.out" "$WORK/$3.sh"
     else
@@ -84,12 +90,18 @@ for name in $NAMES; do
             -o "$WORK/$name.r") >"$WORK/$name.r.log" 2>&1 \
             || { echo "FAIL $name: rustc: $(tail -3 "$WORK/$name.r.log")"; failed=1; continue; }
     fi
-    t=$(measure "$WORK/$name.t" "" "$name.t")
+    data=""
+    if grep -q '^// bench-std: data' "$src.tach"; then
+        data="$WORK/$name.data"
+        "$WORK/$name.t" --make "$data" >"$WORK/$name.make.log" 2>&1 \
+            || { echo "FAIL $name: --make: $(tail -3 "$WORK/$name.make.log")"; failed=1; continue; }
+    fi
+    t=$(measure "$WORK/$name.t" "$data" "$name.t")
     grep -v '^#' "$HERE/targets.txt" | awk -v n="$name" '$1 == n' | while read -r _ base target flag; do
         case "$base" in
-            c) prog="$WORK/$name.c"; arg="" ;;
-            rust) [ $HAVE_RUST = 1 ] || continue; prog="$WORK/$name.r"; arg="" ;;
-            rust:*) [ $HAVE_RUST = 1 ] || continue; prog="$WORK/$name.r"; arg=${base#rust:} ;;
+            c) prog="$WORK/$name.c"; arg="$data" ;;
+            rust) [ $HAVE_RUST = 1 ] || continue; prog="$WORK/$name.r"; arg="$data" ;;
+            rust:*) [ $HAVE_RUST = 1 ] || continue; prog="$WORK/$name.r"; arg="${base#rust:} $data" ;;
         esac
         key=$(echo "$name.$base" | tr ':' '_')
         b=$(measure "$prog" "$arg" "$key")
@@ -109,6 +121,7 @@ for name in $NAMES; do
         fi
         printf '%-14s %-10s %10s %10s %7s %7s  %s\n' "$name" "$base" "$t" "$b" "$ratio" "$target" "$result"
     done
+    [ -z "$data" ] || rm -f "$data"
 done
 [ -f "$WORK/failed" ] && failed=1
 [ $GATE = 1 ] && [ $failed = 1 ] && exit 1
