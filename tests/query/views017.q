@@ -117,8 +117,8 @@ Vec<Cmd>::push	views()
 Vec<Arg>::push	views()
 Vec<Adapter, ScopedArena>::push	views() stores(x) declared
 Vec<(i64, u32)>::push	views()
-Vec<str>::push	views()
-Vec<Path>::push	views()
+Vec<str>::push	views() stores(x) declared
+Vec<Path>::push	views() stores(x) declared
 Vec<Result<DirEntry, Error>>::push	views()
 Vec<Slot>::push	views()
 $ views crate --why

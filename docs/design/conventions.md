@@ -1709,3 +1709,27 @@ patterns in tests/std/own.allowed).
 - tests/std/own.allowed's eight patterns: fmt's rooms as `inout [u8]`
   results, `-> let T` results in the own pass (T3), the sort closures'
   summaries.
+
+### 0.24 (branch c24-fixes)
+
+Done: let is a borrow (conv::let_by_ref: a copyable let parameter with
+storage is passed by reference when the result may hold a view;
+`DirEntry::file_name(self)` again); distinct types (`str`, `Path`) are
+views to the own pass; `gl(make())`; own.move_out through a let access
+offers `.clone()` and `sink`, not `std::take(&self)`; a field moved out of
+a temporary (`let x = make().v;`) moves out of the value (it was read
+through the temporary's address and freed again with it), own.partial for
+a type with Drop.
+
+Left, for after 0.25 (soundness first):
+- **Items of borrowing iterators are bitwise copies typed as owned
+  values** (`Vec::iter`, `HashMap::iter`, `keys`, `values`: `SliceIter`'s
+  and `HashMapIter`'s `next` return `T`): `w.iter().collect_in(gpa)` of a
+  `Vec<Vec<i64>>` frees each element twice. The fix is items that are
+  views of non-copyable elements (`let T`), which needs `-> let T` results
+  and `let T` type arguments in the own pass (T3).
+- Until then a closure's by-value parameter is not dropped (a leak, the
+  safe default): dropping it would free those copies, the map's elements,
+  in `m.iter().fold(..)` and `map`.
+- A value given to a generic let parameter after an impure argument is
+  not made a temporary ("this value has no place").

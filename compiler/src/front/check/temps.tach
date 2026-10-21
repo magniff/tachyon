@@ -166,16 +166,19 @@ fn hoist(amp: i64) {
 // (`let NAME = x?;` before it), whatever the parameter takes: a let
 // parameter borrows the temporary for the call, where the value `?` made
 // was a binding of its desugaring's block, dropped before the call; a sink
-// one moves it, a copy copies it. Not after an impure expression (the
-// order of evaluation stays).
+// one moves it, a copy copies it. (0.24) So does a value given to a
+// generic function's let parameter (`gl(make())`, let_temporaries: its
+// instance may borrow it). Not after an impure expression (the order of
+// evaluation stays).
 fn visit_arg(a: i64) {
     unsafe {
-        if NODES[a].kind != NodeKind::Try || IMPURE {
+        let generic_let = NODES[a].kind != NodeKind::Try && gen_let_arg(a);
+        if NODES[a].kind != NodeKind::Try && !generic_let || IMPURE {
             visit(a);
             return;
         }
         let before = IMPURE;
-        visit(NODES[a].a);
+        visit(if generic_let { a } else { NODES[a].a });
         IMPURE = before;
         let start = NODES[a].start;
         let end = NODES[a].end;
@@ -195,6 +198,21 @@ fn visit_arg(a: i64) {
         NODES[a].count = 0;
         NODES[a].list = 0;
         NODES[a].p = NODE_TEMP;
+    }
+}
+
+// (0.24) The arguments let_temporaries found given to a generic
+// function's let parameters (their nodes).
+static var GEN_LET: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn gen_let_arg(a: i64) -> bool {
+    unsafe {
+        for i in 0..GEN_LET.count {
+            if GEN_LET.data[i] == a {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -288,7 +306,8 @@ fn visit(e: i64) {
         } else if k == NodeKind::Unary || k == NodeKind::Return {
             visit(if k == NodeKind::Unary { NODES[e].b } else { NODES[e].a });
         } else if k == NodeKind::Cast || k == NodeKind::FieldAccess || k == NodeKind::TupleField
-            || k == NodeKind::Try {
+            || k == NodeKind::Try || k == NodeKind::Index {
+            // (0.24: an Index's base, `f([1, 2])[0]`, first)
             visit(NODES[e].a);
         } else if k == NodeKind::Tuple || k == NodeKind::Array {
             for i in 0..NODES[e].count {
@@ -366,6 +385,24 @@ fn let_temporaries(e: i64) {
         }
         let f = SYM_FN[key] - 1;
         if FNS[f].generic > 0 {
+            // (0.24: its instance decides whether a let parameter borrows:
+            // a value given to one becomes a temporary as it is, visit_arg)
+            // (the template's signature is not resolved: its Param nodes)
+            let item = FNS[f].node;
+            let m = if NODES[e].count < NODES[item].count { NODES[e].count }
+                else { NODES[item].count };
+            for i in 0..m {
+                let arg = child(e, i);
+                let p = child(item, i);
+                // (a call's or a literal struct's value: a number, an operation
+                // or a cast is a copy)
+                let k = NODES[arg].kind;
+                if (k == NodeKind::Call || k == NodeKind::MethodCall || k == NodeKind::StructLit)
+                    && NODES[p].kind == NodeKind::Param
+                    && crate::front::conv::param_conv(p) == crate::front::conv::CONV_LET {
+                    GEN_LET.push(arg);
+                }
+            }
             return;
         }
         let n = if NODES[e].count < FNS[f].param_count { NODES[e].count }

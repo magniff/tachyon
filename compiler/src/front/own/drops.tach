@@ -559,6 +559,14 @@ pub fn borrowed_call(e: i64) -> bool {
             return TYPES[p0].kind == TyKind::Slice && TYPES[p0].b != REF_MUT
                 || TYPES[p0].kind == TyKind::Ptr && TYPES[p0].b == REF_SHARED;
         }
+        // (0.24: a borrowing iterator's items, copies of elements its
+        // container keeps, moves::copies_owned_items: in std's adapters,
+        // `count`, `filter`, an item looked at and passed over is not dropped)
+        if (name == "next" || name == "at" || name == "find" || name == "last" || name == "nth")
+            && TYPES[p0].kind == TyKind::Ptr
+            && crate::front::own::moves::copies_owned_items(TYPES[p0].a, 0) {
+            return true;
+        }
         if name == "unwrap" || name == "expect" || name == "unwrap_or" {
             return borrowed_call(crate::front::contracts::desugar::requires_arg(child(e, 0)));
         }
@@ -579,6 +587,22 @@ fn mark_byref(p: i64, at: i64) {
             }
         }
         SCRATCH.count = mark;
+    }
+}
+
+// (0.24, with moves::iter_item_copy) The parameter (its index) of the
+// closure being checked as the argument of `map`, `for_each`,
+// `filter_map` or `fold` on a borrowing iterator's chain that gets its
+// items, which are copies of the container's elements: borrowed (BYREF:
+// not dropped, and moving it is own.move_out); -1: none.
+pub static var ITEM_BORROW: i64 = -1;
+
+// Closure parameter local l (node p) borrows the item it is given.
+pub fn item_borrowed(l: i64, at: i64) {
+    unsafe {
+        if l >= 0 && is_owned_type(LOCALS[l].ty) {
+            BYREF.put(l + 1, at + 1);
+        }
     }
 }
 
@@ -1372,6 +1396,9 @@ static var SYM_TDROP: i64 = 0;
 // The statements made for the unit being visited (its prelude).
 static var PRELUDE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
+// (0.24) Whether the expression visit_temps is visiting is borrowed by its parent (`&e`).
+static var TEMP_BORROW: bool = false;
+
 // Whether pattern p binds local l.
 fn binds(p: i64, l: i64) -> bool {
     unsafe {
@@ -1606,7 +1633,10 @@ fn visit_temps(e: i64) {
             return;
         }
         if k == NodeKind::Unary {
+            // (`&make().v`: the field is borrowed, not moved)
+            TEMP_BORROW = NODES[e].op == Tok::Amp;
             visit_temps(NODES[e].b);
+            TEMP_BORROW = false;
             if NODES[e].op == Tok::Amp && is_temp(NODES[e].b) {
                 // (`&value`: a receiver, a let argument; the block gives
                 // the address, as `&` did)
@@ -1618,8 +1648,15 @@ fn visit_temps(e: i64) {
             return;
         }
         if k == NodeKind::FieldAccess {
+            let borrowed = TEMP_BORROW;
+            TEMP_BORROW = borrowed && NODES[NODES[e].a].kind == NodeKind::FieldAccess;
             visit_temps(NODES[e].a);
-            if NODES[e].y != 1 && is_temp(NODES[e].a) {
+            TEMP_BORROW = false;
+            // (0.24: an owned field moved out, `let x = make().v;`, is not
+            // read through the temporary's address, which would drop it
+            // again with the temporary: it moves out of the value, own.partial
+            // when its type implements Drop)
+            if NODES[e].y != 1 && is_temp(NODES[e].a) && (borrowed || !is_owned_type(NODES[e].ty)) {
                 // (`make().id`: read through the address)
                 NODES[e].a = temp_ptr(NODES[e].a);
                 NODES[e].y = 1;
