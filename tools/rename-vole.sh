@@ -10,7 +10,8 @@
 #   3. the sources' strings and comments: tachyonc to volec, tachyon to
 #      vole (any case: TACHYON_ROOT is VOLE_ROOT, _tachyon. is _vole.),
 #      .tach to .vl in string literals (rewrite --text --strings
-#      --comments, the compiler checked: --check);
+#      --comments, the compiler checked: --check); the code of the tests,
+#      examples, benchmarks and tools (the extern names C files share);
 #   4. every other file (md, sh, py, toml, json, yml, transcripts): the
 #      same words (rewrite --text --no-sources), [head]'s interface first,
 #      paths with the name moved (--move-paths);
@@ -125,6 +126,14 @@ run rewrite --text tachyon vole --word --case --strings --comments --move-paths 
     --exclude-from "$KEEP" $GEN --check "$MAIN" $DRY
 # shellcheck disable=SC2086
 run rewrite --text .tach .vl --word --strings --exclude-from "$KEEP" $GEN --check "$MAIN" $DRY
+# (the code of the tests, examples, benchmarks and tools: extern names
+# their C files share, `tachyon_take_a64`, which step 4 renames there;
+# compiler/src has none, step 2)
+for w in tachyonc:volec tachyon:vole; do
+    # shellcheck disable=SC2086
+    run rewrite --text "${w%%:*}" "${w##*:}" --word --case --code --files 'tests/*' --files 'examples/*' \
+        --files 'bench/*' --files 'tools/*' --exclude-from "$KEEP" $DRY
+done
 
 step "4. every other file"
 # ([head]'s interface: tachyonc-0.10's, named volec-0.24)
@@ -147,8 +156,10 @@ sh compiler/guide/embed.sh || { echo "rename-vole: compiler/guide/embed.sh faile
 step "6. the renamed compiler"
 "$C" compiler/src/main.vl -o target/volec || { echo "rename-vole: the renamed compiler does not build" >&2; exit 1; }
 target/volec check compiler/src/main.vl || { echo "rename-vole: volec's check of itself fails" >&2; exit 1; }
-target/volec compiler/src/main.vl -o "$OUT/volec2" && cmp -s target/volec "$OUT/volec2" \
-    || echo "rename-vole: warning: volec built by itself differs from volec (the fixpoint is the bootstrap's to check)" >&2
+# (the fixpoint: built by itself, then by that, the same object)
+target/volec compiler/src/main.vl -o "$OUT/volec2.o" && cc -o "$OUT/volec2" "$OUT/volec2.o" -lm \
+    && "$OUT/volec2" compiler/src/main.vl -o "$OUT/volec3.o" && cmp -s "$OUT/volec2.o" "$OUT/volec3.o" \
+    || { echo "rename-vole: volec reaches no fixpoint (built by itself twice, the objects differ)" >&2; exit 1; }
 if [ $REGEN -eq 1 ]; then
     sh tests/refactor/run.sh -c target/volec -u >"$OUT/regen-refactor.log" 2>&1
     sh tests/query/run.sh -c target/volec -u >"$OUT/regen-query.log" 2>&1
