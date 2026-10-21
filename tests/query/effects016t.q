@@ -15,8 +15,8 @@ crate::main	alloc(Gpa) io global panic unsafe
 $ effects grow --why alloc syntax016/main.tach
 crate::grow	alloc(Gpa) panic
   'v.push(1)' at syntax016/main.tach:39:5 grows a Vec<i64>
-  'self.reserve_more(1)' at <std>:276:37 grows a Vec<i64>
-  'self.alloc.try_resize(self.ptr as *u8, self...' at <std>:222:13 allocates from Gpa (an Allocator method)
+  'self.reserve_more(1)' at <std>:277:37 grows a Vec<i64>
+  'self.alloc.try_resize(self.ptr as *u8, self...' at <std>:223:13 allocates from Gpa (an Allocator method)
 $ effects grow --why 'alloc(Arena)' syntax016/main.tach
 crate::grow	alloc(Gpa) panic
   (not: alloc(Arena))

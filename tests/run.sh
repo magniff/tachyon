@@ -673,14 +673,17 @@ case arch-enc in
     *"$FILTER"*)
         "$ROOT/tests/arch/enc.sh" -c "$COMPILER" -o "$WORK/arch-enc" >"$WORK/arch-enc.out" 2>&1 & ;;
 esac
-# The terminal's renderer (0.23): macOS hosts,
+# The window library and the terminal's renderer (0.23): macOS hosts,
 # for the host's own target only.
 case "$TARGET" in
     aarch64-macos)
         case voltty_render in
             *"$FILTER"*) "$ROOT/tests/voltty-render/run.sh" -c "$COMPILER" >"$WORK/voltty_render.out" 2>&1 & ;;
+        esac
+        case window in
+            *"$FILTER"*) "$ROOT/tests/window/run.sh" -c "$COMPILER" >"$WORK/window.out" 2>&1 & ;;
         esac ;;
-    *) : >"$WORK/voltty_render.out" ;;
+    *) : >"$WORK/voltty_render.out"; : >"$WORK/window.out" ;;
 esac
 
 # The slots: JOBS of them in a FIFO of our own, or the shared ones of
@@ -941,6 +944,28 @@ case "$TARGET" in
                     count=$((count + 1))
                 fi
                 awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/voltty_render.out" >>"$FAILURES"
+                ;;
+        esac ;;
+esac
+
+# The window library (0.23): tests/window/run.sh (run above, on
+# aarch64-macos), Cocoa windows and events (with a display); category
+# "window".
+case "$TARGET" in
+    aarch64-macos)
+        case window in
+            *"$FILTER"*)
+                while read -r status _; do
+                    case "$status" in
+                        pass) echo "window pass" >>"$TALLY"; count=$((count + 1)) ;;
+                        FAIL) echo "window fail" >>"$TALLY"; count=$((count + 1)) ;;
+                    esac
+                done <"$WORK/window.out"
+                if ! grep -q '^pass' "$WORK/window.out"; then
+                    echo "window fail" >>"$TALLY"
+                    count=$((count + 1))
+                fi
+                awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/window.out" >>"$FAILURES"
                 ;;
         esac ;;
 esac

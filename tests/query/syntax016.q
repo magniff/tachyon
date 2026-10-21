@@ -3,7 +3,7 @@
 ## minimal `query effects`.
 $ items
 crate	syntax016/main.tach	10
-std	<std>	562
+std	<std>	564
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	37
@@ -34,6 +34,10 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
+std::window	<std>	49
+std::window::cocoa	<std>	115
+std::window::keys	<std>	27
+std::window::objc	<std>	88
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6
@@ -64,4 +68,4 @@ apply<closure(i64) -> i64 at syntax016/main.tach:47:32>	none
 crate::grow	alloc(Gpa) panic
 crate::main	alloc(Gpa) io global panic unsafe
 $ def Vec::new_in
-std::Vec::new_in	../../compiler/std/std.tach:183:12	method	pub fn new_in(a: A) -> Vec<T, A>
+std::Vec::new_in	../../compiler/std/std.tach:184:12	method	pub fn new_in(a: A) -> Vec<T, A>

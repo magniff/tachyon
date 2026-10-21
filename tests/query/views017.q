@@ -13,6 +13,9 @@ Vec<u64>::get	views()
 Vec<Vec<u64>>::get	views()
 Vec<Tok>::as_slice	views(self) declared
 Vec<u64>::as_slice	views(self) declared
+Vec<Watch>::as_slice	views(self) declared
+Vec<State>::as_slice	views(self) declared
+Vec<Event>::as_slice	views(self) declared
 Vec<u8>::as_slice	views(self) declared
 Vec<Vec<u64>>::as_slice	views(self) declared
 Vec<[u8]>::push	views() stores(x) declared
@@ -20,6 +23,9 @@ Vec<Tok>::push	views() stores(x) declared
 Vec<u8>::push	views()
 Vec<u64>::push	views()
 Vec<Vec<u64>>::push	views()
+Vec<Event>::push	views()
+Vec<State>::push	views()
+Vec<Watch>::push	views()
 Vec<i64>::push	views()
 Vec<u32>::push	views()
 $ views crate --why

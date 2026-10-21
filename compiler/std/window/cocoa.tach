@@ -1,0 +1,1221 @@
+// The Cocoa backend (terminal.md §2.3, task W1): NSApplication without a
+// bundle or a nib, a runtime NSView subclass with a CAMetalLayer, events
+// drained with nextEventMatchingMask and sendEvent, NSTextInputClient for
+// input methods, CADisplayLink frames, CFFileDescriptor watches.
+//
+// Its message calls go through objc.tach's hand-typed shapes, each with
+// the selector's documented C types, and every one is listed in
+// tables/appkit.objc and tables/quartzcore.objc, which objcgen --check
+// verifies against the runtime; when std::objc lands they are generated
+// from those tables instead.
+//
+// Pitfalls of running AppKit from a plain executable, and what is done
+// about each:
+// - No bundle: the process starts as a background app with no Dock icon
+//   and no menu bar. `setActivationPolicy: Regular` makes it a regular
+//   app; `finishLaunching` must be called since `[NSApp run]` is not;
+//   then `activateIgnoringOtherApps:` (again after the first window is
+//   shown, or a terminal that launched it keeps the focus).
+// - No nib: the menu bar is built by hand (an app menu with Quit, which
+//   targets our own object, so Command-Q is an Event::Quit, not exit()).
+// - No [NSApp run]: events are pulled with
+//   nextEventMatchingMask:untilDate:inMode:dequeue: and dispatched with
+//   sendEvent:, each batch inside an autorelease pool. Run-loop sources
+//   (the display link, watched fds) fire inside nextEventMatchingMask
+//   without an NSEvent, so it would not return: they post an
+//   application-defined NSEvent to wake it, which is dropped.
+// - Key input goes through interpretKeyEvents:, which needs the view to
+//   be the first responder and to implement NSTextInputClient, including
+//   doCommandBySelector: (without it, every Return or arrow beeps).
+// - Command-key releases: NSApplication does not send keyUp: for a key
+//   pressed with Command (a known AppKit quirk); such releases are not
+//   reported.
+// - Live resize runs AppKit's own loop: windowDidResize: calls the one
+//   hook (App::on_live_resize) so the application can draw during the
+//   drag.
+// - Mouse moves need setAcceptsMouseMovedEvents: and a tracking area
+//   (enter and leave too).
+// - The display link (NSView.displayLinkWithTarget:selector:, macOS 14)
+//   runs on the main run loop in common modes: no thread, so no callback
+//   arrives off the main thread before 0.21 (gpu.md §2.11).
+// - A headless session (ssh, no window server) makes NSApplication abort
+//   the process: CGSessionCopyCurrentDictionary is asked first, and
+//   App::new_in returns Err(NoDisplay).
+
+// ---- The Cocoa backend (0.23) ----
+
+use keys::{
+    first_char, mac_keycode, mac_logical, mac_modifier_down, mac_mods, utf16_to_byte, utf8_cut,
+};
+use objc::{
+    NOT_FOUND, Point, Range, Rect, class, class_addIvar, class_addProtocol,
+    class_getInstanceVariable, ivar_getOffset, method_types, msg_b, msg_b_i, msg_b_p, msg_b_pp,
+    msg_d, msg_h, msg_i, msg_p, msg_p_d, msg_p_p, msg_p_pp, msg_p_ppp, msg_p_r, msg_p_rupp,
+    msg_p_ruub, msg_p_u, msg_p_uppb, msg_p_utudipsii, msg_r, msg_r_r, msg_r_rp, msg_t, msg_t_tp,
+    msg_u, msg_v, msg_v_b, msg_v_d, msg_v_p, msg_v_pb, msg_v_pp, msg_v_rp, msg_v_u, msg_v_z,
+    nsstring, nsstring_bytes, objc_allocateClassPair, objc_getProtocol, objc_registerClassPair,
+    pool_pop, pool_push, release, retain, sel,
+};
+use objc::Size as NsSize;
+use super::{
+    Button, CursorIcon, Error, Event, Key, Mouse, MouseAction, Preedit, Scroll, Size, Text, Window,
+    WindowDesc, WindowId,
+};
+
+extern "C" {
+    static NSDefaultRunLoopMode: *u8;
+    static NSRunLoopCommonModes: *u8;
+    static NSPasteboardTypeString: *u8;
+    static kCFRunLoopDefaultMode: *u8;
+    fn CGSessionCopyCurrentDictionary() -> *u8;
+    fn CFRelease(o: *u8);
+    fn CFRunLoopGetMain() -> *u8;
+    fn CFRunLoopAddSource(rl: *u8, src: *u8, mode: *u8);
+    fn CFRunLoopRemoveSource(rl: *u8, src: *u8, mode: *u8);
+
+    fn CFFileDescriptorCreate(alloc: *u8, fd: i32, close_on_invalidate: bool,
+        callout: extern "C" fn(*u8, u64, *u8), ctx: *FdContext) -> *u8;
+
+    fn CFFileDescriptorEnableCallBacks(f: *u8, types: u64);
+    fn CFFileDescriptorCreateRunLoopSource(alloc: *u8, f: *u8, order: i64) -> *u8;
+    fn CFFileDescriptorGetNativeDescriptor(f: *u8) -> i32;
+    fn CFFileDescriptorInvalidate(f: *u8);
+
+    // class_addMethod, once per IMP shape (an `extern "C" fn` type does
+    // not cast to another, so each shape has its own declaration).
+    #[link_name = "class_addMethod"]
+    fn add_v(c: *u8, s: *u8, imp: extern "C" fn(*u8, *u8), t: *u8) -> bool;
+    #[link_name = "class_addMethod"]
+    fn add_v_p(c: *u8, s: *u8, imp: extern "C" fn(*u8, *u8, *u8), t: *u8) -> bool;
+    #[link_name = "class_addMethod"]
+    fn add_b(c: *u8, s: *u8, imp: extern "C" fn(*u8, *u8) -> bool, t: *u8) -> bool;
+    #[link_name = "class_addMethod"]
+    fn add_b_p(c: *u8, s: *u8, imp: extern "C" fn(*u8, *u8, *u8) -> bool, t: *u8) -> bool;
+    #[link_name = "class_addMethod"]
+    fn add_g(c: *u8, s: *u8, imp: extern "C" fn(*u8, *u8) -> Range, t: *u8) -> bool;
+    #[link_name = "class_addMethod"]
+    fn add_p(c: *u8, s: *u8, imp: extern "C" fn(*u8, *u8) -> *u8, t: *u8) -> bool;
+    #[link_name = "class_addMethod"]
+    fn add_v_pg(c: *u8, s: *u8, imp: extern "C" fn(*u8, *u8, *u8, Range), t: *u8) -> bool;
+    #[link_name = "class_addMethod"]
+    fn add_v_pgg(c: *u8, s: *u8, imp: extern "C" fn(*u8, *u8, *u8, Range, Range), t: *u8) -> bool;
+    #[link_name = "class_addMethod"]
+    fn add_p_gP(c: *u8, s: *u8, imp: extern "C" fn(*u8, *u8, Range, *Range) -> *u8, t: *u8) -> bool;
+    #[link_name = "class_addMethod"]
+    fn add_r_gP(c: *u8, s: *u8, imp: extern "C" fn(*u8, *u8, Range, *Range) -> Rect, t: *u8) -> bool;
+    #[link_name = "class_addMethod"]
+    fn add_u_t(c: *u8, s: *u8, imp: extern "C" fn(*u8, *u8, Point) -> u64, t: *u8) -> bool;
+}
+
+// CFFileDescriptorContext; the callbacks we do not use are null.
+#[repr(C)]
+struct FdContext {
+    version: i64,
+    info: *u8,
+    retain: *u8,
+    release: *u8,
+    describe: *u8,
+}
+
+// NSEventType values.
+const EV_LEFT_DOWN: u64 = 1;
+const EV_LEFT_UP: u64 = 2;
+const EV_RIGHT_DOWN: u64 = 3;
+const EV_RIGHT_UP: u64 = 4;
+const EV_MOVED: u64 = 5;
+const EV_LEFT_DRAGGED: u64 = 6;
+const EV_RIGHT_DRAGGED: u64 = 7;
+const EV_APP_DEFINED: u64 = 15;
+const EV_OTHER_DOWN: u64 = 25;
+const EV_OTHER_UP: u64 = 26;
+const EV_OTHER_DRAGGED: u64 = 27;
+
+// data1 of our wake-up NSEvent.
+const WAKE: i64 = 0x74616368;
+
+// The view's instance variable "tachyon": the window id, the cursor
+// shape, the input method area (physical pixels).
+struct ViewData {
+    id: i64,
+    cursor: i64,
+    ime_x: f64,
+    ime_y: f64,
+    ime_w: f64,
+    ime_h: f64,
+}
+
+struct Watch {
+    fd: i32,
+    cf: *u8,
+    src: *u8,
+    armed: bool,
+}
+
+// What the IMPs and run-loop callbacks reach: one per process (AppKit
+// has one NSApp), on the heap, pointed to by ST while the App lives.
+struct State {
+    q: Vec<Event>,
+    head: i64,
+    // The current composition, and whether there is one.
+    preedit: Buf,
+    marked: bool,
+    // Text produced while a keyDown: is interpreted, sent after its Key.
+    in_key: bool,
+    key_text: Buf,
+    // Inside nextEventMatchingMask (a callback must wake it), and
+    // whether a wake-up is already posted.
+    waiting: bool,
+    wake_posted: bool,
+    // The live-resize hook, and whether it is running.
+    hook: Option<fn(*u8)>,
+    hook_ctx: *u8,
+    in_hook: bool,
+    watches: Vec<Watch>,
+    app: *u8,
+    delegate: *u8,
+    target: *u8,
+    view_class: *u8,
+    ivar_off: i64,
+}
+
+// The State of the App (null when there is none). Statics are safe to
+// use on one thread; the pointer is dereferenced in unsafe blocks only.
+static mut ST: *State = 0 as *State;
+
+pub struct Cocoa {
+    // The State's storage (one element: its address is stable).
+    st: Vec<State>,
+}
+
+// SAFETY (for every `unsafe { ST... }` below): ST points to the element
+// of the App's `st` Vec from new_in until close, which nulls it; IMPs and
+// callbacks run on the main thread only, inside App calls (sendEvent:,
+// nextEventMatchingMask:, window creation and closing), so the State is
+// live whenever they run and nothing else holds a reference to it then.
+fn st_live() -> bool {
+    unsafe { ST != 0 as *State }
+}
+
+fn push(e: Event) {
+    // SAFETY: see st_live.
+    unsafe {
+        if ST == 0 as *State {
+            return;
+        }
+        ST.q.push(e);
+        if ST.waiting && !ST.wake_posted {
+            ST.wake_posted = true;
+            post_wake(ST.app);
+        }
+    }
+}
+
+// Posts an application-defined event, so nextEventMatchingMask returns.
+unsafe fn post_wake(app: *u8) {
+    let ev = msg_p_utudipsii(class(c"NSEvent"),
+        sel(c"otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:"),
+        EV_APP_DEFINED, Point { x: 0.0, y: 0.0 }, 0, 0.0, 0, 0 as *u8, 0, WAKE, 0);
+    msg_v_pb(app, sel(c"postEvent:atStart:"), ev, false);
+}
+
+// Text events for `s`, cut into pieces of at most 30 bytes at character
+// boundaries.
+fn push_text(win: WindowId, s: [u8]) {
+    let mut rest = s;
+    while rest.len > 0 {
+        let n = utf8_cut(rest, 30);
+        if n == 0 {
+            break;
+        }
+        let mut t = Text { win: win, len: n as u8, bytes: [0; 30] };
+        for i in 0..n {
+            t.bytes[i] = rest[i];
+        }
+        push(Event::Text(t));
+        rest = rest[n..rest.len];
+    }
+}
+
+// The view's data (an instance variable at a known offset).
+unsafe fn vdata(view: *u8) -> *ViewData {
+    &view[ST.ivar_off] as *ViewData
+}
+
+unsafe fn view_id(view: *u8) -> WindowId {
+    WindowId { n: vdata(view).id }
+}
+
+// The window's backing scale (2.0 on Retina).
+unsafe fn scale_of(view: *u8) -> f64 {
+    let w = msg_p(view, sel(c"window"));
+    if w == 0 as *u8 {
+        return 1.0;
+    }
+    msg_d(w, sel(c"backingScaleFactor"))
+}
+
+unsafe fn view_size(view: *u8) -> Size {
+    let b = msg_r(view, sel(c"bounds"));
+    let s = scale_of(view);
+    Size { w: (b.w * s + 0.5) as i64, h: (b.h * s + 0.5) as i64, scale: s }
+}
+
+// Sets the layer's scale and drawable size to the view's.
+unsafe fn sync_layer(view: *u8) -> Size {
+    let sz = view_size(view);
+    let layer = msg_p(view, sel(c"layer"));
+    if layer != 0 as *u8 {
+        msg_v_d(layer, sel(c"setContentsScale:"), sz.scale);
+        msg_v_z(layer, sel(c"setDrawableSize:"), NsSize { w: sz.w as f64, h: sz.h as f64 });
+    }
+    sz
+}
+
+// ---- the view's methods (IMPs) (0.23) ----
+
+extern "C" fn imp_yes(this: *u8, cmd: *u8) -> bool {
+    true
+}
+
+extern "C" fn imp_yes_p(this: *u8, cmd: *u8, a: *u8) -> bool {
+    true
+}
+
+extern "C" fn imp_key_down(this: *u8, cmd: *u8, ev: *u8) {
+    if !st_live() {
+        return;
+    }
+    // SAFETY: see st_live; `ev` is the NSEvent AppKit passes; the array
+    // is autoreleased in the pool around sendEvent:.
+    unsafe {
+        let code = mac_keycode(msg_h(ev, sel(c"keyCode")));
+        let flags = msg_u(ev, sel(c"modifierFlags"));
+        let repeat = msg_b(ev, sel(c"isARepeat"));
+        let c = first_char(nsstring_bytes(msg_p(ev, sel(c"charactersIgnoringModifiers"))));
+        let id = view_id(this);
+        let had_marked = ST.marked;
+        ST.in_key = true;
+        ST.key_text.clear();
+        let arr = msg_p_p(class(c"NSArray"), sel(c"arrayWithObject:"), ev);
+        msg_v_p(this, sel(c"interpretKeyEvents:"), arr);
+        ST.in_key = false;
+        let text_len = ST.key_text.len();
+        push(Event::Key(Key {
+            win: id,
+            code: code,
+            key: mac_logical(c, code),
+            mods: mac_mods(flags),
+            pressed: true,
+            repeat: repeat,
+            ime: had_marked || ST.marked,
+            text_follows: text_len > 0,
+        }));
+        if text_len > 0 {
+            push_text(id, ST.key_text.as_slice());
+        }
+    }
+}
+
+extern "C" fn imp_key_up(this: *u8, cmd: *u8, ev: *u8) {
+    if !st_live() {
+        return;
+    }
+    // SAFETY: see st_live and imp_key_down.
+    unsafe {
+        let code = mac_keycode(msg_h(ev, sel(c"keyCode")));
+        let flags = msg_u(ev, sel(c"modifierFlags"));
+        let c = first_char(nsstring_bytes(msg_p(ev, sel(c"charactersIgnoringModifiers"))));
+        push(Event::Key(Key {
+            win: view_id(this),
+            code: code,
+            key: mac_logical(c, code),
+            mods: mac_mods(flags),
+            pressed: false,
+            repeat: false,
+            ime: ST.marked,
+            text_follows: false,
+        }));
+    }
+}
+
+extern "C" fn imp_flags_changed(this: *u8, cmd: *u8, ev: *u8) {
+    if !st_live() {
+        return;
+    }
+    // SAFETY: see imp_key_down.
+    unsafe {
+        let code = mac_keycode(msg_h(ev, sel(c"keyCode")));
+        let flags = msg_u(ev, sel(c"modifierFlags"));
+        push(Event::Key(Key {
+            win: view_id(this),
+            code: code,
+            key: mac_logical(0, code),
+            mods: mac_mods(flags),
+            pressed: mac_modifier_down(code, flags),
+            repeat: false,
+            ime: false,
+            text_follows: false,
+        }));
+    }
+}
+
+extern "C" fn imp_mouse(this: *u8, cmd: *u8, ev: *u8) {
+    if !st_live() {
+        return;
+    }
+    // SAFETY: see imp_key_down; convertPoint:fromView: with nil converts
+    // from the window's coordinates.
+    unsafe {
+        let ty = msg_u(ev, sel(c"type"));
+        let at = msg_t(ev, sel(c"locationInWindow"));
+        let p = msg_t_tp(this, sel(c"convertPoint:fromView:"), at, 0 as *u8);
+        let s = scale_of(this);
+        let n = msg_i(ev, sel(c"buttonNumber"));
+        let action = if ty == EV_LEFT_DOWN || ty == EV_RIGHT_DOWN || ty == EV_OTHER_DOWN {
+            MouseAction::Press
+        } else if ty == EV_LEFT_UP || ty == EV_RIGHT_UP || ty == EV_OTHER_UP {
+            MouseAction::Release
+        } else {
+            MouseAction::Move
+        };
+        let button = if ty == EV_MOVED {
+            Button::None
+        } else if n == 0 {
+            Button::Left
+        } else if n == 1 {
+            Button::Right
+        } else if n == 2 {
+            Button::Middle
+        } else {
+            Button::Other(n)
+        };
+        let clicks = if ty == EV_MOVED || ty == EV_LEFT_DRAGGED || ty == EV_RIGHT_DRAGGED
+            || ty == EV_OTHER_DRAGGED {
+            0
+        } else {
+            msg_i(ev, sel(c"clickCount"))
+        };
+        push(Event::Mouse(Mouse {
+            win: view_id(this),
+            action: action,
+            button: button,
+            x: p.x * s,
+            y: p.y * s,
+            mods: mac_mods(msg_u(ev, sel(c"modifierFlags"))),
+            clicks: clicks,
+        }));
+    }
+}
+
+extern "C" fn imp_entered(this: *u8, cmd: *u8, ev: *u8) {
+    if !st_live() {
+        return;
+    }
+    // SAFETY: see st_live.
+    unsafe { push(Event::Cursor(view_id(this), true)); }
+}
+
+extern "C" fn imp_exited(this: *u8, cmd: *u8, ev: *u8) {
+    if !st_live() {
+        return;
+    }
+    // SAFETY: see st_live.
+    unsafe { push(Event::Cursor(view_id(this), false)); }
+}
+
+extern "C" fn imp_scroll(this: *u8, cmd: *u8, ev: *u8) {
+    if !st_live() {
+        return;
+    }
+    // SAFETY: see imp_key_down.
+    unsafe {
+        let precise = msg_b(ev, sel(c"hasPreciseScrollingDeltas"));
+        let s = if precise { scale_of(this) } else { 1.0 };
+        push(Event::Scroll(Scroll {
+            win: view_id(this),
+            dx: msg_d(ev, sel(c"scrollingDeltaX")) * s,
+            dy: msg_d(ev, sel(c"scrollingDeltaY")) * s,
+            precise: precise,
+            mods: mac_mods(msg_u(ev, sel(c"modifierFlags"))),
+        }));
+    }
+}
+
+extern "C" fn imp_frame(this: *u8, cmd: *u8, link: *u8) {
+    if !st_live() {
+        return;
+    }
+    // SAFETY: see st_live; `link` is the CADisplayLink that called us.
+    unsafe {
+        msg_v_b(link, sel(c"setPaused:"), true);
+        push(Event::Frame(view_id(this)));
+    }
+}
+
+extern "C" fn imp_reset_cursor_rects(this: *u8, cmd: *u8) {
+    if !st_live() {
+        return;
+    }
+    // SAFETY: see st_live; the NSCursor class methods return shared
+    // cursors (+0).
+    unsafe {
+        let k = vdata(this).cursor;
+        let c = if k == 1 {
+            msg_p(class(c"NSCursor"), sel(c"IBeamCursor"))
+        } else if k == 2 {
+            msg_p(class(c"NSCursor"), sel(c"pointingHandCursor"))
+        } else {
+            msg_p(class(c"NSCursor"), sel(c"arrowCursor"))
+        };
+        msg_v_rp(this, sel(c"addCursorRect:cursor:"), msg_r(this, sel(c"bounds")), c);
+    }
+}
+
+// ---- NSTextInputClient (0.23) ----
+
+extern "C" fn imp_has_marked(this: *u8, cmd: *u8) -> bool {
+    // SAFETY: see st_live.
+    st_live() && unsafe { ST.marked }
+}
+
+extern "C" fn imp_marked_range(this: *u8, cmd: *u8) -> Range {
+    // SAFETY: see st_live.
+    unsafe {
+        if st_live() && ST.marked {
+            return Range { loc: 0, len: utf16_len(ST.preedit.as_slice()) };
+        }
+    }
+    Range { loc: NOT_FOUND, len: 0 }
+}
+
+extern "C" fn imp_selected_range(this: *u8, cmd: *u8) -> Range {
+    Range { loc: NOT_FOUND, len: 0 }
+}
+
+fn utf16_len(s: [u8]) -> u64 {
+    let mut n: u64 = 0;
+    for b in s {
+        if (b & 0xC0) != 0x80 {
+            n += if b >= 0xF0 { 2 } else { 1 };
+        }
+    }
+    n
+}
+
+// The text of an NSString or NSAttributedString argument.
+unsafe fn arg_text(s: *u8) -> [u8] {
+    if msg_b_p(s, sel(c"isKindOfClass:"), class(c"NSAttributedString")) {
+        return nsstring_bytes(msg_p(s, sel(c"string")));
+    }
+    nsstring_bytes(s)
+}
+
+extern "C" fn imp_set_marked(this: *u8, cmd: *u8, text: *u8, selected: Range, replaced: Range) {
+    if !st_live() {
+        return;
+    }
+    // SAFETY: see st_live; `text` is the NSString or NSAttributedString
+    // the input method passes.
+    unsafe {
+        let s = arg_text(text);
+        ST.preedit.clear();
+        ST.preedit.push_str(s);
+        ST.marked = s.len > 0;
+        let cursor = if selected.loc == NOT_FOUND { s.len }
+            else { utf16_to_byte(s, selected.loc as i64) };
+        push(Event::Preedit(Preedit { win: view_id(this), len: s.len, cursor: cursor }));
+    }
+}
+
+extern "C" fn imp_unmark(this: *u8, cmd: *u8) {
+    if !st_live() {
+        return;
+    }
+    // SAFETY: see st_live; discardMarkedText on the view's input context.
+    unsafe {
+        if ST.marked {
+            ST.marked = false;
+            ST.preedit.clear();
+            push(Event::Preedit(Preedit { win: view_id(this), len: 0, cursor: 0 }));
+        }
+        let ic = msg_p(this, sel(c"inputContext"));
+        if ic != 0 as *u8 {
+            msg_v(ic, sel(c"discardMarkedText"));
+        }
+    }
+}
+
+extern "C" fn imp_insert_text(this: *u8, cmd: *u8, text: *u8, replaced: Range) {
+    if !st_live() {
+        return;
+    }
+    // SAFETY: see imp_set_marked.
+    unsafe {
+        let s = arg_text(text);
+        let id = view_id(this);
+        if ST.marked {
+            ST.marked = false;
+            ST.preedit.clear();
+            push(Event::Preedit(Preedit { win: id, len: 0, cursor: 0 }));
+        }
+        if ST.in_key {
+            ST.key_text.push_str(s);
+        } else {
+            push_text(id, s);
+        }
+    }
+}
+
+extern "C" fn imp_valid_attributes(this: *u8, cmd: *u8) -> *u8 {
+    // SAFETY: +[NSArray array] returns an empty, autoreleased array.
+    unsafe { msg_p(class(c"NSArray"), sel(c"array")) }
+}
+
+extern "C" fn imp_attributed_substring(this: *u8, cmd: *u8, r: Range, actual: *Range) -> *u8 {
+    0 as *u8
+}
+
+extern "C" fn imp_char_index(this: *u8, cmd: *u8, p: Point) -> u64 {
+    NOT_FOUND
+}
+
+extern "C" fn imp_first_rect(this: *u8, cmd: *u8, r: Range, actual: *Range) -> Rect {
+    if !st_live() {
+        return Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+    }
+    // SAFETY: see st_live; the conversions take and return rects by value.
+    unsafe {
+        let d = vdata(this);
+        let s = scale_of(this);
+        let local = Rect { x: d.ime_x / s, y: d.ime_y / s, w: d.ime_w / s, h: d.ime_h / s };
+        let inwin = msg_r_rp(this, sel(c"convertRect:toView:"), local, 0 as *u8);
+        let w = msg_p(this, sel(c"window"));
+        if w == 0 as *u8 {
+            return inwin;
+        }
+        msg_r_r(w, sel(c"convertRectToScreen:"), inwin)
+    }
+}
+
+extern "C" fn imp_do_command(this: *u8, cmd: *u8, selector: *u8) {
+    // Nothing: the application reads keys from Event::Key (and the
+    // default would beep).
+}
+
+// ---- the window delegate (0.23) ----
+
+unsafe fn note_view(note: *u8) -> *u8 {
+    let w = msg_p(note, sel(c"object"));
+    msg_p(w, sel(c"contentView"))
+}
+
+extern "C" fn imp_should_close(this: *u8, cmd: *u8, win: *u8) -> bool {
+    if !st_live() {
+        return true;
+    }
+    // SAFETY: see st_live; `win` is one of our windows (its content view
+    // is our view).
+    unsafe { push(Event::Close(view_id(msg_p(win, sel(c"contentView"))))); }
+    false
+}
+
+extern "C" fn imp_did_resize(this: *u8, cmd: *u8, note: *u8) {
+    if !st_live() {
+        return;
+    }
+    // SAFETY: see st_live; the hook is called with the context it was
+    // registered with (the application's promise: it is valid while the
+    // hook is set).
+    unsafe {
+        let view = note_view(note);
+        let sz = sync_layer(view);
+        push(Event::Resize(view_id(view), sz));
+        let live = msg_b(view, sel(c"inLiveResize"));
+        if live && !ST.in_hook {
+            match ST.hook {
+                Some(f) => {
+                    ST.in_hook = true;
+                    f(ST.hook_ctx);
+                    ST.in_hook = false;
+                }
+                None => {}
+            }
+        }
+    }
+}
+
+extern "C" fn imp_did_backing(this: *u8, cmd: *u8, note: *u8) {
+    if !st_live() {
+        return;
+    }
+    // SAFETY: see st_live.
+    unsafe {
+        let view = note_view(note);
+        let sz = sync_layer(view);
+        push(Event::Resize(view_id(view), sz));
+    }
+}
+
+extern "C" fn imp_did_key(this: *u8, cmd: *u8, note: *u8) {
+    if !st_live() {
+        return;
+    }
+    // SAFETY: see st_live.
+    unsafe { push(Event::Focus(view_id(note_view(note)), true)); }
+}
+
+extern "C" fn imp_did_resign(this: *u8, cmd: *u8, note: *u8) {
+    if !st_live() {
+        return;
+    }
+    // SAFETY: see st_live.
+    unsafe { push(Event::Focus(view_id(note_view(note)), false)); }
+}
+
+extern "C" fn imp_quit(this: *u8, cmd: *u8, sender: *u8) {
+    push(Event::Quit);
+}
+
+// ---- watched file descriptors (0.23) ----
+
+extern "C" fn fd_ready(f: *u8, types: u64, info: *u8) {
+    if !st_live() {
+        return;
+    }
+    // SAFETY: see st_live; `f` is one of our CFFileDescriptors.
+    unsafe {
+        let fd = CFFileDescriptorGetNativeDescriptor(f);
+        for i in 0..ST.watches.len() {
+            if ST.watches[i].fd == fd {
+                ST.watches[i].armed = false;
+            }
+        }
+        push(Event::Readable(fd));
+    }
+}
+
+// ---- classes (0.23) ----
+
+// The encoding of method `name` of the superclass or protocol, or `dflt`.
+fn types(cls: *u8, proto: *u8, name: *u8, dflt: *u8) -> *u8 {
+    let t = method_types(cls, proto, name);
+    if t == 0 as *u8 { dflt } else { t }
+}
+
+unsafe fn make_view_class() -> *u8 {
+    let existing = class(c"TachyonView");
+    if existing != 0 as *u8 {
+        return existing;
+    }
+    let sup = class(c"NSView");
+    let tic = objc_getProtocol(c"NSTextInputClient");
+    let c = objc_allocateClassPair(sup, c"TachyonView", 0);
+    class_addIvar(c, c"tachyon", 48, 3, c"[6q]");
+    class_addProtocol(c, tic);
+    add_b(c, sel(c"acceptsFirstResponder"), imp_yes,
+        types(sup, 0 as *u8, c"acceptsFirstResponder", c"c@:"));
+    add_b(c, sel(c"isFlipped"), imp_yes, types(sup, 0 as *u8, c"isFlipped", c"c@:"));
+    add_b_p(c, sel(c"acceptsFirstMouse:"), imp_yes_p,
+        types(sup, 0 as *u8, c"acceptsFirstMouse:", c"c@:@"));
+    let vp = types(sup, 0 as *u8, c"keyDown:", c"v@:@");
+    add_v_p(c, sel(c"keyDown:"), imp_key_down, vp);
+    add_v_p(c, sel(c"keyUp:"), imp_key_up, vp);
+    add_v_p(c, sel(c"flagsChanged:"), imp_flags_changed, vp);
+    add_v_p(c, sel(c"mouseDown:"), imp_mouse, vp);
+    add_v_p(c, sel(c"mouseUp:"), imp_mouse, vp);
+    add_v_p(c, sel(c"mouseDragged:"), imp_mouse, vp);
+    add_v_p(c, sel(c"mouseMoved:"), imp_mouse, vp);
+    add_v_p(c, sel(c"rightMouseDown:"), imp_mouse, vp);
+    add_v_p(c, sel(c"rightMouseUp:"), imp_mouse, vp);
+    add_v_p(c, sel(c"rightMouseDragged:"), imp_mouse, vp);
+    add_v_p(c, sel(c"otherMouseDown:"), imp_mouse, vp);
+    add_v_p(c, sel(c"otherMouseUp:"), imp_mouse, vp);
+    add_v_p(c, sel(c"otherMouseDragged:"), imp_mouse, vp);
+    add_v_p(c, sel(c"mouseEntered:"), imp_entered, vp);
+    add_v_p(c, sel(c"mouseExited:"), imp_exited, vp);
+    add_v_p(c, sel(c"scrollWheel:"), imp_scroll, vp);
+    add_v_p(c, sel(c"tachyonFrame:"), imp_frame, c"v@:@");
+    add_v(c, sel(c"resetCursorRects"), imp_reset_cursor_rects,
+        types(sup, 0 as *u8, c"resetCursorRects", c"v@:"));
+    // NSTextInputClient.
+    add_b(c, sel(c"hasMarkedText"), imp_has_marked, types(0 as *u8, tic, c"hasMarkedText", c"c@:"));
+    add_g(c, sel(c"markedRange"), imp_marked_range,
+        types(0 as *u8, tic, c"markedRange", c"{_NSRange=QQ}@:"));
+    add_g(c, sel(c"selectedRange"), imp_selected_range,
+        types(0 as *u8, tic, c"selectedRange", c"{_NSRange=QQ}@:"));
+    add_v_pgg(c, sel(c"setMarkedText:selectedRange:replacementRange:"), imp_set_marked,
+        types(0 as *u8, tic, c"setMarkedText:selectedRange:replacementRange:",
+            c"v@:@{_NSRange=QQ}{_NSRange=QQ}"));
+    add_v(c, sel(c"unmarkText"), imp_unmark, types(0 as *u8, tic, c"unmarkText", c"v@:"));
+    add_p(c, sel(c"validAttributesForMarkedText"), imp_valid_attributes,
+        types(0 as *u8, tic, c"validAttributesForMarkedText", c"@@:"));
+    add_p_gP(c, sel(c"attributedSubstringForProposedRange:actualRange:"), imp_attributed_substring,
+        types(0 as *u8, tic, c"attributedSubstringForProposedRange:actualRange:",
+            c"@@:{_NSRange=QQ}^{_NSRange=QQ}"));
+    add_v_pg(c, sel(c"insertText:replacementRange:"), imp_insert_text,
+        types(0 as *u8, tic, c"insertText:replacementRange:", c"v@:@{_NSRange=QQ}"));
+    add_u_t(c, sel(c"characterIndexForPoint:"), imp_char_index,
+        types(0 as *u8, tic, c"characterIndexForPoint:", c"Q@:{CGPoint=dd}"));
+    add_r_gP(c, sel(c"firstRectForCharacterRange:actualRange:"), imp_first_rect,
+        types(0 as *u8, tic, c"firstRectForCharacterRange:actualRange:",
+            c"{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}^{_NSRange=QQ}"));
+    add_v_p(c, sel(c"doCommandBySelector:"), imp_do_command,
+        types(0 as *u8, tic, c"doCommandBySelector:", c"v@::"));
+    objc_registerClassPair(c);
+    c
+}
+
+unsafe fn make_delegate_class() -> *u8 {
+    let existing = class(c"TachyonWindowDelegate");
+    if existing != 0 as *u8 {
+        return existing;
+    }
+    let c = objc_allocateClassPair(class(c"NSObject"), c"TachyonWindowDelegate", 0);
+    let p = objc_getProtocol(c"NSWindowDelegate");
+    if p != 0 as *u8 {
+        class_addProtocol(c, p);
+    }
+    add_b_p(c, sel(c"windowShouldClose:"), imp_should_close, c"c@:@");
+    add_v_p(c, sel(c"windowDidResize:"), imp_did_resize, c"v@:@");
+    add_v_p(c, sel(c"windowDidChangeBackingProperties:"), imp_did_backing, c"v@:@");
+    add_v_p(c, sel(c"windowDidBecomeKey:"), imp_did_key, c"v@:@");
+    add_v_p(c, sel(c"windowDidResignKey:"), imp_did_resign, c"v@:@");
+    add_v_p(c, sel(c"tachyonQuit:"), imp_quit, c"v@:@");
+    objc_registerClassPair(c);
+    c
+}
+
+// The menu bar: an application menu with Quit (Command-Q).
+unsafe fn make_menu(app: *u8, target: *u8) {
+    let bar = msg_p(msg_p(class(c"NSMenu"), sel(c"alloc")), sel(c"init"));
+    let app_item = msg_p(msg_p(class(c"NSMenuItem"), sel(c"alloc")), sel(c"init"));
+    msg_v_p(bar, sel(c"addItem:"), app_item);
+    let menu = msg_p(msg_p(class(c"NSMenu"), sel(c"alloc")), sel(c"init"));
+    let quit = msg_p_ppp(msg_p(class(c"NSMenuItem"), sel(c"alloc")),
+        sel(c"initWithTitle:action:keyEquivalent:"), nsstring("Quit"), sel(c"tachyonQuit:"),
+        nsstring("q"));
+    msg_v_p(quit, sel(c"setTarget:"), target);
+    msg_v_p(menu, sel(c"addItem:"), quit);
+    msg_v_p(app_item, sel(c"setSubmenu:"), menu);
+    msg_v_p(app, sel(c"setMainMenu:"), bar);
+    release(quit);
+    release(menu);
+    release(app_item);
+    release(bar);
+}
+
+// Whether a window server session exists (false under ssh or in a
+// launchd daemon), checked before NSApplication is touched.
+pub fn has_display() -> bool {
+    // SAFETY: CGSessionCopyCurrentDictionary returns a +1 dictionary or
+    // null; it is released.
+    unsafe {
+        let d = CGSessionCopyCurrentDictionary();
+        if d == 0 as *u8 {
+            return false;
+        }
+        CFRelease(d);
+        true
+    }
+}
+
+pub fn hide_cursor_until_moved() {
+    // SAFETY: +[NSCursor setHiddenUntilMouseMoves:] takes a BOOL.
+    unsafe { msg_v_b(class(c"NSCursor"), sel(c"setHiddenUntilMouseMoves:"), true); }
+}
+
+impl Cocoa {
+    pub fn new_in(gpa: Gpa) -> Result<Cocoa, Error> {
+        if !has_display() {
+            return Err(Error::NoDisplay);
+        }
+        // SAFETY: AppKit setup on the main thread with the documented
+        // selectors and types; ST is set to the State's address, which
+        // stays put (the Vec is never pushed to again) until close.
+        unsafe {
+            if ST != 0 as *State {
+                return Err(Error::Failed("one App per process"));
+            }
+            let pool = pool_push();
+            let app = msg_p(class(c"NSApplication"), sel(c"sharedApplication"));
+            if app == 0 as *u8 {
+                pool_pop(pool);
+                return Err(Error::NoDisplay);
+            }
+            // NSApplicationActivationPolicyRegular.
+            msg_b_i(app, sel(c"setActivationPolicy:"), 0);
+            msg_v_b(class(c"NSWindow"), sel(c"setAllowsAutomaticWindowTabbing:"), false);
+            let view_class = make_view_class();
+            let dc = make_delegate_class();
+            let delegate = msg_p(msg_p(dc, sel(c"alloc")), sel(c"init"));
+            make_menu(app, delegate);
+            msg_v(app, sel(c"finishLaunching"));
+            msg_v_b(app, sel(c"activateIgnoringOtherApps:"), true);
+            let off = ivar_getOffset(class_getInstanceVariable(view_class, c"tachyon"));
+            let mut c = Cocoa { st: Vec::with_capacity_in(1, gpa) };
+            c.st.push(State {
+                q: Vec::with_capacity_in(64, gpa),
+                head: 0,
+                preedit: Buf::new_in(gpa),
+                marked: false,
+                in_key: false,
+                key_text: Buf::new_in(gpa),
+                waiting: false,
+                wake_posted: false,
+                hook: None,
+                hook_ctx: 0 as *u8,
+                in_hook: false,
+                watches: Vec::new_in(gpa),
+                app: app,
+                delegate: delegate,
+                target: delegate,
+                view_class: view_class,
+                ivar_off: off,
+            });
+            ST = &c.st[0];
+            pool_pop(pool);
+            Ok(c)
+        }
+    }
+}
+
+impl State {
+    fn pop(self: &mut State) -> Option<Event> {
+        if self.head < self.q.len() {
+            let e = self.q[self.head];
+            self.head += 1;
+            if self.head == self.q.len() {
+                self.q.clear();
+                self.head = 0;
+            }
+            return Some(e);
+        }
+        None
+    }
+
+    fn next_event(self: &mut State, ms: i64) -> Option<Event> {
+        match self.pop() {
+            Some(e) => return Some(e),
+            None => {}
+        }
+        if self.in_hook {
+            return None;
+        }
+        for i in 0..self.watches.len() {
+            if !self.watches[i].armed {
+                // SAFETY: a CFFileDescriptor of ours, live until unwatch.
+                unsafe { CFFileDescriptorEnableCallBacks(self.watches[i].cf, 1); }
+                self.watches[i].armed = true;
+            }
+        }
+        // SAFETY: the event loop's AppKit calls with their documented
+        // types, each batch in an autorelease pool; the date is
+        // autoreleased in the outer pool, which outlives the loop.
+        unsafe {
+            let outer = pool_push();
+            let date = if ms < 0 {
+                msg_p(class(c"NSDate"), sel(c"distantFuture"))
+            } else if ms == 0 {
+                msg_p(class(c"NSDate"), sel(c"distantPast"))
+            } else {
+                msg_p_d(class(c"NSDate"), sel(c"dateWithTimeIntervalSinceNow:"), ms as f64 / 1000.0)
+            };
+            loop {
+                let p = pool_push();
+                self.waiting = ms != 0;
+                let ev = msg_p_uppb(self.app,
+                    sel(c"nextEventMatchingMask:untilDate:inMode:dequeue:"), 0xFFFFFFFFFFFFFFFF,
+                    date, NSDefaultRunLoopMode, true);
+                self.waiting = false;
+                if ev == 0 as *u8 {
+                    pool_pop(p);
+                    break;
+                }
+                if msg_u(ev, sel(c"type")) == EV_APP_DEFINED && msg_i(ev, sel(c"data1")) == WAKE {
+                    self.wake_posted = false;
+                } else {
+                    msg_v_p(self.app, sel(c"sendEvent:"), ev);
+                }
+                pool_pop(p);
+                if self.head < self.q.len() {
+                    break;
+                }
+            }
+            pool_pop(outer);
+        }
+        self.pop()
+    }
+
+    fn watch(self: &mut State, fd: i32) -> bool {
+        let ctx = FdContext {
+            version: 0, info: 0 as *u8, retain: 0 as *u8, release: 0 as *u8, describe: 0 as *u8
+        };
+        // SAFETY: CFFileDescriptorCreate copies the context; the source
+        // is added to the main run loop in the default mode (the mode
+        // wait runs it in) and removed by unwatch.
+        unsafe {
+            let cf = CFFileDescriptorCreate(0 as *u8, fd, false, fd_ready, &ctx);
+            if cf == 0 as *u8 {
+                return false;
+            }
+            let src = CFFileDescriptorCreateRunLoopSource(0 as *u8, cf, 0);
+            CFRunLoopAddSource(CFRunLoopGetMain(), src, kCFRunLoopDefaultMode);
+            CFFileDescriptorEnableCallBacks(cf, 1);
+            self.watches.push(Watch { fd: fd, cf: cf, src: src, armed: true });
+        }
+        true
+    }
+
+    fn unwatch(self: &mut State, fd: i32) {
+        let mut i = 0;
+        while i < self.watches.len() {
+            let w = self.watches[i];
+            if w.fd == fd {
+                // SAFETY: the source and descriptor watch made (+1 each).
+                unsafe {
+                    CFRunLoopRemoveSource(CFRunLoopGetMain(), w.src, kCFRunLoopDefaultMode);
+                    CFFileDescriptorInvalidate(w.cf);
+                    CFRelease(w.src);
+                    CFRelease(w.cf);
+                }
+                self.watches.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn free(self: &mut State) {
+        while self.watches.len() > 0 {
+            let fd = self.watches[0].fd;
+            self.unwatch(fd);
+        }
+        // SAFETY: the delegate was made +1 in new_in.
+        unsafe { release(self.delegate); }
+        self.delegate = 0 as *u8;
+    }
+}
+
+impl super::Backend for Cocoa {
+    fn open_window(self: &mut Cocoa, desc: &WindowDesc, id: WindowId) -> Result<Window, Error> {
+        let view_class = self.st[0].view_class;
+        let delegate = self.st[0].delegate;
+        let app = self.st[0].app;
+        // SAFETY: AppKit and Core Animation calls with their documented
+        // types; alloc/init results are +1 and kept in the NsWindow (the
+        // display link and the layer are retained); the view's data is
+        // the ivar this class was given (48 bytes at ivar_off).
+        unsafe {
+            let pool = pool_push();
+            let rect = Rect { x: 0.0, y: 0.0, w: desc.w as f64, h: desc.h as f64 };
+            // Titled | Closable | Miniaturizable | Resizable.
+            let style: u64 = if desc.resizable { 1 | 2 | 4 | 8 } else { 1 | 2 | 4 };
+            let win = msg_p_ruub(msg_p(class(c"NSWindow"), sel(c"alloc")),
+                sel(c"initWithContentRect:styleMask:backing:defer:"), rect, style, 2, false);
+            if win == 0 as *u8 {
+                pool_pop(pool);
+                return Err(Error::Failed("NSWindow"));
+            }
+            msg_v_b(win, sel(c"setReleasedWhenClosed:"), false);
+            let view = msg_p_r(msg_p(view_class, sel(c"alloc")), sel(c"initWithFrame:"), rect);
+            let d = vdata(view);
+            d.id = id.n;
+            d.cursor = 1;
+            d.ime_x = 0.0;
+            d.ime_y = 0.0;
+            d.ime_w = 0.0;
+            d.ime_h = 0.0;
+            // A layer-hosting view: the layer is set before wantsLayer.
+            let layer = retain(msg_p(class(c"CAMetalLayer"), sel(c"layer")));
+            msg_v_p(view, sel(c"setLayer:"), layer);
+            msg_v_b(view, sel(c"setWantsLayer:"), true);
+            msg_v_p(win, sel(c"setContentView:"), view);
+            msg_v_p(win, sel(c"setDelegate:"), delegate);
+            msg_v_p(win, sel(c"setTitle:"), nsstring(desc.title));
+            msg_v_b(win, sel(c"setAcceptsMouseMovedEvents:"), true);
+            msg_v_z(win, sel(c"setContentMinSize:"),
+                NsSize { w: desc.min_w as f64, h: desc.min_h as f64 });
+            // NSWindowCollectionBehaviorFullScreenPrimary.
+            msg_v_u(win, sel(c"setCollectionBehavior:"), 1 << 7);
+            // Enter, leave and moves over the visible rect, always.
+            let ta = msg_p_rupp(msg_p(class(c"NSTrackingArea"), sel(c"alloc")),
+                sel(c"initWithRect:options:owner:userInfo:"),
+                Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }, 0x01 | 0x02 | 0x80 | 0x200, view,
+                0 as *u8);
+            msg_v_p(view, sel(c"addTrackingArea:"), ta);
+            release(ta);
+            msg_v(win, sel(c"center"));
+            msg_b_p(win, sel(c"makeFirstResponder:"), view);
+            msg_v_p(win, sel(c"makeKeyAndOrderFront:"), 0 as *u8);
+            msg_v_b(app, sel(c"activateIgnoringOtherApps:"), true);
+            let sz = sync_layer(view);
+            let mut link = 0 as *u8;
+            if msg_b_p(view, sel(c"respondsToSelector:"), sel(c"displayLinkWithTarget:selector:")) {
+                link = retain(msg_p_pp(view, sel(c"displayLinkWithTarget:selector:"), view,
+                    sel(c"tachyonFrame:")));
+                msg_v_b(link, sel(c"setPaused:"), true);
+                msg_v_pp(link, sel(c"addToRunLoop:forMode:"),
+                    msg_p(class(c"NSRunLoop"), sel(c"mainRunLoop")), NSRunLoopCommonModes);
+            }
+            pool_pop(pool);
+            push(Event::Resize(id, sz));
+            Ok(Window { id: id, ns: NsWindow { win: win, view: view, layer: layer, link: link } })
+        }
+    }
+
+    fn next_event(self: &mut Cocoa, ms: i64) -> Option<Event> {
+        self.st[0].next_event(ms)
+    }
+
+    fn watch(self: &mut Cocoa, fd: i32) -> bool {
+        self.st[0].watch(fd)
+    }
+
+    fn unwatch(self: &mut Cocoa, fd: i32) {
+        self.st[0].unwatch(fd);
+    }
+
+    fn clipboard_get_in<A: Allocator>(self: &Cocoa, a: A) -> Option<Buf<A>> {
+        // SAFETY: NSPasteboard calls with their types; the string's bytes
+        // are copied before the pool is popped.
+        unsafe {
+            let pool = pool_push();
+            let pb = msg_p(class(c"NSPasteboard"), sel(c"generalPasteboard"));
+            let s = msg_p_p(pb, sel(c"stringForType:"), NSPasteboardTypeString);
+            if s == 0 as *u8 {
+                pool_pop(pool);
+                return None;
+            }
+            let mut b = Buf::new_in(a);
+            b.push_str(nsstring_bytes(s));
+            pool_pop(pool);
+            Some(b)
+        }
+    }
+
+    fn clipboard_set(self: &Cocoa, text: [u8]) {
+        // SAFETY: as clipboard_get_in.
+        unsafe {
+            let pool = pool_push();
+            let pb = msg_p(class(c"NSPasteboard"), sel(c"generalPasteboard"));
+            msg_i(pb, sel(c"clearContents"));
+            msg_b_pp(pb, sel(c"setString:forType:"), nsstring(text), NSPasteboardTypeString);
+            pool_pop(pool);
+        }
+    }
+
+    fn preedit(self: &Cocoa) -> [u8] {
+        self.st[0].preedit.as_slice()
+    }
+
+    fn set_live_resize(self: &mut Cocoa, f: fn(*u8), ctx: &u8) {
+        self.st[0].hook = Some(f);
+        self.st[0].hook_ctx = ctx;
+    }
+
+    fn close(self: &mut Cocoa) {
+        // SAFETY: ST no longer points at the State once it is freed.
+        unsafe { ST = 0 as *State; }
+        self.st[0].free();
+    }
+}
+
+// A window's Cocoa objects (each retained once).
+pub struct NsWindow {
+    pub win: *u8,
+    pub view: *u8,
+    pub layer: *u8,
+    pub link: *u8,
+}
+
+impl NsWindow {
+    pub fn request_frame(self: &NsWindow) {
+        if self.link != 0 as *u8 {
+            // SAFETY: setPaused: on the display link this window retained.
+            unsafe { msg_v_b(self.link, sel(c"setPaused:"), false); }
+        }
+    }
+
+    pub fn size(self: &NsWindow) -> Size {
+        // SAFETY: the view this window retained.
+        unsafe { view_size(self.view) }
+    }
+
+    pub fn set_title(self: &NsWindow, t: [u8]) {
+        // SAFETY: setTitle: takes an NSString (autoreleased in our pool).
+        unsafe {
+            let p = pool_push();
+            msg_v_p(self.win, sel(c"setTitle:"), nsstring(t));
+            pool_pop(p);
+        }
+    }
+
+    pub fn set_cursor(self: &NsWindow, c: CursorIcon) {
+        let k = match c {
+            CursorIcon::Arrow => 0,
+            CursorIcon::Text => 1,
+            CursorIcon::Pointer => 2,
+        };
+        // SAFETY: the view's ivar (see open_window); the window rebuilds
+        // its cursor rects, calling resetCursorRects.
+        unsafe {
+            if ST == 0 as *State {
+                return;
+            }
+            vdata(self.view).cursor = k;
+            msg_v_p(self.win, sel(c"invalidateCursorRectsForView:"), self.view);
+        }
+    }
+
+    pub fn set_ime_area(self: &NsWindow, x: f64, y: f64, w: f64, h: f64) {
+        // SAFETY: the view's ivar (see open_window).
+        unsafe {
+            if ST == 0 as *State {
+                return;
+            }
+            let d = vdata(self.view);
+            d.ime_x = x;
+            d.ime_y = y;
+            d.ime_w = w;
+            d.ime_h = h;
+        }
+    }
+
+    pub fn is_fullscreen(self: &NsWindow) -> bool {
+        // SAFETY: styleMask returns NSWindowStyleMask; FullScreen is 1 << 14.
+        unsafe { (msg_u(self.win, sel(c"styleMask")) & (1 << 14)) != 0 }
+    }
+
+    pub fn set_fullscreen(self: &NsWindow, on: bool) {
+        if on != self.is_fullscreen() {
+            // SAFETY: toggleFullScreen: takes a sender (nil).
+            unsafe { msg_v_p(self.win, sel(c"toggleFullScreen:"), 0 as *u8); }
+        }
+    }
+
+    pub fn focused(self: &NsWindow) -> bool {
+        // SAFETY: isKeyWindow returns a BOOL.
+        unsafe { msg_b(self.win, sel(c"isKeyWindow")) }
+    }
+
+    pub fn close(self: &mut NsWindow) {
+        // SAFETY: releases what open_window retained, after detaching the
+        // delegate (no callback reaches a closed window) and stopping the
+        // display link.
+        unsafe {
+            if self.win == 0 as *u8 {
+                return;
+            }
+            if self.link != 0 as *u8 {
+                msg_v(self.link, sel(c"invalidate"));
+                release(self.link);
+            }
+            msg_v_p(self.win, sel(c"setDelegate:"), 0 as *u8);
+            msg_v(self.win, sel(c"close"));
+            release(self.view);
+            release(self.layer);
+            release(self.win);
+            self.win = 0 as *u8;
+        }
+    }
+}
