@@ -37,7 +37,9 @@
 //
 // std is never rewritten, but under `--std-tree DIR` (its files then).
 
-use crate::base::{FILES, SRC, SYMS, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern};
+use crate::base::{
+    FILES, IntVec, SRC, SYMS, buf_bytes, buf_int, buf_new, buf_slice, buf_str, intern,
+};
 use crate::front::ast::{
     CLOSURE_MOVE, CONV_NEW, FIELD_SHORTHAND, NODES, NODE_COUNT, NODE_REF, NODE_REF_MUT, NodeKind,
     child,
@@ -493,10 +495,23 @@ fn edit_param(n: i64, i: i64, p: i64, closure: bool) {
                 return;
             }
             let inner = NODES[NODES[tn].a].start;
+            if RAW_PARAMS.get(p + 1) != 0 {
+                // (used as a pointer: a raw one)
+                put(ts, inner, "*", CC_PARAM_INOUT);
+                return;
+            }
             if (NODES[tn].p & NODE_REF_MUT) != 0 {
                 put(ts, inner, "inout ", CC_PARAM_INOUT);
             } else {
                 put(ts, inner, if CONV_SPELLING { "let " } else { "" }, CC_PARAM_LET);
+            }
+            if closure && !CONV_SPELLING {
+                // (Phase M: a closure given to a generic function is checked
+                // as a copy of its nodes, so its `*a` may carry no type here:
+                // edit_deref knows it by the parameter's name)
+                CLOSURE_REFS.push(NODES[n].start);
+                CLOSURE_REFS.push(NODES[n].end);
+                CLOSURE_REFS.push(NODES[p].a);
             }
             return;
         }
@@ -617,6 +632,15 @@ fn edit_call(c: i64) {
             if t <= 0 {
                 continue;
             }
+            if raw_param_at(c, i) || raw_ref(arg) {
+                // (a raw parameter's: `&mut e` is `&e`, which converts)
+                if is_amp(arg) && (NODES[arg].p & NODE_REF_MUT) != 0 {
+                    edit_amp(arg, false);
+                } else if is_amp(arg) {
+                    AMP_SEEN.put(arg + 1, 1);
+                }
+                continue;
+            }
             if !is_amp(arg) {
                 // (an exclusive reference passed on, `g(r)`: a named access
                 // is used as its place, so it is lent again, `g(&r)`)
@@ -634,7 +658,9 @@ fn edit_call(c: i64) {
                     continue;
                 }
                 edit_amp(arg, false);
-            } else if is_shared_ref(t) {
+            } else if is_shared_ref(t) || let_param_at(c, i) {
+                // (a let parameter of 0.20: the place itself, `f(x)`; a
+                // generic `x: T` too, whose instance may copy)
                 edit_amp(arg, true);
             } else if TYPES[t].kind == TyKind::Ptr {
                 // (to a raw `*T`: `&e` converts to it, as it is)
@@ -782,7 +808,8 @@ fn edit_deref(n: i64) {
     unsafe {
         let s = NODES[n].start;
         let operand = NODES[n].b;
-        if SRC[s] != '*' || operand <= 0 || !is_ref_type(NODES[operand].ty) {
+        if SRC[s] != '*' || operand <= 0 || raw_ref(operand)
+            || !is_ref_type(NODES[operand].ty) && !closure_ref(operand) {
             return;
         }
         let os = NODES[operand].start;
@@ -800,6 +827,171 @@ fn edit_deref(n: i64) {
             return;
         }
         put(s, os, "", CC_DEREF);
+    }
+}
+
+// (start, end, name) of each closure parameter `name: &T` that becomes
+// `name: T` (edit_param).
+static mut CLOSURE_REFS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Whether e names a closure's reference parameter inside that closure.
+fn closure_ref(e: i64) -> bool {
+    unsafe {
+        if NODES[e].kind != NodeKind::Ident {
+            return false;
+        }
+        let mut i = 0;
+        while i + 2 < CLOSURE_REFS.count + 1 && i < CLOSURE_REFS.count {
+            if NODES[e].a == CLOSURE_REFS.data[i + 2] && NODES[e].start >= CLOSURE_REFS.data[i]
+                && NODES[e].end <= CLOSURE_REFS.data[i + 1] {
+                return true;
+            }
+            i += 3;
+        }
+        false
+    }
+}
+
+// (Phase M) Reference parameters used as pointers: indexed though what
+// they point to is not a Vec, a Buf, a slice or an array (`af[1] = s` on
+// `af: &mut i64`, pointer arithmetic in unsafe code). They become raw
+// `*T`, their `*p` and their calls' `&e` stay. RAW_PARAMS: Param node + 1;
+// RAW_SPANS: (function start, end, name) of each.
+static mut RAW_PARAMS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static mut RAW_SPANS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut FN_NODES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The innermost function node whose span holds position pos, or 0.
+fn enclosing_fn(pos: i64) -> i64 {
+    unsafe {
+        let mut best = 0;
+        for i in 0..FN_NODES.count {
+            let f = FN_NODES.data[i];
+            if NODES[f].start <= pos && pos < NODES[f].end
+                && (best == 0 || NODES[f].start >= NODES[best].start) {
+                best = f;
+            }
+        }
+        best
+    }
+}
+
+// Function node f's parameter named name, written with a `&` type, or 0.
+fn ref_param_named(f: i64, name: i64) -> i64 {
+    unsafe {
+        for j in 0..NODES[f].count {
+            let p = child(f, j);
+            if NODES[p].kind == NodeKind::Param && NODES[p].a == name {
+                let tn = NODES[p].b;
+                if tn > 0 && NODES[tn].kind == NodeKind::TyPtr && (NODES[tn].p & NODE_REF) != 0
+                    && SRC[NODES[tn].start] == '&' {
+                    return p;
+                }
+                return 0;
+            }
+        }
+        0
+    }
+}
+
+fn find_raw_params() {
+    unsafe {
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind == NodeKind::Fn && NODES[n].c > 0 {
+                FN_NODES.push(n);
+            }
+        }
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind != NodeKind::Index {
+                continue;
+            }
+            let base = NODES[n].a;
+            if base <= 0 || NODES[base].kind != NodeKind::Ident {
+                continue;
+            }
+            let t = NODES[base].ty;
+            if t <= 0 || TYPES[t].kind != TyKind::Ptr || TYPES[t].b == 0 {
+                continue;
+            }
+            let pointee = TYPES[t].a;
+            let pk = TYPES[pointee].kind;
+            if pk == TyKind::Slice || pk == TyKind::Array || pk == TyKind::Struct {
+                continue;
+            }
+            let f = enclosing_fn(NODES[n].start);
+            if f == 0 {
+                continue;
+            }
+            let p = ref_param_named(f, NODES[base].a);
+            if p > 0 && RAW_PARAMS.get(p + 1) == 0 {
+                RAW_PARAMS.put(p + 1, 1);
+                RAW_SPANS.push(NODES[f].start);
+                RAW_SPANS.push(NODES[f].end);
+                RAW_SPANS.push(NODES[p].a);
+            }
+        }
+    }
+}
+
+// Whether e names a raw parameter (RAW_SPANS) inside its function.
+fn raw_ref(e: i64) -> bool {
+    unsafe {
+        if NODES[e].kind != NodeKind::Ident {
+            return false;
+        }
+        let mut i = 0;
+        while i < RAW_SPANS.count {
+            if NODES[e].a == RAW_SPANS.data[i + 2] && NODES[e].start >= RAW_SPANS.data[i]
+                && NODES[e].end <= RAW_SPANS.data[i + 1] {
+                return true;
+            }
+            i += 3;
+        }
+        false
+    }
+}
+
+// Whether call c's parameter i is a raw parameter (RAW_PARAMS).
+fn raw_param_at(c: i64, i: i64) -> bool {
+    unsafe {
+        let f = NODES[c].x - 1;
+        if f < 0 || f >= FN_COUNT {
+            return false;
+        }
+        let p = crate::front::conv::param_node(f, i);
+        p > 0 && RAW_PARAMS.get(p + 1) != 0
+    }
+}
+
+// Whether call c's parameter i is a let parameter in 0.20's spelling (std's
+// `fn display<T>(inout self, x: T)`): an `&e` given to it goes.
+fn let_param_at(c: i64, i: i64) -> bool {
+    unsafe {
+        let f = NODES[c].x - 1;
+        if f < 0 || f >= FN_COUNT {
+            return false;
+        }
+        let p = crate::front::conv::param_node(f, i);
+        p > 0 && crate::front::conv::param_conv(p) == crate::front::conv::CONV_LET
+    }
+}
+
+// The references converted to raw pointers by the checker
+// (check_mode::RAW_FROM_REF): a parameter that becomes an access is its
+// value, so its address is written `&x`.
+fn raw_addresses() {
+    unsafe {
+        let v = crate::front::check::check_mode::RAW_FROM_REF;
+        for i in 0..v.count {
+            let n = v.data[i];
+            if NODES[n].kind != NodeKind::Ident || !editable(NODES[n].start) || raw_ref(n) {
+                continue;
+            }
+            let f = enclosing_fn(NODES[n].start);
+            if f > 0 && ref_param_named(f, NODES[n].a) > 0 {
+                put(NODES[n].start, NODES[n].start, "&", CC_MARKER);
+            }
+        }
     }
 }
 
@@ -847,12 +1039,9 @@ fn edit_fn_type(n: i64) {
                 TYPE_DONE.put(tn + 1, 1);
                 let inner = if k == NodeKind::TySlice { skip_ws(s + 1) }
                     else { NODES[NODES[tn].a].start };
-                put(s, inner, if CONV_SPELLING && k == NodeKind::TyPtr { "let " } else { "" },
-                    CC_PARAM_LET);
-            } else if k == NodeKind::TyPtr && (NODES[tn].p & CONV_NEW) != 0 && !CONV_SPELLING
-                && (NODES[tn].p & NODE_REF_MUT) == 0 && word_here(s, "let") {
-                // (`fn(let T)`, conventions-spelling's: `fn(T)`)
-                put(s, skip_ws(s + 3), "", CC_PARAM_LET);
+                // (Phase M: in a function type an unwritten parameter is
+                // taken by value, as 0.19's; a let one is written `let T`)
+                put(s, inner, if k == NodeKind::TyPtr { "let " } else { "" }, CC_PARAM_LET);
             } else if k == NodeKind::TyName && sink_by_name(tn, n, false, 0) {
                 left(s, CL_FN_TYPE);
             }
@@ -995,6 +1184,7 @@ pub fn conventions_edits() -> i64 {
                 }
             }
         }
+        find_raw_params();
         // The signatures, first (their type nodes are theirs).
         for n in 1..NODE_COUNT {
             let k = NODES[n].kind;
@@ -1008,6 +1198,7 @@ pub fn conventions_edits() -> i64 {
             }
         }
         raw_amps();
+        raw_addresses();
         for n in 1..NODE_COUNT {
             edit_node(n);
         }

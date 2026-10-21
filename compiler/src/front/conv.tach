@@ -33,8 +33,10 @@ use crate::front::types::{
 // The first line that makes a crate legacy (its root file's first bytes).
 pub const LEGACY_MARKER: [u8] = "// tachyon-syntax: 0.19";
 
-// `--syntax=0.20` (main's arguments, every command): 0.20's spelling only.
-pub static mut STRICT: bool = false;
+// `--syntax=0.20` (main's arguments, every command): 0.20's spelling only,
+// the default from Phase M; `--syntax=mixed` reads 0.19's too (an opt-out
+// for code not yet migrated by `tachyonc fix --only conventions`).
+pub static mut STRICT: bool = true;
 // The root file starts with LEGACY_MARKER (set by conv_setup).
 pub static mut LEGACY_ROOT: bool = false;
 
@@ -97,6 +99,7 @@ static mut CACHE_FILE: i64 = -1;
 static mut CACHE_START: i64 = 0;
 static mut CACHE_END: i64 = 0;
 static mut CACHE_USER: bool = false;
+static mut CACHE_STD: bool = false;
 
 // Whether pos is in a file of the program's own crate (not std's, not a
 // generated source).
@@ -109,7 +112,12 @@ fn user_at(pos: i64) -> bool {
         CACHE_FILE = f;
         CACHE_START = FILES[f].start;
         CACHE_END = FILES[f].end;
-        CACHE_USER = FILES[f].path[0] != '<' && !within_std(FILES[f].module);
+        // (std's files and its built-in text, `<std>`; not the virtual
+        // modules the compiler writes, `<std::arch::aarch64>`, in 0.19's
+        // spelling until compiler/src migrates)
+        let p = FILES[f].path;
+        CACHE_STD = within_std(FILES[f].module) && !(p[0] == '<' && p[4] == ':');
+        CACHE_USER = FILES[f].path[0] != '<' && !CACHE_STD;
         CACHE_USER
     }
 }
@@ -121,7 +129,23 @@ pub fn legacy_at(pos: i64) -> bool {
 
 // Read in 0.20's spelling only.
 pub fn strict_at(pos: i64) -> bool {
-    unsafe { STRICT && !LEGACY_ROOT && user_at(pos) }
+    unsafe {
+        // (std is 0.20 code from Phase M, whatever the program's mode;
+        // the compiler's generated sources, `<check>` and the like, are
+        // read mixed until compiler/src migrates, 0.21)
+        let user = user_at(pos);
+        CACHE_STD || STRICT && !LEGACY_ROOT && user
+    }
+}
+
+// Whether pos is in a source the compiler made (`<derive>`, `<check>`,
+// ...: not std, not the program's): 0.19's spelling, whose `&e` is not an
+// inout marker (front/parser/exprs: parse_prefix).
+pub fn generated_at(pos: i64) -> bool {
+    unsafe {
+        let user = user_at(pos);
+        !user && !CACHE_STD
+    }
 }
 
 // Whether token i is the identifier `word` (`inout`, `sink`, `var`: words
@@ -370,6 +394,48 @@ pub fn param_type(p: i64, ty: i64) -> i64 {
     }
 }
 
+// (0.20) What a let parameter of type base is: a copy of a copyable value
+// (a slice is one), else a shared reference.
+pub fn let_of(base: i64) -> i64 {
+    unsafe {
+        if base <= 0 || base == TY_ERROR || TYPES[base].kind == TyKind::Slice || copyable(base) {
+            return base;
+        }
+        ref_to(base, REF_SHARED)
+    }
+}
+
+// (0.20) A function type's parameter written `let T` (node t, resolved to
+// `&T`): let_of(T), as a let parameter's.
+pub fn fn_type_param(t: i64, ty: i64) -> i64 {
+    unsafe {
+        if NODES[t].kind == NodeKind::TyPtr && (NODES[t].p & CONV_NEW) != 0
+            && (NODES[t].p & NODE_REF_MUT) == 0 && ty > 0 && TYPES[ty].kind == TyKind::Ptr {
+            return let_of(TYPES[ty].a);
+        }
+        ty
+    }
+}
+
+// (0.20) A closure parameter p annotated with type ty: `a: let T`, and `a: T`
+// in a 0.20 file, are let (let_of); `a: inout T` and 0.19's spellings are
+// as written.
+pub fn closure_param_type(p: i64, ty: i64) -> i64 {
+    unsafe {
+        let t = NODES[p].b;
+        if t <= 0 || ty <= 0 || ty == TY_ERROR {
+            return ty;
+        }
+        if (NODES[t].p & CONV_NEW) != 0 {
+            return fn_type_param(t, ty);
+        }
+        if strict_at(NODES[p].start) && TYPES[ty].kind != TyKind::Ptr {
+            return let_of(ty);
+        }
+        ty
+    }
+}
+
 // Whether Param p is an access (a let parameter that borrows, or an inout
 // one) of type ty: its uses are the value it designates.
 pub fn param_is_access(p: i64, ty: i64) -> bool {
@@ -400,6 +466,60 @@ pub fn let_copy_for_ref(p: i64, it: i64, tt: i64) -> bool {
     unsafe {
         p > 0 && param_conv(p) == CONV_LET && tt > 0 && TYPES[tt].kind == TyKind::Ptr
             && TYPES[tt].b == REF_SHARED && TYPES[tt].a == it
+    }
+}
+
+// (0.20, conventions.md §9.3: legacy calls into new std) Whether an impl's
+// parameter p written in 0.19's spelling, a shared reference `&T` of type
+// it, meets its trait's let parameter tp that copies T (tt): the 0.19
+// spelling of a let (`fn eq(self: &Self, other: &Self)` for `fn eq(self,
+// other: Self)`). The impl keeps its reference; its calls pass places.
+pub fn legacy_ref_for_copy(p: i64, tp: i64, it: i64, tt: i64) -> bool {
+    unsafe {
+        p > 0 && tp > 0 && param_conv(p) == CONV_LEGACY && param_conv(tp) == CONV_LET
+            && it > 0 && TYPES[it].kind == TyKind::Ptr && TYPES[it].b == REF_SHARED
+            && TYPES[it].a == tt
+    }
+}
+
+// (0.20, §9.3) The arguments of call n to f (from parameter first_param
+// on) written `&e` in a file not read in 0.20's spelling (a legacy crate,
+// a mixed file, std, a checker's desugaring: `a == b`'s `eq(&b)`, an
+// f-string's holes) where f's parameter is let in 0.20's spelling: the `&`
+// is dropped, so that a let parameter that copies (or a generic `x: T`)
+// takes the value, as the 0.19 `&T` it replaces took the reference. A let
+// parameter that borrows borrows the place itself.
+pub fn legacy_let_args(n: i64, f: i64, first_param: i64) {
+    unsafe {
+        if f < 0 {
+            return;
+        }
+        for i in 0..NODES[n].count {
+            let arg = child(n, i);
+            if NODES[arg].kind != NodeKind::Unary || NODES[arg].op != Tok::Amp
+                || (NODES[arg].p & (CONV_NEW | NODE_REF_MUT)) != 0 {
+                continue;
+            }
+            let p = param_node(f, first_param + i);
+            if p <= 0 || param_conv(p) != CONV_LET || !syntactic_place(NODES[arg].b) {
+                continue;
+            }
+            NODES[arg] = NODES[NODES[arg].b];
+        }
+    }
+}
+
+// Whether e is written as a place: a name, a field, an element, `*p`.
+fn syntactic_place(e: i64) -> bool {
+    unsafe {
+        let k = NODES[e].kind;
+        if k == NodeKind::Ident {
+            return true;
+        }
+        if k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Index {
+            return syntactic_place(NODES[e].a);
+        }
+        k == NodeKind::Unary && NODES[e].op == Tok::Star
     }
 }
 
