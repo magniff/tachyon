@@ -996,3 +996,30 @@ tree. Their essential lines:
   required: bool, instance: bool) -> MethodDesc;` returns a 16-byte
   struct in x0/x1. The type strings were identical for the protocol and
   for the concrete class `AGXG17GDevice`.
+
+## As built: the shader compiler (std::gpu::shader, branch g22-shaderb)
+
+- **Where.** `std::gpu::shader` (compiler/std/gpu/shader/), in std's
+  embedded tree behind a closed gate (compiler/std/index.awk: its sections
+  are read only by a program naming `gpu`); `tools/wgslc` is its command
+  line (`check ir msl reflect run metal-job bench explain`). The design's
+  `std::gpu::wgsl` name became `shader`: the IR is target-neutral (no
+  Metal slots or names in ir.tach), so other front ends and back ends
+  (SPIR-V, PTX) share it.
+- **API.** `shader::translate(src, options(TARGET_MSL), &mut out, &mut
+  refl, &mut err, gpa) -> bool`; `Reflection` has the entry points (MSL
+  names, workgroup sizes), the bindings in (group, binding) order (kind,
+  min size, a slot per stage: buffers, textures and samplers each from 0
+  over what the stage uses, the rule of the Metal hal on g22-metal), the
+  vertex inputs, and the sizes buffer (one u32 per runtime-sized storage
+  binding, at the stage's next buffer slot; `EntryInfo.sizes_slot`).
+- **Tested.** tests/wgsl/run.sh (category `wgsl` of tests/run.sh): every
+  case on the interpreter and on Metal (headless, tests/wgsl/metalrun);
+  vertex and fragment entry points run alone through *call jobs* (the MSL
+  writer derives a test kernel with the same body), so the terminal's
+  `cells.wgsl` stages are checked against the interpreter; render
+  shaders with sampling are compiled by Metal.
+- **0.22.1.** SPIR-V (spirv.tach is a stub), the uniformity analysis
+  (uniformity.tach is a stub; WGSL's rule is not checked yet), the shader
+  fuzzer, `@size`/`@align`, override constants, sampling in the
+  interpreter.
