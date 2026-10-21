@@ -23,6 +23,7 @@ use crate::middle::ir::{
     ir_unlink, ir_val,
 };
 use crate::middle::ir::Op::{Add, GAddr, Load, Phi, SAddr, Store};
+use crate::middle::ir::atomic::is_barrier;
 use crate::middle::ir::cfg::{succ, succ_count};
 use crate::middle::ir::verify::verify_func;
 use crate::middle::loops::{
@@ -30,7 +31,7 @@ use crate::middle::loops::{
     loop_preheader, loop_size, seal_all,
 };
 use crate::middle::lower::ssa::{new_synth_var, ssa_read, ssa_write};
-use crate::middle::opt::{remove_trivial_phis, resolve_all};
+use crate::middle::opt::{dominates, remove_trivial_phis, resolve_all};
 use crate::middle::range::{prepare_ranges, value_range_at};
 
 const MAX_ACCESSES: i64 = 2000;
@@ -134,7 +135,7 @@ fn collect_accesses(mut cx: *FnCtx, l: i64) -> bool {
                     let ty = if op == Load { cx.insts[v].ty } else { cx.insts[v].imm2 };
                     cx.accesses.push(type_size(ty));
                     cx.accesses.push(ty);
-                } else if is_copy(cx, v) || op.is_call() {
+                } else if is_copy(cx, v) || op.is_call() || is_barrier(cx, v) {
                     cx.accesses.push(v);
                     cx.accesses.push(0);
                     cx.accesses.push(0);
@@ -234,6 +235,13 @@ fn can_promote(mut cx: *FnCtx, l: i64, root: i64, base: i64, offset: i64, ty: i6
                 uses += 1;
                 continue;
             }
+            // (0.21) An atomic or a fence: only private memory moves across.
+            if is_barrier(cx, v) {
+                if !private {
+                    return false;
+                }
+                continue;
+            }
             if op.is_call() && !is_copy(cx, v) {
                 if !private && (call_reads(cx, v) || call_writes(cx, v)) {
                     return false;
@@ -257,7 +265,68 @@ fn can_promote(mut cx: *FnCtx, l: i64, root: i64, base: i64, offset: i64, ty: i6
                 return false;
             }
         }
+        // (0.21, docs/design/concurrency.md §4.2, O3) The value is stored back
+        // at the loop's exits: for memory another thread may see (a slot
+        // whose address escapes), only when the loop stored it on the way to
+        // every exit, so that no store is invented on a path that made none.
+        // A static is main-thread memory (§2.5).
+        if uses >= 2 && !private && cx.insts[root].op == Op::Slot
+            && !stores_before_exits(cx, l, base, offset) {
+            return false;
+        }
         uses >= 2
+    }
+}
+
+// (0.21) Whether loop l stores to [base + offset] before it can leave: each
+// block that exits the loop is dominated by a block of the loop that
+// stores there (or the loop does not store there at all).
+fn stores_before_exits(mut cx: *FnCtx, l: i64, base: i64, offset: i64) -> bool {
+    unsafe {
+        let mut any = false;
+        for i in 0..loop_size(cx, l) {
+            let b = loop_block(cx, l, i);
+            let mut v = cx.blocks[b].first;
+            while v != 0 {
+                if is_location(cx, v, Store, base, offset) {
+                    any = true;
+                }
+                v = cx.insts[v].next;
+            }
+        }
+        if !any {
+            return true;
+        }
+        for i in 0..loop_size(cx, l) {
+            let x = loop_block(cx, l, i);
+            let mut exits = false;
+            for k in 0..succ_count(cx, x) {
+                if !loop_contains(cx, l, succ(cx, x, k)) {
+                    exits = true;
+                }
+            }
+            if !exits {
+                continue;
+            }
+            let mut covered = false;
+            for j in 0..loop_size(cx, l) {
+                let s = loop_block(cx, l, j);
+                if covered || !dominates(cx, s, x) {
+                    continue;
+                }
+                let mut v = cx.blocks[s].first;
+                while v != 0 {
+                    if is_location(cx, v, Store, base, offset) {
+                        covered = true;
+                    }
+                    v = cx.insts[v].next;
+                }
+            }
+            if !covered {
+                return false;
+            }
+        }
+        true
     }
 }
 
