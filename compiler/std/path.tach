@@ -1,0 +1,302 @@
+// std::path (0.20, docs/design/collections-text-io.md §2.6.3, task B6):
+// Path, a view of a path's bytes (Unix paths are bytes, as Rust's OsStr
+// is on Unix), and PathBuf, one that owns them, on an allocator. A string
+// literal is a Path where one goes, a Path goes where `[u8]` does, and
+// `&p` of a PathBuf where a Path or `[u8]` does.
+
+use std::{Allocator, Debug, Display, Fmt, Gpa, Iterator, Option, Vec};
+use std::str::validate_utf8;
+use std::string::str;
+
+// ---- Paths (0.20) ----
+
+// A path: its bytes, '/' between its components.
+pub type Path = distinct [u8];
+
+// The index of the last '/' in b, or -1.
+fn last_slash(b: [u8]) -> i64 {
+    var i = b.len;
+    while i > 0 {
+        i -= 1;
+        if b[i] == '/' {
+            return i;
+        }
+    }
+    -1
+}
+
+// b without the '/'s at its end (one stays for the root).
+fn trim_slashes(b: [u8]) -> [u8] {
+    var n = b.len;
+    while n > 1 && b[n - 1] == '/' {
+        n -= 1;
+    }
+    b[..n]
+}
+
+impl Path {
+    // The path of bytes (or text) s: `Path::new("a/b.txt")`.
+    #[inline]
+    pub fn new(s: [u8]) -> Path {
+        s as Path
+    }
+
+    #[inline]
+    pub fn as_bytes(self) -> [u8] {
+        self as [u8]
+    }
+
+    #[inline]
+    pub fn len(self) -> i64 {
+        (self as [u8]).len
+    }
+
+    // Its text, when its bytes are UTF-8.
+    pub fn to_str(self) -> Option<str> {
+        match str::from_utf8(self as [u8]) {
+            Ok(s) => Option::Some(s),
+            Err(_) => Option::None,
+        }
+    }
+
+    // What prints it (Path is Display itself: its bytes).
+    #[inline]
+    pub fn display(self) -> Path {
+        self
+    }
+
+    pub fn is_absolute(self) -> bool {
+        let b = self as [u8];
+        b.len > 0 && b[0] == '/'
+    }
+
+    pub fn is_relative(self) -> bool {
+        !self.is_absolute()
+    }
+
+    // The last component (None for "/", "", "..", or one ending in "..").
+    pub fn file_name(self) -> Option<Path> {
+        let b = trim_slashes(self as [u8]);
+        if b.len == 0 || b == "/" {
+            return Option::None;
+        }
+        let name = b[last_slash(b) + 1..];
+        if name == ".." || name == "." {
+            return Option::None;
+        }
+        Option::Some(name as Path)
+    }
+
+    // The path without its last component ("" for a single component, None
+    // for "/" and "").
+    pub fn parent(self) -> Option<Path> {
+        let b = trim_slashes(self as [u8]);
+        if b.len == 0 || b == "/" {
+            return Option::None;
+        }
+        let k = last_slash(b);
+        if k < 0 {
+            return Option::Some(""[..0] as Path);
+        }
+        if k == 0 {
+            return Option::Some(b[..1] as Path);
+        }
+        Option::Some(trim_slashes(b[..k]) as Path)
+    }
+
+    // The file name after its last '.' (none for ".bashrc" or "a").
+    pub fn extension(self) -> Option<Path> {
+        match self.file_name() {
+            Option::Some(n) => {
+                let b = n as [u8];
+                let k = last_dot(b);
+                if k <= 0 { Option::None } else { Option::Some(b[k + 1..] as Path) }
+            }
+            Option::None => Option::None,
+        }
+    }
+
+    // The file name before its last '.'.
+    pub fn file_stem(self) -> Option<Path> {
+        match self.file_name() {
+            Option::Some(n) => {
+                let b = n as [u8];
+                let k = last_dot(b);
+                if k <= 0 { Option::Some(n) } else { Option::Some(b[..k] as Path) }
+            }
+            Option::None => Option::None,
+        }
+    }
+
+    // Whether its first components are base's.
+    pub fn starts_with(self, base: Path) -> bool {
+        let a = self as [u8];
+        let b = trim_slashes(base as [u8]);
+        if b.len > a.len || a[..b.len] != b {
+            return false;
+        }
+        a.len == b.len || b == "/" || a[b.len] == '/'
+    }
+
+    // The components ("/" first for an absolute path; "." and empty ones
+    // left out, as Rust's).
+    #[inline]
+    pub fn components(self) -> Components {
+        Components { b: self as [u8], pos: 0 }
+    }
+
+    // The path with p after it, on allocator a (p absolute: p).
+    pub fn join_in<A: Allocator>(self, p: [u8], a: sink A) -> PathBuf<A> {
+        var out: PathBuf<A> = PathBuf::from_in(self as [u8], a);
+        out.push(p);
+        out
+    }
+
+    // An owned copy, on allocator a.
+    pub fn to_path_buf_in<A: Allocator>(self, a: sink A) -> PathBuf<A> {
+        PathBuf::from_in(self as [u8], a)
+    }
+
+    // Whether something is there (std::fs::metadata succeeds).
+    pub fn exists(self) -> bool {
+        std::fs::exists(self as [u8])
+    }
+
+    pub fn is_dir(self) -> bool {
+        match std::fs::metadata(self as [u8]) {
+            Ok(m) => m.is_dir(),
+            Err(_) => false,
+        }
+    }
+
+    pub fn is_file(self) -> bool {
+        match std::fs::metadata(self as [u8]) {
+            Ok(m) => m.is_file(),
+            Err(_) => false,
+        }
+    }
+}
+
+// The index of the last '.' in b, or -1.
+fn last_dot(b: [u8]) -> i64 {
+    var i = b.len;
+    while i > 0 {
+        i -= 1;
+        if b[i] == '.' {
+            return i;
+        }
+    }
+    -1
+}
+
+// `p.components()`.
+pub struct Components { b: [u8], pos: i64 }
+
+impl Iterator for Components {
+    type Item = Path;
+
+    fn next(inout self) -> Option<Path> {
+        let b = self.b;
+        if self.pos == 0 && b.len > 0 && b[0] == '/' {
+            self.pos = 1;
+            return Option::Some(b[..1] as Path);
+        }
+        loop {
+            while self.pos < b.len && b[self.pos] == '/' {
+                self.pos += 1;
+            }
+            if self.pos >= b.len {
+                return Option::None;
+            }
+            let start = self.pos;
+            while self.pos < b.len && b[self.pos] != '/' {
+                self.pos += 1;
+            }
+            let c = b[start..self.pos];
+            if c != "." {
+                return Option::Some(c as Path);
+            }
+        }
+    }
+}
+
+// An owned path, on allocator A.
+#[sealed]
+pub struct PathBuf<A: Allocator = Gpa> { pub bytes: Vec<u8, A> }
+
+impl<A: Allocator> PathBuf<A> {
+    pub fn new_in(a: sink A) -> PathBuf<A> {
+        PathBuf { bytes: Vec::new_in(a) }
+    }
+
+    // A PathBuf of p's bytes.
+    pub fn from_in(p: [u8], a: sink A) -> PathBuf<A> {
+        var v: Vec<u8, A> = Vec::with_capacity_in(p.len, a);
+        v.extend_from_slice(p);
+        PathBuf { bytes: v }
+    }
+
+    #[inline]
+    pub fn as_path(self) -> Path {
+        self.bytes.as_slice() as Path
+    }
+
+    #[inline]
+    pub fn as_bytes(self) -> [u8] {
+        self.bytes.as_slice()
+    }
+
+    // Appends p after a '/' (p absolute: p replaces the path).
+    pub fn push(inout self, p: [u8]) {
+        if p.len > 0 && p[0] == '/' {
+            self.bytes.clear();
+        } else if self.bytes.len > 0 && self.bytes.as_slice()[self.bytes.len - 1] != '/' {
+            self.bytes.push('/');
+        }
+        self.bytes.extend_from_slice(p);
+    }
+
+    // Removes the last component: false when there is none.
+    pub fn pop(inout self) -> bool {
+        match self.as_path().parent() {
+            Option::Some(q) => {
+                let n = (q as [u8]).len;
+                self.bytes.truncate(n);
+                true
+            }
+            Option::None => false,
+        }
+    }
+
+    // Its extension replaced by ext (added when it has none; ext "" removes
+    // it): false when it has no file name.
+    pub fn set_extension(inout self, ext: [u8]) -> bool {
+        let stem_end = match self.as_path().file_stem() {
+            Option::Some(s) => {
+                // (the stem starts the last component)
+                let b = trim_slashes(self.bytes.as_slice());
+                last_slash(b) + 1 + (s as [u8]).len
+            }
+            Option::None => return false,
+        };
+        self.bytes.truncate(stem_end);
+        if ext.len > 0 {
+            self.bytes.push('.');
+            self.bytes.extend_from_slice(ext);
+        }
+        true
+    }
+}
+
+impl<A: Allocator> Display for PathBuf<A> {
+    fn fmt(self, f: inout Fmt) {
+        f.str(self.bytes.as_slice());
+    }
+}
+
+impl<A: Allocator> Debug for PathBuf<A> {
+    fn fmt_debug(self, f: inout Fmt) {
+        let s = self.bytes.as_slice();
+        s.fmt_debug(&f);
+    }
+}

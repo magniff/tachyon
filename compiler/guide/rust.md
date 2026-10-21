@@ -9,16 +9,20 @@ more often than to something else, and each error names the fix.
 
 | Rust | tachyon |
 |---|---|
-| `&str`, `String`, `&[u8]` | `[u8]`: a pointer and a length; `"abc"` is one; no UTF-8 type |
-| `String::new()`, `push_str`, `format!` | `std::Buf` (`Buf::new_in(gpa)`): `push`, `push_str`, `push_int`, `push_fmt(f"..")` (or `push_str(f"..")`), `as_slice`; `format_in(f"..", gpa)` |
+| `&str`, `String` | the same (0.20): `str` is UTF-8 text, a view (`&str` is `str`; a literal is one where one goes, and a `str` goes where `[u8]` does); `String` owns it, on an allocator: `String::new_in(gpa)`, `String::from_in("x", gpa)`; `&s` of a String goes where a `str` does, and it has `str`'s methods (`guide text`) |
+| `String::new()`, `push_str`, `format!` | `String::new_in(gpa)`, `push_str`, `push(c)` (a `u32` code point: no `char` yet), `push_fmt(f"..")`; `to_string_in(f"..", gpa)`; `std::Buf` for bytes, `format_in(f"..", gpa)` (a Buf) |
+| `&[u8]` | `[u8]`: bytes; `str::from_utf8(b)?` makes a `str` of them (checked); `"abc"` is a `[u8]` where no `str` goes |
 | `s.len()` | the same, an `i64` |
 | `s == "x"`, `s < t` | the same (std's `Eq` and `Ord` for `[u8]`, by bytes) |
 | `&s[1..3]` | `s[1..3]` (checked) |
 | `s.as_bytes()[0]`, `b'a'` | `s[0]`, `'a'` (a `u8`) |
 | `CString`, `.as_ptr()` | `c"text"` (a `*u8`); a slice is not NUL-terminated |
 | `match s { "a" => .. }` | `if s == "a" { .. } else if ...` |
-| `x.to_string()`, `s.parse::<i64>()` | `Buf::push_int`; `std::parse_int(s)` (a `Result<i64, ParseIntError>`, 0.15) |
-| `s.trim()`, `s.split(',')`, `s.split_whitespace()` | `std::trim(s)`; `std::split_in(s, ',', gpa)`, `std::split_whitespace_in(s, gpa)`: a `Vec<[u8]>` of views of `s` |
+| `x.to_string()`, `s.parse::<i64>()` | `to_string_in(x, gpa)`, `s.to_string_in(gpa)`; `s.parse::<i64>()` on a `str` (0.20; `std::parse_int(b)` on bytes) |
+| `s.trim()`, `s.split(',')`, `s.split_whitespace()`, `s.lines()` | the same on a `str` (0.20): views of `s`, no allocation; `.collect_in(gpa)` for a Vec; on bytes `std::trim(b)`, `std::split_in(b, ',', gpa)` |
+| `s.to_uppercase()`, `s.replace(a, b)` | `s.to_uppercase_in(gpa)`, `s.replace_in(a, b, gpa)`: the Rust form is `alloc.explicit`, its `try:` the `_in` form |
+| `std::fs::read_to_string(p)?`, `File::open(p)?`, `BufReader::new(f)` | `fs::read_to_string_in(p, gpa)?`; `File::open(p)?` and `BufReader::new(f)` as Rust's (no allocation); `r.lines_in(gpa)`, `r.read_line(&mut s)?` (`guide io`) |
+| `std::env::args()`, `Command::new(p).arg(a).output()` | `env::args()` (views, `.collect_in(gpa)`); `let mut c = Command::new(p); c.arg(a); c.output_in(gpa)?` (`arg` changes `c`: no chaining) |
 
 ```tach
 fn main(gpa: Gpa) -> i32 {
@@ -58,7 +62,7 @@ value itself.
 | `let r = &x; f(r)` | `f(x)`: a let argument needs no reference |
 | `*r = v`, `*n + 1`, `(*p).f` | `r = v`, `n + 1`, `p.f`: an access is used as its value (`*` is only for raw pointers) |
 | `&T` / `&mut T` fields | `let T` / `inout T` fields: `struct P { q: inout Query }`, built with `q: &q` |
-| `&str`, `&[T]`, `&mut [T]` | `[u8]`, `[T]` (read-only), `inout [T]` (writable) |
+| `&str`, `&[T]`, `&mut [T]` | `str` (0.20), `[T]` (read-only), `inout [T]` (writable) |
 | `move \|\| ..` | `sink \|\| ..` |
 | `static mut` | `static var` |
 | `match &mut x { .. }` | `match &x { .. }`: binds inout accesses |

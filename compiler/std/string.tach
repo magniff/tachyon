@@ -1,0 +1,1398 @@
+// std::string (0.20, docs/design/collections-text-io.md §2.5, task B5):
+// `str`, the view of UTF-8 text, and `String`, UTF-8 text that owns its
+// bytes, with Rust's names. A `str` is std::str's `[u8]` known to be
+// UTF-8: the compiler takes string literals as one where a `str` goes,
+// `&str` as `str`, and lets a `str` go where `[u8]` does; bytes become a
+// `str` only checked (`str::from_utf8`), outside std. What allocates takes
+// an allocator, the `_in` forms; the Rust forms (`to_uppercase()`,
+// `String::new()`) are errors naming them. A code point is a `u32` until
+// `char` exists.
+//
+// Searching takes a Pattern: a `str` or `[u8]` (a substring), a `u8` (an
+// ASCII byte: `','`) or a `u32` (a code point). Empty patterns match at
+// every char boundary, as Rust's do.
+
+use std::{
+    Allocator, Ambient, Buf, Clone, Debug, Display, Eq, Fmt, Gpa, Hash, Iterator, Option, Ord,
+    ParseIntError, Result, Vec,
+};
+use std::num::{ParseFloatError, parse_f32, parse_f64, parse_i64_radix, parse_u64_radix};
+use std::str::{
+    Utf8Error, encode_utf8, is_char_boundary, lossy_next, memchr, memrchr, next_code_point,
+    next_code_point_reverse, utf8_char_width, validate_utf8,
+};
+use std::unicode::{Graphemes, graphemes, is_whitespace, str_width, to_lower, to_upper};
+
+// ---- Text: str (0.20) ----
+
+// UTF-8 text, a view: `[u8]` whose bytes are UTF-8 (0.20). String literals
+// are `str` where one goes; `&str` is `str`; a `str` goes where `[u8]` does,
+// for free; bytes become one through `str::from_utf8(b)?`.
+pub type str = distinct [u8];
+
+// Whether code point cp is White_Space (ASCII first).
+#[inline]
+fn is_space_cp(cp: u32) -> bool {
+    if cp < 0x80 {
+        return cp == 0x20 || (cp >= 0x09 && cp <= 0x0d);
+    }
+    is_whitespace(cp)
+}
+
+// The code point that starts at byte i of s (UTF-8), and its length.
+#[inline]
+fn cp_at(s: [u8], i: i64) -> (u32, i64) {
+    let b = s[i];
+    if b < 0x80 {
+        return (b as u32, 1);
+    }
+    var p = i;
+    let cp = lossy_next(s, &p);
+    (cp, p - i)
+}
+
+// The code point that ends at byte `end` of s, and its length.
+#[inline]
+fn cp_before(s: [u8], end: i64) -> (u32, i64) {
+    let b = s[end - 1];
+    if b < 0x80 {
+        return (b as u32, 1);
+    }
+    var start = end - 1;
+    while start > 0 && end - start < 4 && (s[start] & 0xc0) == 0x80 {
+        start -= 1;
+    }
+    var p = start;
+    let cp = lossy_next(s, &p);
+    if p != end {
+        return (0xfffd, 1);
+    }
+    (cp, end - start)
+}
+
+// The index of the first byte b in s at or after `from`, or -1: a plain
+// loop over a short span (a field, a line), std::str's memchr (NEON) over
+// a long one.
+#[inline]
+fn find_byte(b: u8, s: [u8], from: i64) -> i64 {
+    var i = from;
+    let short = if s.len - from < 32 { s.len } else { from + 32 };
+    while i < short {
+        if s[i] == b {
+            return i;
+        }
+        i += 1;
+    }
+    if i >= s.len {
+        return -1;
+    }
+    match memchr(b, s[i..]) {
+        Option::Some(k) => i + k,
+        Option::None => -1,
+    }
+}
+
+// Where `needle` first occurs in s at or after `from`, or -1.
+fn find_bytes(s: [u8], needle: [u8], from: i64) -> i64 {
+    let n = needle.len;
+    if n == 0 {
+        return if from <= s.len { from } else { -1 };
+    }
+    let first = needle[0];
+    if s.len < n {
+        return -1;
+    }
+    let hay = s[..s.len - n + 1];
+    var i = from;
+    while i < hay.len {
+        let at = find_byte(first, hay, i);
+        if at < 0 {
+            return -1;
+        }
+        var same = true;
+        for j in 1..n {
+            if s[at + j] != needle[j] {
+                same = false;
+                break;
+            }
+        }
+        if same {
+            return at;
+        }
+        i = at + 1;
+    }
+    -1
+}
+
+// Where `needle` last occurs in s[..to], or -1.
+fn rfind_bytes(s: [u8], needle: [u8], to: i64) -> i64 {
+    let n = needle.len;
+    if n == 0 {
+        return to;
+    }
+    if n > to {
+        return -1;
+    }
+    let last = needle[n - 1];
+    var end = to;
+    while end >= n {
+        match memrchr(last, s[n - 1..end]) {
+            Option::Some(k) => {
+                let at = k;
+                var same = true;
+                for j in 0..n - 1 {
+                    if s[at + j] != needle[j] {
+                        same = false;
+                        break;
+                    }
+                }
+                if same {
+                    return at;
+                }
+                end = at + n - 1;
+            }
+            Option::None => return -1,
+        }
+    }
+    -1
+}
+
+// What `split`, `find`, `trim_matches` and their kin look for: a `str` or
+// `[u8]` (a substring), a `u8` (a byte: `','`) or a `u32` (a code point).
+pub trait Pattern {
+    // The first match in s at or after byte `from`: its start and end, or
+    // (-1, -1).
+    fn next_match(self, s: [u8], from: i64) -> (i64, i64);
+    // The last match in s[..to]: its start and end, or (-1, -1).
+    fn last_match(self, s: [u8], to: i64) -> (i64, i64);
+    // The length of a match at the start of s, or -1.
+    fn prefix_len(self, s: [u8]) -> i64;
+    // The length of a match at the end of s, or -1.
+    fn suffix_len(self, s: [u8]) -> i64;
+}
+
+impl Pattern for [u8] {
+    fn next_match(self, s: [u8], from: i64) -> (i64, i64) {
+        let at = find_bytes(s, self, from);
+        if at < 0 { (-1, -1) } else { (at, at + self.len) }
+    }
+
+    fn last_match(self, s: [u8], to: i64) -> (i64, i64) {
+        let at = rfind_bytes(s, self, to);
+        if at < 0 { (-1, -1) } else { (at, at + self.len) }
+    }
+
+    fn prefix_len(self, s: [u8]) -> i64 {
+        let p = self;
+        if p.len <= s.len && s[..p.len] == p { p.len } else { -1 }
+    }
+
+    fn suffix_len(self, s: [u8]) -> i64 {
+        let p = self;
+        if p.len <= s.len && s[s.len - p.len..] == p { p.len } else { -1 }
+    }
+}
+
+impl Pattern for str {
+    fn next_match(self, s: [u8], from: i64) -> (i64, i64) {
+        let p = self as [u8];
+        p.next_match(s, from)
+    }
+
+    fn last_match(self, s: [u8], to: i64) -> (i64, i64) {
+        let p = self as [u8];
+        p.last_match(s, to)
+    }
+
+    fn prefix_len(self, s: [u8]) -> i64 {
+        let p = self as [u8];
+        p.prefix_len(s)
+    }
+
+    fn suffix_len(self, s: [u8]) -> i64 {
+        let p = self as [u8];
+        p.suffix_len(s)
+    }
+}
+
+impl Pattern for u8 {
+    fn next_match(self, s: [u8], from: i64) -> (i64, i64) {
+        let at = if from < s.len { find_byte(self, s, from) } else { -1 };
+        if at < 0 { (-1, -1) } else { (at, at + 1) }
+    }
+
+    fn last_match(self, s: [u8], to: i64) -> (i64, i64) {
+        match memrchr(self, s[..to]) {
+            Option::Some(k) => (k, k + 1),
+            Option::None => (-1, -1),
+        }
+    }
+
+    fn prefix_len(self, s: [u8]) -> i64 {
+        if s.len > 0 && s[0] == self { 1 } else { -1 }
+    }
+
+    fn suffix_len(self, s: [u8]) -> i64 {
+        if s.len > 0 && s[s.len - 1] == self { 1 } else { -1 }
+    }
+}
+
+impl Pattern for u32 {
+    fn next_match(self, s: [u8], from: i64) -> (i64, i64) {
+        var buf: [u8; 4] = [0; 4];
+        let n = encode_utf8(self, &buf);
+        let p = buf[..n];
+        p.next_match(s, from)
+    }
+
+    fn last_match(self, s: [u8], to: i64) -> (i64, i64) {
+        var buf: [u8; 4] = [0; 4];
+        let n = encode_utf8(self, &buf);
+        let p = buf[..n];
+        p.last_match(s, to)
+    }
+
+    fn prefix_len(self, s: [u8]) -> i64 {
+        var buf: [u8; 4] = [0; 4];
+        let n = encode_utf8(self, &buf);
+        let p = buf[..n];
+        p.prefix_len(s)
+    }
+
+    fn suffix_len(self, s: [u8]) -> i64 {
+        var buf: [u8; 4] = [0; 4];
+        let n = encode_utf8(self, &buf);
+        let p = buf[..n];
+        p.suffix_len(s)
+    }
+}
+
+impl str {
+    // The text of bytes b, when they are UTF-8 (Rust's `str::from_utf8`).
+    pub fn from_utf8(b: [u8]) -> Result<str, Utf8Error> {
+        match validate_utf8(b) {
+            Result::Ok(_) => Result::Ok(b as str),
+            Result::Err(e) => Result::Err(e),
+        }
+    }
+
+    // The text of bytes b, which must be UTF-8 (not checked: text that is
+    // not decodes as U+FFFD, never out of bounds).
+    pub unsafe fn from_utf8_unchecked(b: [u8]) -> str {
+        b as str
+    }
+
+    // The length in bytes.
+    #[inline]
+    pub fn len(self) -> i64 {
+        (self as [u8]).len
+    }
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        (self as [u8]).len == 0
+    }
+
+    // Its bytes.
+    #[inline]
+    pub fn as_bytes(self) -> [u8] {
+        self as [u8]
+    }
+
+    // Whether byte index i starts a code point (or is the end).
+    pub fn is_char_boundary(self, i: i64) -> bool {
+        is_char_boundary(self as [u8], i)
+    }
+
+    // Whether every byte is ASCII.
+    pub fn is_ascii(self) -> bool {
+        let b = self as [u8];
+        for i in 0..b.len {
+            if b[i] >= 0x80 {
+                return false;
+            }
+        }
+        true
+    }
+
+    // The code points (u32), front to back; `.rev()` back to front.
+    #[inline]
+    pub fn chars(self) -> Chars {
+        let b = self as [u8];
+        Chars { s: b, front: 0, back: b.len }
+    }
+
+    // (byte index, code point) pairs.
+    #[inline]
+    pub fn char_indices(self) -> CharIndices {
+        CharIndices { s: self as [u8], pos: 0 }
+    }
+
+    // The bytes, as `as_bytes().iter()`.
+    #[inline]
+    pub fn bytes(self) -> std::SliceIter<u8> {
+        (self as [u8]).iter()
+    }
+
+    // The lines: split at '\n', a '\r' before it dropped; no last empty
+    // line after a final '\n'.
+    #[inline]
+    pub fn lines(self) -> Lines {
+        Lines { s: self as [u8], pos: 0 }
+    }
+
+    // The pieces between matches of p.
+    #[inline]
+    pub fn split<P: Pattern>(self, p: sink P) -> Split<P> {
+        Split { s: self as [u8], start: 0, pos: 0, pat: p, left: -1, done: false }
+    }
+
+    // At most n pieces: the last is the rest.
+    #[inline]
+    pub fn splitn<P: Pattern>(self, n: i64, p: sink P) -> Split<P> {
+        Split { s: self as [u8], start: 0, pos: 0, pat: p, left: n, done: n <= 0 }
+    }
+
+    // The pieces between runs of whitespace (Unicode White_Space), none
+    // empty.
+    #[inline]
+    pub fn split_whitespace(self) -> SplitWhitespace {
+        SplitWhitespace { s: self as [u8], pos: 0, ascii: false }
+    }
+
+    // As split_whitespace, ASCII whitespace only.
+    #[inline]
+    pub fn split_ascii_whitespace(self) -> SplitWhitespace {
+        SplitWhitespace { s: self as [u8], pos: 0, ascii: true }
+    }
+
+    // The parts before and after the first match of p.
+    pub fn split_once<P: Pattern>(self, p: sink P) -> Option<(str, str)> {
+        let b = self as [u8];
+        let (a, e) = p.next_match(b, 0);
+        if a < 0 {
+            return Option::None;
+        }
+        Option::Some((b[..a] as str, b[e..] as str))
+    }
+
+    // The parts before and after the last match of p.
+    pub fn rsplit_once<P: Pattern>(self, p: sink P) -> Option<(str, str)> {
+        let b = self as [u8];
+        let (a, e) = p.last_match(b, b.len);
+        if a < 0 {
+            return Option::None;
+        }
+        Option::Some((b[..a] as str, b[e..] as str))
+    }
+
+    // The matches of p, front to back.
+    #[inline]
+    pub fn matches<P: Pattern>(self, p: sink P) -> Matches<P> {
+        Matches { s: self as [u8], pos: 0, pat: p }
+    }
+
+    // The byte index of the first match of p.
+    pub fn find<P: Pattern>(self, p: sink P) -> Option<i64> {
+        let (a, _) = p.next_match(self as [u8], 0);
+        if a < 0 { Option::None } else { Option::Some(a) }
+    }
+
+    // The byte index of the last match of p.
+    pub fn rfind<P: Pattern>(self, p: sink P) -> Option<i64> {
+        let b = self as [u8];
+        let (a, _) = p.last_match(b, b.len);
+        if a < 0 { Option::None } else { Option::Some(a) }
+    }
+
+    pub fn contains<P: Pattern>(self, p: sink P) -> bool {
+        let (a, _) = p.next_match(self as [u8], 0);
+        a >= 0
+    }
+
+    pub fn starts_with<P: Pattern>(self, p: sink P) -> bool {
+        p.prefix_len(self as [u8]) >= 0
+    }
+
+    pub fn ends_with<P: Pattern>(self, p: sink P) -> bool {
+        p.suffix_len(self as [u8]) >= 0
+    }
+
+    // Without a match of p at its start.
+    pub fn strip_prefix<P: Pattern>(self, p: sink P) -> Option<str> {
+        let b = self as [u8];
+        let n = p.prefix_len(b);
+        if n < 0 { Option::None } else { Option::Some(b[n..] as str) }
+    }
+
+    // Without a match of p at its end.
+    pub fn strip_suffix<P: Pattern>(self, p: sink P) -> Option<str> {
+        let b = self as [u8];
+        let n = p.suffix_len(b);
+        if n < 0 { Option::None } else { Option::Some(b[..b.len - n] as str) }
+    }
+
+    // Without whitespace (Unicode White_Space) at either end.
+    pub fn trim(self) -> str {
+        self.trim_start().trim_end()
+    }
+
+    pub fn trim_start(self) -> str {
+        let b = self as [u8];
+        var i = 0;
+        while i < b.len {
+            let (cp, n) = cp_at(b, i);
+            if !is_space_cp(cp) {
+                break;
+            }
+            i += n;
+        }
+        b[i..] as str
+    }
+
+    pub fn trim_end(self) -> str {
+        let b = self as [u8];
+        var end = b.len;
+        while end > 0 {
+            let (cp, n) = cp_before(b, end);
+            if !is_space_cp(cp) {
+                break;
+            }
+            end -= n;
+        }
+        b[..end] as str
+    }
+
+    // Without ASCII whitespace at either end.
+    pub fn trim_ascii(self) -> str {
+        let b = self as [u8];
+        var i = 0;
+        var end = b.len;
+        while i < end && is_space_cp(b[i] as u32) && b[i] < 0x80 {
+            i += 1;
+        }
+        while end > i && is_space_cp(b[end - 1] as u32) && b[end - 1] < 0x80 {
+            end -= 1;
+        }
+        b[i..end] as str
+    }
+
+    // Without the matches of p repeated at either end (an empty p: as it
+    // is).
+    pub fn trim_matches<P: Pattern>(self, p: sink P) -> str {
+        self.trim_start_matches(p).trim_end_matches(p)
+    }
+
+    pub fn trim_start_matches<P: Pattern>(self, p: sink P) -> str {
+        var b = self as [u8];
+        loop {
+            let n = p.prefix_len(b);
+            if n <= 0 {
+                break;
+            }
+            b = b[n..];
+        }
+        b as str
+    }
+
+    pub fn trim_end_matches<P: Pattern>(self, p: sink P) -> str {
+        var b = self as [u8];
+        loop {
+            let n = p.suffix_len(b);
+            if n <= 0 {
+                break;
+            }
+            b = b[..b.len - n];
+        }
+        b as str
+    }
+
+    // Whether the two are equal ignoring ASCII case.
+    pub fn eq_ignore_ascii_case(self, other: str) -> bool {
+        let a = self as [u8];
+        let b = other as [u8];
+        if a.len != b.len {
+            return false;
+        }
+        for i in 0..a.len {
+            if ascii_lower(a[i]) != ascii_lower(b[i]) {
+                return false;
+            }
+        }
+        true
+    }
+
+    // The number of code points.
+    pub fn char_count(self) -> i64 {
+        std::str::count_chars(self as [u8])
+    }
+
+    // Its value as a T: `s.trim().parse::<i64>()?` (Rust's FromStr: an
+    // optional sign, digits, no whitespace).
+    #[inline]
+    pub fn parse<T: FromStr>(self) -> Result<T, T::Err> {
+        T::from_str(self)
+    }
+
+    // Its display width in a terminal's columns (std::unicode: per grapheme
+    // cluster, East Asian Wide and emoji 2).
+    pub fn width(self) -> i64 {
+        str_width(self as [u8], false)
+    }
+
+    // As width, East Asian Ambiguous 2 (CJK contexts).
+    pub fn width_cjk(self) -> i64 {
+        str_width(self as [u8], true)
+    }
+
+    // The extended grapheme clusters (UAX #29): the unicode-segmentation
+    // crate's `graphemes(true)`; the flag is Rust's spelling (legacy
+    // clusters are not offered).
+    #[inline]
+    pub fn graphemes(self, extended: bool) -> StrGraphemes {
+        StrGraphemes { g: graphemes(self as [u8]) }
+    }
+
+    // ---- allocating, on allocator a ----
+
+    // A String of this text.
+    pub fn to_string_in<A: Allocator>(self, a: sink A) -> String<A> {
+        String::from_in(self, a)
+    }
+
+    pub fn to_owned_in<A: Allocator>(self, a: sink A) -> String<A> {
+        String::from_in(self, a)
+    }
+
+    // The text in lower case (Unicode's full mappings: 'İ' is two code
+    // points).
+    pub fn to_lowercase_in<A: Allocator>(self, a: sink A) -> String<A> {
+        let b = self as [u8];
+        var out: String<A> = String::with_capacity_in(b.len, a);
+        var i = 0;
+        while i < b.len {
+            let c = b[i];
+            if c < 0x80 {
+                out.bytes.push(ascii_lower(c));
+                i += 1;
+                continue;
+            }
+            let (cp, n) = cp_at(b, i);
+            let m = to_lower(cp);
+            for k in 0..3 {
+                if m[k] != 0 {
+                    out.push(m[k]);
+                }
+            }
+            i += n;
+        }
+        out
+    }
+
+    // The text in upper case (full mappings: 'ß' is "SS").
+    pub fn to_uppercase_in<A: Allocator>(self, a: sink A) -> String<A> {
+        let b = self as [u8];
+        var out: String<A> = String::with_capacity_in(b.len, a);
+        var i = 0;
+        while i < b.len {
+            let c = b[i];
+            if c < 0x80 {
+                out.bytes.push(ascii_upper(c));
+                i += 1;
+                continue;
+            }
+            let (cp, n) = cp_at(b, i);
+            let m = to_upper(cp);
+            for k in 0..3 {
+                if m[k] != 0 {
+                    out.push(m[k]);
+                }
+            }
+            i += n;
+        }
+        out
+    }
+
+    pub fn to_ascii_lowercase_in<A: Allocator>(self, a: sink A) -> String<A> {
+        let b = self as [u8];
+        var out: String<A> = String::with_capacity_in(b.len, a);
+        for i in 0..b.len {
+            out.bytes.push(ascii_lower(b[i]));
+        }
+        out
+    }
+
+    pub fn to_ascii_uppercase_in<A: Allocator>(self, a: sink A) -> String<A> {
+        let b = self as [u8];
+        var out: String<A> = String::with_capacity_in(b.len, a);
+        for i in 0..b.len {
+            out.bytes.push(ascii_upper(b[i]));
+        }
+        out
+    }
+
+    // The text with every match of `from` replaced by `to`.
+    pub fn replace_in<P: Pattern,
+        A: Allocator>(self, from: sink P, to: str, a: sink A) -> String<A> {
+        self.replacen_in(from, to, -1, a)
+    }
+
+    // The first n matches replaced (n < 0: all).
+    pub fn replacen_in<P: Pattern, A: Allocator>(self, from: sink P, to: str, n: i64, a: sink A)
+        -> String<A> {
+        let b = self as [u8];
+        var out: String<A> = String::with_capacity_in(b.len, a);
+        var start = 0;
+        var pos = 0;
+        var left = n;
+        while left != 0 && pos <= b.len {
+            let (m, e) = from.next_match(b, pos);
+            if m < 0 {
+                break;
+            }
+            out.bytes.extend_from_slice(b[start..m]);
+            out.bytes.extend_from_slice(to as [u8]);
+            start = e;
+            pos = if e == m { e + char_len_at(b, e) } else { e };
+            if left > 0 {
+                left -= 1;
+            }
+        }
+        out.bytes.extend_from_slice(b[start..]);
+        out
+    }
+
+    // The text n times.
+    pub fn repeat_in<A: Allocator>(self, n: i64, a: sink A) -> String<A> {
+        let b = self as [u8];
+        var out: String<A> = String::with_capacity_in(b.len * n, a);
+        for _ in 0..n {
+            out.bytes.extend_from_slice(b);
+        }
+        out
+    }
+
+    // ---- the Rust forms: errors naming the _in forms (front/ambient) ----
+
+    #[ambient("to_string_in(gpa)")]
+    pub fn to_string(self) -> String {
+        self.to_string_in(Gpa::ambient())
+    }
+
+    #[ambient("to_owned_in(gpa)")]
+    pub fn to_owned(self) -> String {
+        self.to_owned_in(Gpa::ambient())
+    }
+
+    #[ambient("to_lowercase_in(gpa)")]
+    pub fn to_lowercase(self) -> String {
+        self.to_lowercase_in(Gpa::ambient())
+    }
+
+    #[ambient("to_uppercase_in(gpa)")]
+    pub fn to_uppercase(self) -> String {
+        self.to_uppercase_in(Gpa::ambient())
+    }
+
+    #[ambient("replace_in(from, to, gpa)")]
+    pub fn replace<P: Pattern>(self, from: sink P, to: str) -> String {
+        self.replace_in(from, to, Gpa::ambient())
+    }
+
+    #[ambient("repeat_in(n, gpa)")]
+    pub fn repeat(self, n: i64) -> String {
+        self.repeat_in(n, Gpa::ambient())
+    }
+}
+
+#[inline]
+fn ascii_lower(c: u8) -> u8 {
+    if c >= 'A' && c <= 'Z' { c + 32 } else { c }
+}
+
+#[inline]
+fn ascii_upper(c: u8) -> u8 {
+    if c >= 'a' && c <= 'z' { c - 32 } else { c }
+}
+
+// The length of the code point at byte i (1 past the end).
+#[inline]
+fn char_len_at(s: [u8], i: i64) -> i64 {
+    if i >= s.len {
+        return 1;
+    }
+    let n = utf8_char_width(s[i]);
+    if n == 0 { 1 } else { n }
+}
+
+// ---- Text: str's iterators (0.20) ----
+
+// `s.chars()`: the code points, front to back (`next_back`, `rev()`: back
+// to front). Text that is not UTF-8 (std's own, from_utf8_unchecked)
+// yields U+FFFD for what is not.
+pub struct Chars { s: [u8], front: i64, back: i64 }
+
+impl Iterator for Chars {
+    type Item = u32;
+
+    #[inline]
+    fn next(inout self) -> Option<u32> {
+        if self.front >= self.back {
+            return Option::None;
+        }
+        let b = self.s[self.front];
+        if b < 0x80 {
+            self.front += 1;
+            return Option::Some(b as u32);
+        }
+        let s = self.s[..self.back];
+        Option::Some(lossy_next(s, &self.front))
+    }
+
+    // The code points left: the bytes that are not continuation bytes.
+    fn count(self) -> i64 {
+        std::str::count_chars(self.s[self.front..self.back])
+    }
+}
+
+impl Chars {
+    // The last code point left.
+    pub fn next_back(inout self) -> Option<u32> {
+        if self.front >= self.back {
+            return Option::None;
+        }
+        let (cp, n) = cp_before(self.s[self.front..self.back], self.back - self.front);
+        self.back -= n;
+        Option::Some(cp)
+    }
+
+    // The code points back to front.
+    pub fn rev(self) -> RevChars {
+        RevChars { c: self }
+    }
+
+    // The text left.
+    pub fn as_str(self) -> str {
+        self.s[self.front..self.back] as str
+    }
+}
+
+// `s.chars().rev()`.
+pub struct RevChars { c: Chars }
+
+impl Iterator for RevChars {
+    type Item = u32;
+
+    #[inline]
+    fn next(inout self) -> Option<u32> {
+        self.c.next_back()
+    }
+}
+
+// `s.char_indices()`: (byte index, code point).
+pub struct CharIndices { s: [u8], pos: i64 }
+
+impl Iterator for CharIndices {
+    type Item = (i64, u32);
+
+    #[inline]
+    fn next(inout self) -> Option<(i64, u32)> {
+        if self.pos >= self.s.len {
+            return Option::None;
+        }
+        let at = self.pos;
+        let (cp, n) = cp_at(self.s, at);
+        self.pos = at + n;
+        Option::Some((at, cp))
+    }
+}
+
+// `s.lines()`.
+pub struct Lines { s: [u8], pos: i64 }
+
+impl Iterator for Lines {
+    type Item = str;
+
+    fn next(inout self) -> Option<str> {
+        let s = self.s;
+        let start = self.pos;
+        if start >= s.len {
+            return Option::None;
+        }
+        var end = find_byte('\n', s, start);
+        if end >= 0 {
+            self.pos = end + 1;
+        } else {
+            end = s.len;
+            self.pos = s.len;
+        }
+        if end > start && s[end - 1] == '\r' {
+            end -= 1;
+        }
+        Option::Some(s[start..end] as str)
+    }
+}
+
+// `s.split(p)`, `s.splitn(n, p)`.
+pub struct Split<P> { s: [u8], start: i64, pos: i64, pat: P, left: i64, done: bool }
+
+impl<P: Pattern> Iterator for Split<P> {
+    type Item = str;
+
+    fn next(inout self) -> Option<str> {
+        if self.done {
+            return Option::None;
+        }
+        let s = self.s;
+        if self.left == 1 {
+            self.done = true;
+            return Option::Some(s[self.start..] as str);
+        }
+        let (m, e) = if self.pos <= s.len { self.pat.next_match(s, self.pos) } else { (-1, -1) };
+        if m < 0 {
+            self.done = true;
+            return Option::Some(s[self.start..] as str);
+        }
+        let piece = s[self.start..m];
+        self.start = e;
+        self.pos = if e == m { e + char_len_at(s, e) } else { e };
+        if self.left > 0 {
+            self.left -= 1;
+        }
+        Option::Some(piece as str)
+    }
+}
+
+// `s.split_whitespace()`, `s.split_ascii_whitespace()`.
+pub struct SplitWhitespace { s: [u8], pos: i64, ascii: bool }
+
+impl Iterator for SplitWhitespace {
+    type Item = str;
+
+    fn next(inout self) -> Option<str> {
+        let s = self.s;
+        var i = self.pos;
+        // (the whitespace before the piece)
+        while i < s.len {
+            let c = s[i];
+            if c < 0x80 {
+                if !is_space_cp(c as u32) {
+                    break;
+                }
+                i += 1;
+            } else {
+                if self.ascii {
+                    break;
+                }
+                let (cp, n) = cp_at(s, i);
+                if !is_space_cp(cp) {
+                    break;
+                }
+                i += n;
+            }
+        }
+        if i >= s.len {
+            self.pos = s.len;
+            return Option::None;
+        }
+        let start = i;
+        while i < s.len {
+            let c = s[i];
+            if c < 0x80 {
+                if is_space_cp(c as u32) {
+                    break;
+                }
+                i += 1;
+            } else if self.ascii {
+                i += 1;
+            } else {
+                let (cp, n) = cp_at(s, i);
+                if is_space_cp(cp) {
+                    break;
+                }
+                i += n;
+            }
+        }
+        self.pos = i;
+        Option::Some(s[start..i] as str)
+    }
+}
+
+// `s.matches(p)`.
+pub struct Matches<P> { s: [u8], pos: i64, pat: P }
+
+impl<P: Pattern> Iterator for Matches<P> {
+    type Item = str;
+
+    fn next(inout self) -> Option<str> {
+        let s = self.s;
+        if self.pos > s.len {
+            return Option::None;
+        }
+        let (m, e) = self.pat.next_match(s, self.pos);
+        if m < 0 {
+            self.pos = s.len + 1;
+            return Option::None;
+        }
+        self.pos = if e == m { e + char_len_at(s, e) } else { e };
+        Option::Some(s[m..e] as str)
+    }
+}
+
+// `s.graphemes(true)`: the extended grapheme clusters.
+pub struct StrGraphemes { g: Graphemes }
+
+impl Iterator for StrGraphemes {
+    type Item = str;
+
+    #[inline]
+    fn next(inout self) -> Option<str> {
+        match self.g.next() {
+            Option::Some(b) => Option::Some(b as str),
+            Option::None => Option::None,
+        }
+    }
+}
+
+// ---- Text: parsing (0.20) ----
+
+// A type that text parses as: `s.parse::<T>()`, `T::from_str(s)` (Rust's).
+pub trait FromStr {
+    type Err;
+    fn from_str(s: str) -> Result<Self, Self::Err>;
+}
+
+// Why `s.parse::<bool>()` failed: the text is not "true" or "false".
+#[derive(Eq, Debug, Clone)]
+pub struct ParseBoolError { at: i64 }
+
+impl Display for ParseBoolError {
+    fn fmt(self, f: inout Fmt) {
+        f.str("provided string was not `true` or `false`");
+    }
+}
+
+impl FromStr for bool {
+    type Err = ParseBoolError;
+
+    fn from_str(s: str) -> Result<bool, ParseBoolError> {
+        if s == "true" {
+            return Result::Ok(true);
+        }
+        if s == "false" {
+            return Result::Ok(false);
+        }
+        Result::Err(ParseBoolError { at: 0 })
+    }
+}
+
+impl FromStr for i64 {
+    type Err = ParseIntError;
+
+    fn from_str(s: str) -> Result<i64, ParseIntError> {
+        parse_i64_radix(s as [u8], 10)
+    }
+}
+
+impl FromStr for u64 {
+    type Err = ParseIntError;
+
+    fn from_str(s: str) -> Result<u64, ParseIntError> {
+        parse_u64_radix(s as [u8], 10)
+    }
+}
+
+// An i64 that fits in [lo, hi], else Overflow.
+fn parse_signed_in(s: str, lo: i64, hi: i64) -> Result<i64, ParseIntError> {
+    match parse_i64_radix(s as [u8], 10) {
+        Result::Ok(v) => if v < lo || v > hi { Result::Err(ParseIntError::Overflow) }
+            else { Result::Ok(v) },
+        Result::Err(e) => Result::Err(e),
+    }
+}
+
+fn parse_unsigned_in(s: str, hi: u64) -> Result<u64, ParseIntError> {
+    match parse_u64_radix(s as [u8], 10) {
+        Result::Ok(v) => if v > hi { Result::Err(ParseIntError::Overflow) } else { Result::Ok(v) },
+        Result::Err(e) => Result::Err(e),
+    }
+}
+
+impl FromStr for i32 {
+    type Err = ParseIntError;
+
+    fn from_str(s: str) -> Result<i32, ParseIntError> {
+        match parse_signed_in(s, -2147483648, 2147483647) {
+            Result::Ok(v) => Result::Ok(v as i32),
+            Result::Err(e) => Result::Err(e),
+        }
+    }
+}
+
+impl FromStr for i16 {
+    type Err = ParseIntError;
+
+    fn from_str(s: str) -> Result<i16, ParseIntError> {
+        match parse_signed_in(s, -32768, 32767) {
+            Result::Ok(v) => Result::Ok(v as i16),
+            Result::Err(e) => Result::Err(e),
+        }
+    }
+}
+
+impl FromStr for i8 {
+    type Err = ParseIntError;
+
+    fn from_str(s: str) -> Result<i8, ParseIntError> {
+        match parse_signed_in(s, -128, 127) {
+            Result::Ok(v) => Result::Ok(v as i8),
+            Result::Err(e) => Result::Err(e),
+        }
+    }
+}
+
+impl FromStr for u32 {
+    type Err = ParseIntError;
+
+    fn from_str(s: str) -> Result<u32, ParseIntError> {
+        match parse_unsigned_in(s, 4294967295) {
+            Result::Ok(v) => Result::Ok(v as u32),
+            Result::Err(e) => Result::Err(e),
+        }
+    }
+}
+
+impl FromStr for u16 {
+    type Err = ParseIntError;
+
+    fn from_str(s: str) -> Result<u16, ParseIntError> {
+        match parse_unsigned_in(s, 65535) {
+            Result::Ok(v) => Result::Ok(v as u16),
+            Result::Err(e) => Result::Err(e),
+        }
+    }
+}
+
+impl FromStr for u8 {
+    type Err = ParseIntError;
+
+    fn from_str(s: str) -> Result<u8, ParseIntError> {
+        match parse_unsigned_in(s, 255) {
+            Result::Ok(v) => Result::Ok(v as u8),
+            Result::Err(e) => Result::Err(e),
+        }
+    }
+}
+
+impl FromStr for f64 {
+    type Err = ParseFloatError;
+
+    fn from_str(s: str) -> Result<f64, ParseFloatError> {
+        parse_f64(s as [u8])
+    }
+}
+
+impl FromStr for f32 {
+    type Err = ParseFloatError;
+
+    fn from_str(s: str) -> Result<f32, ParseFloatError> {
+        parse_f32(s as [u8])
+    }
+}
+
+// ---- Text: String (0.20) ----
+
+// UTF-8 text that owns its bytes, on allocator A (Rust's String):
+// `String::new_in(gpa)`, `s.push_str("..")`, `s.push_fmt(f"..")`. It has
+// its `str`'s methods (`s.trim()`, `s.split(',')`: the compiler calls
+// them on `s.as_str()`), and `&s` goes where a `str` or `[u8]` does.
+// (its bytes are std's: #[sealed] keeps other code from changing them)
+#[sealed]
+pub struct String<A: Allocator = Gpa> { pub bytes: Vec<u8, A> }
+
+impl<A: Allocator> String<A> {
+    pub fn new_in(a: sink A) -> String<A> {
+        String { bytes: Vec::new_in(a) }
+    }
+
+    pub fn with_capacity_in(cap: i64, a: sink A) -> String<A> {
+        String { bytes: Vec::with_capacity_in(cap, a) }
+    }
+
+    // A String of s's text (Rust's `String::from(s)`).
+    pub fn from_in(s: str, a: sink A) -> String<A> {
+        let b = s as [u8];
+        var v: Vec<u8, A> = Vec::with_capacity_in(b.len, a);
+        v.extend_from_slice(b);
+        String { bytes: v }
+    }
+
+    // The String of bytes v when they are UTF-8 (they are dropped when not).
+    pub fn from_utf8(v: sink Vec<u8, A>) -> Result<String<A>, Utf8Error> {
+        match validate_utf8(v.as_slice()) {
+            Result::Ok(_) => Result::Ok(String { bytes: v }),
+            Result::Err(e) => Result::Err(e),
+        }
+    }
+
+    // The String of Buf b's bytes when they are UTF-8.
+    pub fn from_buf(b: sink Buf<A>) -> Result<String<A>, Utf8Error> {
+        var b = b;
+        let v = b.bytes.take();
+        String::from_utf8(v)
+    }
+
+    // The text of bytes b, U+FFFD in place of what is not UTF-8 (each
+    // maximal subpart, as Rust's from_utf8_lossy).
+    pub fn from_utf8_lossy_in(b: [u8], a: sink A) -> String<A> {
+        var out: String<A> = String::with_capacity_in(b.len, a);
+        var i = 0;
+        while i < b.len {
+            let start = i;
+            while i < b.len && b[i] < 0x80 {
+                i += 1;
+            }
+            out.bytes.extend_from_slice(b[start..i]);
+            if i < b.len {
+                let cp = lossy_next(b, &i);
+                out.push(cp);
+            }
+        }
+        out
+    }
+
+    #[inline]
+    pub fn len(self) -> i64 {
+        self.bytes.len
+    }
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.bytes.len == 0
+    }
+
+    pub fn capacity(self) -> i64 {
+        self.bytes.capacity()
+    }
+
+    pub fn reserve(inout self, extra: i64) {
+        self.bytes.reserve(extra);
+    }
+
+    pub fn clear(inout self) {
+        self.bytes.clear();
+    }
+
+    // The text, a view (valid until the String changes).
+    #[inline]
+    pub fn as_str(self) -> str {
+        self.bytes.as_slice() as str
+    }
+
+    #[inline]
+    pub fn as_bytes(self) -> [u8] {
+        self.bytes.as_slice()
+    }
+
+    // Its bytes, as a Buf's `as_slice`.
+    #[inline]
+    pub fn as_slice(self) -> [u8] {
+        self.bytes.as_slice()
+    }
+
+    // Appends code point cp (U+FFFD for one that is not a scalar value).
+    pub fn push(inout self, cp: u32) {
+        if cp < 0x80 {
+            self.bytes.push(cp as u8);
+            return;
+        }
+        var buf: [u8; 4] = [0; 4];
+        let n = encode_utf8(cp, &buf);
+        self.bytes.extend_from_slice(buf[..n]);
+    }
+
+    // Appends s (`s.push_str(f"..")` writes the f-string in place).
+    #[inline]
+    pub fn push_str(inout self, s: str) {
+        self.bytes.extend_from_slice(s as [u8]);
+    }
+
+    // Appends x's Display: `s.push_fmt(f"{k}={v};")`.
+    pub fn push_fmt<T: Display>(inout self, x: sink T) {
+        var f = std::fmt::fmt_to_vec(&self.bytes);
+        loop {
+            x.fmt(&f);
+            if std::fmt::fmt_end_vec(&self.bytes, &f) {
+                return;
+            }
+        }
+    }
+
+    // The last code point, removed.
+    pub fn pop(inout self) -> Option<u32> {
+        let n = self.bytes.len;
+        if n == 0 {
+            return Option::None;
+        }
+        let (cp, k) = cp_before(self.bytes.as_slice(), n);
+        self.bytes.truncate(n - k);
+        Option::Some(cp)
+    }
+
+    // Keeps the first n bytes; n must be a char boundary.
+    pub fn truncate(inout self, n: i64) {
+        if n < self.bytes.len {
+            if !is_char_boundary(self.bytes.as_slice(), n) {
+                std::panic_str("String::truncate: not a char boundary");
+            }
+            self.bytes.truncate(n);
+        }
+    }
+
+    // Inserts s at byte index i (a char boundary).
+    pub fn insert_str(inout self, i: i64, s: str) {
+        let b = s as [u8];
+        let len = self.bytes.len;
+        if i < 0 || i > len || !is_char_boundary(self.bytes.as_slice(), i) {
+            std::panic_str("String::insert_str: not a char boundary");
+        }
+        for k in 0..b.len {
+            self.bytes.push(0);
+        }
+        let all = self.bytes.as_mut_slice();
+        var j = len;
+        while j > i {
+            j -= 1;
+            all[j + b.len] = all[j];
+        }
+        for k in 0..b.len {
+            all[i + k] = b[k];
+        }
+    }
+
+    // Inserts code point cp at byte index i.
+    pub fn insert(inout self, i: i64, cp: u32) {
+        var buf: [u8; 4] = [0; 4];
+        let n = encode_utf8(cp, &buf);
+        let t = buf[..n];
+        self.insert_str(i, t as str);
+    }
+
+    // Removes the code point at byte index i, returning it.
+    pub fn remove(inout self, i: i64) -> u32 {
+        let len = self.bytes.len;
+        if i < 0 || i >= len || !is_char_boundary(self.bytes.as_slice(), i) {
+            std::panic_str("String::remove: not a char boundary");
+        }
+        let (cp, n) = cp_at(self.bytes.as_slice(), i);
+        let all = self.bytes.as_mut_slice();
+        for j in i..len - n {
+            all[j] = all[j + n];
+        }
+        self.bytes.truncate(len - n);
+        cp
+    }
+
+    // Keeps the code points f is true for.
+    pub fn retain<F: FnMut(u32) -> bool>(inout self, f: F) {
+        var f = f;
+        let len = self.bytes.len;
+        var w = 0;
+        var i = 0;
+        while i < len {
+            let (cp, n) = cp_at(self.bytes.as_slice(), i);
+            if f(cp) {
+                let all = self.bytes.as_mut_slice();
+                for k in 0..n {
+                    all[w + k] = all[i + k];
+                }
+                w += n;
+            }
+            i += n;
+        }
+        self.bytes.truncate(w);
+    }
+
+    // Its bytes, as a Vec (the String is gone).
+    pub fn into_bytes(sink self) -> Vec<u8, A> {
+        var s = self;
+        s.bytes.take()
+    }
+
+    // Its bytes, as a Buf.
+    pub fn into_buf(sink self) -> Buf<A> {
+        var s = self;
+        Buf { bytes: s.bytes.take() }
+    }
+
+    pub fn allocator(self) -> A {
+        self.bytes.allocator()
+    }
+}
+
+impl<A: Allocator + Ambient> String<A> {
+    #[ambient("String::new_in(gpa)")]
+    pub fn new() -> String<A> {
+        String { bytes: Vec::new_in(A::ambient()) }
+    }
+
+    #[ambient("String::with_capacity_in(cap, gpa)")]
+    pub fn with_capacity(cap: i64) -> String<A> {
+        String { bytes: Vec::with_capacity_in(cap, A::ambient()) }
+    }
+
+    #[ambient("String::from_in(s, gpa)")]
+    pub fn from(s: str) -> String<A> {
+        String::from_in(s, A::ambient())
+    }
+}
+
+impl<A: Allocator> Display for String<A> {
+    fn fmt(self, f: inout Fmt) {
+        f.str(self.bytes.as_slice());
+    }
+}
+
+impl<A: Allocator> Debug for String<A> {
+    fn fmt_debug(self, f: inout Fmt) {
+        let s = self.bytes.as_slice();
+        s.fmt_debug(&f);
+    }
+}
+
+impl<A: Allocator> Eq for String<A> {
+    fn eq(self, other: String<A>) -> bool {
+        let a = self.bytes.as_slice();
+        let b = other.bytes.as_slice();
+        a == b
+    }
+}
+
+impl<A: Allocator> Ord for String<A> {
+    fn cmp(self, other: String<A>) -> i64 {
+        let a = self.bytes.as_slice();
+        let b = other.bytes.as_slice();
+        a.cmp(b)
+    }
+}
+
+impl<A: Allocator> Hash for String<A> {
+    fn hash(self) -> u64 {
+        let a = self.bytes.as_slice();
+        a.hash()
+    }
+}
+
+impl<A: Allocator> Clone for String<A> {
+    fn clone(self) -> String<A> {
+        String { bytes: self.bytes.clone() }
+    }
+}
+
+// x's Display as a new String on allocator a: `to_string_in(n, gpa)`,
+// `to_string_in(f"{a}-{b}", gpa)` (Rust's `x.to_string()`, `format!`).
+pub fn to_string_in<T: Display, A: Allocator>(x: sink T, a: sink A) -> String<A> {
+    var s: String<A> = String::new_in(a);
+    s.push_fmt(x);
+    s
+}

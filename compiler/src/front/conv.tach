@@ -20,7 +20,7 @@ use crate::base::{
     FILES, FILE_COUNT, SRC, SYMS, buf_bytes, buf_int, buf_new, buf_slice, buf_str, streq,
 };
 use crate::base::diag::{
-    ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_try_tool,
+    ERR_KIND, err_begin, err_end, err_end_soft, err_fix, err_fmt, err_help, err_try_tool,
 };
 use crate::front::ast::{
     CONV_INOUT, CONV_NEW, CONV_SINK, NODES, NODE_REF, NODE_REF_MUT, NodeKind, child,
@@ -167,7 +167,10 @@ pub fn strict_at(pos: i64) -> bool {
         // the compiler's generated sources, `<check>` and the like, are
         // read mixed until compiler/src migrates, 0.21)
         let user = user_at(pos);
-        CACHE_STD || STRICT && !LEGACY_ROOT && user
+        // (a std tree read from disk in a mixed run, `fix --only conventions
+        // --std-tree DIR` migrating std's files: mixed, as the program)
+        CACHE_STD && (STRICT || crate::front::stdtree::STD_TREE == 0 as *u8)
+            || STRICT && !LEGACY_ROOT && user
     }
 }
 
@@ -280,6 +283,40 @@ pub fn rust_spelling(start: i64, end: i64, what: [u8], new: [u8]) {
         buf_bytes(b, what);
     }
     conv_error(c"conv.rust", start, end, buf_slice(b), "", new);
+}
+
+// (0.20) `env::var(name)`, Rust's name (and `env::var_in`, std's first):
+// `var` is a word of 0.20, a keyword from 0.21, so std's are `env::get`
+// and `env::get_in(name, gpa)`. Path node n names member of module (its
+// key's text); an error when it is one of them.
+pub fn env_var_error(n: i64, module: [u8], member: [u8]) {
+    unsafe {
+        if module != "std::env" || member != "var" && member != "var_in" {
+            return;
+        }
+        let new = if member == "var" { "get" } else { "get_in" };
+        let start = NODES[n].end - member.len;
+        let b = buf_new();
+        buf_bytes(b, "'env::");
+        buf_bytes(b, member);
+        buf_bytes(b, if member == "var" { "' is Rust's name; std's is 'env::" }
+            else { "' was std's name before 0.20 shipped; it is 'env::" });
+        buf_bytes(b, new);
+        buf_bytes(b, "' ('var' is a word of 0.20, a keyword from 0.21)");
+        let saved = ERR_KIND;
+        ERR_KIND = CODE_RUST;
+        err_begin(NODES[n].start);
+        err_fmt(buf_slice(b));
+        err_help(
+            c"the environment's variables: `env::get_in(name, gpa)`, a `Result<String, VarError>`");
+        if start > NODES[n].start && SRC[start..NODES[n].end] == member {
+            try_patch(start, member, new);
+            err_fix(start, NODES[n].end, new);
+        }
+        err_end_soft();
+        ERR_KIND = saved;
+        crate::base::diag::err_jump();
+    }
 }
 
 // `syntax.legacy`: 0.20's spelling in a crate read in 0.19's.
@@ -580,6 +617,7 @@ pub fn legacy_let_args(n: i64, f: i64, first_param: i64) {
             // (the `&`, for `fix --only conventions`, which sees the checked
             // program: it drops the `&` the checker dropped)
             LET_STRIPPED.push(NODES[arg].start);
+            LET_STRIPPED.push(arg);
             NODES[arg] = NODES[NODES[arg].b];
         }
     }

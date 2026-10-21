@@ -28,11 +28,12 @@ error (short form, without the position), and the fix.
 let s: String = String::new();
 ```
 ```err
-error[type error] unknown type 'String' | help: text is `[u8]`, a slice of bytes (string literals are one); text you build is a `std::Buf` (`Buf::new_in(gpa)`, `b.push_str(s)`, `b.as_slice()` is its `[u8]`) | try: [u8]
+error[type error] allocation is explicit: pass an allocator (try: String::new_in(gpa)) | help: this function's `gpa` is the allocator to pass
 ```
-The `try:` is the type to write. Also `str` (`[u8]`), `char` (`u8`),
-`Box`, `Rc` (`*T`),
-`VecDeque`, `RefCell`.
+`String` and `str` are std's (0.20, `guide text`); what allocates
+takes an allocator: `String::new_in(gpa)`, `s.to_uppercase_in(gpa)`.
+A Rust type tachyon does not have gets the type to write as its `try:`:
+`char` (`u8`), `Box`, `Rc` (`*T`), `VecDeque`, `RefCell`.
 
 ```tach
 use std::cmp::max;
@@ -42,7 +43,8 @@ error[type error] no 'cmp' in module 'std' | help: tachyon's std has no such mod
 ```
 std has a few of Rust's modules (0.20: `std::collections::HashMap`,
 `std::fmt::Display`, `std::io::read_line`, `std::iter`, `std::ops`,
-`std::slice`, `std::num`, `std::convert`, `std::clone`), and every item is
+`std::slice`, `std::num`, `std::convert`, `std::clone`, `std::string`,
+`std::fs`, `std::path`, `std::env`, `std::process`), and every item is
 `std::NAME` as well: `use std::{IoError, is_digit};` (`HashMap`,
 `read_line` and std's most used names are in the prelude: no `use`).
 
@@ -52,18 +54,16 @@ fn main() -> i32 { let s = "  a "; let t = s.trim(); 0 }
 ```err
 error[type error] no method 'trim' on type '[u8]' | help: 'trim' is no method: std's function `trim` takes the value as its first argument | try: trim(s)
 ```
-A method std has as a function (`trim`, `sort`, `parse` as `parse_int`,
+`s` is a `[u8]` here: bytes. A `str` has `trim`, `split`, `parse` (0.20):
+`let s: str = "  a ";`, or `"  a ".trim()` on the literal itself. A
+method std has as a function (`trim`, `sort`, `parse` as `parse_int`,
 `split_whitespace` as `split_whitespace_in(s, gpa)`) gets the call to
 write; another unknown method, the type's nearest methods and `tachyonc
 query items TYPE`, which lists them all.
 
-```tach
-fn count(s: &str) -> i64 { s.len() }
-```
-```err
-error[parser error] expected type, got '&' | help: `&str` is `[u8]` in tachyon: a slice of bytes, as string literals are
-```
-A parameter is read-only by default (let: `s: [u8]`, `v: Vec<i64>`,
+`fn count(s: str)` takes a `str` (0.20: Rust's `&str` is `str`, as
+`&[T]` is `[T]`), and a literal, a `str` or a String goes there. A
+parameter is read-only by default (let: `s: str`, `v: Vec<i64>`,
 nothing to write); `x: inout T` may change the caller's value, called
 with `&x`; `x: sink T` takes it. `*T` is the raw pointer.
 

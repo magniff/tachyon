@@ -17,8 +17,8 @@
 use crate::base::{IntVec, buf_byte, buf_str, sym_name};
 use crate::front::ast::NODES;
 use crate::front::types::{
-    ENUMS, TLISTS, TSCRATCH, TYPES, TyKind, VARIANTS, array_of, enum_variant, make_type, ptr_to,
-    slice_of, type_elem,
+    ENUMS, REF_MUT, TLISTS, TSCRATCH, TYPES, TyKind, VARIANTS, array_of, enum_variant, make_type,
+    mut_slice_of, ptr_to, ref_to, slice_of, type_elem,
 };
 
 // The aliases marked #[niche_null] (their nodes).
@@ -29,6 +29,19 @@ pub static mut ANY_DISTINCT: bool = false;
 
 // What erase_type found for each type id + 1 (0: not yet).
 static mut ERASED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// (0.20) Whether a distinct type over a slice was made (std's `str`), and
+// whether erase_type erases only those (before the own pass, which checks
+// them as the views they are: front/check/distinct: erase_view_distincts).
+pub static mut ANY_VIEW_DISTINCT: bool = false;
+
+// (0.20) std's `str` once its alias is resolved, else 0.
+pub static mut STR_TYPE: i64 = 0;
+
+// (0.20) std::path's `Path` once its alias is resolved, else 0.
+pub static mut PATH_TYPE: i64 = 0;
+
+pub static mut ERASE_VIEWS_ONLY: bool = false;
 
 // Per enum: 0 not known yet, 1 no niche, 2 the null niche.
 static mut NICHE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -42,6 +55,22 @@ pub fn distinct_type(alias: i64, base: i64, mark: i64) -> i64 {
 
 pub fn is_distinct_type(t: i64) -> bool {
     unsafe { t > 0 && TYPES[t].kind == TyKind::Distinct }
+}
+
+// (0.20) Whether t is a distinct type over a slice: std's `str` over
+// `[u8]`, the one such type (front/check/distinct: distinct_of), a view.
+pub fn is_view_distinct(t: i64) -> bool {
+    unsafe {
+        t > 0 && TYPES[t].kind == TyKind::Distinct && TYPES[t].a > 0
+            && TYPES[TYPES[t].a].kind == TyKind::Slice
+    }
+}
+
+// (0.20) Forgets what erase_type found: its mode changed.
+pub fn reset_erased() {
+    unsafe {
+        ERASED.count = 0;
+    }
 }
 
 // The type under every `distinct` of t (t itself when it is not one).
@@ -103,12 +132,19 @@ pub fn erase_type(t: i64) -> i64 {
         }
         let kind = TYPES[t].kind;
         let mut r = t;
-        if kind == TyKind::Distinct {
+        if kind == TyKind::Distinct && ERASE_VIEWS_ONLY && !is_view_distinct(t) {
+            r = t;
+        } else if kind == TyKind::Distinct {
             r = erase_type(TYPES[t].a);
         } else if kind == TyKind::Ptr {
-            r = ptr_to(erase_type(TYPES[t].a));
+            // (0.20: a reference stays one, as the own pass reads it)
+            let e = erase_type(TYPES[t].a);
+            r = if e == TYPES[t].a { t } else if TYPES[t].b != 0 { ref_to(e, TYPES[t].b) }
+                else { ptr_to(e) };
         } else if kind == TyKind::Slice {
-            r = slice_of(erase_type(TYPES[t].a));
+            let e = erase_type(TYPES[t].a);
+            r = if e == TYPES[t].a { t } else if TYPES[t].b == REF_MUT { mut_slice_of(e) }
+                else { slice_of(e) };
         } else if kind == TyKind::Array {
             r = array_of(erase_type(TYPES[t].a), TYPES[t].b);
         } else if kind == TyKind::Tuple || kind == TyKind::Fn {
