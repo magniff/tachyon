@@ -277,10 +277,10 @@ END {
             if (!core[i]) continue
             nd = split(deps[i], dd, " ")
             for (k = 1; k <= nd; k++) {
-                # (0.22) inside a gated module (its `mod` lines and use
-                # lines are core) a lazy section stays lazy: the loader
+                # (0.22) inside a closed gate's module (its `mod` lines and
+                # use lines are core) a lazy section stays lazy: the loader
                 # reads it, and what it needs, when a program reaches it
-                if (gate[dd[k]] != "" && gate[i] == gate[dd[k]]) continue
+                if ((gate[i] in CLOSED) && gate[i] == gate[dd[k]]) continue
                 if (!core[dd[k]]) { core[dd[k]] = 1; changed = 1 }
             }
         }
@@ -296,10 +296,10 @@ END {
         if (title[i] in TRIGGERS) words = words " " TRIGGERS[title[i]]
         if (!core[i] && gate[i] != "") words = " +" gate[i] words
         items = keys_list[i]
-        # (0.22) a core section inside a gated module (its `mod` line and
+        # (0.22) a core section inside a closed gate's module (its `mod` line and
         # use lines) does not need the module's lazy sections: the loader
         # would read them for every program
-        if (core[i] && gate[i] != "") {
+        if (core[i] && (gate[i] in CLOSED)) {
             nd = split(deps[i], dd, " ")
             deps[i] = ""
             for (k = 1; k <= nd; k++) if (core[dd[k]] || gate[dd[k]] != gate[i]) deps[i] = deps[i] " " dd[k]
