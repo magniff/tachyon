@@ -1,0 +1,1003 @@
+// The language server's worker (0.24, docs/lsp.md): a copy of the server
+// (fork) that reads the program once, with the open documents' unsaved
+// texts in place of their files (OVERLAY), publishes its diagnostics,
+// then answers the requests the server hands it from the tables the
+// queries answer from: definition and references (the references every
+// query collects, query/refs; locals, refactor_mod/local), hover (the
+// signature `query def` prints, the effects and features, `query type`'s
+// typed nodes), the document's symbols (`query items`' definitions). The
+// server replaces it when a document changes.
+//
+// Requests come one per line, `METHOD \t PATH \t LINE \t CHARACTER \t FLAG
+// \t ID`; each answer goes back as a frame `KIND LENGTH\n` then the JSON
+// message: `r` a response, `n` a notification (publishDiagnostics), `e`
+// (empty) the end of the diagnostics.
+
+use crate::base::{
+    FILES, FILE_COUNT, IntVec, SRC, STDERR, SYMS, alloc_zeroed, buf_byte, buf_bytes, buf_fmt,
+    buf_int, buf_new, buf_slice, buf_str, cstr,
+};
+use crate::base::diag::{DIAG_SHORT, diag_records, short_diagnostic};
+use crate::base::json::buf_json_str;
+use crate::front::ast::{NODES, NODE_COUNT, NodeKind, child};
+use crate::front::effects::{
+    ALLOCATORS, EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_UNKNOWN,
+    EFF_UNSAFE, EFF_VISIBLE, effects_text, fn_effects,
+};
+use crate::front::effects::check::buf_decl;
+use crate::front::effects::why::{effect_name, step_text};
+use crate::front::lexer::{TOKS, TOK_COUNT};
+use crate::front::modules::file_of_pos;
+use crate::front::types::{FNS, FN_COUNT, buf_type};
+use crate::tools::lsp::{TIMING, now_us, write_all};
+use crate::tools::query::{QF_DEF, parse_digits};
+use crate::tools::query::command_line::load_program;
+use crate::tools::query::defs::{
+    DEFS, DEF_COUNT, K_ALIAS, K_CONST, K_ENUM, K_FIELD, K_FN, K_IMPL_METHOD, K_METHOD, K_STATIC,
+    K_STRUCT, K_TRAIT, K_TRAIT_FN, K_VARIANT, kind_name, last_segment,
+};
+use crate::tools::query::diagnostics::{PROG, ROOT_GIVEN};
+use crate::tools::query::effects::{def_effect_lines, def_effects_text};
+use crate::tools::query::features::put_def_features;
+use crate::tools::query::positions::{sort_by_position, token_at};
+use crate::tools::query::refs::collect_all_refs;
+use crate::tools::query::show::put_signature;
+use crate::tools::query::typeat::typed_nodes_at;
+use crate::tools::refactor_mod::local::{load_decls, local_at, use_decl};
+
+// The worker's state: how positions are counted, the line starts of every
+// file, every reference.
+static mut UTF8: bool = false;
+static mut OUT_FD: i32 = -1;
+static mut LOADED: bool = false;
+static mut LS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut FIRST_LINE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut ALL_REFS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static mut REFS_READY: bool = false;
+
+// What a hover shows of the effects' reasons, at most.
+const WHY_MAX: i64 = 6;
+const WHY_LINE_MAX: i64 = 140;
+
+extern "C" {
+    fn read(fd: i32, buf: *u8, n: u64) -> i64;
+    fn _exit(code: i32) -> !;
+}
+
+// ---- the loop
+
+// Reads the program of root and answers on `output` the requests of
+// `input` until it is closed; never returns.
+pub fn serve(root: *u8, input: i32, output: i32, utf8: bool) -> ! {
+    unsafe {
+        UTF8 = utf8;
+        OUT_FD = output;
+        PROG = c"tachyonc";
+        ROOT_GIVEN = root;
+        let t0 = now_us();
+        LOADED = load_program(root, 0);
+        lap("load", t0);
+        let t1 = now_us();
+        index_lines();
+        publish_diagnostics();
+        lap("diagnostics", t1);
+        // (what the requests look up, made before the first comes)
+        if LOADED {
+            let t2 = now_us();
+            ensure_refs();
+            load_decls();
+            lap("index", t2);
+        }
+        let pending = buf_new();
+        let chunk = alloc_zeroed(65536);
+        let mut from = 0;
+        loop {
+            // a whole line: answered
+            let s = buf_slice(pending);
+            let mut nl = from;
+            while nl < s.len && s[nl] != '\n' {
+                nl += 1;
+            }
+            if nl < s.len {
+                answer_line(s[from..nl]);
+                from = nl + 1;
+                continue;
+            }
+            let got = read(input, chunk, 65536);
+            if got <= 0 {
+                _exit(0);
+            }
+            buf_bytes(pending, chunk[0..got]);
+        }
+    }
+}
+
+// Writes a frame: kind, the body's length, the body.
+fn send(kind: u8, body: [u8]) {
+    unsafe {
+        let head = buf_new();
+        buf_byte(head, kind);
+        buf_byte(head, ' ');
+        buf_int(head, body.len);
+        buf_byte(head, '\n');
+        write_all(OUT_FD, buf_slice(head));
+        write_all(OUT_FD, body);
+    }
+}
+
+// The fields of a request line, split at its TABs (the last one, the id,
+// to the end).
+fn field(line: [u8], k: i64) -> [u8] {
+    let mut start = 0;
+    let mut n = 0;
+    let mut i = 0;
+    while i < line.len {
+        if line[i] == '\t' && n < 5 {
+            if n == k {
+                return line[start..i];
+            }
+            n += 1;
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if n == k { line[start..line.len] } else { line[0..0] }
+}
+
+fn answer_line(line: [u8]) {
+    unsafe {
+        let t0 = now_us();
+        let method = field(line, 0);
+        let path = field(line, 1);
+        let ln = parse_digits(field(line, 2));
+        let ch = parse_digits(field(line, 3));
+        let flag = field(line, 4) == "1";
+        let id = field(line, 5);
+        let out = buf_new();
+        buf_str(out, c"{\"jsonrpc\":\"2.0\",\"id\":");
+        buf_bytes(out, id);
+        buf_str(out, c",\"result\":");
+        let f = if LOADED { file_by_path(path) } else { -1 };
+        let pos = if f >= 0 { pos_at(f, ln, ch) } else { -1 };
+        if method == "definition" {
+            if pos >= 0 { put_definition(out, pos); } else { buf_str(out, c"null"); }
+        } else if method == "references" {
+            if pos >= 0 { put_references(out, pos, flag); } else { buf_str(out, c"[]"); }
+        } else if method == "hover" {
+            if pos >= 0 { put_hover(out, pos); } else { buf_str(out, c"null"); }
+        } else if method == "documentSymbol" {
+            if f >= 0 { put_symbols(out, f); } else { buf_str(out, c"[]"); }
+        } else {
+            buf_str(out, c"null");
+        }
+        buf_byte(out, '}');
+        send('r', buf_slice(out));
+        lap(method, t0);
+    }
+}
+
+// With $TACHYON_LSP_TIME, `lsp worker: WHAT N ms` (since t0) on stderr.
+fn lap(what: [u8], t0: i64) {
+    unsafe {
+        if !TIMING {
+            return;
+        }
+        let us = now_us() - t0;
+        let line = buf_new();
+        buf_str(line, c"lsp worker: ");
+        buf_bytes(line, what);
+        buf_fmt(line, f" {us / 1000}.{(us % 1000) / 100} ms\n");
+        write_all(STDERR, buf_slice(line));
+    }
+}
+
+// ---- positions
+
+// The line starts of every file (also of a program that did not parse).
+fn index_lines() {
+    unsafe {
+        for f in 0..FILE_COUNT {
+            FIRST_LINE.push(LS.count);
+            LS.push(FILES[f].start);
+            for p in FILES[f].start..FILES[f].end {
+                if SRC[p] == '\n' && p + 1 < FILES[f].end {
+                    LS.push(p + 1);
+                }
+            }
+        }
+        FIRST_LINE.push(LS.count);
+    }
+}
+
+// The file of the program at path (as the front end read it), or -1.
+fn file_by_path(path: [u8]) -> i64 {
+    unsafe {
+        for f in 0..FILE_COUNT {
+            if cstr(FILES[f].path) == path {
+                return f;
+            }
+        }
+        -1
+    }
+}
+
+// The bytes of the UTF-8 sequence starting with c.
+fn seq_len(c: u8) -> i64 {
+    if c < 128 as u8 { 1 } else if c < 224 as u8 { 2 } else if c < 240 as u8 { 3 } else { 4 }
+}
+
+// The position of (line, character) in file f (from 0, the character in
+// the position encoding), or -1; the end of the line when the character
+// is past it.
+fn pos_at(f: i64, line: i64, ch: i64) -> i64 {
+    unsafe {
+        let first = FIRST_LINE.data[f];
+        if line < 0 || first + line >= FIRST_LINE.data[f + 1] {
+            return -1;
+        }
+        let mut p = LS.data[first + line];
+        let end = FILES[f].end;
+        let mut units = 0;
+        while p < end && SRC[p] != '\n' && units < ch {
+            let n = seq_len(SRC[p]);
+            units += if UTF8 { n } else if n == 4 { 2 } else { 1 };
+            p += n;
+        }
+        if p > end { end } else { p }
+    }
+}
+
+// `{"line":L,"character":C}` of position pos.
+fn put_position(out: i64, pos: i64) {
+    unsafe {
+        let f = file_of_pos(pos);
+        let mut lo = FIRST_LINE.data[f];
+        let mut hi = FIRST_LINE.data[f + 1];
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if LS.data[mid] <= pos { lo = mid; } else { hi = mid; }
+        }
+        let ls = LS.data[lo];
+        let mut units = 0;
+        let mut p = ls;
+        while p < pos {
+            let n = seq_len(SRC[p]);
+            units += if UTF8 { n } else if n == 4 { 2 } else { 1 };
+            p += n;
+        }
+        buf_fmt(out, f"{{\"line\":{lo - FIRST_LINE.data[f]},\"character\":{units}}}");
+    }
+}
+
+fn put_range(out: i64, from: i64, to: i64) {
+    buf_str(out, c"{\"start\":");
+    put_position(out, from);
+    buf_str(out, c",\"end\":");
+    put_position(out, to);
+    buf_byte(out, '}');
+}
+
+// The file:// URI of file f.
+pub fn put_uri(out: i64, path: [u8]) {
+    let hex = "0123456789ABCDEF";
+    buf_str(out, c"file://");
+    for i in 0..path.len {
+        let c = path[i];
+        let plain = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+            || c == '/' || c == '.' || c == '_' || c == '-' || c == '~';
+        if plain {
+            buf_byte(out, c);
+        } else {
+            buf_byte(out, '%');
+            buf_byte(out, hex[(c >> 4) as i64]);
+            buf_byte(out, hex[(c & 15) as i64]);
+        }
+    }
+}
+
+// Whether position pos is in a file of its own (not std's text).
+fn in_file(pos: i64) -> bool {
+    unsafe {
+        if pos < 0 {
+            return false;
+        }
+        let f = file_of_pos(pos);
+        f >= 0 && FILES[f].path[0] != '<'
+    }
+}
+
+// The end of the token at pos (pos + 1 when none starts there).
+fn token_end(pos: i64) -> i64 {
+    unsafe {
+        let t = token_at(pos);
+        if t < TOK_COUNT && TOKS[t].start == pos && TOKS[t].end > pos {
+            return TOKS[t].end;
+        }
+        let f = file_of_pos(pos);
+        if pos < FILES[f].end && SRC[pos] != '\n' { pos + 1 } else { pos }
+    }
+}
+
+// `{"uri":..,"range":..}` of the token at pos.
+fn put_location(out: i64, pos: i64) {
+    unsafe {
+        buf_str(out, c"{\"uri\":\"");
+        put_uri(out, cstr(FILES[file_of_pos(pos)].path));
+        buf_str(out, c"\",\"range\":");
+        put_range(out, pos, token_end(pos));
+        buf_byte(out, '}');
+    }
+}
+
+// ---- what is at a position
+
+// The start of the token holding pos (or ending at it), or -1.
+fn token_start(pos: i64) -> i64 {
+    unsafe {
+        let t = token_at(pos);
+        if t < TOK_COUNT && TOKS[t].start == pos {
+            return pos;
+        }
+        if t > 0 && TOKS[t - 1].start <= pos && pos <= TOKS[t - 1].end {
+            return TOKS[t - 1].start;
+        }
+        -1
+    }
+}
+
+fn ensure_refs() {
+    unsafe {
+        if !REFS_READY {
+            let t0 = now_us();
+            collect_all_refs(&mut ALL_REFS);
+            lap("references collected", t0);
+            REFS_READY = true;
+        }
+    }
+}
+
+// The definition named at position start (a reference, or a definition's
+// name), or -1.
+fn def_named_at(start: i64) -> i64 {
+    unsafe {
+        if start < 0 {
+            return -1;
+        }
+        ensure_refs();
+        let mut i = 0;
+        while i < ALL_REFS.count {
+            if ALL_REFS.data[i] == start {
+                return ALL_REFS.data[i + 1];
+            }
+            i += 3;
+        }
+        -1
+    }
+}
+
+// The declaration of the local named at start, or -1.
+fn local_named_at(start: i64) -> i64 {
+    if start < 0 {
+        return -1;
+    }
+    load_decls();
+    local_at(start)
+}
+
+fn put_definition(out: i64, pos: i64) {
+    unsafe {
+        let start = token_start(pos);
+        let d = def_named_at(start);
+        if d >= 0 {
+            if in_file(DEFS[d].name_pos) {
+                put_location(out, DEFS[d].name_pos);
+            } else {
+                buf_str(out, c"null");
+            }
+            return;
+        }
+        let l = local_named_at(start);
+        if l >= 0 && in_file(l) {
+            put_location(out, l);
+            return;
+        }
+        buf_str(out, c"null");
+    }
+}
+
+// The positions of a local's declaration and uses, in order, into out.
+fn local_uses(decl: i64, out: &mut IntVec) {
+    unsafe {
+        out.push(decl);
+        let dt = token_at(decl);
+        for n in 1..NODE_COUNT {
+            if use_decl(n) != decl {
+                continue;
+            }
+            let p = NODES[n].start;
+            let t = token_at(p);
+            if TOKS[t].start != p || TOKS[t].value != TOKS[dt].value {
+                continue;
+            }
+            let mut seen = false;
+            for k in 0..out.count {
+                if out.data[k] == p {
+                    seen = true;
+                }
+            }
+            if !seen {
+                out.push(p);
+            }
+        }
+        sort_positions(out);
+    }
+}
+
+fn sort_positions(v: &mut IntVec) {
+    unsafe {
+        let a = v.data;
+        for i in 1..v.count {
+            let mut j = i;
+            while j > 0 && a[j] < a[j - 1] {
+                let x = a[j];
+                a[j] = a[j - 1];
+                a[j - 1] = x;
+                j -= 1;
+            }
+        }
+    }
+}
+
+fn put_references(out: i64, pos: i64, with_decl: bool) {
+    unsafe {
+        let start = token_start(pos);
+        let d = def_named_at(start);
+        let mut at = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        if d >= 0 {
+            let mut i = 0;
+            while i < ALL_REFS.count {
+                if ALL_REFS.data[i + 1] == d && (with_decl || (ALL_REFS.data[i + 2] & QF_DEF) == 0)
+                    && in_file(ALL_REFS.data[i]) {
+                    at.push(ALL_REFS.data[i]);
+                }
+                i += 3;
+            }
+            sort_positions(&mut at);
+        } else {
+            let l = local_named_at(start);
+            if l >= 0 {
+                let mut uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                local_uses(l, &mut uses);
+                for k in 0..uses.count {
+                    if with_decl || uses.data[k] != l {
+                        at.push(uses.data[k]);
+                    }
+                }
+            }
+        }
+        buf_byte(out, '[');
+        let mut last = -1;
+        let mut first = true;
+        for k in 0..at.count {
+            if at.data[k] == last {
+                continue;
+            }
+            last = at.data[k];
+            if !first {
+                buf_byte(out, ',');
+            }
+            first = false;
+            put_location(out, at.data[k]);
+        }
+        buf_byte(out, ']');
+    }
+}
+
+// ---- hover
+
+fn is_fn_kind(k: i64) -> bool {
+    k == K_FN || k == K_METHOD || k == K_IMPL_METHOD || k == K_TRAIT_FN
+}
+
+// The function of definition d (its FNS index), or -1.
+fn fn_of(d: i64) -> i64 {
+    unsafe {
+        if !is_fn_kind(DEFS[d].kind) {
+            return -1;
+        }
+        let f = NODES[DEFS[d].node].x - 1;
+        if f < 0 || f >= FN_COUNT { -1 } else { f }
+    }
+}
+
+// ` (declared #[pure])` or ` (inferred)` after function f's effects, the
+// instance named when there is one (`, of Vec<i64>::push`), then the line's
+// end.
+fn put_decl_note(md: i64, f: i64, instance: [u8]) {
+    unsafe {
+        let decl = FNS[f].effect_decl;
+        if decl != 0 {
+            buf_str(md, c" (declared");
+            let mut s = decl;
+            while s != 0 {
+                buf_byte(md, ' ');
+                buf_decl(md, s);
+                s = NODES[s].b;
+            }
+        } else {
+            buf_str(md, c" (inferred");
+        }
+        if instance.len > 0 {
+            buf_str(md, c", of ");
+            buf_bytes(md, instance);
+        }
+        buf_str(md, c")\n");
+    }
+}
+
+// The function a call names at position start (the instance, for a
+// generic function), or -1.
+fn call_at(start: i64) -> i64 {
+    unsafe {
+        if start < 0 {
+            return -1;
+        }
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind != NodeKind::Call || NODES[n].x <= 0 || NODES[n].start > start
+                || NODES[n].end <= start {
+                continue;
+            }
+            let callee = NODES[n].a;
+            if callee != 0 {
+                if NODES[callee].start <= start && start < NODES[callee].end
+                    && token_start(NODES[callee].end - 1) == start {
+                    return NODES[n].x - 1;
+                }
+            } else if NODES[n].count > 0 && NODES[child(n, 0)].end <= start {
+                return NODES[n].x - 1;
+            }
+        }
+        -1
+    }
+}
+
+// Appends text cut to max bytes (at a character), `…` when cut.
+fn put_cut(out: i64, s: [u8], max: i64) {
+    if s.len <= max {
+        buf_bytes(out, s);
+        return;
+    }
+    let mut e = max - 1;
+    while e > 0 && (s[e] & 192) == 128 {
+        e -= 1;
+    }
+    buf_bytes(out, s[0..e]);
+    buf_bytes(out, "…");
+}
+
+// Appends text with the root's directory dropped from the paths in it.
+fn put_relative(out: i64, text: [u8]) {
+    unsafe {
+        let root = cstr(ROOT_GIVEN);
+        let mut d = root.len;
+        while d > 0 && root[d - 1] != '/' {
+            d -= 1;
+        }
+        let dir = root[0..d];
+        let mut i = 0;
+        while i < text.len {
+            if d > 0 && i + d <= text.len && text[i..i + d] == dir {
+                i += d;
+            } else {
+                buf_byte(out, text[i]);
+                i += 1;
+            }
+        }
+    }
+}
+
+// The reasons of f's effects, one line each (the first step of `query
+// effects --why`), at most WHY_MAX.
+fn put_why_lines(md: i64, f: i64) {
+    unsafe {
+        let e = fn_effects(f);
+        let mut bits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut allocs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..ALLOCATORS.count {
+            if (e.allocs & (1 << i)) != 0 {
+                bits.push(0);
+                allocs.push(1 << i);
+            }
+        }
+        let order: [i64; 6] = [EFF_ALLOC_EXTERN, EFF_IO, EFF_GLOBAL, EFF_PANIC, EFF_DIVERGE,
+            EFF_UNSAFE];
+        for k in 0..6 {
+            if (e.bits & order[k]) != 0 {
+                bits.push(order[k]);
+                allocs.push(0);
+            }
+        }
+        let shown = if bits.count < WHY_MAX { bits.count } else { WHY_MAX };
+        for k in 0..shown {
+            let line = buf_new();
+            effect_name(line, bits.data[k], allocs.data[k]);
+            buf_str(line, c" ← ");
+            let step = buf_new();
+            step_text(step, f, bits.data[k], allocs.data[k], true);
+            put_relative(line, buf_slice(step));
+            buf_str(md, c"- ");
+            put_cut(md, buf_slice(line), WHY_LINE_MAX);
+            buf_byte(md, '\n');
+        }
+        if bits.count > shown {
+            buf_fmt(md, f"- ({bits.count - shown} more: `tachyonc query effects --why EFFECT`)\n");
+        }
+    }
+}
+
+// The hover of definition d: its signature, a function's effects (declared
+// or inferred, with their reasons) and features, its path. At a call of a
+// generic function (inst: the instance called, else -1), the instance's.
+fn hover_def(md: i64, d: i64, inst: i64) {
+    unsafe {
+        buf_str(md, c"```tachyon\n");
+        put_signature(md, d);
+        buf_byte(md, '\n');
+        let f = fn_of(d);
+        let mut why = -1;
+        if f >= 0 {
+            let eff = buf_new();
+            def_effects_text(eff, d);
+            if buf_slice(eff).len > 0 {
+                buf_str(md, c"effects: ");
+                buf_bytes(md, buf_slice(eff));
+                put_decl_note(md, f, "");
+                why = f;
+            } else if FNS[f].generic != 0 && inst >= 0 && FNS[inst].tmpl == f + 1
+                && (fn_effects(inst).bits & EFF_UNKNOWN) == 0 {
+                buf_str(md, c"effects: ");
+                effects_text(md, fn_effects(inst));
+                put_decl_note(md, f, SYMS[FNS[inst].display].text);
+                why = inst;
+            } else if FNS[f].generic != 0 {
+                // (a generic function: its instances' sets)
+                let lines = buf_new();
+                def_effect_lines(lines, d);
+                let t = buf_slice(lines);
+                let mut n = 0;
+                let mut i = 0;
+                while i < t.len && n < 3 {
+                    let mut j = i;
+                    while j < t.len && t[j] != '\n' {
+                        j += 1;
+                    }
+                    buf_str(md, c"effects of ");
+                    let mut tab = i;
+                    while tab < j && t[tab] != '\t' {
+                        tab += 1;
+                    }
+                    buf_bytes(md, t[i..tab]);
+                    if tab < j {
+                        buf_str(md, c": ");
+                        buf_bytes(md, t[tab + 1..j]);
+                    }
+                    buf_byte(md, '\n');
+                    n += 1;
+                    i = j + 1;
+                }
+                if n == 0 {
+                    buf_str(md, c"effects: per instance (none checked)\n");
+                }
+            }
+            let feat = buf_new();
+            if put_def_features(feat, d, c"\n") {
+                buf_bytes(md, buf_slice(feat)[1..buf_slice(feat).len]);
+                buf_byte(md, '\n');
+            } else {
+                buf_str(md, c"features: none\n");
+            }
+        }
+        buf_str(md, c"```\n");
+        if why >= 0 && ((fn_effects(why).bits & EFF_VISIBLE) != 0 || fn_effects(why).allocs != 0) {
+            put_why_lines(md, why);
+        }
+        buf_str(md, c"\n`");
+        buf_bytes(md, SYMS[DEFS[d].fqn].text);
+        buf_str(md, c"` (");
+        buf_str(md, kind_name(DEFS[d].kind));
+        buf_str(md, c")\n");
+    }
+}
+
+// The hover of a local or an expression: its type (one per instance of a
+// generic function).
+fn hover_type(md: i64, pos: i64, start: i64) -> bool {
+    unsafe {
+        let mut at = pos;
+        let l = local_named_at(start);
+        if l >= 0 && l == start {
+            // (a declaration: the type of its first use)
+            let mut uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            local_uses(l, &mut uses);
+            if uses.count > 1 {
+                at = uses.data[1];
+            }
+        }
+        let (found, widened) = typed_nodes_at(1, at, 0);
+        if found.count == 0 {
+            return false;
+        }
+        buf_str(md, c"```tachyon\n");
+        if l >= 0 {
+            buf_bytes(md, SRC[l..token_end(l)]);
+            buf_str(md, c": ");
+        }
+        let mut types = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..found.count {
+            let n = found.data[i];
+            let t = NODES[n].ty;
+            let mut seen = false;
+            for j in 0..types.count {
+                if types.data[j] == t {
+                    seen = true;
+                }
+            }
+            if seen {
+                continue;
+            }
+            if types.count > 0 {
+                buf_str(md, c" | ");
+            }
+            types.push(t);
+            buf_type(md, t);
+            let to = widened.get(n + 1);
+            if to > 0 {
+                buf_str(md, c" (widened to ");
+                buf_type(md, to);
+                buf_byte(md, ')');
+            }
+        }
+        buf_str(md, c"\n```\n");
+        true
+    }
+}
+
+fn put_hover(out: i64, pos: i64) {
+    unsafe {
+        let start = token_start(pos);
+        let md = buf_new();
+        let d = def_named_at(start);
+        if d >= 0 {
+            hover_def(md, d, call_at(start));
+        } else if !hover_type(md, pos, start) {
+            buf_str(out, c"null");
+            return;
+        }
+        buf_str(out, c"{\"contents\":{\"kind\":\"markdown\",\"value\":");
+        buf_json_str(out, buf_slice(md));
+        buf_byte(out, '}');
+        if start >= 0 {
+            buf_str(out, c",\"range\":");
+            put_range(out, start, token_end(start));
+        }
+        buf_byte(out, '}');
+    }
+}
+
+// ---- document symbols
+
+// LSP's SymbolKind of a definition kind.
+fn symbol_kind(k: i64) -> i64 {
+    if k == K_FN { 12 } else if k == K_METHOD || k == K_IMPL_METHOD || k == K_TRAIT_FN { 6 }
+    else if k == K_STRUCT { 23 } else if k == K_ENUM { 10 } else if k == K_VARIANT { 22 }
+    else if k == K_FIELD { 8 } else if k == K_TRAIT { 11 } else if k == K_CONST { 14 }
+    else if k == K_STATIC { 13 } else if k == K_ALIAS { 26 } else { 2 }
+}
+
+fn put_symbol(out: i64, d: i64, children: &IntVec) {
+    unsafe {
+        buf_str(out, c"{\"name\":");
+        let name = buf_new();
+        let k = DEFS[d].kind;
+        if (k == K_METHOD || k == K_IMPL_METHOD) && DEFS[d].owner > 0 {
+            // (a function of an impl block: Type::f)
+            buf_bytes(name, last_segment(SYMS[DEFS[d].owner].text));
+            buf_str(name, c"::");
+        }
+        buf_bytes(name, SYMS[DEFS[d].name].text);
+        buf_json_str(out, buf_slice(name));
+        buf_str(out, c",\"detail\":");
+        let sig = buf_new();
+        put_signature(sig, d);
+        let s = buf_slice(sig);
+        buf_json_str(out, s[0..if s.len > 200 { 200 } else { s.len }]);
+        buf_fmt(out, f",\"kind\":{symbol_kind(k)},\"range\":");
+        let from = if DEFS[d].start < DEFS[d].name_pos { DEFS[d].start } else { DEFS[d].name_pos };
+        let to = if DEFS[d].end > DEFS[d].name_pos { DEFS[d].end }
+            else { token_end(DEFS[d].name_pos) };
+        put_range(out, from, to);
+        buf_str(out, c",\"selectionRange\":");
+        put_range(out, DEFS[d].name_pos, token_end(DEFS[d].name_pos));
+        if children.count > 0 {
+            buf_str(out, c",\"children\":[");
+            let none = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            for i in 0..children.count {
+                if i > 0 {
+                    buf_byte(out, ',');
+                }
+                put_symbol(out, children.data[i], &none);
+            }
+            buf_byte(out, ']');
+        }
+        buf_byte(out, '}');
+    }
+}
+
+fn put_symbols(out: i64, f: i64) {
+    unsafe {
+        let mut all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for d in 0..DEF_COUNT {
+            let p = DEFS[d].name_pos;
+            if p >= FILES[f].start && p < FILES[f].end {
+                all.push(d);
+            }
+        }
+        sort_by_position(&all);
+        buf_byte(out, '[');
+        let mut first = true;
+        for i in 0..all.count {
+            let d = all.data[i];
+            if DEFS[d].parent >= 0 && file_of_pos(DEFS[DEFS[d].parent].name_pos) == f {
+                continue;
+            }
+            let mut children = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            for j in 0..all.count {
+                if DEFS[all.data[j]].parent == d {
+                    children.push(all.data[j]);
+                }
+            }
+            if !first {
+                buf_byte(out, ',');
+            }
+            first = false;
+            put_symbol(out, d, &children);
+        }
+        buf_byte(out, ']');
+    }
+}
+
+// ---- diagnostics
+
+// The diagnostic of recorded text at pos (`check`'s short form, split):
+// `{"range":..,"severity":..,"code":..,"source":"tachyonc","message":..,
+// "relatedInformation":[the try: lines]}`, into out; false when it has
+// no position in a file.
+fn put_diagnostic(out: i64, pos: i64, text: [u8]) -> bool {
+    unsafe {
+        if !in_file(pos) {
+            return false;
+        }
+        let short = buf_new();
+        short_diagnostic(short, text, true);
+        let s = buf_slice(short);
+        // `[POSITION: ]SEVERITY[KIND] MESSAGE | help: .. | try: ..`
+        let mut b = 0;
+        while b < s.len && s[b] != '[' {
+            b += 1;
+        }
+        let mut h = b;
+        while h > 0 && s[h - 1] != ' ' {
+            h -= 1;
+        }
+        let mut k = b;
+        while k < s.len && s[k] != ']' {
+            k += 1;
+        }
+        let severity = if b < s.len { s[h..b] } else { "error" };
+        let code = if k < s.len { s[b + 1..k] } else { s[0..0] };
+        let message = buf_new();
+        let mut tries = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut from = if k + 2 <= s.len { k + 2 } else { s.len };
+        let mut first = true;
+        let mut i = from;
+        while i <= s.len {
+            if i == s.len || (i + 3 <= s.len && s[i] == ' ' && s[i + 1] == '|' && s[i + 2] == ' ') {
+                let part = s[from..i];
+                if first {
+                    buf_bytes(message, part);
+                    first = false;
+                } else if part.len > 5 && part[0..5] == "try: " {
+                    tries.push(from);
+                    tries.push(i);
+                } else {
+                    buf_byte(message, '\n');
+                    buf_bytes(message, part);
+                }
+                from = i + 3;
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        buf_str(out, c"{\"range\":");
+        put_range(out, pos, token_end(pos));
+        buf_fmt(out,
+            f",\"severity\":{if severity == "warning" { 2 } else if severity == "note" { 3 } else { 1 }},\"code\":");
+        buf_json_str(out, code);
+        buf_str(out, c",\"source\":\"tachyonc\",\"message\":");
+        buf_json_str(out, buf_slice(message));
+        if tries.count > 0 {
+            buf_str(out, c",\"relatedInformation\":[");
+            let mut t = 0;
+            while t < tries.count {
+                if t > 0 {
+                    buf_byte(out, ',');
+                }
+                buf_str(out, c"{\"location\":");
+                put_location(out, pos);
+                buf_str(out, c",\"message\":");
+                buf_json_str(out, s[tries.data[t]..tries.data[t + 1]]);
+                buf_byte(out, '}');
+                t += 2;
+            }
+            buf_byte(out, ']');
+        }
+        buf_byte(out, '}');
+        true
+    }
+}
+
+// publishDiagnostics for every file with an error or a warning, then the
+// end frame.
+fn publish_diagnostics() {
+    unsafe {
+        DIAG_SHORT = true;
+        let mut errors = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut warnings = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        diag_records(&mut errors, &mut warnings);
+        // (position, text) pairs, errors then warnings
+        let mut recs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let mut i = 0;
+        while i + 1 < errors.count {
+            recs.push(errors.data[i]);
+            recs.push(errors.data[i + 1]);
+            i += 2;
+        }
+        i = 0;
+        while i + 2 < warnings.count {
+            recs.push(warnings.data[i]);
+            recs.push(warnings.data[i + 1]);
+            i += 3;
+        }
+        for f in 0..FILE_COUNT {
+            let items = buf_new();
+            let mut n = 0;
+            let mut r = 0;
+            while r < recs.count {
+                let pos = recs.data[r];
+                if pos >= FILES[f].start && pos <= FILES[f].end && file_of_pos(pos) == f {
+                    let one = buf_new();
+                    if put_diagnostic(one, pos, buf_slice(recs.data[r + 1])) {
+                        if n > 0 {
+                            buf_byte(items, ',');
+                        }
+                        buf_bytes(items, buf_slice(one));
+                        n += 1;
+                    }
+                }
+                r += 2;
+            }
+            if n == 0 {
+                continue;
+            }
+            let msg = buf_new();
+            buf_str(msg, c"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"");
+            put_uri(msg, cstr(FILES[f].path));
+            buf_str(msg, c"\",\"diagnostics\":[");
+            buf_bytes(msg, buf_slice(items));
+            buf_str(msg, c"]}}");
+            send('n', buf_slice(msg));
+        }
+        send('e', "");
+    }
+}

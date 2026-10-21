@@ -207,6 +207,74 @@ pub fn query_type(arg: [u8]) -> i64 {
         // The innermost typed nodes holding pos (copies of one in each
         // instance of a generic function); without COL, the outermost
         // that starts on the line.
+        let (found, mut widened) = typed_nodes_at(col, pos, le);
+        if found.count == 0 {
+            let d = diag(c"error", c"query.no-match");
+            buf_str(d, c"no checked expression at ");
+            buf_bytes(d, arg);
+            buf_byte(d, '\n');
+            let w = buf_new();
+            buf_bytes(w, file_text(f));
+            buf_byte(w, ':');
+            crate::base::buf_int(w, line);
+            try_query(c"show", buf_slice(w));
+            return 1;
+        }
+        let out = buf_new();
+        let mut types = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..found.count {
+            let n = found.data[i];
+            let t = NODES[n].ty;
+            let mut seen = false;
+            for j in 0..types.count {
+                if types.data[j] == t {
+                    seen = true;
+                }
+            }
+            if seen {
+                continue;
+            }
+            types.push(t);
+            if NODES[n].kind == NodeKind::Interp && NODES[n].y < 0 {
+                put_direct_fstring(out, n);
+            } else {
+                buf_type(out, t);
+            }
+            let to = widened.get(n + 1);
+            if to > 0 {
+                // (0.15)
+                buf_str(out, c" (widened to ");
+                buf_type(out, to);
+                buf_byte(out, ')');
+            }
+            buf_byte(out, '\t');
+            let text = buf_new();
+            collapse(text, NODES[n].start, NODES[n].end);
+            let s = buf_slice(text);
+            if s.len <= EXPR_MAX {
+                buf_bytes(out, s);
+            } else {
+                let mut e = EXPR_MAX - 1;
+                while e > 0 && (s[e] & 192) == 128 {
+                    e -= 1;
+                }
+                buf_bytes(out, s[0..e]);
+                buf_byte(out, 226 as u8);
+                buf_byte(out, 128 as u8);
+                buf_byte(out, 166 as u8);
+            }
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDOUT);
+        0
+    }
+}
+
+// (0.24) The innermost typed nodes holding pos (col >= 1), else the
+// outermost starting on the line (pos..le), and the widened values: what
+// `query type` prints and the language server's hover shows.
+pub fn typed_nodes_at(col: i64, pos: i64, le: i64) -> (IntVec, HMap) {
+    unsafe {
         let mut best = 0;
         let mut have = false;
         let mut found = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -269,14 +337,15 @@ pub fn query_type(arg: [u8]) -> i64 {
             }
             // (0.15: an implicit cast is shown as the value it widens; what
             // the compiler writes for an f-string or a `?` is not shown)
-            if (NODES[n].kind == NodeKind::Cast && (NODES[n].p & NODE_IMPLICIT) != 0)
-                || made_by_compiler(n, &fstrings, &holes, &exprs) {
-                continue;
-            }
+            // (the position first: made_by_compiler scans the f-strings)
             if col >= 1 && (NODES[n].start > pos || NODES[n].end <= pos) {
                 continue;
             }
             if col < 1 && (NODES[n].start < pos || NODES[n].start >= le) {
+                continue;
+            }
+            if (NODES[n].kind == NodeKind::Cast && (NODES[n].p & NODE_IMPLICIT) != 0)
+                || made_by_compiler(n, &fstrings, &holes, &exprs) {
                 continue;
             }
             let size = if col >= 1 { NODES[n].end - NODES[n].start }
@@ -290,64 +359,6 @@ pub fn query_type(arg: [u8]) -> i64 {
                 found.push(n);
             }
         }
-        if found.count == 0 {
-            let d = diag(c"error", c"query.no-match");
-            buf_str(d, c"no checked expression at ");
-            buf_bytes(d, arg);
-            buf_byte(d, '\n');
-            let w = buf_new();
-            buf_bytes(w, file_text(f));
-            buf_byte(w, ':');
-            crate::base::buf_int(w, line);
-            try_query(c"show", buf_slice(w));
-            return 1;
-        }
-        let out = buf_new();
-        let mut types = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-        for i in 0..found.count {
-            let n = found.data[i];
-            let t = NODES[n].ty;
-            let mut seen = false;
-            for j in 0..types.count {
-                if types.data[j] == t {
-                    seen = true;
-                }
-            }
-            if seen {
-                continue;
-            }
-            types.push(t);
-            if NODES[n].kind == NodeKind::Interp && NODES[n].y < 0 {
-                put_direct_fstring(out, n);
-            } else {
-                buf_type(out, t);
-            }
-            let to = widened.get(n + 1);
-            if to > 0 {
-                // (0.15)
-                buf_str(out, c" (widened to ");
-                buf_type(out, to);
-                buf_byte(out, ')');
-            }
-            buf_byte(out, '\t');
-            let text = buf_new();
-            collapse(text, NODES[n].start, NODES[n].end);
-            let s = buf_slice(text);
-            if s.len <= EXPR_MAX {
-                buf_bytes(out, s);
-            } else {
-                let mut e = EXPR_MAX - 1;
-                while e > 0 && (s[e] & 192) == 128 {
-                    e -= 1;
-                }
-                buf_bytes(out, s[0..e]);
-                buf_byte(out, 226 as u8);
-                buf_byte(out, 128 as u8);
-                buf_byte(out, 166 as u8);
-            }
-            buf_byte(out, '\n');
-        }
-        buf_write_fd(out, STDOUT);
-        0
+        (found, widened)
     }
 }
