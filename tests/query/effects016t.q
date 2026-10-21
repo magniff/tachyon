@@ -15,8 +15,8 @@ crate::main	alloc(Gpa) io global panic unsafe
 $ effects grow --why alloc syntax016/main.tach
 crate::grow	alloc(Gpa) panic
   'v.push(1)' at syntax016/main.tach:39:5 grows a Vec<i64>
-  'self.reserve_more(1)' at <std>:239:37 grows a Vec<i64>
-  'self.alloc.try_resize(self.ptr as *u8, self...' at <std>:185:13 allocates from Gpa (an Allocator method)
+  'self.reserve_more(1)' at <std>:281:37 grows a Vec<i64>
+  'self.alloc.try_resize(self.ptr as *u8, self...' at <std>:227:13 allocates from Gpa (an Allocator method)
 $ effects grow --why 'alloc(Arena)' syntax016/main.tach
 crate::grow	alloc(Gpa) panic
   (not: alloc(Arena))
@@ -27,4 +27,4 @@ $ effects Pair syntax016/main.tach
 note query.empty: no function among the names
 [exit 1]
 $ def grow syntax016/main.tach
-crate::grow	syntax016/main.tach:38:4	fn	fn grow(v: &mut Vec<i64>)	effects: alloc(Gpa) panic
+crate::grow	syntax016/main.tach:38:4	fn	fn grow(v: inout Vec<i64>)	effects: alloc(Gpa) panic

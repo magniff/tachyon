@@ -9,7 +9,7 @@
 ## longer builds; the output after it is the one 0.16's semantics gave,
 ## recorded here before 0.18.1: `true true 122 true true 5 1 <bc>`. What the fix keeps raw is wrapped in
 ## `unsafe` by `fix --only unsafe`, the second try: of the error.)
-$ fix --values
+$ fix --values --syntax=mixed
 fixed 1 parameter to &mut T, 1 parameter to &T, 2 arguments	main.tach	+4 -4 lines
 % grep -n 'fn \|add(' main.tach
 2:    fn strlen(s: *u8) -> u64;
@@ -27,8 +27,13 @@ fixed 1 parameter to &mut T, 1 parameter to &T, 2 arguments	main.tach	+4 -4 line
 46:fn main(gpa: Gpa) {
 48:    add(&mut st, 4);
 49:    add(&mut st, 6);
-$ fix --only unsafe
+$ fix --only unsafe --syntax=mixed
 fixed 1 unsafe block	main.tach	+1 -1 lines
+## (0.20) Then 0.20's spelling, `fix --only conventions` (its 0.19 input
+## read --syntax=mixed): the chain 0.16 -> 0.19 -> 0.20 prints what 0.16 did.
+$ fix --only conventions --syntax=mixed
+fixed 1 parameter to let, 1 parameter to inout, 2 '&mut e's to '&e', 1 '&e' to a let, 3 'let mut's / 'mut x's to var	main.tach	+8 -8 lines
+note fix.conv_left: 1 left to hand: '&e' with no let parameter or field to take it: drop it to read, or write 'inout r = &e;'
 $ main.tach -o prog
 ok: built prog
 % ./prog

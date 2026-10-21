@@ -158,11 +158,11 @@ $ undo
 undid rewrote 2 sites in 1 file	main.tach	+3 -3 lines
 ## rewrite refused (edit.breaks): a hole of several types gets --where per type.
 $ rewrite '$v.len() == 0' '$v.is_empty()'
-calc.tach:29:8: error[type error] no method 'is_empty' on type '&Buf' | help: no `is_empty`: `x.len() == 0` | try: tachyonc query items Buf main.tach  [edited: crate::calc::empties]
+calc.tach:29:8: error[type error] no method 'is_empty' on type 'Buf' | help: no `is_empty`: `x.len() == 0` | try: tachyonc query items Buf main.tach  [edited: crate::calc::empties]
 error edit.breaks: 1 new error; nothing written
-note rewrite.where: $v has 2 types at the sites: &Vec<[u8]> (1 site), &Buf (1 site); --where takes the ones the replacement fits
-try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: &Vec<[u8]>'
-try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: &Buf'
+note rewrite.where: $v has 2 types at the sites: Vec<[u8]> (1 site), Buf (1 site); --where takes the ones the replacement fits
+try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8]>'
+try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Buf'
 try: tachyonc rewrite '$v.len() == 0' '$v.is_empty()' --no-check
 [exit 1]
 ## refactor rename: a path mention must name the item's module.

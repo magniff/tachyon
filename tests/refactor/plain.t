@@ -15,10 +15,10 @@ $ query diff
 --- a/main.tach
 +++ b/main.tach
 @@ -10,3 +10,3 @@
--    let mut i = 0;
+-    var i = 0;
 -    while i < points.len() {
 -        let p = points.get(i);
-+    let mut j = 0;
++    var j = 0;
 +    while j < points.len() {
 +        let p = points.get(j);
 @@ -14 +14 @@
@@ -61,8 +61,8 @@ $ refactor rename main.tach:28:9 n --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -28 +28 @@
--    let x = total(&v);
-+    let n = total(&v);
+-    let x = total(v);
++    let n = total(v);
 @@ -30 +30 @@
 -        let x = x + 1;
 +        let x = n + 1;
@@ -79,8 +79,8 @@ $ refactor rename main.tach:28:9 total --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -28 +28 @@
--    let x = total(&v);
-+    let total = total(&v);
+-    let x = total(v);
++    let total = total(v);
 @@ -30 +30 @@
 -        let x = x + 1;
 +        let x = total + 1;
@@ -89,7 +89,7 @@ $ refactor rename main.tach:28:9 total --dry-run
 +    std::print_int(twice(total));
 $ refactor rename total::total p
 error refactor.collision: 'p' is already a name in the scope of local total (at main.tach:12:13); nothing written
-try: tachyonc query show main.tach:9:13
+try: tachyonc query show main.tach:9:9
 [exit 1]
 ## A local of a generic function (and its instances).
 $ refactor rename twice::s sum --dry-run
@@ -107,9 +107,9 @@ $ refactor rename Catalog::add::qty copies --dry-run
 +++ b/catalog.tach
 @@ -12,2 +12,2 @@
 -    // Adds `qty` copies of the book `id`; see `Catalog::total`.
--    pub fn add(self: &mut Catalog, id: i64, qty: i64) -> i64 {
+-    pub fn add(inout self, id: i64, qty: i64) -> i64 {
 +    // Adds `copies` copies of the book `id`; see `Catalog::total`.
-+    pub fn add(self: &mut Catalog, id: i64, copies: i64) -> i64 {
++    pub fn add(inout self, id: i64, copies: i64) -> i64 {
 @@ -18,2 +18,2 @@
 -                // `qty` more; `Item::qty` is the count.
 -                it.qty += qty;
@@ -142,7 +142,7 @@ $ refactor rename main.tach:13:26 surface --dry-run
 +// The `surface` of p: x times y.
 +pub fn surface(p: Point) -> i64 {
 $ refactor rename main.tach:31:14 show
-error edit.not-source: std::print_int is not in a file of the program
+error edit.not-source: std::fmt::print_int is not in a file of the program
 [exit 1]
 ## ---- the mentions in comments ----
 ## A field: only `Item.qty`, `Item::qty` mentions, not the parameter's
@@ -224,8 +224,8 @@ $ refactor rename crate::total sum --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -8 +8 @@
--fn total(points: &Vec<Point>) -> i64 {
-+fn sum(points: &Vec<Point>) -> i64 {
+-fn total(points: Vec<Point>) -> i64 {
++fn sum(points: Vec<Point>) -> i64 {
 @@ -28 +28 @@
--    let x = total(&v);
-+    let x = sum(&v);
+-    let x = total(v);
++    let x = sum(v);

@@ -3,14 +3,15 @@
 // (literals, paths, struct literals, tuples, arrays) and the expressions
 // with blocks: `if`, `if let`, `match` and the loops.
 
-use crate::base::{SYMS, buf_bytes, intern_c, sym_text};
-use crate::base::diag::{ERR, err_begin, err_end, err_help, err_str, err_try_fmt, error_at};
+use crate::base::{SRC, SYMS, buf_bytes, buf_new, buf_slice, intern_c};
+use crate::base::diag::{ERR, err_begin, err_end, err_help, err_str, error_at};
 use crate::front::ast::{
-    ARM_NO_ELSE, ARM_SYNTHETIC, BLOCK_UNSAFE, CLOSURE_MOVE, FIELD_SHORTHAND, FMT_BIN, FMT_CHAR,
-    FMT_HEX, FMT_LEFT, FMT_RIGHT, FMT_UPPER, FMT_ZERO, NODES, NODE_REF_MUT, NodeKind, SCRATCH,
-    list_begin, list_end, list_push, new_node,
+    ARM_NO_ELSE, ARM_SYNTHETIC, BLOCK_UNSAFE, CLOSURE_MOVE, CONV_NEW, CONV_SINK, FIELD_SHORTHAND,
+    FMT_BIN, FMT_CHAR, FMT_EXP, FMT_HEX, FMT_LEFT, FMT_RIGHT, FMT_UPPER, FMT_ZERO, NODES,
+    NODE_REF_MUT, NodeKind, SCRATCH, list_begin, list_end, list_push, new_node,
 };
 use crate::front::check::arch::turbofish_const_error;
+use crate::front::conv::{legacy_at, rust_spelling, strict_at, word_at};
 use crate::front::lexer::{SUF_NONE, TOKS, Tok, is_digit, str_at};
 use crate::front::lexer::Tok::{
     Amp, AmpAmp, AmpEq, Arrow, As, At, Bang, BangEq, Break, CStr, Caret, CaretEq, Char, Colon,
@@ -204,6 +205,23 @@ fn parse_prefix() -> i64 {
             if mutable {
                 NODES[n].p |= NODE_REF_MUT;
             }
+            if kind == Amp && !legacy_at(start) && !crate::front::conv::generated_at(start) {
+                // (0.20) `&x` is the inout marker (front/conv: inout_marker):
+                // in a file read in 0.20's spelling always exclusive; mixed,
+                // where an exclusive reference is expected
+                NODES[n].p |= CONV_NEW;
+                if strict_at(start) {
+                    if mutable {
+                        let new = buf_new();
+                        buf_bytes(new, "&");
+                        buf_bytes(new, SRC[NODES[operand].start..NODES[operand].end]);
+                        rust_spelling(start, NODES[operand].end,
+                            "an inout argument (the callee may change it) is marked '&x'",
+                            buf_slice(new));
+                    }
+                    NODES[n].p |= NODE_REF_MUT;
+                }
+            }
             return n;
         }
         if kind == AmpAmp {
@@ -241,7 +259,9 @@ fn parse_prefix() -> i64 {
         if kind == DotDot || kind == DotDotEq {
             error_at(start, c"a range needs a start: write 'a..b'");
         }
-        if kind == Pipe || kind == PipePipe || kind == Tok::Move {
+        if kind == Pipe || kind == PipePipe || kind == Tok::Move
+            || word_at(P, "sink") && (tok_kind(1) == Pipe || tok_kind(1) == PipePipe)
+            && !legacy_at(start) {
             return parse_closure();
         }
         parse_primary()
@@ -254,8 +274,17 @@ fn parse_closure() -> i64 {
     unsafe {
         let start = cur_start();
         let n = new_node(NodeKind::Closure, start, 0);
+        if at(Tok::Move) && strict_at(start) {
+            rust_spelling(start, TOKS[P].end, "a closure that takes its captures is 'sink |..|'",
+                "sink");
+        }
         if eat(Tok::Move) {
             NODES[n].c = CLOSURE_MOVE;
+        } else if word_at(P, "sink") {
+            // (0.20) `sink |..|` (conventions.md D19)
+            advance();
+            NODES[n].c = CLOSURE_MOVE;
+            NODES[n].p |= CONV_NEW | CONV_SINK;
         }
         let mark = list_begin();
         if !eat(PipePipe) {
@@ -649,6 +678,10 @@ fn parse_spec(hole: i64, spec: i64) {
                 flags |= FMT_BIN;
             } else if c == 'c' {
                 flags |= FMT_CHAR;
+            } else if c == 'e' {
+                flags |= FMT_EXP;
+            } else if c == 'E' {
+                flags |= FMT_EXP | FMT_UPPER;
             } else {
                 i = -1;
             }
@@ -659,7 +692,7 @@ fn parse_spec(hole: i64, spec: i64) {
             err_str(c"invalid format spec ':");
             buf_bytes(ERR, s);
             err_str(c"'");
-            err_help(c"a spec is [<|>][0][width][.precision] then one of ? (Debug), x, X, b, c: '{x:>8.2}', '{v:?}', '{n:08x}'");
+            err_help(c"a spec is [<|>][0][width][.precision] then one of ? (Debug), x, X, b, c, e, E: '{x:>8.2}', '{v:?}', '{n:08x}'");
             err_end();
         }
         NODES[hole].p = flags;

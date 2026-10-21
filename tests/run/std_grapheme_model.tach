@@ -1,0 +1,181 @@
+// std's grapheme clusters (0.20) against an oracle written rule by rule
+// from UAX #29 (GB3 to GB999, each rule's look-behind scanned directly,
+// no state), on random sequences of code points of every grapheme class,
+// Indic_Conjunct_Break value and emoji kind, and random code points
+// (0.18's property tests stand in for later): GraphemeState fed one at a
+// time, and next_grapheme_end over the UTF-8.
+use std::str::encode_utf8;
+use std::unicode::{
+    GCB_CONTROL, GCB_CR, GCB_EXTEND, GCB_EXT_PICT, GCB_L, GCB_LF, GCB_LV, GCB_LVT, GCB_MASK,
+    GCB_OTHER, GCB_PREPEND, GCB_REGIONAL_INDICATOR, GCB_SPACING_MARK, GCB_T, GCB_V, GCB_ZWJ,
+    GraphemeState, PROP_INCB_CONSONANT, PROP_INCB_EXTEND, PROP_INCB_LINKER, PROP_INCB_MASK,
+    next_grapheme_end, props,
+};
+
+struct Rng { s: u64 }
+
+impl Rng {
+    fn next(inout self) -> u64 {
+        var x = self.s;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.s = x;
+        x
+    }
+
+    fn below(inout self, n: i64) -> i64 {
+        (self.next() % n as u64) as i64
+    }
+}
+
+// Grapheme_Cluster_Break as UAX #29 has it (Extended_Pictographic is Other).
+fn gcb(p: u16) -> u16 {
+    let g = p & GCB_MASK;
+    if g == GCB_EXT_PICT { GCB_OTHER } else { g }
+}
+
+fn incb(p: u16) -> u16 {
+    p & PROP_INCB_MASK
+}
+
+// Whether UAX #29 puts a boundary between cps i - 1 and i (0 < i < n).
+fn oracle(p: [u16], i: i64) -> bool {
+    let a = gcb(p[i - 1]);
+    let b = gcb(p[i]);
+    let ctl_a = a == GCB_CR || a == GCB_LF || a == GCB_CONTROL;
+    let ctl_b = b == GCB_CR || b == GCB_LF || b == GCB_CONTROL;
+    if a == GCB_CR && b == GCB_LF { return false; } // GB3
+    if ctl_a { return true; } // GB4
+    if ctl_b { return true; } // GB5
+    if a == GCB_L && (b == GCB_L || b == GCB_V || b == GCB_LV || b == GCB_LVT) {
+        return false; // GB6
+    }
+    if (a == GCB_LV || a == GCB_V) && (b == GCB_V || b == GCB_T) { return false; } // GB7
+    if (a == GCB_LVT || a == GCB_T) && b == GCB_T { return false; } // GB8
+    if b == GCB_EXTEND || b == GCB_ZWJ { return false; } // GB9
+    if b == GCB_SPACING_MARK { return false; } // GB9a
+    if a == GCB_PREPEND { return false; } // GB9b
+    // GB9c: InCB=Linker InCB=Extend* × InCB=Consonant
+    if incb(p[i]) == PROP_INCB_CONSONANT {
+        var j = i - 1;
+        while j >= 0 && incb(p[j]) == PROP_INCB_EXTEND {
+            j -= 1;
+        }
+        if j >= 0 && incb(p[j]) == PROP_INCB_LINKER {
+            return false;
+        }
+    }
+    // GB11: ExtPict Extend* ZWJ × ExtPict
+    if a == GCB_ZWJ && (p[i] & GCB_MASK) == GCB_EXT_PICT {
+        var j = i - 2;
+        while j >= 0 && gcb(p[j]) == GCB_EXTEND {
+            j -= 1;
+        }
+        if j >= 0 && (p[j] & GCB_MASK) == GCB_EXT_PICT {
+            return false;
+        }
+    }
+    // GB12, GB13: an odd number of RIs before
+    if a == GCB_REGIONAL_INDICATOR && b == GCB_REGIONAL_INDICATOR {
+        var k = 0;
+        var j = i - 1;
+        while j >= 0 && gcb(p[j]) == GCB_REGIONAL_INDICATOR {
+            k += 1;
+            j -= 1;
+        }
+        if k % 2 == 1 {
+            return false;
+        }
+    }
+    true // GB999
+}
+
+// Code points of every class the rules name.
+const PALETTE: [u32; 34] = [
+    0x61, 0x62, 0x0d, 0x0a, 0x01, 0x7f, 0xad, 0x300, 0x200d, 0x1f1e6, 0x1f1e7, 0x600, 0x903,
+    0x1100, 0x1161, 0x11a8, 0xac00, 0xac01, 0x1f600, 0x2764, 0x94d, 0x915, 0x93c, 0xfe0f,
+    0x1f3fb, 0x20e3, 0x9cd, 0x995, 0x200c, 0xe0020, 0x1f469, 0x1f466, 0x16d63, 0x11f02,
+];
+
+fn main(gpa: Gpa) -> i32 {
+    var r = Rng { s: 0x853c49e6748fea9b };
+    var cps: Vec<u32> = Vec::new_in(gpa);
+    var ps: Vec<u16> = Vec::new_in(gpa);
+    var utf8 = Buf::new_in(gpa);
+    var offsets: Vec<i64> = Vec::new_in(gpa);
+    var fails = 0;
+    var joins = 0;
+    var positions = 0;
+    for round in 0..40000 {
+        cps.clear();
+        ps.clear();
+        let n = 1 + r.below(12);
+        for _ in 0..n {
+            let cp = if r.below(8) == 0 {
+                let c = r.below(0x110000) as u32;
+                if c >= 0xd800 && c <= 0xdfff { 0x41 } else { c }
+            } else {
+                PALETTE[r.below(34)]
+            };
+            cps.push(cp);
+            ps.push(props(cp));
+        }
+        let p = ps.as_slice();
+        var st = GraphemeState::new();
+        var bad = false;
+        if !st.push(cps[0]) {
+            bad = true;
+        }
+        for i in 1..n {
+            let want = oracle(p, i);
+            positions += 1;
+            if !want {
+                joins += 1;
+            }
+            if st.push(cps[i]) != want {
+                bad = true;
+            }
+        }
+        // next_grapheme_end over the UTF-8, from each boundary
+        utf8.clear();
+        offsets.clear();
+        var e = [0u8; 4];
+        for i in 0..n {
+            offsets.push(utf8.len());
+            let m = encode_utf8(cps[i], &e);
+            utf8.push_str(e[0..m]);
+        }
+        offsets.push(utf8.len());
+        let s = utf8.as_slice();
+        var at = 0;
+        var k = 0;
+        while at < s.len {
+            let end = next_grapheme_end(s, at);
+            // (the next index with a boundary)
+            k += 1;
+            while k < n && !oracle(p, k) {
+                k += 1;
+            }
+            if end != offsets[k] {
+                bad = true;
+                break;
+            }
+            at = end;
+        }
+        if bad {
+            fails += 1;
+            if fails <= 5 {
+                print(f"round {round}:");
+                for i in 0..n {
+                    print(f" {cps[i]:x}");
+                }
+                println("");
+            }
+        }
+    }
+    println(f"{positions} positions, {joins} joined, {fails} failures");
+    if fails == 0 { 0 } else { 1 }
+}
+
+// EXPECT: 220612 positions, 65097 joined, 0 failures

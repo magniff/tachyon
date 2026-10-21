@@ -1,0 +1,108 @@
+// 0.20: owned temporaries live to the end of their statement and drop
+// there, after every use, once: a receiver made by `f()?` or `.unwrap()`
+// (an fd used after its close would write nothing: EBADF), chained
+// receivers, `?` chains, arguments to let parameters (generic too), a
+// closure's body, a field read out of a temporary, a `while` condition
+// (each test), f-string holes and format_in. --check-alloc finds no leak.
+// FLAGS: --check-alloc
+// EXPECT: hello
+// EXPECT: close
+// EXPECT: wrote 6
+// EXPECT: again
+// EXPECT: close
+// EXPECT: close
+// EXPECT: wrote 6
+// EXPECT: show 3
+// EXPECT: drop 3
+// EXPECT: drop 2
+// EXPECT: drop 1
+// EXPECT: after chain
+// EXPECT: show 11
+// EXPECT: drop 11
+// EXPECT: drop 10
+// EXPECT: chain end
+// EXPECT: 11 -1
+// EXPECT: drop 20
+// EXPECT: drop 21
+// EXPECT: after args 21
+// EXPECT: show 30
+// EXPECT: drop 30
+// EXPECT: after closure
+// EXPECT: drop 40
+// EXPECT: after field 40
+// EXPECT: show 50
+// EXPECT: drop 50
+// EXPECT: show 51
+// EXPECT: drop 51
+// EXPECT: show 52
+// EXPECT: drop 52
+// EXPECT: after while
+// EXPECT: len 2
+extern "C" {
+    fn dup(fd: i32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn write(fd: i32, p: *u8, n: u64) -> i64;
+}
+
+// A file descriptor that closes when dropped: using it after its drop is
+// EBADF.
+struct Fd { fd: i32 }
+
+impl Drop for Fd {
+    fn drop(inout self) { unsafe { close(self.fd); } println("close"); }
+}
+
+impl Fd {
+    fn say(self, s: [u8]) -> i64 { unsafe { write(self.fd, s.ptr, s.len as u64) } }
+    fn again(self) -> Fd { Fd { fd: unsafe { dup(self.fd) } } }
+}
+
+fn open() -> Result<Fd, i64> { Ok(Fd { fd: unsafe { dup(1) } }) }
+
+struct R { id: i64 }
+
+impl Drop for R {
+    fn drop(inout self) { println(f"drop {self.id}"); }
+}
+
+impl R {
+    fn show(self) -> i64 { println(f"show {self.id}"); self.id }
+    fn next(self) -> R { R { id: self.id + 1 } }
+}
+
+fn r(id: i64) -> R { R { id: id } }
+fn rr(id: i64) -> Result<R, i64> { if id > 0 { Ok(R { id: id }) } else { Err(id) } }
+fn peek(x: sink R) -> i64 { x.id }
+fn peek_gen<T>(x: sink T) -> i64 { 1 }
+
+fn chain(id: i64) -> Result<i64, i64> {
+    let n = rr(id)?.next().show();
+    println("chain end");
+    Ok(n)
+}
+
+fn main(gpa: Gpa) {
+    let n = open().unwrap().say("hello\n");
+    println(f"wrote {n}");
+    let m = open().unwrap().again().say("again\n");
+    println(f"wrote {m}");
+    r(1).next().next().show();
+    println("after chain");
+    println(f"{chain(10).unwrap_or(-1)} {chain(0).unwrap_or(-1)}");
+    let k = peek(r(20)) + peek_gen(r(21));
+    println(f"after args {k}");
+    let f = |i: i64| r(i).show();
+    f(30);
+    println("after closure");
+    let id = r(40).id;
+    println(f"after field {id}");
+    var i = 0;
+    while r(50 + i).show() < 52 {
+        i += 1;
+    }
+    println("after while");
+    var v: Vec<i64> = Vec::new_in(gpa);
+    v.push(1);
+    let len = v.clone().len() + format_in(f"{v.len()}", gpa).len();
+    println(f"len {len}");
+}

@@ -1,0 +1,880 @@
+// std::collections::btree_node: BTreeRaw<K, V, A>, the B-tree (0.20),
+// the engine of BTreeMap and BTreeSet (0.20), Rust's
+// B-tree. Nodes hold up to 11 keys and values inline (B = 6), internal
+// nodes 12 child pointers too; every node points at its parent and knows
+// its index there, so iteration needs no stack. Leaves and internal nodes
+// are allocated through A at their own sizes. The engine never compares
+// keys itself: a search takes `cmp`, a closure that compares the key
+// sought with the key it is given (negative: the sought one is smaller,
+// 0: equal, positive: larger), so one tree serves maps and sets, and
+// lookups by a borrowed form of the key.
+//
+// Positions are BHandles: a key-value pair (`idx` < the node's len) or an
+// edge, the place between two pairs (`idx` <= len; in a leaf, where an
+// insertion goes). A handle is valid until the tree changes, except the
+// one `insert_at` and `search` return for the next step.
+//
+// Insertion splits a full node around its middle (Rust's split points)
+// and passes the middle pair up, growing a new root at the top. Removal
+// swaps a pair of an internal node with its predecessor, a leaf's last,
+// and removes it there; a node left with fewer than 5 pairs takes one
+// from a sibling or merges with it (through the pair between them in the
+// parent), up the tree, and an empty root gives way to its only child.
+//
+// Safety: the methods taking a handle are `unsafe fn`: the caller
+// guarantees that the handle comes from this tree with no change to it
+// since (BTreeMap and BTreeSet keep to that). Nodes come only from
+// `node_alloc`; every pointer followed below
+// is the root, a child below its node's len + 1, or a parent, all live;
+// every key and value read is below its node's len (initialized). Node
+// fields are reached through raw pointers in `unsafe` blocks; the arrays
+// are indexed with checks; `read_key`, `read_val` and `write_val` check
+// that a handle is a pair.
+
+use std::{Allocator, Drop, Eq, Gpa, Iterator, Option, drop, needs_drop, panic};
+
+// ---- B-tree nodes (0.20 implementation) ----
+
+// The pairs of a node, at most (2B - 1).
+pub const BTREE_CAPACITY: i64 = 11;
+// The pairs of a node other than the root, at least (B - 1).
+const BTREE_MIN_LEN: i64 = 5;
+// More than the height of any tree (6^40 pairs): the bound of the loops
+// that climb or descend it.
+const BTREE_MAX_HEIGHT: i64 = 64;
+
+// A leaf; also the first part of an internal node (repr(C): an internal
+// node's pointer is its leaf part's).
+#[repr(C)]
+pub struct BLeaf<K, V> {
+    parent: *BInternal<K, V>,
+    // its index among its parent's edges
+    parent_idx: i32,
+    len: i32,
+    keys: [K; 11],
+    vals: [V; 11],
+}
+
+#[repr(C)]
+pub struct BInternal<K, V> {
+    data: BLeaf<K, V>,
+    edges: [*BLeaf<K, V>; 12],
+}
+
+// A position in the tree: pair or edge `idx` of `node`, at `height` (0:
+// a leaf).
+pub struct BHandle<K, V> {
+    node: *BLeaf<K, V>,
+    height: i64,
+    idx: i64,
+}
+
+#[sealed]
+pub struct BTreeRaw<K, V, A: Allocator = Gpa> {
+    // null for an empty tree
+    root: *BLeaf<K, V>,
+    // the root's height (leaves are 0)
+    height: i64,
+    len: i64,
+    alloc: A,
+}
+
+impl<K, V> BHandle<K, V> {
+    // The handle of nothing: what a search of an empty tree, or a step
+    // past the end, gives.
+    #[inline]
+    pub fn none() -> BHandle<K, V> {
+        BHandle { node: 0 as *BLeaf<K, V>, height: 0, idx: 0 }
+    }
+
+    #[inline]
+    pub fn is_none(self) -> bool {
+        self.node == 0 as *BLeaf<K, V>
+    }
+
+    // Stops the program unless self is a pair of a node.
+    #[inline]
+    fn check_kv(self) {
+        if self.node == 0 as *BLeaf<K, V> || self.idx < 0
+            || self.idx >= unsafe { bt_len(self.node) } {
+            unsafe { panic(c"BTreeRaw: the handle is not a key-value pair") }
+        }
+    }
+
+    // The pair after leaf edge self, or none at the end.
+    pub unsafe fn next_kv(sink self) -> BHandle<K, V> {
+        let e = self;
+        if e.node == 0 as *BLeaf<K, V> {
+            return e;
+        }
+        var n = e.node;
+        var h = e.height;
+        var i = e.idx;
+        unsafe {
+            for _ in 0..BTREE_MAX_HEIGHT {
+                if i < bt_len(n) {
+                    break;
+                }
+                let p = n.parent as *BLeaf<K, V>;
+                if p == 0 as *BLeaf<K, V> {
+                    return BHandle::none();
+                }
+                i = n.parent_idx as i64;
+                n = p;
+                h += 1;
+            }
+        }
+        BHandle { node: n, height: h, idx: i }
+    }
+
+    // The pair before leaf edge self, or none at the start.
+    pub unsafe fn next_back_kv(sink self) -> BHandle<K, V> {
+        let e = self;
+        if e.node == 0 as *BLeaf<K, V> {
+            return e;
+        }
+        var n = e.node;
+        var h = e.height;
+        var i = e.idx;
+        unsafe {
+            for _ in 0..BTREE_MAX_HEIGHT {
+                if i != 0 {
+                    break;
+                }
+                let p = n.parent as *BLeaf<K, V>;
+                if p == 0 as *BLeaf<K, V> {
+                    return BHandle::none();
+                }
+                i = n.parent_idx as i64;
+                n = p;
+                h += 1;
+            }
+        }
+        BHandle { node: n, height: h, idx: i - 1 }
+    }
+
+    // The leaf edge just after pair self (checked).
+    pub unsafe fn next_leaf_edge(sink self) -> BHandle<K, V> {
+        let kv = self;
+        kv.check_kv();
+        if kv.height == 0 {
+            return BHandle { node: kv.node, height: 0, idx: kv.idx + 1 };
+        }
+        BHandle {
+            node: unsafe { bt_first_leaf(bt_edge(kv.node, kv.idx + 1), kv.height - 1) }, height: 0,
+            idx: 0
+        }
+    }
+
+    // The leaf edge just before pair self (checked).
+    pub unsafe fn prev_leaf_edge(sink self) -> BHandle<K, V> {
+        let kv = self;
+        kv.check_kv();
+        if kv.height == 0 {
+            return BHandle { node: kv.node, height: 0, idx: kv.idx };
+        }
+        let n = unsafe { bt_last_leaf(bt_edge(kv.node, kv.idx), kv.height - 1) };
+        BHandle { node: n, height: 0, idx: unsafe { bt_len(n) } }
+    }
+}
+
+impl<K, V> Eq for BHandle<K, V> {
+    fn eq(self, other: BHandle<K, V>) -> bool {
+        self.node == other.node && self.idx == other.idx
+    }
+}
+
+// (the node of a handle as an internal node, and its fields: raw)
+#[inline]
+unsafe fn bt_int<K, V>(n: *BLeaf<K, V>) -> *BInternal<K, V> {
+    n as *BInternal<K, V>
+}
+
+#[inline]
+unsafe fn bt_len<K, V>(n: *BLeaf<K, V>) -> i64 {
+    n.len as i64
+}
+
+#[inline]
+unsafe fn bt_edge<K, V>(n: *BLeaf<K, V>, i: i64) -> *BLeaf<K, V> {
+    bt_int(n).edges[i]
+}
+
+// Sets edge i of internal node n to child c, and c's parent link.
+#[inline]
+unsafe fn bt_set_edge<K, V>(n: *BLeaf<K, V>, i: i64, c: *BLeaf<K, V>) {
+    bt_int(n).edges[i] = c;
+    c.parent = bt_int(n);
+    c.parent_idx = i as i32;
+}
+
+// The leftmost leaf of the subtree of n, at height h.
+unsafe fn bt_first_leaf<K, V>(n: *BLeaf<K, V>, h: i64) -> *BLeaf<K, V> {
+    var m = n;
+    for _ in 0..h {
+        m = bt_edge(m, 0);
+    }
+    m
+}
+
+// The rightmost leaf of the subtree of n, at height h.
+unsafe fn bt_last_leaf<K, V>(n: *BLeaf<K, V>, h: i64) -> *BLeaf<K, V> {
+    var m = n;
+    for _ in 0..h {
+        m = bt_edge(m, bt_len(m));
+    }
+    m
+}
+
+impl<K, V, A: Allocator> BTreeRaw<K, V, A> {
+    // An empty tree on allocator a; it allocates at the first insertion.
+    pub fn new_in(a: sink A) -> BTreeRaw<K, V, A> {
+        BTreeRaw { root: 0 as *BLeaf<K, V>, height: 0, len: 0, alloc: a }
+    }
+
+    #[inline]
+    pub fn len(self) -> i64 {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    // The height of the root (0: one leaf, or none).
+    pub fn height(self) -> i64 {
+        self.height
+    }
+
+    pub fn allocator(self) -> A {
+        self.alloc
+    }
+
+    // A new empty node of height h (a leaf when 0).
+    fn node_alloc(inout self, h: i64) -> *BLeaf<K, V> {
+        let n = if h == 0 {
+            self.alloc.alloc(size_of(BLeaf<K, V>), align_of(BLeaf<K, V>)) as *BLeaf<K, V>
+        } else {
+            self.alloc.alloc(size_of(BInternal<K, V>), align_of(BInternal<K, V>)) as *BLeaf<K, V>
+        };
+        unsafe {
+            n.parent = 0 as *BInternal<K, V>;
+            n.parent_idx = 0;
+            n.len = 0;
+        }
+        n
+    }
+
+    // Gives back node n of height h.
+    unsafe fn node_free(inout self, n: *BLeaf<K, V>, h: i64) {
+        if h == 0 {
+            self.alloc.free(n as *u8, size_of(BLeaf<K, V>), align_of(BLeaf<K, V>));
+        } else {
+            self.alloc.free(n as *u8, size_of(BInternal<K, V>), align_of(BInternal<K, V>));
+        }
+    }
+
+    // The pair whose key cmp finds equal, as (true, its handle), else
+    // (false, the leaf edge where it would be inserted): one descent,
+    // each node searched linearly. An empty tree gives (false, none).
+    pub fn search<F: FnMut(let K) -> i64>(self, cmp: sink F) -> (bool, BHandle<K, V>) {
+        var n = self.root;
+        if n == 0 as *BLeaf<K, V> {
+            return (false, BHandle::none());
+        }
+        var h = self.height;
+        unsafe {
+            for _ in 0..self.height + 1 {
+                let len = bt_len(n);
+                var i = 0;
+                for _ in 0..len {
+                    let c = cmp(*(&n.keys[i] as *K));
+                    if c == 0 {
+                        return (true, BHandle { node: n, height: h, idx: i });
+                    }
+                    if c < 0 {
+                        break;
+                    }
+                    i += 1;
+                }
+                if h == 0 {
+                    return (false, BHandle { node: n, height: 0, idx: i });
+                }
+                n = bt_edge(n, i);
+                h -= 1;
+            }
+        }
+        (false, BHandle::none())
+    }
+
+    // Stops the program unless h is a pair.
+    #[inline]
+    fn check_kv(self, h: BHandle<K, V>) {
+        h.check_kv();
+    }
+
+    // The key of pair h (checked).
+    #[inline]
+    pub unsafe fn read_key(self, h: sink BHandle<K, V>) -> K {
+        self.check_kv(h);
+        unsafe { h.node.keys[h.idx] }
+    }
+
+    // The value of pair h (checked).
+    #[inline]
+    pub unsafe fn read_val(self, h: sink BHandle<K, V>) -> V {
+        self.check_kv(h);
+        unsafe { h.node.vals[h.idx] }
+    }
+
+    // Replaces the value of pair h (checked).
+    #[inline]
+    pub unsafe fn write_val(inout self, h: sink BHandle<K, V>, v: sink V) {
+        self.check_kv(h);
+        unsafe {
+            h.node.vals[h.idx] = v;
+        }
+    }
+
+    // A pointer to the value of pair h (checked); raw, valid until the
+    // tree changes.
+    #[inline]
+    pub unsafe fn val_ptr(self, h: sink BHandle<K, V>) -> *V {
+        self.check_kv(h);
+        unsafe { &h.node.vals[h.idx] }
+    }
+
+    // Inserts the pair (k, v) at leaf edge `edge` (from `search`, which
+    // found no equal key, with no change to the tree since); returns the
+    // handle of the new pair.
+    pub unsafe fn insert_at(inout self, edge: sink BHandle<K, V>, k: sink K, v: sink V) -> BHandle<K, V> {
+        if self.root == 0 as *BLeaf<K, V> {
+            let n = self.node_alloc(0);
+            unsafe {
+                n.keys[0] = k;
+                n.vals[0] = v;
+                n.len = 1;
+            }
+            self.root = n;
+            self.height = 0;
+            self.len = 1;
+            return BHandle { node: n, height: 0, idx: 0 };
+        }
+        if edge.node == 0 as *BLeaf<K, V> || edge.height != 0 || edge.idx < 0
+            || edge.idx > unsafe { bt_len(edge.node) } {
+            unsafe { panic(c"BTreeRaw::insert_at: the handle is not a leaf edge") }
+        }
+        self.len += 1;
+        let leaf = edge.node;
+        let at = edge.idx;
+        unsafe {
+            if bt_len(leaf) < BTREE_CAPACITY {
+                bt_insert_fit(leaf, at, k, v);
+                return BHandle { node: leaf, height: 0, idx: at };
+            }
+            // (full: split, then the middle pair and the new right node
+            // go up)
+            let (mid, place) = bt_splitpoint(at);
+            let right = self.node_alloc(0);
+            let (mk, mv) = bt_split_kvs(leaf, right, mid);
+            let result = if place < 0 {
+                bt_insert_fit(leaf, at, k, v);
+                BHandle { node: leaf, height: 0, idx: at }
+            } else {
+                bt_insert_fit(right, place, k, v);
+                BHandle { node: right, height: 0, idx: place }
+            };
+            self.insert_up(leaf, 0, mk, mv, right);
+            result
+        }
+    }
+
+    // Puts pair (k, v) and the node `right` (of height h) into the parent
+    // of `left` (h), just after left, splitting full parents up to a new
+    // root.
+    unsafe fn insert_up(inout self, left: *BLeaf<K, V>, h: i64, k: sink K, v: sink V,
+        right: *BLeaf<K, V>) {
+        var l = left;
+        var r = right;
+        var kk = k;
+        var vv = v;
+        var height = h;
+        for _ in 0..BTREE_MAX_HEIGHT {
+            let p = l.parent as *BLeaf<K, V>;
+            if p == 0 as *BLeaf<K, V> {
+                // (l was the root: a new root over l and r)
+                let root = self.node_alloc(height + 1);
+                root.keys[0] = kk;
+                root.vals[0] = vv;
+                root.len = 1;
+                bt_set_edge(root, 0, l);
+                bt_set_edge(root, 1, r);
+                self.root = root;
+                self.height = height + 1;
+                return;
+            }
+            let at = l.parent_idx as i64;
+            if bt_len(p) < BTREE_CAPACITY {
+                bt_insert_fit_internal(p, at, kk, vv, r);
+                return;
+            }
+            let (mid, place) = bt_splitpoint(at);
+            let pr = self.node_alloc(height + 1);
+            let (mk, mv) = bt_split_kvs(p, pr, mid);
+            // (the edges after the middle pair move to the new node)
+            let plen = bt_len(pr);
+            for j in 0..plen + 1 {
+                bt_set_edge(pr, j, bt_edge(p, mid + 1 + j));
+            }
+            if place < 0 {
+                bt_insert_fit_internal(p, at, kk, vv, r);
+            } else {
+                bt_insert_fit_internal(pr, place, kk, vv, r);
+            }
+            l = p;
+            r = pr;
+            kk = mk;
+            vv = mv;
+            height += 1;
+        }
+    }
+
+    // Removes pair h (checked) and returns it.
+    pub unsafe fn remove_kv(inout self, h: sink BHandle<K, V>) -> (K, V) {
+        self.check_kv(h);
+        unsafe {
+            var leaf = h.node;
+            var idx = h.idx;
+            if h.height > 0 {
+                // (its predecessor, the last pair of the left subtree's
+                // last leaf, takes its place; then that leaf loses its
+                // last pair, the one removed)
+                let pred = bt_last_leaf(bt_edge(h.node, h.idx), h.height - 1);
+                let pi = bt_len(pred) - 1;
+                let k = h.node.keys[h.idx];
+                let v = h.node.vals[h.idx];
+                h.node.keys[h.idx] = pred.keys[pi];
+                h.node.vals[h.idx] = pred.vals[pi];
+                pred.keys[pi] = k;
+                pred.vals[pi] = v;
+                leaf = pred;
+                idx = pi;
+            }
+            let k = leaf.keys[idx];
+            let v = leaf.vals[idx];
+            let len = bt_len(leaf);
+            for j in idx..len - 1 {
+                leaf.keys[j] = leaf.keys[j + 1];
+                leaf.vals[j] = leaf.vals[j + 1];
+            }
+            leaf.len = (len - 1) as i32;
+            self.len -= 1;
+            self.rebalance(leaf, 0);
+            (k, v)
+        }
+    }
+
+    // Restores the minimum length from node n (height h) up: a node below
+    // it takes a pair from a sibling or merges with it; an empty root
+    // gives way to its child, or the tree becomes empty.
+    unsafe fn rebalance(inout self, node: *BLeaf<K, V>, height: i64) {
+        var n = node;
+        var h = height;
+        for _ in 0..BTREE_MAX_HEIGHT {
+            let p = n.parent as *BLeaf<K, V>;
+            if p == 0 as *BLeaf<K, V> {
+                if bt_len(n) == 0 {
+                    if h > 0 {
+                        let child = bt_edge(n, 0);
+                        child.parent = 0 as *BInternal<K, V>;
+                        child.parent_idx = 0;
+                        self.root = child;
+                        self.height = h - 1;
+                    } else {
+                        self.root = 0 as *BLeaf<K, V>;
+                        self.height = 0;
+                    }
+                    self.node_free(n, h);
+                }
+                return;
+            }
+            if bt_len(n) >= BTREE_MIN_LEN {
+                return;
+            }
+            let i = n.parent_idx as i64;
+            if i > 0 {
+                let left = bt_edge(p, i - 1);
+                if bt_len(left) + 1 + bt_len(n) <= BTREE_CAPACITY {
+                    self.merge(p, i - 1, h);
+                } else {
+                    bt_steal_left(p, i, h);
+                    return;
+                }
+            } else {
+                let right = bt_edge(p, 1);
+                if bt_len(n) + 1 + bt_len(right) <= BTREE_CAPACITY {
+                    self.merge(p, 0, h);
+                } else {
+                    bt_steal_right(p, 0, h);
+                    return;
+                }
+            }
+            n = p;
+            h += 1;
+        }
+    }
+
+    // Merges children i and i + 1 of internal node p (their height h) and
+    // the pair between them into child i; frees child i + 1.
+    unsafe fn merge(inout self, p: *BLeaf<K, V>, i: i64, h: i64) {
+        let l = bt_edge(p, i);
+        let r = bt_edge(p, i + 1);
+        let ll = bt_len(l);
+        let rl = bt_len(r);
+        l.keys[ll] = p.keys[i];
+        l.vals[ll] = p.vals[i];
+        for j in 0..rl {
+            l.keys[ll + 1 + j] = r.keys[j];
+            l.vals[ll + 1 + j] = r.vals[j];
+        }
+        if h > 0 {
+            for j in 0..rl + 1 {
+                bt_set_edge(l, ll + 1 + j, bt_edge(r, j));
+            }
+        }
+        l.len = (ll + 1 + rl) as i32;
+        let pl = bt_len(p);
+        for j in i..pl - 1 {
+            p.keys[j] = p.keys[j + 1];
+            p.vals[j] = p.vals[j + 1];
+        }
+        for j in i + 1..pl {
+            bt_set_edge(p, j, bt_edge(p, j + 1));
+        }
+        p.len = (pl - 1) as i32;
+        self.node_free(r, h);
+    }
+
+    // The leaf edge before the first pair, or none.
+    pub fn first_leaf_edge(self) -> BHandle<K, V> {
+        if self.root == 0 as *BLeaf<K, V> {
+            return BHandle::none();
+        }
+        BHandle { node: unsafe { bt_first_leaf(self.root, self.height) }, height: 0, idx: 0 }
+    }
+
+    // The leaf edge after the last pair, or none.
+    pub fn last_leaf_edge(self) -> BHandle<K, V> {
+        if self.root == 0 as *BLeaf<K, V> {
+            return BHandle::none();
+        }
+        let n = unsafe { bt_last_leaf(self.root, self.height) };
+        BHandle { node: n, height: 0, idx: unsafe { bt_len(n) } }
+    }
+
+    // The leaf edge before the first pair whose key is not below a bound
+    // (cmp compares the bound with a key); with `strict`, before the first
+    // pair whose key is above it. A range search is two: the pairs of
+    // a..b lie from lower_edge(a, false) to lower_edge(b, false) (a..=b:
+    // to lower_edge(b, true)), stepped through with the handles' next_kv
+    // and next_leaf_edge until the front edge is the back one.
+    pub fn lower_edge<F: FnMut(let K) -> i64>(self, cmp: sink F, strict: bool) -> BHandle<K, V> {
+        var n = self.root;
+        if n == 0 as *BLeaf<K, V> {
+            return BHandle::none();
+        }
+        var h = self.height;
+        unsafe {
+            for _ in 0..self.height + 1 {
+                let len = bt_len(n);
+                var i = 0;
+                for _ in 0..len {
+                    let c = cmp(*(&n.keys[i] as *K));
+                    if c < 0 || (c == 0 && !strict) {
+                        break;
+                    }
+                    i += 1;
+                }
+                if h == 0 {
+                    return BHandle { node: n, height: 0, idx: i };
+                }
+                n = bt_edge(n, i);
+                h -= 1;
+            }
+        }
+        BHandle::none()
+    }
+
+    // The pairs in order (copies), from both ends: a view of the tree.
+    #[views(self)]
+    pub fn iter(self) -> BTreeIter<K, V, A> {
+        BTreeIter { tree: self, front: self.first_leaf_edge(), back: self.last_leaf_edge() }
+    }
+
+    // The pairs between leaf edges front and back (front first, as
+    // lower_edge gives them): a view of the tree. The caller guarantees
+    // that both come from this tree with no change since.
+    #[views(self)]
+    pub unsafe fn iter_between(self, front: sink BHandle<K, V>, back: sink BHandle<K, V>) -> BTreeIter<K, V, A> {
+        BTreeIter { tree: self, front: front, back: back }
+    }
+
+    // Frees every node (post-order, through the parent links: no
+    // recursion, no stack); the tree is empty, and may be used again.
+    pub fn free(inout self) {
+        if self.root == 0 as *BLeaf<K, V> {
+            return;
+        }
+        unsafe {
+            var n = bt_first_leaf(self.root, self.height);
+            var h = 0;
+            // (one node freed a round; a node holds a pair at least)
+            for _ in 0..self.len + 1 {
+                let p = n.parent as *BLeaf<K, V>;
+                let i = n.parent_idx as i64;
+                if needs_drop::<K>() || needs_drop::<V>() {
+                    for j in 0..bt_len(n) {
+                        drop(n.keys[j]);
+                        drop(n.vals[j]);
+                    }
+                }
+                self.node_free(n, h);
+                if p == 0 as *BLeaf<K, V> {
+                    break;
+                }
+                n = p;
+                h += 1;
+                if i < bt_len(n) {
+                    // (the next child's subtree, from its first leaf)
+                    n = bt_first_leaf(bt_edge(n, i + 1), h - 1);
+                    h = 0;
+                }
+            }
+        }
+        self.root = 0 as *BLeaf<K, V>;
+        self.height = 0;
+        self.len = 0;
+    }
+
+    // (tests) The tree's invariants: "" when they hold, else the first
+    // broken. Lengths (5 to 11 below the root, 1 to 11 at it), parent
+    // links, every leaf at the same depth, keys in increasing order
+    // (`less(a, b)`: a's key below b's), the count.
+    pub fn check<F: FnMut(let K, let K) -> bool>(self, less: sink F) -> [u8] {
+        if self.root == 0 as *BLeaf<K, V> {
+            return if self.len == 0 { "" } else { "an empty tree has a length" };
+        }
+        unsafe {
+            if self.root.parent != 0 as *BInternal<K, V> {
+                return "the root has a parent";
+            }
+            // (every pair in order, through the leaf edges; each node's
+            // checks at its first pair, or at its leaf edge when empty)
+            var count = 0;
+            var e = self.first_leaf_edge();
+            var prev: BHandle<K, V> = BHandle::none();
+            for _ in 0..self.len + 1 {
+                if e.node.len == 0 && e.node != self.root {
+                    return "an empty node below the root";
+                }
+                let kv = e.next_kv();
+                if kv.is_none() {
+                    break;
+                }
+                let n = kv.node;
+                let len = bt_len(n);
+                if len > BTREE_CAPACITY || (n != self.root && len < BTREE_MIN_LEN) || len < 1 {
+                    return "a node's length is out of bounds";
+                }
+                if kv.height > 0 {
+                    for j in 0..len + 1 {
+                        let c = bt_edge(n, j);
+                        if c.parent as *BLeaf<K, V> != n || c.parent_idx as i64 != j {
+                            return "a child's parent link is wrong";
+                        }
+                    }
+                }
+                if !prev.is_none()
+                    && !less(*(&prev.node.keys[prev.idx] as *K), *(&n.keys[kv.idx] as *K)) {
+                    return "keys out of order";
+                }
+                // (the depth of every leaf is the root's height)
+                var d = 0;
+                var m = e.node;
+                for _ in 0..BTREE_MAX_HEIGHT {
+                    if m.parent == 0 as *BInternal<K, V> {
+                        break;
+                    }
+                    m = m.parent as *BLeaf<K, V>;
+                    d += 1;
+                }
+                if d != self.height || e.height != 0 {
+                    return "a leaf is not at the bottom";
+                }
+                count += 1;
+                prev = kv;
+                e = kv.next_leaf_edge();
+            }
+            if count != self.len {
+                return "the length is not the number of pairs";
+            }
+        }
+        ""
+    }
+}
+
+// The tree's drop: its pairs' drops, then its nodes given back.
+impl<K, V, A: Allocator> Drop for BTreeRaw<K, V, A> {
+    fn drop(inout self) {
+        self.free();
+    }
+}
+
+// The pairs of a tree in order, as (key, value) copies (`iter`,
+// `iter_between`); both ends move (`next`, `next_back`) until they meet.
+// A view of the tree: its handles stay valid while it lives.
+pub struct BTreeIter<K, V, A: Allocator> {
+    tree: let BTreeRaw<K, V, A>,
+    front: BHandle<K, V>,
+    back: BHandle<K, V>,
+}
+
+impl<K, V, A: Allocator> BTreeIter<K, V, A> {
+    // The last pair not yet given, or none.
+    pub fn next_back(inout self) -> Option<(K, V)> {
+        if self.front == self.back || self.back.is_none() {
+            return Option::None;
+        }
+        // (the handles are the viewed tree's, which cannot change)
+        unsafe {
+            let kv = self.back.next_back_kv();
+            self.back = kv.prev_leaf_edge();
+            Option::Some((kv.node.keys[kv.idx], kv.node.vals[kv.idx]))
+        }
+    }
+}
+
+impl<K, V, A: Allocator> Iterator for BTreeIter<K, V, A> {
+    type Item = (K, V);
+
+    fn next(inout self) -> Option<(K, V)> {
+        if self.front == self.back || self.front.is_none() {
+            return Option::None;
+        }
+        // (the handles are the viewed tree's, which cannot change)
+        unsafe {
+            let kv = self.front.next_kv();
+            self.front = kv.next_leaf_edge();
+            Option::Some((kv.node.keys[kv.idx], kv.node.vals[kv.idx]))
+        }
+    }
+}
+
+// Rust's split points: splitting a full node to insert at edge `at`, the
+// pair that goes up (`mid`) and where the insertion goes: edge `at` of
+// the left node (-1), or the edge of the right node (>= 0).
+#[inline]
+fn bt_splitpoint(at: i64) -> (i64, i64) {
+    if at < 5 {
+        (4, -1)
+    } else if at == 5 {
+        (5, -1)
+    } else if at == 6 {
+        (5, 0)
+    } else {
+        (6, at - 7)
+    }
+}
+
+// Moves the pairs after `mid` of full node n into the empty node r and
+// returns pair mid; n keeps the pairs before it.
+unsafe fn bt_split_kvs<K, V>(n: *BLeaf<K, V>, r: *BLeaf<K, V>, mid: i64) -> (K, V) {
+    let len = bt_len(n);
+    let rl = len - mid - 1;
+    for j in 0..rl {
+        r.keys[j] = n.keys[mid + 1 + j];
+        r.vals[j] = n.vals[mid + 1 + j];
+    }
+    r.len = rl as i32;
+    n.len = mid as i32;
+    (n.keys[mid], n.vals[mid])
+}
+
+// Inserts (k, v) at edge `at` of leaf n, which has room.
+unsafe fn bt_insert_fit<K, V>(n: *BLeaf<K, V>, at: i64, k: sink K, v: sink V) {
+    let len = bt_len(n);
+    for t in 0..len - at {
+        let j = len - t;
+        n.keys[j] = n.keys[j - 1];
+        n.vals[j] = n.vals[j - 1];
+    }
+    n.keys[at] = k;
+    n.vals[at] = v;
+    n.len = (len + 1) as i32;
+}
+
+// Inserts (k, v) at pair `at` of internal node n, which has room, and
+// child r at edge at + 1.
+unsafe fn bt_insert_fit_internal<K, V>(n: *BLeaf<K, V>, at: i64, k: sink K, v: sink V,
+    r: *BLeaf<K, V>) {
+    let len = bt_len(n);
+    for t in 0..len - at {
+        let j = len + 1 - t;
+        bt_set_edge(n, j, bt_edge(n, j - 1));
+    }
+    bt_insert_fit(n, at, k, v);
+    bt_set_edge(n, at + 1, r);
+}
+
+// Child i of p (height h) takes the last pair of child i - 1 through the
+// pair between them (a rotation to the right).
+unsafe fn bt_steal_left<K, V>(p: *BLeaf<K, V>, i: i64, h: i64) {
+    let l = bt_edge(p, i - 1);
+    let n = bt_edge(p, i);
+    let ll = bt_len(l);
+    let nl = bt_len(n);
+    for t in 0..nl {
+        let j = nl - t;
+        n.keys[j] = n.keys[j - 1];
+        n.vals[j] = n.vals[j - 1];
+    }
+    n.keys[0] = p.keys[i - 1];
+    n.vals[0] = p.vals[i - 1];
+    p.keys[i - 1] = l.keys[ll - 1];
+    p.vals[i - 1] = l.vals[ll - 1];
+    if h > 0 {
+        for t in 0..nl + 1 {
+            let j = nl + 1 - t;
+            bt_set_edge(n, j, bt_edge(n, j - 1));
+        }
+        bt_set_edge(n, 0, bt_edge(l, ll));
+    }
+    l.len = (ll - 1) as i32;
+    n.len = (nl + 1) as i32;
+}
+
+// Child i of p (height h) takes the first pair of child i + 1 through the
+// pair between them (a rotation to the left).
+unsafe fn bt_steal_right<K, V>(p: *BLeaf<K, V>, i: i64, h: i64) {
+    let n = bt_edge(p, i);
+    let r = bt_edge(p, i + 1);
+    let nl = bt_len(n);
+    let rl = bt_len(r);
+    n.keys[nl] = p.keys[i];
+    n.vals[nl] = p.vals[i];
+    p.keys[i] = r.keys[0];
+    p.vals[i] = r.vals[0];
+    for j in 0..rl - 1 {
+        r.keys[j] = r.keys[j + 1];
+        r.vals[j] = r.vals[j + 1];
+    }
+    if h > 0 {
+        bt_set_edge(n, nl + 1, bt_edge(r, 0));
+        for j in 0..rl {
+            bt_set_edge(r, j, bt_edge(r, j + 1));
+        }
+    }
+    n.len = (nl + 1) as i32;
+    r.len = (rl - 1) as i32;
+}

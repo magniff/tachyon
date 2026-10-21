@@ -32,7 +32,7 @@ pub fn scale(p: Point, k: i64) -> Point {
 
 impl Point {
     // x + y.
-    pub fn sum(self: &Point) -> i64 {
+    pub fn sum(self) -> i64 {
         self.x + self.y
     }
 }
@@ -43,7 +43,7 @@ $ edit replace geom::area < $T/inputs/area_doc.tach
 replaced crate::geom::area	geom.tach	+2 -3 lines
 % git diff
 diff --git a/geom.tach b/geom.tach
-index 1681721..11d94eb 100644
+index 92df3fe..65fc83f 100644
 --- a/geom.tach
 +++ b/geom.tach
 @@ -5,7 +5,7 @@ pub struct Point {
@@ -60,7 +60,7 @@ $ edit replace Point::sum --dry-run < $T/inputs/sum_unindented.tach
 --- a/geom.tach
 +++ b/geom.tach
 @@ -19,2 +19,2 @@
--    pub fn sum(self: &Point) -> i64 {
+-    pub fn sum(self) -> i64 {
 -        self.x + self.y
 +    pub fn sum(self: *Point) -> i64 {
 +        self.y + self.x

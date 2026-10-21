@@ -63,7 +63,7 @@ function reduction_kernel(id, t,    op, init, ops, n, load) {
     load[1] = "s[i]"
     print "#[inline(never)]"
     print "fn k" id "(s: [" t "], k: " t ") -> " t " {"
-    print "    let mut acc: " t " = " init " as " t ";"
+    print "    var acc: " t " = " init " as " t ";"
     print "    for i in 0..s.len as i64 {"
     print "        acc " op "= " elem_expr(t, rnd(3), 1, load) ";"
     print "    }"
@@ -114,7 +114,7 @@ function explicit_kernel(id, t,    vt, l, op, ops, n) {
     op = ops[1 + rnd(n)]
     print "#[inline(never)]"
     print "fn k" id "(a: [" t "], b: [" t "], out: [" t "], n: i64, k: " t ") {"
-    print "    let mut i = 0;"
+    print "    var i = 0;"
     print "    let kv = " vt "::splat(k);"
     print "    while i + " l " <= n {"
     print "        let x = " vt "::load(a, i);"
@@ -149,7 +149,7 @@ function nested_kernel(id, t,    load, op, ops, n) {
     print "#[inline(never)]"
     print "unsafe fn k" id "(a: *" t ", b: *" t ", out: *" t ", n: i64, k: " t ") {"
     print "    for j in 0..n {"
-    print "        let mut acc: " t " = k;"
+    print "        var acc: " t " = k;"
     print "        for q in 0.." Q[id] " {"
     print "            acc = acc " op " " elem_expr(t, 1 + rnd(2), 2, load) ";"
     print "        }"
@@ -161,7 +161,7 @@ function nested_kernel(id, t,    load, op, ops, n) {
 
 function fill(name, t, len,    s) {
     s = rnd(1000)
-    print "    let mut " name ": [" t "; " len "] = [0 as " t "; " len "];"
+    print "    var " name ": [" t "; " len "] = [0 as " t "; " len "];"
     print "    for i in 0.." len " {"
     if (is_float(t)) {
         print "        " name "[i] = ((i * " (7 + rnd(90)) " + " s ") % 97) as " t " * 0.25 - 3.0;"
@@ -193,7 +193,7 @@ BEGIN {
     print "}"
     print ""
     # Z: 0, but not known to the compiler (bounds stay run-time values).
-    print "static mut Z: i64 = 0;"
+    print "static var Z: i64 = 0;"
     print ""
     nk = 3 + rnd(4)
     for (id = 0; id < nk; id++) {

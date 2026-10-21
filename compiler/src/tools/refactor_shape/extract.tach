@@ -25,10 +25,11 @@ use crate::base::{
 use crate::front::ast::{DEFER_IMPLICIT, NODES, NODE_COUNT, NodeKind, child};
 use crate::front::check::LOCALS;
 use crate::front::modules::file_of_pos;
-use crate::front::types::{TY_NEVER, TY_UNIT, buf_type, is_pointer};
+use crate::front::types::{REF_MUT, TYPES, TY_NEVER, TY_UNIT, TyKind, buf_type, is_pointer};
 use crate::tools::edit::edit_replace;
 use crate::tools::edit::apply::{apply_edit, set_command};
 use crate::tools::edit::items::{after_line, indent_of};
+use crate::tools::fixconv::{new_spelling, put_type_conv};
 use crate::tools::query::{c_slice, root_or_diag};
 use crate::tools::query::defs::{DEFS, DEF_COUNT, K_FN, K_IMPL_METHOD, K_METHOD};
 use crate::tools::query::diagnostics::{
@@ -381,21 +382,32 @@ fn extract_inner(argc: i64, argv: **u8) -> i64 {
         buf_byte(text, '(');
         if method {
             let sp = decl_of(self_local);
-            buf_str(text, c"self: ");
-            buf_bytes(text, SRC[NODES[NODES[sp].b].start..NODES[NODES[sp].b].end]);
+            if (NODES[sp].p & crate::front::ast::CONV_NEW) != 0 {
+                // (0.20: the receiver as written, `self`, `inout self`)
+                buf_bytes(text, SRC[NODES[sp].start..NODES[sp].end]);
+            } else {
+                buf_str(text, c"self: ");
+                buf_bytes(text, SRC[NODES[NODES[sp].b].start..NODES[NODES[sp].b].end]);
+            }
         }
         for i in 0..params.count {
             if i > 0 || method {
                 buf_str(text, c", ");
             }
-            if modes.data[i] == GIVEN_BACK {
+            // (0.20: in 0.20's spelling, but in the crate read in 0.19's,
+            // fixconv::new_spelling: `x: sink T`, `x: inout T`)
+            let new = new_spelling();
+            if modes.data[i] == GIVEN_BACK && !new {
                 buf_str(text, c"mut ");
             }
             buf_bytes(text, local_name(params.data[i]));
             buf_str(text, c": ");
+            if modes.data[i] == GIVEN_BACK && new {
+                buf_str(text, c"sink ");
+            }
             if modes.data[i] == BY_POINTER {
                 // (0.18.1: a reference; a `*T` is raw)
-                buf_str(text, c"&mut ");
+                buf_str(text, if new { c"inout " } else { c"&mut " });
             }
             put_local_type(text, params.data[i]);
         }
@@ -413,7 +425,7 @@ fn extract_inner(argc: i64, argv: **u8) -> i64 {
         }
         else if tail >= 0 && NODES[tail].ty != TY_UNIT && NODES[tail].ty != TY_NEVER
             && NODES[tail].ty != 0 {
-            buf_type(result_type, NODES[tail].ty);
+            put_type_conv(result_type, NODES[tail].ty, false);
         }
         if BUFS[result_type].len > 0 {
             buf_str(text, c" -> ");
@@ -449,8 +461,18 @@ fn extract_inner(argc: i64, argv: **u8) -> i64 {
             buf_bytes(call, local_name(results.data[0]));
             buf_str(call, c" = ");
         } else if results.count > 0 {
-            buf_str(call, c"let ");
-            put_results(call, &results, true, sb);
+            let pat = buf_new();
+            put_results(pat, &results, true, sb);
+            let ps = buf_slice(pat);
+            if new_spelling() && ps.len > 4 && ps[0] == 'm' && ps[1] == 'u' && ps[2] == 't'
+                && ps[3] == ' ' {
+                // (0.20: `var x = ..`; in a tuple `let (var a, b) = ..`)
+                buf_str(call, c"var ");
+                buf_bytes(call, ps[4..ps.len]);
+            } else {
+                buf_str(call, c"let ");
+                buf_bytes(call, ps);
+            }
             buf_str(call, c" = ");
         }
         if method {
@@ -461,7 +483,12 @@ fn extract_inner(argc: i64, argv: **u8) -> i64 {
         for i in 0..params.count {
             buf_str(call, if i == 0 { c"" } else { c", " });
             if modes.data[i] == BY_POINTER {
-                buf_str(call, c"&mut ");
+                buf_str(call, if new_spelling() { c"&" } else { c"&mut " });
+            } else if new_spelling() && LOCALS[params.data[i]].ty > 0
+                && TYPES[LOCALS[params.data[i]].ty].kind == TyKind::Ptr
+                && TYPES[LOCALS[params.data[i]].ty].b == REF_MUT && access_local(params.data[i]) {
+                // (an inout binding or parameter passed on is lent again)
+                buf_str(call, c"&");
             }
             buf_bytes(call, local_name(params.data[i]));
         }
@@ -703,13 +730,35 @@ fn put_results(out: i64, results: &IntVec, pattern: bool, after: i64) {
             let l = (*results).data[i];
             buf_str(out, if i == 0 { c"" } else { c", " });
             if pattern && local_mut(l) && changed_after(l, after) {
-                buf_str(out, c"mut ");
+                buf_str(out, if new_spelling() && n > 1 { c"var " } else { c"mut " });
             }
             buf_bytes(out, local_name(l));
         }
         if n > 1 {
             buf_byte(out, ')');
         }
+    }
+}
+
+// (0.20) Whether local l is an access declared in 0.20's spelling (`x:
+// inout T`, `inout r = &v`; any in a file read in it), used as its place:
+// passed on, it is lent again (`&r`). A 0.19 `&mut T` is a reference
+// value, passed as it is.
+fn access_local(l: i64) -> bool {
+    unsafe {
+        let dn = decl_of(l);
+        if dn < 0 {
+            return false;
+        }
+        if crate::front::conv::strict_at(NODES[dn].start) {
+            return true;
+        }
+        if NODES[dn].kind == NodeKind::Param {
+            return (NODES[dn].p & crate::front::ast::CONV_NEW) != 0;
+        }
+        let p = parent(dn);
+        p >= 0 && NODES[p].kind == NodeKind::Let
+            && (NODES[p].p & crate::front::ast::CONV_INOUT) != 0
     }
 }
 

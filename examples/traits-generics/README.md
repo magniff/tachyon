@@ -86,10 +86,10 @@ default, which is why the triangle prints as `shape`:
 
 ```tach
 pub trait Shape {
-    fn area(self: &Self) -> f64;
-    fn perimeter(self: &Self) -> f64;
-    fn name(self: &Self) -> [u8] { "shape" }
-    fn describe(self: &Self) {
+    fn area(self) -> f64;
+    fn perimeter(self) -> f64;
+    fn name(self) -> [u8] { "shape" }
+    fn describe(self) {
         println(f"{self.name():<8} area {self.area():>7.2}  perimeter {self.perimeter():>6.2}");
     }
 }
@@ -101,7 +101,7 @@ each use with a new type compiles a copy for that type
 
 ```tach
 fn total_area<T: Shape>(shapes: [T]) -> f64 {
-    let mut total = 0.0;
+    var total = 0.0;
     for s in shapes { total += s.area(); } // s: each element in place
     total
 }
@@ -118,8 +118,8 @@ on the mixed list as on the list of rectangles:
 pub enum AnyShape { C(Circle), R(Rect), P(Polygon) }
 
 impl Shape for AnyShape {
-    fn area(self: &AnyShape) -> f64 {
-        match *self {
+    fn area(self) -> f64 {
+        match self {
             AnyShape::C(c) => c.area(),
             AnyShape::R(r) => r.area(),
             AnyShape::P(p) => p.area(),
@@ -136,10 +136,10 @@ the perimeter are then one chain each:
 ```tach
 impl Iterator for Edges {
     type Item = (Vec2, Vec2);
-    fn next(self: &mut Edges) -> Option<(Vec2, Vec2)> { ... }
+    fn next(inout self) -> Option<(Vec2, Vec2)> { ... }
 }
 
-fn perimeter(self: &Polygon) -> f64 {
+fn perimeter(self) -> f64 {
     self.edges().fold(0.0, |acc, (a, b)| acc + (b - a).length())
 }
 ```
@@ -153,15 +153,15 @@ used:
 ```tach
 pub trait Measured {
     type Output;
-    fn measure(self: &Self) -> Self::Output;
+    fn measure(self) -> Self::Output;
 }
 
 impl Measured for Segment {
     type Output = Meters;
-    fn measure(self: &Segment) -> Meters { Meters { m: (self.b - self.a).length() } }
+    fn measure(self) -> Meters { Meters { m: (self.b - self.a).length() } }
 }
 
-fn show<T: Measured>(label: [u8], x: &T) {
+fn show<T: Measured>(label: [u8], x: T) {
     let m: T::Output = x.measure();
     println(f"{label:<10} {m}");
 }
@@ -179,7 +179,7 @@ impl From<Feet> for Meters {
 }
 
 pub fn total<T: Into<Meters>>(lengths: [T]) -> Meters {
-    let mut sum = Meters { m: 0.0 };
+    var sum = Meters { m: 0.0 };
     for x in lengths {
         let m: Meters = x.into(); // Into needs the target type: here, the let's
         sum = sum + m;

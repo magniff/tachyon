@@ -1,0 +1,585 @@
+// std::slice: sorting, searching and the slice algorithms (0.20: from
+// std.tach; the 0.20 sorts, after Rust's ipnsort and driftsort, in
+// the kernels below, slice/unstable.tach and slice/stable.tach; binary
+// search in slice/search.tach; reverse, rotations, fill, dedup, retain
+// and the heap sifts in slice/algo.tach).
+
+mod unstable;
+mod stable;
+mod search;
+mod algo;
+
+pub use algo::{
+    dedup, dedup_by, dedup_by_key, fill, heap_sift_down_less, heap_sift_down_to_bottom_less,
+    heap_sift_up_less, retain_by, reverse, rotate_left, rotate_right,
+};
+pub use search::{binary_search, binary_search_by, binary_search_by_key, partition_point};
+pub use stable::{
+    sort_stable_less, sort_stable_less_with, sort_stable_noalloc, sort_stable_scratch_len,
+};
+pub use unstable::{
+    select_nth_unstable, select_nth_unstable_by, select_nth_unstable_by_key,
+    select_nth_unstable_less, sort_unstable, sort_unstable_by, sort_unstable_by_key,
+    sort_unstable_less,
+};
+
+use std::{Allocator, Gpa, Ord, Vec};
+
+// ---- Sorting (0.9) ----
+
+// Sorts s in place, smallest first; not stable (equal elements may change
+// order): the unstable sort, `sort_unstable` (0.20: ipnsort; before, an
+// introsort). O(n log n) comparisons at worst, O(n) when s is one run up
+// or down. A `cmp` that is not a total order leaves s a permutation of
+// itself in some order, never out of bounds. The sorts' loops are counted
+// and nothing recurses: no effect diverge. (0.17) `sort(&mut a[..])`,
+// `sort(v.as_mut_slice())`, `v.sort()`; the elements move as bits, so any
+// T: Ord sorts, owned ones too.
+pub fn sort<T: Ord>(s: inout [T]) {
+    sort_unstable_less(s, |a: T, b: T| a < b);
+}
+
+impl<T: Ord, A: Allocator> Vec<T, A> {
+    // Sorts it in place, smallest first (0.17; see sort).
+    #[inline]
+    pub fn sort(inout self) {
+        sort(self.as_mut_slice());
+    }
+}
+
+impl<T: Ord>[T] {
+    // Sorts it in place, smallest first (0.17; see sort).
+    #[inline]
+    pub fn sort(self: inout [T]) {
+        sort(self);
+    }
+}
+
+// ---- Swapping (0.17) ----
+
+// Exchanges s[i] and s[j] (checked), as bits: any T, owned ones too.
+#[inline]
+pub fn swap_at<T>(s: inout [T], i: i64, j: i64) {
+    let a: *T = &s[i];
+    let b: *T = &s[j];
+    unsafe {
+        let t = *a;
+        *a = *b;
+        *b = t;
+    }
+}
+
+// Exchanges p[i] and p[j], as bits. Unsafe: both are in p's elements.
+#[inline]
+pub unsafe fn swap_raw<T>(p: *T, i: i64, j: i64) {
+    let t = p[i];
+    p[i] = p[j];
+    p[j] = t;
+}
+
+// ---- Stable sort (0.15) ----
+
+// Sorts s in place, smallest first, keeping equal elements in the order
+// they had (0.15), with a buffer from allocator a (0.16):
+// `sort_stable_by_in` with `|a, b| a.cmp(b)`.
+pub fn sort_stable_in<T: Ord, A: Allocator>(s: inout [T], a: sink A) {
+    sort_stable_less_in(s, |x: T, y: T| x < y, a);
+}
+
+#[ambient("sort_stable_in(s, gpa)")]
+pub fn sort_stable<T: Ord>(s: inout [T]) {
+    sort_stable_in(s, Gpa::ambient());
+}
+
+#[ambient("sort_stable_by_in(s, f, gpa)")]
+pub fn sort_stable_by<T, F: FnMut(let T, let T) -> i64>(s: inout [T], f: F) {
+    sort_stable_by_in(s, f, Gpa::ambient());
+}
+
+// Sorts s in place by f (as sort_by: f(a, b) negative when *a goes before
+// *b), keeping equal elements in the order they had (0.15). The stable
+// sort (0.20: driftsort; before, a merge sort) with its scratch from
+// allocator a (0.16): none up to 20 elements, else all of s up to 8 MB
+// and half beyond (`sort_stable_scratch_len`). O(n log n) comparisons. A
+// `f` that is not a total order leaves s a permutation of itself in some
+// order, never out of bounds.
+pub fn sort_stable_by_in<T, F: FnMut(let T, let T) -> i64, A: Allocator>(s: inout [T], f: F,
+    a: sink A) {
+    var g = f;
+    sort_stable_less_in(s, |x: T, y: T| g(x, y) < 0, a);
+}
+
+// The stable sort by is_less with its scratch from a. (0.17) The elements
+// move as bits between s and the buffer through raw pointers (the
+// buffer's elements are never its own: its length stays 0).
+pub fn sort_stable_less_in<T, F: FnMut(let T, let T) -> bool,
+    A: Allocator>(s: inout [T], is_less: F, a: sink A) {
+    let n = s.len;
+    if n <= 20 {
+        // (no scratch: insertion sort)
+        unsafe {
+            sort_stable_less_with(s, 0 as *T, 0, is_less);
+        }
+        return;
+    }
+    let len = sort_stable_scratch_len::<T>(n);
+    var buf: Vec<T, A> = Vec::with_capacity_in(len, a);
+    // (the buffer has room for len elements, outside s)
+    unsafe {
+        sort_stable_less_with(s, buf.ptr, len, is_less);
+    }
+    buf.free();
+}
+
+// ---- Sort kernels (0.20) ----
+
+// What both sorts (0.20) use on short slices, after Rust's
+// slice::sort::shared::smallsort: insertion sort, a branchless stable
+// sort of 4 elements, the bidirectional merge, and the general small sort
+// built from them (two halves presorted in 8s or 4s, completed by
+// insertion, then merged from both ends at once). Every one is stable.
+//
+// Unsafe code: as the sorts' (Sort, unstable): each kernel takes raw
+// pointers to slots its caller owns, with their lengths in the contract
+// at it; every index is bounded by those lengths whatever the comparator
+// answers. Elements move as bits; with no unwinding (a panic ends the
+// process) a half-done kernel is never observed and nothing is dropped
+// twice.
+
+// Sorts v[0..n] by insertion, v[0..offset] being sorted (1 <= offset).
+// Stable: an element moves left only past greater ones.
+unsafe fn insertion_sort_raw<T, F: FnMut(let T, let T) -> bool>(v: *T, n: i64, offset: i64,
+    is_less: F) {
+    var f = is_less;
+    for i in offset..n {
+        insert_tail_raw(v, i, f);
+    }
+}
+
+// Inserts v[i] into the sorted v[0..i] (i >= 1), after the elements
+// equal to it.
+#[inline]
+unsafe fn insert_tail_raw<T, F: FnMut(let T, let T) -> bool>(v: *T, i: i64, is_less: F) {
+    var f = is_less;
+    if f(*(&v[i]), *(&v[i - 1])) {
+        let x = v[i];
+        v[i] = v[i - 1];
+        var j = i - 1;
+        // (j >= 1 inside the loop: it runs i - 1 times at most)
+        for _ in 0..i - 1 {
+            if !f(x, *(&v[j - 1])) {
+                break;
+            }
+            v[j] = v[j - 1];
+            j -= 1;
+        }
+        v[j] = x;
+    }
+}
+
+// dst[0..4] = v[0..4] sorted, stably, with five comparisons and no
+// branch on them (Rust's sort4_stable). v and dst do not overlap.
+#[inline]
+unsafe fn sort4_stable_raw<T, F: FnMut(let T, let T) -> bool>(v: *T, dst: *T, is_less: F) {
+    var f = is_less;
+    // Two ordered pairs, a <= b and c <= d.
+    let c1 = f(*(&v[1]), *(&v[0])) as i64;
+    let c2 = f(*(&v[3]), *(&v[2])) as i64;
+    let a: *T = &v[c1];
+    let b: *T = &v[1 - c1];
+    let c: *T = &v[2 + c2];
+    let d: *T = &v[3 - c2];
+    // The least and the greatest, and the two left, in their order.
+    let c3 = f(*c, *a);
+    let c4 = f(*d, *b);
+    let min = if c3 { c } else { a };
+    let max = if c4 { b } else { d };
+    let unknown_left = if c3 { a } else if c4 { c } else { b };
+    let unknown_right = if c4 { d } else if c3 { b } else { c };
+    let c5 = f(*unknown_right, *unknown_left);
+    let lo = if c5 { unknown_right } else { unknown_left };
+    let hi = if c5 { unknown_left } else { unknown_right };
+    dst[0] = *min;
+    dst[1] = *lo;
+    dst[2] = *hi;
+    dst[3] = *max;
+}
+
+// dst[0..8] = v[0..8] sorted, stably, through tmp[0..8]. None overlap.
+unsafe fn sort8_stable_raw<T, F: FnMut(let T, let T) -> bool>(v: *T, dst: *T, tmp: *T, is_less: F) {
+    var f = is_less;
+    sort4_stable_raw(v, tmp, f);
+    sort4_stable_raw(&v[4], &tmp[4], f);
+    bidirectional_merge_raw(tmp, 8, dst, f);
+}
+
+// Merges the sorted halves src[0..len/2] and src[len/2..len] (len >= 2)
+// into dst[0..len], stably, from both ends at once: each round takes the
+// least of the two fronts and the greatest of the two backs, with no
+// branch on the comparisons. src and dst do not overlap. Every read stays
+// in src[0..len] whatever the comparator answers (Rust's argument: each
+// end moves at most len / 2 times); when the ends do not meet as they
+// must for a total order, dst gets src back as it was, so it holds a
+// permutation of src either way.
+unsafe fn bidirectional_merge_raw<T, F: FnMut(let T, let T) -> bool>(src: *T, len: i64, dst: *T,
+    is_less: F) {
+    var f = is_less;
+    let half = len / 2;
+    var left = 0;
+    var right = half;
+    var out = 0;
+    var left_rev = half - 1;
+    var right_rev = len - 1;
+    var out_rev = len - 1;
+    for _ in 0..half {
+        let take_left = !f(*(&src[right]), *(&src[left]));
+        let p: *T = if take_left { &src[left] } else { &src[right] };
+        left += take_left as i64;
+        right += (!take_left) as i64;
+        dst[out] = *p;
+        out += 1;
+        let take_left_rev = f(*(&src[right_rev]), *(&src[left_rev]));
+        let q: *T = if take_left_rev { &src[left_rev] } else { &src[right_rev] };
+        left_rev -= take_left_rev as i64;
+        right_rev -= (!take_left_rev) as i64;
+        dst[out_rev] = *q;
+        out_rev -= 1;
+    }
+    if len % 2 != 0 {
+        let left_nonempty = left <= left_rev;
+        let p: *T = if left_nonempty { &src[left] } else { &src[right] };
+        dst[out] = *p;
+        left += left_nonempty as i64;
+        right += (!left_nonempty) as i64;
+    }
+    if left != left_rev + 1 || right != right_rev + 1 {
+        // (not a total order)
+        for i in 0..len {
+            dst[i] = src[i];
+        }
+    }
+}
+
+// Puts v[a] and v[b] (a < b) in order, with no branch on the comparison.
+#[inline]
+unsafe fn swap_if_less_raw<T, F: FnMut(let T, let T) -> bool>(v: *T, a: i64, b: i64, is_less: F) {
+    var f = is_less;
+    let pa: *T = &v[a];
+    let pb: *T = &v[b];
+    let sw = f(*pb, *pa);
+    if size_of(T) == 8 {
+        // (8-byte elements: their bits selected in registers, csel, not
+        // through a selected address; no T is moved, so owned ones too)
+        let x = *(pa as *u64);
+        let y = *(pb as *u64);
+        *(pa as *u64) = if sw { y } else { x };
+        *(pb as *u64) = if sw { x } else { y };
+        return;
+    }
+    let l = if sw { pb } else { pa };
+    let r = if sw { pa } else { pb };
+    let x = *l;
+    let y = *r;
+    v[a] = x;
+    v[b] = y;
+}
+
+// Sorts v[0..9] with an optimal sorting network (25 comparators, depth 7;
+// Bert Dobbelaere's list, as Rust's sort9_optimal). Not stable.
+unsafe fn sort9_network_raw<T, F: FnMut(let T, let T) -> bool>(v: *T, is_less: F) {
+    var f = is_less;
+    swap_if_less_raw(v, 0, 3, f);
+    swap_if_less_raw(v, 1, 7, f);
+    swap_if_less_raw(v, 2, 5, f);
+    swap_if_less_raw(v, 4, 8, f);
+    swap_if_less_raw(v, 0, 7, f);
+    swap_if_less_raw(v, 2, 4, f);
+    swap_if_less_raw(v, 3, 8, f);
+    swap_if_less_raw(v, 5, 6, f);
+    swap_if_less_raw(v, 0, 2, f);
+    swap_if_less_raw(v, 1, 3, f);
+    swap_if_less_raw(v, 4, 5, f);
+    swap_if_less_raw(v, 7, 8, f);
+    swap_if_less_raw(v, 1, 4, f);
+    swap_if_less_raw(v, 3, 6, f);
+    swap_if_less_raw(v, 5, 7, f);
+    swap_if_less_raw(v, 0, 1, f);
+    swap_if_less_raw(v, 2, 4, f);
+    swap_if_less_raw(v, 3, 5, f);
+    swap_if_less_raw(v, 6, 8, f);
+    swap_if_less_raw(v, 2, 3, f);
+    swap_if_less_raw(v, 4, 5, f);
+    swap_if_less_raw(v, 6, 7, f);
+    swap_if_less_raw(v, 1, 2, f);
+    swap_if_less_raw(v, 3, 4, f);
+    swap_if_less_raw(v, 5, 6, f);
+}
+
+// Sorts v[0..13] with an optimal sorting network (45 comparators, depth
+// 10; as Rust's sort13_optimal). Not stable.
+unsafe fn sort13_network_raw<T, F: FnMut(let T, let T) -> bool>(v: *T, is_less: F) {
+    var f = is_less;
+    swap_if_less_raw(v, 0, 12, f);
+    swap_if_less_raw(v, 1, 10, f);
+    swap_if_less_raw(v, 2, 9, f);
+    swap_if_less_raw(v, 3, 7, f);
+    swap_if_less_raw(v, 5, 11, f);
+    swap_if_less_raw(v, 6, 8, f);
+    swap_if_less_raw(v, 1, 6, f);
+    swap_if_less_raw(v, 2, 3, f);
+    swap_if_less_raw(v, 4, 11, f);
+    swap_if_less_raw(v, 7, 9, f);
+    swap_if_less_raw(v, 8, 10, f);
+    swap_if_less_raw(v, 0, 4, f);
+    swap_if_less_raw(v, 1, 2, f);
+    swap_if_less_raw(v, 3, 6, f);
+    swap_if_less_raw(v, 7, 8, f);
+    swap_if_less_raw(v, 9, 10, f);
+    swap_if_less_raw(v, 11, 12, f);
+    swap_if_less_raw(v, 4, 6, f);
+    swap_if_less_raw(v, 5, 9, f);
+    swap_if_less_raw(v, 8, 11, f);
+    swap_if_less_raw(v, 10, 12, f);
+    swap_if_less_raw(v, 0, 5, f);
+    swap_if_less_raw(v, 3, 8, f);
+    swap_if_less_raw(v, 4, 7, f);
+    swap_if_less_raw(v, 6, 11, f);
+    swap_if_less_raw(v, 9, 10, f);
+    swap_if_less_raw(v, 0, 1, f);
+    swap_if_less_raw(v, 2, 5, f);
+    swap_if_less_raw(v, 6, 9, f);
+    swap_if_less_raw(v, 7, 8, f);
+    swap_if_less_raw(v, 10, 11, f);
+    swap_if_less_raw(v, 1, 3, f);
+    swap_if_less_raw(v, 2, 4, f);
+    swap_if_less_raw(v, 5, 6, f);
+    swap_if_less_raw(v, 9, 10, f);
+    swap_if_less_raw(v, 1, 2, f);
+    swap_if_less_raw(v, 3, 4, f);
+    swap_if_less_raw(v, 5, 7, f);
+    swap_if_less_raw(v, 6, 8, f);
+    swap_if_less_raw(v, 2, 3, f);
+    swap_if_less_raw(v, 4, 5, f);
+    swap_if_less_raw(v, 6, 7, f);
+    swap_if_less_raw(v, 8, 9, f);
+    swap_if_less_raw(v, 3, 4, f);
+    swap_if_less_raw(v, 5, 6, f);
+}
+
+// Sorts v[0..len] (len <= 32) with scratch[0..len], not stably (Rust's
+// small_sort_network, for elements of 8 bytes or less): each half (the
+// whole below 18) presorted by a network of 13 or 9, completed by
+// insertion, and the halves merged through the scratch.
+unsafe fn small_sort_network_raw<T, F: FnMut(let T, let T) -> bool>(v: *T, len: i64, scratch: *T,
+    is_less: F) {
+    var f = is_less;
+    if len < 2 {
+        return;
+    }
+    let half = len / 2;
+    let whole = len < 18;
+    let first = if whole { len } else { half };
+    presort_network_raw(v, first, f);
+    if whole {
+        return;
+    }
+    presort_network_raw(&v[half], len - half, f);
+    for i in 0..len {
+        scratch[i] = v[i];
+    }
+    bidirectional_merge_raw(scratch, len, v, f);
+}
+
+// Sorts v[0..len] (len <= 17): a network over its first 13 or 9, then
+// insertion.
+#[inline]
+unsafe fn presort_network_raw<T, F: FnMut(let T, let T) -> bool>(v: *T, len: i64, is_less: F) {
+    var f = is_less;
+    var presorted = 1;
+    if len >= 13 {
+        sort13_network_raw(v, f);
+        presorted = 13;
+    } else if len >= 9 {
+        sort9_network_raw(v, f);
+        presorted = 9;
+    }
+    insertion_sort_raw(v, len, presorted, f);
+}
+
+// Sorts v[0..len] (len <= 32), stably, with scratch[0..len + 16] (Rust's
+// small_sort_general_with_scratch): each half is presorted in 8s (or 4s)
+// into the scratch, completed there by insertion, and the halves are
+// merged back into v.
+unsafe fn small_sort_raw<T,
+    F: FnMut(let T, let T) -> bool>(v: *T, len: i64, scratch: *T, is_less: F) {
+    var f = is_less;
+    if len < 2 {
+        return;
+    }
+    let half = len / 2;
+    var presorted = 1;
+    if len >= 16 {
+        sort8_stable_raw(v, scratch, &scratch[len], f);
+        sort8_stable_raw(&v[half], &scratch[half], &scratch[len + 8], f);
+        presorted = 8;
+    } else if len >= 8 {
+        sort4_stable_raw(v, scratch, f);
+        sort4_stable_raw(&v[half], &scratch[half], f);
+        presorted = 4;
+    } else {
+        scratch[0] = v[0];
+        scratch[half] = v[half];
+    }
+    for i in presorted..half {
+        scratch[i] = v[i];
+        insert_tail_raw(scratch, i, f);
+    }
+    let w: *T = &scratch[half];
+    let src: *T = &v[half];
+    for i in presorted..len - half {
+        w[i] = src[i];
+        insert_tail_raw(w, i, f);
+    }
+    bidirectional_merge_raw(scratch, len, v, f);
+}
+
+// The length of the run that starts v[0..n] (n >= 2), and whether it is
+// strictly descending (else non-descending).
+unsafe fn existing_run_raw<T, F: FnMut(let T, let T) -> bool>(v: *T, n: i64, is_less: F) -> (i64,
+    bool) {
+    var f = is_less;
+    let desc = f(*(&v[1]), *(&v[0]));
+    var run = 2;
+    // (run < n inside each loop)
+    if desc {
+        for _ in 2..n {
+            if !f(*(&v[run]), *(&v[run - 1])) {
+                break;
+            }
+            run += 1;
+        }
+    } else {
+        for _ in 2..n {
+            if f(*(&v[run]), *(&v[run - 1])) {
+                break;
+            }
+            run += 1;
+        }
+    }
+    (run, desc)
+}
+
+// Reverses v[0..n].
+unsafe fn reverse_raw<T>(v: *T, n: i64) {
+    for i in 0..n / 2 {
+        let t = v[i];
+        v[i] = v[n - 1 - i];
+        v[n - 1 - i] = t;
+    }
+}
+
+// The index of a pivot for v[0..len] (len >= 8): the median of three
+// elements at 0, 4/8 and 7/8 of it, each of them, from 64 elements, the
+// median of three spread the same way over its eighth (ipnsort's
+// recursive pseudo-median, which samples about n^0.53 elements).
+unsafe fn choose_pivot_raw<T, F: FnMut(let T, let T) -> bool>(v: *T, len: i64, is_less: F) -> i64 {
+    var f = is_less;
+    let n8 = len / 8;
+    let a = 0;
+    let b = n8 * 4;
+    let c = n8 * 7;
+    if n8 < 8 {
+        return median3_raw(v, a, b, c, f);
+    }
+    if n8 < 64 {
+        let m = n8 / 8;
+        let x = median3_raw(v, a, a + m * 4, a + m * 7, f);
+        let y = median3_raw(v, b, b + m * 4, b + m * 7, f);
+        let z = median3_raw(v, c, c + m * 4, c + m * 7, f);
+        return median3_raw(v, x, y, z, f);
+    }
+    median3_rec_raw(v, n8, f)
+}
+
+// The pseudo-median of v for n = len / 8 >= 64, on an explicit stack of
+// frames (positions x, y, z, their spread n, the children done and their
+// medians): a frame with n >= 8 replaces each position by the median of
+// a frame over its eighth. The depth is log8(len) <= 21.
+unsafe fn median3_rec_raw<T, F: FnMut(let T, let T) -> bool>(v: *T, n: i64, is_less: F) -> i64 {
+    var f = is_less;
+    var pos: [i64; 72] = [0; 72];
+    var res: [i64; 72] = [0; 72];
+    var spread: [i64; 24] = [0; 24];
+    var done: [i64; 24] = [0; 24];
+    var d = 0;
+    pos[0] = 0;
+    pos[1] = n * 4;
+    pos[2] = n * 7;
+    spread[0] = n;
+    // (each frame is visited once per child and once more: fewer rounds
+    // than 4n + 4 for any n)
+    var result = 0;
+    for _ in 0..4 * n + 4 {
+        let k = done[d];
+        if spread[d] < 8 || k == 3 {
+            result = if spread[d] < 8 {
+                median3_raw(v, pos[3 * d], pos[3 * d + 1], pos[3 * d + 2], f)
+            } else {
+                median3_raw(v, res[3 * d], res[3 * d + 1], res[3 * d + 2], f)
+            };
+            if d == 0 {
+                return result;
+            }
+            d -= 1;
+            res[3 * d + done[d]] = result;
+            done[d] += 1;
+            continue;
+        }
+        let p = pos[3 * d + k];
+        let m = spread[d] / 8;
+        d += 1;
+        pos[3 * d] = p;
+        pos[3 * d + 1] = p + m * 4;
+        pos[3 * d + 2] = p + m * 7;
+        spread[d] = m;
+        done[d] = 0;
+    }
+    result
+}
+
+// The index of the median of v[a], v[b], v[c], with no branch on the
+// comparisons (three of them, always).
+#[inline]
+unsafe fn median3_raw<T,
+    F: FnMut(let T, let T) -> bool>(v: *T, a: i64, b: i64, c: i64, is_less: F) -> i64 {
+    var f = is_less;
+    let x = f(*(&v[a]), *(&v[b]));
+    let y = f(*(&v[a]), *(&v[c]));
+    let z = f(*(&v[b]), *(&v[c]));
+    // x == y: v[a] is the least or the greatest, and the median is the
+    // greater of v[b], v[c] (x) or the lesser (!x)
+    let bc = if z != x { c } else { b };
+    if x == y { bc } else { a }
+}
+
+// The sorts' scratch on the stack: 4 KB, 16-aligned, written before it is
+// read (bytes, not elements: nothing in it is ever dropped).
+#[repr(C, align(16))]
+struct SortStackBuf { words: [u64; 512] }
+
+// How many elements of T fit in a SortStackBuf (0 for an alignment over
+// 16, or a T of no size).
+fn sort_stack_cap<T>() -> i64 {
+    if align_of(T) <= 16 && size_of(T) > 0 { 4096 / size_of(T) } else { 0 }
+}
+
+// Rotates v[0..n] left by k (0 <= k <= n): v[k..n] then v[0..k], by
+// three reversals.
+unsafe fn rotate_raw<T>(v: *T, n: i64, k: i64) {
+    if k == 0 || k == n {
+        return;
+    }
+    reverse_raw(v, k);
+    reverse_raw(&v[k], n - k);
+    reverse_raw(v, n);
+}

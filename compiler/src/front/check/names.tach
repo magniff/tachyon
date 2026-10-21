@@ -11,7 +11,7 @@ use crate::base::diag::{
     err_fixable, err_help, err_help_sym, err_pos, err_str, err_sym, err_try,
 };
 use crate::front::assoc::ensure_checked;
-use crate::front::ast::{FN_UNSAFE, NODES};
+use crate::front::ast::{CONV_NEW, FN_UNSAFE, NODES, NodeKind, new_node};
 use crate::front::ast::NodeKind::{CStr, Path, Str};
 use crate::front::check::{CHECK_UNCHECKED, LOCALS, Res, lookup_local, name_error};
 use crate::front::check::synth_mode::synth_expr;
@@ -20,12 +20,14 @@ use crate::front::cimport::c_import_skip_reason;
 use crate::front::closures::note_local_use;
 use crate::front::generics::{TPL_NONE, env_lookup, instance_of, targ_count_error, template_of_key};
 use crate::front::generics::instantiate::{fn_instance, push_written_targs};
+use crate::front::lexer::Tok;
 use crate::front::modules::{
-    CUR_MOD, C_MODULE, MODULES, STD_MODULE, item_key_if_known, module_count,
+    CUR_MOD, C_MODULE, MODULES, STD_MODULE, item_key_if_known, module_count, within_std,
 };
 use crate::front::modules::lookup::{
     B_ITEM, B_MODULE, B_PRIVATE, B_TVARIANT, B_VARIANT, access_error, binding, binding_kind,
-    binding_value, help_std_path, is_prelude_name, lookup_item, lookup_quiet, note_c_use,
+    binding_value, help_std_path, is_prelude_name, lookup_item, lookup_name, lookup_quiet,
+    note_c_use,
 };
 use crate::front::parser::items::ITEM_PUBLIC;
 use crate::front::stdsrc::std_source;
@@ -51,6 +53,11 @@ pub fn synth_name(n: i64) -> i64 {
                     NODES[n].res = Res::Local;
                     NODES[n].y = local;
                     note_local_use(n, local);
+                    if LOCALS[local].access && (NODES[n].p & CONV_NEW) == 0 {
+                        // (0.20) an access is used as the value it designates:
+                        // `x` is `*x` (`&x`: `&*x`, a reborrow), conventions.md D12
+                        return access_use(n);
+                    }
                     return LOCALS[local].ty;
                 }
                 Option::None => {}
@@ -154,6 +161,25 @@ pub fn synth_name(n: i64) -> i64 {
             name_error(NODES[n].start, c"'", name, c"' is a type, not a value");
         }
         unknown_name_error(NODES[n].start, c"undefined variable '", name)
+    }
+}
+
+// (0.20) Ident n, a use of an access local (front/check: Local.access),
+// becomes `*n`: the place it designates. (The Ident inside is flagged
+// CONV_NEW, so that it is the reference.)
+fn access_use(n: i64) -> i64 {
+    unsafe {
+        let inner = new_node(NodeKind::Ident, NODES[n].start, NODES[n].end);
+        NODES[inner] = NODES[n];
+        NODES[inner].p |= CONV_NEW;
+        NODES[n].kind = NodeKind::Unary;
+        NODES[n].op = Tok::Star;
+        NODES[n].a = 0;
+        NODES[n].b = inner;
+        NODES[n].count = 0;
+        NODES[n].list = 0;
+        NODES[n].p = NODES[n].p & NODE_RESOLVED;
+        synth_expr(n)
     }
 }
 
@@ -293,7 +319,7 @@ fn suggest_name(name: i64, value: bool, hint_std: bool) {
             }
             return;
         }
-        if hint_std && CUR_MOD != STD_MODULE && SYMS[name].text.len > 2 {
+        if hint_std && !crate::front::modules::within_std(CUR_MOD) && SYMS[name].text.len > 2 {
             err_help(c"std's names: `tachyonc guide std`");
         }
     }
@@ -386,7 +412,7 @@ fn rust_input_help(name: i64) -> bool {
         if t == "read_to_string" || t == "read_all" || t == "stdin" || t == "input"
             || t == "read_input" || t == "read" || t == "lines" || t == "read_lines"
             || t == "getline" || t == "gets" || t == "scanf" {
-            err_help(c"std reads stdin: `read_stdin_in(gpa)` (all of it, a Buf), `read_line(&mut buf)` (one line, Ok(false) at the end), `Scanner` (tokens)");
+            err_help(c"std reads stdin: `read_stdin_in(gpa)` (all of it, a Buf), `read_line(&buf)` (one line, Ok(false) at the end), `Scanner` (tokens)");
         } else if t == "parse" || t == "atoi" || t == "parse_i64" || t == "to_int"
             || t == "int" || t == "from_str" {
             err_help(
@@ -421,13 +447,6 @@ fn rust_type_help(name: i64) -> bool {
             err_help(c"`i64`: lengths and indices are i64 (`s.len`, `v.len()`)");
             err_try(c"i64");
             rust_type_fix(text, "i64");
-        } else if text == "HashSet" || text == "BTreeSet" {
-            err_help(
-                c"a set is a `std::HashMap<K, bool>` (`m.insert(k, true)`, `m.contains_key(k)`)");
-            err_try(c"HashMap<K, bool>");
-        } else if text == "BTreeMap" {
-            err_help(c"`std::HashMap<K, V>`; for its keys in order, collect them in a Vec and `std::sort` it");
-            err_try(c"HashMap<K, V>");
         } else if text == "Reverse" {
             // (0.18.1) Rust's min-heap, `BinaryHeap<Reverse<T>>`, and its
             // `Reverse(x)`: no tuple structs here
@@ -440,7 +459,7 @@ fn rust_type_help(name: i64) -> bool {
             err_help(c"`*T` points to a value (`&x`; a parameter `p: *T` is a borrow); a value owned on the heap is a `Vec<T>` of one");
             err_try(c"*T");
         } else if text == "RefCell" || text == "Cell" || text == "Mutex" {
-            err_help(c"no interior mutability types: a `*T` writes through (`p.x = 1`), a `let mut` changes in place");
+            err_help(c"no interior mutability types: a `*T` writes through (`p.x = 1`), a `var` changes in place");
             err_try(c"*T");
         } else if STD_MODULE >= 0 && help_std_path(name, 0, CUR_MOD, false) {
             // (`std::cmp::max`: a Rust module of std read as a type)
@@ -782,6 +801,13 @@ pub fn import_path_for(name: i64, value: bool) -> i64 {
                 continue;
             }
             let out = buf_new();
+            // (0.20) std's modules: `std` when its root re-exports the item
+            // (`use std::HashSet;`, not `std::collections::hash_set`)
+            if m != STD_MODULE && within_std(m)
+                && binding_kind(lookup_name(STD_MODULE, name, CUR_MOD)) == B_ITEM {
+                buf_str(out, c"std");
+                return out;
+            }
             put_module_path(out, m);
             return out;
         }

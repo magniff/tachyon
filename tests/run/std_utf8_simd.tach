@@ -1,0 +1,123 @@
+// std::str's NEON routines (0.20, D2) against their scalar versions, the
+// oracle: random texts, mostly UTF-8 with damage at any place (so that
+// errors fall at every position of a 16- and 64-byte block and across
+// them), at every offset: validation (the whole Utf8Error), the ASCII and
+// printable-ASCII prefixes, counting, lossy decoding with any room,
+// memchr and memrchr. On x86-64 both sides are the scalar code.
+use std::arch::detect;
+use std::str::{
+    ascii_prefix_len, ascii_prefix_len_scalar, ascii_printable_prefix_len,
+    ascii_printable_prefix_len_scalar, count_chars, count_chars_scalar, decode_into,
+    decode_into_scalar, encode_utf8, is_utf8, memchr, memrchr, validate_utf8, validate_utf8_scalar,
+};
+
+fn next(s: inout u64) -> u64 {
+    var x = s;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    s = x;
+    x
+}
+
+// Text of n pieces: ASCII runs (printable and controls), scalar values of
+// every length, and now and then a damaged byte.
+fn make(s: inout u64, b: inout Buf, n: u64) {
+    var e = [0u8; 4];
+    for _ in 0..n {
+        let x = next(&s);
+        let k = x % 64;
+        if k < 30 {
+            for j in 0..1 + (x >> 8) % 20 {
+                b.push((0x20 + (x >> (13 + j * 2)) % 95) as u8);
+            }
+        } else if k < 32 {
+            b.push(((x >> 8) % 32) as u8);
+        } else if k < 62 {
+            let c = (x >> 8) % 4;
+            let cp = if c == 0 { 0x80 + (x >> 16) % 0x780 } else if c == 1 {
+                0x800 + (x >> 16) % 0xd000
+            } else if c == 2 { 0xe000 + (x >> 16) % 0x2000 }
+                else { 0x10000 + (x >> 16) % 0x100000 };
+            let m = encode_utf8(cp as u32, &e);
+            b.push_str(e[0..m]);
+        } else {
+            b.push((x >> 8) as u8);
+        }
+    }
+}
+
+fn main(gpa: Gpa) -> i32 {
+    println(f"neon: {detect("neon")}");
+    var s: u64 = 0x2545f4914f6cdd1d;
+    var b = Buf::new_in(gpa);
+    var out1: Vec<u32> = Vec::filled_in(2048, 0, gpa);
+    var out2: Vec<u32> = Vec::filled_in(2048, 0, gpa);
+    var fails = 0;
+    var valid = 0;
+    for round in 0..20000 {
+        b.clear();
+        let n = 1 + next(&s) % 40;
+        make(&s, &b, n);
+        let all = b.as_slice();
+        let off = (next(&s) % 16) as i64;
+        let v = if off < all.len { all[off..all.len] } else { all };
+        var bad = false;
+        let a = validate_utf8(v);
+        let c = validate_utf8_scalar(v);
+        let same = match (a, c) {
+            (Ok(()), Ok(())) => true,
+            (Err(x), Err(y)) => x == y,
+            _ => false,
+        };
+        if !same {
+            bad = true;
+        }
+        if c.is_ok() {
+            valid += 1;
+            if count_chars(v) != count_chars_scalar(v) {
+                bad = true;
+            }
+        }
+        if ascii_prefix_len(v) != ascii_prefix_len_scalar(v)
+            || ascii_printable_prefix_len(v) != ascii_printable_prefix_len_scalar(v)
+            || is_utf8(v) != c.is_ok() {
+            bad = true;
+        }
+        let room = 1 + (next(&s) % 300) as i64;
+        let (c1, m1) = decode_into(v, &out1.as_mut_slice()[0..room]);
+        let (c2, m2) = decode_into_scalar(v, &out2.as_mut_slice()[0..room]);
+        if c1 != c2 || m1 != m2 {
+            bad = true;
+        } else {
+            for k in 0..m1 {
+                if out1[k] != out2[k] {
+                    bad = true;
+                }
+            }
+        }
+        let needle = (next(&s) % 128) as u8;
+        var first = -1;
+        var last = -1;
+        for k in 0..v.len {
+            if v[k] == needle {
+                if first < 0 { first = k; }
+                last = k;
+            }
+        }
+        if memchr(needle, v).unwrap_or(-1) != first || memrchr(needle, v).unwrap_or(-1) != last {
+            bad = true;
+        }
+        if bad {
+            fails += 1;
+            if fails <= 5 {
+                println(f"round {round}: {v.len} bytes at offset {off}");
+            }
+        }
+    }
+    println(f"20000 texts, {valid} valid, {fails} differ");
+    if fails == 0 { 0 } else { 1 }
+}
+
+// EXPECT: neon: true
+// EXPECT: 20000 texts, 12650 valid, 0 differ

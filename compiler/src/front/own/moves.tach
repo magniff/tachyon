@@ -17,12 +17,13 @@ use crate::base::{
     FILES, FILE_COUNT, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
 };
 use crate::base::diag::buf_tool_command;
-use crate::front::ast::{FN_CLOSURE, NODES, NodeKind};
+use crate::front::ast::{FN_CLOSURE, NODES, NODE_CAPTURE, NodeKind};
 use crate::front::check::LOCALS;
 use crate::front::closures::{CLOSURES, CLOSURE_COUNT};
-use crate::front::modules::STD_MODULE;
+use crate::front::lexer::Tok;
+use crate::front::modules::{STD_MODULE, within_std};
 use crate::front::own::diag::{
-    OWN_MOVED, OWN_MOVE_OUT, OWN_PARTIAL, OWN_READONLY, own_begin, own_end, own_help,
+    OWN_MOVED, OWN_MOVE_OUT, OWN_PARTIAL, OWN_READONLY, own_begin, own_bytes, own_end, own_help,
     own_help_bytes, own_str, own_sym, own_try, own_type,
 };
 use crate::front::own::drops::{
@@ -79,6 +80,16 @@ pub fn on_move(p: i64, n: i64, how: i64) {
             check_moved(p, n);
             return;
         }
+        let cap = captured_use(n);
+        if cap > 0 {
+            // (0.20: a closure's capture, reached through its env. A sink
+            // closure's own one moves out under its flag; any other is
+            // still its owner's, or the closure may run again)
+            if cap != n || !sink_capture_move(n) {
+                move_out(p, n, MO_CAPTURED);
+            }
+            return;
+        }
         if how != 0 {
             if PO_RAW {
                 return;
@@ -97,6 +108,58 @@ pub fn on_move(p: i64, n: i64, how: i64) {
         set_bit(dmoved_bits(), p);
         PL_MOVED_BY[p] = n;
         note_move(p, n);
+    }
+}
+
+// (0.20) How move_out says a capture was moved inside its closure.
+const MO_CAPTURED: i64 = -2;
+
+// The capture of a closure that place expression n reaches through the
+// closure's env (closures::rewrite_use: NODE_CAPTURE), or 0.
+fn captured_use(n: i64) -> i64 {
+    unsafe {
+        let mut e = n;
+        while e > 0 {
+            if (NODES[e].p & NODE_CAPTURE) != 0 {
+                return e;
+            }
+            let k = NODES[e].kind;
+            if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+                e = NODES[e].a;
+            } else if k == NodeKind::Unary && NODES[e].op == Tok::Star {
+                e = NODES[e].b;
+            } else {
+                return 0;
+            }
+        }
+        0
+    }
+}
+
+// Capture use n (`(*env).x`) moved in the body of the closure walked: when
+// it is a sink closure's own capture with a flag (closures::finish_closure),
+// the move is kept (drops::capture_move) and allowed.
+fn sink_capture_move(n: i64) -> bool {
+    unsafe {
+        if NODES[n].kind != NodeKind::FieldAccess {
+            return false;
+        }
+        let mut id = -1;
+        for i in 0..CLOSURE_COUNT {
+            if CLOSURES[i].f == CUR_F {
+                id = i;
+            }
+        }
+        if id < 0 || (NODES[CLOSURES[id].node].c & crate::front::ast::CLOSURE_MOVE) == 0 {
+            return false;
+        }
+        let s = CLOSURES[id].env_struct;
+        let flag = crate::front::own::glue::flag_field(s, NODES[n].b);
+        if flag == 0 {
+            return false;
+        }
+        crate::front::own::drops::capture_move(n, flag, s);
+        true
     }
 }
 
@@ -160,13 +223,18 @@ fn check_moved(p: i64, n: i64) {
                 else { c" is used here after it may have moved" });
         }
         if by > 0 {
+            moved_into(by);
             own_str(c" at ");
             line_col(NODES[by].start);
         }
         if !definite {
             own_str(c" (on some paths)");
         }
-        own_help(c"use it before the move, pass a copy where it moves ('.clone()'), or take it by reference ('&')");
+        own_help(if !crate::front::conv::strict_at(NODES[n].start) {
+            c"use it before the move, pass a copy where it moves ('.clone()'), or take it by reference ('&')"
+        } else {
+            c"use it before the move, pass a copy where it moves ('.clone()'), or let the callee borrow it: a let parameter ('x: T'), not 'sink'"
+        });
         if by > 0 {
             try_wrap(by, c"", c".clone()");
         }
@@ -174,11 +242,58 @@ fn check_moved(p: i64, n: i64) {
     }
 }
 
+// (0.20) The calls owned arguments move into: argument node + 1 -> call
+// node * 256 + the parameter's index (walk.tach: eval_call), so that
+// own.moved names the parameter that took the value.
+pub static mut MOVE_CALL: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+pub fn note_move_arg(arg: i64, call: i64, i: i64) {
+    unsafe {
+        if i < 256 {
+            MOVE_CALL.put(arg + 1, call * 256 + i);
+        }
+    }
+}
+
+// ` into 'f(sink x)'` (or `'f(x)'` for a by-value parameter in 0.19's
+// spelling) for the move at node by, when it is an argument.
+fn moved_into(by: i64) {
+    unsafe {
+        let v = MOVE_CALL.get(by + 1);
+        if v <= 0 {
+            return;
+        }
+        let call = v / 256;
+        let i = v % 256;
+        let f = NODES[call].x - 1;
+        if f < 0 {
+            return;
+        }
+        let p = crate::front::conv::param_node(f, i);
+        // (a parameter written `sink`: one in 0.19's spelling keeps the
+        // message it had)
+        if p <= 0 || crate::front::conv::param_conv(p) != crate::front::conv::CONV_SINK_K {
+            return;
+        }
+        let name = SYMS[FNS[if FNS[f].tmpl > 0 { FNS[f].tmpl - 1 } else { f }].display].text;
+        let mut cut = 0;
+        while cut < name.len && name[cut] != '<' {
+            cut += 1;
+        }
+        own_str(c" into '");
+        own_bytes(name[0..cut]);
+        own_str(c"(");
+        own_str(c"sink ");
+        own_bytes(SYMS[NODES[p].a].text);
+        own_str(c")'");
+    }
+}
+
 // own.move_out: place p moved at node n out of an index, a reference, a
 // static (how: MO_*), or a binding that borrows (-1).
 fn move_out(p: i64, n: i64, how: i64) {
     unsafe {
-        if FNS[CUR_F].module == STD_MODULE {
+        if within_std(FNS[CUR_F].module) {
             // (std's bodies copy elements as unsafe code does, for the
             // callers that borrow them (drops::borrowed_call); a copy that
             // would be owned twice is reported at the call:
@@ -197,6 +312,8 @@ fn move_out(p: i64, n: i64, how: i64) {
             own_str(c"out of a static");
         } else if how == MO_DEREF {
             own_str(c"out of a reference: what it points to keeps its value");
+        } else if how == MO_CAPTURED {
+            own_str(c"out of the closure that captures it: the closure may be called again, and its drop, or its owner's, drops it");
         } else {
             let root = root_of(p);
             let mut at = BYREF.get(PL_RID[root] + 1) - 1;
@@ -234,19 +351,31 @@ fn move_out(p: i64, n: i64, how: i64) {
             }
         }
         if how == MO_INDEX {
-            own_help(
-                c"take it out with 'v.remove(i)' or 'std::take(&mut v[i])', or copy it ('.clone()')");
+            own_help(if !crate::front::conv::strict_at(NODES[n].start) {
+                c"take it out with 'v.remove(i)' or 'std::take(&mut v[i])', or copy it ('.clone()')"
+            } else {
+                c"borrow it ('let x = v[i];' reads it in place), take it out with 'v.remove(i)' or 'std::take(&v[i])', or copy it ('.clone()')"
+            });
             try_wrap(n, c"", c".clone()");
         } else if how == -1 {
             own_help(c"copy it ('.clone()'), or match (or loop over) a value the code owns");
             try_wrap(n, c"", c".clone()");
+        } else if how == MO_CAPTURED {
+            own_help(c"use a copy inside the closure ('.clone()'), or move the value out where the closure is made, not in its body");
+            try_wrap(n, c"", c".clone()");
         } else {
-            own_help(c"take it out and leave an empty value in its place ('x.take()' of a Vec, Buf or HashMap, 'std::take(&mut x)', 'std::replace(&mut x, v)'), copy it ('.clone()'), or borrow it ('&')");
+            own_help(if !crate::front::conv::strict_at(NODES[n].start) {
+                c"take it out and leave an empty value in its place ('x.take()' of a Vec, Buf or HashMap, 'std::take(&mut x)', 'std::replace(&mut x, v)'), copy it ('.clone()'), or borrow it ('&')"
+            } else {
+                c"take it out and leave an empty value in its place ('x.take()' of a Vec, Buf or HashMap, 'std::take(&x)', 'std::replace(&x, v)'), copy it ('.clone()'), or borrow it: pass it on let, or take the parameter 'sink' to own it"
+            });
             if owned_base_type(NODES[n].ty) {
                 // (a container keeps its allocator: T4's `take`)
                 try_wrap(n, c"", c".take()");
             } else {
-                try_wrap(n, c"std::take(&mut ", c")");
+                try_wrap(n,
+                    if crate::front::conv::LEGACY_ROOT { c"std::take(&mut " }
+                    else { c"std::take(&" }, c")");
             }
             try_wrap(n, c"", c".clone()");
         }
@@ -269,7 +398,7 @@ pub fn move_out_value(n: i64, how: i64) {
 // a free) would leave the original pointing at memory that is gone.
 pub fn byref_change(p: i64, n: i64, t: i64) {
     unsafe {
-        if p < 0 || FNS[CUR_F].module == STD_MODULE || PO_RAW || !is_owned_type(t) {
+        if p < 0 || within_std(FNS[CUR_F].module) || PO_RAW || !is_owned_type(t) {
             return;
         }
         let root = root_of(p);
@@ -303,7 +432,7 @@ pub fn byref_change(p: i64, n: i64, t: i64) {
             own_str(c" (");
             line_col(NODES[at].start);
             own_str(c") binds: the change would not reach it, and could free memory it points to");
-            own_help(c"match the reference itself ('match e' for 'e: &mut E', or 'match &mut x'): its bindings are '&mut' references into the value (0.18.1)");
+            own_help(c"match the access itself ('match e' for 'e: inout E', or 'match &x'): its bindings are inout accesses into the value");
         }
         own_end();
     }
@@ -360,8 +489,8 @@ fn partial(n: i64) {
                 own_str(c": '");
                 own_type(NODES[base].ty);
                 own_str(c"' implements Drop, which needs all of it");
-                own_help(c"take the field out and leave a value in its place ('std::take(&mut x.f)', 'std::replace(&mut x.f, v)'), or copy it ('.clone()')");
-                try_wrap(n, c"std::take(&mut ", c")");
+                own_help(c"take the field out and leave a value in its place ('std::take(&x.f)', 'std::replace(&x.f, v)'), or copy it ('.clone()')");
+                try_wrap(n, c"std::take(&", c")");
                 own_end();
                 return;
             }

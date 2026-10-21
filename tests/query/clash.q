@@ -53,68 +53,78 @@ pub struct Point {
     pub x: i64,
 }
 $ def len
-crate::geom::V2::len	clash/geom.tach:15:12	method	pub fn len(self: &V2) -> i64	effects: none
-crate::myvec::Vec::len	clash/myvec.tach:11:12	method	pub fn len(self: &Vec) -> i64	effects: none
-std::Vec::len	../../compiler/std/std.tach:157:12	method	pub fn len(self: &Vec<T, A>) -> i64
-std::Buf::len	../../compiler/std/std.tach:459:12	method	pub fn len(self: &Buf<A>) -> i64
-std::HashMap::len	../../compiler/std/std.tach:1143:12	method	pub fn len(self: &HashMap<K, V, A>) -> i64
-std::BinaryHeap::len	../../compiler/std/collections.tach:192:12	method	pub fn len(self: &BinaryHeap<T, A>) -> i64
-std::MinHeap::len	../../compiler/std/collections.tach:288:12	method	pub fn len(self: &MinHeap<T, A>) -> i64
+crate::geom::V2::len	clash/geom.tach:15:12	method	pub fn len(self) -> i64	effects: none
+crate::myvec::Vec::len	clash/myvec.tach:11:12	method	pub fn len(self) -> i64	effects: none
+std::Vec::len	../../compiler/std/std.tach:199:12	method	pub fn len(self) -> i64
+std::Buf::len	../../compiler/std/std.tach:501:12	method	pub fn len(self) -> i64
+std::BinaryHeap::len	../../compiler/std/flat/collections.tach:192:12	method	pub fn len(self) -> i64
+std::MinHeap::len	../../compiler/std/flat/collections.tach:288:12	method	pub fn len(self) -> i64
+std::collections::hash_map::HashMap::len	../../compiler/std/collections/hash_map.tach:37:12	method	pub fn len(self) -> i64
+std::collections::hash_set::HashSet::len	../../compiler/std/collections/hash_set.tach:35:12	method	pub fn len(self) -> i64
+std::collections::raw_table::RawTable::len	../../compiler/std/collections/raw_table.tach:136:12	method	pub fn len(self) -> i64
+std::collections::btree_node::BTreeRaw::len	../../compiler/std/collections/btree_node.tach:236:12	method	pub fn len(self) -> i64
+std::collections::btree_map::BTreeMap::len	../../compiler/std/collections/btree_map.tach:25:12	method	pub fn len(self) -> i64
+std::collections::btree_map::BTreeSet::len	../../compiler/std/collections/btree_map.tach:215:12	method	pub fn len(self) -> i64
+str::len	../../compiler/std/string.tach:287:12	method	pub fn len(self) -> i64	effects: none
+std::string::String::len	../../compiler/std/string.tach:1165:12	method	pub fn len(self) -> i64
+Path::len	../../compiler/std/path.tach:50:12	method	pub fn len(self) -> i64	effects: none
+std::fs::Metadata::len	../../compiler/std/fs.tach:206:12	method	pub fn len(self) -> i64	effects: none
+std::env::Args::len	../../compiler/std/env.tach:69:12	method	pub fn len(self) -> i64	effects: none
 $ refs V2::len
 # clash/geom.tach
-15:12	def	pub fn len(self: &V2) -> i64 {
+15:12	def	pub fn len(self) -> i64 {
 # clash/main.tach
 40:17	call	main	mine.push(v.len());
 $ refs myvec::Vec::len
 # clash/main.tach
-47:76	call	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
+47:74	call	main	let total = twice_generic(sq) + twice_generic(v) + sq.twice() + mine.len() + printf(r);
 # clash/myvec.tach
-11:12	def	pub fn len(self: &Vec) -> i64 {
+11:12	def	pub fn len(self) -> i64 {
 $ def V2::add
-<crate::geom::V2 as Add>::add	clash/geom.tach:21:8	method	fn add(self: V2, o: V2) -> V2	effects: none
+<crate::geom::V2 as Add>::add	clash/geom.tach:21:8	method	fn add(self, o: V2) -> V2	effects: none
 $ def Vec::add
-crate::myvec::Vec::add	clash/myvec.tach:15:12	method	pub fn add(self: &mut Vec, k: i64)	effects: none
+crate::myvec::Vec::add	clash/myvec.tach:15:12	method	pub fn add(inout self, k: i64)	effects: none
 $ refs '<V2 as Add>::add'
 # clash/geom.tach
-21:8	def	fn add(self: V2, o: V2) -> V2 {
+21:8	def	fn add(self, o: V2) -> V2 {
 # clash/main.tach
 35:13	call	main	let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
 $ refs '<crate::geom::V2 as Add>::add' --exact
 # clash/geom.tach
-21:8	def	fn add(self: V2, o: V2) -> V2 {
+21:8	def	fn add(self, o: V2) -> V2 {
 # clash/main.tach
 35:13	call	main	let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
 $ refs V2::add
 # clash/geom.tach
-21:8	def	fn add(self: V2, o: V2) -> V2 {
+21:8	def	fn add(self, o: V2) -> V2 {
 # clash/main.tach
 35:13	call	main	let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
 $ refs crate::myvec::Vec::add
 # clash/main.tach
 41:10	call	main	mine.add(1);
 # clash/myvec.tach
-15:12	def	pub fn add(self: &mut Vec, k: i64) {
+15:12	def	pub fn add(inout self, k: i64) {
 $ refs Area::area
 # clash/geom.tach
-27:8	def	-><geom::V2 as Area>::area	fn area(self: &V2) -> i64 {
+27:8	def	-><geom::V2 as Area>::area	fn area(self) -> i64 {
 # clash/main.tach
 27:7	call	twice_generic	-><geom::V2 as Area>::area	x.area() + x.area()
 27:7	call	twice_generic	-><shapes::Square as Area>::area	x.area() + x.area()
 27:18	call	twice_generic	-><geom::V2 as Area>::area	x.area() + x.area()
 27:18	call	twice_generic	-><shapes::Square as Area>::area	x.area() + x.area()
 # clash/shapes.tach
-2:8	def	->shapes::Area::area	fn area(self: &Self) -> i64;
+2:8	def	->shapes::Area::area	fn area(self) -> i64;
 5:14	call	shapes::Area::twice	-><geom::V2 as Area>::area	self.area() * 2
 5:14	call	shapes::Area::twice	-><shapes::Square as Area>::area	self.area() * 2
-14:8	def	-><shapes::Square as Area>::area	fn area(self: &Square) -> i64 {
+14:8	def	-><shapes::Square as Area>::area	fn area(self) -> i64 {
 $ refs Area::twice
 # clash/main.tach
-47:61	call	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
+47:59	call	main	let total = twice_generic(sq) + twice_generic(v) + sq.twice() + mine.len() + printf(r);
 # clash/shapes.tach
-4:8	def	fn twice(self: &Self) -> i64 {
+4:8	def	fn twice(self) -> i64 {
 $ show '<Square as Area>::area'
 // <crate::shapes::Square as Area>::area	clash/shapes.tach:14-16	effects: none
-    fn area(self: &Square) -> i64 {
+    fn area(self) -> i64 {
         self.side * self.side
     }
 $ refs crate::shapes::Area
@@ -123,19 +133,23 @@ $ refs crate::shapes::Area
 26:6	type	geom	impl Area for V2 {
 # clash/main.tach
 17:14	use	crate	use shapes::{Area, Shape, Square};
-26:21	type	twice_generic	fn twice_generic<T: Area>(x: &T) -> i64 {
+26:21	type	twice_generic	fn twice_generic<T: Area>(x: T) -> i64 {
 # clash/shapes.tach
 1:11	def	pub trait Area {
 13:6	type	shapes	impl Area for Square {
 $ def push
-crate::myvec::Vec::push	clash/myvec.tach:7:12	method	pub fn push(self: &mut Vec, x: i64)	effects: none
-std::Vec::push	../../compiler/std/std.tach:238:12	method	pub fn push(self: &mut Vec<T, A>, x: T)
-std::Buf::push	../../compiler/std/std.tach:463:12	method	pub fn push(self: &mut Buf<A>, b: u8)
-std::BinaryHeap::push	../../compiler/std/collections.tach:202:12	method	pub fn push(self: &mut BinaryHeap<T, A>, x: T)
-std::MinHeap::push	../../compiler/std/collections.tach:298:12	method	pub fn push(self: &mut MinHeap<T, A>, x: T)
+crate::myvec::Vec::push	clash/myvec.tach:7:12	method	pub fn push(inout self, x: i64)	effects: none
+std::Vec::push	../../compiler/std/std.tach:280:12	method	pub fn push(inout self, x: sink T)
+std::Buf::push	../../compiler/std/std.tach:505:12	method	pub fn push(inout self, b: u8)
+std::BinaryHeap::push	../../compiler/std/flat/collections.tach:202:12	method	pub fn push(inout self, x: sink T)
+std::MinHeap::push	../../compiler/std/flat/collections.tach:298:12	method	pub fn push(inout self, x: sink T)
+std::unicode::GraphemeState::push	../../compiler/std/unicode/mod.tach:167:12	method	pub fn push(inout self, cp: u32) -> bool	effects: panic
+std::unicode::ClusterWidth::push	../../compiler/std/unicode/mod.tach:396:12	method	pub fn push(inout self, cp: u32, p: u16)	effects: none
+std::string::String::push	../../compiler/std/string.tach:1204:12	method	pub fn push(inout self, cp: u32)
+std::path::PathBuf::push	../../compiler/std/path.tach:250:12	method	pub fn push(inout self, p: [u8])
 $ refs Vec::push --count
 2	crate::myvec::Vec::push
-25	std::Vec::push
+34	std::Vec::push
 $ callers crate::myvec::Vec::push
 # clash/main.tach
 40:10	call	main	mine.push(v.len());
@@ -143,31 +157,31 @@ $ refs crate::myvec::Vec::push
 # clash/main.tach
 40:10	call	main	mine.push(v.len());
 # clash/myvec.tach
-7:12	def	pub fn push(self: &mut Vec, x: i64) {
+7:12	def	pub fn push(inout self, x: i64) {
 $ refs geom::V2
 # clash/geom.tach
 8:12	def	pub struct V2 {
 13:6	type	geom	impl V2 {
-15:23	type	geom::V2::len	pub fn len(self: &V2) -> i64 {
+15:16	type	geom::V2::len	pub fn len(self) -> i64 {
 20:14	type	geom	impl Add for V2 {
-21:18	type	<geom::V2 as Add>::add	fn add(self: V2, o: V2) -> V2 {
-21:25	type	<geom::V2 as Add>::add	fn add(self: V2, o: V2) -> V2 {
-21:32	type	<geom::V2 as Add>::add	fn add(self: V2, o: V2) -> V2 {
+21:12	type	<geom::V2 as Add>::add	fn add(self, o: V2) -> V2 {
+21:21	type	<geom::V2 as Add>::add	fn add(self, o: V2) -> V2 {
+21:28	type	<geom::V2 as Add>::add	fn add(self, o: V2) -> V2 {
 22:9	init	<geom::V2 as Add>::add	V2 { x: self.x + o.x, y: self.y + o.y }
 26:15	type	geom	impl Area for V2 {
-27:20	type	<geom::V2 as Area>::area	fn area(self: &V2) -> i64 {
+27:13	type	<geom::V2 as Area>::area	fn area(self) -> i64 {
 # clash/main.tach
 16:19	use	crate	use geom::{Point, V2};
 35:13	init	main	let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
 35:33	init	main	let v = V2 { x: 1, y: 2 } + V2 { x: 3, y: 4 };
 $ callers printf
 # clash/main.tach
-47:84	call	main	->printf	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
+47:82	call	main	->printf	let total = twice_generic(sq) + twice_generic(v) + sq.twice() + mine.len() + printf(r);
 49:12	call	main	->c::printf	c::printf(c"%d\n", total as i32);
 $ refs crate::printf
 # clash/main.tach
 21:4	def	fn printf(x: i64) -> i64 {
-47:84	call	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
+47:82	call	main	let total = twice_generic(sq) + twice_generic(v) + sq.twice() + mine.len() + printf(r);
 $ show crate::printf
 // crate::printf	clash/main.tach:20-23	effects: none
 /// The user's own printf (the C one is c::printf).
@@ -220,15 +234,15 @@ $ refs a
 15:5	mod	crate	use a::helper as a_helper;
 33:13	mod	main	let p = a::Point { x: Point(n) };
 $ def twice_generic
-crate::twice_generic	clash/main.tach:26:4	fn	fn twice_generic<T: Area>(x: &T) -> i64
+crate::twice_generic	clash/main.tach:26:4	fn	fn twice_generic<T: Area>(x: T) -> i64
 $ callers twice_generic
 # clash/main.tach
-47:17	call	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
-47:38	call	main	let total = twice_generic(&sq) + twice_generic(&v) + sq.twice() + mine.len() + printf(r);
+47:17	call	main	let total = twice_generic(sq) + twice_generic(v) + sq.twice() + mine.len() + printf(r);
+47:37	call	main	let total = twice_generic(sq) + twice_generic(v) + sq.twice() + mine.len() + printf(r);
 $ def UNIT
 crate::shapes::UNIT	clash/shapes.tach:24:11	const	pub const UNIT: i64 = 1
 $ def COUNT
-crate::shapes::COUNT	clash/shapes.tach:25:16	static	pub static mut COUNT: i64 = 0
+crate::shapes::COUNT	clash/shapes.tach:25:16	static	pub static var COUNT: i64 = 0
 $ def Side
 crate::shapes::Side	clash/shapes.tach:26:10	type	pub type Side = i64
 $ def Area
@@ -238,11 +252,11 @@ $ items geom
 4	fn	pub fn Point(x: i64) -> i64
 8	struct	pub struct V2
 13	impl	impl V2
-15	method	pub fn len(self: &V2) -> i64
+15	method	pub fn len(self) -> i64
 20	impl	impl Add for V2
-21	method	fn add(self: V2, o: V2) -> V2
+21	method	fn add(self, o: V2) -> V2
 26	impl	impl Area for V2
-27	method	fn area(self: &V2) -> i64
+27	method	fn area(self) -> i64
 $ items crate
 # crate	clash/main.tach
 3	mod	mod a
@@ -252,11 +266,138 @@ $ items crate
 7	mod	mod myvec
 9	mod	mod sys
 21	fn	fn printf(x: i64) -> i64
-26	fn	fn twice_generic<T: Area>(x: &T) -> i64
+26	fn	fn twice_generic<T: Area>(x: T) -> i64
 30	fn	fn main(gpa: Gpa) -> i32
 $ items sys
 # crate::sys	clash/main.tach
 10	struct	pub struct SockaddrIn
+# std::sys	<std>
+13951	const	pub const SYS_EPERM: i32 = 1
+13952	const	pub const SYS_ENOENT: i32 = 2
+13953	const	pub const SYS_ESRCH: i32 = 3
+13954	const	pub const SYS_EINTR: i32 = 4
+13955	const	pub const SYS_EIO: i32 = 5
+13956	const	pub const SYS_EBADF: i32 = 9
+13957	const	pub const SYS_ECHILD: i32 = 10
+13958	const	pub const SYS_ENOMEM: i32 = 12
+13959	const	pub const SYS_EACCES: i32 = 13
+13960	const	pub const SYS_EEXIST: i32 = 17
+13961	const	pub const SYS_EXDEV: i32 = 18
+13962	const	pub const SYS_ENOTDIR: i32 = 20
+13963	const	pub const SYS_EISDIR: i32 = 21
+13964	const	pub const SYS_EINVAL: i32 = 22
+13965	const	pub const SYS_ENOSPC: i32 = 28
+13966	const	pub const SYS_EROFS: i32 = 30
+13967	const	pub const SYS_EPIPE: i32 = 32
+13972	enum	pub enum SysErrorKind
+13993	fn	pub fn sys_errno() -> i32
+13999	fn	pub fn sys_set_errno(e: i32)
+14005	fn	pub fn sys_errno_kind(e: i32) -> SysErrorKind
+14039	fn	pub fn sys_strerror_into(e: i32, out: inout [u8]) -> i64
+14052	fn	pub unsafe fn sys_cstr_view(p: *u8) -> [u8]
+14079	struct	pub struct SysPath
+14087	fn	pub fn sys_cpath(path: [u8]) -> Result<SysPath, i32>
+14173	const	pub const SYS_O_RDONLY: i32 = 0
+14174	const	pub const SYS_O_WRONLY: i32 = 1
+14175	const	pub const SYS_O_RDWR: i32 = 2
+14176	const	pub const SYS_SEEK_SET: i32 = 0
+14177	const	pub const SYS_SEEK_CUR: i32 = 1
+14178	const	pub const SYS_SEEK_END: i32 = 2
+14188	fn	pub fn sys_open(path: [u8], flags: i32, mode: i32) -> Result<i32, i32>
+14195	fn	pub fn sys_close(fd: i32) -> Result<(), i32>
+14200	fn	pub fn sys_read(fd: i32, buf: inout [u8]) -> Result<i64, i32>
+14206	fn	pub fn sys_write(fd: i32, buf: [u8]) -> Result<i64, i32>
+14212	fn	pub fn sys_pread(fd: i32, buf: inout [u8], off: i64) -> Result<i64, i32>
+14218	fn	pub fn sys_pwrite(fd: i32, buf: [u8], off: i64) -> Result<i64, i32>
+14224	fn	pub fn sys_lseek(fd: i32, off: i64, whence: i32) -> Result<i64, i32>
+14228	fn	pub fn sys_ftruncate(fd: i32, len: i64) -> Result<(), i32>
+14232	fn	pub fn sys_fsync(fd: i32) -> Result<(), i32>
+14236	fn	pub fn sys_mkdir(path: [u8], mode: i32) -> Result<(), i32>
+14241	fn	pub fn sys_rmdir(path: [u8]) -> Result<(), i32>
+14246	fn	pub fn sys_unlink(path: [u8]) -> Result<(), i32>
+14251	fn	pub fn sys_rename(from: [u8], to: [u8]) -> Result<(), i32>
+14257	fn	pub fn sys_dup(fd: i32) -> Result<i32, i32>
+14263	fn	pub fn sys_dup2(fd: i32, to: i32) -> Result<i32, i32>
+14268	fn	pub fn sys_pipe() -> Result<(i32, i32), i32>
+14278	fn	pub fn sys_set_nonblocking(fd: i32, on: bool) -> Result<(), i32>
+14288	fn	pub fn sys_set_cloexec(fd: i32, on: bool) -> Result<(), i32>
+14298	fn	pub fn sys_isatty(fd: i32) -> bool
+14306	struct	pub struct FileStat
+14325	const	pub const SYS_S_IFMT: u32 = 0xf000
+14326	const	pub const SYS_S_IFDIR: u32 = 0x4000
+14327	const	pub const SYS_S_IFREG: u32 = 0x8000
+14328	const	pub const SYS_S_IFLNK: u32 = 0xa000
+14330	impl	impl FileStat
+14331	method	pub fn is_dir(self) -> bool
+14335	method	pub fn is_file(self) -> bool
+14339	method	pub fn is_symlink(self) -> bool
+14344	method	pub fn permissions(self) -> u32
+14351	struct	pub struct StatMacos
+14378	struct	pub struct StatLinux
+14452	fn	pub fn sys_fstat(fd: i32) -> Result<FileStat, i32>
+14460	fn	pub fn sys_stat(path: [u8]) -> Result<FileStat, i32>
+14469	fn	pub fn sys_lstat(path: [u8]) -> Result<FileStat, i32>
+14499	struct	pub struct DirentMacos
+14510	struct	pub struct DirentLinux
+14519	struct	pub struct SysDir
+14527	struct	pub struct SysDirEntry
+14533	const	pub const SYS_DT_UNKNOWN: u8 = 0
+14534	const	pub const SYS_DT_FIFO: u8 = 1
+14535	const	pub const SYS_DT_CHR: u8 = 2
+14536	const	pub const SYS_DT_DIR: u8 = 4
+14537	const	pub const SYS_DT_BLK: u8 = 6
+14538	const	pub const SYS_DT_REG: u8 = 8
+14539	const	pub const SYS_DT_LNK: u8 = 10
+14540	const	pub const SYS_DT_SOCK: u8 = 12
+14542	fn	pub fn sys_opendir(path: [u8]) -> Result<SysDir, i32>
+14553	fn	pub fn sys_readdir_into(dir: inout SysDir, name: inout [u8; 256]) -> Result<Option<SysDirEntry>, i32>
+14593	fn	pub fn sys_closedir(dir: inout SysDir) -> Result<(), i32>
+14605	fn	pub fn sys_getcwd_into(buf: inout [u8]) -> Result<i64, i32>
+14621	fn	pub fn sys_chdir(path: [u8]) -> Result<(), i32>
+14642	fn	pub fn sys_environ() -> **u8
+14647	fn	pub fn sys_env_count() -> i64
+14662	fn	pub fn sys_env_at(i: i64) -> [u8]
+14672	fn	pub fn sys_getenv(name: [u8]) -> Option<[u8]>
+14689	fn	pub unsafe fn sys_setenv(name: [u8], value: [u8]) -> Result<(), i32>
+14696	fn	pub unsafe fn sys_unsetenv(name: [u8]) -> Result<(), i32>
+14730	const	pub const SYS_SIGHUP: i32 = 1
+14731	const	pub const SYS_SIGINT: i32 = 2
+14732	const	pub const SYS_SIGKILL: i32 = 9
+14733	const	pub const SYS_SIGTERM: i32 = 15
+14738	struct	pub struct SysSpawnActions
+14744	fn	pub fn sys_spawn_actions() -> Result<SysSpawnActions, i32>
+14755	impl	impl SysSpawnActions
+14757	method	pub fn dup2(inout self, fd: i32, to: i32) -> Result<(), i32>
+14767	method	pub fn close(inout self, fd: i32) -> Result<(), i32>
+14776	method	pub fn free(inout self)
+14792	fn	pub unsafe fn sys_spawn(prog: *u8, argv: [*u8], envp: [*u8], actions: *SysSpawnActions) -> Result<i32, i32>
+14816	fn	pub fn sys_waitpid(pid: i32, nohang: bool) -> Result<(i32, i32), i32>
+14826	fn	pub fn sys_exit_code(status: i32) -> Option<i32>
+14831	fn	pub fn sys_exit_signal(status: i32) -> Option<i32>
+14836	fn	pub fn sys_kill(pid: i32, sig: i32) -> Result<(), i32>
+14840	fn	pub fn sys_getpid() -> i32
+14891	struct	pub struct SysWinsize
+14900	struct	pub struct SysTermios
+14907	struct	pub struct SysPollFd
+14913	const	pub const SYS_POLLIN: i16 = 1
+14914	const	pub const SYS_POLLPRI: i16 = 2
+14915	const	pub const SYS_POLLOUT: i16 = 4
+14916	const	pub const SYS_POLLERR: i16 = 8
+14917	const	pub const SYS_POLLHUP: i16 = 16
+14918	const	pub const SYS_POLLNVAL: i16 = 32
+14924	fn	pub fn sys_openpty(size: SysWinsize) -> Result<(i32, i32), i32>
+14964	fn	pub unsafe fn sys_fork_exec_pty(tty: i32, path: *u8, argv: [*u8], envp: [*u8]) -> Result<i32, i32>
+14995	fn	pub fn sys_set_winsize(fd: i32, size: SysWinsize) -> Result<(), i32>
+15002	fn	pub fn sys_get_winsize(fd: i32) -> Result<SysWinsize, i32>
+15010	fn	pub fn sys_tcgetattr(fd: i32) -> Result<SysTermios, i32>
+15018	fn	pub fn sys_tcsetattr(fd: i32, t: SysTermios) -> Result<(), i32>
+15025	fn	pub fn sys_make_raw(t: inout SysTermios)
+15032	fn	pub fn sys_poll(fds: [SysPollFd], timeout_ms: i32) -> Result<i64, i32>
+15054	struct	pub struct SysTimespec
+15059	const	pub const SYS_CLOCK_REALTIME: i32 = 0
+15063	fn	pub fn sys_clock_gettime(clock: i32) -> (i64, i64)
+15073	fn	pub fn sys_nanosleep(secs: i64, nanos: i64, left: inout SysTimespec) -> Result<(), i32>
+15080	fn	pub fn sys_getentropy(buf: inout [u8]) -> Result<(), i32>
 $ def helpr
 error query.no-match: no definition 'helpr'
 try: tachyonc query def crate::a::helper
@@ -265,13 +406,13 @@ try: tachyonc query def crate::b::helper
 $ refs MyVec
 # clash/main.tach
 18:12	use	crate	use myvec::Vec as MyVec;
-39:20	init	main	let mut mine = MyVec { n: 0 };
+39:16	init	main	var mine = MyVec { n: 0 };
 # clash/myvec.tach
 2:12	def	pub struct Vec {
 6:6	type	myvec	impl Vec {
-7:28	type	myvec::Vec::push	pub fn push(self: &mut Vec, x: i64) {
-11:23	type	myvec::Vec::len	pub fn len(self: &Vec) -> i64 {
-15:27	type	myvec::Vec::add	pub fn add(self: &mut Vec, k: i64) {
+7:23	type	myvec::Vec::push	pub fn push(inout self, x: i64) {
+11:16	type	myvec::Vec::len	pub fn len(self) -> i64 {
+15:22	type	myvec::Vec::add	pub fn add(inout self, k: i64) {
 note query.alias: 'MyVec' is an import alias in crate, for crate::myvec::Vec
 $ refs a_helper
 # clash/a.tach

@@ -1879,6 +1879,98 @@ both architectures' code; there is no `cfg`.
   (`arch.multiversion`, naming that version): put it under
   `if std::arch::has("f")`.
 
+## Additions of 0.20: parameter conventions
+
+The design is [design/conventions.md](design/conventions.md): the
+memory model's spelling becomes tachyon's own, `let` / `inout` /
+`sink`, with 0.17's semantics. `tachyonc guide memory` teaches it;
+`tachyonc guide rust` maps Rust's spellings onto it.
+
+```ebnf
+param       = self_param | ident ":" [ convention ] type [ "=" expr ] ;
+self_param  = [ "inout" | "sink" ] "self" | "self" ":" [ convention ] type ;
+convention  = "let" | "inout" | "sink" ;               (* let is the default; fmt does not write it *)
+type       += "let" type | "inout" type ;              (* an access: a field, a result, a type argument, a fn type *)
+fn_type     = "fn" "(" [ [ convention ] type { "," [ convention ] type } ] ")" [ "->" type ] ;
+stmt       += "var" pattern [ ":" type ] "=" expr ";"
+            | "inout" ident [ ":" type ] "=" expr ";" ;  (* expr: "&" place, or an inout access *)
+single     += "var" ident ;                             (* replaces "mut" ident *)
+fpat        = [ "var" ] ident | ident ":" pattern ;
+static_decl = "static" [ "var" ] ident ":" type "=" expr ";" ;
+prefix     += "&" pratt(25) ;                           (* an inout access of a place; no "&" "mut" *)
+closure     = [ "sink" ] "|" params "|" expr ;          (* replaces "move" *)
+match_expr += "match" "&" expr "{" arms "}" ;           (* binds inout accesses *)
+```
+
+- **Conventions.** A `let` parameter (the default) is read-only: a copy
+  of a plain or copyable value, otherwise a borrow for the call (a
+  temporary argument lives to the end of the statement). An `inout`
+  parameter is an exclusive access, and its argument is marked `&place`
+  (`conv.marker` without it, `conv.marker_extra` on a let or sink
+  argument, `conv.place` on a temporary). A `sink` parameter owns its
+  value and is mutable; an owned argument moves into it. Receivers are
+  `self`, `inout self` and `sink self` and are lent without `&`.
+  Defaults are allowed on let and sink parameters. In `extern "C"`
+  signatures `inout` and `sink` are `conv.extern`.
+- **Accesses are used as their values.** A let or inout parameter, an
+  `inout x = &place;` local, a `let x = part;` that borrows, and an
+  access field (`q: inout Query`) are read, written (`x = v`, `x += 1`)
+  and called through as the value they designate; `&x` passes one on.
+  `*` is only for raw pointers: `*x` on an access is `conv.rust`. An
+  access cannot be re-pointed.
+- **Bindings.** `let x = e` owns a temporary or a whole local it takes
+  (which moves) and borrows a part it cannot take (an element, a field
+  through an access); `var x = e` is mutable and always owns (a part is
+  `own.move_out`).
+- **Types.** `[T]` is a let access to elements; `inout [T]` is the
+  exclusive writable slice. A struct with an access field is a view; one
+  with an `inout` field is move-only.
+- **Words.** `var`, `inout` and `sink` are words only where these rules
+  put them; elsewhere they are identifiers (`let var = 1; var(a, b)`),
+  until 0.21 makes them keywords. `set` is not a convention: `x: set T`
+  is `conv.set`, and `sink T` outside a parameter `conv.sink_type`.
+  Rust's spellings (`&T`, `&mut T`, `&mut x`, `&self`, `let mut`, `mut
+  x`, `static mut`, `move`, `*r` on an access) are `conv.rust`, each
+  with the new form in a `try:` line; `tachyonc fix --only conventions`
+  rewrites a program.
+- Not yet: results that are accesses (`-> let T`, `-> inout T`,
+  `Option<inout V>`) and `for inout x in &v`; until they land,
+  `get_or_insert(k, v)` and `get_mut(k)` give one-element views
+  (`[0] += 1`).
+- **Modes.** A file is read *mixed* (both spellings; the default until
+  Phase M), in *0.20's* spelling (`--syntax=0.20`: Rust's spellings are
+  `conv.rust`, and `&x` is always exclusive), or in *0.19's* (a crate
+  whose root's first line is `// tachyon-syntax: 0.19`: 0.20's spelling
+  is `syntax.legacy`). Only compiler/src/main.tach carries that line,
+  during 0.20, so that v0.19.1 can build it; tests/run.sh fails if
+  another file does. std and the compiler's generated sources are read
+  mixed until Phase M migrates them.
+
+## Additions of 0.20: `str`
+
+`str` is std's view of UTF-8 text (`std::string::str`, in the prelude):
+`type str = distinct [u8]`, the one distinct type over a view (and
+`std::path::Path`, over the bytes of a path). Its representation is a
+`[u8]`'s, and the own pass checks it as the view it is. The compiler
+gives it these rules (docs/design/collections-text-io.md §2.3, L3):
+
+- `&str` (and `&mut str`) in a type is `str`, as `&[T]` is `[T]`.
+- A string literal is a `str` where one goes, when its bytes are UTF-8
+  (one with `\x80`..`\xff` escapes that break it stays `[u8]`: the error
+  is `str::from_utf8(..)?`); elsewhere it is a `[u8]`, as before. A
+  literal receiver has `str`'s methods: `"a,b".split(',')`.
+- A `str` goes where a `[u8]` does, for free; `b as str` of bytes is an
+  error outside std (`str::from_utf8(b)?` checks them).
+- `s[i]` is byte i (a `u8`), `s[a..b]` a `str` (byte offsets; not
+  checked at char boundaries in 0.20).
+- `&s` of a String (or a PathBuf) goes where a `str` (a Path) or `[u8]`
+  does, and `&v` of a Vec or a Buf where its slice does: Rust's deref
+  coercions, as `s.as_str()`, `s.as_bytes()`, `v.as_slice()`. A String
+  has its `str`'s methods (`s.trim()` is `s.as_str().trim()`), a PathBuf
+  its Path's.
+- `str` has `[u8]`'s Eq, Ord, Hash, Display, Debug and Clone, and the
+  methods of `impl str` (std::string): none of `[u8]`'s.
+
 ## Importing C headers
 
 `import "stdio.h" as c;` *(0.4; `as`: 0.5, required since 0.8)* reads a C

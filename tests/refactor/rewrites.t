@@ -2,7 +2,7 @@
 $ check
 ok: 0 errors in main.tach
 ## A typed hole: only the calls whose $v the checker typed *IntVec.
-$ rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec' --dry-run
+$ rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: inout IntVec' --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -4 +3,0 @@
@@ -10,24 +10,24 @@ $ rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec' --dry-run
 @@ -5,0 +5 @@
 +use crate::vecs::{ByteVec, IntVec, grow_bytes};
 @@ -10 +10 @@
--    grow(&mut v, 10);
-+    (&mut v).reserve(10);
+-    grow(&v, 10);
++    (&v).reserve(10);
 @@ -25,2 +25,2 @@
--    grow(p, n);
--    grow(p, n * 2);
-+    p.reserve(n);
-+    p.reserve(n * 2);
+-    grow(&p, n);
+-    grow(&p, n * 2);
++    (&p).reserve(n);
++    (&p).reserve(n * 2);
 @@ -31,2 +31,2 @@
--    grow(v, 2);
--    grow(v, 2);
-+    v.reserve(2);
-+    v.reserve(2);
+-    grow(&v, 2);
+-    grow(&v, 2);
++    (&v).reserve(2);
++    (&v).reserve(2);
 note rewrite.imports: removed 1 import the rewrite left unused
 ## No site has that type: what the sites have, and the command for it.
 $ rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: IntVec'
 note rewrite.none: nothing matches 'grow($v, $n)'
-note rewrite.types: 5 sites match but for --where; first: $v is &mut IntVec at main.tach:10:10
-try: tachyonc rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec' --dry-run
+note rewrite.types: 5 sites match but for --where; first: $v is inout IntVec at main.tach:10:10
+try: tachyonc rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: inout IntVec' --dry-run
 ## Casts and comparisons (`x as i64 < y` compares, 0.11).
 $ rewrite '$a as i64 < $b.len' '$a < $b.len as i64' --dry-run
 --- a/main.tach
@@ -77,24 +77,24 @@ $ rewrite 'grow($v, $n);' 'grow($v, $n + 1);' --in main.tach --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -10 +10 @@
--    grow(&mut v, 10);
-+    grow(&mut v, 10 + 1);
+-    grow(&v, 10);
++    grow(&v, 10 + 1);
 @@ -25,2 +25,2 @@
--    grow(p, n);
--    grow(p, n * 2);
-+    grow(p, n + 1);
-+    grow(p, n * 2 + 1);
+-    grow(&p, n);
+-    grow(&p, n * 2);
++    grow(&p, n + 1);
++    grow(&p, n * 2 + 1);
 @@ -31,2 +31,2 @@
--    grow(v, 2);
--    grow(v, 2);
-+    grow(v, 2 + 1);
-+    grow(v, 2 + 1);
+-    grow(&v, 2);
+-    grow(&v, 2);
++    grow(&v, 2 + 1);
++    grow(&v, 2 + 1);
 ## Written, then undone.
 $ rewrite 'twice($x) * twice($x)' 'square(twice($x))'
 rewrote 1 site in 1 file	main.tach	+1 -1 lines
 % git diff
 diff --git a/main.tach b/main.tach
-index d5ed954..02da612 100644
+index 0528a7e..065d912 100644
 --- a/main.tach
 +++ b/main.tach
 @@ -14,7 +14,7 @@ fn main() -> i32 {
@@ -105,16 +105,16 @@ index d5ed954..02da612 100644
 +    let total = square(twice(n + 1)) + twice(n) * twice(n + 1);
      let k = 3 * double(n + 1) + double(double(n));
      log(1, 2);
-     grow_twice(&mut v, 7);
+     grow_twice(&v, 7);
 $ undo
 undid rewrote 1 site in 1 file	main.tach	+1 -1 lines
 ## A rewrite that breaks the program: nothing written.
 $ rewrite 'grow($v, $n)' 'grow($n, $v)'
-main.tach:10:10: error[type error] expected '&mut IntVec', got 'i64'  [edited: crate::main]
-main.tach:25:10: error[type error] expected '&mut IntVec', got 'i64'  [edited: crate::more]
-main.tach:26:10: error[type error] expected '&mut IntVec', got 'i64'  [edited: crate::more]
-main.tach:31:10: error[type error] expected '&mut IntVec', got 'i64' | note: in instantiation of 'grow_twice<i64>' at main.tach:20:5  [edited: crate::grow_twice]
-main.tach:32:10: error[type error] expected '&mut IntVec', got 'i64' | note: in instantiation of 'grow_twice<i64>' at main.tach:20:5  [edited: crate::grow_twice]
+main.tach:10:10: error[type error] expected 'inout IntVec', got 'i64'  [edited: crate::main]
+main.tach:25:10: error[type error] expected 'inout IntVec', got 'i64'  [edited: crate::more]
+main.tach:26:10: error[type error] expected 'inout IntVec', got 'i64'  [edited: crate::more]
+main.tach:31:10: error[type error] expected 'inout IntVec', got 'i64' | note: in instantiation of 'grow_twice<i64>' at main.tach:20:5  [edited: crate::grow_twice]
+main.tach:32:10: error[type error] expected 'inout IntVec', got 'i64' | note: in instantiation of 'grow_twice<i64>' at main.tach:20:5  [edited: crate::grow_twice]
 error edit.breaks: 5 new errors; nothing written
 try: tachyonc rewrite 'grow($v, $n)' 'grow($n, $v)' --no-check
 [exit 1]

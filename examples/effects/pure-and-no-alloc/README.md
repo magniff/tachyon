@@ -92,7 +92,7 @@ crate::score	io global panic
   'smoothed(s, i, gain)' at main.tach:39:14 calls 'smoothed'
   'scaled(s[i], gain)' at main.tach:29:6 calls 'scaled'
   'clamp(x * gain / 10, 0, 1000)' at main.tach:23:5 calls 'clamp'
-  'println(f"clamp {x}")' at main.tach:12:5 calls 'std::println'
+  'println(f"clamp {x}")' at main.tach:12:5 calls 'std::fmt::println'
 warning query.program-errors: 1 error in the program; results may be incomplete
 try: tachyonc --diagnostics=short main.tach -c -o /dev/null
 $ tachyonc undo
@@ -130,10 +130,10 @@ only writes.
 index instead:
 
 ```console
-$ tachyonc edit patch peak --old 'let mut best = s.get(0)?;' --new 'let mut best = s[0];'
-main.tach:74:1: error[effect] 'peak' is #[no_panic], but it may panic: 's[0]' at main.tach:75:20 is a checked index | help: iterate ('for x in s'), or 's.get(i)' (an Option), or remove #[no_panic] | try: tachyonc query effects peak --why panic  [edited: crate::peak]
+$ tachyonc edit patch peak --old 'var best = s.get(0)?;' --new 'var best = s[0];'
+main.tach:74:1: error[effect] 'peak' is #[no_panic], but it may panic: 's[0]' at main.tach:75:16 is a checked index | help: iterate ('for x in s'), or 's.get(i)' (an Option), or remove #[no_panic] | try: tachyonc query effects peak --why panic  [edited: crate::peak]
 error edit.breaks: 1 new error; nothing written
-try: tachyonc edit patch peak --old 'let mut best = s.get(0)?;' --new 'let mut best = s[0];' --no-check
+try: tachyonc edit patch peak --old 'var best = s.get(0)?;' --new 'var best = s[0];' --no-check
 [exit 1]
 ```
 

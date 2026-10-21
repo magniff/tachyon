@@ -15,13 +15,15 @@ use crate::base::diag::{
 };
 use crate::front::ambient::has_local_gpa;
 use crate::front::assoc::ensure_checked;
-use crate::front::ast::{NODES, NodeKind, child, list_begin, list_end, list_push, new_node};
+use crate::front::ast::{
+    NODES, NODE_CHECKED, NodeKind, child, list_begin, list_end, list_push, new_node,
+};
 use crate::front::ast::NodeKind::{Call, Ident, Index, Range, Unary};
 use crate::front::check::{LOCALS, Res, SELF_SYM, is_std_named, name_error};
 use crate::front::check::args::{arity_help, int_limit_help, normalize_args};
 use crate::front::check::assign::is_place;
 use crate::front::check::collect::{GMETHODS, GMETHOD_COUNT, find_generic_method};
-use crate::front::check::distinct::{distinct_method_error, null_test};
+use crate::front::check::distinct::{distinct_method_error, is_utf8_text, null_test};
 use crate::front::check::interp::{direct_call, direct_kind};
 use crate::front::check::names::{NEAR_ALL, NEAR_COLLECT, Near, help_nearest, near_to, std_has};
 use crate::front::check::synth_mode::synth_expr;
@@ -29,17 +31,18 @@ use crate::front::check::unsafety::{U_METHOD, check_call_safety, is_borrow, unsa
 use crate::front::check::vectors::{sym_is_c, vector_method};
 use crate::front::convert::generic_trait_call;
 use crate::front::derive::intrinsic::{has_intrinsic_method, intrinsic_method};
+use crate::front::distinct::{PATH_TYPE, STR_TYPE};
 use crate::front::generics::{TPL_DISTINCT, TPL_SLICE, check_arg, template_name};
 use crate::front::generics::instantiate::instantiate_call;
 use crate::front::lexer::{SUF_I64, Tok};
-use crate::front::modules::{CUR_MOD, STD_MODULE};
+use crate::front::modules::{CUR_MOD, STD_MODULE, within_std};
 use crate::front::modules::lookup::is_prelude_name;
 use crate::front::own::kinds::has_drop_impl;
 use crate::front::traits::require_in_bounds;
 use crate::front::types::{
-    ENUMS, FNS, METHODS, METHOD_COUNT, STRUCTS, TYPES, TY_I64, TY_UNIT, TyKind, VARIANTS, buf_type,
-    decay_ref, enum_variant, err_type, find_field, find_method, fn_param, is_compound, is_mut_slice,
-    is_pointer, is_ref, is_vector, ptr_to, slice_of,
+    ENUMS, FNS, METHODS, METHOD_COUNT, STRUCTS, TYPES, TY_I64, TY_U8, TY_UNIT, TyKind, VARIANTS,
+    buf_type, decay_ref, enum_variant, err_type, find_field, find_method, fn_param, is_compound,
+    is_mut_slice, is_pointer, is_ref, is_vector, ptr_to, slice_of,
 };
 
 // ---- Paths, variants and methods ----
@@ -112,6 +115,12 @@ fn rust_method_help(t: i64, name: i64) {
         let text = SYMS[name].text;
         let kind = TYPES[t].kind;
         let seq = kind == TyKind::Slice || kind == TyKind::Array;
+        // (0.20) a method of `str` on bytes
+        if kind == TyKind::Slice && TYPES[t].a == TY_U8 && STR_TYPE > 0
+            && method_of(STR_TYPE, name) >= 0 {
+            err_help(c"`[u8]` is bytes; text is `str` (UTF-8), which has it: a literal is a `str` where one goes (`let s: str = \"..\";`, `fn f(s: &str)`); bytes become one by `str::from_utf8(b)?`");
+            return;
+        }
         // (0.14 has `iter`: only the names it lacks)
         let iter = text == "into_iter" || text == "chars" || text == "bytes";
         if seq && text == "len" {
@@ -280,7 +289,7 @@ fn is_method(f: i64) -> bool {
 // making the text apart); else -1.
 fn push_str_interp(n: i64, f0: i64, t: i64) -> i64 {
     unsafe {
-        if f0 < 0 || STD_MODULE < 0 || FNS[f0].module != STD_MODULE || CUR_MOD == STD_MODULE
+        if f0 < 0 || STD_MODULE < 0 || !within_std(FNS[f0].module) || within_std(CUR_MOD)
             || NODES[n].count != 1 || NODES[child(n, 0)].kind != NodeKind::Interp
             || SYMS[NODES[FNS[f0].node].a].text != "push_str" {
             return -1;
@@ -328,6 +337,13 @@ pub fn synth_method(n: i64) -> i64 {
         let mut receiver = NODES[n].a;
         let name = NODES[n].b;
         let mut receiver_ty = synth_expr(receiver);
+        // (0.20) a string literal has `str`'s methods, as Rust's `&str`:
+        // `"a,b".split(',')`, `" 7 ".trim()`
+        if NODES[receiver].kind == NodeKind::Str && STR_TYPE > 0 && method_of(STR_TYPE, name) >= 0
+            && is_utf8_text(crate::front::lexer::str_at(NODES[receiver].a)) {
+            receiver_ty = STR_TYPE;
+            NODES[receiver].ty = STR_TYPE;
+        }
         // (0.18.1) `tr.cell(i)` of a `tr: &&Table`, `s.len()` of an `s:
         // &[u8]`: read through to the reference (the slice) that has the
         // methods, as Rust does
@@ -385,6 +401,28 @@ pub fn synth_method(n: i64) -> i64 {
             require_in_bounds(LOCALS[NODES[receiver].y].tparam, name, NODES[n].start);
         }
         let mut f0 = method_of(t, name);
+        // (0.20) a String has its `str`'s methods (Rust's Deref): `s.trim()`
+        // is `s.as_str().trim()`; a PathBuf its Path's (`p.as_path()`)
+        let string = TYPES[t].kind == TyKind::Struct && is_std_named(t, c"String");
+        let path_buf = TYPES[t].kind == TyKind::Struct && is_std_named(t, c"PathBuf");
+        if f0 < 0 && (string || path_buf) {
+            let view = if string { STR_TYPE } else { PATH_TYPE };
+            if view > 0 && method_of(view, name) >= 0 {
+                NODES[receiver].p |= NODE_CHECKED;
+                let call = new_node(NodeKind::MethodCall, NODES[receiver].start,
+                    NODES[receiver].end);
+                NODES[call].a = receiver;
+                NODES[call].b = intern_c(if string { c"as_str" } else { c"as_path" });
+                let mark = list_begin();
+                list_end(call, mark);
+                NODES[n].a = call;
+                receiver = call;
+                receiver_ty = synth_expr(call);
+                t = receiver_ty;
+                through_pointer = false;
+                f0 = method_of(t, name);
+            }
+        }
         // (0.17) `b.push_str(f"..")`: Buf::push_fmt's, the f-string written
         // straight into the Buf
         let pf = push_str_interp(n, f0, t);
@@ -509,15 +547,21 @@ pub fn synth_method(n: i64) -> i64 {
             err_sym(name);
             err_str(c"' has 'self' of type '");
             err_type(self_ty);
-            err_str(c"'; a method's 'self' must be '");
-            err_type(t);
-            err_str(c"', '&");
-            err_type(t);
-            err_str(c"', '&mut ");
-            err_type(t);
-            err_str(c"' or '*");
-            err_type(t);
-            err_str(c"'");
+            if crate::front::conv::LEGACY_ROOT {
+                err_str(c"'; a method's 'self' must be '");
+                err_type(t);
+                err_str(c"', '&");
+                err_type(t);
+                err_str(c"', '&mut ");
+                err_type(t);
+                err_str(c"' or '*");
+                err_type(t);
+                err_str(c"'");
+            } else {
+                err_str(c"'; a method's receiver is 'self', 'inout self', 'sink self' or 'self: *");
+                err_type(t);
+                err_str(c"'");
+            }
             err_end();
         }
         let count = NODES[n].count;

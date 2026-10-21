@@ -15,7 +15,11 @@ use crate::base::{IntVec, SRC, buf_bytes, buf_int, buf_new, buf_slice, intern};
 use crate::front::ast::{
     NODES, NODE_REF_MUT, NodeKind, child, list_begin, list_end, list_push, new_node,
 };
+use crate::front::check::lookup_local;
 use crate::front::lexer::Tok;
+use crate::front::modules::CUR_MOD;
+use crate::front::modules::lookup::{B_ITEM, binding_kind, binding_value, lookup_item};
+use crate::front::types::{FNS, SYM_FN, TYPES, TyKind, fn_param};
 
 // A flag of the Ident that names a temporary (on the `&`'s operand).
 pub const NODE_TEMP: i64 = 1 << 52;
@@ -187,6 +191,7 @@ fn visit(e: i64) {
             return;
         }
         if k == NodeKind::Call {
+            let_temporaries(e);
             visit(NODES[e].a);
             for i in 0..NODES[e].count {
                 visit(child(e, i));
@@ -249,11 +254,71 @@ fn visit(e: i64) {
             // (0.18.1: a body that is an expression, `|a, b| cmp(&f(a),
             // &f(b))`: its temporaries in a block of their own)
             NODES[e].a = visit_sub(NODES[e].a);
+            // (0.20: a body that is an expression becomes the tail of a
+            // block, so that its owned temporaries drop when the body
+            // ends: front/own/drops)
+            let body = NODES[e].a;
+            if body != 0 && NODES[body].kind != NodeKind::Block {
+                let b = new_node(NodeKind::Block, NODES[body].start, NODES[body].end);
+                let m = list_begin();
+                list_end(b, m);
+                NODES[b].a = body;
+                NODES[e].a = b;
+            }
         } else if k == NodeKind::Assign {
             visit(NODES[e].c);
             IMPURE = true;
         } else if impure(e) {
             IMPURE = true;
+        }
+    }
+}
+
+// (0.20, conventions.md §2.1) The values that call e passes to let
+// parameters which borrow (`total(make())` for `total(v: Vec<i64>)`):
+// each becomes `&value`, so that it is a temporary of the statement (hoist).
+// The callee must be a non-generic function named by an identifier (its
+// signature is resolved before the bodies are checked).
+fn let_temporaries(e: i64) {
+    unsafe {
+        let callee = NODES[e].a;
+        if NODES[callee].kind != NodeKind::Ident || NODES[callee].g != 0
+            || lookup_local(NODES[callee].a).is_some() || CUR_MOD < 0 {
+            return;
+        }
+        let b = lookup_item(CUR_MOD, NODES[callee].a, CUR_MOD);
+        if binding_kind(b) != B_ITEM {
+            return;
+        }
+        let key = binding_value(b);
+        if SYM_FN[key] == 0 {
+            return;
+        }
+        let f = SYM_FN[key] - 1;
+        if FNS[f].generic > 0 {
+            return;
+        }
+        let n = if NODES[e].count < FNS[f].param_count { NODES[e].count }
+            else { FNS[f].param_count };
+        for i in 0..n {
+            let arg = child(e, i);
+            let t = fn_param(f, i);
+            if NODES[arg].kind == NodeKind::NamedArg
+                || NODES[arg].kind == NodeKind::Unary && NODES[arg].op == Tok::Amp
+                || t <= 0 || TYPES[t].kind != TyKind::Ptr
+                || TYPES[t].b != crate::front::types::REF_SHARED || !is_value_expr(arg)
+                || crate::front::conv::fn_param_conv(f, i) != crate::front::conv::CONV_LET {
+                continue;
+            }
+            let inner = new_node(NodeKind::None, NODES[arg].start, NODES[arg].end);
+            NODES[inner] = NODES[arg];
+            NODES[arg].kind = NodeKind::Unary;
+            NODES[arg].op = Tok::Amp;
+            NODES[arg].a = 0;
+            NODES[arg].b = inner;
+            NODES[arg].count = 0;
+            NODES[arg].list = 0;
+            NODES[arg].p = 0;
         }
     }
 }

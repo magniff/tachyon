@@ -52,8 +52,90 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.18.1 | `v0.18.1` | 0.18.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | two use-after-free holes in safe code closed (a changed copy of a borrowed owned value; a reference into a Vec across a push); functions compiled in parallel (`-j N`, the same bytes at any N; the -O2 self-compile 2.13 s to 0.72 s at -j8) and incremental rebuilds from a code cache (a one-function edit 0.53 s, byte-identical to clean); V4: every `*T` raw, borrowing only `&`/`&mut`, the compiler and std on references; contracts in generated code (range fixes, `x % n` ranges, entry facts: the contracts bench 25% fewer instructions than without clauses); BinaryHeap/MinHeap, binding modes on references, `&f()` temporaries, let-else and the 0.18 eval's polish; a valgrind row and threads/incremental steps in the gate, a lock on the bootstrap cache |
 | 0.19.0 | `v0.19.0` | 0.18.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | CPU intrinsics and target features: `std::arch` with over 1,775 AArch64 intrinsics (NEON, crc, sha2, sha512, sha3, aes, pmull, dotprod, float), each checked lane by lane against a scalar reference, and 484 x86-64 intrinsics (SSE to AVX2, FMA, BMI, AES-NI, SHA, PCLMULQDQ) encoded as cc does but not run; unsigned, 64-bit and 256-bit vector types; target features inferred like effects, `has`/`detect` guards, foreign architectures constant false, `-C target-cpu`/`target-feature`; run-time detection and `#[multiversion]`; intrinsics pure to the optimizer, never hoisted above their guard, vectors in vector registers; `query arch`, `guide arch`, examples/arch, the fuzzer's arch mode, `tachyonc assemble` |
 | 0.19.1 | `v0.19.1` | 0.19.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | two soundness fixes: the store intrinsics' destination is `&mut [T]` (a store through a read-only view, or while a view of the buffer is used, is an error), and 0.17's transitional rule accepting a read-only `[T]` where `&mut [T]` is wanted is gone (`fix --values` migrates); examples/arch/sha256sum, coreutils-compatible on the SHA-256 instructions, faster than macOS's sha256sum and OpenSSL, about 5 times coreutils' on Linux |
+| 0.20.0 | `v0.20.0` | 0.19.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | parameter conventions in Hylo's spelling, the default syntax: `let` (the default), `inout` with `&x` at the call, `sink`, `var`, accesses used as their values; Rust's spellings `conv.rust` errors with a `try:`, `fix --only conventions` migrates, std, tests, examples, bench and the eval on it (compiler/src on the 0.19 pragma until 0.21); std as a module tree; HashMap/HashSet on a Swiss table (foldhash, SipHash-1-3), BTreeMap/BTreeSet, ipnsort and driftsort; `String` and `str`, std::unicode (UTF-8, graphemes, width, case, Unicode 18), number formatting and parsing; std::io, fs, path, env, process, time, random; owned temporaries dropped at the statement's end; `tachyonc lsp` |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.20
+
+The designs are docs/design/conventions.md (with T1, T2 and Phase M "as
+built") and docs/design/collections-text-io.md; the language in
+docs/grammar.md, "Additions of 0.20"; the server in docs/lsp.md.
+
+- **Parameter conventions in Hylo's spelling, the default syntax.** A
+  parameter is `let` (the default, not written: borrowed, read-only),
+  `inout` (exclusive; `&x` marks it at the call, and only it) or `sink`
+  (the callee takes it); receivers `self`, `inout self`, `sink self`.
+  `var` replaces `let mut`, `static var` `static mut`, `inout r = &v;` an
+  exclusive local access. Accesses are transparent (`r.push(9)`, `n +
+  1`; `*` only for raw pointers), and `&T`/`&mut T` leave the types: an
+  access in a type is `let T` or `inout T` (`inout [T]` for `&mut [T]`).
+  Rust's spellings (`&T`, `&mut x`, `&self`, `let mut`, `*r` on an
+  access, `move ||`, `static mut`, `&&T`, `env::var`) are `conv.rust`
+  errors with a `try:` line giving the new form.
+- **The migration.** `fix --only conventions` rewrites a program (`--in`
+  for the files a merge brought); `refactor signature --convention`
+  changes one parameter. std, tests, examples, bench and the agent eval
+  are in 0.20's spelling. User code is read in it by default
+  (`--syntax=0.20`; `--syntax=mixed` reads both); compiler/src keeps the
+  root pragma `// tachyon-syntax: 0.19` until 0.21, whose first commit
+  migrates it.
+- **std as a module tree** (std::hash, std::str, std::io, ...), with the
+  refactor tools working on it, and a benchmark harness against Rust's
+  std and C (bench/std: a .tach, .rs and .c triple per operation, the
+  same checksum).
+- **Collections**: `HashMap` and `HashSet` on a Swiss table (group
+  probing, NEON on AArch64) with foldhash, and SipHash-1-3 for untrusted
+  keys; `BTreeMap` and `BTreeSet` (a NEON probe within a node); the
+  ipnsort and driftsort sorts; std::slice's algorithms.
+- **Text**: an owned UTF-8 `String` and `str` views; std::unicode on
+  Unicode 18's tables: UTF-8 validation, chars, grapheme clusters,
+  display width, case mapping, with NEON fast paths; number formatting
+  and parsing (Schubfach shortest round-trip for floats, dec2flt
+  parsing, integers).
+- **I/O and the system**: std::io (readers, writers, buffering), fs,
+  path, env (`env::get`/`get_in`), process, std::time, std::random,
+  std::sys.
+- **Owned temporaries dropped at the end of their statement**, and moves
+  of closure captures checked.
+- **`tachyonc lsp`**: a language server written in tachyon (definition,
+  references, document symbols, diagnostics with their `try:` lines,
+  hover with types, effects and why, and CPU features), from the same
+  tables as `query` and `check`.
+- **Compiler fixes from the migration (Phase M)**: `match` of an access
+  matches through it, and a match of a part it cannot take borrows it;
+  a view taken through an access views what it designates; a String or
+  PathBuf place goes where its view does; a closure literal given to a
+  let parameter is lent from the caller's frame; `Iterator::at` takes
+  `inout self` (its default advanced a copy); an assignment through an
+  access drops the old value; fmt keeps `let T` in function types and
+  `sink *T`.
+- **Caught by the release gate, fixed before the tag**: at -O0 std's
+  path functions passed C a pointer into a copy of their `SysPath`
+  (`SysPath::ptr` took `let self`, a copy for a plain type in 0.20),
+  and `DirEntry::file_name` returned a view of a copied entry: file
+  names came out as NUL bytes and files were not found (std_io,
+  sys_files, sys_process); the calls pass their local's address, and
+  `file_name` takes `inout self`. bench/matmul had been migrated to
+  `inout f64` parameters it reads as raw pointers (now `*f64`).
+- **Tested on aarch64 only**, as since 0.15 (`gate.sh --with-x86`).
+- **Breaking**: the 0.19 spellings (`&T`, `&mut`, `&self`, `let mut`,
+  `static mut`, `move ||`, `*r` on an access) are errors in user code
+  (`fix --only conventions`; `--syntax=mixed` for one release reads
+  both); `env::var` is `env::get`; std's API changed with the module tree
+  and the new collections and text types.
+- **Known issues, for 0.20.1**: `fn(T)` and `fn(let T)` are different
+  types in the checker (fmt keeps the `let`); a closure's by-value
+  parameter is not dropped (a leak, as in 0.19.1); a generic `let`
+  parameter given an rvalue of a non-copyable type other than a closure
+  literal errors; `fix --only conventions` drops the `&` of an inout
+  argument inside an f-string hole and mis-migrates `Iterator::at`'s
+  convention in some impls; `query def` does not take back the
+  symbols of std's statics (`tachyon.static.std.X`); std's own
+  functions are not checked by the own pass (how the -O0 bugs above
+  slipped through); a small std program compiles with about 270 M
+  more instructions than with 0.19.1 (std's text built whole), and
+  `check` of the compiler does 13% more.
 
 ### What's new in 0.19.1
 

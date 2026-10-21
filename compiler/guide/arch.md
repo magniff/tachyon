@@ -116,7 +116,7 @@ use std::arch::detect;
 
 // CRC-32C of s, bit by bit: the fallback.
 fn crc32c_portable(s: [u8]) -> u32 {
-    let mut c: u32 = 0xffffffff;
+    var c: u32 = 0xffffffff;
     for b in s {
         c ^= b as u32;
         for _ in 0..8 {
@@ -128,7 +128,7 @@ fn crc32c_portable(s: [u8]) -> u32 {
 
 // The same by the crc instructions: needs crc (inferred).
 fn crc32c_hw(s: [u8]) -> u32 {
-    let mut c: u32 = 0xffffffff;
+    var c: u32 = 0xffffffff;
     for b in s {
         c = __crc32cb(c, b);
     }
@@ -188,15 +188,15 @@ use std::arch::has;
 #[multiversion("dotprod")]
 fn dot(a: [u8], b: [u8]) -> u32 {
     if has("dotprod") {
-        let mut acc = vdupq_n_u32(0);
-        let mut i = 0;
+        var acc = vdupq_n_u32(0);
+        var i = 0;
         while i + 16 <= a.len {
             acc = vdotq_u32(acc, vld1q_u8(a, i), vld1q_u8(b, i));
             i += 16;
         }
         vaddvq_u32(acc)
     } else {
-        let mut n: u32 = 0;
+        var n: u32 = 0;
         for i in 0..a.len {
             n += a[i] as u32 * b[i] as u32;
         }
@@ -220,9 +220,9 @@ The vendor's name is the safe form: it takes a slice and an index,
 `vld1q_u8(s, i)` (16 bytes from `s[i]`), `vst1q_u8(s, i, v)`,
 `_mm_loadu_si128(s, i)`, and checks `0 <= i` and `i + 16 <= s.len` as
 `s[i]` does (`panic` in its effects). A store writes, so its slice is
-`&mut [T]`: `vst1q_u8(&mut out[..], i, v)`, `v.as_mut_slice()`, or a
-`&mut [T]` parameter; a read-only `[T]` there is `own.readonly`, whose
-`try:` line makes the view exclusive. Range analysis removes the check
+`inout [T]`: `vst1q_u8(&out[..], i, v)`, `v.as_mut_slice()`, or an
+`inout [T]` parameter passed on; a read-only `[T]` there is
+`own.readonly`, whose `try:` line makes the view exclusive. Range analysis removes the check
 in counted loops (`while i + 16 <= s.len`), so the loop body is the bare
 load. Aligned forms (`_mm_load_si128`) check the alignment too and stop
 with `misaligned access` instead of faulting (`arch.misaligned`).
@@ -253,7 +253,7 @@ use std::trailing_zeros;
 
 // The first i with s[i] == b, or -1.
 fn find(s: [u8], b: u8) -> i64 {
-    let mut i = 0;
+    var i = 0;
     if has("neon") {
         let needle = vdupq_n_u8(b);
         while i + 16 <= s.len {
@@ -332,14 +332,14 @@ fn words(block: [u8], i: i64) -> uint32x4_t {
 }
 
 // One 64-byte block into the state (a, b, c, d, e, f, g, h).
-fn compress(state: &mut [u32], block: [u8]) {
-    let mut abcd = vld1q_u32(state, 0);
-    let mut efgh = vld1q_u32(state, 4);
+fn compress(state: inout [u32], block: [u8]) {
+    var abcd = vld1q_u32(state, 0);
+    var efgh = vld1q_u32(state, 4);
     let (abcd0, efgh0) = (abcd, efgh);
-    let mut w0 = words(block, 0);
-    let mut w1 = words(block, 16);
-    let mut w2 = words(block, 32);
-    let mut w3 = words(block, 48);
+    var w0 = words(block, 0);
+    var w1 = words(block, 16);
+    var w2 = words(block, 32);
+    var w3 = words(block, 48);
     for g in 0..16 {
         let wk = vaddq_u32(w0, vld1q_u32(K[..], 4 * g));
         let next = if g < 12 { vsha256su1q_u32(vsha256su0q_u32(w0, w1), w2, w3) } else { w0 };
@@ -351,16 +351,16 @@ fn compress(state: &mut [u32], block: [u8]) {
         w2 = w3;
         w3 = next;
     }
-    vst1q_u32(state, 0, vaddq_u32(abcd, abcd0));
-    vst1q_u32(state, 4, vaddq_u32(efgh, efgh0));
+    vst1q_u32(&state, 0, vaddq_u32(abcd, abcd0));
+    vst1q_u32(&state, 4, vaddq_u32(efgh, efgh0));
 }
 
 fn main() {
-    let mut state: [u32; 8] = [
+    var state: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
     ];
     // "abc" padded to one block: 0x80, zeros, its length in bits at the end.
-    let mut block: [u8; 64] = [0; 64];
+    var block: [u8; 64] = [0; 64];
     block[0] = 'a';
     block[1] = 'b';
     block[2] = 'c';
@@ -370,7 +370,7 @@ fn main() {
         println("no sha2 on this CPU: use a portable SHA-256");
         return;
     }
-    compress(&mut state[..], block[..]);
+    compress(&state[..], block[..]);
     for k in 0..8 {
         print(f"{state[k]:08x}");
     }

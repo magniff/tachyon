@@ -17,19 +17,19 @@ $ similar Circle::diameter
 // 1 of 1 methods like crate::shapes::Circle::diameter, nearest first; a new one beside it: tachyonc edit insert --after crate::shapes::Circle::diameter < new.tach
 // crate::shapes::Circle::double_diameter	similar/shapes.tach:17-20	effects: none
     // Four times the radius.
-    pub fn double_diameter(self: Circle) -> i64 {
+    pub fn double_diameter(self) -> i64 {
         4 * self.r
     }
 $ similar Square::perimeter Square
 // 2 of 2 methods like crate::shapes::Square::perimeter, nearest first; a new one beside it: tachyonc edit insert --after crate::shapes::Square::perimeter < new.tach
 // crate::shapes::Circle::double_diameter	similar/shapes.tach:17-20	effects: none
     // Four times the radius.
-    pub fn double_diameter(self: Circle) -> i64 {
+    pub fn double_diameter(self) -> i64 {
         4 * self.r
     }
 // crate::shapes::Circle::diameter	similar/shapes.tach:12-15	effects: none
     // Twice the radius.
-    pub fn diameter(self: Circle) -> i64 {
+    pub fn diameter(self) -> i64 {
         2 * self.r
     }
 // 1 of 1 structs like crate::shapes::Square, nearest first; a new one beside it: tachyonc edit insert --after crate::shapes::Square < new.tach

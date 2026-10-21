@@ -21,11 +21,12 @@ use crate::front::check::{LOCALS, LOCAL_COUNT, is_std_named};
 use crate::front::contracts::checks::fixed_message;
 use crate::front::contracts::diag::{DISTINCT_KIND, DISTINCT_METHOD, DISTINCT_MIX};
 use crate::front::distinct::{
-    ANY_DISTINCT, NICHE_ALIASES, distinct_type, enum_niche, erase_list, erase_type,
-    is_distinct_type, is_niche_alias, strip_distinct,
+    ANY_DISTINCT, ANY_VIEW_DISTINCT, ERASE_VIEWS_ONLY, NICHE_ALIASES, PATH_TYPE, STR_TYPE,
+    distinct_type, enum_niche, erase_list, erase_type, is_distinct_type, is_niche_alias,
+    is_view_distinct, reset_erased, strip_distinct,
 };
 use crate::front::lexer::{SUF_NONE, Tok};
-use crate::front::modules::{STD_MODULE, module_of};
+use crate::front::modules::{STD_MODULE, module_of, within_std};
 use crate::front::own::kinds::{is_owned_type, is_plain_type};
 use crate::front::traits::{implements, std_trait};
 use crate::front::types::{
@@ -47,7 +48,13 @@ pub fn distinct_of(alias: i64, base: i64, mark: i64) -> i64 {
             TSCRATCH.count = mark;
             return base;
         }
-        let bad = not_plain(base, 0);
+        // (0.20) std's `str`, over `[u8]`: a view, checked as one by the
+        // own pass (erase_view_distincts)
+        let text = view_text_alias(alias, base);
+        if text {
+            ANY_VIEW_DISTINCT = true;
+        }
+        let bad = if text { 0 } else { not_plain(base, 0) };
         if bad != 0 {
             let saved = ERR_KIND;
             ERR_KIND = DISTINCT_KIND;
@@ -64,11 +71,28 @@ pub fn distinct_of(alias: i64, base: i64, mark: i64) -> i64 {
             ERR_KIND = saved;
         }
         // (std's NonNull: the null niche, front/distinct.tach)
-        if module_of(alias) == STD_MODULE && SYMS[NODES[alias].a].text == "NonNull"
+        if within_std(module_of(alias)) && SYMS[NODES[alias].a].text == "NonNull"
             && !is_niche_alias(alias) {
             NICHE_ALIASES.push(alias);
         }
-        distinct_type(alias, base, mark)
+        let t = distinct_type(alias, base, mark);
+        if text && SYMS[NODES[alias].a].text == "str" {
+            STR_TYPE = t;
+        } else if text {
+            PATH_TYPE = t;
+        }
+        t
+    }
+}
+
+// (0.20) Whether alias node `alias` over `base` is std's `type str =
+// distinct [u8]` or `type Path = distinct [u8]` (std::path): the distinct
+// types over a view.
+fn view_text_alias(alias: i64, base: i64) -> bool {
+    unsafe {
+        base > 0 && TYPES[base].kind == TyKind::Slice && TYPES[base].b == 0
+            && within_std(module_of(alias))
+            && (SYMS[NODES[alias].a].text == "str" || SYMS[NODES[alias].a].text == "Path")
     }
 }
 
@@ -147,6 +171,7 @@ pub fn check_distinct_kinds() {
             let alias = TYPES[t].b;
             let base = TYPES[t].a;
             if alias <= 0 || base <= 0 || base == TY_ERROR || not_plain(base, 0) != 0
+                || view_text_alias(alias, base)
                 || is_plain_type(base) || (0..seen.count).any(|j| seen.data[j] == alias) {
                 continue;
             }
@@ -171,8 +196,17 @@ pub fn check_distinct_kinds() {
 
 // Whether literal n, checked against distinct type `expected` over a
 // number, was checked against that number: the one implicit conversion.
+// (0.20) And a string literal where std's `str` goes: a `str`.
 pub fn distinct_literal(n: i64, expected: i64) -> bool {
-    if !is_distinct_type(expected) || !crate::front::check::synth_mode::is_context_literal(n) {
+    if !is_distinct_type(expected) {
+        return false;
+    }
+    if is_view_distinct(expected) && is_string_literal(n)
+        && (expected != STR_TYPE || literal_utf8(n)) {
+        crate::front::check::check_mode::check_expr(n, strip_distinct(expected));
+        return true;
+    }
+    if !crate::front::check::synth_mode::is_context_literal(n) {
         return false;
     }
     let base = strip_distinct(expected);
@@ -181,6 +215,59 @@ pub fn distinct_literal(n: i64, expected: i64) -> bool {
     }
     crate::front::check::check_mode::check_expr(n, base);
     true
+}
+
+// (0.20) Whether string literal n (or the block of only it) is UTF-8: a
+// literal with `\x80`..`\xff` escapes that break it stays `[u8]`.
+fn literal_utf8(n: i64) -> bool {
+    unsafe {
+        if NODES[n].kind == NodeKind::Block {
+            return literal_utf8(NODES[n].a);
+        }
+        is_utf8_text(crate::front::lexer::str_at(NODES[n].a))
+    }
+}
+
+// (0.20) Whether s is well-formed UTF-8 (RFC 3629: no overlong forms, no
+// surrogates, nothing above U+10FFFF).
+pub fn is_utf8_text(s: [u8]) -> bool {
+    let mut i = 0;
+    while i < s.len {
+        let b = s[i];
+        if b < 0x80 {
+            i += 1;
+            continue;
+        }
+        let n = if b >= 0xc2 && b < 0xe0 { 2 } else if b >= 0xe0 && b < 0xf0 { 3 }
+            else if b >= 0xf0 && b < 0xf5 { 4 } else { 0 };
+        if n == 0 || i + n > s.len {
+            return false;
+        }
+        let b1 = s[i + 1];
+        let lo: u8 = if b == 0xe0 { 0xa0 } else if b == 0xf0 { 0x90 } else { 0x80 };
+        let hi: u8 = if b == 0xed { 0x9f } else if b == 0xf4 { 0x8f } else { 0xbf };
+        if b1 < lo || b1 > hi {
+            return false;
+        }
+        for k in 2..n {
+            if (s[i + k] & 0xc0) != 0x80 {
+                return false;
+            }
+        }
+        i += n;
+    }
+    true
+}
+
+// (0.20) Whether n is a string literal ("..", not c".."), or a block of
+// only one.
+fn is_string_literal(n: i64) -> bool {
+    unsafe {
+        if NODES[n].kind == NodeKind::Block {
+            return NODES[n].count == 0 && NODES[n].a != 0 && is_string_literal(NODES[n].a);
+        }
+        NODES[n].kind == NodeKind::Str
+    }
 }
 
 // Binary node n (operator op), whose operands are both of distinct type
@@ -213,6 +300,19 @@ pub fn distinct_mismatch(n: i64, expected: i64, actual: i64) {
         if !is_distinct_type(expected) && !is_distinct_type(actual) || expected == TY_ERROR
             || actual == TY_ERROR || n == 0 || NODES[n].end <= NODES[n].start {
             return;
+        }
+        // (0.20) bytes where std's `str` goes: checked, not converted
+        if expected == STR_TYPE && !is_distinct_type(actual) && actual == TYPES[expected].a {
+            let text = SRC[NODES[n].start..NODES[n].end];
+            let saved = ERR_KIND;
+            ERR_KIND = DISTINCT_MIX;
+            err_begin(NODES[n].start);
+            err_fmt(f"'{text}' is '[u8]' where 'str' goes");
+            err_help(c"a `str` is UTF-8: bytes become one through `str::from_utf8(b)` (a Result, Utf8Error when they are not); a literal with \\x80..\\xff escapes is `[u8]`");
+            err_try_fmt(f"str::from_utf8({text})?");
+            err_end_soft();
+            ERR_KIND = saved;
+            err_jump()
         }
         let be = strip_distinct(expected);
         let ba = strip_distinct(actual);
@@ -464,6 +564,30 @@ pub fn erase_program_types() {
         for e in 0..ENUM_COUNT {
             enum_niche(e);
         }
+        erase_all_types();
+    }
+}
+
+// (0.20) Before the own pass: std's `str` (a distinct type over `[u8]`)
+// replaced by `[u8]` everywhere, so that the own pass checks it as the
+// view it is; other distinct types stay until erase_program_types.
+pub fn erase_view_distincts() {
+    unsafe {
+        if !ANY_VIEW_DISTINCT {
+            return;
+        }
+        ERASE_VIEWS_ONLY = true;
+        reset_erased();
+        erase_all_types();
+        ERASE_VIEWS_ONLY = false;
+        reset_erased();
+    }
+}
+
+// The types of every node, field, function, variant, static, constant and
+// local, erased (erase_type, in its mode).
+fn erase_all_types() {
+    unsafe {
         let types = type_count();
         for n in 0..NODE_COUNT {
             let t = NODES[n].ty;

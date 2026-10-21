@@ -41,7 +41,7 @@ name on both, so the program compares the first bytes:
 
 ```tach
 fn on_macos() -> bool {
-    let mut names: [u8; 1280] = [0; 1280];
+    var names: [u8; 1280] = [0; 1280];
     if unsafe { uname(&names as *u8) != 0 } {
         return false;
     }
@@ -60,7 +60,7 @@ capacity), not the cells:
 
 ```tach
 let old = self.cells.take();
-self.cells = std::replace(&mut self.next, old);
+self.cells = std::replace(&self.next, old);
 ```
 
 The edges wrap around (a torus): `(x + width) % width`.

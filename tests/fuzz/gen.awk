@@ -185,14 +185,14 @@ function expr(t, depth,    k, v, u, op, ops) {
 # ---- The 0.6 language ----
 
 function lang06_defs() {
-    print "static mut DLOG: u64 = 0;"
+    print "static var DLOG: u64 = 0;"
     print ""
     print "fn dnote(d: u64) { DLOG = DLOG * 31 + d; }"
     print ""
     print "fn dfn(x: i64, n: i64) -> i64 {"
     print "    defer dnote(1);"
-    print "    let mut acc = x;"
-    print "    let mut i = 0;"
+    print "    var acc = x;"
+    print "    var i = 0;"
     print "    outer: while i < n {"
     print "        defer dnote(2);"
     print "        i += 1;"
@@ -214,8 +214,8 @@ function lang06_defs() {
     print "fn iflet(x: i64) -> i64 { if let Some(v) = opt_of(x) { v } else if let 5 = x { 50 } else { -x } }"
     print ""
     print "fn wlet(x: i64) -> i64 {"
-    print "    let mut v = x;"
-    print "    let mut n = 0;"
+    print "    var v = x;"
+    print "    var n = 0;"
     print "    while let Some(h) = opt_of(v) { v = h; n += 1; if n > 60 { break; } }"
     print "    n * 100 + v"
     print "}"
@@ -287,8 +287,8 @@ function generic_defs() {
     print "impl<T> GB<T> {"
     print "    fn new(v: T, w: T) -> GB<T> { GB { v: v, w: w } }"
     print "    fn swap(self: GB<T>) -> GB<T> { GB::new(self.w, self.v) }"
-    print "    fn first(self: &GB<T>) -> T { self.v }"
-    print "    fn pick<U>(self: &GB<T>, c: bool, u: U, other: U) -> U { if c { u } else { other } }"
+    print "    fn first(self) -> T { self.v }"
+    print "    fn pick<U>(self, c: bool, u: sink U, other: sink U) -> U { if c { u } else { other } }"
     print "}"
     print ""
     print "enum GM<T> { No, Yes(T) }"
@@ -436,11 +436,11 @@ function type_defs(    s, i, n) {
         print line " }"
         print ""
         print "impl S" s " {"
-        print "    fn m0(self: &mut S" s ", x: " SFT[s, 0] ") {"
+        print "    fn m0(inout self, x: " SFT[s, 0] ") {"
         print "        self.f0 = self.f0 ^ x;"
         print "    }"
         print "    fn m1(self: S" s ") -> u64 {"
-        line = "        let mut h: u64 = 7;"
+        line = "        var h: u64 = 7;"
         print line
         for (i = 0; i < SNF[s]; i++) {
             if (is_float(SFT[s, i])) print "        h = h * 31 + ((self.f" i " * 4.0) as i64 as u64);"
@@ -449,7 +449,7 @@ function type_defs(    s, i, n) {
         print "        h"
         print "    }"
         print "    fn g(v: Self, k: i64) -> Self {"
-        print "        let mut w = v;"
+        print "        var w = v;"
         print "        w.f0 = w.f0 ^ (k as " SFT[s, 0] ");"
         print "        w"
         print "    }"
@@ -470,19 +470,19 @@ function feature_locals(    i, s) {
     for (i = 0; i < n; i++) {
         s = rnd(NS)
         SVN[NSV] = "s" i; SVS[NSV] = s
-        print "    let mut s" i ": S" s " = " struct_value(s, 1) ";"
+        print "    var s" i ": S" s " = " struct_value(s, 1) ";"
         NSV++
     }
     n = rnd(3)
     for (i = 0; i < n; i++) {
         EVN[NEV] = "e" i
-        print "    let mut e" i ": E = " enum_value(1) ";"
+        print "    var e" i ": E = " enum_value(1) ";"
         NEV++
     }
     n = rnd(2)
     for (i = 0; i < n; i++) {
         CVN[NCV] = "c" i
-        print "    let mut c" i ": C = " c_value() ";"
+        print "    var c" i ": C = " c_value() ";"
         NCV++
     }
 }
@@ -619,7 +619,7 @@ function statement(level, loops,    k, v, t, a, op, ops, n, lim, saved) {
     if (k == 8 && loops < 2 && level < 4) {
         # A while loop with its own counter.
         COUNTER++
-        print indent(level) "let mut w" COUNTER ": i32 = 0;"
+        print indent(level) "var w" COUNTER ": i32 = 0;"
         print indent(level) "while w" COUNTER " < " (1 + rnd(6)) " {"
         saved = COUNTER
         LOOPS++
@@ -668,17 +668,17 @@ function loop_statement(level, loops,    k, n, t, lo, hi, step, start, bound, a,
         if (k == 1) {
             bound = start - 3 + rnd(40)
             if (!signed(t) && bound < 0) bound = 0
-            print indent(level) "let mut w" saved ": " t " = " start ";"
+            print indent(level) "var w" saved ": " t " = " start ";"
             print indent(level) "while w" saved " < " bound " {"
         } else if (k == 2) {
             bound = signed(t) ? start - rnd(30) : step - 1 + rnd(5)
             if (start < bound) start = bound + rnd(30)
-            print indent(level) "let mut w" saved ": " t " = " start ";"
+            print indent(level) "var w" saved ": " t " = " start ";"
             print indent(level) "while w" saved " > " bound " {"
         } else {
             step = 1
             bound = start + rnd(25)
-            print indent(level) "let mut w" saved ": " t " = " start ";"
+            print indent(level) "var w" saved ": " t " = " start ";"
             print indent(level) "while w" saved " != " bound " {"
         }
         n = NV
@@ -712,7 +712,7 @@ function loop_statement(level, loops,    k, n, t, lo, hi, step, start, bound, a,
             if (rnd(2) || v < 0 || is_float(VT[v]) || is_float(AT[a])) print indent(level + 2) "sl" saved "[j] = " expr(AT[a], 1) ";"
             else print indent(level + 2) VN[v] " ^= sl" saved "[j] as " VT[v] ";"
         } else {
-            print indent(level + 1) "let mut j: u64 = 0;"
+            print indent(level + 1) "var j: u64 = 0;"
             print indent(level + 1) "while j < (sl" saved ".len" x ") as u64 {"
             print indent(level + 2) "sl" saved "[j] = " expr(AT[a], 1) ";"
             print indent(level + 2) "j += 1;"
@@ -767,27 +767,27 @@ function function_def(f,    i, n, t, line) {
         t = pick_type()
         FPT[f, i] = t
         if (i > 0) line = line ", "
-        line = line "mut p" i ": " t
+        line = line "p" i ": sink " t
         VN[NV] = "p" i; VT[NV] = t; VM[NV] = 1; NV++
     }
     print line ") -> u64 {"
     n = PRESSURE ? 12 + rnd(14) : 2 + rnd(4)
     for (i = 0; i < n; i++) {
         t = pick_type()
-        print "    let mut v" i ": " t " = " expr(t, 2) ";"
+        print "    var v" i ": " t " = " expr(t, 2) ";"
         VN[NV] = "v" i; VT[NV] = t; VM[NV] = 1; NV++
     }
     n = rnd(3)
     for (i = 0; i < n; i++) {
         t = pick_type()
         AN[NA] = "a" i; AT[NA] = t; AL[NA] = 2 + rnd(7)
-        print "    let mut a" i ": [" t "; " AL[NA] "] = [" literal(t) "; " AL[NA] "];"
+        print "    var a" i ": [" t "; " AL[NA] "] = [" literal(t) "; " AL[NA] "];"
         NA++
     }
     if (FEAT) feature_locals()
     statements(1, 0, PRESSURE ? 8 + rnd(10) : 4 + rnd(8))
     # The result mixes every variable and array element.
-    print "    let mut h: u64 = 1469598103934665603;"
+    print "    var h: u64 = 1469598103934665603;"
     for (i = 0; i < NV; i++) {
         if (is_float(VT[i])) print "    h = (h ^ ((" VN[i] " * 1000.0) as i64 as u64)) * 1099511628211;"
         else print "    h = (h ^ (" VN[i] " as u64)) * 1099511628211;"
@@ -934,7 +934,7 @@ function calls_defs(    g, i, line) {
             line = line "p" i ": " agg_type(GPT[g, i])
         }
         print line ") -> " agg_type(GR[g]) " {"
-        print "    let mut h: u64 = " (g + 3) ";"
+        print "    var h: u64 = " (g + 3) ";"
         for (i = 0; i < GNP[g]; i++) print "    h = (h ^ " agg_hash(GPT[g, i], "p" i) ") * 1099511628211;"
         print "    " agg_from(GR[g])
         print "}"

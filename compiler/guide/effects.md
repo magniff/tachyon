@@ -2,13 +2,16 @@
 
 Every function has an inferred effect set: what calling it may do. It
 is inferred from the body and everything the body calls, closures and
-generic instances included, and never depends on `-O`:
+generic instances included, and never depends on `-O`. A signature
+says two things: its conventions what a call may change of its
+arguments (`inout`) and keep (`sink`), its effects what it may do beyond
+them:
 
 | effect | comes from |
 |---|---|
 | `alloc(Gpa)`, `alloc(Arena)`, `alloc(extern)` | allocating from that allocator type (`extern`: C's malloc) |
 | `io` | a C function that reads or writes: `write`, `read`, stdio |
-| `global` | reading or writing a `static mut`, taking its address |
+| `global` | reading or writing a `static var`, taking its address |
 | `panic` | a checked index or slice, `unwrap`, `as E`, std's panic |
 | `diverge` | `while`, `loop`, recursion: it may not return (a counted `for` returns) |
 | `unsafe` | unsafe operations in its own body (not its callers') |
@@ -44,7 +47,7 @@ fn mid(a: i64, b: i64) -> i64 { a + (b - a) / 2 }
 fn sum(s: [i64]) -> i64 { s.iter().sum() }
 
 #[effects(alloc(Gpa), panic)]             // at most these
-fn grow(v: &mut Vec<i64>) { v.push(1); }
+fn grow(v: inout Vec<i64>) { v.push(1); }
 
 fn apply<F: Fn(i64) -> i64 + effects(panic)>(f: F, x: i64) -> i64 { f(x) }
 
@@ -59,10 +62,11 @@ fn main() -> i32 {
 ```
 
 - `#[pure]`: no `alloc`, `io`, `global` (it may panic, loop and write
-  through its pointer parameters); `#[no_alloc]`, `#[no_io]`,
+  through its `inout` parameters: they are in the signature, the call
+  marks them `&x`); `#[no_alloc]`, `#[no_io]`,
   `#[no_panic]` forbid one; `#[effects(...)]` lists what is allowed,
   `#[effects()]` nothing. Several attributes intersect.
-- On a trait's function (`#[pure] fn hash(self: &Self) -> u64;`) the
+- On a trait's function (`#[pure] fn hash(self) -> u64;`) the
   declaration binds every impl; std's `Eq`, `Ord` and `Hash` are pure.
 - On a C function in an `extern` block it is trusted, as its signature
   is. Undeclared, std's table applies (libm and `mem*`: none, `malloc`:

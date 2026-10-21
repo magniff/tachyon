@@ -8,9 +8,9 @@ counts are sorted by a hand-written `Ord`.
 std declares the methods of these three traits `#[pure]`:
 
 ```tach
-pub trait Eq { #[pure] fn eq(self: &Self, other: &Self) -> bool; }
-pub trait Ord { #[pure] fn cmp(self: &Self, other: &Self) -> i64; }
-pub trait Hash { #[pure] fn hash(self: &Self) -> u64; }
+pub trait Eq { #[pure] fn eq(self, other: Self) -> bool; }
+pub trait Ord { #[pure] fn cmp(self, other: Self) -> i64; }
+pub trait Hash { #[pure] fn hash(self) -> u64; }
 ```
 
 A declaration on a trait's method binds every impl of it, the program's
@@ -68,11 +68,11 @@ stdin):
 $ tachyonc edit apply <<'EOF'
 > @@ new before Word
 > // How many times hash was called.
-> static mut HASHES: i64 = 0;
+> static var HASHES: i64 = 0;
 > @@ Word::hash
->     fn hash(self: &Word) -> u64 {
+>     fn hash(self) -> u64 {
 >         unsafe { HASHES += 1; }
->         let mut h = 0xcbf29ce484222325u64;
+>         var h = 0xcbf29ce484222325u64;
 >         for b in self.text {
 >             h = (h ^ lower(b) as u64) * 0x100000001b3u64;
 >         }
@@ -97,7 +97,7 @@ A debugging print in `eq`:
 ```console
 $ tachyonc edit patch Word::eq --old '        if self.text.len() != other.text.len() {' --new '        println(f"comparing {self.text} and {other.text}");
 >         if self.text.len() != other.text.len() {'
-main.tach:30:5: error[effect] 'Word::eq' implements 'Eq::eq', which is #[pure], but it does io: 'println(f"comparing {self.text} and {other.t..' at main.tach:31:9 calls 'std::println' | help: return the data and let the caller print it, or remove #[pure] (the trait's) | try: tachyonc query effects Word::eq --why io  [edited: <crate::Word as Eq>::eq]
+main.tach:30:5: error[effect] 'Word::eq' implements 'Eq::eq', which is #[pure], but it does io: 'println(f"comparing {self.text} and {other.t..' at main.tach:31:9 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[pure] (the trait's) | try: tachyonc query effects Word::eq --why io  [edited: <crate::Word as Eq>::eq]
 error edit.breaks: 1 new error; nothing written
 try: tachyonc edit patch Word::eq --old '        if self.text.len() != other.text.len() {' --new '        println(f"comparing {self.text} and {other.text}");
         if self.text.len() != other.text.len() {' --no-check

@@ -118,7 +118,7 @@ plain `book_index(cat, id)` inside `catalog.tach`, and the qualified
 $ tachyonc refactor rename crate::catalog::find book_index --show
 renamed crate::catalog::find to book_index	catalog.tach	+3 -3 lines
 // catalog.tach:35
-35	pub fn book_index(cat: &Catalog, id: i64) -> Option<i64> {
+35	pub fn book_index(cat: Catalog, id: i64) -> Option<i64> {
 // catalog.tach:46
 46	    match book_index(cat, id) {
 // catalog.tach:62
@@ -130,7 +130,7 @@ renamed crate::members::find to member_index	2 files	+3 -3 lines
 // loans.tach:65
 65	            if let Some(i) = crate::members::member_index(ms, member) {
 // members.tach:34
-34	pub fn member_index(ms: &Members, id: i64) -> Option<i64> {
+34	pub fn member_index(ms: Members, id: i64) -> Option<i64> {
 ```
 
 ## 3. A local and a parameter

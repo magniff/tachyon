@@ -1,0 +1,323 @@
+// ---- Run-time CPU features (0.19) ----
+
+// std::arch::detect's word (docs/design/arch.md §2.5): bit b is set when
+// the running CPU has feature b (the compiler's numbering: FT_* in
+// compiler/src/arch/features.tach), bit 63 once the word is filled. A
+// detect the build cannot fold loads it and tests one bit
+// (back/isel/arch.tach; gen0/gen/arch.tach at -O0). Its sources follow,
+// one section per system (the compiler names the target's: arch_init_*
+// and arch_word_*, front/modules/stdsections.tach); each init takes the
+// build's features, which it need not ask the system about.
+//
+// Why there is no data race (no atomics before 0.21):
+// - A program with `main` fills the word once, as the first thing main
+//   does (back/isel/arch.tach; gen0 likewise), while it is the only
+//   thread: every later read, on any thread, comes after that write (a
+//   thread starts after what made it), and nothing writes it again.
+// - Code entered from C with no tachyon `main` (a library) fills it at its
+//   first detect (arch_word_*): two threads may both find 0 and both fill
+//   it. Each computes the same value from what the CPU and the system
+//   report, and stores it with one aligned 64-bit store, which AArch64 and
+//   x86-64 never tear (one str or mov from the compiler's own back end,
+//   which does not assume the absence of races: it never splits, repeats
+//   or invents a store to a static). A reader sees 0, and fills the word
+//   itself, or the whole word. That is a relaxed atomic load and store in
+//   0.21's terms, which the two become then, with the same instructions.
+// - TACHYON_ARCH_DISABLE (comma-separated feature names, or `all`) only
+//   clears bits, so no setting of it makes a missing instruction run: it
+//   makes detect take the fallback paths, for testing them.
+static var ARCH_FEATURES: u64 = 0;
+
+extern "C" {
+    #[link_name = "getenv"]
+    #[effects(global)]
+    fn arch_getenv(name: *u8) -> *u8;
+    #[link_name = "strlen"]
+    #[effects()]
+    fn arch_strlen(s: *u8) -> u64;
+}
+
+fn arch_bit(b: i64) -> u64 {
+    (1 as u64) << (b as u64)
+}
+
+// The word from what the system reports: TACHYON_ARCH_DISABLE's features
+// cleared (`a64`: unqualified names are AArch64's), then those whose
+// requirements are gone, stored once.
+fn arch_store(found: u64, a64: bool) -> u64 {
+    let w = arch_consistent(found & ~arch_disabled(a64)) | 0x8000000000000000;
+    unsafe {
+        ARCH_FEATURES = w;
+    }
+    w
+}
+
+// w without the features whose requirements it lacks (sha3 without sha2,
+// avx2 without avx), in the order of the implications, so that code under
+// `detect("sha3")` never runs where the sha2 it may use is missing.
+fn arch_consistent(w: u64) -> u64 {
+    // (feature, what it needs) pairs: neon fp; crc aarch64; aes sha2
+    // dotprod rdm fp16 i8mm bf16 neon; sha3 sha2; sse2 .. sse4.2 the one
+    // before; avx sse4.2; avx2 and fma avx
+    let pairs: [i64; 36] = [
+        0, 1, 2, 15, 3, 0, 4, 0, 6, 0, 7, 0, 9, 0, 10, 0, 11, 0, 5, 4, 17, 16, 18, 17, 19, 18,
+        20, 19, 21, 20, 29, 21, 30, 29, 31, 29,
+    ];
+    var out = w;
+    var k = 0;
+    while k < 36 {
+        if (out & arch_bit(pairs[k])) != 0 && (out & arch_bit(pairs[k + 1])) == 0 {
+            out &= ~arch_bit(pairs[k]);
+        }
+        k += 2;
+    }
+    out
+}
+
+fn arch_same(a: [u8], b: [u8]) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    for i in 0..a.len as i64 {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+    true
+}
+
+// The bits TACHYON_ARCH_DISABLE names: features (`aarch64.aes`,
+// `x86_64.aes` qualified), `all` every one.
+fn arch_disabled(a64: bool) -> u64 {
+    let p = unsafe { arch_getenv(c"TACHYON_ARCH_DISABLE") };
+    if p == 0 as *u8 {
+        return 0;
+    }
+    let s = unsafe { p[0..arch_strlen(p) as i64] };
+    var out: u64 = 0;
+    var i = 0;
+    while i <= s.len as i64 {
+        var j = i;
+        while j < s.len as i64 && s[j] != ',' {
+            j += 1;
+        }
+        out |= arch_named(s[i..j], a64);
+        i = j + 1;
+    }
+    out
+}
+
+fn arch_named(name: [u8], a64: bool) -> u64 {
+    if arch_same(name, "all") {
+        return 0x7fffffffffffffff;
+    }
+    let a64_names: [[u8]; 12] = ["neon", "fp", "crc", "aes", "sha2", "sha3", "dotprod", "rdm",
+        "lse", "fp16", "i8mm", "bf16"];
+    let x86_names: [[u8]; 16] = ["sse", "sse2", "sse3", "ssse3", "sse4.1", "sse4.2", "popcnt",
+        "lzcnt", "bmi1", "bmi2", "pclmulqdq", "aes", "sha", "avx", "avx2", "fma"];
+    var n = name;
+    var on_a64 = a64;
+    if n.len > 8 && arch_same(n[0..8], "aarch64.") {
+        n = n[8..n.len as i64];
+        on_a64 = true;
+    } else if n.len > 7 && arch_same(n[0..7], "x86_64.") {
+        n = n[7..n.len as i64];
+        on_a64 = false;
+    }
+    if on_a64 {
+        if arch_same(n, "asimd") {
+            return 1;
+        }
+        for k in 0..12 {
+            if arch_same(n, a64_names[k]) {
+                return arch_bit(k);
+            }
+        }
+    } else {
+        for k in 0..16 {
+            if arch_same(n, x86_names[k]) {
+                return arch_bit(16 + k);
+            }
+        }
+    }
+    0
+}
+
+// ---- CPU features on macOS (0.19) ----
+
+// AArch64 macOS: sysctl's hw.optional.arm.FEAT_*, only for the features
+// the build does not assume (a default build, apple-m1, asks for two).
+
+extern "C" {
+    #[link_name = "sysctlbyname"]
+    #[effects(global)]
+    fn arch_sysctlbyname(name: *u8, old: *u8, len: *u64, new: *u8, newlen: u64) -> i32;
+}
+
+// Whether sysctl `name` (an int) is 1.
+fn arch_sysctl(name: *u8) -> bool {
+    var value: [u32; 2] = [0; 2];
+    var len: [u64; 1] = [8];
+    let r = unsafe { arch_sysctlbyname(name, &value as *u8, &len as *u64, 0 as *u8, 0) };
+    r == 0 && value[0] == 1
+}
+
+// Fills the word (`known`: the build's features): before main, or at a
+// library's first detect.
+fn arch_init_macos(known: u64) -> u64 {
+    var found: u64 = known | arch_bit(15) | arch_bit(0) | arch_bit(1);
+    // (bit, then the sysctls that must all be 1)
+    let names: [*u8; 13] = [
+        c"hw.optional.arm.FEAT_CRC32", c"hw.optional.arm.FEAT_AES", c"hw.optional.arm.FEAT_PMULL",
+        c"hw.optional.arm.FEAT_SHA256", c"hw.optional.arm.FEAT_SHA3",
+        c"hw.optional.arm.FEAT_SHA512", c"hw.optional.arm.FEAT_DotProd",
+        c"hw.optional.arm.FEAT_RDM", c"hw.optional.arm.FEAT_LSE", c"hw.optional.arm.FEAT_FP16",
+        c"hw.optional.arm.FEAT_I8MM", c"hw.optional.arm.FEAT_BF16", 0 as *u8,
+    ];
+    // (feature, its first name, how many)
+    let tests: [i64; 30] = [2, 0, 1, 3, 1, 2, 4, 3, 1, 5, 4, 2, 6, 6, 1, 7, 7, 1, 8, 8, 1, 9, 9, 1,
+        10, 10, 1, 11, 11, 1];
+    var k = 0;
+    while k < 30 {
+        if (found & arch_bit(tests[k])) == 0 {
+            var all = true;
+            for j in 0..tests[k + 2] {
+                if !arch_sysctl(names[tests[k + 1] + j]) {
+                    all = false;
+                }
+            }
+            if all {
+                found |= arch_bit(tests[k]);
+            }
+        }
+        k += 3;
+    }
+    arch_store(found, true)
+}
+
+// The word, filled at the first call (a library: no main filled it).
+fn arch_word_macos() -> u64 {
+    let w = unsafe { ARCH_FEATURES };
+    if w != 0 { w } else { arch_init_macos(0) }
+}
+
+// ---- CPU features on Linux (0.19) ----
+
+// AArch64 Linux: getauxval's AT_HWCAP and AT_HWCAP2.
+
+extern "C" {
+    #[link_name = "getauxval"]
+    #[effects(global)]
+    fn arch_getauxval(kind: u64) -> u64;
+}
+
+// Fills the word (`known`: the build's features): before main, or at a
+// library's first detect.
+fn arch_init_linux(known: u64) -> u64 {
+    let cap = unsafe { arch_getauxval(16) };
+    let cap2 = unsafe { arch_getauxval(26) };
+    // (HWCAP bits, all needed, then the feature: fp, asimd, crc32, aes and
+    // pmull, sha1 and sha2, sha3 and sha512, asimddp, asimdrdm, atomics,
+    // fphp and asimdhp)
+    let tests: [u64; 20] = [0x1, 1, 0x2, 0, 0x80, 2, 0x18, 3, 0x60, 4, 0x220000, 5, 0x100000, 6,
+        0x1000, 7, 0x100, 8, 0x600, 9];
+    var found: u64 = known | arch_bit(15);
+    var k = 0;
+    while k < 20 {
+        if (cap & tests[k]) == tests[k] {
+            found |= arch_bit(tests[k + 1] as i64);
+        }
+        k += 2;
+    }
+    // (HWCAP2: i8mm, bf16)
+    if (cap2 & 0x2000) != 0 {
+        found |= arch_bit(10);
+    }
+    if (cap2 & 0x4000) != 0 {
+        found |= arch_bit(11);
+    }
+    arch_store(found, true)
+}
+
+// The word, filled at the first call (a library: no main filled it).
+fn arch_word_linux() -> u64 {
+    let w = unsafe { ARCH_FEATURES };
+    if w != 0 { w } else { arch_init_linux(0) }
+}
+
+// ---- CPU features on x86-64 (0.19) ----
+
+// x86-64, either system: cpuid, and xgetbv for whether the system saves
+// the ymm registers (else no avx family: its state would be lost).
+
+extern "C" {
+    // (the compiler's run-time helpers, gen0/target.tach emit_arch_runtime)
+    #[link_name = "tachyon_arch_cpuid"]
+    #[effects()]
+    fn arch_cpuid(leaf: u32, sub: u32, out: *u32);
+    #[link_name = "tachyon_arch_xgetbv"]
+    #[effects()]
+    fn arch_xgetbv(index: u32) -> u64;
+}
+
+// Fills the word (`known`: the build's features): before main, or at a
+// library's first detect.
+fn arch_init_x86(known: u64) -> u64 {
+    var r: [u32; 4] = [0; 4];
+    unsafe { arch_cpuid(0, 0, &r as *u32); }
+    let max = r[0];
+    unsafe { arch_cpuid(1, 0, &r as *u32); }
+    let c1 = r[2];
+    let d1 = r[3];
+    var w: u64 = known | arch_bit(32);
+    // (register: 2 ecx, 3 edx; its bit; the feature: sse, sse2, sse3,
+    // ssse3, sse4.1, sse4.2, popcnt, pclmulqdq, aes)
+    let tests: [u32; 27] = [3, 25, 16, 3, 26, 17, 2, 0, 18, 2, 9, 19, 2, 19, 20, 2, 20, 21, 2,
+        23, 22, 2, 1, 26, 2, 25, 27];
+    var k = 0;
+    while k < 27 {
+        let reg = if tests[k] == 2 { c1 } else { d1 };
+        if (reg & ((1 as u32) << tests[k + 1])) != 0 {
+            w |= arch_bit(tests[k + 2] as i64);
+        }
+        k += 3;
+    }
+    // osxsave, then XCR0: the system saves xmm and ymm
+    let ymm = (c1 & 0x8000000) != 0 && (unsafe { arch_xgetbv(0) } & 6) == 6;
+    if ymm && (c1 & 0x10000000) != 0 {
+        w |= arch_bit(29);
+        if (c1 & 0x1000) != 0 {
+            w |= arch_bit(31);
+        }
+    }
+    if max >= 7 {
+        unsafe { arch_cpuid(7, 0, &r as *u32); }
+        let b7 = r[1];
+        if (b7 & 0x8) != 0 {
+            w |= arch_bit(24);
+        }
+        if (b7 & 0x100) != 0 {
+            w |= arch_bit(25);
+        }
+        if (b7 & 0x20000000) != 0 {
+            w |= arch_bit(28);
+        }
+        if ymm && (b7 & 0x20) != 0 {
+            w |= arch_bit(30);
+        }
+    }
+    unsafe { arch_cpuid(0x80000000, 0, &r as *u32); }
+    if r[0] >= 0x80000001 {
+        unsafe { arch_cpuid(0x80000001, 0, &r as *u32); }
+        if (r[2] & 0x20) != 0 {
+            w |= arch_bit(23);
+        }
+    }
+    arch_store(w, false)
+}
+
+// The word, filled at the first call (a library: no main filled it).
+fn arch_word_x86() -> u64 {
+    let w = unsafe { ARCH_FEATURES };
+    if w != 0 { w } else { arch_init_x86(0) }
+}

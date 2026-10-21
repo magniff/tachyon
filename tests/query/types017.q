@@ -4,8 +4,8 @@ $ items Shape
 # crate::Shape	types017/main.tach:3:10
 3	enum	pub enum Shape
 8	impl	impl Shape
-9	method	pub fn area(self: &Shape) -> i64
-16	method	pub fn name(self: &Shape) -> [u8]
+9	method	pub fn area(self) -> i64
+16	method	pub fn name(self) -> [u8]
 $ items Nothing
 error query.no-match: no module 'Nothing'
 try: tachyonc query items

@@ -10,8 +10,8 @@ use crate::base::diag::{
     err_int, err_str, err_sym, err_try_fmt,
 };
 use crate::front::ast::{
-    NODES, NODE_CHECKED, NODE_RAW, NODE_REF_MUT, NodeKind, REPR_UNION, child, list_begin, list_end,
-    list_push, new_node,
+    CONV_NEW, NODES, NODE_CHECKED, NODE_RAW, NODE_REF_MUT, NodeKind, REPR_UNION, child, list_begin,
+    list_end, list_push, new_node,
 };
 use crate::front::ast::NodeKind::{
     Arm, Array, Assign, Binary, Block, Bool, Break, CStr, Call, Cast, Char, Closure, Continue,
@@ -19,7 +19,7 @@ use crate::front::ast::NodeKind::{
     PatLit, Path, Range, Repeat, Return, Str, StructLit, Tuple, TupleField, TyArray, TyFn, TyName,
     TyNever, TyPtr, TySlice, TyTuple, TyUnit, Unary, Unit, VariantLit, VecOp, While,
 };
-use crate::front::check::{Res, is_std_named, lookup_local, type_error, type_error_got};
+use crate::front::check::{LOCALS, Res, is_std_named, lookup_local, type_error, type_error_got};
 use crate::front::check::args::misplaced_named_arg;
 use crate::front::check::assign::{check_assign, is_place};
 use crate::front::check::body::{
@@ -48,12 +48,14 @@ use crate::front::check::widen::{join_operands, takes_context};
 use crate::front::closures::check_closure;
 use crate::front::consteval::eval_array_len;
 use crate::front::contracts::desugar::desugar_call;
-use crate::front::distinct::{is_distinct_type, is_niche_alias, strip_distinct};
+use crate::front::distinct::{
+    STR_TYPE, is_distinct_type, is_niche_alias, is_view_distinct, strip_distinct,
+};
 use crate::front::lexer::{
     SUF_F32, SUF_I16, SUF_I32, SUF_I64, SUF_I8, SUF_ISIZE, SUF_NONE, SUF_U16, SUF_U32, SUF_U64,
     SUF_U8, SUF_USIZE, Tok,
 };
-use crate::front::modules::STD_MODULE;
+use crate::front::modules::{CUR_MOD, STD_MODULE, within_std};
 use crate::front::patterns::check_match;
 use crate::front::traits::{binary_op_trait, has_impl, negation_call, operator_call, std_trait};
 use crate::front::types::{
@@ -231,6 +233,10 @@ fn synth_cast(n: i64) -> i64 {
             if is_distinct_type(to_ty) && is_niche_alias(TYPES[to_ty].b) && from == from_ty {
                 return nonnull_cast(n, operand, to_ty);
             }
+            // (0.20) bytes become std's `str` only checked, outside std
+            if to_ty == STR_TYPE && from == from_ty && !within_std(CUR_MOD) {
+                bytes_as_str_error(n, operand);
+            }
             NODES[n] = NODES[operand];
             return to_ty;
         }
@@ -251,6 +257,19 @@ fn synth_cast(n: i64) -> i64 {
             unsafe_op(n, U_INT_PTR, c"casting an integer to a pointer is unsafe");
         }
         to_ty
+    }
+}
+
+// (0.20) `b as str` of bytes outside std: an error, a `str` being UTF-8
+// (str::from_utf8 checks it).
+fn bytes_as_str_error(n: i64, operand: i64) {
+    unsafe {
+        let text = SRC[NODES[operand].start..NODES[operand].end];
+        err_begin(NODES[n].start);
+        err_str(c"'as str' does not check that bytes are UTF-8");
+        err_help(c"a `str` is UTF-8: bytes become one through `str::from_utf8(b)` (a Result, Utf8Error when they are not); `String::from_utf8_lossy_in(b, gpa)` replaces what is not");
+        err_try_fmt(f"str::from_utf8({text})?");
+        err_end_soft();
     }
 }
 
@@ -417,6 +436,14 @@ fn synth_index(n: i64) -> i64 {
                 UNSAFE_DEPTH -= 1;
             }
         }
+        // (0.20) std's `str`: indexed as its bytes' slice (`s[i]` a u8), and
+        // a range of it is a `str` (`s[1..]`)
+        let mut text = 0;
+        if is_view_distinct(base_ty) {
+            text = base_ty;
+            base_ty = TYPES[base_ty].a;
+            base_kind = TyKind::Slice;
+        }
         if base_kind != TyKind::Array && base_kind != TyKind::Ptr && base_kind != TyKind::Slice {
             err_begin(NODES[base].start);
             err_str(c"cannot index type '");
@@ -464,6 +491,9 @@ fn synth_index(n: i64) -> i64 {
                 type_error(index, c"slicing a pointer needs an end: 'p[lo..hi]'");
             }
             NODES[index].ty = TY_UNIT;
+            if text != 0 {
+                return text;
+            }
             return slice_of(TYPES[base_ty].a);
         }
         check_index_type(index);
@@ -475,7 +505,7 @@ fn synth_index(n: i64) -> i64 {
 // slice: std's Vec and Buf.
 fn indexes_as_slice(t: i64) -> bool {
     unsafe {
-        STD_MODULE >= 0 && STRUCTS[TYPES[t].a].module == STD_MODULE
+        STD_MODULE >= 0 && within_std(STRUCTS[TYPES[t].a].module)
             && (is_std_named(t, c"Vec") || is_std_named(t, c"Buf"))
     }
 }
@@ -599,7 +629,24 @@ fn synth_field(n: i64) -> i64 {
         if (STRUCTS[s].repr & REPR_UNION) != 0 && (NODES[n].p & NODE_NO_READ) == 0 {
             unsafe_op(n, U_UNION, c"reading a field of a union is unsafe");
         }
-        (*struct_field(s, field)).ty
+        let fty = (*struct_field(s, field)).ty;
+        if (NODES[n].p & CONV_NEW) == 0 && is_ref(fty)
+            && crate::front::conv::field_is_access(s, field) {
+            // (0.20) an access field: `p.q` is `*p.q`, the value it designates
+            let inner = new_node(NodeKind::None, NODES[n].start, NODES[n].end);
+            NODES[inner] = NODES[n];
+            NODES[inner].p |= CONV_NEW | NODE_CHECKED;
+            NODES[inner].ty = fty;
+            NODES[n].kind = NodeKind::Unary;
+            NODES[n].op = Tok::Star;
+            NODES[n].a = 0;
+            NODES[n].b = inner;
+            NODES[n].count = 0;
+            NODES[n].list = 0;
+            NODES[n].p = 0;
+            return synth_expr(n);
+        }
+        fty
     }
 }
 
@@ -918,6 +965,9 @@ fn synth_unary(n: i64) -> i64 {
             return ty;
         }
         if op == Tok::Star {
+            if star_on_access(n, operand) {
+                return synth_expr(n);
+            }
             let ty = synth_expr(operand);
             // (0.17, issue #1: `(*f)(10)` on a fn value, C's habit: the
             // value is called as it is)
@@ -957,6 +1007,9 @@ fn synth_unary(n: i64) -> i64 {
                 // (0.17) `&s[a..b]`, `&mut a[..]`: a slice value is its own
                 // view; `&mut` makes it the exclusive `&mut [T]`
                 let flags = NODES[n].p;
+                // (0.20: the `&`, for `fix --only conventions`)
+                crate::front::conv::SLICE_AMPS.push(NODES[n].start);
+                crate::front::conv::SLICE_AMPS.push(NODES[operand].start);
                 NODES[n] = NODES[operand];
                 NODES[n].p |= flags & NODE_REF_MUT;
                 return if mutable { mut_slice_of(TYPES[ty].a) } else { ty };
@@ -978,6 +1031,33 @@ fn synth_unary(n: i64) -> i64 {
             return ptr_to(ty);
         }
         ref_to(ty, if mutable { REF_MUT } else { REF_SHARED })
+    }
+}
+
+// (0.20) `*x` where x is an access (a let or inout parameter, an `inout`
+// local): conv.rust, `*` is for raw pointers; n becomes x, the value.
+fn star_on_access(n: i64, operand: i64) -> bool {
+    unsafe {
+        // (only a `*` written in the source: the checker's own desugarings,
+        // an owned assignment's `*x`, make one of a use too)
+        if NODES[operand].kind != NodeKind::Ident || (NODES[operand].p & CONV_NEW) != 0
+            || NODES[n].start >= NODES[operand].start || SRC[NODES[n].start] != '*' {
+            return false;
+        }
+        let l = lookup_local(NODES[operand].a);
+        if l.is_none() || !LOCALS[l.unwrap()].access {
+            return false;
+        }
+        let text = SRC[NODES[operand].start..NODES[operand].end];
+        let b = buf_new();
+        buf_bytes(b, "'");
+        buf_bytes(b, text);
+        buf_bytes(b, "' is an access, used as its value: '");
+        buf_bytes(b, text);
+        buf_bytes(b, "' (`*` is for raw pointers)");
+        crate::front::conv::rust_spelling(NODES[n].start, NODES[operand].end, buf_slice(b), text);
+        NODES[n] = NODES[operand];
+        true
     }
 }
 
@@ -1017,7 +1097,10 @@ fn non_lvalue_error(n: i64, operand: i64) {
                 buf_bytes(t, SRC[NODES[operand].start..NODES[operand].end]);
                 buf_bytes(t, "; ");
                 buf_bytes(t, SRC[NODES[s].start..a]);
-                buf_bytes(t, if (NODES[n].p & NODE_REF_MUT) != 0 { "&mut " } else { "&" });
+                buf_bytes(t,
+                    if (NODES[n].p & NODE_REF_MUT) != 0 && crate::front::conv::LEGACY_ROOT {
+                        "&mut "
+                    } else { "&" });
                 buf_bytes(t, name);
                 buf_bytes(t, SRC[b..NODES[s].end]);
                 err_try_fmt(buf_slice(t));

@@ -22,12 +22,13 @@ In a program of your own:
 
 To add a std function or method.
 
-std is `compiler/std/*.tach`, one module `std`; `compiler/std/embed.sh`
-builds it into the compiler (`compiler/src/front/stdsrc.tach`).
+std is `compiler/std/`: the module `std` (`std.tach` and the files of
+`flat/`) and its modules (`std::fmt` in `fmt.tach`, `std::collections::hash_map`
+in `collections/hash_map.tach`); `compiler/std/embed.sh` builds it into the compiler (`compiler/src/front/stdsrc.tach`).
 
 1. Find where it goes: `tachyonc query similar std::trim` (or
    `Vec::swap`) prints its neighbours, with their files
-   (`compiler/std/io.tach:102`); `tachyonc query examples std-fn`.
+   (`compiler/std/flat/io.tach:28`); `tachyonc query examples std-fn`.
 2. Add it by name, next to its kin:
    `tachyonc edit insert --after std::trim < new.tach` (a method:
    `--after Vec::swap`). The edit is made in std's file and checked with

@@ -9,12 +9,12 @@ shapes.tach:30-39	perimeter, scale	ours 4 lines (HEAD)	theirs 3 lines (feature)
 $ query conflicts shapes.tach:12 --show
 // shapes.tach:10-17	Shape::grow
 // ours (HEAD), line 11:
-        (*self).w += by;
+        self.w += by;
 // base (base), line 13:
-        (*self).w = (*self).w + 1;
+        self.w = self.w + 1;
 // theirs (feature), lines 15-16:
-        (*self).w += by;
-        (*self).h += by;
+        self.w += by;
+        self.h += by;
 $ query conflicts main.tach shapes.tach:25
 main.tach:4-8	use	ours 1 line (HEAD)	theirs 1 line (feature)
 shapes.tach:22-27	area	ours 1 line (HEAD)	theirs 2 lines (feature)
@@ -59,7 +59,7 @@ try: tachyonc query conflicts main.tach:4 --show
 $ edit resolve Shape::grow --base --show
 resolved shapes.tach:10-17 (base)	shapes.tach	+0 -7 lines
 // shapes.tach:10
-10	        (*self).w = (*self).w + 1;
+10	        self.w = self.w + 1;
 note conflict.left: 2 conflict regions left in 2 files
 try: tachyonc query conflicts
 $ edit resolve nosuch --ours
@@ -92,8 +92,8 @@ pub struct Shape {
 }
 
 impl Shape {
-    pub fn grow(self: &mut Shape, by: i64) {
-        (*self).w = (*self).w + 1;
+    pub fn grow(inout self, by: i64) {
+        self.w = self.w + 1;
     }
 }
 

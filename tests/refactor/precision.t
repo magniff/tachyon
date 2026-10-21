@@ -4,8 +4,8 @@ $ edit patch sum_to --dry-run < $T/inputs/partial.patch
 --- a/calc.tach
 +++ b/calc.tach
 @@ -16 +16 @@
--    let mut total = 0;
-+    let mut total = 0 * n;
+-    var total = 0;
++    var total = 0 * n;
 @@ -18,0 +19 @@
 +        // (a term)
 ## --pairs FILE: the blocks from a file, no stdin, no shell quoting.
@@ -13,8 +13,8 @@ $ edit patch sum_to --dry-run --pairs $T/inputs/partial.patch
 --- a/calc.tach
 +++ b/calc.tach
 @@ -16 +16 @@
--    let mut total = 0;
-+    let mut total = 0 * n;
+-    var total = 0;
++    var total = 0 * n;
 @@ -18,0 +19 @@
 +        // (a term)
 $ edit patch sum_to --pairs nothing.patch
@@ -64,12 +64,12 @@ $ edit wrap sum_to --in '' --lines 17-21 --dry-run
 --- a/calc.tach
 +++ b/calc.tach
 @@ -17,4 +17,6 @@
--    let mut i = 1;
+-    var i = 1;
 -    while i <= n {
 -        total += i;
 -        i += 1;
 +    {
-+        let mut i = 1;
++        var i = 1;
 +        while i <= n {
 +            total += i;
 +            i += 1;
@@ -90,14 +90,14 @@ $ edit wrap calc.tach:19 --in unsafe --dry-run
 --- a/calc.tach
 +++ b/calc.tach
 @@ -18,5 +18,8 @@
--    let mut total = 0;
--    let mut i = 1;
+-    var total = 0;
+-    var i = 1;
 -    while i <= n {
 -        total += i;
 -        i += 1;
 +    unsafe {
-+        let mut total = 0;
-+        let mut i = 1;
++        var total = 0;
++        var i = 1;
 +        while i <= n {
 +            total += i;
 +            i += 1;

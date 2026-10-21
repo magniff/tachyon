@@ -19,9 +19,10 @@ use crate::front::check::names::{help_near_item, import_path_for};
 use crate::front::lexer::is_ident_byte;
 use crate::front::modules::{
     CUR_MOD, C_MODULE, MODULES, MODULE_COUNT, STD_MODULE, child_module, file_of_pos, is_within,
-    module_of, qualified_if_known, qualify,
+    item_key_if_known, module_of, qualified_if_known, qualify, within_std,
 };
 use crate::front::parser::items::ITEM_PUBLIC;
+use crate::front::stdtree::STD_TREE;
 use crate::front::types::{ENUMS, SYM_ENUM, VARIANTS, find_variant, item_node_of};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::fix::note_private;
@@ -212,7 +213,9 @@ pub fn resolve_use_of(u: i64) {
                 if binding_kind(result) == B_PRIVATE {
                     access_error(result, NODES[id].start, name);
                 }
-                if result == B_NONE {
+                // (0.20: std's built-in text is read in sections, and an
+                // import of std's from a section not read imports nothing)
+                if result == B_NONE && !(within_std(m) && STD_TREE == 0 as *u8) {
                     unresolved_import(id, path, prefix, m);
                 }
             } else if binding_kind(prefix) == B_ITEM && SYM_ENUM[binding_value(prefix)] != 0 {
@@ -420,6 +423,35 @@ pub fn lookup_name(m: i64, name: i64, from: i64) -> i64 {
         SCOPE_CACHE.put(k, result + 1);
     }
     result
+}
+
+// (0.20) The key of the item `std::NAME` names, -1 for none: std's own
+// item, else what std re-exports under that name (std's items are in its
+// modules, and `std::NAME` keeps naming them); before the imports are
+// read, the item of that name in the first of std's modules that has one.
+pub fn std_item_key(name: i64) -> i64 {
+    unsafe {
+        if STD_MODULE < 0 {
+            return -1;
+        }
+        let own = item_key_if_known(STD_MODULE, name);
+        if own >= 0 && item_node_of(own) != 0 {
+            return own;
+        }
+        if SCOPES_READY {
+            let b = lookup_quiet(STD_MODULE, name, STD_MODULE);
+            return if binding_kind(b) == B_ITEM { binding_value(b) } else { -1 };
+        }
+        for m in 0..MODULE_COUNT {
+            if m != STD_MODULE && within_std(m) {
+                let k = item_key_if_known(m, name);
+                if k >= 0 && item_node_of(k) != 0 {
+                    return k;
+                }
+            }
+        }
+        -1
+    }
 }
 
 // What `name` stands for in module m, seen from `from`, where a value or a
@@ -711,13 +743,17 @@ static mut SYM_PRELUDE: *i64 = 0 as *i64;
 // (front::modules::uses_prelude015). (0.18) The one bound of the prelude's
 // tables (its names here, PRELUDE_DECLARED): a name is added to
 // prelude_name's list and counted here.
-pub const PRELUDE_COUNT: i64 = 66;
+pub const PRELUDE_COUNT: i64 = 69;
 
 pub const PRELUDE_LATE: i64 = 18;
 
 // The index of `panic` (0.17), which is std's safe `panic_str`, not the
 // `unsafe fn panic` of a C string that `std::panic` names.
 const PRELUDE_PANIC: i64 = 49;
+
+// The index of `str` (0.20), and of `String` and `to_string_in` after it:
+// std::string's, not std's (where `str` is the module std::str).
+const PRELUDE_STR: i64 = 66;
 
 static mut PRELUDE_INTERNED: bool = false;
 
@@ -728,7 +764,8 @@ fn prelude_name(i: i64) -> i64 {
         // 0.17: what Rust has without a `use` or programs reach for first:
         // text and input, Buf, HashMap, sorting, cmp_of/eq_of, Fmt, a safe
         // panic and unreachable; the stable sorts; value semantics: Drop,
-        // drop, forget, needs_drop, Copy; 0.18: the assertions; 0.18.1: the heaps)
+        // drop, forget, needs_drop, Copy; 0.18: the assertions; 0.18.1: the heaps;
+        // 0.20: text, str and String, std::string's: prelude_lookup)
         let names: [*u8; PRELUDE_COUNT] = [c"Option", c"Some", c"None", c"Result", c"Ok", c"Err",
             c"Vec", c"print", c"println", c"Add", c"Sub", c"Mul", c"Div", c"Neg", c"Eq", c"Ord",
             c"Hash", c"Iterator", c"Display", c"Debug", c"Clone", c"From", c"Into", c"format",
@@ -738,7 +775,8 @@ fn prelude_name(i: i64) -> i64 {
             c"split_whitespace_in", c"cmp_of", c"eq_of", c"Fmt", c"sort", c"sort_by", c"panic",
             c"unreachable", c"sort_stable", c"sort_stable_by", c"sort_stable_in",
             c"sort_stable_by_in", c"Drop", c"drop", c"forget", c"needs_drop", c"Copy", c"assert",
-            c"assert_eq", c"assert_ne", c"debug_assert", c"BinaryHeap", c"MinHeap"];
+            c"assert_eq", c"assert_ne", c"debug_assert", c"BinaryHeap", c"MinHeap", c"str",
+            c"String", c"to_string_in"];
         unsafe {
             sym_table(&SYM_PRELUDE);
             for k in 0..PRELUDE_COUNT {
@@ -786,6 +824,13 @@ fn prelude_lookup(name: i64, m: i64, depth: i64) -> i64 {
                 return B_NONE;
             }
             return enum_variant_binding(SYM_ENUM[binding_value(e)] - 1, name);
+        }
+        if k >= PRELUDE_STR && k <= PRELUDE_STR + 2 {
+            let sm = lookup_uncached(STD_MODULE, intern_c(c"string"), m, depth + 1);
+            if binding_kind(sm) != B_MODULE {
+                return B_NONE;
+            }
+            return lookup_uncached(binding_value(sm), name, m, depth + 1);
         }
         if k == PRELUDE_PANIC {
             return lookup_uncached(STD_MODULE, intern_c(c"panic_str"), m, depth + 1);
@@ -883,17 +928,19 @@ pub fn resolve_path(m: i64, path: i64, count: i64, entry: i64) -> i64 {
 // the root its try: lines.
 pub fn sibling_module(m: i64, name: i64, seg: i64, path: i64, entry: i64) -> i64 {
     unsafe {
-        if m == 0 {
+        // (0.20: std's root is std, not the program's)
+        if m == 0 || m == STD_MODULE {
             return -1;
         }
+        let root = if within_std(m) { STD_MODULE } else { 0 };
         let parent = MODULES[m].parent;
         let mut sibling = -1;
         if parent >= 0 {
             sibling = child_module(parent, name);
         }
         let mut top = -1;
-        if parent != 0 {
-            top = child_module(0, name);
+        if parent != root {
+            top = child_module(root, name);
         }
         if sibling == STD_MODULE || sibling == C_MODULE {
             sibling = -1;
@@ -1064,8 +1111,8 @@ fn path_fix(at: i64, name: i64, full: [u8]) {
 }
 
 // (0.17) The help of a path through `std::name` that std does not have,
-// `next` the name after it (or 0), seen from module m: tachyon's std is
-// one module, so a Rust path (`std::collections::HashMap`, `std::io`) is
+// `next` the name after it (or 0), seen from module m: (0.20) std has a few
+// of Rust's modules and every item at `std::NAME` too, so a Rust path (`std::collections::HashMap`, `std::io`) is
 // std's item itself (`std::HashMap`, the `use` line as try:), or what
 // replaces that module (`in_use`: the path is a `use` item's; else the
 // try: is the path to write). Whether there was a help.
@@ -1074,7 +1121,7 @@ pub fn help_std_path(name: i64, next: i64, m: i64, in_use: bool) -> bool {
         let t = SYMS[name].text;
         if next != 0 && STD_MODULE >= 0
             && binding_kind(lookup_quiet(STD_MODULE, next, m)) == B_ITEM {
-            err_help_fmt(f"tachyon's std is one module, without '{t}': its items are `std::NAME`");
+            err_help_fmt(f"tachyon's std has no module '{t}': std's items are all `std::NAME` too");
             if in_use {
                 err_try_fmt(f"use std::{sym_text(next)};");
             } else {
@@ -1083,14 +1130,14 @@ pub fn help_std_path(name: i64, next: i64, m: i64, in_use: bool) -> bool {
             return true;
         }
         if t == "io" {
-            err_help(c"tachyon's std is one module: stdin is `read_line(&mut buf)` (a line), `read_stdin_in(gpa)` (all of it, a Buf), `Scanner` (tokens); output is `print`, `println`");
+            err_help(c"stdin is `read_line(&buf)` (a line), `read_stdin_in(gpa)` (all of it, a Buf), `Scanner` (tokens); output is `print`, `println`");
             err_try(c"use std::{Scanner, read_line, read_stdin_in};");
         } else if t == "collections" {
-            err_help(c"tachyon's std is one module: `HashMap<K, V>` (a set: `HashMap<K, bool>`), `Vec<T>` (in the prelude)");
+            err_help(c"`HashMap<K, V>` (a set: `HashMap<K, bool>`), `Vec<T>` (in the prelude)");
             err_try(c"use std::HashMap;");
         } else if t == "fmt" {
             err_help(
-                c"tachyon's std is one module: `Display` (`fn fmt(self: *T, f: *Fmt)`), `Fmt`");
+                c"`Display` (`fn fmt(self: *T, f: *Fmt)`), `Fmt`");
             err_try(c"use std::{Display, Fmt};");
         } else if t == "string" || t == "str" || t == "char" {
             err_help(c"text is `[u8]` (string literals are one), built in a `std::Buf`; std's text functions are `std::trim`, `std::split_in`, `std::parse_int`, ...");
@@ -1103,7 +1150,9 @@ pub fn help_std_path(name: i64, next: i64, m: i64, in_use: bool) -> bool {
             || t == "boxed" || t == "rc" || t == "cell" || t == "sync" || t == "thread"
             || t == "time" || t == "path" || t == "slice" || t == "error" || t == "core"
             || t == "alloc" {
-            err_help(c"tachyon's std is one module, without submodules: its items are `std::NAME` (`tachyonc query items std` lists them)");
+            // (0.20: std's modules are iter, ops, slice, collections, io, fmt,
+            // num, convert and clone)
+            err_help(c"tachyon's std has no such module: std's items are all `std::NAME` too (`tachyonc query items std` lists them)");
         } else {
             return false;
         }

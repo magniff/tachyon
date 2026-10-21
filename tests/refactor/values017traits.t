@@ -7,8 +7,8 @@
 ## longer builds; the output after it is the one 0.16's semantics gave,
 ## recorded here before 0.18.1: `16 9 shape rect true 10 3 true false $7`. What the fix keeps raw is wrapped in
 ## `unsafe` by `fix --only unsafe`, the second try: of the error.)
-$ fix --values
-fixed 9 parameters to &mut T, 17 parameters to &T, 4 arguments	main.tach	+24 -23 lines
+$ fix --values --syntax=mixed
+fixed 9 parameters to &mut T, 17 parameters to &T, 2 arguments	main.tach	+22 -22 lines
 % cat main.tach
 trait Shape {
     fn area(self: &Self) -> i64;
@@ -65,14 +65,17 @@ fn main() {
     let x = Key { k: 1 };
     let y = Key { k: 2 };
     let m = Money { c: 7 };
-    println(
-        f"{total(&a)} {total(&r)} {a.name()} {r.name()} {a.same(&b)} {twice(&mut fx)} {twice(&mut lv)} {x < y} {x == y} {m}");
+    println(f"{total(&a)} {total(&r)} {a.name()} {r.name()} {a.same(&b)} {twice(&fx)} {twice(&lv)} {x < y} {x == y} {m}");
 }
-$ fix --only unsafe
+$ fix --only unsafe --syntax=mixed
 note fix.none: nothing to fix
+$ fix --values --syntax=mixed
+note fix.none: nothing to fix
+## (0.20) Then 0.20's spelling, `fix --only conventions` (its 0.19 input
+## read --syntax=mixed): the chain 0.16 -> 0.19 -> 0.20 prints what 0.16 did.
+$ fix --only conventions --syntax=mixed
+fixed 6 parameters to let, 3 parameters to inout, 17 receivers, 2 '&mut e's to '&e', 3 '&e's to a let, 4 'let mut's / 'mut x's to var	main.tach	+28 -27 lines
 $ main.tach -o prog
 ok: built prog
 % ./prog
 16 9 shape rect true 10 3 true false $7
-$ fix --values
-note fix.none: nothing to fix

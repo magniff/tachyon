@@ -102,7 +102,7 @@ $ cat > old.tach <<'EOF'
 > use std::Buf;
 >
 > fn shout(words: [[u8]]) -> Buf {
->     let mut b = Buf::new();
+>     var b = Buf::new();
 >     for w in words {
 >         if b.len() > 0 {
 >             b.push_str(" ");
@@ -121,7 +121,7 @@ $ cat > old.tach <<'EOF'
 > }
 > EOF
 $ tachyonc check old.tach
-old.tach:4:17: error[type error] allocation is explicit: pass an allocator (try: Buf::new_in(gpa)) | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'shout' and pass it down | try: tachyonc fix --only alloc016 old.tach
+old.tach:4:13: error[type error] allocation is explicit: pass an allocator (try: Buf::new_in(gpa)) | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'shout' and pass it down | try: tachyonc fix --only alloc016 old.tach
 old.tach:16:28: error[type error] allocation is explicit: pass an allocator (try: split_whitespace_in(s, gpa)) | help: main takes the allocator: `fn main(gpa: Gpa)`, passed down as a parameter | try: tachyonc fix --only alloc016 old.tach
 [exit 1]
 ```
@@ -137,9 +137,9 @@ $ tachyonc fix --only alloc016 --dry-run old.tach
 +++ b/old.tach
 @@ -3,2 +3,2 @@
 -fn shout(words: [[u8]]) -> Buf {
--    let mut b = Buf::new();
+-    var b = Buf::new();
 +fn shout(words: [[u8]], gpa: Gpa) -> Buf {
-+    let mut b = Buf::new_in(gpa);
++    var b = Buf::new_in(gpa);
 @@ -15,3 +15,3 @@
 -fn main() -> i32 {
 -    let words: Vec<[u8]> = std::split_whitespace("hello explicit allocation");
@@ -202,7 +202,7 @@ does.
 
 ```console
 $ cat > forge.tach <<'EOF'
-> static mut CACHE: Vec<i64> = Vec::new_in(Gpa {});
+> static var CACHE: Vec<i64> = Vec::new_in(Gpa {});
 >
 > fn main() -> i32 {
 >     let mine = Gpa {};

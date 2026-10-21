@@ -1,0 +1,283 @@
+// std's UTF-8 core against a model (0.20; 0.18's property tests stand in
+// for later): random byte strings from a seeded xorshift, mostly UTF-8
+// with damage (cut sequences, stray bytes, surrogates, overlongs), each
+// checked against a decoder written from Unicode's Table 3-7: validation,
+// lossy decoding (lossy_next, decode_into with any room, Utf8Decoder over
+// any split of the stream), counting, reverse decoding, boundaries and
+// the ASCII prefixes, at every alignment the slices happen to have.
+use std::str::{
+    Utf8Decoder, ascii_prefix_len, ascii_printable_prefix_len, ceil_char_boundary, count_chars,
+    decode_into, encode_utf8, floor_char_boundary, is_char_boundary, lossy_next, next_code_point,
+    next_code_point_reverse, validate_utf8,
+};
+
+struct Rng { s: u64 }
+
+impl Rng {
+    fn next(inout self) -> u64 {
+        var x = self.s;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.s = x;
+        x
+    }
+
+    fn below(inout self, n: i64) -> i64 {
+        (self.next() % n as u64) as i64
+    }
+}
+
+// The model: the code point at v[i] and the bytes it covers; U+FFFD and
+// the maximal subpart for an ill-formed sequence; `cut` when the subpart
+// runs to the end of v.
+fn model_next(v: [u8], i: i64) -> (u32, i64, bool) {
+    let b0 = v[i];
+    if b0 < 0x80 {
+        return (b0 as u32, 1, false);
+    }
+    var need = 0;
+    var lo: u8 = 0x80;
+    var hi: u8 = 0xbf;
+    var cp: u32 = 0;
+    if b0 >= 0xc2 && b0 <= 0xdf {
+        need = 1;
+        cp = (b0 & 0x1f) as u32;
+    } else if b0 >= 0xe0 && b0 <= 0xef {
+        need = 2;
+        cp = (b0 & 0x0f) as u32;
+        if b0 == 0xe0 { lo = 0xa0; }
+        if b0 == 0xed { hi = 0x9f; }
+    } else if b0 >= 0xf0 && b0 <= 0xf4 {
+        need = 3;
+        cp = (b0 & 0x07) as u32;
+        if b0 == 0xf0 { lo = 0x90; }
+        if b0 == 0xf4 { hi = 0x8f; }
+    } else {
+        return (0xfffd, 1, false);
+    }
+    var k = 1;
+    for j in 0..need {
+        if i + k >= v.len {
+            return (0xfffd, k, true);
+        }
+        let b = v[i + k];
+        let (l, h) = if j == 0 { (lo, hi) } else { (0x80u8, 0xbfu8) };
+        if b < l || b > h {
+            return (0xfffd, k, false);
+        }
+        cp = (cp << 6) | (b & 0x3f) as u32;
+        k += 1;
+    }
+    (cp, k, false)
+}
+
+// The model's decoding of all of v (cps), and where the first error is
+// (-1: none), its length (0: cut at the end).
+fn model_decode(v: [u8], cps: inout Vec<u32>) -> (i64, i64) {
+    var i = 0;
+    var err = -1;
+    var err_len = 0;
+    while i < v.len {
+        let (cp, n, cut) = model_next(v, i);
+        let bad = cp == 0xfffd && !(n == 3 && v[i] == 0xef && v[i + 1] == 0xbf && v[i + 2] == 0xbd);
+        if bad && err < 0 {
+            err = i;
+            err_len = if cut { 0 } else { n };
+        }
+        cps.push(cp);
+        i += n;
+    }
+    (err, err_len)
+}
+
+// A random text: pieces of UTF-8 of every length class, and damage.
+fn make(r: inout Rng, out: inout Vec<u8>, n: i64) {
+    var buf = [0u8; 4];
+    while out.len() < n {
+        let k = r.below(100);
+        if k < 40 {
+            out.push((0x20 + r.below(95)) as u8);
+        } else if k < 45 {
+            out.push(r.below(0x20) as u8);
+        } else if k < 80 {
+            // a scalar value of a random length class
+            let c = r.below(4);
+            let cp = if c == 0 { r.below(0x80) } else if c == 1 { 0x80 + r.below(0x780) }
+                else if c == 2 { 0x800 + r.below(0xf800) } else { 0x10000 + r.below(0x100000) };
+            let m = encode_utf8(cp as u32, &buf);
+            // (sometimes cut short)
+            let take = if r.below(20) == 0 { 1 + r.below(m) } else { m };
+            for j in 0..take {
+                out.push(buf[j]);
+            }
+        } else if k < 88 {
+            out.push((0x80 + r.below(0x80)) as u8);
+        } else if k < 92 {
+            // a surrogate, an overlong form, or above 0x10FFFF
+            let w = r.below(3);
+            if w == 0 { out.push(0xed); out.push((0xa0 + r.below(0x20)) as u8); out.push(0x80); }
+            else if w == 1 { out.push(0xc0 + r.below(2) as u8); out.push(0xaf); }
+            else { out.push(0xf4); out.push(0x90); out.push(0x80); out.push(0x80); }
+        } else {
+            out.push(r.below(256) as u8);
+        }
+    }
+}
+
+fn main(gpa: Gpa) -> i32 {
+    var r = Rng { s: 0x9e3779b97f4a7c15 };
+    var text: Vec<u8> = Vec::new_in(gpa);
+    var want: Vec<u32> = Vec::new_in(gpa);
+    var got: Vec<u32> = Vec::with_capacity_in(4096, gpa);
+    for _ in 0..4096 {
+        got.push(0);
+    }
+    var cases = 0;
+    var valid = 0;
+    var fails = 0;
+    for round in 0..30000 {
+        text.clear();
+        want.clear();
+        let n = if round % 100 == 0 { 2000 } else { r.below(60) };
+        make(&r, &text, n);
+        // (a slice at a random offset: every alignment)
+        let off = r.below(8);
+        let all = text.as_slice();
+        let v = if off <= all.len { all[off..all.len] } else { all };
+        let (err, err_len) = model_decode(v, &want);
+        cases += 1;
+
+        // validation
+        match validate_utf8(v) {
+            Ok(()) => {
+                if err
+                    >= 0 {
+                    fails += 1; println(f"round {round}: valid, model says error at {err}");
+                }
+            }
+            Err(e) => {
+                let el = match e.error_len() { Some(x) => x, None => 0 };
+                if e.valid_up_to() != err || el != err_len {
+                    fails += 1;
+                    println(f"round {round}: {e:?}, model {err} {err_len}");
+                }
+            }
+        }
+
+        // lossy_next
+        var i = 0;
+        var k = 0;
+        while i < v.len {
+            let cp = lossy_next(v, &i);
+            if k >= want.len()
+                || cp
+                != want[k] { fails += 1; println(f"round {round}: lossy_next at {k}"); break; }
+            k += 1;
+        }
+        if k != want.len() { fails += 1; println(f"round {round}: lossy_next count"); }
+
+        // decode_into with random room, then lossy_next for a cut end
+        var i = 0;
+        var k = 0;
+        while i < v.len {
+            let room = 1 + r.below(20);
+            let (c, m) = decode_into(v[i..v.len], &got.as_slice()[0..room]);
+            for j in 0..m {
+                if k + j >= want.len()
+                    || got[j] != want[k + j] { fails += 1; println(f"round {round}: decode_into"); }
+            }
+            i += c;
+            k += m;
+            if c == 0 && m == 0 {
+                // (an incomplete sequence at the end)
+                got[0] = lossy_next(v, &i);
+                if k >= want.len()
+                    || got[0]
+                    != want[k] { fails += 1; println(f"round {round}: decode_into tail"); }
+                k += 1;
+                if i != v.len { fails += 1; println(f"round {round}: decode_into stopped early"); }
+            }
+        }
+        if k
+            != want.len() {
+            fails += 1; println(f"round {round}: decode_into count {k} {want.len()}");
+        }
+
+        // a stream decoder over random splits with random room
+        var d = Utf8Decoder::new();
+        var i = 0;
+        var k = 0;
+        while i < v.len {
+            let end = i + 1 + r.below(9);
+            let piece = v[i..(if end > v.len { v.len } else { end })];
+            var p = 0;
+            loop {
+                let room = r.below(6);
+                let (c, m) = d.feed(piece[p..piece.len], &got.as_slice()[0..room]);
+                for j in 0..m {
+                    if k + j >= want.len()
+                        || got[j]
+                        != want[k + j] { fails += 1; println(f"round {round}: stream at {k + j}"); }
+                }
+                k += m;
+                p += c;
+                if p >= piece.len { break; }
+            }
+            i += piece.len;
+        }
+        let m = d.finish(&got.as_slice()[0..1]);
+        if m == 1 {
+            if k >= want.len()
+                || got[0] != want[k] { fails += 1; println(f"round {round}: finish"); }
+            k += 1;
+        }
+        if k != want.len() { fails += 1; println(f"round {round}: stream count {k} {want.len()}"); }
+
+        // ASCII prefixes
+        var a = 0;
+        while a < v.len && v[a] < 0x80 { a += 1; }
+        var pr = 0;
+        while pr < v.len && v[pr] >= 0x20 && v[pr] <= 0x7e { pr += 1; }
+        if ascii_prefix_len(v) != a || ascii_printable_prefix_len(v) != pr {
+            fails += 1;
+            println(f"round {round}: prefixes");
+        }
+
+        if err < 0 {
+            valid += 1;
+            if count_chars(v) != want.len() { fails += 1; println(f"round {round}: count_chars"); }
+            // backwards, the same code points reversed
+            var q = v.len;
+            var k = want.len();
+            while let Some(cp) = next_code_point_reverse(v, &q) {
+                k -= 1;
+                if k < 0 || cp != want[k] { fails += 1; println(f"round {round}: reverse"); break; }
+            }
+            if k != 0 { fails += 1; println(f"round {round}: reverse count"); }
+            var p = 0;
+            var k = 0;
+            while let Some(cp) = next_code_point(v, &p) {
+                if cp != want[k] { fails += 1; println(f"round {round}: forward"); break; }
+                k += 1;
+            }
+            // boundaries
+            for j in 0..v.len + 1 {
+                let b = j == 0 || j == v.len || v[j] < 0x80 || v[j] >= 0xc0;
+                var f = j;
+                while f > 0 && f < v.len && v[f] >= 0x80 && v[f] < 0xc0 { f -= 1; }
+                var c = j;
+                while c < v.len && v[c] >= 0x80 && v[c] < 0xc0 { c += 1; }
+                if is_char_boundary(v, j) != b || floor_char_boundary(v, j) != f
+                    || ceil_char_boundary(v, j) != c {
+                    fails += 1;
+                    println(f"round {round}: boundary {j}");
+                }
+            }
+        }
+    }
+    println(f"{cases} cases, {valid} valid, {fails} failures");
+    if fails == 0 { 0 } else { 1 }
+}
+
+// EXPECT: 30000 cases, 4433 valid, 0 failures

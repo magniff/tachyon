@@ -1,0 +1,147 @@
+// std's grapheme clusters (0.20, compiler/std/unicode/grapheme.tach)
+// against Unicode's own GraphemeBreakTest.txt (tests/std/unicode/, the
+// version of tools/unicode/ucd.lock), every line: GraphemeState fed the
+// code points one at a time, and next_grapheme_end, Graphemes and
+// count_graphemes over the line's UTF-8.
+// ARGS: @ROOT@/tests/std/unicode/GraphemeBreakTest.txt
+import "stdio.h" as c;
+
+use std::trim;
+use std::str::encode_utf8;
+use std::unicode::{GraphemeState, count_graphemes, graphemes, next_grapheme_end};
+
+fn read_all(path: *u8, gpa: Gpa) -> Buf {
+    var text = Buf::new_in(gpa);
+    let f = unsafe { c::fopen(path, c"rb") };
+    if f == 0 as *c::FILE {
+        return text;
+    }
+    var chunk = [0u8; 65536];
+    loop {
+        let n = unsafe { c::fread(&chunk[0], 1, 65536, f) } as i64;
+        if n <= 0 {
+            break;
+        }
+        text.push_str(chunk[0..n]);
+    }
+    unsafe { c::fclose(f); }
+    text
+}
+
+fn hex(s: [u8]) -> i64 {
+    var v = 0;
+    for i in 0..s.len {
+        let b = s[i];
+        let d = if b >= '0' && b <= '9' { (b - '0') as i64 } else { (b - 'A') as i64 + 10 };
+        v = v * 16 + d;
+    }
+    v
+}
+
+fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
+    if argc < 2 {
+        return 2;
+    }
+    let text = unsafe { read_all(argv[1], gpa) };
+    let t = text.as_slice();
+    var cps: Vec<u32> = Vec::new_in(gpa);
+    // breaks[k]: a boundary before cps[k] (k = cps.len(): the end)
+    var breaks: Vec<bool> = Vec::new_in(gpa);
+    var utf8 = Buf::new_in(gpa);
+    var offsets: Vec<i64> = Vec::new_in(gpa);
+    var lines = 0;
+    var fails = 0;
+    var from = 0;
+    for i in 0..t.len + 1 {
+        if i < t.len && t[i] != '\n' {
+            continue;
+        }
+        var line = t[from..i];
+        from = i + 1;
+        for k in 0..line.len {
+            if line[k] == '#' {
+                line = line[0..k];
+                break;
+            }
+        }
+        line = trim(line);
+        if line.len == 0 {
+            continue;
+        }
+        cps.clear();
+        breaks.clear();
+        // tokens: ÷ (C3 B7), × (C3 97), hex code points
+        var k = 0;
+        while k < line.len {
+            if line[k] == ' ' || line[k] == '\t' {
+                k += 1;
+            } else if line[k] == 0xc3 && k + 1 < line.len {
+                breaks.push(line[k + 1] == 0xb7);
+                k += 2;
+            } else {
+                var e = k;
+                while e < line.len && line[e] != ' ' && line[e] != '\t' {
+                    e += 1;
+                }
+                cps.push(hex(line[k..e]) as u32);
+                k = e;
+            }
+        }
+        lines += 1;
+        if breaks.len() != cps.len() + 1 {
+            println(f"line {lines}: cannot read it");
+            fails += 1;
+            continue;
+        }
+        // one code point at a time
+        var st = GraphemeState::new();
+        var bad = false;
+        for j in 0..cps.len() {
+            if st.push(cps[j]) != breaks[j] {
+                bad = true;
+            }
+        }
+        // the same over UTF-8
+        utf8.clear();
+        offsets.clear();
+        var e = [0u8; 4];
+        for j in 0..cps.len() {
+            offsets.push(utf8.len());
+            let n = encode_utf8(cps[j], &e);
+            utf8.push_str(e[0..n]);
+        }
+        offsets.push(utf8.len());
+        let s = utf8.as_slice();
+        var want = 0;
+        for j in 1..cps.len() + 1 {
+            if breaks[j] {
+                want += 1;
+            }
+        }
+        var at = 0;
+        for g in graphemes(s) {
+            at += g.len;
+            // (at must be the offset of a code point with a boundary before it)
+            var j = 0;
+            while j < offsets.len() && offsets[j] != at {
+                j += 1;
+            }
+            if j == offsets.len() || !breaks[j] {
+                bad = true;
+            }
+        }
+        if count_graphemes(s) != want || next_grapheme_end(s, 0) > s.len {
+            bad = true;
+        }
+        if bad {
+            fails += 1;
+            if fails <= 10 {
+                println(f"line {lines}: {line}");
+            }
+        }
+    }
+    println(f"GraphemeBreakTest: {lines} lines, {fails} failures");
+    if fails == 0 { 0 } else { 1 }
+}
+
+// EXPECT: GraphemeBreakTest: 853 lines, 0 failures

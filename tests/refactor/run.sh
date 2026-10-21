@@ -17,7 +17,8 @@
 #             an edit wrote)
 # the lines after it, up to the next `$` or `%` line, are its output:
 # stdout, then stderr, then `[exit N]` when N is not 0. The compiler's
-# path is written `tachyonc`, the copy's `WORK`. Lines starting with `##`
+# path is written `tachyonc`, the copy's `WORK`, the shell's own errors'
+# prefix `tests/refactor/run.sh:` however the runner was called. Lines starting with `##`
 # are comments. A test passes when the transcript it makes is the file,
 # comments aside.
 #
@@ -91,7 +92,8 @@ transcript() {
                 *) eval "$args" >"$WORK/out" 2>"$WORK/err" </dev/null ;;
             esac
             rc=$?
-            cat "$WORK/out" "$WORK/err" | sed -e "s|$COMPILER|tachyonc|g" -e "s|$dir|WORK|g" -e "s|$WORK|WORK|g"
+            cat "$WORK/out" "$WORK/err" | sed -e "s|$COMPILER|tachyonc|g" -e "s|$dir|WORK|g" -e "s|$WORK|WORK|g" \
+                -e "s|^$0: |tests/refactor/run.sh: |"
             [ $rc -eq 0 ] || echo "[exit $rc]"
         )
     done
@@ -245,7 +247,7 @@ check module_path_without_crate "$ok" "$out"
 # compiler's errors (ERR_KIND) and warnings and keyed errors (their
 # third argument); and every entry is such a code.
 {
-    grep -rhoE 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract)\.[a-z0-9_-]+"' \
+    grep -rhoE 'c"(query|edit|patch|undo|check|fix|lint|fmt|same-output|refactor|rewrite|explain|batch|conflict|try|test|probe|reduce|own|fuzz|distinct|contract|conv|syntax)\.[a-z0-9_-]+"' \
         compiler/src
     grep -rhoE 'ERR_KIND = c"[^"]*"' compiler/src
     grep -rhoE 'report_(warning|error_once)\([^,]*, [^,]*, c"[^"]*"' compiler/src

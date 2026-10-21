@@ -31,12 +31,12 @@ use crate::base::{
     buf_int, buf_new, buf_slice, buf_str, free, grow, intern, intern_c,
 };
 use crate::base::diag::{
-    ERR_HELP, err_begin, err_end, err_fix, err_help, err_help_sym, err_int, err_str, err_sym,
-    err_try_fmt,
+    ERR_HELP, err_begin, err_end, err_end_soft, err_fix, err_help, err_help_sym, err_int, err_str,
+    err_sym, err_try_fmt,
 };
 use crate::front::ast::{
-    CLOSURE_MOVE, FN_CLOSURE, NODES, NODE_CAPTURE, NodeKind, child, list_begin, list_end, list_push,
-    new_node,
+    CLOSURE_MOVE, CONV_NEW, FN_CLOSURE, NODES, NODE_CAPTURE, NodeKind, child, list_begin, list_end,
+    list_push, new_node,
 };
 use crate::front::check::{
     CONST_CONTEXT, CUR_FN, DEFER_LOOP_BASE, LOCALS, LOCAL_COUNT, LOOP_BASE, LOOP_STACK, RETURN_TYPE,
@@ -53,8 +53,8 @@ use crate::front::modules::CUR_MOD;
 use crate::front::parser::UNDERSCORE;
 use crate::front::types::{
     FIELDS, FIELD_CAP, FIELD_COUNT, FNS, FN_COUNT, FieldInfo, REF_MUT, STRUCTS, TLISTS, TSCRATCH,
-    TYPES, TY_ERROR, TY_NEVER, TY_UNIT, TyKind, buf_type, err_type, is_pointer, make_type, ptr_to,
-    struct_type, type_elem, type_size,
+    TYPES, TY_BOOL, TY_ERROR, TY_NEVER, TY_UNIT, TyKind, buf_type, err_type, is_pointer, is_ref,
+    make_type, ptr_to, struct_type, type_elem, type_size,
 };
 
 // A closure: its Closure node, its function (FNS index), its env struct
@@ -161,14 +161,36 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64) -> i64 {
         }
         let count = NODES[n].count;
         let tys = alloc_array::<i64>(count + 1);
+        // (0.20, §9.3) a 0.19 closure's `&T` parameter where 0.20's bound
+        // gives the T itself (a let parameter of a copyable T): the closure
+        // takes the T, and its parameter is `&` of it (a let at the body's
+        // start), as 0.19's body reads it
+        let shim = alloc_array::<i64>(count + 1);
+        for i in 0..count {
+            shim[i] = 0;
+        }
         for i in 0..count {
             let param = child(n, i);
             let wanted = if mark + i < TSCRATCH.count { TSCRATCH.data[mark + i] } else { 0 };
             let mut t = wanted;
             if NODES[param].b != 0 {
                 t = resolve_type(NODES[param].b);
+                // (0.20) a closure's parameter written `a: T` in a 0.20 file,
+                // or `a: let T`: let, a copy or a reference by T
+                t = crate::front::conv::closure_param_type(param, t);
+                if wanted > 0 && t > 0 && wanted != t && TYPES[t].kind == TyKind::Ptr
+                    && TYPES[t].a == wanted && TYPES[wanted].kind != TyKind::Ptr
+                    && !crate::front::conv::strict_at(NODES[param].start) {
+                    if TYPES[t].b == 0 {
+                        // (`*T`: the V4 error, its try: `&T`)
+                        raw_closure_param(NODES[param].b, t, t);
+                    }
+                    shim[i] = 1;
+                    t = wanted;
+                }
                 if legacy_ref_param(wanted, t) {
                     raw_closure_param(NODES[param].b, wanted, t);
+                    t = wanted;
                 }
                 if wanted != 0 && wanted != t && wanted != TY_ERROR && t != TY_ERROR {
                     mismatch_error(NODES[param].b, wanted, t);
@@ -223,7 +245,7 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64) -> i64 {
         let mut has_lets = false;
         for i in 0..count {
             let param = child(n, i);
-            if NODES[param].d == 0 {
+            if NODES[param].d == 0 && shim[i] == 0 {
                 params[i] = param;
                 if NODES[param].a == UNDERSCORE {
                     NODES[param].x = -1;
@@ -231,6 +253,14 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64) -> i64 {
                 }
                 let mutable = NODES[param].c != 0;
                 NODES[param].x = define_local(NODES[param].a, tys[i], mutable, true);
+                // (0.20) `|s: inout Sum|`: an access
+                let tn = NODES[param].b;
+                // (Phase M: in a 0.20 file, an unwritten one whose bound
+                // lends it, `Fn(let T)` or `FnMut(inout T)`, and `|a: T|` of
+                // a T that borrows (closure_param_type), too)
+                LOCALS[NODES[param].x].access = tys[i] > 0 && is_ref(tys[i])
+                    && (tn > 0 && (NODES[tn].p & CONV_NEW) != 0
+                        || crate::front::conv::strict_at(NODES[param].start));
                 continue;
             }
             let start = NODES[param].start;
@@ -244,10 +274,20 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64) -> i64 {
             NODES[hidden].a = name;
             NODES[hidden].x = define_local(name, tys[i], false, true);
             params[i] = hidden;
-            let init = new_node(NodeKind::Ident, start, end);
+            let mut init = new_node(NodeKind::Ident, start, end);
             NODES[init].a = name;
+            let mut pattern = NODES[param].d;
+            if shim[i] != 0 {
+                // (`let x = &{param};`)
+                let amp = new_node(NodeKind::Unary, start, end);
+                NODES[amp].op = Tok::Amp;
+                NODES[amp].b = init;
+                init = amp;
+                pattern = new_node(NodeKind::PatBind, start, end);
+                NODES[pattern].a = NODES[param].a;
+            }
             let binding = new_node(NodeKind::Let, start, end);
-            NODES[binding].a = NODES[param].d;
+            NODES[binding].a = pattern;
             NODES[binding].c = init;
             list_push(binding);
             has_lets = true;
@@ -281,6 +321,7 @@ pub fn check_closure_sig(n: i64, mark: i64, ret: i64) -> i64 {
         finish_closure(id, fn_body, params, tys, result);
         free(params as *u8);
         free(tys as *u8);
+        free(shim as *u8);
         CLOSURES[id].sig
     }
 }
@@ -294,7 +335,8 @@ fn raw_closure_param(ty: i64, wanted: i64, t: i64) {
         err_str(c"closure parameter of type '");
         err_type(t);
         err_str(c"' where '");
-        err_type(wanted);
+        // (wanted == t: the bound gives the value, which `&T` reads, 0.20)
+        err_type(if wanted == t { TYPES[t].a } else { wanted });
         err_str(c"' is wanted");
         err_help(c"a `*T` is a raw pointer (0.18.1), not a reference: write the parameter's type as the bound's");
         let rest = SRC[NODES[ty].start + 1..NODES[ty].end];
@@ -306,7 +348,8 @@ fn raw_closure_param(ty: i64, wanted: i64, t: i64) {
         }
         err_try_fmt(f"{buf_slice(text)}");
         err_fix(NODES[ty].start, NODES[ty].end, buf_slice(text));
-        err_end();
+        // (soft: every parameter of the closure gets its fix in one run)
+        err_end_soft();
     }
 }
 
@@ -423,6 +466,24 @@ fn finish_closure(id: i64, fn_body: i64, params: *i64, tys: *i64, result: i64) {
                 borrow = b;
             }
         }
+        // (0.20) A sink closure's owned capture has a flag, true while the
+        // closure holds it: its body may move it out once (then its drop
+        // skips it, and a second move is a run-time failure), front/own.
+        if is_move {
+            for j in 0..capture_count {
+                let local = CAPTURE_LIST.data[CLOSURES[id].captures + 2 * j];
+                if CAPTURE_LIST.data[CLOSURES[id].captures + 2 * j + 1] == 0
+                    && crate::front::own::glue::has_glue(LOCALS[local].ty) {
+                    FIELDS = grow(FIELDS, FIELD_COUNT, &FIELD_CAP);
+                    FIELDS[FIELD_COUNT] = FieldInfo {
+                        name: crate::front::own::glue::live_flag(LOCALS[local].name), ty: TY_BOOL,
+                        offset: 0,
+                    };
+                    FIELD_COUNT += 1;
+                    STRUCTS[s].field_count += 1;
+                }
+            }
+        }
         let ty = struct_type(s);
         CLOSURES[id].env_struct = s;
         CLOSURES[id].ty = ty;
@@ -469,6 +530,18 @@ fn finish_closure(id: i64, fn_body: i64, params: *i64, tys: *i64, result: i64) {
             NODES[init].ty = (*struct_field_of(s, j)).ty;
             list_push(init);
             note_local_use(ident, local);
+        }
+        for j in capture_count..STRUCTS[s].field_count {
+            // (the flags: true)
+            let flag = new_node(NodeKind::Bool, start, end);
+            NODES[flag].a = 1;
+            NODES[flag].ty = TY_BOOL;
+            let init = new_node(NodeKind::FieldInit, start, end);
+            NODES[init].a = (*struct_field_of(s, j)).name;
+            NODES[init].b = flag;
+            NODES[init].x = j;
+            NODES[init].ty = TY_BOOL;
+            list_push(init);
         }
         list_end(lit, inits);
         NODES[lit].ty = ty;
@@ -584,8 +657,25 @@ fn file_lines(file: i64) -> *IntVec {
 
 // A use of a captured local, Ident node `node`, becomes `(*env).x` (by
 // value) or `*(*env).x` (by reference).
-fn rewrite_use(id: i64, node: i64, local: i64, env: i64, env_ty: i64) {
+fn rewrite_use(id: i64, used: i64, local: i64, env: i64, env_ty: i64) {
     unsafe {
+        // (0.20: the checker may have wrapped the Ident since, its content
+        // moved to a node under it: `&x` for a let argument that borrows
+        // (check_mode::wrap_unary), `*x` for an access (names::access_use),
+        // `x[..]` for a container given as a slice)
+        let mut node = used;
+        let mut depth = 0;
+        while depth < 4 && NODES[node].kind != NodeKind::Ident {
+            let k = NODES[node].kind;
+            if k == NodeKind::Unary && NODES[node].b > 0 {
+                node = NODES[node].b;
+            } else if k == NodeKind::Index && NODES[node].a > 0 {
+                node = NODES[node].a;
+            } else {
+                break;
+            }
+            depth += 1;
+        }
         if NODES[node].kind != NodeKind::Ident || NODES[node].res != Res::Local
             || NODES[node].y != local {
             return;
@@ -658,7 +748,10 @@ fn captured_by_ref(id: i64, local: i64) -> bool {
         if (NODES[CLOSURES[id].node].c & CLOSURE_MOVE) != 0 {
             return false;
         }
-        if LOCALS[local].mutable {
+        // (0.20: a sink parameter is mutable, but captured as a let is, by
+        // value, until the closure writes it: note_local_write, and
+        // upgrade_captures for one whose address it takes)
+        if LOCALS[local].mutable && !LOCALS[local].sink {
             return true;
         }
         let t = LOCALS[local].ty;
@@ -674,6 +767,17 @@ pub fn note_local_write(local: i64) {
             let id = CLOSURE_STACK.data[i];
             if local < CLOSURES[id].mark {
                 CLOSURES[id].writes = true;
+                if LOCALS[local].sink {
+                    // (0.20: a sink parameter written: by reference)
+                    let mut k = CLOSURES[id].caps;
+                    while k < CAPS.count {
+                        if CAPS.data[k] == local
+                            && (NODES[CLOSURES[id].node].c & CLOSURE_MOVE) == 0 {
+                            CAPS.data[k + 1] = 1;
+                        }
+                        k += 2;
+                    }
+                }
                 if CLOSURES[id].write_local < 0 {
                     CLOSURES[id].write_local = local;
                 }

@@ -87,8 +87,8 @@ error batch.usage: cannot read 'no-such.pairs'
 // crate::calc::sum_to	calc.tach:14-24	effects: diverge
 // 1 + 2 + ... + n.
 pub fn sum_to(n: i64) -> i64 {
-    let mut total = 0;
-    let mut i = 1;
+    var total = 0;
+    var i = 1;
     while i <= n {
         total += i;
         i += 1;

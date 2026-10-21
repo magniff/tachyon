@@ -61,6 +61,7 @@ use crate::front::generics::{
 use crate::front::generics::instantiate::clone_node;
 use crate::front::lexer::{SUF_NONE, Tok};
 use crate::front::modules::{CUR_MOD, STD_MODULE, module_of, qualify};
+use crate::front::modules::lookup::std_item_key;
 use crate::front::own::kinds::is_plain_type;
 use crate::front::patterns::check_pattern;
 use crate::front::types::{
@@ -429,7 +430,10 @@ pub fn check_impl_signatures() {
                 else { 0 };
             let mark = TSCRATCH.count;
             for k in 0..NODES[decl].count {
-                TSCRATCH.push(resolve_type_or_error(NODES[child(decl, k)].b));
+                // (0.20: a let parameter of the trait's is a copy or a
+                // reference by the impl's types, front/conv)
+                let p = child(decl, k);
+                TSCRATCH.push(crate::front::conv::param_type(p, resolve_type_or_error(NODES[p].b)));
             }
             let ret = if NODES[decl].b == 0 { TY_UNIT }
                 else { resolve_type_or_error(NODES[decl].b) };
@@ -455,7 +459,31 @@ pub fn check_impl_signatures() {
                         if raw_at < 0 {
                             raw_at = k;
                         }
-                    } else if tt != it {
+                    }
+                    else if tt != it
+                        && crate::front::conv::legacy_ref_for_copy(child(FNS[f].node, k),
+                            child(decl, k), it, tt) {
+                        // (0.20, §9.3: an impl in 0.19's spelling of a trait's
+                        // let parameter: it keeps its reference)
+                    }
+                    else if tt != it
+                        && crate::front::conv::let_copy_for_ref(child(FNS[f].node, k), it, tt) {
+                        // (0.20: the impl's let parameter of a copyable type where
+                        // the trait takes `&T`: the trait's, an access)
+                        TLISTS.data[FNS[f].params + k] = tt;
+                    }
+                    else if tt != it && TYPES[tt].kind == TyKind::Ptr
+                        && TYPES[tt].b == crate::front::types::REF_MUT && it > 0
+                        && TYPES[it].kind == TyKind::Ptr
+                        && TYPES[it].b == crate::front::types::REF_SHARED
+                        && TYPES[it].a == TYPES[tt].a
+                        && !crate::front::conv::strict_at(NODES[child(FNS[f].node, k)].start) {
+                        // (0.20: an impl in 0.19's spelling taking `&T` where
+                        // the trait's parameter is inout, as `Iterator::at`'s
+                        // receiver became: it reads only, which is sound)
+                    }
+                    else if tt != it
+                        && !crate::front::conv::let_for_value(child(FNS[f].node, k), it, tt) {
                         same = false;
                     }
                 }
@@ -527,8 +555,8 @@ pub fn std_trait(name: *u8) -> i64 {
         if STD_MODULE < 0 {
             return -1;
         }
-        let key = qualify(STD_MODULE, intern_c(name));
-        if SYM_TRAIT[key] == 0 { -1 } else { SYM_TRAIT[key] - 1 }
+        let key = std_item_key(intern_c(name));
+        if key < 0 || SYM_TRAIT[key] == 0 { -1 } else { SYM_TRAIT[key] - 1 }
     }
 }
 
@@ -948,6 +976,17 @@ pub fn operator_call(n: i64, t: i64) -> i64 {
         check_pattern(NODES[let_l].a, t);
         check_pattern(NODES[let_r].a, NODES[NODES[n].c].ty);
         let ty = synth_expr(tail);
+        if arith && NODES[tail].kind == NodeKind::Call && NODES[tail].x > 0 {
+            // (0.20: an impl taking its operands let, `fn add(self, other:
+            // Self)`, borrows them: they are read, not moved)
+            let f = NODES[tail].x - 1;
+            if crate::front::conv::fn_param_conv(f, 0) == crate::front::conv::CONV_LET {
+                NODES[NODES[let_l].a].a = intern_c(c"==l");
+            }
+            if crate::front::conv::fn_param_conv(f, 1) == crate::front::conv::CONV_LET {
+                NODES[NODES[let_r].a].a = intern_c(c"==r");
+            }
+        }
         pop_scope();
         NODES[n] = NODES[block];
         NODES[n].ty = ty;
@@ -972,6 +1011,12 @@ pub fn negation_call(n: i64, t: i64) -> i64 {
         push_scope();
         check_pattern(NODES[let_l].a, t);
         let ty = synth_expr(tail);
+        if NODES[tail].kind == NodeKind::Call && NODES[tail].x > 0
+            && crate::front::conv::fn_param_conv(NODES[tail].x - 1, 0)
+            == crate::front::conv::CONV_LET {
+            // (0.20: `fn neg(self)`, let: read, not moved)
+            NODES[NODES[let_l].a].a = intern_c(c"==l");
+        }
         pop_scope();
         NODES[n] = NODES[block];
         NODES[n].ty = ty;

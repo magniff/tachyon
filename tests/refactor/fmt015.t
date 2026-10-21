@@ -52,7 +52,7 @@ fn half(o: Option<i64>) -> Option<i64> {
     Some(v / 2)
 }
 
-fn nested<T: Conv<Vec<i64>>>(x: T) -> i64 { 0 }
+fn nested<T: Conv<Vec<i64>>>(x: sink T) -> i64 { 0 }
 
 fn main() {
     let x = 1;

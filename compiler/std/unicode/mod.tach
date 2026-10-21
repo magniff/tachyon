@@ -1,0 +1,634 @@
+// std::unicode (0.20, task A5 of docs/design/collections-text-io.md
+// §2.5.4): the Unicode properties of code points from tables made by
+// tools/unicode/gen.tach (std::unicode::tables, at the version
+// UNICODE_VERSION names): grapheme clusters (UAX #29), display width per
+// code point (unicode-width's) and per cluster, Rust's char classes and
+// case mappings. Each part is a section of its own, read only by the
+// programs that use it.
+
+use std::{Iterator, Option};
+use std::str::{ascii_printable_prefix_len, lossy_next};
+use tables::{
+    CLASSES_LEAVES, CLASSES_MASK2, CLASSES_MASK3, CLASSES_S1, CLASSES_S2, CLASSES_SHIFT1,
+    CLASSES_SHIFT2, CLASSES_WIDE1, CLASSES_WIDE2, LOWER_COUNT, LOWER_MULTI, LOWER_TABLE,
+    PROPS_LEAVES, PROPS_MASK2, PROPS_MASK3, PROPS_S1, PROPS_S2, PROPS_SHIFT1, PROPS_SHIFT2,
+    PROPS_VALUES, PROPS_WIDE1, PROPS_WIDE2, TABLE_BIAS, UPPER_COUNT, UPPER_MULTI, UPPER_TABLE,
+};
+
+pub use tables::UNICODE_VERSION;
+
+pub mod tables;
+
+// ---- Unicode properties (0.20) ----
+//
+// One lookup gives every property that segmenting text into
+// grapheme clusters and measuring its display width need (the design,
+// docs/design/collections-text-io.md §2.5.4, task A5): `props(cp)`, a u16
+// from a three-stage trie of byte strings (unicode/tables.tach, made by
+// tools/unicode/gen.tach from the Unicode version UNICODE_VERSION names).
+// Its bits:
+//
+//   0-3    the grapheme class: Grapheme_Cluster_Break, with
+//          Extended_Pictographic (whose code points are all Other) as a
+//          class of its own: GCB_OTHER .. GCB_EXT_PICT
+//   4-6    the width class: PROP_WIDTH_ZERO .. PROP_WIDTH_CONTROL
+//   7-8    Indic_Conjunct_Break: PROP_INCB_LINKER, _CONSONANT, _EXTEND
+//   9      Emoji_Presentation
+//   10     Emoji
+//   11     Emoji_Modifier
+//   12     White_Space
+
+pub const GCB_MASK: u16 = 0xf;
+pub const GCB_OTHER: u16 = 0;
+pub const GCB_CR: u16 = 1;
+pub const GCB_LF: u16 = 2;
+pub const GCB_CONTROL: u16 = 3;
+pub const GCB_EXTEND: u16 = 4;
+pub const GCB_ZWJ: u16 = 5;
+pub const GCB_REGIONAL_INDICATOR: u16 = 6;
+pub const GCB_PREPEND: u16 = 7;
+pub const GCB_SPACING_MARK: u16 = 8;
+pub const GCB_L: u16 = 9;
+pub const GCB_V: u16 = 10;
+pub const GCB_T: u16 = 11;
+pub const GCB_LV: u16 = 12;
+pub const GCB_LVT: u16 = 13;
+pub const GCB_EXT_PICT: u16 = 14;
+
+// The width class, (p & PROP_WIDTH_MASK) >> PROP_WIDTH_SHIFT: columns 0
+// to 3, ambiguous (1, or 2 in a CJK context), or a control (no width).
+pub const PROP_WIDTH_SHIFT: u16 = 4;
+pub const PROP_WIDTH_MASK: u16 = 0x70;
+pub const PROP_WIDTH_ZERO: u16 = 0;
+pub const PROP_WIDTH_AMBIGUOUS: u16 = 4;
+pub const PROP_WIDTH_CONTROL: u16 = 5;
+
+pub const PROP_INCB_MASK: u16 = 0x180;
+pub const PROP_INCB_LINKER: u16 = 0x80;
+pub const PROP_INCB_CONSONANT: u16 = 0x100;
+pub const PROP_INCB_EXTEND: u16 = 0x180;
+pub const PROP_EMOJI_PRESENTATION: u16 = 0x200;
+pub const PROP_EMOJI: u16 = 0x400;
+pub const PROP_EMOJI_MODIFIER: u16 = 0x800;
+pub const PROP_WHITE_SPACE: u16 = 0x1000;
+
+// Byte i of a table of std::unicode::tables (written plus TABLE_BIAS).
+#[pure]
+#[inline]
+pub fn table_byte(t: [u8], i: i64) -> i64 {
+    (t[i] - TABLE_BIAS) as i64
+}
+
+// The properties of code point cp (one above 0x10FFFF has U+10FFFF's:
+// an unassigned code point's).
+#[pure]
+#[inline]
+pub fn props(cp: u32) -> u16 {
+    let c = if cp > 0x10ffff { 0x10ffff } else { cp as i64 };
+    let i1 = c >> PROPS_SHIFT1;
+    let mid = if PROPS_WIDE1 {
+        table_byte(PROPS_S1, 2 * i1) | (table_byte(PROPS_S1, 2 * i1 + 1) << 8)
+    } else {
+        table_byte(PROPS_S1, i1)
+    };
+    let i2 = (mid << (PROPS_SHIFT1 - PROPS_SHIFT2)) | ((c >> PROPS_SHIFT2) & PROPS_MASK2);
+    let leaf = if PROPS_WIDE2 {
+        table_byte(PROPS_S2, 2 * i2) | (table_byte(PROPS_S2, 2 * i2 + 1) << 8)
+    } else {
+        table_byte(PROPS_S2, i2)
+    };
+    PROPS_VALUES[table_byte(PROPS_LEAVES, (leaf << PROPS_SHIFT2) | (c & PROPS_MASK3))]
+}
+
+// The grapheme class of code point cp (GCB_OTHER .. GCB_EXT_PICT).
+#[pure]
+#[inline]
+pub fn grapheme_class(cp: u32) -> u16 {
+    props(cp) & GCB_MASK
+}
+// ---- Grapheme clusters (0.20) ----
+//
+// Extended grapheme clusters, UAX #29's rules GB1 to GB999 at the
+// Unicode version of UNICODE_VERSION (18.0: GB9c is `InCB=Linker
+// InCB=Extend* × InCB=Consonant`), as unicode-segmentation's
+// `graphemes(true)` (the design, docs/design/collections-text-io.md
+// §2.5.4, task A5). GraphemeState takes code points one at a time and
+// says where a cluster starts, which is what a terminal does; Graphemes
+// and next_grapheme_end segment UTF-8 text. Tested in full against
+// Unicode's GraphemeBreakTest.txt and against a rule-by-rule oracle
+// (tests/run/std_grapheme_*).
+
+// GB3 to GB9b as a table: bit b of row a is set when no boundary falls
+// between grapheme classes a and b (GCB_*); the rest is GB999's boundary,
+// unless GB9c, GB11 or GB12/13 (the state's) say otherwise.
+const GRAPHEME_JOIN: [u16; 16] = [
+    0x0130, // Other: × Extend, ZWJ, SpacingMark (GB9, GB9a)
+    0x0004, // CR: × LF (GB3), else ÷ (GB4)
+    0x0000, // LF (GB4)
+    0x0000, // Control (GB4)
+    0x0130, // Extend
+    0x0130, // ZWJ (and GB11, by the state)
+    0x0130, // Regional_Indicator (and GB12/13, by the state)
+    0xfff1, // Prepend: × all but CR, LF, Control (GB9b, GB5)
+    0x0130, // SpacingMark
+    0x3730, // L: × L, V, LV, LVT (GB6)
+    0x0d30, // V: × V, T (GB7)
+    0x0930, // T: × T (GB8)
+    0x0d30, // LV: × V, T (GB7)
+    0x0930, // LVT: × T (GB8)
+    0x0130, // Extended_Pictographic
+    0x0130,
+];
+
+// Where the next cluster starts, fed one code point (or its props) at a
+// time: the previous grapheme class and what GB9c, GB11 and GB12/13 look
+// back at. A new state is at the start of a text.
+pub struct GraphemeState {
+    // the previous code point's grapheme class; 16 at the start
+    prev: u16,
+    // an odd number of Regional_Indicators ends the text so far
+    ri_odd: bool,
+    // GB11: 1 after ExtPict Extend*, 2 after ExtPict Extend* ZWJ
+    emoji: u8,
+    // GB9c: after InCB=Linker InCB=Extend*
+    linker: bool,
+}
+
+impl GraphemeState {
+    // The state at the start of a text.
+    #[inline]
+    pub fn new() -> GraphemeState {
+        GraphemeState { prev: 16, ri_odd: false, emoji: 0, linker: false }
+    }
+
+    // Takes code point cp: whether a cluster starts at it (true for the
+    // first code point of a text).
+    #[inline]
+    pub fn push(inout self, cp: u32) -> bool {
+        self.push_props(props(cp))
+    }
+
+    // push for a code point whose props(cp) is p.
+    #[inline]
+    pub fn push_props(inout self, p: u16) -> bool {
+        let b = p & GCB_MASK;
+        let a = self.prev;
+        var brk = a >= 16 || ((GRAPHEME_JOIN[(a & 15) as i64] >> b) & 1) == 0;
+        if brk && a < 16 {
+            // GB12/13, GB11, GB9c
+            if b == GCB_REGIONAL_INDICATOR {
+                brk = !(a == GCB_REGIONAL_INDICATOR && self.ri_odd);
+            } else if b == GCB_EXT_PICT {
+                brk = !(a == GCB_ZWJ && self.emoji == 2);
+            } else if (p & PROP_INCB_MASK) == PROP_INCB_CONSONANT && self.linker {
+                brk = false;
+            }
+        }
+        self.ri_odd = b == GCB_REGIONAL_INDICATOR && !(a == GCB_REGIONAL_INDICATOR && self.ri_odd);
+        self.emoji = if b == GCB_EXT_PICT {
+            1
+        } else if self.emoji == 1 && b == GCB_EXTEND {
+            1
+        } else if self.emoji == 1 && b == GCB_ZWJ {
+            2
+        } else {
+            0
+        };
+        let incb = p & PROP_INCB_MASK;
+        self.linker = incb == PROP_INCB_LINKER || (self.linker && incb == PROP_INCB_EXTEND);
+        self.prev = b;
+        brk
+    }
+}
+
+// The end of the grapheme cluster of text s that starts at byte start (a
+// cluster boundary, 0 included): the start of the next one, or s.len. s is
+// decoded lossily (an invalid byte is U+FFFD, a cluster of its own). An
+// ASCII byte followed by one ends there without a lookup (but CR LF).
+#[pure]
+pub fn next_grapheme_end(s: [u8], start: i64) -> i64 {
+    let len = s.len;
+    if start >= len {
+        return len;
+    }
+    let b0 = s[start];
+    if b0 < 0x80 {
+        if start + 1 >= len {
+            return len;
+        }
+        let b1 = s[start + 1];
+        if b1 < 0x80 && !(b0 == '\r' && b1 == '\n') {
+            return start + 1;
+        }
+    }
+    var st = GraphemeState::new();
+    var i = start;
+    st.push_props(props(lossy_next(s, &i)));
+    while i < len {
+        let at = i;
+        if st.push_props(props(lossy_next(s, &i))) {
+            return at;
+        }
+    }
+    len
+}
+
+// The number of grapheme clusters of text s.
+#[pure]
+pub fn count_graphemes(s: [u8]) -> i64 {
+    var n = 0;
+    var i = 0;
+    while i < s.len {
+        i = next_grapheme_end(s, i);
+        n += 1;
+    }
+    n
+}
+
+// The grapheme clusters of text s, front to back, as slices of it:
+// `graphemes(s)` (0.20's `s.graphemes(true)` over `str`).
+pub struct Graphemes { s: [u8], pos: i64 }
+
+// The grapheme clusters of s.
+#[pure]
+#[inline]
+pub fn graphemes(s: [u8]) -> Graphemes {
+    Graphemes { s: s, pos: 0 }
+}
+
+impl Iterator for Graphemes {
+    type Item = [u8];
+
+    #[inline]
+    fn next(inout self) -> Option<[u8]> {
+        let i = self.pos;
+        if i >= self.s.len {
+            return Option::None;
+        }
+        let e = next_grapheme_end(self.s, i);
+        self.pos = e;
+        Option::Some(self.s[i..e])
+    }
+
+    #[inline]
+    fn fold<B, F: FnMut(B, [u8]) -> B>(self, init: sink B, f: F) -> B {
+        var g = f;
+        var acc = init;
+        let s = self.s;
+        var i = self.pos;
+        while i < s.len {
+            let b = s[i];
+            if b >= 0x20 && b < 0x7f {
+                // (printable ASCII before printable ASCII is a cluster of
+                // its own: no rule joins them; the run's last byte may join
+                // what follows)
+                let stop = i + ascii_printable_prefix_len(s[i..s.len]) - 1;
+                while i < stop {
+                    acc = g(acc, s[i..i + 1]);
+                    i += 1;
+                }
+            }
+            let e = next_grapheme_end(s, i);
+            acc = g(acc, s[i..e]);
+            i = e;
+        }
+        acc
+    }
+}
+
+impl Graphemes {
+    // The byte offset of the next cluster.
+    pub fn offset(self) -> i64 {
+        self.pos
+    }
+}
+
+// ---- Display width (0.20) ----
+//
+// How many terminal columns text takes (the design,
+// docs/design/collections-text-io.md §2.5.4, task A5), two ways, because
+// terminals differ:
+//
+// - per code point, unicode-width 0.2's `char::width` (and Alacritty's):
+//   char_width, char_width_cjk, str_width_chars;
+// - per grapheme cluster (Kitty, WezTerm, Ghostty's mode 2027):
+//   ClusterWidth, cluster_width, str_width. A cluster is as wide as its
+//   first code point that has a width (0 when none has), except that an
+//   emoji base followed by U+FE0F (VS16) or an emoji modifier is 2, a
+//   cluster with an Emoji_Presentation base is 2, one followed by U+FE0E
+//   (VS15) is 1 (but in Enclosed Ideographic Supplement, U+1F200 to
+//   U+1F2FF), and a pair of regional indicators (a flag) is 2 (one alone
+//   is 1).
+//
+// Ambiguous characters (East_Asian_Width A and the like) are 1, and 2 in
+// the _cjk forms. Controls (C0, DEL, C1) have no width: -1 from
+// char_width, 0 in the sums.
+
+// The columns of a code point whose props(cp) is p: 0 to 3, -1 for a
+// control; ambiguous ones are 2 when cjk, else 1.
+#[pure]
+#[inline]
+pub fn props_width(p: u16, cjk: bool) -> i64 {
+    let w = ((p & PROP_WIDTH_MASK) >> PROP_WIDTH_SHIFT) as i64;
+    if w < 4 {
+        w
+    } else if w == 4 {
+        if cjk { 2 } else { 1 }
+    } else {
+        -1
+    }
+}
+
+// The columns code point cp takes, unicode-width's `width`: 0 to 3, or -1
+// for a control. Ambiguous characters are 1.
+#[pure]
+#[inline]
+pub fn char_width(cp: u32) -> i64 {
+    if cp < 0x7f {
+        return if cp >= 0x20 { 1 } else { -1 };
+    }
+    props_width(props(cp), false)
+}
+
+// char_width in a CJK context: ambiguous characters are 2
+// (unicode-width's `width_cjk`).
+#[pure]
+#[inline]
+pub fn char_width_cjk(cp: u32) -> i64 {
+    if cp < 0x7f {
+        return if cp >= 0x20 { 1 } else { -1 };
+    }
+    props_width(props(cp), true)
+}
+
+// The width of a grapheme cluster as its code points come (the rule at
+// the top): start with the first, add the others, read width().
+pub struct ClusterWidth {
+    width: i64,
+    // the base has Emoji (VS16, VS15 and modifiers apply)
+    emoji: bool,
+    // the base is in Enclosed Ideographic Supplement (VS15 leaves it wide)
+    enclosed: bool,
+    // the base is a regional indicator not yet paired
+    ri: bool,
+    cjk: bool,
+}
+
+impl ClusterWidth {
+    // A cluster that starts with code point cp, whose props(cp) is p.
+    #[inline]
+    pub fn start(cp: u32, p: u16, cjk: bool) -> ClusterWidth {
+        let w = props_width(p, cjk);
+        let ri = (p & GCB_MASK) == GCB_REGIONAL_INDICATOR;
+        // (a regional indicator alone is 1, as its code point; a pair is a flag)
+        let presentation = (p & PROP_EMOJI_PRESENTATION) != 0 && !ri;
+        ClusterWidth {
+            width: if presentation { 2 } else if w < 0 { 0 } else { w },
+            emoji: (p & PROP_EMOJI) != 0,
+            enclosed: cp >= 0x1f200 && cp <= 0x1f2ff,
+            ri: ri,
+            cjk: cjk,
+        }
+    }
+
+    // The next code point of the cluster, cp with props p.
+    #[inline]
+    pub fn push(inout self, cp: u32, p: u16) {
+        if cp == 0xfe0f {
+            if self.emoji {
+                self.width = 2;
+            }
+        } else if cp == 0xfe0e {
+            if self.emoji && !self.enclosed {
+                self.width = 1;
+            }
+        } else if (p & PROP_EMOJI_MODIFIER) != 0 && self.emoji {
+            self.width = 2;
+        } else if self.ri && (p & GCB_MASK) == GCB_REGIONAL_INDICATOR {
+            self.width = 2;
+        } else if self.width == 0 {
+            let w = props_width(p, self.cjk);
+            if w > 0 {
+                self.width = w;
+            }
+        }
+        self.ri = false;
+    }
+
+    // The cluster's columns so far.
+    #[inline]
+    pub fn width(self) -> i64 {
+        self.width
+    }
+}
+
+// The columns of grapheme cluster s (UTF-8, decoded lossily; 0 when
+// empty).
+#[pure]
+pub fn cluster_width(s: [u8], cjk: bool = false) -> i64 {
+    if s.len == 0 {
+        return 0;
+    }
+    var i = 0;
+    let cp = lossy_next(s, &i);
+    var w = ClusterWidth::start(cp, props(cp), cjk);
+    while i < s.len {
+        let c = lossy_next(s, &i);
+        w.push(c, props(c));
+    }
+    w.width()
+}
+
+// The columns of text s, cluster by cluster (the rule at the top).
+// Printable ASCII is 1 a byte without a lookup.
+#[pure]
+pub fn str_width(s: [u8], cjk: bool = false) -> i64 {
+    let len = s.len;
+    var total = 0;
+    var i = 0;
+    while i < len {
+        // (a run of printable ASCII, but its last byte, which may start a
+        // cluster with what follows)
+        let b = s[i];
+        if b >= 0x20 && b < 0x7f {
+            let run = ascii_printable_prefix_len(s[i..len]);
+            if run > 1 {
+                total += run - 1;
+                i += run - 1;
+            }
+        }
+        let e = next_grapheme_end(s, i);
+        total += cluster_width(s[i..e], cjk);
+        i = e;
+    }
+    total
+}
+
+// The columns of text s, code point by code point (unicode-width's char
+// widths summed; controls 0).
+#[pure]
+pub fn str_width_chars(s: [u8], cjk: bool = false) -> i64 {
+    let len = s.len;
+    var total = 0;
+    var i = 0;
+    while i < len {
+        let b = s[i];
+        if b >= 0x20 && b < 0x7f {
+            let run = ascii_printable_prefix_len(s[i..len]);
+            total += run;
+            i += run;
+            continue;
+        }
+        let w = props_width(props(lossy_next(s, &i)), cjk);
+        if w > 0 {
+            total += w;
+        }
+    }
+    total
+}
+// ---- Unicode classes and case (0.20) ----
+//
+// Rust's char predicates and case mappings over code points (the
+// design, docs/design/collections-text-io.md §2.5.4, task A5; 0.20's
+// char methods call these): classes(cp) is a byte from a trie like
+// props's, the case tables are sorted (cp, mapping) entries searched by
+// halves (unicode/tables.tach).
+
+pub const CLASS_ALPHABETIC: u8 = 1;
+pub const CLASS_NUMERIC: u8 = 2;
+pub const CLASS_WHITE_SPACE: u8 = 4;
+pub const CLASS_LOWERCASE: u8 = 8;
+pub const CLASS_UPPERCASE: u8 = 16;
+pub const CLASS_CONTROL: u8 = 32;
+
+// The class bits of code point cp (CLASS_*).
+#[pure]
+#[inline]
+pub fn classes(cp: u32) -> u8 {
+    let c = if cp > 0x10ffff { 0x10ffff } else { cp as i64 };
+    let i1 = c >> CLASSES_SHIFT1;
+    let mid = if CLASSES_WIDE1 {
+        table_byte(CLASSES_S1, 2 * i1) | (table_byte(CLASSES_S1, 2 * i1 + 1) << 8)
+    } else {
+        table_byte(CLASSES_S1, i1)
+    };
+    let i2 = (mid << (CLASSES_SHIFT1 - CLASSES_SHIFT2)) | ((c >> CLASSES_SHIFT2) & CLASSES_MASK2);
+    let leaf = if CLASSES_WIDE2 {
+        table_byte(CLASSES_S2, 2 * i2) | (table_byte(CLASSES_S2, 2 * i2 + 1) << 8)
+    } else {
+        table_byte(CLASSES_S2, i2)
+    };
+    table_byte(CLASSES_LEAVES, (leaf << CLASSES_SHIFT2) | (c & CLASSES_MASK3)) as u8
+}
+
+// Whether cp is Alphabetic (Rust's char::is_alphabetic).
+#[pure]
+pub fn is_alphabetic(cp: u32) -> bool {
+    if cp < 0x80 {
+        return (cp | 0x20) >= 'a' as u32 && (cp | 0x20) <= 'z' as u32;
+    }
+    (classes(cp) & CLASS_ALPHABETIC) != 0
+}
+
+// Whether cp is a number, General_Category Nd, Nl or No (Rust's
+// char::is_numeric).
+#[pure]
+pub fn is_numeric(cp: u32) -> bool {
+    if cp < 0x80 {
+        return cp >= '0' as u32 && cp <= '9' as u32;
+    }
+    (classes(cp) & CLASS_NUMERIC) != 0
+}
+
+// Whether cp is alphabetic or numeric (Rust's char::is_alphanumeric).
+#[pure]
+pub fn is_alphanumeric(cp: u32) -> bool {
+    (classes(cp) & (CLASS_ALPHABETIC | CLASS_NUMERIC)) != 0
+}
+
+// Whether cp is White_Space (Rust's char::is_whitespace).
+#[pure]
+pub fn is_whitespace(cp: u32) -> bool {
+    if cp < 0x80 {
+        return cp == ' ' as u32 || (cp >= 0x09 && cp <= 0x0d);
+    }
+    (classes(cp) & CLASS_WHITE_SPACE) != 0
+}
+
+// Whether cp is Lowercase (Rust's char::is_lowercase).
+#[pure]
+pub fn is_lowercase(cp: u32) -> bool {
+    if cp < 0x80 {
+        return cp >= 'a' as u32 && cp <= 'z' as u32;
+    }
+    (classes(cp) & CLASS_LOWERCASE) != 0
+}
+
+// Whether cp is Uppercase (Rust's char::is_uppercase).
+#[pure]
+pub fn is_uppercase(cp: u32) -> bool {
+    if cp < 0x80 {
+        return cp >= 'A' as u32 && cp <= 'Z' as u32;
+    }
+    (classes(cp) & CLASS_UPPERCASE) != 0
+}
+
+// Whether cp is a control, General_Category Cc (Rust's char::is_control).
+#[pure]
+pub fn is_control(cp: u32) -> bool {
+    cp < 0x20 || (cp >= 0x7f && cp < 0xa0)
+}
+
+// The 3-byte little-endian number at t[i].
+#[pure]
+#[inline]
+fn case_u24(t: [u8], i: i64) -> u32 {
+    (table_byte(t, i) | (table_byte(t, i + 1) << 8) | (table_byte(t, i + 2) << 16)) as u32
+}
+
+// cp's mapping in a case table of n entries: up to 3 code points, the
+// rest 0; cp itself when the table has none.
+#[pure]
+fn case_map(table: [u8], multi: [u8], n: i64, cp: u32) -> [u32; 3] {
+    var lo = 0;
+    var hi = n;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let k = case_u24(table, mid * 6);
+        if k < cp {
+            lo = mid + 1;
+        } else if k > cp {
+            hi = mid;
+        } else {
+            let m = case_u24(table, mid * 6 + 3);
+            if (m & 0x800000) != 0 {
+                let j = ((m & 0x7fffff) * 9) as i64;
+                return [case_u24(multi, j), case_u24(multi, j + 3), case_u24(multi, j + 6)];
+            }
+            return [m, 0, 0];
+        }
+    }
+    [cp, 0, 0]
+}
+
+// The lowercase of cp: one to three code points, the rest 0 (Rust's
+// char::to_lowercase, unconditional: `İ` is `i` and U+0307).
+#[pure]
+pub fn to_lower(cp: u32) -> [u32; 3] {
+    if cp < 0x80 {
+        let l = if cp >= 'A' as u32 && cp <= 'Z' as u32 { cp | 0x20 } else { cp };
+        return [l, 0, 0];
+    }
+    case_map(LOWER_TABLE, LOWER_MULTI, LOWER_COUNT, cp)
+}
+
+// The uppercase of cp: one to three code points, the rest 0 (Rust's
+// char::to_uppercase: `ß` is `SS`).
+#[pure]
+pub fn to_upper(cp: u32) -> [u32; 3] {
+    if cp < 0x80 {
+        let u = if cp >= 'a' as u32 && cp <= 'z' as u32 { cp & ~0x20 } else { cp };
+        return [u, 0, 0];
+    }
+    case_map(UPPER_TABLE, UPPER_MULTI, UPPER_COUNT, cp)
+}

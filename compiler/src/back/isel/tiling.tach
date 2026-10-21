@@ -3,6 +3,7 @@
 // target: addresses, lea, madd, shop, ubfx, test branches, selects and
 // library calls.
 
+use crate::back::emit::blocks::fits_cmp_imm;
 use crate::back::isel::{
     coverable, isel_const, isel_count_uses, isel_release, isel_retain, isel_set_operands,
 };
@@ -10,12 +11,13 @@ use crate::back::mc_arm64::ops::{is_logical_imm, ma_int_imm_ok};
 use crate::base::{streq, sym_name};
 use crate::base::target::{ELF, X86};
 use crate::front::types::{
-    FNS, TY_F32, TY_F64, fn_param, int_bits, is_float, is_integer, is_signed, type_size,
+    FNS, TY_F32, TY_F64, TY_U32, TY_U64, fn_param, int_bits, is_float, is_integer, is_signed,
+    type_size,
 };
 use crate::gen0::target::{LINK_NAMES, log2};
 use crate::gen0::x86_64::fits_i32;
 use crate::middle::ctx::FnCtx;
-use crate::middle::ir::{Cond, IRFUNCS, Term, ir_arg, ir_set_arg};
+use crate::middle::ir::{Cond, IRFUNCS, Op, Term, ir_arg, ir_set_arg};
 use crate::middle::ir::Op::{
     Add, And, Call, Cmp, Const, FMath, Lea, Load, LoadX, MAdd, MSub, Mul, Or, Select, ShOp, Shl,
     Shr, Slot, Store, StoreX, Sub, Test, Ubfx, Xor,
@@ -62,7 +64,7 @@ fn isel_inst(mut cx: *FnCtx, v: i64) {
                 isel_lea(cx, v);
             }
         } else if op == Add || op == Sub {
-            if !isel_madd(cx, v) {
+            if !isel_madd(cx, v) && !isel_cinc(cx, v) {
                 isel_shop(cx, v);
             }
         } else if op == And {
@@ -70,7 +72,9 @@ fn isel_inst(mut cx: *FnCtx, v: i64) {
                 isel_shop(cx, v);
             }
         } else if op == Or || op == Xor {
-            isel_shop(cx, v);
+            if !isel_rotate(cx, v) {
+                isel_shop(cx, v);
+            }
         }
     }
 }
@@ -238,6 +242,84 @@ fn isel_madd(mut cx: *FnCtx, v: i64) -> bool {
                 isel_set_operands(cx, v, cx.insts[m].a, cx.insts[m].b, other);
                 return true;
             }
+        }
+        false
+    }
+}
+
+// AArch64: x + (a cmp b), an integer comparison's 0 or 1 added: cinc (a
+// csinc on the opposite condition, !c ? x : x + 1), so the comparison's
+// flags feed the add instead of a cset first (0.20: the branchless
+// partitions and merges of std's sorts count with it). 64-bit only, as
+// isel_select_increment.
+fn isel_cinc(mut cx: *FnCtx, v: i64) -> bool {
+    unsafe {
+        if cx.insts[v].op != Add || !is_wide_int(cx.insts[v].ty) {
+            return false;
+        }
+        for side in 0..2 {
+            let c = if side == 0 { cx.insts[v].b } else { cx.insts[v].a };
+            let other = if side == 0 { cx.insts[v].a } else { cx.insts[v].b };
+            if !coverable(cx, c, Cmp, v) || is_float(cx.insts[c].imm2) || other == 0
+                || cx.insts[other].op == Const {
+                continue;
+            }
+            let lhs = cx.insts[c].a;
+            let mut rhs = cx.insts[c].b;
+            let mut imm = 0;
+            let mut value = 0;
+            if isel_const(cx, rhs, &mut value) && fits_cmp_imm(value) {
+                rhs = 0;
+                imm = value;
+            }
+            cx.insts[v].op = Select;
+            cx.insts[v].cond = cx.insts[c].cond.negate();
+            cx.insts[v].imm2 = cx.insts[c].imm2;
+            cx.insts[v].imm = imm;
+            cx.insts[v].scale = 2;
+            cx.insts[v].args = cx.args.count;
+            cx.args.push(lhs);
+            cx.argty.push(0);
+            cx.args.push(rhs);
+            cx.argty.push(0);
+            cx.insts[v].nargs = 2;
+            isel_retain(cx, lhs);
+            isel_retain(cx, rhs);
+            isel_set_operands(cx, v, other, other, 0);
+            return true;
+        }
+        false
+    }
+}
+
+// AArch64 (0.20): (x << a) | (x >> b) with a + b the width, a rotation:
+// ror (also with ^, the two sides having no bit in common). u64 and u32
+// only: an unsigned >> is a logical shift.
+fn isel_rotate(mut cx: *FnCtx, v: i64) -> bool {
+    unsafe {
+        let ty = cx.insts[v].ty;
+        let bits = if ty == TY_U64 { 64 } else if ty == TY_U32 { 32 } else { 0 };
+        if bits == 0 {
+            return false;
+        }
+        for side in 0..2 {
+            let l = if side == 0 { cx.insts[v].a } else { cx.insts[v].b };
+            let r = if side == 0 { cx.insts[v].b } else { cx.insts[v].a };
+            if !coverable(cx, l, Shl, v) || !coverable(cx, r, Shr, v) || cx.insts[l].ty != ty
+                || cx.insts[r].ty != ty || cx.insts[l].a != cx.insts[r].a {
+                continue;
+            }
+            let mut ka = 0;
+            let mut kb = 0;
+            if !isel_const(cx, cx.insts[l].b, &mut ka) || !isel_const(cx, cx.insts[r].b, &mut kb)
+                || ka <= 0 || kb <= 0 || ka + kb != bits {
+                continue;
+            }
+            cx.insts[v].op = ShOp;
+            cx.insts[v].imm = kb;
+            cx.insts[v].imm2 = 4 * (Or as i64) + 3;
+            isel_set_operands(cx, v, cx.insts[r].a, 0, 0);
+            return true;
         }
         false
     }

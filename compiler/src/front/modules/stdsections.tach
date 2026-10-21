@@ -28,6 +28,10 @@ static mut SEC_WORDS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut SEC_ITEMS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut SEC_IMPLS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut SEC_DEPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// (0.20) A section's gate (index.awk's GATES): a word the program must name
+// for the section's words to ask for it, or -1.
+static mut SEC_GATE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut WORDS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut ITEMS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static mut IMPLS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -80,6 +84,7 @@ fn read_index() {
             SEC_ITEMS.push(ITEMS.count);
             SEC_IMPLS.push(IMPLS.count);
             SEC_DEPS.push(DEPS.count);
+            SEC_GATE.push(-1);
             // four fields of words, up to the end of the line
             for field in 0..4 {
                 loop {
@@ -94,7 +99,10 @@ fn read_index() {
                         i += 1;
                     }
                     let word = t[w..i];
-                    if field == 0 {
+                    if field == 0 && word.len > 1 && word[0] == '+' {
+                        // (0.20) the gate: a word the program must name too
+                        SEC_GATE.data[SEC_COUNT] = intern(word[1..word.len]);
+                    } else if field == 0 {
                         WORDS.push(intern(word));
                     } else if field == 1 {
                         ITEMS.push(intern(word));
@@ -154,10 +162,14 @@ fn mark(s: i64, now: &mut IntVec) {
 }
 
 // Whether lazy section s is reached: the program names a word of it, or
-// an impl of it may apply (its trait and type named or defined).
+// an impl of it may apply (its trait and type named or defined); (0.20)
+// a section with a gate (SEC_GATE) asks for its words only when the
+// program names the gate too.
 fn reached(s: i64) -> bool {
     unsafe {
-        for k in SEC_WORDS.data[s]..SEC_WORDS.data[s + 1] {
+        // (0.20) a gated module's section: only for a program naming its gate
+        let gated = SEC_GATE.data[s] >= 0 && !known(SEC_GATE.data[s], PROGRAM);
+        for k in SEC_WORDS.data[s]..(if gated { SEC_WORDS.data[s] } else { SEC_WORDS.data[s + 1] }) {
             if known(WORDS.data[k], PROGRAM) {
                 return true;
             }
@@ -182,6 +194,10 @@ fn know_program() {
         let mut angles = 0;
         let detect = intern_c(c"detect");
         let multiversion = intern_c(c"multiversion");
+        // (0.20) what makes floats: their Display and Debug are lazy
+        // (std::fmt's `impl Display for f64`)
+        let v2f64 = intern_c(c"v2f64");
+        let v4f32 = intern_c(c"v4f32");
         for i in 0..TOK_COUNT {
             let at = TOKS[i].start;
             if at >= STD_START && at < STD_END {
@@ -190,6 +206,10 @@ fn know_program() {
             let k = TOKS[i].kind;
             if k == Tok::Ident {
                 know(TOKS[i].value as i64, PROGRAM);
+                if TOKS[i].value as i64 == v2f64 || TOKS[i].value as i64 == v4f32 {
+                    know_c("f64");
+                    know_c("f32");
+                }
                 // (0.17) `panic(..)`, the prelude's: std's panic_str (not
                 // `effects(panic)`, `std::panic(..)` nor `fn panic(..)`)
                 if i + 1 < TOK_COUNT && TOKS[i + 1].kind == Tok::LParen && i > 0
@@ -216,6 +236,10 @@ fn know_program() {
                     know_c("eq_of");
                     know_c("hash_mix");
                 }
+            } else if k == Tok::Float || k == Tok::Import {
+                // (0.20) a float literal or a C header: floats
+                know_c("f64");
+                know_c("f32");
             } else if k == Tok::Question {
                 know_c("From");
             } else if k == Tok::EqEq || k == Tok::BangEq {

@@ -23,7 +23,7 @@
 # "Semantics"), or, when the column is prose, `fn ref_NAME` in
 # tests/arch/ref/*.tach. The reference takes the intrinsic's parameters
 # (a vector or a slice as its lanes, `[D]`; a scalar as `D`; a constant
-# or an index as `i64`; the slice of a store as `&mut [D]`, which it
+# or an index as `i64`; the slice of a store as `inout [D]`, which it
 # writes) and, for a vector result, the lane `k: i64`, and returns that
 # lane (or the scalar) as `D`: D is i64 for integers narrower than 64
 # bits, the lane type itself for 64-bit ones, f64 for floats. A ref file
