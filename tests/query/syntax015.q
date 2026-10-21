@@ -4,7 +4,7 @@
 ## A method #[derive] makes: the attribute answers (0.15).
 $ items
 crate	syntax015/main.tach	6
-std	<std>	558
+std	<std>	562
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	37
@@ -32,10 +32,13 @@ std::hash	<std>	6
 std::hash::fold	<std>	26
 std::hash::sip	<std>	14
 std::hash::state	<std>	18
-std::arch	<std::arch>	2
-std::arch::aarch64	<std::arch::aarch64>	114
+std::str	<std>	67
+std::unicode	<std>	74
+std::unicode::tables	<std>	27
+std::arch	<std::arch>	3
+std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6
-std::arch::aarch64::raw	<std::arch::aarch64::raw>	108
+std::arch::aarch64::raw	<std::arch::aarch64::raw>	110
 std::arch::x86_64::raw	<std::arch::x86_64::raw>	6
 $ show main
 // crate::main	syntax015/main.tach:25-31	effects: io global panic

@@ -3,7 +3,7 @@
 ## an item shown with its clauses, a distinct type, test functions.
 $ items
 crate	syntax018/main.tach	14
-std	<std>	558
+std	<std>	562
 crate::tests	syntax018/main.tach	1
 std::ops	<std>	5
 std::iter	<std>	67
@@ -32,10 +32,13 @@ std::hash	<std>	6
 std::hash::fold	<std>	26
 std::hash::sip	<std>	14
 std::hash::state	<std>	18
-std::arch	<std::arch>	2
-std::arch::aarch64	<std::arch::aarch64>	114
+std::str	<std>	67
+std::unicode	<std>	74
+std::unicode::tables	<std>	27
+std::arch	<std::arch>	3
+std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6
-std::arch::aarch64::raw	<std::arch::aarch64::raw>	108
+std::arch::aarch64::raw	<std::arch::aarch64::raw>	110
 std::arch::x86_64::raw	<std::arch::x86_64::raw>	6
 $ show crate::push Stack Percent
 // crate::push	syntax018/main.tach:19-27	effects: panic
