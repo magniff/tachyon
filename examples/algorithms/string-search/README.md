@@ -66,11 +66,11 @@ counting compiles to a loop with an increment, no call per match.
 
 ```tach
 trait Searcher {
-    fn each_match<F: FnMut(i64)>(self: &Self, text: [u8], found: F);
+    fn each_match<F: FnMut(i64)>(self, text: [u8], found: F);
 
-    fn count(self: &Self, text: [u8]) -> i64 {
-        let mut n = 0;
-        self.each_match(text, |_| { n += 1; });   // `let mut n`: captured by reference
+    fn count(self, text: [u8]) -> i64 {
+        var n = 0;
+        self.each_match(text, |_| { n += 1; });   // `var n`: the closure changes it in place
         n
     }
 }
@@ -108,7 +108,7 @@ inside the struct, indexed by a byte (`shift[b]`: any integer type
 indexes):
 
 ```tach
-let mut shift = [m; 256];
+var shift = [m; 256];
 for j in 0..m - 1 { shift[pat[j]] = m - 1 - j; }
 ...
 while i + m <= text.len {
@@ -179,7 +179,7 @@ per position and KMP still one.
 | feature | where | guide |
 |---|---|---|
 | a trait with a generic method and a default method | `Searcher` | `tachyonc guide traits` |
-| closures as `FnMut` arguments, capturing `let mut` by reference | `count`, `demo` | `tachyonc guide closures` |
+| closures as `FnMut` arguments, capturing a `var` and changing it | `count`, `demo` | `tachyonc guide closures` |
 | generic functions bounded by a trait | `timed<S: Searcher>` | `tachyonc guide generics` |
 | `[u8]` slices, slicing, `==` by bytes | the searchers | `tachyonc guide types` |
 | arrays as values, `[m; 256]`, indexed by a `u8` | `Horspool` | `tachyonc guide types` |

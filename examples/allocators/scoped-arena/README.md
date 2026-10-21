@@ -8,8 +8,8 @@ at once, when the request is answered:
 
 ```tach
 let used = arena_scope(gpa, |scratch| {
-    let mut out = Buf::new_in(scratch);
-    answer(&mut store, line, scratch, &mut out);
+    var out = Buf::new_in(scratch);
+    answer(&store, line, scratch, &out);
     println(f"{line:<24} -> {out.as_slice()}");
     scratch.used()
 });
@@ -64,7 +64,7 @@ one used 104 bytes.
 `answer` does not know or care what kind of allocator it is given:
 
 ```tach
-fn answer<A: Allocator>(store: &mut Store, line: [u8], scratch: A, out: &mut Buf<A>)
+fn answer<A: Allocator>(store: inout Store, line: [u8], scratch: sink A, out: inout Buf<A>)
 ```
 
 Inside, every temporary is made on `scratch`:
@@ -100,11 +100,11 @@ So `intern` forgets the `Vec` and makes the view from its pointer, in
 
 ```tach
 fn intern(names: Arena, s: [u8]) -> [u8] {
-    let mut v: Vec<u8, Arena> = Vec::with_capacity_in(s.len, names);
+    var v: Vec<u8, Arena> = Vec::with_capacity_in(s.len(), names);
     v.extend_from_slice(s);
     let p = v.as_slice().ptr;
     std::forget(v);
-    unsafe { p[0..s.len] }
+    unsafe { p[0..s.len()] }
 }
 ```
 
@@ -155,7 +155,7 @@ enclosing one (`a.scope(|inner| ...)` makes a scope inside a scope):
 $ cat > capture.tach <<'EOF'
 > fn main(gpa: Gpa) -> i32 {
 >     let n = arena_scope(gpa, |outer| {
->         let mut seen: Vec<i64, ScopedArena> = Vec::new_in(outer);
+>         var seen: Vec<i64, ScopedArena> = Vec::new_in(outer);
 >         seen.push(1);
 >         outer.scope(|inner| {
 >             seen.push(2);
