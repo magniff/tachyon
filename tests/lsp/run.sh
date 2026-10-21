@@ -10,14 +10,16 @@
 # Each tests/lsp/NAME.lsp is a session with the program tests/lsp/prog
 # (copied to a scratch directory, @DIR@ in the file): a line `> JSON` is
 # a message of the client, framed (`Content-Length`) and sent; `> @open
-# FILE` sends didOpen with FILE's text as it is on disk. Every message is
-# sent at once (`> @change FILE TEXT`: didChange, FILE gets the text of
-# tests/lsp/texts/TEXT), then stdin is closed after them; the server answers in
-# order. A line `< JSON` is a message of the server: after a request's
-# line, the messages up to its response (the diagnostics published
-# before it), and at the end the ones after the last response. `##`
-# lines are comments. The scratch directory is written @DIR@ in the
-# answers, the compiler's path `tachyonc`.
+# FILE` sends didOpen with FILE's text as it is on disk, `> @change FILE
+# TEXT` didChange, FILE getting the text of tests/lsp/texts/TEXT. After a
+# request the next message waits for its response, as an editor does;
+# in a session whose first line is `## burst` every message is sent at
+# once (a request then sees the changes queued after it). A line `< JSON`
+# is a message of the server: after a request's line, the messages up to
+# its response (the diagnostics published before it), and at the end
+# the ones after the last response. `##` lines are comments. The
+# scratch directory is written @DIR@ in the answers, the compiler's path
+# `tachyonc`.
 #
 # Then the compiler's own source is opened and asked for a file's symbols
 # and a definition: the answers must be plausible (it changes too often
@@ -65,10 +67,12 @@ frame() {
     printf 'Content-Length: %d\r\n\r\n%s' $((n)) "$1"
 }
 
-# The messages of the session file $1 (the program at $2), framed, into
-# $WORK/in.
+# The messages of the session file $1 (the program at $2), framed, each
+# into $WORK/msg.K, and $WORK/msgs: a line `K ID` per message (ID: a
+# request's id, else -).
 session_input() {
-    : >"$WORK/in"
+    : >"$WORK/msgs"
+    k=0
     grep '^> ' "$1" | sed 's/^> //' | while IFS= read -r line; do
         case "$line" in
             @open\ *)
@@ -82,8 +86,42 @@ session_input() {
                 ;;
             *) msg=$(printf '%s' "$line" | sed "s|@DIR@|$2|g") ;;
         esac
-        frame "$msg" >>"$WORK/in"
+        k=$((k + 1))
+        frame "$msg" >"$WORK/msg.$k"
+        id=$(printf '%s' "$line" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9]*\),.*/\1/p')
+        echo "$k ${id:--}" >>"$WORK/msgs"
     done
+}
+
+# Runs the server in directory $1 on the messages, waiting for each
+# request's response unless $2 is burst; its exit status.
+run_session() {
+    if [ "$2" = burst ]; then
+        # (from a file: all of it there when the server reads)
+        : >"$WORK/in"
+        while read -r k id; do cat "$WORK/msg.$k" >>"$WORK/in"; done <"$WORK/msgs"
+        (cd "$1" && exec "$COMPILER" lsp <"$WORK/in" >"$WORK/out" 2>"$WORK/err")
+        return
+    fi
+    rm -f "$WORK/fifo"
+    mkfifo "$WORK/fifo"
+    (cd "$1" && exec "$COMPILER" lsp <"$WORK/fifo" >"$WORK/out" 2>"$WORK/err") &
+    pid=$!
+    exec 3>"$WORK/fifo"
+    while read -r k id; do
+        cat "$WORK/msg.$k" >&3
+        [ "$id" = - ] && continue
+        tries=0
+        until grep -q -F "\"jsonrpc\":\"2.0\",\"id\":$id," "$WORK/out"; do
+            tries=$((tries + 1))
+            if [ $tries -gt 3000 ] || ! kill -0 "$pid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.02
+        done
+    done <"$WORK/msgs"
+    exec 3>&-
+    wait "$pid"
 }
 
 # The server's messages in $WORK/out, one per line (bodies hold no
@@ -123,7 +161,9 @@ for case in "$HERE"/*.lsp; do
     mkdir -p "$dir"
     cp "$HERE"/prog/*.tach "$dir/"
     session_input "$case" "$dir"
-    (cd "$dir" && "$COMPILER" lsp <"$WORK/in" >"$WORK/out" 2>"$WORK/err")
+    mode=sync
+    head -1 "$case" | grep -q '^## burst' && mode=burst
+    run_session "$dir" "$mode"
     rc=$?
     unframe "$WORK/out" "$dir" >"$WORK/answers"
     transcript "$case" >"$WORK/got"

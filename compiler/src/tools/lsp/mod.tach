@@ -16,7 +16,7 @@
 
 use crate::base::{
     BUFS, IntVec, OVERLAY, STDERR, STDOUT, alloc_array, alloc_zeroed, buf_byte, buf_bytes,
-    buf_clear, buf_fmt, buf_new, buf_slice, buf_str, buf_write_fd, getenv, streq, write,
+    buf_clear, buf_fmt, buf_new, buf_slice, buf_str, getenv, write,
 };
 
 use crate::base::json::buf_json_str;
@@ -61,6 +61,10 @@ static mut UTF8: bool = false;
 // stdin: what was read, how much of it is handled
 static mut IN: i64 = -1;
 static mut IN_AT: i64 = 0;
+// the message being handled (a copy), a file read to compare (buffers)
+static mut MSG: i64 = -1;
+static mut DISK: i64 = -1;
+static mut DISK_PATH: i64 = -1;
 // the open documents: their paths, texts, the copies the worker reads
 // them from (buffers), whether the copy has the text
 static mut DOC_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -221,14 +225,21 @@ fn doc_index(path: [u8]) -> i64 {
 
 // Whether text is not what the file at path holds.
 fn differs_from_disk(path: [u8], text: [u8]) -> bool {
-    let p = buf_new();
-    buf_bytes(p, path);
-    let disk = buf_new();
-    !read_file_if(buf_cstr(p), disk) || buf_slice(disk) != text
+    unsafe {
+        if DISK < 0 {
+            DISK = buf_new();
+            DISK_PATH = buf_new();
+        }
+        buf_clear(DISK_PATH);
+        buf_bytes(DISK_PATH, path);
+        buf_clear(DISK);
+        !read_file_if(buf_cstr(DISK_PATH), DISK) || buf_slice(DISK) != text
+    }
 }
 
-// The document at path gets text (opened when it is not).
-fn set_doc(path: [u8], text: [u8]) {
+// The document at path (opened when it is not) gets the text of the JSON
+// string at `at` in msg, decoded into its buffer; that text.
+fn set_doc(path: [u8], msg: [u8], at: i64) -> [u8] {
     unsafe {
         let mut i = doc_index(path);
         if i < 0 {
@@ -247,8 +258,9 @@ fn set_doc(path: [u8], text: [u8]) {
         }
         let t = DOC_TEXT.data[i];
         buf_clear(t);
-        buf_bytes(t, text);
+        str_into(msg, at, t);
         DOC_FRESH.data[i] = 0;
+        buf_slice(t)
     }
 }
 
@@ -477,6 +489,10 @@ fn ask_worker(method: *u8, id: [u8], msg: [u8], params: i64, empty: *u8, chunk: 
             respond(id, c_slice(empty));
             return;
         }
+        if superseded(path, chunk) {
+            respond_error(id, -32801, "content modified");
+            return;
+        }
         if DIRTY || W_PID < 0 {
             start_worker();
         }
@@ -548,9 +564,8 @@ fn handle(msg: [u8], chunk: *u8) -> bool {
             return false;
         } else if method == "textDocument/didOpen" {
             let path = uri_path(str_at(msg, at_path(msg, params, "textDocument.uri")));
-            let text = str_at(msg, at_path(msg, params, "textDocument.text"));
             if path.len > 0 {
-                set_doc(path, text);
+                let text = set_doc(path, msg, at_path(msg, params, "textDocument.text"));
                 let known = ROOT >= 0;
                 if use_root(path) && (known && differs_from_disk(path, text) || W_PID < 0) {
                     mark_dirty(0);
@@ -561,7 +576,7 @@ fn handle(msg: [u8], chunk: *u8) -> bool {
             let mut changes = IntVec { data: 0 as *i64, count: 0, cap: 0 };
             elements(msg, member(msg, params, "contentChanges"), &mut changes);
             if path.len > 0 && changes.count > 0 {
-                set_doc(path, str_at(msg, member(msg, changes.data[changes.count - 1], "text")));
+                set_doc(path, msg, member(msg, changes.data[changes.count - 1], "text"));
                 if use_root(path) {
                     mark_dirty(DEBOUNCE_MS);
                 }
@@ -571,7 +586,7 @@ fn handle(msg: [u8], chunk: *u8) -> bool {
             let tv = member(msg, params, "text");
             if path.len > 0 {
                 if tv >= 0 && doc_index(path) >= 0 {
-                    set_doc(path, str_at(msg, tv));
+                    set_doc(path, msg, tv);
                 }
                 if use_root(path) {
                     mark_dirty(0);
@@ -618,46 +633,107 @@ fn handle(msg: [u8], chunk: *u8) -> bool {
 fn next_message(chunk: *u8) -> i64 {
     unsafe {
         let s = buf_slice(IN);
-        // the header, up to an empty line
-        let mut e = IN_AT;
-        while e + 3 < s.len
-            && !(s[e] == '\r' && s[e + 1] == '\n' && s[e + 2] == '\r' && s[e + 3] == '\n') {
-            e += 1;
-        }
-        if e + 3 >= s.len {
+        let mut body_at = 0;
+        let mut next = 0;
+        let len = frame_at(s, IN_AT, &mut body_at, &mut next);
+        if len == -2 {
             return 0;
         }
-        let mut len = -1;
-        let head = s[IN_AT..e];
-        let mut i = 0;
-        while i < head.len {
-            let mut j = i;
-            while j < head.len && head[j] != '\r' {
-                j += 1;
-            }
-            let l = head[i..j];
-            if l.len > 15 && lower_eq(l[0..15], "content-length:") {
-                len = int_at(l, 15, -1);
-            }
-            i = j + 2;
-        }
-        let body_at = e + 4;
+        IN_AT = next;
         if len < 0 {
             // (no length: the header skipped)
-            IN_AT = body_at;
             return 1;
         }
-        if body_at + len > s.len {
-            return 0;
+        // (a copy: handle may read more of stdin into IN)
+        if MSG < 0 {
+            MSG = buf_new();
         }
-        IN_AT = body_at + len;
-        let msg = s[body_at..body_at + len];
-        let more = handle(msg, chunk);
+        buf_clear(MSG);
+        buf_bytes(MSG, s[body_at..body_at + len]);
+        let more = handle(buf_slice(MSG), chunk);
         if IN_AT == buf_slice(IN).len {
             buf_clear(IN);
             IN_AT = 0;
         }
         if more { 1 } else { -1 }
+    }
+}
+
+// The message framed at `at` in s: its body's length (its start into
+// *body_at, the next frame's into *next); -1 when the header has no
+// length, -2 when the message is not all there yet.
+fn frame_at(s: [u8], at: i64, body_at: &mut i64, next: &mut i64) -> i64 {
+    let mut e = at;
+    while e + 3 < s.len
+        && !(s[e] == '\r' && s[e + 1] == '\n' && s[e + 2] == '\r' && s[e + 3] == '\n') {
+        e += 1;
+    }
+    if e + 3 >= s.len {
+        return -2;
+    }
+    let mut len = -1;
+    let head = s[at..e];
+    let mut i = 0;
+    while i < head.len {
+        let mut j = i;
+        while j < head.len && head[j] != '\r' {
+            j += 1;
+        }
+        let l = head[i..j];
+        if l.len > 15 && lower_eq(l[0..15], "content-length:") {
+            len = int_at(l, 15, -1);
+        }
+        i = j + 2;
+    }
+    *body_at = e + 4;
+    if len < 0 {
+        *next = e + 4;
+        return -1;
+    }
+    if e + 4 + len > s.len {
+        return -2;
+    }
+    *next = e + 4 + len;
+    len
+}
+
+// Whether a change of the document at path waits on stdin (what is there
+// read first): a request about it is then answered `content modified`
+// (LSP's -32801), so that edits made faster than the program is read do
+// not each read it.
+fn superseded(path: [u8], chunk: *u8) -> bool {
+    unsafe {
+        loop {
+            FDS[0] = 0;
+            FDS[1] = POLLIN;
+            if poll(FDS, 1, 0) <= 0 || (FDS[1] >> 16) == 0 {
+                break;
+            }
+            let got = read(0, chunk, 65536);
+            if got <= 0 {
+                break;
+            }
+            buf_bytes(IN, chunk[0..got]);
+        }
+        let s = buf_slice(IN);
+        let mut at = IN_AT;
+        loop {
+            let mut body_at = 0;
+            let mut next = 0;
+            let len = frame_at(s, at, &mut body_at, &mut next);
+            if len == -2 {
+                return false;
+            }
+            if len >= 0 {
+                let m = s[body_at..body_at + len];
+                if raw(m, member(m, 0, "method")) == "\"textDocument/didChange\""
+                    && uri_path(str_at(m, at_path(m, member(m, 0, "params"), "textDocument.uri")))
+                    == path {
+                    return true;
+                }
+            }
+            at = next;
+        }
     }
 }
 
@@ -688,13 +764,7 @@ fn cleanup() {
 // shutdown, else 1 (as LSP says).
 pub fn run_lsp(argc: i64, argv: **u8) -> i64 {
     unsafe {
-        if argc > 2 && (streq(argv[2], c"--help") || streq(argv[2], c"-h")) {
-            let h = buf_new();
-            buf_str(h,
-                c"tachyonc lsp   the language server: LSP over stdin and stdout (docs/lsp.md)\n");
-            buf_write_fd(h, STDOUT);
-            return 0;
-        }
+        // (`lsp --help`: help.tach; no options)
         // (a worker that ended: its pipe's writes fail, not the server)
         signal(13, 1 as *u8);
         let t = getenv(c"TACHYON_LSP_TIME");
