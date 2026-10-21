@@ -87,7 +87,7 @@ pub struct Interp {
     groups: [i64; 3],
 }
 
-fn words_of(m: *Module, t: i64) -> i64 {
+fn words_of(m: &Module, t: i64) -> i64 {
     let ty = m.types[t];
     if ty.kind == TK_POINTER {
         return 2;
@@ -98,7 +98,7 @@ fn words_of(m: *Module, t: i64) -> i64 {
     ty.size / 4
 }
 
-pub fn new_interp(m: *Module, a: ScopedArena) -> Interp {
+pub fn new_interp(m: &Module, a: ScopedArena) -> Interp {
     let mut it = Interp {
         a: a,
         fns: Vec::new_in(a),
@@ -116,7 +116,7 @@ pub fn new_interp(m: *Module, a: ScopedArena) -> Interp {
         groups: [1, 1, 1],
     };
     for h in 0..m.functions.len() {
-        let f = m.functions[h];
+        let f = &m.functions[h];
         let mut fi = FnInfo {
             regs: Vec::with_capacity_in(f.exprs.len(), a), locals: Vec::new_in(a), size: 0,
             arg_exprs: Vec::filled_in(f.params.len(), -1, a)
@@ -170,7 +170,7 @@ pub fn new_interp(m: *Module, a: ScopedArena) -> Interp {
         for g in 0..m.globals.len() {
             let gl = m.globals[g];
             if gl.space == SP_PRIVATE && gl.init >= 0 {
-                const_eval(m, &cf, &tmp, gl.init);
+                const_eval(m, &cf, &mut tmp, gl.init);
                 let w = words_of(m, gl.ty);
                 for k in 0..w {
                     it.priv_init[it.goff[g] + k] = tmp.mem[cf.regs[gl.init] + k];
@@ -183,7 +183,7 @@ pub fn new_interp(m: *Module, a: ScopedArena) -> Interp {
 
 // Evaluates a constant expression of the module's init function (and its
 // operands) into tmp's registers.
-fn const_eval(m: *Module, cf: *FnInfo, tmp: *Inv, e: i64) {
+fn const_eval(m: &Module, cf: &FnInfo, tmp: &mut Inv, e: i64) {
     let x = m.consts.exprs[e];
     let dst = cf.regs[e];
     let w = words_of(m, x.ty);
@@ -216,7 +216,7 @@ fn const_eval(m: *Module, cf: *FnInfo, tmp: *Inv, e: i64) {
 
 // Where the i-th argument of a composition of type t goes (`at`: the
 // words the earlier arguments filled, for vectors).
-fn compose_offset(m: *Module, t: ir::Type, i: i64, at: i64) -> i64 {
+fn compose_offset(m: &Module, t: ir::Type, i: i64, at: i64) -> i64 {
     if t.kind == TK_VECTOR {
         at
     } else if t.kind == TK_MATRIX {
@@ -235,7 +235,7 @@ fn ub(x: f32) -> u32 { f32_bits(x) }
 fn si(x: u32) -> i64 { x as i32 as i64 }
 
 impl Interp {
-    pub fn fail(self: *Interp, msg: [u8]) {
+    pub fn fail(self: &mut Interp, msg: [u8]) {
         if !self.failed {
             self.failed = true;
             self.err.push_str(msg);
@@ -243,7 +243,7 @@ impl Interp {
     }
 
     // A buffer's binding: its words (sized to the binding).
-    pub fn set_buffer(self: *Interp, g: i64, words: [u32]) {
+    pub fn set_buffer(self: &mut Interp, g: i64, words: [u32]) {
         let mut v: V<u32> = Vec::with_capacity_in(words.len, self.a);
         v.extend_from_slice(words);
         self.bufs[g] = v;
@@ -251,7 +251,7 @@ impl Interp {
 
     // ---- Memory ----
 
-    fn read(self: *Interp, inv: *Inv, ptr: i64, k: i64) -> u32 {
+    fn read(self: &Interp, inv: &Inv, ptr: i64, k: i64) -> u32 {
         let sp = (ptr >> 48) & 255;
         let off = (ptr & OFF_MASK) + k;
         if ptr & PTR_INVALID != 0 {
@@ -265,16 +265,15 @@ impl Interp {
             self.wg[off]
         } else {
             let b = (ptr >> 32) & 65535;
-            let buf = self.bufs[b];
-            if off >= buf.len() {
+            if off >= self.bufs[b].len() {
                 // a fixed-size part beyond a too-small binding reads zero
                 return 0;
             }
-            buf[off]
+            self.bufs[b][off]
         }
     }
 
-    fn write(self: *Interp, inv: *Inv, ptr: i64, k: i64, v: u32) {
+    fn write(self: &mut Interp, inv: &mut Inv, ptr: i64, k: i64, v: u32) {
         let sp = (ptr >> 48) & 255;
         let off = (ptr & OFF_MASK) + k;
         if ptr & PTR_INVALID != 0 {
@@ -288,24 +287,23 @@ impl Interp {
             self.wg[off] = v;
         } else {
             let b = (ptr >> 32) & 65535;
-            let mut buf = self.bufs[b];
-            if off < buf.len() {
-                buf[off] = v;
+            if off < self.bufs[b].len() {
+                self.bufs[b][off] = v;
             }
         }
     }
 
-    fn get_ptr(self: *Interp, inv: *Inv, addr: i64) -> i64 {
+    fn get_ptr(self: &Interp, inv: &Inv, addr: i64) -> i64 {
         (inv.mem[addr] as i64) | ((inv.mem[addr + 1] as i64) << 32)
     }
 
-    fn put_ptr(self: *Interp, inv: *Inv, addr: i64, p: i64) {
+    fn put_ptr(self: &Interp, inv: &mut Inv, addr: i64, p: i64) {
         inv.mem[addr] = (p & OFF_MASK) as u32;
         inv.mem[addr + 1] = ((p >> 32) & OFF_MASK) as u32;
     }
 
     // The length of the runtime-sized array at byte `offset` of global g.
-    fn runtime_len(self: *Interp, g: i64, offset: i64, stride: i64) -> i64 {
+    fn runtime_len(self: &Interp, g: i64, offset: i64, stride: i64) -> i64 {
         let bytes = self.bufs[g].len() * 4 - offset;
         if bytes <= 0 || stride <= 0 {
             return 0;
@@ -314,7 +312,7 @@ impl Interp {
     }
 
     // The global a pointer expression starts from, or -1.
-    fn root_global(self: *Interp, f: *Function, e: i64) -> i64 {
+    fn root_global(self: &Interp, f: &Function, e: i64) -> i64 {
         let x = f.exprs[e];
         if x.op == E_GLOBAL {
             return x.a;
@@ -328,7 +326,7 @@ impl Interp {
     // ---- Running a dispatch ----
 
     // Runs entry point `ei` over groups[0] x groups[1] x groups[2] workgroups.
-    pub fn dispatch(self: *Interp, m: *Module, ei: i64, groups: [i64; 3]) -> bool {
+    pub fn dispatch(self: &mut Interp, m: &Module, ei: i64, groups: [i64; 3]) -> bool {
         let en = m.entries[ei];
         let n = en.wg[0] * en.wg[1] * en.wg[2];
         self.wg_size = en.wg;
@@ -357,7 +355,7 @@ impl Interp {
                         let lx = li % en.wg[0];
                         let ly = (li / en.wg[0]) % en.wg[1];
                         let lz = li / (en.wg[0] * en.wg[1]);
-                        let mut inv = invs[li];
+                        let inv = &mut invs[li];
                         inv.mem.truncate(0);
                         for _ in 0..size {
                             inv.mem.push(0);
@@ -370,11 +368,11 @@ impl Interp {
                         inv.state = ST_RUN;
                         inv.phase = 0;
                         inv.frames.push(Frame { func: fi, base: 0, ctl_base: 0, ret: -1 });
-                        self.enter(m, &inv, inv.frames[0]);
+                        let fr0 = inv.frames[0];
+                        self.enter(m, inv, fr0);
                         let body = m.functions[fi].body;
                         inv.ctl.push(Ctl { kind: CT_BLOCK, blk: body, pos: 0, s: -1 });
-                        self.set_builtins(m, &inv, fi, [lx, ly, lz], [gx, gy, gz], li);
-                        invs[li] = inv;
+                        self.set_builtins(m, inv, fi, [lx, ly, lz], [gx, gy, gz], li);
                     }
                     // run the workgroup's invocations, barrier to barrier
                     loop {
@@ -385,13 +383,11 @@ impl Interp {
                                 continue;
                             }
                             invs[li].state = ST_RUN;
-                            let mut inv = invs[li];
-                            self.run(m, &inv);
-                            invs[li] = inv;
+                            self.run(m, &mut invs[li]);
                             if self.failed {
                                 return false;
                             }
-                            if inv.state == ST_BARRIER {
+                            if invs[li].state == ST_BARRIER {
                                 at_barrier += 1;
                             }
                             running += 1;
@@ -413,9 +409,9 @@ impl Interp {
         true
     }
 
-    fn set_builtins(self: *Interp, m: *Module, inv: *Inv, fi: i64, l: [i64; 3], g: [i64; 3],
+    fn set_builtins(self: &Interp, m: &Module, inv: &mut Inv, fi: i64, l: [i64; 3], g: [i64; 3],
         li: i64) {
-        let f = m.functions[fi];
+        let f = &m.functions[fi];
         for p in 0..f.params.len() {
             let e = self.fns[fi].arg_exprs[p];
             if e < 0 {
@@ -434,7 +430,8 @@ impl Interp {
         }
     }
 
-    fn put_builtin(self: *Interp, inv: *Inv, b: i64, dst: i64, l: [i64; 3], g: [i64; 3], li: i64) {
+    fn put_builtin(self: &Interp, inv: &mut Inv, b: i64, dst: i64, l: [i64; 3], g: [i64; 3],
+        li: i64) {
         for k in 0..3 {
             let v = if b == BI_LOCAL_INVOCATION_ID {
                 l[k]
@@ -457,7 +454,7 @@ impl Interp {
     // ---- Statements ----
 
     // Runs an invocation until it ends, reaches a barrier or fails.
-    fn run(self: *Interp, m: *Module, inv: *Inv) {
+    fn run(self: &Interp, m: &Module, inv: &mut Inv) {
         loop {
             if self.failed {
                 return;
@@ -474,22 +471,22 @@ impl Interp {
             }
             let ci = inv.ctl.len() - 1;
             let c = inv.ctl[ci];
-            let f = m.functions[fr.func];
+            let f = &m.functions[fr.func];
             let blk = f.blocks[c.blk];
             if c.pos >= blk.count {
-                self.end_block(m, inv, &f, ci);
+                self.end_block(m, inv, f, ci);
                 continue;
             }
             inv.ctl[ci].pos += 1;
             let s = f.items[blk.start + c.pos];
-            if !self.exec(m, inv, &f, fr, s) {
+            if !self.exec(m, inv, f, fr, s) {
                 return;
             }
         }
     }
 
     // The block at ctl[ci] finished.
-    fn end_block(self: *Interp, m: *Module, inv: *Inv, f: *Function, ci: i64) {
+    fn end_block(self: &mut Interp, m: &Module, inv: &mut Inv, f: &Function, ci: i64) {
         let c = inv.ctl[ci];
         if c.kind == CT_BODY {
             let st = f.stmts[c.s];
@@ -519,7 +516,7 @@ impl Interp {
 
     // Returns from the current function with the value at register `src`
     // of its frame (or none).
-    fn ret(self: *Interp, m: *Module, inv: *Inv, src_e: i64) {
+    fn ret(self: &Interp, m: &Module, inv: &mut Inv, src_e: i64) {
         let fr = inv.frames.pop().unwrap();
         if fr.ret >= 0 && src_e >= 0 {
             let w = words_of(m, m.functions[fr.func].exprs[src_e].ty);
@@ -538,9 +535,8 @@ impl Interp {
 
     // Runs statement s; false when the invocation stops (a barrier, the
     // end, an error).
-    fn exec(self: *Interp, m: *Module, inv: *Inv, f: *Function, fr: Frame, s: i64) -> bool {
+    fn exec(self: &Interp, m: &Module, inv: &mut Inv, f: &Function, fr: Frame, s: i64) -> bool {
         let st = f.stmts[s];
-        let regs = self.fns[fr.func].regs;
         let op = st.op;
         if op == S_EMIT {
             for e in st.a..st.b {
@@ -549,9 +545,9 @@ impl Interp {
             return !self.failed;
         }
         if op == S_STORE {
-            let p = self.get_ptr(inv, fr.base + regs[st.a]);
+            let p = self.get_ptr(inv, fr.base + self.fns[fr.func].regs[st.a]);
             let w = words_of(m, f.exprs[st.b].ty);
-            let src = fr.base + regs[st.b];
+            let src = fr.base + self.fns[fr.func].regs[st.b];
             for k in 0..w {
                 self.write(inv, p, k, inv.mem[src + k]);
             }
@@ -562,7 +558,7 @@ impl Interp {
             return true;
         }
         if op == S_IF {
-            let c = inv.mem[fr.base + regs[st.a]];
+            let c = inv.mem[fr.base + self.fns[fr.func].regs[st.a]];
             inv.ctl.push(Ctl {
                 kind: CT_BLOCK, blk: if c != 0 { st.b } else { st.c }, pos: 0, s: -1
             });
@@ -573,7 +569,7 @@ impl Interp {
             return true;
         }
         if op == S_SWITCH {
-            let v = inv.mem[fr.base + regs[st.a]] as i64;
+            let v = inv.mem[fr.base + self.fns[fr.func].regs[st.a]] as i64;
             let mut body = -1;
             for k in st.b..st.b + st.c {
                 let cs = f.cases[k];
@@ -639,9 +635,9 @@ impl Interp {
                 return false;
             }
             inv.phase = 0;
-            let p = self.get_ptr(inv, fr.base + regs[st.a]);
+            let p = self.get_ptr(inv, fr.base + self.fns[fr.func].regs[st.a]);
             let w = words_of(m, f.exprs[st.b].ty);
-            let dst = fr.base + regs[st.b];
+            let dst = fr.base + self.fns[fr.func].regs[st.b];
             for k in 0..w {
                 inv.mem[dst + k] = self.read(inv, p, k);
             }
@@ -650,26 +646,24 @@ impl Interp {
         }
         if op == S_CALL {
             let callee = st.a;
-            let cf = self.fns[callee];
             let base = inv.mem.len();
-            for _ in 0..cf.size {
+            for _ in 0..self.fns[callee].size {
                 inv.mem.push(0);
             }
-            let params = m.functions[callee].params;
             for k in 0..st.c {
                 let ae = f.args[st.b + k];
-                let pe = cf.arg_exprs[k];
+                let pe = self.fns[callee].arg_exprs[k];
                 if pe < 0 {
                     continue;
                 }
-                let w = words_of(m, params[k].ty);
-                let src = fr.base + regs[ae];
-                let dst = base + cf.regs[pe];
+                let w = words_of(m, m.functions[callee].params[k].ty);
+                let src = fr.base + self.fns[fr.func].regs[ae];
+                let dst = base + self.fns[callee].regs[pe];
                 for j in 0..w {
                     inv.mem[dst + j] = inv.mem[src + j];
                 }
             }
-            let ret = if st.d >= 0 { fr.base + regs[st.d] } else { -1 };
+            let ret = if st.d >= 0 { fr.base + self.fns[fr.func].regs[st.d] } else { -1 };
             let nf = Frame { func: callee, base: base, ctl_base: inv.ctl.len(), ret: ret };
             inv.frames.push(nf);
             self.enter(m, inv, nf);
@@ -681,10 +675,10 @@ impl Interp {
             return true;
         }
         if op == S_ATOMIC {
-            let p = self.get_ptr(inv, fr.base + regs[st.a]);
+            let p = self.get_ptr(inv, fr.base + self.fns[fr.func].regs[st.a]);
             let sk = m.types[m.pointee(f.exprs[st.a].ty)].scalar;
             let old = self.read(inv, p, 0);
-            let v = if st.c >= 0 { inv.mem[fr.base + regs[st.c]] } else { 0 };
+            let v = if st.c >= 0 { inv.mem[fr.base + self.fns[fr.func].regs[st.c]] } else { 0 };
             let fun = st.b;
             let mut new = old;
             if fun == AT_ADD {
@@ -706,7 +700,7 @@ impl Interp {
             } else if fun == AT_EXCHANGE || fun == AT_STORE {
                 new = v;
             } else if fun == AT_CMPXCHG {
-                let cmp = inv.mem[fr.base + regs[st.e]];
+                let cmp = inv.mem[fr.base + self.fns[fr.func].regs[st.e]];
                 if old == cmp {
                     new = v;
                 }
@@ -715,10 +709,10 @@ impl Interp {
                 self.write(inv, p, 0, new);
             }
             if st.d >= 0 {
-                let dst = fr.base + regs[st.d];
+                let dst = fr.base + self.fns[fr.func].regs[st.d];
                 inv.mem[dst] = old;
                 if fun == AT_CMPXCHG {
-                    let cmp = inv.mem[fr.base + regs[st.e]];
+                    let cmp = inv.mem[fr.base + self.fns[fr.func].regs[st.e]];
                     // exchanged: the member at offset 4
                     inv.mem[dst + 1] = if old == cmp && p & PTR_INVALID == 0 { 1 } else { 0 };
                 }
@@ -736,22 +730,21 @@ impl Interp {
     // A new frame: the registers of its globals and locals hold their
     // addresses from the start (they are leaves: an S_EMIT may cover one
     // in a branch the invocation does not take).
-    fn enter(self: *Interp, m: *Module, inv: *Inv, fr: Frame) {
-        let f = m.functions[fr.func];
+    fn enter(self: &Interp, m: &Module, inv: &mut Inv, fr: Frame) {
+        let f = &m.functions[fr.func];
         for e in 0..f.exprs.len() {
             let op = f.exprs[e].op;
             if op == E_GLOBAL || op == E_LOCAL {
-                self.eval(m, inv, &f, fr, e);
+                self.eval(m, inv, f, fr, e);
             }
         }
     }
 
     // ---- Expressions ----
 
-    fn eval(self: *Interp, m: *Module, inv: *Inv, f: *Function, fr: Frame, e: i64) {
+    fn eval(self: &Interp, m: &Module, inv: &mut Inv, f: &Function, fr: Frame, e: i64) {
         let x = f.exprs[e];
-        let regs = self.fns[fr.func].regs;
-        let dst = fr.base + regs[e];
+        let dst = fr.base + self.fns[fr.func].regs[e];
         let op = x.op;
         if op == E_LITERAL {
             inv.mem[dst] = x.a as u32;
@@ -793,7 +786,7 @@ impl Interp {
             return;
         }
         if op == E_LOAD {
-            let p = self.get_ptr(inv, fr.base + regs[x.a]);
+            let p = self.get_ptr(inv, fr.base + self.fns[fr.func].regs[x.a]);
             let w = words_of(m, x.ty);
             for k in 0..w {
                 inv.mem[dst + k] = self.read(inv, p, k);
@@ -810,7 +803,7 @@ impl Interp {
             if op == E_ACCESS_INDEX {
                 idx = x.b;
             } else {
-                let iv = inv.mem[fr.base + regs[x.b]] as i64;
+                let iv = inv.mem[fr.base + self.fns[fr.func].regs[x.b]] as i64;
                 idx = iv;
                 if x.c == CK_CLAMP {
                     if idx > x.d - 1 {
@@ -818,7 +811,7 @@ impl Interp {
                     }
                 } else if x.c == CK_RZSW {
                     let g = self.root_global(f, x.a);
-                    let bp = self.get_ptr(inv, fr.base + regs[x.a]);
+                    let bp = self.get_ptr(inv, fr.base + self.fns[fr.func].regs[x.a]);
                     let start = (bp & OFF_MASK) * 4;
                     let len = if g >= 0 { self.runtime_len(g, start, t.stride) } else { 0 };
                     if idx >= len {
@@ -840,14 +833,14 @@ impl Interp {
                 idx * t.stride / 4
             };
             if is_ptr {
-                let mut p = self.get_ptr(inv, fr.base + regs[x.a]) + off;
+                let mut p = self.get_ptr(inv, fr.base + self.fns[fr.func].regs[x.a]) + off;
                 if invalid {
                     p = p | PTR_INVALID;
                 }
                 self.put_ptr(inv, dst, p);
             } else {
                 let w = words_of(m, x.ty);
-                let src = fr.base + regs[x.a] + off;
+                let src = fr.base + self.fns[fr.func].regs[x.a] + off;
                 for k in 0..w {
                     inv.mem[dst + k] = inv.mem[src + k];
                 }
@@ -861,7 +854,7 @@ impl Interp {
                 let a = f.args[x.a + k];
                 let aw = words_of(m, f.exprs[a].ty);
                 let o = compose_offset(m, t, k, at);
-                let src = fr.base + regs[a];
+                let src = fr.base + self.fns[fr.func].regs[a];
                 for j in 0..aw {
                     inv.mem[dst + o + j] = inv.mem[src + j];
                 }
@@ -870,7 +863,7 @@ impl Interp {
             return;
         }
         if op == E_SPLAT {
-            let v = inv.mem[fr.base + regs[x.a]];
+            let v = inv.mem[fr.base + self.fns[fr.func].regs[x.a]];
             let n = m.types[x.ty].n;
             for k in 0..n {
                 inv.mem[dst + k] = v;
@@ -878,7 +871,7 @@ impl Interp {
             return;
         }
         if op == E_SWIZZLE {
-            let src = fr.base + regs[x.a];
+            let src = fr.base + self.fns[fr.func].regs[x.a];
             // through a temporary: the source may be read after the first write
             let mut tmp: [u32; 4] = [0; 4];
             for k in 0..x.c {
@@ -892,7 +885,7 @@ impl Interp {
         if op == E_UNARY {
             let t = m.types[x.ty];
             let n = if t.kind == TK_VECTOR { t.n } else { 1 };
-            let src = fr.base + regs[x.b];
+            let src = fr.base + self.fns[fr.func].regs[x.b];
             for k in 0..n {
                 let v = inv.mem[src + k];
                 inv.mem[dst + k] = if x.a == UN_NEG {
@@ -913,9 +906,9 @@ impl Interp {
             let t = m.types[x.ty];
             let w = words_of(m, x.ty);
             let ct = m.types[f.exprs[x.a].ty];
-            let c = fr.base + regs[x.a];
-            let tsrc = fr.base + regs[x.b];
-            let fsrc = fr.base + regs[x.c];
+            let c = fr.base + self.fns[fr.func].regs[x.a];
+            let tsrc = fr.base + self.fns[fr.func].regs[x.b];
+            let fsrc = fr.base + self.fns[fr.func].regs[x.c];
             for k in 0..w {
                 let ck = if ct.kind == TK_VECTOR { inv.mem[c + k] } else { inv.mem[c] };
                 inv.mem[dst + k] = if ck != 0 { inv.mem[tsrc + k] } else { inv.mem[fsrc + k] };
@@ -927,7 +920,7 @@ impl Interp {
             let t = m.types[x.ty];
             let from = m.types[f.exprs[x.a].ty].scalar;
             let n = if t.kind == TK_VECTOR { t.n } else { 1 };
-            let src = fr.base + regs[x.a];
+            let src = fr.base + self.fns[fr.func].regs[x.a];
             for k in 0..n {
                 inv.mem[dst + k] = convert(inv.mem[src + k], from, t.scalar);
             }
@@ -935,7 +928,7 @@ impl Interp {
         }
         if op == E_BITCAST {
             let w = words_of(m, x.ty);
-            let src = fr.base + regs[x.a];
+            let src = fr.base + self.fns[fr.func].regs[x.a];
             for k in 0..w {
                 inv.mem[dst + k] = inv.mem[src + k];
             }
@@ -964,14 +957,13 @@ impl Interp {
         self.fail("unknown expression");
     }
 
-    fn binary(self: *Interp, m: *Module, inv: *Inv, f: *Function, fr: Frame, e: i64) {
+    fn binary(self: &Interp, m: &Module, inv: &mut Inv, f: &Function, fr: Frame, e: i64) {
         let x = f.exprs[e];
-        let regs = self.fns[fr.func].regs;
-        let dst = fr.base + regs[e];
+        let dst = fr.base + self.fns[fr.func].regs[e];
         let lt = m.types[f.exprs[x.b].ty];
         let rt = m.types[f.exprs[x.c].ty];
-        let l = fr.base + regs[x.b];
-        let r = fr.base + regs[x.c];
+        let l = fr.base + self.fns[fr.func].regs[x.b];
+        let r = fr.base + self.fns[fr.func].regs[x.c];
         let op = x.a;
         if lt.kind == TK_MATRIX || rt.kind == TK_MATRIX {
             self.matrix_binary(m, inv, op, lt, rt, x.ty, l, r, dst);
@@ -987,7 +979,7 @@ impl Interp {
         }
     }
 
-    fn matrix_binary(self: *Interp, m: *Module, inv: *Inv, op: i64, lt: ir::Type, rt: ir::Type,
+    fn matrix_binary(self: &Interp, m: &Module, inv: &mut Inv, op: i64, lt: ir::Type, rt: ir::Type,
         ty: i64, l: i64, r: i64, dst: i64) {
         let res = m.types[ty];
         if op == OP_ADD || op == OP_SUB {
@@ -1075,15 +1067,14 @@ impl Interp {
         }
     }
 
-    fn math(self: *Interp, m: *Module, inv: *Inv, fx: *Function, fr: Frame, e: i64) {
+    fn math(self: &Interp, m: &Module, inv: &mut Inv, fx: &Function, fr: Frame, e: i64) {
         let x = fx.exprs[e];
-        let regs = self.fns[fr.func].regs;
-        let dst = fr.base + regs[e];
+        let dst = fr.base + self.fns[fr.func].regs[e];
         let fun = x.a;
         let nargs = x.c;
         let mut a: [i64; 4] = [0; 4];
         for k in 0..nargs {
-            a[k] = fr.base + regs[fx.args[x.b + k]];
+            a[k] = fr.base + self.fns[fr.func].regs[fx.args[x.b + k]];
         }
         let at = m.types[fx.exprs[fx.args[x.b]].ty];
         let n = if at.kind == TK_VECTOR { at.n } else { 1 };
@@ -1208,7 +1199,7 @@ impl Interp {
         }
     }
 
-    fn packing(self: *Interp, inv: *Inv, fun: i64, src: i64, dst: i64) {
+    fn packing(self: &Interp, inv: &mut Inv, fun: i64, src: i64, dst: i64) {
         if fun == ir::MF_PACK4X8UNORM || fun == ir::MF_PACK4X8SNORM {
             let mut r: u32 = 0;
             for k in 0..4 {
@@ -1370,16 +1361,17 @@ pub fn convert(v: u32, from: u8, to: u8) -> u32 {
             if x <= -2147483648.0 {
                 return 2147483648;
             }
-            if x >= 2147483647.0 {
-                return 2147483647;
+            // WGSL: the nearest value representable in both i32 and f32
+            if x >= 2147483520.0 {
+                return 2147483520;
             }
             return (x as i64) as u32;
         }
         if x <= 0.0 {
             return 0;
         }
-        if x >= 4294967295.0 {
-            return 4294967295;
+        if x >= 4294967040.0 {
+            return 4294967040;
         }
         return (x as i64) as u32;
     }

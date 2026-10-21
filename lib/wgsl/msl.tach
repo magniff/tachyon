@@ -68,7 +68,7 @@ pub struct Slots {
     sizes_count: i64,
 }
 
-pub fn slots(m: *Module, a: ScopedArena) -> Slots {
+pub fn slots(m: &Module, a: ScopedArena) -> Slots {
     let mut s = Slots { slot: Vec::new_in(a), size_index: Vec::new_in(a), sizes_count: 0 };
     let mut nb = 0;
     let mut nt = 0;
@@ -98,11 +98,28 @@ pub fn slots(m: *Module, a: ScopedArena) -> Slots {
     s
 }
 
+// A name the writer made: text in its pool (W.pool).
+#[derive(Clone)]
+struct Nm { start: i64, len: i64 }
+
+fn nm(pool: &Buf<ScopedArena>, n: Nm) -> [u8] { pool.as_slice()[n.start..n.start + n.len] }
+
+// Appends s's bytes. (A Buf<ScopedArena> holds a view, of its arena, so
+// the checker takes `dst.push_str(local.as_slice())` into a field as
+// keeping a view of `local`; bytes pushed one by one are plain values.)
+fn copy_into(dst: &mut Buf<ScopedArena>, s: [u8]) {
+    for i in 0..s.len {
+        dst.push(s[i]);
+    }
+}
+
 struct W {
     a: ScopedArena,
     out: Buf<ScopedArena>,
-    // the types' MSL names, made on first use; -1 slots are not yet written
-    tname: V<[u8]>,
+    // the text of every name the writer made
+    pool: Buf<ScopedArena>,
+    // the types' MSL names, made on first use
+    tname: V<Nm>,
     tdone: V<bool>,
     types_out: Buf<ScopedArena>,
     // helpers used
@@ -111,26 +128,26 @@ struct W {
     need_sign: bool,
     need_flb: bool,
     need_ftb: bool,
-    need_cmpxchg: V<[u8]>,
+    need_cmpxchg: V<Nm>,
     sl: Slots,
     // per function: the globals it uses (directly or through calls)
     uses: V<V<bool>>,
-    fnames: V<[u8]>,
-    gnames: V<[u8]>,
+    fnames: V<Nm>,
+    gnames: V<Nm>,
     // the function being written
     fh: i64,
     refc: V<i64>,
     baked: V<bool>,
     // a name per local, parameter and baked expression of the function
-    lnames: V<[u8]>,
-    enames: V<[u8]>,
-    used: HashMap<[u8], bool, ScopedArena>,
+    lnames: V<Nm>,
+    enames: V<Nm>,
+    used: V<Nm>,
     indent: i64,
     loop_n: i64,
     // entry points: the stage being written (255: a plain function), and
     // its output struct's name
     stage: i64,
-    out_name: [u8],
+    out_name: Nm,
     ret_ty: i64,
     // each type's kind
     kinds: V<u8>,
@@ -146,9 +163,30 @@ fn is_reserved(s: [u8]) -> bool {
 }
 
 impl W {
-    fn p(self: *W, s: [u8]) { self.out.push_str(s); }
+    fn p(self: &mut W, s: [u8]) { self.out.push_str(s); }
 
-    fn line(self: *W) {
+    // A pooled name into the output.
+    fn pn(self: &mut W, n: Nm) { self.out.push_str(nm(&self.pool, n)); }
+
+    // A type's name into the output.
+    fn pty(self: &mut W, m: &Module, t: i64) {
+        let n = self.ty(m, t);
+        self.pn(n);
+    }
+
+    fn s(self: &W, n: Nm) -> [u8] { nm(&self.pool, n) }
+
+    // Text into the pool: a name.
+    fn intern(self: &mut W, s: [u8]) -> Nm {
+        let st = self.pool.len();
+        copy_into(&mut self.pool, s);
+        Nm { start: st, len: s.len }
+    }
+
+    // The pool's text from `st` on, as a name.
+    fn since(self: &W, st: i64) -> Nm { Nm { start: st, len: self.pool.len() - st } }
+
+    fn line(self: &mut W) {
         self.out.push('\n');
         for _ in 0..self.indent {
             self.out.push_str("    ");
@@ -157,36 +195,51 @@ impl W {
 
     // A WGSL identifier as an MSL one: reserved words get a `_`, names
     // starting with `_` a `u` (the writer's own names start with `_`).
-    fn escape(self: *W, s: [u8]) -> [u8] {
+    fn escape(self: &mut W, s: [u8]) -> Nm {
         if s.len == 0 {
-            return "_w_t";
+            return self.intern("_w_t");
         }
-        let mut b = Buf::new_in(self.a);
+        let st = self.pool.len();
         if s[0] == '_' {
-            b.push('u');
+            self.pool.push('u');
         }
-        b.push_str(s);
+        copy_into(&mut self.pool, s);
         if is_reserved(s) || s.len > 3 && s[0..3] == "_w_" {
-            b.push('_');
+            self.pool.push('_');
         }
-        b.as_slice()
+        self.since(st)
+    }
+
+    fn is_used(self: &W, n: Nm) -> bool {
+        let t = nm(&self.pool, n);
+        for i in 0..self.used.len() {
+            if nm(&self.pool, self.used[i]) == t {
+                return true;
+            }
+        }
+        false
     }
 
     // A name unique in the function being written.
-    fn unique(self: *W, base: [u8]) -> [u8] {
-        let s = self.escape(base);
-        if !self.used.contains_key(s) {
-            self.used.insert(s, true);
-            return s;
+    fn unique(self: &mut W, base: [u8]) -> Nm {
+        let n = self.escape(base);
+        if !self.is_used(n) {
+            self.used.push(n);
+            return n;
         }
         let mut k = 1;
         loop {
-            let mut b = Buf::new_in(self.a);
-            b.push_str(s);
-            b.push_str(f"_{k}");
-            let t = b.as_slice();
-            if !self.used.contains_key(t) {
-                self.used.insert(t, true);
+            let st = self.pool.len();
+            let mut i = 0;
+            while i < n.len {
+                let c = self.pool.as_slice()[n.start + i];
+                self.pool.push(c);
+                i += 1;
+            }
+            self.pool.push_str(f"_{k}");
+            let t = self.since(st);
+            if !self.is_used(t) {
+                self.used.push(t);
                 return t;
             }
             k += 1;
@@ -208,58 +261,67 @@ impl W {
     }
 
     // The MSL name of type t (declaring structs and array wrappers once).
-    fn ty(self: *W, m: *Module, t: i64) -> [u8] {
+    fn ty(self: &mut W, m: &Module, t: i64) -> Nm {
         if self.tdone[t] {
             return self.tname[t];
         }
         let ty = m.types[t];
-        let mut b = Buf::new_in(self.a);
+        let mut n = Nm { start: 0, len: 0 };
         if ty.kind == TK_SCALAR {
-            b.push_str(W::scalar(ty.scalar));
+            n = self.intern(W::scalar(ty.scalar));
         } else if ty.kind == TK_VECTOR {
-            b.push_str(f"metal::{W::scalar(ty.scalar)}{ty.n}");
+            let st = self.pool.len();
+            self.pool.push_str(f"metal::{W::scalar(ty.scalar)}{ty.n}");
+            n = self.since(st);
         } else if ty.kind == TK_MATRIX {
-            b.push_str(f"metal::float{ty.n}x{ty.m}");
+            let st = self.pool.len();
+            self.pool.push_str(f"metal::float{ty.n}x{ty.m}");
+            n = self.since(st);
         } else if ty.kind == TK_ATOMIC {
-            b.push_str(if ty.scalar == SK_I32 { "metal::atomic_int" }
+            n = self.intern(if ty.scalar == SK_I32 { "metal::atomic_int" }
                 else { "metal::atomic_uint" });
         } else if ty.kind == TK_ARRAY {
             let el = self.ty(m, ty.base);
-            b.push_str(f"_w_arr{t}");
+            let st = self.pool.len();
+            self.pool.push_str(f"_w_arr{t}");
+            n = self.since(st);
             if ty.n > 0 {
-                self.types_out.push_str(f"struct _w_arr{t} {{\n    {el} inner[{ty.n}];\n}};\n");
+                self.types_out.push_str(
+                    f"struct _w_arr{t} {{\n    {nm(&self.pool, el)} inner[{ty.n}];\n}};\n");
             }
         } else if ty.kind == TK_STRUCT {
-            b.push_str(self.escape(ty.name));
-            self.struct_def(m, t, b.as_slice());
+            n = self.escape(ty.name);
+            self.struct_def(m, t, n);
         } else if ty.kind == TK_TEXTURE {
-            let st = W::scalar(ty.scalar);
+            let sc = W::scalar(ty.scalar);
+            let st = self.pool.len();
             if ty.n == TEX_DEPTH_2D {
-                b.push_str("metal::depth2d<float, metal::access::sample>");
+                self.pool.push_str("metal::depth2d<float, metal::access::sample>");
             } else if ty.n == TEX_2D_ARRAY {
-                b.push_str(f"metal::texture2d_array<{st}, metal::access::sample>");
+                self.pool.push_str(f"metal::texture2d_array<{sc}, metal::access::sample>");
             } else if ty.n == TEX_STORAGE_2D {
-                b.push_str(f"metal::texture2d<{st}, metal::access::write>");
+                self.pool.push_str(f"metal::texture2d<{sc}, metal::access::write>");
             } else {
-                b.push_str(f"metal::texture2d<{st}, metal::access::sample>");
+                self.pool.push_str(f"metal::texture2d<{sc}, metal::access::sample>");
             }
+            n = self.since(st);
         } else if ty.kind == TK_SAMPLER {
-            b.push_str("metal::sampler");
+            n = self.intern("metal::sampler");
         } else {
-            b.push_str("void");
+            n = self.intern("void");
         }
-        self.tname[t] = b.as_slice();
+        self.tname[t] = n;
         self.tdone[t] = true;
-        self.tname[t]
+        n
     }
 
     // A member's MSL type: vec3 members are packed (12 bytes, as WGSL's).
-    fn member_ty(self: *W, m: *Module, t: i64) -> [u8] {
+    fn member_ty(self: &mut W, m: &Module, t: i64) -> Nm {
         let ty = m.types[t];
         if ty.kind == TK_VECTOR && ty.n == 3 {
-            let mut b = Buf::new_in(self.a);
-            b.push_str(f"metal::packed_{W::scalar(ty.scalar)}3");
-            return b.as_slice();
+            let st = self.pool.len();
+            self.pool.push_str(f"metal::packed_{W::scalar(ty.scalar)}3");
+            return self.since(st);
         }
         if ty.kind == TK_ARRAY && ty.n == 0 {
             return self.ty(m, ty.base);
@@ -267,14 +329,14 @@ impl W {
         self.ty(m, t)
     }
 
-    fn struct_def(self: *W, m: *Module, t: i64, name: [u8]) {
+    fn struct_def(self: &mut W, m: &Module, t: i64, name: Nm) {
         let ty = m.types[t];
         // member types first: they must be declared before
         for i in ty.mstart..ty.mstart + ty.mcount {
             self.member_ty(m, m.members[i].ty);
         }
         let mut b = Buf::new_in(self.a);
-        b.push_str(f"struct {name} {{\n");
+        b.push_str(f"struct {nm(&self.pool, name)} {{\n");
         let mut off = 0;
         let mut pad = 0;
         for i in ty.mstart..ty.mstart + ty.mcount {
@@ -285,11 +347,12 @@ impl W {
             }
             let mt = m.types[mem.ty];
             let mty = self.member_ty(m, mem.ty);
+            let mn = self.escape(mem.name);
             if mt.kind == TK_ARRAY && mt.n == 0 {
-                b.push_str(f"    {mty} {self.escape(mem.name)}[1];\n");
+                b.push_str(f"    {nm(&self.pool, mty)} {nm(&self.pool, mn)}[1];\n");
                 off = mem.offset + mt.stride;
             } else {
-                b.push_str(f"    {mty} {self.escape(mem.name)};\n");
+                b.push_str(f"    {nm(&self.pool, mty)} {nm(&self.pool, mn)};\n");
                 off = mem.offset + mt.size;
             }
         }
@@ -298,12 +361,12 @@ impl W {
             b.push_str(f"    char _pad{pad}[{ty.size - off}];\n");
         }
         b.push_str("};\n");
-        self.types_out.push_str(b.as_slice());
+        copy_into(&mut self.types_out, b.as_slice());
     }
 
     // The padding members before member k of struct t (for aggregate
     // initialization), and after the last.
-    fn pads_before(m: *Module, t: i64, k: i64) -> bool {
+    fn pads_before(m: &Module, t: i64, k: i64) -> bool {
         let ty = m.types[t];
         let mem = m.members[ty.mstart + k];
         if k == 0 {
@@ -328,7 +391,7 @@ impl W {
 
 // ---- Analysis ----
 
-fn calls_of(f: *Function, list: *V<i64>) {
+fn calls_of(f: &Function, list: &V<i64>) {
     for s in 0..f.stmts.len() {
         if f.stmts[s].op == S_CALL {
             list.push(f.stmts[s].a);
@@ -337,7 +400,7 @@ fn calls_of(f: *Function, list: *V<i64>) {
 }
 
 // Functions in an order where each comes after those it calls.
-pub fn call_order(m: *Module, a: ScopedArena) -> V<i64> {
+pub fn call_order(m: &Module, a: ScopedArena) -> V<i64> {
     let n = m.functions.len();
     let mut state: V<u8> = Vec::filled_in(n, 0u8, a);
     let mut order: V<i64> = Vec::new_in(a);
@@ -347,7 +410,7 @@ pub fn call_order(m: *Module, a: ScopedArena) -> V<i64> {
     order
 }
 
-fn visit(m: *Module, i: i64, state: *V<u8>, order: *V<i64>, a: ScopedArena) {
+fn visit(m: &Module, i: i64, state: &V<u8>, order: &V<i64>, a: ScopedArena) {
     if state[i] != 0 {
         return;
     }
@@ -361,7 +424,7 @@ fn visit(m: *Module, i: i64, state: *V<u8>, order: *V<i64>, a: ScopedArena) {
 }
 
 // Which globals each function uses, through its calls too (order: callees first).
-pub fn global_uses(m: *Module, order: *V<i64>, a: ScopedArena) -> V<V<bool>> {
+pub fn global_uses(m: &Module, order: &V<i64>, a: ScopedArena) -> V<V<bool>> {
     let ng = m.globals.len();
     let mut uses: V<V<bool>> = Vec::new_in(a);
     for _ in 0..m.functions.len() {
@@ -369,22 +432,18 @@ pub fn global_uses(m: *Module, order: *V<i64>, a: ScopedArena) -> V<V<bool>> {
     }
     for oi in 0..order.len() {
         let h = order[oi];
-        let f = m.functions[h];
-        let mut u = uses[h];
+        let f = &m.functions[h];
         for e in 0..f.exprs.len() {
-            if f.exprs[e].op == E_GLOBAL {
-                u[f.exprs[e].a] = true;
-            }
-            if f.exprs[e].op == E_ARRAY_LENGTH {
-                u[f.exprs[e].a] = true;
+            if f.exprs[e].op == E_GLOBAL || f.exprs[e].op == E_ARRAY_LENGTH {
+                uses[h][f.exprs[e].a] = true;
             }
         }
         for s in 0..f.stmts.len() {
             if f.stmts[s].op == S_CALL {
-                let cu = uses[f.stmts[s].a];
+                let callee = f.stmts[s].a;
                 for g in 0..ng {
-                    if cu[g] {
-                        u[g] = true;
+                    if uses[callee][g] {
+                        uses[h][g] = true;
                     }
                 }
             }
@@ -395,7 +454,7 @@ pub fn global_uses(m: *Module, order: *V<i64>, a: ScopedArena) -> V<V<bool>> {
 
 // Whether function h needs the sizes buffer (a runtime-sized array it or a
 // callee reads).
-fn needs_sizes(w: *W, m: *Module, h: i64) -> bool {
+fn needs_sizes(w: &W, m: &Module, h: i64) -> bool {
     for g in 0..m.globals.len() {
         if w.uses[h][g] && w.sl.size_index[g] >= 0 {
             return true;
@@ -404,7 +463,7 @@ fn needs_sizes(w: *W, m: *Module, h: i64) -> bool {
     false
 }
 
-pub fn write(m: *Module, a: ScopedArena, out: *Buf) {
+pub fn write(m: &Module, a: ScopedArena, out: &mut Buf) {
     let mut w = new_writer(m, a);
     let order = call_order(m, a);
     w.uses = global_uses(m, &order, a);
@@ -417,16 +476,16 @@ pub fn write(m: *Module, a: ScopedArena, out: *Buf) {
             }
         }
         if !is_entry {
-            write_fn(&w, m, h);
+            write_fn(&mut w, m, h);
         }
     }
     for e in 0..m.entries.len() {
-        write_entry(&w, m, e);
+        write_entry(&mut w, m, e);
     }
-    finish(&w, out);
+    finish(&mut w, out);
 }
 
-fn new_writer(m: *Module, a: ScopedArena) -> W {
+fn new_writer(m: &Module, a: ScopedArena) -> W {
     let mut w = W {
         a: a,
         out: Buf::with_capacity_in(16384, a),
@@ -448,16 +507,17 @@ fn new_writer(m: *Module, a: ScopedArena) -> W {
         baked: Vec::new_in(a),
         lnames: Vec::new_in(a),
         enames: Vec::new_in(a),
-        used: HashMap::new_in(a),
+        used: Vec::new_in(a),
         indent: 0,
         loop_n: 0,
         stage: 255,
-        out_name: "",
+        out_name: Nm { start: 0, len: 0 },
+        pool: Buf::with_capacity_in(4096, a),
         ret_ty: -1,
         kinds: Vec::new_in(a),
     };
     for t in 0..m.types.len() {
-        w.tname.push("");
+        w.tname.push(Nm { start: 0, len: 0 });
         w.tdone.push(false);
         w.kinds.push(m.types[t].kind);
     }
@@ -473,7 +533,7 @@ fn new_writer(m: *Module, a: ScopedArena) -> W {
     w
 }
 
-fn helpers<A: Allocator>(w: *W, out: *Buf<A>) {
+fn helpers<A: Allocator>(w: &W, out: &mut Buf<A>) {
     if w.need_div {
         out.push_str("static inline int _w_div(int a, int b) { return a / metal::select(b, 1, b == 0 || (a == (-2147483647 - 1) && b == -1)); }\n");
         out.push_str("static inline uint _w_div(uint a, uint b) { return a / metal::select(b, 1u, b == 0u); }\n");
@@ -517,11 +577,11 @@ fn helpers<A: Allocator>(w: *W, out: *Buf<A>) {
         out.push_str("template <typename T> static inline T _w_ftb(T x) { return metal::select(metal::ctz(x), T(4294967295u), x == T(0)); }\n");
     }
     for i in 0..w.need_cmpxchg.len() {
-        out.push_str(w.need_cmpxchg[i]);
+        out.push_str(w.s(w.need_cmpxchg[i]));
     }
 }
 
-fn finish(w: *W, out: *Buf) {
+fn finish(w: &W, out: &mut Buf) {
     out.push_str(
         "// Generated by wgslc (MSL 3.0).\n#include <metal_stdlib>\n#include <simd/simd.h>\n\n");
     helpers(w, out);
@@ -532,7 +592,7 @@ fn finish(w: *W, out: *Buf) {
 
 // ---- Functions ----
 
-fn count_refs(w: *W, f: *Function) {
+fn count_refs(w: &mut W, f: &Function) {
     w.refc.clear();
     w.baked.clear();
     for _ in 0..f.exprs.len() {
@@ -634,7 +694,7 @@ fn count_refs(w: *W, f: *Function) {
 // ---- Expressions ----
 
 impl W {
-    fn lit(self: *W, m: *Module, f: *Function, e: i64) {
+    fn lit(self: &W, m: &Module, f: &Function, e: i64) {
         let x = f.exprs[e];
         let sk = m.types[x.ty].scalar;
         if sk == SK_BOOL {
@@ -681,33 +741,33 @@ impl W {
     }
 
     // e as a value: its name, or its text.
-    fn val(self: *W, m: *Module, f: *Function, e: i64) {
+    fn val(self: &W, m: &Module, f: &Function, e: i64) {
         let op = f.exprs[e].op;
         if self.baked[e] || op == E_CALL_RESULT || op == E_ATOMIC_RESULT
             || op == E_WG_UNIFORM_RESULT {
-            self.p(self.enames[e]);
+            self.pn(self.enames[e]);
             return;
         }
         if op == E_ARG {
-            self.p(self.enames[e]);
+            self.pn(self.enames[e]);
             return;
         }
         self.render(m, f, e);
     }
 
     // The unsigned type of the same shape as t (i32 -> uint, int3 -> uint3).
-    fn utype(self: *W, m: *Module, t: i64) -> [u8] {
+    fn utype(self: &mut W, m: &Module, t: i64) -> Nm {
         let ty = m.types[t];
         if ty.kind == TK_VECTOR {
-            let mut b = Buf::new_in(self.a);
-            b.push_str(f"metal::uint{ty.n}");
-            return b.as_slice();
+            let st = self.pool.len();
+            self.pool.push_str(f"metal::uint{ty.n}");
+            return self.since(st);
         }
-        "uint"
+        self.intern("uint")
     }
 
     // The index of an E_ACCESS, clamped when its check says so.
-    fn index(self: *W, m: *Module, f: *Function, e: i64) {
+    fn index(self: &W, m: &Module, f: &Function, e: i64) {
         let x = f.exprs[e];
         if x.c == CK_CLAMP {
             self.p("metal::min(uint(");
@@ -719,14 +779,14 @@ impl W {
     }
 
     // A pointer expression as an lvalue.
-    fn lval(self: *W, m: *Module, f: *Function, e: i64) {
+    fn lval(self: &W, m: &Module, f: &Function, e: i64) {
         let x = f.exprs[e];
         if x.op == E_GLOBAL {
-            self.p(self.gnames[x.a]);
+            self.pn(self.gnames[x.a]);
         } else if x.op == E_LOCAL {
-            self.p(self.lnames[x.a]);
+            self.pn(self.lnames[x.a]);
         } else if x.op == E_ARG {
-            self.out.push_str(f"(*{self.enames[e]})");
+            self.out.push_str(f"(*{nm(&self.pool, self.enames[e])})");
         } else if x.op == E_ACCESS || x.op == E_ACCESS_INDEX {
             let bt = m.types[m.pointee(f.exprs[x.a].ty)];
             self.lval(m, f, x.a);
@@ -737,12 +797,13 @@ impl W {
     }
 
     // `.member`, `[i]` or `.inner[i]` after a base of type bt.
-    fn selector(self: *W, m: *Module, f: *Function, e: i64, bt: Type) {
+    fn selector(self: &W, m: &Module, f: &Function, e: i64, bt: Type) {
         let x = f.exprs[e];
         if x.op == E_ACCESS_INDEX {
             if bt.kind == TK_STRUCT {
                 self.p(".");
-                self.p(self.escape(m.members[bt.mstart + x.b].name));
+                let n = self.escape(m.members[bt.mstart + x.b].name);
+                self.pn(n);
             } else if bt.kind == TK_ARRAY && bt.n > 0 {
                 self.out.push_str(f".inner[{x.b}]");
             } else {
@@ -760,7 +821,7 @@ impl W {
 
     // Whether e (a pointer, or a member value) is a struct's vec3 member,
     // which MSL holds packed.
-    fn is_packed_member(self: *W, m: *Module, f: *Function, e: i64) -> bool {
+    fn is_packed_member(self: &W, m: &Module, f: &Function, e: i64) -> bool {
         let x = f.exprs[e];
         if x.op != E_ACCESS_INDEX {
             return false;
@@ -776,7 +837,7 @@ impl W {
 
     // The conditions under which the pointer e is in range (runtime-sized
     // arrays); false when there are none.
-    fn guards(self: *W, m: *Module, f: *Function, e: i64, any: bool) -> bool {
+    fn guards(self: &W, m: &Module, f: &Function, e: i64, any: bool) -> bool {
         let x = f.exprs[e];
         let mut a = any;
         if x.op == E_ACCESS || x.op == E_ACCESS_INDEX {
@@ -795,7 +856,7 @@ impl W {
         a
     }
 
-    fn has_guards(self: *W, f: *Function, e: i64) -> bool {
+    fn has_guards(self: &W, f: &Function, e: i64) -> bool {
         let x = f.exprs[e];
         if x.op == E_ACCESS && x.c == CK_RZSW {
             return true;
@@ -807,7 +868,7 @@ impl W {
     }
 
     // The length of the runtime-sized array pointer `base` points to.
-    fn runtime_len(self: *W, m: *Module, f: *Function, base: i64) {
+    fn runtime_len(self: &W, m: &Module, f: &Function, base: i64) {
         let b = f.exprs[base];
         let mut g = -1;
         let mut off = 0;
@@ -822,7 +883,7 @@ impl W {
         self.len_text(g, off, stride);
     }
 
-    fn len_text(self: *W, g: i64, off: i64, stride: i64) {
+    fn len_text(self: &W, g: i64, off: i64, stride: i64) {
         if g < 0 {
             self.p("0u");
             return;
@@ -836,18 +897,18 @@ impl W {
         }
     }
 
-    fn render(self: *W, m: *Module, f: *Function, e: i64) {
+    fn render(self: &mut W, m: &Module, f: &Function, e: i64) {
         let x = f.exprs[e];
         let op = x.op;
         let t = m.types[x.ty];
         if op == E_LITERAL {
             self.lit(m, f, e);
         } else if op == E_ZERO {
-            self.p(self.ty(m, x.ty));
+            self.pty(m, x.ty);
             self.p(" {}");
         } else if op == E_COMPOSE {
             let tn = self.ty(m, x.ty);
-            self.p(tn);
+            self.pn(tn);
             if t.kind == TK_VECTOR || t.kind == TK_MATRIX {
                 self.p("(");
             } else if t.kind == TK_ARRAY {
@@ -872,7 +933,7 @@ impl W {
                 self.p("}");
             }
         } else if op == E_SPLAT {
-            self.p(self.ty(m, x.ty));
+            self.pty(m, x.ty);
             self.p("(");
             self.val(m, f, x.a);
             self.p(")");
@@ -887,7 +948,7 @@ impl W {
             let bt = m.types[f.exprs[x.a].ty];
             let packed = op == E_ACCESS_INDEX && self.is_packed_member(m, f, e);
             if packed {
-                self.p(self.ty(m, x.ty));
+                self.pty(m, x.ty);
                 self.p("(");
             }
             self.p("(");
@@ -907,7 +968,7 @@ impl W {
             }
             let packed = self.is_packed_member(m, f, pe);
             if packed {
-                self.p(self.ty(m, x.ty));
+                self.pty(m, x.ty);
                 self.p("(");
             }
             self.lval(m, f, pe);
@@ -916,13 +977,16 @@ impl W {
             }
             if g {
                 self.p(" : ");
-                self.p(self.ty(m, x.ty));
+                self.pty(m, x.ty);
                 self.p(" {})");
             }
         } else if op == E_UNARY {
             let sk = t.scalar;
             if x.a == UN_NEG && sk == SK_I32 {
-                self.out.push_str(f"as_type<{self.ty(m, x.ty)}>(-as_type<{self.utype(m, x.ty)}>(");
+                let _n1 = self.ty(m, x.ty);
+                let _n2 = self.utype(m, x.ty);
+                self.out.push_str(
+                    f"as_type<{nm(&self.pool, _n1)}>(-as_type<{nm(&self.pool, _n2)}>(");
                 self.val(m, f, x.b);
                 self.p("))");
             } else {
@@ -957,13 +1021,14 @@ impl W {
                 self.need_f2i = true;
                 self.p(if t.scalar == SK_I32 { "_w_f2i(" } else { "_w_f2u(" });
             } else {
-                self.p(self.ty(m, x.ty));
+                self.pty(m, x.ty);
                 self.p("(");
             }
             self.val(m, f, x.a);
             self.p(")");
         } else if op == E_BITCAST {
-            self.out.push_str(f"as_type<{self.ty(m, x.ty)}>(");
+            let _n3 = self.ty(m, x.ty);
+            self.out.push_str(f"as_type<{nm(&self.pool, _n3)}>(");
             self.val(m, f, x.a);
             self.p(")");
         } else if op == E_MATH {
@@ -982,19 +1047,20 @@ impl W {
         } else if op == E_IMAGE_QUERY {
             let tex = self.enames_or_global(m, f, x.a);
             if x.b == IQ_LEVELS {
-                self.out.push_str(f"{tex}.get_num_mip_levels()");
+                self.out.push_str(f"{nm(&self.pool, tex)}.get_num_mip_levels()");
             } else if x.b == IQ_LAYERS {
-                self.out.push_str(f"{tex}.get_array_size()");
+                self.out.push_str(f"{nm(&self.pool, tex)}.get_array_size()");
             } else {
                 let tt = m.types[f.exprs[x.a].ty];
                 if x.c >= 0 && tt.n != TEX_STORAGE_2D {
-                    self.out.push_str(f"metal::uint2({tex}.get_width(");
+                    self.out.push_str(f"metal::uint2({nm(&self.pool, tex)}.get_width(");
                     self.val(m, f, x.c);
-                    self.out.push_str(f"), {tex}.get_height(");
+                    self.out.push_str(f"), {nm(&self.pool, tex)}.get_height(");
                     self.val(m, f, x.c);
                     self.p("))");
                 } else {
-                    self.out.push_str(f"metal::uint2({tex}.get_width(), {tex}.get_height())");
+                    self.out.push_str(
+                        f"metal::uint2({nm(&self.pool, tex)}.get_width(), {nm(&self.pool, tex)}.get_height())");
                 }
             }
         } else {
@@ -1002,7 +1068,7 @@ impl W {
         }
     }
 
-    fn enames_or_global(self: *W, m: *Module, f: *Function, e: i64) -> [u8] {
+    fn enames_or_global(self: &W, m: &Module, f: &Function, e: i64) -> Nm {
         let x = f.exprs[e];
         let _ = m;
         if x.op == E_GLOBAL {
@@ -1011,7 +1077,7 @@ impl W {
         self.enames[e]
     }
 
-    fn binary(self: *W, m: *Module, f: *Function, e: i64) {
+    fn binary(self: &mut W, m: &Module, f: &Function, e: i64) {
         let x = f.exprs[e];
         let op = x.a;
         let lt = m.types[f.exprs[x.b].ty];
@@ -1040,7 +1106,7 @@ impl W {
         if sk == SK_I32 && (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_SHL) {
             let tn = self.ty(m, f.exprs[x.b].ty);
             let un = self.utype(m, f.exprs[x.b].ty);
-            self.out.push_str(f"as_type<{tn}>(as_type<{un}>(");
+            self.out.push_str(f"as_type<{nm(&self.pool, tn)}>(as_type<{nm(&self.pool, un)}>(");
             self.val(m, f, x.b);
             self.p(if op == OP_ADD { ") + as_type<" } else if op == OP_SUB { ") - as_type<" }
                 else if op == OP_MUL { ") * as_type<" } else { ") << (" });
@@ -1048,7 +1114,7 @@ impl W {
                 self.val(m, f, x.c);
                 self.p(" & 31u))");
             } else {
-                self.out.push_str(f"{un}>(");
+                self.out.push_str(f"{nm(&self.pool, un)}>(");
                 self.val(m, f, x.c);
                 self.p("))");
             }
@@ -1107,7 +1173,7 @@ impl W {
         self.p(")");
     }
 
-    fn math(self: *W, m: *Module, f: *Function, e: i64) {
+    fn math(self: &mut W, m: &Module, f: &Function, e: i64) {
         let x = f.exprs[e];
         let fun = x.a;
         let a0 = f.args[x.b];
@@ -1116,14 +1182,18 @@ impl W {
         let int = sk == SK_I32 || sk == SK_U32;
         if fun == ir::MF_ABS && sk == SK_I32 {
             // abs(MIN) is MIN: through uint
+            let _n4 = self.ty(m, x.ty);
+            let _n5 = self.utype(m, x.ty);
             self.out.push_str(
-                f"as_type<{self.ty(m, x.ty)}>(metal::select(as_type<{self.utype(m, x.ty)}>(");
+                f"as_type<{nm(&self.pool, _n4)}>(metal::select(as_type<{nm(&self.pool, _n5)}>(");
             self.val(m, f, a0);
-            self.out.push_str(f"), -as_type<{self.utype(m, x.ty)}>(");
+            let _n6 = self.utype(m, x.ty);
+            self.out.push_str(f"), -as_type<{nm(&self.pool, _n6)}>(");
             self.val(m, f, a0);
             self.p("), ");
             self.val(m, f, a0);
-            self.out.push_str(f" < {self.ty(m, x.ty)}(0)))");
+            let _n7 = self.ty(m, x.ty);
+            self.out.push_str(f" < {nm(&self.pool, _n7)}(0)))");
             return;
         }
         if fun == ir::MF_ABS && sk == SK_U32 {
@@ -1260,7 +1330,7 @@ impl W {
         self.p(")");
     }
 
-    fn sample(self: *W, m: *Module, f: *Function, e: i64) {
+    fn sample(self: &W, m: &Module, f: &Function, e: i64) {
         let x = f.exprs[e];
         let kind = x.d & 255;
         let n = x.d >> 8;
@@ -1268,7 +1338,8 @@ impl W {
         let tex = self.enames_or_global(m, f, x.a);
         let smp = self.enames_or_global(m, f, x.b);
         let compare = kind == IMG_SAMPLE_COMPARE || kind == IMG_SAMPLE_COMPARE_LEVEL;
-        self.out.push_str(f"{tex}.{if compare { "sample_compare" } else { "sample" }}({smp}, ");
+        self.out.push_str(
+            f"{nm(&self.pool, tex)}.{if compare { "sample_compare" } else { "sample" }}({nm(&self.pool, smp)}, ");
         self.val(m, f, f.args[x.c]);
         let mut k = 1;
         if tt.n == TEX_2D_ARRAY {
@@ -1296,29 +1367,26 @@ impl W {
     }
 
     // textureLoad: the level, layer and coordinates clamped into range.
-    fn image_load(self: *W, m: *Module, f: *Function, e: i64) {
+    fn image_load(self: &mut W, m: &Module, f: &Function, e: i64) {
         let x = f.exprs[e];
         let tt = m.types[f.exprs[x.a].ty];
         let tex = self.enames_or_global(m, f, x.a);
         let arrayed = tt.n == TEX_2D_ARRAY;
         let lvl = f.args[x.c + x.d - 1];
-        let mut lb = Buf::new_in(self.a);
-        let saved = self.out;
-        self.out = lb;
+        let saved = std::replace(&mut self.out, Buf::new_in(self.a));
         self.out.push_str(f"metal::min(uint(");
         self.val(m, f, lvl);
-        self.out.push_str(f"), {tex}.get_num_mip_levels() - 1u)");
-        lb = self.out;
-        self.out = saved;
+        self.out.push_str(f"), {nm(&self.pool, tex)}.get_num_mip_levels() - 1u)");
+        let lb = std::replace(&mut self.out, saved);
         let l = lb.as_slice();
-        self.out.push_str(f"{tex}.read(metal::min(metal::uint2(");
+        self.out.push_str(f"{nm(&self.pool, tex)}.read(metal::min(metal::uint2(");
         self.val(m, f, f.args[x.c]);
         self.out.push_str(
-            f"), metal::uint2({tex}.get_width({l}) - 1u, {tex}.get_height({l}) - 1u))");
+            f"), metal::uint2({nm(&self.pool, tex)}.get_width({l}) - 1u, {nm(&self.pool, tex)}.get_height({l}) - 1u))");
         if arrayed {
             self.p(", metal::min(uint(");
             self.val(m, f, f.args[x.c + 1]);
-            self.out.push_str(f"), {tex}.get_array_size() - 1u)");
+            self.out.push_str(f"), {nm(&self.pool, tex)}.get_array_size() - 1u)");
         }
         self.out.push_str(f", {l})");
     }
@@ -1327,14 +1395,14 @@ impl W {
 // ---- Statements ----
 
 impl W {
-    fn block(self: *W, m: *Module, f: *Function, blk: i64) {
+    fn block(self: &W, m: &Module, f: &Function, blk: i64) {
         let b = f.blocks[blk];
         for i in b.start..b.start + b.count {
             self.stmt(m, f, f.items[i]);
         }
     }
 
-    fn braced(self: *W, m: *Module, f: *Function, blk: i64) {
+    fn braced(self: &mut W, m: &Module, f: &Function, blk: i64) {
         self.p("{");
         self.indent += 1;
         self.block(m, f, blk);
@@ -1367,16 +1435,16 @@ impl W {
         }
     }
 
-    fn stmt(self: *W, m: *Module, f: *Function, s: i64) {
+    fn stmt(self: &mut W, m: &Module, f: &Function, s: i64) {
         let st = f.stmts[s];
         let op = st.op;
         if op == S_EMIT {
             for e in st.a..st.b {
                 if self.baked[e] {
                     self.line();
-                    self.p(self.ty(m, f.exprs[e].ty));
+                    self.pty(m, f.exprs[e].ty);
                     self.p(" ");
-                    self.p(self.enames[e]);
+                    self.pn(self.enames[e]);
                     self.p(" = ");
                     self.render(m, f, e);
                     self.p(";");
@@ -1492,16 +1560,16 @@ impl W {
         } else if op == S_WG_UNIFORM_LOAD {
             self.p("metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);");
             self.line();
-            self.p(self.ty(m, f.exprs[st.b].ty));
-            self.out.push_str(f" {self.enames[st.b]} = ");
+            self.pty(m, f.exprs[st.b].ty);
+            self.out.push_str(f" {nm(&self.pool, self.enames[st.b])} = ");
             self.lval(m, f, st.a);
             self.p(";");
             self.line();
             self.p("metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);");
         } else if op == S_CALL {
             if st.d >= 0 {
-                self.p(self.ty(m, f.exprs[st.d].ty));
-                self.out.push_str(f" {self.enames[st.d]} = ");
+                self.pty(m, f.exprs[st.d].ty);
+                self.out.push_str(f" {nm(&self.pool, self.enames[st.d])} = ");
             }
             self.call(m, f, st.a, st.b, st.c);
             self.p(";");
@@ -1512,7 +1580,7 @@ impl W {
             self.p("if (metal::all(metal::uint2(");
             self.val(m, f, st.b);
             self.out.push_str(
-                f") < metal::uint2({tex}.get_width(), {tex}.get_height()))) {{ {tex}.write(");
+                f") < metal::uint2({nm(&self.pool, tex)}.get_width(), {nm(&self.pool, tex)}.get_height()))) {{ {nm(&self.pool, tex)}.write(");
             self.val(m, f, st.c);
             self.p(", metal::uint2(");
             self.val(m, f, st.b);
@@ -1520,7 +1588,7 @@ impl W {
         }
     }
 
-    fn atomic(self: *W, m: *Module, f: *Function, s: i64) {
+    fn atomic(self: &mut W, m: &Module, f: &Function, s: i64) {
         let st = f.stmts[s];
         let g = self.has_guards(f, st.a);
         let pt = m.types[f.exprs[st.a].ty];
@@ -1529,19 +1597,24 @@ impl W {
         let sp = W::space(pt.space, pt.access);
         if st.b == AT_CMPXCHG {
             let rty = self.ty(m, f.exprs[st.d].ty);
+            let mut rb = Buf::new_in(self.a);
+            rb.push_str(nm(&self.pool, rty));
+            let rn = rb.as_slice();
+            let hst = self.pool.len();
             let mut h = Buf::new_in(self.a);
-            h.push_str(f"static inline {rty} _w_cmpxchg({sp} metal::atomic_{tn}* p, {tn} cmp, {tn} v) {{ {tn} old = cmp; bool ok = metal::atomic_compare_exchange_weak_explicit(p, &old, v, metal::memory_order_relaxed, metal::memory_order_relaxed); return {rty} {{old, ok}}; }}\n");
-            let hs = h.as_slice();
+            h.push_str(f"static inline {rn} _w_cmpxchg({sp} metal::atomic_{tn}* p, {tn} cmp, {tn} v) {{ {tn} old = cmp; bool ok = metal::atomic_compare_exchange_weak_explicit(p, &old, v, metal::memory_order_relaxed, metal::memory_order_relaxed); return {rn} {{old, ok}}; }}\n");
+            copy_into(&mut self.pool, h.as_slice());
+            let hs = self.since(hst);
             let mut have = false;
             for i in 0..self.need_cmpxchg.len() {
-                if self.need_cmpxchg[i] == hs {
+                if nm(&self.pool, self.need_cmpxchg[i]) == nm(&self.pool, hs) {
                     have = true;
                 }
             }
             if !have {
                 self.need_cmpxchg.push(hs);
             }
-            self.out.push_str(f"{rty} {self.enames[st.d]} = ");
+            self.out.push_str(f"{nm(&self.pool, rty)} {nm(&self.pool, self.enames[st.d])} = ");
             if g {
                 self.p("(");
                 self.guards(m, f, st.a, false);
@@ -1555,13 +1628,13 @@ impl W {
             self.val(m, f, st.c);
             self.p(")");
             if g {
-                self.out.push_str(f" : {rty} {{}}");
+                self.out.push_str(f" : {nm(&self.pool, rty)} {{}}");
             }
             self.p(";");
             return;
         }
         if st.d >= 0 {
-            self.out.push_str(f"{tn} {self.enames[st.d]} = ");
+            self.out.push_str(f"{tn} {nm(&self.pool, self.enames[st.d])} = ");
         }
         if g {
             if st.d >= 0 {
@@ -1588,8 +1661,8 @@ impl W {
         self.p(";");
     }
 
-    fn call(self: *W, m: *Module, f: *Function, callee: i64, start: i64, n: i64) {
-        self.p(self.fnames[callee]);
+    fn call(self: &W, m: &Module, f: &Function, callee: i64, start: i64, n: i64) {
+        self.pn(self.fnames[callee]);
         self.p("(");
         let mut first = true;
         for k in start..start + n {
@@ -1611,7 +1684,7 @@ impl W {
                     self.p(", ");
                 }
                 first = false;
-                self.p(self.gnames[g]);
+                self.pn(self.gnames[g]);
             }
         }
         if needs_sizes(self, m, callee) {
@@ -1623,7 +1696,7 @@ impl W {
         self.p(")");
     }
 
-    fn ret(self: *W, m: *Module, f: *Function, e: i64) {
+    fn ret(self: &W, m: &Module, f: &Function, e: i64) {
         if e < 0 {
             self.p("return;");
             return;
@@ -1638,13 +1711,14 @@ impl W {
         let rt = m.types[self.ret_ty];
         self.p("{ const auto _w_r = ");
         self.val(m, f, e);
-        self.out.push_str(f"; return {self.out_name} {{ ");
+        self.out.push_str(f"; return {nm(&self.pool, self.out_name)} {{ ");
         if rt.kind == TK_STRUCT && f.result_binding.kind == ir::BIND_NONE {
             for k in 0..rt.mcount {
                 if k > 0 {
                     self.p(", ");
                 }
-                self.out.push_str(f"_w_r.{self.escape(m.members[rt.mstart + k].name)}");
+                let _n8 = self.escape(m.members[rt.mstart + k].name);
+                self.out.push_str(f"_w_r.{nm(&self.pool, _n8)}");
             }
         } else {
             self.p("_w_r");
@@ -1655,19 +1729,21 @@ impl W {
 
 // ---- Functions and entry points ----
 
-fn start_fn(w: *W, m: *Module, h: i64) {
-    let f = m.functions[h];
+fn start_fn(w: &mut W, m: &Module, h: i64) {
+    let f = &m.functions[h];
     w.fh = h;
-    w.used = HashMap::new_in(w.a);
+    w.used.clear();
     w.loop_n = 0;
     // the module-scope names stay reserved
     for k in 0..w.fnames.len() {
-        w.used.insert(w.fnames[k], true);
+        let n = w.fnames[k];
+        w.used.push(n);
     }
     for k in 0..w.gnames.len() {
-        w.used.insert(w.gnames[k], true);
+        let n = w.gnames[k];
+        w.used.push(n);
     }
-    count_refs(w, &f);
+    count_refs(w, f);
     w.enames.clear();
     for e in 0..f.exprs.len() {
         let x = f.exprs[e];
@@ -1681,12 +1757,13 @@ fn start_fn(w: *W, m: *Module, h: i64) {
                 let n = w.unique(f.names[e]);
                 w.enames.push(n);
             } else {
-                let mut b = Buf::new_in(w.a);
-                b.push_str(f"_e{e}");
-                w.enames.push(b.as_slice());
+                let st = w.pool.len();
+                w.pool.push_str(f"_e{e}");
+                let n = w.since(st);
+                w.enames.push(n);
             }
         } else {
-            w.enames.push("");
+            w.enames.push(Nm { start: 0, len: 0 });
         }
     }
     w.lnames.clear();
@@ -1697,7 +1774,7 @@ fn start_fn(w: *W, m: *Module, h: i64) {
 }
 
 // The parameter list's global part: each global the function uses.
-fn global_params(w: *W, m: *Module, h: i64, first: bool) -> bool {
+fn global_params(w: &W, m: &Module, h: i64, first: bool) -> bool {
     let mut fst = first;
     for g in 0..m.globals.len() {
         if !w.uses[h][g] {
@@ -1710,14 +1787,16 @@ fn global_params(w: *W, m: *Module, h: i64, first: bool) -> bool {
         let gl = m.globals[g];
         let tk = m.types[gl.ty].kind;
         if gl.space == SP_HANDLE {
-            w.p(w.ty(m, gl.ty));
+            w.pty(m, gl.ty);
             w.p(" ");
         } else if tk == TK_ARRAY && m.types[gl.ty].n == 0 {
-            w.out.push_str(f"{W::space(gl.space, gl.access)} {w.ty(m, m.types[gl.ty].base)}* ");
+            let _n9 = w.ty(m, m.types[gl.ty].base);
+            w.out.push_str(f"{W::space(gl.space, gl.access)} {nm(&w.pool, _n9)}* ");
         } else {
-            w.out.push_str(f"{W::space(gl.space, gl.access)} {w.ty(m, gl.ty)}& ");
+            let _n10 = w.ty(m, gl.ty);
+            w.out.push_str(f"{W::space(gl.space, gl.access)} {nm(&w.pool, _n10)}& ");
         }
-        w.p(w.gnames[g]);
+        w.pn(w.gnames[g]);
     }
     if needs_sizes(w, m, h) {
         if !fst {
@@ -1729,24 +1808,25 @@ fn global_params(w: *W, m: *Module, h: i64, first: bool) -> bool {
     fst
 }
 
-fn declare_locals(w: *W, m: *Module, f: *Function) {
+fn declare_locals(w: &W, m: &Module, f: &Function) {
     for l in 0..f.locals.len() {
         w.line();
-        w.out.push_str(f"{w.ty(m, f.locals[l].ty)} {w.lnames[l]} = {{}};");
+        let _n11 = w.ty(m, f.locals[l].ty);
+        w.out.push_str(f"{nm(&w.pool, _n11)} {nm(&w.pool, w.lnames[l])} = {{}};");
     }
 }
 
-fn write_fn(w: *W, m: *Module, h: i64) {
-    let f = m.functions[h];
+fn write_fn(w: &mut W, m: &Module, h: i64) {
+    let f = &m.functions[h];
     start_fn(w, m, h);
     w.stage = 255;
     w.p("\n");
     if f.result >= 0 {
-        w.p(w.ty(m, f.result));
+        w.pty(m, f.result);
     } else {
         w.p("void");
     }
-    w.out.push_str(f" {w.fnames[h]}(");
+    w.out.push_str(f" {nm(&w.pool, w.fnames[h])}(");
     let mut first = true;
     for k in 0..f.params.len() {
         if !first {
@@ -1754,24 +1834,26 @@ fn write_fn(w: *W, m: *Module, h: i64) {
         }
         first = false;
         let pt = m.types[f.params[k].ty];
-        let ae = arg_expr(&f, k);
+        let ae = arg_expr(f, k);
         let pname = if ae >= 0 { w.enames[ae] } else { w.unique(f.params[k].name) };
         if pt.kind == TK_POINTER {
-            w.out.push_str(f"thread {w.ty(m, pt.base)}* {pname}");
+            let _n12 = w.ty(m, pt.base);
+            w.out.push_str(f"thread {nm(&w.pool, _n12)}* {nm(&w.pool, pname)}");
         } else {
-            w.out.push_str(f"{w.ty(m, f.params[k].ty)} {pname}");
+            let _n13 = w.ty(m, f.params[k].ty);
+            w.out.push_str(f"{nm(&w.pool, _n13)} {nm(&w.pool, pname)}");
         }
     }
     global_params(w, m, h, first);
     w.p(") {");
     w.indent = 1;
-    declare_locals(w, m, &f);
-    w.block(m, &f, f.body);
+    declare_locals(w, m, f);
+    w.block(m, f, f.body);
     w.indent = 0;
     w.p("\n}\n");
 }
 
-fn arg_expr(f: *Function, k: i64) -> i64 {
+fn arg_expr(f: &Function, k: i64) -> i64 {
     for e in 0..f.exprs.len() {
         if f.exprs[e].op == E_ARG && f.exprs[e].a == k {
             return e;
@@ -1820,8 +1902,8 @@ fn interp_attr(b: Binding) -> [u8] {
 
 // One IO value of an entry point: as a stage_in member (`in_struct`) or a
 // parameter.
-fn io_decl(w: *W, m: *Module, stage: u8, ty: i64, b: Binding, name: [u8], output: bool) {
-    w.p(w.ty(m, ty));
+fn io_decl(w: &W, m: &Module, stage: u8, ty: i64, b: Binding, name: [u8], output: bool) {
+    w.pty(m, ty);
     w.out.push_str(f" {name} [[");
     if b.kind == BIND_BUILTIN {
         w.p(builtin_attr(b.value));
@@ -1835,7 +1917,7 @@ fn io_decl(w: *W, m: *Module, stage: u8, ty: i64, b: Binding, name: [u8], output
     w.p("]]");
 }
 
-fn uses_workgroup(w: *W, m: *Module, h: i64) -> bool {
+fn uses_workgroup(w: &W, m: &Module, h: i64) -> bool {
     for g in 0..m.globals.len() {
         if w.uses[h][g] && m.globals[g].space == SP_WORKGROUP {
             return true;
@@ -1845,10 +1927,11 @@ fn uses_workgroup(w: *W, m: *Module, h: i64) -> bool {
 }
 
 // Zeroes a workgroup variable (atomics by atomic stores).
-fn zero_workgroup(w: *W, m: *Module, lv: [u8], t: i64, depth: i64) {
+fn zero_workgroup(w: &mut W, m: &Module, lv: [u8], t: i64, depth: i64) {
     if !m.has_atomic(t) {
         w.line();
-        w.out.push_str(f"{lv} = {w.ty(m, t)} {{}};");
+        let _n14 = w.ty(m, t);
+        w.out.push_str(f"{lv} = {nm(&w.pool, _n14)} {{}};");
         return;
     }
     let ty = m.types[t];
@@ -1868,27 +1951,26 @@ fn zero_workgroup(w: *W, m: *Module, lv: [u8], t: i64, depth: i64) {
     } else if ty.kind == TK_STRUCT {
         for k in ty.mstart..ty.mstart + ty.mcount {
             let mut b = Buf::new_in(w.a);
-            b.push_str(f"{lv}.{w.escape(m.members[k].name)}");
+            let _n15 = w.escape(m.members[k].name);
+            b.push_str(f"{lv}.{nm(&w.pool, _n15)}");
             zero_workgroup(w, m, b.as_slice(), m.members[k].ty, depth);
         }
     }
 }
 
-fn write_entry(w: *W, m: *Module, ei: i64) {
+fn write_entry(w: &mut W, m: &Module, ei: i64) {
     let en = m.entries[ei];
     let h = en.func;
-    let f = m.functions[h];
+    let f = &m.functions[h];
     start_fn(w, m, h);
     w.stage = en.stage as i64;
     w.ret_ty = f.result;
     let ename = w.fnames[h];
     // the stage_in struct: location inputs of vertex and fragment shaders
-    let mut in_name: [u8] = "";
+    let mut in_buf = Buf::new_in(w.a);
     if en.stage != STAGE_COMPUTE {
         let mut any = false;
-        let mut sb = Buf::new_in(w.a);
-        let saved = w.out;
-        w.out = sb;
+        let saved = std::replace(&mut w.out, Buf::new_in(w.a));
         for k in 0..f.params.len() {
             let pt = m.types[f.params[k].ty];
             if pt.kind == TK_STRUCT && f.params[k].binding.kind == ir::BIND_NONE {
@@ -1917,20 +1999,23 @@ fn write_entry(w: *W, m: *Module, ei: i64) {
                 any = true;
             }
         }
-        sb = w.out;
-        w.out = saved;
+        let sb = std::replace(&mut w.out, saved);
         if any {
-            let mut nb = Buf::new_in(w.a);
-            nb.push_str(f"{ename}_Input");
-            in_name = nb.as_slice();
-            w.out.push_str(f"\nstruct {in_name} {{{sb.as_slice()}\n}};\n");
+            in_buf.push_str(nm(&w.pool, ename));
+            in_buf.push_str("_Input");
+            w.out.push_str("\nstruct ");
+            copy_into(&mut w.out, in_buf.as_slice());
+            w.out.push_str(" {");
+            copy_into(&mut w.out, sb.as_slice());
+            w.out.push_str("\n};\n");
         }
         // the output struct
         if f.result >= 0 {
             let mut nb = Buf::new_in(w.a);
-            nb.push_str(f"{ename}_Output");
-            w.out_name = nb.as_slice();
-            w.out.push_str(f"\nstruct {w.out_name} {{");
+            nb.push_str(nm(&w.pool, ename));
+            nb.push_str("_Output");
+            w.out_name = w.intern(nb.as_slice());
+            w.out.push_str(f"\nstruct {nm(&w.pool, w.out_name)} {{");
             let rt = m.types[f.result];
             if rt.kind == TK_STRUCT && f.result_binding.kind == ir::BIND_NONE {
                 for j in rt.mstart..rt.mstart + rt.mcount {
@@ -1954,15 +2039,15 @@ fn write_entry(w: *W, m: *Module, ei: i64) {
     w.out.push_str(f"\n{kw} ");
     if en.stage != STAGE_COMPUTE {
         if f.result >= 0 {
-            w.out.push_str(f"{w.out_name} ");
+            w.out.push_str(f"{nm(&w.pool, w.out_name)} ");
         } else {
             w.p("void ");
         }
     }
-    w.out.push_str(f"{ename}(");
+    w.out.push_str(f"{nm(&w.pool, ename)}(");
     let mut first = true;
-    if in_name.len > 0 {
-        w.out.push_str(f"{in_name} _w_in [[stage_in]]");
+    if in_buf.len() > 0 {
+        w.out.push_str(f"{in_buf.as_slice()} _w_in [[stage_in]]");
         first = false;
     }
     // builtin inputs as parameters
@@ -2025,14 +2110,17 @@ fn write_entry(w: *W, m: *Module, ei: i64) {
         let tk = m.types[gl.ty].kind;
         let slot = w.sl.slot[g];
         if gl.space == SP_HANDLE {
+            let _n16 = w.ty(m, gl.ty);
             w.out.push_str(
-                f"{w.ty(m, gl.ty)} {w.gnames[g]} [[{if tk == TK_TEXTURE { "texture" } else { "sampler" }}({slot})]]");
+                f"{nm(&w.pool, _n16)} {nm(&w.pool, w.gnames[g])} [[{if tk == TK_TEXTURE { "texture" } else { "sampler" }}({slot})]]");
         } else if tk == TK_ARRAY && m.types[gl.ty].n == 0 {
+            let _n17 = w.ty(m, m.types[gl.ty].base);
             w.out.push_str(
-                f"{W::space(gl.space, gl.access)} {w.ty(m, m.types[gl.ty].base)}* {w.gnames[g]} [[buffer({slot})]]");
+                f"{W::space(gl.space, gl.access)} {nm(&w.pool, _n17)}* {nm(&w.pool, w.gnames[g])} [[buffer({slot})]]");
         } else {
+            let _n18 = w.ty(m, gl.ty);
             w.out.push_str(
-                f"{W::space(gl.space, gl.access)} {w.ty(m, gl.ty)}& {w.gnames[g]} [[buffer({slot})]]");
+                f"{W::space(gl.space, gl.access)} {nm(&w.pool, _n18)}& {nm(&w.pool, w.gnames[g])} [[buffer({slot})]]");
         }
     }
     if needs_sizes(w, m, h) {
@@ -2051,26 +2139,31 @@ fn write_entry(w: *W, m: *Module, ei: i64) {
         let gl = m.globals[g];
         if gl.space == SP_PRIVATE {
             w.line();
-            w.out.push_str(f"{w.ty(m, gl.ty)} {w.gnames[g]} = ");
+            let _n19 = w.ty(m, gl.ty);
+            w.out.push_str(f"{nm(&w.pool, _n19)} {nm(&w.pool, w.gnames[g])} = ");
             if gl.init >= 0 {
                 write_const(w, m, gl.init);
             } else {
-                w.out.push_str(f"{w.ty(m, gl.ty)} {{}}");
+                let _n20 = w.ty(m, gl.ty);
+                w.out.push_str(f"{nm(&w.pool, _n20)} {{}}");
             }
             w.p(";");
         } else if gl.space == SP_WORKGROUP {
             w.line();
-            w.out.push_str(f"threadgroup {w.ty(m, gl.ty)} {w.gnames[g]};");
+            let _n21 = w.ty(m, gl.ty);
+            w.out.push_str(f"threadgroup {nm(&w.pool, _n21)} {nm(&w.pool, w.gnames[g])};");
         }
     }
     if wg {
-        let lid = if has_lid { lid_name(w, m, &f) } else { "_w_lindex" };
+        let lid = if has_lid { lid_name(w, m, f) } else { w.intern("_w_lindex") };
         w.line();
-        w.out.push_str(f"if ({lid} == 0u) {{");
+        w.out.push_str(f"if ({nm(&w.pool, lid)} == 0u) {{");
         w.indent += 1;
         for g in 0..m.globals.len() {
             if w.uses[h][g] && m.globals[g].space == SP_WORKGROUP {
-                zero_workgroup(w, m, w.gnames[g], m.globals[g].ty, 0);
+                let mut lb = Buf::new_in(w.a);
+                lb.push_str(nm(&w.pool, w.gnames[g]));
+                zero_workgroup(w, m, lb.as_slice(), m.globals[g].ty, 0);
             }
         }
         w.indent -= 1;
@@ -2081,39 +2174,42 @@ fn write_entry(w: *W, m: *Module, ei: i64) {
     }
     // the parameters as WGSL sees them
     for k in 0..f.params.len() {
-        let ae = arg_expr(&f, k);
+        let ae = arg_expr(f, k);
         if ae < 0 {
             continue;
         }
         let pt = m.types[f.params[k].ty];
         w.line();
         if pt.kind == TK_STRUCT && f.params[k].binding.kind == ir::BIND_NONE {
-            w.out.push_str(f"{w.ty(m, f.params[k].ty)} {w.enames[ae]} = {{}};");
+            let _n22 = w.ty(m, f.params[k].ty);
+            w.out.push_str(f"{nm(&w.pool, _n22)} {nm(&w.pool, w.enames[ae])} = {{}};");
             for j in pt.mstart..pt.mstart + pt.mcount {
                 let mem = m.members[j];
                 let from_in = mem.binding.kind == BIND_LOCATION
                     || (mem.binding.kind == BIND_BUILTIN && mem.binding.value == BI_POSITION
                         && en.stage == STAGE_FRAGMENT);
                 w.line();
+                let _n23 = w.escape(mem.name);
                 w.out.push_str(
-                    f"{w.enames[ae]}.{w.escape(mem.name)} = {if from_in { "_w_in." } else { "" }}_w_p{k}_{j - pt.mstart};");
+                    f"{nm(&w.pool, w.enames[ae])}.{nm(&w.pool, _n23)} = {if from_in { "_w_in." } else { "" }}_w_p{k}_{j - pt.mstart};");
             }
         } else {
             let from_in = f.params[k].binding.kind == BIND_LOCATION
                 || (f.params[k].binding.kind == BIND_BUILTIN
                     && f.params[k].binding.value == BI_POSITION && en.stage == STAGE_FRAGMENT);
+            let _n24 = w.ty(m, f.params[k].ty);
             w.out.push_str(
-                f"{w.ty(m, f.params[k].ty)} {w.enames[ae]} = {if from_in { "_w_in." } else { "" }}_w_p{k};");
+                f"{nm(&w.pool, _n24)} {nm(&w.pool, w.enames[ae])} = {if from_in { "_w_in." } else { "" }}_w_p{k};");
         }
     }
-    declare_locals(w, m, &f);
-    w.block(m, &f, f.body);
+    declare_locals(w, m, f);
+    w.block(m, f, f.body);
     w.indent = 0;
     w.p("\n}\n");
     w.stage = 255;
 }
 
-fn lid_name(w: *W, m: *Module, f: *Function) -> [u8] {
+fn lid_name(w: &mut W, m: &Module, f: &Function) -> Nm {
     for k in 0..f.params.len() {
         let pt = m.types[f.params[k].ty];
         if pt.kind == TK_STRUCT && f.params[k].binding.kind == ir::BIND_NONE {
@@ -2121,35 +2217,29 @@ fn lid_name(w: *W, m: *Module, f: *Function) -> [u8] {
                 let mem = m.members[j];
                 if mem.binding.kind == BIND_BUILTIN
                     && mem.binding.value == BI_LOCAL_INVOCATION_INDEX {
-                    let mut b = Buf::new_in(w.a);
-                    b.push_str(f"_w_p{k}_{j - pt.mstart}");
-                    return b.as_slice();
+                    let st = w.pool.len();
+                    w.pool.push_str(f"_w_p{k}_{j - pt.mstart}");
+                    return w.since(st);
                 }
             }
         }
         else if f.params[k].binding.kind == BIND_BUILTIN
             && f.params[k].binding.value == BI_LOCAL_INVOCATION_INDEX {
-            let mut b = Buf::new_in(w.a);
-            b.push_str(f"_w_p{k}");
-            return b.as_slice();
+            let st = w.pool.len();
+            w.pool.push_str(f"_w_p{k}");
+            return w.since(st);
         }
     }
-    "_w_lindex"
+    w.intern("_w_lindex")
 }
 
 // A private global's initializer: an expression of the module's constants.
-fn write_const(w: *W, m: *Module, e: i64) {
-    let saved_baked = w.baked;
-    let saved_names = w.enames;
-    let mut nb: V<bool> = Vec::filled_in(m.consts.exprs.len(), false, w.a);
-    let mut nn: V<[u8]> = Vec::filled_in(m.consts.exprs.len(), "", w.a);
-    w.baked = nb;
-    w.enames = nn;
+fn write_const(w: &mut W, m: &Module, e: i64) {
+    let nb: V<bool> = Vec::filled_in(m.consts.exprs.len(), false, w.a);
+    let nn: V<Nm> = Vec::filled_in(m.consts.exprs.len(), Nm { start: 0, len: 0 }, w.a);
+    let saved_baked = std::replace(&mut w.baked, nb);
+    let saved_names = std::replace(&mut w.enames, nn);
     w.render(m, &m.consts, e);
-    nb = w.baked;
-    nn = w.enames;
-    let _ = nb;
-    let _ = nn;
     w.baked = saved_baked;
     w.enames = saved_names;
 }
@@ -2157,7 +2247,7 @@ fn write_const(w: *W, m: *Module, e: i64) {
 // ---- Jobs for tests/wgsl/metalrun ----
 
 // The MSL text of the module, for a job.
-fn module_text(m: *Module, a: ScopedArena, w: *W) -> Buf<ScopedArena> {
+fn module_text(m: &Module, a: ScopedArena, w: &mut W) -> Buf<ScopedArena> {
     let order = call_order(m, a);
     w.uses = global_uses(m, &order, a);
     for oi in 0..order.len() {
@@ -2176,37 +2266,38 @@ fn module_text(m: *Module, a: ScopedArena, w: *W) -> Buf<ScopedArena> {
         write_entry(w, m, e);
     }
     let mut text = Buf::new_in(a);
-    finish_into(w, &text);
+    finish_into(w, &mut text);
     text
 }
 
 // A job that only compiles the MSL and finds each entry point.
-pub fn metal_compile_job<A: Allocator>(m: *Module, a: ScopedArena, out: *Buf<A>) {
+pub fn metal_compile_job<A: Allocator>(m: &Module, a: ScopedArena, out: &mut Buf<A>) {
     let mut w = new_writer(m, a);
-    let text = module_text(m, a, &w);
+    let text = module_text(m, a, &mut w);
     out.push_str(f"msl {text.len()}\n");
     out.push_str(text.as_slice());
     out.push_str("\nfunctions");
     for e in 0..m.entries.len() {
-        out.push_str(f" {w.fnames[m.entries[e].func]}");
+        out.push_str(f" {nm(&w.pool, w.fnames[m.entries[e].func])}");
     }
     out.push('\n');
 }
 
 // The MSL of the module, then what metalrun needs: the entry point's
 // name, workgroup size, dispatch, and each buffer's slot and words.
-pub fn metal_job<A: Allocator>(m: *Module, a: ScopedArena, ei: i64, job: *job::Job, out: *Buf<A>) {
+pub fn metal_job<A: Allocator>(m: &Module, a: ScopedArena, ei: i64, job: &job::Job,
+    out: &mut Buf<A>) {
     let mut w = new_writer(m, a);
-    let text = module_text(m, a, &w);
+    let text = module_text(m, a, &mut w);
     let en = m.entries[ei];
     out.push_str(f"msl {text.len()}\n");
     out.push_str(text.as_slice());
-    out.push_str(f"\nentry {w.fnames[en.func]}\n");
+    out.push_str(f"\nentry {nm(&w.pool, w.fnames[en.func])}\n");
     out.push_str(f"tg {en.wg[0]} {en.wg[1]} {en.wg[2]}\n");
     out.push_str(f"dispatch {job.groups[0]} {job.groups[1]} {job.groups[2]}\n");
     let mut sizes: V<i64> = Vec::filled_in(w.sl.sizes_count, 0, a);
     for i in 0..job.buffers.len() {
-        let b = job.buffers[i];
+        let b = &job.buffers[i];
         let g = job::find_global(m, b.group, b.binding);
         if w.sl.size_index[g] >= 0 {
             sizes[w.sl.size_index[g]] = b.bytes;
@@ -2226,17 +2317,17 @@ pub fn metal_job<A: Allocator>(m: *Module, a: ScopedArena, ei: i64, job: *job::J
     }
 }
 
-fn finish_into(w: *W, out: *Buf<ScopedArena>) {
+fn finish_into(w: &W, out: &mut Buf<ScopedArena>) {
     let mut tmp = Buf::new_in(w.a);
     let _ = tmp;
     // finish writes to a gpa Buf in `write`; here the same text into an arena one
     out.push_str(
         "// Generated by wgslc (MSL 3.0).\n#include <metal_stdlib>\n#include <simd/simd.h>\n\n");
     let mut h = Buf::new_in(w.a);
-    helpers(w, &h);
-    out.push_str(h.as_slice());
+    helpers(w, &mut h);
+    copy_into(out, h.as_slice());
     out.push('\n');
-    out.push_str(w.types_out.as_slice());
-    out.push_str(w.out.as_slice());
+    copy_into(out, w.types_out.as_slice());
+    copy_into(out, w.out.as_slice());
     tmp = h;
 }

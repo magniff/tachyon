@@ -18,7 +18,7 @@ pub struct JobBuffer { group: i64, binding: i64, bytes: i64, words: V<u32> }
 
 pub struct Job { entry: [u8], groups: [i64; 3], buffers: V<JobBuffer> }
 
-fn xorshift(s: *u32) -> u32 {
+fn xorshift(s: &mut u32) -> u32 {
     let mut x = *s;
     x = x ^ (x << 13);
     x = x ^ (x >> 17);
@@ -45,7 +45,7 @@ fn parse_word(t: [u8]) -> Option<u32> {
     }
 }
 
-pub fn parse_job<B: Allocator>(text: [u8], a: ScopedArena, err: *Buf<B>) -> Option<Job> {
+pub fn parse_job<B: Allocator>(text: [u8], a: ScopedArena, err: &mut Buf<B>) -> Option<Job> {
     let mut job = Job { entry: "", groups: [1, 1, 1], buffers: Vec::new_in(a) };
     let mut sc = Scanner::new(text);
     while let Some(line) = sc.next_line() {
@@ -76,7 +76,7 @@ pub fn parse_job<B: Allocator>(text: [u8], a: ScopedArena, err: *Buf<B>) -> Opti
                     s = 1;
                 }
                 for k in 0..bytes / 4 {
-                    b.words[k] = xorshift(&s);
+                    b.words[k] = xorshift(&mut s);
                 }
             } else {
                 for k in 4..words.len() {
@@ -102,7 +102,7 @@ pub fn parse_job<B: Allocator>(text: [u8], a: ScopedArena, err: *Buf<B>) -> Opti
 }
 
 // The entry point a job names (or the first compute one), or -1.
-pub fn find_entry(m: *Module, name: [u8]) -> i64 {
+pub fn find_entry(m: &Module, name: [u8]) -> i64 {
     for e in 0..m.entries.len() {
         if m.entries[e].stage == STAGE_COMPUTE && (name.len == 0 || m.entries[e].name == name) {
             return e;
@@ -112,7 +112,7 @@ pub fn find_entry(m: *Module, name: [u8]) -> i64 {
 }
 
 // The global bound at (group, binding), or -1.
-pub fn find_global(m: *Module, g: i64, b: i64) -> i64 {
+pub fn find_global(m: &Module, g: i64, b: i64) -> i64 {
     for i in 0..m.globals.len() {
         if m.globals[i].group == g && m.globals[i].binding == b {
             return i;
@@ -121,11 +121,12 @@ pub fn find_global(m: *Module, g: i64, b: i64) -> i64 {
     -1
 }
 
-pub fn print_buffers<A: Allocator>(job: *Job, words_of: *V<V<u32>>, out: *Buf<A>) {
+// Each job buffer's words: words[idx[i]] for the job's i-th buffer.
+pub fn print_buffers<A: Allocator>(job: &Job, words: &V<V<u32>>, idx: &V<i64>, out: &mut Buf<A>) {
     for i in 0..job.buffers.len() {
-        let b = job.buffers[i];
+        let b = &job.buffers[i];
         out.push_str(f"buffer {b.group} {b.binding}\n");
-        let w = words_of[i];
+        let w = &words[idx[i]];
         for k in 0..w.len() {
             out.push_str(f"{w[k]:08x}");
             out.push(if k % 8 == 7 || k == w.len() - 1 { '\n' } else { ' ' });
@@ -158,19 +159,19 @@ pub fn command(interp: bool, file: [u8], job_path: [u8], gpa: Gpa) -> i32 {
         let mut fr = new_front(src.as_slice(), a);
         fr.module();
         if !fr.failed {
-            uniformity::check(&fr);
+            uniformity::check(&mut fr);
         }
         if fr.failed {
-            fill_error(&fr, &err);
+            fill_error(&fr, &mut err);
             return 1;
         }
-        bounds::insert_checks(&fr.m, a, true);
+        bounds::insert_checks(&mut fr.m, a, true);
         if compile_only {
-            msl::metal_compile_job(&fr.m, a, &out);
+            msl::metal_compile_job(&fr.m, a, &mut out);
             return 0;
         }
         let mut jerr = Buf::new_in(a);
-        let job = match parse_job(jtext.as_slice(), a, &jerr) {
+        let job = match parse_job(jtext.as_slice(), a, &mut jerr) {
             Some(j) => j,
             None => {
                 out.push_str(f"error wgslc.job: {jerr.as_slice()}\n");
@@ -183,7 +184,7 @@ pub fn command(interp: bool, file: [u8], job_path: [u8], gpa: Gpa) -> i32 {
             return 3;
         }
         for i in 0..job.buffers.len() {
-            let b = job.buffers[i];
+            let b = &job.buffers[i];
             if find_global(&fr.m, b.group, b.binding) < 0 {
                 out.push_str(
                     f"error wgslc.job: nothing is bound at @group({b.group}) @binding({b.binding})\n");
@@ -193,7 +194,7 @@ pub fn command(interp: bool, file: [u8], job_path: [u8], gpa: Gpa) -> i32 {
         if interp {
             let mut it = new_interp(&fr.m, a);
             for i in 0..job.buffers.len() {
-                let b = job.buffers[i];
+                let b = &job.buffers[i];
                 let g = find_global(&fr.m, b.group, b.binding);
                 it.set_buffer(g, b.words.as_slice());
             }
@@ -201,19 +202,19 @@ pub fn command(interp: bool, file: [u8], job_path: [u8], gpa: Gpa) -> i32 {
                 out.push_str(f"error wgslc.interp: {it.err.as_slice()}\n");
                 return 4;
             }
-            let mut res: V<V<u32>> = Vec::new_in(a);
+            let mut idx: V<i64> = Vec::new_in(a);
             for i in 0..job.buffers.len() {
-                let b = job.buffers[i];
-                res.push(it.bufs[find_global(&fr.m, b.group, b.binding)]);
+                let b = &job.buffers[i];
+                idx.push(find_global(&fr.m, b.group, b.binding));
             }
-            print_buffers(&job, &res, &out);
+            print_buffers(&job, &it.bufs, &idx, &mut out);
             return 0;
         }
-        msl::metal_job(&fr.m, a, ei, &job, &out);
+        msl::metal_job(&fr.m, a, ei, &job, &mut out);
         0
     });
     if status == 1 {
-        crate::print_error(file, &err);
+        crate::print_error(file, &mut err);
         return 1;
     }
     if status != 0 {

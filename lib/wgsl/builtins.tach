@@ -30,7 +30,7 @@ impl Front {
     // The arguments of a call, from its `(`: pushed on astack (positions
     // on apos); returns their first index. `hint`: each argument's
     // expected type, or -1.
-    fn args(self: *Front, hint: i64) -> i64 {
+    fn args(self: &mut Front, hint: i64) -> i64 {
         let base = self.astack.len();
         self.expect(T_LPAREN);
         while self.kind() != T_RPAREN && self.kind() != T_EOF {
@@ -47,12 +47,12 @@ impl Front {
         base
     }
 
-    fn drop_args(self: *Front, base: i64) {
+    fn drop_args(self: &mut Front, base: i64) {
         self.astack.truncate(base);
         self.apos.truncate(base);
     }
 
-    fn arg_count_error(self: *Front, at: i64, name: [u8], want: [u8], got: i64) {
+    fn arg_count_error(self: &Front, at: i64, name: [u8], want: [u8], got: i64) {
         if self.err(at, "wgsl.call") {
             self.emsg.push_str(f"'{name}' takes {want}, got {got}");
         }
@@ -60,18 +60,19 @@ impl Front {
 
     // ---- User functions ----
 
-    pub fn user_call(self: *Front, fh: i64, at: i64) -> Val {
-        let params = self.m.functions[fh].params;
-        let name = self.m.functions[fh].name;
+    pub fn user_call(self: &mut Front, fh: i64, at: i64) -> Val {
+        // the function being lowered has its signature in self.f
+        let nparams = if fh == self.fh { self.f.params.len() }
+            else { self.m.functions[fh].params.len() };
         let base = self.estack.len();
         self.expect(T_LPAREN);
         let mut n = 0;
         while self.kind() != T_RPAREN && self.kind() != T_EOF {
             let ap = self.pos();
-            let hint = if n < params.len() { params[n].ty } else { -1 };
+            let hint = if n < nparams { self.param_ty(fh, n) } else { -1 };
             let v = self.parse_expr_hint(hint);
-            if n < params.len() {
-                let pt = params[n].ty;
+            if n < nparams {
+                let pt = self.param_ty(fh, n);
                 let mut ok = true;
                 if self.m.types[pt].kind == TK_POINTER && v.k == VK_REF {
                     ok = false;
@@ -91,10 +92,16 @@ impl Front {
             }
         }
         self.expect(T_RPAREN);
-        if n != params.len() {
+        if n != nparams {
             if self.err(at, "wgsl.call") {
-                self.emsg.push_str(f"'{name}' takes {params.len()} argument");
-                if params.len() != 1 {
+                self.emsg.push('\'');
+                if fh == self.fh {
+                    self.emsg.push_str(self.f.name);
+                } else {
+                    self.emsg.push_str(self.m.functions[fh].name);
+                }
+                self.emsg.push_str(f"' takes {nparams} argument");
+                if nparams != 1 {
                     self.emsg.push('s');
                 }
                 self.emsg.push_str(f", got {n}");
@@ -112,10 +119,18 @@ impl Front {
         r
     }
 
+    fn param_ty(self: &Front, fh: i64, i: i64) -> i64 {
+        if fh == self.fh {
+            self.f.params[i].ty
+        } else {
+            self.m.functions[fh].params[i].ty
+        }
+    }
+
     // ---- Constructors ----
 
     // `T(args)` for a known type T, from the `(`.
-    pub fn construct(self: *Front, ty: i64, at: i64) -> Val {
+    pub fn construct(self: &mut Front, ty: i64, at: i64) -> Val {
         if self.kind() != T_LPAREN {
             if self.err(self.pos(), "wgsl.syntax") {
                 self.emsg.push_str("a type here is a constructor: '");
@@ -139,7 +154,7 @@ impl Front {
         r
     }
 
-    fn construct_from(self: *Front, ty: i64, base: i64, n: i64, at: i64) -> Val {
+    fn construct_from(self: &mut Front, ty: i64, base: i64, n: i64, at: i64) -> Val {
         let t = self.m.types[ty];
         if n == 0 {
             if !self.storable(ty) || self.m.has_atomic(ty) || self.m.is_runtime_sized(ty) {
@@ -204,7 +219,7 @@ impl Front {
         cint(SK_AINT, -1, 0)
     }
 
-    fn compose_args(self: *Front, ty: i64, el: i64, base: i64, n: i64) -> Val {
+    fn compose_args(self: &mut Front, ty: i64, el: i64, base: i64, n: i64) -> Val {
         let start = self.estack.len();
         for i in 0..n {
             let e = self.materialize(self.astack[base + i], el, self.apos[base + i]);
@@ -213,7 +228,7 @@ impl Front {
         self.compose_from_estack(ty, start)
     }
 
-    fn compose_from_estack(self: *Front, ty: i64, start: i64) -> Val {
+    fn compose_from_estack(self: &mut Front, ty: i64, start: i64) -> Val {
         let a = self.f.args.len();
         for i in start..self.estack.len() {
             self.f.args.push(self.estack[i]);
@@ -226,7 +241,7 @@ impl Front {
 
     // A value conversion `T(v)`: scalar to scalar, or vector to vector of
     // the same width.
-    fn convert_value(self: *Front, v0: Val, ty: i64, at: i64) -> Val {
+    fn convert_value(self: &mut Front, v0: Val, ty: i64, at: i64) -> Val {
         let v = self.value(v0, at);
         let t = self.m.types[ty];
         if v.k == VK_CONST {
@@ -258,7 +273,7 @@ impl Front {
     }
 
     // The scalar kind of a value's components (abstract kinds included).
-    fn comp_kind(self: *Front, v: Val) -> u8 {
+    fn comp_kind(self: &Front, v: Val) -> u8 {
         if v.k == VK_CONST {
             return v.sk;
         }
@@ -269,7 +284,7 @@ impl Front {
     // The concrete scalar the arguments base .. base + n share: a
     // concrete argument's, else (all abstract) the hint's, else f32 when
     // one is a float, else `dflt`.
-    fn common_scalar(self: *Front, base: i64, n: i64, hint_sk: i64, dflt: u8) -> u8 {
+    fn common_scalar(self: &Front, base: i64, n: i64, hint_sk: i64, dflt: u8) -> u8 {
         let mut any_float = false;
         for i in base..base + n {
             let v = self.astack[i];
@@ -290,7 +305,7 @@ impl Front {
         if any_float { SK_F32 } else { dflt }
     }
 
-    fn construct_vector(self: *Front, sk: u8, n: i64, base: i64, count: i64, at: i64) -> Val {
+    fn construct_vector(self: &mut Front, sk: u8, n: i64, base: i64, count: i64, at: i64) -> Val {
         let ty = vec_ty(sk, n);
         if count == 1 {
             let v = self.value(self.astack[base], self.apos[base]);
@@ -342,7 +357,7 @@ impl Front {
         self.compose_from_estack(ty, start)
     }
 
-    fn construct_matrix(self: *Front, c: i64, r: i64, base: i64, count: i64, at: i64) -> Val {
+    fn construct_matrix(self: &mut Front, c: i64, r: i64, base: i64, count: i64, at: i64) -> Val {
         let ty = mat_ty(c, r);
         let col = vec_ty(SK_F32, r);
         if count == 1 {
@@ -381,7 +396,7 @@ impl Front {
 
     // ---- Builtins ----
 
-    pub fn builtin_primary(self: *Front, s: i64, at: i64, hint: i64) -> Val {
+    pub fn builtin_primary(self: &mut Front, s: i64, at: i64, hint: i64) -> Val {
         // inferred constructors
         if s >= K_VEC2 && s <= K_VEC4 && self.kind_at(self.p + 1) == T_LPAREN {
             self.p += 1;
@@ -531,7 +546,7 @@ impl Front {
     }
 
     // An f32 scalar or vector type for v (abstract numbers become f32).
-    fn float_type(self: *Front, v: Val, at: i64) -> i64 {
+    fn float_type(self: &mut Front, v: Val, at: i64) -> i64 {
         if v.k == VK_CONST && v.ty < 0 {
             return T_F32;
         }
@@ -550,7 +565,7 @@ impl Front {
         t
     }
 
-    fn bitcast(self: *Front, ty: i64, at: i64) -> Val {
+    fn bitcast(self: &mut Front, ty: i64, at: i64) -> Val {
         let base = self.args(-1);
         let n = self.astack.len() - base;
         if n != 1 {
@@ -589,7 +604,7 @@ impl Front {
         val(e, ty)
     }
 
-    fn select(self: *Front, at: i64) -> Val {
+    fn select(self: &mut Front, at: i64) -> Val {
         let base = self.args(-1);
         let n = self.astack.len() - base;
         if n != 3 {
@@ -633,7 +648,7 @@ impl Front {
         val(e, ty)
     }
 
-    fn array_length(self: *Front, at: i64) -> Val {
+    fn array_length(self: &mut Front, at: i64) -> Val {
         let base = self.args(-1);
         let n = self.astack.len() - base;
         if n != 1 {
@@ -671,7 +686,7 @@ impl Front {
         cint(SK_AINT, -1, 0)
     }
 
-    fn atomic(self: *Front, s: i64, at: i64) -> Val {
+    fn atomic(self: &mut Front, s: i64, at: i64) -> Val {
         let base = self.args(-1);
         let n = self.astack.len() - base;
         let want = if s == K_ATOMIC_LOAD { 1 } else if s == K_ATOMIC_COMPARE_EXCHANGE_WEAK { 3 }
@@ -748,7 +763,7 @@ impl Front {
     }
 
     // __atomic_compare_exchange_result<T>: { old_value: T, exchanged: bool }
-    pub fn cmpxchg_type(self: *Front, sk: u8) -> i64 {
+    pub fn cmpxchg_type(self: &mut Front, sk: u8) -> i64 {
         let i = if sk == SK_I32 { 0 } else { 1 };
         if self.cmpxchg_ty[i] >= 0 {
             return self.cmpxchg_ty[i];
@@ -769,7 +784,7 @@ impl Front {
 
     // ---- Math ----
 
-    fn math(self: *Front, fun: i64, s: i64, at: i64) -> Val {
+    fn math(self: &mut Front, fun: i64, s: i64, at: i64) -> Val {
         let base = self.args(-1);
         let n = self.astack.len() - base;
         let name = self.name_of(s);
@@ -790,7 +805,7 @@ impl Front {
         r
     }
 
-    fn math_fail(self: *Front, at: i64, name: [u8], what: [u8], base: i64, n: i64) -> Val {
+    fn math_fail(self: &mut Front, at: i64, name: [u8], what: [u8], base: i64, n: i64) -> Val {
         if self.err(at, "wgsl.type") {
             self.emsg.push_str(f"'{name}' takes {what}; got ");
             for i in base..base + n {
@@ -805,7 +820,7 @@ impl Front {
 
     // The common type of args[base .. base + n] (abstract ones take the
     // others' scalar; all abstract: f32 when `float`, else by their kind).
-    fn common_type(self: *Front, base: i64, n: i64, float: bool) -> i64 {
+    fn common_type(self: &Front, base: i64, n: i64, float: bool) -> i64 {
         for i in base..base + n {
             let v = self.astack[i];
             if !(v.k == VK_CONST && v.ty < 0) {
@@ -821,7 +836,7 @@ impl Front {
         if any_float { T_F32 } else { T_I32 }
     }
 
-    fn math_typed(self: *Front, fun: i64, name: [u8], base: i64, n: i64, at: i64) -> Val {
+    fn math_typed(self: &mut Front, fun: i64, name: [u8], base: i64, n: i64, at: i64) -> Val {
         let float_only = is_float_fun(fun);
         if fun == MF_ALL || fun == MF_ANY {
             let v = self.value(self.astack[base], self.apos[base]);
@@ -927,7 +942,7 @@ impl Front {
         self.math_expr(fun, rt, es, n)
     }
 
-    fn math_expr(self: *Front, fun: i64, ty: i64, es: [i64; 4], n: i64) -> Val {
+    fn math_expr(self: &mut Front, fun: i64, ty: i64, es: [i64; 4], n: i64) -> Val {
         let a = self.f.args.len();
         for i in 0..n {
             self.f.args.push(es[i]);
@@ -936,7 +951,7 @@ impl Front {
         val(e, ty)
     }
 
-    fn packing(self: *Front, fun: i64, name: [u8], base: i64, at: i64) -> Val {
+    fn packing(self: &Front, fun: i64, name: [u8], base: i64, at: i64) -> Val {
         let unpack = fun == ir::MF_UNPACK4X8UNORM || fun == ir::MF_UNPACK2X16FLOAT
             || fun == ir::MF_UNPACK4X8SNORM || fun == ir::MF_UNPACK2X16UNORM
             || fun == ir::MF_UNPACK2X16SNORM;
@@ -958,7 +973,7 @@ impl Front {
 
     // ---- Textures ----
 
-    fn texture_arg(self: *Front, i: i64, sampler: bool) -> i64 {
+    fn texture_arg(self: &mut Front, i: i64, sampler: bool) -> i64 {
         let v = self.astack[i];
         let want = if sampler { TK_SAMPLER } else { TK_TEXTURE };
         if v.k != VK_VALUE || self.m.types[v.ty].kind != want {
@@ -972,7 +987,7 @@ impl Front {
         v.e
     }
 
-    fn texture_call(self: *Front, s: i64, at: i64) -> Val {
+    fn texture_call(self: &Front, s: i64, at: i64) -> Val {
         let base = self.args(-1);
         let n = self.astack.len() - base;
         let r = self.texture_typed(s, base, n, at);
@@ -980,7 +995,7 @@ impl Front {
         r
     }
 
-    fn texture_typed(self: *Front, s: i64, base: i64, n: i64, at: i64) -> Val {
+    fn texture_typed(self: &mut Front, s: i64, base: i64, n: i64, at: i64) -> Val {
         let name = self.name_of(s);
         if n < 1 {
             self.arg_count_error(at, name, "a texture first", n);
@@ -1141,7 +1156,7 @@ impl Front {
     }
 
     // vec2<i32> or vec2<u32>, as the argument has it.
-    fn coords_type(self: *Front, i: i64) -> i64 {
+    fn coords_type(self: &mut Front, i: i64) -> i64 {
         let v = self.astack[i];
         let t = self.concrete_type_of(v);
         if t == vec_ty(SK_U32, 2) || t == vec_ty(SK_I32, 2) {
@@ -1154,7 +1169,7 @@ impl Front {
         vec_ty(SK_I32, 2)
     }
 
-    fn int_arg_type(self: *Front, i: i64) -> i64 {
+    fn int_arg_type(self: &mut Front, i: i64) -> i64 {
         let v = self.astack[i];
         let t = self.concrete_type_of(v);
         if t == T_U32 || t == T_I32 {
