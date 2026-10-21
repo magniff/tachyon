@@ -329,11 +329,15 @@ END {
         # naming the gate and by no other, so their only word is the gate:
         # every program's loader then reads a few words of them, not
         # thousands (the index is read whole for each program)
+        sec_impls = impls[i]
         if (!core[i] && (gate[i] in CLOSED)) {
             words = " +" gate[i] " " gate[i]
             items = ""
+            # (and no impls: an impl's type may share a name with one std
+            # defines elsewhere, `Error`, `Buffer`, and its trait is std's)
+            sec_impls = ""
         }
-        printf "%d %d %d|%s|%s|%s|%s\n", start[i], end_[i], core[i], substr(words, 2), substr(items, 2), substr(impls[i], 2), substr(deps[i], 2)
+        printf "%d %d %d|%s|%s|%s|%s\n", start[i], end_[i], core[i], substr(words, 2), substr(items, 2), substr(sec_impls, 2), substr(deps[i], 2)
     }
     # (the titles, for a reader of the index: not read by the compiler)
     for (i = 0; i <= count; i++) printf "# %d %s%s\n", i, title[i], core[i] ? "" : " (lazy)"
