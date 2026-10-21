@@ -16,8 +16,8 @@ use crate::base::diag::{
     ERR_HELP, err_begin, err_end, err_fmt, err_help, err_help_fmt, err_str, err_try_fmt,
 };
 use crate::front::ast::{
-    ARM_LET_ELSE, ARM_NO_ELSE, NODES, NodeKind, PAT_DEREF, PAT_FIELDS, PAT_PARENS, PAT_REF, child,
-    list_begin, list_end, list_push, new_node,
+    ARM_LET_ELSE, ARM_NO_ELSE, NODES, NODE_CHECKED, NodeKind, PAT_DEREF, PAT_FIELDS, PAT_PARENS,
+    PAT_REF, child, list_begin, list_end, list_push, new_node,
 };
 use crate::front::ast::NodeKind::{
     Ident, PatBind, PatLit, PatOr, PatRange, PatTuple, PatVariant, PatWild,
@@ -38,6 +38,7 @@ use crate::front::closures::escape::check_scope_exit;
 use crate::front::consteval::{check_const_expr, const_eval, const_less, const_value, wrap_int};
 use crate::front::distinct::{is_distinct_type, strip_distinct};
 use crate::front::generics::{TPL_NONE, env_lookup, instance_of, template_of_key};
+use crate::front::lexer::Tok;
 use crate::front::modules::CUR_MOD;
 use crate::front::modules::lookup::{
     B_ITEM, B_PRIVATE, B_TVARIANT, B_VARIANT, access_error, binding_kind, binding_value,
@@ -230,9 +231,15 @@ fn check_pat(p: i64, ty: i64) {
             if BIND_REF != 0 && !(TYPES[ty].kind == TyKind::Slice && TYPES[ty].b == 0) {
                 if NODES[p].b != 0 {
                     err_begin(NODES[p].start);
-                    err_fmt(
-                        f"'mut {sym_text(name)}' in a pattern on a reference: its bindings are references into the value");
-                    err_help(c"drop the 'mut' (under a '&mut', '*x = v' changes the field), or match a copy: 'match *e'");
+                    if crate::front::conv::LEGACY_ROOT {
+                        err_fmt(
+                            f"'mut {sym_text(name)}' in a pattern on a reference: its bindings are references into the value");
+                        err_help(c"drop the 'mut' (under a '&mut', '*x = v' changes the field), or match a copy: 'match *e'");
+                    } else {
+                        err_fmt(
+                            f"'var {sym_text(name)}' in a pattern through an access: its bindings are accesses into the value");
+                        err_help(c"drop the 'var' (matched through an inout access, 'x = v' changes the field), or match a copy: 'match e.clone()'");
+                    }
                     err_end();
                 }
                 bty = ref_to(ty, BIND_REF);
@@ -690,7 +697,29 @@ pub fn check_match(n: i64, expected: i64) -> i64 {
                 Option::None => {}
             }
         }
-        let st = check_recovering(scrutinee, 0);
+        let mut st = check_recovering(scrutinee, 0);
+        // (0.20, D13 for a match: `match q.conds[i]` of an owned value the
+        // function cannot take, an element or a part through an access,
+        // matches it through a borrow, as `let x = part` does: its
+        // bindings are accesses into it)
+        if st > 0 && st != TY_ERROR && crate::front::conv::strict_at(NODES[scrutinee].start)
+            && !crate::front::conv::std_at(NODES[scrutinee].start)
+            && !crate::front::conv::copyable(st)
+            && crate::front::conv::borrowed_place(scrutinee) {
+            let inner = new_node(NodeKind::None, NODES[scrutinee].start, NODES[scrutinee].end);
+            NODES[inner] = NODES[scrutinee];
+            NODES[inner].p |= NODE_CHECKED;
+            NODES[inner].ty = st;
+            NODES[scrutinee].kind = NodeKind::Unary;
+            NODES[scrutinee].op = Tok::Amp;
+            NODES[scrutinee].a = 0;
+            NODES[scrutinee].b = inner;
+            NODES[scrutinee].count = 0;
+            NODES[scrutinee].list = 0;
+            NODES[scrutinee].p = 0;
+            NODES[scrutinee].ty = 0;
+            st = check_recovering(scrutinee, 0);
+        }
         let mut result = expected;
         let mut all_never = true;
         // `if let` without `else` (0.6): of type `()`, like an `if`.

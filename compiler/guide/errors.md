@@ -368,14 +368,9 @@ fn main(gpa: Gpa) -> i32 { var b = Buf::new_in(gpa); b.push_string("x"); 0 }
 error[type error] no method 'push_string' on type 'Buf' | help: did you mean 'push_str'?
 ```
 
-```tach
-fn sum(s: [i64]) -> i64 { s[0] }
-fn main() -> i32 { let a = [1, 2, 3]; sum(a) as i32 }
-```
-```err
-error[type error] expected '[i64]', got '[i64; 3]'
-```
-`sum(a[..])`. An array's length is `a.len()`.
+An array, a Vec or a Buf goes where a slice of its elements does:
+`sum(a)` for `fn sum(s: [i64])` (0.20; `sum(&v)` for `s: inout [T]`).
+An array's length is `a.len()`.
 
 ```tach
 let e: IoError = IoError::Read;
@@ -594,10 +589,10 @@ impl Ord for K { fn cmp(self: *K, o: *K) -> i64 { 0 } }
 fn main() -> i32 { 0 }
 ```
 ```err
-error[type error] 'cmp' takes 'self' as a raw pointer where trait 'Ord' declares '&K'
+error[type error] 'cmp' does not have the signature trait 'Ord' declares: expected 'fn(K, K) -> i64'
 ```
 An impl takes what the trait declares, as let parameters: `fn cmp(self,
-o: K) -> i64`; `tachyonc fix --values` respells every such impl.
+o: K) -> i64` (`*K` is a raw pointer).
 
 ## Modules and imports
 
