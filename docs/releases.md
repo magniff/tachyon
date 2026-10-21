@@ -53,8 +53,59 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.19.0 | `v0.19.0` | 0.18.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | CPU intrinsics and target features: `std::arch` with over 1,775 AArch64 intrinsics (NEON, crc, sha2, sha512, sha3, aes, pmull, dotprod, float), each checked lane by lane against a scalar reference, and 484 x86-64 intrinsics (SSE to AVX2, FMA, BMI, AES-NI, SHA, PCLMULQDQ) encoded as cc does but not run; unsigned, 64-bit and 256-bit vector types; target features inferred like effects, `has`/`detect` guards, foreign architectures constant false, `-C target-cpu`/`target-feature`; run-time detection and `#[multiversion]`; intrinsics pure to the optimizer, never hoisted above their guard, vectors in vector registers; `query arch`, `guide arch`, examples/arch, the fuzzer's arch mode, `tachyonc assemble` |
 | 0.19.1 | `v0.19.1` | 0.19.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | two soundness fixes: the store intrinsics' destination is `&mut [T]` (a store through a read-only view, or while a view of the buffer is used, is an error), and 0.17's transitional rule accepting a read-only `[T]` where `&mut [T]` is wanted is gone (`fix --values` migrates); examples/arch/sha256sum, coreutils-compatible on the SHA-256 instructions, faster than macOS's sha256sum and OpenSSL, about 5 times coreutils' on Linux |
 | 0.20.0 | `v0.20.0` | 0.19.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | parameter conventions in Hylo's spelling, the default syntax: `let` (the default), `inout` with `&x` at the call, `sink`, `var`, accesses used as their values; Rust's spellings `conv.rust` errors with a `try:`, `fix --only conventions` migrates, std, tests, examples, bench and the eval on it (compiler/src on the 0.19 pragma until 0.21); std as a module tree; HashMap/HashSet on a Swiss table (foldhash, SipHash-1-3), BTreeMap/BTreeSet, ipnsort and driftsort; `String` and `str`, std::unicode (UTF-8, graphemes, width, case, Unicode 18), number formatting and parsing; std::io, fs, path, env, process, time, random; owned temporaries dropped at the statement's end; `tachyonc lsp` |
+| 0.21.0 | `v0.21.0` | 0.20.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | concurrency: safe `std::thread::spawn` and `scope` with what crosses threads checked (Send and Sync from the types), `std::sync` (atomics with every ordering, Mutex, RawLock, Once, Condvar, mpsc channels), `#[thread_local]`, effects `thread`, `sync`, `tls`, atomics as barriers in the optimizer; the compiler's source in 0.20's conventions, the 0.19 spelling removed (`var`, `inout`, `sink` keywords; the mixed reading only inside fix's migrations); `.vl` sources and `VOLE_*` variables accepted |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.21
+
+The compiler's own source moves to 0.20's conventions, the 0.19
+spelling goes, and std gains threads; docs/design/conventions.md (§9.3,
+"0.21") and `tachyonc guide threads`.
+
+- **Threads**:
+  - `std::thread::spawn` (a `move` closure on a new thread; its
+    `JoinHandle`'s `join` gives the result) and `std::thread::scope`
+    (every thread started in it is joined before it returns, so they may
+    borrow the caller's values), both safe; `yield_now`,
+    `available_parallelism`;
+  - **what crosses threads is checked**: Send and Sync computed from the
+    types (raw and fn pointers neither; containers, Mutex, atomics and
+    channels by their type arguments; views only into scoped threads, and
+    only shared views of Sync data); a spawned closure's captures and
+    result are Send and hold no view; a scope changes nothing it borrows;
+    no thread reaches a `static var` (an effect bit beside `global`);
+    `sync.*` diagnostics with `try:` lines;
+  - `std::sync`: `Atomic<T>` (Rust's `AtomicI64` ... `AtomicPtr` as
+    aliases) with every ordering, `Mutex<T>` (`with` runs a closure under
+    the lock; `lock`'s guard stays unsafe until Drop on view types),
+    `RawLock` (a futex mutex), `Once`, `Condvar`, and `std::sync::mpsc`
+    channels; `#[thread_local]` statics;
+  - effects `thread`, `sync` and `tls`;
+  - atomics on AArch64 as LSE (`cas`, `swp`, `ld<op>`, macOS) or
+    exclusive-pair loops (`--atomics=lse|llsc`, Linux's default), checked
+    by litmus tests (MP, SB) and per kind, width and ordering; on x86-64
+    compiled and object-checked, not run; the optimizer treats atomics
+    and fences as barriers (GVN, LICM, promotion, the vectorizers, load
+    pairing) and invents no stores;
+  - printing from several threads takes one lock around std's buffer.
+- **compiler/src in 0.20's conventions** (about 11,000 lines in 329
+  files by `fix --only conventions`, 13 raw pointers by hand); the
+  output is the same.
+- **The 0.19 spelling is gone**: the root pragma is
+  `syntax.legacy_removed`, `--syntax=mixed` is `syntax.mixed_removed`;
+  the mixed reading exists only inside the migrations (`fix --only
+  conventions`, `fix --values`, `--only std015|alloc016`), so no build,
+  check, run, try or query accepts Rust's borrowing spellings; `var`,
+  `inout` and `sink` are keywords.
+- **`.vl` sources and `VOLE_*` variables** are accepted beside `.tach`
+  and `TACHYON_*`, for 0.24's rename (nothing user-facing renamed yet).
+- **Tested on aarch64 only**, as since 0.15 (`gate.sh --with-x86`).
+- **Breaking**: `var`, `inout`, `sink` are keywords (a name spelled so
+  is an error); the 0.19 pragma and `--syntax=mixed` are errors.
+- **Known issues**: the small-program compile regression of 0.20 (a
+  hello world 47 M to 317 M instructions) is being investigated, for
+  0.21.1; the 0.20.1 list of docs/design/conventions.md stands.
 
 ### What's new in 0.20
 
