@@ -2409,3 +2409,23 @@ sieve (+0.9%). Compile time in instructions (0.21's source, no cache):
 the self-compile 11.83 G to 11.89 G at -O0, 45.04 G to 45.51 G at -O2
 -j1 (+1.0%), check 5.68 G to 5.70 G; a hello world 327 M to 336 M (0.20's
 regression, under investigation for 0.21.1).
+
+### 0.22
+
+The release gate (`gate.sh --release --no-x86`, 35:02 wall at load up
+to 66): every step passing but three, rerun with compile-cost (16:59):
+objcheck gave examples/gpu's `-l objc` to `-c` (tests/objcheck.sh now
+gives -l and -L to the links, and skips Metal programs off macOS, in the
+container too); example_allocators-arena-parser was killed by its time
+limit under --check-alloc at load 40 and passed on the rerun. The suite
+1749 (6 XFAIL), aarch64-linux 1391, threads 2635, incremental 160
+series, valgrind 249 clean. compile-cost against v0.21.0: a hello world
+95.9 M instructions against 357.5 M (0.27x), tests/cost/std_heavy 0.96x,
+check of the compiler 5.49 G against 5.42 G (1.01x).
+
+Bench (load 20 to 50: times are not the measure): geomean 0.801 of cc
+-O2, v0.21.0's build 0.789 in the same run; instructions retired against
+v0.21.0's build of the same programs: every program within 0.5% but sort
+(+1.0%) and wordcount (-1.0%), the outputs the same. The self-compile
+(0.22's source, no cache): 11.11 G to 11.17 G at -O0 (+0.6%), 43.38 G to
+43.47 G at -O2 -j1 (+0.2%), 814 MB to 811 MB.
