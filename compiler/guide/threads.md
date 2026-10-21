@@ -1,9 +1,10 @@
 # Threads
 
 Threads, atomics, locks and channels (0.21; the design is
-docs/design/concurrency.md). In 0.21.0 nothing checks yet what crosses
-threads (Rust's `Send` and `Sync` come in 0.21.1), so starting a thread is
-`unsafe`: the code vouches for what it shares. Everything else is safe.
+docs/design/concurrency.md). Safe code cannot make a data race: what
+crosses threads is checked where a thread starts, from the types (Rust's
+`Send` and `Sync`, inferred) and the effects (no `static mut` on another
+thread). The errors are `sync.*` (`tachyonc explain sync.global`).
 
 ## Atomics
 
@@ -15,8 +16,8 @@ pointers, with Rust's names as aliases (`AtomicI64`, `AtomicU32`,
 `fetch_max`, `fetch_min`, `into_inner`, and `fence(order)`. The orderings
 are C++'s (`Ordering::Relaxed`, `Acquire`, `Release`, `AcqRel`,
 `SeqCst`); one an operation cannot have (a load with `Release`) is made
-`SeqCst`. An atomic is move-only. A static one is written with its
-field: `static mut HITS: AtomicI64 = AtomicI64 { v: 0 };`.
+`SeqCst`. An atomic is move-only. A static one needs no `mut` (and so has
+no `global`): `static HITS: AtomicI64 = AtomicI64 { v: 0 };`.
 
 ```tach
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -39,13 +40,18 @@ atomic or a fence, and invents no store to memory another thread may see.
 
 ## Threads
 
-`std::thread::spawn(f)` runs the closure on a new thread; its handle's
-`join()` waits and gives the result (a panic in any thread stops the
-program, so there is no `Result` to unwrap). `thread::scope(|s| ...)`
-joins every thread started with `s.spawn` before it returns, so those may
-borrow the caller's values. Both are `unsafe fn`: what the closure
-captures must be safe to use from another thread (no raw pointer or view
-the caller still writes; no `static mut`: `query effects` shows `global`).
+`std::thread::spawn(move || ...)` runs the closure on a new thread; its
+handle's `join()` waits and gives the result (a panic in any thread stops
+the program, so there is no `Result` to unwrap). The closure is a `move`
+one: the thread may outlive the caller, so it takes owned values (a Vec
+moves in), no views (`sync.borrow_escapes`) and no raw pointers
+(`sync.not_send`). `thread::scope(|s| ...)` joins every thread started
+with `s.spawn` before it returns, so those may borrow the caller's values
+and views; while the scope runs its closure changes nothing it borrows
+(`sync.scope_write`), and a scoped thread only looks at what it borrows
+(`sync.scope_shared_write`: return results through `join`, or use a Mutex
+or an atomic). No thread may reach a `static mut` (`sync.global`; `query
+effects FILE:LINE --why global` shows the chain); printing is fine.
 
 ```tach
 use std::thread;
@@ -60,14 +66,12 @@ fn main(gpa: Gpa) {
     let mut v: Vec<i64> = Vec::new_in(gpa);
     for i in 0..1000 { v.push(i); }
     let s = v.as_slice();
-    let total = unsafe {
-        thread::scope(|sc| {
-            let a = sc.spawn(|| sum(s[0..500]));
-            let b = sc.spawn(|| sum(s[500..]));
-            a.join() + b.join()
-        })
-    };
-    let h = unsafe { thread::spawn(move || v.len()) };
+    let total = thread::scope(|sc| {
+        let a = sc.spawn(|| sum(s[0..500]));
+        let b = sc.spawn(|| sum(s[500..]));
+        a.join() + b.join()
+    });
+    let h = thread::spawn(move || v.len());
     println(f"{total} {h.join()}");
 }
 ```
@@ -76,38 +80,46 @@ fn main(gpa: Gpa) {
 ```
 
 `thread::yield_now()`, `thread::available_parallelism()`. Printing is safe
-from any thread: once threads run, each print holds a lock, so lines do
-not mix.
+from any thread: once threads run, each print holds a lock, so output
+never interleaves.
 
-## Mutex and channels
+## Mutex, Once, Condvar and channels
 
 `std::sync::Mutex<T>` owns its data: `m.with(|data| ...)` locks, runs the
-closure and unlocks (`try_with` when the lock is free now). `std::sync::
-mpsc::channel_in(gpa)` gives a `Sender` (clone it for more senders) and a
-`Receiver`: `send(x)` fails, giving `x` back, when the receiver is gone;
-`recv()` waits, and fails when every sender is gone and nothing is left;
-`for x in rx.iter()` runs until then.
+closure and unlocks (`try_with` when the lock is free now), the way to
+reach the data in 0.21.0. Scoped threads borrow the Mutex (and an atomic)
+and share it. `m.lock()` gives a guard that unlocks when dropped, but it is
+`unsafe` and internal until a type holding a view may implement Drop
+(0.21.x): nothing keeps the guard inside the mutex's life yet. `Once`'s
+`call_once(f)` runs f once whatever the threads; `Condvar`'s
+`wait_then(&m, ready, then)` sleeps until `ready(data)`, then runs `then`
+under the lock (`notify_one`, `notify_all`). There is no poisoning.
+
+`std::sync::mpsc::channel_in(gpa)` gives a `Sender` (clone it for more
+senders) and a `Receiver`: `send(x)` fails, giving `x` back, when the
+receiver is gone; `recv()` waits, and fails when every sender is gone and
+nothing is left; `for x in rx.iter()` runs until then.
 
 ```tach
 use std::thread;
 use std::sync::{Mutex, mpsc};
 
 fn main(gpa: Gpa) {
-    let (tx, rx) = mpsc::channel_in::<i64>(gpa);
     let count = Mutex::new(0);
-    let c = &count as *Mutex<i64>;
-    let t = tx.clone();
-    let h = unsafe { thread::spawn(move || {
-        for i in 1..=10 {
-            t.send(i).unwrap();
-            (*c).with(|n| *n += 1);
-        }
-        0
-    }) };
-    drop(tx);
-    let mut total = 0;
-    for x in rx.iter() { total += x; }
-    h.join();
+    let total = thread::scope(|s| {
+        let (tx, rx) = mpsc::channel_in::<i64>(gpa);
+        s.spawn(move || {
+            for i in 1..=10 { tx.send(i).unwrap(); }
+            0
+        });
+        s.spawn(|| {
+            for _ in 0..10 { count.with(|n| *n += 1); }
+            0
+        });
+        let mut sum = 0;
+        for x in rx.iter() { sum += x; }
+        sum
+    });
     println(f"{total} {count.with(|n| *n)}");
 }
 ```
@@ -115,9 +127,7 @@ fn main(gpa: Gpa) {
 55 10
 ```
 
-`m.lock()` (unsafe in 0.21.0) gives a guard that unlocks when it is
-dropped; `g.with(|data| ...)` reaches the data through it. The locks wait
-on a futex (Linux) or `__ulock` (macOS). There is no poisoning.
+The locks wait on a futex (Linux) or `__ulock` (macOS).
 
 ## Thread-locals
 
@@ -137,7 +147,7 @@ fn work() -> i64 {
 }
 
 fn main() {
-    let h = unsafe { thread::spawn(move || work()) };
+    let h = thread::spawn(move || work());
     CALLS = 100;
     println(f"{h.join()} {CALLS}");
 }

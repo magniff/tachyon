@@ -1,0 +1,58 @@
+// (0.21) std::sync::Once runs its function once whatever the threads
+// calling it; Condvar: a consumer waits until producers have filled a
+// Mutex's queue, under the lock.
+// EXPECT: once 1 true
+// EXPECT: consumed 4000 7998000
+
+use std::thread;
+use std::sync::{Condvar, Mutex, Once};
+use std::sync::atomic::{AtomicI64, Ordering};
+
+static INIT: Once = Once { state: std::sync::atomic::AtomicU32 { v: 0 } };
+static RUNS: AtomicI64 = AtomicI64 { v: 0 };
+
+fn main(gpa: Gpa) {
+    thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                INIT.call_once(|| { RUNS.fetch_add(1, Ordering::Relaxed); });
+                0
+            });
+        }
+        0
+    });
+    println(f"once {RUNS.load(Ordering::SeqCst)} {INIT.is_completed()}");
+
+    let q: Mutex<Vec<i64>> = Mutex::new(Vec::new_in(gpa));
+    let cv = Condvar::new();
+    let qr = &q;
+    let cr = &cv;
+    let total = thread::scope(|s| {
+        for k in 0..4 {
+            s.spawn(move || {
+                for i in 0..1000 {
+                    qr.with(|v| v.push(k * 1000 + i));
+                    cr.notify_one();
+                }
+                0
+            });
+        }
+        let c = s.spawn(|| {
+            let mut got = 0;
+            let mut sum = 0;
+            while got < 4000 {
+                let (n, t) = cv.wait_then(&q, |v| v.len() > 0, |v| {
+                    let mut t = 0;
+                    let n = v.len();
+                    while v.len() > 0 { t += v.pop().unwrap(); }
+                    (n, t)
+                });
+                got += n;
+                sum += t;
+            }
+            (got, sum)
+        });
+        c.join()
+    });
+    println(f"consumed {total.0} {total.1}");
+}

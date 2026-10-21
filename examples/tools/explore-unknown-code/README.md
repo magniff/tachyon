@@ -77,7 +77,7 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
-std::sync	<std>	20
+std::sync	<std>	29
 std::sync::atomic	<std>	48
 std::sync::mpsc	<std>	24
 std::thread	<std>	43

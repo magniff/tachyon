@@ -108,6 +108,6 @@ defined:
   with where the block was allocated and freed;
   bad frees and leaks are reported too (`tachyonc guide memory`). With
   `--check-unsafe`, raw accesses are checked against those blocks.
-- Statics, `static mut` included, are safe in a program of one thread;
-  code another thread runs (0.21's unsafe `thread::spawn`) must not reach
-  a `static mut` (`guide threads`).
+- Statics, `static mut` included, are safe: a `static mut` is for the
+  main thread, and code another thread runs may not reach one
+  (`sync.global`, `guide threads`).
