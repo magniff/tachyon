@@ -1,0 +1,520 @@
+// The input generator of the terminal fuzzer (tests/voltty/run.sh):
+// scripts in the oracle's format (examples/voltty/core/oracle/FORMAT.md) that
+// both examples/voltty/core and the oracle run, their dumps compared.
+//
+//   gen SEED CASES [corpus FILE...]   a script of CASES cases on stdout
+//   gen --reduce SCRIPT TERM ORACLE   the smallest script still differing
+//
+// A case is a terminal of a random size and scrollback, fed chunks of
+// random sequences, split at random places (a parser's favourite bug),
+// with a dump after each chunk and the odd resize between them. The
+// sequences come from three sources, as the design asks:
+//   1. the grammar of what the terminal implements, with edge-case
+//      parameters: 0, 1, the largest, missing, sub-parameters;
+//   2. mutations of recorded sessions (the corpus files);
+//   3. invalid UTF-8, C1 controls, raw bytes.
+
+extern "C" {
+    fn system(cmd: *u8) -> i32;
+}
+
+use std::Buf;
+
+struct Rng {
+    s: u64,
+}
+
+impl Rng {
+    fn next(self: &mut Rng) -> u64 {
+        // xorshift64*
+        let mut x = self.s;
+        x = x ^ (x >> 12);
+        x = x ^ (x << 25);
+        x = x ^ (x >> 27);
+        self.s = x;
+        x * 2685821657736338717
+    }
+
+    // 0..n
+    fn below(self: &mut Rng, n: i64) -> i64 {
+        if n <= 0 {
+            return 0;
+        }
+        ((self.next() >> 11) % (n as u64)) as i64
+    }
+
+    fn chance(self: &mut Rng, percent: i64) -> bool {
+        self.below(100) < percent
+    }
+
+    fn pick(self: &mut Rng, s: [[u8]]) -> [u8] {
+        s[self.below(s.len)]
+    }
+}
+
+// A parameter value: the edges more often than not.
+fn param(r: &mut Rng, b: &mut Buf) {
+    let k = r.below(12);
+    if k == 0 {
+        // missing
+    } else if k == 1 {
+        b.push('0');
+    } else if k == 2 {
+        b.push('1');
+    } else if k == 3 {
+        b.push_int(65535);
+    } else if k == 4 {
+        b.push_int(99999);
+    } else if k == 5 {
+        b.push_int(r.below(300));
+    } else {
+        b.push_int(r.below(30));
+    }
+}
+
+fn params(r: &mut Rng, b: &mut Buf, max: i64) {
+    let n = r.below(max + 1);
+    for i in 0..n {
+        if i > 0 {
+            b.push(if r.chance(8) { ':' } else { ';' });
+        }
+        param(r, b);
+    }
+}
+
+fn text(r: &mut Rng, b: &mut Buf) {
+    let n = r.below(40) + 1;
+    let k = r.below(10);
+    for _ in 0..n {
+        if k < 5 {
+            b.push((0x20 + r.below(95)) as u8);
+        } else if k < 7 {
+            // wide CJK and emoji, combining marks, other scripts
+            let set = ["中", "文", "字", "😀", "🎉", "é", "e\xcc\x81", "\xcc\x81", "\xe2\x80\x8b", "ｱ", "한", "Ω", "\xef\xb8\x8f", "\xe2\x80\x8d", "a", " "];
+            b.push_str(r.pick(set[..]));
+        } else if k < 8 {
+            // invalid UTF-8, C1 controls, raw bytes
+            let set = ["\x80", "\x9b", "\xc2\x9b", "\xc2\x85", "\xe2\x82", "\xf0\x9f", "\xff", "\xc0\xaf", "\xed\xa0\x80", "\xf4\x90\x80\x80", "\xe0\x80\x80", "\x7f", "\x00", "\x18", "\x1a"];
+            b.push_str(r.pick(set[..]));
+        } else {
+            let set = ["\r\n", "\n", "\r", "\t", "\x08", "\x07", "\x0e", "\x0f", "\x0b", "\x0c", " ", "  "];
+            b.push_str(r.pick(set[..]));
+            b.push((0x21 + r.below(94)) as u8);
+        }
+    }
+}
+
+fn csi(r: &mut Rng, b: &mut Buf) {
+    b.push_str("\x1b[");
+    let k = r.below(20);
+    if k == 0 {
+        // private modes
+        b.push('?');
+        let modes = ["1", "3", "6", "7", "12", "25", "47", "1000", "1002", "1003", "1004", "1005", "1006", "1007", "1042", "1047", "1049", "2004", "2026", "9", "1048"];
+        let n = r.below(3) + 1;
+        for i in 0..n {
+            if i > 0 {
+                b.push(';');
+            }
+            b.push_str(r.pick(modes[..]));
+        }
+        b.push(if r.chance(50) { 'h' } else { 'l' });
+        return;
+    }
+    if k == 1 {
+        // SGR, colours in both forms
+        let forms = ["38;5;", "48;5;", "38;2;", "48;2;", "58;5;", "58;2;", "38:5:", "48:2::", "38:2:", "58:2:1:", "4:3", "4:0", "4:5", "4:", "59", "21", "22", "1", "2", "3", "4", "7", "8", "9", "27", "24", "29", "0", "39", "49", "97", "107", "31", "42", ""];
+        let n = r.below(4) + 1;
+        for i in 0..n {
+            if i > 0 {
+                b.push(';');
+            }
+            let f = r.pick(forms[..]);
+            b.push_str(f);
+            if f.len > 0 && (f[f.len - 1] == ';' || f[f.len - 1] == ':') {
+                let sep = f[f.len - 1];
+                param(r, b);
+                if r.chance(60) {
+                    b.push(sep);
+                    param(r, b);
+                    b.push(sep);
+                    param(r, b);
+                }
+            }
+        }
+        b.push('m');
+        return;
+    }
+    if k == 2 {
+        // DECRQM, DECSCUSR, DA2, DECSTR-like intermediates
+        let set = ["?1$p", "?25$p", "?2026$p", "?1049$p", "4$p", "20$p", "?12$p", "?3$p", "99$p", " q", "1 q", "4 q", "6 q", "7 q", ">c", ">0c", "=c", "?u", "=1u", ">1u", "<u", "?5W", " k", ">4;2m", "?4m"];
+        b.push_str(r.pick(set[..]));
+        return;
+    }
+    if r.chance(10) {
+        b.push(if r.chance(50) { '?' } else { '>' });
+    }
+    params(r, b, 4);
+    if r.chance(3) {
+        b.push(if r.chance(50) { ' ' } else { '$' });
+    }
+    let finals = "@ABCDEFGHIJKLMPSTXZ`abcdefghlmnrstu";
+    b.push(finals[r.below(finals.len)]);
+}
+
+fn esc(r: &mut Rng, b: &mut Buf) {
+    let set = ["\x1b7", "\x1b8", "\x1bD", "\x1bE", "\x1bH", "\x1bM", "\x1bZ", "\x1bc", "\x1b#8", "\x1b=", "\x1b>", "\x1b(0", "\x1b(B", "\x1b)0", "\x1b)B", "\x1b*0", "\x1b+B", "\x1b\\", "\x1bB", "\x1b((0", "\x1b%G", "\x1bN", "\x1b\x1b"];
+    b.push_str(r.pick(set[..]));
+}
+
+fn osc(r: &mut Rng, b: &mut Buf) {
+    b.push_str("\x1b]");
+    let set = ["0;title", "2;a;b", "0;  sp  ", "2;\xff\xfe;x", "0;", "4;1;#ff0000", "4;300;#fff", "4;2;rgb:ff/00/80", "4;3;rgb:f/0/8", "4;4;rgb:fff/000/888", "4;5;?", "4;6;#abc", "4;7;#aabbccdd", "4;8;rgb:+f/0/0", "4;1;#", "4;1", "10;?", "11;#123456", "12;rgb:0/0/0", "10;#fff;?;?", "104", "104;1;2", "104;", "110", "111", "112", "8;;http://x", "8;id=a;http://y", "8;id=b:x=y;u;r;i", "8;;", "50;CursorShape=1", "50;CursorShape=2", "52;c;aGVsbG8=", "52;s;aGk=", "52;c;?", "52;p;YQ==", "52;c;YQ", "52;c;YR==", "52;x;YQ==", "22;text", "", ";", "1;x"];
+    b.push_str(r.pick(set[..]));
+    let ends = ["\x07", "\x1b\\", "\x18", "\x1a", "\x07"];
+    b.push_str(r.pick(ends[..]));
+}
+
+fn dcs(r: &mut Rng, b: &mut Buf) {
+    let set = ["\x1bP1;2|data\x1b\\", "\x1bPq#0;2;0;0;0~-\x1b\\", "\x1bX sos \x1b\\", "\x1b^pm\x07x", "\x1b_apc\x1b\\", "\x1bP$q\"p\x1b\\"];
+    b.push_str(r.pick(set[..]));
+}
+
+// One chunk of input.
+fn chunk(r: &mut Rng, b: &mut Buf) {
+    let n = r.below(30) + 1;
+    for _ in 0..n {
+        let k = r.below(100);
+        if k < 35 {
+            text(r, b);
+        } else if k < 75 {
+            csi(r, b);
+        } else if k < 85 {
+            esc(r, b);
+        } else if k < 93 {
+            osc(r, b);
+        } else if k < 96 {
+            dcs(r, b);
+        } else {
+            // REP and line feeds in bulk: scrolling into the scrollback
+            for _ in 0..r.below(20) {
+                b.push_str("line\r\n");
+            }
+        }
+    }
+}
+
+// A mutation of a corpus file's bytes: a slice, with bytes changed,
+// dropped or repeated.
+fn mutate(r: &mut Rng, src: [u8], b: &mut Buf) {
+    if src.len == 0 {
+        return;
+    }
+    let start = r.below(src.len);
+    let mut len = r.below(4000) + 1;
+    if start + len > src.len {
+        len = src.len - start;
+    }
+    let part = src[start..start + len];
+    let mut i = 0;
+    while i < part.len {
+        let k = r.below(1000);
+        if k < 3 {
+            b.push((r.below(256)) as u8);
+        } else if k < 6 {
+            // dropped
+        } else if k < 8 {
+            b.push(part[i]);
+            b.push(part[i]);
+        } else {
+            b.push(part[i]);
+        }
+        i += 1;
+    }
+}
+
+fn emit_chunked(r: &mut Rng, out: &mut Buf, bytes: [u8]) {
+    // Split at random places, a dump after each piece.
+    let mut at = 0;
+    while at < bytes.len {
+        let mut n = r.below(bytes.len - at) + 1;
+        if r.chance(30) {
+            n = r.below(4) + 1;
+        }
+        if at + n > bytes.len {
+            n = bytes.len - at;
+        }
+        out.push_str(f"D {n}\n");
+        out.push_str(bytes[at..at + n]);
+        out.push('\n');
+        if r.chance(40) {
+            out.push_str("P\n");
+        }
+        at += n;
+    }
+}
+
+fn generate(seed: i64, cases: i64, corpus: [Buf], gpa: Gpa) -> Buf {
+    let mut r = Rng { s: (seed as u64) * 0x9E3779B97F4A7C15 + 1 };
+    for _ in 0..5 {
+        r.next();
+    }
+    let mut out = Buf::new_in(gpa);
+    let mut b = Buf::new_in(gpa);
+    for _ in 0..cases {
+        let lines = r.below(12) + 1;
+        let cols = r.below(20) + 2;
+        let hist = if r.chance(30) { 0 } else { r.below(40) };
+        out.push_str(f"T {lines} {cols} {hist}\n");
+        let chunks = r.below(6) + 1;
+        for _ in 0..chunks {
+            b.clear();
+            if corpus.len > 0 && r.chance(30) {
+                let which = r.below(corpus.len);
+                mutate(&mut r, corpus[which].as_slice(), &mut b);
+            } else {
+                chunk(&mut r, &mut b);
+            }
+            emit_chunked(&mut r, &mut out, b.as_slice());
+            if r.chance(25) {
+                let nl = r.below(14) + 1;
+                let nc = r.below(24) + 2;
+                out.push_str(f"R {nl} {nc}\n");
+                if r.chance(50) {
+                    out.push_str("P\n");
+                }
+            }
+        }
+        out.push_str("P\n");
+    }
+    b.free();
+    out
+}
+
+// ---- reduction ----
+
+struct Part {
+    kind: u8,
+    text: Buf,
+}
+
+// The script's commands; `D` ones hold their bytes.
+fn parse_script(s: [u8], gpa: Gpa) -> Vec<Part> {
+    let mut parts: Vec<Part> = Vec::new_in(gpa);
+    let mut at = 0;
+    while at < s.len {
+        let mut nl = at;
+        while nl < s.len && s[nl] != '\n' {
+            nl += 1;
+        }
+        let line = s[at..nl];
+        at = nl + 1;
+        if line.len == 0 {
+            continue;
+        }
+        let mut t = Buf::new_in(gpa);
+        if line[0] == 'D' {
+            let n = parse_int(line[2..]).unwrap_or(0);
+            let mut end = at + n;
+            if end > s.len {
+                end = s.len;
+            }
+            t.push_str(s[at..end]);
+            at = end + 1;
+        } else {
+            t.push_str(line);
+        }
+        parts.push(Part { kind: line[0], text: t });
+    }
+    parts
+}
+
+fn render(parts: [Part], skip_part: i64, cut_part: i64, cut_from: i64, cut_len: i64, gpa: Gpa) -> Buf {
+    let mut out = Buf::new_in(gpa);
+    for i in 0..parts.len {
+        if i == skip_part {
+            continue;
+        }
+        let p = &parts[i];
+        if p.kind == 'D' {
+            let t = p.text.as_slice();
+            if i == cut_part {
+                let n = t.len - cut_len;
+                out.push_str(f"D {n}\n");
+                out.push_str(t[0..cut_from]);
+                out.push_str(t[cut_from + cut_len..]);
+            } else {
+                out.push_str(f"D {t.len}\n");
+                out.push_str(t);
+            }
+            out.push('\n');
+        } else {
+            out.push_str(p.text.as_slice());
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn write_file(path: [u8], data: [u8], gpa: Gpa) -> bool {
+    let mut b = Buf::new_in(gpa);
+    b.push_str(path);
+    b.push(0);
+    let ok = unsafe {
+        // SAFETY: C stdio on a NUL-terminated path and the data's bytes.
+        let f = fopen(b.as_slice().ptr, c"wb");
+        if f == 0 as *u8 {
+            false
+        } else {
+            fwrite(data.ptr, 1, data.len as u64, f);
+            fclose(f);
+            true
+        }
+    };
+    b.free();
+    ok
+}
+
+extern "C" {
+    fn fopen(path: *u8, mode: *u8) -> *u8;
+    fn fwrite(p: *u8, size: u64, n: u64, f: *u8) -> u64;
+    fn fclose(f: *u8) -> i32;
+}
+
+// Whether the two programs disagree on the script in `cand`.
+fn differs(cand: [u8], term: [u8], oracle: [u8], gpa: Gpa) -> bool {
+    let mut cmd = Buf::new_in(gpa);
+    cmd.push_str(f"{term} --script < {cand} > {cand}.a 2>/dev/null; {oracle} script < {cand} > {cand}.b 2>/dev/null; cmp -s {cand}.a {cand}.b");
+    cmd.push(0);
+    // SAFETY: a NUL-terminated command line.
+    let rc = unsafe { system(cmd.as_slice().ptr) };
+    cmd.free();
+    rc != 0
+}
+
+fn reduce(path: [u8], term: [u8], oracle: [u8], gpa: Gpa) -> i32 {
+    let mut src = read_file(path, gpa);
+    let mut parts = parse_script(src.as_slice(), gpa);
+    src.free();
+    let mut cand = Buf::new_in(gpa);
+    cand.push_str(path);
+    cand.push_str(".cand");
+    let cp = cand.as_slice();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        // Whole commands first (but the first T).
+        let mut i = parts.len() - 1;
+        while i >= 1 {
+            let mut s = render(parts.as_slice(), i, -1, 0, 0, gpa);
+            write_file(cp, s.as_slice(), gpa);
+            s.free();
+            if differs(cp, term, oracle, gpa) {
+                let mut p = parts.remove(i);
+                p.text.free();
+                changed = true;
+            }
+            i -= 1;
+        }
+        // Then bytes of the data, in halving spans.
+        for k in 0..parts.len() {
+            if parts[k].kind != 'D' {
+                continue;
+            }
+            let mut span = parts[k].text.len() / 2;
+            while span >= 1 {
+                let mut at = 0;
+                while at + span <= parts[k].text.len() {
+                    let mut s = render(parts.as_slice(), -1, k, at, span, gpa);
+                    write_file(cp, s.as_slice(), gpa);
+                    s.free();
+                    if differs(cp, term, oracle, gpa) {
+                        let mut t = Buf::new_in(gpa);
+                        let old = parts[k].text.as_slice();
+                        t.push_str(old[0..at]);
+                        t.push_str(old[at + span..]);
+                        parts[k].text.free();
+                        parts[k].text = t;
+                        changed = true;
+                    } else {
+                        at += span;
+                    }
+                }
+                span = span / 2;
+            }
+        }
+    }
+    let mut s = render(parts.as_slice(), -1, -1, 0, 0, gpa);
+    print(s.as_slice());
+    s.free();
+    0
+}
+
+fn read_file(path: [u8], gpa: Gpa) -> Buf {
+    let mut out = Buf::new_in(gpa);
+    let mut b = Buf::new_in(gpa);
+    b.push_str(path);
+    b.push(0);
+    unsafe {
+        // SAFETY: C stdio on a NUL-terminated path into a local buffer.
+        let f = fopen(b.as_slice().ptr, c"rb");
+        if f != 0 as *u8 {
+            let mut chunk: [u8; 65536] = [0; 65536];
+            loop {
+                let n = fread(&chunk[0], 1, 65536, f) as i64;
+                if n <= 0 {
+                    break;
+                }
+                out.push_str(chunk[0..n]);
+            }
+            fclose(f);
+        }
+    }
+    b.free();
+    out
+}
+
+extern "C" {
+    fn fread(p: *u8, size: u64, n: u64, f: *u8) -> u64;
+}
+
+fn arg(argv: **u8, i: i64) -> [u8] {
+    // SAFETY: argv[i] is a NUL-terminated string from the C runtime.
+    unsafe {
+        let p = argv[i];
+        let mut n = 0;
+        while p[n] != 0 {
+            n += 1;
+        }
+        p[0..n]
+    }
+}
+
+fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
+    if argc >= 5 && arg(argv, 1) == "--reduce" {
+        return reduce(arg(argv, 2), arg(argv, 3), arg(argv, 4), gpa);
+    }
+    if argc < 3 {
+        eprintln("usage: gen SEED CASES [corpus FILE...] | gen --reduce SCRIPT TERM ORACLE");
+        return 2;
+    }
+    let seed = parse_int(arg(argv, 1)).unwrap_or(1);
+    let cases = parse_int(arg(argv, 2)).unwrap_or(10);
+    let mut corpus: Vec<Buf> = Vec::new_in(gpa);
+    let mut i = 3;
+    if i < argc as i64 && arg(argv, i) == "corpus" {
+        i += 1;
+        while i < argc as i64 {
+            corpus.push(read_file(arg(argv, i), gpa));
+            i += 1;
+        }
+    }
+    let mut out = generate(seed, cases, corpus.as_slice(), gpa);
+    print(out.as_slice());
+    out.free();
+    for k in 0..corpus.len() {
+        corpus[k].free();
+    }
+    corpus.free();
+    0
+}

@@ -1,0 +1,525 @@
+// Resize, with reflow: rows joined by the WRAPLINE flag are one logical
+// line, re-wrapped to the new width, the cursor kept on its character.
+// This is alacritty_terminal 0.26's grid/resize.rs step by step (the
+// oracle compares the results), rows' `occ` included, on a copy of the
+// rows: a resize costs O(scrollback), once per resize. The alternate
+// screen is not reflowed: its rows are cut or padded.
+
+use super::Term;
+use super::extra::Extras;
+use super::cell::{Cell, DEFAULT_BG, LEADING_WIDE_CHAR_SPACER, WIDE_CHAR, WRAPLINE};
+use super::grid::{Grid, is_empty};
+
+pub const MIN_COLUMNS: i64 = 2;
+pub const MIN_LINES: i64 = 1;
+
+impl Term {
+    // The new size in cells (at least 2 columns and 1 line).
+    pub fn resize(self: &mut Term, lines_in: i64, cols_in: i64) {
+        let lines = if lines_in < MIN_LINES { MIN_LINES } else { lines_in };
+        let cols = if cols_in < MIN_COLUMNS { MIN_COLUMNS } else { cols_in };
+        let old_cols = self.grid.cols;
+        if lines == self.grid.lines && cols == old_cols {
+            return;
+        }
+        let alt = (self.mode & super::ALT_SCREEN) != 0;
+        resize_grid(&mut self.grid, &mut self.extras, !alt, lines, cols);
+        resize_grid(&mut self.inactive, &mut self.extras, alt, lines, cols);
+        if old_cols != cols {
+            // New tab stops every 8 columns past the old width.
+            while self.tabs.len() > cols {
+                self.tabs.pop();
+            }
+            while self.tabs.len() < cols {
+                let i = self.tabs.len();
+                self.tabs.push(i % 8 == 0);
+            }
+        }
+        self.region_top = 0;
+        self.region_bot = lines;
+        self.tmpl_changed();
+    }
+}
+
+// Alacritty's `Grid::resize`: lines first, then columns. Rows reset on
+// the way take the default background (Alacritty empties the template).
+fn resize_grid(g: &mut Grid, x: &mut Extras, reflow: bool, lines: i64, cols: i64) {
+    if lines > g.lines {
+        grow_lines(g, lines);
+    } else if lines < g.lines {
+        shrink_lines(g, lines);
+    }
+    if cols > g.cols {
+        grow_columns(g, x, reflow, cols);
+    } else if cols < g.cols {
+        shrink_columns(g, x, reflow, cols);
+    }
+    // The damage, per screen line.
+    g.damage_lo.clear();
+    g.damage_hi.clear();
+    for _ in 0..g.lines {
+        g.damage_lo.push(0);
+        g.damage_hi.push(g.cols - 1);
+    }
+    g.damage_all = true;
+}
+
+// `grow_lines`: the lines come from the scrollback while it has some
+// (the cursor moves down with its text), then blank at the bottom.
+fn grow_lines(g: &mut Grid, target: i64) {
+    let added = target - g.lines;
+    g.initialize(added);
+    g.lines = target;
+    let mut from_history = g.hist();
+    if from_history > added {
+        from_history = added;
+    }
+    if from_history != added {
+        g.scroll_up(0, target, added - from_history, DEFAULT_BG);
+    }
+    g.cursor.line += from_history;
+    g.saved.line += from_history;
+    g.decrease_scroll_limit(added);
+}
+
+// `shrink_lines`: the bottom lines go, but the cursor's line stays: the
+// lines above it scroll into the scrollback first.
+fn shrink_lines(g: &mut Grid, target: i64) {
+    let required = g.cursor.line + 1 - target;
+    if required > 0 {
+        g.scroll_up(0, g.lines, required, DEFAULT_BG);
+        if g.cursor.line > target - 1 {
+            g.cursor.line = target - 1;
+        }
+    }
+    if g.saved.line > target - 1 {
+        g.saved.line = target - 1;
+    }
+    g.rotate(g.lines - target);
+    let n = g.lines - target;
+    g.shrink_storage(n);
+    g.lines = target;
+}
+
+// ---- rows apart from the grid: Alacritty's `Row` ----
+
+struct Row {
+    cells: Vec<Cell>,
+    occ: i64,
+}
+
+fn empty_row(gpa: Gpa) -> Row {
+    Row { cells: Vec::new_in(gpa), occ: 0 }
+}
+
+fn new_row(cols: i64, gpa: Gpa) -> Row {
+    let mut v: Vec<Cell> = Vec::with_capacity_in(cols, gpa);
+    for _ in 0..cols {
+        v.push(Cell::blank(DEFAULT_BG));
+    }
+    Row { cells: v, occ: 0 }
+}
+
+// `Storage::take_all`: the rows, the bottom line first.
+fn take_all(g: &mut Grid) -> Vec<Row> {
+    g.truncate();
+    let mut rows: Vec<Row> = Vec::with_capacity_in(g.inner.len(), g.gpa);
+    for k in 0..g.inner.len() {
+        let s = g.inner[k];
+        let base = s * g.cols;
+        let mut v: Vec<Cell> = Vec::with_capacity_in(g.cols, g.gpa);
+        v.extend_from_slice(g.cells.as_slice()[base..base + g.cols]);
+        rows.push(Row { cells: v, occ: g.occ[s] });
+    }
+    rows
+}
+
+// `Storage::replace_inner`: the grid from `rows` (the bottom line
+// first), each `cols` cells.
+fn replace_inner(g: &mut Grid, rows: &Vec<Row>, cols: i64) {
+    let total = rows.len();
+    g.cells.clear();
+    g.occ.clear();
+    g.free_slots.clear();
+    g.inner.clear();
+    g.cols = cols;
+    g.cells.reserve(total * cols);
+    let mut rows = rows;
+    for k in 0..total {
+        let mut r = std::replace(&mut rows[k], empty_row(g.gpa));
+        for i in 0..cols {
+            if i < r.cells.len() {
+                g.cells.push(r.cells[i]);
+            } else {
+                g.cells.push(Cell::blank(DEFAULT_BG));
+            }
+        }
+        g.occ.push(r.occ);
+        g.inner.push(k);
+        r.cells.free();
+    }
+    let mut rs = rows;
+    rs.free();
+    g.zero = 0;
+    g.len = total;
+}
+
+fn cell_empty(x: &mut Extras, c: Cell) -> bool {
+    is_empty(c) && !x.has_zw(c.extra_id())
+}
+
+fn is_clear(x: &mut Extras, r: &mut Row) -> bool {
+    for i in 0..r.cells.len() {
+        if !cell_empty(x, r.cells[i]) {
+            return false;
+        }
+    }
+    true
+}
+
+fn spacer() -> Cell {
+    let mut c = Cell::blank(DEFAULT_BG);
+    c.flags = LEADING_WIDE_CHAR_SPACER;
+    c
+}
+
+// `Row::front_split_off`: the first `at` cells, removed.
+fn front_split_off(r: &mut Row, at: i64, gpa: Gpa) -> Vec<Cell> {
+    let mut front: Vec<Cell> = Vec::with_capacity_in(at, gpa);
+    let mut rest: Vec<Cell> = Vec::with_capacity_in(r.cells.len() - at, gpa);
+    for i in 0..r.cells.len() {
+        if i < at {
+            front.push(r.cells[i]);
+        } else {
+            rest.push(r.cells[i]);
+        }
+    }
+    r.cells.free();
+    r.cells = rest;
+    r.occ = if r.occ > at { r.occ - at } else { 0 };
+    front
+}
+
+// `Row::shrink`: the cells past `cols` cut off; returned (without their
+// trailing empty cells) when any is left, else an empty vector.
+fn shrink(x: &mut Extras, r: &mut Row, cols: i64, gpa: Gpa) -> Vec<Cell> {
+    let mut cut: Vec<Cell> = Vec::new_in(gpa);
+    if r.cells.len() <= cols {
+        return cut;
+    }
+    for i in cols..r.cells.len() {
+        cut.push(r.cells[i]);
+    }
+    r.cells.truncate(cols);
+    let mut n = cut.len();
+    while n > 0 && cell_empty(x, cut[n - 1]) {
+        n -= 1;
+    }
+    cut.truncate(n);
+    if r.occ > cols {
+        r.occ = cols;
+    }
+    cut
+}
+
+// `Row::last_mut`, setting or clearing `flag` on the last cell.
+fn last_flag(r: &mut Row, flag: u16, on: bool) {
+    let n = r.cells.len();
+    if n == 0 {
+        return;
+    }
+    r.occ = n;
+    if on {
+        r.cells[n - 1].flags = r.cells[n - 1].flags | flag;
+    } else {
+        r.cells[n - 1].flags = r.cells[n - 1].flags & ~flag;
+    }
+}
+
+// `Point::sub(.., Boundary::Cursor, n)` on the resized grid.
+fn sub_point(g: &mut Grid, line: i64, col: i64, n: i64) -> (i64, i64) {
+    let cols = g.cols;
+    let mut changes = n + cols - 1 - col;
+    if changes < 0 {
+        changes = 0;
+    }
+    let mut l = line - changes / cols;
+    let mut c = (cols + col - n % cols) % cols;
+    if c > cols - 1 {
+        c = cols - 1;
+    }
+    if l < 0 {
+        l = 0;
+        c = 0;
+    } else if l > g.lines - 1 {
+        l = g.lines - 1;
+        c = cols - 1;
+    }
+    (l, c)
+}
+
+fn grow_columns(g: &mut Grid, x: &mut Extras, reflow: bool, columns: i64) {
+    let gpa = g.gpa;
+    let mut rows = take_all(g);
+    g.cols = columns;
+    if g.cursor.needs_wrap && reflow {
+        g.cursor.needs_wrap = false;
+        g.cursor.col += 1;
+    }
+    // The rows top to bottom, merged.
+    let mut reversed: Vec<Row> = Vec::new_in(gpa);
+    let mut cursor_line_delta = 0;
+    let mut i = rows.len() - 1;
+    while i >= 0 {
+        let mut row = std::replace(&mut rows[i], empty_row(gpa));
+        let nr = reversed.len();
+        let mut wraps = false;
+        if nr > 0 && reflow {
+            let len = reversed[nr - 1].cells.len();
+            wraps = len > 0 && len < columns && (reversed[nr - 1].cells[len - 1].flags & WRAPLINE) != 0;
+        }
+        if !wraps {
+            reversed.push(row);
+            i -= 1;
+            continue;
+        }
+        let mut last = std::replace(&mut reversed[nr - 1], empty_row(gpa));
+        last_flag(&mut last, WRAPLINE, false);
+        let mut last_len = last.cells.len();
+        if last_len >= 1 && (last.cells[last_len - 1].flags & LEADING_WIDE_CHAR_SPACER) != 0 {
+            let mut gone = shrink(x, &mut last, last_len - 1, gpa);
+            gone.free();
+            last_len -= 1;
+        }
+        let mut num_wrapped = columns - last_len;
+        let mut len = row.cells.len();
+        if len > num_wrapped {
+            len = num_wrapped;
+        }
+        let mut cells: Vec<Cell> = Vec::new_in(gpa);
+        if (row.cells[len - 1].flags & WIDE_CHAR) != 0 {
+            num_wrapped -= 1;
+            cells = front_split_off(&mut row, len - 1, gpa);
+            cells.push(spacer());
+        } else {
+            cells = front_split_off(&mut row, len, gpa);
+        }
+        last.occ += cells.len();
+        last.cells.extend_from_slice(cells.as_slice());
+        cells.free();
+        let cursor_buffer_line = g.lines - g.cursor.line - 1;
+        if i == cursor_buffer_line {
+            let (l1, c1) = sub_point(g, g.cursor.line, g.cursor.col, num_wrapped);
+            let mut tl = l1;
+            let mut tc = c1;
+            if tc == 0 && is_clear(x, &mut row) {
+                g.cursor.needs_wrap = true;
+                let (l2, c2) = sub_point(g, tl, tc, 1);
+                tl = l2;
+                tc = c2;
+            }
+            g.cursor.col = tc;
+            let line_delta = g.cursor.line - tl;
+            if line_delta != 0 && is_clear(x, &mut row) {
+                reversed[nr - 1] = last;
+                row.cells.free();
+                i -= 1;
+                continue;
+            }
+            cursor_line_delta += line_delta;
+        } else if is_clear(x, &mut row) {
+            if i < cursor_buffer_line {
+                g.cursor.line += 1;
+            }
+            reversed[nr - 1] = last;
+            row.cells.free();
+            i -= 1;
+            continue;
+        }
+        last_flag(&mut last, WRAPLINE, true);
+        reversed[nr - 1] = last;
+        reversed.push(row);
+        i -= 1;
+    }
+    rows.free();
+    // At least the screen.
+    if reversed.len() < g.lines {
+        let delta = g.lines - reversed.len();
+        g.cursor.line -= delta;
+        if g.cursor.line < 0 {
+            g.cursor.line = 0;
+        }
+        while reversed.len() < g.lines {
+            reversed.push(new_row(columns, gpa));
+        }
+    }
+    // Pull content down to put the cursor on its line, or move the cursor
+    // up when there are no more lines below it to remove.
+    if cursor_line_delta != 0 {
+        let cursor_buffer_line = g.lines - g.cursor.line - 1;
+        let mut available = reversed.len() - g.lines;
+        if cursor_buffer_line < available {
+            available = cursor_buffer_line;
+        }
+        let mut overflow = cursor_line_delta - available;
+        if overflow < 0 {
+            overflow = 0;
+        }
+        let keep = reversed.len() + overflow - cursor_line_delta;
+        while reversed.len() > keep {
+            let mut r = reversed.pop().unwrap();
+            r.cells.free();
+        }
+        g.cursor.line -= overflow;
+        if g.cursor.line < 0 {
+            g.cursor.line = 0;
+        }
+    }
+    // Bottom first again, each row `columns` long.
+    let mut new_raw: Vec<Row> = Vec::with_capacity_in(reversed.len(), gpa);
+    let mut k = reversed.len() - 1;
+    while k >= 0 {
+        let mut r = std::replace(&mut reversed[k], empty_row(gpa));
+        while r.cells.len() < columns {
+            r.cells.push(Cell::blank(DEFAULT_BG));
+        }
+        new_raw.push(r);
+        k -= 1;
+    }
+    reversed.free();
+    replace_inner(g, new_raw, columns);
+}
+
+fn shrink_columns(g: &mut Grid, x: &mut Extras, reflow: bool, columns: i64) {
+    let gpa = g.gpa;
+    let mut rows = take_all(g);
+    g.cols = columns;
+    if g.cursor.needs_wrap && reflow {
+        g.cursor.needs_wrap = false;
+        g.cursor.col += 1;
+    }
+    // The rows top to bottom, split.
+    let mut new_raw: Vec<Row> = Vec::new_in(gpa);
+    let mut buffered: Vec<Cell> = Vec::new_in(gpa);
+    let mut has_buffered = false;
+    let mut i = rows.len() - 1;
+    while i >= 0 {
+        let mut row = std::replace(&mut rows[i], empty_row(gpa));
+        if has_buffered {
+            let cursor_buffer_line = g.lines - g.cursor.line - 1;
+            if i == cursor_buffer_line {
+                g.cursor.col += buffered.len();
+            }
+            // `Row::append_front`.
+            row.occ += buffered.len();
+            buffered.extend_from_slice(row.cells.as_slice());
+            row.cells.free();
+            row.cells = buffered;
+            buffered = Vec::new_in(gpa);
+            has_buffered = false;
+        }
+        loop {
+            let mut wrapped = shrink(x, &mut row, columns, gpa);
+            if wrapped.len() == 0 || !reflow {
+                let cursor_buffer_line = g.lines - g.cursor.line - 1;
+                if reflow && i == cursor_buffer_line && g.cursor.col > columns {
+                    // Empty cells before the cursor: explicit white space,
+                    // wrapped as text is.
+                } else {
+                    wrapped.free();
+                    new_raw.push(row);
+                    break;
+                }
+            }
+            // A wide character in the last column goes to the next line,
+            // a leading spacer in its place.
+            if row.cells.len() >= columns && (row.cells[columns - 1].flags & WIDE_CHAR) != 0 {
+                let wide = row.cells[columns - 1];
+                row.cells[columns - 1] = spacer();
+                if row.occ < columns {
+                    row.occ = columns;
+                }
+                wrapped.insert(0, wide);
+            }
+            let wl = wrapped.len();
+            if wl > 0 && (wrapped[wl - 1].flags & LEADING_WIDE_CHAR_SPACER) != 0 {
+                if wl == 1 {
+                    row.cells[columns - 1].flags = row.cells[columns - 1].flags | WRAPLINE;
+                    if row.occ < columns {
+                        row.occ = columns;
+                    }
+                    new_raw.push(row);
+                    wrapped.free();
+                    break;
+                }
+                wrapped[wl - 2].flags = wrapped[wl - 2].flags | WRAPLINE;
+                wrapped.truncate(wl - 1);
+            }
+            last_flag(&mut row, WRAPLINE, true);
+            new_raw.push(row);
+            let wl = wrapped.len();
+            if wl > 0 && (wrapped[wl - 1].flags & WRAPLINE) != 0 && i >= 1 && wl < columns {
+                wrapped[wl - 1].flags = wrapped[wl - 1].flags & ~WRAPLINE;
+                buffered = wrapped;
+                has_buffered = true;
+                break;
+            }
+            let cursor_buffer_line = g.lines - g.cursor.line - 1;
+            if (i == cursor_buffer_line && g.cursor.col < columns) || i < cursor_buffer_line {
+                g.cursor.line -= 1;
+                if g.cursor.line < 0 {
+                    g.cursor.line = 0;
+                }
+            }
+            if i == cursor_buffer_line && g.cursor.col >= columns {
+                g.cursor.col -= columns;
+            }
+            let occ = wrapped.len();
+            while wrapped.len() < columns {
+                wrapped.push(Cell::blank(DEFAULT_BG));
+            }
+            row = Row { cells: wrapped, occ: occ };
+        }
+        i -= 1;
+    }
+    rows.free();
+    buffered.free();
+    // Bottom first, the newest `max_hist + lines` rows.
+    let keep = g.max_hist + g.lines;
+    let mut out: Vec<Row> = Vec::with_capacity_in(new_raw.len(), gpa);
+    let mut k = new_raw.len() - 1;
+    while k >= 0 {
+        let mut r = std::replace(&mut new_raw[k], empty_row(gpa));
+        if out.len() < keep {
+            out.push(r);
+        } else {
+            r.cells.free();
+        }
+        k -= 1;
+    }
+    new_raw.free();
+    replace_inner(g, out, columns);
+    if !reflow {
+        if g.cursor.col > columns - 1 {
+            g.cursor.col = columns - 1;
+        }
+    } else if g.cursor.col == columns && g.cursor.line >= 0 && g.cursor.line < g.lines
+        && (g.row(g.cursor.line)[columns - 1].flags & WRAPLINE) == 0 {
+        g.cursor.needs_wrap = true;
+        g.cursor.col -= 1;
+    } else {
+        if g.cursor.col > columns - 1 {
+            g.cursor.col = columns - 1;
+        }
+        if g.cursor.line < 0 {
+            g.cursor.line = 0;
+            g.cursor.col = 0;
+        } else if g.cursor.line > g.lines - 1 {
+            g.cursor.line = g.lines - 1;
+            g.cursor.col = columns - 1;
+        }
+    }
+    if g.saved.col > columns - 1 {
+        g.saved.col = columns - 1;
+    }
+}
