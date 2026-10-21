@@ -3,7 +3,7 @@
 ## an item shown with its clauses, a distinct type, test functions.
 $ items
 crate	syntax018/main.tach	14
-std	<std>	577
+std	<std>	579
 crate::tests	syntax018/main.tach	1
 std::ops	<std>	5
 std::iter	<std>	67
@@ -37,7 +37,17 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
-std::gpu	<std>	2
+std::objc	<std>	50
+std::objc::foundation	<std>	67
+std::gpu	<std>	139
+std::gpu::hal	<std>	7
+std::gpu::hal::metal	<std>	109
+std::gpu::hal::metal::bindings	<std>	776
+std::gpu::shader	<std>	20
+std::gpu::types	<std>	50
+std::gpu::types::BufferUsage	<std>	9
+std::gpu::types::TextureUsage	<std>	5
+std::gpu::types::ShaderStage	<std>	3
 std::gpu::wgsl	<std>	30
 std::gpu::wgsl::ir	<std>	267
 std::gpu::wgsl::names	<std>	238

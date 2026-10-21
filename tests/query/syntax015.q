@@ -4,7 +4,7 @@
 ## A method #[derive] makes: the attribute answers (0.15).
 $ items
 crate	syntax015/main.tach	6
-std	<std>	577
+std	<std>	579
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	37
@@ -37,7 +37,17 @@ std::hash::state	<std>	18
 std::str	<std>	67
 std::unicode	<std>	74
 std::unicode::tables	<std>	27
-std::gpu	<std>	2
+std::objc	<std>	50
+std::objc::foundation	<std>	67
+std::gpu	<std>	139
+std::gpu::hal	<std>	7
+std::gpu::hal::metal	<std>	109
+std::gpu::hal::metal::bindings	<std>	776
+std::gpu::shader	<std>	20
+std::gpu::types	<std>	50
+std::gpu::types::BufferUsage	<std>	9
+std::gpu::types::TextureUsage	<std>	5
+std::gpu::types::ShaderStage	<std>	3
 std::gpu::wgsl	<std>	30
 std::gpu::wgsl::ir	<std>	267
 std::gpu::wgsl::names	<std>	238

@@ -18,15 +18,15 @@ The program is the whole of std::gpu's compute path, on wgpu's model:
 - `gpu::Instance::new_in(gpa)`, `inst.adapter()?`, `adapter.device()?`:
   the device and its queue (`Result`s: a Mac without Metal has no
   adapter).
-- `dev.shader(&ShaderSource::msl(text, refl))?`: the shader compiler's
+- `dev.shader(ShaderSource::msl(text, refl))?` (bound to a local first): the shader compiler's
   output for this device's `caps().shader_kind`. Until the WGSL compiler
   lands, the MSL and its `Reflection` (entry points, bindings with their
   Metal slots) are written by hand.
-- `dev.compute_pipeline(&shader, "main")?` and `dev.bind_group(
+- `dev.compute_pipeline(shader, "main")?` and `dev.bind_group(
   pipe.bind_layout(0), [...])`: the layout comes from the reflection.
 - `enc.compute_pass(|pass| { ... })`: a pass is a closure; it ends when
   the closure returns.
-- `queue.submit(enc.finish())`, then `host.map_read(&dev)`: it waits for
+- `queue.submit(enc.finish())`, then `host.map_read(dev)`: it waits for
   the GPU and returns a view of the buffer's bytes; `gpu::u32s` reads
   them as `u32`s.
 
