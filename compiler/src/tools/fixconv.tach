@@ -42,7 +42,7 @@ use crate::front::ast::{
     CLOSURE_MOVE, CONV_NEW, FIELD_SHORTHAND, NODES, NODE_COUNT, NODE_REF, NODE_REF_MUT, NodeKind,
     child,
 };
-use crate::front::lexer::Tok;
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
 use crate::front::modules::file_of_pos;
 use crate::front::own::kinds::{K_OWNED, type_kind};
 use crate::front::traits::{IMPLS, impl_of_fn, trait_fn};
@@ -860,6 +860,99 @@ fn edit_fn_type(n: i64) {
     }
 }
 
+// The widest postfix expression (a name, a field, an index, a call)
+// starting at each position (key + 1: node), for the token rules.
+static mut POSTFIX_AT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+fn postfix_kind(k: NodeKind) -> bool {
+    k == NodeKind::Ident || k == NodeKind::FieldAccess || k == NodeKind::Index
+        || k == NodeKind::Call || k == NodeKind::MethodCall || k == NodeKind::TupleField
+        || k == NodeKind::Path
+}
+
+// Whether token k (`*`, `&`) is a prefix operator: what is before it
+// does not end an operand.
+fn prefix_token(k: i64) -> bool {
+    unsafe {
+        if k == 0 {
+            return true;
+        }
+        let p = TOKS[k - 1].kind;
+        !(p == Tok::Ident || p == Tok::Int || p == Tok::Float || p == Tok::Char || p == Tok::Str
+            || p == Tok::CStr || p == Tok::RParen || p == Tok::RBracket || p == Tok::True
+            || p == Tok::False || p == Tok::FTail || p == Tok::Question)
+    }
+}
+
+// Rules 4 and 5 by the tokens, where the checker made the `&mut e` or
+// `*r` node another (`&mut a[..]` a slicing, `(*p).f` a field of p): a
+// prefix `&mut` is `&`; a prefix `*` before an expression of a reference
+// type goes (with the parentheses of `(*p).f`).
+fn token_rules() {
+    unsafe {
+        for n in 1..NODE_COUNT {
+            let k = NODES[n].kind;
+            let s = NODES[n].start;
+            if !postfix_kind(k) || NODES[n].ty <= 0 || !editable(s) {
+                continue;
+            }
+            let have = POSTFIX_AT.get(s + 1);
+            if have == 0 || NODES[have].end < NODES[n].end {
+                POSTFIX_AT.put(s + 1, n);
+            }
+        }
+        for k in 0..TOK_COUNT - 1 {
+            let kind = TOKS[k].kind;
+            let s = TOKS[k].start;
+            if kind != Tok::Amp && kind != Tok::Star || !editable(s) || DONE.get(s + 1) != 0
+                || !prefix_token(k) {
+                continue;
+            }
+            if kind == Tok::Amp {
+                if TOKS[k + 1].kind == Tok::Mut {
+                    put(s, TOKS[k + 2].start, "&", CC_MARKER);
+                }
+                continue;
+            }
+            let operand = POSTFIX_AT.get(TOKS[k + 1].start + 1);
+            if operand <= 0 || !is_ref_type(NODES[operand].ty) {
+                continue;
+            }
+            let oe = NODES[operand].end;
+            let close = skip_ws(oe);
+            if k > 0 && TOKS[k - 1].kind == Tok::LParen && SRC[close] == ')'
+                && (SRC[close + 1] == '.' || SRC[close + 1] == '[') {
+                if put(TOKS[k - 1].start, TOKS[k + 1].start, "", CC_DEREF) {
+                    put(close, close + 1, "", -1);
+                }
+            } else {
+                put(s, TOKS[k + 1].start, "", CC_DEREF);
+            }
+        }
+    }
+}
+
+// `&x as *u8`, `&x` to a C function (variadic too): a raw pointer's
+// address, as it is (D23); not reported.
+fn raw_amps() {
+    unsafe {
+        for n in 1..NODE_COUNT {
+            let k = NODES[n].kind;
+            if k == NodeKind::Cast && NODES[n].a > 0 && is_amp(NODES[n].a) {
+                AMP_SEEN.put(NODES[n].a + 1, 1);
+            } else if k == NodeKind::Call && NODES[n].x > 0 && NODES[n].x - 1 < FN_COUNT
+                && FNS[NODES[n].x - 1].is_extern {
+                for i in 0..NODES[n].count {
+                    let a = arg_value(child(n, i));
+                    if a > 0 && is_amp(a) && !amp_mut(a) {
+                        AMP_SEEN.put(a + 1, 1);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Identifiers that are 0.20's words (D27: renamed by hand for 0.21).
 fn find_words() {
     unsafe {
@@ -914,6 +1007,7 @@ pub fn conventions_edits() -> i64 {
                 edit_fn_type(n);
             }
         }
+        raw_amps();
         for n in 1..NODE_COUNT {
             edit_node(n);
         }
@@ -944,6 +1038,9 @@ pub fn conventions_edits() -> i64 {
                 continue;
             }
             put(s, skip_ws(after_mut(skip_ws(s + 1))), "&", CC_MARKER);
+        }
+        if !CONV_SPELLING {
+            token_rules();
         }
         find_words();
         let mut total = 0;
