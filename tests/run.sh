@@ -599,6 +599,10 @@ run_case() {
 if [ -x "$ROOT/compiler/std/embed.sh" ] && ! "$ROOT/compiler/std/embed.sh" -c; then
     exit 1
 fi
+# (0.21.1) std's core, the sections every program reads, stays small.
+if [ -x "$ROOT/tests/std/core_sections.sh" ] && ! "$ROOT/tests/std/core_sections.sh" >/dev/null; then
+    exit 1
+fi
 # (0.19) The intrinsic tables, compiler/arch/*.def, as tables.tach has them.
 if [ -x "$ROOT/compiler/arch/embed.sh" ] && ! "$ROOT/compiler/arch/embed.sh" -c; then
     exit 1
