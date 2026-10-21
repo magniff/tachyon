@@ -33,8 +33,8 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-gpubench.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT INT TERM
 B="$ROOT/bench/gpu"
 clang -O2 -fobjc-arc "$B/draws.m" -framework Metal -framework Foundation -o "$WORK/objc" || exit 1
-"$COMPILER" -O2 "$B/draws.tach" -l objc -o "$WORK/tachyon" >/dev/null || exit 1
-"$COMPILER" -O2 "$B/draws_hal.tach" -l objc -o "$WORK/tachyon-hal" >/dev/null || exit 1
+"$COMPILER" -O2 "$B/draws.tach" -l objc -o "$WORK/tachyon" >/dev/null 2>&1 || exit 1
+"$COMPILER" -O2 "$B/draws_hal.tach" -l objc -o "$WORK/tachyon-hal" >/dev/null 2>&1 || exit 1
 progs="objc tachyon tachyon-hal"
 if command -v cargo >/dev/null 2>&1 &&
    CARGO_TARGET_DIR="$WORK/cargo" cargo build -q --release --offline --manifest-path "$B/wgpu/Cargo.toml" >"$WORK/cargo.log" 2>&1; then

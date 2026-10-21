@@ -1083,3 +1083,12 @@ is added without touching the public API:
 6. **Tests.** tests/gpu/run.sh's compute cases are backend-neutral but
    for their MSL: with the WGSL compiler they take WGSL, and a `NEEDS:
    cuda` directive runs them on the CUDA backend where a GPU is present.
+
+### Measured (bench/gpu/run.sh, Apple M5, load average 15 to 30)
+
+10,000 draws with a bind group change every 10, the median of 5 rounds
+of 60 encodings: Objective-C 256 µs; std::gpu 266 µs (1.04x, goal
+1.10x); std::gpu::hal::metal directly 262 µs (the contracts cost about
+1.5%, goal 3%); wgpu 30.0.1 498 µs (std::gpu 1.9x faster). A program
+that uses neither std::gpu nor std::objc compiles in the same time as on
+release-0.20 (their sections are lazy and gated).
