@@ -1,0 +1,557 @@
+// The renderer (terminal.md §3.5, D10): one instanced draw per frame of
+// 16-byte instances, one per cell, with damage tracking.
+//
+// - The instances live in a ring of rows that mirrors the grid's ring:
+//   slot s holds the line (s - top) mod lines. A whole-screen scroll of k
+//   lines moves `top` by k and rebuilds only the lines the grid reports
+//   damaged (the k that scrolled in): no other row is touched.
+// - `master` is the CPU copy of the ring. Each of the three frames in
+//   flight has its own GPU buffer of the ring and the version of every
+//   slot it holds; a frame copies only the slots whose version moved
+//   since that buffer was last drawn (one memcpy per row into shared
+//   memory: Apple silicon needs no staging).
+// - The uniforms (ring top, cursor, selection, metrics) are copied into
+//   each frame's command stream (setVertexBytes), so moving the cursor or
+//   the selection changes no instance.
+// - A frame with nothing changed is not drawn (`dirty()` is false).
+//
+// Colours are resolved on the CPU when a row is built (palette, default
+// colours, dim, inverse, hidden); a palette change rebuilds every row.
+//
+// Before 0.21 the CPU never waits on a completion handler: a frame
+// buffer about to be reused waits for its last command buffer, which is
+// normally long done (gpu.md §2.11).
+
+use super::atlas::Atlas;
+use super::font::Font;
+use super::font::BOLD as S_BOLD;
+use super::font::BOLD_ITALIC as S_BOLD_ITALIC;
+use super::font::ITALIC as S_ITALIC;
+use super::font::REGULAR as S_REGULAR;
+use super::input::{
+    BOLD, BRIGHT_FG, COLOR_INDEXED, COLOR_RGB, CURSOR_BLOCK, CURSOR_HIDDEN, Cell, CellGrid,
+    CursorView, DASHED_UNDERLINE, DEFAULT_BG, DEFAULT_FG, DIM, DIM_BLACK, DIM_FG, DOTTED_UNDERLINE,
+    DOUBLE_UNDERLINE, HIDDEN, INVERSE, ITALIC, LEADING_WIDE_CHAR_SPACER, STRIKEOUT, TAG_MASK,
+    UNDERCURL, UNDERLINE, VALUE_MASK, WIDE_CHAR, WIDE_CHAR_SPACER,
+};
+use super::metal::{Buffer, Device, Pass, Pipeline, Submitted, Texture};
+use super::objc::ClearColor;
+use super::shader::msl;
+
+// One instance: the shader's `Inst`.
+pub struct Inst {
+    pub glyph: u32,
+    pub fg: u32,
+    pub bg: u32,
+    pub flags: u32,
+}
+
+// Instance flags (the shader's): underline style in bits 0-2, strike,
+// the right half of a wide glyph.
+pub const I_UNDER_SINGLE: u32 = 1;
+pub const I_UNDER_DOUBLE: u32 = 2;
+pub const I_UNDER_CURLY: u32 = 3;
+pub const I_UNDER_DOTTED: u32 = 4;
+pub const I_UNDER_DASHED: u32 = 5;
+pub const I_STRIKE: u32 = 8;
+pub const I_RIGHT_HALF: u32 = 16;
+
+// The shader's `U`, 80 bytes.
+pub struct Uniforms {
+    pub cols: u32,
+    pub lines: u32,
+    pub top: u32,
+    pub cw: u32,
+    pub ch: u32,
+    pub ul_pos: u32,
+    pub ul_thick: u32,
+    pub strike_pos: u32,
+    pub cur_line: u32,
+    pub cur_col: u32,
+    pub cur_shape: u32,
+    pub cur_color: u32,
+    pub sel_lo: u32,
+    pub sel_hi: u32,
+    pub pad_x: u32,
+    pub pad_y: u32,
+    pub vw: f32,
+    pub vh: f32,
+    pub r0: u32,
+    pub r1: u32,
+}
+
+const FRAMES: i64 = 3;
+
+struct FrameBuf {
+    buf: Buffer,
+    ver: Vec<u64>,
+    last: Option<Submitted>,
+}
+
+// Counters for the tests and the bench.
+pub struct Stats {
+    pub rows_built: i64,
+    pub rows_copied: i64,
+    pub frames: i64,
+    pub skipped: i64,
+    pub atlas_clears: i64,
+}
+
+pub struct Renderer {
+    dev: Device,
+    pipe: Pipeline,
+    pub font: Font,
+    pub atlas: Atlas,
+    pub lines: i64,
+    pub cols: i64,
+    pub top: i64,
+    pub master: Vec<Inst>,
+    ver: Vec<u64>,
+    next_ver: u64,
+    frames: Vec<FrameBuf>,
+    frame: i64,
+    pub palette: Vec<u32>,
+    pub cursor: CursorView,
+    pub sel_lo: i64,
+    pub sel_hi: i64,
+    pub pad_x: i64,
+    pub pad_y: i64,
+    // Whether anything differs from the last frame drawn.
+    changed: bool,
+    // The next update rebuilds every row (a resize, a palette change).
+    force_all: bool,
+    // The frame buffer `encode` used, for `submitted`.
+    pending: i64,
+    pub stats: Stats,
+    gpa: Gpa,
+}
+
+// Alacritty's default colours: the 16 ANSI colours, the 6×6×6 cube, the
+// grey ramp, then foreground (256), background (257), cursor (258), the
+// eight dim colours (259..266), bright and dim foreground (267, 268).
+pub fn default_palette(out: inout Vec<u32>) {
+    let base: [u32; 16] = [
+        0x181818, 0xac4242, 0x90a959, 0xf4bf75, 0x6a9fb5, 0xaa759f, 0x75b5aa, 0xd8d8d8,
+        0x6b6b6b, 0xc55555, 0xaac474, 0xfeca88, 0x82b8c8, 0xc28cb8, 0x93d3c3, 0xf8f8f8,
+    ];
+    out.clear();
+    for c in base {
+        out.push(c);
+    }
+    let steps: [u32; 6] = [0, 95, 135, 175, 215, 255];
+    for r in 0..6 {
+        for g in 0..6 {
+            for b in 0..6 {
+                out.push((steps[r] << 16) | (steps[g] << 8) | steps[b]);
+            }
+        }
+    }
+    for i in 0..24 {
+        let v = (8 + i * 10) as u32;
+        out.push((v << 16) | (v << 8) | v);
+    }
+    out.push(0xd8d8d8);
+    out.push(0x181818);
+    out.push(0xd8d8d8);
+    for i in 0..8 {
+        out.push(dim(base[i]));
+    }
+    out.push(0xf8f8f8);
+    out.push(dim(0xd8d8d8));
+}
+
+// Alacritty's dim: two thirds of each channel.
+pub fn dim(c: u32) -> u32 {
+    let r = ((c >> 16) & 255) * 2 / 3;
+    let g = ((c >> 8) & 255) * 2 / 3;
+    let b = (c & 255) * 2 / 3;
+    (r << 16) | (g << 8) | b
+}
+
+impl Renderer {
+    // A renderer drawing into targets of pixel `format` (BGRA8 for a
+    // CAMetalLayer, RGBA8 for the tests' textures). The error is Metal's
+    // compiler message, or the font's name.
+    pub fn new_in(dev: Device, font: [u8], points: f64, scale: f64, format: u64, gpa: Gpa) -> Result<Renderer, Buf> {
+        var err = Buf::new_in(gpa);
+        let f = match Font::new_in(font, points, scale, gpa) {
+            Some(f) => f,
+            None => {
+                err.push_str("no font named ");
+                err.push_str(font);
+                return Err(err);
+            }
+        };
+        var src = Buf::new_in(gpa);
+        msl(&src);
+        let pipe = match dev.pipeline(src.as_slice(), "vs", "fs", format, &err) {
+            Some(p) => p,
+            None => return Err(err),
+        };
+        var pal: Vec<u32> = Vec::new_in(gpa);
+        default_palette(&pal);
+        var r = Renderer {
+            dev: dev.clone(),
+            pipe: pipe,
+            font: f,
+            atlas: Atlas::new_in(dev, gpa),
+            lines: 0,
+            cols: 0,
+            top: 0,
+            master: Vec::new_in(gpa),
+            ver: Vec::new_in(gpa),
+            next_ver: 1,
+            frames: Vec::new_in(gpa),
+            frame: 0,
+            palette: pal,
+            cursor: CursorView { line: 0, col: 0, shape: CURSOR_HIDDEN },
+            sel_lo: 0,
+            sel_hi: 0,
+            pad_x: 0,
+            pad_y: 0,
+            changed: true,
+            force_all: true,
+            pending: 0,
+            stats: Stats { rows_built: 0, rows_copied: 0, frames: 0, skipped: 0, atlas_clears: 0 },
+            gpa: gpa,
+        };
+        for _ in 0..FRAMES {
+            r.frames.push(FrameBuf {
+                buf: dev.buffer(16),
+                ver: Vec::new_in(gpa),
+                last: None,
+            });
+        }
+        Ok(r)
+    }
+
+    // Waits for every frame in flight.
+    pub fn wait_idle(inout self) {
+        for i in 0..self.frames.len() {
+            match std::replace(&self.frames[i].last, None) {
+                Some(s) => s.wait(),
+                None => {}
+            }
+        }
+    }
+
+    // Cell size in pixels.
+    pub fn cell_w(self) -> i64 {
+        self.font.m.cw
+    }
+
+    pub fn cell_h(self) -> i64 {
+        self.font.m.ch
+    }
+
+    // Sizes the ring for `lines` × `cols`; everything is rebuilt by the
+    // next update.
+    pub fn resize(inout self, lines: i64, cols: i64) {
+        if lines == self.lines && cols == self.cols {
+            return;
+        }
+        self.wait_idle();
+        self.lines = lines;
+        self.cols = cols;
+        self.top = 0;
+        let n = lines * cols;
+        self.master.clear();
+        for _ in 0..n {
+            self.master.push(Inst { glyph: 0, fg: 0, bg: 0, flags: 0 });
+        }
+        self.ver.clear();
+        for _ in 0..lines {
+            self.ver.push(0);
+        }
+        for i in 0..self.frames.len() {
+            self.frames[i].buf = self.dev.buffer(n * 16);
+            self.frames[i].ver.clear();
+            for _ in 0..lines {
+                self.frames[i].ver.push(0);
+            }
+        }
+        self.changed = true;
+    }
+
+    pub fn set_cursor(inout self, c: CursorView) {
+        if c.line != self.cursor.line || c.col != self.cursor.col || c.shape != self.cursor.shape {
+            self.cursor = c;
+            self.changed = true;
+        }
+    }
+
+    // The selection: screen cells [lo, hi) in line-major order (lo ==
+    // hi: none).
+    pub fn set_selection(inout self, lo: i64, hi: i64) {
+        if lo != self.sel_lo || hi != self.sel_hi {
+            self.sel_lo = lo;
+            self.sel_hi = hi;
+            self.changed = true;
+        }
+    }
+
+    // A palette entry changed (OSC 4, 10, 11, 12, 104, 110-112): every
+    // row is rebuilt at the next update.
+    pub fn set_color(inout self, i: i64, rgb: u32) {
+        if i >= 0 && i < self.palette.len() && self.palette[i] != rgb {
+            self.palette[i] = rgb;
+            for s in 0..self.ver.len() {
+                self.ver[s] = 0;
+            }
+            self.changed = true;
+            self.force_all = true;
+        }
+    }
+
+    pub fn dirty(self) -> bool {
+        self.changed
+    }
+
+    // Reads the grid's damage and rebuilds the damaged rows of the ring.
+    // The grid's damage is reset.
+    pub fn update<G: CellGrid>(inout self, g: inout G) {
+        if g.lines() != self.lines || g.cols() != self.cols {
+            self.resize(g.lines(), g.cols());
+            self.force_all = true;
+        }
+        let all = self.force_all || g.damage_all();
+        let gen = self.atlas.generation;
+        if !all {
+            let k = g.scrolled();
+            if k != 0 && self.lines > 0 {
+                self.top = ((self.top + k) % self.lines + self.lines) % self.lines;
+                self.changed = true;
+            }
+        }
+        for l in 0..self.lines {
+            if all || g.damaged(l) {
+                self.build_row(g.row(l), l);
+            }
+        }
+        // The atlas filled up and was cleared while building: entries of
+        // rows built before are gone, so build them all again (once; the
+        // visible cells fit in an empty page).
+        if self.atlas.generation != gen {
+            self.stats.atlas_clears += 1;
+            for l in 0..self.lines {
+                self.build_row(g.row(l), l);
+            }
+        }
+        self.force_all = false;
+        g.reset_damage();
+    }
+
+    fn color(self, c: u32, fg: bool, flags: u16) -> u32 {
+        let tag = c & TAG_MASK;
+        let v = c & VALUE_MASK;
+        if tag == COLOR_RGB {
+            return if fg && (flags & DIM) != 0 { dim(v) } else { v };
+        }
+        var i = v as i64;
+        if tag == COLOR_INDEXED {
+            if fg && (flags & DIM) != 0 {
+                return dim(self.palette[i & 255]);
+            }
+            return self.palette[i & 255];
+        }
+        // Named: 0..15, 256.. (Alacritty's NamedColor), dim variants.
+        if fg && (flags & DIM) != 0 {
+            if i < 8 {
+                i = (DIM_BLACK as i64) + i;
+            } else if i == (DEFAULT_FG as i64) || i == (BRIGHT_FG as i64) {
+                i = DIM_FG as i64;
+            }
+        }
+        if i >= self.palette.len() {
+            return 0;
+        }
+        self.palette[i]
+    }
+
+    fn build_row(inout self, row: [Cell], l: i64) {
+        let slot = (self.top + l) % self.lines;
+        let base = slot * self.cols;
+        let n = if row.len < self.cols { row.len } else { self.cols };
+        var prev = Inst { glyph: 0, fg: 0, bg: 0, flags: 0 };
+        for x in 0..self.cols {
+            var inst = Inst {
+                glyph: 0, fg: self.palette[DEFAULT_FG as i64], bg: self.palette[DEFAULT_BG as i64],
+                flags: 0
+            };
+            if x < n {
+                let c = row[x];
+                let fl = c.flags;
+                if (fl & WIDE_CHAR_SPACER) != 0 {
+                    // The right half of the wide glyph before it.
+                    inst = prev;
+                    inst.flags = inst.flags | I_RIGHT_HALF;
+                } else {
+                    var fg = self.color(c.fg, true, fl);
+                    var bg = self.color(c.bg, false, fl);
+                    if (fl & INVERSE) != 0 {
+                        let t = fg;
+                        fg = bg;
+                        bg = t;
+                    }
+                    if (fl & HIDDEN) != 0 {
+                        fg = bg;
+                    }
+                    let bold = (fl & BOLD) != 0;
+                    let italic = (fl & ITALIC) != 0;
+                    let style = if bold && italic {
+                        S_BOLD_ITALIC
+                    } else if bold {
+                        S_BOLD
+                    } else if italic {
+                        S_ITALIC
+                    } else {
+                        S_REGULAR
+                    };
+                    let ch = c.ch & 0x1FFFFF;
+                    var glyph: i64 = 0;
+                    if (fl & LEADING_WIDE_CHAR_SPACER) == 0 && (fl & HIDDEN) == 0 && ch > 32 {
+                        let cells = if (fl & WIDE_CHAR) != 0 { 2 } else { 1 };
+                        glyph = self.atlas.lookup(&self.font, ch, style, cells);
+                        if glyph < 0 {
+                            self.atlas.clear();
+                            glyph = self.atlas.lookup(&self.font, ch, style, cells);
+                            if glyph < 0 {
+                                glyph = 0;
+                            }
+                        }
+                    }
+                    var f: u32 = 0;
+                    if (fl & UNDERCURL) != 0 {
+                        f = I_UNDER_CURLY;
+                    } else if (fl & DOUBLE_UNDERLINE) != 0 {
+                        f = I_UNDER_DOUBLE;
+                    } else if (fl & DOTTED_UNDERLINE) != 0 {
+                        f = I_UNDER_DOTTED;
+                    } else if (fl & DASHED_UNDERLINE) != 0 {
+                        f = I_UNDER_DASHED;
+                    } else if (fl & UNDERLINE) != 0 {
+                        f = I_UNDER_SINGLE;
+                    }
+                    if (fl & STRIKEOUT) != 0 {
+                        f = f | I_STRIKE;
+                    }
+                    inst = Inst { glyph: glyph as u32, fg: fg, bg: bg, flags: f };
+                }
+            }
+            self.master[base + x] = inst;
+            prev = inst;
+        }
+        self.ver[slot] = self.next_ver;
+        self.next_ver += 1;
+        self.stats.rows_built += 1;
+        self.changed = true;
+    }
+
+    // The uniforms for a target of w × h pixels.
+    pub fn uniforms(self, w: i64, h: i64) -> Uniforms {
+        let m = self.font.m;
+        let shown = self.cursor.shape != CURSOR_HIDDEN && self.cursor.line >= 0
+            && self.cursor.line < self.lines && self.cursor.col >= 0 && self.cursor.col < self.cols;
+        Uniforms {
+            cols: self.cols as u32,
+            lines: self.lines as u32,
+            top: self.top as u32,
+            cw: m.cw as u32,
+            ch: m.ch as u32,
+            ul_pos: m.ul_pos as u32,
+            ul_thick: m.ul_thick as u32,
+            strike_pos: m.strike_pos as u32,
+            cur_line: if shown { self.cursor.line as u32 } else { 0xFFFFFFFF },
+            cur_col: if shown { self.cursor.col as u32 } else { 0xFFFFFFFF },
+            cur_shape: if shown { self.cursor.shape as u32 } else { 0 },
+            cur_color: self.palette[258],
+            sel_lo: self.sel_lo as u32,
+            sel_hi: self.sel_hi as u32,
+            pad_x: self.pad_x as u32,
+            pad_y: self.pad_y as u32,
+            vw: w as f32,
+            vh: h as f32,
+            r0: 0,
+            r1: 0,
+        }
+    }
+
+    // Encodes the frame into `target` and returns its pass, not yet
+    // submitted (the caller presents or submits it). Copies the rows this
+    // frame's buffer lacks first.
+    pub fn encode(inout self, target: Texture) -> Pass {
+        let f = self.frame;
+        self.frame = (self.frame + 1) % FRAMES;
+        match std::replace(&self.frames[f].last, None) {
+            Some(s) => s.wait(),
+            None => {}
+        }
+        let row_bytes = self.cols * 16;
+        let n = self.lines * self.cols;
+        // SAFETY: the frame's buffer is shared memory of lines × cols
+        // instances (resize made it so), live while the renderer is; the
+        // GPU is not reading it: its last command buffer was waited for
+        // above.
+        let dst = unsafe { (self.frames[f].buf.ptr as *Inst)[0..n] };
+        let src = self.master.as_slice();
+        for s in 0..self.lines {
+            if self.frames[f].ver[s] != self.ver[s] {
+                // SAFETY: both rows are checked elements of slices of n
+                // instances, and row_bytes is one row of them.
+                unsafe {
+                    memcpy(&dst[s * self.cols] as *u8, &src[s * self.cols] as *u8,
+                        row_bytes as u64);
+                }
+                self.frames[f].ver[s] = self.ver[s];
+                self.stats.rows_copied += 1;
+            }
+        }
+        let bg = self.palette[DEFAULT_BG as i64];
+        let clear = ClearColor {
+            r: ((bg >> 16) & 255) as f64 / 255.0,
+            g: ((bg >> 8) & 255) as f64 / 255.0,
+            b: (bg & 255) as f64 / 255.0,
+            a: 1.0,
+        };
+        let u = self.uniforms(target.w, target.h);
+        var pass = self.dev.begin(target, clear, false);
+        pass.set_pipeline(self.pipe);
+        let ub = as_bytes_u(&u);
+        pass.vertex_bytes(ub, 0);
+        pass.fragment_bytes(ub, 0);
+        pass.vertex_buffer(self.frames[f].buf, 0, 1);
+        pass.vertex_buffer(self.atlas.entries, 0, 2);
+        pass.fragment_texture(self.atlas.cov, 0);
+        pass.fragment_texture(self.atlas.color, 1);
+        pass.draw_quads(self.lines * self.cols);
+        self.pending = f;
+        self.changed = false;
+        self.stats.frames += 1;
+        pass
+    }
+
+    // Records the submitted command buffer of the frame `encode` made.
+    pub fn submitted(inout self, s: sink Submitted) {
+        let f = self.pending;
+        self.frames[f].last = Some(s);
+    }
+}
+
+// The frames in flight finish before the buffers they read are released.
+impl Drop for Renderer {
+    fn drop(inout self) {
+        self.wait_idle();
+    }
+}
+
+extern "C" {
+    fn memcpy(dst: *u8, src: *u8, n: u64) -> *u8;
+}
+
+// The uniforms' bytes (a view of `u`, valid while it is).
+fn as_bytes_u(u: *Uniforms) -> [u8] {
+    // SAFETY: Uniforms is 20 four-byte fields (80 bytes, no padding);
+    // the slice views the caller's value for the duration of the call
+    // that copies it (setVertexBytes copies at once).
+    unsafe { (u as *u8)[0..80] }
+}
