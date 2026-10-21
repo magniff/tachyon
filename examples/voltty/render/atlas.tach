@@ -1,0 +1,244 @@
+// The glyph atlas (terminal.md §3.5): glyphs rasterized on first use and
+// packed into shelves of two pages, R8 coverage (2048²) and RGBA8 colour
+// (1024², made on the first colour glyph), with a table of entries the
+// fragment shader indexes by the instance's glyph number.
+//
+// An entry is 16 bytes, the layout cells.metal reads:
+//   x, y, w, h   u16: the glyph's texels in its page
+//   ox, oy       u16: where they sit inside the cell box (from its top-left)
+//   kind         u16: 0 coverage, 1 colour
+//   pad          u16
+// Entry 0 is the empty glyph (a space: nothing to sample).
+//
+// A full page is not followed by another page (one draw binds one page
+// of each kind): the atlas is cleared and the renderer rebuilds every
+// visible row, which needs at most lines × cols glyphs (4,800 at 120×40;
+// a page holds about 7,000 cells of Menlo 14 at 2×). `generation` tells
+// the renderer it happened.
+
+use super::font::Font;
+use super::metal::{
+    Buffer, Device, R8_UNORM, RGBA8_UNORM, STORAGE_SHARED, Texture, USAGE_SHADER_READ,
+};
+
+pub const ENTRY_BYTES: i64 = 16;
+pub const COV_PAGE: i64 = 2048;
+pub const COLOR_PAGE: i64 = 1024;
+const MAX_ENTRIES: i64 = 65536;
+
+// A shelf: a row of the page `h` texels high, filled from the left.
+struct Shelf {
+    y: i64,
+    h: i64,
+    x: i64,
+}
+
+// One page's packing state.
+struct Packer {
+    size: i64,
+    shelves: Vec<Shelf>,
+    top: i64,
+}
+
+impl Packer {
+    fn new_in(size: i64, gpa: Gpa) -> Packer {
+        Packer { size: size, shelves: Vec::new_in(gpa), top: 0 }
+    }
+
+    // A place for w × h texels, with a texel of space after each glyph
+    // (no neighbour bleeds in, whatever the sampling); None when full.
+    fn place(self: &mut Packer, w: i64, h: i64) -> Option<(i64, i64)> {
+        let w1 = w + 1;
+        let h1 = h + 1;
+        for i in 0..self.shelves.len() {
+            let s = self.shelves[i];
+            // A shelf takes glyphs as high as it is, down to 3/4 of it.
+            if h1 <= s.h && h1 * 4 >= s.h * 3 && s.x + w1 <= self.size {
+                self.shelves[i].x = s.x + w1;
+                return Some((s.x, s.y));
+            }
+        }
+        if self.top + h1 > self.size || w1 > self.size {
+            return None;
+        }
+        let y = self.top;
+        self.shelves.push(Shelf { y: y, h: h1, x: w1 });
+        self.top += h1;
+        Some((0, y))
+    }
+
+    fn clear(self: &mut Packer) {
+        self.shelves.clear();
+        self.top = 0;
+    }
+}
+
+pub struct Atlas {
+    dev: Device,
+    pub cov: Texture,
+    pub color: Texture,
+    has_color: bool,
+    pub entries: Buffer,
+    pub count: i64,
+    cov_pack: Packer,
+    color_pack: Packer,
+    // Entry numbers: printable ASCII in 4 styles directly, the rest in a
+    // map keyed by character, style and width.
+    ascii: Vec<i32>,
+    map: HashMap<i64, i64>,
+    // Incremented by every clear.
+    pub generation: i64,
+    gpa: Gpa,
+}
+
+fn key(c: u32, style: i64, cells: i64) -> i64 {
+    (c as i64) | (style << 21) | (cells << 23)
+}
+
+impl Atlas {
+    pub fn new_in(dev: &Device, gpa: Gpa) -> Atlas {
+        let cov = dev.texture(COV_PAGE, COV_PAGE, R8_UNORM, USAGE_SHADER_READ, STORAGE_SHARED);
+        // A 1 × 1 stand-in until the first colour glyph (the shader binds
+        // a colour page in every draw).
+        let color = dev.texture(1, 1, RGBA8_UNORM, USAGE_SHADER_READ, STORAGE_SHARED);
+        let entries = dev.buffer(MAX_ENTRIES * ENTRY_BYTES);
+        let mut a = Atlas {
+            dev: dev.clone(),
+            cov: cov,
+            color: color,
+            has_color: false,
+            entries: entries,
+            count: 1,
+            cov_pack: Packer::new_in(COV_PAGE, gpa),
+            color_pack: Packer::new_in(COLOR_PAGE, gpa),
+            ascii: Vec::filled_in(4 * 128, 0, gpa),
+            map: HashMap::new_in(gpa),
+            generation: 0,
+            gpa: gpa,
+        };
+        a.write_entry(0, 0, 0, 0, 0, 0, 0, 0);
+        a
+    }
+
+    // Forgets every glyph (the pages' texels are overwritten as glyphs
+    // are added again).
+    pub fn clear(self: &mut Atlas) {
+        self.count = 1;
+        self.cov_pack.clear();
+        self.color_pack.clear();
+        for i in 0..self.ascii.len() {
+            self.ascii[i] = 0;
+        }
+        self.map = HashMap::new_in(self.gpa);
+        self.generation += 1;
+    }
+
+    fn write_entry(self: &Atlas, n: i64, x: i64, y: i64, w: i64, h: i64, ox: i64, oy: i64,
+        kind: i64) {
+        if n < 0 || n >= MAX_ENTRIES {
+            panic("atlas: entry out of range");
+        }
+        let p = self.entries.ptr as *u16;
+        let i = n * 8;
+        // SAFETY: the entries buffer is shared memory of MAX_ENTRIES ×
+        // 16 bytes (made in new_in, live until the drop); n is checked above,
+        // so the 8 u16s written are inside it. The GPU reads an entry only
+        // after a draw that references it is encoded, which is after this
+        // write.
+        unsafe {
+            p[i] = x as u16;
+            p[i + 1] = y as u16;
+            p[i + 2] = w as u16;
+            p[i + 3] = h as u16;
+            p[i + 4] = ox as u16;
+            p[i + 5] = oy as u16;
+            p[i + 6] = kind as u16;
+            p[i + 7] = 0;
+        }
+    }
+
+    // The entry of `c` in `style` over `cells` cells, rasterized and
+    // packed on first use: 0 for an empty glyph, -1 when the atlas is
+    // full (the caller clears it and starts again).
+    pub fn lookup(self: &mut Atlas, font: &Font, c: u32, style: i64, cells: i64) -> i64 {
+        if c > 32 && c < 127 && cells == 1 {
+            let e = self.ascii[style * 128 + c as i64] as i64;
+            if e != 0 {
+                return e;
+            }
+        } else {
+            if c <= 32 {
+                return 0;
+            }
+            match self.map.get(key(c, style, cells)) {
+                Some(e) => return e,
+                None => {}
+            }
+        }
+        let e = self.add(font, c, style, cells);
+        if e >= 0 {
+            if c > 32 && c < 127 && cells == 1 {
+                self.ascii[style * 128 + c as i64] = e as i32;
+            } else {
+                self.map.insert(key(c, style, cells), e);
+            }
+        }
+        e
+    }
+
+    fn add(self: &mut Atlas, font: &Font, c: u32, style: i64, cells: i64) -> i64 {
+        let g = font.raster(c, style, cells);
+        if g.w == 0 {
+            return 0;
+        }
+        if self.count >= MAX_ENTRIES {
+            return -1;
+        }
+        if g.color && !self.has_color {
+            self.color = self.dev.texture(COLOR_PAGE, COLOR_PAGE, RGBA8_UNORM, USAGE_SHADER_READ,
+                STORAGE_SHARED);
+            self.has_color = true;
+        }
+        let spot = if g.color { self.color_pack.place(g.w, g.h) }
+            else { self.cov_pack.place(g.w, g.h) };
+        match spot {
+            None => -1,
+            Some((x, y)) => {
+                let px = font.pixels(g.color);
+                let row = font.row_bytes(g.color);
+                let bpp = if g.color { 4 } else { 1 };
+                let off = g.y * row + g.x * bpp;
+                let sub = px[off..px.len];
+                if g.color {
+                    self.color.upload(x, y, g.w, g.h, sub, row);
+                } else {
+                    self.cov.upload(x, y, g.w, g.h, sub, row);
+                }
+                let n = self.count;
+                self.count += 1;
+                self.write_entry(n, x, y, g.w, g.h, g.x, g.y, if g.color { 1 } else { 0 });
+                n
+            }
+        }
+    }
+
+    // An entry's fields (for the CPU reference renderer in the tests).
+    pub fn entry(self: &Atlas, n: i64) -> [i64; 7] {
+        let p = self.entries.ptr as *u16;
+        let mut out: [i64; 7] = [0; 7];
+        if n < 0 || n >= self.count {
+            return out;
+        }
+        // SAFETY: as write_entry: n < count <= MAX_ENTRIES.
+        unsafe {
+            for k in 0..7 {
+                out[k] = p[n * 8 + k] as i64;
+            }
+        }
+        out
+    }
+
+    pub fn has_color_page(self: &Atlas) -> bool {
+        self.has_color
+    }
+}

@@ -1,0 +1,116 @@
+// The one shader of the terminal (terminal.md §3.5), in Metal Shading
+// Language, written by hand until std::gpu::wgsl translates cells.wgsl
+// (0.22's G5; cells.wgsl is the same program in WGSL, kept in step with
+// this one). It is a function that builds the source, one line per call,
+// because tachyon has neither multi-line strings nor include_str yet
+// (0.22's C3 adds include_str; then this file is cells.metal).
+//
+// One instanced draw of a 4-vertex strip per cell. The vertex shader
+// does the per-cell work once per vertex rather than once per pixel: it
+// places instance i at its line and column (the line from the ring's top
+// row, a uniform), unpacks the colours, swaps them for the selection and
+// the block cursor, and fetches the glyph's atlas entry. The fragment
+// shader reads the glyph's coverage (or colour) texel at the pixel's
+// offset in the cell, draws the decorations and the thin cursors, and
+// mixes foreground over background: no blending, no overdraw. Every rule
+// has its twin in tests/voltty-render/cpu.tach, the reference renderer the
+// tests compare GPU images with.
+
+pub fn msl(b: &Buf) {
+    b.push_str("#include <metal_stdlib>\n");
+    b.push_str("using namespace metal;\n");
+    b.push_str("struct U {\n");
+    b.push_str("  uint cols; uint lines; uint top; uint cw;\n");
+    b.push_str("  uint ch; uint ul_pos; uint ul_thick; uint strike_pos;\n");
+    b.push_str("  uint cur_line; uint cur_col; uint cur_shape; uint cur_color;\n");
+    b.push_str("  uint sel_lo; uint sel_hi; uint pad_x; uint pad_y;\n");
+    b.push_str("  float vw; float vh; uint r0; uint r1;\n");
+    b.push_str("};\n");
+    b.push_str("struct Inst { uint glyph; uint fg; uint bg; uint flags; };\n");
+    b.push_str("struct Entry { ushort x; ushort y; ushort w; ushort h; ushort ox; ushort oy; ushort kind; ushort pad; };\n");
+    // Per cell: the colours (after the selection and block-cursor swaps),
+    // the glyph's texels (origin, size, offset in the cell, kind: 0 none,
+    // 1 coverage, 2 colour), the cell's pixel origin and the x shift of a
+    // wide glyph's right half, and the thin cursor's shape here (0: none).
+    b.push_str("struct V {\n");
+    b.push_str("  float4 pos [[position]];\n");
+    b.push_str("  float3 fg [[flat]]; float3 bg [[flat]];\n");
+    b.push_str("  uint2 org [[flat]]; int2 size [[flat]]; int2 off [[flat]];\n");
+    b.push_str("  uint kind [[flat]]; uint flags [[flat]];\n");
+    b.push_str("  uint2 cell [[flat]]; int xoff [[flat]]; uint cur [[flat]];\n");
+    b.push_str("};\n");
+    b.push_str("static float3 rgbf(uint c) {\n");
+    b.push_str("  return float3(float((c >> 16) & 255u), float((c >> 8) & 255u), float(c & 255u)) / 255.0;\n");
+    b.push_str("}\n");
+    b.push_str("vertex V vs(uint vid [[vertex_id]], uint iid [[instance_id]], constant U& u [[buffer(0)]],\n");
+    b.push_str("            const device Inst* inst [[buffer(1)]], const device Entry* ent [[buffer(2)]]) {\n");
+    b.push_str("  uint slot = iid / u.cols;\n");
+    b.push_str("  uint col = iid - slot * u.cols;\n");
+    b.push_str("  uint line = (slot + u.lines - u.top) % u.lines;\n");
+    b.push_str("  uint cx = u.pad_x + col * u.cw;\n");
+    b.push_str("  uint cy = u.pad_y + line * u.ch;\n");
+    b.push_str("  float2 c = float2(float(vid & 1u), float(vid >> 1u));\n");
+    b.push_str(
+        "  float2 p = float2(float(cx), float(cy)) + c * float2(float(u.cw), float(u.ch));\n");
+    b.push_str("  V o;\n");
+    b.push_str("  o.pos = float4(p.x / u.vw * 2.0 - 1.0, 1.0 - p.y / u.vh * 2.0, 0.0, 1.0);\n");
+    b.push_str("  Inst i = inst[iid];\n");
+    b.push_str("  uint fg = i.fg; uint bg = i.bg;\n");
+    b.push_str("  uint idx = line * u.cols + col;\n");
+    b.push_str("  if (idx >= u.sel_lo && idx < u.sel_hi) { uint t = fg; fg = bg; bg = t; }\n");
+    b.push_str("  bool at = line == u.cur_line && col == u.cur_col;\n");
+    b.push_str("  if (at && u.cur_shape == 1u) { fg = bg; bg = u.cur_color; }\n");
+    b.push_str("  o.fg = rgbf(fg); o.bg = rgbf(bg);\n");
+    b.push_str("  o.kind = 0u; o.org = uint2(0u); o.size = int2(0); o.off = int2(0);\n");
+    b.push_str("  if (i.glyph != 0u) {\n");
+    b.push_str("    Entry e = ent[i.glyph];\n");
+    b.push_str("    o.kind = e.kind + 1u; o.org = uint2(e.x, e.y);\n");
+    b.push_str("    o.size = int2(int(e.w), int(e.h)); o.off = int2(int(e.ox), int(e.oy));\n");
+    b.push_str("  }\n");
+    b.push_str("  o.flags = i.flags; o.cell = uint2(cx, cy);\n");
+    b.push_str("  o.xoff = ((i.flags & 16u) != 0u) ? int(u.cw) : 0;\n");
+    b.push_str("  o.cur = (at && u.cur_shape >= 2u) ? u.cur_shape : 0u;\n");
+    b.push_str("  return o;\n");
+    b.push_str("}\n");
+    // The decoration covering pixel (x, y) of a cell: 1 or 0.
+    b.push_str("static float deco(uint fl, int x, int y, constant U& u) {\n");
+    b.push_str("  if (fl == 0u || fl == 16u) { return 0.0; }\n");
+    b.push_str("  int t = int(u.ul_thick); int ul = int(u.ul_pos); int ch = int(u.ch); int cw = int(u.cw);\n");
+    b.push_str("  uint s = fl & 7u;\n");
+    b.push_str("  bool on = false;\n");
+    b.push_str("  if (s == 1u) { on = y >= ul && y < ul + t; }\n");
+    b.push_str("  else if (s == 2u) { int a = min(ul, ch - 3 * t); on = (y >= a && y < a + t) || (y >= a + 2 * t && y < a + 3 * t); }\n");
+    b.push_str("  else if (s == 3u) { int h = max(cw / 2, 1); int ph = x % cw; int tri = ph < h ? ph : cw - ph;\n");
+    b.push_str(
+        "    int top = min(ul - t + tri * 2 * t / h, ch - t); on = y >= top && y < top + t; }\n");
+    b.push_str("  else if (s == 4u) { on = y >= ul && y < ul + t && (x / t) % 2 == 0; }\n");
+    b.push_str("  else if (s == 5u) { on = y >= ul && y < ul + t && x % (6 * t) < 4 * t; }\n");
+    b.push_str("  if ((fl & 8u) != 0u) { int sp = int(u.strike_pos); on = on || (y >= sp && y < sp + t); }\n");
+    b.push_str("  return on ? 1.0 : 0.0;\n");
+    b.push_str("}\n");
+    b.push_str("fragment float4 fs(V in [[stage_in]], constant U& u [[buffer(0)]],\n");
+    b.push_str("                   texture2d<float, access::read> cov [[texture(0)]],\n");
+    b.push_str("                   texture2d<float, access::read> colp [[texture(1)]]) {\n");
+    b.push_str("  int y = int(in.pos.y) - int(in.cell.y);\n");
+    b.push_str("  int x = int(in.pos.x) - int(in.cell.x) + in.xoff;\n");
+    b.push_str("  float c = 0.0; float4 k = float4(0.0);\n");
+    b.push_str("  int2 t = int2(x, y) - in.off;\n");
+    b.push_str(
+        "  if (in.kind != 0u && t.x >= 0 && t.y >= 0 && t.x < in.size.x && t.y < in.size.y) {\n");
+    b.push_str("    uint2 at = in.org + uint2(t);\n");
+    b.push_str("    if (in.kind == 1u) { c = cov.read(at).r; } else { k = colp.read(at); }\n");
+    b.push_str("  }\n");
+    b.push_str("  float3 o = k.rgb + in.bg * (1.0 - k.a);\n");
+    b.push_str("  o = o + (in.fg - o) * c;\n");
+    b.push_str("  o = o + (in.fg - o) * deco(in.flags, x, y, u);\n");
+    b.push_str("  if (in.cur != 0u) {\n");
+    b.push_str(
+        "    int th = int(u.ul_thick); int cw = int(u.cw); int ch = int(u.ch); bool m = false;\n");
+    b.push_str("    if (in.cur == 2u) { m = x < th; }\n");
+    b.push_str("    else if (in.cur == 3u) { m = y >= ch - th; }\n");
+    b.push_str("    else { m = x < th || x >= cw - th || y < th || y >= ch - th; }\n");
+    b.push_str("    if (m) { o = rgbf(u.cur_color); }\n");
+    b.push_str("  }\n");
+    b.push_str("  return float4(o, 1.0);\n");
+    b.push_str("}\n");
+}
