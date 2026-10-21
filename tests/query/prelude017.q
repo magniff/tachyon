@@ -31,7 +31,7 @@ std::num::tables	<std>	4
 std::convert	<std>	2
 std::clone	<std>	1
 std::random	<std>	17
-std::sys	<std>	192
+std::sys	<std>	191
 std::time	<std>	40
 std::hash	<std>	6
 std::hash::fold	<std>	26
