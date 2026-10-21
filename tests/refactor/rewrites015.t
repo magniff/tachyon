@@ -54,18 +54,18 @@ $ rewrite 'for $i in 0..$v.len { let $x = $v[$i]; $s... }' 'for $x in $v.iter() 
 note rewrite.dropped: 1 site is left: the replacement drops $i, which the code it keeps uses; first: main.tach:19:18
 try: tachyonc query show main.tach:19
 ## Statements before $s... (and none after).
-$ rewrite '{ let mut $t = 0; $s... }' '{ let mut $t = 1; $s... }' --dry-run
+$ rewrite '{ var $t = 0; $s... }' '{ var $t = 1; $s... }' --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -3 +3 @@
--    let mut t = 0;
-+    let mut t = 1;
+-    var t = 0;
++    var t = 1;
 @@ -16 +16 @@
--    let mut t = 0;
-+    let mut t = 1;
+-    var t = 0;
++    var t = 1;
 @@ -25 +25 @@
--    let mut t = 0;
-+    let mut t = 1;
+-    var t = 0;
++    var t = 1;
 ## A match, its arms' patterns with holes.
 $ rewrite 'match $o { Option::Some($y) => $a, Option::None => $b }' 'if let Option::Some($y) = $o { $a } else { $b }' --dry-run
 --- a/main.tach

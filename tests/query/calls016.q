@@ -21,7 +21,7 @@ $ callees main
 1	call	apply	calls016/main.tach:21
 1	call	sum	calls016/main.tach:11
 1	ref	twice	calls016/main.tach:25
-1	call	std::fmt::print_int	<std>:10041
+1	call	std::fmt::print_int	<std>:10047
 ## main reaches a borrow of TABLE (put takes it by pointer) and a write of
 ## a field of it; sum reaches neither.
 $ callees main --writes TABLE
@@ -38,7 +38,7 @@ $ callees sum --writes TABLE --count
 ## declaration or a use; a shadowed local and the one shadowing it.
 $ refs sum::total
 # calls016/main.tach
-12:13	def	let mut total = 0;
+12:9	def	var total = 0;
 15:9	write	sum	total += i;
 17:5	write	sum	total = total * 2;
 17:13	read	sum	total = total * 2;

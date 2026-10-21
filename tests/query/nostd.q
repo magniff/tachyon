@@ -2,21 +2,21 @@
 ## the program does not define, its source by `std`, grep in it, a
 ## show with the `use` line a program needs.
 $ def std::read_line Vec::push
-std::io::read_line	../../compiler/std/io.tach:30:8	fn	pub fn read_line<A: Allocator>(line: &mut Buf<A>) -> Result<bool, IoError>
-std::Vec::push	../../compiler/std/std.tach:275:12	method	pub fn push(self: &mut Vec<T, A>, x: T)
+std::io::read_line	../../compiler/std/io.tach:30:8	fn	pub fn read_line<A: Allocator>(line: inout Buf<A>) -> Result<bool, IoError>
+std::Vec::push	../../compiler/std/std.tach:275:12	method	pub fn push(inout self, x: sink T)
 $ def read_line twice
-std::io::read_line	../../compiler/std/io.tach:30:8	fn	pub fn read_line<A: Allocator>(line: &mut Buf<A>) -> Result<bool, IoError>
+std::io::read_line	../../compiler/std/io.tach:30:8	fn	pub fn read_line<A: Allocator>(line: inout Buf<A>) -> Result<bool, IoError>
 crate::twice	nostd/main.tach:4:4	fn	fn twice(x: i64) -> i64	effects: none
 $ show std::print_int
 // std::fmt::print_int	../../compiler/std/fmt.tach:31-39	effects: io global panic
 // use std::print_int;
 #[inline(never)]
 pub fn print_int(v: i64) {
-    let mut f = Fmt::to_fd(1);
+    var f = Fmt::to_fd(1);
     // (decimal only: not Fmt::int, whose hex and binary every program
     // using print_int would compile)
     let negative = v < 0;
-    fmt_decimal(&mut f, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative);
+    fmt_decimal(&f, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative);
     f.flush();
 }
 $ text std:1-2
@@ -25,7 +25,7 @@ $ text std:1-2
 2	// (compiler/std/embed.sh makes compiler/src/front/stdsrc.tach from this file
 $ grep 'pub fn read_line' --in std
 # <std>
-9957:1	code	std::io	pub fn read_line<A: Allocator>(line: &mut Buf<A>) -> Result<bool, IoError> {
+9963:1	code	std::io	pub fn read_line<A: Allocator>(line: inout Buf<A>) -> Result<bool, IoError> {
 $ def no_such_name
 error query.no-match: no definition 'no_such_name'
 try: tachyonc query items

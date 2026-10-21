@@ -1,52 +1,49 @@
 # tachyon in brief
 
-A value has one owner, moves or copies, and is dropped at scope end. A
-parameter reads its argument (`x: T`, the default), changes it (`x:
-inout T`, called `f(&x)`) or takes it (`x: sink T`). No lifetimes,
-macros or `char`.
+Rust's syntax and value semantics (moves, drops at scope end, checked
+`&T`/`&mut T`), but no lifetimes to write, no macros, no `char`. Each
+line next to the Rust it replaces:
 
 ```tach
 struct P { x: i64 }
 
 impl P {
-    fn bump(inout self) { self.x += 1; }  // or self, sink self
+    fn bump(self: &mut P) { self.x += 1; }   // Rust: &mut self; &self is self: &P
 }
 
-fn total(v: Vec<i64>) -> i64 { v.iter().sum() }      // reads v
-fn add(v: inout Vec<i64>, x: i64) { v.push(x); }     // changes it
+fn total(v: &Vec<i64>) -> i64 { v.iter().sum() }  // a Vec (or a struct with one) moves
 
-fn main(gpa: Gpa) -> i32 {                // gpa: the allocator
+fn main(gpa: Gpa) -> i32 {                // Rust: fn main()   gpa: the allocator; 0: exit status
     let input = read_stdin_in(gpa).unwrap();          // all of stdin, a Buf
-    var sc = Scanner::new(input.as_slice());          // next_int(), next_token(), next_line()
-    var v: Vec<i64> = Vec::new_in(gpa);   // var: mutable; let: not
-    add(&v, sc.next_int().unwrap_or(0));  // &: the callee may change v
-    v[0] += 1;                            // checked; v.get(0): the same i64, not an Option
-    let s: [u8] = "hi";                   // text is [u8]; 'a' is a u8
-    var m: HashMap<[u8], i64> = HashMap::new_in(gpa);
-    m.get_or_insert(s, 0)[0] += 1;        // a one-element view: [0] is the value
-    var b = Buf::new_in(gpa);
+    let mut sc = Scanner::new(input.as_slice());      // next_int(), next_token(), next_line()
+    let mut v: Vec<i64> = Vec::new_in(gpa);   // Rust: Vec::new()
+    v.push(sc.next_int().unwrap_or(0));
+    v[0] += 1;                                // checked; v.get(0): the same i64, not an Option
+    let s: [u8] = "hi";                       // Rust: &str, String: text is [u8]; 'a' is a u8
+    let mut m: HashMap<[u8], i64> = HashMap::new_in(gpa);
+    m.get_or_insert(s, 0)[0] += 1;            // Rust: *m.entry(k).or_insert(0) += 1
+    let mut b = Buf::new_in(gpa);             // Rust: String::new()
     b.push_str(s);
-    var p = P { x: s.len() + v.len() };   // .len() on all of them
-    p.bump();                             // a receiver needs no &
-    println(f"{b.as_slice()} {v:?} {p.x} {total(v)}");
+    let mut p = P { x: s.len() + v.len() };   // .len() on slices, Vec, Buf, HashMap
+    p.bump();                                 // passes &mut p
+    println(f"{b.as_slice()} {v:?} {p.x} {total(&v)}");
     0
 }
 ```
 
 The prelude (`Vec`, `Buf`, `HashMap`, `MinHeap`, `Scanner`,
-`read_line`, `parse_int`, `split_in`, `sort`, `cmp_of`, ...) needs no
-`use`; the rest: `use std::{is_digit};`. Only constructors and `_in`
-functions take an allocator: pass `gpa` down from main.
+`read_line`, `parse_int`, `split_in`, `sort`, `cmp_of`, ...) needs no `use`; the rest:
+`use std::{is_digit};`. Only constructors and `_in` functions take an
+allocator: pass `gpa` down from main as a parameter.
 
-An access is used as its value: `out = acc`, `n + 1` (`*` is for raw
-pointers only); `inout r = &x;` names one, passed on as `f(&r)`. A sink
-argument or `let w = v;` moves an owned `v` (`Vec`, `Buf`, ...);
-`.clone()` copies. `[u8]` and tuples compare and sort;
-`match e` on a let `E` binds into it; `x?`, closures
-(`sink ||`), traits, `#[derive(Debug, Eq, Ord)]`. `for x in v`,
-`v.get(i)`, `m.get(k)` give copies (in place: `v[i].push(x)`);
-`sort_by(|a, b| a - b)` returns an `i64`; `usize` is `i64`; integers
-wrap; `as` narrows; no `dyn`, `Box`.
+As in Rust: `[u8]` and tuples compare and sort (`==`, `<`, `v.sort()`);
+`v[i] = x` through `&mut Vec`; match guards;
+`match e` on a `&E` binds references (`E::A(x) => x + 1`); `let ...
+else`; `&f()`; `x?`, closures, traits, `#[derive(Debug, Eq, Ord)]`.
+Unlike Rust: `for x in v`, `v.iter()`, `v.get(i)`, `m.get(k)` give
+copies, not `&T` (passed where `&T` is wanted, borrowed; change one
+in place: `v[i].push(x)`); `sort_by(|a, b| a - b)` returns an
+`i64`; `usize` is `i64`; integers wrap; `as` narrows; no `dyn`, `Box`.
 
 On demand: `tachyonc guide --find WORDS` (`--find read a line`),
 `tachyonc guide std` (the most used; `std#the-api`: all),

@@ -22,7 +22,9 @@ use crate::base::{
 use crate::base::diag::{
     ERR_KIND, err_begin, err_end_soft, err_fix, err_fmt, err_help, err_try_tool,
 };
-use crate::front::ast::{CONV_INOUT, CONV_NEW, CONV_SINK, NODES, NODE_REF_MUT, NodeKind, child};
+use crate::front::ast::{
+    CONV_INOUT, CONV_NEW, CONV_SINK, NODES, NODE_REF, NODE_REF_MUT, NodeKind, child,
+};
 use crate::front::lexer::{TOKS, Tok};
 use crate::front::modules::{file_of_pos, within_std};
 use crate::front::own::kinds::{K_OWNED, type_kind};
@@ -71,11 +73,40 @@ pub fn syntax_option(arg: *u8) -> bool {
         if streq(arg, c"--syntax=0.20") {
             STRICT = true;
         } else if streq(arg, c"--syntax=mixed") {
-            STRICT = false;
+            set_mixed();
         } else {
             return false;
         }
         true
+    }
+}
+
+extern "C" {
+    #[link_name = "setenv"]
+    fn conv_setenv(name: *u8, value: *u8, overwrite: i32) -> i32;
+}
+
+// The program is read mixed (0.19's spelling too): a migration's (`fix
+// --values`, `--only conventions`), whose child processes (the checks of
+// the edit) inherit it through TACHYON_SYNTAX.
+pub fn set_mixed() {
+    unsafe {
+        STRICT = false;
+        conv_setenv(c"TACHYON_SYNTAX", c"mixed", 1);
+    }
+}
+
+// At start (main): TACHYON_SYNTAX=mixed (a migration's child) or 0.20.
+pub fn syntax_from_env() {
+    unsafe {
+        let v = crate::base::getenv(c"TACHYON_SYNTAX");
+        if v != 0 as *u8 {
+            if streq(v, c"mixed") {
+                STRICT = false;
+            } else if streq(v, c"0.20") {
+                STRICT = true;
+            }
+        }
     }
 }
 
@@ -497,17 +528,31 @@ pub fn legacy_let_args(n: i64, f: i64, first_param: i64) {
         for i in 0..NODES[n].count {
             let arg = child(n, i);
             if NODES[arg].kind != NodeKind::Unary || NODES[arg].op != Tok::Amp
-                || (NODES[arg].p & (CONV_NEW | NODE_REF_MUT)) != 0 {
+                || (NODES[arg].p & NODE_REF_MUT) != 0
+                || (NODES[arg].p & CONV_NEW) != 0 && strict_at(NODES[arg].start) {
                 continue;
             }
             let p = param_node(f, first_param + i);
             if p <= 0 || param_conv(p) != CONV_LET || !syntactic_place(NODES[arg].b) {
                 continue;
             }
+            // (a raw `*T`, as 0.19 meant it: `&e` is its address)
+            let tn = NODES[p].b;
+            if tn > 0 && NODES[tn].kind == NodeKind::TyPtr && (NODES[tn].p & NODE_REF) == 0 {
+                continue;
+            }
+            // (the `&`, for `fix --only conventions`, which sees the checked
+            // program: it drops the `&` the checker dropped)
+            LET_STRIPPED.push(NODES[arg].start);
             NODES[arg] = NODES[NODES[arg].b];
         }
     }
 }
+
+// The positions of the `&`s legacy_let_args dropped.
+pub static mut LET_STRIPPED: crate::base::IntVec = crate::base::IntVec {
+    data: 0 as *i64, count: 0, cap: 0
+};
 
 // Whether e is written as a place: a name, a field, an element, `*p`.
 fn syntactic_place(e: i64) -> bool {

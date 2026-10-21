@@ -18,6 +18,7 @@ main.tach:31:13: error[type error] 'describe' is private | help: make it public:
 main.tach:32:13: error[type error] function 'table::make' expects 2 arguments, got 1 | help: its signature: `fn make(width: i64, gpa: Gpa) -> Table` (table.tach:3) | try: table::make(3, gpa) | try: tachyonc fix --suggested main.tach
 main.tach:34:5: error[type error] no method 'push_string' on type 'Buf' | help: did you mean 'push_str'? | try: tachyonc query items Buf main.tach | try: tachyonc fix --suggested main.tach
 main.tach:37:16: error[type error] undefined variable 'cut' | help: did you mean 'cat'?
+<std>:10090:33: error[type error] expected '*[u8; 256]', got '[u8; 256]' | help: a pointer to it: its address | try: &tmp | note: in instantiation of 'format_in<{error}, Gpa>' at <std>:10153:5 | note: in instantiation of 'format<{error}>' at main.tach:29:13
 text.tach:1:5: error[type error] unknown module 'inner' | help: 'inner' is the module crate::lib::inner; a path starts in this module, beside it or at the root: write `crate::lib::inner::...` | try: use crate::lib::inner::width; | try: tachyonc fix --suggested main.tach
 text.tach:4:12: error[type error] unknown module 'shapes' | help: 'shapes' is the module crate::lib::shapes; a path starts in this module, beside it or at the root: write `crate::lib::shapes::...` | try: use crate::lib::shapes; | try: tachyonc fix --suggested main.tach
 text.tach:5:5: error[type error] unknown module 'shapes' | help: 'shapes' is the module crate::lib::shapes; a path starts in this module, beside it or at the root: write `crate::lib::shapes::...` | try: use crate::lib::shapes; | try: tachyonc fix --suggested main.tach
@@ -36,7 +37,7 @@ $ fix --suggested --dry-run
 -    let small: u8 = t;
 -    let n = count([1, 2, 3]);
 -    if n {
-+    let t = total(&v);
++    let t = total(v);
 +    let small: u8 = t as u8;
 +    let n = count([1, 2, 3][..]);
 +    if n != 0 {
@@ -62,7 +63,7 @@ $ fix --suggested --dry-run
 -    shapes::area(&r)
 +pub fn describe(n: i64) -> i64 {
 +    let r: crate::lib::shapes::Rect = crate::lib::shapes::Rect { w: n, h: 2 };
-+    crate::lib::shapes::area(&r)
++    crate::lib::shapes::area(r)
 @@ -8,2 +8,2 @@
 -pub fn wrap(s: &str) -> String {
 -    let c: char = 'x';
@@ -82,20 +83,20 @@ $ fix --suggested --in text.tach --dry-run
 -    shapes::area(&r)
 +pub fn describe(n: i64) -> i64 {
 +    let r: crate::lib::shapes::Rect = crate::lib::shapes::Rect { w: n, h: 2 };
-+    crate::lib::shapes::area(&r)
++    crate::lib::shapes::area(r)
 @@ -8,2 +8,2 @@
 -pub fn wrap(s: &str) -> String {
 -    let c: char = 'x';
 +pub fn wrap(s: [u8]) -> [u8] {
 +    let c: u8 = 'x';
 $ fix --suggested --show
-fixed 2 missing imports, 1 pub, 15 suggested fixes	2 files	+17 -14 lines
+fixed 2 missing imports, 1 pub, 17 suggested fixes	2 files	+17 -14 lines
 // main.tach:1-3
 1	use std::num::I64_MIN;
 2	use text::wrap;
 3	
 // main.tach:25-28
-25	    let t = total(&v);
+25	    let t = total(v);
 26	    let small: u8 = t as u8;
 27	    let n = count([1, 2, 3][..]);
 28	    if n != 0 {
@@ -111,7 +112,7 @@ fixed 2 missing imports, 1 pub, 15 suggested fixes	2 files	+17 -14 lines
 // text.tach:3-5
 3	pub fn describe(n: i64) -> i64 {
 4	    let r: crate::lib::shapes::Rect = crate::lib::shapes::Rect { w: n, h: 2 };
-5	    crate::lib::shapes::area(&r)
+5	    crate::lib::shapes::area(r)
 // text.tach:8-9
 8	pub fn wrap(s: [u8]) -> [u8] {
 9	    let c: u8 = 'x';
@@ -121,11 +122,12 @@ $ check
 main.tach:40:16: error[type error] undefined variable 'cut' | help: did you mean 'cat'?
 [exit 1]
 $ undo
-undid fixed 2 missing imports, 1 pub, 15 suggested fixes	2 files	+17 -14 lines
+undid fixed 2 missing imports, 1 pub, 17 suggested fixes	2 files	+17 -14 lines
 ## A Rust label: the program does not lex; the fix respells each line.
 $ fix --suggested labels.tach --show
-fixed 2 suggested fixes	labels.tach	+2 -2 lines
-// labels.tach:4
+fixed 3 suggested fixes	labels.tach	+3 -3 lines
+// labels.tach:3-4
+3	    var n = 0;
 4	    outer: for i in 0..3 {
 // labels.tach:7
 7	                break :outer;

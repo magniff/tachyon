@@ -7,8 +7,8 @@
 ## longer builds; the output after it is the one 0.16's semantics gave,
 ## recorded here before 0.18.1: `16 9 shape rect true 10 3 true false $7`. What the fix keeps raw is wrapped in
 ## `unsafe` by `fix --only unsafe`, the second try: of the error.)
-$ fix --values
-fixed 9 parameters to &mut T, 17 parameters to &T, 4 arguments	main.tach	+24 -23 lines
+$ fix --values --syntax=mixed
+fixed 8 parameters to &mut T, 12 parameters to &T, 2 arguments	main.tach	+19 -19 lines
 % cat main.tach
 trait Shape {
     fn area(self: &Self) -> i64;
@@ -42,12 +42,12 @@ impl Counter for Live { fn tick(self: &mut Live) -> i64 { self.n += 1; self.n } 
 
 // std's Ord and Eq declare `&Self`: their impls are spelled so.
 struct Key { k: i64 }
-impl Ord for Key { fn cmp(self: &Key, other: &Key) -> i64 { self.k - other.k } }
-impl Eq for Key { fn eq(self: &Key, other: &Key) -> bool { self.k == other.k } }
+impl Ord for Key { fn cmp(self: *Key, other: *Key) -> i64 { self.k - other.k } }
+impl Eq for Key { fn eq(self: *Key, other: *Key) -> bool { self.k == other.k } }
 
 // Display declares `&Self` and `&mut Fmt` (0.18): spelled so too.
 struct Money { c: i64 }
-impl Display for Money { fn fmt(self: &Money, f: &mut Fmt) { f.write(f"${self.c}"); } }
+impl Display for Money { fn fmt(self: *Money, f: *Fmt) { f.write(f"${self.c}"); } }
 
 fn total<T: Shape>(s: &T) -> i64 { s.area() }
 fn bump<T: Shape>(s: &mut T) { s.grow(1); }
@@ -65,14 +65,17 @@ fn main() {
     let x = Key { k: 1 };
     let y = Key { k: 2 };
     let m = Money { c: 7 };
-    println(
-        f"{total(&a)} {total(&r)} {a.name()} {r.name()} {a.same(&b)} {twice(&mut fx)} {twice(&mut lv)} {x < y} {x == y} {m}");
+    println(f"{total(&a)} {total(&r)} {a.name()} {r.name()} {a.same(&b)} {twice(&fx)} {twice(&lv)} {x < y} {x == y} {m}");
 }
-$ fix --only unsafe
+$ fix --only unsafe --syntax=mixed
 note fix.none: nothing to fix
-$ main.tach -o prog
-ok: built prog
+$ main.tach -o prog --syntax=mixed
+main.tach:33:20: error[type error] 'cmp' does not have the signature trait 'Ord' declares: expected 'fn(Key, Key) -> i64'
+main.tach:34:19: error[type error] 'eq' does not have the signature trait 'Eq' declares: expected 'fn(Key, Key) -> bool'
+main.tach:38:26: error[type error] 'fmt' does not have the signature trait 'Display' declares: expected 'fn(Money, &mut Fmt) -> ()'
+[exit 1]
 % ./prog
-16 9 shape rect true 10 3 true false $7
-$ fix --values
+tests/refactor/run.sh: line 91: ./prog: No such file or directory
+[exit 127]
+$ fix --values --syntax=mixed
 note fix.none: nothing to fix

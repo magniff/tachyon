@@ -10,11 +10,11 @@
 ## The migrated program compiles as 0.16 asks and prints what it printed
 ## under 0.15 (the design's acceptance: the migration is exact); a second
 ## run finds nothing to do.
-$ fix --only alloc016
+$ fix --only alloc016 --syntax=mixed
 fixed 13 allocations made explicit	2 files	+36 -36 lines
 % git diff --stat | tail -1
  2 files changed, 36 insertions(+), 36 deletions(-)
-% "$COMPILER" main.tach -o prog && ./prog < input.txt
+% "$COMPILER" --syntax=mixed main.tach -o prog && ./prog < input.txt
 6 words, shortest 3, longest 5
 squares 16
 (1, 2)
@@ -22,5 +22,5 @@ area 14
 7 0
 padded 0 4 9
 ok: built prog
-$ fix --only alloc016
+$ fix --only alloc016 --syntax=mixed
 note fix.none: nothing to fix

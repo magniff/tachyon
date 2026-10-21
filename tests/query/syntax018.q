@@ -42,13 +42,13 @@ std::arch::aarch64::raw	<std::arch::aarch64::raw>	110
 std::arch::x86_64::raw	<std::arch::x86_64::raw>	6
 $ show crate::push Stack Percent
 // crate::push	syntax018/main.tach:19-27	effects: panic
-fn push(s: &mut Stack, x: i64)
+fn push(s: inout Stack, x: i64)
     requires s.len < s.max else "push on a full stack"
     ensures s.len == old(s.len) + 1
 {
     unsafe {
-        (*s).items[(*s).len] = x;
-        (*s).len += 1;
+        s.items[s.len] = x;
+        s.len += 1;
     }
 }
 // crate::Stack	syntax018/main.tach:10-11

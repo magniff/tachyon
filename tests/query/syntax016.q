@@ -48,7 +48,7 @@ fn apply<F: Fn(i64) -> i64 + effects(panic)>(f: F, x: i64) -> i64 {
 }
 // crate::grow	syntax016/main.tach:37-40	effects: alloc(Gpa) panic
 #[effects(alloc(Gpa), panic)]
-fn grow(v: &mut Vec<i64>) {
+fn grow(v: inout Vec<i64>) {
     v.push(1);
 }
 $ show crate::Pair
@@ -64,4 +64,4 @@ apply<closure(i64) -> i64 at syntax016/main.tach:47:32>	none
 crate::grow	alloc(Gpa) panic
 crate::main	alloc(Gpa) io global panic unsafe
 $ def Vec::new_in
-std::Vec::new_in	../../compiler/std/std.tach:183:12	method	pub fn new_in(a: A) -> Vec<T, A>
+std::Vec::new_in	../../compiler/std/std.tach:183:12	method	pub fn new_in(a: sink A) -> Vec<T, A>

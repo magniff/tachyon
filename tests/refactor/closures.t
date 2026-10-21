@@ -48,7 +48,7 @@ rewrote 2 sites in 1 file	main.tach	+2 -2 lines
 @@ -16,11 +16,11 @@ fn scaled(k: i64, x: i64) -> i64 {
  fn main() -> i32 {
      let k = 3;
-     let mut total = 0;
+     var total = 0;
 -    let add = |x: i64| double(x) + k;
 +    let add = |x: i64| (x * 2) + k;
      total += apply(add, 1);

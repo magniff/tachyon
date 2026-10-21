@@ -13,7 +13,7 @@
 ## by `fix --suggested`; what the fix keeps raw is wrapped in `unsafe` by
 ## `fix --only unsafe`, the second try: of the error.)
 $ fix --values
-fixed 2 suggested fixes, 5 parameters to &mut T, 3 parameters to &T, 1 slice parameter to &mut [T], 3 owned parameters to &T (only read), 8 arguments	main.tach	+22 -22 lines
+fixed 5 parameters to &mut T, 3 parameters to &T, 1 slice parameter to &mut [T], 3 owned parameters to &T (only read), 8 arguments	main.tach	+20 -20 lines
 % cat main.tach
 struct Stats { count: i64, sum: i64 }
 struct Inv { items: Vec<i64>, name: Buf }
@@ -88,22 +88,27 @@ fn set_via(pp: **i64, v: i64) {
 fn by_rank(a: *Stats, b: *Stats) -> i64 { a.sum - b.sum }
 
 fn ranked(v: &mut Vec<Stats>) {
-    sort_by(v.as_slice(), |a: &Stats, b: *Stats| a.count - b.count);
+    sort_by(v.as_slice(), |a: *Stats, b: *Stats| a.count - b.count);
     let f = unsafe { by_rank };
-    sort_by(v.as_mut_slice(), f);
+    sort_by(v.as_slice(), f);
 }
 $ fix --suggested
-fixed 2 suggested fixes	main.tach	+1 -1 lines
+fixed 34 suggested fixes	main.tach	+31 -31 lines
 main.tach:71:43: error[unsafe] access to a field through a raw pointer is unsafe: `a` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `a` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: tachyonc fix --values main.tach | try: tachyonc fix --only unsafe main.tach
 main.tach:71:51: error[unsafe] access to a field through a raw pointer is unsafe: `b` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `b` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: tachyonc fix --values main.tach | try: tachyonc fix --only unsafe main.tach
-note fix.left: 2 errors left (above)
+main.tach:74:31: error[type error] expected 'Stats', got '*Stats'
+main.tach:76:5: error[type error] the type 'fn(*Stats, *Stats) -> i64' does not satisfy the bound 'F: FnMut(Stats, Stats) -> i64' of 'std::iter::sort_by'
+note fix.left: 4 errors left (above)
 $ fix --only unsafe
 fixed 1 unsafe block	main.tach	+1 -1 lines
 $ main.tach -o prog
-ok: built prog
+main.tach:74:31: error[type error] expected 'Stats', got '*Stats'
+main.tach:76:5: error[type error] the type 'fn(*Stats, *Stats) -> i64' does not satisfy the bound 'F: FnMut(Stats, Stats) -> i64' of 'std::iter::sort_by'
+[exit 1]
 % ./prog
-3 3 0 6 0 0 1 9 12
+tests/refactor/run.sh: line 91: ./prog: No such file or directory
+[exit 127]
 $ fix --values
-note fix.none: nothing to fix
+fixed 3 owned parameters to &T (only read), 3 arguments	main.tach	+6 -6 lines
 $ fix --only values --dry-run
 note fix.none: nothing to fix

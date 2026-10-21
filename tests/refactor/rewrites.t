@@ -10,18 +10,18 @@ $ rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec' --dry-run
 @@ -5,0 +5 @@
 +use crate::vecs::{ByteVec, IntVec, grow_bytes};
 @@ -10 +10 @@
--    grow(&mut v, 10);
-+    (&mut v).reserve(10);
+-    grow(&v, 10);
++    (&v).reserve(10);
 @@ -25,2 +25,2 @@
--    grow(p, n);
--    grow(p, n * 2);
-+    p.reserve(n);
-+    p.reserve(n * 2);
+-    grow(&p, n);
+-    grow(&p, n * 2);
++    (&p).reserve(n);
++    (&p).reserve(n * 2);
 @@ -31,2 +31,2 @@
--    grow(v, 2);
--    grow(v, 2);
-+    v.reserve(2);
-+    v.reserve(2);
+-    grow(&v, 2);
+-    grow(&v, 2);
++    (&v).reserve(2);
++    (&v).reserve(2);
 note rewrite.imports: removed 1 import the rewrite left unused
 ## No site has that type: what the sites have, and the command for it.
 $ rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: IntVec'
@@ -77,24 +77,24 @@ $ rewrite 'grow($v, $n);' 'grow($v, $n + 1);' --in main.tach --dry-run
 --- a/main.tach
 +++ b/main.tach
 @@ -10 +10 @@
--    grow(&mut v, 10);
-+    grow(&mut v, 10 + 1);
+-    grow(&v, 10);
++    grow(&v, 10 + 1);
 @@ -25,2 +25,2 @@
--    grow(p, n);
--    grow(p, n * 2);
-+    grow(p, n + 1);
-+    grow(p, n * 2 + 1);
+-    grow(&p, n);
+-    grow(&p, n * 2);
++    grow(&p, n + 1);
++    grow(&p, n * 2 + 1);
 @@ -31,2 +31,2 @@
--    grow(v, 2);
--    grow(v, 2);
-+    grow(v, 2 + 1);
-+    grow(v, 2 + 1);
+-    grow(&v, 2);
+-    grow(&v, 2);
++    grow(&v, 2 + 1);
++    grow(&v, 2 + 1);
 ## Written, then undone.
 $ rewrite 'twice($x) * twice($x)' 'square(twice($x))'
 rewrote 1 site in 1 file	main.tach	+1 -1 lines
 % git diff
 diff --git a/main.tach b/main.tach
-index d5ed954..02da612 100644
+index 0528a7e..065d912 100644
 --- a/main.tach
 +++ b/main.tach
 @@ -14,7 +14,7 @@ fn main() -> i32 {
@@ -105,7 +105,7 @@ index d5ed954..02da612 100644
 +    let total = square(twice(n + 1)) + twice(n) * twice(n + 1);
      let k = 3 * double(n + 1) + double(double(n));
      log(1, 2);
-     grow_twice(&mut v, 7);
+     grow_twice(&v, 7);
 $ undo
 undid rewrote 1 site in 1 file	main.tach	+1 -1 lines
 ## A rewrite that breaks the program: nothing written.

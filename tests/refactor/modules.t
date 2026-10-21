@@ -79,8 +79,8 @@ $ refactor rename Point::sum total --dry-run
 --- a/geom.tach
 +++ b/geom.tach
 @@ -12 +12 @@
--    pub fn sum(self: &Point) -> i64 {
-+    pub fn total(self: &Point) -> i64 {
+-    pub fn sum(self) -> i64 {
++    pub fn total(self) -> i64 {
 ## A module: its file is renamed too.
 $ refactor rename crate::util tools
 renamed crate::util to tools	3 files	+4 -4 lines
@@ -158,7 +158,7 @@ use crate::geom::{Point, half, scale};
 pub const LIMIT: i64 = 100;
 
 // How many times `twice` ran.
-pub static mut COUNTER: i64 = 0;
+pub static var COUNTER: i64 = 0;
 
 pub fn twice(x: i64) -> i64 {
     unsafe { COUNTER += 1; }
@@ -188,7 +188,7 @@ pub struct Point {
 
 impl Point {
     // x + y.
-    pub fn sum(self: &Point) -> i64 {
+    pub fn sum(self) -> i64 {
         self.x + self.y
     }
 }
@@ -203,7 +203,7 @@ use crate::geom::Point;
 pub const LIMIT: i64 = 100;
 
 // How many times `twice` ran.
-pub static mut COUNTER: i64 = 0;
+pub static var COUNTER: i64 = 0;
 
 pub fn twice(x: i64) -> i64 {
     unsafe { COUNTER += 1; }
@@ -233,7 +233,7 @@ $ refactor move geom::Point --to crate::shapes
 moved crate::geom::Point to crate::shapes	3 files	+16 -14 lines
 % git diff
 diff --git a/geom.tach b/geom.tach
-index 97f33f8..872f916 100644
+index c211645..872f916 100644
 --- a/geom.tach
 +++ b/geom.tach
 @@ -1,19 +1,8 @@
@@ -249,7 +249,7 @@ index 97f33f8..872f916 100644
 -
 -impl Point {
 -    // x + y.
--    pub fn sum(self: &Point) -> i64 {
+-    pub fn sum(self) -> i64 {
 -        self.x + self.y
 -    }
 -}
@@ -272,7 +272,7 @@ index 620be80..2ddb6f5 100644
  
  fn main() -> i32 {
 diff --git a/shapes.tach b/shapes.tach
-index 0c40caf..bd6cf2f 100644
+index 0c40caf..a466091 100644
 --- a/shapes.tach
 +++ b/shapes.tach
 @@ -1,6 +1,6 @@
@@ -295,7 +295,7 @@ index 0c40caf..bd6cf2f 100644
 +
 +impl Point {
 +    // x + y.
-+    pub fn sum(self: &Point) -> i64 {
++    pub fn sum(self) -> i64 {
 +        self.x + self.y
 +    }
 +}
@@ -312,7 +312,7 @@ $ refactor move util::COUNTER --to crate::geom --dry-run
 @@ -36,0 +37,3 @@
 +
 +// How many times `twice` ran.
-+pub static mut COUNTER: i64 = 0;
++pub static var COUNTER: i64 = 0;
 --- a/util.tach
 +++ b/util.tach
 @@ -1 +1 @@
@@ -320,7 +320,7 @@ $ refactor move util::COUNTER --to crate::geom --dry-run
 +use crate::geom::COUNTER;
 @@ -3,2 +3 @@
 -// How many times `twice` ran.
--pub static mut COUNTER: i64 = 0;
+-pub static var COUNTER: i64 = 0;
 +pub const LIMIT: i64 = 100;
 ## An item imported alone (`use p::twice;`): the `use` lines get its new
 ## path.
@@ -508,7 +508,7 @@ pub struct Point {
 
 impl Point {
     // x + y.
-    pub fn sum(self: &Point) -> i64 {
+    pub fn sum(self) -> i64 {
         self.x + self.y
     }
 }
@@ -664,7 +664,7 @@ split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
 +
 +impl Point {
 +    // x + y.
-+    pub fn sum(self: &Point) -> i64 {
++    pub fn sum(self) -> i64 {
 +        self.x + self.y
 +    }
 +}
@@ -703,7 +703,7 @@ split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
 -
 -impl Point {
 -    // x + y.
--    pub fn sum(self: &Point) -> i64 {
+-    pub fn sum(self) -> i64 {
 -        self.x + self.y
 -    }
 -}

@@ -444,6 +444,14 @@ fn edit_signature(n: i64, closure: bool) {
 fn edit_param(n: i64, i: i64, p: i64, closure: bool) {
     unsafe {
         let tn = NODES[p].b;
+        if closure && tn <= 0 && !CONV_SPELLING && NODES[p].a > 0 && editable(NODES[p].start) {
+            // (an unwritten closure parameter: given `&T` by a bound that
+            // becomes `let T`, an access in 0.20, its `*a` goes: edit_deref)
+            CLOSURE_REFS.push(NODES[n].start);
+            CLOSURE_REFS.push(NODES[n].end);
+            CLOSURE_REFS.push(NODES[p].a);
+            return;
+        }
         if tn <= 0 || !editable(NODES[p].start) {
             return;
         }
@@ -981,6 +989,21 @@ fn let_param_at(c: i64, i: i64) -> bool {
 // value, so its address is written `&x`.
 fn raw_addresses() {
     unsafe {
+        // (`p as *T` of a reference parameter: `&p as *T`)
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind != NodeKind::Cast || NODES[n].a <= 0 {
+                continue;
+            }
+            let e = NODES[n].a;
+            let t = NODES[e].ty;
+            if NODES[e].kind == NodeKind::Ident && t > 0 && TYPES[t].kind == TyKind::Ptr
+                && TYPES[t].b != 0 && editable(NODES[e].start) && !raw_ref(e) {
+                let f = enclosing_fn(NODES[e].start);
+                if f > 0 && ref_param_named(f, NODES[e].a) > 0 {
+                    put(NODES[e].start, NODES[e].start, "&", CC_MARKER);
+                }
+            }
+        }
         let v = crate::front::check::check_mode::RAW_FROM_REF;
         for i in 0..v.count {
             let n = v.data[i];
@@ -990,6 +1013,21 @@ fn raw_addresses() {
             let f = enclosing_fn(NODES[n].start);
             if f > 0 && ref_param_named(f, NODES[n].a) > 0 {
                 put(NODES[n].start, NODES[n].start, "&", CC_MARKER);
+            }
+        }
+    }
+}
+
+// The `&e`s of 0.19 code the checker read as the value given to a let
+// parameter (front/conv: legacy_let_args): the `&` goes.
+fn stripped_amps() {
+    unsafe {
+        let v = crate::front::conv::LET_STRIPPED;
+        for i in 0..v.count {
+            let s = v.data[i];
+            if s > 0 && editable(s) && SRC[s] == '&' && SRC[s + 1] != '&'
+                && !word_here(skip_ws(s + 1), "mut") {
+                put(s, skip_ws(s + 1), "", CC_UNMARKED);
             }
         }
     }
@@ -1199,6 +1237,9 @@ pub fn conventions_edits() -> i64 {
         }
         raw_amps();
         raw_addresses();
+        if !CONV_SPELLING {
+            stripped_amps();
+        }
         for n in 1..NODE_COUNT {
             edit_node(n);
         }
@@ -1309,10 +1350,15 @@ pub fn conventions_report() {
 // ---- The tools' printer of conventions (T2.a) ----
 
 // Whether the tools write 0.20's spelling: in any crate but the legacy one
-// (compiler/src during 0.20), which is written in 0.19's.
+// (compiler/src during 0.20), which is written in 0.19's, and but for the
+// migrations to 0.19's own forms (`fix --values`, alloc016, std015: their
+// output is 0.19 code, which `fix --only conventions` takes on, Phase M).
 pub fn new_spelling() -> bool {
-    unsafe { !crate::front::conv::LEGACY_ROOT }
+    unsafe { !crate::front::conv::LEGACY_ROOT && !WRITE_019 }
 }
+
+// Set by `fix --values`, `--only alloc016`, `--only std015` (tools/fix).
+pub static mut WRITE_019: bool = false;
 
 // Type t as a tool writes it, into out: in 0.20's spelling an access is
 // `inout T` / `let T` (`T` alone as a parameter's, param), `&mut [T]`

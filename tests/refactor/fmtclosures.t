@@ -33,20 +33,15 @@ $ fmt --dry-run main.tach
 +        .enumerate()
 +        .map(|(i, x)| i * x)
 +        .sum();
-@@ -25 +31,3 @@
--    let f = move |left: i64, right: i64| -> i64 { let m = left * right; m + total + some_long_name_here + 1 };
-+    let f = move |left: i64, right: i64| -> i64 {
-+        let m = left * right; m + total + some_long_name_here + 1
-+    };
 $ fmt
-formatted	main.tach	+14 -6 lines
+formatted	main.tach	+11 -5 lines
 % cat main.tach
 // Closures and iterator chains laid out by hand, for `tachyonc fmt` (0.14).
 fn apply<F: Fn(i64) -> i64>(f: F, x: i64) -> i64 { f(x) }
 
-fn each<F: FnMut(i64)>(n: i64, mut f: F) { for i in 0..n { f(i); } }
+fn each<F: FnMut(i64)>(n: i64, f: sink F) { for i in 0..n { f(i); } }
 
-fn sum_of<I: Iterator<Item = i64>>(it: I) -> I::Item { it.sum() }
+fn sum_of<I: Iterator<Item = i64>>(it: sink I) -> I::Item { it.sum() }
 
 trait Source {
     type Item;
@@ -57,9 +52,9 @@ fn main() -> i32 {
     let k = 3;
     let a = apply(|x| x + k, 1);
     let b = apply(|x: i64| x * 2, a);
-    let c = apply(move |x| -> i64 { x | k }, b);
+    let c = apply(sink |x| -> i64 { x | k }, b);
     let d = apply(|(p, q): (i64, i64)| p + q, c);
-    let mut total = 0;
+    var total = 0;
     each(4, |i| { total += i; });
     each(2, || -> () {});
     let all = a || b > 0 || c | d > 0;
@@ -71,7 +66,7 @@ fn main() -> i32 {
         .map(|(i, x)| i * x)
         .sum();
     let w = numbers.iter().map(|x| x + 1).sum();
-    let f = move |left: i64, right: i64| -> i64 {
+    let f = sink |left: i64, right: i64| -> i64 {
         let m = left * right; m + total + some_long_name_here + 1
     };
     let neg = |&x| -x;
