@@ -9,7 +9,7 @@ of a PathBuf. `File::open(p)?`, `File::create(p)?`,
 `Vec<u8>`), `fs::write(p, data)?`, `fs::append(p, data)?`,
 `fs::metadata(p)?` (`len()`, `is_dir()`), `fs::create_dir_all(p)?`,
 `fs::remove_file`, `fs::remove_dir_all`, `fs::rename(a, b)`,
-`fs::read_dir(p)?` (entries: `var e = e?; e.file_name()`, a view of the entry; `e.path_in(dir, gpa)`),
+`fs::read_dir(p)?` (entries: `let e = e?; e.file_name()`, a view of the entry; `e.path_in(dir, gpa)`),
 `fs::exists(p)`. Errors are `io::Error` (`e.kind()`, an `ErrorKind`;
 Display as Rust's: `No such file or directory (os error 2)`), and
 `io::Result<T>` goes with `?`. `BufReader::new(f)` and
