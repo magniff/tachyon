@@ -23,33 +23,42 @@ manager), Windows, a stable language or a track record.
 ## An example
 
 ```rust
-fn fill(v: inout Vec<i64>, n: i64) {       // inout: changes the caller's Vec
-    for i in 0..n { v.push(i * i); }
+// Quicksort, in place: `inout` lends the slice for writing, nothing is copied.
+#[no_alloc] // checked: sorting allocates nothing
+fn quicksort<T: Ord>(xs: inout [T]) {
+    if xs.len() <= 1 { return; }
+    let p = partition(&xs);
+    quicksort(&xs[0..p]); // the two halves are disjoint places
+    quicksort(&xs[p + 1..xs.len()]);
 }
 
-#[no_alloc]                                // checked: nothing in it allocates
-fn total(v: Vec<i64>) -> i64 { v.iter().sum() }   // let, the default: read in place
-
-fn nth(v: Vec<i64>, i: i64) -> i64
-    requires 0 <= i && i < v.len() else "no such item"
+fn partition<T: Ord>(xs: inout [T]) -> i64
+    ensures 0 <= result && result < xs.len()
 {
-    v[i]                                   // its bounds check removed: requires proved it
+    let last = xs.len() - 1;
+    xs.swap(last / 2, last); // the middle element is the pivot
+    var store = 0;
+    for i in 0..last {
+        if xs[i] < xs[last] {
+            xs.swap(i, store);
+            store += 1;
+        }
+    }
+    xs.swap(store, last);
+    store
 }
 
-fn keep(all: inout Vec<Vec<i64>>, v: sink Vec<i64>) { all.push(v); }   // sink: takes v
-
-fn main(gpa: Gpa) -> i32 {                 // the program's allocator
-    var v: Vec<i64> = Vec::new_in(gpa);
-    fill(&v, 4);                           // & marks what the callee may change
-    println(f"{total(v)} {nth(v, 3)}");    // 14 9
-    var all: Vec<Vec<i64>> = Vec::new_in(gpa);
-    keep(&all, v);                         // v moved: a later use is own.moved
-    println(all.len());                    // 1
-    0
-}                                          // all, and v in it, freed here
+fn main(gpa: Gpa) {
+    var v: Vec<i64> = Vec::new_in(gpa); // the allocator is explicit
+    for x in [5, 3, 9, 1, 4, 8, 2, 7, 6] { v.push(x); }
+    quicksort(&v); // & marks what the callee may change
+    println(f"{v:?}"); // [1, 2, 3, 4, 5, 6, 7, 8, 9]
+}
 ```
 
-`volec query effects fill main.vl` answers `alloc(Gpa) panic`.
+`volec query effects quicksort main.vl` answers `panic diverge`: an
+index may fail its check, and the recursion may not end; no `alloc`, as
+`#[no_alloc]` checks.
 
 ## Why this is not Rust
 
