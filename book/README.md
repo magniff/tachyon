@@ -37,7 +37,7 @@ are the way they are. It is not a specification. For precise rules, see
 6. [Errors: Option, Result and panics](06-errors.md) *(outline)*
 7. [Collections and text](07-collections-and-text.md)
 8. [Allocation: where memory comes from](08-allocation.md)
-9. [Traits and generics](09-traits-generics.md) *(outline)*
+9. [Traits and generics](09-traits-generics.md)
 10. [Closures and iterators](10-closures-iterators.md) *(outline)*
 11. [Modules and programs](11-modules-and-programs.md) *(outline)*
 12. [Effects: what a function may do](12-effects.md) *(outline)*
