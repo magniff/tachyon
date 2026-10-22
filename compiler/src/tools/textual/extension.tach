@@ -1,0 +1,764 @@
+// `tachyonc refactor extension OLD NEW [ROOT | DIR | --all]...
+// [--exclude SPEC]... [--exclude-from FILE] [--dry-run] [--diff]
+// [--no-check] [-j N]` (0.21, for 0.24's `.tach` to `.vl`;
+// docs/refactor.md): every source file of a program (ROOT: its root and
+// its modules), of a directory, or of the whole tree (--all; less the
+// exclusions) renamed from OLD to NEW, as `git mv` renames, and the
+// mentions of their paths changed in every file git tracks: scripts,
+// test runners and their fixtures, docs, the directives and comments of
+// the sources. `mod` needs no change: it finds either extension.
+//
+// A mention is a path ending in OLD. With ROOT or DIR it is changed when
+// it names a renamed file (from the mentioning file's directory, from
+// here, or by the end of its path when that is one file's), and left
+// when it names another file; with --all every one is changed (`*.tach`
+// too). A string literal of a source is never changed (that changes what
+// the program does: `rewrite --text OLD NEW --strings`, checked), nor a
+// mention in an excluded file or line: they are reported, with what names
+// no file.
+//
+// Then every program renamed (ROOT; with DIR and --all each root among
+// the files: a `main` with `mod` items, or a file no such root is above)
+// is compiled before and after (samebuild): the same assembly, output and
+// exit status, the renamed paths aside, or the edit is taken back.
+
+use crate::base::{
+    FILES, FILE_COUNT, IntVec, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, streq,
+};
+use crate::front::cpp::directives::file_exists;
+use crate::tools::edit::DRY_RUN;
+use crate::tools::edit::diff::diff_texts;
+use crate::tools::edit::undo::run_undo;
+use crate::tools::proc::{absolute_path, buf_cstr, read_file_if, same_bytes};
+use crate::tools::query::{c_slice, find_root};
+use crate::tools::query::command_line::load_program;
+use crate::tools::query::diagnostics::{
+    PROG, diag, diags, put_cword, put_word, try_end, write_diags,
+};
+use crate::tools::query::grep::{G_COMMENT, G_STRING};
+use crate::tools::textual::{
+    M_FROM, M_TO, W_AFTER, W_BEFORE, W_PATH, add_exclusion, excluded, flush, is_text, kept_ranges,
+    read_exclusions, tracked_files, write_edit,
+};
+use crate::tools::textual::places::{match_in, read_lines, read_places};
+use crate::tools::textual::samebuild::{clean, compare_one, compile_all, has_mod_lines, processors};
+
+fn usage(message: *u8) -> i64 {
+    unsafe {
+        let d = diag(c"error", c"extension.usage");
+        buf_str(d, message);
+        buf_byte(d, '\n');
+        let out = diags();
+        buf_str(out, c"try:");
+        put_cword(out, PROG);
+        buf_str(out, c" refactor extension .tach .vl --all --dry-run");
+        try_end(out);
+        2
+    }
+}
+
+fn is_path_byte(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+        || c == '.' || c == '/' || c == '-' || c == '*' || c == '?'
+}
+
+fn is_alnum(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
+// `.ext` from `ext` or `.ext`, as a slice.
+fn dotted(s: *u8) -> [u8] {
+    unsafe {
+        let t = c_slice(s);
+        if t.len > 0 && t[0] == '.' {
+            return t;
+        }
+        let b = buf_new();
+        buf_byte(b, '.');
+        buf_bytes(b, t);
+        buf_slice(b)
+    }
+}
+
+fn ends_with(p: [u8], e: [u8]) -> bool {
+    p.len > e.len && same_bytes(p[p.len - e.len..p.len], e)
+}
+
+// Path p normalized: `./` and `x/..` dropped, no leading `./`.
+fn normalized(p: [u8]) -> [u8] {
+    unsafe {
+        var parts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var lens = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let absolute = p.len > 0 && p[0] == '/';
+        var i = 0;
+        while i <= p.len {
+            var e = i;
+            while e < p.len && p[e] != '/' {
+                e += 1;
+            }
+            let part = p[i..e];
+            if part.len == 0 || (part.len == 1 && part[0] == '.') {
+            } else if part.len == 2 && part[0] == '.' && part[1] == '.' && parts.count > 0
+                && lens.data[lens.count - 1] != -2 {
+                parts.count -= 1;
+                lens.count -= 1;
+            } else {
+                parts.push(i);
+                lens.push(if part.len == 2 && part[0] == '.' && part[1] == '.' { -2 }
+                    else { e - i });
+            }
+            i = e + 1;
+        }
+        let b = buf_new();
+        if absolute {
+            buf_byte(b, '/');
+        }
+        for k in 0..parts.count {
+            if k > 0 {
+                buf_byte(b, '/');
+            }
+            let s = parts.data[k];
+            let n = if lens.data[k] == -2 { 2 } else { lens.data[k] };
+            buf_bytes(b, p[s..s + n]);
+        }
+        buf_slice(b)
+    }
+}
+
+// The directory of path p (`` for a file here).
+fn dir_of(p: [u8]) -> [u8] {
+    var i = p.len - 1;
+    while i >= 0 && p[i] != '/' {
+        i -= 1;
+    }
+    if i < 0 { p[0..0] } else { p[0..i] }
+}
+
+// The files with OLD git tracks (all; C strings) and which are renamed.
+static var OLD_FILES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var RENAMED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn index_of(p: [u8]) -> i64 {
+    unsafe {
+        for k in 0..OLD_FILES.count {
+            if same_bytes(c_slice(OLD_FILES.data[k] as *u8), p) {
+                return k;
+            }
+        }
+        -1
+    }
+}
+
+// The file a mention `tok` in file `from` names: an index into OLD_FILES;
+// -1 none, -2 several (the end of a path that is several files').
+fn resolve(tok: [u8], from: [u8]) -> i64 {
+    unsafe {
+        let d = dir_of(from);
+        if d.len > 0 {
+            let b = buf_new();
+            buf_bytes(b, d);
+            buf_byte(b, '/');
+            buf_bytes(b, tok);
+            let k = index_of(normalized(buf_slice(b)));
+            if k >= 0 {
+                return k;
+            }
+        }
+        let k = index_of(normalized(tok));
+        if k >= 0 {
+            return k;
+        }
+        // (by its end: the longest end of tok that ends one file's path)
+        var s = 0;
+        while s < tok.len {
+            let end = tok[s..tok.len];
+            var found = -1;
+            var count = 0;
+            for j in 0..OLD_FILES.count {
+                let q = c_slice(OLD_FILES.data[j] as *u8);
+                if same_bytes(q, end) || (q.len > end.len && q[q.len - end.len - 1] == '/'
+                    && same_bytes(q[q.len - end.len..q.len], end)) {
+                    found = j;
+                    count += 1;
+                }
+            }
+            if count == 1 {
+                return found;
+            }
+            if count > 1 {
+                return -2;
+            }
+            while s < tok.len && tok[s] != '/' {
+                s += 1;
+            }
+            s += 1;
+        }
+        -1
+    }
+}
+
+// The renamed path of p (OLD replaced by NEW at its end).
+fn renamed(p: [u8], old: [u8], new: [u8]) -> *u8 {
+    let b = buf_new();
+    buf_bytes(b, p[0..p.len - old.len]);
+    buf_bytes(b, new);
+    buf_cstr(b)
+}
+
+// Whether a renamed file p is a program's root: a `main` file with `mod`
+// items, or a file with no such root in its directory or above.
+fn is_root(p: [u8], old: [u8]) -> bool {
+    unsafe {
+        let text = buf_new();
+        let b = buf_new();
+        buf_bytes(b, p);
+        if !read_file_if(buf_cstr(b), text) {
+            return false;
+        }
+        var d = dir_of(p);
+        loop {
+            let m = buf_new();
+            if d.len > 0 {
+                buf_bytes(m, d);
+                buf_byte(m, '/');
+            }
+            buf_str(m, c"main");
+            buf_bytes(m, old);
+            let mp = buf_slice(m);
+            if !same_bytes(mp, p) && file_exists(buf_cstr(m)) {
+                let t = buf_new();
+                read_file_if(buf_cstr(m), t);
+                if has_mod_lines(buf_slice(t)) {
+                    return false;
+                }
+            }
+            if d.len == 0 {
+                return true;
+            }
+            d = dir_of(d);
+        }
+    }
+}
+
+// Path p of the program as git names it: relative to here.
+fn here_relative(p: *u8) -> [u8] {
+    unsafe {
+        let s = c_slice(p);
+        if s.len > 0 && s[0] == '/' {
+            let here = c_slice(absolute_path(c"."));
+            let full = c_slice(absolute_path(p));
+            if full.len > here.len + 1 && full[here.len] == '/'
+                && same_bytes(full[0..here.len], here) {
+                return full[here.len + 1..full.len];
+            }
+            return s;
+        }
+        normalized(s)
+    }
+}
+
+pub fn run_extension(argc: i64, argv: **u8) -> i64 {
+    let status = run_inner(argc, argv);
+    write_diags();
+    status
+}
+
+fn run_inner(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        PROG = argv[0];
+        var words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var all = false;
+        var no_check = false;
+        var show_diff = false;
+        var jobs = 0;
+        var i = 3;
+        while i < argc {
+            let a = argv[i];
+            let valued = i + 1 < argc;
+            if streq(a, c"--all") {
+                all = true;
+            } else if streq(a, c"--dry-run") {
+                DRY_RUN = true;
+            } else if streq(a, c"--diff") {
+                show_diff = true;
+            } else if streq(a, c"--no-check") {
+                no_check = true;
+            } else if streq(a, c"-j") && valued {
+                jobs = crate::tools::query::parse_count(argv[i + 1]);
+                i += 1;
+            } else if streq(a, c"--exclude") && valued {
+                if !add_exclusion(c_slice(argv[i + 1])) {
+                    return 2;
+                }
+                i += 1;
+            } else if streq(a, c"--exclude-from") && valued {
+                if !read_exclusions(argv[i + 1]) {
+                    return 2;
+                }
+                i += 1;
+            } else if a[0] == '-' && a[1] == '-' {
+                let d = diag(c"error", c"extension.usage");
+                buf_str(d, c"unknown option '");
+                buf_str(d, a);
+                buf_str(d,
+                    c"' (--all, --exclude, --exclude-from, --dry-run, --diff, --no-check, -j)\n");
+                return 2;
+            } else {
+                words.push(a as i64);
+            }
+            i += 1;
+        }
+        if words.count < 2 {
+            return usage(c"extension takes OLD and NEW (.tach .vl), then ROOT, DIR or --all");
+        }
+        let old = dotted(words.data[0] as *u8);
+        let new = dotted(words.data[1] as *u8);
+        if old.len < 2 || new.len < 2 || same_bytes(old, new) {
+            return usage(c"OLD and NEW are two extensions");
+        }
+        if jobs <= 0 {
+            jobs = processors();
+        }
+        var tracked = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        if !tracked_files(&tracked) {
+            let d = diag(c"error", c"extension.no-git");
+            buf_str(d,
+                c"refactor extension renames the files git tracks: this is no git checkout\n");
+            return 2;
+        }
+        for k in 0..tracked.count {
+            if ends_with(c_slice(tracked.data[k] as *u8), old) {
+                OLD_FILES.push(tracked.data[k]);
+            }
+        }
+        // The renamed files (indexes into OLD_FILES; -1 untracked, in
+        // `untracked`), the roots to compile.
+        let picked = crate::base::alloc_array::<bool>(OLD_FILES.count + 1);
+        for k in 0..OLD_FILES.count + 1 {
+            picked[k] = false;
+        }
+        var untracked = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var roots = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var excluded_count = 0;
+        let targets = words.count - 2;
+        if all {
+            for k in 0..OLD_FILES.count {
+                picked[k] = true;
+            }
+        }
+        var t = 2;
+        while t < words.count || (targets == 0 && !all && t == 2) {
+            let arg = if t < words.count { words.data[t] as *u8 } else { find_root(0 as *u8) };
+            t += 1;
+            if arg == 0 as *u8 {
+                return usage(c"no program here: name a ROOT, a DIR, or --all");
+            }
+            let a = here_relative(arg);
+            if ends_with(a, old) {
+                // A program: its files.
+                if !load_program(arg, 0) {
+                    let d = diag(c"error", c"extension.no-program");
+                    buf_str(d, c"cannot read the program of '");
+                    buf_str(d, arg);
+                    buf_str(d, c"'\n");
+                    return 1;
+                }
+                let rb = buf_new();
+                buf_bytes(rb, a);
+                roots.push(buf_cstr(rb) as i64);
+                for f in 0..FILE_COUNT {
+                    let path = FILES[f].path;
+                    if path[0] == '<' || crate::tools::edit::stdedit::is_std_file(c_slice(path)) {
+                        continue;
+                    }
+                    let p = here_relative(path);
+                    if !ends_with(p, old) {
+                        continue;
+                    }
+                    let k = index_of(p);
+                    if k >= 0 {
+                        picked[k] = true;
+                    } else {
+                        let b = buf_new();
+                        buf_bytes(b, p);
+                        untracked.push(buf_cstr(b) as i64);
+                    }
+                }
+            } else {
+                // A directory: the files under it.
+                var any = false;
+                for k in 0..OLD_FILES.count {
+                    let q = c_slice(OLD_FILES.data[k] as *u8);
+                    if a.len == 0
+                        || (q.len > a.len && q[a.len] == '/' && same_bytes(q[0..a.len], a)) {
+                        picked[k] = true;
+                        any = true;
+                    }
+                }
+                if !any {
+                    let d = diag(c"error", c"extension.no-files");
+                    buf_str(d, c"no file of git's ends with ");
+                    buf_bytes(d, old);
+                    buf_str(d, c" under '");
+                    buf_str(d, arg);
+                    buf_str(d, c"'\n");
+                    return 1;
+                }
+            }
+        }
+        let by_program = roots.count > 0;
+        for k in 0..OLD_FILES.count {
+            if !picked[k] {
+                continue;
+            }
+            let p = c_slice(OLD_FILES.data[k] as *u8);
+            if excluded(p) {
+                picked[k] = false;
+                excluded_count += 1;
+                continue;
+            }
+            RENAMED.push(k);
+        }
+        if RENAMED.count == 0 && untracked.count == 0 {
+            let d = diag(c"note", c"extension.no-files");
+            buf_str(d, c"no file to rename\n");
+            return 0;
+        }
+        // The moves.
+        for r in 0..RENAMED.count {
+            let p = c_slice(OLD_FILES.data[RENAMED.data[r]] as *u8);
+            M_FROM.push(OLD_FILES.data[RENAMED.data[r]]);
+            M_TO.push(renamed(p, old, new) as i64);
+            if !by_program && is_root(p, old) {
+                roots.push(OLD_FILES.data[RENAMED.data[r]]);
+            }
+        }
+        for u in 0..untracked.count {
+            let p = c_slice(untracked.data[u] as *u8);
+            M_FROM.push(untracked.data[u]);
+            M_TO.push(renamed(p, old, new) as i64);
+        }
+        for m in 0..M_TO.count {
+            if file_exists(M_TO.data[m] as *u8) {
+                let d = diag(c"error", c"extension.exists");
+                buf_str(d, c"'");
+                buf_str(d, M_TO.data[m] as *u8);
+                buf_str(d, c"' exists already: '");
+                buf_str(d, M_FROM.data[m] as *u8);
+                buf_str(d, c"' cannot take its name; nothing renamed\n");
+                return 1;
+            }
+        }
+        // The mentions, in every file git tracks.
+        let out = buf_new();
+        let diff = buf_new();
+        var mentions = 0;
+        var mention_files = 0;
+        var in_strings = 0;
+        var string_files = 0;
+        var unresolved = 0;
+        var ambiguous = 0;
+        var left_excluded = 0;
+        var left_kept = 0;
+        let example = buf_new();
+        for f in 0..tracked.count {
+            let path = tracked.data[f] as *u8;
+            let p = c_slice(path);
+            let text = buf_new();
+            if !read_file_if(path, text) || !is_text(buf_slice(text)) {
+                continue;
+            }
+            let tx = buf_slice(text);
+            // (the matches: OLD that ends a word)
+            var starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            var j = 0;
+            while j + old.len <= tx.len {
+                if tx[j] == old[0] && same_bytes(tx[j..j + old.len], old)
+                    && (j + old.len == tx.len || !is_alnum(tx[j + old.len])) {
+                    starts.push(j);
+                    j += old.len;
+                } else {
+                    j += 1;
+                }
+            }
+            if starts.count == 0 {
+                continue;
+            }
+            if excluded(p) {
+                left_excluded += starts.count;
+                continue;
+            }
+            var keep = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            kept_ranges(p, tx, &keep);
+            let source = crate::base::source_ext_len(p) > 0 || ends_with(p, old);
+            var placed = source && read_places(tx);
+            if source && !placed {
+                // (it does not lex: its `//` lines are its comments)
+                read_lines(tx);
+                placed = true;
+            }
+            let after = buf_new();
+            var at = 0;
+            var n = 0;
+            var strings_here = 0;
+            var r = 0;
+            for k in 0..starts.count {
+                let s = starts.data[k];
+                let e = s + old.len;
+                while r < keep.count && keep.data[r + 1] <= s {
+                    r += 2;
+                }
+                if r < keep.count && keep.data[r] < e {
+                    left_kept += 1;
+                    continue;
+                }
+                if source {
+                    if placed && match_in(s, e, G_STRING) {
+                        strings_here += 1;
+                        continue;
+                    }
+                    if !placed || !match_in(s, e, G_COMMENT) {
+                        continue;
+                    }
+                }
+                if !all {
+                    var b = s;
+                    while b > 0 && is_path_byte(tx[b - 1]) {
+                        b -= 1;
+                    }
+                    let tok = tx[b..e];
+                    let res = resolve(tok, p);
+                    if res == -1 {
+                        unresolved += 1;
+                        if buf_len(example) == 0 {
+                            buf_bytes(example, p);
+                            buf_str(example, c": ");
+                            buf_bytes(example, tok);
+                        }
+                        continue;
+                    }
+                    if res == -2 {
+                        ambiguous += 1;
+                        continue;
+                    }
+                    if !picked[res] {
+                        continue;
+                    }
+                }
+                buf_bytes(after, tx[at..s]);
+                buf_bytes(after, new);
+                at = e;
+                n += 1;
+            }
+            if strings_here > 0 {
+                in_strings += strings_here;
+                string_files += 1;
+            }
+            if n == 0 {
+                continue;
+            }
+            buf_bytes(after, tx[at..tx.len]);
+            // (a renamed file's path after the move)
+            var final_path = path;
+            for m in 0..M_FROM.count {
+                if streq(M_FROM.data[m] as *u8, path) {
+                    final_path = M_TO.data[m] as *u8;
+                }
+            }
+            W_PATH.push(final_path as i64);
+            W_BEFORE.push(text);
+            W_AFTER.push(after);
+            buf_bytes(out, c_slice(final_path));
+            buf_byte(out, '\t');
+            buf_int(out, n);
+            buf_str(out, if n == 1 { c" mention\n" } else { c" mentions\n" });
+            if show_diff {
+                diff_texts(diff, c_slice(final_path), tx, buf_slice(after));
+            }
+            mentions += n;
+            mention_files += 1;
+        }
+        // The renames, a line per directory (in the order first seen).
+        var dirs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var counts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for m in 0..M_FROM.count {
+            let dir = dir_of(c_slice(M_FROM.data[m] as *u8));
+            var found = -1;
+            for k in 0..dirs.count {
+                if same_bytes(dir_of(c_slice(M_FROM.data[dirs.data[k]] as *u8)), dir) {
+                    found = k;
+                    break;
+                }
+            }
+            if found < 0 {
+                dirs.push(m);
+                counts.push(1);
+            } else {
+                counts.data[found] += 1;
+            }
+        }
+        for k in 0..dirs.count {
+            let dir = dir_of(c_slice(M_FROM.data[dirs.data[k]] as *u8));
+            if dir.len > 0 {
+                buf_bytes(out, dir);
+                buf_byte(out, '/');
+            }
+            buf_byte(out, '*');
+            buf_bytes(out, old);
+            buf_str(out, c" -> *");
+            buf_bytes(out, new);
+            buf_byte(out, '\t');
+            buf_int(out, counts.data[k]);
+            buf_str(out, if counts.data[k] == 1 { c" file\n" } else { c" files\n" });
+        }
+        buf_str(out, if DRY_RUN { c"would rename " } else { c"renamed " });
+        buf_int(out, M_FROM.count);
+        buf_str(out, if M_FROM.count == 1 { c" file (" } else { c" files (" });
+        buf_bytes(out, old);
+        buf_str(out, c" -> ");
+        buf_bytes(out, new);
+        buf_str(out, c"), ");
+        buf_int(out, mentions);
+        buf_str(out, if mentions == 1 { c" mention in " } else { c" mentions in " });
+        buf_int(out, mention_files);
+        buf_str(out, if mention_files == 1 { c" file\n" } else { c" files\n" });
+        if show_diff {
+            buf_bytes(out, buf_slice(diff));
+        }
+        // What is left.
+        if in_strings > 0 {
+            let d = diag(c"note", c"extension.strings");
+            buf_int(d, in_strings);
+            buf_str(d,
+                if in_strings == 1 { c" mention in string literals of " }
+                else { c" mentions in string literals of " });
+            buf_int(d, string_files);
+            buf_str(d, if string_files == 1 { c" source" } else { c" sources" });
+            buf_str(d, c" left: changing them changes what the program does\n");
+            let tr = diags();
+            buf_str(tr, c"try:");
+            put_cword(tr, PROG);
+            buf_str(tr, c" rewrite --text");
+            put_word(tr, old);
+            put_word(tr, new);
+            buf_str(tr, c" --word --strings --dry-run");
+            try_end(tr);
+        }
+        if excluded_count > 0 || left_excluded > 0 || left_kept > 0 {
+            let d = diag(c"note", c"extension.excluded");
+            let left = left_excluded + left_kept;
+            buf_int(d, excluded_count);
+            buf_str(d,
+                if excluded_count == 1 { c" file kept its name" }
+                else { c" files kept their name" });
+            buf_str(d, c" (excluded); ");
+            buf_int(d, left);
+            buf_str(d, if left == 1 { c" mention" } else { c" mentions" });
+            buf_str(d, c" left in excluded files and lines\n");
+        }
+        if untracked.count > 0 {
+            let d = diag(c"note", c"extension.untracked");
+            buf_int(d, untracked.count);
+            buf_str(d, if untracked.count == 1 { c" file" } else { c" files" });
+            buf_str(d, c" of the program git does not track: renamed without it\n");
+        }
+        if unresolved > 0 || ambiguous > 0 {
+            let d = diag(c"note", c"extension.unresolved");
+            buf_int(d, unresolved);
+            buf_str(d, c" mentions name no file, ");
+            buf_int(d, ambiguous);
+            buf_str(d, c" the end of several files' paths: left");
+            if buf_len(example) > 0 {
+                buf_str(d, c" (");
+                buf_bytes(d, buf_slice(example));
+                buf_byte(d, ')');
+            }
+            buf_byte(d, '\n');
+        }
+        if DRY_RUN {
+            flush(out);
+            if !no_check && roots.count > 0 {
+                let d = diag(c"note", c"extension.check");
+                buf_int(d, roots.count);
+                buf_str(d, if roots.count == 1 { c" program" } else { c" programs" });
+                buf_str(d, c" would be compiled before and after the rename, and compared\n");
+            }
+            return 0;
+        }
+        // The build before.
+        let before = c"target/extension-check/before";
+        let after = c"target/extension-check/after";
+        if !no_check && roots.count > 0 && !compile_all(roots, before, jobs) {
+            let d = diag(c"error", c"extension.check");
+            buf_str(d, c"cannot make target/extension-check; nothing renamed\n");
+            return 1;
+        }
+        let summary = buf_new();
+        buf_str(summary, c"renamed ");
+        buf_int(summary, M_FROM.count);
+        buf_str(summary, c" files ");
+        buf_bytes(summary, old);
+        buf_str(summary, c" -> ");
+        buf_bytes(summary, new);
+        buf_byte(summary, '\t');
+        buf_int(summary, mentions);
+        buf_str(summary, c" mentions in ");
+        buf_int(summary, mention_files);
+        buf_str(summary, c" files");
+        if !write_edit(buf_slice(summary), c".") {
+            return 1;
+        }
+        flush(out);
+        if no_check || roots.count == 0 {
+            return 0;
+        }
+        // The build after: the same, or the edit is undone.
+        var new_roots = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..roots.count {
+            let p = c_slice(roots.data[k] as *u8);
+            new_roots.push(renamed(p, old, new) as i64);
+        }
+        compile_all(new_roots, after, jobs);
+        var differ = 0;
+        let why = buf_new();
+        var first = -1;
+        for k in 0..roots.count {
+            let w = buf_new();
+            if compare_one(before, after, k, old, new, w) != 0 {
+                differ += 1;
+                if first < 0 {
+                    first = k;
+                    buf_bytes(why, buf_slice(w));
+                }
+            }
+        }
+        if differ > 0 {
+            let d = diag(c"error", c"extension.differs");
+            buf_int(d, differ);
+            buf_str(d, c" of ");
+            buf_int(d, roots.count);
+            buf_str(d, c" programs build differently after the rename (");
+            buf_str(d, new_roots.data[first] as *u8);
+            buf_str(d, c": ");
+            buf_bytes(d, buf_slice(why));
+            buf_str(d, c"); the rename is undone, the outputs are in target/extension-check\n");
+            run_undo(false, c".");
+            return 1;
+        }
+        clean(before, roots.count);
+        clean(after, roots.count);
+        crate::tools::proc::remove_dir(c"target/extension-check");
+        let o = buf_new();
+        buf_str(o, c"same build\t");
+        buf_int(o, roots.count);
+        buf_str(o, if roots.count == 1 { c" program builds" } else { c" programs build" });
+        buf_str(o, c" as before (the paths aside)\n");
+        flush(o);
+        0
+    }
+}
+
+// The length of buffer b.
+fn buf_len(b: i64) -> i64 {
+    unsafe { crate::base::BUFS[b].len }
+}

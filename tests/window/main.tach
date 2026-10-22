@@ -1,0 +1,836 @@
+// The window library's tests (terminal.md §4.1, "std::window Cocoa"),
+// run by tests/window/run.sh, and a demo to try by hand.
+//
+//   main test      the headless checks (key tables, modifiers, UTF-8 and
+//                  UTF-16 helpers), then, when a window server is there
+//                  (NEEDS: display), the Cocoa checks: a window, its first
+//                  size, frames on request and none without, the window's
+//                  surface presenting the renderer's grid (std::gpu), keys and text
+//                  through interpretKeyEvents, the input method's
+//                  composition, the mouse, a resize, the clipboard (the
+//                  user's is restored), a watched pipe, close and Quit,
+//                  and no CPU used while idle
+//   main demo      a window showing what you type through the terminal's
+//                  renderer (Command-Q quits)
+//
+// Events are synthesized with +[NSEvent keyEventWithType:...] and sent to
+// the window (-[NSWindow sendEvent:]), so no Accessibility permission is
+// needed and the window need not be the key window.
+//
+// `render` is a link to examples/voltty/render: a program's modules sit
+// under its root.
+
+mod count;
+mod render;
+
+use render::input::{
+    CURSOR_BEAM, CURSOR_BLOCK, Cell, CellGrid, CursorView, DEFAULT_BG, DEFAULT_FG, cell, named,
+};
+use render::objc::{
+    Point, Range, Rect, class, msg_b, msg_i, msg_p, msg_p_p, msg_p_u, msg_p_utudipiif,
+    msg_p_utudipppbh, msg_r_gP, msg_v_p, msg_v_pg, msg_v_pgg, msg_v_z, nsstring, pool_pop,
+    pool_push, sel,
+};
+use render::objc::Size as NsSize;
+use render::renderer::Renderer;
+use std::gpu::{Format, RawSurface, Surface};
+use std::window::{App, Button, Event, MouseAction, Window, WindowDesc, WindowId};
+use std::window::keys::{
+    ALT_L, ALT_R, CAPS, CTRL_L, CTRL_R, KeyCode, Logical, Named, SHIFT_L, SHIFT_R, SUPER_L,
+    first_char, mac_keycode, mac_logical, mac_modifier_down, mac_mods, utf16_to_byte, utf8_cut,
+};
+
+extern "C" {
+    fn pipe(fds: *i32) -> i32;
+    fn write(fd: i32, p: *u8, n: u64) -> i64;
+    fn read(fd: i32, p: *u8, n: u64) -> i64;
+    fn close(fd: i32) -> i32;
+    fn getrusage(who: i32, usage: *u8) -> i32;
+    fn getenv(name: *u8) -> *u8;
+
+    fn CGEventCreateScrollWheelEvent2(source: *u8, units: u32, count: u32, w1: i32, w2: i32,
+        w3: i32) -> *u8;
+
+    fn CFRelease(o: *u8);
+}
+
+struct T {
+    failed: i64,
+}
+
+impl T {
+    fn check<N: Display, D: Display>(inout self, name: sink N, ok: bool, why: sink D) {
+        if ok {
+            println(f"ok {name}");
+        } else {
+            println(f"FAIL {name}: {why}");
+            self.failed += 1;
+        }
+    }
+}
+
+// ---- headless ------------------------------------------------------------
+
+fn code_is(c: KeyCode, want: KeyCode) -> bool {
+    c == want
+}
+
+fn test_keys(t: T) {
+    t.check("keys_letters",
+        code_is(mac_keycode(0x00), KeyCode::KeyA) && code_is(mac_keycode(0x06), KeyCode::KeyZ)
+            && code_is(mac_keycode(0x2E), KeyCode::KeyM), "kVK_ANSI_A/Z/M");
+    t.check("keys_digits",
+        code_is(mac_keycode(0x1D), KeyCode::Digit0) && code_is(mac_keycode(0x16), KeyCode::Digit6)
+            && code_is(mac_keycode(0x17), KeyCode::Digit5), "kVK_ANSI_0/6/5");
+    t.check("keys_named",
+        code_is(mac_keycode(0x24), KeyCode::Enter) && code_is(mac_keycode(0x33), KeyCode::Backspace)
+            && code_is(mac_keycode(0x75), KeyCode::Delete)
+            && code_is(mac_keycode(0x7E), KeyCode::ArrowUp)
+            && code_is(mac_keycode(0x7A), KeyCode::F1) && code_is(mac_keycode(0x6F), KeyCode::F12)
+            && code_is(mac_keycode(0x4C), KeyCode::NumpadEnter),
+        "Return, Delete, ForwardDelete, Up, F1, F12");
+    t.check("keys_modifiers", code_is(mac_keycode(0x38), KeyCode::ShiftLeft)
+        && code_is(mac_keycode(0x3C), KeyCode::ShiftRight)
+        && code_is(mac_keycode(0x37), KeyCode::SuperLeft)
+        && code_is(mac_keycode(0x36), KeyCode::SuperRight)
+        && code_is(mac_keycode(0x3D), KeyCode::AltRight),
+        "Shift, RightShift, Command, RightCommand, RightOption");
+    t.check("keys_unknown", code_is(mac_keycode(0x34), KeyCode::Unidentified)
+        && code_is(mac_keycode(0x200), KeyCode::Unidentified), "0x34, 0x200");
+    // Every code below 0x80 maps somewhere or to Unidentified, and the
+    // known ones are distinct.
+    var seen = 0;
+    for a in 0..128 {
+        let ca = mac_keycode(a as u16);
+        if ca == KeyCode::Unidentified {
+            continue;
+        }
+        seen += 1;
+        for b in a + 1..128 {
+            if mac_keycode(b as u16) == ca {
+                t.check(f"keys_distinct_{a}_{b}", false, "two codes map to one key");
+            }
+        }
+    }
+    t.check("keys_count", seen >= 110, f"{seen} mapped codes");
+
+    let up = mac_logical(0xF700, KeyCode::ArrowUp);
+    t.check("logical_arrow", match up {
+        Logical::Named(Named::ArrowUp) => true,
+        _ => false,
+    }, "U+F700");
+    let f5 = mac_logical(0xF708, KeyCode::F5);
+    t.check("logical_f5", match f5 {
+        Logical::F(n) => n == 5,
+        _ => false,
+    }, "U+F708");
+    let ret = mac_logical(13, KeyCode::Enter);
+    let a = mac_logical('a' as u32, KeyCode::KeyA);
+    let sh = mac_logical(0, KeyCode::ShiftRight);
+    t.check("logical_misc", match ret {
+        Logical::Named(Named::Enter) => true,
+        _ => false,
+    } && match a {
+        Logical::Char(c) => c == 'a' as u32,
+        _ => false,
+    } && match sh {
+        Logical::Named(Named::Shift) => true,
+        _ => false,
+    }, "Return, a, RightShift");
+
+    // Modifier flags: device bits tell left from right.
+    let m1 = mac_mods((1 << 17) | 0x04);
+    let m2 = mac_mods((1 << 18) | (1 << 19) | 0x01 | 0x40);
+    let m3 = mac_mods(1 << 20);
+    let m4 = mac_mods(1 << 16);
+    t.check("mods_sides",
+        m1.bits == SHIFT_R && m2.bits == (CTRL_L | ALT_R) && m3.bits == SUPER_L && m4.bits == CAPS,
+        f"{m1.bits} {m2.bits} {m3.bits} {m4.bits}");
+    t.check("mods_accessors", m2.ctrl() && m2.alt() && !m2.shift() && !m2.sup() && m4.caps(),
+        "ctrl alt");
+    t.check("mods_flags_changed", mac_modifier_down(KeyCode::ShiftRight, (1 << 17) | 0x04)
+        && !mac_modifier_down(KeyCode::ShiftLeft, (1 << 17) | 0x04)
+        && !mac_modifier_down(KeyCode::ControlRight, (1 << 18) | 0x01),
+        "right shift down, left not");
+    let _ = SHIFT_L;
+    let _ = CTRL_R;
+    let _ = ALT_L;
+
+    t.check("utf8_first", first_char("a") == 97 && first_char("\xc3\xa9") == 0xE9
+        && first_char("\xe4\xb8\xad") == 0x4E2D && first_char("\xf0\x9f\x98\x80") == 0x1F600
+        && first_char("") == 0 && first_char("\xe4") == 0xFFFD, "a, e-acute, U+4E2D, U+1F600");
+    // "aé中😀": UTF-16 units 1, 1, 1, 2; bytes 1, 2, 3, 4.
+    let s = "a\xc3\xa9\xe4\xb8\xad\xf0\x9f\x98\x80";
+    t.check("utf16_to_byte",
+        utf16_to_byte(s, 0) == 0 && utf16_to_byte(s, 1) == 1 && utf16_to_byte(s, 2) == 3
+            && utf16_to_byte(s, 3) == 6 && utf16_to_byte(s, 5) == 10 && utf16_to_byte(s, 9) == 10,
+        "unit offsets to byte offsets");
+    // "z" and ten 3-byte characters (31 bytes) cut at 30: the last
+    // character does not fit whole.
+    let long = "z\xe4\xb8\xad\xe4\xb8\xad\xe4\xb8\xad\xe4\xb8\xad\xe4\xb8\xad\xe4\xb8\xad\xe4\xb8\xad\xe4\xb8\xad\xe4\xb8\xad\xe4\xb8\xad";
+    t.check("utf8_cut",
+        utf8_cut(long, 30) == 28 && utf8_cut(long[1..long.len], 30) == 30
+            && utf8_cut("ab", 30) == 2, f"{utf8_cut(long, 30)} {utf8_cut(long[1..long.len], 30)}");
+}
+
+// ---- with a display ------------------------------------------------------
+
+// Waits up to `ms` for an event `want` accepts; the others are dropped
+// (counted in `other`).
+fn wait_for(app: inout App, ms: i64, want: fn(Event) -> bool, other: inout i64) -> Option<Event> {
+    let t0 = clock_ms();
+    loop {
+        let left = ms - (clock_ms() - t0);
+        if left <= 0 {
+            return None;
+        }
+        match app.wait_timeout(left) {
+            Some(e) => {
+                if want(e) {
+                    return Some(e);
+                }
+                other += 1;
+            }
+            None => return None,
+        }
+    }
+}
+
+extern "C" {
+    fn clock_gettime_nsec_np(clock: i32) -> u64;
+}
+
+fn clock_ms() -> i64 {
+    // SAFETY: a libc clock read.
+    unsafe { (clock_gettime_nsec_np(8) / 1000000) as i64 }
+}
+
+fn is_resize(e: Event) -> bool {
+    match e {
+        Event::Resize(_, _) => true,
+        _ => false,
+    }
+}
+
+fn is_frame(e: Event) -> bool {
+    match e {
+        Event::Frame(_) => true,
+        _ => false,
+    }
+}
+
+fn is_key(e: Event) -> bool {
+    match e {
+        Event::Key(k) => k.pressed,
+        _ => false,
+    }
+}
+
+fn is_key_any(e: Event) -> bool {
+    match e {
+        Event::Key(_) => true,
+        _ => false,
+    }
+}
+
+fn is_text(e: Event) -> bool {
+    match e {
+        Event::Text(_) => true,
+        _ => false,
+    }
+}
+
+fn is_preedit(e: Event) -> bool {
+    match e {
+        Event::Preedit(_) => true,
+        _ => false,
+    }
+}
+
+fn is_mouse_press(e: Event) -> bool {
+    match e {
+        Event::Mouse(m) => m.action == MouseAction::Press,
+        _ => false,
+    }
+}
+
+fn is_scroll(e: Event) -> bool {
+    match e {
+        Event::Scroll(_) => true,
+        _ => false,
+    }
+}
+
+fn is_readable(e: Event) -> bool {
+    match e {
+        Event::Readable(_) => true,
+        _ => false,
+    }
+}
+
+fn is_close(e: Event) -> bool {
+    match e {
+        Event::Close(_) => true,
+        _ => false,
+    }
+}
+
+fn is_quit(e: Event) -> bool {
+    match e {
+        Event::Quit => true,
+        _ => false,
+    }
+}
+
+fn is_any(e: Event) -> bool {
+    true
+}
+
+// A key event as the hardware would make it, sent to the window.
+fn send_key(w: inout Window, down: bool, code: u16, chars: [u8], plain: [u8], flags: u64) {
+    // SAFETY: +[NSEvent keyEventWithType:location:modifierFlags:timestamp:
+    // windowNumber:context:characters:charactersIgnoringModifiers:
+    // isARepeat:keyCode:] with its types; -[NSWindow sendEvent:]
+    // dispatches it to the first responder, our view. The event and
+    // strings are autoreleased in the pool around.
+    unsafe {
+        let p = pool_push();
+        let num = msg_i(w.ns.win, sel(c"windowNumber"));
+        let ev = msg_p_utudipppbh(class(c"NSEvent"),
+            sel(c"keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:"),
+            if down { 10 } else { 11 }, Point { x: 0.0, y: 0.0 }, flags, 0.0, num, 0 as *u8,
+            nsstring(chars), nsstring(plain), false, code);
+        msg_v_p(w.ns.win, sel(c"sendEvent:"), ev);
+        pool_pop(p);
+    }
+}
+
+// A left-button press at (x, y) points from the content's bottom-left
+// (AppKit's window coordinates).
+fn send_click(w: inout Window, x: f64, y: f64) {
+    // SAFETY: +[NSEvent mouseEventWithType:location:modifierFlags:
+    // timestamp:windowNumber:context:eventNumber:clickCount:pressure:].
+    unsafe {
+        let p = pool_push();
+        let num = msg_i(w.ns.win, sel(c"windowNumber"));
+        let ev = msg_p_utudipiif(class(c"NSEvent"),
+            sel(c"mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:"),
+            1, Point { x: x, y: y }, 0, 0.0, num, 0 as *u8, 0, 1, 1.0);
+        msg_v_p(w.ns.win, sel(c"sendEvent:"), ev);
+        pool_pop(p);
+    }
+}
+
+// The renderer's grid for the display test and the demo.
+struct Screen {
+    lines: i64,
+    cols: i64,
+    cells: Vec<Cell>,
+    dirty: Vec<bool>,
+    all: bool,
+}
+
+impl Screen {
+    fn new_in(lines: i64, cols: i64, gpa: Gpa) -> Screen {
+        var s = Screen {
+            lines: lines, cols: cols, cells: Vec::new_in(gpa),
+            dirty: Vec::filled_in(lines, true, gpa),
+            all: true
+        };
+        for _ in 0..lines * cols {
+            s.cells.push(cell(32, named(DEFAULT_FG), named(DEFAULT_BG), 0));
+        }
+        s
+    }
+
+    fn free(inout self) {
+        self.cells.free();
+        self.dirty.free();
+    }
+
+    fn put(inout self, l: i64, x: i64, c: u32, fg: u32) {
+        if l >= 0 && l < self.lines && x >= 0 && x < self.cols {
+            self.cells[l * self.cols + x] = cell(c, fg, named(DEFAULT_BG), 0);
+            self.dirty[l] = true;
+        }
+    }
+
+    fn text(inout self, l: i64, x: i64, s: [u8], fg: u32) {
+        for i in 0..s.len {
+            self.put(l, x + i, s[i] as u32, fg);
+        }
+    }
+
+    // Sizes to lines × cols, keeping what fits.
+    fn resize(inout self, lines: i64, cols: i64, gpa: Gpa) {
+        if lines == self.lines && cols == self.cols {
+            return;
+        }
+        var n = Screen::new_in(lines, cols, gpa);
+        for l in 0..lines {
+            for x in 0..cols {
+                if l < self.lines && x < self.cols {
+                    n.cells[l * cols + x] = self.cells[l * self.cols + x];
+                }
+            }
+        }
+        self.free();
+        self = n;
+    }
+}
+
+impl CellGrid for Screen {
+    fn lines(self) -> i64 {
+        self.lines
+    }
+
+    fn cols(self) -> i64 {
+        self.cols
+    }
+
+    fn row(self, l: i64) -> [Cell] {
+        self.cells[l * self.cols..(l + 1) * self.cols]
+    }
+
+    fn damaged(self, l: i64) -> bool {
+        self.dirty[l]
+    }
+
+    fn damage_all(self) -> bool {
+        self.all
+    }
+
+    fn scrolled(self) -> i64 {
+        0
+    }
+
+    fn reset_damage(inout self) {
+        for l in 0..self.lines {
+            self.dirty[l] = false;
+        }
+        self.all = false;
+    }
+}
+
+// Draws the screen into the surface's next frame and presents it.
+fn present(r: inout Renderer, s: inout Screen, surf: inout Surface) -> bool {
+    r.update(&s);
+    match surf.frame() {
+        Err(_) => false,
+        Ok(f) => {
+            let view = f.texture.view();
+            r.render(view);
+            f.present(&r.queue);
+            true
+        }
+    }
+}
+
+// The window's surface on the renderer's device, w × h pixels.
+fn surface(r: Renderer, win: Window, w: i64, h: i64, gpa: Gpa) -> Option<Surface> {
+    let inst = std::gpu::Instance::new_in(gpa);
+    match inst.surface(r.dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(sf) => {
+            var surf = sf;
+            surf.configure(r.dev, w, h);
+            Some(surf)
+        }
+        Err(_) => None,
+    }
+}
+
+fn cpu_seconds() -> f64 {
+    // struct rusage: ru_utime and ru_stime (timevals of i64 seconds and
+    // i32 microseconds, padded to 16 bytes) first, then 14 longs.
+    var ru: [i64; 18] = [0; 18];
+    // SAFETY: getrusage writes one struct rusage (144 bytes) into the
+    // 144-byte array.
+    unsafe { getrusage(0, &ru as *u8); }
+    let us = (ru[1] & 0xFFFFFFFF) + (ru[3] & 0xFFFFFFFF);
+    (ru[0] + ru[2]) as f64 + us as f64 / 1000000.0
+}
+
+fn test_display(t: T, gpa: Gpa) {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            t.check("app_new", false, "NSApplication failed with a display");
+            return;
+        }
+    };
+    let desc = WindowDesc::new("tachyon window test", 400, 300);
+    var win = match app.window(desc) {
+        Ok(w) => w,
+        Err(_) => {
+            t.check("window_open", false, "NSWindow");
+            return;
+        }
+    };
+    var other = 0;
+    // The first size: the content in physical pixels.
+    match wait_for(&app, 2000, is_resize, &other) {
+        Some(Event::Resize(id, s)) => {
+            t.check("window_first_size", id.eq(win.id) && s.w == (400.0 * s.scale) as i64
+                && s.h == (300.0 * s.scale) as i64 && s.scale >= 1.0, f"{s.w}x{s.h} at {s.scale}");
+        }
+        _ => t.check("window_first_size", false, "no Resize"),
+    }
+
+    // Frames come only when asked for.
+    let t0 = clock_ms();
+    win.request_frame();
+    let f = wait_for(&app, 1000, is_frame, &other);
+    let dt = clock_ms() - t0;
+    t.check("frame_on_request", f.is_some(), f"no Frame in {dt} ms");
+    let none = wait_for(&app, 150, is_frame, &other);
+    t.check("frame_not_unasked", none.is_none(), "a Frame without request_frame");
+
+    // The window's surface presents the renderer's grid (std::gpu).
+    let sz = win.size();
+    match Renderer::new_in("Menlo", 13.0, sz.scale, Format::Bgra8Unorm, gpa) {
+        Err(e) => t.check("layer_present", false, e.as_slice()),
+        Ok(rr) => {
+            var r = rr;
+            match surface(r, win, sz.w, sz.h, gpa) {
+                None => t.check("layer_present", false, "no surface for the window's layer"),
+                Some(sf) => {
+                    var surf = sf;
+                    var s = Screen::new_in(sz.h / r.cell_h(), sz.w / r.cell_w(), gpa);
+                    s.text(0, 0, "tachyon: std::window on Cocoa", named(2));
+                    s.text(1, 0, "one instanced draw per frame", named(DEFAULT_FG));
+                    r.set_cursor(CursorView { line: 2, col: 0, shape: CURSOR_BLOCK });
+                    var shown = 0;
+                    for _ in 0..3 {
+                        win.request_frame();
+                        if wait_for(&app, 1000, is_frame, &other).is_some()
+                            && present(&r, &s, &surf) {
+                            shown += 1;
+                        }
+                    }
+                    r.wait_idle();
+                    t.check("layer_present", shown == 3, f"{shown} of 3 frames presented");
+                }
+            }
+        }
+    }
+
+    // Keys: a letter (a Key, then its Text), Return (no text), Control-C
+    // (no text), a release, a modifier.
+    send_key(&win, true, 0x00, "a", "a", 0);
+    match wait_for(&app, 500, is_key, &other) {
+        Some(Event::Key(k)) => t.check("key_letter",
+            k.code == KeyCode::KeyA && k.pressed && k.text_follows && !k.ime
+                && match k.key {
+                Logical::Char(c) => c == 'a' as u32,
+                _ => false,
+            }, "KeyA"),
+        _ => t.check("key_letter", false, "no Key"),
+    }
+    match wait_for(&app, 500, is_text, &other) {
+        Some(Event::Text(x)) => t.check("key_letter_text", x.bytes[0..x.len as i64] == "a",
+            x.bytes[0..x.len as i64]),
+        _ => t.check("key_letter_text", false, "no Text"),
+    }
+    send_key(&win, true, 0x24, "\r", "\r", 0);
+    match wait_for(&app, 500, is_key, &other) {
+        Some(Event::Key(k)) => t.check("key_return",
+            k.code == KeyCode::Enter && !k.text_follows && match k.key {
+                Logical::Named(Named::Enter) => true,
+                _ => false,
+            }, "Enter"),
+        _ => t.check("key_return", false, "no Key"),
+    }
+    send_key(&win, true, 0x08, "\x03", "c", (1 << 18) | 0x01);
+    match wait_for(&app, 500, is_key, &other) {
+        Some(Event::Key(k)) => t.check("key_ctrl_c",
+            k.code == KeyCode::KeyC && k.mods.ctrl() && !k.text_follows,
+            f"text_follows {k.text_follows}"),
+        _ => t.check("key_ctrl_c", false, "no Key"),
+    }
+    send_key(&win, false, 0x00, "a", "a", 0);
+    match wait_for(&app, 500, is_key_any, &other) {
+        Some(Event::Key(k)) => t.check("key_release", k.code == KeyCode::KeyA && !k.pressed,
+            "KeyA up"),
+        _ => t.check("key_release", false, "no Key"),
+    }
+    // Shift-Option-e on a US layout: Option composes (a dead key) and
+    // Shift-letter text arrives as one more Key and Text.
+    send_key(&win, true, 0x0E, "E", "e", 1 << 17);
+    match wait_for(&app, 500, is_text, &other) {
+        Some(Event::Text(x)) => t.check("key_shift_text", x.bytes[0..x.len as i64] == "E",
+            x.bytes[0..x.len as i64]),
+        _ => t.check("key_shift_text", false, "no Text"),
+    }
+
+    // The input method: a composition, then its commit.
+    // SAFETY: the NSTextInputClient methods of our view, called as an
+    // input method calls them (NSString, NSRange by value).
+    unsafe {
+        let p = pool_push();
+        msg_v_pgg(win.ns.view, sel(c"setMarkedText:selectedRange:replacementRange:"),
+            nsstring("\xe3\x81\xab\xe3\x81\xbb"), Range { loc: 1, len: 0 },
+            Range { loc: 0x7fffffffffffffff, len: 0 });
+        pool_pop(p);
+    }
+    match wait_for(&app, 500, is_preedit, &other) {
+        Some(Event::Preedit(pe)) => t.check("ime_preedit", pe.len == 6 && pe.cursor == 3
+            && app.preedit() == "\xe3\x81\xab\xe3\x81\xbb", f"len {pe.len} cursor {pe.cursor}"),
+        _ => t.check("ime_preedit", false, "no Preedit"),
+    }
+    // SAFETY: as above.
+    let has = unsafe { msg_b(win.ns.view, sel(c"hasMarkedText")) };
+    t.check("ime_has_marked", has, "hasMarkedText");
+    win.set_ime_area(20.0, 40.0, 10.0, 30.0);
+    // SAFETY: firstRectForCharacterRange:actualRange: returns an NSRect.
+    let rect = unsafe {
+        var act = Range { loc: 0, len: 0 };
+        msg_r_gP(win.ns.view, sel(c"firstRectForCharacterRange:actualRange:"),
+            Range { loc: 0, len: 1 }, &act)
+    };
+    t.check("ime_rect", rect.h > 1.0 && rect.w > 1.0, f"{rect.x},{rect.y} {rect.w}x{rect.h}");
+    // SAFETY: as above.
+    unsafe {
+        let p = pool_push();
+        msg_v_pg(win.ns.view, sel(c"insertText:replacementRange:"),
+            nsstring("\xe6\x97\xa5\xe6\x9c\xac"), Range { loc: 0x7fffffffffffffff, len: 0 });
+        pool_pop(p);
+    }
+    var ended = false;
+    var committed = false;
+    for _ in 0..2 {
+        match wait_for(&app, 500, is_any, &other) {
+            Some(Event::Preedit(pe)) => ended = pe.len == 0,
+            Some(Event::Text(x)) => committed = x.bytes[0..x.len as i64]
+                == "\xe6\x97\xa5\xe6\x9c\xac",
+            _ => {}
+        }
+    }
+    t.check("ime_commit", ended && committed, f"ended {ended}, committed {committed}");
+
+    // The mouse: a press at (100, 100) points from the bottom-left is at
+    // (100, 200) from the top-left of a 300-point-high view.
+    send_click(&win, 100.0, 100.0);
+    match wait_for(&app, 500, is_mouse_press, &other) {
+        Some(Event::Mouse(m)) => {
+            let s = win.size().scale;
+            t.check("mouse_press",
+                m.button == Button::Left && m.clicks == 1 && m.x == 100.0 * s && m.y == 200.0 * s,
+                f"at {m.x},{m.y} clicks {m.clicks}");
+        }
+        _ => t.check("mouse_press", false, "no Mouse"),
+    }
+
+    // A wheel: 3 lines up, not precise. (Given to the view directly: the
+    // window would route it by the pointer's position.)
+    // SAFETY: CGEventCreateScrollWheelEvent2 (the non-variadic form)
+    // returns +1, released after +[NSEvent eventWithCGEvent:] (+0, in
+    // the pool) has copied it; scrollWheel: takes the NSEvent.
+    unsafe {
+        let p = pool_push();
+        let cg = CGEventCreateScrollWheelEvent2(0 as *u8, 1, 1, 3, 0, 0);
+        let ev = msg_p_p(class(c"NSEvent"), sel(c"eventWithCGEvent:"), cg);
+        msg_v_p(win.ns.view, sel(c"scrollWheel:"), ev);
+        CFRelease(cg);
+        pool_pop(p);
+    }
+    match wait_for(&app, 500, is_scroll, &other) {
+        Some(Event::Scroll(sc)) => t.check("scroll_lines",
+            !sc.precise && sc.dy > 0.0 && sc.dx == 0.0, f"dy {sc.dy} precise {sc.precise}"),
+        _ => t.check("scroll_lines", false, "no Scroll"),
+    }
+    win.set_cursor(std::window::CursorIcon::Arrow);
+    win.set_cursor(std::window::CursorIcon::Text);
+
+    // A resize: the new size arrives, and the layer follows.
+    // SAFETY: setContentSize: takes an NSSize.
+    unsafe { msg_v_z(win.ns.win, sel(c"setContentSize:"), NsSize { w: 500.0, h: 360.0 }); }
+    match wait_for(&app, 1000, is_resize, &other) {
+        Some(Event::Resize(_, s)) => t.check("resize", s.w == (500.0 * s.scale) as i64
+            && s.h == (360.0 * s.scale) as i64, f"{s.w}x{s.h}"),
+        _ => t.check("resize", false, "no Resize"),
+    }
+
+    // The clipboard, restored afterwards; the paste is read into a
+    // ScopedArena, as a frame would (it is sent to the pty and forgotten).
+    let saved = app.clipboard_get_in(gpa);
+    app.clipboard_set("tachyon clipboard \xe2\x9c\x93");
+    let pasted = arena_scope(gpa, |a| {
+        match app.clipboard_get_in(a) {
+            Some(b) => b.as_slice() == "tachyon clipboard \xe2\x9c\x93",
+            None => false,
+        }
+    });
+    t.check("clipboard", pasted, "the clipboard did not round-trip");
+    match saved {
+        Some(b) => app.clipboard_set(b.as_slice()),
+        None => {}
+    }
+
+    // Event batches allocate nothing once the queue has its working size:
+    // 50 keys, each a Key and a Text, delivered and drained.
+    let a0 = count::allocs();
+    var got = 0;
+    for _ in 0..50 {
+        send_key(&win, true, 0x00, "a", "a", 0);
+        loop {
+            match app.poll() {
+                Some(Event::Text(_)) => got += 1,
+                Some(_) => {}
+                None => break,
+            }
+        }
+    }
+    let n = count::allocs() - a0;
+    t.check("events_no_allocations", n == 0 && got == 50, f"{n} allocations for {got} keys");
+    println(f"bench event_allocations: {n} in 50 key batches");
+
+    // A watched pipe.
+    var fds: [i32; 2] = [0, 0];
+    // SAFETY: pipe writes two fds into the array.
+    unsafe { pipe(&fds as *i32); }
+    t.check("watch_add", app.watch(fds[0]), "CFFileDescriptor");
+    let quiet = wait_for(&app, 100, is_readable, &other);
+    t.check("watch_quiet", quiet.is_none(), "Readable before any write");
+    // SAFETY: write and read one byte through the pipe's fds.
+    unsafe { write(fds[1], c"x", 1); }
+    match wait_for(&app, 1000, is_readable, &other) {
+        Some(Event::Readable(fd)) => t.check("watch_readable", fd == fds[0], f"fd {fd}"),
+        _ => t.check("watch_readable", false, "no Readable"),
+    }
+    var byte: [u8; 4] = [0; 4];
+    // SAFETY: reads at most 4 bytes into the array.
+    unsafe { read(fds[0], &byte as *u8, 4); }
+    let drained = wait_for(&app, 100, is_readable, &other);
+    t.check("watch_drained", drained.is_none(), "Readable after the data was read");
+    app.unwatch(fds[0]);
+    // SAFETY: closes the pipe's fds.
+    unsafe {
+        close(fds[0]);
+        close(fds[1]);
+    }
+
+    // Idle: nothing requested, nothing happens, no CPU.
+    let c0 = cpu_seconds();
+    let idle = wait_for(&app, 1000, is_frame, &other);
+    let used = cpu_seconds() - c0;
+    t.check("idle", idle.is_none() && used < 0.02, f"{used} s of CPU in 1 s idle");
+    println(f"bench idle_cpu: {used * 1000.0} ms of CPU in 1 s");
+
+    // Close asks; the window stays until dropped.
+    // SAFETY: performClose: takes a sender (nil).
+    unsafe { msg_v_p(win.ns.win, sel(c"performClose:"), 0 as *u8); }
+    match wait_for(&app, 1000, is_close, &other) {
+        Some(Event::Close(id)) => t.check("close_request", id.eq(win.id), "Close"),
+        _ => t.check("close_request", false, "no Close"),
+    }
+    // Quit from the menu.
+    // SAFETY: the main menu built by the App: item 0's submenu has Quit
+    // at index 0.
+    unsafe {
+        let bar = msg_p(msg_p(class(c"NSApplication"), sel(c"sharedApplication")),
+            sel(c"mainMenu"));
+        let menu = msg_p(msg_p_u(bar, sel(c"itemAtIndex:"), 0), sel(c"submenu"));
+        msg_p_u(menu, sel(c"performActionForItemAtIndex:"), 0);
+    }
+    t.check("quit", wait_for(&app, 1000, is_quit, &other).is_some(), "no Quit");
+    let _ = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+    let _ = WindowId { n: 0 };
+}
+
+// ---- the demo -----------------------------------------------------------
+
+fn demo(gpa: Gpa) -> i32 {
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            println("no display");
+            return 1;
+        }
+    };
+    let desc = WindowDesc::new("tachyon", 720, 420);
+    var win = app.window(desc).unwrap();
+    let sz = win.size();
+    var r = match Renderer::new_in("Menlo", 14.0, sz.scale, Format::Bgra8Unorm, gpa) {
+        Ok(r) => r,
+        Err(e) => {
+            println(e.as_slice());
+            return 1;
+        }
+    };
+    var surf = match surface(r, win, sz.w, sz.h, gpa) {
+        Some(sf) => sf,
+        None => {
+            println("no surface");
+            return 1;
+        }
+    };
+    var s = Screen::new_in(sz.h / r.cell_h(), sz.w / r.cell_w(), gpa);
+    s.text(0, 0, "tachyon window demo: type; Return for a new line; Command-Q quits", named(2));
+    var line = 2;
+    var col = 0;
+    r.set_cursor(CursorView { line: line, col: col, shape: CURSOR_BEAM });
+    win.request_frame();
+    loop {
+        match app.wait() {
+            Ok(Event::Frame(_)) => {
+                present(&r, &s, &surf);
+            }
+            Ok(Event::Text(x)) => {
+                let b = x.bytes[0..x.len as i64];
+                var i = 0;
+                while i < b.len {
+                    let n = if b[i] >= 0xF0 { 4 } else if b[i] >= 0xE0 { 3 }
+                        else if b[i] >= 0xC0 { 2 } else { 1 };
+                    let c = first_char(b[i..b.len]);
+                    s.put(line, col, c, named(DEFAULT_FG));
+                    col += 1;
+                    i += n;
+                }
+                r.set_cursor(CursorView { line: line, col: col, shape: CURSOR_BEAM });
+                win.request_frame();
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && k.code == KeyCode::Enter && !k.ime {
+                    line += 1;
+                    col = 0;
+                } else if k.pressed && k.code == KeyCode::Backspace && !k.ime && col > 0 {
+                    col -= 1;
+                    s.put(line, col, 32, named(DEFAULT_FG));
+                }
+                r.set_cursor(CursorView { line: line, col: col, shape: CURSOR_BEAM });
+                win.request_frame();
+            }
+            Ok(Event::Resize(_, z)) => {
+                surf.configure(r.dev, z.w, z.h);
+                s.resize(z.h / r.cell_h(), z.w / r.cell_w(), gpa);
+                s.all = true;
+                win.request_frame();
+            }
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+    }
+    0
+}
+
+fn main(argc: i64, argv: **u8, gpa: Gpa) -> i32 {
+    // SAFETY: argv holds argc NUL-terminated strings.
+    let mode = if argc > 1 { unsafe { render::objc::cstr(argv[1]) } } else { "test" };
+    if mode == "demo" {
+        return demo(gpa);
+    }
+    var t = T { failed: 0 };
+    test_keys(t);
+    // SAFETY: getenv with a literal; read only when not null.
+    let no_display = unsafe {
+        let p = getenv(c"TACHYON_NO_DISPLAY_TESTS");
+        p != 0 as *u8 && p[0] == '1'
+    };
+    if no_display || !std::window::cocoa::has_display() {
+        println("skip display: no window server (NEEDS: display)");
+    } else {
+        test_display(t, gpa);
+    }
+    if t.failed > 0 { 1 } else { 0 }
+}

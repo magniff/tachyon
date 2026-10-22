@@ -54,6 +54,7 @@ that they print what the README says, errors and traps included.
 | [md5](md5/) | the MD5 digest of a file or stdin | arrays, wrapping `u32`, a streaming hash, `defer`, hex specs |
 | [life](life/) | Conway's Game of Life in the terminal | `#[repr(C)]`, `ioctl`, `Vec` handles, ANSI colour through `Buf` |
 | [httpd](httpd/) | an HTTP file server (`python -m http.server`) | sockets and `readdir` declared by hand, Linux and macOS layouts, modules, `defer` |
+| [voltty](voltty/) | a terminal emulator's core, headless: escape-sequence parser, scrollback, reflow, input encoders, a pty; checked against alacritty_terminal | generic `Perform` dispatch, a ring of 16-byte cells, `std::sys` pty, `std::unicode` widths, a Rust oracle |
 | [c-qsort](c-qsort/) | libc `qsort`/`bsearch` over `#[repr(C)]` structs with tachyon callbacks, a generic `c_sort<T>` | `import "stdlib.h"`, `extern "C" fn`, `#[repr(C)]`, `unsafe fn`, `size_of` |
 | [c-libc-tour](c-libc-tour/) | `getenv`/`setenv`, `gmtime`/`localtime`/`strftime`/`mktime`, `mkdtemp`/`opendir`/`readdir`/`stat`: a small `ls -l` | system headers as `c`, C structs and constants, C strings, `defer`, `Option` at the boundary |
 | [c-math](c-math/) | libm, and Simpson, adaptive Simpson, bisection and Newton checked against `erf`/`tgamma`/`cbrt` | `import "math.h"`, out-parameters, closures and `Fn`/`FnMut` generics, float specs, linking `-lm` |

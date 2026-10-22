@@ -402,8 +402,17 @@ starts another.
   - Three frames in flight, each with its own uniforms. The instance
     ring is double-buffered per frame in flight, on dirty rows only.
 - **The shader is `cells.wgsl`,** translated by `std::gpu::wgsl` (0.22),
-  so the terminal exercises the translator on both backends. Until G5
-  lands, a hand-written MSL equivalent is used in render tests.
+  so the terminal exercises the translator on both backends. *As built
+  (0.23):* examples/voltty/render draws through std::gpu (device, queue,
+  a surface's frames, storage buffers for the instances and the atlas
+  table, the two atlas pages as textures) with `dev.shader_wgsl` on
+  render/cells.wgsl (render/cells.tach holds its text, written by
+  render/embed.sh until include_str); the hand-written MSL and the Metal
+  shim are gone. With one queue that orders writes (gpu.md §2.11) the
+  three per-frame instance buffers became one: a frame writes the
+  changed rows, a run at a time, and the uniforms with `write_buffer`;
+  glyphs go into CPU copies of the pages and are written once a frame
+  (`Atlas::flush`). std::gpu's surface keeps three drawables, not two.
 - **Presentation** uses `maximumDrawableCount = 2` and display sync on,
   for the lowest latency without tearing.
 

@@ -49,6 +49,9 @@
 # edits the same as clean builds, 0.18.1);
 # stress-grow (the compiler with every table growth moving, 0.14);
 # examples-checkalloc (every example's test built with --check-alloc, 0.16);
+# voltty-fuzz (tests/voltty/run.sh -s 60: the terminal's core against
+# alacritty_terminal, 60 s of the differential fuzzer, 0.23; skipped
+# without cargo);
 # compile-cost (tests/compile_cost.sh: the instructions of a hello world,
 # a std-heavy program and `check` of compiler/src against the previous
 # release's, 0.21.1: fails above 1.5x, 1.5x and 1.15x);
@@ -177,13 +180,13 @@ esac
 
 FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-seed"
 ABI_STEPS="abi-plain abi-import abi-header"
-HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compile-cost"
+HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc voltty-fuzz compile-cost"
 LINUX_STEPS="linux-x86_64 linux-aarch64"
 # (steps only --only names: valgrind runs in the linux-aarch64 container)
 OTHER_STEPS="valgrind"
 [ "$X86" = 1 ] || LINUX_STEPS="linux-aarch64"
 case "$MODE" in
-    quick) STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch compile-cost" ;;
+    quick) STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz compile-cost" ;;
     *) STEPS="$HOST_STEPS"; [ $LINUX -eq 1 ] && STEPS="$STEPS $LINUX_STEPS" ;;
 esac
 if [ -n "$ONLY" ]; then
@@ -249,12 +252,16 @@ done
 TACHYON_JOBSERVER="$RUN/jobs"
 export TACHYON_JOBSERVER
 
+# (0.21, for 0.24's rename) The compiler's name and root at HEAD, from
+# bootstrap/releases.toml's [head].
+HEAD_BIN=$(sh "$ROOT/bootstrap/release-tags.sh" --head bin)
+HEAD_ROOT="$ROOT/$(sh "$ROOT/bootstrap/release-tags.sh" --head compiler)/$(sh "$ROOT/bootstrap/release-tags.sh" --head root)"
 if [ -n "$COMPILER" ]; then
     case "$COMPILER" in /*) ;; *) COMPILER="$(pwd)/$COMPILER" ;; esac
     [ -x "$COMPILER" ] || die "no compiler at $COMPILER"
-    cp "$COMPILER" "$RUN/tachyonc"
+    cp "$COMPILER" "$RUN/$HEAD_BIN"
 fi
-C="$RUN/tachyonc"
+C="$RUN/$HEAD_BIN"
 
 # The bootstrap caches: this checkout's, then the shared one (bootstrap.sh:
 # $TACHYON_BOOTSTRAP_CACHE, or the main checkout's in a linked worktree).
@@ -276,16 +283,17 @@ find_seed() {
 }
 
 # The newest release built here (for bench/run.sh -p), in the order of
-# releases.toml.
+# releases.toml; (0.21) each by its compiler's name.
 find_previous() {
     fp=""
-    for tag in $(sh "$ROOT/bootstrap/release-tags.sh"); do
+    sh "$ROOT/bootstrap/release-tags.sh" --bins >"$RUN/release-bins"
+    while read -r tag bin; do
         for b in $BOOT_CACHES; do
-            for p in "$b"/"$HOST"/"$tag"-*/tachyonc; do
+            for p in "$b"/"$HOST"/"$tag"-*/"$bin"; do
                 [ -x "$p" ] && { fp=$p; break 2; }
             done
         done
-    done
+    done <"$RUN/release-bins"
     echo "$fp"
 }
 
@@ -314,7 +322,7 @@ run_step() {
     case "$1" in
         chain)
             sh "$ROOT/bootstrap/bootstrap.sh" --dev --no-head-tests --history "$HISTORY" </dev/null \
-                && cp "$ROOT/target/tachyonc" "$C" ;;
+                && cp "$ROOT/target/$HEAD_BIN" "$C" ;;
         suite-O2)
             TACHYON_CODE_CACHE=on TACHYON_CACHE="$RUN/code-cache" sh "$ROOT/tests/run.sh" -c "$C" -O 2
             st=$?
@@ -352,6 +360,7 @@ run_step() {
         debug) sh "$ROOT/tests/debug.sh" -c "$C" ;;
         threads) sh "$ROOT/tests/threads_writes.sh" -c "$C" && sh "$ROOT/tests/threads.sh" -c "$C" ;;
         incremental) sh "$ROOT/tests/incremental.sh" -c "$C" ;;
+        voltty-fuzz) sh "$ROOT/tests/voltty/run.sh" -c "$C" -s 60 -k "$k" ;;
         stress-grow)
             # (0.14) The compiler with TACHYON_STRESS_GROW=1 (base::grow):
             # every growth of its tables moves them and poisons the old
@@ -360,8 +369,8 @@ run_step() {
             # passes at -O0 and -O2.
             o="$RUN/stress-grow"
             mkdir -p "$o"
-            "$C" "$ROOT/compiler/src/main.tach" -o "$o/plain.o" || return 1
-            TACHYON_STRESS_GROW=1 "$C" "$ROOT/compiler/src/main.tach" -o "$o/stress.o" || return 1
+            "$C" "$HEAD_ROOT" -o "$o/plain.o" || return 1
+            TACHYON_STRESS_GROW=1 "$C" "$HEAD_ROOT" -o "$o/stress.o" || return 1
             cmp -s "$o/plain.o" "$o/stress.o" \
                 || { echo "stress-grow: the self-compile differs: $o/plain.o $o/stress.o"; return 1; }
             for level in 0 2; do
@@ -542,6 +551,7 @@ note_of() {
         suite-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed\n", $2, $3, $4 }' "$l" ;;
         fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind)
             grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind):' "$l" | tail -1 ;;
+        voltty-fuzz) grep -E '^(pass|FAIL|skip) oracle' "$l" | tail -1 ;;
         compile-cost) awk '$2 ~ /^[0-9.]+$/ && $3 == "M" { printf "%s%s %s M %s", sep, $1, $2, $8; sep = ", " } END { print "" }' "$l" ;;
         linux-*) grep '^gate-row' "$l" | awk -F'\t' '$3 != "pass" && $3 != "skip" { bad = bad " " $2 } END { n = NR; print n " steps in the container" (bad == "" ? "" : "; failed:" bad) }' ;;
         bench) grep '^geomean' "$l" | tail -1 ;;
@@ -582,7 +592,7 @@ for s in $([ $CHAIN -eq 1 ] && echo chain) $STEPS $([ $BENCH -eq 1 ] && echo ben
     [ -f "$l" ] || { echo "    not run (the chain failed)"; continue; }
     case "$s" in
         suite-*|examples-checkalloc) awk '/^tests for / { exit } { print }' "$l" | head -60 ;;
-        fuzz-*|abi-*|objcheck|objcheck-*|threads|incremental) grep -E '^FAIL' "$l" | head -20; [ -d "$RUN/failures/$s" ] && echo "    kept in $RUN/failures/$s" ;;
+        fuzz-*|abi-*|objcheck|objcheck-*|threads|incremental|voltty-fuzz) grep -E '^FAIL' "$l" | head -20; [ -d "$RUN/failures/$s" ] && echo "    kept in $RUN/failures/$s" ;;
         compile-cost) cat "$l" ;;
         linux-*) awk '/^--- / { p = 1 } p' "$l" | head -80; grep -q '^--- ' "$l" || tail -30 "$l" ;;
         *) tail -30 "$l" ;;

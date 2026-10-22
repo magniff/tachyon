@@ -1,6 +1,6 @@
-// The terminal's shader (docs/design/terminal.md §3.5, the hand-written
-// MSL of examples/term/render/shader.tach as WGSL): its vertex stage, run
-// alone for random instances (out-of-range ones read zero from the
+// The terminal's shader (docs/design/terminal.md §3.5,
+// examples/voltty/render/cells.wgsl): its vertex stage, run alone for
+// random instances (out-of-range ones read zero from the
 // runtime-sized arrays). cells_fs.wgsl is the same file's fragment stage.
 // (Metal divides within 2.5 ULP:)
 // ULP: 2

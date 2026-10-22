@@ -210,7 +210,20 @@ case noalloc in
         out=$("$COMPILER" query effects --has 'alloc(Gpa)' "$f" --root "$WORK/noalloc.tach" 2>&1)
         case "$out" in
             *query.empty*) ;;
-            *) echo "$f allocates from Gpa: $out" >>"$why" ;;
+            *)
+                # (0.23) an allocation that comes only through a call of
+                # unknown C is the analysis's: such a call may run any
+                # address-taken `extern "C" fn` of the program, and
+                # std::window's Cocoa callbacks queue events (query loads
+                # all of std; an implicit drop's call is not shown: "no
+                # source found"). The gpu path itself must not allocate.
+                chain=$("$COMPILER" query effects "$f" --root "$WORK/noalloc.tach" --why 'alloc(Gpa)' 2>&1)
+                last=$(printf '%s\n' "$chain" | tail -1)
+                case "$last" in
+                    *"calls C's"*|*"(no source found)"*) ;;
+                    *) echo "$f allocates from Gpa: $out" >>"$why"
+                       printf '%s\n' "$chain" | sed 's/^/    /' >>"$why" ;;
+                esac ;;
         esac
     done
     # (and the query sees what does allocate: shader creation copies names)

@@ -1,0 +1,612 @@
+// Text edits of a tree's files, vole sources or not (0.21, for 0.24's
+// rename; docs/refactor.md "Renaming the language"): `rewrite --text OLD
+// NEW` (rewrite) and `refactor extension OLD NEW` (extension). The files
+// are git's (`git ls-files`), less an exclusion list: whole files, or the
+// lines of a file a regular expression picks, or ranges of lines. In a
+// vole source a match can be limited to its comments, strings or code
+// (places: the lexer's tokens). The edit is written as the engine writes
+// one (a copy next to each file, renamed onto it), files are moved as
+// `git mv` moves them (the index's entries, then the files), and it is
+// journaled for `undo` (edit/undo: kind 3, a moved file).
+//
+// This file holds the options, the exclusions, the matching, the files,
+// and the writing; the places of a source in places, the build compared
+// before and after a rename in samebuild.
+
+pub mod places;
+pub mod rewrite;
+pub mod extension;
+pub mod samebuild;
+
+use crate::base::{
+    BUFS, IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd,
+};
+use crate::front::cpp::directives::file_exists;
+use crate::tools::edit::remove_empty_dirs;
+use crate::tools::edit::apply::{cannot_write, copy_path, make_parent};
+use crate::tools::edit::undo::journal_moves;
+use crate::tools::proc::{
+    buf_cstr, read_file_if, remove_file, rename_file, run_capture, run_with_stdin, same_bytes,
+    write_file_if,
+};
+use crate::tools::query::c_slice;
+use crate::tools::query::diagnostics::diag;
+use crate::tools::rewrite::regex::{re_find, re_search, re_valid};
+
+// ---- The options of a match ----
+
+// --word: OLD is not part of a longer word of letters and digits (`_`,
+// `.`, `-` end a word: TACHYON_ROOT has the word TACHYON).
+pub static var T_WORD: bool = false;
+// --case: OLD matches in any case, and NEW takes the case of the match
+// (all lower, all upper, or a capital first).
+pub static var T_CASE: bool = false;
+// --regex: OLD is a regular expression (rewrite's: ^ $ . * + ? [a-z] \d
+// \w), matched within a line.
+pub static var T_REGEX: bool = false;
+// The places of a vole source a match may be in: G_CODE | G_COMMENT |
+// G_STRING (query grep's); 0: anywhere.
+pub static var T_PLACES: i64 = 0;
+// Matches whose case NEW could not follow (--case: `TachYon`).
+pub static var MIXED_CASE: i64 = 0;
+
+fn is_alnum(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 'A' && c <= 'Z' { c + 32 } else { c }
+}
+
+fn upper(c: u8) -> u8 {
+    if c >= 'a' && c <= 'z' { c - 32 } else { c }
+}
+
+// Whether text[s..e) is a match of literal old.
+fn literal_at(text: [u8], s: i64, old: [u8]) -> bool {
+    if s + old.len > text.len {
+        return false;
+    }
+    for j in 0..old.len {
+        let a = text[s + j];
+        if a != old[j] && !(T_CASE && lower(a) == lower(old[j])) {
+            return false;
+        }
+    }
+    true
+}
+
+// --word: whether the match text[s..e) has a word boundary where its own
+// ends are letters or digits.
+fn word_ok(text: [u8], s: i64, e: i64) -> bool {
+    if !T_WORD || e <= s {
+        return true;
+    }
+    // (an escape before it ends a word too: `\ntachyon` in a literal)
+    if is_alnum(text[s]) && s > 0 && is_alnum(text[s - 1])
+        && !(s > 1 && text[s - 2] == '\\' && text[s - 1] != 'x') {
+        return false;
+    }
+    if is_alnum(text[e - 1]) && e < text.len && is_alnum(text[e]) {
+        return false;
+    }
+    true
+}
+
+// The matches of old in text[from..to), in order and apart: their starts
+// and ends.
+pub fn find_matches(text: [u8], from: i64, to: i64, old: [u8], starts: inout IntVec,
+    ends: inout IntVec) {
+    if old.len == 0 {
+        return;
+    }
+    if T_REGEX {
+        // (line by line)
+        var a = from;
+        while a < to {
+            var b = a;
+            while b < to && text[b] != '\n' {
+                b += 1;
+            }
+            let line = text[a..b];
+            var at = 0;
+            while at <= line.len {
+                var end = 0;
+                let s = re_find(old, line, at, &end);
+                if s < 0 {
+                    break;
+                }
+                if end > s && word_ok(text, a + s, a + end) {
+                    starts.push(a + s);
+                    ends.push(a + end);
+                    at = end;
+                } else {
+                    at = s + 1;
+                }
+            }
+            a = b + 1;
+        }
+        return;
+    }
+    var i = from;
+    while i + old.len <= to {
+        if literal_at(text, i, old) && word_ok(text, i, i + old.len) {
+            starts.push(i);
+            ends.push(i + old.len);
+            i += old.len;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+// The replacement of match m by new, into buffer out: with --case, in the
+// case of m.
+pub fn put_replacement(out: i64, new: [u8], m: [u8]) {
+    if !T_CASE {
+        buf_bytes(out, new);
+        return;
+    }
+    var letters = 0;
+    var uppers = 0;
+    for j in 0..m.len {
+        if lower(m[j]) != upper(m[j]) {
+            letters += 1;
+            if m[j] == upper(m[j]) {
+                uppers += 1;
+            }
+        }
+    }
+    let first_upper = m.len > 0 && lower(m[0]) != m[0];
+    if letters > 1 && uppers == letters {
+        for j in 0..new.len {
+            buf_byte(out, upper(new[j]));
+        }
+    } else if first_upper && uppers == 1 {
+        for j in 0..new.len {
+            buf_byte(out, if j == 0 { upper(new[j]) } else { new[j] });
+        }
+    } else {
+        if uppers > 0 {
+            unsafe { MIXED_CASE += 1; }
+        }
+        buf_bytes(out, new);
+    }
+}
+
+// ---- Exclusions ----
+//
+// A spec is `GLOB` (the whole file), `GLOB:/RE/` (its lines RE matches)
+// or `GLOB:/A/,/B/` (each range of lines from one A matches to the line
+// before the next one B matches, or to the end). In a GLOB, `*` is any
+// bytes (`/` too) and `?` one; a GLOB ending in `/` is everything under
+// it. `\/` is a `/` in a RE.
+
+static var X_GLOB: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var X_A: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var X_B: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Whether glob g matches path p.
+pub fn glob_match(g: [u8], p: [u8]) -> bool {
+    if g.len > 0 && g[g.len - 1] == '/' {
+        return p.len >= g.len && same_bytes(p[0..g.len], g);
+    }
+    glob_at(g, 0, p, 0)
+}
+
+fn glob_at(g: [u8], i: i64, p: [u8], j: i64) -> bool {
+    if i == g.len {
+        return j == p.len;
+    }
+    if g[i] == '*' {
+        var k = j;
+        while k <= p.len {
+            if glob_at(g, i + 1, p, k) {
+                return true;
+            }
+            k += 1;
+        }
+        return false;
+    }
+    j < p.len && (g[i] == '?' || g[i] == p[j]) && glob_at(g, i + 1, p, j + 1)
+}
+
+// The regular expression of a spec from s[i] (a `/`) to the next
+// unescaped `/`: into a buffer; the index after it, or -1.
+fn take_re(s: [u8], i: i64, out: inout i64) -> i64 {
+    if i >= s.len || s[i] != '/' {
+        return -1;
+    }
+    let b = buf_new();
+    var k = i + 1;
+    while k < s.len && s[k] != '/' {
+        if s[k] == '\\' && k + 1 < s.len {
+            buf_byte(b, s[k]);
+            k += 1;
+        }
+        buf_byte(b, s[k]);
+        k += 1;
+    }
+    if k >= s.len || !re_valid(buf_slice(b)) {
+        return -1;
+    }
+    out = b;
+    k + 1
+}
+
+// Adds exclusion spec s; false (and the diagnostic) when it is malformed.
+pub fn add_exclusion(s: [u8]) -> bool {
+    unsafe {
+        var colon = -1;
+        for k in 0..s.len {
+            if s[k] == ':' && k + 1 < s.len && s[k + 1] == '/' {
+                colon = k;
+                break;
+            }
+        }
+        let g = buf_new();
+        buf_bytes(g, if colon < 0 { s } else { s[0..colon] });
+        var a = -1;
+        var b = -1;
+        if colon >= 0 {
+            var at = take_re(s, colon + 1, &a);
+            if at > 0 && at < s.len {
+                if s[at] != ',' {
+                    at = -1;
+                } else {
+                    at = take_re(s, at + 1, &b);
+                }
+            }
+            if at != s.len {
+                let d = diag(c"error", c"rewrite.exclude");
+                buf_str(d, c"'");
+                buf_bytes(d, s);
+                buf_str(d,
+                    c"' is no exclusion: GLOB, GLOB:/RE/ (its lines) or GLOB:/A/,/B/ (from A to before B)\n");
+                return false;
+            }
+        }
+        X_GLOB.push(g);
+        X_A.push(a);
+        X_B.push(b);
+        true
+    }
+}
+
+// Adds the specs of file path, one a line (`#` starts a comment line);
+// false after the diagnostic.
+pub fn read_exclusions(path: *u8) -> bool {
+    unsafe {
+        let text = buf_new();
+        if !read_file_if(path, text) {
+            let d = diag(c"error", c"rewrite.exclude");
+            buf_str(d, c"cannot read '");
+            buf_str(d, path);
+            buf_str(d, c"'\n");
+            return false;
+        }
+        let t = buf_slice(text);
+        var i = 0;
+        while i < t.len {
+            var e = i;
+            while e < t.len && t[e] != '\n' {
+                e += 1;
+            }
+            var a = i;
+            var z = e;
+            while a < z && (t[a] == ' ' || t[a] == '\t') {
+                a += 1;
+            }
+            while z > a && (t[z - 1] == ' ' || t[z - 1] == '\t' || t[z - 1] == '\r') {
+                z -= 1;
+            }
+            if z > a && t[a] != '#' && !add_exclusion(t[a..z]) {
+                return false;
+            }
+            i = e + 1;
+        }
+        true
+    }
+}
+
+// Whether file p is excluded whole.
+pub fn excluded(p: [u8]) -> bool {
+    unsafe {
+        for k in 0..X_GLOB.count {
+            if X_A.data[k] < 0 && glob_match(buf_slice(X_GLOB.data[k]), p) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// The kept lines of file p with text t: byte ranges (start, end pairs,
+// in order, apart) into out; the number of lines kept.
+pub fn kept_ranges(p: [u8], t: [u8], out: inout IntVec) -> i64 {
+    unsafe {
+        var specs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..X_GLOB.count {
+            if X_A.data[k] >= 0 && glob_match(buf_slice(X_GLOB.data[k]), p) {
+                specs.push(k);
+            }
+        }
+        if specs.count == 0 {
+            return 0;
+        }
+        // Per spec: in a range (until its B), or not.
+        let open = crate::base::alloc_array::<bool>(specs.count);
+        for k in 0..specs.count {
+            open[k] = false;
+        }
+        var lines = 0;
+        var i = 0;
+        while i < t.len {
+            var e = i;
+            while e < t.len && t[e] != '\n' {
+                e += 1;
+            }
+            let line = t[i..e];
+            var keep = false;
+            for k in 0..specs.count {
+                let x = specs.data[k];
+                if open[k] && X_B.data[x] >= 0 && re_search(buf_slice(X_B.data[x]), line) {
+                    open[k] = false;
+                }
+                if !open[k] && re_search(buf_slice(X_A.data[x]), line) {
+                    if X_B.data[x] >= 0 {
+                        open[k] = true;
+                    }
+                    keep = true;
+                }
+                if open[k] {
+                    keep = true;
+                }
+            }
+            if keep {
+                let end = if e < t.len { e + 1 } else { e };
+                if out.count > 0 && out.data[out.count - 1] == i {
+                    out.data[out.count - 1] = end;
+                } else {
+                    out.push(i);
+                    out.push(end);
+                }
+                lines += 1;
+            }
+            i = e + 1;
+        }
+        lines
+    }
+}
+
+// ---- The files ----
+
+// The files git tracks under the current directory (C strings, relative
+// to it), into out; false when git cannot tell (no checkout).
+pub fn tracked_files(out: inout IntVec) -> bool {
+    unsafe {
+        let args = crate::base::alloc_array::<*u8>(5);
+        args[0] = c"git";
+        args[1] = c"ls-files";
+        args[2] = c"-z";
+        args[3] = c"--";
+        args[4] = 0 as *u8;
+        // (stderr goes with stdout: a path never starts with "fatal: ")
+        let listing = buf_new();
+        if run_capture(args, listing) != 0 {
+            return false;
+        }
+        let t = buf_slice(listing);
+        var i = 0;
+        while i < t.len {
+            var e = i;
+            while e < t.len && t[e] != 0 {
+                e += 1;
+            }
+            if e > i {
+                let b = buf_new();
+                buf_bytes(b, t[i..e]);
+                out.push(buf_cstr(b) as i64);
+            }
+            i = e + 1;
+        }
+        true
+    }
+}
+
+// Whether text t is text: no NUL byte.
+pub fn is_text(t: [u8]) -> bool {
+    for i in 0..t.len {
+        if t[i] == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+// ---- Writing an edit ----
+//
+// The files changed: path (as it is after the moves), text before and
+// after (buffers); the files moved: from, to (C strings).
+
+pub static var W_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var W_BEFORE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var W_AFTER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var M_FROM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var M_TO: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Moves files from[k] to to[k], as `git mv` does: the index's entry of a
+// tracked file moves (one `git update-index --index-info`), then the file
+// (and the directories left empty go). False after the diagnostic; what
+// was moved stays moved.
+pub fn move_files(from: IntVec, to: IntVec) -> bool {
+    unsafe {
+        // (git names them from here: the journal's absolute paths too)
+        let here = crate::tools::proc::absolute_path(c".");
+        // The index's entries: `MODE SHA STAGE<TAB>PATH`.
+        let args = crate::base::alloc_array::<*u8>(6);
+        args[0] = c"git";
+        args[1] = c"ls-files";
+        args[2] = c"-s";
+        args[3] = c"-z";
+        args[4] = c"--";
+        args[5] = 0 as *u8;
+        let listing = buf_new();
+        let in_git = run_capture(args, listing) == 0;
+        let info = buf_new();
+        if in_git {
+            let t = buf_slice(listing);
+            // (the entries by path, for the moved ones)
+            var i = 0;
+            while i < t.len {
+                var e = i;
+                while e < t.len && t[e] != 0 {
+                    e += 1;
+                }
+                var tab = i;
+                while tab < e && t[tab] != '\t' {
+                    tab += 1;
+                }
+                if tab < e {
+                    let path = t[tab + 1..e];
+                    for k in 0..from.count {
+                        if same_bytes(relative(here, from.data[k] as *u8), path) {
+                            // `MODE SHA` (the stage dropped), the new path
+                            var sp = i;
+                            var spaces = 0;
+                            while sp < tab && spaces < 2 {
+                                if t[sp] == ' ' {
+                                    spaces += 1;
+                                }
+                                sp += 1;
+                            }
+                            buf_str(info, c"0 0000000000000000000000000000000000000000\t");
+                            buf_bytes(info, path);
+                            buf_byte(info, 0);
+                            buf_bytes(info, t[i..sp - 1]);
+                            buf_byte(info, '\t');
+                            buf_bytes(info, relative(here, to.data[k] as *u8));
+                            buf_byte(info, 0);
+                            break;
+                        }
+                    }
+                }
+                i = e + 1;
+            }
+        }
+        for k in 0..from.count {
+            let a = from.data[k] as *u8;
+            let b = to.data[k] as *u8;
+            if file_exists(b) {
+                let d = diag(c"error", c"rewrite.exists");
+                buf_str(d, c"'");
+                buf_str(d, b);
+                buf_str(d, c"' exists already; nothing moved\n");
+                return false;
+            }
+        }
+        if BUFS[info].len > 0 {
+            let u = crate::base::alloc_array::<*u8>(5);
+            u[0] = c"git";
+            u[1] = c"update-index";
+            u[2] = c"-z";
+            u[3] = c"--index-info";
+            u[4] = 0 as *u8;
+            if run_with_stdin(u, info) != 0 {
+                let d = diag(c"error", c"rewrite.git");
+                buf_str(d, c"git update-index could not move the index's entries; nothing moved\n");
+                return false;
+            }
+        }
+        var ok = true;
+        for k in 0..from.count {
+            let a = from.data[k] as *u8;
+            let b = to.data[k] as *u8;
+            if !make_parent(b) || !rename_file(a, b) {
+                cannot_write(b);
+                ok = false;
+            } else {
+                remove_empty_dirs(a);
+            }
+        }
+        ok
+    }
+}
+
+// Path p (a C string) relative to directory `here` (absolute) when it
+// is under it, else as it is.
+fn relative(here: *u8, p: *u8) -> [u8] {
+    unsafe {
+        let h = c_slice(here);
+        let s = c_slice(p);
+        if s.len > h.len + 1 && s[h.len] == '/' && same_bytes(s[0..h.len], h) {
+            return s[h.len + 1..s.len];
+        }
+        s
+    }
+}
+
+// Writes the edit (W_*, M_*): the moves, then each file's new text (a
+// copy, renamed onto it), journaled as one edit with `summary`, from the
+// checkout around `from`. False after the diagnostics.
+pub fn write_edit(summary: [u8], from: *u8) -> bool {
+    unsafe {
+        if M_FROM.count > 0 && !move_files(M_FROM, M_TO) {
+            return false;
+        }
+        for k in 0..W_PATH.count {
+            let p = W_PATH.data[k] as *u8;
+            let written = write_file_if(copy_path(p), buf_slice(W_AFTER.data[k]));
+            if written {
+                crate::tools::proc::keep_mode(p, copy_path(p));
+            }
+            if !written {
+                for x in 0..k + 1 {
+                    remove_file(copy_path(W_PATH.data[x] as *u8));
+                }
+                cannot_write(p);
+                return false;
+            }
+        }
+        journal_moves(from, W_PATH, W_BEFORE, W_AFTER, M_FROM, M_TO, summary);
+        var ok = true;
+        for k in 0..W_PATH.count {
+            let p = W_PATH.data[k] as *u8;
+            if !rename_file(copy_path(p), p) {
+                cannot_write(p);
+                ok = false;
+            }
+        }
+        ok
+    }
+}
+
+// `PATH<TAB>N matches` (` <- OLD` when moved; `<TAB>K lines kept`), a
+// line of the per-file summary, into out.
+pub fn put_file_line(out: i64, path: [u8], moved_from: [u8], n: i64, kept: i64) {
+    buf_bytes(out, path);
+    if moved_from.len > 0 {
+        buf_str(out, c" <- ");
+        buf_bytes(out, moved_from);
+    }
+    buf_byte(out, '\t');
+    buf_int(out, n);
+    buf_str(out, if n == 1 { c" match" } else { c" matches" });
+    if kept > 0 {
+        buf_byte(out, '\t');
+        buf_int(out, kept);
+        buf_str(out, if kept == 1 { c" line kept" } else { c" lines kept" });
+    }
+    buf_byte(out, '\n');
+}
+
+pub fn flush(out: i64) {
+    buf_write_fd(out, STDOUT);
+}
+
+// Whether path p names an existing file (a C string made of bytes).
+pub fn exists(p: [u8]) -> bool {
+    let b = buf_new();
+    buf_bytes(b, p);
+    file_exists(buf_cstr(b))
+}

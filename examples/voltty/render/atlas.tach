@@ -1,0 +1,317 @@
+// The glyph atlas (terminal.md §3.5): glyphs rasterized on first use and
+// packed into shelves of two pages, R8 coverage (2048²) and RGBA8 colour
+// (1024², made on the first colour glyph), with a table of entries the
+// fragment shader indexes by the instance's glyph number.
+//
+// An entry is 16 bytes, the layout cells.wgsl reads (its `Entry`, four
+// u32s little-endian):
+//   x, y, w, h   u16: the glyph's texels in its page
+//   ox, oy       u16: where they sit inside the cell box (from its top-left)
+//   kind         u16: 0 coverage, 1 colour
+//   pad          u16
+// Entry 0 is the empty glyph (a space: nothing to sample).
+//
+// The pages and the entries live on the GPU (std::gpu textures and a
+// storage buffer). A glyph is rasterized into the CPU's copy of its page
+// and its entry into the CPU's copy of the table; `flush`, once a frame,
+// writes what changed through the queue in one write per page and one for
+// the table (rows of the page: shelves fill rows in order). The queue
+// orders each write after the frames already submitted, so a glyph added
+// while a frame is in flight never changes what that frame reads. `pages`
+// counts the page changes: the renderer makes its bind group again when it
+// moves.
+//
+// A full page is not followed by another page (one draw binds one page
+// of each kind): the atlas is cleared and the renderer rebuilds every
+// visible row, which needs at most lines × cols glyphs (4,800 at 120×40;
+// a page holds about 7,000 cells of Menlo 14 at 2×). `generation` tells
+// the renderer it happened.
+
+use std::gpu;
+use std::gpu::{BufferUsage, Format, TextureUsage};
+use super::font::Font;
+
+pub const ENTRY_BYTES: i64 = 16;
+pub const COV_PAGE: i64 = 2048;
+pub const COLOR_PAGE: i64 = 1024;
+const MAX_ENTRIES: i64 = 65536;
+
+// A shelf: a row of the page `h` texels high, filled from the left.
+struct Shelf {
+    y: i64,
+    h: i64,
+    x: i64,
+}
+
+// One page's packing state.
+struct Packer {
+    size: i64,
+    shelves: Vec<Shelf>,
+    top: i64,
+}
+
+impl Packer {
+    fn new_in(size: i64, gpa: Gpa) -> Packer {
+        Packer { size: size, shelves: Vec::new_in(gpa), top: 0 }
+    }
+
+    // A place for w × h texels, with a texel of space after each glyph
+    // (no neighbour bleeds in, whatever the sampling); None when full.
+    fn place(inout self, w: i64, h: i64) -> Option<(i64, i64)> {
+        let w1 = w + 1;
+        let h1 = h + 1;
+        for i in 0..self.shelves.len() {
+            let s = self.shelves[i];
+            // A shelf takes glyphs as high as it is, down to 3/4 of it.
+            if h1 <= s.h && h1 * 4 >= s.h * 3 && s.x + w1 <= self.size {
+                self.shelves[i].x = s.x + w1;
+                return Some((s.x, s.y));
+            }
+        }
+        if self.top + h1 > self.size || w1 > self.size {
+            return None;
+        }
+        let y = self.top;
+        self.shelves.push(Shelf { y: y, h: h1, x: w1 });
+        self.top += h1;
+        Some((0, y))
+    }
+
+    fn clear(inout self) {
+        self.shelves.clear();
+        self.top = 0;
+    }
+}
+
+// The pages: sampled, written by the queue, read back by the tests.
+const PAGE_USAGE: u32 = TextureUsage::TEXTURE_BINDING | TextureUsage::COPY_DST
+    | TextureUsage::COPY_SRC;
+
+pub struct Atlas {
+    pub cov: gpu::Texture,
+    pub color: gpu::Texture,
+    has_color: bool,
+    // The table on the GPU, and its CPU copy (8 u16s an entry).
+    pub table: gpu::Buffer,
+    entries: Vec<u16>,
+    pub count: i64,
+    pub pages: i64,
+    // The pages' CPU copies (the colour one made with its page), and what
+    // `flush` has to write of them and of the table: rows [lo, hi) of
+    // each page, entries [lo, hi) (lo >= hi: nothing).
+    cov_px: Vec<u8>,
+    color_px: Vec<u8>,
+    cov_dirty: [i64; 2],
+    color_dirty: [i64; 2],
+    entries_dirty: [i64; 2],
+    cov_pack: Packer,
+    color_pack: Packer,
+    // Entry numbers: printable ASCII in 4 styles directly, the rest in a
+    // map keyed by character, style and width.
+    ascii: Vec<i32>,
+    map: HashMap<i64, i64>,
+    // Incremented by every clear.
+    pub generation: i64,
+    gpa: Gpa,
+}
+
+fn key(c: u32, style: i64, cells: i64) -> i64 {
+    (c as i64) | (style << 21) | (cells << 23)
+}
+
+// [lo, hi) grown to hold [a, b).
+fn grow(r: inout [i64; 2], a: i64, b: i64) {
+    if r[0] >= r[1] {
+        r[0] = a;
+        r[1] = b;
+    } else {
+        if a < r[0] { r[0] = a; }
+        if b > r[1] { r[1] = b; }
+    }
+}
+
+impl Atlas {
+    pub fn new_in(dev: gpu::Device, gpa: Gpa) -> Atlas {
+        let cov = dev.texture(COV_PAGE, COV_PAGE, Format::R8Unorm, usage: PAGE_USAGE);
+        // A 1 × 1 stand-in until the first colour glyph (the shader binds
+        // a colour page in every draw).
+        let color = dev.texture(1, 1, Format::Rgba8Unorm, usage: PAGE_USAGE);
+        // (zeroed: entry 0, the empty glyph, is all zeros)
+        let table = dev.buffer(MAX_ENTRIES * ENTRY_BYTES,
+            BufferUsage::STORAGE | BufferUsage::COPY_DST);
+        Atlas {
+            cov: cov,
+            color: color,
+            has_color: false,
+            table: table,
+            entries: Vec::filled_in(MAX_ENTRIES * 8, 0, gpa),
+            count: 1,
+            pages: 0,
+            cov_px: Vec::filled_in(COV_PAGE * COV_PAGE, 0, gpa),
+            color_px: Vec::new_in(gpa),
+            cov_dirty: [0, 0],
+            color_dirty: [0, 0],
+            entries_dirty: [0, 0],
+            cov_pack: Packer::new_in(COV_PAGE, gpa),
+            color_pack: Packer::new_in(COLOR_PAGE, gpa),
+            ascii: Vec::filled_in(4 * 128, 0, gpa),
+            map: HashMap::new_in(gpa),
+            generation: 0,
+            gpa: gpa,
+        }
+    }
+
+    // Forgets every glyph (the pages' texels are overwritten as glyphs
+    // are added again).
+    pub fn clear(inout self) {
+        self.count = 1;
+        self.cov_pack.clear();
+        self.color_pack.clear();
+        for i in 0..self.ascii.len() {
+            self.ascii[i] = 0;
+        }
+        self.map = HashMap::new_in(self.gpa);
+        self.generation += 1;
+    }
+
+    // Writes what was added since the last flush: one write of the rows
+    // each page gained, one of the table's new entries. The queue orders
+    // them after the frames already submitted and before the next.
+    pub fn flush(inout self, queue: inout gpu::Queue) {
+        if self.cov_dirty[0] < self.cov_dirty[1] {
+            let (y0, y1) = (self.cov_dirty[0], self.cov_dirty[1]);
+            queue.write_texture(self.cov, self.cov_px[y0 * COV_PAGE..y1 * COV_PAGE], COV_PAGE,
+                y: y0, h: y1 - y0);
+            self.cov_dirty = [0, 0];
+        }
+        if self.color_dirty[0] < self.color_dirty[1] {
+            let (y0, y1) = (self.color_dirty[0], self.color_dirty[1]);
+            let row = COLOR_PAGE * 4;
+            queue.write_texture(self.color, self.color_px[y0 * row..y1 * row], row, y: y0,
+                h: y1 - y0);
+            self.color_dirty = [0, 0];
+        }
+        if self.entries_dirty[0] < self.entries_dirty[1] {
+            let (n0, n1) = (self.entries_dirty[0], self.entries_dirty[1]);
+            // SAFETY: entries n0..n1 are (n1 - n0) * 8 u16s of the Vec
+            // (n1 <= MAX_ENTRIES: write_entry checks n), 16 bytes each.
+            let bytes = unsafe {
+                (&self.entries[n0 * 8] as *u8)[0..(n1 - n0) * ENTRY_BYTES]
+            };
+            queue.write_buffer(self.table, n0 * ENTRY_BYTES, bytes);
+            self.entries_dirty = [0, 0];
+        }
+    }
+
+    // Entry n, in the CPU's copy of the table (written by `flush`).
+    fn write_entry(inout self, n: i64, x: i64, y: i64, w: i64, h: i64, ox: i64, oy: i64,
+        kind: i64) {
+        if n < 0 || n >= MAX_ENTRIES {
+            panic("atlas: entry out of range");
+        }
+        let i = n * 8;
+        let v: [i64; 8] = [x, y, w, h, ox, oy, kind, 0];
+        for k in 0..8 {
+            self.entries[i + k] = v[k] as u16;
+        }
+        grow(&self.entries_dirty, n, n + 1);
+    }
+
+    // The entry of `c` in `style` over `cells` cells, rasterized and
+    // packed on first use: 0 for an empty glyph, -1 when the atlas is
+    // full (the caller clears it and starts again). `dev` makes the
+    // colour page on the first colour glyph.
+    pub fn lookup(inout self, font: inout Font, dev: gpu::Device, c: u32, style: i64,
+        cells: i64) -> i64 {
+        if c > 32 && c < 127 && cells == 1 {
+            let e = self.ascii[style * 128 + c as i64] as i64;
+            if e != 0 {
+                return e;
+            }
+        } else {
+            if c <= 32 {
+                return 0;
+            }
+            match self.map.get(key(c, style, cells)) {
+                Some(e) => return e,
+                None => {}
+            }
+        }
+        let e = self.add(&font, dev, c, style, cells);
+        if e >= 0 {
+            if c > 32 && c < 127 && cells == 1 {
+                self.ascii[style * 128 + c as i64] = e as i32;
+            } else {
+                self.map.insert(key(c, style, cells), e);
+            }
+        }
+        e
+    }
+
+    fn add(inout self, font: inout Font, dev: gpu::Device, c: u32, style: i64, cells: i64) -> i64 {
+        let g = font.raster(c, style, cells);
+        if g.w == 0 {
+            return 0;
+        }
+        if self.count >= MAX_ENTRIES {
+            return -1;
+        }
+        if g.color && !self.has_color {
+            self.color = dev.texture(COLOR_PAGE, COLOR_PAGE, Format::Rgba8Unorm, usage: PAGE_USAGE);
+            self.color_px = Vec::filled_in(COLOR_PAGE * COLOR_PAGE * 4, 0, self.gpa);
+            self.has_color = true;
+            self.pages += 1;
+        }
+        let spot = if g.color { self.color_pack.place(g.w, g.h) }
+            else { self.cov_pack.place(g.w, g.h) };
+        match spot {
+            None => -1,
+            Some((x, y)) => {
+                // the glyph's inked box into the page's copy
+                let px = font.pixels(g.color);
+                let row = font.row_bytes(g.color);
+                let bpp = if g.color { 4 } else { 1 };
+                let page_row = if g.color { COLOR_PAGE * 4 } else { COV_PAGE };
+                let n = g.w * bpp;
+                for r in 0..g.h {
+                    let src = (g.y + r) * row + g.x * bpp;
+                    let dst = (y + r) * page_row + x * bpp;
+                    if g.color {
+                        for k in 0..n {
+                            self.color_px[dst + k] = px[src + k];
+                        }
+                    } else {
+                        for k in 0..n {
+                            self.cov_px[dst + k] = px[src + k];
+                        }
+                    }
+                }
+                if g.color {
+                    grow(&self.color_dirty, y, y + g.h);
+                } else {
+                    grow(&self.cov_dirty, y, y + g.h);
+                }
+                let e = self.count;
+                self.count += 1;
+                self.write_entry(e, x, y, g.w, g.h, g.x, g.y, if g.color { 1 } else { 0 });
+                e
+            }
+        }
+    }
+
+    // An entry's fields (for the CPU reference renderer in the tests).
+    pub fn entry(self, n: i64) -> [i64; 7] {
+        var out: [i64; 7] = [0; 7];
+        if n < 0 || n >= self.count {
+            return out;
+        }
+        for k in 0..7 {
+            out[k] = self.entries[n * 8 + k] as i64;
+        }
+        out
+    }
+
+    pub fn has_color_page(self) -> bool {
+        self.has_color
+    }
+}

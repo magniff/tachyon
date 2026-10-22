@@ -4,7 +4,7 @@
 ## A method #[derive] makes: the attribute answers (0.15).
 $ items
 crate	syntax015/main.tach	6
-std	<std>	588
+std	<std>	590
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	37
@@ -73,6 +73,10 @@ std::path	<std>	34
 std::fs	<std>	59
 std::env	<std>	21
 std::process	<std>	36
+std::window	<std>	48
+std::window::cocoa	<std>	115
+std::window::keys	<std>	27
+std::window::objc	<std>	88
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6
@@ -87,9 +91,9 @@ fn main() -> Option<i64> {
     println(f"p = {p:?}, x = {x:>4}, {{y}} = {y:08x}");
     Some(p.x)
 }
-$ grep 'f"' --code
+$ grep 'f"' --strings
 # syntax015/main.tach
-29:13	code	main	println(f"p = {p:?}, x = {x:>4}, {{y}} = {y:08x}");
+29:13	string	main	println(f"p = {p:?}, x = {x:>4}, {{y}} = {y:08x}");
 $ refs area
 # syntax015/main.tach
 13:4	def	fn area(w: i64, h: i64 = 1) -> i64 {

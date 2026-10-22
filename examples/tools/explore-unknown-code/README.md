@@ -42,7 +42,7 @@ generated header:
 ```console
 $ tachyonc query items
 crate	main.tach	6
-std	<std>	588
+std	<std>	590
 crate::graph	graph.tach	11
 crate::heap	heap.tach	7
 crate::network	network.tach	2
@@ -115,6 +115,10 @@ std::path	<std>	34
 std::fs	<std>	59
 std::env	<std>	21
 std::process	<std>	36
+std::window	<std>	48
+std::window::cocoa	<std>	115
+std::window::keys	<std>	27
+std::window::objc	<std>	88
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6
@@ -182,9 +186,9 @@ crate::heap::is_empty	heap.tach:18:8	fn	pub fn is_empty(h: MinHeap) -> bool
 crate::heap::pop	heap.tach:35:8	fn	pub fn pop(h: inout MinHeap) -> Option<Entry>
 crate::graph::edges_from	graph.tach:55:8	fn	pub fn edges_from(g: Graph, i: i64) -> [Edge]
 crate::heap::push	heap.tach:22:8	fn	pub fn push(h: inout MinHeap, e: Entry)
-std::Vec::set	<std>:310:12	method	pub fn set(inout self, i: i64, x: sink T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
-std::Vec::filled_in	<std>:1489:12	method	pub fn filled_in(n: i64, x: sink T, a: sink A) -> Vec<T, A>
-std::Option::unwrap	<std>:128:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
+std::Vec::set	<std>:311:12	method	pub fn set(inout self, i: i64, x: sink T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
+std::Vec::filled_in	<std>:1490:12	method	pub fn filled_in(n: i64, x: sink T, a: sink A) -> Vec<T, A>
+std::Option::unwrap	<std>:129:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
 // callers (1)
 plan	main.tach:20:11	match quickest(g, a, b, gpa) {
 note query.budget: over the budget of 600 tokens, left out: calls 2, types or uses 9

@@ -55,6 +55,9 @@ Vec<Vec<u32, ScopedArena>, ScopedArena>::as_slice	views(self) declared
 Vec<Frame, ScopedArena>::as_slice	views(self) declared
 Vec<Inv, ScopedArena>::as_slice	views(self) declared
 Vec<Ctl, ScopedArena>::as_slice	views(self) declared
+Vec<Watch>::as_slice	views(self) declared
+Vec<Event>::as_slice	views(self) declared
+Vec<State>::as_slice	views(self) declared
 Vec<u8>::as_slice	views(self) declared
 Vec<Vec<u64>>::as_slice	views(self) declared
 Vec<Adapter, ScopedArena>::as_slice	views(self) declared
@@ -103,6 +106,9 @@ Vec<InputInfo>::push	views()
 Vec<i64>::push	views()
 Vec<BindingInfo>::push	views()
 Vec<u32>::push	views()
+Vec<Event>::push	views()
+Vec<State>::push	views()
+Vec<Watch>::push	views()
 Vec<Adapter, ScopedArena>::push	views() stores(x) declared
 Vec<(i64, u32)>::push	views()
 Vec<str>::push	views()
@@ -125,7 +131,7 @@ std::gpu::wgsl::msl::W::intern	../../compiler/std/gpu/wgsl/msl.tach:242:8	method
 crate::count	views017/main.tach:31:4	fn	fn count(toks: Vec<Tok>) -> i64	effects: none
 std::iter::Iterator::count	../../compiler/std/iter.tach:73:8	trait-method	fn count(self) -> i64
 std::objc::foundation::NSArrayMethods::count	../../compiler/std/objc/foundation.tach:304:8	trait-method	fn count(self) -> u64
-<std::objc::Ref as NSArrayMethods>::count	../../compiler/std/objc/foundation.tach:310:8	method	fn count(self) -> u64	effects: alloc(extern) io global panic diverge unsafe
+<std::objc::Ref as NSArrayMethods>::count	../../compiler/std/objc/foundation.tach:310:8	method	fn count(self) -> u64	effects: alloc(Gpa, extern) io global panic diverge unsafe
 <std::string::Chars as Iterator>::count	../../compiler/std/string.tach:753:8	method	fn count(self) -> i64	effects: panic diverge
 $ views nothing_here
 error query.no-match: no definition 'nothing_here'

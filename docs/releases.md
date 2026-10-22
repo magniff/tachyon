@@ -55,8 +55,50 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.20.0 | `v0.20.0` | 0.19.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | parameter conventions in Hylo's spelling, the default syntax: `let` (the default), `inout` with `&x` at the call, `sink`, `var`, accesses used as their values; Rust's spellings `conv.rust` errors with a `try:`, `fix --only conventions` migrates, std, tests, examples, bench and the eval on it (compiler/src on the 0.19 pragma until 0.21); std as a module tree; HashMap/HashSet on a Swiss table (foldhash, SipHash-1-3), BTreeMap/BTreeSet, ipnsort and driftsort; `String` and `str`, std::unicode (UTF-8, graphemes, width, case, Unicode 18), number formatting and parsing; std::io, fs, path, env, process, time, random; owned temporaries dropped at the statement's end; `tachyonc lsp` |
 | 0.21.0 | `v0.21.0` | 0.20.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | concurrency: safe `std::thread::spawn` and `scope` with what crosses threads checked (Send and Sync from the types), `std::sync` (atomics with every ordering, Mutex, RawLock, Once, Condvar, mpsc channels), `#[thread_local]`, effects `thread`, `sync`, `tls`, atomics as barriers in the optimizer; the compiler's source in 0.20's conventions, the 0.19 spelling removed (`var`, `inout`, `sink` keywords; the mixed reading only inside fix's migrations); `.vl` sources and `VOLE_*` variables accepted |
 | 0.22.0 | `v0.22.0` | 0.21.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | GPU: `std::gpu`, a wgpu-like API native-first with the Metal backend (device, queue, buffers, textures, samplers, bind groups, compute and render pipelines, command encoders, headless surfaces) over `std::objc`, the sizes of runtime-sized arrays bound per dispatch and draw; `std::gpu::wgsl`, a WGSL compiler to MSL with reflection, `Device::shader_wgsl`; std's section index fixed (a hello world 357 M to 96 M instructions) and a compile-cost gate row; std own-checked; `f(x?)` into a `let` parameter kept alive through the call; `fn(T)` is `fn(let T)` |
+| 0.23.0 | `v0.23.0` | 0.22.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | windows: `std::window`, winit-like with events pulled, on Cocoa (windows, keyboard and text input with IME basics, mouse, scroll, scale, cursor, clipboard, frames on request, watched fds), loaded only when a program names it; voltty (examples/voltty), a terminal emulator on std::window and std::gpu: a core checked against alacritty_terminal by an oracle and a fuzzer, Core Text glyphs in an atlas, one instanced draw of 16-byte cells per frame with `cells.wgsl` through std::gpu::wgsl, damage tracking, no allocation per frame, a shell on a pty; the rename tools for 0.24: `rewrite --text`, `refactor extension`, `query grep --ignore-case`, releases.toml's `bin` and `ext` |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.23
+
+Windows and input in std, and a terminal emulator on them; the design
+is docs/design/terminal.md, the guide `tachyonc guide window`.
+
+- **std::window**: windows and their input in the manner of winit, with
+  events pulled (`app.wait()`, `poll()`, `wait_timeout(ms)`) rather than
+  pushed, on Cocoa: `Frame` once per `request_frame`, `Key` (physical
+  and logical keys, both sides' modifiers, repeat), `Text` and
+  `Preedit` (IME basics), `Resize` in physical pixels with the scale,
+  `Mouse`, `Scroll`, `Cursor`, `Focus`, `Readable` (a file descriptor
+  watched by `app.watch`), `Close`, `Quit`; cursor icons, the clipboard,
+  live resize, and `raw_surface()` for std::gpu. It sits behind a gate:
+  a program that does not name it reads none of it.
+- **voltty** (examples/voltty), the terminal emulator:
+  - core/: vte's parser, Alacritty's terminal state (two grids, 10,000
+    lines of scrollback, reflow, charsets, colours, hyperlinks), the
+    input encoders (keys, mouse reporting, bracketed paste, focus) and a
+    pty; held to alacritty_terminal 0.26 by an oracle and a differential
+    parser fuzzer (the gate's `voltty-fuzz`); 1.3x to 2.7x
+    alacritty_terminal's throughput;
+  - render/: Core Text glyphs in an atlas, one instanced draw of 16-byte
+    cells per frame on std::gpu with `cells.wgsl` compiled by
+    std::gpu::wgsl, damage tracking, no allocation per frame; a full
+    redraw 43 us of CPU, at parity with the Metal stand-in it replaced
+    (41 us);
+  - app/: a shell on a pty in a std::window window, one event loop. A
+    first cut: no selection, scrollback view or configuration yet.
+- **The rename tools**, for 0.24's tachyon to vole: `rewrite --text`
+  (text edits of the tree: words, case, regexes, only comments, strings
+  or code of sources, paths moved, checked), `refactor extension` (files
+  renamed as `git mv` does, their mentions changed, each program's build
+  compared before and after), `query grep --ignore-case` (an f-string's
+  text a string), releases.toml's `bin` and `ext`; tools/rename-vole.sh
+  is the rename, dry-run so far.
+- **Tested on aarch64 only**, as since 0.15 (`gate.sh --with-x86`).
+- **Known issues**: the 0.22.1 list stands; std::window and voltty are
+  macOS only (the Wayland and X11 backends are designed, not written);
+  fonts come through Core Text, a rasterizer in the language is planned
+  after 0.24.
 
 ### What's new in 0.22
 

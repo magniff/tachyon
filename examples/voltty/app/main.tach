@@ -1,0 +1,473 @@
+// voltty, assembled (terminal.md §6.3, E7, a first cut): a window
+// (std::window), the renderer (render/, on std::gpu and cells.wgsl), the
+// terminal (core's vt/ and term/) and a shell on a pty, in one event loop.
+//
+//   voltty [-n FRAMES] [-o FILE.ppm] [-- CMD ARG...]
+//       the shell (or CMD) in a window; -n: quit after that many frames
+//       drawn, -o: each frame drawn written as a PPM image (the last one
+//       stays: for tests)
+//
+// Build it from the root of the repository (frameworks.c links AppKit
+// and friends until tachyonc takes -framework):
+//
+//   target/tachyonc -O2 examples/voltty/app/main.tach tests/window/frameworks.c -l objc -o voltty
+//
+// The modules other than this file are links to core/ and render/: a
+// program's modules sit under its root. One thread (0.21's pty thread
+// comes later): the pty's descriptor is watched by the window's loop
+// (Event::Readable), and a frame is asked for when the screen changed.
+// What the loop allocates per event is a pasted text, in a ScopedArena
+// dropped once it is sent.
+
+mod input;
+mod pty;
+mod render;
+mod sys;
+mod term;
+mod vt;
+
+use pty::{Pty, PtyError};
+use render::input::{
+    CURSOR_BEAM, CURSOR_BLOCK, CURSOR_HIDDEN, CURSOR_HOLLOW, CURSOR_UNDERLINE, Cell, CellGrid,
+    CursorView,
+};
+use render::renderer::Renderer;
+use std::Buf;
+use std::gpu::{Format, RawSurface, Surface};
+use std::window::{App, Event, Window, WindowDesc};
+use std::window::keys::{Logical, Named};
+use term::{SHAPE_BEAM, SHAPE_UNDERLINE, SHOW_CURSOR, Term};
+use vt::Parser;
+
+// `\e`, `\n`, `\r`, `\t`, `\\`, `\xNN`.
+fn unescape(s: [u8], gpa: Gpa) -> Buf {
+    var out = Buf::new_in(gpa);
+    var i = 0;
+    while i < s.len {
+        let c = s[i];
+        if c == '\\' && i + 1 < s.len {
+            let d = s[i + 1];
+            if d == 'e' {
+                out.push(0x1B);
+                i += 2;
+            } else if d == 'n' {
+                out.push('\n');
+                i += 2;
+            } else if d == 'r' {
+                out.push('\r');
+                i += 2;
+            } else if d == 't' {
+                out.push('\t');
+                i += 2;
+            }
+            else if d == 'x' && i + 3 < s.len + 0 && hexval(s[i + 2]) >= 0
+                && hexval(s[i + 3]) >= 0 {
+                out.push((hexval(s[i + 2]) * 16 + hexval(s[i + 3])) as u8);
+                i += 4;
+            } else {
+                out.push(d);
+                i += 2;
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn hexval(c: u8) -> i64 {
+    if c >= '0' && c <= '9' {
+        (c - '0') as i64
+    } else if c >= 'a' && c <= 'f' {
+        (c - 'a') as i64 + 10
+    } else if c >= 'A' && c <= 'F' {
+        (c - 'A') as i64 + 10
+    } else {
+        -1
+    }
+}
+
+// The terminal's screen as the renderer reads it: a copy of each visible
+// line, and which lines differ from the copy the last frame drew (a cell
+// by cell comparison: the grid's own damage is not reset per frame yet).
+struct Screen {
+    lines: i64,
+    cols: i64,
+    cells: Vec<Cell>,
+    dirty: Vec<bool>,
+    all: bool,
+}
+
+impl Screen {
+    fn new_in(gpa: Gpa) -> Screen {
+        Screen { lines: 0, cols: 0, cells: Vec::new_in(gpa), dirty: Vec::new_in(gpa), all: true }
+    }
+
+    // Takes the terminal's visible lines; true when one changed.
+    fn take(inout self, t: inout Term) -> bool {
+        let lines = t.lines();
+        let cols = t.cols();
+        if lines != self.lines || cols != self.cols {
+            self.lines = lines;
+            self.cols = cols;
+            self.cells.clear();
+            self.dirty.clear();
+            for _ in 0..lines * cols {
+                self.cells.push(Cell { ch: 0, fg: 0, bg: 0, flags: 0, extra: 0 });
+            }
+            for _ in 0..lines {
+                self.dirty.push(true);
+            }
+            self.all = true;
+        }
+        var any = self.all;
+        for l in 0..lines {
+            let row = t.row(l);
+            let n = if row.len < cols { row.len } else { cols };
+            let base = l * cols;
+            for x in 0..n {
+                let c = row[x];
+                let o = self.cells[base + x];
+                if c.ch != o.ch || c.fg != o.fg || c.bg != o.bg || c.flags != o.flags {
+                    self.cells[base + x] = Cell {
+                        ch: c.ch, fg: c.fg, bg: c.bg, flags: c.flags, extra: c.extra
+                    };
+                    self.dirty[l] = true;
+                    any = true;
+                }
+            }
+        }
+        any
+    }
+}
+
+impl CellGrid for Screen {
+    fn lines(self) -> i64 {
+        self.lines
+    }
+
+    fn cols(self) -> i64 {
+        self.cols
+    }
+
+    fn row(self, l: i64) -> [Cell] {
+        self.cells[l * self.cols..(l + 1) * self.cols]
+    }
+
+    fn damaged(self, l: i64) -> bool {
+        self.dirty[l]
+    }
+
+    fn damage_all(self) -> bool {
+        self.all
+    }
+
+    fn scrolled(self) -> i64 {
+        0
+    }
+
+    fn reset_damage(inout self) {
+        for l in 0..self.lines {
+            self.dirty[l] = false;
+        }
+        self.all = false;
+    }
+}
+
+// The cursor as the terminal shows it (DECTCEM, DECSCUSR), hollow when
+// the window is not focused.
+fn cursor_of(t: Term, focused: bool) -> CursorView {
+    if (t.mode & SHOW_CURSOR) == 0 {
+        return CursorView { line: 0, col: 0, shape: CURSOR_HIDDEN };
+    }
+    let shape = if !focused {
+        CURSOR_HOLLOW
+    } else if t.style_set && t.style_shape == SHAPE_BEAM {
+        CURSOR_BEAM
+    } else if t.style_set && t.style_shape == SHAPE_UNDERLINE {
+        CURSOR_UNDERLINE
+    } else {
+        CURSOR_BLOCK
+    };
+    CursorView { line: t.grid.cursor.line, col: t.grid.cursor.col, shape: shape }
+}
+
+// A key press as core's encoder takes it; None for keys that send
+// nothing (modifiers alone) or that send their text (Event::Text).
+fn key_of(k: std::window::Key) -> Option<input::Key> {
+    var mods: u8 = 0;
+    if k.mods.shift() { mods = mods | input::SHIFT; }
+    if k.mods.alt() { mods = mods | input::ALT; }
+    if k.mods.ctrl() { mods = mods | input::CTRL; }
+    let named = match k.key {
+        Logical::Named(n) => match n {
+            Named::Enter => input::KEY_ENTER,
+            Named::Tab => input::KEY_TAB,
+            Named::Backspace => input::KEY_BACKSPACE,
+            Named::Escape => input::KEY_ESCAPE,
+            Named::Delete => input::KEY_DELETE,
+            Named::Insert => input::KEY_INSERT,
+            Named::Home => input::KEY_HOME,
+            Named::End => input::KEY_END,
+            Named::PageUp => input::KEY_PAGE_UP,
+            Named::PageDown => input::KEY_PAGE_DOWN,
+            Named::ArrowLeft => input::KEY_LEFT,
+            Named::ArrowRight => input::KEY_RIGHT,
+            Named::ArrowUp => input::KEY_UP,
+            Named::ArrowDown => input::KEY_DOWN,
+            _ => return None,
+        },
+        Logical::F(n) => if n >= 1 && n <= 20 { input::KEY_F1 + n - 1 } else { return None },
+        Logical::Char(c) => {
+            // a character with Control (or Alt as Meta) is encoded; without,
+            // its text follows
+            if k.text_follows && !k.mods.ctrl() {
+                return None;
+            }
+            return Some(input::Key { named: input::KEY_CHAR, ch: c, mods: mods, keypad: false });
+        }
+        Logical::Unidentified => return None,
+    };
+    Some(input::Key { named: named, ch: 0, mods: mods, keypad: false })
+}
+
+// A BGRA8 frame's pixels as a binary PPM.
+fn write_ppm(path: [u8], px: [u8], w: i64, h: i64, gpa: Gpa) -> bool {
+    var b = format_in(f"P6\n{w} {h}\n255\n", gpa);
+    for i in 0..w * h {
+        b.push(px[i * 4 + 2]);
+        b.push(px[i * 4 + 1]);
+        b.push(px[i * 4]);
+    }
+    std::fs::write(path, b.as_slice()).is_ok()
+}
+
+// The window's surface on the renderer's device.
+fn surface(r: Renderer, win: Window, w: i64, h: i64, gpa: Gpa) -> Option<Surface> {
+    let inst = std::gpu::Instance::new_in(gpa);
+    match inst.surface(r.dev, RawSurface::MetalLayer(win.raw_surface())) {
+        Ok(sf) => {
+            var surf = sf;
+            surf.configure(r.dev, w, h);
+            Some(surf)
+        }
+        Err(_) => None,
+    }
+}
+
+fn arg(argv: **u8, i: i64) -> [u8] {
+    // SAFETY: argv[i] is a NUL-terminated string from the C runtime.
+    unsafe {
+        let p = argv[i];
+        var n = 0;
+        while p[n] != 0 {
+            n += 1;
+        }
+        p[0..n]
+    }
+}
+
+fn main(argc: i64, argv: **u8, gpa: Gpa) -> i32 {
+    var max_frames: i64 = -1;
+    var snapshot: [u8] = "";
+    var cmd: Vec<[u8]> = Vec::new_in(gpa);
+    var i = 1;
+    while i < argc {
+        let a = arg(argv, i);
+        if a == "-n" && i + 1 < argc {
+            max_frames = parse_int(arg(argv, i + 1)).unwrap_or(-1);
+            i += 2;
+        } else if a == "-o" && i + 1 < argc {
+            snapshot = arg(argv, i + 1);
+            i += 2;
+        } else if a == "--" {
+            for k in i + 1..argc {
+                cmd.push(arg(argv, k));
+            }
+            break;
+        } else {
+            eprintln("usage: voltty [-n FRAMES] [-o FILE.ppm] [-- CMD ARG...]");
+            return 2;
+        }
+    }
+    var app = match App::new_in(gpa) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln("voltty: no window server");
+            return 1;
+        }
+    };
+    var win = match app.window(WindowDesc::new("voltty", 960, 600)) {
+        Ok(w) => w,
+        Err(_) => {
+            eprintln("voltty: no window");
+            return 1;
+        }
+    };
+    let sz = win.size();
+    var r = match Renderer::new_in("Menlo", 14.0, sz.scale, Format::Bgra8Unorm, gpa) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln(f"voltty: {e.as_slice()}");
+            return 1;
+        }
+    };
+    var surf = match surface(r, win, sz.w, sz.h, gpa) {
+        Some(s) => s,
+        None => {
+            eprintln("voltty: no GPU surface for the window");
+            return 1;
+        }
+    };
+    var lines = sz.h / r.cell_h();
+    var cols = sz.w / r.cell_w();
+    var term = Term::new_in(lines, cols, 10000, gpa);
+    term.cell_width = r.cell_w();
+    term.cell_height = r.cell_h();
+    var parser = Parser::new_in(1048576, gpa);
+    let spawned = if cmd.len() > 0 { Pty::spawn(cmd.as_slice(), lines, cols, gpa) }
+        else { Pty::spawn_shell(lines, cols, gpa) };
+    var pt = match spawned {
+        Ok(p) => p,
+        Err(PtyError::NotFound) => {
+            eprintln("voltty: program not found");
+            return 127;
+        }
+        Err(PtyError::Sys(e)) => {
+            eprintln(f"voltty: pty: errno {e}");
+            return 1;
+        }
+    };
+    pt.resize(lines, cols, sz.w, sz.h);
+    if !app.watch(pt.fd) {
+        eprintln("voltty: cannot watch the pty");
+        return 1;
+    }
+    var screen = Screen::new_in(gpa);
+    var buf: Vec<u8> = Vec::filled_in(65536, 0, gpa);
+    var keys = Buf::new_in(gpa);
+    var focused = true;
+    var asked = false;
+    var frames = 0;
+    win.request_frame();
+    asked = true;
+    loop {
+        var changed = false;
+        match app.wait() {
+            Ok(Event::Readable(_)) => {
+                loop {
+                    let n = pt.read(buf.as_mut_slice());
+                    if n <= 0 {
+                        break;
+                    }
+                    term.feed(&parser, buf.as_slice()[0..n]);
+                    changed = true;
+                }
+                if term.reply.len() > 0 {
+                    pt.write(term.reply.as_slice());
+                    term.reply.clear();
+                }
+                if term.title_changed {
+                    win.set_title(term.title.as_slice());
+                    term.title_changed = false;
+                }
+            }
+            Ok(Event::Frame(_)) => {
+                asked = false;
+                if term.sync {
+                    term.stop_sync(&parser);
+                }
+                let any = screen.take(&term);
+                r.set_cursor(cursor_of(term, focused));
+                if any || r.dirty() {
+                    r.update(&screen);
+                    match surf.frame() {
+                        Ok(f) => {
+                            let view = f.texture.view();
+                            r.render(view);
+                            frames += 1;
+                            if snapshot.len() > 0 {
+                                var px: Vec<u8> = Vec::new_in(gpa);
+                                r.read_texture(f.texture, &px);
+                                if !write_ppm(snapshot, px.as_slice(), f.texture.width(),
+                                    f.texture.height(), gpa) {
+                                    eprintln(f"voltty: cannot write {snapshot}");
+                                }
+                            }
+                            f.present(&r.queue);
+                        }
+                        Err(_) => {}
+                    }
+                }
+                if max_frames >= 0 && frames >= max_frames {
+                    break;
+                }
+            }
+            Ok(Event::Text(x)) => {
+                pt.write(x.bytes[0..x.len as i64]);
+            }
+            Ok(Event::Key(k)) => {
+                if k.pressed && !k.ime {
+                    if k.mods.sup() {
+                        // Command-V pastes; other Command keys are the menu's
+                        match k.key {
+                            Logical::Char(c) => if c == 'v' as u32 {
+                                arena_scope(gpa, |a| {
+                                    match app.clipboard_get_in(a) {
+                                        Some(text) => {
+                                            keys.clear();
+                                            input::encode_paste(text.as_slice(), term.mode, &keys);
+                                        }
+                                        None => {}
+                                    }
+                                });
+                                pt.write(keys.as_slice());
+                            },
+                            _ => {}
+                        }
+                    } else {
+                        match key_of(k) {
+                            Some(key) => {
+                                keys.clear();
+                                input::encode_key(key, term.mode, false, &keys);
+                                pt.write(keys.as_slice());
+                            }
+                            None => {}
+                        }
+                    }
+                }
+            }
+            Ok(Event::Resize(_, z)) => {
+                let nl = if z.h / r.cell_h() < 1 { 1 } else { z.h / r.cell_h() };
+                let nc = if z.w / r.cell_w() < 1 { 1 } else { z.w / r.cell_w() };
+                surf.configure(r.dev, z.w, z.h);
+                if nl != lines || nc != cols {
+                    lines = nl;
+                    cols = nc;
+                    term.resize(lines, cols);
+                    pt.resize(lines, cols, z.w, z.h);
+                }
+                changed = true;
+            }
+            Ok(Event::Focus(_, on)) => {
+                focused = on;
+                changed = true;
+            }
+            Ok(Event::Close(_)) => break,
+            Ok(Event::Quit) => break,
+            _ => {}
+        }
+        pt.flush();
+        if pt.closed {
+            break;
+        }
+        if changed && !asked {
+            win.request_frame();
+            asked = true;
+        }
+    }
+    r.wait_idle();
+    app.unwatch(pt.fd);
+    0
+}
