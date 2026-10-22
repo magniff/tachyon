@@ -21,7 +21,7 @@
 // group made before it. The group is vectorized when the scalar
 // instructions that go outnumber the vector ones it costs.
 
-use crate::base::{IntVec, alloc_array, free};
+use crate::base::{IntVec, alloc_array, free, memcpy};
 use crate::base::target::X86;
 use crate::front::types::{
     TY_F32, TY_F64, TY_I16, TY_I32, TY_I64, TY_I8, TY_U16, TY_U32, TY_U64, TY_U8, is_float,
@@ -289,9 +289,13 @@ fn add_dead_use(cx: sink *FnCtx, v: i64) {
     }
 }
 
-// Whether scalar v goes: every use of it by scalars that go.
+// Whether scalar v goes: every use of it by scalars that go. (0.25) One
+// made since count_uses has no uses yet.
 fn goes(cx: sink *FnCtx, v: i64) -> bool {
-    unsafe { v < cx.table_size && dead_uses(cx, v) == cx.slp_uses[v] }
+    unsafe {
+        let uses = if v < cx.slp_counted { cx.slp_uses[v] } else { 0 };
+        dead_uses(cx, v) == uses
+    }
 }
 
 // The scalar instructions the group's vectorization removes: its stores,
@@ -534,6 +538,7 @@ fn try_group(cx: sink *FnCtx) -> bool {
 // Looks for groups in block b; whether any was vectorized.
 fn slp_block(cx: sink *FnCtx, b: i64) -> bool {
     unsafe {
+        grow_tables(cx);
         cx.slp_stamp += 1;
         var stores = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         var i = 0;
@@ -605,6 +610,7 @@ fn slp_block(cx: sink *FnCtx, b: i64) -> bool {
                 changed = true;
                 // (Positions: the new instructions have none, which the
                 // later groups' checks treat as outside; renumber.)
+                grow_tables(cx);
                 cx.slp_stamp += 1;
                 var j = 0;
                 var x = cx.blocks[b].first;
@@ -624,22 +630,30 @@ fn slp_block(cx: sink *FnCtx, b: i64) -> bool {
 }
 
 // USES, POS and POS_STAMP, indexed by instruction, as large as the
-// function's instructions are now, with room for a half more. (0.17: ids
-// are local to each function, so slp_block's new instructions can pass a
-// size taken once at the pass's start; count_uses runs after each block
-// that made some.)
+// function's instructions are now, with room for a half more, their
+// contents kept. (0.25: also grown when slp_block's new instructions pass
+// the size, so that every instruction has a position; a size left by an
+// earlier function in this context once decided which did, and so the
+// code, by the threads' schedule.)
 fn grow_tables(cx: sink *FnCtx) {
     unsafe {
         if cx.table_size < cx.inst_count {
+            let size = cx.inst_count + cx.inst_count / 2;
+            let uses = alloc_array::<i64>(size);
+            let pos = alloc_array::<i64>(size);
+            let stamp = alloc_array::<i64>(size);
             if cx.table_size > 0 {
+                memcpy(uses as *u8, cx.slp_uses as *u8, (cx.table_size * 8) as u64);
+                memcpy(pos as *u8, cx.pos as *u8, (cx.table_size * 8) as u64);
+                memcpy(stamp as *u8, cx.pos_stamp as *u8, (cx.table_size * 8) as u64);
                 free(cx.slp_uses as *u8);
                 free(cx.pos as *u8);
                 free(cx.pos_stamp as *u8);
             }
-            cx.table_size = cx.inst_count + cx.inst_count / 2;
-            cx.slp_uses = alloc_array::<i64>(cx.table_size);
-            cx.pos = alloc_array::<i64>(cx.table_size);
-            cx.pos_stamp = alloc_array::<i64>(cx.table_size);
+            cx.table_size = size;
+            cx.slp_uses = uses;
+            cx.pos = pos;
+            cx.pos_stamp = stamp;
         }
     }
 }
@@ -648,14 +662,12 @@ fn grow_tables(cx: sink *FnCtx) {
 fn count_uses(cx: sink *FnCtx, fi: i64) {
     unsafe {
         grow_tables(cx);
-        for i in 0..IRFUNCS[fi].blocks.count {
-            let b = IRFUNCS[fi].blocks.data[i];
-            var v = cx.blocks[b].first;
-            while v != 0 {
-                cx.slp_uses[v] = 0;
-                v = cx.insts[v].next;
-            }
+        // (0.25: every instruction, not only those in a block: what an
+        // earlier function left here is never read)
+        for v in 0..cx.inst_count {
+            cx.slp_uses[v] = 0;
         }
+        cx.slp_counted = cx.inst_count;
         for i in 0..IRFUNCS[fi].blocks.count {
             let b = IRFUNCS[fi].blocks.data[i];
             if cx.blocks[b].removed != 0 {
