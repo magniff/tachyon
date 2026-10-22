@@ -92,7 +92,7 @@ and [docs/lsp.md](docs/lsp.md).
 
 Vole is at 0.25, before 1.0: no users yet, no stability promise, and
 releases break programs (with a `volec fix` migration where one can be
-written). The written specification comes before 1.0.
+written). The language is still being designed: expect it to change.
 
 - **Works:** the self-hosting compiler (191k lines of vole, built by a
   chain of every release from a frozen Rust seed, each reaching a
