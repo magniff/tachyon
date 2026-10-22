@@ -39,7 +39,7 @@ A Rust type vole does not have gets the type to write as its `try:`:
 use std::cmp::max;
 ```
 ```err
-error[type error] no 'cmp' in module 'std' | help: vole's std has no such module: std's items are all `std::NAME` too
+error[type error] no 'cmp' in module 'std' | help: vole's std has no module 'cmp': std's items are all `std::NAME` too | try: use std::max;
 ```
 std has a few of Rust's modules (0.20: `std::collections::HashMap`,
 `std::fmt::Display`, `std::io::read_line`, `std::iter`, `std::ops`,
