@@ -831,6 +831,24 @@ fn check_scope(f: i64) {
                 }
             }
         }
+        // (0.25) its value holds no Scope and no handle of a thread started
+        // in it: they end with the scope
+        let rt = FNS[CLOSURES[c].f].ret;
+        let held = scope_part(rt, 0);
+        if held != 0 {
+            let msg = buf_new();
+            let help = buf_new();
+            buf_str(msg, c"the closure given to thread::scope returns ");
+            buf_type(msg, rt);
+            if held != rt {
+                buf_str(msg, c", which holds ");
+                buf_type(msg, held);
+            }
+            buf_str(msg,
+                c": its threads are joined and its Scope is gone when thread::scope returns");
+            buf_str(help, c"join the threads inside and return their results: `thread::scope(|s| s.spawn(|| ...).join())`");
+            report(scope_value_pos(c), c"sync.scope_escape", msg, help);
+        }
         let w = capture_write(body_of(c), CLOSURES[c].mark);
         SHARED_ONLY = false;
         if w != 0 {
@@ -845,6 +863,78 @@ fn check_scope(f: i64) {
             buf_str(help, c"change it before or after thread::scope; inside, give each thread its own data, or share a Mutex or an atomic");
             report(NODES[w].start, c"sync.scope_write", msg, help);
         }
+    }
+}
+
+// The part of type t that is std's Scope or a ScopedJoinHandle (a type),
+// in a field, an element, a variant or behind a pointer; 0: none.
+fn scope_part(t: i64, depth: i64) -> i64 {
+    unsafe {
+        if t <= 0 || t == TY_ERROR || depth > 16 {
+            return 0;
+        }
+        let kind = TYPES[t].kind;
+        if kind == TyKind::Ptr || kind == TyKind::Slice || kind == TyKind::Array {
+            return scope_part(TYPES[t].a, depth + 1);
+        }
+        if kind == TyKind::Tuple {
+            for i in 0..TYPES[t].count {
+                let p = scope_part(TLISTS.data[TYPES[t].list + i], depth + 1);
+                if p != 0 {
+                    return p;
+                }
+            }
+            return 0;
+        }
+        if kind == TyKind::Enum {
+            let e = TYPES[t].a;
+            for i in 0..ENUMS[e].variant_count {
+                let p = scope_part(VARIANTS[enum_variant(e, i)].shape, depth + 1);
+                if p != 0 {
+                    return p;
+                }
+            }
+            return 0;
+        }
+        if kind != TyKind::Struct {
+            return 0;
+        }
+        let s = TYPES[t].a;
+        let name = std_name(s);
+        if name == "Scope" || name == "ScopedJoinHandle" {
+            return t;
+        }
+        if STRUCTS[s].closure != 0 {
+            return 0;
+        }
+        // (a container's elements: its type arguments)
+        for i in 0..STRUCTS[s].targ_count {
+            let p = scope_part(TLISTS.data[STRUCTS[s].targs + i], depth + 1);
+            if p != 0 {
+                return p;
+            }
+        }
+        for i in 0..STRUCTS[s].field_count {
+            let p = scope_part((*struct_field(s, i)).ty, depth + 1);
+            if p != 0 {
+                return p;
+            }
+        }
+        0
+    }
+}
+
+// Where closure c's value is: its body's tail, else the closure.
+fn scope_value_pos(c: i64) -> i64 {
+    unsafe {
+        let body = body_of(c);
+        if body > 0 && NODES[body].kind == NodeKind::Block && NODES[body].a > 0 {
+            return NODES[NODES[body].a].start;
+        }
+        if body > 0 && NODES[body].kind != NodeKind::Block {
+            return NODES[body].start;
+        }
+        NODES[CLOSURES[c].node].start
     }
 }
 

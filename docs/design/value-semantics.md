@@ -219,6 +219,9 @@ Consequences:
   - Passing `&S` or `&mut S` to a function with `global` is an error, because noalias would be a lie.
   - 0.17.1 refines `global` into written-static sets (a bitmask, like 0.16's `allocs`), which makes this precise. It also lets a summary name statics (`views(TYPES)`), so a function can return a view of statics.
 - **Closures.** A closure capturing by reference holds shared or mut loans while it is live. `move` moves owned captures. 0.14's rule that an immutable binding is captured by copy applies to plain values only; an owned immutable binding is captured by shared reference.
+  - *0.25:* a closure's function takes its env as an `inout` parameter: a capture by reference is `*env` (what the env's views point into), a capture by value is `env`. So its summary says what its result views of its captures (`views(*env)`), its stores into captures are checked (`own.escape` for a view of the body's own local) and summarized, and a call of it, direct or through a generic function's `F` (a parameter holding a closure takes stores, `store_param`), gives the captured variables what it stores.
+  - *0.25:* a generic result made of type parameters takes its floor, joined with what the results of the body's callables (closures, fn values, functions outside std: `infer::col_call`) view, as far as the result carries them.
+  - *0.25:* std's lock functions (`Mutex::with`, `try_with`, `Condvar::wait_then`) hand the callable a reference made from a raw pointer into the locked data: a callable result viewing it, or a store of a view of it, is `own.escape` at the call. A call of std's with a lock holding views stores the views of the storing closures given to it into the lock.
 
 ### 2.5 Allocators and arenas (0.16)
 

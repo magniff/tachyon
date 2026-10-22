@@ -52,7 +52,9 @@ and views; while the scope runs its closure changes nothing they use
 thread only reads what it is given (`sync.scope_shared_write`, also for
 `&v`, `&a[..]`, `v[i] = x` and `a.sort()`: return results through `join`,
 or use a Mutex or an atomic; two threads cannot yet each write their own
-part of one slice, there is no `split_at_mut`). No thread may reach a `static var` (`sync.global`; `query
+part of one slice, there is no `split_at_mut`). Neither the scope nor a
+scoped thread's handle leaves `thread::scope` (`sync.scope_escape`): join
+inside and return the results. No thread may reach a `static var` (`sync.global`; `query
 effects FILE:LINE --why global` shows the chain); printing is fine.
 
 ```tach
@@ -89,7 +91,9 @@ never interleaves.
 
 `std::sync::Mutex<T>` owns its data: `m.with(|data| ...)` locks, runs the
 closure and unlocks (`try_with` when the lock is free now), the way to
-reach the data in 0.21.0. Scoped threads share the Mutex (and an atomic). `m.lock()` gives a guard that unlocks when dropped, but it is
+reach the data in 0.21.0. The closure's result may not view the data,
+nor may it store a view of it elsewhere (`own.escape`: the lock is
+released when `with` returns): copy out what you need. Scoped threads share the Mutex (and an atomic). `m.lock()` gives a guard that unlocks when dropped, but it is
 `unsafe` and internal until a type holding a view may implement Drop
 (0.21.x): nothing keeps the guard inside the mutex's life yet. `Once`'s
 `call_once(f)` runs f once whatever the threads; `Condvar`'s

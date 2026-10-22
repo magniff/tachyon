@@ -40,10 +40,11 @@ use crate::front::own::state::{
     CUR, DEREF_FIELD, F_INVALID, F_SCOPE, F_STATIC, LOC_CAP, LOC_PL, NSLOT, NW, OV, PE, PEND, PE_BY,
     PE_INVALID, PE_KIND, PE_OV, PK_NONE, PK_RAW, PL_COUNT, PL_FIELD, PL_MASK, PL_PARENT, PL_RID,
     PL_RKIND, POOL, POOL_TOP, RK_LOCAL, RK_MARK, RK_ROOT, RK_STATIC, SLOT_LOCAL, SLOT_PARENT,
-    TUPLE_FIELD, any_and, at, child_place, clear_bit, field_number, get_bit, is_deref_place, l1, l2,
-    mark_place, new_ov, or_expanded, or_into, ov_hits, ov_inner, ov_or, root_of, root_place,
-    set_bit, slot_for, slot_of_local, slot_of_place, slot_off,
+    TUPLE_FIELD, any_and, at, child_place, clear_bit, field_number, get_bit, is_deref_place,
+    is_empty, l1, l2, mark_place, new_ov, or_expanded, or_into, ov_hits, ov_inner, ov_or, root_of,
+    root_place, set_bit, slot_for, slot_of_local, slot_of_place, slot_off,
 };
+use crate::front::own::summary::{closure_param, env_param};
 use crate::front::own::walk::{
     BOUND, CUR_F, PARAM_LOCALS, PO_DEREF, PO_INNER, PO_RAW, PO_VIEWSLOT, W_DROP, W_MOVE,
     W_MUT_BORROW,
@@ -808,6 +809,7 @@ pub fn on_enter(f: i64) {
         ANY_MUT = false;
         ANY_REF = false;
         ANY_CHILD = false;
+        CAPTURES_STORED = 0;
         LAST_READ_NODE = 0;
         QUIET = within_std(FNS[f].module) && !own_std();
         for i in 0..PARAM_LOCALS.count {
@@ -818,9 +820,12 @@ pub fn on_enter(f: i64) {
             note_binding(l, crate::front::ast::child(FNS[f].node, i));
             let t = LOCALS[l].ty;
             var s = slot_of_local(l);
-            if s < 0 && is_ptr(t) && param_mode(f, i) == P_MUT && is_view_type(TYPES[t].a) {
-                // (a legacy `*T` parameter to what holds views: its
-                // referent's views are tracked, for the stores)
+            let env = env_param(f, i);
+            if s < 0 && is_ptr(t) && (param_mode(f, i) == P_MUT || env)
+                && is_view_type(TYPES[t].a) {
+                // (a legacy `*T` parameter to what holds views, or a
+                // closure's env: its referent's views are tracked, for the
+                // stores)
                 s = slot_for(l, true);
             }
             if s < 0 {
@@ -838,12 +843,47 @@ pub fn on_enter(f: i64) {
             POOL[off + OV] = start_flags(l);
             if is_ptr(t) && LOCALS[l].ty > 0 && TYPES[t].b == 0 {
                 ANY_REF = true;
-                if param_mode(f, i) == P_MUT {
+                if param_mode(f, i) == P_MUT || env {
                     ANY_MUT = true;
                     POOL[off + OV] |= F_MUTLOAN;
                 }
             }
         }
+    }
+}
+
+// The parameters (bits) holding a closure that the walk stores views into:
+// the walked closure's env (it stores into what it captures), a closure
+// given to the walked function. Their summary's stores then name their own
+// roots too (infer::col_result), as one capture may now view another.
+pub static var CAPTURES_STORED: i64 = 0;
+
+// Slot s gains the views of origin v by a store or an assignment through
+// it: when s is a closure's (the walked closure's env, or a parameter
+// holding a closure), CAPTURES_STORED notes it.
+pub fn note_env_store(s: i64, v: i64) {
+    unsafe {
+        if v < 0 || SLOT_LOCAL.data[s] < 0 || is_empty(l1(v)) && is_empty(l2(v)) {
+            return;
+        }
+        let l = SLOT_LOCAL.data[s];
+        for i in 0..PARAM_LOCALS.count {
+            if PARAM_LOCALS.data[i] == l && i < 63 && i < FNS[CUR_F].param_count
+                && (env_param(CUR_F, i) || closure_param(CUR_F, i)) {
+                CAPTURES_STORED |= 1 << i;
+                crate::front::own::infer::col_stored(v);
+            }
+        }
+    }
+}
+
+// The walked closure's env slot (summary::env_param), or -1.
+pub fn env_slot() -> i64 {
+    unsafe {
+        if PARAM_LOCALS.count == 0 || PARAM_LOCALS.data[0] < 0 || !env_param(CUR_F, 0) {
+            return -1;
+        }
+        slot_of_local(PARAM_LOCALS.data[0])
     }
 }
 
@@ -1134,6 +1174,7 @@ pub fn on_assign(p: i64, n: i64, v: i64) {
             // invalidates what views p)
             use_slot(s, n, &PL_MASK[p * NW]);
             write_place(p, n, H_WRITE, s);
+            note_env_store(s, v);
             if v >= 0 {
                 or_into(l2(slot_off(CUR, s)), l1(v));
                 or_into(l2(slot_off(CUR, s)), l2(v));
@@ -1407,16 +1448,25 @@ pub fn on_result(e: i64, v: i64) {
             let q = escaping(m, 0 as *i64);
             if q >= 0 && !hidden_place(q) && !hidden_local(l) && reporting(e) {
                 own_begin(e, OWN_ESCAPE);
-                own_sym(FNS[f].display);
-                own_str(c" stores a view of ");
-                own_place(q);
-                own_str(c" into what ");
-                own_sym(LOCALS[l].name);
-                own_str(c" points to, and ");
-                own_place(root_of(q));
-                own_str(c" is dropped when ");
-                own_sym(FNS[f].display);
-                own_str(c" returns");
+                if env_param(f, i) {
+                    // (0.25: a closure storing into what it captures)
+                    own_str(c"the closure stores a view of ");
+                    own_place(q);
+                    own_str(c" into a variable it captures, and ");
+                    own_place(root_of(q));
+                    own_str(c" is dropped when the closure returns");
+                } else {
+                    own_sym(FNS[f].display);
+                    own_str(c" stores a view of ");
+                    own_place(q);
+                    own_str(c" into what ");
+                    own_sym(LOCALS[l].name);
+                    own_str(c" points to, and ");
+                    own_place(root_of(q));
+                    own_str(c" is dropped when ");
+                    own_sym(FNS[f].display);
+                    own_str(c" returns");
+                }
                 own_help(
                     c"store an owned copy (a Buf, '.to_vec()'), or keep the owner in the caller");
                 if any_and(l2(off), at_mark()) {

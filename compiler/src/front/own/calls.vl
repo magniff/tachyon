@@ -24,25 +24,31 @@
 // (§7 V3).
 
 use crate::front::ast::{NODES, NodeKind, child};
-use crate::front::check::Res;
+use crate::front::check::{LOCALS, Res};
+use crate::front::closures::{CAPTURE_LIST, CLOSURES, closure_of_type};
 use crate::front::effects::{EFF_GLOBAL, effects_top, fn_effects};
-use crate::front::modules::{STD_MODULE, within_std};
+use crate::front::modules::within_std;
 use crate::front::own::diag::{
-    OWN_CONFLICT, own_begin, own_end, own_help, own_pos, own_soft, own_str,
+    OWN_CONFLICT, OWN_ESCAPE, own_begin, own_end, own_help, own_pos, own_soft, own_str, own_sym,
 };
-use crate::front::own::infer::summary_at_call;
-use crate::front::own::kinds::is_view_type;
+use crate::front::own::infer::{col_callable, deep, holds, summary_at_call};
+use crate::front::own::kinds::{is_view_type, view_elem};
 use crate::front::own::state::{
     CUR, NSLOT, PE, PEND, PE_BY, PE_INVALID, PE_NODE, PE_OV, PE_PLACE, PK_MUT, PK_MUT_VIEW, PK_NONE,
-    PK_RAW, PK_RESERVE, PK_SHARED, PK_VIEW, PL_COUNT, POOL_TOP, STATIC_MASK, at, clear_bit, get_bit,
-    is_empty, l1, l2, mark_place, new_ov, or_expanded, or_into, ov_hits, root_of, set_bit, slot_off,
+    PK_RAW, PK_RESERVE, PK_SHARED, PK_VIEW, PL_COUNT, PL_PARENT, PL_RID, PL_RKIND, POOL_TOP,
+    RK_LOCAL, STATIC_MASK, at, clear_bit, get_bit, is_empty, l1, l2, local_place, mark_place,
+    new_ov, or_expanded, or_into, ov_hits, root_of, set_bit, slot_of_local, slot_off,
 };
-use crate::front::own::summary::{S_L1_P, S_L1_STAR, S_L2_P, S_L2_STAR};
+use crate::front::own::summary::{
+    S_L1_P, S_L1_STAR, S_L2_P, S_L2_STAR, ViewSummary, captures_by_ref, env_param, store_param,
+};
 use crate::front::own::views::{
-    H_CALL, H_GLOBAL, QUIET, close_mask, first_place, hidden_place, invalidate, own_place, own_src,
-    seen,
+    H_CALL, H_GLOBAL, QUIET, close_mask, env_slot, first_place, hidden_place, invalidate,
+    note_env_store, own_place, own_src, seen,
 };
-use crate::front::types::{FNS, TYPES, TyKind};
+use crate::front::own::walk::CUR_F;
+use crate::front::threads::is_interior_type;
+use crate::front::types::{FNS, STRUCTS, TYPES, TyKind, struct_field};
 
 // Whether origin o holds the mark place (it came in part from a top
 // summary).
@@ -157,6 +163,33 @@ fn apply(dst: i64, o: i64, j: i64, m: *i64) {
     }
 }
 
+// (0.25) The type filter per place: a call's result of type rt, origin o,
+// whose views are of E (kinds::view_elem) points at level 1 only into
+// storage that can hold an E, so a loan on a whole local whose type holds
+// no E, by itself or through its views, is dropped (a `[u8]` made by a
+// closure an iterator over a `Vec<i64>` calls views none of the Vec).
+fn type_narrow(o: i64, rt: i64) {
+    unsafe {
+        let e = view_elem(rt);
+        if e <= 0 {
+            return;
+        }
+        for q in 0..PL_COUNT {
+            if PL_PARENT[q] >= 0 || PL_RKIND[q] != RK_LOCAL || !get_bit(l1(o), q) {
+                continue;
+            }
+            let l = PL_RID[q];
+            if l < 0 {
+                continue;
+            }
+            let t = LOCALS[l].ty;
+            if t > 0 && !holds(t, e) && !deep(t, e) {
+                clear_bit(l1(o), q);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The call
 
@@ -214,10 +247,42 @@ pub fn on_call(n: i64, f: i64, base: i64, dst: i64) {
         }
         let rt = NODES[n].ty;
         let result = dst >= 0 && end > base && is_view_type(rt);
-        if !stores && !result {
+        // (a closure's captures written: its env given to its function, a
+        // closure given to a function that calls it; store_captures)
+        var captures = false;
+        if f >= 0 && NSLOT > 0 {
+            var a1 = base;
+            var j1 = 0;
+            while a1 < end {
+                if closure_target(f, j1, PEND.data[a1 + PE_NODE]) {
+                    captures = true;
+                }
+                a1 += PE;
+                j1 += 1;
+            }
+        }
+        if f >= 0 && within_std(FNS[f].module) && NSLOT > 0 {
+            interior_stores(base, end);
+        }
+        if !stores && !result && !captures {
             return;
         }
         let s = summary_at_call(n, f);
+        if FNS[CUR_F].tmpl != 0 && within_std(FNS[CUR_F].module)
+            && (f < 0 || !within_std(FNS[f].module)) {
+            lent_escape(n, f, base, end, s);
+        }
+        if captures && !s.top {
+            var a3 = base;
+            var j3 = 0;
+            while a3 < end {
+                if closure_target(f, j3, PEND.data[a3 + PE_NODE]) {
+                    store_captures(a3, base, end, s.sto);
+                }
+                a3 += PE;
+                j3 += 1;
+            }
+        }
         // 4. The stores into `&mut` arguments' referents (std's are pinned
         // by T4: an unpinned one assumes none, until its legacy `*T`
         // parameters are `&T` or `&mut T`)
@@ -233,16 +298,27 @@ pub fn on_call(n: i64, f: i64, base: i64, dst: i64) {
         POOL_TOP = mark;
         // 6. The result.
         if result {
+            // (a callable result in a generic body: what it views is kept
+            // apart for the parametric result, infer::col_call)
+            let callable = col_callable(f);
+            let into = new_ov();
             var b = base;
             var j = 0;
             while b < end {
                 let o = PEND.data[b + PE_OV];
                 if o >= 0 && PEND.data[b] != PK_NONE {
-                    apply(dst, o, j, &s.ret[0]);
+                    apply(into, o, j, &s.ret[0]);
                 }
                 b += PE;
                 j += 1;
             }
+            type_narrow(into, rt);
+            if callable {
+                crate::front::own::infer::col_call(into);
+            }
+            or_into(l1(dst), l1(into));
+            or_into(l2(dst), l2(into));
+            POOL_TOP = into;
             if s.top && !is_empty(l1(dst)) {
                 set_mark(dst);
             }
@@ -260,8 +336,12 @@ fn store(a: i64, base: i64, end: i64, sto: [i64; 4], top: bool) {
             return;
         }
         let at_ty = NODES[arg].ty;
-        if at_ty <= 0 || !is_view_type(if TYPES[at_ty].kind == TyKind::Ptr { TYPES[at_ty].a }
-            else { at_ty }) {
+        let rt = if at_ty > 0 && TYPES[at_ty].kind == TyKind::Ptr { TYPES[at_ty].a } else { at_ty };
+        if rt <= 0 || !is_view_type(rt) {
+            return;
+        }
+        if TYPES[rt].kind == TyKind::Slice && !is_view_type(TYPES[rt].a) {
+            // (0.25: a slice whose elements hold no views comes to hold none)
             return;
         }
         let tmp = new_ov();
@@ -293,6 +373,7 @@ fn store(a: i64, base: i64, end: i64, sto: [i64; 4], top: bool) {
         if top {
             set_mark(tmp);
         }
+        crate::front::own::views::note_env_store(ts, tmp);
         let off = slot_off(CUR, ts);
         let through = NODES[arg].kind == NodeKind::Ident || PEND.data[a] == PK_MUT_VIEW
             || NODES[arg].kind == NodeKind::Unary && path_derefs(NODES[arg].b);
@@ -306,6 +387,248 @@ fn store(a: i64, base: i64, end: i64, sto: [i64; 4], top: bool) {
         }
         POOL_TOP = tmp;
     }
+}
+
+// Whether argument j (node arg) of a call of f holds a closure whose
+// captures the call may store into: the env of a call of the closure's
+// own function, or a closure given to a parameter that stores go into
+// (summary::store_param: a generic function that calls it).
+fn closure_target(f: i64, j: i64, arg: i64) -> bool {
+    unsafe {
+        if j == 0 && env_param(f, 0) {
+            return true;
+        }
+        var t = NODES[arg].ty;
+        if t <= 0 || closure_of_type(t) == 0 {
+            return false;
+        }
+        j < FNS[f].param_count && store_param(f, j)
+    }
+}
+
+// Pending entry a, a closure (its env or its value) the call may store
+// into as the summary's stores say (sto): every argument's views, the
+// closure's own among them (it may store one capture into another), go to
+// the variables it captures by reference: their slots when they are this
+// function's; else this closure's env, when it captures them too (a
+// nested closure); and the closure's own slot.
+fn store_captures(a: i64, base: i64, end: i64, sto: [i64; 4]) {
+    unsafe {
+        let arg = PEND.data[a + PE_NODE];
+        var t = NODES[arg].ty;
+        if t > 0 && TYPES[t].kind == TyKind::Ptr {
+            t = TYPES[t].a;
+        }
+        let c = closure_of_type(t) - 1;
+        if c < 0 {
+            return;
+        }
+        let tmp = new_ov();
+        var b = base;
+        var j = 0;
+        while b < end {
+            let o = PEND.data[b + PE_OV];
+            if o >= 0 && PEND.data[b] != PK_NONE {
+                apply(tmp, o, j, &sto[0]);
+            }
+            b += PE;
+            j += 1;
+        }
+        if is_empty(l1(tmp)) && is_empty(l2(tmp)) {
+            POOL_TOP = tmp;
+            return;
+        }
+        let env = env_slot();
+        for k in 0..CLOSURES[c].capture_count {
+            if CAPTURE_LIST.data[CLOSURES[c].captures + 2 * k + 1] == 0 {
+                continue;
+            }
+            let l = CAPTURE_LIST.data[CLOSURES[c].captures + 2 * k];
+            let s = slot_of_local(l);
+            if s >= 0 {
+                let off = slot_off(CUR, s);
+                let r = local_place(l);
+                let m = new_ov();
+                or_into(l1(m), l1(tmp));
+                or_into(l2(m), l2(tmp));
+                // (minus loans on the variable itself)
+                if r >= 0 {
+                    for q in 0..PL_COUNT {
+                        if root_of(q) == r {
+                            clear_bit(l1(m), q);
+                            clear_bit(l2(m), q);
+                        }
+                    }
+                }
+                or_into(l1(off), l1(m));
+                or_into(l2(off), l2(m));
+                POOL_TOP = m;
+            } else if env >= 0 && captures_by_ref(CUR_F, l) {
+                let off = slot_off(CUR, env);
+                note_env_store(env, tmp);
+                or_into(l2(off), l1(tmp));
+                or_into(l2(off), l2(tmp));
+            }
+        }
+        // (a parameter of the same closure type, of which the argument may
+        // be a copy, `var g = f`: the same closure, so the same captures)
+        for i in 0..crate::front::own::walk::PARAM_LOCALS.count {
+            let pl = crate::front::own::walk::PARAM_LOCALS.data[i];
+            if pl < 0 || i >= FNS[CUR_F].param_count
+                || crate::front::types::fn_param(CUR_F, i) != t {
+                continue;
+            }
+            let ps = slot_of_local(pl);
+            if ps >= 0 && ps != arg_slot(arg) {
+                let off = slot_off(CUR, ps);
+                note_env_store(ps, tmp);
+                or_into(l1(off), l1(tmp));
+                or_into(l2(off), l2(tmp));
+            }
+        }
+        let own = arg_slot(arg);
+        if own >= 0 {
+            let off = slot_off(CUR, own);
+            note_env_store(own, tmp);
+            if own == env {
+                or_into(l2(off), l1(tmp));
+            } else {
+                or_into(l1(off), l1(tmp));
+            }
+            or_into(l2(off), l2(tmp));
+        }
+        POOL_TOP = tmp;
+    }
+}
+
+// Whether type t lends what it locks (std's Mutex and what holds one; a
+// MutexGuard's pointer to one): a function of it hands its callable a
+// reference into memory that changes through shared references.
+fn lends_interior(t: i64) -> bool {
+    unsafe {
+        if t <= 0 {
+            return false;
+        }
+        let u = if TYPES[t].kind == TyKind::Ptr { TYPES[t].a } else { t };
+        if is_interior_type(u) {
+            return true;
+        }
+        if u > 0 && TYPES[u].kind == TyKind::Struct {
+            let st = TYPES[u].a;
+            for i in 0..STRUCTS[st].field_count {
+                let ft = (*struct_field(st, i)).ty;
+                if ft > 0 && TYPES[ft].kind == TyKind::Ptr && is_interior_type(TYPES[ft].a) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+// Call n, in an instance of std's (Mutex::with: CUR_F), of the program's
+// callable f (summary s): a reference the instance makes from a raw
+// pointer into data it locks (`&*p`) must not be viewed by f's result nor
+// stored by f, as the lock is released when the instance returns: own.escape
+// at the call that made the instance.
+fn lent_escape(n: i64, f: i64, base: i64, end: i64, s: ViewSummary) {
+    unsafe {
+        let origin = FNS[CUR_F].origin;
+        if origin <= 0 {
+            return;
+        }
+        var lends = false;
+        for i in 0..FNS[CUR_F].param_count {
+            if lends_interior(crate::front::types::fn_param(CUR_F, i)) {
+                lends = true;
+            }
+        }
+        if !lends {
+            return;
+        }
+        var b = base;
+        var j = 0;
+        while b < end && j < 63 {
+            let arg = PEND.data[b + PE_NODE];
+            let t = NODES[arg].ty;
+            let o = PEND.data[b + PE_OV];
+            let raw = PEND.data[b] == PK_RAW || o < 0 || is_empty(l1(o)) && is_empty(l2(o));
+            if raw && !(j == 0 && env_param(f, 0)) && t > 0 && TYPES[t].kind == TyKind::Ptr
+                && (f < 0 || j < FNS[f].param_count) {
+                let bit = 1 << j;
+                let ret = (s.ret[S_L1_P] & bit) != 0;
+                if ret || (s.sto[S_L1_P] & bit) != 0 {
+                    if seen(origin) {
+                        return;
+                    }
+                    own_begin(origin, OWN_ESCAPE);
+                    if f < 0 {
+                        own_str(if ret { c"the function's result views its argument" }
+                            else { c"the function stores a view of its argument" });
+                    } else {
+                        let pl = NODES[child(FNS[f].node, j)].x;
+                        own_str(if ret { c"the closure's result views " }
+                            else { c"the closure stores a view of " });
+                        if pl >= 0 {
+                            own_sym(LOCALS[pl].name);
+                        } else {
+                            own_str(c"its argument");
+                        }
+                    }
+                    own_str(c", the data ");
+                    own_sym(NODES[FNS[CUR_F].node].a);
+                    own_str(c" locks: the lock is released when ");
+                    own_sym(NODES[FNS[CUR_F].node].a);
+                    own_str(c" returns, and the view would outlive it");
+                    own_help(c"copy what you need out inside the closure ('.to_vec()', an element), or do the work there");
+                    own_end();
+                    return;
+                }
+            }
+            b += PE;
+            j += 1;
+        }
+    }
+}
+
+// A call of std's with an argument that locks data holding views (a
+// `Mutex<Vec<[u8]>>`, interior: changed through a shared reference, which
+// no summary's stores can say): the closures given to it that store views
+// (their summaries' stores) may store them into the data, so the argument
+// comes to view everything those closures hold.
+fn interior_stores(base: i64, end: i64) {
+    unsafe {
+        var a = base;
+        while a < end {
+            let arg = PEND.data[a + PE_NODE];
+            let at_ty = NODES[arg].ty;
+            let u = if at_ty > 0 && TYPES[at_ty].kind == TyKind::Ptr { TYPES[at_ty].a }
+                else { at_ty };
+            let ts = arg_slot(arg);
+            if ts >= 0 && is_view_type(u) && lends_interior(at_ty) {
+                let off = slot_off(CUR, ts);
+                var b = base;
+                while b < end {
+                    let o = PEND.data[b + PE_OV];
+                    let bt = NODES[PEND.data[b + PE_NODE]].ty;
+                    let c = closure_of_type(bt) - 1;
+                    if b != a && o >= 0 && c >= 0 && stores_any(CLOSURES[c].f) {
+                        or_into(l1(off), l1(o));
+                        or_into(l1(off), l2(o));
+                        or_into(l2(off), l2(o));
+                    }
+                    b += PE;
+                }
+            }
+            a += PE;
+        }
+    }
+}
+
+// Whether f's summary stores views.
+fn stores_any(f: i64) -> bool {
+    let s = crate::front::own::summary::summary_of(f);
+    (s.sto[0] | s.sto[1] | s.sto[2] | s.sto[3]) != 0
 }
 
 // A call whose effects include `global`: the views of statics are invalid
