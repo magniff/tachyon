@@ -89,14 +89,13 @@ Nothing is allocated per block or per file; output is buffered (written
 at 64 KiB and at the end, and before an error, so the two streams keep
 their order). The C calls (`open`, `read`, `write`, `close`,
 `strerror`) are declared in `main.vl` without headers, so the program
-also compiles for another target without its C library, and `errno.c`
-reads `errno`, which is a macro (a different function on each system)
-that vole's C import does not give.
+also compiles for another target without its C library; `errno` comes
+from std (`std::sys::sys_errno`).
 
 ## Run it
 
 ```console
-$ volec main.vl errno.c -o sha256sum
+$ volec main.vl -o sha256sum
 ok: built sha256sum
 $ printf abc > abc.txt && : > empty.txt && ./sha256sum abc.txt empty.txt | tee sums
 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  abc.txt
@@ -127,7 +126,7 @@ in 37-byte writes, 40 random files against the system's tool (coreutils'
 and the system's:
 
 ```console
-$ volec -C target-cpu=generic main.vl errno.c -o sha256sum-generic
+$ volec -C target-cpu=generic main.vl -o sha256sum-generic
 ok: built sha256sum-generic
 $ sh test.sh
 known answers: 5 messages, both paths
