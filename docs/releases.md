@@ -1817,8 +1817,10 @@ then the working tree, built and checked for its fixpoint); then, at
 once, `suite-O0`, `suite-O1`, `suite-O2`; `fuzz-plain`, `fuzz-loops`,
 `fuzz-generics`, `fuzz-pressure`, `fuzz-calls`, `fuzz-lang06`,
 `fuzz-vector`, `fuzz-div`, `fuzz-range`, `fuzz-arch` (0.19: the
-intrinsics, `tests/fuzz/run.sh -A`) and `fuzz-seed` (the seed as a
-third oracle); `abi-plain`, `abi-import`, `abi-header`; `objcheck`;
+intrinsics, `tests/fuzz/run.sh -A`), `fuzz-guard` (0.25: guarded
+accesses far out of bounds and calls of 2^62 steps under conditions
+that never hold, in loops, `-G`) and `fuzz-seed` (the seed as a third
+oracle); `abi-plain`, `abi-import`, `abi-header`; `objcheck`;
 `layout` (`tests/cimport/layout.sh` on the system headers); `debug`
 (`tests/debug.sh`); `stress-grow` (0.14, not in `--quick`: the compiler
 run with `VOLE_STRESS_GROW=1`, under which every growth of its tables,
