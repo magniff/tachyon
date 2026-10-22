@@ -197,7 +197,7 @@ try: volec query callers quickest
 try: volec query context quickest --budget 1800
 ```
 
-The total is `best.get(to)`, the sum of `ride_cost(...)` along the way.
+The total is `best[to]`, the sum of `ride_cost(...)` along the way.
 The context of `ride_cost` is small enough to print whole:
 
 ```console
