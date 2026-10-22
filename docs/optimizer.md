@@ -806,7 +806,11 @@ addresses in place of rescanning per address, and a component whose
 functions do not call each other is inferred in one round. The largest
 phases are the loop passes (about 130 ms), register allocation with
 emission (about 110 ms) and inlining with the simplification after it
-(about 80 ms).
+(about 80 ms). (0.25) Its first line, `read, lex and modules (and C
+imports)`, is the time before parsing: reading the files, lexing them,
+loading the modules and std's sections; until 0.25 a compilation left it
+out (about 100 ms of the self-compile), and `VOLE_PHASE_TIMES=1` prints it
+as its first phase too.
 
 **Function pointers as constants:** interprocedural constant propagation
 carries function addresses too: a function pointer parameter every
