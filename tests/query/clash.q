@@ -50,17 +50,17 @@ $ refs Point
 33:16	init	main	->a::Point	let p = a::Point { x: Point(n) };
 33:27	call	main	->geom::Point	let p = a::Point { x: Point(n) };
 # <std>
-43947:16	use	std::window::cocoa	->std::window::objc::Point	NOT_FOUND, Point, Range, Rect, class, class_addIvar, class_addProtocol,
-43999:61	type	std::window::cocoa::add_u_t	->std::window::objc::Point	fn add_u_t(c: *u8, s: *u8, imp: extern "C" fn(*u8, *u8, Point) -> u64, t: *u8) -> bool;
-44109:25	init	std::window::cocoa::post_wake	->std::window::objc::Point	EV_APP_DEFINED, Point { x: 0.0, y: 0.0 }, 0, 0.0, 0, 0 as *u8, 0, WAKE, 0);
-44470:54	type	std::window::cocoa::imp_char_index	->std::window::objc::Point	extern "C" fn imp_char_index(this: *u8, cmd: *u8, p: Point) -> u64 {
-45626:12	def	->std::window::objc::Point	pub struct Point {
-45712:53	type	std::window::objc::msg_p_utudipsii	->std::window::objc::Point	fn msg_p_utudipsii(o: *u8, s: *u8, ty: u64, at: Point, flags: u64, time: f64, win: i64,
-45717:54	type	std::window::objc::msg_p_utudipppbh	->std::window::objc::Point	fn msg_p_utudipppbh(o: *u8, s: *u8, ty: u64, at: Point, flags: u64, time: f64, win: i64,
-45722:53	type	std::window::objc::msg_p_utudipiif	->std::window::objc::Point	fn msg_p_utudipiif(o: *u8, s: *u8, ty: u64, at: Point, flags: u64, time: f64, win: i64,
-45781:33	type	std::window::objc::msg_t	->std::window::objc::Point	fn msg_t(o: *u8, s: *u8) -> Point;
-45793:36	type	std::window::objc::msg_t_tp	->std::window::objc::Point	fn msg_t_tp(o: *u8, s: *u8, a: Point, b: *u8) -> Point;
-45793:54	type	std::window::objc::msg_t_tp	->std::window::objc::Point	fn msg_t_tp(o: *u8, s: *u8, a: Point, b: *u8) -> Point;
+43948:16	use	std::window::cocoa	->std::window::objc::Point	NOT_FOUND, Point, Range, Rect, class, class_addIvar, class_addProtocol,
+44000:61	type	std::window::cocoa::add_u_t	->std::window::objc::Point	fn add_u_t(c: *u8, s: *u8, imp: extern "C" fn(*u8, *u8, Point) -> u64, t: *u8) -> bool;
+44110:25	init	std::window::cocoa::post_wake	->std::window::objc::Point	EV_APP_DEFINED, Point { x: 0.0, y: 0.0 }, 0, 0.0, 0, 0 as *u8, 0, WAKE, 0);
+44471:54	type	std::window::cocoa::imp_char_index	->std::window::objc::Point	extern "C" fn imp_char_index(this: *u8, cmd: *u8, p: Point) -> u64 {
+45627:12	def	->std::window::objc::Point	pub struct Point {
+45713:53	type	std::window::objc::msg_p_utudipsii	->std::window::objc::Point	fn msg_p_utudipsii(o: *u8, s: *u8, ty: u64, at: Point, flags: u64, time: f64, win: i64,
+45718:54	type	std::window::objc::msg_p_utudipppbh	->std::window::objc::Point	fn msg_p_utudipppbh(o: *u8, s: *u8, ty: u64, at: Point, flags: u64, time: f64, win: i64,
+45723:53	type	std::window::objc::msg_p_utudipiif	->std::window::objc::Point	fn msg_p_utudipiif(o: *u8, s: *u8, ty: u64, at: Point, flags: u64, time: f64, win: i64,
+45782:33	type	std::window::objc::msg_t	->std::window::objc::Point	fn msg_t(o: *u8, s: *u8) -> Point;
+45794:36	type	std::window::objc::msg_t_tp	->std::window::objc::Point	fn msg_t_tp(o: *u8, s: *u8, a: Point, b: *u8) -> Point;
+45794:54	type	std::window::objc::msg_t_tp	->std::window::objc::Point	fn msg_t_tp(o: *u8, s: *u8, a: Point, b: *u8) -> Point;
 $ show a::Point
 // crate::a::Point	clash/a.vl:6-8
 pub struct Point {
@@ -83,7 +83,7 @@ str::len	../../compiler/std/string.vl:287:12	method	pub fn len(self) -> i64	effe
 std::string::String::len	../../compiler/std/string.vl:1165:12	method	pub fn len(self) -> i64
 Path::len	../../compiler/std/path.vl:50:12	method	pub fn len(self) -> i64	effects: none
 std::fs::Metadata::len	../../compiler/std/fs.vl:206:12	method	pub fn len(self) -> i64	effects: none
-std::env::Args::len	../../compiler/std/env.vl:69:12	method	pub fn len(self) -> i64	effects: none
+std::env::Args::len	../../compiler/std/env.vl:70:12	method	pub fn len(self) -> i64	effects: none
 $ refs V2::len
 # clash/geom.vl
 15:12	def	pub fn len(self) -> i64 {
@@ -214,9 +214,9 @@ $ refs Point.x
 33:24	init	main	->a::Point.x	let p = a::Point { x: Point(n) };
 34:39	read	main	->a::Point.x	let s = sys::SockaddrIn { port: p.x };
 # <std>
-44109:33	init	std::window::cocoa::post_wake	->std::window::objc::Point.x	EV_APP_DEFINED, Point { x: 0.0, y: 0.0 }, 0, 0.0, 0, 0 as *u8, 0, WAKE, 0);
-44294:18	read	std::window::cocoa::imp_mouse	->std::window::objc::Point.x	x: p.x * s,
-45627:9	def	->std::window::objc::Point.x	pub x: f64,
+44110:33	init	std::window::cocoa::post_wake	->std::window::objc::Point.x	EV_APP_DEFINED, Point { x: 0.0, y: 0.0 }, 0, 0.0, 0, 0 as *u8, 0, WAKE, 0);
+44295:18	read	std::window::cocoa::imp_mouse	->std::window::objc::Point.x	x: p.x * s,
+45628:9	def	->std::window::objc::Point.x	pub x: f64,
 $ refs .x --count
 3	crate::a::Point.x
 9	crate::geom::V2.x

@@ -31,7 +31,7 @@ $ callees main --writes table::Table.count
 # calls016/table.vl
 15:14	write	main > add_and_sum > table::grow > table::put	(*t).count += 1;
 $ callees sum --writes TABLE
-note query.empty: sum reaches no write or borrow of table::TABLE (216 functions reached by calls and functions named as values)
+note query.empty: sum reaches no write or borrow of table::TABLE (213 functions reached by calls and functions named as values)
 $ callees sum --writes TABLE --count
 0
 ## query refs of a local (0.16): FN::local, or FILE:LINE:COL at its
