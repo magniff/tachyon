@@ -61,7 +61,10 @@ fn main(gpa: Gpa) -> i32 {
   expressions after `::` (`Vec::<u8>::new_in(gpa)`, `max::<i64>(a, b)`,
   `Pair::<i64> { a: 1, b: 2 }`, a method's own: `x.m::<u8>()`). They are inferred
   from arguments and from the expected type (`let v: Vec<i64> =
-  Vec::new_in(gpa);`); unsuffixed literals are looked at last.
+  Vec::new_in(gpa);`); unsuffixed literals are looked at last. A `[T]`
+  parameter (let, `inout` or `sink`) infers T from what lends it the
+  slice: `sort(&v)` of a `Vec<i64>`, `&xs[a..b]`, an array, a Buf, a
+  String's bytes (to read), `&xs` of an `inout [T]` parameter (0.25.1).
 - A generic function used as a value needs its arguments:
   `let f = largest::<i64>;`.
 - Without bounds, a body is checked per instance: `a > b` works for

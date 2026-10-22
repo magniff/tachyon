@@ -981,6 +981,23 @@ case example_layout in
         ;;
 esac
 
+# (0.25.1) The README's example: its first code block under "## An
+# example" is tests/run/readme_example.vl after its header (compiled and
+# run as a case there); category "readme".
+case readme_sync in
+    *"$FILTER"*)
+        readme_block=$(awk '/^## An example/ { s = 1; next } s && /^```/ { if (c) exit; c = 1; next } c' "$ROOT/README.md")
+        readme_case=$(awk 'h { print; next } /^$/ { h = 1 }' "$ROOT/tests/run/readme_example.vl")
+        if [ -n "$readme_block" ] && [ "$readme_block" = "$readme_case" ]; then
+            echo "readme pass" >>"$TALLY"
+        else
+            echo "readme fail" >>"$TALLY"
+            printf 'FAIL readme_sync:\n    README.md "An example" differs from tests/run/readme_example.vl (after its header)\n\n' >>"$FAILURES"
+        fi
+        count=$((count + 1))
+        ;;
+esac
+
 # The examples' sessions (0.15): tests/walkthrough/run.sh (run above),
 # each examples/tools/NAME/README.md (0.16: and each other
 # examples/GROUP/NAME/README.md with a console block) run as a
