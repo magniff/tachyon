@@ -5,27 +5,30 @@ values, each with the outcome its value semantics give, computed here.
 A program is generated as a tree (the classes below) that is both printed
 as vole and run by a small interpreter of the value semantics: moves,
 copies, clones, inout accesses, sink parameters, drops at scope end in
-reverse declaration order, temporaries at the end of their statement,
-drop flags of conditionally moved locals, early returns and `?`. The
-interpreter gives the expected output: every observation the program
-prints (`o<N> ...`) and every drop of a Tracked value (`d<id>`), in order
-where the order is specified (an enum's payload: a set), and at the end
-`live 0`. The program is then compiled at several levels and job counts
-with --check-alloc, run, and compared with the expectation and with each
-other. Failing programs are shrunk (statements deleted while the failure
-stays the same) and kept.
+reverse declaration order (with the `defer`s), temporaries at the end of
+their statement, drop flags of conditionally moved locals and fields,
+early returns, `break`, `?`. The interpreter gives the expected output:
+every observation the program prints (`o<N> ...`) and every drop of a
+Tracked value (`d<id>`), in order where the order is specified (an
+enum's payload is a set), and at the end `live 0`. The program is then
+compiled at -O0, -O1 and -O2, at -j1 and -j8, with --check-alloc (and
+once without), run, and compared with the expectation. A program the
+checker rejects is a possible OVERSTRICT finding (or a generator bug).
+Failing programs are shrunk (statements and functions deleted while the
+failure stays the same) and kept, with their expected output.
 
 usage: tools/semfuzz/semfuzz.py [-c VOLEC] [-n COUNT] [-f FIRST] [-k DIR]
                                 [-j JOBS] [--known] [--no-shrink]
-                                [--print SEED] [--levels L,..]
+                                [--print SEED] [--shrink SEED] [--size N]
 
-  -c VOLEC     the compiler (default: target/volec)
-  -n COUNT     programs (default 100); -f FIRST: the first seed (default 1)
-  -k DIR       where failing programs are kept (default tests/fuzz/failures/sem)
-  -j JOBS      programs at once (default: $VOLE_JOBSERVER's slots, or the CPUs)
-  --known      also generate the constructs of known bugs (see KNOWN)
-  --print SEED print the program of SEED and its expected output, and stop
-  --size N     statements in run's body, about (default 24)
+  -c VOLEC      the compiler (default: target/volec)
+  -n COUNT      programs (default 100); -f FIRST: the first seed (default 1)
+  -k DIR        where failing programs are kept (default tests/fuzz/failures/sem)
+  -j JOBS       programs at once (default: $VOLE_JOBSERVER's slots, or the CPUs)
+  --known       also generate the constructs of known bugs (KNOWN below)
+  --print SEED  print the program of SEED and its expected output
+  --shrink SEED check SEED, and print it shrunk if it fails
+  --size N      statements in run's body, about (default 24)
 
 Exit status: 0 when every program behaved as expected.
 """
@@ -105,6 +108,27 @@ class SV:
         self.n = n
 
 
+class TupV:
+    __slots__ = ('_0', '_1')
+
+    def __init__(self, a, b):
+        self._0 = a
+        self._1 = b
+
+
+class GV:
+    """struct G { t: T, k: i64 } with a Drop of its own."""
+    __slots__ = ('t', 'k')
+
+    def __init__(self, t, k):
+        self.t = t
+        self.k = k
+
+
+class ArrV(list):
+    pass
+
+
 class EV:
     __slots__ = ('tag', 'items')
 
@@ -152,6 +176,13 @@ class CloV:
         self.k = k
 
 
+class DeferMark:
+    __slots__ = ('n',)
+
+    def __init__(self, n):
+        self.n = n
+
+
 def copy_plain(v):
     if type(v) is PV:
         return PV(v.x, v.y)
@@ -160,6 +191,10 @@ def copy_plain(v):
 
 def is_plain(v):
     return type(v) in (int, bool, PV)
+
+
+def attr(f):
+    return '_' + f if f[0].isdigit() else f
 
 
 # ---------------------------------------------------------------- places
@@ -179,7 +214,8 @@ class Cell:
 
 
 class AliasCell:
-    """A let or inout parameter: the caller's place, never dropped here."""
+    """A let or inout parameter, an inout local: the place it accesses,
+    never dropped here."""
     __slots__ = ('place', 'owned')
 
     def __init__(self, place):
@@ -196,9 +232,9 @@ class AliasCell:
 class AttrPlace:
     __slots__ = ('obj', 'attr')
 
-    def __init__(self, obj, attr):
+    def __init__(self, obj, a):
         self.obj = obj
-        self.attr = attr
+        self.attr = a
 
     def get(self):
         return getattr(self.obj, self.attr)
@@ -221,13 +257,17 @@ class IdxPlace:
         self.lst[self.i] = v
 
 
+PLACES = (Cell, AliasCell, AttrPlace, IdxPlace)
+
+
 class ReturnEx(Exception):
     def __init__(self, val):
         self.val = val
 
 
 class BreakEx(Exception):
-    pass
+    def __init__(self, label=None):
+        self.label = label
 
 
 class ContinueEx(Exception):
@@ -257,7 +297,7 @@ class Interp:
 
     def tick(self):
         self.steps += 1
-        if self.steps > 200000:
+        if self.steps > 100000:
             raise Invalid('runs too long')
 
     def line(self, s):
@@ -286,6 +326,8 @@ class Interp:
             return StrV(v.s)
         if t is PV:
             return PV(v.x, v.y)
+        if t is TupV:
+            return TupV(self.clone(v._0), self.clone(v._1))
         return v
 
     def drop(self, v):
@@ -295,12 +337,18 @@ class Interp:
         if t is TV:
             self.live -= 1
             self.line('d%d' % v.id)
-        elif t is list:
+        elif t is list or t is ArrV:
             for e in v:
                 self.drop(e)
         elif t is SV:
             self.drop(v.t)
             self.drop(v.w)
+        elif t is TupV:
+            self.drop(v._0)
+            self.drop(v._1)
+        elif t is GV:
+            self.line('dg%d %d' % (v.k, v.t.id))
+            self.drop(v.t)
         elif t is EV:
             items = [e for e in v.items if e is not MOVED]
             if len(items) >= 2:
@@ -324,7 +372,9 @@ class Interp:
 
     def drop_scope(self, sc):
         for _, c in reversed(sc):
-            if c.owned:
+            if type(c) is DeferMark:
+                self.line('df%d' % c.n)
+            elif c.owned:
                 v = c.val
                 c.val = MOVED
                 self.drop(v)
@@ -332,7 +382,10 @@ class Interp:
     def run(self):
         fr = Frame()
         fr.scopes.append([('gpa', Cell(0, owned=False))])
-        self.prog.run_fn.body.run(self, fr)
+        try:
+            self.prog.run_fn.body.run(self, fr)
+        except ReturnEx:
+            pass
         self.line('live %d' % self.live)
         return self.ev
 
@@ -340,8 +393,11 @@ class Interp:
 def rd(v):
     if v is MOVED:
         raise Invalid('read of a moved value')
-    if type(v) is SV and (v.t is MOVED or v.w is MOVED):
+    t = type(v)
+    if t is SV and (v.t is MOVED or v.w is MOVED):
         raise Invalid('read of a partly moved struct')
+    if t is TupV and (v._0 is MOVED or v._1 is MOVED):
+        raise Invalid('read of a partly moved tuple')
     return v
 
 
@@ -373,7 +429,7 @@ class PField:
         obj = self.base.place(it, fr).get()
         if obj is MOVED:
             raise Invalid('field of a moved value')
-        return AttrPlace(obj, self.f)
+        return AttrPlace(obj, attr(self.f))
 
     def root(self):
         return self.base.root()
@@ -400,7 +456,6 @@ class PIdx:
 # ---------------------------------------------------------------- expressions
 
 class E:
-    """An expression: code() and ev(it, fr)."""
     pass
 
 
@@ -424,6 +479,17 @@ class BoolLit(E):
 
     def ev(self, it, fr):
         return self.b
+
+
+class StrLit(E):
+    def __init__(self, s):
+        self.s = s
+
+    def code(self):
+        return '"%s"' % self.s
+
+    def ev(self, it, fr):
+        return self.s
 
 
 class Read(E):
@@ -466,6 +532,8 @@ class Bin(E):
 
     def ev(self, it, fr):
         a = self.a.ev(it, fr)
+        if self.op == '&&' and not a:
+            return False
         b = self.b.ev(it, fr)
         op = self.op
         if op == '+':
@@ -485,13 +553,24 @@ class Bin(E):
         if op == '>':
             return a > b
         if op == '&&':
-            return a and b
+            return bool(b)
         raise ValueError(op)
 
 
+class Not(E):
+    def __init__(self, x):
+        self.x = x
+
+    def code(self):
+        return '!%s' % self.x.code()
+
+    def ev(self, it, fr):
+        return not self.x.ev(it, fr)
+
+
 class Arg:
-    """An argument: conv 'let' (a place or, for a plain value, an
-    expression), 'inout' (a place, `&p`), 'sink' or 'val' (an expression)."""
+    """An argument: conv 'let' (a place or a temporary), 'inout' (a
+    place, `&p`), 'sink' or 'val' (an expression)."""
     def __init__(self, conv, x):
         self.conv = conv
         self.x = x
@@ -529,7 +608,7 @@ def eval_args(it, fr, args):
 
 def val(x):
     """A let argument's value (a place, or a temporary)."""
-    if isinstance(x, (Cell, AliasCell, AttrPlace, IdxPlace)):
+    if isinstance(x, PLACES):
         return rd(x.get())
     return x
 
@@ -562,6 +641,9 @@ class Call(E):
                 rd(recv.get())
         return HELPERS[self.name](it, recv, *args)
 
+
+# The header's functions, in the model. A let argument is a place (or a
+# temporary's cell), an inout one a place, a sink one the value.
 
 def h_obs(it, r, t):
     return val(t).v
@@ -646,6 +728,10 @@ def h_gid(it, r, x):
     return x
 
 
+def h_dup(it, r, x):
+    return it.clone(val(x))
+
+
 def h_chk(it, r, t, lim):
     t = val(t)
     if t.v > lim:
@@ -686,6 +772,41 @@ def h_callf(it, r, f):
     return n
 
 
+def h_geat(it, r, g):
+    k = g.k
+    it.drop(g)
+    return k
+
+
+def h_usig(it, r, u):
+    u = rd(val(u))
+    return wrap(u._0.id * 100 + u._1.id * 10 + u._0.v + u._1.v)
+
+
+def h_vssig(it, r, ws):
+    h = 3
+    for s in val(ws):
+        h = wrap(wrap(h * 17) + h_ssig(it, None, s))
+    return h
+
+
+def h_swap(it, r, a, b):
+    va = rd(a.get())
+    vb = rd(b.get())
+    a.set(vb)
+    b.set(va)
+
+
+def h_replace(it, r, dest, v):
+    old = rd(dest.get())
+    dest.set(v)
+    return old
+
+
+def h_drop(it, r, x):
+    it.drop(x)
+
+
 # methods: recv is a place (let, inout) or a value (sink)
 
 def m_get(it, r):
@@ -714,6 +835,12 @@ def m_push(it, r, x):
 def m_pop(it, r):
     w = rd(r.get())
     return OV(w.pop() if w else None)
+
+
+def m_last(it, r):
+    # (for --known: a borrowed copy; the model gives the element)
+    w = rd(r.get())
+    return OV(w[-1] if w else None)
 
 
 def m_remove(it, r, i):
@@ -766,15 +893,24 @@ def m_len(it, r):
     return len(v)
 
 
+def m_is_empty(it, r):
+    return len(rd(r.get())) == 0
+
+
 def m_is_some(it, r):
     return rd(r.get()).val is not None
 
 
+def m_unwrap(it, r):
+    if r.val is None:
+        raise Invalid('unwrap of None (unguarded)')
+    return r.val
+
+
 def m_unwrap_or(it, r, other):
-    o = r
-    if o.val is not None:
+    if r.val is not None:
         it.drop(other)
-        return o.val
+        return r.val
     return other
 
 
@@ -783,36 +919,46 @@ def m_push_str(it, r, s):
     x.s = x.s + s
 
 
-def h_swap(it, r, a, b):
-    va = rd(a.get())
-    vb = rd(b.get())
-    a.set(vb)
-    b.set(va)
+def m_take(it, r):
+    w = rd(r.get())
+    r.set([])
+    return w
 
 
-def h_replace(it, r, dest, v):
-    old = rd(dest.get())
-    dest.set(v)
-    return old
+def m_tv(it, r):
+    s = rd(r.get())
+    return wrap(s.t.v + s.n)
 
 
-def h_drop(it, r, x):
-    it.drop(x)
+def m_grow(it, r, k):
+    s = rd(r.get())
+    s.w.append(it.mk(k))
+    s.n = wrap(s.n + 1)
+
+
+def m_into_t(it, r):
+    s = rd(r)
+    t = s.t
+    it.drop(s.w)
+    return t
 
 
 HELPERS = {
     'obs': h_obs, 'bump': h_bump, 'eat': h_eat, 'ident': h_ident,
     'vsig': h_vsig, 'vbump': h_vbump, 'veat': h_veat, 'keep': h_keep,
     'pick': h_pick, 'ssig': h_ssig, 'esig': h_esig, 'osig': h_osig,
-    'total': h_total, 'gid': h_gid, 'chk': h_chk, 'tchk': h_tchk,
-    'pget': h_pget, 'pbump': h_pbump, 'psink': h_psink, 'seat': h_seat,
-    'callf': h_callf, 'std::swap': h_swap, 'std::replace': h_replace,
+    'total': h_total, 'gid': h_gid, 'dup': h_dup, 'chk': h_chk,
+    'tchk': h_tchk, 'pget': h_pget, 'pbump': h_pbump, 'psink': h_psink,
+    'seat': h_seat, 'callf': h_callf, 'geat': h_geat, 'usig': h_usig,
+    'vssig': h_vssig, 'std::swap': h_swap, 'std::replace': h_replace,
     'drop': h_drop,
     'get': m_get, 'add': m_add, 'into_v': m_into_v, 'clone': m_clone,
-    'push': m_push, 'pop': m_pop, 'remove': m_remove, 'insert': m_insert,
-    'truncate': m_truncate, 'clear': m_clear, 'swap': m_swap, 'set': m_set,
-    'len': m_len, 'is_some': m_is_some, 'unwrap_or': m_unwrap_or,
-    'push_str': m_push_str,
+    'push': m_push, 'pop': m_pop, 'last': m_last, 'remove': m_remove,
+    'insert': m_insert, 'truncate': m_truncate, 'clear': m_clear,
+    'swap': m_swap, 'set': m_set, 'len': m_len, 'is_empty': m_is_empty,
+    'is_some': m_is_some, 'unwrap': m_unwrap, 'unwrap_or': m_unwrap_or,
+    'push_str': m_push_str, 'take': m_take, 'tv': m_tv, 'grow': m_grow,
+    'into_t': m_into_t,
 }
 
 
@@ -848,6 +994,42 @@ class NewS(E):
         t = self.t.ev(it, fr)
         w = self.w.ev(it, fr)
         return SV(t, w, self.n)
+
+
+class NewG(E):
+    def __init__(self, t, k):
+        self.t = t
+        self.k = k
+
+    def code(self):
+        return 'G { t: %s, k: %d }' % (self.t.code(), self.k)
+
+    def ev(self, it, fr):
+        return GV(self.t.ev(it, fr), self.k)
+
+
+class NewTup(E):
+    def __init__(self, a, b):
+        self.a = a
+        self.b = b
+
+    def code(self):
+        return '(%s, %s)' % (self.a.code(), self.b.code())
+
+    def ev(self, it, fr):
+        a = self.a.ev(it, fr)
+        return TupV(a, self.b.ev(it, fr))
+
+
+class NewArr(E):
+    def __init__(self, items):
+        self.items = items
+
+    def code(self):
+        return '[%s]' % ', '.join(x.code() for x in self.items)
+
+    def ev(self, it, fr):
+        return ArrV([x.ev(it, fr) for x in self.items])
 
 
 class NewE(E):
@@ -919,8 +1101,8 @@ class Wrap(E):
 
 
 class Unres(E):
-    """An int from an Option<i64> or a Result<i64, i64> call: `match e {
-    Some(n) => n, None => -7 }`."""
+    """An i64 from an Option<i64> or a Result<i64, i64>: `match e {
+    Some(q) => q, None => -7 }`."""
     def __init__(self, x, kind):
         self.x = x
         self.kind = kind
@@ -1013,7 +1195,7 @@ class CallGen(E):
         nf = Frame()
         sc = [('gpa', Cell(0, owned=False))]
         for (pname, conv, ty), v in zip(self.fn.params, vals):
-            if conv in ('let', 'inout') and isinstance(v, (Cell, AliasCell, AttrPlace, IdxPlace)):
+            if conv in ('let', 'inout') and isinstance(v, PLACES):
                 sc.append((pname, AliasCell(v)))
             else:
                 sc.append((pname, Cell(copy_plain(v), owned=True)))
@@ -1049,6 +1231,35 @@ class Decl(S_):
     def run(self, it, fr):
         v = self.init.ev(it, fr)
         fr.scopes[-1].append((self.name, Cell(v)))
+
+
+class Destructure(S_):
+    """`let (a, b) = u;`: u moves, a and b are its parts."""
+    def __init__(self, a, b, p):
+        self.a = a
+        self.b = b
+        self.p = p
+
+    def emit(self, out, ind):
+        out.append('%slet (%s, %s) = %s;' % (ind, self.a, self.b, self.p.code()))
+
+    def run(self, it, fr):
+        pl = self.p.place(it, fr)
+        u = rd(pl.get())
+        pl.set(MOVED)
+        fr.scopes[-1].append((self.a, Cell(u._0)))
+        fr.scopes[-1].append((self.b, Cell(u._1)))
+
+
+class Defer(S_):
+    def __init__(self, n):
+        self.n = n
+
+    def emit(self, out, ind):
+        out.append('%sdefer println("df%d");' % (ind, self.n))
+
+    def run(self, it, fr):
+        fr.scopes[-1].append(('#defer', DeferMark(self.n)))
 
 
 class Assign(S_):
@@ -1175,36 +1386,79 @@ class If(S_):
             self.els.run(it, fr)
 
 
+def loop_body(it, fr, body, label, pre=None):
+    """One iteration; False when the loop ends here."""
+    try:
+        body.run(it, fr, pre=pre)
+    except BreakEx as b:
+        if b.label is None or b.label == label:
+            return False
+        raise
+    except ContinueEx:
+        pass
+    return True
+
+
 class For(S_):
-    def __init__(self, var, n, body):
+    def __init__(self, var, n, body, label=None):
         self.var = var
         self.n = n
         self.body = body
+        self.label = label
 
     def emit(self, out, ind):
-        out.append('%sfor %s in 0..%d {' % (ind, self.var, self.n))
+        lab = '%s: ' % self.label if self.label else ''
+        out.append('%s%sfor %s in 0..%d {' % (ind, lab, self.var, self.n))
         self.body.emit_body(out, ind + '    ')
         out.append(ind + '}')
 
     def run(self, it, fr):
         for i in range(self.n):
-            try:
-                self.body.run(it, fr, pre=[(self.var, Cell(i, owned=False))])
-            except BreakEx:
+            it.tick()
+            if not loop_body(it, fr, self.body, self.label, pre=[(self.var, Cell(i, owned=False))]):
                 break
-            except ContinueEx:
-                continue
+
+
+class While(S_):
+    """`while c < K { c += 1; body }` (the count first: a continue does
+    not skip it)."""
+    def __init__(self, cname, n, body):
+        self.cname = cname
+        self.n = n
+        self.body = body
+
+    def emit(self, out, ind):
+        out.append('%swhile %s < %d {' % (ind, self.cname, self.n))
+        out.append('%s    %s += 1;' % (ind, self.cname))
+        self.body.emit_body(out, ind + '    ')
+        out.append(ind + '}')
+
+    def run(self, it, fr):
+        c = fr.lookup(self.cname)
+        while c.get() < self.n:
+            it.tick()
+            c.set(c.get() + 1)
+            if not loop_body(it, fr, self.body, None):
+                break
 
 
 class Break(S_):
-    def __init__(self, cont=False):
+    def __init__(self, cont=False, label=None):
         self.cont = cont
+        self.label = label
 
     def emit(self, out, ind):
-        out.append(ind + ('continue;' if self.cont else 'break;'))
+        if self.cont:
+            out.append(ind + 'continue;')
+        elif self.label:
+            out.append('%sbreak :%s;' % (ind, self.label))
+        else:
+            out.append(ind + 'break;')
 
     def run(self, it, fr):
-        raise ContinueEx() if self.cont else BreakEx()
+        if self.cont:
+            raise ContinueEx()
+        raise BreakEx(self.label)
 
 
 class Return(S_):
@@ -1212,10 +1466,13 @@ class Return(S_):
         self.x = x
 
     def emit(self, out, ind):
-        out.append('%sreturn %s;' % (ind, self.x.code()))
+        if self.x is None:
+            out.append(ind + 'return;')
+        else:
+            out.append('%sreturn %s;' % (ind, self.x.code()))
 
     def run(self, it, fr):
-        raise ReturnEx(self.x.ev(it, fr))
+        raise ReturnEx(None if self.x is None else self.x.ev(it, fr))
 
 
 class Question(S_):
@@ -1286,41 +1543,85 @@ class MatchE(S_):
             self.arms['_'][1].run(it, fr)
 
 
-class IfLet(S_):
-    """`if let Some(t) = o { .. } else { .. }` (or the match form): o moves."""
-    def __init__(self, p, name, then, els, form):
-        self.p = p
+class MatchOpt(S_):
+    """`if let Some(t) = x { .. } else { .. }`, its match form, or the same
+    on a Result<T, i64> (`Ok(t)`, `Err(n)`); x is an owned local (which
+    moves) or a call (a temporary). `while let Some(t) = w.pop() { .. }`
+    with form 'while'."""
+    def __init__(self, x, kind, name, then, ename, els, form):
+        self.x = x
+        self.kind = kind     # 'O' or 'R'
         self.name = name
         self.then = then
+        self.ename = ename   # the Err binding (R)
         self.els = els
-        self.form = form
+        self.form = form     # 'iflet', 'match', 'while'
 
     def emit(self, out, ind):
-        if self.form == 'iflet':
-            out.append('%sif let Some(%s) = %s {' % (ind, self.name, self.p.code()))
+        some = 'Some(%s)' % self.name if self.kind == 'O' else 'Ok(%s)' % self.name
+        none = 'None' if self.kind == 'O' else 'Err(%s)' % self.ename
+        if self.form == 'while':
+            out.append('%swhile let %s = %s {' % (ind, some, self.x.code()))
+            self.then.emit_body(out, ind + '    ')
+            out.append(ind + '}')
+        elif self.form == 'iflet':
+            out.append('%sif let %s = %s {' % (ind, some, self.x.code()))
             self.then.emit_body(out, ind + '    ')
             if self.els.stmts:
                 out.append(ind + '} else {')
                 self.els.emit_body(out, ind + '    ')
             out.append(ind + '}')
         else:
-            out.append('%smatch %s {' % (ind, self.p.code()))
-            out.append('%s    Some(%s) => {' % (ind, self.name))
+            out.append('%smatch %s {' % (ind, self.x.code()))
+            out.append('%s    %s => {' % (ind, some))
             self.then.emit_body(out, ind + '        ')
             out.append(ind + '    }')
-            out.append(ind + '    None => {')
+            out.append('%s    %s => {' % (ind, none))
             self.els.emit_body(out, ind + '        ')
             out.append(ind + '    }')
             out.append(ind + '}')
 
     def run(self, it, fr):
-        pl = self.p.place(it, fr)
-        v = rd(pl.get())
-        pl.set(MOVED)
-        if v.val is not None:
-            self.then.run(it, fr, pre=[(self.name, Cell(v.val))])
+        if self.form == 'while':
+            while True:
+                it.tick()
+                v = self.x.ev(it, fr)
+                if v.val is None:
+                    break
+                if not loop_body(it, fr, self.then, None, pre=[(self.name, Cell(v.val))]):
+                    break
+            return
+        v = self.x.ev(it, fr)
+        if self.kind == 'O':
+            if v.val is not None:
+                self.then.run(it, fr, pre=[(self.name, Cell(v.val))])
+            else:
+                self.els.run(it, fr)
         else:
-            self.els.run(it, fr)
+            if v.ok:
+                self.then.run(it, fr, pre=[(self.name, Cell(v.val))])
+            else:
+                pre = [(self.ename, Cell(v.val))] if self.form == 'match' else []
+                self.els.run(it, fr, pre=pre)
+
+
+class InoutBlock(S_):
+    """`{ inout r = &place; ops on r }`."""
+    def __init__(self, name, p, body):
+        self.name = name
+        self.p = p
+        self.body = body
+
+    def emit(self, out, ind):
+        out.append(ind + '{')
+        out.append('%s    inout %s = &%s;' % (ind, self.name, self.p.code()))
+        self.body.emit_body(out, ind + '    ')
+        out.append(ind + '}')
+
+    def run(self, it, fr):
+        pl = self.p.place(it, fr)
+        rd(pl.get())
+        self.body.run(it, fr, pre=[(self.name, AliasCell(pl))])
 
 
 class CloBlock(S_):
@@ -1367,11 +1668,28 @@ class CloBlock(S_):
             t.v = wrap(t.v + 2 * self.k)
 
 
+class ForEachObs(S_):
+    """`for x in w { print(f" {x.id}:{x.v}"); }` and a newline: a loop
+    over the borrowed elements."""
+    def __init__(self, p, n):
+        self.p = p
+        self.n = n
+
+    def emit(self, out, ind):
+        out.append('%sprint("o%d");' % (ind, self.n))
+        out.append('%sfor x in %s { print(f" {x.id}:{x.v}"); }' % (ind, self.p.code()))
+        out.append('%sprintln("");' % ind)
+
+    def run(self, it, fr):
+        w = rd(self.p.place(it, fr).get())
+        it.line('o%d%s' % (self.n, ''.join(' %d:%d' % (x.id, x.v) for x in w)))
+
+
 class GenFn:
     def __init__(self, name, params, ret, body):
         self.name = name
         self.params = params     # [(name, conv, ty)]
-        self.ret = ret           # 'i', 'T', 'OI', 'RI'
+        self.ret = ret           # 'i', 'T', 'V', 'OI', 'RI'
         self.body = body
 
     def emit(self, out):
@@ -1386,8 +1704,9 @@ class GenFn:
 
 
 TYNAME = {'T': 'T', 'V': 'Vec<T>', 'S': 'S', 'E': 'E', 'O': 'Option<T>',
-          'P': 'Pt', 'Str': 'String', 'i': 'i64', 'F': None}
-RETNAME = {'i': 'i64', 'T': 'T', 'OI': 'Option<i64>', 'RI': 'Result<i64, i64>'}
+          'P': 'Pt', 'Str': 'String', 'i': 'i64', 'G': 'G', 'VS': 'Vec<S>'}
+RETNAME = {'i': 'i64', 'T': 'T', 'V': 'Vec<T>', 'OI': 'Option<i64>',
+           'RI': 'Result<i64, i64>'}
 
 
 class Program:
@@ -1443,8 +1762,23 @@ impl T {
 #[derive(Clone)]
 struct S { t: T, w: Vec<T>, n: i64 }
 
+impl S {
+    fn tv(self) -> i64 { self.t.v + self.n }
+    fn grow(inout self, k: i64) {
+        self.w.push(mk(k));
+        self.n += 1;
+    }
+    fn into_t(sink self) -> T { self.t }
+}
+
 #[derive(Clone)]
 enum E { One(T), Two(T, T), Nada }
+
+struct G { t: T, k: i64 }
+
+impl Drop for G {
+    fn drop(inout self) { println(f"dg{self.k} {self.t.id}"); }
+}
 
 struct Pt { x: i64, y: i64 }
 
@@ -1454,6 +1788,7 @@ impl Score for S { fn score(self) -> i64 { self.t.v + self.w.len() + self.n } }
 
 fn total<X: Score>(x: X) -> i64 { x.score() }
 fn gid<X>(x: sink X) -> X { x }
+fn dup<X: Clone>(x: X) -> X { x.clone() }
 fn obs(t: T) -> i64 { t.v }
 fn bump(t: inout T, k: i64) { t.v += k; }
 fn eat(t: sink T) -> i64 { t.v }
@@ -1473,6 +1808,12 @@ fn vbump(w: inout Vec<T>, k: i64) {
 fn veat(w: sink Vec<T>) -> i64 { w.len() }
 fn keep(w: inout Vec<T>, t: sink T) { w.push(t); }
 fn ssig(s: S) -> i64 { s.t.id * 1000 + s.t.v * 7 + vsig(s.w) + s.n }
+fn vssig(ws: Vec<S>) -> i64 {
+    var h = 3;
+    for s in ws { h = h * 17 + ssig(s); }
+    h
+}
+fn usig(u: (T, T)) -> i64 { u.0.id * 100 + u.1.id * 10 + u.0.v + u.1.v }
 fn esig(e: E) -> i64 {
     match e {
         E::One(a) => a.id * 10 + a.v,
@@ -1494,6 +1835,7 @@ fn tchk(t: sink T, lim: i64) -> Result<T, i64> {
     if t.v > lim { return Err(t.v); }
     Ok(t)
 }
+fn geat(g: sink G) -> i64 { g.k }
 fn pget(p: Pt) -> i64 { p.x * 10 + p.y }
 fn pbump(p: inout Pt, k: i64) { p.x += k; }
 fn psink(p: sink Pt) -> i64 {
@@ -1516,10 +1858,14 @@ MAIN = '''fn main(gpa: Gpa) -> i32 {
 
 # ---------------------------------------------------------------- the generator
 #
-# The generator keeps the checker's view of each variable: live, moved or
-# maybe moved ('L', 'M', 'Q'), per field for S, and makes only the uses
-# the language accepts. Branches join; a branch that leaves (return,
-# break, continue) does not reach the join.
+# The generator keeps the checker's view of each variable: live, moved,
+# maybe moved ('L', 'M', 'Q'; 'X': not to be touched again), per field
+# for S and tuples, and makes only the uses the language accepts.
+# Branches join; a branch that leaves (return, break, continue) does not
+# reach the join.
+
+FIELDS = {'S': ('t', 'w'), 'Tu': ('0', '1')}
+
 
 class Var:
     __slots__ = ('name', 'ty', 'mut', 'kind', 'st', 'fst', 'loop')
@@ -1530,17 +1876,16 @@ class Var:
         self.mut = mut
         self.kind = kind      # 'local', 'let', 'inout', 'sink', 'loopvar'
         self.st = 'L'
-        self.fst = {'t': 'L', 'w': 'L'} if ty == 'S' else None
+        self.fst = {f: 'L' for f in FIELDS[ty]} if ty in FIELDS else None
         self.loop = loop
 
 
 def join_st(a, b):
     if a == b:
         return a
+    if 'X' in (a, b):
+        return 'X'
     return 'Q'
-
-
-OWNED = ('T', 'V', 'S', 'E', 'O', 'Str', 'F')
 
 
 class Ctx:
@@ -1548,8 +1893,9 @@ class Ctx:
         self.scopes = [[]]
         self.loop = 0
         self.ret = ret            # None in run
-        self.break_states = []    # per loop: states at break/continue
+        self.loops = []           # per loop: (label, [states at its breaks])
         self.dead = False         # after a return/break: no more statements
+        self.frozen = set()       # vars not to change (a while let's Vec)
 
 
 class Gen:
@@ -1560,6 +1906,7 @@ class Gen:
         self.nid = 0
         self.nobs = 0
         self.fns = []
+        self.calls = 0
 
     def name(self, p):
         self.nid += 1
@@ -1574,18 +1921,31 @@ class Gen:
 
     # ---- variables
 
-    def all_vars(self, c):
+    def raw_vars(self, c):
         for sc in c.scopes:
             for v in sc:
                 yield v
 
+    def all_vars(self, c):
+        """The visible variables (a shadowed one is not)."""
+        seen = set()
+        out = []
+        for sc in reversed(c.scopes):
+            for v in reversed(sc):
+                if v.name in seen:
+                    continue
+                seen.add(v.name)
+                out.append(v)
+        out.reverse()
+        return out
+
     def snapshot(self, c):
-        return {v.name: (v.st, dict(v.fst) if v.fst else None) for v in self.all_vars(c)}
+        return {id(v): (v.st, dict(v.fst) if v.fst else None) for v in self.raw_vars(c)}
 
     def restore(self, c, snap):
-        for v in self.all_vars(c):
-            if v.name in snap:
-                v.st, f = snap[v.name]
+        for v in self.raw_vars(c):
+            if id(v) in snap:
+                v.st, f = snap[id(v)]
                 v.fst = dict(f) if f else None
 
     def join(self, c, snaps):
@@ -1593,8 +1953,8 @@ class Gen:
         if not snaps:
             return None
         res = {}
-        for name in snaps[0]:
-            sts = [s[name] for s in snaps if name in s]
+        for key in snaps[0]:
+            sts = [s[key] for s in snaps if key in s]
             st = sts[0][0]
             f = dict(sts[0][1]) if sts[0][1] else None
             for s2, f2 in sts[1:]:
@@ -1602,8 +1962,17 @@ class Gen:
                 if f is not None:
                     for k in f:
                         f[k] = join_st(f[k], f2[k])
-            res[name] = (st, f)
+            res[key] = (st, f)
         return res
+
+    def branch_join(self, c, snap, ends):
+        """After branches with end states `ends` (None: it left)."""
+        j = self.join(c, ends)
+        if j is None:
+            c.dead = True
+            self.restore(c, snap)
+        else:
+            self.restore(c, j)
 
     def declare(self, c, name, ty, mut, kind='local'):
         v = Var(name, ty, mut, kind, c.loop)
@@ -1617,52 +1986,71 @@ class Gen:
         return [v for v in self.all_vars(c) if v.ty == ty and self.whole(v)]
 
     def mutable(self, c, ty):
-        return [v for v in self.readable(c, ty) if v.mut]
+        return [v for v in self.readable(c, ty) if v.mut and v.name not in c.frozen]
 
     def movable(self, c, ty):
         return [v for v in self.readable(c, ty)
-                if v.kind in ('local', 'sink') and (v.loop == c.loop or ty in ('P', 'i'))]
+                if v.kind in ('local', 'sink') and v.name not in c.frozen
+                and (v.loop == c.loop or ty in ('P', 'i'))]
 
     def assignable(self, c, ty):
         # a var (or a sink parameter) of any state, an inout parameter
-        # (live); not in a loop for a moved one (it would be revived only
-        # in some iterations)
+        # (live); a moved one only outside loops it was declared out of
         out = []
         for v in self.all_vars(c):
-            if v.ty != ty or not v.mut or v.st == 'X':
+            if v.ty != ty or not v.mut or v.st == 'X' or v.name in c.frozen:
                 continue
             if v.kind == 'inout' and v.st != 'L':
                 continue
             if v.fst is not None and not self.whole(v) and v.st == 'L':
-                continue   # (a partly moved S: assign its fields instead)
+                continue   # (a partly moved one: assign its fields instead)
+            if v.st != 'L' and v.loop != c.loop:
+                continue
             out.append(v)
         return out
 
-    def s_with_field(self, c, f, need_mut=False, movable=False):
+    def with_field(self, c, ty, f, need_mut=False, movable=False):
         out = []
         for v in self.all_vars(c):
-            if v.ty != 'S' or v.st != 'L' or v.fst[f] != 'L':
+            if v.ty != ty or v.st != 'L':
                 continue
-            if need_mut and not v.mut:
+            if v.fst is not None and v.fst[f] != 'L':
                 continue
-            if movable and (v.kind not in ('local', 'sink') or v.loop != c.loop):
+            if need_mut and (not v.mut or v.name in c.frozen):
+                continue
+            if movable and (v.kind not in ('local', 'sink') or v.loop != c.loop or v.name in c.frozen):
+                continue
+            if ty == 'G' and not self.whole(v):
                 continue
             out.append(v)
         return out
 
-    def t_places(self, c, need_mut=False):
-        """Readable places of a T: T variables, S fields `s.t`."""
+    def t_places(self, c, need_mut=False, elems=True):
+        """Readable places of a T: T variables, fields (`s.t`, `u.0`,
+        `g.t`), array elements."""
         ps = [PVar(v.name) for v in (self.mutable(c, 'T') if need_mut else self.readable(c, 'T'))]
-        ps += [PField(PVar(v.name), 't') for v in self.s_with_field(c, 't', need_mut)]
+        ps += [PField(PVar(v.name), 't') for v in self.with_field(c, 'S', 't', need_mut)]
+        ps += [PField(PVar(v.name), 't') for v in self.with_field(c, 'G', 't', need_mut)]
+        for f in ('0', '1'):
+            ps += [PField(PVar(v.name), f) for v in self.with_field(c, 'Tu', f, need_mut)]
+        if elems:
+            vs = self.mutable(c, 'A') if need_mut else self.readable(c, 'A')
+            ps += [PIdx(PVar(v.name), i) for v in vs for i in (0, 1)]
+        return ps
+
+    def t_movable_fields(self, c):
+        ps = [PField(PVar(v.name), 't') for v in self.with_field(c, 'S', 't', movable=True)]
+        for f in ('0', '1'):
+            ps += [PField(PVar(v.name), f) for v in self.with_field(c, 'Tu', f, movable=True)]
         return ps
 
     def v_places(self, c, need_mut=False):
         ps = [PVar(v.name) for v in (self.mutable(c, 'V') if need_mut else self.readable(c, 'V'))]
-        ps += [PField(PVar(v.name), 'w') for v in self.s_with_field(c, 'w', need_mut)]
+        ps += [PField(PVar(v.name), 'w') for v in self.with_field(c, 'S', 'w', need_mut)]
         return ps
 
     def var_of(self, c, name):
-        for v in self.all_vars(c):
+        for v in reversed(self.all_vars(c)):
             if v.name == name:
                 return v
         raise KeyError(name)
@@ -1675,6 +2063,16 @@ class Gen:
         elif isinstance(p, PField):
             v = self.var_of(c, p.base.name)
             v.fst[p.f] = 'M'
+
+    def take_var(self, c, ty, used):
+        """A movable variable of ty, moved (or None)."""
+        mv = [v for v in self.movable(c, ty) if v.name not in used]
+        if not mv:
+            return None
+        v = self.r.choice(mv)
+        used.add(v.name)
+        self.mark_moved(c, PVar(v.name))
+        return Move(PVar(v.name))
 
     def loopvars(self, c):
         return [v for v in self.all_vars(c) if v.kind == 'loopvar']
@@ -1691,86 +2089,108 @@ class Gen:
         return Lit(self.small())
 
     def texpr(self, c, depth=0, used=None):
-        """An owned T value; moves what it takes. used: roots this call
-        uses already (exclusivity)."""
+        """An owned T value; moves what it takes. used: the roots this
+        call uses already (exclusivity)."""
         used = used if used is not None else set()
         r = self.r.random()
-        mv = [v for v in self.movable(c, 'T') if v.name not in used]
-        mvf = [v for v in self.s_with_field(c, 't', movable=True) if v.name not in used]
-        if depth < 2 and r < 0.30 and mv:
-            v = self.r.choice(mv)
-            used.add(v.name)
-            self.mark_moved(c, PVar(v.name))
-            return Move(PVar(v.name))
-        if depth < 2 and r < 0.36 and mvf:
-            v = self.r.choice(mvf)
-            used.add(v.name)
-            self.mark_moved(c, PField(PVar(v.name), 't'))
-            return Move(PField(PVar(v.name), 't'))
-        if r < 0.48:
+        if depth < 2 and r < 0.26:
+            m = self.take_var(c, 'T', used)
+            if m is not None:
+                return m
+        if depth < 2 and r < 0.32:
+            ps = [p for p in self.t_movable_fields(c) if p.root() not in used]
+            if ps:
+                p = self.r.choice(ps)
+                used.add(p.root())
+                self.mark_moved(c, p)
+                return Move(p)
+        if r < 0.42:
             ps = [p for p in self.t_places(c) if p.root() not in used]
             if ps:
                 p = self.r.choice(ps)
+                if self.chance(0.2):
+                    return Call('dup', [Arg('let', p)])
                 return Call('clone', [], method=True, recv=p)
-        if depth < 2 and r < 0.56:
+        if depth < 2 and r < 0.49:
             return Call('ident', [Arg('sink', self.texpr(c, depth + 1, used))])
-        if depth < 2 and r < 0.60:
+        if depth < 2 and r < 0.52:
             return Call('gid', [Arg('sink', self.texpr(c, depth + 1, used))])
-        if depth < 1 and r < 0.66:
+        if depth < 1 and r < 0.57:
             a = self.texpr(c, depth + 1, used)
             b = self.texpr(c, depth + 1, used)
             return Call('pick', [Arg('sink', a), Arg('sink', b), Arg('val', BoolLit(self.chance(0.5)))])
-        if depth < 1 and r < 0.70:
-            ps = [p for p in self.t_places(c, need_mut=True) if p.root() not in used and self.inout_ok(c, p)]
+        if depth < 1 and r < 0.61:
+            ps = [p for p in self.t_places(c, need_mut=True) if p.root() not in used]
             if ps:
                 p = self.r.choice(ps)
                 used.add(p.root())
                 x = self.texpr(c, depth + 1, used)
                 return Call('std::replace', [Arg('inout', p), Arg('sink', x)])
-        if depth < 1 and r < 0.76:
+        if depth < 2 and r < 0.65:
+            o = self.take_var(c, 'O', used)
+            if o is not None:
+                return Call('unwrap_or', [Arg('sink', self.texpr(c, depth + 1, used))], method=True, recv=o, recv_conv='sink')
+        if depth < 2 and r < 0.68:
+            s = self.take_var(c, 'S', used)
+            if s is not None:
+                return Call('into_t', [], method=True, recv=s, recv_conv='sink')
+        if depth < 1 and r < 0.73:
             fs = [f for f in self.fns if f.ret == 'T']
             if fs:
                 call = self.gen_call(c, self.r.choice(fs), used)
                 if call is not None:
                     return call
+        if r < 0.78:
+            ws = self.v_places(c)
+            if ws:
+                # (two-phase: the argument reads the Vec the call is on)
+                return Mk(Call('len', [], method=True, recv=self.r.choice(ws)))
         return Mk(self.int_k(c))
-
-    def inout_ok(self, c, p):
-        """An inout access of p: a whole var that is var/inout/sink, or a field."""
-        return True
 
     def vexpr(self, c, used=None):
         used = used if used is not None else set()
         r = self.r.random()
-        mv = [v for v in self.movable(c, 'V') if v.name not in used]
-        if r < 0.35 and mv:
-            v = self.r.choice(mv)
-            used.add(v.name)
-            self.mark_moved(c, PVar(v.name))
-            return Move(PVar(v.name))
-        if r < 0.5:
+        if r < 0.3:
+            m = self.take_var(c, 'V', used)
+            if m is not None:
+                return m
+        if r < 0.45:
             ps = [p for p in self.v_places(c) if p.root() not in used]
             if ps:
-                return Call('clone', [], method=True, recv=self.r.choice(ps))
-        if r < 0.55 and mv:
-            v = self.r.choice(mv)
-            used.add(v.name)
-            self.mark_moved(c, PVar(v.name))
-            return Call('gid', [Arg('sink', Move(PVar(v.name)))])
+                p = self.r.choice(ps)
+                if self.chance(0.25):
+                    return Call('dup', [Arg('let', p)])
+                return Call('clone', [], method=True, recv=p)
+        if r < 0.55:
+            ps = [p for p in self.v_places(c, need_mut=True) if p.root() not in used]
+            if ps:
+                p = self.r.choice(ps)
+                used.add(p.root())
+                return Call('take', [], method=True, recv=p)
+        if r < 0.6:
+            m = self.take_var(c, 'V', used)
+            if m is not None:
+                return Call('gid', [Arg('sink', m)])
+        if r < 0.66:
+            fs = [f for f in self.fns if f.ret == 'V']
+            if fs:
+                call = self.gen_call(c, self.r.choice(fs), used)
+                if call is not None:
+                    return call
         return NewVec()
 
     def obs_expr(self, c, used, ints=True):
         """An i64 observing a live value (no change); None if nothing.
-        ints=False: also a String's text."""
+        ints=False: also a bool or a String's text."""
         opts = []
-        tp = [p for p in self.t_places(c)]
+        tp = self.t_places(c)
         if tp:
             opts += ['tv', 'tid', 'obs', 'get', 'total', 'apply']
         vp = self.v_places(c)
         if vp:
             opts += ['vsig', 'vlen', 'vsig', 'isum', 'icount']
         if self.readable(c, 'S'):
-            opts += ['ssig', 'stotal']
+            opts += ['ssig', 'stotal', 'stv']
         if self.readable(c, 'E'):
             opts += ['esig']
         if self.readable(c, 'O'):
@@ -1783,6 +2203,12 @@ class Gen:
             opts += ['fcall']
         if self.readable(c, 'i'):
             opts += ['int']
+        if self.readable(c, 'Tu'):
+            opts += ['usig']
+        if self.readable(c, 'G'):
+            opts += ['gk']
+        if self.readable(c, 'VS'):
+            opts += ['vssig', 'vslen']
         if not opts:
             return None
         o = self.r.choice(opts)
@@ -1813,8 +2239,10 @@ class Gen:
             if o == 'isum':
                 return IterSum(p, 'sum')
             return IterSum(p, 'count', self.small())
-        if o in ('ssig', 'stotal'):
+        if o in ('ssig', 'stotal', 'stv'):
             v = self.r.choice(self.readable(c, 'S'))
+            if o == 'stv':
+                return Call('tv', [], method=True, recv=PVar(v.name))
             return Call('ssig' if o == 'ssig' else 'total', [Arg('let', PVar(v.name))])
         if o == 'esig':
             return Call('esig', [Arg('let', PVar(self.r.choice(self.readable(c, 'E')).name))])
@@ -1833,33 +2261,39 @@ class Gen:
             return Read(PVar(self.r.choice(self.readable(c, 'Str')).name))
         if o == 'fcall':
             return CloCall(self.r.choice(self.readable(c, 'F')).name)
+        if o == 'usig':
+            return Call('usig', [Arg('let', PVar(self.r.choice(self.readable(c, 'Tu')).name))])
+        if o == 'gk':
+            return Read(PField(PVar(self.r.choice(self.readable(c, 'G')).name), 'k'))
+        if o == 'vssig':
+            return Call('vssig', [Arg('let', PVar(self.r.choice(self.readable(c, 'VS')).name))])
+        if o == 'vslen':
+            return Call('len', [], method=True, recv=PVar(self.r.choice(self.readable(c, 'VS')).name))
         return Read(PVar(self.r.choice(self.readable(c, 'i')).name))
 
     def consume_expr(self, c, used):
         """An i64 that consumes a value."""
         r = self.r.random()
-        if r < 0.35:
+        if r < 0.3:
             return Call('eat', [Arg('sink', self.texpr(c, 1, used))])
-        if r < 0.5:
+        if r < 0.42:
             x = self.texpr(c, 1, used)
             return Call('into_v', [], method=True, recv=x, recv_conv='sink')
-        if r < 0.62:
+        if r < 0.52:
             return Call('veat', [Arg('sink', self.vexpr(c, used))])
+        if r < 0.58:
+            m = self.take_var(c, 'F', used)
+            if m is not None:
+                return Call('callf', [Arg('sink', m)])
+        if r < 0.64:
+            m = self.take_var(c, 'Str', used)
+            if m is not None:
+                return Call('seat', [Arg('sink', m)])
         if r < 0.70:
-            fs = [v for v in self.movable(c, 'F') if v.name not in used]
-            if fs:
-                v = self.r.choice(fs)
-                used.add(v.name)
-                self.mark_moved(c, PVar(v.name))
-                return Call('callf', [Arg('sink', Move(PVar(v.name)))])
-        if r < 0.78:
-            ss = [v for v in self.movable(c, 'Str') if v.name not in used]
-            if ss:
-                v = self.r.choice(ss)
-                used.add(v.name)
-                self.mark_moved(c, PVar(v.name))
-                return Call('seat', [Arg('sink', Move(PVar(v.name)))])
-        if r < 0.86:
+            m = self.take_var(c, 'G', used)
+            if m is not None:
+                return Call('geat', [Arg('sink', m)])
+        if r < 0.76:
             ps = self.readable(c, 'P')
             if ps:
                 return Call('psink', [Arg('sink', Move(PVar(self.r.choice(ps).name)))])
@@ -1872,6 +2306,15 @@ class Gen:
         return Call('eat', [Arg('sink', Mk(self.int_k(c)))])
 
     def gen_call(self, c, f, used):
+        if self.calls > 1:
+            return None
+        self.calls += 1
+        try:
+            return self.gen_call1(c, f, used)
+        finally:
+            self.calls -= 1
+
+    def gen_call1(self, c, f, used):
         args = []
         for pname, conv, ty in f.params:
             if ty == 'i':
@@ -1889,10 +2332,9 @@ class Gen:
                     used.add(p.root())
                     args.append(Arg('let', p))
                     continue
-                if self.known or ty not in ('T', 'V', 'S'):
-                    if ty == 'T':
-                        args.append(Arg('let', Mk(self.int_k(c))))
-                        continue
+                if self.known and ty == 'T':
+                    args.append(Arg('let', Mk(self.int_k(c))))
+                    continue
                 return None
             if conv == 'inout':
                 if ty == 'T':
@@ -1919,12 +2361,10 @@ class Gen:
         return CallGen(f, args)
 
     def sexpr(self, c, used):
-        mv = [v for v in self.movable(c, 'S') if v.name not in used]
-        if mv and self.chance(0.4):
-            v = self.r.choice(mv)
-            used.add(v.name)
-            self.mark_moved(c, PVar(v.name))
-            return Move(PVar(v.name))
+        if self.chance(0.4):
+            m = self.take_var(c, 'S', used)
+            if m is not None:
+                return m
         ps = [v for v in self.readable(c, 'S') if v.name not in used]
         if ps and self.chance(0.3):
             return Call('clone', [], method=True, recv=PVar(self.r.choice(ps).name))
@@ -1935,24 +2375,28 @@ class Gen:
     def cond(self, c):
         r = self.r.random()
         tp = self.t_places(c)
-        if r < 0.4 and tp:
+        if r < 0.35 and tp:
             p = self.r.choice(tp)
             return Bin(Bin(Read(PField(p, 'v')), '%', Lit(self.r.choice([2, 3]))), self.r.choice(['==', '!=']), Lit(0))
         vp = self.v_places(c)
-        if r < 0.6 and vp:
+        if r < 0.5 and vp:
             return Bin(Call('len', [], method=True, recv=self.r.choice(vp)), '>', Lit(self.r.randint(0, 3)))
+        if r < 0.55 and vp:
+            return Not(Call('is_empty', [], method=True, recv=self.r.choice(vp)))
         os_ = self.readable(c, 'O')
-        if r < 0.7 and os_:
+        if r < 0.65 and os_:
             return Call('is_some', [], method=True, recv=PVar(self.r.choice(os_).name))
         lv = self.loopvars(c)
-        if r < 0.85 and lv:
+        if r < 0.82 and lv:
             return Bin(Bin(Read(PVar(self.r.choice(lv).name)), '%', Lit(2)), '==', Lit(self.r.randint(0, 1)))
         return BoolLit(self.chance(0.5))
 
     # ---- statements
 
-    def gen_block(self, c, n, tail_fn=None):
+    def gen_block(self, c, n, tail_fn=None, pre=None):
         c.scopes.append([])
+        for (nm, ty, mut, kind) in (pre or []):
+            self.declare(c, nm, ty, mut, kind)
         stmts = []
         for _ in range(n):
             if c.dead:
@@ -1968,17 +2412,28 @@ class Gen:
         c.scopes.pop()
         return Block(stmts, tail)
 
-    def sub_block(self, c, n):
-        """A block whose end state is returned (None if it leaves)."""
-        b = self.gen_block(c, n)
+    def sub_block(self, c, n, pre=None):
+        """A block and its end state (None if it leaves)."""
+        b = self.gen_block(c, n, pre=pre)
         if c.dead:
             c.dead = False
             return b, None
         return b, self.snapshot(c)
 
+    def guarded(self, c, make):
+        """make() builds what a guard (an if) runs: its moves are
+        conditional."""
+        snap = self.snapshot(c)
+        x = make()
+        if c.dead:
+            c.dead = False
+            self.restore(c, snap)
+        else:
+            self.restore(c, self.join(c, [snap, self.snapshot(c)]))
+        return x
+
     def gen_stmt(self, c):
         depth = len(c.scopes)
-        r = self.r.random()
         w = [
             (10, self.st_decl),
             (4, self.st_copy),
@@ -1990,20 +2445,28 @@ class Gen:
             (4, self.st_assign),
             (2, self.st_swap),
             (5 if depth < 5 else 0, self.st_if),
-            (3 if depth < 4 and c.loop < 2 else 0, self.st_for),
+            (3 if depth < 4 and c.loop < 2 else 0, self.st_loop),
             (2 if depth < 5 else 0, self.st_block),
             (3, self.st_closure),
             (3, self.st_match),
-            (2, self.st_struct),
+            (2, self.st_option),
+            (3, self.st_struct),
+            (2, self.st_tuple),
+            (1, self.st_array),
+            (1, self.st_g),
+            (1, self.st_vs),
             (2, self.st_plain),
             (1, self.st_string),
+            (1, self.st_inout),
+            (1, self.st_defer),
+            (1, self.st_shadow),
             (2 if c.loop > 0 else 0, self.st_break),
-            (2 if c.ret is not None and depth < 7 else 0, self.st_return),
+            (2 if depth < 7 else 0, self.st_return),
             (3 if c.ret in ('OI', 'RI') else 0, self.st_question),
             (1, self.st_drop),
         ]
         tot = sum(x for x, _ in w)
-        pick = r * tot
+        pick = self.r.random() * tot
         for wt, f in w:
             if pick < wt:
                 return f(c)
@@ -2042,12 +2505,13 @@ class Gen:
 
     def st_copy(self, c):
         """`var b = a;`: a moves (owned) or is copied (plain)."""
-        ty = self.r.choice(['T', 'T', 'V', 'O', 'P', 'Str'])
+        ty = self.r.choice(['T', 'T', 'V', 'O', 'P', 'Str', 'S', 'Tu', 'A', 'G', 'E'])
         mv = self.movable(c, ty)
         if not mv:
             return None
         v = self.r.choice(mv)
-        n = self.name({'T': 't', 'V': 'w', 'O': 'o', 'P': 'p', 'Str': 'g'}[ty])
+        n = self.name({'T': 't', 'V': 'w', 'O': 'o', 'P': 'p', 'Str': 'g', 'S': 's',
+                       'Tu': 'u', 'A': 'a', 'G': 'k', 'E': 'e'}[ty])
         self.mark_moved(c, PVar(v.name))
         self.declare(c, n, ty, True)
         return Decl(n, True, None, Move(PVar(v.name)))
@@ -2065,6 +2529,7 @@ class Gen:
         p = self.r.choice(ps)
         n = self.name({'T': 't', 'V': 'w', 'S': 's', 'E': 'e', 'O': 'o', 'Str': 'g'}[ty])
         self.declare(c, n, ty, True)
+        # (a clone is independent: changed, the original is not)
         return Decl(n, True, None, Call('clone', [], method=True, recv=p))
 
     def st_mutate(self, c):
@@ -2079,21 +2544,23 @@ class Gen:
                 return Do(Call('bump', [Arg('inout', p), Arg('val', self.int_k(c))]))
             return Do(Call('add', [Arg('val', self.int_k(c))], method=True, recv=p))
         vp = self.v_places(c, need_mut=True)
-        if r < 0.75 and vp:
+        if r < 0.72 and vp:
             p = self.r.choice(vp)
             if self.chance(0.5):
                 return Do(Call('vbump', [Arg('inout', p), Arg('val', self.int_k(c))]))
-            # guarded element change
+            # a guarded element change
             i = self.r.randint(0, 2)
-            k = self.r.random()
-            if k < 0.5:
+            if self.chance(0.5):
                 inner = OpAssign(PField(PIdx(p, i), 'v'), self.int_k(c))
             else:
                 inner = Do(Call('bump', [Arg('inout', PIdx(p, i)), Arg('val', self.int_k(c))]))
             return If(Bin(Call('len', [], method=True, recv=p), '>', Lit(i)), Block([inner]), None)
-        ss = self.s_with_field(c, 't', need_mut=True)
-        if ss and self.chance(0.5):
-            return OpAssign(PField(PVar(self.r.choice(ss).name), 'n'), self.int_k(c))
+        ss = self.with_field(c, 'S', 't', need_mut=True)
+        if r < 0.85 and ss:
+            v = self.r.choice(ss)
+            if self.chance(0.5) and v.fst['w'] == 'L':
+                return Do(Call('grow', [Arg('val', self.int_k(c))], method=True, recv=PVar(v.name)))
+            return OpAssign(PField(PVar(v.name), 'n'), self.int_k(c))
         ints = self.mutable(c, 'i')
         if ints:
             return OpAssign(PVar(self.r.choice(ints).name), self.int_k(c))
@@ -2113,7 +2580,7 @@ class Gen:
 
     def print_of(self, c, holes):
         """A println of holes; a hole that cannot be written in an
-        f-string (braces, a ':') is computed into a let first."""
+        f-string (braces, a ':', a string) is computed into a let first."""
         pre = []
         hs = []
         for h in holes:
@@ -2145,80 +2612,86 @@ class Gen:
         p = self.r.choice(vp)
         used = {p.root()}
         r = self.r.random()
+        lenp = Call('len', [], method=True, recv=p)
         if r < 0.25:
             return Do(Call('push', [Arg('sink', self.texpr(c, 0, used))], method=True, recv=p))
         if r < 0.33:
             return Do(Call('keep', [Arg('inout', p), Arg('sink', self.texpr(c, 0, used))]))
-        if r < 0.45:
+        if r < 0.43:
             n = self.name('o')
             self.declare(c, n, 'O', True)
             return Decl(n, True, None, Call('pop', [], method=True, recv=p))
-        if r < 0.55:
+        if r < 0.53:
             i = self.r.randint(0, 2)
             n = self.name('t')
-            snap = self.snapshot(c)
-            c.scopes.append([])
-            self.declare(c, n, 'T', True)
+
+            def make():
+                body = self.gen_block(c, self.r.randint(0, 3), pre=[(n, 'T', True, 'local')])
+                return body
+            body = self.guarded(c, make)
             inner = [Decl(n, True, None, Call('remove', [Arg('val', Lit(i))], method=True, recv=p))]
-            body = self.gen_block(c, self.r.randint(0, 3))
-            c.scopes.pop()
-            if c.dead:
-                c.dead = False
-                self.restore(c, snap)
-            else:
-                self.restore(c, self.join(c, [snap, self.snapshot(c)]))
-            return If(Bin(Call('len', [], method=True, recv=p), '>', Lit(i)), Block(inner + body.stmts), None)
-        if r < 0.62:
+            return If(Bin(lenp, '>', Lit(i)), Block(inner + body.stmts), None)
+        if r < 0.60:
             i = self.r.randint(0, 2)
-            snap = self.snapshot(c)
-            x = self.texpr(c, 1, used)
-            self.restore(c, self.join(c, [snap, self.snapshot(c)]))
-            return If(Bin(Call('len', [], method=True, recv=p), '>', Lit(i - 1)),
+            x = self.guarded(c, lambda: self.texpr(c, 1, used))
+            return If(Bin(lenp, '>', Lit(i - 1)),
                       Block([Do(Call('insert', [Arg('val', Lit(i)), Arg('sink', x)], method=True, recv=p))]),
                       None)
-        if r < 0.68:
+        if r < 0.66:
             return Do(Call('truncate', [Arg('val', Lit(self.r.randint(0, 3)))], method=True, recv=p))
-        if r < 0.71:
+        if r < 0.69:
             return Do(Call('clear', [], method=True, recv=p))
-        if r < 0.77:
+        if r < 0.75:
             i, j = self.r.randint(0, 2), self.r.randint(0, 2)
-            return If(Bin(Call('len', [], method=True, recv=p), '>', Lit(max(i, j))),
+            return If(Bin(lenp, '>', Lit(max(i, j))),
                       Block([Do(Call('swap', [Arg('val', Lit(i)), Arg('val', Lit(j))], method=True, recv=p))]), None)
-        if r < 0.85 and self.known:
+        if r < 0.80 and self.known:
             i = self.r.randint(0, 2)
-            # (the guard is evaluated before the value is made; a move in
-            # the guarded block is a conditional move)
-            snap = self.snapshot(c)
-            x = self.texpr(c, 1, used)
-            after = self.snapshot(c)
-            self.restore(c, self.join(c, [snap, after]))
+            x = self.guarded(c, lambda: self.texpr(c, 1, used))
             if self.chance(0.5):
                 inner = Assign(PIdx(p, i), x)
             else:
                 inner = Do(Call('set', [Arg('val', Lit(i)), Arg('sink', x)], method=True, recv=p))
-            return If(Bin(Call('len', [], method=True, recv=p), '>', Lit(i)), Block([inner]), None)
-        if r < 0.92:
-            # a loop over the elements, observing
-            n = self.obsn()
-            return ForEachObs(p, n)
+            return If(Bin(lenp, '>', Lit(i)), Block([inner]), None)
+        if r < 0.87:
+            return ForEachObs(p, self.obsn())
+        if r < 0.93 and isinstance(p, PVar) and c.loop < 2:
+            # while let over pops; the Vec is not changed in the body
+            n = self.name('t')
+            v = self.var_of(c, p.name)
+            snap = self.snapshot(c)
+            c.loop += 1
+            c.loops.append((None, []))
+            c.frozen.add(v.name)
+            body = self.gen_block(c, self.r.randint(0, 3), pre=[(n, 'T', False, 'local')])
+            c.frozen.discard(v.name)
+            end = None if c.dead else self.snapshot(c)
+            c.dead = False
+            _, bs = c.loops.pop()
+            c.loop -= 1
+            self.restore(c, self.join(c, [snap, end] + bs))
+            return MatchOpt(Call('pop', [], method=True, recv=p), 'O', n, body, None, None, 'while')
         k = self.r.randint(1, 4)
         iv = self.name('i')
         return For(iv, k, Block([Do(Call('push', [Arg('sink', Mk(Bin(Read(PVar(iv)), '*', Lit(self.r.randint(1, 5)))))], method=True, recv=p))]))
 
     def st_assign(self, c):
-        ty = self.r.choice(['T', 'T', 'V', 'O', 'E', 'S'])
-        vs = [v for v in self.assignable(c, ty) if v.st == 'L' or v.loop == c.loop]
-        if ty == 'S' and self.chance(0.6):
-            # a field of an S: revives a moved one, or drops the old
-            ss = [v for v in self.all_vars(c) if v.ty == 'S' and v.st == 'L' and v.mut]
-            if ss:
-                v = self.r.choice(ss)
-                f = self.r.choice(['t', 'w'])
-                if v.fst[f] != 'L' and v.loop != c.loop:
+        ty = self.r.choice(['T', 'T', 'V', 'O', 'E', 'S', 'G', 'Tu'])
+        if ty in ('S', 'Tu', 'G') and self.chance(0.6):
+            # a field: revives a moved one, or drops the old value
+            fs = {'S': ('t', 'w'), 'Tu': ('0', '1'), 'G': ('t',)}[ty]
+            vs = [v for v in self.all_vars(c) if v.ty == ty and v.st == 'L' and v.mut
+                  and v.name not in c.frozen and (ty != 'G' or self.whole(v))]
+            if vs:
+                v = self.r.choice(vs)
+                f = self.r.choice(fs)
+                if v.fst is not None and v.fst[f] != 'L' and v.loop != c.loop:
                     return None
-                x = self.texpr(c, 0, {v.name}) if f == 't' else self.vexpr(c, {v.name})
-                v.fst[f] = 'L'
+                x = self.vexpr(c, {v.name}) if f == 'w' else self.texpr(c, 0, {v.name})
+                if v.fst is not None:
+                    v.fst[f] = 'L'
                 return Assign(PField(PVar(v.name), f), x)
+        vs = self.assignable(c, ty)
         if not vs:
             return None
         v = self.r.choice(vs)
@@ -2231,15 +2704,19 @@ class Gen:
             x = NewO(self.texpr(c, 1, used)) if self.chance(0.6) else NewO(None)
         elif ty == 'E':
             x = NewE('One', [self.texpr(c, 1, used)]) if self.chance(0.6) else NewE('Nada', [])
-        else:
+        elif ty == 'S':
             x = self.sexpr(c, used)
+        elif ty == 'G':
+            x = NewG(self.texpr(c, 1, used), self.small())
+        else:
+            x = NewTup(self.texpr(c, 1, used), self.texpr(c, 1, used))
         v.st = 'L'
         if v.fst:
-            v.fst = {'t': 'L', 'w': 'L'}
+            v.fst = {f: 'L' for f in v.fst}
         return Assign(PVar(v.name), x)
 
     def st_swap(self, c):
-        ps = self.t_places(c, need_mut=True)
+        ps = self.t_places(c, need_mut=True, elems=False)
         if len(ps) < 2:
             return None
         a, b = self.r.sample(ps, 2)
@@ -2263,48 +2740,59 @@ class Gen:
             e, se = self.sub_block(c, self.r.randint(0, 3))
         else:
             e, se = None, snap
-        j = self.join(c, [st, se])
-        if j is None:
-            c.dead = True
-            self.restore(c, snap)
-        else:
-            self.restore(c, j)
+        self.branch_join(c, snap, [st, se])
         return If(cond, t, e)
 
-    def st_for(self, c):
+    def st_loop(self, c):
         snap = self.snapshot(c)
-        iv = self.name('i')
+        kind = 'for' if self.chance(0.75) else 'while'
+        label = self.name('l') if kind == 'for' and self.chance(0.25) else None
         c.loop += 1
-        c.break_states.append([])
-        c.scopes.append([])
-        self.declare(c, iv, 'i', False, kind='loopvar')
-        body = self.gen_block(c, self.r.randint(1, 5))
-        c.scopes.pop()
+        c.loops.append((label, []))
+        pre = []
+        iv = None
+        cn = None
+        if kind == 'for':
+            iv = self.name('i')
+            pre = [(iv, 'i', False, 'loopvar')]
+        else:
+            cn = self.name('c')
+        body = self.gen_block(c, self.r.randint(1, 5), pre=pre)
         end = None if c.dead else self.snapshot(c)
         c.dead = False
-        bs = c.break_states.pop()
+        _, bs = c.loops.pop()
         c.loop -= 1
-        j = self.join(c, [snap, end] + bs)
-        self.restore(c, j)
-        return For(iv, self.r.randint(0, 4), body)
+        self.restore(c, self.join(c, [snap, end] + bs))
+        n = self.r.randint(0, 4)
+        if kind == 'for':
+            return For(iv, n, body, label)
+        self.declare(c, cn, 'i', True)
+        return [Decl(cn, True, None, Lit(0)), While(cn, n, body)]
 
     def st_block(self, c):
-        b = self.gen_block(c, self.r.randint(1, 4))
-        return b
+        return self.gen_block(c, self.r.randint(1, 4))
 
     def st_break(self, c):
-        # `if cond { break; }`, after the drops of the block's locals
+        # `if cond { break; }`: the block's locals are dropped first
         cond = self.cond(c)
-        c.break_states[-1].append(self.snapshot(c))
+        labeled = [i for i, (lab, _) in enumerate(c.loops) if lab]
+        if labeled and self.chance(0.4):
+            i = self.r.choice(labeled)
+            c.loops[i][1].append(self.snapshot(c))
+            return If(cond, Block([Break(False, c.loops[i][0])]), None)
+        c.loops[-1][1].append(self.snapshot(c))
         return If(cond, Block([Break(self.chance(0.3))]), None)
 
     def ret_expr(self, c):
+        if c.ret is None:
+            return None
         if c.ret == 'i':
-            used = set()
-            x = self.obs_expr(c, used)
+            x = self.obs_expr(c, set())
             return x if x is not None else Lit(self.small())
         if c.ret == 'T':
             return self.texpr(c, 0)
+        if c.ret == 'V':
+            return self.vexpr(c)
         if c.ret == 'OI':
             if self.chance(0.3):
                 return Wrap('None', None)
@@ -2316,6 +2804,8 @@ class Gen:
         return Wrap('Ok', x if x is not None else Lit(self.small()))
 
     def st_return(self, c):
+        if c.ret is None and self.chance(0.6):
+            return None
         cond = self.cond(c)
         snap = self.snapshot(c)
         x = self.ret_expr(c)
@@ -2325,13 +2815,12 @@ class Gen:
     def st_question(self, c):
         r = self.r.random()
         if c.ret == 'OI':
-            os_ = self.movable(c, 'O')
-            if r < 0.5 and os_:
-                v = self.r.choice(os_)
-                self.mark_moved(c, PVar(v.name))
-                n = self.name('t')
-                self.declare(c, n, 'T', False)
-                return Question(n, Move(PVar(v.name)))
+            if r < 0.5:
+                m = self.take_var(c, 'O', set())
+                if m is not None:
+                    n = self.name('t')
+                    self.declare(c, n, 'T', False)
+                    return Question(n, m)
             vp = self.v_places(c, need_mut=True)
             if vp:
                 n = self.name('t')
@@ -2361,13 +2850,11 @@ class Gen:
         return q
 
     def st_drop(self, c):
-        ty = self.r.choice(['T', 'V', 'O', 'E', 'S'])
-        mv = self.movable(c, ty)
-        if not mv:
+        ty = self.r.choice(['T', 'V', 'O', 'E', 'S', 'G', 'Tu', 'VS'])
+        m = self.take_var(c, ty, set())
+        if m is None:
             return None
-        v = self.r.choice(mv)
-        self.mark_moved(c, PVar(v.name))
-        return Do(Call('drop', [Arg('sink', Move(PVar(v.name)))]))
+        return Do(Call('drop', [Arg('sink', m)]))
 
     def st_closure(self, c):
         r = self.r.random()
@@ -2381,97 +2868,103 @@ class Gen:
                 kind = self.r.choice(['var', 'twice'])
                 return CloBlock(kind, PVar(self.r.choice(vs).name), self.small(), self.obsn() if kind == 'var' else 0, self.name('f'))
         if r < 0.7:
-            vs = self.movable(c, 'T')
-            if vs:
-                v = self.r.choice(vs)
-                self.mark_moved(c, PVar(v.name))
-                return CloBlock('sink', PVar(v.name), self.small(), self.obsn(), self.name('f'))
-        vs = self.movable(c, 'T')
-        if vs:
+            m = self.take_var(c, 'T', set())
+            if m is not None:
+                return CloBlock('sink', m.p, self.small(), self.obsn(), self.name('f'))
+        m = self.take_var(c, 'T', set())
+        if m is not None:
             # a sink closure kept as a local
-            v = self.r.choice(vs)
-            self.mark_moved(c, PVar(v.name))
             n = self.name('f')
             self.declare(c, n, 'F', False)
-            return Decl(n, False, None, NewClo(PVar(v.name), self.small()))
+            return Decl(n, False, None, NewClo(m.p, self.small()))
         return None
 
     def st_match(self, c):
-        r = self.r.random()
-        if r < 0.5:
-            es = self.movable(c, 'E')
-            if not es:
-                return None
-            v = self.r.choice(es)
-            self.mark_moved(c, PVar(v.name))
-            snap = self.snapshot(c)
-            arms = {}
-            ends = []
-            wild = self.known and self.chance(0.3)
-            for tag, k in (('One', 1), ('Two', 2), ('Nada', 0)):
-                if wild and tag != 'One' and self.chance(0.5):
-                    continue
-                self.restore(c, snap)
-                names = []
-                c.scopes.append([])
-                for _ in range(k):
-                    if wild and self.chance(0.4):
-                        names.append('_')
-                    else:
-                        nm = self.name('t')
-                        names.append(nm)
-                        self.declare(c, nm, 'T', False)
-                b, s = self.sub_block(c, self.r.randint(0, 3))
-                c.scopes.pop()
-                arms[tag] = (names, b)
-                ends.append(s)
-            if len(arms) < 3:
-                self.restore(c, snap)
-                b, s = self.sub_block(c, self.r.randint(0, 2))
-                arms['_'] = (None, b)
-                ends.append(s)
-            if wild:
-                v.st = 'X'
-            j = self.join(c, ends)
-            if j is None:
-                c.dead = True
-                self.restore(c, snap)
-            else:
-                self.restore(c, j)
-            if wild:
-                v.st = 'X'
-            return MatchE(PVar(v.name), arms)
-        os_ = self.movable(c, 'O')
-        if not os_:
+        es = self.movable(c, 'E')
+        if not es:
             return None
-        v = self.r.choice(os_)
+        v = self.r.choice(es)
         self.mark_moved(c, PVar(v.name))
         snap = self.snapshot(c)
-        n = self.name('t')
-        c.scopes.append([])
-        self.declare(c, n, 'T', self.chance(0.3) and False)
-        t, st = self.sub_block(c, self.r.randint(0, 3))
-        c.scopes.pop()
-        self.restore(c, snap)
-        e, se = self.sub_block(c, self.r.randint(0, 2))
-        j = self.join(c, [st, se])
-        if j is None:
-            c.dead = True
+        arms = {}
+        ends = []
+        wild = self.known and self.chance(0.3)
+        for tag, k in (('One', 1), ('Two', 2), ('Nada', 0)):
+            if wild and tag != 'One' and self.chance(0.5):
+                continue
             self.restore(c, snap)
+            names = []
+            pre = []
+            for _ in range(k):
+                if wild and self.chance(0.4):
+                    names.append('_')
+                else:
+                    nm = self.name('t')
+                    names.append(nm)
+                    pre.append((nm, 'T', False, 'local'))
+            b, s = self.sub_block(c, self.r.randint(0, 3), pre=pre)
+            arms[tag] = (names, b)
+            ends.append(s)
+        if len(arms) < 3:
+            self.restore(c, snap)
+            b, s = self.sub_block(c, self.r.randint(0, 2))
+            arms['_'] = (None, b)
+            ends.append(s)
+        self.branch_join(c, snap, ends)
+        if wild:
+            v.st = 'X'
+        return MatchE(PVar(v.name), arms)
+
+    def st_option(self, c):
+        r = self.r.random()
+        form = self.r.choice(['iflet', 'match'])
+        if r < 0.45:
+            m = self.take_var(c, 'O', set())
+            if m is None:
+                return None
+            x, kind = m, 'O'
+        elif r < 0.65:
+            vp = self.v_places(c, need_mut=True)
+            if not vp:
+                return None
+            x, kind = Call('pop', [], method=True, recv=self.r.choice(vp)), 'O'
+        elif r < 0.85:
+            x, kind = Call('tchk', [Arg('sink', self.texpr(c, 1)), Arg('val', Lit(self.r.randint(0, 12)))]), 'R'
         else:
-            self.restore(c, j)
-        return IfLet(PVar(v.name), n, t, e, self.r.choice(['iflet', 'match']))
+            # `if o.is_some() { var t = o.unwrap(); .. }`: a conditional move
+            os_ = self.movable(c, 'O')
+            if not os_:
+                return None
+            v = self.r.choice(os_)
+            n = self.name('t')
+
+            def make():
+                self.mark_moved(c, PVar(v.name))
+                return self.gen_block(c, self.r.randint(0, 3), pre=[(n, 'T', True, 'local')])
+            body = self.guarded(c, make)
+            inner = Decl(n, True, None, Call('unwrap', [], method=True, recv=Move(PVar(v.name)), recv_conv='sink'))
+            return If(Call('is_some', [], method=True, recv=PVar(v.name)), Block([inner] + body.stmts), None)
+        snap = self.snapshot(c)
+        n = self.name('t')
+        en = self.name('n') if kind == 'R' else None
+        t, st = self.sub_block(c, self.r.randint(0, 3), pre=[(n, 'T', False, 'local')])
+        self.restore(c, snap)
+        epre = [(en, 'i', False, 'local')] if kind == 'R' and form == 'match' else None
+        e, se = self.sub_block(c, self.r.randint(0, 2), pre=epre)
+        self.branch_join(c, snap, [st, se])
+        return MatchOpt(x, kind, n, t, en, e, form)
 
     def st_struct(self, c):
         r = self.r.random()
-        ss = [v for v in self.all_vars(c) if v.ty == 'S' and v.st == 'L']
-        if r < 0.4 or not ss:
+        ss = [v for v in self.all_vars(c) if v.ty == 'S' and v.st == 'L' and v.name not in c.frozen]
+        if r < 0.35 or not ss:
             n = self.name('s')
             x = self.sexpr(c, set())
             self.declare(c, n, 'S', True)
             return Decl(n, True, None, x)
         v = self.r.choice(ss)
-        if r < 0.7 and v.kind in ('local', 'sink') and v.loop == c.loop:
+        local = v.kind in ('local', 'sink') and v.loop == c.loop
+        if r < 0.6 and local:
             f = self.r.choice(['t', 'w'])
             if v.fst[f] == 'L':
                 # a partial move out of the struct
@@ -2479,9 +2972,97 @@ class Gen:
                 v.fst[f] = 'M'
                 self.declare(c, n, 'T' if f == 't' else 'V', True)
                 return Decl(n, True, None, Move(PField(PVar(v.name), f)))
+        if r < 0.75 and local and v.mut and v.fst['t'] == 'L' and v.fst['w'] == 'L':
+            # disjoint fields: s.t moves into s.w
+            v.fst['t'] = 'M'
+            return Do(Call('keep', [Arg('inout', PField(PVar(v.name), 'w')), Arg('sink', Move(PField(PVar(v.name), 't')))]))
+        if r < 0.85 and v.mut and v.fst['t'] == 'L' and v.fst['w'] == 'L':
+            return Do(Call('bump', [Arg('inout', PField(PVar(v.name), 't')), Arg('val', Read(PField(PVar(v.name), 'n')))]))
         if v.fst['w'] == 'L' and v.mut:
             return Do(Call('push', [Arg('sink', self.texpr(c, 1, {v.name}))], method=True, recv=PField(PVar(v.name), 'w')))
         return None
+
+    def st_tuple(self, c):
+        us = [v for v in self.all_vars(c) if v.ty == 'Tu' and v.st == 'L' and v.name not in c.frozen]
+        r = self.r.random()
+        if r < 0.45 or not us:
+            n = self.name('u')
+            used = set()
+            a = self.texpr(c, 1, used)
+            b = self.texpr(c, 1, used)
+            self.declare(c, n, 'Tu', True)
+            return Decl(n, True, None, NewTup(a, b))
+        v = self.r.choice(us)
+        local = v.kind in ('local', 'sink') and v.loop == c.loop
+        if r < 0.65 and local:
+            f = self.r.choice(['0', '1'])
+            if v.fst[f] == 'L':
+                n = self.name('t')
+                v.fst[f] = 'M'
+                self.declare(c, n, 'T', True)
+                return Decl(n, True, None, Move(PField(PVar(v.name), f)))
+        if r < 0.8 and local and self.whole(v):
+            a, b = self.name('t'), self.name('t')
+            v.st = 'M'
+            self.declare(c, a, 'T', False)
+            self.declare(c, b, 'T', False)
+            return Destructure(a, b, PVar(v.name))
+        return None
+
+    def st_array(self, c):
+        arrs = self.readable(c, 'A')
+        if not arrs or self.chance(0.4):
+            n = self.name('a')
+            used = set()
+            items = [self.texpr(c, 1, used), self.texpr(c, 1, used)]
+            self.declare(c, n, 'A', True)
+            return Decl(n, True, None, NewArr(items))
+        v = self.r.choice(arrs)
+        i = self.r.randint(0, 1)
+        if v.mut and v.name not in c.frozen:
+            if self.known and self.chance(0.3):
+                return Assign(PIdx(PVar(v.name), i), self.texpr(c, 1, {v.name}))
+            return Do(Call('bump', [Arg('inout', PIdx(PVar(v.name), i)), Arg('val', self.int_k(c))]))
+        return Print(self.obsn(), [Read(PField(PIdx(PVar(v.name), i), 'v'))])
+
+    def st_g(self, c):
+        gs = self.readable(c, 'G')
+        if not gs or self.chance(0.5):
+            n = self.name('k')
+            x = NewG(self.texpr(c, 1), self.r.randint(0, 9))
+            self.declare(c, n, 'G', True)
+            return Decl(n, True, None, x)
+        v = self.r.choice(gs)
+        if v.mut and v.name not in c.frozen:
+            return OpAssign(PField(PVar(v.name), 'k'), Lit(self.r.randint(1, 5)))
+        return None
+
+    def st_vs(self, c):
+        vss = self.readable(c, 'VS')
+        if not vss or self.chance(0.3):
+            n = self.name('q')
+            self.declare(c, n, 'VS', True)
+            return Decl(n, True, 'Vec<S>', NewVec())
+        v = self.r.choice(vss)
+        p = PVar(v.name)
+        r = self.r.random()
+        if not v.mut or v.name in c.frozen:
+            return Print(self.obsn(), [Call('vssig', [Arg('let', p)])])
+        if r < 0.4:
+            return Do(Call('push', [Arg('sink', self.sexpr(c, {v.name}))], method=True, recv=p))
+        i = self.r.randint(0, 2)
+        lenp = Call('len', [], method=True, recv=p)
+        if r < 0.6:
+            x = self.guarded(c, lambda: self.texpr(c, 1, {v.name}))
+            return If(Bin(lenp, '>', Lit(i)), Block([Do(Call('push', [Arg('sink', x)], method=True, recv=PField(PIdx(p, i), 'w')))]), None)
+        if r < 0.75:
+            return If(Bin(lenp, '>', Lit(i)), Block([OpAssign(PField(PField(PIdx(p, i), 't'), 'v'), self.int_k(c))]), None)
+        if r < 0.9:
+            n = self.name('s')
+            body = self.guarded(c, lambda: self.gen_block(c, self.r.randint(0, 2), pre=[(n, 'S', True, 'local')]))
+            inner = [Decl(n, True, None, Call('remove', [Arg('val', Lit(i))], method=True, recv=p))]
+            return If(Bin(lenp, '>', Lit(i)), Block(inner + body.stmts), None)
+        return Do(Call('truncate', [Arg('val', Lit(self.r.randint(0, 2)))], method=True, recv=p))
 
     def st_plain(self, c):
         ps = self.readable(c, 'P')
@@ -2497,7 +3078,7 @@ class Gen:
             return Block([Decl(n, True, None, Read(PVar(v.name))),
                           OpAssign(PField(PVar(n), 'x'), Lit(self.r.randint(1, 9))),
                           Print(self.obsn(), [Read(PField(PVar(v.name), 'x')), Read(PField(PVar(n), 'x'))])])
-        if r < 0.7 and v.mut:
+        if r < 0.7 and v.mut and v.name not in c.frozen:
             return Do(Call('pbump', [Arg('inout', PVar(v.name)), Arg('val', self.int_k(c))]))
         return self.print_of(c, [Call('psink', [Arg('sink', Read(PVar(v.name)))]), Call('pget', [Arg('let', PVar(v.name))])])
 
@@ -2509,17 +3090,54 @@ class Gen:
             self.declare(c, n, 'Str', True)
             return Decl(n, True, None, NewStr(self.r.choice(['ab', 'x', 'hello', ''])))
         v = self.r.choice(ss)
-        if v.mut and r < 0.7:
+        if v.mut and r < 0.7 and v.name not in c.frozen:
             return Do(Call('push_str', [Arg('val', StrLit(self.r.choice(['z', 'yy', '!'])))], method=True, recv=PVar(v.name)))
         n = self.name('g')
         self.declare(c, n, 'Str', True)
         return Decl(n, True, None, Call('clone', [], method=True, recv=PVar(v.name)))
 
+    def st_inout(self, c):
+        """`{ inout r = &place; .. }`: r used as the place itself."""
+        ps = self.t_places(c, need_mut=True, elems=False)
+        if not ps:
+            return None
+        p = self.r.choice(ps)
+        n = self.name('r')
+        rp = PVar(n)
+        ops = []
+        for _ in range(self.r.randint(1, 3)):
+            k = self.r.random()
+            if k < 0.25:
+                ops.append(OpAssign(PField(rp, 'v'), self.int_k(c)))
+            elif k < 0.45:
+                ops.append(Do(Call('bump', [Arg('inout', rp), Arg('val', self.int_k(c))])))
+            elif k < 0.6:
+                ops.append(Do(Call('add', [Arg('val', self.int_k(c))], method=True, recv=rp)))
+            elif k < 0.8:
+                ops.append(Assign(rp, Mk(self.int_k(c))))
+            else:
+                ops.append(Print(self.obsn(), [Call('obs', [Arg('let', rp)]), Read(PField(rp, 'id'))]))
+        return InoutBlock(n, p, Block(ops))
+
+    def st_defer(self, c):
+        return Defer(self.obsn())
+
+    def st_shadow(self, c):
+        """`let t = ..;` with the name of a visible T: the old one stays
+        until its scope ends."""
+        ts = [v for v in self.all_vars(c) if v.ty == 'T' and v.kind == 'local']
+        if not ts:
+            return None
+        old = self.r.choice(ts)
+        x = self.texpr(c)
+        self.declare(c, old.name, 'T', self.chance(0.5))
+        return Decl(old.name, self.var_of(c, old.name).mut, None, x)
+
     # ---- functions
 
     def gen_fn(self):
         name = 'f%d' % (len(self.fns) + 1)
-        ret = self.r.choice(['i', 'i', 'T', 'OI', 'RI'])
+        ret = self.r.choice(['i', 'i', 'T', 'V', 'OI', 'RI'])
         c = Ctx(ret)
         params = []
         for _ in range(self.r.randint(1, 3)):
@@ -2530,64 +3148,18 @@ class Gen:
             pn = self.name('a')
             params.append((pn, conv, ty))
             self.declare(c, pn, ty, conv in ('inout', 'sink'), kind=conv if ty != 'i' else 'let')
-        def tail(c2):
-            return self.ret_expr(c2)
-        body = self.gen_block(c, self.r.randint(2, 8), tail_fn=tail)
-        if body.tail is None:
-            # (the body left on every path: still give it a value)
-            body.tail = None
-        f = GenFn(name, params, ret, body)
-        return f
+        body = self.gen_block(c, self.r.randint(2, 8), tail_fn=self.ret_expr)
+        return GenFn(name, params, ret, body)
 
     def program(self):
         for _ in range(self.r.randint(0, 3)):
             f = self.gen_fn()
-            if f.body.tail is not None or (f.body.stmts and self._ends_return(f.body)):
+            if f.body.tail is not None:
                 self.fns.append(f)
         c = Ctx(None)
         c.scopes[0].append(Var('gpa', 'gpa', False, 'let', 0))
         body = self.gen_block(c, self.size + self.r.randint(-self.size // 3, self.size // 3))
         return Program(self.fns, GenFn('run', [], None, body))
-
-    def _ends_return(self, b):
-        return False
-
-
-class StrLit(E):
-    def __init__(self, s):
-        self.s = s
-
-    def code(self):
-        return '"%s"' % self.s
-
-    def ev(self, it, fr):
-        return self.s
-
-
-class ForEachObs(S_):
-    """`for x in w { print(f"{x.v} "); }` then a newline: a loop over the
-    borrowed elements."""
-    def __init__(self, p, n):
-        self.p = p
-        self.n = n
-
-    def emit(self, out, ind):
-        out.append('%sprint("o%d");' % (ind, self.n))
-        out.append('%sfor x in %s { print(f" {x.id}:{x.v}"); }' % (ind, self.p.code()))
-        out.append('%sprintln("");' % ind)
-
-    def run(self, it, fr):
-        w = rd(self.p.place(it, fr).get())
-        it.line('o%d%s' % (self.n, ''.join(' %d:%d' % (x.id, x.v) for x in w)))
-
-
-# m_last for --known (a borrowed copy; the model gives the element)
-def m_last(it, r):
-    w = rd(r.get())
-    return OV(w[-1] if w else None)
-
-
-HELPERS['last'] = m_last
 
 
 # ---------------------------------------------------------------- checking
@@ -2632,16 +3204,18 @@ CONFIGS = [
 ]
 
 
-def run_cmd(cmd, timeout=60, env=None):
+def run_cmd(cmd, timeout=60):
     try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, env=env)
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
         return p.returncode, p.stdout.decode('utf-8', 'replace'), p.stderr.decode('utf-8', 'replace')
     except subprocess.TimeoutExpired:
         return 124, '', 'timeout'
 
 
 def check_program(volec, prog, work, tag, configs=CONFIGS):
-    """('ok', None) or (kind, detail)."""
+    """('ok', None) or (kind, detail): invalid (the model's), reject (the
+    checker's: OVERSTRICT or a generator bug), crash, exit, alloc
+    (--check-alloc's report), oracle (not the expected output)."""
     try:
         events = prog.expect()
     except Invalid as e:
@@ -2655,10 +3229,9 @@ def check_program(volec, prog, work, tag, configs=CONFIGS):
     if rc != 0:
         msg = (out + err).strip().splitlines()
         first = next((l for l in msg if 'error' in l), msg[0] if msg else 'no message')
-        if rc not in (0, 1):
+        if rc != 1:
             return ('crash', 'volec check exit %d: %s' % (rc, first))
-        return ('reject', first)
-    outputs = {}
+        return ('reject', first.replace(src, 'p.vl'))
     for name, flags in configs:
         exe = os.path.join(work, '%s.%s' % (tag, name))
         rc, out, err = run_cmd([volec] + flags + [src, '-o', exe], timeout=120)
@@ -2673,21 +3246,18 @@ def check_program(volec, prog, work, tag, configs=CONFIGS):
         lines = out.rstrip('\n').split('\n') if out else []
         if rc != 0:
             return ('exit', '%s: exit %d: %s' % (name, rc, err.strip().splitlines()[0] if err.strip() else ''))
-        if 'check-alloc' in err or 'use after free' in err or 'double free' in err:
+        if err.strip():
             return ('alloc', '%s: %s' % (name, err.strip().splitlines()[0]))
         d = compare(events, lines)
         if d is not None:
             return ('oracle', '%s: %s' % (name, d))
-        outputs[name] = out
-    if len(set(outputs.values())) > 1:
-        return ('levels', 'outputs differ: ' + ' '.join(sorted(outputs)))
     return ('ok', None)
 
 
 # ---------------------------------------------------------------- shrinking
 
 def blocks_of(prog):
-    """Every statement list of the program, as (list owner, list)."""
+    """Every statement list of the program."""
     out = []
 
     def walk_block(b):
@@ -2702,14 +3272,17 @@ def blocks_of(prog):
             walk_block(s.then)
             if s.els is not None:
                 walk_block(s.els)
-        elif isinstance(s, For):
+        elif isinstance(s, (For, While)):
             walk_block(s.body)
         elif isinstance(s, MatchE):
             for _, b in s.arms.values():
                 walk_block(b)
-        elif isinstance(s, IfLet):
+        elif isinstance(s, MatchOpt):
             walk_block(s.then)
-            walk_block(s.els)
+            if s.els is not None:
+                walk_block(s.els)
+        elif isinstance(s, InoutBlock):
+            walk_block(s.body)
 
     for f in prog.fns:
         walk_block(f.body)
@@ -2717,22 +3290,24 @@ def blocks_of(prog):
     return out
 
 
-def shrink(volec, prog, kind, work, log=None):
-    """Deletes statements (and unused functions) while check_program keeps
-    giving `kind`."""
-    def still(p, tag):
-        k, _ = check_program(volec, p, work, tag)
+def shrink(volec, prog, kind, work, budget=600):
+    """Deletes statements (and functions) while check_program keeps giving
+    `kind`; an if is also replaced by one of its blocks."""
+    state = {'n': 0}
+
+    def still(p):
+        state['n'] += 1
+        if state['n'] > budget:
+            return False
+        k, _ = check_program(volec, p, work, 'shrink%d' % state['n'])
         return k == kind
-    n = 0
     progress = True
-    while progress:
+    while progress and state['n'] <= budget:
         progress = False
-        # functions no longer called
         for f in list(prog.fns):
             saved = prog.fns
             prog.fns = [g for g in prog.fns if g is not f]
-            n += 1
-            if still(prog, 'shrink%d' % n):
+            if still(prog):
                 progress = True
             else:
                 prog.fns = saved
@@ -2744,19 +3319,16 @@ def shrink(volec, prog, kind, work, log=None):
                     continue
                 s = lst[i]
                 del lst[i]
-                n += 1
-                if still(prog, 'shrink%d' % n):
+                if still(prog):
                     progress = True
                 else:
                     lst.insert(i, s)
-                    # an if: keep one branch only
-                    if isinstance(s, If) and (s.then.stmts or (s.els and s.els.stmts)):
-                        for repl in ([s.then], [s.els] if s.els else []):
-                            if not repl:
+                    if isinstance(s, If):
+                        for repl in (s.then, s.els):
+                            if repl is None:
                                 continue
-                            lst[i] = repl[0]
-                            n += 1
-                            if still(prog, 'shrink%d' % n):
+                            lst[i] = repl
+                            if still(prog):
                                 progress = True
                                 break
                             lst[i] = s
@@ -2820,13 +3392,16 @@ def main():
             print('// invalid: %s' % e)
         return 0
     volec = os.path.abspath(a.c)
+    if not os.access(volec, os.X_OK):
+        print('sem-fuzz: no compiler at %s' % volec)
+        return 2
     work = tempfile.mkdtemp(prefix='vole-semfuzz.')
     if a.shrink is not None:
         prog = Gen(a.shrink, a.known, a.size).program()
         kind, detail = check_program(volec, prog, work, 'p')
         print('// %s: %s' % (kind, detail))
-        if kind != 'ok':
-            small = shrink(volec, prog, kind, work)
+        if kind not in ('ok', 'invalid'):
+            small = shrink(volec, prog, kind, work, budget=2000)
             print(small.code())
             print('// expected:\n' + ''.join('// ' + l + '\n' for l in render(small.expect()).splitlines()))
             print('// %s: %s' % check_program(volec, small, work, 'q'))
@@ -2852,7 +3427,7 @@ def main():
                     f.write(render(prog.expect()))
             except Invalid:
                 pass
-            if kind not in ('invalid',) and not a.no_shrink:
+            if kind != 'invalid' and not a.no_shrink:
                 with slots:
                     small = shrink(volec, Gen(seed, a.known, a.size).program(), kind, d)
                 with open(base + '.min.vl', 'w') as f:
@@ -2876,7 +3451,7 @@ def main():
             bad += 1
             print('FAIL seed %d: %s: %s (kept as %s)' % (s, kind, detail, os.path.join(a.k, 'sem%d.vl' % s)))
     summary = ', '.join('%d %s' % (counts[k], k) for k in sorted(counts))
-    print('sem-fuzz: %d programs, %d failing (%s)' % (len(seeds), bad, summary))
+    print('fuzz: %d value-semantics programs, %d failing (%s)' % (len(seeds), bad, summary))
     return 1 if bad else 0
 
 
