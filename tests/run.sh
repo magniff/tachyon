@@ -981,6 +981,43 @@ case example_layout in
         ;;
 esac
 
+# (0.25.1) Every example builds the way a reader would build it: the one
+# command `volec examples/.../main.vl -o NAME`, no extra files or flags.
+# Exceptions are only the examples whose point needs more (named with the
+# reason below). Category "example_build"; host target only (it links).
+case example_build in
+    *"$FILTER"*)
+        case "$(uname -s)-$(uname -m)" in
+            Darwin-arm64) eb_host=aarch64-macos ;;
+            Darwin-x86_64) eb_host=x86_64-macos ;;
+            Linux-x86_64) eb_host=x86_64-linux ;;
+            Linux-aarch64) eb_host=aarch64-linux ;;
+            *) eb_host="" ;;
+        esac
+        if [ "$TARGET" = "$eb_host" ]; then
+            for m in "$ROOT"/examples/*/main.vl "$ROOT"/examples/*/*/main.vl; do
+                [ -f "$m" ] || continue
+                ex=${m%/main.vl}
+                ex=${ex#"$ROOT"/examples/}
+                case "$ex" in
+                    tools | tools/*) continue ;;   # walkthroughs; some fail on purpose
+                    c-mixed-build) continue ;;     # its point is linking C sources
+                esac
+                # (a folder of a program's modules, not an example)
+                [ -f "${m%/main.vl}/../main.vl" ] && case "$ex" in */*) continue ;; esac
+                if "$COMPILER" "$m" -o "$WORK/example_build.bin" >"$WORK/example_build.out" 2>&1; then
+                    echo "example_build pass" >>"$TALLY"
+                else
+                    echo "example_build fail" >>"$TALLY"
+                    printf 'FAIL example_build %s:\n    `volec examples/%s/main.vl -o x` does not build:\n%s\n\n' \
+                        "$ex" "$ex" "$(tail -3 "$WORK/example_build.out" | sed 's/^/    /')" >>"$FAILURES"
+                fi
+                count=$((count + 1))
+            done
+        fi
+        ;;
+esac
+
 # (0.25.1) The README's example: its first code block under "## An
 # example" is tests/run/readme_example.vl after its header (compiled and
 # run as a case there); category "readme".
