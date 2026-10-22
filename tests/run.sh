@@ -11,7 +11,8 @@
 # tests/walkthrough/run.sh (the sessions of examples/tools/*/README.md,
 # 0.15, and of every examples/GROUP/NAME/README.md with one, 0.16) and
 # tests/own-try/run.sh (the own pass's try: lines run, 0.17) and
-# tests/lsp/run.sh (`volec lsp`'s sessions, 0.24) and tests/link/run.sh
+# tests/lsp/run.sh (`volec lsp`'s sessions, 0.24) and tests/book/run.sh
+# (the book's examples and sessions, 0.25) and tests/link/run.sh
 # (the link without cc, 0.25) and tests/gpu/run.sh (std::gpu on Metal, 0.22, skipped off macOS). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-k LINKER] [-d FORMAT] [FILTER]
@@ -676,6 +677,10 @@ esac
 case guide in
     *"$FILTER"*) "$ROOT/tests/guide/run.sh" -c "$COMPILER" >"$WORK/guide.out" 2>&1 & ;;
 esac
+# (0.25) The book's blocks and sessions (tests/book/run.sh): category "book".
+case book in
+    *"$FILTER"*) "$ROOT/tests/book/run.sh" -c "$COMPILER" >"$WORK/book.out" 2>&1 & ;;
+esac
 case fmt in
     *"$FILTER"*) "$ROOT/tests/fmt/run.sh" -c "$COMPILER" -j 1 >"$WORK/fmt.out" 2>&1 & ;;
 esac
@@ -882,6 +887,25 @@ case guide in
             count=$((count + 1))
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/guide.out" >>"$FAILURES"
+        ;;
+esac
+
+# The book (0.25): tests/book/run.sh (run above), every vole block of
+# book/*.md compiled, its outputs, errors and shell sessions as printed;
+# category "book".
+case book in
+    *"$FILTER"*)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "book pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "book fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/book.out"
+        if ! grep -q '^pass' "$WORK/book.out"; then
+            echo "book fail" >>"$TALLY"
+            count=$((count + 1))
+        fi
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/book.out" >>"$FAILURES"
         ;;
 esac
 
