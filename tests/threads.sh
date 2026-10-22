@@ -11,6 +11,12 @@
 # the output depend on the schedule). -O0 compiles from the syntax tree on
 # the main thread and assembles on another.
 #
+# (0.25) A schedule that shows a difference only now and then is caught by
+# repeats: tests/run/std_gpu_wgsl_reflect.vl for aarch64-linux at -O2, the
+# program whose SLP tables, left by an earlier function in a thread's
+# context, once gave 1 build in 40 other code, compiled REPEATS times
+# (default 96) at -jN, 32 at once, each the same assembly as -j1's.
+#
 # usage: tests/threads.sh [-c COMPILER] [-t TARGET] [-n THREADS] [-j JOBS] [FILTER]
 #
 #   -c COMPILER   the volec to check (default: target/volec)
@@ -18,6 +24,7 @@
 #   -n THREADS    the threads compared with one (default 8)
 #   -j JOBS       programs checked at once (default: the number of CPUs,
 #                 or the slots of $VOLE_JOBSERVER, see tests/run.sh)
+#   -r REPEATS    the repeated builds (0: none)
 #   FILTER        only the programs whose path contains FILTER
 
 set -u
@@ -33,6 +40,7 @@ TARGET=""
 THREADS=8
 JOBS=""
 FILTER=""
+REPEATS=96
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -40,8 +48,9 @@ while [ $# -gt 0 ]; do
         -t) TARGET=$2; shift 2 ;;
         -n) THREADS=$2; shift 2 ;;
         -j) JOBS=$2; shift 2 ;;
-        -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        -*) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        -r) REPEATS=$2; shift 2 ;;
+        -h|--help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
         *) FILTER=$1; shift ;;
     esac
 done
@@ -106,6 +115,18 @@ check() { # <file> <level> <env> <threads> <n>
     echo "ok $1 $what"
 }
 
+# Build $3 of program $1 for target $2 at -O2 -jN, against -j1's ($4).
+repeat_check() { # <file> <target> <n> <reference>
+    out="$WORK/repeat.$3.s"
+    "$COMPILER" --target "$2" -O2 "-j$THREADS" -S "$1" -o "$out" >/dev/null 2>&1
+    if cmp -s "$4" "$out"; then
+        rm -f "$out"
+        echo "ok $1 $2 -O2 -j$THREADS, repeat $3"
+    else
+        echo "FAIL $1 $2 -O2 -j$THREADS, repeat $3: the assembly differs from -j1's (kept: $out)"
+    fi
+}
+
 cd "$ROOT" || exit 1
 list="$WORK/list"
 : >"$list"
@@ -150,6 +171,20 @@ if [ -z "$FILTER" ] || echo compiler/src/main.vl | grep -q "$FILTER"; then
     for o in 1 2; do
         run compiler/src/main.vl "$o" "" 3
         run compiler/src/main.vl "$o" VOLE_FRESH_CONTEXTS=1 "$THREADS"
+    done
+fi
+rp=tests/run/std_gpu_wgsl_reflect.vl
+if [ "$REPEATS" -gt 0 ] && [ -f "$rp" ] && { [ -z "$FILTER" ] || echo "$rp" | grep -q "$FILTER"; }; then
+    "$COMPILER" --target aarch64-linux -O2 -j1 -S "$rp" -o "$WORK/repeat.ref.s" >/dev/null 2>&1
+    wait
+    # (in bursts of 32 at once, past the slots: a loaded machine
+    # interleaves the threads' tasks most)
+    r=0
+    while [ "$r" -lt "$REPEATS" ]; do
+        r=$((r + 1))
+        n=$((n + 1))
+        repeat_check "$rp" aarch64-linux "$r" "$WORK/repeat.ref.s" >"$WORK/$n.result" &
+        [ $((r % 32)) -eq 0 ] && wait
     done
 fi
 wait
