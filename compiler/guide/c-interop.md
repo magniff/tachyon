@@ -142,10 +142,11 @@ An extern block can say what it links (0.25): `#[link(lib = "objc")]`
 (`-lobjc`), `#[link(framework = "Metal")]` (macOS; Linux leaves it
 out), or Rust's `#[link(name = "objc")]` and `#[link(name = "Metal",
 kind = "framework")]`, several in one attribute or in several, before
-`extern "C"`. A program links them when it uses the block's module, so
-std::gpu, std::objc and std::window bring their frameworks and
-libobjc, and a program without them links nothing more. On the command
-line, `-framework NAME` adds a framework.
+`extern "C"`. A program links them when it calls a function of the
+block or uses one of its statics, so std::gpu, std::objc and
+std::window bring libobjc and their frameworks, and a program without
+them links nothing more (keep the C library's functions in a block of
+their own). On the command line, `-framework NAME` adds a framework.
 
 ```tach
 #[link(lib = "m")]

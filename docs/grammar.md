@@ -587,9 +587,9 @@ keyword (`s.r#type`); C names that are vole keywords are imported so.
 symbol of a declaration; a static shared with C may be an array.
 (0.25) `#[link(lib = "objc")]` and `#[link(framework = "Metal")]` (or
 Rust's `#[link(name = "...", kind = "framework")]`) before `extern "C"`
-name what the block links: a program links them when it reaches the
-block's module (frameworks on macOS only); `-framework NAME` on the
-command line likewise.
+name what the block links: a program links them when it uses one of the
+block's functions or statics (frameworks on macOS only); `-framework
+NAME` on the command line adds one.
 
 ## Additions of 0.5
 

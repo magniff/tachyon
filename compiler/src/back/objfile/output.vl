@@ -150,9 +150,71 @@ pub fn add_framework(name: [u8]) {
     }
 }
 
-pub fn add_link_lib(name: [u8]) {
+// The extern blocks' links (#[link]): a kind ('F', 'l'), the name (a C
+// string), then where its block's symbols start in LINK_DECL_SYMS and how
+// many: four words each.
+static var LINK_DECLS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var LINK_DECL_SYMS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// A link an extern block declares (front::parser::foreign::link_block),
+// with the C symbols of its functions and statics (C strings).
+pub fn add_link_decl(kind: u8, name: [u8], syms: inout IntVec) {
     unsafe {
-        add_once(&LINK_LIBS, name);
+        let b = buf_new();
+        buf_bytes(b, name);
+        buf_byte(b, 0);
+        LINK_DECLS.push(kind as i64);
+        LINK_DECLS.push(BUFS[b].data as i64);
+        LINK_DECLS.push(LINK_DECL_SYMS.count);
+        LINK_DECLS.push(syms.count);
+        for i in 0..syms.count {
+            LINK_DECL_SYMS.push(syms.data[i]);
+        }
+    }
+}
+
+// Adds the declared links the program uses to LINK_FRAMEWORKS and
+// LINK_LIBS: those whose block has a symbol the object refers to and does
+// not define (or no symbol at all).
+fn resolve_declared() {
+    unsafe {
+        var d = 0;
+        while d < LINK_DECLS.count {
+            let first = LINK_DECLS.data[d + 2];
+            let n = LINK_DECLS.data[d + 3];
+            var used = n == 0;
+            for s in 0..ASYM_COUNT {
+                if used {
+                    break;
+                }
+                if ASYMS[s].defined {
+                    continue;
+                }
+                var text = ASYMS[s].text;
+                if !ELF {
+                    if text.len == 0 || text[0] != '_' {
+                        continue;
+                    }
+                    text = text[1..text.len];
+                }
+                for k in first..first + n {
+                    if cstr(LINK_DECL_SYMS.data[k] as *u8) == text {
+                        used = true;
+                        break;
+                    }
+                }
+            }
+            if used {
+                let name = cstr(LINK_DECLS.data[d + 1] as *u8);
+                if LINK_DECLS.data[d] == 'F' {
+                    add_once(&LINK_FRAMEWORKS, name);
+                } else {
+                    add_once(&LINK_LIBS, name);
+                }
+            }
+            d += 4;
+        }
+        LINK_DECLS.count = 0;
     }
 }
 
@@ -352,6 +414,7 @@ fn linker() -> i64 {
 // (the linker said why).
 pub fn link_program(path: *u8, obj_path: *u8) -> i64 {
     unsafe {
+        resolve_declared();
         let cc = getenv(c"VOLE_CC");
         // ($VOLE_CC=cc, as tests/run.sh sets it, is the default driver)
         let own = !LINK_C && LINK_ARGS.count == 0

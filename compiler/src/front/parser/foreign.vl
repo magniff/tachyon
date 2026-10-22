@@ -2,10 +2,10 @@
 // with their link names), functions with the C convention, and statics
 // with a C symbol.
 
-use crate::back::objfile::output::{add_framework, add_link_lib};
-use crate::base::{intern, intern_c};
+use crate::back::objfile::output::add_link_decl;
+use crate::base::{IntVec, intern, intern_c, sym_name};
 use crate::base::diag::error_at;
-use crate::front::ast::{NODES, NodeKind, list_push, new_node};
+use crate::front::ast::{NODES, NodeKind, SCRATCH, list_push, new_node};
 use crate::front::check::name_error;
 use crate::front::lexer::{TOKS, str_at};
 use crate::front::lexer::Tok::{
@@ -33,13 +33,18 @@ pub fn at_link_attribute() -> bool {
     }
 }
 
+// (0.25) The links of the `#[link]`s read, for the block that follows:
+// a kind ('F' a framework, 'l' a library) and the name's string id, two
+// words each.
+static var LINK_PENDING: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
 // (0.25) `#[link(...)]`s before an extern block: what the program links
-// when it reaches the block's module (so a std module the program does
-// not use links nothing). `framework = "Metal"` (macOS's; Linux leaves
-// it out) or `lib = "objc"` (`-lobjc`); Rust's `name = "objc"`, with
-// `kind = "framework"` for a framework, too. Several in one attribute,
-// separated by commas, and several attributes. The block itself follows
-// (it may be empty).
+// when it calls into the block (back::objfile::output::add_link_decl), so
+// a std module the program does not use links nothing. `framework =
+// "Metal"` (macOS's; Linux leaves it out) or `lib = "objc"` (`-lobjc`);
+// Rust's `name = "objc"`, with `kind = "framework"` for a framework, too.
+// Several in one attribute, separated by commas, and several attributes.
+// The block follows; link_block takes them when it is read.
 pub fn parse_link_attributes() {
     unsafe {
         let start = cur_start();
@@ -59,10 +64,9 @@ pub fn parse_link_attributes() {
                 }
                 let value = TOKS[P].value as i64;
                 advance();
-                if key == intern_c(c"framework") {
-                    add_framework(str_at(value));
-                } else if key == intern_c(c"lib") {
-                    add_link_lib(str_at(value));
+                if key == intern_c(c"framework") || key == intern_c(c"lib") {
+                    LINK_PENDING.push(if key == intern_c(c"framework") { 'F' } else { 'l' } as i64);
+                    LINK_PENDING.push(value);
                 } else if key == intern_c(c"name") {
                     name = value;
                 } else if key == intern_c(c"kind") {
@@ -83,16 +87,37 @@ pub fn parse_link_attributes() {
             expect(RParen);
             expect(RBracket);
             if name >= 0 {
-                if framework {
-                    add_framework(str_at(name));
-                } else {
-                    add_link_lib(str_at(name));
-                }
+                LINK_PENDING.push(if framework { 'F' } else { 'l' } as i64);
+                LINK_PENDING.push(name);
             }
         }
         if !at(Extern) && !(at(Pub) && tok_kind(1) == Extern) {
             error_at(start, c"#[link] goes before an extern block: `#[link(lib = \"objc\")] extern \"C\" { ... }`");
         }
+    }
+}
+
+// (0.25) The block of the `#[link]`s just read was read: its items are
+// SCRATCH from `mark`. Each link is the program's when the program calls
+// one of its functions or uses one of its statics (by their C symbols);
+// a block of none links always.
+pub fn link_block(mark: i64) {
+    unsafe {
+        var syms = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in mark..SCRATCH.count {
+            let item = SCRATCH.data[i];
+            if NODES[item].kind == NodeKind::ExternFn
+                || (NODES[item].kind == NodeKind::Static && NODES[item].y == 1) {
+                let link = LINK_NAMES.get(NODES[item].a + 1);
+                syms.push(sym_name(if link > 0 { link - 1 } else { NODES[item].a }) as i64);
+            }
+        }
+        var k = 0;
+        while k < LINK_PENDING.count {
+            add_link_decl(LINK_PENDING.data[k] as u8, str_at(LINK_PENDING.data[k + 1]), &syms);
+            k += 2;
+        }
+        LINK_PENDING.count = 0;
     }
 }
 
