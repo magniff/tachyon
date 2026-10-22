@@ -435,6 +435,24 @@ pub static var W_AFTER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 pub static var M_FROM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 pub static var M_TO: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
+// (0.24) The target a link moved from a to b points at after the move: its
+// extension a's replaced by b's when it has a's; 0 when it keeps its own.
+fn relinked_target(t: [u8], a: [u8], b: [u8]) -> *u8 {
+    unsafe {
+        let ea = crate::base::source_ext_len(a);
+        let eb = crate::base::source_ext_len(b);
+        if ea == 0 || eb == 0 || t.len <= ea
+            || !same_bytes(t[t.len - ea..t.len], a[a.len - ea..a.len])
+            || same_bytes(a[a.len - ea..a.len], b[b.len - eb..b.len]) {
+            return 0 as *u8;
+        }
+        let out = buf_new();
+        buf_bytes(out, t[0..t.len - ea]);
+        buf_bytes(out, b[b.len - eb..b.len]);
+        buf_cstr(out)
+    }
+}
+
 // Moves files from[k] to to[k], as `git mv` does: the index's entry of a
 // tracked file moves (one `git update-index --index-info`), then the file
 // (and the directories left empty go). False after the diagnostic; what
@@ -519,15 +537,43 @@ pub fn move_files(from: IntVec, to: IntVec) -> bool {
             }
         }
         var ok = true;
+        // (0.24) A link to a file of the old extension (`pty.tach ->
+        // ../core/pty.tach`) moved to the new one points at the new one too:
+        // the file it names moves in the same edit; git adds it again
+        var relinked = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for k in 0..from.count {
             let a = from.data[k] as *u8;
             let b = to.data[k] as *u8;
+            let target = crate::tools::proc::link_target(a);
             if !make_parent(b) || !rename_file(a, b) {
                 cannot_write(b);
                 ok = false;
-            } else {
-                remove_empty_dirs(a);
+                continue;
             }
+            remove_empty_dirs(a);
+            if target >= 0 {
+                let re = relinked_target(buf_slice(target), c_slice(a), c_slice(b));
+                if re != 0 as *u8 {
+                    remove_file(b);
+                    if !crate::tools::proc::make_link(re, b) {
+                        cannot_write(b);
+                        ok = false;
+                    }
+                    relinked.push(b as i64);
+                }
+            }
+        }
+        if in_git && relinked.count > 0 {
+            let g = crate::base::alloc_array::<*u8>(relinked.count + 5);
+            g[0] = c"git";
+            g[1] = c"add";
+            g[2] = c"--";
+            for k in 0..relinked.count {
+                g[3 + k] = relinked.data[k] as *u8;
+            }
+            g[3 + relinked.count] = 0 as *u8;
+            let out = buf_new();
+            run_capture(g, out);
         }
         ok
     }

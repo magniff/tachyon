@@ -117,14 +117,16 @@ docs/notes.md	2 mentions
 geo/shapes.vl	1 mention
 main.vl	2 mentions
 tachyon-run.sh	4 mentions
+*.tach -> *.vl	2 files
 geo/*.tach -> *.vl	2 files
-*.tach -> *.vl	1 file
-renamed 3 files (.tach -> .vl), 9 mentions in 4 files
+renamed 4 files (.tach -> .vl), 9 mentions in 4 files
 same build	1 program builds as before (the paths aside)
 note extension.strings: 1 mention in string literals of 1 source left: changing them changes what the program does
 try: tachyonc rewrite --text .tach .vl --word --strings --dry-run
 note extension.excluded: 0 files kept their name (excluded); 1 mention left in excluded files and lines
 % git status --short
+D  alias.tach
+A  alias.vl
  M docs/notes.md
 R  geo/mod.tach -> geo/mod.vl
 RM geo/shapes.tach -> geo/shapes.vl
@@ -132,6 +134,9 @@ RM main.tach -> main.vl
  M tachyon-run.sh
 % test -x tachyon-run.sh && echo executable
 executable
+## (0.24) A link to a renamed file is moved and points at its new name.
+% readlink alias.vl
+geo/shapes.vl
 % cat tachyon-run.sh docs/notes.md
 #!/bin/sh
 # Builds main.vl with tachyonc; every *.vl here.
@@ -148,7 +153,7 @@ tachyon now.
 main.tach says Tachyon
 ok: built prog
 $ undo
-undid renamed 3 files .tach -> .vl	9 mentions in 4 files
+undid renamed 4 files .tach -> .vl	9 mentions in 4 files
 % test -x tachyon-run.sh && echo executable
 executable
 % git status --short
