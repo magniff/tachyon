@@ -86,6 +86,13 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   the gate.
 - `crate::tools::fmt::format_source(text)`: the formatter in the
   process, for the language server's format-on-save.
+- **The language server** (`volec lsp`, the VS Code extension 0.25.1):
+  format-on-save and range formatting through fmt's engine (no edits on
+  code that does not parse); completion after `.` and `::`, of names,
+  keywords and snippets, on buffers that do not parse too (about 1.6 ms
+  median), resolved with the signature, effects and doc comment;
+  signature help with the conventions (`let`, `inout`, `sink`); the
+  extension formats on save, tab size 4.
 - **Breaking**: nothing in the language. Code that passed `fmt --check`
   under 0.25.0 may need a `volec fmt`.
 
