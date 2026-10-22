@@ -1,9 +1,11 @@
 // The vole extension: starts `volec lsp` as a language server over stdio.
 //
 // The server gives diagnostics, go to definition, references, hover and
-// document symbols. The compiler is vole.server.path (default `volec`,
-// looked up on PATH). Nothing here talks to the network or collects
-// telemetry.
+// document and workspace symbols, on every name: std's items too, whose
+// definitions are in std's text as the server writes it to a cache
+// directory (`.../vole/std-VERSION-HASH/`, docs/lsp.md); those files open
+// read-only. The compiler is vole.server.path (default `volec`, looked
+// up on PATH). Nothing here talks to the network or collects telemetry.
 
 import * as fs from "fs";
 import * as path from "path";
@@ -34,7 +36,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await startClient(context);
       }
     }),
+    vscode.window.onDidChangeActiveTextEditor((editor) => readOnlyIfStd(editor)),
   );
+  readOnlyIfStd(vscode.window.activeTextEditor);
 
   await startClient(context);
 }
@@ -150,6 +154,24 @@ function expandHome(p: string): string {
     return path.join(process.env.HOME ?? "", p.slice(1));
   }
   return p;
+}
+
+// std's files, as the server writes them (`<cache>/vole/std-VERSION-HASH/`):
+// what is edited there is not std (std is in the compiler), so the editor
+// shows them read-only.
+const STD_CACHE = /[\\/]vole[\\/]std-[^\\/]+[\\/]/;
+const readOnlyDone = new Set<string>();
+
+function readOnlyIfStd(editor: vscode.TextEditor | undefined): void {
+  const doc = editor?.document;
+  if (!doc || doc.uri.scheme !== "file" || !STD_CACHE.test(doc.uri.fsPath)) return;
+  const key = doc.uri.toString();
+  if (readOnlyDone.has(key)) return;
+  readOnlyDone.add(key);
+  void vscode.commands.executeCommand("workbench.action.files.setActiveEditorReadonlyInSession").then(
+    undefined,
+    (err) => log(`marking ${doc.uri.fsPath} read-only: ${String(err)}`),
+  );
 }
 
 function log(msg: string): void {

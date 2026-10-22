@@ -28,7 +28,7 @@ pub fn restock(items: inout Vec<Item>, i: i64, n: i64) {
     var it = items.get(i);
     if it.count == 0 && n <= MAX {
         it.count = n;
-        &items.set(i, it);
+        items.set(i, it);
     }
 }
 // calls (2)
@@ -81,7 +81,7 @@ pub fn restock(items: inout Vec<Item>, i: i64, n: i64) {
     var it = items.get(i);
     if it.count == 0 && n <= MAX {
         it.count = n;
-        &items.set(i, it);
+        items.set(i, it);
     }
 }
 // crate::stock::total	context/stock.vl:18-25	used 0 times in the module, 1 outside

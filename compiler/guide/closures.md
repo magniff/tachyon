@@ -63,16 +63,45 @@ Decided per variable, so the meaning never depends on an analysis:
 | `var x` | inout | `x` itself: its assignments change `x` |
 | anything, in a `sink \|..\|` closure | taken: copied, an owned local moved in | a snapshot; assignments change the closure's own |
 
-A closure capturing `x` by access is a view of `x` (0.17): while the
-closure is still to be called, `x` is not changed another way
-(`own.conflict`). Change it after the closure's last call, or capture a
-snapshot with `sink`.
+A closure capturing `x` by access holds that access from its creation
+to its last call (0.25). One that changes `x` (an assignment, `&x`, an
+inout method such as `x.push(..)`) holds an inout access: while it is
+still to be called, `x` is not read or changed another way, and calling
+it or passing it next to `&x` or a view of `x` is an error
+(`own.conflict`). One that only reads `x` holds a let access: `x` may be
+read, not changed. Use `x` after the closure's last call, pass the
+value to the closure as a parameter instead of capturing it, or capture
+a snapshot with `sink`.
+
+```tach
+fn main(gpa: Gpa) {
+    var v: Vec<i64> = Vec::new_in(gpa);
+    var add = |x: i64| v.push(x);
+    add(1);
+    add(2);
+    println(f"{v.len()}");             // add's last call is above
+}
+```
+```out
+2
+```
+
+A captured variable is the closure's `inout` parameter (0.25): what its
+body stores into one must outlive the call. A view of the body's own
+local stored into a captured `Vec`, through `arena_scope`'s closure or
+any other, is `own.escape`, as it is for a function storing into its
+`inout` parameter. A view the closure returns, or stores into what it
+captures, counts at every call: called directly or by a generic
+function (`apply(x, f)`, `iter.map(f)`), the result views what the
+closure views.
 
 ## sink closures
 
 `sink || body` takes what it captures, as a `sink` parameter does: a
 plain value is copied, an owned local moves into the closure (and is
-dead after it), and the closure may change its own copies. It is the
+dead after it), and the closure may change its own copies. A borrowed
+owned value (a `let` or `inout` parameter, `self`, a loop's element)
+cannot be taken: that is `own.move_out`; clone it first, or drop `sink`. It is the
 way to keep a closure that outlives the block of what it uses: the
 move closure of other languages (`move ||` is `conv.rust`, with `sink
 ||` in its `try:` line).

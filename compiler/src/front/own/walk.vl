@@ -30,26 +30,30 @@
 //
 // Phase 0 contract: walk_fn and the ev_* signatures are fixed.
 
-use crate::base::{SYMS, intern_c};
+use crate::base::{IntVec, SYMS, intern_c};
 use crate::front::ast::{
-    CLOSURE_MOVE, DEFER_IMPLICIT, FN_CLOSURE, NODES, NODE_IN_BOUNDS, NODE_RAW, NODE_REF_MUT,
-    NodeKind, child,
+    CLOSURE_MOVE, DEFER_IMPLICIT, FN_CLOSURE, NODES, NODE_CAPTURE, NODE_IN_BOUNDS, NODE_RAW,
+    NODE_REF_MUT, NodeKind, child,
 };
 use crate::front::check::{LOCALS, Res};
 use crate::front::lexer::Tok;
 use crate::front::modules::{STD_MODULE, within_std};
 use crate::front::own::{calls, fast, moves, views};
 use crate::front::own::kinds::{
-    P_MUT, P_MUT_VIEW, P_RAW, P_SHARED, P_VALUE, P_VIEW, is_owned_type, is_view_type, param_mode,
+    P_MUT, P_MUT_VIEW, P_RAW, P_SHARED, P_VALUE, P_VIEW, has_drop_impl, is_moved_type,
+    is_owned_type, is_view_type, param_mode,
 };
 use crate::front::own::state::{
     CUR, LOC_CAP, LOC_PL, LOC_SLOT, MAXNW, NW, PE, PEND, PK_MUT, PK_MUT_VIEW, PK_NONE, PK_RAW,
     PK_RESERVE, PK_SHARED, PK_VIEW, PL_OVERFLOW, PL_PARENT, PL_RKIND, POOL, POOL_TOP, RK_STATIC,
-    SLOT_CAP, SLOT_OVERFLOW, TUPLE_FIELD, alias_local, child_place, copy_state, join_state,
-    local_place, new_ov, new_state, pend_push, reachable, reset_places, root_of, same_state,
-    set_unreachable, set_words, slot_for, static_has_place, static_place, variant_field_key,
+    SLOT_CAP, SLOT_OVERFLOW, TUPLE_FIELD, alias_local, child_place, copy_state, is_empty,
+    join_state, l1, l2, local_place, new_ov, new_state, or_into, ov_inner, ov_or, pend_push,
+    reachable, reset_places, root_of, same_state, set_bit, set_unreachable, set_words, slot_for,
+    static_has_place, static_place, variant_field_key,
 };
-use crate::front::own::summary::{ViewSummary, collect_begin, collect_end, collect_result};
+use crate::front::own::summary::{
+    ViewSummary, collect_begin, collect_end, collect_result, env_param,
+};
 use crate::front::patterns::binds_ref;
 use crate::front::types::{FNS, REF_MUT, REF_SHARED, TYPES, TyKind};
 
@@ -205,7 +209,7 @@ pub fn ev_bind(l: i64, n: i64, v: i64) {
         }
         BOUND.push(l);
         views::on_bind(l, n, v);
-        if is_owned_type(LOCALS[l].ty) {
+        if is_moved_type(LOCALS[l].ty) {
             ev_init(local_place(l));
         }
     }
@@ -275,7 +279,7 @@ fn relevant_local(l: i64) -> bool {
         if l < LOC_CAP && (LOC_PL[l] != 0 || LOC_SLOT[l] != 0) {
             return true;
         }
-        LOCALS[l].is_param || is_owned_type(LOCALS[l].ty)
+        LOCALS[l].is_param || is_moved_type(LOCALS[l].ty)
     }
 }
 
@@ -315,8 +319,23 @@ fn is_reference(e: i64) -> bool {
         if NODES[e].ty > 0 && TYPES[NODES[e].ty].kind == TyKind::Ptr && TYPES[NODES[e].ty].b != 0 {
             return true;
         }
+        if NODES[e].kind == NodeKind::FieldAccess && NODES[e].y == 1 && NODES[e].a > 0
+            && (NODES[e].p & NODE_CAPTURE) == 0 && env_local(NODES[e].a) {
+            // (a closure's capture by reference, `(*env).x`: the captured
+            // variable itself, env_ref_field)
+            return true;
+        }
         NODES[e].kind == NodeKind::Ident && NODES[e].res == Res::Local && NODES[e].y >= 0
-            && LOCALS[NODES[e].y].borrow
+            && (LOCALS[NODES[e].y].borrow || env_local(e))
+    }
+}
+
+// Whether e names the walked closure's env parameter (summary::env_param):
+// a reference to the closure's value, its captures.
+pub fn env_local(e: i64) -> bool {
+    unsafe {
+        NODES[e].kind == NodeKind::Ident && NODES[e].res == Res::Local && PARAM_LOCALS.count > 0
+            && NODES[e].y == PARAM_LOCALS.data[0] && env_param(CUR_F, 0)
     }
 }
 
@@ -401,7 +420,21 @@ fn place_rec(e: i64) -> i64 {
         // loan views: `&v[i]` of a Vec is `&v.as_slice()[i]`)
         let d = PO_VALUE_DST;
         PO_VALUE_DST = -1;
+        // (0.25: what the value's own evaluation finds on its way is not this
+        // place's: PO_* as they were)
+        let deref = PO_DEREF;
+        let index = PO_INDEX;
+        let raw = PO_RAW;
+        let inner = PO_INNER;
+        let vs = PO_VIEWSLOT;
+        let make = PO_MAKE;
         eval(e, CX_READ, d);
+        PO_DEREF = deref;
+        PO_INDEX = index;
+        PO_RAW = raw;
+        PO_INNER = inner;
+        PO_VIEWSLOT = vs;
+        PO_MAKE = make;
         -1
     }
 }
@@ -441,6 +474,19 @@ fn eval_list(n: i64, ctx: i64, dst: i64) {
 // receiver of `unwrap` and the like (eval_let, eval_match, eval_call).
 static var BORROW_OK: i64 = 0;
 
+// (0.25) The value of a let-else's matching arm on a borrowed copy, a
+// tuple of its bindings, read (not moved): eval's Match.
+static var LE_READ: i64 = 0;
+
+// (0.25) The temporaries' places made in the statement being walked
+// (state::temp_place), which die at its end.
+pub static var TEMPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// (0.25) Whether the value being bound is a borrowed copy (drops::
+// borrowed_call: `let s = v.get(0)` of a Vec<String>): a binding of an
+// owned type then views what the copy's container holds.
+static var BIND_BORROWED: bool = false;
+
 // Evaluates expression n (0: none); ctx says whether its value is moved;
 // dst (an origin value, or -1) gets the views it holds.
 pub fn eval(n: i64, ctx: i64, dst: i64) {
@@ -465,6 +511,25 @@ pub fn eval(n: i64, ctx: i64, dst: i64) {
                         let kind = if (NODES[n].p & NODE_REF_MUT) != 0 { REF_MUT }
                             else { REF_SHARED };
                         ev_borrow(p, n, kind, PO_RAW, dst);
+                    } else if dst >= 0 {
+                        // (0.25) `&temp`: a loan on a value no place holds;
+                        // what it holds is at both levels (a method of the
+                        // temporary reads it through the loan, `*self`)
+                        let t = new_ov();
+                        eval(operand, CX_READ, t);
+                        crate::front::own::calls::deep_into(dst, t);
+                        POOL_TOP = t;
+                        // and, when it has storage of its own (an owner, or
+                        // plain data: not only views), the temporary itself,
+                        // which dies at the end of the statement
+                        let ot = NODES[operand].ty;
+                        if ot > 0 && (is_owned_type(ot) || !is_view_type(ot)) {
+                            let q = crate::front::own::state::temp_place(operand);
+                            if q >= 0 {
+                                set_bit(l1(dst), q);
+                                TEMPS.push(q);
+                            }
+                        }
                     } else {
                         eval(operand, CX_READ, dst);
                     }
@@ -497,6 +562,7 @@ pub fn eval(n: i64, ctx: i64, dst: i64) {
             NodeKind::Call => {
                 let ok = BORROW_OK == n;
                 eval_call(n, dst);
+                moves::drop_call(n);
                 if ctx == CX_MOVE && !ok && !within_std(FNS[CUR_F].module)
                     && crate::front::own::drops::borrowed_call(n) {
                     // (a copy of an element a collection keeps, moved:
@@ -517,7 +583,23 @@ pub fn eval(n: i64, ctx: i64, dst: i64) {
                 join_state(CUR, then_state);
                 POOL_TOP = saved;
             }
-            NodeKind::Match => eval_match(n, ctx, dst),
+            NodeKind::Match => {
+                // (0.25: let-else on a borrowed copy, `let Some(t) = v.last()
+                // else ..`: its bindings borrow, read as its value, as `?`'s)
+                if crate::front::own::drops::borrowed_call(n) {
+                    let ok = BORROW_OK == n;
+                    let value = NODES[child(n, 0)].c;
+                    let saved = LE_READ;
+                    LE_READ = value;
+                    eval_match(n, CX_READ, dst);
+                    LE_READ = saved;
+                    if ctx == CX_MOVE && !ok && !within_std(FNS[CUR_F].module) {
+                        crate::front::own::moves::borrowed_move(n);
+                    }
+                } else {
+                    eval_match(n, ctx, dst);
+                }
+            }
             NodeKind::Loop | NodeKind::While | NodeKind::For => eval_loop(n),
             NodeKind::Break => {
                 let lp = NODES[n].x;
@@ -550,7 +632,7 @@ pub fn eval(n: i64, ctx: i64, dst: i64) {
                 POOL_TOP = v;
             }
             NodeKind::Tuple | NodeKind::Array | NodeKind::StructLit | NodeKind::VariantLit => {
-                eval_list(n, CX_MOVE, dst);
+                eval_list(n, if LE_READ == n { CX_READ } else { CX_MOVE }, dst);
             }
             NodeKind::FieldInit | NodeKind::NamedArg => eval(NODES[n].b, ctx, dst),
             NodeKind::Repeat => eval(NODES[n].a, CX_MOVE, dst),
@@ -562,13 +644,25 @@ pub fn eval(n: i64, ctx: i64, dst: i64) {
                 let moving = (NODES[n].c & CLOSURE_MOVE) != 0;
                 if !moving {
                     NO_MOVE += 1;
+                } else {
+                    moves::sink_borrowed_captures(n);
                 }
                 eval(NODES[n].y, CX_MOVE, dst);
                 if !moving {
                     NO_MOVE -= 1;
                 }
             }
-            NodeKind::Try => eval(NODES[n].y, ctx, dst),
+            NodeKind::Try => {
+                // (0.25: `v.last()?`, a borrowed copy, as the Call above)
+                // (its match binds ?v by reference, drops::try_let_borrows:
+                // the value is read there, and moved only as a whole, here)
+                let ok = BORROW_OK == n;
+                let borrowed = crate::front::own::drops::borrowed_call(n);
+                eval(NODES[n].y, if borrowed { CX_READ } else { ctx }, dst);
+                if borrowed && ctx == CX_MOVE && !ok && !within_std(FNS[CUR_F].module) {
+                    crate::front::own::moves::borrowed_move(n);
+                }
+            }
             NodeKind::Interp => {
                 // (the holes are shared borrows, §2.7: their lets, `let =fN
                 // = eN`, read eN (eval_let); what eN moves inside, as
@@ -598,7 +692,7 @@ fn eval_place_value(n: i64, ctx: i64, dst: i64) {
             // collection a call views, `v[i]` of a Vec (`v.as_slice()[i]`),
             // or what a call's reference points to, moved: own.move_out)
             // (a raw pointer's `p[i]`, `*p`: unsafe code's bitwise read)
-            if ctx == CX_MOVE && is_owned_type(t) && (NODES[n].p & NODE_RAW) == 0 {
+            if ctx == CX_MOVE && is_moved_type(t) && (NODES[n].p & NODE_RAW) == 0 {
                 let k = NODES[n].kind;
                 if k == NodeKind::Index {
                     crate::front::own::moves::move_out_value(n, MO_INDEX);
@@ -612,20 +706,42 @@ fn eval_place_value(n: i64, ctx: i64, dst: i64) {
                     crate::front::own::moves::partial(n);
                 }
             }
-            eval(NODES[n].a, ctx, dst);
+            // (0.25: a plain field of a borrowed copy, `v.last()?.id`, is read)
+            let bctx = if ctx == CX_MOVE && !is_owned_type(t)
+                && crate::front::own::drops::borrowed_call(NODES[n].a) { CX_READ } else { ctx };
+            eval(NODES[n].a, bctx, dst);
             return;
         }
+        // (0.25) a place reached through a value, `v[i]` of a Vec
+        // (`v.as_slice()[i]`), `*r()`: tmp gets that value's views, and
+        // the element read out of what it views gets their level 2
+        let view = dst >= 0 && (is_view_type(t) || t > 0 && TYPES[t].kind == TyKind::Ptr);
+        let tmp = if view { new_ov() } else { -1 };
+        PO_VALUE_DST = tmp;
         let p = place_of(n);
+        PO_VALUE_DST = -1;
+        if tmp >= 0 {
+            if p < 0 && !PO_RAW {
+                if PO_INNER || PO_DEREF {
+                    ov_inner(dst, tmp);
+                } else {
+                    ov_or(dst, tmp);
+                }
+            }
+            POOL_TOP = tmp;
+        }
         if p < 0 {
             // (`v[i]` of a Vec through a reference: no place, a copy of an
             // element the Vec keeps)
-            if ctx == CX_MOVE && is_owned_type(t) && NODES[n].kind == NodeKind::Index
-                && (NODES[n].p & NODE_RAW) == 0 {
+            // (0.25: a field or a tuple part of such an element too, `w[0].v`)
+            if ctx == CX_MOVE && is_moved_type(t) && (NODES[n].p & NODE_RAW) == 0
+                && part_of_index(n) {
                 crate::front::own::moves::move_out_value(n, MO_INDEX);
             }
             return;
         }
-        if ctx == CX_MOVE && is_owned_type(t) {
+        // (0.25: or one holding an inout access, move-only)
+        if ctx == CX_MOVE && is_moved_type(t) {
             let r = root_of(p);
             let how = if PL_RKIND[r] == RK_STATIC { MO_STATIC } else if PO_INDEX { MO_INDEX }
                 else if PO_DEREF { MO_DEREF } else { MO_PLACE };
@@ -633,9 +749,24 @@ fn eval_place_value(n: i64, ctx: i64, dst: i64) {
         } else {
             ev_read(p, n);
         }
-        if is_view_type(t) || t > 0 && TYPES[t].kind == TyKind::Ptr {
+        if is_view_type(t) || t > 0 && TYPES[t].kind == TyKind::Ptr
+            || crate::front::own::glue::has_glue(t)
+            && crate::front::own::state::slot_of_place(p) >= 0 {
             ev_value(p, n, t, dst);
         }
+    }
+}
+
+// (0.25) Whether place expression n is an index, or a field or a tuple part
+// of one (`w[0].v.1`).
+fn part_of_index(n: i64) -> bool {
+    unsafe {
+        var e = n;
+        while NODES[e].kind == NodeKind::FieldAccess && NODES[e].y != 1
+            || NODES[e].kind == NodeKind::TupleField {
+            e = NODES[e].a;
+        }
+        NODES[e].kind == NodeKind::Index
     }
 }
 
@@ -658,15 +789,59 @@ fn eval_slicing(n: i64, dst: i64) {
     }
 }
 
+// (0.25) Whether local l is a statement temporary's pointer (drops::
+// visit_temps: `__own_tp = &__own_tv`), which the walk follows: what it
+// points to is the temporary, alive to the end of its statement.
+fn tp_local(l: i64) -> bool {
+    unsafe { l >= 0 && SYMS[LOCALS[l].name].text == "__own_tp" }
+}
+
+// (0.25) Whether place expression e is a part of a static (not through a
+// pointer): an assignment to it needs its place, for statics hold only
+// views of static data (views::static_store).
+fn static_root(e: i64) -> bool {
+    unsafe {
+        let k = NODES[e].kind;
+        if k == NodeKind::Ident {
+            return NODES[e].res == Res::Static;
+        }
+        if k == NodeKind::FieldAccess && NODES[e].y == 0 || k == NodeKind::TupleField
+            || k == NodeKind::Index {
+            return static_root(NODES[e].a);
+        }
+        false
+    }
+}
+
 fn eval_assign(n: i64) {
     unsafe {
         let target = NODES[n].b;
         let value = NODES[n].c;
         let v = new_ov();
         eval(value, if NODES[n].op == Tok::Eq { CX_MOVE } else { CX_READ }, v);
-        let p = place_of(target);
-        if p >= 0 {
+        // (0.25: a place reached through a view value, `v[i] = w` of a Vec:
+        // its origin, what the write reaches)
+        let t = new_ov();
+        PO_VALUE_DST = t;
+        let p = if static_root(target) { place_of_make(target) } else { place_of(target) };
+        PO_VALUE_DST = -1;
+        if p >= 0 && NODES[target].kind == NodeKind::Ident && NODES[target].res == Res::Local
+            && tp_local(NODES[target].y) {
+            // (0.25) `__own_tp = &__own_tv`: it points to the statement's
+            // temporary (a place of its own, which dies with the statement,
+            // views::kill_temps), which holds what __own_tv holds
+            let w = new_ov();
+            let q = crate::front::own::state::temp_place(n);
+            if q >= 0 {
+                set_bit(l1(w), q);
+                TEMPS.push(q);
+            }
+            or_into(l2(w), l2(v));
+            ev_assign(p, n, w);
+        } else if p >= 0 {
             ev_assign(p, n, v);
+        } else if !PO_RAW && reachable(CUR) {
+            views::write_through_value(t, n, v);
         }
         POOL_TOP = v;
     }
@@ -703,7 +878,12 @@ fn bind_at(pat: i64, v: i64, place: i64) {
                 POOL_TOP = o;
                 return;
             }
-            slot_for(l, is_view_type(LOCALS[l].ty));
+            // (0.25: or a value of no view type that views something, a
+            // borrowed copy of an element: `let x = v.get(0)` of a
+            // Vec<String> is a view of v)
+            slot_for(l, is_view_type(LOCALS[l].ty) || tp_local(l) || v >= 0 && BIND_BORROWED
+                && crate::front::own::glue::has_glue(LOCALS[l].ty)
+                && (!is_empty(l1(v)) || !is_empty(l2(v))));
             ev_bind(l, pat, v);
             return;
         }
@@ -776,14 +956,14 @@ fn ref_bind_place(e: i64, pat: i64) -> i64 {
     }
 }
 
-fn pattern_binds_owned(p: i64) -> bool {
+pub fn pattern_binds_owned(p: i64) -> bool {
     unsafe {
         if p == 0 {
             return false;
         }
         let k = NODES[p].kind;
         if k == NodeKind::PatBind {
-            return NODES[p].x >= 0 && is_owned_type(LOCALS[NODES[p].x].ty);
+            return NODES[p].x >= 0 && is_moved_type(LOCALS[NODES[p].x].ty);
         }
         if k == NodeKind::PatTuple || k == NodeKind::PatVariant || k == NodeKind::PatOr {
             for i in 0..NODES[p].count {
@@ -806,7 +986,25 @@ fn eval_match(n: i64, ctx: i64, dst: i64) {
         }
         let v = new_ov();
         BORROW_OK = NODES[n].a;
-        eval(NODES[n].a, if moves { CX_MOVE } else { CX_READ }, v);
+        // (0.25: a local's place matched by value moves only the parts its
+        // arms bind: the rest stays, dropped where the local is)
+        let parts = moves && part_scrutinee(NODES[n].a);
+        let sty = if NODES[n].a != 0 { NODES[NODES[n].a].ty } else { 0 };
+        if moves && has_drop_impl(sty)
+            && (NODES[NODES[n].a].p & crate::front::own::drops::MATCH_BYREF) == 0 {
+            for i in 0..NODES[n].count {
+                let p = NODES[child(n, i)].a;
+                if NODES[p].kind != NodeKind::PatBind && pattern_binds_owned(p) {
+                    moves::partial_pattern(p, sty);
+                }
+            }
+        }
+        eval(NODES[n].a, if moves && !parts { CX_MOVE } else { CX_READ }, v);
+        let pp = if parts { part_place(NODES[n].a) } else { -1 };
+        if parts && pp < 0 {
+            // (no place for it: moved whole, as before)
+            eval(NODES[n].a, CX_MOVE, -1);
+        }
         let entry = new_state();
         copy_state(entry, CUR);
         let acc = new_state();
@@ -814,11 +1012,22 @@ fn eval_match(n: i64, ctx: i64, dst: i64) {
             let arm = child(n, i);
             copy_state(CUR, entry);
             let mark = BOUND.count;
-            // (a view bound out of the scrutinee reborrows what it
-            // comes from: `if let Some(a) = m.get_mut(k)`, views::on_bind)
-            views::BIND_FROM = NODES[n].a;
-            bind_at(NODES[arm].a, v, ref_bind_place(NODES[n].a, NODES[arm].a));
-            views::BIND_FROM = 0;
+            if parts && pp >= 0 {
+                // (the arm's mark, drops::ARM_MARK: an expression evaluated
+                // when the arm is taken, where its moves clear drop flags)
+                let mk = crate::front::own::drops::ARM_MARK.get(arm + 1) - 1;
+                moves::MOVE_AT = if mk > 0 { mk } else { NODES[arm].c };
+                bind_parts(NODES[arm].a, v, pp);
+                moves::MOVE_AT = 0;
+            } else {
+                // (a view bound out of the scrutinee reborrows what it
+                // comes from: `if let Some(a) = m.get_mut(k)`, views::on_bind)
+                views::BIND_FROM = NODES[n].a;
+                BIND_BORROWED = crate::front::own::drops::borrowed_call(NODES[n].a);
+                bind_at(NODES[arm].a, v, ref_bind_place(NODES[n].a, NODES[arm].a));
+                BIND_BORROWED = false;
+                views::BIND_FROM = 0;
+            }
             eval(NODES[arm].b, CX_READ, -1);
             eval(NODES[arm].c, ctx, dst);
             ev_scope(mark, -1, 0);
@@ -826,6 +1035,98 @@ fn eval_match(n: i64, ctx: i64, dst: i64) {
         }
         copy_state(CUR, acc);
         POOL_TOP = v;
+    }
+}
+
+// (0.25, conventions.md "Partial moves") Whether match or `let` scrutinee
+// e, matched by value with owned bindings, moves part by part: a path of
+// a local's fields (`e`, `s.f`, `t.0`, no index, no `*`, no static), owned,
+// not matched through a reference (MATCH_BYREF), with no Drop impl on the
+// way (its drop needs all of it).
+fn part_scrutinee(e: i64) -> bool {
+    unsafe {
+        if e == 0 || (NODES[e].p & crate::front::own::drops::MATCH_BYREF) != 0
+            || !is_owned_type(NODES[e].ty) {
+            return false;
+        }
+        var x = e;
+        loop {
+            if has_drop_impl(NODES[x].ty) || (NODES[x].p & NODE_RAW) != 0 {
+                return false;
+            }
+            let k = NODES[x].kind;
+            if k == NodeKind::Ident {
+                return NODES[x].res == Res::Local && NODES[x].y >= 0
+                    && crate::front::own::drops::BYREF.get(NODES[x].y + 1) == 0;
+            }
+            if k == NodeKind::FieldAccess && NODES[x].y != 1 || k == NodeKind::TupleField {
+                x = NODES[x].a;
+            } else {
+                return false;
+            }
+        }
+        false
+    }
+}
+
+// The place of part_scrutinee e (evaluated already), or -1.
+fn part_place(e: i64) -> i64 {
+    unsafe {
+        let p = place_of_make(e);
+        if p < 0 || PO_RAW || PO_INDEX || PO_DEREF || PL_RKIND[root_of(p)] == RK_STATIC {
+            return -1;
+        }
+        p
+    }
+}
+
+// Pattern pat of a match (or `let`) by value on the value at place `place`
+// (part_place; -1: none) binds: an owned binding moves its part only
+// (moves::MOVE_AT, the arm's body, clears its drop flag), so the parts it
+// leaves (`_`, `..`, other variants) stay in the place, and drop with it.
+// A part without a place moves its parent whole.
+fn bind_parts(pat: i64, v: i64, place: i64) {
+    unsafe {
+        if pat == 0 {
+            return;
+        }
+        let k = NODES[pat].kind;
+        if k == NodeKind::PatBind {
+            let l = NODES[pat].x;
+            if l < 0 {
+                return;
+            }
+            if place >= 0 && is_owned_type(LOCALS[l].ty) {
+                ev_move(place, pat, MO_PLACE);
+            } else if place >= 0 {
+                ev_read(place, pat);
+            }
+            slot_for(l, is_view_type(LOCALS[l].ty));
+            ev_bind(l, pat, v);
+            return;
+        }
+        if k == NodeKind::PatTuple || k == NodeKind::PatVariant || k == NodeKind::PatOr {
+            for i in 0..NODES[pat].count {
+                let c = child(pat, i);
+                var sub = place;
+                if place >= 0 && k == NodeKind::PatTuple {
+                    sub = child_place(place, TUPLE_FIELD + i);
+                } else if place >= 0 && k == NodeKind::PatVariant {
+                    sub = child_place(place, variant_field_key(NODES[pat].x, i));
+                }
+                if place >= 0 && pattern_binds_owned(c)
+                    && (sub < 0 || has_drop_impl(NODES[c].ty) && NODES[c].kind != NodeKind::PatBind) {
+                    // (no place for the part, or a Drop impl's value taken
+                    // apart, own.partial: the part moves whole)
+                    if sub >= 0 {
+                        moves::partial_pattern(c, NODES[c].ty);
+                    }
+                    ev_move(if sub >= 0 { sub } else { place }, pat, MO_PLACE);
+                    sub = -1;
+                }
+                bind_parts(c, v, sub);
+            }
+        }
     }
 }
 
@@ -946,12 +1247,16 @@ fn eval_block(n: i64, ctx: i64, dst: i64) {
         let dmark = DEFS.count;
         // (0.18: a requires check's block whose call may be a borrowed copy)
         let tail_ok = BORROW_OK == n && crate::front::contracts::expand::requires_tail(n) > 0;
+        // (0.25) a `let`'s temporaries, and the tail's, live to the block's
+        // end (the `let` may keep a view of them); a statement's, to its own
+        let bmark = TEMPS.count;
         for i in 0..NODES[n].count {
             if !reachable(CUR) {
                 break;
             }
             let s = child(n, i);
             let k = NODES[s].kind;
+            let tmark = TEMPS.count;
             if k == NodeKind::Let && for_alias(s) {
                 // (`for x in v`: the loop borrows v)
             } else if k == NodeKind::Let {
@@ -963,6 +1268,9 @@ fn eval_block(n: i64, ctx: i64, dst: i64) {
             } else {
                 eval(s, CX_READ, -1);
             }
+            if k != NodeKind::Let {
+                views::kill_temps(tmark);
+            }
         }
         let tail = NODES[n].a;
         if tail != 0 && reachable(CUR) {
@@ -973,6 +1281,13 @@ fn eval_block(n: i64, ctx: i64, dst: i64) {
         }
         run_defers(dmark);
         DEFS.count = dmark;
+        views::kill_temps(bmark);
+        if (NODES[n].p & crate::front::check::temps::NODE_TEMP) != 0 {
+            // (0.25: a statement temporary's block, own/drops temp_make:
+            // its __own_tv lives as long as the statement, the scope its
+            // drop is in)
+            return;
+        }
         ev_scope(mark, dst, tail);
     }
 }
@@ -1018,8 +1333,26 @@ fn eval_let(s: i64) {
             && SYMS[NODES[pat].a].text == "__own_new") {
             BORROW_OK = init;
         }
-        eval(init, ctx, v);
+        if ctx == CX_MOVE && pat != 0 && init != 0
+            && (NODES[pat].kind == NodeKind::PatTuple || NODES[pat].kind == NodeKind::PatVariant)
+            && pattern_binds_owned(pat) && part_scrutinee(init) {
+            // (0.25: `let (a, _) = t;` moves t.0 only, as a match does)
+            eval(init, CX_READ, v);
+            let pp = part_place(init);
+            if pp >= 0 {
+                moves::MOVE_AT = init;
+                bind_parts(pat, v, pp);
+                moves::MOVE_AT = 0;
+                POOL_TOP = v;
+                return;
+            }
+            eval(init, CX_MOVE, -1);
+        } else {
+            eval(init, ctx, v);
+        }
+        BIND_BORROWED = init != 0 && crate::front::own::drops::borrowed_call(init);
         bind_at(pat, v, ref_bind_place(init, pat));
+        BIND_BORROWED = false;
         POOL_TOP = v;
         if pat != 0 && init != 0 && NODES[pat].kind == NodeKind::PatBind && NODES[pat].x >= 0 {
             views::on_let(NODES[pat].x, init);
@@ -1109,6 +1442,14 @@ fn eval_call(n: i64, dst: i64) {
                 } else if mode == P_RAW || c_callee {
                     kind = PK_RAW;
                 }
+                if i == 0 && crate::front::closures::closure_of_type(NODES[NODES[arg].b].ty) > 0
+                    && kind == PK_RAW {
+                    // (0.25) a closure called or lent, `&g`: an access of its
+                    // captures for the call (o holds them at level 2),
+                    // inout where it changes one
+                    kind = if views::holds_mut(NODES[NODES[arg].b].ty, 0) { PK_MUT_VIEW }
+                        else { PK_VIEW };
+                }
                 if made && mode == P_MUT && f >= 0 && i < FNS[f].param_count {
                     // (a `&mut` parameter, not a legacy `*T` one: through a
                     // `&T` or a `[T]` it is own.readonly, as a write is)
@@ -1151,10 +1492,40 @@ fn eval_call(n: i64, dst: i64) {
                     kind = PK_RAW;
                 } else if mode == P_MUT_VIEW {
                     kind = PK_MUT_VIEW;
+                } else if made && mode == P_MUT && !raw
+                    || mode == P_MUT && k == NodeKind::Unary && NODES[arg].op == Tok::Amp
+                    && through_exclusive_view(NODES[arg].b) {
+                    // (0.25) `&mut v[i]` of a Vec, `v[i].push(w)`: a place
+                    // inside what a view value points to, written by the
+                    // call: its origin (the loans it holds) is written;
+                    // `&v[i]` of a Vec, a Buf, a String: a loan of an
+                    // element through the view `v.as_mut_slice()` makes (o
+                    // holds it), exclusive as `&a[i]` of an array is
+                    kind = PK_MUT;
                 } else if is_view_type(at_ty) {
-                    kind = PK_VIEW;
+                    // (0.25) one holding an inout access (a closure that
+                    // writes a capture, a struct with an inout field) may
+                    // change what it views during the call
+                    // (a closure lent to a let parameter, `&|| ..`, too: the
+                    // callee calls it)
+                    let inner = if TYPES[at_ty].kind == TyKind::Ptr { TYPES[at_ty].a } else { 0 };
+                    // (a temporary lent, `&v.iter()`, writes itself: only a
+                    // value that holds an inout access writes through it)
+                    let held = if inner > 0 { views::holds_mut(inner, 0) }
+                        else { views::holds_mut(at_ty, 0) };
+                    kind = if held
+                        || inner > 0 && crate::front::closures::closure_holds_inout(inner) {
+                        PK_MUT_VIEW
+                    } else {
+                        PK_VIEW
+                    };
                 } else if at_ty > 0 && TYPES[at_ty].kind == TyKind::Ptr {
                     kind = PK_RAW;
+                } else if crate::front::own::glue::has_glue(at_ty)
+                    && (!is_empty(l1(o)) || !is_empty(l2(o))) {
+                    // (0.25) a value of no view type that views something:
+                    // a borrowed copy of an element (`m.get(k).unwrap()`)
+                    kind = PK_VIEW;
                 }
                 pend_push(kind, -1, o, arg, mode);
             }
@@ -1180,6 +1551,35 @@ fn eval_call(n: i64, dst: i64) {
         }
         PEND.count = base;
         POOL_TOP = mark;
+    }
+}
+
+// (0.25) Whether place e (`v.as_mut_slice()[i].x`) is reached through an
+// exclusive view a call makes (an `inout [T]` or `inout T` result): a loan of
+// it writes what that view points into. A temporary itself (`&v.iter()`)
+// is not: its change is its own.
+fn through_exclusive_view(e: i64) -> bool {
+    unsafe {
+        var p = e;
+        var depth = 0;
+        while depth < 64 {
+            let k = NODES[p].kind;
+            if k == NodeKind::Index || k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+                p = NODES[p].a;
+            } else if k == NodeKind::Call || k == NodeKind::MethodCall {
+                if depth == 0 {
+                    return false;
+                }
+                // (a part of what a call returns a view of: `v[0]` as a
+                // receiver is `v.as_slice()[0]`; a written element)
+                let t = NODES[p].ty;
+                return t > 0 && (TYPES[t].kind == TyKind::Slice || TYPES[t].kind == TyKind::Ptr);
+            } else {
+                return false;
+            }
+            depth += 1;
+        }
+        false
     }
 }
 

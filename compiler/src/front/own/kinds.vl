@@ -158,13 +158,25 @@ pub fn type_kind(t: i64) -> i64 {
                 if (STRUCTS[s].repr & STRUCT_SCOPED) != 0 {
                     k |= K_VIEW;
                 }
+                var raw = false;
                 for i in 0..STRUCTS[s].field_count {
                     let ft = (*struct_field(s, i)).ty;
                     if STRUCTS[s].closure != 0 && ft > 0 && TYPES[ft].kind == TyKind::Ptr {
                         // (a capture by reference)
                         k |= K_VIEW;
                     }
+                    if ft > 0 && TYPES[ft].kind == TyKind::Ptr && TYPES[ft].b == 0 {
+                        raw = true;
+                    }
                     k |= type_kind(ft);
+                }
+                if raw && STRUCTS[s].closure == 0 {
+                    // (0.25) a generic container that keeps its T values
+                    // through raw pointers (a BTreeMap's nodes, a heap's or
+                    // a deque's buffer) holds the views they hold
+                    for i in 0..STRUCTS[s].targ_count {
+                        k |= type_kind(TLISTS.data[STRUCTS[s].targs + i]) & (K_VIEW | K_LEVEL2);
+                    }
                 }
             }
         } else if kind == TyKind::Tuple {
@@ -211,6 +223,78 @@ pub fn is_view_type(t: i64) -> bool {
     (type_kind(t) & K_VIEW) != 0
 }
 
+// (0.25) Whether a value of type t holds an inout access, directly or in a
+// part: an `inout T` or `inout [T]` (a reference REF_MUT inside), a struct
+// with such a field, a closure that changes a capture
+// (closures::closure_holds_inout), a tuple, array, enum variant or
+// container element (a type argument: `Vec<C>`, `Option<C>`) holding one.
+// Such a value is move-only (conventions.md §6.2): `let d = c`, `var p2 =
+// p` and a sink argument move it, a later use is own.moved, and it is
+// never copyable (conv::copyable).
+pub fn holds_inout(t: i64) -> bool {
+    holds_inout_rec(t, 0)
+}
+
+fn holds_inout_rec(t: i64, depth: i64) -> bool {
+    unsafe {
+        if t <= 0 || t == TY_ERROR || depth > 8 {
+            return false;
+        }
+        let kind = TYPES[t].kind;
+        if kind == TyKind::Ptr || kind == TyKind::Slice {
+            return TYPES[t].b == REF_MUT;
+        }
+        if kind == TyKind::Struct {
+            if crate::front::closures::closure_holds_inout(t) {
+                return true;
+            }
+            let s = TYPES[t].a;
+            for i in 0..STRUCTS[s].field_count {
+                if holds_inout_rec((*struct_field(s, i)).ty, depth + 1) {
+                    return true;
+                }
+            }
+            for i in 0..STRUCTS[s].targ_count {
+                if holds_inout_rec(TLISTS.data[STRUCTS[s].targs + i], depth + 1) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if kind == TyKind::Tuple {
+            for i in 0..TYPES[t].count {
+                if holds_inout_rec(type_elem(t, i), depth + 1) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if kind == TyKind::Array || kind == TyKind::Distinct {
+            return holds_inout_rec(TYPES[t].a, depth + 1);
+        }
+        if kind == TyKind::Enum {
+            let e = TYPES[t].a;
+            for i in 0..ENUMS[e].variant_count {
+                if holds_inout_rec(VARIANTS[enum_variant(e, i)].shape, depth + 1) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+// What moves when assigned or passed by value: an owned value, or an
+// aggregate holding an inout access (holds_inout: a struct, tuple, enum,
+// array, closure or container of one). An access itself (`inout T`,
+// `inout [T]`) passed on is a reborrow, not a move.
+pub fn is_moved_type(t: i64) -> bool {
+    unsafe {
+        is_owned_type(t) || t > 0 && TYPES[t].kind != TyKind::Ptr && TYPES[t].kind != TyKind::Slice
+            && holds_inout(t)
+    }
+}
+
 // The element type of the views a value of type t holds (`[E]`: E,
 // `Vec<[E]>`: E, `&E`: E, a struct holding only views of E: E); 0: none;
 // -1: several, or unknown (a closure). For the type filter (§2.4, T3).
@@ -249,7 +333,14 @@ fn view_elem_of(t: i64) -> i64 {
                 return r;
             }
             for i in 0..STRUCTS[s].field_count {
-                r = join_elem(r, view_elem((*struct_field(s, i)).ty));
+                let ft = (*struct_field(s, i)).ty;
+                if ft > 0 && TYPES[ft].kind == TyKind::Ptr && TYPES[ft].b == 0 {
+                    // (0.25) a raw pointer of a view (an iterator's into a
+                    // table's buckets) points to its pointee too
+                    r = join_elem(r, TYPES[ft].a);
+                } else {
+                    r = join_elem(r, view_elem(ft));
+                }
             }
             return r;
         }

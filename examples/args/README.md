@@ -54,9 +54,18 @@ a promise its caller makes by calling it inside `unsafe { }`. The slice
 `s[0..n]` of a raw pointer is how memory from C becomes a `[u8]`, which
 the f-string `f"-- {arg}"` then prints as text.
 
+## The same with std::cli
+
+`argv` by hand is how a program reaches C's arguments. A program that
+takes flags and options declares them instead, with `std::cli` (0.24),
+which parses them and gives `--help` and the errors for bad arguments:
+[cli](../cli/) is this program with a flag and two options, and no
+`unsafe`.
+
 ## Language features
 
 - `main(argc, argv)`, `**u8`: `volec guide types`
 - `unsafe` blocks and `unsafe fn`: `volec guide unsafe`
 - importing a C header, `c::strlen`: `volec guide c-interop`
 - f-strings: `volec guide formatting`
+- parsing flags and options instead: `volec guide cli`, [cli](../cli/)

@@ -5,7 +5,7 @@
 $ check --json
 $ query def add --json
 crate::add	main.vl:3:4	fn	fn add(a: i64, b: i64) -> i64	effects: none
-std::ops::Add::add	<std>:4683:20	trait-method	fn add(self, other: Self) -> Self
+std::ops::Add::add	<std>:4787:20	trait-method	fn add(self, other: Self) -> Self
 ## (quotes and tabs escaped)
 $ query grep bad --json
 # main.vl

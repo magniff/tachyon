@@ -21,7 +21,7 @@ use crate::base::{
     IntVec, STDERR, SYMS, buf_byte, buf_bytes, buf_clear, buf_int, buf_new, buf_slice, buf_str,
     buf_write_fd,
 };
-use crate::base::diag::{buf_position, report_error_once, report_warning};
+use crate::base::diag::{buf_position, put_try_lines, report_error_tries};
 use crate::front::ast::NODES;
 use crate::front::types::buf_type;
 
@@ -36,7 +36,8 @@ pub const OWN_STATIC: i64 = 5;
 pub const OWN_VIEWS: i64 = 6;
 pub const OWN_DROP_VIEW: i64 = 7;
 pub const OWN_READONLY: i64 = 8;
-pub const OWN_CODES: i64 = 9;
+pub const OWN_DROP_CALL: i64 = 9;
+pub const OWN_CODES: i64 = 10;
 
 pub fn code_name(c: i64) -> *u8 {
     if c == OWN_MOVED { return c"own.moved"; }
@@ -47,6 +48,7 @@ pub fn code_name(c: i64) -> *u8 {
     if c == OWN_STATIC { return c"own.static"; }
     if c == OWN_VIEWS { return c"own.views"; }
     if c == OWN_DROP_VIEW { return c"own.drop_view"; }
+    if c == OWN_DROP_CALL { return c"own.drop_call"; }
     c"own.readonly"
 }
 
@@ -63,7 +65,7 @@ pub static var OWN_REPORT_PRINT: bool = false;
 
 // The findings recorded in report mode (buffers), and counts per code.
 pub static var OWN_REPORTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-pub static var OWN_COUNTS: [i64; 9] = [0; 9];
+pub static var OWN_COUNTS: [i64; 10] = [0; 10];
 
 // The message being built.
 static var MSG: i64 = -1;
@@ -133,7 +135,7 @@ pub fn own_try(s: [u8]) {
     unsafe {
         if buf_slice(TRY).len > 0 {
             // (each line a try: of its own, as check prints them)
-            buf_str(TRY, c"\ntry: ");
+            buf_byte(TRY, '\n');
         }
         buf_bytes(TRY, s);
     }
@@ -157,17 +159,13 @@ pub fn own_end() {
         buf_bytes(msg, buf_slice(MSG));
         let help = buf_new();
         buf_bytes(help, buf_slice(HELP));
-        if buf_slice(TRY).len > 0 {
-            if buf_slice(HELP).len > 0 {
-                buf_str(help, c" | ");
-            }
-            buf_str(help, c"try: ");
-            buf_bytes(help, buf_slice(TRY));
-        }
+        let tries = buf_new();
+        buf_bytes(tries, buf_slice(TRY));
         PENDING.push(NODES[M_NODE].start);
         PENDING.push(if M_SOFT { M_CODE | SOFT_BIT } else { M_CODE });
         PENDING.push(msg);
         PENDING.push(help);
+        PENDING.push(tries);
     }
 }
 
@@ -203,7 +201,8 @@ pub fn own_flush() {
             let code = PENDING.data[i + 1] & ~SOFT_BIT;
             let msg = PENDING.data[i + 2];
             let help = PENDING.data[i + 3];
-            i += 4;
+            let tries = PENDING.data[i + 4];
+            i += 5;
             if code >= 0 && code < OWN_CODES {
                 OWN_COUNTS[code] += 1;
             }
@@ -221,6 +220,7 @@ pub fn own_flush() {
                     buf_bytes(line, buf_slice(help));
                     buf_str(line, c"\n");
                 }
+                put_try_lines(line, buf_slice(tries));
                 OWN_REPORTS.push(line);
                 continue;
             }
@@ -228,11 +228,8 @@ pub fn own_flush() {
             buf_byte(msg, 0);
             buf_byte(help, 0);
             let h = if has_help { buf_slice(help).ptr } else { 0 as *u8 };
-            if OWN_MODE == MODE_WARN || soft {
-                report_warning(pos, 1000 + code, code_name(code), buf_slice(msg).ptr, h);
-            } else {
-                report_error_once(pos, 1000 + code, code_name(code), buf_slice(msg).ptr, h, "");
-            }
+            report_error_tries(pos, 1000 + code, code_name(code), buf_slice(msg).ptr, h,
+                buf_slice(tries), OWN_MODE == MODE_WARN || soft);
         }
         PENDING.count = 0;
     }

@@ -16,7 +16,7 @@ use crate::base::diag::{
 use crate::front::ambient::has_local_gpa;
 use crate::front::assoc::ensure_checked;
 use crate::front::ast::{
-    NODES, NODE_CHECKED, NodeKind, child, list_begin, list_end, list_push, new_node,
+    NODES, NODE_CHECKED, NODE_REF_MUT, NodeKind, child, list_begin, list_end, list_push, new_node,
 };
 use crate::front::ast::NodeKind::{Call, Ident, Index, Range, Unary};
 use crate::front::check::{LOCALS, Res, SELF_SYM, is_std_named, name_error};
@@ -32,7 +32,7 @@ use crate::front::check::vectors::{sym_is_c, vector_method};
 use crate::front::convert::generic_trait_call;
 use crate::front::derive::intrinsic::{has_intrinsic_method, intrinsic_method};
 use crate::front::distinct::{PATH_TYPE, STR_TYPE};
-use crate::front::generics::{TPL_DISTINCT, TPL_SLICE, check_arg, template_name};
+use crate::front::generics::{TPL_DISTINCT, TPL_SLICE, check_arg, check_call_arg, template_name};
 use crate::front::generics::instantiate::instantiate_call;
 use crate::front::lexer::{SUF_I64, Tok};
 use crate::front::modules::{CUR_MOD, STD_MODULE, within_std};
@@ -40,9 +40,9 @@ use crate::front::modules::lookup::is_prelude_name;
 use crate::front::own::kinds::has_drop_impl;
 use crate::front::traits::require_in_bounds;
 use crate::front::types::{
-    ENUMS, FNS, METHODS, METHOD_COUNT, STRUCTS, TYPES, TY_I64, TY_U8, TY_UNIT, TyKind, VARIANTS,
-    buf_type, decay_ref, enum_variant, err_type, find_field, find_method, fn_param, is_compound,
-    is_mut_slice, is_pointer, is_ref, is_vector, ptr_to, slice_of,
+    ENUMS, FNS, METHODS, METHOD_COUNT, REF_MUT, STRUCTS, TYPES, TY_I64, TY_U8, TY_UNIT, TyKind,
+    VARIANTS, buf_type, decay_ref, enum_variant, err_type, find_field, find_method, fn_param,
+    is_compound, is_mut_slice, is_pointer, is_ref, is_vector, ptr_to, slice_of,
 };
 
 // ---- Paths, variants and methods ----
@@ -118,7 +118,7 @@ fn rust_method_help(t: i64, name: i64) {
         // (0.20) a method of `str` on bytes
         if kind == TyKind::Slice && TYPES[t].a == TY_U8 && STR_TYPE > 0
             && method_of(STR_TYPE, name) >= 0 {
-            err_help(c"`[u8]` is bytes; text is `str` (UTF-8), which has it: a literal is a `str` where one goes (`let s: str = \"..\";`, `fn f(s: &str)`); bytes become one by `str::from_utf8(b)?`");
+            err_help(c"`[u8]` is bytes; text is `str` (UTF-8), which has it: a literal is a `str` where one goes (`let s: str = \"..\";`, `fn f(s: str)`); bytes become one by `str::from_utf8(b)?`");
             return;
         }
         // (0.14 has `iter`: only the names it lacks)
@@ -501,6 +501,11 @@ pub fn synth_method(n: i64) -> i64 {
             }
             let arg = if through_pointer { receiver }
                 else { synthetic_unary(Tok::Amp, receiver, ptr_to(t)) };
+            // (0.25) an `inout self` receiver needs the place mutable
+            let st = fn_param(f, 0);
+            if !through_pointer && TYPES[st].kind == TyKind::Ptr && TYPES[st].b == REF_MUT {
+                crate::front::check::assign::check_inout_place(receiver, n);
+            }
             return direct_call(n, f, direct, arg);
         }
         if FNS[f].generic > 0 {
@@ -544,11 +549,29 @@ pub fn synth_method(n: i64) -> i64 {
                     err_end();
                 }
                 arg = synthetic_unary(Tok::Amp, receiver, self_ty);
+                // (0.25) an `inout self` receiver needs the place mutable
+                if TYPES[self_ty].b == REF_MUT {
+                    crate::front::check::assign::check_inout_place(receiver, n);
+                    check_elem_receiver(receiver, n);
+                }
             }
         } else if TYPES[self_ty].kind == TyKind::Slice && TYPES[t].kind == TyKind::Slice
             && TYPES[self_ty].a == TYPES[t].a {
             // (0.17) `self: &mut [T]` on a slice, `self: [T]` on a `&mut
             // [T]`: a slice is its own view
+            if TYPES[self_ty].b == REF_MUT && TYPES[t].b != REF_MUT {
+                if NODES[receiver].kind == Index && NODES[NODES[receiver].b].kind == Range
+                    && NODES[NODES[receiver].a].ty > 0
+                    && TYPES[NODES[NODES[receiver].a].ty].kind == TyKind::Array {
+                    // (0.25) an array's slicing, `a.sort()`, `a[1..].sort()`:
+                    // an exclusive one, as `&a[..]` is
+                    NODES[receiver].p |= NODE_REF_MUT;
+                    NODES[receiver].ty = self_ty;
+                }
+                // (any other view: the own pass takes the call as a change
+                // of what it views, `s.sort()` of `let s = v.as_slice()`;
+                // threads::capture_write as a thread's write)
+            }
         } else {
             err_begin(NODES[n].start);
             err_str(c"method '");
@@ -576,7 +599,7 @@ pub fn synth_method(n: i64) -> i64 {
         list_push(arg);
         for i in 0..count {
             let a = child(n, i);
-            check_arg(a, fn_param(f, i + 1));
+            check_call_arg(a, f, i + 1);
             list_push(a);
         }
         list_end(n, mark);
@@ -586,6 +609,39 @@ pub fn synth_method(n: i64) -> i64 {
         ensure_checked(f, n);
         check_call_safety(n, f, 1);
         FNS[f].ret
+    }
+}
+
+// (0.25) An `inout self` receiver that is an element of a Vec, a Buf or a
+// String (`v[0].inc()`, checked as `v.as_slice()[0]`): the rule of an inout
+// access for the container, v.
+fn check_elem_receiver(receiver: i64, at: i64) {
+    unsafe {
+        var p = receiver;
+        for _ in 0..64 {
+            let k = NODES[p].kind;
+            if k == NodeKind::FieldAccess && NODES[p].y == 0 || k == NodeKind::TupleField
+                || k == NodeKind::Index {
+                p = NODES[p].a;
+            } else {
+                break;
+            }
+        }
+        if p != receiver
+            && (NODES[p].kind == NodeKind::Call || NODES[p].kind == NodeKind::MethodCall)
+            && NODES[p].count > 0 {
+            let f = NODES[p].x - 1;
+            if f >= 0 && SYMS[FNS[f].display].text.len >= 8 {
+                let w = SYMS[FNS[f].display].text;
+                if w.len >= 8 && w[w.len - 8..w.len] == "as_slice" {
+                    var base = child(p, 0);
+                    if NODES[base].kind == Unary && NODES[base].op == Tok::Amp {
+                        base = NODES[base].b;
+                    }
+                    crate::front::check::assign::check_inout_place(base, at);
+                }
+            }
+        }
     }
 }
 

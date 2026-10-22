@@ -103,7 +103,26 @@ closure with it, and frees all of it when the closure returns; nothing allocated
 the closure (the compiler rejects a result or a capture that holds the
 `ScopedArena`). `Arena::new_in(gpa)` is a handle kept longer (it does
 not drop yet: `unsafe { a.free_all(); }` returns its memory, 0.17),
-`a.scope(|s| ...)` a scope of it; `FixedBuf::new(mem)` allocates from memory you give it.
+`a.scope(|s| ...)` a scope of it; `FixedBuf::new(&mem[..])` allocates
+from memory you give it, which it holds inout (0.25): while it, or a
+container on it, lives, `mem` is not read, written or dropped another
+way (`own.conflict`), and it cannot outlive `mem`. Two containers alive
+together need a buffer each.
+
+```tach
+use std::FixedBuf;
+
+fn main() {
+    var mem = [0u8; 256];
+    var v: Vec<i64, FixedBuf> = Vec::new_in(FixedBuf::new(&mem[..]));
+    v.push(7);
+    v.push(8);
+    println(f"{v[0] + v[1]}");
+}
+```
+```out
+15
+```
 
 ```tach
 fn longest(words: [[u8]], gpa: Gpa) -> i64 {

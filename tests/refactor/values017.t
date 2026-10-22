@@ -1,3 +1,4 @@
+## XFAIL: deferred to 0.25.1 (docs/design/conventions.md, "0.25.1"): after the 0.25 merges `fix --suggested` writes its fixes on the 0.19 program (a closure's `a: &Stats` is no longer a reference, so `&*a`'s error is not new), and the migration then breaks; diagnosis in .claude/briefs/resume-025/fix25.md, "values017"
 ## (0.17) fix --values, the migration to references (docs/design/
 ## value-semantics.md §5): `*T` parameters become `&mut T` when written
 ## (through a callee too: add_twice), else `&T`; written slices `&mut

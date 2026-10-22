@@ -27,7 +27,7 @@ use crate::front::ast::{
 use crate::front::closures::CLOSURES;
 use crate::front::lexer::{SUF_I64, Tok};
 use crate::front::own::kinds::{K_NEEDS_DROP, has_drop_impl, owned_base_type, type_kind};
-use crate::front::own::state::TUPLE_FIELD;
+use crate::front::own::state::{TUPLE_FIELD, variant_field_key};
 use crate::front::types::{
     ENUMS, STRUCTS, TYPES, TyKind, VARIANTS, enum_variant, struct_field, type_elem, variant_field,
 };
@@ -36,6 +36,11 @@ use crate::middle::lower::ssa::HMap;
 // On a Match the glue makes: its bindings are owned (drops.vl drops
 // them), whatever the scrutinee is reached through.
 pub const GLUE_MATCH: i64 = 1 << 56;
+
+// (0.25) On a Match the glue makes to reach a part of an enum's value past
+// a variant step (wrap_variants): its bindings name the parts, nothing
+// drops them (drops.vl: arm_drops).
+pub const GLUE_REF: i64 = 1 << 59;
 // A path step `[__giK]` (an array's element, K the loop's depth); other
 // steps are a field's name or TUPLE_FIELD + i.
 pub const INDEX_STEP: i64 = 1 << 48;
@@ -153,6 +158,11 @@ static var G_AT: i64 = 0;
 static var G_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // Inside an array's loop (its statements are not entries).
 static var G_DEPTH: i64 = 0;
+// (0.25) The variant steps of G_PATH, four numbers each: the step's index
+// in G_PATH, the enum type, the variant (VARIANTS), the field. The part at
+// step K is bound to `__gvK` (wrap_variants).
+static var G_VS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
 // The entries made: the statement, and its path at G_PATHS[G_PATH_AT[i]]
 // (the count, then the steps).
 pub static var G_STMTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -197,11 +207,23 @@ fn numbered(prefix: *u8, k: i64) -> i64 {
     intern(crate::base::buf_slice(b))
 }
 
-// The place expression: the root, then the path.
+// The place expression: the root, then the path; past a variant step
+// (G_VS), the innermost one's binding, then the steps after it.
 fn path_expr() -> i64 {
     unsafe {
-        var e = ident(G_ROOT);
-        for i in 0..G_PATH.count {
+        let n = G_VS.count / 4;
+        if n == 0 {
+            return seg_expr(G_ROOT, 0, G_PATH.count);
+        }
+        seg_expr(numbered(c"__gv", n - 1), G_VS.data[(n - 1) * 4] + 1, G_PATH.count)
+    }
+}
+
+// The expression of `root`, then the steps G_PATH[from..to].
+fn seg_expr(root: i64, from: i64, to: i64) -> i64 {
+    unsafe {
+        var e = ident(root);
+        for i in from..to {
             let step = G_PATH.data[i];
             if step >= INDEX_STEP {
                 let x = node(NodeKind::Index);
@@ -227,15 +249,76 @@ fn path_expr() -> i64 {
     }
 }
 
-// Statement `e;` pushed on the list being built; an entry at top level.
+// (0.25) Statement st of an entry past variant steps, inside the matches
+// that reach its place: `match e { E::V(_, __gv0) => { st }, _ => {} }`,
+// one per step, outermost first. Their bindings name the parts (GLUE_REF:
+// nothing drops them).
+fn wrap_variants(st: i64) -> i64 {
+    unsafe {
+        var inner = st;
+        var k = G_VS.count / 4 - 1;
+        while k >= 0 {
+            let pos = G_VS.data[k * 4];
+            let t = G_VS.data[k * 4 + 1];
+            let v = G_VS.data[k * 4 + 2];
+            let j = G_VS.data[k * 4 + 3];
+            let root = if k == 0 { G_ROOT } else { numbered(c"__gv", k - 1) };
+            let from = if k == 0 { 0 } else { G_VS.data[(k - 1) * 4] + 1 };
+            let m = node(NodeKind::Match);
+            NODES[m].a = seg_expr(root, from, pos);
+            NODES[m].p |= GLUE_REF;
+            let pat = node(NodeKind::PatVariant);
+            NODES[pat].y = t;
+            NODES[pat].b = VARIANTS[v].name;
+            NODES[pat].c = 1;
+            let pmark = list_begin();
+            for i in 0..VARIANTS[v].field_count {
+                if i == j {
+                    let b = node(NodeKind::PatBind);
+                    NODES[b].a = numbered(c"__gv", k);
+                    list_push(b);
+                } else {
+                    list_push(node(NodeKind::PatWild));
+                }
+            }
+            list_end(pat, pmark);
+            let body = node(NodeKind::Block);
+            let bmark = list_begin();
+            list_push(inner);
+            list_end(body, bmark);
+            let mark = list_begin();
+            let arm = node(NodeKind::Arm);
+            NODES[arm].a = pat;
+            NODES[arm].c = body;
+            list_push(arm);
+            if ENUMS[TYPES[t].a].variant_count > 1 {
+                let other = node(NodeKind::Arm);
+                NODES[other].a = node(NodeKind::PatWild);
+                NODES[other].c = empty_block();
+                list_push(other);
+            }
+            list_end(m, mark);
+            let s = node(NodeKind::ExprStmt);
+            NODES[s].a = m;
+            NODES[s].b = 1;
+            inner = s;
+            k -= 1;
+        }
+        inner
+    }
+}
+
+// Statement `e;` pushed on the list being built; an entry at top level
+// (past variant steps, inside their matches: wrap_variants).
 fn emit(e: i64) {
     unsafe {
         let st = node(NodeKind::ExprStmt);
         NODES[st].a = e;
         NODES[st].b = 1;
-        list_push(st);
+        let top = if G_DEPTH == 0 && G_VS.count > 0 { wrap_variants(st) } else { st };
+        list_push(top);
         if G_DEPTH == 0 {
-            G_STMTS.push(st);
+            G_STMTS.push(top);
             G_PATH_AT.push(G_PATHS.count);
             G_PATHS.push(G_PATH.count);
             for i in 0..G_PATH.count {
@@ -250,6 +333,19 @@ fn emit(e: i64) {
 fn push_glue(t: i64) {
     unsafe {
         if !has_glue(t) {
+            return;
+        }
+        if has_drop_impl(t) && G_VS.count > 0 && G_DEPTH == 0 {
+            // (0.25: past a variant step the place is a binding's copy:
+            // its drop and then its fields' glue, on that copy, are one
+            // entry, as the drop needs all of it)
+            let b = node(NodeKind::Block);
+            G_DEPTH += 1;
+            let m = list_begin();
+            push_glue(t);
+            list_end(b, m);
+            G_DEPTH -= 1;
+            emit(b);
             return;
         }
         if has_drop_impl(t) {
@@ -304,8 +400,31 @@ fn push_glue(t: i64) {
             }
         } else if kind == TyKind::Array {
             emit(array_loop(TYPES[t].a, TYPES[t].b));
-        } else if kind == TyKind::Enum {
+        } else if kind == TyKind::Enum && (has_drop_impl(t) || G_DEPTH > 0) {
+            // (a Drop impl's value is never taken apart: one entry)
             emit(enum_match(t));
+        } else if kind == TyKind::Enum {
+            // (0.25) an entry per field of a variant that has glue, its path
+            // through the variant step: a match by value that moves some
+            // parts leaves the others to drop with the value (bind_parts)
+            let e = TYPES[t].a;
+            for i in 0..ENUMS[e].variant_count {
+                let v = enum_variant(e, i);
+                for j in 0..VARIANTS[v].field_count {
+                    let ft = variant_field(v, j);
+                    if !has_glue(ft) {
+                        continue;
+                    }
+                    G_VS.push(G_PATH.count);
+                    G_VS.push(t);
+                    G_VS.push(v);
+                    G_VS.push(j);
+                    G_PATH.push(variant_field_key(v, j));
+                    push_glue(ft);
+                    G_PATH.count -= 1;
+                    G_VS.count -= 4;
+                }
+            }
         }
     }
 }
@@ -419,6 +538,7 @@ pub fn glue_block(root: i64, t: i64, at: i64) -> i64 {
         G_AT = at;
         G_PATH.count = 0;
         G_DEPTH = 0;
+        G_VS.count = 0;
         let block = node(NodeKind::Block);
         let mark = list_begin();
         push_glue(t);

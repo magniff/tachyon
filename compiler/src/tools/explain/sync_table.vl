@@ -3,24 +3,24 @@
 
 use crate::tools::explain::Explain;
 
-pub const SYNC_COUNT: i64 = 9;
+pub const SYNC_COUNT: i64 = 11;
 
-pub static SYNC_TABLE: [Explain; 9] = [
+pub static SYNC_TABLE: [Explain; 11] = [
     Explain {
         code: "sync.borrow_escapes",
         severity: "error",
-        means: "The closure given to thread::spawn borrows a variable (it is not a `move` \
-            closure), moves a view (a slice, a `&T`) into the thread, or the thread returns one. \
+        means: "The closure given to thread::spawn borrows a variable (it is not a `sink` \
+            closure), moves a view (a slice, a let access) into the thread, or the thread returns one. \
             A spawned thread may run after the function that started it returns, so it can hold \
             nothing that points into that function's values.",
-        fix: "Make the closure `move ||` so that it takes its own values; give it an owned copy \
+        fix: "Make the closure `sink ||` so that it takes its own values; give it an owned copy \
             of a view (`s.to_vec_in(gpa)`, a Buf); or start the thread in `thread::scope(|s| \
             ...)`, whose threads end before the scope does and may borrow.",
         example: "let h = thread::spawn(|| n + 1);\n\
             \n\
-            main.vl:5:13: error[sync.borrow_escapes] the closure given to 'thread::spawn' borrows 'n', but the thread may outlive it\n\
-            \x20 help: move it into the thread (`move ||`), or start the thread in thread::scope, which ends before it does\n\
-            \x20 try: volec edit patch main.vl:5 --old 'spawn(||' --new 'spawn(move ||'",
+            main.vl:4:13: error[sync.borrow_escapes] the closure given to 'thread::spawn' borrows 'n', but the thread may outlive it\n\
+            \x20 help: move it into the thread (`sink ||`), or start the thread in thread::scope, which ends before it does\n\
+            \x20 try: volec edit patch main.vl:4 --old 'spawn(||' --new 'spawn(sink ||'",
     },
     Explain {
         code: "sync.not_send",
@@ -32,7 +32,7 @@ pub static SYNC_TABLE: [Explain; 9] = [
         fix: "Hold the data in std's owned containers instead of raw memory; share it through a \
             Mutex or atomics; or keep the pointer on one thread and send the values it points to.",
         example: "struct Cache { slots: *i64, n: i64 }\n\
-            let h = thread::spawn(move || c.n);\n\
+            let h = thread::spawn(sink || c.n);\n\
             \n\
             main.vl:9:13: error[sync.not_send] 'thread::spawn' moves 'c' (Cache holds a raw pointer at '.slots' (*i64)) to another thread, which may alias memory this one still uses",
     },
@@ -49,24 +49,26 @@ pub static SYNC_TABLE: [Explain; 9] = [
     Explain {
         code: "sync.global",
         severity: "error",
-        means: "A closure that runs on another thread reaches a `static mut`, directly or through \
-            what it calls (its effects have `global`). A static mut is safe and unsynchronized: \
+        means: "A closure that runs on another thread reaches a `static var`, directly or through \
+            what it calls (its effects have `global`). A static var is safe and unsynchronized: \
             it is for the main thread only. Printing does not count: std's print buffer is \
             locked once threads run.",
-        fix: "Make the static an atomic or a Mutex without `mut` (`static N: AtomicI64 = \
+        fix: "Make the static an atomic or a Mutex, not `var` (`static N: AtomicI64 = \
             AtomicI64 { v: 0 };`, then `N.fetch_add(1, Ordering::Relaxed)`), a \
-            `#[thread_local] static mut`, or pass the data to the thread and return the result. \
+            `#[thread_local] static var`, or pass the data to the thread and return the result. \
             `volec query effects FILE:LINE --why global` shows the chain.",
-        example: "static mut COUNT: i64 = 0;\n\
-            let h = thread::spawn(move || { COUNT += 1; 0 });\n\
+        example: "static var COUNT: i64 = 0;\n\
+            let h = thread::spawn(sink || { COUNT += 1; 0 });\n\
             \n\
-            main.vl:6:13: error[sync.global] 'thread::spawn' runs a closure on another thread, but it reaches a static mut (its effects have `global`): a static mut is for the main thread",
+            main.vl:4:13: error[sync.global] 'thread::spawn' runs a closure on another thread, but it reaches a static var (its effects have `global`): a static var is for the main thread\n\
+            \x20 help: make the static an atomic or a Mutex, not `var` (`static N: AtomicI64 = AtomicI64 { v: 0 };`), a #[thread_local], or pass the data in\n\
+            \x20 try: volec query effects main.vl:4 --why global",
     },
     Explain {
         code: "sync.scope_write",
         severity: "error",
         means: "The closure given to thread::scope changes a variable it borrows from the \
-            caller (an assignment, a `&mut`, a method that takes `&mut self`): the scope's \
+            caller (an assignment, a `&x` inout argument, an `inout self` method): the scope's \
             threads may be reading it at the same time.",
         fix: "Change it before or after thread::scope; inside, give each thread its own data, \
             or share a Mutex or an atomic.",
@@ -75,10 +77,23 @@ pub static SYNC_TABLE: [Explain; 9] = [
             main.vl:7:9: error[sync.scope_write] the closure given to 'thread::scope' changes 'v', which its threads may read at the same time",
     },
     Explain {
+        code: "sync.scope_escape",
+        severity: "error",
+        means: "The closure given to thread::scope returns its Scope, or a handle of a thread \
+            started in it (`ScopedJoinHandle`), or a value holding one (a Vec of handles): every \
+            thread of the scope is joined, and the Scope is gone, when thread::scope returns, so \
+            the handle would point to freed memory (0.25).",
+        fix: "Join the threads inside the scope and return their results: \
+            `thread::scope(|s| s.spawn(|| work()).join())`, or collect the results into a Vec.",
+        example: "let h = thread::scope(|s| s.spawn(|| 7));\n\
+            \n\
+            main.vl:4:32: error[sync.scope_escape] the closure given to 'thread::scope' returns ScopedJoinHandle<i64>: its threads are joined and its Scope is gone when thread::scope returns",
+    },
+    Explain {
         code: "sync.scope_shared_write",
         severity: "error",
         means: "A scoped thread changes a variable it borrows from the caller, or takes an \
-            exclusive view (`&mut T`, `&mut [T]`) into the thread. In 0.21.0 scoped threads only \
+            inout access (`inout T`, `inout [T]`) into the thread. Scoped threads only \
             read what they borrow.",
         fix: "Return the thread's result (`h.join()`) and combine it after; split the data into \
             owned parts before the scope and move one into each thread; or use a Mutex or an \
@@ -94,7 +109,7 @@ pub static SYNC_TABLE: [Explain; 9] = [
             thread::scope (or moves a view of one, or moves the caller's owned value): that \
             closure returns before its threads are joined, so its locals end first.",
         fix: "Make the value before thread::scope, so that it outlives the scope; or move an owned \
-            value made in the scope into the thread (`move ||`).",
+            value made in the scope into the thread (`sink ||`).",
         example: "thread::scope(|s| { let mine = make(); s.spawn(|| mine.len()); 0 });\n\
             \n\
             main.vl:8:17: error[sync.scope_local] a thread of 'thread::scope' borrows 'mine', made inside the scope's closure, which ends before the thread is joined",
@@ -106,9 +121,9 @@ pub static SYNC_TABLE: [Explain; 9] = [
             function received the scope): what its threads borrow is checked in that closure.",
         fix: "Call `s.spawn(...)` directly in the closure given to thread::scope; a helper can \
             return the closure, or the data, instead.",
-        example: "fn start(s: &mut thread::Scope, k: i64) { s.spawn(move || k * 2); }\n\
+        example: "fn start(s: inout thread::Scope, k: i64) { s.spawn(sink || k * 2); }\n\
             \n\
-            main.vl:4:5: error[sync.scope_spawn] 's.spawn' is called outside the closure given to 'thread::scope'",
+            main.vl:2:44: error[sync.scope_spawn] 's.spawn' is called outside the closure given to 'thread::scope'",
     },
     Explain {
         code: "sync.spawn_closure",
@@ -116,9 +131,25 @@ pub static SYNC_TABLE: [Explain; 9] = [
         means: "thread::spawn, thread::scope or s.spawn is given a function value instead of a \
             closure written at the call: a fn value may reach any static, and its captures are \
             not known.",
-        fix: "Wrap the function in a closure: `thread::spawn(move || work(x))`.",
+        fix: "Wrap the function in a closure: `thread::spawn(sink || work(x))`.",
         example: "let h = thread::spawn(work);\n\
             \n\
             main.vl:6:13: error[sync.spawn_closure] 'thread::spawn' takes a closure written at the call, not fn() -> i64",
+    },
+    Explain {
+        code: "sync.view_item",
+        severity: "error",
+        means: "A channel's item type, a Mutex's data or an atomic's value is a view (a slice, \
+            a `str`, a struct holding one). What is sent or stored there is taken out elsewhere \
+            and later, by another thread or after the scope that made the view, and nothing ties \
+            it to what it views: it could be read after that is freed. Likewise the closure given \
+            to `m.with` (`try_with`, a guard's `with`, `Condvar::wait_then`) returns no view of \
+            the locked data, which would outlive the lock.",
+        fix: "Send and store owned values: a copy of the view (`s.to_vec_in(gpa)`, \
+            `s.to_string_in(gpa)`, a Buf), or an index into data the threads share. Scoped \
+            threads (`thread::scope`) may still borrow views of data that outlives the scope.",
+        example: "let (tx, rx) = mpsc::channel_in::<[i64]>(gpa);\n\
+            \n\
+            main.vl:4:20: error[sync.view_item] a channel of [i64], a view: what is sent is received elsewhere, later, and may outlive what it views",
     },
 ];

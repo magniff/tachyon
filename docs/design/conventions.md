@@ -186,9 +186,23 @@ The three kinds of 0.17 (§2.1 there) decide what each convention costs:
   owned types. `fn add(v: inout Vec<Item>, it: Item)` is right for a
   view-holding `Item`: `push` takes `x: sink T`, and a copyable value
   passes from a let binding to a sink by copy.
-- A `let` argument of an owned type that is a temporary (`total(make())`)
-  is dropped after the call, at the end of the statement, as
-  temporaries are today.
+- **Temporaries (0.25).** An owned temporary is dropped at the end of
+  its full statement, unless it is moved, or is viewed by a binding that
+  outlives the statement. A viewed temporary lives until the end of its
+  block (`let s = mk().view();`). On an early exit (`?`, `return`,
+  `break`) every temporary already evaluated is dropped exactly once.
+  Temporaries drop in the reverse of the order they were made. This
+  covers a value given to a let parameter (`total(make())`, of a
+  function, a method, a generic function, an operator's impl), a
+  receiver (`make().len()`, `v.clone().len()`), a part read or moved out
+  of one (`make().id`, `make().a`, `make().1`, `make()[1]`; the rest drops
+  with the statement), a scrutinee no arm takes a part of (`match make()
+  { E::A(_) => .. }`), `let _ = make()` (at once, as `make();`), and a
+  value an argument moves into a callee while a later argument may leave
+  the statement (`two(mk(1), g()?)`: dropped if `?` returns, the callee's
+  if the call is made). A view of a temporary used after the temporary
+  is dropped is `own.escape`, naming the temporary; in a loop each
+  iteration's temporary is its own.
 
 ### 2.3 What a convention means to the own pass
 
@@ -273,7 +287,7 @@ a mutating `match`, a mutating `for`, or a `-> inout T` result.
 | `x: inout T` | `f(&v)`, `f(&v[i])`, `f(&self.items)`, `f(&r)` for an inout binding r | `f(v)`: `conv.marker` |
 | `x: inout [T]` | `sort(&v)` (a Vec, Buf or array place gives its elements), `sort(&v[a..b])` | |
 | `x: sink T` | `f(v)` (moves an owned local), `f(make())`, `f(v.clone())` | `f(&v)`: `conv.marker_extra` |
-| `p: *T` (raw) | `f(&x)`: converts to the raw pointer (the call takes an exclusive loan), or a raw pointer | |
+| `p: *T` (raw) | `f(&x)`: converts to the raw pointer (its address; the call takes a loan), or a raw pointer | |
 
 - **An argument that already is an inout access needs no `&`.** This is
   a call returning `-> inout T` (`sort(v.as_mut_slice())`), or an
@@ -293,8 +307,23 @@ a mutating `match`, a mutating `for`, or a `-> inout T` result.
   field) would be noise on the commonest calls. For plain and copyable
   types a sink argument is a copy, and nothing is dead.
 - **Exclusivity and evaluation order are unchanged** (left to right,
-  two-phase receivers): `f(&a, a.len())` conflicts, as `f(&mut a,
-  a.len())` did. `v.push(v.len())` is fine.
+  two-phase): an inout access begins when the call starts, after every
+  argument is evaluated. A read that is over by then is fine:
+  `f(&a, a.len())` and `v.push(v.len())` (the length is a number,
+  computed first). An argument that keeps a view or an access of the
+  place into the call conflicts: `f(&a, a[..])`, `f(&v[0], v)`,
+  `f(&a, &a)`, `v.extend_from_slice(v.as_slice())` (`own.conflict`).
+- **(0.25) An inout access needs a mutable place.** `&place` given to an
+  inout parameter, `inout r = &place`, `match &place`, and the receiver
+  of an `inout self` method (`c.inc()`, `v.push(x)`, `v[i] = x`) need
+  the place's root mutable: a `var` local, an inout parameter or `inout
+  self`, a `static var`, or memory through a raw pointer. A let binding,
+  a let parameter, a let receiver and an immutable static are read-only:
+  `own.readonly`, naming the binding, with `try: var n = ...`, `try: x:
+  inout T`, `try: inout self` or `try: static var N`. An immutable static
+  stays in read-only data. `&x` given where a raw `*T` is wanted is its
+  address and takes no inout access (C reads it: `fwrite(&buf[0], ...)`);
+  writing a let binding through it is unsafe code's mistake.
 
 The diagnostics, each one line with `try:` lines that run as they are:
 
@@ -457,7 +486,8 @@ argument borrows the place directly, so `let r = &x; f(r); g(r)` is
   and matching `&place` (a mutating match, D7) binds inout accesses:
   `match e { E::A(n) => n + 1 }` with `e: E` a let parameter (was `*n`),
   and `match &self.state { S::Run(n) => n += 1, _ => {} }`. Matching an
-  owned local by value still moves its parts out.
+  owned local by value moves out the parts its pattern binds, and only
+  those (0.25, "Partial moves" below).
 - `if let`, `while let` and `let ... else` follow `let` (D13).
 
 ### 5.4 Closures
@@ -468,6 +498,40 @@ are otherwise 0.14's, in the new words: a `var` is captured inout, an
 owned `let` by let access, a plain `let` by copy. `sink` and `inout`
 become keywords in new code (D27), so `sink |x|` cannot be read as `sink
 | x | ...`.
+
+**(0.25) A closure holds its captures' accesses while it lives**, from
+its creation to its last use, as an `inout r = &x` local does (the
+lifetime model of value-semantics.md §2.4, refined by use):
+
+- a capture the closure changes (an assignment, `&x`, an `inout self`
+  method such as `v.push(..)`) is an **inout access**: nothing else
+  reads or changes x while the closure is live, and the closure is a
+  move-only view;
+- a capture it only reads is a **let access**: x may be read, not
+  changed, while the closure is live.
+
+```tach
+var v: Vec<i64> = Vec::new_in(gpa);
+var add = |x: i64| v.push(x);
+add(1);
+add(2);                    // fine: only add touches v
+println(f"{v.len()}");     // fine: add's last use is above
+
+var n = 0;
+var f = || { n += 10; };
+f();
+println(f"{n}");           // own.conflict: 'n' is read while 'f' holds
+f();                       // it inout; 'f' is used here
+```
+
+Calling a closure, or passing it, is an access of its captures for the
+call: `f(&n)` for an `f` that captures n, `run(&g, &n)`, `both(|| n, ||
+{ n += 1; })`, `f(v, || v.push(1))` and `let s = v.as_slice(); g();
+s[0]` (g pushes v) conflict. Sequential uses of two closures over one
+variable are fine once the first is dead: `f(); g();` where f is not
+used again. The `try:` lines: move the read after the closure's last
+use, or pass the value to the closure as a parameter instead of
+capturing it.
 
 ## 6. Types (question 5)
 
@@ -512,7 +576,14 @@ before:
 - *view*: holds a slice, an access, a by-access closure, or a part that
   is one;
 - *move-only view*: holds an `inout` access or an `inout [T]`, which 0.17
-  called the views with `&mut`.
+  called the views with `&mut`. (0.25) It is move-only transitively
+  (front/own/kinds.vl, holds_inout): a struct with such a field, a tuple,
+  array, enum (`Option<C>`) or container (`Vec<C>`) of one, a generic
+  instance holding one, and a closure that changes a capture or captures
+  one. `let d = c`, `var p2 = p` and a sink argument move it, and a later
+  use of the source is `own.moved`; it is not `Copy`, does not derive
+  `Clone`, and `.clone()` without an impl is no copy of it. An access
+  itself (`inout T`, `inout [T]`) passed on is a reborrow, not a move.
 
 Views are second-class: they live in locals, parameters, fields and
 containers, and the own pass keeps each inside what it views, with
@@ -1492,9 +1563,10 @@ gate with the rehearsal (§9.3 step 7).
   Anything else is taken as `&T`. In a 0.20 file an unwritten convention
   is let; in a mixed file it keeps 0.19's by-value meaning.
 - **Temporaries.** A value passed to a let parameter that borrows
-  (`total(make())`) becomes a temporary of the statement. temps.vl
-  does this for calls of non-generic functions named by an identifier;
-  method calls and generic callees do not get it yet.
+  (`total(make())`) becomes a temporary of the statement (§2.2). Since
+  0.25 the checker lends it at any call, method and generic callee
+  included (generics::check_call_arg), and front/own/drops.vl keeps it
+  to the statement's end.
 - **`let x = part;`** in a 0.20 file borrows (D13) when the part is an
   element, a dereference, or a field reached through one. `var x =
   part` stays `own.move_out`.
@@ -1732,4 +1804,165 @@ Left, for after 0.25 (soundness first):
   safe default): dropping it would free those copies, the map's elements,
   in `m.iter().fold(..)` and `map`.
 - A value given to a generic let parameter after an impure argument is
-  not made a temporary ("this value has no place").
+  not made a temporary ("this value has no place"). (Done in 0.25.)
+
+### 0.25: partial moves and stores (branch fix25b)
+
+**Partial moves.** A `match`, `if let`, `let ... else` or destructuring
+`let` by value on an owned local (or a path of its fields: `s.e`, `t.0`)
+moves out the parts its pattern binds, and only those, as Rust does. The
+parts it skips (`_`, `..`, the fields of a variant it does not bind, the
+whole value under a wildcard arm or an arm that binds nothing) stay in
+the local, and drop with it where its scope ends, once:
+
+    let t = (mk(1), mk(2));
+    { let (a, _) = t; }        // drops a (1) here
+    ...                        // t.1 (2) drops where t's scope ends
+
+    match e { E::B(_, x) => .., _ => .. }   // x drops at the arm's end;
+                                            // the rest of e at e's end
+
+Arms that skip different fields, nested patterns (`O::In(E::B(_, b), _)`)
+and guards work the same way: the own walk moves each binding's place
+(walk::bind_parts) and the drop of the local runs per part, under a drop
+flag where a part moved on some paths only. An enum's drop glue is one
+entry per field of a variant with glue (glue.vl: `match e { E::B(_, __gv0)
+=> { glue of __gv0 }, _ => {} }`), so a moved part's entry is left out or
+flagged; an enum with a Drop impl keeps its one `match`, and taking parts
+out of it is own.partial (its drop needs all of it; Rust's E0509). A
+scrutinee that is not a local's place (a temporary, an index, a
+reference) is matched as before: by reference through an index or a
+reference, and a temporary's unbound parts are the temporaries' rules.
+
+**Stores.** `v[i] = x` (a Vec's, an array's, a slice's, through inout,
+`self.v[i]`, `h.v[0]`, `w[0][0]`, `v[i].f`) drops the element it
+replaces, after the write, as any owned assignment does: `{ let __own_new
+= x; let __own_i0 = i; { let =o = v[__own_i0]; v[__own_i0] = __own_new; }
+}`, the index evaluated once, after the right side (Rust's order).
+`Vec::set` is `self[i] = x`. A field or a tuple part of a Vec's element
+cannot be moved out (`w[0].v`, `eat(w[0].1)`): own.move_out, as the
+element itself.
+
+**`?` and let-else on borrowed copies.** `v.last()?` (and `get`, `first`,
+`HashMap::get`, `peek`, a borrowing iterator's `next`) is a borrowed copy
+as `v.last().unwrap()` is: its binding borrows, moving it is
+own.move_out, a field of it is read. `let Some(t) = v.last() else { .. }`
+binds t the same way.
+
+**`x.drop()`** is own.drop_call (`try: drop(x)`): Drop's drop runs where
+the value's owner ends, and would run again.
+
+
+### 0.25 (branch fix25f): one rule for temporaries
+
+The rule is §2.2's "Temporaries". It is implemented once, in
+front/own/drops.vl's statement temporaries (0.20's machinery, which
+receivers and field reads already used): each temporary gets a hidden
+local, a drop flag and a `defer` in its statement's prelude, so the
+statement's end and every early exit drop what was made, once. What
+changed:
+- check/temps.vl no longer hoists let arguments, `x?` arguments and
+  generic let arguments into `let`s of the block (they lived to the
+  block's end, and could not be made after an impure argument:
+  `peek(mk(1)) + peek(mk(2))` was "cannot take address of non-lvalue");
+  the checker lends a value given to a let parameter where it stands
+  (check_mode::LET_ARG), method calls and generic callees included.
+- The temporary's block gives `&__own_tv` and is no scope of its own in
+  the own walk: views of the temporary are views of a local that lives
+  as long as the statement (or the block, for a `let` of a view), so a
+  view kept longer is own.escape (`keep = mk().view();` in an inner
+  block, `keep.push(mk(c).nm())` in a loop were accepted: a use after
+  free, and every element viewing one reused slot). A temporary without
+  glue that is lent (`E { .. }.nm()`) gets such a local too.
+- An operator's operands an impl reads (`==l`, `==r`) that are owned
+  temporaries are kept and dropped (they were never dropped).
+- A part moved out of a temporary leaves the rest to drop
+  (part_drops); by a run-time index of an array temporary it is
+  own.partial.
+- A temporary scrutinee no arm takes a part of is matched in place and
+  dropped with the statement; `let _ = make()` drops at once, and `let _
+  = x` of an owned place moves nothing.
+- An owned argument a callee takes is held as a temporary when a later
+  argument may leave the statement; its flag is cleared once the last
+  argument is evaluated (hold_args).
+- `clone`, and a generic result whose type arguments have no glue
+  (`String::from_in(..)`), make a new value: a receiver of a std method
+  that is one is dropped (`v.clone().len()` leaked).
+
+### 0.25: drop check and views across threads (branch fix25g)
+
+Three soundness holes the poly red team found (tests/run/sem_poly_x15,
+x14, x03, x02, th10), and one the exclusivity red team found, closed with
+the simplest sound rules:
+
+- **Drop check: a type with a Drop of its own holds no view, also
+  through a type argument** (`own.drop_view`). 0.17 rejected `impl Drop`
+  on a struct whose own fields hold views, but let `impl<T> Drop for
+  G<T>` be instantiated with a view (`G<[i64]>`), as Rust's `may_dangle`.
+  Nothing orders a drop before the drop of what its views point into
+  (`var g = G { x: a[..] }; var v = ..; g = G { x: v.as_slice() };` drops v
+  first, then g's drop reads the view: a use after free). Rust's answer,
+  dropck, rejects the declaration order instead; the rule here is
+  simpler and loses little: an instance of a user Drop type whose type
+  arguments hold a view is `own.drop_view` at the impl (with a try: an
+  owned argument, `.to_vec_in(gpa)`). std's generic containers keep the
+  exemption (their drops read no element: `Vec<[u8]>`). So drop order
+  never matters for soundness: no drop that runs reads a view. A type
+  holding a view and a Drop field that holds none (`struct W { s: [i64],
+  d: D }`) is fine.
+- **No view in a channel, a Mutex, an atomic or a lock's result**
+  (`sync.view_item`, front/threads::check_sync_items, whether or not the
+  program starts threads). What `tx.send(x)` sends, `Mutex::new(x)` and
+  `m.with(|d| d.push(x))` store and `Atomic::new(x)` holds is taken out
+  elsewhere and later (another thread, or after the scope of what it
+  views), and nothing ties it to what it views; what `m.with(|d| ..)`
+  (`try_with`, a guard's `with`, `Condvar::wait_then`) returns would
+  outlive the lock. The instances of `mpsc::channel_in::<T>`,
+  `Mutex::new`, `Atomic::new` with T a view type, and of the lock
+  functions with R one, are rejected; the try is an owned copy
+  (`s.to_vec_in(gpa)`, new in std, or `s.to_string_in(gpa)`). Scoped
+  threads still borrow views of data that outlives the scope (unchanged);
+  `thread::spawn` already required Send without views. A thread-local of
+  a view type (`#[thread_local] static var X: [u8]`) does not compile
+  today (std's __tls_addr instance fails to check: a separate bug).
+- **Scoped threads only read what they borrow, in every form**
+  (`sync.scope_shared_write`). The check (front/threads::capture_write)
+  missed an exclusive slicing that is no `&x` node after the checker:
+  `&a[..]`, `&v[i..j]`, `&v` and `&a` coerced to `inout [T]`, `v[i] = x`
+  on a Vec or a Buf (`v.as_mut_slice()[i]`), an inout method of an
+  array's slicing (`a.sort()`) or of a captured shared slice. It now takes the
+  root of any argument an inout parameter is given and of any access a
+  call returns. Two threads cannot each write a disjoint part of one
+  slice: std has no `split_at_mut` yet (OVERSTRICT, for later), and a
+  thread may not capture an `inout [T]` at all.
+- **An array's slicing as an inout method's receiver** (`a.sort()`,
+  `a[1..].sort()`) is an exclusive slicing, as `&a[..]` (it was a shared
+  one, which the own pass and the thread check took as a read). An inout
+  method of a shared view (`s.sort()` of `let s = v.as_slice()`) stays
+  legal, unlike `sort(s)` (own.readonly): the own pass takes it as a
+  change of what s views, and a scoped thread's copy of s is a write of
+  the view it copied (two threads sorting one shared slice raced).
+- OVERSTRICT fixed: the scope's own closure may change a variable no
+  thread of the scope borrows (`var n = 0; thread::scope(|s| { s.spawn(||
+  1); n += 1; })`), unless a thread borrows a view, whose origin the check
+  does not know.
+
+Left: `let v: Vec<i64>; v.push(1)` and `let a = [..]; fill(&a)` change a
+`let` binding (immutability, not memory safety).
+
+### 0.25.1
+
+Deferred from 0.25:
+- **tests/refactor/values017.t** (the 0.17 `fix --values` migration), XFAIL
+  in 0.25. After the 0.25 merges, a closure parameter spelled `a: &Stats`
+  in the unmigrated 0.19 program reads as a let access, not a reference,
+  so `&*a` is already an error before any fix. `fix --suggested`
+  therefore writes its 41 fixes where it used to refuse (edit.breaks),
+  and the next `fix --only conventions` breaks: own.readonly on
+  `fill(&a[..])`, or own.move_out for `keep`'s `v`.
+
+  Either restore the 0.19 reading of a closure's `&T` parameter, or have
+  `fix --suggested` leave conv.* fixes to `fix --only conventions` while a
+  program still has the 0.19 spelling. Then take the transcript's new path.
+
+  Diagnosis: .claude/briefs/resume-025/fix25.md, "values017".

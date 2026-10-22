@@ -3,9 +3,9 @@
 ## minimal `query effects`.
 $ items
 crate	syntax016/main.vl	10
-std	<std>	592
+std	<std>	603
 std::ops	<std>	5
-std::iter	<std>	67
+std::iter	<std>	68
 std::slice	<std>	37
 std::slice::unstable	<std>	16
 std::slice::stable	<std>	22

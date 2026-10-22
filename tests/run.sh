@@ -861,6 +861,7 @@ case refactor in
             case "$status" in
                 pass) echo "refactor pass" >>"$TALLY"; count=$((count + 1)) ;;
                 FAIL) echo "refactor fail" >>"$TALLY"; count=$((count + 1)) ;;
+                xfail) echo "refactor xfail" >>"$TALLY"; count=$((count + 1)) ;;
             esac
         done <"$WORK/refactor.out"
         if ! grep -q '^pass' "$WORK/refactor.out"; then

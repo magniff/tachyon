@@ -182,10 +182,14 @@ Exit status: 0 done, 1 refused or failed (nothing written), 2 usage.
 
 `volec lsp` (0.24) is a language server over stdin and stdout: the
 same answers in an editor, unsaved edits included. Definition and
-references; hover with a function's signature, effects (declared or
-inferred, a line of why each) and features, or a local's type; the
-file's symbols; `check`'s errors as diagnostics, their `try:` lines
-attached. The root: the nearest `main.vl` (docs/lsp.md).
+references of every name, std's included (0.25: its files written to a
+cache, `~/Library/Caches/vole/std-*`, `~/.cache/vole/std-*`), operators
+(`+` of a type with `Add`) and type parameters too; hover with a
+function's signature, effects (declared or inferred, a line of why
+each), features and comment, a local's type, or a line on a keyword,
+an attribute or a primitive type; the file's and the workspace's
+symbols; `check`'s errors as diagnostics, their `try:` lines attached.
+The root: the nearest `main.vl` (docs/lsp.md).
 
 ## Other compiler options
 

@@ -10,7 +10,7 @@
 ## `String`, `char`); a tie (`cut`: `cat` and `cot`) is left.
 $ check
 main.vl:22:13: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl
-main.vl:24:19: error[type error] expected '[i64]', got '[i64; 3]' | help: an array is not a slice: take one of all of it | try: [1, 2, 3][..] | try: volec fix --suggested main.vl
+main.vl:25:8: error[type error] expected 'bool', got 'i64' | help: a condition is a bool: compare (`x != 0`); bitwise not is `~x` | try: n != 0 | try: volec fix --suggested main.vl
 main.vl:29:13: error[type error] allocation is explicit: pass an allocator (try: format_in(x, gpa)) | help: this function's `gpa` is the allocator to pass | try: volec fix --only alloc016 main.vl | try: volec fix --suggested main.vl
 main.vl:30:15: error[type error] undefined variable 'I64_MIN' | help: add `use std::I64_MIN;` | try: volec fix --suggested main.vl
 main.vl:31:13: error[type error] 'describe' is private | help: make it public: `pub fn describe` at text.vl:3:1 | try: volec fix --suggested main.vl
@@ -30,14 +30,13 @@ $ fix --suggested --dry-run
 +use std::I64_MIN;
 +use text::wrap;
 +
-@@ -22,4 +25,4 @@
+@@ -22,2 +25,2 @@
 -    let t = totl(&v);
 -    let small: u8 = t;
--    let n = count([1, 2, 3]);
--    if n {
 +    let t = total(v);
 +    let small: u8 = t as u8;
-+    let n = count([1, 2, 3][..]);
+@@ -25 +28 @@
+-    if n {
 +    if n != 0 {
 @@ -29 +32 @@
 -    let w = format(f"{t}");
@@ -82,15 +81,15 @@ $ fix --suggested --in text.vl --dry-run
 -    let c: char = 'x';
 +    let c: u8 = 'x';
 $ fix --suggested --show
-fixed 2 missing imports, 1 pub, 14 suggested fixes	2 files	+15 -12 lines
+fixed 2 missing imports, 1 pub, 13 suggested fixes	2 files	+14 -11 lines
 // main.vl:1-3
 1	use std::I64_MIN;
 2	use text::wrap;
 3	
-// main.vl:25-28
+// main.vl:25-26
 25	    let t = total(v);
 26	    let small: u8 = t as u8;
-27	    let n = count([1, 2, 3][..]);
+// main.vl:28
 28	    if n != 0 {
 // main.vl:32
 32	    let w = format_in(f"{t}", gpa);
@@ -112,7 +111,7 @@ $ check
 main.vl:40:16: error[type error] undefined variable 'cut' | help: did you mean 'cat'?
 [exit 1]
 $ undo
-undid fixed 2 missing imports, 1 pub, 14 suggested fixes	2 files	+15 -12 lines
+undid fixed 2 missing imports, 1 pub, 13 suggested fixes	2 files	+14 -11 lines
 ## A Rust label: the program does not lex; the fix respells each line.
 $ fix --suggested labels.vl --show
 fixed 3 suggested fixes	labels.vl	+3 -3 lines
