@@ -415,3 +415,138 @@ Then on the merged release:
 - The in-house linker as the default, if P7's stretch did not land.
 
 That is the path to a self-compile under 150 ms, and then to 100 ms.
+
+## 7. Achieved: release-0.25
+
+**What was merged into release-0.25.** All seven planned tasks landed, plus two fixes.
+
+| branch | task | head |
+|---|---|---|
+| p25-resolve | P1 | ed63899f |
+| p25-lines | P2 | 1062aa04 |
+| p25-lex | P4 and P5 | 90aec0bd |
+| p25-asm | P3 and P6, and faster `buf_uint`/`buf_str` | 607bb348 |
+| p25-link | P7: `ld` without `sh` and `cc`, `#[link(...)]` and `-framework`, and the compiler's own Mach-O linker, the default on aarch64-macos | d0586fc4 |
+| p25-det | fix: SLP's nondeterministic output at -O2 | ea990532 |
+| p25-atomics | fix: litmus tests' waits yield (test only) | 66cf06b3 |
+
+Each merge was clean and bootstrapped to a fixpoint. The suite passes:
+1881 tests, 6 xfail.
+
+**The gate.** `bootstrap/gate.sh --quick --no-x86` passes in 5:19:
+- suite-O2: 1881 passed;
+- threads: 2791 of 2791 compilations the same at -j1 and -j8;
+- incremental: 160 of 160 series, 92% hits;
+- objcheck, fuzz, abi and voltty-fuzz: pass;
+- compile-cost:
+
+  | row | instructions | against v0.24.0 |
+  |---|---|---|
+  | hello | 78.4 M | 0.83x |
+  | std | 1012.8 M | 0.87x |
+  | check | 3168 M | **0.54x** |
+
+`tests/run.sh litmus` passed 5 times in a row, and litmus_sb_llsc did not
+fail in the gate either.
+
+**The same output.** `same-output` against v0.24.0 covers 10692
+compilations. 1407 differ, and every difference is intended:
+- **1221: the `try:` lines.** The diagnostics' `try:` lines name the
+  compiler by the path it was run from. Rewritten to the same path, they
+  are the same.
+- **12: arch_own_module.vl.** A program's own `arch` module no longer
+  loads std::arch, so the run-time table of files has 5 entries fewer
+  (P5).
+- **174: programs that use std's window, objc and gpu modules.** p25-link
+  edits those std files (`#[link]`), so their panic positions, the C
+  library names in their string data, and the string numbers after them
+  move. Each such program differs at every level and on every target, so
+  no difference is specific to one optimization level.
+
+Nothing else differs. An -O2 difference seen once, before p25-det was
+merged, did not come back in the second run.
+
+**Measurements.** The machine was idle-ish: load 6 to 30 from other
+agents (one Linux VM). Old and new runs were interleaved, best of 7.
+Instructions are the fewest of the 7 and are what to trust; wall times
+are the best runs. Each compiler compiles its own source, except in the
+"same input" rows.
+
+| run | v0.24.0 | release-0.25 | instructions | 0.25 plan |
+|---|---|---|---|---|
+| self -O0 -j8, -c | 481 ms | **281 ms** | 11.36 → 5.81 G (−48.9%) | 250–280 |
+| self -O0 -j8, linked | 520 ms | **289 ms** | 11.37 → 5.96 G (−47.6%) | 255 with P7's linker |
+| self -O0 -j1, linked | 581 ms | 342 ms | 11.33 → 5.93 G (−47.6%) | |
+| self -O1 -j8, -c | 568 ms | 440 ms | 18.27 → 14.18 G (−22.4%) | about 450 |
+| self -O1 -j8, linked | 603 ms | 448 ms | 18.25 → 14.27 G (−21.8%) | |
+| self -O1 -j1, linked | 1167 ms | 978 ms | 18.19 → 14.02 G (−22.9%) | |
+| self -O2 -j8, -c | 1006 ms | 891 ms | 44.74 → 41.72 G (−6.7%) | about 890 |
+| self -O2 -j8, linked | 1048 ms | 896 ms | 44.74 → 41.83 G (−6.5%) | |
+| self -O2 -j1, linked | 2846 ms | 2747 ms | 44.61 → 41.70 G (−6.5%) | |
+| `check` | 295 ms | **207 ms** | 5.58 → 3.10 G (−44.4%) | about 190 |
+| `query refs`, no cache | 705 ms | **303 ms** | 18.32 → 4.55 G (−75.1%) | about 330 |
+| LSP: didOpen to the first answer (the worker's load) | 745 (657) ms | **341 (254) ms** | | about 330 |
+| one-function rebuild, -O1, code cache | 563 ms | 390 ms | 10.12 → 6.25 G (−38.2%) | |
+| one-function rebuild, -O2, code cache | 732 ms | 554 ms | 13.70 → 9.65 G (−29.6%) | |
+| hello world, linked | 32.9 ms | **7.8 ms** | 0.10 → 0.08 G | 27, or about 13 with P7's linker |
+| hello world, -c | 7.7 ms | 7.2 ms | 0.10 → 0.08 G (−17.7%) | |
+| std_heavy -O0, -c | 42.3 ms | 36.6 ms | 1.15 → 1.01 G (−12.5%) | |
+| std_heavy -O2, linked | 67.9 ms | **37.0 ms** | 1.15 → 1.01 G (−12.2%) | |
+
+The same input, release-0.25's compiler/src, for both compilers:
+
+| run | v0.24.0 | release-0.25 | instructions |
+|---|---|---|---|
+| self -O0 -j8, -c | 506 ms | 276 ms | 11.70 → 5.81 G (−50.3%) |
+| self -O0 -j8, linked | 532 ms | 280 ms | 11.69 → 5.95 G (−49.1%) |
+| self -O1 -j8, linked | 631 ms | 443 ms | 18.67 → 14.27 G (−23.6%) |
+| self -O2 -j8, linked | 1089 ms | 895 ms | 46.66 → 41.84 G (−10.3%) |
+| `check` (a copy without compiler/std) | 316 ms | 205 ms | 5.81 → 3.07 G (−47.1%) |
+
+`volec examples/voltty/app/main.vl -o voltty` now builds with no extra
+arguments, through the internal linker, in 0.40 s. The binary is signed
+(`codesign -v`), links AppKit, QuartzCore, CoreGraphics, CoreFoundation,
+Foundation, CoreText, libobjc and libSystem, and `./voltty -- true` exits
+0 on its own.
+
+**Peak RSS.** The source grew with link_macho.vl, and the syntax tree's
+table (`NODES`, 18 words a node) crossed a doubling: its realloc went
+from 128 to 256 MB, made in the checker. Peak RSS went up as a result:
+
+| run | v0.24.0 source | release-0.25 source |
+|---|---|---|
+| -O0 | 430 MB | 539–564 MB |
+| `check` | 310 MB | 445 MB |
+
+v0.24.0 compiling the same input peaks at 570 MB too, so the cause is
+the input, not the changes. #9 (tables sized up front, a smaller `Node`)
+is the fix, for 0.26.
+
+**Against the plan.** In instructions:
+- -O0 fell 49%, `check` 44% and the cold query 75%.
+
+In wall time:
+- **-O0 -c** (281 ms), **-O1** (440) and **-O2** (891) are where the
+  plan expected them.
+- **The cold query and the LSP** (303 and 341 ms) beat the plan.
+- **`check`**, at 207 ms, is 17 ms above the plan.
+- **The linked self-compile**, at 289 ms, is 34 ms above the plan's
+  255. The link itself now costs about 8 ms, against 33 before.
+- **A hello world is 4.2 times faster linked:** 33 → 7.8 ms, of which the
+  link is now about 0.6 ms.
+
+Where the rest goes (-O0 -j1, `VOLE_PHASE_TIMES`, measured under load):
+
+| phase | ms |
+|---|---|
+| read, lex and modules | 58 |
+| parse and check | 166 |
+| code generation, assembly, data and output | 154 |
+
+So §4's bound is unchanged: the serial front end, now about 225 ms
+including loading, is still twice the whole 100 ms budget. The next
+steps are §6's 0.26 items:
+- the parallel lexer and parser;
+- a design for checking in parallel and for the incremental front end;
+- direct binary emission;
+- #9, for memory.
