@@ -126,6 +126,47 @@ pub fn check_mutable_place(target: i64) {
     let root = place_root(target);
     if root > 0 {
         check_mutable_name(root, target);
+    } else {
+        note_write_through(target);
+    }
+}
+
+// (0.25) A write through an inout access a local holds (`c.n += 1` with
+// `struct C { n: inout i64 }`, `self.q.push(x)` through an inout field): a
+// closure that does it changes that local, which it then captures inout
+// (closures::note_local_write; the closure is move-only).
+pub fn note_write_through(target: i64) {
+    var e = target;
+    for _ in 0..64 {
+        unsafe {
+            match NODES[e].kind {
+                Unary if NODES[e].op == Tok::Star => {
+                    // (only through an inout access, not a raw pointer)
+                    let t = NODES[NODES[e].b].ty;
+                    if t <= 0 || TYPES[t].kind != TyKind::Ptr || TYPES[t].b != REF_MUT {
+                        return;
+                    }
+                    e = NODES[e].b;
+                }
+                Index => {
+                    let t = NODES[NODES[e].a].ty;
+                    if t > 0 && (TYPES[t].kind == TyKind::Ptr
+                        || TYPES[t].kind == TyKind::Slice && TYPES[t].b != REF_MUT) {
+                        return;
+                    }
+                    e = NODES[e].a;
+                }
+                FieldAccess | TupleField => e = NODES[e].a,
+                Ident => {
+                    if NODES[e].res == Res::Local && NODES[e].y >= 0
+                        && (LOCALS[NODES[e].y].mutable || LOCALS[NODES[e].y].access) {
+                        note_local_write(NODES[e].y);
+                    }
+                    return;
+                }
+                _ => return,
+            }
+        }
     }
 }
 
@@ -299,6 +340,7 @@ fn inout_root_kind(target: i64) -> i64 {
         }
         let root = place_root(target);
         if root <= 0 {
+            note_write_through(target);
             return 0;
         }
         INOUT_ROOT = root;
