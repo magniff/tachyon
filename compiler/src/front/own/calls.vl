@@ -37,7 +37,7 @@ use crate::front::own::state::{
     CUR, NSLOT, PE, PEND, PE_BY, PE_INVALID, PE_NODE, PE_OV, PE_PLACE, PK_MUT, PK_MUT_VIEW, PK_NONE,
     PK_RAW, PK_RESERVE, PK_SHARED, PK_VIEW, PL_COUNT, PL_PARENT, PL_RID, PL_RKIND, POOL_TOP,
     RK_LOCAL, STATIC_MASK, at, clear_bit, get_bit, is_empty, l1, l2, local_place, mark_place,
-    new_ov, or_expanded, or_into, ov_hits, root_of, set_bit, slot_of_local, slot_off,
+    new_ov, or_expanded, or_into, ov_hits, ov_or, root_of, set_bit, slot_of_local, slot_off,
 };
 use crate::front::own::summary::{
     S_L1_P, S_L1_STAR, S_L2_P, S_L2_STAR, ViewSummary, captures_by_ref, env_param, store_param,
@@ -245,7 +245,26 @@ pub fn on_call(n: i64, f: i64, base: i64, dst: i64) {
                 global_call(n, base);
             }
         }
+        // (0.25) A closure given to the call (or called: its env) may
+        // keep anything the other arguments view in what it captures by
+        // reference, whatever the summary says (closure_stores)
+        if NSLOT > 0 && end - base > PE {
+            var c = base;
+            while c < end {
+                if closure_arg(PEND.data[c + PE_NODE]) && PEND.data[c + PE_OV] >= 0 {
+                    closure_stores(c, base, end);
+                }
+                c += PE;
+            }
+        }
         let rt = NODES[n].ty;
+        // (0.25) a copy of an element the receiver keeps (drops::
+        // borrowed_call: `v.get(i)` of a Vec<String>): its storage is the
+        // receiver's, a view of all the receiver views
+        if dst >= 0 && end > base && !is_view_type(rt)
+            && crate::front::own::drops::borrowed_call(n) {
+            deep_into(dst, PEND.data[base + PE_OV]);
+        }
         let result = dst >= 0 && end > base && is_view_type(rt);
         // (a closure's captures written: its env given to its function, a
         // closure given to a function that calls it; store_captures)
@@ -322,7 +341,136 @@ pub fn on_call(n: i64, f: i64, base: i64, dst: i64) {
             if s.top && !is_empty(l1(dst)) {
                 set_mark(dst);
             }
+            // (0.25) and what a closure among the arguments views, at any
+            // depth: its captures (a closure called, its env)
+            var c = base;
+            while c < end {
+                if closure_arg(PEND.data[c + PE_NODE]) {
+                    deep_into(dst, PEND.data[c + PE_OV]);
+                }
+                c += PE;
+            }
+            filter_places(dst, rt);
         }
+    }
+}
+
+// (0.25) The type filter place by place (§2.4): a result of type rt whose
+// views are of element E points at level 1 only into storage that can
+// hold an E, so a loan on a local whose own storage cannot (`order:
+// Vec<i64>` for a Vec<[u8]> result) is dropped. Paths through a reference
+// (DEREF), statics and the parameters' roots are kept.
+fn filter_places(dst: i64, rt: i64) {
+    unsafe {
+        let e = crate::front::own::kinds::view_elem(rt);
+        if e <= 0 || dst < 0 {
+            return;
+        }
+        for q in 0..PL_COUNT {
+            if !get_bit(l1(dst), q) {
+                continue;
+            }
+            var through = false;
+            var a = q;
+            while a >= 0 {
+                if crate::front::own::state::is_deref_place(a) {
+                    through = true;
+                }
+                a = crate::front::own::state::PL_PARENT[a];
+            }
+            let r = root_of(q);
+            let rk = crate::front::own::state::PL_RKIND[r];
+            if through || rk != crate::front::own::state::RK_LOCAL
+                && rk != crate::front::own::state::RK_TEMP {
+                continue;
+            }
+            let rid = crate::front::own::state::PL_RID[r];
+            let t = if rk == crate::front::own::state::RK_TEMP { NODES[rid].ty }
+                else { crate::front::check::LOCALS[rid].ty };
+            if t > 0 && TYPES[t].kind != TyKind::Ptr && !crate::front::own::infer::holds(t, e) {
+                clear_bit(l1(dst), q);
+            }
+        }
+    }
+}
+
+// (0.25) Whether argument node e is a closure, or a pointer to one (the env
+// of a closure called): its origin is what its captures view.
+fn closure_arg(e: i64) -> bool {
+    unsafe { closure_type(NODES[e].ty) }
+}
+
+// (0.25) Whether type t is a closure's, or a pointer to one.
+fn closure_type(t0: i64) -> bool {
+    unsafe {
+        var t = t0;
+        if t > 0 && TYPES[t].kind == TyKind::Ptr {
+            t = TYPES[t].a;
+        }
+        crate::front::closures::closure_of_type(t) != 0
+    }
+}
+
+// (0.25) dst gets, at both levels, everything origin o views at any depth.
+pub fn deep_into(dst: i64, o: i64) {
+    unsafe {
+        if dst < 0 || o < 0 {
+            return;
+        }
+        or_into(l1(dst), l1(o));
+        or_into(l1(dst), l2(o));
+        or_into(l2(dst), l1(o));
+        or_into(l2(dst), l2(o));
+    }
+}
+
+// (0.25) Pending closure c (an argument, or the env of the closure called)
+// may store what the other arguments view into the locals it captures by
+// reference (the places at its level 1): no summary says what its body
+// does with them, so each of those locals' slots gets all of it, at both
+// levels, minus loans on the local itself.
+fn closure_stores(c: i64, base: i64, end: i64) {
+    unsafe {
+        let oc = PEND.data[c + PE_OV];
+        let u = new_ov();
+        var b = base;
+        while b < end {
+            let o = PEND.data[b + PE_OV];
+            if b != c && o >= 0 && PEND.data[b] != PK_NONE {
+                deep_into(u, o);
+            }
+            b += PE;
+        }
+        if is_empty(l1(u)) {
+            POOL_TOP = u;
+            return;
+        }
+        // (the env of a closure called, `&c`: its captures are at level 2,
+        // level 1 is the loan on c)
+        let at_ty = NODES[PEND.data[c + PE_NODE]].ty;
+        let caps = if at_ty > 0 && TYPES[at_ty].kind == TyKind::Ptr { l2(oc) } else { l1(oc) };
+        for p in 0..PL_COUNT {
+            if !get_bit(caps, p) || root_of(p) != p {
+                continue;
+            }
+            let s = crate::front::own::state::slot_of_place(p);
+            if s < 0 || closure_type(crate::front::check::LOCALS[
+                crate::front::own::state::SLOT_LOCAL.data[s]].ty) {
+                continue;
+            }
+            let t = new_ov();
+            ov_or(t, u);
+            for q in 0..PL_COUNT {
+                if root_of(q) == p {
+                    clear_bit(l1(t), q);
+                    clear_bit(l2(t), q);
+                }
+            }
+            crate::front::own::views::store_deep(s, t);
+            crate::front::own::views::store_through_loans(s, t, 0);
+            POOL_TOP = t;
+        }
+        POOL_TOP = u;
     }
 }
 
@@ -385,6 +533,8 @@ fn store(a: i64, base: i64, end: i64, sto: [i64; 4], top: bool) {
             or_into(l1(off), l1(tmp));
             or_into(l2(off), l2(tmp));
         }
+        // (0.25) and what the slot holds loans on: `r = &mut v; r.push(w)`
+        crate::front::own::views::store_through_loans(ts, tmp, 0);
         POOL_TOP = tmp;
     }
 }

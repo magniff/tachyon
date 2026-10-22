@@ -64,7 +64,7 @@ Vec<u8>::as_slice	views(self) declared
 Vec<Vec<u64>>::as_slice	views(self) declared
 Vec<Adapter, ScopedArena>::as_slice	views(self) declared
 Vec<Slot>::as_slice	views(self) declared
-Vec<str>::as_slice	views(*self) declared
+Vec<str>::as_slice	views(self) declared
 Vec<[u8]>::push	views() stores(x) declared
 Vec<Tok>::push	views() stores(x) declared
 Vec<u8>::push	views()

@@ -30,7 +30,7 @@
 //
 // Phase 0 contract: walk_fn and the ev_* signatures are fixed.
 
-use crate::base::{SYMS, intern_c};
+use crate::base::{IntVec, SYMS, intern_c};
 use crate::front::ast::{
     CLOSURE_MOVE, DEFER_IMPLICIT, FN_CLOSURE, NODES, NODE_CAPTURE, NODE_IN_BOUNDS, NODE_RAW,
     NODE_REF_MUT, NodeKind, child,
@@ -46,9 +46,10 @@ use crate::front::own::kinds::{
 use crate::front::own::state::{
     CUR, LOC_CAP, LOC_PL, LOC_SLOT, MAXNW, NW, PE, PEND, PK_MUT, PK_MUT_VIEW, PK_NONE, PK_RAW,
     PK_RESERVE, PK_SHARED, PK_VIEW, PL_OVERFLOW, PL_PARENT, PL_RKIND, POOL, POOL_TOP, RK_STATIC,
-    SLOT_CAP, SLOT_OVERFLOW, TUPLE_FIELD, alias_local, child_place, copy_state, join_state,
-    local_place, new_ov, new_state, pend_push, reachable, reset_places, root_of, same_state,
-    set_unreachable, set_words, slot_for, static_has_place, static_place, variant_field_key,
+    SLOT_CAP, SLOT_OVERFLOW, TUPLE_FIELD, alias_local, child_place, copy_state, is_empty,
+    join_state, l1, l2, local_place, new_ov, new_state, or_into, ov_inner, ov_or, pend_push,
+    reachable, reset_places, root_of, same_state, set_bit, set_unreachable, set_words, slot_for,
+    static_has_place, static_place, variant_field_key,
 };
 use crate::front::own::summary::{
     ViewSummary, collect_begin, collect_end, collect_result, env_param,
@@ -419,7 +420,21 @@ fn place_rec(e: i64) -> i64 {
         // loan views: `&v[i]` of a Vec is `&v.as_slice()[i]`)
         let d = PO_VALUE_DST;
         PO_VALUE_DST = -1;
+        // (0.25: what the value's own evaluation finds on its way is not this
+        // place's: PO_* as they were)
+        let deref = PO_DEREF;
+        let index = PO_INDEX;
+        let raw = PO_RAW;
+        let inner = PO_INNER;
+        let vs = PO_VIEWSLOT;
+        let make = PO_MAKE;
         eval(e, CX_READ, d);
+        PO_DEREF = deref;
+        PO_INDEX = index;
+        PO_RAW = raw;
+        PO_INNER = inner;
+        PO_VIEWSLOT = vs;
+        PO_MAKE = make;
         -1
     }
 }
@@ -463,6 +478,15 @@ static var BORROW_OK: i64 = 0;
 // tuple of its bindings, read (not moved): eval's Match.
 static var LE_READ: i64 = 0;
 
+// (0.25) The temporaries' places made in the statement being walked
+// (state::temp_place), which die at its end.
+pub static var TEMPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// (0.25) Whether the value being bound is a borrowed copy (drops::
+// borrowed_call: `let s = v.get(0)` of a Vec<String>): a binding of an
+// owned type then views what the copy's container holds.
+static var BIND_BORROWED: bool = false;
+
 // Evaluates expression n (0: none); ctx says whether its value is moved;
 // dst (an origin value, or -1) gets the views it holds.
 pub fn eval(n: i64, ctx: i64, dst: i64) {
@@ -487,6 +511,25 @@ pub fn eval(n: i64, ctx: i64, dst: i64) {
                         let kind = if (NODES[n].p & NODE_REF_MUT) != 0 { REF_MUT }
                             else { REF_SHARED };
                         ev_borrow(p, n, kind, PO_RAW, dst);
+                    } else if dst >= 0 {
+                        // (0.25) `&temp`: a loan on a value no place holds;
+                        // what it holds is at both levels (a method of the
+                        // temporary reads it through the loan, `*self`)
+                        let t = new_ov();
+                        eval(operand, CX_READ, t);
+                        crate::front::own::calls::deep_into(dst, t);
+                        POOL_TOP = t;
+                        // and, when it has storage of its own (an owner, or
+                        // plain data: not only views), the temporary itself,
+                        // which dies at the end of the statement
+                        let ot = NODES[operand].ty;
+                        if ot > 0 && (is_owned_type(ot) || !is_view_type(ot)) {
+                            let q = crate::front::own::state::temp_place(operand);
+                            if q >= 0 {
+                                set_bit(l1(dst), q);
+                                TEMPS.push(q);
+                            }
+                        }
                     } else {
                         eval(operand, CX_READ, dst);
                     }
@@ -669,7 +712,24 @@ fn eval_place_value(n: i64, ctx: i64, dst: i64) {
             eval(NODES[n].a, bctx, dst);
             return;
         }
+        // (0.25) a place reached through a value, `v[i]` of a Vec
+        // (`v.as_slice()[i]`), `*r()`: tmp gets that value's views, and
+        // the element read out of what it views gets their level 2
+        let view = dst >= 0 && (is_view_type(t) || t > 0 && TYPES[t].kind == TyKind::Ptr);
+        let tmp = if view { new_ov() } else { -1 };
+        PO_VALUE_DST = tmp;
         let p = place_of(n);
+        PO_VALUE_DST = -1;
+        if tmp >= 0 {
+            if p < 0 && !PO_RAW {
+                if PO_INNER || PO_DEREF {
+                    ov_inner(dst, tmp);
+                } else {
+                    ov_or(dst, tmp);
+                }
+            }
+            POOL_TOP = tmp;
+        }
         if p < 0 {
             // (`v[i]` of a Vec through a reference: no place, a copy of an
             // element the Vec keeps)
@@ -688,7 +748,9 @@ fn eval_place_value(n: i64, ctx: i64, dst: i64) {
         } else {
             ev_read(p, n);
         }
-        if is_view_type(t) || t > 0 && TYPES[t].kind == TyKind::Ptr {
+        if is_view_type(t) || t > 0 && TYPES[t].kind == TyKind::Ptr
+            || crate::front::own::glue::has_glue(t)
+            && crate::front::own::state::slot_of_place(p) >= 0 {
             ev_value(p, n, t, dst);
         }
     }
@@ -726,15 +788,59 @@ fn eval_slicing(n: i64, dst: i64) {
     }
 }
 
+// (0.25) Whether local l is a statement temporary's pointer (drops::
+// visit_temps: `__own_tp = &__own_tv`), which the walk follows: what it
+// points to is the temporary, alive to the end of its statement.
+fn tp_local(l: i64) -> bool {
+    unsafe { l >= 0 && SYMS[LOCALS[l].name].text == "__own_tp" }
+}
+
+// (0.25) Whether place expression e is a part of a static (not through a
+// pointer): an assignment to it needs its place, for statics hold only
+// views of static data (views::static_store).
+fn static_root(e: i64) -> bool {
+    unsafe {
+        let k = NODES[e].kind;
+        if k == NodeKind::Ident {
+            return NODES[e].res == Res::Static;
+        }
+        if k == NodeKind::FieldAccess && NODES[e].y == 0 || k == NodeKind::TupleField
+            || k == NodeKind::Index {
+            return static_root(NODES[e].a);
+        }
+        false
+    }
+}
+
 fn eval_assign(n: i64) {
     unsafe {
         let target = NODES[n].b;
         let value = NODES[n].c;
         let v = new_ov();
         eval(value, if NODES[n].op == Tok::Eq { CX_MOVE } else { CX_READ }, v);
-        let p = place_of(target);
-        if p >= 0 {
+        // (0.25: a place reached through a view value, `v[i] = w` of a Vec:
+        // its origin, what the write reaches)
+        let t = new_ov();
+        PO_VALUE_DST = t;
+        let p = if static_root(target) { place_of_make(target) } else { place_of(target) };
+        PO_VALUE_DST = -1;
+        if p >= 0 && NODES[target].kind == NodeKind::Ident && NODES[target].res == Res::Local
+            && tp_local(NODES[target].y) {
+            // (0.25) `__own_tp = &__own_tv`: it points to the statement's
+            // temporary (a place of its own, which dies with the statement,
+            // views::kill_temps), which holds what __own_tv holds
+            let w = new_ov();
+            let q = crate::front::own::state::temp_place(n);
+            if q >= 0 {
+                set_bit(l1(w), q);
+                TEMPS.push(q);
+            }
+            or_into(l2(w), l2(v));
+            ev_assign(p, n, w);
+        } else if p >= 0 {
             ev_assign(p, n, v);
+        } else if !PO_RAW && reachable(CUR) {
+            views::write_through_value(t, n, v);
         }
         POOL_TOP = v;
     }
@@ -771,7 +877,12 @@ fn bind_at(pat: i64, v: i64, place: i64) {
                 POOL_TOP = o;
                 return;
             }
-            slot_for(l, is_view_type(LOCALS[l].ty));
+            // (0.25: or a value of no view type that views something, a
+            // borrowed copy of an element: `let x = v.get(0)` of a
+            // Vec<String> is a view of v)
+            slot_for(l, is_view_type(LOCALS[l].ty) || tp_local(l) || v >= 0 && BIND_BORROWED
+                && crate::front::own::glue::has_glue(LOCALS[l].ty)
+                && (!is_empty(l1(v)) || !is_empty(l2(v))));
             ev_bind(l, pat, v);
             return;
         }
@@ -908,7 +1019,9 @@ fn eval_match(n: i64, ctx: i64, dst: i64) {
                 // (a view bound out of the scrutinee reborrows what it
                 // comes from: `if let Some(a) = m.get_mut(k)`, views::on_bind)
                 views::BIND_FROM = NODES[n].a;
+                BIND_BORROWED = crate::front::own::drops::borrowed_call(NODES[n].a);
                 bind_at(NODES[arm].a, v, ref_bind_place(NODES[n].a, NODES[arm].a));
+                BIND_BORROWED = false;
                 views::BIND_FROM = 0;
             }
             eval(NODES[arm].b, CX_READ, -1);
@@ -1130,12 +1243,16 @@ fn eval_block(n: i64, ctx: i64, dst: i64) {
         let dmark = DEFS.count;
         // (0.18: a requires check's block whose call may be a borrowed copy)
         let tail_ok = BORROW_OK == n && crate::front::contracts::expand::requires_tail(n) > 0;
+        // (0.25) a `let`'s temporaries, and the tail's, live to the block's
+        // end (the `let` may keep a view of them); a statement's, to its own
+        let bmark = TEMPS.count;
         for i in 0..NODES[n].count {
             if !reachable(CUR) {
                 break;
             }
             let s = child(n, i);
             let k = NODES[s].kind;
+            let tmark = TEMPS.count;
             if k == NodeKind::Let && for_alias(s) {
                 // (`for x in v`: the loop borrows v)
             } else if k == NodeKind::Let {
@@ -1147,6 +1264,9 @@ fn eval_block(n: i64, ctx: i64, dst: i64) {
             } else {
                 eval(s, CX_READ, -1);
             }
+            if k != NodeKind::Let {
+                views::kill_temps(tmark);
+            }
         }
         let tail = NODES[n].a;
         if tail != 0 && reachable(CUR) {
@@ -1157,6 +1277,7 @@ fn eval_block(n: i64, ctx: i64, dst: i64) {
         }
         run_defers(dmark);
         DEFS.count = dmark;
+        views::kill_temps(bmark);
         if (NODES[n].p & crate::front::check::temps::NODE_TEMP) != 0 {
             // (0.25: a statement temporary's block, own/drops temp_make:
             // its __own_tv lives as long as the statement, the scope its
@@ -1225,7 +1346,9 @@ fn eval_let(s: i64) {
         } else {
             eval(init, ctx, v);
         }
+        BIND_BORROWED = init != 0 && crate::front::own::drops::borrowed_call(init);
         bind_at(pat, v, ref_bind_place(init, pat));
+        BIND_BORROWED = false;
         POOL_TOP = v;
         if pat != 0 && init != 0 && NODES[pat].kind == NodeKind::PatBind && NODES[pat].x >= 0 {
             views::on_let(NODES[pat].x, init);
@@ -1357,10 +1480,20 @@ fn eval_call(n: i64, dst: i64) {
                     kind = PK_RAW;
                 } else if mode == P_MUT_VIEW {
                     kind = PK_MUT_VIEW;
+                } else if made && mode == P_MUT && !raw {
+                    // (0.25) `&mut v[i]` of a Vec, `v[i].push(w)`: a place
+                    // inside what a view value points to, written by the
+                    // call: its origin (the loans it holds) is written
+                    kind = PK_MUT;
                 } else if is_view_type(at_ty) {
                     kind = PK_VIEW;
                 } else if at_ty > 0 && TYPES[at_ty].kind == TyKind::Ptr {
                     kind = PK_RAW;
+                } else if crate::front::own::glue::has_glue(at_ty)
+                    && (!is_empty(l1(o)) || !is_empty(l2(o))) {
+                    // (0.25) a value of no view type that views something:
+                    // a borrowed copy of an element (`m.get(k).unwrap()`)
+                    kind = PK_VIEW;
                 }
                 pend_push(kind, -1, o, arg, mode);
             }
