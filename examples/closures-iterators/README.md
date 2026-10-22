@@ -124,11 +124,10 @@ Inside the call the closure's parameter type comes from the bound. A
 closure kept in a `let` has no bound to learn from, so its parameter is
 annotated: `let is_slow = |e: Entry| e.millis > limit;`.
 
-**collect, sort_by, enumerate, take.** `collect()` makes a `Vec` of the
-items (freed with `defer`); `sort_by` sorts it in place by a comparison
-of two elements (let: read in place) returning negative, zero or
-positive, so `b.cmp(a)`
-sorts descending:
+**collect, sort_by, enumerate, take.** `collect_in(gpa)` makes a `Vec`
+of the items (dropped, so freed, at the end of `main`); `sort_by` sorts
+it in place by a comparison of two elements (let: read in place)
+returning negative, zero or positive, so `b.cmp(a)` sorts descending:
 
 ```tach
 var slow = all.iter().filter(is_slow).collect_in(gpa);
@@ -161,7 +160,7 @@ zipping the entries with `all[1..]` pairs each request with the next.
 - closures, captures (a `var` inout, the rest let), `sink ||`, `Fn`/`FnMut` bounds: `volec guide closures`
 - `Iterator`, `type Item`, adapters and consumers, `sort_by`: `volec guide iterators`
 - `Option` and `?`, `.ok()`: `volec guide conversions`
-- `HashMap`, `split_whitespace`, `parse_int`, `read_stdin`: `volec guide std`
+- `HashMap`, `split_whitespace_in`, `parse_int`, `read_stdin_in`: `volec guide std`
 - f-string specs (`{n:>3}`, `{service:<6}`): `volec guide formatting`
 - `#[derive(Eq, Debug)]` on an enum: `volec guide formatting`
 
@@ -169,7 +168,7 @@ zipping the entries with `all[1..]` pairs each request with the next.
 
 What Rust has that vole does not (yet), and what to write instead:
 
-- `iter_mut`: loop over indices, `v.set(i, v.get(i) * 2)`.
+- `iter_mut`: loop over indices, `v[i] *= 2`.
 - `rev`, `step_by`, `chain`, `flat_map`, `peekable`: write the loop, or
   an iterator of your own like `Lines`.
 - `collect::<HashMap<..>>()`: `collect` always makes a `Vec`; fill a map
