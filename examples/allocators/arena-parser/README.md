@@ -49,10 +49,10 @@ struct Node<A: Allocator> { op: u8, num: i64, kids: Vec<Node<A>, A> }
 ```
 
 and every function that builds one is generic over it, taking the
-allocator as a value (`a: A`) and passing it to each `Vec` it makes:
+allocator as a value (`a: sink A`) and passing it to each `Vec` it makes:
 
 ```tach
-fn parse<A: Allocator>(src: [u8], a: A) -> Result<(Node<A>, i64), ParseError>
+fn parse<A: Allocator>(src: [u8], a: sink A) -> Result<(Node<A>, i64), ParseError>
 fn parse_expr<A: Allocator>(p: inout Parser<A>, t: Tok) -> Result<Node<A>, ParseError>
 ```
 
@@ -85,8 +85,7 @@ once, and `arena.scope(|a| ...)` per round, which rewinds the arena at
 its end but keeps its memory for the next round (instead of giving it
 back to `Gpa` and asking again). `unsafe { arena.free_all() }` gives it
 back at the end: unsafe because nothing stops a view into the arena
-from being used after it (0.17.1's arena references close that; a scope
-has no such hole).
+from being used after it (a scope has no such hole).
 
 ## Arena-friendly allocation
 

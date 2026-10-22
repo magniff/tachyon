@@ -93,8 +93,8 @@ match store.values.get_mut(key.as_slice()) {
 (`Arena::new_in(gpa)`) and freed at the end (`unsafe { names.free_all()
 }`: unsafe because a view into it could still be used after). The view
 it returns lives as long as the arena, not as long as the `Vec` that
-copied the bytes there, which 0.17's safe code cannot say (a view of a
-`Vec` ends when the `Vec` is dropped; arena references are 0.17.1's).
+copied the bytes there, which safe code cannot say yet (a view of a
+`Vec` ends when the `Vec` is dropped).
 So `intern` forgets the `Vec` and makes the view from its pointer, in
 `unsafe`:
 
@@ -201,9 +201,9 @@ view.vl:4:9: error[own.escape] 'closure(ScopedArena) -> [[u8]] at view.vl:2:34' 
 [exit 1]
 ```
 
-[check-alloc](../check-alloc/) has the other bugs of this kind, and how
-`--check-alloc` catches them at run time in code built with
-`--values=off`.
+[check-alloc](../check-alloc/) has the other bugs of this kind, compile
+errors too, and what `--check-alloc` still catches at run time: leaks,
+and bugs in `unsafe` code.
 
 ## Read more
 
