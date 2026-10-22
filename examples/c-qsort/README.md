@@ -117,17 +117,17 @@ really point at `City`s.
 
 ```tach
 unsafe fn c_sort<T>(items: [T], cmp: extern "C" fn(*u8, *u8) -> i32) {
-    c::qsort(items.ptr as *u8, items.len as u64, size_of(T) as u64, cmp);
+    c::qsort(items.ptr as *u8, items.len() as u64, size_of(T) as u64, cmp);
 }
 ```
 
-A slice `[T]` is a pointer and a length (`items.ptr`, `items.len`): with
+A slice `[T]` is a pointer and a length (`items.ptr`, `items.len()`): with
 `size_of(T)` that is all `qsort` needs, for any `T`. The wrapper is an
 `unsafe fn` because its contract cannot be checked: `cmp` must read its
 pointers as `T`s. Its callers say so with `unsafe { c_sort(cities[..],
-by_population); }`. The same goes for any function with pointer
-parameters used as a value: the compiler treats passing `by_population`
-around as unsafe, because it cannot know who will call it with what.
+by_population); }`. Passing `by_population` as a value is safe in
+itself; what is unsafe is the reads through `*u8` inside it, which is
+why each one sits in an `unsafe { }` block.
 
 ### bsearch with a key of another type
 
@@ -135,7 +135,7 @@ around as unsafe, because it cannot know who will call it with what.
 extern "C" fn name_key(key: *u8, element: *u8) -> i32 {
     let wanted = unsafe { *(key as *[u8]) };
     let name = unsafe { text((*(element as *City)).name) };
-    sign(wanted.cmp(&name))
+    sign(wanted.cmp(name))
 }
 ```
 
@@ -187,7 +187,7 @@ f-strings with widths (`>` right, `<` left) and a precision for floats
   through a raw pointer is `unsafe`; wrap it in a small function whose
   comment states the contract.
 - **Strings**: `c"..."` is a NUL-terminated `*u8`; a `[u8]` slice has no
-  NUL (pass `.ptr` and `.len`, or copy it with a 0 after).
+  NUL (pass `.ptr` and `.len()`, or copy it with a 0 after).
 - **Linking**: `volec main.vl -o prog` links with `cc` and the C
   library; other libraries and C files go through an object (see
   [c-mixed-build](../c-mixed-build/) and [c-math](../c-math/)).

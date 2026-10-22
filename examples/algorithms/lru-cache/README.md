@@ -42,8 +42,9 @@ its key from the map and reuses its slot.
 
 The list's links are **indices into a `Vec`**, not pointers: the
 entries are allocated once (the `Vec` of `capacity` slots), nothing is
-allocated or freed per request, and the whole cache is freed with three
-calls. An "intrusive" list: the links live in the entries themselves.
+allocated or freed per request, and the whole cache (its map and its
+`Vec`) is dropped at the end of its scope. An "intrusive" list: the
+links live in the entries themselves.
 
 | | |
 |---|---|
@@ -145,8 +146,9 @@ if written by hand for its types.
 **The workload** draws a magnitude, then a key below it, so key 0 is
 drawn about once in 10 requests while a key near 10^6 is drawn about
 once in 20 million. `serve` has default arguments for the request count
-and the seed, and returns its statistics (`#[derive(Debug, Clone)]
-struct Stats`) and the sum of the values served in a tuple. The sum is
+and the seed, and returns its statistics (`#[derive(Debug)]
+struct Stats`, a plain value, copied out of the cache) and the sum of
+the values served in a tuple. The sum is
 the same for every capacity: a cache changes how fast an answer comes,
 never the answer.
 
@@ -200,10 +202,10 @@ map and the node array.
 | your own `impl Iterator`, `type Item`, `enumerate` | `LruIter`, `show` | `volec guide iterators` |
 | `match` as an expression with an early `return` | `get`, `serve` | `volec guide syntax` |
 | `Option<(K, V)>`, tuple patterns in `for` and `if let` | `put`, `main` | `volec guide syntax` |
-| `#[derive(Debug, Clone)]`, `{x:?}` | `Stats`, `main` | `volec guide formatting` |
+| `#[derive(Debug)]`, `{x:?}` | `Stats`, `main` | `volec guide formatting` |
 | default arguments | `serve` | `volec guide core` |
 | f-strings: `{rate:.2}`, `{n:>7}` | `main` | `volec guide formatting` |
-| `defer` to free | `serve`, `main` | `volec guide memory` |
+| drops: each cache freed at the end of its scope, with no `free` | `serve`, `main` | `volec guide memory` |
 | a C header: `import "time.h" as c;` | `now_ns` | `volec guide c-interop` |
 
 ## Try

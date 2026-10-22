@@ -1,7 +1,7 @@
 # Split a module
 
 A shop's till: products and stock, carts, coupons and tax, receipts, and
-the commands a clerk types, all in one 415-line `shop.vl` that grew
+the commands a clerk types, all in one 381-line `shop.vl` that grew
 one function at a time. `main.vl` stocks the shop and replays a day at
 the till.
 
@@ -38,7 +38,7 @@ command that shows the way out:
 
 ```console
 $ volec lint --max-lines 170
-error lint.max-lines: shop.vl: 410 lines (at most 170)
+error lint.max-lines: shop.vl: 381 lines (at most 170)
 try: volec query deps crate::shop --max-lines 170
 [exit 1]
 ```
@@ -48,11 +48,11 @@ The file already has sections, marked with banner comments; `query items
 
 ```console
 $ volec query items shop --comments | grep section
-7-84	section	Products and stock
-86-163	section	Carts
-165-240	section	Prices and discounts
-242-302	section	Receipts
-304-410	section	Commands
+7-72	section	Products and stock
+74-138	section	Carts
+140-215	section	Prices and discounts
+217-277	section	Receipts
+279-381	section	Commands
 ```
 
 ## 2. What uses what
@@ -63,9 +63,9 @@ and fit the size. The groups alone:
 
 ```console
 $ volec query deps shop --max-lines 170 | grep -v '^[A-Za-z_]*	'
-# crate::shop	shop.vl	356 lines	39 items
-group 1	164	Product Store new_store add_product find_sku product in_stock restock take_stock free_store print_stock Command number parse_command run
-group 2	148	Line Cart new_cart line_index add_to_cart remove_from_cart qty_of items_in clear_cart free_cart Total subtotal total money pad_to receipt_line print_receipt checkout
+# crate::shop	shop.vl	329 lines	37 items
+group 1	149	Product Store new_store add_product find_sku product in_stock restock take_stock print_stock Command number parse_command run
+group 2	136	Line Cart new_cart line_index add_to_cart remove_from_cart qty_of items_in clear_cart Total subtotal total money pad_to receipt_line print_receipt checkout
 group 3	44	TAX_PERMILLE Coupon parse_coupon discount round_div tax_on
 ```
 
@@ -88,11 +88,11 @@ outside stays in `shop` itself:
 
 ```console
 $ volec refactor split shop --plan --max-lines 170
-# crate::shop	410 lines	5 parts of at most 170 lines
-# commands: banner '// ---- Commands ----': 4 of 4 items, 89 of 89 lines
+# crate::shop	381 lines	5 parts of at most 170 lines
+# commands: banner '// ---- Commands ----': 4 of 4 items, 85 of 85 lines
 volec refactor split crate::shop --into crate::shop::commands --items Command,number,parse_command,run
-# carts: banner '// ---- Carts ----': 10 of 12 items, 67 of 88 lines
-volec refactor split crate::shop --into crate::shop::carts --items Line,Cart,new_cart,line_index,add_to_cart,remove_from_cart,qty_of,items_in,clear_cart,free_cart,subtotal,checkout
+# carts: banner '// ---- Carts ----': 9 of 11 items, 55 of 76 lines
+volec refactor split crate::shop --into crate::shop::carts --items Line,Cart,new_cart,line_index,add_to_cart,remove_from_cart,qty_of,items_in,clear_cart,subtotal,checkout
 # stays in crate::shop: the part most used from other modules
 # receipts: banner '// ---- Receipts ----': 4 of 6 items, 47 of 60 lines
 volec refactor split crate::shop --into crate::shop::receipts --items Total,total,money,pad_to,receipt_line,print_receipt
@@ -109,15 +109,15 @@ the parts other names, in the plan's order; `prices_discounts` becomes
 
 ```console
 $ volec refactor split shop --auto --max-lines 170 --names commands,carts,receipts,pricing
-split crate::shop into 4 modules	6 files	+346 -319 lines
+split crate::shop into 4 modules	6 files	+329 -302 lines
 $ volec query stats
-105	12	shop/carts.vl
-100	11	shop/mod.vl
-100	4	shop/commands.vl
+96	4	shop/commands.vl
+92	11	shop/carts.vl
+88	10	shop/mod.vl
 75	6	shop/receipts.vl
 54	6	shop/pricing.vl
-35	1	main.vl
-469	40	total
+33	1	main.vl
+438	38	total
 $ volec lint --max-lines 170 && echo every file fits
 every file fits
 ```
@@ -146,12 +146,11 @@ $ volec query items shop
 30	fn	pub fn new_store(gpa: Gpa) -> Store
 34	fn	pub fn add_product(st: inout Store, sku: i64, name: [u8], price: i64, stock: i64)
 39	fn	pub fn find_sku(st: Store, sku: i64) -> Option<i64>
-48	fn	pub fn product(st: Store, sku: i64) -> Option<Product>
-55	fn	pub fn in_stock(st: Store, sku: i64) -> i64
-63	fn	pub fn restock(st: inout Store, sku: i64, n: i64) -> bool
-76	fn	fn take_stock(st: inout Store, sku: i64, n: i64) -> i64
-89	fn	pub fn free_store(st: inout Store)
-93	fn	pub fn print_stock(st: Store, gpa: Gpa)
+43	fn	pub fn product(st: Store, sku: i64) -> Option<Product>
+50	fn	pub fn in_stock(st: Store, sku: i64) -> i64
+58	fn	pub fn restock(st: inout Store, sku: i64, n: i64) -> bool
+69	fn	fn take_stock(st: inout Store, sku: i64, n: i64) -> i64
+81	fn	pub fn print_stock(st: Store, gpa: Gpa)
 ```
 
 Code outside the module was changed too: `main.vl` imports from where
@@ -160,16 +159,16 @@ the items are now.
 ```console
 $ git diff main.vl
 diff --git a/main.vl b/main.vl
-index d77f38d..ea18ac7 100644
+index 51768eb..1e7b68d 100644
 --- a/main.vl
 +++ b/main.vl
 @@ -4,7 +4,10 @@ mod shop;
  
  use std::Buf;
  
--use shop::{Store, add_product, free_cart, free_store, money, new_cart, new_store, run};
-+use shop::{Store, add_product, free_store, new_store};
-+use shop::carts::{free_cart, new_cart};
+-use shop::{Store, add_product, money, new_cart, new_store, run};
++use shop::{Store, add_product, new_store};
++use shop::carts::new_cart;
 +use shop::commands::run;
 +use shop::receipts::money;
  
@@ -195,7 +194,7 @@ The split was one edit: one `undo` puts `shop.vl` back whole.
 
 ```console
 $ volec undo
-undid split crate::shop into 4 modules	6 files	+346 -319 lines
+undid split crate::shop into 4 modules	6 files	+329 -302 lines
 $ ls *.vl
 main.vl
 shop.vl
@@ -203,7 +202,7 @@ shop.vl
 
 ## Why not by hand
 
-Splitting a 400-line file by hand means cutting and pasting five
+Splitting a 380-line file by hand means cutting and pasting five
 sections, then working out each new file's `use` lines, which private
 items must become `pub`, and what `main.vl` must import from where,
 mostly by compiling and reading errors, one round at a time. The tool

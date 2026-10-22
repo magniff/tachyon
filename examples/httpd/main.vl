@@ -144,27 +144,33 @@ mod sys {
     pub const DT_UNKNOWN: u8 = 0;
     pub const DT_DIR: u8 = 4;
 
-    // The name (NUL-terminated) and the d_type of an entry from readdir.
-    pub fn dirent(system: System, entry: u8) -> (*u8, u8) {
+    // The name (NUL-terminated) and the d_type of the entry readdir
+    // returned.
+    //
+    // Unsafe: `entry` must point to a struct dirent of this system.
+    pub unsafe fn dirent(system: System, entry: *u8) -> (*u8, u8) {
         match system {
             System::Linux => {
-                let d = &entry as *DirentLinux;
-                unsafe { (&d.name as *u8, d.r#type) }
+                let d = entry as *DirentLinux;
+                (&d.name as *u8, d.r#type)
             }
             System::MacArm => {
-                let d = &entry as *DirentMac;
-                unsafe { (&d.name as *u8, d.r#type) }
+                let d = entry as *DirentMac;
+                (&d.name as *u8, d.r#type)
             }
             System::MacIntel => {
-                let d = &entry as *DirentMacOld;
-                unsafe { (&d.name as *u8, d.r#type) }
+                let d = entry as *DirentMacOld;
+                (&d.name as *u8, d.r#type)
             }
         }
     }
 
     // The bytes of a C string.
-    pub fn cstr(s: *u8) -> [u8] {
-        unsafe { s[0..strlen(s) as i64] }
+    //
+    // Unsafe: `s` must point to a NUL-terminated string that outlives the
+    // slice.
+    pub unsafe fn cstr(s: *u8) -> [u8] {
+        s[0..strlen(s) as i64]
     }
 }
 
@@ -178,7 +184,8 @@ fn ends_with(s: [u8], suffix: [u8]) -> bool {
     s.len() >= suffix.len() && s[s.len() - suffix.len()..] == suffix
 }
 
-// A path for C: its bytes and a NUL.
+// A path for C: its bytes and a NUL (the Buf is freed when the Path is
+// dropped).
 struct Path { buf: Buf }
 
 impl Path {
@@ -208,22 +215,18 @@ impl Path {
         let s = self.buf.as_slice();
         s[..s.len() - 1]
     }
-
-    fn free(inout self) {
-        self.buf.free();
-    }
 }
 
 // What a path names.
 enum Kind { Missing, Dir, File(i64) }
 
-fn probe(system: System, path: inout u8) -> Kind {
-    let dir = unsafe { opendir(&path) };
+fn probe(system: System, path: Path) -> Kind {
+    let dir = unsafe { opendir(path.c()) };
     if dir as u64 != 0 {
         unsafe { closedir(dir); }
         return Kind::Dir;
     }
-    let fd = unsafe { open(&path, O_RDONLY | sys::o_nonblock(system)) };
+    let fd = unsafe { open(path.c(), O_RDONLY | sys::o_nonblock(system)) };
     if fd < 0 {
         return Kind::Missing;
     }
@@ -390,7 +393,7 @@ fn push_style(out: inout Buf) {
     out.push_str("</style>\n");
 }
 
-fn serve_directory(fd: i32, system: System, dir_path: inout Path, url: [u8], gpa: Gpa) {
+fn serve_directory(fd: i32, system: System, dir_path: Path, url: [u8], gpa: Gpa) {
     let dir = unsafe { opendir(dir_path.c()) };
     if dir as u64 == 0 {
         send_404(fd, url, gpa);
@@ -419,15 +422,14 @@ fn serve_directory(fd: i32, system: System, dir_path: inout Path, url: [u8], gpa
         if entry as u64 == 0 {
             break;
         }
-        let (cname, dtype) = unsafe { sys::dirent(system, *entry) };
-        let name = unsafe { sys::cstr(&*cname) };
+        let (cname, dtype) = unsafe { sys::dirent(system, entry) };
+        let name = unsafe { sys::cstr(cname) };
         if ends_with(name, ".") && (name.len() == 1 || name.len() == 2 && name[0] == '.') {
             continue;
         }
 
-        var path = Path::join(dir_path.bytes(), name, gpa);
-        defer path.free();
-        let kind = unsafe { probe(system, &*path.c()) };
+        let path = Path::join(dir_path.bytes(), name, gpa);
+        let kind = probe(system, path);
         // d_type is DT_UNKNOWN on file systems that do not keep it
         let is_dir = if dtype == sys::DT_UNKNOWN { kind == Kind::Dir }
             else { dtype == sys::DT_DIR };
@@ -467,7 +469,7 @@ fn serve_directory(fd: i32, system: System, dir_path: inout Path, url: [u8], gpa
 // File serving
 // ============================================================================
 
-fn serve_file(fd: i32, system: System, path: inout Path, size: i64, gpa: Gpa) {
+fn serve_file(fd: i32, system: System, path: Path, size: i64, gpa: Gpa) {
     // (not to wait for a writer if it is a FIFO)
     let file = unsafe { open(path.c(), O_RDONLY | sys::o_nonblock(system)) };
     if file < 0 {
@@ -528,22 +530,21 @@ fn handle_request(fd: i32, system: System, root: [u8], gpa: Gpa) {
         return;
     };
 
-    var decoded = url_decode(raw_path, gpa);
+    let decoded = url_decode(raw_path, gpa);
     let url = decoded.as_slice();
 
     // log the request on stderr
     eprint(f"{method} {url}");
 
-    var path = Path::join(root, url, gpa);
-    defer path.free();
-    match unsafe { probe(system, &*path.c()) } {
+    let path = Path::join(root, url, gpa);
+    match probe(system, path) {
         Kind::Missing => {
             eprintln(" 404");
             send_404(fd, url, gpa);
         }
         Kind::File(size) => {
             eprintln(f" 200 ({guess_mime(path.bytes())})");
-            serve_file(fd, system, &path, size, gpa);
+            serve_file(fd, system, path, size, gpa);
         }
         Kind::Dir => {
             if !ends_with(url, "/") {
@@ -554,15 +555,14 @@ fn handle_request(fd: i32, system: System, root: [u8], gpa: Gpa) {
                 send_redirect(fd, location.as_slice(), gpa);
                 return;
             }
-            var index = Path::join(path.bytes(), "index.html", gpa);
-            defer index.free();
-            if let Kind::File(size) = unsafe { probe(system, &*index.c()) } {
+            let index = Path::join(path.bytes(), "index.html", gpa);
+            if let Kind::File(size) = probe(system, index) {
                 eprintln(" 200 (index.html)");
-                serve_file(fd, system, &index, size, gpa);
+                serve_file(fd, system, index, size, gpa);
                 return;
             }
             eprintln(" 200 (dir)");
-            serve_directory(fd, system, &path, url, gpa);
+            serve_directory(fd, system, path, url, gpa);
         }
     }
 }
@@ -595,7 +595,7 @@ fn main(gpa: Gpa) -> i32 {
             return 1;
         }
     }
-    let root = unsafe { sys::cstr(&*root_c) };
+    let root = unsafe { sys::cstr(root_c) };
 
     eprintln(f"Serving {root}");
 

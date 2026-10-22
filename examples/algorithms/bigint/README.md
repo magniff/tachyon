@@ -287,7 +287,7 @@ another 10%.
 | slices as views, sub-slices `a[..m]`, written through | the kernels | `volec guide types`, `guide memory` |
 | drops: every number freed at the end of its scope | everywhere | `volec guide memory` |
 | closures and iterators: `map`, `sum`, `fold` | `digit_sum`, `main` | `volec guide iterators`, `guide closures` |
-| `unsafe { std::panic(c"...") }` for a broken precondition | `BigUint::minus` | `volec guide unsafe` |
+| `panic("...")` for a broken precondition, `self < other` from `Ord` | `BigUint::minus` | `volec guide errors` |
 | a C header: `import "time.h" as c;` | `now_ns` | `volec guide c-interop` |
 
 ## Try

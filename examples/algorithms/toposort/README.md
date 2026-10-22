@@ -70,7 +70,7 @@ a slice directly:
 
 ```tach
 var start = Vec::filled_in(n + 1, 0, gpa);
-let s = start.as_slice();
+let s = start.as_mut_slice();
 for (from, _) in edges { s[from + 1] += 1; }
 for v in 0..n { s[v + 1] += s[v]; }
 ```
@@ -85,7 +85,7 @@ queue: the nodes before `head` are done, the ones after it wait:
 ```tach
 var head = 0;
 while head < order.len() {
-    let v = order.get(head);
+    let v = order[head];
     head += 1;
     for u in g.edges(v) {
         deg[u] -= 1;
@@ -119,8 +119,7 @@ parse and once (inside `order`) on the sort:
 enum PlanError { Syntax([u8]), Cycle(Vec<[u8]>) }
 
 fn plan_order(lines: [[u8]], gpa: Gpa) -> Result<Vec<[u8]>, PlanError> {
-    var plan = Plan::parse(lines, gpa)?;
-    defer plan.free();
+    let plan = Plan::parse(lines, gpa)?;
     plan.order(gpa) // the names are views of `lines`, not of the plan
 }
 ```
@@ -131,12 +130,12 @@ captures the plan (`order` and `named` only read it: `self`, a `let`
 receiver), then `?` returns it:
 
 ```tach
-var order = sort(g, gpa).map_err(|c| self.named(c, gpa))?;
-Ok(order.iter().map(|v| self.names.get(v)).collect_in(gpa))
+let order = sort(g, gpa).map_err(|c| self.named(c, gpa))?;
+Ok(order.iter().map(|v| self.names[v]).collect_in(gpa))
 ```
 
 Task names are mapped to numbers with a `HashMap<[u8], i64>`; the names
-themselves are views of the input lines (`split_whitespace` returns
+themselves are views of the input lines (`split_whitespace_in` returns
 slices of its argument), so nothing is copied.
 
 **The random DAG** hides a random permutation of the nodes
@@ -187,11 +186,11 @@ program, generation and checks included, runs in about 0.3 s.
 | `Result`, `?`, `map_err` with a closure | `plan_order`, `Plan::order` | `volec guide conversions` |
 | `Option` and `?` | `find_cycle` | `volec guide conversions` |
 | enums with payloads, matched by variant | `PlanError`, `print_plan` | `volec guide syntax` |
-| `HashMap<[u8], i64>`, `split_whitespace` (views, no copies) | `Plan` | `volec guide std` |
+| `HashMap<[u8], i64>`, `split_whitespace_in` (views, no copies) | `Plan` | `volec guide std` |
 | tuples in `Vec`s, patterns in `for`, `while let`, closures | `Graph::new`, `find_cycle` | `volec guide syntax`, `guide closures` |
 | iterators: `position`, `map`, `collect`, `all`, `any`, `enumerate` | `find_cycle`, `main` | `volec guide iterators` |
 | default arguments | `random_dag` | `volec guide core` |
-| `defer` to free, on every path out | everywhere | `volec guide memory` |
+| drops: graphs, plans and orders freed at the end of their scope, on every path out (an early `return` or `?` too) | everywhere | `volec guide memory` |
 | f-strings | `print_plan`, `main` | `volec guide formatting` |
 | a C header: `import "time.h" as c;` | `now_ns` | `volec guide c-interop` |
 

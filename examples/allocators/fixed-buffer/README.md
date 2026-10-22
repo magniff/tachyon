@@ -84,7 +84,7 @@ the same way, a byte at a time with `try_push`: a line that does not fit
 is read to its end and reported. (std's `read_line` would grow the line
 with `push`, and it keeps its own buffer for stdin from C's `malloc`:
 this program reads stdin with C's `read` into 64 bytes of its own.)
-Only `Vec` has `try_` forms in 0.16; a `Buf` or a `HashMap` on a
+Only `Vec` has `try_` forms; a `Buf` or a `HashMap` on a
 `FixedBuf` stops the program when it is full.
 
 ## What the compiler can show

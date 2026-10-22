@@ -33,8 +33,9 @@ fn main() -> i32 {
 - `main` returns the process's exit status. Its last expression, `0`,
   written without a `;`, is the value of the body: there is no `return`.
   `fn main()` with no result type exits with 0 too.
-- `"Hello from vole!"` is a `[u8]`, a slice of bytes. Vole has no
-  `String` type: text is bytes, built with `std::Buf` when it grows.
+- `"Hello from vole!"` is a `[u8]`, a slice of bytes (or a `str`, UTF-8
+  text, where one is wanted). A literal needs no allocation; text that
+  grows is built in a `Buf` or a `String`, on an allocator.
 - `println` comes from the prelude, the part of `std` every module sees
   without a `use`. It prints anything with `Display` (numbers, slices,
   f-strings) and a newline; `print` leaves the newline out.

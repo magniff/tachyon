@@ -4,7 +4,7 @@ For each n below 2^20, the number of steps the Collatz map
 (`n -> n/2` or `3n+1`) takes to reach 1, one GPU invocation per n:
 
 ```sh
-volec main.vl -l objc -o compute && ./compute
+volec main.vl -o compute && ./compute
 ```
 
 ```text
@@ -15,13 +15,15 @@ steps in all: 138299831
 
 The program is the whole of std::gpu's compute path, on wgpu's model:
 
-- `gpu::Instance::new_in(gpa)`, `inst.adapter()?`, `adapter.device()?`:
+- `gpu::Instance::new_in(gpa)`, `inst.adapter()?.device()?`:
   the device and its queue (`Result`s: a Mac without Metal has no
   adapter).
-- `dev.shader(ShaderSource::msl(text, refl))?` (bound to a local first): the shader compiler's
-  output for this device's `caps().shader_kind`. Until the WGSL compiler
-  lands, the MSL and its `Reflection` (entry points, bindings with their
-  Metal slots) are written by hand.
+- `dev.shader(ShaderSource::msl(MSL, refl))?`: a shader for this
+  device's `caps().shader_kind`, with its `Reflection` (entry points,
+  bindings with their Metal slots). `dev.shader_wgsl(text)` makes both
+  from WGSL (as [triangle](../triangle/) does), but the walk climbs past
+  2^32 (704511 reaches 56991483520) and WGSL has no 64-bit integers, so
+  this kernel is MSL, its `ulong` and its reflection written by hand.
 - `dev.compute_pipeline(shader, "main")?` and `dev.bind_group(
   pipe.bind_layout(0), [...])`: the layout comes from the reflection.
 - `enc.compute_pass(|pass| { ... })`: a pass is a closure; it ends when
@@ -31,7 +33,8 @@ The program is the whole of std::gpu's compute path, on wgpu's model:
   them as `u32`s.
 
 Everything is dropped at the end of `main`: buffers, pipelines, the
-device. `-l objc` links the Objective-C runtime; std::gpu opens Metal
-itself. Misuse (a buffer bound as storage without
-`BufferUsage::STORAGE`, a dispatch before its bind group) stops the
-program with the rule's code, `gpu.usage`, `gpu.pipeline`.
+device. std::gpu links the Objective-C runtime and opens Metal itself:
+no flags to add (`-l objc` was needed before 0.25). Misuse (a buffer
+bound as storage without `BufferUsage::STORAGE`, a dispatch before its
+bind group) stops the program with the rule's code, `gpu.usage`,
+`gpu.pipeline`.

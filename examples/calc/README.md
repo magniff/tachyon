@@ -43,16 +43,16 @@ enum Error { BadChar(u8), Unexpected(Token), DivideByZero }
 inside the `match`. A byte that starts no token ends it with an error:
 
 ```tach
-fn tokenize(text: [u8]) -> Result<Vec<Token>, Error> {
+fn tokenize(text: [u8], gpa: Gpa) -> Result<Vec<Token>, Error> {
+    var tokens: Vec<Token> = Vec::new_in(gpa);
     ...
-        _ => {
-            tokens.free();
-            return Err(BadChar(c));
-        }
+            _ => return Err(BadChar(c)),
 ```
 
-There are no destructors in vole, so the vector is freed by hand on
-the error path; the caller of the `Ok` frees it with `defer`.
+The vector owns its memory and is dropped when it goes out of scope, so
+the early `return` frees it; on success it moves out in the `Ok`, and
+`evaluate` drops it when it returns. The parser holds only a view of
+the tokens, `tokens.as_slice()`.
 
 **The parser** has one method per grammar rule, each returning
 `Result<i64, Error>`. `?` returns the first error from every level at
@@ -106,7 +106,7 @@ which returns `Ok(false)` at the end of the input:
 
 ```tach
 while read_line(&line).unwrap_or(false) {
-    match evaluate(line.as_slice()) {
+    match evaluate(line.as_slice(), gpa) {
         Ok(value) => println(f"{value}"),
         Err(e) => println(f"error: {e}"),
     }
@@ -118,5 +118,5 @@ while read_line(&line).unwrap_or(false) {
 - enums with data, `match`, or-patterns, ranges and guards: `volec guide syntax`
 - `Result` and `?`: `volec guide conversions`
 - `impl Display`, f-strings and specs (`{c:c}`): `volec guide formatting`
-- methods on `*Parser`, `Vec`, `defer` and `free`: `volec guide memory`
+- methods on `inout self`, a `Vec` and its drop, a struct holding a view: `volec guide memory`
 - reading stdin (`read_line`): `volec guide std`

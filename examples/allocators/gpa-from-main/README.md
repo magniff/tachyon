@@ -4,7 +4,7 @@ A shop's orders, read from stdin (`customer item quantity price`, the
 price in cents), totalled per customer and per item. The program is
 small on purpose: what it shows is where its memory comes from.
 
-In vole 0.16 nothing allocates unless it is given an allocator.
+Since vole 0.16 nothing allocates unless it is given an allocator.
 There is no global `malloc` to reach for: the general-purpose allocator
 is a value of type `Gpa`, `main` receives it as a parameter, and a
 function that allocates either takes one as a parameter or works on a
@@ -39,8 +39,8 @@ all (see [fixed-buffer](../fixed-buffer/)).
 
 ```tach
 fn main(gpa: Gpa) -> i32 {
-    let mut input = read_stdin_in(gpa).unwrap();
-    let mut orders = parse_orders(input.as_slice(), gpa);
+    let input = read_stdin_in(gpa).unwrap();
+    let orders = parse_orders(input.as_slice(), gpa);
 ```
 
 Each standard-library function that allocates has an `_in` form taking
@@ -51,8 +51,8 @@ that allocates takes it the same way and passes it on:
 
 ```tach
 fn parse_orders(text: [u8], gpa: Gpa) -> Vec<Order> {
-    let mut orders: Vec<Order> = Vec::new_in(gpa);
-    let mut lines = split_in(text, '\n', gpa);
+    var orders: Vec<Order> = Vec::new_in(gpa);
+    let lines = split_in(text, '\n', gpa);
 ```
 
 There are four kinds of function in `main.vl`, by what they are given:
@@ -61,8 +61,8 @@ There are four kinds of function in `main.vl`, by what they are given:
 |---|---|---|
 | `parse_orders` | `(text: [u8], gpa: Gpa) -> Vec<Order>` | from the `gpa` it is passed |
 | `total` | `(orders: [Order]) -> i64` | never: a slice and no allocator |
-| `by_customer` | `(orders: &Vec<Order>) -> HashMap<[u8], i64>` | from the allocator the Vec holds: `orders.allocator()` |
-| `count_items` | `<A: Allocator>(orders: [Order], a: A) -> HashMap<[u8], i64, A>` | from whichever allocator the caller picks |
+| `by_customer` | `(orders: Vec<Order>) -> HashMap<[u8], i64>` | from the allocator the Vec holds: `orders.allocator()` |
+| `count_items` | `<A: Allocator>(orders: [Order], a: sink A) -> HashMap<[u8], i64, A>` | from whichever allocator the caller picks |
 
 A container keeps its allocator: `Vec<T>` is short for `Vec<T, Gpa>`
 (and costs three words, as before: a `Gpa` takes no bytes), and its

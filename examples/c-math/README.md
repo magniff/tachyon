@@ -152,13 +152,15 @@ root and the steps taken, as an `Option` of a tuple matched with
 
 ```tach
 fn newton<F: Fn(f64) -> f64, D: Fn(f64) -> f64, T: FnMut(i64, f64)>(
-    f: F, df: D, x0: f64, mut trace: T,
+    f: F, df: D, x0: f64, trace: sink T,
 ) -> Option<f64>
 ```
 
 Newton's method takes three closures: the function, its derivative, and
 a `FnMut` that sees each iterate (here it prints them: the number of
-correct digits doubles each step). A zero derivative gives `None`,
+correct digits doubles each step). Calling a `FnMut` may change what it
+captured, so `newton` takes it `sink`: it owns the closure and may call
+it as often as it likes. A zero derivative gives `None`,
 printed with `{flat:?}`.
 
 ## C interop rules in brief

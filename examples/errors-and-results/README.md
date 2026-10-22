@@ -103,8 +103,12 @@ does it instead of `From`:
 
 ```tach
 let n = parse_number(field.value, lo, hi)
-    .map_err(|e| ConfigError::BadValue(field.line, key, e))?;
+    .map_err(|e| ConfigError::BadValue(field.line,
+        Buf::from_in(key, fields.allocator()), e))?;
 ```
+
+(The error owns a copy of the key, made on the map's allocator: see
+"An error that owns its text" below.)
 
 **Option means absent, Result means failed.** A missing optional key is
 not an error, a malformed one is, so the getter returns
@@ -176,4 +180,6 @@ source.
 - No `expect(msg)`: `unwrap` on an `Err` or `None` stops the program
   with a fixed message and exit status 101; for a message of your own,
   `match` and `unwrap_or_else`, or return a `Result` as here.
-- No `let ... else`: `match` on the `Option`, as `number` does.
+- `let ... else` (0.18.1) is the other way to handle absence:
+  `let Some(field) = fields.get(key) else { return Ok(None); };` does
+  what `number`'s `match` does, with one level less of nesting.

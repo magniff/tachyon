@@ -2,7 +2,7 @@
 
 `gradebook` reads a class's test scores and prints each student's
 average, grade and biggest swing between tests. It was written in a
-hurry, with Rust habits, and half-changed: it does not compile. Three
+hurry and half-changed: it does not compile. Three
 files, about 130 lines, nine errors.
 
 The session gets it to build the way an agent should: every error at
