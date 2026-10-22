@@ -93,7 +93,12 @@ fn main(gpa: Gpa) {
   panic. A moved value is not dropped where it was.
 - `impl Drop for T { fn drop(inout self) { ... } }` runs code at the
   drop; a type without one drops its fields. `drop(x)` drops early,
-  `std::forget(x)` never (a leak, safe).
+  `std::forget(x)` never (a leak, safe); `x.drop()` by hand is
+  `own.drop_call` (`try: drop(x)`).
+- A `match`, `if let` or `let (a, _) = t` by value on a local moves
+  only the parts it binds; the rest (`_`, `..`, a wildcard arm) stays
+  in the local and is dropped with it, at its scope's end. `v[i] = x`
+  drops the element it replaces.
 - `let x = v[i];` of an owned element borrows it (a let access, read
   only); `var x = v[i];` would move it out of the Vec and is
   `own.move_out`, as is `var k = self.keys;` in an `inout self` method:

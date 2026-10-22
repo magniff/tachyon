@@ -16,8 +16,8 @@
 //   sequence, when not a place, at the loop's end (check/iterate.vl).
 // - an owned temporary whose value a statement discards (`make(3);`) is
 //   bound to a hidden local, which drops at the statement's end;
-// - `p = rhs` on an owned place p (not through a raw pointer, not an
-//   index) becomes `{ let __own_new = rhs; { let =o = p; p = __own_new; } }`:
+// - `p = rhs` on an owned place p (not through a raw pointer; 0.25: an
+//   index too, `v[i]`, its index evaluated once) becomes `{ let __own_new = rhs; { let =o = p; p = __own_new; } }`:
 //   the right side, then the write, then the old value's drop (=o's
 //   implicit defer) with the state p had before the write.
 //
@@ -552,6 +552,15 @@ pub fn borrowed_call(e: i64) -> bool {
         if wrapped > 0 {
             return borrowed_call(wrapped);
         }
+        // (0.25: `e?`, the payload of a borrowed Option: `v.last()?`)
+        if e > 0 && NODES[e].kind == NodeKind::Try {
+            return borrowed_call(NODES[e].a);
+        }
+        // (0.25: `let Some(t) = v.last() else { .. };`, its match: parser::let_else)
+        if e > 0 && NODES[e].kind == NodeKind::Match && NODES[e].count == 2
+            && (NODES[child(e, 1)].p & crate::front::ast::ARM_LET_ELSE) != 0 {
+            return borrowed_call(NODES[e].a);
+        }
         if e <= 0 || NODES[e].kind != NodeKind::Call || NODES[e].count == 0 {
             return false;
         }
@@ -600,6 +609,15 @@ fn mark_byref(p: i64, at: i64) {
             }
         }
         SCRATCH.count = mark;
+    }
+}
+
+// (0.25) `e?` (check/try_op.vl), its `let ?try = e;` bound (pattern bind):
+// when e is a borrowed copy (`v.last()?`), ?try borrows it, so the match
+// binds ?v by reference and nothing in the desugaring drops the element.
+pub fn try_let_borrows(bind: i64, operand: i64) {
+    if drops_on() && borrowed_call(operand) {
+        mark_byref(bind, operand);
     }
 }
 
@@ -699,8 +717,9 @@ fn temporary(e: i64) -> i64 {
     }
 }
 
-// A fresh (unchecked) copy of place expression e, made of names, fields
-// and dereferences; 0 when e is something else (an index, a call).
+// A fresh (unchecked) copy of place expression e, made of names, fields,
+// dereferences and (0.25) indexes whose index is a name or a literal
+// (hoist_indexes makes them so); 0 when e is something else (a call).
 fn copy_place(e: i64) -> i64 {
     unsafe {
         let k = NODES[e].kind;
@@ -738,13 +757,135 @@ fn copy_place(e: i64) -> i64 {
             NODES[n].b = base;
             return n;
         }
+        if k == NodeKind::Index {
+            let i = NODES[e].b;
+            if i == 0 || NODES[i].kind == NodeKind::Range {
+                return 0;
+            }
+            let r = slice_receiver(NODES[e].a);
+            let base = copy_place(if r != 0 { r } else { NODES[e].a });
+            if base == 0 {
+                return 0;
+            }
+            var idx = 0;
+            if NODES[i].kind == NodeKind::Int {
+                idx = new_node(NodeKind::Int, NODES[i].start, NODES[i].end);
+                NODES[idx].a = NODES[i].a;
+                NODES[idx].b = NODES[i].b;
+            } else {
+                idx = copy_place(i);
+                if idx == 0 || NODES[idx].kind != NodeKind::Ident {
+                    return 0;
+                }
+            }
+            let n = new_node(k, NODES[e].start, NODES[e].end);
+            NODES[n].a = base;
+            NODES[n].b = idx;
+            return n;
+        }
         0
+    }
+}
+
+// (0.25) The receiver of `v.as_mut_slice()` that the checker made of a
+// Vec's or a Buf's `v[i]` written (check/synth_mode.vl: synth_index), when
+// it is call e; else 0.
+fn slice_receiver(e: i64) -> i64 {
+    unsafe {
+        if NODES[e].kind == NodeKind::MethodCall {
+            let name = SYMS[NODES[e].b].text;
+            return if name == "as_mut_slice" { NODES[e].a } else { 0 };
+        }
+        if NODES[e].kind != NodeKind::Call || NODES[e].count != 1 {
+            return 0;
+        }
+        let f = NODES[e].x - 1;
+        if f < 0 || !within_std(FNS[f].module)
+            || method_word(SYMS[FNS[f].display].text) != "as_mut_slice" {
+            return 0;
+        }
+        var r = child(e, 0);
+        if NODES[r].kind == NodeKind::Unary && NODES[r].op == Tok::Amp {
+            r = NODES[r].b;
+        }
+        r
+    }
+}
+
+// (0.25) Whether place e (an assignment's target) is one copy_place copies
+// once its indexes are names: names, fields, `*` and indexes, no call.
+fn indexable_place(e: i64) -> bool {
+    unsafe {
+        if e == 0 || (NODES[e].p & NODE_RAW) != 0 {
+            return false;
+        }
+        let k = NODES[e].kind;
+        if k == NodeKind::Ident {
+            return NODES[e].res == Res::Local || NODES[e].res == Res::Static;
+        }
+        if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+            return indexable_place(NODES[e].a);
+        }
+        if k == NodeKind::Unary && NODES[e].op == Tok::Star {
+            return indexable_place(NODES[e].b);
+        }
+        if k == NodeKind::Index {
+            let i = NODES[e].b;
+            let r = slice_receiver(NODES[e].a);
+            return i != 0 && NODES[i].kind != NodeKind::Range
+                && indexable_place(if r != 0 { r } else { NODES[e].a });
+        }
+        false
+    }
+}
+
+// (0.25) The indexes of place e that are not a local's name or a literal,
+// each bound first, once (`let __own_iK = i;`, pushed on the list being
+// built), and read by its name in e: the old element's read and the write
+// then index the same element, with the index evaluated once.
+fn hoist_indexes(e: i64, k: i64) -> i64 {
+    unsafe {
+        let kind = NODES[e].kind;
+        if kind == NodeKind::FieldAccess || kind == NodeKind::TupleField {
+            return hoist_indexes(NODES[e].a, k);
+        }
+        if kind == NodeKind::Unary {
+            return hoist_indexes(NODES[e].b, k);
+        }
+        if kind != NodeKind::Index {
+            return k;
+        }
+        let r = slice_receiver(NODES[e].a);
+        let k2 = hoist_indexes(if r != 0 { r } else { NODES[e].a }, k);
+        let i = NODES[e].b;
+        if NODES[i].kind == NodeKind::Int
+            || NODES[i].kind == NodeKind::Ident && NODES[i].res == Res::Local {
+            return k2;
+        }
+        let b = crate::base::buf_new();
+        crate::base::buf_str(b, c"__own_i");
+        crate::base::buf_int(b, k2);
+        let sym = crate::base::intern(crate::base::buf_slice(b));
+        let start = NODES[i].start;
+        let pat = new_node(NodeKind::PatBind, start, start);
+        NODES[pat].a = sym;
+        let st = new_node(NodeKind::Let, start, NODES[i].end);
+        NODES[st].a = pat;
+        NODES[st].c = i;
+        NODES[i].p |= NODE_CHECKED;
+        list_push(st);
+        let id = new_node(NodeKind::Ident, start, NODES[i].end);
+        NODES[id].a = sym;
+        NODES[id].res = Res::Local;
+        NODES[e].b = id;
+        k2 + 1
     }
 }
 
 // Assignment e (`p = rhs`, checked) to an owned place: its desugaring,
 // checked, or 0 (not owned, compound, or a place this does not handle:
-// through a raw pointer, which writes without dropping, or an index).
+// through a raw pointer, which writes without dropping, or a call; 0.25:
+// an index is handled, evaluated once, hoist_indexes).
 fn assign_drops(e: i64) -> i64 {
     unsafe {
         syms();
@@ -756,6 +897,18 @@ fn assign_drops(e: i64) -> i64 {
         if target == 0 || value == 0 || !has_glue(NODES[target].ty) {
             return 0;
         }
+        if !indexable_place(target) {
+            return 0;
+        }
+        // (0.25: `v[i] = x` drops the element it replaces; i once)
+        let hmark = list_begin();
+        hoist_indexes(target, 0);
+        let hoisted = SCRATCH.count - hmark;
+        let lets = crate::base::alloc_array::<i64>(hoisted + 1);
+        for h in 0..hoisted {
+            lets[h] = SCRATCH.data[hmark + h];
+        }
+        SCRATCH.count = hmark;
         let read = copy_place(target);
         let write = copy_place(target);
         if read == 0 || write == 0 {
@@ -796,6 +949,10 @@ fn assign_drops(e: i64) -> i64 {
         let outer = new_node(NodeKind::Block, start, end);
         let m2 = list_begin();
         list_push(nlet);
+        for h in 0..hoisted {
+            list_push(lets[h]);
+        }
+        crate::base::free(lets as *u8);
         list_push(ist);
         list_end(outer, m2);
         synth_expr(outer);
@@ -841,6 +998,10 @@ pub fn arm_drops(m: i64, arm: i64) {
             return;
         }
         NODES[arm].p |= ARM_DROPS_DONE;
+        if (NODES[m].p & crate::front::own::glue::GLUE_REF) != 0 {
+            // (0.25: the glue's way to a part, glue::wrap_variants)
+            return;
+        }
         let pat = NODES[arm].a;
         let scrutinee = NODES[m].a;
         if (NODES[m].p & GLUE_MATCH) == 0 {
@@ -1479,7 +1640,7 @@ fn fresh_value(e: i64, pat: i64) -> bool {
 fn fresh(e: i64) -> bool {
     unsafe {
         let k = NODES[e].kind;
-        if k == NodeKind::Call {
+        if k == NodeKind::Call || k == NodeKind::Try && borrowed_call(e) {
             return !borrowed_call(e) && !parametric_copy(e);
         }
         if k == NodeKind::MethodCall || k == NodeKind::StructLit || k == NodeKind::Tuple

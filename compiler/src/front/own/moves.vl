@@ -23,8 +23,8 @@ use crate::front::closures::{CLOSURES, CLOSURE_COUNT};
 use crate::front::lexer::Tok;
 use crate::front::modules::within_std;
 use crate::front::own::diag::{
-    OWN_MOVED, OWN_MOVE_OUT, OWN_PARTIAL, OWN_READONLY, own_begin, own_bytes, own_end, own_help,
-    own_str, own_sym, own_try, own_type,
+    OWN_DROP_CALL, OWN_MOVED, OWN_MOVE_OUT, OWN_PARTIAL, OWN_READONLY, own_begin, own_bytes,
+    own_end, own_help, own_str, own_sym, own_try, own_type,
 };
 use crate::front::own::drops::{
     ASSIGN_OLD, BYREF, MATCH_BYREF, assign_read, drop_state, note_move, walk_begin,
@@ -70,6 +70,11 @@ pub fn on_read(p: i64, n: i64) {
     }
 }
 
+// (0.25) The node a part's move clears its drop flag at (drops::clear_at
+// wraps it) when the move's own node is a pattern's binding: the arm's
+// body (walk::bind_parts); 0: the move's node.
+pub static var MOVE_AT: i64 = 0;
+
 // Owned place p is moved at node n; how (walk::MO_*) says how it left its
 // place: out of an index, a pointer or reference, or a static is
 // own.move_out.
@@ -107,7 +112,7 @@ pub fn on_move(p: i64, n: i64, how: i64) {
         set_bit(moved_bits(), p);
         set_bit(dmoved_bits(), p);
         PL_MOVED_BY[p] = n;
-        note_move(p, n);
+        note_move(p, if MOVE_AT > 0 { MOVE_AT } else { n });
     }
 }
 
@@ -235,7 +240,9 @@ fn check_moved(p: i64, n: i64) {
         } else {
             c"use it before the move, pass a copy where it moves ('.clone()'), or let the callee borrow it: a let parameter ('x: T'), not 'sink'"
         });
-        if by > 0 {
+        // (0.25: not a pattern's binding, walk::bind_parts: `.clone()` there
+        // does not parse)
+        if by > 0 && NODES[by].kind != NodeKind::PatBind {
             try_wrap(by, c"", c".clone()");
         }
         own_end();
@@ -321,6 +328,10 @@ fn move_out(p: i64, n: i64, how: i64) {
             let wrapped = crate::front::contracts::expand::requires_tail(at);
             if wrapped > 0 {
                 at = wrapped;
+            }
+            // (0.25: `v.last()?`, its call)
+            while at > 0 && NODES[at].kind == NodeKind::Try {
+                at = NODES[at].a;
             }
             if at > 0 && NODES[at].kind == NodeKind::Index {
                 own_str(c"out of ");
@@ -646,6 +657,58 @@ pub fn partial(n: i64) {
     }
 }
 
+// (0.25) own.partial: pattern pat, of a match by value, takes owned parts
+// out of a value of type t, which implements Drop (its drop needs all of
+// it).
+pub fn partial_pattern(pat: i64, t: i64) {
+    unsafe {
+        if within_std(FNS[CUR_F].module) {
+            return;
+        }
+        own_begin(pat, OWN_PARTIAL);
+        own_str(c"cannot move parts out of a '");
+        own_type(t);
+        own_str(c"' with ");
+        src_quoted(pat);
+        own_str(c": it implements Drop, which needs all of it");
+        own_help(c"match it through an access ('match &e'), and clone what is kept; or bind it whole ('x => ...')");
+        own_end();
+    }
+}
+
+// (0.25) own.drop_call: call n is `x.drop()` of a type's Drop impl,
+// written by hand (the glue's own calls are not walked): x would be
+// dropped again where its owner's scope ends.
+pub fn drop_call(n: i64) {
+    unsafe {
+        if within_std(FNS[CUR_F].module) || NODES[n].kind != NodeKind::Call || NODES[n].count == 0 {
+            return;
+        }
+        let f = NODES[n].x - 1;
+        if f < 0 || FNS[f].self_ty <= 0 || FNS[f].node <= 0 || !has_drop_impl(FNS[f].self_ty)
+            || SYMS[NODES[FNS[f].node].a].text != "drop" {
+            return;
+        }
+        var r = child(n, 0);
+        if NODES[r].kind == NodeKind::Unary && NODES[r].op == Tok::Amp && NODES[r].b != 0 {
+            r = NODES[r].b;
+        }
+        own_begin(n, OWN_DROP_CALL);
+        own_str(c"cannot call ");
+        src_quoted(n);
+        own_str(c": Drop's drop runs where the value's owner ends, and would run again there");
+        own_help(c"drop it now with 'drop(x)', which takes it, or let its scope end");
+        if NODES[r].start < NODES[r].end && NODES[r].end <= NODES[n].end {
+            SKIP_FROM = NODES[r].end;
+            SKIP_TO = NODES[n].end;
+            try_wrap(r, c"drop(", c")");
+            SKIP_FROM = 0;
+            SKIP_TO = 0;
+        }
+        own_end();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Positions and source text
 
@@ -706,6 +769,11 @@ fn src_quoted(n: i64) {
     }
 }
 
+// (0.25) Source bytes the new line of try_wrap leaves out: `.drop()` of
+// `x.drop()` (drop_call); empty when SKIP_FROM == SKIP_TO.
+static var SKIP_FROM: i64 = 0;
+static var SKIP_TO: i64 = 0;
+
 // Appends s quoted for a shell (single quotes).
 fn shell_quoted(out: i64, from: i64, to: i64, pre: i64, at: i64, end: i64, post: i64) {
     unsafe {
@@ -718,7 +786,7 @@ fn shell_quoted(out: i64, from: i64, to: i64, pre: i64, at: i64, end: i64, post:
             if i == end && post >= 0 {
                 quote_bytes(out, buf_slice(post));
             }
-            if i < to {
+            if i < to && !(pre >= 0 && i >= SKIP_FROM && i < SKIP_TO) {
                 quote_byte(out, SRC[i]);
             }
             i += 1;

@@ -457,7 +457,8 @@ argument borrows the place directly, so `let r = &x; f(r); g(r)` is
   and matching `&place` (a mutating match, D7) binds inout accesses:
   `match e { E::A(n) => n + 1 }` with `e: E` a let parameter (was `*n`),
   and `match &self.state { S::Run(n) => n += 1, _ => {} }`. Matching an
-  owned local by value still moves its parts out.
+  owned local by value moves out the parts its pattern binds, and only
+  those (0.25, "Partial moves" below).
 - `if let`, `while let` and `let ... else` follow `let` (D13).
 
 ### 5.4 Closures
@@ -1733,3 +1734,50 @@ Left, for after 0.25 (soundness first):
   in `m.iter().fold(..)` and `map`.
 - A value given to a generic let parameter after an impure argument is
   not made a temporary ("this value has no place").
+
+### 0.25: partial moves and stores (branch fix25b)
+
+**Partial moves.** A `match`, `if let`, `let ... else` or destructuring
+`let` by value on an owned local (or a path of its fields: `s.e`, `t.0`)
+moves out the parts its pattern binds, and only those, as Rust does. The
+parts it skips (`_`, `..`, the fields of a variant it does not bind, the
+whole value under a wildcard arm or an arm that binds nothing) stay in
+the local, and drop with it where its scope ends, once:
+
+    let t = (mk(1), mk(2));
+    { let (a, _) = t; }        // drops a (1) here
+    ...                        // t.1 (2) drops where t's scope ends
+
+    match e { E::B(_, x) => .., _ => .. }   // x drops at the arm's end;
+                                            // the rest of e at e's end
+
+Arms that skip different fields, nested patterns (`O::In(E::B(_, b), _)`)
+and guards work the same way: the own walk moves each binding's place
+(walk::bind_parts) and the drop of the local runs per part, under a drop
+flag where a part moved on some paths only. An enum's drop glue is one
+entry per field of a variant with glue (glue.vl: `match e { E::B(_, __gv0)
+=> { glue of __gv0 }, _ => {} }`), so a moved part's entry is left out or
+flagged; an enum with a Drop impl keeps its one `match`, and taking parts
+out of it is own.partial (its drop needs all of it; Rust's E0509). A
+scrutinee that is not a local's place (a temporary, an index, a
+reference) is matched as before: by reference through an index or a
+reference, and a temporary's unbound parts are the temporaries' rules.
+
+**Stores.** `v[i] = x` (a Vec's, an array's, a slice's, through inout,
+`self.v[i]`, `h.v[0]`, `w[0][0]`, `v[i].f`) drops the element it
+replaces, after the write, as any owned assignment does: `{ let __own_new
+= x; let __own_i0 = i; { let =o = v[__own_i0]; v[__own_i0] = __own_new; }
+}`, the index evaluated once, after the right side (Rust's order).
+`Vec::set` is `self[i] = x`. A field or a tuple part of a Vec's element
+cannot be moved out (`w[0].v`, `eat(w[0].1)`): own.move_out, as the
+element itself.
+
+**`?` and let-else on borrowed copies.** `v.last()?` (and `get`, `first`,
+`HashMap::get`, `peek`, a borrowing iterator's `next`) is a borrowed copy
+as `v.last().unwrap()` is: its binding borrows, moving it is
+own.move_out, a field of it is read. `let Some(t) = v.last() else { .. }`
+binds t the same way.
+
+**`x.drop()`** is own.drop_call (`try: drop(x)`): Drop's drop runs where
+the value's owner ends, and would run again.
+
