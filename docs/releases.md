@@ -108,6 +108,11 @@ docs/lsp.md, the parser's docs/design/cli.md and `volec guide cli`.
     too) until iterator items are views.
 - **Timing tests** (voltty's renderer, the sort and parser examples) no
   longer fail under a loaded machine.
+- **Found by the release gate** and fixed: `volec test` took every
+  `#[test]`, `#[property]` and `#[fuzz]` for a contract, so it replayed
+  no saved fuzz crash (the test list's prefix was cut at the old name's
+  length); `env::args()` reads the arguments and its iterator does no
+  io, so std::cli's `#[no_io]` parse builds on Linux too.
 - **Tested on aarch64 only**, as since 0.15 (`gate.sh --with-x86`).
 - **Breaking**: every name: `volec`, `.vl` (a `.tach` file is not a
   source any more), `VOLE_*`; programs read through the stopgap above.
