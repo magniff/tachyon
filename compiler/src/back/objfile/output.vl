@@ -3,10 +3,23 @@
 // that makes the executable (link_command), with what the command line
 // added for it (`-l NAME`, `-L DIR`, objects, archives, shared libraries,
 // C files) and C's math library when the program calls into it.
+//
+// (0.25) link_program runs the link. A program of vole objects only (no
+// C file, no link argument, no $VOLE_CC) is linked by the system's linker
+// run directly, without `sh` and the C driver: the command the driver
+// would run (`cc -###`) is asked for once and kept in a file (the link
+// template), then reused while the files it names stay what they were.
+// `--linker=cc` (or $VOLE_LINKER=cc) links through `cc` as before; so
+// does every link the direct one cannot make. On AArch64 macOS the
+// compiler links such a program itself (link_macho) when it can: the
+// default; `--linker=system` runs ld.
 
 use crate::back::dwarf::DEBUG_INFO;
 use crate::back::objfile::{ASYMS, ASYM_COUNT};
-use crate::base::{BUFS, IntVec, buf_byte, buf_fmt, buf_new, buf_str, strlen};
+use crate::base::{
+    BUFS, IntVec, alloc_array, alloc_zeroed, buf_byte, buf_bytes, buf_fmt, buf_hex, buf_new,
+    buf_str, buf_write_fd, cstr, die2, fclose, fopen, fread, fwrite, realpath, streq, strlen,
+};
 use crate::base::target::{ELF, X86};
 use crate::front::modules::C_MODULE;
 use crate::middle::ctx::FnCtx;
@@ -14,6 +27,21 @@ use crate::middle::opt::OPT_LEVEL;
 
 extern "C" {
     fn getenv(name: *u8) -> *u8;
+    fn system(command: *u8) -> i32;
+    static environ: **u8;
+    fn posix_spawnp(pid: *i32, file: *u8, actions: *u8, attr: *u8, argv: **u8, envp: **u8) -> i32;
+    fn posix_spawn_file_actions_init(actions: *u8) -> i32;
+    fn posix_spawn_file_actions_adddup2(actions: *u8, fd: i32, to: i32) -> i32;
+    fn posix_spawn_file_actions_destroy(actions: *u8) -> i32;
+    fn waitpid(pid: i32, status: *i32, options: i32) -> i32;
+    fn creat(path: *u8, mode: i32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn unlink(path: *u8) -> i32;
+    fn rename(from: *u8, to: *u8) -> i32;
+    fn mkdir(path: *u8, mode: i32) -> i32;
+    fn uname(info: *u8) -> i32;
+    fn confstr(name: i32, buf: *u8, size: u64) -> u64;
+    fn getpid() -> i32;
 }
 
 // ---- The C module's symbols ----
@@ -93,6 +121,108 @@ pub fn add_link_include(dir: *u8) {
     unsafe {
         LINK_INCLUDES.push(dir as i64);
     }
+}
+
+// (0.25) What the program links besides: the frameworks and libraries
+// its extern blocks name (`#[link(...)]`, in the modules it reaches,
+// front::parser::foreign) and `-framework NAME`s, each once, in the order
+// first named. A framework is macOS's (Linux leaves it out); a library is
+// linked as `-lNAME`.
+static var LINK_FRAMEWORKS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var LINK_LIBS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Adds name (a C string made of it) to v, unless it is there.
+fn add_once(v: inout IntVec, name: [u8]) {
+    unsafe {
+        for i in 0..v.count {
+            if cstr(v.data[i] as *u8) == name {
+                return;
+            }
+        }
+        let b = buf_new();
+        buf_bytes(b, name);
+        buf_byte(b, 0);
+        v.push(BUFS[b].data as i64);
+    }
+}
+
+pub fn add_framework(name: [u8]) {
+    unsafe {
+        add_once(&LINK_FRAMEWORKS, name);
+    }
+}
+
+// The extern blocks' links (#[link]): a kind ('F', 'l'), the name (a C
+// string), then where its block's symbols start in LINK_DECL_SYMS and how
+// many: four words each.
+static var LINK_DECLS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var LINK_DECL_SYMS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// A link an extern block declares (front::parser::foreign::link_block),
+// with the C symbols of its functions and statics (C strings).
+pub fn add_link_decl(kind: u8, name: [u8], syms: inout IntVec) {
+    unsafe {
+        let b = buf_new();
+        buf_bytes(b, name);
+        buf_byte(b, 0);
+        LINK_DECLS.push(kind as i64);
+        LINK_DECLS.push(BUFS[b].data as i64);
+        LINK_DECLS.push(LINK_DECL_SYMS.count);
+        LINK_DECLS.push(syms.count);
+        for i in 0..syms.count {
+            LINK_DECL_SYMS.push(syms.data[i]);
+        }
+    }
+}
+
+// Adds the declared links the program uses to LINK_FRAMEWORKS and
+// LINK_LIBS: those whose block has a symbol the object refers to and does
+// not define (or no symbol at all).
+fn resolve_declared() {
+    unsafe {
+        var d = 0;
+        while d < LINK_DECLS.count {
+            let first = LINK_DECLS.data[d + 2];
+            let n = LINK_DECLS.data[d + 3];
+            var used = n == 0;
+            for s in 0..ASYM_COUNT {
+                if used {
+                    break;
+                }
+                if ASYMS[s].defined {
+                    continue;
+                }
+                var text = ASYMS[s].text;
+                if !ELF {
+                    if text.len == 0 || text[0] != '_' {
+                        continue;
+                    }
+                    text = text[1..text.len];
+                }
+                for k in first..first + n {
+                    if cstr(LINK_DECL_SYMS.data[k] as *u8) == text {
+                        used = true;
+                        break;
+                    }
+                }
+            }
+            if used {
+                let name = cstr(LINK_DECLS.data[d + 1] as *u8);
+                if LINK_DECLS.data[d] == 'F' {
+                    add_once(&LINK_FRAMEWORKS, name);
+                } else {
+                    add_once(&LINK_LIBS, name);
+                }
+            }
+            d += 4;
+        }
+        LINK_DECLS.count = 0;
+    }
+}
+
+// Whether the program links a framework or a library of its own.
+fn links_declared() -> bool {
+    unsafe { LINK_LIBS.count > 0 || (!ELF && LINK_FRAMEWORKS.count > 0) }
 }
 
 // Whether the command line added anything for the link.
@@ -209,6 +339,16 @@ pub fn link_command(path: *u8, obj_path: *u8) -> *u8 {
             quoted(cmd, LINK_ARGS.data[i + 1] as *u8);
             i += 2;
         }
+        if !ELF {
+            for i in 0..LINK_FRAMEWORKS.count {
+                buf_str(cmd, c" -framework ");
+                quoted(cmd, LINK_FRAMEWORKS.data[i] as *u8);
+            }
+        }
+        for i in 0..LINK_LIBS.count {
+            buf_str(cmd, c" -l");
+            quoted(cmd, LINK_LIBS.data[i] as *u8);
+        }
         if ELF && (LINK_C || uses_libm()) {
             buf_str(cmd, c" -lm");
         }
@@ -217,5 +357,606 @@ pub fn link_command(path: *u8, obj_path: *u8) -> *u8 {
         }
         buf_byte(cmd, 0);
         BUFS[cmd].data
+    }
+}
+
+// ---- Running the link (0.25) ----
+
+// The linker: the system's, run directly, through `cc`, or the compiler's
+// own (link_macho: programs of vole objects on AArch64 macOS; the
+// default, which is the system's for any other program).
+pub const LINKER_SYSTEM: i64 = 0;
+pub const LINKER_CC: i64 = 1;
+pub const LINKER_INTERNAL: i64 = 2;
+// --linker=NAME, or -1: $VOLE_LINKER, else the default.
+static var LINKER: i64 = -1;
+
+// The linker named `name` (system, cc, internal), or -1.
+fn linker_of_name(name: *u8) -> i64 {
+    unsafe {
+        if streq(name, c"system") {
+            return LINKER_SYSTEM;
+        }
+        if streq(name, c"cc") {
+            return LINKER_CC;
+        }
+        if streq(name, c"internal") {
+            return LINKER_INTERNAL;
+        }
+        -1
+    }
+}
+
+// `--linker=NAME`: whether NAME is a linker.
+pub fn set_linker(name: *u8) -> bool {
+    unsafe {
+        LINKER = linker_of_name(name);
+        LINKER >= 0
+    }
+}
+
+// The linker this link uses.
+fn linker() -> i64 {
+    unsafe {
+        if LINKER >= 0 {
+            return LINKER;
+        }
+        let env = getenv(c"VOLE_LINKER");
+        if env == 0 as *u8 || env[0] == 0 {
+            // (link_program falls back to the system's when the internal
+            // one does not take the program)
+            return LINKER_INTERNAL;
+        }
+        let l = linker_of_name(env);
+        if l < 0 {
+            die2(c"$VOLE_LINKER is not a linker (system, cc or internal): ", env);
+        }
+        l
+    }
+}
+
+// Links obj_path into the executable path: 0, or the link's exit status
+// (the linker said why).
+pub fn link_program(path: *u8, obj_path: *u8) -> i64 {
+    unsafe {
+        resolve_declared();
+        let cc = getenv(c"VOLE_CC");
+        // ($VOLE_CC=cc, as tests/run.sh sets it, is the default driver)
+        let own = !LINK_C && LINK_ARGS.count == 0
+            && (cc == 0 as *u8 || cc[0] == 0 || streq(cc, c"cc"));
+        let how = linker();
+        // (--linker=internal: the compiler's own, when it takes the program;
+        // else the system's)
+        if own && how == LINKER_INTERNAL && !DEBUG_INFO && !links_declared()
+            && crate::back::objfile::link_macho::link_macho(path, obj_path) {
+            return 0;
+        }
+        if own && how != LINKER_CC && link_direct(path, obj_path) {
+            return 0;
+        }
+        system(link_command(path, obj_path)) as i64
+    }
+}
+
+// The status of a process as waitpid gives it: its exit code, or 128 +
+// the signal that ended it.
+fn exit_code(status: i32) -> i64 {
+    let s = status as i64;
+    if (s & 127) == 0 { (s >> 8) & 255 } else { 128 + (s & 127) }
+}
+
+// Runs argv (argv[0] found as a shell finds it; argv ends with 0), its
+// stdout and stderr into the file log (made anew): its exit status, 127
+// when it could not be run.
+fn run_logged(argv: **u8, log: *u8) -> i64 {
+    unsafe {
+        let fd = creat(log, 384);
+        if fd < 0 {
+            return 127;
+        }
+        // (posix_spawn_file_actions_t is opaque: 8 bytes on macOS, 80 with
+        // glibc)
+        let actions = alloc_zeroed(256);
+        posix_spawn_file_actions_init(actions);
+        posix_spawn_file_actions_adddup2(actions, fd, 1);
+        posix_spawn_file_actions_adddup2(actions, fd, 2);
+        var pid = 0 as i32;
+        let r = posix_spawnp(&pid, argv[0], actions, 0 as *u8, argv, environ);
+        posix_spawn_file_actions_destroy(actions);
+        close(fd);
+        if r != 0 {
+            return 127;
+        }
+        var status = 0 as i32;
+        if waitpid(pid, &status, 0) != pid {
+            return 127;
+        }
+        exit_code(status)
+    }
+}
+
+// The file at path, appended to buffer b: whether it could be read.
+pub fn read_into(path: *u8, b: i64) -> bool {
+    unsafe {
+        let f = fopen(path, c"rb");
+        if f == 0 as *u8 {
+            return false;
+        }
+        let chunk = alloc_zeroed(65536);
+        loop {
+            let got = fread(chunk, 1, 65536, f);
+            if got == 0 {
+                break;
+            }
+            buf_bytes(b, chunk[0..got as i64]);
+        }
+        fclose(f);
+        true
+    }
+}
+
+// The link made by the system's linker run directly, with the link
+// template: whether it linked. When it did not, what it printed is not
+// shown and its template is dropped: the caller links through `cc`, which
+// says why.
+fn link_direct(path: *u8, obj_path: *u8) -> bool {
+    unsafe {
+        let lb = buf_new();
+        buf_fmt(lb, f"{cstr(obj_path)}.log\0");
+        let log = BUFS[lb].data;
+        let file = template_file();
+        var t = -1;
+        if file != 0 as *u8 {
+            t = template_read(file);
+        }
+        if t < 0 {
+            t = template_make(path, obj_path, log);
+            if t < 0 {
+                unlink(log);
+                return false;
+            }
+            if file != 0 as *u8 {
+                template_write(t, file);
+            }
+        }
+        let status = run_logged(template_argv(t, path, obj_path), log);
+        if status == 0 {
+            // (the linker's warnings, as cc shows them)
+            let out = buf_new();
+            if read_into(log, out) && BUFS[out].len > 0 {
+                buf_write_fd(out, 2);
+            }
+        } else if file != 0 as *u8 {
+            unlink(file);
+        }
+        unlink(log);
+        status == 0
+    }
+}
+
+// ---- The link template ----
+
+// The driver's link command, the output and the object as markers: one
+// argument a line, after a first line that stamps it (the real paths of
+// the arguments that are absolute paths; they change when the toolchain or
+// the SDK does).
+const MARK_OUT: *u8 = c"@vole-out";
+const MARK_OBJ: *u8 = c"@vole-obj";
+
+// struct utsname: sysname is the first field, release the third; the
+// fields are 256 bytes long on macOS, 65 on Linux.
+const UTS_SIZE: i64 = 2048;
+
+// (confstr) The per-user cache directory on macOS.
+const CS_DARWIN_USER_CACHE_DIR: i32 = 65538;
+
+// The file of the link template (named by a hash of what the driver's
+// answer depends on: the target, the system's release, the environment
+// the driver reads), or 0: none ($VOLE_LINK_CACHE=off, or no directory
+// for it). Its directory: $VOLE_LINK_CACHE, else the user's cache
+// directory (macOS), $XDG_CACHE_HOME or ~/.cache (Linux).
+fn template_file() -> *u8 {
+    unsafe {
+        let info = alloc_zeroed(UTS_SIZE);
+        if uname(info) != 0 {
+            return 0 as *u8;
+        }
+        let macos = streq(info, c"Darwin");
+        let field = if macos { 256 } else { 65 };
+        let release = &info[2 * field];
+        let dir = buf_new();
+        let env = getenv(c"VOLE_LINK_CACHE");
+        if env != 0 as *u8 && env[0] != 0 {
+            if streq(env, c"off") {
+                return 0 as *u8;
+            }
+            buf_str(dir, env);
+        } else if macos {
+            let room = alloc_zeroed(1024);
+            let n = confstr(CS_DARWIN_USER_CACHE_DIR, room, 1024);
+            if n == 0 || n > 1024 {
+                return 0 as *u8;
+            }
+            buf_str(dir, room);
+        } else {
+            let xdg = getenv(c"XDG_CACHE_HOME");
+            let home = getenv(c"HOME");
+            if xdg != 0 as *u8 && xdg[0] == '/' {
+                buf_str(dir, xdg);
+            } else if home != 0 as *u8 && home[0] == '/' {
+                buf_str(dir, home);
+                buf_str(dir, c"/.cache");
+                buf_byte(dir, 0);
+                mkdir(BUFS[dir].data, 448);
+                BUFS[dir].len -= 1;
+            } else {
+                return 0 as *u8;
+            }
+        }
+        let key = buf_new();
+        buf_str(key, c"vole-link 1\n");
+        buf_str(key, if ELF { c"elf" } else { c"macho" });
+        buf_str(key, if X86 { c" x86_64\n" } else { c" arm64\n" });
+        buf_str(key, info);
+        buf_byte(key, ' ');
+        buf_str(key, release);
+        buf_byte(key, '\n');
+        let all = [
+            c"PATH", c"SDKROOT", c"DEVELOPER_DIR", c"MACOSX_DEPLOYMENT_TARGET", c"COMPILER_PATH",
+            c"LIBRARY_PATH", c"GCC_EXEC_PREFIX", c"LD_RUN_PATH",
+        ];
+        let names = all[..];
+        for i in 0..names.len {
+            let v = getenv(names[i]);
+            buf_str(key, names[i]);
+            buf_byte(key, '=');
+            if v != 0 as *u8 {
+                buf_str(key, v);
+            }
+            buf_byte(key, '\n');
+        }
+        var h: u64 = 14695981039346656037;
+        for i in 0..BUFS[key].len {
+            h ^= BUFS[key].data[i] as u64;
+            h *= 1099511628211;
+        }
+        let at = BUFS[dir].len;
+        if at > 0 && BUFS[dir].data[at - 1] != '/' {
+            buf_byte(dir, '/');
+        }
+        buf_str(dir, c"vole-link-");
+        buf_hex(dir, h, 16);
+        buf_byte(dir, 0);
+        BUFS[dir].data
+    }
+}
+
+// The stamp of the arguments in buffer t from offset `from` (one a line),
+// appended to buffer b: each absolute path's real path, or `?`.
+fn template_stamp(t: i64, from: i64, b: i64) {
+    unsafe {
+        let text = BUFS[t].data;
+        let n = BUFS[t].len;
+        let one = buf_new();
+        let real = alloc_zeroed(4096);
+        var i = from;
+        while i < n {
+            var j = i;
+            while j < n && text[j] != '\n' {
+                j += 1;
+            }
+            if j > i && text[i] == '/' {
+                BUFS[one].len = 0;
+                buf_bytes(one, text[i..j]);
+                buf_byte(one, 0);
+                if realpath(BUFS[one].data, real) != 0 as *u8 {
+                    buf_str(b, real);
+                } else {
+                    buf_byte(b, '?');
+                }
+                buf_byte(b, ' ');
+            }
+            i = j + 1;
+        }
+    }
+}
+
+// The template in file, as a buffer, when its stamp holds; else -1.
+fn template_read(file: *u8) -> i64 {
+    unsafe {
+        let t = buf_new();
+        if !read_into(file, t) {
+            return -1;
+        }
+        let text = BUFS[t].data;
+        let n = BUFS[t].len;
+        if n == 0 || text[n - 1] != '\n' {
+            return -1;
+        }
+        var first = 0;
+        while text[first] != '\n' {
+            first += 1;
+        }
+        let stamp = buf_new();
+        template_stamp(t, first + 1, stamp);
+        if BUFS[stamp].len != first || BUFS[stamp].data[0..first] != text[0..first] {
+            return -1;
+        }
+        // (one output and one object, each a whole line)
+        var outs = 0;
+        var objs = 0;
+        var i = first + 1;
+        while i < n {
+            var j = i;
+            while text[j] != '\n' {
+                j += 1;
+            }
+            if text[i..j] == cstr(MARK_OUT) {
+                outs += 1;
+            } else if text[i..j] == cstr(MARK_OBJ) {
+                objs += 1;
+            }
+            i = j + 1;
+        }
+        if outs != 1 || objs != 1 {
+            return -1;
+        }
+        t
+    }
+}
+
+// Writes template t to file (under another name first, then renamed:
+// links running at once read a whole template or none).
+fn template_write(t: i64, file: *u8) {
+    unsafe {
+        let tmp = buf_new();
+        buf_fmt(tmp, f"{cstr(file)}.{getpid()}\0");
+        let f = fopen(BUFS[tmp].data, c"wb");
+        if f == 0 as *u8 {
+            return;
+        }
+        let n = BUFS[t].len as u64;
+        let wrote = fwrite(BUFS[t].data, 1, n, f);
+        fclose(f);
+        if wrote != n || rename(BUFS[tmp].data, file) != 0 {
+            unlink(BUFS[tmp].data);
+        }
+    }
+}
+
+// Whether C string s starts with prefix.
+unsafe fn starts_with(s: *u8, prefix: *u8) -> bool {
+    var i = 0;
+    while prefix[i] != 0 {
+        if s[i] != prefix[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+// The arguments of a line of `cc -###` (each in double quotes, with `\`
+// before a quote, a backslash or `$`, or bare up to a space), appended to
+// buffer b, each ended by a NUL, from offset i of text up to the line's
+// end; their starts into args.
+fn split_line(text: *u8, n: i64, from: i64, b: i64, args: inout IntVec) {
+    unsafe {
+        var i = from;
+        loop {
+            while i < n && text[i] == ' ' {
+                i += 1;
+            }
+            if i >= n || text[i] == '\n' || text[i] == '\r' {
+                break;
+            }
+            args.push(BUFS[b].len);
+            var quoted = false;
+            while i < n && text[i] != '\n' && text[i] != '\r' && (quoted || text[i] != ' ') {
+                if text[i] == '"' {
+                    quoted = !quoted;
+                } else if text[i] == '\\' && i + 1 < n && text[i + 1] != '\n' {
+                    i += 1;
+                    buf_byte(b, text[i]);
+                } else {
+                    buf_byte(b, text[i]);
+                }
+                i += 1;
+            }
+            buf_byte(b, 0);
+        }
+    }
+}
+
+// What `cc -print-prog-name=ld` says (the linker collect2 runs), or 0.
+fn driver_ld(log: *u8) -> *u8 {
+    unsafe {
+        let argv = alloc_array::<*u8>(3);
+        argv[0] = c"cc";
+        argv[1] = c"-print-prog-name=ld";
+        if run_logged(argv, log) != 0 {
+            return 0 as *u8;
+        }
+        let out = buf_new();
+        if !read_into(log, out) {
+            return 0 as *u8;
+        }
+        var n = BUFS[out].len;
+        while n > 0 && (BUFS[out].data[n - 1] == '\n' || BUFS[out].data[n - 1] == ' ') {
+            n -= 1;
+        }
+        if n == 0 {
+            return 0 as *u8;
+        }
+        BUFS[out].len = n;
+        buf_byte(out, 0);
+        BUFS[out].data
+    }
+}
+
+// The link template for linking obj_path into path, from what `cc -###`
+// says it would run (the linker itself for gcc's collect2, without its LTO
+// plugin), or -1.
+fn template_make(path: *u8, obj_path: *u8, log: *u8) -> i64 {
+    unsafe {
+        let argv = alloc_array::<*u8>(8);
+        argv[0] = c"cc";
+        argv[1] = c"-###";
+        var k = 2;
+        if !ELF {
+            argv[2] = c"-arch";
+            argv[3] = if X86 { c"x86_64" } else { c"arm64" };
+            k = 4;
+        }
+        argv[k] = c"-o";
+        argv[k + 1] = path;
+        argv[k + 2] = obj_path;
+        if run_logged(argv, log) != 0 {
+            return -1;
+        }
+        let out = buf_new();
+        if !read_into(log, out) {
+            return -1;
+        }
+        // The link's line: the last with the object among its arguments.
+        let text = BUFS[out].data;
+        let n = BUFS[out].len;
+        let words = buf_new();
+        var args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var i = 0;
+        while i < n {
+            if text[i] == ' ' {
+                let b = buf_new();
+                var line = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                split_line(text, n, i, b, &line);
+                var has = false;
+                for a in 0..line.count {
+                    if streq(&BUFS[b].data[line.data[a]], obj_path) {
+                        has = true;
+                    }
+                }
+                if has {
+                    BUFS[words].len = 0;
+                    buf_bytes(words, BUFS[b].data[0..BUFS[b].len]);
+                    args = line;
+                }
+            }
+            while i < n && text[i] != '\n' {
+                i += 1;
+            }
+            i += 1;
+        }
+        if args.count == 0 {
+            return -1;
+        }
+        let body = buf_new();
+        var outs = 0;
+        var objs = 0;
+        var a = 0;
+        while a < args.count {
+            let w = &BUFS[words].data[args.data[a]];
+            var text_of = w;
+            if a == 0 && (streq(w, c"collect2") || (strlen(w) > 9 && ends_with(w, c"/collect2"))) {
+                text_of = driver_ld(log);
+                if text_of == 0 as *u8 {
+                    return -1;
+                }
+            } else if streq(w, c"-plugin") {
+                a += 2;
+                continue;
+            } else if starts_with(w, c"-plugin-opt=") {
+                a += 1;
+                continue;
+            } else if streq(w, c"-o") && a + 1 < args.count
+                && streq(&BUFS[words].data[args.data[a + 1]], path) {
+                buf_str(body, c"-o\n");
+                text_of = MARK_OUT;
+                outs += 1;
+                a += 1;
+            } else if streq(w, obj_path) {
+                text_of = MARK_OBJ;
+                objs += 1;
+            }
+            var c = 0;
+            while text_of[c] != 0 {
+                if text_of[c] == '\n' {
+                    return -1;
+                }
+                c += 1;
+            }
+            buf_str(body, text_of);
+            buf_byte(body, '\n');
+            a += 1;
+        }
+        if outs != 1 || objs != 1 {
+            return -1;
+        }
+        let t = buf_new();
+        template_stamp(body, 0, t);
+        buf_byte(t, '\n');
+        buf_bytes(t, BUFS[body].data[0..BUFS[body].len]);
+        t
+    }
+}
+
+// The link's arguments from template t (ended by 0): the output and the
+// object in place of their markers, with libm and libpthread after the
+// object on Linux when the program calls into them (as link_command).
+fn template_argv(t: i64, path: *u8, obj_path: *u8) -> **u8 {
+    unsafe {
+        let words = buf_new();
+        let n = BUFS[t].len;
+        var first = 0;
+        while BUFS[t].data[first] != '\n' {
+            first += 1;
+        }
+        buf_bytes(words, BUFS[t].data[first + 1..n]);
+        let text = BUFS[words].data;
+        let m = BUFS[words].len;
+        var lines = 0;
+        for i in 0..m {
+            if text[i] == '\n' {
+                text[i] = 0;
+                lines += 1;
+            }
+        }
+        let argv = alloc_array::<*u8>(lines + 3 + 2 * LINK_FRAMEWORKS.count + LINK_LIBS.count);
+        var k = 0;
+        var i = 0;
+        while i < m {
+            let w = &text[i];
+            if streq(w, MARK_OUT) {
+                argv[k] = path;
+            } else if streq(w, MARK_OBJ) {
+                argv[k] = obj_path;
+                if ELF && uses_libm() {
+                    k += 1;
+                    argv[k] = c"-lm";
+                }
+                if ELF && uses_pthreads() {
+                    k += 1;
+                    argv[k] = c"-lpthread";
+                }
+                // (what the program declares it links, as link_command)
+                if !ELF {
+                    for f in 0..LINK_FRAMEWORKS.count {
+                        argv[k + 1] = c"-framework";
+                        argv[k + 2] = LINK_FRAMEWORKS.data[f] as *u8;
+                        k += 2;
+                    }
+                }
+                for l in 0..LINK_LIBS.count {
+                    let b = buf_new();
+                    buf_fmt(b, f"-l{cstr(LINK_LIBS.data[l] as *u8)}\0");
+                    k += 1;
+                    argv[k] = BUFS[b].data;
+                }
+            } else {
+                argv[k] = w;
+            }
+            k += 1;
+            i += strlen(w) as i64 + 1;
+        }
+        argv
     }
 }

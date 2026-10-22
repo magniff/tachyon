@@ -5,7 +5,7 @@
 # texture through Metal, compared with the CPU reference renderer
 # (cpu.vl) and with ref/golden-block.ppm; damage tracking (rows rebuilt
 # and copied, images equal to a full redraw); the bench (prints, no
-# gate). main.vl is built at -O2 with tests/window/frameworks.c and run
+# gate). main.vl is built at -O2 (std links its frameworks) and run
 # from the root. macOS only: elsewhere every check is skipped (the Linux
 # renderer, FreeType and Vulkan, is another task).
 #
@@ -51,7 +51,7 @@ else
     echo "FAIL voltty_render_cells_embedded: run examples/voltty/render/embed.sh"
 fi
 
-if ! (cd "$ROOT" && "$COMPILER" -O2 tests/voltty-render/main.vl tests/window/frameworks.c -l objc -o "$WORK/prog") \
+if ! (cd "$ROOT" && "$COMPILER" -O2 tests/voltty-render/main.vl -o "$WORK/prog") \
         >"$WORK/build.out" 2>&1; then
     echo "FAIL voltty_render_build:"
     head -20 "$WORK/build.out" | sed 's/^/    /'

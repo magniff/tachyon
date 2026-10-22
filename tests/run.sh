@@ -11,9 +11,10 @@
 # tests/walkthrough/run.sh (the sessions of examples/tools/*/README.md,
 # 0.15, and of every examples/GROUP/NAME/README.md with one, 0.16) and
 # tests/own-try/run.sh (the own pass's try: lines run, 0.17) and
-# tests/lsp/run.sh (`volec lsp`'s sessions, 0.24) and tests/gpu/run.sh (std::gpu on Metal, 0.22, skipped off macOS). POSIX sh and awk only, so it runs the same on macOS and Linux.
+# tests/lsp/run.sh (`volec lsp`'s sessions, 0.24) and tests/link/run.sh
+# (the link without cc, 0.25) and tests/gpu/run.sh (std::gpu on Metal, 0.22, skipped off macOS). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
-# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-d FORMAT] [FILTER]
+# usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-k LINKER] [-d FORMAT] [FILTER]
 #
 #   -c COMPILER   the volec binary to test (default: target/volec,
 #                 as left by bootstrap/bootstrap.sh)
@@ -27,6 +28,9 @@
 #                 every JOBS
 #   -a            programs go through assembly (volec -S, then cc), as
 #                 before 0.7, instead of the compiler's own objects
+#   -k LINKER     (0.25) the compiler links each case without C files
+#                 itself (`volec --linker=LINKER -o prog`; system, cc or
+#                 internal) instead of the C compiler linking its object
 #   -d FORMAT     the compiler's diagnostics: human (the default) or short
 #                 (--diagnostics=short, 0.11); the ERROR and WARNING
 #                 directives are written for human and hold for both
@@ -134,9 +138,10 @@ TIMEOUT=${VOLE_TEST_TIMEOUT:-20}
 JOBS=""
 OUT=prog.o
 DIAG=human
+LINKER=""
 
 usage() {
-    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -147,6 +152,7 @@ while [ $# -gt 0 ]; do
         -O) [ $# -ge 2 ] || usage; OPT="-O$2"; shift 2 ;;
         -j) [ $# -ge 2 ] || usage; JOBS=$2; shift 2 ;;
         -a) OUT=prog.s; shift ;;
+        -k) [ $# -ge 2 ] || usage; LINKER=$2; shift 2 ;;
         -d) [ $# -ge 2 ] || usage; DIAG=$2; shift 2 ;;
         -h|--help) usage ;;
         -*) usage ;;
@@ -377,6 +383,13 @@ check_case() {
         # (0.16) volec compiles the C files and links, as `cc` would
         # shellcheck disable=SC2086
         if ! VOLE_CC="$CC" "$COMPILER" --target "$TARGET" $OPT $FLAGS $PFLAGS "$source" $csources -o "$dir/prog" >"$dir/compile.out" 2>&1; then
+            { echo "compile and link failed:"; cat "$dir/compile.out"; } >"$dir/why"
+            return 1
+        fi
+    elif [ -n "$LINKER" ] && [ -z "$csources" ] && [ "$OUT" = prog.o ]; then
+        # (0.25, -k) the compiler links
+        # shellcheck disable=SC2086
+        if ! "$COMPILER" --target "$TARGET" --linker="$LINKER" $OPT $FLAGS $PFLAGS "$source" -o "$dir/prog" >"$dir/compile.out" 2>&1; then
             { echo "compile and link failed:"; cat "$dir/compile.out"; } >"$dir/why"
             return 1
         fi
@@ -686,6 +699,11 @@ esac
 case lsp in
     *"$FILTER"*) "$ROOT/tests/lsp/run.sh" -c "$COMPILER" >"$WORK/lsp.out" 2>&1 & ;;
 esac
+# (0.25) The link without cc, and its template (tests/link/run.sh):
+# category "link". (macOS and Linux hosts; the target's own)
+case link in
+    *"$FILTER"*) "$ROOT/tests/link/run.sh" -c "$COMPILER" >"$WORK/link.out" 2>&1 & ;;
+esac
 # (0.22) std::gpu and std::objc: tests/gpu/run.sh, Metal on macOS/arm64
 # (skipped elsewhere); category "gpu".
 case gpu in
@@ -809,6 +827,23 @@ case lsp in
             count=$((count + 1))
         fi
         awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/lsp.out" >>"$FAILURES"
+        ;;
+esac
+
+# The link (0.25): tests/link/run.sh (run above); category "link".
+case link in
+    *"$FILTER"*)
+        while read -r status _; do
+            case "$status" in
+                pass) echo "link pass" >>"$TALLY"; count=$((count + 1)) ;;
+                FAIL) echo "link fail" >>"$TALLY"; count=$((count + 1)) ;;
+            esac
+        done <"$WORK/link.out"
+        if ! grep -q '^pass' "$WORK/link.out"; then
+            echo "link fail" >>"$TALLY"
+            count=$((count + 1))
+        fi
+        awk '/^FAIL/ { p = 1 } /^pass/ { p = 0 } p' "$WORK/link.out" >>"$FAILURES"
         ;;
 esac
 
