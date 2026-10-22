@@ -41,8 +41,8 @@ use crate::front::own::state::{
     PE_INVALID, PE_KIND, PE_OV, PK_NONE, PK_RAW, PL_COUNT, PL_FIELD, PL_MASK, PL_PARENT, PL_RID,
     PL_RKIND, POOL, POOL_TOP, RK_LOCAL, RK_MARK, RK_ROOT, RK_STATIC, SLOT_LOCAL, SLOT_PARENT,
     TUPLE_FIELD, any_and, at, child_place, clear_bit, field_number, get_bit, is_deref_place, l1, l2,
-    mark_place, new_ov, or_expanded, or_into, ov_hits, ov_inner, ov_or, root_of, root_place,
-    set_bit, slot_for, slot_of_local, slot_of_place, slot_off,
+    local_place, mark_place, new_ov, or_expanded, or_into, ov_hits, ov_inner, ov_or, root_of,
+    root_place, set_bit, slot_for, slot_of_local, slot_of_place, slot_off,
 };
 use crate::front::own::walk::{
     BOUND, CUR_F, PARAM_LOCALS, PO_DEREF, PO_INNER, PO_RAW, PO_VIEWSLOT, W_DROP, W_MOVE,
@@ -297,6 +297,126 @@ fn write_place(p: i64, n: i64, how: i64, except: i64) {
 // ---------------------------------------------------------------------------
 // Messages
 
+// (0.25) The statement ends: the temporaries made in it since
+// walk::TEMPS[mark..] die; a later use of a view of one is own.escape.
+pub fn kill_temps(mark: i64) {
+    unsafe {
+        let n = crate::front::own::walk::TEMPS.count;
+        if n <= mark {
+            return;
+        }
+        let m = new_ov();
+        for i in mark..n {
+            or_into(at(m), &PL_MASK[crate::front::own::walk::TEMPS.data[i] * NW]);
+        }
+        close_mask(at(m));
+        let first = crate::front::own::walk::TEMPS.data[mark];
+        invalidate(at(m), PL_RID[first], H_DROP, -1, 0);
+        POOL_TOP = m;
+        crate::front::own::walk::TEMPS.count = mark;
+    }
+}
+
+// (0.25) Slot s's value now holds what origin v views: at both levels
+// (where in it is not known), minus loans on s's own local.
+pub fn store_deep(s: i64, v: i64) {
+    unsafe {
+        if s < 0 || v < 0 {
+            return;
+        }
+        let m = new_ov();
+        crate::front::own::calls::deep_into(m, v);
+        let own = local_place(SLOT_LOCAL.data[s]);
+        for q in 0..PL_COUNT {
+            if own >= 0 && root_of(q) == own {
+                clear_bit(l1(m), q);
+                clear_bit(l2(m), q);
+            }
+        }
+        let so = slot_off(CUR, s);
+        let lt = LOCALS[SLOT_LOCAL.data[s]].ty;
+        if is_ptr(lt) || lt > 0 && TYPES[lt].kind == TyKind::Slice {
+            // (a reference, a slice: its level 1 is what it points to, and
+            // a write through it writes that; what is stored is held there)
+            or_into(l2(so), l1(m));
+            or_into(l2(so), l2(m));
+        } else {
+            or_into(l1(so), l1(m));
+            or_into(l2(so), l2(m));
+        }
+        POOL_TOP = m;
+    }
+}
+
+// (0.25) A store of origin v into slot s reaches the locals s holds loans
+// on (the locals at its level 1: `r = &mut v; r.push(w)`, a match's `&`
+// binding, `m = v.as_mut_slice(); m[0] = w`): each holds v too, at both
+// levels; through references to references, a few deep.
+pub fn store_through_loans(s: i64, v: i64, depth: i64) {
+    unsafe {
+        if s < 0 || v < 0 || depth > 4 {
+            return;
+        }
+        // (only a reference or a slice points to what it stores into: the
+        // level 1 of an owned container, a Vec<[u8]>, is what its elements
+        // view, not where a store into it goes)
+        let lt = LOCALS[SLOT_LOCAL.data[s]].ty;
+        if !(is_ptr(lt) || lt > 0 && TYPES[lt].kind == TyKind::Slice) {
+            return;
+        }
+        let so = slot_off(CUR, s);
+        for p in 0..PL_COUNT {
+            if !get_bit(l1(so), p) {
+                continue;
+            }
+            let r = root_of(p);
+            if PL_RKIND[r] != RK_LOCAL {
+                continue;
+            }
+            let t = slot_of_local(PL_RID[r]);
+            if t < 0 || t == s {
+                continue;
+            }
+            store_deep(t, v);
+            store_through_loans(t, v, depth + 1);
+        }
+    }
+}
+
+// (0.25) A write at node n into a place reached through a view value of
+// origin o, which has no place of its own (`v[i] = w`, `v.as_mut_slice()
+// [i]`): the places at o's level 1 are written, and (v >= 0: a store of
+// origin v) the locals they belong to hold v.
+pub fn write_through_value(o: i64, n: i64, v: i64) {
+    unsafe {
+        if o < 0 {
+            return;
+        }
+        for p in 0..PL_COUNT {
+            if !get_bit(l1(o), p) {
+                continue;
+            }
+            let r = root_of(p);
+            if PL_RKIND[r] != RK_LOCAL {
+                // (the loans are the places written: a parameter's root at
+                // level 1 is what the container's own views point into, an
+                // arena a Vec<T, ScopedArena> is in, not its elements)
+                continue;
+            }
+            // (written through r: a reference r, `self.v[i] = x`, stays
+            // valid, as a write through it does, on_assign)
+            write_place(p, n, H_WRITE, slot_of_place(r));
+            if v >= 0 {
+                let t = slot_of_local(PL_RID[r]);
+                if t >= 0 {
+                    store_deep(t, v);
+                    store_through_loans(t, v, 1);
+                }
+            }
+        }
+    }
+}
+
 fn src_of(n: i64) -> [u8] {
     unsafe {
         let s = NODES[n].start;
@@ -361,6 +481,9 @@ fn put_place(p: i64) {
             own_bytes(SYMS[NODES[STATICS[PL_RID[p]].node].a].text);
         } else if k == RK_MARK {
             own_str(c"?");
+        } else if k == crate::front::own::state::RK_TEMP {
+            own_str(c"the temporary ");
+            own_src(PL_RID[p]);
         } else {
             if PL_FIELD[p] == 1 {
                 own_str(c"*");
@@ -1098,6 +1221,7 @@ pub fn on_assign(p: i64, n: i64, v: i64) {
             if v >= 0 {
                 or_into(l2(slot_off(CUR, vs)), l1(v));
                 or_into(l2(slot_off(CUR, vs)), l2(v));
+                store_through_loans(vs, v, 0);
             }
             return;
         }
@@ -1116,6 +1240,7 @@ pub fn on_assign(p: i64, n: i64, v: i64) {
             if v >= 0 {
                 or_into(l2(slot_off(CUR, s)), l1(v));
                 or_into(l2(slot_off(CUR, s)), l2(v));
+                store_through_loans(s, v, 0);
             }
             return;
         }
@@ -1229,6 +1354,11 @@ fn readonly(n: i64, l: i64, t: i64) {
 fn static_store(p: i64, n: i64, v: i64) {
     unsafe {
         let q = first_place(v, 0 as *i64);
+        // (0.25: a raw pointer is unsafe code's, which vouches for it)
+        let vt = if NODES[n].kind == NodeKind::Assign { NODES[NODES[n].c].ty } else { 0 };
+        if vt > 0 && !is_view_type(vt) {
+            return;
+        }
         if q < 0 || hidden_place(q) || !reporting(n) {
             return;
         }
@@ -1370,6 +1500,13 @@ pub fn on_result(e: i64, v: i64) {
             if s < 0 || (POOL[slot_off(CUR, s) + OV] & F_MUTLOAN) == 0 {
                 continue;
             }
+            // (0.25) what it holds reaches the caller here: a view stored
+            // into it that a later write invalidated is used at the exit
+            // (a local that dies at the return is the escape below)
+            let how = (POOL[slot_off(CUR, s) + OV] >> HOW_SHIFT) & 15;
+            if how != H_SCOPE && how != H_DROP {
+                use_slot(s, e, 0 as *i64);
+            }
             let off = slot_off(CUR, s);
             let m = new_ov();
             or_into(at(m), l2(off));
@@ -1407,6 +1544,10 @@ fn escaping(o: i64, m: *i64) -> i64 {
                 continue;
             }
             let r = root_of(q);
+            if PL_RKIND[r] == crate::front::own::state::RK_TEMP {
+                // (0.25: a temporary dies at its statement's end)
+                return q;
+            }
             if PL_RKIND[r] != RK_LOCAL {
                 continue;
             }
