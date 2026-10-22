@@ -1920,8 +1920,10 @@ default (`--history fast`), runs only the last release's test suite (the
 release that builds HEAD); a suite that passed before for the same tag
 and commit (in the cache) is not run again in either mode.
 `--history full` runs every release's suite: an occasional complete
-replay (with `--clean`, from nothing; `gate.sh --history full --fresh`
-does it on this host and in the x86_64-linux container).
+replay (with `--clean`, from nothing). `gate.sh --history full --fresh`
+runs every suite on this host, but from the cache: `--fresh` empties only
+the x86_64-linux container's volume. On this host a rebuild from nothing
+is the `chain-fresh` step (0.25, below).
 
 Between releases, `tests/fuzz/forever.sh` fuzzes in every mode, batch
 after batch on new seeds, at the lowest priority (nice 19), so the gate's
@@ -1949,6 +1951,91 @@ From 0.16 the gate gives each test program a minute (`VOLE_TEST_TIMEOUT`,
 60; tests/run.sh's own default stays 20 s): its steps run side by side
 with the Linux container, and the heavier examples at -O0 took longer
 than 20 s on a loaded machine (the examples-checkalloc step: 2 minutes).
+
+## Trusting the chain
+
+Every compiler since 0.1.0 was built by the one before it. So a bug, or
+worse, in a compiler that the chain trusted could live on in every later
+one without being in any source. These are the checks against that, and
+what remains trusted.
+
+**The root of trust.**
+- **rustc and cargo**, for the seed: the Rust compiler at the `seed` tag,
+  pinned by its rust-toolchain.toml, with its crates (Cranelift) pinned
+  by Cargo.lock (`--locked`).
+- **git**: the tags' trees, read by `git archive` from the repository's
+  objects.
+- **The OS toolchain:**
+  - `cc` and `ld` link every compiler of the chain. bootstrap.sh links
+    with `cc`, even from 0.25 on.
+  - Up to 0.6, `cc` also assembled the compiler's output; from 0.7 the
+    compiler writes its own objects.
+  - The system's libSystem, or glibc on Linux.
+- **The kernel and the CPU.**
+- **From 0.25, the compiler's own Mach-O linker,** `back/objfile/link_macho.vl`.
+  It links what `volec -o` builds on aarch64-macos: the test suite's
+  programs, examples and users' programs. It does not link the compilers
+  of the chain, which `cc` links. `chain-diverse` links with `cc` too, so
+  neither check depends on the new linker.
+
+Nothing else is trusted: no binary built before, no cache.
+
+**The checks**
+
+| check | what it shows | where |
+|---|---|---|
+| the fixpoint | each compiler, built by its builder and then by itself, emits the same bytes | every bootstrap step |
+| `chain-fresh` | the seed is built again by cargo, and every release again from its tag into an empty cache (`bootstrap.sh --clean --cache DIR --until LAST`). What each release emits for itself is compared by SHA-256 with `bootstrap/chain-hashes/<host>.txt` and with the shared cache | `gate.sh --only chain-fresh`, part of `--release` |
+| `chain-diverse` | HEAD's compiler by three paths: the normal chain (-O2); a path with no optimizer before the last step (the previous release at -O0, then HEAD at -O0, which builds HEAD at -O2); and the chain at -j1. The paths must end in the same bytes, and the -O2-built and -O0-built compilers must give the same output on the whole corpus (`same-output`) | `gate.sh --only chain-diverse`, part of `--release` |
+| `valgrind` | the compiler's own -O2 self-compile (at -j4) and the opt_, own_ and contract_ cases plus examples, under memcheck: no invalid read or write, no use of an uninitialised value | aarch64-linux container, `--release` |
+| `compiler-memcheck` | the same set on macOS, two ways. With the compiler built `--check-alloc`, a use after free or double free of Gpa memory stops it. Under Guard Malloc, the same for the memory it takes from malloc itself. The objects must be the plain compiler's | every gate but `--quick` |
+| `stress-grow` | with every table growth moving and poisoning the old block, the self-compile is the same and the suite passes | every gate but `--quick` |
+| `fuzz-seed` | random programs give the same output from the seed, the oracle written in Rust, as from HEAD | every gate |
+
+**chain-fresh's record.** A release adds its line when it is tagged, with
+`bootstrap/chain-fresh.sh --record`. The first record (0.25) was written
+from the long-lived shared cache. The first fresh run then confirms that
+the cache holds what the tags rebuild to. A mismatch is not to be
+re-recorded: find which release differs, and why.
+
+**chain-diverse's argument** (after Wheeler's diverse double-compiling):
+- A3 is what the normally built compiler A2 emits for HEAD at -O2.
+- B3 is what B2 emits for the same input. B2 is a HEAD compiler that no
+  optimizer touched.
+- If an optimizer bug had miscompiled the compiler in a way that changes
+  what it does, A3 and B3 would differ.
+
+For both to be wrong the same way, the -O0 back ends of the previous
+release and of HEAD would both have to miscompile HEAD into the same
+wrong behaviour as the optimizer did. The corpus comparison widens this
+check from the compiler's own source to every program in the corpus.
+
+**The stricter checker as an audit of the compiler** (from 0.25, as
+the semantics fixes merge). When a fix makes the checker reject code it
+used to accept, it checks compiler/src and compiler/std too.
+
+Every site it rejects in the compiler is a place where the compiler may
+have had latent undefined behaviour: a view outliving its buffer, an
+exclusivity violation, a missing drop. Its own builds would not have
+shown it. For each site:
+1. **Record it** in the fix's commit message or in a list in its PR:
+   the error's code, the file and line, and the item.
+2. **Review it before changing it.** Read the code through
+   `volec query context`, and decide whether the rejected pattern was
+   only unprovable or could actually misbehave: which input, which
+   path, what happens.
+3. **For a real case:**
+   - write a test that showed it, if one can (a compilation whose output
+     was wrong, or a memcheck failure);
+   - check whether a release shipped it; for one that did, `chain-diverse`
+     and `same-output` against that release tell whether any output
+     changed.
+4. **Only then patch it.** Do not satisfy the checker by mechanical
+   rewrites (an `unsafe` block, a copy, a reordered borrow) without
+   steps 2 and 3. `fix --suggested` must not be applied blindly to
+   compiler/src for these codes.
+5. **Summarize** in the release notes: how many sites, and how many were
+   real.
 
 ## Adding a host
 

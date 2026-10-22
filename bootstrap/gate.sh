@@ -57,6 +57,15 @@
 # release's, 0.21.1: fails above 1.5x, 1.5x and 1.15x);
 # valgrind (tests/valgrind.sh: the compiler under memcheck, 0.18.1; run by
 # --release in the linux-aarch64 container, where valgrind is);
+# compiler-memcheck (tests/compiler_memcheck.sh: the compiler built with
+# --check-alloc, and under Guard Malloc, on its self-compile and a sample
+# of the suite, 0.25);
+# chain-diverse (bootstrap/chain-diverse.sh: HEAD's compiler by the
+# normal chain, by a path without the optimizer and at -j1, the same
+# bytes and the same output on the corpus, 0.25; --release);
+# chain-fresh (bootstrap/chain-fresh.sh: the seed and every release
+# rebuilt from their tags into an empty cache, compared with
+# bootstrap/chain-hashes/, 0.25; --release);
 # linux-x86_64 (bootstrap/linux-check.sh); linux-aarch64
 # (bootstrap/aarch64-linux-check.sh); bench.
 #
@@ -180,7 +189,10 @@ esac
 
 FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-seed"
 ABI_STEPS="abi-plain abi-import abi-header"
-HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc voltty-fuzz compile-cost"
+HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost"
+# (0.25) the chain's integrity, by --release (or --only): slow, and they
+# rebuild compilers rather than test one
+RELEASE_STEPS="chain-diverse chain-fresh"
 LINUX_STEPS="linux-x86_64 linux-aarch64"
 # (steps only --only names: valgrind runs in the linux-aarch64 container)
 OTHER_STEPS="valgrind"
@@ -189,12 +201,13 @@ case "$MODE" in
     quick) STEPS="suite-O2 $FUZZ_STEPS abi-plain threads incremental objcheck-x86-arch voltty-fuzz compile-cost" ;;
     *) STEPS="$HOST_STEPS"; [ $LINUX -eq 1 ] && STEPS="$STEPS $LINUX_STEPS" ;;
 esac
+[ "$MODE" != release ] || STEPS="$STEPS $RELEASE_STEPS"
 if [ -n "$ONLY" ]; then
     # (every known step that one of the patterns matches; the patterns are
     # not file names)
     set -f
     selected=""
-    for s in $HOST_STEPS $LINUX_STEPS $OTHER_STEPS bench; do
+    for s in $HOST_STEPS $RELEASE_STEPS $LINUX_STEPS $OTHER_STEPS bench; do
         for p in $(echo "$ONLY" | tr ',' ' '); do
             # shellcheck disable=SC2254
             case "$s" in $p) selected="$selected $s"; break ;; esac
@@ -203,7 +216,7 @@ if [ -n "$ONLY" ]; then
     for p in $(echo "$ONLY" | tr ',' ' '); do
         [ "$p" = chain ] && continue
         found=0
-        for s in $HOST_STEPS $LINUX_STEPS $OTHER_STEPS bench; do
+        for s in $HOST_STEPS $RELEASE_STEPS $LINUX_STEPS $OTHER_STEPS bench; do
             # shellcheck disable=SC2254
             case "$s" in $p) found=1 ;; esac
         done
@@ -379,6 +392,11 @@ run_step() {
             done
             echo "stress-grow: the self-compile is the same; the suite passes at -O0 and -O2" ;;
         valgrind) sh "$ROOT/tests/valgrind.sh" -c "$C" ;;
+        compiler-memcheck) sh "$ROOT/tests/compiler_memcheck.sh" -c "$C" ;;
+        chain-diverse)
+            previous=$(find_previous_release)
+            sh "$ROOT/bootstrap/chain-diverse.sh" ${previous:+-p "$previous"} -w "$RUN/chain-diverse" ;;
+        chain-fresh) sh "$ROOT/bootstrap/chain-fresh.sh" -w "$RUN/chain-fresh" --history "$HISTORY" ;;
         compile-cost)
             previous=$(find_previous_release)
             sh "$ROOT/tests/compile_cost.sh" -c "$C" ${previous:+-p "$previous"} ;;
@@ -550,8 +568,8 @@ note_of() {
     case "$1" in
         chain) awk '/^  head / { sub(/^  head +/, ""); print; exit }' "$l" ;;
         suite-*) awk '$1 == "total" { printf "%d passed, %d xfail, %d failed\n", $2, $3, $4 }' "$l" ;;
-        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind)
-            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind):' "$l" | tail -1 ;;
+        fuzz-*|abi-*|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-*)
+            grep -E '^(fuzz|abi|objcheck|objcheck-*|layout|debug|threads|incremental|stress-grow|examples-checkalloc|valgrind|compiler-memcheck|chain-diverse|chain-fresh):' "$l" | tail -1 ;;
         voltty-fuzz) grep -E '^(pass|FAIL|skip) oracle' "$l" | tail -1 ;;
         compile-cost) awk '$2 ~ /^[0-9.]+$/ && $3 == "M" { printf "%s%s %s M %s", sep, $1, $2, $8; sep = ", " } END { print "" }' "$l" ;;
         linux-*) grep '^gate-row' "$l" | awk -F'\t' '$3 != "pass" && $3 != "skip" { bad = bad " " $2 } END { n = NR; print n " steps in the container" (bad == "" ? "" : "; failed:" bad) }' ;;
@@ -593,7 +611,7 @@ for s in $([ $CHAIN -eq 1 ] && echo chain) $STEPS $([ $BENCH -eq 1 ] && echo ben
     [ -f "$l" ] || { echo "    not run (the chain failed)"; continue; }
     case "$s" in
         suite-*|examples-checkalloc) awk '/^tests for / { exit } { print }' "$l" | head -60 ;;
-        fuzz-*|abi-*|objcheck|objcheck-*|threads|incremental|voltty-fuzz) grep -E '^FAIL' "$l" | head -20; [ -d "$RUN/failures/$s" ] && echo "    kept in $RUN/failures/$s" ;;
+        fuzz-*|abi-*|objcheck|objcheck-*|threads|incremental|voltty-fuzz|compiler-memcheck|chain-*) grep -E '^FAIL' "$l" | head -20; [ -d "$RUN/failures/$s" ] && echo "    kept in $RUN/failures/$s" ;;
         compile-cost) cat "$l" ;;
         linux-*) awk '/^--- / { p = 1 } p' "$l" | head -80; grep -q '^--- ' "$l" || tail -30 "$l" ;;
         *) tail -30 "$l" ;;
