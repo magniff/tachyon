@@ -67,16 +67,16 @@ note rewrite.imports: removed 1 import the rewrite left unused
 $ volec rewrite 'buf_add_int(&$b, $n)' '$b.push_int($n)'
 rewrote 10 sites in 1 file	report.vl	+11 -11 lines
 note rewrite.imports: removed 1 import the rewrite left unused
-$ volec rewrite 'vec_at($v, $i)' '$v.get($i)' --show
+$ volec rewrite 'vec_at($v, $i)' '$v[$i]' --show
 rewrote 3 sites in 2 files	2 files	+3 -6 lines
 // report.vl:4: 1 line removed after line 4
 // report.vl:32
-32	        let c = top.get(i);
+32	        let c = top[i];
 // stats.vl:4: 2 lines removed after line 4
 // stats.vl:64
-64	        out.push(v.get(i));
+64	        out.push(v[i]);
 // stats.vl:73
-73	        if v.get(i).n == 1 {
+73	        if v[i].n == 1 {
 note rewrite.imports: removed 2 imports the rewrite left unused
 ```
 
