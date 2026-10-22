@@ -35,7 +35,7 @@ are the way they are. It is not a specification. For precise rules, see
 4. [Value semantics: let, inout, sink](04-value-semantics.md) *(outline)*
 5. [Structs, enums and pattern matching](05-structs-enums-match.md) *(outline)*
 6. [Errors: Option, Result and panics](06-errors.md) *(outline)*
-7. [Collections and text](07-collections-and-text.md) *(outline)*
+7. [Collections and text](07-collections-and-text.md)
 8. [Allocation: where memory comes from](08-allocation.md) *(outline)*
 9. [Traits and generics](09-traits-generics.md) *(outline)*
 10. [Closures and iterators](10-closures-iterators.md) *(outline)*
