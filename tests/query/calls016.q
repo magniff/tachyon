@@ -21,7 +21,7 @@ $ callees main
 1	call	apply	calls016/main.vl:21
 1	call	sum	calls016/main.vl:11
 1	ref	twice	calls016/main.vl:25
-1	call	std::fmt::print_int	<std>:10886
+1	call	std::fmt::print_int	<std>:10892
 ## main reaches a borrow of TABLE (put takes it by pointer) and a write of
 ## a field of it; sum reaches neither.
 $ callees main --writes TABLE

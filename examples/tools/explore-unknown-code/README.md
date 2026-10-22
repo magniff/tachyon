@@ -42,7 +42,7 @@ generated header:
 ```console
 $ volec query items
 crate	main.vl	6
-std	<std>	593
+std	<std>	603
 crate::graph	graph.vl	11
 crate::heap	heap.vl	7
 crate::network	network.vl	2
@@ -188,7 +188,7 @@ crate::heap::pop	heap.vl:35:8	fn	pub fn pop(h: inout MinHeap) -> Option<Entry>
 crate::graph::edges_from	graph.vl:55:8	fn	pub fn edges_from(g: Graph, i: i64) -> [Edge]
 crate::heap::push	heap.vl:22:8	fn	pub fn push(h: inout MinHeap, e: Entry)
 std::Vec::set	<std>:311:12	method	pub fn set(inout self, i: i64, x: sink T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
-std::Vec::filled_in	<std>:1490:12	method	pub fn filled_in(n: i64, x: sink T, a: sink A) -> Vec<T, A>
+std::Vec::filled_in	<std>:1516:12	method	pub fn filled_in(n: i64, x: sink T, a: sink A) -> Vec<T, A>
 std::Option::unwrap	<std>:129:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
 // callers (1)
 plan	main.vl:20:11	match quickest(g, a, b, gpa) {
