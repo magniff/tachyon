@@ -186,9 +186,23 @@ The three kinds of 0.17 (§2.1 there) decide what each convention costs:
   owned types. `fn add(v: inout Vec<Item>, it: Item)` is right for a
   view-holding `Item`: `push` takes `x: sink T`, and a copyable value
   passes from a let binding to a sink by copy.
-- A `let` argument of an owned type that is a temporary (`total(make())`)
-  is dropped after the call, at the end of the statement, as
-  temporaries are today.
+- **Temporaries (0.25).** An owned temporary is dropped at the end of
+  its full statement, unless it is moved, or is viewed by a binding that
+  outlives the statement. A viewed temporary lives until the end of its
+  block (`let s = mk().view();`). On an early exit (`?`, `return`,
+  `break`) every temporary already evaluated is dropped exactly once.
+  Temporaries drop in the reverse of the order they were made. This
+  covers a value given to a let parameter (`total(make())`, of a
+  function, a method, a generic function, an operator's impl), a
+  receiver (`make().len()`, `v.clone().len()`), a part read or moved out
+  of one (`make().id`, `make().a`, `make().1`, `make()[1]`; the rest drops
+  with the statement), a scrutinee no arm takes a part of (`match make()
+  { E::A(_) => .. }`), `let _ = make()` (at once, as `make();`), and a
+  value an argument moves into a callee while a later argument may leave
+  the statement (`two(mk(1), g()?)`: dropped if `?` returns, the callee's
+  if the call is made). A view of a temporary used after the temporary
+  is dropped is `own.escape`, naming the temporary; in a loop each
+  iteration's temporary is its own.
 
 ### 2.3 What a convention means to the own pass
 
@@ -1492,9 +1506,10 @@ gate with the rehearsal (§9.3 step 7).
   Anything else is taken as `&T`. In a 0.20 file an unwritten convention
   is let; in a mixed file it keeps 0.19's by-value meaning.
 - **Temporaries.** A value passed to a let parameter that borrows
-  (`total(make())`) becomes a temporary of the statement. temps.vl
-  does this for calls of non-generic functions named by an identifier;
-  method calls and generic callees do not get it yet.
+  (`total(make())`) becomes a temporary of the statement (§2.2). Since
+  0.25 the checker lends it at any call, method and generic callee
+  included (generics::check_call_arg), and front/own/drops.vl keeps it
+  to the statement's end.
 - **`let x = part;`** in a 0.20 file borrows (D13) when the part is an
   element, a dereference, or a field reached through one. `var x =
   part` stays `own.move_out`.
@@ -1732,4 +1747,40 @@ Left, for after 0.25 (soundness first):
   safe default): dropping it would free those copies, the map's elements,
   in `m.iter().fold(..)` and `map`.
 - A value given to a generic let parameter after an impure argument is
-  not made a temporary ("this value has no place").
+  not made a temporary ("this value has no place"). (Done in 0.25.)
+
+### 0.25 (branch fix25f): one rule for temporaries
+
+The rule is §2.2's "Temporaries". It is implemented once, in
+front/own/drops.vl's statement temporaries (0.20's machinery, which
+receivers and field reads already used): each temporary gets a hidden
+local, a drop flag and a `defer` in its statement's prelude, so the
+statement's end and every early exit drop what was made, once. What
+changed:
+- check/temps.vl no longer hoists let arguments, `x?` arguments and
+  generic let arguments into `let`s of the block (they lived to the
+  block's end, and could not be made after an impure argument:
+  `peek(mk(1)) + peek(mk(2))` was "cannot take address of non-lvalue");
+  the checker lends a value given to a let parameter where it stands
+  (check_mode::LET_ARG), method calls and generic callees included.
+- The temporary's block gives `&__own_tv` and is no scope of its own in
+  the own walk: views of the temporary are views of a local that lives
+  as long as the statement (or the block, for a `let` of a view), so a
+  view kept longer is own.escape (`keep = mk().view();` in an inner
+  block, `keep.push(mk(c).nm())` in a loop were accepted: a use after
+  free, and every element viewing one reused slot). A temporary without
+  glue that is lent (`E { .. }.nm()`) gets such a local too.
+- An operator's operands an impl reads (`==l`, `==r`) that are owned
+  temporaries are kept and dropped (they were never dropped).
+- A part moved out of a temporary leaves the rest to drop
+  (part_drops); by a run-time index of an array temporary it is
+  own.partial.
+- A temporary scrutinee no arm takes a part of is matched in place and
+  dropped with the statement; `let _ = make()` drops at once, and `let _
+  = x` of an owned place moves nothing.
+- An owned argument a callee takes is held as a temporary when a later
+  argument may leave the statement; its flag is cleared once the last
+  argument is evaluated (hold_args).
+- `clone`, and a generic result whose type arguments have no glue
+  (`String::from_in(..)`), make a new value: a receiver of a std method
+  that is one is dropped (`v.clone().len()` leaked).

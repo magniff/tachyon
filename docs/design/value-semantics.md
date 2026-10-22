@@ -101,7 +101,7 @@ There is no `Copy` derive. "Plain" is structural, so a struct copies if and only
 - **`Drop`.** `trait Drop { fn drop(self: &mut Self); }` is in the prelude. A type without an impl gets generated *drop glue*: field by field for structs and tuples, a `match` for enums, a loop for arrays (none when `needs_drop::<T>()` is false), and the owned captures of a closure. Calling `x.drop()` directly is an error (`try: drop(x)`). `std::drop(x: T)` consumes. `std::forget(x)` is safe: leaks are not UB, and `--check-alloc` lists them. **A view type may not implement `Drop`.** This removes Rust's dropck problem: no destructor can read a view whose owner died first.
 - **When drops run.** At scope end, in reverse declaration order, interleaved with `defer`s as if each owned `let` registered one. They run on every exit: block end, `return`, `break`, `continue`, `?`.
   - They do not run on `exit` or a failed check (exit 101), which is today's defer rule.
-  - Temporaries drop at the end of their statement.
+  - Temporaries drop at the end of their statement (0.25: the whole rule, conventions.md §2.2 "Temporaries").
   - Assigning an owned place evaluates the right side, drops the old value, then writes (the grammar's existing order). The corpus has 48 such assignments (§8.3), so this is in 0.17.0.
   - A conditionally moved local carries a drop flag (8 locals in the corpus).
   - Statics are never dropped.
@@ -904,7 +904,7 @@ Phase 0 fixed the interfaces below; T1–T6 build against them in parallel. A ta
 - **Node flags** taken: bits 56–62 (`GLUE_MATCH`, `ASSIGN_OLD`, `MATCH_BYREF`, `NO_DROP`, `ARM_DROPS_DONE`, `PARAM_DROPS_DONE`, `ARM_FOR_NEXT`).
 - **std.** `std::replace` moves the old value out and the new one in through a raw pointer. Otherwise the assignment desugaring would drop the value it returns.
 - **Not done (0.17.1):**
-  - owned temporaries other than `e;` (method receivers, `let _ = e`);
+  - owned temporaries other than `e;` (method receivers, `let _ = e`; done in 0.20 and 0.25);
   - by-value closure parameters;
   - assignments through an index;
   - the error for calling `x.drop()` directly.
