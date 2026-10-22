@@ -6,7 +6,7 @@
 use crate::base::{
     BUFS, FILES, FILE_COUNT, IntVec, SRC, SRC_LEN, STDERR, STDOUT, SYMS, _longjmp, alloc_array,
     alloc_zeroed, buf_byte, buf_bytes, buf_clear, buf_fmt, buf_int, buf_new, buf_slice, buf_str,
-    buf_write_fd, cstr, exit, fmt_end, fmt_scratch, free, intern,
+    buf_write_fd, cstr, exit, fmt_end, fmt_scratch, free, intern, memcpy,
 };
 use crate::base::json::{DIAG_JSON, json_diagnostic};
 use crate::front::generics::instantiate::instantiation_notes;
@@ -780,7 +780,7 @@ pub fn err_end() -> ! {
             buf_write_fd(out, STDOUT);
             exit(0);
         }
-        record_error(error_text());
+        record_error_text();
         err_jump()
     }
 }
@@ -805,7 +805,10 @@ pub fn err_jump() -> ! {
 pub fn err_end_text(pos: i64, out: i64) -> ! {
     err_begin(pos);
     buf_bytes(ERR, buf_slice(out));
-    record_error(out);
+    let key = error_key();
+    if key >= 0 {
+        record_error(key, out);
+    }
     err_jump()
 }
 
@@ -839,22 +842,32 @@ fn error_text() -> i64 {
     }
 }
 
-// Records the error being made (its text in `out`), unless it names the
-// error type or is already recorded: the same message at the same
-// position (a generic function is checked per instance; 0.10).
-fn record_error(out: i64) {
+// The key of the error being made, or -1 when it is not to be recorded:
+// it names the error type, or it is already recorded (the same message at
+// the same position: a generic function is checked per instance; 0.10).
+// (0.25) Asked before its text is made: a query checks the generic
+// functions no one instantiates, and a repeated error is not formatted.
+fn error_key() -> i64 {
     unsafe {
         if ERR_POISONED {
-            return;
+            return -1;
         }
         let key = intern(buf_slice(ERR));
         var i = 0;
         while i < ERROR_KEYS.count {
             if ERROR_KEYS.data[i] == ERR_POS && ERROR_KEYS.data[i + 1] == key {
-                return;
+                return -1;
             }
             i += 2;
         }
+        key
+    }
+}
+
+// Records the error being made (its text in `out`), under key (from
+// error_key).
+fn record_error(key: i64, out: i64) {
+    unsafe {
         ERROR_KEYS.push(ERR_POS);
         ERROR_KEYS.push(key);
         ERRORS.push(ERR_POS);
@@ -871,11 +884,20 @@ fn record_error(out: i64) {
     }
 }
 
+// Records the error being made, its text made by error_text, unless
+// error_key says not to.
+fn record_error_text() {
+    let key = error_key();
+    if key >= 0 {
+        record_error(key, error_text());
+    }
+}
+
 // Like err_end, but the work goes on after the error (0.10): for errors
 // that leave nothing undone, or whose callers make do (an unknown type is
 // the error type, a duplicate is left out...).
 pub fn err_end_soft() {
-    record_error(error_text());
+    record_error_text();
     if ERROR_COUNT >= MAX_ERRORS {
         exit_if_errors();
     }
@@ -918,25 +940,88 @@ pub fn err_failed_name(name: i64) {
     }
 }
 
+// ---- Lines and columns (0.25) ----
+
+// The line starts of each file, made on first use and read only as far
+// as the positions asked for: a position's line is found by halves, not
+// counted from its file's start. (A query's errors in std, one file of
+// 48k lines, each counted its lines from the start: 37% of a cold query.)
+struct LineIndex { src: *u8, start: i64, scanned: i64, starts: IntVec }
+
+static var LINE_INDEX: *LineIndex = 0 as *LineIndex;
+static var LINE_INDEX_CAP: i64 = 0;
+
+extern "C" {
+    fn memchr(s: *u8, c: i32, n: u64) -> *u8;
+}
+
+// The line (from 1) of position pos in file `file`, and its column
+// (from 1) through `col`: as counted from the file's start up to pos,
+// and not past the end of SRC.
+pub fn file_line_col(file: i64, pos: i64, col: inout i64) -> i64 {
+    unsafe {
+        let start = FILES[file].start;
+        let p = if pos < SRC_LEN { pos } else { SRC_LEN };
+        if p <= start {
+            col = 1;
+            return 1;
+        }
+        if file >= LINE_INDEX_CAP {
+            let cap = if FILE_COUNT > file { FILE_COUNT } else { file + 1 };
+            let grown = alloc_zeroed(cap * size_of(LineIndex)) as *LineIndex;
+            if LINE_INDEX_CAP > 0 {
+                memcpy(grown as *u8, LINE_INDEX as *u8,
+                    (LINE_INDEX_CAP * size_of(LineIndex)) as u64);
+                free(LINE_INDEX as *u8);
+            }
+            LINE_INDEX = grown;
+            LINE_INDEX_CAP = cap;
+        }
+        let x = &LINE_INDEX[file] as *LineIndex;
+        // (the sources are only added to, so a file's text is the same
+        // while SRC is; SRC changes when they grow, and while `fmt` lexes
+        // a text of its own)
+        if (*x).src != SRC || (*x).start != start {
+            (*x).src = SRC;
+            (*x).start = start;
+            (*x).scanned = start;
+            (*x).starts.count = 0;
+            (*x).starts.push(start);
+        }
+        while (*x).scanned < p {
+            let at = (*x).scanned;
+            let found = memchr(&SRC[at], '\n' as i32, (p - at) as u64);
+            if found == 0 as *u8 {
+                (*x).scanned = p;
+            } else {
+                let nl = at + (found as i64 - &SRC[at] as i64);
+                (*x).starts.push(nl + 1);
+                (*x).scanned = nl + 1;
+            }
+        }
+        // the last line start at or before p
+        let starts = (*x).starts.data;
+        var lo = 0;
+        var hi = (*x).starts.count;
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if starts[mid] <= p {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        col = p - starts[lo] + 1;
+        lo + 1
+    }
+}
+
 // `<file>: line <line>, column <column>` of position pos.
 pub fn buf_position(out: i64, pos: i64) {
     unsafe {
-        var file = 0;
-        while file + 1 < FILE_COUNT && pos >= FILES[file + 1].start {
-            file += 1;
-        }
-        var line = 1;
+        let file = file_at(pos);
         var col = 1;
-        var i = FILES[file].start;
-        while i < pos && i < SRC_LEN {
-            if SRC[i] == '\n' {
-                line += 1;
-                col = 1;
-            } else {
-                col += 1;
-            }
-            i += 1;
-        }
+        let line = file_line_col(file, pos, &col);
         // (0.16: a module next to a root given without a directory is
         // `x.vl`, not `./x.vl`)
         let path = FILES[file].path;
@@ -947,21 +1032,8 @@ pub fn buf_position(out: i64, pos: i64) {
 
 // (0.17) The line of position pos in its file.
 pub fn pos_line(pos: i64) -> i64 {
-    unsafe {
-        var file = 0;
-        while file + 1 < FILE_COUNT && pos >= FILES[file + 1].start {
-            file += 1;
-        }
-        var line = 1;
-        var i = FILES[file].start;
-        while i < pos && i < SRC_LEN {
-            if SRC[i] == '\n' {
-                line += 1;
-            }
-            i += 1;
-        }
-        line
-    }
+    var col = 1;
+    file_line_col(file_at(pos), pos, &col)
 }
 
 // (0.17) `FILE:LINE` of position pos, as the tools take an item's
