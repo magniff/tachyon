@@ -152,10 +152,10 @@ program as it is does not compile: the first four bugs are errors.
 
 ```console
 $ volec check main.vl
-main.vl:27:9: error[own.moved] 'counts' is used here after it moved at 22:48 | help: use it before the move, pass a copy where it moves ('.clone()'), or let the callee borrow it: a let parameter ('x: T'), not 'sink' | try: volec edit patch main.vl:22 --old 'let shelf = Shelf { name: "fruit", counts: counts };' --new 'let shelf = Shelf { name: "fruit", counts: counts.clone() };'
+main.vl:27:9: error[own.moved] 'counts' is used here after it moved at 22:48 | help: use it before the move, pass a copy where it moves ('.clone()'), or let the callee read it: a let parameter ('x: T'), not 'sink' | try: volec edit patch main.vl:22 --old 'let shelf = Shelf { name: "fruit", counts: counts };' --new 'let shelf = Shelf { name: "fruit", counts: counts.clone() };'
 main.vl:42:5: error[own.conflict] 'v.push(40)' may change 'v' while 'first' (main.vl:41:9) views it; 'first' is used at main.vl:47:26 | help: use the view before the change, keep an index instead of a view, or keep a copy | try: volec edit patch slice_after_push --old 'v.as_slice()' --new 'v.clone()' | try: volec query own main.vl:47:26
 main.vl:66:13: error[own.escape] 'closure(ScopedArena) -> [i64] at main.vl:63:34' returns a view of 'v', which is dropped when 'closure(ScopedArena) -> [i64] at main.vl:63:34' returns | help: return the owner itself; a caller that wants a view takes '.as_slice()' of it | try: volec edit patch closure(ScopedArena) -> [i64] at main.vl:63:34 --old '-> [i64]' --new '-> Vec<i64, ScopedArena>' --old 'v.as_slice()' --new 'v'
-main.vl:78:5: error[own.moved] 'counts' is used here after it moved at 76:48 | help: use it before the move, pass a copy where it moves ('.clone()'), or let the callee borrow it: a let parameter ('x: T'), not 'sink' | try: volec edit patch main.vl:76 --old 'var shelf = Shelf { name: "tools", counts: counts };' --new 'var shelf = Shelf { name: "tools", counts: counts.clone() };'
+main.vl:78:5: error[own.moved] 'counts' is used here after it moved at 76:48 | help: use it before the move, pass a copy where it moves ('.clone()'), or let the callee read it: a let parameter ('x: T'), not 'sink' | try: volec edit patch main.vl:76 --old 'var shelf = Shelf { name: "tools", counts: counts };' --new 'var shelf = Shelf { name: "tools", counts: counts.clone() };'
 [exit 1]
 ```
 
