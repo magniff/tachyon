@@ -46,6 +46,7 @@ use crate::front::ast::{
 use crate::front::check::{LOCALS, Res};
 use crate::front::check::unsafety::{NODE_NO_READ, is_borrow, is_borrow_param};
 use crate::front::closures::{CLOSURES, CLOSURE_COUNT};
+use crate::front::contracts::checks::CHECK_FN;
 use crate::front::effects::{
     ALLOC_ANY, EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_RAW_DIVERGE,
     EFF_RAW_GLOBAL, EFF_RAW_PANIC, EFF_SYNC, EFF_TLS, EFF_UNKNOWN, EFF_UNSAFE, Effects, FN_EFFECTS,
@@ -53,6 +54,7 @@ use crate::front::effects::{
 };
 use crate::front::effects::builtin::unknown_c_effects;
 use crate::front::effects::check::extern_effects;
+use crate::front::lexer::Tok;
 use crate::front::modules::{STD_MODULE, qualify, within_std};
 use crate::front::modules::lookup::std_item_key;
 use crate::front::threadlocal::is_thread_local;
@@ -132,6 +134,10 @@ static var SEARCH_ALLOC: i64 = 0;
 pub static var FOUND_NODE: i64 = 0;
 pub static var FOUND_CALLEE: i64 = -1;
 pub static var FOUND_KIND: i64 = 0;
+
+// (0.25) Evaluation mode (expr_effects): the walk adds what a call brings
+// (its callee's inferred effects) to ACC instead of making edges.
+static var EVAL: bool = false;
 
 // Function f's body failed to check (check_function_recovering): its
 // effects are ⊤.
@@ -494,6 +500,17 @@ fn call_edge(n: i64, to: i64, kind: i64, add: i64) {
             }
             return;
         }
+        if EVAL {
+            // (expr_effects: the callee's effects now; -1: no function of
+            // that fn type is reached)
+            if to < 0 || to >= GRAPH_SIZE {
+                return;
+            }
+            let e = through(NODE_FX[to], kind, add);
+            ACC.bits |= e.bits;
+            ACC.allocs |= e.allocs;
+            return;
+        }
         push_edge(to, kind, add);
     }
 }
@@ -658,7 +675,7 @@ fn walk_ident(n: i64) {
         if f < 0 {
             return;
         }
-        if !SEARCH {
+        if !SEARCH && !EVAL {
             ADDRESS_TAKEN.push(NODES[n].ty);
             ADDRESS_TAKEN.push(f);
         }
@@ -696,6 +713,15 @@ fn walk_call(n: i64) {
         let f = NODES[n].x - 1;
         if f >= 0 {
             walk_list(n);
+            if f == CHECK_FN {
+                // (an assertion or a clause, lowered in place as a branch
+                // to the failure: it may panic unless its condition is
+                // true as written, and its body is not called)
+                if !proven_true(child(n, 0)) {
+                    local(n, EFF_PANIC, 0);
+                }
+                return;
+            }
             let info = callee_info(f);
             if (info & CALL_UNSAFE) != 0
                 || (info >> BORROW_SHIFT) != 0 && raw_to_borrow(n, f, info) {
@@ -718,18 +744,80 @@ fn walk_call(n: i64) {
         if TYPES[t].b != 0 {
             // (an `extern "C" fn` value: C, unknown)
             local(n, EFF_UNSAFE, 0);
-            if SEARCH {
+            if EVAL && C_UNKNOWN < 0 {
+                local(n, unknown_c_effects().bits, 0);
+            } else if SEARCH || EVAL {
                 call_edge(n, C_UNKNOWN, E_CALL, 0);
             } else {
                 call_edge(n, c_unknown_node(), E_CALL, 0);
             }
             return;
         }
-        if SEARCH {
+        if SEARCH || EVAL {
             call_edge(n, dispatch_of(t), E_CALL, 0);
         } else {
             call_edge(n, dispatch_node(t), E_CALL, 0);
         }
+    }
+}
+
+// (0.25) Whether condition n is true as written: `true`, or `!`, `&&` and
+// `||` of such, or a comparison of integer literals (an assertion that
+// cannot fail does not panic).
+pub fn proven_true(n: i64) -> bool {
+    const_bool(n, 0) == 1
+}
+
+// The value of condition n as written: 1 true, 0 false, -1 not known.
+fn const_bool(n: i64, depth: i64) -> i64 {
+    unsafe {
+        if n <= 0 || depth > 16 {
+            return -1;
+        }
+        let kind = NODES[n].kind;
+        if kind == NodeKind::Bool {
+            return if NODES[n].a != 0 { 1 } else { 0 };
+        }
+        if kind == NodeKind::Unary && NODES[n].op == Tok::Bang {
+            let v = const_bool(NODES[n].b, depth + 1);
+            return if v < 0 { -1 } else { 1 - v };
+        }
+        if kind != NodeKind::Binary {
+            return -1;
+        }
+        let op = NODES[n].op;
+        let l = NODES[n].b;
+        let r = NODES[n].c;
+        if op == Tok::AmpAmp || op == Tok::PipePipe {
+            let a = const_bool(l, depth + 1);
+            let b = const_bool(r, depth + 1);
+            if op == Tok::AmpAmp {
+                return if a == 0 || b == 0 { 0 } else if a == 1 && b == 1 { 1 } else { -1 };
+            }
+            return if a == 1 || b == 1 { 1 } else if a == 0 && b == 0 { 0 } else { -1 };
+        }
+        if NODES[l].kind != NodeKind::Int || NODES[r].kind != NodeKind::Int {
+            return -1;
+        }
+        let x = NODES[l].a;
+        let y = NODES[r].a;
+        var t = false;
+        if op == Tok::EqEq {
+            t = x == y;
+        } else if op == Tok::BangEq {
+            t = x != y;
+        } else if op == Tok::Lt {
+            t = x < y;
+        } else if op == Tok::LtEq {
+            t = x <= y;
+        } else if op == Tok::Gt {
+            t = x > y;
+        } else if op == Tok::GtEq {
+            t = x >= y;
+        } else {
+            return -1;
+        }
+        if t { 1 } else { 0 }
     }
 }
 
@@ -1055,5 +1143,27 @@ pub fn find_step(f: i64, bit: i64, alloc: i64) {
         }
         walk(NODES[FNS[f].node].c);
         SEARCH = false;
+    }
+}
+
+// (0.25) The effects of expression n of a checked body, once inferred
+// (FN_EFFECTS): its own and those of the functions it calls, directly or
+// through fn values (contracts' conditions, check_contracts); a closure's
+// body is its own function, not part of n.
+pub fn expr_effects(n: i64) -> Effects {
+    unsafe {
+        if n <= 0 || NODE_FX == 0 as *Effects {
+            return effects_top();
+        }
+        let saved = ACC;
+        let mark = LOOPS.count;
+        ACC = effects_none();
+        EVAL = true;
+        walk(n);
+        EVAL = false;
+        LOOPS.count = mark;
+        let e = ACC;
+        ACC = saved;
+        e
     }
 }

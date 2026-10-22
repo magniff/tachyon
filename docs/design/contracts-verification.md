@@ -268,7 +268,13 @@ analysis (§2.5).
 - A requires check adds `panic` to the caller, unless the front end folds it to
   true for constant arguments.
 - An ensures adds `panic` to the callee.
+- An assertion (`assert`, `assert_eq`, `assert_ne`, and `debug_assert` in
+  test builds) adds its operands' effects and `panic`, unless its
+  condition is true as written (`assert(true)`, literals compared); it
+  never makes the effects unknown (0.25).
 - `debug` clauses add nothing outside test builds.
+- A condition's calls through fn values count, closed world: what every
+  function of that type whose address is taken may do (0.25).
 - `query effects --why panic` names the clause: `requires 'i < self.len()' of
   'get' at main.vl:14:13`.
 

@@ -10,7 +10,9 @@ of an `unsafe fn`:
   an `extern "C" fn` pointer) or an `unsafe fn`;
 - dereferencing a raw pointer: `*p`, `p.f`, a method called through `p`;
 - indexing or slicing a raw pointer: `p[i]`, `p[lo..hi]` (unchecked);
-- casting an integer to a pointer (except the literal `0`, null);
+- casting an integer to a pointer (except the literal `0`, null), in a
+  static's or a constant's initializer too: `static P: *u8 = unsafe {
+  4096 as *u8 };`;
 - reading a union's field;
 - using an `unsafe fn` as a value.
 
