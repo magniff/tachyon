@@ -13,46 +13,47 @@ pub const OWN_COUNT: i64 = 9;
 pub static OWN_TABLE: [Explain; 9] = [
     Explain {
         code: "own.moved",
-        severity: "error (--values=error, the 0.17 default; a warning with warn, a note with report)",
+        severity: "error (--values=error, the default; a warning with warn, a note with report)",
         means: "A value of an owned type (one with a Drop, or holding a Vec, Buf or HashMap) is \
-            used after it moved. `let w = v`, a by-value argument `f(v)`, a struct literal's \
-            field, `return v` and a `move` capture all move it: the old name is dead until it \
-            is assigned again. Plain values (numbers, structs of them) copy and never move.",
-        fix: "When the callee only reads it, take a reference: the parameter `v: &Vec<T>` \
-            (`&mut Vec<T>` if it pushes) and the call `f(&v)` (`f(&mut v)`); `volec \
-            refactor signature F --type v '&Vec<T>' --default '&$v'` changes both. Else pass \
-            a copy, `f(v.clone())`, or use the value before the move. A collection passed by \
-            value to a function that pushes to it was a lost push before 0.17 too: make it \
-            `&mut Vec<T>`.",
-        example: "fn total(v: Vec<i64>) -> i64 { let mut s = 0; for x in v { s += x; } s }\n\
+            used after it moved. `let w = v` of a whole local, an argument to a `sink` \
+            parameter, a struct literal's field, `return v` and a `sink ||` capture all move \
+            it: the old name is dead until it is assigned again. Plain values (numbers, \
+            structs of them) copy and never move.",
+        fix: "When the callee only reads it, make the parameter let, `v: Vec<T>` (no marker at \
+            the call: `f(v)` lends it for the call); `volec refactor signature F --convention \
+            v let` changes the parameter and its calls. When it changes it, `v: inout Vec<T>`, \
+            called `f(&v)` (`--convention v inout`). Else pass a copy, `f(v.clone())`, or use \
+            the value before the move.",
+        example: "fn total(v: sink Vec<i64>) -> i64 { var s = 0; for x in v { s += x; } s }\n\
             ...\n\
             let n = total(v);\n\
             v.push(n);\n\
             \n\
-            main.vl:6:5: error[own.moved] 'v' is used here after it moved into 'total(v)' at 5:19\n\
-            \x20 help: 'total' only reads its parameter 'v': take it by reference ('v: &Vec<i64>'), or pass a copy\n\
-            \x20 try: volec refactor signature total --type v '&Vec<i64>' --default '&$v'\n\
-            \x20 try: volec edit patch main.vl:5 --old 'total(v)' --new 'total(v.clone())'",
+            main.vl:6:5: error[own.moved] 'v' is used here after it moved into 'total(sink v)' at 5:19\n\
+            \x20 help: use it before the move, pass a copy where it moves ('.clone()'), or let the callee borrow it: a let parameter ('x: T'), not 'sink'\n\
+            \x20 try: volec edit patch main.vl:5 --old 'let n = total(v);' --new 'let n = total(v.clone());'",
     },
     Explain {
         code: "own.move_out",
         severity: "error (as own.moved)",
-        means: "An owned value is moved out of a place that must keep one: an index (`v[i]`), \
-            `*r`, a static, or a field of a parameter taken by reference (`self.keys` in a \
-            `self: &mut T` method). The place would be left without a value, and its owner \
+        means: "An owned value is moved out of a place that must keep one: an index (`v[i]`), a \
+            static, or a part of an access (`self.keys` in an `inout self` method, a field of \
+            a let or inout parameter). The place would be left without a value, and its owner \
             would drop it again.",
-        fix: "Take it out and leave an empty one: `std::take(&mut self.keys)`; swap a new \
-            value in: `std::replace(&mut self.keys, new)`; remove an element: `v.remove(i)`; \
-            or copy it: `self.keys.clone()`. To only read it, borrow: `for k in self.keys`, \
-            `let ks = &self.keys;`.",
-        example: "fn rehash(self: &mut Table) {\n\
-            \x20   let old = self.keys;\n\
+        fix: "Take it out and leave an empty one: `self.keys.take()` (a Vec, Buf or HashMap), \
+            `std::take(&self.keys)`; swap a new value in: `std::replace(&self.keys, new)`; \
+            remove an element: `v.remove(i)`; or copy it: `self.keys.clone()`. To only read \
+            it, borrow it: `let ks = self.keys;` (a let binding of a part borrows), `for k in \
+            self.keys`, or pass it to a let parameter.",
+        example: "fn rehash(inout self) {\n\
+            \x20   var old = self.keys;\n\
             \x20   for k in old { self.insert(k); }\n\
             }\n\
             \n\
-            table.vl:2:15: error[own.move_out] cannot move 'self.keys' (Vec<Entry>) out of '*self': 'rehash' borrows 'self'\n\
-            \x20 help: take it out and leave an empty Vec in its place, or iterate over it by reference\n\
-            \x20 try: volec edit patch table.vl:2 --old 'self.keys' --new 'std::take(&mut self.keys)'",
+            main.vl:5:19: error[own.move_out] cannot move 'self.keys' (Vec<i64>) out of a reference: what it points to keeps its value\n\
+            \x20 help: take it out and leave an empty value in its place ('x.take()' of a Vec, Buf or HashMap, 'std::take(&x)', 'std::replace(&x, v)'), copy it ('.clone()'), or borrow it: pass it on let, or take the parameter 'sink' to own it\n\
+            \x20 try: volec edit patch main.vl:5 --old 'var old = self.keys;' --new 'var old = self.keys.take();'\n\
+            \x20 try: volec edit patch main.vl:5 --old 'var old = self.keys;' --new 'var old = self.keys.clone();'",
     },
     Explain {
         code: "own.partial",
@@ -60,34 +61,39 @@ pub static OWN_TABLE: [Explain; 9] = [
         means: "A field is moved out of a value whose type implements Drop: its `drop` would run \
             on a value with the field gone. Moving fields out of a struct without its own Drop \
             is allowed (a partial move; the rest is dropped field by field).",
-        fix: "Take the field out and leave an empty one, `std::take(&mut f.name)`, or copy it, \
+        fix: "Take the field out and leave an empty one, `std::take(&f.name)`, or copy it, \
             `f.name.clone()`; or move the whole value.",
-        example: "impl Drop for File { fn drop(self: &mut File) { close(self.fd); } }\n\
+        example: "impl Drop for File { fn drop(inout self) { close(self.fd); } }\n\
             let name = f.name;\n\
             \n\
-            main.vl:9:16: error[own.partial] cannot move 'f.name' out of 'f': 'File' implements Drop\n\
-            \x20 help: take it out and leave an empty Buf, or copy it\n\
-            \x20 try: volec edit patch main.vl:9 --old 'f.name' --new 'std::take(&mut f.name)'",
+            main.vl:5:16: error[own.partial] cannot move 'f.name' out of 'f': 'File' implements Drop, which needs all of it\n\
+            \x20 help: take the field out and leave a value in its place ('std::take(&x.f)', 'std::replace(&x.f, v)'), or copy it ('.clone()')\n\
+            \x20 try: volec edit patch main.vl:5 --old 'let name = f.name;' --new 'let name = std::take(&f.name);'",
     },
     Explain {
         code: "own.conflict",
         severity: "error (as own.moved)",
-        means: "A place is written, moved, dropped or borrowed `&mut` while a view or a loan of \
-            it is used later (aliasing XOR mutation, checked within the function): a slice of a \
-            Vec used after a push (the push may move the elements); a `for` loop over a Vec \
-            that pushes to it; two arguments of one call where one is `&mut a` and another \
-            reads `a`; a `&mut self` method whose arguments change the receiver \
-            (`rng.big(rng.next())`); a view returned by a method of a type that owns the text \
-            (`views(self)`) kept across the next call. The line names both positions; when a \
-            callee causes it, it names the callee's view summary and the line that makes it.",
+        means: "A place is written, moved, dropped or lent inout (`&x`) while a view or an \
+            access of it is used later (aliasing XOR mutation, checked within the function): \
+            a slice of a Vec used after a push (the push may move the elements); a `for` loop \
+            over a Vec that pushes to it; two arguments of one call where one is `&a` (inout) \
+            and another views `a` (`f(&a, a[..])`, `f(&v[0], v)`; a read finished before the \
+            call, `f(&a, a.len())`, is fine); an `inout self` method whose arguments change \
+            the receiver (`rng.big(rng.next())`); a closure that changes a capture, while \
+            that capture is used another way before the closure's last use, or called or \
+            passed alongside an access of it (`f(&n)` for an `f` capturing n); a view \
+            returned by a method of a type that owns the text (`views(self)`) kept across the \
+            next call. The line names both positions; when a callee causes it, it names the \
+            callee's view summary and the line that makes it.",
         fix: "Use the view before the change, or take it again after (`let s = v.as_slice();` \
             after the push); keep an index instead of a view; copy a plain element out first \
             (`let x = v[0];`); loop over indexes (`for i in 0..v.len() { let x = v[i]; ... }`) \
             or collect the new elements and append them after the loop; hoist an argument \
-            that changes the receiver into a `let`; `v.swap(i, j)` for two elements. A lexer \
-            that owns its text and returns views of it: let it view text its caller owns \
-            (`src: [u8]`), or copy each word. `volec query own FILE:LINE:COL` shows every \
-            local's state there.",
+            that changes the receiver into a `let`; `v.swap(i, j)` for two elements. A \
+            closure: move the other use after its last call, or pass the value to it as a \
+            parameter instead of capturing it. A lexer that owns its text and returns views \
+            of it: let it view text its caller owns (`src: [u8]`), or copy each word. `volec \
+            query own FILE:LINE:COL` shows every local's state there.",
         example: "let first = v.as_slice();\n\
             v.push(4);\n\
             println(f\"{first[0]}\");\n\
@@ -108,7 +114,7 @@ pub static OWN_TABLE: [Explain; 9] = [
         means: "A view outlives what it points into: a function returns a slice (or a struct \
             holding one) of a local, or of an owned parameter, which is dropped when it \
             returns; a block's value views a local of the block; a view is stored into a \
-            static or into a `&mut` parameter's referent that outlives its owner.",
+            static or into what an inout parameter designates, which outlives its owner.",
         fix: "Return the owner (the Buf, the Vec) instead of a view of it; a caller that wants \
             a view takes `.as_slice()` of what it got. Or take the text as a parameter (`s: \
             [u8]`), so that the result views the caller's text. A function that returns a view \
@@ -125,9 +131,9 @@ pub static OWN_TABLE: [Explain; 9] = [
     Explain {
         code: "own.static",
         severity: "error (as own.moved)",
-        means: "A view of a static (`TYPES.as_slice()`, `&TABLE`) is used after a call whose \
+        means: "A view of a static (`TYPES.as_slice()`, `TABLE[..]`) is used after a call whose \
             effects include `global` (it may write statics, and so grow or free what the view \
-            points into); or `&S`/`&mut S` of a static is passed to such a function.",
+            points into); or a static is lent (`&S`, or let) to such a function.",
         fix: "Copy the plain value out first (`let t = TYPES[i];`), or take the view again \
             after the call. `volec query effects F --why global` shows why the callee \
             writes statics.",
@@ -152,46 +158,55 @@ pub static OWN_TABLE: [Explain; 9] = [
             --why` shows the inferred summary and the line making each source; removing the \
             declaration lets it be inferred.",
         example: "#[views(*self)]\n\
-            fn word(self: &mut Lexer) -> [u8] { ...; self.src.as_slice()[a..b] }\n\
+            fn word(self) -> [u8] { self.src.as_slice()[0..1] }\n\
             \n\
-            lex.vl:9:5: error[own.views] 'word' is #[views(*self)] but returns a view of 'self': 'self.src.as_slice()[a..b]' at 14:9\n\
-            \x20 help: declare #[views(self)], or return a view of what 'self' holds\n\
+            main.vl:4:29: error[own.views] 'Lexer::word' is #[views(*self)] but returns a view of 'self': 'self.src.as_slice()[0..1]'\n\
+            \x20 help: callers rely on the declaration: change the body to keep to it, or declare what it does: #[views(self)]\n\
             \x20 try: volec query views Lexer::word --why",
     },
     Explain {
         code: "own.drop_view",
         severity: "error",
-        means: "A view type (one holding a slice, a reference, or a closure capturing by \
+        means: "A view type (one holding a slice, an access, or a closure capturing by \
             reference) implements Drop. Its drop could read what its owner already freed, so \
             view types have none: this is what keeps vole free of Rust's drop-check rules.",
         fix: "Implement Drop on the owner instead (the type holding the Buf or Vec), or make \
             the type own its data (`text: Buf` rather than `text: [u8]`).",
         example: "struct Scanner { text: [u8], pos: i64 }\n\
-            impl Drop for Scanner { fn drop(self: &mut Scanner) { ... } }\n\
+            impl Drop for Scanner { fn drop(inout self) { ... } }\n\
             \n\
-            scan.vl:2:1: error[own.drop_view] 'Scanner' holds a view ('text: [u8]') and cannot implement Drop\n\
-            \x20 help: implement Drop on the type that owns the text, or let 'Scanner' own it ('text: Buf')",
+            main.vl:2:25: error[own.drop_view] 'Scanner' holds views and cannot implement Drop: its drop could read what it views after that is gone\n\
+            \x20 help: hold owned values (Buf, Vec) instead of the views, or remove the impl",
     },
     Explain {
         code: "own.readonly",
         severity: "error (as own.moved)",
-        means: "A write through a shared reference (`&T`) or a read-only slice (`[T]`, the same \
-            as `&[T]`): an assignment, a compound assignment, a `&mut` borrow or a call of a \
-            method taking `self: &mut Self` through it. Also (0.18.1) a change to an owned \
-            copy that borrows: a `match *e` binding, a `v.get(i)`, a `for` loop's element; \
-            the original keeps pointing at what the change may free. Match the reference \
-            instead (`match e` binds `&mut T` under `e: &mut E`), or change the element in \
-            place (`v[i].push(x)`). (0.19.1) And a read-only `[T]` given where `&mut [T]` is \
-            expected, to a callee that writes through it (`sort(v.as_slice())`, a store \
-            intrinsic): 0.17's legacy rule took it as the exclusive view.",
-        fix: "Take `p: &mut T` and pass `&mut x` at the calls (`volec refactor signature F \
-            --type p '&mut T'` rewrites `&x` to `&mut x` at every call); for a slice, `s: &mut \
-            [T]`, passed as `v.as_mut_slice()` or `&mut a[..]`. `volec fix --values` does \
-            this for every written parameter.",
-        example: "fn reset(p: &P) { p.x = 0; }\n\
+        means: "A change of something read-only. (0.25) An inout access of a let place: `&x` \
+            given to an inout parameter, `inout r = &x`, `match &x`, or an `inout self` method \
+            (`x.push(1)`, `x[i] = v` on a Vec) whose root is a let binding, a let parameter \
+            (a copy of a plain value), a let receiver (`self` of a `fn m(self)`), or an \
+            immutable static (in read-only memory). Also a write through a let access or a \
+            let slice (`[T]`): an assignment, an inout method, a let parameter of an owned \
+            type changed; a change to an owned copy that borrows (a `match` binding, a \
+            `v.get(i)`, a `for` loop's element), whose original keeps pointing at what the \
+            change may free; and a let `[T]` given where `inout [T]` is expected, to a callee \
+            that writes through it (`sort(v.as_slice())`, a store intrinsic). `&x` given \
+            where a raw `*T` is wanted is its address and needs no var.",
+        fix: "A local: declare it `var n = ...`. A parameter: take it `x: inout T` and pass \
+            `&x` at the calls (`volec refactor signature F --convention x inout`), or `x: \
+            sink T` for a copy of its own. A receiver: `inout self`. A static: `static var \
+            N`. A slice: `inout [T]`, passed as `&v`, `&a[..]` or `v.as_mut_slice()`.",
+        example: "let n = 1;\n\
+            bump(&n);\n\
             \n\
-            main.vl:1:20: error[own.readonly] cannot write 'p.x': 'p' is '&P', a shared reference\n\
-            \x20 help: take '&mut P' and pass '&mut x' at the calls\n\
-            \x20 try: volec refactor signature reset --type p '&mut P'",
+            main.vl:4:10: error[own.readonly] '&n' changes 'n', a let binding: it is read-only\n\
+            \x20 help: declare it `var` to change it\n\
+            \x20 try: var n = ...\n\
+            \n\
+            fn reset(p: P) { p.x.clear(); }\n\
+            \n\
+            main.vl:2:18: error[own.readonly] writes through 'p', a 'let P', which is read-only (let: borrowed to be read)\n\
+            \x20 help: take it inout ('x: inout T', called with '&x') to change it\n\
+            \x20 try: volec refactor signature reset --type p 'inout P'",
     },
 ];

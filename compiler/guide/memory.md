@@ -67,9 +67,10 @@ fn main(gpa: Gpa) {
 ```
 
 - There are no references to take or store: where other languages
-  borrow (a shared reference `&T`, a mutable reference `&mut T`), a let
-  parameter borrows the value read-only for the call and an inout one
-  borrows it exclusively, with `&x` at the call.
+  borrow a reference, a let parameter borrows the value read-only for
+  the call and an inout one borrows it exclusively, with `&x` at the
+  call. An inout access needs a mutable place: `&x` and an `inout self`
+  method (`x.push(1)`) on a let binding are `own.readonly` (`var x`).
 - For a plain type (`i64`, a struct of numbers) `let` and `sink` are
   both a copy; only `inout` changes the caller's value. For an owned one
   `let` lends it and `sink` moves it.

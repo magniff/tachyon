@@ -807,6 +807,19 @@ v inout`, changes both); a slice to sort in place is `s: inout [T]`,
 passed as `&v` or `&a[..]`.
 
 ```tach
+fn bump(n: inout i64) { n += 1; }
+fn main() -> i32 { let n = 1; bump(&n); n as i32 }
+```
+```err
+error[own.readonly] '&n' changes 'n', a let binding: it is read-only
+```
+An inout access needs a mutable place: `&n`, `inout r = &n`, `match
+&n` and an `inout self` method (`v.push(x)`, `v[i] = x`) on a let
+binding, a let parameter or receiver, or an immutable static are
+errors. The `try:` says which: `var n = ...`, `x: inout T`, `inout
+self`, `static var N`.
+
+```tach
 fn keep(v: sink Vec<i64>) -> i64 { v.len() }
 fn main(gpa: Gpa) -> i32 { let v: Vec<i64> = Vec::new_in(gpa); keep(v); v.len() as i32 }
 ```
