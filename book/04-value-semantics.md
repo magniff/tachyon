@@ -60,7 +60,8 @@ fn main() {
 nobody is surprised that `a` is still 5. `b = a` gave `b` its own 5.
 In vole, a list, a string, a struct, any value at all, behaves like
 that: assigning it or passing it never creates a second name through
-which someone else can change it. You can always change what is yours
+which someone else can change it, unless you hand one over on purpose,
+in a way you can see at the call. You can always change what is yours
 (`var`), and nothing changes behind your back. The rest of this chapter
 is about how vole keeps that promise without copying everything all
 the time.
@@ -92,14 +93,14 @@ fn main(gpa: Gpa) {
 ```
 
 `var edit = first;` copied the song. Changing `edit` left `first` alone,
-just as with the numbers. A song is a couple of fields, so copying it
-costs about as much as copying two numbers.
+just as with the numbers. A song is a couple of small fields, so
+copying it costs about as much as copying a few numbers.
 
 Values like that are called *plain*: numbers, `bool`, and tuples,
 arrays and structs made only of plain values. `=` copies them, bit for
 bit, as C would. (A `Song` holds a `str`, which is a *view* of text
-stored somewhere else; views are copied too, and section "Views" below
-explains them. For now, read a `Song` as plain.)
+stored somewhere else. Views are copied too, and the section on views,
+later in this chapter, explains them. For now, read a `Song` as plain.)
 
 `list` is different. A `Vec` (a growable list, chapter 7) holds its
 elements in memory it got from an allocator, and that memory can be
@@ -638,9 +639,9 @@ This is the normal way to make a value in a function and hand it out.
 In some languages, returning a big value is something to avoid; in
 vole, it costs the same as returning its small handle.
 
-Functions don't fill in their caller's variables through a pointer;
-they return the result. To return several things, return a tuple or a
-struct.
+So prefer returning a result to filling in an `inout` parameter the
+caller made empty for you. To return several things, return a tuple or
+a struct.
 
 ## Views
 

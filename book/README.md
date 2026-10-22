@@ -31,10 +31,10 @@ are the way they are. It is not a specification. For precise rules, see
    `volec`, errors, `volec try`, an editor
 2. [A guessing game](02-guessing-game.md): a first real program, using
    a little of everything
-3. [Values, types, functions and control flow](03-basics.md) *(outline)*
-4. [Value semantics: let, inout, sink](04-value-semantics.md) *(outline)*
-5. [Structs, enums and pattern matching](05-structs-enums-match.md) *(outline)*
-6. [Errors: Option, Result and panics](06-errors.md) *(outline)*
+3. [Values, types, functions and control flow](03-basics.md)
+4. [Value semantics: let, inout, sink](04-value-semantics.md)
+5. [Structs, enums and pattern matching](05-structs-enums-match.md)
+6. [Errors: Option, Result and panics](06-errors.md)
 7. [Collections and text](07-collections-and-text.md) *(outline)*
 8. [Allocation: where memory comes from](08-allocation.md) *(outline)*
 9. [Traits and generics](09-traits-generics.md) *(outline)*
@@ -50,7 +50,7 @@ are the way they are. It is not a specification. For precise rules, see
 
 Appendices:
 
-- A. [Keywords, operators and attributes](19-appendix-keywords-operators.md) *(outline)*
+- A. [Keywords, operators and attributes](19-appendix-keywords-operators.md)
 - B. [Reading diagnostics](20-appendix-diagnostics.md) *(outline)*
 - C. [Coming from another language](21-appendix-coming-from.md) *(outline)*
 
