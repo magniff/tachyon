@@ -78,6 +78,6 @@ out.push_fmt(f"\x1B[48;2;{color / 2};{color / 5};{color}m ");
 ## Language features
 
 - `#[repr(C)]` structs, variadic `extern "C"` functions: `volec guide c-interop`
-- `Vec` as a handle, `Buf`: `volec guide memory`, `volec guide std`
+- a `Vec` that owns its cells, `take` and `std::replace`, `Buf`: `volec guide memory`, `volec guide std`
 - slices compared with `==`: `volec guide types`
 - f-strings appended to a `Buf` (`push_fmt`): `volec guide formatting`
