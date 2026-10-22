@@ -7,7 +7,7 @@ $ def trim
 crate::trim	prelude017/main.vl:6:4	fn	fn trim(x: i64) -> i64	effects: none
 $ items prelude017/uses.vl
 crate	prelude017/uses.vl	1
-std	<std>	593
+std	<std>	603
 std::ops	<std>	5
 std::iter	<std>	68
 std::slice	<std>	37

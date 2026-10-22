@@ -3,7 +3,7 @@
 ## an item shown with its clauses, a distinct type, test functions.
 $ items
 crate	syntax018/main.vl	14
-std	<std>	593
+std	<std>	603
 crate::tests	syntax018/main.vl	1
 std::ops	<std>	5
 std::iter	<std>	68
