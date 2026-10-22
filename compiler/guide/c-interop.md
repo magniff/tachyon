@@ -138,6 +138,29 @@ volec prog.vl helper.c -L vendor/lib -l png -o prog
 `-o prog.o` makes an object instead, for a build that links it itself
 (`cc prog.o helper.o -o prog -lm`).
 
+An extern block can say what it links (0.25): `#[link(lib = "objc")]`
+(`-lobjc`), `#[link(framework = "Metal")]` (macOS; Linux leaves it
+out), or Rust's `#[link(name = "objc")]` and `#[link(name = "Metal",
+kind = "framework")]`, several in one attribute or in several, before
+`extern "C"`. A program links them when it uses the block's module, so
+std::gpu, std::objc and std::window bring their frameworks and
+libobjc, and a program without them links nothing more. On the command
+line, `-framework NAME` adds a framework.
+
+```tach
+#[link(lib = "m")]
+extern "C" {
+    fn ilogb(x: f64) -> i32;
+}
+
+fn main() {
+    println(f"{unsafe { ilogb(8.0) }}");
+}
+```
+```out
+3
+```
+
 A program with nothing to link but itself skips `cc`: the system's
 linker runs directly, with the command `cc -###` gave the first time
 (kept in the user's cache directory; `$VOLE_LINK_CACHE` names another,

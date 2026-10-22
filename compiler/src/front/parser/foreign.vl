@@ -2,14 +2,15 @@
 // with their link names), functions with the C convention, and statics
 // with a C symbol.
 
+use crate::back::objfile::output::{add_framework, add_link_lib};
 use crate::base::{intern, intern_c};
 use crate::base::diag::error_at;
 use crate::front::ast::{NODES, NodeKind, list_push, new_node};
 use crate::front::check::name_error;
 use crate::front::lexer::{TOKS, str_at};
 use crate::front::lexer::Tok::{
-    Arrow, Colon, Eof, Eq, Extern, Fn, Hash, LBrace, LBracket, LParen, RBrace, RBracket, RParen,
-    Semi, Static, Str,
+    Arrow, Colon, Comma, Eof, Eq, Extern, Fn, Hash, Ident, LBrace, LBracket, LParen, Pub, RBrace,
+    RBracket, RParen, Semi, Static, Str,
 };
 use crate::front::parser::{
     P, advance, at, cur_start, eat, expect, expect_binding_name, expect_ident, prev_end,
@@ -23,6 +24,77 @@ use crate::front::parser::items::attrs::{
 use crate::front::parser::items::params::parse_params;
 use crate::front::parser::types::parse_type;
 use crate::gen0::target::LINK_NAMES;
+
+// (0.25) At `#[link(...)]`.
+pub fn at_link_attribute() -> bool {
+    unsafe {
+        tok_kind(0) == Hash && tok_kind(1) == LBracket && tok_kind(2) == Ident
+            && TOKS[P + 2].value as i64 == intern_c(c"link") && tok_kind(3) == LParen
+    }
+}
+
+// (0.25) `#[link(...)]`s before an extern block: what the program links
+// when it reaches the block's module (so a std module the program does
+// not use links nothing). `framework = "Metal"` (macOS's; Linux leaves
+// it out) or `lib = "objc"` (`-lobjc`); Rust's `name = "objc"`, with
+// `kind = "framework"` for a framework, too. Several in one attribute,
+// separated by commas, and several attributes. The block itself follows
+// (it may be empty).
+pub fn parse_link_attributes() {
+    unsafe {
+        let start = cur_start();
+        while at_link_attribute() {
+            advance();
+            advance();
+            advance();
+            advance();
+            var name = 0 - 1;
+            var framework = false;
+            while !at(RParen) && !at(Eof) {
+                let pos = cur_start();
+                let key = expect_ident();
+                expect(Eq);
+                if !at(Str) {
+                    syntax_error(c"expected a string: `#[link(framework = \"Metal\")]` or `#[link(lib = \"objc\")]`");
+                }
+                let value = TOKS[P].value as i64;
+                advance();
+                if key == intern_c(c"framework") {
+                    add_framework(str_at(value));
+                } else if key == intern_c(c"lib") {
+                    add_link_lib(str_at(value));
+                } else if key == intern_c(c"name") {
+                    name = value;
+                } else if key == intern_c(c"kind") {
+                    let kind = str_at(value);
+                    if kind == "framework" {
+                        framework = true;
+                    } else if kind != "dylib" && kind != "static" {
+                        error_at(pos, c"a link's kind is \"framework\", \"dylib\" or \"static\"");
+                    }
+                } else {
+                    name_error(pos, c"unknown key '", key,
+                        c"' in #[link] (expected framework, lib, name or kind)");
+                }
+                if !eat(Comma) {
+                    break;
+                }
+            }
+            expect(RParen);
+            expect(RBracket);
+            if name >= 0 {
+                if framework {
+                    add_framework(str_at(name));
+                } else {
+                    add_link_lib(str_at(name));
+                }
+            }
+        }
+        if !at(Extern) && !(at(Pub) && tok_kind(1) == Extern) {
+            error_at(start, c"#[link] goes before an extern block: `#[link(lib = \"objc\")] extern \"C\" { ... }`");
+        }
+    }
+}
 
 // After `extern "C"`: a block of C declarations, `extern "C" { fn f(...)
 // -> T; static mut x: T; }`; a function with the C convention and an

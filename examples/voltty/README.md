@@ -10,7 +10,7 @@ measured against Alacritty. One folder per part:
 | app/ | the parts assembled: a std::window window, the renderer on its surface, the terminal, a shell on a pty, one event loop (a first cut of E7: no selection, scrollback view or config yet) |
 
 ```sh
-target/volec -O2 examples/voltty/app/main.vl tests/window/frameworks.c -l objc -o voltty
+target/volec -O2 examples/voltty/app/main.vl -o voltty
 ./voltty                      # your shell in a window
 ./voltty -- htop              # a program instead
 ```

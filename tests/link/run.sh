@@ -15,6 +15,10 @@
 #   off         $VOLE_LINK_CACHE=off: no template kept, the link works
 #   errors      a link that fails says so as cc does, once
 #   linker      $VOLE_LINKER=cc is --linker=cc; an unknown one is an error
+#   declared    an extern block's #[link(...)] and -framework reach the
+#               link (macOS: the executable loads them; Linux leaves a
+#               framework out), a hello world links nothing more, and an
+#               unknown key is an error
 
 set -u
 LC_ALL=C
@@ -147,6 +151,39 @@ if env VOLE_LINKER=cc "$COMPILER" hello.vl -o prog >build.out 2>&1 && cmp -s pro
     pass linker
 else
     fail linker "VOLE_LINKER: $(cat build.out)"
+fi
+
+# declared
+cat >declared.vl <<'EOF'
+#[link(lib = "m")]
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn ilogb(x: f64) -> i32;
+}
+
+fn main() {
+    println(f"{unsafe { ilogb(8.0) }}");
+}
+EOF
+cat >badkey.vl <<'EOF'
+#[link(library = "m")]
+extern "C" {
+    fn ilogb(x: f64) -> i32;
+}
+
+fn main() {}
+EOF
+if ! build declared.vl -framework CoreGraphics -o prog || [ "$(./prog)" != 3 ]; then
+    fail declared "#[link]: $(cat build.out)"
+elif [ "$(uname -s)" = Darwin ] && ! { otool -L prog | grep -q CoreFoundation.framework \
+    && otool -L prog | grep -q CoreGraphics.framework; }; then
+    fail declared "the frameworks are not loaded: $(otool -L prog)"
+elif ! build hello.vl -o prog || { [ "$(uname -s)" = Darwin ] && [ "$(otool -L prog | grep -c dylib)" != 1 ]; }; then
+    fail declared "hello world links more: $(otool -L prog 2>&1)"
+elif build badkey.vl -o prog || ! grep -q "unknown key 'library' in #\[link\]" build.out; then
+    fail declared "an unknown key: $(cat build.out)"
+else
+    pass declared
 fi
 
 exit $STATUS

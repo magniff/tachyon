@@ -4,11 +4,11 @@
 `Instance`, an `Adapter`, a `Device` and its `Queue`; `Buffer`s,
 `Texture`s and their views, `Sampler`s; a `Shader`, bind groups and
 compute and render pipelines; an `Encoder` whose passes are closures.
-On macOS it runs on Metal. Link the Objective-C runtime; std opens
-Metal itself (no `-framework`):
+On macOS it runs on Metal. std links Metal and the Objective-C runtime
+itself (its extern blocks' `#[link]`s):
 
 ```sh
-volec main.vl -l objc -o prog
+volec main.vl -o prog
 ```
 
 ## Lifecycle

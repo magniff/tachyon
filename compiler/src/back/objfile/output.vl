@@ -121,6 +121,46 @@ pub fn add_link_include(dir: *u8) {
     }
 }
 
+// (0.25) What the program links besides: the frameworks and libraries
+// its extern blocks name (`#[link(...)]`, in the modules it reaches,
+// front::parser::foreign) and `-framework NAME`s, each once, in the order
+// first named. A framework is macOS's (Linux leaves it out); a library is
+// linked as `-lNAME`.
+static var LINK_FRAMEWORKS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var LINK_LIBS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Adds name (a C string made of it) to v, unless it is there.
+fn add_once(v: inout IntVec, name: [u8]) {
+    unsafe {
+        for i in 0..v.count {
+            if cstr(v.data[i] as *u8) == name {
+                return;
+            }
+        }
+        let b = buf_new();
+        buf_bytes(b, name);
+        buf_byte(b, 0);
+        v.push(BUFS[b].data as i64);
+    }
+}
+
+pub fn add_framework(name: [u8]) {
+    unsafe {
+        add_once(&LINK_FRAMEWORKS, name);
+    }
+}
+
+pub fn add_link_lib(name: [u8]) {
+    unsafe {
+        add_once(&LINK_LIBS, name);
+    }
+}
+
+// Whether the program links a framework or a library of its own.
+fn links_declared() -> bool {
+    unsafe { LINK_LIBS.count > 0 || (!ELF && LINK_FRAMEWORKS.count > 0) }
+}
+
 // Whether the command line added anything for the link.
 pub fn link_args_given() -> bool {
     unsafe { LINK_ARGS.count > 0 }
@@ -234,6 +274,16 @@ pub fn link_command(path: *u8, obj_path: *u8) -> *u8 {
             }
             quoted(cmd, LINK_ARGS.data[i + 1] as *u8);
             i += 2;
+        }
+        if !ELF {
+            for i in 0..LINK_FRAMEWORKS.count {
+                buf_str(cmd, c" -framework ");
+                quoted(cmd, LINK_FRAMEWORKS.data[i] as *u8);
+            }
+        }
+        for i in 0..LINK_LIBS.count {
+            buf_str(cmd, c" -l");
+            quoted(cmd, LINK_LIBS.data[i] as *u8);
         }
         if ELF && (LINK_C || uses_libm()) {
             buf_str(cmd, c" -lm");
@@ -795,7 +845,7 @@ fn template_argv(t: i64, path: *u8, obj_path: *u8) -> **u8 {
                 lines += 1;
             }
         }
-        let argv = alloc_array::<*u8>(lines + 3);
+        let argv = alloc_array::<*u8>(lines + 3 + 2 * LINK_FRAMEWORKS.count + LINK_LIBS.count);
         var k = 0;
         var i = 0;
         while i < m {
@@ -811,6 +861,20 @@ fn template_argv(t: i64, path: *u8, obj_path: *u8) -> **u8 {
                 if ELF && uses_pthreads() {
                     k += 1;
                     argv[k] = c"-lpthread";
+                }
+                // (what the program declares it links, as link_command)
+                if !ELF {
+                    for f in 0..LINK_FRAMEWORKS.count {
+                        argv[k + 1] = c"-framework";
+                        argv[k + 2] = LINK_FRAMEWORKS.data[f] as *u8;
+                        k += 2;
+                    }
+                }
+                for l in 0..LINK_LIBS.count {
+                    let b = buf_new();
+                    buf_fmt(b, f"-l{cstr(LINK_LIBS.data[l] as *u8)}\0");
+                    k += 1;
+                    argv[k] = BUFS[b].data;
                 }
             } else {
                 argv[k] = w;
