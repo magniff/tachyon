@@ -13,7 +13,7 @@ pub mod diag;
 pub mod flags;
 
 use crate::base::{IntVec, SRC, buf_fmt, buf_new, buf_slice, cstr, free, sym_text};
-use crate::base::diag::{err_begin, err_fmt, err_help, err_str, err_try_tool};
+use crate::base::diag::{err_begin, err_fmt, err_help, err_str, err_try_tool, error_count};
 use crate::front::ast::{NODES, NodeKind, child};
 use crate::front::check::{LOCALS, Res};
 use crate::front::contracts::checks::{
@@ -22,8 +22,10 @@ use crate::front::contracts::checks::{
 use crate::front::contracts::diag::{CONTRACT_EFFECT, CONTRACT_OLD, end_with_code};
 use crate::front::contracts::expand::subtree;
 use crate::front::effects::{
-    ALLOC_ANY, EFF_GLOBAL, EFF_IO, EFF_UNKNOWN, FN_EFFECTS_COUNT, fn_effects,
+    ALLOC_ANY, EFF_ALLOC_EXTERN, EFF_GLOBAL, EFF_IO, EFF_UNKNOWN, Effects, FN_EFFECTS_COUNT,
+    fn_effects,
 };
+use crate::front::effects::infer::expr_effects;
 use crate::front::own::kinds::{is_owned_type, is_view_type};
 use crate::front::types::{FNS, err_type};
 
@@ -151,7 +153,8 @@ pub fn check_contracts() {
                 seen.push(check);
                 continue;
             }
-            if FN_EFFECTS_COUNT != 0 && impure(child(call, 0), check) {
+            if FN_EFFECTS_COUNT != 0
+                && (impure(child(call, 0), check) || impure_whole(child(call, 0), check)) {
                 seen.push(check);
             }
         }
@@ -231,11 +234,12 @@ fn impure(n: i64, check: i64) -> bool {
             let e = fn_effects(f);
             // (not inferred: a function that failed, a template checked with
             // errors in a query; not reported)
-            if (e.bits & EFF_UNKNOWN) != 0 || e.allocs == ALLOC_ANY {
+            // (0.25: unknown otherwise, conservatively impure)
+            if (e.bits & EFF_UNKNOWN) != 0
+                && (error_count() > 0 || FNS[f].generic > 0 || f == CHECK_FN) {
                 return false;
             }
-            let bad = if e.allocs != 0 { -2 } else if (e.bits & EFF_IO) != 0 { EFF_IO }
-                else if (e.bits & EFF_GLOBAL) != 0 { EFF_GLOBAL } else { 0 };
+            let bad = impure_bit(e);
             if bad != 0 && f != CHECK_FN {
                 effect_error(n, check, f, bad);
                 return true;
@@ -251,16 +255,53 @@ fn impure(n: i64, check: i64) -> bool {
                 return true;
             }
         }
+        // (0.25) A call through a fn value: what the functions it may
+        // call do.
+        if kind == NodeKind::Call && NODES[n].x <= 0 {
+            let bad = impure_bit(expr_effects(n));
+            if bad != 0 && (bad != -4 || error_count() == 0) {
+                effect_error(n, check, -3, bad);
+                return true;
+            }
+        }
         false
     }
 }
 
-// contract.effect at node n, a call of f (-1: a static read) that has
-// effect `bit` (-2: alloc).
+// (0.25) Whether condition n does io, allocates or touches a static by any
+// other way than impure finds (all that the effect inference sees of it);
+// reported at the condition.
+fn impure_whole(n: i64, check: i64) -> bool {
+    let bad = impure_bit(expr_effects(n));
+    if bad == 0 || bad == -4 {
+        return false;
+    }
+    effect_error(n, check, -5, bad);
+    true
+}
+
+// (0.25) What makes effects e impure in a condition: -4 unknown
+// (conservatively), -2 alloc, EFF_IO, EFF_GLOBAL, or 0.
+fn impure_bit(e: Effects) -> i64 {
+    if (e.bits & EFF_UNKNOWN) != 0 {
+        return -4;
+    }
+    if e.allocs != 0 || (e.bits & EFF_ALLOC_EXTERN) != 0 {
+        return -2;
+    }
+    if (e.bits & EFF_IO) != 0 {
+        return EFF_IO;
+    }
+    if (e.bits & EFF_GLOBAL) != 0 { EFF_GLOBAL } else { 0 }
+}
+
+// contract.effect at node n, a call of f (-1: a static read; -3: a call
+// through a fn value; -5: the condition as a whole) that has effect `bit` (-2: alloc; -4: unknown
+// effects).
 fn effect_error(n: i64, check: i64, f: i64, bit: i64) {
     unsafe {
         let what = if bit == -2 { c"allocates" } else if bit == EFF_IO { c"does io" }
-            else { c"touches a static" };
+            else if bit == -4 { c"has effects that are not known" } else { c"touches a static" };
         let word = if CHECK_KIND.data[check] == CHK_REQUIRES { c"requires" }
             else if CHECK_KIND.data[check] == CHK_ENSURES { c"ensures" } else { c"invariant" };
         let owner = CHECK_OWNER.data[check];
@@ -268,12 +309,18 @@ fn effect_error(n: i64, check: i64, f: i64, bit: i64) {
         err_fmt(f"the '{cstr(word)}' of '{sym_text(NODES[owner].a)}' ");
         if f >= 0 {
             err_fmt(f"calls '{sym_text(FNS[f].display)}', which {cstr(what)}");
+        } else if f == -3 {
+            let callee = NODES[n].a;
+            err_fmt(
+                f"calls '{SRC[NODES[callee].start..NODES[callee].end]}', a fn value that may call a function which {cstr(what)}");
+        } else if f == -5 {
+            err_fmt(f"{cstr(what)}");
         } else {
             err_fmt(f"reads the static '{sym_text(NODES[n].a)}'");
         }
         err_str(c": a condition may not do io, allocate or touch statics");
         err_help(c"a check that passes must not change what the program does: compute the value in the body, or check it with assert there");
-        if f >= 0 {
+        if f >= 0 && bit != -4 {
             let effect = if bit == -2 { "alloc" } else if bit == EFF_IO { "io" } else { "global" };
             let t = buf_new();
             buf_fmt(t, f"query effects {sym_text(FNS[f].display)} --why {effect}");

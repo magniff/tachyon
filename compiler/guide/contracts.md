@@ -58,7 +58,9 @@ main.vl:22:16: pop on an empty stack: self.items.len() = 0
 
 A condition reads the parameters, `result`, `old(..)` and constants, and
 calls functions; it must be pure: no io, no allocation, no static
-(`contract.effect`, with the `query effects --why` that shows the call).
+(`contract.effect`, with the `query effects --why` that shows the call),
+through a fn value too (what every function of its type whose address
+is taken may do).
 Owned parameters are read in place, never moved or dropped.
 
 An ensures runs after the body, so (`contract.old`):
