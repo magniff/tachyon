@@ -19,6 +19,13 @@
 #               link (macOS: the executable loads them; Linux leaves a
 #               framework out), a hello world links nothing more, and an
 #               unknown key is an error
+# and, on aarch64 macOS, the compiler's own linker (--linker=internal,
+# back::objfile::link_macho):
+#   internal    the executable runs, its signature verifies, and the same
+#               input gives the same bytes
+#   internal-ld a program it does not take (an import libSystem lacks) is
+#               linked by ld, which says why it fails
+#   libsystem   libSystem has every name of link_macho's LIBSYSTEM
 
 set -u
 LC_ALL=C
@@ -184,6 +191,60 @@ elif build badkey.vl -o prog || ! grep -q "unknown key 'library' in #\[link\]" b
     fail declared "an unknown key: $(cat build.out)"
 else
     pass declared
+fi
+
+if [ "$(uname -s)-$(uname -m)" = Darwin-arm64 ]; then
+    # internal
+    if build --linker=internal hello.vl -o prog && [ "$(./prog)" = hello ] \
+        && codesign -v prog 2>/dev/null && cp prog prog.internal \
+        && build --linker=internal hello.vl -o prog && cmp -s prog prog.internal \
+        && ! cmp -s prog prog.direct; then
+        pass internal
+    else
+        fail internal "--linker=internal: $(cat build.out); $(codesign -v prog 2>&1)"
+    fi
+
+    # internal-ld
+    if build --linker=internal missing.vl -o prog; then
+        fail internal-ld "linked a program with an undefined symbol"
+    elif ! grep -q 'vole_link_test_missing' build.out || ! grep -q 'error: linking failed' build.out; then
+        fail internal-ld "not ld's message: $(cat build.out)"
+    else
+        pass internal-ld
+    fi
+
+    # libsystem
+    awk '/^const LIBSYSTEM:/ { p = 1; next } p && /^\];/ { p = 0 } p' \
+        "$ROOT/compiler/src/back/objfile/link_macho.vl" | tr ',' '\n' \
+        | sed -n 's/.*c"\([A-Za-z0-9_]*\)".*/\1/p' >names.txt
+    cat >has.c <<'EOF'
+#include <dlfcn.h>
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    void *h = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY);
+    char line[256];
+    int bad = 0;
+    while (h && fgets(line, sizeof line, stdin)) {
+        line[strcspn(line, "\n")] = 0;
+        if (!dlsym(h, line)) {
+            printf("%s\n", line);
+            bad = 1;
+        }
+    }
+    return h ? bad : 2;
+}
+EOF
+    if [ "$(wc -l <names.txt)" -lt 200 ]; then
+        fail libsystem "LIBSYSTEM not found in link_macho.vl ($(wc -l <names.txt) names)"
+    elif ! cc has.c -o has >has.out 2>&1; then
+        fail libsystem "cc has.c: $(cat has.out)"
+    elif ! ./has <names.txt >has.out; then
+        fail libsystem "libSystem lacks: $(tr '\n' ' ' <has.out)"
+    else
+        pass libsystem
+    fi
 fi
 
 exit $STATUS

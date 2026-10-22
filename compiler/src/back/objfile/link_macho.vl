@@ -1,0 +1,1280 @@
+// The compiler's own Mach-O linker (0.25, `--linker=internal`): the
+// executable of a program that is the compiler's one AArch64 object and
+// libSystem, made without ld (whose fixed cost, reading libSystem's
+// stubs, is most of a small program's link).
+//
+// What it takes: an object of __TEXT,__text, __TEXT,__const and
+// __DATA,__data, as write_object makes it without -g; relocations
+// BRANCH26, PAGE21, PAGEOFF12 and GOT_LOAD_* in the text, 64-bit UNSIGNED
+// in the data; undefined symbols that libSystem has (LIBSYSTEM, below:
+// another one is linked by ld, which says whether it exists). Anything
+// else, and link_macho says no and the system's linker links.
+//
+// What it makes, as ld64 lays it out: __PAGEZERO; __TEXT (the header and
+// load commands, __text, __stubs, __const); __DATA_CONST (__got);
+// __DATA (__data); __LINKEDIT (the chained fixups, the exports trie, the
+// symbol table, the indirect symbols, the strings and the code
+// signature). A call to libSystem goes through a stub and its GOT slot,
+// bound by dyld from the chained fixups (DYLD_CHAINED_PTR_64); a pointer
+// in the data is a rebase in the same chains. The signature is ad hoc,
+// SHA-256 over 4 KB pages, as `ld` signs ("linker-signed"); the UUID is
+// a hash of the page hashes, so the same input gives the same file.
+
+use crate::back::objfile::align_up;
+use crate::back::objfile::output::read_into;
+use crate::base::{
+    BUFS, IntVec, alloc_array, alloc_zeroed, buf_new, fclose, fopen, fwrite, memcpy, streq, strlen,
+};
+use crate::base::target::{ELF, X86};
+use std::arch::detect;
+use std::arch::aarch64::{
+    vaddq_u32, vld1q_u32, vld1q_u8, vreinterpretq_u32_u8, vrev32q_u8, vsha256h2q_u32, vsha256hq_u32,
+    vsha256su0q_u32, vsha256su1q_u32, vst1q_u32,
+};
+
+extern "C" {
+    fn chmod(path: *u8, mode: i32) -> i32;
+    fn rename(from: *u8, to: *u8) -> i32;
+    fn unlink(path: *u8) -> i32;
+    fn getpid() -> i32;
+}
+
+// The functions and data libSystem has on every macOS from 12 (the
+// externs of compiler/std and compiler/src, those of the tests and
+// examples, libm's and the rest of the C library's common ones), without
+// the leading underscore, sorted. An import
+// of another name goes to ld. (tests/link/run.sh checks that libSystem
+// has each.)
+const LIBSYSTEM: [*u8; 402] = [
+    c"_NSGetArgc", c"_NSGetArgv", c"__error", c"__stderrp", c"__stdinp", c"__stdoutp",
+    c"__ulock_wait", c"__ulock_wake", c"_exit", c"_longjmp", c"_setjmp", c"abort", c"abs",
+    c"accept", c"access", c"acos", c"acosf", c"acosh", c"acoshf", c"alarm", c"aligned_alloc",
+    c"arc4random", c"arc4random_buf", c"arc4random_uniform", c"asin", c"asinf", c"asinh", c"asinhf",
+    c"atan", c"atan2", c"atan2f", c"atanf", c"atanh", c"atanhf", c"atexit", c"atof", c"atoi",
+    c"atol", c"basename", c"bind", c"bsearch", c"bzero", c"calloc", c"cbrt", c"cbrtf", c"ceil",
+    c"ceilf", c"cfmakeraw", c"chdir", c"chmod", c"chown", c"clock", c"clock_getres",
+    c"clock_gettime", c"close", c"closedir", c"confstr", c"connect", c"copysign", c"copysignf",
+    c"cos", c"cosf", c"cosh", c"coshf", c"creat", c"dirname", c"div", c"dlopen", c"dlsym",
+    c"dprintf", c"dup", c"dup2", c"environ", c"erf", c"erfc", c"erfcf", c"erff", c"execl", c"execv",
+    c"execve", c"execvp", c"exit", c"exp", c"exp2", c"exp2f", c"expf", c"expm1", c"expm1f", c"fabs",
+    c"fabsf", c"fchmod", c"fchown", c"fclose", c"fcntl", c"fdim", c"fdimf", c"fdopen", c"feof",
+    c"ferror", c"fflush", c"fgetc", c"fgets", c"fileno", c"floor", c"floorf", c"fma", c"fmaf",
+    c"fmax", c"fmaxf", c"fmin", c"fminf", c"fmod", c"fmodf", c"fopen", c"fork", c"fprintf",
+    c"fputc", c"fputs", c"fread", c"free", c"freeaddrinfo", c"frexp", c"frexpf", c"fseek", c"fstat",
+    c"fsync", c"ftell", c"ftruncate", c"futimes", c"fwrite", c"gai_strerror", c"getaddrinfo",
+    c"getchar", c"getcwd", c"getentropy", c"getenv", c"geteuid", c"getgid", c"getline",
+    c"getpagesize", c"getpgid", c"getpid", c"getppid", c"getrlimit", c"getrusage", c"getsockopt",
+    c"gettimeofday", c"getuid", c"gmtime", c"gmtime_r", c"grantpt", c"htonl", c"htons", c"hypot",
+    c"hypotf", c"ilogb", c"ilogbf", c"inet_ntop", c"inet_pton", c"ioctl", c"isalnum", c"isalpha",
+    c"isatty", c"isblank", c"iscntrl", c"isdigit", c"isgraph", c"islower", c"isprint", c"ispunct",
+    c"isspace", c"isupper", c"isxdigit", c"kill", c"labs", c"ldexp", c"ldexpf", c"ldiv", c"lgamma",
+    c"lgammaf", c"link", c"listen", c"llabs", c"lldiv", c"llrint", c"llrintf", c"llround",
+    c"llroundf", c"localtime", c"localtime_r", c"log", c"log10", c"log10f", c"log1p", c"log1pf",
+    c"log2", c"log2f", c"logb", c"logbf", c"logf", c"lrint", c"lrintf", c"lround", c"lroundf",
+    c"lseek", c"lstat", c"mach_absolute_time", c"mach_timebase_info", c"malloc", c"memccpy",
+    c"memchr", c"memcmp", c"memcpy", c"memmove", c"memset", c"mkdir", c"mkdtemp", c"mktime",
+    c"mmap", c"modf", c"modff", c"mprotect", c"nan", c"nanf", c"nanosleep", c"nearbyint",
+    c"nearbyintf", c"nextafter", c"nextafterf", c"nexttoward", c"nexttowardf", c"ntohl", c"ntohs",
+    c"open", c"opendir", c"pclose", c"perror", c"pipe", c"poll", c"popen", c"posix_memalign",
+    c"posix_openpt", c"posix_spawn_file_actions_addclose", c"posix_spawn_file_actions_adddup2",
+    c"posix_spawn_file_actions_destroy", c"posix_spawn_file_actions_init", c"posix_spawnp", c"pow",
+    c"powf", c"pread", c"printf", c"pthread_attr_destroy", c"pthread_attr_init",
+    c"pthread_attr_setdetachstate", c"pthread_attr_setstacksize", c"pthread_cond_broadcast",
+    c"pthread_cond_destroy", c"pthread_cond_init", c"pthread_cond_signal",
+    c"pthread_cond_timedwait", c"pthread_cond_wait", c"pthread_create", c"pthread_detach",
+    c"pthread_equal", c"pthread_exit", c"pthread_getspecific", c"pthread_join",
+    c"pthread_key_create", c"pthread_kill", c"pthread_mutex_destroy", c"pthread_mutex_init",
+    c"pthread_mutex_lock", c"pthread_mutex_trylock", c"pthread_mutex_unlock", c"pthread_once",
+    c"pthread_rwlock_destroy", c"pthread_rwlock_init", c"pthread_rwlock_rdlock",
+    c"pthread_rwlock_unlock", c"pthread_rwlock_wrlock", c"pthread_self", c"pthread_setspecific",
+    c"ptsname", c"putchar", c"puts", c"pwrite", c"qsort", c"raise", c"rand", c"read", c"readdir",
+    c"readlink", c"realloc", c"reallocf", c"realpath", c"recv", c"remainder", c"remainderf",
+    c"remquo", c"remquof", c"rename", c"rewind", c"rint", c"rintf", c"rmdir", c"round", c"roundf",
+    c"scalbln", c"scalblnf", c"scalbn", c"scalbnf", c"sched_yield", c"send", c"setenv", c"setpgid",
+    c"setrlimit", c"setsid", c"setsockopt", c"setvbuf", c"shutdown", c"sigaction", c"sigaddset",
+    c"sigemptyset", c"signal", c"sigprocmask", c"sin", c"sinf", c"sinh", c"sinhf", c"sleep",
+    c"snprintf", c"socket", c"socketpair", c"sprintf", c"sqrt", c"sqrtf", c"srand", c"sscanf",
+    c"stat", c"strcasecmp", c"strcat", c"strchr", c"strcmp", c"strcpy", c"strcspn", c"strdup",
+    c"strerror", c"strftime", c"strlen", c"strncasecmp", c"strncmp", c"strncpy", c"strndup",
+    c"strnlen", c"strpbrk", c"strrchr", c"strsep", c"strspn", c"strstr", c"strtod", c"strtof",
+    c"strtok", c"strtok_r", c"strtol", c"strtold", c"strtoll", c"strtoul", c"strtoull", c"symlink",
+    c"syscall", c"sysconf", c"sysctlbyname", c"system", c"tan", c"tanf", c"tanh", c"tanhf",
+    c"tcgetattr", c"tcsetattr", c"tgamma", c"tgammaf", c"time", c"timespec_get", c"tolower",
+    c"toupper", c"trunc", c"truncate", c"truncf", c"tzset", c"umask", c"uname", c"unlink",
+    c"unlockpt", c"unsetenv", c"usleep", c"utimes", c"vsnprintf", c"wait", c"wait4", c"waitpid",
+    c"wcslen", c"write",
+];
+const LIBSYSTEM_COUNT: i64 = 402;
+
+// Whether a symbol's name (with its underscore) is one of LIBSYSTEM's.
+fn in_libsystem(name: *u8) -> bool {
+    unsafe {
+        if name[0] != '_' {
+            return false;
+        }
+        let bare = &name[1];
+        for i in 0..LIBSYSTEM_COUNT {
+            if streq(LIBSYSTEM[i], bare) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// ---- Bytes ----
+
+fn get16(d: *u8, at: i64) -> i64 {
+    unsafe { d[at] as i64 | (d[at + 1] as i64) << 8 }
+}
+
+fn get32(d: *u8, at: i64) -> i64 {
+    get16(d, at) | get16(d, at + 2) << 16
+}
+
+fn get64(d: *u8, at: i64) -> i64 {
+    get32(d, at) | get32(d, at + 4) << 32
+}
+
+fn put8(d: *u8, at: i64, v: i64) {
+    unsafe {
+        d[at] = (v & 255) as u8;
+    }
+}
+
+fn put16(d: *u8, at: i64, v: i64) {
+    put8(d, at, v);
+    put8(d, at + 1, v >> 8);
+}
+
+fn put32(d: *u8, at: i64, v: i64) {
+    put16(d, at, v);
+    put16(d, at + 2, v >> 16);
+}
+
+fn put64(d: *u8, at: i64, v: i64) {
+    put32(d, at, v);
+    put32(d, at + 4, v >> 32);
+}
+
+// Big-endian, for the code signature.
+fn putbe32(d: *u8, at: i64, v: i64) {
+    put8(d, at, v >> 24);
+    put8(d, at + 1, v >> 16);
+    put8(d, at + 2, v >> 8);
+    put8(d, at + 3, v);
+}
+
+fn putbe64(d: *u8, at: i64, v: i64) {
+    putbe32(d, at, v >> 32);
+    putbe32(d, at + 4, v);
+}
+
+// A name in a 16-byte field.
+fn put_name(d: *u8, at: i64, name: *u8) {
+    unsafe {
+        let n = strlen(name) as i64;
+        for i in 0..n {
+            d[at + i] = name[i];
+        }
+    }
+}
+
+// Whether the 16-byte field at d[at] holds name.
+fn name_is(d: *u8, at: i64, name: *u8) -> bool {
+    unsafe {
+        let n = strlen(name) as i64;
+        for i in 0..16 {
+            let c = if i < n { name[i] } else { 0 };
+            if d[at + i] != c {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// ---- SHA-256 ----
+
+const K256: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+fn rotr(x: u32, n: u32) -> u32 {
+    (x >> n) | (x << (32 - n))
+}
+
+// The 64-byte blocks of s from `at`, n of them, into state h (FIPS 180-4).
+fn sha_blocks_portable(h: inout [u32; 8], s: [u8], at: i64, n: i64) {
+    var w: [u32; 64] = [0; 64];
+    for blk in 0..n {
+        let base = at + 64 * blk;
+        for i in 0..16 {
+            let p = base + 4 * i;
+            w[i] = (s[p] as u32) << 24 | (s[p + 1] as u32) << 16 | (s[p + 2] as u32) << 8
+                | s[p + 3] as u32;
+        }
+        for i in 16..64 {
+            let s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            let s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        var a = h[0];
+        var b = h[1];
+        var c = h[2];
+        var d = h[3];
+        var e = h[4];
+        var f = h[5];
+        var g = h[6];
+        var hh = h[7];
+        for i in 0..64 {
+            let t1 = hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + K256[i]
+                + w[i];
+            let t2 = (rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+            hh = g;
+            g = f;
+            f = e;
+            e = d + t1;
+            d = c;
+            c = b;
+            b = a;
+            a = t1 + t2;
+        }
+        h[0] += a;
+        h[1] += b;
+        h[2] += c;
+        h[3] += d;
+        h[4] += e;
+        h[5] += f;
+        h[6] += g;
+        h[7] += hh;
+    }
+}
+
+// The same by the sha2 instructions.
+fn sha_blocks_hw(h: inout [u32; 8], s: [u8], at: i64, n: i64) {
+    let k = K256[..];
+    var abcd = vld1q_u32(h[..], 0);
+    var efgh = vld1q_u32(h[..], 4);
+    for blk in 0..n {
+        let p = at + 64 * blk;
+        var m0 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(s, p)));
+        var m1 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(s, p + 16)));
+        var m2 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(s, p + 32)));
+        var m3 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(s, p + 48)));
+        let abcd0 = abcd;
+        let efgh0 = efgh;
+        for g in 0..16 {
+            let wk = vaddq_u32(m0, vld1q_u32(k, 4 * g));
+            let a = abcd;
+            abcd = vsha256hq_u32(abcd, efgh, wk);
+            efgh = vsha256h2q_u32(efgh, a, wk);
+            let next = if g < 12 { vsha256su1q_u32(vsha256su0q_u32(m0, m1), m2, m3) } else { m0 };
+            m0 = m1;
+            m1 = m2;
+            m2 = m3;
+            m3 = next;
+        }
+        abcd = vaddq_u32(abcd, abcd0);
+        efgh = vaddq_u32(efgh, efgh0);
+    }
+    vst1q_u32(&h[..], 0, abcd);
+    vst1q_u32(&h[..], 4, efgh);
+}
+
+fn sha_blocks(h: inout [u32; 8], s: [u8], at: i64, n: i64) {
+    if detect("sha2") {
+        sha_blocks_hw(&h, s, at, n);
+    } else {
+        sha_blocks_portable(&h, s, at, n);
+    }
+}
+
+// SHA-256 of d[at..at + n] into out[o..o + 32].
+fn sha256(d: *u8, at: i64, n: i64, out: *u8, o: i64) {
+    unsafe {
+        var h: [u32; 8] = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
+        ];
+        let full = n / 64;
+        sha_blocks(&h, d[at..at + n], 0, full);
+        // The rest, then 0x80, zeros and the length in bits: one block or two.
+        var tail: [u8; 128] = [0; 128];
+        let rest = n - 64 * full;
+        for i in 0..rest {
+            tail[i] = d[at + 64 * full + i];
+        }
+        tail[rest] = 0x80;
+        let blocks = if rest < 56 { 1 } else { 2 };
+        let bits = n * 8;
+        for i in 0..8 {
+            tail[64 * blocks - 1 - i] = ((bits >> (8 * i)) & 255) as u8;
+        }
+        sha_blocks(&h, tail[..], 0, blocks);
+        for i in 0..8 {
+            putbe32(out, o + 4 * i, h[i] as i64);
+        }
+    }
+}
+
+// ---- The object ----
+
+// Section kinds: the object's three, and the two the link adds.
+const K_TEXT: i64 = 0;
+const K_CONST: i64 = 1;
+const K_DATA: i64 = 2;
+const K_STUBS: i64 = 3;
+const K_GOT: i64 = 4;
+
+// Relocation types (ARM64_RELOC_*).
+const R_UNSIGNED: i64 = 0;
+const R_BRANCH26: i64 = 2;
+const R_PAGE21: i64 = 3;
+const R_PAGEOFF12: i64 = 4;
+const R_GOT_PAGE21: i64 = 5;
+const R_GOT_PAGEOFF12: i64 = 6;
+const R_ADDEND: i64 = 10;
+
+const BASE: i64 = 0x100000000;
+const PAGE: i64 = 0x4000;
+
+// The link: the object (OB, its bytes), its sections by kind, its symbols,
+// and what the output adds (imports, stubs, GOT slots).
+struct Link {
+    ob: *u8,
+    // per kind (5): in the object (offset, address, size, alignment as a
+    // power of 2, relocations' offset and count), whether present; in
+    // the output (address, file offset, section ordinal)
+    in_off: [i64; 5],
+    in_addr: [i64; 5],
+    size: [i64; 5],
+    align: [i64; 5],
+    rel_off: [i64; 5],
+    rel_n: [i64; 5],
+    present: [bool; 5],
+    addr: [i64; 5],
+    file: [i64; 5],
+    ord: [i64; 5],
+    // the object's section ordinals (1..) by kind, -1 for none
+    ord_kind: [i64; 16],
+    symoff: i64,
+    nsyms: i64,
+    stroff: i64,
+    // per symbol: its kind (-1: undefined), its import (-1), its GOT
+    // slot (-1), its index in the output's symbol table (-1: none)
+    sym_kind: *i64,
+    sym_import: *i64,
+    sym_got: *i64,
+    sym_index: *i64,
+    imports: IntVec,
+    // per import, its stub (-1: none)
+    stub_of: IntVec,
+    stubs: IntVec,
+    got: IntVec,
+}
+
+// The symbol's name.
+fn sym_name(l: *Link, s: i64) -> *u8 {
+    unsafe { &l.ob[l.stroff + get32(l.ob, l.symoff + 16 * s)] }
+}
+
+fn sym_value(l: *Link, s: i64) -> i64 {
+    unsafe { get64(l.ob, l.symoff + 16 * s + 8) }
+}
+
+// A defined symbol's address in the output.
+fn sym_addr(l: *Link, s: i64) -> i64 {
+    unsafe {
+        let k = l.sym_kind[s];
+        l.addr[k] + sym_value(l, s) - l.in_addr[k]
+    }
+}
+
+// Reads the object's header, sections and symbols: whether it is one
+// link_macho takes.
+fn read_object(l: inout Link, n: i64) -> bool {
+    unsafe {
+        let d = l.ob;
+        if n < 32 || get32(d, 0) != 0xfeedfacf || get32(d, 4) != 0x0100000c || get32(d, 12) != 1 {
+            return false;
+        }
+        for i in 0..16 {
+            l.ord_kind[i] = -1;
+        }
+        let ncmds = get32(d, 16);
+        var c = 32;
+        var nsect = 0;
+        for _ in 0..ncmds {
+            let cmd = get32(d, c);
+            let size = get32(d, c + 4);
+            if cmd == 0x19 {
+                let ns = get32(d, c + 64);
+                for i in 0..ns {
+                    let s = c + 72 + 80 * i;
+                    var k = -1;
+                    if name_is(d, s, c"__text") && name_is(d, s + 16, c"__TEXT") {
+                        k = K_TEXT;
+                    } else if name_is(d, s, c"__const") && name_is(d, s + 16, c"__TEXT") {
+                        k = K_CONST;
+                    } else if name_is(d, s, c"__data") && name_is(d, s + 16, c"__DATA") {
+                        k = K_DATA;
+                    }
+                    if k < 0 || l.present[k] || nsect >= 15 {
+                        return false;
+                    }
+                    nsect += 1;
+                    l.ord_kind[nsect] = k;
+                    l.present[k] = true;
+                    l.in_addr[k] = get64(d, s + 32);
+                    l.size[k] = get64(d, s + 40);
+                    l.in_off[k] = get32(d, s + 48);
+                    l.align[k] = get32(d, s + 52);
+                    l.rel_off[k] = get32(d, s + 56);
+                    l.rel_n[k] = get32(d, s + 60);
+                    if l.in_off[k] + l.size[k] > n || l.rel_off[k] + 8 * l.rel_n[k] > n {
+                        return false;
+                    }
+                }
+            } else if cmd == 2 {
+                l.symoff = get32(d, c + 8);
+                l.nsyms = get32(d, c + 12);
+                l.stroff = get32(d, c + 16);
+                if l.symoff + 16 * l.nsyms > n || l.stroff + get32(d, c + 20) > n {
+                    return false;
+                }
+            } else if cmd != 0x32 && cmd != 0xb {
+                return false;
+            }
+            c += size;
+        }
+        if !l.present[K_TEXT] || l.rel_n[K_CONST] > 0 {
+            return false;
+        }
+        l.sym_kind = alloc_array::<i64>(l.nsyms + 1);
+        l.sym_import = alloc_array::<i64>(l.nsyms + 1);
+        l.sym_got = alloc_array::<i64>(l.nsyms + 1);
+        l.sym_index = alloc_array::<i64>(l.nsyms + 1);
+        for s in 0..l.nsyms {
+            let e = l.symoff + 16 * s;
+            let ty = d[e + 4] as i64;
+            l.sym_import[s] = -1;
+            l.sym_got[s] = -1;
+            l.sym_index[s] = -1;
+            if (ty & 0xe0) != 0 {
+                // a debugging symbol
+                return false;
+            }
+            if (ty & 0x0e) == 0x0e {
+                let sect = d[e + 5] as i64;
+                if sect < 1 || sect > 15 || l.ord_kind[sect] < 0 {
+                    return false;
+                }
+                l.sym_kind[s] = l.ord_kind[sect];
+            } else if (ty & 0x0e) == 0 && (ty & 1) == 1 {
+                l.sym_kind[s] = -1;
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// Symbol s's import (made when first asked for), or -1: not one libSystem
+// has.
+fn import_of(l: inout Link, s: i64) -> i64 {
+    unsafe {
+        if l.sym_import[s] >= 0 {
+            return l.sym_import[s];
+        }
+        if !in_libsystem(sym_name(&l, s)) {
+            return -1;
+        }
+        l.sym_import[s] = l.imports.count;
+        l.imports.push(s);
+        l.sym_import[s]
+    }
+}
+
+// Symbol s's GOT slot (made when first asked for).
+fn got_of(l: inout Link, s: i64) -> i64 {
+    unsafe {
+        if l.sym_got[s] < 0 {
+            l.sym_got[s] = l.got.count;
+            l.got.push(s);
+        }
+        l.sym_got[s]
+    }
+}
+
+// The relocations, a first time: what they need (imports, stubs, GOT
+// slots), and whether link_macho takes them all.
+fn scan_relocations(l: inout Link) -> bool {
+    unsafe {
+        let d = l.ob;
+        for k in 0..3 {
+            if !l.present[k] {
+                continue;
+            }
+            for r in 0..l.rel_n[k] {
+                let at = l.rel_off[k] + 8 * r;
+                let addr = get32(d, at);
+                let info = get32(d, at + 4);
+                let sym = info & 0xffffff;
+                let length = (info >> 25) & 3;
+                let ext = (info >> 27) & 1;
+                let ty = (info >> 28) & 15;
+                if (addr & 0x80000000) != 0 || addr >= l.size[k] {
+                    return false;
+                }
+                if ty == R_ADDEND && k == K_TEXT {
+                    continue;
+                }
+                if k == K_DATA {
+                    if ty != R_UNSIGNED || length != 3 || ((l.in_addr[k] + addr) & 7) != 0 {
+                        return false;
+                    }
+                    if ext == 1 {
+                        if sym >= l.nsyms {
+                            return false;
+                        }
+                        if l.sym_kind[sym] < 0 && import_of(&l, sym) < 0 {
+                            return false;
+                        }
+                    } else if sym < 1 || sym > 15 || l.ord_kind[sym] < 0 {
+                        return false;
+                    }
+                    continue;
+                }
+                if ext != 1 || sym >= l.nsyms || length != 2 {
+                    return false;
+                }
+                let undefined = l.sym_kind[sym] < 0;
+                if ty == R_BRANCH26 {
+                    if undefined {
+                        let i = import_of(&l, sym);
+                        if i < 0 {
+                            return false;
+                        }
+                        // (a stub per import called, in the order of the
+                        // first call)
+                        while l.stub_of.count <= i {
+                            l.stub_of.push(-1);
+                        }
+                        if l.stub_of.data[i] < 0 {
+                            l.stub_of.data[i] = l.stubs.count;
+                            l.stubs.push(sym);
+                        }
+                    }
+                } else if ty == R_GOT_PAGE21 || ty == R_GOT_PAGEOFF12 {
+                    if undefined && import_of(&l, sym) < 0 {
+                        return false;
+                    }
+                } else if ty == R_PAGE21 || ty == R_PAGEOFF12 {
+                    if undefined {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+        }
+        // The GOT: the stubs' slots first, in the stubs' order, then those
+        // GOT_LOAD reaches.
+        for i in 0..l.stubs.count {
+            got_of(&l, l.stubs.data[i]);
+        }
+        for r in 0..l.rel_n[K_TEXT] {
+            let at = l.rel_off[K_TEXT] + 8 * r;
+            let info = get32(d, at + 4);
+            let ty = (info >> 28) & 15;
+            if ty == R_GOT_PAGE21 || ty == R_GOT_PAGEOFF12 {
+                got_of(&l, info & 0xffffff);
+            }
+        }
+        true
+    }
+}
+
+// An instruction's new immediate for a relocation of type ty to target
+// from pc, or -1 when it does not fit (the link goes to ld).
+fn patch(insn: i64, ty: i64, pc: i64, target: i64) -> i64 {
+    if ty == R_BRANCH26 {
+        let delta = target - pc;
+        if (delta & 3) != 0 || delta >= (1 << 27) || delta < 0 - (1 << 27) {
+            return -1;
+        }
+        return (insn & 0xfc000000) | ((delta >> 2) & 0x3ffffff);
+    }
+    if ty == R_PAGE21 || ty == R_GOT_PAGE21 {
+        let delta = (target >> 12) - (pc >> 12);
+        if delta >= (1 << 20) || delta < 0 - (1 << 20) {
+            return -1;
+        }
+        return (insn & 0x9f00001f) | ((delta & 3) << 29) | (((delta >> 2) & 0x7ffff) << 5);
+    }
+    // PAGEOFF12: an add (unscaled) or a load or store (scaled by its size).
+    let lo = target & 0xfff;
+    var scale = 0;
+    if (insn & 0x3b000000) == 0x39000000 {
+        scale = (insn >> 30) & 3;
+        if (insn & 0x04800000) == 0x04800000 && scale == 0 {
+            scale = 4;
+        }
+    } else if (insn & 0x1f800000) != 0x11000000 {
+        return -1;
+    }
+    if (lo & ((1 << scale) - 1)) != 0 {
+        return -1;
+    }
+    (insn & 0xffc003ff) | ((lo >> scale) << 10)
+}
+
+// The fixups of a segment: per 8-byte slot of its first `slots`, 0 (none),
+// 1 + the value (a rebase's target or a bind) in VALUE.
+struct Fixups { kind: *u8, value: *i64, slots: i64 }
+
+fn fixups_new(size: i64) -> Fixups {
+    let slots = size / 8 + 1;
+    Fixups { kind: alloc_zeroed(slots), value: alloc_array::<i64>(slots), slots: slots }
+}
+
+// A rebase to target, or a bind to import i with addend a.
+fn rebase(f: *Fixups, offset: i64, target: i64) {
+    unsafe {
+        f.kind[offset / 8] = 1;
+        f.value[offset / 8] = target & 0xfffffffff;
+    }
+}
+
+fn bind(f: *Fixups, offset: i64, i: i64, a: i64) {
+    unsafe {
+        f.kind[offset / 8] = 2;
+        f.value[offset / 8] = i | a << 24 | 1 << 63;
+    }
+}
+
+// Writes segment's fixups (at file offset `file` of out) as chains, and
+// its dyld_chained_starts_in_segment into lk at `at` (segment_offset
+// `vmoff`, `pages` pages): the bytes it took.
+fn write_chains(f: *Fixups, out: *u8, file: i64, lk: *u8, at: i64, vmoff: i64, pages: i64) -> i64 {
+    unsafe {
+        let size = 22 + 2 * pages;
+        put32(lk, at, size);
+        put16(lk, at + 4, PAGE);
+        put16(lk, at + 6, 2);
+        put64(lk, at + 8, vmoff);
+        put32(lk, at + 16, 0);
+        put16(lk, at + 20, pages);
+        for p in 0..pages {
+            put16(lk, at + 22 + 2 * p, 0xffff);
+        }
+        var prev = -1;
+        for s in 0..f.slots {
+            if f.kind[s] == 0 {
+                continue;
+            }
+            let off = 8 * s;
+            put64(out, file + off, f.value[s]);
+            if prev >= 0 && prev / PAGE == off / PAGE {
+                let word = get64(out, file + prev) | ((off - prev) / 4) << 51;
+                put64(out, file + prev, word);
+            } else {
+                put16(lk, at + 22 + 2 * (off / PAGE), off % PAGE);
+            }
+            prev = off;
+        }
+        size
+    }
+}
+
+// Whether a symbol goes to the output's symbol table as a local: not an
+// assembler temporary (L...) nor a section's marker (ltmpN).
+fn keep_local(name: *u8) -> bool {
+    unsafe {
+        !(name[0] == 'L' || (name[0] == 'l' && name[1] == 't' && name[2] == 'm' && name[3] == 'p'))
+    }
+}
+
+// The file name in path (the signature's identifier).
+fn base_name(path: *u8) -> *u8 {
+    unsafe {
+        var at = 0;
+        var i = 0;
+        while path[i] != 0 {
+            if path[i] == '/' {
+                at = i + 1;
+            }
+            i += 1;
+        }
+        &path[at]
+    }
+}
+
+fn uleb_len(v: i64) -> i64 {
+    var n = 1;
+    var x = v >> 7;
+    while x != 0 {
+        n += 1;
+        x = x >> 7;
+    }
+    n
+}
+
+// Links the object at obj_path into the executable path: whether it did
+// (false: link_macho does not take this program, or could not write it;
+// the system's linker links).
+pub fn link_macho(path: *u8, obj_path: *u8) -> bool {
+    unsafe {
+        if ELF || X86 {
+            return false;
+        }
+        let ob = buf_new();
+        if !read_into(obj_path, ob) {
+            return false;
+        }
+        var l = Link {
+            ob: BUFS[ob].data,
+            in_off: [0; 5], in_addr: [0; 5], size: [0; 5], align: [0; 5], rel_off: [0; 5],
+            rel_n: [0; 5], present: [false; 5], addr: [0; 5], file: [0; 5], ord: [0; 5],
+            ord_kind: [0; 16], symoff: 0, nsyms: 0, stroff: 0,
+            sym_kind: 0 as *i64, sym_import: 0 as *i64, sym_got: 0 as *i64, sym_index: 0 as *i64,
+            imports: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            stub_of: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            stubs: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            got: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        };
+        if !read_object(&l, BUFS[ob].len) || !scan_relocations(&l) {
+            return false;
+        }
+        var main_sym = -1;
+        for s in 0..l.nsyms {
+            if l.sym_kind[s] == K_TEXT && streq(sym_name(&l, s), c"_main") {
+                main_sym = s;
+            }
+        }
+        if main_sym < 0 {
+            return false;
+        }
+        let nstubs = l.stubs.count;
+        let ngot = l.got.count;
+        l.present[K_STUBS] = nstubs > 0;
+        l.size[K_STUBS] = 12 * nstubs;
+        l.align[K_STUBS] = 2;
+        l.present[K_GOT] = ngot > 0;
+        l.size[K_GOT] = 8 * ngot;
+        l.align[K_GOT] = 3;
+        if l.present[K_CONST] && l.size[K_CONST] == 0 {
+            l.present[K_CONST] = false;
+        }
+        let has_data = l.present[K_DATA] && l.size[K_DATA] > 0;
+        l.present[K_DATA] = has_data;
+
+        // ---- The layout ----
+        let order = [K_TEXT, K_STUBS, K_CONST, K_GOT, K_DATA];
+        var nsect = 0;
+        var ntext = 0;
+        for i in 0..5 {
+            let k = order[i];
+            if l.present[k] {
+                nsect += 1;
+                l.ord[k] = nsect;
+                if i < 3 {
+                    ntext += 1;
+                }
+            }
+        }
+        let ident = base_name(path);
+        let ident_len = strlen(ident) as i64 + 1;
+        // load commands: __PAGEZERO, __TEXT, __DATA_CONST, __DATA,
+        // __LINKEDIT, then the others (16 chained fixups, 16 exports trie,
+        // 24 symtab, 80 dysymtab, 32 dylinker, 24 uuid, 32 build version,
+        // 16 source version, 24 main, 56 libSystem, 16 code signature)
+        var nseg = 3;
+        var cmds = 72 + 72 + 80 * ntext + 72;
+        if l.present[K_GOT] {
+            nseg += 1;
+            cmds += 72 + 80;
+        }
+        if has_data {
+            nseg += 1;
+            cmds += 72 + 80;
+        }
+        let ncmds = nseg + 11;
+        cmds += 16 + 16 + 24 + 80 + 32 + 24 + 32 + 16 + 24 + 56 + 16;
+        var at = 32 + cmds;
+        for i in 0..3 {
+            let k = order[i];
+            if l.present[k] {
+                at = align_up(at, 1 << l.align[k]);
+                l.file[k] = at;
+                l.addr[k] = BASE + at;
+                at += l.size[k];
+            }
+        }
+        let text_size = align_up(at, PAGE);
+        var seg = text_size;
+        var dc_off = 0;
+        var dc_size = 0;
+        if l.present[K_GOT] {
+            dc_off = seg;
+            l.file[K_GOT] = seg;
+            l.addr[K_GOT] = BASE + seg;
+            dc_size = align_up(l.size[K_GOT], PAGE);
+            seg += dc_size;
+        }
+        var da_off = 0;
+        var da_size = 0;
+        if has_data {
+            da_off = seg;
+            l.file[K_DATA] = seg;
+            l.addr[K_DATA] = BASE + seg;
+            da_size = align_up(l.size[K_DATA], PAGE);
+            seg += da_size;
+        }
+        let le_off = seg;
+
+        // ---- __LINKEDIT, but the signature ----
+        // The symbols: locals, the defined globals (with
+        // __mh_execute_header), the imports.
+        var nlocal = 0;
+        var next = 0;
+        let strs = buf_new();
+        crate::base::buf_byte(strs, ' ');
+        crate::base::buf_byte(strs, 0);
+        var syms = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for pass in 0..2 {
+            for s in 0..l.nsyms {
+                let k = l.sym_kind[s];
+                if k < 0 {
+                    continue;
+                }
+                let ext = (l.ob[l.symoff + 16 * s + 4] & 1) == 1;
+                if (pass == 0 && !ext && keep_local(sym_name(&l, s))) || (pass == 1 && ext) {
+                    l.sym_index[s] = syms.count;
+                    syms.push(s);
+                    if pass == 0 {
+                        nlocal += 1;
+                    } else {
+                        next += 1;
+                    }
+                }
+            }
+            if pass == 1 {
+                syms.push(-1);
+                next += 1;
+            }
+        }
+        for i in 0..l.imports.count {
+            let s = l.imports.data[i];
+            l.sym_index[s] = syms.count;
+            syms.push(s);
+        }
+        let nundef = l.imports.count;
+        let lk = buf_new();
+        // the chained fixups: header, starts in image, starts in the two
+        // segments, imports, their names
+        let fx_size_guess = 64 + 4 * nseg + 2 * (22 + 2 * (dc_size + da_size) / PAGE) + 4 * nundef;
+        var names_size = 0;
+        for i in 0..l.imports.count {
+            names_size += strlen(sym_name(&l, l.imports.data[i])) as i64 + 1;
+        }
+        let fx_cap = align_up(fx_size_guess + names_size + 64, 8);
+        let symtab_off = align_up(fx_cap + 32, 8);
+        let indirect_off = symtab_off + 16 * syms.count;
+        let nindirect = nstubs + ngot;
+        let strtab_off = indirect_off + 4 * nindirect;
+        // the strings
+        var strx = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..syms.count {
+            let s = syms.data[i];
+            strx.push(BUFS[strs].len);
+            crate::base::buf_str(strs,
+                if s < 0 { c"__mh_execute_header" } else { sym_name(&l, s) });
+            crate::base::buf_byte(strs, 0);
+        }
+        while BUFS[strs].len % 8 != 0 {
+            crate::base::buf_byte(strs, 0);
+        }
+        let strtab_size = BUFS[strs].len;
+        let sig_off_rel = align_up(strtab_off + strtab_size, 16);
+        let code_limit = le_off + sig_off_rel;
+        let pages = (code_limit + 4095) / 4096;
+        let cd_size = 88 + ident_len + 32 * pages;
+        let sig_size = align_up(20 + cd_size, 16);
+        let le_size = sig_off_rel + sig_size;
+        let total = le_off + le_size;
+        let out = alloc_zeroed(total);
+
+        // ---- The header and load commands ----
+        put32(out, 0, 0xfeedfacf);
+        put32(out, 4, 0x0100000c);
+        put32(out, 8, 0);
+        put32(out, 12, 2);
+        put32(out, 16, ncmds);
+        put32(out, 20, cmds);
+        put32(out, 24, 0x00200085);
+        var c = 32;
+        // __PAGEZERO
+        put32(out, c, 0x19);
+        put32(out, c + 4, 72);
+        put_name(out, c + 8, c"__PAGEZERO");
+        put64(out, c + 32, BASE);
+        c += 72;
+        // __TEXT
+        put32(out, c, 0x19);
+        put32(out, c + 4, 72 + 80 * ntext);
+        put_name(out, c + 8, c"__TEXT");
+        put64(out, c + 24, BASE);
+        put64(out, c + 32, text_size);
+        put64(out, c + 40, 0);
+        put64(out, c + 48, text_size);
+        put32(out, c + 56, 5);
+        put32(out, c + 60, 5);
+        put32(out, c + 64, ntext);
+        c += 72;
+        for i in 0..5 {
+            let k = order[i];
+            if !l.present[k] {
+                continue;
+            }
+            if i == 3 || i == 4 {
+                // the segment of __got or __data
+                let off = if i == 3 { dc_off } else { da_off };
+                let size = if i == 3 { dc_size } else { da_size };
+                put32(out, c, 0x19);
+                put32(out, c + 4, 72 + 80);
+                put_name(out, c + 8, if i == 3 { c"__DATA_CONST" } else { c"__DATA" });
+                put64(out, c + 24, BASE + off);
+                put64(out, c + 32, size);
+                put64(out, c + 40, off);
+                put64(out, c + 48, size);
+                put32(out, c + 56, 3);
+                put32(out, c + 60, 3);
+                put32(out, c + 64, 1);
+                put32(out, c + 68, if i == 3 { 0x10 } else { 0 });
+                c += 72;
+            }
+            put_name(out, c,
+                if k == K_TEXT { c"__text" } else if k == K_STUBS { c"__stubs" }
+                else if k == K_CONST { c"__const" } else if k == K_GOT { c"__got" }
+                else { c"__data" });
+            put_name(out, c + 16,
+                if i < 3 { c"__TEXT" } else if i == 3 { c"__DATA_CONST" } else { c"__DATA" });
+            put64(out, c + 32, l.addr[k]);
+            put64(out, c + 40, l.size[k]);
+            put32(out, c + 48, l.file[k]);
+            put32(out, c + 52, l.align[k]);
+            put32(out, c + 64,
+                if k == K_TEXT { 0x80000400 } else if k == K_STUBS { 0x80000408 }
+                else if k == K_GOT { 6 } else { 0 });
+            put32(out, c + 68, if k == K_GOT { nstubs } else { 0 });
+            put32(out, c + 72, if k == K_STUBS { 12 } else { 0 });
+            c += 80;
+        }
+        // __LINKEDIT
+        put32(out, c, 0x19);
+        put32(out, c + 4, 72);
+        put_name(out, c + 8, c"__LINKEDIT");
+        put64(out, c + 24, BASE + le_off);
+        put64(out, c + 32, align_up(le_size, PAGE));
+        put64(out, c + 40, le_off);
+        put64(out, c + 48, le_size);
+        put32(out, c + 56, 1);
+        put32(out, c + 60, 1);
+        c += 72;
+        let fixups_cmd = c;
+        put32(out, c, 0x80000034);
+        put32(out, c + 4, 16);
+        c += 16;
+        let trie_cmd = c;
+        put32(out, c, 0x80000033);
+        put32(out, c + 4, 16);
+        c += 16;
+        put32(out, c, 2);
+        put32(out, c + 4, 24);
+        put32(out, c + 8, le_off + symtab_off);
+        put32(out, c + 12, syms.count);
+        put32(out, c + 16, le_off + strtab_off);
+        put32(out, c + 20, strtab_size);
+        c += 24;
+        put32(out, c, 0xb);
+        put32(out, c + 4, 80);
+        put32(out, c + 8, 0);
+        put32(out, c + 12, nlocal);
+        put32(out, c + 16, nlocal);
+        put32(out, c + 20, next);
+        put32(out, c + 24, nlocal + next);
+        put32(out, c + 28, nundef);
+        put32(out, c + 56, le_off + indirect_off);
+        put32(out, c + 60, nindirect);
+        c += 80;
+        put32(out, c, 0xe);
+        put32(out, c + 4, 32);
+        put32(out, c + 8, 12);
+        put_name(out, c + 12, c"/usr/lib/dyld");
+        c += 32;
+        let uuid_at = c + 8;
+        put32(out, c, 0x1b);
+        put32(out, c + 4, 24);
+        c += 24;
+        // macOS 12.0, SDK 12.0; the tool: ld (3), 0.25
+        put32(out, c, 0x32);
+        put32(out, c + 4, 32);
+        put32(out, c + 8, 1);
+        put32(out, c + 12, 0x000c0000);
+        put32(out, c + 16, 0x000c0000);
+        put32(out, c + 20, 1);
+        put32(out, c + 24, 3);
+        put32(out, c + 28, 0x00001900);
+        c += 32;
+        put32(out, c, 0x2a);
+        put32(out, c + 4, 16);
+        c += 16;
+        put32(out, c, 0x80000028);
+        put32(out, c + 4, 24);
+        put64(out, c + 8, sym_addr(&l, main_sym) - BASE);
+        c += 24;
+        put32(out, c, 0xc);
+        put32(out, c + 4, 56);
+        put32(out, c + 8, 24);
+        put32(out, c + 12, 2);
+        put32(out, c + 16, 0x054c0000);
+        put32(out, c + 20, 0x00010000);
+        put_name(out, c + 24, c"/usr/lib/libSystem.B.dylib");
+        c += 56;
+        put32(out, c, 0x1d);
+        put32(out, c + 4, 16);
+        put32(out, c + 8, le_off + sig_off_rel);
+        put32(out, c + 12, sig_size);
+
+        // ---- The sections ----
+        for k in 0..3 {
+            if l.present[k] {
+                memcpy(&out[l.file[k]], &l.ob[l.in_off[k]], l.size[k] as u64);
+            }
+        }
+        for i in 0..nstubs {
+            let s = l.stubs.data[i];
+            let pc = l.addr[K_STUBS] + 12 * i;
+            let slot = l.addr[K_GOT] + 8 * l.sym_got[s];
+            let at_stub = l.file[K_STUBS] + 12 * i;
+            put32(out, at_stub, patch(0x90000010, R_PAGE21, pc, slot));
+            put32(out, at_stub + 4, patch(0xf9400210, R_PAGEOFF12, pc + 4, slot));
+            put32(out, at_stub + 8, 0xd61f0200);
+        }
+        // The text's relocations.
+        var addend = 0;
+        for r in 0..l.rel_n[K_TEXT] {
+            let ra = l.rel_off[K_TEXT] + 8 * r;
+            let off = get32(l.ob, ra);
+            let info = get32(l.ob, ra + 4);
+            let sym = info & 0xffffff;
+            let ty = (info >> 28) & 15;
+            if ty == R_ADDEND {
+                addend = if (sym & 0x800000) != 0 { sym - 0x1000000 } else { sym };
+                continue;
+            }
+            let pc = l.addr[K_TEXT] + off;
+            var target = 0;
+            if ty == R_GOT_PAGE21 || ty == R_GOT_PAGEOFF12 {
+                target = l.addr[K_GOT] + 8 * l.sym_got[sym];
+            } else if l.sym_kind[sym] < 0 {
+                // (a call of an import: its stub)
+                target = l.addr[K_STUBS] + 12 * l.stub_of.data[l.sym_import[sym]];
+            } else {
+                target = sym_addr(&l, sym) + addend;
+            }
+            addend = 0;
+            let insn = get32(out, l.file[K_TEXT] + off);
+            let patched = patch(insn, ty, pc, target);
+            if patched < 0 {
+                return false;
+            }
+            put32(out, l.file[K_TEXT] + off, patched);
+        }
+        // The fixups: the GOT's slots, the data's pointers.
+        let fx_got = fixups_new(l.size[K_GOT]);
+        for g in 0..ngot {
+            let s = l.got.data[g];
+            if l.sym_kind[s] < 0 {
+                bind(&fx_got, 8 * g, l.sym_import[s], 0);
+            } else {
+                rebase(&fx_got, 8 * g, sym_addr(&l, s));
+            }
+        }
+        let fx_data = fixups_new(l.size[K_DATA]);
+        for r in 0..l.rel_n[K_DATA] {
+            let ra = l.rel_off[K_DATA] + 8 * r;
+            let off = get32(l.ob, ra);
+            let info = get32(l.ob, ra + 4);
+            let sym = info & 0xffffff;
+            let ext = (info >> 27) & 1;
+            let value = get64(out, l.file[K_DATA] + off);
+            if ext == 0 {
+                let k = l.ord_kind[sym];
+                rebase(&fx_data, off, l.addr[k] + value - l.in_addr[k]);
+            } else if l.sym_kind[sym] >= 0 {
+                rebase(&fx_data, off, sym_addr(&l, sym) + value);
+            } else {
+                if value < 0 || value > 255 {
+                    return false;
+                }
+                bind(&fx_data, off, l.sym_import[sym], value);
+            }
+        }
+
+        // ---- __LINKEDIT ----
+        let le = &out[le_off];
+        // dyld_chained_fixups_header (28 bytes, then starts at 32)
+        let starts = 32;
+        put32(le, starts, nseg);
+        var w = align_up(starts + 4 + 4 * nseg, 8);
+        var segi = 0;
+        // (segments: __PAGEZERO, __TEXT, [__DATA_CONST], [__DATA], __LINKEDIT)
+        segi = 2;
+        if l.present[K_GOT] {
+            put32(le, starts + 4 + 4 * segi, w - starts);
+            w += write_chains(&fx_got, out, dc_off, le, w, dc_off, dc_size / PAGE);
+            w = align_up(w, 8);
+            segi += 1;
+        }
+        if has_data {
+            put32(le, starts + 4 + 4 * segi, w - starts);
+            w += write_chains(&fx_data, out, da_off, le, w, da_off, da_size / PAGE);
+            w = align_up(w, 8);
+        }
+        let imports_off = w;
+        w += 4 * nundef;
+        let symbols_off = w;
+        for i in 0..nundef {
+            let name = sym_name(&l, l.imports.data[i]);
+            put32(le, imports_off + 4 * i, 1 | (w - symbols_off) << 9);
+            let n = strlen(name) as i64;
+            for j in 0..n {
+                le[w + j] = name[j];
+            }
+            w += n + 1;
+        }
+        let fx_size = align_up(w, 8);
+        if fx_size > fx_cap {
+            return false;
+        }
+        put32(le, 0, 0);
+        put32(le, 4, starts);
+        put32(le, 8, imports_off);
+        put32(le, 12, symbols_off);
+        put32(le, 16, nundef);
+        put32(le, 20, 1);
+        put32(le, 24, 0);
+        put32(out, fixups_cmd + 8, le_off);
+        put32(out, fixups_cmd + 12, fx_size);
+        // The exports trie: __mh_execute_header at 0.
+        let trie = fx_cap;
+        put8(le, trie, 0);
+        put8(le, trie + 1, 1);
+        put_name(le, trie + 2, c"__mh_execute_header");
+        put8(le, trie + 22, 23);
+        put8(le, trie + 23, 2);
+        put32(out, trie_cmd + 8, le_off + trie);
+        put32(out, trie_cmd + 12, 32);
+        // The symbol table.
+        for i in 0..syms.count {
+            let s = syms.data[i];
+            let e = symtab_off + 16 * i;
+            put32(le, e, strx.data[i]);
+            if s < 0 {
+                put8(le, e + 4, 0x0f);
+                put8(le, e + 5, 1);
+                put16(le, e + 6, 0x10);
+                put64(le, e + 8, BASE);
+            } else if l.sym_kind[s] < 0 {
+                put8(le, e + 4, 0x01);
+                put16(le, e + 6, 0x0100);
+            } else {
+                put8(le, e + 4, l.ob[l.symoff + 16 * s + 4] as i64);
+                put8(le, e + 5, l.ord[l.sym_kind[s]]);
+                put64(le, e + 8, sym_addr(&l, s));
+            }
+        }
+        // The indirect symbols: the stubs', then the GOT's.
+        for i in 0..nstubs {
+            put32(le, indirect_off + 4 * i, l.sym_index[l.stubs.data[i]]);
+        }
+        for g in 0..ngot {
+            let s = l.got.data[g];
+            put32(le, indirect_off + 4 * (nstubs + g),
+                if l.sym_kind[s] < 0 { l.sym_index[s] } else { 0x80000000 });
+        }
+        memcpy(&le[strtab_off], BUFS[strs].data, strtab_size as u64);
+
+        // ---- The signature ----
+        let sig = le_off + sig_off_rel;
+        putbe32(out, sig, 0xfade0cc0);
+        putbe32(out, sig + 4, 20 + cd_size);
+        putbe32(out, sig + 8, 1);
+        putbe32(out, sig + 12, 0);
+        putbe32(out, sig + 16, 20);
+        let cd = sig + 20;
+        putbe32(out, cd, 0xfade0c02);
+        putbe32(out, cd + 4, cd_size);
+        putbe32(out, cd + 8, 0x20400);
+        putbe32(out, cd + 12, 0x20002);
+        putbe32(out, cd + 16, 88 + ident_len);
+        putbe32(out, cd + 20, 88);
+        putbe32(out, cd + 24, 0);
+        putbe32(out, cd + 28, pages);
+        putbe32(out, cd + 32, code_limit);
+        put8(out, cd + 36, 32);
+        put8(out, cd + 37, 2);
+        put8(out, cd + 38, 0);
+        put8(out, cd + 39, 12);
+        putbe64(out, cd + 64, 0);
+        putbe64(out, cd + 72, text_size);
+        putbe64(out, cd + 80, 1);
+        for i in 0..ident_len - 1 {
+            out[cd + 88 + i] = ident[i];
+        }
+        let hashes = cd + 88 + ident_len;
+        for p in 0..pages {
+            let from = 4096 * p;
+            let n = if from + 4096 <= code_limit { 4096 } else { code_limit - from };
+            sha256(out, from, n, out, hashes + 32 * p);
+        }
+        // The UUID: of the page hashes (with the UUID zero), then page 0
+        // again.
+        let uuid = alloc_zeroed(32);
+        sha256(out, hashes, 32 * pages, uuid, 0);
+        uuid[6] = (uuid[6] & 0x0f) | 0x40;
+        uuid[8] = (uuid[8] & 0x3f) | 0x80;
+        for i in 0..16 {
+            out[uuid_at + i] = uuid[i];
+        }
+        sha256(out, 0, if code_limit < 4096 { code_limit } else { 4096 }, out, hashes);
+
+        // ---- The file: written aside, then renamed over path ----
+        let tmp = buf_new();
+        crate::base::buf_str(tmp, path);
+        crate::base::buf_fmt(tmp, f".{getpid()}.tmp\0");
+        let f = fopen(BUFS[tmp].data, c"wb");
+        if f == 0 as *u8 {
+            return false;
+        }
+        let wrote = fwrite(out, 1, total as u64, f);
+        fclose(f);
+        if wrote != total as u64 || chmod(BUFS[tmp].data, 493) != 0
+            || rename(BUFS[tmp].data, path) != 0 {
+            unlink(BUFS[tmp].data);
+            return false;
+        }
+        true
+    }
+}

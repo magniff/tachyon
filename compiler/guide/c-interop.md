@@ -166,7 +166,9 @@ A program with nothing to link but itself skips `cc`: the system's
 linker runs directly, with the command `cc -###` gave the first time
 (kept in the user's cache directory; `$VOLE_LINK_CACHE` names another,
 `off` none). The executable is the same. `--linker=cc` (or
-`$VOLE_LINKER=cc`) links through `cc` anyway.
+`$VOLE_LINKER=cc`) links through `cc` anyway. On AArch64 macOS,
+`--linker=internal` links with the compiler's own linker (no `ld`, a
+few ms), when the program needs nothing but libSystem; else `ld` does.
 
 Reading stdin: std has `read_line` and `read_stdin` (`volec guide
 std`); from C, `getchar()` from `stdio.h`, or `read(0, buf, n)` from
