@@ -1,0 +1,365 @@
+// Calls of std::arch's intrinsics (0.19, docs/design/arch.md §2.1, §2.9):
+// after a call of a virtual declaration is checked as any call
+// (check_direct_call), its immediates are checked against the table's
+// ranges, has()/detect() take a known feature's name as a literal,.
+// Spellings from Rust and C are named with their vole form
+// (arch.rust_form: `vshrq_n_u8::<3>(v)` and `is_x86_feature_detected!`,
+// from the parser; arch.raw_form: a memory intrinsic given a pointer).
+
+use crate::arch::{
+    ARCH_X86_64, FEAT_DETECT, FORM_FEAT, INTRS, MEM_LOAD, MEM_STORE, intr_param_hi,
+    intr_param_is_const, intr_param_lo, intr_param_name, intrinsic_named, intrinsic_of_fn,
+};
+use crate::arch::features::parse_feature;
+use crate::base::{
+    FILES, FILE_COUNT, SRC, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, sym_text,
+};
+use crate::base::diag::{err_begin, err_end, err_fmt, err_help, err_str, err_try_tool};
+use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::check::Res;
+use crate::front::check::synth_mode::synth_expr;
+use crate::front::consteval::const_eval;
+use crate::front::features::{
+    AE_CONST_ARG, AE_FEATURE_LITERAL, AE_RAW_FORM, AE_RUST_FORM, arch_error_begin, arch_error_end,
+    note_feature_call, unknown_feature,
+};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok, str_at};
+use crate::front::types::{FNS, is_pointer};
+
+// Call n of function f, a declaration of std::arch's (FN_INTRINSIC).
+pub fn check_intrinsic_call(n: i64, f: i64) {
+    unsafe {
+        let id = intrinsic_of_fn(f);
+        if id < 0 || NODES[n].count != INTRS[id].nparams {
+            return;
+        }
+        if INTRS[id].form == FORM_FEAT {
+            check_feature_call(n, id);
+            return;
+        }
+        for k in 0..INTRS[id].nparams {
+            if intr_param_is_const(id, k) {
+                check_immediate(n, f, id, k);
+            }
+        }
+    }
+}
+
+// has("f") and detect("f"): a literal naming a feature.
+fn check_feature_call(n: i64, id: i64) {
+    unsafe {
+        let arg = child(n, 0);
+        if NODES[arg].kind != NodeKind::Str {
+            arch_error_begin(NODES[arg].start, AE_FEATURE_LITERAL);
+            err_fmt(f"'{sym_text(INTRS[id].name)}' takes the feature's name as a string literal: its answer is a constant of the build or one cached bit");
+            err_help(c"write the name: `std::arch::has(\"neon\")`; `volec explain arch.feature_name` lists them");
+            arch_error_end();
+            return;
+        }
+        let name = str_at(NODES[arg].a);
+        let bit = parse_feature(name);
+        if bit < 0 {
+            unknown_feature(name, NODES[arg].start, arg);
+            return;
+        }
+        note_feature_call(n, bit, INTRS[id].form_arg == FEAT_DETECT);
+        // (0.19 T3) std's run-time word: its functions are lazy, checked (and
+        // emitted) when a detect may need them
+        if INTRS[id].form_arg == FEAT_DETECT {
+            crate::front::assoc::ensure_checked(crate::back::isel::arch::arch_std_fn(true), n);
+            crate::front::assoc::ensure_checked(crate::back::isel::arch::arch_std_fn(false), n);
+        }
+    }
+}
+
+// Whether e is a constant expression: literals, constants, and operators
+// and casts of them.
+fn is_constant(e: i64) -> bool {
+    unsafe {
+        let kind = NODES[e].kind;
+        if kind == NodeKind::Int || kind == NodeKind::Char || kind == NodeKind::Bool {
+            return true;
+        }
+        if kind == NodeKind::Ident {
+            return NODES[e].res == Res::Const;
+        }
+        if kind == NodeKind::Unary {
+            return NODES[e].op != Tok::Star && NODES[e].op != Tok::Amp && is_constant(NODES[e].b);
+        }
+        if kind == NodeKind::Binary {
+            return is_constant(NODES[e].a) && is_constant(NODES[e].b);
+        }
+        if kind == NodeKind::Cast {
+            return is_constant(NODES[e].a);
+        }
+        false
+    }
+}
+
+// Immediate k of intrinsic id at call n (of declaration f): a constant in
+// the table's range (arch.const_arg).
+fn check_immediate(n: i64, f: i64, id: i64, k: i64) {
+    unsafe {
+        let arg = child(n, k);
+        let lo = intr_param_lo(id, k);
+        let hi = intr_param_hi(id, k);
+        let fname = sym_text(INTRS[id].name);
+        let pname = sym_text(intr_param_name(id, k));
+        if !is_constant(arg) {
+            arch_error_begin(NODES[arg].start, AE_CONST_ARG);
+            err_fmt(
+                f"'{fname}' takes {pname} as a constant in {lo}..={hi}: its instruction encodes it");
+            err_help(c"write a literal or a `const`; to choose at run time, branch on the value (`if n == 3 { f(a, 3) } else { ... }`)");
+            arch_error_end();
+            return;
+        }
+        let value = const_eval(arg);
+        if value < lo || value > hi {
+            arch_error_begin(NODES[arg].start, AE_CONST_ARG);
+            err_fmt(f"'{fname}' takes {pname} in {lo}..={hi}; got {value}");
+            arch_error_end();
+        }
+    }
+}
+
+// ---- Spellings from Rust and C (0.19 T1, docs/design/arch.md §2.9) ----
+
+// The file of position pos (an index in FILES).
+fn file_at(pos: i64) -> i64 {
+    unsafe {
+        var f = 0;
+        while f + 1 < FILE_COUNT && pos >= FILES[f + 1].start {
+            f += 1;
+        }
+        f
+    }
+}
+
+// Whether text s holds a quote or a line break (no `try:` line for it).
+fn unquotable(s: [u8]) -> bool {
+    for i in 0..s.len {
+        if s[i] == '\'' || s[i] == '\n' {
+            return true;
+        }
+    }
+    false
+}
+
+// `try: volec edit patch FILE:LINE --old 'OLD' --new 'NEW'` for the error
+// at pos; none in a virtual source or for text a shell word cannot hold.
+fn try_patch_at(pos: i64, old: [u8], new: [u8]) {
+    unsafe {
+        let f = file_at(pos);
+        let path = FILES[f].path;
+        if path[0] == '<' || unquotable(old) || unquotable(new) {
+            return;
+        }
+        var line = 1;
+        for i in FILES[f].start..pos {
+            if SRC[i] == '\n' {
+                line += 1;
+            }
+        }
+        let a = buf_new();
+        buf_str(a, c"edit patch ");
+        buf_str(a, if path[0] == '.' && path[1] == '/' { &path[2] } else { path });
+        buf_byte(a, ':');
+        buf_int(a, line);
+        buf_str(a, c" --old '");
+        buf_bytes(a, old);
+        buf_str(a, c"' --new '");
+        buf_bytes(a, new);
+        buf_str(a, c"'");
+        err_try_tool(buf_slice(a), false);
+    }
+}
+
+// The token closing the bracket opened at token i (TOK_COUNT - 1 if none).
+fn closing_token(i: i64) -> i64 {
+    unsafe {
+        var depth = 0;
+        var k = i;
+        while k < TOK_COUNT {
+            let kind = TOKS[k].kind;
+            if kind == Tok::LParen || kind == Tok::LBracket || kind == Tok::LBrace {
+                depth += 1;
+            } else if kind == Tok::RParen || kind == Tok::RBracket || kind == Tok::RBrace {
+                depth -= 1;
+                if depth == 0 {
+                    return k;
+                }
+            }
+            k += 1;
+        }
+        TOK_COUNT - 1
+    }
+}
+
+// The parser's error for `NAME::<3>(args)` (token i is NAME, `::<` and a
+// number follow): Rust's const generics, which vole writes as
+// arguments after the others (arch.rust_form for an intrinsic, a parser
+// error for another function): `NAME(args, 3)`.
+pub fn turbofish_const_error(i: i64) -> ! {
+    unsafe {
+        let start = TOKS[i].start;
+        var gt = i + 3;
+        while gt + 1 < TOK_COUNT && TOKS[gt].kind != Tok::Gt && TOKS[gt].kind != Tok::Semi {
+            gt += 1;
+        }
+        let values = SRC[TOKS[i + 3].start..TOKS[gt - 1].end];
+        let old = buf_new();
+        let new = buf_new();
+        buf_bytes(new, sym_text(TOKS[i].value as i64));
+        buf_str(new, c"(");
+        var end = TOKS[gt].end;
+        if TOKS[gt].kind == Tok::Gt && gt + 1 < TOK_COUNT && TOKS[gt + 1].kind == Tok::LParen {
+            let r = closing_token(gt + 1);
+            end = TOKS[r].end;
+            if r > gt + 2 {
+                buf_bytes(new, SRC[TOKS[gt + 1].end..TOKS[r].start]);
+                buf_str(new, c", ");
+            }
+        }
+        buf_bytes(new, values);
+        buf_str(new, c")");
+        buf_bytes(old, SRC[start..end]);
+        if intrinsic_named(TOKS[i].value as i64) >= 0 {
+            arch_error_begin(start, AE_RUST_FORM);
+            err_fmt(f"'{buf_slice(old)}': vole has no const generics; an intrinsic's immediates are arguments, after the others");
+            err_help(c"write the constant as the last argument; it must be a constant in the intrinsic's range (`volec query show NAME` gives it)");
+        } else {
+            err_begin(start);
+            err_fmt(
+                f"'{buf_slice(old)}': vole has no const generics; a constant is an ordinary argument");
+            err_help(c"pass it as an argument, and take it as a parameter in the function");
+        }
+        try_patch_at(start, buf_slice(old), buf_slice(new));
+        err_end()
+    }
+}
+
+// Whether `name!` is Rust's run-time feature test (`is_x86_feature_detected!`).
+pub fn is_detect_macro(name: i64) -> bool {
+    let text = sym_text(name);
+    text == "is_x86_feature_detected" || text == "is_aarch64_feature_detected"
+        || text == "is_arm_feature_detected"
+}
+
+// The parser's error for `is_x86_feature_detected!("avx2")` at token i:
+// std::arch::detect("avx2") here (arch.rust_form).
+pub fn detect_macro_error(i: i64) -> ! {
+    unsafe {
+        let start = TOKS[i].start;
+        let old = buf_new();
+        let new = buf_new();
+        buf_str(new, c"std::arch::detect(");
+        var end = TOKS[i].end;
+        if i + 2 < TOK_COUNT && TOKS[i + 2].kind == Tok::LParen {
+            let r = closing_token(i + 2);
+            end = TOKS[r].end;
+            buf_bytes(new, SRC[TOKS[i + 2].end..TOKS[r].start]);
+        }
+        buf_str(new, c")");
+        buf_bytes(old, SRC[start..end]);
+        arch_error_begin(start, AE_RUST_FORM);
+        err_fmt(
+            f"'{buf_slice(old)}' is {buf_slice(new)} here: a cached test of the running CPU, a constant when the feature is known");
+        err_help(c"`std::arch::has(\"f\")` is the build's answer, a constant; both take the feature's name as a literal");
+        try_patch_at(start, buf_slice(old), buf_slice(new));
+        err_end()
+    }
+}
+
+// Whether e is `&X[I]`, `X.ptr` or `X.ptr + I` (X a slice or an array):
+// X in *x, I in *i (0 for `X.ptr`).
+fn pointer_into(e: i64, x: inout i64, i: inout i64) -> bool {
+    unsafe {
+        let kind = NODES[e].kind;
+        if kind == NodeKind::Unary && NODES[e].op == Tok::Amp
+            && NODES[NODES[e].b].kind == NodeKind::Index {
+            x = NODES[NODES[e].b].a;
+            i = NODES[NODES[e].b].b;
+            return true;
+        }
+        if kind == NodeKind::FieldAccess && sym_text(NODES[e].b) == "ptr" {
+            x = NODES[e].a;
+            i = 0;
+            return true;
+        }
+        if kind == NodeKind::Binary && NODES[e].op == Tok::Plus
+            && NODES[NODES[e].b].kind == NodeKind::FieldAccess
+            && sym_text(NODES[NODES[e].b].b) == "ptr" {
+            x = NODES[NODES[e].b].a;
+            i = NODES[e].c;
+            return true;
+        }
+        false
+    }
+}
+
+// The source text of node e.
+fn node_text(e: i64) -> [u8] {
+    unsafe { SRC[NODES[e].start..NODES[e].end] }
+}
+
+// Call n of memory intrinsic f's safe form with one argument fewer, as C
+// and Rust call it with a pointer (`vld1q_u8(p)`): arch.raw_form when that
+// argument is a pointer, else the arity error; true when n was so reported
+// (its arguments checked).
+pub fn check_raw_form(n: i64, f: i64) -> bool {
+    unsafe {
+        let id = intrinsic_of_fn(f);
+        if id < 0 || (INTRS[id].mem != MEM_LOAD && INTRS[id].mem != MEM_STORE)
+            || FNS[f].param_count != INTRS[id].nparams || NODES[n].count != INTRS[id].nparams - 1 {
+            return false;
+        }
+        let s = INTRS[id].mem_param;
+        let name = sym_text(INTRS[id].name);
+        var pointer = false;
+        for k in 0..NODES[n].count {
+            let ty = synth_expr(child(n, k));
+            if k == s && is_pointer(ty) {
+                pointer = true;
+            }
+        }
+        let call = node_text(n);
+        if !pointer {
+            err_begin(NODES[n].start);
+            err_fmt(f"'{name}' takes a slice and an index (its bytes are checked to be in the slice), then the other arguments; got {NODES[n].count} arguments");
+            err_help(c"`volec query show NAME` gives its parameters");
+            err_end();
+            return true;
+        }
+        let module = if INTRS[id].arch == ARCH_X86_64 { c"x86_64" } else { c"aarch64" };
+        arch_error_begin(NODES[child(n, s)].start, AE_RAW_FORM);
+        err_fmt(
+            f"'{call}' passes a pointer: the safe form takes a slice and an index ('{name}(s, i)'), the pointer form is 'std::arch::");
+        err_str(module);
+        err_fmt(f"::raw::{name}' (unsafe)");
+        var x = 0;
+        var i = 0;
+        if pointer_into(child(n, s), &x, &i) {
+            let new = buf_new();
+            buf_bytes(new, name);
+            buf_str(new, c"(");
+            for k in 0..NODES[n].count {
+                if k > 0 {
+                    buf_str(new, c", ");
+                }
+                if k == s {
+                    buf_bytes(new, node_text(x));
+                    buf_str(new, c", ");
+                    if i == 0 { buf_str(new, c"0"); } else { buf_bytes(new, node_text(i)); }
+                } else {
+                    buf_bytes(new, node_text(child(n, k)));
+                }
+            }
+            buf_str(new, c")");
+            try_patch_at(NODES[n].start, call, buf_slice(new));
+        } else {
+            err_help(c"pass the slice the pointer points into and the index of the first element; the check is removed where the compiler proves it (counted loops)");
+        }
+        arch_error_end();
+        true
+    }
+}

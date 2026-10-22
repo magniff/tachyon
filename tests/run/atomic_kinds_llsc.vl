@@ -1,0 +1,101 @@
+// (0.21) atomic_kinds.vl with exclusive-pair loops (ldxr, stxr) for every
+// read-modify-write instead of LSE, the code aarch64-linux gets: every
+// atomic operation on every width, each checked against the same
+// arithmetic done plainly.
+// FLAGS: --atomics=llsc
+// EXPECT: i8 ok -57 1
+// EXPECT: u8 ok 199 1
+// EXPECT: i16 ok -31000 1
+// EXPECT: u16 ok 65000 1
+// EXPECT: i32 ok -2000000000 1
+// EXPECT: u32 ok 4000000000 1
+// EXPECT: i64 ok -9000000000000000000 1
+// EXPECT: u64 ok 18000000000000000000 1
+// EXPECT: isize ok -5 1
+// EXPECT: usize ok 77 1
+// EXPECT: bool ok true false
+// EXPECT: ptr ok 2 3
+// EXPECT: fence ok
+
+use std::sync::atomic::{Atomic, AtomicBool, AtomicPtr, Ordering, compiler_fence, fence};
+
+fn bad(label: [u8], step: [u8]) {
+    println(f"{label}: {step} mismatch");
+}
+
+fn run<T>(label: [u8], a: sink T, b: sink T, o: Ordering) {
+    let x = Atomic::new(a);
+    var m = a;
+    var ok = true;
+    if x.fetch_add(b, Ordering::Relaxed) != m { ok = false; bad(label, "add"); }
+    m = m + b;
+    if x.load(Ordering::Acquire) != m { ok = false; bad(label, "load"); }
+    if x.fetch_sub(a, Ordering::Release) != m { ok = false; bad(label, "sub"); }
+    m = m - a;
+    if x.fetch_and(a, Ordering::AcqRel) != m { ok = false; bad(label, "and"); }
+    m = m & a;
+    if x.fetch_or(b, Ordering::SeqCst) != m { ok = false; bad(label, "or"); }
+    m = m | b;
+    if x.fetch_xor(a, o) != m { ok = false; bad(label, "xor"); }
+    m = m ^ a;
+    if x.fetch_nand(b, Ordering::Acquire) != m { ok = false; bad(label, "nand"); }
+    m = ~(m & b);
+    if x.fetch_max(a, Ordering::Release) != m { ok = false; bad(label, "max"); }
+    m = if m > a { m } else { a };
+    if x.fetch_min(b, o) != m { ok = false; bad(label, "min"); }
+    m = if m < b { m } else { b };
+    if x.swap(a, Ordering::SeqCst) != m { ok = false; bad(label, "swap"); }
+    m = a;
+    match x.compare_exchange(b, a, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => { ok = false; bad(label, "cas succeeded"); }
+        Err(found) => if found != m { ok = false; bad(label, "cas found"); },
+    }
+    match x.compare_exchange_weak(a, b, Ordering::SeqCst, Ordering::Relaxed) {
+        Ok(old) => if old != a { ok = false; bad(label, "cas old"); },
+        Err(_) => { ok = false; bad(label, "cas failed"); }
+    }
+    m = b;
+    if x.load(o) != m { ok = false; bad(label, "after cas"); }
+    x.store(a, Ordering::Release);
+    x.store(a, o);
+    let changed = x.fetch_add(b, Ordering::Relaxed) == a && x.load(Ordering::Relaxed) == a + b;
+    println(f"{label} {if ok { "ok" } else { "FAILED" }} {a} {changed as i64}");
+}
+
+fn main() -> i32 {
+    run::<i8>("i8", -57, 100, Ordering::SeqCst);
+    run::<u8>("u8", 199, 120, Ordering::Relaxed);
+    run::<i16>("i16", -31000, 30000, Ordering::Acquire);
+    run::<u16>("u16", 65000, 1000, Ordering::AcqRel);
+    run::<i32>("i32", -2000000000, 2100000000, Ordering::SeqCst);
+    run::<u32>("u32", 4000000000, 300000000, Ordering::Relaxed);
+    run::<i64>("i64", -9000000000000000000, 9000000000000000007, Ordering::SeqCst);
+    run::<u64>("u64", 18000000000000000000, 500000000000000000, Ordering::Acquire);
+    run::<isize>("isize", -5, 3, Ordering::SeqCst);
+    run::<usize>("usize", 77, 1 << 63, Ordering::SeqCst);
+
+    let f = AtomicBool::new(true);
+    var ok = f.swap(false, Ordering::AcqRel) && !f.load(Ordering::Acquire);
+    ok = ok && !f.fetch_or(true, Ordering::SeqCst) && f.fetch_and(false, Ordering::Release);
+    ok = ok && !f.fetch_xor(true, Ordering::Relaxed) && f.load(Ordering::SeqCst);
+    ok = ok && f.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok();
+    println(f"bool {if ok { "ok" } else { "FAILED" }} true {f.load(Ordering::Relaxed)}");
+
+    var cells = [1, 2, 3];
+    let p: AtomicPtr<i64> = Atomic::new(&cells[0] as *i64);
+    let old = p.swap(&cells[1] as *i64, Ordering::AcqRel);
+    let ok2 = old == &cells[0] as *i64
+        && p.compare_exchange(&cells[1] as *i64, &cells[2] as *i64, Ordering::SeqCst,
+            Ordering::Relaxed).is_ok();
+    cells[2] = 3;
+    let now = p.load(Ordering::Acquire);
+    println(f"ptr {if ok2 { "ok" } else { "FAILED" }} {unsafe { *old } + 1} {unsafe { *now }}");
+
+    fence(Ordering::Acquire);
+    fence(Ordering::Release);
+    fence(Ordering::AcqRel);
+    fence(Ordering::SeqCst);
+    compiler_fence(Ordering::SeqCst);
+    println("fence ok");
+    0
+}

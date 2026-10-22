@@ -8,7 +8,7 @@ On macOS it runs on Metal. Link the Objective-C runtime; std opens
 Metal itself (no `-framework`):
 
 ```sh
-tachyonc main.tach -l objc -o prog
+volec main.vl -l objc -o prog
 ```
 
 ## Lifecycle

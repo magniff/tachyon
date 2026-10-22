@@ -1,0 +1,481 @@
+// C import (2/2): C declarations to vole, for `import "header.h" as c;`.
+//
+// The preprocessed headers (cpp.vl) are parsed as C declarations
+// (C11 6.7, with the GNU extensions of system headers: __attribute__,
+// __asm__ labels, __extension__, anonymous members) and written out as
+// vole source: `#[repr(C)]` structs and unions with C's exact layout
+// (computed here: bit-fields, `packed` and `aligned` become explicit
+// padding where vole's own C layout would differ), type aliases for
+// typedefs and enums, constants for enumerators and for object-like
+// macros that are integer or float constants, and an `extern "C"` block
+// of functions and variables (with `#[link_name]` where a label renames
+// the symbol). That text is then compiled with the program (90_main).
+//
+// What vole cannot express is left out, and remembered with the
+// reason, for the error when it is used: long double (80-bit on x86-64),
+// _Complex, __int128, vectors, variables with thread-local storage,
+// `static` and inline functions. A struct whose layout depends on such a
+// type stays opaque (usable through pointers only).
+//
+// This file: C's types, the tables of the declarations read, the token
+// cursor over the preprocessed tokens, and the import itself; the parts:
+// specifiers (attributes, type specifiers, structs, unions, enums),
+// decls (declarators and declarations), layout (C's sizes, alignments
+// and record layouts) and emit (the vole text written).
+
+mod emit;
+mod layout;
+pub mod decls;
+mod specifiers;
+
+use CT::{Array, Bad, Bool, Enum, Float, Func, Int, Named, Ptr, Record, Void};
+use crate::host_target;
+use crate::base::{
+    BUFS, FILES, FILE_COUNT, IntVec, _setjmp, add_source, buf_byte, buf_fmt, buf_new, buf_str,
+    buf_write_file, cstr, die, exit, grow, intern_c, streq, sym_name,
+};
+use crate::base::diag::{RECOVER_DEPTH, exit_if_errors, fail_name, recover_enter, recover_leave};
+use crate::base::target::{
+    T_AARCH64_LINUX, T_AARCH64_MACOS, T_X86_64_MACOS, target_is_linux, target_name,
+};
+use crate::front::ast::{NODES, NodeKind, child, list_begin, list_end, list_push};
+use crate::front::cimport::decls::cdecl_parse;
+use crate::front::cimport::emit::{C_TARGET_ELF, cimport_emit};
+use crate::front::cimport::specifiers::{C_LONG_DOUBLE_64, C_TARGET_A64_LINUX, C_TARGET_X86};
+use crate::front::cpp::{
+    CINTS, CK, CTOKS, C_EOF, C_IMPORT_FILE, C_IMPORT_POS, MACROS, ctok_text, init_cpp, macro_of,
+    macro_tok, strtoull,
+};
+use crate::front::cpp::cc::{c_compiler_given, cpp_query_compiler};
+use crate::front::cpp::directives::{CDIRS, path_dir, path_join};
+use crate::front::cpp::expand::cpp_next;
+use crate::front::cpp::input::{c_load_text, push_frame};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok, lex_range, str_at};
+use crate::front::modules::{C_MODULE, MODULES, add_module, module_of};
+use crate::middle::lower::ssa::HMap;
+
+enum CT { Void, Int, Bool, Float, Ptr, Array, Func, Record, Enum, Named, Bad }
+
+// Int: a=bits b=signed. Float: a=bits. Ptr: a=pointee. Array: a=element
+// b=length (-1: unknown). Func: a=result b=params (CINTS) c=count
+// d=variadic. Record: a=record. Enum: a=enum. Named: a=typedef.
+// Bad: a=the reason (a symbol).
+struct CType { kind: CT, a: i64, b: i64, c: i64, d: i64 }
+
+static var CTYPES: *CType = 0 as *CType;
+static var CTYPE_COUNT: i64 = 0;
+static var CTYPE_CAP: i64 = 0;
+static var CTY_INTS: [i64; 16] = [0; 16];
+static var CTY_VOID: i64 = 0;
+static var CTY_BOOL: i64 = 0;
+static var CTY_F32: i64 = 0;
+static var CTY_F64: i64 = 0;
+
+fn cty_new(kind: CT, a: i64, b: i64, c: i64, d: i64) -> i64 {
+    unsafe {
+        CTYPES = grow(CTYPES, CTYPE_COUNT, &CTYPE_CAP);
+        CTYPES[CTYPE_COUNT] = CType { kind, a, b, c, d };
+    }
+    CTYPE_COUNT += 1;
+    CTYPE_COUNT - 1
+}
+
+fn bits_index(bits: i64) -> i64 {
+    if bits == 8 { 0 } else if bits == 16 { 1 } else if bits == 32 { 2 } else { 3 }
+}
+
+pub fn cty_int(bits: i64, signed: bool) -> i64 {
+    CTY_INTS[bits_index(bits) * 2 + signed as i64]
+}
+
+fn cty_bad(reason: *u8) -> i64 {
+    cty_new(Bad, intern_c(reason), 0, 0, 0)
+}
+
+fn cty_ptr(t: i64) -> i64 {
+    cty_new(Ptr, t, 0, 0, 0)
+}
+
+// Through typedefs.
+fn cty_resolve(t: i64) -> i64 {
+    unsafe {
+        var r = t;
+        while CTYPES[r].kind == Named {
+            r = CTYPEDEFS[CTYPES[r].a].ty;
+        }
+        r
+    }
+}
+
+// Integer-like: integers, bool, enums (as their integer type).
+fn cty_integer(t: i64) -> i64 {
+    unsafe {
+        let r = cty_resolve(t);
+        match CTYPES[r].kind {
+            Int => r,
+            Bool => cty_int(8, signed: false),
+            Enum => cty_integer(CENUMS[CTYPES[r].a].underlying),
+            _ => 0,
+        }
+    }
+}
+
+pub fn cty_bits(t: i64) -> i64 {
+    let r = cty_integer(t);
+    if r == 0 { 64 } else { unsafe { CTYPES[r].a } }
+}
+
+pub fn cty_signed(t: i64) -> bool {
+    let r = cty_integer(t);
+    unsafe { r != 0 && CTYPES[r].b != 0 }
+}
+
+// ---- Declarations ----
+
+// Records: `opaque` is the reason (a symbol) it cannot be laid out or
+// expressed, or -1. `name`: its vole name. `state`: layout 0 not done,
+// 1 in progress, 2 done.
+struct CRec {
+    tag: i64, is_union: i64, complete: i64, packed: i64, align_attr: i64,
+    fields: i64, field_count: i64, size: i64, align: i64, state: i64,
+    opaque: i64, name: i64, ty: i64, parent: i64, emit_packed: i64, emit_align: i64, pack: i64,
+}
+
+// `bits`: the width of a bit-field, -1 for other fields; `name` -1 for
+// anonymous members and unnamed bit-fields.
+struct CField { name: i64, ty: i64, bits: i64, align_attr: i64, offset: i64, bit_offset: i64 }
+struct CEnum { tag: i64, underlying: i64, name: i64, ty: i64, has_values: i64 }
+struct CTypedef { name: i64, ty: i64, tname: i64, align_attr: i64 }
+struct CFunc { name: i64, ty: i64, link: i64, noreturn: i64 }
+struct CVar { name: i64, ty: i64, link: i64, is_const: i64 }
+struct CEnumerator { name: i64, value: i64, ty: i64 }
+
+static var CRECS: *CRec = 0 as *CRec;
+static var CREC_COUNT: i64 = 0;
+static var CREC_CAP: i64 = 0;
+static var CFIELDS: *CField = 0 as *CField;
+static var CFIELD_COUNT: i64 = 0;
+static var CFIELD_CAP: i64 = 0;
+static var CENUMS: *CEnum = 0 as *CEnum;
+static var CENUM_COUNT: i64 = 0;
+static var CENUM_CAP: i64 = 0;
+static var CTYPEDEFS: *CTypedef = 0 as *CTypedef;
+static var CTYPEDEF_COUNT: i64 = 0;
+static var CTYPEDEF_CAP: i64 = 0;
+static var CFUNCS: *CFunc = 0 as *CFunc;
+static var CFUNC_COUNT: i64 = 0;
+static var CFUNC_CAP: i64 = 0;
+static var CVARS: *CVar = 0 as *CVar;
+static var CVAR_COUNT: i64 = 0;
+static var CVAR_CAP: i64 = 0;
+static var CENUMERATORS: *CEnumerator = 0 as *CEnumerator;
+static var CENUMERATOR_COUNT: i64 = 0;
+static var CENUMERATOR_CAP: i64 = 0;
+
+// C's namespaces (symbol + 1 -> index + 1): tags, typedefs, functions and
+// variables, enumerators.
+static var TAG_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var TYPEDEF_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var FUNC_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var VAR_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var ENUMERATOR_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// Names left out, with the reason: symbol + 1 -> reason symbol + 1.
+static var C_SKIPPED: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+fn crec_new(tag: i64, is_union: bool) -> i64 {
+    unsafe {
+        CRECS = grow(CRECS, CREC_COUNT, &CREC_CAP);
+        let r = CREC_COUNT;
+        CREC_COUNT += 1;
+        CRECS[r] = CRec {
+            tag, is_union: is_union as i64, complete: 0, packed: 0, align_attr: 0,
+            fields: 0, field_count: 0, size: -1, align: 1, state: 0, opaque: -1, name: -1,
+            ty: 0, parent: -1, emit_packed: 0, emit_align: 0, pack: 0,
+        };
+        CRECS[r].ty = cty_new(Record, r, 0, 0, 0);
+        r
+    }
+}
+
+fn cfield(r: i64, i: i64) -> *CField {
+    unsafe { &CFIELDS[CINTS.data[CRECS[r].fields + i]] }
+}
+
+fn skip_reason(name: i64, reason: i64) {
+    if name >= 0 && C_SKIPPED.get(name + 1) == 0 {
+        C_SKIPPED.put(name + 1, reason + 1);
+    }
+}
+
+// ---- The token cursor ----
+
+static var D_TOKS: *i64 = 0 as *i64;
+static var D_N: i64 = 0;
+static var D_POS: i64 = 0;
+// The declaration being read cannot be: the reason (a symbol), or -1.
+static var D_BAD: i64 = -1;
+
+fn dpeek(k: i64) -> i64 {
+    if D_POS + k < D_N { unsafe { D_TOKS[D_POS + k] } } else { C_EOF }
+}
+
+fn dcur() -> i64 {
+    dpeek(0)
+}
+
+fn d_is(text: *u8) -> bool {
+    let t = dcur();
+    unsafe {
+        t != C_EOF && CTOKS[t].kind != CK::Str && CTOKS[t].kind != CK::Char
+            && streq(ctok_text(t), text)
+    }
+}
+
+fn d_is_at(k: i64, text: *u8) -> bool {
+    let t = dpeek(k);
+    unsafe {
+        t != C_EOF && CTOKS[t].kind != CK::Str && CTOKS[t].kind != CK::Char
+            && streq(ctok_text(t), text)
+    }
+}
+
+fn d_eat(text: *u8) -> bool {
+    if d_is(text) {
+        D_POS += 1;
+        return true;
+    }
+    false
+}
+
+fn d_fail(reason: *u8) {
+    if D_BAD < 0 {
+        D_BAD = intern_c(reason);
+    }
+    D_POS = D_N;
+}
+
+fn d_expect(text: *u8) {
+    if !d_eat(text) {
+        unsafe { d_fail(c"syntax vole cannot read"); }
+    }
+}
+
+// Skips a balanced (...) group starting at `(`.
+fn d_skip_parens() {
+    unsafe {
+        if !d_eat(c"(") {
+            return;
+        }
+        var depth = 1;
+        while depth > 0 && D_POS < D_N {
+            if d_is(c"(") {
+                depth += 1;
+            } else if d_is(c")") {
+                depth -= 1;
+            }
+            D_POS += 1;
+        }
+    }
+}
+
+// ---- The import ----
+
+fn init_cimport() {
+    let widths: [i64; 4] = [8, 16, 32, 64];
+    for i in 0..4 {
+        CTY_INTS[i * 2] = cty_new(Int, widths[i], 0, 0, 0);
+        CTY_INTS[i * 2 + 1] = cty_new(Int, widths[i], 1, 0, 0);
+    }
+    CTY_VOID = cty_new(Void, 0, 0, 0, 0);
+    CTY_BOOL = cty_new(Bool, 0, 0, 0, 0);
+    CTY_F32 = cty_new(Float, 32, 0, 0, 0);
+    CTY_F64 = cty_new(Float, 64, 0, 0, 0);
+}
+
+// The value of a predefined macro that is a number, or -1.
+fn builtin_number(name: *u8) -> i64 {
+    unsafe {
+        let m = macro_of(intern_c(name));
+        if m < 0 || MACROS[m].body_count != 1 {
+            return -1;
+        }
+        let t = macro_tok(m, 0);
+        if CTOKS[t].kind != CK::Num {
+            return -1;
+        }
+        var end = 0 as *u8;
+        strtoull(ctok_text(t), &end, 10) as i64
+    }
+}
+
+// Imports the C headers named by the `import` items (`names`: C strings;
+// `relative`: whether each is relative to `dirs`, the directory of its
+// file) for target `target`; returns the vole source as a buffer.
+pub fn c_import(names: IntVec, dirs: IntVec, include_dirs: IntVec, target: i64) -> i64 {
+    unsafe {
+        init_cpp();
+        init_cimport();
+        C_TARGET_X86 = target != T_AARCH64_MACOS && target != T_AARCH64_LINUX;
+        C_TARGET_A64_LINUX = target == T_AARCH64_LINUX;
+        C_TARGET_ELF = target_is_linux(target);
+        let host = host_target();
+        let host_linux = target_is_linux(host);
+        let target_linux = target_is_linux(target);
+        if (host == 0 || host_linux != target_linux || (target_linux && host != target))
+            && !c_compiler_given() {
+            // (0.9) Cross-compiling: the target's headers and predefined
+            // macros come from a C compiler for it, named by $VOLE_CC.
+            let b = buf_new();
+            buf_fmt(b, f"`import` of C headers for {cstr(target_name(target))}");
+            buf_str(b, c" needs a C compiler for that target, with its headers: this host's cc is not one. Set VOLE_CC to one (for example `clang --target=x86_64-linux-gnu --sysroot=DIR`, DIR holding a Linux system's /usr/include), or write the declarations as vole source with `volec --emit-imports` on a host of the target's system");
+            buf_byte(b, 0);
+            die(BUFS[b].data);
+        }
+        for i in 0..include_dirs.count {
+            CDIRS.push(include_dirs.data[i]);
+        }
+        let flags = if target == T_AARCH64_MACOS { c" -arch arm64" }
+            else if target == T_X86_64_MACOS { c" -arch x86_64" } else { c"" };
+        cpp_query_compiler(flags);
+        C_LONG_DOUBLE_64 = builtin_number(c"__SIZEOF_LONG_DOUBLE__") == 8;
+        // The headers, as one translation unit of #includes.
+        let top = buf_new();
+        for i in 0..names.count {
+            let name = names.data[i] as *u8;
+            if name[0] == '.' && (name[1] == '/' || (name[1] == '.' && name[2] == '/')) {
+                buf_fmt(top, f"#include \"{cstr(path_join(dirs.data[i] as *u8, name))}\"\n");
+            } else {
+                buf_fmt(top, f"#include <{cstr(name)}>\n");
+            }
+        }
+        let f = c_load_text(c"<import>", top);
+        C_IMPORT_FILE = f;
+        push_frame(f);
+        let toks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        loop {
+            let t = cpp_next();
+            if t == C_EOF {
+                break;
+            }
+            toks.push(t);
+        }
+        cdecl_parse(toks);
+        let b = buf_new();
+        buf_str(b, c"// Declarations imported from C headers by volec.\n");
+        cimport_emit(b);
+        b
+    }
+}
+
+// Imported declarations live in a module of their own (modules.vl), so
+// the program's own functions and constants of the same names shadow them
+// without clashing (0.5). The program's types replace the imported ones
+// of the same names (a program may declare the types a header it imports
+// also declares; the imported functions then take the program's, as the
+// C module sees the root's names), and so do its statics (the code
+// generators know statics by symbol).
+pub fn drop_shadowed_imports(program: i64) {
+    unsafe {
+        var types = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        var values = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for i in 0..NODES[program].count {
+            let item = child(program, i);
+            if NODES[item].start >= IMPORTED_START || module_of(item) != 0 {
+                continue;
+            }
+            let name = NODES[item].a;
+            match NODES[item].kind {
+                NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias => types.put(name + 1, 1),
+                NodeKind::Static => values.put(name + 1, 1),
+                _ => {}
+            }
+        }
+        let mark = list_begin();
+        for i in 0..NODES[program].count {
+            let item = child(program, i);
+            if NODES[item].start >= IMPORTED_START {
+                let name = NODES[item].a;
+                let shadowed = match NODES[item].kind {
+                    NodeKind::Struct | NodeKind::Enum | NodeKind::TypeAlias => types.get(name + 1)
+                        != 0,
+                    NodeKind::Static => values.get(name + 1) != 0,
+                    _ => false,
+                };
+                if shadowed {
+                    continue;
+                }
+            }
+            list_push(item);
+        }
+        list_end(program, mark);
+    }
+}
+
+// Why `name` was not imported from the C headers (0: it was not
+// skipped), for the error when a program uses it.
+pub fn c_import_skip_reason(name: i64) -> *u8 {
+    let r = C_SKIPPED.get(name + 1);
+    if r == 0 { 0 as *u8 } else { sym_name(r - 1) }
+}
+
+// The start in SRC of the declarations imported from C headers (-1: no
+// `import`).
+pub static var IMPORTED_START: i64 = -1;
+
+// `import "header.h" as c;` items: the headers are read (cimport.vl) and
+// their declarations, as vole source, are added to the program.
+pub fn import_c_headers(target: i64, include_dirs: IntVec, emit: bool, output: *u8) {
+    unsafe {
+        var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var dirs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..TOK_COUNT {
+            if TOKS[i].kind == Tok::Import && i + 1 < TOK_COUNT && TOKS[i + 1].kind == Tok::Str {
+                let name = str_at(TOKS[i + 1].value as i64).ptr;
+                var file = 0;
+                while file + 1 < FILE_COUNT && TOKS[i].start >= FILES[file + 1].start {
+                    file += 1;
+                }
+                names.push(name as i64);
+                C_IMPORT_POS.push(TOKS[i + 1].start);
+                dirs.push(path_dir(FILES[file].path) as i64);
+            }
+        }
+        if names.count == 0 {
+            if emit {
+                buf_write_file(buf_new(), output);
+                exit(0);
+            }
+            return;
+        }
+        // A recovery point (0.10): after an error in the headers, the
+        // program is checked without them; the names they would have
+        // brought (`c` in `import "h.h" as c;`) are failed names.
+        let depth = RECOVER_DEPTH;
+        var text = -1;
+        if _setjmp(recover_enter()) == 0 {
+            text = c_import(names, dirs, include_dirs, target);
+        }
+        recover_leave(depth);
+        if text < 0 {
+            for i in 0..TOK_COUNT {
+                if TOKS[i].kind == Tok::Import && i + 3 < TOK_COUNT && TOKS[i + 2].kind == Tok::As
+                    && TOKS[i + 3].kind == Tok::Ident {
+                    fail_name(TOKS[i + 3].value as i64);
+                }
+            }
+            if emit {
+                exit_if_errors();
+            }
+            return;
+        }
+        if emit {
+            buf_write_file(text, output);
+            exit(0);
+        }
+        IMPORTED_START = add_source(c"<C import>", text);
+        C_MODULE = add_module(intern_c(c"<c>"), 0, true);
+        MODULES[C_MODULE].is_c = true;
+        FILES[FILE_COUNT - 1].module = C_MODULE;
+        lex_range(IMPORTED_START, FILES[FILE_COUNT - 1].end, last: false);
+    }
+}

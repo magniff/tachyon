@@ -1,16 +1,16 @@
 #!/bin/sh
 # The headless benchmark: parse + grid throughput of voltty against
 # alacritty_terminal 0.26 (the oracle's `bench`), on vtebench-like
-# workloads (bench/workloads.tach), fed in 64 KiB chunks to a 120x40
+# workloads (bench/workloads.vl), fed in 64 KiB chunks to a 120x40
 # terminal with 10,000 lines of scrollback. The two run in turns, ROUNDS
 # times, and the best of each is kept, so a busy machine slows both alike.
 #
-# usage: examples/voltty/core/bench/run.sh [-c TACHYONC] [-m MIB] [-r ROUNDS]
+# usage: examples/voltty/core/bench/run.sh [-c VOLEC] [-m MIB] [-r ROUNDS]
 #   prints a table: workload, MiB/s of each, voltty / alacritty
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../../.." && pwd)
-TC="$ROOT/target/tachyonc"
+TC="$ROOT/target/volec"
 MIB=32
 ROUNDS=3
 while [ $# -gt 0 ]; do
@@ -23,8 +23,8 @@ while [ $# -gt 0 ]; do
 done
 W=$(mktemp -d "${TMPDIR:-/tmp}/voltty-bench.XXXXXX")
 trap 'rm -rf "$W"' EXIT
-"$TC" -O2 "$HERE/../main.tach" -o "$W/voltty" >/dev/null
-"$TC" -O2 "$HERE/workloads.tach" -o "$W/workloads" >/dev/null
+"$TC" -O2 "$HERE/../main.vl" -o "$W/voltty" >/dev/null
+"$TC" -O2 "$HERE/workloads.vl" -o "$W/workloads" >/dev/null
 (cd "$HERE/../oracle" && cargo build --release --offline --quiet)
 ORACLE="$HERE/../oracle/target/release/voltty-oracle"
 KINDS="ascii sgr cjk region motion"

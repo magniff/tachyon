@@ -29,7 +29,7 @@ and the fallback is not even generated.
 ## Run it
 
 ```console
-$ tachyonc main.tach -o crc32 && ./crc32
+$ volec main.vl -o crc32 && ./crc32
 crc32("123456789") = cbf43926
 4800 checksums, 0 wrong
 ok: built crc32
@@ -37,12 +37,12 @@ ok: built crc32
 
 `cbf43926` is CRC-32's check value. For a build where crc is not known,
 `-C target-cpu=generic` makes `detect` a real test of the CPU, and
-`TACHYON_ARCH_DISABLE` turns a feature off at run time (it can only
+`VOLE_ARCH_DISABLE` turns a feature off at run time (it can only
 clear features, never add one), so the fallback runs and prints the
 same:
 
 ```console
-$ tachyonc -C target-cpu=generic main.tach -o crc32-generic && TACHYON_ARCH_DISABLE=crc ./crc32-generic
+$ volec -C target-cpu=generic main.vl -o crc32-generic && VOLE_ARCH_DISABLE=crc ./crc32-generic
 crc32("123456789") = cbf43926
 4800 checksums, 0 wrong
 ok: built crc32-generic
@@ -51,13 +51,13 @@ ok: built crc32-generic
 ## What needs crc
 
 ```console
-$ tachyonc query features crc32_hw crc32 main -C target-cpu=generic
+$ volec query features crc32_hw crc32 main -C target-cpu=generic
 crate::crc32_hw	crc (inferred)
 crate::crc32	none
 crate::main	none
-$ tachyonc query features crc32_hw --why crc -C target-cpu=generic
+$ volec query features crc32_hw --why crc -C target-cpu=generic
 crate::crc32_hw	crc (inferred)
-  main.tach:42:13: calls 'std::arch::aarch64::__crc32d', which needs crc
+  main.vl:42:13: calls 'std::arch::aarch64::__crc32d', which needs crc
 ```
 
 Without the guard, the program would run an instruction the CPU may
@@ -68,16 +68,16 @@ is where it surfaces, at `main`'s calls, with the intrinsic it comes
 from:
 
 ```console
-$ tachyonc edit patch crc32 --old '    if !detect("crc") {
+$ volec edit patch crc32 --old '    if !detect("crc") {
 >         return crc32_portable(t, crc, s);
 >     }
 > ' --new '' -C target-cpu=generic
-main.tach:112:9: error[arch.feature] 'bench' needs crc (from '__crc32d' at main.tach:42:13), which 'main' does not know here: the build's features are neon | help: test the CPU and keep a fallback, declare #[target_feature] on the caller, or build only for CPUs that have it | try: tachyonc edit patch main.tach:112 --old 'bench(gpa, t[..], mode == "hw");' --new 'if std::arch::detect("crc") { bench(gpa, t[..], mode == "hw"); };' -C target-cpu=generic main.tach | try: tachyonc -C target-feature=+crc -C target-cpu=generic -o main main.tach | try: tachyonc query features bench --why crc -C target-cpu=generic main.tach  [in crate::main]
-main.tach:114:9: error[arch.feature] 'check' needs crc (from '__crc32d' at main.tach:42:13), which 'main' does not know here: the build's features are neon | help: test the CPU and keep a fallback, declare #[target_feature] on the caller, or build only for CPUs that have it | try: tachyonc edit patch main.tach:114 --old 'check(gpa, t[..]);' --new 'if std::arch::detect("crc") { check(gpa, t[..]); };' -C target-cpu=generic main.tach | try: tachyonc -C target-feature=+crc -C target-cpu=generic -o main main.tach | try: tachyonc query features check --why crc -C target-cpu=generic main.tach  [in crate::main]
+main.vl:112:9: error[arch.feature] 'bench' needs crc (from '__crc32d' at main.vl:42:13), which 'main' does not know here: the build's features are neon | help: test the CPU and keep a fallback, declare #[target_feature] on the caller, or build only for CPUs that have it | try: volec edit patch main.vl:112 --old 'bench(gpa, t[..], mode == "hw");' --new 'if std::arch::detect("crc") { bench(gpa, t[..], mode == "hw"); };' -C target-cpu=generic main.vl | try: volec -C target-feature=+crc -C target-cpu=generic -o main main.vl | try: volec query features bench --why crc -C target-cpu=generic main.vl  [in crate::main]
+main.vl:114:9: error[arch.feature] 'check' needs crc (from '__crc32d' at main.vl:42:13), which 'main' does not know here: the build's features are neon | help: test the CPU and keep a fallback, declare #[target_feature] on the caller, or build only for CPUs that have it | try: volec edit patch main.vl:114 --old 'check(gpa, t[..]);' --new 'if std::arch::detect("crc") { check(gpa, t[..]); };' -C target-cpu=generic main.vl | try: volec -C target-feature=+crc -C target-cpu=generic -o main main.vl | try: volec query features check --why crc -C target-cpu=generic main.vl  [in crate::main]
 error edit.breaks: 2 new errors (2 in crate::main, which the edit does not change); nothing written
 note edit.together: change crate::main in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
-try: tachyonc query show crate::main
-try: tachyonc edit patch crc32 --old '    if !detect("crc") {
+try: volec query show crate::main
+try: volec edit patch crc32 --old '    if !detect("crc") {
         return crc32_portable(t, crc, s);
     }
 ' --new '' -C target-cpu=generic --no-check
@@ -98,10 +98,10 @@ fastest of two runs, with the same loop in C (`__crc32d` from
 ./crc32 hw                                  0.09 s   (about 12 GB/s)
 C, the same loop                            0.09 s
 ./crc32 portable                            2.21 s
--C target-cpu=generic, TACHYON_ARCH_DISABLE=crc ./crc32-generic hw   1.75 s (the fallback)
+-C target-cpu=generic, VOLE_ARCH_DISABLE=crc ./crc32-generic hw   1.75 s (the fallback)
 ```
 
 24 times the table, and the same speed as clang's. The loop is one
 dependency chain (each step waits for the last, three cycles); zlib's
 fastest versions interleave three chains and fold them with `vmull_p64`
-(`tachyonc guide arch#recipes`).
+(`volec guide arch#recipes`).

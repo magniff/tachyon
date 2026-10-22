@@ -1,0 +1,817 @@
+// Equality saturation, acyclic (0.9): an e-graph over the pure integer
+// operations, in the manner of Cranelift's aegraph, built during GVN's
+// walk of the dominator tree (gvn.vl).
+//
+// GVN's table already hash-conses the pure instructions: an instruction
+// equal to one that dominates it is that one. Here each value also has an
+// e-class: the values known to be equal to it. When an instruction is new
+// to the table, the rewrite rules (RULES, below) are matched against it,
+// their patterns' operands against every member of the operands' classes;
+// each match builds its right-hand side from existing classes (through
+// the table, so equal nodes are shared; new ones are inserted before the
+// instruction) and joins it to the instruction's class. Nodes only refer to
+// values that already exist, so the graph stays acyclic and needs no
+// rebuilding. Then extraction picks the class's cheapest member (by
+// operation costs, its operands' best costs added) to stand for the
+// instruction; the members not picked are dead code, which the next pass
+// removes.
+//
+// The rules are written in a small language, parsed once into patterns:
+//
+//   (add (add x c1) c2) => (add x (+ c1 c2))
+//   (mul x c1) if (pow2 c1) => (shl x (log2 c1))
+//
+// `x`, `y` match any value (the same name: the same class), names starting
+// with `c` a constant, a number a constant of that value; operations are
+// add sub mul and or xor shl neg bnot, eq and ne (comparisons); the
+// commutative ones (add mul and or xor eq ne) match their operands either
+// way round. A right-hand side may compute constants: (+ a b), (- a b),
+// (* a b), (& a b), (| a b), (^ a b), (negc a), (log2 a), wrapped to the
+// type. Every rule is checked by `volec --check-rules`: both sides
+// evaluated on random values (edge values included) at every integer
+// width, with the folding semantics of the optimizer (fold.vl), which
+// are the language's.
+
+use crate::base::{IntVec, STDOUT, buf_byte, buf_int, buf_new, buf_str, buf_write_fd, die2, strlen};
+use crate::front::consteval::wrap_int;
+use crate::front::types::{
+    TY_BOOL, TY_I16, TY_I32, TY_I64, TY_I8, TY_U16, TY_U32, TY_U64, TY_U8, is_integer,
+};
+use crate::gen0::target::log2;
+use crate::middle::ctx::FnCtx;
+use crate::middle::fold::{fold_compare, fold_value};
+use crate::middle::gvn::{gvn_find_or_add, is_commutative_op, operands_out_of_order};
+use crate::middle::ir::{Cond, Op, ir_insert_before, ir_make, ir_replace, ir_scratch};
+use crate::middle::ir::Op::{Add, And, BNot, Cmp, Const, Mul, Neg, Or, Shl, Sub, Xor};
+
+// ---- The rules ----
+
+const RULE_COUNT: i64 = 31;
+
+fn rule_text(i: i64) -> *u8 {
+    let rules: [*u8; 31] = [
+        c"(add (add x c1) c2) => (add x (+ c1 c2))",
+        c"(sub x c1) => (add x (negc c1))",
+        c"(mul (mul x c1) c2) => (mul x (* c1 c2))",
+        c"(and (and x c1) c2) => (and x (& c1 c2))",
+        c"(or (or x c1) c2) => (or x (| c1 c2))",
+        c"(xor (xor x c1) c2) => (xor x (^ c1 c2))",
+        c"(sub (add x y) y) => x",
+        c"(add (sub x y) y) => x",
+        c"(sub x (sub x y)) => y",
+        c"(sub (sub x y) x) => (neg y)",
+        c"(xor (xor x y) y) => x",
+        c"(and (or x y) x) => x",
+        c"(or (and x y) x) => x",
+        c"(add (mul x c1) x) => (mul x (+ c1 1))",
+        c"(sub (mul x c1) x) => (mul x (- c1 1))",
+        c"(mul x c1) if (pow2 c1) => (shl x (log2 c1))",
+        c"(eq (add x c1) c2) => (eq x (- c2 c1))",
+        c"(ne (add x c1) c2) => (ne x (- c2 c1))",
+        c"(eq (xor x c1) c2) => (eq x (^ c1 c2))",
+        c"(ne (xor x c1) c2) => (ne x (^ c1 c2))",
+        c"(eq (sub x y) 0) => (eq x y)",
+        c"(ne (sub x y) 0) => (ne x y)",
+        c"(neg (sub x y)) => (sub y x)",
+        c"(neg (neg x)) => x",
+        c"(bnot (bnot x)) => x",
+        c"(add x (neg y)) => (sub x y)",
+        c"(sub x (neg y)) => (add x y)",
+        c"(add (bnot x) 1) => (neg x)",
+        c"(bnot (neg x)) => (add x -1)",
+        c"(and x (bnot x)) => 0",
+        c"(xor x (bnot x)) => -1",
+    ];
+    rules[i]
+}
+
+// Pattern nodes: kind, operation (an Op, or a constant operator), its
+// condition (eq, ne), operands a and b, a variable's index or a literal.
+const K_OP: i64 = 1;
+const K_VAR: i64 = 2;
+const K_CVAR: i64 = 3;
+const K_LIT: i64 = 4;
+const K_CEXPR: i64 = 5;
+
+// Constant operators of right-hand sides.
+const C_ADD: i64 = 1;
+const C_SUB: i64 = 2;
+const C_MUL: i64 = 3;
+const C_AND: i64 = 4;
+const C_OR: i64 = 5;
+const C_XOR: i64 = 6;
+const C_NEG: i64 = 7;
+const C_LOG2: i64 = 8;
+
+static var P_KIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var P_OP: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var P_COND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var P_A: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var P_B: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var P_VAL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Per rule: left and right patterns, the guarded constant variable (-1:
+// no guard), the variable count.
+static var R_LHS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var R_RHS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var R_GUARD: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var R_VARS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var RULES_READY: bool = false;
+
+// The parser's state: the text, the position, the variable names (C
+// strings' first two bytes) of the rule being parsed.
+static var PT: *u8 = 0 as *u8;
+static var PP: i64 = 0;
+static var PVARS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn rule_error(message: *u8) -> ! {
+    unsafe { die2(message, PT) }
+}
+
+fn skip_space() {
+    while unsafe { PT[PP] == ' ' } {
+        PP += 1;
+    }
+}
+
+fn is_word_byte(c: u8) -> bool {
+    c != 0 && c != ' ' && c != '(' && c != ')'
+}
+
+// The word at PP: its start; PP moves past it.
+fn word() -> i64 {
+    unsafe {
+        skip_space();
+        let start = PP;
+        while is_word_byte(PT[PP]) {
+            PP += 1;
+        }
+        if PP == start {
+            rule_error(c"internal error: a rewrite rule is malformed: ");
+        }
+        start
+    }
+}
+
+fn word_is(start: i64, text: *u8) -> bool {
+    unsafe {
+        let n = strlen(text) as i64;
+        if PP - start != n {
+            return false;
+        }
+        for i in 0..n {
+            if PT[start + i] != text[i] {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn new_pattern(kind: i64, op: i64, a: i64, b: i64, val: i64) -> i64 {
+    P_KIND.push(kind);
+    P_OP.push(op);
+    P_COND.push(0);
+    P_A.push(a);
+    P_B.push(b);
+    P_VAL.push(val);
+    P_KIND.count - 1
+}
+
+// The variable named by the word at [start, PP), numbered in order of
+// appearance.
+fn variable(start: i64) -> i64 {
+    unsafe {
+        let second = if PP - start > 1 { PT[start + 1] as i64 } else { 0 };
+        let key = (PP - start) * 65536 + (PT[start] as i64) * 256 + second;
+        for i in 0..PVARS.count {
+            if PVARS.data[i] == key {
+                return i;
+            }
+        }
+        PVARS.push(key);
+        PVARS.count - 1
+    }
+}
+
+fn parse_pattern(rhs: bool) -> i64 {
+    unsafe {
+        skip_space();
+        if PT[PP] != '(' {
+            let start = word();
+            let c = PT[start];
+            if c == '-' || (c >= '0' && c <= '9') {
+                var value = 0;
+                var i = start;
+                let negative = c == '-';
+                if negative {
+                    i += 1;
+                }
+                while i < PP {
+                    value = value * 10 + (PT[i] - '0') as i64;
+                    i += 1;
+                }
+                return new_pattern(K_LIT, 0, 0, 0, if negative { 0 - value } else { value });
+            }
+            let var_id = variable(start);
+            if rhs && var_id >= R_VARS_NOW {
+                rule_error(c"internal error: a rewrite rule's right side has a new variable: ");
+            }
+            return new_pattern(if c == 'c' { K_CVAR } else { K_VAR }, 0, 0, 0, var_id);
+        }
+        PP += 1;
+        let start = word();
+        var kind = K_OP;
+        var op = 0;
+        var cond = 0;
+        var arity = 2;
+        if word_is(start, c"add") { op = Add as i64; }
+        else if word_is(start, c"sub") { op = Sub as i64; }
+        else if word_is(start, c"mul") { op = Mul as i64; }
+        else if word_is(start, c"and") { op = And as i64; }
+        else if word_is(start, c"or") { op = Or as i64; }
+        else if word_is(start, c"xor") { op = Xor as i64; }
+        else if word_is(start, c"shl") { op = Shl as i64; }
+        else if word_is(start, c"neg") { op = Neg as i64; arity = 1; }
+        else if word_is(start, c"bnot") { op = BNot as i64; arity = 1; }
+        else if word_is(start, c"eq") { op = Cmp as i64; cond = Cond::Eq as i64; }
+        else if word_is(start, c"ne") { op = Cmp as i64; cond = Cond::Ne as i64; }
+        else {
+            kind = K_CEXPR;
+            if word_is(start, c"+") { op = C_ADD; }
+            else if word_is(start, c"-") { op = C_SUB; }
+            else if word_is(start, c"*") { op = C_MUL; }
+            else if word_is(start, c"&") { op = C_AND; }
+            else if word_is(start, c"|") { op = C_OR; }
+            else if word_is(start, c"^") { op = C_XOR; }
+            else if word_is(start, c"negc") { op = C_NEG; arity = 1; }
+            else if word_is(start, c"log2") { op = C_LOG2; arity = 1; }
+            else { rule_error(c"internal error: unknown operation in a rewrite rule: "); }
+        }
+        let a = parse_pattern(rhs);
+        let b = if arity == 2 { parse_pattern(rhs) } else { -1 };
+        skip_space();
+        if PT[PP] != ')' {
+            rule_error(c"internal error: expected ')' in a rewrite rule: ");
+        }
+        PP += 1;
+        let p = new_pattern(kind, op, a, b, 0);
+        P_COND.data[p] = cond;
+        p
+    }
+}
+
+static var R_VARS_NOW: i64 = 0;
+
+// (0.17) The rules whose left side is operation op:
+// R_BY_OP[R_BY_OP_START[op] .. R_BY_OP_START[op + 1]], in order
+// (egraph_rewrite went through all of them for every instruction).
+static var R_BY_OP: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var R_BY_OP_START: [i64; 65] = [0; 65];
+
+pub fn init_rules() {
+    unsafe {
+        if RULES_READY {
+            return;
+        }
+        RULES_READY = true;
+        for r in 0..RULE_COUNT {
+            PT = rule_text(r);
+            PP = 0;
+            PVARS.count = 0;
+            R_VARS_NOW = 1000;
+            let lhs = parse_pattern(false);
+            var guard = -1;
+            let at = word();
+            if word_is(at, c"if") {
+                skip_space();
+                PP += 1;
+                let pred = word();
+                if !word_is(pred, c"pow2") {
+                    rule_error(c"internal error: unknown guard in a rewrite rule: ");
+                }
+                let v = word();
+                guard = variable(v);
+                skip_space();
+                PP += 1;
+                let arrow = word();
+                if !word_is(arrow, c"=>") {
+                    rule_error(c"internal error: expected '=>' in a rewrite rule: ");
+                }
+            } else if !word_is(at, c"=>") {
+                rule_error(c"internal error: expected '=>' in a rewrite rule: ");
+            }
+            R_VARS_NOW = PVARS.count;
+            let rhs = parse_pattern(true);
+            if P_KIND.data[lhs] != K_OP {
+                rule_error(c"internal error: a rewrite rule's left side is not an operation: ");
+            }
+            R_LHS.push(lhs);
+            R_RHS.push(rhs);
+            R_GUARD.push(guard);
+            R_VARS.push(PVARS.count);
+        }
+        // (0.17) The rules by the operation of their left side, in order.
+        for op in 0..64 {
+            R_BY_OP_START[op] = R_BY_OP.count;
+            for r in 0..RULE_COUNT {
+                if P_OP.data[R_LHS.data[r]] == op {
+                    R_BY_OP.push(r);
+                }
+            }
+        }
+        R_BY_OP_START[64] = R_BY_OP.count;
+    }
+}
+
+// ---- E-classes ----
+//
+// The e-classes are directional, as in Cranelift: when a rule shows
+// instruction v equal to w (which dominates v), w and its own members
+// join v's class, but v does not join w's (w's other users may not be
+// dominated by v). Per value (by id, valid when its stamp is this run's):
+// its members (a run in ALTS; none recorded: the value alone) and the
+// best cost found for it.
+
+// Whether the e-graph runs (-O1 and up; `--no-egraph` turns it off, to
+// compare).
+pub static var EGRAPH: bool = true;
+
+pub fn egraph_start(cx: sink *FnCtx) {
+    unsafe {
+        init_rules();
+        cx.run += 1;
+        cx.alts.count = 0;
+    }
+}
+
+fn ec_touch(cx: sink *FnCtx, v: i64) {
+    unsafe {
+        while cx.ec_stamp.count <= v {
+            cx.ec_stamp.push(0);
+            cx.ec_start.push(0);
+            cx.ec_len.push(0);
+            cx.ec_cost.push(0);
+        }
+        if cx.ec_stamp.data[v] != cx.run {
+            cx.ec_stamp.data[v] = cx.run;
+            cx.ec_start.data[v] = 0;
+            cx.ec_len.data[v] = 0;
+            cx.ec_cost.data[v] = 0;
+        }
+    }
+}
+
+fn member_count(cx: sink *FnCtx, v: i64) -> i64 {
+    unsafe {
+        ec_touch(cx, v);
+        if cx.ec_len.data[v] == 0 { 1 } else { cx.ec_len.data[v] }
+    }
+}
+
+fn member(cx: sink *FnCtx, v: i64, i: i64) -> i64 {
+    unsafe {
+        if cx.ec_len.data[v] == 0 { v } else { cx.alts.data[cx.ec_start.data[v] + i] }
+    }
+}
+
+fn is_member(cx: sink *FnCtx, v: i64, w: i64) -> bool {
+    let n = member_count(cx, v);
+    for i in 0..n {
+        if member(cx, v, i) == w {
+            return true;
+        }
+    }
+    false
+}
+
+// Whether v and w are known equal.
+fn same_value(cx: sink *FnCtx, v: i64, w: i64) -> bool {
+    v == w || is_member(cx, v, w) || is_member(cx, w, v)
+}
+
+fn op_cost(op: Op) -> i64 {
+    match op {
+        Const => 0,
+        Mul => 3,
+        Op::Div | Op::Rem => 20,
+        _ => 1,
+    }
+}
+
+// The cost of node m: its operation's, with its operands' best.
+fn node_cost(cx: sink *FnCtx, m: i64) -> i64 {
+    unsafe {
+        var cost = op_cost(cx.insts[m].op);
+        let a = cx.insts[m].a;
+        let b = cx.insts[m].b;
+        if a != 0 {
+            ec_touch(cx, a);
+            cost += cx.ec_cost.data[a];
+        }
+        if b != 0 {
+            ec_touch(cx, b);
+            cost += cx.ec_cost.data[b];
+        }
+        cost
+    }
+}
+
+// ---- Matching ----
+
+fn undo_to(cx: sink *FnCtx, mark: i64) {
+    unsafe {
+        while cx.trail.count > mark {
+            cx.bind[cx.trail.pop()] = 0;
+        }
+    }
+}
+
+fn bind(cx: sink *FnCtx, var_id: i64, v: i64) -> bool {
+    unsafe {
+        if cx.bind[var_id] == 0 {
+            cx.bind[var_id] = v;
+            cx.trail.push(var_id);
+            return true;
+        }
+        same_value(cx, cx.bind[var_id], v)
+    }
+}
+
+fn is_commutative_pattern(p: i64) -> bool {
+    let op = unsafe { P_OP.data[p] };
+    op == Add as i64 || op == Mul as i64 || op == And as i64 || op == Or as i64 || op == Xor as i64
+        || op == Cmp as i64
+}
+
+// Whether pattern p matches value v (of integer type ty): a member of
+// v's class, for an operation.
+fn pmatch(cx: sink *FnCtx, p: i64, v: i64, ty: i64) -> bool {
+    unsafe {
+        let kind = P_KIND.data[p];
+        if kind == K_VAR {
+            return bind(cx, P_VAL.data[p], v);
+        }
+        if kind == K_CVAR || kind == K_LIT {
+            let c = const_member(cx, v);
+            if c == 0 {
+                return false;
+            }
+            if kind == K_LIT {
+                return cx.insts[c].imm == wrap_int(P_VAL.data[p], ty);
+            }
+            return bind(cx, P_VAL.data[p], c);
+        }
+        let op = P_OP.data[p];
+        let is_cmp = op == Cmp as i64;
+        let n = member_count(cx, v);
+        for k in 0..n {
+            let m = member(cx, v, k);
+            let mop = cx.insts[m].op;
+            if mop as i64 == op && (if is_cmp {
+                cx.insts[m].cond as i64 == P_COND.data[p] && cx.insts[m].ty == TY_BOOL
+            } else {
+                cx.insts[m].ty == ty
+            }) {
+                let child_ty = if is_cmp { cx.insts[m].imm2 } else { ty };
+                if is_integer(child_ty) {
+                    let mark = cx.trail.count;
+                    if pmatch(cx, P_A.data[p], cx.insts[m].a, child_ty)
+                        && (P_B.data[p] < 0 || pmatch(cx, P_B.data[p], cx.insts[m].b, child_ty)) {
+                        return true;
+                    }
+                    undo_to(cx, mark);
+                    if P_B.data[p] >= 0 && is_commutative_pattern(p) {
+                        if pmatch(cx, P_A.data[p], cx.insts[m].b, child_ty)
+                            && pmatch(cx, P_B.data[p], cx.insts[m].a, child_ty) {
+                            return true;
+                        }
+                        undo_to(cx, mark);
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+// A constant member of v's class, or 0.
+fn const_member(cx: sink *FnCtx, v: i64) -> i64 {
+    let n = member_count(cx, v);
+    for k in 0..n {
+        let m = member(cx, v, k);
+        if unsafe { cx.insts[m].op == Const } {
+            return m;
+        }
+    }
+    0
+}
+
+// ---- Building right-hand sides ----
+
+// (0.17) The constant `x <op> y`, folded through a scratch instruction:
+// the free entry after the function's last instruction (ir_scratch).
+// (0.18.1: always; 0.17 made the program's first one an instruction of
+// the function that needed it first, which made that function's ids
+// depend on the order the functions were optimized in.)
+fn fold2(cx: sink *FnCtx, op: Op, ty: i64, x: i64, y: i64) -> i64 {
+    unsafe {
+        let scratch = ir_scratch(cx, op, ty);
+        cx.insts[scratch].op = op;
+        cx.insts[scratch].ty = ty;
+        fold_value(cx, scratch, x, y)
+    }
+}
+
+// The value of constant expression p (of type ty), with BIND's constants.
+fn const_value_of(cx: sink *FnCtx, p: i64, ty: i64, consts: *i64) -> i64 {
+    unsafe {
+        let kind = P_KIND.data[p];
+        if kind == K_LIT {
+            return wrap_int(P_VAL.data[p], ty);
+        }
+        if kind == K_CVAR {
+            return consts[P_VAL.data[p]];
+        }
+        let x = const_value_of(cx, P_A.data[p], ty, consts);
+        let op = P_OP.data[p];
+        if op == C_NEG {
+            return fold2(cx, Neg, ty, x, 0);
+        }
+        if op == C_LOG2 {
+            return log2(x);
+        }
+        let y = const_value_of(cx, P_B.data[p], ty, consts);
+        let fop = if op == C_ADD { Add } else if op == C_SUB { Sub } else if op == C_MUL { Mul }
+            else if op == C_AND { And } else if op == C_OR { Or } else { Xor };
+        fold2(cx, fop, ty, x, y)
+    }
+}
+
+// A node (op, ty, a, b) before instruction `at`: an equal one the table
+// knows, or a new one.
+fn make_node(cx: sink *FnCtx, at: i64, op: Op, cond: i64, ty: i64, operand_ty: i64, a: i64, b: i64,
+    imm: i64) -> i64 {
+    unsafe {
+        let n = ir_make(cx, op, ty, a, b, imm);
+        if op == Cmp {
+            cx.insts[n].cond = if cond == Cond::Ne as i64 { Cond::Ne } else { Cond::Eq };
+            cx.insts[n].imm2 = operand_ty;
+        }
+        if b != 0 && is_commutative_op(cx, n) && operands_out_of_order(cx, a, b) {
+            cx.insts[n].a = b;
+            cx.insts[n].b = a;
+        }
+        ir_insert_before(cx, at, n);
+        let w = gvn_find_or_add(cx, n);
+        if w != 0 {
+            ir_replace(cx, n, w);
+            return w;
+        }
+        ec_touch(cx, n);
+        cx.ec_cost.data[n] = node_cost(cx, n);
+        n
+    }
+}
+
+fn build(cx: sink *FnCtx, at: i64, p: i64, ty: i64) -> i64 {
+    unsafe {
+        let kind = P_KIND.data[p];
+        if kind == K_VAR || kind == K_CVAR {
+            return cx.bind[P_VAL.data[p]];
+        }
+        if kind == K_LIT || kind == K_CEXPR {
+            return make_node(cx, at, Const, 0, ty, 0, 0, 0,
+                const_value_of(cx, p, ty, &cx.consts as *i64));
+        }
+        let op = P_OP.data[p];
+        let is_cmp = op == Cmp as i64;
+        let child_ty = if is_cmp { cx.build_cmp_ty } else { ty };
+        let a = build(cx, at, P_A.data[p], child_ty);
+        let b = if P_B.data[p] >= 0 { build(cx, at, P_B.data[p], child_ty) } else { 0 };
+        let iop = op_of(op);
+        make_node(cx, at, iop, P_COND.data[p], if is_cmp { TY_BOOL } else { ty }, child_ty, a, b, 0)
+    }
+}
+
+fn op_of(op: i64) -> Op {
+    if op == Add as i64 { return Add; }
+    if op == Sub as i64 { return Sub; }
+    if op == Mul as i64 { return Mul; }
+    if op == And as i64 { return And; }
+    if op == Or as i64 { return Or; }
+    if op == Xor as i64 { return Xor; }
+    if op == Shl as i64 { return Shl; }
+    if op == Neg as i64 { return Neg; }
+    if op == BNot as i64 { return BNot; }
+    Cmp
+}
+
+fn is_pow2(x: i64) -> bool {
+    x > 0 && (x & (x - 1)) == 0
+}
+
+// The rules on instruction v (new to GVN's table, its operands resolved):
+// returns the value standing for it (v itself, or a cheaper equal one).
+pub fn egraph_rewrite(cx: sink *FnCtx, v: i64) -> i64 {
+    unsafe {
+        let op = cx.insts[v].op;
+        let is_cmp = op == Cmp;
+        let ty = cx.insts[v].ty;
+        let operand_ty = if is_cmp { cx.insts[v].imm2 } else { ty };
+        ec_touch(cx, v);
+        cx.ec_cost.data[v] = node_cost(cx, v);
+        if !is_integer(operand_ty)
+            || (is_cmp && cx.insts[v].cond != Cond::Eq && cx.insts[v].cond != Cond::Ne) {
+            return v;
+        }
+        cx.found.count = 0;
+        cx.found.push(v);
+        let o = op as i64;
+        if o >= 64 {
+            return v;
+        }
+        for ri in R_BY_OP_START[o]..R_BY_OP_START[o + 1] {
+            let r = R_BY_OP.data[ri];
+            let lhs = R_LHS.data[r];
+            for i in 0..8 {
+                cx.bind[i] = 0;
+            }
+            cx.trail.count = 0;
+            if !pmatch(cx, lhs, v, ty) {
+                continue;
+            }
+            // The constants bound, as values of their type.
+            for i in 0..R_VARS.data[r] {
+                cx.consts[i] = if cx.bind[i] != 0
+                    && cx.insts[cx.bind[i]].op == Const { cx.insts[cx.bind[i]].imm }
+                    else { 0 };
+            }
+            let guard = R_GUARD.data[r];
+            if guard >= 0 && !is_pow2(cx.consts[guard]) {
+                continue;
+            }
+            cx.build_cmp_ty = operand_ty;
+            let w = build(cx, v, R_RHS.data[r], ty);
+            if cx.insts[w].ty != ty {
+                continue;
+            }
+            // w and its members join v's class.
+            let n = member_count(cx, w);
+            for k in 0..n {
+                let m = member(cx, w, k);
+                var known = false;
+                for j in 0..cx.found.count {
+                    if cx.found.data[j] == m {
+                        known = true;
+                    }
+                }
+                if !known {
+                    cx.found.push(m);
+                }
+            }
+        }
+        if cx.found.count == 1 {
+            return v;
+        }
+        cx.ec_start.data[v] = cx.alts.count;
+        cx.ec_len.data[v] = cx.found.count;
+        for j in 0..cx.found.count {
+            cx.alts.push(cx.found.data[j]);
+        }
+        // Extraction: the cheapest member (v on a tie).
+        var best = v;
+        var best_cost = cx.ec_cost.data[v];
+        for j in 1..cx.found.count {
+            let m = cx.found.data[j];
+            ec_touch(cx, m);
+            if cx.ec_cost.data[m] < best_cost {
+                best = m;
+                best_cost = cx.ec_cost.data[m];
+            }
+        }
+        cx.ec_cost.data[v] = best_cost;
+        best
+    }
+}
+
+// ---- Checking the rules (volec --check-rules) ----
+
+static var RNG: u64 = 88172645463325252;
+
+fn rand64() -> i64 {
+    RNG = RNG ^ (RNG << 13);
+    RNG = RNG ^ (RNG >> 7);
+    RNG = RNG ^ (RNG << 17);
+    RNG as i64
+}
+
+// A random value of type ty: often small, or at an edge.
+fn random_value(ty: i64) -> i64 {
+    let k = rand64() & 7;
+    let raw = if k == 0 {
+        0
+    } else if k == 1 {
+        -1
+    } else if k == 2 {
+        1
+    } else if k == 3 {
+        (rand64() & 15) - 8
+    } else if k == 4 {
+        1 << ((rand64() & 63) as u64)
+    } else if k == 5 {
+        (1 << ((rand64() & 63) as u64)) - 1
+    } else {
+        rand64()
+    };
+    wrap_int(raw, ty)
+}
+
+static var EVAL_VARS: [i64; 8] = [0; 8];
+
+// Pattern p evaluated with EVAL_VARS (integers of type ty; comparisons as
+// 0 or 1).
+fn eval_pattern(cx: sink *FnCtx, p: i64, ty: i64, cmp_ty: i64) -> i64 {
+    unsafe {
+        let kind = P_KIND.data[p];
+        if kind == K_VAR || kind == K_CVAR {
+            return EVAL_VARS[P_VAL.data[p]];
+        }
+        if kind == K_LIT || kind == K_CEXPR {
+            return const_value_of(cx, p, ty, &EVAL_VARS as *i64);
+        }
+        let op = P_OP.data[p];
+        if op == Cmp as i64 {
+            let x = eval_pattern(cx, P_A.data[p], cmp_ty, cmp_ty);
+            let y = eval_pattern(cx, P_B.data[p], cmp_ty, cmp_ty);
+            let cond = if P_COND.data[p] == Cond::Ne as i64 { Cond::Ne } else { Cond::Eq };
+            return fold_compare(cond, cmp_ty, x, y) as i64;
+        }
+        let x = eval_pattern(cx, P_A.data[p], ty, cmp_ty);
+        let y = if P_B.data[p] >= 0 { eval_pattern(cx, P_B.data[p], ty, cmp_ty) } else { 0 };
+        fold2(cx, op_of(op), ty, x, y)
+    }
+}
+
+// Checks every rule on random values at every integer width; prints a
+// line per failure and a summary; returns the number of failures.
+pub fn check_rules(cx: sink *FnCtx, trials: i64) -> i64 {
+    unsafe {
+        init_rules();
+        let types: [i64; 8] = [TY_I8, TY_I16, TY_I32, TY_I64, TY_U8, TY_U16, TY_U32, TY_U64];
+        let out = buf_new();
+        var failures = 0;
+        var checked = 0;
+        for r in 0..RULE_COUNT {
+            let lhs = R_LHS.data[r];
+            let is_cmp = P_OP.data[lhs] == Cmp as i64;
+            for t in 0..8 {
+                let ty = types[t];
+                let value_ty = if is_cmp { TY_BOOL } else { ty };
+                var failed = false;
+                for _ in 0..trials {
+                    for i in 0..R_VARS.data[r] {
+                        EVAL_VARS[i] = random_value(ty);
+                    }
+                    let guard = R_GUARD.data[r];
+                    if guard >= 0 && !is_pow2(EVAL_VARS[guard]) {
+                        EVAL_VARS[guard] = wrap_int(1 << ((rand64() & 7) as u64), ty);
+                        if !is_pow2(EVAL_VARS[guard]) {
+                            continue;
+                        }
+                    }
+                    checked += 1;
+                    let left = eval_pattern(cx, lhs, value_ty, ty);
+                    let right = eval_pattern(cx, R_RHS.data[r], value_ty, ty);
+                    if left != right && !failed {
+                        failed = true;
+                        failures += 1;
+                        buf_str(out, c"rule failed: ");
+                        buf_str(out, rule_text(r));
+                        buf_str(out, c" (type ");
+                        buf_int(out, t);
+                        buf_str(out, c", variables");
+                        for i in 0..R_VARS.data[r] {
+                            buf_byte(out, ' ');
+                            buf_int(out, EVAL_VARS[i]);
+                        }
+                        buf_str(out, c": ");
+                        buf_int(out, left);
+                        buf_str(out, c" vs ");
+                        buf_int(out, right);
+                        buf_str(out, c")\n");
+                    }
+                }
+            }
+        }
+        buf_str(out, c"rewrite rules: ");
+        buf_int(out, RULE_COUNT);
+        buf_str(out, c" rules, ");
+        buf_int(out, checked);
+        buf_str(out, c" checks, ");
+        buf_int(out, failures);
+        buf_str(out, c" failed\n");
+        buf_write_fd(out, STDOUT);
+        failures
+    }
+}

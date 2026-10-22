@@ -1,4 +1,4 @@
-# Run by compiler/std/embed.sh over std's source (std.tach and the files
+# Run by compiler/std/embed.sh over std's source (std.vl and the files
 # appended to it, as std_source writes it): the index of its sections,
 # one line each, for the loader (front/modules: std_sections), which lexes
 # only the sections a program can reach (0.15).
@@ -50,7 +50,7 @@ BEGIN {
     # the module (no re-export outside it): a word of one of their lazy
     # sections asks for it only from a program that also names the module's
     # gate word, written first in the section's words as `+WORD` (the
-    # loader: front/modules/stdsections.tach), so that a program's own
+    # loader: front/modules/stdsections.vl), so that a program's own
     # `props` or `to_lower` loads no Unicode table.
     GATES["std::str"] = "str"
     GATES["std::unicode"] = "unicode"

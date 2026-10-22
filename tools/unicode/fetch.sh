@@ -1,5 +1,5 @@
 #!/bin/sh
-# Downloads the Unicode Character Database files that tools/unicode/gen.tach
+# Downloads the Unicode Character Database files that tools/unicode/gen.vl
 # reads, at the version pinned in tools/unicode/ucd.lock, into a cache
 # outside the tree, and checks each against its SHA-256 in the lock.
 #
@@ -10,14 +10,14 @@
 #                files the lock names at the version on its first line and
 #                rewrite the lock's sums from what was downloaded
 #
-# The cache: $TACHYON_UCD_CACHE, else $HOME/.cache/tachyon/ucd; the files
+# The cache: $VOLE_UCD_CACHE, else $HOME/.cache/vole/ucd; the files
 # go to CACHE/VERSION/, flat (auxiliary/ and emoji/ dropped). Prints the
 # directory on success. Needs curl and shasum (macOS) or sha256sum.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 lock="$here/ucd.lock"
 version=$(awk '$1 == "version" { print $2 }' "$lock")
-cache=${TACHYON_UCD_CACHE:-$HOME/.cache/tachyon/ucd}
+cache=${VOLE_UCD_CACHE:-$HOME/.cache/vole/ucd}
 dir="$cache/$version"
 mkdir -p "$dir"
 

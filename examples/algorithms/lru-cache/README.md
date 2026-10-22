@@ -6,7 +6,7 @@ A least-recently-used cache, generic over its key and value types: a
 sizes take about 230 ms, under 20 ns a request.
 
 ```sh
-tachyonc examples/algorithms/lru-cache/main.tach -o lru && ./lru
+volec examples/algorithms/lru-cache/main.vl -o lru && ./lru
 ```
 
 ## The problem
@@ -180,9 +180,9 @@ an Apple M-series machine:
 
 | | time |
 |---|---|
-| tachyon 0.15, `-O2` (the default) | 230 ms |
-| tachyon 0.15, `-O1` | 330 ms |
-| tachyon 0.15, `-O0` | 2.0 s |
+| vole 0.15, `-O2` (the default) | 230 ms |
+| vole 0.15, `-O1` | 330 ms |
+| vole 0.15, `-O0` | 2.0 s |
 | C, `clang -O2` | 155 ms |
 
 The whole request path, `HashMap::get` included, is inlined into
@@ -195,16 +195,16 @@ map and the node array.
 
 | feature | where | guide |
 |---|---|---|
-| a generic struct with bounds, `impl<K: Hash + Eq, V>` | `LruCache` | `tachyonc guide generics`, `guide traits` |
-| `HashMap` with `[u8]` and `i64` keys | `LruCache` | `tachyonc guide std` |
-| your own `impl Iterator`, `type Item`, `enumerate` | `LruIter`, `show` | `tachyonc guide iterators` |
-| `match` as an expression with an early `return` | `get`, `serve` | `tachyonc guide syntax` |
-| `Option<(K, V)>`, tuple patterns in `for` and `if let` | `put`, `main` | `tachyonc guide syntax` |
-| `#[derive(Debug, Clone)]`, `{x:?}` | `Stats`, `main` | `tachyonc guide formatting` |
-| default arguments | `serve` | `tachyonc guide core` |
-| f-strings: `{rate:.2}`, `{n:>7}` | `main` | `tachyonc guide formatting` |
-| `defer` to free | `serve`, `main` | `tachyonc guide memory` |
-| a C header: `import "time.h" as c;` | `now_ns` | `tachyonc guide c-interop` |
+| a generic struct with bounds, `impl<K: Hash + Eq, V>` | `LruCache` | `volec guide generics`, `guide traits` |
+| `HashMap` with `[u8]` and `i64` keys | `LruCache` | `volec guide std` |
+| your own `impl Iterator`, `type Item`, `enumerate` | `LruIter`, `show` | `volec guide iterators` |
+| `match` as an expression with an early `return` | `get`, `serve` | `volec guide syntax` |
+| `Option<(K, V)>`, tuple patterns in `for` and `if let` | `put`, `main` | `volec guide syntax` |
+| `#[derive(Debug, Clone)]`, `{x:?}` | `Stats`, `main` | `volec guide formatting` |
+| default arguments | `serve` | `volec guide core` |
+| f-strings: `{rate:.2}`, `{n:>7}` | `main` | `volec guide formatting` |
+| `defer` to free | `serve`, `main` | `volec guide memory` |
+| a C header: `import "time.h" as c;` | `now_ns` | `volec guide c-interop` |
 
 ## Try
 

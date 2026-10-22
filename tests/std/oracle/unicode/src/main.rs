@@ -1,4 +1,4 @@
-// The reference for tachyon's Unicode tables (tests/std/unicode/reference-rust.txt):
+// The reference for vole's Unicode tables (tests/std/unicode/reference-rust.txt):
 // per-code-point widths from unicode-width and Rust std's char properties
 // and case mappings, over every scalar value. Format: see README.
 use std::fmt::Write as _;

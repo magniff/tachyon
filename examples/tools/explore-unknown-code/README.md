@@ -1,9 +1,9 @@
 # Explore unknown code
 
 `transit` plans the quickest routes across a city's train network: a
-graph of stations (`graph.tach`), a binary heap (`heap.tach`), Dijkstra's
-search with a cost for changing lines (`route.tach`), the timetable
-(`network.tach`) and a few trips in `main.tach`. About 300 lines.
+graph of stations (`graph.vl`), a binary heap (`heap.vl`), Dijkstra's
+search with a cost for changing lines (`route.vl`), the timetable
+(`network.vl`) and a few trips in `main.vl`. About 300 lines.
 
 A bug report comes in: "Airport to Museum is one 16-minute ride on line
 A, but the planner says 21 minutes." This session is the first look of
@@ -17,7 +17,7 @@ its output is checked against this file.
 ## The symptom
 
 ```console
-$ tachyonc main.tach -o transit && ./transit
+$ volec main.vl -o transit && ./transit
 Airport -> Museum: 21 min
   line A  Airport    -> Museum      16 min
 Airport -> Market: 25 min
@@ -40,13 +40,13 @@ items each has; with a module, its items' signatures and lines, like a
 generated header:
 
 ```console
-$ tachyonc query items
-crate	main.tach	6
+$ volec query items
+crate	main.vl	6
 std	<std>	592
-crate::graph	graph.tach	11
-crate::heap	heap.tach	7
-crate::network	network.tach	2
-crate::route	route.tach	7
+crate::graph	graph.vl	11
+crate::heap	heap.vl	7
+crate::network	network.vl	2
+crate::route	route.vl	7
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	37
@@ -125,8 +125,8 @@ std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6
 std::arch::aarch64::raw	<std::arch::aarch64::raw>	110
 std::arch::x86_64::raw	<std::arch::x86_64::raw>	6
-$ tachyonc query items route
-# crate::route	route.tach
+$ volec query items route
+# crate::route	route.vl
 8	const	pub const TRANSFER_MINUTES: i64 = 5
 10	struct	pub struct Leg
 17	struct	pub struct Route
@@ -144,8 +144,8 @@ types it uses and its callers, cut to a budget of tokens. What did not
 fit is counted, with the commands that print it:
 
 ```console
-$ tachyonc query context quickest --budget 600
-// crate::route::quickest	route.tach:34-64	effects: alloc(Gpa) panic diverge
+$ volec query context quickest --budget 600
+// crate::route::quickest	route.vl:34-64	effects: alloc(Gpa) panic diverge
 pub fn quickest(g: Graph, from: i64, to: i64, gpa: Gpa) -> Option<Route> {
     let n = size(g);
     var best: Vec<i64> = Vec::filled_in(n, i64::MAX, gpa);
@@ -178,38 +178,38 @@ pub fn quickest(g: Graph, from: i64, to: i64, gpa: Gpa) -> Option<Route> {
     Some(Route { legs: legs_to(how, from, to, gpa), total: best.get(to) })
 }
 // calls (14)
-crate::route::ride_cost	route.tach:30:4	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64
-crate::route::legs_to	route.tach:68:4	fn	fn legs_to(how: Vec<Step>, from: i64, to: i64, gpa: Gpa) -> Vec<Leg>
-crate::graph::size	graph.tach:21:8	fn	pub fn size(g: Graph) -> i64
-crate::heap::new_heap	heap.tach:14:8	fn	pub fn new_heap(gpa: Gpa) -> MinHeap
-crate::heap::free_heap	heap.tach:63:8	fn	pub fn free_heap(h: inout MinHeap)
-crate::heap::is_empty	heap.tach:18:8	fn	pub fn is_empty(h: MinHeap) -> bool
-crate::heap::pop	heap.tach:35:8	fn	pub fn pop(h: inout MinHeap) -> Option<Entry>
-crate::graph::edges_from	graph.tach:55:8	fn	pub fn edges_from(g: Graph, i: i64) -> [Edge]
-crate::heap::push	heap.tach:22:8	fn	pub fn push(h: inout MinHeap, e: Entry)
+crate::route::ride_cost	route.vl:30:4	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64
+crate::route::legs_to	route.vl:68:4	fn	fn legs_to(how: Vec<Step>, from: i64, to: i64, gpa: Gpa) -> Vec<Leg>
+crate::graph::size	graph.vl:21:8	fn	pub fn size(g: Graph) -> i64
+crate::heap::new_heap	heap.vl:14:8	fn	pub fn new_heap(gpa: Gpa) -> MinHeap
+crate::heap::free_heap	heap.vl:63:8	fn	pub fn free_heap(h: inout MinHeap)
+crate::heap::is_empty	heap.vl:18:8	fn	pub fn is_empty(h: MinHeap) -> bool
+crate::heap::pop	heap.vl:35:8	fn	pub fn pop(h: inout MinHeap) -> Option<Entry>
+crate::graph::edges_from	graph.vl:55:8	fn	pub fn edges_from(g: Graph, i: i64) -> [Edge]
+crate::heap::push	heap.vl:22:8	fn	pub fn push(h: inout MinHeap, e: Entry)
 std::Vec::set	<std>:311:12	method	pub fn set(inout self, i: i64, x: sink T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
 std::Vec::filled_in	<std>:1490:12	method	pub fn filled_in(n: i64, x: sink T, a: sink A) -> Vec<T, A>
 std::Option::unwrap	<std>:129:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
 // callers (1)
-plan	main.tach:20:11	match quickest(g, a, b, gpa) {
+plan	main.vl:20:11	match quickest(g, a, b, gpa) {
 note query.budget: over the budget of 600 tokens, left out: calls 2, types or uses 9
-try: tachyonc query context quickest --budget 1800
+try: volec query context quickest --budget 1800
 ```
 
 The total is `best.get(to)`, the sum of `ride_cost(...)` along the way.
 The context of `ride_cost` is small enough to print whole:
 
 ```console
-$ tachyonc query context ride_cost
-// crate::route::ride_cost	route.tach:29-32	effects: none
+$ volec query context ride_cost
+// crate::route::ride_cost	route.vl:29-32	effects: none
 // What a ride on `e` costs, arriving at its start on `here_line`.
 fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64 {
     if line != here_line { minutes + TRANSFER_MINUTES } else { minutes }
 }
 // uses (1)
-crate::route::TRANSFER_MINUTES	route.tach:8:11	const	pub const TRANSFER_MINUTES: i64 = 5
+crate::route::TRANSFER_MINUTES	route.vl:8:11	const	pub const TRANSFER_MINUTES: i64 = 5
 // callers (1)
-route::quickest	route.tach:52:35	let cost = cur.cost + ride_cost(cur.line, e.minutes, e.line);
+route::quickest	route.vl:52:35	let cost = cur.cost + ride_cost(cur.line, e.minutes, e.line);
 ```
 
 `ride_cost` adds a transfer whenever the ride's line differs from the
@@ -223,8 +223,8 @@ start?
 function. `--kind` keeps some kinds:
 
 ```console
-$ tachyonc query refs Entry.line --kind init
-# route.tach
+$ volec query refs Entry.line --kind init
+# route.vl
 42:43	init	route::quickest	push(&h, Entry { cost: 0, node: from, line: 0 });
 56:58	init	route::quickest	push(&h, Entry { cost: cost, node: e.to, line: e.line });
 ```
@@ -234,10 +234,10 @@ says what 0 means (each hit names the item its comment documents, here
 the field `Entry.line` and the function `ride_cost`):
 
 ```console
-$ tachyonc query grep start --comments
-# heap.tach
+$ volec query grep start --comments
+# heap.vl
 6:48	comment	heap::Entry.line	// the line the state arrived on; 0 at the start
-# route.tach
+# route.vl
 29:46	comment	route::ride_cost	// What a ride on `e` costs, arriving at its start on `here_line`.
 ```
 
@@ -245,9 +245,9 @@ And `query type` gives the type of the expression at a position (here
 `cur`, on line 46, and the `e.minutes` passed to `ride_cost`):
 
 ```console
-$ tachyonc query type route.tach:46:13
+$ volec query type route.vl:46:13
 !	continue
-$ tachyonc query type route.tach:54:58
+$ volec query type route.vl:54:58
 ()	{ best.set(e.to, cost); how.set(e.to, Step { from: cur.node, line: e.line, minutes: e.minutes }); p…
 ```
 
@@ -256,11 +256,11 @@ charges a transfer for the first ride. That is the bug.
 
 ## 4. Two side questions, answered without leaving the terminal
 
-`main.tach` prints the line with `{l.line:c}`. What does `:c` do? The
+`main.vl` prints the line with `{l.line:c}`. What does `:c` do? The
 guide answers from its own text:
 
 ```console
-$ tachyonc guide --find 'spec width align' --budget 900 | head -11
+$ volec guide --find 'spec width align' --budget 900 | head -11
 # formatting#f-strings
 - `{{` and `}}` are a brace; the text takes a string's escapes.
 - A hole holds any expression but a top-level `:` (parenthesize it);
@@ -279,9 +279,9 @@ runs statements with std imported and prints the last value with its
 type):
 
 ```console
-$ tachyonc try 'println(f"[{65u8:c}] [{65u8}]")'
+$ volec try 'println(f"[{65u8:c}] [{65u8}]")'
 [A] [65]
-$ tachyonc try 'let here: u8 = 0; let line = 65u8; here != 0 && line != here'
+$ volec try 'let here: u8 = 0; let line = 65u8; here != 0 && line != here'
 bool = false
 ```
 
@@ -291,20 +291,20 @@ Before changing a function, what does the change touch? `query impact`
 lists the calls by file, `query callers` each call:
 
 ```console
-$ tachyonc query impact ride_cost
-crate::route::ride_cost	route.tach:30:4	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64	effects: none
-route.tach	1	0	route::quickest
+$ volec query impact ride_cost
+crate::route::ride_cost	route.vl:30:4	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64	effects: none
+route.vl	1	0	route::quickest
 total	1	0	1 file
 ```
 
 One call, in the same module. The fix is one condition, changed by name:
 
 ```console
-$ tachyonc edit patch ride_cost --old 'if line != here_line' --new 'if here_line != 0 && line != here_line' --show
-patched crate::route::ride_cost	route.tach	+1 -1 lines
-// route.tach:31
+$ volec edit patch ride_cost --old 'if line != here_line' --new 'if here_line != 0 && line != here_line' --show
+patched crate::route::ride_cost	route.vl	+1 -1 lines
+// route.vl:31
 31	    if here_line != 0 && line != here_line { minutes + TRANSFER_MINUTES } else { minutes }
-$ tachyonc main.tach -o transit && ./transit
+$ volec main.vl -o transit && ./transit
 Airport -> Museum: 16 min
   line A  Airport    -> Museum      16 min
 Airport -> Market: 20 min
@@ -321,7 +321,7 @@ Airport to Museum is 16 minutes, Airport to Market 20 (12, a change, 3).
 
 ## Why not by hand
 
-The usual first look is `ls`, `cat route.tach`, `grep -rn ride_cost`,
+The usual first look is `ls`, `cat route.vl`, `grep -rn ride_cost`,
 `grep -rn 'line: 0'`, then reading 300 lines to be sure nothing else
 writes the line. Here every answer was exact and short:
 
@@ -338,5 +338,5 @@ writes the line. Here every answer was exact and short:
   documentation, for this version of the language.
 
 On a program of this size, reading it whole once is also reasonable
-(`tachyonc query show route.tach` prints a file); the queries pay off as
+(`volec query show route.vl` prints a file); the queries pay off as
 the program grows, and they cost the same at 300 lines as at 30,000.

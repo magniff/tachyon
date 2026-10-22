@@ -1,11 +1,11 @@
 # std::gpu: compute and rendering on the GPU
 
-Tachyon 0.22 has GPU support in std, on wgpu's model: an instance, an
+Vole 0.22 has GPU support in std, on wgpu's model: an instance, an
 adapter, a device and its queue; buffers (mapped to read and write them),
 textures, views and samplers; shaders, bind groups and compute and render
 pipelines; command encoders whose passes are closures; surfaces for
 windows. On macOS it runs on Metal. A program links the Objective-C
-runtime with `-l objc`; std opens Metal itself. `tachyonc guide gpu` is
+runtime with `-l objc`; std opens Metal itself. `volec guide gpu` is
 the whole story.
 
 | example | the program | what it shows |

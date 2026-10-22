@@ -4,7 +4,7 @@ machine's configuration.
 Isolation (verified on a dev run, see README.md):
 - the environment is rebuilt from scratch (lib.common.base_env): no
   CLAUDE_* variables of a calling session, PATH = the run's bin dir and
-  the system directories (tachyonc for tachyon, rustc for Rust);
+  the system directories (volec for vole, rustc for Rust);
 - `--setting-sources ""`: no user, project or local settings, so no hooks,
   plugins, permissions or model settings of this machine; the settings the
   run needs come from `--settings`;
@@ -40,17 +40,17 @@ TOOLS = "Read,Write,Edit,Glob,Grep,Bash"
 # Commands a programmer runs; Bash runs in the sandbox anyway, and a
 # command outside this list is still auto-allowed there unless Claude Code
 # itself asks for approval (shell variables, or commands it does not know,
-# such as `tachyonc edit`): the list covers those. Claude Code splits a
+# such as `volec edit`): the list covers those. Claude Code splits a
 # compound line at && || ; | and newlines and wants every part allowed,
 # so every command an agent chains must be here.
-ALLOW = ["tachyonc", "rustc", "./prog", "prog", "cat", "ls", "echo", "printf",
+ALLOW = ["volec", "rustc", "./prog", "prog", "cat", "ls", "echo", "printf",
          "head", "tail", "grep", "sed", "awk", "diff", "cmp", "wc", "sort",
          "uniq", "tr", "cut", "mkdir", "cp", "mv", "rm", "touch", "find",
          "python3", "time", "timeout", "test", "true", "false", "cd", "pwd",
          "which", "seq", "xxd", "od", "git", "sh", "bash", "chmod", "tee",
          "env", "file", "stat", "du",
          # (0.16) the compiler tasks
-         "target/tachyonc", "target/tools/tachyonc", "./target/tachyonc",
+         "target/volec", "target/tools/volec", "./target/volec",
          "bootstrap/eval-build.sh", "./bootstrap/eval-build.sh", "tests/run.sh",
          "./tests/run.sh", "tools/agent-feedback", "cc", "xargs", "cmp", "basename",
          "dirname", "date", "sleep",
@@ -58,7 +58,7 @@ ALLOW = ["tachyonc", "rustc", "./prog", "prog", "cat", "ls", "echo", "printf",
          # with the commands above (every part of a chain must be allowed);
          # all of it runs in the sandbox (writes only in the workspace and
          # temp, no network)
-         "./target/tools/tachyonc", "compiler/std/embed.sh", "./compiler/std/embed.sh",
+         "./target/tools/volec", "compiler/std/embed.sh", "./compiler/std/embed.sh",
          "compiler/guide/embed.sh", "./compiler/guide/embed.sh", "tools/agent-feedback",
          "perl", "patch", "paste", "join", "comm", "column", "fold", "rev", "split",
          "nl", "expr", "bc", "tar", "gzip", "gunzip", "shasum", "md5", "base64",
@@ -120,7 +120,7 @@ def _tee_entry(h, tee):
 
 def hooks_for(check_hook=None, query_hook=None, extra=None, tee=None):
     """The `hooks` of --settings: (--check-hook, +hook, compiler-tools)
-    `tachyonc check` after every change to a .tach file, its errors added
+    `volec check` after every change to a .vl file, its errors added
     to the tool result; (compiler-tools) the query-first hook before and
     after tool calls, as .claude/settings.json registers it in the
     repository; (0.17, +test) `extra`: the hooks of settings-eval.json
@@ -254,7 +254,7 @@ def run(prompt, ws, bin_dir, model, timeout_s, rdir, check_hook=None, query_hook
 def _env(bin_dir, rdir, check_hook, tee):
     e = env(bin_dir)
     if check_hook:
-        e["TACHYON_CHECK_HOOK_LOG"] = check_hook[1]
+        e["VOLE_CHECK_HOOK_LOG"] = check_hook[1]
     if tee:
         e["EVAL_HOOK_OUTPUT_LOG"] = os.path.join(rdir, "hook-output.jsonl")
     return e

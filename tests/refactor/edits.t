@@ -1,18 +1,18 @@
-## tachyonc edit replace|insert|delete and undo (tests/refactor/edits/).
+## volec edit replace|insert|delete and undo (tests/refactor/edits/).
 $ check
-ok: 0 errors in main.tach
+ok: 0 errors in main.vl
 ## Replacing an item replaces its lines; the comment above it stays when
 ## the new text has none.
-$ edit replace geom::area --dry-run < $T/inputs/area_plain.tach
---- a/geom.tach
-+++ b/geom.tach
+$ edit replace geom::area --dry-run < $T/inputs/area_plain.vl
+--- a/geom.vl
++++ b/geom.vl
 @@ -10 +10,2 @@
 -    p.x * p.y
 +    let w = p.x;
 +    w * p.y
-$ edit replace geom::area < $T/inputs/area_plain.tach
-replaced crate::geom::area	geom.tach	+2 -1 lines
-% cat geom.tach
+$ edit replace geom::area < $T/inputs/area_plain.vl
+replaced crate::geom::area	geom.vl	+2 -1 lines
+% cat geom.vl
 // Points.
 
 pub struct Point {
@@ -39,13 +39,13 @@ impl Point {
 
 pub enum Corner { Low, High }
 ## The new text starts with a comment: the comment is replaced too.
-$ edit replace geom::area < $T/inputs/area_doc.tach
-replaced crate::geom::area	geom.tach	+2 -3 lines
+$ edit replace geom::area < $T/inputs/area_doc.vl
+replaced crate::geom::area	geom.vl	+2 -3 lines
 % git diff
-diff --git a/geom.tach b/geom.tach
+diff --git a/geom.vl b/geom.vl
 index 92df3fe..65fc83f 100644
---- a/geom.tach
-+++ b/geom.tach
+--- a/geom.vl
++++ b/geom.vl
 @@ -5,7 +5,7 @@ pub struct Point {
      pub y: i64,
  }
@@ -56,137 +56,137 @@ index 92df3fe..65fc83f 100644
      p.x * p.y
  }
 ## A method: text that is not indented is indented like the method.
-$ edit replace Point::sum --dry-run < $T/inputs/sum_unindented.tach
---- a/geom.tach
-+++ b/geom.tach
+$ edit replace Point::sum --dry-run < $T/inputs/sum_unindented.vl
+--- a/geom.vl
++++ b/geom.vl
 @@ -19,2 +19,2 @@
 -    pub fn sum(self) -> i64 {
 -        self.x + self.y
 +    pub fn sum(self: *Point) -> i64 {
 +        self.y + self.x
-geom.tach:20:9: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: tachyonc fix --values main.tach | try: tachyonc fix --only unsafe main.tach  [edited: crate::geom::Point::sum]
-geom.tach:20:18: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: tachyonc fix --values main.tach | try: tachyonc fix --only unsafe main.tach  [edited: crate::geom::Point::sum]
+geom.vl:20:9: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: volec fix --values main.vl | try: volec fix --only unsafe main.vl  [edited: crate::geom::Point::sum]
+geom.vl:20:18: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: volec fix --values main.vl | try: volec fix --only unsafe main.vl  [edited: crate::geom::Point::sum]
 warning edit.breaks: 2 new errors (dry run)
 [exit 1]
 ## The text as `query show` prints it: its header line is dropped.
-$ edit replace geom::scale --dry-run < $T/inputs/scale_shown.tach
---- a/geom.tach
-+++ b/geom.tach
+$ edit replace geom::scale --dry-run < $T/inputs/scale_shown.vl
+--- a/geom.vl
++++ b/geom.vl
 @@ -14 +14 @@
 -    Point { x: p.x * k, y: p.y * k }
 +    Point { x: p.x * k, y: p.y * (k + 0) }
 ## Inserting after an item, before a method.
-$ edit insert --after geom::area --dry-run < $T/inputs/perimeter.tach
---- a/geom.tach
-+++ b/geom.tach
+$ edit insert --after geom::area --dry-run < $T/inputs/perimeter.vl
+--- a/geom.vl
++++ b/geom.vl
 @@ -12,0 +13,5 @@
 +// Twice the sum of its sides.
 +pub fn perimeter(p: Point) -> i64 {
 +    2 * (p.x + p.y)
 +}
 +
-$ edit insert --before Point::sum --dry-run < $T/inputs/diag.tach
---- a/geom.tach
-+++ b/geom.tach
+$ edit insert --before Point::sum --dry-run < $T/inputs/diag.vl
+--- a/geom.vl
++++ b/geom.vl
 @@ -17,0 +18,4 @@
 +    pub fn diag(self: *Point) -> i64 {
 +        self.x - self.y
 +    }
 +
-geom.tach:19:9: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: tachyonc fix --values main.tach | try: tachyonc fix --only unsafe main.tach  [edited]
-geom.tach:19:18: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: tachyonc fix --values main.tach | try: tachyonc fix --only unsafe main.tach  [edited]
+geom.vl:19:9: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: volec fix --values main.vl | try: volec fix --only unsafe main.vl  [edited]
+geom.vl:19:18: error[unsafe] access to a field through a raw pointer is unsafe: `self` is a `*T` parameter | help: a `*T` parameter is a raw pointer (0.18.1); a borrow is `&T`, or `&mut T` when written through: make `self` one (the first try: changes such parameters, with their calls), or put this in an `unsafe { ... }` block (the second: what the first keeps raw, a pointer indexed, compared, cast, stored or given to C) | try: volec fix --values main.vl | try: volec fix --only unsafe main.vl  [edited]
 warning edit.breaks: 2 new errors (dry run)
 [exit 1]
 ## Deleting: an item with one blank line; a variant of a one-line enum;
 ## a field (the struct literals need it: refused).
 $ edit delete geom::Corner --dry-run
---- a/geom.tach
-+++ b/geom.tach
+--- a/geom.vl
++++ b/geom.vl
 @@ -23,2 +22,0 @@
 -
 -pub enum Corner { Low, High }
 $ edit delete Corner::High --dry-run
---- a/geom.tach
-+++ b/geom.tach
+--- a/geom.vl
++++ b/geom.vl
 @@ -24 +24 @@
 -pub enum Corner { Low, High }
 +pub enum Corner { Low }
 $ edit delete Point.y
-main.tach:13:27: error[type error] unknown field 'y' in struct 'Point'  [in crate::main]
-main.tach:14:33: error[type error] unknown field 'y' in struct 'Point'  [in crate::main]
-geom.tach:9:11: error[type error] struct 'Point' has no field 'y'  [in crate::geom::area]
-geom.tach:13:25: error[type error] unknown field 'y' in struct 'Point'  [in crate::geom::scale]
-geom.tach:19:18: error[type error] struct 'Point' has no field 'y'  [in crate::geom::Point::sum]
+main.vl:13:27: error[type error] unknown field 'y' in struct 'Point'  [in crate::main]
+main.vl:14:33: error[type error] unknown field 'y' in struct 'Point'  [in crate::main]
+geom.vl:9:11: error[type error] struct 'Point' has no field 'y'  [in crate::geom::area]
+geom.vl:13:25: error[type error] unknown field 'y' in struct 'Point'  [in crate::geom::scale]
+geom.vl:19:18: error[type error] struct 'Point' has no field 'y'  [in crate::geom::Point::sum]
 error edit.breaks: 5 new errors (5 in crate::main, crate::geom::area, crate::geom::scale and 1 more, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::geom::Point no longer fit its new shape: a refactoring changes them with it, then the rest of the edit
-try: tachyonc query refs crate::geom::Point.y
+try: volec query refs crate::geom::Point.y
 note edit.together: change crate::main, crate::geom::area, crate::geom::scale and 1 more in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
-try: tachyonc query show crate::main crate::geom::area crate::geom::scale crate::geom::Point::sum
-try: tachyonc edit delete Point.y --no-check
+try: volec query show crate::main crate::geom::area crate::geom::scale crate::geom::Point::sum
+try: volec edit delete Point.y --no-check
 [exit 1]
 ## An edit that adds an error writes nothing (--dry-run says so too).
-$ edit replace geom::area < $T/inputs/area_bool.tach
-main.tach:9:5: error[type error] expected 'i64', got 'bool'  [in crate::total]
+$ edit replace geom::area < $T/inputs/area_bool.vl
+main.vl:9:5: error[type error] expected 'i64', got 'bool'  [in crate::total]
 error edit.breaks: 1 new error (1 in crate::total, which the edit does not change); nothing written
 note edit.together: change crate::total in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
-try: tachyonc query show crate::total
-try: tachyonc edit replace geom::area --no-check
+try: volec query show crate::total
+try: volec edit replace geom::area --no-check
 [exit 1]
 % git status --short
- M geom.tach
-$ edit replace geom::area --dry-run < $T/inputs/area_bool.tach
---- a/geom.tach
-+++ b/geom.tach
+ M geom.vl
+$ edit replace geom::area --dry-run < $T/inputs/area_bool.vl
+--- a/geom.vl
++++ b/geom.vl
 @@ -9,2 +9,2 @@
 -pub fn area(p: Point) -> i64 {
 -    p.x * p.y
 +pub fn area(p: Point) -> bool {
 +    p.x > p.y
-main.tach:9:5: error[type error] expected 'i64', got 'bool'  [in crate::total]
+main.vl:9:5: error[type error] expected 'i64', got 'bool'  [in crate::total]
 warning edit.breaks: 1 new error (1 in crate::total, which the edit does not change) (dry run)
 [exit 1]
 ## NAME must name one definition; replace needs its text on stdin.
 $ edit delete area
 error query.ambiguous: 2 definitions match 'area'; name one
-try: tachyonc edit delete crate::geom::area
-try: tachyonc edit delete crate::shapes::area
+try: volec edit delete crate::geom::area
+try: volec edit delete crate::shapes::area
 [exit 1]
 $ edit delete nowhere
 error query.no-match: no definition 'nowhere'
-try: tachyonc query items
+try: volec query items
 [exit 1]
 $ edit replace geom::area
 error edit.no-text: the new text is read from stdin; none was given
-try: tachyonc edit replace geom::area < new.tach
+try: volec edit replace geom::area < new.vl
 [exit 2]
 $ edit move geom::area
 error edit.usage: unknown command 'move' (patch, apply, replace, insert, delete, wrap, new-file, resolve)
 [exit 2]
 ## Undo, edit by edit; a file changed since is not undone (--force does).
 $ undo
-undid replaced crate::geom::area	geom.tach	+2 -3 lines
+undid replaced crate::geom::area	geom.vl	+2 -3 lines
 % git diff --stat
- geom.tach | 3 ++-
+ geom.vl | 3 ++-
  1 file changed, 2 insertions(+), 1 deletion(-)
 $ undo
-undid replaced crate::geom::area	geom.tach	+2 -1 lines
+undid replaced crate::geom::area	geom.vl	+2 -1 lines
 % git status --short
 $ undo
 error undo.empty: no edit to undo
 [exit 1]
 $ edit delete shapes::area --no-check
-main.tach:15:27: error[type error] no 'area' in module 'shapes'  [in crate::main]
-deleted crate::shapes::area	shapes.tach	+0 -4 lines
+main.vl:15:27: error[type error] no 'area' in module 'shapes'  [in crate::main]
+deleted crate::shapes::area	shapes.vl	+0 -4 lines
 warning edit.breaks: 1 new error (1 in crate::main, which the edit does not change); written anyway (--no-check)
-try: tachyonc check
+try: volec check
 $ check
-main.tach:15:27: error[type error] no 'area' in module 'shapes'
+main.vl:15:27: error[type error] no 'area' in module 'shapes'
 [exit 1]
-% printf '// changed\n' >>shapes.tach
+% printf '// changed\n' >>shapes.vl
 $ undo
-error undo.changed: 'WORK/shapes.tach' changed since the edit; nothing undone
-try: tachyonc undo --force
+error undo.changed: 'WORK/shapes.vl' changed since the edit; nothing undone
+try: volec undo --force
 [exit 1]
 $ undo --force
-undid deleted crate::shapes::area	shapes.tach	+0 -4 lines
+undid deleted crate::shapes::area	shapes.vl	+0 -4 lines
 % git status --short

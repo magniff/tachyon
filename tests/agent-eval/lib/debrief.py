@@ -39,8 +39,8 @@ RATINGS = ("READABILITY", "EASE", "CONFIDENCE")
 
 def prompt_for(cond):
     """The debrief's text for a condition (lib/conds.Cond)."""
-    lang = {"rust": "Rust", "compiler": "tachyon and its tools (tachyonc)"}.get(
-        cond.lang, "tachyon")
+    lang = {"rust": "Rust", "compiler": "vole and its tools (volec)"}.get(
+        cond.lang, "vole")
     with open(os.path.join(PROMPTS_DIR, "debrief.md")) as fh:
         return fh.read().strip().replace("@LANG@", lang)
 
@@ -114,7 +114,7 @@ THEMES = [
     ("match / enums / patterns", r"\bmatch\b|\benums?\b|pattern|exhaustive"),
     ("unsafe", r"\bunsafe\b"),
     ("contracts (requires/ensures)", r"\bcontracts?\b|\brequires\b|\bensures\b|invariant|contract\."),
-    ("tests (#[test], tachyonc test)", r"#\[test\]|\btests?\b|tachyonc test|test\."),
+    ("tests (#[test], volec test)", r"#\[test\]|\btests?\b|volec test|test\."),
     ("distinct types", r"\bdistinct\b|newtype|distinct\."),
     ("lifetimes (Rust)", r"lifetime|'a\b|borrow checker|borrowck"),
     ("guide / docs / lookup", r"\bguide\b|docs?\b|documentation|--find|lookup"),

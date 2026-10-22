@@ -1,31 +1,31 @@
 ## Several NAMEs in one call, ROOT by --root, FILE:LINE (0.11).
-$ def --root clash/main.tach a::helper b::helper
-crate::a::helper	clash/a.tach:2:8	fn	pub fn helper() -> i64	effects: none
-crate::b::helper	clash/b.tach:1:8	fn	pub fn helper() -> i64	effects: none
-$ show a::helper geom::V2::len --root clash/main.tach
-// crate::a::helper	clash/a.tach:1-4	effects: none
+$ def --root clash/main.vl a::helper b::helper
+crate::a::helper	clash/a.vl:2:8	fn	pub fn helper() -> i64	effects: none
+crate::b::helper	clash/b.vl:1:8	fn	pub fn helper() -> i64	effects: none
+$ show a::helper geom::V2::len --root clash/main.vl
+// crate::a::helper	clash/a.vl:1-4	effects: none
 // `helper` here and in b; a struct named like geom's function.
 pub fn helper() -> i64 {
     1
 }
-// crate::geom::V2::len	clash/geom.tach:14-17	effects: none
+// crate::geom::V2::len	clash/geom.vl:14-17	effects: none
     /// Its squared length.
     pub fn len(self) -> i64 {
         self.x * self.x + self.y * self.y
     }
-$ show clash/geom.tach:16 --root clash/main.tach
-// crate::geom::V2::len	clash/geom.tach:14-17	effects: none
+$ show clash/geom.vl:16 --root clash/main.vl
+// crate::geom::V2::len	clash/geom.vl:14-17	effects: none
     /// Its squared length.
     pub fn len(self) -> i64 {
         self.x * self.x + self.y * self.y
     }
-$ show geom.tach:16:9 clash/main.tach:33 --root clash/main.tach
-// crate::geom::V2::len	clash/geom.tach:14-17	effects: none
+$ show geom.vl:16:9 clash/main.vl:33 --root clash/main.vl
+// crate::geom::V2::len	clash/geom.vl:14-17	effects: none
     /// Its squared length.
     pub fn len(self) -> i64 {
         self.x * self.x + self.y * self.y
     }
-// crate::main	clash/main.tach:30-52	effects: alloc(Gpa) io panic unsafe
+// crate::main	clash/main.vl:30-52	effects: alloc(Gpa) io panic unsafe
 fn main(gpa: Gpa) -> i32 {
     let helper = 3;
     let n = a_helper() + b::helper() + helper;
@@ -49,26 +49,26 @@ fn main(gpa: Gpa) -> i32 {
     }
     0
 }
-$ def clash/geom.tach:2 --root clash/main.tach
-error query.no-match: no item at clash/geom.tach:2
-try: tachyonc query items crate::geom clash/main.tach
+$ def clash/geom.vl:2 --root clash/main.vl
+error query.no-match: no item at clash/geom.vl:2
+try: volec query items crate::geom clash/main.vl
 [exit 1]
-$ def nowhere.tach:3 --root clash/main.tach
-error query.no-match: no file 'nowhere.tach' in the program
-try: tachyonc query items clash/main.tach
+$ def nowhere.vl:3 --root clash/main.vl
+error query.no-match: no file 'nowhere.vl' in the program
+try: volec query items clash/main.vl
 [exit 1]
-$ refs a::helper b::helper --root clash/main.tach
-# clash/a.tach
+$ refs a::helper b::helper --root clash/main.vl
+# clash/a.vl
 2:8	def	->a::helper	pub fn helper() -> i64 {
-# clash/b.tach
+# clash/b.vl
 1:8	def	->b::helper	pub fn helper() -> i64 {
-# clash/main.tach
+# clash/main.vl
 15:8	use	crate	->a::helper	use a::helper as a_helper;
 32:13	call	main	->a::helper	let n = a_helper() + b::helper() + helper;
 32:29	call	main	->b::helper	let n = a_helper() + b::helper() + helper;
-$ def a::helper nothing_here b::helper --root clash/main.tach
-crate::a::helper	clash/a.tach:2:8	fn	pub fn helper() -> i64	effects: none
-crate::b::helper	clash/b.tach:1:8	fn	pub fn helper() -> i64	effects: none
+$ def a::helper nothing_here b::helper --root clash/main.vl
+crate::a::helper	clash/a.vl:2:8	fn	pub fn helper() -> i64	effects: none
+crate::b::helper	clash/b.vl:1:8	fn	pub fn helper() -> i64	effects: none
 error query.no-match: no definition 'nothing_here'
-try: tachyonc query items clash/main.tach
+try: volec query items clash/main.vl
 [exit 1]

@@ -23,7 +23,7 @@ LC_ALL=C
 export LC_ALL
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 FILTER=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -36,7 +36,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 fail=0
 # The command line: wgslc, tools/wgslc.
-if ! "$COMPILER" "$ROOT/tools/wgslc/main.tach" -o "$WORK/wgslc" >"$WORK/build.out" 2>&1; then
+if ! "$COMPILER" "$ROOT/tools/wgslc/main.vl" -o "$WORK/wgslc" >"$WORK/build.out" 2>&1; then
     echo "FAIL wgsl_build:"
     sed 's/^/    /' "$WORK/build.out"
     exit 1
@@ -44,10 +44,10 @@ fi
 W="$WORK/wgslc"
 
 # Metal: metalrun, linked with the frameworks by hand (no -framework in
-# tachyonc before C4).
+# volec before C4).
 METAL=""
 if [ "$(uname -s)" = Darwin ] && command -v cc >/dev/null 2>&1; then
-    if "$COMPILER" "$HERE/metalrun/main.tach" -c -o "$WORK/metalrun.o" >"$WORK/mbuild.out" 2>&1 \
+    if "$COMPILER" "$HERE/metalrun/main.vl" -c -o "$WORK/metalrun.o" >"$WORK/mbuild.out" 2>&1 \
         && cc "$WORK/metalrun.o" -framework Metal -framework Foundation -lobjc -o "$WORK/metalrun" >>"$WORK/mbuild.out" 2>&1; then
         METAL="$WORK/metalrun"
     else
@@ -156,7 +156,7 @@ for f in "$HERE"/cases/*.wgsl; do
 done
 # every wgsl.* code the compiler reports has an explanation
 why=""
-for code in $(cat "$ROOT"/compiler/std/gpu/wgsl/*.tach | grep -o '"wgsl\.[a-z]*"' | tr -d '"' | sort -u); do
+for code in $(cat "$ROOT"/compiler/std/gpu/wgsl/*.vl | grep -o '"wgsl\.[a-z]*"' | tr -d '"' | sort -u); do
     "$W" explain "$code" >/dev/null 2>&1 || why="$why $code"
 done
 if [ -n "$why" ]; then

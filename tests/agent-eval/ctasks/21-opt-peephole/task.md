@@ -1,7 +1,7 @@
 # Combine shifts of shifts
 
 At -O2 the optimizer leaves a shift of a shift by constants as two
-instructions. `tachyonc --emit-ir -O2` on
+instructions. `volec --emit-ir -O2` on
 
     fn f(x: u32) -> u32 { (x << 3) << 4 }
 
@@ -27,10 +27,10 @@ see docs/optimizer.md):
 Acceptance:
 
 - the compiler builds (`bootstrap/eval-build.sh`, the fixpoint);
-- add a test `tests/run/<name>.tach` of your own whose `// CHECK:` /
+- add a test `tests/run/<name>.vl` of your own whose `// CHECK:` /
   `// CHECK-NOT:` lines show the rule firing in the -O2 IR and whose
   `// EXPECT:` lines show the right results (the directives are
-  described at the top of tests/run.sh; tests/run/opt_egraph.tach is an
+  described at the top of tests/run.sh; tests/run/opt_egraph.vl is an
   example);
 - `tests/run.sh opt_`, `tests/run.sh arith_` and
   `tests/run.sh algorithms` pass, and your test passes. Hidden tests of

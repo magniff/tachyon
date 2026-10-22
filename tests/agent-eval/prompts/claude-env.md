@@ -6,7 +6,7 @@ because of their form, not their purpose: lines with shell variables
 (`$x`, `$?`), loops, heredocs, or several commands chained with `&&`,
 `;` or `cd`. When that happens, do not give up and do not stop: write
 files with the Write tool (a script, a test input), then run one simple
-command at a time, e.g. `tachyonc main.tach -o prog`, `sh check.sh`,
+command at a time, e.g. `volec main.vl -o prog`, `sh check.sh`,
 `./prog < input.txt`.
 
 Change files with the Edit tool. This is macOS: BSD `sed -i` needs an

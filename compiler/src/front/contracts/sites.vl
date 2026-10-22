@@ -1,0 +1,141 @@
+// The run-time check sites (0.18 T5, design §2.4): one record per check
+// (contracts and the existing bounds, unwrap and `as E` checks), its
+// position as file, line and column, from which the runtime prints
+// `FILE:LINE:COL: WHAT: DETAILS`. Site 0 is "none": the message as before
+// 0.18. The back ends pass a check's site to the run-time helper; the
+// helper's tables (gen0/target.vl's emit_runtime) are written from
+// SITE_FILE, SITE_LINE and SITE_COL once the code is emitted.
+//
+// A site is one per position: two checks at the same place (an index read
+// twice, a clause checked by both back ends) share it.
+
+use crate::base::{FILES, FILE_COUNT, IntVec, SRC};
+use crate::front::ast::NODES;
+use crate::front::contracts::flags::NO_POSITIONS;
+use crate::middle::lower::ssa::HMap;
+
+pub const SITE_NONE: i64 = 0;
+
+// The kinds of check (`lower_check`'s kinds stay as they are; these name
+// the contract checks T1 adds).
+pub const SITE_REQUIRES: i64 = 1;
+pub const SITE_ENSURES: i64 = 2;
+pub const SITE_INVARIANT: i64 = 3;
+pub const SITE_ASSERT: i64 = 4;
+
+// The sites, from 1 (index 0 is the unused "none"): the file (a FILES
+// index), the line and the column (from 1) of each.
+pub static var SITE_FILE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var SITE_LINE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var SITE_COL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Whether a check was given a site (the helper's tables are then written).
+pub static var SITES_USED: bool = false;
+// position + 1 -> site.
+static var BY_POS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// The offsets just after each '\n' of SRC, up to LINES_END.
+static var LINE_STARTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var LINES_END: i64 = 0;
+
+// The number of line starts at or before pos (the newlines before it).
+// (0.22) The table is read up to pos only, not to its file's end: std is
+// one file, and a contract site early in it read all of std's text.
+fn starts_upto(pos: i64, file_end: i64) -> i64 {
+    unsafe {
+        let _ = file_end;
+        while LINES_END < pos {
+            if SRC[LINES_END] == '\n' {
+                LINE_STARTS.push(LINES_END + 1);
+            }
+            LINES_END += 1;
+        }
+        var lo = 0;
+        var hi = LINE_STARTS.count;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if LINE_STARTS.data[mid] <= pos {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+}
+
+// The file of position pos (a FILES index).
+pub fn file_of_pos(pos: i64) -> i64 {
+    unsafe {
+        var lo = 0;
+        var hi = FILE_COUNT - 1;
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            if FILES[mid].start <= pos {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    }
+}
+
+// The line (from 1) of pos in file `file`, and its column through `col`.
+pub fn line_col(file: i64, pos: i64, col: inout i64) -> i64 {
+    unsafe {
+        let start = FILES[file].start;
+        let end = FILES[file].end;
+        let at = starts_upto(pos, end);
+        let before = starts_upto(start, end);
+        let line_start = if at > 0 && LINE_STARTS.data[at - 1] > start {
+            LINE_STARTS.data[at - 1]
+        } else {
+            start
+        };
+        col = pos - line_start + 1;
+        at - before + 1
+    }
+}
+
+// The site of check `kind` at `node` (its first character): its number
+// in the table, made on first use.
+pub fn site_of(node: i64, kind: i64) -> i64 {
+    unsafe {
+        if node <= 0 {
+            return SITE_NONE;
+        }
+        site_at(NODES[node].start)
+    }
+}
+
+// The site at source position pos.
+pub fn site_at(pos: i64) -> i64 {
+    unsafe {
+        if FILE_COUNT == 0 || pos < 0 || NO_POSITIONS {
+            return SITE_NONE;
+        }
+        let found = BY_POS.get(pos + 1);
+        if found != 0 {
+            return found;
+        }
+        if SITE_FILE.count == 0 {
+            SITE_FILE.push(0);
+            SITE_LINE.push(0);
+            SITE_COL.push(0);
+        }
+        let file = file_of_pos(pos);
+        var col = 0;
+        let line = line_col(file, pos, &col);
+        let site = SITE_FILE.count;
+        SITE_FILE.push(file);
+        SITE_LINE.push(line);
+        SITE_COL.push(col);
+        BY_POS.put(pos + 1, site);
+        site
+    }
+}
+
+// The number of sites made (the helper's table has one entry per site,
+// and an unused one at 0).
+pub fn site_count() -> i64 {
+    unsafe { SITE_FILE.count }
+}

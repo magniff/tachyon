@@ -1,4 +1,4 @@
-# Rewrites a tachyon program's `extern "C" { ... }` blocks of function
+# Rewrites a vole program's `extern "C" { ... }` blocks of function
 # declarations into the form the seed knows (0.2's `extern fn f(...);`,
 # removed from the language in 0.4), one declaration per line:
 #

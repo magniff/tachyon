@@ -1,9 +1,9 @@
 #!/bin/sh
 # Makes compiler/src/guide/text/ from the guide's source (0.13): for each
 # topic of compiler/guide/topics.txt (`name: summary`, in the order
-# `tachyonc guide --list` prints them), t_NAME.tach holds a function that
+# `volec guide --list` prints them), t_NAME.vl holds a function that
 # writes compiler/guide/NAME.md to a buffer, one call per line (string
-# literals cannot span lines); mod.tach has the table of topics. Run it
+# literals cannot span lines); mod.vl has the table of topics. Run it
 # after changing the guide; tests/guide/run.sh checks they agree.
 #
 # usage: compiler/guide/embed.sh [-c]   (-c: only check, exit 1 if stale)
@@ -37,8 +37,8 @@ while IFS= read -r line; do
         echo "pub fn text(out: i64) {"
         escape <"$src/$name.md" | sed -e 's/^/    buf_bytes(out, "/' -e 's/$/\\n");/'
         echo "}"
-    } >"$tmp/$mod.tach"
-    lines=$(wc -l <"$tmp/$mod.tach" | tr -d ' ')
+    } >"$tmp/$mod.vl"
+    lines=$(wc -l <"$tmp/$mod.vl" | tr -d ' ')
     [ "$lines" -le 1000 ] || { echo "embed.sh: $src/$name.md makes $lines lines (over 1000): split the topic" >&2; exit 1; }
     names="$names $name"
     count=$((count + 1))
@@ -89,7 +89,7 @@ done <"$src/topics.txt"
     echo "        _ => {}"
     echo "    }"
     echo "}"
-} >"$tmp/mod.tach"
+} >"$tmp/mod.vl"
 
 if [ "${1:-}" = "-c" ]; then
     if diff -r "$tmp" "$out" >/dev/null 2>&1; then exit 0; fi
@@ -98,4 +98,4 @@ if [ "${1:-}" = "-c" ]; then
 fi
 rm -rf "$out"
 mkdir -p "$out"
-cp "$tmp"/*.tach "$out/"
+cp "$tmp"/*.vl "$out/"

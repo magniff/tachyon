@@ -5,14 +5,14 @@ a struct, and `sqrt` from C's math library.
 
 ## Build and run
 
-From this folder (with `tachyonc` on your `PATH`, or `../../target/tachyonc`):
+From this folder (with `volec` on your `PATH`, or `../../target/volec`):
 
 ```sh
-tachyonc main.tach -o floats && ./floats
+volec main.vl -o floats && ./floats
 ```
 
 On Linux, C's math functions are in a library of their own, `libm`:
-`tachyonc` links it because the program calls `sqrt`.
+`volec` links it because the program calls `sqrt`.
 
 ## Expected output
 
@@ -23,7 +23,7 @@ On Linux, C's math functions are in a library of their own, `libm`:
 ## How it works
 
 A C function can be declared by hand in an `extern "C"` block, with
-tachyon's types for C's (`double` is `f64`):
+vole's types for C's (`double` is `f64`):
 
 ```tach
 extern "C" {
@@ -55,7 +55,7 @@ as the same float (`1.7320508075688772`).
 
 ## Language features
 
-- `f64`, float literals: `tachyonc guide types`
-- structs and methods, `self` by value: `tachyonc guide syntax`
-- `extern "C"` declarations, `unsafe` calls: `tachyonc guide c-interop`
-- format specs (`:.6`): `tachyonc guide formatting`
+- `f64`, float literals: `volec guide types`
+- structs and methods, `self` by value: `volec guide syntax`
+- `extern "C"` declarations, `unsafe` calls: `volec guide c-interop`
+- format specs (`:.6`): `volec guide formatting`

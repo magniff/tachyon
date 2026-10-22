@@ -12,15 +12,15 @@ CODE: MESSAGE` with `try:` lines ([query.md](query.md)). NAME is
 anything query accepts.
 
 ```
-tachyonc refactor signature FN --add 'x: T [= VALUE]' [--at N] [--fill-calls] | --remove x
+volec refactor signature FN --add 'x: T [= VALUE]' [--at N] [--fill-calls] | --remove x
                                | --rename-param a b | --reorder b,a,c | --type x T [--default EXPR]
-tachyonc refactor field STRUCT --add 'g: T = VALUE' | --remove g | --rename g h | --type g T
-tachyonc refactor variant ENUM --add 'X(T, ...)'|'X { a: T, ... }' [--arm EXPR] [--arm-in SITE EXPR]... | --remove V | --rename V W
-tachyonc rewrite 'PATTERN' 'REPLACEMENT' [--where '$x: T']... [--subst 'P' 'R']... [--in FILE|MODULE|ITEM]... [--list]
-tachyonc rewrite 'PATTERN' --list [--where ...] [--in FILE|MODULE|ITEM]   (0.16)
-tachyonc refactor extract-function FN --lines A-B --to NEW          (0.13)
-tachyonc refactor inline FN [--at FILE:LINE] [--keep]                 (0.13)
-tachyonc refactor --script FILE
+volec refactor field STRUCT --add 'g: T = VALUE' | --remove g | --rename g h | --type g T
+volec refactor variant ENUM --add 'X(T, ...)'|'X { a: T, ... }' [--arm EXPR] [--arm-in SITE EXPR]... | --remove V | --rename V W
+volec rewrite 'PATTERN' 'REPLACEMENT' [--where '$x: T']... [--subst 'P' 'R']... [--in FILE|MODULE|ITEM]... [--list]
+volec rewrite 'PATTERN' --list [--where ...] [--in FILE|MODULE|ITEM]   (0.16)
+volec refactor extract-function FN --lines A-B --to NEW          (0.13)
+volec refactor inline FN [--at FILE:LINE] [--keep]                 (0.13)
+volec refactor --script FILE
 ```
 
 Exit status: 0 done, 1 refused or failed (nothing written), 2 usage
@@ -50,9 +50,9 @@ change with it: `f(a)`, `x.f(a)` (whose receiver is `self`), `T::f(x,
 a)`, calls in generic instances, calls through a bound.
 
 ```
-$ tachyonc refactor signature area --add 'scale: i64 = 1'
-added parameter scale: i64 = 1 to crate::geom::area, 2 calls→geom.tach→+1 -1 lines
-$ tachyonc refactor signature area --add 'scale: i64 = 1' --fill-calls
+$ volec refactor signature area --add 'scale: i64 = 1'
+added parameter scale: i64 = 1 to crate::geom::area, 2 calls→geom.vl→+1 -1 lines
+$ volec refactor signature area --add 'scale: i64 = 1' --fill-calls
 added parameter scale: i64 to crate::geom::area, 2 calls→2 files→+2 -2 lines
 ```
 
@@ -137,15 +137,15 @@ A `#[repr(C)]` struct's layout changes with --add, --remove and --type:
   function the listing names, `FILE:LINE` when it has two), to fill in:
 
 ```
-$ tachyonc refactor variant Shape --add 'Ring(i64)'
-shapes.tach:9:5→shapes::area
-shapes.tach:16:5→shapes::round
+$ volec refactor variant Shape --add 'Ring(i64)'
+shapes.vl:9:5→shapes::area
+shapes.vl:16:5→shapes::round
 error refactor.non-exhaustive: 2 matches on crate::shapes::Shape would not cover Ring; nothing written
-try: tachyonc query show shapes.tach:9
-try: tachyonc query show shapes.tach:16
-try: tachyonc refactor variant crate::shapes::Shape --add 'Ring(i64)' --arm 'EXPR' --dry-run
-try: tachyonc refactor variant crate::shapes::Shape --add 'Ring(i64)' --arm-in shapes::area 'EXPR' --arm-in shapes::round 'EXPR' --dry-run
-$ tachyonc refactor variant Shape --add 'Ring(i64)' --arm-in area 0 --arm-in round false
+try: volec query show shapes.vl:9
+try: volec query show shapes.vl:16
+try: volec refactor variant crate::shapes::Shape --add 'Ring(i64)' --arm 'EXPR' --dry-run
+try: volec refactor variant crate::shapes::Shape --add 'Ring(i64)' --arm-in shapes::area 'EXPR' --arm-in shapes::round 'EXPR' --dry-run
+$ volec refactor variant Shape --add 'Ring(i64)' --arm-in area 0 --arm-in round false
 ```
 
   A SITE that names no match needing an arm: `error refactor.no-site`,
@@ -162,12 +162,12 @@ $ tachyonc refactor variant Shape --add 'Ring(i64)' --arm-in area 0 --arm-in rou
 ## rewrite
 
 ```
-tachyonc rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec'
+volec rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec'
 rewrote 37 sites in 9 files→9 files→+37 -37 lines
 ```
 
 A typed structural search and replace over the program's expressions and
-statements. PATTERN and REPLACEMENT are tachyon (a statement when the
+statements. PATTERN and REPLACEMENT are vole (a statement when the
 pattern ends with `;` or starts with `let`, else an expression), parsed
 by the compiler's parser, with holes:
 
@@ -211,7 +211,7 @@ A pattern also matches `for` loops, `match` arms (patterns with holes:
 types are checked once the whole pattern matched.
 
 ```
-tachyonc rewrite 'for $i in 0..$v.count { let $x = $v.data[$i]; $s... }' \
+volec rewrite 'for $i in 0..$v.count { let $x = $v.data[$i]; $s... }' \
     'for $x in $v.items() { $s... }' --where '$v: IntVec'
 ```
 
@@ -244,7 +244,7 @@ new names. A site where a dropped binding is still used after the
 substitutions is left (`note rewrite.dropped`):
 
 ```
-tachyonc rewrite 'for $i in 0..$v.count { $s... }' 'for $x in $v.items() { $s... }' \
+volec rewrite 'for $i in 0..$v.count { $s... }' 'for $x in $v.items() { $s... }' \
     --subst '$v.data[$i]' '$x' --where '$v: name'
 ```
 
@@ -265,9 +265,9 @@ REPLACEMENT, the sites that would be rewritten (not those left by
 `rewrite.dropped`); without one, every site PATTERN matches:
 
 ```
-$ tachyonc rewrite 'for $i in 0..$v.count { $s... }' --list
-loops.tach:8:5→$i=i→$v=w→$s...=t += w.data[i] * 2; if w.data[i] > 2 { t += w.data[i]; }
-loops.tach:18:5→$i=j→$v=w→$s...=t -= w.data[j];
+$ volec rewrite 'for $i in 0..$v.count { $s... }' --list
+loops.vl:8:5→$i=i→$v=w→$s...=t += w.data[i] * 2; if w.data[i] > 2 { t += w.data[i]; }
+loops.vl:18:5→$i=j→$v=w→$s...=t -= w.data[j];
 ```
 
 Nothing matches: `note rewrite.none`, exit 0; when sites matched but for
@@ -284,9 +284,9 @@ comments among them too) become a new function NEW, right after FN,
 called where they were:
 
 ```
-$ tachyonc refactor extract-function mean_to --lines 40-43 --to add_all --show
-extracted lines 40-43 of crate::calc::mean_to into add_all(i, n, acc) -> i64→calc.tach→+6 -1 lines
-// calc.tach:40-44
+$ volec refactor extract-function mean_to --lines 40-43 --to add_all --show
+extracted lines 40-43 of crate::calc::mean_to into add_all(i, n, acc) -> i64→calc.vl→+6 -1 lines
+// calc.vl:40-44
 40→    i = add_all(i, n, &mut acc);
 ...
 44→fn add_all(mut i: i64, n: i64, acc: &mut Acc) -> i64 {
@@ -337,7 +337,7 @@ importing it (`--keep` keeps it); `--at FILE:LINE`: the call on that
 line only, FN kept.
 
 ```
-$ tachyonc refactor inline quad
+$ volec refactor inline quad
 inlined crate::calc::quad at 1 call, deleted it→2 files→+10 -12 lines
 ```
 
@@ -388,28 +388,28 @@ against the compiler was identical (4668 compilations).
 refactor field Point --rename y height
 refactor signature area --add 'scale: i64 = 1' --fill-calls   # the calls get 1
 rewrite 'area($p, 1)' 'area($p, 2)'
-edit replace twice < twice.tach
+edit replace twice < twice.vl
 ```
 
 ```
-$ tachyonc refactor --script steps.txt
+$ volec refactor --script steps.txt
 renamed field y to height of crate::geom::Point, 6 uses→2 files→+6 -6 lines
 added parameter scale: i64 to crate::geom::area, 2 calls→2 files→+2 -2 lines
-rewrote 2 sites in 1 file→main.tach→+1 -1 lines
-replaced crate::geom::twice→geom.tach→+1 -1 lines
+rewrote 2 sites in 1 file→main.vl→+1 -1 lines
+replaced crate::geom::twice→geom.vl→+1 -1 lines
 script steps.txt: 4 commands→2 files→+9 -9 lines
 ```
 
 A file of `refactor`, `rewrite`, `edit` and `fix` commands, one per line
-as typed after `tachyonc` (words as sh splits them: `'...'`, `"..."`;
+as typed after `volec` (words as sh splits them: `'...'`, `"..."`;
 `#` starts a comment; `< PATH` gives the command its stdin, and 0.14,
 `<<WORD` the lines after it up to a line `WORD`, as sh's here-document:
 `<<'WORD'` and `<< WORD` too, the text taken as it is), run in turn
 in one invocation, each on the program the ones before left, and checked
 once, at the end: all or nothing. Each command runs in a copy of the
 process (fork) that reads the copies the commands before it wrote
-(`FILE.tachyon-edit~`, as --overlay) and writes its own, unchecked
-(edit.tach's STEP_REPORT), printing its summary line. A command that
+(`FILE.vole-edit~`, as --overlay) and writes its own, unchecked
+(edit.vl's STEP_REPORT), printing its summary line. A command that
 fails ends the script: `error refactor.script: FILE:LINE: the command
 failed (exit N): ...; nothing written`. After the last, the copies are
 one edit: checked, written, journaled (one `undo` takes the whole script
@@ -437,12 +437,12 @@ pub fn half_area(p: Point) -> i64 {
 EOF
 ```
 
-The text goes to a file next to the root (`ROOT.tachyon-stdin~`) while
+The text goes to a file next to the root (`ROOT.vole-stdin~`) while
 the command runs. A `<<WORD` without its line `WORD`: `error
 refactor.script: FILE:LINE: no line 'WORD' ends the text of <<WORD`.
 `--pairs FILE` works in a script as on the command line.
 
-The commands come from one table, `compiler/src/tools/commands.tach`:
+The commands come from one table, `compiler/src/tools/commands.vl`:
 `run_tool` (the commands a script may run: `edit`, `fix`, `rewrite`,
 `refactor`) and `run_refactor` (a `refactor` subcommand, one row each). A
 command added there works from the command line and in scripts, as long

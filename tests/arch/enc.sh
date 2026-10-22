@@ -5,7 +5,7 @@
 # with low and high registers (VEX.R, X, B and vvvv), both vector widths
 # (VEX.L), every class's operand order and memory operands with each
 # addressing form (written by tools/arch/x86_families.py --write). It is
-# assembled by the compiler (`tachyonc assemble`) and by cc, for
+# assembled by the compiler (`volec assemble`) and by cc, for
 # x86_64-macos (Mach-O) and x86_64-linux (ELF), and the two disassemblies
 # must be the same. Nothing is run: x86-64 is not executed in 0.19. Every
 # mnemonic of insn_x86.def must appear in the corpus (else the corpus is
@@ -16,7 +16,7 @@ set -u
 LC_ALL=C
 export LC_ALL
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 OUT="$ROOT/target/arch-enc"
 while [ $# -gt 0 ]; do
     case "$1" in

@@ -1,0 +1,679 @@
+// Value ranges and the comparisons they decide (0.4): bounds-check
+// elimination, comparison folding, jump threading on implied conditions,
+// and comparison chains turned into switches.
+//
+// A fact is a comparison (or a bool) known to hold, or not, at a block: the
+// condition of every branch on the way to it along the dominator tree (when
+// the edge into a block on that way is its only way in), the case of a
+// switch that leads there, and for the blocks of a counted loop
+// (scev.vl) `i < n` and `i >= start` for its induction variable. The
+// range of an integer value is an interval (in the signed 64-bit view of
+// its canonical value) from its type and its operation (masks, remainders,
+// conversions, constants), narrowed by the facts that compare it with a
+// constant. A comparison is decided when the facts about the same operands,
+// or the ranges, leave only outcomes that agree.
+//
+// 0.11: phis have ranges (the union of their operands', a loop's found by
+// induction: below), while a check's branch is decided; facts comparing a
+// value with another bound it by the other's range; shifts and 64-bit
+// conversions keep ranges; and a branch on a phi of `&&` or `||` is
+// threaded from the predecessor that decided it, so that the facts on the
+// way hold where it leads.
+
+mod chains;
+mod interval;
+mod phi;
+mod thread;
+
+use crate::base::{alloc_array, free};
+use crate::front::types::{TY_BOOL, int_bits, is_integer, is_signed};
+use crate::middle::ctx::FnCtx;
+use crate::middle::fold::is_const;
+use crate::middle::ir::{Cond, IRFUNCS, Op, Term, ir_append, ir_arg, ir_enter, ir_make, ir_val};
+use crate::middle::ir::Cond::{Eq, Ge, Gt, Le, Lt, Ne};
+use crate::middle::ir::cfg::{case_target, case_value};
+use crate::middle::ir::verify::verify_func;
+use crate::middle::loops::{analyze_loops, innermost_loop, loop_count, loop_latch, loop_preheader};
+use crate::middle::opt::{remove_trivial_phis, remove_unreachable, resolve_all, simplify_cfg};
+use crate::middle::range::chains::chains_to_switches;
+use crate::middle::range::interval::{
+    MAX_I64, MIN_I64, greater, lesser, range_at, range_with_facts, type_max, type_min,
+};
+use crate::middle::range::phi::{FACT_RANGE_DEPTH, forget_phi_ranges};
+use crate::middle::range::thread::{thread_implied, thread_phi_conditions};
+use crate::middle::scev::{counted_loop, iv_start};
+use crate::tools::query::checks::{PRINT_CHECKS, note_removed};
+
+// Outcomes of a comparison as a set: 1 less, 2 equal, 4 greater.
+fn cond_set(c: Cond) -> i64 {
+    match c {
+        Lt => 1,
+        Le => 3,
+        Eq => 2,
+        Ne => 5,
+        Gt => 4,
+        Ge => 6,
+    }
+}
+
+// The set with less and greater swapped (the operands swapped).
+fn mirror_set(s: i64) -> i64 {
+    (s & 2) | ((s & 1) << 2) | ((s & 4) >> 2)
+}
+
+fn is_order(c: Cond) -> bool {
+    c != Eq && c != Ne
+}
+
+// A comparison instruction outside any block, for a fact.
+fn fact_cmp(cx: sink *FnCtx, cond: Cond, ty: i64, a: i64, b: i64) -> i64 {
+    let v = ir_make(cx, Op::Cmp, TY_BOOL, a, b, 0);
+    unsafe {
+        cx.insts[v].cond = cond;
+        cx.insts[v].imm2 = ty;
+    }
+    v
+}
+
+fn fact_const(cx: sink *FnCtx, value: i64, ty: i64) -> i64 {
+    ir_make(cx, Op::Const, ty, 0, 0, value)
+}
+
+// The facts of the counted loops of the function (after analyze_loops).
+fn make_loop_facts(cx: sink *FnCtx) {
+    unsafe {
+        cx.loop_fact_lt.count = 0;
+        cx.loop_fact_ge.count = 0;
+        for l in 0..loop_count(cx) {
+            var lt = 0;
+            var ge = 0;
+            var iv = 0;
+            var step = 0;
+            var n = 0;
+            var ne = false;
+            if loop_preheader(cx, l) != 0 && loop_latch(cx, l) != 0
+                && counted_loop(cx, l, &iv, &step, &n, &ne) && !ne {
+                let latch = loop_latch(cx, l);
+                let ty = unsafe { cx.insts[cx.blocks[latch].cond].imm2 };
+                let start = iv_start(cx, l, iv);
+                if step == 1 {
+                    lt = fact_cmp(cx, Lt, ty, iv, n);
+                    ge = fact_cmp(cx, Ge, ty, iv, start);
+                } else {
+                    lt = fact_cmp(cx, Gt, ty, iv, n);
+                    ge = fact_cmp(cx, Le, ty, iv, start);
+                }
+            }
+            cx.loop_fact_lt.push(lt);
+            cx.loop_fact_ge.push(ge);
+        }
+    }
+}
+
+// The facts at the start of block b into FACTS.
+fn collect_facts(cx: sink *FnCtx, b: i64) {
+    unsafe {
+        cx.facts_ver += 1;
+        cx.facts.count = 0;
+        var x = b;
+        var steps = 0;
+        while steps < 64 {
+            steps += 1;
+            if cx.blocks[x].preds.count == 1 {
+                let p = cx.blocks[x].preds.data[0];
+                edge_fact(cx, p, x);
+            }
+            let up = cx.blocks[x].idom;
+            if up == x || up == 0 {
+                break;
+            }
+            x = up;
+        }
+        var l = innermost_loop(cx, b);
+        while l >= 0 {
+            if l < cx.loop_fact_lt.count && cx.loop_fact_lt.data[l] != 0 {
+                cx.facts.push(cx.loop_fact_lt.data[l]);
+                cx.facts.push(1);
+                cx.facts.push(cx.loop_fact_ge.data[l]);
+                cx.facts.push(1);
+            }
+            l = cx.lp_parent.data[l];
+        }
+    }
+}
+
+// The fact the edge p -> x gives (x reached by it), if any.
+fn edge_fact(cx: sink *FnCtx, p: i64, x: i64) {
+    unsafe {
+        cx.facts_ver += 1;
+        if cx.blocks[p].term == Term::Branch && cx.blocks[p].s0 != cx.blocks[p].s1 {
+            cx.facts.push(ir_val(cx, cx.blocks[p].cond));
+            cx.facts.push(if cx.blocks[p].s0 == x { 1 } else { 0 });
+        } else if cx.blocks[p].term == Term::Switch && cx.blocks[p].s0 != x {
+            // x is the target of exactly one case: the value is that case's.
+            var found = -1;
+            var count = 0;
+            for i in 0..cx.blocks[p].ncases {
+                if case_target(cx, p, i) == x {
+                    found = i;
+                    count += 1;
+                }
+            }
+            if count == 1 {
+                let v = ir_val(cx, cx.blocks[p].cond);
+                let ty = cx.insts[v].ty;
+                cx.facts.push(fact_cmp(cx, Eq, ty, v,
+                    fact_const(cx, case_value(cx, p, found), ty)));
+                cx.facts.push(1);
+            }
+        }
+    }
+}
+
+// v with conversions between 64-bit integer types (which change no bits)
+// looked through, and (0.18.1) `x + 0` and `x - 0` of 64-bit integer types,
+// which instcombine keeps when the type changes (a Vec's length read as a
+// slice's, `sub len, 0` in u64): values equal as bits compare equal.
+pub fn bits_of_value(cx: sink *FnCtx, v: i64) -> i64 {
+    unsafe {
+        var x = ir_val(cx, v);
+        loop {
+            let op = cx.insts[x].op;
+            if op == Op::Conv && is_integer(cx.insts[x].ty) && is_integer(cx.insts[x].imm2)
+                && int_bits(cx.insts[x].ty) == 64 && int_bits(cx.insts[x].imm2) == 64 {
+                x = ir_val(cx, cx.insts[x].a);
+            } else if (op == Op::Add || op == Op::Sub) && is_integer(cx.insts[x].ty)
+                && int_bits(cx.insts[x].ty) == 64 && is_const(cx, cx.insts[x].b)
+                && cx.insts[cx.insts[x].b].imm == 0
+                && is_integer(cx.insts[cx.insts[x].a].ty)
+                && int_bits(cx.insts[cx.insts[x].a].ty) == 64 {
+                x = ir_val(cx, cx.insts[x].a);
+            } else {
+                break;
+            }
+        }
+        x
+    }
+}
+
+// ---- Ranges at a block, and the comparisons they decide ----
+
+// Prepares the range queries of value_range_at for function fi: its
+// loops and their facts (again after its control flow changes).
+pub fn prepare_ranges(cx: sink *FnCtx, fi: i64) {
+    analyze_loops(cx, fi);
+    make_loop_facts(cx);
+    forget_phi_ranges(cx);
+}
+
+// The range of integer value v at block b (the signed 64-bit view of its
+// canonical value): from its operations and the facts that hold at b.
+pub fn value_range_at(cx: sink *FnCtx, v: i64, b: i64, lo: inout i64, hi: inout i64) {
+    collect_facts(cx, b);
+    range_at(cx, v, &lo, &hi);
+}
+
+// Narrows [*lo, *hi], the range of v, by the facts in FACTS comparing v
+// with a constant, or (0.11; while a check's branch is decided, as for
+// phis, and not too deep) with a value whose range bounds it: v < w gives
+// v < w's upper bound, v > w v > w's lower one, v == w w's range (an
+// unsigned comparison only with a non-negative w).
+fn narrow_by_facts(cx: sink *FnCtx, v: i64, lo: inout i64, hi: inout i64, depth: i64) {
+    unsafe {
+        if cx.mark_ver != cx.facts_ver {
+            mark_facts(cx);
+        }
+        let x0 = bits_of_value(cx, v);
+        if x0 < cx.mark_cap && cx.fact_mark[x0] != cx.mark_stamp {
+            return;
+        }
+        var i = 0;
+        while i < cx.facts.count {
+            let f = cx.facts.data[i];
+            let holds = cx.facts.data[i + 1] != 0;
+            i += 2;
+            if cx.insts[f].op != Op::Cmp || !is_integer(cx.insts[f].imm2) {
+                continue;
+            }
+            var cond = cx.insts[f].cond;
+            if !holds {
+                cond = cond.negate();
+            }
+            let fa = bits_of_value(cx, cx.insts[f].a);
+            let fb = bits_of_value(cx, cx.insts[f].b);
+            let x = bits_of_value(cx, v);
+            var k = 0;
+            var w = 0;
+            if fa == x && fa != fb {
+                w = fb;
+            } else if fb == x && fa != fb {
+                w = fa;
+                cond = cond.mirror();
+            } else {
+                continue;
+            }
+            let signed = is_signed(cx.insts[f].imm2);
+            let min = 0 - 9223372036854775807 - 1;
+            let max = 9223372036854775807;
+            // The bound w gives: k for a constant; else its range's upper end
+            // for < and <=, its lower end for > and >=, both for ==.
+            var klo = 0;
+            if is_const(cx, w) {
+                k = cx.insts[w].imm;
+                klo = k;
+            } else {
+                if !cx.phi_ranges || cx.fact_nest >= FACT_RANGE_DEPTH || cond == Ne {
+                    continue;
+                }
+                var whi = 0;
+                cx.fact_nest += 1;
+                range_with_facts(cx, w, &klo, &whi, depth + 1);
+                cx.fact_nest -= 1;
+                if !signed && klo < 0 {
+                    continue;
+                }
+                k = if cond == Gt || cond == Ge { klo } else { whi };
+            }
+            match cond {
+                Eq => {
+                    if is_const(cx, w) {
+                        lo = k;
+                        hi = k;
+                    } else if klo <= hi && k >= lo {
+                        lo = greater(lo, klo);
+                        hi = lesser(hi, k);
+                    }
+                }
+                Ne => {
+                    if lo == k && k != max {
+                        lo = k + 1;
+                    } else if hi == k && k != min {
+                        hi = k - 1;
+                    }
+                }
+                Lt | Le => {
+                    let bound = if cond == Lt { if k == min { min } else { k - 1 } } else { k };
+                    if signed || (k >= 0 && lo >= 0) {
+                        if bound < hi {
+                            hi = bound;
+                        }
+                    } else if k >= 0 {
+                        // Unsigned: below a non-negative bound, so non-negative.
+                        if lo < 0 {
+                            lo = 0;
+                        }
+                        if bound < hi {
+                            hi = bound;
+                        }
+                    }
+                }
+                _ => {
+                    let bound = if cond == Gt { if k == max { max } else { k + 1 } } else { k };
+                    if signed || (k >= 0 && lo >= 0) {
+                        if bound > lo {
+                            lo = bound;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Whether range [lo, hi] of comparison operand v can help decide it: not
+// its type's whole range, and for an unsigned order not of unknown sign.
+fn bounds_something(cx: sink *FnCtx, v: i64, lo: i64, hi: i64, signed: bool, order: bool) -> bool {
+    unsafe {
+        let ty = cx.insts[v].ty;
+        if lo <= type_min(ty) && hi >= type_max(ty) {
+            return false;
+        }
+        signed || !order || lo >= 0
+    }
+}
+
+// Marks the operands of the comparisons in FACTS (see FACT_MARK).
+fn mark_facts(cx: sink *FnCtx) {
+    unsafe {
+        if cx.mark_cap <= cx.inst_count {
+            free(cx.fact_mark as *u8);
+            cx.mark_cap = 2 * cx.inst_count + 1024;
+            cx.fact_mark = alloc_array::<i64>(cx.mark_cap);
+        }
+        cx.mark_stamp += 1;
+        var i = 0;
+        while i < cx.facts.count {
+            let f = cx.facts.data[i];
+            i += 2;
+            if cx.insts[f].op != Op::Cmp {
+                continue;
+            }
+            let fa = bits_of_value(cx, cx.insts[f].a);
+            let fb = bits_of_value(cx, cx.insts[f].b);
+            if fa < cx.mark_cap {
+                cx.fact_mark[fa] = cx.mark_stamp;
+            }
+            if fb < cx.mark_cap {
+                cx.fact_mark[fb] = cx.mark_stamp;
+            }
+        }
+        cx.mark_ver = cx.facts_ver;
+    }
+}
+
+// The outcomes possible for intervals a and b.
+fn interval_outcomes(alo: i64, ahi: i64, blo: i64, bhi: i64) -> i64 {
+    var s = 0;
+    if alo < bhi {
+        s |= 1;
+    }
+    if alo <= bhi && blo <= ahi {
+        s |= 2;
+    }
+    if ahi > blo {
+        s |= 4;
+    }
+    s
+}
+
+// Whether comparison or bool c holds at a block with facts FACTS: 1 true,
+// 0 false, -1 unknown.
+fn decide(cx: sink *FnCtx, c: i64) -> i64 {
+    unsafe {
+        var i = 0;
+        while i < cx.facts.count {
+            if cx.facts.data[i] == c {
+                return cx.facts.data[i + 1];
+            }
+            i += 2;
+        }
+        if cx.insts[c].op != Op::Cmp || !is_integer(cx.insts[c].imm2) {
+            return -1;
+        }
+        let a = bits_of_value(cx, cx.insts[c].a);
+        let b = bits_of_value(cx, cx.insts[c].b);
+        let q = cond_set(cx.insts[c].cond);
+        let signed = is_signed(cx.insts[c].imm2);
+        // (0.11) The cheaper side first (a phi's range costs most): when its
+        // range bounds nothing, the other's cannot decide anything.
+        var alo = MIN_I64;
+        var ahi = MAX_I64;
+        var blo = MIN_I64;
+        var bhi = MAX_I64;
+        let order = is_order(cx.insts[c].cond);
+        if cx.insts[a].op == Op::Phi && cx.insts[b].op != Op::Phi {
+            range_at(cx, b, &blo, &bhi);
+            if bounds_something(cx, b, blo, bhi, signed, order) {
+                range_at(cx, a, &alo, &ahi);
+            }
+        } else {
+            range_at(cx, a, &alo, &ahi);
+            if bounds_something(cx, a, alo, ahi, signed, order) {
+                range_at(cx, b, &blo, &bhi);
+            }
+        }
+        let nonneg = alo >= 0 && blo >= 0;
+        var outcomes = 7;
+        if a == b {
+            outcomes = 2;
+        }
+        if signed || nonneg || !is_order(cx.insts[c].cond) {
+            outcomes &= interval_outcomes(alo, ahi, blo, bhi);
+        }
+        i = 0;
+        while i < cx.facts.count {
+            let f = cx.facts.data[i];
+            let holds = cx.facts.data[i + 1] != 0;
+            i += 2;
+            if cx.insts[f].op != Op::Cmp || !is_integer(cx.insts[f].imm2) {
+                continue;
+            }
+            let fa = bits_of_value(cx, cx.insts[f].a);
+            let fb = bits_of_value(cx, cx.insts[f].b);
+            var fs = cond_set(cx.insts[f].cond);
+            if !holds {
+                fs = 7 & ~fs;
+            }
+            if fa == b && fb == a {
+                fs = mirror_set(fs);
+            } else if fa != a || fb != b {
+                continue;
+            }
+            let fsigned = is_signed(cx.insts[f].imm2);
+            if fs == 2 || fs == 5 || fsigned == signed || nonneg {
+                outcomes &= fs;
+            } else if fsigned && !signed && alo >= 0 && (fs & 4) == 0 {
+                // a <s b (or <=) with a >= 0: both are non-negative, and the
+                // unsigned order is the same.
+                outcomes &= fs;
+            }
+        }
+        // (0.18.1) x % n against n itself, n known positive: below it.
+        if order && (outcomes & q) != 0 && (outcomes & ~q) != 0 {
+            if rem_below(cx, a, b) {
+                outcomes &= 1;
+            } else if rem_below(cx, b, a) {
+                outcomes &= 4;
+            }
+        }
+        // (0.18.1) One step of transitivity, when the facts above left c open:
+        // facts a R w and w R' b of one signedness, both orders the same way
+        // (< or <=; > or >=), give a R'' b, strict when either is. So `i < n` (a
+        // counted loop's) and `n <= len` (a requires', a guard's) decide the
+        // check `i < len`.
+        if order && (outcomes & q) != 0 && (outcomes & ~q) != 0 {
+            let s = chained(cx, a, b);
+            if s != 7 {
+                let fsigned = (s & 8) != 0;
+                let fs = s & 7;
+                if !signed && fsigned && !nonneg && alo < 0 && (fs & 4) == 0 {
+                    range_at(cx, a, &alo, &ahi);
+                }
+                if fsigned == signed || nonneg || (fsigned && alo >= 0 && (fs & 4) == 0) {
+                    outcomes &= fs;
+                }
+            }
+        }
+        if outcomes == 0 {
+            return -1;
+        }
+        if (outcomes & ~q) == 0 {
+            return 1;
+        }
+        if (outcomes & q) == 0 {
+            return 0;
+        }
+        -1
+    }
+}
+
+// The order between a and b that two facts give through a third value w
+// (see decide): a set of outcomes (1 less, 2 equal, 4 greater), with 8
+// when the facts are signed; 7 when no two facts chain.
+fn chained(cx: sink *FnCtx, a: i64, b: i64) -> i64 {
+    unsafe {
+        var i = 0;
+        while i < cx.facts.count {
+            let f = cx.facts.data[i];
+            let holds = cx.facts.data[i + 1] != 0;
+            i += 2;
+            if cx.insts[f].op != Op::Cmp || !is_integer(cx.insts[f].imm2) {
+                continue;
+            }
+            let fa = bits_of_value(cx, cx.insts[f].a);
+            let fb = bits_of_value(cx, cx.insts[f].b);
+            var s1 = cond_set(cx.insts[f].cond);
+            if !holds {
+                s1 = 7 & ~s1;
+            }
+            var w = fb;
+            if fb == a && fa != a {
+                w = fa;
+                s1 = mirror_set(s1);
+            } else if fa != a || fb == a {
+                continue;
+            }
+            if w == b || ((s1 & 4) != 0 && (s1 & 1) != 0) {
+                continue;
+            }
+            let signed = is_signed(cx.insts[f].imm2);
+            var j = 0;
+            while j < cx.facts.count {
+                let g = cx.facts.data[j];
+                let gholds = cx.facts.data[j + 1] != 0;
+                j += 2;
+                if g == f || cx.insts[g].op != Op::Cmp || !is_integer(cx.insts[g].imm2)
+                    || is_signed(cx.insts[g].imm2) != signed {
+                    continue;
+                }
+                let ga = bits_of_value(cx, cx.insts[g].a);
+                let gb = bits_of_value(cx, cx.insts[g].b);
+                var s2 = cond_set(cx.insts[g].cond);
+                if !gholds {
+                    s2 = 7 & ~s2;
+                }
+                if ga == b && gb == w {
+                    s2 = mirror_set(s2);
+                } else if ga != w || gb != b {
+                    continue;
+                }
+                let strict = (s1 & 2) == 0 || (s2 & 2) == 0;
+                let sign = if signed { 8 } else { 0 };
+                if (s1 & 4) == 0 && (s2 & 4) == 0 {
+                    return sign | if strict { 1 } else { 3 };
+                }
+                if (s1 & 1) == 0 && (s2 & 1) == 0 {
+                    return sign | if strict { 4 } else { 6 };
+                }
+            }
+        }
+        7
+    }
+}
+
+// (0.18.1) Whether r is `x % n` with n (as bits) the value m, n at least 1
+// (its range, with the facts), and r non-negative (an unsigned remainder,
+// or a signed one of a non-negative x): then 0 <= r < m, signed or not.
+fn rem_below(cx: sink *FnCtx, r: i64, m: i64) -> bool {
+    unsafe {
+        if cx.insts[r].op != Op::Rem || int_bits(cx.insts[r].ty) != 64
+            || bits_of_value(cx, cx.insts[r].b) != m {
+            return false;
+        }
+        var lo = 0;
+        var hi = 0;
+        range_at(cx, m, &lo, &hi);
+        if lo < 1 {
+            return false;
+        }
+        if !is_signed(cx.insts[r].ty) {
+            return true;
+        }
+        range_at(cx, cx.insts[r].a, &lo, &hi);
+        lo >= 0
+    }
+}
+
+// ---- The pass ----
+
+// Decides the branches of fi whose condition the facts and ranges decide,
+// threads edges past blocks whose test the edge decides, and turns chains
+// of equality tests into switches. Returns whether anything changed.
+pub fn fold_by_ranges(cx: sink *FnCtx, fi: i64) -> bool {
+    unsafe {
+        ir_enter(cx, fi);
+        resolve_all(cx, fi);
+        var changed = thread_phi_conditions(cx, fi);
+        if changed {
+            resolve_all(cx, fi);
+            remove_unreachable(cx, fi);
+            remove_trivial_phis(cx, fi);
+            resolve_all(cx, fi);
+        }
+        analyze_loops(cx, fi);
+        make_loop_facts(cx);
+        for round in 0..3 {
+            if round > 0 {
+                resolve_all(cx, fi);
+                analyze_loops(cx, fi);
+            }
+            forget_phi_ranges(cx);
+            var folded = false;
+            for i in 0..IRFUNCS[fi].blocks.count {
+                let b = IRFUNCS[fi].blocks.data[i];
+                if cx.blocks[b].removed != 0 || cx.blocks[b].order < 0
+                    || cx.blocks[b].term != Term::Branch {
+                    continue;
+                }
+                let c = ir_val(cx, cx.blocks[b].cond);
+                if is_const(cx, c) {
+                    continue;
+                }
+                cx.phi_ranges = is_check(cx, cx.blocks[b].s0) || is_check(cx, cx.blocks[b].s1);
+                let d = decide_branch(cx, b, c);
+                cx.phi_ranges = false;
+                if d >= 0 {
+                    // (0.18: --print-checks names the checks removed here)
+                    if PRINT_CHECKS != 0 as *u8 {
+                        note_removed(cx, if d == 1 { cx.blocks[b].s1 } else { cx.blocks[b].s0 });
+                    }
+                    let k = ir_make(cx, Op::Const, TY_BOOL, 0, 0, d);
+                    ir_append(cx, b, k);
+                    cx.blocks[b].cond = k;
+                    folded = true;
+                }
+            }
+            if folded {
+                simplify_cfg(cx, fi);
+            }
+            let threaded = thread_implied(cx, fi);
+            if !folded && !threaded {
+                break;
+            }
+            changed = true;
+        }
+        if chains_to_switches(cx, fi) {
+            changed = true;
+        }
+        if changed {
+            resolve_all(cx, fi);
+            remove_unreachable(cx, fi);
+            remove_trivial_phis(cx, fi);
+            verify_func(cx, fi, c"value ranges");
+        }
+        changed
+    }
+}
+
+// Whether block b is where a check fails: it ends the program.
+fn is_check(cx: sink *FnCtx, b: i64) -> bool {
+    unsafe { cx.blocks[b].term == Term::Unreach }
+}
+
+// Whether the condition c of block b's branch is decided: by the facts at
+// b, or, for a phi of b, by the facts on each incoming edge alike.
+fn decide_branch(cx: sink *FnCtx, b: i64, c: i64) -> i64 {
+    unsafe {
+        collect_facts(cx, b);
+        let d = decide(cx, c);
+        if d >= 0 || cx.insts[c].op != Op::Phi || cx.insts[c].block != b {
+            return d;
+        }
+        var all = -1;
+        for k in 0..cx.insts[c].nargs {
+            let p = cx.blocks[b].preds.data[k];
+            if cx.blocks[p].term == Term::Switch
+                || (cx.blocks[p].term == Term::Branch && cx.blocks[p].s0 == cx.blocks[p].s1) {
+                return -1;
+            }
+            collect_facts(cx, p);
+            edge_fact(cx, p, b);
+            let dk = decide(cx, ir_val(cx, ir_arg(cx, c, k)));
+            if dk < 0 || (all >= 0 && dk != all) {
+                return -1;
+            }
+            all = dk;
+        }
+        all
+    }
+}

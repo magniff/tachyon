@@ -1,4 +1,4 @@
-// The hash vectors of tests/run/std_hash_vectors.tach (0.20): foldhash
+// The hash vectors of tests/run/std_hash_vectors.vl (0.20): foldhash
 // 0.2.0's fast FixedState (the crate itself, not a port) and Rust's
 // DefaultHasher (SipHash-1-3, keys 0 and 0), over 100000 random sequences
 // of writes. It needs the crate: in a cargo project with

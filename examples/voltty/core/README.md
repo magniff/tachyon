@@ -1,7 +1,7 @@
 # voltty/core: a terminal's core, headless
 
 The parser, the terminal state, the input encoders and the pty of
-voltty, the terminal emulator of tachyon 0.23 (docs/design/terminal.md;
+voltty, the terminal emulator of vole 0.23 (docs/design/terminal.md;
 the window and the renderer are std::window's and std::gpu's, elsewhere).
 It behaves as Alacritty does: a Rust harness over `alacritty_terminal`
 0.26.0, the crate Alacritty 0.17.0 is built on, is its oracle, and a
@@ -10,7 +10,7 @@ differential fuzzer holds the two to the same state, byte for byte.
 Build it from the root of the repository:
 
 ```sh
-target/tachyonc -O2 examples/voltty/core/main.tach -o voltty
+target/volec -O2 examples/voltty/core/main.vl -o voltty
 printf 'hi \033[1;31mthere\033[0m\r\n' | ./voltty --dump 4 20 100   # the state
 ./voltty --run 24 80 -- ls -l /                  # a program on a pty, then the screen
 printf 'key Up shift\n' | ./voltty --keys       # what a key sends: \x1b[1;2A
@@ -23,14 +23,14 @@ tests/voltty/run.sh                              # against the oracle (cargo)
 | file | what |
 |---|---|
 | vt/ | the escape-sequence parser: vte 0.15's state machine (Paul Williams' DEC parser), `Perform` statically dispatched; printable ASCII and runs of UTF-8 handed over in bulk; no allocation in `advance` |
-| term/mod.tach | the terminal: two grids, modes, tab stops, the scroll region, charsets, colours, title; `feed` with synchronized updates (2026) as vte holds them |
-| term/ops.tach | the control functions: Alacritty's set of CSI, ESC and OSC sequences, quirks included |
-| term/grid.tach | the ring of rows: Alacritty's `Storage` step by step, 16-byte cells (Alacritty's are 24), 10,000 lines of scrollback allocated as they fill |
-| term/reflow.tach | resize: wrapped lines re-wrapped, the cursor kept on its character; the alternate screen cut, not reflowed |
-| term/extra.tach | combining characters, underline colours and hyperlinks of cells, in a side table collected by mark and sweep |
-| term/dump.tach | the state as text (oracle/FORMAT.md) |
+| term/mod.vl | the terminal: two grids, modes, tab stops, the scroll region, charsets, colours, title; `feed` with synchronized updates (2026) as vte holds them |
+| term/ops.vl | the control functions: Alacritty's set of CSI, ESC and OSC sequences, quirks included |
+| term/grid.vl | the ring of rows: Alacritty's `Storage` step by step, 16-byte cells (Alacritty's are 24), 10,000 lines of scrollback allocated as they fill |
+| term/reflow.vl | resize: wrapped lines re-wrapped, the cursor kept on its character; the alternate screen cut, not reflowed |
+| term/extra.vl | combining characters, underline colours and hyperlinks of cells, in a side table collected by mark and sweep |
+| term/dump.vl | the state as text (oracle/FORMAT.md) |
 | input/ | keys with modifiers, the keypad, mouse reporting (X10, SGR, UTF-8), the wheel, bracketed paste, focus events |
-| pty.tach | a child program on a pseudo-terminal through std::sys: a fork that does only async-signal-safe work, a non-blocking controller, queued writes |
+| pty.vl | a child program on a pseudo-terminal through std::sys: a fork that does only async-signal-safe work, a non-blocking controller, queued writes |
 | oracle/ | the Rust harness over alacritty_terminal (dump, script, bench, width table); allowed.txt lists the deliberate differences |
 | bench/ | the workloads and the benchmark against alacritty_terminal |
 

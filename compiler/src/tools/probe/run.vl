@@ -1,0 +1,256 @@
+// volec probe's run and report (0.17): the program run with its
+// arguments, stdin and time limit; then per probe its count and values,
+// the exit status, the start of stdout and stderr.
+
+use crate::base::{
+    STDOUT, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd,
+};
+use crate::tools::probe::{
+    ARGS, AT_AFTER, AT_BLOCK, AT_BODY, INPUT, PROBES, TIMEOUT, _exit, alarm, close, creat, dup2,
+    execvp, fork, next_line, open, probe, starts, waitpid,
+};
+use crate::tools::probe::code::trim;
+use crate::tools::proc::read_file_if;
+use crate::tools::query::refs::file_text;
+
+// Runs prog with ARGS, stdin from INPUT (else this one's), stdout and
+// stderr into the files: its exit status, 128 + a signal, -1 past the time
+// limit.
+pub fn run_program(prog: *u8, out_path: *u8, err_path: *u8) -> i64 {
+    unsafe {
+        let argv = alloc_array::<*u8>(ARGS.count + 2);
+        argv[0] = prog;
+        for i in 0..ARGS.count {
+            argv[i + 1] = ARGS.data[i] as *u8;
+        }
+        argv[ARGS.count + 1] = 0 as *u8;
+        let pid = fork();
+        if pid < 0 {
+            return 127;
+        }
+        if pid == 0 {
+            if INPUT != 0 as *u8 {
+                let fd = open(INPUT, 0);
+                if fd >= 0 {
+                    dup2(fd, 0);
+                    close(fd);
+                }
+            }
+            let o = creat(out_path, 420);
+            if o >= 0 {
+                dup2(o, 1);
+                close(o);
+            }
+            let e = creat(err_path, 420);
+            if e >= 0 {
+                dup2(e, 2);
+                close(e);
+            }
+            alarm(TIMEOUT as u32);
+            execvp(prog, argv);
+            _exit(127);
+        }
+        var status = 0 as i32;
+        waitpid(pid, &status, 0);
+        let s = status as i64;
+        if (s & 127) == 14 {
+            return -1;
+        }
+        if (s & 127) == 0 { (s >> 8) & 255 } else { 128 + (s & 127) }
+    }
+}
+
+// ---- The report ----
+
+fn put_cut(out: i64, s: [u8], max: i64) {
+    if s.len > max {
+        buf_bytes(out, s[0..max]);
+        buf_bytes(out, "...");
+    } else {
+        buf_bytes(out, s);
+    }
+}
+
+pub fn report(status: i64, out_path: *u8, err_path: *u8) -> i64 {
+    unsafe {
+        let err_b = buf_new();
+        read_file_if(err_path, err_b);
+        let err = buf_slice(err_b);
+        let out_b = buf_new();
+        read_file_if(out_path, out_b);
+        let got = buf_slice(out_b);
+        let out = buf_new();
+        // Per probe: its hits (the count at exit, else the lines printed).
+        // (exact from the report at exit, else at least the last power of
+        // two the probe announced, or the lines it printed)
+        let counts = alloc_array::<i64>(PROBES.count);
+        let printed = alloc_array::<i64>(PROBES.count);
+        let lower = alloc_array::<i64>(PROBES.count);
+        for k in 0..PROBES.count {
+            counts[k] = -1;
+            printed[k] = 0;
+            lower[k] = 0;
+        }
+        let rest = buf_new();
+        var rest_lines = 0;
+        var i = 0;
+        while i < err.len {
+            let e = next_line(err, i);
+            let l = err[i..e];
+            i = e + 1;
+            if starts(l, "@@probe-count ") || starts(l, "@@probe-total ") {
+                var j = 14;
+                var k = 0;
+                while j < l.len && l[j] != ' ' {
+                    k = k * 10 + (l[j] - '0') as i64;
+                    j += 1;
+                }
+                var n = 0;
+                j += 1;
+                while j < l.len {
+                    n = n * 10 + (l[j] - '0') as i64;
+                    j += 1;
+                }
+                if k < PROBES.count && starts(l, "@@probe-total ") {
+                    counts[k] = n;
+                } else if k < PROBES.count && n > lower[k] {
+                    lower[k] = n;
+                }
+            } else if starts(l, "@@probe ") {
+                var j = 8;
+                var k = 0;
+                while j < l.len && l[j] >= '0' && l[j] <= '9' {
+                    k = k * 10 + (l[j] - '0') as i64;
+                    j += 1;
+                }
+                if k < PROBES.count {
+                    printed[k] = printed[k] + 1;
+                }
+            } else if rest_lines < 12 {
+                buf_bytes(rest, "  ");
+                put_cut(rest, l, 200);
+                buf_byte(rest, '\n');
+                rest_lines += 1;
+            } else {
+                rest_lines += 1;
+            }
+        }
+        for k in 0..PROBES.count {
+            let p = probe(k);
+            buf_bytes(out, "probe ");
+            buf_bytes(out, file_text(p.file));
+            buf_byte(out, ':');
+            buf_int(out, p.line);
+            buf_bytes(out, if p.how == AT_AFTER { " (after `" }
+                else if p.how == AT_BODY { " (each time round `" }
+                else if p.how == AT_BLOCK { " (in the block of `" }
+                else { " (before `" });
+            put_cut(out, trim(p.what), 50);
+            buf_bytes(out, "`): ");
+            let n = if counts[k] >= 0 { counts[k] }
+                else if lower[k] > printed[k] { lower[k] } else { printed[k] };
+            if n == 0 {
+                buf_bytes(out, if status == 0 || status == 101 { "never ran\n" }
+                    else { "did not run before it stopped\n" });
+                continue;
+            }
+            if counts[k] < 0 {
+                buf_bytes(out, "at least ");
+            }
+            buf_int(out, n);
+            buf_bytes(out, if n == 1 { " time" } else { " times" });
+            if p.exprs.count > 0 && n > printed[k] {
+                buf_bytes(out, ", the first ");
+                buf_int(out, printed[k]);
+                buf_bytes(out, " (--max N)");
+            }
+            buf_byte(out, '\n');
+            // The values.
+            var hit = 0;
+            var i = 0;
+            while i < err.len {
+                let e = next_line(err, i);
+                let l = err[i..e];
+                i = e + 1;
+                if !starts(l, "@@probe ") {
+                    continue;
+                }
+                var j = 8;
+                var kk = 0;
+                while j < l.len && l[j] >= '0' && l[j] <= '9' {
+                    kk = kk * 10 + (l[j] - '0') as i64;
+                    j += 1;
+                }
+                if kk != k {
+                    continue;
+                }
+                hit += 1;
+                let line = buf_new();
+                buf_bytes(line, "  #");
+                buf_int(line, hit);
+                var x = 0;
+                while j < l.len && x < p.exprs.count {
+                    j += 1;
+                    var v = j;
+                    while v < l.len && l[v] != '\t' {
+                        v += 1;
+                    }
+                    buf_bytes(line, "  ");
+                    buf_str(line, p.exprs.data[x] as *u8);
+                    buf_bytes(line, " = ");
+                    buf_bytes(line, l[j..v]);
+                    j = v;
+                    x += 1;
+                }
+                put_cut(out, buf_slice(line), 300);
+                buf_byte(out, '\n');
+            }
+        }
+        buf_bytes(out, "run: ");
+        if status == -1 {
+            buf_bytes(out, "stopped after ");
+            buf_int(out, TIMEOUT);
+            buf_bytes(out, " s (--timeout S)");
+        } else {
+            buf_bytes(out, "exit ");
+            buf_int(out, status);
+        }
+        var lines = 0;
+        for c in 0..got.len {
+            if got[c] == '\n' {
+                lines += 1;
+            }
+        }
+        if got.len > 0 && got[got.len - 1] != '\n' {
+            lines += 1;
+        }
+        buf_bytes(out, "; stdout ");
+        buf_int(out, lines);
+        buf_bytes(out, if lines == 1 { " line (" } else { " lines (" });
+        buf_str(out, out_path);
+        buf_bytes(out, ")\n");
+        var shown = 0;
+        var i = 0;
+        while i < got.len && shown < 5 {
+            let e = next_line(got, i);
+            buf_bytes(out, "  | ");
+            put_cut(out, got[i..e], 200);
+            buf_byte(out, '\n');
+            i = e + 1;
+            shown += 1;
+        }
+        if rest_lines > 0 {
+            buf_bytes(out, "stderr:\n");
+            buf_bytes(out, buf_slice(rest));
+            if rest_lines > 12 {
+                buf_bytes(out, "  (");
+                buf_int(out, rest_lines - 12);
+                buf_bytes(out, " more lines: ");
+                buf_str(out, err_path);
+                buf_bytes(out, ")\n");
+            }
+        }
+        buf_write_fd(out, STDOUT);
+        0
+    }
+}

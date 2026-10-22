@@ -5,10 +5,10 @@ range folded by a closure) and checked against each other.
 
 ## Build and run
 
-From this folder (with `tachyonc` on your `PATH`, or `../../target/tachyonc`):
+From this folder (with `volec` on your `PATH`, or `../../target/volec`):
 
 ```sh
-tachyonc main.tach -o factorial && ./factorial
+volec main.vl -o factorial && ./factorial
 ```
 
 ## Expected output
@@ -60,7 +60,7 @@ println(f"Factorial of {n} == {f}");
 
 ## Language features
 
-- `if` as an expression, recursion: `tachyonc guide syntax`
-- ranges as iterators, `fold`: `tachyonc guide iterators`
-- closures: `tachyonc guide closures`
-- f-strings, `eprintln`: `tachyonc guide formatting`
+- `if` as an expression, recursion: `volec guide syntax`
+- ranges as iterators, `fold`: `volec guide iterators`
+- closures: `volec guide closures`
+- f-strings, `eprintln`: `volec guide formatting`

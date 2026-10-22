@@ -1,0 +1,91 @@
+// --coverage (0.18, T3; docs/design/contracts-verification.md §2.8): an
+// 8-bit counter per basic block of the program's functions, as lowered
+// (a `&&`, `||` or `if` is blocks of its own, so the edges between them
+// are counted), incremented as the program runs: what `volec fuzz`
+// reads to keep the inputs that reach new code. The counters are std's
+// (compiler/std/fuzz.vl: COVERAGE_MAP, 65536 of them; block k counts
+// in COVERAGE_MAP[k % 65536]). std's functions and the runtimes' are not
+// counted. A program built with --coverage prints what it prints without.
+
+use crate::base::intern_c;
+use crate::front::modules::{STD_MODULE, within_std};
+use crate::front::types::{FNS, SYM_STATIC, TY_U64, TY_U8};
+use crate::middle::ctx::FnCtx;
+use crate::middle::ir::{IRFUNCS, IRFUNC_COUNT, Op, ir_append, ir_enter, ir_insert_before, ir_make};
+
+// `--coverage` (front/contracts/flags.vl).
+pub static var COVERAGE: bool = false;
+
+// The counters std has room for.
+const MAP_SIZE: i64 = 65536;
+
+// Whether IR function fi is counted: the program's, not std's nor a
+// runtime's.
+fn counted(fi: i64) -> bool {
+    unsafe {
+        let m = FNS[IRFUNCS[fi].f].module;
+        !within_std(m) && (m != crate::middle::profile::PROFILE_MODULE || m < 0)
+            && (m != crate::middle::unsafecheck::CHECK_MODULE || m < 0)
+            && (m != crate::middle::trace::TRACE_MODULE || m < 0)
+    }
+}
+
+// The first instruction of block b after its phis and parameters (0: none).
+fn body_start(cx: sink *FnCtx, b: i64) -> i64 {
+    unsafe {
+        var v = cx.blocks[b].first;
+        while v != 0 && (cx.insts[v].op == Op::Phi || cx.insts[v].op == Op::Param) {
+            v = cx.insts[v].next;
+        }
+        v
+    }
+}
+
+// Counter k's increment (8 bits, wrapping), at the start of block b.
+fn count_block(cx: sink *FnCtx, b: i64, k: i64, map: i64) {
+    unsafe {
+        let g = ir_make(cx, Op::GAddr, TY_U64, 0, 0, map);
+        let off = ir_make(cx, Op::Const, TY_U64, 0, 0, k % MAP_SIZE);
+        let a = ir_make(cx, Op::Add, TY_U64, g, off, 0);
+        let c = ir_make(cx, Op::Load, TY_U8, a, 0, 0);
+        let one = ir_make(cx, Op::Const, TY_U8, 0, 0, 1);
+        let c1 = ir_make(cx, Op::Add, TY_U8, c, one, 0);
+        let s = ir_make(cx, Op::Store, 0, a, c1, 0);
+        cx.insts[s].imm2 = TY_U8;
+        let list: [i64; 7] = [g, off, a, c, one, c1, s];
+        let at = body_start(cx, b);
+        for i in 0..7 {
+            if at == 0 {
+                ir_append(cx, b, list[i]);
+            } else {
+                ir_insert_before(cx, at, list[i]);
+            }
+        }
+    }
+}
+
+// After lowering, with --coverage: every counted block's increment
+// (nothing when std's map is not in the program: no fuzz target uses it).
+pub fn coverage_after_lowering(cx: sink *FnCtx) {
+    unsafe {
+        if !COVERAGE {
+            return;
+        }
+        let map = intern_c(c"std.COVERAGE_MAP");
+        if SYM_STATIC[map] == 0 {
+            return;
+        }
+        var k = 0;
+        for fi in 0..IRFUNC_COUNT {
+            if !counted(fi) {
+                continue;
+            }
+            ir_enter(cx, fi);
+            let n = IRFUNCS[fi].blocks.count;
+            for i in 0..n {
+                count_block(cx, IRFUNCS[fi].blocks.data[i], k, map);
+                k += 1;
+            }
+        }
+    }
+}

@@ -1,0 +1,147 @@
+// std::hash::sip: SipHash-1-3 (0.20).
+// SipHasher13: SipHash-1-3 (Aumasson and Bernstein), Rust's default
+// hasher, bit for bit (tests/run/std_siphash.vl checks it against Rust's
+// DefaultHasher). Slower than FoldHasher, but a keyed pseudorandom
+// function: with keys an attacker does not know (SipHashState::new), the
+// attacker cannot make keys collide. Bytes and integers are one stream:
+// writing a u64 is writing its 8 bytes, little-endian.
+
+use super::fold::fold_read64;
+
+// ---- SipHash (0.20 implementation) ----
+
+pub struct SipHasher13 {
+    v0: u64,
+    v1: u64,
+    v2: u64,
+    v3: u64,
+    // the bytes after the last full 8, little-endian, and their count
+    tail: u64,
+    ntail: i64,
+    // all the bytes written
+    length: i64,
+}
+
+#[inline]
+fn sip_rotl(x: u64, r: u64) -> u64 {
+    (x << r) | (x >> (64 - r))
+}
+
+impl SipHasher13 {
+    // A hasher keyed by k0 and k1.
+    pub fn new_with_keys(k0: u64, k1: u64) -> SipHasher13 {
+        SipHasher13 {
+            v0: k0 ^ 0x736f6d6570736575,
+            v1: k1 ^ 0x646f72616e646f6d,
+            v2: k0 ^ 0x6c7967656e657261,
+            v3: k1 ^ 0x7465646279746573,
+            tail: 0,
+            ntail: 0,
+            length: 0,
+        }
+    }
+
+    // One SipRound.
+    #[inline]
+    fn round(inout self) {
+        self.v0 += self.v1;
+        self.v1 = sip_rotl(self.v1, 13);
+        self.v1 ^= self.v0;
+        self.v0 = sip_rotl(self.v0, 32);
+        self.v2 += self.v3;
+        self.v3 = sip_rotl(self.v3, 16);
+        self.v3 ^= self.v2;
+        self.v0 += self.v3;
+        self.v3 = sip_rotl(self.v3, 21);
+        self.v3 ^= self.v0;
+        self.v2 += self.v1;
+        self.v1 = sip_rotl(self.v1, 17);
+        self.v1 ^= self.v2;
+        self.v2 = sip_rotl(self.v2, 32);
+    }
+
+    // The message word m, compressed in (one round: SipHash-1-3).
+    #[inline]
+    fn compress(inout self, m: u64) {
+        self.v3 ^= m;
+        self.round();
+        self.v0 ^= m;
+    }
+
+    // The bytes s[i..i + n] (n < 8), little-endian.
+    #[inline]
+    fn bytes_le(s: [u8], i: i64, n: i64) -> u64 {
+        var x = 0u64;
+        for k in 0..n {
+            x |= (s[i + k] as u64) << (8 * k) as u64;
+        }
+        x
+    }
+
+    pub fn write(inout self, bytes: [u8]) {
+        let n = bytes.len;
+        self.length += n;
+        var i = 0;
+        if self.ntail != 0 {
+            let needed = 8 - self.ntail;
+            let take = if n < needed { n } else { needed };
+            self.tail |= SipHasher13::bytes_le(bytes, 0, take) << (8 * self.ntail) as u64;
+            if n < needed {
+                self.ntail += n;
+                return;
+            }
+            self.compress(self.tail);
+            self.ntail = 0;
+            i = needed;
+        }
+        for _ in 0..(n - i) / 8 {
+            // (bytes[i..i + 8] is in the slice)
+            self.compress(unsafe { fold_read64(bytes.ptr, i) });
+            i += 8;
+        }
+        self.tail = SipHasher13::bytes_le(bytes, i, n - i);
+        self.ntail = n - i;
+    }
+
+    // Writes the n low bytes of x, little-endian.
+    #[inline]
+    fn write_le(inout self, x: u64, n: i64) {
+        var b = [0u8; 8];
+        for k in 0..n {
+            b[k] = (x >> (8 * k) as u64) as u8;
+        }
+        self.write(b[0..n]);
+    }
+
+    pub fn write_u8(inout self, x: u8) {
+        self.write_le(x as u64, 1);
+    }
+
+    pub fn write_u16(inout self, x: u16) {
+        self.write_le(x as u64, 2);
+    }
+
+    pub fn write_u32(inout self, x: u32) {
+        self.write_le(x as u64, 4);
+    }
+
+    pub fn write_u64(inout self, x: u64) {
+        self.write_le(x, 8);
+    }
+
+    pub fn write_i64(inout self, x: i64) {
+        self.write_le(x as u64, 8);
+    }
+
+    // The hash of what was written (the hasher is unchanged).
+    pub fn finish(self) -> u64 {
+        var s = self;
+        let b = ((self.length as u64 & 0xff) << 56) | self.tail;
+        s.compress(b);
+        s.v2 ^= 0xff;
+        s.round();
+        s.round();
+        s.round();
+        s.v0 ^ s.v1 ^ s.v2 ^ s.v3
+    }
+}

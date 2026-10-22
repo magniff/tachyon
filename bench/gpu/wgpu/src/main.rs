@@ -1,6 +1,6 @@
 // bench/gpu: CPU cost of encoding DRAWS draws with a bind group change
 // every 10 into one render pass (wgpu on Metal). Prints the median of the
-// iterations in microseconds, as draws.tach and draws.m do.
+// iterations in microseconds, as draws.vl and draws.m do.
 use std::time::Instant;
 
 const DRAWS: usize = 10_000;

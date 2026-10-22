@@ -1,0 +1,128 @@
+// std::collections::group: the control bytes of a Swiss table (0.20).
+// The control bytes of a RawTable (raw_table.vl) are read GROUP at a
+// time and matched all at once: one byte per bucket, EMPTY (0xff),
+// DELETED (0x80) or FULL (0x00-0x7f: the top 7 bits of the hash, its
+// tag). A Group is GROUP control bytes; a BitMask is the result of a
+// match, the top bit of each byte that matched (0x80 lanes, the lowest
+// byte the first bucket). SWAR on a u64 (hashbrown's generic.rs), with
+// match_tag a NEON compare on AArch64 (0.20 D1). GROUP is 8 on every
+// target and in every version, so a table's layout, and its iteration
+// order, is the same everywhere.
+
+use std::{leading_zeros, trailing_zeros};
+use std::arch::has;
+use std::arch::aarch64::{
+    vceq_u8, vdup_n_u64, vdup_n_u8, vget_lane_u64, vreinterpret_u64_u8, vreinterpret_u8_u64,
+};
+
+// ---- Swiss-table groups (0.20 implementation) ----
+
+pub type Group = u64;
+pub type BitMask = u64;
+
+// Control bytes per group.
+pub const GROUP: i64 = 8;
+// A bucket never used since the table was made or cleared: a search ends
+// at a group that has one.
+pub const CTRL_EMPTY: u8 = 0xff;
+// A bucket whose element was erased (a tombstone): a search goes past it.
+pub const CTRL_DELETED: u8 = 0x80;
+
+const GROUP_LSB: u64 = 0x0101010101010101;
+const GROUP_MSB: u64 = 0x8080808080808080;
+
+// The tag of a hash: its top 7 bits, a FULL control byte.
+#[inline]
+pub fn ctrl_tag(hash: u64) -> u8 {
+    (hash >> 57) as u8
+}
+
+// The GROUP control bytes at ctrl[pos..pos + GROUP] (an unaligned load).
+// The caller guarantees that those bytes are readable.
+#[inline]
+pub unsafe fn group_load(ctrl: *u8, pos: i64) -> Group {
+    // (AArch64 and x86_64, every target of vole, load from any address;
+    // the compiler emits one 8-byte load)
+    *(&ctrl[pos] as *u64)
+}
+
+// Stores g at ctrl[pos..pos + GROUP]; the caller guarantees that those
+// bytes are writable.
+#[inline]
+pub unsafe fn group_store(ctrl: *u8, pos: i64, g: Group) {
+    *(&ctrl[pos] as *u64) = g;
+}
+
+// The buckets of g whose control byte is tag (a FULL byte). (0.20 D1) On
+// AArch64 one NEON compare (cmeq on the 8 bytes): exact. Elsewhere
+// match_tag_swar, which may also report false positives; either way the
+// table's layout is the same (a match only decides which keys are
+// compared).
+#[inline]
+pub fn match_tag(g: Group, tag: u8) -> BitMask {
+    if has("neon") {
+        let v = vreinterpret_u8_u64(vdup_n_u64(g));
+        let eq = vceq_u8(v, vdup_n_u8(tag));
+        return vget_lane_u64(vreinterpret_u64_u8(eq), 0) & GROUP_MSB;
+    }
+    match_tag_swar(g, tag)
+}
+
+// match_tag in SWAR on a u64 (hashbrown's generic.rs): may report a false
+// positive, always a FULL byte above a true match, which the caller's key
+// comparison rejects.
+#[inline]
+pub fn match_tag_swar(g: Group, tag: u8) -> BitMask {
+    let cmp = g ^ (tag as u64 * GROUP_LSB);
+    (cmp - GROUP_LSB) & ~cmp & GROUP_MSB
+}
+
+// The EMPTY buckets of g.
+#[inline]
+pub fn match_empty(g: Group) -> BitMask {
+    g & (g << 1) & GROUP_MSB
+}
+
+// The EMPTY and DELETED buckets of g: where an insertion may go.
+#[inline]
+pub fn match_empty_or_deleted(g: Group) -> BitMask {
+    g & GROUP_MSB
+}
+
+// The FULL buckets of g.
+#[inline]
+pub fn match_full(g: Group) -> BitMask {
+    ~g & GROUP_MSB
+}
+
+// g with EMPTY and DELETED bytes made EMPTY and FULL ones DELETED: the
+// first step of rehashing a table in place.
+#[inline]
+pub fn convert_special_to_empty_and_full_to_deleted(g: Group) -> Group {
+    let full = ~g & GROUP_MSB;
+    ~full + (full >> 7)
+}
+
+// The first bucket of m (m != 0), 0 to GROUP - 1.
+#[inline]
+pub fn bitmask_lowest(m: BitMask) -> i64 {
+    trailing_zeros(m) >> 3
+}
+
+// m without its first bucket.
+#[inline]
+pub fn bitmask_remove_lowest(m: BitMask) -> BitMask {
+    m & (m - 1)
+}
+
+// The buckets before the first of m (GROUP when m is 0).
+#[inline]
+pub fn bitmask_trailing(m: BitMask) -> i64 {
+    trailing_zeros(m) >> 3
+}
+
+// The buckets after the last of m (GROUP when m is 0).
+#[inline]
+pub fn bitmask_leading(m: BitMask) -> i64 {
+    leading_zeros(m) >> 3
+}

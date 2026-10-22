@@ -1,0 +1,697 @@
+// std's API, for `volec guide std` (0.13): every public item of the
+// standard library's source as this compiler embeds it
+// (front/stdsrc.vl), with the comment above it. Functions and methods
+// are their signatures, types and traits their declarations, and the
+// trait impls are summed up by trait at the end. It is made from the
+// source's text, written in one style: an item starts a line, and the
+// braces of a body balance on its lines (tests/guide/run.sh compares the
+// result with the compiler's item index).
+
+use crate::base::{BUFS, IntVec, SYMS, buf_byte, buf_bytes, buf_clear, buf_new, buf_slice, intern};
+use crate::front::stdsrc::std_source;
+
+// Whether s starts with p.
+fn starts(s: [u8], p: [u8]) -> bool {
+    s.len >= p.len && s[0..p.len] == p
+}
+
+// Where p first occurs in s, or -1.
+fn find(s: [u8], p: [u8]) -> i64 {
+    var i = 0;
+    while i + p.len <= s.len {
+        if s[i..i + p.len] == p {
+            return i;
+        }
+        i += 1;
+    }
+    -1
+}
+
+// s without its leading blanks.
+fn trim(s: [u8]) -> [u8] {
+    var i = 0;
+    while i < s.len && s[i] == ' ' {
+        i += 1;
+    }
+    s[i..]
+}
+
+// s without its leading and trailing blanks.
+fn trim_both(s: [u8]) -> [u8] {
+    let t = trim(s);
+    var e = t.len;
+    while e > 0 && t[e - 1] == ' ' {
+        e -= 1;
+    }
+    t[0..e]
+}
+
+// s without a leading `pub `.
+fn unpub(s: [u8]) -> [u8] {
+    if starts(s, "pub ") { s[4..] } else { s }
+}
+
+// (0.16) A struct's declaration s (`struct V<T> { a: T, pub n: i64 }`)
+// with its `pub` fields only, into out with a line break: the others are
+// std's (a #[sealed] type's are not visible); none left, its name alone.
+fn put_struct(out: i64, s: [u8]) {
+    var open = -1;
+    var angle = 0;
+    for i in 0..s.len {
+        if s[i] == '<' {
+            angle += 1;
+        } else if s[i] == '>' {
+            angle -= 1;
+        } else if s[i] == '{' && angle == 0 && open < 0 {
+            open = i;
+        }
+    }
+    if open < 0 || s[s.len - 1] != '}' {
+        put_line(out, "", s);
+        return;
+    }
+    let head = trim_both(s[0..open]);
+    let body = s[open + 1..s.len - 1];
+    let kept = buf_new();
+    var depth = 0;
+    var from = 0;
+    for i in 0..body.len + 1 {
+        let c = if i < body.len { body[i] } else { ',' as u8 };
+        if c == '<' || c == '(' || c == '[' {
+            depth += 1;
+        } else if c == '>' || c == ')' || c == ']' {
+            depth -= 1;
+        } else if c == ',' && depth == 0 {
+            let field = trim_both(body[from..i]);
+            if starts(field, "pub ") {
+                if buf_slice(kept).len > 0 {
+                    buf_bytes(kept, ", ");
+                }
+                buf_bytes(kept, field);
+            }
+            from = i + 1;
+        }
+    }
+    buf_bytes(out, head);
+    if buf_slice(kept).len > 0 {
+        buf_bytes(out, " { ");
+        buf_bytes(out, buf_slice(kept));
+        buf_bytes(out, " }");
+    }
+    buf_bytes(out, "\n");
+}
+
+// What line s changes the depth of braces by; braces in strings,
+// characters and comments do not count.
+fn brace_delta(s: [u8]) -> i64 {
+    var d = 0;
+    var i = 0;
+    while i < s.len {
+        let ch = s[i];
+        if ch == '/' && i + 1 < s.len && s[i + 1] == '/' {
+            return d;
+        }
+        if ch == '"' || ch == '\'' {
+            i += 1;
+            while i < s.len && s[i] != ch {
+                if s[i] == '\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+        } else if ch == '{' {
+            d += 1;
+        } else if ch == '}' {
+            d -= 1;
+        }
+        i += 1;
+    }
+    d
+}
+
+// A function's signature: its line up to the body, without `pub`.
+fn signature(t: [u8]) -> [u8] {
+    let u = unpub(t);
+    let k = find(u, " {");
+    if k >= 0 { u[0..k] } else { u }
+}
+
+fn is_fn(t: [u8]) -> bool {
+    starts(t, "pub fn ") || starts(t, "pub unsafe fn ")
+}
+
+fn is_decl(t: [u8]) -> bool {
+    starts(t, "pub struct ") || starts(t, "pub enum ") || starts(t, "pub union ")
+        || starts(t, "pub trait ") || starts(t, "pub const ") || starts(t, "pub static ")
+        || starts(t, "pub type ")
+}
+
+// Writes line s to out, after `indent` and with a line break.
+fn put_line(out: i64, indent: [u8], s: [u8]) {
+    buf_bytes(out, indent);
+    buf_bytes(out, s);
+    buf_bytes(out, "\n");
+}
+
+// Writes the comment lines of buffer doc (each ends with a line break),
+// indented, and empties doc.
+fn put_doc(out: i64, doc: i64, indent: [u8]) {
+    let text = buf_slice(doc);
+    var start = 0;
+    while start < text.len {
+        var end = start;
+        while end < text.len && text[end] != '\n' {
+            end += 1;
+        }
+        put_line(out, indent, text[start..end]);
+        start = end + 1;
+    }
+    buf_clear(doc);
+}
+
+// `impl<T: Hash> Hash for Pair<T>` (a trait impl's header, without its
+// brace): the trait and the type.
+fn trait_impl_parts(head: [u8]) -> ([u8], [u8]) {
+    var rest = head[4..];
+    if starts(rest, "<") {
+        let close = find(rest, ">");
+        rest = rest[close + 1..];
+    }
+    rest = trim(rest);
+    let k = find(rest, " for ");
+    (rest[0..k], rest[k + 5..])
+}
+
+// What std_api writes: every item with its comment (`guide std#api`);
+// (0.15) the signatures of what the core guide teaches, without comments
+// (`guide --full`); (0.17) the index, `guide std`: every item a program
+// uses, its signature on one line, `self: *Self` for the receiver's type.
+pub const API_DOC: i64 = 0;
+pub const API_CORE: i64 = 1;
+pub const API_INDEX: i64 = 2;
+
+// (0.17) Whether a section banner of std's source (`// ---- Gpa's
+// implementation (0.16) ----`) is about std's own workings: not in the
+// index.
+fn internal_section(t: [u8]) -> bool {
+    find(t, "implementation") >= 0 || find(t, "leak checks") >= 0 || find(t, "hooks") >= 0
+        || find(t, "holes") >= 0 || find(t, "ambient") >= 0
+}
+
+// (0.17) Whether the index leaves out a section of std's source: the
+// allocators (`guide allocators`), the bit operations and (0.18.1) the
+// heaps (their section of `guide std`), (0.20) number conversion, and
+// the other sections new in 0.20 (until 0.20 lists them), which
+// INDEX_ALSO names, and (0.23) std::window's.
+fn unindexed_section(t: [u8]) -> bool {
+    internal_section(t) || find(t, "Allocation (0.16)") >= 0 || t == "// ---- Gpa ----"
+        || find(t, "Arenas (0.16)") >= 0 || find(t, "FixedBuf (0.16)") >= 0
+        || find(t, "Bits (0.16)") >= 0 || find(t, "Heaps (0.18.1)") >= 0
+        || find(t, "Numbers: ") >= 0
+        // (0.20) the other sections new in 0.20, until 0.20 lists them (B7)
+        || find(t, "(0.20)") >= 0
+        // (0.23) std::window: its own guide topic, not the index
+        || find(t, "(0.23)") >= 0
+        // (0.21) atomics, threads and locks: guide threads
+        || find(t, "(0.21)") >= 0
+        // (0.24) std::cli: guide cli
+        || find(t, "(0.24)") >= 0
+}
+
+// (0.17) Whether the index leaves out item `name` (of the impl of
+// `owner`, "" outside one): what programs seldom call by name, which
+// INDEX_ALSO names.
+fn unindexed(owner: [u8], name: [u8]) -> bool {
+    if owner == "Fmt" {
+        return name == "to_fd" || name == "spec" || name == "end_spec" || name == "int"
+            || name == "uint" || name == "float" || name == "flush" || name == "byte";
+    }
+    if owner.len > 0 {
+        return false;
+    }
+    name == "Add" || name == "Sub" || name == "Mul" || name == "Div" || name == "Neg"
+        || name == "Map" || name == "Filter" || name == "Enumerate" || name == "Zip"
+        || name == "Take" || name == "RevRange" || name == "HashMapIter" || name == "Keys"
+        || name == "Values" || name == "Interp" || name == "FmtSpec" || name == "debug_list"
+        || name == "hash_u64" || name == "hash_mix" || name == "main_error" || name == "print_cstr"
+}
+
+// (0.17) The index's last line: what it leaves out, and where it is.
+const INDEX_ALSO: [u8] =
+    "// Also, in guide std#every-item: the operator traits Add Sub Mul Div Neg; the iterator adapters' types (Map, Filter, Keys, ...); Fmt's low-level writers; count_ones, leading_zeros, trailing_zeros; Allocator, Arena, ScopedArena, FixedBuf, arena_scope (guide allocators); BinaryHeap, MinHeap (guide std#heaps-priority-queues); std::num's parse_f64, write_f64, parse_i64_radix (guide formatting#numbers); std::sync and std::thread (guide threads); std::cli (guide cli).";
+
+// (0.17) The name an item line of std's listing declares (`fn split_in<A:
+// ...`, `unsafe fn panic(`, `struct Scanner`, `enum IoError {`, `trait
+// Ord {`), and whether it is a type or trait; "" when it declares none.
+pub fn item_name(t: [u8]) -> ([u8], bool) {
+    var r = unpub(t);
+    if starts(r, "unsafe ") {
+        r = r[7..];
+    }
+    var ty = false;
+    if starts(r, "fn ") {
+        r = r[3..];
+    } else if starts(r, "struct ") {
+        r = r[7..];
+        ty = true;
+    } else if starts(r, "enum ") || starts(r, "trait ") {
+        r = r[(if starts(r, "enum ") { 5 } else { 6 })..];
+        ty = true;
+    } else {
+        return ("", false);
+    }
+    var e = 0;
+    while e < r.len && name_byte(r[e]) {
+        e += 1;
+    }
+    (r[0..e], ty)
+}
+
+fn name_byte(c: u8) -> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// (0.17) The type an impl header is for, by name: `Vec` for `impl<T, A:
+// Allocator> Vec<T, A> {`, `Scanner` for `impl Scanner {`.
+pub fn impl_name(h: [u8]) -> [u8] {
+    var r = h[4..];
+    if starts(r, "<") {
+        var depth = 0;
+        var i = 0;
+        while i < r.len {
+            if r[i] == '<' {
+                depth += 1;
+            } else if r[i] == '>' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            i += 1;
+        }
+        r = r[i + 1..];
+    }
+    r = trim(r);
+    var e = 0;
+    while e < r.len && name_byte(r[e]) {
+        e += 1;
+    }
+    r[0..e]
+}
+
+// (0.17) Writes signature s after `indent`, with a line break; in the
+// index (`short`), the receiver's type as `Self`: `fn push(self: *Self,
+// x: T)` for `fn push(self: *Vec<T, A>, x: T)`.
+fn put_sig(out: i64, indent: [u8], s: [u8], short: bool) {
+    let k = find(s, "(self: ");
+    if !short || k < 0 {
+        put_line(out, indent, s);
+        return;
+    }
+    var i = k + 7;
+    let ptr = s[i] == '*';
+    // (0.17: `&Self`, `&mut Self`)
+    let rest = s[i..];
+    let shared = starts(rest, "&") && !starts(rest, "&mut ");
+    let exclusive = starts(rest, "&mut ");
+    var depth = 0;
+    while i < s.len {
+        let c = s[i];
+        if c == '<' || c == '(' || c == '[' {
+            depth += 1;
+        } else if c == '>' || c == ']' {
+            depth -= 1;
+        } else if c == ')' {
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+        } else if c == ',' && depth == 0 {
+            break;
+        }
+        i += 1;
+    }
+    buf_bytes(out, indent);
+    buf_bytes(out, s[0..k + 1]);
+    buf_bytes(out, if ptr { "self: *Self" } else if exclusive { "self: &mut Self" }
+        else if shared { "self: &Self" } else { "self: Self" });
+    buf_bytes(out, s[i..]);
+    buf_bytes(out, "\n");
+}
+
+// Writes std's API to buffer out, in `mode` (API_DOC, API_CORE,
+// API_INDEX).
+pub fn std_api(out: i64, mode: i64) {
+    // (0.15) The core guide's form: the signatures only, without their
+    // comments; (0.17) the index too.
+    let core = mode != API_DOC;
+    let index = mode == API_INDEX;
+    let src = buf_new();
+    std_source(src);
+    let text = buf_slice(src);
+    let doc = buf_new();
+    let decl = buf_new();
+    let sig = buf_new();
+    // (symbols: the compiler's source keeps off std's containers, 0.16)
+    var impl_traits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var impl_types = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var depth = 0;
+    // In an impl of a type's own methods: its header, printed before its
+    // first public method.
+    var in_impl = false;
+    var impl_head: [u8] = "";
+    var head_done = false;
+    // (0.16) The type of the impl block just closed, and where its `}`
+    // starts: in the core guide, a block of the same type right after it
+    // (`impl<T, A: Allocator + GlobalAllocator> Vec<T, A>`, then `impl<T,
+    // A: Allocator> Vec<T, A>`) continues it.
+    var closed_type: [u8] = "";
+    var closed_at = -1;
+    // (0.14) In a trait of several lines: its items' signatures are
+    // printed, not their default bodies.
+    var in_trait = false;
+    // (0.17) A trait the index leaves out: its lines are skipped.
+    var hide_trait = false;
+    // A declaration whose braces close on a later line, joined into one.
+    var joining = false;
+    // (0.16) In the core guide, the sections 0.16 adds (their banners say
+    // `(0.16`) are left out, as 0.15's were until its guide was made: the
+    // allocators, arenas, Gpa (`volec guide std` lists them).
+    var skipping = false;
+    var hide_fn = false;
+    // (0.16) After `#[sealed]`: the struct's fields are std's own, so it
+    // is shown as `struct Vec<T, A: Allocator = Gpa> { .. }`; its body's
+    // lines are skipped.
+    var sealed = false;
+    var sealed_body = false;
+    // (0.20) The line after a module's banner in the built-in text: its
+    // `mod NAME {` or `}` (embed.sh), not std's API.
+    var wrapper = false;
+    var in_use = false;
+    // (0.22) std::gpu and std::objc have guide topics of their own: their
+    // modules are not in std's listing (every-item, the index)
+    var own_topic = 0;
+    var start = 0;
+    if index {
+        put_line(out, "",
+            "// Signatures only; with their comments: volec guide std#every-item.");
+    } else if core {
+        put_line(out, "", "// Signatures only; with their comments: volec guide std.");
+    }
+    while start < text.len {
+        var end = start;
+        while end < text.len && text[end] != '\n' {
+            end += 1;
+        }
+        var line = text[start..end];
+        start = end + 1;
+        // (0.18) A signature fmt wrapped inside its generics or parameters
+        // (`fn gen_result<T, E, F: Fn(&mut Gen) -> T,`), joined into one.
+        if (is_fn(trim(line)) || starts(trim(line), "fn ")) && line.len > 0
+            && (line[line.len - 1] == ',' || line[line.len - 1] == '('
+                || line[line.len - 1] == '<') {
+            let joined = buf_new();
+            buf_bytes(joined, line);
+            while start < text.len {
+                var e = start;
+                while e < text.len && text[e] != '\n' {
+                    e += 1;
+                }
+                let next = trim(text[start..e]);
+                let so_far = buf_slice(joined);
+                let last = so_far[so_far.len - 1];
+                if last != '(' && last != '<' {
+                    buf_byte(joined, ' ');
+                }
+                buf_bytes(joined, next);
+                start = e + 1;
+                if next.len == 0 || next[next.len - 1] != ',' && next[next.len - 1] != '('
+                    && next[next.len - 1] != '<' {
+                    break;
+                }
+            }
+            line = buf_slice(joined);
+        }
+        let t = trim(line);
+        // (0.20) std's modules: their items are listed as the root's are
+        if starts(t, "// ---- mod std::gpu") || starts(t, "// ---- mod std::objc") {
+            own_topic += 1;
+        }
+        if own_topic > 0 {
+            if starts(t, "// ---- end mod std::gpu") || starts(t, "// ---- end mod std::objc") {
+                own_topic -= 1;
+                // (the module's closing brace, on the next line)
+                wrapper = own_topic == 0;
+            }
+            continue;
+        }
+        if starts(t, "// ---- mod std::") || starts(t, "// ---- end mod std::") {
+            // (a module's items before its first banner are a section of
+            // their own: listed)
+            wrapper = true;
+            skipping = false;
+            continue;
+        }
+        if wrapper {
+            wrapper = false;
+            continue;
+        }
+        if in_use || starts(t, "pub mod ") || starts(t, "pub use ") || starts(t, "use ") {
+            in_use = (in_use || starts(t, "pub use ") || starts(t, "use ")) && find(t, ";") < 0;
+            continue;
+        }
+        let before = depth;
+        depth += brace_delta(line);
+        if core && before == 0 && starts(t, "// ----") {
+            skipping = if index { unindexed_section(t) } else { find(t, "(0.16") >= 0 };
+        }
+        if skipping {
+            continue;
+        }
+        // (0.16: std's ambient functions, errors outside std, are not
+        // in the core guide, and marked in `guide std`: front/ambient.vl)
+        if starts(t, "#[ambient(") {
+            if core {
+                hide_fn = true;
+            } else {
+                let what = t[11..t.len - 3];
+                buf_bytes(doc, "// (0.16) An error: allocation is explicit; write ");
+                buf_bytes(doc, what);
+                buf_bytes(doc, ".\n");
+            }
+            continue;
+        }
+        // (0.17: a `#[views(..)]` or `#[stores(..)]` pin keeps the comment
+        // above it for the item below)
+        if starts(t, "#[views(") || starts(t, "#[stores(") {
+            continue;
+        }
+        if hide_fn && (is_fn(t) || starts(t, "fn ")) {
+            hide_fn = false;
+            buf_clear(doc);
+            continue;
+        }
+        if sealed_body {
+            sealed_body = depth > 0;
+            continue;
+        }
+        if before == 0 && t == "#[sealed]" {
+            sealed = true;
+            continue;
+        }
+        if joining {
+            buf_bytes(decl, " ");
+            buf_bytes(decl, t);
+            if depth == 0 {
+                // (`a: i64, }`: the last field's comma goes)
+                let joined = buf_slice(decl);
+                let n = joined.len;
+                if core && starts(joined, "struct ") {
+                    put_struct(out, joined);
+                } else if n >= 3 && joined[n - 3..] == ", }" {
+                    buf_bytes(out, joined[0..n - 3]);
+                    put_line(out, "", " }");
+                } else {
+                    put_line(out, "", joined);
+                }
+                joining = false;
+            }
+            continue;
+        }
+        if before == 0 {
+            if starts(t, "//") {
+                if !core {
+                    put_line(doc, "", t);
+                }
+                continue;
+            }
+            // (0.16: the core guide leaves out std's aliases of the builtin
+            // limits, `I32_MAX` for `i32::MAX`)
+            if core && starts(t, "pub const ")
+                && (find(t, "::MIN;") >= 0 || find(t, "::MAX;") >= 0) {
+                buf_clear(doc);
+                continue;
+            }
+            if index && (find(t, "fn __") >= 0 || unindexed("", item_name(t).0)) {
+                // (0.17: what std's own f-strings call, and what the
+                // index leaves out; a trait of several lines: its items too)
+                if starts(t, "pub trait ") && depth > 0 {
+                    in_trait = true;
+                    hide_trait = true;
+                }
+            } else if is_fn(t) {
+                put_doc(out, doc, "");
+                put_sig(out, "", signature(t), index);
+            } else if starts(t, "pub trait ") && depth > 0 {
+                put_doc(out, doc, "");
+                buf_bytes(out, signature(t));
+                put_line(out, "", " {");
+                in_trait = true;
+            } else if sealed && starts(t, "pub struct ") && find(t, "{") > 0 {
+                put_doc(out, doc, "");
+                buf_bytes(out, trim(unpub(t)[0..find(unpub(t), "{")]));
+                put_line(out, "", " { .. }");
+                sealed_body = depth > 0;
+                sealed = false;
+            } else if is_decl(t) {
+                put_doc(out, doc, "");
+                if depth == 0 && core && starts(unpub(t), "struct ") {
+                    put_struct(out, unpub(t));
+                } else if depth == 0 {
+                    put_line(out, "", unpub(t));
+                } else {
+                    buf_clear(decl);
+                    buf_bytes(decl, unpub(t));
+                    joining = true;
+                }
+            } else if starts(t, "impl") && depth > 0 {
+                let head = signature(t);
+                if find(head, " for ") >= 0 {
+                    let parts = trait_impl_parts(head);
+                    impl_traits.push(intern(parts.0));
+                    impl_types.push(intern(parts.1));
+                } else {
+                    in_impl = true;
+                    impl_head = head;
+                    head_done = false;
+                }
+            }
+            if !starts(t, "#[") {
+                sealed = false;
+            }
+            buf_clear(doc);
+            continue;
+        }
+        if in_trait && hide_trait {
+            if depth == 0 {
+                in_trait = false;
+                hide_trait = false;
+            }
+            continue;
+        }
+        if in_trait && before == 1 {
+            if starts(t, "//") {
+                if !core {
+                    put_line(doc, "", t);
+                }
+                continue;
+            }
+            if starts(t, "fn ") || starts(t, "type ") {
+                put_doc(out, doc, "    ");
+                put_sig(out, "    ", signature(t), index);
+            }
+            if !starts(t, "#[") {
+                buf_clear(doc);
+            }
+        }
+        if in_trait && depth == 0 {
+            put_line(out, "", "}");
+            in_trait = false;
+        }
+        if in_impl && before == 1 {
+            if starts(t, "//") {
+                if !core {
+                    put_line(doc, "", t);
+                }
+                continue;
+            }
+            if is_fn(t) && index && unindexed(impl_name(impl_head), item_name(t).0) {
+                buf_clear(doc);
+            } else if is_fn(t) {
+                if !head_done && core && closed_at >= 0
+                    && buf_slice(out).len == closed_at + 2 && impl_type(impl_head) == closed_type {
+                    unsafe {
+                        BUFS[out].len = closed_at;
+                    }
+                    head_done = true;
+                }
+                if !head_done {
+                    buf_bytes(out, impl_head);
+                    put_line(out, "", " {");
+                    head_done = true;
+                }
+                put_doc(out, doc, "    ");
+                put_sig(out, "    ", signature(t), index);
+            }
+            buf_clear(doc);
+        }
+        if in_impl && depth == 0 {
+            if head_done {
+                closed_at = buf_slice(out).len;
+                closed_type = impl_type(impl_head);
+                put_line(out, "", "}");
+            }
+            in_impl = false;
+        }
+    }
+    // The trait impls, by trait, in the order of their first impl.
+    let traits = unsafe { impl_traits.data[0..impl_traits.count] };
+    let types = unsafe { impl_types.data[0..impl_types.count] };
+    if traits.len > 0 {
+        put_line(out, "", "// Trait impls (their methods are the traits'):");
+    }
+    for i in 0..traits.len {
+        var first = true;
+        for j in 0..i {
+            if traits[j] == traits[i] {
+                first = false;
+            }
+        }
+        if !first
+            || (index && (sym_text(traits[i]) == "Iterator" || sym_text(traits[i]) == "Allocator")) {
+            continue;
+        }
+        buf_bytes(out, "impl ");
+        buf_bytes(out, sym_text(traits[i]));
+        buf_bytes(out, " for ");
+        var sep = "";
+        for j in i..traits.len {
+            if traits[j] == traits[i] {
+                buf_bytes(out, sep);
+                buf_bytes(out, sym_text(types[j]));
+                sep = ", ";
+            }
+        }
+        buf_bytes(out, "\n");
+    }
+    if index {
+        put_line(out, "", INDEX_ALSO);
+    }
+}
+
+// The type of impl header h (`impl<T, A: Allocator> Vec<T, A>`: `Vec<T,
+// A>`): what follows its last `> `.
+fn impl_type(h: [u8]) -> [u8] {
+    var i = h.len - 2;
+    while i >= 0 {
+        if h[i] == '>' && h[i + 1] == ' ' {
+            return h[i + 2..];
+        }
+        i -= 1;
+    }
+    h
+}
+
+fn sym_text(s: i64) -> [u8] {
+    unsafe { SYMS[s].text }
+}

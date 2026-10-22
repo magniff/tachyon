@@ -1,22 +1,22 @@
 #!/bin/sh
-# The tests of `tachyonc query` (0.11). POSIX sh and awk only.
+# The tests of `volec query` (0.11). POSIX sh and awk only.
 #
 # usage: tests/query/run.sh [-c COMPILER] [-u]
 #
-#   -c COMPILER   the tachyonc binary (default: target/tachyonc)
+#   -c COMPILER   the volec binary (default: target/volec)
 #   -u            rewrite the .q files with the output they get now
 #
 # Each tests/query/NAME.q is a transcript: a line `$ ARGS` runs
-# `tachyonc query ARGS` in tests/query (ARGS are split as the shell
-# splits them: quote a name with spaces), with TACHYON_ROOT set to
-# NAME/main.tach when that directory exists (unset otherwise); the lines
+# `volec query ARGS` in tests/query (ARGS are split as the shell
+# splits them: quote a name with spaces), with VOLE_ROOT set to
+# NAME/main.vl when that directory exists (unset otherwise); the lines
 # after it, up to the next `$` line, are its output: stdout, then stderr
-# (the compiler's path in `try:` lines written `tachyonc`), then `[exit N]`
+# (the compiler's path in `try:` lines written `volec`), then `[exit N]`
 # when N is not 0. Lines starting with `##` are comments (`#` starts
 # the file headers of refs).
 # A test passes when the transcript it makes is the file, comments aside.
 #
-# Then the compiler's own source, compiler/src/main.tach, is asked a few
+# Then the compiler's own source, compiler/src/main.vl, is asked a few
 # questions whose answers must be plausible (it changes too often for a
 # transcript): a definition is found and shown, references are counted.
 #
@@ -29,7 +29,7 @@ export LC_ALL
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 UPDATE=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -44,12 +44,12 @@ case "$COMPILER" in
 esac
 [ -x "$COMPILER" ] || { echo "query/run.sh: no compiler at $COMPILER" >&2; exit 2; }
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-query.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-query.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 STATUS=0
 
-# One run of `tachyonc query ARGS` (in $1, the line's ARGS), its output as
+# One run of `volec query ARGS` (in $1, the line's ARGS), its output as
 # the transcript has it, into $WORK/run.
 run_line() {
     (
@@ -57,8 +57,8 @@ run_line() {
         eval "set -- $1"
         "$COMPILER" query "$@" >"$WORK/out" 2>"$WORK/err"
         rc=$?
-        # (`try:` lines name the compiler as it was run: `tachyonc` here)
-        cat "$WORK/out" "$WORK/err" | sed "s|$COMPILER|tachyonc|g"
+        # (`try:` lines name the compiler as it was run: `volec` here)
+        cat "$WORK/out" "$WORK/err" | sed "s|$COMPILER|volec|g"
         [ $rc -eq 0 ] || echo "[exit $rc]"
     ) >"$WORK/run"
 }
@@ -67,29 +67,29 @@ run_line() {
 # mode $2 (0.13): `off`, without the tools' cache; `cache`, each line run
 # twice with a cache of its own ($WORK/cache): the first run may make it,
 # the second must answer the same, and from the cache when the first made
-# it (TACHYON_CACHE_TRACE says which).
+# it (VOLE_CACHE_TRACE says which).
 transcript() {
     name=$(basename "$1" .q)
     if [ -d "$HERE/$name" ]; then
-        TACHYON_ROOT="$name/main.tach"
-        export TACHYON_ROOT
+        VOLE_ROOT="$name/main.vl"
+        export VOLE_ROOT
     else
-        unset TACHYON_ROOT
+        unset VOLE_ROOT
     fi
     grep '^\$ ' "$1" | while IFS= read -r line; do
         printf '%s\n' "$line"
         args=${line#\$ }
         if [ "$2" = off ]; then
-            TACHYON_CACHE=off run_line "$args"
+            VOLE_CACHE=off run_line "$args"
             cat "$WORK/run"
             continue
         fi
         : >"$WORK/trace"
-        TACHYON_CACHE="$WORK/cache" TACHYON_CACHE_TRACE="$WORK/trace" run_line "$args"
+        VOLE_CACHE="$WORK/cache" VOLE_CACHE_TRACE="$WORK/trace" run_line "$args"
         mv "$WORK/run" "$WORK/run1"
         saved=$(grep -c '^save$' "$WORK/trace")
         : >"$WORK/trace"
-        TACHYON_CACHE="$WORK/cache" TACHYON_CACHE_TRACE="$WORK/trace" run_line "$args"
+        VOLE_CACHE="$WORK/cache" VOLE_CACHE_TRACE="$WORK/trace" run_line "$args"
         cat "$WORK/run"
         cmp -s "$WORK/run1" "$WORK/run" || echo "[cache: the second run answered otherwise]"
         if [ "$saved" != 0 ]; then
@@ -149,31 +149,31 @@ check() { # <name> <condition> <output>
     fi
 }
 cd "$ROOT" || exit 2
-unset TACHYON_ROOT
+unset VOLE_ROOT
 TAB=$(printf '\t')
-out=$("$COMPILER" query show gvn::run_gvn compiler/src/main.tach 2>&1)
+out=$("$COMPILER" query show gvn::run_gvn compiler/src/main.vl 2>&1)
 ok=0
-printf '%s\n' "$out" | head -1 | grep -q "^// crate::middle::gvn::run_gvn${TAB}compiler/src/middle/gvn.tach:[0-9]*-[0-9]*${TAB}effects: [a-z(), ]*\$" \
+printf '%s\n' "$out" | head -1 | grep -q "^// crate::middle::gvn::run_gvn${TAB}compiler/src/middle/gvn.vl:[0-9]*-[0-9]*${TAB}effects: [a-z(), ]*\$" \
     && printf '%s\n' "$out" | grep -q '^pub fn run_gvn(' && ok=1
 check self_show "$ok" "$out"
-out=$("$COMPILER" query refs --count crate::middle::gvn::run_gvn compiler/src/main.tach 2>&1)
+out=$("$COMPILER" query refs --count crate::middle::gvn::run_gvn compiler/src/main.vl 2>&1)
 ok=0
 [ "$out" -ge 3 ] 2>/dev/null && ok=1
 check self_refs_count "$ok" "$out"
-# (the root found by default: ./compiler/src/main.tach)
+# (the root found by default: ./compiler/src/main.vl)
 # More refs than the budget (60): a summary per file, and how to narrow.
 out=$("$COMPILER" query refs IntVec::push 2>"$WORK/err")
 err=$(cat "$WORK/err")
 ok=0
-n=$(printf '%s\n' "$out" | grep -c "^compiler/src/[a-z_0-9/]*\.tach${TAB}[0-9]*\$")
+n=$(printf '%s\n' "$out" | grep -c "^compiler/src/[a-z_0-9/]*\.vl${TAB}[0-9]*\$")
 [ "$n" -ge 10 ] && [ "$n" = "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" ] \
     && printf '%s\n' "$err" | head -1 | grep -q '^note query.truncated: [0-9]* refs in [0-9]* files$' \
     && [ "$(printf '%s\n' "$err" | grep -c '^try: .* query refs IntVec::push --')" = 3 ] && ok=1
 check self_refs_budget "$ok" "$(printf '%s\n' "$out" "$err" | tail -6)"
-out=$("$COMPILER" query refs IntVec::push --in compiler/src/base/mod.tach 2>&1)
+out=$("$COMPILER" query refs IntVec::push --in compiler/src/base/mod.vl 2>&1)
 ok=0
 n=$(printf '%s\n' "$out" | grep -c "^[0-9]*:[0-9]*${TAB}call${TAB}base::[A-Za-z_:]*${TAB}")
-[ "$n" -ge 1 ] && printf '%s\n' "$out" | head -1 | grep -q '^# compiler/src/base/mod.tach$' \
+[ "$n" -ge 1 ] && printf '%s\n' "$out" | head -1 | grep -q '^# compiler/src/base/mod.vl$' \
     && printf '%s\n' "$out" | grep -q "^[0-9]*:[0-9]*${TAB}def${TAB}fn push(" && ok=1
 check self_refs_in_file "$ok" "$(printf '%s\n' "$out" | head -5)"
 out=$("$COMPILER" query refs IntVec::push --in gvn --limit 5 2>&1)
@@ -191,11 +191,11 @@ printf '%s\n' "$out" | grep -q "^[0-9]*:[0-9]*${TAB}call${TAB}gen0::gen::compile
 check self_callers "$ok" "$out"
 out=$("$COMPILER" query def NodeKind::Fn 2>&1)
 ok=0
-[ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 1 ] && printf '%s\n' "$out" | grep -q "^crate::front::ast::NodeKind::Fn${TAB}compiler/src/front/ast.tach:[0-9]*:[0-9]*${TAB}variant${TAB}Fn\$" && ok=1
+[ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 1 ] && printf '%s\n' "$out" | grep -q "^crate::front::ast::NodeKind::Fn${TAB}compiler/src/front/ast.vl:[0-9]*:[0-9]*${TAB}variant${TAB}Fn\$" && ok=1
 check self_def_variant "$ok" "$out"
 out=$("$COMPILER" query items gvn 2>&1)
 ok=0
-printf '%s\n' "$out" | head -1 | grep -q "^# crate::middle::gvn${TAB}compiler/src/middle/gvn.tach\$" \
+printf '%s\n' "$out" | head -1 | grep -q "^# crate::middle::gvn${TAB}compiler/src/middle/gvn.vl\$" \
     && printf '%s\n' "$out" | grep -q "^[0-9]*${TAB}fn${TAB}pub fn run_gvn(cx: sink \*FnCtx, fi: i64) -> bool\$" && ok=1
 check self_items "$ok" "$(printf '%s\n' "$out" | head -5)"
 # More than 5 definitions for show: their paths, and an error.
@@ -218,7 +218,7 @@ printf '%s\n' "$out" | grep -q "^[0-9]*-[0-9]*${TAB}section${TAB}The value table
 check self_banners "$ok" "$(printf '%s\n' "$out" | head -5)"
 out=$("$COMPILER" query show gvn::section 'value table' 2>&1)
 ok=0
-printf '%s\n' "$out" | head -1 | grep -q "^// crate::middle::gvn::section The value table${TAB}compiler/src/middle/gvn.tach:[0-9]*-[0-9]*\$" \
+printf '%s\n' "$out" | head -1 | grep -q "^// crate::middle::gvn::section The value table${TAB}compiler/src/middle/gvn.vl:[0-9]*-[0-9]*\$" \
     && [ "$(printf '%s\n' "$out" | sed -n 2p)" = "// ---- The value table ----" ] && ok=1
 check self_section "$ok" "$(printf '%s\n' "$out" | head -3)"
 out=$("$COMPILER" query grep 'fn run_gvn(' 2>&1)
@@ -229,10 +229,10 @@ n=$("$COMPILER" query grep 'query.no-match' --strings --in compiler/src/tools/ -
 ok=0
 [ "$n" -ge 3 ] 2>/dev/null && ok=1
 check self_grep_strings "$ok" "$n"
-# (./main.tach, found by default)
+# (./main.vl, found by default)
 out=$(cd "$HERE/clash" && "$COMPILER" query def a::helper 2>&1)
 ok=0
-[ "$out" = "crate::a::helper${TAB}a.tach:2:8${TAB}fn${TAB}pub fn helper() -> i64${TAB}effects: none" ] && ok=1
+[ "$out" = "crate::a::helper${TAB}a.vl:2:8${TAB}fn${TAB}pub fn helper() -> i64${TAB}effects: none" ] && ok=1
 check default_root "$ok" "$out"
 # std where there is no program (0.15): its API by `items std` (no
 # private item), an item by a name std defines. (0.20: all of it, past the
@@ -257,7 +257,7 @@ check std_show_no_program "$ok" "$(printf '%s\n' "$out" | head -5)"
 out=$("$COMPILER" query def std::trim 2>&1)
 loc=$(printf '%s\n' "$out" | awk -F "$TAB" '$1 == "std::trim" { print $2 }')
 ok=0
-case "$loc" in compiler/std/*.tach:*) ok=1 ;; esac
+case "$loc" in compiler/std/*.vl:*) ok=1 ;; esac
 check std_def_in_repo "$ok" "$out"
 out=$("$COMPILER" query show "${loc%:*}" 2>&1)
 ok=0
@@ -267,7 +267,7 @@ out=$("$COMPILER" check --std-tree compiler/std 2>&1)
 rc=$?
 ok=0
 # (0.18.1: a clean check says so in one line)
-[ $rc -eq 0 ] && [ "$out" = "ok: 0 errors in compiler/src/main.tach" ] && ok=1
+[ $rc -eq 0 ] && [ "$out" = "ok: 0 errors in compiler/src/main.vl" ] && ok=1
 check std_tree_checks "$ok" "$out"
 bad=""
 for kind in $("$COMPILER" query examples | cut -f1); do
@@ -287,7 +287,7 @@ check self_similar "$ok" "$(printf '%s\n' "$out" | grep '^// ' | head -8)"
 # (FILE:L:C, FILE:A-B, FILE:L:C: of a short diagnostic), enclosing items
 # and modules that def, show, refs, callers, items, type and check print,
 # and the symbols of the generated code (closures, instances; not the
-# runtime's, nor std's statics: 0.20.0 names `tachyon.static.std.X` for a
+# runtime's, nor std's statics: 0.20.0 names `vole.static.std.X` for a
 # static of a std submodule, which `query def` does not take back yet, a
 # 0.20.1 item; aarch64-linux's argv statics showed it), each
 # given to `query def` (positions and modules to `show` and `items`).
@@ -295,8 +295,8 @@ cd "$HERE" || exit 2
 roundtrip() { # <program dir> <seed names...>
     prog=$1
     shift
-    TACHYON_ROOT="$prog/main.tach"
-    export TACHYON_ROOT
+    VOLE_ROOT="$prog/main.vl"
+    export VOLE_ROOT
     {
         "$COMPILER" query def "$@" 2>/dev/null | awk -F "$TAB" '{ print "def " $1; print "show " $2 }'
         "$COMPILER" query show "$@" 2>/dev/null | awk -F "$TAB" '/^\/\/ [^ ]*\t/ { sub(/^\/\/ /, "", $1); print "def " $1; print "show " $2 }'
@@ -304,9 +304,9 @@ roundtrip() { # <program dir> <seed names...>
             /^# / { file = substr($0, 3); next }
             { print "show " file ":" $1; if ($2 != "def") print "def " $3 }'
         "$COMPILER" query items 2>/dev/null | awk -F "$TAB" '{ print "items " $1; print "items " $2 }'
-        "$COMPILER" check --diagnostics=short "$prog/main.tach" 2>&1 | awk '/^[^ ]*:[0-9]+:[0-9]+:/ { print "show " $1 }'
-        "$COMPILER" "$prog/main.tach" -O0 -S -o "$WORK/rt.s" >/dev/null 2>&1 \
-            && awk '/^_?tachyon\.[^ \t]*:$/ && !/^_?tachyon\.rt\./ && !/^_?tachyon\.static\.std\./ { sub(/:$/, ""); print "def " $0 }' "$WORK/rt.s"
+        "$COMPILER" check --diagnostics=short "$prog/main.vl" 2>&1 | awk '/^[^ ]*:[0-9]+:[0-9]+:/ { print "show " $1 }'
+        "$COMPILER" "$prog/main.vl" -O0 -S -o "$WORK/rt.s" >/dev/null 2>&1 \
+            && awk '/^_?vole\.[^ \t]*:$/ && !/^_?vole\.rt\./ && !/^_?vole\.static\.std\./ { sub(/:$/, ""); print "def " $0 }' "$WORK/rt.s"
     } | sort -u >"$WORK/rt.names"
     : >"$WORK/rt.bad"
     n=0
@@ -316,7 +316,7 @@ roundtrip() { # <program dir> <seed names...>
         "$COMPILER" query "$cmd" "$name" >/dev/null 2>"$WORK/rt.err" \
             || echo "query $cmd $name: $(head -1 "$WORK/rt.err")" >>"$WORK/rt.bad"
     done <"$WORK/rt.names"
-    unset TACHYON_ROOT
+    unset VOLE_ROOT
     ok=0
     [ "$n" -ge 10 ] && [ ! -s "$WORK/rt.bad" ] && ok=1
     check "roundtrip_$prog" "$ok" "$n names; $(cat "$WORK/rt.bad")"

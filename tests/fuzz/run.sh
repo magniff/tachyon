@@ -7,7 +7,7 @@
 #                          [-f FIRST] [-k DIR] [-j JOBS] [-l] [-g] [-p] [-C] [-N]
 #                          [-V] [-D] [-R] [-A]
 #
-#   -c COMPILER   the tachyonc to test (default: target/tachyonc)
+#   -c COMPILER   the volec to test (default: target/volec)
 #   -s SEED       also compare with the seed binary (divisors are then
 #                 positive: the seed traps on 0 and on MIN / -1)
 #   -t TARGET     aarch64-macos, aarch64-linux, x86_64-linux or
@@ -32,13 +32,13 @@
 #                 operations, on loads near a slice's end, from
 #                 genarch.awk
 #   -j JOBS       programs tested at once (default: the number of CPUs,
-#                 or the slots of $TACHYON_JOBSERVER, see tests/run.sh)
+#                 or the slots of $VOLE_JOBSERVER, see tests/run.sh)
 
 set -u
 LC_ALL=C
 export LC_ALL
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 SEED=""
 TARGET=""
 COUNT=200
@@ -84,13 +84,13 @@ esac
 NONZERO=0
 [ -n "$SEED" ] && NONZERO=1
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-fuzz.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-fuzz.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 
 # The C compiler, once more when it crashed (a signal, or gcc's "internal
 # compiler error"): an emulated toolchain (x86-64 Linux under Rosetta)
-# now and then does, and a crash of cc is not tachyon's. Its output (and
+# now and then does, and a crash of cc is not vole's. Its output (and
 # the crash's, if any) on stdout.
 cc_run() {
     cr_out=$("$CC" "$@" 2>&1)
@@ -111,7 +111,7 @@ cc_run() {
 # $WORK/p$1.why.
 test_seed() {
     seed=$1
-    program="$WORK/p$seed.tach"
+    program="$WORK/p$seed.vl"
     if [ "${VECTOR:-0}" = 1 ]; then
         awk -v seed="$seed" -f "$ROOT/tests/fuzz/genvec.awk" >"$program"
     elif [ "${ARCHMODE:-0}" = 1 ]; then
@@ -129,8 +129,8 @@ test_seed() {
         exe="$WORK/p$seed.$level"
         if [ "$level" = seed ]; then
             [ -n "$SEED" ] && [ "${DIVIDE:-0}" = 0 ] && [ "${ARCHMODE:-0}" = 0 ] || continue
-            awk -f "$ROOT/tests/seed-compat.awk" "$program" >"$exe.tach"
-            "$SEED" build --target "$SEED_TARGET" "$exe.tach" -o "$exe" >"$exe.log" 2>&1 \
+            awk -f "$ROOT/tests/seed-compat.awk" "$program" >"$exe.vl"
+            "$SEED" build --target "$SEED_TARGET" "$exe.vl" -o "$exe" >"$exe.log" 2>&1 \
                 || { why="the seed failed to compile it"; break; }
         else
             # (0.17: --values=off. The programs are 0.16 code: slices
@@ -163,10 +163,10 @@ test_seed() {
     rm -f "$WORK/p$seed".O* "$WORK/p$seed".seed*
 }
 
-# The slots: JOBS of them, or (0.11) the ones $TACHYON_JOBSERVER shares
+# The slots: JOBS of them, or (0.11) the ones $VOLE_JOBSERVER shares
 # between the runners of bootstrap/gate.sh (see tests/run.sh).
-if [ -z "$JOBS" ] && [ -n "${TACHYON_JOBSERVER:-}" ] && [ -p "$TACHYON_JOBSERVER" ]; then
-    exec 3<>"$TACHYON_JOBSERVER"
+if [ -z "$JOBS" ] && [ -n "${VOLE_JOBSERVER:-}" ] && [ -p "$VOLE_JOBSERVER" ]; then
+    exec 3<>"$VOLE_JOBSERVER"
 else
     if [ -z "$JOBS" ]; then
         JOBS=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
@@ -196,8 +196,8 @@ while [ "$seed" -lt "$last" ]; do
     if [ -f "$WORK/p$seed.why" ]; then
         failures=$((failures + 1))
         mkdir -p "$KEEP"
-        cp "$WORK/p$seed.tach" "$KEEP/"
-        echo "FAIL seed $seed: $(cat "$WORK/p$seed.why") (kept as $KEEP/p$seed.tach)"
+        cp "$WORK/p$seed.vl" "$KEEP/"
+        echo "FAIL seed $seed: $(cat "$WORK/p$seed.why") (kept as $KEEP/p$seed.vl)"
     fi
     seed=$((seed + 1))
 done

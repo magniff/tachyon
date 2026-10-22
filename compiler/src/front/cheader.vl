@@ -1,0 +1,557 @@
+// `--emit-header`: a C header for the C side of a program. It declares
+// what C can use: the `extern "C" fn` definitions, the `extern "C"`
+// statics, and the #[repr(C)] (and integer-repr) types they and their
+// fields need, in an order C accepts, with include guards. Types of
+// default layout appear only behind pointers, as incomplete structs.
+// Declarations imported from C headers are not repeated.
+
+use crate::base::{
+    BUFS, SYMS, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
+    buf_write_file, intern_c, strlen,
+};
+use crate::base::diag::{err_begin, err_end, err_str};
+use crate::front::ast::{NODES, NodeKind, REPR_C, REPR_INT, REPR_PACKED, REPR_UNION, child};
+use crate::front::check::name_error;
+use crate::front::cimport::IMPORTED_START;
+use crate::front::distinct::{enum_niche, niche_full_variant};
+use crate::front::lexer::{is_alpha, is_digit};
+use crate::front::modules::{module_of, qualify};
+use crate::front::parser::UNDERSCORE;
+use crate::front::types::{
+    ENUMS, ENUM_COUNT, FNS, STATICS, STRUCTS, STRUCT_COUNT, SYM_ENUM, SYM_STATIC, SYM_STRUCT, TYPES,
+    TY_BOOL, TY_F32, TY_F64, TY_I16, TY_I32, TY_I64, TY_I8, TY_NEVER, TY_U16, TY_U32, TY_U64, TY_U8,
+    TY_UNIT, VARIANTS, compute_layout, enum_type, enum_variant, err_type, fn_param, struct_field,
+    struct_type, type_align, type_elem, type_size, variant_field,
+};
+use crate::front::types::TyKind::{Array, Enum, Fn, Ptr, Struct};
+
+static var HB: i64 = 0;
+// Per struct and enum: 0 not written, 1 being written, 2 written.
+static var H_STRUCT_STATE: *i64 = 0 as *i64;
+static var H_ENUM_STATE: *i64 = 0 as *i64;
+static var H_FORWARD: *i64 = 0 as *i64;
+
+fn h(s: *u8) {
+    buf_str(HB, s);
+}
+
+fn h_sym(sym: i64) {
+    unsafe { buf_bytes(HB, SYMS[sym].text); }
+}
+
+fn is_c_keyword(sym: i64) -> bool {
+    let names: [*u8; 44] = [c"auto", c"break", c"case", c"char", c"const", c"continue", c"default",
+        c"do", c"double", c"else", c"enum", c"extern", c"float", c"for", c"goto", c"if", c"inline",
+        c"int", c"long", c"register", c"restrict", c"return", c"short", c"signed", c"sizeof",
+        c"static", c"struct", c"switch", c"typedef", c"union", c"unsigned", c"void", c"volatile",
+        c"while", c"_Bool", c"_Complex", c"_Imaginary", c"_Alignas", c"_Alignof", c"_Atomic",
+        c"_Noreturn", c"_Static_assert", c"_Thread_local", c"bool"];
+    for i in 0..44 {
+        if unsafe { sym == intern_c(names[i]) } {
+            return true;
+        }
+    }
+    false
+}
+
+// A name the header uses: an error if C cannot spell it.
+fn h_name(sym: i64, pos: i64) {
+    if is_c_keyword(sym) {
+        unsafe {
+            name_error(pos, c"'", sym,
+                c"' is a C keyword: it cannot be a name in a C header (--emit-header)");
+        }
+    }
+    h_sym(sym);
+}
+
+// The C spelling of a declaration of `name` (a C string, may be empty)
+// with vole type t: `int32_t x`, `uint8_t *p`, `int32_t a[4]`,
+// `void (*f)(int32_t)`.
+fn h_decl(t: i64, name: *u8, pos: i64) {
+    let b = buf_new();
+    buf_str(b, name);
+    h_decl_into(t, b, pos);
+}
+
+// `inner` is the declarator so far (a buffer).
+fn h_decl_into(t: i64, inner: i64, pos: i64) {
+    unsafe {
+        let kind = TYPES[t].kind;
+        // (0.18: the null niche, `Option<NonNull<T>>`, is C's nullable `T *`)
+        if kind == Enum && enum_niche(TYPES[t].a) {
+            h_decl_into(variant_field(niche_full_variant(TYPES[t].a), 0), inner, pos);
+            return;
+        }
+        if kind == Ptr {
+            let pointee = TYPES[t].a;
+            let b = buf_new();
+            let pk = TYPES[pointee].kind;
+            if pk == Array || pk == Fn {
+                buf_str(b, c"(*");
+                buf_bytes(b, buf_slice(inner));
+                buf_str(b, c")");
+            } else {
+                buf_byte(b, '*');
+                buf_bytes(b, buf_slice(inner));
+            }
+            if pointee == TY_UNIT {
+                h(c"void ");
+                buf_bytes(HB, buf_slice(b));
+                return;
+            }
+            h_decl_into(pointee, b, pos);
+            return;
+        }
+        if kind == Array {
+            let b = buf_new();
+            buf_bytes(b, buf_slice(inner));
+            buf_byte(b, '[');
+            buf_int(b, TYPES[t].b);
+            buf_byte(b, ']');
+            h_decl_into(TYPES[t].a, b, pos);
+            return;
+        }
+        if kind == Fn {
+            // A function pointer: R (*inner)(params).
+            let b = buf_new();
+            buf_str(b, c"(*");
+            buf_bytes(b, buf_slice(inner));
+            buf_str(b, c")(");
+            if TYPES[t].count == 0 {
+                buf_str(b, c"void");
+            }
+            let saved = HB;
+            for i in 0..TYPES[t].count {
+                if i > 0 {
+                    buf_str(b, c", ");
+                }
+                HB = b;
+                h_decl(type_elem(t, i), c"", pos);
+                HB = saved;
+            }
+            buf_byte(b, ')');
+            let ret = TYPES[t].a;
+            if ret == TY_UNIT || ret == TY_NEVER {
+                h(c"void ");
+                buf_bytes(HB, buf_slice(b));
+                return;
+            }
+            h_decl_into(ret, b, pos);
+            return;
+        }
+        h_base(t, pos);
+        if BUFS[inner].len > 0 {
+            h(c" ");
+            buf_bytes(HB, buf_slice(inner));
+        }
+    }
+}
+
+// A type that is not a pointer, an array or a function pointer.
+fn h_base(t: i64, pos: i64) {
+    unsafe {
+        if t == TY_I8 { h(c"int8_t"); return; }
+        if t == TY_I16 { h(c"int16_t"); return; }
+        if t == TY_I32 { h(c"int32_t"); return; }
+        if t == TY_I64 { h(c"int64_t"); return; }
+        if t == TY_U8 { h(c"uint8_t"); return; }
+        if t == TY_U16 { h(c"uint16_t"); return; }
+        if t == TY_U32 { h(c"uint32_t"); return; }
+        if t == TY_U64 { h(c"uint64_t"); return; }
+        if t == TY_F32 { h(c"float"); return; }
+        if t == TY_F64 { h(c"double"); return; }
+        if t == TY_BOOL { h(c"bool"); return; }
+        if t == TY_UNIT || t == TY_NEVER { h(c"void"); return; }
+        let kind = TYPES[t].kind;
+        if kind == Struct {
+            let s = TYPES[t].a;
+            h_name(STRUCTS[s].name, pos);
+            return;
+        }
+        if kind == Enum {
+            h_name(ENUMS[TYPES[t].a].name, pos);
+            return;
+        }
+        err_begin(pos);
+        err_str(c"type '");
+        err_type(t);
+        err_str(c"' has no C spelling (--emit-header)");
+        err_end();
+    }
+}
+
+// Writes the definitions types t needs by value, then t's (for structs
+// and enums of C layout).
+fn h_need(t: i64, pos: i64) {
+    unsafe {
+        let kind = TYPES[t].kind;
+        if kind == Array {
+            h_need(TYPES[t].a, pos);
+        } else if kind == Ptr {
+            h_forward(TYPES[t].a);
+        } else if kind == Fn {
+            for i in 0..TYPES[t].count {
+                h_need(type_elem(t, i), pos);
+            }
+            h_need(TYPES[t].a, pos);
+        } else if kind == Struct {
+            h_struct(TYPES[t].a);
+        } else if kind == Enum && enum_niche(TYPES[t].a) {
+            h_need(variant_field(niche_full_variant(TYPES[t].a), 0), pos);
+        } else if kind == Enum {
+            h_enum(TYPES[t].a);
+        }
+    }
+}
+
+// A type behind a pointer: an incomplete struct when C does not get its
+// definition.
+fn h_forward(t: i64) {
+    unsafe {
+        let kind = TYPES[t].kind;
+        if kind == Struct {
+            let s = TYPES[t].a;
+            if (STRUCTS[s].repr & REPR_C) != 0 {
+                h_struct(s);
+                return;
+            }
+            if H_FORWARD[s] == 0 {
+                H_FORWARD[s] = 1;
+                h(c"/* ");
+                h_sym(STRUCTS[s].name);
+                h(c": a vole type, not visible to C. */\ntypedef struct ");
+                h_name(STRUCTS[s].name, NODES[STRUCTS[s].node].start);
+                h(c" ");
+                h_sym(STRUCTS[s].name);
+                h(c";\n\n");
+            }
+        } else if kind == Enum {
+            let e = TYPES[t].a;
+            if (ENUMS[e].repr & (REPR_C | REPR_INT)) != 0 {
+                h_enum(e);
+            }
+        } else if kind == Ptr {
+            h_forward(TYPES[t].a);
+        } else if kind == Array {
+            h_forward(TYPES[t].a);
+        } else if kind == Fn {
+            h_need(t, 0);
+        }
+    }
+}
+
+fn h_struct(s: i64) {
+    unsafe {
+        if H_STRUCT_STATE[s] != 0 {
+            return;
+        }
+        H_STRUCT_STATE[s] = 1;
+        let node = STRUCTS[s].node;
+        let pos = NODES[node].start;
+        let t = struct_type(s);
+        compute_layout(t);
+        let is_union0 = (STRUCTS[s].repr & REPR_UNION) != 0;
+        h(if is_union0 { c"typedef union " } else { c"typedef struct " });
+        h_name(STRUCTS[s].name, pos);
+        h(c" ");
+        h_sym(STRUCTS[s].name);
+        h(c";\n");
+        // Its fields' types first.
+        for i in 0..STRUCTS[s].field_count {
+            h_need((*struct_field(s, i)).ty, pos);
+        }
+        let repr = STRUCTS[s].repr;
+        let is_union = (repr & REPR_UNION) != 0;
+        // packed(N), N > 1: GCC's #pragma pack(N).
+        let pack_n = (repr & REPR_PACKED) != 0 && STRUCTS[s].align > 1;
+        if pack_n {
+            h(c"#pragma pack(push, ");
+            buf_int(HB, STRUCTS[s].align);
+            h(c")\n");
+        }
+        h(if is_union { c"union " } else { c"struct " });
+        if (repr & REPR_PACKED) != 0 && !pack_n {
+            h(c"__attribute__((packed)) ");
+        }
+        h_name(STRUCTS[s].name, pos);
+        h(c" {\n");
+        for i in 0..STRUCTS[s].field_count {
+            let f = struct_field(s, i);
+            h(c"    ");
+            let name = buf_new();
+            buf_bytes(name, SYMS[(*f).name].text);
+            if is_c_keyword((*f).name) {
+                name_error(pos, c"field '", (*f).name,
+                    c"' is a C keyword: it cannot be a name in a C header (--emit-header)");
+            }
+            let saved = HB;
+            HB = buf_new();
+            h_decl_into((*f).ty, name, pos);
+            let text = HB;
+            HB = saved;
+            buf_bytes(HB, buf_slice(text));
+            h(c";\n");
+        }
+        h(c"}");
+        if (repr & REPR_PACKED) == 0 && STRUCTS[s].align > 0 {
+            h(c" __attribute__((aligned(");
+            buf_int(HB, STRUCTS[s].align);
+            h(c")))");
+        }
+        h(c";\n");
+        if pack_n {
+            h(c"#pragma pack(pop)\n");
+        }
+        h(c"_Static_assert(sizeof(");
+        h_sym(STRUCTS[s].name);
+        h(c") == ");
+        buf_int(HB, type_size(t));
+        h(c" && _Alignof(");
+        h_sym(STRUCTS[s].name);
+        h(c") == ");
+        buf_int(HB, type_align(t));
+        h(c", \"the layout of ");
+        h_sym(STRUCTS[s].name);
+        h(c" in vole\");\n\n");
+        H_STRUCT_STATE[s] = 2;
+    }
+}
+
+// The C names of enum e's variants: E_V.
+fn h_variant_name(e: i64, v: i64, pos: i64) {
+    unsafe {
+        h_name(ENUMS[e].name, pos);
+        h(c"_");
+        h_sym(VARIANTS[v].name);
+    }
+}
+
+fn h_enum(e: i64) {
+    unsafe {
+        if H_ENUM_STATE[e] != 0 {
+            return;
+        }
+        H_ENUM_STATE[e] = 1;
+        let pos = NODES[ENUMS[e].node].start;
+        let is_c = (ENUMS[e].repr & REPR_C) != 0;
+        for i in 0..ENUMS[e].variant_count {
+            let v = enum_variant(e, i);
+            for k in 0..VARIANTS[v].field_count {
+                h_need(variant_field(v, k), pos);
+            }
+        }
+        // The discriminants: an enum of constants.
+        h(c"enum {");
+        for i in 0..ENUMS[e].variant_count {
+            let v = enum_variant(e, i);
+            h(if i > 0 { c", " } else { c" " });
+            h_variant_name(e, v, pos);
+            if ENUMS[e].has_fields {
+                h(c"_TAG");
+            }
+            h(c" = ");
+            buf_int(HB, VARIANTS[v].discr);
+        }
+        h(c" };\n");
+        let tag = ENUMS[e].tag;
+        if !ENUMS[e].has_fields {
+            // A fieldless enum is its tag's integer type.
+            h(c"typedef ");
+            h_base(tag, pos);
+            h(c" ");
+            h_name(ENUMS[e].name, pos);
+            h(c";\n\n");
+            H_ENUM_STATE[e] = 2;
+            return;
+        }
+        if is_c {
+            // RFC 2195: the tag, then a union of one struct per variant.
+            h(c"typedef struct ");
+            h_name(ENUMS[e].name, pos);
+            h(c" {\n    ");
+            h_base(tag, pos);
+            h(c" tag;\n    union {\n");
+            for i in 0..ENUMS[e].variant_count {
+                let v = enum_variant(e, i);
+                if VARIANTS[v].field_count == 0 {
+                    continue;
+                }
+                h(c"        struct {");
+                for k in 0..VARIANTS[v].field_count {
+                    h(c" ");
+                    h_field_decl(variant_field(v, k), k, pos);
+                    h(c";");
+                }
+                h(c" } ");
+                h_sym(VARIANTS[v].name);
+                h(c";\n");
+            }
+            h(c"    } u;\n} ");
+        } else {
+            // An integer tag with fields: a union of structs that start with
+            // the tag.
+            h(c"typedef union ");
+            h_name(ENUMS[e].name, pos);
+            h(c" {\n    ");
+            h_base(tag, pos);
+            h(c" tag;\n");
+            for i in 0..ENUMS[e].variant_count {
+                let v = enum_variant(e, i);
+                h(c"    struct { ");
+                h_base(tag, pos);
+                h(c" tag;");
+                for k in 0..VARIANTS[v].field_count {
+                    h(c" ");
+                    h_field_decl(variant_field(v, k), k, pos);
+                    h(c";");
+                }
+                h(c" } ");
+                h_sym(VARIANTS[v].name);
+                h(c";\n");
+            }
+            h(c"} ");
+        }
+        h_sym(ENUMS[e].name);
+        h(c";\n_Static_assert(sizeof(");
+        h_sym(ENUMS[e].name);
+        h(c") == ");
+        buf_int(HB, type_size(enum_type(e)));
+        h(c", \"the layout of ");
+        h_sym(ENUMS[e].name);
+        h(c" in vole\");\n\n");
+        H_ENUM_STATE[e] = 2;
+    }
+}
+
+// Field k of a variant: `T _k`.
+fn h_field_decl(t: i64, k: i64, pos: i64) {
+    let b = buf_new();
+    buf_byte(b, '_');
+    buf_int(b, k);
+    h_decl_into(t, b, pos);
+}
+
+pub fn emit_c_header(program: i64, output: *u8) {
+    unsafe {
+        HB = buf_new();
+        let all = HB;
+        H_STRUCT_STATE = alloc_array::<i64>(STRUCT_COUNT + 1);
+        H_FORWARD = alloc_array::<i64>(STRUCT_COUNT + 1);
+        H_ENUM_STATE = alloc_array::<i64>(ENUM_COUNT + 1);
+        // Types, then declarations, written to separate buffers.
+        let decls = buf_new();
+        for i in 0..NODES[program].count {
+            let item = child(program, i);
+            let pos = NODES[item].start;
+            if IMPORTED_START >= 0 && pos >= IMPORTED_START {
+                continue;
+            }
+            let kind = NODES[item].kind;
+            if kind == NodeKind::Fn && NODES[item].y == 1 {
+                let f = NODES[item].x - 1;
+                HB = all;
+                for k in 0..FNS[f].param_count {
+                    h_need(fn_param(f, k), pos);
+                }
+                h_need(FNS[f].ret, pos);
+                HB = decls;
+                if FNS[f].ret == TY_NEVER {
+                    h(c"_Noreturn ");
+                }
+                let b = buf_new();
+                buf_bytes(b, SYMS[FNS[f].name].text);
+                if is_c_keyword(FNS[f].name) {
+                    h_name(FNS[f].name, pos);
+                }
+                buf_byte(b, '(');
+                if FNS[f].param_count == 0 {
+                    buf_str(b, c"void");
+                }
+                let saved = HB;
+                for k in 0..FNS[f].param_count {
+                    if k > 0 {
+                        buf_str(b, c", ");
+                    }
+                    let param = child(item, k);
+                    let pname = NODES[param].a;
+                    HB = b;
+                    let n = buf_new();
+                    if pname != UNDERSCORE && !is_c_keyword(pname) {
+                        buf_bytes(n, SYMS[pname].text);
+                    }
+                    h_decl_into(fn_param(f, k), n, pos);
+                    HB = saved;
+                }
+                buf_byte(b, ')');
+                let ret = FNS[f].ret;
+                if ret == TY_UNIT || ret == TY_NEVER {
+                    h(c"void ");
+                    buf_bytes(HB, buf_slice(b));
+                } else {
+                    h_decl_into(ret, b, pos);
+                }
+                h(c";\n");
+            } else if kind == NodeKind::Static && NODES[item].y == 2 {
+                let st = SYM_STATIC[NODES[item].a] - 1;
+                let t = STATICS[st].ty;
+                HB = all;
+                h_need(t, pos);
+                HB = decls;
+                h(c"extern ");
+                if !STATICS[st].mutable {
+                    h(c"const ");
+                }
+                let n = buf_new();
+                buf_bytes(n, SYMS[NODES[item].a].text);
+                if is_c_keyword(NODES[item].a) {
+                    h_name(NODES[item].a, pos);
+                }
+                h_decl_into(t, n, pos);
+                h(c";\n");
+            } else if kind == NodeKind::Struct && (NODES[item].c & REPR_C) != 0 {
+                HB = all;
+                h_struct(SYM_STRUCT[qualify(module_of(item), NODES[item].a)] - 1);
+            } else if kind == NodeKind::Enum && (NODES[item].c & (REPR_C | REPR_INT)) != 0 {
+                HB = all;
+                h_enum(SYM_ENUM[qualify(module_of(item), NODES[item].a)] - 1);
+            }
+        }
+        let out = buf_new();
+        let guard = buf_new();
+        let base = path_basename(output);
+        for i in 0..strlen(base) as i64 {
+            let c = base[i];
+            if is_alpha(c) || is_digit(c) {
+                buf_byte(guard, if c >= 'a' && c <= 'z' { c - 32 } else { c });
+            } else {
+                buf_byte(guard, '_');
+            }
+        }
+        buf_str(guard, c"_INCLUDED");
+        buf_str(out,
+            c"/* Generated by volec --emit-header: the C view of a vole program. */\n#ifndef ");
+        buf_bytes(out, buf_slice(guard));
+        buf_str(out, c"\n#define ");
+        buf_bytes(out, buf_slice(guard));
+        buf_str(out, c"\n\n#include <stdbool.h>\n#include <stdint.h>\n\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
+        buf_bytes(out, buf_slice(all));
+        buf_bytes(out, buf_slice(decls));
+        buf_str(out, c"\n#ifdef __cplusplus\n}\n#endif\n\n#endif\n");
+        buf_write_file(out, output);
+    }
+}
+
+fn path_basename(path: *u8) -> *u8 {
+    unsafe {
+        let n = strlen(path) as i64;
+        var i = n - 1;
+        while i >= 0 && path[i] != '/' {
+            i -= 1;
+        }
+        &path[i + 1]
+    }
+}
+
+// --emit-header: write the program's C header (cheader.vl).
+pub static var EMIT_HEADER: bool = false;

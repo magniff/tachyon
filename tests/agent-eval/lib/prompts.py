@@ -16,23 +16,23 @@ def _read(name):
 
 
 def guide_text(tach_bin, which="full"):
-    """`tachyonc guide` from the binary under test. which="full": the long
+    """`volec guide` from the binary under test. which="full": the long
     core, the 0.16 control (`guide --full` where the compiler has it, 0.17;
-    plain `guide` before); which="core": the short core (`tachyonc guide`
+    plain `guide` before); which="core": the short core (`volec guide`
     of a compiler that has `--full`; SystemExit otherwise)."""
     env = base_env(tach_bin)
-    rc, out, err, _ = run_proc(["tachyonc", "guide", "--full"], tach_bin, env, 60)
+    rc, out, err, _ = run_proc(["volec", "guide", "--full"], tach_bin, env, 60)
     has_full = rc == 0 and out.strip()
     if which == "full":
         if not has_full:
-            rc, out, err, _ = run_proc(["tachyonc", "guide"], tach_bin, env, 60)
+            rc, out, err, _ = run_proc(["volec", "guide"], tach_bin, env, 60)
     else:
         if not has_full:
-            raise SystemExit("guide-core: this compiler has no short core (`tachyonc guide "
-                             "--full` fails, so `tachyonc guide` is the old one)")
-        rc, out, err, _ = run_proc(["tachyonc", "guide"], tach_bin, env, 60)
+            raise SystemExit("guide-core: this compiler has no short core (`volec guide "
+                             "--full` fails, so `volec guide` is the old one)")
+        rc, out, err, _ = run_proc(["volec", "guide"], tach_bin, env, 60)
     if rc != 0 or not out.strip():
-        raise SystemExit("tachyonc guide failed: %s" % err.decode()[:400])
+        raise SystemExit("volec guide failed: %s" % err.decode()[:400])
     return out.decode("utf-8").strip()
 
 
@@ -46,21 +46,21 @@ def guide_core_text(core=None):
 
 
 def guide_topic(tach_bin, topic):
-    """(0.17) `tachyonc guide TOPIC` from the binary under test; SystemExit
+    """(0.17) `volec guide TOPIC` from the binary under test; SystemExit
     when it has no such topic."""
     env = base_env(tach_bin)
-    rc, out, err, _ = run_proc(["tachyonc", "guide", topic], tach_bin, env, 60)
+    rc, out, err, _ = run_proc(["volec", "guide", topic], tach_bin, env, 60)
     if rc != 0 or not out.strip():
-        raise SystemExit("tachyonc guide %s failed: %s" % (topic, err.decode()[:400]))
+        raise SystemExit("volec guide %s failed: %s" % (topic, err.decode()[:400]))
     return out.decode("utf-8").strip()
 
 
 def guide_example_text(example=None):
     """(0.17 iterations) The guide-example condition's text:
-    prompts/guide-example.md with `tachyonc guide example` at @EXAMPLE@ (a
+    prompts/guide-example.md with `volec guide example` at @EXAMPLE@ (a
     stub when the compiler has no such topic: dry runs only)."""
     return _read("guide-example.md").replace(
-        "@EXAMPLE@", example or STUB % "a compiler with `tachyonc guide example`")
+        "@EXAMPLE@", example or STUB % "a compiler with `volec guide example`")
 
 
 def preamble(cond, guide=None, env_note=None, check_hook=False, guide_core=None,

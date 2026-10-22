@@ -6,8 +6,8 @@
 ## the refactorings that need it checked.)
 $ fmt --check
 $ rewrite 'double($x)' '($x * 2)' --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -19 +19 @@
 -    let add = |x: i64| double(x) + k;
 +    let add = |x: i64| (x * 2) + k;
@@ -17,8 +17,8 @@ $ rewrite 'double($x)' '($x * 2)' --dry-run
 ## A closure called where it is written gets no parameter types from
 ## the arguments: the edit would add an error.
 $ rewrite 'apply($f, $x)' '$f($x)' --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -13 +13 @@
 -    apply(by, x)
 +    by(x)
@@ -30,12 +30,12 @@ $ rewrite 'apply($f, $x)' '$f($x)' --dry-run
 @@ -24 +24 @@
 -    }, 2);
 +    })(2);
-main.tach:21:16: error[type error] cannot infer the type of closure parameter 'y' | help: write its type: '|y: i64| ...'  [edited: crate::main]
+main.vl:21:16: error[type error] cannot infer the type of closure parameter 'y' | help: write its type: '|y: i64| ...'  [edited: crate::main]
 warning edit.breaks: 1 new error (dry run)
 [exit 1]
 $ rewrite 'apply(|y| $b, $x)' 'apply(|y| $b + 0, $x)' --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -24 +24 @@
 -    }, 2);
 +    } + 0, 2);
@@ -43,7 +43,7 @@ $ rewrite 'apply(|y| $b, $x)' 'apply(|y| $b + 0, $x)' --dry-run
 $ rewrite 'apply(|z| $b, $x)' 'apply(|z| $b + 0, $x)' --dry-run
 note rewrite.none: nothing matches 'apply(|z| $b, $x)'
 $ rewrite 'double($x)' '($x * 2)'
-rewrote 2 sites in 1 file	main.tach	+2 -2 lines
+rewrote 2 sites in 1 file	main.vl	+2 -2 lines
 % git diff | sed -n '/^@@/,$p'
 @@ -16,11 +16,11 @@ fn scaled(k: i64, x: i64) -> i64 {
  fn main() -> i32 {

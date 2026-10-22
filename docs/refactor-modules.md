@@ -6,18 +6,18 @@ files by hand. Release 0.12 uses them to reorganize the compiler's own
 source into folders with no file over 1,000 lines.
 
 ```
-tachyonc refactor rename PATH NEW [ROOT]
-tachyonc refactor move PATH... --to MODULE [--after ITEM|--before ITEM] [--keep-impls] [--no-tidy]
-tachyonc refactor new-module crate::a::b [--file|--dir]
-tachyonc refactor move-module crate::a crate::x::b
-tachyonc refactor split MODULE --into NEWMOD --items a,b,c [--keep-impls] [--reexport] [--header TEXT]
-tachyonc refactor split MODULE --plan|--auto [--max-lines N] [--names a,b] [--reexport]
+volec refactor rename PATH NEW [ROOT]
+volec refactor move PATH... --to MODULE [--after ITEM|--before ITEM] [--keep-impls] [--no-tidy]
+volec refactor new-module crate::a::b [--file|--dir]
+volec refactor move-module crate::a crate::x::b
+volec refactor split MODULE --into NEWMOD --items a,b,c [--keep-impls] [--reexport] [--header TEXT]
+volec refactor split MODULE --plan|--auto [--max-lines N] [--names a,b] [--reexport]
 ```
 
 Every one is one edit of the edit engine ([refactor.md](refactor.md)):
 checked by the front end before anything is written (an edit that adds
 an error writes nothing: `error edit.breaks`, the new errors, `try:` with
-`--no-check`), journaled for `tachyonc undo` (file moves too), printed as
+`--no-check`), journaled for `volec undo` (file moves too), printed as
 a zero-context diff with `--dry-run` (a moved file as git's `rename
 from`/`rename to`), and summed up in one line:
 
@@ -49,7 +49,7 @@ alias, `use a::f as g`, keeps its own name). For
   in the program's files: `edit.not-source`);
 - a field or a variant: its struct or enum must not have one NEW;
 - a module: its parent must not have a NEW, and its file is renamed
-  (`a.tach` -> `NEW.tach`, `a/` with it; `a/mod.tach`: the directory).
+  (`a.vl` -> `NEW.vl`, `a/` with it; `a/mod.vl`: the directory).
 
 PATH may be `FILE:LINE:COL` (0.14, as a compiler error has it): the
 local there (below), else the definition referred to or defined at
@@ -206,9 +206,9 @@ second command.
 of new-module, move-module and split may leave out `crate::`): makes
 `b`'s file, empty, and its
 `mod b;` line in `a` (after `a`'s last `mod` line, else before its first
-item). `--dir` makes it a dir module (`b/mod.tach`). The modules of the
+item). `--dir` makes it a dir module (`b/mod.vl`). The modules of the
 path that do not exist are made too, as dir modules. A file module that
-gains a child becomes a dir module: `a.tach` is moved to `a/mod.tach`
+gains a child becomes a dir module: `a.vl` is moved to `a/mod.vl`
 (its children were in `a/` already). A module that exists:
 `refactor.exists`; a name taken: `refactor.collision`.
 
@@ -227,8 +227,8 @@ written).
 
 `refactor split MODULE --into NEWMOD --items a,b,c`: `move` of the items
 (names in MODULE, or paths) to NEWMOD, made when it does not exist: a
-child (`crate::m::part`) makes MODULE a dir module (`m.tach` ->
-`m/mod.tach`, `m/part.tach`).
+child (`crate::m::part`) makes MODULE a dir module (`m.vl` ->
+`m/mod.vl`, `m/part.vl`).
 
 `--reexport` (0.12) keeps MODULE's interface: code outside MODULE is
 left as it is, and MODULE re-exports its parts' items that code outside
@@ -246,12 +246,12 @@ order (or edit first):
 # crate::middle::gvn→932 lines→6 parts of at most 300 lines
 # stays in crate::middle::gvn: the part most used from other modules
 # walk: banner '// ---- The walk ----': 1 of 8 items, 87 of 142 lines
-tachyonc refactor split crate::middle::gvn --into crate::middle::gvn::walk --items DOM_START,...
+volec refactor split crate::middle::gvn --into crate::middle::gvn::walk --items DOM_START,...
 # memory_values: banner '// ---- Memory values ----': 5 of 6 items, 136 of 141 lines
-tachyonc refactor split crate::middle::gvn --into crate::middle::gvn::memory_values --items copy_src,...
+volec refactor split crate::middle::gvn --into crate::middle::gvn::memory_values --items copy_src,...
 ...
 note refactor.plan: the same in one edit: --auto (other names: --names a,b)
-try: tachyonc refactor split crate::middle::gvn --auto --max-lines 300
+try: volec refactor split crate::middle::gvn --auto --max-lines 300
 ```
 
 The parts come from `query deps`'s clustering (average linkage, then
@@ -294,7 +294,7 @@ refactor split crate::geom --into crate::geom::scaling --items scale,half,double
 
 ## The engine
 
-`edit_move_file(f, PATH)` (edit.tach): file f, with its edits, becomes
+`edit_move_file(f, PATH)` (edit.vl): file f, with its edits, becomes
 PATH: a new file and a removed one. The check reads the new file's copy
 and the removed file as missing (an overlay with no file), the journal
 keeps the removed file's text (undo writes it back and removes the new
@@ -306,8 +306,8 @@ file and the directories it made), the diff is git's rename.
 On a copy of the compiler's source (0.11, 61 files, 60,000 lines), `split
 --auto --max-lines 1000` of each of the 23 files over 1000 lines took 3
 seconds in all; every split passed the check, `lint --max-lines 1000`
-found no file over, the copy built with target/tachyonc, and
-`same-output` against target/tachyonc was identical (3375 compilations).
+found no file over, the copy built with target/volec, and
+`same-output` against target/volec was identical (3375 compilations).
 
 ## Known limits
 

@@ -1,14 +1,14 @@
-/* C side of tests/run/c_interop.tach: globals read and written from both
-   sides, calls of extern "C" tachyon functions by name, #[repr(C)] layouts
+/* C side of tests/run/c_interop.vl: globals read and written from both
+   sides, calls of extern "C" vole functions by name, #[repr(C)] layouts
    checked against C's. */
 #include <stddef.h>
 #include <stdint.h>
 
 int64_t c_counter = 40;
 double c_scale = 2.5;
-extern int64_t t_total;                 /* defined in tachyon */
-int64_t t_square(int64_t x);            /* defined in tachyon */
-int32_t t_classify(int32_t shape_tag);  /* defined in tachyon */
+extern int64_t t_total;                 /* defined in vole */
+int64_t t_square(int64_t x);            /* defined in vole */
+int32_t t_classify(int32_t shape_tag);  /* defined in vole */
 
 int64_t c_bump(void) { return ++c_counter; }
 int64_t c_read_total(void) { return t_total; }

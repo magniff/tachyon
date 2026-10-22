@@ -1,0 +1,142 @@
+// The own pass (0.17, docs/design/value-semantics.md): mutable value
+// semantics checked on the typed AST, after the effects (check_program).
+// Kinds, moves and drops, views with two-level origins and exclusivity,
+// view summaries inferred per function.
+//
+// The files (Phase 0 fixed their interfaces; §6 and "Phase 0 contract"
+// say who fills what):
+//   kinds.vl    type_kind, view_elem, param_mode (the legacy `*T` rule)
+//   state.vl    places, bitsets, the pool, states, origins, slots,
+//                 pending arguments
+//   walk.vl     the evaluation-order walk, its events, walk_fn
+//   moves.vl    the move events (T1); drops.vl, glue.vl (T1)
+//   views.vl    the view events (T2); calls.vl: calls (T2)
+//   summary.vl  ViewSummary, summary_of, summary_text, #[views] (T3)
+//   infer.vl    the driver (SCC order, recursive components to a fixed
+//                 point), the type filter, indirect calls, own.views, the
+//                 why-chains, --print-views (T3)
+//   diag.vl     the codes, the messages, --values
+//   observe.vl  `query own` (T2, T6)
+//   fast.vl     the fast path: functions with nothing to track (T2)
+//
+// --values=off|report|warn|error (OWN_MODE, diag.vl): off skips the
+// pass; report (the default until T7) records the findings and prints
+// them only when --values=report is given; warn and error report them so.
+// error is the default (T7): compiler/src too is checked and dropped under
+// it (its legacy `*T` parameters are the legacy rule's, and it checks
+// clean), so no mode of its own.
+
+pub mod kinds;
+pub mod state;
+pub mod walk;
+pub mod moves;
+pub mod views;
+pub mod calls;
+pub mod summary;
+pub mod infer;
+pub mod diag;
+pub mod observe;
+pub mod fast;
+pub mod drops;
+pub mod glue;
+
+use crate::base::{STDOUT, buf_new, buf_write_fd, streq};
+use crate::base::timer::{T_CHECK, T_OWN, timer_now, timer_sub};
+use crate::front::own::diag::{
+    MODE_ERROR, MODE_OFF, MODE_REPORT, MODE_WARN, OWN_MODE, OWN_REPORT_PRINT, own_discard,
+    own_flush, print_reports,
+};
+use crate::front::own::drops::{any_drops, finish_drops, fn_has_drops};
+use crate::front::own::infer::{PRINT_VIEWS, infer_summaries, print_views, walkable};
+use crate::front::own::state::init_state;
+use crate::front::own::summary::{validate_views_decls, view_fn};
+use crate::front::own::walk::walk_fn;
+use crate::front::types::FN_COUNT;
+use crate::tools::query::command_line::QUERY;
+
+// `--values=MODE` (main's arguments): sets the mode; false when arg is not
+// that option. An unknown mode is an error there (main).
+pub fn values_option(arg: *u8) -> bool {
+    unsafe {
+        if streq(arg, c"--values=off") {
+            OWN_MODE = MODE_OFF;
+        } else if streq(arg, c"--values=report") {
+            OWN_MODE = MODE_REPORT;
+            OWN_REPORT_PRINT = true;
+        } else if streq(arg, c"--values=warn") {
+            OWN_MODE = MODE_WARN;
+        } else if streq(arg, c"--values=error") {
+            OWN_MODE = MODE_ERROR;
+        } else if streq(arg, c"--print-views") {
+            // (every function's view summary, after checking: infer.vl)
+            PRINT_VIEWS = true;
+        } else {
+            return false;
+        }
+        true
+    }
+}
+
+// Whether arg starts with `--values`.
+pub fn is_values_option(arg: *u8) -> bool {
+    unsafe {
+        let p = c"--values";
+        var i = 0;
+        while p[i] != 0 {
+            if arg[i] != p[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+}
+
+// The pass (check_program, after the effects): the #[views] declarations
+// checked, then (unless off, or report without --values=report) every
+// function walked, callees first (infer.vl). For the summaries alone
+// (`query`, the cache, --print-views), only the functions whose summaries
+// can carry views are walked, and their findings are not printed.
+//
+// (T1) Drops are placed under --values=error (drops::drops_on), and their
+// moves decide them; finish_drops empties, flags or keeps each drop.
+pub fn check_own() {
+    unsafe {
+        validate_views_decls();
+        // (report, the default, walks only when its findings are printed:
+        // --values=report; tests/refactor/run.sh keeps compiler/src clean
+        // under it)
+        let all = !(OWN_MODE == MODE_OFF || OWN_MODE == MODE_REPORT && !OWN_REPORT_PRINT);
+        let drops = any_drops();
+        if !all && !drops && !PRINT_VIEWS && !QUERY {
+            return;
+        }
+        let t = timer_now();
+        init_state();
+        infer_summaries(all);
+        if !all && drops {
+            // (the functions with drops the summaries did not walk)
+            for f in 0..FN_COUNT {
+                if walkable(f) && fn_has_drops(f) && !view_fn(f) {
+                    walk_fn(f, 0);
+                    own_discard();
+                }
+            }
+        }
+        finish_drops();
+        if all {
+            own_flush();
+        } else {
+            own_discard();
+        }
+        if OWN_REPORT_PRINT {
+            print_reports();
+        }
+        if PRINT_VIEWS {
+            let out = buf_new();
+            print_views(out);
+            buf_write_fd(out, STDOUT);
+        }
+        timer_sub(T_CHECK, T_OWN, t);
+    }
+}

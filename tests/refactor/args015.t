@@ -7,16 +7,16 @@
 ## writes a call with labels in the new order; inline puts in labelled
 ## arguments and defaults by parameter.
 $ check
-ok: 0 errors in main.tach
+ok: 0 errors in main.vl
 $ refactor signature area --add 'scale: i64 = 2' --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -2 +2 @@
 -fn area(w: i64, h: i64 = 1, depth: i64 = 1) -> i64 {
 +fn area(w: i64, h: i64 = 1, depth: i64 = 1, scale: i64 = 2) -> i64 {
 $ refactor signature area --add 'scale: i64 = 2' --fill-calls --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -2 +2 @@
 -fn area(w: i64, h: i64 = 1, depth: i64 = 1) -> i64 {
 +fn area(w: i64, h: i64 = 1, depth: i64 = 1, scale: i64 = 2) -> i64 {
@@ -30,8 +30,8 @@ $ refactor signature area --add 'scale: i64 = 2' --fill-calls --dry-run
 +    let c = area(2, 3, depth: 4, scale: 2);
 +    let d = area(2, depth: 5, scale: 2);
 $ refactor signature area --add 'first: i64 = 0' --at 0 --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -2 +2 @@
 -fn area(w: i64, h: i64 = 1, depth: i64 = 1) -> i64 {
 +fn area(first: i64, w: i64, h: i64 = 1, depth: i64 = 1) -> i64 {
@@ -46,8 +46,8 @@ $ refactor signature area --add 'first: i64 = 0' --at 0 --dry-run
 +    let d = area(0, 2, depth: 5);
 note refactor.fill-calls: the calls get the value (a default is on trailing parameters only, and a later one has none)
 $ refactor signature area --rename-param h height --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -2,2 +2,2 @@
 -fn area(w: i64, h: i64 = 1, depth: i64 = 1) -> i64 {
 -    w * h * depth
@@ -57,8 +57,8 @@ $ refactor signature area --rename-param h height --dry-run
 -    let b = area(2, h: 3);
 +    let b = area(2, height: 3);
 $ refactor signature label --remove unused --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -6 +6 @@
 -fn label(n: i64, unused: i64 = 0, wide: bool = false) -> i64 {
 +fn label(n: i64, wide: bool = false) -> i64 {
@@ -66,8 +66,8 @@ $ refactor signature label --remove unused --dry-run
 -    let f = label(1, wide: true) + label(2, 0) + label(3);
 +    let f = label(1, wide: true) + label(2) + label(3);
 $ refactor signature area --reorder w,depth,h --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -2 +2 @@
 -fn area(w: i64, h: i64 = 1, depth: i64 = 1) -> i64 {
 +fn area(w: i64, depth: i64 = 1, h: i64 = 1) -> i64 {
@@ -75,8 +75,8 @@ $ refactor signature area --reorder w,depth,h --dry-run
 -    let c = area(2, 3, depth: 4);
 +    let c = area(2, depth: 4, h: 3);
 $ refactor signature Box::grow --rename-param times n --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -17,2 +17,2 @@
 -    fn grow(inout self, by: i64, times: i64 = 1) {
 -        self.w += by * times;
@@ -86,8 +86,8 @@ $ refactor signature Box::grow --rename-param times n --dry-run
 -    x.grow(2, times: 3);
 +    x.grow(2, n: 3);
 $ refactor inline twice --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -10,4 +9,0 @@
 -fn twice(x: i64, k: i64 = 2) -> i64 {
 -    x * k
@@ -98,7 +98,7 @@ $ refactor inline twice --dry-run
 +    let e = 3 * 2 + 4 * 5;
 ## Written: the program still runs.
 $ refactor signature area --reorder w,depth,h
-reordered the parameters of crate::area, 4 calls	main.tach	+2 -2 lines
-% "$COMPILER" main.tach -o prog && ./prog && echo ran
+reordered the parameters of crate::area, 4 calls	main.vl	+2 -2 lines
+% "$COMPILER" main.vl -o prog && ./prog && echo ran
 ran
 ok: built prog

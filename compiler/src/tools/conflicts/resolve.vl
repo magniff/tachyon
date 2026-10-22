@@ -1,0 +1,470 @@
+// `volec edit resolve TARGET --ours|--theirs|--both|--base [--all]
+// [--in FILE]`, or `< TEXT` (0.15): the conflict regions of TARGET
+// replaced by a side, both, the base or TEXT; each file written whole
+// (its copy renamed onto it) and journaled for `undo`; then what is left:
+// the regions in other files, else the program's errors (`volec check`).
+
+use crate::base::{
+    BUFS, IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd,
+    streq,
+};
+use crate::front::cpp::directives::file_exists;
+use crate::tools::conflicts::{
+    F_PATH, F_TEXT, R_BASE, R_END, R_FILE, R_SEP, R_START, blank, conflicted_files, default_dir,
+    file_target, indent, line, line_pos, marker, names_item, ours_end, path_of, read_dir,
+    read_source, try_start,
+};
+use crate::tools::edit::{DRY_RUN, SHOW};
+use crate::tools::edit::apply::copy_path;
+use crate::tools::edit::cli::take_edit_option;
+use crate::tools::edit::diff::diff_texts;
+use crate::tools::edit::undo::journal_texts;
+use crate::tools::proc::{
+    read_file_if, read_stdin, remove_file, rename_file, run_capture, same_bytes, write_file_if,
+};
+use crate::tools::query::{c_slice, find_root};
+use crate::tools::query::diagnostics::{
+    PROG, ROOT_GIVEN, diag, put_cword, put_root, put_word, try_end,
+};
+
+fn usage(message: *u8) -> i64 {
+    unsafe {
+        let d = diag(c"error", c"edit.usage");
+        buf_str(d, message);
+        buf_byte(d, '\n');
+        let out = try_start();
+        buf_str(out, c" edit resolve FILE:LINE --ours");
+        put_root(out);
+        try_end(out);
+        2
+    }
+}
+
+// The command as it was run, with TARGET (argv[t]) replaced by region r's
+// first line.
+fn try_region(argc: i64, argv: **u8, t: i64, r: i64, stdin: bool) {
+    unsafe {
+        let out = try_start();
+        for i in 1..argc {
+            if i == t {
+                let w = buf_new();
+                buf_bytes(w, path_of(R_FILE.data[r]));
+                buf_byte(w, ':');
+                buf_int(w, R_START.data[r]);
+                put_word(out, buf_slice(w));
+            } else if !streq(argv[i], c"--all") {
+                put_cword(out, argv[i]);
+            }
+        }
+        if stdin {
+            buf_str(out, c" < text.vl");
+        }
+        try_end(out);
+    }
+}
+
+// Region r's replacement (side: 'o' ours, 't' theirs, 'b' both, 'a' the
+// base, 'x' the text), appended to out; its number of lines.
+fn put_resolved(out: i64, r: i64, side: u8, text: i64) -> i64 {
+    unsafe {
+        let f = R_FILE.data[r];
+        let t = buf_slice(F_TEXT.data[f]);
+        let s = R_START.data[r];
+        let before = BUFS[out].len;
+        if side == 'x' {
+            let x = buf_slice(text);
+            buf_bytes(out, x);
+            if x.len > 0 && x[x.len - 1] != '\n' {
+                buf_byte(out, '\n');
+            }
+        } else {
+            if side == 'o' || side == 'b' {
+                buf_bytes(out, t[line_pos(f, s + 1)..line_pos(f, ours_end(r))]);
+            }
+            if side == 'a' {
+                buf_bytes(out, t[line_pos(f, R_BASE.data[r] + 1)..line_pos(f, R_SEP.data[r])]);
+            }
+            // (both: an item at the top level after another, a blank line apart)
+            let ours = ours_end(r) - s - 1;
+            let theirs = R_END.data[r] - R_SEP.data[r] - 1;
+            if side == 'b' && ours > 0 && theirs > 0
+                && same_bytes(line(f, ours_end(r) - 1), c_slice(c"}"))
+                && !blank(line(f, R_SEP.data[r] + 1)) && indent(line(f, R_SEP.data[r] + 1)) == 0 {
+                buf_byte(out, '\n');
+            }
+            if side == 't' || side == 'b' {
+                buf_bytes(out, t[line_pos(f, R_SEP.data[r] + 1)..line_pos(f, R_END.data[r])]);
+            }
+        }
+        var n = 0;
+        for i in before..BUFS[out].len {
+            if BUFS[out].data[i] == '\n' {
+                n += 1;
+            }
+        }
+        n
+    }
+}
+
+fn side_name(side: u8) -> *u8 {
+    if side == 'o' { c"ours" } else if side == 't' { c"theirs" } else if side == 'b' { c"both" }
+    else if side == 'a' { c"base" } else { c"text" }
+}
+
+// The marker lines left in the files under the root's directory.
+fn regions_left(files: inout i64) -> i64 {
+    unsafe {
+        var paths = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        conflicted_files(default_dir(), &paths);
+        files = paths.count;
+        var n = 0;
+        for k in 0..paths.count {
+            let b = buf_new();
+            if !read_file_if(paths.data[k] as *u8, b) {
+                continue;
+            }
+            let t = buf_slice(b);
+            var i = 0;
+            while i < t.len {
+                var e = i;
+                while e < t.len && t[e] != '\n' {
+                    e += 1;
+                }
+                if marker(t[i..e], '<') {
+                    n += 1;
+                }
+                i = e + 1;
+            }
+        }
+        n
+    }
+}
+
+// `volec edit resolve TARGET --ours|--theirs|--both|--base [--all]
+// [--in FILE]` (or `< TEXT`): the exit status (the diagnostics are
+// written by run_edit).
+pub fn run_resolve(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        var side = 'x';
+        var all = false;
+        var in_file = 0 as *u8;
+        var root = 0 as *u8;
+        var target = 0 as *u8;
+        var target_at = 0;
+        var i = 3;
+        while i < argc {
+            let a = argv[i];
+            let s = if streq(a, c"--ours") { 'o' } else if streq(a, c"--theirs") { 't' }
+                else if streq(a, c"--both") { 'b' } else if streq(a, c"--base") { 'a' }
+                else { 'x' };
+            if s != 'x' {
+                if side != 'x' {
+                    return usage(c"one of --ours, --theirs, --both, --base (or the text on stdin)");
+                }
+                side = s;
+            } else if streq(a, c"--all") {
+                all = true;
+            } else if streq(a, c"--in") && i + 1 < argc {
+                in_file = argv[i + 1];
+                i += 1;
+            } else if take_edit_option(argc, argv, &i, &root) {
+            } else if a[0] == '-' && a[1] == '-' {
+                let d = diag(c"error", c"edit.usage");
+                buf_str(d, c"unknown option '");
+                buf_str(d, a);
+                buf_str(d, c"' of edit resolve\n");
+                return usage(
+                    c"edit resolve TARGET --ours|--theirs|--both|--base [--all] [--in FILE]");
+            } else if target == 0 as *u8 {
+                target = a;
+                target_at = i;
+            } else {
+                return usage(c"one TARGET at a time (FILE:LINE, FILE or an item's NAME)");
+            }
+            i += 1;
+        }
+        if target == 0 as *u8 {
+            return usage(c"a TARGET is needed (FILE:LINE, FILE or an item's NAME)");
+        }
+        ROOT_GIVEN = root;
+        let text = buf_new();
+        if side == 'x' && (!read_stdin(text) || BUFS[text].len == 0) {
+            let d = diag(c"error", c"edit.no-text");
+            buf_str(d, c"no side (--ours, --theirs, --both, --base), and no text on stdin\n");
+            let out = try_start();
+            buf_str(out, c" edit resolve");
+            put_cword(out, target);
+            buf_str(out, c" --ours");
+            put_root(out);
+            try_end(out);
+            return 2;
+        }
+        // The regions.
+        var sel = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let t = file_target(target, &sel);
+        if t == 2 {
+            return 1;
+        }
+        let by_name = t == 1;
+        if by_name {
+            if in_file != 0 as *u8 {
+                if read_source(in_file) < 0 {
+                    return 1;
+                }
+            } else if !read_dir(default_dir()) {
+                return 1;
+            }
+            for r in 0..R_FILE.count {
+                if names_item(r, c_slice(target)) {
+                    sel.push(r);
+                }
+            }
+        }
+        if sel.count == 0 {
+            let d = diag(c"error", c"conflict.none");
+            if by_name {
+                buf_str(d, c"no conflict region in an item '");
+            } else {
+                buf_str(d, c"no conflict markers in '");
+            }
+            buf_str(d, target);
+            buf_str(d, c"'\n");
+            let out = try_start();
+            buf_str(out, c" query conflicts");
+            put_root(out);
+            try_end(out);
+            return 1;
+        }
+        if sel.count > 1 && !all {
+            let d = diag(c"error", c"conflict.ambiguous");
+            buf_int(d, sel.count);
+            buf_str(d, c" conflict regions match '");
+            buf_str(d, target);
+            buf_str(d, c"': ");
+            for k in 0..sel.count {
+                let r = sel.data[k];
+                if k > 0 {
+                    buf_str(d, c", ");
+                }
+                buf_bytes(d, path_of(R_FILE.data[r]));
+                buf_byte(d, ':');
+                buf_int(d, R_START.data[r]);
+            }
+            buf_str(d, c"; give FILE:LINE, or --all for every one\n");
+            var k = 0;
+            while k < sel.count && k < 3 {
+                try_region(argc, argv, target_at, sel.data[k], side == 'x');
+                k += 1;
+            }
+            return 1;
+        }
+        if side == 'a' {
+            for k in 0..sel.count {
+                let r = sel.data[k];
+                if R_BASE.data[r] < 0 {
+                    let d = diag(c"error", c"conflict.no-base");
+                    buf_bytes(d, path_of(R_FILE.data[r]));
+                    buf_byte(d, ':');
+                    buf_int(d, R_START.data[r]);
+                    buf_str(d,
+                        c" has no base side (git writes it with merge.conflictStyle diff3)\n");
+                    let out = try_start();
+                    buf_str(out, c" query conflicts");
+                    let w = buf_new();
+                    buf_bytes(w, path_of(R_FILE.data[r]));
+                    buf_byte(w, ':');
+                    buf_int(w, R_START.data[r]);
+                    put_word(out, buf_slice(w));
+                    buf_str(out, c" --show");
+                    try_end(out);
+                    return 1;
+                }
+            }
+        }
+        // (in the order of the files and their lines)
+        let v = sel.data;
+        for k in 1..sel.count {
+            var j = k;
+            while j > 0 && v[j] < v[j - 1] {
+                let x = v[j];
+                v[j] = v[j - 1];
+                v[j - 1] = x;
+                j -= 1;
+            }
+        }
+        // The new texts, file by file; what --show prints.
+        var paths = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var befores = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var afters = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let shown = buf_new();
+        let diff = buf_new();
+        var k = 0;
+        while k < sel.count {
+            let f = R_FILE.data[sel.data[k]];
+            let old = buf_slice(F_TEXT.data[f]);
+            let new = buf_new();
+            var cur = 0;
+            var delta = 0;
+            while k < sel.count && R_FILE.data[sel.data[k]] == f {
+                let r = sel.data[k];
+                let s = R_START.data[r];
+                buf_bytes(new, old[cur..line_pos(f, s)]);
+                let at = BUFS[new].len;
+                let n = put_resolved(new, r, side, text);
+                buf_str(shown, c"// ");
+                buf_bytes(shown, path_of(f));
+                buf_byte(shown, ':');
+                buf_int(shown, s + delta);
+                if n == 0 {
+                    buf_str(shown, c": the region removed\n");
+                } else {
+                    if n > 1 {
+                        buf_byte(shown, '-');
+                        buf_int(shown, s + delta + n - 1);
+                    }
+                    buf_byte(shown, '\n');
+                    let nt = buf_slice(new);
+                    var p = at;
+                    var ln = s + delta;
+                    while p < nt.len {
+                        var e = p;
+                        while e < nt.len && nt[e] != '\n' {
+                            e += 1;
+                        }
+                        buf_int(shown, ln);
+                        buf_byte(shown, '\t');
+                        buf_bytes(shown, nt[p..e]);
+                        buf_byte(shown, '\n');
+                        ln += 1;
+                        p = e + 1;
+                    }
+                }
+                delta += n - (R_END.data[r] - s + 1);
+                cur = line_pos(f, R_END.data[r] + 1);
+                k += 1;
+            }
+            buf_bytes(new, old[cur..old.len]);
+            diff_texts(diff, path_of(f), old, buf_slice(new));
+            paths.push(F_PATH.data[f]);
+            befores.push(F_TEXT.data[f]);
+            afters.push(new);
+        }
+        // Lines added and removed, from the diff.
+        var added = 0;
+        var removed = 0;
+        let d = buf_slice(diff);
+        var p = 0;
+        while p < d.len {
+            var e = p;
+            while e < d.len && d[e] != '\n' {
+                e += 1;
+            }
+            if e > p && d[p] == '+' && !(e - p >= 3 && d[p + 1] == '+' && d[p + 2] == '+') {
+                added += 1;
+            }
+            if e > p && d[p] == '-' && !(e - p >= 3 && d[p + 1] == '-' && d[p + 2] == '-') {
+                removed += 1;
+            }
+            p = e + 1;
+        }
+        if DRY_RUN {
+            buf_write_fd(diff, STDOUT);
+            return 0;
+        }
+        // Written: the copies, then renamed onto the files.
+        for j in 0..paths.count {
+            let path = paths.data[j] as *u8;
+            if !write_file_if(copy_path(path), buf_slice(afters.data[j])) {
+                for x in 0..j + 1 {
+                    remove_file(copy_path(paths.data[x] as *u8));
+                }
+                let e = diag(c"error", c"edit.write");
+                buf_str(e, c"cannot write '");
+                buf_str(e, path);
+                buf_str(e, c"'\n");
+                return 1;
+            }
+        }
+        let summary = buf_new();
+        buf_str(summary, c"resolved ");
+        if sel.count == 1 {
+            let r = sel.data[0];
+            buf_bytes(summary, path_of(R_FILE.data[r]));
+            buf_byte(summary, ':');
+            buf_int(summary, R_START.data[r]);
+            buf_byte(summary, '-');
+            buf_int(summary, R_END.data[r]);
+        } else {
+            buf_int(summary, sel.count);
+            buf_str(summary, c" conflicts");
+        }
+        buf_str(summary, c" (");
+        buf_str(summary, side_name(side));
+        buf_str(summary, c")\t");
+        if paths.count == 1 {
+            buf_str(summary, paths.data[0] as *u8);
+        } else {
+            buf_int(summary, paths.count);
+            buf_str(summary, c" files");
+        }
+        buf_str(summary, c"\t+");
+        buf_int(summary, added);
+        buf_str(summary, c" -");
+        buf_int(summary, removed);
+        buf_str(summary, c" lines");
+        let root_path = find_root(ROOT_GIVEN);
+        journal_texts(if root_path != 0 as *u8 { root_path } else { paths.data[0] as *u8 }, paths,
+            befores, afters, buf_slice(summary));
+        var ok = true;
+        for j in 0..paths.count {
+            let path = paths.data[j] as *u8;
+            if !rename_file(copy_path(path), path) {
+                ok = false;
+                let e = diag(c"error", c"edit.write");
+                buf_str(e, c"cannot write '");
+                buf_str(e, path);
+                buf_str(e, c"'\n");
+            }
+        }
+        buf_byte(summary, '\n');
+        if SHOW {
+            buf_bytes(summary, buf_slice(shown));
+        }
+        buf_write_fd(summary, STDOUT);
+        // What is left: other regions, else the program's errors.
+        var files = 0;
+        let left = regions_left(&files);
+        if left > 0 {
+            let n = diag(c"note", c"conflict.left");
+            buf_int(n, left);
+            buf_str(n,
+                if left == 1 { c" conflict region left in " }
+                else { c" conflict regions left in " });
+            buf_int(n, files);
+            buf_str(n, if files == 1 { c" file\n" } else { c" files\n" });
+            let out = try_start();
+            buf_str(out, c" query conflicts");
+            put_root(out);
+            try_end(out);
+        } else if root_path != 0 as *u8 && file_exists(root_path) {
+            var args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            args.push(PROG as i64);
+            args.push(c"check" as i64);
+            args.push(c"--diagnostics=short" as i64);
+            args.push(root_path as i64);
+            args.push(0);
+            let out = buf_new();
+            let status = run_capture(args.data as **u8, out);
+            if status != 0 {
+                buf_write_fd(out, STDOUT);
+                let w = diag(c"warning", c"conflict.check");
+                buf_str(w, c"the resolved program has errors (written; the merge may need more than one side)\n");
+                let tr = try_start();
+                buf_str(tr, c" check");
+                put_root(tr);
+                try_end(tr);
+            }
+        }
+        if ok { 0 } else { 1 }
+    }
+}

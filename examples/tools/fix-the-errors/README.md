@@ -6,7 +6,7 @@ hurry, with Rust habits, and half-changed: it does not compile. Three
 files, about 130 lines, nine errors.
 
 The session gets it to build the way an agent should: every error at
-once, one line each; the mechanical ones fixed by `tachyonc fix`; the
+once, one line each; the mechanical ones fixed by `volec fix`; the
 rest fixed by name with `edit patch` and `edit apply`, each edit checked
 before it is written. Every command below is run by
 `tests/walkthrough/run.sh` on a fresh copy of this directory, and its
@@ -20,16 +20,16 @@ names, types, unsafe), which is fast, and prints every error of every
 file, one per line, `FILE:LINE:COL: error[KIND] MESSAGE | help: ...`:
 
 ```console
-$ tachyonc check
-main.tach:8:38: error[type error] 'letter' is private | help: make it public: `pub fn letter` at grades.tach:21:1 | try: tachyonc fix --suggested main.tach
-main.tach:9:14: error[type error] unresolved import 'roster::add_score'
-main.tach:16:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.tach:17)
-main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.tach:17)
-main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.tach:17)
-main.tach:31:19: error[type error] undefined variable 'I64_MIN' | help: add `use std::I64_MIN;` | try: tachyonc fix --suggested main.tach
-grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: tachyonc fix --suggested main.tach
-grades.tach:39:17: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: tachyonc fix --only unsafe main.tach
-roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `var count`
+$ volec check
+main.vl:8:38: error[type error] 'letter' is private | help: make it public: `pub fn letter` at grades.vl:21:1 | try: volec fix --suggested main.vl
+main.vl:9:14: error[type error] unresolved import 'roster::add_score'
+main.vl:16:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+main.vl:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+main.vl:31:19: error[type error] undefined variable 'I64_MIN' | help: add `use std::I64_MIN;` | try: volec fix --suggested main.vl
+grades.vl:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl
+grades.vl:39:17: error[unsafe] calling a C function is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: volec fix --only unsafe main.vl
+roster.vl:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `var count`
 [exit 1]
 ```
 
@@ -38,46 +38,46 @@ Most say what to do, in their `help:`. A `KIND` (`type error`,
 `explain`:
 
 ```console
-$ tachyonc explain unsafe
+$ volec explain unsafe
 unsafe: error (compiler)
 An unsafe operation (a raw pointer's dereference or indexing, a C call, a union field) outside unsafe code.
-fix: Put it in an `unsafe { }` block, or the function in `unsafe fn`; the try: line, `tachyonc fix --only unsafe ROOT`, wraps every such place (the check hook prints it once, with how many errors it answers). Through a `*T` parameter (raw since 0.18.1, V4; until then a non-`mut` one was a borrow, `&mut T`): make it `&T`, or `&mut T` when written through, with `tachyonc fix --values ROOT` (every such parameter and its calls), then `fix --only unsafe` for what it keeps raw (indexed, compared, cast, stored, given to C).
+fix: Put it in an `unsafe { }` block, or the function in `unsafe fn`; the try: line, `volec fix --only unsafe ROOT`, wraps every such place (the check hook prints it once, with how many errors it answers). Through a `*T` parameter (raw since 0.18.1, V4; until then a non-`mut` one was a borrow, `&mut T`): make it `&T`, or `&mut T` when written through, with `volec fix --values ROOT` (every such parameter and its calls), then `fix --only unsafe` for what it keeps raw (indexed, compared, cast, stored, given to C).
 example:
-    main.tach:39:13: error[unsafe] dereference of a raw pointer is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: tachyonc fix --only unsafe main.tach
+    main.vl:39:13: error[unsafe] dereference of a raw pointer is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: volec fix --only unsafe main.vl
 ```
 
 ## 2. The mechanical ones: `fix`
 
 A missing `use` line, an item that must become `pub`, a C call outside
 `unsafe`: these have exactly one fix, and `fix` makes them all in one
-edit. (An error whose `try:` is `tachyonc fix --suggested` has an exact
+edit. (An error whose `try:` is `volec fix --suggested` has an exact
 fix the compiler knows, `totl` for `total` too: `fix --suggested` makes
 those, then prints the errors left; `totl` is fixed by hand below, to
 show `edit patch`.) `--dry-run` shows the diff first:
 
 ```console
-$ tachyonc fix --dry-run
---- a/main.tach
-+++ b/main.tach
+$ volec fix --dry-run
+--- a/main.vl
++++ b/main.vl
 @@ -9,0 +10 @@
 +use std::I64_MIN;
---- a/grades.tach
-+++ b/grades.tach
+--- a/grades.vl
++++ b/grades.vl
 @@ -21 +21 @@
 -fn letter(avg: i64) -> u8 {
 +pub fn letter(avg: i64) -> u8 {
 @@ -39 +39 @@
 -        let d = abs((scores[i] - scores[i - 1]) as i32) as i64;
 +        let d = unsafe { abs((scores[i] - scores[i - 1]) as i32) as i64 };
-$ tachyonc fix
+$ volec fix
 fixed 1 missing import, 1 pub, 1 unsafe block	2 files	+3 -2 lines
-$ tachyonc check
-main.tach:9:14: error[type error] unresolved import 'roster::add_score'
-main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.tach:17)
-main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.tach:17)
-main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.tach:17)
-grades.tach:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: tachyonc fix --suggested main.tach
-roster.tach:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `var count`
+$ volec check
+main.vl:9:14: error[type error] unresolved import 'roster::add_score'
+main.vl:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+main.vl:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+grades.vl:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl
+roster.vl:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `var count`
 [exit 1]
 ```
 
@@ -86,8 +86,8 @@ roster.tach:26:13: error[type error] cannot assign to immutable variable 'count'
 The item at an error's position is `query show FILE:LINE`:
 
 ```console
-$ tachyonc query show roster.tach:26
-// crate::roster::with_scores	roster.tach:21-30
+$ volec query show roster.vl:26
+// crate::roster::with_scores	roster.vl:21-30
 // How many students have at least `n` scores.
 pub fn with_scores(r: Roster, n: i64) -> i64 {
     let count = 0;
@@ -99,16 +99,16 @@ pub fn with_scores(r: Roster, n: i64) -> i64 {
     count
 }
 warning query.program-errors: 6 errors in the program; results may be incomplete
-try: tachyonc --diagnostics=short main.tach -c -o /dev/null
+try: volec --diagnostics=short main.vl -c -o /dev/null
 ```
 
 `edit patch` changes text inside one item, named by name or by a
 `FILE:LINE` inside it; OLD must occur exactly once in that item:
 
 ```console
-$ tachyonc edit patch roster.tach:26 --old 'let count' --new 'var count' --show
-patched crate::roster::with_scores	roster.tach	+1 -1 lines
-// roster.tach:23
+$ volec edit patch roster.vl:26 --old 'let count' --new 'var count' --show
+patched crate::roster::with_scores	roster.vl	+1 -1 lines
+// roster.vl:23
 23	    var count = 0;
 ```
 
@@ -117,13 +117,13 @@ and a `try:` command built from it. Here it shows that the source
 writes the field, `scores.len` (a slice has both, `.len` and `.len()`):
 
 ```console
-$ tachyonc edit patch grades.tach:18 --old 'totl / scores.len()' --new 'total / scores.len()'
+$ volec edit patch grades.vl:18 --old 'totl / scores.len()' --new 'total / scores.len()'
 error patch.no-match: OLD 1 is not in crate::grades::average; nearest, line 18: totl / scores.len
-try: tachyonc edit patch grades.tach:18 --old 'totl / scores.len' --new 'total / scores.len()'
+try: volec edit patch grades.vl:18 --old 'totl / scores.len' --new 'total / scores.len()'
 [exit 1]
-$ tachyonc edit patch grades.tach:18 --old 'totl' --new 'total' --show
-patched crate::grades::average	grades.tach	+1 -1 lines
-// grades.tach:18
+$ volec edit patch grades.vl:18 --old 'totl' --new 'total' --show
+patched crate::grades::average	grades.vl	+1 -1 lines
+// grades.vl:18
 18	    total / scores.len
 ```
 
@@ -134,20 +134,20 @@ What is left is one change seen from two sides: `main` calls
 two-argument `enrol` and no `add_score`.
 
 ```console
-$ tachyonc check
-main.tach:9:14: error[type error] unresolved import 'roster::add_score'
-main.tach:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.tach:17)
-main.tach:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.tach:17)
-main.tach:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.tach:17)
+$ volec check
+main.vl:9:14: error[type error] unresolved import 'roster::add_score'
+main.vl:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+main.vl:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
 [exit 1]
-$ tachyonc query show roster::enrol
-// crate::roster::enrol	roster.tach:16-19	effects: alloc(Gpa) panic
+$ volec query show roster::enrol
+// crate::roster::enrol	roster.vl:16-19	effects: alloc(Gpa) panic
 // A student with no scores yet.
 pub fn enrol(r: inout Roster, name: [u8]) {
     r.students.push(Student { name: name, scores: Vec::new_in(r.students.allocator()) });
 }
 warning query.program-errors: 4 errors in the program; results may be incomplete
-try: tachyonc --diagnostics=short main.tach -c -o /dev/null
+try: volec --diagnostics=short main.vl -c -o /dev/null
 ```
 
 `edit apply` takes the new text of several items as blocks: `@@ NAME`
@@ -157,7 +157,7 @@ together, undone together. (The output of `query show A B`, edited, is
 a valid input.)
 
 ```console
-$ tachyonc edit apply --show <<'EOF'
+$ volec edit apply --show <<'EOF'
 > @@ roster::enrol
 > // A student and their scores so far.
 > pub fn enrol(r: inout Roster, name: [u8], scores: [i64]) {
@@ -177,8 +177,8 @@ $ tachyonc edit apply --show <<'EOF'
 >     false
 > }
 > EOF
-applied 2 blocks: replaced crate::roster::enrol; inserted after crate::roster::enrol	roster.tach	+16 -3 lines
-// roster.tach:16-31
+applied 2 blocks: replaced crate::roster::enrol; inserted after crate::roster::enrol	roster.vl	+16 -3 lines
+// roster.vl:16-31
 16	// A student and their scores so far.
 17	pub fn enrol(r: inout Roster, name: [u8], scores: [i64]) {
 18	    var v: Vec<i64> = Vec::new_in(r.students.allocator());
@@ -200,19 +200,19 @@ applied 2 blocks: replaced crate::roster::enrol; inserted after crate::roster::e
 ## 5. It builds
 
 ```console
-$ tachyonc check && echo no errors
+$ volec check && echo no errors
 no errors
-ok: 0 errors in main.tach
-$ tachyonc main.tach -o gradebook && ./gradebook
+ok: 0 errors in main.vl
+$ volec main.vl -o gradebook && ./gradebook
 Ada     95 A  swing  6, with honours
 Brook   75 C  swing 21
 Cyd     64 D  swing 17
 best: Ada (95); 3 students have 3 scores or more
 ok: built gradebook
 $ git diff --stat
- grades.tach |  6 +++---
- main.tach   |  1 +
- roster.tach | 21 +++++++++++++++++----
+ grades.vl |  6 +++---
+ main.vl   |  1 +
+ roster.vl | 21 +++++++++++++++++----
  3 files changed, 21 insertions(+), 7 deletions(-)
 ```
 

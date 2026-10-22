@@ -2,7 +2,7 @@
  * 100k: the i-th random key inserted, then the key inserted 100k
  * operations before removed. A hand-written table: linear probing, load
  * at most 1/2, removal by backward shifting (no tombstones), the same
- * hash as tachyon's FixedState. */
+ * hash as vole's FixedState. */
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>

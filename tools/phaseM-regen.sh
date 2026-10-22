@@ -7,7 +7,7 @@
 #
 # usage: tools/phaseM-regen.sh [-c COMPILER] [--accept-held] [--base REV]
 #
-#   -c COMPILER     the tachyonc binary (default: target/tachyonc)
+#   -c COMPILER     the volec binary (default: target/volec)
 #   --accept-held   keep what -u wrote into the HELD files too
 #   --base REV      the originals to review against (default: bde11a83,
 #                   the corpus before any migration)
@@ -28,7 +28,7 @@ LC_ALL=C
 export LC_ALL
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 ACCEPT=0
 BASE=bde11a83
 while [ $# -gt 0 ]; do

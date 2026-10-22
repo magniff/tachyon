@@ -1,0 +1,197 @@
+// `volec fix --only std015` (0.15): a program written against 0.14's
+// std moved to 0.15's I/O API, where failure is a Result with a typed
+// error (docs/design/errors-formatting.md, "Error and I/O convention").
+// Each call of the four functions whose result changed type gets the
+// method that gives back the old value, exactly:
+//
+//   std::parse_int(s)         Option<i64>  ->  parse_int(s).ok()
+//   std::Scanner::next_int()  Option<i64>  ->  sc.next_int().ok()
+//   std::read_line(b)         bool         ->  read_line(b).unwrap_or(false)
+//   std::read_stdin()         Buf          ->  read_stdin().unwrap()
+//
+// (exact but for read_stdin on a read error, which 0.14 read as empty
+// input). The calls are the ones the checker resolved to std's functions
+// (a function of the program named parse_int is not one), as written,
+// in generic functions' instances too. A call whose value is already
+// handled as a Result is left as it is, so a second run finds nothing to
+// do: the operand of `?`; the receiver of `ok`, `err`, `map_err`,
+// `is_ok`, `is_err`, `unwrap`, `unwrap_or`, `expect`, `unwrap_or_else`
+// with a closure of one parameter (and, for read_line and read_stdin,
+// whose old types had no such methods, of any method of Result); the
+// scrutinee of a `match` or `if let` with an `Ok` or `Err` pattern; the
+// value of a `let` whose type is written `Result<...>`.
+
+use crate::base::{FILES, SRC, SYMS, buf_new, buf_str, intern_c};
+use crate::front::ast::{NODES, NODE_COUNT, NodeKind, PARSED_COUNT};
+use crate::front::modules::file_of_pos;
+use crate::front::types::FNS;
+use crate::middle::lower::ssa::HMap;
+use crate::tools::edit::edit_replace;
+use crate::tools::query::defs::{DEFS, bytes_eq, def_of_node};
+use crate::tools::query::refs::ref_in;
+use crate::tools::rewrite::parsed::{pa, pb, pc, pchild, pcount, pend, pk, pstart};
+
+// The functions, by what the fix appends.
+const S_OK: i64 = 1;
+const S_FALSE: i64 = 2;
+const S_UNWRAP: i64 = 3;
+
+// Which of the four std function node f is (S_*), or 0.
+fn std_function(f: i64) -> i64 {
+    unsafe {
+        let d = def_of_node(f);
+        if d < 0 || DEFS[d].fqn <= 0 {
+            return 0;
+        }
+        let p = SYMS[DEFS[d].fqn].text;
+        if bytes_eq(p, "std::parse_int") || bytes_eq(p, "std::Scanner::next_int") {
+            S_OK
+        } else if bytes_eq(p, "std::read_line") || bytes_eq(p, "std::io::read_line") {
+            S_FALSE
+        } else if bytes_eq(p, "std::read_stdin") {
+            S_UNWRAP
+        } else {
+            0
+        }
+    }
+}
+
+fn span_key(start: i64, end: i64) -> i64 {
+    start * 65536 + (end - start) % 65536 + 1
+}
+
+// Whether pattern p names the variant Ok or Err (in an or-pattern too).
+fn result_pattern(p: i64, ok: i64, err: i64) -> bool {
+    if p <= 0 {
+        return false;
+    }
+    let k = pk(p);
+    if k == NodeKind::PatVariant {
+        return pb(p) == ok || pb(p) == err;
+    }
+    if k == NodeKind::PatOr {
+        for i in 0..pcount(p) {
+            if result_pattern(pchild(p, i), ok, err) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// Whether method `name` of a receiver that is the call's value says the
+// value is already a Result (kind: S_*; m: the MethodCall).
+fn result_method(name: i64, kind: i64, m: i64) -> bool {
+    unsafe {
+        let text = SYMS[name].text;
+        if bytes_eq(text, "ok") || bytes_eq(text, "err") || bytes_eq(text, "map_err")
+            || bytes_eq(text, "is_ok") || bytes_eq(text, "is_err") {
+            return true;
+        }
+        if kind != S_OK {
+            // (bool and Buf had none of Result's methods)
+            return bytes_eq(text, "unwrap") || bytes_eq(text, "unwrap_or")
+                || bytes_eq(text, "unwrap_or_else") || bytes_eq(text, "expect")
+                || bytes_eq(text, "map") || bytes_eq(text, "and_then");
+        }
+        // (the same on Option and Result: nothing to change)
+        if bytes_eq(text, "unwrap") || bytes_eq(text, "unwrap_or") || bytes_eq(text, "expect") {
+            return true;
+        }
+        if bytes_eq(text, "unwrap_or_else") && pcount(m) == 1 {
+            let f = pchild(m, 0);
+            return pk(f) == NodeKind::Closure && pcount(f) == 1;
+        }
+        false
+    }
+}
+
+// Whether type node t is written `Result<...>` (or `std::Result<...>`).
+fn result_type(t: i64) -> bool {
+    unsafe {
+        if t <= 0 {
+            return false;
+        }
+        let s = pstart(t);
+        let text = SRC[s..pend(t)];
+        (text.len >= 7 && bytes_eq(text[0..7], "Result<"))
+            || (text.len >= 12 && bytes_eq(text[0..12], "std::Result<"))
+    }
+}
+
+// The edits of `fix --only std015`; their number.
+pub fn std015_edits() -> i64 {
+    unsafe {
+        // The calls as written (Call and MethodCall nodes), by their span.
+        var written = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        // What holds each node's value: a MethodCall it is the receiver
+        // of, a Try, a Match it is the scrutinee of, a Let it is the
+        // value of.
+        var holder = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for n in 1..PARSED_COUNT {
+            let k = pk(n);
+            if k == NodeKind::Call || k == NodeKind::MethodCall {
+                written.put(span_key(pstart(n), pend(n)), n);
+            }
+            if (k == NodeKind::MethodCall || k == NodeKind::Try || k == NodeKind::Match)
+                && pa(n) > 0 {
+                holder.put(pa(n), n);
+            } else if k == NodeKind::Let && pc(n) > 0 {
+                holder.put(pc(n), n);
+            }
+        }
+        let ok = intern_c(c"Ok");
+        let err = intern_c(c"Err");
+        var done = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        var fixes = 0;
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind != NodeKind::Call || NODES[n].x <= 0 {
+                continue;
+            }
+            let kind = std_function(FNS[NODES[n].x - 1].node);
+            if kind == 0 {
+                continue;
+            }
+            let o = written.get(span_key(NODES[n].start, NODES[n].end));
+            if o <= 0 || done.get(o) != 0 {
+                continue;
+            }
+            done.put(o, 1);
+            if FILES[file_of_pos(pstart(o))].path[0] == '<' || !ref_in(pstart(o)) {
+                continue;
+            }
+            let h = holder.get(o);
+            if h > 0 {
+                let hk = pk(h);
+                if hk == NodeKind::Try {
+                    continue;
+                }
+                if hk == NodeKind::MethodCall && result_method(pb(h), kind, h) {
+                    continue;
+                }
+                if hk == NodeKind::Let && result_type(pb(h)) {
+                    continue;
+                }
+                if hk == NodeKind::Match {
+                    var handled = false;
+                    for i in 0..pcount(h) {
+                        if result_pattern(pa(pchild(h, i)), ok, err) {
+                            handled = true;
+                        }
+                    }
+                    if handled {
+                        continue;
+                    }
+                }
+            }
+            let text = buf_new();
+            buf_str(text, if kind == S_OK { c".ok()" }
+                else if kind == S_FALSE { c".unwrap_or(false)" } else { c".unwrap()" });
+            let at = pend(o);
+            if edit_replace(at, at, text) {
+                fixes += 1;
+            }
+        }
+        fixes
+    }
+}

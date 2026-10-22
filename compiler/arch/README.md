@@ -11,7 +11,7 @@ docs/design/arch.md (§2.1, and §7.2 for who adds what).
 | `x86_64.def` | `std::arch::x86_64`: Intel's names |
 | `insn_a64.def` | the AArch64 instructions the compiler's assembler reads from here |
 | `insn_x86.def` | the x86-64 instructions the same |
-| `embed.sh` | writes them into `compiler/src/arch/tables.tach` |
+| `embed.sh` | writes them into `compiler/src/arch/tables.vl` |
 
 Run `compiler/arch/embed.sh` after changing a `.def` file;
 `tests/run.sh` fails while the generated file is stale. Lines starting
@@ -28,12 +28,12 @@ internal error of the compiler on the first program that names
 |---|---|---|
 | name | the vendor's name, unique over the three tables | `vqsubq_u8`, `_mm_movemask_epi8` |
 | features | the target features it needs, comma-separated (the table's architecture's names); `-` none | `neon`, `crc`, `sse4.2` |
-| signature | `(PARAM: TYPE, ...) -> TYPE`, without `->` for none. Types are tachyon's, the vendor aliases of the same module (`uint8x16_t`, `__m128i`), or a slice `[u8]` with an `i64` index for a memory form. An immediate is `NAME: const LO..=HI`: an argument that must be a constant in that range (`arch.const_arg`), passed as an `i64` | `(a: uint8x16_t, n: const 0..=15) -> uint8x16_t` |
-| form | how lowering makes it (`middle/lower/arch.tach`): `intr` (`Op::Intr`, the instruction), `intr.mem` (0.19: vld2q/vst2q, two vector loads and the uzp1/uzp2 permutes, or zip1/zip2 and two stores; the instruction at -O0; `<u>`, `<t>` are the pair v30, v31), `load`, `store` (a checked `Load`/`Store` of the vector), `cast` (no instruction), `vbin.OP` (add sub mul div and or xor), `vcmp.C` (eq gt ge lt le), `vsplat`, `vext`, `vneg`, `vins` (x, v, lane), `vsel` (the bitwise select of mask a, b, c), `vsum` (the wrapping sum of the lanes): 0.10's vector operations, where the intrinsic is exactly one (-O0 writes its instruction); `load.dup` (one checked element, splat: `ld1r`); `bits.K` (ones leading trailing), `feat.has`, `feat.detect`, `hint`. `:TYPE` after a generic form: the type it computes in when the signature's are others | `intr`, `vcmp.eq:v16i8` |
+| signature | `(PARAM: TYPE, ...) -> TYPE`, without `->` for none. Types are vole's, the vendor aliases of the same module (`uint8x16_t`, `__m128i`), or a slice `[u8]` with an `i64` index for a memory form. An immediate is `NAME: const LO..=HI`: an argument that must be a constant in that range (`arch.const_arg`), passed as an `i64` | `(a: uint8x16_t, n: const 0..=15) -> uint8x16_t` |
+| form | how lowering makes it (`middle/lower/arch.vl`): `intr` (`Op::Intr`, the instruction), `intr.mem` (0.19: vld2q/vst2q, two vector loads and the uzp1/uzp2 permutes, or zip1/zip2 and two stores; the instruction at -O0; `<u>`, `<t>` are the pair v30, v31), `load`, `store` (a checked `Load`/`Store` of the vector), `cast` (no instruction), `vbin.OP` (add sub mul div and or xor), `vcmp.C` (eq gt ge lt le), `vsplat`, `vext`, `vneg`, `vins` (x, v, lane), `vsel` (the bitwise select of mask a, b, c), `vsum` (the wrapping sum of the lanes): 0.10's vector operations, where the intrinsic is exactly one (-O0 writes its instruction); `load.dup` (one checked element, splat: `ld1r`); `bits.K` (ones leading trailing), `feat.has`, `feat.detect`, `hint`. `:TYPE` after a generic form: the type it computes in when the signature's are others | `intr`, `vcmp.eq:v16i8` |
 | instruction | its assembly template (below); `-` none | `uqsub <d>.16b, <a>.16b, <b>.16b` |
 | flags | `pure`, `commutative`, `tied=PARAM` (the instruction overwrites that parameter's register: the result starts as a copy of it); `-` none | `pure tied=a` |
 | memory | `none`, `load(SLICE, BYTES)`, `store(SLICE, BYTES)` (SLICE's parameter is followed by the index; checked `0 <= i`, `i + BYTES / elem <= len`), `raw` (a pointer form: unsafe) | `load(s, 16)` |
-| fold | the constant folder's family (T6, `middle/fold/arch.tach`); `-` none | `lanes.qsub_u`, `perm.tbl` |
+| fold | the constant folder's family (T6, `middle/fold/arch.vl`); `-` none | `lanes.qsub_u`, `perm.tbl` |
 | semantics | one line of what it computes, lane `k` of result `r`: the reference `tests/arch/gen.sh` tests against (below, "Semantics") | `r[k] = max(a[k] - b[k], 0)` |
 | equivalent | the other architecture's equivalent or recipe (`query arch --equiv`) | `x86_64: _mm_subs_epu8` |
 | doc | one line for `query show` and the guide | `lanewise a - b, saturating at 0` |
@@ -43,8 +43,8 @@ The effects come from the memory column: none for a register intrinsic,
 
 ### Instruction templates
 
-The assembly the machine layers write (`back/mc_arm64/arch.tach`,
-`back/mc_x86_64/arch.tach`, and -O0's `gen0/gen/arch.tach` with fixed
+The assembly the machine layers write (`back/mc_arm64/arch.vl`,
+`back/mc_x86_64/arch.vl`, and -O0's `gen0/gen/arch.vl` with fixed
 registers), AT&T syntax on x86-64. Placeholders in angle brackets:
 
 | placeholder | is |
@@ -72,7 +72,7 @@ intrinsic is tested against, when it is one of:
 | `S[I] = E` | a store into slice parameter S, for each lane k | `s[i + k] = v[k]` |
 | `X[A..B]` | the elements from A: `r = s[i..i + 16]` is `r[k] = s[i + k]`, `s[i..i + 16] = v` is `s[i + k] = v[k]` | |
 
-E is a tachyon expression naming only the parameters, `k`, `if`/`else`,
+E is a vole expression naming only the parameters, `k`, `if`/`else`,
 `as`, integer and float literals, the lane types and `max`, `min`,
 `abs`, `clamp`. A vector parameter is its lanes, indexed by `k` (`a[k]`,
 or any lane: `t[idx[k]]`); a tuple's lanes follow each other. Integers
@@ -85,14 +85,14 @@ parenthesized note is a comment (`(wrapping)`), except the lanes an
 opaque x86 type is read as: `(bytes)`, `(i16 lanes)`, or by name, `(a,
 b: i16 lanes; r: i8 lanes)`; `__m128i` is bytes unless it says. Any
 other text is prose: the intrinsic then needs `fn ref_NAME` in
-`tests/arch/ref/*.tach` (gen.sh's header gives its parameters), and
+`tests/arch/ref/*.vl` (gen.sh's header gives its parameters), and
 gen.sh reports one that has neither. A `cast` form is compared byte for
 byte with its operand.
 
 ## Instruction lines
 
 AArch64 (`insn_a64.def`), for the mnemonics the scalar encoder
-(`back/enc_arm64/mod.tach`) does not know:
+(`back/enc_arm64/mod.vl`) does not know:
 
     mnemonic | class | bits | syntax
 
@@ -101,7 +101,7 @@ documentation. With vector operands (and SIMD scalar ones, `d0`), the
 encoder reads this table before its own chain: a mnemonic may have
 several lines, consecutive, and the first whose class fits the operands
 encodes them (`cmeq` against `#0` is a line here, against a register the
-chain's). The classes (`back/enc_arm64/simd.tach`):
+chain's). The classes (`back/enc_arm64/simd.vl`):
 
 | class | operands | fields added |
 |---|---|---|
@@ -131,7 +131,7 @@ operation) are written by `tools/arch/a64_families.py --write`, between
 the `# ==== generated` markers of `aarch64.def` and `insn_a64.def`: change
 a family there, not its lines; lines outside the markers are kept.
 
-x86-64 (`insn_x86.def`), for the mnemonics `back/enc_x86.tach`'s own
+x86-64 (`insn_x86.def`), for the mnemonics `back/enc_x86.vl`'s own
 table lacks:
 
     mnemonic | class | prefix | map | opcode | flags

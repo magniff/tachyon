@@ -1,5 +1,5 @@
-/* (0.19 T3) A C program calling tachyon code that has no main
-   (tests/run/arch_detect_lib.tach): its detects fill std's word at the
+/* (0.19 T3) A C program calling vole code that has no main
+   (tests/run/arch_detect_lib.vl): its detects fill std's word at the
    first one. */
 #include <stdio.h>
 

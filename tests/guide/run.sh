@@ -1,29 +1,29 @@
 #!/bin/sh
-# The tests of `tachyonc guide` (0.13): the guide's examples compile and
+# The tests of `volec guide` (0.13): the guide's examples compile and
 # print what it says they print, its std section is std's API, the core
 # guide stays in its token budget, and the topics answer. POSIX sh and
 # awk only.
 #
 # usage: tests/guide/run.sh [-c COMPILER] [-j JOBS] [-f FILE]
 #
-#   -c COMPILER   the tachyonc binary (default: target/tachyonc)
+#   -c COMPILER   the volec binary (default: target/volec)
 #   -j JOBS       examples compiled at once (default 2)
 #   -f FILE       check only the code blocks of FILE (a topic's source,
 #                 compiler/guide/NAME.md), not the embedded guide
 #
-# The code blocks of every topic (`tachyonc guide NAME`), by the fence's
+# The code blocks of every topic (`volec guide NAME`), by the fence's
 # language:
 #
-#   ```tach   tachyon code, compiled with --deny-warnings: a program when
+#   ```tach   vole code, compiled with --deny-warnings: a program when
 #             it has a line starting `fn main(`; else items, when every
 #             line at column 0 starts an item (fn, struct, impl, use...),
 #             compiled with an empty main; else statements, compiled as
 #             main's body (leading `use` and `import` lines above it;
 #             0.16: main is `fn main(gpa: Gpa)`, its allocator `gpa`)
-#   ```tach NAME.tach
+#   ```tach NAME.vl
 #             (0.17) a file of a program of several modules: the blocks
 #             named so, in a row (prose between them, no other block),
-#             are written next to each other and main.tach is compiled;
+#             are written next to each other and main.vl is compiled;
 #             an in and out block after the last one are the program's
 #   ```in     right after a tach block: the program's stdin (else empty)
 #   ```out    after a tach block (and its in block): it is run, and its stdout and
@@ -42,7 +42,7 @@ export LC_ALL
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 JOBS=2
 ONLY=""
 while [ $# -gt 0 ]; do
@@ -60,7 +60,7 @@ esac
 [ -x "$COMPILER" ] || { echo "guide/run.sh: no compiler at $COMPILER" >&2; exit 2; }
 
 HOST="$(uname -s)-$(uname -m)"
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-guide.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-guide.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 STATUS=0
@@ -68,7 +68,7 @@ RESULTS="$WORK/results"
 : >"$RESULTS"
 
 # Splits the guide text $1 (topic $2) into one directory per tach block
-# under $WORK/blocks: prog.tach (wrapped as its kind needs), and, when an
+# under $WORK/blocks: prog.vl (wrapped as its kind needs), and, when an
 # out or err block follows, out (with exit) or err.
 split_blocks() {
     awk -v topic="$2" -v dir="$WORK/blocks" '
@@ -92,10 +92,10 @@ split_blocks() {
             }
             if (line == "```") {
                 infence = 0
-                if (lang ~ /^tach [a-z_][a-z0-9_]*\.tach$/) {
+                if (lang ~ /^tach [a-z_][a-z0-9_]*\.vl$/) {
                     # (0.17) a file of a program of several: the blocks
-                    # `tach NAME.tach` in a row are one program, built from
-                    # main.tach; an in or out block after them is its
+                    # `tach NAME.vl` in a row are one program, built from
+                    # main.vl; an in or out block after them is its
                     if (proj == "") {
                         n++
                         proj = dir "/" topic "-" sprintf("%05d", start)
@@ -104,7 +104,7 @@ split_blocks() {
                         close(proj "/name")
                     }
                     fname = substr(lang, 6)
-                    f = proj "/" (fname == "main.tach" ? "prog.tach" : fname)
+                    f = proj "/" (fname == "main.vl" ? "prog.vl" : fname)
                     for (i = 1; i <= nbody; i++) print b[i] > f
                     close(f)
                     pending = proj
@@ -131,7 +131,7 @@ split_blocks() {
                         for (i = 1; i <= nbody; i++)
                             if (b[i] !~ /^[ \t]/ && !item_line(b[i])) { kind = "stmts"; break }
                     }
-                    f = d "/prog.tach"
+                    f = d "/prog.vl"
                     if (kind == "program" || kind == "items") {
                         for (i = 1; i <= nbody; i++) print b[i] > f
                         if (kind == "items") print "fn main() -> i32 { 0 }" > f
@@ -184,7 +184,7 @@ check_block() {
     d=$1
     name=$(cat "$d/name")
     if [ -f "$d/err" ]; then
-        "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short "$d/prog.tach" -o "$d/prog" >"$d/compile.out" 2>&1
+        "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short "$d/prog.vl" -o "$d/prog" >"$d/compile.out" 2>&1
         rc=$?
         if [ $rc -ne 1 ]; then
             { echo "FAIL $name: expected a compile error (exit 1), got exit $rc"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
@@ -200,17 +200,17 @@ check_block() {
         echo "pass $name" >"$d/result"
         return
     fi
-    # (0.18: from its directory, as main.tach: a failed check's position
-    # reads `main.tach:LINE:COL`, as the guide shows it)
-    cp "$d/prog.tach" "$d/main.tach"
+    # (0.18: from its directory, as main.vl: a failed check's position
+    # reads `main.vl:LINE:COL`, as the guide shows it)
+    cp "$d/prog.vl" "$d/main.vl"
     # (0.22) A program of std::gpu or std::objc links libobjc and runs on
     # macOS/arm64 (Metal); elsewhere it is compiled to an object only.
     link=""
-    if grep -q 'std::gpu\|std::objc' "$d/main.tach"; then
+    if grep -q 'std::gpu\|std::objc' "$d/main.vl"; then
         if [ "$HOST" = Darwin-arm64 ]; then
             link="-l objc"
         else
-            if (cd "$d" && "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short main.tach -o prog.o) >"$d/compile.out" 2>&1; then
+            if (cd "$d" && "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short main.vl -o prog.o) >"$d/compile.out" 2>&1; then
                 echo "pass $name" >"$d/result"
             else
                 { echo "FAIL $name: does not compile"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
@@ -218,7 +218,7 @@ check_block() {
             return
         fi
     fi
-    if ! (cd "$d" && "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short main.tach $link -o prog) >"$d/compile.out" 2>&1; then
+    if ! (cd "$d" && "$COMPILER" --syntax=0.20 --deny-warnings --diagnostics=short main.vl $link -o prog) >"$d/compile.out" 2>&1; then
         { echo "FAIL $name: does not compile"; sed 's/^/    /' "$d/compile.out"; } >"$d/result"
         return
     fi
@@ -299,7 +299,7 @@ fi
 
 # The topics: --list names each one, with its size; each answers.
 if ! "$COMPILER" guide --list >"$WORK/list" 2>&1; then
-    result FAIL guide-list "tachyonc guide --list failed:" "$(cat "$WORK/list")"
+    result FAIL guide-list "volec guide --list failed:" "$(cat "$WORK/list")"
 fi
 missing=""
 for t in core language rust syntax types std errors unsafe c-interop arch modules generics traits closures iterators conversions formatting memory views tools gpu; do
@@ -317,7 +317,7 @@ while IFS= read -r t; do
         && [ ! -s "$WORK/topic-$t.err" ]; then
         split_blocks "$WORK/topic-$t.md" "$t"
     else
-        result FAIL "guide-topic-$t" "tachyonc guide $t failed:" "$(cat "$WORK/topic-$t.err")"
+        result FAIL "guide-topic-$t" "volec guide $t failed:" "$(cat "$WORK/topic-$t.err")"
     fi
 done <"$WORK/topics"
 
@@ -326,7 +326,7 @@ done <"$WORK/topics"
 # listing (`guide std`).
 "$COMPILER" guide >"$WORK/default.md" 2>&1
 if ! cmp -s "$WORK/default.md" "$WORK/topic-core.md"; then
-    result FAIL guide-default "tachyonc guide is not tachyonc guide core"
+    result FAIL guide-default "volec guide is not volec guide core"
 else
     size=$(wc -c <"$WORK/default.md" | tr -d ' ')
     if [ "$size" -gt 10240 ]; then
@@ -346,10 +346,10 @@ if [ "$(head -1 "$WORK/full.md")" = "$(head -1 "$WORK/topic-language.md")" ]; th
         && ! grep -q '@STD-API' "$WORK/full.md" "$WORK/topic-language.md"; then
         result pass guide-full
     else
-        result FAIL guide-full "tachyonc guide --full lacks std's API (or guide language has it)"
+        result FAIL guide-full "volec guide --full lacks std's API (or guide language has it)"
     fi
 else
-    result FAIL guide-full "tachyonc guide --full does not start as guide language:" "$(head -2 "$WORK/full.md")"
+    result FAIL guide-full "volec guide --full does not start as guide language:" "$(head -2 "$WORK/full.md")"
 fi
 
 # A topic that does not exist: one line, and what to run.
@@ -368,15 +368,15 @@ while IFS= read -r t; do cat "$WORK/topic-$t.md" >>"$WORK/cat.md"; done <"$WORK/
 if cmp -s "$WORK/all.md" "$WORK/cat.md"; then
     result pass guide-all
 else
-    result FAIL guide-all "tachyonc guide --all is not every topic in turn"
+    result FAIL guide-all "volec guide --all is not every topic in turn"
 fi
 
 # The std topic is std's API: every public item, as the compiler's item
 # index has it, is in its section std#every-item (without `pub`).
 mkdir -p "$WORK/std"
 "$COMPILER" guide 'std#every-item' >"$WORK/std/every.md" 2>&1
-printf 'fn main(gpa: Gpa) -> i32 {\n    let v: Vec<i64> = Vec::new_in(gpa);\n    0\n}\n' >"$WORK/std/main.tach"
-if (cd "$WORK/std" && "$COMPILER" query items std --root main.tach) >"$WORK/std/items" 2>&1; then
+printf 'fn main(gpa: Gpa) -> i32 {\n    let v: Vec<i64> = Vec::new_in(gpa);\n    0\n}\n' >"$WORK/std/main.vl"
+if (cd "$WORK/std" && "$COMPILER" query items std --root main.vl) >"$WORK/std/items" 2>&1; then
     # (0.18: the index's signatures leave std's clauses out)
     awk -F '\t' '$3 ~ /^pub / && $3 !~ /^pub mod / { s = $3; sub(/^pub /, "", s); sub(/ (debug )?(requires|ensures) .*$/, "", s); print s }' "$WORK/std/items" >"$WORK/std/want"
     : >"$WORK/std/missing"
@@ -386,7 +386,7 @@ if (cd "$WORK/std" && "$COMPILER" query items std --root main.tach) >"$WORK/std/
     if [ ! -s "$WORK/std/want" ]; then
         result FAIL guide-std "query items std listed no public item"
     elif [ -s "$WORK/std/missing" ]; then
-        result FAIL guide-std "std items missing from tachyonc guide std#every-item:" "$(head -5 "$WORK/std/missing")"
+        result FAIL guide-std "std items missing from volec guide std#every-item:" "$(head -5 "$WORK/std/missing")"
     else
         result pass guide-std
     fi
@@ -411,7 +411,7 @@ if [ "$size" -le 21000 ] && [ "$page" -le 4500 ] \
     && head -1 "$WORK/std-page.md" | grep -q '^# std$' \
     && grep -q '^## The most used$' "$WORK/std-page.md" \
     && grep -qF 'Vec::new_in(gpa) -> Vec<T>' "$WORK/std-page.md" \
-    && grep -qF 'tachyonc guide std#the-api' "$WORK/std-page.md" && grep -qF 'MinHeap::new_in(gpa)' "$WORK/std-page.md" \
+    && grep -qF 'volec guide std#the-api' "$WORK/std-page.md" && grep -qF 'MinHeap::new_in(gpa)' "$WORK/std-page.md" \
     && ! grep -q '^## Overview$' "$WORK/std-page.md" && ! grep -q '@PAGE-END@' "$WORK/std-page.md" "$WORK/topic-std.md" \
     && grep -q '^## Overview$' "$WORK/topic-std.md" && grep -qF 'fn push(inout self, x: sink T)' "$WORK/topic-std.md" \
     && grep -qF 'fn split_in<A: Allocator>(s: [u8], sep: u8, a: sink A) -> Vec<[u8], A>' "$WORK/topic-std.md" \
@@ -422,7 +422,7 @@ if [ "$size" -le 21000 ] && [ "$page" -le 4500 ] \
     && grep -q '^## Every item with its comment$' "$WORK/std/every.md"; then
     result pass guide-std-index
 else
-    result FAIL guide-std-index "tachyonc guide std --whole is $size bytes (21000 at most), its first page $page (4500 at most), or not the index (most used first, then std#the-api)"
+    result FAIL guide-std-index "volec guide std --whole is $size bytes (21000 at most), its first page $page (4500 at most), or not the index (most used first, then std#the-api)"
 fi
 
 # The guide by piece (0.15): --find prints the paragraphs about the
@@ -547,7 +547,7 @@ for c in "" edit "edit patch" refactor "refactor signature" fix fmt check undo e
 done
 result pass help
 
-# tachyonc try (0.15): a snippet run with std; its last value and type,
+# volec try (0.15): a snippet run with std; its last value and type,
 # its output, its errors at the snippet's lines, its exit code.
 try_case() { # <name> <expected output> <snippet...>
     n=$1
@@ -572,8 +572,8 @@ try_case error "snippet:2:5: error[type error] expected 'i64', got '[u8]'" 'let 
 a + "b"'
 try_case panic 'snippet:1:37: index out of bounds: index 3, length 0
 exit 101' 'let v: Vec<i64> = Vec::new_in(gpa); v.get(3)'
-printf 'struct P { x: i64 }\n\nlet p = P { x: 4 };\np.x * 10\n' >"$WORK/snip.tach"
-try_case file 'i64 = 40' --file "$WORK/snip.tach"
+printf 'struct P { x: i64 }\n\nlet p = P { x: 4 };\np.x * 10\n' >"$WORK/snip.vl"
+try_case file 'i64 = 40' --file "$WORK/snip.vl"
 got=$(printf '7\n' | "$COMPILER" try 'var b = Buf::new_in(gpa); read_line(&b).unwrap(); parse_int(b.as_slice()).ok()' 2>&1)
 if [ "$got" = 'Option<i64> = Some(7)' ]; then result pass try-stdin; else result FAIL try-stdin "$got"; fi
 "$COMPILER" try >"$WORK/try.out" 2>&1

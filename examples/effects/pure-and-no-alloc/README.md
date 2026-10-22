@@ -24,7 +24,7 @@ this directory, and its output is checked against this file;
 ## Run it
 
 ```console
-$ tachyonc main.tach -o samples && ./samples
+$ volec main.vl -o samples && ./samples
 score: 1936
 histogram: 8 0 0 1 1
 peak: Some(950), of none: None
@@ -35,7 +35,7 @@ ok: built samples
 ## What each function may do
 
 ```console
-$ tachyonc query effects crate
+$ volec query effects crate
 crate::clamp	none
 crate::scaled	none
 crate::smoothed	panic
@@ -62,13 +62,13 @@ buffer is a static).
 debugging print in `clamp`:
 
 ```console
-$ tachyonc edit patch clamp --old '    if x < lo {' --new '    println(f"clamp {x}");
+$ volec edit patch clamp --old '    if x < lo {' --new '    println(f"clamp {x}");
 >     if x < lo {'
-main.tach:36:1: error[effect] 'score' is #[pure], but it does io: 'smoothed(s, i, gain)' at main.tach:39:14 calls 'smoothed' | help: return the data and let the caller print it, or remove #[pure] | try: tachyonc query effects score --why io  [in crate::score]
+main.vl:36:1: error[effect] 'score' is #[pure], but it does io: 'smoothed(s, i, gain)' at main.vl:39:14 calls 'smoothed' | help: return the data and let the caller print it, or remove #[pure] | try: volec query effects score --why io  [in crate::score]
 error edit.breaks: 1 new error (1 in crate::score, which the edit does not change); nothing written
 note edit.together: change crate::score in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
-try: tachyonc query show crate::score
-try: tachyonc edit patch clamp --old '    if x < lo {' --new '    println(f"clamp {x}");
+try: volec query show crate::score
+try: volec edit patch clamp --old '    if x < lo {' --new '    println(f"clamp {x}");
     if x < lo {' --no-check
 [exit 1]
 ```
@@ -81,22 +81,22 @@ chain. To see it, write the change anyway (`--no-check`, as the `try:`
 line says):
 
 ```console
-$ tachyonc edit patch clamp --old '    if x < lo {' --new '    println(f"clamp {x}");
+$ volec edit patch clamp --old '    if x < lo {' --new '    println(f"clamp {x}");
 >     if x < lo {' --no-check
-main.tach:36:1: error[effect] 'score' is #[pure], but it does io: 'smoothed(s, i, gain)' at main.tach:39:14 calls 'smoothed' | help: return the data and let the caller print it, or remove #[pure] | try: tachyonc query effects score --why io  [in crate::score]
-patched crate::clamp	main.tach	+1 -0 lines
+main.vl:36:1: error[effect] 'score' is #[pure], but it does io: 'smoothed(s, i, gain)' at main.vl:39:14 calls 'smoothed' | help: return the data and let the caller print it, or remove #[pure] | try: volec query effects score --why io  [in crate::score]
+patched crate::clamp	main.vl	+1 -0 lines
 warning edit.breaks: 1 new error (1 in crate::score, which the edit does not change); written anyway (--no-check)
-try: tachyonc check
-$ tachyonc query effects score --why io | head -5
+try: volec check
+$ volec query effects score --why io | head -5
 crate::score	io global panic
-  'smoothed(s, i, gain)' at main.tach:39:14 calls 'smoothed'
-  'scaled(s[i], gain)' at main.tach:29:6 calls 'scaled'
-  'clamp(x * gain / 10, 0, 1000)' at main.tach:23:5 calls 'clamp'
-  'println(f"clamp {x}")' at main.tach:12:5 calls 'std::fmt::println'
+  'smoothed(s, i, gain)' at main.vl:39:14 calls 'smoothed'
+  'scaled(s[i], gain)' at main.vl:29:6 calls 'scaled'
+  'clamp(x * gain / 10, 0, 1000)' at main.vl:23:5 calls 'clamp'
+  'println(f"clamp {x}")' at main.vl:12:5 calls 'std::fmt::println'
 warning query.program-errors: 1 error in the program; results may be incomplete
-try: tachyonc --diagnostics=short main.tach -c -o /dev/null
-$ tachyonc undo
-undid patched crate::clamp	main.tach	+1 -0 lines
+try: volec --diagnostics=short main.vl -c -o /dev/null
+$ volec undo
+undid patched crate::clamp	main.vl	+1 -0 lines
 ```
 
 (The chain goes on inside std, down to C's `write`; `head` cuts it at
@@ -110,11 +110,11 @@ promise.
 allocated (here, an array on the stack). `outliers` would not:
 
 ```console
-$ tachyonc edit patch outliers --old 'fn outliers' --new '#[no_alloc]
+$ volec edit patch outliers --old 'fn outliers' --new '#[no_alloc]
 > fn outliers'
-main.tach:89:1: error[effect] 'outliers' is #[no_alloc], but it allocates from Gpa: 'out.push(x)' at main.tach:92:13 grows a Vec<i64> | help: allocate in the caller and pass the memory in, or remove #[no_alloc] | try: tachyonc query effects outliers --why alloc(Gpa)  [edited: crate::outliers]
+main.vl:89:1: error[effect] 'outliers' is #[no_alloc], but it allocates from Gpa: 'out.push(x)' at main.vl:92:13 grows a Vec<i64> | help: allocate in the caller and pass the memory in, or remove #[no_alloc] | try: volec query effects outliers --why alloc(Gpa)  [edited: crate::outliers]
 error edit.breaks: 1 new error; nothing written
-try: tachyonc edit patch outliers --old 'fn outliers' --new '#[no_alloc]
+try: volec edit patch outliers --old 'fn outliers' --new '#[no_alloc]
 fn outliers' --no-check
 [exit 1]
 ```
@@ -130,10 +130,10 @@ only writes.
 index instead:
 
 ```console
-$ tachyonc edit patch peak --old 'var best = s.get(0)?;' --new 'var best = s[0];'
-main.tach:74:1: error[effect] 'peak' is #[no_panic], but it may panic: 's[0]' at main.tach:75:16 is a checked index | help: iterate ('for x in s'), or 's.get(i)' (an Option), or remove #[no_panic] | try: tachyonc query effects peak --why panic  [edited: crate::peak]
+$ volec edit patch peak --old 'var best = s.get(0)?;' --new 'var best = s[0];'
+main.vl:74:1: error[effect] 'peak' is #[no_panic], but it may panic: 's[0]' at main.vl:75:16 is a checked index | help: iterate ('for x in s'), or 's.get(i)' (an Option), or remove #[no_panic] | try: volec query effects peak --why panic  [edited: crate::peak]
 error edit.breaks: 1 new error; nothing written
-try: tachyonc edit patch peak --old 'var best = s.get(0)?;' --new 'var best = s[0];' --no-check
+try: volec edit patch peak --old 'var best = s.get(0)?;' --new 'var best = s[0];' --no-check
 [exit 1]
 ```
 
@@ -158,7 +158,7 @@ that length, and `for x in s`.
 
 ## Read more
 
-- `tachyonc guide effects`: the effects, `query effects`, the
+- `volec guide effects`: the effects, `query effects`, the
   declarations (`#[no_io]` and `#[effects(...)]` too).
 - [effect-bounds](../effect-bounds/): promises asked of closures.
 - [trait-purity](../trait-purity/): std's `Hash`, `Eq` and `Ord` are

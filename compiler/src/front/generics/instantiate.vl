@@ -1,0 +1,1012 @@
+// Type arguments inferred and functions instantiated: unifying a
+// template's parameter types with the arguments' types (and the expected
+// type), the instances of generic functions (each a copy of the template's
+// AST, checked with its parameters bound), the type arguments of enum
+// variants and struct literals, and the instantiation chain errors show.
+
+use crate::base::{
+    IntVec, SYMS, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, free,
+    intern,
+};
+use crate::base::diag::{buf_position, err_begin, err_end, err_help, err_str, err_sym, err_try_fmt};
+use crate::front::assoc::{infer_from_assoc, is_projection_node};
+use crate::front::ast::{
+    NODES, NODE_REF, NodeKind, child, list_begin, list_end, list_push, new_node,
+};
+use crate::front::ast::NodeKind::{
+    Arm, Assign, AssocType, Binary, Block, Break, Call, Cast, Closure, Defer, EnumPanic, ExprStmt,
+    FieldAccess, FieldInit, Fn, For, If, Index, Let, Loop, Match, MethodCall, Param, PatLit,
+    PatRange, Range, Repeat, Return, TupleField, TyArray, TyFn, TyName, TyPtr, TySlice, TyTuple,
+    Unary, While,
+};
+use crate::front::check::{Res, SELF_TYPE, SELF_TYPE_SYM};
+use crate::front::check::args::is_default_arg;
+use crate::front::check::collect::{add_fn, template_of_type_node};
+use crate::front::check::resolve::{resolve_signature, resolve_type, type_name_key};
+use crate::front::check::synth_mode::synth_expr;
+use crate::front::check::widen::{join_int, takes_context};
+use crate::front::closures::fn_bounds::{infer_closure_arg, infer_from_fn_bound, is_deferred_arg};
+use crate::front::contracts::is_distinct;
+use crate::front::generics::{
+    CUR_INST, FN_INSTANCES, HINT_NODE, HINT_TY, INST_QUEUE, MAX_INST_DEPTH, SYNTHED, TPL_DISTINCT,
+    TPL_NONE, TPL_SLICE, check_targ_depth, env_enter, env_leave, env_lookup, generic_symbol,
+    hint_for, inst_add, inst_first, inst_hash, inst_id, inst_next, instance_of, instance_targs,
+    is_untyped_literal_expr, mangle_type, mark_synthed, param_default, same_targs, shown_targs,
+    take_targs, targ_count_error, template_instance,
+};
+use crate::front::modules::{CUR_MOD, module_of};
+use crate::front::traits::check_bounds;
+use crate::front::types::{
+    ENUMS, FNS, FN_COUNT, STRUCTS, SYM_ALIAS, TLISTS, TSCRATCH, TYPES, TY_NEVER, TyKind, buf_type,
+    decay_ref, err_type, is_integer, is_mut_slice, type_elem,
+};
+use std::Option;
+
+// ---- Inference ----
+
+// Bindings of the parameters `params` (a Generics node) being inferred:
+// bound[i] is the type of parameter i, 0 while unknown.
+pub fn tparam_index(params: i64, name: i64) -> Option<i64> {
+    if params == 0 {
+        return Option::None;
+    }
+    unsafe {
+        for i in 0..NODES[params].count {
+            if NODES[child(params, i)].a == name {
+                return Option::Some(i);
+            }
+        }
+    }
+    Option::None
+}
+
+// The self type (a TyName) of the impl block of the template being
+// inferred, which `Self` stands for in its signature (0: none).
+pub static var UNIFY_SELF: i64 = 0;
+
+// (0.14) When UNIFY_SELF is 0: the type `Self` stands for in the bounds of
+// a generic method of a non-generic impl (`Counter::map`, a trait default
+// copied into `impl Iterator for Counter`): the receiver's type (0: none).
+pub static var UNIFY_SELF_TY: i64 = 0;
+
+fn is_self_name(p: i64) -> bool {
+    unsafe {
+        UNIFY_SELF != 0 && NODES[p].a == SELF_TYPE_SYM && NODES[p].count == 0 && NODES[p].g == 0
+    }
+}
+
+// Whether type node p (of a template) mentions a parameter not yet bound.
+pub fn mentions_unbound(params: i64, bound: *i64, p: i64) -> bool {
+    unsafe {
+        if p == 0 {
+            return false;
+        }
+        let kind = NODES[p].kind;
+        if kind == TyName {
+            if is_self_name(p) {
+                return mentions_unbound(params, bound, UNIFY_SELF);
+            }
+            if NODES[p].count == 0 {
+                match tparam_index(params, NODES[p].a) {
+                    Option::Some(k) => return bound[k] == 0,
+                    Option::None => {}
+                }
+            }
+            let g = NODES[p].g;
+            if g != 0 {
+                for i in 0..NODES[g].count {
+                    if mentions_unbound(params, bound, child(g, i)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        if kind == TyPtr || kind == TySlice || kind == TyArray {
+            return mentions_unbound(params, bound, NODES[p].a);
+        }
+        if kind == TyTuple || kind == TyFn {
+            for i in 0..NODES[p].count {
+                if mentions_unbound(params, bound, child(p, i)) {
+                    return true;
+                }
+            }
+            return kind == TyFn && mentions_unbound(params, bound, NODES[p].a);
+        }
+        false
+    }
+}
+
+// Matches type node p (of a template declared in module `tmod`) against
+// type t, binding parameters; false when a parameter is already bound to
+// another type.
+// Generic aliases met while unifying (0.6): (name, argument node, its
+// module, the frame it is in: lo, hi) for each parameter of the aliases
+// being looked through; ALIAS_LO..ALIAS_HI are the entries in scope.
+static var ALIAS_SUBST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static var ALIAS_LO: i64 = 0;
+
+static var ALIAS_HI: i64 = 0;
+
+// Unifies the body of the generic alias named by p (`Pair<T>`, its
+// arguments in p's `g`) with t, its parameters standing for those
+// arguments.
+fn unify_alias(params: i64, bound: *i64, tmod: i64, p: i64, alias: i64, t: i64) -> bool {
+    unsafe {
+        let g = NODES[p].g;
+        // (0.18: a generic distinct type: its arguments are t's)
+        if is_distinct(alias) {
+            if TYPES[t].kind != TyKind::Distinct || TYPES[t].b != alias
+                || TYPES[t].count != NODES[g].count {
+                return true;
+            }
+            var ok = true;
+            for i in 0..NODES[g].count {
+                if !unify(params, bound, tmod, child(g, i), type_elem(t, i)) {
+                    ok = false;
+                }
+            }
+            return ok;
+        }
+        let aparams = NODES[alias].g;
+        if NODES[g].count != NODES[aparams].count {
+            return true;
+        }
+        let mark = ALIAS_SUBST.count;
+        for i in 0..NODES[g].count {
+            ALIAS_SUBST.push(NODES[child(aparams, i)].a);
+            ALIAS_SUBST.push(child(g, i));
+            ALIAS_SUBST.push(tmod);
+            ALIAS_SUBST.push(ALIAS_LO);
+            ALIAS_SUBST.push(ALIAS_HI);
+        }
+        let (lo, hi) = (ALIAS_LO, ALIAS_HI);
+        ALIAS_LO = mark;
+        ALIAS_HI = ALIAS_SUBST.count;
+        let ok = unify(params, bound, module_of(alias), NODES[alias].b, t);
+        ALIAS_LO = lo;
+        ALIAS_HI = hi;
+        ALIAS_SUBST.count = mark;
+        ok
+    }
+}
+
+pub fn unify(params: i64, bound: *i64, tmod: i64, p: i64, t: i64) -> bool {
+    unsafe {
+        if p == 0 || t == 0 {
+            return true;
+        }
+        let kind = NODES[p].kind;
+        let tk = TYPES[t].kind;
+        if kind == TyName {
+            // (0.14: `I::Item` binds nothing here: infer_from_assoc)
+            if is_projection_node(p) {
+                return true;
+            }
+            if is_self_name(p) {
+                return unify(params, bound, module_of(UNIFY_SELF), UNIFY_SELF, t);
+            }
+            if NODES[p].count == 0 && NODES[p].g == 0 {
+                // A parameter of an alias being looked through: its argument.
+                var i = ALIAS_LO;
+                while i < ALIAS_HI {
+                    if ALIAS_SUBST.data[i] == NODES[p].a {
+                        let (lo, hi) = (ALIAS_LO, ALIAS_HI);
+                        ALIAS_LO = ALIAS_SUBST.data[i + 3];
+                        ALIAS_HI = ALIAS_SUBST.data[i + 4];
+                        let ok = unify(params, bound, ALIAS_SUBST.data[i + 2],
+                            ALIAS_SUBST.data[i + 1], t);
+                        ALIAS_LO = lo;
+                        ALIAS_HI = hi;
+                        return ok;
+                    }
+                    i += 5;
+                }
+                match tparam_index(params, NODES[p].a) {
+                    Option::Some(k) => {
+                        // (0.17: a reference binds its raw type: references
+                        // are not type arguments until 0.17.1; a `&mut [T]`,
+                        // a slice, binds as itself, `Option<&mut [V]>` from
+                        // HashMap::get_mut, and joins `[T]` as `[T]`)
+                        let t = if is_mut_slice(t) { t } else { decay_ref(t) };
+                        if bound[k] == 0 {
+                            bound[k] = t;
+                            return true;
+                        }
+                        if is_mut_slice(t) && bound[k] == decay_ref(t) {
+                            return true;
+                        }
+                        if is_mut_slice(bound[k]) && decay_ref(bound[k]) == t {
+                            bound[k] = t;
+                            return true;
+                        }
+                        // (0.15: two arguments of two integer types join in
+                        // infer_from, where they are values)
+                        return bound[k] == t;
+                    }
+                    Option::None => return true,
+                }
+            }
+            let g = NODES[p].g;
+            if g == 0 {
+                return true;
+            }
+            let saved = CUR_MOD;
+            CUR_MOD = tmod;
+            let key = if NODES[p].count == 0 && env_lookup(NODES[p].a) != 0 { -1 }
+                else { type_name_key(p) };
+            let tpl = template_of_type_node(p);
+            CUR_MOD = saved;
+            if key >= 0 && SYM_ALIAS[key] != 0 && NODES[SYM_ALIAS[key]].g != 0 {
+                return unify_alias(params, bound, tmod, p, SYM_ALIAS[key], t);
+            }
+            if tpl == TPL_NONE || !instance_of(t, tpl) {
+                return true;
+            }
+            let targs = instance_targs(t);
+            var ok = true;
+            for i in 0..NODES[g].count {
+                if !unify(params, bound, tmod, child(g, i), TLISTS.data[targs + i]) {
+                    ok = false;
+                }
+            }
+            return ok;
+        }
+        if kind == TyPtr && (NODES[p].p & NODE_REF) != 0
+            && (tk == TyKind::Slice && TYPES[t].b == 0 || tk != TyKind::Slice && tk != TyKind::Ptr) {
+            // (0.18.1) `&T` given a value, `x` or `&x.text()` (a slice is
+            // its own view): T is its type (check_mode::coerce_ref borrows
+            // a place, or says to)
+            return unify(params, bound, tmod, NODES[p].a, t);
+        }
+        if kind == TyPtr && tk == TyKind::Ptr || kind == TySlice && tk == TyKind::Slice
+            || kind == TyArray && tk == TyKind::Array {
+            return unify(params, bound, tmod, NODES[p].a, TYPES[t].a);
+        }
+        if kind == TyTuple && tk == TyKind::Tuple && NODES[p].count == TYPES[t].count
+            || kind == TyFn && tk == TyKind::Fn && NODES[p].count == TYPES[t].count {
+            var ok = true;
+            for i in 0..NODES[p].count {
+                if !unify(params, bound, tmod, child(p, i), type_elem(t, i)) {
+                    ok = false;
+                }
+            }
+            if kind == TyFn && !unify(params, bound, tmod, NODES[p].a, TYPES[t].a) {
+                ok = false;
+            }
+            return ok;
+        }
+        true
+    }
+}
+
+// Infers the parameters of `params` from the expressions `args` (a node
+// whose list they are, from list index `first`) against the type nodes
+// `types` (a node whose list they are, from `first_type`; for a function
+// its Param nodes, whose `b` is the type; `param_nodes` says which), and
+// from the expected type `hint` against `result` (a type node, or 0).
+fn infer_from(params: i64, bound: *i64, tmod: i64, args: i64, first: i64, types: i64,
+    first_type: i64, param_nodes: bool, result: i64, hint: i64) {
+    unsafe {
+        // (0.15) Which parameters a value binds (the expected type, or an
+        // argument whose type is the parameter itself) are `loose`: two
+        // integer types of values join. One bound before (by the receiver,
+        // the turbofish) or inside another type (`Vec<T>`) is exact.
+        let count = NODES[params].count;
+        let loose = alloc_array::<i64>(count);
+        for i in 0..count {
+            loose[i] = if bound[i] == 0 { 2 } else { 0 };
+        }
+        if hint != 0 && result != 0 {
+            let trial = alloc_array::<i64>(count);
+            for i in 0..count {
+                trial[i] = bound[i];
+            }
+            if unify(params, trial, tmod, result, hint) {
+                for i in 0..count {
+                    bound[i] = trial[i];
+                }
+            }
+            free(trial as *u8);
+        }
+        for i in 0..count {
+            loose[i] = if loose[i] == 2 && bound[i] != 0 { 1 } else { 0 };
+        }
+        // (0.14: pass 2, the closures, typed from their parameters' bounds;
+        // then what the bounds' constraints bind)
+        for pass in 0..3 {
+            for i in first..NODES[args].count {
+                let k = first_type + i - first;
+                if k >= NODES[types].count {
+                    break;
+                }
+                let p = if param_nodes { NODES[child(types, k)].b } else { child(types, k) };
+                let arg = child(args, i);
+                let joins = joins_later(params, bound, loose, p) && !takes_context(arg);
+                if !joins && !mentions_unbound(params, bound, p) {
+                    continue;
+                }
+                // (0.15: a parameter's default is checked against the
+                // instance's type, in the callee's module)
+                if is_default_arg(arg) {
+                    continue;
+                }
+                if is_deferred_arg(arg) {
+                    if pass == 2 {
+                        infer_closure_arg(params, bound, tmod, arg, p);
+                        mark_synthed(arg);
+                    }
+                    continue;
+                }
+                if pass == 0 && is_untyped_literal_expr(arg) || pass == 2 {
+                    continue;
+                }
+                var t = NODES[arg].ty;
+                if SYNTHED.get(arg + 1) == 0 {
+                    if joins {
+                        // (the hint check mode would give it)
+                        HINT_NODE = arg;
+                        HINT_TY = bound[bare_param(params, p)];
+                    }
+                    t = synth_expr(arg);
+                    mark_synthed(arg);
+                }
+                if t != TY_NEVER && join_arg(params, bound, loose, p, t) {
+                    continue;
+                }
+                if t != TY_NEVER && !unify(params, bound, tmod, p, t) {
+                    err_begin(NODES[arg].start);
+                    err_str(c"mismatched types: this is '");
+                    err_type(t);
+                    err_str(c"', which does not fit the type parameters inferred so far");
+                    err_end();
+                }
+            }
+        }
+        free(loose as *u8);
+        for k in 0..count {
+            infer_from_fn_bound(params, bound, tmod, k);
+            infer_from_assoc(params, bound, tmod, k);
+        }
+    }
+}
+
+// The parameter of `params` that type node p is itself (`T`, not `*T`),
+// or -1.
+fn bare_param(params: i64, p: i64) -> i64 {
+    unsafe {
+        if NODES[p].kind != TyName || NODES[p].count != 0 || NODES[p].g != 0
+            || is_projection_node(p) || is_self_name(p) || ALIAS_LO < ALIAS_HI {
+            return -1;
+        }
+        match tparam_index(params, NODES[p].a) {
+            Option::Some(k) => k,
+            Option::None => -1,
+        }
+    }
+}
+
+// (0.15) Whether an argument of type node p must be synthesized although
+// p's parameters are bound: p is a parameter a value bound (`loose`), so
+// that a wider integer argument joins with it.
+fn joins_later(params: i64, bound: *i64, loose: *i64, p: i64) -> bool {
+    let k = bare_param(params, p);
+    unsafe { k >= 0 && loose[k] != 0 && is_integer(bound[k]) }
+}
+
+// (0.15) An argument of type t whose parameter's type is p: when p is a
+// type parameter itself, it is bound to t, or joins with the integer type
+// it has: kept when t widens to it (the argument is widened when it is
+// checked), the wider t when it was bound by a value (`loose`). True when
+// done, false for unify to bind or report.
+fn join_arg(params: i64, bound: *i64, loose: *i64, p: i64, t: i64) -> bool {
+    let k = bare_param(params, p);
+    if k < 0 {
+        return false;
+    }
+    unsafe {
+        if bound[k] == 0 {
+            bound[k] = t;
+            loose[k] = 1;
+            return true;
+        }
+        if bound[k] == t {
+            return true;
+        }
+        let j = join_int(bound[k], t);
+        if j == 0 {
+            return false;
+        }
+        if j == bound[k] {
+            return true;
+        }
+        if loose[k] == 0 {
+            return false;
+        }
+        bound[k] = j;
+        true
+    }
+}
+
+// All parameters bound, or an error naming the first that is not. 0.17:
+// the help says how to give it, and the try: line is the path with its
+// type arguments written (those inferred, the others by their names):
+// `shape` 0 a call of `what` (a function, or `Type::f` whose first
+// `outer` parameters are the type's), 1 a variant `member` of enum
+// `what` (3: with fields), 2 a literal of struct `what`.
+fn require_bound(params: i64, bound: *i64, pos: i64, what: i64, shape: i64, outer: i64,
+    member: i64) {
+    unsafe {
+        for i in 0..NODES[params].count {
+            if bound[i] == 0 {
+                err_begin(pos);
+                err_str(c"cannot infer type parameter '");
+                err_sym(NODES[child(params, i)].a);
+                err_str(c"' of '");
+                err_sym(what);
+                err_str(c"'");
+                err_help(c"nothing here says what it is: give the variable a type (`let x: TYPE = ...`), or write the type arguments (try:, with the parameter's type for its name)");
+                let t = buf_new();
+                let w = SYMS[what].text;
+                if shape == 0 && outer > 0 {
+                    var cut = w.len;
+                    var k = w.len;
+                    while k > 1 {
+                        if w[k - 1] == ':' && w[k - 2] == ':' {
+                            cut = k - 2;
+                            break;
+                        }
+                        k -= 1;
+                    }
+                    buf_bytes(t, w[0..cut]);
+                    put_targs(t, params, bound, 0, outer);
+                    buf_bytes(t, w[cut..w.len]);
+                    put_targs(t, params, bound, outer, NODES[params].count);
+                } else {
+                    buf_bytes(t, w);
+                    put_targs(t, params, bound, 0, NODES[params].count);
+                }
+                if shape == 0 {
+                    buf_str(t, c"(...)");
+                } else if shape == 1 || shape == 3 {
+                    buf_str(t, c"::");
+                    buf_bytes(t, SYMS[member].text);
+                    if shape == 3 {
+                        buf_str(t, c"(...)");
+                    }
+                } else {
+                    buf_str(t, c" { ... }");
+                }
+                err_try_fmt(buf_slice(t));
+                err_end();
+            }
+        }
+    }
+}
+
+// `::<A, B>` of parameters from..to: an inferred one's type, else its
+// name; nothing after the last unbound one (its defaults apply), nothing
+// at all when all are bound.
+fn put_targs(out: i64, params: i64, bound: *i64, from: i64, to: i64) {
+    unsafe {
+        var last = -1;
+        for i in from..to {
+            if bound[i] == 0 {
+                last = i;
+            }
+        }
+        if last < 0 {
+            return;
+        }
+        buf_str(out, c"::<");
+        for i in from..last + 1 {
+            if i > from {
+                buf_str(out, c", ");
+            }
+            if bound[i] != 0 {
+                buf_type(out, bound[i]);
+            } else {
+                buf_bytes(out, SYMS[NODES[child(params, i)].a].text);
+            }
+        }
+        buf_byte(out, '>');
+    }
+}
+
+// (0.16) The parameters bound[first..first+count] that nothing bound and
+// that stand for parameters of generic struct or enum `node` (declared in
+// `module`) with a default, bound to the default: `Vec::new()` is
+// `Vec::<_, Gpa>::new()` when no argument or expected type says otherwise.
+fn bind_defaults(node: i64, module: i64, bound: *i64, first: i64, count: i64) {
+    unsafe {
+        let params = NODES[node].g;
+        for k in 0..count {
+            if k >= NODES[params].count {
+                return;
+            }
+            if bound[first + k] != 0 || NODES[child(params, k)].b == 0 {
+                continue;
+            }
+            let mark = TSCRATCH.count;
+            var known = true;
+            for i in 0..k {
+                if bound[first + i] == 0 {
+                    known = false;
+                }
+                TSCRATCH.push(bound[first + i]);
+            }
+            if known {
+                bound[first + k] = param_default(node, module, k);
+            }
+            TSCRATCH.count = mark;
+        }
+    }
+}
+
+// bind_defaults for the parameters of an impl block's generic type
+// (`impl<T, A: Allocator> Vec<T, A>`): those of function template
+// `template` that come from its impl.
+fn bind_impl_defaults(template: i64, bound: *i64) {
+    unsafe {
+        let self_node = NODES[template].h;
+        let params = NODES[template].g;
+        if self_node == 0 || NODES[params].a == 0 {
+            return;
+        }
+        let saved = CUR_MOD;
+        CUR_MOD = module_of(self_node);
+        let tpl = template_of_type_node(self_node);
+        CUR_MOD = saved;
+        if tpl == TPL_NONE || tpl == TPL_SLICE || tpl >= TPL_DISTINCT {
+            return;
+        }
+        if tpl > 0 {
+            bind_defaults(STRUCTS[tpl - 1].node, STRUCTS[tpl - 1].module, bound, 0,
+                NODES[params].a);
+        } else {
+            bind_defaults(ENUMS[-tpl - 1].node, ENUMS[-tpl - 1].module, bound, 0, NODES[params].a);
+        }
+    }
+}
+
+// The type arguments written in a Generics node (in the current scope),
+// pushed on TSCRATCH.
+pub fn push_written_targs(g: i64) {
+    unsafe {
+        for i in 0..NODES[g].count {
+            let t = resolve_type(child(g, i));
+            TSCRATCH.push(t);
+        }
+    }
+}
+
+// ---- Instances of functions ----
+
+// The instance of function template tf with the type arguments
+// TSCRATCH[mark..] (popped); `origin` is the node using it.
+pub fn fn_instance(tf: i64, mark: i64, origin: i64) -> i64 {
+    unsafe {
+        let count = TSCRATCH.count - mark;
+        let h = inst_hash(tf, mark);
+        var found = -1;
+        var slot = inst_first(FN_INSTANCES, h);
+        while slot >= 0 {
+            let f = inst_id(FN_INSTANCES, slot);
+            if FNS[f].tmpl == tf + 1 && same_targs(FNS[f].targs, FNS[f].targ_count, mark)
+                && (found < 0 || f < found) {
+                found = f;
+            }
+            slot = inst_next(FN_INSTANCES, h, slot);
+        }
+        if found >= 0 {
+            TSCRATCH.count = mark;
+            return found;
+        }
+        check_targ_depth(mark, NODES[origin].start);
+        let depth = if CUR_INST >= 0 { FNS[CUR_INST].depth + 1 } else { 1 };
+        if depth > MAX_INST_DEPTH {
+            err_begin(NODES[origin].start);
+            err_str(c"too many nested instantiations of '");
+            err_sym(FNS[tf].display);
+            err_str(c"' (does a generic function call itself with ever larger type arguments?)");
+            err_end();
+        }
+        let targs = take_targs(mark);
+        let template = FNS[tf].node;
+        let item = clone_node(template);
+        NODES[item].g = 0;
+        add_fn(item, instance_symbol(tf, targs, count), 0);
+        let f = FN_COUNT - 1;
+        FNS[f].targs = targs;
+        FNS[f].targ_count = count;
+        FNS[f].origin = origin;
+        FNS[f].parent = CUR_INST + 1;
+        FNS[f].depth = depth;
+        FNS[f].module = FNS[tf].module;
+        FNS[f].is_extern = false;
+        FNS[f].export = false;
+        let saved_mod = CUR_MOD;
+        let saved_self = SELF_TYPE;
+        CUR_MOD = FNS[f].module;
+        let saved = env_enter(NODES[template].g, targs, count);
+        // (the self type in its own module: a trait default's is the impl's)
+        if NODES[template].h != 0 {
+            CUR_MOD = module_of(NODES[template].h);
+            SELF_TYPE = resolve_type(NODES[template].h);
+            CUR_MOD = FNS[f].module;
+        } else {
+            SELF_TYPE = 0;
+        }
+        FNS[f].self_ty = SELF_TYPE;
+        // (0.14: checked with the parameters and `Self` of the instance in
+        // scope, which an `Fn(Self::Item)` bound names)
+        check_bounds(NODES[template].g, targs, count, FNS[tf].display, NODES[origin].start);
+        FNS[f].display = instance_display(f, tf);
+        resolve_signature(f);
+        // Found from now on (not when its signature failed to resolve).
+        FNS[f].tmpl = tf + 1;
+        inst_add(&FN_INSTANCES, f, h);
+        env_leave(saved);
+        CUR_MOD = saved_mod;
+        SELF_TYPE = saved_self;
+        INST_QUEUE.push(f);
+        f
+    }
+}
+
+// The symbol of the instance of function template tf with the type
+// arguments TLISTS[targs..targs+count] (generic_symbol); for a function of
+// a generic type's impl block, the impl's trailing arguments equal to the
+// type's defaults are left out, as in the type's own symbol (0.16:
+// `Vec.push.Gl` is push of `Vec<i64, Gpa>`, as before defaults existed).
+fn instance_symbol(tf: i64, targs: i64, count: i64) -> i64 {
+    unsafe {
+        let template = FNS[tf].node;
+        let self_node = NODES[template].h;
+        let params = NODES[template].g;
+        let impl_count = if self_node != 0 { NODES[params].a } else { 0 };
+        if impl_count == 0 {
+            return generic_symbol(FNS[tf].name, targs, count);
+        }
+        let saved = CUR_MOD;
+        CUR_MOD = module_of(self_node);
+        let tpl = template_of_type_node(self_node);
+        CUR_MOD = saved;
+        if tpl == TPL_NONE || tpl == TPL_SLICE || tpl >= TPL_DISTINCT {
+            return generic_symbol(FNS[tf].name, targs, count);
+        }
+        let shown = if tpl > 0 {
+            shown_targs(STRUCTS[tpl - 1].node, STRUCTS[tpl - 1].module, targs, impl_count)
+        } else {
+            shown_targs(ENUMS[-tpl - 1].node, ENUMS[-tpl - 1].module, targs, impl_count)
+        };
+        if shown == impl_count || shown == 0 && count == impl_count {
+            return generic_symbol(FNS[tf].name, targs, shown + count - impl_count);
+        }
+        let out = buf_new();
+        buf_bytes(out, SYMS[FNS[tf].name].text);
+        buf_str(out, c".G");
+        for i in 0..count {
+            if i < shown || i >= impl_count {
+                mangle_type(out, TLISTS.data[targs + i]);
+            }
+        }
+        intern(buf_slice(out))
+    }
+}
+
+// `max<i64>`, or `Vec<i64>::push` for a method of a generic impl (with
+// its own type arguments after it, if any).
+fn instance_display(f: i64, tf: i64) -> i64 {
+    unsafe {
+        let template = FNS[tf].node;
+        let out = buf_new();
+        let params = NODES[template].g;
+        let impl_count = if NODES[template].h != 0 { NODES[params].a } else { 0 };
+        if NODES[template].h != 0 {
+            buf_type(out, FNS[f].self_ty);
+            buf_str(out, c"::");
+        }
+        buf_bytes(out, SYMS[NODES[template].a].text);
+        if FNS[f].targ_count > impl_count {
+            buf_byte(out, '<');
+            for i in impl_count..FNS[f].targ_count {
+                if i > impl_count {
+                    buf_str(out, c", ");
+                }
+                buf_type(out, TLISTS.data[FNS[f].targs + i]);
+            }
+            buf_byte(out, '>');
+        }
+        intern(buf_slice(out))
+    }
+}
+
+// The instance of generic function tf called by `n` (a Call whose list
+// holds the arguments, or a MethodCall, whose receiver of type `self_ty`
+// is not in its list): its type parameters are bound from `self_ty` (the
+// type of a method's receiver, or the type of a path `Vec<i64>::f`, 0 when
+// none), the turbofish `written` (a Generics node with the function's own
+// parameters, 0 when none), the arguments (from list index 0, against
+// the parameters from `first_param`) and the expected type.
+pub fn instantiate_call(tf: i64, n: i64, first_param: i64, self_ty: i64, written: i64) -> i64 {
+    unsafe {
+        let template = FNS[tf].node;
+        let params = NODES[template].g;
+        let count = NODES[params].count;
+        let impl_count = if NODES[template].h != 0 { NODES[params].a } else { 0 };
+        let tmod = FNS[tf].module;
+        let bound = alloc_array::<i64>(count);
+        let saved_self = UNIFY_SELF;
+        let saved_self_ty = UNIFY_SELF_TY;
+        UNIFY_SELF = NODES[template].h;
+        UNIFY_SELF_TY = if NODES[template].h == 0 { self_ty } else { 0 };
+        if self_ty != 0 && NODES[template].h != 0 {
+            unify(params, bound, module_of(NODES[template].h), NODES[template].h, self_ty);
+        }
+        if written != 0 {
+            if NODES[written].count != count - impl_count {
+                targ_count_error(NODES[written].start, c"function", FNS[tf].display,
+                    count - impl_count, NODES[written].count);
+            }
+            for i in 0..NODES[written].count {
+                bound[impl_count + i] = resolve_type(child(written, i));
+            }
+        }
+        infer_from(params, bound, tmod, n, 0, template, first_param, true, NODES[template].b,
+            hint_for(n));
+        UNIFY_SELF = saved_self;
+        UNIFY_SELF_TY = saved_self_ty;
+        bind_impl_defaults(template, bound);
+        require_bound(params, bound, NODES[n].start, FNS[tf].display, 0, impl_count, 0);
+        let mark = TSCRATCH.count;
+        for i in 0..count {
+            TSCRATCH.push(bound[i]);
+        }
+        free(bound as *u8);
+        fn_instance(tf, mark, n)
+    }
+}
+
+// The instance of enum template `tpl` (encoded, < 0) a variant `member`
+// constructor makes: from the type arguments written on the path
+// (`written`), the expected type, or the fields (the arguments of call
+// `n`, 0 for a variant without fields).
+pub fn infer_enum(tpl: i64, written: i64, member: i64, n: i64, pos: i64) -> i64 {
+    unsafe {
+        let e = -tpl - 1;
+        let item = ENUMS[e].node;
+        let params = NODES[item].g;
+        let mark = TSCRATCH.count;
+        if written != 0 {
+            push_written_targs(written);
+            return template_instance(tpl, mark, pos);
+        }
+        let hint = if n != 0 { hint_for(n) } else { HINT_TY_PATH };
+        if hint != 0 && instance_of(hint, tpl) {
+            return hint;
+        }
+        let bound = alloc_array::<i64>(NODES[params].count);
+        var variant = 0;
+        for i in 0..NODES[item].count {
+            if NODES[child(item, i)].a == member {
+                variant = child(item, i);
+            }
+        }
+        if n != 0 && variant != 0 {
+            infer_from(params, bound, ENUMS[e].module, n, 0, variant, 0, false, 0, 0);
+        }
+        bind_defaults(item, ENUMS[e].module, bound, 0, NODES[params].count);
+        require_bound(params, bound, pos, ENUMS[e].name, if n != 0 { 3 } else { 1 }, 0, member);
+        for i in 0..NODES[params].count {
+            TSCRATCH.push(bound[i]);
+        }
+        free(bound as *u8);
+        template_instance(tpl, mark, pos)
+    }
+}
+
+// The type expected of a variant written without arguments (`None`): set
+// by synth_path from the hint of its node.
+pub static var HINT_TY_PATH: i64 = 0;
+
+// The instance of struct template s a literal `n` builds: from its
+// written type arguments, the expected type, or its fields' values.
+pub fn infer_struct_literal(s: i64, n: i64, expected: i64) -> i64 {
+    unsafe {
+        let tpl = s + 1;
+        let item = STRUCTS[s].node;
+        let params = NODES[item].g;
+        let mark = TSCRATCH.count;
+        if NODES[n].g != 0 {
+            push_written_targs(NODES[n].g);
+            // (the instance first: making it can move TYPES)
+            let t = template_instance(tpl, mark, NODES[n].start);
+            return TYPES[t].a;
+        }
+        if expected != 0 && instance_of(expected, tpl) {
+            return TYPES[expected].a;
+        }
+        let bound = alloc_array::<i64>(NODES[params].count);
+        for pass in 0..2 {
+            for i in 0..NODES[n].count {
+                let init = child(n, i);
+                var field = 0;
+                for k in 0..NODES[item].count {
+                    if NODES[child(item, k)].a == NODES[init].a {
+                        field = child(item, k);
+                    }
+                }
+                if field == 0 || !mentions_unbound(params, bound, NODES[field].b) {
+                    continue;
+                }
+                let value = NODES[init].b;
+                // (0.14: a closure, from the field's bound, after the rest)
+                if is_deferred_arg(value) {
+                    if pass == 1 {
+                        let saved_self = UNIFY_SELF;
+                        let saved_self_ty = UNIFY_SELF_TY;
+                        UNIFY_SELF = 0;
+                        UNIFY_SELF_TY = 0;
+                        infer_closure_arg(params, bound, STRUCTS[s].module, value, NODES[field].b);
+                        UNIFY_SELF = saved_self;
+                        UNIFY_SELF_TY = saved_self_ty;
+                        mark_synthed(value);
+                    }
+                    continue;
+                }
+                if pass == 0 && is_untyped_literal_expr(value) {
+                    continue;
+                }
+                let t = synth_expr(value);
+                mark_synthed(value);
+                if t != TY_NEVER && !unify(params, bound, STRUCTS[s].module, NODES[field].b, t) {
+                    err_begin(NODES[value].start);
+                    err_str(c"mismatched types: this is '");
+                    err_type(t);
+                    err_str(c"', which does not fit the type parameters inferred so far");
+                    err_end();
+                }
+            }
+        }
+        bind_defaults(item, STRUCTS[s].module, bound, 0, NODES[params].count);
+        require_bound(params, bound, NODES[n].start, STRUCTS[s].name, 2, 0, 0);
+        for i in 0..NODES[params].count {
+            TSCRATCH.push(bound[i]);
+        }
+        free(bound as *u8);
+        let t = template_instance(tpl, mark, NODES[n].start);
+        TYPES[t].a
+    }
+}
+
+// ---- Copying templates ----
+
+// A deep copy of the tree at n (0 stays 0), with the checker's fields
+// cleared: the body of a function instance.
+pub fn clone_node(n: i64) -> i64 {
+    unsafe {
+        if n == 0 {
+            return 0;
+        }
+        let c = new_node(NODES[n].kind, NODES[n].start, NODES[n].end);
+        NODES[c] = NODES[n];
+        NODES[c].ty = 0;
+        NODES[c].x = 0;
+        NODES[c].y = 0;
+        // (0.16: a function keeps its effect declarations)
+        if NODES[n].kind != Fn {
+            NODES[c].z = 0;
+        }
+        NODES[c].res = Res::None;
+        let kind = NODES[n].kind;
+        match kind {
+            Fn => {
+                NODES[c].b = clone_node(NODES[n].b);
+                NODES[c].c = clone_node(NODES[n].c);
+            }
+            Param | Let | Cast | Index | Repeat
+                | If | Loop | While | For | Range
+                | Assign | Return | Break | Arm
+                | Binary | Unary | FieldInit | ExprStmt
+                | Call | Match | MethodCall | FieldAccess
+                | TupleField | Block | PatLit | PatRange
+                | TyPtr | TyArray | TySlice | TyFn
+                | EnumPanic | Defer | Closure | AssocType
+                | NodeKind::Try | NodeKind::InterpHole | NodeKind::NamedArg => {
+                if node_field_a(kind) {
+                    NODES[c].a = clone_node(NODES[n].a);
+                }
+                if node_field_b(kind) {
+                    NODES[c].b = clone_node(NODES[n].b);
+                }
+                if node_field_c(kind) {
+                    NODES[c].c = clone_node(NODES[n].c);
+                }
+                // (0.14: a closure parameter's pattern)
+                if kind == For || kind == Param {
+                    NODES[c].d = clone_node(NODES[n].d);
+                }
+            }
+            _ => {}
+        }
+        NODES[c].g = clone_node(NODES[n].g);
+        if kind != Fn {
+            NODES[c].h = clone_node(NODES[n].h);
+        }
+        if NODES[n].count > 0 {
+            let mark = list_begin();
+            for i in 0..NODES[n].count {
+                let copy = clone_node(child(n, i));
+                list_push(copy);
+            }
+            list_end(c, mark);
+        }
+        c
+    }
+}
+
+// Which of a, b, c are child nodes, by kind (see ast.vl).
+pub fn node_field_a(kind: NodeKind) -> bool {
+    match kind {
+        Let | Cast | Index | Repeat | If
+            | Range | Return | Arm | ExprStmt
+            | Call | Match | MethodCall | FieldAccess
+            | TupleField | Block | PatLit | PatRange
+            | TyPtr | TyArray | TySlice | TyFn
+            | EnumPanic | Defer | Closure | NodeKind::Try | NodeKind::InterpHole => true,
+        _ => false,
+    }
+}
+
+pub fn node_field_b(kind: NodeKind) -> bool {
+    match kind {
+        Param | Let | Cast | Index | Repeat
+            | If | Loop | While | For | Range
+            | Assign | Break | Arm | Binary
+            | Unary | FieldInit | PatRange | TyArray | Closure | AssocType
+            | NodeKind::NamedArg => true,
+        _ => false,
+    }
+}
+
+pub fn node_field_c(kind: NodeKind) -> bool {
+    match kind {
+        Let | If | While | For | Assign
+            | Arm | Binary => true,
+        _ => false,
+    }
+}
+
+// ---- Instantiation chains in messages ----
+
+// Notes after an error in an instance: where each enclosing instance was
+// made.
+pub fn instantiation_notes(out: i64) {
+    unsafe {
+        var f = CUR_INST;
+        var lines = 0;
+        while f >= 0 {
+            if lines == 4 {
+                buf_str(out, c"  = note: (and ");
+                buf_int(out, FNS[f].depth);
+                buf_str(out, c" more instantiations)\n");
+                return;
+            }
+            buf_str(out, c"  = note: in instantiation of '");
+            let text = SYMS[FNS[f].display].text;
+            if text.len > 120 {
+                buf_bytes(out, text[0..100]);
+                buf_str(out, c"...");
+            } else {
+                buf_bytes(out, text);
+            }
+            buf_str(out, c"' at ");
+            buf_position(out, NODES[FNS[f].origin].start);
+            buf_byte(out, '\n');
+            f = FNS[f].parent - 1;
+            lines += 1;
+        }
+    }
+}

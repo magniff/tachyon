@@ -98,16 +98,16 @@ defined:
 
 ## Tools
 
-- `tachyonc fix --only unsafe` puts each unsafe operation outside unsafe
+- `volec fix --only unsafe` puts each unsafe operation outside unsafe
   code into an `unsafe { }` block (the statement around it).
-- `tachyonc --check-unsafe -O1 prog.tach -o prog` checks raw-pointer
+- `volec --check-unsafe -O1 prog.vl -o prog` checks raw-pointer
   accesses against the heap blocks at run time (`malloc`/`free`):
   out-of-bounds and use-after-free stop the program with `unsafe access
   ...` and exit 101. Programs run tens of times slower.
-- `tachyonc --check-alloc` (0.16) puts every block of Gpa on pages of
+- `volec --check-alloc` (0.16) puts every block of Gpa on pages of
   its own: a use after free through raw pointers faults and is reported
   with where the block was allocated and freed;
-  bad frees and leaks are reported too (`tachyonc guide memory`). With
+  bad frees and leaks are reported too (`volec guide memory`). With
   `--check-unsafe`, raw accesses are checked against those blocks.
 - Statics, `static var` included, are safe: a `static var` is for the
   main thread, and code another thread runs may not reach one

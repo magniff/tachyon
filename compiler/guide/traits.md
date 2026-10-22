@@ -94,8 +94,8 @@ shape 10
   supertraits, associated constants, `impl Trait` in argument or return
   position, blanket impls over all `T`.
 - (0.15) Traits may take type parameters, `trait From<T>`; bounds take
-  arguments, `T: From<i64>` (`tachyonc guide conversions`).
-  `#[derive(Eq, Ord, Hash, Debug, Clone)]` writes impls (`tachyonc
+  arguments, `T: From<i64>` (`volec guide conversions`).
+  `#[derive(Eq, Ord, Hash, Debug, Clone)]` writes impls (`volec
   guide formatting`).
 
 ## Associated types (0.14)

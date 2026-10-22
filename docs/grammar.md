@@ -1,6 +1,6 @@
-# Tachyon grammar
+# Vole grammar
 
-This is the grammar of tachyon 0.4, as the compiler implements it
+This is the grammar of vole 0.4, as the compiler implements it
 (`compiler/src/front/lexer/`, `compiler/src/front/parser/`; the seed
 implements the language of 0.1 in `seed/src/lexer` and `seed/src/parser`).
 What 0.3 added is marked *(0.3)*, what 0.4 added *(0.4)*.
@@ -67,7 +67,7 @@ import_item  = "import" string_lit "as" ident ";" ;     (* (0.4) a C header, see
 use_item     = "use" path "::" "{" use_name { "," use_name } [ "," ] "}" ";"
              | "use" path "::" use_name ";" ;          (* (0.4) variants of an enum; (0.5) paths, as; no "*" (0.8) *)
 use_name     = ident [ "as" ident ] ;
-mod_item     = "mod" ident ";"                         (* (0.5) the module in ident.tach, see "Modules" *)
+mod_item     = "mod" ident ";"                         (* (0.5) the module in ident.vl, see "Modules" *)
              | "mod" ident "{" { item } "}" ;          (* (0.6) an inline module *)
 path         = ident { "::" ident } ;                  (* crate, self, super, std, modules, an enum *)
 
@@ -310,10 +310,10 @@ of bounds: ...`) to stderr and exits with code 101.
 
 ## Undefined behaviour
 
-The principle: a tachyon program means one thing, the same at every
+The principle: a vole program means one thing, the same at every
 optimization level and on every target, so that it can be reasoned about
 (by people and by agents) from what it says. Where C leaves behaviour
-undefined, tachyon defines it, or checks it and stops with a message.
+undefined, vole defines it, or checks it and stops with a message.
 Since 0.9 there is none at all in safe code: the operations that can
 have it (all of them through raw pointers, unions or C) are allowed only
 in unsafe code, `unsafe { ... }` and `unsafe fn`.
@@ -376,7 +376,7 @@ parameters). The unsafe operations, and what they promise:
   index the pointee, checked (0.17), and are unsafe as `*p` is.
 - Casting an integer to a pointer (other than the literal `0`, a null
   pointer, which safe code cannot dereference). Pointer-to-pointer and
-  pointer-to-integer casts are safe; tachyon has no pointer arithmetic
+  pointer-to-integer casts are safe; vole has no pointer arithmetic
   (cast to an integer and back, in unsafe code).
 - Calling C: an `extern "C"` declaration (also the ones `import` makes)
   or an `extern "C" fn` pointer. Everything C leaves undefined stays so
@@ -400,7 +400,7 @@ using a view after its storage was gone was the one way safe code could
 still reach undefined behaviour; from 0.17 the own pass rejects it under
 `--values=error`, the default (its opt-outs `warn`, `report` and `off`
 do not; std's types also assume their fields are changed by their
-methods only, as tachyon has no private fields yet). A view need not have a name: a slice argument (or a
+methods only, as vole has no private fields yet). A view need not have a name: a slice argument (or a
 receiver taken by value) is a copy made before the later arguments run
 (`take(v.as_slice(), grow(&v))`); the base of an index that is not a
 place, before its index (`v.as_slice()[grow(&v)]`); and `for x in v`,
@@ -413,15 +413,15 @@ indexing rule above).
 Reading memory nobody wrote (from `malloc`, or a struct's padding read as
 bytes, both through raw pointers) gives an unspecified value, which the
 optimizer may take to be any value. Statics, `static mut` included, are
-safe to use: tachyon has no threads of its own (threads started through
+safe to use: vole has no threads of its own (threads started through
 C are C's business). Runaway recursion still exhausts the stack, which
 the operating system stops (a guard page) without corrupting memory.
 
 **Errors.** An unsafe operation outside unsafe code is an error
 (`error[unsafe]`, from 0.10; 0.9 reported it as a warning).
-`tachyonc --fix-unsafe` wraps such operations in unsafe blocks.
+`volec --fix-unsafe` wraps such operations in unsafe blocks.
 
-**Checking unsafe code** (0.10). `tachyonc --check-unsafe` (at `-O1` or
+**Checking unsafe code** (0.10). `volec --check-unsafe` (at `-O1` or
 `-O2`) checks unsafe code's raw-pointer accesses at run time: every
 dereference of a raw pointer (`*p`, the whole pointee), index (`p[i]`,
 the element), field through one (`p.f`, the field) and slice made from
@@ -438,7 +438,7 @@ C allocates, pointers C code dereferences, a function pointer to
 
 ## Layout, conventions and C
 
-Tachyon guarantees **nothing** about the layout of its own types (the order
+Vole guarantees **nothing** about the layout of its own types (the order
 and offsets of a struct's fields, the layout of tuples, enums and slices)
 or about the calling convention of its own functions: the compiler is free
 to choose them (0.3 orders a struct's fields to save padding; 0.5 has a
@@ -452,7 +452,7 @@ and then it is exact:
 
 - `#[repr(C)]` types have C's layout: fields in order, each at its C
   offset; unions overlap their fields; `packed` and `align(N)` as with
-  GCC's attributes. Values aligned above 16 are aligned wherever tachyon
+  GCC's attributes. Values aligned above 16 are aligned wherever vole
   places them (frames, statics, arguments it copies onto the stack); the
   heap is the allocator's business (`malloc` aligns to 16). A fieldless `#[repr(C)]` enum is a C `int`; one with
   fields is a C struct: an `int` tag, then a union of one struct per
@@ -474,7 +474,7 @@ and then it is exact:
   tuples, default-layout structs and enums, and plain `fn` pointers are
   rejected, with a hint. Variadic arguments may be any FFI-safe type
   (`f32` is passed as a double).
-- A plain `fn` and an `extern "C" fn` are different types: a tachyon
+- A plain `fn` and an `extern "C" fn` are different types: a vole
   function cannot be handed to C as a callback; define the callback with
   `extern "C" fn`.
 
@@ -566,7 +566,7 @@ A local, constant, static or function of the same name wins. `use` is the
 keyword modules will extend (0.5): `use path::{...};`.
 
 **Layout queries.** `size_of(T)` and `align_of(T)` are integer constants
-typed like an integer literal (`[u8; size_of(Header)]`). For a tachyon
+typed like an integer literal (`[u8; size_of(Header)]`). For a vole
 type they are fixed per compiler, not by the language. (In 0.4 a program's
 own functions named `size_of` or `align_of` won; since 0.5 they are
 builtins, and no item may have those names.)
@@ -580,7 +580,7 @@ slice or an array by value (the sequence is evaluated once; `break`,
 `continue` and labels work as in other loops).
 
 **Raw identifiers.** `r#name` is an identifier even when `name` is a
-keyword (`s.r#type`); C names that are tachyon keywords are imported so.
+keyword (`s.r#type`); C names that are vole keywords are imported so.
 
 **C.** `#[repr(C, packed(N))]` aligns fields to at most N (GCC's
 `#pragma pack(N)`); `#[link_name = "sym"]` in an extern block names the C
@@ -649,18 +649,18 @@ take or return a `#[repr(C)]` instance (`Pair<i32>`).
 
 A file is a module. The files named on the command line make the root
 module (the *crate*); `mod name;` in a module's file loads the child module
-`name` from `name.tach`, or `name/mod.tach`, next to the file (from a
-module's file `a.tach`, in the directory `a/`: `a/name.tach`). There are
+`name` from `name.vl`, or `name/mod.vl`, next to the file (from a
+module's file `a.vl`, in the directory `a/`: `a/name.vl`). There are
 no inline modules.
 
 ```
-// main.tach
-mod geometry;                     // geometry.tach
+// main.vl
+mod geometry;                     // geometry.vl
 use geometry::shapes::{Shape, area};
 use geometry::Rect as Box;
 
-// geometry.tach
-pub mod shapes;                   // geometry/shapes.tach
+// geometry.vl
+pub mod shapes;                   // geometry/shapes.vl
 pub struct Rect { pub w: i64, pub h: i64 }
 fn helper() { ... }               // private to geometry (and its children)
 ```
@@ -694,7 +694,7 @@ imported ones (`c::abs` and the program's `abs`).
 
 Items of the root module keep their names as symbols; an item of module
 `a::b` has the symbol `a.b.name` (`extern "C"` items and `#[link_name]`
-keep their C names). `tachyonc a.tach b.tach` still compiles several files
+keep their C names). `volec a.vl b.vl` still compiles several files
 as one root module.
 
 ### The standard library
@@ -706,9 +706,9 @@ The module `std` is built into the compiler, read when a program names it
 `clear`, `free`), `Buf` (a byte buffer: `push`, `push_str`, `push_cstr`,
 `push_int`, `as_slice`), and `print`, `println`, `print_int`, `print_cstr`.
 Failures (`unwrap` of `None`, an index out of bounds) write a message to
-stderr and exit with 101. Its source is `compiler/std/std.tach` (0.15:
+stderr and exit with 101. Its source is `compiler/std/std.vl` (0.15:
 with the files `compiler/std/embed.sh` appends to it); the
-whole API, from that source: `tachyonc guide std` (0.17: a line per
+whole API, from that source: `volec guide std` (0.17: a line per
 item; with the comments, `guide std#every-item`; one name, `guide --find
 NAME`).
 
@@ -829,7 +829,7 @@ The errors for the removed forms name their replacement, from what the
 program uses through them: `wildcard imports are not allowed: write 'use
 util::{double, half};'`.
 
-**`tachyonc --fix-imports FILE...`** rewrites a program written for 0.7 or
+**`volec --fix-imports FILE...`** rewrites a program written for 0.7 or
 earlier, in place: every file of it (the files of its modules too). It
 checks the program as for compiling it, resolving the old forms as 0.7
 did, then:
@@ -896,10 +896,10 @@ method whose own `self` is `*T`, which takes the pointer as it is.
 Passing a pointer on to a `*T` parameter, comparing and casting one are
 safe, and so is using a function with pointer parameters as a value;
 `&x` and `&mut x` convert to a `*T`. The error is `dereference of a raw
-pointer is unsafe: `p` is a `*T` parameter`, with `try: tachyonc fix
+pointer is unsafe: `p` is a `*T` parameter`, with `try: volec fix
 --values` (parameters to `&T` / `&mut T`, with their calls; it keeps raw
 a pointer that is indexed, compared, cast, stored or given to C) and
-`try: tachyonc fix --only unsafe`.
+`try: volec fix --only unsafe`.
 
 **Diagnostics.** An unsafe operation outside unsafe code is an error,
 `error[unsafe]` (each place once, in source order, with the other
@@ -914,7 +914,7 @@ errors; 0.9 reported it as a warning). Options:
   above). An unknown name's help is the `use` line that imports it from
   another module (``add `use crate::m::name;` ``), else the nearest name in
   scope (`did you mean 'total'?`).
-- `tachyonc --fix-unsafe FILE...`: rewrites the program in place, putting
+- `volec --fix-unsafe FILE...`: rewrites the program in place, putting
   each unsafe operation outside unsafe code in an unsafe block: the
   statement around it (consecutive statements share one block), a
   `let`'s value, a condition, a match arm or a block's tail. Nothing else
@@ -1021,8 +1021,8 @@ slot).
 - **`if` and generic variants**: `if c { Some(x) } else { None }` (either
   way round, and for any generic enum's variant named without type
   arguments) takes its type from the other branch.
-- **Importing C headers when cross-compiling** (see below): `$TACHYON_CC`
-  may name a C compiler for another system, e.g. `TACHYON_CC="clang
+- **Importing C headers when cross-compiling** (see below): `$VOLE_CC`
+  may name a C compiler for another system, e.g. `VOLE_CC="clang
   --target=x86_64-linux-gnu --sysroot=DIR"` on macOS for `--target
   x86_64-linux`; without it, the error says so.
 
@@ -1106,7 +1106,7 @@ vectors is undefined behaviour.
 **C.** Vectors are not FFI-safe: an `extern "C"` signature, function
 pointer type or static cannot hold one (C's vector types and their
 conventions are not supported; pass a pointer to the lanes or an array).
-In tachyon's own convention a vector is passed like a struct of its
+In vole's own convention a vector is passed like a struct of its
 lanes.
 
 ## Additions of 0.14
@@ -1144,7 +1144,7 @@ let g: fn(i64) -> i64 = |x| x * 2;   // captures nothing: a plain fn
 
 - **Types.** Each closure expression (in each instance of the generic
   function it is in) has its own anonymous type, shown as
-  `closure(i64) -> i64 at f.tach:4:15`; it cannot be written, so a closure
+  `closure(i64) -> i64 at f.vl:4:15`; it cannot be written, so a closure
   is passed to a generic `F` or kept in a local or a generic struct.
 - **Parameters** take their types from the annotation, else from the
   expected `fn(..)` type or the `Fn`/`FnMut` bound of the parameter the
@@ -1311,12 +1311,12 @@ its `use std::...;` line, or the nearest std name, even when the program
 does not name std; a private item gets the help
 `make it public: `pub fn f` at FILE:LINE:COL`; Rust habits (`&self`,
 `&str`, `&mut x`, `println!` and the other macros, `?`, `String`,
-`s.len()`, `.chars()`, `.iter_mut()`) get a help naming what tachyon writes.
+`s.len()`, `.chars()`, `.iter_mut()`) get a help naming what vole writes.
 
 ## Additions of 0.15
 
 The design is [design/errors-formatting.md](design/errors-formatting.md);
-the guide's topics are `tachyonc guide conversions` and `tachyonc guide
+the guide's topics are `volec guide conversions` and `volec guide
 formatting`.
 
 ```ebnf
@@ -1478,8 +1478,8 @@ Every function has an inferred effect set: `alloc(A, ...)`, `io`,
 `global`, `panic`, `diverge`, `unsafe` (to come: the inference). A
 declaration is an upper bound of it, checked (to come); on a C function
 it is trusted. `#[pure]` is no `alloc`, `io` or `global`; `#[effects()]`
-is the empty set. Several declarations intersect. `tachyonc
---print-effects` and `tachyonc query effects NAME` show the sets.
+is the empty set. Several declarations intersect. `volec
+--print-effects` and `volec query effects NAME` show the sets.
 
 ### Default type parameters
 
@@ -1511,7 +1511,7 @@ main = "fn" "main" "(" [ "gpa" ":" "Gpa" ] ")" [ "->" type ] block
 
 (any parameter names; the `Gpa` parameter is last). `Allocator`, `Gpa`,
 `Arena`, `ScopedArena`, `arena_scope` and `format_in` are in the prelude
-(arenas: to come). `tachyonc fix --only alloc016` moves a 0.15 program
+(arenas: to come). `volec fix --only alloc016` moves a 0.15 program
 over: the calls become their `_in` forms and `gpa: Gpa` is threaded
 from `main` to them ([refactor.md](refactor.md)).
 
@@ -1523,7 +1523,7 @@ of the type from outliving the scope that made them.
 
 ## Additions of 0.17: familiar forms
 
-Forms a Rust reader writes first, with tachyon's meaning unchanged
+Forms a Rust reader writes first, with vole's meaning unchanged
 (nothing here allocates, and every index stays checked). The measure
 behind them is `.claude/briefs/research/familiar-names.md`.
 
@@ -1553,7 +1553,7 @@ holding one) moves on `=`, a by-value argument and `return`, and is
 dropped at the end of its scope; views (slices, references) cannot
 outlive or alias against what they view. These checks and the drops are
 on by default: `--values=error` (the default since T7, which moved the
-tests, examples and evals over with `tachyonc fix --values`).
+tests, examples and evals over with `volec fix --values`).
 `--values=warn` and `--values=report` keep 0.16's semantics (no drops)
 and only warn or list; `--values=off` turns the pass off. They are
 opt-outs for 0.17 only. `defer v.free()` stays legal (`free` frees now
@@ -1626,7 +1626,7 @@ only; `v.len = n` and `&v.len` are still errors.
 **Paths.** A path's first segment that is not `crate`, `self`, `super`,
 `std` nor a name of the module it is written in is looked up beside that
 module (a child of its parent), then at the root: `use lexer::{Tok,
-next};` in `parser.tach`, where `main.tach` has `mod lexer; mod parser;`,
+next};` in `parser.vl`, where `main.vl` has `mod lexer; mod parser;`,
 is `use crate::lexer::{Tok, next};`. A path in code starts the same way
 (0.17): `lexer::next(..)`, `fn f(t: lexer::Tok)`, `lexer::Tok { .. }` and
 `lexer::Kind::Ident` in a pattern are `crate::lexer::...` there, as the
@@ -1710,7 +1710,7 @@ let_stmt += "let" pattern "=" expr "else" block ";" ;     (* let-else *)
 
 ## Additions of 0.19: vector types, std::arch, target features
 
-The design is docs/design/arch.md; `tachyonc guide arch` teaches it.
+The design is docs/design/arch.md; `volec guide arch` teaches it.
 
 ### More vector types
 
@@ -1794,9 +1794,9 @@ An intrinsic is a function of `std::arch`, `std::arch::aarch64` or
   where the target has it).
 - **The modules are virtual**: their declarations are made from the
   intrinsic tables (`compiler/arch/*.def`) for the names a program uses,
-  so a program that names none pays nothing. `tachyonc query show NAME`
+  so a program that names none pays nothing. `volec query show NAME`
   prints one's declaration with its features, instruction, what it
-  computes and its other architecture's equivalent; `tachyonc query
+  computes and its other architecture's equivalent; `volec query
   arch WORDS` searches the tables (docs/query.md).
 - **Effects.** A register intrinsic has none; a checked memory form is
   `panic`; a `raw` form is `unsafe`; `has` and `detect` have none. So
@@ -1805,7 +1805,7 @@ An intrinsic is a function of `std::arch`, `std::arch::aarch64` or
 ### Target features
 
 Every intrinsic needs target features (`neon`, `crc`, `sha2`, `avx2`,
-...; the lists are in `tachyonc explain arch.feature_name`). A call is
+...; the lists are in `volec explain arch.feature_name`). A call is
 legal only where its features are *known*:
 
 - **The build's features**: the target's baseline (aarch64-macos:
@@ -1860,10 +1860,10 @@ both architectures' code; there is no `cfg`.
   `getauxval(AT_HWCAP)` and `AT_HWCAP2`, on x86-64 from `cpuid` and
   `xgetbv` (the avx family only when the system saves the ymm registers).
   A program's `main` fills the word before its first statement; code
-  entered from C with no tachyon `main` fills it at its first detect.
+  entered from C with no vole `main` fills it at its first detect.
   The test is pure: repeated tests merge, and one in a loop is hoisted
   out of it.
-- **`TACHYON_ARCH_DISABLE=crc,aes`** (or `all`) in the environment of a
+- **`VOLE_ARCH_DISABLE=crc,aes`** (or `all`) in the environment of a
   running program clears those features from the word (and the features
   that need them: sha3 with sha2), so its detects take the fallback
   paths. It only clears: no setting makes a missing instruction run.
@@ -1883,9 +1883,9 @@ both architectures' code; there is no `cfg`.
 ## Additions of 0.20: parameter conventions
 
 The design is [design/conventions.md](design/conventions.md): the
-memory model's spelling becomes tachyon's own, `let` / `inout` /
-`sink`, with 0.17's semantics. `tachyonc guide memory` teaches it;
-`tachyonc guide rust` maps Rust's spellings onto it.
+memory model's spelling becomes vole's own, `let` / `inout` /
+`sink`, with 0.17's semantics. `volec guide memory` teaches it;
+`volec guide rust` maps Rust's spellings onto it.
 
 ```ebnf
 param       = self_param | ident ":" [ convention ] type [ "=" expr ] ;
@@ -1932,7 +1932,7 @@ match_expr += "match" "&" expr "{" arms "}" ;           (* binds inout accesses 
   is `conv.set`, and `sink T` outside a parameter `conv.sink_type`.
   Rust's spellings (`&T`, `&mut T`, `&mut x`, `&self`, `let mut`, `mut
   x`, `static mut`, `move`, `*r` on an access) are `conv.rust`, each
-  with the new form in a `try:` line; `tachyonc fix --only conventions`
+  with the new form in a `try:` line; `volec fix --only conventions`
   rewrites a program.
 - Not yet: results that are accesses (`-> let T`, `-> inout T`,
   `Option<inout V>`) and `for inout x in &v`; until they land,
@@ -1941,8 +1941,8 @@ match_expr += "match" "&" expr "{" arms "}" ;           (* binds inout accesses 
 - **Modes.** A file is read *mixed* (both spellings; the default until
   Phase M), in *0.20's* spelling (`--syntax=0.20`: Rust's spellings are
   `conv.rust`, and `&x` is always exclusive), or in *0.19's* (a crate
-  whose root's first line is `// tachyon-syntax: 0.19`: 0.20's spelling
-  is `syntax.legacy`). Only compiler/src/main.tach carries that line,
+  whose root's first line is `// vole-syntax: 0.19`: 0.20's spelling
+  is `syntax.legacy`). Only compiler/src/main.vl carries that line,
   during 0.20, so that v0.19.1 can build it; tests/run.sh fails if
   another file does. std and the compiler's generated sources are read
   mixed until Phase M migrates them.
@@ -1980,19 +1980,19 @@ header and adds its declarations to the program, named through `c`
 is relative to the importing file; `-I DIR` adds include directories. All
 imports of a program are read as one translation unit, as the target's C
 compiler reads them: its predefined macros and its include path come
-from `cc -dM -E -v` (`$TACHYON_CC` instead of `cc`), so headers need the
+from `cc -dM -E -v` (`$VOLE_CC` instead of `cc`), so headers need the
 target's C compiler on the host (a macOS host for both macOS targets, an
-x86-64 Linux host for `x86_64-linux`), unless `$TACHYON_CC` names a C
+x86-64 Linux host for `x86_64-linux`), unless `$VOLE_CC` names a C
 compiler for the target (0.9: `clang --target=x86_64-linux-gnu
 --sysroot=DIR` with a Linux system's headers in DIR, or a cross gcc),
 which is then trusted for its headers and predefined macros. Another
-way: `tachyonc --emit-imports` on a host of the target's system writes
-the declarations as tachyon source, to use in place of the `import`.
+way: `volec --emit-imports` on a host of the target's system writes
+the declarations as vole source, to use in place of the `import`.
 
-What a header declares becomes tachyon declarations
-(`tachyonc --emit-imports file.tach -o decls.tach` shows them):
+What a header declares becomes vole declarations
+(`volec --emit-imports file.vl -o decls.vl` shows them):
 
-| C | tachyon |
+| C | vole |
 |---|---|
 | `char` (plain), `signed char`, `unsigned char` | `u8`, `i8`, `u8` (`c"..."` strings are `*u8`) |
 | `short`, `int`, `long`, `long long`, and the unsigned ones | `i16`, `i32`, `i64`, `i64`, and `u16` ... `u64` |
@@ -2007,9 +2007,9 @@ What a header declares becomes tachyon declarations
 | macros naming a variable or a function (`#define stdin __stdinp`) | the same symbol under the macro's name |
 | functions, `extern` variables | an `extern "C"` block; asm labels (`realpath` as `_realpath$DARWIN_EXTSN`) become `#[link_name]` |
 
-Tags and ordinary names share tachyon's type namespace: a tag whose name
+Tags and ordinary names share vole's type namespace: a tag whose name
 a different typedef takes is renamed `struct_<tag>`. A record whose C
-layout tachyon cannot express (alignment above 16; packed and aligned at
+layout vole cannot express (alignment above 16; packed and aligned at
 once), or that holds such a record or a type left out, is imported as an
 opaque struct, usable through pointers. Left out, and named with the
 reason when a program uses them: `long double` (x86-64), `_Complex`,
@@ -2023,7 +2023,7 @@ names live in the C module, named by `as`.
 
 ## C headers of a program
 
-`tachyonc --emit-header prog.tach -o prog.h` *(0.4)* writes the C view of
+`volec --emit-header prog.vl -o prog.h` *(0.4)* writes the C view of
 a program: its `extern "C" fn` definitions and `extern "C"` statics, and
 the `#[repr(C)]` and integer-repr types they need, in dependency order,
 with an include guard, `extern "C"` for C++, and a `_Static_assert` of

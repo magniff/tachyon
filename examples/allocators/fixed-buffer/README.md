@@ -20,7 +20,7 @@ this directory, and its output is checked against this file;
 ## Run it
 
 ```console
-$ tachyonc main.tach -o rpn && ./rpn < input.txt
+$ volec main.vl -o rpn && ./rpn < input.txt
 1 2 + = 3
 3 4 * 5 - = 7
 10 dup * = 100
@@ -86,7 +86,7 @@ Only `Vec` has `try_` forms in 0.16; a `Buf` or a `HashMap` on a
 ## What the compiler can show
 
 ```console
-$ tachyonc query effects crate
+$ volec query effects crate
 <crate::CalcError as Display>::fmt	io global panic
 crate::push	alloc(FixedBuf)
 crate::skip	panic
@@ -116,7 +116,7 @@ line.
 
 ## Read more
 
-- `tachyonc guide allocators`, sections "Arenas" (`FixedBuf::new`) and
+- `volec guide allocators`, sections "Arenas" (`FixedBuf::new`) and
   "--check-alloc" (a `FixedBuf`'s blocks are checked too).
-- `tachyonc guide effects`, for `#[effects(...)]`.
+- `volec guide effects`, for `#[effects(...)]`.
 - [scoped-arena](../scoped-arena/): growing memory, freed per request.

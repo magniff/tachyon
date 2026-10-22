@@ -1,0 +1,781 @@
+// Lifetime intervals (regalloc/mod.vl): built from liveness, with fixed
+// intervals for the registers that calls and instructions clobber, and
+// hints for the registers values would like; their ranges and uses looked
+// up, and an interval split in two.
+
+use crate::arch::intr_tied_operand;
+use crate::back::abi::{conv_classify, conv_return_piece_reg, fn_uses_c};
+use crate::back::emit::calls::{call_locations, callee_result};
+use crate::back::emit::function::param_locations;
+use crate::back::emit::machine::{
+    arg_reg, call_returns_through_pointer, call_uses_c, reg_ret, xl_is_stack,
+};
+use crate::back::mc_arm64::atomic::{ATOMIC_SCRATCH, atomic_needs_scratch};
+use crate::back::mc_x86_64::atomic::atomic_needs_rax;
+use crate::back::mc_x86_64::ops::is_commutative;
+use crate::back::regalloc::{Interval, POS_MAX, UNASSIGNED, USE_NONE, USE_REG};
+use crate::back::regalloc::prepare::{
+    bit_clear, bit_set, is_fused_compare, is_live_use, live_set, term_uses, tracked, use_kind,
+};
+use crate::back::regalloc::scan::{is_allocatable, is_callee_saved_reg};
+use crate::base::{IntVec, SYMS, alloc_array, die, free, grow};
+use crate::base::target::X86;
+use crate::front::types::{FNS, in_fregs, is_compound, max_i64};
+use crate::middle::ctx::FnCtx;
+use crate::middle::ir::{IRFUNCS, Op, Term, ir_arg, ir_operand, ir_operand_count};
+use crate::middle::ir::Op::{
+    BNot, Call, CallC, Const, Conv, Div, MulH, Neg, Pack, Param, Phi, Piece, Rem, Select, Shl, Shr,
+};
+
+// ---- Intervals ----
+
+fn iv_new(cx: sink *FnCtx, t: i64) -> i64 {
+    unsafe {
+        cx.ivs = grow(cx.ivs, cx.iv_count, &cx.iv_cap);
+        let i = cx.iv_count;
+        cx.ivs[i] = Interval {
+            value: t, reg: UNASSIGNED,
+            ranges: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            uses: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            next: -1,
+        };
+        cx.iv_count += 1;
+        i
+    }
+}
+
+// Frees every interval (and the fixed ones' ranges).
+fn iv_reset(cx: sink *FnCtx) {
+    unsafe {
+        for i in 0..cx.iv_count {
+            free(cx.ivs[i].ranges.data as *u8);
+            free(cx.ivs[i].uses.data as *u8);
+        }
+        cx.iv_count = 0;
+        for r in 0..64 {
+            free(cx.fixed[r].data as *u8);
+            cx.fixed[r] = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        }
+    }
+}
+
+pub fn ra_start(cx: sink *FnCtx, i: i64) -> i64 {
+    unsafe { cx.ivs[i].ranges.data[0] }
+}
+
+pub fn ra_end(cx: sink *FnCtx, i: i64) -> i64 {
+    unsafe { cx.ivs[i].ranges.data[cx.ivs[i].ranges.count - 1] }
+}
+
+// While building (backwards), ranges and uses are kept in descending
+// order, then reversed.
+
+// Adds [from, to) below the ranges so far (merging with the lowest one).
+fn rev_add_range(list: *IntVec, from: i64, to: i64) {
+    unsafe {
+        let n = list.count;
+        if n > 0 && to >= list.data[n - 2] {
+            if from < list.data[n - 2] {
+                list.data[n - 2] = from;
+            }
+            if to > list.data[n - 1] {
+                list.data[n - 1] = to;
+            }
+            return;
+        }
+        list.push(from);
+        list.push(to);
+    }
+}
+
+fn rev_add_use(cx: sink *FnCtx, t: i64, pos: i64, kind: i64) {
+    unsafe {
+        let i = cx.rv_first[t];
+        let n = cx.ivs[i].uses.count;
+        if n > 0 && cx.ivs[i].uses.data[n - 2] == pos {
+            if kind > cx.ivs[i].uses.data[n - 1] {
+                cx.ivs[i].uses.data[n - 1] = kind;
+            }
+            return;
+        }
+        cx.ivs[i].uses.push(pos);
+        cx.ivs[i].uses.push(kind);
+    }
+}
+
+// Value t is used at `pos` (in the block starting at `start`).
+fn ra_add_use(cx: sink *FnCtx, t: i64, start: i64, pos: i64, kind: i64, live: *u64) {
+    unsafe {
+        let i = cx.rv_first[t];
+        rev_add_range(&cx.ivs[i].ranges, start, pos + 1);
+        rev_add_use(cx, t, pos, kind);
+        bit_set(live, t);
+    }
+}
+
+// Value t is defined at `pos` (in the block starting at `start`).
+fn add_def(cx: sink *FnCtx, t: i64, start: i64, pos: i64, kind: i64, live: *u64) {
+    unsafe {
+        let i = cx.rv_first[t];
+        let n = cx.ivs[i].ranges.count;
+        if n > 0 && cx.ivs[i].ranges.data[n - 2] == start && cx.ivs[i].ranges.data[n - 1] > pos {
+            cx.ivs[i].ranges.data[n - 2] = pos;
+        } else {
+            // Never used after: it still needs a place to be written.
+            cx.ivs[i].ranges.push(pos);
+            cx.ivs[i].ranges.push(pos + 1);
+        }
+        if kind != USE_NONE {
+            rev_add_use(cx, t, pos, kind);
+        }
+        bit_clear(live, t);
+    }
+}
+
+fn reverse_pairs(list: *IntVec) {
+    unsafe {
+        let n = list.count / 2;
+        for i in 0..n / 2 {
+            let j = n - 1 - i;
+            let a = list.data[2 * i];
+            let b = list.data[2 * i + 1];
+            list.data[2 * i] = list.data[2 * j];
+            list.data[2 * i + 1] = list.data[2 * j + 1];
+            list.data[2 * j] = a;
+            list.data[2 * j + 1] = b;
+        }
+    }
+}
+
+fn add_fixed(cx: sink *FnCtx, r: i64, from: i64, to: i64) {
+    unsafe { rev_add_range(&cx.fixed[r], from, to); }
+}
+
+// ---- Calls that return twice ----
+//
+// setjmp and the like return again when something longjmps to them: then
+// the code after them runs again with the registers as the longjmp left
+// them (callee-saved ones as they were at the setjmp) and the frame as it
+// is now. So no register keeps a value across such a call (it clobbers
+// every register: what lives across is on the stack, stored before),
+// spill slots are not shared in its function (a slot reused after the
+// call would be wrong after the second return), and the function is never
+// a sibling caller, nor inlined, nor inlined into.
+
+// (a slice, not a C string: no strlen per comparison; is_returns_twice_call
+// runs for every call of every function the inliner and the attribute pass
+// look at, and was a sixth of the self-compile at -O2)
+fn sym_is(name: i64, s: [u8]) -> bool {
+    unsafe { SYMS[name].text == s }
+}
+
+pub fn is_returns_twice_call(cx: sink *FnCtx, v: i64) -> bool {
+    unsafe {
+        let op = cx.insts[v].op;
+        var name = 0;
+        if op == Call {
+            name = FNS[cx.insts[v].imm].name;
+        } else if op == CallC {
+            name = cx.insts[v].imm;
+        } else {
+            return false;
+        }
+        sym_is(name, "setjmp") || sym_is(name, "_setjmp") || sym_is(name, "sigsetjmp")
+            || sym_is(name, "__sigsetjmp") || sym_is(name, "savectx") || sym_is(name, "vfork")
+            || sym_is(name, "getcontext")
+    }
+}
+
+pub fn calls_returns_twice(cx: sink *FnCtx, fi: i64) -> bool {
+    unsafe {
+        for b in IRFUNCS[fi].blocks.items() {
+            if cx.blocks[b].removed == 0 {
+                var v = cx.blocks[b].first;
+                while v != 0 {
+                    if is_returns_twice_call(cx, v) {
+                        return true;
+                    }
+                    v = cx.insts[v].next;
+                }
+            }
+        }
+    }
+    false
+}
+
+// Registers clobbered by the instruction at p (besides its result).
+fn add_clobbers(cx: sink *FnCtx, v: i64, p: i64) {
+    unsafe {
+        let op = cx.insts[v].op;
+        if op.is_call() {
+            // (0.17: the registers from a list made once per function,
+            // CLOBBERED, not from tests of all 64 per call)
+            if is_returns_twice_call(cx, v) {
+                for r in 0..64 {
+                    if is_allocatable(r) {
+                        add_fixed(cx, r, p + 1, p + 2);
+                    }
+                }
+            } else {
+                for k in 0..cx.clobbered.count {
+                    add_fixed(cx, cx.clobbered.data[k], p + 1, p + 2);
+                }
+            }
+            return;
+        }
+        if op == Op::Atomic {
+            // (0.21) The loops' scratch register (AArch64), rax (x86-64's
+            // cmpxchg): mc_arm64/atomic.vl, mc_x86_64/atomic.vl.
+            let kind = cx.insts[v].imm & 255;
+            if X86 {
+                if atomic_needs_rax(kind) && is_allocatable(0) {
+                    add_fixed(cx, 0, p, p + 3);
+                }
+            } else if atomic_needs_scratch(kind) && is_allocatable(ATOMIC_SCRATCH) {
+                add_fixed(cx, ATOMIC_SCRATCH, p, p + 3);
+            }
+            return;
+        }
+        if X86 && !in_fregs(cx.insts[v].ty) {
+            // Division and MULH use rax and rdx, shifts by a register cl, from
+            // the reading of the operands to the writing of the result.
+            if (op == Div || op == Rem || op == MulH) && is_allocatable(0) {
+                add_fixed(cx, 0, p, p + 3);
+                add_fixed(cx, 2, p, p + 3);
+            }
+            if (op == Shl || op == Shr) && cx.insts[cx.insts[v].b].op != Const
+                && is_allocatable(1) {
+                add_fixed(cx, 1, p, p + 3);
+            }
+        }
+    }
+}
+
+// The pieces of call v's aggregate result (PIECE instructions after it in
+// its block): defined by the call, in its result registers (as hints).
+fn add_piece_defs(cx: sink *FnCtx, v: i64, start: i64, p: i64, live: *u64) {
+    unsafe {
+        // (0.17: only a call returning an aggregate has pieces; the scan of
+        // the rest of the block for every call was quadratic in its calls)
+        if !is_compound(callee_result(cx, v)) {
+            return;
+        }
+        var w = cx.insts[v].next;
+        var classified = false;
+        while w != 0 {
+            if cx.insts[w].op == Piece && cx.insts[w].a == v {
+                if !classified {
+                    conv_classify(cx, call_uses_c(cx, v), callee_result(cx, v));
+                    classified = true;
+                }
+                let t = tracked(cx, w);
+                if t >= 0 {
+                    add_def(cx, t, start, p + 2, USE_REG, live);
+                    if cx.rv_hreg[t] < 0 {
+                        cx.rv_hreg[t] = conv_return_piece_reg(cx, call_uses_c(cx, v),
+                            cx.insts[w].imm);
+                    }
+                }
+            }
+            w = cx.insts[w].next;
+        }
+    }
+}
+
+// The hints of instruction v (at p): its result's register, its operands'.
+fn add_hints(cx: sink *FnCtx, v: i64) {
+    unsafe {
+        let op = cx.insts[v].op;
+        let t = tracked(cx, v);
+        if op.is_call() {
+            if t >= 0 && cx.rv_hreg[t] < 0 {
+                cx.rv_hreg[t] = reg_ret(in_fregs(cx.insts[v].ty));
+            }
+            var locations: [i64; 64] = [0; 64];
+            var copies: [i64; 64] = [0; 64];
+            var float_regs = 0;
+            call_locations(cx, v, &locations as *i64, &copies as *i64, &float_regs);
+            for i in 0..cx.insts[v].nargs {
+                let a = tracked(cx, ir_arg(cx, v, i));
+                if a >= 0 && !xl_is_stack(locations[i]) && cx.rv_hreg[a] < 0
+                    && cx.regalloc_uses[ir_arg(cx, v, i)] == 1 {
+                    cx.rv_hreg[a] = arg_reg(locations[i]);
+                }
+            }
+            return;
+        }
+        if t < 0 {
+            return;
+        }
+        if op.is_binary() || op == Neg || op == BNot || op == Conv {
+            let a = tracked(cx, cx.insts[v].a);
+            if a >= 0 && cx.rv_hint[t] < 0
+                && in_fregs(cx.insts[cx.insts[v].a].ty) == in_fregs(cx.insts[v].ty) {
+                cx.rv_hint[t] = a;
+            }
+        }
+        // (0.19) An intrinsic whose instruction overwrites an operand: its
+        // result in that operand's register (no move first).
+        if op == Op::Intr {
+            let k = intr_tied_operand(cx.insts[v].imm);
+            if k >= 0 {
+                let a = tracked(cx, ir_operand(cx, v, k));
+                if a >= 0 && cx.rv_hint[t] < 0 {
+                    cx.rv_hint[t] = a;
+                }
+            }
+        }
+        if op == Select && X86 {
+            // cmov into the register of the value it replaces: that value
+            // would like the select's register. The select itself would like
+            // the register of an operand used only here (free once it is
+            // read): the one it replaces, else the other (an inverted cmov);
+            // either way no movq first.
+            let b = tracked(cx, cx.insts[v].b);
+            if b >= 0 && cx.rv_hint[b] < 0 && cx.regalloc_uses[cx.insts[v].b] == 1 {
+                cx.rv_hint[b] = t;
+            }
+            let a = tracked(cx, cx.insts[v].a);
+            if cx.rv_hint[t] < 0 {
+                if b >= 0 && cx.regalloc_uses[cx.insts[v].b] == 1 {
+                    cx.rv_hint[t] = b;
+                } else if a >= 0 && cx.regalloc_uses[cx.insts[v].a] == 1 {
+                    cx.rv_hint[t] = a;
+                }
+            }
+        }
+    }
+}
+
+pub fn build_intervals(cx: sink *FnCtx) {
+    unsafe {
+        iv_reset(cx);
+        cx.clobbered.count = 0;
+        for r in 0..64 {
+            if is_allocatable(r) && !is_callee_saved_reg(r) {
+                cx.clobbered.push(r);
+            }
+        }
+        cx.split_moves.count = 0;
+        for t in 0..cx.ra_vals.count {
+            cx.rv_first[t] = iv_new(cx, t);
+            cx.rv_slot[t] = -1;
+            cx.rv_hint[t] = -1;
+            cx.rv_hreg[t] = -1;
+        }
+        let live = alloc_array::<u64>(cx.live_words + 1);
+        var out: [i64; 8] = [0; 8];
+        var k = cx.order.count - 1;
+        while k >= 0 {
+            let b = cx.order.data[k];
+            let start = cx.bstart.data[k];
+            let end = cx.bend.data[k];
+            let live_out = live_set(cx, cx.live_out, k);
+            for w in 0..cx.live_words {
+                live[w] = live_out[w];
+                var bits = live_out[w];
+                while bits != 0 {
+                    let bit = trailing_zeros(bits);
+                    bits &= bits - 1;
+                    let t = w * 64 + bit;
+                    rev_add_range(&cx.ivs[cx.rv_first[t]].ranges, start, end + 2);
+                }
+            }
+            let count = term_uses(cx, b, &out as *i64);
+            for i in 0..count {
+                let t = tracked(cx, out[2 * i]);
+                if t >= 0 && is_live_use(cx, out[2 * i], out[2 * i + 1]) {
+                    ra_add_use(cx, t, start, end, out[2 * i + 1], &*live);
+                }
+            }
+            if cx.blocks[b].term == Term::Ret && count > 0 {
+                let t = tracked(cx, out[0]);
+                if t >= 0 && cx.rv_hreg[t] < 0 && !is_compound(FNS[IRFUNCS[cx.irf].f].ret) {
+                    cx.rv_hreg[t] = reg_ret(in_fregs(cx.insts[out[0]].ty));
+                }
+                let pack = cx.blocks[b].cond;
+                if cx.insts[pack].op == Pack {
+                    let f = IRFUNCS[cx.irf].f;
+                    conv_classify(cx, fn_uses_c(f), FNS[f].ret);
+                    for i in 0..count {
+                        let a = tracked(cx, out[2 * i]);
+                        if a >= 0 && cx.rv_hreg[a] < 0 {
+                            cx.rv_hreg[a] = conv_return_piece_reg(cx, fn_uses_c(f), i);
+                        }
+                    }
+                }
+            }
+            var v = cx.blocks[b].last;
+            while v != 0 {
+                let op = cx.insts[v].op;
+                if op != Phi && op != Param && op != Piece && op != Pack
+                    && !is_fused_compare(cx, v) {
+                    let p = cx.insts[v].mark;
+                    let t = tracked(cx, v);
+                    if t >= 0 {
+                        add_def(cx, t, start, p + 2, if op.is_remat() { USE_NONE } else { USE_REG },
+                            &*live);
+                    }
+                    if op.is_call() {
+                        add_piece_defs(cx, v, start, p, &*live);
+                    }
+                    add_clobbers(cx, v, p);
+                    add_hints(cx, v);
+                    for i in 0..ir_operand_count(cx, v) {
+                        let operand = ir_operand(cx, v, i);
+                        let kind = use_kind(cx, v, i);
+                        let a = tracked(cx, operand);
+                        if a >= 0 && is_live_use(cx, operand, kind) {
+                            // An aggregate result in registers is stored through
+                            // its address after the call.
+                            let at = if op.is_call() && i == 2
+                                && !call_returns_through_pointer(cx, v) { p + 2 } else { p };
+                            ra_add_use(cx, a, start, at, kind, &*live);
+                        }
+                    }
+                }
+                v = cx.insts[v].prev;
+            }
+            // Phis and parameters, defined at the start (parameters may come
+            // after other instructions of the entry block).
+            v = cx.blocks[b].first;
+            while v != 0 {
+                let t = tracked(cx, v);
+                let op = cx.insts[v].op;
+                if t >= 0 && (op == Phi || op == Param) {
+                    add_def(cx, t, start, start, USE_NONE, &*live);
+                }
+                v = cx.insts[v].next;
+            }
+            k -= 1;
+        }
+        free(live as *u8);
+        for t in 0..cx.ra_vals.count {
+            let i = cx.rv_first[t];
+            reverse_pairs(&cx.ivs[i].ranges);
+            reverse_pairs(&cx.ivs[i].uses);
+        }
+        for r in 0..64 {
+            reverse_pairs(&cx.fixed[r]);
+        }
+        phi_hints(cx);
+        param_hints(cx);
+    }
+}
+
+// A phi operand would like its phi's register; a phi, the register of the
+// phi it flows into, else of an operand (coalescing them removes moves).
+// Whether value w's hint is only the operand it is computed from (see
+// add_hints), which a phi it flows into overrides: the phi's register
+// saves a move on the edge (a loop's back edge, often), the operand's
+// nothing on AArch64, and on x86-64 nothing either when the operation
+// commutes or has one operand (its result in the phi's register costs
+// the same move as in the operand's).
+fn operand_hint_only(cx: sink *FnCtx, w: i64, t: i64) -> bool {
+    unsafe {
+        let op = cx.insts[w].op;
+        if op == Select && X86
+            && (cx.rv_hint[t] == tracked(cx, cx.insts[w].a)
+                || cx.rv_hint[t] == tracked(cx, cx.insts[w].b)) {
+            return true;
+        }
+        if !(op.is_binary() || op == Neg || op == BNot || op == Conv)
+            || cx.rv_hint[t] != tracked(cx, cx.insts[w].a) {
+            return false;
+        }
+        !X86 || !op.is_binary() || is_commutative(op)
+    }
+}
+
+fn phi_hints(cx: sink *FnCtx) {
+    unsafe {
+        for k in 0..cx.order.count {
+            var v = cx.blocks[cx.order.data[k]].first;
+            while v != 0 && cx.insts[v].op == Phi {
+                let t = tracked(cx, v);
+                if t >= 0 {
+                    for i in 0..cx.insts[v].nargs {
+                        let w = ir_arg(cx, v, i);
+                        let a = tracked(cx, w);
+                        if a >= 0 && (cx.rv_hint[a] < 0 || operand_hint_only(cx, w, a)) {
+                            cx.rv_hint[a] = t;
+                        }
+                    }
+                }
+                v = cx.insts[v].next;
+            }
+        }
+        // A phi's own hint: the value it gets on a back edge (the loop's
+        // value, moved on every iteration when they differ), else the first.
+        for k in 0..cx.order.count {
+            let b = cx.order.data[k];
+            var v = cx.blocks[b].first;
+            while v != 0 && cx.insts[v].op == Phi {
+                let t = tracked(cx, v);
+                if t >= 0 && cx.rv_hint[t] < 0 {
+                    for i in 0..cx.insts[v].nargs {
+                        let a = tracked(cx, ir_arg(cx, v, i));
+                        let p = cx.blocks[b].preds.data[i];
+                        if a >= 0 && a != t && cx.blocks[p].order >= k {
+                            cx.rv_hint[t] = a;
+                        }
+                    }
+                    for i in 0..cx.insts[v].nargs {
+                        let a = tracked(cx, ir_arg(cx, v, i));
+                        if a >= 0 && cx.rv_hint[t] < 0 {
+                            cx.rv_hint[t] = a;
+                        }
+                    }
+                }
+                v = cx.insts[v].next;
+            }
+        }
+    }
+}
+
+// Parameters would like the register they arrive in.
+fn param_hints(cx: sink *FnCtx) {
+    unsafe {
+        let f = IRFUNCS[cx.irf].f;
+        var locations: [i64; 64] = [0; 64];
+        var pieces: [i64; 256] = [0; 256];
+        if FNS[f].param_count > 64 {
+            return;
+        }
+        param_locations(cx, f, &locations as *i64, &pieces as *i64);
+        var v = cx.blocks[IRFUNCS[cx.irf].entry].first;
+        while v != 0 {
+            let t = tracked(cx, v);
+            if cx.insts[v].op == Param && t >= 0 && cx.insts[v].imm >= 0 {
+                let index = cx.insts[v].imm;
+                let piece = cx.insts[v].imm2;
+                let location = if piece > 0 { pieces[4 * index + piece - 1] }
+                    else { locations[index] };
+                if piece >= 0 && !xl_is_stack(location) {
+                    cx.rv_hreg[t] = arg_reg(location);
+                }
+            }
+            v = cx.insts[v].next;
+        }
+    }
+}
+
+pub fn trailing_zeros(bits: u64) -> i64 {
+    var n = 0;
+    var x = bits;
+    while x & 0xff == 0 {
+        x >>= 8;
+        n += 8;
+    }
+    while x & 1 == 0 {
+        x >>= 1;
+        n += 1;
+    }
+    n
+}
+
+// The index of the last range of `list` starting at or before pos, or -1.
+fn ra_range_at(list: *IntVec, pos: i64) -> i64 {
+    var lo = 0;
+    var hi = unsafe { list.count / 2 };
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if unsafe { list.data[2 * mid] <= pos } {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo - 1
+}
+
+pub fn covers(cx: sink *FnCtx, i: i64, pos: i64) -> bool {
+    unsafe {
+        let r = ra_range_at(&cx.ivs[i].ranges, pos);
+        r >= 0 && pos < cx.ivs[i].ranges.data[2 * r + 1]
+    }
+}
+
+// The first position at or after `from` in both range lists, or POS_MAX.
+pub fn next_intersection(a: *IntVec, b: *IntVec, from: i64) -> i64 {
+    unsafe {
+        var i = ra_range_at(a, from);
+        if i < 0 {
+            i = 0;
+        }
+        var j = ra_range_at(b, from);
+        if j < 0 {
+            j = 0;
+        }
+        let na = a.count / 2;
+        let nb = b.count / 2;
+        while i < na && j < nb {
+            let lo = max_i64(max_i64(a.data[2 * i], b.data[2 * j]), from);
+            let hi = min_i64(a.data[2 * i + 1], b.data[2 * j + 1]);
+            if lo < hi {
+                return lo;
+            }
+            if a.data[2 * i + 1] < b.data[2 * j + 1] {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+        POS_MAX
+    }
+}
+
+// The first use of interval i at or after pos needing at least `kind`.
+pub fn next_use(cx: sink *FnCtx, i: i64, pos: i64, kind: i64) -> i64 {
+    unsafe {
+        let uses = &cx.ivs[i].uses;
+        let n = uses.count / 2;
+        var lo = 0;
+        var hi = n;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if uses.data[2 * mid] < pos {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        while lo < n {
+            if uses.data[2 * lo + 1] >= kind {
+                return uses.data[2 * lo];
+            }
+            lo += 1;
+        }
+        POS_MAX
+    }
+}
+
+pub fn min_i64(a: i64, b: i64) -> i64 {
+    if a < b { a } else { b }
+}
+
+// The layout index of the block holding position pos.
+pub fn block_at(cx: sink *FnCtx, pos: i64) -> i64 {
+    var lo = 0;
+    var hi = unsafe { cx.bstart.count };
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if unsafe { cx.bstart.data[mid] <= pos } {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo - 1
+}
+
+fn is_block_start(cx: sink *FnCtx, pos: i64) -> bool {
+    let k = block_at(cx, pos);
+    unsafe { k >= 0 && cx.bstart.data[k] == pos }
+}
+
+// Splits interval i at pos: i keeps what comes before, the new interval
+// (returned) the rest. A split inside a block, where the value is live,
+// moves it in the gap at pos (only gaps hold moves: a split anywhere else
+// must leave the rest on the stack).
+pub fn split_at(cx: sink *FnCtx, i: i64, pos: i64) -> i64 {
+    unsafe {
+        let child = iv_new(cx, cx.ivs[i].value);
+        let n = cx.ivs[i].ranges.count / 2;
+        var r = 0;
+        while r < n && cx.ivs[i].ranges.data[2 * r + 1] <= pos {
+            r += 1;
+        }
+        var live_across = false;
+        var cut = 0;
+        if r < n && cx.ivs[i].ranges.data[2 * r] < pos {
+            live_across = true;
+            cx.ivs[child].ranges.push(pos);
+            cx.ivs[child].ranges.push(cx.ivs[i].ranges.data[2 * r + 1]);
+            cx.ivs[i].ranges.data[2 * r + 1] = pos;
+            cut = r + 1;
+            r += 1;
+        } else {
+            cut = r;
+        }
+        while r < n {
+            cx.ivs[child].ranges.push(cx.ivs[i].ranges.data[2 * r]);
+            cx.ivs[child].ranges.push(cx.ivs[i].ranges.data[2 * r + 1]);
+            r += 1;
+        }
+        cx.ivs[i].ranges.count = 2 * cut;
+        let m = cx.ivs[i].uses.count / 2;
+        var u = 0;
+        while u < m && cx.ivs[i].uses.data[2 * u] < pos {
+            u += 1;
+        }
+        let keep = u;
+        while u < m {
+            cx.ivs[child].uses.push(cx.ivs[i].uses.data[2 * u]);
+            cx.ivs[child].uses.push(cx.ivs[i].uses.data[2 * u + 1]);
+            u += 1;
+        }
+        cx.ivs[i].uses.count = 2 * keep;
+        cx.ivs[child].next = cx.ivs[i].next;
+        cx.ivs[i].next = child;
+        if cx.ivs[i].ranges.count == 0 || cx.ivs[child].ranges.count == 0 {
+            die(c"internal error: empty interval after a split");
+        }
+        if live_across && !is_block_start(cx, pos) && pos % 4 == 3 {
+            cx.split_moves.push(pos);
+            cx.split_moves.push(cx.ivs[i].value);
+        }
+        child
+    }
+}
+
+// The latest position at or before max where a value can move (a gap, or
+// a block start), not before min; -1 if there is none.
+pub fn move_point_before(cx: sink *FnCtx, max: i64, min: i64) -> i64 {
+    unsafe {
+        let k = block_at(cx, max);
+        let start = cx.bstart.data[k];
+        let end = cx.bend.data[k];
+        var q = 0;
+        if max >= end {
+            q = end - 1;
+        } else {
+            q = max - (max + 1) % 4;
+            if q < start + 3 {
+                q = start;
+            }
+        }
+        if q < min { -1 } else { q }
+    }
+}
+
+// Where to split between min and max for a value to come back into a
+// register (or change register): the last move point before max, or the
+// start of the outermost block in between when that is less deep in loops
+// (so that reloads leave loops).
+pub fn split_point(cx: sink *FnCtx, min: i64, max: i64) -> i64 {
+    unsafe {
+        let kmin = block_at(cx, min);
+        let kmax = block_at(cx, max);
+        if kmax > kmin {
+            var best = kmax;
+            var k = kmax;
+            while k > kmin {
+                if cx.ldepth.data[k] < cx.ldepth.data[best] {
+                    best = k;
+                }
+                k -= 1;
+            }
+            if best != kmax {
+                return cx.bstart.data[best];
+            }
+        }
+        move_point_before(cx, max, min)
+    }
+}
+
+// The gap before the instruction using a value at `use_pos` (p for an
+// operand, p + 2 for a result, the end of a block for the terminator).
+pub fn gap_before(use_pos: i64) -> i64 {
+    use_pos - 1 - use_pos % 4
+}

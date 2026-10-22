@@ -1,0 +1,153 @@
+// `query examples [KIND]` (0.17): for each kind of "add an X" change to
+// the compiler or std (the recipes of `volec guide how`), the existing
+// items to start from: their definitions, then the first one's source.
+// The table names items of compiler/src and compiler/std; tests/query
+// checks that every one is still found.
+
+use crate::base::{IntVec, STDOUT, buf_new, buf_str, buf_write_fd, cstr, streq};
+use crate::tools::query::resolve_name;
+use crate::tools::query::diagnostics::{diag, try_begin, try_end};
+use crate::tools::query::show::{query_def_one, query_show};
+
+// The kinds, in the order `query examples` lists them.
+const KINDS: i64 = 10;
+
+// Kind k's name.
+fn kind_word(k: i64) -> *u8 {
+    if k == 0 { c"std-fn" } else if k == 1 { c"std-method" } else if k == 2 { c"peephole" }
+    else if k == 3 { c"egraph-rule" } else if k == 4 { c"pass" }
+    else if k == 5 { c"diagnostic" } else if k == 6 { c"tool-diagnostic" }
+    else if k == 7 { c"subcommand" } else if k == 8 { c"query-command" } else { c"test" }
+}
+
+// What kind k adds, where, and its recipe (`guide how SECTION`).
+fn kind_summary(k: i64) -> *u8 {
+    if k == 0 { c"a std function: compiler/std/*.vl, by its section (guide how add-std-fn)" }
+    else if k
+        == 1 { c"a method of a std type: its impl in compiler/std/*.vl (guide how add-std-fn)" }
+    else if k == 2 { c"an instruction-combining rule: compiler/src/middle/fold/mod.vl, called from combine (guide how add-peephole)" }
+    else if k == 3 { c"a rewrite rule of the e-graph: a line of rule_text, middle/egraph.vl (guide how add-peephole)" }
+    else if k
+        == 4 { c"an optimization pass: fn(fi: i64) -> bool, called from middle/opt.vl (guide how add-pass)" }
+    else if k
+        == 5 { c"a front-end error: err_begin .. err_help .. err_end (guide how add-diagnostic)" }
+    else if k == 6 { c"a tool diagnostic with a code and try: lines, and its explain entry (guide how add-diagnostic)" }
+    else if k
+        == 7 {
+        c"a volec subcommand: run_command's chain, its --help row (guide how add-subcommand)"
+    }
+    else if k
+        == 8 { c"a query command: command_name, answer, put_usage (guide how add-subcommand)" }
+    else {
+        c"a test case: tests/run/NAME.vl with EXPECT, ERROR or CHECK lines (guide how add-test)"
+    }
+}
+
+// Kind k's items, separated by spaces (a test: files).
+fn kind_items(k: i64) -> *u8 {
+    if k == 0 { c"std::trim std::is_digit std::split_whitespace" }
+    else if k == 1 { c"std::Vec::last std::Vec::swap std::Buf::push_str" }
+    else if k == 2 { c"crate::middle::fold::combine_not crate::middle::fold::combine_select crate::middle::fold::combine" }
+    else if k == 3 { c"crate::middle::egraph::rule_text crate::middle::egraph::RULE_COUNT" }
+    else if k == 4 { c"crate::middle::copies::elide_copies crate::middle::tags::thread_tags crate::middle::opt::simplify_function" }
+    else if k
+        == 5 {
+        c"crate::front::check::vectors::vecop_arity crate::front::check::vectors::vector_method"
+    }
+    else if k == 6 { c"crate::tools::explain::usage crate::tools::query::diagnostics::diag crate::tools::explain::tools_table::TOOLS_COUNT" }
+    else if k == 7 { c"crate::tools::plan::run_lint crate::tools::commands::run_command crate::tools::help::HELP_COUNT" }
+    else if k == 8 { c"crate::tools::query::similar::query_similar crate::tools::query::command_name crate::tools::query::answer" }
+    else { c"tests/run/std_text.vl tests/run/opt_egraph.vl tests/run/err_suggest_std.vl" }
+}
+
+// The kind named w, or -1.
+pub fn example_kind(w: *u8) -> i64 {
+    unsafe {
+        for k in 0..KINDS {
+            if streq(w, kind_word(k)) {
+                return k;
+            }
+        }
+        -1
+    }
+}
+
+// `query examples` without a KIND: the kinds. Without the program.
+pub fn list_examples() -> i64 {
+    unsafe {
+        let out = buf_new();
+        for k in 0..KINDS {
+            buf_str(out, kind_word(k));
+            buf_str(out, c"\t");
+            buf_str(out, kind_summary(k));
+            buf_str(out, c"\n");
+        }
+        buf_write_fd(out, STDOUT);
+        0
+    }
+}
+
+// Whether every argument is a kind; the diagnostic for the first that is
+// not (before the program is read).
+pub fn check_kinds(args: IntVec) -> bool {
+    unsafe {
+        for i in 0..args.count {
+            if example_kind(args.data[i] as *u8) < 0 {
+                let d = diag(c"error", c"query.no-kind");
+                buf_str(d, c"no kind of example '");
+                buf_str(d, args.data[i] as *u8);
+                buf_str(d, c"' (query examples lists them)\n");
+                try_end(try_begin(c"examples", cstr(c""), false));
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// `query examples KIND...`: per kind, a line `# KIND: summary`, its
+// items' definitions (a test: its files), then the first item's source.
+pub fn query_examples(args: IntVec) -> i64 {
+    unsafe {
+        var status = 0;
+        for i in 0..args.count {
+            let k = example_kind(args.data[i] as *u8);
+            let out = buf_new();
+            buf_str(out, c"# ");
+            buf_str(out, kind_word(k));
+            buf_str(out, c": ");
+            buf_str(out, kind_summary(k));
+            buf_str(out, c"\n");
+            let names = cstr(kind_items(k));
+            var first = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            var a = 0;
+            while a < names.len {
+                var b = a;
+                while b < names.len && names[b] != ' ' {
+                    b += 1;
+                }
+                let name = names[a..b];
+                a = b + 1;
+                if k == KINDS - 1 {
+                    crate::base::buf_bytes(out, name);
+                    buf_str(out, c"\n");
+                    continue;
+                }
+                var matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                if !resolve_name(c"examples", name, &matches) {
+                    status = 1;
+                    continue;
+                }
+                query_def_one(out, matches.data[0]);
+                if first.count == 0 {
+                    first.push(matches.data[0]);
+                }
+            }
+            buf_write_fd(out, STDOUT);
+            if first.count > 0 && query_show(first, names) != 0 {
+                status = 1;
+            }
+        }
+        status
+    }
+}

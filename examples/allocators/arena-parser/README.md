@@ -19,7 +19,7 @@ this directory, and its output is checked against this file;
 ## Run it
 
 ```console
-$ tachyonc main.tach -o parser && ./parser 2>/dev/null
+$ volec main.vl -o parser && ./parser 2>/dev/null
 (+ 1 (* 2 3) (max 4 5) (- 10 1 2)) = 19
 (+ 1 (* 2 3): a '(' is not closed
 (+ 1 2)): unexpected ')' at byte 7
@@ -135,7 +135,7 @@ comparison is the allocator's cost, not a different algorithm.
 ## What the effects say
 
 ```console
-$ tachyonc query effects parse eval
+$ volec query effects parse eval
 parse<Gpa>	alloc(Gpa) panic diverge
 parse<ScopedArena>	alloc(ScopedArena) panic diverge
 eval<Gpa>	diverge
@@ -162,7 +162,7 @@ them in the kernel.)
 
 ## Read more
 
-- `tachyonc guide allocators`, section "Arenas".
+- `volec guide allocators`, section "Arenas".
 - [scoped-arena](../scoped-arena/): per-request scratch memory, and the
   compile errors that keep arena values in their scope.
 - `examples/algorithms` for the timing conventions (stderr, best of

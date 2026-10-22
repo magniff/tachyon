@@ -7,7 +7,7 @@
 // UnicodeWidthStr::width to cells. (The crates have no incremental
 // segmenter, so an ASCII letter that combining marks follow is not joined
 // to them, and the str width has unicode-width's own rules: the checksum
-// differs from tachyon's.)
+// differs from vole's.)
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 include!("text_gen.rs");

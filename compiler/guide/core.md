@@ -1,6 +1,6 @@
-# tachyon, the core (tachyon 0.20)
+# vole, the core (vole 0.20)
 
-Tachyon is a compiled systems language of values: a value has one
+Vole is a compiled systems language of values: a value has one
 owner, is copied or moved, and is dropped at the end of its scope. A
 function says what it does with each argument: reads it (`let`, the
 default), changes it (`inout`, marked `&x` at the call) or takes it
@@ -8,14 +8,14 @@ default), changes it (`inout`, marked `&x` at the call) or takes it
 (slices, structs holding one) are checked to stay inside what they view.
 Nothing allocates without an allocator, indexing is checked, and safe
 code has no undefined behaviour. This page is the core; the rest is on
-demand (the end). From Rust: `tachyonc guide rust` has the mapping.
+demand (the end). From Rust: `volec guide rust` has the mapping.
 
 ## Build and run
 
 ```sh
-tachyonc main.tach -o prog && ./prog < in.txt   # `mod x;` loads x.tach
-tachyonc check main.tach                        # every error, one line each
-tachyonc try 'parse_int("42")'                  # a snippet: its TYPE = VALUE
+volec main.vl -o prog && ./prog < in.txt   # `mod x;` loads x.vl
+volec check main.vl                        # every error, one line each
+volec try 'parse_int("42")'                  # a snippet: its TYPE = VALUE
 ```
 
 ## The language in one program
@@ -154,8 +154,8 @@ makes a temporary that lives to the end of the block (0.18.1); any other
 owned temporary used without being moved (`f()?.read()`,
 `make().len()`) is dropped at the end of its statement (0.20). A slice
 of `v` is a view: take it again after `v` grows. std's most used items:
-`tachyonc guide std`; all, a line each: `tachyonc guide std#the-api`;
-one name with its comment: `tachyonc guide --find split_in`.
+`volec guide std`; all, a line each: `volec guide std#the-api`;
+one name with its comment: `volec guide --find split_in`.
 
 ## The first errors and their fixes
 
@@ -168,34 +168,34 @@ one name with its comment: `tachyonc guide --find split_in`.
 | `own.moved: 'v' is used here after it moved into 'keep(sink v)'` | lend it (a let parameter), or `keep(v.clone())` |
 | `own.conflict: ... while 'first' views them` | use the view before the change, or take it again after (`guide views`) |
 | `non-exhaustive match: 'E::B' is not covered` | an arm for it, or `_ =>` |
-| `calling a C function is unsafe` | `unsafe { ... }`; `tachyonc fix --only unsafe` adds them |
+| `calling a C function is unsafe` | `unsafe { ... }`; `volec fix --only unsafe` adds them |
 | `no 'cmp' in module 'std'` | every std item is `std::name` (its most used names need no `use`) |
 | `expected 'String', got '[u8]'` | `String::from_in("..", gpa)`: a String owns its text; a parameter `s: str` takes literals and a String's `&s` |
 | `allocation is explicit: pass an allocator` | `Vec::new_in(gpa)`, `gpa` from `fn main(gpa: Gpa)` passed down |
 
-Every error has a `help:`; `tachyonc guide errors` has more.
+Every error has a `help:`; `volec guide errors` has more.
 
 Tests and checks (0.18): `#[test] fn` and `#[property] fn p(v: Vec<i64>)`
-(inputs generated, shrunk) sit next to the code and `tachyonc test` runs
+(inputs generated, shrunk) sit next to the code and `volec test` runs
 them at -O0 and -O2; `requires`/`ensures` clauses and `assert_eq(a, b)`
 are checked at run time, a failure one line `FILE:L:C: message` (`guide
 testing`, `guide contracts`).
 
 SIMD and CPU intrinsics (0.19): `std::arch`, the vendors' names (`vaddq_u8`,
-`__crc32cd`) checked against the CPU: `tachyonc guide arch`; `query arch WORDS`.
-GPU compute and rendering (0.22): `std::gpu`, wgpu's objects on Metal, `-l objc`: `tachyonc guide gpu`.
+`__crc32cd`) checked against the CPU: `volec guide arch`; `query arch WORDS`.
+GPU compute and rendering (0.22): `std::gpu`, wgpu's objects on Metal, `-l objc`: `volec guide gpu`.
 
 ## The loop
 
-Write the program, then `tachyonc check` (a check hook, where there is
+Write the program, then `volec check` (a check hook, where there is
 one, runs it after each edit); fix the first error first. A clean check
-ends with `ok: 0 errors in main.tach`, a build with `ok: built prog`. Before writing a construct
-you are unsure of, `tachyonc guide --find WORDS` (`--find read a line`)
-or `tachyonc guide TOPIC#SECTION` prints the lines on it; `tachyonc
+ends with `ok: 0 errors in main.vl`, a build with `ok: built prog`. Before writing a construct
+you are unsure of, `volec guide --find WORDS` (`--find read a line`)
+or `volec guide TOPIC#SECTION` prints the lines on it; `volec
 try 'CODE'` runs a snippet. For an unfamiliar item, ask
-`tachyonc query context NAME` first: its source, what it calls and its
+`volec query context NAME` first: its source, what it calls and its
 callers in one call (`query context parse_args`). Edits, refactorings
-and the other queries: `tachyonc guide tools`.
+and the other queries: `volec guide tools`.
 
-Topics (`tachyonc guide TOPIC`, `TOPIC#` lists its sections):
+Topics (`volec guide TOPIC`, `TOPIC#` lists its sections):
 @TOPIC-NAMES@

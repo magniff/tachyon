@@ -15,7 +15,7 @@ ensure_image() { # <image> <platform> <dockerfile> [context files...]
     ei_image=$1 ei_platform=$2 ei_dockerfile=$3
     shift 3
     ei_recipe=$(cat "$ei_dockerfile" "$@" | cksum | awk '{ print $1 "-" $2 }')
-    ei_have=$(docker image inspect -f '{{ index .Config.Labels "tachyon.recipe" }}' "$ei_image" 2>/dev/null || true)
+    ei_have=$(docker image inspect -f '{{ index .Config.Labels "vole.recipe" }}' "$ei_image" 2>/dev/null || true)
     if [ "$ei_have" = "$ei_recipe" ] && [ "${REBUILD_IMAGE:-0}" != 1 ]; then
         echo "==> the image $ei_image ($ei_platform) is up to date" >&2
         return 0
@@ -26,10 +26,10 @@ ensure_image() { # <image> <platform> <dockerfile> [context files...]
         /"architecture"/ { a = $2; gsub(/[",]/, "", a); if (a == arch && !found) { print d; found = 1 } }')
     [ -n "$ei_base" ] || die "no $ei_platform manifest of debian:bookworm-slim"
     # (a context of its own: only the files the Dockerfile copies)
-    ei_ctx=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-image.XXXXXX")
+    ei_ctx=$(mktemp -d "${TMPDIR:-/tmp}/vole-image.XXXXXX")
     [ $# -eq 0 ] || cp "$@" "$ei_ctx/"
     if ! docker build --quiet --platform "$ei_platform" --build-arg BASE="debian@$ei_base" \
-        --label "tachyon.recipe=$ei_recipe" -t "$ei_image" -f "$ei_dockerfile" "$ei_ctx" >/dev/null; then
+        --label "vole.recipe=$ei_recipe" -t "$ei_image" -f "$ei_dockerfile" "$ei_ctx" >/dev/null; then
         rm -rf "$ei_ctx"
         die "docker build of $ei_image failed"
     fi
@@ -67,7 +67,7 @@ clamp_cpus() {
 
 # The container's name, and its removal however the script ends (an
 # interrupted `docker run` may leave its container running).
-CONTAINER="tachyon-check-$$-$(date +%s)"
+CONTAINER="vole-check-$$-$(date +%s)"
 stop_container() {
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 }

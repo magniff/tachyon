@@ -35,7 +35,7 @@ fn main(gpa: Gpa) -> i32 {
 ```
 ```out (exit 101)
 4 4
-main.tach:22:16: pop on an empty stack: self.items.len() = 0
+main.vl:22:16: pop on an empty stack: self.items.len() = 0
 ```
 
 - `requires COND` is checked at the call, after the arguments: a failure
@@ -47,7 +47,7 @@ main.tach:22:16: pop on an empty stack: self.items.len() = 0
 - A failure reads `requires failed: 'COND' of 'f' (FILE:L:C): x = 4, ...`
   (the integer operands' values). `else "text"` (or an f-string,
   evaluated only on failure) replaces all before the values.
-- `debug requires` / `debug ensures` are checked only by `tachyonc test`
+- `debug requires` / `debug ensures` are checked only by `volec test`
   (and `--debug-contracts`): for conditions that cost more than the
   function (`debug requires is_sorted(v)`).
 - std's own: `Vec::get`, `set`, `swap`, `insert`, `remove`,
@@ -88,14 +88,14 @@ fn main() -> i32 {
 }
 ```
 ```out (exit 101)
-main.tach:4:5: k is small: k = 3
+main.vl:4:5: k is small: k = 3
 ```
 
 ## The failure line
 
 Every run-time check prints one line, `FILE:LINE:COL: message`, and
 exits with 101: bounds, `as E`, `unwrap`, contracts, assertions.
-`--trace` adds the calls that led there (`tachyonc test` builds with
+`--trace` adds the calls that led there (`volec test` builds with
 it; guide debug).
 
 ## Contracts and the optimizer
@@ -107,11 +107,11 @@ Nothing is assumed: a fact comes only from a check that ran, so a
 function whose address is taken (an indirect call does not check its
 requires) or that C calls keeps its own checks. Integers wrap: `i + 4
 <= v.len()` holds for an i near `i64::MAX`, so it does not prove
-`v[i + 1]`; `x % n` with `requires n > 0` is in `0..n`. `tachyonc
+`v[i + 1]`; `x % n` with `requires n > 0` is in `0..n`. `volec
 query checks FN` lists the checks left after the optimizer and the ones
 it removed.
 
 ## Contracts as tests
 
-`tachyonc test` tests every function with an `ensures` as a property:
+`volec test` tests every function with an `ensures` as a property:
 its inputs generated, its requires filtering them (guide testing).

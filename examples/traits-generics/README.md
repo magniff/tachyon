@@ -5,18 +5,18 @@ with default methods, generic functions with bounds, a trait with an
 associated type, an iterator of the library's own, `#[derive]`d and
 hand-written impls, operator overloading (`+ - * ==` and `<`), and
 `From`/`Into` between units of length. The library is two modules,
-`geometry.tach` and `units.tach`, loaded by `mod` lines in `main.tach`.
+`geometry.vl` and `units.vl`, loaded by `mod` lines in `main.vl`.
 
 ## Build and run
 
-From this folder (with `tachyonc` on your `PATH`, or `../../target/tachyonc`):
+From this folder (with `volec` on your `PATH`, or `../../target/volec`):
 
 ```sh
-tachyonc main.tach -o traits-generics && ./traits-generics
+volec main.vl -o traits-generics && ./traits-generics
 ```
 
-Only `main.tach` is named: `mod geometry;` and `mod units;` load
-`geometry.tach` and `units.tach` next to it.
+Only `main.vl` is named: `mod geometry;` and `mod units;` load
+`geometry.vl` and `units.vl` next to it.
 
 ## Expected output
 
@@ -109,7 +109,7 @@ fn total_area<T: Shape>(shapes: [T]) -> f64 {
 fn largest<T: Ord>(xs: [T]) -> Option<T> { ... }
 ```
 
-**No trait objects: an enum of the cases.** Tachyon has no `dyn Shape`.
+**No trait objects: an enum of the cases.** Vole has no `dyn Shape`.
 A list of different shapes is an enum, and the enum implements the
 trait by dispatching with `match`; `total_area(shapes[..])` then works
 on the mixed list as on the list of rectangles:
@@ -195,10 +195,10 @@ the clone leaves the original as it was; each is freed when it goes out
 of scope. `main` puts a clone of the triangle into the `shapes` array,
 because it uses the triangle afterwards.
 
-**Modules.** `main.tach` loads the library with `mod geometry;` and
+**Modules.** `main.vl` loads the library with `mod geometry;` and
 `mod units;` and imports by name (`use geometry::{Shape, Vec2, ...}`);
 items are private unless `pub` (a struct's fields are as visible as the
-struct; the `pub` on them is documentation). `geometry.tach` reaches its
+struct; the `pub` on them is documentation). `geometry.vl` reaches its
 sibling with `use crate::units::{Meters, SquareMeters};`.
 
 **A little C.** The square root comes from C's `sqrt`, declared in an
@@ -207,13 +207,13 @@ safe function once: `pub fn square_root(x: f64) -> f64 { unsafe { sqrt(x) } }`.
 
 ## Language features
 
-- traits, default methods, operator traits, `impl Ord` by hand: `tachyonc guide traits`
-- generic functions and bounds, monomorphization: `tachyonc guide generics`
-- associated types (`type Output;`, `T::Output`), `impl Iterator`: `tachyonc guide traits`, `tachyonc guide iterators`
-- `#[derive(Eq, Ord, Hash, Debug, Clone)]`, `impl Display`: `tachyonc guide formatting`
-- `From`/`Into` and `T: Into<U>` bounds: `tachyonc guide conversions`
-- modules, `mod`, `pub`, `use crate::...`: `tachyonc guide modules`
-- `static` values of struct type, `extern "C"`: `tachyonc guide syntax`, `tachyonc guide c-interop`
+- traits, default methods, operator traits, `impl Ord` by hand: `volec guide traits`
+- generic functions and bounds, monomorphization: `volec guide generics`
+- associated types (`type Output;`, `T::Output`), `impl Iterator`: `volec guide traits`, `volec guide iterators`
+- `#[derive(Eq, Ord, Hash, Debug, Clone)]`, `impl Display`: `volec guide formatting`
+- `From`/`Into` and `T: Into<U>` bounds: `volec guide conversions`
+- modules, `mod`, `pub`, `use crate::...`: `volec guide modules`
+- `static` values of struct type, `extern "C"`: `volec guide syntax`, `volec guide c-interop`
 
 ## Going further
 

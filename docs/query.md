@@ -1,6 +1,6 @@
-# tachyonc query
+# volec query
 
-`tachyonc query` answers questions about a program from the compiler's
+`volec query` answers questions about a program from the compiler's
 front end: where a name is defined, its source, every reference the
 checker resolved to it, and a module's items. It replaces reading the
 source with `grep`, `sed -n 'N,Mp'` and `head` (see
@@ -12,29 +12,29 @@ line saying what went wrong followed by the commands that recover
 compiler's own `<std>` and `<C import>` last), then line, then column.
 
 ```
-tachyonc query def NAME... [--root ROOT] [--exact]
-tachyonc query show NAME... [--root ROOT] [--exact] [--with-comments]
-tachyonc query show FILE.tach... | MODULE::use | MODULE::header | MODULE::extern
-tachyonc query context NAME...|MODULE [--budget TOKENS]     (0.15) source, calls, types, callers
-tachyonc query text FILE[:A[-B]]...                         (no program read)
-tachyonc query diff [ROOT]                                  the last journaled edit
-tachyonc query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--kind K,...] [--limit N] [--all]
-tachyonc query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
-tachyonc query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]   (0.16)
-tachyonc query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (0.16) the inferred effects
-tachyonc query views NAME...|MODULE [--why]   (0.17) what results and `&mut` parameters view
-tachyonc query features NAME... [--why FEATURE] [-C OPTION]   (0.19) what a function needs of the CPU
-tachyonc query arch WORDS... [--feature F] [--arch A] [--equiv NAME]   (0.19) the intrinsic tables (also `intrinsics`; no program read)
-tachyonc query items [MODULE|TYPE...] [--root ROOT] [--comments]
-tachyonc query show MODULE::section TITLE                   (0.13)
-tachyonc query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--ignore-case] [--count] [--limit N] [--all]
-tachyonc query type FILE:LINE[:COL]...                      (0.13)
-tachyonc query own FILE:LINE:COL...                         (0.17)
-tachyonc query stats [MODULE|FILE] [--over N] [--all]      (refactor.md)
-tachyonc query deps MODULE [--max-lines N]                 (refactor.md)
-tachyonc query unused [MODULE|FILE] [--all]                (refactor.md)
-tachyonc query impact NAME                                 (refactor.md)
-tachyonc query --help
+volec query def NAME... [--root ROOT] [--exact]
+volec query show NAME... [--root ROOT] [--exact] [--with-comments]
+volec query show FILE.vl... | MODULE::use | MODULE::header | MODULE::extern
+volec query context NAME...|MODULE [--budget TOKENS]     (0.15) source, calls, types, callers
+volec query text FILE[:A[-B]]...                         (no program read)
+volec query diff [ROOT]                                  the last journaled edit
+volec query refs NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--kind K,...] [--limit N] [--all]
+volec query callers NAME... [--root ROOT] [--exact] [--count] [--in FILE|MODULE] [--limit N] [--all]
+volec query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]   (0.16)
+volec query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (0.16) the inferred effects
+volec query views NAME...|MODULE [--why]   (0.17) what results and `&mut` parameters view
+volec query features NAME... [--why FEATURE] [-C OPTION]   (0.19) what a function needs of the CPU
+volec query arch WORDS... [--feature F] [--arch A] [--equiv NAME]   (0.19) the intrinsic tables (also `intrinsics`; no program read)
+volec query items [MODULE|TYPE...] [--root ROOT] [--comments]
+volec query show MODULE::section TITLE                   (0.13)
+volec query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--ignore-case] [--count] [--limit N] [--all]
+volec query type FILE:LINE[:COL]...                      (0.13)
+volec query own FILE:LINE:COL...                         (0.17)
+volec query stats [MODULE|FILE] [--over N] [--all]      (refactor.md)
+volec query deps MODULE [--max-lines N]                 (refactor.md)
+volec query unused [MODULE|FILE] [--all]                (refactor.md)
+volec query impact NAME                                 (refactor.md)
+volec query --help
 ```
 
 Every command takes `--budget TOKENS` (0.15, [The output
@@ -42,9 +42,9 @@ budget](#the-output-budget-015)), and answers about std from any program
 ([std](#std-from-any-program-015)).
 
 `ROOT` is the program's root file: `--root ROOT`, or (the form of 0.11's
-first query) a last argument ending in `.tach` after the NAMEs (`items
-ROOT` alone too). Without it: `$TACHYON_ROOT`, else `./main.tach`, else
-`./compiler/src/main.tach`. Positions are `file:line:col`, 1-based, with
+first query) a last argument ending in `.vl` after the NAMEs (`items
+ROOT` alone too). Without it: `$VOLE_ROOT`, else `./main.vl`, else
+`./compiler/src/main.vl`. Positions are `file:line:col`, 1-based, with
 the file as the module loader names it (relative to the current
 directory when ROOT is).
 
@@ -53,7 +53,7 @@ callers list the references to all of them together, each line naming
 its target. A NAME that matches nothing gets its diagnostic and the
 others are still answered (exit 1).
 
-The tools that change a program by name (`tachyonc edit`, `undo`,
+The tools that change a program by name (`volec edit`, `undo`,
 `check`, `fix`, `lint`, `same-output`) and the planning queries (stats,
 deps, unused, impact) are in [refactor.md](refactor.md).
 
@@ -64,78 +64,78 @@ Exit status: 0 answered, 1 no answer (nothing matches, an ambiguous
 
 The table AGENTS.md carried until 0.17, when its core was cut to the
 eight rows agents use (the rest cost tokens on every turn and was not
-used: docs/research/applying-to-tachyon.md, item 2). Each row is what you
+used: docs/research/applying-to-vole.md, item 2). Each row is what you
 want and the command that does it, for the compiler's own source
-(`target/tachyonc`; any program with `--root ROOT`). `tachyonc --help`
-and `tachyonc CMD --help` print the same commands, `tachyonc guide
+(`target/volec`; any program with `--root ROOT`). `volec --help`
+and `volec CMD --help` print the same commands, `volec guide
 tools` the ones a program needs.
 
 | you want | run |
 |---|---|
-| an item with what it calls, its types and callers, in one answer | `target/tachyonc query context NAME` (`--budget N`; a MODULE: its items and central bodies) |
-| the source of a function, type, method | `target/tachyonc query show NAME` |
-| where something is used | `target/tachyonc query refs NAME` (`--count`, `--in FILE\|MODULE`, `--kind write,call,...`; a local: `FN::x` or `FILE:LINE:COL`) |
-| what a function calls, all it reaches; can it change a table | `target/tachyonc query callees FN` (`--transitive`; `--writes TABLE`: the writes and borrows it reaches, with the call chain) |
-| text that is not a name (a message, a comment), with its item | `target/tachyonc query grep TEXT` (`--comments`, `--strings`, `--code`, `--word`, `--ignore-case`, `--in`) |
-| a module's section banners; one section | `target/tachyonc query items MODULE --comments`, `query show MODULE::section TITLE` |
-| the type of an expression | `target/tachyonc query type FILE:LINE:COL` |
-| each local's kind, moves and views at a position (0.17) | `target/tachyonc query own FILE:LINE:COL` |
-| what a function may do (allocate, io, panic, loop forever) | `target/tachyonc query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
-| the CPU intrinsic for a task, its instruction and feature; what a function needs of the CPU (0.19) | `target/tachyonc query arch WORDS` (`--feature crc`, `--equiv NAME`); `query show vqtbl1q_u8`; `query features NAME --why crc` |
-| where it is defined, its signature | `target/tachyonc query def NAME` |
-| what a module contains; a type's methods | `target/tachyonc query items MODULE`; `query items TYPE` |
-| the item at a compiler error's position | `target/tachyonc query show FILE:LINE` (`--with-comments`: its section comment too) |
-| a module's `use` lines, header comment, extern blocks | `target/tachyonc query show MODULE::use` (`::header`, `::extern`) |
-| change a module's `use` lines or header comment | `target/tachyonc edit patch\|replace MODULE::use` (`MODULE::header`, `MODULE::extern`; `edit insert --after MODULE::use`, `edit delete`) |
-| lines of any file (a test, a fixture, conflict markers), a small file | `target/tachyonc query text FILE:A-B`, `query show FILE.tach` |
-| merge conflicts: the regions, their items, both sides; resolve one | `target/tachyonc query conflicts [FILE] [--show]`; `target/tachyonc edit resolve FILE:LINE\|NAME --ours\|--theirs\|--both` (`< text`, `--all`) |
-| change a few lines inside an item (a condition, a statement; FILE:LINE: a comment between items too) | `target/tachyonc edit patch NAME\|FILE:LINE --old 'TEXT' --new 'TEXT'` (pairs repeat; several lines: `< pairs` or `--pairs FILE`, blocks `<<<<<<< OLD` / `=======` / `>>>>>>> NEW`; `--loose` for other indentation; OLD there several times: `--nth N`, `--all`) |
-| add statements inside an item | `target/tachyonc edit insert --in NAME --after\|--before 'ANCHOR' < text` |
-| replace, add or remove an item by name | `target/tachyonc edit replace NAME < new.tach`, `edit insert --after\|--before NAME`, `edit delete NAME` (a module: its file too; `edit replace FILE.tach`: a whole file; `--dry-run` for the diff; the `use` lines new text needs are added) |
-| change several items (several files) in one checked edit | `target/tachyonc edit apply items.tach`: blocks `@@ NAME` (its new text), `@@ new after NAME`, `@@ new in MODULE`, `@@ delete NAME`, or `query show`'s output edited; `edit patch --in NAME` (or `@@ NAME` in `--pairs FILE`) starts another target's pairs |
+| an item with what it calls, its types and callers, in one answer | `target/volec query context NAME` (`--budget N`; a MODULE: its items and central bodies) |
+| the source of a function, type, method | `target/volec query show NAME` |
+| where something is used | `target/volec query refs NAME` (`--count`, `--in FILE\|MODULE`, `--kind write,call,...`; a local: `FN::x` or `FILE:LINE:COL`) |
+| what a function calls, all it reaches; can it change a table | `target/volec query callees FN` (`--transitive`; `--writes TABLE`: the writes and borrows it reaches, with the call chain) |
+| text that is not a name (a message, a comment), with its item | `target/volec query grep TEXT` (`--comments`, `--strings`, `--code`, `--word`, `--ignore-case`, `--in`) |
+| a module's section banners; one section | `target/volec query items MODULE --comments`, `query show MODULE::section TITLE` |
+| the type of an expression | `target/volec query type FILE:LINE:COL` |
+| each local's kind, moves and views at a position (0.17) | `target/volec query own FILE:LINE:COL` |
+| what a function may do (allocate, io, panic, loop forever) | `target/volec query effects NAME\|MODULE` (`--why EFFECT`: the chain; `--has alloc(Gpa)`: which still allocate) |
+| the CPU intrinsic for a task, its instruction and feature; what a function needs of the CPU (0.19) | `target/volec query arch WORDS` (`--feature crc`, `--equiv NAME`); `query show vqtbl1q_u8`; `query features NAME --why crc` |
+| where it is defined, its signature | `target/volec query def NAME` |
+| what a module contains; a type's methods | `target/volec query items MODULE`; `query items TYPE` |
+| the item at a compiler error's position | `target/volec query show FILE:LINE` (`--with-comments`: its section comment too) |
+| a module's `use` lines, header comment, extern blocks | `target/volec query show MODULE::use` (`::header`, `::extern`) |
+| change a module's `use` lines or header comment | `target/volec edit patch\|replace MODULE::use` (`MODULE::header`, `MODULE::extern`; `edit insert --after MODULE::use`, `edit delete`) |
+| lines of any file (a test, a fixture, conflict markers), a small file | `target/volec query text FILE:A-B`, `query show FILE.vl` |
+| merge conflicts: the regions, their items, both sides; resolve one | `target/volec query conflicts [FILE] [--show]`; `target/volec edit resolve FILE:LINE\|NAME --ours\|--theirs\|--both` (`< text`, `--all`) |
+| change a few lines inside an item (a condition, a statement; FILE:LINE: a comment between items too) | `target/volec edit patch NAME\|FILE:LINE --old 'TEXT' --new 'TEXT'` (pairs repeat; several lines: `< pairs` or `--pairs FILE`, blocks `<<<<<<< OLD` / `=======` / `>>>>>>> NEW`; `--loose` for other indentation; OLD there several times: `--nth N`, `--all`) |
+| add statements inside an item | `target/volec edit insert --in NAME --after\|--before 'ANCHOR' < text` |
+| replace, add or remove an item by name | `target/volec edit replace NAME < new.vl`, `edit insert --after\|--before NAME`, `edit delete NAME` (a module: its file too; `edit replace FILE.vl`: a whole file; `--dry-run` for the diff; the `use` lines new text needs are added) |
+| change several items (several files) in one checked edit | `target/volec edit apply items.vl`: blocks `@@ NAME` (its new text), `@@ new after NAME`, `@@ new in MODULE`, `@@ delete NAME`, or `query show`'s output edited; `edit patch --in NAME` (or `@@ NAME` in `--pairs FILE`) starts another target's pairs |
 | an edit refused with `edit.breaks` | each error says `[edited: PATH]` or `[in PATH]`; run the `try:` refactoring it names (`note edit.refactor`), or change the broken items in the same edit (`note edit.together`); `--no-check` last |
-| see what an edit changed, without reading the file back | `--show` on any edit or refactoring; `target/tachyonc query diff` (the last one) |
-| wrap a body or lines in a block (`unsafe`, `loop`), re-indented; make a file with its `mod` line | `target/tachyonc edit wrap NAME --in unsafe [--lines A-B]`, `edit new-file PATH < text` |
-| take the last edit back | `target/tachyonc undo` (outside git: the journal is `.tachyonc/` next to the root) |
-| add, remove, rename, reorder or retype a parameter, with every call | `target/tachyonc refactor signature FN --add 'x: i64 = 0'` (`--remove x`, `--rename-param a b`, `--reorder b,a`, `--type x T --default '$x as T'`) |
-| add, remove, rename or retype a field, with every literal and access | `target/tachyonc refactor field STRUCT --add 'g: i64 = 0'` (`--remove g`, `--rename g h`, `--type g T`) |
-| add a variant (an arm in each match that needs one), remove, rename one | `target/tachyonc refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match; `--remove V`, `--rename V W`) |
-| move lines of a function into a new one, parameters and result computed | `target/tachyonc refactor extract-function FN --lines A-B --to NEW` |
-| put a small function's body where it is called (and delete it) | `target/tachyonc refactor inline FN` (`--at FILE:LINE`: one call) |
-| replace an idiom everywhere, typed | `target/tachyonc rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec' --dry-run` (`--list`: the sites and their holes; `--subst 'P' 'R'`: inside the holes' code; `--where '$v: name ~ RE'`; `--in FN\|MODULE\|FILE`, repeated) |
-| text in any file git tracks (md, sh, toml, sources' comments or strings), one edit; sources renamed to another extension, mentions too, the build compared (0.21, for 0.24's rename) | `target/tachyonc rewrite --text OLD NEW --word --case [--files GLOB] [--comments\|--strings\|--no-sources] [--exclude SPEC] --dry-run --diff`; `target/tachyonc refactor extension .tach .vl ROOT\|DIR\|--all --dry-run` (docs/refactor.md, "Renaming the language") |
-| rename anything (a module: its file too), with every reference | `target/tachyonc refactor rename PATH NEW` (a local or parameter: `FILE:LINE:COL` or `FN::x`, shadowing respected) |
-| move items to another module, imports and `pub` fixed | `target/tachyonc refactor move PATH... --to MODULE` (`--after\|--before ITEM`: where; a MODULE that does not exist is made) |
-| make a module; move one (file, folder, paths) | `target/tachyonc refactor new-module crate::a::b`, `refactor move-module crate::a crate::x::a` |
-| split a module into files | `target/tachyonc refactor split MODULE --plan` (then `--auto`, or `--into M --items a,b`; `--names a,b`; `--reexport` leaves code outside as it is; `--header TEXT`) |
-| several changes, checked once, all or nothing | `target/tachyonc refactor --script steps.txt` (one command per line; `<<END` ... `END` gives one its stdin) |
-| several queries and edits in one call, outputs under `## $ tachyonc ARGS` lines | `target/tachyonc batch < cmds.txt` (one command per line; `--stop` at the first failure) |
-| the errors, one per line (front end only) | `target/tachyonc check` |
-| build what changed and run the tests; counts, then each failure | `target/tachyonc test [FILTER...]` (a program: `tests/NAME.in`/`.out`; `--full`, `--budget N`) |
-| a crash's line and callers; values at a line as the program runs; a failing input made small | `target/tachyonc test` (built with `--trace`), `target/tachyonc probe FILE:LINE EXPR... -- ARGS`, `target/tachyonc reduce FILE --until 'CMD'` (`guide debug`) |
-| missing/unused imports, `pub`, `unsafe` blocks | `target/tachyonc fix` (`--only imports,unused,pub,unsafe`, `--in FILE\|MODULE`, `--dry-run`; several modules have the name: `--use PATH::NAME`) |
-| imports through re-exports, then the re-exports; merged, sorted, wrapped `use` lines | `target/tachyonc fix --only reexports,tidy-imports` (`// api:` above a `pub use` keeps it) |
-| prove a refactoring changed no output | `target/tachyonc same-output OLD_TACHYONC` |
-| file and item sizes | `target/tachyonc query stats [MODULE\|FILE]` |
-| how a module's items use each other, how to split it | `target/tachyonc query deps MODULE --max-lines 1000` |
-| what nothing uses | `target/tachyonc query unused [MODULE\|FILE]` |
-| what a signature change touches | `target/tachyonc query impact NAME` |
-| files over a size | `target/tachyonc lint --max-lines 1000` |
-| lay code out (indentation, spaces, wrapping, `use` lines; edits do it too) | `target/tachyonc fmt FILE\|MODULE` (`--check`, `--dry-run`; `--all` the tree) |
-| what a diagnostic code means, how to fix it | `target/tachyonc explain CODE` (`explain TOOL` lists its codes; `explain WORDS`: the guide on them) |
-| std's API, a std item (from any program, or none) | `target/tachyonc query items std`, `query show std::read_line`, `query def Vec::push` |
-| what an expression or a few statements do, with std | `target/tachyonc try 'STATEMENTS'` (prints the output and `TYPE = VALUE`; `--file F`) |
-| the language on a word, an error message; one section | `target/tachyonc guide --find WORDS`, `guide TOPIC#SECTION` (`guide TOPIC#`: its sections) |
-| add a std function, pass, diagnostic, test, subcommand: the steps; items to copy | `target/tachyonc guide how TASK`; `query examples KIND`; `query similar NAME` |
-| a command's options | `target/tachyonc CMD [SUB] --help` |
+| see what an edit changed, without reading the file back | `--show` on any edit or refactoring; `target/volec query diff` (the last one) |
+| wrap a body or lines in a block (`unsafe`, `loop`), re-indented; make a file with its `mod` line | `target/volec edit wrap NAME --in unsafe [--lines A-B]`, `edit new-file PATH < text` |
+| take the last edit back | `target/volec undo` (outside git: the journal is `.volec/` next to the root) |
+| add, remove, rename, reorder or retype a parameter, with every call | `target/volec refactor signature FN --add 'x: i64 = 0'` (`--remove x`, `--rename-param a b`, `--reorder b,a`, `--type x T --default '$x as T'`) |
+| add, remove, rename or retype a field, with every literal and access | `target/volec refactor field STRUCT --add 'g: i64 = 0'` (`--remove g`, `--rename g h`, `--type g T`) |
+| add a variant (an arm in each match that needs one), remove, rename one | `target/volec refactor variant ENUM --add 'X(i64)' --arm 'EXPR'` (`--arm-in FN 'EXPR'` per match; `--remove V`, `--rename V W`) |
+| move lines of a function into a new one, parameters and result computed | `target/volec refactor extract-function FN --lines A-B --to NEW` |
+| put a small function's body where it is called (and delete it) | `target/volec refactor inline FN` (`--at FILE:LINE`: one call) |
+| replace an idiom everywhere, typed | `target/volec rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: &mut IntVec' --dry-run` (`--list`: the sites and their holes; `--subst 'P' 'R'`: inside the holes' code; `--where '$v: name ~ RE'`; `--in FN\|MODULE\|FILE`, repeated) |
+| text in any file git tracks (md, sh, toml, sources' comments or strings), one edit; sources renamed to another extension, mentions too, the build compared (0.21, for 0.24's rename) | `target/volec rewrite --text OLD NEW --word --case [--files GLOB] [--comments\|--strings\|--no-sources] [--exclude SPEC] --dry-run --diff`; `target/volec refactor extension .vl .vl ROOT\|DIR\|--all --dry-run` (docs/refactor.md, "Renaming the language") |
+| rename anything (a module: its file too), with every reference | `target/volec refactor rename PATH NEW` (a local or parameter: `FILE:LINE:COL` or `FN::x`, shadowing respected) |
+| move items to another module, imports and `pub` fixed | `target/volec refactor move PATH... --to MODULE` (`--after\|--before ITEM`: where; a MODULE that does not exist is made) |
+| make a module; move one (file, folder, paths) | `target/volec refactor new-module crate::a::b`, `refactor move-module crate::a crate::x::a` |
+| split a module into files | `target/volec refactor split MODULE --plan` (then `--auto`, or `--into M --items a,b`; `--names a,b`; `--reexport` leaves code outside as it is; `--header TEXT`) |
+| several changes, checked once, all or nothing | `target/volec refactor --script steps.txt` (one command per line; `<<END` ... `END` gives one its stdin) |
+| several queries and edits in one call, outputs under `## $ volec ARGS` lines | `target/volec batch < cmds.txt` (one command per line; `--stop` at the first failure) |
+| the errors, one per line (front end only) | `target/volec check` |
+| build what changed and run the tests; counts, then each failure | `target/volec test [FILTER...]` (a program: `tests/NAME.in`/`.out`; `--full`, `--budget N`) |
+| a crash's line and callers; values at a line as the program runs; a failing input made small | `target/volec test` (built with `--trace`), `target/volec probe FILE:LINE EXPR... -- ARGS`, `target/volec reduce FILE --until 'CMD'` (`guide debug`) |
+| missing/unused imports, `pub`, `unsafe` blocks | `target/volec fix` (`--only imports,unused,pub,unsafe`, `--in FILE\|MODULE`, `--dry-run`; several modules have the name: `--use PATH::NAME`) |
+| imports through re-exports, then the re-exports; merged, sorted, wrapped `use` lines | `target/volec fix --only reexports,tidy-imports` (`// api:` above a `pub use` keeps it) |
+| prove a refactoring changed no output | `target/volec same-output OLD_VOLEC` |
+| file and item sizes | `target/volec query stats [MODULE\|FILE]` |
+| how a module's items use each other, how to split it | `target/volec query deps MODULE --max-lines 1000` |
+| what nothing uses | `target/volec query unused [MODULE\|FILE]` |
+| what a signature change touches | `target/volec query impact NAME` |
+| files over a size | `target/volec lint --max-lines 1000` |
+| lay code out (indentation, spaces, wrapping, `use` lines; edits do it too) | `target/volec fmt FILE\|MODULE` (`--check`, `--dry-run`; `--all` the tree) |
+| what a diagnostic code means, how to fix it | `target/volec explain CODE` (`explain TOOL` lists its codes; `explain WORDS`: the guide on them) |
+| std's API, a std item (from any program, or none) | `target/volec query items std`, `query show std::read_line`, `query def Vec::push` |
+| what an expression or a few statements do, with std | `target/volec try 'STATEMENTS'` (prints the output and `TYPE = VALUE`; `--file F`) |
+| the language on a word, an error message; one section | `target/volec guide --find WORDS`, `guide TOPIC#SECTION` (`guide TOPIC#`: its sections) |
+| add a std function, pass, diagnostic, test, subcommand: the steps; items to copy | `target/volec guide how TASK`; `query examples KIND`; `query similar NAME` |
+| a command's options | `target/volec CMD [SUB] --help` |
 
 NAME is `foo`, `module::foo`, `Type::method`, `Enum::Variant`,
 `Struct.field` or `FILE:LINE`; several in one call; every spelling a
 tool prints is taken back (`FILE:L:C:`, `FILE:A-B`, `Vec<i64>::push`,
-`main.0`, `./x.tach`). Any query takes `--budget N` (tokens; answers over
+`main.0`, `./x.vl`). Any query takes `--budget N` (tokens; answers over
 8000 are cut, with the command that prints the rest). The root defaults to
-`compiler/src/main.tach` (`--root ROOT`, or a last argument ending in
-`.tach`, for other programs). A problem is one stderr line, `error CODE:
+`compiler/src/main.vl` (`--root ROOT`, or a last argument ending in
+`.vl`, for other programs). A problem is one stderr line, `error CODE:
 message`, then `try:` lines: commands to run as they are. A build prints
 its errors as `check` does, one line each, when its output is not a
 terminal (`--diagnostics=human` for the long form), so a `check` before
@@ -217,7 +217,7 @@ definition is named, and accepted back as NAME:
 - `--exact`: only a full path matches.
 - `FILE:LINE` (or `FILE:LINE:COL`, as a compiler error has it) is the
   innermost item whose text (its comments and attributes included)
-  holds that line: `query show gvn.tach:740` after an error there. FILE
+  holds that line: `query show gvn.vl:740` after an error there. FILE
   is matched like `--in`'s (the path, or its end by whole components).
   A line between items: `error query.no-match: no item at FILE:LINE`,
   `try:` the items of its module; an unknown file: `no file 'FILE' in
@@ -233,24 +233,24 @@ definition is named, and accepted back as NAME:
 ### Every spelling a tool prints (0.15)
 
 What one command prints, another takes back as NAME, FILE or MODULE
-(`query/names.tach`; `tests/query/run.sh` round-trips every name def,
+(`query/names.vl`; `tests/query/run.sh` round-trips every name def,
 show, refs, items, check and the assembly print):
 
 | printed | taken as |
 |---|---|
-| `main.tach:12:5:` (a short diagnostic), `main.tach:12-30` (a show header) | `main.tach:12` |
-| `./main.tach`, `/home/me/prog/main.tach` | the program's `main.tach` (by whole components) |
+| `main.vl:12:5:` (a short diagnostic), `main.vl:12-30` (a show header) | `main.vl:12` |
+| `./main.vl`, `/home/me/prog/main.vl` | the program's `main.vl` (by whole components) |
 | `Vec<i64>::push`, `Vec::<i64>::new`, `twice<V2>` (an instance) | `Vec::push`, `Vec::new`, `twice` |
 | `main.0`, `main.0.1` (a closure's symbol) | `main` |
-| `_tachyon.std.Buf.new`, `tachyon.apply.GN6main.0`, `_tachyon.Tl.cmp` (a symbol of the generated code) | `std::Buf::new`, `apply`, `i64::cmp` |
+| `_vole.std.Buf.new`, `vole.apply.GN6main.0`, `_vole.Tl.cmp` (a symbol of the generated code) | `std::Buf::new`, `apply`, `i64::cmp` |
 | `a::mod`, `f()` | `a`, `f` |
-| `std`, `std.tach`, `<std>` (a FILE) | std's source |
+| `std`, `std.vl`, `<std>` (a FILE) | std's source |
 | `crate`, `a::b` (a module) | its `mod` item; the root's items, with `note query.module` |
 
 `FILE:LINE` on a comment line is the item below it (a show header's
 first line); outside every item (a `use` line) it is what the name at
 COL (or the first on the line) names. `--in`, `items` and the
-refactorings' module paths take a file's path (`./catalog.tach`) and a
+refactorings' module paths take a file's path (`./catalog.vl`) and a
 path without `crate::` (`refactor new-module report`).
 
 ## def
@@ -258,7 +258,7 @@ path without `crate::` (`refactor new-module report`).
 One line per matching definition (shown here with the TABs as `→`):
 
 ```
-crate::middle::gvn::run_gvn→compiler/src/middle/gvn.tach:721:8→fn→pub fn run_gvn(fi: i64) -> bool
+crate::middle::gvn::run_gvn→compiler/src/middle/gvn.vl:721:8→fn→pub fn run_gvn(fi: i64) -> bool
 ```
 
 The position is the name's. The signature is the source up to the body
@@ -268,8 +268,8 @@ a long constant's value is cut to `...`.
 (0.15) A method `#[derive(...)]` makes (Eq's `eq`, Ord's `cmp`, Hash's
 `hash`, Debug's `fmt_debug`, Clone's `clone`) has no source of its own:
 `def P::cmp` (and show, refs, the refactorings' NAME) answers with the
-attribute, `note query.derived: 'P::cmp' is derived, at main.tach:6:14:
-#[derive] makes it; it has no source of its own` and `try: tachyonc
+attribute, `note query.derived: 'P::cmp' is derived, at main.vl:6:14:
+#[derive] makes it; it has no source of its own` and `try: volec
 query show crate::P` (exit 1).
 
 ## show
@@ -278,7 +278,7 @@ Each matching definition's exact source: a header, then whole lines from
 the comments and attributes directly above it through its end.
 
 ```
-// crate::middle::gvn::run_gvn→compiler/src/middle/gvn.tach:721-796
+// crate::middle::gvn::run_gvn→compiler/src/middle/gvn.vl:721-796
 pub fn run_gvn(fi: i64) -> bool {
     ...
 }
@@ -304,9 +304,9 @@ conflict markers. These are answered too:
 | `MODULE::use` | the module's `use` lines (each run of consecutive ones, with their continuation lines) |
 | `MODULE::header` | the comment at the top of its file (to its first line that is neither a comment nor blank) |
 | `MODULE::extern` | its `extern "C" { ... }` blocks |
-| `FILE.tach` (every NAME a file) | the whole file, `// FILE:1-N` then its lines, when it has at most 200 lines; else `error query.too-long` with `try:` `query stats FILE` (compiler source) and `query text FILE:1-200` |
+| `FILE.vl` (every NAME a file) | the whole file, `// FILE:1-N` then its lines, when it has at most 200 lines; else `error query.too-long` with `try:` `query stats FILE` (compiler source) and `query text FILE:1-200` |
 
-Each region is printed as an item is (`// crate::middle::gvn::use→compiler/src/middle/gvn.tach:12-20`,
+Each region is printed as an item is (`// crate::middle::gvn::use→compiler/src/middle/gvn.vl:12-20`,
 then its lines); none: `note query.empty`. A module of an inline `mod m
 { }` has no file of its own: its name is matched as a NAME.
 
@@ -316,7 +316,7 @@ the program (no root, no parse: a test fixture, a generated program, a
 file with conflict markers, a doc):
 
 ```
-// text/main.tach:6-8
+// text/main.vl:6-8
 6→mod util;
 7→
 8→use util::{
@@ -335,15 +335,15 @@ items; `--show` prints both sides. `edit resolve` resolves them
 `query diff [ROOT]`: the last edit of the journal (what `undo` would take
 back, [refactor.md](refactor.md)): `# SUMMARY`, then its diff with no
 context lines. Nothing changes. In a git checkout the journal is in its
-git directory; elsewhere (0.14) in `.tachyonc/edits/` next to the root.
+git directory; elsewhere (0.14) in `.volec/edits/` next to the root.
 
 ### A file outside the compiler's source (0.12)
 
-When the default root would be the compiler's (`./compiler/src/main.tach`,
-or none) and a NAME is a `FILE.tach` or `FILE:LINE` outside compiler/src
-and compiler/std, the root is that file's program: the `main.tach` of its
+When the default root would be the compiler's (`./compiler/src/main.vl`,
+or none) and a NAME is a `FILE.vl` or `FILE:LINE` outside compiler/src
+and compiler/std, the root is that file's program: the `main.vl` of its
 directory or of one of the two above it, else the file itself. So `query
-show tests/run/loops.tach:12` answers from that test, not from the
+show tests/run/loops.vl:12` answers from that test, not from the
 compiler.
 
 ## refs and callers
@@ -351,9 +351,9 @@ compiler.
 Every resolved reference, one per line, under a header per file:
 
 ```
-# compiler/src/middle/gvn.tach
+# compiler/src/middle/gvn.vl
 721:8→def→pub fn run_gvn(fi: i64) -> bool {
-# compiler/src/middle/opt.tach
+# compiler/src/middle/opt.vl
 17:17→use→opt→use crate::middle::gvn::run_gvn;
 533:13→call→opt::simplify_function→run_gvn(fi);
 ```
@@ -423,8 +423,8 @@ references.
 - `callers` is `refs` restricted to calls (method and operator calls
   included; no definition line).
 - `--in FILE|MODULE` keeps the references in a file (an argument with a
-  `/`, ending in `.tach` or `<std>`: the path, or its end by whole
-  components, `gvn.tach`) or a module (matched like NAME, its inline
+  `/`, ending in `.vl` or `<std>`: the path, or its end by whole
+  components, `gvn.vl`) or a module (matched like NAME, its inline
   modules included: `gvn`, `crate::ir`), or the item holding a line,
   `FILE:LINE` (0.12; `rewrite --in` too; `fix --in FILE:LINE` fixes that
   line's module), or (0.13) a directory, by whole components
@@ -445,8 +445,8 @@ references.
   checker resolved, so these read the program in full (no cache).
 
 ```
-$ tachyonc query refs sum::total
-# calls016/main.tach
+$ volec query refs sum::total
+# calls016/main.vl
 12:13→def→let mut total = 0;
 15:9→write→sum→total += i;
 17:13→read→sum→total = total * 2;
@@ -458,13 +458,13 @@ More than 60 references (after `--in`) are not listed: refs prints how
 many each file has, and how to narrow the question:
 
 ```
-compiler/src/back/abi.tach→10
+compiler/src/back/abi.vl→10
 ...
-compiler/src/middle/vectorize.tach→60
+compiler/src/middle/vectorize.vl→60
 note query.truncated: 645 refs in 44 files
-try: target/tachyonc query refs IntVec::push --in compiler/src/middle/vectorize.tach
-try: target/tachyonc query refs IntVec::push --limit 60
-try: target/tachyonc query refs IntVec::push --all
+try: target/volec query refs IntVec::push --in compiler/src/middle/vectorize.vl
+try: target/volec query refs IntVec::push --limit 60
+try: target/volec query refs IntVec::push --all
 ```
 
 (the `--in` suggestion is the file with the most). `--limit N` lists the
@@ -485,11 +485,11 @@ was made is. Past 100 lines, `note query.truncated` and `--all`;
 `--count` the number.
 
 ```
-$ tachyonc query callees add_and_sum --transitive
-1→call→sum→calls016/main.tach:11
-1→call→table::grow→calls016/table.tach:6
-2→call→table::peek→calls016/table.tach:19→via sum
-2→call→table::put→calls016/table.tach:12→via table::grow
+$ volec query callees add_and_sum --transitive
+1→call→sum→calls016/main.vl:11
+1→call→table::grow→calls016/table.vl:6
+2→call→table::peek→calls016/table.vl:19→via sum
+2→call→table::put→calls016/table.vl:12→via table::grow
 ```
 
 `--writes TABLE` (a static or a field) answers whether FN can change
@@ -501,8 +501,8 @@ None: `note query.empty: FN reaches no write or borrow of TABLE (N
 functions reached ...)`.
 
 ```
-$ tachyonc query callees main --writes TABLE
-# calls016/table.tach
+$ volec query callees main --writes TABLE
+# calls016/table.vl
 8:14→borrow→main > add_and_sum > table::grow→put(&TABLE, x);
 ```
 
@@ -515,7 +515,7 @@ panic diverge unsafe` (that order; `alloc` alone for any allocator,
 `alloc(extern)` for C's; `none` for the empty set; ` (unknown)` after a
 set the front end could not infer, a body that failed to check). A
 generic function's line is each of its instances' (`apply<closure(i64)
--> i64 at main.tach:47:32> \t panic`). A MODULE gives the functions of
+-> i64 at main.vl:47:32> \t panic`). A MODULE gives the functions of
 it and of the modules under it (the root's: not std's).
 
 - `--has EFFECT` keeps the functions whose set has EFFECT: `alloc` (any
@@ -525,7 +525,7 @@ it and of the modules under it (the root's: not std's).
   allocates from a Gpa.
 - `--why EFFECT` adds, under each function's line, why it has EFFECT:
   the chain of calls down to the operation it starts at
-  (front/effects/why.tach), each line indented two spaces; `(not:
+  (front/effects/why.vl), each line indented two spaces; `(not:
   EFFECT)` when it has not.
 - An unknown EFFECT is `error query.usage` (exit 2).
 
@@ -536,7 +536,7 @@ so the warm answers stay as fast; `effects` without `--has` and `--why`
 is answered from it too.
 
 ```
-$ tachyonc query effects total --why alloc
+$ volec query effects total --why alloc
 crate::total→alloc(Gpa) panic
   ...the chain...
 ```
@@ -561,10 +561,10 @@ and the editing commands take them too).
 - An unknown FEATURE is `error query.usage` (exit 2).
 
 ```
-$ tachyonc query features twice --why crc -C target-cpu=generic
+$ volec query features twice --why crc -C target-cpu=generic
 crate::twice	crc (inferred)
-  features019/main.tach:11:5: calls 'hw'
-  features019/main.tach:7:5: calls 'std::arch::aarch64::__crc32cd', which needs crc
+  features019/main.vl:11:5: calls 'hw'
+  features019/main.vl:7:5: calls 'std::arch::aarch64::__crc32cd', which needs crc
 ```
 
 ### features: on def, show and context
@@ -596,14 +596,14 @@ template (`<d>` the result, `<a>` parameter a).
 - `--equiv NAME` prints NAME's line, its `equivalent:` column (the
   other architecture's intrinsic, or a recipe), the lines of the
   intrinsics that names, and those whose equivalent names NAME.
-- Nothing matches: `error query.no-match` and `try: tachyonc guide
+- Nothing matches: `error query.no-match` and `try: volec guide
   arch#recipes` (exit 1). The answer is cut at `--budget` as any.
 
 ```
-$ tachyonc query arch saturating subtract u8
+$ volec query arch saturating subtract u8
 aarch64::vqsubq_u8→neon→uqsub <d>.16b, <a>.16b, <b>.16b→lanewise a - b, saturating at 0 and 255
 aarch64::vqsub_u8→neon→uqsub <d>.8b, <a>.8b, <b>.8b→lanewise a - b, saturating at 0 and 255
-$ tachyonc query arch --equiv _mm_movemask_epi8
+$ volec query arch --equiv _mm_movemask_epi8
 x86_64::_mm_movemask_epi8→sse2→pmovmskb <a>, <d:w>→the 16 bytes' top bits as a 16-bit mask
 equivalent: aarch64: (recipe) vshrn_n_u16(vreinterpretq_u16_u8(m), 4)
 aarch64::vshrn_n_u16→neon→shrn <d>.8b, <a>.8h, #<n>→each lane shifted right by n, narrowed ...
@@ -620,7 +620,7 @@ the table; `show` and `context` add its doc, what it computes, its
 equivalent and its `use` line:
 
 ```
-$ tachyonc query show vqtbl1q_u8
+$ volec query show vqtbl1q_u8
 // std::arch::aarch64::vqtbl1q_u8→<std::arch::aarch64>:109-110→effects: none→features: neon→instruction: tbl <d>.16b, {<t>.16b}, <idx>.16b
 // a table lookup: lane k is t[idx[k]], 0 when idx[k] >= 16
 // computes: r[k] = if idx[k] < 16 { t[idx[k]] } else { 0 }
@@ -653,9 +653,9 @@ it is not `views()`; `--print-views` prints every function's summary
 after checking, as `--print-effects` does.
 
 ```
-$ tachyonc query views Parser --why
+$ volec query views Parser --why
 crate::Parser::name→views(*self) inferred
-  why: parse.tach:4:83 't.text': views what 'self' holds
+  why: parse.vl:4:83 't.text': views what 'self' holds
 ```
 
 ## context (0.15)
@@ -671,20 +671,20 @@ gets at least half; what does not fit is counted in a last note with
 the commands that print it:
 
 ```
-$ tachyonc query context report --budget 120
-// crate::report→context/main.tach:9-15→section: Reports
+$ volec query context report --budget 120
+// crate::report→context/main.vl:9-15→section: Reports
 // The total, after restocking the empty items.
 fn report(items: *Vec<Item>) -> i64 {
     ...
 }
 // calls (3)
 std::Vec::len→<std>:120:12→method→pub fn len(self: *Vec<T>) -> i64
-crate::stock::restock→context/stock.tach:10:8→fn→pub fn restock(items: *Vec<Item>, i: i64, n: i64)
+crate::stock::restock→context/stock.vl:10:8→fn→pub fn restock(items: *Vec<Item>, i: i64, n: i64)
 // callers (2)
-main→context/main.tach:21:13→let n = report(&items);
+main→context/main.vl:21:13→let n = report(&items);
 note query.budget: over the budget of 120 tokens, left out: calls 1, types or uses 2, callers 1
-try: tachyonc query callers report
-try: tachyonc query context report --budget 360
+try: volec query callers report
+try: volec query context report --budget 360
 ```
 
 `query context MODULE` prints `items MODULE --comments`, then the
@@ -704,7 +704,7 @@ the answer.
 
 std's items answer from every root, whether the program uses std or
 not, and where there is no program at all (a directory without
-`main.tach`):
+`main.vl`):
 
 - a question that names std (`std`, `std::read_line`, `<std>`,
   `std:A-B`, `--in std`) reads the program with std (and without the
@@ -718,13 +718,13 @@ not, and where there is no program at all (a directory without
 - `text std:A-B` prints std's source (as `<std>` numbers it), `grep
   TEXT --in std` searches it.
 
-(0.17) In the tachyon repository, where std's files are
-(`compiler/std/*.tach`, found from the current directory or one of the
+(0.17) In the vole repository, where std's files are
+(`compiler/std/*.vl`, found from the current directory or one of the
 three above it) and are the std built into the compiler, std's
 positions are those files' lines: `query def std::trim` prints
-`compiler/std/io.tach:102:8`, not `<std>:2075:8`; a FILE:LINE in one of
-them (`query show compiler/std/io.tach:102`, `--in
-compiler/std/io.tach`) reads std from its files. Elsewhere std is the
+`compiler/std/io.vl:102:8`, not `<std>:2075:8`; a FILE:LINE in one of
+them (`query show compiler/std/io.vl:102`, `--in
+compiler/std/io.vl`) reads std from its files. Elsewhere std is the
 compiler's text, `<std>`. The edits of std items: refactor.md, "Editing
 std by name".
 
@@ -739,16 +739,16 @@ of the trait's other impls; anything else: the items of its kind in
 its module, its file's first.
 
 ```
-$ tachyonc query similar std::trim --limit 1
-// 1 of 135 fns like std::trim, nearest first; a new one beside it: tachyonc edit insert --after std::trim < new.tach
-// std::is_digit→compiler/std/io.tach:96-99→effects: none
+$ volec query similar std::trim --limit 1
+// 1 of 135 fns like std::trim, nearest first; a new one beside it: volec edit insert --after std::trim < new.vl
+// std::is_digit→compiler/std/io.vl:96-99→effects: none
 ...
 ```
 
 `query examples` lists the kinds of "add an X" change to the compiler
 and std (`std-fn`, `std-method`, `peephole`, `egraph-rule`, `pass`,
 `diagnostic`, `tool-diagnostic`, `subcommand`, `query-command`,
-`test`), each with where it goes and its recipe in `tachyonc guide how`;
+`test`), each with where it goes and its recipe in `volec guide how`;
 `query examples KIND` prints the kind's items to start from (their
 definitions, then the first one's source; `test`: files). The table of
 items is the compiler's own; tests/query/run.sh checks that every one
@@ -759,7 +759,7 @@ is still found (`self_examples`).
 `items MODULE` lists a module's items in order, without bodies:
 
 ```
-# crate::geom→clash/geom.tach
+# crate::geom→clash/geom.vl
 4→fn→pub fn Point(x: i64) -> i64
 8→struct→pub struct V2
 13→impl→impl V2
@@ -786,7 +786,7 @@ section banners and its comments that belong to no item, each with the
 lines it spans:
 
 ```
-# crate::middle::gvn→compiler/src/middle/gvn.tach
+# crate::middle::gvn→compiler/src/middle/gvn.vl
 58-156→section→The value table
 62→static→static mut VT_KEYS: IntVec = ...
 ...
@@ -817,7 +817,7 @@ the comments, part of an identifier. Each hit is printed as a reference
 is, under its file, with where it is and the item holding it:
 
 ```
-# compiler/src/tools/query/diagnostics.tach
+# compiler/src/tools/query/diagnostics.vl
 23:42→comment→tools::query::diagnostics→// The codes are stable: query.no-match, query.alias, ...
 288:40→string→tools::query::diagnostics::no_match→let out = diag(c"error", c"query.alias");
 ```
@@ -865,13 +865,13 @@ shown.
 then a line per local in scope there (parameters first, then in the
 order they are declared), its name, type and kind (`plain`, `owned`,
 `view`, `owned view`), and, from the own pass's walk of the function
-(front/own/observe.tach), whether it is moved (where, into what) and the
+(front/own/observe.vl), whether it is moved (where, into what) and the
 views it holds (what they view, where they were taken, what invalidated
 them). Without the walk (a template never instantiated, or before the
 checker has it), the kinds alone:
 
 ```
-main.tach:16:17 in crate::main
+main.vl:16:17 in crate::main
 gpa    Gpa       plain
 v      Vec<i64>  owned
 first  [i64]     view
@@ -913,21 +913,21 @@ when it was given, names quoted for the shell when they need it).
 | `undo.empty` | error | 1 | `diff`: no edit in the journal | |
 | `query.program-errors` | warning | (the answer's) | the program has errors: their number, and the first one when nothing answered | the compilation that lists them all, one per line |
 | `query.program-errors` | error | 1 | the program could not be parsed at all | the same |
-| `query.no-root` | error | 2 | no ROOT, no `$TACHYON_ROOT`, no `./main.tach` or `./compiler/src/main.tach` | the command with a root |
+| `query.no-root` | error | 2 | no ROOT, no `$VOLE_ROOT`, no `./main.vl` or `./compiler/src/main.vl` | the command with a root |
 | `query.bad-root` | error | 2 | ROOT cannot be read | the command without it, when a default root exists |
 | `query.usage` | error | 2 | no command, an unknown command or option, a missing NAME or option value, an extra argument | the command corrected (the nearest command, the option dropped, `--limit 60`), or `items` |
 
 ```
 error query.no-match: no definition 'run_gnv'
-try: target/tachyonc query def crate::middle::gvn::run_gvn
+try: target/volec query def crate::middle::gvn::run_gvn
 note query.alias: 'MyVec' is an import alias in crate, for crate::myvec::Vec
-error query.no-root: no root (TACHYON_ROOT, ./main.tach, ./compiler/src/main.tach)
-try: target/tachyonc query def main path/to/main.tach
+error query.no-root: no root (VOLE_ROOT, ./main.vl, ./compiler/src/main.vl)
+try: target/volec query def main path/to/main.vl
 warning query.program-errors: 4 errors in the program; results may be incomplete
-try: target/tachyonc --diagnostics=short broken/main.tach -c -o /dev/null
+try: target/volec --diagnostics=short broken/main.vl -c -o /dev/null
 ```
 
-`tachyonc explain CODE` (0.13; [fmt.md](fmt.md)): what a code means, how
+`volec explain CODE` (0.13; [fmt.md](fmt.md)): what a code means, how
 to fix it, an example; for every code of every tool, and the compiler's
 error kinds (`explain type-error`).
 
@@ -943,10 +943,10 @@ the model, which reads the text form as well and in fewer tokens.
   edit's new errors (on stdout, as now):
 
   ```
-  {"kind":"diagnostic","severity":"error","code":"type error","file":"main.tach","line":4,"col":5,
+  {"kind":"diagnostic","severity":"error","code":"type error","file":"main.vl","line":4,"col":5,
    "message":"undefined variable 'prinln'","help":["did you mean 'println'?"],"notes":[],"try":[]}
   {"kind":"diagnostic","severity":"error","code":"query.no-match","file":null,"line":null,"col":null,
-   "message":"no definition 'nosuch'","help":[],"notes":[],"try":["tachyonc query items"]}
+   "message":"no definition 'nosuch'","help":[],"notes":[],"try":["volec query items"]}
   ```
 
   `code` is the tool's code or the compiler error's kind (`type error`,
@@ -955,7 +955,7 @@ the model, which reads the text form as well and in fewer tokens.
   the commands as the agent would run them (without `--json`).
 - Every other line of stdout: `{"kind":"output","fields":[...]}`, its
   TAB-separated fields ([Output formats](#output-formats)); an edit's
-  summary is `["patched crate::add","main.tach","+1 -1 lines"]`.
+  summary is `["patched crate::add","main.vl","+1 -1 lines"]`.
 - Every key is always there, in this order; new keys may be added at
   the end.
 
@@ -973,7 +973,7 @@ nothing answered, and gives the compilation that prints them all with
 `--diagnostics=short` (one line each:
 `FILE:LINE:COL: error[KIND] MESSAGE | help: ...`). (0.15) A build whose
 stderr is not a terminal (an agent's shell, a pipe, a file) prints that
-form by default, the same lines as `tachyonc check`;
+form by default, the same lines as `volec check`;
 `--diagnostics=human` asks for the multi-line form.
 
 ## Speed: the cache (0.13)
@@ -1010,21 +1010,21 @@ byte for byte: tests/query/run.sh and tests/refactor/run.sh run every
 transcript without the cache and with it (a query twice: the second
 must come from the cache when the first made it).
 
-- Where: `target/tachyonc-cache/q-KEY.bin` and `q-KEY.refs` (every
+- Where: `target/volec-cache/q-KEY.bin` and `q-KEY.refs` (every
   reference, read by refs and callers only), KEY a hash of the root as
-  given, the current directory and the target. `$TACHYON_CACHE` names
+  given, the current directory and the target. `$VOLE_CACHE` names
   another directory, or `off`; without it there is a cache only when the
   current directory has a `target` directory.
 - When it holds: for the compiler that wrote it (a hash of its
   executable), when every file of the program has the text it had (each
   is read again and hashed: an edit by any means is seen), and when the
-  module files that were looked for and not found (`a.tach` before
-  `a/mod.tach`) still do not exist. Else the program is read in full and
+  module files that were looked for and not found (`a.vl` before
+  `a/mod.vl`) still do not exist. Else the program is read in full and
   the cache made anew.
 - Made: by the `query` commands that use it and `check` (which then
   also records what the queries need), after the answer is out, by a copy of the process (fork) while
   the command ends; in the process itself with `--time-passes` or
-  `$TACHYON_CACHE_TRACE` (a file that gets `hit`, `miss` or `save` per
+  `$VOLE_CACHE_TRACE` (a file that gets `hit`, `miss` or `save` per
   use: the tests). `check --overlay` (an edit's check of the edited
   program) makes `q-KEY.next.bin`: the cache once the edit is written,
   taken over by the next command that finds it holds (else removed).
@@ -1037,13 +1037,13 @@ must come from the cache when the first made it).
   edit did not change it ([optimizer.md](optimizer.md), "0.18.1:
   incremental rebuilds"); `--no-cache` goes without.
 
-(0.24) `tachyonc lsp`, the language server ([lsp.md](lsp.md)), reads the
+(0.24) `volec lsp`, the language server ([lsp.md](lsp.md)), reads the
 program once per edit and answers an editor from these same tables.
 
 ## Several commands in one call: batch (0.15)
 
-`tachyonc batch [FILE] [--root R] [--stop]` runs the commands of FILE
-(or stdin), one per line as typed after `tachyonc`: any tool command
+`volec batch [FILE] [--root R] [--stop]` runs the commands of FILE
+(or stdin), one per line as typed after `volec`: any tool command
 (`query`, `edit`, `undo`, `check`, `fix`, `fmt`, `refactor`, `rewrite`,
 `explain`, `guide`, `lint`, `same-output`), quoted as in sh, `#`
 comments, `< PATH` or `<<WORD` (the lines after it up to a line WORD)
@@ -1052,17 +1052,17 @@ sequences agents run call after call: `query items` then `query show`,
 `show` then `refs`, an edit then `check` or `query show`.
 
 ```
-$ tachyonc batch < cmds.txt        (query show clamp; query refs clamp --count)
-## $ tachyonc query show clamp
-// crate::calc::clamp→calc.tach:3-12
+$ volec batch < cmds.txt        (query show clamp; query refs clamp --count)
+## $ volec query show clamp
+// crate::calc::clamp→calc.vl:3-12
 ...
-## $ tachyonc query refs clamp --count
+## $ volec query refs clamp --count
 3
 ```
 
 - Each command runs in turn, in a copy of the process (fork), as it
   would alone: its stdout and stderr together, in the order written,
-  after a line `## $ tachyonc ARGS`, then `## exit N` when N is not 0.
+  after a line `## $ volec ARGS`, then `## exit N` when N is not 0.
   A command without `<` or `<<` reads an empty stdin.
 - A command sees what the commands before it wrote (an edit is written
   when its check passes, as alone). Unlike `refactor --script`, the
@@ -1070,7 +1070,7 @@ $ tachyonc batch < cmds.txt        (query show clamp; query refs clamp --count)
   on its own.
 - A failing command does not end the batch; `--stop` ends it at the
   first. The exit status is the first one that is not 0 (else 0).
-- `--root R` is every command's root (`$TACHYON_ROOT` in each).
+- `--root R` is every command's root (`$VOLE_ROOT` in each).
 - The program is read once: the first command parses it and leaves it
   in the cache (above), and each command after it restores it (about
   10 ms on the compiler's source). Loading it in the batch process and
@@ -1082,27 +1082,27 @@ $ tachyonc batch < cmds.txt        (query show clamp; query refs clamp --count)
 
 ## test: build, run the cases, a summary (0.17)
 
-`tachyonc test [FILTER...] [ROOT.tach]` is the one verification command
-(docs/research/applying-to-tachyon.md, item 3): it builds what changed,
+`volec test [FILTER...] [ROOT.vl]` is the one verification command
+(docs/research/applying-to-vole.md, item 3): it builds what changed,
 runs the tests and ends with a summary whose first line is always the
 counts, then only the failing cases, each with a few lines of
 difference, within `--budget N` tokens (1,000; `--full`: every failure,
 40 lines each, no budget unless given). It never needs `| tail`.
 
-**A program** (ROOT, default `./main.tach`). A case is `tests/NAME.in`
+**A program** (ROOT, default `./main.vl`). A case is `tests/NAME.in`
 (its stdin; none: empty) with `tests/NAME.out` (the expected stdout) in
 ROOT's directory (`--dir DIR`: another), and `tests/NAME.exit`, when
 there, the expected exit status (default 0): the agent eval's own
 convention, and the one agents write by hand. Output is compared as the
 eval grades it: `\r\n` as `\n`, trailing whitespace at the end left out.
-The program is built into `.tachyonc/test/prog` next to ROOT when a
-`.tach` file under ROOT's directory is newer than the build, or the
+The program is built into `.volec/test/prog` next to ROOT when a
+`.vl` file under ROOT's directory is newer than the build, or the
 compiler or `-O` level differs; each run's stdout and stderr stay there
 (`NAME.got`, `NAME.err`). A case may run `--timeout S` seconds (10).
 
 ```text
-$ tachyonc test --timeout 1
-test main.tach: 2 passed, 3 failed (tests/)
+$ volec test --timeout 1
+test main.vl: 2 passed, 3 failed (tests/)
 FAIL bad: stdout differs at line 2 (3 lines expected, 3 printed)
   - line 2: B
   - line 3: c
@@ -1112,8 +1112,8 @@ FAIL crash: exit 3 (expected 0)
 FAIL hang: no exit after 1 s (--timeout S)
   stderr: stopped by signal 14 (SIGALRM: a time limit)
   stderr: trace, innermost call first:
-  stderr:   main.tach:12  main
-(outputs: .tachyonc/test/NAME.got, NAME.err)
+  stderr:   main.vl:12  main
+(outputs: .volec/test/NAME.got, NAME.err)
 ```
 
 (0.17) The program is built with `--trace` (not with `-O 0`; `--no-trace`
@@ -1122,33 +1122,33 @@ turns it off): a case that crashes or runs out of time shows the first
 `FILE:LINE  function`.
 
 A FILTER selects the cases whose name contains it. Without cases, the
-build alone (`test main.tach: builds; no tests in tests/ ...`), or one
+build alone (`test main.vl: builds; no tests in tests/ ...`), or one
 run on `--input FILE` (`-`: stdin): its exit status, its output within
 the budget, its stderr. A build that fails prints `test ROOT: does not
 build (N errors)` and the errors, one line each.
 
-**The tachyon tree** (`./compiler/src/main.tach` and `./tests/run.sh`,
+**The vole tree** (`./compiler/src/main.vl` and `./tests/run.sh`,
 no ROOT): `compiler/std/embed.sh` when compiler/std is newer than its
-embedding; `target/tachyonc` rebuilt (one build, by
-`target/tools/tachyonc` when there; `bootstrap/bootstrap.sh --dev`
-checks the fixpoint) when a `.tach` file of compiler/src or compiler/std
+embedding; `target/volec` rebuilt (one build, by
+`target/tools/volec` when there; `bootstrap/bootstrap.sh --dev`
+checks the fixpoint) when a `.vl` file of compiler/src or compiler/std
 is newer; then `tests/run.sh [-O N] FILTER` once per FILTER (none: the
 whole suite), its `FAIL` blocks (8 lines each) and totals summarized:
 
 ```text
-$ target/tachyonc test gvn inline
-test gvn inline: 40 passed, 1 failed (tests/run.sh; target/tachyonc rebuilt in 1.9 s; 7.31 s)
+$ target/volec test gvn inline
+test gvn inline: 40 passed, 1 failed (tests/run.sh; target/volec rebuilt in 1.9 s; 7.31 s)
 FAIL run_gvn_loads:
   stdout mismatch
   ...
 ```
 
-(0.17) Each failing case is run again with `target/tools/tachyonc`, the
+(0.17) Each failing case is run again with `target/tools/volec`, the
 last build whose suite passed (when its bytes differ from
-`target/tachyonc`'s; `--against TACHYONC` another, `--against none`
+`target/volec`'s; `--against VOLEC` another, `--against none`
 not at all): its block ends with `(new: passes with ...)` or `(fails
 with ... too: not from this change)`, and the headline counts both
-(`with target/tools/tachyonc: 1 new, 6 failing too`). A failure that
+(`with target/tools/volec: 1 new, 6 failing too`). A failure that
 fails before the change too is the environment's or older: no need to
 stash the change and rebuild to find out.
 
@@ -1159,9 +1159,9 @@ tests/refactor/testcmd.t has a transcript.
 
 ## probe, reduce, --trace: what a program does (0.17)
 
-`tachyonc guide debug` is the agent-facing text, with the recipe.
+`volec guide debug` is the agent-facing text, with the recipe.
 
-- `tachyonc FILE.tach --trace -o prog` (middle/trace.tach): each
+- `volec FILE.vl --trace -o prog` (middle/trace.vl): each
   function of the program's own files keeps a frame on a shadow stack
   (4096 entries, a ring), set at its entry, before each call (the line
   of the expression lowered last, so the line of `v[i]` in a statement
@@ -1173,7 +1173,7 @@ tests/refactor/testcmd.t has a transcript.
   larger binary (the site strings); none without the flag. Without it,
   a failure is one line, `FILE:LINE:COL: message` (0.18; 0.17 added a
   note on --trace).
-- `tachyonc probe FILE:LINE [EXPR...]... [--count FILE:LINE] [--max N]
+- `volec probe FILE:LINE [EXPR...]... [--count FILE:LINE] [--max N]
   [--input FILE] [--timeout S] [-O N] [--root ROOT] [-- ARGS]`
   (tools/probe/): the line's statement found in the front end's tree
   (before it; after a `let`; in a loop's body; at the start of a block
@@ -1186,17 +1186,17 @@ tests/refactor/testcmd.t has a transcript.
   the build (with --trace) is run, and its stderr's `@@probe` lines
   become the report. Counts come from an atexit report, else (stopped)
   from the powers of two each probe announces (`at least N`).
-- `tachyonc reduce FILE --until 'CMD' [--out F] [--max-runs N]
-  [--timeout S]` (tools/reduce.tach): delta debugging on lines; CMD
+- `volec reduce FILE --until 'CMD' [--out F] [--max-runs N]
+  [--timeout S]` (tools/reduce.vl): delta debugging on lines; CMD
   (`sh -c`, `{}` the candidate, which keeps FILE's name in
-  `.tachyonc/reduce/`) exits 0 while the failure is there; each run in
+  `.volec/reduce/`) exits 0 while the failure is there; each run in
   a process group killed after S seconds (5).
 
 Codes: `probe.usage`, `probe.no-root`, `probe.no-file`,
 `probe.no-line`, `probe.no-statement`, `probe.expr`, `probe.build`,
 `reduce.usage`, `reduce.no-file`, `reduce.not-failing`
-(`tachyonc explain CODE`). tests/refactor/debugtools.t has a
-transcript; tests/run/trace_*.tach the traces.
+(`volec explain CODE`). tests/refactor/debugtools.t has a
+transcript; tests/run/trace_*.vl the traces.
 
 ## The agent hooks (0.17)
 
@@ -1204,47 +1204,47 @@ tools/agent-hooks, registered in .claude/settings.json (and per
 condition in tools/agent-hooks/settings-eval.json for the agent eval):
 
 - **check-after-edit.py** (PostToolUse): `check --json` after every
-  Write or Edit of a `.tach` file, every `tachyonc edit|refactor|fix|
-  rewrite|undo` that wrote, and every shell command that writes a `.tach`
-  file (`> f.tach`, `tee`, `cp`, `mv`). The root and the compiler are
+  Write or Edit of a `.vl` file, every `volec edit|refactor|fix|
+  rewrite|undo` that wrote, and every shell command that writes a `.vl`
+  file (`> f.vl`, `tee`, `cp`, `mv`). The root and the compiler are
   the command's own: a Bash line's `cd`s are followed (`cd WORKTREE &&
-  tachyonc edit ...` checks WORKTREE). The compiler is
-  target/tools/tachyonc, except for a program outside the compiler's
-  own source (a test case, an example) when target/tachyonc is newer: a
+  volec edit ...` checks WORKTREE). The compiler is
+  target/tools/volec, except for a program outside the compiler's
+  own source (a test case, an example) when target/volec is newer: a
   compiler just rebuilt from a fixed source checks the programs written
   for the fix (0.17; the tools binary reported the errors the fix had
   removed). After the session's first check
-  of a root it reports the delta: `tachyonc check main.tach: 2 errors (1
+  of a root it reports the delta: `volec check main.vl: 2 errors (1
   new, 1 fixed, 1 as before)` and only the new errors; `0 errors (2
   fixed)` when it became clean; nothing when it was and is clean. After
-  a clean check of a program with tests (`tests/*.out`), `tachyonc test
+  a clean check of a program with tests (`tests/*.out`), `volec test
   ROOT --full --timeout 2` runs (not again within 20 s,
-  `$TACHYON_TEST_DEBOUNCE`; never again for a program whose tests took
+  `$VOLE_TEST_DEBOUNCE`; never again for a program whose tests took
   over 8 s) and its line follows: the counts, the newly failing cases
-  with their differences, the fixed ones by name. TACHYON_CHECK_TESTS=0
-  leaves the tests out. (0.18.1) Errors whose `try:` is `tachyonc fix
+  with their differences, the fixed ones by name. VOLE_CHECK_TESTS=0
+  leaves the tests out. (0.18.1) Errors whose `try:` is `volec fix
   --suggested` (the compiler gives it only for an exact fix: a
   did-you-mean name with one candidate, a missing `use` or `pub`, a
   conversion) are fixed by the hook: it runs `fix --suggested --json
   ROOT` (one checked, journaled edit), checks again, and prints a head
-  line (`tachyonc fix --suggested main.tach, run by the hook (tachyonc
+  line (`volec fix --suggested main.vl, run by the hook (volec
   undo takes it back; ...)`), a `fixed FILE:L:C: MESSAGE | FIX` line per
   error it fixed, then the errors left. A refused fix leaves the report
-  as before, with its `try:`; TACHYON_HOOK_FIX=0 turns it off; the
+  as before, with its `try:`; VOLE_HOOK_FIX=0 turns it off; the
   record says `hook_fixed`. (The 0.18 eval: the `try:` was offered 43
   times and run once.)
 - **turn-end.py** (Stop): when a root this session touched (or the
   current directory's) changed since its last clean check and test run,
   `check` (and the tests) once; errors or failures block the stop once,
-  with `turn-end: unchecked changes in main.tach: 2 errors` and the
+  with `turn-end: unchecked changes in main.vl: 2 errors` and the
   errors as the reason. Never twice for the same sources.
 - **query-first.py** (PreToolUse, PostToolUse on Bash): blocks a shell
-  read of `.tach` source, judging each command of a line on its own (in
+  read of `.vl` source, judging each command of a line on its own (in
   the directory its `cd`s lead to, `$VAR`s assigned on the line
   expanded); a whole file under 300 lines is read freely with `cat`,
   `head`, `tail`, `sed -n`; a larger one gets its length and `query items
-  MODULE`; a `.tach` file outside any program's module tree (a probe, a
-  scratch copy: not a main.tach, not declared by a `mod` line) is not
+  MODULE`; a `.vl` file outside any program's module tree (a probe, a
+  scratch copy: not a main.vl, not declared by a `mod` line) is not
   source. The blocked record logs the `try:` commands it gave. After a
   call: a `# no-query:` reason asking for line numbers for the Edit tool
   is answered with `edit insert --after NAME` and `query def NAME`; the
@@ -1252,10 +1252,10 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   show, refs, def or callers in a row on related items: one name, a name
   and its type or module, a name the previous answer printed;
   `unfamiliar-construct` from the check hook) are printed as written
-  there, each once a session; TACHYON_HINTS=0 turns them off. Every text
+  there, each once a session; VOLE_HINTS=0 turns them off. Every text
   a hook adds is a factual statement with its command, the same words
   every time (no times, no ids: appended text is written to the prompt
-  cache once). With TACHYON_QUERY_MODE=rewrite (the eval's `+rewrite`), a
+  cache once). With VOLE_QUERY_MODE=rewrite (the eval's `+rewrite`), a
   read whose query is not in doubt runs as that query instead of being
   blocked (PreToolUse `updatedInput`, permission `allow`, and a one-line
   `note hook.query-first: ... ran as ...` beside the result): `sed -n
@@ -1265,13 +1265,13 @@ condition in tools/agent-hooks/settings-eval.json for the agent eval):
   files, a regex or another flag is blocked as before; writes always are.
 - **lookup-note.py** (PostToolUse on Bash; the eval's `+note`): when a
   `guide`, `query`, `explain` or `--help` call prints the same text as
-  the same call earlier in the session, one line: ``note: `tachyonc
+  the same call earlier in the session, one line: ``note: `volec
   guide std` printed the same text at shell call 4 of this session``, once
   per call. The call runs: an old result may have been cleared from the
-  context. TACHYON_LOOKUP_NOTE=0 turns it off.
+  context. VOLE_LOOKUP_NOTE=0 turns it off.
 
-The hooks keep a small per-session state ($TACHYON_HOOK_STATE, default
-$TMPDIR/tachyon-agent-hooks). Measured on an M-series Mac under load
+The hooks keep a small per-session state ($VOLE_HOOK_STATE, default
+$TMPDIR/vole-agent-hooks). Measured on an M-series Mac under load
 (load average 6 on 12 cores; medians, Python's start included): a Bash
 call that changes nothing, 46 ms in the check hook (45 before 0.17) and
 60 ms in query-first (as before); the check hook after an edit, 76 ms

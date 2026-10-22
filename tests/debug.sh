@@ -1,5 +1,5 @@
 #!/bin/sh
-# Debug information against a real debugger (0.11): tests/debug/crash.tach
+# Debug information against a real debugger (0.11): tests/debug/crash.vl
 # (two files) is compiled with -g at -O0 and -O2 and run under lldb
 # (macOS) or gdb (Linux). Breakpoints on source lines of both files must
 # stop there, and the backtrace of the crash that follows must give every
@@ -7,7 +7,7 @@
 #
 # usage: tests/debug.sh [-c COMPILER] [-t TARGET]
 #
-#   -c COMPILER   the tachyonc to test (default: target/tachyonc)
+#   -c COMPILER   the volec to test (default: target/volec)
 #   -t TARGET     the target (default: the host); its programs must run here
 
 set -u
@@ -15,7 +15,7 @@ LC_ALL=C
 export LC_ALL
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 TARGET=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -39,31 +39,31 @@ if [ "$TARGET" = x86_64-macos ] && [ "$(uname -m)" = arm64 ]; then
     exit 0
 fi
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-debug.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-debug.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 
 # What the debugger must print, one pattern per line, in order: a
 # breakpoint in each file (with its frame), then the frames of the crash.
 cat >"$WORK/expect" <<'EOF'
-total.* at .*helper.tach:10
-poke.* at .*crash.tach:13
-poke.* at .*crash.tach:13
-outer.* at .*crash.tach:20
-main.* at .*crash.tach:26
+total.* at .*helper.vl:10
+poke.* at .*crash.vl:13
+poke.* at .*crash.vl:13
+outer.* at .*crash.vl:20
+main.* at .*crash.vl:26
 EOF
 
 failed=0
 for o in 0 2; do
     exe="$WORK/crash$o"
-    if ! (cd "$ROOT" && "$COMPILER" --target "$TARGET" -g "-O$o" tests/debug/crash.tach -o "$exe") >"$WORK/out" 2>&1; then
+    if ! (cd "$ROOT" && "$COMPILER" --target "$TARGET" -g "-O$o" tests/debug/crash.vl -o "$exe") >"$WORK/out" 2>&1; then
         echo "FAIL -O$o: compilation: $(head -c 300 "$WORK/out")"
         failed=$((failed + 1))
         continue
     fi
     # Three runs: stopped at each breakpoint, then the crash.
     : >"$WORK/log$o"
-    for stop in helper.tach:10 crash.tach:13 crash; do
+    for stop in helper.vl:10 crash.vl:13 crash; do
         if [ "$DEBUGGER" = lldb ]; then
             if [ "$stop" = crash ]; then
                 printf 'run\nbt\nquit\n' >"$WORK/cmds"
@@ -108,5 +108,5 @@ for o in 0 2; do
     fi
     echo "ok -O$o"
 done
-echo "debug: tests/debug/crash.tach at -O0 and -O2 under $DEBUGGER for $TARGET, $failed failing"
+echo "debug: tests/debug/crash.vl at -O0 and -O2 under $DEBUGGER for $TARGET, $failed failing"
 [ "$failed" -eq 0 ]

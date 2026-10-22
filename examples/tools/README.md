@@ -1,7 +1,7 @@
 # The compiler as a toolset
 
 Each directory here is a small, realistic program and a session that
-changes it with `tachyonc`'s tools: the queries that read a program by
+changes it with `volec`'s tools: the queries that read a program by
 name, and the edits and refactorings that change it by name, checked
 before they are written. The sessions are written for a reader who
 drives the tools by hand, and for an agent that drives them in a loop.
@@ -20,7 +20,7 @@ drives the tools by hand, and for an agent that drives them in a loop.
 ## Why tools, and not grep and sed
 
 An agent working on code spends most of its effort reading it, and
-reads it blind. Over the first ten releases of tachyon (about thirty
+reads it blind. Over the first ten releases of vole (about thirty
 agents, two days of work), every shell command the agents ran was
 recorded and classified ([docs/agent-tool-usage.md](../../docs/agent-tool-usage.md)):
 
@@ -39,23 +39,23 @@ recorded and classified ([docs/agent-tool-usage.md](../../docs/agent-tool-usage.
   `refactor` and `rewrite` change what the compiler resolved, and every
   edit is checked: one that adds an error writes nothing.
 - The tally of programs run: `grep` 3310 times, `head` 2585, `sed` 1937,
-  `tachyonc` 410.
+  `volec` 410.
 
 The tools were built from that list. The evaluation of 0.13
 ([docs/eval/0.13-findings.md](../../docs/eval/0.13-findings.md)) measured
-what they buy, with Claude Sonnet and Haiku on twelve tasks, in tachyon
+what they buy, with Claude Sonnet and Haiku on twelve tasks, in vole
 and in Rust:
 
 - **The refactor task is where the tools win.** On a rename across a
   program, Sonnet with the tools used 103k tokens; the same task
   in Rust took 160k tokens. With the tools and the guide together it
   took 27 seconds, against 33 in Rust.
-- On existing code (fix and extend tasks), tachyon cost about what Rust
+- On existing code (fix and extend tasks), vole cost about what Rust
   does: 51-197k tokens against 73-123k.
 - **They do not pay off everywhere.** Given the tools without the
   guide, agents explored small programs query by query (Haiku made 134
   `query` calls over 12 small tasks); on a program of a few hundred
-  lines, reading a file once costs less (`query show FILE.tach` prints
+  lines, reading a file once costs less (`query show FILE.vl` prints
   one). The tools pay off on renames, moves, signature, field and
   variant changes, errors across files, and code too large to read,
   which is what these examples do.
@@ -66,7 +66,7 @@ What makes them suited to an agent, beyond being right:
   (`--budget N` cuts any answer to about N tokens, and says what it
   left out).
 - **Every problem is one line** `error CODE: message`, then `try:`
-  lines that are commands to run as they are; `tachyonc explain CODE`
+  lines that are commands to run as they are; `volec explain CODE`
   says what a code means.
 - **Edits are atomic and checked**: the program is checked with the
   change before the change is written; an edit that adds an error writes
@@ -87,7 +87,7 @@ walkthrough` runs only it). When a tool's output changes on purpose,
 (the prose around it is kept), and the diff shows what changed.
 
 ```text
-$ COMMAND      a shell line, run in the copy; `tachyonc` is the compiler under test
+$ COMMAND      a shell line, run in the copy; `volec` is the compiler under test
 > MORE         the command's next line (a heredoc's text)
 other lines    what it printed: stdout, then stderr, then [exit N] when N is not 0
 ```

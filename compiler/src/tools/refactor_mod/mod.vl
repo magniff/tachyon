@@ -1,0 +1,914 @@
+// The module-structure refactorings (0.11, phase 2a; docs/refactor.md):
+//
+//   volec refactor rename PATH NEW            an item, method, field, variant or
+//                                                module, and every reference to it
+//   volec refactor move PATH... --to MODULE   items into another module
+//   volec refactor new-module crate::a::b [--file|--dir]
+//   volec refactor move-module crate::a crate::x::a
+//   volec refactor split MODULE --into NEWMOD --items a,b,c
+//   volec refactor split MODULE --plan|--auto [--max-lines N]
+//
+// Each is one edit of the edit engine (edit.vl): checked before it is
+// written (nothing is written when it adds an error), journaled for
+// `undo`, printed as a diff with --dry-run, one summary line. The moves
+// and splits are in refactor_move.vl; this file has the command line,
+// what they share (every reference of the program, the modules an edit
+// makes, module files), rename, new-module and move-module.
+
+pub mod cli;
+
+pub mod local;
+pub mod mentions;
+
+use crate::base::{
+    FILES, FILE_COUNT, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern,
+};
+use crate::front::ast::{NODES, NODE_COUNT, child};
+use crate::front::cpp::directives::{file_exists, path_dir};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::modules::{MODULES, STD_MODULE, file_of_pos, module_at, module_count, module_of};
+use crate::middle::lower::ssa::HMap;
+use crate::tools::edit::{edit_move_file, edit_new_file, edit_replace};
+use crate::tools::edit::cli::delete_lines;
+use crate::tools::proc::{buf_cstr, same_bytes};
+use crate::tools::query::{QF_DEF, QF_USE, c_slice};
+use crate::tools::query::defs::{
+    DEFS, DEF_COUNT, K_FIELD, K_IMPL_METHOD, K_METHOD, K_MOD, K_TRAIT_FN, K_VARIANT, MOD_DEF,
+    bytes_eq, kind_name, mod_fqn_text,
+};
+use crate::tools::query::diagnostics::{diag, try_begin, try_end};
+use crate::tools::query::positions::{line_end, line_start, shorthand_at, shorthand_text, token_at};
+use crate::tools::query::refs::{R_DEF, R_FLAGS, R_POS, collect_refs, set_targets, sorted_refs};
+use crate::tools::query::show::text_start;
+use crate::tools::refactor_mod::cli::{EDIT_FAILED, inline_module, is_name_use, user_pos};
+
+// ---- The program's references ----
+
+// Every reference the checker resolved (every definition is a target),
+// in order, each once: indices into query's R_* vectors.
+pub static var REFS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// What the name a `use` imports at a position is (position + 1 ->
+// definition + 1), and its Ident node (position + 1 -> node).
+static var USE_AT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var USE_ID: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// The Use node of a name's Ident node (node -> Use node).
+static var USE_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// The names of the modules: (module, name) -> definition + 1, for the
+// items (and `mod` declarations), and for the imports.
+static var ITEM_BIND: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var USE_BIND: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+fn bind_key(m: i64, name: i64) -> i64 {
+    (m + 1) * 4294967296 + name + 1
+}
+
+// Collects the references of the whole program, and the names of its
+// modules.
+pub fn load_refs() {
+    unsafe {
+        var all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for d in 0..DEF_COUNT {
+            all.push(d);
+            let k = DEFS[d].kind;
+            if DEFS[d].parent < 0 && k != K_METHOD && k != K_IMPL_METHOD {
+                ITEM_BIND.put(bind_key(DEFS[d].module, DEFS[d].name), d + 1);
+            }
+        }
+        set_targets(all);
+        collect_refs();
+        sorted_refs(&REFS);
+        for k in 0..REFS.count {
+            let r = REFS.data[k];
+            if (R_FLAGS.data[r] & QF_USE) != 0 {
+                USE_AT.put(R_POS.data[r] + 1, R_DEF.data[r] + 1);
+            }
+        }
+        for u in 1..NODE_COUNT {
+            if !is_name_use(u) {
+                continue;
+            }
+            let m = module_of(u);
+            for k in 0..NODES[u].count {
+                let id = child(u, k);
+                USE_ID.put(NODES[id].start + 1, id);
+                USE_OF.put(id, u);
+                if USE_AT.get(NODES[id].start + 1) > 0 {
+                    USE_BIND.put(bind_key(m, use_local(id)), id);
+                }
+            }
+        }
+    }
+}
+
+// The name a `use` gives (its alias, or the name), of its Ident node id.
+pub fn use_local(id: i64) -> i64 {
+    unsafe { if NODES[id].b != 0 { NODES[id].b } else { NODES[id].a } }
+}
+
+// The Ident node of the `use` name at pos (0: none), and its Use node.
+pub fn use_id_at(pos: i64) -> i64 {
+    unsafe { USE_ID.get(pos + 1) }
+}
+
+pub fn use_node_of(id: i64) -> i64 {
+    unsafe { USE_OF.get(id) }
+}
+
+// What the `use` name of Ident node id imports (its definition; -1:
+// nothing the checker resolved).
+pub fn use_def(id: i64) -> i64 {
+    unsafe { USE_AT.get(NODES[id].start + 1) - 1 }
+}
+
+// What name `name` is in module m: an item (or a module declared there),
+// an import; -1 for none.
+pub fn item_binding(m: i64, name: i64) -> i64 {
+    unsafe { ITEM_BIND.get(bind_key(m, name)) - 1 }
+}
+
+pub fn use_binding(m: i64, name: i64) -> i64 {
+    unsafe {
+        let id = USE_BIND.get(bind_key(m, name));
+        if id == 0 { -1 } else { USE_AT.get(NODES[id].start + 1) - 1 }
+    }
+}
+
+// The Ident node of the import of `name` in module m (0: none).
+pub fn use_binding_id(m: i64, name: i64) -> i64 {
+    unsafe { USE_BIND.get(bind_key(m, name)) }
+}
+
+pub fn binding_of(m: i64, name: i64) -> i64 {
+    let d = item_binding(m, name);
+    if d >= 0 { d } else { use_binding(m, name) }
+}
+
+// Whether the token at pos is identifier `name`.
+pub fn ref_named(pos: i64, name: i64) -> bool {
+    unsafe {
+        let i = token_at(pos);
+        i < TOK_COUNT && TOKS[i].start == pos && TOKS[i].kind == Tok::Ident
+            && TOKS[i].value as i64 == name
+    }
+}
+
+// Whether the name at pos follows a `::` (a path's later segment).
+pub fn qualified(pos: i64) -> bool {
+    unsafe {
+        let i = token_at(pos);
+        i > 0 && TOKS[i - 1].kind == Tok::ColonColon
+    }
+}
+
+// The start of the path whose segment is at pos: back over `NAME::`.
+pub fn path_start(pos: i64) -> i64 {
+    unsafe {
+        var i = token_at(pos);
+        while i >= 2 && TOKS[i - 1].kind == Tok::ColonColon && TOKS[i - 2].kind == Tok::Ident {
+            i -= 2;
+        }
+        TOKS[i].start
+    }
+}
+
+// ---- Regions: the modules, and the ones the edit makes ----
+//
+// A region is a module of the program (0 .. module_count()) or a module the
+// edit makes (module_count() + k): its name, parent region, file, whether
+// it is a dir module (`name/mod.vl`), whether it is declared `pub`, and
+// its text: the `mod` lines of the modules made in it, its imports, the
+// items moved into it.
+
+pub static var NM_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var NM_PARENT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var NM_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var NM_PUB: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var NM_MODS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var NM_USES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var NM_BODY: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// (0.12) its header comment (split: --header, or a banner).
+pub static var NM_HEAD: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+pub fn new_region(parent: i64, name: i64, path: *u8) -> i64 {
+    unsafe {
+        NM_NAME.push(name);
+        NM_PARENT.push(parent);
+        NM_PATH.push(path as i64);
+        NM_PUB.push(0);
+        NM_MODS.push(buf_new());
+        NM_USES.push(buf_new());
+        NM_BODY.push(buf_new());
+        NM_HEAD.push(buf_new());
+        module_count() + NM_NAME.count - 1
+    }
+}
+
+pub fn is_new(r: i64) -> bool {
+    r >= module_count()
+}
+
+pub fn region_parent(r: i64) -> i64 {
+    unsafe {
+        if r < 0 {
+            return -1;
+        }
+        if r < module_count() { MODULES[r].parent } else { NM_PARENT.data[r - module_count()] }
+    }
+}
+
+pub fn region_name(r: i64) -> i64 {
+    unsafe { if r < module_count() { MODULES[r].name } else { NM_NAME.data[r - module_count()] } }
+}
+
+// Whether region `inner` is `outer` or inside it.
+pub fn within(inner: i64, outer: i64) -> bool {
+    var m = inner;
+    while m >= 0 {
+        if m == outer {
+            return true;
+        }
+        m = region_parent(m);
+    }
+    false
+}
+
+pub fn region_public(r: i64) -> bool {
+    unsafe {
+        if r == 0 {
+            return true;
+        }
+        if r < module_count() { MODULES[r].public } else { NM_PUB.data[r - module_count()] != 0 }
+    }
+}
+
+// The path of region r: `crate`, `crate::a::b`.
+pub fn put_region_path(out: i64, r: i64) {
+    unsafe {
+        if r < module_count() {
+            buf_bytes(out, mod_fqn_text(r));
+            return;
+        }
+        put_region_path(out, region_parent(r));
+        buf_str(out, c"::");
+        buf_bytes(out, SYMS[NM_NAME.data[r - module_count()]].text);
+    }
+}
+
+// ---- Module files ----
+
+// The file of module m (not an inline module's), or -1.
+pub fn own_file(m: i64) -> i64 {
+    unsafe {
+        for f in 0..FILE_COUNT {
+            if FILES[f].module == m && FILES[f].path[0] != '<' {
+                return f;
+            }
+        }
+        -1
+    }
+}
+
+// The last component of a path.
+pub fn base_name(path: *u8) -> [u8] {
+    unsafe {
+        let p = c_slice(path);
+        var i = p.len;
+        while i > 0 && p[i - 1] != '/' {
+            i -= 1;
+        }
+        p[i..p.len]
+    }
+}
+
+pub fn is_mod_file(path: *u8) -> bool {
+    unsafe {
+        bytes_eq(base_name(path), c_slice(c"mod.vl"))
+            || bytes_eq(base_name(path), c_slice(c"mod.vl"))
+    }
+}
+
+// (0.20) Whether module m finds its children's files next to its own, as
+// the program's root does: the root, and std's root (std is a crate of
+// its own: compiler/std/NAME.vl is std::NAME).
+pub fn root_like(m: i64) -> bool {
+    m == 0 || unsafe { m == STD_MODULE }
+}
+
+// The file of module `name`, a child of the module whose file is `path`
+// (`root`: the root module's), as the module loader finds it: next to the
+// file for the root or a `mod.vl`, else in the directory named after it;
+// `name.vl`, or `name/mod.vl` for a dir module (0.21: ext, `.vl` too).
+pub fn child_path(path: *u8, root: bool, name: [u8], dir: bool, ext: *u8 = c".vl") -> *u8 {
+    unsafe {
+        let out = buf_new();
+        buf_str(out, path_dir(path));
+        buf_byte(out, '/');
+        let mod_file = is_mod_file(path);
+        let base = base_name(path);
+        if !root && !mod_file {
+            buf_bytes(out, base[0..base.len - crate::base::source_ext_len(base)]);
+            buf_byte(out, '/');
+        }
+        buf_bytes(out, name);
+        buf_str(out, if dir { c"/mod" } else { c"" });
+        buf_str(out, ext);
+        buf_cstr(out)
+    }
+}
+
+// `x/a.vl` as a dir module's file: `x/a/mod.vl`.
+pub fn dir_form(path: *u8) -> *u8 {
+    unsafe {
+        let p = c_slice(path);
+        let b = buf_new();
+        // (the file's extension, either)
+        let e = crate::base::source_ext_len(p);
+        buf_bytes(b, p[0..p.len - e]);
+        buf_str(b, c"/mod");
+        buf_bytes(b, p[p.len - e..p.len]);
+        buf_cstr(b)
+    }
+}
+
+// The file module m's text will be in after the edit, and moves it to its
+// dir form (`a.vl` -> `a/mod.vl`) when it gains a child: the path its
+// children are found from. 0 for an inline module.
+pub fn parent_file_path(m: i64, converts: inout HMap) -> *u8 {
+    unsafe {
+        let f = own_file(m);
+        if f < 0 {
+            return 0 as *u8;
+        }
+        if root_like(m) || is_mod_file(FILES[f].path) {
+            return FILES[f].path;
+        }
+        let p = dir_form(FILES[f].path);
+        if converts.get(f + 1) == 0 {
+            converts.put(f + 1, p as i64);
+            edit_move_file(f, p);
+        }
+        converts.get(f + 1) as *u8
+    }
+}
+
+// Moves the files of module m (its file, and its children's) so that its
+// file is `path`.
+pub fn move_tree(m: i64, path: *u8) {
+    unsafe {
+        let f = own_file(m);
+        let p = c_slice(FILES[f].path);
+        let np = c_slice(path);
+        let old = buf_new();
+        let new = buf_new();
+        // (either extension, by its length)
+        let e = crate::base::source_ext_len(p);
+        let ne = crate::base::source_ext_len(np);
+        if is_mod_file(FILES[f].path) {
+            buf_bytes(old, p[0..p.len - 3 - e]);
+            buf_bytes(new, np[0..np.len - 3 - ne]);
+        } else {
+            buf_bytes(old, p[0..p.len - e]);
+            buf_byte(old, '/');
+            buf_bytes(new, np[0..np.len - ne]);
+            buf_byte(new, '/');
+            edit_move_file(f, path);
+        }
+        let o = buf_slice(old);
+        for g in 0..FILE_COUNT {
+            let q = c_slice(FILES[g].path);
+            if q.len > o.len && same_bytes(q[0..o.len], o) {
+                let b = buf_new();
+                buf_bytes(b, buf_slice(new));
+                buf_bytes(b, q[o.len..q.len]);
+                edit_move_file(g, buf_cstr(b));
+            }
+        }
+    }
+}
+
+// Adds line `text` (`mod NAME;`) to file f: after its last `mod NAME;`
+// line, else before its first item (after the comment at its top).
+pub fn add_mod_line(f: i64, text: [u8]) {
+    unsafe {
+        var last = -1;
+        for d in 0..DEF_COUNT {
+            if DEFS[d].kind == K_MOD && file_of_pos(DEFS[d].start) == f
+                && SRC[DEFS[d].end - 1] == ';'
+                && (last < 0 || DEFS[d].start > DEFS[last].start) {
+                last = d;
+            }
+        }
+        let b = buf_new();
+        if last >= 0 {
+            buf_byte(b, '\n');
+            buf_bytes(b, text);
+            let at = line_end(DEFS[last].end - 1);
+            put_edit(at, at, b);
+            return;
+        }
+        let at = first_item_line(f);
+        buf_bytes(b, text);
+        buf_byte(b, '\n');
+        if at < FILES[f].end {
+            buf_byte(b, '\n');
+        }
+        put_edit(at, at, b);
+    }
+}
+
+// The start of the line where file f's first item (or `use`) starts, with
+// the comment lines directly above it; the file's end when it has none.
+pub fn first_item_line(f: i64) -> i64 {
+    unsafe {
+        let i = token_at(FILES[f].start);
+        if i >= TOK_COUNT || TOKS[i].start >= FILES[f].end {
+            return FILES[f].end;
+        }
+        var at = line_start(TOKS[i].start);
+        while at > FILES[f].start {
+            let prev = line_start(at - 1);
+            if !comment_line(prev) {
+                break;
+            }
+            at = prev;
+        }
+        // (a comment from the top of the file is the file's)
+        if at == FILES[f].start { line_start(TOKS[i].start) } else { at }
+    }
+}
+
+// Whether the line at pos (a line's start) is a `//` comment.
+pub fn comment_line(pos: i64) -> bool {
+    unsafe {
+        var p = pos;
+        while SRC[p] == ' ' || SRC[p] == '\t' {
+            p += 1;
+        }
+        SRC[p] == '/' && SRC[p + 1] == '/'
+    }
+}
+
+// ---- Edits ----
+
+pub fn put_edit(a: i64, b: i64, text: i64) {
+    unsafe {
+        if !edit_replace(a, b, text) {
+            EDIT_FAILED = true;
+        }
+    }
+}
+
+pub fn text_of(s: [u8]) -> i64 {
+    let b = buf_new();
+    buf_bytes(b, s);
+    b
+}
+
+// ---- Diagnostics ----
+
+// `name` would be two things in region r: d is the other (a definition,
+// or what an import of that name brings).
+pub fn collision(name: [u8], r: i64, d: i64, imported: bool) -> i64 {
+    unsafe {
+        let e = diag(c"error", c"refactor.collision");
+        buf_byte(e, '\'');
+        buf_bytes(e, name);
+        buf_str(e, c"' is already a name in ");
+        put_region_path(e, r);
+        if d >= 0 {
+            buf_str(e, if imported { c" (an import of " } else { c" (" });
+            buf_str(e, kind_name(DEFS[d].kind));
+            buf_byte(e, ' ');
+            buf_bytes(e, SYMS[DEFS[d].fqn].text);
+            buf_byte(e, ')');
+        }
+        buf_str(e, c"; nothing written\n");
+        if d >= 0 {
+            let out = try_begin(if imported { c"refs" } else { c"def" }, SYMS[DEFS[d].fqn].text,
+                true);
+            if imported && r < module_count() {
+                buf_str(out, c" --in ");
+                buf_bytes(out, mod_fqn_text(r));
+            }
+            try_end(out);
+        }
+        1
+    }
+}
+
+// ---- rename ----
+
+// Every reference to the definitions of group, written `old`, becomes new.
+fn rename_refs(group: IntVec, old: i64, new: [u8]) {
+    unsafe {
+        var in_group = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for i in 0..group.count {
+            in_group.put(group.data[i] + 1, 1);
+        }
+        var done = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        let n = SYMS[old].text.len;
+        for k in 0..REFS.count {
+            let r = REFS.data[k];
+            let p = R_POS.data[r];
+            if in_group.get(R_DEF.data[r] + 1) == 0 || !user_pos(p) || done.get(p + 1) != 0
+                || !ref_named(p, old) {
+                continue;
+            }
+            done.put(p + 1, 1);
+            if shorthand_at(p) {
+                // (0.15: `S { x }`: the field renamed, `y: x`; the value, `x: y`)
+                let o = SYMS[old].text;
+                let field = DEFS[R_DEF.data[r]].kind == K_FIELD;
+                put_edit(p, p + n,
+                    if field { shorthand_text(new, o) } else { shorthand_text(o, new) });
+                continue;
+            }
+            put_edit(p, p + n, text_of(new));
+        }
+    }
+}
+
+// Whether the new name is taken where the definitions of group are named
+// (diagnosed).
+fn rename_collides(d: i64, group: IntVec, new: i64) -> bool {
+    unsafe {
+        let k = DEFS[d].kind;
+        let text = SYMS[new].text;
+        let m = DEFS[d].module;
+        if k == K_FIELD || k == K_VARIANT || k == K_TRAIT_FN {
+            for e in 0..DEF_COUNT {
+                if DEFS[e].parent == DEFS[d].parent && DEFS[e].name == new {
+                    collision(text, m, e, false);
+                    return true;
+                }
+            }
+        }
+        if k == K_METHOD || k == K_TRAIT_FN {
+            for i in 0..group.count {
+                let g = group.data[i];
+                for e in 0..DEF_COUNT {
+                    if (DEFS[e].kind == K_METHOD || DEFS[e].kind == K_IMPL_METHOD)
+                        && DEFS[e].owner == DEFS[g].owner
+                        && DEFS[e].name == new && (k == K_METHOD || DEFS[g].kind == K_IMPL_METHOD) {
+                        collision(text, m, e, false);
+                        return true;
+                    }
+                }
+            }
+        }
+        if DEFS[d].parent >= 0 || k == K_METHOD || k == K_IMPL_METHOD {
+            return false;
+        }
+        // An item: its module's names, and those of the modules importing it.
+        let b = binding_of(m, new);
+        if b >= 0 {
+            collision(text, m, b, item_binding(m, new) < 0);
+            return true;
+        }
+        for x in 0..REFS.count {
+            let r = REFS.data[x];
+            if R_DEF.data[r] != d || (R_FLAGS.data[r] & QF_USE) == 0 {
+                continue;
+            }
+            let id = use_id_at(R_POS.data[r]);
+            if id == 0 || NODES[id].b != 0 {
+                continue;
+            }
+            let u = module_at(R_POS.data[r]);
+            let c = binding_of(u, new);
+            if c >= 0 {
+                collision(text, u, c, item_binding(u, new) < 0);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// ---- new-module ----
+
+// Makes module `name` in region parent (its `mod` line goes there when the
+// edit is emitted): its region, or -1 after a diagnostic.
+pub fn make_module(parent: i64, name: i64, dir: bool, converts: inout HMap) -> i64 {
+    unsafe {
+        var ppath = 0 as *u8;
+        var proot = false;
+        if is_new(parent) {
+            ppath = NM_PATH.data[parent - module_count()] as *u8;
+        } else {
+            let b = binding_of(parent, name);
+            if b >= 0 {
+                collision(SYMS[name].text, parent, b, item_binding(parent, name) < 0);
+                return -1;
+            }
+            ppath = parent_file_path(parent, &converts);
+            proot = root_like(parent);
+            if ppath == 0 as *u8 {
+                return inline_module(parent);
+            }
+        }
+        let path = child_path(ppath, proot, SYMS[name].text, dir);
+        let other = child_path(ppath, proot, SYMS[name].text, !dir);
+        if file_exists(path) || file_exists(other) {
+            let d = diag(c"error", c"refactor.exists");
+            buf_str(d, c"'");
+            buf_str(d, if file_exists(path) { path } else { other });
+            buf_str(d, c"' exists already; nothing written\n");
+            return -1;
+        }
+        let r = new_region(parent, name, path);
+        // (0.20) std's modules are its interface: `pub mod`
+        if STD_MODULE >= 0 && within(parent, STD_MODULE) {
+            NM_PUB.data[r - module_count()] = 1;
+        }
+        r
+    }
+}
+
+// The texts of the modules the edit makes: their files, and their `mod`
+// lines in the modules of the program.
+pub fn emit_regions() {
+    unsafe {
+        let mc = module_count();
+        // (the lines for one module of the program together)
+        var lines = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        var parents = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..NM_NAME.count {
+            let line = buf_new();
+            if NM_PUB.data[k] != 0 {
+                buf_str(line, c"pub ");
+            }
+            buf_str(line, c"mod ");
+            buf_bytes(line, SYMS[NM_NAME.data[k]].text);
+            buf_byte(line, ';');
+            let parent = NM_PARENT.data[k];
+            if parent < mc {
+                var b = lines.get(parent + 1);
+                if b == 0 {
+                    b = buf_new();
+                    lines.put(parent + 1, b);
+                    parents.push(parent);
+                } else {
+                    buf_byte(b, '\n');
+                }
+                buf_bytes(b, buf_slice(line));
+            } else {
+                buf_bytes(NM_MODS.data[parent - mc], buf_slice(line));
+                buf_byte(NM_MODS.data[parent - mc], '\n');
+            }
+        }
+        for i in 0..parents.count {
+            add_mod_line(own_file(parents.data[i]), buf_slice(lines.get(parents.data[i] + 1)));
+        }
+        for k in 0..NM_NAME.count {
+            let text = buf_new();
+            let parts = [NM_HEAD.data[k], NM_MODS.data[k], NM_USES.data[k], NM_BODY.data[k]];
+            for j in 0..4 {
+                if crate::base::BUFS[parts[j]].len == 0 {
+                    continue;
+                }
+                if crate::base::BUFS[text].len > 0 {
+                    buf_byte(text, '\n');
+                }
+                buf_bytes(text, buf_slice(parts[j]));
+            }
+            edit_new_file(NM_PATH.data[k] as *u8, text);
+        }
+    }
+}
+
+// ---- move-module ----
+
+// The edits making module m (of its own file) module `name` of region
+// parent: its files, its `mod` line, the references to it. -1 when they
+// are made, else the exit status (after a diagnostic).
+fn relocate_module(m: i64, parent: i64, name: i64) -> i64 {
+    unsafe {
+        let dm = MOD_DEF.data[m];
+        let same = parent == MODULES[m].parent;
+        var converts = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        // Its new file.
+        var ppath = 0 as *u8;
+        if is_new(parent) {
+            ppath = NM_PATH.data[parent - module_count()] as *u8;
+        } else {
+            let b = binding_of(parent, name);
+            if b >= 0 {
+                return collision(SYMS[name].text, parent, b, item_binding(parent, name) < 0);
+            }
+            ppath = if same { FILES[own_file(parent)].path }
+                else { parent_file_path(parent, &converts) };
+            if ppath == 0 as *u8 {
+                return inline_module(parent);
+            }
+        }
+        let dir = is_mod_file(FILES[own_file(m)].path);
+        let path = child_path(ppath, root_like(parent), SYMS[name].text, dir);
+        let other = child_path(ppath, root_like(parent), SYMS[name].text, !dir);
+        if file_exists(path) || file_exists(other) {
+            let d = diag(c"error", c"refactor.collision");
+            buf_str(d, c"'");
+            buf_str(d, if file_exists(path) { path } else { other });
+            buf_str(d, c"' exists already; nothing written\n");
+            return 1;
+        }
+        move_tree(m, path);
+        // The references.
+        let newpath = buf_new();
+        put_region_path(newpath, parent);
+        buf_str(newpath, c"::");
+        buf_bytes(newpath, SYMS[name].text);
+        let old = MODULES[m].name;
+        var at = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        var public = MODULES[m].public;
+        for k in 0..REFS.count {
+            let r = REFS.data[k];
+            if R_DEF.data[r] == dm && user_pos(R_POS.data[r]) {
+                at.put(R_POS.data[r] + 1, 1);
+            }
+        }
+        for k in 0..REFS.count {
+            let r = REFS.data[k];
+            let p = R_POS.data[r];
+            if R_DEF.data[r] != dm || !user_pos(p) || !ref_named(p, old) {
+                continue;
+            }
+            let flags = R_FLAGS.data[r];
+            if same {
+                // (a rename: the name, where it is written)
+                put_edit(p, p + SYMS[old].text.len, text_of(SYMS[name].text));
+                continue;
+            }
+            if (flags & QF_DEF) != 0 {
+                continue;
+            }
+            let from = module_at(p);
+            if !within(from, parent) {
+                public = true;
+            }
+            chain_public(from, parent);
+            if (flags & QF_USE) != 0 {
+                use_of_module(p, buf_slice(newpath), old, name);
+            } else if qualified(p) {
+                put_edit(path_start(p), p + SYMS[old].text.len, text_of(buf_slice(newpath)));
+            } else if use_binding(from, old) != dm {
+                // (a path from its old parent: `a::f`)
+                put_edit(p, p + SYMS[old].text.len, text_of(buf_slice(newpath)));
+            }
+        }
+        if same {
+            if public && !MODULES[m].public {
+                put_edit(DEFS[dm].start, DEFS[dm].start, text_of(c_slice(c"pub ")));
+            }
+            return -1;
+        }
+        // The `super::` paths of its files that lead out of it.
+        for f in 0..FILE_COUNT {
+            if FILES[f].path[0] != '<' && within(FILES[f].module, m) {
+                escaping_supers(f, m, at);
+            }
+        }
+        // Its `mod` line, from its old parent to its new one.
+        let line = buf_new();
+        let ts = line_start(text_start(dm));
+        let kw = DEFS[dm].start;
+        buf_bytes(line, SRC[ts..line_start(kw)]);
+        if public {
+            buf_str(line, c"pub ");
+        }
+        buf_str(line, c"mod ");
+        buf_bytes(line, SYMS[name].text);
+        buf_byte(line, ';');
+        delete_lines(ts, DEFS[dm].end);
+        if is_new(parent) {
+            buf_bytes(NM_MODS.data[parent - module_count()], buf_slice(line));
+            buf_byte(NM_MODS.data[parent - module_count()], '\n');
+        } else {
+            add_mod_line(own_file(parent), buf_slice(line));
+        }
+        -1
+    }
+}
+
+// The modules of the path of region r that the code of region from cannot
+// see while they are private: made `pub`.
+pub fn chain_public(from: i64, r: i64) {
+    unsafe {
+        var x = r;
+        while x > 0 {
+            let p = region_parent(x);
+            if !region_public(x) && !within(from, p) {
+                if is_new(x) {
+                    NM_PUB.data[x - module_count()] = 1;
+                } else if MOD_DEF.data[x] >= 0 && !MODULES[x].public {
+                    let dx = MOD_DEF.data[x];
+                    MODULES[x].public = true;
+                    put_edit(DEFS[dx].start, DEFS[dx].start, text_of(c_slice(c"pub ")));
+                }
+            }
+            x = p;
+        }
+    }
+}
+
+// The import of the module (`use a::m;`) at pos: its path becomes newpath
+// (`as old` when its name changes); in a list, the name leaves it for a
+// `use` line of its own.
+fn use_of_module(pos: i64, newpath: [u8], old: i64, name: i64) {
+    unsafe {
+        let id = use_id_at(pos);
+        let u = use_node_of(id);
+        if id == 0 || u == 0 {
+            return;
+        }
+        let text = buf_new();
+        buf_bytes(text, newpath);
+        if NODES[id].b == 0 && old != name {
+            buf_str(text, c" as ");
+            buf_bytes(text, SYMS[old].text);
+        }
+        if NODES[u].count == 1 && !braced(u) {
+            put_edit(NODES[NODES[u].c].start, NODES[id].start + SYMS[old].text.len, text);
+            return;
+        }
+        crate::tools::refactor_move::imports::remove_use_names(u, id);
+        let line = buf_new();
+        buf_str(line, c"\nuse ");
+        buf_bytes(line, buf_slice(text));
+        if NODES[id].b != 0 {
+            buf_str(line, c" as ");
+            buf_bytes(line, SYMS[NODES[id].b].text);
+        }
+        buf_byte(line, ';');
+        let at = line_end(NODES[u].end - 1);
+        put_edit(at, at, line);
+    }
+}
+
+// Whether Use node u lists its names between braces.
+pub fn braced(u: i64) -> bool {
+    unsafe {
+        for p in NODES[NODES[u].c].end..NODES[u].end {
+            if SRC[p] == '{' {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// The paths of file f (of module m or one of its children) that start
+// with `super::` and lead out of m: written from `crate`. A path that
+// goes on to name m itself is left to the reference's rewriting.
+fn escaping_supers(f: i64, m: i64, refs_at: HMap) {
+    unsafe {
+        let q = FILES[f].module;
+        var depth = 0;
+        var x = q;
+        while x != m && x >= 0 {
+            depth += 1;
+            x = MODULES[x].parent;
+        }
+        let sup = intern(c_slice(c"super"));
+        var i = token_at(FILES[f].start);
+        while i + 1 < TOK_COUNT && TOKS[i].start < FILES[f].end {
+            if TOKS[i].kind != Tok::Ident || TOKS[i].value as i64 != sup
+                || TOKS[i + 1].kind != Tok::ColonColon
+                || (i > 0 && TOKS[i - 1].kind == Tok::ColonColon) {
+                i += 1;
+                continue;
+            }
+            let first = i;
+            var k = 0;
+            var target = module_at(TOKS[i].start);
+            while i + 1 < TOK_COUNT && TOKS[i].kind == Tok::Ident && TOKS[i].value as i64 == sup
+                && TOKS[i + 1].kind == Tok::ColonColon {
+                k += 1;
+                target = if target >= 0 { MODULES[target].parent } else { -1 };
+                i += 2;
+            }
+            if k <= depth || target < 0 {
+                continue;
+            }
+            // (the rest of the path naming m: left to the reference)
+            var j = i;
+            var names_m = false;
+            while j + 1 < TOK_COUNT && TOKS[j].kind == Tok::Ident {
+                if refs_at.get(TOKS[j].start + 1) != 0 {
+                    names_m = true;
+                }
+                if TOKS[j + 1].kind != Tok::ColonColon {
+                    break;
+                }
+                j += 2;
+            }
+            if names_m {
+                continue;
+            }
+            let text = buf_new();
+            buf_bytes(text, mod_fqn_text(target));
+            buf_str(text, c"::");
+            put_edit(TOKS[first].start, TOKS[i].start, text);
+        }
+    }
+}

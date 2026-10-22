@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
 """Agent harness hook (0.17): a check at the end of the agent's turn (a
-Claude Code Stop hook), so that a turn does not end on tachyon source
-nobody checked: a file written by a shell command (`cat > main.tach`, a
+Claude Code Stop hook), so that a turn does not end on vole source
+nobody checked: a file written by a shell command (`cat > main.vl`, a
 Python script), or an edit after which errors were left
-(docs/research/applying-to-tachyon.md, item 4: checks once at turn exit).
+(docs/research/applying-to-vole.md, item 4: checks once at turn exit).
 
 Registered in .claude/settings.json for Stop, and by the agent eval
 (tools/agent-hooks/settings-eval.json). Reads the hook event (JSON) on
 stdin. For each program root this session touched (the check hook's
 state, hookstate.py) and the one of the event's directory (its
-compiler/src/main.tach, else its main.tach):
+compiler/src/main.vl, else its main.vl):
 
-- nothing when its sources (fingerprint: the .tach files and tests'
+- nothing when its sources (fingerprint: the .vl files and tests'
   names, sizes and times) are as they were at the last check in this
   session and that check was clean (and its tests, when it has fast ones,
-  ran on those sources); nothing when a root never checked has no .tach
+  ran on those sources); nothing when a root never checked has no .vl
   file changed since the session began;
-- else `tachyonc check` once (and its fast tests, check-after-edit.py's
+- else `volec check` once (and its fast tests, check-after-edit.py's
   verify), and when there are errors or failing tests the stop is blocked
   once with them as the reason (`{"decision": "block", "reason": ...}`):
-  the agent sees `turn-end: unchecked changes in main.tach: 2 errors`
+  the agent sees `turn-end: unchecked changes in main.vl: 2 errors`
   and the errors; never twice for the same sources (the state records
   the fingerprint it reported on).
 
-TACHYON_TURN_END=0 turns it off; TACHYON_CHECK_TESTS=0 leaves the tests
+VOLE_TURN_END=0 turns it off; VOLE_CHECK_TESTS=0 leaves the tests
 out. Logged as `turn-end` records where the check hook logs. Development
 tooling only.
 """
@@ -73,13 +73,13 @@ def needs_check(event, st, root, start):
         return (start is None or newest > start), fp
     clean = not entry.get("errors")
     tested = not cae.hs.has_tests(root) or entry.get("slow") or \
-        os.environ.get("TACHYON_CHECK_TESTS", "1") == "0" or \
+        os.environ.get("VOLE_CHECK_TESTS", "1") == "0" or \
         (entry.get("tests") or {}).get("fp") == fp
     return not (entry.get("fp") == fp and clean and tested), fp
 
 
 def main():
-    if os.environ.get("TACHYON_TURN_END") == "0" or os.environ.get("TACHYON_CHECK_HOOK") == "0":
+    if os.environ.get("VOLE_TURN_END") == "0" or os.environ.get("VOLE_CHECK_HOOK") == "0":
         return 0
     try:
         event = json.load(sys.stdin)
@@ -95,7 +95,7 @@ def main():
         if not need:
             continue
         cwd = os.path.dirname(root)
-        if root.endswith(os.path.join("compiler", "src", "main.tach")):
+        if root.endswith(os.path.join("compiler", "src", "main.vl")):
             cwd = os.path.dirname(os.path.dirname(cwd))
         compiler = cae.compiler_for(cwd)
         if not compiler:

@@ -1,5 +1,5 @@
-/* The C side of tests/run/cheader_roundtrip.tach, through the header
-   tachyonc --emit-header makes for it. */
+/* The C side of tests/run/cheader_roundtrip.vl, through the header
+   volec --emit-header makes for it. */
 #include <stdio.h>
 #include <stddef.h>
 #include "roundtrip.h"

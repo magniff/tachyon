@@ -1,0 +1,313 @@
+// voltty, the terminal emulator of vole 0.23 (docs/design/terminal.md),
+// headless: the parser (vt/), the terminal state (term/), the input
+// encoders (input/), the pty (pty.vl). The window and the renderer join
+// it on std::window and std::gpu; without them it runs this way:
+//
+//   voltty --dump LINES COLS HISTORY   stdin through the terminal, then its dump
+//   voltty --script                    the oracle's script format on stdin
+//                                      (oracle/FORMAT.md)
+//   voltty --bench [-n RUNS] FILE...   parse + grid throughput, 120x40, 10,000 lines
+//   voltty --run LINES COLS [--send TEXT] [--send-n N] -- CMD ARG...
+//                                      CMD on a pty, TEXT (or N bytes `a`) typed
+//                                      to it after its first output, until it
+//                                      exits; then the dump
+//   voltty --keys                      key, mouse and paste encodings (input/),
+//                                      a table of events on stdin
+//
+// `--escaped` before the mode reads stdin with `\e`, `\n`, `\xNN` escapes
+// (for test cases, whose stdin is text).
+
+mod input;
+mod pty;
+mod sys;
+mod term;
+mod vt;
+
+use std::Buf;
+use term::Term;
+use vt::Parser;
+
+// The OSC buffer: OSC 52 clipboard payloads fit (vte has no limit).
+const OSC_LIMIT: i64 = 1048576;
+
+fn arg(argv: **u8, i: i64) -> [u8] {
+    // SAFETY: argv[i] is a NUL-terminated string from the C runtime.
+    unsafe {
+        let p = argv[i];
+        var n = 0;
+        while p[n] != 0 {
+            n += 1;
+        }
+        p[0..n]
+    }
+}
+
+fn number(s: [u8]) -> i64 {
+    parse_int(s).unwrap_or(-1)
+}
+
+// `\e`, `\n`, `\r`, `\t`, `\\`, `\xNN`.
+fn unescape(s: [u8], gpa: Gpa) -> Buf {
+    var out = Buf::new_in(gpa);
+    var i = 0;
+    while i < s.len {
+        let c = s[i];
+        if c == '\\' && i + 1 < s.len {
+            let d = s[i + 1];
+            if d == 'e' {
+                out.push(0x1B);
+                i += 2;
+            } else if d == 'n' {
+                out.push('\n');
+                i += 2;
+            } else if d == 'r' {
+                out.push('\r');
+                i += 2;
+            } else if d == 't' {
+                out.push('\t');
+                i += 2;
+            }
+            else if d == 'x' && i + 3 < s.len + 0 && hexval(s[i + 2]) >= 0
+                && hexval(s[i + 3]) >= 0 {
+                out.push((hexval(s[i + 2]) * 16 + hexval(s[i + 3])) as u8);
+                i += 4;
+            } else {
+                out.push(d);
+                i += 2;
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn hexval(c: u8) -> i64 {
+    if c >= '0' && c <= '9' {
+        (c - '0') as i64
+    } else if c >= 'a' && c <= 'f' {
+        (c - 'a') as i64 + 10
+    } else if c >= 'A' && c <= 'F' {
+        (c - 'A') as i64 + 10
+    } else {
+        -1
+    }
+}
+
+// A terminal and its parser, with the parser's OSC buffer.
+struct Session {
+    term: Term,
+    parser: Parser,
+}
+
+fn session(lines: i64, cols: i64, history: i64, gpa: Gpa) -> Session {
+    Session {
+        term: Term::new_in(lines, cols, history, gpa), parser: Parser::new_in(OSC_LIMIT, gpa)
+    }
+}
+
+fn end_session(s: inout Session) {
+    s.term.free();
+}
+
+fn dump_mode(lines: i64, cols: i64, history: i64, input: [u8], gpa: Gpa) {
+    var s = session(lines, cols, history, gpa);
+    s.term.feed(&s.parser, input);
+    var out = Buf::new_in(gpa);
+    s.term.stop_sync(&s.parser);
+    s.term.dump(&out);
+    sys::write_all(1, out.as_mut_slice());
+    out.free();
+    end_session(&s);
+}
+
+// The script format (oracle/FORMAT.md): `T lines cols history`, `D n`
+// then n bytes, `R lines cols`, `P`.
+fn script_mode(input: [u8], gpa: Gpa) -> i32 {
+    var out = Buf::new_in(gpa);
+    var s = session(1, 2, 0, gpa);
+    var have = false;
+    var at = 0;
+    while at < input.len {
+        var nl = at;
+        while nl < input.len && input[nl] != '\n' {
+            nl += 1;
+        }
+        let line = input[at..nl];
+        at = nl + 1;
+        if line.len == 0 {
+            continue;
+        }
+        var words = split_in(line, ' ', gpa);
+        let cmd = words[0];
+        if cmd == "T" && words.len() == 4 {
+            if have {
+                end_session(&s);
+            }
+            s = session(number(words[1]), number(words[2]), number(words[3]), gpa);
+            have = true;
+        } else if cmd == "D" && words.len() == 2 {
+            let n = number(words[1]);
+            var end = at + n;
+            if end > input.len {
+                end = input.len;
+            }
+            if have {
+                s.term.feed(&s.parser, input[at..end]);
+            }
+            at = end;
+        } else if cmd == "R" && words.len() == 3 {
+            if have {
+                s.term.stop_sync(&s.parser);
+                s.term.resize(number(words[1]), number(words[2]));
+            }
+        } else if cmd == "P" {
+            if have {
+                s.term.stop_sync(&s.parser);
+                s.term.dump(&out);
+            }
+        } else {
+            eprintln(f"voltty: unknown script line {line}");
+            words.free();
+            return 2;
+        }
+        words.free();
+    }
+    if have {
+        end_session(&s);
+    }
+    sys::write_all(1, out.as_mut_slice());
+    out.free();
+    0
+}
+
+// The throughput of parser and grid on each file: the best of `runs`, fed
+// in 64 KiB chunks (a pty read's size) to a 120x40 terminal with 10,000
+// lines of scrollback.
+fn bench_mode(files: Vec<[u8]>, runs: i64, gpa: Gpa) -> i32 {
+    for f in files.as_slice() {
+        let data = match sys::read_file(f, gpa) {
+            Some(d) => d,
+            None => {
+                eprintln(f"voltty: cannot read {f}");
+                return 2;
+            }
+        };
+        let bytes = data.as_slice();
+        var best = 0;
+        for r in 0..runs {
+            var s = session(40, 120, 10000, gpa);
+            let t0 = sys::now_ns();
+            var at = 0;
+            while at < bytes.len {
+                var end = at + 65536;
+                if end > bytes.len {
+                    end = bytes.len;
+                }
+                s.term.feed(&s.parser, bytes[at..end]);
+                at = end;
+            }
+            let t = sys::now_ns() - t0;
+            if r == 0 || t < best {
+                best = t;
+            }
+            end_session(&s);
+        }
+        let mib = bytes.len as f64 / 1048576.0;
+        let ms = best as f64 / 1000000.0;
+        let rate = mib / (ms / 1000.0);
+        println(f"{f}: {mib:.1} MiB in {ms:.1} ms, {rate:.0} MiB/s");
+        var d = data;
+        d.free();
+    }
+    0
+}
+
+fn usage() -> i32 {
+    eprintln("usage: voltty [--escaped] --dump LINES COLS HISTORY | --script | --bench [-n RUNS] FILE... | --run LINES COLS -- CMD ARG... | --keys");
+    2
+}
+
+fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
+    var i = 1;
+    var escaped = false;
+    if i < argc as i64 && arg(argv, i) == "--escaped" {
+        escaped = true;
+        i += 1;
+    }
+    if i >= argc as i64 {
+        return usage();
+    }
+    let mode = arg(argv, i);
+    i += 1;
+    if mode == "--bench" {
+        var runs = 5;
+        var files: Vec<[u8]> = Vec::new_in(gpa);
+        while i < argc as i64 {
+            let a = arg(argv, i);
+            if a == "-n" && i + 1 < argc as i64 {
+                runs = number(arg(argv, i + 1));
+                i += 2;
+            } else {
+                files.push(a);
+                i += 1;
+            }
+        }
+        let rc = bench_mode(files, runs, gpa);
+        files.free();
+        return rc;
+    }
+    if mode == "--run" {
+        if i + 3 > argc as i64 {
+            return usage();
+        }
+        let lines = number(arg(argv, i));
+        let cols = number(arg(argv, i + 1));
+        var cmd: Vec<[u8]> = Vec::new_in(gpa);
+        var k = i + 2;
+        var send = Buf::new_in(gpa);
+        if k + 1 < argc as i64 && arg(argv, k) == "--send" {
+            send = unescape(arg(argv, k + 1), gpa);
+            k += 2;
+        }
+        if k + 1 < argc as i64 && arg(argv, k) == "--send-n" {
+            // N bytes `a` (a large paste: the queue holds what the pty
+            // does not take yet)
+            for _ in 0..number(arg(argv, k + 1)) {
+                send.push('a');
+            }
+            k += 2;
+        }
+        if k < argc as i64 && arg(argv, k) == "--" {
+            k += 1;
+        }
+        while k < argc as i64 {
+            cmd.push(arg(argv, k));
+            k += 1;
+        }
+        let rc = pty::run_headless(lines, cols, cmd.as_slice(), send.as_slice(), gpa);
+        cmd.free();
+        return rc;
+    }
+    let raw = read_stdin_in(gpa).unwrap();
+    let input = if escaped { unescape(raw.as_slice(), gpa) } else { raw };
+    var rc: i32 = 0;
+    if mode == "--dump" && i + 3 <= argc as i64 {
+        let lines = number(arg(argv, i));
+        let cols = number(arg(argv, i + 1));
+        let hist = number(arg(argv, i + 2));
+        if lines < 1 || cols < 2 || hist < 0 {
+            rc = usage();
+        } else {
+            dump_mode(lines, cols, hist, input.as_slice(), gpa);
+        }
+    } else if mode == "--script" {
+        rc = script_mode(input.as_slice(), gpa);
+    } else if mode == "--keys" {
+        rc = input::run_table(input.as_slice(), gpa);
+    } else {
+        rc = usage();
+    }
+    rc
+}

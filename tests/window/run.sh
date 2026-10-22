@@ -1,13 +1,13 @@
 #!/bin/sh
 # The window library's tests (0.23, terminal.md §4.1), std::window on
 # Cocoa: the key tables and text helpers (headless), then, when a window
-# server is there (NEEDS: display; TACHYON_NO_DISPLAY_TESTS=1 skips),
+# server is there (NEEDS: display; VOLE_NO_DISPLAY_TESTS=1 skips),
 # a real window driven by synthesized events: its first size, frames on
 # request and none without, the CAMetalLayer presenting the renderer's
 # grid, keys and text through interpretKeyEvents, an input method's
 # composition and commit, the mouse, the wheel, a resize, the clipboard
 # (restored), a watched pipe, close, Quit, and no CPU while idle.
-# main.tach is built at -O2 with tests/window/frameworks.c and run from the
+# main.vl is built at -O2 with tests/window/frameworks.c and run from the
 # root. macOS only (the Wayland and X11 backends are 0.23.1).
 #
 # usage: tests/window/run.sh [-c COMPILER] [-v]
@@ -22,7 +22,7 @@ export LC_ALL
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 VERBOSE=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -41,11 +41,11 @@ if [ "$(uname -s)" != Darwin ]; then
     exit 0
 fi
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-window.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-window.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 
-if ! (cd "$ROOT" && "$COMPILER" -O2 tests/window/main.tach tests/window/frameworks.c -l objc -o "$WORK/prog") \
+if ! (cd "$ROOT" && "$COMPILER" -O2 tests/window/main.vl tests/window/frameworks.c -l objc -o "$WORK/prog") \
         >"$WORK/build.out" 2>&1; then
     echo "FAIL window_build:"
     head -20 "$WORK/build.out" | sed 's/^/    /'
@@ -71,7 +71,7 @@ fi
 app_status=0
 if grep -q '^skip display' "$WORK/run.out"; then
     echo "pass window (voltty_app skipped: no display)"
-elif ! (cd "$ROOT" && "$COMPILER" -O2 examples/voltty/app/main.tach tests/window/frameworks.c -l objc -o "$WORK/voltty") \
+elif ! (cd "$ROOT" && "$COMPILER" -O2 examples/voltty/app/main.vl tests/window/frameworks.c -l objc -o "$WORK/voltty") \
         >"$WORK/app-build.out" 2>&1; then
     echo "FAIL window_voltty_app_build:"
     head -20 "$WORK/app-build.out" | sed 's/^/    /'

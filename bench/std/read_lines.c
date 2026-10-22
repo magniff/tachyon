@@ -1,5 +1,5 @@
-// bench/std: read a 256 MB file of text lines (made by read_lines.tach
-// --make) with getline into one buffer. Prints what read_lines.tach
+// bench/std: read a 256 MB file of text lines (made by read_lines.vl
+// --make) with getline into one buffer. Prints what read_lines.vl
 // prints.
 #define _GNU_SOURCE
 #include <stdio.h>

@@ -6,10 +6,10 @@ recursive-descent parser, with enums, `match`, `Result` and `?`.
 
 ## Build and run
 
-From this folder (with `tachyonc` on your `PATH`, or `../../target/tachyonc`):
+From this folder (with `volec` on your `PATH`, or `../../target/volec`):
 
 ```sh
-tachyonc main.tach -o calc
+volec main.vl -o calc
 printf '1 + 2 * 3\n(1 + 2) * 3\n100 / (5 - 5)\n2 * (3 + 4\n2 $ 3\n' | ./calc
 ```
 
@@ -51,7 +51,7 @@ fn tokenize(text: [u8]) -> Result<Vec<Token>, Error> {
         }
 ```
 
-There are no destructors in tachyon, so the vector is freed by hand on
+There are no destructors in vole, so the vector is freed by hand on
 the error path; the caller of the `Ok` frees it with `defer`.
 
 **The parser** has one method per grammar rule, each returning
@@ -82,7 +82,7 @@ fn term(inout self) -> Result<i64, Error> {
 ```
 
 `Star | Slash | Percent` is an or-pattern and `_ if rhs == 0` a guard.
-(Tachyon defines `x / 0` as 0, so the check is the program's choice, not
+(Vole defines `x / 0` as 0, so the check is the program's choice, not
 a crash it avoids.)
 
 **Messages come from `Display` impls.** `impl Display for Error` writes
@@ -115,8 +115,8 @@ while read_line(&line).unwrap_or(false) {
 
 ## Language features
 
-- enums with data, `match`, or-patterns, ranges and guards: `tachyonc guide syntax`
-- `Result` and `?`: `tachyonc guide conversions`
-- `impl Display`, f-strings and specs (`{c:c}`): `tachyonc guide formatting`
-- methods on `*Parser`, `Vec`, `defer` and `free`: `tachyonc guide memory`
-- reading stdin (`read_line`): `tachyonc guide std`
+- enums with data, `match`, or-patterns, ranges and guards: `volec guide syntax`
+- `Result` and `?`: `volec guide conversions`
+- `impl Display`, f-strings and specs (`{c:c}`): `volec guide formatting`
+- methods on `*Parser`, `Vec`, `defer` and `free`: `volec guide memory`
+- reading stdin (`read_line`): `volec guide std`

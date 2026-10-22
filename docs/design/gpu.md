@@ -1,11 +1,11 @@
-# tachyon 0.22 design: GPU support (`std::gpu`)
+# vole 0.22 design: GPU support (`std::gpu`)
 
 I read the language from the worktree of branch design-022 (from
-night-final: 0.16.0 plus the 0.17 work merged so far) through `tachyonc
+night-final: 0.16.0 plus the 0.17 work merged so far) through `volec
 guide unsafe|effects|closures|rust`, `guide --find extern|import`,
 docs/grammar.md ("Unsafe code", "Layout, conventions and C", "Importing C
 headers", "Modules"), `query show front::cpp::directives::include`,
-`query items front::modules::stdsections`, main.tach's option parsing,
+`query items front::modules::stdsections`, main.vl's option parsing,
 tests/run.sh's directives and examples/c-qsort, c-mixed-build and httpd.
 The 0.17 design (branch design-017b, docs/design/value-semantics.md) is
 the model for this document's form and the source of the ownership rules
@@ -19,7 +19,7 @@ below is taken as recommended and listed in the last section.
 
 ## 1. The current state
 
-### 1.1 What tachyon has for this today
+### 1.1 What vole has for this today
 
 - **C interop is exact and opt-in.** `extern "C"` blocks, `#[repr(C)]`
   types with C's layout, `extern "C" fn` definitions usable as callbacks,
@@ -31,7 +31,7 @@ below is taken as recommended and listed in the last section.
   typed prototype. On arm64 this is exactly how `objc_msgSend` must be
   called: it is a trampoline that keeps every argument register and x8,
   and Apple's headers require a cast to the method's exact type.
-- **`import "h" as c`** runs tachyon's own C preprocessor and parser
+- **`import "h" as c`** runs vole's own C preprocessor and parser
   (front/cpp, front/cimport) over C headers. It has no framework lookup:
   `import "CoreText/CoreText.h"` fails with `header not found`.
 - **Linking:** `-l`, `-L`, objects and C files are passed to `cc` in
@@ -54,7 +54,7 @@ below is taken as recommended and listed in the last section.
 
 ### 1.2 Spikes on today's compiler (2026-10-16, Apple M5, macOS 26.6.2)
 
-Six small programs, compiled with this branch's `target/tools/tachyonc`
+Six small programs, compiled with this branch's `target/tools/volec`
 and linked with `cc ... -framework Metal -framework Foundation -lobjc`.
 They are the evidence for §2.9; their code is in §3.1 and the appendix.
 
@@ -62,7 +62,7 @@ They are the evidence for §2.9; their code is in §3.1 and the appendix.
 |---|---|---|
 | S1 | Metal **compute**: device, MSL compiled at run time, pipeline, shared buffer, `dispatchThreads:` with two `MTLSize` (24-byte structs passed indirectly), `waitUntilCompleted`, CPU check | 1024 floats correct, 0 mismatches; 166 ms cold (shader cache empty), **20 ms warm** for the whole process |
 | S2 | Metal **render to texture**: render pipeline from MSL, 8×8 RGBA8 texture, `setClearColor:` (an HFA of four doubles in v0–v3), `getBytes:...fromRegion:` (a 48-byte `MTLRegion` by value), read back | exact pixel values (16,16,64,255) at (0,0) and (239,239,64,255) at (7,7) |
-| S3 | an **Objective-C class defined at run time** (`objc_allocateClassPair`, `class_addMethod` with a tachyon `extern "C" fn` as the IMP, typed `class_addMethod` declaration) | `[o mul:6 by:7]` = 43 |
+| S3 | an **Objective-C class defined at run time** (`objc_allocateClassPair`, `class_addMethod` with a vole `extern "C" fn` as the IMP, typed `class_addMethod` declaration) | `[o mul:6 by:7]` = 43 |
 | S4 | a **block built by hand** (a global block: `isa = &_NSConcreteGlobalBlock`, `BLOCK_IS_GLOBAL`, a context field after the literal) given to `addCompletedHandler:` | the handler ran, **on a Metal thread, not the main thread** |
 | S5 | **type encodings** read back: `protocol_getMethodDescription(objc_getProtocol("MTLDevice"), ...)` and `method_getTypeEncoding` | `@32@0:8Q16Q24` for `newBufferWithLength:options:`, `{?=QQQ}16@0:8` for `maxThreadsPerThreadgroup`: the runtime can check every binding |
 | S6 | a **struct result** through `objc_msgSend` (`-> MTLSize`, x8 indirect) | 1024 × 1024 × 1024 |
@@ -82,7 +82,7 @@ itself. `/usr/bin/leaks` and `footprint` are present.
 
 ### 1.3 The linux/arm64 container (probed 2026-10-16)
 
-From the gate's image `tachyon-check:linux-aarch64` (Debian bookworm),
+From the gate's image `vole-check:linux-aarch64` (Debian bookworm),
 with `apt-get install`:
 
 | package | version | gives |
@@ -97,7 +97,7 @@ with `apt-get install`:
 
 So everything on the Vulkan side, swapchains included, can be tested
 without a GPU or a display. The gate gets a second image,
-`tachyon-check:linux-aarch64-gpu`, with these packages; the minimal image
+`vole-check:linux-aarch64-gpu`, with these packages; the minimal image
 stays as it is.
 
 ### 1.4 Gaps to close
@@ -118,11 +118,11 @@ stays as it is.
 ### 2.1 Layers
 
 ```
-std::gpu              the API: wgpu's objects, tachyon's shapes (§2.2–2.7)
+std::gpu              the API: wgpu's objects, vole's shapes (§2.2–2.7)
   std::gpu::core      validation, lifetimes, tracking; generic over hal::Api
   std::gpu::hal       trait Api { type Device; type Buffer; ... }: the backend interface
-  std::gpu::metal     hal for Metal          (gpu/metal.macos.tach + metal/)
-  std::gpu::vk        hal for Vulkan         (gpu/vk.linux.tach + vk/)
+  std::gpu::metal     hal for Metal          (gpu/metal.macos.vl + metal/)
+  std::gpu::vk        hal for Vulkan         (gpu/vk.linux.vl + vk/)
   std::gpu::wgsl      the shader compiler: WGSL subset -> IR -> MSL | SPIR-V (§2.10)
 std::objc             the Objective-C runtime: Id<T>, selectors, classes, blocks, pools (§2.9)
 ```
@@ -136,7 +136,7 @@ stream to replay, except where Vulkan needs one to place barriers
 
 ### 2.2 The API: wgpu's objects
 
-| wgpu | tachyon | kind (0.17) | notes |
+| wgpu | vole | kind (0.17) | notes |
 |---|---|---|---|
 | `Instance` | `gpu::Instance` | owned | holds the allocator (`Instance::new_in(gpa)`) |
 | `Adapter` | `gpu::Adapter` | plain | a description plus a native handle; `inst.adapters()` lists, `inst.adapter(Power::High)` picks |
@@ -212,7 +212,7 @@ COPY_SRC)`.
   examples/gpu's frame functions declare `#[effects(io, panic,
   alloc(Arena))]`.
 - **GPU memory is not host memory,** and does not go through the
-  `Allocator` trait. The Vulkan hal has its own sub-allocator in tachyon:
+  `Allocator` trait. The Vulkan hal has its own sub-allocator in vole:
   64 MiB blocks per memory type, a TLSF free list inside each, and
   dedicated allocations above 32 MiB or when the driver prefers them.
   Metal allocates each resource from the device, which sub-allocates
@@ -286,10 +286,10 @@ proves it, never by assuming it (0.18).
 ### 2.8 Backends
 
 **Selection: OS-specific module files (C1).** `mod native;` loads
-`native.macos.tach` on macOS targets and `native.linux.tach` on Linux
-targets (else `native.tach`). Every variant is **type-checked on every
+`native.macos.vl` on macOS targets and `native.linux.vl` on Linux
+targets (else `native.vl`). Every variant is **type-checked on every
 host**, and only the target's is generated, so an agent on the Mac who
-breaks the Vulkan hal sees the error at `tachyonc check`. This is 0.19's
+breaks the Vulkan hal sees the error at `volec check`. This is 0.19's
 rule for foreign architectures ("checked, never generated") applied to
 files. It needs no `cfg` syntax, it is Go's well-known `_linux.go`
 convention, and both hals implement `trait hal::Api`, so their interfaces
@@ -327,9 +327,9 @@ needs no foreign headers.
   `dlopen`, and instance and device function pointers are loaded into a
   table (volk's model). Device-level calls go through
   `vkGetDeviceProcAddr` pointers, which skip the loader's trampoline. The
-  bindings are generated once by `tachyonc --emit-imports` from
+  bindings are generated once by `volec --emit-imports` from
   `vulkan_core.h` 1.3.239 in the container and checked in
-  (`gpu/vk/sys.tach`), so building needs no Vulkan headers anywhere.
+  (`gpu/vk/sys.vl`), so building needs no Vulkan headers anywhere.
 - **The version.** Vulkan 1.3 is required, which lavapipe and every
   current desktop driver provide. That gives dynamic rendering (no
   `VkRenderPass`/`VkFramebuffer` objects), synchronization2 and timeline
@@ -350,7 +350,7 @@ needs no foreign headers.
   `VkSurfaceKHR` (`wayland_surface`, `xcb_surface`): FIFO by default,
   MAILBOX when asked for and available.
 
-### 2.9 Calling Objective-C from tachyon (`std::objc`)
+### 2.9 Calling Objective-C from vole (`std::objc`)
 
 The spikes (§1.2) show the mechanics work today. The design is about
 making them safe to write in volume: Metal alone needs about 150
@@ -372,8 +372,8 @@ selectors, and AppKit in 0.23 about 120.
       name                          () -> NSString
     ```
 
-  - `tools/objcgen`, a tachyon program, turns the table into
-    `metal/sys.tach`, which is checked in. It emits the typed shapes, one
+  - `tools/objcgen`, a vole program, turns the table into
+    `metal/sys.vl`, which is checked in. It emits the typed shapes, one
     small `unsafe fn` per selector, and the selector cache.
   - The generator **checks every line against the runtime's own
     metadata** on the Mac: `protocol_getMethodDescription` for protocols,
@@ -408,9 +408,9 @@ selectors, and AppKit in 0.23 about 120.
   it matters (O1).
 - **Autorelease pools:** `objc::pool(|| { ... })`, a closure-scoped push
   and pop. The window library wraps each event and each frame in one.
-- **Classes defined in tachyon** (needed by 0.23: an `NSView` subclass,
+- **Classes defined in vole** (needed by 0.23: an `NSView` subclass,
   a window delegate, an `NSTextInputClient`):
-  `objc::ClassBuilder::new("TachyonView", superclass)`, `.method(sel,
+  `objc::ClassBuilder::new("VoleView", superclass)`, `.method(sel,
   imp, "v@:@")`, `.ivar("state", 8)`, `.protocol(...)`, `.register()`.
   - IMPs are `extern "C" fn`s whose first two parameters are
     `this: *u8, cmd: *u8` (S3).
@@ -424,15 +424,15 @@ selectors, and AppKit in 0.23 about 120.
   - a context pointer after the descriptor, which the invoke function
     reads.
 
-  Its memory is owned by the tachyon side and freed when the API
+  Its memory is owned by the vole side and freed when the API
   guarantees the block is no longer called. Until 0.21, std passes blocks
   only to APIs that call them on the calling thread. Metal's completion
   handlers do not (S4), so they are not used (§2.11).
-- **Exceptions.** An Objective-C exception that reaches tachyon frames
-  terminates the process: no tachyon frame has a personality routine, so
+- **Exceptions.** An Objective-C exception that reaches vole frames
+  terminates the process: no vole frame has a personality routine, so
   no handler is ever found and the runtime calls `std::terminate`. That
   is a crash, not undefined behaviour. Phase 0 confirms it with a test
-  that throws through a tachyon frame.
+  that throws through a vole frame.
   The contracts (§2.6) run first, so a well-typed call that passes them
   should not throw. `objc::init` installs `NSSetUncaughtExceptionHandler`
   to print the exception's name and reason before the abort.
@@ -440,7 +440,7 @@ selectors, and AppKit in 0.23 about 120.
   same `Id<T>`, `ClassBuilder`, `pool` and `objcgen` table format. `guide
   objc` documents it, with the S1 compute program as its example.
 
-### 2.10 Shaders: a WGSL subset compiled in tachyon (`std::gpu::wgsl`)
+### 2.10 Shaders: a WGSL subset compiled in vole (`std::gpu::wgsl`)
 
 **Pipeline.** The pipeline is naga's, kept small:
 
@@ -495,11 +495,11 @@ does, and the translator keeps WGSL's definitions:
   `OpLoopMerge`), `Block` and `Offset` decorations from WGSL's layout
   rules, and `OpEntryPoint` interfaces.
 - **The interpreter**, a third back end over the same IR, written in
-  tachyon. It runs compute entry points and single fragment invocations
+  vole. It runs compute entry points and single fragment invocations
   on the CPU and is the oracle for the tests (§4).
 
 **Diagnostics** use the compiler's form: `file:line:col: error
-wgsl.CODE: message`, with `help:` lines; `tachyonc explain wgsl.CODE`
+wgsl.CODE: message`, with `help:` lines; `volec explain wgsl.CODE`
 explains each code. The uniformity analysis follows the WGSL
 specification and reports the non-uniform value's origin, as naga does.
 
@@ -514,14 +514,14 @@ terminal's start-up time counts.
 **Where it runs.** At run time, in `dev.shader(src)`, as wgpu does.
 Sources come from `include_str("cells.wgsl")` (C3), so they live in
 `.wgsl` files and are embedded at compile time. Checking shaders during
-`tachyonc check` needs the translator inside compiler/src. The release
+`volec check` needs the translator inside compiler/src. The release
 rule allows that from 0.23 at the earliest, and it is O4.
 
 ### 2.11 Threads (0.21)
 
 - **Before 0.21 nothing runs off the main thread.** Metal's completion
   and scheduled handlers, `CVDisplayLink` and `dispatch_async` all call
-  back on threads tachyon does not know about (S4), and tachyon's statics
+  back on threads vole does not know about (S4), and vole's statics
   are only safe because there is one thread. std::gpu does not use them:
   it waits with `waitUntilCompleted` or polls shared-event values.
 - **With 0.21:**
@@ -540,12 +540,12 @@ rule allows that from 0.23 at the earliest, and it is O4.
 - **Bind wgpu-native (its C API) and naga as a C library.** It is the
   fastest way to pixels, but it misses the release's purpose: the API
   would be wgpu's (no `Drop` on resources, no views, run-time checks of
-  what 0.17 proves), the shader compiler would not dogfood tachyon, and a
+  what 0.17 proves), the shader compiler would not dogfood vole, and a
   Rust toolchain would become a dependency of std. Rejected. wgpu and
   naga remain the reference for behaviour and the bench's baseline.
 - **Port naga line by line.** Its IR is good and is the model, but it is
   45k lines of Rust built on lifetimes, `Arena<T>` handles and `Result`
-  chains. A tachyon design of a third that size, covering the subset,
+  chains. A vole design of a third that size, covering the subset,
   costs less than a port and reads better.
 - **GLSL instead of WGSL.** WGSL has a specification, a defined
   uniformity analysis and defined out-of-bounds behaviour, and agents
@@ -573,7 +573,7 @@ rule allows that from 0.23 at the earliest, and it is O4.
 
 ### 2.13 What agents see
 
-- **`tachyonc guide gpu`**: the objects in one table (§2.2), the
+- **`volec guide gpu`**: the objects in one table (§2.2), the
   compute example of §3.2 and the render example of §3.3, both run by
   tests/guide; and the six commonest failures with their fixes:
   1. `gpu.usage` → add the usage at creation;
@@ -582,12 +582,12 @@ rule allows that from 0.23 at the earliest, and it is O4.
   4. `wgsl.type` → the cast;
   5. `wgsl.uniformity` → move the `textureSample` out of the branch;
   6. a 0.17 error for a mapped buffer still in use → end the view first.
-- **`tachyonc explain gpu.usage`** (and every `gpu.*` and `wgsl.*` code):
+- **`volec explain gpu.usage`** (and every `gpu.*` and `wgsl.*` code):
   the rule, an example, the fix.
 - **Contract failures** print the rule and the `try:`:
   `contract gpu.usage failed: buffer 'verts' (usage COPY_DST) bound as
-  VERTEX at main.tach:41:9`, then `try: create it with usage = VERTEX |
-  COPY_DST (main.tach:22)`.
+  VERTEX at main.vl:41:9`, then `try: create it with usage = VERTEX |
+  COPY_DST (main.vl:22)`.
 - **Shader errors** carry the `.wgsl` file's own line and column, even
   through `include_str`: the compiler records the included file's name
   with the constant.
@@ -700,7 +700,7 @@ interpreter-backed CPU rasterizer of the test harness, never by the GPU
 under test.
 
 **The shader fuzzer** (G7). It generates random well-typed WGSL compute
-programs, in the manner of tests/fuzz for tachyon itself: integer
+programs, in the manner of tests/fuzz for vole itself: integer
 arithmetic, control flow, arrays, workgroup memory and atomics, with a
 `@group(0)` buffer of results. Each program runs on the interpreter and
 on the backend, and the outputs must agree. Floats are compared with a
@@ -767,23 +767,23 @@ with tests, guide and explain entries):
 
 | # | what | files |
 |---|---|---|
-| C1 | OS-specific module files: `mod m;` loads `m.macos.tach`, `m.linux.tach` or `m.tach` for the target; every variant type-checked, the target's generated; `query`/`refactor` see all variants | front/modules/lookup.tach, the module loader, tools' file walk; tests/run/os_files_* |
-| C2 | std submodules: `std::objc`, `std::gpu` and later `std::window` loaded only when a program names them (sections inside, as std's); `--std-dir DIR` loads them from disk; embed.sh's manifest lists the shipped ones | front/modules/stdsections.tach, front/stdsrc.tach, compiler/std/embed.sh, main.tach |
-| C3 | `include_str("path")`: a `[u8]` constant of a file relative to the source file, recorded for the query cache's dependencies and for diagnostics that point into it | front/check (a builtin), front/stdsrc or a new front/include.tach, the cache's dependency list |
-| C4 | `-framework NAME` and `-F DIR` link inputs; framework lookup in `import` (`X/Y.h` → `DIR/X.framework/Headers/Y.h`, the SDK's `System/Library/Frameworks` by default, umbrella sub-frameworks); the tools accept `-I` and `-F` | main.tach, back/objfile/output.tach, front/cpp/directives.tach (`find_include`), tools' option parsing (`fix` and `edit` reject `-I` today) |
+| C1 | OS-specific module files: `mod m;` loads `m.macos.vl`, `m.linux.vl` or `m.vl` for the target; every variant type-checked, the target's generated; `query`/`refactor` see all variants | front/modules/lookup.vl, the module loader, tools' file walk; tests/run/os_files_* |
+| C2 | std submodules: `std::objc`, `std::gpu` and later `std::window` loaded only when a program names them (sections inside, as std's); `--std-dir DIR` loads them from disk; embed.sh's manifest lists the shipped ones | front/modules/stdsections.vl, front/stdsrc.vl, compiler/std/embed.sh, main.vl |
+| C3 | `include_str("path")`: a `[u8]` constant of a file relative to the source file, recorded for the query cache's dependencies and for diagnostics that point into it | front/check (a builtin), front/stdsrc or a new front/include.vl, the cache's dependency list |
+| C4 | `-framework NAME` and `-F DIR` link inputs; framework lookup in `import` (`X/Y.h` → `DIR/X.framework/Headers/Y.h`, the SDK's `System/Library/Frameworks` by default, umbrella sub-frameworks); the tools accept `-I` and `-F` | main.vl, back/objfile/output.vl, front/cpp/directives.vl (`find_include`), tools' option parsing (`fix` and `edit` reject `-I` today) |
 
 **I. Interfaces** (stubs; after them every task builds against fixed
 signatures):
 
 | file | contents |
 |---|---|
-| `compiler/std/objc/mod.tach` | `Id<T>`, `Ref<T>`, `Sel`, `pool`, `ClassBuilder`, `Block` signatures; the four spike shapes working |
+| `compiler/std/objc/mod.vl` | `Id<T>`, `Ref<T>`, `Sel`, `pool`, `ClassBuilder`, `Block` signatures; the four spike shapes working |
 | `compiler/std/objc/tables/README.md` | the `.objc` table format |
-| `compiler/std/gpu/mod.tach` | the public types of §2.2 with their method signatures in the 0.16 form (`self: *T`, `free`), returning stubs |
-| `compiler/std/gpu/hal.tach` | `trait Api` with its associated types and the hal operations (create, bind, encode, submit, wait, present) |
-| `compiler/std/gpu/wgsl/ir.tach` | the IR: types, expressions, statements, functions, entry points, globals, handles; printing |
-| `compiler/std/gpu/wgsl/mod.tach` | `pub fn translate(src: [u8], target: Target, arena: Arena) -> Result<Output, ShaderError>`, `Output { text_or_words, reflection }`, `Reflection` |
-| `compiler/std/gpu/rules.tach` | the rule codes of §2.6 and `validate(cond, rule)` |
+| `compiler/std/gpu/mod.vl` | the public types of §2.2 with their method signatures in the 0.16 form (`self: *T`, `free`), returning stubs |
+| `compiler/std/gpu/hal.vl` | `trait Api` with its associated types and the hal operations (create, bind, encode, submit, wait, present) |
+| `compiler/std/gpu/wgsl/ir.vl` | the IR: types, expressions, statements, functions, entry points, globals, handles; printing |
+| `compiler/std/gpu/wgsl/mod.vl` | `pub fn translate(src: [u8], target: Target, arena: Arena) -> Result<Output, ShaderError>`, `Output { text_or_words, reflection }`, `Reflection` |
+| `compiler/std/gpu/rules.vl` | the rule codes of §2.6 and `validate(cond, rule)` |
 | `tests/gpu/run.sh` | the runner, its directives, one passing case per backend |
 | `bootstrap/ci/linux-aarch64-gpu.Dockerfile` | the gpu image (§1.3) |
 
@@ -794,22 +794,22 @@ Every task below is **start now** unless marked.
 | task | owns | provides | start |
 |---|---|---|---|
 | **G1 Objective-C layer** | compiler/std/objc/*, tools/objcgen/ | `Id<T>`, `Ref<T>`, selector cache, pools, `ClassBuilder`, `Block`, NSString/NSError helpers; objcgen with the runtime check (§2.9); `guide objc` draft | now |
-| **G2 Metal hal** | compiler/std/gpu/metal.macos.tach, gpu/metal/*, objc/tables/metal.objc | §2.8's Metal column; tested at first with hand-written MSL, then with G5's | now (needs G1's `Id`; until then the spike's raw shapes) |
-| **G3 Vulkan hal** | compiler/std/gpu/vk.linux.tach, gpu/vk/* (sys.tach generated), the gpu image | §2.8's Vulkan column; the sub-allocator; barriers by recorded pass; swapchain on Xvfb and weston | now (container) |
-| **G4 WGSL front end** | gpu/wgsl/{lex,parse,ast,resolve,types,layout,uniformity,validate}.tach | the subset (§2.10) to IR; diagnostics and `explain wgsl.*`; the bounds-check pass | now |
-| **G5 MSL writer** | gpu/wgsl/msl.tach | MSL 3.0 text, slots and reflection; tests by Metal compilation | now, after Phase 0's IR |
-| **G6 SPIR-V writer** | gpu/wgsl/spirv.tach | SPIR-V 1.3 words; spirv-val clean | now, after Phase 0's IR |
-| **G7 Interpreter and shader fuzzer** | gpu/wgsl/interp.tach, tests/gpu/fuzz/* | the oracle; the differential fuzzer against Metal and lavapipe; the CPU reference rasterizer for reference images | now, after Phase 0's IR |
-| **G8 Core and API** | gpu/mod.tach, gpu/core/* | §2.2–2.7: lifetimes, submission tracking, deferred destruction, frame arenas, validation, errors, reflection-driven layouts; surfaces through `RawSurface` | now in the 0.16 form; final shape needs 0.17 and 0.18 (§6.4) |
+| **G2 Metal hal** | compiler/std/gpu/metal.macos.vl, gpu/metal/*, objc/tables/metal.objc | §2.8's Metal column; tested at first with hand-written MSL, then with G5's | now (needs G1's `Id`; until then the spike's raw shapes) |
+| **G3 Vulkan hal** | compiler/std/gpu/vk.linux.vl, gpu/vk/* (sys.vl generated), the gpu image | §2.8's Vulkan column; the sub-allocator; barriers by recorded pass; swapchain on Xvfb and weston | now (container) |
+| **G4 WGSL front end** | gpu/wgsl/{lex,parse,ast,resolve,types,layout,uniformity,validate}.vl | the subset (§2.10) to IR; diagnostics and `explain wgsl.*`; the bounds-check pass | now |
+| **G5 MSL writer** | gpu/wgsl/msl.vl | MSL 3.0 text, slots and reflection; tests by Metal compilation | now, after Phase 0's IR |
+| **G6 SPIR-V writer** | gpu/wgsl/spirv.vl | SPIR-V 1.3 words; spirv-val clean | now, after Phase 0's IR |
+| **G7 Interpreter and shader fuzzer** | gpu/wgsl/interp.vl, tests/gpu/fuzz/* | the oracle; the differential fuzzer against Metal and lavapipe; the CPU reference rasterizer for reference images | now, after Phase 0's IR |
+| **G8 Core and API** | gpu/mod.vl, gpu/core/* | §2.2–2.7: lifetimes, submission tracking, deferred destruction, frame arenas, validation, errors, reflection-driven layouts; surfaces through `RawSurface` | now in the 0.16 form; final shape needs 0.17 and 0.18 (§6.4) |
 | **G9 Tests, benches, guide, examples** | tests/gpu/*, bench/gpu/*, compiler/guide/gpu.md, examples/gpu/{compute,triangle,image-blur,triangle-window}, docs | the gate rows, the bench pairs (Objective-C, wgpu, naga), the guide topic and its six failures, the `explain gpu.*` entries | now; the guide's final text after 0.18 |
 
 **Where the tasks meet.**
-- **G4, G5, G6 and G7** meet at `wgsl/ir.tach`, which Phase 0 fixes.
+- **G4, G5, G6 and G7** meet at `wgsl/ir.vl`, which Phase 0 fixes.
   - A change to the IR is the lead's commit, with every consumer updated
     in it.
   - The bounds-check pass (G4) rewrites IR, so the writers never see an
     unchecked access.
-- **G2 and G3** meet at `hal.tach`, through G8.
+- **G2 and G3** meet at `hal.vl`, through G8.
   - G8 owns the trait.
   - A hal that needs a new operation asks the lead. The other hal gets a
     stub that fails a contract, and its owner fills it in.
@@ -860,7 +860,7 @@ x86 rows stay off, per the standing instruction.
 | R1 | **A wrong `objc_msgSend` prototype** is silent memory corruption, not an error | no prototype by hand: objcgen generates them and checks every one against the runtime's type encodings (S5), and `--check-unsafe` re-checks receivers at first call |
 | R2 | **Retain/release mistakes** (+1 versus +0) crash late or leak | the table's `own`; `Id<T>` versus `Ref<T>`; retain-count assertions in std::objc's tests; `leaks --atExit` in the gate |
 | R3 | **Callbacks on foreign threads** (S4) break single-threaded statics | none used before 0.21 (§2.11); a test asserts no std::gpu path passes a block to a handler API |
-| R4 | **Objective-C exceptions** through tachyon frames | contracts run first; the uncaught-exception handler prints the reason; the abort is defined behaviour |
+| R4 | **Objective-C exceptions** through vole frames | contracts run first; the uncaught-exception handler prints the reason; the abort is defined behaviour |
 | R5 | **No GPU debugger** on this machine (Command Line Tools only) | `MTL_DEBUG_LAYER` and shader validation in every Metal test; the interpreter as the reference; Vulkan validation layers in the container |
 | R6 | **lavapipe is not a real GPU**: it hides some synchronization bugs | synchronization validation; the barrier logic shared and unit-tested on recorded passes; a real Linux GPU run asked of the user before 1.0 (O5) |
 | R7 | **The shader compiler's size and subtlety** (the uniformity analysis, layout rules) | the subset; the interpreter oracle; the fuzzer; naga's acceptance as a cross-check on the corpus |
@@ -877,7 +877,7 @@ x86 rows stay off, per the standing instruction.
 - **O3. `MTLHeap` sub-allocation and untracked resources on Metal.**
   *Proposed:* after the terminal measures its frame time; likely
   unneeded.
-- **O4. Checking shaders in `tachyonc check`.** It needs the translator
+- **O4. Checking shaders in `volec check`.** It needs the translator
   in compiler/src: possible from 0.23 under the release rule.
   *Proposed:* 0.23.x, with `include_str`'d `.wgsl` files checked as part
   of the program and their errors in the same one-line form.
@@ -888,20 +888,20 @@ x86 rows stay off, per the standing instruction.
 
 ### Critical files for implementation
 
-- compiler/src/front/modules/lookup.tach and the module loader (C1);
-  compiler/src/front/modules/stdsections.tach, front/stdsrc.tach and
+- compiler/src/front/modules/lookup.vl and the module loader (C1);
+  compiler/src/front/modules/stdsections.vl, front/stdsrc.vl and
   compiler/std/embed.sh (C2).
-- compiler/src/front/cpp/directives.tach (`include`, `find_include`: C4's
-  framework lookup); compiler/src/main.tach (option parsing: `-l`, `-L`,
-  `-I` at lines 366–392) with back/objfile/output.tach
+- compiler/src/front/cpp/directives.vl (`include`, `find_include`: C4's
+  framework lookup); compiler/src/main.vl (option parsing: `-l`, `-L`,
+  `-I` at lines 366–392) with back/objfile/output.vl
   (`add_link_arg`): C4's `-framework` and `-F`.
-- compiler/src/front/cimport/mod.tach (`--emit-imports`, used to generate
-  gpu/vk/sys.tach in the container).
+- compiler/src/front/cimport/mod.vl (`--emit-imports`, used to generate
+  gpu/vk/sys.vl in the container).
 - tests/run.sh (directives) and tests/abi/run.sh (the model for
   tests/gpu/run.sh); bootstrap/gate.sh and
   bootstrap/aarch64-linux-check.sh (the gpu image's row).
-- New: compiler/std/objc/, compiler/std/gpu/ (hal.tach, core/,
-  metal.macos.tach, vk.linux.tach, wgsl/), tools/objcgen/, tests/gpu/,
+- New: compiler/std/objc/, compiler/std/gpu/ (hal.vl, core/,
+  metal.macos.vl, vk.linux.vl, wgsl/), tools/objcgen/, tests/gpu/,
   bench/gpu/, examples/gpu/, compiler/guide/{gpu,objc}.md.
 
 ## Decisions taken (for the user's review)
@@ -914,7 +914,7 @@ work autonomously through 0.23. Each can be revisited.
   `gpu::core` (validation, lifetimes, tracking) over `trait hal::Api`
   with two implementations; no `dyn`, no run-time backend choice.
 - D2. **The backend is chosen by OS-specific module files**
-  (`metal.macos.tach`, `vk.linux.tach`; C1): every variant type-checked
+  (`metal.macos.vl`, `vk.linux.vl`; C1): every variant type-checked
   on every host, only the target's generated. This is not `cfg`, and not
   run-time dispatch.
 - D3. **std grows submodules loaded on use** (`std::objc`, `std::gpu`,
@@ -945,7 +945,7 @@ work autonomously through 0.23. Each can be revisited.
 - D11. **Metal first**, through `std::objc`: typed `objc_msgSend` shapes
   generated from `.objc` tables and checked against the runtime's type
   encodings; `Id<T>`/`Ref<T>` ownership; cached selectors; pools as
-  closures; classes and blocks built in tachyon. Shared storage on Apple
+  closures; classes and blocks built in vole. Shared storage on Apple
   silicon. macOS 14 is the floor.
 - D12. **Vulkan 1.3 second**: `dlopen` plus a function table, bindings
   generated from `vulkan_core.h` 1.3.239 and checked in; dynamic
@@ -1003,7 +1003,7 @@ tree. Their essential lines:
   embedded tree behind a closed gate (compiler/std/index.awk: its sections
   are read only by a program naming `gpu`); `tools/wgslc` is its command
   line (`check ir msl reflect run metal-job bench explain`). The IR is
-  target-neutral (no Metal slots or names in ir.tach), so other back ends
+  target-neutral (no Metal slots or names in ir.vl), so other back ends
   (SPIR-V, PTX) share it.
 - **API.** `wgsl::translate(src, options(TARGET_MSL), &mut out, &mut
   refl, &mut err, gpa) -> bool`; `Reflection` has the entry points (MSL
@@ -1018,8 +1018,8 @@ tree. Their essential lines:
   writer derives a test kernel with the same body), so the terminal's
   `cells.wgsl` stages are checked against the interpreter; render
   shaders with sampling are compiled by Metal.
-- **0.22.1.** SPIR-V (spirv.tach is a stub), the uniformity analysis
-  (uniformity.tach is a stub; WGSL's rule is not checked yet), the shader
+- **0.22.1.** SPIR-V (spirv.vl is a stub), the uniformity analysis
+  (uniformity.vl is a stub; WGSL's rule is not checked yet), the shader
   fuzzer, `@size`/`@align`, override constants, sampling in the
   interpreter.
 
@@ -1027,7 +1027,7 @@ tree. Their essential lines:
 
 - **Names.** The compiler is `std::gpu::wgsl` (g22-metalb's
   `std::gpu::shader` keeps ShaderSource and Reflection). At the merge,
-  compiler/std/gpu/mod.tach is g22-metalb's plus `pub mod wgsl;`; the
+  compiler/std/gpu/mod.vl is g22-metalb's plus `pub mod wgsl;`; the
   closed gate of index.awk is for std::gpu::wgsl and its submodules
   (drop `GATES["std::gpu"]` if std::gpu's own sections are to stay as
   g22-metalb has them).
@@ -1050,7 +1050,7 @@ tree. Their essential lines:
   the stage's first after its buffers, so it must stay below the vertex
   buffers (30 - i): a gpu.limits contract. Without it, an index of a
   runtime-sized array reads zero (the length is 0), never out of range.
-  tests/run/std_gpu_wgsl_reflect.tach checks the reflection and the
+  tests/run/std_gpu_wgsl_reflect.vl checks the reflection and the
   words; tests/wgsl/metalrun binds the buffer exactly so.
   *Done on g22-metalb-v20:* `shader::Reflection` has `sizes` (`size_binding(g,
   b)`) and `EntryPoint.sizes_slot` (`sizes_slot(name, stage, slot)`); a
@@ -1082,7 +1082,7 @@ compiler's other outputs in 0.22.x.
   against the SDK's headers). Every section is lazy behind the gate words
   `gpu` and `objc` (compiler/std/index.awk): a program that names neither
   reads none of it, and compiles as fast as before.
-- **Linking without C4.** A program links libobjc (`tachyonc prog.tach -l
+- **Linking without C4.** A program links libobjc (`volec prog.vl -l
   objc`); std::objc opens Foundation, Metal and QuartzCore with `dlopen`
   and reaches their C functions with `dlsym`, so no `-framework` is
   needed. `import` of framework headers is not used at all.

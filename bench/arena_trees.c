@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-/* arena_trees: binarytrees with its nodes in arenas (bench/arena_trees.tach). */
+/* arena_trees: binarytrees with its nodes in arenas (bench/arena_trees.vl). */
 typedef struct { char *base; long used, limit, total; } Arena;
 typedef struct Node { struct Node *left, *right; } Node;
 #define CHUNK (1L << 20)

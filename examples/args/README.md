@@ -5,10 +5,10 @@ them, the program's own name first.
 
 ## Build and run
 
-From this folder (with `tachyonc` on your `PATH`, or `../../target/tachyonc`):
+From this folder (with `volec` on your `PATH`, or `../../target/volec`):
 
 ```sh
-tachyonc main.tach -o args && ./args foo bar
+volec main.vl -o args && ./args foo bar
 ```
 
 ## Expected output
@@ -38,7 +38,7 @@ fn main(argc: i64, argv: **u8) -> i32 {
 
 Indexing a raw pointer (`argv[i]`) is unchecked, so it is `unsafe`: the
 compiler cannot know that `argv` holds `argc` pointers. A C string becomes
-a tachyon slice, a pointer and a length, once its length is known; C's
+a vole slice, a pointer and a length, once its length is known; C's
 `strlen` gives it, from the header `string.h`:
 
 ```tach
@@ -56,7 +56,7 @@ the f-string `f"-- {arg}"` then prints as text.
 
 ## Language features
 
-- `main(argc, argv)`, `**u8`: `tachyonc guide types`
-- `unsafe` blocks and `unsafe fn`: `tachyonc guide unsafe`
-- importing a C header, `c::strlen`: `tachyonc guide c-interop`
-- f-strings: `tachyonc guide formatting`
+- `main(argc, argv)`, `**u8`: `volec guide types`
+- `unsafe` blocks and `unsafe fn`: `volec guide unsafe`
+- importing a C header, `c::strlen`: `volec guide c-interop`
+- f-strings: `volec guide formatting`

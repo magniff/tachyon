@@ -1,6 +1,6 @@
 # The agent eval
 
-How well does a coding agent write tachyon, with and without the guide
+How well does a coding agent write vole, with and without the guide
 and the tools, against the same task in Rust (which it already knows)?
 Each task is a small program that reads stdin and writes stdout, graded
 by hidden tests. The format of a task is fixed (see "Tasks" below);
@@ -9,8 +9,8 @@ reports go to [docs/eval/](../../docs/eval/README.md).
 ## Running
 
 Python 3 (stdlib only), `rustc`, the `claude` CLI for hosted models,
-Ollama for local ones. The compiler under test is `target/tachyonc`
-unless `--tachyonc PATH` says otherwise; the runner copies it, so a
+Ollama for local ones. The compiler under test is `target/volec`
+unless `--volec PATH` says otherwise; the runner copies it, so a
 rebuild during a run changes nothing.
 
 ```sh
@@ -64,7 +64,7 @@ tests/agent-eval/run.py costx --rust DIR:rust --cell LABEL=DIR:COND,... --md FIL
 
 # (0.18) the compiler binary each program run used (its recorded md5 and
 # its workspace root's copy), against the one intended
-tests/agent-eval/run.py binaudit RUNDIR... --expect target/tachyonc
+tests/agent-eval/run.py binaudit RUNDIR... --expect target/volec
 ```
 
 ```sh
@@ -86,24 +86,24 @@ tests/agent-eval/run.py run ... --skip-existing-in BASELINE_RUNDIR
 
 - `--model`: `claude:sonnet`, `claude:haiku` (any `claude --model`
   name), `ollama:MODEL`.
-- `--cond`: `bare` (tachyon, the preamble says only what tachyon is and
-  how to build), `guide` (bare + `tachyonc guide` inlined, generated from
-  the binary under test; from 0.17 `tachyonc guide --full`, the long
+- `--cond`: `bare` (vole, the preamble says only what vole is and
+  how to build), `guide` (bare + `volec guide` inlined, generated from
+  the binary under test; from 0.17 `volec guide --full`, the long
   core), `tools` (bare + the tools table,
   [prompts/tools.md](prompts/tools.md)), `both`, `rust`.
 - (0.17) a condition is `BASE[+MOD...]` ([lib/conds.py](lib/conds.py)):
   new bases `guide-core` (the ~2k example-first core: prompts/guide-core.md
-  and `tachyonc guide` of a 0.17 compiler), `tools-core` (the tiered tools
+  and `volec guide` of a 0.17 compiler), `tools-core` (the tiered tools
   preamble, prompts/tools-core.md), `both-core` (the two),
-  `rust-pairs` (paired Rust -> tachyon examples, prompts/rust-pairs.md,
+  `rust-pairs` (paired Rust -> vole examples, prompts/rust-pairs.md,
   compiled by check-tasks), `compiler-tools-core` (the task's AGENTS.md
   with this checkout's tiered tools section), the iterations' `guide-mini`
   (prompts/guide-mini.md: one compiled example and the lookup lines) and
-  `guide-example` (prompts/guide-example.md around `tachyonc guide
+  `guide-example` (prompts/guide-example.md around `volec guide
   example`, a whole program in three files and a test case;
   `tests/agent-eval/check-prompts.sh` dry-runs both and checks their
   prompts); modifiers `+hook` (the
-  check hook in any tachyon condition), `+test` (`tachyonc test` in the
+  check hook in any vole condition), `+test` (`volec test` in the
   prompt, prompts/test.md or compiler-test.md, and the hooks of
   tools/agent-hooks/settings-eval.json, with the turn-end Stop hook),
   `+turn-end` (the Stop hook: with +hook settings-eval's `hook+turn-end`,
@@ -128,8 +128,8 @@ tests/agent-eval/run.py run ... --skip-existing-in BASELINE_RUNDIR
   3 for a round, differences of a run or two are noise.
 - `--check-hook` (0.15): in the tools and both conditions,
   tools/agent-hooks/check-after-edit.py runs after every change to a
-  `.tach` file (Write, Edit, a `tachyonc edit` that wrote) and adds
-  `tachyonc check`'s errors to that tool result, as it does for the
+  `.vl` file (Write, Edit, a `volec edit` that wrote) and adds
+  `volec check`'s errors to that tool result, as it does for the
   agents working on the compiler; the prompt says so
   ([prompts/check-hook.md](prompts/check-hook.md)). Claude: a PostToolUse
   hook in `--settings` (a copy of the script outside the repository);
@@ -139,8 +139,8 @@ tests/agent-eval/run.py run ... --skip-existing-in BASELINE_RUNDIR
 - `--dry-run` (0.16): no model; each workspace is set up, `prompt.md`,
   `settings.json` and `command.json` (the `claude` command line) are
   written, and every hook in the settings is run on synthetic events as
-  Claude Code would (a Write that adds an error to a `.tach` file: the
-  check hook must report it; a `grep` of a `.tach` file: the query hook
+  Claude Code would (a Write that adds an error to a `.vl` file: the
+  check hook must report it; a `grep` of a `.vl` file: the query hook
   must block it); `dry_run` in result.json. A hosted run's
   `check-hook.jsonl` is written by the hook itself, so it shows the hook
   fired (checked on 00-hello-sum with Haiku, 2026-10-15: one check after
@@ -154,7 +154,7 @@ tests/agent-eval/run.py run ... --skip-existing-in BASELINE_RUNDIR
   the workspace and $TMPDIR, `mktemp` (with and without `-d`/`-t`),
   `python3`, `git`, the compiler, a build, a run, `check`; for compiler
   tasks `compiler/std/embed.sh -c`, `bootstrap/eval-build.sh --quick`,
-  one `tests/run.sh` case; `tachyonc test` with `+test`. Offline: under
+  one `tests/run.sh` case; `volec test` with `+test`. Offline: under
   sandbox-exec with an approximation of Claude Code's box (it reproduces
   0.16's mktemp failure when the shim is taken away). Hosted (the default
   for Claude; one Haiku session per kind, under a cent): the same probes
@@ -165,8 +165,8 @@ tests/agent-eval/run.py run ... --skip-existing-in BASELINE_RUNDIR
   `$(...)`, a pipe, `cd`, `perl`, `sed -i`, ...), whose refusals are
   recorded, not required. A failed required probe stops the round
   (`OUT/selfcheck.json`, reused for 12 hours).
-- (0.17) `--tools-tachyonc PATH`: the compiler-tools conditions get PATH
-  as `target/tools/tachyonc` (newer tools on the same compiler tasks).
+- (0.17) `--tools-volec PATH`: the compiler-tools conditions get PATH
+  as `target/tools/volec` (newer tools on the same compiler tasks).
 - Hosted runs go `--jobs` at a time; Ollama runs one at a time.
 
 The prompt is `prompts/` assembled by `lib/prompts.py`: the language
@@ -178,18 +178,18 @@ task's `task.md`. Each run keeps its prompt in `prompt.md`.
 ## What a run does
 
 1. A fresh workspace outside the repository
-   (`$TMPDIR/tachyon-eval/RUN/TASK/MODEL/COND/repN/ws`, `--ws-root` to
+   (`$TMPDIR/vole-eval/RUN/TASK/MODEL/COND/repN/ws`, `--ws-root` to
    move it): the starter (`tach/` or `rust/`) copied, `git init` with
-   one commit (so `tachyonc undo` and `query diff` work, and the agent
+   one commit (so `volec undo` and `query diff` work, and the agent
    can diff; done for Rust too), and a `bin/` on PATH holding only
-   `tachyonc` (tachyon conditions) or only `rustc` (Rust), and (0.16) a
+   `volec` (vole conditions) or only `rustc` (Rust), and (0.16) a
    `mktemp` shim: macOS mktemp without a template ignores `$TMPDIR` and
    writes in the per-user temp directory, which the sandbox forbids; the
    shim adds a template in `$TMPDIR`.
 2. The agent, with the task's `timeout_s`.
 3. Processes the agent left running in the workspace are killed, then
    the grading, in a copy without `.git` and the agent's `prog`: the
-   fixed build command (`tachyonc main.tach -o prog`, `rustc -O
+   fixed build command (`volec main.vl -o prog`, `rustc -O
    --edition 2021 main.rs -o prog`), every hidden test (`./prog < NN.in`,
    exit 0 and stdout equal to `NN.out` up to line endings and trailing
    whitespace, within `test_timeout_s`), then `check.sh` if the task has
@@ -209,9 +209,9 @@ tests_total build_ok check_ok wall_s turns tool_calls tool_calls_by_kind
 input_tokens output_tokens cache_read_tokens cost_usd error`, and
 `permission_denials` (count and the denied calls), `leftover_processes`,
 `agent_env` (Claude's own report of its tools, MCP servers, skills,
-plugins, permission mode), `compiler`, `model_id`; for tachyon,
+plugins, permission mode), `compiler`, `model_id`; for vole,
 `final_check` (0.15: the errors left in the finished workspace by code,
-from `tachyonc check --json`; null for a compiler before 0.15) and with
+from `volec check --json`; null for a compiler before 0.15) and with
 `--check-hook`, `check_hook`.
 
 - (0.17) `anatomy` ([lib/anatomy.py](lib/anatomy.py)): `tokens` (turns,
@@ -221,7 +221,7 @@ from `tachyonc check --json`; null for a compiler before 0.15) and with
   `errors` (the distinct compile errors seen in tool results and hook
   output, each with its class: name, type, match, syntax, unsafe, alloc,
   own, effects, other; Rust's by rustc code) with `classes` and `habits`
-  (Rust habits in tachyon errors: `String`, `std::io`, a C call without
+  (Rust habits in vole errors: `String`, `std::io`, a C call without
   `unsafe`, `Vec::new`, ...), `repair` (calls from an error to the next
   clean build/check/checked edit, per error), `edit_recovery` (failed
   edits and whether the next one worked), `denials` (by cause: heredoc,
@@ -236,13 +236,13 @@ from `tachyonc check --json`; null for a compiler before 0.15) and with
   whole prompt of each call. `cost_usd` is Claude Code's list-price
   figure (not what a subscription pays).
 - `tool_calls_by_kind` counts the commands inside each tool call:
-  `tachyonc:query`, `tachyonc:edit`, `tachyonc:refactor`,
-  `tachyonc:check`, `tachyonc:fix`, `tachyonc:explain`,
-  `tachyonc:guide`, `tachyonc:undo`, ... (`tachyonc:build` for a
+  `volec:query`, `volec:edit`, `volec:refactor`,
+  `volec:check`, `volec:fix`, `volec:explain`,
+  `volec:guide`, `volec:undo`, ... (`volec:build` for a
   compile), `rustc`, `run` (`./prog`), `shell:CMD` for the rest (`cat`,
   `sed`, `grep`, ...), `file:TOOL` for the file tools (Claude's Read,
   Write, Edit, Glob, Grep; the loop's read_file, write_file, edit_file).
-  The report's tool share is tachyonc tools / (those + file tools + shell
+  The report's tool share is volec tools / (those + file tools + shell
   reads).
 
 ## Isolation
@@ -267,7 +267,7 @@ Claude (`lib/claude_backend.py`) runs `claude -p PROMPT --model M
 - `--settings` with the sandbox on (`autoAllowBashIfSandboxed`, no
   unsandboxed retry; `denyRead` and `Read(...)` deny rules for this
   repository, its main checkout and `~/.claude`), and a Bash allowlist of
-  the commands a programmer runs (tachyonc, rustc, ./prog, cat, ls, echo,
+  the commands a programmer runs (volec, rustc, ./prog, cat, ls, echo,
   printf, head, tail, grep, sed, diff, wc, mkdir, cp, mv, touch, find,
   python3, sh, git, ...);
 - `--permission-mode acceptEdits --permission-prompts none`: edits in
@@ -317,10 +317,10 @@ without a tool call, after 60 model calls, or at the task's timeout.
   the background, context management and long context; the loop has four
   plain tools, 60 s commands and a 32k context that Ollama truncates
   silently. Compare models within a backend; across backends, compare
-  the tachyon/Rust gap rather than the absolute numbers.
-- Rust is the control: the agents know it from training, tachyon only
-  from the prompt. `bare` is not "no help": `tachyonc` alone prints a
-  usage line naming `tachyonc guide`, and agents find it (`tachyonc:guide` in
+  the vole/Rust gap rather than the absolute numbers.
+- Rust is the control: the agents know it from training, vole only
+  from the prompt. `bare` is not "no help": `volec` alone prints a
+  usage line naming `volec guide`, and agents find it (`volec:guide` in
   `tool_calls_by_kind`).
 - The tools table names the tools; whether an agent uses them is
   measured (the report's tool share), not forced.
@@ -347,7 +347,7 @@ twin file names, both solutions build and pass every test and the check,
 no solution test takes more than half its time limit, and every starter
 fails (does not build, a test, or the check), building when
 `starter_builds` says it should. (0.17) Also: the reference solutions'
-lints (tachyon `fmt --check`, `lint --max-lines 1000`, `query unused`,
+lints (vole `fmt --check`, `lint --max-lines 1000`, `query unused`,
 `fix --dry-run`; Rust `rustfmt --check`, `rustc -D warnings`;
 `--no-lint` skips), every `variants/LANG-NAME.patch` (`diff -ruN a b`
 against solution/LANG: a second correct solution written another way,
@@ -358,7 +358,7 @@ writing it; and every ```` ```tach ```` block of prompts/*.md builds.
 
 ## Compiler tasks (0.16)
 
-`ctasks/NN-name/`: a change to tachyon's own compiler, made in a copy of
+`ctasks/NN-name/`: a change to vole's own compiler, made in a copy of
 the repository, graded by building the compiler and running part of its
 suite. The format is in `lib/ctasks.py`'s header: `meta.toml` (`kind`
 optimize|refactor|fix|feature, `base`: the commit the task is made
@@ -372,13 +372,13 @@ reference), `hidden/` (tests copied over the graded tree), `grade.sh`.
 - **The workspace**: `git archive` of the base, the starter patch,
   `git init` with one commit; `bootstrap/eval-build.sh`
   ([lib/eval-build.sh](lib/eval-build.sh): what bootstrap.sh does for
-  HEAD, from `target/builder/tachyonc`, the release that builds the base,
-  since the copy has no tags); `target/tachyonc` built from the starter;
+  HEAD, from `target/builder/volec`, the release that builds the base,
+  since the copy has no tags); `target/volec` built from the starter;
   CLAUDE.md and `.claude/` removed: the prompt carries AGENTS.md; (0.17)
   tests/agent-eval removed (the reference solutions are in it). A base
   after the last release is built by that release, as bootstrap.sh
   builds HEAD.
-- **compiler-tools**: AGENTS.md as it is; `target/tools/tachyonc`; the
+- **compiler-tools**: AGENTS.md as it is; `target/tools/volec`; the
   query-first hook (PreToolUse on Bash, Read, Grep, Edit, Write; PostToolUse
   on Bash) and the check hook (PostToolUse), registered in `--settings`
   as the repository's `.claude/settings.json` does, the scripts copied out
@@ -394,8 +394,8 @@ reference), `hidden/` (tests copied over the graded tree), `grade.sh`.
   `task.md`.
 - **The grading** (`ctasks.grade`), in a copy without `.git` and
   `target/`: `hidden/` copied over it; the build with the fixpoint; every
-  `suite` filter; `tachyonc same-output STARTER` on the corpus; `grade.sh`
-  (with `TACHYONC`, `EVAL_STARTER_TACHYONC`, `EVAL_STARTER_TREE`).
+  `suite` filter; `volec same-output STARTER` on the corpus; `grade.sh`
+  (with `VOLEC`, `EVAL_STARTER_VOLEC`, `EVAL_STARTER_TREE`).
   `tests_passed`/`tests_total` count those steps.
 - **Kept per run**: `changes.patch` (the agent's diff, `target/` left
   out), `agent-tools.jsonl` (the query hook's log), `check-hook.jsonl`;

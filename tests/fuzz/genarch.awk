@@ -1,4 +1,4 @@
-# Writes a random tachyon program of intrinsics (0.19, docs/design/arch.md
+# Writes a random vole program of intrinsics (0.19, docs/design/arch.md
 # §6.7): expression trees over the intrinsics of the target's table
 # (compiler/arch/aarch64.def or x86_64.def, and portable.def) and the
 # portable vector operations (lanewise + - & | ^, splat, from_bits between

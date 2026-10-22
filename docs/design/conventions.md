@@ -13,17 +13,17 @@ What this design changes is the **surface**. The semantics stay what
 mutable value semantics, second-class references, views with inferred
 summaries, `Drop`, moves, effects and explicit allocators. The Rust-like
 spelling (`&T`, `&mut T`, `&mut x`, `let mut`, `*r` through a reference)
-is replaced by spellings that say what tachyon means. Evals are off until
+is replaced by spellings that say what vole means. Evals are off until
 0.24, so each choice below is made on design merit and consistency, not
 on Rust familiarity. The language becomes **vole** in 0.24 (`volec`,
-`.vl`); this design keeps the name tachyon, and its diagnostics name no
+`.vl`); this design keeps the name vole, and its diagnostics name no
 language so that the rename changes none of them.
 
 Sources: value-semantics.md (§2, the "as built" sections, V4),
 docs/grammar.md (0.17 "familiar forms", 0.18.1), compiler/guide/{core,
 memory, views, rust, allocators, effects}.md,
-tests/agent-eval/prompts/guide-mini.md, front/parser/items/params.tach,
-front/own/kinds.tach (`param_mode`), and probes run with this branch's
+tests/agent-eval/prompts/guide-mini.md, front/parser/items/params.vl,
+front/own/kinds.vl (`param_mode`), and probes run with this branch's
 compiler.
 
 ## 0. Summary
@@ -105,7 +105,7 @@ Hylo, which this design takes the words from, as far as I know it:
   *remote parts* (a projection stored in a type), but I do not know its
   state, so this design does not rely on it.
 - I am *not sure* whether a `sink` parameter is mutable in the callee.
-  This design makes it mutable (§2.4), for tachyon's own reasons.
+  This design makes it mutable (§2.4), for vole's own reasons.
 
 Swift is the other precedent. It has `inout` with `&x` at the call,
 mutating methods called without a marker (`a.append(x)`), and
@@ -135,7 +135,7 @@ of a `Vec` is right without thinking.
 
 **D2. Spelling: the convention goes before the type, `x: inout T`
 (Hylo's and Swift's placement), not before the name.** The convention
-belongs with the type because tachyon also needs accesses in places
+belongs with the type because vole also needs accesses in places
 that have no parameter name: fields (`q: inout Query`), results (`->
 inout V`), type arguments (`Option<inout V>`) and function types (`fn(inout
 Sum, i64)`). So one form serves everywhere. A prefix spelling (`inout
@@ -144,7 +144,7 @@ idea. Receivers are the exception, because they have no type to put it
 before (§4).
 
 **D3. No `set`.** Hylo's `set` initializes storage the caller has not
-initialized. Tachyon has no uninitialized locals (`let x;` is not
+initialized. Vole has no uninitialized locals (`let x;` is not
 allowed, and that stays), so a `set` argument could only be a place
 whose old value is dropped first, which is `inout` plus an assignment.
 Out-parameters are results: a function returns its values (a tuple or a
@@ -193,7 +193,7 @@ The three kinds of 0.17 (§2.1 there) decide what each convention costs:
 ### 2.3 What a convention means to the own pass
 
 Nothing new. Each convention maps onto 0.17's parameter modes
-(kinds.tach `param_mode`), so the walk, the loans, the summaries and
+(kinds.vl `param_mode`), so the walk, the loans, the summaries and
 exclusivity stay as built:
 
 | convention | type kind | `param_mode` | internal parameter type |
@@ -255,7 +255,7 @@ fn build(t: inout Vec<Node, let Arena>, d: i64) { ... }    // U3's arena contain
 - **`extern "C"`.** C has only values and pointers. An extern function's
   parameters are by value (`let`, the default, a C value). `inout` and
   `sink` there are the error `conv.extern` ("C takes a pointer: `p:
-  *T`, pass `&x`"). A tachyon function exported to C follows the same
+  *T`, pass `&x`"). A vole function exported to C follows the same
   rule.
 - **`sink` outside parameters** is the error `conv.sink_type`: a field
   or a result of type T already owns its value.
@@ -299,9 +299,9 @@ a mutating `match`, a mutating `for`, or a `-> inout T` result.
 The diagnostics, each one line with `try:` lines that run as they are:
 
 ```text
-main.tach:7:10: error[conv.marker] 'fill' takes 'v' inout (it may change 'v'): mark the argument | try: tachyonc edit patch main.tach:7 --old 'fill(v, 3)' --new 'fill(&v, 3)'
-main.tach:8:15: error[conv.marker_extra] '&' marks an argument the callee may change; 'total' takes 'v' let (it only reads) | try: tachyonc edit patch main.tach:8 --old 'total(&v)' --new 'total(v)'
-main.tach:9:11: error[conv.place] '&' lends a place, and 'make()' is a temporary | help: bind it first | try: tachyonc edit patch main.tach:9 --old 'grow(&make())' --new 'var t = make(); grow(&t)'
+main.vl:7:10: error[conv.marker] 'fill' takes 'v' inout (it may change 'v'): mark the argument | try: volec edit patch main.vl:7 --old 'fill(v, 3)' --new 'fill(&v, 3)'
+main.vl:8:15: error[conv.marker_extra] '&' marks an argument the callee may change; 'total' takes 'v' let (it only reads) | try: volec edit patch main.vl:8 --old 'total(&v)' --new 'total(v)'
+main.vl:9:11: error[conv.place] '&' lends a place, and 'make()' is a temporary | help: bind it first | try: volec edit patch main.vl:9 --old 'grow(&make())' --new 'var t = make(); grow(&t)'
 ```
 
 When the callee declares `inout` but never writes the parameter (the
@@ -309,7 +309,7 @@ own pass knows: no write, no inout call, no inout store reaches it), a
 second `try:` changes the callee instead, with every call:
 
 ```text
-main.tach:7:10: error[conv.marker] 'show' takes 'v' inout (it may change 'v'): mark the argument | help: 'show' never changes 'v': it could take it let | try: tachyonc edit patch main.tach:7 --old 'show(v)' --new 'show(&v)' | try: tachyonc refactor signature show --convention v let
+main.vl:7:10: error[conv.marker] 'show' takes 'v' inout (it may change 'v'): mark the argument | help: 'show' never changes 'v': it could take it let | try: volec edit patch main.vl:7 --old 'show(v)' --new 'show(&v)' | try: volec refactor signature show --convention v let
 ```
 
 ## 4. Receivers (question 3)
@@ -561,7 +561,7 @@ sort(v.as_mut_slice());                          // likewise
   projection costs a pointer return, with no coroutine.
 - **Why not Hylo's `subscript` with `yield`?** Hylo yields so that code
   can run after the access: write-back, invariants, computed
-  properties. Tachyon's accesses are addresses, so every projection
+  properties. Vole's accesses are addresses, so every projection
   that points at storage is a function returning one. A `yield` form
   would need coroutine lowering or forced inlining for the case of a
   part that is computed rather than stored (a bit field, a proxy), and
@@ -588,7 +588,7 @@ The principle: **a Rust form that conflicts with the new vocabulary is
 not accepted, but it is recognized**, and its diagnostic gives the new
 form in a `try:` line (cheap, and it helps anyone who comes from Rust).
 A form that does not conflict and is good on its own merits stays as
-tachyon's own.
+vole's own.
 
 | form (where it came from) | decision | why |
 |---|---|---|
@@ -609,7 +609,7 @@ tachyon's own.
 | struct-like variants `V { a: A }` (0.17) | **kept** | labeled payloads are a feature on their own merit (Swift and Hylo have them) |
 | the larger prelude, safe `panic`/`unreachable` (night) | **kept** | names, not syntax |
 | `use sibling::X` resolving beside the module (night) | **kept** | not a Rust form (Rust rejects it) |
-| `let ... else`, `x?`, closures, `impl Trait for T`, `#[derive]`, `if let` | **kept** | tachyon's own now; no conflict |
+| `let ... else`, `x?`, closures, `impl Trait for T`, `#[derive]`, `if let` | **kept** | vole's own now; no conflict |
 | Display's `fmt(&self, f: &mut Formatter)` help (0.15) | **reworded**: `fn fmt(self, f: inout Fmt)` | |
 
 `conv.rust` is one code with one message per spelling, since a user
@@ -642,7 +642,7 @@ under `inout`.
 compiler/src of release N is compiled twice:
 
 - by release N-1, with N-1's std (the compiler that runs supplies std);
-- by N itself (build2, build3), with N's std, which stdsrc.tach embeds.
+- by N itself (build2, build3), with N's std, which stdsrc.vl embeds.
 
 std of release N is only ever compiled by compilers of release N, so
 std may use the new syntax in the release that introduces it.
@@ -728,27 +728,27 @@ The proof:
 - `tests/run.sh guide` compiles the rewritten guide;
 - for std, tools/std020/same-code.sh: the same code before and after,
   since the spelling changes and the instructions do not;
-- for compiler/src (R+1), `tachyonc same-output OLD_TACHYONC` plus the
+- for compiler/src (R+1), `volec same-output OLD_VOLEC` plus the
   fixpoint.
 
 ### 9.3 The bootstrap transition, exactly
 
 **Release R (0.20): the new syntax, with compiler/src on the old one.**
 
-1. **The pragma.** compiler/src/main.tach gets, as its first line:
+1. **The pragma.** compiler/src/main.vl gets, as its first line:
 
-       // tachyon-syntax: 0.19 (tachyon's own source until 0.21; docs/design/conventions.md §9.3)
+       // vole-syntax: 0.19 (vole's own source until 0.21; docs/design/conventions.md §9.3)
 
    v0.19.1 sees a comment. R's driver reads the root file's leading
    comment lines and, on exactly this line, parses the whole crate in
    **legacy mode**: the 0.19 spelling, with its meaning. std is a crate
    of its own (0.20) and is never legacy.
 2. **Only the bootstrap may use it.** tests/run.sh (and so the gate)
-   fails if any file other than compiler/src/main.tach carries the line.
+   fails if any file other than compiler/src/main.vl carries the line.
    It is not documented in the guide or in `--help`. `explain
    syntax.legacy` says what it is for and that 0.21 removes it. A user
    program in legacy syntax gets the `conv.rust` errors and `try:
-   tachyonc fix --only conventions`. A command-line flag was the
+   volec fix --only conventions`. A command-line flag was the
    alternative, but every tool would have to pass it: bootstrap.sh,
    gate.sh, the hooks, query, edit, refactor, same-output and the
    refactor tests. A pragma reaches all of them, because they all parse
@@ -789,7 +789,7 @@ The proof:
    already the rule ("compiler/src uses only what the previous release
    supports").
 7. **The rehearsal, in R's gate.** On a scratch copy of the tree, run
-   `tachyonc fix --only conventions` over compiler/src, delete the
+   `volec fix --only conventions` over compiler/src, delete the
    pragma, build the result with R's build2 (as R+1's build1 will be),
    run the suite with it, and run `same-output`. R does not ship unless
    the rehearsal passes, so that R+1's first step is known to work.
@@ -802,7 +802,7 @@ The proof:
 **Release R+1 (0.21): compiler/src migrated, the old syntax removed.**
 These are the first commits of 0.21, before its other work branches off:
 
-1. **C1.** Run `tachyonc fix --only conventions` (v0.20.0's) over
+1. **C1.** Run `volec fix --only conventions` (v0.20.0's) over
    compiler/src and delete the pragma. The bootstrap builds it with
    v0.20.0 (which accepts the new syntax) and then with itself. The
    fixpoint must hold, the suite must pass, and `same-output` must hold
@@ -811,7 +811,7 @@ These are the first commits of 0.21, before its other work branches off:
    `LEGACY` bit, the tools' legacy printer and the cross-mode table.
    `mut` becomes reserved, with its `conv.rust` messages kept. The
    pragma line becomes the error `syntax.legacy_removed`: "this
-   compiler reads only the new syntax; tachyonc 0.20's `fix --only
+   compiler reads only the new syntax; volec 0.20's `fix --only
    conventions` migrates it".
 3. **C3.** The `Allocator` trait's receivers become `self`, together
    with compiler/src's impls (step 5 above).
@@ -829,11 +829,11 @@ references to conventions. Each keeps 0.17's contract: one line, a
 are, tested by tests/own-try.
 
 ```text
-fill.tach:2:5: error[own.readonly] 'v' is let here (borrowed, read-only): 'v.push(1)' changes it | help: to change it, take it inout | try: tachyonc refactor signature fill --convention v inout
-main.tach:6:5: error[own.moved] 'v' is used here after it moved into 'consume(v)' at 5:13 ('consume' takes 'v' sink) | help: 'consume' only reads 'v': take it let, or pass a copy | try: tachyonc refactor signature consume --convention v let | try: tachyonc edit patch main.tach:5 --old 'consume(v)' --new 'consume(v.clone())'
-table.tach:2:15: error[own.move_out] cannot take 'self.keys' (Vec<Entry>) out of 'self': 'rehash' has self inout | help: take it and leave an empty one, or borrow it with 'let' | try: tachyonc edit patch table.tach:2 --old 'var old = self.keys' --new 'var old = self.keys.take()'
-main.tach:9:13: error[own.conflict] 'a' is lent inout to argument 1 and to argument 2 of 'transfer' | help: two inout accesses of one value cannot be live at once
-main.tach:5:5: error[own.conflict] 'v.push(4)' may move v's elements while 'first' (4:17) views them; 'first' is used at 6:16 | help: use 'first' before the push, keep an index, or keep a copy | try: tachyonc edit patch main.tach:4 --old 'v.as_slice()' --new 'v.clone()'
+fill.vl:2:5: error[own.readonly] 'v' is let here (borrowed, read-only): 'v.push(1)' changes it | help: to change it, take it inout | try: volec refactor signature fill --convention v inout
+main.vl:6:5: error[own.moved] 'v' is used here after it moved into 'consume(v)' at 5:13 ('consume' takes 'v' sink) | help: 'consume' only reads 'v': take it let, or pass a copy | try: volec refactor signature consume --convention v let | try: volec edit patch main.vl:5 --old 'consume(v)' --new 'consume(v.clone())'
+table.vl:2:15: error[own.move_out] cannot take 'self.keys' (Vec<Entry>) out of 'self': 'rehash' has self inout | help: take it and leave an empty one, or borrow it with 'let' | try: volec edit patch table.vl:2 --old 'var old = self.keys' --new 'var old = self.keys.take()'
+main.vl:9:13: error[own.conflict] 'a' is lent inout to argument 1 and to argument 2 of 'transfer' | help: two inout accesses of one value cannot be live at once
+main.vl:5:5: error[own.conflict] 'v.push(4)' may move v's elements while 'first' (4:17) views them; 'first' is used at 6:16 | help: use 'first' before the push, keep an index, or keep a copy | try: volec edit patch main.vl:4 --old 'v.as_slice()' --new 'v.clone()'
 ```
 
 - **`refactor signature F --convention x let|inout|sink`** (new) changes
@@ -886,7 +886,7 @@ Rewritten in the new syntax, and compiled by `tests/run.sh guide`:
 **rust.md's mapping table**, which replaces "References, ownership,
 memory":
 
-| Rust | tachyon |
+| Rust | vole |
 |---|---|
 | `x: &T`, `f(&x)` | `x: T` (let, the default), `f(x)` |
 | `x: &mut T`, `f(&mut x)` | `x: inout T`, `f(&x)` |
@@ -1125,11 +1125,11 @@ The call says which arguments change: `transfer(&a, &b, 30)`,
 
 ```text
 transfer(&a, &a, 1);
-main.tach:14:5: error[own.conflict] 'a' is lent inout to argument 1 and to argument 2 of 'transfer' | help: two inout accesses of one value cannot be live at once
+main.vl:14:5: error[own.conflict] 'a' is lent inout to argument 1 and to argument 2 of 'transfer' | help: two inout accesses of one value cannot be live at once
 transfer(&accts[i], &accts[j], 5);
-main.tach:15:5: error[own.conflict] 'accts[i]' and 'accts[j]' may be the same element: both are lent inout to 'transfer' | help: work by index in a function that takes 'accts: inout Vec<Account>', or take one out first ('std::take(&accts[j])', then put it back)
+main.vl:15:5: error[own.conflict] 'accts[i]' and 'accts[j]' may be the same element: both are lent inout to 'transfer' | help: work by index in a function that takes 'accts: inout Vec<Account>', or take one out first ('std::take(&accts[j])', then put it back)
 report(a, sum);
-main.tach:16:15: error[conv.marker] 'report' takes 'out' inout (it may change 'sum'): mark the argument | try: tachyonc edit patch main.tach:16 --old 'report(a, sum)' --new 'report(a, &sum)'
+main.vl:16:15: error[conv.marker] 'report' takes 'out' inout (it may change 'sum'): mark the argument | try: volec edit patch main.vl:16 --old 'report(a, sum)' --new 'report(a, &sum)'
 ```
 
 ### 11.4 A consuming builder
@@ -1182,7 +1182,7 @@ fn main(gpa: Gpa) {
 its `mut` said separately. A second `r.send()`:
 
 ```text
-main.tach:16:13: error[own.moved] 'r' is used here after it moved into 'r.send()' at 15:13 ('send' takes self sink) | help: 'send' only reads self: take it let | try: tachyonc refactor signature Request::send --convention self let
+main.vl:16:13: error[own.moved] 'r' is used here after it moved into 'r.send()' at 15:13 ('send' takes self sink) | help: 'send' only reads self: take it let | try: volec refactor signature Request::send --convention self let
 ```
 
 ## 12. Implementation plan
@@ -1195,23 +1195,23 @@ corpus migration, and the projections. Release R = 0.20.
 
 | chunk | contents | files |
 |---|---|---|
-| P0.1 | lexer: `var`, `inout`, `sink` as keywords of new-mode files (none of them is an identifier in std; 49 `var` in tests are renamed by M) | front/lexer/mod.tach |
-| P0.2 | parser, new mode: `x: [let\|inout\|sink] T`; receivers `self`, `inout self`, `sink self`, `self: inout Self`; access types `let T`/`inout T` in fields, results, type arguments, fn types; `var` bindings and `var` in patterns; `inout x = e;`; `static var`; `sink \|..\|`; `for inout x in &e`; `&e` as the inout marker (the node that legacy `&mut e` makes, `NODE_REF_MUT`); the recognizer of §7's Rust spellings (`conv.rust`), as parse errors with the try text; legacy mode: today's parser, unchanged | front/parser/{items/params, types, stmts, exprs}.tach, front/patterns |
-| P0.3 | the mode: the pragma (§9.3), `CRATE_LEGACY`, per-file mode for std; the tests/run.sh lint; compiler/src/main.tach gets the pragma | driver (front/mod.tach, front/modules), tests/run.sh |
-| P0.4 | the fixed interface: AST fields (a parameter's `PARAM_CONV`: LET, INOUT, SINK, LEGACY_VALUE; a binding's `BIND_VAR`, `BIND_INOUT`; the type node's access flag); `front/conv.tach`: `param_conv(f, i)`, `binding_is_access(l)`, `is_transparent(l)`, `let_of(t)` (copy or `&T` by kind, per instance), `conv_text(c)` for every printer; `param_mode` (kinds.tach) mapping conventions per §2.3, with stubs where T1 fills the rules | front/ast.tach, front/conv.tach (new), front/own/kinds.tach |
-| P0.5 | the codes (`conv.*`, `syntax.legacy`) with stub explain entries; tests: `conv_*` cases (XFAIL until their task), `err_conv_rust_*` (passing: the parser's errors), `conv_legacy_bridge` (a legacy crate calling a new-syntax module: §9.3 table) | front/own/diag.tach, tools/explain/, tests/run |
+| P0.1 | lexer: `var`, `inout`, `sink` as keywords of new-mode files (none of them is an identifier in std; 49 `var` in tests are renamed by M) | front/lexer/mod.vl |
+| P0.2 | parser, new mode: `x: [let\|inout\|sink] T`; receivers `self`, `inout self`, `sink self`, `self: inout Self`; access types `let T`/`inout T` in fields, results, type arguments, fn types; `var` bindings and `var` in patterns; `inout x = e;`; `static var`; `sink \|..\|`; `for inout x in &e`; `&e` as the inout marker (the node that legacy `&mut e` makes, `NODE_REF_MUT`); the recognizer of §7's Rust spellings (`conv.rust`), as parse errors with the try text; legacy mode: today's parser, unchanged | front/parser/{items/params, types, stmts, exprs}.vl, front/patterns |
+| P0.3 | the mode: the pragma (§9.3), `CRATE_LEGACY`, per-file mode for std; the tests/run.sh lint; compiler/src/main.vl gets the pragma | driver (front/mod.vl, front/modules), tests/run.sh |
+| P0.4 | the fixed interface: AST fields (a parameter's `PARAM_CONV`: LET, INOUT, SINK, LEGACY_VALUE; a binding's `BIND_VAR`, `BIND_INOUT`; the type node's access flag); `front/conv.vl`: `param_conv(f, i)`, `binding_is_access(l)`, `is_transparent(l)`, `let_of(t)` (copy or `&T` by kind, per instance), `conv_text(c)` for every printer; `param_mode` (kinds.vl) mapping conventions per §2.3, with stubs where T1 fills the rules | front/ast.vl, front/conv.vl (new), front/own/kinds.vl |
+| P0.5 | the codes (`conv.*`, `syntax.legacy`) with stub explain entries; tests: `conv_*` cases (XFAIL until their task), `err_conv_rust_*` (passing: the parser's errors), `conv_legacy_bridge` (a legacy crate calling a new-syntax module: §9.3 table) | front/own/diag.vl, tools/explain/, tests/run |
 
 Rule: after P0, tasks change only the files they own. A change to the
-AST fields, to `front/conv.tach`'s signatures or to `param_mode`'s
+AST fields, to `front/conv.vl`'s signatures or to `param_mode`'s
 contract goes through the lead.
 
 ### The parallel tasks
 
 | task | owns | chunks (one commit each) |
 |---|---|---|
-| **T1 checking** | front/check/** (calls, check_mode, assign, body, names, iterate), front/patterns, front/closures, front/traits.tach; front/own/{moves, views, calls, diag text} | T1.a transparency: implicit dereference of access bindings, writes through, `&r` reborrows, `*` on an access is `conv.rust`; T1.b markers: `conv.marker`, `conv.marker_extra`, `conv.place`, the Vec/Buf/array → `[T]`/`inout [T]` conversions; T1.c bindings: let immutability as `own.readonly` in the new words, `let x = part` borrows (was `own.move_out`), `var x = part` stays `own.move_out`, `inout` locals, sink bindings mutable, plain let as a copy without a loan; T1.d receivers, trait/impl matching across modes (§9.3 rows 6–7, the Allocator rule), fn types with conventions, closures (`sink \|\|`, captures), `extern "C"` rules; T1.e patterns through accesses and `match &e`; T1.f the own diagnostics' words (§10.1), tests/own-try updated |
-| **T2 tools** | tools/** (new tools/fixconv.tach; fixvalues, fix/, refactor_shape, edit, fmt/, query/, rewrite, explain tables) | T2.a one printer of conventions and access types, mode-aware, used by every tool; T2.b `fix --only conventions` rules 1–4; T2.c rules 5–8 and the reports; T2.d `refactor signature --convention`, `refactor field --type 'inout T'`, `extract-function` emitting `inout`, `fix --values` emitting the new syntax; T2.e fmt (the short receiver form, drops a written `let`), query def/show/context/own in the new words |
-| **T3 projections** | front/types.tach (access type arguments without `decay_ref`), front/own/summary.tach and the result side of views.tach, front/check/iterate.tach's `for inout` (after T1.a), compiler/std's collection APIs | T3.a bare `-> let T` / `-> inout T` (body rules, summaries, calls as views); T3.b `Option<let T>`, `Option<inout T>` as type arguments, `?`/`unwrap`/patterns on them; T3.c `for inout x in &v` over Vec, Buf, arrays and slices; T3.d std: `get_mut`, `get_or_insert`, `last_mut`, `as_mut_slice -> inout [T]`, the one-element views deprecated; `fix` rule 9 |
+| **T1 checking** | front/check/** (calls, check_mode, assign, body, names, iterate), front/patterns, front/closures, front/traits.vl; front/own/{moves, views, calls, diag text} | T1.a transparency: implicit dereference of access bindings, writes through, `&r` reborrows, `*` on an access is `conv.rust`; T1.b markers: `conv.marker`, `conv.marker_extra`, `conv.place`, the Vec/Buf/array → `[T]`/`inout [T]` conversions; T1.c bindings: let immutability as `own.readonly` in the new words, `let x = part` borrows (was `own.move_out`), `var x = part` stays `own.move_out`, `inout` locals, sink bindings mutable, plain let as a copy without a loan; T1.d receivers, trait/impl matching across modes (§9.3 rows 6–7, the Allocator rule), fn types with conventions, closures (`sink \|\|`, captures), `extern "C"` rules; T1.e patterns through accesses and `match &e`; T1.f the own diagnostics' words (§10.1), tests/own-try updated |
+| **T2 tools** | tools/** (new tools/fixconv.vl; fixvalues, fix/, refactor_shape, edit, fmt/, query/, rewrite, explain tables) | T2.a one printer of conventions and access types, mode-aware, used by every tool; T2.b `fix --only conventions` rules 1–4; T2.c rules 5–8 and the reports; T2.d `refactor signature --convention`, `refactor field --type 'inout T'`, `extract-function` emitting `inout`, `fix --values` emitting the new syntax; T2.e fmt (the short receiver form, drops a written `let`), query def/show/context/own in the new words |
+| **T3 projections** | front/types.vl (access type arguments without `decay_ref`), front/own/summary.vl and the result side of views.vl, front/check/iterate.vl's `for inout` (after T1.a), compiler/std's collection APIs | T3.a bare `-> let T` / `-> inout T` (body rules, summaries, calls as views); T3.b `Option<let T>`, `Option<inout T>` as type arguments, `?`/`unwrap`/patterns on them; T3.c `for inout x in &v` over Vec, Buf, arrays and slices; T3.d std: `get_mut`, `get_or_insert`, `last_mut`, `as_mut_slice -> inout [T]`, the one-element views deprecated; `fix` rule 9 |
 | **T4 guide and docs** | compiler/guide/*.md, docs/grammar.md (a new section, "Additions of 0.20: conventions", with the EBNF of §13), tests/agent-eval/prompts/*.md, the explain entries' text and examples | one chunk per topic: core, memory, views, rust, syntax, closures/traits/iterators, allocators/effects/unsafe/errors, guide-mini and guide-core, grammar.md, explain `conv.*` |
 
 ### Phase M: the migration and the flip (serial, after T1 and T2; the lead or T2's owner)
@@ -1328,7 +1328,7 @@ Each was decided here; the section that argues it is in brackets.
     same-output, same-code and the suites. `fix --values` emits the new
     syntax [§9.2].
 25. **D25** The bootstrap: 0.20 parses compiler/src in legacy mode under
-    a root pragma that only compiler/src/main.tach may carry (a lint).
+    a root pragma that only compiler/src/main.vl may carry (a lint).
     The tools are mode-aware. The rehearsal is in the gate. 0.21's first
     commits migrate compiler/src and delete legacy mode [§9.3].
 26. **D26** Diagnostics keep the `own.*` codes in the new words and add
@@ -1357,7 +1357,7 @@ the AST flags below, or to the modes' rules goes through the lead.
 
 ### What Phase 0 contains
 
-**The modes** (front/conv.tach). A file is read in one of three ways:
+**The modes** (front/conv.vl). A file is read in one of three ways:
 
 - **mixed**, the default until Phase M: both spellings, each with its
   meaning.
@@ -1366,10 +1366,10 @@ the AST flags below, or to the modes' rules goes through the lead.
   spellings are `conv.rust`, and `&x` is always exclusive. M makes this
   the default.
 - **0.19 (legacy)**: the crate whose root starts with `LEGACY_MARKER`,
-  `// tachyon-syntax: 0.19`. 0.20's forms are `syntax.legacy`, and
+  `// vole-syntax: 0.19`. 0.20's forms are `syntax.legacy`, and
   `var`, `inout` and `sink` are plain identifiers.
-  compiler/src/main.tach carries the line now. tests/run.sh fails when
-  any other .tach under compiler/, tests/, examples/ or bench/ carries
+  compiler/src/main.vl carries the line now. tests/run.sh fails when
+  any other .vl under compiler/, tests/, examples/ or bench/ carries
   it, except tests/run/conv_legacy* (the mode's own tests).
 
 std and the generated sources (`<check>`, `<profile>`, `<trace>`) are
@@ -1379,7 +1379,7 @@ always read mixed, until M migrates them. The helpers are
 `starts_type(k)`.
 
 **The parser** (front/parser/{items/params, types, stmts, exprs, mod,
-foreign, items/mod}.tach) reads these forms:
+foreign, items/mod}.vl) reads these forms:
 
 | form | the AST it makes (until T1: what 0.19 would have made) |
 |---|---|
@@ -1412,17 +1412,17 @@ The other errors: `x: set T` is `conv.set`, and `sink T` outside a
 parameter is `conv.sink_type`. The receiver help (`&self` and
 `fmt(&self, ..)`) now names `self`, `inout self` and `sink self`.
 
-**The fixed interface** (front/conv.tach, front/ast.tach):
+**The fixed interface** (front/conv.vl, front/ast.vl):
 
 | name | contract |
 |---|---|
-| `CONV_NEW`, `CONV_INOUT`, `CONV_SINK` (ast.tach: bits 54, 55, 49 of `p`) | as in the table above; a node without CONV_NEW was written in 0.19's spelling |
+| `CONV_NEW`, `CONV_INOUT`, `CONV_SINK` (ast.vl: bits 54, 55, 49 of `p`) | as in the table above; a node without CONV_NEW was written in 0.19's spelling |
 | `param_conv(p)`, `fn_param_conv(f, i)`, `param_node(f, i)` | CONV_LEGACY (0.19's spelling: the type says how it is taken), CONV_LET, CONV_IN_OUT, CONV_SINK_K |
 | `conv_word(c)` | "", "let", "inout", "sink" (for messages and printers) |
 | `inout_marker(n)` | a CONV_NEW `&` that is not yet exclusive |
 | `conv_error(code, start, end, message, help, new)`, `rust_spelling(start, end, what, new)`, `legacy_error(start, end, what)`, `try_patch(pos, old, new)` | the diagnostics' helpers: soft, coded, with try: and fix |
-| `CODE_RUST`, `CODE_SET`, `CODE_SINK_TYPE`, `CODE_LEGACY` (reported); `CODE_MARKER`, `CODE_MARKER_EXTRA`, `CODE_PLACE`, `CODE_EXTERN` (T1's); `CODE_LEGACY_REMOVED` (0.21) | the codes; each has its `explain` entry in tools/explain/conv_table.tach, and tests/refactor's self_explain covers the `conv.` and `syntax.` prefixes |
-| `PARAM_TYPE` (parser/items/params.tach) | true while a parameter's type is parsed |
+| `CODE_RUST`, `CODE_SET`, `CODE_SINK_TYPE`, `CODE_LEGACY` (reported); `CODE_MARKER`, `CODE_MARKER_EXTRA`, `CODE_PLACE`, `CODE_EXTERN` (T1's); `CODE_LEGACY_REMOVED` (0.21) | the codes; each has its `explain` entry in tools/explain/conv_table.vl, and tests/refactor's self_explain covers the `conv.` and `syntax.` prefixes |
+| `PARAM_TYPE` (parser/items/params.vl) | true while a parameter's type is parsed |
 | `mark_param_conv(n)` | a Param flagged from its type node |
 
 **fmt** keeps a space after `inout` and `sink` before `[` or `(` in a
@@ -1444,10 +1444,10 @@ type position, and after a statement's `var` before `(`. It reads `sink
 
 | task | owns | fills | must not change |
 |---|---|---|---|
-| **T1 checking** | front/check/** (calls, check_mode's coercions, assign, body, names, iterate), front/patterns, front/closures, front/traits.tach, front/own/{kinds `param_mode`, moves, views, calls}, the own diagnostics' words | `let_of`: a let parameter of a plain or copyable type is a copy, otherwise `&T`, per instance; transparency of access bindings (implicit `*`, writes through, `&r` reborrows; `*r` on an access is `conv.rust`); `conv.marker`, `conv.marker_extra`, `conv.place`, `conv.extern`; let parameters read-only (`own.readonly` in the new words); `let x = part` borrows; sink bindings; `fn(sink T)` / `fn(inout T)` in function types (conventions in `TyKind::Fn`); trait and impl matching across modes (§9.3 rows 6–7, the Allocator rule); `match &e`; the receiver of `sink self` moves; the own pass's messages in the new vocabulary (§10.1) and tests/own-try | the parser, front/conv.tach's signatures, the AST flags |
-| **T2 tools** | tools/** (new tools/fixconv.tach; fixvalues, fix/, refactor_shape, edit, fmt/, query/, rewrite) | one mode-aware printer of conventions; `fix --only conventions` (§9.2 rules 1–8); `refactor signature --convention`; `refactor field --type 'inout T'`; extract-function and `fix --values` emitting 0.20's spelling in mixed and 0.20 crates and 0.19's in the legacy one; fmt writing `self` / `inout self` and dropping a written `let`; query def/show/context/own in the new words | front/**, explain's codes |
-| **T3 returned parts** | front/types.tach (accesses as type arguments: no `decay_ref` for a CONV_NEW access), front/own/summary.tach and the result side of views.tach, front/check/iterate.tach's `for inout`, compiler/std's collection APIs, after M | `-> let T` and `-> inout T` (they parse now; the body's `&place` and the summaries are T3's), `Option<let T>` / `Option<inout T>`, `for inout x in &v` (parser: T3 adds it in stmts.tach's `for`, after asking the lead), `get_mut`, `get_or_insert`, `last_mut`, `as_mut_slice -> inout [T]`; `fix` rule 9 | the parser's other forms, `param_conv` |
-| **T4 guide and docs** | compiler/guide/*.md (and `compiler/guide/embed.sh`), docs/grammar.md (the 0.20 section, then the EBNF of §13 at M), tests/agent-eval/prompts/*.md, the text of conv_table.tach's entries | the guide in 0.20's spelling, landing with M.4 (until then each example compiles mixed); rust.md's table (§10.2); guide-mini and guide-core | the code |
+| **T1 checking** | front/check/** (calls, check_mode's coercions, assign, body, names, iterate), front/patterns, front/closures, front/traits.vl, front/own/{kinds `param_mode`, moves, views, calls}, the own diagnostics' words | `let_of`: a let parameter of a plain or copyable type is a copy, otherwise `&T`, per instance; transparency of access bindings (implicit `*`, writes through, `&r` reborrows; `*r` on an access is `conv.rust`); `conv.marker`, `conv.marker_extra`, `conv.place`, `conv.extern`; let parameters read-only (`own.readonly` in the new words); `let x = part` borrows; sink bindings; `fn(sink T)` / `fn(inout T)` in function types (conventions in `TyKind::Fn`); trait and impl matching across modes (§9.3 rows 6–7, the Allocator rule); `match &e`; the receiver of `sink self` moves; the own pass's messages in the new vocabulary (§10.1) and tests/own-try | the parser, front/conv.vl's signatures, the AST flags |
+| **T2 tools** | tools/** (new tools/fixconv.vl; fixvalues, fix/, refactor_shape, edit, fmt/, query/, rewrite) | one mode-aware printer of conventions; `fix --only conventions` (§9.2 rules 1–8); `refactor signature --convention`; `refactor field --type 'inout T'`; extract-function and `fix --values` emitting 0.20's spelling in mixed and 0.20 crates and 0.19's in the legacy one; fmt writing `self` / `inout self` and dropping a written `let`; query def/show/context/own in the new words | front/**, explain's codes |
+| **T3 returned parts** | front/types.vl (accesses as type arguments: no `decay_ref` for a CONV_NEW access), front/own/summary.vl and the result side of views.vl, front/check/iterate.vl's `for inout`, compiler/std's collection APIs, after M | `-> let T` and `-> inout T` (they parse now; the body's `&place` and the summaries are T3's), `Option<let T>` / `Option<inout T>`, `for inout x in &v` (parser: T3 adds it in stmts.vl's `for`, after asking the lead), `get_mut`, `get_or_insert`, `last_mut`, `as_mut_slice -> inout [T]`; `fix` rule 9 | the parser's other forms, `param_conv` |
+| **T4 guide and docs** | compiler/guide/*.md (and `compiler/guide/embed.sh`), docs/grammar.md (the 0.20 section, then the EBNF of §13 at M), tests/agent-eval/prompts/*.md, the text of conv_table.vl's entries | the guide in 0.20's spelling, landing with M.4 (until then each example compiles mixed); rust.md's table (§10.2); guide-mini and guide-core | the code |
 
 **Merge order:** Phase 0 → T1 and T2 (T2 merges after T1) → M.1–M.4,
 where the default becomes `--syntax=0.20` and T4 lands → T3 → the R
@@ -1492,7 +1492,7 @@ gate with the rehearsal (§9.3 step 7).
   Anything else is taken as `&T`. In a 0.20 file an unwritten convention
   is let; in a mixed file it keeps 0.19's by-value meaning.
 - **Temporaries.** A value passed to a let parameter that borrows
-  (`total(make())`) becomes a temporary of the statement. temps.tach
+  (`total(make())`) becomes a temporary of the statement. temps.vl
   does this for calls of non-generic functions named by an identifier;
   method calls and generic callees do not get it yet.
 - **`let x = part;`** in a 0.20 file borrows (D13) when the part is an
@@ -1514,13 +1514,13 @@ gate with the rehearsal (§9.3 step 7).
 - **Access fields** (`q: inout Query`, `cfg: let Config`, declared with
   CONV_NEW) are transparent too. `synth_field` makes `p.q` into `*p.q`,
   so `h.p.q = 10` and `h.n = 7` write the place the field designates.
-  The owned-assignment desugaring (drops.tach `copy_place`) keeps the
+  The owned-assignment desugaring (drops.vl `copy_place`) keeps the
   flag that marks the reference under an access's `*`. Before this,
   `x = v` in an instance with an owned T made `**x`. `star_on_access`
   reports only a `*` written in the source.
 - **own.moved names the sink parameter** that took the value: "'v' is
-  used here after it moved into 'keep(sink v)' at 16:18" (walk.tach
-  records owned arguments, moves.tach `moved_into`). A by-value
+  used here after it moved into 'keep(sink v)' at 16:18" (walk.vl
+  records owned arguments, moves.vl `moved_into`). A by-value
   parameter in 0.19's spelling keeps the old message.
 - **Not done:**
   - projections' bodies (T3);
@@ -1542,7 +1542,7 @@ gate with the rehearsal (§9.3 step 7).
 
 ## T2: the tools (2026-10-21, branch c20-conv-t2)
 
-**Built.** `fix --only conventions` (tools/fixconv.tach; §9.2 rules 1 to
+**Built.** `fix --only conventions` (tools/fixconv.vl; §9.2 rules 1 to
 8, rule 8 reported), in two stages: `--only conventions-spelling`
 rewrites only what Phase 0's checker means as 0.19 did (`x: &T` → `x:
 let T`, `&e` to it and `*r` kept), so its result checks and runs as
@@ -1597,9 +1597,9 @@ The migration and the flip, with helpers for the corpus (pm-tests,
 pm-examples, pm-transcripts, merged in).
 
 - **The flip.** User code is read in 0.20's spelling by default
-  (`--syntax=0.20`); `--syntax=mixed` (and TACHYON_SYNTAX=mixed, which a
+  (`--syntax=0.20`); `--syntax=mixed` (and VOLE_SYNTAX=mixed, which a
   migration sets for the checks it runs) reads both; the root pragma
-  `// tachyon-syntax: 0.19` is compiler/src's until 0.21. std is 0.20 code
+  `// vole-syntax: 0.19` is compiler/src's until 0.21. std is 0.20 code
   whatever the program's mode, except a std tree read from disk in a mixed
   run (`fix --only conventions --std-tree compiler/std`: std migrating).
 - **fix --only conventions** works on the checked program, and in a merge
@@ -1647,7 +1647,7 @@ pm-examples, pm-transcripts, merged in).
 ## 0.21 on c20-convM (branch c21-srcM)
 
 - **C1** (09c21885): compiler/src in 0.20's spelling (`fix --only
-  conventions` with TACHYON_SYNTAX=mixed for the steps before it: the
+  conventions` with VOLE_SYNTAX=mixed for the steps before it: the
   raw-pointer retypes of 13 parameters indexed as pointers; the 24
   `var`/`inout`/`sink` identifiers renamed; the two hand fixes above).
   c20-convM's compiler checks it clean, builds it, the fixpoint holds,
@@ -1663,10 +1663,10 @@ pm-examples, pm-transcripts, merged in).
 - **Mixed only in the migrations**: `--syntax=mixed` is refused
   (syntax.mixed_removed); `fix --only conventions`, `fix --values` and
   `--only std015|alloc016` set the mode themselves, and their children
-  inherit it through TACHYON_SYNTAX=mixed:PID (honored only by a child of
+  inherit it through VOLE_SYNTAX=mixed:PID (honored only by a child of
   PID). No build, check, run, try or query reads 0.19's spelling.
-- **`.vl`** (for 0.24's name): sources are `.tach` or `.vl` everywhere,
-  `x.tach` and `x.vl` both is an error, and every TACHYON_X is read as
+- **`.vl`** (for 0.24's name): sources are `.vl` or `.vl` everywhere,
+  `x.vl` and `x.vl` both is an error, and every VOLE_X is read as
   VOLE_X too (VOLE_ wins); tests/refactor/vole021.
 - Suite with C3's compiler: 1660 passed, 2 xfail, 0 failed. The
   bootstrap from v0.20.0 (releases.toml's 0.20.0 entry, then `bootstrap.sh

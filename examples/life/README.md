@@ -6,10 +6,10 @@ with the time since they died (ANSI 24-bit colour).
 
 ## Build and run
 
-From this folder (with `tachyonc` on your `PATH`, or `../../target/tachyonc`):
+From this folder (with `volec` on your `PATH`, or `../../target/volec`):
 
 ```sh
-tachyonc main.tach -o life && ./life
+volec main.vl -o life && ./life
 ```
 
 It runs until interrupted (Ctrl-C). It needs a terminal with 24-bit
@@ -31,7 +31,7 @@ builds it.
 struct Winsize { rows: u16, cols: u16, xpixel: u16, ypixel: u16 }
 ```
 
-`#[repr(C)]` asks for C's field order and padding: a plain tachyon struct
+`#[repr(C)]` asks for C's field order and padding: a plain vole struct
 has no fixed layout. `ioctl` is variadic, declared by hand with `...`.
 
 **One binary per system, chosen at run time.** The request number differs
@@ -77,7 +77,7 @@ out.push_fmt(f"\x1B[48;2;{color / 2};{color / 5};{color}m ");
 
 ## Language features
 
-- `#[repr(C)]` structs, variadic `extern "C"` functions: `tachyonc guide c-interop`
-- `Vec` as a handle, `Buf`: `tachyonc guide memory`, `tachyonc guide std`
-- slices compared with `==`: `tachyonc guide types`
-- f-strings appended to a `Buf` (`push_fmt`): `tachyonc guide formatting`
+- `#[repr(C)]` structs, variadic `extern "C"` functions: `volec guide c-interop`
+- `Vec` as a handle, `Buf`: `volec guide memory`, `volec guide std`
+- slices compared with `==`: `volec guide types`
+- f-strings appended to a `Buf` (`push_fmt`): `volec guide formatting`

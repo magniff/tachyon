@@ -1,7 +1,7 @@
 # std::cli: command lines (0.24)
 
 A small, clap-like argument parser in std, with a builder and no derive.
-The guide is `tachyonc guide cli`; the code is compiler/std/cli.tach.
+The guide is `volec guide cli`; the code is compiler/std/cli.vl.
 
 ## The API
 

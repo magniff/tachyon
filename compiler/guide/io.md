@@ -33,7 +33,7 @@ use std::io::{BufReader, BufWriter, Write, writeln};
 use std::process::Command;
 
 fn run(gpa: Gpa) -> io::Result<()> {
-    let path = "/tmp/tachyon-guide-files.txt";
+    let path = "/tmp/vole-guide-files.txt";
     {
         var w = BufWriter::new(File::create(path)?);
         for i in 1..4 {

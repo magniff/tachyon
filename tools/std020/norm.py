@@ -1,4 +1,4 @@
-# Compares two tachyon assembly files across std's reorganization: the
+# Compares two vole assembly files across std's reorganization: the
 # functions' code only (a sorted multiset of bodies), with std's module
 # segments dropped from symbols and string-literal labels made anonymous
 # (the string pool and the source-position tables follow std's text,

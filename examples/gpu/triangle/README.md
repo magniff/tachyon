@@ -5,7 +5,7 @@ copied to a buffer, mapped and printed: one character a pixel, after the
 channel that dominates it.
 
 ```sh
-tachyonc main.tach -l objc -o triangle && ./triangle
+volec main.vl -l objc -o triangle && ./triangle
 ```
 
 ```text

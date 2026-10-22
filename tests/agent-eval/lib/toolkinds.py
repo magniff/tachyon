@@ -1,4 +1,4 @@
-"""Classifies an agent's tool calls: tachyonc subcommands, builds, runs,
+"""Classifies an agent's tool calls: volec subcommands, builds, runs,
 shell reads, file tools."""
 
 import os
@@ -6,7 +6,7 @@ import re
 
 TACH_SUBS = {"query", "edit", "refactor", "check", "fix", "explain", "guide",
              "undo", "rewrite", "fmt", "lint", "same-output"}
-# The tachyonc subcommands that read or change code (the "tools").
+# The volec subcommands that read or change code (the "tools").
 TACH_TOOL_SUBS = TACH_SUBS - {"guide"}
 SHELL_READS = {"cat", "head", "tail", "sed", "grep", "egrep", "rg", "awk",
                "less", "more", "nl", "wc", "cut"}
@@ -90,16 +90,16 @@ def classify_command(seg):
         w = w[1:]  # (sh bootstrap/eval-build.sh)
         head = w[0]
         base = os.path.basename(head)
-    # (0.15) a copy (tachyonc-old, tc0) or a variable ($T) running a
-    # tachyonc subcommand counts as tachyonc
+    # (0.15) a copy (volec-old, tc0) or a variable ($T) running a
+    # volec subcommand counts as volec
     sub_next = len(w) > 1 and w[1] in TACH_SUBS
-    if (base.startswith("tachyonc") or (re.match(r"^tc[\w.+-]*$", base) and sub_next)
+    if (base.startswith("volec") or (re.match(r"^tc[\w.+-]*$", base) and sub_next)
             or (re.match(r"^\$\{?\w+\}?$", head) and sub_next)):
         for a in w[1:]:
             if a.startswith("-"):
                 continue
-            return "tachyonc:" + a if a in TACH_SUBS else "tachyonc:build"
-        return "tachyonc:other"  # --version, --help
+            return "volec:" + a if a in TACH_SUBS else "volec:build"
+        return "volec:other"  # --version, --help
     if base == "rustc":
         return "rustc"
     # (0.16) the compiler tasks: building the compiler, the test suite
@@ -126,11 +126,11 @@ def classify_call(tool, args):
 
 
 def is_tach_tool(kind):
-    return kind.startswith("tachyonc:") and kind[9:] in TACH_TOOL_SUBS
+    return kind.startswith("volec:") and kind[9:] in TACH_TOOL_SUBS
 
 
 def is_plain_code_access(kind):
-    """Reading or changing code without tachyonc: file tools, shell reads."""
+    """Reading or changing code without volec: file tools, shell reads."""
     if kind.startswith("file:"):
         return True
     return kind.startswith("shell:") and kind[6:] in SHELL_READS

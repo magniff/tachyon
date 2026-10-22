@@ -1,0 +1,460 @@
+// `volec --fix-imports FILE...` (0.8): rewrites a program written for
+// 0.7 or earlier, in place, into the imports 0.8 allows; and the errors
+// for the forms 0.8 removed, which name what replaces them.
+//
+//   - `use a::b::*;` and `use E::*;` become `use a::b::{x, y};` (or `use
+//     a::b::x;`), listing the names the program finds through that `*`
+//     (sorted); a `*` nothing is found through is removed.
+//   - `import "h.h";` becomes `import "h.h" as c;` (every header's
+//     declarations are in one C module, so one name serves them all), and
+//     each use of a declaration found through it is written `c::name`.
+//
+// The program is checked as for compiling it; the module resolution
+// records what each `*` brought (modules.vl, LEGACY_IMPORTS). Every
+// file of the program (its modules' files too) is rewritten; the rest of
+// the text is left as it is.
+
+use crate::base::{
+    FILES, IntVec, SRC, SYMS, _setjmp, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern_c,
+};
+use crate::base::diag::{
+    ERR, ERR_KIND, RECOVER_DEPTH, buf_file_line, err_begin, err_end, err_end_soft, err_help,
+    err_str, err_sym, err_try_tool, recover_enter, recover_leave,
+};
+use crate::front::ast::NODES;
+use crate::front::modules::{C_MODULE, STD_MODULE, file_of_pos, within_std};
+use crate::front::modules::lookup::{
+    B_MODULE, B_NONE, C_BY_NAME, C_QUALS, GLOB_USES, LEGACY_IMPORTS, binding, glob_name_qualified,
+    lookup_quiet, use_entry_count, use_entry_glob, use_entry_module, use_entry_node,
+};
+use crate::tools::edit::edit_replace;
+use crate::tools::query::refs::ref_in;
+
+pub static var FIX_IMPORTS: bool = false;
+
+// The longest line a rewritten `use` keeps on one line.
+const LINE_WIDTH: i64 = 100;
+
+fn sym_less(a: i64, b: i64) -> bool {
+    unsafe {
+        let x = SYMS[a].text;
+        let y = SYMS[b].text;
+        let n = if x.len < y.len { x.len as i64 } else { y.len as i64 };
+        for i in 0..n {
+            if x[i] != y[i] {
+                return x[i] < y[i];
+            }
+        }
+        x.len < y.len
+    }
+}
+
+// Whether entry u is a plain `import "h.h";`.
+pub fn is_plain_import(u: i64) -> bool {
+    unsafe { use_entry_glob(u) && NODES[use_entry_node(u)].d == 2 }
+}
+
+// The names the program finds through `*` entry u, sorted, into `out`;
+// the C declarations written with their path are left out, and `alias`
+// (the C module's name) takes their place.
+pub fn glob_names(u: i64, alias: i64, out: inout IntVec) {
+    unsafe {
+        var qualified = false;
+        var i = 0;
+        while i < GLOB_USES.count {
+            if GLOB_USES.data[i] == u {
+                let name = GLOB_USES.data[i + 1];
+                if glob_name_qualified(u, name) {
+                    qualified = true;
+                } else {
+                    out.push(name);
+                }
+            }
+            i += 2;
+        }
+        if qualified {
+            var known = false;
+            for k in 0..out.count {
+                if out.data[k] == alias {
+                    known = true;
+                }
+            }
+            if !known {
+                out.push(alias);
+            }
+        }
+        sort_syms(&out);
+    }
+}
+
+fn sort_syms(v: inout IntVec) {
+    unsafe {
+        for k in 1..v.count {
+            var j = k;
+            while j > 0 && sym_less(v.data[j], v.data[j - 1]) {
+                let t = v.data[j];
+                v.data[j] = v.data[j - 1];
+                v.data[j - 1] = t;
+                j -= 1;
+            }
+        }
+    }
+}
+
+// The name for the C module: `c`, unless a module that needs it already
+// has another `c` in scope.
+pub fn c_alias() -> i64 {
+    unsafe {
+        let candidates: [*u8; 3] = [c"c", c"c_", c"cdecl"];
+        for k in 0..3 {
+            let name = intern_c(candidates[k]);
+            var free = true;
+            for u in 0..use_entry_count() {
+                if !use_entry_glob(u) {
+                    continue;
+                }
+                let m = use_entry_module(u);
+                let b = lookup_quiet(m, name, m);
+                if b != B_NONE && (C_MODULE < 0 || b != binding(B_MODULE, C_MODULE)) {
+                    free = false;
+                }
+            }
+            if free {
+                return name;
+            }
+        }
+        intern_c(c"cdecl")
+    }
+}
+
+fn line_start(pos: i64) -> i64 {
+    let f = file_of_pos(pos);
+    var i = pos;
+    while unsafe { i > FILES[f].start && SRC[i - 1] != '\n' } {
+        i -= 1;
+    }
+    i
+}
+
+fn line_end(pos: i64) -> i64 {
+    let f = file_of_pos(pos);
+    var i = pos;
+    while unsafe { i < FILES[f].end && SRC[i] != '\n' } {
+        i += 1;
+    }
+    i
+}
+
+fn blank(from: i64, to: i64) -> bool {
+    for i in from..to {
+        if unsafe { SRC[i] != ' ' && SRC[i] != '\t' && SRC[i] != '\r' } {
+            return false;
+        }
+    }
+    true
+}
+
+fn add_edit(edits: inout IntVec, pos: i64, del: i64, text: i64) {
+    edits.push(pos);
+    edits.push(del);
+    edits.push(text);
+}
+
+// The edit for `*` entry u: its list of names, or its removal.
+fn glob_edit(u: i64, alias: i64, edits: inout IntVec) {
+    unsafe {
+        let n = use_entry_node(u);
+        let star = star_of(n);
+        var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        glob_names(u, alias, &names);
+        let start = line_start(n_start(n));
+        if names.count == 0 {
+            let first = n_start(n);
+            let end = line_end(NODES[n].end);
+            if blank(start, first) && blank(NODES[n].end, end) {
+                let f = file_of_pos(start);
+                add_edit(&edits, start,
+                    if end < FILES[f].end { end + 1 - start } else { end - start }, buf_new());
+            } else {
+                add_edit(&edits, first, NODES[n].end - first, buf_new());
+            }
+            return;
+        }
+        let text = buf_new();
+        if names.count == 1 {
+            // (one name: `use a::b::x;`)
+            buf_bytes(text, SYMS[names.data[0]].text);
+            add_edit(&edits, star, 1, text);
+            return;
+        }
+        buf_byte(text, '{');
+        var width = 1;
+        for k in 0..names.count {
+            if k > 0 {
+                buf_str(text, c", ");
+            }
+            buf_bytes(text, SYMS[names.data[k]].text);
+            width += SYMS[names.data[k]].text.len as i64 + 2;
+        }
+        buf_byte(text, '}');
+        if (star - start) + width + (line_end(star) - star - 1) <= LINE_WIDTH {
+            add_edit(&edits, star, 1, text);
+            return;
+        }
+        // One name after the other, on the lines between the braces.
+        var indent = start;
+        while SRC[indent] == ' ' || SRC[indent] == '\t' {
+            indent += 1;
+        }
+        let long = buf_new();
+        buf_byte(long, '{');
+        var col = LINE_WIDTH;
+        for k in 0..names.count {
+            let len = SYMS[names.data[k]].text.len as i64;
+            if col + 1 + len + 1 > LINE_WIDTH {
+                buf_byte(long, '\n');
+                buf_bytes(long, SRC[start..indent]);
+                buf_str(long, c"    ");
+                col = indent - start + 4;
+            } else {
+                buf_byte(long, ' ');
+                col += 1;
+            }
+            buf_bytes(long, SYMS[names.data[k]].text);
+            buf_byte(long, ',');
+            col += len + 1;
+        }
+        buf_byte(long, '\n');
+        buf_bytes(long, SRC[start..indent]);
+        buf_byte(long, '}');
+        add_edit(&edits, star, 1, long);
+    }
+}
+
+// The position of the `*` of Use node n.
+fn star_of(n: i64) -> i64 {
+    unsafe {
+        var star = NODES[NODES[n].c].end;
+        while SRC[star] != '*' {
+            star += 1;
+        }
+        star
+    }
+}
+
+// Where the item of Use node n starts (its `pub`, if any).
+fn n_start(n: i64) -> i64 {
+    unsafe {
+        let first = NODES[n].start;
+        var i = first;
+        while i > 0 && (SRC[i - 1] == ' ' || SRC[i - 1] == '\t') {
+            i -= 1;
+        }
+        if i >= 3 && SRC[i - 3] == 'p' && SRC[i - 2] == 'u' && SRC[i - 1] == 'b'
+            && (i == 3 || SRC[i - 4] == ' ' || SRC[i - 4] == '\t' || SRC[i - 4] == '\n') {
+            return i - 3;
+        }
+        first
+    }
+}
+
+fn alias_text(alias: i64, before: *u8, after: *u8) -> i64 {
+    let text = buf_new();
+    buf_str(text, before);
+    unsafe { buf_bytes(text, SYMS[alias].text); }
+    buf_str(text, after);
+    text
+}
+
+// The edits rewriting the program (to the edit engine, edit.vl);
+// returns the number of imports rewritten.
+pub fn fix_imports_edits() -> i64 {
+    unsafe {
+        let alias = c_alias();
+        var edits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var fixes = 0;
+        for u in 0..use_entry_count() {
+            if !use_entry_glob(u) || !ref_in(NODES[use_entry_node(u)].start) {
+                continue;
+            }
+            fixes += 1;
+            if is_plain_import(u) {
+                let n = use_entry_node(u);
+                add_edit(&edits, NODES[n].end - 1, 0, alias_text(alias, c" as ", c""));
+            } else {
+                glob_edit(u, alias, &edits);
+            }
+        }
+        // The C declarations used in patterns, imported by name after the
+        // import (or the `*`) that brought them.
+        for u in 0..use_entry_count() {
+            var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            var k = 0;
+            while k < C_BY_NAME.count {
+                if C_BY_NAME.data[k] == u {
+                    names.push(C_BY_NAME.data[k + 1]);
+                }
+                k += 2;
+            }
+            if names.count == 0 {
+                continue;
+            }
+            sort_syms(&names);
+            let n = use_entry_node(u);
+            let start = line_start(n_start(n));
+            var indent = start;
+            while SRC[indent] == ' ' || SRC[indent] == '\t' {
+                indent += 1;
+            }
+            let text = buf_new();
+            buf_byte(text, '\n');
+            buf_bytes(text, SRC[start..indent]);
+            buf_str(text, c"use ");
+            buf_bytes(text, SYMS[alias].text);
+            buf_str(text, if names.count > 1 { c"::{" } else { c"::" });
+            for j in 0..names.count {
+                if j > 0 {
+                    buf_str(text, c", ");
+                }
+                buf_bytes(text, SYMS[names.data[j]].text);
+            }
+            buf_str(text, if names.count > 1 { c"};" } else { c";" });
+            add_edit(&edits, NODES[n].end, 0, text);
+        }
+        var i = 0;
+        while i < C_QUALS.count {
+            add_edit(&edits, C_QUALS.data[i], 0, alias_text(alias, c"", c"::"));
+            i += 3;
+        }
+        // (in order of position: an insertion sort of the triples)
+        let n = edits.count / 3;
+        for k in 1..n {
+            var j = k;
+            while j > 0 && edits.data[3 * j] < edits.data[3 * (j - 1)] {
+                for x in 0..3 {
+                    let t = edits.data[3 * j + x];
+                    edits.data[3 * j + x] = edits.data[3 * (j - 1) + x];
+                    edits.data[3 * (j - 1) + x] = t;
+                }
+                j -= 1;
+            }
+        }
+        var k = 0;
+        while k < edits.count {
+            let f = file_of_pos(edits.data[k]);
+            if !within_std(FILES[f].module) && FILES[f].module != C_MODULE {
+                edit_replace(edits.data[k], edits.data[k] + edits.data[k + 1], edits.data[k + 2]);
+            }
+            k += 3;
+        }
+        fixes
+    }
+}
+
+// ---- The errors for the removed forms (0.8) ----
+
+static var LEGACY_REPORTED: bool = false;
+
+// One error for each `*` import and plain header import of the program
+// (not under --fix-imports), once. When the function bodies were checked
+// (`complete`), the error names what the program uses through it.
+pub fn report_legacy_imports(complete: bool) {
+    if !LEGACY_IMPORTS || FIX_IMPORTS || LEGACY_REPORTED {
+        return;
+    }
+    LEGACY_REPORTED = true;
+    let kind = ERR_KIND;
+    ERR_KIND = c"module error";
+    for u in 0..use_entry_count() {
+        if use_entry_glob(u) {
+            report_recovering(u, complete);
+        }
+    }
+    ERR_KIND = kind;
+}
+
+fn report_recovering(u: i64, complete: bool) {
+    let depth = RECOVER_DEPTH;
+    if unsafe { _setjmp(recover_enter()) == 0 } {
+        legacy_error(u, complete);
+    }
+    recover_leave(depth);
+}
+
+// The most names an error lists.
+const LISTED_NAMES: i64 = 8;
+
+fn legacy_error(u: i64, complete: bool) {
+    unsafe {
+        let alias = intern_c(c"c");
+        let n = use_entry_node(u);
+        // (0.18) `use super::*;`, Rust's test-module habit: a `#[cfg(test)]`
+        // module sees its parent's items without it (front/tests)
+        if !is_plain_import(u) && SRC[NODES[n].start..star_of(n)] == "use super::" {
+            let kind_was = ERR_KIND;
+            ERR_KIND = c"import.wildcard";
+            err_begin(NODES[n].start);
+            err_str(c"wildcard imports are not allowed: 'use super::*;' is not needed");
+            err_help(c"a #[cfg(test)] module sees its parent's items, private ones too, without an import");
+            let t = buf_new();
+            buf_str(t, c"edit patch ");
+            buf_file_line(t, NODES[n].start);
+            buf_str(t, c" --old 'use super::*;' --new ''");
+            err_try_tool(buf_slice(t), true);
+            err_end_soft();
+            ERR_KIND = kind_was;
+            return;
+        }
+        err_begin(NODES[n].start);
+        if is_plain_import(u) {
+            err_str(c"importing every declaration of a header is not allowed: write '");
+            buf_bytes(ERR, SRC[NODES[n].start..NODES[n].end - 1]);
+            err_str(c" as c;' and 'c::");
+            var example = -1;
+            var i = 0;
+            while i < C_QUALS.count && example < 0 {
+                if C_QUALS.data[i + 1] == u {
+                    example = C_QUALS.data[i + 2];
+                }
+                i += 3;
+            }
+            if example >= 0 {
+                err_sym(example);
+            } else {
+                err_str(c"name");
+            }
+            err_str(c"'");
+        } else {
+            var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            glob_names(u, alias, &names);
+            if complete && names.count == 0 {
+                err_str(c"wildcard imports are not allowed, and nothing is used through this one: remove it");
+            } else {
+                err_str(c"wildcard imports are not allowed: write '");
+                buf_bytes(ERR, SRC[NODES[n].start..star_of(n)]);
+                if !complete {
+                    err_str(c"{...}");
+                } else if names.count == 1 {
+                    err_sym(names.data[0]);
+                } else {
+                    err_str(c"{");
+                    for k in 0..names.count {
+                        if k == LISTED_NAMES {
+                            err_str(c", ...");
+                            break;
+                        }
+                        if k > 0 {
+                            err_str(c", ");
+                        }
+                        err_sym(names.data[k]);
+                    }
+                    err_str(c"}");
+                }
+                err_str(c";'");
+            }
+        }
+        err_str(c" (volec --fix-imports rewrites a program this way)");
+        err_help(c"every name a file uses is declared in it, imported by name, or written with its path (0.8)");
+        err_end();
+    }
+}

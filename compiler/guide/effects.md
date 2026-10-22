@@ -23,11 +23,11 @@ explicit (`guide allocators`), so `alloc(Gpa)` without `global` means
 ## Asking
 
 ```sh
-tachyonc query effects total            # crate::total  alloc(Gpa) panic
-tachyonc query effects crate::parser    # every function of a module
-tachyonc query effects total --why alloc     # the chain of calls down to where it allocates
-tachyonc query effects crate --has io        # the functions that do io
-tachyonc --print-effects main.tach           # every function's set, then the build
+volec query effects total            # crate::total  alloc(Gpa) panic
+volec query effects crate::parser    # every function of a module
+volec query effects total --why alloc     # the chain of calls down to where it allocates
+volec query effects crate --has io        # the functions that do io
+volec --print-effects main.vl           # every function's set, then the build
 ```
 
 `query def`, `show` and `context` print a function's set on its first
@@ -79,7 +79,7 @@ fn main() -> i32 {
 A broken declaration is one error with where the effect comes from:
 
 ```text
-sum.tach:3:1: error[effect] 'total' is #[no_alloc], but it allocates from Gpa: 'v.push(x)' at sum.tach:7:9 grows a Vec<i64>
+sum.vl:3:1: error[effect] 'total' is #[no_alloc], but it allocates from Gpa: 'v.push(x)' at sum.vl:7:9 grows a Vec<i64>
 help: allocate in the caller and pass the memory in, or remove #[no_alloc]
-try: tachyonc query effects total --why alloc
+try: volec query effects total --why alloc
 ```

@@ -7,8 +7,8 @@
 ## inline refuse `?`, which may return from the function (the program has
 ## the `?` stub's error).
 $ refactor field P --rename x px --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -4 +4 @@
 -struct P { x: i64, y: i64 }
 +struct P { px: i64, y: i64 }
@@ -21,17 +21,17 @@ $ refactor field P --rename x px --dry-run
 @@ -25 +25 @@
 -    (q.x + q.y + c.LIMIT - 17) as i32
 +    (q.px + q.y + c.LIMIT - 17) as i32
-$ refactor rename main.tach:9:9 yy --dry-run
---- a/main.tach
-+++ b/main.tach
+$ refactor rename main.vl:9:9 yy --dry-run
+--- a/main.vl
++++ b/main.vl
 @@ -9,2 +9,2 @@
 -    let y = k * 2;
 -    P { x, y }
 +    let yy = k * 2;
 +    P { x, y: yy }
 $ refactor signature make --rename-param x xx --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -8 +8 @@
 -fn make(x: i64, k: i64) -> P {
 +fn make(xx: i64, k: i64) -> P {
@@ -39,8 +39,8 @@ $ refactor signature make --rename-param x xx --dry-run
 -    P { x, y }
 +    P { x: xx, y }
 $ refactor rename LIMIT MAXV --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -2 +2 @@
 -const LIMIT: i64 = 10;
 +const MAXV: i64 = 10;
@@ -48,8 +48,8 @@ $ refactor rename LIMIT MAXV --dry-run
 -    Cap { LIMIT }
 +    Cap { LIMIT: MAXV }
 $ refactor inline shift --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -17,4 +16,0 @@
 -fn shift(p: P, x: i64) -> P {
 -    P { x, y: p.y }
@@ -59,8 +59,8 @@ $ refactor inline shift --dry-run
 -    let q = shift(p, 3);
 +    let q = P { x: 3, y: p.y };
 $ refactor signature make --add 'z: i64 = 5' --fill-calls --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -8 +8 @@
 -fn make(x: i64, k: i64) -> P {
 +fn make(x: i64, k: i64, z: i64) -> P {
@@ -68,8 +68,8 @@ $ refactor signature make --add 'z: i64 = 5' --fill-calls --dry-run
 -    let p = make(1, 2);
 +    let p = make(1, 2, 5);
 $ refactor signature make --add 'z: i64 = 5' --at 0 --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -8 +8 @@
 -fn make(x: i64, k: i64) -> P {
 +fn make(z: i64, x: i64, k: i64) -> P {
@@ -79,11 +79,11 @@ $ refactor signature make --add 'z: i64 = 5' --at 0 --dry-run
 note refactor.fill-calls: the calls get the value (a default is on trailing parameters only, and a later one has none)
 $ refactor extract-function half --lines 30-31 --to part --dry-run
 error refactor.escapes: line 30 may return (`?`) from crate::half: out of lines 30-31, which NEW cannot do for its caller
-try: tachyonc query show main.tach:30
+try: volec query show main.vl:30
 [exit 1]
 $ refactor inline half --dry-run
 error refactor.escapes: crate::half may return early (`?`), on line 30: inline takes a function that ends with its value
-try: tachyonc query show main.tach:30
+try: volec query show main.vl:30
 [exit 1]
 $ explain refactor.fill-calls
 refactor.fill-calls: note, exit 0
@@ -102,7 +102,7 @@ same-output.target	note
 same-output.usage	error, exit 2
 same-output.work	error, exit 2
 $ edit apply --help
-tachyonc edit apply [FILE]   several items' new text in one checked edit (stdin without FILE)
+volec edit apply [FILE]   several items' new text in one checked edit (stdin without FILE)
 blocks: @@ NAME (its new text), @@ new after|before NAME, @@ new in MODULE, @@ delete NAME,
 @@ MODULE::use, @@ MODULE::header; or query show's output, changed
 --show: the diff after; --dry-run: the diff only; --no-check: write despite new errors

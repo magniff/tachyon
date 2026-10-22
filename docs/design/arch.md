@@ -1,8 +1,8 @@
-# tachyon 0.19 design: CPU intrinsics and target features (`std::arch`)
+# vole 0.19 design: CPU intrinsics and target features (`std::arch`)
 
 I read the language and the compiler from the worktree of branch
 design-019 (from night-final: 0.16.0 plus the 0.17 work merged so far)
-through `tachyonc guide types|effects|generics`, `query items/show/refs/grep`
+through `volec guide types|effects|generics`, `query items/show/refs/grep`
 on `middle::ir`, `middle::lower`, `middle::vectorize`, `back::mc_arm64`,
 `back::mc_x86_64`, `back::enc_arm64`, `back::enc_x86`, `back::emit`,
 `gen0::gen::vector`, `front::check::vectors`, `front::effects::infer` and
@@ -65,7 +65,7 @@ and bounds tests. It uses SSE2 and NEON only: AVX2 was never used,
 because Rosetta, where x86-64 used to be tested, lacked it. Loops with
 calls are left alone.
 
-**Calling convention.** In tachyon's own convention, an aggregate of at
+**Calling convention.** In vole's own convention, an aggregate of at
 most four leaves goes as its leaves, and a larger one as 8-byte integer
 chunks. A vector is "a struct of its lanes": a `v4f32` is four float
 registers, a `v16i8` two integer registers. Helper functions that take
@@ -108,7 +108,7 @@ instructions that may not exist on the running CPU.
 `compiler/arch/aarch64.def`, `x86_64.def` and `portable.def`. The
 instructions they use are lines of `compiler/arch/insn_a64.def` and
 `insn_x86.def`. `compiler/arch/embed.sh`, like `compiler/std/embed.sh`,
-writes them into `compiler/src/arch/tables.tach` as compact strings. A
+writes them into `compiler/src/arch/tables.vl` as compact strings. A
 test fails when the generated file is stale. An intrinsic line holds:
 
 | field | example (`vqsubq_u8`) | used by |
@@ -179,7 +179,7 @@ they forget Rust's turbofish.
 - **AArch64:** the ACLE types are *aliases*: `uint8x16_t = v16u8`,
   `int16x8_t = v8i16`, `float32x4_t = v4f32`, `uint8x8_t = v8u8`, and so
   on for every one; `poly8x16_t = v16u8` and `poly64x2_t = v2u64`, with
-  `p64 = u64` and `p128 = v2u64`. Tachyon has no `u128`, so `vmull_p64`
+  `p64 = u64` and `p128 = v2u64`. Vole has no `u128`, so `vmull_p64`
   returns `v2u64` (low lane first). The tuple types are tuples:
   `uint8x16x2_t = (v16u8, v16u8)`, also x3 and x4.
 - **x86-64:** `__m128i`, `__m128`, `__m128d`, `__m256i`, `__m256` and
@@ -192,7 +192,7 @@ they forget Rust's turbofish.
 All vector types are plain (0.17): they are bit-copied, never moved and
 never dropped.
 
-**Calling convention change** (tachyon's own convention only; C's is
+**Calling convention change** (vole's own convention only; C's is
 untouched, and vectors stay non-FFI-safe):
 - A vector is one leaf in a vector register: v0-v7 and v16-v23 on
   AArch64, xmm0-xmm13 on x86-64, never split into lanes.
@@ -439,7 +439,7 @@ to `map` is legal because it is under the guard.
     bit.
   - The IR op is `CpuFeat` (imm = the bit). It is pure: its value never
     changes during a run. So GVN merges repeated tests, LICM hoists a
-    test out of a loop, and unswitching (`lsr.tach`) duplicates a loop
+    test out of a loop, and unswitching (`lsr.vl`) duplicates a loop
     that branches on it.
 - **Late expansion.** Just before instruction selection, `CpuFeat`
   becomes:
@@ -452,11 +452,11 @@ to `map` is legal because it is under the guard.
 - **Initialization.**
   - A program whose `main` can reach `detect` calls `init_features()`
     once at start-up, before `main`. The cold path is then never taken.
-  - A library entered from C, which has no tachyon start-up, takes the
+  - A library entered from C, which has no vole start-up, takes the
     cold path once.
   - Bit 63 means "initialized", so a CPU with no optional features still
     caches.
-- **Sources of the word** (std code, `compiler/std/arch.tach`):
+- **Sources of the word** (std code, `compiler/std/arch.vl`):
   - **aarch64-linux:** `getauxval(AT_HWCAP)` and `AT_HWCAP2`, through C
     import.
   - **aarch64-macos:** `sysctlbyname("hw.optional.arm.FEAT_*")`, only for
@@ -467,7 +467,7 @@ to `map` is legal because it is under the guard.
     intrinsics (`cpuid`, `xgetbv`), safe because every x86-64 CPU has
     cpuid.
 - **Testing the fallback branches.** `init_features()` clears the bits
-  named in `TACHYON_ARCH_DISABLE=aes,crc,...`. It can only *clear* bits,
+  named in `VOLE_ARCH_DISABLE=aes,crc,...`. It can only *clear* bits,
   so no setting of it can make a missing instruction run. The aarch64-linux
   container runs every detect test twice, with and without it.
 - **Threads (0.21).** The word is written once, with the same value by
@@ -588,11 +588,11 @@ fn count_byte(s: [u8], b: u8) -> i64 { ... if std::arch::has("avx2") { ... } ...
 - **Lazy-only detection** (no start-up init). Rejected for programs with
   `main`: the cold path would be taken once anyway, and the start-up init
   costs one sysctl, auxval read or cpuid. Kept for C-entered libraries.
-- **`cfg(target_arch)`.** Tachyon has no conditional compilation, and
+- **`cfg(target_arch)`.** Vole has no conditional compilation, and
   0.19 does not add it. Foreign-feature guards (§2.4) give the same
   result and keep both architectures' code type-checked everywhere. A
   general `cfg` stays possible later, for OS differences (0.20's I/O).
-- **`has::<"neon">()`** (the roadmap's spelling). Tachyon has no const
+- **`has::<"neon">()`** (the roadmap's spelling). Vole has no const
   generics. `has("neon")` with a required string literal
   (`arch.feature_literal`) gives the same constant, and agents write it
   naturally.
@@ -612,13 +612,13 @@ T8) runs every `try:` of the arch error tests and checks that the program
 then checks clean or reports a different, named next step.
 
 **Discovery.**
-- `tachyonc guide arch` gives the model in about 2,500 tokens: types,
+- `volec guide arch` gives the model in about 2,500 tokens: types,
   `has`/`detect`, the known set, slices, the recipes table of §2.3.4,
   and the NEON movemask idiom.
 - `query arch --find WORDS` searches the table's doc and semantics lines
   and prints one intrinsic per line with feature and instruction:
   ```text
-  $ tachyonc query arch --find 'saturating subtract u8'
+  $ volec query arch --find 'saturating subtract u8'
   vqsubq_u8        neon     uqsub v.16b     lanewise a - b, saturating at 0 (u8)
   vqsub_u8         neon     uqsub v.8b      the same, 64-bit
   x86_64::_mm_subs_epu8   sse2  psubusb     lanewise a - b, saturating at 0 (u8)
@@ -626,14 +626,14 @@ then checks clean or reports a different, named next step.
 - `query arch --equiv NAME` gives the other architecture's equivalent, or
   the recipe when there is no single instruction:
   ```text
-  $ tachyonc query arch --equiv _mm_movemask_epi8
+  $ volec query arch --equiv _mm_movemask_epi8
   _mm_movemask_epi8 (x86_64, sse2): no single AArch64 instruction
   aarch64 recipe (guide arch#movemask): vshrn_n_u16(vreinterpretq_u16_u8(m), 4) -> vget_lane_u64(_, 0): 4 bits per byte; trailing_zeros(x) / 4 is the first set lane
   ```
 - `query show`/`def` on an intrinsic print the synthesized declaration
   with the table's facts:
   ```text
-  $ tachyonc query show vqtbl1q_u8
+  $ volec query show vqtbl1q_u8
   // std::arch::aarch64::vqtbl1q_u8  intrinsic  feature: neon  instruction: tbl Vd.16b, {Vn.16b}, Vm.16b  effects: none
   // r[i] = if idx[i] < 16 { t[idx[i]] } else { 0 }   (x86_64: _mm_shuffle_epi8 zeroes when bit 7 is set instead)
   pub fn vqtbl1q_u8(t: uint8x16_t, idx: uint8x16_t) -> uint8x16_t
@@ -655,11 +655,11 @@ Below, the parts are split for reading.
 1. **A call that needs a feature the point does not know** (the
    commonest).
 ```text
-sum.tach:14:13: error[arch.feature] 'sum_avx2' needs avx2 (from '_mm256_add_epi32' at sum.tach:5:17), which 'main' does not know here: x86_64-linux's baseline is sse2
+sum.vl:14:13: error[arch.feature] 'sum_avx2' needs avx2 (from '_mm256_add_epi32' at sum.vl:5:17), which 'main' does not know here: x86_64-linux's baseline is sse2
   help: test the CPU and keep a fallback, compile one function per feature set with #[multiversion], or build only for CPUs that have it
-  try: tachyonc edit patch sum.tach:14 --old 'sum_avx2(s)' --new 'if std::arch::detect("avx2") { sum_avx2(s) } else { sum_scalar(s) }'
-  try: tachyonc sum.tach -C target-feature=+avx2 -o sum
-  try: tachyonc query features sum_avx2 --why avx2
+  try: volec edit patch sum.vl:14 --old 'sum_avx2(s)' --new 'if std::arch::detect("avx2") { sum_avx2(s) } else { sum_scalar(s) }'
+  try: volec sum.vl -C target-feature=+avx2 -o sum
+  try: volec query features sum_avx2 --why avx2
 ```
 The first `try:` names a fallback only when one exists: a function in
 scope with the same parameter and result types, needing nothing beyond
@@ -669,19 +669,19 @@ the point's known set, whose name shares the stem (`sum_avx2` →
 
 2. **A declaration that is too small.**
 ```text
-crc.tach:9:9: error[arch.declared] 'fold' is #[target_feature(enable = "neon")], but '__crc32cd' at crc.tach:9:9 needs crc
-  try: tachyonc edit patch crc.tach:7 --old 'enable = "neon"' --new 'enable = "neon,crc"'
+crc.vl:9:9: error[arch.declared] 'fold' is #[target_feature(enable = "neon")], but '__crc32cd' at crc.vl:9:9 needs crc
+  try: volec edit patch crc.vl:7 --old 'enable = "neon"' --new 'enable = "neon,crc"'
 ```
 
 3. **A Rust spelling.** The diagnostic takes the place of the "unknown
    function" or type error.
 ```text
-scan.tach:8:17: error[arch.rust_form] 'vshrq_n_u8::<3>(v)': tachyon passes an intrinsic's immediates as arguments
-  try: tachyonc edit patch scan.tach:8 --old 'vshrq_n_u8::<3>(v)' --new 'vshrq_n_u8(v, 3)'
-scan.tach:3:13: error[arch.raw_form] 'vld1q_u8(p)' passes a pointer: the safe form takes a slice and an index ('vld1q_u8(s, i)'); the pointer form is 'std::arch::aarch64::raw::vld1q_u8' (unsafe)
-  try: tachyonc edit patch scan.tach:3 --old 'vld1q_u8(p)' --new 'vld1q_u8(s, i)'
-scan.tach:2:8: error[arch.rust_form] 'is_x86_feature_detected!("avx2")' is std::arch::detect("avx2") here
-  try: tachyonc edit patch scan.tach:2 --old 'is_x86_feature_detected!("avx2")' --new 'std::arch::detect("avx2")'
+scan.vl:8:17: error[arch.rust_form] 'vshrq_n_u8::<3>(v)': vole passes an intrinsic's immediates as arguments
+  try: volec edit patch scan.vl:8 --old 'vshrq_n_u8::<3>(v)' --new 'vshrq_n_u8(v, 3)'
+scan.vl:3:13: error[arch.raw_form] 'vld1q_u8(p)' passes a pointer: the safe form takes a slice and an index ('vld1q_u8(s, i)'); the pointer form is 'std::arch::aarch64::raw::vld1q_u8' (unsafe)
+  try: volec edit patch scan.vl:3 --old 'vld1q_u8(p)' --new 'vld1q_u8(s, i)'
+scan.vl:2:8: error[arch.rust_form] 'is_x86_feature_detected!("avx2")' is std::arch::detect("avx2") here
+  try: volec edit patch scan.vl:2 --old 'is_x86_feature_detected!("avx2")' --new 'std::arch::detect("avx2")'
 ```
 `raw_form` writes `s, i` only when the pointer is `s.ptr + i` or
 `&s[i]` and the slice is in scope. Otherwise it leaves out the `try:`,
@@ -689,18 +689,18 @@ and `help:` explains the slice form.
 
 4. **An immediate out of range.**
 ```text
-utf8.tach:21:20: error[arch.const_arg] 'vextq_u8' takes n in 0..=15; got 16
+utf8.vl:21:20: error[arch.const_arg] 'vextq_u8' takes n in 0..=15; got 16
 ```
 
 5. **An unknown or ambiguous feature name** (with did-you-mean).
 ```text
-fast.tach:4:24: error[arch.feature_name] unknown feature 'avx-2' for x86_64
-  try: tachyonc edit patch fast.tach:4 --old '"avx-2"' --new '"avx2"'
+fast.vl:4:24: error[arch.feature_name] unknown feature 'avx-2' for x86_64
+  try: volec edit patch fast.vl:4 --old '"avx-2"' --new '"avx2"'
 ```
 
 6. **An entry point or function pointer.**
 ```text
-lib.tach:30:1: error[arch.feature] 'hash_block' is extern "C", so its callers cannot know aes, which it needs (vaeseq_u8 at 33:13): guard the call or build with -C target-feature=+aes
+lib.vl:30:1: error[arch.feature] 'hash_block' is extern "C", so its callers cannot know aes, which it needs (vaeseq_u8 at 33:13): guard the call or build with -C target-feature=+aes
 ```
 
 7. **`unsafe` around safe intrinsic calls**, written from Rust habit:
@@ -821,35 +821,35 @@ tests/walkthrough runs:
 - **Parsing.**
   - `#[target_feature(enable = "a,b")]` and `#[multiversion("f", ...)]`
     on functions, stored on the Def.
-  - `-C target-cpu`/`-C target-feature` in `main.tach`'s option parser
+  - `-C target-cpu`/`-C target-feature` in `main.vl`'s option parser
     and in the tools' option pass-through (`tools::edit::cli`,
     `tools::fix::command`, `tools::edit::apply` forward them like
     `--target`).
-- **Types** (`front/types.tach`, `front/check/vectors.tach`):
+- **Types** (`front/types.vl`, `front/check/vectors.vl`):
   - the 18 new vector type names are reserved like 0.10's;
   - the opaque x86 types;
   - `from_bits`;
   - unsigned compares and masks;
   - lane types for `lane`, `sum` and `with_lane`.
-- **Resolution** (`arch/virtual.tach`): a path into `std::arch*` resolves
+- **Resolution** (`arch/virtual.vl`): a path into `std::arch*` resolves
   through the table. The item made is a Def with `intrinsic = id`, a
   signature and no body, cached per id.
-- **Calls** (`front/check/arch.tach`): ordinary call checking, then the
+- **Calls** (`front/check/arch.vl`): ordinary call checking, then the
   table's const-parameter ranges, then the Rust-form diagnostics.
 - **Features** (`front/features/`, a pass after `infer_effects`):
-  - `regions.tach`: the guard walk that computes `known(c)` per call
+  - `regions.vl`: the guard walk that computes `known(c)` per call
     node, and the static deadness of `has`/`detect` branches (a node
     flag gen0 and lowering read);
-  - `infer.tach`: `needs` over the SCCs, reusing `components`, with the
+  - `infer.vl`: `needs` over the SCCs, reusing `components`, with the
     set stored next to the effects;
-  - `check.tach`: declarations, entries, address-taking, multiversion
+  - `check.vl`: declarations, entries, address-taking, multiversion
     clones;
-  - `why.tach`: the chains for `query features --why` and for the
+  - `why.vl`: the chains for `query features --why` and for the
     diagnostics.
   - **Cost.** One walk over bodies plus one bit-set per function: under
     1% of check time. A program that names no `std::arch` item skips
     the pass entirely, because every requirement is then empty.
-- **Multiversion** (`front/features/multiversion.tach`): after
+- **Multiversion** (`front/features/multiversion.vl`): after
   collection, before bodies are checked, each listed set gets a clone of
   the function's AST (the generics instantiation machinery's copier),
   with declared features. The original Def becomes the dispatcher body
@@ -859,7 +859,7 @@ tests/walkthrough runs:
 
 ## 5. Lowering, the optimizer and the back ends
 
-### 5.1 Lowering (`middle/lower/arch.tach`)
+### 5.1 Lowering (`middle/lower/arch.vl`)
 
 Each intrinsic lowers by its table's IR form:
 
@@ -886,7 +886,7 @@ Each intrinsic lowers by its table's IR form:
   blobs). Statics holding vector constants, and `vNtT(...)` of constants,
   produce it. This is what makes `tbl`/`pshufb` lookup tables cheap
   (§5.3).
-- **gen0** (`gen0/gen/arch.tach`): -O0 evaluates the arguments to slots,
+- **gen0** (`gen0/gen/arch.vl`): -O0 evaluates the arguments to slots,
   loads the vector operands into fixed registers (v0-v2 / xmm0-xmm2,
   ymm with AVX), emits the table's instruction template with those
   registers and the immediates, and stores the result. A generic-form
@@ -902,7 +902,7 @@ Each intrinsic lowers by its table's IR form:
 | `gvn` | `Intr` numbered by (id, operands, const args), with operands sorted when the table says commutative. `IntrMem` loads take part in memory forwarding through their recorded range. `CpuFeat` numbered by its bit, so repeated detects merge. |
 | `licm` | a pure `Intr` whose features are in the function's known set (baseline or declared) is hoisted like any pure op. **One whose features are known only under a guard is never speculated**: it is hoisted only when `runs_first` holds (LICM's rule for ops that may trap). The same for `ifconv` (no arm containing one is if-converted), `sroa`/`copies` (they never move ops), and the inliner (§2.4). This is the no-UB line in the optimizer: an instruction the CPU may lack never runs earlier than its guard. |
 | `adce`, `opt` (dead code) | pure `Intr`, `CpuFeat`, `VConst` removed when unused; `Hint` kept |
-| `fold` | **new: vector folding.** `VBin`, `VCmp`, `VSel`, `VSplat`, `VExt`, `VIns`, `VSum`, `VNeg` on `VConst`/splat operands fold, and `Intr` folds through the table's `fold` class: lanewise saturating/halving/abs-diff/min/max/shift/narrow/widen/pairwise/horizontal, `ext`/`zip`/`uzp`/`trn`/`rev`, `tbl`/`tbx`/`pshufb` with a constant index, `movemask`, `cnt`/`clz`/`rbit`, crc32 (a byte at a time), and the portable ops. Crypto rounds are not folded (no workload needs it). `fold_value` dispatches to `fold/arch.tach`. |
+| `fold` | **new: vector folding.** `VBin`, `VCmp`, `VSel`, `VSplat`, `VExt`, `VIns`, `VSum`, `VNeg` on `VConst`/splat operands fold, and `Intr` folds through the table's `fold` class: lanewise saturating/halving/abs-diff/min/max/shift/narrow/widen/pairwise/horizontal, `ext`/`zip`/`uzp`/`trn`/`rev`, `tbl`/`tbx`/`pshufb` with a constant index, `movemask`, `cnt`/`clz`/`rbit`, crc32 (a byte at a time), and the portable ops. Crypto rounds are not folded (no workload needs it). `fold_value` dispatches to `fold/arch.vl`. |
 | `vectorize` | (1) loops containing an `Intr` are left alone: they are explicit SIMD already. (2) The portable scalar ops `Bits(ones)`, `BSwap` and `Rot` in a loop body become vector lanes (`cnt`+`uaddlp` chain, `rev`, shifts and orr) instead of blocking the loop. (3) The memory intrinsics' checks are the bounds checks the legality pass already proves for the whole loop. |
 | `lsr` (unswitching) | already unswitches on loop-invariant conditions. `CpuFeat` is one, so a detect inside a hot loop costs nothing. Tested. |
 | `range` | the loads' and stores' checks are ordinary `idx <u len` checks: removed in counted loops, hoisted elsewhere |
@@ -940,13 +940,13 @@ waits for the property tests (0.18) to cover it.
     temporaries v30/v31 (two `mov`s; documented). Tuples of three or
     four need consecutive allocation in the allocator, which is 0.19.x
     (§2.3.1).
-- **`mc_arm64/arch.tach`.** One function, `ma_intr(id, d, ops, imms)`,
+- **`mc_arm64/arch.vl`.** One function, `ma_intr(id, d, ops, imms)`,
   formats the table's template into the text. When the program uses a
   non-baseline feature for the target, the text gets `.arch_extension
   crc|aes|sha2|sha3|dotprod` directives at the top. `cc -c` (GNU as on
   Linux) needs them to accept the instructions; the compiler's assembler
   ignores them.
-- **`enc_arm64/simd.tach`.**
+- **`enc_arm64/simd.vl`.**
   - A table-driven encoder for the Advanced SIMD and crypto encoding
     classes: three same, three different, two-register misc, across
     lanes, copy, modified immediate, shift by immediate, permute,
@@ -1006,7 +1006,7 @@ waits for the property tests (0.18) to cover it.
      `semantics` line, so one line is the spec, the doc and the test.
    - Non-lanewise ones (tbl/tbx, ext, zip family, movemask, narrowing
      pairs, crc, aes, sha, pmull, dot products, string compares) have
-     hand-written references in `tests/arch/ref/*.tach`.
+     hand-written references in `tests/arch/ref/*.vl`.
    - 8-bit unary ops are checked exhaustively (256 inputs), and 8-bit
      binary ops on all 65,536 pairs for one lane position.
 2. **Constant folding against the instruction.**
@@ -1021,7 +1021,7 @@ waits for the property tests (0.18) to cover it.
    - CRC-32 and CRC-32C: the check values `0xCBF43926` and `0xE3069283`,
      plus random buffers against table implementations.
    - pmull against a scalar carry-less multiply.
-4. **The optimizer** (`tests/run/opt_arch_*.tach`, IR and `ASM(T)`
+4. **The optimizer** (`tests/run/opt_arch_*.vl`, IR and `ASM(T)`
    checks):
    - GVN merges identical intrinsics;
    - LICM hoists a pure baseline intrinsic and **does not hoist a guarded
@@ -1033,7 +1033,7 @@ waits for the property tests (0.18) to cover it.
      each family's representative;
    - `has` branches are absent from the output;
    - foreign-architecture functions are not generated.
-5. **Features and diagnostics** (`tests/run/arch_err_*.tach`):
+5. **Features and diagnostics** (`tests/run/arch_err_*.vl`):
    - every `arch.*` code, with ERROR lines;
    - `-C` combinations;
    - narrowing forms: `&&`, early return, `assert`, else of `!`;
@@ -1044,7 +1044,7 @@ waits for the property tests (0.18) to cover it.
    **tests/arch-try** runs every `try:` they print.
 6. **Detection.**
    - In the aarch64-linux container, every test that uses detect runs
-     twice: plain, and with `TACHYON_ARCH_DISABLE` naming every optional
+     twice: plain, and with `VOLE_ARCH_DISABLE` naming every optional
      feature. Both runs must print the same thing, since the fallbacks
      compute the same result.
    - On aarch64-macos, `-C target-cpu=generic` builds of the same tests
@@ -1059,7 +1059,7 @@ waits for the property tests (0.18) to cover it.
      programs part of the corpus, so every intrinsic is assembled both
      ways at least once with its immediate's extreme values.
    - For x86, `objcheck -t x86_64-macos arch_` and the `CROSS` cases
-     (§5.4). One `tests/arch/all_x86_64.tach` calls every x86 intrinsic
+     (§5.4). One `tests/arch/all_x86_64.vl` calls every x86 intrinsic
      once.
 9. **Examples and benchmarks.**
    - `examples/arch/*` with walkthrough sessions.
@@ -1071,7 +1071,7 @@ waits for the property tests (0.18) to cover it.
 
 **0.18's property tests.** When 0.18 ships, the generated programs of
 items 1 and 2 become `#[property]` tests with generators derived from the
-vector types, run by `tachyonc test` with its built-in -O0/-O2
+vector types, run by `volec test` with its built-in -O0/-O2
 comparison. Until then they are plain programs with an explicit xorshift
 loop, so nothing in 0.19 waits for 0.18. The conversion is mechanical, in
 the generator (T7).
@@ -1085,8 +1085,8 @@ the generator (T7).
 | `&mut [T]` (split slices, 0.17 U2) | 0.17.0 | only the *spelling* of store intrinsics' slice parameter; developed with today's `[T]`, migrated by one generator commit plus `fix --values` |
 | `&[T; N]` / `&mut [T; N]` place forms | 0.17.0 | the place forms of loads and stores (§2.6); 0.19.1 if 0.17 is late |
 | plain kind (0.17 §2.1) | 0.17.0 | nothing: vectors are plain by structure |
-| `#[property]`, `tachyonc test` | 0.18 | the conversion of the reference tests (§6); the harness exists before |
-| `#[test]/#[fuzz]` entries as feature entry points | 0.18 | one line in `front/features/check.tach` |
+| `#[property]`, `volec test` | 0.18 | the conversion of the reference tests (§6); the harness exists before |
+| `#[test]/#[fuzz]` entries as feature entry points | 0.18 | one line in `front/features/check.vl` |
 | per-function pipeline, parallel codegen | 0.17 speed track / 0.18 | the table is parsed in the front end (single-threaded) and read-only after; the back end keeps no new mutable globals |
 | compiler/src using std::arch (e.g. crc32 for interning hashes) | 0.20 | the release rule: 0.19's features in compiler/src from 0.20; `-C target-cpu=native` detection in the compiler therefore uses sysctl/getauxval/`/proc/cpuinfo` and `sysctl machdep.cpu`, not `std::arch` |
 
@@ -1104,7 +1104,7 @@ The conflict risk is in shared files. 0.17's T5 owns
 `middle/{copies,gvn,licm,vectorize,inline}` and 0.18 moves the IR to
 per-function arenas. So 0.19's optimizer task (T6) rebases after 0.17's
 T5 merges. Its first commits are self-contained new files
-(`fold/arch.tach`, `lower/arch.tach`).
+(`fold/arch.vl`, `lower/arch.vl`).
 
 ### 7.2 Phase 0: the interface commit (serial, the lead)
 
@@ -1125,31 +1125,31 @@ contains:
 
   | file | contents | in Phase 0 |
   |---|---|---|
-  | `mod.tach` | `pub struct IntrInfo { id, name, arch, features: u64, form, nparams, consts, flags, mem, fold, ... }`, `intrinsic(id) -> IntrInfo`, `intrinsic_named(arch, name) -> i64` | done |
-  | `tables.tach` | generated | the seeds |
-  | `table.tach` | the lazy parser of the table strings into `IntrInfo` and the instruction lines | done |
-  | `features.tach` | names, bits, implications, `parse_feature`, CPUs, baselines, `-C` parsing, `native` | done for the listed names; `native` a stub |
-  | `virtual.tach` | Defs synthesized for `std::arch*` paths; vendor types | done for the seeds |
+  | `mod.vl` | `pub struct IntrInfo { id, name, arch, features: u64, form, nparams, consts, flags, mem, fold, ... }`, `intrinsic(id) -> IntrInfo`, `intrinsic_named(arch, name) -> i64` | done |
+  | `tables.vl` | generated | the seeds |
+  | `table.vl` | the lazy parser of the table strings into `IntrInfo` and the instruction lines | done |
+  | `features.vl` | names, bits, implications, `parse_feature`, CPUs, baselines, `-C` parsing, `native` | done for the listed names; `native` a stub |
+  | `virtual.vl` | Defs synthesized for `std::arch*` paths; vendor types | done for the seeds |
 - **IR:** `Op::Intr`, `IntrMem`, `VConst`, `CpuFeat`, `Hint` declared,
   with printing, verification and the `is_pure`/`is_vector`/side-effect
   classifications. `Rot`/`BSwap` are added by T6.
 - **Types:** the 18 vector type names and the six x86 types reserved and
   sized. `from_bits` checked. The operators on new types are T1's.
 - **Front:**
-  - `front/features/mod.tach` with `pub fn check_features()`, hooked after
+  - `front/features/mod.vl` with `pub fn check_features()`, hooked after
     `infer_effects()`; the known-set walk and the inference are stubs
     (every requirement empty);
   - `has`/`detect` constant for baseline and foreign;
   - the attribute parsing;
   - the `arch.*` codes, with stub `explain` entries.
 - **Lowering and emission, end to end for the seeds:**
-  - `lower/arch.tach` with the form dispatch;
-  - `mc_arm64/arch.tach` and `mc_x86_64/arch.tach` template formatting;
+  - `lower/arch.vl` with the form dispatch;
+  - `mc_arm64/arch.vl` and `mc_x86_64/arch.vl` template formatting;
   - the encoders' class dispatch with the classes the seeds need;
   - gen0's template path.
 - **Tests:**
-  - `tests/run/arch_seed_*.tach` (aarch64, run);
-  - `arch_seed_x86.tach` (`CROSS`);
+  - `tests/run/arch_seed_*.vl` (aarch64, run);
+  - `arch_seed_x86.vl` (`CROSS`);
   - the `CROSS` directive in tests/run.sh;
   - the `arch_` objcheck filter for x86_64-macos in gate.sh;
   - `tests/arch/gen.sh` skeleton.
@@ -1158,12 +1158,12 @@ contains:
 
 | task | owns | provides |
 |---|---|---|
-| **T1 Types and checking** | `front/types.tach` (vector parts), `front/check/vectors.tach`, `front/check/arch.tach`, `compiler/src/arch/virtual.tach`, `middle/lower/vector.tach`, `gen0/gen/vector.tach` | unsigned, 64-bit and 256-bit vectors with every 0.10 operation at every level; 256-bit legalization in lowering; `from_bits`; const-argument checking; the Rust-form diagnostics (`arch.rust_form`, `arch.raw_form`); `raw::` submodules; the grammar.md section |
-| **T2 Features** | `front/features/*`, `compiler/src/arch/features.tach`, `main.tach` options, the tools' option forwarding | the known-set walk (guards, `&&`, early exit, `assert`); inference over SCCs; declarations; entries; `arch.fn_pointer`; ambiguity; `#[multiversion]` clones and dispatcher; static dead branches; `-C`; `native` (sysctl, `getauxval`, `/proc/cpuinfo`); `query features`; the `arch.*` explain entries for its codes |
-| **T3 Detection** | `compiler/std/arch.tach`, `middle/` late expansion of `CpuFeat` (`back/isel/arch.tach`), start-up init hook | `init_features` on the three OS paths; `cpuid`/`xgetbv`; `TACHYON_ARCH_DISABLE`; the cold path; the container double runs |
-| **T4 AArch64** | `compiler/arch/aarch64.def`, `insn_a64.def`, `back/enc_arm64/simd.tach`, `back/mc_arm64/arch.tach`, the AArch64 half of `gen0/gen/arch.tach`, `tests/arch/ref/a64_*.tach` | every name of §2.3.1, core families first (§2.3.4's column), then breadth; tied operands; v30/v31 pairs; `.arch_extension`; objcheck clean on both aarch64 targets |
-| **T5 x86-64** | `compiler/arch/x86_64.def`, `insn_x86.def`, `back/enc_x86.tach` (VEX), `back/mc_x86_64/arch.tach`, the x86 half of `gen0/gen/arch.tach`, `back/regalloc` (the ymm class and 32-byte spills), `back/emit/function.tach` (vzeroupper, VEX selection in avx functions) | every name of §2.3.2; compile-only and `CROSS` tests; `objcheck -t x86_64-macos` clean; `--verify-regalloc` clean; the x86 run tests written and gated off |
-| **T6 Optimizer** | `middle/fold/arch.tach` (new), `middle/fold/mod.tach` (dispatch), `middle/gvn.tach`, `middle/licm.tach`, `middle/ifconv.tach`, `middle/vectorize/legality.tach`, `middle/vectorize/build.tach`, `middle/ir/*` (Rot, BSwap), `back/isel/tiling.tach` (ld1r, VConst), the VConst literal pools in `back/emit` + `objfile` | vector folding; intrinsic folds; GVN/LICM/ifconv rules incl. no speculation above guards; `VConst`; portable ops lowered on x86 too (`bits_kind` removed); vectorizing `Bits`/`BSwap`/`Rot`; **the calling-convention change** (vectors as one leaf in a vector register; `back/abi.tach`, `back/emit/calls.tach`); the bench gate |
+| **T1 Types and checking** | `front/types.vl` (vector parts), `front/check/vectors.vl`, `front/check/arch.vl`, `compiler/src/arch/virtual.vl`, `middle/lower/vector.vl`, `gen0/gen/vector.vl` | unsigned, 64-bit and 256-bit vectors with every 0.10 operation at every level; 256-bit legalization in lowering; `from_bits`; const-argument checking; the Rust-form diagnostics (`arch.rust_form`, `arch.raw_form`); `raw::` submodules; the grammar.md section |
+| **T2 Features** | `front/features/*`, `compiler/src/arch/features.vl`, `main.vl` options, the tools' option forwarding | the known-set walk (guards, `&&`, early exit, `assert`); inference over SCCs; declarations; entries; `arch.fn_pointer`; ambiguity; `#[multiversion]` clones and dispatcher; static dead branches; `-C`; `native` (sysctl, `getauxval`, `/proc/cpuinfo`); `query features`; the `arch.*` explain entries for its codes |
+| **T3 Detection** | `compiler/std/arch.vl`, `middle/` late expansion of `CpuFeat` (`back/isel/arch.vl`), start-up init hook | `init_features` on the three OS paths; `cpuid`/`xgetbv`; `VOLE_ARCH_DISABLE`; the cold path; the container double runs |
+| **T4 AArch64** | `compiler/arch/aarch64.def`, `insn_a64.def`, `back/enc_arm64/simd.vl`, `back/mc_arm64/arch.vl`, the AArch64 half of `gen0/gen/arch.vl`, `tests/arch/ref/a64_*.vl` | every name of §2.3.1, core families first (§2.3.4's column), then breadth; tied operands; v30/v31 pairs; `.arch_extension`; objcheck clean on both aarch64 targets |
+| **T5 x86-64** | `compiler/arch/x86_64.def`, `insn_x86.def`, `back/enc_x86.vl` (VEX), `back/mc_x86_64/arch.vl`, the x86 half of `gen0/gen/arch.vl`, `back/regalloc` (the ymm class and 32-byte spills), `back/emit/function.vl` (vzeroupper, VEX selection in avx functions) | every name of §2.3.2; compile-only and `CROSS` tests; `objcheck -t x86_64-macos` clean; `--verify-regalloc` clean; the x86 run tests written and gated off |
+| **T6 Optimizer** | `middle/fold/arch.vl` (new), `middle/fold/mod.vl` (dispatch), `middle/gvn.vl`, `middle/licm.vl`, `middle/ifconv.vl`, `middle/vectorize/legality.vl`, `middle/vectorize/build.vl`, `middle/ir/*` (Rot, BSwap), `back/isel/tiling.vl` (ld1r, VConst), the VConst literal pools in `back/emit` + `objfile` | vector folding; intrinsic folds; GVN/LICM/ifconv rules incl. no speculation above guards; `VConst`; portable ops lowered on x86 too (`bits_kind` removed); vectorizing `Bits`/`BSwap`/`Rot`; **the calling-convention change** (vectors as one leaf in a vector register; `back/abi.vl`, `back/emit/calls.vl`); the bench gate |
 | **T7 Tests** | `tests/arch/*`, `tests/fuzz/genarch.awk`, `tests/fuzz/run.sh` (`-A`), `tests/run/opt_arch_*`, `tests/run/arch_err_*` | the generator from the tables; references; KATs; constant-vs-run-time; the fuzzer mode; detection double runs; after 0.18, the `#[property]` conversion |
 | **T8 Tools, guide, examples** | `tools/query` (`query arch`, the intrinsic lines in show/def/context, `query items --feature`), `tools/explain` entries, `compiler/guide/arch.md`, `compiler/guide/types.md` (vector table), `examples/arch/*`, `bench/*` pairs, docs/optimizer.md "0.19", tests/arch-try | discovery (§2.9) and its tests in tests/query; `guide arch` with its examples run by tests/guide; the four examples with walkthroughs; benches; docs |
 
@@ -1172,8 +1172,8 @@ contains:
   `.def` files hold, so each family T4 or T5 adds is tested by the next
   generator run without T7's help. Hand references come with the family.
 - **T1 and T6** share lowering of vector types. T1 owns
-  `lower/vector.tach` (new types, legalization), and T6 owns
-  `lower/arch.tach` after Phase 0 (forms, `VConst`).
+  `lower/vector.vl` (new types, legalization), and T6 owns
+  `lower/arch.vl` after Phase 0 (forms, `VConst`).
 - **T2 and T3** meet at `CpuFeat`. T2 folds it, T3 expands what remains.
 - **T6 and T4/T5** meet at `VConst` emission. T6 writes it with one
   `ma_vconst`/`mx_vconst` function in each machine layer, the only
@@ -1192,7 +1192,7 @@ contains:
 
 **Gate:**
 - `gate.sh --quick` plus `objcheck -t x86_64-macos arch_`;
-- the aarch64-linux container row, with its `TACHYON_ARCH_DISABLE` runs;
+- the aarch64-linux container row, with its `VOLE_ARCH_DISABLE` runs;
 - `tests/fuzz/run.sh -A`;
 - the bench gate.
 
@@ -1211,27 +1211,27 @@ leave alone. The briefs of T1–T8 are these paragraphs.
 **What exists.**
 - `compiler/arch/`: the tables (`portable.def`, `aarch64.def`,
   `x86_64.def`; `insn_a64.def`, `insn_x86.def`), `embed.sh` (writes
-  `compiler/src/arch/tables.tach`; `tests/run.sh` fails while it is
+  `compiler/src/arch/tables.vl`; `tests/run.sh` fails while it is
   stale) and `README.md`, the formats. 23 seeds: the 13 AArch64 and 7
   x86-64 ones of §7.2 and `count_ones`, `has`, `detect`.
-- `compiler/src/arch/` (`crate::arch`): `mod.tach` (`IntrInfo`; the
+- `compiler/src/arch/` (`crate::arch`): `mod.vl` (`IntrInfo`; the
   `FORM_*`, `IF_*`, `MEM_*`, `F_*` constants; `intrinsic(id) ->
   *IntrInfo`, `intrinsic_named(sym) -> i64`, `intr_text(id, F_*)`,
   `intr_param_*`, `intr_tied`, `intr_tied_operand`, `intr_imm`,
   `intr_with_imm`, `intrinsic_of_fn(f)`, `intrinsic_of_node(n)`,
   `intrinsic_is_foreign(id)`, `intrinsic_effect_bits(id)`, `ARCH_USED`);
-  `table.tach` (the lazy parser; `insn_named`, `insn_text`, `insn_hex`);
-  `features.tach` (bits `FT_*`, `feature_name`, `feature_bit_in`,
+  `table.vl` (the lazy parser; `insn_named`, `insn_text`, `insn_hex`);
+  `features.vl` (bits `FT_*`, `feature_name`, `feature_bit_in`,
   `parse_feature`, `feature_ambiguous`, `implied`, `cpu_features`,
   `target_baseline`, `abi_features`, `arch_option` for `-C`,
   `build_features`, `feature_is_foreign`, `feature_value`);
-  `template.tach` (the instruction templates: `<d>`, `<t>`, `<NAME>`,
-  `<NAME:w>`); `virtual.tach` (`load_arch_modules`: the three modules,
+  `template.vl` (the instruction templates: `<d>`, `<t>`, `<NAME>`,
+  `<NAME:w>`); `virtual.vl` (`load_arch_modules`: the three modules,
   the vendor types, a `#[intrinsic(ID)]` declaration per intrinsic the
   program's tokens name).
 - Types: the 24 new vector names of §2.2 (§7.2 said 18) and Intel's six
   opaque types (vectors of i64 lanes with a marker element,
-  `is_opaque_vector`, `opaque_vector_name`; spelled `__tachyon__m128i`
+  `is_opaque_vector`, `opaque_vector_name`; spelled `__vole__m128i`
   inside, `__m128i` by the x86_64 module's aliases), sized 8/16/32 bytes
   and aligned to their size; `T::from_bits(v)` (`VK_FROM_BITS`, a
   `Conv` between vector types at -O1/-O2, the same bytes at -O0); 64-bit
@@ -1247,33 +1247,33 @@ leave alone. The briefs of T1–T8 are these paragraphs.
   definition: an intrinsic with effects is an `IntrMem` or a `Hint`.
 - Front: `FN_INTRINSIC` (bodyless declarations: not checked, not
   emitted, effects from the table), `FN_FEATURES`;
-  `front/check/arch.tach` (`check_intrinsic_call`, from
-  `check_direct_call`); `front/features/mod.tach` (`check_features`,
+  `front/check/arch.vl` (`check_intrinsic_call`, from
+  `check_direct_call`); `front/features/mod.vl` (`check_features`,
   after the effects; `known_at(n)`, `fn_needs(f)`,
   `fn_declared_features(node)`, `feature_call_bit(n)`,
   `feature_call_value(n)`; the attributes `#[target_feature(enable =
   "...")]` and `#[multiversion("...", ...)]` in `FEATURE_ATTRS`; the
   codes `AE_*` with `arch_error_begin(pos, AE_*)` / `arch_error_end()`);
   `-C target-cpu=` / `-C target-feature=` on the build's command line.
-- Lowering and emission: `middle/lower/arch.tach` (`lower_intrinsic`,
-  from `lower_call`), `gen0/gen/arch.tach` (`gen_intrinsic`, from
+- Lowering and emission: `middle/lower/arch.vl` (`lower_intrinsic`,
+  from `lower_call`), `gen0/gen/arch.vl` (`gen_intrinsic`, from
   `gen_call`: the operands in v0-v2/x0-x2, the machine layer's own
-  emission), `back/emit/arch.tach` (`emit_intr`),
-  `back/mc_arm64/arch.tach` (`ma_intr`, `.arch_extension`),
-  `back/mc_x86_64/arch.tach` (`mx_intr`), `back/isel/arch.tach`
+  emission), `back/emit/arch.vl` (`emit_intr`),
+  `back/mc_arm64/arch.vl` (`ma_intr`, `.arch_extension`),
+  `back/mc_x86_64/arch.vl` (`mx_intr`), `back/isel/arch.vl`
   (`expand_cpu_features`: a stub, `CpuFeat` is false),
-  `back/enc_arm64/simd.tach` (classes same3, across, umov, tbl, ext,
+  `back/enc_arm64/simd.vl` (classes same3, across, umov, tbl, ext,
   shrn, crc; register lists `{v.16b}`), `enc_x86`'s
   `x86_table_instruction` (classes sse, ssei: maps 0f/0f38/0f3a, REX.W).
   The allocator hints a tied result into its operand.
-- Tests: `tests/run/arch_seed_neon.tach` (run; one instruction each,
-  ASM lines), `arch_seed_x86.tach` (`// CROSS: x86_64-linux`),
-  `arch_err_seed.tach`, `opt_arch_seed.tach` (GVN, LICM);
+- Tests: `tests/run/arch_seed_neon.vl` (run; one instruction each,
+  ASM lines), `arch_seed_x86.vl` (`// CROSS: x86_64-linux`),
+  `arch_err_seed.vl`, `opt_arch_seed.vl` (GVN, LICM);
   `tests/arch/gen.sh` (every intrinsic of each table, -O0 against -O2;
   category `arch-gen`); the `CROSS` directive (tests/run.sh); the gate's
   `objcheck-x86-arch` step (`tests/objcheck.sh -t x86_64-macos arch_`, in
-  `--quick` too); `tachyonc explain arch.*` (13 entries,
-  `tools/explain/arch_table.tach`).
+  `--quick` too); `volec explain arch.*` (13 entries,
+  `tools/explain/arch_table.vl`).
 - Cost: a program that names no `arch` token pays one scan of its tokens
   (not measurable: the compiler's own source checks and builds in the
   same CPU time as before, 167 against 171 ms for `check`, 428 against
@@ -1299,14 +1299,14 @@ leave alone. The briefs of T1–T8 are these paragraphs.
 
 **What each task owns, fills, and leaves alone.** Every task may add
 lines to the `.def` tables of its families and tests under
-`tests/run/arch_*`; `compiler/src/arch/tables.tach` is only ever
+`tests/run/arch_*`; `compiler/src/arch/tables.vl` is only ever
 written by `embed.sh`.
 
-- **T1 Types and checking.** Owns `front/types.tach` (vector parts:
+- **T1 Types and checking.** Owns `front/types.vl` (vector parts:
   `init_arch_vector_types`, `is_opaque_vector`, `vec_mask_type`),
-  `front/check/vectors.tach`, `front/check/arch.tach`,
-  `compiler/src/arch/virtual.tach`, `middle/lower/vector.tach`,
-  `gen0/gen/vector.tach`, `back/mc_*/vector.tach` (the generic
+  `front/check/vectors.vl`, `front/check/arch.vl`,
+  `compiler/src/arch/virtual.vl`, `middle/lower/vector.vl`,
+  `gen0/gen/vector.vl`, `back/mc_*/vector.vl` (the generic
   operations on the new types). Fills: every 0.10 operation on the
   unsigned, 64- and 256-bit types (unsigned compares and masks, `umov`
   lanes; `vector_type` stays the six for the vectorizer), 256-bit
@@ -1315,9 +1315,9 @@ written by `embed.sh`.
   `arch.raw_form` in `check_intrinsic_call`, the tuple types, the
   grammar.md section; may route -O0's generic forms through lane-by-lane
   code. Leaves: the table formats, `IntrInfo`, the IR ops, the features.
-- **T2 Features.** Owns `front/features/*` (adds `regions.tach`,
-  `infer.tach`, `check.tach`, `why.tach`, `multiversion.tach`),
-  `compiler/src/arch/features.tach`, `main.tach`'s `-C` and the tools'
+- **T2 Features.** Owns `front/features/*` (adds `regions.vl`,
+  `infer.vl`, `check.vl`, `why.vl`, `multiversion.vl`),
+  `compiler/src/arch/features.vl`, `main.vl`'s `-C` and the tools'
   forwarding of it. Fills: `known_at(n)` (declared features, guards),
   `fn_needs(f)` over the SCCs, the static deadness of has/detect
   branches (read by lowering and gen0 where they lower `If`), the
@@ -1327,32 +1327,32 @@ written by `embed.sh`.
   (today it lowers to unreachable), `native`, `query features`. Leaves:
   the bit numbers (`FT_*`: the run-time word's too), `feature_value`'s
   meaning, lowering's use of `feature_call_value`.
-- **T3 Detection.** Owns `compiler/std/arch.tach` (new; std's
-  `init_features`), `back/isel/arch.tach`, the start-up hook. Fills:
+- **T3 Detection.** Owns `compiler/std/arch.vl` (new; std's
+  `init_features`), `back/isel/arch.vl`, the start-up hook. Fills:
   `expand_cpu_features` (the load of `ARCH_FEATURES`, the bit test, the
   cold `init_features` call), gen0's detect (today constant false in
-  `gen_intrinsic`), the three OS sources, `TACHYON_ARCH_DISABLE`, the
+  `gen_intrinsic`), the three OS sources, `VOLE_ARCH_DISABLE`, the
   container's double runs. Leaves: `Op::CpuFeat`'s meaning (pure, imm =
   `FT_*` bit), the folding (T2's `feature_call_value`).
 - **T4 AArch64.** Owns `compiler/arch/aarch64.def`, `insn_a64.def`,
-  `back/enc_arm64/simd.tach` (and moves the chain's vector mnemonics
-  into it), `back/mc_arm64/arch.tach`, the AArch64 half of
-  `gen0/gen/arch.tach`. Fills: the names of §2.3.1, the encoding
+  `back/enc_arm64/simd.vl` (and moves the chain's vector mnemonics
+  into it), `back/mc_arm64/arch.vl`, the AArch64 half of
+  `gen0/gen/arch.vl`. Fills: the names of §2.3.1, the encoding
   classes they need, tied operands beyond the hint, the v30/v31 pairs,
   objcheck on both aarch64 targets. Leaves: the template syntax (adds
   modifiers if needed, documented in the README), `IntrInfo`.
 - **T5 x86-64.** Owns `compiler/arch/x86_64.def`, `insn_x86.def`,
-  `back/enc_x86.tach` (VEX in `x86_table_instruction`),
-  `back/mc_x86_64/arch.tach`, the x86 half of `gen0/gen/arch.tach`,
+  `back/enc_x86.vl` (VEX in `x86_table_instruction`),
+  `back/mc_x86_64/arch.vl`, the x86 half of `gen0/gen/arch.vl`,
   `back/regalloc` (the ymm class, 32-byte spills),
-  `back/emit/function.tach` (vzeroupper). Fills: §2.3.2's names, the
+  `back/emit/function.vl` (vzeroupper). Fills: §2.3.2's names, the
   CROSS and objcheck tests, `--verify-regalloc`. Leaves: what x86 runs:
   nothing (the gate's x86 switch).
-- **T6 Optimizer.** Owns `middle/lower/arch.tach` (after Phase 0; adds
+- **T6 Optimizer.** Owns `middle/lower/arch.vl` (after Phase 0; adds
   `VConst`, the forms `vsel vins vneg vsum load.dup rot bswap wmul`),
-  `middle/fold/arch.tach`, the GVN/LICM/ifconv rules (the no-speculation
+  `middle/fold/arch.vl`, the GVN/LICM/ifconv rules (the no-speculation
   line for guarded intrinsics), `Rot`/`BSwap`, the vectorizer's portable
-  bit ops, `back/emit/arch.tach`'s `VConst` and the literal pools, the
+  bit ops, `back/emit/arch.vl`'s `VConst` and the literal pools, the
   calling-convention change, `bits_kind`'s removal. Leaves: `Op::Intr`'s
   operand layout and imm2 packing, `is_vector`'s classification unless
   it moves all three ops at once.
@@ -1361,7 +1361,7 @@ written by `embed.sh`.
   run-time values), `tests/fuzz/genarch.awk`, `-A`, `tests/run/opt_arch_*`,
   `tests/run/arch_err_*`. Leaves: the tables.
 - **T8 Tools, guide, examples.** Owns `tools/query` (`query arch`, the
-  intrinsic lines in show/def/context), `tools/explain/arch_table.tach`
+  intrinsic lines in show/def/context), `tools/explain/arch_table.vl`
   (the 13 entries are there: T8 makes them follow T1/T2's messages),
   `compiler/guide/arch.md`, `examples/arch/*`, `bench/*`, the docs,
   `tests/arch-try`. Phase 0 adds no guide text. Leaves: the codes'
@@ -1391,17 +1391,17 @@ the `AE_*` codes.
   unreachable until T2 makes it an error.
 
 **T2 as built (branch a19-t2).**
-- `front/features/regions.tach` walks every checked body once (after the
+- `front/features/regions.vl` walks every checked body once (after the
   effects): the known set at each point (the build's features, the
   declaration, the guards of §2.4: `then` of `if G`, `&&` atoms, `else` of
   `if !G`, the rest of a block after `if !G { DIVERGES }` or
   `assert(G)`, which 0.18 checks as `std::contract_check`), recorded per
   direct call (`CALLS`: caller, callee, known, the ambiguous readings,
   node) and per has()/detect() call (`known_at`).
-- `infer.tach`: `NEEDS[f]` (beyond the build's features; a declaration
+- `infer.vl`: `NEEDS[f]` (beyond the build's features; a declaration
   pins it to what it declares) by a worklist over the calls, from the
   intrinsics and declarations up. No SCCs are needed: a set only grows.
-- `check.tach`: `arch.feature` in entry points (main, `extern "C" fn`s,
+- `check.vl`: `arch.feature` in entry points (main, `extern "C" fn`s,
   tests), `arch.declared`, `arch.feature_ambiguous` (where the
   unqualified name is, not carried up), `arch.fn_pointer` for a plain
   `fn` value or a closure coerced to a `fn` type. **Change:** a closure
@@ -1417,7 +1417,7 @@ the `AE_*` codes.
   `sysctl` (`front::cpp::cc::run_command`, now `pub`); `check`, `query`
   and the editing commands take `-C` (their cache is skipped then), and
   the edits' checks forward it (`push_arch_args`).
-- `query features NAME [--why F] [-C ...]` (tools/query/features.tach).
+- `query features NAME [--why F] [-C ...]` (tools/query/features.vl).
 - Not done: `#[multiversion]` (clones, dispatcher, `arch.multiversion`);
   `features:` on `def`/`show`/`context` lines (T8's); `--target` on
   `query`. `arch.feature_ambiguous` has no run test until an AArch64 aes
@@ -1441,8 +1441,8 @@ the `AE_*` codes.
   trailing note says `(i16 lanes)` or `(a, b: i16 lanes; r: i8 lanes)`.
   Tuples are their lanes one after the other (`t[idx[k]]` over 32 lanes
   for tbl2).
-- **Prose needs `fn ref_NAME`** in `tests/arch/ref/*.tach` (T4's:
-  `a64_*.tach`; shared ones: `crc.tach`, `movemask.tach`, `bits.tach`):
+- **Prose needs `fn ref_NAME`** in `tests/arch/ref/*.vl` (T4's:
+  `a64_*.vl`; shared ones: `crc.vl`, `movemask.vl`, `bits.vl`):
   the intrinsic's parameters with vectors and slices as `[D]`, scalars
   as `D`, constants and indexes as `i64`, a store's slice as `&mut [D]`,
   then `k: i64` for a vector result; it returns lane k (or the value). An
@@ -1457,11 +1457,11 @@ the `AE_*` codes.
   architecture (with the portable one) as part of its corpus, so the
   gate's `objcheck-x86-arch` covers every x86 intrinsic.
 - Fixed on the way: a memory intrinsic's bounds check now names the
-  index's position at -O1/-O2 as at -O0 (`middle/lower/arch.tach`,
+  index's position at -O1/-O2 as at -O0 (`middle/lower/arch.vl`,
   `checked_address`'s `site`).
 - Not done: the KATs (AES, SHA: no such intrinsic yet; the CRC reference
   is bitwise), `tests/run/opt_arch_*` beyond the seed, the container's
-  `TACHYON_ARCH_DISABLE` double runs (T3), the `#[property]` conversion.
+  `VOLE_ARCH_DISABLE` double runs (T3), the `#[property]` conversion.
 
 **T5 as built (branch a19-t5).** x86-64, compile-tested only.
 - `x86_64.def` holds 484 intrinsics, written with every line of
@@ -1469,8 +1469,8 @@ the `AE_*` codes.
   --write` between the `# ==== generated` markers: sse 20, sse2 127, sse3
   8, ssse3 16, sse4.1 47, sse4.2 5, popcnt 2, lzcnt 2, bmi1 12, bmi2 6,
   pclmulqdq 1, aes 6, sha 7, avx 71, avx2 138, fma 16. Each has its
-  semantics or a `fn ref_NAME` (`tests/arch/ref/x86_bits.tach`,
-  `x86_float.tach`, `x86_crypto.tach`); `arch-gen` compiles all 33
+  semantics or a `fn ref_NAME` (`tests/arch/ref/x86_bits.vl`,
+  `x86_float.vl`, `x86_crypto.vl`); `arch-gen` compiles all 33
   programs at -O0 and -O2 for x86_64-linux and x86_64-macos, and
   `objcheck -t x86_64-macos arch_` agrees with cc on all 184 compilations.
 - **Encoder.** VEX (two- and three-byte prefixes, L, W, vvvv) in
@@ -1479,8 +1479,8 @@ the `AE_*` codes.
   ymm registers; `vmovdqu`, `vmovdqa`, `vzeroupper` in its own table; the
   operand swaps LLVM's assembler makes for the short VEX prefix
   (commutative operations, symmetric `vcmpps` predicates, register moves).
-  **`tachyonc assemble [--target T] FILE.s -o FILE.o`** (a developer's
-  tool, `tools/assemble.tach`) runs the compiler's assembler on a file;
+  **`volec assemble [--target T] FILE.s -o FILE.o`** (a developer's
+  tool, `tools/assemble.vl`) runs the compiler's assembler on a file;
   **`tests/arch/enc.sh`** (category `arch-enc` of tests/run.sh) assembles
   `tests/arch/enc_x86.s` (7,777 instructions: every line of `insn_x86.def`
   and the back end's AVX moves, low and high registers, both widths, eight
@@ -1503,18 +1503,18 @@ the `AE_*` codes.
   xmm0 (SSE4.1's `pblendvb`/`blendvps`/`blendvpd`, `sha256rnds2`): the
   machine layer saves xmm0 in xmm14 around it (`mx_intr_xmm0`, five moves).
   A tied 256-bit result (FMA) is moved whole.
-- Tests: `tests/run/arch_x86_core.tach` (byte search with SSE2 and AVX2,
+- Tests: `tests/run/arch_x86_core.vl` (byte search with SSE2 and AVX2,
   pshufb/palignr/psubusb/ptest, CRC-32C, POPCNT, pblendvb),
-  `arch_x86_kat.tach` (FIPS-197 C.1 through aeskeygenassist, aesenc,
+  `arch_x86_kat.vl` (FIPS-197 C.1 through aeskeygenassist, aesenc,
   aesdec with aesimc's keys; carry-less squares; sha1msg1),
-  `arch_x86_avx.tach` (sixteen live ymm values: spills; FMA; vpblendvb,
+  `arch_x86_avx.vl` (sixteen live ymm values: spills; FMA; vpblendvb,
   shifts, permutes): `CROSS: x86_64-linux` with ASM lines, run on AArch64
   (the fallbacks print the answers).
 - Not done (of §2.3.2): gathers and masked loads/stores (`intr.mem` is not
   lowered), the string compares (`pcmpistri`/`pcmpestri`: implicit ecx,
   eax, edx), `_mulx_u64`, `_mm256_zeroupper` (the `hint` form is T6's),
   intrinsics with float scalars (`_mm_set1_ps`, `_mm_cvtss_f32`: -O0's
-  float operands are T4's change to `gen0/gen/arch.tach`), `_mm_set_epi*`
+  float operands are T4's change to `gen0/gen/arch.vl`), `_mm_set_epi*`
   (more than three operands), `_mm_loadl_epi64`/`storel` (8 of a 16-byte
   vector), `lddqu`, `_mm_dp_ps`, `mpsadbw`, `pause`/`prefetch` (T6's
   hints), VEX forms of the generic 128-bit operations in AVX functions,
@@ -1546,8 +1546,8 @@ the `AE_*` codes.
   migration to `&mut [T]` is D13's generator commit, for both tables).
 
 **T3 as built (branch a19-t3).**
-- **std's word** is `compiler/std/arch.tach`, four lazy sections: the
-  portable part (`ARCH_FEATURES`, `TACHYON_ARCH_DISABLE`, the
+- **std's word** is `compiler/std/arch.vl`, four lazy sections: the
+  portable part (`ARCH_FEATURES`, `VOLE_ARCH_DISABLE`, the
   implications' consistency: sha3 without sha2 is cleared), then one per
   source: macOS (sysctl `hw.optional.arm.FEAT_*`), Linux (`getauxval`),
   x86-64 (`cpuid`, `xgetbv`). No `cfg`: the compiler names the target's
@@ -1558,7 +1558,7 @@ the `AE_*` codes.
   takes the build's features (`known`), which it does not ask the system
   about, so a default macOS build reads two sysctls (i8mm, bf16).
 - **Who fills it.** A program with `main`: main's first call
-  (`arch_after_lowering`, after lowering, `back/isel/arch.tach`; gen0's
+  (`arch_after_lowering`, after lowering, `back/isel/arch.vl`; gen0's
   `gen_function` at -O0), only when a CPUFEAT survived lowering (-O0: a
   detect not folded). Then each CPUFEAT becomes, just before isel, a load
   and a bit test: no cold path is needed, nothing is clobbered, the
@@ -1573,12 +1573,12 @@ the `AE_*` codes.
   an idempotent race on one aligned word that every writer fills with
   the same value, which the hardware never tears and the back end never
   splits; relaxed atomics in 0.21's terms.
-- **x86-64** (compile-only): `tachyon_arch_cpuid` and
-  `tachyon_arch_xgetbv`, global helpers the compiler writes after the
+- **x86-64** (compile-only): `vole_arch_cpuid` and
+  `vole_arch_xgetbv`, global helpers the compiler writes after the
   run-time helpers (`emit_arch_runtime`), `cpuid`/`xgetbv` as `.byte`s:
   no table intrinsic, no register-class change (T5's regalloc stays as
   it is).
-- **`#[multiversion]`** (`front/features/multiversion.tach`): before
+- **`#[multiversion]`** (`front/features/multiversion.vl`): before
   the contracts, each listed set of the target's architecture that the
   build lacks makes a version `f$mvK` (a copy of the AST, `FN_DERIVED`,
   declaring the set through a `FA_TARGET_FEATURE` entry); the first set
@@ -1591,11 +1591,11 @@ the `AE_*` codes.
   (`Self::f$mvK`, the type parameters written).
 - **The double runs**: `tests/run.sh` runs every run case whose source
   names `detect(` or `#[multiversion` a second time with
-  `TACHYON_ARCH_DISABLE=all` and expects the same output and exit code,
+  `VOLE_ARCH_DISABLE=all` and expects the same output and exit code,
   on every host (the container's suite included).
 - Tests: `arch_detect_run` (CRC-32C by detect and by a multiversioned
   function, through a `fn` value and a closure; the word's implications;
-  a detect in a loop), `arch_detect_lib` (a C main, no tachyon main),
+  a detect in a loop), `arch_detect_lib` (a C main, no vole main),
   `arch_err_multiversion`.
 
 **T4 as built (branch a19-t4).**
@@ -1603,14 +1603,14 @@ the `AE_*` codes.
   written by `tools/arch/a64_families.py --write` between the `# ====
   generated` markers of `aarch64.def` and `insn_a64.def` (one Python
   function per family; lines outside the markers are kept). Every one
-  has its semantics or a `fn ref_NAME` (`tests/arch/ref/a64_lanes.tach`,
-  `a64_crypto.tach`, `a64_float.tach`, and `crc.tach`'s other seven) and
+  has its semantics or a `fn ref_NAME` (`tests/arch/ref/a64_lanes.vl`,
+  `a64_crypto.vl`, `a64_float.vl`, and `crc.vl`'s other seven) and
   passes `arch-gen`; `tests/objcheck.sh arch_` agrees with `cc -c` on
   aarch64-macos and aarch64-linux.
 - **Encoder.** For vector and SIMD scalar operands the table is read
   before the chain, and a mnemonic may have several (consecutive) lines:
   the first whose class fits the operands encodes them; none fits, the
-  chain does (`arch/table.tach`'s name map keeps a mnemonic's first
+  chain does (`arch/table.vl`'s name map keeps a mnemonic's first
   line). Classes added: `same3f diff3 misc2 misc2f acrossf shl elem
   fpair rr rrr rrrr xar` and the scalar `same3s misc2s misc2fs shrns
   shls` (compiler/arch/README.md); operands `.1q`, `.4b[i]`, `#0.0`.
@@ -1627,13 +1627,13 @@ the `AE_*` codes.
   those extensions only on an Armv8.2 base.
 - -O0 keeps float scalar operands and results in vector registers (v0-v2).
 - A function that needs another architecture's features is lowered as
-  `unreachable` (`middle/lower/mod.tach`, `lower_function`, as §2.4
+  `unreachable` (`middle/lower/mod.vl`, `lower_function`, as §2.4
   says): its calls are dead or errors, and lowering such a body, never
   called, could overflow the stack in SSA construction
   (tests/run/arch_foreign_body).
 - Fixed: a 64-bit vector of constant lanes (a folded load of a constant
   8-byte array) was materialized into a general register numbered 48
-  and up (`back/emit/operands.tach`, `materialize`).
+  and up (`back/emit/operands.vl`, `materialize`).
 - Not done (left of §2.3.1): `vld1q_dup` (the `load.dup` form, T6's),
   `vld2q`/`vst2q` (`intr.mem` is not lowered yet), `vqtbl2q`/`vqtbx2q`
   (tuple operands: the v30/v31 pair), the float forms whose references
@@ -1647,7 +1647,7 @@ the `AE_*` codes.
 - **Guards in the optimizer.** An `Intr` needing a feature outside its
   function's whole-body set (the build's, `made_build_features()`, and
   `fn_needs(f)`) is under a guard: LICM hoists it only when `runs_first`
-  holds (`middle/licm.tach`, `intr_guarded`). Inlined intrinsics are
+  holds (`middle/licm.vl`, `intr_guarded`). Inlined intrinsics are
   judged in the caller. `ifconv` and isel's selects never speculate an
   `Intr` (it is not `is_pure`); GVN only replaces by dominating copies.
   `NEEDS` and `BUILD_FEATURES` are on threads_writes.sh's READ list.
@@ -1656,13 +1656,13 @@ the `AE_*` codes.
   vnegq/vnegq_f, vsetq_lane, vbslq, vaddvq, vdivq lower to VNEG, VINS,
   VSEL (bitwise), VSUM, VBIN div; one 64-bit lane keeps `intr`. -O0 writes
   the table's instruction for them (an independent check of -O2).
-- **Folding** (`middle/fold/arch.tach`, from instcombine): constant
+- **Folding** (`middle/fold/arch.vl`, from instcombine): constant
   vectors are VSPLATs of constants; the generic ops and the fold classes
   listed in that file fold to a VSPLAT or a constant; integer lanes,
   AArch64 and portable intrinsics. `VConst` (non-splat constants, the
   literal pools) is not made yet.
-- **Calling convention** (`back/abi.tach` `tabi_leaves`,
-  `back/emit/machine.tach` `t_arg_location`): a vector is one leaf in a
+- **Calling convention** (`back/abi.vl` `tabi_leaves`,
+  `back/emit/machine.vl` `t_arg_location`): a vector is one leaf in a
   float/vector register (256-bit: two), past them a stack slot of its
   size at a multiple of it. C's convention is untouched. bench/ compiles
   to the same code.
@@ -1678,7 +1678,7 @@ the `AE_*` codes.
 
 **T8 as built (branch a19-t8).**
 - `query arch WORDS... [--feature F] [--arch A] [--equiv NAME]` (also
-  `query intrinsics`; tools/query/intrinsics.tach): the tables without a
+  `query intrinsics`; tools/query/intrinsics.vl): the tables without a
   program; words are positional (the design's `--find`), `--feature`
   stands for `query items --feature`; `query arch --features` (the
   baseline listing) is not done.
@@ -1734,26 +1734,26 @@ the `AE_*` codes.
 
 ### Critical files for implementation
 
-- compiler/src/middle/ir/mod.tach (`Op`, `is_pure`, `is_vector`,
+- compiler/src/middle/ir/mod.vl (`Op`, `is_pure`, `is_vector`,
   `has_side_effect`): the new ops
-- compiler/src/middle/lower/calls.tach (`bits_kind`, `lower_call`): the
-  existing std-call-to-instruction path, generalized by lower/arch.tach
-- compiler/src/back/emit/insts.tach (`emit_vector`) with
-  back/mc_arm64/vector.tach and back/mc_x86_64/vector.tach (`ma_vbin`,
+- compiler/src/middle/lower/calls.vl (`bits_kind`, `lower_call`): the
+  existing std-call-to-instruction path, generalized by lower/arch.vl
+- compiler/src/back/emit/insts.vl (`emit_vector`) with
+  back/mc_arm64/vector.vl and back/mc_x86_64/vector.vl (`ma_vbin`,
   `mx_v2op`, `ma_vmacw`): where `Intr` is emitted and the tied-operand
   pattern comes from
-- compiler/src/back/enc_arm64/mod.tach (`a64_simd`, `init_a64`) and
-  back/enc_x86.tach (`sse`, `enc`): the encoders made table-driven
-- compiler/src/front/effects/infer.tach (`infer_effects`, `components`,
+- compiler/src/back/enc_arm64/mod.vl (`a64_simd`, `init_a64`) and
+  back/enc_x86.vl (`sse`, `enc`): the encoders made table-driven
+- compiler/src/front/effects/infer.vl (`infer_effects`, `components`,
   `ADDRESS_TAKEN`): the SCCs and address-taken set that feature inference
   reuses
-- compiler/src/front/check/vectors.tach and gen0/gen/vector.tach: the
+- compiler/src/front/check/vectors.vl and gen0/gen/vector.vl: the
   vector types' checking and -O0 code
-- compiler/src/front/modules/stdsections.tach and front/modules/lookup.tach:
+- compiler/src/front/modules/stdsections.vl and front/modules/lookup.vl:
   where virtual `std::arch*` paths resolve
-- compiler/src/middle/licm.tach (`runs_first`), middle/ifconv.tach: the
+- compiler/src/middle/licm.vl (`runs_first`), middle/ifconv.vl: the
   no-speculation rule
-- compiler/src/back/abi.tach and back/emit/calls.tach: the vector
+- compiler/src/back/abi.vl and back/emit/calls.vl: the vector
   calling-convention change
 - tests/objcheck.sh, tests/run.sh (the `CROSS` directive), tests/fuzz/run.sh
 
@@ -1774,9 +1774,9 @@ work autonomously through 0.23. Each can be revisited.
   legalized to pairs where the registers are missing, so they run and
   are tested on aarch64.
 - D4. **The vendor types:** NEON types are aliases of the portable types;
-  `p128` is `v2u64` (tachyon has no `u128`). x86 `__m*` types are
+  `p128` is `v2u64` (vole has no `u128`). x86 `__m*` types are
   opaque distinct types with no operators.
-- D5. **The calling convention:** tachyon's own convention passes a
+- D5. **The calling convention:** vole's own convention passes a
   vector as one leaf in a vector register, and a 256-bit vector as two.
   It does not depend on features. C's convention is unchanged, and
   vectors stay non-FFI-safe.
@@ -1808,7 +1808,7 @@ work autonomously through 0.23. Each can be revisited.
 - D11. **Detection:** a pure `CpuFeat` op over one cached word, expanded
   late with a cold init path. The word is initialized at start-up in
   programs with `main`, and lazily for C-entered code. The sources are
-  sysctl, getauxval and cpuid+xgetbv. `TACHYON_ARCH_DISABLE` may only
+  sysctl, getauxval and cpuid+xgetbv. `VOLE_ARCH_DISABLE` may only
   clear bits, for testing the fallbacks.
 - D12. **Multiversioning** is clones with declared features plus an
   inlinable chain of `detect` tests, not ifunc. `has` folds per clone.

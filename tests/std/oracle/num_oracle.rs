@@ -1,7 +1,7 @@
-// The Rust side of std's number-conversion checks (0.20, compiler/std/num.tach):
+// The Rust side of std's number-conversion checks (0.20, compiler/std/num.vl):
 // prints, chunk by chunk, an FNV-1a hash of Rust's text for each value, so
-// that tests/std/oracle/num_check.tach, which prints the same lines from
-// tachyon's std, can be compared with it (tests/std/oracle/num.sh). The
+// that tests/std/oracle/num_check.vl, which prints the same lines from
+// vole's std, can be compared with it (tests/std/oracle/num.sh). The
 // values are made the same way on both sides (xorshift64, fixed seeds).
 //
 //   num_oracle f32 LO HI       every f32 with bits in [LO, HI): {} {:?} {:e}

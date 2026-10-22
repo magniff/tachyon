@@ -1,0 +1,455 @@
+// Section banners and comments as items (0.13; docs/query.md):
+//
+//   volec query items MODULE --comments    the items, with the banners
+//                                              and comments between them
+//   volec query show MODULE::section TITLE  a banner's section
+//
+// A banner is a block of comment lines outside every item whose first
+// line is a rule, `// ---- Title ----` (a run of `-`, `=`, `#`, `*` or
+// `~`, the title, maybe another run); its section runs to the next
+// banner of its file (or the file's end). A comment is any other block of
+// comment lines outside every item that is not an item's own (a blank
+// line, or nothing, follows it) and not the file's header (code comes
+// before it).
+
+use crate::base::{
+    FILES, FILE_COUNT, IntVec, SRC, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice,
+    buf_str, buf_write_fd,
+};
+use crate::front::lexer::{TOKS, TOK_COUNT};
+use crate::front::modules::module_at;
+use crate::tools::query::cache::{C_CODE_START, RESTORED};
+use crate::tools::query::defs::mod_fqn_text;
+use crate::tools::query::diagnostics::{diag, try_begin, try_end, try_query};
+use crate::tools::query::positions::{enclosing, line_end, line_of, put_path, token_at};
+use crate::tools::query::show::find_modules;
+use crate::tools::query_text::{TEXT_MAX, root_stem};
+
+// ---- Finding banners ----
+
+pub const B_SECTION: i64 = 1;
+pub const B_COMMENT: i64 = 2;
+
+// --comments: items lists the banners and comments too.
+pub static var OPT_BANNERS: bool = false;
+
+// The banners and comments found: kind, the start of the first line, the
+// start of the section's (or comment's) last line, the title (in SRC).
+pub static var B_KIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var B_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var B_LAST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var B_TITLE_A: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var B_TITLE_B: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The first byte of the line at pos that is not a space or a tab.
+fn indent_end(pos: i64) -> i64 {
+    unsafe {
+        let e = line_end(pos);
+        var a = pos;
+        while a < e && (SRC[a] == ' ' || SRC[a] == '\t') {
+            a += 1;
+        }
+        a
+    }
+}
+
+fn comment_at(pos: i64) -> bool {
+    unsafe {
+        let a = indent_end(pos);
+        a + 1 < line_end(pos) && SRC[a] == '/' && SRC[a + 1] == '/'
+    }
+}
+
+fn blank_at(pos: i64) -> bool {
+    unsafe {
+        let a = indent_end(pos);
+        a >= line_end(pos) || SRC[a] == '\r'
+    }
+}
+
+fn is_rule_byte(c: u8) -> bool {
+    c == '-' || c == '=' || c == '#' || c == '*' || c == '~'
+}
+
+// The title of the rule at line pos (its text between the runs), into *a,
+// *b; whether the line is a rule: a run of at least two rule bytes after
+// the `//`, then a space; a run of two or three needs another after the
+// title.
+fn rule_title(pos: i64, a: inout i64, b: inout i64) -> bool {
+    unsafe {
+        let e = line_end(pos);
+        var i = indent_end(pos) + 2;
+        while i < e && SRC[i] == '/' {
+            i += 1;
+        }
+        while i < e && SRC[i] == ' ' {
+            i += 1;
+        }
+        let run = i;
+        while i < e && is_rule_byte(SRC[i]) {
+            i += 1;
+        }
+        let lead = i - run;
+        if lead < 2 || (i < e && SRC[i] != ' ' && SRC[i] != '\r') {
+            return false;
+        }
+        while i < e && SRC[i] == ' ' {
+            i += 1;
+        }
+        var j = e;
+        while j > i && (SRC[j - 1] == ' ' || SRC[j - 1] == '\r') {
+            j -= 1;
+        }
+        let tail = j;
+        while j > i && is_rule_byte(SRC[j - 1]) {
+            j -= 1;
+        }
+        // (`// -- a note` is not a rule: a short run needs another after
+        // the title)
+        if lead < 4 && tail - j < 2 && i < j {
+            return false;
+        }
+        while j > i && SRC[j - 1] == ' ' {
+            j -= 1;
+        }
+        a = i;
+        b = j;
+        true
+    }
+}
+
+// The text of comment line pos after its `//` and spaces, into *a, *b.
+fn comment_text(pos: i64, a: inout i64, b: inout i64) {
+    unsafe {
+        let e = line_end(pos);
+        var i = indent_end(pos) + 2;
+        while i < e && (SRC[i] == '/' || SRC[i] == ' ') {
+            i += 1;
+        }
+        var j = e;
+        while j > i && (SRC[j - 1] == ' ' || SRC[j - 1] == '\r') {
+            j -= 1;
+        }
+        a = i;
+        b = j;
+    }
+}
+
+// The start of the line after the one at pos (the file's end: none).
+fn next_line(pos: i64, end: i64) -> i64 {
+    let e = line_end(pos);
+    if e + 1 < end { e + 1 } else { end }
+}
+
+static var FOUND: bool = false;
+
+// The banners and comments of every file of the program (once).
+pub fn find_banners() {
+    unsafe {
+        if FOUND {
+            return;
+        }
+        FOUND = true;
+        for f in 0..FILE_COUNT {
+            if FILES[f].path[0] != '<' {
+                banners_of_file(f);
+            }
+        }
+    }
+}
+
+// Where the code of file f starts: its first token, or its end (from the
+// tools' cache when the program came from it).
+pub fn code_start(f: i64) -> i64 {
+    unsafe {
+        if RESTORED {
+            return C_CODE_START.data[f];
+        }
+        let end = FILES[f].end;
+        let t = token_at(FILES[f].start);
+        if t < TOK_COUNT && TOKS[t].start < end { TOKS[t].start } else { end }
+    }
+}
+
+fn banners_of_file(f: i64) {
+    unsafe {
+        let end = FILES[f].end;
+        let code_start = code_start(f);
+        let first = B_KIND.count;
+        var p = FILES[f].start;
+        while p < end {
+            if !comment_at(p) || enclosing(p) >= 0 {
+                p = next_line(p, end);
+                continue;
+            }
+            let start = p;
+            var last = p;
+            while p < end && comment_at(p) {
+                last = p;
+                p = next_line(p, end);
+            }
+            let detached = p >= end || blank_at(p);
+            var a = 0;
+            var b = 0;
+            if rule_title(start, &a, &b) {
+                if a == b && last != start {
+                    // (a rule alone: the title is the next line's text)
+                    comment_text(next_line(start, end), &a, &b);
+                }
+                add_banner(B_SECTION, start, last, a, b);
+            } else if detached && start >= code_start {
+                comment_text(start, &a, &b);
+                add_banner(B_COMMENT, start, last, a, b);
+            }
+        }
+        // A section runs to the next banner (its blank lines left out).
+        for i in first..B_KIND.count {
+            if B_KIND.data[i] != B_SECTION {
+                continue;
+            }
+            var stop = end;
+            for j in i + 1..B_KIND.count {
+                if B_KIND.data[j] == B_SECTION {
+                    stop = B_START.data[j];
+                    break;
+                }
+            }
+            var q = B_LAST.data[i];
+            var r = next_line(q, end);
+            while r < stop {
+                if !blank_at(r) {
+                    q = r;
+                }
+                r = next_line(r, end);
+            }
+            B_LAST.data[i] = q;
+        }
+    }
+}
+
+fn add_banner(kind: i64, start: i64, last: i64, a: i64, b: i64) {
+    unsafe {
+        B_KIND.push(kind);
+        B_START.push(start);
+        B_LAST.push(last);
+        B_TITLE_A.push(a);
+        B_TITLE_B.push(b);
+    }
+}
+
+// The banners of module m (in its files, not in its inline modules), in
+// order, into out.
+pub fn banners_of_module(m: i64, out: inout IntVec) {
+    unsafe {
+        find_banners();
+        for i in 0..B_KIND.count {
+            if module_at(B_START.data[i]) == m {
+                out.push(i);
+            }
+        }
+    }
+}
+
+// The title of banner i, cut to TITLE_MAX bytes (with `…`).
+const TITLE_MAX: i64 = 72;
+
+pub fn put_title(out: i64, i: i64) {
+    unsafe {
+        let a = B_TITLE_A.data[i];
+        let b = B_TITLE_B.data[i];
+        if b - a <= TITLE_MAX {
+            buf_bytes(out, SRC[a..b]);
+            return;
+        }
+        var e = a + TITLE_MAX - 1;
+        while e > a && (SRC[e] & 192) == 128 {
+            e -= 1;
+        }
+        buf_bytes(out, SRC[a..e]);
+        buf_byte(out, 226 as u8);
+        buf_byte(out, 128 as u8);
+        buf_byte(out, 166 as u8);
+    }
+}
+
+// `A-B<TAB>section|comment<TAB>TITLE`, a line of `items --comments`.
+pub fn put_banner_line(out: i64, i: i64) {
+    unsafe {
+        buf_int(out, line_of(B_START.data[i]));
+        buf_byte(out, '-');
+        buf_int(out, line_of(B_LAST.data[i]));
+        buf_str(out, if B_KIND.data[i] == B_SECTION { c"\tsection\t" } else { c"\tcomment\t" });
+        put_title(out, i);
+        buf_byte(out, '\n');
+    }
+}
+
+// ---- show MODULE::section TITLE ----
+
+fn lower(c: u8) -> u8 {
+    if c >= 'A' && c <= 'Z' { c + 32 } else { c }
+}
+
+// How title of banner i matches want: 3 the same, 2 the same but for
+// case, 1 it contains want (but for case), 0 not.
+fn title_match(i: i64, want: [u8]) -> i64 {
+    unsafe {
+        let t = SRC[B_TITLE_A.data[i]..B_TITLE_B.data[i]];
+        if want.len == 0 || want.len > t.len {
+            return 0;
+        }
+        var k = 0;
+        while k + want.len <= t.len {
+            var same = true;
+            var exact = true;
+            for j in 0..want.len {
+                if lower(t[k + j]) != lower(want[j]) {
+                    same = false;
+                    break;
+                }
+                if t[k + j] != want[j] {
+                    exact = false;
+                }
+            }
+            if same {
+                if want.len == t.len {
+                    return if exact { 3 } else { 2 };
+                }
+                return 1;
+            }
+            k += 1;
+        }
+        0
+    }
+}
+
+// More matches than this: their titles only.
+const SECTION_SHOW_MAX: i64 = 5;
+
+// `query show MODULE::section TITLE` (name is `MODULE::section`): its exit
+// status, or -1 when name is not one (MODULE names no module).
+pub fn show_section(name: [u8], title: [u8]) -> i64 {
+    unsafe {
+        let cut = 9;
+        let module = name[0..name.len - cut];
+        var modules = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_modules(module, false, &modules);
+        if modules.count == 0 && root_stem(module) {
+            modules.push(0);
+        }
+        if modules.count == 0 {
+            return -1;
+        }
+        var all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..modules.count {
+            banners_of_module(modules.data[i], &all);
+        }
+        if title.len == 0 {
+            let d = diag(c"error", c"query.usage");
+            buf_str(d, c"show MODULE::section needs a TITLE\n");
+            try_list(modules.data[0]);
+            return 2;
+        }
+        // The best kind of match, sections before comments.
+        var best = 0;
+        var best_kind = 3;
+        for k in 0..all.count {
+            let i = all.data[k];
+            let m = title_match(i, title);
+            if m > best || (m == best && m > 0 && B_KIND.data[i] < best_kind) {
+                best = m;
+                best_kind = B_KIND.data[i];
+            }
+        }
+        var sel = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..all.count {
+            let i = all.data[k];
+            if best > 0 && title_match(i, title) == best && B_KIND.data[i] == best_kind {
+                sel.push(i);
+            }
+        }
+        if sel.count == 0 {
+            let d = diag(c"error", c"query.no-match");
+            buf_str(d, c"no section '");
+            buf_bytes(d, title);
+            buf_str(d, c"' in ");
+            buf_bytes(d, module);
+            buf_byte(d, '\n');
+            try_list(modules.data[0]);
+            return 1;
+        }
+        let out = buf_new();
+        if sel.count > SECTION_SHOW_MAX {
+            for k in 0..sel.count {
+                put_banner_line(out, sel.data[k]);
+            }
+            buf_write_fd(out, STDOUT);
+            let d = diag(c"error", c"query.ambiguous");
+            buf_int(d, sel.count);
+            buf_str(d, c" sections match '");
+            buf_bytes(d, title);
+            buf_str(d, c"'; showing titles only\n");
+            return 1;
+        }
+        for k in 0..sel.count {
+            put_section(out, sel.data[k]);
+        }
+        buf_write_fd(out, STDOUT);
+        0
+    }
+}
+
+// `try: query items MODULE --comments`.
+fn try_list(m: i64) {
+    unsafe {
+        let t = try_begin(c"items", mod_fqn_text(m), true);
+        buf_str(t, c" --comments");
+        try_end(t);
+    }
+}
+
+// Banner i's section: `// MODULE::section TITLE<TAB>FILE:A-B`, then its
+// lines (at most TEXT_MAX: then a note, and the rest by `query text`).
+fn put_section(out: i64, i: i64) {
+    unsafe {
+        let from = B_START.data[i];
+        let a = line_of(from);
+        let b = line_of(B_LAST.data[i]);
+        let f = crate::front::modules::file_of_pos(from);
+        buf_str(out, c"// ");
+        buf_bytes(out, mod_fqn_text(module_at(from)));
+        buf_str(out, if B_KIND.data[i] == B_SECTION { c"::section " } else { c"::comment " });
+        put_title(out, i);
+        buf_byte(out, '\t');
+        put_path(out, f);
+        buf_byte(out, ':');
+        buf_int(out, a);
+        buf_byte(out, '-');
+        buf_int(out, b);
+        buf_byte(out, '\n');
+        let shown_b = if b - a + 1 > TEXT_MAX { a + TEXT_MAX - 1 } else { b };
+        var p = from;
+        for _ in a..shown_b + 1 {
+            let e = line_end(p);
+            buf_bytes(out, SRC[p..e]);
+            buf_byte(out, '\n');
+            p = e + 1;
+        }
+        if shown_b == b {
+            return;
+        }
+        let d = diag(c"note", c"query.truncated");
+        buf_str(d, c"the section has ");
+        buf_int(d, b - a + 1);
+        buf_str(d, c" lines; showing ");
+        buf_int(d, TEXT_MAX);
+        buf_byte(d, '\n');
+        let w = buf_new();
+        put_path(w, f);
+        buf_byte(w, ':');
+        buf_int(w, shown_b + 1);
+        buf_byte(w, '-');
+        buf_int(w, if b - shown_b > TEXT_MAX { shown_b + TEXT_MAX } else { b });
+        try_query(c"text", buf_slice(w));
+    }
+}

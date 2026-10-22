@@ -1,6 +1,6 @@
 # Roadmap
 
-Where tachyon is going, release by release. Each release is built by the
+Where vole is going, release by release. Each release is built by the
 previous one (see [releases.md](releases.md)): a language feature introduced in
 release N may be *used in the compiler's own source* only from N+1.
 
@@ -25,7 +25,7 @@ x86_64-linux:
   equivalent;
 - the agents' tool use is traced (`tools/agent-tool-usage.py`, the hook's
   log): what share of reading, searching and editing went through
-  `tachyonc` rather than the shell, and why the rest did not; the gaps
+  `volec` rather than the shell, and why the rest did not; the gaps
   feed the next release's tools.
 
 The gate is one command (from 0.11; [releases.md](releases.md), "The
@@ -60,7 +60,7 @@ The reference points: **Cranelift** does SSA, e-graph-based rewriting
 (GVN, constant folding, algebraic simplification, LICM, redundant load
 elimination) and regalloc2, but no inlining, no loop transformations, no
 vectorization and no interprocedural analysis. **LLVM -O2** does all of
-those. Tachyon should pass Cranelift around 0.5 and work toward LLVM from
+those. Vole should pass Cranelift around 0.5 and work toward LLVM from
 there.
 
 ## 0.2: a middle end
@@ -71,7 +71,7 @@ The foundation every later release builds on. Design and status in
 - [x] SSA IR (CFG of typed virtual registers, Braun et al. construction),
   printer (`--emit-ir`), verifier after every pass
   (`--verify-ir`), `--print-after-all`
-- [x] mem2reg (as part of SSA construction), SCCP (with tachyon's folding
+- [x] mem2reg (as part of SSA construction), SCCP (with vole's folding
   semantics), copy propagation (by replacement), dead code elimination
   (mark and sweep), CFG simplification. *Aggressive* DCE over control
   dependence (removing dead loops and branches) moves to 0.4, with dead
@@ -124,7 +124,7 @@ Optimizations:
 
 ## C interop track
 
-C compatibility is opt-in, as in Rust: the layout of tachyon's own types
+C compatibility is opt-in, as in Rust: the layout of vole's own types
 and the convention of its own functions are unspecified; where C is asked
 for, it is exact.
 
@@ -142,12 +142,12 @@ for, it is exact.
   compiler does (its predefined macros and include path come from
   `cc -dM -E -v`): a C preprocessor (`#include_next`, `#pragma once`,
   `#pragma pack`, GNU variadic macros, `__has_include`) and a declaration
-  reader in tachyon, written out as tachyon source (`--emit-imports`
+  reader in vole, written out as vole source (`--emit-imports`
   shows it): `#[repr(C)]` records with C's layout (bit-fields, `packed`,
   `aligned` and `#pragma pack` as explicit padding or `packed(N)`),
   typedefs and enums as aliases, enumerators and constant macros as
   constants, macro aliases of variables and functions, an `extern "C"`
-  block with `#[link_name]` for asm-label renames; what tachyon cannot
+  block with `#[link_name]` for asm-label renames; what vole cannot
   express (long double on x86-64, `_Complex`, `__int128`, vectors,
   thread-local variables, static and inline functions) is left out and
   named, with the reason, when used. `--emit-header` writes the C header
@@ -251,7 +251,7 @@ The back end, in two stages (design and status in
   simulating the allocation, and `--print-regalloc`
 - [x] frame elision for leaf functions; sibling calls (tail calls to
   callees taking no stack arguments, at -O2)
-- [x] (stage B1) a tachyon calling convention of its own for plain
+- [x] (stage B1) a vole calling convention of its own for plain
   functions at -O1/-O2: 16 integer and 16 float argument registers on
   AArch64 (7 and 14 on x86-64), aggregates of up to four pieces passed and
   returned in registers by their leaves (or 8-byte chunks), results as IR
@@ -263,7 +263,7 @@ The back end, in two stages (design and status in
 
 Stage B:
 
-- [x] instruction selection by rules (`isel.tach`): a per-target rule
+- [x] instruction selection by rules (`isel.vl`): a per-target rule
   table tiling each block's SSA DAG by maximal munch into machine
   operations the allocator sees like any instruction: scaled-index
   addressing (AArch64 `[x, x, lsl #s]`, x86-64 `d(b, i, s)`, frame slots
@@ -274,7 +274,7 @@ Stage B:
   macOS and `fabs`/`floor`/`ceil`/`trunc`/`round` on AArch64 as
   instructions; branches on phis threaded into their predecessors, a
   branch on its predecessor's condition decided
-- [x] block layout (`layout.tach`): chains by fall-through from static
+- [x] block layout (`layout.vl`): chains by fall-through from static
   edge weights (loop depth, back edges, cold panic paths last), and tail
   duplication of small blocks at emission (threaded dispatch in
   interpreters, loop rotation by layout), small epilogues inlined
@@ -369,7 +369,7 @@ matters to agents above all.
   stay. The prelude (a fixed, documented list) is not a wildcard.
 - `import "h.h";` (every declaration of a header in scope) is removed;
   `import "h.h" as c;` and `c::printf(...)` stay.
-- `tachyonc --fix-imports FILE...` rewrites both forms into what replaces
+- `volec --fix-imports FILE...` rewrites both forms into what replaces
   them, listing the names the code actually uses; the errors for the
   removed forms suggest the same.
 - the compiler's own source moves to explicit imports first (while 0.7.0
@@ -380,7 +380,7 @@ matters to agents above all.
 **0.9 status** (work in progress on branch `release-0.9`):
 
 - done: `unsafe` blocks and `unsafe fn`, borrows, `warning[unsafe]`,
-  `--deny-warnings`, `--allow-unsafe` (bootstrap interface `tachyonc-0.9`),
+  `--deny-warnings`, `--allow-unsafe` (bootstrap interface `volec-0.9`),
   `--fix-unsafe`; std, tests, examples, bench and fuzzers migrated.
   Traits: declarations with defaults, impls for any type, generic impls
   with bounds, bounds on functions, structs and enums, coherence,
@@ -388,10 +388,10 @@ matters to agents above all.
   for the primitives and `[u8]`, `HashMap`, `sort`
   Small fixes: array constants, strings in static aggregates, line
   continuations in strings, `if c { Some(x) } else { None }` inference,
-  `$TACHYON_CC` for importing C headers when cross-compiling
+  `$VOLE_CC` for importing C headers when cross-compiling
   E-graph: GVN's table is an acyclic e-graph (Cranelift's aegraph) with
   31 rewrite rules in a small pattern language, cost-based extraction,
-  and `tachyonc --check-rules` (randomized differential checking of
+  and `volec --check-rules` (randomized differential checking of
   every rule at every integer width); `--no-egraph` to compare
 - gate (on 249e3d1): bootstrap --dev fixpoint ok, 346 tests at -O0/1/2
   on aarch64-macos and x86_64-macos, fuzz 200 per mode, ABI 50 (plain,
@@ -423,11 +423,11 @@ written against 0.5's unbounded generics mean.
 
 - done: the compiler's own source migrated to unsafe code (whole
   function bodies in `unsafe { ... }` where a function has several
-  unsafe operations, `tachyonc --fix-unsafe` for the rest; the compilers
+  unsafe operations, `volec --fix-unsafe` for the rest; the compilers
   built before and after are byte-identical, and tests/compare.sh finds
   9281 of 9281 compilations identical); unsafe operations outside unsafe
   code are errors (`error[unsafe]`), `--allow-unsafe` is gone, and the
-  bootstrap interface `tachyonc-0.10` builds HEAD
+  bootstrap interface `volec-0.10` builds HEAD
 - done: vector types (`v2f64` ... `v16i8`; grammar.md "Additions of
   0.10"): lanewise operators, masks, select, lanes, sums, checked loads
   and stores; -O0 lane by lane; IR vector instructions (vbin, vcmp,
@@ -436,7 +436,7 @@ written against 0.5's unbounded generics mean.
   emitters and both encoders; vectors in the float registers (never
   d8-d15, whose upper halves calls do not keep), 16-byte spill slots;
   not FFI-safe
-- done: loop vectorizer (vectorize.tach): innermost counted loops with
+- done: loop vectorizer (vectorize.vl): innermost counted loops with
   unit-stride loads and stores of one type and integer reductions, a
   vector loop guarded at run time (bounds checks proven for the whole
   loop, no overlap between stores and other accesses) and the original
@@ -446,7 +446,7 @@ written against 0.5's unbounded generics mean.
   overlapping slices, checks failing part way
 - done: vector loops of small bodies run two vectors an iteration (own
   accumulators); invariant splats before the loop; optimizer.md "0.10"
-- done: profile-guided optimization (profile.tach): `--profile-generate
+- done: profile-guided optimization (profile.vl): `--profile-generate
   FILE` (block counters, written at exit by a small runtime added to the
   program), `--profile-use FILE` (counts per function, checked by a
   checksum of its IR: stale profiles ignored with a warning) for block
@@ -457,7 +457,7 @@ written against 0.5's unbounded generics mean.
   reassociated); loads at invariant addresses kept scalar under the
   overlap test; overlap tests by groups of accesses
 - done: a checking mode for unsafe code (`--check-unsafe`,
-  unsafecheck.tach): raw-pointer accesses checked against the heap blocks
+  unsafecheck.vl): raw-pointer accesses checked against the heap blocks
   the program allocated (out of bounds, use after free, double free); the
   compiler compiled with it compiles itself to the same output
 - done: every error in one compilation (grammar.md "Error recovery"):
@@ -507,7 +507,7 @@ The last release of the build-out.
 
 0.11 A status (DWARF line tables, aarch64-linux):
 
-- aarch64-linux target: done (AAPCS64 in abi.tach and both back ends, ELF
+- aarch64-linux target: done (AAPCS64 in abi.vl and both back ends, ELF
   objects with R_AARCH64_* relocations and mapping symbols, `import`);
   tests, fuzz, ABI (three modes) and objcheck pass in a linux/arm64
   container
@@ -556,15 +556,15 @@ suite on x86_64-macos (Rosetta on the test machine, as for part A).
 
 ## 0.11 (continued): tools for agents
 
-`tachyonc query` (def, show, refs, callers, items; fully qualified paths
+`volec query` (def, show, refs, callers, items; fully qualified paths
 in and out; see docs/query.md) and the agent harness's query-first test
 (AGENTS.md, tools/agent-hooks/), then the refactoring toolkit, measured
 by docs/agent-tool-usage.md:
 
-- edit by name: `tachyonc edit replace|insert|delete NAME` (no reading a
+- edit by name: `volec edit replace|insert|delete NAME` (no reading a
   file to change one item)
-- `tachyonc check` (front end only, short diagnostics), `tachyonc fix`
-  (every machine-applicable fix), `tachyonc same-output OLD` (a pure
+- `volec check` (front end only, short diagnostics), `volec fix`
+  (every machine-applicable fix), `volec same-output OLD` (a pure
   refactor proven to change nothing)
 - semantic refactors, atomic (checked after editing, nothing written on
   failure), one summary line each: `refactor rename`, `move`, `signature`,
@@ -572,7 +572,7 @@ by docs/agent-tool-usage.md:
   structural `rewrite`; `refactor --script` batches; `--dry-run`, `--undo`
 - planning queries: `query stats` (sizes), `query deps` (what references
   what inside a module), `query unused`, `query impact`
-- `tachyonc lint --max-lines N`
+- `volec lint --max-lines N`
 - every diagnostic: one line with a stable code, then `try:` lines with
   the exact command; large outputs summarized
 
@@ -616,10 +616,10 @@ compile times in "Benchmarks", 0.12. Not run: the suite on x86_64-macos
 What 0.12's refactoring showed the tools lacked, fixed and measured
 again.
 
-- `tachyonc guide` (`compiler/guide/`, `compiler/src/guide/`): the
+- `volec guide` (`compiler/guide/`, `compiler/src/guide/`): the
   language for a reader who has never seen it, built into the compiler:
   the core guide by default (about 5k tokens: Rust habits and what
-  tachyon has instead, the essentials, std's API generated from std's
+  vole has instead, the essentials, std's API generated from std's
   source, the first errors, the tools), `guide TOPIC` for the detail,
   `guide --list` with each topic's size. `tests/guide/run.sh` (category
   `guide`) compiles and runs every example, checks the std section
@@ -632,9 +632,9 @@ subtree); query completeness (banners and sections, `query grep`, `query
 type`, kinds of references); the tools' cache (a query or `check` of an
 unchanged program in about 6 to 8 ms instead of about 60); refactor
 (`split` part names, layout kept so a move and the move back change
-nothing, `extract-function`, `inline`); `tachyonc fmt`, with the tree
-formatted (same-output identical to 0.12.0), and `tachyonc explain`;
-`tachyonc guide`. 83% of the edits to existing compiler source went
+nothing, `extract-function`, `inline`); `volec fmt`, with the tree
+formatted (same-output identical to 0.12.0), and `volec explain`;
+`volec guide`. 83% of the edits to existing compiler source went
 through the tools, every one of the feature agents' on files that existed
 before they began (agent-tool-usage.md, "0.13: the tools, built with the
 tools").
@@ -655,17 +655,17 @@ three, objcheck, layouts, gdb). Not run here: the benchmarks (`gate.sh
 
 From here a feature new in release N enters the compiler's own source in N+1
 (migrated with the refactoring tools; breaking changes come with a
-`tachyonc fix` migration).
+`volec fix` migration).
 
 - the agent eval (`tests/agent-eval/`): about twelve fixed tasks (write a
   hash map, fix a parser bug, port a C program, add a compiler pass,
   refactor a module, a CLI tool, ...) with hidden acceptance tests, each
-  given to a fresh agent with only `tachyonc guide` and the docs;
+  given to a fresh agent with only `volec guide` and the docs;
   measured: success rate, tokens, tool calls, compile-fix iterations.
   Baseline on 0.13; no release may regress it, and language changes must
   improve it. Each task has a Rust twin (same specification, same hidden
   tests) as the control: a language the models know against one they do
-  not; tachyon runs in four conditions (compiler only, with the guide,
+  not; vole runs in four conditions (compiler only, with the guide,
   with the tools and `try:` diagnostics, with both) to show what each
   contributes; models of several sizes, hosted (small, mid, large) and
   local (e.g. Qwen3-Coder through any OpenAI-compatible server, driven by a
@@ -686,7 +686,7 @@ From here a feature new in release N enters the compiler's own source in N+1
 - candidates from 0.13's record (agent-tool-usage.md, "0.13"): `edit
   insert` adding a new item's imports in the same edit; `split --items`
   moving a section's banner with it; `edit patch FILE:LINE` on a comment
-  line outside items; merge conflicts in `.tach` files (a query of the
+  line outside items; merge conflicts in `.vl` files (a query of the
   regions, `edit resolve`)
 
 Done (0.14.0). The agent eval first (twelve tasks with Rust twins,
@@ -703,12 +703,12 @@ associated types (needed by `Iterator`, with constraints and lazy
 defaults); iterators (`for` over anything iterable, ranges as values,
 `map`, `filter`, `enumerate`, `zip`, `take`, `fold`, `for_each`,
 `count`, `sum`, `min`, `max`, `collect`, `sort_by`; slices, `Vec`,
-ranges and `HashMap` iterable); zero cost (bench/iterchain.tach against
-bench/iterloop.tach, held by `bench/run.sh` at a ratio of at most 1.05);
+ranges and `HashMap` iterable); zero cost (bench/iterchain.vl against
+bench/iterloop.vl, held by `bench/run.sh` at a ratio of at most 1.05);
 the tools, fmt and the guide on closures. Of 0.13's tool candidates,
 `edit insert` adding imports, `split` moving a banner with its group and
 `edit patch FILE:LINE` between items are done. Moved: merge conflicts in
-`.tach` files (docs/tool-gaps-014.md, gap 8) to a later release;
+`.vl` files (docs/tool-gaps-014.md, gap 8) to a later release;
 `iter_mut` to 0.17's value semantics (indexing until then); `collect`
 into anything but a `Vec`, and returning closures (`impl Fn`), to a
 later release. Fixed on the way: three reads of freed memory (slicing
@@ -765,7 +765,7 @@ docs/tool-gaps-014.md (`query context` and budgets, std from any
 program, names in every printed spelling, `try`, `batch`, `edit apply`
 and several targets, `edit.breaks` hints, merge conflicts through `query
 conflicts` and `edit resolve` (0.14's moved gap 8), `--json`, the check
-hook, `target/tools/tachyonc`); the compiler's back end, gen0 and base on
+hook, `target/tools/volec`); the compiler's back end, gen0 and base on
 closures and iterators. Decided at integration: `i64::MAX` and the other
 integer limits as builtin constants (no associated constants in general
 yet); `==` on `Vec`, `Buf` and `HashMap` by contents. std doubled in size
@@ -882,7 +882,7 @@ run (off from 0.15). Benchmarks and compile times in "Benchmarks", 0.16.
   moves and destructors free through it; values in an arena skip
   per-value destruction, and second-class references keep arena data from
   outliving its scope. One design covers ownership and allocation
-- `tachyonc fix --values` migrates the common patterns (manual `free` to
+- `volec fix --values` migrates the common patterns (manual `free` to
   destructors, stored slices to owned copies or indices) and gives exact
   diagnostics for the rest
 - the largest design change of the plan: a design document and a
@@ -977,7 +977,7 @@ Moved to 0.17.1:
   a read-only `s` as own.readonly, a closure parameter's call as a legacy
   `self: *Self` store, a Vec made on an allocator copied out of `*p`;
   why-chains through locals and matches, the type filter on stores,
-  `query own`'s state gaps, closures/escape.tach folded into the own pass;
+  `query own`'s state gaps, closures/escape.vl folded into the own pass;
 - `fix --values`: written slice locals (`as_mut_slice()`, 45 of the eval
   solutions' 92 errors), `&mut *c` for a `&T` local, a slice passed to C;
 - the optimizer: noalias scopes through inlining (per-instruction tags),
@@ -997,8 +997,8 @@ Moved to 0.17.1:
   exits with 101, like any check); the optimizer removes a check only
   where range analysis proves it, never by assuming it
 - `test` blocks; `#[property]` tests with generators derived from the
-  types; `#[fuzz]` entry points; snapshot tests; `tachyonc test` (with the
-  `-O0` against `-O2` comparison built in) and `tachyonc reduce`
+  types; `#[fuzz]` entry points; snapshot tests; `volec test` (with the
+  `-O0` against `-O2` comparison built in) and `volec reduce`
 - `type X = distinct T`; non-null pointer types
 - the compiler's source moves to mutable value semantics (0.17) and to
   arenas: the syntax tree and types in one per compilation, the IR in one
@@ -1032,8 +1032,8 @@ contracts and check positions (T1, T5: `requires`/`ensures`, the
 assertions, std's clauses, the site table and one failure line, `query
 checks`, `--no-positions`); tests and properties (T2: `#[test]`,
 `#[cfg(test)]`, snapshots, `#[property]` with generated, shrunk inputs,
-`tachyonc test` comparing -O0 and -O2); fuzzing and reduce (T3:
-`--coverage`, `#[fuzz]`, `tachyonc fuzz`, `reduce --differs/--fails/
+`volec test` comparing -O0 and -O2); fuzzing and reduce (T3:
+`--coverage`, `#[fuzz]`, `volec fuzz`, `reduce --differs/--fails/
 --test`); distinct types and `NonNull` (T4: the null niche, the checked
 cast). Also in 0.18: std's `Display`, `Debug`, `Iterator` and `Clone`
 on references and `fix --values` over traits, with the corpus moved;
@@ -1102,9 +1102,9 @@ Moved to 0.18.1:
   files, candidates checked in the process;
 - distinct types: field access through a distinct struct, `!` on a
   distinct bool, a distinct type's `invariant`;
-- the gate: the level comparison over tests/run as `tachyonc test` runs
+- the gate: the level comparison over tests/run as `volec test` runs
   it, a fuzz mode whose programs carry clauses, the `-j` and incremental
-  byte comparisons, `TACHYON_ARENA_SHUFFLE`, a valgrind row on
+  byte comparisons, `VOLE_ARENA_SHUFFLE`, a valgrind row on
   aarch64-linux (0.17.0's gate found two heap bugs macOS hid), a lock on
   bootstrap.sh's shared release cache;
 - compile time: std's text built by section as it is loaded (a small
@@ -1184,7 +1184,7 @@ no-UB rule. It comes before the standard library build-out, which uses it
   `prefetch`, `spin_loop`, `wide_mul` (128-bit product), with
   constant folding
 - target features: `#[target_feature(enable = "avx2")]` on a function;
-  `tachyonc -C target-cpu=native|NAME` and `-C target-feature=+x,-y`; a
+  `volec -C target-cpu=native|NAME` and `-C target-feature=+x,-y`; a
   build's baseline features are known at compile time
   (`std::arch::has::<"neon">()` constant-folds)
 - no UB: an instruction the CPU lacks must never run. A
@@ -1285,7 +1285,7 @@ std as a module tree with a benchmark harness against Rust and C
 and BTreeSet, ipnsort and driftsort, slice algorithms), text (String,
 str, std::unicode, number formatting and parsing), I/O and the system
 (io, fs, path, env, process, time, random, sys), owned temporaries
-dropped at the statement's end, and `tachyonc lsp`
+dropped at the statement's end, and `volec lsp`
 (docs/design/collections-text-io.md for std's parts).
 
 The release gate (`gate.sh --release --no-x86`, 22:15 wall at load up
@@ -1311,7 +1311,7 @@ Moved to 0.20.1 or 0.21:
   other than a closure literal;
 - `fix --only conventions`: the `&` of an inout argument in an
   f-string hole, `Iterator::at`'s convention in impls;
-- `query def` of std's statics' symbols (`tachyon.static.std.X`);
+- `query def` of std's statics' symbols (`vole.static.std.X`);
 - the own pass over std's own functions (two -O0 wrong-output bugs of
   std slipped through without it before the tag);
 - compile time: a small std program does about 270 M more instructions
@@ -1354,14 +1354,14 @@ safe (Drop on view types), x86-64 atomics run.
 
 - a native `gpu` library: wgpu's model (instance, adapter, device, queue,
   buffers, textures, samplers, bind groups, render and compute pipelines,
-  command encoders, surfaces), but designed for tachyon rather than
+  command encoders, surfaces), but designed for vole rather than
   ported: resources as values with destructors (0.17), allocation through
   allocators (0.16), effects for what touches the device, traits for the
   backend interface, contracts for the validation rules
 - backends: Metal first (macOS is the main platform), Vulkan second
   (Linux); through C interop: `import "..." as` for Vulkan and the
   Objective-C runtime for Metal (`objc_msgSend` behind typed bindings)
-- shaders: a WGSL subset compiled by a tachyon library to MSL and SPIR-V
+- shaders: a WGSL subset compiled by a vole library to MSL and SPIR-V
   (a translator in the manner of naga; a compiler workload that dogfoods
   the language)
 - tested headless: compute kernels against CPU results, render passes
@@ -1434,7 +1434,7 @@ through and stable, after as many 0.11.x / 0.12+ iterations as that takes:
   ergonomics, naming; anything breaking settled before 1.0
 - tools: a language server (editor support), a formatter, build and
   package workflow, documentation generation
-- stability: long-running fuzzing, real programs in tachyon beyond the
+- stability: long-running fuzzing, real programs in vole beyond the
   compiler, no known miscompiles
 - making the language and its tools work for agents as well as people:
   ideas collected in [agents.md](agents.md)
@@ -1578,7 +1578,7 @@ by 0.5, compiling its own source. All builds print identical output.
 
 0.5 -O2 code runs about 1.4× faster than the seed's here. The compilers
 themselves are about as fast; the end-to-end build is slower because
-tachyon emits textual assembly (about 1 MB here) that `cc` assembles.
+vole emits textual assembly (about 1 MB here) that `cc` assembles.
 
 ### 0.6
 
@@ -1727,8 +1727,8 @@ compilers alternating on the same input: the 0.11 source, 71,900 lines):
 | the compiler to an object, -O2 | 1208 ms | 1206 ms |
 | to an executable (`cc` links), -O0 | 184 ms | 171 ms |
 | to an executable (`cc` links), -O2 | 1231 ms | 1232 ms |
-| `tachyonc check compiler/src/main.tach` | | 44 ms |
-| `tachyonc query refs vector_unroll` | | 49 ms |
+| `volec check compiler/src/main.vl` | | 44 ms |
+| `volec query refs vector_unroll` | | 49 ms |
 
 The 0.11 compiler, built by itself, compiles the same input at -O2 as
 fast as 0.10.0 (its new passes cost about what its better-optimized code
@@ -1762,7 +1762,7 @@ programs with a C version only):
 | geomean vs cc -O2 | 0.957 | 0.963 | 1 |
 
 (-O0 and -O1 in the same run: geomean 6.843 and 1.344.) The generated
-code is 0.11.0's byte for byte: `tachyonc same-output` against the
+code is 0.11.0's byte for byte: `volec same-output` against the
 0.11.0 compiler is identical over the whole corpus (4,668 compilations:
 tests/run, examples, bench and compiler/src, four targets, -O0 to -O2),
 so the differences above are this machine's spread (the gate's own
@@ -1779,8 +1779,8 @@ files):
 | the compiler to an object, -O2 | 1316 ms | 1315 ms |
 | to an executable (`cc` links), -O0 | 194 ms | 195 ms |
 | to an executable (`cc` links), -O2 | 1347 ms | 1350 ms |
-| `tachyonc check compiler/src/main.tach` | 60 ms | 60 ms |
-| `tachyonc query refs run_gvn` | 65 ms | 66 ms |
+| `volec check compiler/src/main.vl` | 60 ms | 60 ms |
+| `volec query refs run_gvn` | 65 ms | 66 ms |
 
 The same within noise, as expected of a reorganization that changes no
 output (the 0.11 numbers above were on the 0.11 source, 71,900 lines; the
@@ -1817,7 +1817,7 @@ cc -O2's, programs with a C version only):
 | geomean vs cc -O2 | 0.966 | 0.939 | 1 |
 
 (-O0 and -O1 in the same run: geomean 6.770 and 1.359.) The generated
-code is 0.12.0's byte for byte: `tachyonc same-output` against the
+code is 0.12.0's byte for byte: `volec same-output` against the
 0.12.0 compiler is identical over the whole corpus (4,668 compilations,
 as for 0.12), so the differences above are this machine's spread under
 load: interp's 64 against 47 ms and json's 127 against 110 are the same
@@ -1835,10 +1835,10 @@ slower than 0.12's on an emptier one):
 | the compiler to an object, -O2 | 1613 ms | 1633 ms |
 | to an executable (`cc` links), -O0 | 230 ms | 228 ms |
 | to an executable (`cc` links), -O2 | 1713 ms | 1738 ms |
-| `tachyonc check compiler/src/main.tach`, no cache | 74 ms | 73 ms |
-| `tachyonc query refs run_gvn`, no cache (`TACHYON_CACHE=off`) | 80 ms | 86 ms |
-| `tachyonc check compiler/src/main.tach`, cache warm | | 6.8 ms |
-| `tachyonc query refs run_gvn`, cache warm | | 7.2 ms |
+| `volec check compiler/src/main.vl`, no cache | 74 ms | 73 ms |
+| `volec query refs run_gvn`, no cache (`VOLE_CACHE=off`) | 80 ms | 86 ms |
+| `volec check compiler/src/main.vl`, cache warm | | 6.8 ms |
+| `volec query refs run_gvn`, cache warm | | 7.2 ms |
 
 Compiling is the same within noise (the -O2 rows 1 to 1.5% apart, the
 output identical). Without the cache, `query refs` is a few ms slower
@@ -1903,10 +1903,10 @@ the same within a few percent each way but for a busier `check`):
 |---|---|---|
 | the compiler to an object, -O0 | 226 ms | 231 ms |
 | the compiler to an object, -O2 | 1901 ms | 1950 ms |
-| `tachyonc check compiler/src/main.tach`, no cache | 79 ms | 81 ms |
-| `tachyonc query refs run_gvn`, no cache (`TACHYON_CACHE=off`) | 93 ms | 103 ms |
-| `tachyonc check compiler/src/main.tach`, cache warm | 6.7 ms | 6.9 ms |
-| `tachyonc query refs run_gvn`, cache warm | 7.0 ms | 7.3 ms |
+| `volec check compiler/src/main.vl`, no cache | 79 ms | 81 ms |
+| `volec query refs run_gvn`, no cache (`VOLE_CACHE=off`) | 93 ms | 103 ms |
+| `volec check compiler/src/main.vl`, cache warm | 6.7 ms | 6.9 ms |
+| `volec query refs run_gvn`, cache warm | 7.0 ms | 7.3 ms |
 | a 7-line std program to an object, -O2 | 4.4 ms | 4.7 ms |
 
 0.14 is 2 to 3% slower to compile the compiler, in both runs: at -O2,
@@ -1972,10 +1972,10 @@ files; load average about 4.5):
 |---|---|---|
 | the compiler to an object, -O0 | 303 ms | 300 ms |
 | the compiler to an object, -O2 | 2423 ms | 2399 ms |
-| `tachyonc check compiler/src/main.tach`, no cache | 97 ms | 100 ms |
-| `tachyonc query refs run_gvn`, no cache (`TACHYON_CACHE=off`) | 121 ms | 135 ms |
-| `tachyonc check compiler/src/main.tach`, cache warm | 8.7 ms | 8.9 ms |
-| `tachyonc query refs run_gvn`, cache warm | 10.1 ms | 9.5 ms |
+| `volec check compiler/src/main.vl`, no cache | 97 ms | 100 ms |
+| `volec query refs run_gvn`, no cache (`VOLE_CACHE=off`) | 121 ms | 135 ms |
+| `volec check compiler/src/main.vl`, cache warm | 8.7 ms | 8.9 ms |
+| `volec query refs run_gvn`, cache warm | 10.1 ms | 9.5 ms |
 | a 7-line std program to an object, -O0 | 3.2 ms | 2.9 ms |
 | a 7-line std program to an object, -O2 | 5.0 ms | 5.0 ms |
 
@@ -2056,8 +2056,8 @@ files; load average about 1.3):
 | the compiler to an object, -O0 | 299 ms | 298 ms |
 | the compiler to an object, -O1 | 851 ms | 856 ms |
 | the compiler to an object, -O2 | 2596 ms | 2502 ms |
-| `tachyonc check compiler/src/main.tach`, no cache | 114 ms | 117 ms |
-| `tachyonc query refs run_gvn`, no cache | 149 ms | 158 ms |
+| `volec check compiler/src/main.vl`, no cache | 114 ms | 117 ms |
+| `volec query refs run_gvn`, no cache | 149 ms | 158 ms |
 | a 7-line std program to an object, -O0 | 2.8 ms | 3.0 ms |
 | a 7-line std program to an object, -O2 | 5.7 ms | 6.8 ms |
 
@@ -2074,7 +2074,7 @@ inline, which user programs pay too; the fix belongs to the f-string
 lowering, in 0.17's compile-speed work, not to reverting the compiler's
 f-strings. The small std program compiles 0.2 ms slower at -O0 and 1.1
 ms at -O2: std's allocation layer (the Allocator trait, Gpa's methods
-inlined, alloc.tach's sections) and, at -O2, the effects the optimizer
+inlined, alloc.vl's sections) and, at -O2, the effects the optimizer
 reads (at -O0 inference is skipped when nothing reads it).
 
 ### 0.17
@@ -2128,15 +2128,15 @@ against 70 then.
 
 Compile time (aarch64-macos, wall time, best of 7, the two compilers
 alternating on the same input: 0.17's source, 150,200 lines in 315
-files; `TACHYON_CACHE=off`; load average 2.3 to 5.9):
+files; `VOLE_CACHE=off`; load average 2.3 to 5.9):
 
 | | 0.16.0 | 0.17 |
 |---|---|---|
 | the compiler to an object, -O0 | 370 ms | 318 ms (-14%) |
 | the compiler to an object, -O1 | 1104 ms | 815 ms (-26%) |
 | the compiler to an object, -O2 | 3134 ms | 1967 ms (-37%) |
-| `tachyonc check compiler/src/main.tach` | 143 ms | 154 ms (+7.6%) |
-| `tachyonc query refs run_gvn` | 188 ms | 202 ms (+7.6%) |
+| `volec check compiler/src/main.vl` | 143 ms | 154 ms (+7.6%) |
+| `volec query refs run_gvn` | 188 ms | 202 ms (+7.6%) |
 | a small std program to an object, -O0 | 3.3 ms | 3.5 ms |
 | a small std program to an object, -O2 | 6.1 ms | 6.0 ms |
 
@@ -2229,8 +2229,8 @@ copy outside the tree; no query cache):
 | the compiler to an object, -O0 | 376 ms / 7.33 G / 343 MB | 386 ms / 7.50 G / 352 MB |
 | the compiler to an object, -O1 | 932 ms / 14.09 G / 439 MB | 943 ms / 14.29 G / 441 MB |
 | the compiler to an object, -O2 | 2193 ms / 35.41 G / 580 MB | 2185 ms / 35.61 G / 581 MB |
-| `tachyonc check compiler/src/main.tach` | 181 ms / 3.23 G | 183 ms / 3.28 G |
-| `tachyonc query refs run_gvn` | 241 ms / 4.23 G | 251 ms / 4.45 G |
+| `volec check compiler/src/main.vl` | 181 ms / 3.23 G | 183 ms / 3.28 G |
+| `volec query refs run_gvn` | 241 ms / 4.23 G | 251 ms / 4.45 G |
 | a small std program to an object, -O0 | 3.9 ms / 47 M | 4.6 ms / 57 M |
 | a small std program to an object, -O2 | 6.7 ms / 79 M | 7.3 ms / 91 M |
 
@@ -2290,8 +2290,8 @@ Compile time (aarch64-macos, best of 5 alternating, wall, load 2 to 6;
 | the compiler to an object, -O1 | 873 ms | 392 ms |
 | the compiler to an object, -O2 | 2150 ms / 37.17 G / 613 MB | 765 ms / 36.46 G / 684 MB |
 | the same at -j1 | 37.16 G | 36.34 G / 651 MB |
-| `tachyonc check compiler/src/main.tach` | 177 ms / 3.48 G | 189 ms / 3.73 G |
-| `tachyonc query refs run_gvn` | 238 ms | 253 ms |
+| `volec check compiler/src/main.vl` | 177 ms / 3.48 G | 189 ms / 3.73 G |
+| `volec query refs run_gvn` | 238 ms | 253 ms |
 | a small std program to an object, -O0 | 3.9 ms / 57 M | 4.1 ms / 63 M |
 | a small std program to an object, -O2 | 6.5 ms | 6.1 ms |
 
@@ -2342,7 +2342,7 @@ retired; 0.19's source in a copy outside the tree; no cache):
 | the compiler to an object, -O0 | 347 ms / 8.84 G | 373 ms / 9.33 G |
 | -O1 | 438 ms | 450 ms |
 | -O2 (-j8; -j1 instructions) | 834 ms / 39.65 G | 855 ms / 40.21 G |
-| `tachyonc check` | 209 ms / 4.11 G | 220 ms / 4.27 G |
+| `volec check` | 209 ms / 4.11 G | 220 ms / 4.27 G |
 | a small std program, -O0 / -O2 | 4.1 / 6.2 ms | 4.2 / 6.3 ms |
 
 The -O0 self-compile does 5.5% more instructions: the feature analysis
@@ -2386,7 +2386,7 @@ source against 0.20's, one run each):
 The pairs: iterchain/iterloop 0.974, fmtloop/fmtints 0.957,
 purecall/purecall_hoisted 1.000.
 
-bench/std (`bench/std/run.sh -r 3`, tachyon's time over the baseline's;
+bench/std (`bench/std/run.sh -r 3`, vole's time over the baseline's;
 Rust with the same hash where marked): hash_u64 0.98 (rust:fold), 0.62
 (Rust's default), 0.61 (C); hash_str 1.07, 0.81, 0.81; hash_churn 1.05,
 0.69, 0.73; btree_u64 0.86 (Rust), 1.00 (C); sort_unstable 1.16 (Rust),

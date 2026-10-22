@@ -1,6 +1,6 @@
 // bench/std: the str_ops loop by hand in C (memchr for the line and the
 // fields, a trim, a decimal parse, memmem-like search for "ab"): 2,000,000
-// CSV-like lines, three times. Prints what str_ops.tach prints.
+// CSV-like lines, three times. Prints what str_ops.vl prints.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

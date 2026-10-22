@@ -1,0 +1,433 @@
+// ---- Shader compiler implementation, lex (0.22) ----
+// The WGSL lexer: the whole source becomes arrays of tokens (kind, start,
+// end, and for an identifier its symbol). Identifiers are interned: the
+// predeclared names (names.vl) have fixed symbols, so the parser
+// compares integers. Comments (`//`, nesting `/* */`) and blanks are
+// skipped.
+
+use ir::V;
+use names::PREDECLARED;
+use std::{HashMap, ScopedArena, Vec};
+use std::Option::{None, Some};
+
+pub const T_EOF: u8 = 0;
+pub const T_IDENT: u8 = 1;
+// an integer literal: its text is start .. end, the suffix included
+pub const T_INT: u8 = 2;
+pub const T_FLOAT: u8 = 3;
+pub const T_LPAREN: u8 = 4;
+pub const T_RPAREN: u8 = 5;
+pub const T_LBRACE: u8 = 6;
+pub const T_RBRACE: u8 = 7;
+pub const T_LBRACKET: u8 = 8;
+pub const T_RBRACKET: u8 = 9;
+pub const T_COMMA: u8 = 10;
+pub const T_SEMI: u8 = 11;
+pub const T_COLON: u8 = 12;
+pub const T_DOT: u8 = 13;
+pub const T_AT: u8 = 14;
+pub const T_ARROW: u8 = 15;
+pub const T_EQ: u8 = 16;
+pub const T_EQEQ: u8 = 17;
+pub const T_NE: u8 = 18;
+pub const T_LT: u8 = 19;
+pub const T_LE: u8 = 20;
+pub const T_GT: u8 = 21;
+pub const T_GE: u8 = 22;
+pub const T_PLUS: u8 = 23;
+pub const T_MINUS: u8 = 24;
+pub const T_STAR: u8 = 25;
+pub const T_SLASH: u8 = 26;
+pub const T_PERCENT: u8 = 27;
+pub const T_AMP: u8 = 28;
+pub const T_PIPE: u8 = 29;
+pub const T_CARET: u8 = 30;
+pub const T_TILDE: u8 = 31;
+pub const T_BANG: u8 = 32;
+pub const T_ANDAND: u8 = 33;
+pub const T_OROR: u8 = 34;
+pub const T_SHL: u8 = 35;
+pub const T_SHR: u8 = 36;
+pub const T_PLUSEQ: u8 = 37;
+pub const T_MINUSEQ: u8 = 38;
+pub const T_STAREQ: u8 = 39;
+pub const T_SLASHEQ: u8 = 40;
+pub const T_PERCENTEQ: u8 = 41;
+pub const T_AMPEQ: u8 = 42;
+pub const T_PIPEEQ: u8 = 43;
+pub const T_CARETEQ: u8 = 44;
+pub const T_SHLEQ: u8 = 45;
+pub const T_SHREQ: u8 = 46;
+pub const T_PLUSPLUS: u8 = 47;
+pub const T_MINUSMINUS: u8 = 48;
+pub const T_UNDERSCORE: u8 = 49;
+// a byte that starts no token
+pub const T_BAD: u8 = 50;
+
+pub struct Tokens {
+    kinds: V<u8>,
+    starts: V<i64>,
+    ends: V<i64>,
+    // the symbol of an identifier, else -1
+    syms: V<i64>,
+    // symbol -> its text
+    names: V<[u8]>,
+    intern: HashMap<[u8], i64, ScopedArena>,
+    // a comment that is not closed: its start, else -1
+    open_comment: i64,
+}
+
+fn is_ident_start(c: u8) -> bool { (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' }
+
+fn is_ident_char(c: u8) -> bool { is_ident_start(c) || (c >= '0' && c <= '9') }
+
+fn is_hex(c: u8) -> bool {
+    (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+fn is_dec(c: u8) -> bool { c >= '0' && c <= '9' }
+
+impl Tokens {
+    pub fn sym(inout self, s: [u8]) -> i64 {
+        if let Some(h) = self.intern.get(s) {
+            return h;
+        }
+        let h = self.names.len();
+        self.names.push(s);
+        self.intern.insert(s, h);
+        h
+    }
+
+    fn push_token(inout self, k: u8, s: i64, e: i64, sym: i64) {
+        self.kinds.push(k);
+        self.starts.push(s);
+        self.ends.push(e);
+        self.syms.push(sym);
+    }
+}
+
+// The length of the number at src[i ..], and whether it is a float.
+fn number_len(src: [u8], i: i64) -> (i64, bool) {
+    let n = src.len;
+    var j = i;
+    var float = false;
+    if src[j] == '0' && j + 1 < n && (src[j + 1] == 'x' || src[j + 1] == 'X') {
+        j += 2;
+        while j < n && is_hex(src[j]) {
+            j += 1;
+        }
+        if j < n && src[j] == '.' {
+            float = true;
+            j += 1;
+            while j < n && is_hex(src[j]) {
+                j += 1;
+            }
+        }
+        if j < n && (src[j] == 'p' || src[j] == 'P') {
+            float = true;
+            j += 1;
+            if j < n && (src[j] == '+' || src[j] == '-') {
+                j += 1;
+            }
+            while j < n && is_dec(src[j]) {
+                j += 1;
+            }
+        }
+        if j < n && (src[j] == 'f' || src[j] == 'h') && float {
+            j += 1;
+        } else if j < n && (src[j] == 'i' || src[j] == 'u') && !float {
+            j += 1;
+        }
+        return (j - i, float);
+    }
+    while j < n && is_dec(src[j]) {
+        j += 1;
+    }
+    if j < n && src[j] == '.' && !(j + 1 < n && src[j + 1] == '.') {
+        float = true;
+        j += 1;
+        while j < n && is_dec(src[j]) {
+            j += 1;
+        }
+    }
+    if j < n && (src[j] == 'e' || src[j] == 'E') {
+        var k = j + 1;
+        if k < n && (src[k] == '+' || src[k] == '-') {
+            k += 1;
+        }
+        if k < n && is_dec(src[k]) {
+            float = true;
+            j = k;
+            while j < n && is_dec(src[j]) {
+                j += 1;
+            }
+        }
+    }
+    if j < n && (src[j] == 'f' || src[j] == 'h') {
+        float = true;
+        j += 1;
+    } else if j < n && (src[j] == 'i' || src[j] == 'u') && !float {
+        j += 1;
+    }
+    (j - i, float)
+}
+
+pub fn lex(src: [u8], a: ScopedArena) -> Tokens {
+    var t = Tokens {
+        kinds: Vec::with_capacity_in(src.len / 3 + 16, a),
+        starts: Vec::with_capacity_in(src.len / 3 + 16, a),
+        ends: Vec::with_capacity_in(src.len / 3 + 16, a),
+        syms: Vec::with_capacity_in(src.len / 3 + 16, a),
+        names: Vec::with_capacity_in(512, a),
+        intern: HashMap::with_capacity_in(512, a),
+        open_comment: -1,
+    };
+    for i in 0..PREDECLARED.len() {
+        t.sym(PREDECLARED[i]);
+    }
+    let n = src.len;
+    var i = 0;
+    while i < n {
+        let c = src[i];
+        if c == ' ' || c == '\n' || c == '\t' || c == '\r' || c == 11 || c == 12 {
+            i += 1;
+            continue;
+        }
+        if c == '/' && i + 1 < n && src[i + 1] == '/' {
+            while i < n && src[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && i + 1 < n && src[i + 1] == '*' {
+            let start = i;
+            var depth = 1;
+            i += 2;
+            while i < n && depth > 0 {
+                if src[i] == '/' && i + 1 < n && src[i + 1] == '*' {
+                    depth += 1;
+                    i += 2;
+                } else if src[i] == '*' && i + 1 < n && src[i + 1] == '/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if depth > 0 {
+                t.open_comment = start;
+            }
+            continue;
+        }
+        if is_ident_start(c) {
+            let s = i;
+            while i < n && is_ident_char(src[i]) {
+                i += 1;
+            }
+            if i - s == 1 && c == '_' {
+                t.push_token(T_UNDERSCORE, s, i, -1);
+            } else {
+                let sym = t.sym(src[s..i]);
+                t.push_token(T_IDENT, s, i, sym);
+            }
+            continue;
+        }
+        if is_dec(c) || (c == '.' && i + 1 < n && is_dec(src[i + 1])) {
+            let (len, float) = number_len(src, i);
+            t.push_token(if float { T_FLOAT } else { T_INT }, i, i + len, -1);
+            i += len;
+            continue;
+        }
+        let c1 = if i + 1 < n { src[i + 1] } else { 0 };
+        let c2 = if i + 2 < n { src[i + 2] } else { 0 };
+        var k = T_BAD;
+        var len = 1;
+        if c == '(' {
+            k = T_LPAREN;
+        } else if c == ')' {
+            k = T_RPAREN;
+        } else if c == '{' {
+            k = T_LBRACE;
+        } else if c == '}' {
+            k = T_RBRACE;
+        } else if c == '[' {
+            k = T_LBRACKET;
+        } else if c == ']' {
+            k = T_RBRACKET;
+        } else if c == ',' {
+            k = T_COMMA;
+        } else if c == ';' {
+            k = T_SEMI;
+        } else if c == ':' {
+            k = T_COLON;
+        } else if c == '.' {
+            k = T_DOT;
+        } else if c == '@' {
+            k = T_AT;
+        } else if c == '~' {
+            k = T_TILDE;
+        } else if c == '=' {
+            if c1 == '=' {
+                k = T_EQEQ;
+                len = 2;
+            } else {
+                k = T_EQ;
+            }
+        } else if c == '!' {
+            if c1 == '=' {
+                k = T_NE;
+                len = 2;
+            } else {
+                k = T_BANG;
+            }
+        } else if c == '<' {
+            if c1 == '<' && c2 == '=' {
+                k = T_SHLEQ;
+                len = 3;
+            } else if c1 == '<' {
+                k = T_SHL;
+                len = 2;
+            } else if c1 == '=' {
+                k = T_LE;
+                len = 2;
+            } else {
+                k = T_LT;
+            }
+        } else if c == '>' {
+            if c1 == '>' && c2 == '=' {
+                k = T_SHREQ;
+                len = 3;
+            } else if c1 == '>' {
+                k = T_SHR;
+                len = 2;
+            } else if c1 == '=' {
+                k = T_GE;
+                len = 2;
+            } else {
+                k = T_GT;
+            }
+        } else if c == '+' {
+            if c1 == '+' {
+                k = T_PLUSPLUS;
+                len = 2;
+            } else if c1 == '=' {
+                k = T_PLUSEQ;
+                len = 2;
+            } else {
+                k = T_PLUS;
+            }
+        } else if c == '-' {
+            if c1 == '>' {
+                k = T_ARROW;
+                len = 2;
+            } else if c1 == '-' {
+                k = T_MINUSMINUS;
+                len = 2;
+            } else if c1 == '=' {
+                k = T_MINUSEQ;
+                len = 2;
+            } else {
+                k = T_MINUS;
+            }
+        } else if c == '*' {
+            if c1 == '=' {
+                k = T_STAREQ;
+                len = 2;
+            } else {
+                k = T_STAR;
+            }
+        } else if c == '/' {
+            if c1 == '=' {
+                k = T_SLASHEQ;
+                len = 2;
+            } else {
+                k = T_SLASH;
+            }
+        } else if c == '%' {
+            if c1 == '=' {
+                k = T_PERCENTEQ;
+                len = 2;
+            } else {
+                k = T_PERCENT;
+            }
+        } else if c == '&' {
+            if c1 == '&' {
+                k = T_ANDAND;
+                len = 2;
+            } else if c1 == '=' {
+                k = T_AMPEQ;
+                len = 2;
+            } else {
+                k = T_AMP;
+            }
+        } else if c == '|' {
+            if c1 == '|' {
+                k = T_OROR;
+                len = 2;
+            } else if c1 == '=' {
+                k = T_PIPEEQ;
+                len = 2;
+            } else {
+                k = T_PIPE;
+            }
+        } else if c == '^' {
+            if c1 == '=' {
+                k = T_CARETEQ;
+                len = 2;
+            } else {
+                k = T_CARET;
+            }
+        }
+        t.push_token(k, i, i + len, -1);
+        i += len;
+    }
+    t.push_token(T_EOF, n, n, -1);
+    t
+}
+
+// How a token is written, for messages.
+pub fn token_text(k: u8) -> [u8] {
+    if k == T_EOF {
+        "the end of the file"
+    } else if k == T_IDENT {
+        "an identifier"
+    } else if k == T_INT || k == T_FLOAT {
+        "a number"
+    } else if k == T_LPAREN {
+        "'('"
+    } else if k == T_RPAREN {
+        "')'"
+    } else if k == T_LBRACE {
+        "'{'"
+    } else if k == T_RBRACE {
+        "'}'"
+    } else if k == T_LBRACKET {
+        "'['"
+    } else if k == T_RBRACKET {
+        "']'"
+    } else if k == T_COMMA {
+        "','"
+    } else if k == T_SEMI {
+        "';'"
+    } else if k == T_COLON {
+        "':'"
+    } else if k == T_DOT {
+        "'.'"
+    } else if k == T_AT {
+        "'@'"
+    } else if k == T_ARROW {
+        "'->'"
+    } else if k == T_EQ {
+        "'='"
+    } else if k == T_LT {
+        "'<'"
+    } else if k == T_GT {
+        "'>'"
+    } else if k == T_UNDERSCORE {
+        "'_'"
+    } else if k == T_BAD {
+        "a character WGSL does not use"
+    } else {
+        "an operator"
+    }
+}

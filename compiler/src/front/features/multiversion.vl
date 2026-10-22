@@ -1,0 +1,363 @@
+// #[multiversion("f", "g,h", ...)] (0.19, docs/design/arch.md §2.7): the
+// function is compiled once per listed feature set of the target's
+// architecture, each version declaring its set as #[target_feature] does
+// (so has() folds per version, and the vectorizer and isel see the set),
+// plus the baseline version; the function itself dispatches:
+//
+//     fn f(a: A) -> R { if detect("f") { f$mv0(a) } else if detect("g") && detect("h") { f$mv1(a) } else { <f's body> } }
+//
+// ordinary code (inlined, its tests hoisted out of a caller's loop by
+// LICM), no indirect call. A set of another architecture makes no version;
+// a set the build already has makes none either, nor do the ones after it
+// (the baseline knows them). Made before the names are collected
+// (check_program, before the contracts).
+//
+// The checks (check.vl): a call needing what a version lacks is
+// arch.multiversion, naming the version; the dispatcher needs only the
+// baseline (its NEEDS are pinned to nothing), so its address may be taken.
+
+use crate::arch::features::{build_features, feature_is_foreign, has_bit, implied};
+use crate::base::{IntVec, buf_bytes, buf_new, buf_slice, buf_str, intern, intern_c, sym_text};
+use crate::base::diag::{err_fmt, err_help_fmt};
+use crate::front::ast::{
+    FN_DERIVED, NODES, NodeKind, child, list_begin, list_end, list_push, new_node,
+};
+use crate::front::check::PROGRAM;
+use crate::front::features::{
+    AE_MULTIVERSION, FA_MULTIVERSION, FA_TARGET_FEATURE, FA_WIDTH, FEATURE_ATTRS, arch_error_begin,
+    arch_error_end, features_of_string,
+};
+use crate::front::features::check::{put_feature, put_features};
+use crate::front::features::regions::{CALLS, C_CALLEE, C_NODE};
+use crate::front::generics::instantiate::clone_node;
+use crate::front::lexer::{Tok, add_string, str_at};
+use crate::front::types::FNS;
+
+// The versions: (node, the multiversioned function's node, the
+// FEATURE_ATTRS index of its set, or -1 for the function itself: the
+// dispatcher, whose else branch is the baseline version), MV_WIDTH each.
+pub static var VERSIONS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub const MV_WIDTH: i64 = 3;
+
+// Positions of the arch.multiversion errors reported (a call is in every
+// version: reported once).
+static var REPORTED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The versions of every #[multiversion] function, and its dispatcher.
+pub fn expand_multiversion() {
+    unsafe {
+        if FEATURE_ATTRS.count == 0 {
+            return;
+        }
+        let program = PROGRAM;
+        let build = build_features();
+        let made = list_begin();
+        var attrs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..NODES[program].count {
+            let f = child(program, i);
+            if NODES[f].kind != NodeKind::Fn || NODES[f].c == 0 {
+                continue;
+            }
+            var clones = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            var conds = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            var listed = false;
+            var done = false;
+            var a = 0;
+            while a < FEATURE_ATTRS.count {
+                if FEATURE_ATTRS.data[a] == f && FEATURE_ATTRS.data[a + 1] == FA_MULTIVERSION {
+                    listed = true;
+                    let text = str_at(FEATURE_ATTRS.data[a + 2]);
+                    let set = implied(features_of_string(text));
+                    if !done && set != 0 && !foreign(set) {
+                        if (set & ~build) == 0 {
+                            // (the baseline has it, and what comes after)
+                            done = true;
+                        } else {
+                            let pos = FEATURE_ATTRS.data[a + 3];
+                            let g = version_of(f, clones.count);
+                            clones.push(g);
+                            conds.push(condition(text, pos));
+                            list_push(g);
+                            attrs.push(g);
+                            attrs.push(a);
+                            VERSIONS.push(g);
+                            VERSIONS.push(f);
+                            VERSIONS.push(a);
+                        }
+                    }
+                }
+                a += FA_WIDTH;
+            }
+            if listed {
+                VERSIONS.push(f);
+                VERSIONS.push(f);
+                VERSIONS.push(-1);
+            }
+            if clones.count > 0 {
+                dispatch(f, clones, conds);
+            }
+        }
+        // Each version declares its set (after the walk over FEATURE_ATTRS).
+        var k = 0;
+        while k < attrs.count {
+            let a = attrs.data[k + 1];
+            FEATURE_ATTRS.push(attrs.data[k]);
+            FEATURE_ATTRS.push(FA_TARGET_FEATURE);
+            FEATURE_ATTRS.push(FEATURE_ATTRS.data[a + 2]);
+            FEATURE_ATTRS.push(FEATURE_ATTRS.data[a + 3]);
+            k += 2;
+        }
+        let count = crate::front::ast::SCRATCH.count - made;
+        if count == 0 {
+            crate::front::ast::SCRATCH.count = made;
+            return;
+        }
+        // The program's items, then the versions.
+        let extra = crate::base::alloc_array::<i64>(count);
+        for j in 0..count {
+            extra[j] = crate::front::ast::SCRATCH.data[made + j];
+        }
+        crate::front::ast::SCRATCH.count = made;
+        let all = list_begin();
+        for i in 0..NODES[program].count {
+            list_push(child(program, i));
+        }
+        for j in 0..count {
+            list_push(extra[j]);
+        }
+        list_end(program, all);
+    }
+}
+
+// Whether set names a feature of another architecture.
+fn foreign(set: i64) -> bool {
+    for b in 0..63 {
+        if has_bit(set, b) && feature_is_foreign(b) {
+            return true;
+        }
+    }
+    false
+}
+
+// Version k of f: a copy named `f$mvK`, with its generics and parameters.
+fn version_of(f: i64, k: i64) -> i64 {
+    unsafe {
+        let name = buf_new();
+        buf_bytes(name, sym_text(NODES[f].a));
+        buf_str(name, c"$mv");
+        crate::base::buf_fmt(name, f"{k}");
+        let g = new_node(NodeKind::Fn, NODES[f].start, NODES[f].end);
+        NODES[g] = NODES[f];
+        NODES[g].a = intern(buf_slice(name));
+        NODES[g].b = clone_node(NODES[f].b);
+        NODES[g].c = clone_node(NODES[f].c);
+        NODES[g].g = clone_node(NODES[f].g);
+        NODES[g].x = 0;
+        NODES[g].y = 0;
+        NODES[g].ty = 0;
+        NODES[g].p = NODES[f].p | FN_DERIVED;
+        let mark = list_begin();
+        for i in 0..NODES[f].count {
+            list_push(clone_node(child(f, i)));
+        }
+        list_end(g, mark);
+        g
+    }
+}
+
+// `std::arch::detect("a") && std::arch::detect("b")` for the set "a,b".
+fn condition(text: [u8], pos: i64) -> i64 {
+    var cond = 0;
+    var i = 0;
+    while i < text.len as i64 {
+        var j = i;
+        while j < text.len as i64 && text[j] != ',' {
+            j += 1;
+        }
+        var a = i;
+        var b = j;
+        while a < b && text[a] == ' ' {
+            a += 1;
+        }
+        while b > a && text[b - 1] == ' ' {
+            b -= 1;
+        }
+        if b > a {
+            let test = detect_call(text[a..b], pos);
+            if cond == 0 {
+                cond = test;
+            } else {
+                let and = new_node(NodeKind::Binary, pos, pos);
+                unsafe {
+                    NODES[and].op = Tok::AmpAmp;
+                    NODES[and].b = cond;
+                    NODES[and].c = test;
+                }
+                cond = and;
+            }
+        }
+        i = j + 1;
+    }
+    cond
+}
+
+fn ident(sym: i64, pos: i64) -> i64 {
+    let n = new_node(NodeKind::Ident, pos, pos);
+    unsafe { NODES[n].a = sym; }
+    n
+}
+
+// `std::arch::detect("name")`
+fn detect_call(name: [u8], pos: i64) -> i64 {
+    unsafe {
+        let path = new_node(NodeKind::Path, pos, pos);
+        NODES[path].a = intern_c(c"arch");
+        NODES[path].b = intern_c(c"detect");
+        let segs = list_begin();
+        list_push(ident(intern_c(c"std"), pos));
+        list_push(ident(intern_c(c"arch"), pos));
+        list_push(ident(intern_c(c"detect"), pos));
+        list_end(path, segs);
+        let lit = new_node(NodeKind::Str, pos, pos);
+        NODES[lit].a = add_string(name);
+        let call = new_node(NodeKind::Call, pos, pos);
+        NODES[call].a = path;
+        let args = list_begin();
+        list_push(lit);
+        list_end(call, args);
+        call
+    }
+}
+
+// f's body becomes `if c0 { f$mv0(..) } else if c1 { .. } else { <body> }`.
+fn dispatch(f: i64, clones: IntVec, conds: IntVec) {
+    unsafe {
+        var rest = NODES[f].c;
+        var k = clones.count - 1;
+        while k >= 0 {
+            let pos = NODES[conds.data[k]].start;
+            let then = new_node(NodeKind::Block, pos, pos);
+            NODES[then].a = call_version(f, clones.data[k], pos);
+            let none = list_begin();
+            list_end(then, none);
+            let test = new_node(NodeKind::If, pos, pos);
+            NODES[test].a = conds.data[k];
+            NODES[test].b = then;
+            NODES[test].c = rest;
+            let block = new_node(NodeKind::Block, NODES[NODES[f].c].start, NODES[NODES[f].c].end);
+            NODES[block].a = test;
+            let empty = list_begin();
+            list_end(block, empty);
+            rest = block;
+            k -= 1;
+        }
+        NODES[f].c = rest;
+    }
+}
+
+// The call of version g with f's parameters (`Self::g(..)` in an impl), f's
+// own type parameters written.
+fn call_version(f: i64, g: i64, pos: i64) -> i64 {
+    unsafe {
+        let call = new_node(NodeKind::Call, pos, pos);
+        var own = 0;
+        let gen = NODES[f].g;
+        if gen != 0 && NODES[gen].count > NODES[gen].a {
+            own = new_node(NodeKind::Generics, pos, pos);
+            let gm = list_begin();
+            for i in NODES[gen].a..NODES[gen].count {
+                let t = new_node(NodeKind::TyName, pos, pos);
+                NODES[t].a = NODES[child(gen, i)].a;
+                list_push(t);
+            }
+            list_end(own, gm);
+        }
+        if NODES[f].h != 0 {
+            let path = new_node(NodeKind::Path, pos, pos);
+            NODES[path].a = intern_c(c"Self");
+            NODES[path].b = NODES[g].a;
+            NODES[path].h = own;
+            NODES[call].a = path;
+        } else {
+            let callee = ident(NODES[g].a, pos);
+            NODES[callee].g = own;
+            NODES[call].a = callee;
+        }
+        let am = list_begin();
+        for i in 0..NODES[f].count {
+            list_push(ident(NODES[child(f, i)].a, pos));
+        }
+        list_end(call, am);
+        call
+    }
+}
+
+// The VERSIONS row of function f (its template's, for an instance), or -1.
+pub fn version_row(f: i64) -> i64 {
+    unsafe {
+        if VERSIONS.count == 0 {
+            return -1;
+        }
+        let node = if FNS[f].tmpl > 0 { FNS[FNS[f].tmpl - 1].node } else { FNS[f].node };
+        var r = 0;
+        while r < VERSIONS.count {
+            if VERSIONS.data[r] == node {
+                return r;
+            }
+            r += MV_WIDTH;
+        }
+        -1
+    }
+}
+
+// Whether f is a #[multiversion] function's dispatcher (its NEEDS pinned
+// to the baseline's).
+pub fn is_dispatcher(f: i64) -> bool {
+    let r = version_row(f);
+    unsafe { r >= 0 && VERSIONS.data[r + 2] < 0 }
+}
+
+// error[arch.multiversion] at call record `at`, in version row r.
+pub fn multiversion_error(at: i64, missing: i64, r: i64) {
+    unsafe {
+        let n = CALLS.data[at + C_NODE];
+        let pos = NODES[n].start;
+        for i in 0..REPORTED.count {
+            if REPORTED.data[i] == pos {
+                return;
+            }
+        }
+        REPORTED.push(pos);
+        let g = CALLS.data[at + C_CALLEE];
+        let origin = VERSIONS.data[r + 1];
+        let a = VERSIONS.data[r + 2];
+        let m = buf_new();
+        buf_str(m, c"'");
+        buf_bytes(m, sym_text(NODES[FNS[g].node].a));
+        buf_str(m, c"' needs ");
+        put_features(m, missing, c", ", c"");
+        buf_str(m, c", which the ");
+        if a < 0 {
+            buf_str(m, c"baseline");
+        } else {
+            buf_str(m, c"\"");
+            buf_bytes(m, str_at(FEATURE_ATTRS.data[a + 2]));
+            buf_str(m, c"\"");
+        }
+        buf_str(m, c" version of #[multiversion] '");
+        buf_bytes(m, sym_text(NODES[origin].a));
+        buf_str(m, c"' lacks");
+        arch_error_begin(pos, AE_MULTIVERSION);
+        err_fmt(buf_slice(m));
+        let h = buf_new();
+        buf_str(h, c"every version compiles the same body: test the feature around the call, `if std::arch::has(\"");
+        var b = 0;
+        while b < 63 && !has_bit(missing, b) {
+            b += 1;
+        }
+        put_feature(h, b);
+        buf_str(h, c"\") { ... } else { ... }`, true only in the versions that have it");
+        err_help_fmt(buf_slice(h));
+        arch_error_end();
+    }
+}

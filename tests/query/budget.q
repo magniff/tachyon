@@ -2,16 +2,16 @@
 ## in two files, six `size` functions, a line longer than 100 bytes; and
 ## every usage error.
 $ refs bump
-budget/main.tach	47
-budget/util.tach	24
+budget/main.vl	47
+budget/util.vl	24
 note query.truncated: 71 refs in 2 files
-try: tachyonc query refs bump --in budget/main.tach
-try: tachyonc query refs bump --limit 60
-try: tachyonc query refs bump --all
+try: volec query refs bump --in budget/main.vl
+try: volec query refs bump --limit 60
+try: volec query refs bump --all
 $ refs bump --count
 71
-$ callers bump --all --in main.tach
-# budget/main.tach
+$ callers bump --all --in main.vl
+# budget/main.vl
 15:16	call	many	t += util::bump(0);
 16:16	call	many	t += util::bump(1);
 17:16	call	many	t += util::bump(2);
@@ -59,8 +59,8 @@ $ callers bump --all --in main.tach
 59:75	call	long_line	util::bump(1) + util::bump(2) + util::bump(3) + util::bump(4) + util::bump(5) + util::bump(6) + uti…
 59:91	call	long_line	util::bump(1) + util::bump(2) + util::bump(3) + util::bump(4) + util::bump(5) + util::bump(6) + uti…
 59:107	call	long_line	util::bump(1) + util::bump(2) + util::bump(3) + util::bump(4) + util::bump(5) + util::bump(6) + uti…
-$ refs bump --in util.tach
-# budget/util.tach
+$ refs bump --in util.vl
+# budget/util.vl
 1:8	def	pub fn bump(x: i64) -> i64 {
 7:10	call	util::more	t += bump(0);
 8:10	call	util::more	t += bump(1);
@@ -86,23 +86,23 @@ $ refs bump --in util.tach
 28:10	call	util::more	t += bump(21);
 29:10	call	util::more	t += bump(22);
 $ refs bump --in crate --limit 3
-# budget/main.tach
+# budget/main.vl
 15:16	call	many	t += util::bump(0);
 16:16	call	many	t += util::bump(1);
 17:16	call	many	t += util::bump(2);
 note query.truncated: showing 3 of 71 refs
-try: tachyonc query refs bump --in budget/main.tach
-try: tachyonc query refs bump --in crate --all
+try: volec query refs bump --in budget/main.vl
+try: volec query refs bump --in crate --all
 $ refs bump --limit 2
-# budget/main.tach
+# budget/main.vl
 15:16	call	many	t += util::bump(0);
 16:16	call	many	t += util::bump(1);
 note query.truncated: showing 2 of 71 refs
-try: tachyonc query refs bump --in budget/main.tach
-try: tachyonc query refs bump --all
+try: volec query refs bump --in budget/main.vl
+try: volec query refs bump --all
 $ refs bump --in nosuch
 error query.bad-in: no file, module or item 'nosuch' in the program
-try: tachyonc query refs bump
+try: volec query refs bump
 [exit 1]
 $ callers m2::size
 note query.empty: 0 calls
@@ -123,16 +123,16 @@ crate::m4::size
 crate::m5::size
 crate::m6::size
 error query.ambiguous: 6 definitions match 'size'; showing paths only
-try: tachyonc query show crate::m1::size
+try: volec query show crate::m1::size
 [exit 1]
 $ show m2::size
-// crate::m2::size	budget/main.tach:7-7	effects: none
+// crate::m2::size	budget/main.vl:7-7	effects: none
 mod m2 { pub fn size() -> i64 { 2 } }
 $ callers long_line
-# budget/main.tach
+# budget/main.vl
 63:15	call	main	(many() + long_line() + m1::size()) as i32
 $ refs bump --in long_line
-# budget/main.tach
+# budget/main.vl
 59:11	call	long_line	util::bump(1) + util::bump(2) + util::bump(3) + util::bump(4) + util::bump(5) + util::bump(6) + uti…
 59:27	call	long_line	util::bump(1) + util::bump(2) + util::bump(3) + util::bump(4) + util::bump(5) + util::bump(6) + uti…
 59:43	call	long_line	util::bump(1) + util::bump(2) + util::bump(3) + util::bump(4) + util::bump(5) + util::bump(6) + uti…
@@ -142,73 +142,73 @@ $ refs bump --in long_line
 59:107	call	long_line	util::bump(1) + util::bump(2) + util::bump(3) + util::bump(4) + util::bump(5) + util::bump(6) + uti…
 $ refs bump --bogus
 error query.usage: unknown option '--bogus'
-try: tachyonc query refs bump
+try: volec query refs bump
 [exit 2]
 $ refs bump --limit
 error query.usage: --limit needs a number
-try: tachyonc query refs bump --limit 60
+try: volec query refs bump --limit 60
 [exit 2]
 $ refs bump --limit x
 error query.usage: --limit needs a number
-try: tachyonc query refs bump --limit 60
+try: volec query refs bump --limit 60
 [exit 2]
 $ refs bump --in
 error query.usage: --in needs a FILE or MODULE
-try: tachyonc query refs bump
+try: volec query refs bump
 [exit 2]
-$ refs bump budget/main.tach extra
+$ refs bump budget/main.vl extra
 error query.usage: unexpected argument 'extra'
-try: tachyonc query refs bump budget/main.tach
+try: volec query refs bump budget/main.vl
 [exit 2]
-$ refs bump nosuch.tach
-error query.bad-root: cannot read 'nosuch.tach'
-try: tachyonc query refs bump
+$ refs bump nosuch.vl
+error query.bad-root: cannot read 'nosuch.vl'
+try: volec query refs bump
 [exit 2]
 $ defs bump
 error query.usage: unknown command 'defs'
-try: tachyonc query def bump
+try: volec query def bump
 [exit 2]
 $ items mm1
 error query.no-match: no module 'mm1'
-try: tachyonc query items crate::m1
+try: volec query items crate::m1
 [exit 1]
 $ def util::bumpp
 error query.no-match: no definition 'util::bumpp'
-try: tachyonc query def crate::util::bump
+try: volec query def crate::util::bump
 [exit 1]
 $ def utill::bump
 error query.no-match: no definition 'utill::bump'
-try: tachyonc query def crate::util::bump
+try: volec query def crate::util::bump
 [exit 1]
 $ 
 error query.usage: no command
-try: tachyonc query items
+try: volec query items
 [exit 2]
 $ --help
-usage: tachyonc query def|show NAME... [--root ROOT] [--exact] [--with-comments]
-       tachyonc query show FILE.tach | MODULE::use | MODULE::header | MODULE::extern
-       tachyonc query context NAME...|MODULE [--budget TOKENS]   (source, calls, types, callers)
-       tachyonc query text FILE[:A[-B]]...
-       tachyonc query diff
-       tachyonc query refs|callers NAME... [--exact] [--count] [--in FILE|MODULE|ITEM] [--limit N] [--all]
-       tachyonc query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]
-       tachyonc query items [MODULE...] [--comments]
-       tachyonc query show MODULE::section TITLE
-       tachyonc query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
-       tachyonc query type FILE:LINE[:COL]...
-       tachyonc query own FILE:LINE:COL...   (0.17: each local's kind, moves and views there)
-       tachyonc query stats [MODULE|FILE] [--over N] [--all]
-       tachyonc query deps MODULE [--max-lines N]
-       tachyonc query unused [MODULE] [--all]
-       tachyonc query impact NAME
-       tachyonc query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (alloc(Gpa) io global panic diverge unsafe)
-       tachyonc query features NAME... [--why FEATURE] [-C target-cpu=CPU] [-C target-feature=+x,-y]   (std::arch: what a function needs beyond the build's features)
-       tachyonc query arch WORDS... [--feature F] [--arch aarch64|x86_64|portable] [--equiv NAME]   (std::arch: the intrinsics by name, instruction, feature or doc; also query intrinsics)
-       tachyonc query views NAME...|MODULE [--why]   (what results and `&mut` parameters view: views(self), views(*self), stores(word))
-       tachyonc query conflicts [FILE|DIR|FILE:LINE...] [--show]
-       tachyonc query similar NAME... [--limit N]   (items like NAME to copy, nearest first)
-       tachyonc query examples [KIND...]   (items to start from for an "add an X" change; tachyonc guide how)
+usage: volec query def|show NAME... [--root ROOT] [--exact] [--with-comments]
+       volec query show FILE.vl | MODULE::use | MODULE::header | MODULE::extern
+       volec query context NAME...|MODULE [--budget TOKENS]   (source, calls, types, callers)
+       volec query text FILE[:A[-B]]...
+       volec query diff
+       volec query refs|callers NAME... [--exact] [--count] [--in FILE|MODULE|ITEM] [--limit N] [--all]
+       volec query callees FN... [--transitive] [--writes TABLE] [--count] [--limit N] [--all]
+       volec query items [MODULE...] [--comments]
+       volec query show MODULE::section TITLE
+       volec query grep PATTERN... [--in FILE|MODULE|ITEM] [--code] [--comments] [--strings] [--word] [--count] [--limit N] [--all]
+       volec query type FILE:LINE[:COL]...
+       volec query own FILE:LINE:COL...   (0.17: each local's kind, moves and views there)
+       volec query stats [MODULE|FILE] [--over N] [--all]
+       volec query deps MODULE [--max-lines N]
+       volec query unused [MODULE] [--all]
+       volec query impact NAME
+       volec query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]   (alloc(Gpa) io global panic diverge unsafe)
+       volec query features NAME... [--why FEATURE] [-C target-cpu=CPU] [-C target-feature=+x,-y]   (std::arch: what a function needs beyond the build's features)
+       volec query arch WORDS... [--feature F] [--arch aarch64|x86_64|portable] [--equiv NAME]   (std::arch: the intrinsics by name, instruction, feature or doc; also query intrinsics)
+       volec query views NAME...|MODULE [--why]   (what results and `&mut` parameters view: views(self), views(*self), stores(word))
+       volec query conflicts [FILE|DIR|FILE:LINE...] [--show]
+       volec query similar NAME... [--limit N]   (items like NAME to copy, nearest first)
+       volec query examples [KIND...]   (items to start from for an "add an X" change; volec guide how)
 NAME: a path or its end (f, m::f, T::f, T.field), or FILE:LINE; std's too (std::f, Vec::push)
 --budget TOKENS: any answer cut to about TOKENS (default 8000; 0: no limit; context: 2000)
-ROOT: --root ROOT, a last argument ending in .tach, $TACHYON_ROOT, ./main.tach, ./compiler/src/main.tach
+ROOT: --root ROOT, a last argument ending in .vl, $VOLE_ROOT, ./main.vl, ./compiler/src/main.vl
 see docs/query.md and docs/refactor.md

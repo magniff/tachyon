@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
-/* bench/iterchain.tach in C: each kernel a fold over the vector with
+/* bench/iterchain.vl in C: each kernel a fold over the vector with
    its closures as small functions the compiler inlines (the nearest C
    has to a chain of adapters) */
 typedef struct { const long *s; long pos, len; } SliceIter;

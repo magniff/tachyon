@@ -1,8 +1,8 @@
-# tachyon 0.18 design: contracts and verification in the language
+# vole 0.18 design: contracts and verification in the language
 
 Read from `.claude/worktrees/design-018` (branch design-018 at night-final
 dd6fc28, built with `bootstrap/bootstrap.sh --dev`: 1042 tests passed). Sources:
-`tachyonc guide debug|errors|std|allocators|effects`, `tachyonc test|reduce|probe
+`volec guide debug|errors|std|allocators|effects`, `volec test|reduce|probe
 --help`, `query` on the compiler, docs/optimizer.md ("0.17: compile time",
 "Ready for threads?"), docs/query.md ("Speed: the cache"), the 0.16 design
 (branch design-016, docs/design/effects-allocation.md), the 0.17 design (branch
@@ -52,10 +52,10 @@ the compiler that embeds it, so it uses contracts in 0.18 (§2.1, T1).
   with an invalid value, `panic(..)` and `unreachable()`. Arithmetic wraps, and
   `/ 0` is 0. There is no `assert`. The guide maps `assert!(c)` to
   `if !c { panic("...") }`, and `assert!` is a parser error ("'assert!' is a
-  macro call: tachyon has no macros").
+  macro call: vole has no macros").
 - **Messages give no position.** For example `index out of bounds: index 5,
   length 3`, followed by `note: build with --trace for the line and its
-  callers`. With `--trace` (a shadow stack, middle/trace.tach), the frames
+  callers`. With `--trace` (a shadow stack, middle/trace.vl), the frames
   follow, innermost first.
 - **std blames itself.** `Vec::insert: index out of bounds` and `called unwrap
   on None` are std's own `panic` calls, so the line where the mistake was made
@@ -63,7 +63,7 @@ the compiler that embeds it, so it uses contracts in 0.18 (§2.1, T1).
 - **Lowering.** `middle::lower::calls::lower_check(ok, kind, a, b, c)` branches
   to a block that calls the runtime helper (`gen0::target::emit_runtime`, which
   uses printf) with the kind and three values. gen0 does the same at -O0.
-- **The range analysis** (middle/range.tach) removes a bounds check when it
+- **The range analysis** (middle/range.vl) removes a bounds check when it
   proves the index in range. It decides comparisons from the dominating
   conditions, including the branch a check takes. It is "taken while the branch
   of a check is decided (one way ends the program)". Contract checks become the
@@ -71,18 +71,18 @@ the compiler that embeds it, so it uses contracts in 0.18 (§2.1, T1).
 
 ### 1.2 Testing and debugging
 
-- **`tachyonc test`** (0.17):
+- **`volec test`** (0.17):
   - a program's cases are `tests/NAME.in` with `.out` and `.exit`; in the
-    tachyon tree it runs the suite by filter;
+    vole tree it runs the suite by filter;
   - builds use `--trace`; a failure shows its first stderr lines;
   - `-O N` runs one level;
-  - `--against` (in the tachyon tree) labels failures `new` or `failing too`.
-- **`tachyonc reduce FILE --until CMD`** shrinks an input line by line: chunks
-  are left out and halved. **`tachyonc probe FILE:LINE EXPR...`** prints values
+  - `--against` (in the vole tree) labels failures `new` or `failing too`.
+- **`volec reduce FILE --until CMD`** shrinks an input line by line: chunks
+  are left out and halved. **`volec probe FILE:LINE EXPR...`** prints values
   as the program runs, without editing it.
 - **What the language lacks:** test functions, property tests and fuzz targets.
   A test is a whole program's run on an input. The -O0 against -O2 comparison
-  is done by hand (`tachyonc test -O 0`, then `tachyonc test`). Only the gate's
+  is done by hand (`volec test -O 0`, then `volec test`). Only the gate's
   fuzzer compares levels, and only for the programs it generates.
 
 **What the evals say about testing and fixing:**
@@ -91,12 +91,12 @@ the compiler that embeds it, so it uses contracts in 0.18 (§2.1, T1).
   generators or reference programs per run, and runs the program 6.6 times
   (Rust: 3.5, 0.9, 5.7). The chains `run > run > run > run` (248 times in 67
   runs) and `Write × 4` (254 in 66) are its most frequent sequences. The 0.16
-  findings proposed `tachyonc test --against CMD --gen CMD`.
+  findings proposed `volec test --against CMD --gen CMD`.
 - **0.17, iteration 4.** No agent used `--trace`, `probe`, `reduce` or `guide
   debug` in 48 runs. A tool named in one table row is not discovered on tasks
   that one test and a reading of the code solve.
 - **Iteration 5.** A prompt line that steered agents to test through
-  `tests/NAME.in/.out` brought 30% of runs to `tachyonc test`, and made the
+  `tests/NAME.in/.out` brought 30% of runs to `volec test`, and made the
   small tasks 5–9% dearer: writing the files costs turns.
 - **Iteration 9.** A runnable `try:` was run 0 times out of 7. Agents fix by
   hand.
@@ -115,7 +115,7 @@ the compiler that embeds it, so it uses contracts in 0.18 (§2.1, T1).
   reference program and comparison script.
 - **D3. Nothing to learn before it pays.** Rust's spellings work: `#[test]`,
   `assert_eq`, `#[cfg(test)] mod tests`.
-- **D4. Results arrive where agents already look:** `tachyonc test`, which they
+- **D4. Results arrive where agents already look:** `volec test`, which they
   run, and the check hook's test summary.
 - **D5. No new cost on small tasks.** Nothing new is required: a program
   without contracts or tests is built and tested exactly as before.
@@ -123,7 +123,7 @@ the compiler that embeds it, so it uses contracts in 0.18 (§2.1, T1).
 ### 1.3 Types
 
 - **`type X = T` is a transparent alias** (generic aliases exist). The only
-  nominal wrapper is a one-field struct, `struct NodeId { v: i64 }`. Tachyon
+  nominal wrapper is a one-field struct, `struct NodeId { v: i64 }`. Vole
   has no tuple structs, so such a wrapper has no operators and needs `.v`
   everywhere. The compiler's own ids (nodes, types, symbols, blocks,
   instructions) are all `i64`, and mixing them up is the bug class behind
@@ -247,7 +247,7 @@ No program breaks.
 `else "message"` (or `else f"..."`, evaluated only on failure) replaces the
 condition's text in the report; the values are still printed.
 
-**`debug` clauses** are checked only in test builds (`tachyonc test`,
+**`debug` clauses** are checked only in test builds (`volec test`,
 `--debug-contracts`), at every -O level. They are for conditions whose cost would
 change the program's complexity (`debug requires is_sorted(s)` on a binary
 search). They give the optimizer no facts.
@@ -270,7 +270,7 @@ analysis (§2.5).
 - An ensures adds `panic` to the callee.
 - `debug` clauses add nothing outside test builds.
 - `query effects --why panic` names the clause: `requires 'i < self.len()' of
-  'get' at main.tach:14:13`.
+  'get' at main.vl:14:13`.
 
 **At compile time.** A requires that the front end's constant evaluation finds
 false for literal arguments (`get(-1)`) is the error `contract.violated`. It is
@@ -286,7 +286,7 @@ decided by the front end alone, so errors never depend on `-O`.
   `assert_ne!`, `debug_assert!`, `panic!` and `unreachable!`, each with plain
   arguments, a string literal or an f-string. `fmt` writes them without the `!`.
   `panic!("x = {}", x)` is the error `macro.args`, whose `try:` gives the
-  f-string. Tachyon still has no macros: these six names are spellings, not a
+  f-string. Vole still has no macros: these six names are spellings, not a
   mechanism.
 - **The message is the same as `assert`'s:** `assert_eq(a, b)` reports like
   `assert(a == b)`, with both values printed by Debug.
@@ -331,16 +331,16 @@ advice.
 
 | check | the line |
 |---|---|
-| requires | `main.tach:31:17: requires failed: 's.len() > 0' of 'median' (stats.tach:2:14): s.len() = 0` |
-| ensures | `stats.tach:19:5: ensures failed: 'result <= s.len()' of 'count_above': result = 7, s.len() = 5` |
-| invariant | `stack.tach:30:5: invariant failed: 'self.items.len() <= self.max' of 'Stack' when 'Stack::push' returns: self.items.len() = 5, self.max = 4` |
-| assert | `main.tach:9:5: assertion failed: 'x > 0': x = -1` |
-| assert_eq | `lexer.tach:41:5: assertion failed: 'toks.len() == 0': toks.len() = 1` |
-| index | `main.tach:12:13: index out of bounds: index 3, length 2` |
-| unwrap | `main.tach:10:31: called unwrap on None` (std: `requires self.is_some() else "called unwrap on None"`) |
-| `as E` | `main.tach:7:13: invalid value 3 for enum Level` |
-| distinct | `main.tach:4:13: invariant failed: '0 <= self && self <= 100' of 'Percent' in 'x as Percent': self = 140` |
-| NonNull | `ffi.tach:9:13: null pointer made NonNull<u8>: 'c::getenv(name)'` |
+| requires | `main.vl:31:17: requires failed: 's.len() > 0' of 'median' (stats.vl:2:14): s.len() = 0` |
+| ensures | `stats.vl:19:5: ensures failed: 'result <= s.len()' of 'count_above': result = 7, s.len() = 5` |
+| invariant | `stack.vl:30:5: invariant failed: 'self.items.len() <= self.max' of 'Stack' when 'Stack::push' returns: self.items.len() = 5, self.max = 4` |
+| assert | `main.vl:9:5: assertion failed: 'x > 0': x = -1` |
+| assert_eq | `lexer.vl:41:5: assertion failed: 'toks.len() == 0': toks.len() = 1` |
+| index | `main.vl:12:13: index out of bounds: index 3, length 2` |
+| unwrap | `main.vl:10:31: called unwrap on None` (std: `requires self.is_some() else "called unwrap on None"`) |
+| `as E` | `main.vl:7:13: invalid value 3 for enum Level` |
+| distinct | `main.vl:4:13: invariant failed: '0 <= self && self <= 100' of 'Percent' in 'x as Percent': self = 140` |
+| NonNull | `ffi.vl:9:13: null pointer made NonNull<u8>: 'c::getenv(name)'` |
 
 **Which values are printed** (power-assert style, after pytest's assertion
 rewriting):
@@ -391,7 +391,7 @@ never used:
 **What the optimizer never does:** remove a check because a clause says so
 without the clause having been checked. That would be Ada's `pragma Assume`, C's
 `__builtin_assume`, or a verified mode. A wrong contract would then be
-undefined behaviour, which tachyon does not have.
+undefined behaviour, which vole does not have.
 
 **Cost.** A few range constraints per call and per entry. The range analysis
 scans its facts linearly (`narrow_by_facts`, 2.5% of -O2: an open item of 0.17).
@@ -414,7 +414,7 @@ mod tests {
   strict allocation: a test gets its allocator as `main` does). It returns `()`
   or `Result<(), E>`; an `Err` fails, printed with Debug. `#[test]` items and
   `#[cfg(test)]` items or modules are compiled only for tests. `cfg(test)` is
-  the one `cfg` tachyon accepts (D3).
+  the one `cfg` vole accepts (D3).
 - **A test module sees its parent's items,** private ones included, without a
   `use`, as a nested scope sees its parent's names.
   - `use super::*;` is **not** accepted, in a test module or anywhere: no
@@ -424,8 +424,8 @@ mod tests {
     --suggested` and `fix --only imports` apply that deletion (decided
     2026-10-16).
 - **The harness.**
-  - `tachyonc test` compiles the program with a test entry in place of `main`:
-    one binary for every test, where `prog --tachyon-test NAME` runs one.
+  - `volec test` compiles the program with a test entry in place of `main`:
+    one binary for every test, where `prog --vole-test NAME` runs one.
   - Each test runs in its own process, forked by the runner. A failed check
     exits with 101 there, and the other tests go on.
   - Tests run in parallel, one per core, each within a time limit (10 s,
@@ -433,7 +433,7 @@ mod tests {
 - **Test builds turn on** `--trace`, `--check-alloc`, `debug` clauses and
   `debug_assert`.
   - **A test that leaks fails:** `leaked 2 blocks (48 bytes): allocated at
-    parse.tach:14:9`. With value semantics a leak is a `forget` or a cycle
+    parse.vl:14:9`. With value semantics a leak is a `forget` or a cycle
     through raw pointers, which is rare and a bug.
   - `--no-check-alloc` turns the leak check off.
 - **Snapshots.**
@@ -441,7 +441,7 @@ mod tests {
     `tests/snapshots/MODULE__TEST__N.snap`.
   - A missing file is written and reported as `new snapshot` (the test
     passes); a difference fails with its first differing line.
-  - `tachyonc test --accept` writes the current values. It also writes the
+  - `volec test --accept` writes the current values. It also writes the
     `.out` of an I/O case that has none or differs (`.exit` too).
   - I/O cases (`tests/NAME.in/.out`) stay as they are: they are snapshots of a
     whole program.
@@ -451,8 +451,8 @@ mod tests {
   - **What must agree:** stdout, the exit status and the first line of stderr.
   - **A difference is reported as the compiler's bug,** because the program has
     no undefined behaviour to blame: `DIFF b: -O0 and -O2 differ at stdout line
-    3: '7' against '8'. A compiler bug, not this program's` | `try: tachyonc
-    reduce main.tach --differs --input tests/b.in`.
+    3: '7' against '8'. A compiler bug, not this program's` | `try: volec
+    reduce main.vl --differs --input tests/b.in`.
   - `-O N` runs one level.
 
 ### 2.7 Property tests
@@ -498,20 +498,20 @@ fn sort_matches_naive(v: Vec<i64>) {
 - Values shrink without code per type. Invariants and requires still hold,
   because every candidate goes through the same generators and filters.
 
-**The report** (in `tachyonc test`, §2.9):
+**The report** (in `volec test`, §2.9):
 
 ```text
-FAIL sort_matches_naive (property, case 37 of 100, shrunk in 41 steps): main.tach:22:5: assertion failed: 'a == naive_sort(v)': a = [1, 0], naive_sort(v) = [0, 1]
+FAIL sort_matches_naive (property, case 37 of 100, shrunk in 41 steps): main.vl:22:5: assertion failed: 'a == naive_sort(v)': a = [1, 0], naive_sort(v) = [0, 1]
   input: v = [1, 0]
-  try: tachyonc probe main.tach:21 a --test sort_matches_naive --seed 0x9e3779b9
+  try: volec probe main.vl:21 a --test sort_matches_naive --seed 0x9e3779b9
 ```
 
-Failing inputs are saved in `.tachyonc/test/corpus/NAME/` and replayed first
+Failing inputs are saved in `.volec/test/corpus/NAME/` and replayed first
 next time. `--accept` copies them into `tests/corpus/NAME/`, where every run
 replays them.
 
 **Contracts are properties.**
-- `tachyonc test` also tests every function that has a non-`debug` `ensures`, or
+- `volec test` also tests every function that has a non-`debug` `ensures`, or
   that returns a type with an invariant, when its parameters are generable and
   its effects have no `io` and no `global`.
 - It gives each such function 100 argument sets that satisfy its requires.
@@ -536,25 +536,25 @@ fn parse_never_crashes(data: [u8]) {
 - **The parameter.** A `#[fuzz]` function takes one parameter: `[u8]`, or any
   generable type. With another type it is a property whose choice sequence is
   the fuzzer's bytes: one engine for properties and fuzz targets.
-- **`tachyonc fuzz NAME [--time S] [--jobs N]`** is coverage-guided:
+- **`volec fuzz NAME [--time S] [--jobs N]`** is coverage-guided:
   - the program is built with `--coverage` at -O1: one 8-bit counter per CFG
-    edge (middle/coverage.tach);
+    edge (middle/coverage.vl);
   - a fork server in the test binary runs each input in a forked child, so a
     failed check ends only the child;
-  - inputs that reach new edges join `.tachyonc/fuzz/NAME/`;
+  - inputs that reach new edges join `.volec/fuzz/NAME/`;
   - mutations: bit flips, byte runs, splices, and a dictionary of the program's
     string constants, which the compiler knows;
   - a crash is shrunk with the property shrinker over bytes, saved, and
     reported as a property is.
-- **`tachyonc test`** replays `tests/fuzz/NAME/*` and the saved crashes as
+- **`volec test`** replays `tests/fuzz/NAME/*` and the saved crashes as
   regression cases. It fuzzes only with `--fuzz S` (S seconds per target).
-- **Not libFuzzer or AFL.** macOS's cc ships no libFuzzer, and tachyon emits its
+- **Not libFuzzer or AFL.** macOS's cc ships no libFuzzer, and vole emits its
   own code. The engine is about 600 lines in std and middle.
 
-### 2.9 `tachyonc test` and `tachyonc reduce`
+### 2.9 `volec test` and `volec reduce`
 
 ```text
-tachyonc test [FILTER...] [ROOT.tach]
+volec test [FILTER...] [ROOT.vl]
   runs: tests/NAME.in cases, #[test], #[property], functions with ensures, fuzz regressions;
         each at -O0 and at -O2 (the first 20 cases of a property at -O0)
   -O N            one level only
@@ -570,13 +570,13 @@ tachyonc test [FILTER...] [ROOT.tach]
 trace on one line, and one `try:`:
 
 ```text
-test main.tach: 14 passed, 2 failed, 1 new snapshot (6 cases, 7 #[test], 2 #[property], 1 contract; -O0 and -O2 agree)
-FAIL empty_input_has_no_tokens: lexer.tach:41:5: assertion failed: 'toks.len() == 0': toks.len() = 1
-  trace: lexer.tach:22 lexer::lex < lexer.tach:41 lexer::tests::empty_input_has_no_tokens
-  try: tachyonc probe lexer.tach:22 i c --test empty_input_has_no_tokens
-FAIL b: exit 101 (expected 0): main.tach:31:17: requires failed: 's.len() > 0' of 'median' (stats.tach:2:14): s.len() = 0
-  trace: main.tach:31 main
-  try: tachyonc probe main.tach:31 groups --input tests/b.in
+test main.vl: 14 passed, 2 failed, 1 new snapshot (6 cases, 7 #[test], 2 #[property], 1 contract; -O0 and -O2 agree)
+FAIL empty_input_has_no_tokens: lexer.vl:41:5: assertion failed: 'toks.len() == 0': toks.len() = 1
+  trace: lexer.vl:22 lexer::lex < lexer.vl:41 lexer::tests::empty_input_has_no_tokens
+  try: volec probe lexer.vl:22 i c --test empty_input_has_no_tokens
+FAIL b: exit 101 (expected 0): main.vl:31:17: requires failed: 's.len() > 0' of 'median' (stats.vl:2:14): s.len() = 0
+  trace: main.vl:31 main
+  try: volec probe main.vl:31 groups --input tests/b.in
 ```
 
 - **The `try:` is a `probe`** at the blamed line, with the condition's names
@@ -588,10 +588,10 @@ FAIL b: exit 101 (expected 0): main.tach:31:17: requires failed: 's.len() > 0' o
 **`reduce` gains three program modes:**
 
 ```text
-tachyonc reduce FILE --until 'CMD'                   (0.17) the lines of an input
-tachyonc reduce PROG.tach --differs [--input F]      a program whose -O0 and -O2 runs disagree
-tachyonc reduce PROG.tach --fails 'TEXT'             a program whose build or run prints TEXT (a compiler crash, an error code)
-tachyonc reduce PROG.tach --test NAME                a failing property or fuzz case's smallest input (saved to tests/corpus)
+volec reduce FILE --until 'CMD'                   (0.17) the lines of an input
+volec reduce PROG.vl --differs [--input F]      a program whose -O0 and -O2 runs disagree
+volec reduce PROG.vl --fails 'TEXT'             a program whose build or run prints TEXT (a compiler crash, an error code)
+volec reduce PROG.vl --test NAME                a failing property or fuzz case's smallest input (saved to tests/corpus)
 ```
 
 - **How a program is reduced.** It removes items, statements, match arms and
@@ -599,8 +599,8 @@ tachyonc reduce PROG.tach --test NAME                a failing property or fuzz 
   their type, and inlines calls (`refactor inline`).
 - **Every candidate goes through the edit engine,** which refuses one that does
   not check. Only the predicate is run.
-- The result is `PROG.min.tach`, or a directory for several files.
-- This is C-Reduce for tachyon, built on its own refactorings. It is for the
+- The result is `PROG.min.vl`, or a directory for several files.
+- This is C-Reduce for vole, built on its own refactorings. It is for the
   gate's fuzz failures and for compiler tasks.
 
 ### 2.10 Distinct types
@@ -647,7 +647,7 @@ These are Go's defined types. The alternatives are in §2.13.
 pub type NonNull<T> = distinct *T invariant self as u64 != 0 else "null pointer made NonNull";
 ```
 
-- **The std API** (std/nonnull.tach):
+- **The std API** (std/nonnull.vl):
   - `NonNull::new(p: *T) -> Option<NonNull<T>>`; `p.as_ptr() -> *T`;
   - `p as *T`; `q as NonNull<T>`, which checks;
   - `*T` gets `is_null()`.
@@ -657,7 +657,7 @@ pub type NonNull<T> = distinct *T invariant self as u64 != 0 else "null pointer 
   about invariants.
 - **C interop.**
   - An `extern "C"` signature may use `NonNull<T>`. C must not return null
-    there: the value is checked when C returns it: `ffi.tach:9:13: null pointer
+    there: the value is checked when C returns it: `ffi.vl:9:13: null pointer
     made NonNull<u8>: 'c::getenv(name)'`.
   - It may also use `Option<NonNull<T>>`, which is nullable, with `*T`'s ABI.
   - cimport keeps `*T` for C's pointers, and imports clang's `_Nonnull` as
@@ -697,7 +697,7 @@ pub type NonNull<T> = distinct *T invariant self as u64 != 0 else "null pointer 
 **Contract syntax.**
 - *Attributes,* `#[requires(c)]` and `#[ensures(|r| ..)]`, as in Rust's
   `core::contracts`, Prusti, Creusot and Kani. Some agents know them, and
-  tachyon already has attributes for effects. Rejected:
+  vole already has attributes for effects. Rejected:
   - a condition is part of the signature, and above it, outside fmt's
     expression layout, it reads badly;
   - a result bound by a closure (`|r|`) is noisier than `result`.
@@ -750,7 +750,7 @@ pub type NonNull<T> = distinct *T invariant self as u64 != 0 else "null pointer 
   - the effects could no longer prove that the workers share nothing mutable.
 - *The front end in a context too:* not needed for threads. The front end stays
   serial in 0.18, and its tables become `Vec<T, Comp>` statics.
-- *Incremental builds by object file per module* (C's way): tachyon compiles
+- *Incremental builds by object file per module* (C's way): vole compiles
   whole programs (inlining, IPO), so per-function keys with recorded reads follow
   the dependencies exactly.
 - *A parallel front end:* 12% of -O2 serial; later.
@@ -763,18 +763,18 @@ them with ` | `.
 
 | code | when | example | `try:` |
 |---|---|---|---|
-| `contract.effect` | a condition does io, allocates or touches a static | `'requires' of 'push' calls 'log', which does io (log.tach:3:5); a condition may not do io, allocate or touch statics` | `tachyonc query effects log --why io` |
-| `contract.old` | `old(e)` of a view, or of an owned value without `.clone()` | `'old(self.items.as_slice())' would view 'self', which 'pop' changes` | `tachyonc edit patch stack.tach:12 --old 'old(self.items.as_slice())' --new 'old(self.items.len())'` |
+| `contract.effect` | a condition does io, allocates or touches a static | `'requires' of 'push' calls 'log', which does io (log.vl:3:5); a condition may not do io, allocate or touch statics` | `volec query effects log --why io` |
+| `contract.old` | `old(e)` of a view, or of an owned value without `.clone()` | `'old(self.items.as_slice())' would view 'self', which 'pop' changes` | `volec edit patch stack.vl:12 --old 'old(self.items.as_slice())' --new 'old(self.items.len())'` |
 | `contract.result` | `result` outside an ensures, or in a function returning `()` | | `edit patch` |
-| `contract.violated` | a requires false for constant arguments; a literal outside a distinct type's invariant | `'get(-1)' violates 'requires 0 <= i' of 'get' (stack.tach:4:14)` | `edit patch` |
-| `contract.sealed` | a field write or struct literal outside the module of a type with an invariant | `'s.max = 3' writes a field of 'Stack', which has an invariant; outside 'crate::stack' use its methods` | `tachyonc query items stack` |
+| `contract.violated` | a requires false for constant arguments; a literal outside a distinct type's invariant | `'get(-1)' violates 'requires 0 <= i' of 'get' (stack.vl:4:14)` | `edit patch` |
+| `contract.sealed` | a field write or struct literal outside the module of a type with an invariant | `'s.max = 3' writes a field of 'Stack', which has an invariant; outside 'crate::stack' use its methods` | `volec query items stack` |
 | `contract.impl-requires` | an impl adds a requires to a trait method | | `edit patch` (move it to the trait) |
-| `distinct.mix` | an operator between a distinct type and another type | `'d + x' adds 'Meters' and 'f64'` | `tachyonc edit patch main.tach:9 --old 'd + x' --new 'd + x as Meters'` |
+| `distinct.mix` | an operator between a distinct type and another type | `'d + x' adds 'Meters' and 'f64'` | `volec edit patch main.vl:9 --old 'd + x' --new 'd + x as Meters'` |
 | `distinct.method` | a method of the underlying type | `'abs' is a method of i64, not of 'NodeId'` | `edit patch ... --new '(id as i64).abs()'` |
 | `distinct.kind` | `distinct` over an owned or view type | | `help:` a struct |
 | `test.signature` | a `#[test]` with parameters other than `gpa: Gpa` | | `edit patch` `#[test]` → `#[property]` |
-| `test.generate` | a property parameter with no generator | `no generator for '*u8' (raw pointer)` | `tachyonc edit insert --after T < impl Arbitrary for T {..}` |
-| `import.wildcard` | `use super::*;` (in a test module or elsewhere) | `wildcard imports are not allowed \| help: a test module sees its parent's items without an import` | `tachyonc edit delete FILE:LINE` (applied by `fix --suggested`, `fix --only imports`) |
+| `test.generate` | a property parameter with no generator | `no generator for '*u8' (raw pointer)` | `volec edit insert --after T < impl Arbitrary for T {..}` |
+| `import.wildcard` | `use super::*;` (in a test module or elsewhere) | `wildcard imports are not allowed \| help: a test module sees its parent's items without an import` | `volec edit delete FILE:LINE` (applied by `fix --suggested`, `fix --only imports`) |
 | `macro.args` | `panic!("{}", x)` | | an f-string, by `edit patch` |
 
 Run-time failures are §2.4's lines, and the test summary is §2.9's.
@@ -798,9 +798,9 @@ Run-time failures are §2.4's lines, and the test summary is §2.9's.
   - New topics: `contracts` (clauses, invariants, `old`, `result`, `debug`, the
     messages, what the optimizer does and does not do) and `testing`
     (`#[test]`, `cfg(test)`, the assert family, snapshots, properties, fuzz,
-    `tachyonc test`'s summary, the level comparison).
+    `volec test`'s summary, the level comparison).
   - `types` gains `distinct` and `NonNull`.
-  - `debug` is rewritten around the failure line, `tachyonc test` and `probe`.
+  - `debug` is rewritten around the failure line, `volec test` and `probe`.
   - The core guide gains three lines (`#[test]`, `assert_eq`, `requires`)
     within its budget.
   - `errors#at-run-time` shows the new line.
@@ -829,12 +829,12 @@ fn median(s: [i64]) -> i64
     let n = s.len();
     s[(n - 1) / 2]          // the bounds check is gone: the entry fact s.len() > 0 implies it
 }
-// stderr: main.tach:31:17: requires failed: 's.len() > 0' of 'median' (stats.tach:2:14): s.len() = 0
+// stderr: main.vl:31:17: requires failed: 's.len() > 0' of 'median' (stats.vl:2:14): s.len() = 0
 ```
 
-The line printed is the caller's (main.tach:31, where the empty group was
+The line printed is the caller's (main.vl:31, where the empty group was
 formed), not the median's. Without the clause, 0.18 still prints the median's
-position (`stats.tach:6:5: index out of bounds: index 0, length 0`), which is
+position (`stats.vl:6:5: index out of bounds: index 0, length 0`), which is
 0.17's first trace frame, without `--trace`.
 
 **2. Haiku's generator, reference program and comparison, as a property** (0.16:
@@ -849,7 +849,7 @@ for f in tests/*.in; do ./prog < $f > got; python3 ref.py < $f > want; cmp got w
 // after: three lines in the program's file
 #[property]
 fn fast_matches_naive(v: Vec<i64>) { assert_eq(max_gap(v.as_slice()), max_gap_naive(v.as_slice())); }
-// tachyonc test: FAIL fast_matches_naive (property, case 12 of 100, shrunk in 9 steps): main.tach:40:38:
+// volec test: FAIL fast_matches_naive (property, case 12 of 100, shrunk in 9 steps): main.vl:40:38:
 //   assertion failed: 'max_gap(v.as_slice()) == max_gap_naive(v.as_slice())': max_gap(v.as_slice()) = 0, max_gap_naive(v.as_slice()) = 5
 //   input: v = [5, 0]
 ```
@@ -857,7 +857,7 @@ fn fast_matches_naive(v: Vec<i64>) { assert_eq(max_gap(v.as_slice()), max_gap_na
 **3. A type with an invariant.**
 
 ```tach
-// stack.tach
+// stack.vl
 pub struct Stack { items: Vec<i64>, max: i64 }
 invariant self.items.len() <= self.max
 
@@ -866,8 +866,8 @@ impl Stack {
         requires self.items.len() < self.max else "push on a full stack"
     { self.items.push(x); }
 }
-// main.tach: 's.max = 3;'
-// main.tach:8:5: error[contract.sealed] 's.max = 3' writes a field of 'Stack', which has an invariant; outside 'crate::stack' use its methods | try: tachyonc query items stack
+// main.vl: 's.max = 3;'
+// main.vl:8:5: error[contract.sealed] 's.max = 3' writes a field of 'Stack', which has an invariant; outside 'crate::stack' use its methods | try: volec query items stack
 ```
 
 **4. Ids that cannot be mixed up** (in the compiler from 0.19).
@@ -878,7 +878,7 @@ type TypeId = distinct i64;
 static mut TYPES: Vec<Type, Comp> = Vec::new_in(Comp {});
 fn type_of(n: NodeId) -> TypeId { NODE_TYPE[n as i64] }
 let t = TYPES[node];
-// check.tach:41:15: error[type error] cannot index 'Vec<Type, Comp>' with 'NodeId' | help: 'TYPES' is indexed by 'i64'; was 'type_of(node)' meant? | try: tachyonc edit patch check.tach:41 --old 'TYPES[node]' --new 'TYPES[type_of(node) as i64]'
+// check.vl:41:15: error[type error] cannot index 'Vec<Type, Comp>' with 'NodeId' | help: 'TYPES' is indexed by 'i64'; was 'type_of(node)' meant? | try: volec edit patch check.vl:41 --old 'TYPES[node]' --new 'TYPES[type_of(node) as i64]'
 ```
 
 **5. C with nullability** (§2.11).
@@ -975,7 +975,7 @@ tool-driven script, proven with `same-output` against the Phase 0 compiler
 **The shared state becomes two contexts.** The new `refactor context` does it:
 
 ```text
-tachyonc refactor context STATIC... --into middle::ctx::FnCtx --param cx [--shared]
+volec refactor context STATIC... --into middle::ctx::FnCtx --param cx [--shared]
 ```
 
 - It makes a struct of the given statics, with their types and initial values
@@ -1039,7 +1039,7 @@ It is useful beyond the compiler: agents' programs with statics. Applied:
   "data and output" is per function too. The join writes the functions in
   their order, as soon as each one is ready (a reorder buffer).
 
-**The pool** (base/threads.tach) is the unsafe island over `pthread_create`,
+**The pool** (base/threads.vl) is the unsafe island over `pthread_create`,
 `pthread_join`, a mutex and a condition variable: a queue of ready tasks,
 `-j N` workers (all cores by default), and the main thread joining.
 - `-j1` runs the same path with no thread.
@@ -1075,7 +1075,7 @@ optimization, no assembly. This is a verifying trace, as in Salsa or Bazel.
 - §4.3's determinism says the output depends on nothing else. Addresses are the
   one risk (§9), and the gate checks for them.
 
-**Storage.** `target/tachyonc-cache/` (beside the query cache, with the same
+**Storage.** `target/volec-cache/` (beside the query cache, with the same
 rules for when it holds): one pack file and an index per option set, compacted
 to at most twice the program's code. `--no-cache` turns it off. It is on by
 default when a `target` directory exists, as for the query cache.
@@ -1091,12 +1091,12 @@ join.
 **The same bytes as a clean build:** the gate builds clean and then
 incrementally after random edits of K functions, and compares the bytes.
 
-**For agents:** the compiler tasks (21–24) rebuild `target/tachyonc` before
-every `tachyonc test` and `tests/run.sh`. Those rebuilds become sub-second.
+**For agents:** the compiler tasks (21–24) rebuild `target/volec` before
+every `volec test` and `tests/run.sh`. Those rebuilds become sub-second.
 
 ## 5. Algorithms and their cost
 
-**Checking clauses** (front/contracts/check.tach).
+**Checking clauses** (front/contracts/check.vl).
 - **The AST.** A function's clauses are a `ContractList` node on its Fn
   (`FnInfo.contracts`), and a type's invariant one on the type.
 - **Checking.** Each condition is checked as a `bool` expression in a scope with
@@ -1107,7 +1107,7 @@ every `tachyonc test` and `tests/run.sh`. Those rebuilds become sub-second.
   - Clauses are checked per instance, as bodies are.
 - **Cost:** one walk per clause, which is nothing for programs without contracts.
 
-**Desugaring, so the back ends change little** (front/contracts/desugar.tach). As
+**Desugaring, so the back ends change little** (front/contracts/desugar.vl). As
 0.17 lowered drops as implicit defers, and f-strings straight to their writes,
 clauses become checked AST before either back end sees them:
 
@@ -1127,7 +1127,7 @@ clauses become checked AST before either back end sees them:
   number. gen0 does the same. The runtime helper prints §2.4's line from the
   site table.
 
-**The site table** (front/contracts/sites.tach, written by both back ends).
+**The site table** (front/contracts/sites.vl, written by both back ends).
 - One record per check site, of the new checks and of the existing bounds,
   unwrap and `as E` checks: about 16 bytes plus interned text.
 - A generated `__site_values(site, block)` prints the operands with their Debug
@@ -1135,12 +1135,12 @@ clauses become checked AST before either back end sees them:
 - Budget: +5% of a program's text and data. T5 measures it on the compiler and
   bench.
 
-**Range facts** (middle/range.tach, middle/ipo.tach, T5).
+**Range facts** (middle/range.vl, middle/ipo.vl, T5).
 - Requires conditions as entry facts, and ensures facts on call results (§2.5).
 - The facts are indexed by value first, the open 0.17 item.
 - Budget: -O2 self-compile instructions within +1%.
 
-**Properties** (std/test.tach, T2).
+**Properties** (std/test.vl, T2).
 - **The choice sequence** is a `Vec<u64>`. Generators draw from it, with sizes
   that grow with the case number.
 - **The shrinker's passes:** delete chunks of 8, 4, 2 and 1 choices; set a
@@ -1150,7 +1150,7 @@ clauses become checked AST before either back end sees them:
   take about 0.3 s.
 - **Time:** 100 cases of a small property take tens of milliseconds.
 
-**Fuzzing** (middle/coverage.tach, std/fuzz.tach, T3).
+**Fuzzing** (middle/coverage.vl, std/fuzz.vl, T3).
 - **Instrumentation:** one counter increment per critical edge, after the edges
   are split, at -O1.
 - **The fork server:** one fork per input. Expect 2,000–5,000 executions per
@@ -1159,7 +1159,7 @@ clauses become checked AST before either back end sees them:
 **Test runs.**
 - An I/O case or `#[test]` costs one fork and exec per level.
 - The -O0 build of a small program takes a few milliseconds.
-- `tachyonc test` on a 300-line program with 10 tests and 2 properties is
+- `volec test` on a 300-line program with 10 tests and 2 properties is
   estimated at under 1 s at both levels.
 
 **Compile time.**
@@ -1182,11 +1182,11 @@ clauses become checked AST before either back end sees them:
    for any prelude name.
 3. **Run-time failure lines** gain a position and lose the `note:` line. Every
    expected stderr in tests/run, examples, the guide's examples and the eval
-   tasks' checkers is regenerated with `tachyonc test --accept`, and the diff is
+   tasks' checkers is regenerated with `volec test --accept`, and the diff is
    read once (T5).
-4. **`tachyonc test`** now runs at two levels and with `--check-alloc`. Cases
-   that leak or differ between levels newly fail. In the tachyon tree,
-   `tachyonc test FILTER` still runs tests/run.sh.
+4. **`volec test`** now runs at two levels and with `--check-alloc`. Cases
+   that leak or differ between levels newly fail. In the vole tree,
+   `volec test FILTER` still runs tests/run.sh.
 5. Nothing has `#[test]` today, so making those items test-only breaks nothing.
 
 **Before 0.17 ships.** Every task is marked "can start now" or "needs 0.17"
@@ -1234,20 +1234,20 @@ compiled programs' output is unchanged.
 
    | file | contents |
    |---|---|
-   | mod.tach | `check_contracts()`, called by `check_program` after `infer_effects()`; accepts and ignores clauses |
-   | desugar.tach | `desugar_call(n)`, `desugar_return(n)`, `desugar_boundary(f)` as no-ops |
-   | sites.tach | `site_of(node, kind) -> i64` and the table |
-   | diag.tach | the codes of §2.14 with stub `explain` entries |
+   | mod.vl | `check_contracts()`, called by `check_program` after `infer_effects()`; accepts and ignores clauses |
+   | desugar.vl | `desugar_call(n)`, `desugar_return(n)`, `desugar_boundary(f)` as no-ops |
+   | sites.vl | `site_of(node, kind) -> i64` and the table |
+   | diag.vl | the codes of §2.14 with stub `explain` entries |
 
-3. **`lower_check` gains a `site` argument** in middle/lower/calls.tach and gen0.
+3. **`lower_check` gains a `site` argument** in middle/lower/calls.vl and gen0.
    With 0 (none) the runtime prints exactly what it prints now.
-4. **std:** std/test.tach (`Arbitrary`, `Gen`, `assert_snapshot`, with
-   `panic("0.18 T2")` bodies) and std/nonnull.tach (`NonNull<T>` in the distinct
+4. **std:** std/test.vl (`Arbitrary`, `Gen`, `assert_snapshot`, with
+   `panic("0.18 T2")` bodies) and std/nonnull.vl (`NonNull<T>` in the distinct
    form), with embed.sh's file list.
 5. **Driver and tools:**
    - `--debug-contracts`, `--coverage` ("not yet") and `-j N` (1 only) are
      accepted;
-   - `tachyonc test`'s new flags, `tachyonc fuzz` and `reduce`'s new modes are
+   - `volec test`'s new flags, `volec fuzz` and `reduce`'s new modes are
      stubs whose errors name the task;
    - `query checks` is a stub.
 6. **The compiler's names fixed for T6 and T7:** `base::Comp` and `base::Ast`
@@ -1268,7 +1268,7 @@ is added to the AST's `Node`), and each shared file gets one-line hooks.
 
 **What phase 0 does.**
 - The parser reads clauses, invariants, `distinct` and the test
-  attributes (front/parser/clauses.tach) into front/contracts's tables:
+  attributes (front/parser/clauses.vl) into front/contracts's tables:
   `CLAUSE_OWNER/KIND/COND/MESSAGE/POS` (`add_clause`, `clause_count`),
   `DISTINCT_ALIASES` (`mark_distinct`, `is_distinct`), `TEST_ITEM/KIND`
   (`add_test_item`, `test_kind`; TEST_FN, TEST_PROPERTY, TEST_FUZZ,
@@ -1279,28 +1279,28 @@ is added to the AST's `Node`), and each shared file gets one-line hooks.
 - A distinct alias is a transparent alias; test items are compiled as
   ordinary items.
 - `lower_check(.., site: i64 = 0)` and `emit_panic(kind, site: i64 = 0)`
-  take a site (always 0, unused); front/contracts/sites.tach has
+  take a site (always 0, unused); front/contracts/sites.vl has
   `site_of` (returns 0) and the kinds.
 - main reads `--debug-contracts`, `-j N` / `-jN` (kept in
   `front::contracts::flags::JOBS`, the compiler still runs on one thread)
   and `--coverage` (an error naming T3).
-- `tachyonc test --accept|--cases|--seed|--no-contracts|--no-check-alloc|--fuzz|--gen`,
-  `tachyonc reduce --differs|--fails|--test` and `tachyonc fuzz` print
+- `volec test --accept|--cases|--seed|--no-contracts|--no-check-alloc|--fuzz|--gen`,
+  `volec reduce --differs|--fails|--test` and `volec fuzz` print
   `error test.not-yet` / `reduce.not-yet` / `fuzz.not-yet` naming the
-  task (tools/v018.tach).
-- `explain` knows the five codes phase 0 prints or names (the `.not-yet` ones, `test.signature`, `test.generate`) (tools/explain/v018_table.tach;
+  task (tools/v018.vl).
+- `explain` knows the five codes phase 0 prints or names (the `.not-yet` ones, `test.signature`, `test.generate`) (tools/explain/v018_table.vl;
   tests/refactor/run.sh wants every entry to be printed somewhere). The
-  other codes of §2.14 are constants in front/contracts/diag.tach, and
+  other codes of §2.14 are constants in front/contracts/diag.vl, and
   each task adds their entries when it starts reporting them (and the
   code's prefix to run.sh's list).
-- `fmt` lays the syntax out (tools/fmt/clauses.tach, three hooks in
-  layout.tach): clause lines continue the signature, a body's `{` after
+- `fmt` lays the syntax out (tools/fmt/clauses.vl, three hooks in
+  layout.vl): clause lines continue the signature, a body's `{` after
   them is at the signature's level, the line after an `invariant` starts
   an item, `distinct *T` is a prefix `*`.
 - std gains two lazy sections, loaded only when a program names them:
-  `Testing (0.18)` (compiler/std/test.tach: `Arbitrary`, `Gen`,
+  `Testing (0.18)` (compiler/std/test.vl: `Arbitrary`, `Gen`,
   `assert_snapshot`, bodies that panic) and `Non-null pointers (0.18)`
-  (compiler/std/nonnull.tach: `NonNull<T>` in the distinct form).
+  (compiler/std/nonnull.vl: `NonNull<T>` in the distinct form).
 - The compiler's names: `base::comp::{Comp, Ast}` (zero-sized
   `impl Allocator`, on C's allocator for now) and `middle::ctx::{FnCtx,
   Program}` with `Program::freeze()`; docs/design/018-migration/.
@@ -1309,7 +1309,7 @@ is added to the AST's `Node`), and each shared file gets one-line hooks.
 - the assert family and the bang spellings go to **T1**: their prelude
   names would take the prelude past its 64 entries together with 0.17's
   `Drop`, `drop`, `forget`, `needs_drop`, `take` and `replace`
-  (`PRELUDE_DECLARED: [bool; 64]` in front/modules/lookup.tach), so T1
+  (`PRELUDE_DECLARED: [bool; 64]` in front/modules/lookup.vl), so T1
   adds them after c17-phase0's merge, raising that bound;
 - cloning a generic function's clauses into its instances (**T1**);
 - leaving test items out of other builds, a test module's view of its
@@ -1324,28 +1324,28 @@ is added to the AST's `Node`), and each shared file gets one-line hooks.
 
 | task | owns (new files are its own) | its hooks (already in place) | must not touch |
 |---|---|---|---|
-| T1 | front/contracts/{mod,desugar,diag}.tach (the tables' readers, `check_contracts`), the clause lines of compiler/std/*.tach, the prelude entries for the assert family, the bang spellings in front/parser/exprs.tach (`parse_primary`'s `at_macro_call` branch), tests/run/contract_* | `check_contracts()` in `check_program`; the parser's `parse_clauses`, `parse_type_invariant` | the table layout in front/contracts/mod.tach (add tables, do not change these), front/parser/clauses.tach's grammar (ask the lead), other tasks' std files |
-| T2 | tools/testrun/*, front/tests/* (new), compiler/std/test.tach, tools/v018.tach's `test_option018`, tests/testcmd/* | `test_option018` in `test_inner`; `TEST_ITEM/KIND`; `at_cfg_test`/`parse_cfg_test_item` in `parse_top_item` | the parser's hooks (read the tables instead), main's option loop |
-| T3 | middle/coverage.tach (new), compiler/std/fuzz.tach (new, a lazy section), tools/reduce.tach's program modes, tools/v018.tach's `run_fuzz` and `reduce_mode018` | `run_fuzz` in `run_command`; `reduce_mode018` in `reduce_inner`; `--coverage` in front/contracts/flags.tach | gen0 beyond one hook line; T2's harness (call it) |
-| T4 | the distinct kind in front/types.tach, the operator and conversion parts of front/check, front/layout's niche, compiler/std/nonnull.tach, front/cimport's `_Nonnull`, tests/run/distinct_*, nonnull_* | `DISTINCT_ALIASES`; `parse_alias_target` | the clause tables (an invariant is T1's to check) |
-| T5 | front/contracts/sites.tach, the `site` argument's use in middle/lower/calls.tach and gen0/target.tach (`emit_runtime`), middle/range.tach, middle/ipo.tach, `query checks` | `lower_check(.., site)`, `emit_panic(kind, site)`, `site_of` | the parser; the checker |
-| T6 | base/comp.tach, front/tools/base edits by replayed scripts (docs/design/018-migration/front-*) | `Comp`, `Ast` | middle, back, gen0 |
-| T7 | middle/ctx.tach, base/threads.tach (new), back/emit/join.tach (new), tools/refactor_ctx/ (new), middle/back/gen0 edits by replayed scripts (middle-*) | `FnCtx`, `Program::freeze`, `JOBS` | front; the files T5 owns until T5 has merged |
-| T8 | back/codecache.tach (new), Program's read recording, tests/incremental/ | T7's Program | T7's schedule |
-| T9 | tools/query (clauses in def/show/context), tools/fmt (with tools/fmt/clauses.tach), refactor's clause handling, fix's `--suggested` forms and the `use super::*` deletion, tools/explain/v018_table.tach's texts, compiler/guide/*, docs, tools/agent-hooks/check-after-edit.py, tests/agent-eval tasks | the explain table | the compiler's semantics |
+| T1 | front/contracts/{mod,desugar,diag}.vl (the tables' readers, `check_contracts`), the clause lines of compiler/std/*.vl, the prelude entries for the assert family, the bang spellings in front/parser/exprs.vl (`parse_primary`'s `at_macro_call` branch), tests/run/contract_* | `check_contracts()` in `check_program`; the parser's `parse_clauses`, `parse_type_invariant` | the table layout in front/contracts/mod.vl (add tables, do not change these), front/parser/clauses.vl's grammar (ask the lead), other tasks' std files |
+| T2 | tools/testrun/*, front/tests/* (new), compiler/std/test.vl, tools/v018.vl's `test_option018`, tests/testcmd/* | `test_option018` in `test_inner`; `TEST_ITEM/KIND`; `at_cfg_test`/`parse_cfg_test_item` in `parse_top_item` | the parser's hooks (read the tables instead), main's option loop |
+| T3 | middle/coverage.vl (new), compiler/std/fuzz.vl (new, a lazy section), tools/reduce.vl's program modes, tools/v018.vl's `run_fuzz` and `reduce_mode018` | `run_fuzz` in `run_command`; `reduce_mode018` in `reduce_inner`; `--coverage` in front/contracts/flags.vl | gen0 beyond one hook line; T2's harness (call it) |
+| T4 | the distinct kind in front/types.vl, the operator and conversion parts of front/check, front/layout's niche, compiler/std/nonnull.vl, front/cimport's `_Nonnull`, tests/run/distinct_*, nonnull_* | `DISTINCT_ALIASES`; `parse_alias_target` | the clause tables (an invariant is T1's to check) |
+| T5 | front/contracts/sites.vl, the `site` argument's use in middle/lower/calls.vl and gen0/target.vl (`emit_runtime`), middle/range.vl, middle/ipo.vl, `query checks` | `lower_check(.., site)`, `emit_panic(kind, site)`, `site_of` | the parser; the checker |
+| T6 | base/comp.vl, front/tools/base edits by replayed scripts (docs/design/018-migration/front-*) | `Comp`, `Ast` | middle, back, gen0 |
+| T7 | middle/ctx.vl, base/threads.vl (new), back/emit/join.vl (new), tools/refactor_ctx/ (new), middle/back/gen0 edits by replayed scripts (middle-*) | `FnCtx`, `Program::freeze`, `JOBS` | front; the files T5 owns until T5 has merged |
+| T8 | back/codecache.vl (new), Program's read recording, tests/incremental/ | T7's Program | T7's schedule |
+| T9 | tools/query (clauses in def/show/context), tools/fmt (with tools/fmt/clauses.vl), refactor's clause handling, fix's `--suggested` forms and the `use super::*` deletion, tools/explain/v018_table.vl's texts, compiler/guide/*, docs, tools/agent-hooks/check-after-edit.py, tests/agent-eval tasks | the explain table | the compiler's semantics |
 
 ### The tasks
 
 | task | owns | consumes | provides |
 |---|---|---|---|
-| **T1 Contracts** | front/contracts/{check,desugar,old}.tach; the clause lines in compiler/std/{std,iter,io,alloc}.tach; tests/run/contract_*, err_contract_* | P0 | clause checking, purity, `old`/`result`, call-site requires with checking entries, ensures, type invariants and `contract.sealed`, `debug`, the assert family, `contract.violated` at compile time, std's clauses (and its redundant internal checks removed) |
-| **T2 Tests and properties** | tools/testrun/*, front/tests/* (collection, the test entry, `cfg(test)` scoping), compiler/std/test.tach, tests/testcmd/* | P0; T1's assert (staged) | `#[test]`, harness, fork per test, parallel runs, check-alloc leaks, snapshots and `--accept`, the -O0/-O2 comparison, `#[property]` (generators, `Arbitrary`, shrinking, corpus), contracts as properties, `--against`/`--gen`, the summary format, `probe --test/--seed` |
-| **T3 Fuzzing and reduce** | middle/coverage.tach, the gen0 hook, compiler/std/fuzz.tach, tools/reduce.tach and tools/reduce/*, tools/fuzzcmd.tach | P0; T2's harness and shrinker | `--coverage`, `tachyonc fuzz`, the fork server, the corpus, regressions in `test`; `reduce --differs/--fails/--test` over the edit engine |
-| **T4 Distinct and NonNull** | front/types.tach (the distinct kind), the conversion and operator parts of front/check, front/layout (the niche), compiler/std/nonnull.tach, front/cimport (`_Nonnull`), tests/run/distinct_*, nonnull_* | P0 | §2.10 and §2.11, `distinct.*` codes, `is_null` |
-| **T5 Checks: positions, optimizer** | middle/range.tach, middle/ipo.tach, gen0/target.tach's runtime, back's site table data, tools/query/checks.tach, bench | P0; T1's desugaring | the site table and §2.4's lines for every check, the expected-output regeneration, entry and result facts, indexed facts, `query checks`, `--print-checks`, identical-body folding |
-| **T6 Compiler: front, tools, base on values and arenas** | scripts in docs/design/018-migration/front-*.txt; base/comp.tach; tools/refactor_table/ | 0.17.0; P0's names | §4.1: `Comp`/`Ast`, IntVec → Vec, `refactor table`, `fix --values` on front, tools and base, the release of `Ast` after lowering |
-| **T7 Compiler: middle, back, gen0; threads** | scripts in docs/design/018-migration/middle-*.txt; tools/refactor_ctx/; middle/ctx.tach; base/threads.tach; back/emit/join.tach | 0.17.0 (0.17.1 optional); T5 merged before its replay | §4.2 and §4.3: `refactor context`, FnCtx and Program, `fix --values` there, per-function arenas and the inline store, the pool, the deterministic join, per-component inline budgets, `-j` |
-| **T8 Incremental** | back/codecache.tach, Program's read recording (after T7's context step), tests/incremental/* | T7 step 1 | §4.4: keys, read sets, the pack, the gate's clean-against-incremental check |
+| **T1 Contracts** | front/contracts/{check,desugar,old}.vl; the clause lines in compiler/std/{std,iter,io,alloc}.vl; tests/run/contract_*, err_contract_* | P0 | clause checking, purity, `old`/`result`, call-site requires with checking entries, ensures, type invariants and `contract.sealed`, `debug`, the assert family, `contract.violated` at compile time, std's clauses (and its redundant internal checks removed) |
+| **T2 Tests and properties** | tools/testrun/*, front/tests/* (collection, the test entry, `cfg(test)` scoping), compiler/std/test.vl, tests/testcmd/* | P0; T1's assert (staged) | `#[test]`, harness, fork per test, parallel runs, check-alloc leaks, snapshots and `--accept`, the -O0/-O2 comparison, `#[property]` (generators, `Arbitrary`, shrinking, corpus), contracts as properties, `--against`/`--gen`, the summary format, `probe --test/--seed` |
+| **T3 Fuzzing and reduce** | middle/coverage.vl, the gen0 hook, compiler/std/fuzz.vl, tools/reduce.vl and tools/reduce/*, tools/fuzzcmd.vl | P0; T2's harness and shrinker | `--coverage`, `volec fuzz`, the fork server, the corpus, regressions in `test`; `reduce --differs/--fails/--test` over the edit engine |
+| **T4 Distinct and NonNull** | front/types.vl (the distinct kind), the conversion and operator parts of front/check, front/layout (the niche), compiler/std/nonnull.vl, front/cimport (`_Nonnull`), tests/run/distinct_*, nonnull_* | P0 | §2.10 and §2.11, `distinct.*` codes, `is_null` |
+| **T5 Checks: positions, optimizer** | middle/range.vl, middle/ipo.vl, gen0/target.vl's runtime, back's site table data, tools/query/checks.vl, bench | P0; T1's desugaring | the site table and §2.4's lines for every check, the expected-output regeneration, entry and result facts, indexed facts, `query checks`, `--print-checks`, identical-body folding |
+| **T6 Compiler: front, tools, base on values and arenas** | scripts in docs/design/018-migration/front-*.txt; base/comp.vl; tools/refactor_table/ | 0.17.0; P0's names | §4.1: `Comp`/`Ast`, IntVec → Vec, `refactor table`, `fix --values` on front, tools and base, the release of `Ast` after lowering |
+| **T7 Compiler: middle, back, gen0; threads** | scripts in docs/design/018-migration/middle-*.txt; tools/refactor_ctx/; middle/ctx.vl; base/threads.vl; back/emit/join.vl | 0.17.0 (0.17.1 optional); T5 merged before its replay | §4.2 and §4.3: `refactor context`, FnCtx and Program, `fix --values` there, per-function arenas and the inline store, the pool, the deterministic join, per-component inline budgets, `-j` |
+| **T8 Incremental** | back/codecache.vl, Program's read recording (after T7's context step), tests/incremental/* | T7 step 1 | §4.4: keys, read sets, the pack, the gate's clean-against-incremental check |
 | **T9 Tools, guide, eval preparation** | tools/query (def/show/context clauses), tools/fmt, refactor's clause handling, fix (`--suggested` forms, the deletion of `use super::*`), explain entries, compiler/guide/{contracts,testing,debug,errors,core,types}.md, docs/{grammar,query,refactor}.md, tools/agent-hooks/check-after-edit.py, tests/agent-eval tasks (§8) | P0 shapes; T1/T2 outputs | §2.14 |
 
 **When each task can start.** Releases are pipelined: 0.18's tasks begin
@@ -1438,26 +1438,26 @@ the previous release, and nothing below uses 0.17's syntax until 0.17 ships.
     - clean against incremental comparison;
     - the bench gate.
 
-std's `stdsrc.tach` conflicts are resolved by rerunning embed.sh. Each task
+std's `stdsrc.vl` conflicts are resolved by rerunning embed.sh. Each task
 appends "Tn notes" here.
 
 **T1 and T5 notes (branch b18-contracts).**
-- *How clauses are made* (front/contracts/expand.tach): before the names
+- *How clauses are made* (front/contracts/expand.vl): before the names
   are collected, a function with a `requires` gets a companion
   `f$pre(?site, <params>)` beside it (same module, impl, generics), and one
   with an `ensures` has its body moved to `f$body`, f calling it and
   checking `result` (`old(e)` are lets at entry). Being ordinary functions,
   they are instantiated, lazy in std and inferred like any other; nothing
   is cloned per instance by hand. A checked call of f becomes `{ let ?aI =
-  argI; f$pre(SITE, ..); f(..) }` (desugar.tach; simple reads are read
+  argI; f$pre(SITE, ..); f(..) }` (desugar.vl; simple reads are read
   again, not bound). Both back ends lower `std::contract_check(COND, SITE,
   CHECK[, holes])` as a branch per `&&` conjunct to rt.panic.
-- *Reports* (checks.tach): the integer operands of a comparison or call;
+- *Reports* (checks.vl): the integer operands of a comparison or call;
   other values are not shown yet (no Debug on the failing path). `else
   "m"` replaces the condition; `else f"..."` takes up to three integer
   holes, evaluated only on failure, which keeps std's old messages byte for
   byte. An ensures blames the clause's line, not the return's.
-- *Sites* (sites.tach): one per position, (line, file << 16 | column) in
+- *Sites* (sites.vl): one per position, (line, file << 16 | column) in
   rt.sites; rt.panic takes the site as a fifth argument and prints
   `FILE:LINE:COL: ` first. `--no-positions` makes every site 0. The `note:
   build with --trace` line is kept for now.
@@ -1475,21 +1475,21 @@ appends "Tn notes" here.
   ranges).
 
 **The gate gains:**
-- the level comparison over tests/run's programs as `tachyonc test` runs it;
+- the level comparison over tests/run's programs as `volec test` runs it;
 - a fuzz mode (`-K`) whose generated programs carry clauses (the outcome must
   be the same at every level);
 - the `-j` and incremental byte comparisons;
-- `TACHYON_ARENA_SHUFFLE`, which randomizes the arenas' chunk addresses, so
+- `VOLE_ARENA_SHUFFLE`, which randomizes the arenas' chunk addresses, so
   that any address-dependent output shows up as a byte difference.
 
 **T4 notes** (b18-distinct).
-- A distinct type is `TyKind::Distinct` (front/distinct.tach) while the
-  program is checked; `erase_program_types` (front/check/distinct.tach)
+- A distinct type is `TyKind::Distinct` (front/distinct.vl) while the
+  program is checked; `erase_program_types` (front/check/distinct.vl)
   then writes its underlying type wherever the code generators read
   types (node types, fields, signatures, variants, statics, locals), so
   middle, back and gen0 never see one. Tools (QUERY) keep it.
 - The inherited traits are std's `distinct_eq/cmp/hash/fmt/fmt_debug/clone`
-  (clone.tach), called through `intrinsic_method` with `<X, T>`; an
+  (clone.vl), called through `intrinsic_method` with `<X, T>`; an
   explicit impl wins. Generic distinct types have generic impls through
   `TPL_DISTINCT + alias` (`impl<T> NonNull<T>`, `NonNull::new`).
 - The niche knows std's `NonNull` by its alias (std's module, that name),
@@ -1522,12 +1522,12 @@ under about 15%), 3 for Sonnet.
 | # | hypothesis | cells | measure | success |
 |---|---|---|---|---|
 | E1 | A contract violation names the line to change and its values, so bug fixes cost less | 07-fix-bugs and 17-debug-crash with the starter's functions given clauses (the same code otherwise) against the starters as they are; guide-mini+readfirst | cost × Rust; turns until the first edit of the faulty function; distinct run-time failures seen | cost −15% or more, and turns-to-the-fix halved, for both models |
-| E2 | Tests in the language replace scripts and files | 01–06, 15 unchanged | per run: `Write` of `.in`/`.py` files, `run > run > run` chains, `#[test]`/`#[property]` written, `tachyonc test` calls | Haiku's run chains per run halved without a prompt change (D3/D5), or with one line in the loop |
-| E3 | Failures far from their cause need the new facts | new tasks 25-deep-cause (a wrong value made in module A, a crash three calls later in module C; the Rust twin has the same checks as `assert!`) and 26-edge-case (a spec'd function with one edge case that properties find) | as E1 | tachyon at or below Rust's cost on 25 (Rust's asserts give no caller line) |
+| E2 | Tests in the language replace scripts and files | 01–06, 15 unchanged | per run: `Write` of `.in`/`.py` files, `run > run > run` chains, `#[test]`/`#[property]` written, `volec test` calls | Haiku's run chains per run halved without a prompt change (D3/D5), or with one line in the loop |
+| E3 | Failures far from their cause need the new facts | new tasks 25-deep-cause (a wrong value made in module A, a crash three calls later in module C; the Rust twin has the same checks as `assert!`) and 26-edge-case (a spec'd function with one edge case that properties find) | as E1 | vole at or below Rust's cost on 25 (Rust's asserts give no caller line) |
 | E4 | No new cost on small tasks (D5) | 01, 03, 06 | cost × Rust against night-final's cells | within noise |
 
 **`anatomy` gains:** contract and assertion failures seen per run, clauses and
-tests written, `tachyonc test` calls and their summary lines, and probe calls
+tests written, `volec test` calls and their summary lines, and probe calls
 that follow a summary's `try:`.
 
 The compiler tasks (21–24) gain contracts and tests only from 0.19, when
@@ -1548,7 +1548,7 @@ rebuilds: wall time per run, and the build share of it.
   applies costs a day.
 - **Determinism.** Output that depends on addresses (a hash table keyed by
   pointers, iteration order) would break the `-j` and cache byte equality, and
-  the arenas change addresses. `TACHYON_ARENA_SHUFFLE` and the byte comparisons
+  the arenas change addresses. `VOLE_ARENA_SHUFFLE` and the byte comparisons
   catch it. Order-dependent program state other than the inlining budget may
   turn up. Each piece found becomes per-function state joined in order.
 - **The speedup** is bounded by the 12% serial part, the efficiency cores and
@@ -1606,12 +1606,12 @@ is listed again under "Decisions taken".
   A front end in a context is a later step, should the front end go parallel.
 - **Q8. Test builds use `--check-alloc` and leaks fail a test.** *Recommended:
   yes,* with `--no-check-alloc`.
-- **Q9. `tachyonc test` compares -O0 and -O2 by default.** *Recommended: yes*
+- **Q9. `volec test` compares -O0 and -O2 by default.** *Recommended: yes*
   (it costs a few milliseconds per case on agents' programs, and it is the
   roadmap's built-in).
 - **Q10. Every run-time check prints its position** (a site table, about +5%
   binary size), and the `note:` line goes. *Recommended: yes.*
-- **Q11. Functions with `ensures` are tested as properties by `tachyonc test`.**
+- **Q11. Functions with `ensures` are tested as properties by `volec test`.**
   *Recommended: yes,* with `--no-contracts`.
 - **Q12. Loop invariants** (`while c invariant e { }`). *Recommended: not in
   0.18;* `assert` at the top of the body checks the same thing at run time, and
@@ -1647,24 +1647,24 @@ is listed again under "Decisions taken".
 
 ### Critical files for implementation
 
-- compiler/src/front/parser/items/mod.tach (`parse_type_alias`, the fn
-  signature and attribute parsing) and compiler/src/front/check/mod.tach
+- compiler/src/front/parser/items/mod.vl (`parse_type_alias`, the fn
+  signature and attribute parsing) and compiler/src/front/check/mod.vl
   (`check_program`: where `check_contracts` runs, after `infer_effects`)
-- compiler/src/middle/lower/calls.tach (`lower_check`, `lower_panic`: the site
-  argument), compiler/src/gen0/target.tach (`emit_runtime`, `emit_panic`,
-  `PANIC_USED`: the failure line) and compiler/src/middle/trace.tach (the frames)
-- compiler/src/middle/range.tach (facts, `narrow_by_facts`) and
-  compiler/src/middle/ipo.tach (`call_attrs`: result facts)
-- compiler/src/tools/testrun/mod.tach (`run_program`, `run_case`,
-  `put_failures`: the harness and the summary) and compiler/src/tools/reduce.tach,
+- compiler/src/middle/lower/calls.vl (`lower_check`, `lower_panic`: the site
+  argument), compiler/src/gen0/target.vl (`emit_runtime`, `emit_panic`,
+  `PANIC_USED`: the failure line) and compiler/src/middle/trace.vl (the frames)
+- compiler/src/middle/range.vl (facts, `narrow_by_facts`) and
+  compiler/src/middle/ipo.vl (`call_attrs`: result facts)
+- compiler/src/tools/testrun/mod.vl (`run_program`, `run_case`,
+  `put_failures`: the harness and the summary) and compiler/src/tools/reduce.vl,
   compiler/src/tools/probe/
-- compiler/src/back/emit/function.tach (`emit_ir_functions`: the per-function
+- compiler/src/back/emit/function.vl (`emit_ir_functions`: the per-function
   pipeline that becomes the parallel schedule), compiler/src/middle/ir/
-  (`ir_enter`, `ir_free_func`, `IRTables`), compiler/src/middle/inline.tach
+  (`ir_enter`, `ir_free_func`, `IRTables`), compiler/src/middle/inline.vl
   (`PROGRAM_SIZE`, `should_inline`)
-- compiler/src/front/effects/infer.tach (`infer_effects`, SCCs: purity of
+- compiler/src/front/effects/infer.vl (`infer_effects`, SCCs: purity of
   conditions and the workers' declaration)
-- docs/query.md "Speed: the cache" and compiler/src/tools/query/cache.tach (the
+- docs/query.md "Speed: the cache" and compiler/src/tools/query/cache.vl (the
   code cache's neighbour)
 
 ## Decisions taken (for the user's review)
@@ -1697,9 +1697,9 @@ later by a `fix` migration or a flag.
    `try:` deletes the line, applied by `fix --suggested` and `fix --only
    imports`. *Decided 2026-10-16* (coordinator, on the user's standing rule).
 9. **Test builds use `--trace` and `--check-alloc`,** and leaks fail (Q8).
-   `tachyonc test` compares -O0 and -O2 by default (Q9).
+   `volec test` compares -O0 and -O2 by default (Q9).
 10. **Properties:** integrated shrinking; contracts with `ensures` are tested
-    as properties by default (Q11); fuzz targets share the engine; tachyon's own
+    as properties by default (Q11); fuzz targets share the engine; vole's own
     coverage-guided fuzzer (no libFuzzer).
 11. **`reduce` gains program modes** (`--differs`, `--fails`, `--test`) built on
     the edit engine.
@@ -1734,9 +1734,9 @@ later by a `fix` migration or a flag.
   sections the generated code names are loaded: one `<test>` source per
   module with tests (or a type a property generates), in that module, so
   that private names resolve. The program's root `main` is renamed
-  `__tachyon_program_main`; the made `main(argc, argv, gpa)` runs
-  `--tachyon-test NAME` (or `--tachyon-list`). Each module on the way to a
-  test gets a `pub fn __tachyon_tests(name, gpa) -> bool` dispatcher.
+  `__vole_program_main`; the made `main(argc, argv, gpa)` runs
+  `--vole-test NAME` (or `--vole-list`). Each module on the way to a
+  test gets a `pub fn __vole_tests(name, gpa) -> bool` dispatcher.
 - **Generators are made, not derived by traits:** a parameter's type is
   turned into an expression (`std::gen_vec(g, |g: &mut std::Gen| ..)` for
   `Vec<T>`, tuples element by element, `[T]` an owned Vec lent); any other
@@ -1748,7 +1748,7 @@ later by a `fix` migration or a flag.
   `compile_program` only: `check` and the queries see (and check) them.
   The lookup hook makes a `#[cfg(test)]` module see its parent's items
   (and its parent's imports) before the prelude.
-- **The runtime** (std/test.tach, "The test runtime's implementation"):
+- **The runtime** (std/test.vl, "The test runtime's implementation"):
   a property's cases each run in a forked child (stdout and stderr to
   /dev/null); the child tells the choices it used through a pipe. Sizes
   grow over 100 cases whatever `--cases` is, so -O0's 20 cases are -O2's
@@ -1758,11 +1758,11 @@ later by a `fix` migration or a flag.
   processes. Leaks of a `#[test]` are checked by the made code with
   --check-alloc (`gpa.live_blocks()`); properties are not leak-checked
   until 0.17's drops free their values.
-- **The runner** (tools/testrun/program.tach): builds the program and the
-  test binary at -O2 then -O0 (.tachyonc/test/O2, O0), runs every case
+- **The runner** (tools/testrun/program.vl): builds the program and the
+  test binary at -O2 then -O0 (.volec/test/O2, O0), runs every case
   and test as its own process, as many at once as there are processors,
   -O2's first (new snapshots are written then compared at -O0). A time
-  limit at either level is not compared. `TACHYON_PLANT_MISCOMPILE` (a
+  limit at either level is not compared. `VOLE_PLANT_MISCOMPILE` (a
   test-only switch: -O1/-O2 read the literal 12345 as 12346) is in the
   build key.
 - **Left for 0.18.1:** `probe --test/--seed`, `--against CMD --gen CMD`,
@@ -1780,8 +1780,8 @@ later by a `fix` migration or a flag.
   after lowering, as --profile-generate's counters are, so the optimizer
   sees ordinary loads and stores (no new IR operation). -O0 is promoted to
   -O1. A program built with --coverage but no fuzz target gets an anchor
-  (`__tachyon_coverage`) so that the map exists and the counters run.
-- **The fuzzer** is in the test binary (std/fuzz.tach): one fork per run,
+  (`__vole_coverage`) so that the map exists and the counters run.
+- **The fuzzer** is in the test binary (std/fuzz.vl): one fork per run,
   the child's counters sent back through a pipe, AFL's count buckets,
   mutations over the input's bytes (bits, bytes, runs deleted or
   repeated, splices, the program's string constants). It found the

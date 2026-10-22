@@ -1,0 +1,289 @@
+// Divisions by constants (isel/mod.vl, step 1b): x / d and x % d as a
+// multiplication by a magic number.
+
+use crate::front::types::{TY_I64, TY_U64, int_bits, is_integer, is_signed};
+use crate::middle::ctx::FnCtx;
+use crate::middle::fold::{const_before, op_before};
+use crate::middle::ir::{IRFUNCS, ir_replace};
+use crate::middle::ir::Op::{Add, Const, Div, Mul, MulH, Neg, Rem, Shr, Sub};
+use crate::middle::opt::resolve_all;
+
+// ---- Divisions by constants (0.11) ----
+//
+// x / d for a constant d is a multiplication by a magic number (T.
+// Granlund and P. Montgomery, "Division by Invariant Integers using
+// Multiplication", PLDI 1994; H. S. Warren, "Hacker's Delight", chapter
+// 10), on the canonical 64-bit x:
+//
+//   unsigned, up to 32 bits   mulh(x, m), m = 2^64 / d rounded up
+//   u64                       mulh(x, m) >> s; or, when the magic number
+//                             has 65 bits, t = mulh(x, m) and
+//                             (((x - t) >> 1) + t) >> (s - 1)
+//   signed, up to 32 bits     t = (x * m) >> (bits + s), a 64-bit product
+//                             (the magic number's corrections folded into
+//                             m), then t - (t >> 63): one more when negative
+//   i64                       t = smulh(x, m), + x or - x when m's sign is
+//                             not d's, >> s, then t - (t >> 63)
+//   unsigned 2^k              x >> k (instcombine leaves 2^63 for u64)
+//   1, -1                     x, -x (wrapping: MIN / -1 is MIN)
+//
+// x % d is x - q * d (msub on AArch64), and shares q with an x / d of the
+// block. Division by 0 stays as it is (x / 0 is 0, x % 0 is x, as the
+// division instructions give them), and so do signed divisions by the
+// negative powers of two and MIN, which instcombine does not take.
+
+pub fn lower_divisions(cx: sink *FnCtx, fi: i64) {
+    resolve_all(cx, fi);
+    unsafe {
+        for b in IRFUNCS[fi].blocks.items() {
+            if cx.blocks[b].removed != 0 {
+                continue;
+            }
+            cx.div_seen.count = 0;
+            var v = cx.blocks[b].first;
+            while v != 0 {
+                let next = cx.insts[v].next;
+                let op = cx.insts[v].op;
+                if (op == Div || op == Rem) && is_integer(cx.insts[v].ty)
+                    && cx.insts[cx.insts[v].b].op == Const {
+                    lower_division(cx, v);
+                }
+                v = next;
+            }
+        }
+    }
+}
+
+// Division or remainder v by a constant: the quotient by multiplication
+// (shared by a quotient and a remainder of the same operands in a block),
+// the remainder x - q * d.
+fn lower_division(cx: sink *FnCtx, v: i64) {
+    unsafe {
+        let ty = cx.insts[v].ty;
+        let x = cx.insts[v].a;
+        let d = cx.insts[cx.insts[v].b].imm;
+        var q = 0;
+        var k = 0;
+        while k < cx.div_seen.count {
+            if cx.div_seen.data[k] == x && cx.div_seen.data[k + 1] == d
+                && cx.div_seen.data[k + 2] == ty {
+                q = cx.div_seen.data[k + 3];
+                break;
+            }
+            k += 4;
+        }
+        if q == 0 {
+            q = make_quotient(cx, v, x, d, ty);
+            if q == 0 {
+                return;
+            }
+            cx.div_seen.push(x);
+            cx.div_seen.push(d);
+            cx.div_seen.push(ty);
+            cx.div_seen.push(q);
+        }
+        if cx.insts[v].op == Div {
+            ir_replace(cx, v, q);
+            return;
+        }
+        if is_signed(ty) && d == -1 {
+            ir_replace(cx, v, const_before(cx, v, 0, ty));
+            return;
+        }
+        let product = op_before(cx, v, Mul, ty, q, const_before(cx, v, d, ty));
+        ir_replace(cx, v, op_before(cx, v, Sub, ty, x, product));
+    }
+}
+
+// The high half of x * m (inserted before v).
+fn mulh_before(cx: sink *FnCtx, v: i64, ty: i64, x: i64, m: i64, signed: bool) -> i64 {
+    let h = op_before(cx, v, MulH, ty, x,
+        const_before(cx, v, m, if signed { TY_I64 } else { TY_U64 }));
+    unsafe { cx.insts[h].imm = if signed { 1 } else { 0 }; }
+    h
+}
+
+// k for d = 2^k (d as unsigned), or -1.
+fn exact_log2(d: u64) -> i64 {
+    if d == 0 || (d & (d - 1)) != 0 {
+        return -1;
+    }
+    var k = 0;
+    while (d >> k as u64) != 1 {
+        k += 1;
+    }
+    k
+}
+
+// x / d for the constant d (canonical for ty), computed before v from the
+// canonical 64-bit x; 0 when the division stays (by 0, which has its
+// defined result, and by negative powers of two).
+fn make_quotient(cx: sink *FnCtx, v: i64, x: i64, d: i64, ty: i64) -> i64 {
+    let bits = int_bits(ty);
+    if d == 0 {
+        return 0;
+    }
+    if !is_signed(ty) {
+        let ud = d as u64;
+        let k = exact_log2(ud);
+        if k == 0 {
+            return x;
+        }
+        if k > 0 {
+            return op_before(cx, v, Shr, ty, x, const_before(cx, v, k, ty));
+        }
+        if bits <= 32 {
+            // m = 2^64 / d rounded up: for x < 2^bits, x * m / 2^64 differs
+            // from x / d by less than x / 2^64 <= 1 / d, too little to
+            // reach the next integer.
+            let m = 0xffffffffffffffff as u64 / ud + 1;
+            return mulh_before(cx, v, ty, x, m as i64, signed: false);
+        }
+        var m: u64 = 0;
+        var add = false;
+        var s = 0;
+        magic_unsigned(ud, &m, &add, &s);
+        let t = mulh_before(cx, v, TY_U64, x, m as i64, signed: false);
+        if !add {
+            return op_before(cx, v, Shr, TY_U64, t, const_before(cx, v, s, TY_U64));
+        }
+        // m is 2^64 + the constant: q = (((x - t) >> 1) + t) >> (s - 1).
+        let half = op_before(cx, v, Shr, TY_U64, op_before(cx, v, Sub, TY_U64, x, t),
+            const_before(cx, v, 1, TY_U64));
+        let sum = op_before(cx, v, Add, TY_U64, half, t);
+        return op_before(cx, v, Shr, TY_U64, sum, const_before(cx, v, s - 1, TY_U64));
+    }
+    if d == 1 {
+        return x;
+    }
+    if d == -1 {
+        // Wrapping: MIN / -1 is MIN.
+        return op_before(cx, v, Neg, ty, x, 0);
+    }
+    let ad = if d < 0 { (0 - d) as u64 } else { d as u64 };
+    if exact_log2(ad) >= 0 {
+        return 0;
+    }
+    var m = 0;
+    var s = 0;
+    magic_signed(d, bits, &m, &s);
+    var t = 0;
+    if bits <= 32 {
+        // The bits-wide magic with its correction folded in, and a 64-bit
+        // product (|x * m| < 2^63).
+        let wide = 1 << bits as u64;
+        if d > 0 && m < 0 {
+            m += wide;
+        } else if d < 0 && m > 0 {
+            m -= wide;
+        }
+        let product = op_before(cx, v, Mul, TY_I64, x, const_before(cx, v, m, TY_I64));
+        t = op_before(cx, v, Shr, TY_I64, product, const_before(cx, v, bits + s, TY_I64));
+    } else {
+        t = mulh_before(cx, v, TY_I64, x, m, signed: true);
+        if d > 0 && m < 0 {
+            t = op_before(cx, v, Add, TY_I64, t, x);
+        } else if d < 0 && m > 0 {
+            t = op_before(cx, v, Sub, TY_I64, t, x);
+        }
+        if s > 0 {
+            t = op_before(cx, v, Shr, TY_I64, t, const_before(cx, v, s, TY_I64));
+        }
+    }
+    // Rounded toward zero: one more when negative.
+    op_before(cx, v, Sub, TY_I64, t,
+        op_before(cx, v, Shr, TY_I64, t, const_before(cx, v, 63, TY_I64)))
+}
+
+// The magic number of signed division by d (2 <= |d| < 2^(w-1), w bits;
+// Hacker's Delight, figure 10-1): *m (a signed w-bit value) and *s, with
+// x / d = hi(m * x) (+ x when d > 0 and m < 0, - x when d < 0 and m > 0)
+// >> s, plus 1 when that is negative.
+fn magic_signed(d: i64, w: i64, m: inout i64, s: inout i64) {
+    let two: u64 = (1 as u64) << (w - 1) as u64;
+    let ad: u64 = if d < 0 { (0 - d) as u64 } else { d as u64 };
+    let t: u64 = two + (if d < 0 { 1 as u64 } else { 0 as u64 });
+    let anc: u64 = t - 1 - t % ad;
+    var p = w - 1;
+    var q1: u64 = two / anc;
+    var r1: u64 = two - q1 * anc;
+    var q2: u64 = two / ad;
+    var r2: u64 = two - q2 * ad;
+    loop {
+        p += 1;
+        q1 = 2 * q1;
+        r1 = 2 * r1;
+        if r1 >= anc {
+            q1 += 1;
+            r1 -= anc;
+        }
+        q2 = 2 * q2;
+        r2 = 2 * r2;
+        if r2 >= ad {
+            q2 += 1;
+            r2 -= ad;
+        }
+        let delta = ad - r2;
+        if !(q1 < delta || (q1 == delta && r1 == 0)) {
+            break;
+        }
+    }
+    var magic = q2 + 1;
+    if d < 0 {
+        magic = 0 - magic;
+    }
+    // As a signed w-bit value.
+    let shift = (64 - w) as u64;
+    unsafe {
+        m = ((magic << shift) as i64) >> shift;
+        s = p - w;
+    }
+}
+
+// The magic number of unsigned 64-bit division by d (2 <= d, not a power
+// of two; Hacker's Delight, figure 10-2): *m and *s with x / d =
+// hi(m * x) >> s, or, when *add (the magic is 2^64 + m), with t = hi(m * x),
+// (((x - t) >> 1) + t) >> (s - 1).
+fn magic_unsigned(d: u64, m: inout u64, add: inout bool, s: inout i64) {
+    let min: u64 = (1 as u64) << 63;
+    let max: u64 = min - 1;
+    let nc: u64 = 0xffffffffffffffff as u64 - (0 - d) % d;
+    var p = 63;
+    var q1: u64 = min / nc;
+    var r1: u64 = min - q1 * nc;
+    var q2: u64 = max / d;
+    var r2: u64 = max - q2 * d;
+    var a = false;
+    loop {
+        p += 1;
+        if r1 >= nc - r1 {
+            q1 = 2 * q1 + 1;
+            r1 = 2 * r1 - nc;
+        } else {
+            q1 = 2 * q1;
+            r1 = 2 * r1;
+        }
+        if r2 + 1 >= d - r2 {
+            if q2 >= max {
+                a = true;
+            }
+            q2 = 2 * q2 + 1;
+            r2 = 2 * r2 + 1 - d;
+        } else {
+            if q2 >= min {
+                a = true;
+            }
+            q2 = 2 * q2;
+            r2 = 2 * r2 + 1;
+        }
+        let delta = d - 1 - r2;
+        if !(p < 128 && (q1 < delta || (q1 == delta && r1 == 0))) {
+            break;
+        }
+    }
+    unsafe {
+        m = q2 + 1;
+        add = a;
+        s = p - 64;
+    }
+}

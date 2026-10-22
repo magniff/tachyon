@@ -5,8 +5,8 @@
 #
 # usage: tests/own-try/run.sh [-c COMPILER] [FILTER]
 #
-# Each tests/own-try/NAME/ is a program (main.tach, and its other files);
-# directives in `//` comments of main.tach:
+# Each tests/own-try/NAME/ is a program (main.vl, and its other files);
+# directives in `//` comments of main.vl:
 #   // OWN: CODE     `check --values=error` reports CODE first (own.moved,
 #                    own.conflict, ...; `type error` too); `none`: the
 #                    program checks clean (an agent's pattern that must not
@@ -16,7 +16,7 @@
 #   // XFAIL: why    the checker task that reports CODE has not landed:
 #                    the case is expected to fail, and reported as a
 #                    failure (XPASS) once it passes
-# Then every try: line of the first diagnostic that is a tachyonc command
+# Then every try: line of the first diagnostic that is a volec command
 # is run on a fresh copy (as printed: the compiler's path replaced), and
 # the program checked again: it must check clean, or report a different
 # next step (another code, an edit.breaks with its own try: lines); a
@@ -31,7 +31,7 @@ export LC_ALL
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 FILTER=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -46,11 +46,11 @@ case "$COMPILER" in
 esac
 [ -x "$COMPILER" ] || { echo "own-try/run.sh: no compiler at $COMPILER" >&2; exit 2; }
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-own-try.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-own-try.XXXXXX")
 WORK=$(cd "$WORK" && pwd -P)
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
-unset TACHYON_ROOT
+unset VOLE_ROOT
 STATUS=0
 
 # directive NAME FILE: the values of `// NAME: value` lines, one per line.
@@ -65,7 +65,7 @@ directive() {
 # The first diagnostic of `check --values=error` in directory $1 (one
 # line, short form), into $1/../diag; its exit code is the function's.
 first_diag() {
-    (cd "$1" && "$COMPILER" check --values=error main.tach) >"$WORK/out" 2>&1
+    (cd "$1" && "$COMPILER" check --values=error main.vl) >"$WORK/out" 2>&1
     st=$?
     grep -m 1 'error' "$WORK/out" >"$WORK/diag" || : >"$WORK/diag"
     return $st
@@ -85,7 +85,7 @@ try_lines() {
 for dir in "$HERE"/*/; do
     name=$(basename "$dir")
     case "$name" in *"$FILTER"*) ;; *) continue ;; esac
-    main="$dir/main.tach"
+    main="$dir/main.vl"
     [ -f "$main" ] || continue
     code=$(directive OWN "$main" | head -n 1)
     xfail=$(directive XFAIL "$main" | head -n 1)
@@ -116,7 +116,7 @@ for dir in "$HERE"/*/; do
             # (a command: its first word is the compiler, as printed)
             first=${cmd%% *}
             case "$first" in
-                *tachyonc) ;;
+                *volec) ;;
                 *) continue ;;
             esac
             rest=${cmd#"$first"}

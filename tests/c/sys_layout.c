@@ -1,4 +1,4 @@
-/* The C side of tests/run/sys_layout.tach (0.20): the layouts and constants
+/* The C side of tests/run/sys_layout.vl (0.20): the layouts and constants
  * std's OS layer (compiler/std/sys/) writes by hand, from the system's
  * headers, by name. */
 #define _GNU_SOURCE

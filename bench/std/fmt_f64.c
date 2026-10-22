@@ -1,7 +1,7 @@
 /* bench/std: 1,000,000 random f64 (in [0, 1e6)) written with
    snprintf("%.17g") into one buffer, a space after each (enough digits
    to read back, not the shortest: its text differs from Rust's and
-   tachyon's, so the harness does not compare it). Prints the length and
+   vole's, so the harness does not compare it). Prints the length and
    the FNV-1a hash. */
 #include <stdint.h>
 #include <stdio.h>

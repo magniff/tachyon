@@ -1,21 +1,21 @@
 #!/bin/sh
-# The test suite of this release, run with a tachyon compiler (no cargo
-# needed): every tests/run/*.tach, tests/run/*/main.tach (a program of
+# The test suite of this release, run with a vole compiler (no cargo
+# needed): every tests/run/*.vl, tests/run/*/main.vl (a program of
 # several modules, 0.5) and tests/examples/*.test case (examples/NAME/,
 # 0.15) is compiled, assembled and linked with the C compiler, run, checked;
-# alongside them, tests/query/run.sh (`tachyonc query`, 0.11),
+# alongside them, tests/query/run.sh (`volec query`, 0.11),
 # tests/refactor/run.sh (the refactoring tools, 0.11), tests/guide/run.sh
-# (`tachyonc guide`, 0.13), tests/fmt/run.sh (`tachyonc fmt --check`
+# (`volec guide`, 0.13), tests/fmt/run.sh (`volec fmt --check`
 # of the tree, and formatting changes no program, 0.13) and
 # tests/voltty/run.sh (the terminal's core against its oracle, 0.23),
 # tests/walkthrough/run.sh (the sessions of examples/tools/*/README.md,
 # 0.15, and of every examples/GROUP/NAME/README.md with one, 0.16) and
 # tests/own-try/run.sh (the own pass's try: lines run, 0.17) and
-# tests/lsp/run.sh (`tachyonc lsp`'s sessions, 0.24) and tests/gpu/run.sh (std::gpu on Metal, 0.22, skipped off macOS). POSIX sh and awk only, so it runs the same on macOS and Linux.
+# tests/lsp/run.sh (`volec lsp`'s sessions, 0.24) and tests/gpu/run.sh (std::gpu on Metal, 0.22, skipped off macOS). POSIX sh and awk only, so it runs the same on macOS and Linux.
 #
 # usage: tests/run.sh [-c COMPILER] [-t TARGET] [-O LEVEL] [-j JOBS] [-a] [-d FORMAT] [FILTER]
 #
-#   -c COMPILER   the tachyonc binary to test (default: target/tachyonc,
+#   -c COMPILER   the volec binary to test (default: target/volec,
 #                 as left by bootstrap/bootstrap.sh)
 #   -t TARGET     aarch64-macos, aarch64-linux, x86_64-linux or x86_64-macos
 #                 (default: the host; x86_64-macos runs under Rosetta on
@@ -23,9 +23,9 @@
 #   -O LEVEL      the optimization level (0, 1 or 2; default: the
 #                 compiler's default)
 #   -j JOBS       cases run at once (default: the number of CPUs, or the
-#                 slots of $TACHYON_JOBSERVER); the report is the same for
+#                 slots of $VOLE_JOBSERVER); the report is the same for
 #                 every JOBS
-#   -a            programs go through assembly (tachyonc -S, then cc), as
+#   -a            programs go through assembly (volec -S, then cc), as
 #                 before 0.7, instead of the compiler's own objects
 #   -d FORMAT     the compiler's diagnostics: human (the default) or short
 #                 (--diagnostics=short, 0.11); the ERROR and WARNING
@@ -33,7 +33,7 @@
 #   FILTER        run only the cases whose name contains FILTER
 #
 # Environment: CC is the linker (and the assembler with -a; default cc).
-# TACHYON_JOBSERVER (0.11), when -j is not given, names a FIFO holding
+# VOLE_JOBSERVER (0.11), when -j is not given, names a FIFO holding
 # one line per free slot, shared by every runner bootstrap/gate.sh starts
 # (tests/run.sh, tests/fuzz/run.sh, tests/abi/run.sh, tests/objcheck.sh):
 # a case takes a line before it starts and puts it back when done.
@@ -77,19 +77,19 @@
 #                        it run: x86-64's intrinsics are checked so on an arm
 #                        host. Skipped when T is the target tested.
 #   // FIXIMPORTS: why   (0.8) a copy of the case (its directory, for a
-#                        main.tach) is rewritten by tachyonc --fix-imports,
+#                        main.vl) is rewritten by volec --fix-imports,
 #                        which must then find nothing more to do; the copy
 #                        is what the other directives check
 #   // FIXED: text       the rewritten copy has a line (not a comment)
 #                        containing text, one directive per line
-#   // FIXUNSAFE: why    (0.9) the same with tachyonc --fix-unsafe
+#   // FIXUNSAFE: why    (0.9) the same with volec --fix-unsafe
 #   // FLAGS: flags      (0.9) more compiler options for the case (0.10:
 #                        @ROOT@ stands for the root of the tree)
 #   // WARNING: text     (0.9) the case compiles with a warning containing
 #                        this text, one directive per message, in order
-#   // LINK: why         (0.16) tachyonc links the case itself: its CSOURCE
+#   // LINK: why         (0.16) volec links the case itself: its CSOURCE
 #                        files (with -I for its CHEADER) and FLAGS on its
-#                        command line, `-o prog`; no -lm added (tachyonc
+#                        command line, `-o prog`; no -lm added (volec
 #                        links libm when the program calls into it)
 #   // REQUIRES: clang    (0.18) the case runs only where the C compiler
 #                        ($CC, which C imports read) is clang: what it
@@ -98,7 +98,7 @@
 #   // REQUIRES: metal    (0.22) the case runs only on aarch64-macos (std::gpu
 #                        on Metal); elsewhere it is skipped, counted apart
 #   // NO-EXTRA-FLAGS: why (0.16) the case is built without
-#                        $TACHYON_TEST_FLAGS (its output differs by design
+#                        $VOLE_TEST_FLAGS (its output differs by design
 #                        with them)
 #   // PROFILE: why      (0.10) at -O1 and -O2, the case is first compiled
 #                        with --profile-generate, run and checked; the
@@ -108,8 +108,8 @@
 # directives (0.9's unsafe warnings are errors from 0.10; there are no
 # warnings at the moment).
 # Stdout is compared after removing trailing whitespace. Each program may
-# run for 20 seconds ($TACHYON_TEST_TIMEOUT: another limit, for a loaded
-# machine). $TACHYON_TEST_FLAGS (0.16): more compiler options for every
+# run for 20 seconds ($VOLE_TEST_TIMEOUT: another limit, for a loaded
+# machine). $VOLE_TEST_FLAGS (0.16): more compiler options for every
 # case but those with NO-EXTRA-FLAGS (the gate's examples-checkalloc
 # step: --check-alloc).
 
@@ -118,19 +118,19 @@ LC_ALL=C
 export LC_ALL
 # (0.18.1) Without the code cache (back::codecache), unless the caller
 # says (gate.sh's suite-O2 row): its programs are small, and a cache per
-# program and compiler would fill target/tachyonc-cache.
-TACHYON_CODE_CACHE=${TACHYON_CODE_CACHE:-off}
-export TACHYON_CODE_CACHE
+# program and compiler would fill target/volec-cache.
+VOLE_CODE_CACHE=${VOLE_CODE_CACHE:-off}
+export VOLE_CODE_CACHE
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 CC=${CC:-cc}
 # (0.18) Whether the C compiler is clang, for `// REQUIRES: clang`.
 CC_IS_CLANG=0
 "$CC" --version 2>/dev/null | grep -qi clang && CC_IS_CLANG=1
 TARGET=""
 OPT=""
-TIMEOUT=${TACHYON_TEST_TIMEOUT:-20}
+TIMEOUT=${VOLE_TEST_TIMEOUT:-20}
 JOBS=""
 OUT=prog.o
 DIAG=human
@@ -175,7 +175,7 @@ if [ -z "$TARGET" ]; then
         Darwin-x86_64) TARGET=x86_64-macos ;;
         Linux-x86_64) TARGET=x86_64-linux ;;
         Linux-aarch64) TARGET=aarch64-linux ;;
-        *) echo "run.sh: no tachyon target for this host ($(uname -s) $(uname -m)); use -t" >&2; exit 2 ;;
+        *) echo "run.sh: no vole target for this host ($(uname -s) $(uname -m)); use -t" >&2; exit 2 ;;
     esac
 fi
 # How the C compiler assembles and links for the target.
@@ -186,7 +186,7 @@ case "$TARGET" in
     *) echo "run.sh: unknown target '$TARGET'" >&2; exit 2 ;;
 esac
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-tests.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-tests.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 FAILURES="$WORK/failures"
@@ -196,7 +196,7 @@ TALLY="$WORK/tally"
 
 # The C compiler, once more when it crashed (a signal, or gcc's "internal
 # compiler error"): an emulated toolchain (x86-64 Linux under Rosetta)
-# now and then does, and a crash of cc is not tachyon's. Its output (and
+# now and then does, and a crash of cc is not vole's. Its output (and
 # the crash's, if any) on stdout.
 cc_run() {
     cr_out=$("$CC" "$@" 2>&1)
@@ -272,7 +272,7 @@ run_program() {
     dir=$1
     (
         cd "$dir" || exit 1
-        # (0.19: RUN_ENV, a variable for the run: TACHYON_ARCH_DISABLE)
+        # (0.19: RUN_ENV, a variable for the run: VOLE_ARCH_DISABLE)
         if [ -n "${RUN_ENV:-}" ]; then
             # shellcheck disable=SC2046
             exec env "$RUN_ENV" ./prog $(cat args) <stdin >stdout 2>stderr
@@ -319,8 +319,8 @@ check_case() {
     fi
     [ -s "$dir/warnings" ] && FLAGS="$DIAG_FLAG $(sed "s|@ROOT@|$ROOT|g" "$dir/flags")"
     # (0.16: options for every case, from the environment)
-    if [ -n "${TACHYON_TEST_FLAGS:-}" ] && [ "$(cat "$dir/noextra")" != 1 ]; then
-        FLAGS="$FLAGS $TACHYON_TEST_FLAGS"
+    if [ -n "${VOLE_TEST_FLAGS:-}" ] && [ "$(cat "$dir/noextra")" != 1 ]; then
+        FLAGS="$FLAGS $VOLE_TEST_FLAGS"
     fi
     if [ -s "$dir/errors" ]; then
         # shellcheck disable=SC2086
@@ -374,9 +374,9 @@ check_case() {
         csources="-I $dir $csources"
     fi
     if [ "$(cat "$dir/link")" = 1 ]; then
-        # (0.16) tachyonc compiles the C files and links, as `cc` would
+        # (0.16) volec compiles the C files and links, as `cc` would
         # shellcheck disable=SC2086
-        if ! TACHYON_CC="$CC" "$COMPILER" --target "$TARGET" $OPT $FLAGS $PFLAGS "$source" $csources -o "$dir/prog" >"$dir/compile.out" 2>&1; then
+        if ! VOLE_CC="$CC" "$COMPILER" --target "$TARGET" $OPT $FLAGS $PFLAGS "$source" $csources -o "$dir/prog" >"$dir/compile.out" 2>&1; then
             { echo "compile and link failed:"; cat "$dir/compile.out"; } >"$dir/why"
             return 1
         fi
@@ -426,13 +426,13 @@ check_case() {
     # #[multiversion]) runs again with every optional feature disabled:
     # its fallback paths must print the same (docs/design/arch.md §2.5).
     if grep -q -E 'detect\(|#\[multiversion' "$source"; then
-        RUN_ENV=TACHYON_ARCH_DISABLE=all
+        RUN_ENV=VOLE_ARCH_DISABLE=all
         run_program "$dir"
         RUN_ENV=
         trimmed "$dir/stdout" >"$dir/actual"
         if ! cmp -s "$dir/actual" "$dir/wanted" || [ "$RC" -ne "$expected_exit" ]; then
             {
-                echo "with TACHYON_ARCH_DISABLE=all (the fallback paths): exit code $RC, stdout"
+                echo "with VOLE_ARCH_DISABLE=all (the fallback paths): exit code $RC, stdout"
                 echo "--- expected"; cat "$dir/wanted"; echo
                 echo "--- actual"; cat "$dir/actual"; echo
             } >"$dir/why"
@@ -450,9 +450,9 @@ fix_case() {
     mkdir -p "$fixdir/run"
     ln -s "$ROOT/tests/c" "$fixdir/c"
     case "$1" in
-        */main.tach)
+        */main.vl)
             cp -R "$(dirname "$1")" "$fixdir/run/"
-            source="$fixdir/run/$(basename "$(dirname "$1")")/main.tach" ;;
+            source="$fixdir/run/$(basename "$(dirname "$1")")/main.vl" ;;
         *)
             cp "$1" "$fixdir/run/"
             source="$fixdir/run/$(basename "$1")" ;;
@@ -465,7 +465,7 @@ fix_case() {
         { echo "a second $3 did not leave the program as it was:"; cat "$2/fix2.out"; } >"$2/why"
         return 1
     fi
-    find "$fixdir/run" -name '*.tach' -exec cat {} + | grep -v '^[[:space:]]*//' >"$2/fixed.txt"
+    find "$fixdir/run" -name '*.vl' -exec cat {} + | grep -v '^[[:space:]]*//' >"$2/fixed.txt"
     while IFS= read -r text; do
         if ! grep -qF -- "$text" "$2/fixed.txt"; then
             { echo "the rewritten program has no line containing '$text':"; cat "$2/fixed.txt"; } >"$2/why"
@@ -614,16 +614,16 @@ fi
 if [ -x "$ROOT/tests/std/core_sections.sh" ] && ! "$ROOT/tests/std/core_sections.sh" >/dev/null; then
     exit 1
 fi
-# (0.19) The intrinsic tables, compiler/arch/*.def, as tables.tach has them.
+# (0.19) The intrinsic tables, compiler/arch/*.def, as tables.vl has them.
 if [ -x "$ROOT/compiler/arch/embed.sh" ] && ! "$ROOT/compiler/arch/embed.sh" -c; then
     exit 1
 fi
 
-# (0.21) Every TACHYON_X the compiler reads (a c"TACHYON_X" literal) is
+# (0.21) Every VOLE_X the compiler reads (a c"VOLE_X" literal) is
 # also read as VOLE_X, the name from 0.24: it is in base::ENV_NAMES.
-for v in $(grep -rhoE 'c"TACHYON_[A-Z0-9_]+"' "$ROOT/compiler/src" | sed 's/^c"TACHYON_//; s/"$//' | sort -u); do
-    if ! grep -q "c\"$v\"" "$ROOT/compiler/src/base/mod.tach"; then
-        echo "error: TACHYON_$v is read by the compiler but not as VOLE_$v: add \"$v\" to ENV_NAMES (compiler/src/base/mod.tach)" >&2
+for v in $(grep -rhoE 'c"VOLE_[A-Z0-9_]+"' "$ROOT/compiler/src" | sed 's/^c"VOLE_//; s/"$//' | sort -u); do
+    if ! grep -q "c\"$v\"" "$ROOT/compiler/src/base/mod.vl"; then
+        echo "error: VOLE_$v is read by the compiler but not as VOLE_$v: add \"$v\" to ENV_NAMES (compiler/src/base/mod.vl)" >&2
         exit 1
     fi
 done
@@ -636,14 +636,14 @@ fi
 # The cases, in order; up to JOBS at once (a FIFO holds the free slots).
 CASES="$WORK/cases"
 : >"$CASES"
-for file in "$ROOT"/tests/run/*.tach "$ROOT"/tests/run/*/main.tach "$ROOT"/tests/examples/*.test; do
+for file in "$ROOT"/tests/run/*.vl "$ROOT"/tests/run/*/main.vl "$ROOT"/tests/examples/*.test; do
     [ -f "$file" ] || continue
     base=${file##*/}
     name=${base%.*}
     case "$file" in
         *.test) name="example_$name" ;;
-        # A program of several modules: a directory with main.tach (0.5).
-        */main.tach) name=${file%/main.tach}; name=${name##*/} ;;
+        # A program of several modules: a directory with main.vl (0.5).
+        */main.vl) name=${file%/main.vl}; name=${name##*/} ;;
     esac
     case "$name" in
         *"$FILTER"*) ;;
@@ -734,9 +734,9 @@ case "$TARGET" in
 esac
 
 # The slots: JOBS of them in a FIFO of our own, or the shared ones of
-# $TACHYON_JOBSERVER (see above).
-if [ -z "$JOBS" ] && [ -n "${TACHYON_JOBSERVER:-}" ] && [ -p "$TACHYON_JOBSERVER" ]; then
-    exec 3<>"$TACHYON_JOBSERVER"
+# $VOLE_JOBSERVER (see above).
+if [ -z "$JOBS" ] && [ -n "${VOLE_JOBSERVER:-}" ] && [ -p "$VOLE_JOBSERVER" ]; then
+    exec 3<>"$VOLE_JOBSERVER"
 else
     [ -n "$JOBS" ] || JOBS=$(cpu_count)
     mkfifo "$WORK/slots"
@@ -776,7 +776,7 @@ while read -r name file; do
     count=$((count + 1))
 done <"$CASES"
 
-# `tachyonc query` (0.11): tests/query/run.sh (run above), its transcripts
+# `volec query` (0.11): tests/query/run.sh (run above), its transcripts
 # and its checks on the compiler's own source; category "query".
 case query in
     *"$FILTER"*)
@@ -794,7 +794,7 @@ case query in
         ;;
 esac
 
-# `tachyonc lsp` (0.24): tests/lsp/run.sh (run above), its sessions and
+# `volec lsp` (0.24): tests/lsp/run.sh (run above), its sessions and
 # its check on the compiler's own source; category "lsp".
 case lsp in
     *"$FILTER"*)
@@ -831,7 +831,7 @@ case refactor in
         ;;
 esac
 
-# `tachyonc guide` (0.13): tests/guide/run.sh (run above), the guide's
+# `volec guide` (0.13): tests/guide/run.sh (run above), the guide's
 # examples compiled and run, its std section, its budget; category
 # "guide".
 case guide in
@@ -883,9 +883,9 @@ case hooks in
 esac
 
 # The examples (0.15: one folder each, examples/NAME/, or a group of them,
-# examples/GROUP/NAME/ under a README.md): each has a main.tach, a
+# examples/GROUP/NAME/ under a README.md): each has a main.vl, a
 # README.md and a case in tests/examples (a .test whose SOURCE is its
-# main.tach); category "example". examples/tools/ (walkthroughs of the
+# main.vl); category "example". examples/tools/ (walkthroughs of the
 # tools, some failing to compile on purpose) has its own runner.
 case example_layout in
     *"$FILTER"*)
@@ -895,21 +895,21 @@ case example_layout in
             ex=${ex#"$ROOT"/examples/}
             case "$ex" in tools | tools/*) continue ;; esac
             # (0.23: examples/voltty is assembled from parallel tasks, the
-            # renderer's modules first; until its main.tach lands, its
+            # renderer's modules first; until its main.vl lands, its
             # folders are modules, not examples)
-            case "$ex" in voltty | voltty/*) [ -f "$ROOT/examples/voltty/main.tach" ] || continue ;; esac
+            case "$ex" in voltty | voltty/*) [ -f "$ROOT/examples/voltty/main.vl" ] || continue ;; esac
             why=""
             case "$ex" in
                 */*) ;;
                 # a group: its README; its folders are the examples
-                *) [ -f "$d/main.tach" ] || { [ -f "$d/README.md" ] && continue; } ;;
+                *) [ -f "$d/main.vl" ] || { [ -f "$d/README.md" ] && continue; } ;;
             esac
             # (a folder of a program's modules, not an example)
-            case "$ex" in */*) [ -f "${d%/}/../main.tach" ] && continue ;; esac
-            [ -f "$d/main.tach" ] || why="no main.tach"
+            case "$ex" in */*) [ -f "${d%/}/../main.vl" ] && continue ;; esac
+            [ -f "$d/main.vl" ] || why="no main.vl"
             [ -f "$d/README.md" ] || why="$why${why:+; }no README.md"
-            grep -qx "// SOURCE: examples/$ex/main.tach" "$ROOT"/tests/examples/*.test \
-                || why="$why${why:+; }no tests/examples/*.test with '// SOURCE: examples/$ex/main.tach'"
+            grep -qx "// SOURCE: examples/$ex/main.vl" "$ROOT"/tests/examples/*.test \
+                || why="$why${why:+; }no tests/examples/*.test with '// SOURCE: examples/$ex/main.vl'"
             if [ -n "$why" ]; then
                 echo "example fail" >>"$TALLY"
                 printf 'FAIL example_layout %s:\n    %s\n\n' "$ex" "$why" >>"$FAILURES"

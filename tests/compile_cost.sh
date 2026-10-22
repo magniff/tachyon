@@ -5,8 +5,8 @@
 # each the fewest of a few runs, and their ratios:
 #
 #   hello   a hello world built (an object: no linker), at most 1.5x
-#   std     tests/cost/std_heavy.tach built (most of std read), at most 1.5x
-#   check   `tachyonc check` of compiler/src (a copy without compiler/std,
+#   std     tests/cost/std_heavy.vl built (most of std read), at most 1.5x
+#   check   `volec check` of compiler/src (a copy without compiler/std,
 #           so that both read their own std; no tools' cache), at most 1.15x
 #
 # Instructions, not time: they hardly move with the machine's load. They
@@ -38,15 +38,15 @@ if ! /usr/bin/time -l true 2>&1 | grep -q 'instructions retired'; then
     echo "compile-cost: /usr/bin/time -l counts no instructions on this host"
     exit 77
 fi
-W=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-cost.XXXXXX")
+W=$(mktemp -d "${TMPDIR:-/tmp}/vole-cost.XXXXXX")
 trap 'rm -rf "$W"' EXIT
-printf 'fn main() {\n    println("hello");\n}\n' >"$W/hello.tach"
-cp "$ROOT/tests/cost/std_heavy.tach" "$W/std_heavy.tach"
+printf 'fn main() {\n    println("hello");\n}\n' >"$W/hello.vl"
+cp "$ROOT/tests/cost/std_heavy.vl" "$W/std_heavy.vl"
 mkdir -p "$W/src"
 cp -R "$ROOT/compiler/src/." "$W/src/"
-TACHYON_CACHE=off
-TACHYON_CODE_CACHE=off
-export TACHYON_CACHE TACHYON_CODE_CACHE
+VOLE_CACHE=off
+VOLE_CODE_CACHE=off
+export VOLE_CACHE VOLE_CODE_CACHE
 
 # The fewest instructions of $RUNS runs of the command (in $W), or
 # nothing when it fails.
@@ -79,9 +79,9 @@ measure() {
     }' || FAILED=1
 }
 echo "compile cost against $P:"
-measure hello 1.5 hello.tach -c -o hello.o
-measure std 1.5 std_heavy.tach -c -o std_heavy.o
-measure check 1.15 check src/main.tach
+measure hello 1.5 hello.vl -c -o hello.o
+measure std 1.5 std_heavy.vl -c -o std_heavy.o
+measure check 1.15 check src/main.vl
 if [ $FAILED -ne 0 ]; then
     echo "compile-cost: a compilation is dearer than the previous release allows (see above; --time-passes splits it by phase, and std's sections: tests/std/core_sections.sh)"
     exit 1

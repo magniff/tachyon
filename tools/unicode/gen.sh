@@ -1,21 +1,21 @@
 #!/bin/sh
-# Remakes std's Unicode tables, compiler/std/unicode/tables.tach, from the
+# Remakes std's Unicode tables, compiler/std/unicode/tables.vl, from the
 # Unicode Character Database at the version tools/unicode/ucd.lock pins
 # (0.20): downloads what is missing into the cache (tools/unicode/fetch.sh,
-# which checks every file's SHA-256), builds tools/unicode/gen.tach and runs
+# which checks every file's SHA-256), builds tools/unicode/gen.vl and runs
 # it. Then run compiler/std/embed.sh and rebuild the compiler.
 #
 # usage: tools/unicode/gen.sh [--check] [-c COMPILER]
 #
-#   --check       write nothing: fail when tables.tach is not what the
+#   --check       write nothing: fail when tables.vl is not what the
 #                 generator makes; when the cache does not hold the files,
 #                 say so and succeed (the gate runs this; nothing is
 #                 downloaded)
-#   -c COMPILER   the tachyonc to build the generator with (default:
-#                 target/tachyonc)
+#   -c COMPILER   the volec to build the generator with (default:
+#                 target/volec)
 set -eu
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 CHECK=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -25,18 +25,18 @@ while [ $# -gt 0 ]; do
     esac
 done
 version=$(awk '$1 == "version" { print $2 }' "$ROOT/tools/unicode/ucd.lock")
-cache=${TACHYON_UCD_CACHE:-$HOME/.cache/tachyon/ucd}
+cache=${VOLE_UCD_CACHE:-$HOME/.cache/vole/ucd}
 if [ -n "$CHECK" ]; then
     for f in $(awk '$1 == "file" { print $2 }' "$ROOT/tools/unicode/ucd.lock"); do
         if [ ! -s "$cache/$version/$(basename "$f")" ]; then
-            echo "note unicode.no-cache: no Unicode $version files in $cache: tables.tach not checked" >&2
+            echo "note unicode.no-cache: no Unicode $version files in $cache: tables.vl not checked" >&2
             echo "try: tools/unicode/fetch.sh" >&2
             exit 0
         fi
     done
 fi
 dir=$("$ROOT/tools/unicode/fetch.sh")
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-ucd.XXXXXX")
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/vole-ucd.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
-"$COMPILER" -O1 "$ROOT/tools/unicode/gen.tach" -o "$tmp/gen"
+"$COMPILER" -O1 "$ROOT/tools/unicode/gen.vl" -o "$tmp/gen"
 "$tmp/gen" $CHECK "$dir" "$ROOT"

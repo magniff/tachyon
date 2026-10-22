@@ -131,17 +131,17 @@ crate::text_of	views(*toks) declared
 crate::intern	views() stores(word) declared
   why: declared (#[views], #[stores]): callers use the declaration, and the body is checked against it
 $ def pick intern count
-crate::pick	views017/main.tach:16:4	fn	fn pick(toks: Vec<Tok>, counts: Vec<i64>) -> [Tok]	effects: none	views: views(toks) declared
-crate::intern	views017/main.tach:27:4	fn	fn intern(names: inout Vec<[u8]>, word: [u8])	effects: alloc(Gpa) panic	views: views() stores(word) declared
-std::gpu::wgsl::ir::Module::intern	../../compiler/std/gpu/wgsl/ir.tach:528:12	method	pub fn intern(inout self, kind: u8, sk: u8, n: i64, mm: i64, base: i64, space: u8, access: u8) -> i64	effects: alloc(ScopedArena) panic
-std::gpu::wgsl::msl::W::intern	../../compiler/std/gpu/wgsl/msl.tach:242:8	method	fn intern(inout self, s: [u8]) -> Nm	effects: alloc(ScopedArena) panic
-crate::count	views017/main.tach:31:4	fn	fn count(toks: Vec<Tok>) -> i64	effects: none
-std::iter::Iterator::count	../../compiler/std/iter.tach:73:8	trait-method	fn count(self) -> i64
-std::objc::foundation::NSArrayMethods::count	../../compiler/std/objc/foundation.tach:304:8	trait-method	fn count(self) -> u64
-<std::objc::Ref as NSArrayMethods>::count	../../compiler/std/objc/foundation.tach:310:8	method	fn count(self) -> u64	effects: alloc(Gpa, extern) io global panic diverge unsafe
-<std::string::Chars as Iterator>::count	../../compiler/std/string.tach:753:8	method	fn count(self) -> i64	effects: panic diverge
-std::cli::Matches::count	../../compiler/std/cli.tach:824:12	method	pub fn count(self, name: str) -> i64
+crate::pick	views017/main.vl:16:4	fn	fn pick(toks: Vec<Tok>, counts: Vec<i64>) -> [Tok]	effects: none	views: views(toks) declared
+crate::intern	views017/main.vl:27:4	fn	fn intern(names: inout Vec<[u8]>, word: [u8])	effects: alloc(Gpa) panic	views: views() stores(word) declared
+std::gpu::wgsl::ir::Module::intern	../../compiler/std/gpu/wgsl/ir.vl:528:12	method	pub fn intern(inout self, kind: u8, sk: u8, n: i64, mm: i64, base: i64, space: u8, access: u8) -> i64	effects: alloc(ScopedArena) panic
+std::gpu::wgsl::msl::W::intern	../../compiler/std/gpu/wgsl/msl.vl:242:8	method	fn intern(inout self, s: [u8]) -> Nm	effects: alloc(ScopedArena) panic
+crate::count	views017/main.vl:31:4	fn	fn count(toks: Vec<Tok>) -> i64	effects: none
+std::iter::Iterator::count	../../compiler/std/iter.vl:73:8	trait-method	fn count(self) -> i64
+std::objc::foundation::NSArrayMethods::count	../../compiler/std/objc/foundation.vl:304:8	trait-method	fn count(self) -> u64
+<std::objc::Ref as NSArrayMethods>::count	../../compiler/std/objc/foundation.vl:310:8	method	fn count(self) -> u64	effects: alloc(Gpa, extern) io global panic diverge unsafe
+<std::string::Chars as Iterator>::count	../../compiler/std/string.vl:753:8	method	fn count(self) -> i64	effects: panic diverge
+std::cli::Matches::count	../../compiler/std/cli.vl:824:12	method	pub fn count(self, name: str) -> i64
 $ views nothing_here
 error query.no-match: no definition 'nothing_here'
-try: tachyonc query items
+try: volec query items
 [exit 1]

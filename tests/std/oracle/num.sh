@@ -1,6 +1,6 @@
 #!/bin/sh
-# std::num's checks against Rust (0.20, A6): tools/numtables/gen.tach
-# makes the tables checked in; num_check.tach (tachyon's std) and
+# std::num's checks against Rust (0.20, A6): tools/numtables/gen.vl
+# makes the tables checked in; num_check.vl (vole's std) and
 # num_oracle.rs (Rust's std) print the same hashes, chunk by chunk, of
 #   - {} {:?} {:e} of N f64 (raw bits, near 1, integers, short decimals),
 #     each read back and checked to be the shortest;
@@ -13,7 +13,7 @@
 # usage: tests/std/oracle/num.sh [-c COMPILER] [-n N] [--full]
 set -eu
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
-TC=$ROOT/target/tachyonc
+TC=$ROOT/target/volec
 N=2000000
 FULL=0
 while [ $# -gt 0 ]; do
@@ -24,17 +24,17 @@ while [ $# -gt 0 ]; do
         *) echo "usage: $0 [-c COMPILER] [-n N] [--full]" >&2; exit 2 ;;
     esac
 done
-W=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-num.XXXXXX")
+W=$(mktemp -d "${TMPDIR:-/tmp}/vole-num.XXXXXX")
 trap 'rm -rf "$W"' EXIT
 fail=0
-"$TC" "$ROOT/tools/numtables/gen.tach" -O2 -o "$W/gen" >/dev/null
-"$W/gen" >"$W/tables.tach"
-if cmp -s "$W/tables.tach" "$ROOT/compiler/std/num/tables.tach"; then
-    echo "ok tables: compiler/std/num/tables.tach is gen.tach's"
+"$TC" "$ROOT/tools/numtables/gen.vl" -O2 -o "$W/gen" >/dev/null
+"$W/gen" >"$W/tables.vl"
+if cmp -s "$W/tables.vl" "$ROOT/compiler/std/num/tables.vl"; then
+    echo "ok tables: compiler/std/num/tables.vl is gen.vl's"
 else
-    echo "FAIL tables: compiler/std/num/tables.tach differs from gen.tach's output"; fail=1
+    echo "FAIL tables: compiler/std/num/tables.vl differs from gen.vl's output"; fail=1
 fi
-"$TC" "$ROOT/tests/std/oracle/num_check.tach" -O2 -o "$W/check" >/dev/null
+"$TC" "$ROOT/tests/std/oracle/num_check.vl" -O2 -o "$W/check" >/dev/null
 if ! command -v rustc >/dev/null 2>&1; then
     echo "note: no rustc: only the tables are checked"; exit $fail
 fi

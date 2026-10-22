@@ -2,12 +2,12 @@
 the check hook last reported for each program root (its errors, its tests,
 the fingerprint of the sources then), which hints were given, the last
 queries; the fingerprint of a program's sources; the hint texts
-(hints.txt; TACHYON_HINTS=0 turns the hints off); when the session
+(hints.txt; VOLE_HINTS=0 turns the hints off); when the session
 started. A hook that runs beside another on the same event keeps its
 state in a part of its own (`load(event, part)`).
 
-The state is one JSON file per session in $TACHYON_HOOK_STATE, else
-$TMPDIR/tachyon-agent-hooks/ (written whole, renamed over: a hook that
+The state is one JSON file per session in $VOLE_HOOK_STATE, else
+$TMPDIR/vole-agent-hooks/ (written whole, renamed over: a hook that
 loses a race loses an update, never the file). Development tooling only:
 Python stdlib, loaded by path by check-after-edit.py, query-first.py and
 turn-end.py.
@@ -19,13 +19,13 @@ import re
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SKIP_DIRS = {".git", "target", "node_modules", ".tachyonc", "__pycache__"}
+SKIP_DIRS = {".git", "target", "node_modules", ".volec", "__pycache__"}
 TEST_EXTS = (".in", ".out", ".exit")
 
 
 def state_dir():
-    d = os.environ.get("TACHYON_HOOK_STATE") or os.path.join(
-        os.environ.get("TMPDIR") or "/tmp", "tachyon-agent-hooks")
+    d = os.environ.get("VOLE_HOOK_STATE") or os.path.join(
+        os.environ.get("TMPDIR") or "/tmp", "vole-agent-hooks")
     try:
         os.makedirs(d, exist_ok=True)
     except OSError:
@@ -74,19 +74,19 @@ def save(event, st, part=None):
 
 
 def source_dirs(root):
-    """The directories whose .tach files make up root's program: the
+    """The directories whose .vl files make up root's program: the
     compiler's compiler/src and compiler/std, else the root's directory."""
     root = os.path.abspath(root)
     d = os.path.dirname(root)
-    if root.endswith(os.path.join("compiler", "src", "main.tach")):
+    if root.endswith(os.path.join("compiler", "src", "main.vl")):
         return [d, os.path.join(os.path.dirname(d), "std")]
-    if root.endswith(os.path.join("compiler", "std", "std.tach")):
+    if root.endswith(os.path.join("compiler", "std", "std.vl")):
         return [d]
     return [d]
 
 
 def fingerprint(root, limit=5000):
-    """A hash of the program's .tach files (path, size, mtime) under its
+    """A hash of the program's .vl files (path, size, mtime) under its
     source directories, and of its tests (tests/*.in, .out, .exit), and the
     newest mtime among them: (hash, newest)."""
     parts, newest, n = [], 0.0, 0
@@ -95,7 +95,7 @@ def fingerprint(root, limit=5000):
             dirs[:] = sorted(x for x in dirs if x not in SKIP_DIRS and not x.startswith("."))
             in_tests = os.path.basename(d) == "tests"
             for f in sorted(files):
-                if not (f.endswith(".tach") or (in_tests and f.endswith(TEST_EXTS))):
+                if not (f.endswith(".vl") or (in_tests and f.endswith(TEST_EXTS))):
                     continue
                 p = os.path.join(d, f)
                 try:
@@ -119,7 +119,7 @@ def digest(parts):
 
 
 def has_tests(root):
-    """Whether the program has cases for `tachyonc test`: tests/*.out next
+    """Whether the program has cases for `volec test`: tests/*.out next
     to its root (not the compiler: its suite is not fast)."""
     root = os.path.abspath(root)
     if "/compiler/src/" in root or "/compiler/std/" in root:
@@ -137,26 +137,26 @@ _HINTS = None
 # system message; short, the same words every time (nothing that varies
 # from run to run: no times, no ids), so that it costs its tokens once.
 DEFAULT_HINTS = {
-    "repeat-query": "note: `{TACHYONC} query context {NAME}` prints in one call what show, refs and "
+    "repeat-query": "note: `{VOLEC} query context {NAME}` prints in one call what show, refs and "
                     "def print about {NAME}: its source, the items it uses, its callers",
-    "unfamiliar-construct": "note: `{TACHYONC} guide --find WORDS` prints the guide's lines on WORDS "
-                            "(an error's own words work); `{TACHYONC} guide TOPIC#SECTION` prints "
+    "unfamiliar-construct": "note: `{VOLEC} guide --find WORDS` prints the guide's lines on WORDS "
+                            "(an error's own words work); `{VOLEC} guide TOPIC#SECTION` prints "
                             "one section",
     "rewritten": "note hook.query-first: `{FROM}` ran as `{TO}`: {WHY}",
-    "rewritten-first": "note hook.query-first: shell reads of large .tach files are answered with "
+    "rewritten-first": "note hook.query-first: shell reads of large .vl files are answered with "
                        "the matching query (sed -n, head, tail: `query text`; cat: `query items`; "
                        "grep: `query refs` or `query grep`), each command of a line on its own, "
                        "the others as typed; `{FROM}` ran as `{TO}`: {WHY}",
     "rewritten-also": "note hook.query-first: also `{FROM}` ran as `{TO}`: {WHY}",
     "repeat-lookup": "note: `{WHAT}` printed the same text at shell call {N} of this session",
 }
-# The hints proper (E3): TACHYON_HINTS=0 turns these off; the other texts
+# The hints proper (E3): VOLE_HINTS=0 turns these off; the other texts
 # (a rewrite's note, a repeat lookup's) have switches of their own.
 HINT_KEYS = ("repeat-query", "unfamiliar-construct")
 
 
 def hints_on():
-    return os.environ.get("TACHYON_HINTS", "1") != "0"
+    return os.environ.get("VOLE_HINTS", "1") != "0"
 
 
 def text(key, **values):
@@ -180,7 +180,7 @@ def text(key, **values):
 
 
 def hint(key, **values):
-    """The hint KEY (text()), or "" when hints are off (TACHYON_HINTS=0)."""
+    """The hint KEY (text()), or "" when hints are off (VOLE_HINTS=0)."""
     if key in HINT_KEYS and not hints_on():
         return ""
     return text(key, **values)

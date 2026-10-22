@@ -61,7 +61,7 @@ text`); files, env, processes: `guide io`. (0.20)
 `next_back()` from the largest; `first_key_value`, `pop_first`,
 `pop_last`.
 
-@PAGE-END@ More, a section at a time: `tachyonc guide std#the-api` (every item, a line each), `std#overview` (ownership, views, HashMap), `std#input` (reading stdin), `std#heaps` (priority queues); one item: `tachyonc guide --find NAME`; all of it: `tachyonc guide std --whole`.
+@PAGE-END@ More, a section at a time: `volec guide std#the-api` (every item, a line each), `std#overview` (ownership, views, HashMap), `std#input` (reading stdin), `std#heaps` (priority queues); one item: `volec guide --find NAME`; all of it: `volec guide std --whole`.
 
 ## Overview
 
@@ -80,11 +80,11 @@ Anything else is used by path (`std::print_int(n)`) or imported by name
 (`use std::{IoError, is_digit};`).
 
 What a Rust programmer will miss: there is no `String` (use `[u8]` and
-`Buf`), no file reading (call C; iterators: `tachyonc guide
+`Buf`), no file reading (call C; iterators: `volec guide
 iterators`). A `Vec` (and a `Buf`) indexes as
 its slice: `v[i]`, `v[i] = x`, `v[a..b]` (0.17), checked. Formatting is 0.15's f-strings,
-`println(f"{x:>4}")` (`tachyonc guide formatting`); errors are enums in a
-`Result` (`tachyonc guide conversions`). A `Vec`, `Buf` or `HashMap` is
+`println(f"{x:>4}")` (`volec guide formatting`); errors are enums in a
+`Result` (`volec guide conversions`). A `Vec`, `Buf` or `HashMap` is
 dropped (freed) at the end of its scope (0.17): no `free` calls.
 
 - `Vec<T>`, `Buf` and `HashMap<K, V>` own their memory: `let w = v;`
@@ -93,7 +93,7 @@ dropped (freed) at the end of its scope (0.17): no `free` calls.
   changes it `v: inout Vec<T>` (called `f(&v)`), one that keeps it `v:
   sink Vec<T>` (`f(v)` moves it).
 - A slice from `as_slice()` views the container: the checker rejects its
-  use after the next push, `free` or drop (`tachyonc guide views`).
+  use after the next push, `free` or drop (`volec guide views`).
 - `get`, `set`, slice indexing and `unwrap` are checked: a failure prints
   a message and exits with 101.
 - `HashMap` keys need `Hash` and `Eq` (integers, `bool`, `[u8]` have
@@ -155,8 +155,8 @@ b=1 a=3 c=10
 field) are priority queues: `push(x)`, `pop() -> Option<T>`, `peek()`,
 `len()`, `from_vec(v)`, `into_sorted_vec()`; a BinaryHeap pops the
 largest first, a MinHeap the smallest (Rust's `BinaryHeap<Reverse<T>>`:
-tachyon has no tuple structs, so no `Reverse(x)`). Dijkstra with a
-MinHeap: `tachyonc guide --find dijkstra`.
+vole has no tuple structs, so no `Reverse(x)`). Dijkstra with a
+MinHeap: `volec guide --find dijkstra`.
 
 ## Input
 
@@ -221,7 +221,7 @@ std is migrated: `self: &Self` is `self`, let, it reads; `self: &mut
 Self` is `inout self`, it changes, called as `v.push(x)` on a `var`;
 `&T` is a let parameter `T`, `&mut T` an `inout T`; `self: Self` by
 value is `sink self`). Each item with its
-comment: `tachyonc guide std#every-item`; one item's source: `tachyonc
+comment: `volec guide std#every-item`; one item's source: `volec
 query show std::Scanner::next_line`.
 
 ```text

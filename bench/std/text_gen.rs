@@ -1,5 +1,5 @@
 // bench/std's text benchmarks' input, Rust half (include!d by the text
-// benchmarks): text_gen.tach's five kinds of text, byte for byte, and the
+// benchmarks): text_gen.vl's five kinds of text, byte for byte, and the
 // same benchmark loop (`KIND SUM` on stdout, `NAME KIND: MB/s` on stderr).
 
 const SIZE: usize = 16 * 1024 * 1024;

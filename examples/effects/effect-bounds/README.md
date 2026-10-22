@@ -1,6 +1,6 @@
 # Effect bounds: what a library lets your closure do
 
-`table.tach` is a small library over rows of a name and a value. Its
+`table.vl` is a small library over rows of a name and a value. Its
 operations take closures, and each closure parameter's bound says what
 the closure may do, with `+ effects(...)` after the `Fn` type:
 
@@ -33,7 +33,7 @@ this directory, and its output is checked against this file;
 ## Run it
 
 ```console
-$ tachyonc main.tach -o table && ./table
+$ volec main.vl -o table && ./table
 grace     90
 alan      46
 ada       41
@@ -43,7 +43,7 @@ barbara   17
 ok: built table
 ```
 
-`main.tach` gives each operation a closure within its bound: `|v| v +
+`main.vl` gives each operation a closure within its bound: `|v| v +
 bonus` (it captures `bonus`, and only reads it), `|r| r.value >= 20`,
 `|r| -r.value`. The closure for `each` prints, and counts the rows it
 printed in a local it captures (`shown += 1`): state of the caller's
@@ -54,11 +54,11 @@ own is not an effect, only statics are (`global`).
 A generic function's effects are its instances': one per closure.
 
 ```console
-$ tachyonc query effects crate::table
-map_values<closure(i64) -> i64 at main.tach:17:27>	none
-partition<closure(Row) -> bool at main.tach:18:34>	panic
-sort_by_key<closure(Row) -> i64 at main.tach:19:29>	none
-each<closure(Row) -> () at main.tach:21:20>	io global panic
+$ volec query effects crate::table
+map_values<closure(i64) -> i64 at main.vl:17:27>	none
+partition<closure(Row) -> bool at main.vl:18:34>	panic
+sort_by_key<closure(Row) -> i64 at main.vl:19:29>	none
+each<closure(Row) -> () at main.vl:21:20>	io global panic
 ```
 
 `map_values` is `none` for this closure (its `rows[i]` is in a counted
@@ -68,13 +68,13 @@ loop over the rows: in range); `each`'s instance has the closure's
 ## A closure that prints
 
 ```console
-$ tachyonc edit patch main --old '|v| v + bonus' --new '|v| {
+$ volec edit patch main --old '|v| v + bonus' --new '|v| {
 >         println(f"{v}");
 >         v + bonus
 >     }'
-main.tach:17:5: error[effect] the closure for 'F' of 'table::map_values' does io ('println(f"{v}")' at main.tach:18:9 calls 'std::fmt::println'); 'F: Fn(i64) -> i64 + effects(panic)' allows panic only | help: do only what the bound allows in the closure, or allow 'io' in the bound  [edited: crate::main]
+main.vl:17:5: error[effect] the closure for 'F' of 'table::map_values' does io ('println(f"{v}")' at main.vl:18:9 calls 'std::fmt::println'); 'F: Fn(i64) -> i64 + effects(panic)' allows panic only | help: do only what the bound allows in the closure, or allow 'io' in the bound  [edited: crate::main]
 error edit.breaks: 1 new error; nothing written
-try: tachyonc edit patch main --old '|v| v + bonus' --new '|v| {
+try: volec edit patch main --old '|v| v + bonus' --new '|v| {
         println(f"{v}");
         v + bonus
     }' --no-check
@@ -92,21 +92,21 @@ the library) widen the bound.
 `partition`'s bound is `effects()`:
 
 ```console
-$ tachyonc edit patch main --old '|r| r.value >= 20' --new "|r| r.name[0] == 'a'"
-main.tach:18:13: error[effect] the closure for 'F' of 'table::partition' may panic ('r.name[0]' at main.tach:18:38 is a checked index); 'F: Fn(let Row) -> bool + effects()' allows none only | help: do only what the bound allows in the closure, or allow 'panic' in the bound  [edited: crate::main]
+$ volec edit patch main --old '|r| r.value >= 20' --new "|r| r.name[0] == 'a'"
+main.vl:18:13: error[effect] the closure for 'F' of 'table::partition' may panic ('r.name[0]' at main.vl:18:38 is a checked index); 'F: Fn(let Row) -> bool + effects()' allows none only | help: do only what the bound allows in the closure, or allow 'panic' in the bound  [edited: crate::main]
 error edit.breaks: 1 new error; nothing written
-try: tachyonc edit patch main --old '|r| r.value >= 20' --new '|r| r.name[0] == 'a'' --no-check
+try: volec edit patch main --old '|r| r.value >= 20' --new '|r| r.name[0] == 'a'' --no-check
 [exit 1]
 ```
 
 `get` returns an `Option` instead, which cannot fail:
 
 ```console
-$ tachyonc edit patch main --old '|r| r.value >= 20' --new "|r| r.name.get(0) == Some('a')" --show
-patched crate::main	main.tach	+1 -1 lines
-// main.tach:18
+$ volec edit patch main --old '|r| r.value >= 20' --new "|r| r.name.get(0) == Some('a')" --show
+patched crate::main	main.vl	+1 -1 lines
+// main.vl:18
 18	    let n = partition(&rows[..], |r| r.name.get(0) == Some('a'));
-$ tachyonc main.tach -o table && ./table
+$ volec main.vl -o table && ./table
 alan      46
 ada       41
 brian     12
@@ -128,8 +128,8 @@ ok: built table
 
 ## Read more
 
-- `tachyonc guide effects`, section "Declaring" (bounds are the last
+- `volec guide effects`, section "Declaring" (bounds are the last
   form).
-- `tachyonc guide closures`: `Fn` and `FnMut`, captures.
+- `volec guide closures`: `Fn` and `FnMut`, captures.
 - [pure-and-no-alloc](../pure-and-no-alloc/): the same promises on
   functions.

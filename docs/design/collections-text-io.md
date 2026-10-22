@@ -1,14 +1,14 @@
-# tachyon 0.20 design: collections, text and I/O, split so that most of it starts before 0.17
+# vole 0.20 design: collections, text and I/O, split so that most of it starts before 0.17
 
-I read the language and std from `/Users/magniff/workspace/tachyon/.claude/worktrees/design-020` (branch design-020 at night-final 28b1a42: 0.16.0 plus the night's 0.17 familiar forms), using `tachyonc query items std`, `query show` on std's items, `guide std`, `guide rust`, docs/grammar.md ("Additions of 0.17: familiar forms") and docs/roadmap.md (0.16 to 0.23). The designs this one builds on are docs/design/effects-allocation.md (0.16, decided) and docs/design/value-semantics.md on branch design-017b (0.17, Revision 1, decided). The naming evidence is .claude/briefs/research/familiar-names.md. The measurements in §1 were taken on aarch64-macos with this tree's `target/tachyonc -O2` and rustc 1.98 `-O`. I changed nothing outside this file.
+I read the language and std from `/Users/magniff/workspace/vole/.claude/worktrees/design-020` (branch design-020 at night-final 28b1a42: 0.16.0 plus the night's 0.17 familiar forms), using `volec query items std`, `query show` on std's items, `guide std`, `guide rust`, docs/grammar.md ("Additions of 0.17: familiar forms") and docs/roadmap.md (0.16 to 0.23). The designs this one builds on are docs/design/effects-allocation.md (0.16, decided) and docs/design/value-semantics.md on branch design-017b (0.17, Revision 1, decided). The naming evidence is .claude/briefs/research/familiar-names.md. The measurements in §1 were taken on aarch64-macos with this tree's `target/volec -O2` and rustc 1.98 `-O`. I changed nothing outside this file.
 
 The roadmap's 0.20 is three things: collections, text, and I/O with the system, each measured against Rust's std and C. This design fixes what they are (§2), how fast they must be (§3), and how the work splits (§4). The split is the point of the document: 0.17 (value semantics), 0.18 (property tests) and 0.19 (`std::arch`) have not shipped, but about half of 0.20's code does not depend on them. That half is algorithms over slices and integers: sorting, the hash function and the table's probing, UTF-8, the Unicode tables, float conversion, and thin bindings to libc. §4 lists it as Wave A, which can start now. Wave B needs 0.17, Wave C needs 0.18, and Wave D needs 0.19.
 
 ## 1. Current state, measured
 
 **std's shape.**
-- std is one module, `std`: 5,538 lines in compiler/std/*.tach, joined by embed.sh into the text built into the compiler.
-- A program gets std when it names it or a prelude name. Only the *sections* it reaches are lexed (front/modules/stdsections.tach, from 0.15). The compiler picks Gpa's implementation at the end of the text (gpa.tach, or alloc_check.tach with `--check-alloc`). That is the only per-build choice of std code.
+- std is one module, `std`: 5,538 lines in compiler/std/*.vl, joined by embed.sh into the text built into the compiler.
+- A program gets std when it names it or a prelude name. Only the *sections* it reaches are lexed (front/modules/stdsections.vl, from 0.15). The compiler picks Gpa's implementation at the end of the text (gpa.vl, or alloc_check.vl with `--check-alloc`). That is the only per-build choice of std code.
 - A hello world compiles in 32 ms at -O0.
 - There is no `#[cfg]`. There are no std submodules: `std::collections::HashMap` does not resolve.
 
@@ -42,7 +42,7 @@ The roadmap's 0.20 is three things: collections, text, and I/O with the system, 
 
 **Measured against Rust 1.98** (fastest of 3 runs, whole program, data made in-process with xorshift; the programs are in this session's scratchpad and become bench/std pairs in P0):
 
-| operation | tachyon -O2 | Rust -O | ratio |
+| operation | vole -O2 | Rust -O | ratio |
 |---|---|---|---|
 | format 1M random f64 with `{}` into a buffer | 0.50 s | 0.04 s | **12.5×** |
 | sort 5M random u64, unstable (`sort` against `sort_unstable`) | ≈0.27 s | 0.068 s | **≈4×** |
@@ -57,9 +57,9 @@ The table wins on strings only because FNV is cheaper than SipHash. With the sam
 ### 2.1 Principles
 
 1. **Rust's names and shapes wherever they do not allocate implicitly.** The familiar-names research measured the gain: renaming a known API costs models most of their accuracy, and 56% of the 0.16 name/API errors went away with six Rust forms. Its warning applies too: a familiar name with a different meaning is worse than a new name. So the rule is:
-   - **R1.** A Rust std item whose semantics tachyon can keep exactly has Rust's path, name, argument order and result shape: `HashMap::insert -> Option<V>`, `s.split_whitespace()` returning an iterator, `binary_search -> Result<i64, i64>`, `Ordering`, `BufReader::new(f)`, `File::open(p)?`.
-   - **R2.** A Rust item that allocates from the global allocator takes an allocator in tachyon. Its name gets the `_in` suffix and the allocator comes last, as 0.16 already does: `String::new_in(gpa)`, `s.to_uppercase_in(gpa)`, `fs::read_to_string_in(p, gpa)`, `it.collect_in(gpa)`. The Rust spelling exists and is the `alloc.explicit` error, whose `try:` is the `_in` form (0.16's mechanism, `#[ambient]` text).
-   - **R3.** Where Rust allocates only as an implementation detail, tachyon does not allocate and keeps Rust's name:
+   - **R1.** A Rust std item whose semantics vole can keep exactly has Rust's path, name, argument order and result shape: `HashMap::insert -> Option<V>`, `s.split_whitespace()` returning an iterator, `binary_search -> Result<i64, i64>`, `Ordering`, `BufReader::new(f)`, `File::open(p)?`.
+   - **R2.** A Rust item that allocates from the global allocator takes an allocator in vole. Its name gets the `_in` suffix and the allocator comes last, as 0.16 already does: `String::new_in(gpa)`, `s.to_uppercase_in(gpa)`, `fs::read_to_string_in(p, gpa)`, `it.collect_in(gpa)`. The Rust spelling exists and is the `alloc.explicit` error, whose `try:` is the `_in` form (0.16's mechanism, `#[ambient]` text).
+   - **R3.** Where Rust allocates only as an implementation detail, vole does not allocate and keeps Rust's name:
      - `BufReader::new(f)` has an inline 8 KB buffer;
      - `stdin().lines()` and `BufRead::lines()` yield views of a reused buffer, a lending iterator under 0.17's view rules;
      - `Command::new(p).arg(..)` keeps up to 32 arguments inline;
@@ -75,16 +75,16 @@ The table wins on strings only because FNV is cheaper than SipHash. With the sam
 
    Nondeterminism (a random hash seed, OS entropy, the clock) is opt-in. It carries the `io` effect.
 4. **Pure where possible.** Text, number and Unicode routines read only immutable statics, which are not `global`. They are `#[pure]` and `#[no_alloc]`, so `query effects` shows formatting a float as `none`.
-5. **Performance is a release criterion.** Every routine of §3 has a bench/std pair (tachyon, Rust's std, C) with a target, and the 0.20 gate runs them.
+5. **Performance is a release criterion.** Every routine of §3 has a bench/std pair (vole, Rust's std, C) with a target, and the 0.20 gate runs them.
 6. **No UB.** All indexing is checked or proven, and `unsafe` stays inside std's raw-storage modules. A `str` is valid UTF-8 by construction, and a `char` is a scalar value by construction, so the unchecked constructors are `unsafe fn`.
 
 ### 2.2 std becomes a module tree; the prelude grows
 
-- **Paths.** std gets Rust's module paths: `std::collections`, `std::str`, `std::string`, `std::char`, `std::fmt`, `std::io`, `std::fs`, `std::path`, `std::env`, `std::process`, `std::time`, `std::hash`, `std::cmp`, `std::num`, `std::slice`, `std::iter`, `std::mem`, `std::alloc`, `std::os::unix`. Two are tachyon's own: `std::random` and `std::unicode` (which is public for the terminal's needs).
+- **Paths.** std gets Rust's module paths: `std::collections`, `std::str`, `std::string`, `std::char`, `std::fmt`, `std::io`, `std::fs`, `std::path`, `std::env`, `std::process`, `std::time`, `std::hash`, `std::cmp`, `std::num`, `std::slice`, `std::iter`, `std::mem`, `std::alloc`, `std::os::unix`. Two are vole's own: `std::random` and `std::unicode` (which is public for the terminal's needs).
 - **Old names.** Every 0.17 name stays at `std::NAME` through a `pub use` (`// api:` keeps it from `fix --only reexports`). `use std::collections::HashMap;` and `use std::HashMap;` name the same item, and neither is needed for prelude names.
 - **Loading.** Each file is one section or more, loaded lazily as today. P0 makes sure a program that reaches only `HashMap` does not lex the Unicode or float tables.
-- **Per-target code** without `#[cfg]`. The compiler appends `sys/macos.tach` or `sys/linux.tach`, as it appends gpa.tach today. Both files define the same public items, and a test checks this. `std::TARGET_OS` is an injected constant, like `CHECK_ALLOC`, for code that branches on it (constant-folded).
-- **The prelude gains** `String`, `str`, `char`, `Ordering`, `Reverse`, `HashSet`, `BTreeMap`, `BTreeSet`, `VecDeque`, `BinaryHeap`, `ToString`, `FromStr`, `Read`, `Write` and `BufRead`. That is Rust's prelude plus the collections, which tachyon's prelude already leans toward: missing imports were the largest single fixable class in the research. As before, the prelude comes last, so a program's own `String` hides it.
+- **Per-target code** without `#[cfg]`. The compiler appends `sys/macos.vl` or `sys/linux.vl`, as it appends gpa.vl today. Both files define the same public items, and a test checks this. `std::TARGET_OS` is an injected constant, like `CHECK_ALLOC`, for code that branches on it (constant-folded).
+- **The prelude gains** `String`, `str`, `char`, `Ordering`, `Reverse`, `HashSet`, `BTreeMap`, `BTreeSet`, `VecDeque`, `BinaryHeap`, `ToString`, `FromStr`, `Read`, `Write` and `BufRead`. That is Rust's prelude plus the collections, which vole's prelude already leans toward: missing imports were the largest single fixable class in the research. As before, the prelude comes last, so a program's own `String` hides it.
 
 ### 2.3 Language additions 0.20 needs
 
@@ -281,10 +281,10 @@ The iterators are views (`views(self)` in 0.17's summaries) and are double-ended
 #### 2.5.4 Unicode properties, graphemes, display width (A5)
 
 - **Unicode version.** The newest Unicode release when A5 starts (17.0 or later). Its version and the SHA-256 of each UCD file it reads are pinned in tools/unicode/ucd.lock. `std::unicode::UNICODE_VERSION` names it.
-- **The generator is tools/unicode/gen.tach, a tachyon program.** It dogfoods the language and reads files through `import "stdio.h"` until A7's layer exists.
+- **The generator is tools/unicode/gen.vl, a vole program.** It dogfoods the language and reads files through `import "stdio.h"` until A7's layer exists.
   - **Input:** UnicodeData.txt, DerivedCoreProperties.txt, PropList.txt, EastAsianWidth.txt, emoji-data.txt, GraphemeBreakProperty.txt, SpecialCasing.txt and CaseFolding.txt, downloaded into a cache outside the tree by tools/unicode/fetch.sh and checked against the lock.
-  - **Output:** compiler/std/unicode/tables.tach, checked in and marked generated.
-  - **Check:** `gen.tach --check` regenerates the tables and compares them, and the gate runs it when the cache is present.
+  - **Output:** compiler/std/unicode/tables.vl, checked in and marked generated.
+  - **Check:** `gen.vl --check` regenerates the tables and compares them, and the gate runs it when the cache is present.
   - **Tests:** the test files (GraphemeBreakTest.txt, emoji-test.txt) are copied into tests/std/unicode/, where tests read them.
 - **One properties lookup per code point.** `props(cp: u32) -> u16` packs:
   - the Grapheme_Cluster_Break value (4 bits);
@@ -316,7 +316,7 @@ The iterators are views (`views(self)` in 0.17's summaries) and are double-ended
 - **Integer formatting** follows itoa and Rust: a two-digit lookup table, writing from the end of a `[u8; 20]`. It replaces `Fmt::int`'s loop, with byte-identical output. **Integer parsing** is `parse_i64_radix` and `parse_u64_radix`: checked accumulation with an overflow check per digit, a fast path of 8 digits at a time by SWAR for decimal, and Rust's `FromStr` grammar (an optional `+` or `-`, no whitespace, no `_`). `ParseIntError` keeps its 0.15 variants and gains `kind()` with Rust's `IntErrorKind` names.
 - **Float formatting is Schubfach** (Giulietti, 2020; Java 19's `Double.toString`), which finds the shortest correctly rounded digits:
   - one 128×64-bit multiply per bound, against a 617-entry table of 128-bit powers of ten (about 10 KB);
-  - the table is generated by tools/numtables/gen.tach, using big integers, and checked in;
+  - the table is generated by tools/numtables/gen.vl, using big integers, and checked in;
   - `f32` has its own 64-bit table.
 - **The output formats match Rust's text exactly:**
   - Display: no exponent, `1e16` written out in full;
@@ -342,7 +342,7 @@ The iterators are views (`views(self)` in 0.17's summaries) and are double-ended
 
 | layer | module | what | Wave |
 |---|---|---|---|
-| sys | `std::sys` (private), sys/unix.tach plus sys/{macos,linux}.tach | `extern "C"` libc bindings with declared effects; `#[repr(C)]` structs per target; errno; results as `Result<T, i32>` | A7 |
+| sys | `std::sys` (private), sys/unix.vl plus sys/{macos,linux}.vl | `extern "C"` libc bindings with declared effects; `#[repr(C)]` structs per target; errno; results as `Result<T, i32>` | A7 |
 | os | `std::os::unix` | `RawFd`, `pty`, `poll`, `isatty`, the terminal's ioctls | A7 (sys), B6 (types) |
 | io | `std::io`, `fs`, `path`, `env`, `process`, `time`, `random` | the safe API: owned handles with Drop, `io::Error`, the traits | B6 |
 
@@ -356,7 +356,7 @@ The iterators are views (`views(self)` in 0.17's summaries) and are double-ended
   - `code` is the OS errno, or 0.
   - `msg` is a static `str` for std's own errors (∅ origin under 0.17), or empty.
   - Methods: `kind()`, `raw_os_error() -> Option<i32>`, `Error::new(kind, msg: str)` (static messages only), `Error::other(msg)`, Display (`strerror_r` into the formatter, no allocation) and Debug.
-- **`ErrorKind`** has Rust's variants that tachyon can produce: NotFound, PermissionDenied, AlreadyExists, WouldBlock, InvalidInput, InvalidData, TimedOut, WriteZero, Interrupted, UnexpectedEof, BrokenPipe, NotADirectory, IsADirectory, DirectoryNotEmpty, Unsupported, OutOfMemory and Other.
+- **`ErrorKind`** has Rust's variants that vole can produce: NotFound, PermissionDenied, AlreadyExists, WouldBlock, InvalidInput, InvalidData, TimedOut, WriteZero, Interrupted, UnexpectedEof, BrokenPipe, NotADirectory, IsADirectory, DirectoryNotEmpty, Unsupported, OutOfMemory and Other.
 - **The old name.** `io::Result<T>` is `Result<T, io::Error>`. `IoError` remains one release as a type alias of `io::Error`, and `fix` rewrites patterns on `IoError::Read` and `IoError::Write`.
 - **`?` converts** through `From`, as in 0.15.
 
@@ -427,7 +427,7 @@ The iterators are views (`views(self)` in 0.17's summaries) and are double-ended
   - under 0.18, every container states its invariants (`invariant` on RawTable's `items + growth_left`, BTree node lengths, `String`'s validity under a debug flag);
   - public preconditions are checked panics with Rust's messages (`index out of bounds: the len is 3 but the index is 5`);
   - `--check-alloc` covers every container through its allocator.
-- **Unsafe** stays inside the raw modules: collections/raw_table, btree_node, vec, vec_deque, small_vec, string's unchecked constructors and sys. Each module's header states its safety argument, as std.tach's does today.
+- **Unsafe** stays inside the raw modules: collections/raw_table, btree_node, vec, vec_deque, small_vec, string's unchecked constructors and sys. Each module's header states its safety argument, as std.vl's does today.
 
 ### 2.8 What agents see
 
@@ -476,14 +476,14 @@ The guide gets three topics, `collections`, `text` and `io`, each in the 0.17 gu
 ## 3. Performance: benchmarks and targets
 
 **The harness: bench/std/** (P0).
-- Each benchmark is a triple: NAME.tach, NAME.rs (rustc `-C opt-level=3 -C codegen-units=1 -C panic=abort`, std only, no crates) and NAME.c (`cc -O2`, libc only; hand-written where libc has nothing).
+- Each benchmark is a triple: NAME.vl, NAME.rs (rustc `-C opt-level=3 -C codegen-units=1 -C panic=abort`, std only, no crates) and NAME.c (`cc -O2`, libc only; hand-written where libc has nothing).
 - Each program makes its input in-process from a fixed xorshift seed. Text benchmarks make theirs from samples of the UCD, written by the generator into bench/std/data/ (generated, not checked in).
 - All three print the same checksum, and the harness checks it.
 - bench/std/run.sh prints each row's fastest of N runs and the ratios. bench/std/targets.txt gives each row's Rust and C targets.
 - `--gate` fails on a ratio above its target by more than 10% (noise). `gate.sh --only bench` runs it on an idle aarch64-macos machine. x86_64 is not measured.
 - **Fair Rust baselines.** Where Rust's default differs in algorithm (SipHash), the .rs file has two variants: Rust's default, and Rust's table with the same hash as ours (foldhash written into the .rs file, about 60 lines). The target binds against the second, so the comparison is between tables, not hash functions.
 
-**Targets** (tachyon -O2 time divided by the baseline's; below 1 is faster):
+**Targets** (vole -O2 time divided by the baseline's; below 1 is faster):
 
 | bench | operation | vs Rust | vs C | today | owner |
 |---|---|---|---|---|---|
@@ -550,7 +550,7 @@ Wave A is written in today's language (0.16 plus the familiar forms): `*T` param
   - The loader resolves `std::a::b::Item` and lazy sections per file.
   - `pub use` re-exports keep every 0.17 name at `std::NAME`.
   - The prelude list is extended, and new names are added as their items land.
-- **Per-target tail.** `std_sys_tail` appends sys/macos.tach or sys/linux.tach, as `std_alloc_tail` does, plus the injected `std::TARGET_OS`.
+- **Per-target tail.** `std_sys_tail` appends sys/macos.vl or sys/linux.vl, as `std_alloc_tail` does, plus the injected `std::TARGET_OS`.
 - **Declarations with stub bodies (`unreachable()`)**, so that every task builds against fixed signatures:
   - `Ordering` (the enum and its methods);
   - `Hasher`, `BuildHasher` and `FixedState`;
@@ -571,27 +571,27 @@ Wave A is written in today's language (0.16 plus the familiar forms): `*T` param
 
 | task | owns | provides (interfaces) | depends |
 |---|---|---|---|
-| **A0 Ordering, Hash and Hasher** | compiler/std/cmp.tach; hash/mod.tach (the traits); compiler/src/front's derive of Ord and Hash; the `fix --only std020` rules for comparators and hand-written impls | `Ord::cmp -> Ordering`, `PartialOrd`, `Reverse`, `cmp_of -> Ordering`; `Hash::hash<H: Hasher>(self: *Self, state: *H)`; derive(Hash) as `state.write_*` per field; every std impl moved; `hash_of` through FixedState; the fix rules: comparator bodies `a - b` → `a.cmp(&b)`, otherwise `Ordering::from_i64(e)`; `fn hash(self) -> u64 { e }` → `fn hash<H: Hasher>(self, state: *H) { state.write_u64(e) }` | P0 |
-| **A1 Slice algorithms and sorts** | compiler/std/slice/{sort_unstable,sort_stable,search,algo,heap}.tach | `sort_unstable_by<T, F: FnMut(*T, *T) -> Ordering>(s: [T], f: F)`; `sort_stable_by_with<T, F>(s: [T], scratch: *T, scratch_len: i64, f: F)` (scratch ≥ n/2 for O(n log n), smaller falls back to in-place merges); `binary_search_by(s, f: FnMut(*T) -> Ordering) -> Result<i64, i64>`; `partition_point`; `select_nth_unstable_by`; `heap_sift_up_by`, `heap_sift_down_to_bottom_by`; `reverse`, `rotate_left`, `rotate_right`, `fill`, `dedup_by(s, f) -> i64` (the new length), `retain_by(s, f) -> i64`, `shuffle(s, rng)`; bench pairs: sort_*, bsearch, heap (algorithm half) | A0 (Ordering) |
-| **A2 Hashing and the raw table** | compiler/std/hash/{fold,sip,state}.tach; collections/raw_table.tach; collections/group.tach (scalar) | FoldHasher, FixedState, RandomState (its seed through A7's `sys::getentropy`, stubbed until A7 merges), SipHashState; `RawTable<T, A>` with `new_in`, `with_capacity_in`, `find(hash, eq: FnMut(*T) -> bool) -> i64`, `bucket(i) -> *T`, `insert(hash, x: T, hasher: FnMut(*T) -> u64) -> i64`, `erase(i)`, `take(i) -> T`, `reserve(n, hasher)`, `clear`, `iter() -> RawIter` (the next full index), `len`, `free`; the Group API of §2.4.2; the probe-length statistics (a test-only function); bench pairs hash_u64, hash_str, hash_churn (on RawTable, through a thin test map) | A0, P0 |
-| **A3 The B-tree node core** | compiler/std/collections/btree_node.tach | leaf and internal nodes (`[K; 11]`, `[V; 11]`, `[*Node; 12]`, `parent`, `parent_idx`, `len`), allocated through a generic `A`; `search_tree(root, height, key: *K) -> Handle`, `insert_fit/split`, `remove_kv` with steal and merge, `first_leaf_edge`, `next_kv`, `next_back_kv`, `range_search`, `free_tree`; the bench pair btree_u64 (on a thin test map) | A0 |
-| **A4 UTF-8 core** | compiler/std/str/utf8.tach | `validate_utf8(b: [u8]) -> Result<(), Utf8Error>`; `ascii_prefix_len`, `ascii_printable_prefix_len`; `decode_at(b, i) -> u64` (cp and length; valid input); `next_code_point`, `next_code_point_reverse`; `encode_utf8(cp: u32, out: *[u8; 4]) -> i64`; `count_chars`; `Utf8Decoder { state, pending }` with `feed(self, b: [u8], out: [u32]) -> (consumed, produced)` and `finish`; `decode_into`; `lossy_next`; boundary helpers; bench pairs utf8_validate, chars, the term_feed decode half | P0 |
-| **A5 Unicode tables, graphemes, width** | tools/unicode/{gen.tach,fetch.sh,ucd.lock}; compiler/std/unicode/{tables.tach (generated), props.tach, grapheme.tach, width.tach, case.tach, class.tach}; tests/std/unicode/ | `props(cp: u32) -> u16` and its masks; `char_width(cp) -> i64` (-1 for a control), `char_width_cjk`; `GraphemeState::new()`, `push(self: *Self, cp: u32) -> bool`; `cluster_width(..)` (the §2.5.4 rule, fed code points); `is_alphabetic`, `is_numeric`, `is_whitespace`, `is_lowercase`, `is_uppercase`, `is_control`; `to_lower(cp) -> [u32; 3]`, `to_upper`; `UNICODE_VERSION`; bench pairs graphemes, width, term_feed | P0; A4 for the bench only |
-| **A6 Numbers** | compiler/std/num/{wide,int_fmt,int_parse,flt2dec,dec2flt,tables}.tach; tools/numtables/gen.tach; fmt.tach's float and int paths (the early swap) | `wide_mul(a: u64, b: u64) -> (u64, u64)`; `fmt_u64(v, out: *[u8; 20]) -> i64` (the start index); `f64_shortest(v) -> (u64, i32)`, `f32_shortest`; `write_f64(v, mode, out: *[u8; 32]) -> i64` (Display, Debug, LowerExp, UpperExp); `parse_f64(s: [u8]) -> Result<f64, ParseFloatError>`, `parse_f32`; `parse_i64_radix`, `parse_u64_radix`; bench pairs fmt_f64, fmt_f64_prec, parse_f64, fmt_int, parse_int | P0 |
-| **A7 The OS layer** | compiler/std/sys/{unix,macos,linux}.tach; compiler/std/time.tach (Duration); compiler/std/random.tach (the core); the layout test | every function `Result<T, i32>` with the effect `io`: `open(path: [u8], flags: i32, mode: i32) -> Result<i32, i32>` (the NUL copy inside), `read(fd, buf: [u8])`, `write`, `pread`, `pwrite`, `lseek`, `close`, `fstat`/`stat`/`lstat -> FileStat`, `mkdir`, `rmdir`, `unlink`, `rename`, `ftruncate`, `fsync`, `opendir`/`readdir_into(dir, name: *[u8; 256])`/`closedir`, `getcwd_into`, `chdir`, `pipe`, `dup2`, `fcntl_nonblock`, `spawn(prog, argv: [*u8], envp, actions) -> Result<i32, i32>` (`posix_spawnp`), `waitpid`, `kill`, `openpty`, `fork_exec_pty`, `poll`, `isatty`, `tcgetattr`/`tcsetattr`, `ioctl_winsize`, `clock_gettime(clock) -> (i64, i64)`, `nanosleep`, `getentropy(buf: [u8])`, `errno() -> i32`, `strerror_into`, `errno_kind(e) -> ErrorKind`, `argv()`/`environ()` access; Duration's arithmetic; `Xoshiro256pp`, `seed_from_u64`, `random_range_u64` (Lemire), `unit_f64`; bench pairs rng, the sys half of read_file and spawn | P0 |
+| **A0 Ordering, Hash and Hasher** | compiler/std/cmp.vl; hash/mod.vl (the traits); compiler/src/front's derive of Ord and Hash; the `fix --only std020` rules for comparators and hand-written impls | `Ord::cmp -> Ordering`, `PartialOrd`, `Reverse`, `cmp_of -> Ordering`; `Hash::hash<H: Hasher>(self: *Self, state: *H)`; derive(Hash) as `state.write_*` per field; every std impl moved; `hash_of` through FixedState; the fix rules: comparator bodies `a - b` → `a.cmp(&b)`, otherwise `Ordering::from_i64(e)`; `fn hash(self) -> u64 { e }` → `fn hash<H: Hasher>(self, state: *H) { state.write_u64(e) }` | P0 |
+| **A1 Slice algorithms and sorts** | compiler/std/slice/{sort_unstable,sort_stable,search,algo,heap}.vl | `sort_unstable_by<T, F: FnMut(*T, *T) -> Ordering>(s: [T], f: F)`; `sort_stable_by_with<T, F>(s: [T], scratch: *T, scratch_len: i64, f: F)` (scratch ≥ n/2 for O(n log n), smaller falls back to in-place merges); `binary_search_by(s, f: FnMut(*T) -> Ordering) -> Result<i64, i64>`; `partition_point`; `select_nth_unstable_by`; `heap_sift_up_by`, `heap_sift_down_to_bottom_by`; `reverse`, `rotate_left`, `rotate_right`, `fill`, `dedup_by(s, f) -> i64` (the new length), `retain_by(s, f) -> i64`, `shuffle(s, rng)`; bench pairs: sort_*, bsearch, heap (algorithm half) | A0 (Ordering) |
+| **A2 Hashing and the raw table** | compiler/std/hash/{fold,sip,state}.vl; collections/raw_table.vl; collections/group.vl (scalar) | FoldHasher, FixedState, RandomState (its seed through A7's `sys::getentropy`, stubbed until A7 merges), SipHashState; `RawTable<T, A>` with `new_in`, `with_capacity_in`, `find(hash, eq: FnMut(*T) -> bool) -> i64`, `bucket(i) -> *T`, `insert(hash, x: T, hasher: FnMut(*T) -> u64) -> i64`, `erase(i)`, `take(i) -> T`, `reserve(n, hasher)`, `clear`, `iter() -> RawIter` (the next full index), `len`, `free`; the Group API of §2.4.2; the probe-length statistics (a test-only function); bench pairs hash_u64, hash_str, hash_churn (on RawTable, through a thin test map) | A0, P0 |
+| **A3 The B-tree node core** | compiler/std/collections/btree_node.vl | leaf and internal nodes (`[K; 11]`, `[V; 11]`, `[*Node; 12]`, `parent`, `parent_idx`, `len`), allocated through a generic `A`; `search_tree(root, height, key: *K) -> Handle`, `insert_fit/split`, `remove_kv` with steal and merge, `first_leaf_edge`, `next_kv`, `next_back_kv`, `range_search`, `free_tree`; the bench pair btree_u64 (on a thin test map) | A0 |
+| **A4 UTF-8 core** | compiler/std/str/utf8.vl | `validate_utf8(b: [u8]) -> Result<(), Utf8Error>`; `ascii_prefix_len`, `ascii_printable_prefix_len`; `decode_at(b, i) -> u64` (cp and length; valid input); `next_code_point`, `next_code_point_reverse`; `encode_utf8(cp: u32, out: *[u8; 4]) -> i64`; `count_chars`; `Utf8Decoder { state, pending }` with `feed(self, b: [u8], out: [u32]) -> (consumed, produced)` and `finish`; `decode_into`; `lossy_next`; boundary helpers; bench pairs utf8_validate, chars, the term_feed decode half | P0 |
+| **A5 Unicode tables, graphemes, width** | tools/unicode/{gen.vl,fetch.sh,ucd.lock}; compiler/std/unicode/{tables.vl (generated), props.vl, grapheme.vl, width.vl, case.vl, class.vl}; tests/std/unicode/ | `props(cp: u32) -> u16` and its masks; `char_width(cp) -> i64` (-1 for a control), `char_width_cjk`; `GraphemeState::new()`, `push(self: *Self, cp: u32) -> bool`; `cluster_width(..)` (the §2.5.4 rule, fed code points); `is_alphabetic`, `is_numeric`, `is_whitespace`, `is_lowercase`, `is_uppercase`, `is_control`; `to_lower(cp) -> [u32; 3]`, `to_upper`; `UNICODE_VERSION`; bench pairs graphemes, width, term_feed | P0; A4 for the bench only |
+| **A6 Numbers** | compiler/std/num/{wide,int_fmt,int_parse,flt2dec,dec2flt,tables}.vl; tools/numtables/gen.vl; fmt.vl's float and int paths (the early swap) | `wide_mul(a: u64, b: u64) -> (u64, u64)`; `fmt_u64(v, out: *[u8; 20]) -> i64` (the start index); `f64_shortest(v) -> (u64, i32)`, `f32_shortest`; `write_f64(v, mode, out: *[u8; 32]) -> i64` (Display, Debug, LowerExp, UpperExp); `parse_f64(s: [u8]) -> Result<f64, ParseFloatError>`, `parse_f32`; `parse_i64_radix`, `parse_u64_radix`; bench pairs fmt_f64, fmt_f64_prec, parse_f64, fmt_int, parse_int | P0 |
+| **A7 The OS layer** | compiler/std/sys/{unix,macos,linux}.vl; compiler/std/time.vl (Duration); compiler/std/random.vl (the core); the layout test | every function `Result<T, i32>` with the effect `io`: `open(path: [u8], flags: i32, mode: i32) -> Result<i32, i32>` (the NUL copy inside), `read(fd, buf: [u8])`, `write`, `pread`, `pwrite`, `lseek`, `close`, `fstat`/`stat`/`lstat -> FileStat`, `mkdir`, `rmdir`, `unlink`, `rename`, `ftruncate`, `fsync`, `opendir`/`readdir_into(dir, name: *[u8; 256])`/`closedir`, `getcwd_into`, `chdir`, `pipe`, `dup2`, `fcntl_nonblock`, `spawn(prog, argv: [*u8], envp, actions) -> Result<i32, i32>` (`posix_spawnp`), `waitpid`, `kill`, `openpty`, `fork_exec_pty`, `poll`, `isatty`, `tcgetattr`/`tcsetattr`, `ioctl_winsize`, `clock_gettime(clock) -> (i64, i64)`, `nanosleep`, `getentropy(buf: [u8])`, `errno() -> i32`, `strerror_into`, `errno_kind(e) -> ErrorKind`, `argv()`/`environ()` access; Duration's arithmetic; `Xoshiro256pp`, `seed_from_u64`, `random_range_u64` (Lemire), `unit_f64`; bench pairs rng, the sys half of read_file and spawn | P0 |
 | **A8 const generics (L1)** | compiler/src/front: generic parameters, instantiation keys, array-length substitution; docs/grammar.md's section; tests | `const N: i64` on structs, enums, impls and fns; `[T; N]`; inference of N from an argument's array type; a const argument written `Foo::<T, 4>`; mangling | none |
-| **A9 `char` (L2)** | compiler/src/front: the type, its literal typing and casts; middle and back: a 4-byte integer with an `as` check; docs/grammar.md; tests | `char`; `'é'`; `b'a'`; `c as u32`, `u as char` only for `u8` (Rust's rule); `char::from_u32`; Display and Debug for char in fmt.tach (Rust's escapes for Debug) | none |
+| **A9 `char` (L2)** | compiler/src/front: the type, its literal typing and casts; middle and back: a 4-byte integer with an `as` check; docs/grammar.md; tests | `char`; `'é'`; `b'a'`; `c as u32`, `u as char` only for `u8` (Rust's rule); `char::from_u32`; Display and Debug for char in fmt.vl (Rust's escapes for Debug) | none |
 
 ### 4.4 Wave B: needs 0.17 (".1": needs 0.17.1's projections)
 
 | task | owns | provides | depends |
 |---|---|---|---|
-| **B1 Vec and slices on values** | compiler/std/collections/vec.tach (Vec moves out of std.tach); slice/mod.tach (the `[T]` and `&mut [T]` methods over A1) | §2.4.1: Drop, the `&self`/`&mut self` API, `iter`/`iter_mut` (.1), `get -> Option<&T>` (.1), `retain`, `dedup`, `drain`, `extend`, `into_iter`, `v.sort()` through its allocator; DoubleEndedIterator and ExactSizeIterator in iter.tach | 0.17 T4 (std on values), A1 |
-| **B2 HashMap and HashSet** | collections/{hash_map,hash_set}.tach; the removal of std.tach's HashMap | §2.4.2's API over RawTable; `Borrow`; `entry` (.1); `iter`, `drain`, `retain`; Debug, Eq, Clone; the bench rows hash_* on the public map | A2, B1 |
-| **B3 BTreeMap and BTreeSet** | collections/{btree_map,btree_set}.tach | the API over A3; `range` views; Drop (the iterative free) | A3, B1 |
-| **B4 VecDeque, BinaryHeap, SmallVec, ArrayVec, BitSet** | collections/{vec_deque,binary_heap,small_vec,bit_set}.tach | §2.4.4; heap over A1's sift functions; bench rows deque, heap | B1, A8, A1 |
-| **B5 Text** | compiler/src/front: `str` (L3), literal typing, the deref coercions; compiler/std/{str/mod,str/pattern,str/iter,string,char}.tach; fmt.tach (`format_in -> String`, `fmt::Write`, `{:e}`) | §2.5.1–2: `str` and its methods, `String`, char's methods over A5, `graphemes(true)`, `width()`, `Pattern`, `FromStr`/`parse` over A6, `ToString`, `Borrow<str>`; Scanner, `split_in` and `trim` re-based on `str`/`[u8]`, keeping their 0.17 names | A4, A5, A6, A9, B1 |
-| **B6 I/O and the system API** | compiler/std/io/{mod,buffered,stdio,error}.tach (io.tach's content moves here); fs.tach, path.tach, env.tach, process.tach, os/unix.tach, time.tach (Instant, SystemTime), random.tach (the `Rng` API) | §2.6: `io::Error`, Read/Write/BufRead, `BufReader`/`BufWriter` with inline buffers, lending `lines()`, std streams with buffering, `fs`, `Path`/`PathBuf`, `env`, `process`, pty and poll, `Instant`, `Rng`; the main wrapper's argv and environ capture (compiler/src/front/ambient.tach); bench rows read_lines, write_lines, read_file, spawn | A7, B1, B5 (for `str` and `String`) |
+| **B1 Vec and slices on values** | compiler/std/collections/vec.vl (Vec moves out of std.vl); slice/mod.vl (the `[T]` and `&mut [T]` methods over A1) | §2.4.1: Drop, the `&self`/`&mut self` API, `iter`/`iter_mut` (.1), `get -> Option<&T>` (.1), `retain`, `dedup`, `drain`, `extend`, `into_iter`, `v.sort()` through its allocator; DoubleEndedIterator and ExactSizeIterator in iter.vl | 0.17 T4 (std on values), A1 |
+| **B2 HashMap and HashSet** | collections/{hash_map,hash_set}.vl; the removal of std.vl's HashMap | §2.4.2's API over RawTable; `Borrow`; `entry` (.1); `iter`, `drain`, `retain`; Debug, Eq, Clone; the bench rows hash_* on the public map | A2, B1 |
+| **B3 BTreeMap and BTreeSet** | collections/{btree_map,btree_set}.vl | the API over A3; `range` views; Drop (the iterative free) | A3, B1 |
+| **B4 VecDeque, BinaryHeap, SmallVec, ArrayVec, BitSet** | collections/{vec_deque,binary_heap,small_vec,bit_set}.vl | §2.4.4; heap over A1's sift functions; bench rows deque, heap | B1, A8, A1 |
+| **B5 Text** | compiler/src/front: `str` (L3), literal typing, the deref coercions; compiler/std/{str/mod,str/pattern,str/iter,string,char}.vl; fmt.vl (`format_in -> String`, `fmt::Write`, `{:e}`) | §2.5.1–2: `str` and its methods, `String`, char's methods over A5, `graphemes(true)`, `width()`, `Pattern`, `FromStr`/`parse` over A6, `ToString`, `Borrow<str>`; Scanner, `split_in` and `trim` re-based on `str`/`[u8]`, keeping their 0.17 names | A4, A5, A6, A9, B1 |
+| **B6 I/O and the system API** | compiler/std/io/{mod,buffered,stdio,error}.vl (io.vl's content moves here); fs.vl, path.vl, env.vl, process.vl, os/unix.vl, time.vl (Instant, SystemTime), random.vl (the `Rng` API) | §2.6: `io::Error`, Read/Write/BufRead, `BufReader`/`BufWriter` with inline buffers, lending `lines()`, std streams with buffering, `fs`, `Path`/`PathBuf`, `env`, `process`, pty and poll, `Instant`, `Rng`; the main wrapper's argv and environ capture (compiler/src/front/ambient.vl); bench rows read_lines, write_lines, read_file, spawn | A7, B1, B5 (for `str` and `String`) |
 | **B7 Tools, guide, migration, examples** | compiler/guide/{collections,text,io,std,rust}.md; tools: `fix --only std020` (beyond A0's rules), the explain entries, the guide's most-used list; docs/grammar.md (L3); examples/std/ (wordfreq on HashMap and String, a grep on BufReader and `str::find`, a `du` on read_dir, a pipeline on process); docs/releases.md | everything of §2.8 tested as `try:` lines (each `alloc.explicit` try runs in tests/std/try); `fix --only std020` over the corpus with same-output | everything; last |
 
 ### 4.5 Wave C: needs 0.18
@@ -604,8 +604,8 @@ Wave A is written in today's language (0.16 plus the familiar forms): `*T` param
 
 | task | owns | provides |
 |---|---|---|
-| **D1 The SIMD Group** | collections/group_neon.tach (aarch64), group_sse2.tach (x86_64, built and compiled but not run, per the no-x86 rule); the selection by `std::arch::has` | the Group API on `uint8x8_t` (and SSE2's low 8 lanes); a test that inserts 10^6 keys with each Group and compares the control bytes and buckets bytewise against the scalar table; hash_* rows rerun |
-| **D2 SIMD text and bits** | str/utf8_neon.tach; str/memchr.tach; unicode/width_neon.tach; the `wide_mul` and `count_ones` swaps | Keiser–Lemire validation, `ascii_prefix_len`, `ascii_printable_prefix_len`, `count_chars`, memchr/memrchr (for `find`, `split`, `lines`, BufRead), and a width fast path for ASCII runs, each tested equal to its scalar version on random and adversarial input; `wide_mul` through `std::arch`, `BitSet::len` through `count_ones` |
+| **D1 The SIMD Group** | collections/group_neon.vl (aarch64), group_sse2.vl (x86_64, built and compiled but not run, per the no-x86 rule); the selection by `std::arch::has` | the Group API on `uint8x8_t` (and SSE2's low 8 lanes); a test that inserts 10^6 keys with each Group and compares the control bytes and buckets bytewise against the scalar table; hash_* rows rerun |
+| **D2 SIMD text and bits** | str/utf8_neon.vl; str/memchr.vl; unicode/width_neon.vl; the `wide_mul` and `count_ones` swaps | Keiser–Lemire validation, `ascii_prefix_len`, `ascii_printable_prefix_len`, `count_chars`, memchr/memrchr (for `find`, `split`, `lines`, BufRead), and a width fast path for ASCII runs, each tested equal to its scalar version on random and adversarial input; `wide_mul` through `std::arch`, `BitSet::len` through `count_ones` |
 
 The scalar version comes first in every case. It is the fallback when a feature is missing at run time, and the oracle for the SIMD version. Only aarch64 is measured and run.
 
@@ -628,13 +628,13 @@ The scalar version comes first in every case. It is the fallback when a feature 
 **Conflicts to avoid:**
 - A0 touches derive in compiler/src, and A8 and A9 touch the front end's types and generics. Those three rebase on whatever 0.17's front/own work has landed, and keep to their files: generics/instantiate, the lexer's char literals, check's literal typing.
 - B5's `str` changes check's coercion code, which 0.17's views also touch. It goes after 0.17.1.
-- Only B1 edits std.tach's Vec section, and only B2 edits its HashMap section.
+- Only B1 edits std.vl's Vec section, and only B2 edits its HashMap section.
 
 ### 4.8 What can start now, in one list
 
 P0, A0, A1, A2, A3, A4, A5, A6, A7, A8, A9: eleven tasks, about 60% of 0.20's code by line count, and all of its hard algorithms. They can run on up to nine agents at once after P0 and A0.
 
-## 5. Migration: `tachyonc fix --only std020`
+## 5. Migration: `volec fix --only std020`
 
 Run over the corpus (tests, examples, bench, the guide's examples, the eval starters and solutions), then `same-output` against the previous compiler. The rules:
 
@@ -682,17 +682,17 @@ Every one was taken as recommended, because the user is away and said to proceed
 - **W12. Random.** rand 0.9's names (`random_range`, `seed_from_u64`) on xoshiro256++, in `std::random`. *Recommended: yes.*
 - **W13. Const generics (L1)** in 0.20, for `SmallVec`, `ArrayVec` and array impls. *Recommended: yes*, as A8, now.
 - **W14. Wave A merges early as private std items**, with the formatting and sort swaps allowed to ship in 0.17 to 0.19 when their output is byte-identical. *Recommended: yes.*
-- **W15. The generator is written in tachyon.** *Recommended: yes* (dogfooding). Python would be quicker to write, but adds a second language to the release chain.
+- **W15. The generator is written in vole.** *Recommended: yes* (dogfooding). Python would be quicker to write, but adds a second language to the release chain.
 
 ### Critical files for implementation
 
-- compiler/std/embed.sh, compiler/std/index.awk, compiler/src/front/modules/stdsections.tach (`load_std_sections`, `read_index`) and compiler/src/front/modules/mod.tach (`load_std_if_named`): std as a module tree, lazy per file (P0).
-- compiler/src/front/stdalloc.tach (`std_alloc_tail`): the model for `std_sys_tail` and `TARGET_OS` (P0).
-- compiler/std/std.tach: `HashMap` (`slot_of`, `insert_new`, `rehash`), `sort` and `quicksort`, `sort_stable_in`, the `Hash`/`Ord`/`Eq` impls, `hash_u64`. These are what A0, A1, A2, B1 and B2 replace.
-- compiler/std/clone.tach (`hash_mix`, `hash_of`, `cmp_of`) and compiler/src/front's derive (`derive(Hash)`, `derive(Ord)`): A0.
-- compiler/std/fmt.tach (`fmt_float`, `Fmt::int`, `format_in`): A6's swap, then B5.
-- compiler/std/io.tach (`read_line`, `read_stdin_in`, `Scanner`, `IoError`): moves under std::io (B6), re-based on `str` (B5).
-- compiler/src/front/ambient.tach (`main_gpa`): where B6 captures argv and environ.
+- compiler/std/embed.sh, compiler/std/index.awk, compiler/src/front/modules/stdsections.vl (`load_std_sections`, `read_index`) and compiler/src/front/modules/mod.vl (`load_std_if_named`): std as a module tree, lazy per file (P0).
+- compiler/src/front/stdalloc.vl (`std_alloc_tail`): the model for `std_sys_tail` and `TARGET_OS` (P0).
+- compiler/std/std.vl: `HashMap` (`slot_of`, `insert_new`, `rehash`), `sort` and `quicksort`, `sort_stable_in`, the `Hash`/`Ord`/`Eq` impls, `hash_u64`. These are what A0, A1, A2, B1 and B2 replace.
+- compiler/std/clone.vl (`hash_mix`, `hash_of`, `cmp_of`) and compiler/src/front's derive (`derive(Hash)`, `derive(Ord)`): A0.
+- compiler/std/fmt.vl (`fmt_float`, `Fmt::int`, `format_in`): A6's swap, then B5.
+- compiler/std/io.vl (`read_line`, `read_stdin_in`, `Scanner`, `IoError`): moves under std::io (B6), re-based on `str` (B5).
+- compiler/src/front/ambient.vl (`main_gpa`): where B6 captures argv and environ.
 - bench/run.sh: the model for bench/std/run.sh (P0).
 
 ## Decisions taken (for the user's review)
@@ -730,7 +730,7 @@ Taken on 2026-10-16, as recommended, because the user is away and said to work t
   - itoa-style integer formatting;
   - `wide_mul` scalar now and an intrinsic in 0.19.
 - **D10 (W10). Unicode:**
-  - pinned UCD files and a tachyon generator, with generated tables checked in;
+  - pinned UCD files and a vole generator, with generated tables checked in;
   - one `props()` trie (at most 24 KB) for the grapheme property, width class and the emoji and InCB bits;
   - UAX #29 graphemes through an incremental `GraphemeState`;
   - width both per code point (unicode-width's semantics) and per grapheme.
@@ -742,4 +742,4 @@ Taken on 2026-10-16, as recommended, because the user is away and said to work t
   - the float-formatting and sort swaps may ship early when their output is byte-identical;
   - Wave B (B1 to B7) after 0.17, Wave C (C1) after 0.18, Wave D (D1 and D2) after 0.19, scalar first in every case;
   - 0.20 may split into 0.20 (collections and text) and 0.20.1 (I/O) if B6 runs late.
-- **D15. Performance gate:** every §3 row has a bench/std triple (tachyon, Rust std, C), with targets in bench/std/targets.txt, and `gate.sh --only bench` fails on a hard miss. Programs that do not use the new std must not compile slower (+1 ms for a hello world).
+- **D15. Performance gate:** every §3 row has a bench/std triple (vole, Rust std, C), with targets in bench/std/targets.txt, and `gate.sh --only bench` fails on a hard miss. Programs that do not use the new std must not compile slower (+1 ms for a hello world).

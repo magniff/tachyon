@@ -3,11 +3,11 @@
 Five memory bugs, each in a function of its own, chosen by the
 program's argument: `copy`, `push`, `scope`, `twice`, `leak`. With no
 argument the program runs the correct version of each. All five
-compiled in tachyon 0.16; the first four are undefined behaviour, the
+compiled in vole 0.16; the first four are undefined behaviour, the
 one gap 0.16 left open. 0.17 closes it: they are compile errors now
 (the last section). The program is 0.16 code, so the sessions build it
 with `--values=off`, 0.16's semantics (no moves, no drops, no view
-checks), to show what `tachyonc --check-alloc` does with such bugs: it
+checks), to show what `volec --check-alloc` does with such bugs: it
 builds the program with a checking allocator that stops at each of them
 with the block, where it was allocated and where it was freed. It still
 matters in 0.17 for leaks, for unsafe code and for code built with
@@ -21,7 +21,7 @@ and with each bug.
 ## The correct version
 
 ```console
-$ tachyonc --values=off main.tach -o shop && ./shop
+$ volec --values=off main.vl -o shop && ./shop
 fruit: 7
 fruit: 7
 first 0
@@ -58,7 +58,7 @@ message, and nothing at all.
 ## The bugs, built with `--check-alloc`
 
 ```console
-$ tachyonc --values=off --check-alloc main.tach -o shop-checked
+$ volec --values=off --check-alloc main.vl -o shop-checked
 ok: built shop-checked
 ```
 
@@ -77,7 +77,7 @@ println(f"{shelf.name}: {stock(&shelf)}");   // reads freed memory
 ```console
 $ ./shop-checked copy
 fruit: 7
-use after free: block #1 (32 bytes), allocated at main.tach:20:5, freed at main.tach:29:9
+use after free: block #1 (32 bytes), allocated at main.vl:20:5, freed at main.vl:29:9
 [exit 101]
 ```
 
@@ -95,7 +95,7 @@ happened to move it:
 
 ```console
 $ ./shop-checked push
-use after free: block #1 (32 bytes), allocated at main.tach:39:9, freed at main.tach:42:5
+use after free: block #1 (32 bytes), allocated at main.vl:39:9, freed at main.vl:42:5
 [exit 101]
 ```
 
@@ -105,7 +105,7 @@ slice of it can, and the scope's end freed what it points at:
 
 ```console
 $ ./shop-checked scope
-use after release: block #2 (32 bytes) of an arena, allocated at main.tach:65:13, released at main.tach:63:17 (the arena's reset or scope end)
+use after release: block #2 (32 bytes) of an arena, allocated at main.vl:65:13, released at main.vl:63:17 (the arena's reset or scope end)
 [exit 101]
 ```
 
@@ -114,7 +114,7 @@ use after release: block #2 (32 bytes) of an arena, allocated at main.tach:65:13
 ```console
 $ ./shop-checked twice
 tools: 1
-double free: block #1 (32 bytes), allocated at main.tach:75:5, freed at main.tach:78:5, freed again at main.tach:80:9
+double free: block #1 (32 bytes), allocated at main.vl:75:5, freed at main.vl:78:5, freed again at main.vl:80:9
 [exit 101]
 ```
 
@@ -126,7 +126,7 @@ they were allocated:
 $ ./shop-checked leak
 a report nobody frees
 check-alloc: 1 block of Gpa not freed (21 bytes):
-  block #1 (21 bytes), allocated at main.tach:87:5
+  block #1 (21 bytes), allocated at main.vl:87:5
 ```
 
 A test can ask instead: `gpa.live_blocks()` is the number of blocks not
@@ -151,11 +151,11 @@ production builds.
 program as it is does not compile: the first four bugs are errors.
 
 ```console
-$ tachyonc check main.tach
-main.tach:27:9: error[own.moved] 'counts' is used here after it moved at 22:48 | help: use it before the move, pass a copy where it moves ('.clone()'), or let the callee borrow it: a let parameter ('x: T'), not 'sink' | try: tachyonc edit patch main.tach:22 --old 'let shelf = Shelf { name: "fruit", counts: counts };' --new 'let shelf = Shelf { name: "fruit", counts: counts.clone() };'
-main.tach:42:5: error[own.conflict] 'v.push(40)' may change 'v' while 'first' (main.tach:41:9) views it; 'first' is used at main.tach:47:26 | help: use the view before the change, keep an index instead of a view, or keep a copy | try: tachyonc edit patch slice_after_push --old 'v.as_slice()' --new 'v.clone()' | try: tachyonc query own main.tach:47:26
-main.tach:66:13: error[own.escape] 'closure(ScopedArena) -> [i64] at main.tach:63:34' returns a view of 'v', which is dropped when 'closure(ScopedArena) -> [i64] at main.tach:63:34' returns | help: return the owner itself; a caller that wants a view takes '.as_slice()' of it | try: tachyonc edit patch closure(ScopedArena) -> [i64] at main.tach:63:34 --old '-> [i64]' --new '-> Vec<i64, ScopedArena>' --old 'v.as_slice()' --new 'v'
-main.tach:78:5: error[own.moved] 'counts' is used here after it moved at 76:48 | help: use it before the move, pass a copy where it moves ('.clone()'), or let the callee borrow it: a let parameter ('x: T'), not 'sink' | try: tachyonc edit patch main.tach:76 --old 'var shelf = Shelf { name: "tools", counts: counts };' --new 'var shelf = Shelf { name: "tools", counts: counts.clone() };'
+$ volec check main.vl
+main.vl:27:9: error[own.moved] 'counts' is used here after it moved at 22:48 | help: use it before the move, pass a copy where it moves ('.clone()'), or let the callee borrow it: a let parameter ('x: T'), not 'sink' | try: volec edit patch main.vl:22 --old 'let shelf = Shelf { name: "fruit", counts: counts };' --new 'let shelf = Shelf { name: "fruit", counts: counts.clone() };'
+main.vl:42:5: error[own.conflict] 'v.push(40)' may change 'v' while 'first' (main.vl:41:9) views it; 'first' is used at main.vl:47:26 | help: use the view before the change, keep an index instead of a view, or keep a copy | try: volec edit patch slice_after_push --old 'v.as_slice()' --new 'v.clone()' | try: volec query own main.vl:47:26
+main.vl:66:13: error[own.escape] 'closure(ScopedArena) -> [i64] at main.vl:63:34' returns a view of 'v', which is dropped when 'closure(ScopedArena) -> [i64] at main.vl:63:34' returns | help: return the owner itself; a caller that wants a view takes '.as_slice()' of it | try: volec edit patch closure(ScopedArena) -> [i64] at main.vl:63:34 --old '-> [i64]' --new '-> Vec<i64, ScopedArena>' --old 'v.as_slice()' --new 'v'
+main.vl:78:5: error[own.moved] 'counts' is used here after it moved at 76:48 | help: use it before the move, pass a copy where it moves ('.clone()'), or let the callee borrow it: a let parameter ('x: T'), not 'sink' | try: volec edit patch main.vl:76 --old 'var shelf = Shelf { name: "tools", counts: counts };' --new 'var shelf = Shelf { name: "tools", counts: counts.clone() };'
 [exit 1]
 ```
 
@@ -172,13 +172,13 @@ main.tach:78:5: error[own.moved] 'counts' is used here after it moved at 76:48 |
 - **Leaks** stay possible (they are safe), and drops make them rare;
   `--check-alloc` keeps listing them.
 
-`tachyonc fix --values` migrates the common patterns (`defer x.free()`
+`volec fix --values` migrates the common patterns (`defer x.free()`
 removed where the value drops, parameters to references), with exact
-diagnostics for the rest (`tachyonc guide memory`).
+diagnostics for the rest (`volec guide memory`).
 
 ## Read more
 
-- `tachyonc guide allocators`, section "--check-alloc".
-- `tachyonc guide memory`: moves, drops, views and their lifetime.
+- `volec guide allocators`, section "--check-alloc".
+- `volec guide memory`: moves, drops, views and their lifetime.
 - [gpa-from-main](../gpa-from-main/) and
   [arena-parser](../arena-parser/): leaks found by `--check-alloc`.

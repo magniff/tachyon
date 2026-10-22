@@ -1,10 +1,10 @@
-## tachyonc fmt on the syntax of 0.16 (tests/refactor/fmt016/): effect
+## volec fmt on the syntax of 0.16 (tests/refactor/fmt016/): effect
 ## attributes and their lists, `effects(...)` bounds, default type
 ## parameters (a type argument in a default, `Vec< T >`, is one), and a
 ## long list of type parameters broken after a `,`, its next line indented.
 $ fmt
-formatted	main.tach	+8 -7 lines
-% cat main.tach
+formatted	main.vl	+8 -7 lines
+% cat main.vl
 extern "C" {
     #[link_name = "write"] #[effects(io)]
     fn out_write(fd: i32, data: *u8, count: u64) -> i64;

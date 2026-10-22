@@ -29,7 +29,7 @@ LC_ALL=C
 export LC_ALL
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 while [ $# -gt 0 ]; do
     case "$1" in
         -c) COMPILER=$2; shift 2 ;;
@@ -345,7 +345,7 @@ middle::parallel::COMP_OF	read: R_STATIC (ready)
 middle::parallel::COMP_START	key: the component'"'"'s functions
 middle::parallel::FN_CONSTS	IR: constant data by owner, place and bytes (const_canon); outputs
 middle::parallel::FN_TEXT	own: an output
-middle::parallel::FRESH_CONTEXTS	key: options_hash (cc_args: $TACHYON_FRESH_CONTEXTS)
+middle::parallel::FRESH_CONTEXTS	key: options_hash (cc_args: $VOLE_FRESH_CONTEXTS)
 middle::parallel::ITEMS	own: the task'"'"'s function
 middle::profile::PROFILE_MAX	off: --profile-use (and options_hash)
 middle::slp::SLP	key: options_hash
@@ -365,7 +365,7 @@ mkdir -p "$WORK"
 [ -s "$WORK/reached" ] || { echo "threads-writes: query callees found nothing"; exit 1; }
 # Every static, as a query path.
 grep -rn '^ *\(pub \)\{0,1\}static mut [A-Za-z_0-9]* *:' compiler/src | awk -F: '{
-    file = $1; sub(/^compiler\/src\//, "", file); sub(/\.tach$/, "", file); sub(/\/mod$/, "", file)
+    file = $1; sub(/^compiler\/src\//, "", file); sub(/\.vl$/, "", file); sub(/\/mod$/, "", file)
     gsub(/\//, "::", file)
     line = $0; sub(/^[^:]*:[^:]*:/, "", line)
     sub(/^ *(pub )?static mut /, "", line); sub(/ *:.*/, "", line)
@@ -374,7 +374,7 @@ grep -rn '^ *\(pub \)\{0,1\}static mut [A-Za-z_0-9]* *:' compiler/src | awk -F: 
 sed 's/^/query refs /; s/$/ --all/' "$WORK/statics" | "$COMPILER" batch >"$WORK/refs" 2>&1
 awk -F'\t' -v reached="$WORK/reached" '
     BEGIN { while ((getline f < reached) > 0) in_task[f] = 1 }
-    /^## \$ tachyonc query refs / { s = $0; sub(/^## \$ tachyonc query refs crate::/, "", s); sub(/ --all$/, "", s); n = s; sub(/.*::/, "", n); next }
+    /^## \$ volec query refs / { s = $0; sub(/^## \$ volec query refs crate::/, "", s); sub(/ --all$/, "", s); n = s; sub(/.*::/, "", n); next }
     NF >= 4 && $1 ~ /^[0-9]+:[0-9]+$/ {
         w = ($2 == "write" || $2 == "borrow")
         # (a method that changes it, through an element too; an address
@@ -398,7 +398,7 @@ awk -F'\t' -v joined="$WORK/joined" -v reached="$WORK/reached" '
         while ((getline f < joined) > 0) in_join[f] = 1
         while ((getline f < reached) > 0) in_task[f] = 1
     }
-    /^## \$ tachyonc query refs / { s = $0; sub(/^## \$ tachyonc query refs crate::/, "", s); sub(/ --all$/, "", s); n = s; sub(/.*::/, "", n); next }
+    /^## \$ volec query refs / { s = $0; sub(/^## \$ volec query refs crate::/, "", s); sub(/ --all$/, "", s); n = s; sub(/.*::/, "", n); next }
     NF >= 4 && $1 ~ /^[0-9]+:[0-9]+$/ {
         w = ($2 == "write" || $2 == "borrow")
         if ($2 == "read" && match($4, n "(\\[[^]]*\\])?[ \t]*\\.[ \t]*(push|pop|clear|set|insert|put|reserve|truncate|remove|append|extend)[ \t]*\\(")) w = 1
@@ -427,7 +427,7 @@ awk -F'\t' -v A="$WORK/assembler" -v M="$WORK/gen0" '
         while ((getline f < A) > 0) in_asm[f] = 1
         while ((getline f < M) > 0) in_main[f] = 1
     }
-    /^## \$ tachyonc query refs / { s = $0; sub(/^## \$ tachyonc query refs crate::/, "", s); sub(/ --all$/, "", s); n = s; sub(/.*::/, "", n); next }
+    /^## \$ volec query refs / { s = $0; sub(/^## \$ volec query refs crate::/, "", s); sub(/ --all$/, "", s); n = s; sub(/.*::/, "", n); next }
     NF >= 4 && $1 ~ /^[0-9]+:[0-9]+$/ {
         w = ($2 == "write" || $2 == "borrow")
         if ($2 == "read" && match($4, n "(\\[[^]]*\\])?[ \t]*\\.[ \t]*(push|pop|clear|set|insert|put|reserve|truncate|remove|append|extend)[ \t]*\\(")) w = 1
@@ -445,7 +445,7 @@ done
 # (T8) Every static task code touches, against READ.
 awk -F'\t' -v reached="$WORK/reached" '
     BEGIN { while ((getline f < reached) > 0) in_task[f] = 1 }
-    /^## \$ tachyonc query refs / { s = $0; sub(/^## \$ tachyonc query refs crate::/, "", s); sub(/ --all$/, "", s); next }
+    /^## \$ volec query refs / { s = $0; sub(/^## \$ volec query refs crate::/, "", s); sub(/ --all$/, "", s); next }
     NF >= 4 && $1 ~ /^[0-9]+:[0-9]+$/ { if ($2 != "use" && $2 != "def" && ($3 in in_task)) print s }' "$WORK/refs" \
     | sort -u >"$WORK/touched"
 printf '%s\n' "$READ" | cut -f1 | sort -u >"$WORK/read-allowed"

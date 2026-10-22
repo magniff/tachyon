@@ -1,4 +1,4 @@
-/* The C side of tests/run/cimport_*.tach (declarations in cimport.h). */
+/* The C side of tests/run/cimport_*.vl (declarations in cimport.h). */
 #include <stdarg.h>
 #include <stdlib.h>
 #include "cimport.h"

@@ -8,12 +8,12 @@
 ## recorded here before 0.18.1: `16 9 shape rect true 10 3 true false $7`. What the fix keeps raw is wrapped in
 ## `unsafe` by `fix --only unsafe`, the second try: of the error.)
 $ fix --values
-fixed 9 parameters to &mut T, 17 parameters to &T, 2 arguments	main.tach	+22 -22 lines
+fixed 9 parameters to &mut T, 17 parameters to &T, 2 arguments	main.vl	+22 -22 lines
 ## (0.20) Then 0.20's spelling, `fix --only conventions` (the migration reads
 ## 0.19's spelling itself), before the fixes that read 0.20's.
 $ fix --only conventions
-fixed 6 parameters to let, 3 parameters to inout, 17 receivers, 2 '&mut e's to '&e', 3 '&e's to a let, 4 'let mut's / 'mut x's to var	main.tach	+28 -27 lines
-% cat main.tach
+fixed 6 parameters to let, 3 parameters to inout, 17 receivers, 2 '&mut e's to '&e', 3 '&e's to a let, 4 'let mut's / 'mut x's to var	main.vl	+28 -27 lines
+% cat main.vl
 trait Shape {
     fn area(self) -> i64;
     fn grow(inout self, by: i64);
@@ -76,7 +76,7 @@ $ fix --only unsafe
 note fix.none: nothing to fix
 $ fix --values
 note fix.none: nothing to fix
-$ main.tach -o prog
+$ main.vl -o prog
 ok: built prog
 % ./prog
 16 9 shape rect true 10 3 true false $7

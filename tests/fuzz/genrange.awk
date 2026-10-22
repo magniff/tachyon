@@ -1,9 +1,9 @@
-# Writes a random tachyon program of loops indexing arrays of fixed sizes
+# Writes a random vole program of loops indexing arrays of fixed sizes
 # (0.11): induction variables with steps of 1 to 4, steps read from the
 # array, decreasing ones, two of them together, sift-downs (`child + 1 <
 # end && a[child] < a[child + 1]`); now and then an index goes past an end
 # (the bounds check stops the program with 101, alike at every level). The
-# range analysis drops the checks it proves (range.tach): every level must
+# range analysis drops the checks it proves (range.vl): every level must
 # print the same.
 #
 # usage: awk -v seed=N -f genrange.awk

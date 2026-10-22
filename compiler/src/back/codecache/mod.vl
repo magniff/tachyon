@@ -1,0 +1,2071 @@
+// (0.18.1) Incremental rebuilds: the code cache (T8 of
+// docs/design/contracts-verification.md; docs/optimizer.md, "0.18.1:
+// incremental rebuilds"). A task of middle::parallel whose inputs are the
+// same as in an earlier build takes that build's outputs instead of
+// running: -O2's cleanup and scalar pipeline of a function (its IR), -O2's
+// components (their functions' optimized IR and facts) and every
+// function's emission (its text), at -O1 and -O2.
+//
+// An entry is found by its key: the compiler, the options and the
+// program's types (env), the task's functions by symbol, their IR as the
+// task receives it (hash::ir_hash) and what the program knows of them
+// (own_fp). It holds what the task read of other functions while it ran
+// (a verifying trace): each read is recorded when it is made (cc_note,
+// from the accessors: the callee of a call, its readiness, size,
+// attributes, call flags, deciders and IR) with the value read, and the
+// entry is used only when every one reads the same now. Two reads of the
+// program record the answer, not the value: the inlining budget (whether
+// the program's size plus a growth is within it) and a callee's calls
+// left (whether one). The outputs name strings, symbols, functions and
+// constant data by what they are (snapshot::Rel), mapped to this build's
+// ids when used.
+//
+// A task that reads something the trace cannot hold (IR whose hash is not
+// known) is poisoned: it runs and nothing is stored. The output with the
+// cache is the same as without, byte for byte (tests/incremental.sh).
+
+pub mod hash;
+pub mod snapshot;
+pub mod pack;
+
+use crate::host_target;
+use crate::back::codecache::hash::{
+    FN_AMBIG, FN_CANON, FN_NAMEH, H2, fn_of_name, h2_new, h2_put, h2_puti, hash_bytes, ir_hash,
+    ir_nameh, ir_of_name, mix, names_begin, strings_begin, types_hash,
+};
+use crate::back::codecache::pack::{
+    VERSION, pack_body, pack_body_at, pack_changed, pack_find, pack_load, pack_new, pack_save,
+    pack_touch, pack_used,
+};
+use crate::back::codecache::snapshot::{
+    ByteBuf, IRCopy, Ids, Reader, Rel, bb_new, decode_ir, encode_ir, free_copy, get_bytes,
+    get_count, get_s, get_u, ids_free, put_bytes, put_s, put_u, rel_add_source, rel_clear, rel_fn,
+    rel_new, rel_rtid, rel_saddr, rel_str_source,
+};
+use crate::back::dwarf::DEBUG_INFO;
+use crate::back::emit::stats::STATS;
+use crate::back::objfile::OUTPUT_MODE;
+use crate::back::regalloc::{PRINT_REGALLOC, VERIFY_REGALLOC};
+use crate::back::regalloc::scan::X86_ALLOC_ACD;
+use crate::base::{
+    FILES, IntVec, SYMS, alloc_array, alloc_zeroed, find_sym, free, getenv, memcpy, streq,
+    stress_grow, strlen,
+};
+use crate::base::target::{APPLE_A64, ELF, X86};
+use crate::base::timer::TIME_PASSES;
+use crate::front::distinct::ANY_DISTINCT;
+use crate::front::own::diag::OWN_MODE;
+use crate::front::stdalloc::CHECK_ALLOC_MODE;
+use crate::front::types::{FNS, FN_COUNT};
+use crate::gen0::gen::{EMIT_IR, EMIT_MIR};
+use crate::middle::copies::move_copies;
+use crate::middle::coverage::COVERAGE;
+use crate::middle::ctx::FnCtx;
+use crate::middle::effects_verify::VERIFY_EFFECTS;
+use crate::middle::egraph::EGRAPH;
+use crate::middle::gvn::NOALIAS_OFF;
+use crate::middle::ifconv::IFCONV;
+use crate::middle::inline::{
+    FN_ADDRESS, FN_CALLS, FN_DECIDERS, FN_DECIDERS_START, FN_LIVE, FN_RT, FN_SCC, FN_SIZE,
+    LEAF_DONE, LEAF_KEEP, LEAF_SMALL, PROGRAM_BUDGET, PROGRAM_SIZE, SCC_ORDER,
+};
+use crate::middle::ipo::{ATTRS_READY, FN_ATTRS, FN_ATTRS_DONE, FN_NOCAPTURE, PRINT_ATTRS};
+use crate::middle::ir::{FN_IR, IRFUNCS, IRFUNC_COUNT, IRTables, ir_enter, ir_release};
+use crate::middle::ir::verify::{PRINT_AFTER_ALL, VERIFY_IR};
+use crate::middle::opt::{DEFERRED, OPT_LEVEL, PER_FUNCTION};
+use crate::middle::parallel::{
+    COMP_GROWTH, COMP_INLINED, FN_TEXT, K_COMPONENT, OWNER_SHIFT, P_CLEANUP, P_COMPONENT, P_EMIT,
+    P_SIMPLIFY, comp_of, const_data, const_data_count, const_data_entry, fn_facts_ready,
+};
+use crate::middle::profile::{PROFILE_GENERATE, PROFILE_MAX, PROFILE_USE};
+use crate::middle::slp::SLP;
+use crate::middle::trace::TRACE;
+use crate::middle::unsafecheck::CHECK_UNSAFE;
+use crate::middle::vectorize::VECTORIZE;
+use crate::middle::vectorize::unroll::UNROLL_RUNTIME;
+use crate::tools::proc::{fork_worker, make_dirs, worker_exit};
+use crate::tools::query::cache::{cache_dir, ident};
+use crate::tools::query::checks::PRINT_CHECKS;
+
+extern "C" {
+    fn getcwd(buf: *u8, size: u64) -> *u8;
+    fn setsid() -> i32;
+    fn open(path: *u8, flags: i32) -> i32;
+    fn dup2(from: i32, to: i32) -> i32;
+    fn fopen(path: *u8, mode: *u8) -> *u8;
+    fn fwrite(buf: *u8, size: u64, count: u64, file: *u8) -> u64;
+    fn fclose(file: *u8) -> i32;
+}
+
+// ---- Options ----
+
+// --cache=on (1), --cache=off or --no-cache (-1), neither (0: on where the
+// tools' cache is, a ./target directory or $VOLE_CACHE).
+pub static var CC_FLAG: i64 = 0;
+// Whether this compilation uses the cache (cc_begin).
+pub static var CC_ON: bool = false;
+
+// The size of the program's code below which the cache is off without
+// --cache=on: its live functions' instructions as lowered. A 7-line
+// program with std has 1405 (a build at -O1 6 ms, the cache's start 4 ms
+// more: the compiler's hash, the pack); examples/calc 3321 (-O1 7.3 ms,
+// 8.0 with the cache), examples/closures-iterators 8230 (-O1 10.6 ms,
+// 10.5; -O2 36 ms, 13); the compiler 716164.
+const MIN_INSTS: i64 = 8000;
+// The size of this program's, for $VOLE_CACHE_STATS.
+static var PROGRAM_INSTS: i64 = 0;
+// The command line's hash (cc_args), and whether it has an option the
+// cache does not know (then it is off).
+static var ARGS_H: u64 = 0;
+static var ARGS_UNKNOWN: bool = false;
+
+// Whether `arg` is one of the cache's options (taken).
+pub fn cc_option(arg: *u8) -> bool {
+    unsafe {
+        if streq(arg, c"--no-cache") || streq(arg, c"--cache=off") {
+            CC_FLAG = -1;
+            return true;
+        }
+        if streq(arg, c"--cache=on") {
+            CC_FLAG = 1;
+            return true;
+        }
+        false
+    }
+}
+
+fn starts(s: *u8, prefix: *u8) -> bool {
+    unsafe {
+        var i = 0;
+        while prefix[i] != 0 {
+            if s[i] != prefix[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+}
+
+// The options that change no code (left out of the hash), and those
+// known not to need the cache off; any other option turns it off.
+fn arg_kind(a: *u8) -> i64 {
+    unsafe {
+        // (0: hashed; 1: left out; 2: left out with the next; 3: hashed with
+        // the next; 4: hashed with the next two; -1: unknown)
+        if a[0] != '-' {
+            return 0;
+        }
+        if streq(a, c"-o") {
+            return 2;
+        }
+        if a[1] == 'j' {
+            return if a[2] == 0 { 2 } else { 1 };
+        }
+        if streq(a, c"--no-cache") || starts(a, c"--cache=") || starts(a, c"--diagnostics=")
+            || streq(a, c"--deny-warnings") {
+            return 1;
+        }
+        if streq(a, c"-O0") || streq(a, c"-O1") || streq(a, c"-O2") || streq(a, c"-c")
+            || streq(a, c"-S") || streq(a, c"--emit-asm") || streq(a, c"--no-ifconv")
+            || streq(a, c"--no-vectorize") || streq(a, c"--no-unroll-runtime")
+            || streq(a, c"--no-slp") || streq(a, c"--no-noalias") || streq(a, c"--no-egraph")
+            || streq(a, c"--debug-contracts") || streq(a, c"--no-positions")
+            || streq(a, c"--test-build") || starts(a, c"--values=")
+            || starts(a, c"--syntax=") || starts(a, c"--atomics=") {
+            return 0;
+        }
+        if (a[1] == 'I' || a[1] == 'l' || a[1] == 'L') && a[2] != 0 {
+            return 0;
+        }
+        if streq(a, c"--target") || streq(a, c"-I") || streq(a, c"-l") || streq(a, c"-L")
+            || streq(a, c"-C") {
+            return 3;
+        }
+        if streq(a, c"--overlay") {
+            return 4;
+        }
+        -1
+    }
+}
+
+// The command line's options, hashed (main, before they are read).
+pub fn cc_args(argc: i64, argv: **u8) {
+    unsafe {
+        // (the compiler, whose executable's hash keys the cache:
+        // tools::query::cache::ident)
+        if crate::tools::query::diagnostics::PROG == 0 as *u8 {
+            crate::tools::query::diagnostics::PROG = argv[0];
+        }
+        var h: u64 = 0x61726773;
+        var i = 1;
+        while i < argc {
+            let a = argv[i];
+            let kind = arg_kind(a);
+            if kind < 0 {
+                ARGS_UNKNOWN = true;
+            }
+            if kind != 1 && kind != 2 {
+                h = mix(h, hash_bytes(a, strlen(a) as i64));
+            }
+            let take = if kind == 2 || kind == 3 { 1 } else if kind == 4 { 2 } else { 0 };
+            for k in 1..take + 1 {
+                if i + k < argc && kind != 2 {
+                    h = mix(h, hash_bytes(argv[i + k], strlen(argv[i + k]) as i64));
+                }
+            }
+            i += 1 + take;
+        }
+        // (the environment the code generator reads)
+        let names = [c"VOLE_STRESS_GROW", c"VOLE_PLANT_MISCOMPILE", c"VOLE_FRESH_CONTEXTS",
+            c"VOLE_ROOT", c"VOLE_QUERY_STD"];
+        for k in 0..5 {
+            let v = getenv(names[k]);
+            h = mix(h, if v == 0 as *u8 { 1 } else { hash_bytes(v, strlen(v) as i64) });
+        }
+        ARGS_H = h;
+    }
+}
+
+// Whether this compilation may use the cache: -O1 or -O2, none of the
+// modes that print as they go, keep the program's state in statics or
+// change the IR outside the tasks' view, and a directory for it.
+fn cc_wanted() -> bool {
+    unsafe {
+        let env = getenv(c"VOLE_CODE_CACHE");
+        // ($VOLE_CODE_CACHE=off: the code cache off, the tools' cache as
+        // it is; tests/run.sh's default)
+        let off = env != 0 as *u8 && streq(env, c"off");
+        CC_FLAG >= 0 && !off && !ARGS_UNKNOWN && OPT_LEVEL >= 1 && !DEBUG_INFO && !TIME_PASSES
+            && STATS == 0
+            && !VERIFY_IR && !PRINT_AFTER_ALL && !PRINT_REGALLOC && !VERIFY_REGALLOC
+            && PRINT_CHECKS == 0 as *u8 && !EMIT_IR && !EMIT_MIR && !PRINT_ATTRS && !TRACE
+            && PROFILE_USE == 0 as *u8 && PROFILE_GENERATE == 0 as *u8 && !CHECK_ALLOC_MODE
+            && !CHECK_UNSAFE && !COVERAGE && !VERIFY_EFFECTS && cache_dir() != 0 as *u8
+            && ident() != 0
+    }
+}
+
+// ---- A thread's state ----
+
+// What a task records (one per context, made when first needed).
+pub struct CcCtx {
+    // Recording: the task's reads, triples (kind, a, b).
+    rec: bool,
+    reads: IntVec,
+    poison: bool,
+    // Per IR function: the stamp of the task that noted it, and the kinds
+    // noted then (bits).
+    seen: *i64,
+    seen_bits: *i64,
+    seen_cap: i64,
+    stamp: i64,
+    // The task: its component (-1: one function, fi), the SCC of its
+    // functions (-1: none).
+    comp: i64,
+    fi: i64,
+    own_scc: i64,
+    // Its functions (IR).
+    members: IntVec,
+    // Its functions' strings as the task received them, one list after the
+    // other (own_start: where each begins), and their constant data then.
+    own_strs: IntVec,
+    own_start: IntVec,
+    consts_before: IntVec,
+    // The key.
+    key: H2,
+    // The text's string and constant ids (emission), by index; their map.
+    text: bool,
+    relocs: IntVec,
+    reloc_map: crate::middle::lower::ssa::HMap,
+    // Scratch for hash::ir_hash's strings.
+    str_seen: *i64,
+    str_k: *i64,
+    str_cap: i64,
+    str_stamp: i64,
+    // Scratch for an entry.
+    rel: Rel,
+    out: ByteBuf,
+    body: ByteBuf,
+}
+
+// cx's cache state (made the first time).
+pub fn cc_of(cx: sink *FnCtx) -> *CcCtx {
+    unsafe {
+        if cx.cc != 0 as *CcCtx {
+            return cx.cc;
+        }
+        let cc = alloc_zeroed(size_of(CcCtx)) as *CcCtx;
+        (*cc).comp = -1;
+        (*cc).fi = -1;
+        (*cc).own_scc = -1;
+        (*cc).rel = rel_new();
+        (*cc).out = bb_new();
+        (*cc).body = bb_new();
+        cx.cc = cc;
+        cc
+    }
+}
+
+// ---- The program's state for the cache ----
+
+// Per IR function: the hash of its IR as last made (by its task, or read
+// back), whether that is its IR now, and its strings then.
+pub static var FN_IRH: *H2 = 0 as *H2;
+pub static var FN_IRH_OK: *bool = 0 as *bool;
+pub static var FN_STRS: *IntVec = 0 as *IntVec;
+// Per IR function: what its component's task (at its first function) and
+// its emission did (OUT_*), for the counts.
+static var OUT_COMP: *i64 = 0 as *i64;
+static var OUT_EMIT: *i64 = 0 as *i64;
+static var OUT_SCALAR: *i64 = 0 as *i64;
+const OUT_HIT: i64 = 1;
+const OUT_NONE: i64 = 2;
+const OUT_READ: i64 = 3;
+const OUT_BAD: i64 = 4;
+const OUT_POISON: i64 = 5;
+// The program's hash for the phase (cc_phase).
+static var ENV: H2 = H2 { a: 0, b: 0 };
+// (testing, $VOLE_CACHE_CHECK) Every entry made is read back and
+// compared.
+static var CHECK: bool = false;
+// (testing, $VOLE_CACHE_WHY, with -j1) Each miss, and the read that
+// changed.
+static var WHY: bool = false;
+
+// The kinds of entries (and of the slots of pack's new entries).
+const E_COMPONENT: i64 = 1;
+const E_EMIT: i64 = 2;
+const SLOTS_PER_FN: i64 = 3;
+
+// The compilation's cache: off, or on with the pack read (main thread,
+// at the start of the optimizer, the program lowered).
+pub fn cc_begin() {
+    unsafe {
+        CC_ON = false;
+        // A program whose code is small compiles in less than the cache takes
+        // to start (the compiler's hash, the pack): without it, unless
+        // --cache=on.
+        PROGRAM_INSTS = 0;
+        for fi in 0..IRFUNC_COUNT {
+            if FN_LIVE[fi] != 0 {
+                PROGRAM_INSTS += IRFUNCS[fi].t.inst_count;
+            }
+        }
+        if (PROGRAM_INSTS < MIN_INSTS && CC_FLAG <= 0) || !cc_wanted() || IRFUNC_COUNT == 0 {
+            return;
+        }
+        let dir = cache_dir();
+        if !make_dirs(dir) {
+            return;
+        }
+        let moves = move_copies();
+        names_begin(*moves);
+        FN_IRH = alloc_zeroed((IRFUNC_COUNT + 1) * size_of(H2)) as *H2;
+        FN_IRH_OK = alloc_array::<bool>(IRFUNC_COUNT + 1);
+        FN_STRS = alloc_zeroed((IRFUNC_COUNT + 1) * size_of(IntVec)) as *IntVec;
+        OUT_COMP = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        OUT_EMIT = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        OUT_SCALAR = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        SCALAR_REC = alloc_zeroed((IRFUNC_COUNT + 1) * size_of(ScalarRec)) as *ScalarRec;
+        CHECK = getenv(c"VOLE_CACHE_CHECK") != 0 as *u8;
+        WHY = getenv(c"VOLE_CACHE_WHY") != 0 as *u8;
+        let options = options_hash();
+        pack_load(pack_path(dir, options), ident(), options as i64,
+            SLOTS_PER_FN * (IRFUNC_COUNT + 1));
+        CC_ON = true;
+    }
+}
+
+// The options and the compiler, hashed.
+fn options_hash() -> u64 {
+    unsafe {
+        var h: u64 = mix(ARGS_H, ident() as u64);
+        h = mix(h, VERSION as u64);
+        h = mix(h, OPT_LEVEL as u64);
+        h = mix(h, (if PER_FUNCTION { 1 } else { 0 }) | (if X86 { 2 } else { 0 })
+            | (if ELF { 4 } else { 0 }) | (if APPLE_A64 { 8 } else { 0 })
+            | (if IFCONV { 16 } else { 0 }) | (if VECTORIZE { 32 } else { 0 })
+            | (if UNROLL_RUNTIME { 64 } else { 0 }) | (if SLP { 128 } else { 0 })
+            | (if NOALIAS_OFF { 256 } else { 0 }) | (if EGRAPH { 512 } else { 0 })
+            | (if X86_ALLOC_ACD { 1024 } else { 0 }) | (if ANY_DISTINCT { 2048 } else { 0 })
+            | (if stress_grow() { 4096 } else { 0 }));
+        h = mix(h, OWN_MODE as u64);
+        h = mix(h, PROFILE_MAX as u64);
+        h = mix(h, OUTPUT_MODE as u64);
+        h = mix(h, host_target() as u64);
+        // (0.19: the build's target features, which has() and detect() fold)
+        if crate::arch::ARCH_USED {
+            h = mix(h, crate::arch::features::build_features() as u64);
+        }
+        h
+    }
+}
+
+// target/volec-cache/g-KEY.pack: KEY the root as given, the current
+// directory and the options.
+fn pack_path(dir: *u8, options: u64) -> *u8 {
+    unsafe {
+        let root = FILES[0].path;
+        var h: u64 = mix(options, hash_bytes(root, strlen(root) as i64));
+        let cwd = alloc_zeroed(4096);
+        if getcwd(cwd, 4096) != 0 as *u8 {
+            h = mix(h, hash_bytes(cwd, strlen(cwd) as i64));
+        }
+        free(cwd);
+        let n = strlen(dir) as i64;
+        let p = alloc_zeroed(n + 32);
+        memcpy(p, dir, n as u64);
+        var k = n;
+        p[k] = '/';
+        p[k + 1] = 'g';
+        p[k + 2] = '-';
+        k += 3;
+        for i in 0..16 {
+            let d = ((h >> ((15 - i) * 4) as u64) & 15) as u8;
+            p[k] = if d < 10 { '0' + d } else { 'a' + d - 10 };
+            k += 1;
+        }
+        let tail = c".pack";
+        for i in 0..5 {
+            p[k + i] = tail[i];
+        }
+        p
+    }
+}
+
+// Before a phase's tasks (main thread): the program's hash as they see it,
+// the strings hashed.
+pub fn cc_phase(kind: i64) {
+    unsafe {
+        if !CC_ON {
+            return;
+        }
+        // (-O2's components hash their IR as interprocedural constants left
+        // it: the scalar phases' hashes are not it)
+        if kind == K_COMPONENT {
+            for fi in 0..IRFUNC_COUNT {
+                FN_IRH_OK[fi] = false;
+            }
+        }
+        strings_begin();
+        var h = h2_new(0x656e76);
+        h2_put(&h, ARGS_H);
+        h2_put(&h, types_hash());
+        h2_puti(&h, if ATTRS_READY { 1 } else { 0 });
+        h2_puti(&h, crate::front::types::TY_STRING);
+        h2_puti(&h, crate::front::types::TY_U8_PTR);
+        ENV = h;
+        // (-O1: the small leaves' IR, which the emission tasks inline, hashed
+        // first)
+        if PER_FUNCTION && LEAF_SMALL != 0 as *i64 {
+            let cx = crate::middle::ctx::main_cx();
+            for g in 0..IRFUNC_COUNT {
+                if LEAF_SMALL[g] != 0 && FN_LIVE[g] != 0 {
+                    ir_enter(cx, g);
+                    FN_STRS[g].count = 0;
+                    var h2 = H2 { a: 0, b: 0 };
+                    FN_IRH_OK[g] = ir_hash(cx, g, 0, &FN_STRS[g], &h2);
+                    FN_IRH[g] = h2;
+                }
+            }
+            ir_release(cx);
+        }
+    }
+}
+
+// The end of the compilation (its output written): the pack written when
+// anything changed, by a copy of the process (this one ends), or here
+// with $VOLE_CACHE_SYNC or $VOLE_CACHE_TRACE.
+pub fn cc_end() {
+    unsafe {
+        if !CC_ON {
+            return;
+        }
+        report();
+        if !pack_changed() {
+            pack_touch();
+            return;
+        }
+        if getenv(c"VOLE_CACHE_SYNC") == 0 as *u8
+            && getenv(c"VOLE_CACHE_TRACE") == 0 as *u8 {
+            let pid = fork_worker();
+            if pid > 0 {
+                return;
+            }
+            if pid == 0 {
+                setsid();
+                let null = open(c"/dev/null", 1);
+                if null >= 0 {
+                    dup2(null, 1);
+                    dup2(null, 2);
+                }
+                pack_save();
+                worker_exit(0);
+            }
+        }
+        pack_save();
+    }
+}
+
+// The counts ($VOLE_CACHE_STATS: on stderr; $VOLE_CACHE_TRACE: a
+// line `code H M` in that file), and with $VOLE_CACHE_WHY each miss.
+fn report() {
+    unsafe {
+        var counts: [i64; 18] = [0; 18];
+        for fi in 0..IRFUNC_COUNT {
+            let a = OUT_SCALAR[fi];
+            if a > 0 && a < 6 {
+                counts[a] += 1;
+            }
+            let c = OUT_COMP[fi];
+            if c > 0 && c < 6 {
+                counts[6 + c] += 1;
+            }
+            let e = OUT_EMIT[fi];
+            if e > 0 && e < 6 {
+                counts[12 + e] += 1;
+            }
+        }
+        let hits = counts[OUT_HIT] + counts[6 + OUT_HIT] + counts[12 + OUT_HIT];
+        var misses = 0;
+        for o in 2..6 {
+            misses += counts[o] + counts[6 + o] + counts[12 + o];
+        }
+        if getenv(c"VOLE_CACHE_STATS") != 0 as *u8 {
+            let b = crate::base::buf_new();
+            let kinds = [c"scalar", c"components", c"emission"];
+            crate::base::buf_fmt(b, f"code cache ({PROGRAM_INSTS} instructions):");
+            for k in 0..3 {
+                let o = 6 * k;
+                crate::base::buf_fmt(b,
+                    f" {crate::base::cstr(kinds[k])} {counts[o + 1]} hit, {counts[o + 2]} new, {counts[o + 3]} read changed, {counts[o + 4]} unreadable, {counts[o + 5]} not cacheable;");
+            }
+            crate::base::buf_str(b, c"\n");
+            crate::base::buf_write_fd(b, crate::base::STDERR);
+        }
+        if WHY {
+            for fi in 0..IRFUNC_COUNT {
+                why(fi, c"scalar", OUT_SCALAR[fi]);
+                why(fi, c"component", OUT_COMP[fi]);
+                why(fi, c"emission", OUT_EMIT[fi]);
+            }
+        }
+        let path = getenv(c"VOLE_CACHE_TRACE");
+        if path != 0 as *u8 {
+            let f = fopen(path, c"a");
+            if f != 0 as *u8 {
+                let b = crate::base::buf_new();
+                crate::base::buf_fmt(b, f"code {hits} {misses}\n");
+                fwrite(crate::base::BUFS[b].data, 1, crate::base::BUFS[b].len as u64, f);
+                fclose(f);
+            }
+        }
+    }
+}
+
+fn why(fi: i64, what: *u8, o: i64) {
+    unsafe {
+        if o <= OUT_HIT {
+            return;
+        }
+        let reason = if o == OUT_NONE { c"new" } else if o == OUT_READ { c"read changed" }
+            else if o == OUT_BAD { c"unreadable" } else { c"not cacheable" };
+        let name = crate::base::sym_name(FNS[IRFUNCS[fi].f].name);
+        eprintln(
+            f"code cache: {crate::base::cstr(what)} {crate::base::cstr(name)}: {crate::base::cstr(reason)}");
+    }
+}
+
+// ---- Recording what a task reads ----
+
+pub const R_STATIC: i64 = 1;
+pub const R_SIZE: i64 = 2;
+pub const R_ATTRS: i64 = 3;
+pub const R_RT: i64 = 4;
+pub const R_DEC: i64 = 5;
+pub const R_IR: i64 = 6;
+const R_CALLS: i64 = 7;
+const R_BUDGET: i64 = 8;
+
+// Whether IR function g is one of the task's own (what it reads of them
+// is its own doing).
+fn is_own(cc: CcCtx, g: i64) -> bool {
+    unsafe {
+        if cc.comp >= 0 {
+            return comp_of(g) == cc.comp;
+        }
+        g == cc.fi
+    }
+}
+
+// The task running in cx read fact `kind` (R_STATIC .. R_IR) of IR
+// function g.
+pub fn cc_note(cx: sink *FnCtx, kind: i64, g: i64) {
+    unsafe {
+        let cc = cx.cc;
+        if cc == 0 as *CcCtx || !(*cc).rec || g < 0 || is_own(*cc, g) {
+            return;
+        }
+        if (*cc).seen[g] != (*cc).stamp {
+            (*cc).seen[g] = (*cc).stamp;
+            (*cc).seen_bits[g] = 0;
+        }
+        let bit = 1 << kind;
+        if ((*cc).seen_bits[g] & bit) != 0 {
+            return;
+        }
+        (*cc).seen_bits[g] = (*cc).seen_bits[g] | bit;
+        // (a fact of a function not ready is not read: its task may be
+        // writing it; its IR, if read, cannot be recorded)
+        if kind != R_STATIC && !ready_or_done(cx, g) {
+            (*cc).seen_bits[g] = (*cc).seen_bits[g] & ~bit;
+            if kind == R_IR {
+                (*cc).poison = true;
+            }
+            return;
+        }
+        if kind == R_IR && !FN_IRH_OK[g] {
+            (*cc).poison = true;
+            return;
+        }
+        (*cc).reads.push(kind);
+        (*cc).reads.push(ir_nameh(g));
+        (*cc).reads.push(fact(cx, kind, g));
+    }
+}
+
+// The task read whether callee g has one call left, own_dec of them
+// inlined by the task already: `one`.
+pub fn cc_note_calls(cx: sink *FnCtx, g: i64, own_dec: i64, one: bool) {
+    unsafe {
+        let cc = cx.cc;
+        if cc == 0 as *CcCtx || !(*cc).rec || g < 0 || is_own(*cc, g) {
+            return;
+        }
+        (*cc).reads.push(R_CALLS);
+        (*cc).reads.push(ir_nameh(g));
+        (*cc).reads.push((own_dec << 1) | (if one { 1 } else { 0 }));
+    }
+}
+
+// The task read whether the program's size, grown by `growth`, is within
+// the inlining budget: `within`.
+pub fn cc_note_budget(cx: sink *FnCtx, growth: i64, within: bool) {
+    unsafe {
+        let cc = cx.cc;
+        if cc == 0 as *CcCtx || !(*cc).rec {
+            return;
+        }
+        (*cc).reads.push(R_BUDGET);
+        (*cc).reads.push(growth);
+        (*cc).reads.push(if within { 1 } else { 0 });
+    }
+}
+
+// Whether IR function g's facts may be read by the task (its readiness,
+// as middle::parallel::fn_facts_ready answers it).
+fn ready(cx: sink *FnCtx, g: i64) -> bool {
+    unsafe {
+        if cx.cur_comp >= 0 {
+            return fn_facts_ready(cx, g, true);
+        }
+        FN_ATTRS_DONE != 0 as *i64 && FN_ATTRS_DONE[g] != 0
+    }
+}
+
+// The value of fact `kind` of IR function g now.
+fn fact(cx: sink *FnCtx, kind: i64, g: i64) -> i64 {
+    unsafe {
+        if kind == R_STATIC {
+            return static_fp(cx, g) as i64;
+        }
+        if kind == R_SIZE {
+            return FN_SIZE[g];
+        }
+        if kind == R_ATTRS {
+            return mix(mix(FN_ATTRS[g] as u64, FN_NOCAPTURE[g] as u64), FN_ATTRS_DONE[g] as u64)
+                as i64;
+        }
+        if kind == R_RT {
+            return FN_RT[g];
+        }
+        if kind == R_DEC {
+            return deciders_hash(g) as i64;
+        }
+        FN_IRH[g].a as i64
+    }
+}
+
+fn deciders_hash(g: i64) -> u64 {
+    unsafe {
+        var h: u64 = mix(0x646563, FN_DECIDERS_START[g] as u64);
+        for i in 0..FN_DECIDERS[g].count {
+            h = mix(h, FN_DECIDERS[g].data[i] as u64);
+        }
+        h
+    }
+}
+
+// What a task reads of another function that its own task does not
+// change: its declaration, whether it is live, its address taken, -O1's
+// leaf marks, whether it is in the task's SCC, and whether it is ready.
+fn static_fp(cx: sink *FnCtx, g: i64) -> u64 {
+    unsafe {
+        let cc = cx.cc;
+        var h = facts_fixed(g);
+        if FN_SCC != 0 as *i64 && (*cc).own_scc >= 0 {
+            h = mix(h, if FN_SCC[g] == (*cc).own_scc { 1 } else { 2 });
+        }
+        mix(h, if ready(cx, g) { 3 } else { 4 })
+    }
+}
+
+fn facts_fixed(g: i64) -> u64 {
+    unsafe {
+        var h: u64 = mix(FN_CANON[IRFUNCS[g].f] as u64, FN_LIVE[g] as u64);
+        if FN_ADDRESS != 0 as *i64 {
+            h = mix(h, FN_ADDRESS[g] as u64);
+        }
+        if LEAF_SMALL != 0 as *i64 {
+            h = mix(h, (LEAF_SMALL[g] | (LEAF_KEEP[g] << 1) | (LEAF_DONE[g] << 2)) as u64);
+        }
+        h
+    }
+}
+
+// What the program knows of the task's own function fi as it begins:
+// facts_fixed and, at -O2, its size, call flags, deciders, attributes
+// and whether its loop passes wait.
+fn own_fp(fi: i64) -> u64 {
+    unsafe {
+        var h = facts_fixed(fi);
+        if FN_SIZE != 0 as *i64 {
+            h = mix(h, FN_SIZE[fi] as u64);
+            h = mix(h, FN_RT[fi] as u64);
+            h = mix(h, deciders_hash(fi));
+        }
+        if FN_ATTRS != 0 as *i64 {
+            h = mix(h, FN_ATTRS[fi] as u64);
+            h = mix(h, FN_NOCAPTURE[fi] as u64);
+            h = mix(h, FN_ATTRS_DONE[fi] as u64);
+        }
+        if DEFERRED != 0 as *i64 {
+            h = mix(h, DEFERRED[fi] as u64);
+        }
+        h
+    }
+}
+
+// Starts a task's recording in cx (its own: component comp, or function
+// fi).
+fn task_begin(cx: sink *FnCtx, comp: i64, fi: i64) -> *CcCtx {
+    unsafe {
+        let cc = cc_of(cx);
+        if (*cc).seen_cap < IRFUNC_COUNT + 1 {
+            free((*cc).seen as *u8);
+            free((*cc).seen_bits as *u8);
+            (*cc).seen_cap = IRFUNC_COUNT + 1;
+            (*cc).seen = alloc_array::<i64>((*cc).seen_cap);
+            (*cc).seen_bits = alloc_array::<i64>((*cc).seen_cap);
+        }
+        (*cc).stamp += 1;
+        (*cc).reads.count = 0;
+        (*cc).poison = false;
+        (*cc).rec = false;
+        (*cc).comp = comp;
+        (*cc).fi = fi;
+        (*cc).members.count = 0;
+        (*cc).own_strs.count = 0;
+        (*cc).own_start.count = 0;
+        (*cc).consts_before.count = 0;
+        (*cc).text = false;
+        (*cc).relocs.count = 0;
+        (*cc).reloc_map.clear();
+        cc
+    }
+}
+
+// The key of a task: its kind, the phase's hash, and per function its
+// symbol, what is known of it and its IR's hash.
+fn key_put_fn(k: inout H2, fi: i64, irh: *H2) {
+    unsafe {
+        h2_puti(&k, FN_NAMEH[IRFUNCS[fi].f]);
+        h2_put(&k, own_fp(fi));
+        h2_put(&k, (*irh).a);
+        h2_put(&k, (*irh).b);
+    }
+}
+
+// Hashes function fi's IR as the task receives it into the key, its
+// strings appended to the task's; false when it cannot be.
+fn hash_input(cx: sink *FnCtx, cc: inout CcCtx, fi: i64, key: inout H2) -> bool {
+    unsafe {
+        cc.members.push(fi);
+        cc.own_start.push(cc.own_strs.count);
+        cc.consts_before.push(const_data_count(fi));
+        var h = H2 { a: 0, b: 0 };
+        ir_enter(cx, fi);
+        let ok = ir_hash(cx, fi, 0, &cc.own_strs, &h);
+        key_put_fn(&key, fi, &h);
+        ok
+    }
+}
+
+// ---- Checking an entry's reads ----
+
+// Whether every read entry r records reads the same now (r is left after
+// them, and the alias hash).
+fn reads_hold(cx: sink *FnCtx, cc: inout CcCtx, r: inout Reader) -> bool {
+    unsafe {
+        let n = get_count(&r);
+        cc.reads.count = 0;
+        for i in 0..n {
+            let kind = get_u(&r) as i64;
+            let a = get_s(&r);
+            let b = get_s(&r);
+            if r.bad {
+                return false;
+            }
+            if kind == R_BUDGET {
+                let within = PROGRAM_SIZE + a <= PROGRAM_BUDGET;
+                if within != (b != 0) {
+                    if WHY {
+                        eprintln(f"code cache: read budget {a} changed");
+                    }
+                    return false;
+                }
+                continue;
+            }
+            let g = ir_of_name(a);
+            if g < 0 || is_own(cc, g) {
+                return false;
+            }
+            if kind == R_CALLS {
+                let one = FN_CALLS[g] - (b >> 1) == 1;
+                if one != ((b & 1) != 0) {
+                    if WHY {
+                        eprintln(
+                            f"code cache: read calls of {crate::base::cstr(crate::base::sym_name(FNS[IRFUNCS[g].f].name))} changed");
+                    }
+                    return false;
+                }
+                continue;
+            }
+            if kind < R_STATIC || kind > R_IR {
+                return false;
+            }
+            // (a function's other facts only once it is ready: its own task
+            // may be writing them)
+            if kind != R_STATIC && !ready_or_done(cx, g) {
+                return false;
+            }
+            if kind == R_IR && !FN_IRH_OK[g] {
+                return false;
+            }
+            if fact(cx, kind, g) != b {
+                if WHY {
+                    let name = crate::base::sym_name(FNS[IRFUNCS[g].f].name);
+                    eprintln(f"code cache: read {kind} of {crate::base::cstr(name)} changed");
+                }
+                return false;
+            }
+            if kind == R_IR {
+                cc.reads.push(g);
+            }
+        }
+        let alias = get_u(&r);
+        !r.bad && alias == alias_hash(cc)
+    }
+}
+
+// Whether g's facts are final for the task: ready in -O2's bottom-up
+// phase, else always (the phases after it read only what is done).
+fn ready_or_done(cx: sink *FnCtx, g: i64) -> bool {
+    unsafe {
+        if cx.cur_comp >= 0 {
+            return fn_facts_ready(cx, g, true);
+        }
+        true
+    }
+}
+
+// Which strings of the task's lists (its own, then those of the
+// functions whose IR it read, (*cc).reads after reads_hold) are the same
+// id: for each, how far back the first of its id is, hashed.
+fn alias_hash(cc: CcCtx) -> u64 {
+    unsafe {
+        var map = crate::middle::lower::ssa::HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0,
+            count: 0 };
+        var h: u64 = 0x616c6961;
+        var pos = 0;
+        for i in 0..cc.own_strs.count {
+            h = alias_put(&map, h, cc.own_strs.data[i], pos);
+            pos += 1;
+        }
+        for k in 0..cc.reads.count {
+            let g = cc.reads.data[k];
+            for i in 0..FN_STRS[g].count {
+                h = alias_put(&map, h, FN_STRS[g].data[i], pos);
+                pos += 1;
+            }
+        }
+        free(map.keys as *u8);
+        free(map.vals as *u8);
+        h
+    }
+}
+
+fn alias_put(map: inout crate::middle::lower::ssa::HMap, h: u64, id: i64, pos: i64) -> u64 {
+    unsafe {
+        let key = (id << 1) | 1;
+        let first = map.get(key);
+        if first == 0 {
+            map.put(key, pos + 1);
+            return mix(h, 0);
+        }
+        mix(h, (pos + 1 - first) as u64)
+    }
+}
+
+// The recorded reads into an entry's body: the reads, then the alias hash
+// over the strings of the functions whose IR was read (in their order).
+fn put_reads(cc: inout CcCtx, b: inout ByteBuf) {
+    unsafe {
+        let n = cc.reads.count / 3;
+        put_u(&b, n as u64);
+        var irs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..n {
+            let kind = cc.reads.data[3 * i];
+            put_u(&b, kind as u64);
+            put_s(&b, cc.reads.data[3 * i + 1]);
+            put_s(&b, cc.reads.data[3 * i + 2]);
+            if kind == R_IR {
+                irs.push(ir_of_name(cc.reads.data[3 * i + 1]));
+            }
+        }
+        // (alias_hash reads the functions from cc.reads)
+        let saved = cc.reads;
+        cc.reads = irs;
+        put_u(&b, alias_hash(cc));
+        cc.reads = saved;
+        free(irs.data as *u8);
+    }
+}
+
+// ---- The entry's tables ----
+
+// The strings an entry's outputs may name: the task's own lists, then
+// those of the functions whose IR it read (src: their place).
+fn rel_sources(cc: inout CcCtx, irs: IntVec) {
+    unsafe {
+        let rel: *Rel = &cc.rel;
+        rel_clear(&*rel);
+        let m = cc.own_start.count;
+        for i in 0..m {
+            let from = cc.own_start.data[i];
+            let to = if i + 1 < m { cc.own_start.data[i + 1] } else { cc.own_strs.count };
+            rel_add_source(&*rel, i, &cc.own_strs.data[from], to - from);
+        }
+        for j in 0..irs.count {
+            let g = irs.data[j];
+            rel_add_source(&*rel, m + j, FN_STRS[g].data, FN_STRS[g].count);
+        }
+    }
+}
+
+// The IR functions whose IR the task read, in the order of its reads.
+fn read_irs(cc: CcCtx) -> IntVec {
+    unsafe {
+        var irs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let n = cc.reads.count / 3;
+        for i in 0..n {
+            if cc.reads.data[3 * i] == R_IR {
+                irs.push(ir_of_name(cc.reads.data[3 * i + 1]));
+            }
+        }
+        irs
+    }
+}
+
+// Writes the tables of rel into b: strings by source, constant data by
+// owner (a function of the task: 1 + its place among them, with k past
+// what it had when the task began; else 0 and the owner's symbol),
+// symbols by text, functions by symbol.
+fn put_tables(cc: inout CcCtx, b: inout ByteBuf) {
+    unsafe {
+        let rel: *Rel = &cc.rel;
+        put_u(&b, (*rel).strs.count as u64);
+        for i in 0..(*rel).strs.count {
+            let s = rel_str_source(*rel, i);
+            put_u(&b, (s >> 32) as u64);
+            put_u(&b, (s & 0xffffffff) as u64);
+        }
+        put_u(&b, (*rel).consts.count as u64);
+        for i in 0..(*rel).consts.count {
+            let m = -(*rel).consts.data[i] - 1;
+            let owner = m >> OWNER_SHIFT;
+            let k = m & ((1 << OWNER_SHIFT) - 1);
+            var member = -1;
+            for j in 0..cc.own_start.count {
+                if member_fn(cc, j) == owner && k >= cc.consts_before.data[j] {
+                    member = j;
+                }
+            }
+            if member >= 0 {
+                put_u(&b, (member + 1) as u64);
+                put_u(&b, (k - cc.consts_before.data[member]) as u64);
+            } else {
+                put_u(&b, 0);
+                put_s(&b, ir_nameh(owner));
+                put_u(&b, k as u64);
+            }
+        }
+        put_u(&b, (*rel).syms.count as u64);
+        for i in 0..(*rel).syms.count {
+            let t = SYMS[(*rel).syms.data[i]].text;
+            put_bytes(&b, t.ptr, t.len as i64);
+        }
+        // (a function whose symbol another has, a C function declared in
+        // several modules: by its index too, which the IR's hashes hold)
+        put_u(&b, (*rel).fns.count as u64);
+        for i in 0..(*rel).fns.count {
+            let f = (*rel).fns.data[i];
+            put_s(&b, FN_NAMEH[f]);
+            put_s(&b, if FN_AMBIG[f] { f } else { -1 });
+        }
+        // (RTID values: a function of the task by its place, another by its
+        // symbol; the place among its values)
+        put_u(&b, (*rel).rtids.count as u64);
+        for i in 0..(*rel).rtids.count {
+            let v = (*rel).rtids.data[i];
+            let owner = v >> 20;
+            var member = -1;
+            for j in 0..cc.members.count {
+                if cc.members.data[j] == owner {
+                    member = j;
+                }
+            }
+            put_s(&b, member);
+            if member < 0 {
+                put_s(&b, ir_nameh(owner));
+            }
+            put_u(&b, (v & 1048575) as u64);
+        }
+    }
+}
+
+// The task's j-th function.
+fn member_fn(cc: CcCtx, j: i64) -> i64 {
+    unsafe { cc.members.data[j] }
+}
+
+// Reads an entry's tables, mapped to this build's ids (members: the
+// task's functions, start in SCC_ORDER or the one; irs: the functions
+// whose IR it read): false when one names what is not here.
+fn get_tables(cc: inout CcCtx, r: inout Reader, irs: IntVec, ids: inout Ids) -> bool {
+    unsafe {
+        let m = cc.own_start.count;
+        let ns = get_count(&r);
+        ids.strs = alloc_array::<i64>(ns + 1);
+        ids.nstrs = ns;
+        for i in 0..ns {
+            let src = get_u(&r) as i64;
+            let k = get_u(&r) as i64;
+            var list = 0 as *i64;
+            var count = 0;
+            if src < m {
+                let from = cc.own_start.data[src];
+                let to = if src + 1 < m { cc.own_start.data[src + 1] }
+                    else { cc.own_strs.count };
+                list = &cc.own_strs.data[from];
+                count = to - from;
+            } else if src - m < irs.count {
+                let g = irs.data[src - m];
+                list = FN_STRS[g].data;
+                count = FN_STRS[g].count;
+            }
+            if k < 0 || k >= count {
+                if CHECK {
+                    eprintln(f"code cache check: string {src} {k} not in {count}");
+                }
+                return false;
+            }
+            ids.strs[i] = list[k];
+        }
+        let nc = get_count(&r);
+        ids.consts = alloc_array::<i64>(nc + 1);
+        ids.nconsts = nc;
+        for i in 0..nc {
+            let member = get_u(&r) as i64;
+            var owner = -1;
+            var k = 0;
+            if member > 0 {
+                if member > m {
+                    return false;
+                }
+                owner = member_fn(cc, member - 1);
+                k = cc.consts_before.data[member - 1] + get_u(&r) as i64;
+            } else {
+                // (a placeholder some IR the task read holds: made in an
+                // earlier phase)
+                owner = ir_of_name(get_s(&r));
+                k = get_u(&r) as i64;
+                if owner < 0 {
+                    return false;
+                }
+            }
+            if k < 0 || k >= (1 << OWNER_SHIFT) {
+                return false;
+            }
+            ids.consts[i] = -(1 + (owner << OWNER_SHIFT) + k);
+        }
+        let ny = get_count(&r);
+        ids.syms = alloc_array::<i64>(ny + 1);
+        ids.nsyms = ny;
+        for i in 0..ny {
+            var len = 0;
+            let p = get_bytes(&r, &len);
+            if r.bad {
+                return false;
+            }
+            let sym = find_sym(p[0..len]);
+            if sym < 0 {
+                if CHECK {
+                    eprintln("code cache check: a symbol not found");
+                }
+                return false;
+            }
+            ids.syms[i] = sym;
+        }
+        let nf = get_count(&r);
+        ids.fns = alloc_array::<i64>(nf + 1);
+        ids.nfns = nf;
+        for i in 0..nf {
+            let h = get_s(&r);
+            let raw = get_s(&r);
+            let f = if raw < 0 { fn_of_name(h) }
+                else if raw < FN_COUNT && FN_NAMEH[raw] == h { raw } else { -1 };
+            if f < 0 {
+                if CHECK {
+                    eprintln("code cache check: a function not found (or several)");
+                }
+                return false;
+            }
+            ids.fns[i] = f;
+        }
+        let nt = get_count(&r);
+        ids.rtids = alloc_array::<i64>(nt + 1);
+        ids.nrtids = nt;
+        for i in 0..nt {
+            let member = get_s(&r);
+            let owner = if member >= 0 && member < m { member_fn(cc, member) }
+                else if member < 0 { ir_of_name(get_s(&r)) } else { -1 };
+            let k = get_u(&r) as i64;
+            if owner < 0 || k < 0 || k > 1048575 {
+                return false;
+            }
+            ids.rtids[i] = (owner << 20) | k;
+        }
+        !r.bad
+    }
+}
+
+// ---- -O2's components ----
+
+// Component c's task (middle::parallel::run_component, cx.cur_comp set):
+// true when its outputs were read from the cache; else its recording
+// begins (cc_component_end ends it).
+pub fn cc_component_begin(cx: sink *FnCtx, c: i64, start: i64, end: i64) -> bool {
+    unsafe {
+        let cc = task_begin(cx, c, SCC_ORDER.data[start]);
+        (*cc).own_scc = FN_SCC[SCC_ORDER.data[start]];
+        var key = h2_new(E_COMPONENT as u64);
+        h2_put(&key, ENV.a);
+        h2_put(&key, ENV.b);
+        h2_puti(&key, end - start);
+        var ok = true;
+        for i in start..end {
+            let fi = SCC_ORDER.data[i];
+            FN_IRH_OK[fi] = false;
+            if !hash_input(cx, &*cc, fi, &key) {
+                ok = false;
+            }
+        }
+        ir_release(cx);
+        (*cc).key = key;
+        let first = SCC_ORDER.data[start];
+        if !ok {
+            (*cc).poison = true;
+            (*cc).rec = true;
+            OUT_COMP[first] = OUT_POISON;
+            return false;
+        }
+        let e = pack_find(key.a, key.b);
+        if e >= 0 {
+            let got = component_hit(cx, &*cc, e, c, start, end);
+            if got == OUT_HIT {
+                pack_used(e);
+                OUT_COMP[first] = OUT_HIT;
+                return true;
+            }
+            OUT_COMP[first] = got;
+        } else {
+            OUT_COMP[first] = OUT_NONE;
+        }
+        (*cc).reads.count = 0;
+        (*cc).rec = true;
+        false
+    }
+}
+
+// The members' facts a component's task leaves (in its entry).
+fn put_facts(b: inout ByteBuf, fi: i64) {
+    unsafe {
+        put_s(&b, FN_SIZE[fi]);
+        put_s(&b, FN_RT[fi]);
+        put_s(&b, FN_DECIDERS_START[fi]);
+        put_u(&b, FN_DECIDERS[fi].count as u64);
+        for i in 0..FN_DECIDERS[fi].count {
+            put_s(&b, FN_DECIDERS[fi].data[i]);
+        }
+        put_s(&b, DEFERRED[fi]);
+        put_s(&b, FN_ATTRS[fi]);
+        put_s(&b, FN_NOCAPTURE[fi]);
+        put_s(&b, FN_ATTRS_DONE[fi]);
+    }
+}
+
+// The constant data function fi's task made (from its count at the start,
+// `before`): their phase, rank (less `rank0`), alignment and bytes.
+fn put_consts(b: inout ByteBuf, fi: i64, before: i64, rank0: i64) {
+    unsafe {
+        let n = const_data_count(fi);
+        put_u(&b, (n - before) as u64);
+        for k in before..n {
+            var phase = 0;
+            var rank = 0;
+            var align = 0;
+            let bytes = const_data_entry(fi, k, &phase, &rank, &align);
+            put_u(&b, phase as u64);
+            put_s(&b, rank - rank0);
+            put_s(&b, align);
+            put_bytes(&b, bytes.ptr, bytes.len as i64);
+        }
+    }
+}
+
+// Component c's task is done (cx): its functions' IR hashed (what their
+// callers and emission read), and its entry made unless poisoned.
+pub fn cc_component_end(cx: sink *FnCtx, c: i64, start: i64, end: i64) {
+    unsafe {
+        let cc = cx.cc;
+        (*cc).rec = false;
+        for i in start..end {
+            out_hash(cx, SCC_ORDER.data[i]);
+        }
+        ir_release(cx);
+        if (*cc).poison {
+            OUT_COMP[SCC_ORDER.data[start]] = OUT_POISON;
+            return;
+        }
+        var irs = read_irs(*cc);
+        rel_sources(&*cc, irs);
+        let out: *ByteBuf = &(*cc).out;
+        (*out).len = 0;
+        put_s(&*out, COMP_GROWTH[c]);
+        put_u(&*out, COMP_INLINED[c].count as u64);
+        for m in 0..COMP_INLINED[c].count {
+            put_u(&*out, rel_fn(&(*cc).rel, IRFUNCS[COMP_INLINED[c].data[m]].f) as u64);
+        }
+        for i in start..end {
+            let fi = SCC_ORDER.data[i];
+            ir_enter(cx, fi);
+            encode_ir(cx, fi, &*out, &(*cc).rel);
+            put_facts(&*out, fi);
+            put_u(&*out, FN_IRH[fi].a);
+            put_u(&*out, FN_IRH[fi].b);
+            put_consts(&*out, fi, (*cc).consts_before.data[i - start], start);
+        }
+        ir_release(cx);
+        free(irs.data as *u8);
+        if !store(&*cc, E_COMPONENT, SCC_ORDER.data[start]) {
+            OUT_COMP[SCC_ORDER.data[start]] = OUT_POISON;
+            return;
+        }
+        if CHECK {
+            check_component(cx, &*cc, start, end);
+        }
+    }
+}
+
+// (testing, $VOLE_CACHE_CHECK) The entry just made, read back: its IR
+// must be the tables it was made from.
+fn check_component(cx: sink *FnCtx, cc: inout CcCtx, start: i64, end: i64) {
+    unsafe {
+        let body: *ByteBuf = &cc.body;
+        var r = Reader { p: (*body).data, at: 0, end: (*body).len, bad: false };
+        get_u(&r);
+        let n = get_count(&r);
+        for i in 0..n {
+            get_u(&r);
+            get_s(&r);
+            get_s(&r);
+        }
+        get_u(&r);
+        var irs = read_irs(cc);
+        var ids = Ids { strs: 0 as *i64, nstrs: 0, consts: 0 as *i64, nconsts: 0,
+            syms: 0 as *i64, nsyms: 0, fns: 0 as *i64, nfns: 0, rtids: 0 as *i64, nrtids: 0 };
+        let name = crate::base::sym_name(FNS[IRFUNCS[SCC_ORDER.data[start]].f].name);
+        if !get_tables(&cc, &r, irs, &ids) {
+            eprintln(f"code cache check: {crate::base::cstr(name)}: tables do not read back");
+            return;
+        }
+        get_s(&r);
+        let ni = get_count(&r);
+        for m in 0..ni {
+            get_u(&r);
+        }
+        for i in start..end {
+            let fi = SCC_ORDER.data[i];
+            var copy = IRCopy { entry: 0, result_ptr: 0,
+                blocks: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+                slots: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+                t: IRTables { insts: 0 as *crate::middle::ir::Inst, inst_count: 0, inst_cap: 0,
+                    blocks: 0 as *crate::middle::ir::Block, block_count: 0, block_cap: 0,
+                    slots: 0 as *crate::middle::ir::Slot, slot_count: 0, slot_cap: 0,
+                    args: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+                    argty: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+                    swcases: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+                    inst_loc: IntVec { data: 0 as *i64, count: 0, cap: 0 } } };
+            let fname = crate::base::sym_name(FNS[IRFUNCS[fi].f].name);
+            if !decode_ir(&r, fi, &ids, &copy) {
+                eprintln(
+                    f"code cache check: {crate::base::cstr(fname)}: IR does not read back (at {r.at} of {r.end})");
+                return;
+            }
+            ir_enter(cx, fi);
+            let d = crate::back::codecache::snapshot::copy_differs(cx, fi, &copy);
+            if d != 0 {
+                eprintln(
+                    f"code cache check: {crate::base::cstr(fname)}: IR differs read back ({d})");
+            }
+            free_copy(&copy);
+            skip_facts(&r);
+        }
+        ir_release(cx);
+        ids_free(ids);
+        free(irs.data as *u8);
+    }
+}
+
+// Function fi's IR as its task leaves it, hashed (FN_IRH, FN_STRS).
+fn out_hash(cx: sink *FnCtx, fi: i64) {
+    unsafe {
+        ir_enter(cx, fi);
+        FN_STRS[fi].count = 0;
+        var h = H2 { a: 0, b: 0 };
+        let ok = ir_hash(cx, fi, 0, &FN_STRS[fi], &h);
+        FN_IRH[fi] = h;
+        FN_IRH_OK[fi] = ok;
+        if !ok {
+            (*cx.cc).poison = true;
+        }
+    }
+}
+
+// The entry of the task in cc: its reads, tables and outputs (cc.out),
+// stored in the slot of function fi.
+fn store(cc: inout CcCtx, kind: i64, fi: i64) -> bool {
+    unsafe {
+        if cc.rel.bad {
+            return false;
+        }
+        let body: *ByteBuf = &cc.body;
+        (*body).len = 0;
+        put_u(&*body, kind as u64);
+        put_reads(&cc, &*body);
+        put_tables(&cc, &*body);
+        let out: *ByteBuf = &cc.out;
+        bb_append(&*body, (*out).data, (*out).len);
+        let copy = alloc_zeroed((*body).len + 1);
+        memcpy(copy, (*body).data, (*body).len as u64);
+        pack_new(SLOTS_PER_FN * fi + kind - 1, cc.key.a, cc.key.b, copy, (*body).len);
+        true
+    }
+}
+
+fn bb_append(b: inout ByteBuf, p: *u8, n: i64) {
+    unsafe {
+        crate::back::codecache::snapshot::bb_reserve(&b, n);
+        if n > 0 {
+            memcpy(&b.data[b.len], p, n as u64);
+        }
+        b.len += n;
+    }
+}
+
+// Reads entry e for component c: its reads checked, then its outputs
+// installed. OUT_HIT, or why not (nothing installed then).
+fn component_hit(cx: sink *FnCtx, cc: inout CcCtx, e: i64, c: i64, start: i64, end: i64) -> i64 {
+    unsafe {
+        var r = Reader { p: 0 as *u8, at: 0, end: 0, bad: false };
+        if !pack_body(e, &r) || get_u(&r) as i64 != E_COMPONENT {
+            return OUT_BAD;
+        }
+        if !reads_hold(cx, &cc, &r) {
+            return OUT_READ;
+        }
+        var irs = cc.reads;
+        cc.reads = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var ids = Ids { strs: 0 as *i64, nstrs: 0, consts: 0 as *i64, nconsts: 0,
+            syms: 0 as *i64, nsyms: 0, fns: 0 as *i64, nfns: 0, rtids: 0 as *i64, nrtids: 0 };
+        var result = OUT_BAD;
+        if get_tables(&cc, &r, irs, &ids) {
+            result = component_install(cx, cc, &r, &ids, c, start, end);
+        }
+        ids_free(ids);
+        free(irs.data as *u8);
+        result
+    }
+}
+
+// The outputs of a component's entry (r at them), installed when all of
+// them read.
+fn component_install(cx: sink *FnCtx, cc: CcCtx, r: inout Reader, ids: inout Ids, c: i64,
+    start: i64, end: i64) -> i64 {
+    unsafe {
+        let n = end - start;
+        let growth = get_s(&r);
+        let ni = get_count(&r);
+        var inlined = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for m in 0..ni {
+            let x = get_u(&r) as i64;
+            if x >= ids.nfns {
+                free(inlined.data as *u8);
+                return OUT_BAD;
+            }
+            let f = ids.fns[x];
+            let g = if FN_IR[f] > 0 { FN_IR[f] - 1 } else { -1 };
+            if g < 0 {
+                free(inlined.data as *u8);
+                return OUT_BAD;
+            }
+            inlined.push(g);
+        }
+        let copies = alloc_zeroed((n + 1) * size_of(IRCopy)) as *IRCopy;
+        // (per member: where its facts and constant data are in r)
+        let facts_at = alloc_array::<i64>(n + 1);
+        var ok = true;
+        for i in 0..n {
+            let fi = SCC_ORDER.data[start + i];
+            if !decode_ir(&r, fi, &ids, &copies[i]) {
+                ok = false;
+                n_free(copies, i + 1);
+                break;
+            }
+            facts_at[i] = r.at;
+            skip_facts(&r);
+            if r.bad {
+                ok = false;
+                n_free(copies, i + 1);
+                break;
+            }
+        }
+        if !ok || r.bad {
+            free(copies as *u8);
+            free(facts_at as *u8);
+            free(inlined.data as *u8);
+            return OUT_BAD;
+        }
+        // Installed: each function's IR, facts and constant data.
+        for i in 0..n {
+            let fi = SCC_ORDER.data[start + i];
+            install_ir(cx, fi, &copies[i]);
+            r.at = facts_at[i];
+            get_facts(&r, fi);
+            FN_IRH[fi].a = get_u(&r);
+            FN_IRH[fi].b = get_u(&r);
+            FN_IRH_OK[fi] = true;
+            replay_consts(cx, &r, fi, P_COMPONENT, start);
+            // (its strings, as hash::ir_hash lists them)
+            list_strings(cx, fi);
+        }
+        ir_release(cx);
+        COMP_GROWTH[c] = growth;
+        for m in 0..inlined.count {
+            COMP_INLINED[c].push(inlined.data[m]);
+        }
+        free(copies as *u8);
+        free(facts_at as *u8);
+        free(inlined.data as *u8);
+        OUT_HIT
+    }
+}
+
+fn n_free(copies: *IRCopy, n: i64) {
+    unsafe {
+        for i in 0..n {
+            free_copy(&copies[i]);
+        }
+    }
+}
+
+fn skip_facts(r: inout Reader) {
+    unsafe {
+        for i in 0..3 {
+            get_s(&r);
+        }
+        let nd = get_count(&r);
+        for i in 0..nd {
+            get_s(&r);
+        }
+        for i in 0..4 {
+            get_s(&r);
+        }
+        get_u(&r);
+        get_u(&r);
+        let nc = get_count(&r);
+        for k in 0..nc {
+            get_u(&r);
+            get_s(&r);
+            get_s(&r);
+            var len = 0;
+            get_bytes(&r, &len);
+        }
+    }
+}
+
+fn get_facts(r: inout Reader, fi: i64) {
+    unsafe {
+        FN_SIZE[fi] = get_s(&r);
+        FN_RT[fi] = get_s(&r);
+        FN_DECIDERS_START[fi] = get_s(&r);
+        let nd = get_count(&r);
+        FN_DECIDERS[fi].count = 0;
+        for i in 0..nd {
+            FN_DECIDERS[fi].push(get_s(&r));
+        }
+        DEFERRED[fi] = get_s(&r);
+        FN_ATTRS[fi] = get_s(&r);
+        FN_NOCAPTURE[fi] = get_s(&r);
+        FN_ATTRS_DONE[fi] = get_s(&r);
+    }
+}
+
+// The constant data an entry's task made for function fi, made again (in
+// its order: the same placeholders), in phase `phase`'s order with rank
+// rank0 + the recorded one.
+fn replay_consts(cx: sink *FnCtx, r: inout Reader, fi: i64, phase: i64, rank0: i64) {
+    unsafe {
+        let nc = get_count(&r);
+        let saved_phase = cx.task_phase;
+        let saved_rank = cx.task_rank;
+        for k in 0..nc {
+            let ph = get_u(&r) as i64;
+            let rank = get_s(&r);
+            let align = get_s(&r);
+            var len = 0;
+            let p = get_bytes(&r, &len);
+            cx.task_phase = ph;
+            cx.task_rank = rank + rank0;
+            const_data(cx, fi, p[0..len], align);
+        }
+        cx.task_phase = saved_phase;
+        cx.task_rank = saved_rank;
+    }
+}
+
+// Function fi's tables replaced by a read copy.
+fn install_ir(cx: sink *FnCtx, fi: i64, c: *IRCopy) {
+    unsafe {
+        ir_enter(cx, fi);
+        for b in 0..cx.block_count {
+            free(cx.blocks[b].preds.data as *u8);
+        }
+        free(cx.insts as *u8);
+        free(cx.blocks as *u8);
+        free(cx.slots as *u8);
+        free(cx.args.data as *u8);
+        free(cx.argty.data as *u8);
+        free(cx.swcases.data as *u8);
+        free(cx.inst_loc.data as *u8);
+        free(IRFUNCS[fi].blocks.data as *u8);
+        free(IRFUNCS[fi].slots.data as *u8);
+        IRFUNCS[fi].entry = (*c).entry;
+        IRFUNCS[fi].result_ptr = (*c).result_ptr;
+        IRFUNCS[fi].blocks = (*c).blocks;
+        IRFUNCS[fi].slots = (*c).slots;
+        let t = (*c).t;
+        cx.insts = t.insts;
+        cx.inst_count = t.inst_count;
+        cx.inst_cap = t.inst_cap;
+        cx.blocks = t.blocks;
+        cx.block_count = t.block_count;
+        cx.block_cap = t.block_cap;
+        cx.slots = t.slots;
+        cx.slot_count = t.slot_count;
+        cx.slot_cap = t.slot_cap;
+        cx.args = t.args;
+        cx.argty = t.argty;
+        cx.swcases = t.swcases;
+        cx.inst_loc = t.inst_loc;
+    }
+}
+
+// FN_STRS[fi]: the distinct string ids of fi's SADDRs (current in cx), in
+// instruction order (as ir_hash lists them).
+fn list_strings(cx: sink *FnCtx, fi: i64) {
+    unsafe {
+        FN_STRS[fi].count = 0;
+        var map = crate::middle::lower::ssa::HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0,
+            count: 0 };
+        for i in 0..cx.inst_count {
+            if cx.insts[i].op == crate::middle::ir::Op::SAddr && cx.insts[i].imm >= 0 {
+                let key = (cx.insts[i].imm << 1) | 1;
+                if map.get(key) == 0 {
+                    map.put(key, 1);
+                    FN_STRS[fi].push(cx.insts[i].imm);
+                }
+            }
+        }
+        free(map.keys as *u8);
+        free(map.vals as *u8);
+    }
+}
+
+// ---- Emission ----
+
+// Function fi's emission task (task: its rank): true when its text came
+// from the cache (FN_TEXT[fi] set, its IR freed); else its recording
+// begins, and the text names strings by index (cc_text_string).
+pub fn cc_emit_begin(cx: sink *FnCtx, fi: i64, task: i64) -> bool {
+    unsafe {
+        let cc = task_begin(cx, -1, fi);
+        if FN_SCC != 0 as *i64 {
+            (*cc).own_scc = FN_SCC[fi];
+        }
+        var key = h2_new(E_EMIT as u64);
+        h2_put(&key, ENV.a);
+        h2_put(&key, ENV.b);
+        var ok = true;
+        if FN_IRH_OK[fi] {
+            (*cc).members.push(fi);
+            (*cc).own_start.push(0);
+            (*cc).consts_before.push(const_data_count(fi));
+            for i in 0..FN_STRS[fi].count {
+                (*cc).own_strs.push(FN_STRS[fi].data[i]);
+            }
+            key_put_fn(&key, fi, &FN_IRH[fi]);
+        } else {
+            ok = hash_input(cx, &*cc, fi, &key);
+            ir_release(cx);
+        }
+        FN_IRH_OK[fi] = false;
+        (*cc).key = key;
+        (*cc).text = true;
+        if !ok {
+            (*cc).poison = true;
+            (*cc).rec = true;
+            OUT_EMIT[fi] = OUT_POISON;
+            return false;
+        }
+        let e = pack_find(key.a, key.b);
+        if e >= 0 {
+            let got = emit_hit(cx, &*cc, e, fi, task);
+            if got == OUT_HIT {
+                pack_used(e);
+                OUT_EMIT[fi] = OUT_HIT;
+                (*cc).text = false;
+                return true;
+            }
+            OUT_EMIT[fi] = got;
+        } else {
+            OUT_EMIT[fi] = OUT_NONE;
+        }
+        (*cc).reads.count = 0;
+        (*cc).relocs.count = 0;
+        (*cc).reloc_map.clear();
+        (*cc).rec = true;
+        false
+    }
+}
+
+// The text's name for string or constant data `id` (a task's, with the
+// cache): its index among the text's (written L\x03<index>, the join puts
+// the id), or -1 without.
+pub fn cc_text_string(cx: sink *FnCtx, id: i64) -> i64 {
+    unsafe {
+        let cc = cx.cc;
+        if cc == 0 as *CcCtx || !(*cc).text {
+            return -1;
+        }
+        let key = (id << 1) | 1;
+        let i = (*cc).reloc_map.get(key);
+        if i > 0 {
+            return i - 1;
+        }
+        (*cc).relocs.push(id);
+        (*cc).reloc_map.put(key, (*cc).relocs.count);
+        (*cc).relocs.count - 1
+    }
+}
+
+// Function fi's emission is done (its text in FN_TEXT[fi]): the text's
+// string ids for the join, and its entry made unless poisoned.
+pub fn cc_emit_end(cx: sink *FnCtx, fi: i64, task: i64) {
+    unsafe {
+        let cc = cx.cc;
+        (*cc).rec = false;
+        (*cc).text = false;
+        let t: *crate::middle::parallel::FnText = &FN_TEXT[fi];
+        let nr = (*cc).relocs.count;
+        (*t).relocs = alloc_array::<i64>(nr + 1);
+        for i in 0..nr {
+            (*t).relocs[i] = (*cc).relocs.data[i];
+        }
+        (*t).nrelocs = nr;
+        if (*cc).poison {
+            OUT_EMIT[fi] = OUT_POISON;
+            return;
+        }
+        var irs = read_irs(*cc);
+        rel_sources(&*cc, irs);
+        let out: *ByteBuf = &(*cc).out;
+        (*out).len = 0;
+        put_bytes(&*out, (*t).data, (*t).len);
+        put_s(&*out, (*t).labels);
+        put_u(&*out, nr as u64);
+        for i in 0..nr {
+            put_u(&*out, rel_saddr(&(*cc).rel, (*cc).relocs.data[i]) as u64);
+        }
+        put_consts(&*out, fi, (*cc).consts_before.data[0], 0);
+        put_u(&*out, (*t).nrtids as u64);
+        for i in 0..(*t).nrtids {
+            put_u(&*out, rel_rtid(&(*cc).rel, (*t).rtids[i]) as u64);
+        }
+        free(irs.data as *u8);
+        if !store(&*cc, E_EMIT, fi) {
+            OUT_EMIT[fi] = OUT_POISON;
+        }
+    }
+}
+
+// Reads entry e for function fi's emission: its reads checked, then its
+// text and constant data installed. OUT_HIT, or why not.
+fn emit_hit(cx: sink *FnCtx, cc: inout CcCtx, e: i64, fi: i64, task: i64) -> i64 {
+    unsafe {
+        var r = Reader { p: 0 as *u8, at: 0, end: 0, bad: false };
+        if !pack_body(e, &r) || get_u(&r) as i64 != E_EMIT {
+            return OUT_BAD;
+        }
+        if !reads_hold(cx, &cc, &r) {
+            return OUT_READ;
+        }
+        var irs = cc.reads;
+        cc.reads = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var ids = Ids { strs: 0 as *i64, nstrs: 0, consts: 0 as *i64, nconsts: 0,
+            syms: 0 as *i64, nsyms: 0, fns: 0 as *i64, nfns: 0, rtids: 0 as *i64, nrtids: 0 };
+        var result = OUT_BAD;
+        if get_tables(&cc, &r, irs, &ids) {
+            result = emit_install(cx, &r, &ids, fi, task);
+        }
+        ids_free(ids);
+        free(irs.data as *u8);
+        result
+    }
+}
+
+fn emit_install(cx: sink *FnCtx, r: inout Reader, ids: inout Ids, fi: i64, task: i64) -> i64 {
+    unsafe {
+        var len = 0;
+        let text = get_bytes(&r, &len);
+        let labels = get_s(&r);
+        let nr = get_count(&r);
+        let relocs = alloc_array::<i64>(nr + 1);
+        var bad = false;
+        for i in 0..nr {
+            relocs[i] = crate::back::codecache::snapshot::ids_saddr(ids, get_u(&r) as i64, &bad);
+        }
+        if bad || r.bad {
+            free(relocs as *u8);
+            return OUT_BAD;
+        }
+        // (the constant data: P_EMIT's rank is the task's, the others' the
+        // function's)
+        let nc_at = r.at;
+        let nc = get_count(&r);
+        for k in 0..nc {
+            get_u(&r);
+            get_s(&r);
+            get_s(&r);
+            var n = 0;
+            get_bytes(&r, &n);
+        }
+        // (its RTID values, after: the text's loads of them)
+        let nt = get_count(&r);
+        let rtids = alloc_array::<i64>(nt + 1);
+        for k in 0..nt {
+            rtids[k] = crate::back::codecache::snapshot::ids_at(ids.rtids, ids.nrtids,
+                get_u(&r) as i64, &bad);
+        }
+        if r.bad || bad {
+            free(relocs as *u8);
+            free(rtids as *u8);
+            return OUT_BAD;
+        }
+        r.at = nc_at;
+        let saved_phase = cx.task_phase;
+        let saved_rank = cx.task_rank;
+        for k in 0..get_count(&r) {
+            let ph = get_u(&r) as i64;
+            get_s(&r);
+            let align = get_s(&r);
+            var n = 0;
+            let p = get_bytes(&r, &n);
+            cx.task_phase = ph;
+            cx.task_rank = if ph == P_EMIT { task } else { fi };
+            const_data(cx, fi, p[0..n], align);
+        }
+        cx.task_phase = saved_phase;
+        cx.task_rank = saved_rank;
+        let t: *crate::middle::parallel::FnText = &FN_TEXT[fi];
+        (*t).len = len;
+        (*t).data = alloc_zeroed(len + 1);
+        memcpy((*t).data, text, len as u64);
+        (*t).labels = labels;
+        (*t).relocs = relocs;
+        (*t).nrelocs = nr;
+        (*t).rtids = rtids;
+        (*t).nrtids = nt;
+        crate::middle::ir::ir_free_func(cx, fi);
+        OUT_HIT
+    }
+}
+
+// ---- The scalar phases ----
+
+// -O2's cleanup and scalar pipeline of a function (two tasks, two phases)
+// are one entry: its IR as lowered in, as the scalar pipeline leaves it
+// out. (-O1's cleanup alone costs less than hashing and reading its
+// entry: not cached.) A hit in the cleanup task installs the IR the
+// scalar pipeline leaves (no other task reads it between) and makes the
+// cleanup's constant data; the scalar pipeline's task then makes its
+// constant data (in its phase's order) and nothing else. A miss records
+// across both tasks (SCALAR_REC, the function's own).
+struct ScalarRec { reads: IntVec, own_strs: IntVec, before: i64, key: H2, poison: bool, hit: i64,
+    at: i64 }
+
+static var SCALAR_REC: *ScalarRec = 0 as *ScalarRec;
+const E_SCALAR: i64 = 3;
+
+fn scalar_rec(fi: i64) -> *ScalarRec {
+    unsafe {
+        &SCALAR_REC[fi]
+    }
+}
+
+// Function fi's cleanup task (task: its rank): true when the entry was
+// used (its IR installed).
+pub fn cc_scalar_begin(cx: sink *FnCtx, fi: i64, task: i64) -> bool {
+    unsafe {
+        let cc = task_begin(cx, -1, fi);
+        let sr = scalar_rec(fi);
+        (*sr).hit = -1;
+        FN_IRH_OK[fi] = false;
+        var key = h2_new(E_SCALAR as u64);
+        h2_put(&key, ENV.a);
+        h2_put(&key, ENV.b);
+        let ok = hash_input(cx, &*cc, fi, &key);
+        ir_release(cx);
+        (*cc).key = key;
+        if !ok {
+            (*cc).poison = true;
+            (*cc).rec = true;
+            OUT_SCALAR[fi] = OUT_POISON;
+            return false;
+        }
+        let e = pack_find(key.a, key.b);
+        if e >= 0 {
+            let got = scalar_hit(cx, &*cc, e, fi, task);
+            if got == OUT_HIT {
+                pack_used(e);
+                OUT_SCALAR[fi] = OUT_HIT;
+                return true;
+            }
+            OUT_SCALAR[fi] = got;
+        } else {
+            OUT_SCALAR[fi] = OUT_NONE;
+        }
+        (*cc).reads.count = 0;
+        (*cc).rec = true;
+        false
+    }
+}
+
+// Function fi's cleanup is done (a miss): the recording kept for its
+// scalar pipeline's task.
+pub fn cc_scalar_cleanup_end(cx: sink *FnCtx, fi: i64) {
+    unsafe {
+        let cc = cx.cc;
+        (*cc).rec = false;
+        let sr = scalar_rec(fi);
+        copy_ints(&(*sr).reads, &(*cc).reads);
+        copy_ints(&(*sr).own_strs, &(*cc).own_strs);
+        (*sr).before = (*cc).consts_before.data[0];
+        (*sr).key = (*cc).key;
+        (*sr).poison = (*cc).poison;
+    }
+}
+
+fn copy_ints(dst: *IntVec, src: *IntVec) {
+    unsafe {
+        (*dst).count = 0;
+        for i in 0..(*src).count {
+            (*dst).push((*src).data[i]);
+        }
+    }
+}
+
+// Function fi's scalar pipeline task (-O2): true when its cleanup's task
+// used the entry (its constant data made here); else the recording goes
+// on.
+pub fn cc_scalar_simplify_begin(cx: sink *FnCtx, fi: i64, task: i64) -> bool {
+    unsafe {
+        let sr = scalar_rec(fi);
+        if (*sr).hit >= 0 {
+            var r = Reader { p: 0 as *u8, at: 0, end: 0, bad: false };
+            pack_body_at((*sr).hit, &r);
+            r.at = (*sr).at;
+            replay_phase(cx, &r, fi, P_SIMPLIFY, task);
+            return true;
+        }
+        let cc = task_begin(cx, -1, fi);
+        (*cc).members.push(fi);
+        (*cc).own_start.push(0);
+        (*cc).consts_before.push((*sr).before);
+        copy_ints(&(*cc).own_strs, &(*sr).own_strs);
+        copy_ints(&(*cc).reads, &(*sr).reads);
+        (*cc).key = (*sr).key;
+        (*cc).poison = (*sr).poison;
+        (*cc).rec = true;
+        false
+    }
+}
+
+// Function fi's scalar phases are done (a miss): its IR hashed, its entry
+// made unless poisoned.
+pub fn cc_scalar_end(cx: sink *FnCtx, fi: i64) {
+    unsafe {
+        let cc = cx.cc;
+        (*cc).rec = false;
+        out_hash(cx, fi);
+        if (*cc).poison {
+            OUT_SCALAR[fi] = OUT_POISON;
+            ir_release(cx);
+            return;
+        }
+        var irs = read_irs(*cc);
+        rel_sources(&*cc, irs);
+        let out: *ByteBuf = &(*cc).out;
+        (*out).len = 0;
+        ir_enter(cx, fi);
+        encode_ir(cx, fi, &*out, &(*cc).rel);
+        ir_release(cx);
+        put_u(&*out, FN_IRH[fi].a);
+        put_u(&*out, FN_IRH[fi].b);
+        put_consts(&*out, fi, (*cc).consts_before.data[0], 0);
+        free(irs.data as *u8);
+        if !store(&*cc, E_SCALAR, fi) {
+            OUT_SCALAR[fi] = OUT_POISON;
+        }
+    }
+}
+
+// Reads entry e for function fi's scalar phases: its reads checked, then
+// its IR installed and the cleanup's constant data made (the rest waits
+// for the scalar pipeline's task: SCALAR_REC). OUT_HIT, or why not.
+fn scalar_hit(cx: sink *FnCtx, cc: inout CcCtx, e: i64, fi: i64, task: i64) -> i64 {
+    unsafe {
+        var r = Reader { p: 0 as *u8, at: 0, end: 0, bad: false };
+        if !pack_body(e, &r) || get_u(&r) as i64 != E_SCALAR {
+            return OUT_BAD;
+        }
+        if !reads_hold(cx, &cc, &r) {
+            return OUT_READ;
+        }
+        var irs = cc.reads;
+        cc.reads = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var ids = Ids { strs: 0 as *i64, nstrs: 0, consts: 0 as *i64, nconsts: 0,
+            syms: 0 as *i64, nsyms: 0, fns: 0 as *i64, nfns: 0, rtids: 0 as *i64, nrtids: 0 };
+        var result = OUT_BAD;
+        if get_tables(&cc, &r, irs, &ids) {
+            let copy = alloc_zeroed(size_of(IRCopy)) as *IRCopy;
+            if decode_ir(&r, fi, &ids, copy) {
+                let h_a = get_u(&r);
+                let h_b = get_u(&r);
+                let at = r.at;
+                if consts_read(&r) {
+                    install_ir(cx, fi, copy);
+                    list_strings(cx, fi);
+                    ir_release(cx);
+                    FN_IRH[fi] = H2 { a: h_a, b: h_b };
+                    FN_IRH_OK[fi] = true;
+                    r.at = at;
+                    replay_phase(cx, &r, fi, P_CLEANUP, task);
+                    let sr = scalar_rec(fi);
+                    (*sr).hit = e;
+                    (*sr).at = at;
+                    result = OUT_HIT;
+                } else {
+                    free_copy(copy);
+                }
+            } else {
+                free_copy(copy);
+            }
+            free(copy as *u8);
+        }
+        ids_free(ids);
+        free(irs.data as *u8);
+        result
+    }
+}
+
+// Whether an entry's constant data reads whole (r is left after it).
+fn consts_read(r: inout Reader) -> bool {
+    unsafe {
+        let nc = get_count(&r);
+        for k in 0..nc {
+            get_u(&r);
+            get_s(&r);
+            get_s(&r);
+            var n = 0;
+            get_bytes(&r, &n);
+        }
+        !r.bad
+    }
+}
+
+// The constant data of an entry (r at its list) made in phase `phase`
+// made again for function fi, in their order, with rank `rank`.
+fn replay_phase(cx: sink *FnCtx, r: inout Reader, fi: i64, phase: i64, rank: i64) {
+    unsafe {
+        let nc = get_count(&r);
+        let saved_phase = cx.task_phase;
+        let saved_rank = cx.task_rank;
+        for k in 0..nc {
+            let ph = get_u(&r) as i64;
+            get_s(&r);
+            let align = get_s(&r);
+            var n = 0;
+            let p = get_bytes(&r, &n);
+            if ph == phase {
+                cx.task_phase = ph;
+                cx.task_rank = rank;
+                const_data(cx, fi, p[0..n], align);
+            }
+        }
+        cx.task_phase = saved_phase;
+        cx.task_rank = saved_rank;
+    }
+}

@@ -56,7 +56,7 @@ come to hold) points into.
 | `views(s)`, `views()` | into parameter `s`; nothing | `first_word(s)`; a function returning a Buf |
 | `stores(word)` | what the `inout` parameters may come to hold | `intern(names: inout Vec<[u8]>, word: [u8])` |
 
-`tachyonc query views NAME --why` shows a summary and the line that
+`volec query views NAME --why` shows a summary and the line that
 makes each part; `#[views(*self)]` on a function pins it (the body is
 checked against it, callers use it).
 
@@ -96,12 +96,12 @@ A lexer that *owns* its text (`src: Buf`) and returns views of it is
 while the first word still views it.
 
 ```text
-main.tach:14:13: error[own.conflict] 'lx.word()' may change 'lx' while 'a' (main.tach:13:9) views it; 'a' is used at main.tach:15:16
+main.vl:14:13: error[own.conflict] 'lx.word()' may change 'lx' while 'a' (main.vl:13:9) views it; 'a' is used at main.vl:15:16
   help: use the view before the change, keep an index instead of a view, or keep a copy
-  try: tachyonc query own main.tach:15:16
+  try: volec query own main.vl:15:16
 ```
 
-Let the lexer view text its caller owns (`src: [u8]`: `tachyonc
+Let the lexer view text its caller owns (`src: [u8]`: `volec
 refactor field Lexer --type src '[u8]'`), or copy each word into a
 `Buf`.
 
@@ -109,29 +109,29 @@ refactor field Lexer --type src '[u8]'`), or copy each word into a
 
 Each is one line (`check` joins the parts with ` | `), with what
 happened and both positions, a `help:` with the fix, and `try:` lines
-that run as they are. `tachyonc explain own.conflict` (and the other
-codes) has each in full; `tachyonc query own FILE:LINE:COL` shows every
+that run as they are. `volec explain own.conflict` (and the other
+codes) has each in full; `volec query own FILE:LINE:COL` shows every
 local's state at a position.
 
 ```text
-main.tach:10:5: error[own.conflict] 'v.push(4)' may change 'v' while 'first' (main.tach:9:9) views it; 'first' is used at main.tach:11:13
+main.vl:10:5: error[own.conflict] 'v.push(4)' may change 'v' while 'first' (main.vl:9:9) views it; 'first' is used at main.vl:11:13
   help: use the view before the change, keep an index instead of a view, or keep a copy
-  try: tachyonc edit patch main --old 'v.as_slice()' --new 'v.clone()'
-  try: tachyonc query own main.tach:11:13
+  try: volec edit patch main --old 'v.as_slice()' --new 'v.clone()'
+  try: volec query own main.vl:11:13
 
-greet.tach:4:5: error[own.escape] 'greet' returns a view of 'b', which is dropped when 'greet' returns
+greet.vl:4:5: error[own.escape] 'greet' returns a view of 'b', which is dropped when 'greet' returns
   help: return the owner itself; a caller that wants a view takes '.as_slice()' of it
-  try: tachyonc edit patch greet --old '-> [u8]' --new '-> Buf' --old 'b.as_slice()' --new 'b'
+  try: volec edit patch greet --old '-> [u8]' --new '-> Buf' --old 'b.as_slice()' --new 'b'
 
-main.tach:12:18: error[own.conflict] 'v.push(x)' may change the elements of 'v' while the 'for' at main.tach:12:5 iterates over them
+main.vl:12:18: error[own.conflict] 'v.push(x)' may change the elements of 'v' while the 'for' at main.vl:12:5 iterates over them
   help: loop over the indexes (the loop sees the elements present when it starts), or collect the new elements and append them after the loop
-  try: tachyonc edit patch main --old 'for x in v {' --new 'for i in 0..v.len() { let x = v[i];'
+  try: volec edit patch main --old 'for x in v {' --new 'for i in 0..v.len() { let x = v[i];'
 
-main.tach:6:11: error[own.conflict] 'a' is borrowed mutably by '&a' and mutably again by '&a' in the same call
+main.vl:6:11: error[own.conflict] 'a' is borrowed mutably by '&a' and mutably again by '&a' in the same call
   help: pass disjoint places, copy the plain value out first, or for two elements of one Vec use 'v.swap(i, j)'
 ```
 
 They are errors by default (`--values=error`). `--values=warn` makes
 them warnings; `--values=report` lists them without failing
 the build; `--values=off` turns the checks and the drops off (0.16's
-semantics, for code not yet migrated by `tachyonc fix --values`).
+semantics, for code not yet migrated by `volec fix --values`).

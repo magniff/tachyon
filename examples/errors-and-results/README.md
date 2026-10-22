@@ -8,10 +8,10 @@ difference between "absent" (`Option`) and "failed" (`Result`), and a
 
 ## Build and run
 
-From this folder (with `tachyonc` on your `PATH`, or `../../target/tachyonc`):
+From this folder (with `volec` on your `PATH`, or `../../target/volec`):
 
 ```sh
-tachyonc main.tach -o errors-and-results
+volec main.vl -o errors-and-results
 ./errors-and-results < server.conf      # a good config: exit 0
 ./errors-and-results < broken.conf      # a bad one: exit 1
 ```
@@ -157,17 +157,17 @@ view there would outlive its owner, which the compiler rejects
 (`own.escape`: main returns a view of `input`, which is dropped when main
 returns); before 0.17 the program had to leak `input` on the
 error path instead. An owned field (the `Buf`, not a view of it) is what
-`tachyonc explain own.escape` suggests for a value that must outlive its
+`volec explain own.escape` suggests for a value that must outlive its
 source.
 
 ## Language features
 
-- `?`, `From`/`Into`, `main -> Result`, std's error enums: `tachyonc guide conversions`
-- `Option`/`Result` methods (`map`, `map_err`, `ok_or`, `unwrap_or`): `tachyonc guide std`
-- `#[derive(Debug)]`, `impl Display`, `{x:<26?}`: `tachyonc guide formatting`
-- closures given to `map_err`, `position`, `any`: `tachyonc guide closures`
-- drops, `HashMap`, `Scanner`, `trim`: `tachyonc guide std`, `tachyonc guide memory`
-- a `type` alias (`type Fields = HashMap<[u8], Field>;`): `tachyonc guide generics`
+- `?`, `From`/`Into`, `main -> Result`, std's error enums: `volec guide conversions`
+- `Option`/`Result` methods (`map`, `map_err`, `ok_or`, `unwrap_or`): `volec guide std`
+- `#[derive(Debug)]`, `impl Display`, `{x:<26?}`: `volec guide formatting`
+- closures given to `map_err`, `position`, `any`: `volec guide closures`
+- drops, `HashMap`, `Scanner`, `trim`: `volec guide std`, `volec guide memory`
+- a `type` alias (`type Fields = HashMap<[u8], Field>;`): `volec guide generics`
 
 ## Going further
 

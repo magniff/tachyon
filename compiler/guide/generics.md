@@ -43,7 +43,7 @@ fn main(gpa: Gpa) -> i32 {
     let a = [3, 8, 1];
     std::print_int(largest(a[..]));
     print(" ");
-    std::print_int(largest::<u8>("tachyon") as i64);   // the turbofish
+    std::print_int(largest::<u8>("vole") as i64);   // the turbofish
     print(" ");
     let t = swap((1, "one"));
     print(t.0);
@@ -54,7 +54,7 @@ fn main(gpa: Gpa) -> i32 {
 }
 ```
 ```out
-13 8 121 one 14
+13 8 118 one 14
 ```
 
 - Type arguments: after a type's name (`Vec<i64>`, `Option<*u8>`), and in
@@ -76,5 +76,5 @@ fn main(gpa: Gpa) -> i32 {
 - Not there: const generics (`[T; N]` with `N` a parameter), generic
   traits (`trait Conv<T>`), `where` clauses, variadic generics.
   Associated types (0.14): `I::Item` for `I: Iterator`, and bounds
-  `I: Iterator<Item = i64>`, `F: Fn(i64) -> bool` (`tachyonc guide
+  `I: Iterator<Item = i64>`, `F: Fn(i64) -> bool` (`volec guide
   iterators`, `guide closures`).

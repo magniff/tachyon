@@ -1,4 +1,4 @@
-/* The C side of tests/run/abi_stack_struct_float.tach. */
+/* The C side of tests/run/abi_stack_struct_float.vl. */
 #include <stdint.h>
 
 typedef struct { double d; int32_t i; } Mixed;

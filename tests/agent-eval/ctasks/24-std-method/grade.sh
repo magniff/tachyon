@@ -10,7 +10,7 @@ for name in strip_prefix strip_suffix; do
     # The topic's text by hand: its API listing (@STD-API@) comes from std's
     # source by itself, so it does not count.
     grep -v '@STD-API@' "$md" | grep -q "$name" || fail "$md does not mention $name (only the generated API listing does)"
-    "$TACHYONC" guide std 2>/dev/null | grep -q "$name" || fail "tachyonc guide std does not print $name"
+    "$VOLEC" guide std 2>/dev/null | grep -q "$name" || fail "volec guide std does not print $name"
 done
 # An example: a ```tach block of the topic (compiled and run by the guide
 # filter) that calls one of them.
@@ -21,7 +21,7 @@ awk '/^```tach/ { inb = 1; next } /^```/ { inb = 0 } inb && /strip_(prefix|suffi
 own=""
 for name in strip_prefix strip_suffix; do
     found=""
-    for f in tests/run/*.tach tests/run/*/*.tach; do
+    for f in tests/run/*.vl tests/run/*/*.vl; do
         [ -f "$f" ] || continue
         case "$f" in tests/run/eval_std_strip_*) continue ;; esac
         if grep -q "$name" "$f"; then
@@ -32,8 +32,8 @@ for name in strip_prefix strip_suffix; do
     [ -n "$found" ] || fail "no test in tests/run/ (besides the hidden ones) uses $name"
 done
 for f in $own; do
-    case "$f" in */main.tach) case_name=$(basename "$(dirname "$f")") ;; *) case_name=$(basename "$f" .tach) ;; esac
-    out=$(sh tests/run.sh -c "$TACHYONC" "$case_name" 2>&1) ||
+    case "$f" in */main.vl) case_name=$(basename "$(dirname "$f")") ;; *) case_name=$(basename "$f" .vl) ;; esac
+    out=$(sh tests/run.sh -c "$VOLEC" "$case_name" 2>&1) ||
         fail "the test $f fails: $(printf '%s\n' "$out" | grep -m1 -E 'FAIL|no cases' || echo "tests/run.sh $case_name failed")"
 done
 exit 0

@@ -1,0 +1,956 @@
+// `volec test` on a program (0.18, T2; docs/design/contracts-verification.md
+// §2.6, §2.9): its I/O cases (tests/NAME.in, .out, .exit) and its tests in
+// the language (#[test], #[property], #[fuzz] regressions, functions with an
+// `ensures`), from a test build (`--test-build`, front/tests: a main that
+// runs the test its arguments name). Each runs in its own process, several
+// at once, at -O0 and at -O2: the levels must agree on stdout, the exit
+// status and the first line of stderr, else the difference is the
+// compiler's bug (the program has no undefined behaviour to blame). The
+// summary comes first, then one line per failure.
+
+use crate::base::{
+    IntVec, STDOUT, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
+    buf_write_fd, getenv, streq,
+};
+use crate::front::cpp::directives::file_exists;
+use crate::tools::proc::{buf_cstr, read_file_if, rename_file, write_file_if};
+use crate::tools::query::c_slice;
+use crate::tools::query::diagnostics::{PROG, diag, put_cword, try_begin, try_end};
+use crate::tools::testrun::{
+    BUDGET, FILTERS, OPT, TIMEOUT, build_key_for, case_file, contains, expected_exit, join,
+    line_count, line_end, list_cases, normal, put_cut, put_difference, put_failures, put_lines,
+    put_lines_count, selected, shown_path, starts, traced,
+};
+
+extern "C" {
+    fn fork() -> i32;
+    fn execvp(file: *u8, argv: **u8) -> i32;
+    fn waitpid(pid: i32, status: *i32, options: i32) -> i32;
+    fn open(path: *u8, flags: i32) -> i32;
+    fn creat(path: *u8, mode: i32) -> i32;
+    fn dup2(from: i32, to: i32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn alarm(seconds: u32) -> u32;
+    fn _exit(code: i32) -> !;
+    fn chmod(path: *u8, mode: i32) -> i32;
+    fn sysconf(name: i32) -> i64;
+    fn getenv(name: *u8) -> *u8;
+}
+
+// (0.18) The options of the language's tests (tools/testrun/mod.vl reads
+// them): --cases N, --seed S, --accept, --no-contracts, --no-check-alloc.
+pub static var CASES: i64 = 0;
+pub static var SEED: *u8 = 0 as *u8;
+pub static var ACCEPT: bool = false;
+pub static var NO_CONTRACTS: bool = false;
+pub static var NO_CHECK_ALLOC: bool = false;
+
+// What an item is.
+const CASE: i64 = 0;
+const TEST: i64 = 1;
+const PROPERTY: i64 = 2;
+const FUZZ: i64 = 3;
+const CONTRACT: i64 = 4;
+
+// The cases of a property both levels run (-O0 runs only these).
+const LEVEL_CASES: i64 = 20;
+
+// A process to run: argv, stdin from `input` (0: /dev/null), stdout and
+// stderr into files; its exit status (128 + a signal, -1 past the time
+// limit).
+pub struct Job { argv: **u8, input: *u8, out: *u8, err: *u8, pid: i32, status: i64 }
+
+pub static var JOBS: *Job = 0 as *Job;
+static var JOB_COUNT: i64 = 0;
+static var JOB_CAP: i64 = 0;
+
+pub fn add_job(argv: **u8, input: *u8, out: *u8, err: *u8) -> i64 {
+    unsafe {
+        if JOB_COUNT == JOB_CAP {
+            let cap = if JOB_CAP == 0 { 64 } else { JOB_CAP * 2 };
+            let bigger = alloc_array::<Job>(cap);
+            for i in 0..JOB_COUNT {
+                bigger[i] = JOBS[i];
+            }
+            JOBS = bigger;
+            JOB_CAP = cap;
+        }
+        JOBS[JOB_COUNT] = Job { argv, input, out, err, pid: 0, status: 0 };
+        JOB_COUNT += 1;
+        JOB_COUNT - 1
+    }
+}
+
+fn start_job(j: i64) {
+    unsafe {
+        let job = JOBS[j];
+        let pid = fork();
+        if pid == 0 {
+            let fd = open(if job.input != 0 as *u8 { job.input } else { c"/dev/null" }, 0);
+            if fd >= 0 {
+                dup2(fd, 0);
+                close(fd);
+            }
+            let o = creat(job.out, 420);
+            if o >= 0 {
+                dup2(o, 1);
+                close(o);
+            }
+            let e = creat(job.err, 420);
+            if e >= 0 {
+                dup2(e, 2);
+                close(e);
+            }
+            alarm(TIMEOUT as u32);
+            execvp(job.argv[0], job.argv);
+            _exit(127);
+        }
+        JOBS[j].pid = pid;
+        if pid < 0 {
+            JOBS[j].status = 127;
+        }
+    }
+}
+
+// Runs jobs from..JOB_COUNT, as many at once as there are processors.
+pub fn run_jobs(from: i64) {
+    unsafe {
+        var most = sysconf(58);
+        if most < 1 {
+            most = 4;
+        }
+        var next = from;
+        var running = 0;
+        while next < JOB_COUNT || running > 0 {
+            while next < JOB_COUNT && running < most {
+                start_job(next);
+                if JOBS[next].pid > 0 {
+                    running += 1;
+                }
+                next += 1;
+            }
+            if running == 0 {
+                break;
+            }
+            var status = 0 as i32;
+            let pid = waitpid(-1, &status, 0);
+            if pid <= 0 {
+                break;
+            }
+            for j in from..next {
+                if JOBS[j].pid == pid {
+                    let s = status as i64;
+                    JOBS[j].status = if (s & 127) == 14 { -1 }
+                        else if (s & 127) == 0 { (s >> 8) & 255 } else { 128 + (s & 127) };
+                    JOBS[j].pid = 0;
+                    running -= 1;
+                }
+            }
+        }
+    }
+}
+
+pub fn argv_of(words: IntVec) -> **u8 {
+    unsafe {
+        let argv = alloc_array::<*u8>(words.count + 1);
+        for i in 0..words.count {
+            argv[i] = words.data[i] as *u8;
+        }
+        argv[words.count] = 0 as *u8;
+        argv
+    }
+}
+
+pub fn file_text(path: *u8) -> [u8] {
+    let b = buf_new();
+    read_file_if(path, b);
+    buf_slice(b)
+}
+
+// The first line of s (without its newline).
+pub fn first_line(s: [u8]) -> [u8] {
+    s[0..line_end(s, 0)]
+}
+
+// The lines of s that are not `vole-test:` lines (the runtime's, to
+// this runner).
+fn program_lines(s: [u8]) -> [u8] {
+    let b = buf_new();
+    var i = 0;
+    while i < s.len {
+        let e = line_end(s, i);
+        if !starts(s[i..e], "vole-test: ") {
+            buf_bytes(b, s[i..e]);
+            buf_byte(b, '\n');
+        }
+        i = e + 1;
+    }
+    normal(buf_slice(b))
+}
+
+// The rest of the `vole-test: WORD ` line of s, or "".
+pub fn runtime_line(s: [u8], word: [u8], nth: i64) -> [u8] {
+    var i = 0;
+    var seen = 0;
+    let prefix = buf_new();
+    buf_bytes(prefix, "vole-test: ");
+    buf_bytes(prefix, word);
+    buf_byte(prefix, ' ');
+    let p = buf_slice(prefix);
+    while i < s.len {
+        let e = line_end(s, i);
+        if starts(s[i..e], p) {
+            if seen == nth {
+                return s[i + p.len..e];
+            }
+            seen += 1;
+        }
+        i = e + 1;
+    }
+    ""
+}
+
+// Whether a source file under dir has a test: `#[test]`, `#[property]`,
+// `#[fuzz]` or `ensures`.
+fn has_tests(dir: *u8) -> bool {
+    unsafe {
+        let words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var w = words;
+        w.push(c"grep" as i64);
+        w.push(c"-rlE" as i64);
+        w.push(c"--include=*.vl" as i64);
+        w.push(c"--include=*.vl" as i64);
+        w.push(c"#\\[(test|property|fuzz)\\]|ensures" as i64);
+        w.push(dir as i64);
+        let out = buf_new();
+        crate::tools::proc::run_capture(argv_of(w), out);
+        buf_slice(out).len > 0
+    }
+}
+
+// Builds root at `level` into `prog` (for tests: `test` true), unless it is
+// newer than the sources and was built the same way; false, with the
+// errors in out, when it does not build.
+pub fn build(root: *u8, src_dir: *u8, work: u8, prog: *u8, level: *u8, test: bool, out: i64,
+    coverage: bool = false) -> bool {
+    unsafe {
+        let key_file = buf_new();
+        buf_str(key_file, prog);
+        buf_bytes(key_file, ".key");
+        let key_path = buf_cstr(key_file);
+        let k = buf_new();
+        buf_bytes(k, build_key_for(level));
+        if test {
+            buf_bytes(k, if NO_CHECK_ALLOC || coverage { "test" } else { "test check-alloc" });
+        }
+        if coverage {
+            buf_bytes(k, " coverage");
+        }
+        if getenv(c"VOLE_PLANT_MISCOMPILE") != 0 as *u8 {
+            // (front/tests' test-only switch changes what is built)
+            buf_bytes(k, " planted");
+        }
+        let key = buf_slice(k);
+        let old = buf_new();
+        if file_exists(prog) && read_file_if(key_path, old) && buf_slice(old) == key
+            && !super::newer_tach(src_dir, 0 as *u8, prog) {
+            return true;
+        }
+        let built = buf_new();
+        buf_str(built, prog);
+        buf_bytes(built, ".build");
+        let built_path = buf_cstr(built);
+        let words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var w = words;
+        w.push(PROG as i64);
+        w.push(root as i64);
+        w.push(c"-o" as i64);
+        w.push(built_path as i64);
+        w.push(c"--diagnostics=short" as i64);
+        w.push(level as i64);
+        if !streq(level, c"-O0") && traced() {
+            w.push(c"--trace" as i64);
+        }
+        if test {
+            w.push(c"--test-build" as i64);
+            if coverage {
+                // (volec fuzz: the counters, and the speed of -O1)
+                w.push(c"--coverage" as i64);
+            } else if !NO_CHECK_ALLOC {
+                w.push(c"--check-alloc" as i64);
+            }
+        }
+        let log = buf_new();
+        let rc = crate::tools::proc::run_capture(argv_of(w), log);
+        if rc != 0 {
+            let l = buf_slice(log);
+            var errors = 0;
+            var i = 0;
+            while i < l.len {
+                let e = line_end(l, i);
+                if contains(l[i..e], ": error") || starts(l[i..e], "error") {
+                    errors += 1;
+                }
+                i = e + 1;
+            }
+            buf_bytes(out, "test ");
+            buf_str(out, root);
+            buf_bytes(out, if test { ": its tests do not build" } else { ": does not build" });
+            if errors > 0 {
+                buf_bytes(out, " (");
+                buf_int(out, errors);
+                buf_bytes(out, if errors == 1 { " error)" } else { " errors)" });
+            }
+            buf_byte(out, '\n');
+            i = 0;
+            while i < l.len {
+                let e = line_end(l, i);
+                if e > i {
+                    if buf_slice(out).len + (e - i) > BUDGET {
+                        buf_bytes(out, "(more: ");
+                        buf_str(out, PROG);
+                        buf_bytes(out, " check ");
+                        buf_str(out, root);
+                        buf_bytes(out, ")\n");
+                        break;
+                    }
+                    put_cut(out, "", l[i..e]);
+                }
+                i = e + 1;
+            }
+            return false;
+        }
+        // (written over in place: macOS checks a new executable file the
+        // first time it runs, not one written over)
+        let bytes = buf_new();
+        if !read_file_if(built_path, bytes) || !write_file_if(prog, buf_slice(bytes)) {
+            rename_file(built_path, prog);
+        }
+        chmod(prog, 493);
+        write_file_if(key_path, key);
+        true
+    }
+}
+
+// The items of a test binary (`--vole-list`): kinds, names (buffers)
+// and positions (buffers).
+pub fn list_tests(tbin: *u8, kinds: inout IntVec, names: inout IntVec, positions: inout IntVec) {
+    unsafe {
+        let words = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var w = words;
+        w.push(tbin as i64);
+        w.push(c"--vole-list" as i64);
+        let out = buf_new();
+        crate::tools::proc::run_capture(argv_of(w), out);
+        let s = buf_slice(out);
+        var i = 0;
+        while i < s.len {
+            let e = line_end(s, i);
+            let line = s[i..e];
+            i = e + 1;
+            if !starts(line, "vole-test: ") {
+                continue;
+            }
+            let rest = line[14..line.len];
+            let sp1 = line_end_at(rest, 0, ' ');
+            let sp2 = line_end_at(rest, sp1 + 1, ' ');
+            if sp2 >= rest.len {
+                continue;
+            }
+            let word = rest[0..sp1];
+            let kind = if word == "test" { TEST } else if word == "property" { PROPERTY }
+                else if word == "fuzz" { FUZZ } else { CONTRACT };
+            let name = rest[sp1 + 1..sp2];
+            if !selected(name) || kind == CONTRACT && NO_CONTRACTS {
+                continue;
+            }
+            kinds.push(kind);
+            let nb = buf_new();
+            buf_bytes(nb, name);
+            names.push(nb);
+            let pb = buf_new();
+            buf_bytes(pb, rest[sp2 + 1..rest.len]);
+            positions.push(pb);
+        }
+    }
+}
+
+fn line_end_at(s: [u8], from: i64, c: u8) -> i64 {
+    var e = from;
+    while e < s.len && s[e] != c {
+        e += 1;
+    }
+    e
+}
+
+pub fn level_dir(work: *u8, level: *u8) -> *u8 {
+    unsafe {
+        let d = join(work, c_slice(level)[1..3]);
+        crate::tools::proc::make_dirs(d);
+        d
+    }
+}
+
+// A fuzz target's saved inputs, as `--replay FILE` words: tests/fuzz/NAME/
+// and the crashes `volec fuzz` saved (--accept copies those into
+// tests/fuzz/NAME/).
+fn put_replays(words: inout IntVec, src_dir: *u8, tests: *u8, name: [u8]) {
+    unsafe {
+        var crashes = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        crate::tools::testrun::fuzz::files_in(crate::tools::testrun::fuzz::fuzz_dir(src_dir, name),
+            "crash-", &crashes);
+        let b = buf_new();
+        buf_bytes(b, "fuzz/");
+        buf_bytes(b, name);
+        let kept = join(tests, buf_slice(b));
+        if ACCEPT && crashes.count > 0 {
+            crate::tools::proc::make_dirs(kept);
+            for k in 0..crashes.count {
+                let path = crashes.data[k] as *u8;
+                let s = c_slice(path);
+                var base = s.len;
+                while base > 0 && s[base - 1] != '/' {
+                    base -= 1;
+                }
+                write_file_if(join(kept, s[base..s.len]), file_text(path));
+            }
+        }
+        var inputs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        crate::tools::testrun::fuzz::files_in(kept, "", &inputs);
+        for k in 0..crashes.count {
+            inputs.push(crashes.data[k]);
+        }
+        for k in 0..inputs.count {
+            if k < 200 {
+                words.push(c"--replay" as i64);
+                words.push(shown_path(inputs.data[k] as *u8) as i64);
+            }
+        }
+    }
+}
+
+// `volec test` on the program at root: the summary, then the failures
+// (at most BUDGET bytes); exit 1 when one failed.
+pub fn run_all(root: *u8, src_dir: *u8, tests: *u8, shown: *u8, work: *u8, out: i64) -> i64 {
+    unsafe {
+        let levels = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var lv = levels;
+        if OPT != 0 as *u8 {
+            lv.push(OPT as i64);
+        } else {
+            // (-O2 first: it writes the new snapshots -O0 then compares)
+            lv.push(c"-O2" as i64);
+            lv.push(c"-O0" as i64);
+        }
+        var cases = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let listed = list_cases(tests, &cases);
+        let with_tests = has_tests(src_dir);
+        // the builds
+        let progs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var pv = progs;
+        let tbins = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var tv = tbins;
+        for l in 0..lv.count {
+            let level = lv.data[l] as *u8;
+            let dir = level_dir(work, level);
+            let prog = join(dir, "prog");
+            let tbin = join(dir, "tests");
+            pv.push(prog as i64);
+            tv.push(tbin as i64);
+            if (cases.count > 0 || !with_tests)
+                && !build(root, src_dir, *work, prog, level, false, out) {
+                buf_write_fd(out, STDOUT);
+                return 1;
+            }
+            if with_tests && !build(root, src_dir, *work, tbin, level, true, out) {
+                buf_write_fd(out, STDOUT);
+                return 1;
+            }
+        }
+        // the items: the cases, then the tests
+        var kinds = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var positions = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..cases.count {
+            kinds.push(CASE);
+            names.push(cases.data[k]);
+            positions.push(buf_new());
+        }
+        if with_tests {
+            list_tests(tv.data[0] as *u8, &kinds, &names, &positions);
+        }
+        if kinds.count == 0 {
+            if FILTERS.count > 0 && (listed || with_tests) {
+                let d = diag(c"error", c"test.no-root");
+                buf_bytes(d, "no case in ");
+                buf_str(d, shown);
+                buf_bytes(d, if with_tests { "/ and no test match the filters\n" }
+                    else { "/ matches the filters\n" });
+                let t = try_begin(c"test", c_slice(c""), false);
+                put_cword(t, root);
+                try_end(t);
+                return 2;
+            }
+            buf_bytes(out, "test ");
+            buf_str(out, root);
+            buf_bytes(out, ": builds; no tests in ");
+            buf_str(out, shown);
+            buf_bytes(out, "/ (a case: NAME.in, its stdin, and NAME.out, the expected stdout; a #[test] fn in the program; --input FILE: one run)\n");
+            buf_write_fd(out, STDOUT);
+            return 0;
+        }
+        // the runs: each level's, all at once (one level after the other)
+        let first_job = JOB_COUNT;
+        let n = kinds.count;
+        for l in 0..lv.count {
+            let level = lv.data[l] as *u8;
+            let dir = level_dir(work, level);
+            let from = JOB_COUNT;
+            for k in 0..n {
+                let name = buf_slice(names.data[k]);
+                let w = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                var words = w;
+                var input = 0 as *u8;
+                if kinds.data[k] == CASE {
+                    words.push(pv.data[l]);
+                    let path = case_file(tests, name, ".in");
+                    if file_exists(path) {
+                        input = path;
+                    }
+                } else {
+                    words.push(tv.data[l]);
+                    words.push(c"--vole-test" as i64);
+                    words.push(buf_cstr(names.data[k]) as i64);
+                    words.push(c"--snapshots" as i64);
+                    words.push(tests as i64);
+                    let quick = lv.count > 1 && streq(level, c"-O0");
+                    if quick || CASES > 0 {
+                        let b = buf_new();
+                        buf_int(b, if quick && (CASES == 0 || CASES > LEVEL_CASES) { LEVEL_CASES }
+                            else { CASES });
+                        words.push(c"--cases" as i64);
+                        words.push(buf_cstr(b) as i64);
+                    }
+                    if SEED != 0 as *u8 {
+                        words.push(c"--seed" as i64);
+                        words.push(SEED as i64);
+                    }
+                    if ACCEPT {
+                        words.push(c"--accept" as i64);
+                    }
+                    if kinds.data[k] == FUZZ {
+                        put_replays(&words, src_dir, tests, name);
+                    }
+                }
+                let base = buf_new();
+                buf_bytes(base, if kinds.data[k] == CASE { "case-" } else { "test-" });
+                buf_bytes(base, name);
+                let b = buf_slice(base);
+                add_job(argv_of(words), input, case_file(dir, b, ".got"),
+                    case_file(dir, b, ".err"));
+            }
+            run_jobs(from);
+        }
+        // the results
+        var blocks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var failed = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var passed = 0;
+        var diffs = 0;
+        var new_snaps = 0;
+        var counts = [0, 0, 0, 0, 0];
+        for k in 0..n {
+            counts[kinds.data[k]] += 1;
+            let main_job = first_job + k;
+            let block = buf_new();
+            let ok = judge(block, kinds.data[k], buf_slice(names.data[k]), main_job, tests, shown,
+                root);
+            // the snapshots made new (at the first level)
+            let got = file_text(JOBS[main_job].out);
+            var s = 0;
+            while runtime_line(got, "snapshot", s).len > 0 {
+                if starts(runtime_line(got, "snapshot", s), "new ") {
+                    new_snaps += 1;
+                }
+                s += 1;
+            }
+            var agree = true;
+            if lv.count > 1 {
+                let other = first_job + n + k;
+                agree = put_level_difference(block, kinds.data[k], buf_slice(names.data[k]),
+                    main_job, other, lv.data[0] as *u8, lv.data[1] as *u8, root, tests, shown);
+                if !agree {
+                    diffs += 1;
+                }
+            }
+            if ok && agree {
+                passed += 1;
+            } else {
+                blocks.push(block);
+                failed.push(names.data[k]);
+            }
+        }
+        // the summary
+        buf_bytes(out, "test ");
+        buf_str(out, root);
+        buf_bytes(out, ": ");
+        buf_int(out, passed);
+        buf_bytes(out, " passed");
+        if blocks.count > 0 {
+            buf_bytes(out, ", ");
+            buf_int(out, blocks.count);
+            buf_bytes(out, " failed");
+        }
+        if new_snaps > 0 {
+            buf_bytes(out, ", ");
+            buf_int(out, new_snaps);
+            buf_bytes(out, if new_snaps == 1 { " new snapshot" } else { " new snapshots" });
+        }
+        buf_bytes(out, " (");
+        let labels = ["case", "#[test]", "#[property]", "#[fuzz] target", "contract"];
+        var any = false;
+        for c in 0..5 {
+            if counts[c] > 0 {
+                if any {
+                    buf_bytes(out, ", ");
+                }
+                any = true;
+                buf_int(out, counts[c]);
+                buf_byte(out, ' ');
+                buf_bytes(out, labels[c]);
+                if counts[c] > 1 && (c == 0 || c == 4) {
+                    buf_byte(out, 's');
+                }
+            }
+        }
+        if lv.count > 1 {
+            if diffs == 0 {
+                buf_bytes(out, "; -O0 and -O2 agree)\n");
+            } else {
+                buf_bytes(out, "; -O0 and -O2 differ on ");
+                buf_int(out, diffs);
+                buf_bytes(out, ")\n");
+            }
+        } else {
+            buf_bytes(out, "; ");
+            buf_str(out, lv.data[0] as *u8);
+            buf_bytes(out, " only)\n");
+        }
+        if blocks.count > 0 {
+            put_failures(out, blocks, failed);
+            buf_bytes(out, "(outputs: ");
+            buf_str(out, shown_path(level_dir(work, lv.data[0] as *u8)));
+            buf_bytes(out, "/case-NAME.got, .err; test-NAME.got, .err)\n");
+        }
+        buf_write_fd(out, STDOUT);
+        if blocks.count > 0 { 1 } else { 0 }
+    }
+}
+
+// The stderr lines after the first: a --trace's frames, on one line.
+fn put_trace(block: i64, err: [u8]) {
+    let first = line_end(err, 0);
+    if first >= err.len {
+        return;
+    }
+    let rest = err[first + 1..err.len];
+    var i = 0;
+    let t = buf_new();
+    var frames = 0;
+    while i < rest.len && frames < 8 {
+        let e = line_end(rest, i);
+        let line = rest[i..e];
+        i = e + 1;
+        if starts(line, "check-alloc: ") {
+            // (what a failed test left allocated: not its trace)
+            break;
+        }
+        if starts(line, "note: ") || starts(line, "trace, ") || line.len == 0 {
+            continue;
+        }
+        if frames > 0 {
+            buf_bytes(t, " < ");
+        }
+        // (the frame's words, one space between them)
+        var space = false;
+        for a in 0..line.len {
+            if line[a] == ' ' {
+                space = buf_slice(t).len > 0 && frames >= 0;
+            } else {
+                if space && buf_slice(t)[buf_slice(t).len - 1] != ' ' {
+                    buf_byte(t, ' ');
+                }
+                space = false;
+                buf_byte(t, line[a]);
+            }
+        }
+        frames += 1;
+    }
+    if frames > 0 {
+        put_cut(block, "  trace: ", buf_slice(t));
+    }
+}
+
+// Whether item k passed at its first level (job j); else why, into block.
+fn judge(block: i64, kind: i64, name: [u8], j: i64, tests: *u8, shown: *u8, root: *u8) -> bool {
+    unsafe {
+        let status = JOBS[j].status;
+        let got = file_text(JOBS[j].out);
+        let err = normal(file_text(JOBS[j].err));
+        if kind == CASE {
+            let want_b = buf_new();
+            let has_want = read_file_if(case_file(tests, name, ".out"), want_b);
+            let want = normal(buf_slice(want_b));
+            let want_exit = expected_exit(case_file(tests, name, ".exit"));
+            let g = normal(got);
+            if status == want_exit && has_want && g == want {
+                return true;
+            }
+            if ACCEPT && status != -1 {
+                // (--accept: the case's .out, and .exit, as it ran)
+                let b = buf_new();
+                buf_bytes(b, g);
+                if g.len > 0 {
+                    buf_byte(b, '\n');
+                }
+                write_file_if(case_file(tests, name, ".out"), buf_slice(b));
+                if status != 0 {
+                    let e = buf_new();
+                    buf_int(e, status);
+                    buf_byte(e, '\n');
+                    write_file_if(case_file(tests, name, ".exit"), buf_slice(e));
+                }
+                return true;
+            }
+            buf_bytes(block, "FAIL ");
+            buf_bytes(block, name);
+            buf_bytes(block, ": ");
+            if status == -1 || status != want_exit {
+                if status == -1 {
+                    buf_bytes(block, "no exit after ");
+                    buf_int(block, TIMEOUT);
+                    buf_bytes(block, " s (--timeout S)");
+                } else {
+                    buf_bytes(block, "exit ");
+                    buf_int(block, status);
+                    buf_bytes(block, " (expected ");
+                    buf_int(block, want_exit);
+                    buf_bytes(block, ")");
+                }
+                if err.len > 0 {
+                    buf_bytes(block, ": ");
+                    buf_bytes(block, first_line(err));
+                }
+                buf_byte(block, '\n');
+                put_trace(block, err);
+            } else if !has_want {
+                buf_bytes(block, "no ");
+                buf_str(block, shown);
+                buf_byte(block, '/');
+                buf_bytes(block, name);
+                buf_bytes(block, ".out to compare with; it printed ");
+                put_lines_count(block, line_count(g));
+                buf_bytes(block, " (--accept writes it)\n");
+                put_lines(block, g, 0, 4, "  + ");
+            } else {
+                put_difference(block, want, g);
+            }
+            return false;
+        }
+        if status == 0 {
+            return true;
+        }
+        buf_bytes(block, "FAIL ");
+        buf_bytes(block, name);
+        let prop = runtime_line(got, "property", 0);
+        if kind != TEST && prop.len > 0 {
+            // `case 11 of 100, shrunk in 14 steps, seed H`
+            let seed_at = find(prop, ", seed ");
+            buf_bytes(block, " (");
+            buf_bytes(block, if kind == CONTRACT { "contract, " } else if kind == FUZZ { "fuzz, " }
+                else { "property, " });
+            buf_bytes(block, if seed_at >= 0 { prop[0..seed_at] } else { prop });
+            buf_byte(block, ')');
+        }
+        buf_bytes(block, ": ");
+        if status == -1 {
+            buf_bytes(block, "no exit after ");
+            buf_int(block, TIMEOUT);
+            buf_bytes(block, " s (--timeout S)\n");
+        } else if err.len == 0 {
+            buf_bytes(block, "exit ");
+            buf_int(block, status);
+            buf_byte(block, '\n');
+        } else if starts(err, "check-alloc: ") {
+            // a leak: the count, then where the first block was allocated
+            buf_bytes(block, first_line(err));
+            let second = line_end(err, 0) + 1;
+            if second < err.len {
+                let line = err[second..line_end(err, second)];
+                var a = 0;
+                while a < line.len && line[a] == ' ' {
+                    a += 1;
+                }
+                buf_byte(block, ' ');
+                buf_bytes(block, line[a..line.len]);
+            }
+            buf_byte(block, '\n');
+        } else {
+            put_cut(block, "", first_line(err));
+            put_trace(block, err);
+            if starts(err, "snapshot differs: ") {
+                let t = buf_new();
+                buf_bytes(t, "  try: ");
+                buf_str(t, PROG);
+                buf_bytes(t, " test ");
+                buf_bytes(t, name);
+                buf_bytes(t, " --accept ");
+                buf_str(t, root);
+                buf_byte(t, '\n');
+                buf_bytes(block, buf_slice(t));
+            }
+        }
+        var k = 0;
+        while runtime_line(got, "input", k).len > 0 {
+            put_cut(block, "  input: ", runtime_line(got, "input", k));
+            k += 1;
+        }
+        if kind != TEST && prop.len > 0 {
+            let seed_at = find(prop, ", seed ");
+            if seed_at >= 0 {
+                let t = buf_new();
+                buf_bytes(t, "  try: ");
+                buf_str(t, PROG);
+                buf_bytes(t, " test ");
+                buf_bytes(t, name);
+                buf_bytes(t, " --seed 0x");
+                buf_bytes(t, prop[seed_at + 7..prop.len]);
+                buf_byte(t, ' ');
+                buf_str(t, root);
+                buf_byte(t, '\n');
+                buf_bytes(block, buf_slice(t));
+            }
+        }
+        false
+    }
+}
+
+fn find(s: [u8], p: [u8]) -> i64 {
+    var i = 0;
+    while i + p.len <= s.len {
+        if s[i..i + p.len] == p {
+            return i;
+        }
+        i += 1;
+    }
+    -1
+}
+
+fn quoted(block: i64, s: [u8]) {
+    buf_byte(block, '\'');
+    if s.len > 60 {
+        buf_bytes(block, s[0..60]);
+        buf_bytes(block, "...");
+    } else {
+        buf_bytes(block, s);
+    }
+    buf_byte(block, '\'');
+}
+
+// Whether jobs a (level la) and b (level lb) agree: stdout (without the
+// runtime's lines), the exit status and the first line of stderr. A
+// property's cases agree when both ran them (lb runs the first 20).
+// Else a DIFF line into block.
+fn put_level_difference(block: i64, kind: i64, name: [u8], a: i64, b: i64, la: *u8, lb: *u8,
+    root: *u8, tests: *u8, shown: *u8) -> bool {
+    unsafe {
+        let ga = file_text(JOBS[a].out);
+        let gb = file_text(JOBS[b].out);
+        let ea = first_line(normal(file_text(JOBS[a].err)));
+        let eb = first_line(normal(file_text(JOBS[b].err)));
+        let sa = JOBS[a].status;
+        let sb = JOBS[b].status;
+        if sa == -1 || sb == -1 {
+            // (a time limit: the levels need not stop at the same place)
+            return true;
+        }
+        if kind != CASE && kind != TEST {
+            // (a failure beyond the cases lb ran is not a difference)
+            let pa = runtime_line(ga, "property", 0);
+            if sa != 0 && sb == 0 && pa.len > 0 && case_number(pa) > LEVEL_CASES {
+                return true;
+            }
+        }
+        let oa = program_lines(ga);
+        let ob = program_lines(gb);
+        if sa == sb && oa == ob && ea == eb {
+            return true;
+        }
+        buf_bytes(block, "DIFF ");
+        buf_bytes(block, name);
+        buf_bytes(block, ": ");
+        buf_str(block, lb);
+        buf_bytes(block, " and ");
+        buf_str(block, la);
+        buf_bytes(block, " differ ");
+        if oa != ob {
+            var i = 0;
+            var j = 0;
+            var ln = 1;
+            while i < oa.len && j < ob.len && oa[i..line_end(oa, i)] == ob[j..line_end(ob, j)] {
+                i = line_end(oa, i) + 1;
+                j = line_end(ob, j) + 1;
+                ln += 1;
+            }
+            buf_bytes(block, "at stdout line ");
+            buf_int(block, ln);
+            buf_bytes(block, ": ");
+            quoted(block, if j < ob.len { ob[j..line_end(ob, j)] } else { "(end)" });
+            buf_bytes(block, " against ");
+            quoted(block, if i < oa.len { oa[i..line_end(oa, i)] } else { "(end)" });
+        } else if sa != sb {
+            buf_bytes(block, "in the exit status: ");
+            buf_int(block, sb);
+            buf_bytes(block, " against ");
+            buf_int(block, sa);
+        } else {
+            buf_bytes(block, "on stderr: ");
+            quoted(block, eb);
+            buf_bytes(block, " against ");
+            quoted(block, ea);
+        }
+        buf_bytes(block, ". A compiler bug, not this program's\n");
+        buf_bytes(block, "  try: ");
+        buf_str(block, PROG);
+        buf_bytes(block, " reduce ");
+        buf_str(block, root);
+        buf_bytes(block, " --differs");
+        if kind == CASE {
+            if file_exists(case_file(tests, name, ".in")) {
+                buf_bytes(block, " --input ");
+                buf_str(block, shown);
+                buf_byte(block, '/');
+                buf_bytes(block, name);
+                buf_bytes(block, ".in");
+            }
+        } else {
+            buf_bytes(block, " --test ");
+            buf_bytes(block, name);
+        }
+        buf_byte(block, '\n');
+        false
+    }
+}
+
+// `case K of N, ...`: K.
+fn case_number(p: [u8]) -> i64 {
+    var i = 0;
+    while i < p.len && (p[i] < '0' || p[i] > '9') {
+        i += 1;
+    }
+    var n = 0;
+    while i < p.len && p[i] >= '0' && p[i] <= '9' {
+        n = n * 10 + (p[i] - '0') as i64;
+        i += 1;
+    }
+    n
+}

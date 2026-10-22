@@ -1,0 +1,991 @@
+// The middle-end IR (used from -O1 on): every function is a control flow
+// graph of basic blocks; instructions compute typed scalar values in SSA
+// form; memory is explicit (loads, stores and copies through addresses).
+//
+// A value is the id of the instruction that defines it (an index in
+// INSTS; 0 is "no value"). Types are the checker's scalar types: the
+// integers, f32, f64 and bool; pointers, function values and the
+// addresses of compound values (structs, tuples, arrays) are TY_U64.
+// Integer values are kept canonical, as in the 0.1 code generator: sign-
+// or zero-extended to 64 bits, so every operation is a 64-bit operation
+// followed by a normalization to the result type.
+//
+// Instructions (operands a, b, c are values; imm and imm2 immediates):
+//   CONST   imm = the value (a float as the bits of an f64, rounded to f32
+//           first for f32, as in consteval.vl)
+//   PARAM   imm = the index of the parameter (-1: the result pointer of a
+//           function returning a compound value)
+//   SLOT    imm = a frame slot (SLOTS): its address
+//   GADDR   imm = the name of a static: its address
+//   SADDR   imm = a string literal: its address
+//   FADDR   imm = a function (FNS): its address
+//   PHI     one operand per predecessor of its block, in order (ARGS)
+//   ADD SUB MUL DIV REM AND OR XOR SHL SHR   a <op> b, of type ty (floats
+//           for ADD..DIV; SHL/SHR: a of type ty, b any integer)
+//   NEG     -a;  NOT  !a (a bool);  BNOT  ~a
+//   CMP     a <cond> b, operands of type imm2;
+//           the result is a bool
+//   CONV    a converted from type imm2 to ty
+//   LOAD    the value of type ty at a + imm
+//   STORE   stores b (of type imm2) at a + imm
+//   COPY    copies imm bytes from b to a (small sizes; larger copies are
+//           calls to memcpy)
+//   CALL    calls function imm (FNS) with the operands in ARGS
+//   CALLI   calls the function value a, of function type imm
+//   CALLC   calls the C library function named by symbol imm
+//           For calls: ty is the result type (0: none); c is the result
+//           pointer for a compound result; ARGTY holds the type of each
+//           argument as the callee sees it (negated for the `...` of a
+//           variadic function: an aggregate passed in pieces there has its
+//           negated type on the first, VARIADIC_PIECE on the others).
+//   Vectors (0.10; ty or imm2 a vector type, a value of 16 bytes in a
+//   float register; LOAD and STORE move them too):
+//   VBIN    a <imm> b lanewise, imm = ADD SUB MUL DIV (floats) AND OR XOR
+//   VCMP    a <cond> b lanewise, operands of vector type imm2; ty is the
+//           mask type (each lane -1 or 0)
+//   VSPLAT  every lane = a;  VNEG  -a lanewise
+//   VEXT    lane imm of a (ty: the lane type, canonical)
+//   VINS    a with lane imm = b
+//   VSUM    the sum of a's lanes (floats: pairwise)
+//   VSEL    (b & a) | (c & ~a) on the bits: a is a mask, b and c of type ty
+//   SEL     a ? b : c (0.15): a a bool, b and c of the integer type ty
+//
+// Block terminators: JUMP s0; BRANCH cond ? s0 : s1; RET cond (0: no
+// value; for an aggregate returned in registers, its address); UNREACH;
+// SWITCH on the integer cond: its cases (value, block) are pairs in
+// SWCASES (`cases`, `ncases` pairs), s0 is the default; its distinct
+// successors (the default first) are listed in SWCASES at `succs`
+// (`nsucc` of them), and each has the block once among its predecessors.
+// Instructions of a block form a doubly linked list (phis first).
+
+pub mod cfg;
+pub mod print;
+pub mod verify;
+pub mod atomic;
+
+// (The numbering is the 0.3 one: GVN hashes the opcode.)
+use Op::{
+    Add, And, BNot, Call, CallC, CallI, Cmp, Const, Conv, Copy, Div, FAddr, FMath, GAddr, Lea, Load,
+    LoadX, MAdd, MSub, Mul, MulH, Neg, Not, Or, Pack, Param, Phi, Piece, Rem, SAddr, Select, ShOp,
+    Shl, Shr, Store, StoreX, Sub, Test, Ubfx, VBin, VCmp, VExt, VIns, VNeg, VSel, VSplat, VSum, Xor,
+};
+use crate::back::codecache::{R_IR, cc_note};
+use crate::base::{IntVec, alloc_array, free, grow, realloc};
+use crate::front::lexer::Tok;
+use crate::front::types::{
+    FN_COUNT, TY_BOOL, TY_U64, is_fieldless_enum, is_float, is_integer, is_vector, is_void,
+    scalar_type,
+};
+use crate::middle::ctx::FnCtx;
+
+pub enum Op {
+    None = 0,
+    Const = 1, Param = 2, Slot = 3, GAddr = 4, SAddr = 5, FAddr = 6, Phi = 7,
+    Add = 10, Sub = 11, Mul = 12, Div = 13, Rem = 14, And = 15, Or = 16, Xor = 17,
+    Shl = 18, Shr = 19,
+    Neg = 20, Not = 21, BNot = 22, Cmp = 23, Conv = 24,
+    Load = 25, Store = 26, Copy = 27, Call = 28, CallI = 29, CallC = 30,
+    // An aggregate result in registers (0.5): PIECE k of call `a` (defined
+    // by the call, in the block after it); PACK, the operand of a RET, the
+    // pieces returned (its operands).
+    Piece = 31, Pack = 32,
+    // Machine operations, made by instruction selection (isel.vl)
+    // just before register allocation; nothing else sees them.
+    LoadX = 33, StoreX = 34, Lea = 35, MAdd = 36, MSub = 37, ShOp = 38, Ubfx = 39,
+    Test = 40, Select = 41, FMath = 42,
+    // Vectors (0.10), not machine operations.
+    VBin = 43, VCmp = 44, VSplat = 45, VExt = 46, VIns = 47, VSum = 48, VNeg = 49, VSel = 50,
+    // (0.11) A machine operation of instruction selection: the high 64 bits
+    // of the 128-bit product of a and b (signed when imm is 1), for
+    // divisions by constants.
+    MulH = 51,
+    // (0.15) SEL: a ? b : c, a a bool, b and c integers of type ty (made
+    // by if-conversion in loops, ifconv.vl; isel.vl makes it a SELECT).
+    Sel = 52,
+    // (0.16) Bit counts of a (a u64), an i64: imm BITS_ONES the 1 bits,
+    // BITS_LEADING the zeros above the highest 1, BITS_TRAILING those below
+    // the lowest (64 for 0). std's count_ones, leading_zeros and
+    // trailing_zeros on AArch64 (cnt, clz, rbit and clz); elsewhere the
+    // calls stay (their bodies count by halves).
+    Bits = 53,
+    // (0.16) VMACW: a + b * c lanewise for a vector a of two u64 lanes, b
+    // the two u32 of an 8-byte value (an f64 load of them: memory is read
+    // by an ordinary load) widened, and c's lanes below 2^32 (the low 32
+    // bits of its first lane are used for both). AArch64's umlal; made by
+    // the vectorizer for `out[j] += k * (b[j] as u64)` (bigint kernels).
+    VMacW = 54,
+    // (0.18.1) RTID: a number only the run-time helper reads (a check's
+    // site, or its kind past the fixed ones), the program's numbering of
+    // which is made at the join, in the order of the code (code generation's
+    // own). imm: (function << 20) | k, the function's k-th (FN_RTIDS): the
+    // same in every build of the function, whatever was added elsewhere.
+    RtId = 55,
+    // (0.19, std::arch: docs/design/arch.md §5) INTR: intrinsic imm (its
+    // table id, arch/mod.vl) on a, b, c (its register parameters, in
+    // order), imm2 its immediates (16 bits each, in parameter order); pure,
+    // its one instruction (the table's template). INTRMEM: the same reading
+    // or writing memory: address a, the bytes it touches in aux. VCONST: a
+    // constant vector, imm the index of its bytes in the program's pool.
+    // CPUFEAT: whether the running CPU has feature imm (a bool; pure, the
+    // value never changes in a run), expanded late into a load and a bit
+    // test. HINT: a hint imm (prefetch, spin_loop) on a, kept but no write.
+    Intr = 56, IntrMem = 57, VConst = 58, CpuFeat = 59, Hint = 60,
+    // (0.21) Concurrency (ir/atomic.vl; docs/design/concurrency.md §4.1),
+    // numbered apart from 0.19's operations. ATOMIC: an atomic access of
+    // the ty-sized value at address a (b the value or the new one, c the
+    // expected one of a CAS); imm = kind | order << 8; the result is the
+    // old value (LOAD: the value; STORE: none). FENCE: imm = order |
+    // FENCE_COMPILER. TLSADDR: the address of thread-local static imm in
+    // the running thread.
+    Atomic = 70, Fence = 71, TlsAddr = 72,
+}
+
+// The comparison of a CMP instruction (and of the -O0 code generator's
+// compare-and-branch).
+pub enum Cond { Eq, Ne, Lt, Le, Gt, Ge }
+
+// Block terminators; None while a block is being built.
+pub enum Term { None, Jump, Branch, Ret, Unreach, Switch }
+
+pub const VARIADIC_PIECE: i64 = -1073741824;
+
+// The counts of a BITS instruction (its imm).
+pub const BITS_ONES: i64 = 0;
+pub const BITS_LEADING: i64 = 1;
+pub const BITS_TRAILING: i64 = 2;
+
+// Copies up to this many bytes are inline loads and stores; larger ones
+// call memcpy.
+pub const INLINE_COPY_MAX: i64 = 128;
+
+pub struct Inst {
+    op: Op, cond: Cond, ty: i64,
+    a: i64, b: i64, c: i64,
+    imm: i64, imm2: i64,
+    args: i64, nargs: i64,
+    block: i64, prev: i64, next: i64,
+    // The value this one was replaced by (0: none); see ir_val.
+    repl: i64,
+    // Scratch fields for the passes.
+    mark: i64, aux: i64,
+    // Machine operations: the shift of an index (LOADX, STOREX, LEA), the
+    // kind of comparison (SELECT: 0 compare, 1 test).
+    scale: i64,
+}
+
+pub struct Block {
+    first: i64, last: i64,
+    preds: IntVec,
+    term: Term, cond: i64, s0: i64, s1: i64,
+    // SSA construction: whether every predecessor is known, and the
+    // incomplete phis (see lower.vl).
+    sealed: i64, incomplete: i64,
+    func: i64, removed: i64,
+    // Scratch fields for the passes and the back end.
+    order: i64, idom: i64, mark: i64, aux: i64, loop_depth: i64,
+    // The header of a loop the vectorizer made a scalar remainder of (or
+    // one copied from such): not vectorized again (0.10).
+    novec: i64,
+    // How often the block ran in the profile (--profile-use, 0.10; see
+    // profile.vl), or -1.
+    count: i64,
+    // SWITCH terminators.
+    cases: i64, ncases: i64, succs: i64, nsucc: i64,
+}
+
+struct IRFunc {
+    f: i64, item: i64, entry: i64,
+    blocks: IntVec,
+    slots: IntVec,
+    // The PARAM holding the result pointer (functions returning a compound
+    // value), or 0.
+    result_ptr: i64,
+    // (0.17) Its tables, while another function is the current one (see
+    // ir_enter).
+    t: IRTables,
+}
+
+// (0.17) The IR tables of one function: its instructions, blocks, frame
+// slots, operand lists, switch cases and (-g) source positions. Ids are
+// local to the function (0 is "none" in each table), so a function's IR
+// can be built, optimized, emitted and freed on its own, and, from 0.18,
+// on a thread of its own. The current function's tables are the statics
+// INSTS, BLOCKS, SLOTS, ARGS, ARGTY, SWCASES and INST_LOC (with their
+// counts), where every pass reads them; ir_enter switches to another
+// function's, and the inliner reads a callee's through ir_view.
+pub struct IRTables {
+    insts: *Inst, inst_count: i64, inst_cap: i64,
+    blocks: *Block, block_count: i64, block_cap: i64,
+    slots: *Slot, slot_count: i64, slot_cap: i64,
+    args: IntVec, argty: IntVec, swcases: IntVec, inst_loc: IntVec,
+}
+
+// A frame slot: memory in the function's frame; `ty` is the checker type
+// of the value it holds (0 when unknown), for scalar replacement.
+pub struct Slot { size: i64, align: i64, offset: i64, escapes: i64, ty: i64 }
+
+pub static var IRFUNCS: *IRFunc = 0 as *IRFunc;
+pub static var IRFUNC_COUNT: i64 = 0;
+static var IRFUNC_CAP: i64 = 0;
+// Per function (FNS index): its IRFUNCS index + 1, or 0.
+pub static var FN_IR: *i64 = 0 as *i64;
+
+pub static var IR_LOC: i64 = 0;
+// (0.17) Whether INST_LOC is kept: -g, or --trace (middle/trace.vl).
+pub static var IR_LOCS: bool = false;
+// (0.17, --trace) Calls (and failed checks) take the position of the
+// expression lowered last before them, + 1 (0: the statement's), when
+// IR_CALL_LOCS: the line of `v[i]` in a statement of several lines.
+pub static var IR_CALL_LOCS: bool = false;
+pub static var IR_EXPR_LOC: i64 = 0;
+
+pub static var CUR: i64 = 0;
+
+pub fn init_ir(cx: sink *FnCtx) {
+    unsafe {
+        cx.ir_cur = -1;
+        FN_IR = alloc_array::<i64>(FN_COUNT + 1);
+    }
+}
+
+// (0.17) Makes function fi's tables the current ones (INSTS, BLOCKS, ...),
+// and fi the function being built (IRF).
+pub fn ir_enter(cx: sink *FnCtx, fi: i64) {
+    unsafe {
+        if cx.ir_cur != fi {
+            // (0.18.1: another function's IR, read by a task: for the code
+            // cache, back::codecache)
+            cc_note(cx, R_IR, fi);
+            ir_save(cx);
+            let t = IRFUNCS[fi].t;
+            cx.insts = t.insts;
+            cx.inst_count = t.inst_count;
+            cx.inst_cap = t.inst_cap;
+            cx.blocks = t.blocks;
+            cx.block_count = t.block_count;
+            cx.block_cap = t.block_cap;
+            cx.slots = t.slots;
+            cx.slot_count = t.slot_count;
+            cx.slot_cap = t.slot_cap;
+            cx.args = t.args;
+            cx.argty = t.argty;
+            cx.swcases = t.swcases;
+            cx.inst_loc = t.inst_loc;
+            cx.ir_cur = fi;
+        }
+        cx.irf = fi;
+    }
+}
+
+// (0.17) Function g's tables, to read (and mark, through aux) while
+// another function is current: the inliner copies a callee g into its
+// caller. g is not the current function.
+pub fn ir_view(g: i64) -> IRTables {
+    unsafe { IRFUNCS[g].t }
+}
+
+// (0.17) Gives back the room the current function's tables have beyond
+// what it uses (each table starts at 64 entries and doubles; a block's
+// predecessor list too): after the function is lowered, and at -O2 once
+// its component is optimized, the IR kept for later is its size.
+pub fn ir_shrink(cx: sink *FnCtx) {
+    unsafe {
+        cx.insts = shrink_array(cx.insts, cx.inst_count, &cx.inst_cap);
+        cx.blocks = shrink_array(cx.blocks, cx.block_count, &cx.block_cap);
+        cx.slots = shrink_array(cx.slots, cx.slot_count, &cx.slot_cap);
+        shrink_vec(&cx.args);
+        shrink_vec(&cx.argty);
+        shrink_vec(&cx.swcases);
+        shrink_vec(&cx.inst_loc);
+        for b in 0..cx.block_count {
+            shrink_vec(&cx.blocks[b].preds);
+        }
+        shrink_vec(&IRFUNCS[cx.ir_cur].blocks);
+        shrink_vec(&IRFUNCS[cx.ir_cur].slots);
+    }
+}
+
+// An array of `count` used elements of capacity *cap, reallocated to its
+// size when the room left is worth it.
+fn shrink_array<T>(data: *T, count: i64, cap: *i64) -> *T {
+    unsafe {
+        if *cap <= count + count / 4 + 4 {
+            return data;
+        }
+        let n = if count < 1 { 1 } else { count };
+        let p = realloc(data as *u8, (n * size_of(T)) as u64);
+        if p == 0 as *u8 {
+            return data;
+        }
+        *cap = n;
+        p as *T
+    }
+}
+
+fn shrink_vec(v: *IntVec) {
+    unsafe {
+        if (*v).cap > 0 {
+            (*v).data = shrink_array((*v).data, (*v).count, &(*v).cap);
+        }
+    }
+}
+
+// (0.17) The room the IR's tables take (every function's, in bytes): for
+// --time-passes.
+pub fn ir_tables_bytes(cx: sink *FnCtx) -> i64 {
+    unsafe {
+        ir_save(cx);
+        var total = 0;
+        for fi in 0..IRFUNC_COUNT {
+            let t = IRFUNCS[fi].t;
+            total += t.inst_cap * size_of(Inst) + t.block_cap * size_of(Block)
+                + t.slot_cap * size_of(Slot)
+                + (t.args.cap + t.argty.cap + t.swcases.cap + t.inst_loc.cap) * 8;
+            for b in 0..t.block_count {
+                total += t.blocks[b].preds.cap * 8;
+            }
+            total += (IRFUNCS[fi].blocks.cap + IRFUNCS[fi].slots.cap) * 8;
+        }
+        total
+    }
+}
+
+// The current function's tables, back into its IRFunc.
+fn ir_save(cx: sink *FnCtx) {
+    unsafe {
+        if cx.ir_cur >= 0 {
+            IRFUNCS[cx.ir_cur].t = IRTables {
+                insts: cx.insts, inst_count: cx.inst_count, inst_cap: cx.inst_cap,
+                blocks: cx.blocks, block_count: cx.block_count, block_cap: cx.block_cap,
+                slots: cx.slots, slot_count: cx.slot_count, slot_cap: cx.slot_cap,
+                args: cx.args, argty: cx.argty, swcases: cx.swcases, inst_loc: cx.inst_loc,
+            };
+        }
+    }
+}
+
+// (0.18.1) The current function's tables back into its IRFunc, and none
+// current: what a task does when it ends (middle::parallel), and the main
+// thread before a phase, so that no context keeps another's function
+// current (it would read stale tables, and write them back on its next
+// ir_enter).
+pub fn ir_release(cx: sink *FnCtx) {
+    unsafe {
+        ir_save(cx);
+        cx.ir_cur = -1;
+    }
+}
+
+// (0.17) Frees function fi's IR (once it is emitted, or dropped); fi is
+// not current afterwards.
+pub fn ir_free_func(cx: sink *FnCtx, fi: i64) {
+    unsafe {
+        ir_enter(cx, fi);
+        for b in 0..cx.block_count {
+            free(cx.blocks[b].preds.data as *u8);
+        }
+        free(cx.insts as *u8);
+        free(cx.blocks as *u8);
+        free(cx.slots as *u8);
+        free(cx.args.data as *u8);
+        free(cx.argty.data as *u8);
+        free(cx.swcases.data as *u8);
+        free(cx.inst_loc.data as *u8);
+        free(IRFUNCS[fi].blocks.data as *u8);
+        free(IRFUNCS[fi].slots.data as *u8);
+        IRFUNCS[fi].blocks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        IRFUNCS[fi].slots = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        IRFUNCS[fi].t = empty_tables();
+        cx.ir_cur = -1;
+        cx.insts = 0 as *Inst;
+        cx.inst_count = 0;
+        cx.inst_cap = 0;
+        cx.blocks = 0 as *Block;
+        cx.block_count = 0;
+        cx.block_cap = 0;
+        cx.slots = 0 as *Slot;
+        cx.slot_count = 0;
+        cx.slot_cap = 0;
+        cx.args = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        cx.argty = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        cx.swcases = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        cx.inst_loc = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    }
+}
+
+fn empty_tables() -> IRTables {
+    IRTables {
+        insts: 0 as *Inst, inst_count: 0, inst_cap: 0,
+        blocks: 0 as *Block, block_count: 0, block_cap: 0,
+        slots: 0 as *Slot, slot_count: 0, slot_cap: 0,
+        args: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        argty: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        swcases: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        inst_loc: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+    }
+}
+
+fn empty_block(func: i64) -> Block {
+    Block {
+        first: 0, last: 0, preds: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        term: Term::None, cond: 0, s0: 0, s1: 0, sealed: 0, incomplete: 0, func: func, removed: 0,
+        order: 0, idom: 0, mark: 0, aux: 0, loop_depth: 0, novec: 0, count: -1,
+        cases: 0, ncases: 0, succs: 0, nsucc: 0,
+    }
+}
+
+// The IR type of a value of checker type `t` (0 for unit and `!`).
+pub fn ir_type(t: i64) -> i64 {
+    if is_void(t) {
+        return 0;
+    }
+    if is_integer(t) || is_float(t) || t == TY_BOOL || is_vector(t) {
+        return t;
+    }
+    if is_fieldless_enum(t) {
+        return scalar_type(t);
+    }
+    TY_U64
+}
+
+// ---- Functions, blocks and slots ----
+
+// A new IR function for FNS entry f (its item: the Fn node), current from
+// now on, with its tables' "none" entries (instruction, block and slot 0).
+pub fn ir_new_func(cx: sink *FnCtx, f: i64, item: i64) -> i64 {
+    unsafe {
+        IRFUNCS = grow(IRFUNCS, IRFUNC_COUNT, &IRFUNC_CAP);
+        let id = IRFUNC_COUNT;
+        IRFUNCS[id] = IRFunc {
+            f: f, item: item, entry: 0,
+            blocks: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            slots: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            result_ptr: 0,
+            t: empty_tables(),
+        };
+        IRFUNC_COUNT += 1;
+        FN_IR[f] = id + 1;
+        ir_enter(cx, id);
+        cx.insts = grow(cx.insts, cx.inst_count, &cx.inst_cap);
+        cx.insts[0] = Inst {
+            op: Op::None, cond: Cond::Eq, ty: 0, a: 0, b: 0, c: 0, imm: 0, imm2: 0, args: 0,
+            nargs: 0,
+            block: 0, prev: 0, next: 0, repl: 0, mark: 0, aux: 0, scale: 0
+        };
+        cx.inst_count = 1;
+        if IR_LOCS {
+            cx.inst_loc.push(0);
+        }
+        cx.blocks = grow(cx.blocks, cx.block_count, &cx.block_cap);
+        cx.blocks[0] = empty_block(0);
+        cx.block_count = 1;
+        cx.slots = grow(cx.slots, cx.slot_count, &cx.slot_cap);
+        cx.slots[0] = Slot { size: 0, align: 1, offset: 0, escapes: 0, ty: 0 };
+        cx.slot_count = 1;
+        cx.args.push(0);
+        cx.argty.push(0);
+        id
+    }
+}
+
+pub fn ir_new_block(cx: sink *FnCtx) -> i64 {
+    unsafe {
+        cx.blocks = grow(cx.blocks, cx.block_count, &cx.block_cap);
+        let b = cx.block_count;
+        cx.blocks[b] = empty_block(cx.irf);
+        cx.block_count += 1;
+        IRFUNCS[cx.irf].blocks.push(b);
+        b
+    }
+}
+
+pub fn ir_new_slot(cx: sink *FnCtx, size: i64, align: i64) -> i64 {
+    unsafe {
+        cx.slots = grow(cx.slots, cx.slot_count, &cx.slot_cap);
+        let s = cx.slot_count;
+        var a = align;
+        if a < 1 {
+            a = 1;
+        }
+        cx.slots[s] = Slot { size: size, align: a, offset: 0, escapes: 0, ty: 0 };
+        cx.slot_count += 1;
+        IRFUNCS[cx.irf].slots.push(s);
+        s
+    }
+}
+
+// ---- Instructions ----
+
+// A new instruction, not yet in a block.
+pub fn ir_make(cx: sink *FnCtx, op: Op, ty: i64, a: i64, b: i64, imm: i64) -> i64 {
+    unsafe {
+        cx.insts = grow(cx.insts, cx.inst_count, &cx.inst_cap);
+        let v = cx.inst_count;
+        cx.insts[v] = Inst {
+            op: op, cond: Cond::Eq, ty: ty, a: a, b: b, c: 0, imm: imm, imm2: 0, args: 0, nargs: 0,
+            block: 0, prev: 0, next: 0, repl: 0, mark: 0, aux: 0, scale: 0
+        };
+        cx.inst_count += 1;
+        if IR_LOCS {
+            let fine = IR_CALL_LOCS && IR_EXPR_LOC > 0 && op.is_call();
+            cx.inst_loc.push(if fine { IR_EXPR_LOC } else { IR_LOC });
+        }
+        v
+    }
+}
+
+// (0.17) A scratch instruction, not part of the function: the entry after
+// its last one (the next ir_make takes it), for a pure computation over
+// an instruction's fields (folding) that must not take an id.
+pub fn ir_scratch(cx: sink *FnCtx, op: Op, ty: i64) -> i64 {
+    unsafe {
+        cx.insts = grow(cx.insts, cx.inst_count, &cx.inst_cap);
+        cx.insts[cx.inst_count] = Inst {
+            op: op, cond: Cond::Eq, ty: ty, a: 0, b: 0, c: 0, imm: 0, imm2: 0, args: 0, nargs: 0,
+            block: 0, prev: 0, next: 0, repl: 0, mark: 0, aux: 0, scale: 0
+        };
+        cx.inst_count
+    }
+}
+
+// Appends instruction `v` to block `b`.
+pub fn ir_append(cx: sink *FnCtx, b: i64, v: i64) {
+    unsafe {
+        let last = cx.blocks[b].last;
+        cx.insts[v].block = b;
+        cx.insts[v].prev = last;
+        cx.insts[v].next = 0;
+        if last == 0 {
+            cx.blocks[b].first = v;
+        } else {
+            cx.insts[last].next = v;
+        }
+        cx.blocks[b].last = v;
+    }
+}
+
+// Inserts instruction `v` at the start of block `b`.
+pub fn ir_prepend(cx: sink *FnCtx, b: i64, v: i64) {
+    unsafe {
+        let first = cx.blocks[b].first;
+        cx.insts[v].block = b;
+        cx.insts[v].prev = 0;
+        cx.insts[v].next = first;
+        if first == 0 {
+            cx.blocks[b].last = v;
+        } else {
+            cx.insts[first].prev = v;
+        }
+        cx.blocks[b].first = v;
+    }
+}
+
+// Inserts instruction `v` before instruction `at` (in the same block).
+pub fn ir_insert_before(cx: sink *FnCtx, at: i64, v: i64) {
+    unsafe {
+        let b = cx.insts[at].block;
+        let prev = cx.insts[at].prev;
+        cx.insts[v].block = b;
+        cx.insts[v].prev = prev;
+        cx.insts[v].next = at;
+        cx.insts[at].prev = v;
+        if prev == 0 {
+            cx.blocks[b].first = v;
+        } else {
+            cx.insts[prev].next = v;
+        }
+    }
+}
+
+// Removes instruction `v` from its block (it stays in INSTS).
+pub fn ir_unlink(cx: sink *FnCtx, v: i64) {
+    unsafe {
+        let b = cx.insts[v].block;
+        let prev = cx.insts[v].prev;
+        let next = cx.insts[v].next;
+        if prev == 0 {
+            cx.blocks[b].first = next;
+        } else {
+            cx.insts[prev].next = next;
+        }
+        if next == 0 {
+            cx.blocks[b].last = prev;
+        } else {
+            cx.insts[next].prev = prev;
+        }
+        cx.insts[v].block = 0;
+        cx.insts[v].prev = 0;
+        cx.insts[v].next = 0;
+    }
+}
+
+// The value `v` stands for now (following replacements).
+pub fn ir_val(cx: sink *FnCtx, v: i64) -> i64 {
+    unsafe {
+        var r = v;
+        while r != 0 && cx.insts[r].repl != 0 {
+            r = cx.insts[r].repl;
+        }
+        // Path compression.
+        var w = v;
+        while w != 0 && cx.insts[w].repl != 0 && cx.insts[w].repl != r {
+            let next = cx.insts[w].repl;
+            cx.insts[w].repl = r;
+            w = next;
+        }
+        r
+    }
+}
+
+// Replaces every use of `v` by `by` (and removes `v` from its block).
+pub fn ir_replace(cx: sink *FnCtx, v: i64, by: i64) {
+    unsafe {
+        if v == by {
+            return;
+        }
+        cx.insts[v].repl = by;
+        if cx.insts[v].block != 0 {
+            ir_unlink(cx, v);
+        }
+    }
+}
+
+// Appends an instruction to the current block.
+pub fn emit_ir(cx: sink *FnCtx, op: Op, ty: i64, a: i64, b: i64, imm: i64) -> i64 {
+    let v = ir_make(cx, op, ty, a, b, imm);
+    ir_append(cx, CUR, v);
+    v
+}
+
+pub fn ir_const(cx: sink *FnCtx, value: i64, ty: i64) -> i64 {
+    emit_ir(cx, Const, ty, 0, 0, value)
+}
+
+pub fn ir_binary(cx: sink *FnCtx, op: Op, ty: i64, a: i64, b: i64) -> i64 {
+    emit_ir(cx, op, ty, a, b, 0)
+}
+
+pub fn ir_cmp(cx: sink *FnCtx, cond: Cond, operand_ty: i64, a: i64, b: i64) -> i64 {
+    let v = emit_ir(cx, Cmp, TY_BOOL, a, b, 0);
+    unsafe {
+        cx.insts[v].cond = cond;
+        cx.insts[v].imm2 = operand_ty;
+    }
+    v
+}
+
+pub fn ir_load(cx: sink *FnCtx, ty: i64, addr: i64, offset: i64) -> i64 {
+    emit_ir(cx, Load, ty, addr, 0, offset)
+}
+
+pub fn ir_store(cx: sink *FnCtx, ty: i64, addr: i64, value: i64, offset: i64) {
+    let v = emit_ir(cx, Store, 0, addr, value, offset);
+    unsafe { cx.insts[v].imm2 = ty; }
+}
+
+pub fn ir_slot_addr(cx: sink *FnCtx, slot: i64) -> i64 {
+    emit_ir(cx, Op::Slot, TY_U64, 0, 0, slot)
+}
+
+// addr + offset (no instruction for 0).
+pub fn ir_offset(cx: sink *FnCtx, addr: i64, offset: i64) -> i64 {
+    if offset == 0 {
+        return addr;
+    }
+    ir_binary(cx, Add, TY_U64, addr, ir_const(cx, offset, TY_U64))
+}
+
+// (0.18.1) The classes of RTID values: a check's site, a check's kind.
+pub const RT_SITE: i64 = 1;
+pub const RT_KIND: i64 = 2;
+
+// Per IR function: its RTID values, each (class << 56) | the front end's
+// number (a site of front/contracts/sites.vl, a kind of
+// gen0::target::ENUM_PANICS + 4), made when it is lowered.
+pub static var FN_RTIDS: *IntVec = 0 as *IntVec;
+static var FN_RTIDS_CAP: i64 = 0;
+
+// A value of class `class` and number `value` for the function being
+// lowered (an RTID instruction of type ty).
+pub fn ir_rtid(cx: sink *FnCtx, class: i64, value: i64, ty: i64) -> i64 {
+    unsafe {
+        let fi = cx.irf;
+        if fi >= FN_RTIDS_CAP {
+            let cap = if FN_RTIDS_CAP < 64 { 64 } else { FN_RTIDS_CAP * 2 } + fi;
+            let n = alloc_array::<IntVec>(cap);
+            for i in 0..FN_RTIDS_CAP {
+                n[i] = FN_RTIDS[i];
+            }
+            free(FN_RTIDS as *u8);
+            FN_RTIDS = n;
+            FN_RTIDS_CAP = cap;
+        }
+        let tagged = (class << 56) | value;
+        let list = &FN_RTIDS[fi];
+        var k = 0;
+        while k < (*list).count && (*list).data[k] != tagged {
+            k += 1;
+        }
+        if k == (*list).count {
+            (*list).push(tagged);
+        }
+        emit_ir(cx, Op::RtId, ty, 0, 0, (fi << 20) | k)
+    }
+}
+
+// The class and the front end's number of RTID imm `imm`.
+pub fn rtid_class(imm: i64) -> i64 {
+    unsafe { FN_RTIDS[imm >> 20].data[imm & 1048575] >> 56 }
+}
+
+pub fn rtid_value(imm: i64) -> i64 {
+    unsafe { FN_RTIDS[imm >> 20].data[imm & 1048575] & ((1 << 56) - 1) }
+}
+
+impl Op {
+    #[inline]
+    fn is_call(self) -> bool {
+        self == Call || self == CallI || self == CallC
+    }
+
+    // Whether an instruction may be removed when its value is unused (and
+    // moved or merged with an equal one, for those that read no memory).
+    fn has_side_effect(self) -> bool {
+        self == Store || self == StoreX || self == Copy || self.is_call() || self == Param
+            || self == Piece || self == Pack || self == Op::IntrMem || self == Op::Hint
+            || self == Op::Atomic || self == Op::Fence
+    }
+
+    // Instructions whose value is recomputed at each use by the back end
+    // instead of being kept in a register.
+    fn is_remat(self) -> bool {
+        self == Const || self == Op::Slot || self == GAddr || self == SAddr || self == FAddr
+            || self == Op::RtId
+    }
+
+    // The operations computed from their operands alone (no memory, no
+    // effects): arithmetic, comparisons, conversions.
+    fn is_pure(self) -> bool {
+        match self {
+            Add | Sub | Mul | Div | Rem | And | Or | Xor
+                | Shl | Shr | Neg | Not | BNot | Cmp | Conv | Op::Bits => true,
+            _ => false,
+        }
+    }
+
+    // The machine operations of instruction selection.
+    fn is_machine(self) -> bool {
+        (self as i64 >= LoadX as i64 && self as i64 <= FMath as i64) || self == MulH
+    }
+
+    // The vector operations (0.10): pure, computed from their operands
+    // alone, never trapping. (0.19) Also the intrinsics' INTR, VCONST and
+    // CPUFEAT, scalar ones included: GVN numbers them, LICM moves them, the
+    // vectorizer leaves their loops alone (explicit SIMD), emission goes
+    // through emit_vector. (Not is_pure: the scalar passes that evaluate or
+    // speculate pure operations do not know them.)
+    fn is_vector(self) -> bool {
+        self as i64 >= VBin as i64 && self as i64 <= VSel as i64 || self == Op::VMacW
+            || self == Op::Intr || self == Op::VConst || self == Op::CpuFeat
+    }
+
+    // The binary arithmetic and bitwise operations.
+    fn is_binary(self) -> bool {
+        match self {
+            Add | Sub | Mul | Div | Rem | And | Or | Xor
+                | Shl | Shr => true,
+            _ => false,
+        }
+    }
+}
+
+// Operand list `args` of a phi or call.
+pub fn ir_arg(cx: sink *FnCtx, v: i64, i: i64) -> i64 {
+    unsafe { cx.args.data[cx.insts[v].args + i] }
+}
+
+pub fn ir_set_arg(cx: sink *FnCtx, v: i64, i: i64, value: i64) {
+    unsafe { cx.args.data[cx.insts[v].args + i] = value; }
+}
+
+// The operands of `v` are ir_operand(v, i) for i below ir_operand_count(v)
+// (some may be 0): a, b, c, then the ARGS of phis and calls.
+#[inline]
+pub fn ir_operand_count(cx: sink *FnCtx, v: i64) -> i64 {
+    unsafe {
+        let op = cx.insts[v].op;
+        if op == Phi || op.is_call() || op == Pack || op == Select {
+            return cx.insts[v].nargs + 3;
+        }
+        3
+    }
+}
+
+// Operand `i` of `v` (0 when there is none): a, b, c, then the ARGS.
+#[inline]
+pub fn ir_operand(cx: sink *FnCtx, v: i64, i: i64) -> i64 {
+    unsafe {
+        if i == 0 { return cx.insts[v].a; }
+        if i == 1 { return cx.insts[v].b; }
+        if i == 2 { return cx.insts[v].c; }
+        ir_arg(cx, v, i - 3)
+    }
+}
+
+pub fn ir_set_operand(cx: sink *FnCtx, v: i64, i: i64, value: i64) {
+    unsafe {
+        if i == 0 { cx.insts[v].a = value; }
+        else if i == 1 { cx.insts[v].b = value; }
+        else if i == 2 { cx.insts[v].c = value; }
+        else { ir_set_arg(cx, v, i - 3, value); }
+    }
+}
+
+// Resolves every operand of `v` (and of the block's terminator).
+// (0.17: an operand not replaced is left as it is, without a write; the
+// passes resolve every instruction of a function many times over)
+pub fn ir_resolve_operands(cx: sink *FnCtx, v: i64) {
+    unsafe {
+        let a = cx.insts[v].a;
+        if a != 0 && cx.insts[a].repl != 0 {
+            cx.insts[v].a = ir_val(cx, a);
+        }
+        let b = cx.insts[v].b;
+        if b != 0 && cx.insts[b].repl != 0 {
+            cx.insts[v].b = ir_val(cx, b);
+        }
+        let c = cx.insts[v].c;
+        if c != 0 && cx.insts[c].repl != 0 {
+            cx.insts[v].c = ir_val(cx, c);
+        }
+        let op = cx.insts[v].op;
+        if op == Phi || op.is_call() || op == Pack || op == Select {
+            let base = cx.insts[v].args;
+            for i in 0..cx.insts[v].nargs {
+                let w = cx.args.data[base + i];
+                if w != 0 && cx.insts[w].repl != 0 {
+                    cx.args.data[base + i] = ir_val(cx, w);
+                }
+            }
+        }
+    }
+}
+
+// ---- Printing (--emit ir) ----
+
+impl Op {
+    fn name(self) -> *u8 {
+        match self {
+            Op::None => c"none",
+            Const => c"const",
+            Param => c"param",
+            Op::Slot => c"slot",
+            GAddr => c"gaddr",
+            SAddr => c"saddr",
+            FAddr => c"faddr",
+            Op::RtId => c"rtid",
+            Phi => c"phi",
+            Add => c"add",
+            Sub => c"sub",
+            Mul => c"mul",
+            Div => c"div",
+            Rem => c"rem",
+            And => c"and",
+            Or => c"or",
+            Xor => c"xor",
+            Shl => c"shl",
+            Shr => c"shr",
+            Neg => c"neg",
+            Not => c"not",
+            BNot => c"bnot",
+            Cmp => c"cmp",
+            Conv => c"conv",
+            Load => c"load",
+            Store => c"store",
+            Copy => c"copy",
+            Call => c"call",
+            CallI => c"calli",
+            CallC => c"callc",
+            Piece => c"piece",
+            Pack => c"pack",
+            LoadX => c"loadx",
+            StoreX => c"storex",
+            Lea => c"lea",
+            MAdd => c"madd",
+            MSub => c"msub",
+            ShOp => c"shop",
+            Ubfx => c"ubfx",
+            Test => c"test",
+            Select => c"select",
+            FMath => c"fmath",
+            VBin => c"vbin",
+            VCmp => c"vcmp",
+            VSplat => c"vsplat",
+            VExt => c"vext",
+            VIns => c"vins",
+            VSum => c"vsum",
+            VNeg => c"vneg",
+            VSel => c"vsel",
+            MulH => c"mulh",
+            Op::Sel => c"sel",
+            Op::Bits => c"bits",
+            Op::VMacW => c"vmacw",
+            Op::Intr => c"intr",
+            Op::IntrMem => c"intrmem",
+            Op::VConst => c"vconst",
+            Op::CpuFeat => c"cpufeat",
+            Op::Hint => c"hint",
+            Op::Atomic => c"atomic",
+            Op::Fence => c"fence",
+            Op::TlsAddr => c"tlsaddr",
+        }
+    }
+}
+
+impl Cond {
+    fn name(self) -> *u8 {
+        match self {
+            Cond::Eq => c"eq",
+            Cond::Ne => c"ne",
+            Cond::Lt => c"lt",
+            Cond::Le => c"le",
+            Cond::Gt => c"gt",
+            Cond::Ge => c"ge",
+        }
+    }
+
+    // The opposite comparison: !(a < b) is a >= b (for integers).
+    fn negate(self) -> Cond {
+        match self {
+            Cond::Eq => Cond::Ne,
+            Cond::Ne => Cond::Eq,
+            Cond::Lt => Cond::Ge,
+            Cond::Ge => Cond::Lt,
+            Cond::Gt => Cond::Le,
+            Cond::Le => Cond::Gt,
+        }
+    }
+
+    // The comparison with its operands swapped: a < b is b > a.
+    fn mirror(self) -> Cond {
+        match self {
+            Cond::Lt => Cond::Gt,
+            Cond::Gt => Cond::Lt,
+            Cond::Le => Cond::Ge,
+            Cond::Ge => Cond::Le,
+            _ => self,
+        }
+    }
+}
+
+// The comparison a comparison operator stands for.
+pub fn cond_of_token(op: Tok) -> Cond {
+    match op {
+        Tok::EqEq => Cond::Eq,
+        Tok::BangEq => Cond::Ne,
+        Tok::Lt => Cond::Lt,
+        Tok::LtEq => Cond::Le,
+        Tok::Gt => Cond::Gt,
+        _ => Cond::Ge,
+    }
+}

@@ -1,4 +1,4 @@
-# Writes a random tachyon program of divisions by constants (0.11): for
+# Writes a random vole program of divisions by constants (0.11): for
 # every integer type, quotients and remainders by random constants (small
 # ones, powers of two and their neighbours, the type's extremes, random ones
 # of every width, negative ones, 0, 1 and -1) of random values, of the
@@ -7,14 +7,14 @@
 # compiler cannot know (the constant plus a zero read at run time), which
 # stays a division instruction, and goes into a checksum; quotients and
 # remainders alone go into it too. At -O1 and -O2 a division by a constant
-# is a multiplication (isel.tach), at -O0 a division instruction: every
+# is a multiplication (isel.vl), at -O0 a division instruction: every
 # level must print the same checksum, and no FAIL line.
 #
 # usage: awk -v seed=N [-v count=K] [-v iterations=M] [-v curated=1] -f gendiv.awk
 #   count        constants per type (default 6)
 #   iterations   dividends per constant (default 2000), times four
 #   curated      the constants of curated_list below instead of random
-#                ones (tests/run/opt_divide_constant.tach is made this way)
+#                ones (tests/run/opt_divide_constant.vl is made this way)
 
 function rnd(n) { return int(rand() * n) }
 
@@ -99,7 +99,7 @@ function lit(t, v, neg) {
     return v t
 }
 
-# Curated divisors per type: each way of isel.tach's lowering (narrow and
+# Curated divisors per type: each way of isel.vl's lowering (narrow and
 # 64-bit, the add fix-up of 65-bit magic numbers, the corrections of signed
 # ones, powers of two, 0, 1, -1, the extremes).
 function curated_list(t) {

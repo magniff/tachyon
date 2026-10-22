@@ -1,0 +1,177 @@
+// std's UTF-8 core (0.20, compiler/std/str/utf8.vl): validation with
+// Rust's Utf8Error (the vectors of Rust's from_utf8 tests), decoding both
+// ways, encoding every scalar value, lossy decoding by maximal subparts
+// (Unicode's own example, Table 3-8), counting, the ASCII prefixes at
+// every alignment, char boundaries.
+use std::str::{
+    CodePoints, Utf8Decoder, Utf8Error, ascii_prefix_len, ascii_printable_prefix_len,
+    ceil_char_boundary, code_points, count_chars, decode_at, decode_into, encode_utf8,
+    floor_char_boundary, is_char_boundary, is_utf8, lossy_next, next_code_point,
+    next_code_point_reverse, utf8_len, validate_utf8,
+};
+
+fn show(v: [u8]) {
+    match validate_utf8(v) {
+        Ok(()) => println("ok"),
+        Err(e) => println(f"{e} | {e:?}"),
+    }
+}
+
+fn main(gpa: Gpa) -> i32 {
+    show("");
+    show("hello, κόσμε, 世界, 🌍");
+    show("\xc3"); // incomplete at the end
+    show("ab\xe2\x82"); // incomplete
+    show("ab\xe2\x82x"); // invalid: 2 bytes
+    show("\x80"); // a lone continuation
+    show("\xc0\xaf"); // overlong
+    show("\xe0\x80\xaf"); // overlong, 3 bytes
+    show("\xed\xa0\x80"); // a surrogate
+    show("\xf4\x90\x80\x80"); // above 0x10FFFF
+    show("\xf5\x80\x80\x80"); // never a lead byte
+    show("\xf0\x9f\x98\x80\xf0\x9f\x98"); // a whole emoji, then 3 of 4 bytes
+    show("\xf0\x9f\x98x"); // 3 bytes, then not a continuation
+
+    // Every scalar value: encode, then decode it back three ways.
+    var buf = [0u8; 4];
+    var bad = 0;
+    var total = 0;
+    var cp: u32 = 0;
+    while cp <= 0x10ffff {
+        if cp == 0xd800 {
+            cp = 0xe000;
+        }
+        let n = encode_utf8(cp, &buf);
+        let s = buf[0..n];
+        var p = 0;
+        var q = n;
+        if n != utf8_len(cp) || !is_utf8(s) || next_code_point(s, &p) != Some(cp) || p != n
+            || next_code_point_reverse(s, &q) != Some(cp) || q != 0
+            || decode_at(s, 0) != (cp as u64 | ((n as u64) << 32)) {
+            bad += 1;
+        }
+        total += n;
+        cp += 1;
+    }
+    println(f"scalars: {total} bytes, {bad} bad");
+    let n = encode_utf8(0xd800, &buf);
+    println(f"surrogate encodes as {n} bytes: {buf[0]:x} {buf[1]:x} {buf[2]:x}");
+
+    // Unicode 16, Table 3-8: U+FFFD for each maximal subpart.
+    let t = "\x61\xf1\x80\x80\xe1\x80\xc2\x62\x80\x63\x80\xbf\x64";
+    var p = 0;
+    while p < t.len {
+        print(f" {lossy_next(t, &p):x}");
+    }
+    println("");
+    var out = [0u32; 32];
+    let (c, m) = decode_into(t, &out[..]);
+    print(f"decode_into: {c} {m}:");
+    for k in 0..m {
+        print(f" {out[k]:x}");
+    }
+    println("");
+    // (an incomplete sequence at the end is left for the next buffer)
+    let (c, m) = decode_into("ab\xe2\x82", &out[..]);
+    println(f"cut: {c} {m}");
+    // ... which a decoder keeps across buffers
+    var d = Utf8Decoder::new();
+    let (c1, m1) = d.feed("ab\xe2", &out[..]);
+    let (c2, m2) = d.feed("\x82\xac!\xf0\x9f", &out[m1..]);
+    let m3 = d.finish(&out[m1 + m2..]);
+    print(f"stream: {c1} {m1} {c2} {m2} {m3}:");
+    for k in 0..m1 + m2 + m3 {
+        print(f" {out[k]:x}");
+    }
+    println("");
+
+    // Counting, iterating both ways.
+    let s = "añ€😀b";
+    println(f"count_chars: {count_chars(s)}");
+    var it = code_points(s);
+    print("forward:");
+    while let Some(c) = it.next() {
+        print(f" {c:x}");
+    }
+    var back = code_points(s);
+    print(" | back:");
+    while let Some(c) = back.next_back() {
+        print(f" {c:x}");
+    }
+    var both = code_points(s);
+    println(
+        f" | mixed: {both.next().unwrap():x} {both.next_back().unwrap():x} {both.next().unwrap():x} {both.next_back().unwrap():x} {both.next().unwrap():x} {both.next().is_none()} {both.next_back().is_none()}");
+    let sum = code_points(s).fold(0u32, |a, c| a + c);
+    println(f"sum: {sum:x}");
+
+    // Boundaries in "añ€" (a, then 2 bytes, then 3).
+    let b = "añ€";
+    for i in 0..b.len + 2 {
+        print(
+            f" {i}:{is_char_boundary(b, i)},{floor_char_boundary(b, i)},{ceil_char_boundary(b, i)}");
+    }
+    println("");
+
+    // The ASCII prefixes, at every offset and length of a 64-byte text
+    // with one byte changed (so every alignment of the word loop is met).
+    var text: Vec<u8> = Vec::new_in(gpa);
+    for i in 0..64 {
+        text.push((0x21 + i) as u8);
+    }
+    var wrong = 0;
+    for at in 0..64 {
+        for bad_byte in [0x80u8, 0x1f, 0x7f, 0xff, 0x09, 0x20, 0x7e] {
+            let old = text[at];
+            text[at] = bad_byte;
+            let all = text.as_slice();
+            for lo in 0..17 {
+                for hi in lo..65 {
+                    let v = all[lo..hi];
+                    var a = 0;
+                    while a < v.len && v[a] < 0x80 {
+                        a += 1;
+                    }
+                    var pr = 0;
+                    while pr < v.len && v[pr] >= 0x20 && v[pr] <= 0x7e {
+                        pr += 1;
+                    }
+                    if ascii_prefix_len(v) != a || ascii_printable_prefix_len(v) != pr {
+                        wrong += 1;
+                    }
+                }
+            }
+            text[at] = old;
+        }
+    }
+    println(f"prefixes: {wrong} wrong");
+    let e = match validate_utf8("\xff") { Err(e) => e, Ok(()) => return 1 };
+    println(
+        f"{e.valid_up_to()} {e.error_len().unwrap()} {e == Utf8Error { valid_up_to: 0, error_len: Some(1) }}");
+    0
+}
+
+// EXPECT: ok
+// EXPECT: ok
+// EXPECT: incomplete utf-8 byte sequence from index 0 | Utf8Error { valid_up_to: 0, error_len: None }
+// EXPECT: incomplete utf-8 byte sequence from index 2 | Utf8Error { valid_up_to: 2, error_len: None }
+// EXPECT: invalid utf-8 sequence of 2 bytes from index 2 | Utf8Error { valid_up_to: 2, error_len: Some(2) }
+// EXPECT: invalid utf-8 sequence of 1 bytes from index 0 | Utf8Error { valid_up_to: 0, error_len: Some(1) }
+// EXPECT: invalid utf-8 sequence of 1 bytes from index 0 | Utf8Error { valid_up_to: 0, error_len: Some(1) }
+// EXPECT: invalid utf-8 sequence of 1 bytes from index 0 | Utf8Error { valid_up_to: 0, error_len: Some(1) }
+// EXPECT: invalid utf-8 sequence of 1 bytes from index 0 | Utf8Error { valid_up_to: 0, error_len: Some(1) }
+// EXPECT: invalid utf-8 sequence of 1 bytes from index 0 | Utf8Error { valid_up_to: 0, error_len: Some(1) }
+// EXPECT: invalid utf-8 sequence of 1 bytes from index 0 | Utf8Error { valid_up_to: 0, error_len: Some(1) }
+// EXPECT: incomplete utf-8 byte sequence from index 4 | Utf8Error { valid_up_to: 4, error_len: None }
+// EXPECT: invalid utf-8 sequence of 3 bytes from index 0 | Utf8Error { valid_up_to: 0, error_len: Some(3) }
+// EXPECT: scalars: 4382592 bytes, 0 bad
+// EXPECT: surrogate encodes as 3 bytes: ef bf bd
+// EXPECT:  61 fffd fffd fffd 62 fffd 63 fffd fffd 64
+// EXPECT: decode_into: 13 10: 61 fffd fffd fffd 62 fffd 63 fffd fffd 64
+// EXPECT: cut: 2 2
+// EXPECT: stream: 3 2 5 2 1: 61 62 20ac 21 fffd
+// EXPECT: count_chars: 5
+// EXPECT: forward: 61 f1 20ac 1f600 62 | back: 62 1f600 20ac f1 61 | mixed: 61 62 f1 1f600 20ac true true
+// EXPECT: sum: 21860
+// EXPECT:  0:true,0,0 1:true,1,1 2:false,1,3 3:true,3,3 4:false,3,6 5:false,3,6 6:true,6,6 7:false,6,6
+// EXPECT: prefixes: 0 wrong
+// EXPECT: 0 1 true

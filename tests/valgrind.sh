@@ -12,21 +12,21 @@
 #
 # usage: tests/valgrind.sh [-c COMPILER] [-j JOBS] [FILTER]
 #
-#   -c COMPILER   the tachyonc to check (default: target/tachyonc)
+#   -c COMPILER   the volec to check (default: target/volec)
 #   -j JOBS       compilations at once (default: the number of CPUs, or
-#                 the slots of $TACHYON_JOBSERVER, see tests/run.sh)
+#                 the slots of $VOLE_JOBSERVER, see tests/run.sh)
 #   FILTER        only the programs whose path contains FILTER (the
-#                 self-compile too: its path is compiler/src/main.tach)
+#                 self-compile too: its path is compiler/src/main.vl)
 
 set -u
 LC_ALL=C
 export LC_ALL
 # (each compilation from its source, not the code cache's objects)
-TACHYON_CODE_CACHE=off
-export TACHYON_CODE_CACHE
+VOLE_CODE_CACHE=off
+export VOLE_CODE_CACHE
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 JOBS=""
 FILTER=""
 
@@ -70,18 +70,18 @@ check() { # <file> <level> <dir> [options...]
 cd "$ROOT" || exit 1
 list="$WORK/list"
 : >"$list"
-for f in tests/run/opt_*.tach tests/run/own_*.tach tests/run/contract_*.tach \
-    tests/run/opt_*/main.tach tests/run/own_*/main.tach tests/run/contract_*/main.tach \
-    examples/md5/main.tach examples/calc/main.tach examples/life/main.tach \
-    examples/httpd/main.tach examples/algorithms/huffman/main.tach \
-    examples/algorithms/bigint/main.tach examples/closures-iterators/main.tach; do
+for f in tests/run/opt_*.vl tests/run/own_*.vl tests/run/contract_*.vl \
+    tests/run/opt_*/main.vl tests/run/own_*/main.vl tests/run/contract_*/main.vl \
+    examples/md5/main.vl examples/calc/main.vl examples/life/main.vl \
+    examples/httpd/main.vl examples/algorithms/huffman/main.vl \
+    examples/algorithms/bigint/main.vl examples/closures-iterators/main.vl; do
     [ -f "$f" ] || continue
     case "$f" in *"$FILTER"*) ;; *) continue ;; esac
     echo "$f" >>"$list"
 done
-# The slots: JOBS of them, or the ones $TACHYON_JOBSERVER shares.
-if [ -z "$JOBS" ] && [ -n "${TACHYON_JOBSERVER:-}" ] && [ -p "$TACHYON_JOBSERVER" ]; then
-    exec 3<>"$TACHYON_JOBSERVER"
+# The slots: JOBS of them, or the ones $VOLE_JOBSERVER shares.
+if [ -z "$JOBS" ] && [ -n "${VOLE_JOBSERVER:-}" ] && [ -p "$VOLE_JOBSERVER" ]; then
+    exec 3<>"$VOLE_JOBSERVER"
 else
     [ -n "$JOBS" ] || JOBS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
     rm -f "$WORK/slots"
@@ -96,11 +96,11 @@ fi
 n=0
 # The self-compile first (the longest): -O2 at -j4, the compiler's threads
 # under valgrind's.
-case "compiler/src/main.tach" in
+case "compiler/src/main.vl" in
     *"$FILTER"*)
         n=$((n + 1))
         read -r _ <&3
-        ( check compiler/src/main.tach 2 "$WORK/$n" -j4 >"$WORK/$n.result"; echo >&3 ) & ;;
+        ( check compiler/src/main.vl 2 "$WORK/$n" -j4 >"$WORK/$n.result"; echo >&3 ) & ;;
 esac
 while read -r f; do
     # The case's FLAGS (tests/directives.awk, as tests/run.sh reads them).

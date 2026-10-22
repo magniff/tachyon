@@ -7,41 +7,41 @@ saw, which part of an input matters. None of them edits the source.
 ## The recipe
 
 1. Make the failure a test case: the input in `tests/NAME.in`, the
-   output it should give in `tests/NAME.out`. Then run `tachyonc test
+   output it should give in `tests/NAME.out`. Then run `volec test
    NAME`. Tests are built with `--trace`. A crash prints its line and
    the calls that led to it, and a hang stopped by `--timeout S` prints
-   where it was running. For one run without a case: `tachyonc test
+   where it was running. For one run without a case: `volec test
    --input FILE`.
 2. Read the trace. Its first frame, `FILE:LINE  function`, is the
-   failing statement. `tachyonc query show FILE:LINE` prints its item.
+   failing statement. `volec query show FILE:LINE` prints its item.
 3. See the values without editing:
-   `tachyonc probe FILE:LINE EXPR... --input FILE`. Probe the lines
+   `volec probe FILE:LINE EXPR... --input FILE`. Probe the lines
    above the failure, then the callers in the trace. `--count FILE:LINE`
    says how often a line runs (a loop that never ends, a branch never
    taken).
 4. If the input is too big to reason about, shrink it:
-   `tachyonc reduce FILE --until 'CMD'`.
-5. Fix the bug (`edit patch`), then run `tachyonc test` again. In the
-   tachyon tree, each failing case is also run with
-   `target/tools/tachyonc`. A case that fails there too
+   `volec reduce FILE --until 'CMD'`.
+5. Fix the bug (`edit patch`), then run `volec test` again. In the
+   vole tree, each failing case is also run with
+   `target/tools/volec`. A case that fails there too
    (`failing too`) was not broken by your change.
 
 ## Failure traces
 
-`tachyonc FILE.tach --trace -o prog` builds with a shadow stack: each
+`volec FILE.vl --trace -o prog` builds with a shadow stack: each
 function's frame records the statement it is running. A failed check
 prints the frames, innermost first:
 
 ```text
 index out of bounds: index 0, length 0
 trace, innermost call first:
-  stats.tach:44  stats::best
-  main.tach:25  main
+  stats.vl:44  stats::best
+  main.vl:25  main
 ```
 
 The first frame is the line of the failing index (or `unwrap`, `panic`).
 The frames below it are the calls that led there, each at the line of its
-call. A program stopped by SIGALRM (`tachyonc test --timeout`), SIGINT,
+call. A program stopped by SIGALRM (`volec test --timeout`), SIGINT,
 SIGTERM or SIGSEGV prints `stopped by signal N` and the frames. A loop
 without calls shows its own line.
 
@@ -59,21 +59,21 @@ fn main() -> i32 {
 }
 ```
 ```out (exit 101)
-main.tach:4:20: index out of bounds: index 3, length 3
+main.vl:4:20: index out of bounds: index 3, length 3
 ```
 
-`tachyonc test` builds with `--trace` (`--no-trace` turns it off). A
+`volec test` builds with `--trace` (`--no-trace` turns it off). A
 failing case shows the first lines of its stderr, so the trace appears
 in the summary.
 
 ## probe
 
 ```text
-$ tachyonc probe stats.tach:46 i m 'v[i]' --input tests/ok.in
-probe stats.tach:46 (before `if v[i] > m {`): 2 times
+$ volec probe stats.vl:46 i m 'v[i]' --input tests/ok.in
+probe stats.vl:46 (before `if v[i] > m {`): 2 times
   #1  i = 1  m = 3  v[i] = 7
   #2  i = 1  m = 3  v[i] = 7
-run: exit 0; stdout 4 lines (.tachyonc/probe/out)
+run: exit 0; stdout 4 lines (.volec/probe/out)
   | a best 7
 ```
 
@@ -98,29 +98,29 @@ the same, and with `--trace`. Then it runs with `-- ARGS` and stdin from
 The report lists each probe's count and values, then the exit status,
 the start of stdout and stderr.
 
-Several probes go in one run: `tachyonc probe a.tach:10 x a.tach:20 y`.
+Several probes go in one run: `volec probe a.vl:10 x a.vl:20 y`.
 `--count FILE:LINE` counts runs without printing. A probe whose name is
 not in scope at its line is an error (`probe.expr`), so probe a later
 line for a value made later.
 
-In the tachyon tree the program is the compiler itself. To see what it
+In the vole tree the program is the compiler itself. To see what it
 does when compiling a test:
 
 ```text
-tachyonc probe compiler/src/front/check/interp.tach:633 h t -- case.tach -o /tmp/p
+volec probe compiler/src/front/check/interp.vl:633 h t -- case.vl -o /tmp/p
 ```
 
 ## reduce
 
 ```text
-$ tachyonc reduce big.in --until './prog < {} > /dev/null 2>&1; test $? = 101'
+$ volec reduce big.in --until './prog < {} > /dev/null 2>&1; test $? = 101'
 reduced big.in: 304 lines to 2 in 35 runs; written to big.in.min
 ```
 
 `{}` is the candidate's path. CMD must exit with 0 while the failure is
 still there: `./prog < {} | grep -q wrong` for wrong output,
 `test $? = 101` for a crash. For a compiler bug, use
-`target/tachyonc {} -o /tmp/p 2>&1 | grep -q 'MESSAGE'`. Lines are left
+`target/volec {} -o /tmp/p 2>&1 | grep -q 'MESSAGE'`. Lines are left
 out in chunks, and the chunks are halved when none can go. A run that
 takes longer than `--timeout S` (5) counts as not failing.
 
@@ -128,8 +128,8 @@ takes longer than `--timeout S` (5) counts as not failing.
 
 | to know | run |
 |---|---|
-| who changes a field or static | `tachyonc query refs Struct.field --kind write` |
-| who calls a function, transitively | `tachyonc query callers NAME`, `query callees FN --transitive` |
-| whether optimization changes it | `tachyonc test -O 0`, then `tachyonc test` (-O2) |
-| which test a compiler change broke | `tachyonc test FILTER` (tachyon tree): `new` vs `failing too` |
-| what an expression gives | `tachyonc try 'STATEMENTS'` |
+| who changes a field or static | `volec query refs Struct.field --kind write` |
+| who calls a function, transitively | `volec query callers NAME`, `query callees FN --transitive` |
+| whether optimization changes it | `volec test -O 0`, then `volec test` (-O2) |
+| which test a compiler change broke | `volec test FILTER` (vole tree): `new` vs `failing too` |
+| what an expression gives | `volec try 'STATEMENTS'` |

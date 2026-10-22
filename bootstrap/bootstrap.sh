@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds the tachyon compiler from nothing but git, a Rust toolchain and a C
+# Builds the vole compiler from nothing but git, a Rust toolchain and a C
 # compiler, release by release, following bootstrap/releases.toml:
 #
 #   1. the seed: the frozen Rust compiler, from the seed/ directory of the
@@ -16,18 +16,18 @@
 #
 # Built steps are cached under target/bootstrap/<host>/, by tag and
 # commit, so a rerun only redoes HEAD (and what --history full asks for
-# that the cache lacks). The final compiler is copied to target/tachyonc,
+# that the cache lacks). The final compiler is copied to target/volec,
 # where tests/run.sh looks for it, and (0.15), when its test suite ran and
-# passed, to target/tools/tachyonc: the binary agents query and edit with,
-# which their own builds of target/tachyonc do not replace. (0.14) In a linked git worktree the
-# releases come from the main checkout's cache (or $TACHYON_BOOTSTRAP_CACHE),
+# passed, to target/tools/volec: the binary agents query and edit with,
+# which their own builds of target/volec do not replace. (0.14) In a linked git worktree the
+# releases come from the main checkout's cache (or $VOLE_BOOTSTRAP_CACHE),
 # so a fresh worktree builds only HEAD; HEAD itself is always built in the
 # worktree's own target/bootstrap. (0.18.1) Runs from several worktrees
 # share that cache safely: an entry is written under a lock (<entry>.lock,
 # a directory: mkdir is atomic), built in <entry>.building and renamed into
 # place once its fixpoint (and suite) passed, so no run sees a half-built
 # entry or deletes another's; a run waits for the lock, and takes it over
-# when its holder is gone (or after TACHYON_BOOTSTRAP_LOCK_STALE minutes,
+# when its holder is gone (or after VOLE_BOOTSTRAP_LOCK_STALE minutes,
 # default 120).
 #
 # usage: bootstrap/bootstrap.sh [options]
@@ -47,7 +47,7 @@
 #                      bootstrap/aarch64-linux-check.sh)
 #   --seed-bin PATH    use this seed binary instead of building one
 #   --cache DIR        the cache directory for the releases (default:
-#                      $TACHYON_BOOTSTRAP_CACHE, else the main checkout's
+#                      $VOLE_BOOTSTRAP_CACHE, else the main checkout's
 #                      target/bootstrap in a linked worktree, else
 #                      target/bootstrap)
 #   --clean            empty the cache first (and use this checkout's own)
@@ -130,8 +130,8 @@ while [ $# -gt 0 ]; do
     shift
 done
 if [ -z "$CACHE" ] && [ $CLEAN -eq 0 ]; then
-    if [ -n "${TACHYON_BOOTSTRAP_CACHE:-}" ]; then
-        CACHE=$TACHYON_BOOTSTRAP_CACHE
+    if [ -n "${VOLE_BOOTSTRAP_CACHE:-}" ]; then
+        CACHE=$VOLE_BOOTSTRAP_CACHE
     else
         # A linked worktree shares the main checkout's releases (keyed by tag
         # and commit, so sharing is safe); HEAD stays local, below.
@@ -150,7 +150,7 @@ esac
 
 # ---- The host ----
 
-# The host as a tachyon target name.
+# The host as a vole target name.
 detect_host() {
     case "$(uname -s)-$(uname -m)" in
         Darwin-arm64) echo aarch64-macos ;;
@@ -164,7 +164,7 @@ CROSS=""
 if [ -z "$HOST" ]; then
     HOST=$(detect_host)
     [ "$HOST" != unsupported ] \
-        || die "unsupported host: $(uname -s) $(uname -m). tachyon builds on aarch64-macos (Apple silicon), x86_64-macos and x86_64-linux; another host needs a release with a backend for it (see docs/releases.md)."
+        || die "unsupported host: $(uname -s) $(uname -m). vole builds on aarch64-macos (Apple silicon), x86_64-macos and x86_64-linux; another host needs a release with a backend for it (see docs/releases.md)."
 fi
 # aarch64-linux (0.11): no release before 0.11, nor the seed (Rust and
 # Cranelift, pinned), runs there, so the chain cannot start on it. It runs
@@ -200,7 +200,7 @@ need git "releases are read from git tags"
 need tar "release trees are extracted with git archive | tar"
 need awk "the manifest is read with awk"
 need cmp "the fixpoint compares the emitted assembly or objects"
-need "$CC" "the C compiler assembles and links tachyon's output (set CC to use another)"
+need "$CC" "the C compiler assembles and links vole's output (set CC to use another)"
 if [ -z "$SEED_BIN" ]; then
     need cargo "the seed is the Rust compiler; install Rust with rustup (https://rustup.rs)"
 fi
@@ -208,7 +208,7 @@ fi
 
 # ---- The manifest ----
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-bootstrap.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-bootstrap.XXXXXX")
 HELD_LOCK=""
 trap 'rm -rf "$WORK" $HELD_LOCK' EXIT
 trap 'exit 130' INT TERM
@@ -309,7 +309,7 @@ tag_commit() { # <tag>: its commit, or nothing when the tag does not exist
 # time (HELD_LOCK, removed on exit). A lock whose holder is gone (this
 # host's processes) or older than the stale limit is taken over: renamed
 # away first, so two waiters cannot both break it.
-LOCK_STALE=${TACHYON_BOOTSTRAP_LOCK_STALE:-120}
+LOCK_STALE=${VOLE_BOOTSTRAP_LOCK_STALE:-120}
 lock() { # <dir>
     lk_waited=0
     while ! mkdir "$1.lock" 2>/dev/null; do
@@ -363,10 +363,10 @@ extract() { # <commit> <dir>
 # Compiles the compiler in <src> into the executable <out> with the
 # compiler <bin>, invoked through interface <cli>, for the host: its root
 # file <root> (a module tree, from 0.6), or else all the files of <src>
-# with extension <ext> (one module; .tach then).
+# with extension <ext> (one module; .vl then).
 # (POSIX sh has no local variables: each function uses its own prefix.)
 compile_with() { # <cli> <bin> <src> <root> <out> <ext>
-    cw_cli=$1 cw_bin=$2 cw_src=$3 cw_root=$4 cw_out=$5 cw_ext=${6:-.tach}
+    cw_cli=$1 cw_bin=$2 cw_src=$3 cw_root=$4 cw_out=$5 cw_ext=${6:-.vl}
     if [ -n "$cw_root" ]; then
         set -- "$cw_src/$cw_root"
         [ -f "$1" ] || die "no root file $cw_root in $cw_src"
@@ -605,7 +605,7 @@ if [ $STOPPED -eq 0 ]; then
     mkdir -p "$ROOT/target"
     cp "$FINAL" "$ROOT/target/$HEAD_BIN"
     # (0.15) The tools binary: a compiler that passed its fixpoint and its
-    # test suite, for querying and editing while target/tachyonc is under
+    # test suite, for querying and editing while target/volec is under
     # test (an agent's own builds replace that one); replaced by rename, so
     # a query running at that moment keeps its file.
     if [ "$RUN_HEAD_TESTS" = 1 ]; then
@@ -633,7 +633,7 @@ fi
 [ -z "$OUT" ] || cp "$FINAL" "$OUT"
 
 echo
-echo "tachyon bootstrap on $HOST${CROSS:+, for $CROSS}:"
+echo "vole bootstrap on $HOST${CROSS:+, for $CROSS}:"
 cat "$SUMMARY"
 if [ -n "$CROSS" ]; then
     echo "compiler for $CROSS: $ROOT/target/$CROSS/$HEAD_BIN.o${OUT:+, also $OUT}; for $HOST: $ROOT/target/$HEAD_BIN"

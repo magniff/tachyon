@@ -1,6 +1,6 @@
-# Algorithms in tachyon
+# Algorithms in vole
 
-Ten classic algorithms, each a complete program in idiomatic tachyon
+Ten classic algorithms, each a complete program in idiomatic vole
 0.15 with a README that explains the problem, the algorithm, its
 complexity and the code. Every one works on a deterministic, generated
 input (seeded generators, so the output is the same on every run and
@@ -8,7 +8,7 @@ machine), checks its own answer, and times its core on stderr. Most
 come with `reference.c`, the same program in C, and the README says how
 the two compare.
 
-| example | algorithm | complexity | tachyon features shown | time (-O2) | vs C (clang -O2) |
+| example | algorithm | complexity | vole features shown | time (-O2) | vs C (clang -O2) |
 |---|---|---|---|---|---|
 | [dijkstra](dijkstra/) | Dijkstra's shortest paths, binary heap, CSR graph | O((V + E) log V) | generic `MinHeap<T: Ord>`, `?` on Option, `while let`, `Vec::filled`, iterators, f-string specs | 41 ms, 1M nodes | 35 ms |
 | [kruskal](kruskal/) | union-find + Kruskal's minimum spanning tree | O(E log E) | `#[derive(Ord)]` sort, union-find, default args, iterators, tuples | 55 ms, 1M edges | 73 ms (`qsort`) |
@@ -29,7 +29,7 @@ table (`-O0`, `-O1`, `-O2`, C) and what the gap is, where there is one.
 Each example is one file:
 
 ```sh
-tachyonc examples/algorithms/NAME/main.tach -o NAME && ./NAME
+volec examples/algorithms/NAME/main.vl -o NAME && ./NAME
 cc -O2 examples/algorithms/NAME/reference.c -o NAME-c && ./NAME-c   # the C version, where there is one
 ```
 
@@ -44,14 +44,14 @@ The test suite runs every one and compares its output
 - **Timing on stderr.** `import "time.h" as c;` and C's
   `timespec_get`; stdout holds only results.
 - **Memory without `free`.** Vectors and maps are dropped at the end of
-  their scope, or moved to an owner that outlives it (`tachyonc guide
+  their scope, or moved to an owner that outlives it (`volec guide
   memory`).
 - **Checked indexing.** Every slice access is bounds-checked; the C
   references check nothing, and the times above include the checks.
 
 ## What they found
 
-Writing these for speed turned up a few places where tachyon 0.15's
+Writing these for speed turned up a few places where vole 0.15's
 code is slower than it should be; each README says what was measured
 and how the example avoids it:
 

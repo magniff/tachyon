@@ -6,10 +6,10 @@ hash state, and the C library's `open` and `read`.
 
 ## Build and run
 
-From this folder (with `tachyonc` on your `PATH`, or `../../target/tachyonc`):
+From this folder (with `volec` on your `PATH`, or `../../target/volec`):
 
 ```sh
-tachyonc main.tach -o md5
+volec main.vl -o md5
 printf abc | ./md5
 ./md5 README.md          # a file
 ```
@@ -34,7 +34,7 @@ the same program in C.
 static K: [u32; 64] = [0xd76aa478, 0xe8c7b756, ...];
 ```
 
-**Arithmetic that wraps.** MD5 is defined modulo 2^32, and tachyon's
+**Arithmetic that wraps.** MD5 is defined modulo 2^32, and vole's
 integers wrap on overflow (it is defined, never undefined behaviour), so
 `f + a + K[i] + m[g]` on `u32`s is MD5's addition as written in the RFC.
 
@@ -85,8 +85,8 @@ for byte in hash.finish() {
 
 ## Language features
 
-- fixed-size arrays, slices, `u32`/`u64` and wrapping arithmetic: `tachyonc guide types`
-- statics, structs, methods on `*Self`: `tachyonc guide syntax`
-- `defer`: `tachyonc guide memory`
-- `extern "C"` and `unsafe` calls: `tachyonc guide c-interop`
-- hex format specs, `push_fmt`: `tachyonc guide formatting`
+- fixed-size arrays, slices, `u32`/`u64` and wrapping arithmetic: `volec guide types`
+- statics, structs, methods on `*Self`: `volec guide syntax`
+- `defer`: `volec guide memory`
+- `extern "C"` and `unsafe` calls: `volec guide c-interop`
+- hex format specs, `push_fmt`: `volec guide formatting`

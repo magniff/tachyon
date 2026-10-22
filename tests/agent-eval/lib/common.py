@@ -27,7 +27,7 @@ ALL_CONDS = ("bare", "guide", "tools", "both", "guide-core", "tools-core", "both
              "compiler-plain", "compiler-tools-core")
 KINDS = ("write", "fix", "extend", "refactor", "perf")
 
-TACH_BUILD = ["tachyonc", "main.tach", "-o", "prog"]
+TACH_BUILD = ["volec", "main.vl", "-o", "prog"]
 RUST_BUILD = ["rustc", "-O", "--edition", "2021", "main.rs", "-o", "prog"]
 BUILD_TIMEOUT_S = 300
 
@@ -347,7 +347,7 @@ def tail(b, n=2000):
 def install_hooks(ws_root):
     """The agent hooks (tools/agent-hooks/: check-after-edit.py,
     query-first.py, turn-end.py, the modules and files they load:
-    tachyonc_cmd.py, hookstate.py, hints.txt, settings-eval.json; every file
+    volec_cmd.py, hookstate.py, hints.txt, settings-eval.json; every file
     but the tests) and (0.17) lib/hook-tee.py
     copied out of the repository, which the agent's sandbox cannot read:
     {"check": path, "query": path, "tee": path, "dir": the copies}."""
@@ -490,9 +490,9 @@ def check_hook_summary(log_path):
 
 
 def final_check(ws, env):
-    """`tachyonc check --json` on the finished workspace: its errors by code
+    """`volec check --json` on the finished workspace: its errors by code
     (None when the compiler has no --json, before 0.15)."""
-    rc, out, err, _ = run_proc(["tachyonc", "check", "--json"], ws, env, 60)
+    rc, out, err, _ = run_proc(["volec", "check", "--json"], ws, env, 60)
     if rc not in (0, 1) or b"unknown option" in err:
         return None
     codes = {}

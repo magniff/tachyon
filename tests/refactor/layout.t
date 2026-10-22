@@ -2,14 +2,14 @@
 ## with its whole group; split --plan's names and --names
 ## (tests/refactor/layout/; tests/refactor/roundtrip.sh moves random
 ## items there and back).
-$ main.tach -o prog
+$ main.vl -o prog
 ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 ## Into a run of constants: joined to it, as written there.
 $ refactor move crate::tables::LIMIT --to crate::shapes --after CORNERS
 moved crate::tables::LIMIT to crate::shapes	3 files	+3 -4 lines
-% sed -n '3,12p' shapes.tach
+% sed -n '3,12p' shapes.vl
 use crate::util::{clamp, twice};
 
 pub const SIDES: i64 = 4;
@@ -32,7 +32,7 @@ $ refactor move crate::util::MISSES --to crate::tables --after HITS
 moved crate::util::MISSES to crate::tables	2 files	+2 -2 lines
 $ refactor move crate::shapes::origin crate::shapes::unit --to crate::util
 moved 2 items to crate::util	3 files	+14 -12 lines
-% sed -n '/Points/,$p' util.tach
+% sed -n '/Points/,$p' util.vl
 // ---- Points ----
 
 pub fn origin() -> Point {
@@ -49,11 +49,11 @@ moved 2 items to crate::shapes	3 files	+12 -14 lines
 ## --after an item that is not one of the module the items go to.
 $ refactor move crate::shapes::area --to crate::tables --after area
 error refactor.anchor: --after area: not an item of crate::tables with lines of its own (a function, type, constant, static)
-try: tachyonc query items crate::tables
+try: volec query items crate::tables
 [exit 1]
 $ refactor move crate::shapes::area --to crate::tables --after Point
 error refactor.anchor: --after Point: not an item of crate::tables with lines of its own (a function, type, constant, static)
-try: tachyonc query items crate::tables
+try: volec query items crate::tables
 [exit 1]
 ## split --plan: each part named from what its items share, the reason
 ## printed; --names names them.
@@ -61,31 +61,31 @@ $ refactor split crate::shapes --plan --max-lines 25
 # crate::shapes	47 lines	3 parts of at most 25 lines
 # stays in crate::shapes: the part most used from other modules
 # points: banner '// ---- Points ----': 2 of 3 items, 6 of 11 lines
-tachyonc refactor split crate::shapes --into crate::shapes::points --items area,origin,unit
+volec refactor split crate::shapes --into crate::shapes::points --items area,origin,unit
 # measures: banner '// ---- Measures ----': 2 of 5 items, 7 of 10 lines
-tachyonc refactor split crate::shapes --into crate::shapes::measures --items SIDES,CORNERS,EDGES,perimeter,diagonal
+volec refactor split crate::shapes --into crate::shapes::measures --items SIDES,CORNERS,EDGES,perimeter,diagonal
 note refactor.plan: the same in one edit: --auto (other names: --names a,b)
-try: tachyonc refactor split crate::shapes --auto --max-lines 25
+try: volec refactor split crate::shapes --auto --max-lines 25
 $ refactor split crate::shapes --plan --max-lines 25 --names geometry
 # crate::shapes	47 lines	3 parts of at most 25 lines
 # stays in crate::shapes: the part most used from other modules
 # geometry: --names
-tachyonc refactor split crate::shapes --into crate::shapes::geometry --items area,origin,unit
+volec refactor split crate::shapes --into crate::shapes::geometry --items area,origin,unit
 # measures: banner '// ---- Measures ----': 2 of 5 items, 7 of 10 lines
-tachyonc refactor split crate::shapes --into crate::shapes::measures --items SIDES,CORNERS,EDGES,perimeter,diagonal
+volec refactor split crate::shapes --into crate::shapes::measures --items SIDES,CORNERS,EDGES,perimeter,diagonal
 note refactor.plan: the same in one edit: --auto (other names: --names a,b)
-try: tachyonc refactor split crate::shapes --auto --max-lines 25
+try: volec refactor split crate::shapes --auto --max-lines 25
 $ refactor split crate::shapes --auto --max-lines 25 --names geometry,a,b
 error refactor.usage: --names gives 3 names for 2 parts
-try: tachyonc refactor split crate::shapes --plan --max-lines 25
+try: volec refactor split crate::shapes --plan --max-lines 25
 [exit 2]
 $ refactor split crate::shapes --auto --max-lines 25 --names measures
 split crate::shapes into 2 modules	4 files	+41 -33 lines
 % ls shapes
-measures.tach
-mod.tach
-point.tach
-$ main.tach -o prog
+measures.vl
+mod.vl
+point.vl
+$ main.vl -o prog
 ok: built prog
 % ./prog; echo "exit $?"
 exit 0

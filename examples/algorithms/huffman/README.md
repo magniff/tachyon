@@ -6,7 +6,7 @@ a round-trip check. 4 MiB of generated text compresses to 47.7% at
 about 500 MB/s and decodes at 300 MB/s, within 1.2x of C.
 
 ```sh
-tachyonc examples/algorithms/huffman/main.tach -o huffman && ./huffman
+volec examples/algorithms/huffman/main.vl -o huffman && ./huffman
 ```
 
 ## The problem
@@ -202,12 +202,12 @@ the same size and checksum). On 4 MiB, Apple M-series:
 
 | | count + tree | encode | decode |
 |---|---|---|---|
-| tachyon 0.15, `-O2` (the default) | 2.4 ms | 8.7 ms | 14.0 ms |
-| tachyon 0.15, `-O1` | 2.1 ms | 10.3 ms | 20.3 ms |
-| tachyon 0.15, `-O0` | 9.6 ms | 37.8 ms | 56.7 ms |
+| vole 0.15, `-O2` (the default) | 2.4 ms | 8.7 ms | 14.0 ms |
+| vole 0.15, `-O1` | 2.1 ms | 10.3 ms | 20.3 ms |
+| vole 0.15, `-O0` | 9.6 ms | 37.8 ms | 56.7 ms |
 | C, `clang -O2` | 2.3 ms | 7.4 ms | 13.1 ms |
 
-The tachyon version checks its indexes and grows its output `Vec` with
+The vole version checks its indexes and grows its output `Vec` with
 `push`; the C one writes into preallocated arrays unchecked.
 
 The encoder was first written with a `BitWriter { out, acc, bits }`
@@ -220,16 +220,16 @@ fix (in C too, where the compiler has more freedom to promote it).
 
 | feature | where | guide |
 |---|---|---|
-| `#[derive(Eq, Ord, Debug)]` to order heap entries and sort | `Subtree`, `ByLength`, `HuffError` | `tachyonc guide formatting` |
-| generic `MinHeap<T: Ord>`, `?` on an `Option` | `MinHeap` | `tachyonc guide generics`, `guide conversions` |
-| `Result`, `?`, `main -> Result<(), E>` | `Codebook::new`, `round_trip`, `main` | `tachyonc guide conversions` |
-| default and named arguments: `table: bool = false` | `round_trip` | `tachyonc guide core` |
-| tuples in a `Vec`, destructured in `while let` and `let` | `code_lengths` | `tachyonc guide syntax` |
-| widening: `u8` into `u64`, `u32` into `i64` | `decode`, `encode` | `tachyonc guide conversions` |
-| iterators: `zip`, `fold`, `filter`, `count`, `position`, `Option::map` | `round_trip`, `entropy` | `tachyonc guide iterators` |
-| arrays as values: `[i64; 256]` returned and stored in a struct | `code_lengths`, `Codebook` | `tachyonc guide types` |
-| f-strings: `{x:.4}`, `{h:x}`, `{b:c}`, `{s:?}` | output | `tachyonc guide formatting` |
-| C's `log2` and clock | `entropy`, `now_ns` | `tachyonc guide c-interop` |
+| `#[derive(Eq, Ord, Debug)]` to order heap entries and sort | `Subtree`, `ByLength`, `HuffError` | `volec guide formatting` |
+| generic `MinHeap<T: Ord>`, `?` on an `Option` | `MinHeap` | `volec guide generics`, `guide conversions` |
+| `Result`, `?`, `main -> Result<(), E>` | `Codebook::new`, `round_trip`, `main` | `volec guide conversions` |
+| default and named arguments: `table: bool = false` | `round_trip` | `volec guide core` |
+| tuples in a `Vec`, destructured in `while let` and `let` | `code_lengths` | `volec guide syntax` |
+| widening: `u8` into `u64`, `u32` into `i64` | `decode`, `encode` | `volec guide conversions` |
+| iterators: `zip`, `fold`, `filter`, `count`, `position`, `Option::map` | `round_trip`, `entropy` | `volec guide iterators` |
+| arrays as values: `[i64; 256]` returned and stored in a struct | `code_lengths`, `Codebook` | `volec guide types` |
+| f-strings: `{x:.4}`, `{h:x}`, `{b:c}`, `{s:?}` | output | `volec guide formatting` |
+| C's `log2` and clock | `entropy`, `now_ns` | `volec guide c-interop` |
 
 ## Try
 

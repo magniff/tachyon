@@ -1,0 +1,124 @@
+// The explanations of the thread checks' codes (0.21, front/threads.vl;
+// docs/design/concurrency.md §2.4, §2.5, §2.10): what may cross threads.
+
+use crate::tools::explain::Explain;
+
+pub const SYNC_COUNT: i64 = 9;
+
+pub static SYNC_TABLE: [Explain; 9] = [
+    Explain {
+        code: "sync.borrow_escapes",
+        severity: "error",
+        means: "The closure given to thread::spawn borrows a variable (it is not a `move` \
+            closure), moves a view (a slice, a `&T`) into the thread, or the thread returns one. \
+            A spawned thread may run after the function that started it returns, so it can hold \
+            nothing that points into that function's values.",
+        fix: "Make the closure `move ||` so that it takes its own values; give it an owned copy \
+            of a view (`s.to_vec_in(gpa)`, a Buf); or start the thread in `thread::scope(|s| \
+            ...)`, whose threads end before the scope does and may borrow.",
+        example: "let h = thread::spawn(|| n + 1);\n\
+            \n\
+            main.vl:5:13: error[sync.borrow_escapes] the closure given to 'thread::spawn' borrows 'n', but the thread may outlive it\n\
+            \x20 help: move it into the thread (`move ||`), or start the thread in thread::scope, which ends before it does\n\
+            \x20 try: volec edit patch main.vl:5 --old 'spawn(||' --new 'spawn(move ||'",
+    },
+    Explain {
+        code: "sync.not_send",
+        severity: "error",
+        means: "A value that moves to another thread holds a raw pointer `*T` (or a fn \
+            pointer), which may alias memory the spawning thread still uses. std's containers \
+            (Vec, Buf, HashMap...), Mutex, atomics, Sender and Receiver move fine: their pointers \
+            are their own.",
+        fix: "Hold the data in std's owned containers instead of raw memory; share it through a \
+            Mutex or atomics; or keep the pointer on one thread and send the values it points to.",
+        example: "struct Cache { slots: *i64, n: i64 }\n\
+            let h = thread::spawn(move || c.n);\n\
+            \n\
+            main.vl:9:13: error[sync.not_send] 'thread::spawn' moves 'c' (Cache holds a raw pointer at '.slots' (*i64)) to another thread, which may alias memory this one still uses",
+    },
+    Explain {
+        code: "sync.not_sync",
+        severity: "error",
+        means: "A scoped thread shares a value with others through a reference, and part of it \
+            (a raw pointer) may change through that reference without a lock.",
+        fix: "Hold the data in std's containers, a Mutex or atomics, which may be shared.",
+        example: "s.spawn(|| peek(&c));   // c: a struct with a raw pointer\n\
+            \n\
+            main.vl:9:9: error[sync.not_sync] a thread of 'thread::scope' shares 'c' (Cache holds a raw pointer at '.slots' (*i64)) with another thread, and that part may change through a shared reference",
+    },
+    Explain {
+        code: "sync.global",
+        severity: "error",
+        means: "A closure that runs on another thread reaches a `static mut`, directly or through \
+            what it calls (its effects have `global`). A static mut is safe and unsynchronized: \
+            it is for the main thread only. Printing does not count: std's print buffer is \
+            locked once threads run.",
+        fix: "Make the static an atomic or a Mutex without `mut` (`static N: AtomicI64 = \
+            AtomicI64 { v: 0 };`, then `N.fetch_add(1, Ordering::Relaxed)`), a \
+            `#[thread_local] static mut`, or pass the data to the thread and return the result. \
+            `volec query effects FILE:LINE --why global` shows the chain.",
+        example: "static mut COUNT: i64 = 0;\n\
+            let h = thread::spawn(move || { COUNT += 1; 0 });\n\
+            \n\
+            main.vl:6:13: error[sync.global] 'thread::spawn' runs a closure on another thread, but it reaches a static mut (its effects have `global`): a static mut is for the main thread",
+    },
+    Explain {
+        code: "sync.scope_write",
+        severity: "error",
+        means: "The closure given to thread::scope changes a variable it borrows from the \
+            caller (an assignment, a `&mut`, a method that takes `&mut self`): the scope's \
+            threads may be reading it at the same time.",
+        fix: "Change it before or after thread::scope; inside, give each thread its own data, \
+            or share a Mutex or an atomic.",
+        example: "thread::scope(|s| { let h = s.spawn(|| v.len()); v.push(2); h.join() });\n\
+            \n\
+            main.vl:7:9: error[sync.scope_write] the closure given to 'thread::scope' changes 'v', which its threads may read at the same time",
+    },
+    Explain {
+        code: "sync.scope_shared_write",
+        severity: "error",
+        means: "A scoped thread changes a variable it borrows from the caller, or takes an \
+            exclusive view (`&mut T`, `&mut [T]`) into the thread. In 0.21.0 scoped threads only \
+            read what they borrow.",
+        fix: "Return the thread's result (`h.join()`) and combine it after; split the data into \
+            owned parts before the scope and move one into each thread; or use a Mutex or an \
+            atomic.",
+        example: "thread::scope(|s| { s.spawn(|| { total += 1; 0 }); 0 });\n\
+            \n\
+            main.vl:7:22: error[sync.scope_shared_write] a thread of 'thread::scope' changes 'total', which the scope's other code may use at the same time",
+    },
+    Explain {
+        code: "sync.scope_local",
+        severity: "error",
+        means: "A scoped thread borrows a variable made inside the closure given to \
+            thread::scope (or moves a view of one, or moves the caller's owned value): that \
+            closure returns before its threads are joined, so its locals end first.",
+        fix: "Make the value before thread::scope, so that it outlives the scope; or move an owned \
+            value made in the scope into the thread (`move ||`).",
+        example: "thread::scope(|s| { let mine = make(); s.spawn(|| mine.len()); 0 });\n\
+            \n\
+            main.vl:8:17: error[sync.scope_local] a thread of 'thread::scope' borrows 'mine', made inside the scope's closure, which ends before the thread is joined",
+    },
+    Explain {
+        code: "sync.scope_spawn",
+        severity: "error",
+        means: "Scope::spawn is called outside the closure given to thread::scope (a helper \
+            function received the scope): what its threads borrow is checked in that closure.",
+        fix: "Call `s.spawn(...)` directly in the closure given to thread::scope; a helper can \
+            return the closure, or the data, instead.",
+        example: "fn start(s: &mut thread::Scope, k: i64) { s.spawn(move || k * 2); }\n\
+            \n\
+            main.vl:4:5: error[sync.scope_spawn] 's.spawn' is called outside the closure given to 'thread::scope'",
+    },
+    Explain {
+        code: "sync.spawn_closure",
+        severity: "error",
+        means: "thread::spawn, thread::scope or s.spawn is given a function value instead of a \
+            closure written at the call: a fn value may reach any static, and its captures are \
+            not known.",
+        fix: "Wrap the function in a closure: `thread::spawn(move || work(x))`.",
+        example: "let h = thread::spawn(work);\n\
+            \n\
+            main.vl:6:13: error[sync.spawn_closure] 'thread::spawn' takes a closure written at the call, not fn() -> i64",
+    },
+];

@@ -8,10 +8,10 @@ the C library, declared by hand; the HTML and the headers built in
 
 ## Build and run
 
-From this folder (with `tachyonc` on your `PATH`, or `../../target/tachyonc`):
+From this folder (with `volec` on your `PATH`, or `../../target/volec`):
 
 ```sh
-tachyonc main.tach -o httpd
+volec main.vl -o httpd
 ./httpd ..            # serve the examples folder; no argument: the current directory
 ```
 
@@ -44,7 +44,7 @@ file. The test suite only builds it (a server runs until stopped).
 ## How it works
 
 **Declaring the C library by hand.** Every C function the server uses is
-in one `extern "C"` block, with tachyon types for C's (`int` is `i32`,
+in one `extern "C"` block, with vole types for C's (`int` is `i32`,
 `size_t` is `u64`, any pointer `*u8`):
 
 ```tach
@@ -61,7 +61,7 @@ Declaring them, rather than importing the headers (`import
 "sys/socket.h" as c;`, as the `c-libc-tour` example does), keeps the
 program independent of the headers of the machine that builds it: the
 same source cross-compiles for Linux and macOS from either
-(`tachyonc --target x86_64-linux main.tach -o httpd.o`).
+(`volec --target x86_64-linux main.vl -o httpd.o`).
 
 **What differs between the systems, at run time.** The module `sys`
 holds every difference: the socket constants, `struct sockaddr_in` (BSD
@@ -82,7 +82,7 @@ what failed, which `main` prints.
 **Raw pointers from C, viewed safely.** `readdir` returns a pointer to an
 entry; `sys::dirent` casts it to the system's layout and returns the
 name's address and the entry's type. `sys::cstr` turns a C string into a
-`[u8]` slice, after which everything is checked tachyon code:
+`[u8]` slice, after which everything is checked vole code:
 
 ```tach
 pub fn cstr(s: *u8) -> [u8] {
@@ -121,9 +121,9 @@ extension) are ordinary safe code over slices, with `match` on bytes and
 
 ## Language features
 
-- `extern "C"` declarations, `#[repr(C)]` structs, raw pointers: `tachyonc guide c-interop`
-- `unsafe` blocks, raw pointers: `tachyonc guide unsafe`
-- inline modules (`mod sys { ... }`), `pub`, `use super::`: `tachyonc guide modules`
-- `defer`, `Buf`: `tachyonc guide memory`
-- `Result`, `Option`, `if let`: `tachyonc guide conversions`
-- f-strings, `push_fmt`, `eprintln`: `tachyonc guide formatting`
+- `extern "C"` declarations, `#[repr(C)]` structs, raw pointers: `volec guide c-interop`
+- `unsafe` blocks, raw pointers: `volec guide unsafe`
+- inline modules (`mod sys { ... }`), `pub`, `use super::`: `volec guide modules`
+- `defer`, `Buf`: `volec guide memory`
+- `Result`, `Option`, `if let`: `volec guide conversions`
+- f-strings, `push_fmt`, `eprintln`: `volec guide formatting`

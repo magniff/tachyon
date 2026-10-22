@@ -1,0 +1,389 @@
+// `query type FILE:LINE[:COL]...` (0.13; docs/query.md): the type the
+// checker gave the innermost expression holding that position (without
+// COL: the line's first non-blank byte), `TYPE<TAB>EXPRESSION`; one line
+// per type when the expression is in a generic function checked once per
+// instance.
+
+use crate::base::{
+    FILES, FILE_COUNT, IntVec, SRC, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice,
+    buf_str, buf_write_fd,
+};
+use crate::front::ast::{NODES, NODE_CAPTURE, NODE_COUNT, NODE_IMPLICIT, NodeKind, child};
+use crate::front::types::buf_type;
+use crate::middle::lower::ssa::HMap;
+use crate::tools::query::{parse_digits, trailing_number};
+use crate::tools::query::diagnostics::{diag, try_begin, try_end, try_query};
+use crate::tools::query::names::path_matches;
+use crate::tools::query::positions::{LINES, collapse, line_end, line_index};
+use crate::tools::query::refs::file_text;
+
+// Whether nodes of kind k are expressions (or bindings) the checker types
+// (0.14: a closure, its type `closure(i64) -> i64 at FILE:LINE:COL`; a
+// closure's parameter).
+fn typed_kind(k: NodeKind) -> bool {
+    match k {
+        NodeKind::Int | NodeKind::Float | NodeKind::Char | NodeKind::Str | NodeKind::CStr
+            | NodeKind::Bool | NodeKind::Unit | NodeKind::Ident | NodeKind::Binary | NodeKind::Unary
+            | NodeKind::Cast | NodeKind::Call | NodeKind::Index | NodeKind::FieldAccess
+            | NodeKind::TupleField | NodeKind::Tuple | NodeKind::Array | NodeKind::Repeat
+            | NodeKind::StructLit | NodeKind::Block | NodeKind::If | NodeKind::Loop
+            | NodeKind::While | NodeKind::For | NodeKind::Range | NodeKind::Assign
+            | NodeKind::Return | NodeKind::Break | NodeKind::Continue | NodeKind::Path
+            | NodeKind::Match | NodeKind::MethodCall | NodeKind::VariantLit | NodeKind::EnumPanic
+            | NodeKind::VecOp | NodeKind::PatBind | NodeKind::Closure | NodeKind::Param
+            | NodeKind::Try | NodeKind::Interp => true,
+        _ => false,
+    }
+}
+
+// The file of the program named `file` (its path, or its end by whole
+// components), or -1.
+pub fn file_named(file: [u8]) -> i64 {
+    for g in 0..FILE_COUNT {
+        let p = file_text(g);
+        if path_matches(p, file) {
+            return g;
+        }
+    }
+    -1
+}
+
+// Expression text longer than this is cut (with `…`).
+const EXPR_MAX: i64 = 100;
+
+// (0.15) Whether typed node n is one the compiler made, which the source
+// does not show: a hidden local (`__f0`, `__out`, `__t`) or what takes it
+// as its operand (`&__f0`, `__out.str(..)`, also once rewritten as a
+// call), a node with a hole's span and another type than its expression
+// (`&__f0` of a captured `__f0`), and inside an f-string or a `?` (the
+// pairs `fstrings`) anything outside its holes' expressions or its
+// operand (the pairs `holes`) but the f-string or `?` itself.
+fn made_by_compiler(n: i64, fstrings: IntVec, holes: IntVec, exprs: IntVec) -> bool {
+    unsafe {
+        if hidden_name(n) {
+            return true;
+        }
+        let k = NODES[n].kind;
+        if (k == NodeKind::Unary && hidden_name(NODES[n].b))
+            || ((k == NodeKind::MethodCall || k == NodeKind::FieldAccess)
+                && hidden_name(NODES[n].a)) {
+            return true;
+        }
+        if (k == NodeKind::Call || k == NodeKind::MethodCall) && NODES[n].count > 0 {
+            let r = child(n, 0);
+            if hidden_name(r) || (NODES[r].kind == NodeKind::Unary && hidden_name(NODES[r].b)) {
+                return true;
+            }
+        }
+        if k == NodeKind::Interp || k == NodeKind::Try {
+            return false;
+        }
+        let s = NODES[n].start;
+        let e = NODES[n].end;
+        for i in 0..exprs.count {
+            let x = exprs.data[i];
+            if x != n && NODES[x].start == s && NODES[x].end == e && NODES[x].ty != NODES[n].ty {
+                return true;
+            }
+        }
+        var i = 0;
+        while i + 1 < fstrings.count {
+            if s >= fstrings.data[i] && e <= fstrings.data[i + 1] {
+                var j = 0;
+                while j + 1 < holes.count {
+                    if s >= holes.data[j] && e <= holes.data[j + 1] {
+                        return false;
+                    }
+                    j += 2;
+                }
+                return true;
+            }
+            i += 2;
+        }
+        false
+    }
+}
+
+// Whether node n is an identifier, binding or parameter whose name the
+// compiler made (`__` and more).
+fn hidden_name(n: i64) -> bool {
+    unsafe {
+        if n <= 0 {
+            return false;
+        }
+        let k = NODES[n].kind;
+        if k != NodeKind::Ident && k != NodeKind::PatBind && k != NodeKind::Param {
+            return false;
+        }
+        let a = NODES[n].a;
+        if a <= 0 {
+            return false;
+        }
+        let name = SYMS[a].text;
+        name.len > 2 && name[0] == '_' && name[1] == '_'
+    }
+}
+
+// (0.17) The type of f-string n written straight into std's printing
+// (front/check/interp.vl, direct_call), which makes no value: the one it
+// has elsewhere, `Interp<closure(*Fmt) -> () at FILE:LINE:COL>`.
+fn put_direct_fstring(out: i64, n: i64) {
+    unsafe {
+        let pos = NODES[n].start;
+        var file = 0;
+        while file + 1 < FILE_COUNT && pos >= FILES[file + 1].start {
+            file += 1;
+        }
+        let first = line_index(FILES[file].start);
+        var i = first;
+        while i + 1 < LINES.count && LINES.data[i + 1] <= pos {
+            i += 1;
+        }
+        buf_str(out, c"Interp<closure(*Fmt) -> () at ");
+        buf_str(out, FILES[file].path);
+        buf_byte(out, ':');
+        crate::base::buf_int(out, i - first + 1);
+        buf_byte(out, ':');
+        crate::base::buf_int(out, pos - LINES.data[i] + 1);
+        buf_byte(out, '>');
+    }
+}
+
+pub fn query_type(arg: [u8]) -> i64 {
+    unsafe {
+        // FILE:LINE[:COL]
+        var line = -1;
+        var col = -1;
+        var file = arg[0..0];
+        let a = trailing_number(arg);
+        if a > 0 && arg[a - 1] == ':' {
+            line = parse_digits(arg[a..arg.len]);
+            file = arg[0..a - 1];
+            let b = trailing_number(file);
+            if b > 0 && file[b - 1] == ':' {
+                col = line;
+                line = parse_digits(file[b..file.len]);
+                file = file[0..b - 1];
+            }
+        }
+        if line < 1 {
+            let d = diag(c"error", c"query.usage");
+            buf_str(d, c"type needs a position, FILE:LINE:COL (not '");
+            buf_bytes(d, arg);
+            buf_str(d, c"')\n");
+            return 2;
+        }
+        let f = file_named(file);
+        if f < 0 {
+            let d = diag(c"error", c"query.no-match");
+            buf_str(d, c"no file '");
+            buf_bytes(d, file);
+            buf_str(d, c"' in the program\n");
+            try_end(try_begin(c"items", arg[0..0], false));
+            return 1;
+        }
+        let idx = line_index(FILES[f].start) + line - 1;
+        if idx >= LINES.count || LINES.data[idx] >= FILES[f].end {
+            let d = diag(c"error", c"query.no-match");
+            buf_bytes(d, file_text(f));
+            buf_str(d, c" has no line ");
+            buf_int(d, line);
+            buf_byte(d, '\n');
+            return 1;
+        }
+        let ls = LINES.data[idx];
+        let le = line_end(ls);
+        var pos = ls;
+        if col >= 1 {
+            pos = ls + col - 1;
+        } else {
+            while pos < le && (SRC[pos] == ' ' || SRC[pos] == '\t') {
+                pos += 1;
+            }
+        }
+        if pos > le {
+            pos = le;
+        }
+        // The innermost typed nodes holding pos (copies of one in each
+        // instance of a generic function); without COL, the outermost
+        // that starts on the line.
+        let (found, var widened) = typed_nodes_at(col, pos, le);
+        if found.count == 0 {
+            let d = diag(c"error", c"query.no-match");
+            buf_str(d, c"no checked expression at ");
+            buf_bytes(d, arg);
+            buf_byte(d, '\n');
+            let w = buf_new();
+            buf_bytes(w, file_text(f));
+            buf_byte(w, ':');
+            crate::base::buf_int(w, line);
+            try_query(c"show", buf_slice(w));
+            return 1;
+        }
+        let out = buf_new();
+        var types = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..found.count {
+            let n = found.data[i];
+            let t = NODES[n].ty;
+            var seen = false;
+            for j in 0..types.count {
+                if types.data[j] == t {
+                    seen = true;
+                }
+            }
+            if seen {
+                continue;
+            }
+            types.push(t);
+            if NODES[n].kind == NodeKind::Interp && NODES[n].y < 0 {
+                put_direct_fstring(out, n);
+            } else {
+                buf_type(out, t);
+            }
+            let to = widened.get(n + 1);
+            if to > 0 {
+                // (0.15)
+                buf_str(out, c" (widened to ");
+                buf_type(out, to);
+                buf_byte(out, ')');
+            }
+            buf_byte(out, '\t');
+            let text = buf_new();
+            collapse(text, NODES[n].start, NODES[n].end);
+            let s = buf_slice(text);
+            if s.len <= EXPR_MAX {
+                buf_bytes(out, s);
+            } else {
+                var e = EXPR_MAX - 1;
+                while e > 0 && (s[e] & 192) == 128 {
+                    e -= 1;
+                }
+                buf_bytes(out, s[0..e]);
+                buf_byte(out, 226 as u8);
+                buf_byte(out, 128 as u8);
+                buf_byte(out, 166 as u8);
+            }
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDOUT);
+        0
+    }
+}
+
+// (0.24) The innermost typed nodes holding pos (col >= 1), else the
+// outermost starting on the line (pos..le), and the widened values: what
+// `query type` prints and the language server's hover shows.
+pub fn typed_nodes_at(col: i64, pos: i64, le: i64) -> (IntVec, HMap) {
+    let ix = typed_index();
+    (typed_nodes_in(ix, col, pos, le), ix.widened)
+}
+
+// (0.24) What the search for typed nodes leaves out or shows otherwise,
+// whatever the position (the language server makes it once).
+pub struct TypedIndex {
+    // (0.14: the closure's environment that a captured use reads, written
+    // nowhere: not shown)
+    pub hidden: HMap,
+    // (0.14: what a closure is lowered to, its environment's literal or its
+    // function, has the closure's span: not shown)
+    pub spans: HMap,
+    // (0.15: an f-string's spans, and its holes' expressions; the widened
+    // values, the copies an implicit cast holds, by type)
+    pub fstrings: IntVec,
+    pub holes: IntVec,
+    pub exprs: IntVec,
+    pub widened: HMap,
+}
+
+pub fn typed_index() -> TypedIndex {
+    unsafe {
+        var ix = TypedIndex {
+            hidden: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
+            spans: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
+            fstrings: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            holes: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            exprs: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+            widened: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
+        };
+        for n in 1..NODE_COUNT {
+            if (NODES[n].p & NODE_CAPTURE) == 0 {
+                continue;
+            }
+            var q = n;
+            while q > 0
+                && (NODES[q].kind == NodeKind::Unary || NODES[q].kind == NodeKind::FieldAccess) {
+                if q != n {
+                    ix.hidden.put(q + 1, 1);
+                }
+                q = if NODES[q].kind == NodeKind::Unary { NODES[q].b } else { NODES[q].a };
+            }
+            if q > 0 && q != n {
+                ix.hidden.put(q + 1, 1);
+            }
+        }
+        for n in 1..NODE_COUNT {
+            let k = NODES[n].kind;
+            if k == NodeKind::Closure {
+                ix.spans.put(NODES[n].start + 1, NODES[n].end + 1);
+            } else if k == NodeKind::Interp {
+                ix.fstrings.push(NODES[n].start);
+                ix.fstrings.push(NODES[n].end);
+            } else if k == NodeKind::InterpHole && NODES[n].a > 0 {
+                ix.holes.push(NODES[NODES[n].a].start);
+                ix.holes.push(NODES[NODES[n].a].end);
+                ix.exprs.push(NODES[n].a);
+            } else if k == NodeKind::Try && NODES[n].a > 0 {
+                // (a `?`: what it is checked as, but its operand)
+                ix.fstrings.push(NODES[n].start);
+                ix.fstrings.push(NODES[n].end);
+                ix.holes.push(NODES[NODES[n].a].start);
+                ix.holes.push(NODES[NODES[n].a].end);
+            } else if k == NodeKind::Cast && (NODES[n].p & NODE_IMPLICIT) != 0 && NODES[n].a > 0 {
+                ix.widened.put(NODES[n].a + 1, NODES[n].ty);
+            }
+        }
+        ix
+    }
+}
+
+// The search of typed_nodes_at, with the index made.
+pub fn typed_nodes_in(ix: TypedIndex, col: i64, pos: i64, le: i64) -> IntVec {
+    unsafe {
+        var best = 0;
+        var have = false;
+        var found = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for n in 1..NODE_COUNT {
+            // (the position first: the rest looks up tables)
+            if col >= 1 && (NODES[n].start > pos || NODES[n].end <= pos) {
+                continue;
+            }
+            if col < 1 && (NODES[n].start < pos || NODES[n].start >= le) {
+                continue;
+            }
+            if NODES[n].ty <= 0 || !typed_kind(NODES[n].kind) || ix.hidden.get(n + 1) != 0 {
+                continue;
+            }
+            if NODES[n].kind != NodeKind::Closure && NODES[n].kind != NodeKind::Interp
+                && ix.spans.get(NODES[n].start + 1) == NODES[n].end + 1 {
+                continue;
+            }
+            // (0.15: an implicit cast is shown as the value it widens; what
+            // the compiler writes for an f-string or a `?` is not shown)
+            if (NODES[n].kind == NodeKind::Cast && (NODES[n].p & NODE_IMPLICIT) != 0)
+                || made_by_compiler(n, ix.fstrings, ix.holes, ix.exprs) {
+                continue;
+            }
+            let size = if col >= 1 { NODES[n].end - NODES[n].start }
+                else { NODES[n].start - NODES[n].end };
+            if !have || size < best {
+                have = true;
+                best = size;
+                found.count = 0;
+            }
+            if size == best {
+                found.push(n);
+            }
+        }
+        found
+    }
+}

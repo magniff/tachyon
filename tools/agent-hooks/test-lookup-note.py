@@ -35,7 +35,7 @@ def call(command, stdout, session="s1", env=None):
     event = {"hook_event_name": "PostToolUse", "tool_name": "Bash", "session_id": session,
              "cwd": STATE, "tool_input": {"command": command},
              "tool_response": {"stdout": stdout, "stderr": ""}}
-    e = dict(os.environ, TACHYON_HOOK_STATE=STATE, **(env or {}))
+    e = dict(os.environ, VOLE_HOOK_STATE=STATE, **(env or {}))
     p = subprocess.run([sys.executable, "-I", HOOK], input=json.dumps(event),
                        capture_output=True, text=True, env=e)
     if p.returncode != 0 or p.stderr:
@@ -48,41 +48,41 @@ def call(command, stdout, session="s1", env=None):
 
 try:
     STD = "## std\nVec::push ...\n"
-    case("first guide std: nothing", call("tachyonc guide std", STD), "")
+    case("first guide std: nothing", call("volec guide std", STD), "")
     case("another command: nothing", call("ls", "a\nb\n"), "")
     case("the same lookup, the same text: the note",
-         call("tachyonc guide std", STD),
-         "PostToolUse: note: `tachyonc guide std` printed the same text at shell call 1 of this session")
-    case("never twice for one call", call("tachyonc guide std", STD), "")
+         call("volec guide std", STD),
+         "PostToolUse: note: `volec guide std` printed the same text at shell call 1 of this session")
+    case("never twice for one call", call("volec guide std", STD), "")
     case("through a copy of the compiler: the same call, noted once already",
-         call("target/tools/tachyonc guide std", STD), "")
-    case("a section: its own call", call("tachyonc guide std#Vec", "Vec\n"), "")
-    case("a section again", call("tachyonc guide std#Vec", "Vec\n"),
-         "PostToolUse: note: `tachyonc guide std#Vec` printed the same text at shell call 6 of this session")
+         call("target/tools/volec guide std", STD), "")
+    case("a section: its own call", call("volec guide std#Vec", "Vec\n"), "")
+    case("a section again", call("volec guide std#Vec", "Vec\n"),
+         "PostToolUse: note: `volec guide std#Vec` printed the same text at shell call 6 of this session")
     case("a query whose answer changed: nothing",
-         (call("tachyonc query show f", "fn f() {}\n"), call("tachyonc query show f", "fn f() { g() }\n")),
+         (call("volec query show f", "fn f() {}\n"), call("volec query show f", "fn f() { g() }\n")),
          ("", ""))
     case("the changed answer again: the note names its call",
-         call("tachyonc query show f", "fn f() { g() }\n"),
-         "PostToolUse: note: `tachyonc query show f` printed the same text at shell call 9 of this session")
-    case("explain, --help", (call("tachyonc explain E0101", "x\n"), call("tachyonc explain E0101", "x\n"),
-                             call("tachyonc edit patch --help", "usage\n"),
-                             call("tachyonc edit patch --help", "usage\n")[-32:]),
-         ("", "PostToolUse: note: `tachyonc explain E0101` printed the same text at shell call 11 of this session",
+         call("volec query show f", "fn f() { g() }\n"),
+         "PostToolUse: note: `volec query show f` printed the same text at shell call 9 of this session")
+    case("explain, --help", (call("volec explain E0101", "x\n"), call("volec explain E0101", "x\n"),
+                             call("volec edit patch --help", "usage\n"),
+                             call("volec edit patch --help", "usage\n")[-32:]),
+         ("", "PostToolUse: note: `volec explain E0101` printed the same text at shell call 11 of this session",
           "", "at shell call 13 of this session"))
-    case("an edit is no lookup", (call("tachyonc edit patch f --old a --new b", "patched\n"),
-                                  call("tachyonc edit patch f --old a --new b", "patched\n")), ("", ""))
+    case("an edit is no lookup", (call("volec edit patch f --old a --new b", "patched\n"),
+                                  call("volec edit patch f --old a --new b", "patched\n")), ("", ""))
     case("two calls on a line: not one lookup",
-         (call("tachyonc guide std; tachyonc guide unsafe", "x\n"),
-          call("tachyonc guide std; tachyonc guide unsafe", "x\n")), ("", ""))
+         (call("volec guide std; volec guide unsafe", "x\n"),
+          call("volec guide std; volec guide unsafe", "x\n")), ("", ""))
     case("an empty answer (an error): nothing",
-         (call("tachyonc guide nope", ""), call("tachyonc guide nope", "")), ("", ""))
-    case("another session: its own", call("tachyonc guide std", STD, session="s2"), "")
-    case("TACHYON_LOOKUP_NOTE=0: off",
-         call("tachyonc guide std", STD, session="s2", env={"TACHYON_LOOKUP_NOTE": "0"}), "")
+         (call("volec guide nope", ""), call("volec guide nope", "")), ("", ""))
+    case("another session: its own", call("volec guide std", STD, session="s2"), "")
+    case("VOLE_LOOKUP_NOTE=0: off",
+         call("volec guide std", STD, session="s2", env={"VOLE_LOOKUP_NOTE": "0"}), "")
     case("deterministic: no time or id in the text",
-         call("tachyonc guide std", STD, session="s2"),
-         "PostToolUse: note: `tachyonc guide std` printed the same text at shell call 1 of this session")
+         call("volec guide std", STD, session="s2"),
+         "PostToolUse: note: `volec guide std` printed the same text at shell call 1 of this session")
 finally:
     shutil.rmtree(STATE, ignore_errors=True)
 

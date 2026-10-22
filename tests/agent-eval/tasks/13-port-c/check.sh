@@ -28,13 +28,13 @@ hit=$(grep -nE '\.c"|\.o"|#\[link|link_name|include!|include_str!|include_bytes!
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/check13.XXXXXX") || fail "mktemp failed"
 trap 'rm -rf "$tmp"' EXIT
 # (0.16) The whole workspace, its directories kept: `cp $files` flattened
-# them, so a copy such as scratch/main.tach replaced main.tach.
+# them, so a copy such as scratch/main.vl replaced main.vl.
 tar cf - --exclude ./.git --exclude ./prog . | (cd "$tmp" && tar xf -) ||
     fail "copying the sources failed"
 cd "$tmp" || fail "cd failed"
 rm -f reference.c prog
 case "$EVAL_LANG" in
-    tach) tachyonc main.tach -o prog >build.log 2>&1 ;;
+    tach) volec main.vl -o prog >build.log 2>&1 ;;
     rust) rustc -O --edition 2021 main.rs -o prog >build.log 2>&1 ;;
 esac
 [ -x prog ] || fail "does not build without reference.c"

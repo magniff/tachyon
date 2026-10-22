@@ -8,13 +8,13 @@
 // entry. The fragment stage reads the glyph's coverage (or colour) texel
 // at the pixel's offset in the cell, draws the decorations and the thin
 // cursors, and mixes foreground over background: no blending, no
-// overdraw. Every rule has its twin in tests/voltty-render/cpu.tach, the
+// overdraw. Every rule has its twin in tests/voltty-render/cpu.vl, the
 // reference renderer the tests compare GPU images with;
 // tests/wgsl/cases/cells_vs.wgsl and cells_fs.wgsl run the two stages on
 // the interpreter.
 //
-// cells.tach holds this text as a constant (render/embed.sh writes it:
-// tachyon has no include_str yet).
+// cells.vl holds this text as a constant (render/embed.sh writes it:
+// vole has no include_str yet).
 
 struct U {
     cols: u32, lines: u32, top: u32, cw: u32,

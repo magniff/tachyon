@@ -1,0 +1,722 @@
+// The commands: `edit replace|insert|delete|patch` and their options,
+// `undo` and `check`; an item's text replaced, inserted next to another,
+// or deleted with its lines.
+
+use crate::arch::features::arch_options_given;
+use crate::base::{
+    BUFS, FILES, FILE_COUNT, IntVec, OVERLAY, SRC, SYMS, _setjmp, alloc_zeroed, buf_byte, buf_bytes,
+    buf_fmt, buf_int, buf_new, buf_slice, buf_str, streq,
+};
+use crate::base::diag::{
+    DIAG_SHORT, ERR_BAIL, RECOVER_DEPTH, error_count, flush_warnings, print_ok, warning_count,
+    write_errors,
+};
+use crate::base::target::target_of_name;
+use crate::base::timer::{TIME_PASSES, timer_report};
+use crate::front::modules::file_of_pos;
+use crate::front::own::diag::OWN_REPORT_PRINT;
+use crate::front::stdtree::{STD_TREE, find_std_tree, std_files_differ};
+use crate::tools::conflicts::resolve::run_resolve;
+use crate::tools::edit::{
+    ARGC, ARGV, DRY_RUN, NO_CHECK, SHOW, TARGET, TARGET_NAME, edit_remove_file, edit_replace,
+};
+use crate::tools::edit::apply::{ADD_IMPORTS, apply_edit, try_replaced};
+use crate::tools::edit::applyfile::run_apply;
+use crate::tools::edit::items::{
+    after_line, blank_line, indent_of, item_head, item_tail, item_text, keyword_head, leading,
+    whole_lines,
+};
+use crate::tools::edit::newfile::run_new_file;
+use crate::tools::edit::stdedit::{names_std_file, rerun_in_std_tree, std_rerun};
+use crate::tools::edit::undo::run_undo;
+use crate::tools::edit::wrap::run_wrap;
+use crate::tools::patch::run_patch;
+use crate::tools::proc::read_stdin;
+use crate::tools::query::{c_slice, file_named, resolve_name, root_or_diag};
+use crate::tools::query::cache::{cache_on, cache_restore, cache_save};
+use crate::tools::query::command_line::{PARSED, QUERY, front_end, index_program, load_program};
+use crate::tools::query::defs::{
+    DEFS, K_CONST, K_FIELD, K_MOD, K_STATIC, K_VARIANT, bytes_eq, mod_fqn_text,
+};
+use crate::tools::query::diagnostics::{
+    OPT_EXACT, PROG, ROOT_GIVEN, TOOL, diag, program_errors, try_begin, try_end, write_diags,
+};
+use crate::tools::query::positions::{line_end, line_of, line_start};
+use crate::tools::query::refs::file_text;
+use crate::tools::query::show::text_start;
+use crate::tools::query_text::{region_spans, region_target};
+
+// ---- The commands ----
+
+pub fn run_edit(argc: i64, argv: **u8) -> i64 {
+    let status = run_edit_inner(argc, argv);
+    write_diags();
+    timer_report();
+    status
+}
+
+fn usage(message: *u8) -> i64 {
+    unsafe {
+        let d = diag(c"error", c"edit.usage");
+        buf_str(d, message);
+        buf_byte(d, '\n');
+        let out = try_begin(c"replace NAME < new.vl", c_slice(c""), false);
+        try_end(out);
+        2
+    }
+}
+
+// The options the editing commands share: --dry-run, --no-check, --show,
+// --exact, --root R, --target T, --std-tree DIR. Whether a[i] is one (*i moves past its
+// value).
+pub fn take_edit_option(argc: i64, argv: **u8, i: inout i64, root: **u8) -> bool {
+    unsafe {
+        let a = argv[i];
+        if streq(a, c"--dry-run") {
+            DRY_RUN = true;
+        } else if streq(a, c"--show") {
+            SHOW = true;
+        } else if streq(a, c"--time-passes") {
+            TIME_PASSES = true;
+        } else if streq(a, c"--no-check") {
+            NO_CHECK = true;
+        } else if streq(a, c"--exact") {
+            OPT_EXACT = true;
+        } else if streq(a, c"-C") && i + 1 < argc
+            && crate::arch::features::arch_option(argv[i + 1]) {
+            // (0.19: -C target-cpu=, -C target-feature=: which calls are
+            // legal)
+            i += 1;
+        } else if (streq(a, c"--root") || streq(a, c"--target") || streq(a, c"--std-tree"))
+            && i + 1 < argc {
+            if streq(a, c"--root") {
+                *root = argv[i + 1];
+            } else if streq(a, c"--std-tree") {
+                // (0.17: std from its files, stdtree.vl; stdedit.vl)
+                STD_TREE = argv[i + 1];
+            } else {
+                TARGET_NAME = argv[i + 1];
+                TARGET = target_of_name(TARGET_NAME);
+            }
+            i += 1;
+        } else {
+            return false;
+        }
+        true
+    }
+}
+
+// Whether word is one of argv[3..].
+fn has_arg(argc: i64, argv: **u8, word: *u8) -> bool {
+    for i in 3..argc {
+        if unsafe { streq(argv[i], word) } {
+            return true;
+        }
+    }
+    false
+}
+
+// `edit replace|insert|delete ...` (`patch`, `insert --in`: patch.vl).
+fn run_edit_inner(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        PROG = argv[0];
+        TOOL = c"edit";
+        ARGC = argc;
+        ARGV = argv;
+        if argc < 3 {
+            return usage(c"no command (patch, apply, replace, insert, delete)");
+        }
+        let cmd = argv[2];
+        // (0.17: a std file named, `edit patch compiler/std/io.vl:102`:
+        // the edit runs on std's files; stdedit.vl)
+        if names_std_file(argc, argv) {
+            return rerun_in_std_tree(argc, argv);
+        }
+        if streq(cmd, c"patch") || (streq(cmd, c"insert") && has_arg(argc, argv, c"--in")) {
+            return run_patch(argc, argv);
+        }
+        if streq(cmd, c"resolve") {
+            return run_resolve(argc, argv);
+        }
+        if streq(cmd, c"wrap") {
+            return run_wrap(argc, argv);
+        }
+        if streq(cmd, c"new-file") {
+            return run_new_file(argc, argv);
+        }
+        if streq(cmd, c"apply") {
+            return run_apply(argc, argv);
+        }
+        let replace = streq(cmd, c"replace");
+        let insert = streq(cmd, c"insert");
+        let delete = streq(cmd, c"delete");
+        if !replace && !insert && !delete {
+            let d = diag(c"error", c"edit.usage");
+            buf_str(d, c"unknown command '");
+            buf_str(d, cmd);
+            buf_str(d, c"' (patch, apply, replace, insert, delete, wrap, new-file, resolve)\n");
+            return 2;
+        }
+        var after = false;
+        var before = false;
+        var root = 0 as *u8;
+        var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var i = 3;
+        while i < argc {
+            let a = argv[i];
+            if streq(a, c"--after") {
+                after = true;
+            } else if streq(a, c"--before") {
+                before = true;
+            } else if take_edit_option(argc, argv, &i, &root) {
+            } else if a[0] == '-' && a[1] == '-' {
+                let d = diag(c"error", c"edit.usage");
+                buf_str(d, c"unknown option '");
+                buf_str(d, a);
+                buf_str(d, c"'\n");
+                return 2;
+            } else {
+                names.push(a as i64);
+            }
+            i += 1;
+        }
+        if names.count == 2 && root == 0 as *u8
+            && crate::base::is_source_path(names.data[1] as *u8) {
+            root = names.data[1] as *u8;
+            names.count = 1;
+        }
+        if names.count != 1 {
+            return usage(if names.count == 0 { c"a NAME is needed" }
+                else { c"one NAME at a time" });
+        }
+        if insert && after == before {
+            return usage(c"insert needs --after or --before");
+        }
+        let name = c_slice(names.data[0] as *u8);
+        let what = if insert { if after { c"insert --after" } else { c"insert --before" } }
+            else { cmd };
+        ROOT_GIVEN = root;
+        // The new text, first: nothing is read when there is none.
+        let input = buf_new();
+        if !delete && (!read_stdin(input) || BUFS[input].len == 0) {
+            let d = diag(c"error", c"edit.no-text");
+            buf_str(d, c"the new text is read from stdin; none was given\n");
+            let out = try_begin(what, name, true);
+            buf_str(out, c" < new.vl");
+            try_end(out);
+            return 2;
+        }
+        root = root_or_diag(root, what, name, true);
+        if root == 0 as *u8 {
+            return 2;
+        }
+        if !cache_restore(root, TARGET, false) && !load_program(root, TARGET) {
+            program_errors(c"error", root, true);
+            return 1;
+        }
+        // A module's use lines or header comment (0.12).
+        var rf = 0;
+        var rk = 0;
+        var spans = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        let r = region_target(name, what, &rf, &rk, &spans);
+        if r == 1 {
+            return 1;
+        }
+        let how = if replace { 'r' } else if insert { if after { 'a' } else { 'b' } } else { 'd' };
+        if r == 0 {
+            return edit_region(rf, rk, spans, how, input, root);
+        }
+        // (0.17) `edit replace FILE.vl < text`: the whole file.
+        if replace && crate::base::is_source_path(names.data[0] as *u8) {
+            let f = file_named(name);
+            if f >= 0 && FILES[f].path[0] != '<' {
+                let text = buf_new();
+                buf_bytes(text, buf_slice(input));
+                if BUFS[text].len > 0 && BUFS[text].data[BUFS[text].len - 1] != '\n' {
+                    buf_byte(text, '\n');
+                }
+                edit_replace(FILES[f].start, FILES[f].end, text);
+                let summary = buf_new();
+                buf_str(summary, c"replaced ");
+                buf_bytes(summary, file_text(f));
+                return apply_edit(buf_slice(summary), root);
+            }
+        }
+        var matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        if !resolve_name(what, name, &matches) {
+            return 1;
+        }
+        source_only(&matches);
+        if matches.count > 1 {
+            ambiguous(what, name, matches);
+            return 1;
+        }
+        let d = matches.data[0];
+        let f = file_of_pos(DEFS[d].start);
+        if FILES[f].path[0] == '<' {
+            // (0.17: std, in the repository: in its files; stdedit.vl)
+            if std_rerun(f) {
+                return rerun_in_std_tree(argc, argv);
+            }
+            let e = diag(c"error", c"edit.not-source");
+            buf_bytes(e, SYMS[DEFS[d].fqn].text);
+            buf_str(e, c" is in ");
+            buf_str(e, FILES[f].path);
+            buf_str(e, c", not in a file of the program\n");
+            return 1;
+        }
+        let summary = buf_new();
+        // (0.14: the imports the new text needs, when it has new errors)
+        ADD_IMPORTS = !delete;
+        if !item_edit(how, d, input, summary) {
+            return 1;
+        }
+        apply_edit(buf_slice(summary), root)
+    }
+}
+
+// The edit of item d (0.15: for edit apply too): `how` 'r' replace it by
+// the text of buffer input, 'a' or 'b' insert that text after or before
+// it, 'd' delete it (see Items as text); its words in summary (`replaced
+// crate::f`). False after the diagnostic.
+pub fn item_edit(how: u8, d: i64, input: i64, summary: i64) -> bool {
+    unsafe {
+        let whole = whole_lines(d);
+        let head = item_head(d);
+        let tail = item_tail(d);
+        let member = DEFS[d].kind == K_FIELD || DEFS[d].kind == K_VARIANT;
+        var added = true;
+        if how == 'r' {
+            let text = item_text(buf_slice(input), if whole { indent_of(head) } else { SRC[0..0] });
+            if whole {
+                // (what the text has, it replaces: comments, attributes)
+                let lead = leading(buf_slice(text));
+                let from = if lead == '/' { line_start(text_start(d)) }
+                    else if lead == '#' { line_start(head) } else { line_start(keyword_head(d)) };
+                added = edit_replace(from, line_end(tail - 1), text);
+            } else {
+                added = edit_replace(head, tail, text);
+            }
+            buf_str(summary, c"replaced ");
+        } else if how == 'a' || how == 'b' {
+            if !whole {
+                let e = diag(c"error", c"edit.layout");
+                buf_bytes(e, SYMS[DEFS[d].fqn].text);
+                buf_str(e,
+                    c" shares its line with other code; insert needs an item on lines of its own\n");
+                return false;
+            }
+            let text = item_text(buf_slice(input), indent_of(head));
+            // (0.17: a one-line const or static next to one joins its run)
+            let t = buf_slice(text);
+            var lines = 0;
+            for i in 0..t.len {
+                if t[i] == '\n' && i + 1 < t.len {
+                    lines += 1;
+                }
+            }
+            let run = (DEFS[d].kind == K_CONST || DEFS[d].kind == K_STATIC) && lines == 0
+                && line_of(text_start(d)) == line_of(tail - 1)
+                && const_or_static(t);
+            let sep = if member || run { c"\n" } else { c"\n\n" };
+            let out = buf_new();
+            if how == 'a' {
+                buf_str(out, sep);
+                buf_bytes(out, buf_slice(text));
+                added = edit_replace(line_end(tail - 1), line_end(tail - 1), out);
+                buf_str(summary, c"inserted after ");
+            } else {
+                buf_bytes(out, buf_slice(text));
+                buf_str(out, sep);
+                let at = line_start(text_start(d));
+                added = edit_replace(at, at, out);
+                buf_str(summary, c"inserted before ");
+            }
+        } else {
+            added = delete_item(d, whole, head, tail);
+            buf_str(summary, c"deleted ");
+        }
+        buf_bytes(summary, SYMS[DEFS[d].fqn].text);
+        if !added {
+            let e = diag(c"error", c"edit.overlap");
+            buf_bytes(e, SYMS[DEFS[d].fqn].text);
+            buf_str(e, c" is changed twice in one edit; give each item one block\n");
+            return false;
+        }
+        true
+    }
+}
+
+// (0.17) Whether text t (an item's) is a const or a static.
+fn const_or_static(t: [u8]) -> bool {
+    unsafe {
+        var i = 0;
+        while i < t.len && (t[i] == ' ' || t[i] == '\t') {
+            i += 1;
+        }
+        var s = t[i..t.len];
+        if s.len > 4 && bytes_eq(s[0..4], c_slice(c"pub ")) {
+            s = s[4..s.len];
+        }
+        (s.len > 6 && bytes_eq(s[0..6], c_slice(c"const ")))
+            || (s.len > 7 && bytes_eq(s[0..7], c_slice(c"static ")))
+    }
+}
+
+// The edit deleting definition d (its text, see Items as text).
+fn delete_item(d: i64, whole: bool, head: i64, tail: i64) -> bool {
+    unsafe {
+        let f = file_of_pos(head);
+        if !whole {
+            // Its bytes, and the `, ` after it (or the `,` before it).
+            var a = head;
+            var b = tail;
+            if SRC[tail - 1] != ',' {
+                var n = tail;
+                while n < FILES[f].end && (SRC[n] == ' ' || SRC[n] == '\t') {
+                    n += 1;
+                }
+                var p = head;
+                while p > FILES[f].start && (SRC[p - 1] == ' ' || SRC[p - 1] == '\t') {
+                    p -= 1;
+                }
+                if n < FILES[f].end && SRC[n] == ',' {
+                    b = n + 1;
+                } else if p > FILES[f].start && SRC[p - 1] == ',' {
+                    a = p - 1;
+                }
+            }
+            if a == head {
+                while b < FILES[f].end && (SRC[b] == ' ' || SRC[b] == '\t') {
+                    b += 1;
+                }
+            }
+            return edit_replace(a, b, buf_new());
+        }
+        if !delete_lines(line_start(text_start(d)), tail) {
+            return false;
+        }
+        // (0.17) A module's files go with its `mod` line: its own file
+        // and its children's.
+        if DEFS[d].kind == K_MOD {
+            let m = SYMS[DEFS[d].fqn].text;
+            for g in 0..FILE_COUNT {
+                let t = mod_fqn_text(FILES[g].module);
+                if FILES[g].path[0] != '<'
+                    && (FILES[g].start < DEFS[d].start || FILES[g].start >= DEFS[d].end)
+                    && (bytes_eq(t, m) || (t.len > m.len + 2 && bytes_eq(t[0..m.len], m)
+                        && t[m.len] == ':' && t[m.len + 1] == ':')) {
+                    edit_remove_file(c_slice(FILES[g].path));
+                }
+            }
+        }
+        true
+    }
+}
+
+// An edit of a module's use lines or its header comment, file f's regions
+// of kind `kind` (1 use, 2 header; byte ranges in spans), `how`: 'r'
+// replace (the first region becomes TEXT, the others go; with none, TEXT
+// goes at the top of the file, after its header for use lines), 'a' or
+// 'b' insert (after the last use line, before the first), 'd' delete.
+fn edit_region(f: i64, kind: i64, spans: IntVec, how: u8, input: i64, root: *u8) -> i64 {
+    let summary = buf_new();
+    let status = region_edit(f, kind, spans, how, input, summary);
+    if status >= 0 {
+        return status;
+    }
+    apply_edit(buf_slice(summary), root)
+}
+
+// The edit of edit_region, its words in summary (`replaced crate::m::use`):
+// -1 when it is made, else the exit status (after the diagnostic).
+pub fn region_edit(f: i64, kind: i64, spans: IntVec, how: u8, input: i64, summary: i64) -> i64 {
+    unsafe {
+        let n = spans.count;
+        let text = if how == 'd' { buf_new() } else { item_text(buf_slice(input), SRC[0..0]) };
+        if (how == 'a' || how == 'b') && kind == 2 {
+            let e = diag(c"error", c"edit.layout");
+            buf_str(e, c"a header comment is replaced, not inserted next to\n");
+            let out = try_begin(c"replace", mod_fqn_text(FILES[f].module), true);
+            buf_str(out, c"::header < header.txt");
+            try_end(out);
+            return 1;
+        }
+        if how == 'd' && n == 0 {
+            let e = diag(c"note", c"edit.unchanged");
+            buf_str(e, c"nothing to delete\n");
+            return 0;
+        }
+        if how == 'd' {
+            var k = 0;
+            while k < n {
+                delete_lines(spans.data[k], spans.data[k + 1]);
+                k += 2;
+            }
+            buf_str(summary, c"deleted ");
+        } else if n == 0 {
+            // (none yet: at the top, after the header for use lines)
+            var at = FILES[f].start;
+            if kind != 2 {
+                while at < FILES[f].end && (blank_line(at) || comment_at(at)) {
+                    at = after_line(at);
+                }
+            }
+            if kind == 3 {
+                // (extern blocks: after the use lines)
+                var uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                region_spans(f, 1, &uses);
+                if uses.count > 0 {
+                    at = FILES[f].start;
+                    for _ in 0..uses.data[uses.count - 1] + 1 {
+                        at = after_line(at);
+                    }
+                    while at < FILES[f].end && blank_line(at) {
+                        at = after_line(at);
+                    }
+                }
+            }
+            let out = buf_new();
+            buf_bytes(out, buf_slice(text));
+            buf_str(out, if at < FILES[f].end { c"\n\n" } else { c"\n" });
+            edit_replace(at, at, out);
+            buf_str(summary, if how == 'r' { c"replaced " } else { c"inserted " });
+        } else if how == 'r' {
+            edit_replace(spans.data[0], line_end(spans.data[1] - 1), text);
+            var k = 2;
+            while k < n {
+                delete_lines(spans.data[k], spans.data[k + 1]);
+                k += 2;
+            }
+            buf_str(summary, c"replaced ");
+        } else {
+            let out = buf_new();
+            if how == 'a' {
+                let at = line_end(spans.data[n - 1] - 1);
+                buf_byte(out, '\n');
+                buf_bytes(out, buf_slice(text));
+                edit_replace(at, at, out);
+                buf_str(summary, c"inserted after ");
+            } else {
+                buf_bytes(out, buf_slice(text));
+                buf_byte(out, '\n');
+                edit_replace(spans.data[0], spans.data[0], out);
+                buf_str(summary, c"inserted before ");
+            }
+        }
+        buf_bytes(summary, mod_fqn_text(FILES[f].module));
+        buf_str(summary, if kind == 1 { c"::use" } else if kind == 2 { c"::header" }
+            else { c"::extern" });
+        -1
+    }
+}
+
+// Whether the line at pos is a comment (blanks before `//`).
+fn comment_at(pos: i64) -> bool {
+    unsafe {
+        var p = pos;
+        while SRC[p] == ' ' || SRC[p] == '\t' {
+            p += 1;
+        }
+        SRC[p] == '/' && SRC[p + 1] == '/'
+    }
+}
+
+// The edit deleting the lines from `first` (a line's start) through the
+// line of tail - 1, and one blank line next to them, so that no two are
+// left together (nor one after an opening brace, or before a closing
+// one).
+pub fn delete_lines(first: i64, tail: i64) -> bool {
+    unsafe {
+        let f = file_of_pos(first);
+        var a = first;
+        var b = after_line(tail - 1);
+        let prev = if a > FILES[f].start { line_start(a - 1) } else { -1 };
+        let prev_blank = prev >= 0 && blank_line(prev);
+        let opens = prev >= 0 && !prev_blank && ends_with_brace(prev, a - 1);
+        if b < FILES[f].end && blank_line(b) && (prev < 0 || prev_blank || opens) {
+            b = after_line(b);
+        } else if prev_blank && (b >= FILES[f].end || starts_with_brace(b)) {
+            a = prev;
+        }
+        edit_replace(a, b, buf_new())
+    }
+}
+
+// Whether the line from..to ends with `{` (blanks aside).
+fn ends_with_brace(from: i64, to: i64) -> bool {
+    unsafe {
+        var e = to;
+        while e > from && (SRC[e - 1] == ' ' || SRC[e - 1] == '\t' || SRC[e - 1] == '\r') {
+            e -= 1;
+        }
+        e > from && SRC[e - 1] == '{'
+    }
+}
+
+// Whether the line at pos starts with `}` (blanks aside).
+fn starts_with_brace(pos: i64) -> bool {
+    unsafe {
+        var p = pos;
+        while SRC[p] == ' ' || SRC[p] == '\t' {
+            p += 1;
+        }
+        SRC[p] == '}'
+    }
+}
+
+// Leaves out of matches the definitions that are not in a file of the
+// program (std's, the C headers'), unless all are.
+pub fn source_only(matches: inout IntVec) {
+    unsafe {
+        var kept = 0;
+        for i in 0..matches.count {
+            let d = matches.data[i];
+            if FILES[file_of_pos(DEFS[d].start)].path[0] != '<' {
+                matches.data[kept] = d;
+                kept += 1;
+            }
+        }
+        if kept > 0 {
+            matches.count = kept;
+        }
+    }
+}
+
+// NAME matches several definitions: refused, with the first three paths
+// (and the query listing them all, when there are more).
+pub fn ambiguous(what: *u8, name: [u8], matches: IntVec) {
+    unsafe {
+        let n = matches.count;
+        let d = diag(c"error", c"query.ambiguous");
+        buf_int(d, n);
+        buf_str(d, c" definitions match '");
+        buf_bytes(d, name);
+        buf_str(d, c"'; name one\n");
+        for i in 0..n {
+            if i == 3 || (i == 2 && n > 3) {
+                break;
+            }
+            // (0.17: the command as run, the name replaced)
+            let fqn = SYMS[DEFS[matches.data[i]].fqn].text;
+            if !try_replaced(name, fqn) {
+                try_end(try_begin(what, fqn, true));
+            }
+        }
+        if n > 3 {
+            let out = try_begin(c"def", name, true);
+            try_end(out);
+        }
+    }
+}
+
+// `volec undo [--force] [ROOT]`.
+pub fn run_undo_command(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        PROG = argv[0];
+        var force = false;
+        var from = 0 as *u8;
+        for i in 2..argc {
+            if streq(argv[i], c"--force") {
+                force = true;
+            } else if argv[i][0] != '-' {
+                from = argv[i];
+            }
+        }
+        let status = run_undo(force, from);
+        write_diags();
+        status
+    }
+}
+
+// `volec check [ROOT] [--target T] [--diagnostics=human]`: the front
+// end (parse, resolve, check, unsafe check), every error, one per line;
+// exit 1 when there is one. (`--overlay FILE COPY` reads COPY for FILE:
+// how an edit is checked before it is written.)
+pub fn run_check(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        PROG = argv[0];
+        DIAG_SHORT = true;
+        var root = 0 as *u8;
+        var i = 2;
+        while i < argc {
+            let a = argv[i];
+            if streq(a, c"--overlay") && i + 2 < argc {
+                OVERLAY.push(argv[i + 1] as i64);
+                OVERLAY.push(argv[i + 2] as i64);
+                i += 3;
+                continue;
+            }
+            if streq(a, c"--diagnostics=human") || streq(a, c"--diagnostics=short") {
+                DIAG_SHORT = streq(a, c"--diagnostics=short");
+            } else if take_edit_option(argc, argv, &i, &root) {
+            } else if a[0] == '-' {
+                let d = diag(c"error", c"check.usage");
+                buf_str(d, c"unknown option '");
+                buf_str(d, a);
+                buf_str(d, c"'\n");
+                write_diags();
+                return 2;
+            } else {
+                root = a;
+            }
+            i += 1;
+        }
+        // (0.17: std's files in the repository edited since this compiler
+        // was built: checked with them, as the next build will be;
+        // front/stdtree.vl. Not for an edit's check: --overlay.)
+        if STD_TREE == 0 as *u8 && OVERLAY.count == 0 {
+            let tree = find_std_tree();
+            if tree != 0 as *u8 && std_files_differ(tree) {
+                STD_TREE = tree;
+                let d = diag(c"note", c"check.std-files");
+                buf_str(d, c"std's files differ from this compiler's std: checked with ");
+                buf_str(d, tree);
+                buf_str(d, c" (bootstrap/bootstrap.sh --dev builds them in)\n");
+            }
+        }
+        ROOT_GIVEN = root;
+        root = root_or_diag(root, c"check", c_slice(c""), false);
+        if root == 0 as *u8 {
+            write_diags();
+            return 2;
+        }
+        // (0.13: the errors from the tools' cache, when it holds for the
+        // program; else the front end, with the queries' notes and index
+        // for the cache)
+        // (0.17: --values=report prints what the walk finds: no cache)
+        if OWN_REPORT_PRINT || arch_options_given() || !cache_restore(root, TARGET, false) {
+            let cached = cache_on() && !arch_options_given();
+            QUERY = cached;
+            ERR_BAIL = alloc_zeroed(512);
+            if _setjmp(ERR_BAIL) == 0 {
+                front_end(root, TARGET);
+            }
+            RECOVER_DEPTH = 0;
+            ERR_BAIL = 0 as *u8;
+            QUERY = false;
+            if cached && PARSED {
+                index_program();
+                cache_save(root, TARGET);
+            }
+        }
+        if error_count() > 0 {
+            write_errors();
+            timer_report();
+            return 1;
+        }
+        let warned = warning_count();
+        flush_warnings();
+        timer_report();
+        // (0.18.1) the success line: `ok: 0 errors in ROOT`
+        let what = buf_new();
+        buf_str(what, c"0 errors");
+        if warned > 0 {
+            buf_fmt(what, f", {warned} warning{if warned == 1 { "" } else { "s" }}");
+        }
+        buf_str(what, c" in ");
+        buf_str(what, root);
+        print_ok(buf_slice(what));
+        0
+    }
+}

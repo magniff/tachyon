@@ -1,22 +1,22 @@
 #!/bin/sh
 # The 0.17 validation round (plans/0.17-validation.md): the deciding cells
-# of docs/research/applying-to-tachyon.md's rerun matrix, against the 0.16
+# of docs/research/applying-to-vole.md's rerun matrix, against the 0.16
 # round as the baseline. Run from the repository root of a checkout holding
 # this runner:
 #
 #   sh tests/agent-eval/plans/0.17-validation.sh             # A, A-control, drift, tools, C, G, report
-#   STEP=D sh tests/agent-eval/plans/0.17-validation.sh      # after `tachyonc test` and settings-eval.json
-#   STEP=E TACHYONC_DIAG=... sh tests/agent-eval/plans/0.17-validation.sh   # after item 5
+#   STEP=D sh tests/agent-eval/plans/0.17-validation.sh      # after `volec test` and settings-eval.json
+#   STEP=E VOLEC_DIAG=... sh tests/agent-eval/plans/0.17-validation.sh   # after item 5
 #
 # Environment:
 #   BASE        the 0.16 round's results (default: the main checkout's
 #               .claude/briefs/evalruns/0.16)
-#   TACHYONC    the 0.17 candidate for the program tasks (default
-#               target/tachyonc; must have `tachyonc guide --full`)
-#   TOOLS_TACHYONC  compiler tasks: the binary given as target/tools/tachyonc
+#   VOLEC    the 0.17 candidate for the program tasks (default
+#               target/volec; must have `volec guide --full`)
+#   TOOLS_VOLEC  compiler tasks: the binary given as target/tools/volec
 #               (default: unset, the starter's: the compiler tasks' base is
 #               the integrated 0.17 tree, so the starter has the new tools)
-#   TACHYONC_DIAG   step E: the compiler with item 5's diagnostics
+#   VOLEC_DIAG   step E: the compiler with item 5's diagnostics
 #   MODELS      default "claude:haiku claude:sonnet" (side by side)
 #   DREPS       reps of the deciding Sonnet program cells (default 10)
 #   REPS        reps elsewhere (default 3)
@@ -29,8 +29,8 @@ cd "$(dirname "$0")/../../.."
 RUN=tests/agent-eval/run.py
 main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 BASE=${BASE:-$main/.claude/briefs/evalruns/0.16}
-TACHYONC=${TACHYONC:-target/tachyonc}
-TOOLS_TACHYONC=${TOOLS_TACHYONC:-}
+VOLEC=${VOLEC:-target/volec}
+TOOLS_VOLEC=${TOOLS_VOLEC:-}
 MODELS=${MODELS:-"claude:haiku claude:sonnet"}
 DREPS=${DREPS:-10}
 REPS=${REPS:-3}
@@ -54,27 +54,27 @@ wait_all() {
 }
 
 [ -d "$BASE" ] || { echo "plan: no baseline at $BASE (BASE=...)" >&2; exit 1; }
-"$TACHYONC" guide --full > /dev/null 2>&1 ||
-    { echo "plan: $TACHYONC has no 'guide --full' (not a 0.17 candidate with the short core)" >&2; exit 1; }
+"$VOLEC" guide --full > /dev/null 2>&1 ||
+    { echo "plan: $VOLEC has no 'guide --full' (not a 0.17 candidate with the short core)" >&2; exit 1; }
 tools_arg=""
-[ -n "$TOOLS_TACHYONC" ] && tools_arg="--tools-tachyonc $TOOLS_TACHYONC"
+[ -n "$TOOLS_VOLEC" ] && tools_arg="--tools-volec $TOOLS_VOLEC"
 
 # J. the tasks are valid: solutions, variants, lints, the prompts' examples
 if want check; then
     say "check-tasks"
-    $RUN check-tasks --set all --tachyonc "$TACHYONC"
+    $RUN check-tasks --set all --volec "$VOLEC"
 fi
 
 # no model: every new condition's prompt, settings and hooks
 if want dry; then
     say "dry run"
     rm -rf "$OUT/0.17v-dry"
-    $RUN run --model claude:haiku --set dev --tasks 00-hello-sum --tachyonc "$TACHYONC" \
+    $RUN run --model claude:haiku --set dev --tasks 00-hello-sum --volec "$VOLEC" \
         --cond guide,guide-core,tools-core,both-core,rust-pairs,both+hook,both+hook+test,rust \
-        --dry-run --out "$OUT/0.17v-dry" --ws-root "${TMPDIR:-/tmp}/tachyon-eval/0.17v-dry"
+        --dry-run --out "$OUT/0.17v-dry" --ws-root "${TMPDIR:-/tmp}/vole-eval/0.17v-dry"
     $RUN run --model claude:haiku --set compiler --tasks 21-opt-peephole $tools_arg \
         --cond compiler-tools,compiler-plain,compiler-tools-core,compiler-tools-core+test \
-        --dry-run --out "$OUT/0.17v-dry" --ws-root "${TMPDIR:-/tmp}/tachyon-eval/0.17v-dry"
+        --dry-run --out "$OUT/0.17v-dry" --ws-root "${TMPDIR:-/tmp}/vole-eval/0.17v-dry"
     python3 - "$OUT/0.17v-dry" <<'PY'
 import json, os, sys
 bad = 0
@@ -109,7 +109,7 @@ if want A; then
     for m in $MODELS; do
         say "A: $m guide-core x $(reps_for "$m")"
         $RUN run --model "$m" --set programs --cond guide-core --reps "$(reps_for "$m")" \
-            --jobs "$JOBS" --tachyonc "$TACHYONC" --out "$OUT/0.17v-A-$(slug "$m")" &
+            --jobs "$JOBS" --volec "$VOLEC" --out "$OUT/0.17v-A-$(slug "$m")" &
         pids="$pids $!"
     done
     wait_all
@@ -121,7 +121,7 @@ if want A-control; then
         say "A-control: $m guide x $REPS, baseline cells reused"
         $RUN run --model "$m" --set programs --cond guide --reps "$REPS" \
             --skip-existing-in "$BASE/0.16-programs-$(slug "$m")" \
-            --jobs "$JOBS" --tachyonc "$TACHYONC" --out "$OUT/0.17v-Actl-$(slug "$m")" &
+            --jobs "$JOBS" --volec "$VOLEC" --out "$OUT/0.17v-Actl-$(slug "$m")" &
         pids="$pids $!"
     done
     wait_all
@@ -133,7 +133,7 @@ if want drift; then
         say "drift: $m guide on 13, 16, 17 x $REPS"
         $RUN run --model "$m" --set programs --cond guide --reps "$REPS" \
             --tasks 13-port-c,16-perf-tight,17-debug-crash \
-            --jobs "$JOBS" --tachyonc "$TACHYONC" --out "$OUT/0.17v-drift-$(slug "$m")" &
+            --jobs "$JOBS" --volec "$VOLEC" --out "$OUT/0.17v-drift-$(slug "$m")" &
         pids="$pids $!"
     done
     wait_all
@@ -144,7 +144,7 @@ if want tools; then
     for m in $MODELS; do
         say "tools: $m both-core on 13-18 x $(reps_for "$m")"
         $RUN run --model "$m" --set programs --cond both-core --tasks "$HARD" \
-            --reps "$(reps_for "$m")" --jobs "$JOBS" --tachyonc "$TACHYONC" \
+            --reps "$(reps_for "$m")" --jobs "$JOBS" --volec "$VOLEC" \
             --out "$OUT/0.17v-tools-$(slug "$m")" &
         pids="$pids $!"
     done
@@ -173,27 +173,27 @@ if want C-plain; then
     wait_all
 fi
 
-# G. paired Rust -> tachyon lines against the core guide, hard tasks
+# G. paired Rust -> vole lines against the core guide, hard tasks
 if want G; then
     for m in $MODELS; do
         say "G: $m rust-pairs on 13-18 x $REPS"
         $RUN run --model "$m" --set programs --cond rust-pairs --tasks "$HARD" --reps "$REPS" \
-            --jobs "$JOBS" --tachyonc "$TACHYONC" --out "$OUT/0.17v-G-$(slug "$m")" &
+            --jobs "$JOBS" --volec "$VOLEC" --out "$OUT/0.17v-G-$(slug "$m")" &
         pids="$pids $!"
     done
     wait_all
 fi
 
-# D. tachyonc test in the hook (needs it in TACHYONC and settings-eval.json)
+# D. volec test in the hook (needs it in VOLEC and settings-eval.json)
 if want D; then
     for m in $MODELS; do
         say "D: $m both+hook+test on 13-18; the check-hook control where missing"
         $RUN run --model "$m" --set programs --cond both+hook+test --tasks "$HARD" \
-            --reps "$(reps_for "$m")" --jobs "$JOBS" --tachyonc "$TACHYONC" \
+            --reps "$(reps_for "$m")" --jobs "$JOBS" --volec "$VOLEC" \
             --out "$OUT/0.17v-D-$(slug "$m")"
         $RUN run --model "$m" --set programs --cond both --check-hook --tasks "$HARD" \
             --reps "$REPS" --skip-existing-in "$BASE/0.16-hook-$(slug "$m")" --jobs "$JOBS" \
-            --tachyonc "$TACHYONC" --out "$OUT/0.17v-Dctl-$(slug "$m")"
+            --volec "$VOLEC" --out "$OUT/0.17v-Dctl-$(slug "$m")"
         $RUN run --model "$m" --set compiler --cond compiler-tools-core+test --reps "$REPS" \
             --jobs "$CJOBS" $tools_arg --out "$OUT/0.17v-D-$(slug "$m")" &
         pids="$pids $!"
@@ -203,11 +203,11 @@ fi
 
 # E. the diagnostics (item 5): guide-core again with that compiler
 if want E; then
-    : "${TACHYONC_DIAG:?STEP=E needs TACHYONC_DIAG, the compiler with item 5}"
+    : "${VOLEC_DIAG:?STEP=E needs VOLEC_DIAG, the compiler with item 5}"
     for m in $MODELS; do
-        say "E: $m guide-core with $TACHYONC_DIAG x $REPS"
+        say "E: $m guide-core with $VOLEC_DIAG x $REPS"
         $RUN run --model "$m" --set programs --cond guide-core --reps "$REPS" \
-            --jobs "$JOBS" --tachyonc "$TACHYONC_DIAG" --out "$OUT/0.17v-E-$(slug "$m")" &
+            --jobs "$JOBS" --volec "$VOLEC_DIAG" --out "$OUT/0.17v-E-$(slug "$m")" &
         pids="$pids $!"
     done
     wait_all

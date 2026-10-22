@@ -2,11 +2,11 @@
 
 **The change.** At -O2, `(x << c1) << c2` and `(x >> c1) >> c2` (constant
 amounts, one direction, one type) stay two instructions: neither
-instruction combining (`middle/fold/mod.tach`, `combine`) nor the e-graph
-rules (`middle/egraph.tach`) merge them. The agent adds the rule. It is a
+instruction combining (`middle/fold/mod.vl`, `combine`) nor the e-graph
+rules (`middle/egraph.vl`) merge them. The agent adds the rule. It is a
 real peephole every optimizer has (LLVM's InstCombine does it), small (the
 reference is 18 lines in `combine`), and easy to get subtly wrong:
-tachyon's shift amounts are taken modulo 64 (64-bit) or 32 (narrower
+vole's shift amounts are taken modulo 64 (64-bit) or 32 (narrower
 types, shifted as 32-bit values and truncated), a negative amount is a
 large one, and when the amounts together reach the width the answer is 0
 for `<<` and logical `>>` but a shift by width - 1 for arithmetic `>>`.
@@ -15,7 +15,7 @@ signed and unsigned `>>` alike, each gives wrong results.
 
 **Grading** (`ctasks.grade`):
 
-1. `hidden/tests/run/eval_peephole_shifts.tach` is copied over the tree;
+1. `hidden/tests/run/eval_peephole_shifts.vl` is copied over the tree;
    the compiler is built with the fixpoint (it compiles itself with the
    rule).
 2. `suite`: `eval_peephole` (the hidden test: 16 `#[inline(never)]`
@@ -25,7 +25,7 @@ signed and unsigned `>>` alike, each gives wrong results.
    for negative, maximal and wrapping inputs, plus pairs that must not be
    merged: `(x << 4) >> 4`, a shift of a cast, a variable amount),
    `opt_` (52 optimizer tests), `arith_` (14), `algorithms` (10).
-3. `grade.sh`: the agent's own test: some new `tests/run/*.tach` (not
+3. `grade.sh`: the agent's own test: some new `tests/run/*.vl` (not
    in the starter, not `eval_peephole_*`) with `// CHECK` lines, which
    passes under `tests/run.sh`.
 
@@ -39,19 +39,19 @@ zero-amount identities, when `a` is the same shift of the same type by a
 constant, sum both amounts through `shift_amount`; at or past
 `int_bits(ty)` make the constant 0 (left, unsigned) or clamp to
 `bits - 1` (signed right); otherwise shift `a`'s operand by the sum. Plus
-`tests/run/opt_shift_chains.tach` and a phrase in docs/optimizer.md.
+`tests/run/opt_shift_chains.vl` and a phrase in docs/optimizer.md.
 
 **Time.** Grading takes about 1.5 min (build ~10 s, the suite ~50 s,
 grade.sh ~5 s) on an M-series Mac.
 
 **If the patches do not apply at v0.16.0.** 0.16 moves the compiler
 source to `?`, derive and interpolation, so `combine` in
-`compiler/src/middle/fold/mod.tach` may read differently. Re-make the
+`compiler/src/middle/fold/mod.vl` may read differently. Re-make the
 reference: in a tree of v0.16.0, add the same rule at the same place in
 `combine` (after `if (op == Shl || op == Shr) && shift_amount(c, ty) == 0`),
-copy `tests/run/opt_shift_chains.tach` from this patch, and
+copy `tests/run/opt_shift_chains.vl` from this patch, and
 `git diff > solution.patch`. Check that the rule is still missing at
-v0.16.0 (`tachyonc --emit-ir -O2` on `(x << 3) << 4` shows two `shl`) and
+v0.16.0 (`volec --emit-ir -O2` on `(x << 3) << 4` shows two `shl`) and
 that the hidden test still fails there. The hidden test's CHECKs on the
 results that fold to 0 rely on those functions keeping a `y * 5` term (so
 IPO does not delete them); if a v0.16.0 pass changes that, adjust the

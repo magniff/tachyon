@@ -1,0 +1,210 @@
+// C's layout, as GCC and Clang lay out for the targets: the sizes and
+// alignments of C types, and the layout of structs and unions
+// (bit-fields, `packed`, `aligned`), with whether vole can express it.
+
+use crate::base::intern_c;
+use crate::front::cimport::{CENUMS, CRECS, CTYPEDEFS, CTYPES, cfield, cty_resolve};
+use crate::front::cimport::CT::{Array, Bad, Bool, Enum, Float, Func, Int, Named, Ptr, Record, Void};
+use crate::front::types::align_to;
+
+pub fn c_size(t: i64) -> i64 {
+    unsafe {
+        let r = cty_resolve(t);
+        match CTYPES[r].kind {
+            Int | Float => CTYPES[r].a / 8,
+            Bool | Void => 1,
+            Ptr => 8,
+            Array => {
+                let e = c_size(CTYPES[r].a);
+                if e < 0 { -1 } else if CTYPES[r].b < 0 { 0 } else { e * CTYPES[r].b }
+            }
+            Record => {
+                let rec = CTYPES[r].a;
+                crec_layout(rec);
+                if CRECS[rec].opaque >= 0 { -1 } else { CRECS[rec].size }
+            }
+            Enum => c_size(CENUMS[CTYPES[r].a].underlying),
+            _ => -1,
+        }
+    }
+}
+
+pub fn c_align(t: i64) -> i64 {
+    unsafe {
+        if CTYPES[t].kind == Named {
+            let td = CTYPES[t].a;
+            let inner = c_align(CTYPEDEFS[td].ty);
+            return if CTYPEDEFS[td].align_attr > inner { CTYPEDEFS[td].align_attr } else { inner };
+        }
+        match CTYPES[t].kind {
+            Int | Float => CTYPES[t].a / 8,
+            Bool | Void => 1,
+            Ptr => 8,
+            Array => c_align(CTYPES[t].a),
+            Record => {
+                let rec = CTYPES[t].a;
+                crec_layout(rec);
+                if CRECS[rec].opaque >= 0 { -1 } else { CRECS[rec].align }
+            }
+            Enum => c_align(CENUMS[CTYPES[t].a].underlying),
+            _ => -1,
+        }
+    }
+}
+
+// Why a type cannot be a value in vole (-1: it can): Bad types, opaque
+// records, functions.
+pub fn c_value_problem(t: i64) -> i64 {
+    unsafe {
+        let r = cty_resolve(t);
+        match CTYPES[r].kind {
+            Bad => CTYPES[r].a,
+            Func => intern_c(c"a function type"),
+            Array => c_value_problem(CTYPES[r].a),
+            Record => {
+                let rec = CTYPES[r].a;
+                crec_layout(rec);
+                CRECS[rec].opaque
+            }
+            _ => -1,
+        }
+    }
+}
+
+const C_MAX_ALIGN: i64 = 4096;
+
+// C's layout of record r (GCC's and Clang's for these targets: fields in
+// order, bit-fields in storage units of their type, `packed` and
+// `aligned`), then whether vole can express it: as a #[repr(C)] type
+// (with explicit padding), packed when a field is unaligned.
+pub fn crec_layout(r: i64) {
+    unsafe {
+        if CRECS[r].state != 0 {
+            return;
+        }
+        CRECS[r].state = 1;
+        if CRECS[r].complete == 0 {
+            CRECS[r].opaque = intern_c(c"its definition is not in the headers");
+            CRECS[r].state = 2;
+            return;
+        }
+        let packed = CRECS[r].packed != 0;
+        let is_union = CRECS[r].is_union != 0;
+        var bit = 0;
+        var size = 0;
+        var align = 1;
+        var widest = 1;
+        for i in 0..CRECS[r].field_count {
+            let f = cfield(r, i);
+            let problem = c_value_problem((*f).ty);
+            if problem >= 0 {
+                CRECS[r].opaque = problem;
+                CRECS[r].state = 2;
+                return;
+            }
+            let fs = c_size((*f).ty);
+            var fa = c_align((*f).ty);
+            widest = if fa > widest { fa } else { widest };
+            if (*f).align_attr > fa {
+                fa = (*f).align_attr;
+            }
+            var eff = if packed && (*f).align_attr == 0 { 1 } else { fa };
+            if CRECS[r].pack > 0 && eff > CRECS[r].pack {
+                eff = CRECS[r].pack;
+            }
+            if (*f).bits >= 0 {
+                let w = (*f).bits;
+                if is_union {
+                    (*f).bit_offset = 0;
+                    size = if (w + 7) / 8 > size { (w + 7) / 8 } else { size };
+                } else if w == 0 {
+                    if !packed {
+                        bit = align_to(bit, fa * 8);
+                    }
+                    (*f).bit_offset = bit;
+                } else {
+                    if !packed && (bit % (fs * 8)) + w > fs * 8 {
+                        bit = align_to(bit, fa * 8);
+                    }
+                    (*f).bit_offset = bit;
+                    bit += w;
+                }
+                if (*f).name >= 0 && w > 0 {
+                    align = if eff > align { eff } else { align };
+                }
+                continue;
+            }
+            align = if eff > align { eff } else { align };
+            if is_union {
+                (*f).offset = 0;
+                size = if fs > size { fs } else { size };
+            } else {
+                bit = align_to(bit, eff * 8);
+                (*f).offset = bit / 8;
+                bit += fs * 8;
+            }
+        }
+        if CRECS[r].align_attr > align {
+            align = CRECS[r].align_attr;
+        }
+        if !is_union {
+            size = (bit + 7) / 8;
+        }
+        CRECS[r].size = align_to(size, align);
+        CRECS[r].align = align;
+        // In vole: unpacked when every member is at a multiple of its
+        // alignment and the record is at least as aligned as its widest
+        // member; packed when its alignment is 1; otherwise not expressible.
+        var aligned_members = true;
+        for i in 0..CRECS[r].field_count {
+            let f = cfield(r, i);
+            if (*f).bits < 0 && (*f).offset % c_align((*f).ty) != 0 {
+                aligned_members = false;
+            }
+        }
+        var natural = 1;
+        for i in 0..CRECS[r].field_count {
+            let f = cfield(r, i);
+            if (*f).bits < 0 {
+                let a = c_align((*f).ty);
+                natural = if a > natural { a } else { natural };
+            }
+        }
+        let _ = widest;
+        if aligned_members && align >= natural {
+            CRECS[r].emit_packed = 0;
+            CRECS[r].emit_align = if align > natural { align } else { 0 };
+        } else if packs_as(r, align) {
+            // #[repr(C, packed(N))]: fields aligned to at most N.
+            CRECS[r].emit_packed = align;
+        } else {
+            CRECS[r].opaque = intern_c(c"its layout (packed and aligned) cannot be expressed");
+        }
+        if CRECS[r].emit_align > C_MAX_ALIGN {
+            CRECS[r].opaque = intern_c(c"its alignment is too large");
+        }
+        CRECS[r].state = 2;
+    }
+}
+
+// Whether vole's packed(p) gives C's layout of r (with explicit
+// padding): every field at a multiple of min(its alignment, p), and the
+// record aligned to p.
+fn packs_as(r: i64, p: i64) -> bool {
+    var widest = 1;
+    unsafe {
+        for i in 0..CRECS[r].field_count {
+            let f = cfield(r, i);
+            if (*f).bits >= 0 {
+                continue;
+            }
+            let a = c_align((*f).ty);
+            let eff = if a > p { p } else { a };
+            if (*f).offset % eff != 0 {
+                return false;
+            }
+            widest = if eff > widest { eff } else { widest };
+        }
+    }
+    widest == p
+}

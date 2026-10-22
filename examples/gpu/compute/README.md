@@ -4,7 +4,7 @@ For each n below 2^20, the number of steps the Collatz map
 (`n -> n/2` or `3n+1`) takes to reach 1, one GPU invocation per n:
 
 ```sh
-tachyonc main.tach -l objc -o compute && ./compute
+volec main.vl -l objc -o compute && ./compute
 ```
 
 ```text

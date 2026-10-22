@@ -1,6 +1,6 @@
 // bench/std: word count, 4,000,000 pseudo-random words counted in a
 // HashMap<&[u8], u64>. Variants (argv[1]): `default` (SipHash), `same`
-// (tachyon's hash), `fold` (foldhash's): fairhash.rs.
+// (vole's hash), `fold` (foldhash's): fairhash.rs.
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 mod fairhash;

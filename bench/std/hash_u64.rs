@@ -1,6 +1,6 @@
 // bench/std: HashMap<u64, u64>, 2,000,000 inserts of random u64, then
 // 2,000,000 lookups (half hits). Variants (argv[1]): `default` (SipHash),
-// `same` (tachyon's hash), `fold` (foldhash's): fairhash.rs.
+// `same` (vole's hash), `fold` (foldhash's): fairhash.rs.
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 mod fairhash;

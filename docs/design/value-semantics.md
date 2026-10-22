@@ -1,6 +1,6 @@
-# tachyon 0.17 design: memory safety by mutable value semantics
+# vole 0.17 design: memory safety by mutable value semantics
 
-I read the language from `/Users/magniff/workspace/tachyon/.claude/worktrees/integ-0.15` (release-0.15) using `tachyonc guide memory|unsafe|types`, `query show/items/grep/refs`, `try`, docs/grammar.md ("Indexing", "Undefined behaviour", "Additions of 0.9", "Escape"), docs/optimizer.md, the commits c51304d/7229534 (the index-order fix), docs/design/closures-iterators.md and errors-formatting.md. The decided 0.16 design comes from `/Users/magniff/workspace/tachyon/.claude/worktrees/design-016/docs/design/effects-allocation.md`. I modified nothing.
+I read the language from `/Users/magniff/workspace/vole/.claude/worktrees/integ-0.15` (release-0.15) using `volec guide memory|unsafe|types`, `query show/items/grep/refs`, `try`, docs/grammar.md ("Indexing", "Undefined behaviour", "Additions of 0.9", "Escape"), docs/optimizer.md, the commits c51304d/7229534 (the index-order fix), docs/design/closures-iterators.md and errors-formatting.md. The decided 0.16 design comes from `/Users/magniff/workspace/vole/.claude/worktrees/design-016/docs/design/effects-allocation.md`. I modified nothing.
 
 ## Revision 1 (2026-10-15): after the prototype
 
@@ -62,7 +62,7 @@ One `let p = &ps` gives an error at every use, so single runs show 24–35 of th
 - Every `=`, argument and return copies bits; nothing moves.
 - `Vec<T> {ptr,len,cap}`, `Buf` and `HashMap` are handles. `Vec::free` is safe: it frees, then nulls the handle.
 - There are no destructors. `defer v.free()` is the idiom: 131 of the 156 `.free()` lines in tests are `defer x.free()`.
-- Tachyon has one pointer type, `*T`. A *borrow* is `&place` written directly as an argument, or a non-`mut` pointer parameter, and dereferencing one is safe. A pointer held anywhere else (a local, a field, a call result) is raw and needs `unsafe`. So `*T` references are already second-class *across* calls.
+- Vole has one pointer type, `*T`. A *borrow* is `&place` written directly as an argument, or a non-`mut` pointer parameter, and dereferencing one is safe. A pointer held anywhere else (a local, a field, a call result) is raw and needs `unsafe`. So `*T` references are already second-class *across* calls.
 - Slices `[T]` are first-class. They are writable and need no `mut`. They are stored freely: `Scanner { text: [u8] }`, `SliceIter { s: [T] }`, `split() -> Vec<[u8]>`, `HashMap<[u8], i64>`, `HashMap::get_mut -> Option<[V]>` (a one-element view).
 - Closures that capture by reference are confined by 0.14's scope-escape check. Borrowed locals keep their frame slot for the whole function.
 - 0.16 adds `Vec<T, A: Allocator = Gpa>`, `Arena`, `ScopedArena` (`#[scoped]`, rules S2/S3), `FixedBuf`, `#[sealed]` and `--check-alloc`. It makes `Arena::reset`/`free_all` `unsafe fn`, and lists four gaps under "waits for 0.17".
@@ -190,7 +190,7 @@ Internally a summary is four bits per parameter for the result and four for the 
 
 *Why inferring is right here, when inferring mutability was rejected (§2.8):*
 - Mutability shows at every call site (`&mut x`), and agents write it from Rust habit.
-- View relations are what Rust says with lifetime elision and explicit lifetimes. Those are what agents get wrong most often, and tachyon never asks for them.
+- View relations are what Rust says with lifetime elision and explicit lifetimes. Those are what agents get wrong most often, and vole never asks for them.
 - One region per signature needs a narrowing annotation in 3.4% of the eval's functions; inferred summaries need none in any corpus (§8.4).
 - The cost of inference, that a callee's body change can break its callers, is paid as 0.16 pays it for effects:
   - the caller's error names the callee's summary and the line that makes it (§2.9);
@@ -235,7 +235,7 @@ Consequences:
 
 - Raw pointers are unchanged and remain the escape hatch, checked by `--check-unsafe` and `--check-alloc`.
 - A reference passed where an extern expects `*T` converts implicitly; exclusivity is still checked at that call.
-- An owned type in an extern signature, or as a by-value field of a `#[repr(C)]` struct passed to C, is an error ("Vec<i64> owns memory; pass v.as_ptr() and v.len()"). `#[repr(C)]` with `Drop` is allowed on the tachyon side.
+- An owned type in an extern signature, or as a by-value field of a `#[repr(C)]` struct passed to C, is an error ("Vec<i64> owns memory; pass v.as_ptr() and v.len()"). `#[repr(C)]` with `Drop` is allowed on the vole side.
 - Callbacks take raw pointers. `longjmp` over frames that drop is UB, the same contract as for defers.
 - Unsafe code must not create a second live alias of a place under `&mut`; this is documented in the unsafe contract. G8 becomes a rule: a type whose safe methods manage memory through raw pointers must implement `Drop`, which makes it owned and move-only. The guide says so, and a lint flags safe methods that write through raw fields of a plain struct.
 
@@ -263,7 +263,7 @@ Consequences:
 - **Mojo.** Its origins are close to ours, but parametric. ASAP destruction (drop at last use) was rejected: destructor timing must be readable in the text, and scope-end drop with NLL liveness for *views* gives the same freedom where it matters.
 - **Vale's generational references.** They make every dereference a run-time check plus a 64-bit generation per allocation. They violate "zero-cost", but they remain the model for `--check-alloc`.
 - **Austral linear types.** "Must consume" would make every early return name every value. Affine types with automatic drop are kept.
-- **Tachyon-specific relaxations.**
+- **Vole-specific relaxations.**
   - Shape-versus-content writes: plain element writes allowed while views are live. Rejected: two notions of "write", weaker optimizer facts, and agents already know aliasing XOR mutation.
   - Inferring each pointer parameter's mutability from the body: changing a callee body would break its callers silently. Rejected. Mutability shows at every call site (`&mut x`) and agents write it; view summaries are inferred instead because nothing at the call site shows them and Rust's equivalent, lifetimes, is what agents get wrong (§2.4).
 
@@ -274,7 +274,7 @@ Consequences:
 **The contract of every `own.*` diagnostic:**
 - **One line.** It gives the position and the code, then what happened and what still needed the value, with both positions.
 - **`help:`** gives the idiomatic fix in words.
-- **One or more `try:` lines** give commands that run as they are: `tachyonc edit patch`, `refactor ...`, `rewrite`. When the fix needs a choice, `try:` gives the query that shows the facts (`query own`, `query views --why`).
+- **One or more `try:` lines** give commands that run as they are: `volec edit patch`, `refactor ...`, `rewrite`. When the fix needs a choice, `try:` gives the query that shows the facts (`query own`, `query views --why`).
 - **A conflict that comes through a callee** names the callee's summary and the line that makes it, so the agent does not have to read the callee.
 - **The `try:` lines are tested.** tests/own-try (T6) runs every `try:` of the own error tests. After it, the program must check clean, or report a different, named next step: an `edit.breaks` at the callers counts.
 
@@ -299,15 +299,15 @@ fn main(gpa: Gpa) {
 }
 ```
 ```text
-main.tach:6:5: error[own.moved] 'v' is used here after it moved into 'total(v)' at 5:19
+main.vl:6:5: error[own.moved] 'v' is used here after it moved into 'total(v)' at 5:19
   help: 'total' only reads its parameter 'v': take it by reference ('v: &Vec<i64>'), or pass a copy
-  try: tachyonc refactor signature total --type v '&Vec<i64>' --default '&$v'
-  try: tachyonc edit patch main.tach:5 --old 'total(v)' --new 'total(v.clone())'
+  try: volec refactor signature total --type v '&Vec<i64>' --default '&$v'
+  try: volec edit patch main.vl:5 --old 'total(v)' --new 'total(v.clone())'
 ```
 When the callee keeps or consumes its parameter, the first `try:` is left out.
 ```text
-$ tachyonc query own main.tach:6:5
-main.tach:6:5 in crate::main
+$ volec query own main.vl:6:5
+main.vl:6:5 in crate::main
 v  Vec<i64>  owned  moved at 5:19 into 'total(v)' (total takes 'v: Vec<i64>' and only reads it)
 n  i64       plain
 ```
@@ -321,9 +321,9 @@ fn rehash(self: &mut Table) {
 }
 ```
 ```text
-table.tach:2:15: error[own.move_out] cannot move 'self.keys' (Vec<Entry>) out of '*self': 'rehash' borrows 'self'
+table.vl:2:15: error[own.move_out] cannot move 'self.keys' (Vec<Entry>) out of '*self': 'rehash' borrows 'self'
   help: take it out and leave an empty Vec in its place, or iterate over it by reference
-  try: tachyonc edit patch table.tach:2 --old 'self.keys' --new 'self.keys.take()'
+  try: volec edit patch table.vl:2 --old 'self.keys' --new 'self.keys.take()'
 ```
 
 **3. A view used after its owner changed** (G1: the 3 intended tests, the 35 reports of index_order, std_self_append).
@@ -334,14 +334,14 @@ v.push(4);
 println(f"{first[0]}");
 ```
 ```text
-main.tach:5:5: error[own.conflict] 'v.push(4)' may move v's elements while 'first' (4:17) views them; 'first' is used at 6:16
+main.vl:5:5: error[own.conflict] 'v.push(4)' may move v's elements while 'first' (4:17) views them; 'first' is used at 6:16
   help: use 'first' before the push, keep an index instead of a view, or keep a copy
-  try: tachyonc edit patch main.tach:4 --old 'v.as_slice()' --new 'v.clone()'
-  try: tachyonc query own main.tach:6:16
+  try: volec edit patch main.vl:4 --old 'v.as_slice()' --new 'v.clone()'
+  try: volec query own main.vl:6:16
 ```
 ```text
-$ tachyonc query own main.tach:6:16
-main.tach:6:16 in crate::main
+$ volec query own main.vl:6:16
+main.vl:6:16 in crate::main
 v      Vec<i64>  owned  written at 5:5 by 'v.push(4)'
 first  [i64]     view   views v (taken at 4:17); invalid since 5:5 'v.push(4)'
 ```
@@ -354,9 +354,9 @@ first  [i64]     view   views v (taken at 4:17); invalid since 5:5 'v.push(4)'
 for x in v { if x % 2 == 0 { v.push(x / 2); } }
 ```
 ```text
-main.tach:7:30: error[own.conflict] 'v.push' may move v's elements while the 'for' at 7:1 iterates over them
+main.vl:7:30: error[own.conflict] 'v.push' may move v's elements while the 'for' at 7:1 iterates over them
   help: loop over the indexes (the loop sees the elements present when it starts), or collect the new elements and append them after the loop
-  try: tachyonc edit patch main.tach:7 --old 'for x in v {' --new 'for i in 0..v.len() { let x = v[i];'
+  try: volec edit patch main.vl:7 --old 'for x in v {' --new 'for i in 0..v.len() { let x = v[i];'
 ```
 
 **5. Returning a view of something the function owns** (G5; the one unintended bug the prototype found has this shape).
@@ -368,9 +368,9 @@ fn greet(name: [u8]) -> [u8] {
 }
 ```
 ```text
-greet.tach:3:5: error[own.escape] 'greet' returns a view of 'b', which is dropped when 'greet' returns
+greet.vl:3:5: error[own.escape] 'greet' returns a view of 'b', which is dropped when 'greet' returns
   help: return the Buf itself; a caller that wants a view takes '.as_slice()' of it
-  try: tachyonc edit patch greet --old '-> [u8]' --new '-> Buf' --old 'b.as_slice()' --new 'b'
+  try: volec edit patch greet --old '-> [u8]' --new '-> Buf' --old 'b.as_slice()' --new 'b'
 ```
 If a caller then breaks, the edit reports `edit.breaks` with that caller's own `try:` lines.
 
@@ -389,11 +389,11 @@ impl Parser {
 }
 ```
 ```text
-$ tachyonc query views Parser --why
+$ volec query views Parser --why
 crate::Parser::name  views(*self)  inferred
-  why: parse.tach:4:83 't.text': 't' is a Tok read out of 'self.toks' (4:46), so its text is a view 'self' holds
+  why: parse.vl:4:83 't.text': 't' is a Tok read out of 'self.toks' (4:46), so its text is a view 'self' holds
 crate::Parser::item  views(*self)  inferred
-  why: parse.tach:8:12 'col' comes from 'self.name()' (views(*self))
+  why: parse.vl:8:12 'col' comes from 'self.name()' (views(*self))
 ```
 The rejection that remains is the real one: the lexer *owns* its text and hands out views of it while it is still mutated, which Rust rejects too.
 ```tach
@@ -404,10 +404,10 @@ let b = lx.word();
 println(f"{a} {b}");
 ```
 ```text
-main.tach:12:13: error[own.conflict] 'lx.word()' borrows 'lx' mutably while 'a' (11:13) views it; 'a' is used at 13:16
-  help: 'Lexer::word' is views(self): it returns 'self.src.as_slice()[a..b]' (lex.tach:9:5), a view of the Buf the lexer owns. Let the lexer view text its caller owns ('src: [u8]'), or copy each word
-  try: tachyonc refactor field Lexer --type src '[u8]' --default '$src.as_slice()'
-  try: tachyonc edit patch main.tach:11 --old 'lx.word()' --new 'Buf::from(lx.word())'
+main.vl:12:13: error[own.conflict] 'lx.word()' borrows 'lx' mutably while 'a' (11:13) views it; 'a' is used at 13:16
+  help: 'Lexer::word' is views(self): it returns 'self.src.as_slice()[a..b]' (lex.vl:9:5), a view of the Buf the lexer owns. Let the lexer view text its caller owns ('src: [u8]'), or copy each word
+  try: volec refactor field Lexer --type src '[u8]' --default '$src.as_slice()'
+  try: volec edit patch main.vl:11 --old 'lx.word()' --new 'Buf::from(lx.word())'
 ```
 
 The other rejections are rarer in the corpus and follow the same contract:
@@ -418,7 +418,7 @@ The other rejections are rarer in the corpus and follow the same contract:
 
 ## 3. Before and after
 
-**1. wordcount (bench/wordcount.tach): views into the text, no frees.**
+**1. wordcount (bench/wordcount.vl): views into the text, no frees.**
 
 ```tach
 // before (0.15)
@@ -442,9 +442,9 @@ let mut counts: HashMap<[u8], i64> = HashMap::new();
 0
 }   // counts dropped, then text: reverse order, so the view goes before its owner
 // text.push(b' ') after the counting loop, while counts is used later:
-// wc.tach:52:5: error[own.conflict] 'text.push' may move text's bytes while 'counts' (keys from 's[start..i]' at 44:27) views them; 'counts' is used at 60:9
+// wc.vl:52:5: error[own.conflict] 'text.push' may move text's bytes while 'counts' (keys from 's[start..i]' at 44:27) views them; 'counts' is used at 60:9
 //   help: finish with 'counts' first, or keep owned keys: 'HashMap<Buf, i64>' with 'Buf::from(w)'
-//   try: tachyonc query own wc.tach:60:9
+//   try: volec query own wc.vl:60:9
 ```
 
 The generated code is the same as today's. The `free` calls come from drop glue, inlined.
@@ -483,17 +483,17 @@ println(f"{snap.total()} {inv.total()}");
 
 ```tach
 for x in v { if x % 2 == 0 { v.push(x / 2); } }
-// e.tach:2:30: error[own.conflict] 'v.push' may move v's elements while the 'for' at 2:1 iterates over them
+// e.vl:2:30: error[own.conflict] 'v.push' may move v's elements while the 'for' at 2:1 iterates over them
 //   help: loop over the indexes, or collect first: 'let extra: Vec<i64> = v.iter().filter(|x| x % 2 == 0).map(|x| x / 2).collect();' then 'v.extend_from_slice(extra.as_slice())'
-//   try: tachyonc edit patch e.tach:2 --old 'for x in v {' --new 'for i in 0..v.len() { let x = v[i];'
+//   try: volec edit patch e.vl:2 --old 'for x in v {' --new 'for i in 0..v.len() { let x = v[i];'
 take(v.as_slice(), grow(&mut v));
-// e.tach:5:20: error[own.conflict] 'grow(&mut v)' changes v while the view 'v.as_slice()' (5:6) waits for 'take'
-//   try: tachyonc edit patch e.tach:5 --old 'take(v.as_slice(), grow(&mut v));' --new 'let k = grow(&mut v); take(v.as_slice(), k);'
+// e.vl:5:20: error[own.conflict] 'grow(&mut v)' changes v while the view 'v.as_slice()' (5:6) waits for 'take'
+//   try: volec edit patch e.vl:5 --old 'take(v.as_slice(), grow(&mut v));' --new 'let k = grow(&mut v); take(v.as_slice(), k);'
 fn bad(xs: &mut Vec<i64>, first: &i64) { xs.push(1); println(f"{*first}"); }
 bad(&mut v, &v[0]);
-// e.tach:9:13: error[own.conflict] 'v' is borrowed mutably by argument 1 and read by argument 2
+// e.vl:9:13: error[own.conflict] 'v' is borrowed mutably by argument 1 and read by argument 2
 //   help: copy the plain value out first
-//   try: tachyonc edit patch e.tach:9 --old 'bad(&mut v, &v[0]);' --new 'let f0 = v[0]; bad(&mut v, &f0);'
+//   try: volec edit patch e.vl:9 --old 'bad(&mut v, &v[0]);' --new 'let f0 = v[0]; bad(&mut v, &f0);'
 ```
 
 **4. Arenas (0.16 to 0.17.1, with U3).**
@@ -531,9 +531,9 @@ fn add_type(t: Type) -> i64 { TYPES.push(t); TYPES.len() - 1 }    // safe
 let a = TYPES[template_instance(s, args)].a;            // defined: the index first, then the place (0.14 order)
 let t = &TYPES[i];
 let j = template_instance(s, args);
-// types.tach:41:9: error[own.static] 'template_instance' writes statics (global) while 't' (40:9) views TYPES; 't' is used at 42:13
+// types.vl:41:9: error[own.static] 'template_instance' writes statics (global) while 't' (40:9) views TYPES; 't' is used at 42:13
 //   help: copy the plain value first: 'let t = TYPES[i];' (Type is plain)
-//   try: tachyonc edit patch types.tach:40 --old '&TYPES[i]' --new 'TYPES[i]'
+//   try: volec edit patch types.vl:40 --old '&TYPES[i]' --new 'TYPES[i]'
 ```
 
 In 0.17 the static check is coarse (any `global`). 0.17.1's written-static sets make it exact (`intern`, which writes only SYMS, stops conflicting). Index handles plus plain copies stay the recommended table style. After inlining, SROA reduces `TYPES[i].a` to one load.
@@ -561,7 +561,7 @@ fn decl(self: &mut Parser) -> i64 {
 **Where: on the typed AST, not a MIR.**
 - `check` is front-end only (79 ms on the compiler, about 45 ms of it in the checker; 7 ms warm), and the tools need these errors without lowering.
 - Errors need source spans and the "used at" secondary positions.
-- Tachyon's control flow is structured: blocks, if, match, loop/while/for, labeled break/continue, return, `?` (a desugared return), defer.
+- Vole's control flow is structured: blocks, if, match, loop/while/for, labeled break/continue, return, `?` (a desugared return), defer.
 - 0.16's effects pass made the same choice. A MIR would duplicate middle/lower and cost compile time.
 - Expressions are walked per statement in the grammar's documented evaluation order: left to right, the right-hand side before the place, the index before the base is read, two-phase receivers. That gives an exact access sequence.
 - The prototype confirmed the choice. Its walk is about 3,100 lines on the typed AST, it needed no back-end change, and it found every gap it was meant to find except G8, which is a lint (§2.6).
@@ -605,7 +605,7 @@ fn decl(self: &mut Parser) -> i64 {
 5. **Finishing the drops.**
    - A placeholder whose local is moved away at every exit is emptied.
    - One that is moved on some exits gets a hidden `bool` flag, cleared at each move (8 locals in the corpus).
-   - Both back ends already lower `defer` on every exit (middle/lower/control.tach `lower_defers`, gen0), so **no back-end change is needed**.
+   - Both back ends already lower `defer` on every exit (middle/lower/control.vl `lower_defers`, gen0), so **no back-end change is needed**.
 6. **Statics.** A small post-pass checks the recorded "view of static S live across call c" pairs against c's effects.
 7. **Cache.** Kinds and summaries are stored per Def in the query cache, as effects are. `query views` reads them; `query own` walks one function using its callees' cached summaries.
 
@@ -642,7 +642,7 @@ fn decl(self: &mut Parser) -> i64 {
   | `own.drop_view` | `Drop` on a view type |
 
 **Optimizer work for zero cost.**
-1. **Moves.** Move copies are flagged `COPY_MOVE`. copies.tach's "source used only before the copy" then holds by construction, so it skips the use scan and also elides copies inside loops. NRVO: a returned local is merged with the sret slot.
+1. **Moves.** Move copies are flagged `COPY_MOVE`. copies.vl's "source used only before the copy" then holds by construction, so it skips the use scan and also elides copies inside loops. NRVO: a returned local is merged with the sret slot.
 2. **Passing.** A large plain by-value parameter, and a moved-in owned parameter, are passed by the caller's slot address with no copy: exclusivity guarantees nothing writes the slot during the call.
 3. **Drops.** std's `drop` impls and the generated glue are `#[inline]`. `needs_drop::<T>()` folds at type-check time. Drop flags are SROA'd and constant-folded away. At -O0, gen0 emits flags only for maybe-moved locals. The prototype measured byte-identical -O2 code on 5 of 7 benchmarks, and the other two differ only by a fixed leak and a reversed free order (§8.3).
 4. **Aliasing (U2).**
@@ -655,7 +655,7 @@ fn decl(self: &mut Parser) -> i64 {
 
 **Gate.** bench/ within noise at -O2 (wordcount, json, sort, binarytrees, iterchain, fmtloop); -O0 within +3%; self-compile within +2%; the own pass at most 8% of the checker.
 
-## 5. Migration: `tachyonc fix --values`
+## 5. Migration: `volec fix --values`
 
 **Rules, each typed and checked like any edit:**
 1. Delete `defer X.free();` when X is an owned local of the same block. Mid-scope, `X.free();` becomes `drop(X);` when X is not used later, else `X = Vec::new();` (the old meaning: an empty, reusable handle).
@@ -701,13 +701,13 @@ Steps 1, 2 and 4 passed. Step 3 failed the gate on the eval solutions (3.4%), wh
 
   | file | contents | in Phase 0 |
   |---|---|---|
-  | `mod.tach` | `pub fn check_own()`, hooked into `check_program` after `infer_effects()`; `--values=off\|report\|warn\|error` (`OWN_MODE`) | done; the default was `report` until T7; it is `error` |
-  | `kinds.tach` | `type_kind(t) -> i64` (PLAIN, OWNED, VIEW, NEEDS_DROP, LEVEL2), `view_elem(t) -> i64` | done (small, and every task uses it) |
-  | `state.tach` | the walk's state layout: owned bits, slots, two-level origins, the invalidation marks, pending arguments, the pool, the bitset fast path | done |
-  | `walk.tach` | the evaluation-order walk from the prototype: expressions, blocks, `let`, `match`, loops to a fixpoint, joins, exits and defers. It calls the event hooks `ev_read`, `ev_write`, `ev_move`, `ev_init`, `ev_drop`, `ev_call` and `ev_result`, and `pub fn walk_fn(f: i64, round: i64) -> ViewSummary` | the skeleton, with the events as stubs |
-  | `summary.tach` | `pub struct ViewSummary { ret: [i64; 4], sto: [i64; 4], top: bool, declared: bool }`, `summary_of(f) -> ViewSummary`, `summary_text(out, s)`, `parse_views_attr` | `summary_of` returns the parametric floor for a generic result, else `top` (one region) |
-  | `diag.tach` | the codes of §4, `own_error(node, code, msg, other)`, `own_help`, `own_try`, and the `explain` entries | the codes and helpers, with stub entries |
-  | `observe.tach` | `own_state_at(file, line, col)` for `query own` | a stub |
+  | `mod.vl` | `pub fn check_own()`, hooked into `check_program` after `infer_effects()`; `--values=off\|report\|warn\|error` (`OWN_MODE`) | done; the default was `report` until T7; it is `error` |
+  | `kinds.vl` | `type_kind(t) -> i64` (PLAIN, OWNED, VIEW, NEEDS_DROP, LEVEL2), `view_elem(t) -> i64` | done (small, and every task uses it) |
+  | `state.vl` | the walk's state layout: owned bits, slots, two-level origins, the invalidation marks, pending arguments, the pool, the bitset fast path | done |
+  | `walk.vl` | the evaluation-order walk from the prototype: expressions, blocks, `let`, `match`, loops to a fixpoint, joins, exits and defers. It calls the event hooks `ev_read`, `ev_write`, `ev_move`, `ev_init`, `ev_drop`, `ev_call` and `ev_result`, and `pub fn walk_fn(f: i64, round: i64) -> ViewSummary` | the skeleton, with the events as stubs |
+  | `summary.vl` | `pub struct ViewSummary { ret: [i64; 4], sto: [i64; 4], top: bool, declared: bool }`, `summary_of(f) -> ViewSummary`, `summary_text(out, s)`, `parse_views_attr` | `summary_of` returns the parametric floor for a generic result, else `top` (one region) |
+  | `diag.vl` | the codes of §4, `own_error(node, code, msg, other)`, `own_help`, `own_try`, and the `explain` entries | the codes and helpers, with stub entries |
+  | `observe.vl` | `own_state_at(file, line, col)` for `query own` | a stub |
 - **The query cache** gets slots for kinds and summaries (a cache format bump).
 - **The legacy `*T` rule.**
 - **compiler/src stays clean under `report`.** §8 found nothing to fix: 0 moves, and its 1 one-region case disappears with summaries.
@@ -717,16 +717,16 @@ Steps 1, 2 and 4 passed. Step 3 failed the gate on the eval solutions (3.4%), wh
 
 | task | owns | provides |
 |---|---|---|
-| T1 Moves and drops | front/own/{moves,drops,glue}.tach; the hooks in `check_block`, `check_function` and `check_defer` | the move events (init/move bits, partial moves, binding modes for `match` through references); drop placeholders and their filling; generated glue (struct, tuple, enum, array, closure); drop flags; owned temporaries; the assignment desugaring; `own.moved`, `own.move_out`, `own.partial`, `own.drop_view` |
-| T2 Views and exclusivity | front/own/{views,calls}.tach; closures/escape.tach (subsumed) | the view events (two-level origins, slots, invalidation, implicit liveness); pending arguments, two-phase receivers, reborrows, `for` loans, f-string holes as borrows; exclusivity; escapes; coarse statics; `own.conflict`, `own.escape`, `own.static`; `observe.tach`; **the cost budget** |
-| T3 View summaries | front/own/{summary,infer}.tach; `query views`, `--print-views` | the driver: SCC order over the effects graph, the fixpoint for recursive SCCs, errors only from the final round; the parametric floor; the type filter; indirect calls through address-taken functions; `#[views]`/`stores` checked (`own.views`); the why-chains; the cache |
-| T4 std on values | compiler/std/*.tach | Drop impls; a consuming `free`; `v[i]`; `as_mut_slice`, `iter_ref`, `swap`/`take`/`replace`; `sort(&mut [T])` (the stable sort's ping-pong buffers on indices or raw pointers, §8.4); `sort_by` closures taking `&T`; Scanner, SliceIter, split and Fmt (`&mut Buf`) as views; `Clone` bounds; `Buf::from`; **`#[views]` pins on every public std function that returns or stores views** |
-| T5 Optimizer | middle/{copies,gvn,licm,vectorize,inline}.tach | COPY_MOVE elision, NRVO, noalias/readonly gated on `error` mode, noalias scopes through inlining, drop inlining, the bench gate |
+| T1 Moves and drops | front/own/{moves,drops,glue}.vl; the hooks in `check_block`, `check_function` and `check_defer` | the move events (init/move bits, partial moves, binding modes for `match` through references); drop placeholders and their filling; generated glue (struct, tuple, enum, array, closure); drop flags; owned temporaries; the assignment desugaring; `own.moved`, `own.move_out`, `own.partial`, `own.drop_view` |
+| T2 Views and exclusivity | front/own/{views,calls}.vl; closures/escape.vl (subsumed) | the view events (two-level origins, slots, invalidation, implicit liveness); pending arguments, two-phase receivers, reborrows, `for` loans, f-string holes as borrows; exclusivity; escapes; coarse statics; `own.conflict`, `own.escape`, `own.static`; `observe.vl`; **the cost budget** |
+| T3 View summaries | front/own/{summary,infer}.vl; `query views`, `--print-views` | the driver: SCC order over the effects graph, the fixpoint for recursive SCCs, errors only from the final round; the parametric floor; the type filter; indirect calls through address-taken functions; `#[views]`/`stores` checked (`own.views`); the why-chains; the cache |
+| T4 std on values | compiler/std/*.vl | Drop impls; a consuming `free`; `v[i]`; `as_mut_slice`, `iter_ref`, `swap`/`take`/`replace`; `sort(&mut [T])` (the stable sort's ping-pong buffers on indices or raw pointers, §8.4); `sort_by` closures taking `&T`; Scanner, SliceIter, split and Fmt (`&mut Buf`) as views; `Clone` bounds; `Buf::from`; **`#[views]` pins on every public std function that returns or stores views** |
+| T5 Optimizer | middle/{copies,gvn,licm,vectorize,inline}.vl | COPY_MOVE elision, NRVO, noalias/readonly gated on `error` mode, noalias scopes through inlining, drop inlining, the bench gate |
 | T6 Tools and guide | tools/*, compiler/guide/{memory,unsafe,rust,errors,core}.md and a new topic `views`, docs | `query own`; the `explain own.*` entries; `fix --values`; fmt; `refactor signature` with `&`/`&mut`; `refactor field --type` with `--default`; **tests/own-try, which runs every `try:` of §2.9**; the guide rewritten (memory and unsafe lose "the one gap") |
 | T7 Migration | tests/, examples/, bench/, tests/agent-eval | `fix --values` applied; the hand cases (bigint's operators, ledger's two `get_mut`, 15-multi-module's leaked Bufs, the aliasing opt tests); the eval solutions re-run |
 
 **Where the tasks meet:**
-- **T1 and T2** share one walk: they implement disjoint event hooks over Phase 0's `state.tach` layout, and neither changes `walk.tach`'s traversal without the lead.
+- **T1 and T2** share one walk: they implement disjoint event hooks over Phase 0's `state.vl` layout, and neither changes `walk.vl`'s traversal without the lead.
 - **T2 and T3** meet at `walk_fn` and `summary_of`.
   - T2 develops against `summary_of`'s fallback, which is one region, so T2's own tests use only non-generic callees or `#[views]`-declared ones.
   - T3 develops its driver against declared summaries and the parametric floor; tests/own_views_* declare what they need.
@@ -782,7 +782,7 @@ Steps 1, 2 and 4 passed. Step 3 failed the gate on the eval solutions (3.4%), wh
   - (c) **Rejected in safe functions from 0.17.1**, with a `try:` that writes `p: &mut T` (and `let mut q = p;` inside) or `unsafe fn`: no meaning to learn, and `fix --values` rewrites the corpus's cases. The cost is churn in tests and the compiler, which uses `mut` pointer parameters for cursor-style loops.
   - (d) **Deprecated with 0.18's rule** (all `*T` parameters raw): `mut` stops mattering because every `*T` parameter is raw, and references are spelled `&`/`&mut`. This defers the question to the compiler's migration.
 
-  *Phase 0 implements (a)*, the current semantics, as kinds.tach's `param_mode` (`P_RAW`). Whichever the user picks changes that one function and the guide. With (d) decided, `param_mode` loses its legacy `P_MUT` case for `*T` in 0.18.1, and `mut p: *T` stays `P_RAW` as it is now.
+  *Phase 0 implements (a)*, the current semantics, as kinds.vl's `param_mode` (`P_RAW`). Whichever the user picks changes that one function and the guide. With (d) decided, `param_mode` loses its legacy `P_MUT` case for `*T` in 0.18.1, and `mut p: *T` stays `P_RAW` as it is now.
 
 **Decided here** (each can be revisited):
 - drops at scope end in reverse order (not at last use);
@@ -799,13 +799,13 @@ Steps 1, 2 and 4 passed. Step 3 failed the gate on the eval solutions (3.4%), wh
 - leaks are safe.
 
 ### Critical Files for Implementation
-- /Users/magniff/workspace/tachyon/.claude/worktrees/integ-0.15/compiler/src/front/check/mod.tach (`check_program`, where the own pass and the effects ordering hook in), with /Users/magniff/workspace/tachyon/.claude/worktrees/integ-0.15/compiler/src/front/check/unsafety.tach (`is_borrow`, `is_borrow_param`: today's borrow rule, which becomes the legacy `*T` rule)
-- /Users/magniff/workspace/tachyon/.claude/worktrees/integ-0.15/compiler/src/front/closures/escape.tach (`type_borrow`, `check_scope_exit`: the model for the kind table, subsumed by origins) and /Users/magniff/workspace/tachyon/.claude/worktrees/integ-0.15/compiler/src/front/check/iterate.tach (`for` desugaring: loop loans, `iter_ref`)
-- /Users/magniff/workspace/tachyon/.claude/worktrees/integ-0.15/compiler/src/front/check/body.tach (`check_defer`) and /Users/magniff/workspace/tachyon/.claude/worktrees/integ-0.15/compiler/src/middle/lower/control.tach (`lower_defers`, `lower_break`): drops lowered as implicit defers
-- /Users/magniff/workspace/tachyon/.claude/worktrees/integ-0.15/compiler/std/std.tach (Vec/Buf/HashMap: Drop, consuming `free`, views), with compiler/std/iter.tach, io.tach (Scanner, split) and fmt.tach (Fmt as a view)
-- compiler/src/front/effects/infer.tach (`infer_effects`, `components`, `COMPONENT`, `ADDRESS_TAKEN`): the call graph and SCC order the summaries reuse
-- branch c17-proto: compiler/src/front/own/mod.tach (the walk, places, bitsets, two-level origins, `eval_call`, `check_result`, the level summaries) and drops.tach (the implicit defers): the starting code for Phase 0, T1 and T2; tests/values-proto
-- /Users/magniff/workspace/tachyon/.claude/worktrees/integ-0.15/compiler/src/middle/copies.tach and /Users/magniff/workspace/tachyon/.claude/worktrees/integ-0.15/compiler/src/middle/gvn.tach (`may_alias`): move elision, NRVO, noalias for `&mut`
+- /Users/magniff/workspace/vole/.claude/worktrees/integ-0.15/compiler/src/front/check/mod.vl (`check_program`, where the own pass and the effects ordering hook in), with /Users/magniff/workspace/vole/.claude/worktrees/integ-0.15/compiler/src/front/check/unsafety.vl (`is_borrow`, `is_borrow_param`: today's borrow rule, which becomes the legacy `*T` rule)
+- /Users/magniff/workspace/vole/.claude/worktrees/integ-0.15/compiler/src/front/closures/escape.vl (`type_borrow`, `check_scope_exit`: the model for the kind table, subsumed by origins) and /Users/magniff/workspace/vole/.claude/worktrees/integ-0.15/compiler/src/front/check/iterate.vl (`for` desugaring: loop loans, `iter_ref`)
+- /Users/magniff/workspace/vole/.claude/worktrees/integ-0.15/compiler/src/front/check/body.vl (`check_defer`) and /Users/magniff/workspace/vole/.claude/worktrees/integ-0.15/compiler/src/middle/lower/control.vl (`lower_defers`, `lower_break`): drops lowered as implicit defers
+- /Users/magniff/workspace/vole/.claude/worktrees/integ-0.15/compiler/std/std.vl (Vec/Buf/HashMap: Drop, consuming `free`, views), with compiler/std/iter.vl, io.vl (Scanner, split) and fmt.vl (Fmt as a view)
+- compiler/src/front/effects/infer.vl (`infer_effects`, `components`, `COMPONENT`, `ADDRESS_TAKEN`): the call graph and SCC order the summaries reuse
+- branch c17-proto: compiler/src/front/own/mod.vl (the walk, places, bitsets, two-level origins, `eval_call`, `check_result`, the level summaries) and drops.vl (the implicit defers): the starting code for Phase 0, T1 and T2; tests/values-proto
+- /Users/magniff/workspace/vole/.claude/worktrees/integ-0.15/compiler/src/middle/copies.vl and /Users/magniff/workspace/vole/.claude/worktrees/integ-0.15/compiler/src/middle/gvn.vl (`may_alias`): move elision, NRVO, noalias for `&mut`
 
 ## Decisions taken for now (to confirm with the user)
 
@@ -834,16 +834,16 @@ Decided by the user on 2026-10-16:
 
 ## Phase 0 contract (2026-10-16, branch c17-phase0)
 
-Phase 0 fixed the interfaces below; T1–T6 build against them in parallel. A task changes only the files it owns; a change to a fixed signature, to `state.tach`'s layout or to `walk.tach`'s traversal goes through the lead. These are the tasks' briefs.
+Phase 0 fixed the interfaces below; T1–T6 build against them in parallel. A task changes only the files it owns; a change to a fixed signature, to `state.vl`'s layout or to `walk.vl`'s traversal goes through the lead. These are the tasks' briefs.
 
 **What Phase 0 contains** (commits "References", "front/own", "std: Drop ..."):
-- **References.** `&T`, `&mut T` are pointer types whose `b` is `REF_SHARED`/`REF_MUT` (types.tach: `ref_to`, `ref_kind`, `is_ref`, `decay_ref`); `&mut [T]` is a slice whose `b` is `REF_MUT` (`mut_slice_of`, `is_mut_slice`); `&[T]` is `[T]`. `&place` is `&T`, `&mut place` is `&mut T` (`NODE_REF_MUT` on the Unary node); a local holding one is a borrow, safe to read through. Where a type is expected, `check_mode::coerce_ref` converts a reference to a raw `*T` (and `&&T` to `**T`), `&mut T` to `&T`, `&mut [T]` to `[T]`, and a reference to a slice to the slice. `&x` where `&mut T` is wanted is a type error whose `try:` is `&mut x`.
+- **References.** `&T`, `&mut T` are pointer types whose `b` is `REF_SHARED`/`REF_MUT` (types.vl: `ref_to`, `ref_kind`, `is_ref`, `decay_ref`); `&mut [T]` is a slice whose `b` is `REF_MUT` (`mut_slice_of`, `is_mut_slice`); `&[T]` is `[T]`. `&place` is `&T`, `&mut place` is `&mut T` (`NODE_REF_MUT` on the Unary node); a local holding one is a borrow, safe to read through. Where a type is expected, `check_mode::coerce_ref` converts a reference to a raw `*T` (and `&&T` to `**T`), `&mut T` to `&T`, `&mut [T]` to `[T]`, and a reference to a slice to the slice. `&x` where `&mut T` is wanted is a type error whose `try:` is `&mut x`.
   - *Deviation:* a place reached through a raw pointer still gives a raw `*T` (`&(*p).f`); `&*p` gives a reference. This keeps today's unsafe code compiling.
   - *Deviation:* a type argument inferred from a reference is its raw type (`decay_ref` in `unify`): references as type arguments are 0.17.1's.
   - Not in Phase 0: writes through `&T` and `[T]` are still accepted (U2's read-only rule is T2's `own.readonly`); `-> &T` results are not rejected yet (T2: an `own.escape` until 0.17.1's projections).
-- **The prelude** (compiler/std/values.tach, appended after alloc.tach): `Drop` (`fn drop(self: &mut Self)`), `drop`, `forget`, `needs_drop` (returns false until T1 folds it), `Copy` (an intrinsic bound: plain types only, `traits::intrinsic` through `kinds::is_plain_type`); `std::Default`, `std::replace`, `std::take<T: Default>`. Drops do not run and nothing moves yet.
+- **The prelude** (compiler/std/values.vl, appended after alloc.vl): `Drop` (`fn drop(self: &mut Self)`), `drop`, `forget`, `needs_drop` (returns false until T1 folds it), `Copy` (an intrinsic bound: plain types only, `traits::intrinsic` through `kinds::is_plain_type`); `std::Default`, `std::replace`, `std::take<T: Default>`. Drops do not run and nothing moves yet.
 - **`#[views(a, *b)]` and `#[stores(c)]`**: two attributes (the text form `views(..) stores(..)` maps to them one to one), parsed into EffectSet nodes of form `VIEWS_FORM`/`STORES_FORM` (`attrs::VIEWS_OF`), stored as `FnInfo.views_decl`, checked against the parameter names in every mode (`own.views`).
-- **`--values=off|report|warn|error`** (`own::values_option`, diag.tach `OWN_MODE`). `report` is the default until T7; it records findings and walks only when they are printed (`--values=report`). The query cache's file is keyed by the mode, and `check --values=report` does not use the cache.
+- **`--values=off|report|warn|error`** (`own::values_option`, diag.vl `OWN_MODE`). `report` is the default until T7; it records findings and walks only when they are printed (`--values=report`). The query cache's file is keyed by the mode, and `check --values=report` does not use the cache.
 - **Cost.** With every event a stub, the walk costs 7.3–8.1 ms against a check of 76–82 ms on the self-compile (load 16–22): **about 10% of the checker**, 6,376 functions, 375,519 node visits, 4,868 loop rounds. That is the traversal itself, already over V2's 8%: T2 owns the budget (§4) and must find time in the traversal (a per-function pre-filter, cheaper places), not only in the events. By default (`report`, not printed) the pass costs nothing.
 - **Tests:** `own_refs`, `err_own_refs`, `own_prelude`, `err_own_copy_views`, `err_own_views_attr`, `own_parser_views` (clean under `--values=error`; must stay clean), `own_drop_order` (XFAIL until T1), `own_report_basics` (XFAIL until T1 and T2); tests/refactor/run.sh `own_report_compiler` (compiler/src is clean under `--values=report`).
 
@@ -851,26 +851,26 @@ Phase 0 fixed the interfaces below; T1–T6 build against them in parallel. A ta
 
 | file | fixed |
 |---|---|
-| `mod.tach` | `check_own()` (after the effects, then `exit_if_errors`), `values_option(arg) -> bool`, `is_values_option` |
-| `kinds.tach` | `type_kind(t)` with `K_OWNED`, `K_VIEW`, `K_NEEDS_DROP`, `K_LEVEL2` (0: plain); `is_plain_type`, `is_owned_type`, `is_view_type`, `owned_base_type`, `has_drop_impl`, `view_elem(t)` (0 none, -1 several), `kind_word`; `param_mode(f, i)` → `P_VALUE`, `P_SHARED`, `P_MUT` (incl. the legacy rule), `P_RAW`, `P_VIEW`, `P_MUT_VIEW`; `mode_borrows`, `mode_writes` |
-| `state.tach` | places (`local_place`, `root_place(l, inner)`, `static_place`, `child_place`, `TUPLE_FIELD`, `PL_*`, `PL_MASK`, `STATIC_MASK`, `PL_OVERFLOW`); slots (`slot_for`, `slot_of_local`, `slot_of_place`, `SLOT_LOCAL`, `SLOT_PARENT`, `SLOT_CAP`/`SLOT_OVERFLOW`); bitsets (`set_bit`, `clear_bit`, `get_bit`, `any_and`, `or_into`, `or_expanded`, `is_empty`); the pool (`alloc`, `at`, `POOL_TOP` as a stack); the state (`CUR`, `S_MOVED`, `S_DMOVED`, `S_SLOTS`, `OV`, `SW`, `slot_off`, `slot_flags`, `F_INVALID`/`F_STATIC`/`F_SCOPE`, `new_state`, `copy_state`, `join_state`, `same_state`, `moved_bits`, `dmoved_bits`); origins (`new_ov`, `l1`, `l2`, `ov_or`, `ov_copy`, `ov_clear`, `ov_inner`, `ov_hits`); pending arguments (`PEND`, `PE` words: `PE_KIND`, `PE_PLACE`, `PE_OV`, `PE_INVALID`, `PE_BY`, `PE_NODE`, `PE_MODE`; kinds `PK_NONE`, `PK_SHARED`, `PK_RESERVE`, `PK_MUT`, `PK_VIEW`, `PK_MUT_VIEW`, `PK_RAW`) |
-| `walk.tach` | `walk_fn(f, round) -> ViewSummary`; the events `ev_read(p, n)`, `ev_write(p, n, how)` (`W_WRITE`, `W_MOVE`, `W_DROP`, `W_MUT_BORROW`), `ev_move(p, n, how)` (`MO_PLACE`, `MO_INDEX`, `MO_DEREF`, `MO_STATIC`), `ev_init(p)`, `ev_drop(l, d)`, `ev_borrow(p, n, kind, raw, dst)`, `ev_value(p, n, ty, dst)`, `ev_bind(l, n, v)`, `ev_assign(p, n, v)`, `ev_scope(mark, v, tail)`, `ev_call(n, f, base, dst)`, `ev_result(e, v)`; what the walk exposes: `CUR_F`, `PARAM_LOCALS`, `BOUND`, `DEFS`, `NO_MOVE`, `IN_DEFER`, `PO_DEREF`/`PO_INDEX`/`PO_RAW`/`PO_INNER`/`PO_VIEWSLOT` |
-| `summary.tach` | `struct ViewSummary { ret: [i64; 4], sto: [i64; 4], top: bool, declared: bool }` indexed by `S_L1_P`, `S_L1_STAR`, `S_L2_P`, `S_L2_STAR` (bit i: parameter i); `summary_of(f)`, `summary_store(f, s)`, `declared_summary`/`parse_views_attr(f)`, `ret_parametric(f)`, `summary_text(out, f, s)` (*deviation:* it takes f, for the names), `collect_begin(f, round)`, `collect_result(e, v)`, `collect_end(f) -> ViewSummary`, `validate_views_decls()` |
-| `diag.tach` | the codes `OWN_MOVED`, `OWN_MOVE_OUT`, `OWN_PARTIAL`, `OWN_CONFLICT`, `OWN_ESCAPE`, `OWN_STATIC`, `OWN_VIEWS`, `OWN_DROP_VIEW`, `OWN_READONLY` (new: a write through `&T` or `[T]`); `own_begin(n, code)`, `own_str`, `own_bytes`, `own_sym`, `own_type`, `own_pos`, `own_help`, `own_help_bytes`, `own_try(cmd)`, `own_end()`, `own_error(n, code, msg, other)`; `own_flush`/`own_discard` (the driver's: findings wait until the walk that made them is kept); `OWN_MODE`, `MODE_*` |
-| `observe.tach` | `own_state_at(out, pos) -> bool` |
-| ast.tach | `NODE_REF`, `NODE_REF_MUT`, `FN_VIEWS_DECL`, `DEFER_IMPLICIT` (a Defer made for a drop, its `b` the binding), `BLOCK_DROPS_DONE` |
-| tools | `tools/query/values.tach`: `def_kind_text`, `def_views_text`, the cache's two texts per definition (`C_OWN_TEXT`, version 6); `tools/explain/own_table.tach`: the `explain own.*` entries |
+| `mod.vl` | `check_own()` (after the effects, then `exit_if_errors`), `values_option(arg) -> bool`, `is_values_option` |
+| `kinds.vl` | `type_kind(t)` with `K_OWNED`, `K_VIEW`, `K_NEEDS_DROP`, `K_LEVEL2` (0: plain); `is_plain_type`, `is_owned_type`, `is_view_type`, `owned_base_type`, `has_drop_impl`, `view_elem(t)` (0 none, -1 several), `kind_word`; `param_mode(f, i)` → `P_VALUE`, `P_SHARED`, `P_MUT` (incl. the legacy rule), `P_RAW`, `P_VIEW`, `P_MUT_VIEW`; `mode_borrows`, `mode_writes` |
+| `state.vl` | places (`local_place`, `root_place(l, inner)`, `static_place`, `child_place`, `TUPLE_FIELD`, `PL_*`, `PL_MASK`, `STATIC_MASK`, `PL_OVERFLOW`); slots (`slot_for`, `slot_of_local`, `slot_of_place`, `SLOT_LOCAL`, `SLOT_PARENT`, `SLOT_CAP`/`SLOT_OVERFLOW`); bitsets (`set_bit`, `clear_bit`, `get_bit`, `any_and`, `or_into`, `or_expanded`, `is_empty`); the pool (`alloc`, `at`, `POOL_TOP` as a stack); the state (`CUR`, `S_MOVED`, `S_DMOVED`, `S_SLOTS`, `OV`, `SW`, `slot_off`, `slot_flags`, `F_INVALID`/`F_STATIC`/`F_SCOPE`, `new_state`, `copy_state`, `join_state`, `same_state`, `moved_bits`, `dmoved_bits`); origins (`new_ov`, `l1`, `l2`, `ov_or`, `ov_copy`, `ov_clear`, `ov_inner`, `ov_hits`); pending arguments (`PEND`, `PE` words: `PE_KIND`, `PE_PLACE`, `PE_OV`, `PE_INVALID`, `PE_BY`, `PE_NODE`, `PE_MODE`; kinds `PK_NONE`, `PK_SHARED`, `PK_RESERVE`, `PK_MUT`, `PK_VIEW`, `PK_MUT_VIEW`, `PK_RAW`) |
+| `walk.vl` | `walk_fn(f, round) -> ViewSummary`; the events `ev_read(p, n)`, `ev_write(p, n, how)` (`W_WRITE`, `W_MOVE`, `W_DROP`, `W_MUT_BORROW`), `ev_move(p, n, how)` (`MO_PLACE`, `MO_INDEX`, `MO_DEREF`, `MO_STATIC`), `ev_init(p)`, `ev_drop(l, d)`, `ev_borrow(p, n, kind, raw, dst)`, `ev_value(p, n, ty, dst)`, `ev_bind(l, n, v)`, `ev_assign(p, n, v)`, `ev_scope(mark, v, tail)`, `ev_call(n, f, base, dst)`, `ev_result(e, v)`; what the walk exposes: `CUR_F`, `PARAM_LOCALS`, `BOUND`, `DEFS`, `NO_MOVE`, `IN_DEFER`, `PO_DEREF`/`PO_INDEX`/`PO_RAW`/`PO_INNER`/`PO_VIEWSLOT` |
+| `summary.vl` | `struct ViewSummary { ret: [i64; 4], sto: [i64; 4], top: bool, declared: bool }` indexed by `S_L1_P`, `S_L1_STAR`, `S_L2_P`, `S_L2_STAR` (bit i: parameter i); `summary_of(f)`, `summary_store(f, s)`, `declared_summary`/`parse_views_attr(f)`, `ret_parametric(f)`, `summary_text(out, f, s)` (*deviation:* it takes f, for the names), `collect_begin(f, round)`, `collect_result(e, v)`, `collect_end(f) -> ViewSummary`, `validate_views_decls()` |
+| `diag.vl` | the codes `OWN_MOVED`, `OWN_MOVE_OUT`, `OWN_PARTIAL`, `OWN_CONFLICT`, `OWN_ESCAPE`, `OWN_STATIC`, `OWN_VIEWS`, `OWN_DROP_VIEW`, `OWN_READONLY` (new: a write through `&T` or `[T]`); `own_begin(n, code)`, `own_str`, `own_bytes`, `own_sym`, `own_type`, `own_pos`, `own_help`, `own_help_bytes`, `own_try(cmd)`, `own_end()`, `own_error(n, code, msg, other)`; `own_flush`/`own_discard` (the driver's: findings wait until the walk that made them is kept); `OWN_MODE`, `MODE_*` |
+| `observe.vl` | `own_state_at(out, pos) -> bool` |
+| ast.vl | `NODE_REF`, `NODE_REF_MUT`, `FN_VIEWS_DECL`, `DEFER_IMPLICIT` (a Defer made for a drop, its `b` the binding), `BLOCK_DROPS_DONE` |
+| tools | `tools/query/values.vl`: `def_kind_text`, `def_views_text`, the cache's two texts per definition (`C_OWN_TEXT`, version 6); `tools/explain/own_table.vl`: the `explain own.*` entries |
 
 **The tasks:**
 
 | task | owns | fills | must not change |
 |---|---|---|---|
-| T1 moves and drops | front/own/{moves, drops (new), glue (new)}.tach; the drop hooks in check/body.tach (`check_block`, `check_function`, `check_defer`); `needs_drop`'s folding; values.tach's `drop`/`forget` bodies | `moves::on_fn`, `on_read`, `on_move`, `on_init`, `on_drop` over `moved_bits`/`dmoved_bits`/`PL_MOVED_BY`; implicit defers (`DEFER_IMPLICIT`), glue, drop flags, owned temporaries, the assignment desugaring, `match` binding modes through references; `own.moved`, `own.move_out`, `own.partial`, `own.drop_view`; removes `own_drop_order`'s XFAIL | walk.tach, state.tach's layout, views/calls/summary |
-| T2 views and exclusivity | front/own/{views, calls, observe}.tach; closures/escape.tach (subsumed) | every `views::on_*`, `calls::on_call` (pending conflicts, two-phase, stores, the type filter at calls, `global`), parameter roots in `on_enter`, reborrows (`on_let`, and a `&mut` reference local passed to a parameter is an implicit reborrow, not a move), `for` loans (`on_for_alias`), escapes; `own.conflict`, `own.escape`, `own.static`, `own.readonly`; `own_state_at`; **the cost budget**, traversal included; `own_report_basics`' views half | moves.tach, summary.tach's types, the walk's traversal (asks the lead) |
-| T3 summaries | front/own/{summary, infer (new)}.tach; the driver in `check_own` (SCC order, the fixed point, `own_flush` only from the final round); `query views`, `--print-views` | `collect_result`, `collect_end`, `summary_store`; inference callees first over the effects' SCCs (effects must then be inferred whenever the own pass walks: `EFFECTS_WANTED` is false at -O0); checks `#[views]` against bodies (`own.views`); why-chains; `def_views_text` used by def/show/context | `ViewSummary`'s fields, `summary_of`'s contract (declared > inferred > floor > top) |
-| T4 std | compiler/std/*.tach (values.tach included) | Drop impls (Vec, Buf, HashMap, Arena), consuming `free`, `Default` impls (an empty container needs its allocator: `take` on `Vec<T, Arena>`, or a `take` that keeps it, is T4's call), `as_mut_slice`, `swap`, `sort(&mut [T])`, `&T` receivers, `#[views]` pins | the prelude's names and signatures |
-| T5 optimizer | middle/{copies, gvn, licm, vectorize, inline}.tach | noalias/readonly only when `OWN_MODE == MODE_ERROR` and no own error | front/own |
-| T6 tools and guide | tools/*, compiler/guide/*, tools/explain/own_table.tach | `query own`, the explain entries' fixes and examples, `fix --values` (incl. rule 2: `&x` to `&mut x` where the parameter became `&mut`), fmt, `refactor signature`/`field` with `&`/`&mut`, tests/own-try, the guide (memory, unsafe, rust, errors, core; a `views` topic) | front/own's diagnostics' text contract (§2.9) |
+| T1 moves and drops | front/own/{moves, drops (new), glue (new)}.vl; the drop hooks in check/body.vl (`check_block`, `check_function`, `check_defer`); `needs_drop`'s folding; values.vl's `drop`/`forget` bodies | `moves::on_fn`, `on_read`, `on_move`, `on_init`, `on_drop` over `moved_bits`/`dmoved_bits`/`PL_MOVED_BY`; implicit defers (`DEFER_IMPLICIT`), glue, drop flags, owned temporaries, the assignment desugaring, `match` binding modes through references; `own.moved`, `own.move_out`, `own.partial`, `own.drop_view`; removes `own_drop_order`'s XFAIL | walk.vl, state.vl's layout, views/calls/summary |
+| T2 views and exclusivity | front/own/{views, calls, observe}.vl; closures/escape.vl (subsumed) | every `views::on_*`, `calls::on_call` (pending conflicts, two-phase, stores, the type filter at calls, `global`), parameter roots in `on_enter`, reborrows (`on_let`, and a `&mut` reference local passed to a parameter is an implicit reborrow, not a move), `for` loans (`on_for_alias`), escapes; `own.conflict`, `own.escape`, `own.static`, `own.readonly`; `own_state_at`; **the cost budget**, traversal included; `own_report_basics`' views half | moves.vl, summary.vl's types, the walk's traversal (asks the lead) |
+| T3 summaries | front/own/{summary, infer (new)}.vl; the driver in `check_own` (SCC order, the fixed point, `own_flush` only from the final round); `query views`, `--print-views` | `collect_result`, `collect_end`, `summary_store`; inference callees first over the effects' SCCs (effects must then be inferred whenever the own pass walks: `EFFECTS_WANTED` is false at -O0); checks `#[views]` against bodies (`own.views`); why-chains; `def_views_text` used by def/show/context | `ViewSummary`'s fields, `summary_of`'s contract (declared > inferred > floor > top) |
+| T4 std | compiler/std/*.vl (values.vl included) | Drop impls (Vec, Buf, HashMap, Arena), consuming `free`, `Default` impls (an empty container needs its allocator: `take` on `Vec<T, Arena>`, or a `take` that keeps it, is T4's call), `as_mut_slice`, `swap`, `sort(&mut [T])`, `&T` receivers, `#[views]` pins | the prelude's names and signatures |
+| T5 optimizer | middle/{copies, gvn, licm, vectorize, inline}.vl | noalias/readonly only when `OWN_MODE == MODE_ERROR` and no own error | front/own |
+| T6 tools and guide | tools/*, compiler/guide/*, tools/explain/own_table.vl | `query own`, the explain entries' fixes and examples, `fix --values` (incl. rule 2: `&x` to `&mut x` where the parameter became `&mut`), fmt, `refactor signature`/`field` with `&`/`&mut`, tests/own-try, the guide (memory, unsafe, rust, errors, core; a `views` topic) | front/own's diagnostics' text contract (§2.9) |
 | T7 migration | tests/, examples/, bench/, tests/agent-eval | `fix --values` applied; the default `--values=error` | — |
 
 **Found while building Phase 0 (for the tasks and the user):**
@@ -880,7 +880,7 @@ Phase 0 fixed the interfaces below; T1–T6 build against them in parallel. A ta
 - **Kinds can be asked during type checking** (the `Copy` bound) before a closure's captures are known; `type_kind` memoizes by type id, so T1 must make sure closure kinds are computed after `finish_closure`, or not memoized before. *(T1: moot. A closure's struct type is made inside `finish_closure`, after its capture modes are set, so no kind can be asked of it earlier.)*
 
 **T1 as built (branch c17-t1).** Drops, moves, and the move codes.
-- **Placing the drops** (front/own/drops.tach, called from check/body.tach and patterns/mod.tach):
+- **Placing the drops** (front/own/drops.vl, called from check/body.vl and patterns/mod.vl):
   - After a `let`, the checker inserts an implicit defer for each binding whose type has glue, and checks it where it stands.
   - A body starts with one implicit defer per by-value parameter, except std's `forget`.
   - A match by value wraps each arm's body in a block that starts with its owned bindings' drops.
@@ -888,7 +888,7 @@ Phase 0 fixed the interfaces below; T1–T6 build against them in parallel. A ta
   - The binding of a `for` loop over `next()` is neither dropped nor by reference (`ARM_FOR_NEXT`) until T4 settles what iterators yield.
   - A temporary discarded by `e;` becomes `{ let __own_tmp = e; }`.
   - `p = rhs` on an owned place becomes `{ let __own_new = rhs; { let =o = p; p = __own_new; } }`. The `=o` read is flagged `ASSIGN_OLD`: it takes p's state, and the drop of the old value uses that state. The desugaring is skipped when the place is reached through a raw pointer (such a write drops nothing, as `ptr::write` does) or through an index (the old value leaks, which is safe).
-- **Glue** (glue.tach) is untyped AST that the checker checks in place, rather than generated functions:
+- **Glue** (glue.vl) is untyped AST that the checker checks in place, rather than generated functions:
   - a Drop impl gives `x.drop()`, then the fields;
   - an enum gives a `match` (`GLUE_MATCH`) whose bindings drop through the arm mechanism above;
   - an array gives a counted `while` loop;
@@ -911,7 +911,7 @@ Phase 0 fixed the interfaces below; T1–T6 build against them in parallel. A ta
 
 **T7 as built (branch c17-t7): the migration, and `--values=error` the default.**
 
-- **What was migrated.** `tachyonc fix --values` rewrote 108 of 380 tests/run programs, 30 of 39 agent-eval programs (solutions and starters), 35 of 43 examples and 11 of 20 bench programs; the rest by hand. The proof is the same-output one: every tests/run and tests/examples case prints what it printed (EXPECT lines unchanged, except scoped-arena's scratch size, 196 → 104 bytes, as drops free sooner), every bench program gives the same output, check-tasks passes every solution and fails each starter as before, and `--check-alloc` reports nothing it did not report before (fewer leaks: drops free what programs leaked).
+- **What was migrated.** `volec fix --values` rewrote 108 of 380 tests/run programs, 30 of 39 agent-eval programs (solutions and starters), 35 of 43 examples and 11 of 20 bench programs; the rest by hand. The proof is the same-output one: every tests/run and tests/examples case prints what it printed (EXPECT lines unchanged, except scoped-arena's scratch size, 196 → 104 bytes, as drops free sooner), every bench program gives the same output, check-tasks passes every solution and fails each starter as before, and `--check-alloc` reports nothing it did not report before (fewer leaks: drops free what programs leaked).
 - **compiler/src** checks clean under the new default and builds under it, so it needs no mode of its own: its `*T` parameters are the legacy rule's, it has no moves the checker rejects (§8.2), and its first build is v0.16.0's (no own pass), the next ones its own (drops placed, checked). The chain's fixpoint holds and the suite passes with a compiler built under `--values=error`.
 - **The hand cases the design named:**
   - bigint's operator traits take `self: Self`: borrowing `plus`/`minus`/`times` do the work, `Add`/`Sub`/`Mul` consume and delegate; `rng.big(1 + rng.next() % 600)` hoisted.
@@ -936,9 +936,9 @@ The four prototype steps were built on 0.16 (b3975e1) behind flags that are off 
 
 | flag | what it does | code |
 |---|---|---|
-| `--values=report` (`report-std`: std's own functions) | kinds, moves, views, exclusivity; one line per report, then an `own-summary:` line | front/own/mod.tach (≈3,100 lines), a hook after the effects in `check_program` |
-| `--values=drops` | `Drop`, drop glue, drops as implicit defers | front/own/drops.tach, hooks in `check_block`, `check_function` and `check_defer`; std's `Drop` section is appended to std's source only under the flag |
-| `--noalias-params`, `--vec-stats` | the optimizer facts of `&mut`/`&`/`[T]` parameters | middle/gvn.tach, middle/vectorize/checks.tach (merged from c17-noalias) |
+| `--values=report` (`report-std`: std's own functions) | kinds, moves, views, exclusivity; one line per report, then an `own-summary:` line | front/own/mod.vl (≈3,100 lines), a hook after the effects in `check_program` |
+| `--values=drops` | `Drop`, drop glue, drops as implicit defers | front/own/drops.vl, hooks in `check_block`, `check_function` and `check_defer`; std's `Drop` section is appended to std's source only under the flag |
+| `--noalias-params`, `--vec-stats` | the optimizer facts of `&mut`/`&`/`[T]` parameters | middle/gvn.vl, middle/vectorize/checks.vl (merged from c17-noalias) |
 
 tests/values-proto/ holds the drop-order program, two report examples, the corpus script (`corpus.sh`) and the bench script (`bench-drops.sh`). bench/drops/ is bench/ with its 13 frees removed.
 
@@ -1015,7 +1015,7 @@ The apparatus passes are not part of 0.17: inferring mutability takes 3–9 ms, 
 - After every body is checked, the move analysis (pass 2) empties the implicit defer of a local that is moved away at every exit.
 - **No back-end change was needed**: both back ends already lower `defer` on every exit.
 
-**Correctness (gen0 and -O2).** tests/values-proto/drop_order.tach gives identical output at -O0 and -O2, and it matches the expected order. It covers:
+**Correctness (gen0 and -O2).** tests/values-proto/drop_order.vl gives identical output at -O0 and -O2, and it matches the expected order. It covers:
 
 - reverse order at scope end;
 - a nested block;
@@ -1025,7 +1025,7 @@ The apparatus passes are not part of 0.17: inferring mutability takes 3–9 ms, 
 - the drop of a by-value parameter;
 - struct glue, with fields in declaration order.
 
-**Bench.** This compares bench/X.tach with its frees against bench/drops/X.tach under `--values=drops`. Times are the best of 9; the machine was loaded, and the noise is about ±10% (fmtloop at -O2 read 1.10 with byte-identical code).
+**Bench.** This compares bench/X.vl with its frees against bench/drops/X.vl under `--values=drops`. Times are the best of 9; the machine was loaded, and the noise is about ±10% (fmtloop at -O2 read 1.10 with byte-identical code).
 
 | program | -O2 code | -O2 time | -O0 time |
 |---|---|---|---|

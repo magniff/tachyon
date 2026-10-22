@@ -10,8 +10,8 @@ from lib.common import (BUILD_TIMEOUT_S, RUST_BUILD, TACH_BUILD, base_env,
                         copy_tree, normalise, run_proc, tail)
 
 
-def prepare_bins(root, tachyonc):
-    """bin-tach/tachyonc (a copy, so the frozen binary is readable from the
+def prepare_bins(root, volec):
+    """bin-tach/volec (a copy, so the frozen binary is readable from the
     agents' sandbox even when the original sits in the repo) and
     bin-rust/rustc (a link to the toolchain's own rustc, not rustup's
     proxy). Returns {"tach": dir, "rust": dir}."""
@@ -19,13 +19,13 @@ def prepare_bins(root, tachyonc):
             "rust": os.path.join(root, "bin-rust")}
     os.makedirs(bins["tach"], exist_ok=True)
     os.makedirs(bins["rust"], exist_ok=True)
-    tc = os.path.join(bins["tach"], "tachyonc")
-    # (0.17 iterations) a copy that differs from --tachyonc is replaced
-    if not os.path.exists(tc) or not filecmp.cmp(tc, tachyonc, shallow=False):
-        if not os.path.isfile(tachyonc):
-            raise SystemExit("no tachyon compiler at %s (--tachyonc PATH)"
-                             % tachyonc)
-        shutil.copy2(tachyonc, tc + ".tmp")
+    tc = os.path.join(bins["tach"], "volec")
+    # (0.17 iterations) a copy that differs from --volec is replaced
+    if not os.path.exists(tc) or not filecmp.cmp(tc, volec, shallow=False):
+        if not os.path.isfile(volec):
+            raise SystemExit("no vole compiler at %s (--volec PATH)"
+                             % volec)
+        shutil.copy2(volec, tc + ".tmp")
         os.replace(tc + ".tmp", tc)
     rc = os.path.join(bins["rust"], "rustc")
     if not os.path.lexists(rc):
@@ -50,7 +50,7 @@ def rustc_path():
 
 
 def tool_version(bin_dir, lang):
-    argv = ["tachyonc", "--version"] if lang == "tach" else ["rustc", "--version"]
+    argv = ["volec", "--version"] if lang == "tach" else ["rustc", "--version"]
     rc, out, err, _ = run_proc(argv, bin_dir, base_env(bin_dir), 60)
     return (out or err).decode("utf-8", "replace").strip().splitlines()[0] \
         if (out or err) else "?"

@@ -44,9 +44,9 @@ fn main(gpa: Gpa) -> i32 {
   `text_follows`, then a `Text`. Encode keys that do not (arrows, Return,
   Control-letters); send `Text` as it is. `ime` marks keys an input
   method took.
-- **Linking** (until tachyonc takes `-framework`): link AppKit,
+- **Linking** (until volec takes `-framework`): link AppKit,
   QuartzCore, Metal, CoreText, CoreGraphics, CoreFoundation and libobjc,
   e.g. with `tests/window/frameworks.c` on the command line
-  (`tachyonc main.tach tests/window/frameworks.c -o app`).
+  (`volec main.vl tests/window/frameworks.c -o app`).
 - **Tests**: `tests/window/run.sh`; the checks that need a display skip
-  without one (`TACHYON_NO_DISPLAY_TESTS=1` too).
+  without one (`VOLE_NO_DISPLAY_TESTS=1` too).

@@ -5,7 +5,7 @@ graph of a million nodes and four million weighted edges: about 40 ms,
 within 1.2x of the same program in C.
 
 ```sh
-tachyonc examples/algorithms/dijkstra/main.tach -o dijkstra && ./dijkstra
+volec examples/algorithms/dijkstra/main.vl -o dijkstra && ./dijkstra
 ```
 
 ## The problem
@@ -157,12 +157,12 @@ and checksum). The search alone, on an Apple M-series machine:
 
 | | time |
 |---|---|
-| tachyon 0.15, `-O2` (the default) | 41 ms |
-| tachyon 0.15, `-O1` | 52 ms |
-| tachyon 0.15, `-O0` | 300 ms |
+| vole 0.15, `-O2` (the default) | 41 ms |
+| vole 0.15, `-O1` | 52 ms |
+| vole 0.15, `-O0` | 300 ms |
 | C, `clang -O2` | 35 ms |
 
-The tachyon version checks every index; the C one checks none.
+The vole version checks every index; the C one checks none.
 
 A heap of `(dist, node)` structs with a derived `Ord` is the more
 obvious design, and it works unchanged with this `MinHeap<T: Ord>`; it
@@ -174,15 +174,15 @@ by field. The packed `i64` is the classic fix, in either language.
 
 | feature | where | guide |
 |---|---|---|
-| generic struct with a bound, `impl<T: Ord>` | `MinHeap<T: Ord>` | `tachyonc guide generics`, `guide traits` |
-| `?` on an `Option` | `MinHeap::pop` | `tachyonc guide conversions` |
-| `while let`, `continue`, tuple patterns | `dijkstra` | `tachyonc guide syntax` |
-| `Vec::filled`, `as_slice`, slices written through | `dijkstra` | `tachyonc guide std`, `guide memory` |
-| widening (`i32` weight + `i64` distance) | `dijkstra` | `tachyonc guide conversions` |
-| `defer` to free | everywhere | `tachyonc guide memory` |
-| iterators and closures: `iter().max()`, `fold` | `main` | `tachyonc guide iterators`, `guide closures` |
-| f-strings with specs: `{d:>3}`, `{x:c}`, `{h:x}` | `draw`, `main` | `tachyonc guide formatting` |
-| a C header: `import "time.h" as c;` | `now_ns` | `tachyonc guide c-interop` |
+| generic struct with a bound, `impl<T: Ord>` | `MinHeap<T: Ord>` | `volec guide generics`, `guide traits` |
+| `?` on an `Option` | `MinHeap::pop` | `volec guide conversions` |
+| `while let`, `continue`, tuple patterns | `dijkstra` | `volec guide syntax` |
+| `Vec::filled`, `as_slice`, slices written through | `dijkstra` | `volec guide std`, `guide memory` |
+| widening (`i32` weight + `i64` distance) | `dijkstra` | `volec guide conversions` |
+| `defer` to free | everywhere | `volec guide memory` |
+| iterators and closures: `iter().max()`, `fold` | `main` | `volec guide iterators`, `guide closures` |
+| f-strings with specs: `{d:>3}`, `{x:c}`, `{h:x}` | `draw`, `main` | `volec guide formatting` |
+| a C header: `import "time.h" as c;` | `now_ns` | `volec guide c-interop` |
 
 ## Try
 

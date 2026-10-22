@@ -1,6 +1,6 @@
 # Effects
 
-Every function in tachyon 0.16 has an *effect set*: what calling it may
+Every function in vole 0.16 has an *effect set*: what calling it may
 do. The compiler infers it from the function's body and everything the
 body calls, closures and generic instances included:
 
@@ -13,7 +13,7 @@ body calls, closures and generic instances included:
 | `diverge` | `while`, `loop`, recursion: it may not return |
 | `unsafe` | unsafe operations in its own body |
 
-`tachyonc query effects NAME` prints a function's set, `--why EFFECT`
+`volec query effects NAME` prints a function's set, `--why EFFECT`
 the chain of calls down to the line that has it, and `--has EFFECT`
 lists the functions of a module that have it. A declaration turns a set
 into a promise the compiler checks on every build: `#[pure]` (no
@@ -41,7 +41,7 @@ error). Each program also has a test case in
 
 - `none` is the empty set: a function that only computes.
 - `alloc(Gpa)` without `global` means "from a `Gpa` it was given": no
-  allocator can be had from nothing (`tachyonc guide allocators`), so a
+  allocator can be had from nothing (`volec guide allocators`), so a
   function allocates only from allocators it was handed (parameters,
   captures, containers) or reaches through statics.
 - `io global` together usually mean printing: std's print functions
@@ -49,5 +49,5 @@ error). Each program also has a test case in
 - Callers see the inferred set, which may be smaller than a declared
   one: a declaration is an upper bound.
 
-`tachyonc guide effects` is the reference. [../allocators/](../allocators/)
+`volec guide effects` is the reference. [../allocators/](../allocators/)
 has the examples for allocation.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tachyon's agent eval: how well a coding agent writes tachyon (bare, with
+"""vole's agent eval: how well a coding agent writes vole (bare, with
 the guide, with the tools, with both) against the same tasks in Rust.
 
     run.py check-tasks [--set all|programs|compiler|dev | --tasks-dir D] [TASK...]
@@ -11,7 +11,7 @@ the guide, with the tools, with both) against the same tasks in Rust.
     run.py compare --baseline DIR... --new DIR... [--md FILE]   (0.17)
     run.py selfcheck --model M --kinds tach,rust,compiler [--offline]   (0.17)
     run.py debrief RUNDIR... [--md FILE]   (0.18: the +debrief answers by theme)
-    run.py binaudit RUNDIR... [--expect TACHYONC]   (0.18: the binary each run used)
+    run.py binaudit RUNDIR... [--expect VOLEC]   (0.18: the binary each run used)
     run.py costx --rust DIR[:COND]... --cell LABEL=DIR[:COND],... [--md FILE]   (0.18)
 
 README.md next to this file has the details."""
@@ -44,8 +44,8 @@ def main(argv):
         p.add_argument("--builder", help="compiler tasks: the compiler that builds the "
                        "base (default: the release its releases.toml names, from a "
                        "bootstrap cache)")
-        p.add_argument("--tachyonc", default=os.path.join(REPO_ROOT, "target", "tachyonc"),
-                       help="the tachyon compiler under test (default target/tachyonc)")
+        p.add_argument("--volec", default=os.path.join(REPO_ROOT, "target", "volec"),
+                       help="the vole compiler under test (default target/volec)")
 
     p = sub.add_parser("check-tasks", help="validate tasks: solutions pass, starters fail")
     common(p)
@@ -71,7 +71,7 @@ def main(argv):
                    "tests/agent-eval/results/<timestamp>); rerun with the same "
                    "--out to resume")
     p.add_argument("--ws-root", help="where workspaces go (default "
-                   "$TMPDIR/tachyon-eval/<run>); must be outside the repository")
+                   "$TMPDIR/vole-eval/<run>); must be outside the repository")
     p.add_argument("--claude-permissions", choices=("allowlist", "bypass"),
                    default="allowlist",
                    help="claude backend: acceptEdits + sandbox + Bash allowlist "
@@ -79,7 +79,7 @@ def main(argv):
     p.add_argument("--check-hook", action="store_true",
                    help="tools and both conditions (always on in compiler-tools): "
                    "tools/agent-hooks/check-after-edit.py "
-                   "after every change to a .tach file (its errors appended to the "
+                   "after every change to a .vl file (its errors appended to the "
                    "tool result); result.json gets check_hook")
     p.add_argument("--dry-run", action="store_true",
                    help="no model: set up each workspace, write prompt.md, settings.json "
@@ -98,9 +98,9 @@ def main(argv):
                    "stops when a probe fails")
     p.add_argument("--selfcheck-model", default="claude:haiku",
                    help="the model of the hosted self-check sessions")
-    p.add_argument("--tools-tachyonc",
+    p.add_argument("--tools-volec",
                    help="(0.17) compiler-tools conditions: the binary given as "
-                   "target/tools/tachyonc (default the starter's): newer tools on the same tasks")
+                   "target/tools/volec (default the starter's): newer tools on the same tasks")
 
     p = sub.add_parser("report", help="tables from result.json files")
     p.add_argument("rundirs", nargs="+", metavar="RUNDIR")
@@ -115,10 +115,10 @@ def main(argv):
     p.add_argument("--only-check-failed", action="store_true",
                    help="program runs: only those whose check.sh failed")
     p.add_argument("--tasks", default="", help="program runs: these task ids only")
-    p.add_argument("--tachyonc", default=os.path.join(REPO_ROOT, "target", "tachyonc"),
-                   help="program runs: the compiler under test (default target/tachyonc)")
+    p.add_argument("--volec", default=os.path.join(REPO_ROOT, "target", "volec"),
+                   help="program runs: the compiler under test (default target/volec)")
     p.add_argument("--ws-root", help="where the starter trees are built and the grading "
-                   "runs (default $TMPDIR/tachyon-eval/regrade)")
+                   "runs (default $TMPDIR/vole-eval/regrade)")
     p.add_argument("--builder", help="the compiler that builds the base (default: the "
                    "release its releases.toml names)")
 
@@ -143,7 +143,7 @@ def main(argv):
     p.add_argument("--model", default="claude:haiku")
     p.add_argument("--kinds", default="tach", help="tach,rust,compiler")
     p.add_argument("--cond", default="", help="conditions whose needs are probed "
-                   "(+test: tachyonc test)")
+                   "(+test: volec test)")
     p.add_argument("--offline", action="store_true", help="no model session")
     p.add_argument("--out", help="where selfcheck.json goes (default results/selfcheck-TIME)")
     p.add_argument("--ws-root")

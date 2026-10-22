@@ -1,0 +1,318 @@
+// The `use` lines of `volec fmt` (0.13): each run of `use` items on
+// consecutive lines (no blank line, no comment between or after them) is
+// written as `fix --only tidy-imports` writes a module's: the items with
+// one path (and one `pub`) merged, their names sorted, wrapped at 100
+// columns (tidyimports::put_use_text); and the run's items sorted by
+// path, segment by segment (a `pub use` after a `use` of its path).
+
+use crate::base::{BUFS, IntVec, buf_byte, buf_bytes, buf_new, buf_slice, intern};
+use crate::front::lexer::Tok;
+use crate::tools::fmt::pieces::{FT, P_END, P_KIND, P_NL, P_START, kind, piece};
+use crate::tools::proc::same_bytes;
+use crate::tools::tidyimports::put_use_text;
+
+// The items of the run being read: their first piece, whether public,
+// the pieces of their path (first, end), their names and aliases.
+static var U_FIRST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var U_PUB: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var U_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var U_PATH_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var U_NAMES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn is(i: i64, k: Tok) -> bool {
+    unsafe { i < P_KIND.count && P_KIND.data[i] == k as i64 }
+}
+
+// A `use` item at piece i that has its lines to itself: the piece after
+// its `;`, or -1. Its parts go to the U_ vectors.
+fn read_use(i: i64) -> i64 {
+    unsafe {
+        var j = i;
+        let public = is(j, Tok::Pub);
+        if public {
+            j += 1;
+        }
+        if !is(j, Tok::Use) || !is(j + 1, Tok::Ident) {
+            return -1;
+        }
+        j += 1;
+        let path = j;
+        // `a::b::...::`: the path ends at the last `::`
+        while is(j, Tok::Ident) && is(j + 1, Tok::ColonColon) {
+            j += 2;
+        }
+        if j == path {
+            return -1;
+        }
+        let path_end = j - 1;
+        let names = buf_new();
+        var list = false;
+        if is(j, Tok::LBrace) {
+            list = true;
+            j += 1;
+        }
+        loop {
+            if !is(j, Tok::Ident) {
+                return -1;
+            }
+            let name = j;
+            j += 1;
+            var alias = -1;
+            if is(j, Tok::As) {
+                if !is(j + 1, Tok::Ident) {
+                    return -1;
+                }
+                alias = j + 1;
+                j += 2;
+            }
+            put_name(names, name, alias);
+            if !list {
+                break;
+            }
+            if is(j, Tok::Comma) {
+                j += 1;
+            }
+            if is(j, Tok::RBrace) {
+                j += 1;
+                break;
+            }
+        }
+        if !is(j, Tok::Semi) {
+            return -1;
+        }
+        j += 1;
+        if j < P_KIND.count && P_NL.data[j] == 0 {
+            return -1;
+        }
+        U_FIRST.push(i);
+        U_PUB.push(if public { 1 } else { 0 });
+        U_PATH.push(path);
+        U_PATH_END.push(path_end);
+        U_NAMES.push(names);
+        j
+    }
+}
+
+// A name (and its alias, or -1) as two symbols in buffer b.
+fn put_name(b: i64, name: i64, alias: i64) {
+    unsafe {
+        let n = intern(piece(name));
+        let a = if alias >= 0 { intern(piece(alias)) } else { 0 };
+        for s in 0..8 {
+            buf_byte(b, (n >> (8 * s)) as u8);
+        }
+        for s in 0..8 {
+            buf_byte(b, (a >> (8 * s)) as u8);
+        }
+    }
+}
+
+fn word_at(b: [u8], k: i64) -> i64 {
+    unsafe {
+        var v = 0;
+        for s in 0..8 {
+            v = v | ((b[k + s] as i64) << (8 * s));
+        }
+        v
+    }
+}
+
+// The path of item u, as written (`crate::a::b`).
+fn path_text(u: i64) -> [u8] {
+    unsafe { FT[P_START.data[U_PATH.data[u]]..P_END.data[U_PATH_END.data[u] - 1]] }
+}
+
+// Whether item u's path sorts before v's: by segments (`::` lowest),
+// then a `use` before a `pub use`.
+fn use_less(u: i64, v: i64) -> bool {
+    unsafe {
+        let a = path_text(u);
+        let b = path_text(v);
+        let n = if a.len < b.len { a.len } else { b.len };
+        for i in 0..n {
+            let x = if a[i] == ':' { 1 } else { a[i] as i64 };
+            let y = if b[i] == ':' { 1 } else { b[i] as i64 };
+            if x != y {
+                return x < y;
+            }
+        }
+        if a.len != b.len {
+            return a.len < b.len;
+        }
+        U_PUB.data[u] < U_PUB.data[v]
+    }
+}
+
+fn same_group(u: i64, v: i64) -> bool {
+    unsafe { U_PUB.data[u] == U_PUB.data[v] && same_bytes(path_text(u), path_text(v)) }
+}
+
+// The run's text, tidied, into out (no newline after it).
+fn put_run(out: i64, indent: [u8]) {
+    unsafe {
+        let n = U_FIRST.count;
+        var order = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for u in 0..n {
+            order.push(u);
+        }
+        for k in 1..n {
+            var j = k;
+            while j > 0 && use_less(order.data[j], order.data[j - 1]) {
+                let t = order.data[j];
+                order.data[j] = order.data[j - 1];
+                order.data[j - 1] = t;
+                j -= 1;
+            }
+        }
+        var lines = 0;
+        var k = 0;
+        while k < n {
+            let u = order.data[k];
+            var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            var aliased = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            while k < n && same_group(u, order.data[k]) {
+                let b = buf_slice(U_NAMES.data[order.data[k]]);
+                var x = 0;
+                while x < b.len {
+                    let name = word_at(b, x);
+                    let alias = word_at(b, x + 8);
+                    if alias != 0 {
+                        aliased.push(name);
+                        aliased.push(alias);
+                    } else {
+                        names.push(name);
+                    }
+                    x += 16;
+                }
+                k += 1;
+            }
+            if lines > 0 {
+                buf_byte(out, '\n');
+            }
+            put_use_text(out, indent, U_PUB.data[u] != 0, path_text(u), &names, &aliased);
+            lines += 1;
+        }
+    }
+}
+
+// The text with its `use` runs tidied (a new buffer), or -1 when they
+// are tidy. Reads the pieces of FT (pieces::read_pieces). With ranges
+// (byte offsets of FT, an edit's: format_ranges), only the runs whose
+// lines they touch, and `mapped` gets the ranges in the new text, and
+// the runs rewritten.
+pub fn tidy_uses(ranges: *IntVec, mapped: inout IntVec) -> i64 {
+    unsafe {
+        let n = P_KIND.count;
+        let out = buf_new();
+        var copied = 0;
+        var depth = 0;
+        var old = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var i = 0;
+        while i < n {
+            let k = kind(i);
+            if (i == 0 || P_NL.data[i] > 0) && (k == Tok::Use as i64 || k == Tok::Pub as i64) {
+                U_FIRST.count = 0;
+                U_PUB.count = 0;
+                U_PATH.count = 0;
+                U_PATH_END.count = 0;
+                U_NAMES.count = 0;
+                var j = read_use(i);
+                var end = i;
+                while j >= 0 {
+                    end = j;
+                    if j >= n || P_NL.data[j] != 1 {
+                        break;
+                    }
+                    j = read_use(j);
+                }
+                if end > i {
+                    var s = P_START.data[i];
+                    while s > 0 && FT[s - 1] != '\n' {
+                        s -= 1;
+                    }
+                    let e = P_END.data[end - 1];
+                    let text = buf_new();
+                    let indent = buf_new();
+                    for d in 0..depth {
+                        buf_bytes(indent, "    ");
+                    }
+                    put_run(text, buf_slice(indent));
+                    if !same_bytes(buf_slice(text), FT[s..e]) && touches(s, e, ranges) {
+                        buf_bytes(out, FT[copied..s]);
+                        old.push(s);
+                        old.push(e);
+                        old.push(BUFS[out].len);
+                        buf_bytes(out, buf_slice(text));
+                        old.push(BUFS[out].len);
+                        copied = e;
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+            if k == Tok::LBrace as i64 {
+                depth += 1;
+            } else if k == Tok::RBrace as i64 {
+                depth -= 1;
+            }
+            i += 1;
+        }
+        if old.count == 0 {
+            return -1;
+        }
+        buf_bytes(out, FT[copied..FT.len]);
+        if ranges != 0 as *IntVec {
+            for r in 0..(*ranges).count {
+                mapped.push(moved((*ranges).data[r], old));
+            }
+            var x = 0;
+            while x < old.count {
+                mapped.push(old.data[x + 2]);
+                mapped.push(old.data[x + 3]);
+                x += 4;
+            }
+        }
+        out
+    }
+}
+
+// Whether the lines of FT[s..e) meet a range (all do without ranges).
+fn touches(s: i64, e: i64, ranges: *IntVec) -> bool {
+    unsafe {
+        if ranges == 0 as *IntVec {
+            return true;
+        }
+        var k = 0;
+        while k + 1 < (*ranges).count {
+            let lo = (*ranges).data[k];
+            let hi = (*ranges).data[k + 1];
+            let last = if hi > lo { hi - 1 } else { lo };
+            if s <= last && lo <= e {
+                return true;
+            }
+            k += 2;
+        }
+        false
+    }
+}
+
+// Offset p of FT in the tidied text; `old` holds the runs rewritten (old
+// start, old end, new start, new end), in order. A point in a run is its
+// new start.
+fn moved(p: i64, old: IntVec) -> i64 {
+    unsafe {
+        var delta = 0;
+        var x = 0;
+        while x < old.count {
+            let os = old.data[x];
+            let oe = old.data[x + 1];
+            if p >= oe {
+                delta = old.data[x + 3] - oe;
+            } else if p >= os {
+                return old.data[x + 2];
+            }
+            x += 4;
+        }
+        p + delta
+    }
+}

@@ -1,6 +1,6 @@
 # Memory
 
-Tachyon's values have one owner each (0.17; spelled `let` / `inout` /
+Vole's values have one owner each (0.17; spelled `let` / `inout` /
 `sink` since 0.20): an owned value moves and is dropped at the end of
 its scope, a function says by its parameters' conventions what it does
 with each argument, and the views a slice holds are checked. Nothing
@@ -18,7 +18,7 @@ The kind is computed from the type; nothing is declared:
 | owned | `Vec`, `Buf`, `HashMap`, `Arena`, a type with `Drop`, a struct holding one | a move: the old name is dead until assigned again; `.clone()` copies |
 | view | a slice `[T]`, a struct holding one (`Scanner`) or an access field (`q: inout Query`), a closure capturing by access | a copy (one holding an `inout`: a move) that cannot outlive what it views |
 
-`tachyonc query own FILE:LINE:COL` shows each local's kind there, and
+`volec query own FILE:LINE:COL` shows each local's kind there, and
 whether it is moved or what it views.
 
 ## Conventions: let, inout, sink
@@ -150,10 +150,10 @@ println(f"{s2.len()}");
 1 101
 ```
 
-`tachyonc guide views` has the rules, the diagnostics and the patterns
+`volec guide views` has the rules, the diagnostics and the patterns
 (parsers and lexers that keep views of their input are fine).
 
-`tachyonc --check-alloc` (0.16) also checks at run time: every Gpa block
+`volec --check-alloc` (0.16) also checks at run time: every Gpa block
 on pages of its own, so a use after free (through `unsafe` code) faults
 and is reported with where the block was allocated and freed; bad frees
 and leaks are reported too (`gpa.live_blocks()`, `gpa.check_leaks()` for
@@ -161,7 +161,7 @@ tests).
 
 ## Raw memory
 
-`malloc` and `free` from C, raw `*T` pointers, in `unsafe` (`tachyonc
-guide unsafe`). `tachyonc --check-unsafe -O1` checks heap accesses
+`malloc` and `free` from C, raw `*T` pointers, in `unsafe` (`volec
+guide unsafe`). `volec --check-unsafe -O1` checks heap accesses
 through raw pointers at run time. Memory nobody wrote (from `malloc`)
 has an unspecified value: write it before reading it.

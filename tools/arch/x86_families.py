@@ -24,7 +24,7 @@ x86-64 is not executed in 0.19 (compile-tested only): the semantics are
 the references tests/arch/gen.sh compiles; they run once x86 testing
 returns (docs/design/arch.md, "T5 as built": what is encoded but never
 run). A semantics column that is prose names `fn ref_NAME` in
-tests/arch/ref/x86_*.tach.
+tests/arch/ref/x86_*.vl.
 """
 import os
 import sys

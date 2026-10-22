@@ -1,4 +1,4 @@
-# tachyon in brief
+# vole in brief
 
 Rust's syntax and value semantics (moves, drops at scope end), but a
 parameter takes a convention instead of a reference: `x: T` (let, the
@@ -47,7 +47,7 @@ not `*r = v`); `static var`, `sink ||` for `static mut`, `move ||`;
 `sort_by(|a, b| a - b)` returns an
 `i64`; `usize` is `i64`; integers wrap; `as` narrows; no `dyn`, `Box`.
 
-On demand: `tachyonc guide --find WORDS` (`--find read a line`),
-`tachyonc guide std` (the most used; `std#the-api`: all),
-`tachyonc try 'CODE'` runs a snippet, `tachyonc check main.tach` lists
+On demand: `volec guide --find WORDS` (`--find read a line`),
+`volec guide std` (the most used; `std#the-api`: all),
+`volec try 'CODE'` runs a snippet, `volec check main.vl` lists
 every error.

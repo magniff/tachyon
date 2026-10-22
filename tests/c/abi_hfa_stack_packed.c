@@ -1,4 +1,4 @@
-/* The C side of tests/run/abi_hfa_stack_packed.tach. */
+/* The C side of tests/run/abi_hfa_stack_packed.vl. */
 #include <stdint.h>
 
 typedef struct { float a, b, c; } F3;

@@ -87,4 +87,4 @@ single row and a single column, a grid of only walls, a grid with no
 walls, the largest seed, and several inputs with h and w near 2000,
 q = 200,000, dmax = 30 and p from 5 to 30. Each test has a time limit of
 2.5 seconds.
-<!-- reference times on the task author's machine (Apple silicon, other jobs running), median of 3 on the five large tests (2000 x 2000 or 1500 x 2000, q = 200,000, dmax = 30): solution tachyon 0.41-0.80 s, Rust 0.38-0.94 s; the starter (a Vec of Vecs, and a hash set and a queue allocated per query) tachyon 2.7-8.7 s, Rust 3.0-6.7 s (5.0 s or more on four of the five); a flat grid with a hash set per query is as slow as the starter; limit 2.5 s -->
+<!-- reference times on the task author's machine (Apple silicon, other jobs running), median of 3 on the five large tests (2000 x 2000 or 1500 x 2000, q = 200,000, dmax = 30): solution vole 0.41-0.80 s, Rust 0.38-0.94 s; the starter (a Vec of Vecs, and a hash set and a queue allocated per query) vole 2.7-8.7 s, Rust 3.0-6.7 s (5.0 s or more on four of the five); a flat grid with a hash set per query is as slow as the starter; limit 2.5 s -->

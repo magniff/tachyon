@@ -10,13 +10,13 @@
 ## recorded here before 0.18.1: `true true 122 true true 5 1 <bc>`. What the fix keeps raw is wrapped in
 ## `unsafe` by `fix --only unsafe`, the second try: of the error.)
 $ fix --values
-fixed 1 parameter to &mut T, 1 parameter to &T, 2 arguments	main.tach	+4 -4 lines
+fixed 1 parameter to &mut T, 1 parameter to &T, 2 arguments	main.vl	+4 -4 lines
 ## (0.20) Then 0.20's spelling, `fix --only conventions` (the migration reads
 ## 0.19's spelling itself), before the fixes that read 0.20's.
 $ fix --only conventions
-fixed 1 parameter to let, 1 parameter to inout, 2 '&mut e's to '&e', 1 '&e' to a let, 3 'let mut's / 'mut x's to var	main.tach	+8 -8 lines
+fixed 1 parameter to let, 1 parameter to inout, 2 '&mut e's to '&e', 1 '&e' to a let, 3 'let mut's / 'mut x's to var	main.vl	+8 -8 lines
 note fix.conv_left: 1 left to hand: '&e' with no let parameter or field to take it: drop it to read, or write 'inout r = &e;'
-% grep -n 'fn \|add(' main.tach
+% grep -n 'fn \|add(' main.vl
 2:    fn strlen(s: *u8) -> u64;
 3:    fn memcmp(a: *u8, b: *u8, n: u64) -> i32;
 12:fn streq(a: *u8, b: *u8) -> bool {
@@ -33,8 +33,8 @@ note fix.conv_left: 1 left to hand: '&e' with no let parameter or field to take 
 48:    add(&st, 4);
 49:    add(&st, 6);
 $ fix --only unsafe
-fixed 1 unsafe block	main.tach	+1 -1 lines
-$ main.tach -o prog
+fixed 1 unsafe block	main.vl	+1 -1 lines
+$ main.vl -o prog
 ok: built prog
 % ./prog
 true true 122 true true 5 1 <bc>

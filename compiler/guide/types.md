@@ -22,7 +22,7 @@
 ## Numbers
 
 Only widening converts implicitly (0.15: a narrower integer to a wider
-one, `tachyonc guide conversions`); otherwise both sides of `+`, `==`,
+one, `volec guide conversions`); otherwise both sides of `+`, `==`,
 `=` have one type, and `as` converts between numeric types (and `bool` to an integer,
 fieldless enums to integers and back). An unsuffixed literal takes the
 type the context needs (`let b: u8 = 7;`, `x + 1` with `x: u32`), and
@@ -82,7 +82,7 @@ unsafe.
 An *access* is how a function reaches a value it does not own: a let
 parameter (read-only), an `x: inout T` parameter (exclusive, writes
 reach the caller, passed as `&place`), an `inout r = &place;` local, an
-access field (`q: inout Query`). All are checked (`tachyonc guide
+access field (`q: inout Query`). All are checked (`volec guide
 memory`), safe, and used as the value itself: `r.n += 5`, `r = v`, `n +
 1`, with no `*`. A raw pointer `*T` (from C, `&place` where a `*T` is
 expected, `0 as *T` for null) is dereferenced only in `unsafe`. There is
@@ -120,7 +120,7 @@ converts both ways for free (`id as i64`, `n as NodeId`); a literal is
 the one implicit conversion. T's operators work between two values of
 the type, or one and a literal (`a + 1`, `m / 2.0`, `a < b` is a bool);
 mixing it with T is `distinct.mix`, whose `try:` is the `as` to write
-(`tachyonc fix --suggested` writes them all). It has T's Eq, Ord, Hash,
+(`volec fix --suggested` writes them all). It has T's Eq, Ord, Hash,
 Debug, Display and Clone (`Vec<NodeId>` sorts, prints, is a HashMap key)
 and T's literal patterns, but none of T's methods (`distinct.method`):
 `impl NodeId { .. }` adds its own. `type Id<T> = distinct i64;` makes
@@ -207,9 +207,9 @@ high
 
 ## Layout
 
-`size_of(T)` and `align_of(T)` are constants. Tachyon's own types have
+`size_of(T)` and `align_of(T)` are constants. Vole's own types have
 no guaranteed layout (field order, enum tags, slices); `#[repr(C)]`
-gives C's. See `tachyonc guide c-interop`.
+gives C's. See `volec guide c-interop`.
 
 ## SIMD vectors
 
@@ -229,7 +229,7 @@ An unsigned vector compares unsigned, and its mask is itself (a lane all
 ones or 0); 32-byte vectors are two registers where the CPU has no wider
 ones. `T::from_bits(v)` reinterprets a vector of the same size, with no
 instruction. The CPU's own instructions on them (NEON, SSE, AVX2, CRC,
-AES, SHA) are `std::arch`'s: `tachyonc guide arch`.
+AES, SHA) are `std::arch`'s: `volec guide arch`.
 
 ```tach
 let xs: [f32; 4] = [1.0, 2.0, 3.0, 4.0];

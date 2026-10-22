@@ -9,12 +9,12 @@
 #   log             one line per batch: time, mode, seeds, result, compiler
 #   failures/MODE/  the failing programs (FAIL lines in the log say which)
 #   next/MODE       the next seed of each mode (a restart goes on from there)
-#   tachyonc        the compiler under test, copied when it starts
+#   volec        the compiler under test, copied when it starts
 #   stop            create this file to stop after the current batch
 #
 # usage: tests/fuzz/forever.sh [-c COMPILER] [-n BATCH] [-j JOBS] [--follow]
 #
-#   -c COMPILER   the compiler to test (default: target/tachyonc)
+#   -c COMPILER   the compiler to test (default: target/volec)
 #   -n BATCH      programs per batch (default 50)
 #   -j JOBS       programs at once (default: the number of CPUs)
 #   --follow      take the compiler again whenever COMPILER changes (else
@@ -29,7 +29,7 @@ LC_ALL=C
 export LC_ALL
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 DIR="$ROOT/target/fuzz-forever"
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 BATCH=50
 JOBS=""
 FOLLOW=0
@@ -45,7 +45,7 @@ done
 case "$COMPILER" in /*) ;; *) COMPILER="$(pwd)/$COMPILER" ;; esac
 [ -x "$COMPILER" ] || { echo "forever: no compiler at $COMPILER (use -c)" >&2; exit 2; }
 # (not a gate's runner: its own slots)
-unset TACHYON_JOBSERVER
+unset VOLE_JOBSERVER
 
 mkdir -p "$DIR/next" "$DIR/failures"
 if [ -f "$DIR/pid" ] && kill -0 "$(cat "$DIR/pid")" 2>/dev/null; then
@@ -57,7 +57,7 @@ rm -f "$DIR/stop"
 trap 'rm -f "$DIR/pid"' EXIT
 trap 'exit 130' INT TERM
 
-C="$DIR/tachyonc"
+C="$DIR/volec"
 take_compiler() {
     cp "$COMPILER" "$C.new" && mv "$C.new" "$C"
     COMPILER_ID="$("$C" --version 2>/dev/null | cut -d' ' -f2) $(cksum <"$C" | cut -d' ' -f1)"
@@ -75,7 +75,7 @@ case "$(uname -s)-$(uname -m)" in
     Linux-x86_64) HOSTDIR=x86_64-linux ;;
 esac
 SEED=""
-for s in "$ROOT"/target/bootstrap/"$HOSTDIR"/seed-*/target/release/tachyon; do
+for s in "$ROOT"/target/bootstrap/"$HOSTDIR"/seed-*/target/release/vole; do
     [ -x "$s" ] && { SEED=$s; break; }
 done
 

@@ -1,0 +1,1152 @@
+// objcgen: Objective-C bindings for vole, generated from a table and
+// checked against the runtime (design docs/design/gpu.md, §2.9).
+//
+//   objcgen TABLE.objc            the bindings (a vole module) on stdout
+//   objcgen --check TABLE.objc    every method of the table against the
+//                                 runtime's type encoding; exit 1 on a
+//                                 mismatch, one `error` line each
+//   objcgen --c-check TABLE.objc  an Objective-C file on stdout that checks
+//                                 the table's constants and struct layouts
+//                                 against the SDK's headers at compile
+//                                 time (clang -fsyntax-only)
+//
+// The format is lib/objc/tables/README.md's. Build: volec
+// tools/objcgen/main.vl -o objcgen.o && cc objcgen.o -o objcgen -lobjc
+// (frameworks are opened with dlopen by the `framework` lines).
+
+use std::Buf;
+
+import "stdio.h" as c;
+import "dlfcn.h" as c;
+
+#[repr(C)]
+struct MethodDesc {
+    name: *u8,
+    types: *u8,
+}
+
+extern "C" {
+    fn sel_registerName(name: *u8) -> *u8;
+    fn objc_getClass(name: *u8) -> *u8;
+    fn objc_getProtocol(name: *u8) -> *u8;
+    fn protocol_getMethodDescription(p: *u8, s: *u8, required: bool, instance: bool) -> MethodDesc;
+    fn class_getInstanceMethod(cls: *u8, s: *u8) -> *u8;
+    fn class_getClassMethod(cls: *u8, s: *u8) -> *u8;
+    fn method_getTypeEncoding(m: *u8) -> *u8;
+    fn object_getClass(o: *u8) -> *u8;
+    fn objc_release(o: *u8);
+    #[link_name = "objc_msgSend"]
+    fn msg_p(o: *u8, s: *u8) -> *u8;
+    fn strlen(s: *u8) -> u64;
+}
+
+// ---- the table ----
+
+const K_VOID: i64 = 0;
+const K_SCALAR: i64 = 1; // code: Q q I i S s C c B f d
+const K_PTR: i64 = 2; // *T: raw memory, the wrapper is unsafe
+const K_OBJ: i64 = 3; // an object: Ref<T>, Id<T> with own
+const K_SEL: i64 = 4;
+const K_CLASS: i64 = 5;
+const K_STRUCT: i64 = 6;
+
+#[derive(Clone)]
+struct Ty {
+    kind: i64,
+    code: u8,
+    name: [u8], // the vole type: u64, MTLSize, MTLBuffer, *u8
+    nullable: bool,
+    own: bool,
+}
+
+#[derive(Clone)]
+struct Param {
+    name: [u8],
+    ty: Ty,
+}
+
+#[derive(Clone)]
+struct Method {
+    line: i64,
+    class_method: bool,
+    selector: [u8],
+    params: Vec<Param>,
+    ret: Ty,
+    alias: [u8],
+}
+
+#[derive(Clone)]
+struct Decl {
+    line: i64,
+    is_protocol: bool,
+    name: [u8],
+    parents: Vec<[u8]>,
+    methods: Vec<Method>,
+}
+
+#[derive(Clone)]
+struct StructDef {
+    line: i64,
+    name: [u8],
+    fields: Vec<Param>,
+}
+
+#[derive(Clone)]
+struct ConstDef {
+    line: i64,
+    name: [u8],
+    ty: [u8],
+    value: [u8],
+}
+
+struct Table {
+    file: [u8],
+    objc: [u8],
+    frameworks: Vec<[u8]>,
+    headers: Vec<[u8]>,
+    uses: Vec<[u8]>, // `use` lines, verbatim
+    imported: Vec<[u8]>, // the object types they bring
+    structs: Vec<StructDef>,
+    consts: Vec<ConstDef>,
+    decls: Vec<Decl>,
+    errors: i64,
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+fn is_upper(b: u8) -> bool {
+    b >= 'A' && b <= 'Z'
+}
+
+fn is_lower(b: u8) -> bool {
+    b >= 'a' && b <= 'z'
+}
+
+fn is_digit(b: u8) -> bool {
+    b >= '0' && b <= '9'
+}
+
+fn starts_with(s: [u8], p: [u8]) -> bool {
+    s.len >= p.len && s[0..p.len] == p
+}
+
+fn find_byte(s: [u8], b: u8) -> i64 {
+    for i in 0..s.len {
+        if s[i] == b { return i; }
+    }
+    -1
+}
+
+fn trim(s: [u8]) -> [u8] {
+    std::trim(s)
+}
+
+// The table's errors so far.
+static var ERRORS: i64 = 0;
+
+impl Table {
+    fn error<T: Display>(self, line: i64, msg: sink T) {
+        eprintln(f"{self.file}:{line}: error objcgen.table: {msg}");
+        ERRORS += 1;
+    }
+
+    fn is_object(inout self, name: [u8]) -> bool {
+        if name == "id" { return true; }
+        for d in self.decls {
+            if d.name == name { return true; }
+        }
+        for n in self.imported {
+            if n == name { return true; }
+        }
+        false
+    }
+
+    fn find_struct(self, name: [u8]) -> Option<StructDef> {
+        for s in self.structs {
+            if s.name == name { return Some(s.clone()); }
+        }
+        None
+    }
+
+    fn find_decl(self, name: [u8]) -> Option<Decl> {
+        for d in self.decls {
+            if d.name == name { return Some(d.clone()); }
+        }
+        None
+    }
+
+    // A type as written: u64, *u8, sel, class, NAME, NAME?, own NAME?.
+    fn parse_type(inout self, line: i64, text: [u8]) -> Ty {
+        var t = trim(text);
+        var own = false;
+        if starts_with(t, "own ") {
+            own = true;
+            t = trim(t[4..]);
+        }
+        var nullable = false;
+        if t.len > 0 && t[t.len - 1] == '?' {
+            nullable = true;
+            t = trim(t[0..t.len - 1]);
+        }
+        var ty = Ty { kind: K_VOID, code: 'v', name: t, nullable: nullable, own: own };
+        if t == "void" || t == "" {
+            ty.kind = K_VOID;
+        } else if t == "u64" { ty.kind = K_SCALAR; ty.code = 'Q'; }
+        else if t == "i64" { ty.kind = K_SCALAR; ty.code = 'q'; }
+        else if t == "u32" { ty.kind = K_SCALAR; ty.code = 'I'; }
+        else if t == "i32" { ty.kind = K_SCALAR; ty.code = 'i'; }
+        else if t == "u16" { ty.kind = K_SCALAR; ty.code = 'S'; }
+        else if t == "i16" { ty.kind = K_SCALAR; ty.code = 's'; }
+        else if t == "u8" { ty.kind = K_SCALAR; ty.code = 'C'; }
+        else if t == "i8" { ty.kind = K_SCALAR; ty.code = 'c'; }
+        else if t == "bool" { ty.kind = K_SCALAR; ty.code = 'B'; }
+        else if t == "f32" { ty.kind = K_SCALAR; ty.code = 'f'; }
+        else if t == "f64" { ty.kind = K_SCALAR; ty.code = 'd'; }
+        else if t == "sel" { ty.kind = K_SEL; ty.code = ':'; ty.name = "*u8"; }
+        else if t == "class" { ty.kind = K_CLASS; ty.code = '#'; ty.name = "*u8"; }
+        else if t[0] == '*' { ty.kind = K_PTR; ty.code = '^'; }
+        else if self.is_object(t) {
+            ty.kind = K_OBJ;
+            ty.code = '@';
+            if t == "id" { ty.name = "Object"; }
+        } else {
+            match self.find_struct(t) {
+                Some(_) => { ty.kind = K_STRUCT; ty.code = '{'; }
+                None => self.error(line, f"unknown type '{t}' (a scalar, *T, sel, class, a struct, class or protocol of the table, or a `use`d one)"),
+            }
+        }
+        if (own || nullable) && ty.kind != K_OBJ {
+            self.error(line, f"'own' and '?' are for object types, not '{t}'");
+        }
+        ty
+    }
+
+    // `(a: T, b: U)` into params.
+    fn parse_params(inout self, line: i64, text: [u8], out: inout Vec<Param>) {
+        let t = trim(text);
+        if t.len < 2 || t[0] != '(' || t[t.len - 1] != ')' {
+            self.error(line, f"expected '(name: type, ...)', got '{t}'");
+            return;
+        }
+        self.parse_list(line, t[1..t.len - 1], &out);
+    }
+
+    // `a: T, b: U` into params.
+    fn parse_list(inout self, line: i64, text: [u8], out: inout Vec<Param>) {
+        let inner = trim(text);
+        if inner.len == 0 { return; }
+        var start = 0;
+        for i in 0..inner.len + 1 {
+            if i == inner.len || inner[i] == ',' {
+                let part = trim(inner[start..i]);
+                let colon = find_byte(part, ':');
+                if colon < 0 {
+                    self.error(line, f"expected 'name: type', got '{part}'");
+                } else {
+                    let name = trim(part[0..colon]);
+                    let ty = self.parse_type(line, part[colon + 1..]);
+                    out.push(Param { name: name, ty: ty });
+                }
+                start = i + 1;
+            }
+        }
+    }
+}
+
+// A line's first word and the rest.
+fn split_word(s: [u8]) -> ([u8], [u8]) {
+    let t = trim(s);
+    var i = 0;
+    while i < t.len && t[i] != ' ' && t[i] != '\t' { i += 1; }
+    (t[0..i], trim(t[i..]))
+}
+
+fn parse_table(text: [u8], file: [u8], gpa: Gpa) -> Table {
+    var tb = Table {
+        file: file,
+        objc: "std::objc",
+        frameworks: Vec::new_in(gpa),
+        headers: Vec::new_in(gpa),
+        uses: Vec::new_in(gpa),
+        imported: Vec::new_in(gpa),
+        structs: Vec::new_in(gpa),
+        consts: Vec::new_in(gpa),
+        decls: Vec::new_in(gpa),
+        errors: 0,
+    };
+    // Two passes: declarations first, so that types may be used before
+    // the line that declares them.
+    for pass in 0..2 {
+        var line_no = 0;
+        var start = 0;
+        var cur = -1;
+        for i in 0..text.len + 1 {
+            if i < text.len && text[i] != '\n' { continue; }
+            line_no += 1;
+            let raw = text[start..i];
+            start = i + 1;
+            let hash = find_byte(raw, '#');
+            let body = if hash >= 0 { raw[0..hash] } else { raw };
+            if trim(body).len == 0 { continue; }
+            let indented = body[0] == ' ' || body[0] == '\t';
+            let (word, rest) = split_word(body);
+            if indented {
+                if pass == 0 { continue; }
+                if cur < 0 {
+                    tb.error(line_no, "a method outside a class or protocol");
+                    continue;
+                }
+                let m = parse_method(&tb, line_no, trim(body), gpa);
+                tb.decls[cur].methods.push(m);
+                continue;
+            }
+            if word == "class" || word == "protocol" {
+                if pass == 0 {
+                    let colon = find_byte(rest, ':');
+                    let name = if colon >= 0 { trim(rest[0..colon]) } else { rest };
+                    var parents: Vec<[u8]> = Vec::new_in(gpa);
+                    if colon >= 0 {
+                        for p in std::split_in(rest[colon + 1..], ',', gpa) {
+                            parents.push(trim(p));
+                        }
+                    }
+                    tb.decls.push(Decl {
+                        line: line_no, is_protocol: word == "protocol", name: name,
+                        parents: parents, methods: Vec::new_in(gpa)
+                    });
+                } else {
+                    cur += 1;
+                }
+            } else if pass == 1 {
+                cur = -1;
+                if word == "objc" {
+                    tb.objc = rest;
+                } else if word == "framework" {
+                    tb.frameworks.push(rest);
+                } else if word == "header" {
+                    tb.headers.push(rest);
+                } else if word == "use" {
+                    tb.uses.push(trim(body));
+                } else if word == "struct" || word == "const" {
+                    // parsed in pass 0
+                } else {
+                    tb.error(line_no, f"unknown line '{word}' (objc, framework, header, use, struct, const, class, protocol, or an indented method)");
+                }
+            } else if word == "use" {
+                // the names in braces, or the last segment
+                let open = find_byte(rest, '{');
+                if open >= 0 {
+                    let close = find_byte(rest, '}');
+                    let inner = if close > open { rest[open + 1..close] } else { rest[open + 1..] };
+                    for n in std::split_in(inner, ',', gpa) {
+                        tb.imported.push(trim(n));
+                    }
+                } else {
+                    var k = rest.len;
+                    while k > 0 && rest[k - 1] != ':' { k -= 1; }
+                    var last = trim(rest[k..]);
+                    if last.len > 0 && last[last.len - 1] == ';' { last = last[0..last.len - 1]; }
+                    tb.imported.push(last);
+                }
+            } else if word == "struct" {
+                let open = find_byte(rest, '{');
+                let close = find_byte(rest, '}');
+                if open < 0 || close < open {
+                    tb.error(line_no, "expected 'struct NAME { field: type, ... }' on one line");
+                    continue;
+                }
+                tb.structs.push(StructDef {
+                    line: line_no, name: trim(rest[0..open]), fields: Vec::new_in(gpa)
+                });
+            } else if word == "const" {
+                // const NAME: TYPE = VALUE
+                let colon = find_byte(rest, ':');
+                let eq = find_byte(rest, '=');
+                if colon < 0 || eq < colon {
+                    tb.error(line_no, "expected 'const NAME: type = value'");
+                    continue;
+                }
+                tb.consts.push(ConstDef {
+                    line: line_no, name: trim(rest[0..colon]), ty: trim(rest[colon + 1..eq]),
+                    value: trim(rest[eq + 1..])
+                });
+            }
+        }
+        if pass == 0 {
+            // the struct fields, now that every type name is known
+            for k in 0..tb.structs.len() {
+                let sline = tb.structs[k].line;
+                let raw = line_text(text, sline);
+                let open = find_byte(raw, '{');
+                let close = find_byte(raw, '}');
+                var fields: Vec<Param> = Vec::new_in(gpa);
+                tb.parse_list(sline, raw[open + 1..close], &fields);
+                tb.structs[k].fields = fields;
+            }
+        }
+    }
+    tb
+}
+
+fn line_text(text: [u8], line: i64) -> [u8] {
+    var n = 1;
+    var start = 0;
+    for i in 0..text.len + 1 {
+        if i == text.len || text[i] == '\n' {
+            if n == line { return text[start..i]; }
+            n += 1;
+            start = i + 1;
+        }
+    }
+    ""
+}
+
+// [+|-]SELECTOR (params) [-> TYPE] [as NAME]
+fn parse_method(tb: inout Table, line: i64, text: [u8], gpa: Gpa) -> Method {
+    var t = text;
+    var class_method = false;
+    if t[0] == '+' || t[0] == '-' {
+        class_method = t[0] == '+';
+        t = trim(t[1..]);
+    }
+    var i = 0;
+    while i < t.len && t[i] != ' ' && t[i] != '\t' && t[i] != '(' { i += 1; }
+    let selector = t[0..i];
+    var rest = trim(t[i..]);
+    var alias: [u8] = "";
+    // ` as NAME` at the end
+    var k = rest.len;
+    while k >= 4 {
+        if rest[k - 4..k] == " as " {
+            alias = trim(rest[k..]);
+            rest = trim(rest[0..k - 4]);
+            break;
+        }
+        k -= 1;
+    }
+    var ret_text: [u8] = "void";
+    var arrow = -1;
+    for j in 0..rest.len - 1 {
+        if rest[j] == '-' && rest[j + 1] == '>' { arrow = j; }
+    }
+    let params_text = if arrow >= 0 { rest[0..arrow] } else { rest };
+    if arrow >= 0 { ret_text = rest[arrow + 2..]; }
+    var params: Vec<Param> = Vec::new_in(gpa);
+    tb.parse_params(line, params_text, &params);
+    let colons = selector.iter().filter(|b| b == ':').count();
+    if colons != params.len() {
+        tb.error(line, f"'{selector}' takes {colons} arguments, the line has {params.len()}");
+    }
+    let ret = tb.parse_type(line, ret_text);
+    Method {
+        line: line, class_method: class_method, selector: selector, params: params, ret: ret,
+        alias: alias
+    }
+}
+
+// ---- names ----
+
+// The ancestors of d (d first), transitively.
+fn ancestors(tb: Table, d: [u8], out: inout Vec<[u8]>) {
+    for x in out.iter() {
+        if x == d { return; }
+    }
+    out.push(d);
+    match tb.find_decl(d) {
+        Some(dd) => {
+            for p in dd.parents { ancestors(tb, p, &out); }
+        }
+        None => {}
+    }
+}
+
+// Two methods one type has under the same name: an error (the second
+// needs `as NAME`).
+fn check_names(tb: inout Table, gpa: Gpa) {
+    for d in tb.decls {
+        var anc: Vec<[u8]> = Vec::new_in(gpa);
+        ancestors(tb, d.name, &anc);
+        var seen: Vec<Buf> = Vec::new_in(gpa);
+        for a in anc {
+            match tb.find_decl(a) {
+                Some(ad) => {
+                    for m in ad.methods {
+                        if m.class_method || is_init(m.selector) { continue; }
+                        let n = method_name(m, gpa);
+                        for s in seen {
+                            if s.as_slice() == n.as_slice() {
+                                tb.error(m.line,
+                                    f"{d.name} has two methods named '{n.as_slice()}' (this is {m.selector}): give one `as NAME`");
+                            }
+                        }
+                        seen.push(n);
+                    }
+                }
+                None => {
+                    if a != d.name {
+                        tb.error(d.line, f"unknown parent '{a}' of {d.name}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+const KEYWORDS: [[u8]; 30] = ["as", "break", "const", "continue", "defer", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "import", "in", "let", "loop", "match", "mod", "mut", "pub",
+    "return", "static", "struct", "trait", "true", "type", "union", "unsafe", "use"];
+
+fn push_ident(out: inout Buf, s: [u8]) {
+    out.push_str(s);
+    for k in KEYWORDS {
+        if k == s { out.push('_'); }
+    }
+}
+
+// newBufferWithLength:options: -> new_buffer_with_length_options
+fn snake(sel: [u8], gpa: Gpa) -> Buf {
+    var out = Buf::new_in(gpa);
+    var prev: u8 = 0;
+    for i in 0..sel.len {
+        let ch = sel[i];
+        if ch == ':' {
+            prev = '_';
+            continue;
+        }
+        let next: u8 = if i + 1 < sel.len { sel[i + 1] } else { 0 };
+        if out.len() > 0 && prev == '_' {
+            out.push('_');
+        }
+        else if is_upper(ch) && out.len() > 0
+            && (is_lower(prev) || is_digit(prev) || (is_upper(prev) && is_lower(next))) {
+            out.push('_');
+        }
+        out.push(if is_upper(ch) { ch + 32 } else { ch });
+        prev = ch;
+    }
+    out
+}
+
+fn method_name(m: Method, gpa: Gpa) -> Buf {
+    if m.alias.len > 0 {
+        var b = Buf::new_in(gpa);
+        b.push_str(m.alias);
+        return b;
+    }
+    let s = snake(m.selector, gpa);
+    var b = Buf::new_in(gpa);
+    push_ident(&b, s.as_slice());
+    b
+}
+
+fn is_init(sel: [u8]) -> bool {
+    starts_with(sel, "init") && (sel.len == 4 || is_upper(sel[4]) || sel[4] == ':')
+}
+
+// The ABI shape's code for a type: one token of the shape's name.
+fn shape_code(tb: Table, t: Ty, out: inout Buf) {
+    if t.kind == K_VOID { out.push('v'); }
+    else if t.kind == K_SCALAR {
+        match t.code {
+            'Q' => out.push_str("u64"), 'q' => out.push_str("i64"), 'I' => out.push_str("u32"),
+            'i' => out.push_str("i32"), 'S' => out.push_str("u16"), 's' => out.push_str("i16"),
+            'C' => out.push_str("u8"), 'c' => out.push_str("i8"), 'B' => out.push_str("bool"),
+            'f' => out.push_str("f32"), _ => out.push_str("f64"),
+        }
+    }
+    else if t.kind == K_STRUCT { out.push_str(t.name); }
+    else { out.push('p'); }
+}
+
+// The type in the extern declaration.
+fn abi_type(t: Ty, out: inout Buf) {
+    if t.kind == K_SCALAR || t.kind == K_STRUCT { out.push_str(t.name); }
+    else { out.push_str("*u8"); }
+}
+
+// The type in the wrapper's signature.
+fn api_type(tb: Table, t: Ty, is_result: bool, out: inout Buf) {
+    if t.kind == K_OBJ {
+        if t.nullable { out.push_str("Option<"); }
+        out.push_str(if t.own && is_result { "Id<" } else { "Ref<" });
+        out.push_str(t.name);
+        out.push('>');
+        if t.nullable { out.push('>'); }
+    } else if t.kind == K_PTR {
+        out.push_str(t.name);
+    } else {
+        abi_type(t, &out);
+    }
+}
+
+fn shape_name(tb: Table, m: Method, gpa: Gpa) -> Buf {
+    var b = Buf::new_in(gpa);
+    b.push_str("msg_");
+    shape_code(tb, m.ret, &b);
+    for p in m.params {
+        b.push('_');
+        shape_code(tb, p.ty, &b);
+    }
+    b
+}
+
+// ---- generation ----
+
+struct Gen {
+    out: Buf,
+    shapes: Vec<Buf>,
+    shape_lines: Buf,
+    sels: Vec<[u8]>,
+    classes: Vec<[u8]>,
+}
+
+fn sel_index(g: inout Gen, sel: [u8]) -> i64 {
+    for i in 0..g.sels.len() {
+        if g.sels.get(i) == sel { return i; }
+    }
+    g.sels.push(sel);
+    g.sels.len() - 1
+}
+
+fn class_index(g: inout Gen, name: [u8]) -> i64 {
+    for i in 0..g.classes.len() {
+        if g.classes.get(i) == name { return i; }
+    }
+    g.classes.push(name);
+    g.classes.len() - 1
+}
+
+fn need_shape(tb: Table, g: inout Gen, m: Method, gpa: Gpa) -> Buf {
+    let name = shape_name(tb, m, gpa);
+    for s in g.shapes {
+        if s.as_slice() == name.as_slice() { return name; }
+    }
+    push_shape(&g.shape_lines, name.as_slice(), m);
+    g.shapes.push(name.clone());
+    name
+}
+
+fn push_shape(l: inout Buf, name: [u8], m: Method) {
+    l.push_str("    #[link_name = \"objc_msgSend\"]\n    fn ");
+    l.push_str(name);
+    l.push_str("(o: *u8, s: *u8");
+    for i in 0..m.params.len() {
+        let p = m.params.get(i);
+        l.push_fmt(f", a{i}: ");
+        abi_type(p.ty, &l);
+    }
+    l.push(')');
+    if m.ret.kind != K_VOID {
+        l.push_str(" -> ");
+        abi_type(m.ret, &l);
+    }
+    l.push_str(";\n");
+}
+
+fn is_unsafe(m: Method) -> bool {
+    m.params.iter().any(|p| p.ty.kind == K_PTR)
+}
+
+// The signature after `fn `: name(self, a: A) -> R
+fn push_signature(tb: Table, out: inout Buf, m: Method, recv: [u8], recv_kind: i64, gpa: Gpa) {
+    let name = method_name(m, gpa);
+    out.push_str(name.as_slice());
+    out.push('(');
+    var first = true;
+    if recv_kind == 3 {
+        out.push_str("self");
+        first = false;
+    } else if recv_kind == 1 {
+        out.push_str("self");
+        first = false;
+    } else if recv_kind == 2 {
+        out.push_str("this: sink Id<");
+        out.push_str(recv);
+        out.push('>');
+        first = false;
+    }
+    for p in m.params {
+        if !first { out.push_str(", "); }
+        first = false;
+        push_ident(&out, p.name);
+        out.push_str(": ");
+        api_type(tb, p.ty, false, &out);
+    }
+    out.push(')');
+    if m.ret.kind != K_VOID {
+        out.push_str(" -> ");
+        api_type(tb, m.ret, true, &out);
+    }
+}
+
+fn push_body(tb: Table, g: inout Gen, out: inout Buf, m: Method, receiver: [u8], gpa: Gpa) {
+    let shape = need_shape(tb, &g, m, gpa);
+    let si = sel_index(&g, m.selector);
+    var call = Buf::new_in(gpa);
+    call.push_str(shape.as_slice());
+    call.push('(');
+    call.push_str(receiver);
+    call.push_fmt(f", sel_{si}()");
+    for p in m.params {
+        call.push_str(", ");
+        if p.ty.kind == K_OBJ {
+            if p.ty.nullable {
+                call.push_str("opt_ptr(");
+                push_ident(&call, p.name);
+                call.push(')');
+            } else {
+                push_ident(&call, p.name);
+                call.push_str(".ptr");
+            }
+        } else {
+            push_ident(&call, p.name);
+        }
+    }
+    call.push(')');
+    let c = call.as_slice();
+    let in_unsafe = is_unsafe(m);
+    out.push_str(" {\n        // the prototype is checked against the runtime's encoding (objcgen --check)\n        ");
+    if !in_unsafe { out.push_str("unsafe { "); }
+    let r = m.ret;
+    if r.kind == K_OBJ {
+        if r.own {
+            if r.nullable { out.push_fmt(f"Id::<{r.name}>::from_owned({c})"); }
+            else { out.push_fmt(f"Id::<{r.name}>::from_owned_or_nil({c})"); }
+        } else {
+            // a +0 result lives as long as its receiver (or the pool)
+            if receiver == "self.ptr" {
+                if r.nullable { out.push_fmt(
+                    f"Ref::<{r.name}>::from_raw_opt({c}, &self.keep as *u8)"); }
+                else { out.push_fmt(f"Ref::<{r.name}>::from_raw({c}, &self.keep as *u8)"); }
+            } else {
+                if r.nullable { out.push_fmt(f"Ref::<{r.name}>::from_global_opt({c})"); }
+                else { out.push_fmt(f"Ref::<{r.name}>::from_global({c})"); }
+            }
+        }
+    } else {
+        out.push_str(c);
+    }
+    if r.kind == K_VOID { out.push(';'); }
+    if !in_unsafe { out.push_str(" }"); }
+    out.push_str("\n    }\n");
+    call.free();
+}
+
+// The declarations whose instances have d's methods: d and every
+// declaration deriving from it, transitively.
+fn heirs(tb: Table, d: [u8], out: inout Vec<[u8]>) {
+    for x in out.iter() {
+        if x == d { return; }
+    }
+    out.push(d);
+    for e in tb.decls {
+        for p in e.parents {
+            if p == d { heirs(tb, e.name, &out); }
+        }
+    }
+}
+
+fn generate(tb: Table, gpa: Gpa) -> Buf {
+    var g = Gen {
+        out: Buf::new_in(gpa), shapes: Vec::new_in(gpa), shape_lines: Buf::new_in(gpa),
+        sels: Vec::new_in(gpa), classes: Vec::new_in(gpa)
+    };
+    var body = Buf::new_in(gpa);
+    gen_items(tb, &g, &body, gpa);
+    finish(tb, &g, body.as_slice());
+    body.free();
+    g.out
+}
+
+fn gen_items(tb: Table, g: inout Gen, b: inout Buf, gpa: Gpa) {
+    for s in tb.structs {
+        b.push_str("#[repr(C)]\n#[derive(Clone)]\npub struct ");
+        b.push_str(s.name);
+        b.push_str(" {\n");
+        for f in s.fields {
+            b.push_str("    pub ");
+            push_ident(&b, f.name);
+            b.push_str(": ");
+            abi_type(f.ty, &b);
+            b.push_str(",\n");
+        }
+        b.push_str("}\n\n");
+    }
+    for k in tb.consts {
+        b.push_fmt(f"pub const {k.name}: {k.ty} = {k.value};\n");
+    }
+    if tb.consts.len() > 0 { b.push('\n'); }
+    for di in 0..tb.decls.len() {
+        let d = tb.decls[di];
+        let kind = if d.is_protocol { "protocol" } else { "class" };
+        b.push_fmt(f"/// The Objective-C {kind} {d.name}.\npub struct {d.name} {{}}\n\n");
+        // instance methods: a trait, implemented for Ref<D> and its heirs
+        var inst = 0;
+        for m in d.methods {
+            if !m.class_method && !is_init(m.selector) { inst += 1; }
+        }
+        if inst > 0 {
+            b.push_fmt(f"pub trait {d.name}Methods {{\n");
+            for m in d.methods {
+                if m.class_method || is_init(m.selector) { continue; }
+                b.push_fmt(f"    // {m.selector}\n    ");
+                if is_unsafe(m) { b.push_str("unsafe "); }
+                b.push_str("fn ");
+                push_signature(tb, &b, m, "Self", 3, gpa);
+                // the trait's receiver is `self: Self`
+                b.push_str(";\n");
+            }
+            b.push_str("}\n\n");
+            var hs: Vec<[u8]> = Vec::new_in(gpa);
+            heirs(tb, d.name, &hs);
+            for h in hs {
+                b.push_fmt(f"impl {d.name}Methods for Ref<{h}> {{\n");
+                for m in d.methods {
+                    if m.class_method || is_init(m.selector) { continue; }
+                    b.push_str("    ");
+                    if is_unsafe(m) { b.push_str("unsafe "); }
+                    b.push_str("fn ");
+                    push_signature(tb, &b, m, h, 1, gpa);
+                    push_body(tb, &g, &b, m, "self.ptr", gpa);
+                }
+                b.push_str("}\n\n");
+            }
+            hs.free();
+        }
+        // class methods and the init family: associated functions
+        var assoc = 0;
+        for m in d.methods {
+            if m.class_method || is_init(m.selector) { assoc += 1; }
+        }
+        if assoc > 0 {
+            b.push_fmt(f"impl {d.name} {{\n");
+            for m in d.methods {
+                if m.class_method {
+                    let ci = class_index(&g, d.name);
+                    b.push_fmt(f"    // +{m.selector}\n    pub ");
+                    if is_unsafe(m) { b.push_str("unsafe "); }
+                    b.push_str("fn ");
+                    push_signature(tb, &b, m, d.name, 0, gpa);
+                    let recv = format_in(f"class_{ci}()", gpa);
+                    push_body(tb, &g, &b, m, recv.as_slice(), gpa);
+                } else if is_init(m.selector) {
+                    b.push_fmt(
+                        f"    // -{m.selector}: consumes `this` (the init family), returns +1\n    pub ");
+                    if is_unsafe(m) { b.push_str("unsafe "); }
+                    b.push_str("fn ");
+                    push_signature(tb, &b, m, d.name, 2, gpa);
+                    push_body(tb, &g, &b, m, "this.into_raw()", gpa);
+                }
+            }
+            b.push_str("}\n\n");
+        }
+    }
+}
+
+fn finish(tb: Table, g: inout Gen, body: [u8]) {
+    g.out.push_fmt(f"// Generated by tools/objcgen from {tb.file}: do not edit.\n");
+    g.out.push_str("// Every prototype below is checked against the Objective-C runtime's\n// type encoding by `objcgen --check`, and every constant and struct\n// against the SDK's headers by `objcgen --c-check` (tests/gpu/run.sh).\n\n");
+    g.out.push_fmt(f"use {tb.objc}::{{Id, Object, Ref, opt_ptr}};\n");
+    for u in tb.uses {
+        g.out.push_str(u);
+        if u[u.len - 1] != ';' { g.out.push(';'); }
+        g.out.push('\n');
+    }
+    g.out.push_str("\nextern \"C\" {\n    fn sel_registerName(name: *u8) -> *u8;\n    fn objc_getClass(name: *u8) -> *u8;\n");
+    g.out.push_str(g.shape_lines.as_slice());
+    g.out.push_str("}\n\n");
+    g.out.push_str("// The selectors and classes, looked up on first use.\n");
+    for i in 0..g.sels.len() {
+        let s = g.sels.get(i);
+        g.out.push_fmt(
+            f"static var SEL_{i}: *u8 = 0 as *u8;\n\nfn sel_{i}() -> *u8 {{\n    if SEL_{i}.is_null() {{\n        SEL_{i} = unsafe {{ sel_registerName(c\"{s}\") }};\n    }}\n    SEL_{i}\n}}\n\n");
+    }
+    for i in 0..g.classes.len() {
+        let s = g.classes.get(i);
+        g.out.push_fmt(
+            f"static var CLASS_{i}: *u8 = 0 as *u8;\n\nfn class_{i}() -> *u8 {{\n    if CLASS_{i}.is_null() {{\n        CLASS_{i} = unsafe {{ objc_getClass(c\"{s}\") }};\n    }}\n    CLASS_{i}\n}}\n\n");
+    }
+    g.out.push_str(body);
+}
+
+// ---- the runtime check ----
+
+// The canonical form of one type of an encoding at s[*i]: qualifiers and
+// offsets dropped, pointers as '^', structs as {fields}.
+fn put(out: inout Buf, emit: bool, ch: u8) {
+    if emit { out.push(ch); }
+}
+
+fn canon_one(s: [u8], i: inout i64, out: inout Buf, emit: bool) {
+    while i < s.len && find_byte("rnNoORVA", s[i]) >= 0 { i += 1; }
+    if i >= s.len { return; }
+    let ch = s[i];
+    i += 1;
+    if ch == '{' {
+        while i < s.len && s[i] != '=' && s[i] != '}' { i += 1; }
+        if i < s.len && s[i] == '=' { i += 1; }
+        put(&out, emit, '{');
+        while i < s.len && s[i] != '}' { canon_one(s, &i, &out, emit); }
+        i += 1;
+        put(&out, emit, '}');
+    } else if ch == '^' || ch == '*' {
+        put(&out, emit, '^');
+        if ch == '^' {
+            canon_one(s, &i, &out, false);
+        }
+    } else if ch == '@' {
+        put(&out, emit, '@');
+        if i < s.len && s[i] == '?' {
+            put(&out, emit, '?');
+            i += 1;
+        } else if i < s.len && s[i] == '"' {
+            i += 1;
+            while i < s.len && s[i] != '"' { i += 1; }
+            i += 1;
+        }
+    } else if ch == '[' {
+        put(&out, emit, '[');
+        while i < s.len && is_digit(s[i]) { i += 1; }
+        canon_one(s, &i, &out, emit);
+        i += 1;
+        put(&out, emit, ']');
+    } else {
+        put(&out, emit, ch);
+    }
+    while i < s.len && is_digit(s[i]) { i += 1; }
+}
+
+fn canon(s: [u8], gpa: Gpa) -> Buf {
+    var out = Buf::new_in(gpa);
+    var i = 0;
+    while i < s.len { canon_one(s, &i, &out, true); }
+    out
+}
+
+fn expect_one(tb: Table, t: Ty, out: inout Buf) {
+    if t.kind == K_STRUCT {
+        out.push('{');
+        match tb.find_struct(t.name) {
+            Some(sd) => {
+                for f in sd.fields { expect_one(tb, f.ty, &out); }
+            }
+            None => {}
+        }
+        out.push('}');
+    } else {
+        out.push(t.code);
+    }
+}
+
+fn expected(tb: Table, m: Method, gpa: Gpa) -> Buf {
+    var out = Buf::new_in(gpa);
+    expect_one(tb, m.ret, &out);
+    out.push_str("@:");
+    for p in m.params { expect_one(tb, p.ty, &out); }
+    out
+}
+
+fn cstr(s: [u8], gpa: Gpa) -> Buf {
+    var b = Buf::new_in(gpa);
+    b.push_str(s);
+    b.push(0);
+    b
+}
+
+// The caller passes nil or a NUL-terminated string that outlives the slice.
+unsafe fn from_c(p: *u8) -> [u8] {
+    if p == 0 as *u8 { return ""; }
+    p[0..strlen(p) as i64]
+}
+
+// The runtime's encoding of a declaration's method, or "".
+fn runtime_encoding(d: Decl, m: Method, gpa: Gpa) -> [u8] {
+    let name = cstr(d.name, gpa);
+    let selname = cstr(m.selector, gpa);
+    // Every call below is to the Objective-C runtime with NUL-terminated
+    // names; the objects made to probe a class are released.
+    unsafe {
+        let sel = sel_registerName(selname.as_slice().ptr);
+        if d.is_protocol {
+            let p = objc_getProtocol(name.as_slice().ptr);
+            if p == 0 as *u8 { return ""; }
+            let inst = !m.class_method;
+            var md = protocol_getMethodDescription(p, sel, true, inst);
+            if md.types == 0 as *u8 { md = protocol_getMethodDescription(p, sel, false, inst); }
+            return from_c(md.types);
+        }
+        let cls = objc_getClass(name.as_slice().ptr);
+        if cls == 0 as *u8 { return ""; }
+        if m.class_method {
+            return from_c(method_getTypeEncoding(class_getClassMethod(cls, sel)));
+        }
+        var meth = class_getInstanceMethod(cls, sel);
+        if meth == 0 as *u8 {
+            // property accessors live in the private subclass that alloc
+            // (or alloc then init) returns: MTLTextureDescriptorInternal
+            let a = msg_p(cls, sel_registerName(c"alloc"));
+            if a != 0 as *u8 {
+                meth = class_getInstanceMethod(object_getClass(a), sel);
+                if meth == 0 as *u8 {
+                    let o = msg_p(a, sel_registerName(c"init"));
+                    if o != 0 as *u8 {
+                        meth = class_getInstanceMethod(object_getClass(o), sel);
+                        objc_release(o);
+                    }
+                } else {
+                    // an allocated, uninitialized object: init it to free it
+                    let o = msg_p(a, sel_registerName(c"init"));
+                    if o != 0 as *u8 { objc_release(o); }
+                }
+            }
+        }
+        if meth == 0 as *u8 { return ""; }
+        from_c(method_getTypeEncoding(meth))
+    }
+}
+
+fn check(tb: inout Table, gpa: Gpa) -> i64 {
+    for f in tb.frameworks {
+        let path = format_in(f"/System/Library/Frameworks/{f}.framework/{f}", gpa);
+        let p = cstr(path.as_slice(), gpa);
+        // dlopen of a NUL-terminated path
+        let h = unsafe { c::dlopen(p.as_slice().ptr, c::RTLD_NOW) };
+        if h == 0 as *u8 {
+            eprintln(f"{tb.file}: error objcgen.framework: cannot open {path.as_slice()}");
+            return 1;
+        }
+    }
+    var bad = 0;
+    var n = 0;
+    for d in tb.decls {
+        for m in d.methods {
+            n += 1;
+            var enc = runtime_encoding(d, m, gpa);
+            if enc.len == 0 && !d.is_protocol {
+                // an abstract class's accessors live in its heirs'
+                // private subclasses: check them on a table heir
+                var hs: Vec<[u8]> = Vec::new_in(gpa);
+                heirs(tb, d.name, &hs);
+                for h in hs {
+                    if enc.len > 0 { break; }
+                    match tb.find_decl(h) {
+                        Some(hd) => { enc = runtime_encoding(hd, m, gpa); }
+                        None => {}
+                    }
+                }
+                hs.free();
+            }
+            let want = expected(tb, m, gpa);
+            let sign = if m.class_method { "+" } else { "-" };
+            if enc.len == 0 {
+                eprintln(
+                    f"{tb.file}:{m.line}: error objcgen.missing: {d.name} {sign}{m.selector} is not in the runtime");
+                bad += 1;
+                continue;
+            }
+            let got = canon(enc, gpa);
+            if got.as_slice() != want.as_slice() {
+                eprintln(
+                    f"{tb.file}:{m.line}: error objcgen.encoding: {d.name} {sign}{m.selector} is {enc} in the runtime ({got.as_slice()}), the table says {want.as_slice()}");
+                eprintln("  help: Q u64, q i64, I u32, i i32, B bool, f f32, d f64, @ an object, ^ a pointer, {..} a struct; the first type is the result, then @: (self, _cmd)");
+                bad += 1;
+            }
+        }
+    }
+    if bad > 0 { return 1; }
+    println(f"objcgen: {tb.file}: {n} methods match the runtime");
+    0
+}
+
+// ---- the header check ----
+
+fn c_type(t: [u8]) -> [u8] {
+    if t == "u64" { "unsigned long long" } else if t == "i64" { "long long" }
+    else if t == "u32" { "unsigned int" } else if t == "i32" { "int" }
+    else if t == "f64" { "double" } else if t == "f32" { "float" } else { t }
+}
+
+fn c_check(tb: Table, gpa: Gpa) -> Buf {
+    var o = Buf::new_in(gpa);
+    o.push_fmt(
+        f"// Generated by objcgen --c-check from {tb.file}: compile with clang -fsyntax-only.\n");
+    for h in tb.headers { o.push_fmt(f"#import <{h}>\n"); }
+    o.push_str("#include <stddef.h>\n\n");
+    for k in tb.consts {
+        o.push_fmt(
+            f"_Static_assert({k.name} == {k.value}, \"{tb.file}:{k.line}: {k.name} is not {k.value}\");\n");
+    }
+    for s in tb.structs {
+        var size = 0;
+        o.push_fmt(f"_Static_assert(sizeof({s.name}) == ");
+        var sizes = Buf::new_in(gpa);
+        for f in s.fields {
+            sizes.push_fmt(f"sizeof({c_type(f.ty.name)}) + ");
+            size += 1;
+        }
+        o.push_str(sizes.as_slice());
+        o.push_fmt(f"0, \"{tb.file}:{s.line}: the size of {s.name}\");\n");
+        for f in s.fields {
+            o.push_fmt(
+                f"_Static_assert(__builtin_types_compatible_p(__typeof__((({s.name} *)0)->{f.name}), {c_type(f.ty.name)}) || sizeof((({s.name} *)0)->{f.name}) == sizeof({c_type(f.ty.name)}), \"{tb.file}:{s.line}: {s.name}.{f.name}\");\n");
+        }
+        sizes.free();
+    }
+    o
+}
+
+fn read_file(name: [u8], gpa: Gpa) -> Option<Buf> {
+    var out = Buf::new_in(gpa);
+    let path_c = cstr(name, gpa);
+    let path = path_c.as_slice().ptr;
+    // fopen/fread/fclose on a NUL-terminated path, into a local array
+    unsafe {
+        let f = c::fopen(path, c"rb");
+        if f == 0 as *c::FILE { return None; }
+        var chunk: [u8; 4096] = [0; 4096];
+        loop {
+            let n = c::fread(&chunk as *u8, 1, 4096, f) as i64;
+            if n <= 0 { break; }
+            out.push_str(chunk[0..n]);
+        }
+        c::fclose(f);
+    }
+    Some(out)
+}
+
+fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
+    var mode: [u8] = "gen";
+    var path: [u8] = "";
+    for k in 1..argc as i64 {
+        // argv holds argc NUL-terminated strings that live as long as main
+        let s = unsafe { from_c(argv[k]) };
+        if s == "--check" { mode = "check"; }
+        else if s == "--c-check" { mode = "c-check"; }
+        else { path = s; }
+    }
+    if path.len == 0 {
+        eprintln("usage: objcgen [--check | --c-check] TABLE.objc");
+        return 2;
+    }
+    let text = match read_file(path, gpa) {
+        Some(t) => t,
+        None => {
+            eprintln(f"error objcgen.read: cannot read {path}");
+            return 2;
+        }
+    };
+    var tb = parse_table(text.as_slice(), path, gpa);
+    check_names(&tb, gpa);
+    if ERRORS > 0 { return 1; }
+    if mode == "check" {
+        return check(&tb, gpa) as i32;
+    }
+    if mode == "c-check" {
+        print(c_check(tb, gpa).as_slice());
+        return 0;
+    }
+    print(generate(tb, gpa).as_slice());
+    0
+}

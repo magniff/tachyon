@@ -1,9 +1,9 @@
-# Changing a program by name: tachyonc edit, fix, check, same-output
+# Changing a program by name: volec edit, fix, check, same-output
 
 The refactoring tools of 0.11 (phase 1), for agents that would otherwise
 read a file to change one item, and edit it with `sed`, `perl` or a
 Python script (see [agent-tool-usage.md](agent-tool-usage.md)). They are
-built on `tachyonc query` ([query.md](query.md)): NAME is anything query
+built on `volec query` ([query.md](query.md)): NAME is anything query
 accepts, positions and spans are the compiler's, and every problem is
 one line `SEVERITY CODE: MESSAGE` followed by `try:` lines, as there.
 Every query, edit and refactoring in one table, a row each: [query.md,
@@ -13,27 +13,27 @@ Sessions with these tools on small programs, each step's command and
 its output, tested by `tests/walkthrough/run.sh`: [examples/tools](../examples/tools/README.md).
 
 ```
-tachyonc edit patch TARGET --old TEXT --new TEXT [--old TEXT --new TEXT]... [--loose]
-tachyonc edit patch TARGET [--loose] < PAIRS   (0.12; see "Edits inside an item")
-tachyonc edit patch TARGET --pairs FILE [--loose]   (0.13)
-tachyonc edit patch [TARGET] --old A --new B --in NAME --old C --new D   (0.15: several targets)
-tachyonc edit apply [FILE]                     (0.15) several items' new text, one edit
-tachyonc edit insert --in TARGET --after|--before ANCHOR [--loose] < TEXT
-tachyonc edit wrap TARGET --in HEAD [--body | --lines A-B]   (0.13)
-tachyonc edit new-file PATH [--pub] < TEXT     (0.13) the file and its mod line
-tachyonc edit replace NAME [ROOT] < TEXT       the item's text becomes TEXT
-tachyonc edit insert --after|--before NAME [ROOT] < TEXT
-tachyonc edit delete NAME [ROOT]
-tachyonc undo [--force]                        the last edit, undone
-tachyonc check [ROOT]                          the front end's errors, one per line
-tachyonc fix [ROOT] [--only imports,unused,pub,unsafe,tidy-imports,reexports,std015,alloc016,values] [--values] [--in FILE|MODULE]
-tachyonc fix --suggested [--at FILE:LINE] [ROOT]   (0.18) the errors' exact fixes
-tachyonc same-output OLD [--corpus DIR|FILE]... [-j N] [--work DIR]
-tachyonc lint --max-lines N [ROOT]
-tachyonc query stats [MODULE|FILE] [--over N] [--all]
-tachyonc query deps MODULE [--max-lines N]
-tachyonc query unused [MODULE|FILE] [--all]
-tachyonc query impact NAME
+volec edit patch TARGET --old TEXT --new TEXT [--old TEXT --new TEXT]... [--loose]
+volec edit patch TARGET [--loose] < PAIRS   (0.12; see "Edits inside an item")
+volec edit patch TARGET --pairs FILE [--loose]   (0.13)
+volec edit patch [TARGET] --old A --new B --in NAME --old C --new D   (0.15: several targets)
+volec edit apply [FILE]                     (0.15) several items' new text, one edit
+volec edit insert --in TARGET --after|--before ANCHOR [--loose] < TEXT
+volec edit wrap TARGET --in HEAD [--body | --lines A-B]   (0.13)
+volec edit new-file PATH [--pub] < TEXT     (0.13) the file and its mod line
+volec edit replace NAME [ROOT] < TEXT       the item's text becomes TEXT
+volec edit insert --after|--before NAME [ROOT] < TEXT
+volec edit delete NAME [ROOT]
+volec undo [--force]                        the last edit, undone
+volec check [ROOT]                          the front end's errors, one per line
+volec fix [ROOT] [--only imports,unused,pub,unsafe,tidy-imports,reexports,std015,alloc016,values] [--values] [--in FILE|MODULE]
+volec fix --suggested [--at FILE:LINE] [ROOT]   (0.18) the errors' exact fixes
+volec same-output OLD [--corpus DIR|FILE]... [-j N] [--work DIR]
+volec lint --max-lines N [ROOT]
+volec query stats [MODULE|FILE] [--over N] [--all]
+volec query deps MODULE [--max-lines N]
+volec query unused [MODULE|FILE] [--all]
+volec query impact NAME
 ```
 
 The editing commands (edit, fix) also take `--dry-run`, `--no-check`, `--show`,
@@ -43,8 +43,8 @@ the build's features it is given, so one that removes a
 `detect("crc")` guard is refused on a `generic` build
 (`arch.feature`) and accepted where crc is in the baseline
 (examples/arch/crc32/README.md shows it). ROOT is found as for query
-(`--root`, a last argument ending in `.tach`, `$TACHYON_ROOT`,
-`./main.tach`, `./compiler/src/main.tach`).
+(`--root`, a last argument ending in `.vl`, `$VOLE_ROOT`,
+`./main.vl`, `./compiler/src/main.vl`).
 
 Exit status: 0 done, 1 refused or failed (nothing written), 2 usage
 error.
@@ -55,8 +55,8 @@ Every change is a set of replacements of byte ranges of the program's
 files, computed from the compiler's spans. It is applied atomically:
 
 1. each changed file's new text is written to a copy next to it,
-   `FILE.tachyon-edit~`;
-2. the front end runs again on the edited program: `tachyonc check
+   `FILE.vole-edit~`;
+2. the front end runs again on the edited program: `volec check
    --overlay FILE COPY... ROOT`, in a process of its own, reads the copies
    in place of the files (parse, resolve, type check, unsafe check);
 3. its errors are compared with the program's before the edit, by file
@@ -73,7 +73,7 @@ files, computed from the compiler's spans. It is applied atomically:
    one line says what changed:
 
 ```
-replaced crate::middle::gvn::run_gvn→compiler/src/middle/gvn.tach→+3 -5 lines
+replaced crate::middle::gvn::run_gvn→compiler/src/middle/gvn.vl→+3 -5 lines
 ```
 
 (`→` is a TAB; with several files, `N files`). Nothing outside the
@@ -86,31 +86,31 @@ are not new: an edit of a program with errors is checked against them.
   run)`, exit 1).
 - `--no-check` writes an edit that adds errors anyway (a signature
   changed before its callers are), with `warning edit.breaks` and the
-  errors; `tachyonc check` lists what is left.
+  errors; `volec check` lists what is left.
 - `--show` (0.12; every edit, fix, rewrite and refactoring) prints, after
   the summary line, the regions the edit changed as their new lines,
   numbered, so that the edit need not be read back:
 
 ```
-patched crate::one→main.tach→+2 -1 lines
-// main.tach:21-22
+patched crate::one→main.vl→+2 -1 lines
+// main.vl:21-22
 21→    let twice = k + k;
 22→    unsafe { twice * abs(a) as i64 / 2 }
 ```
 
   (lines only removed: `// FILE:A: N lines removed after line A`).
-  `tachyonc query diff` prints the last journaled edit as a diff.
+  `volec query diff` prints the last journaled edit as a diff.
 
 ### The journal and undo
 
 Each edit is journaled in the git directory of the root's checkout,
-`.git/tachyon-edits/`: `head` holds the number N of the last edit, and
+`.git/vole-edits/`: `head` holds the number N of the last edit, and
 `N/` its summary line, its files (absolute paths) and each file's text
-before and after. `tachyonc undo` restores the files of the last edit
+before and after. `volec undo` restores the files of the last edit
 and forgets it; run again, it undoes the one before. It refuses when a
 file changed since the edit (`error undo.changed`, `try:` `undo --force`,
 which restores it anyway). A program in no git checkout (0.14: a
-user's workspace) is journaled in `.tachyonc/edits/` next to its root;
+user's workspace) is journaled in `.volec/edits/` next to its root;
 `undo` and `query diff` find it from the root, or from the current
 directory or one below it.
 
@@ -121,8 +121,8 @@ an expression. `edit patch` makes them by text, as cheaply as a
 `s.replace(OLD, NEW)`, and with the engine's check, journal and undo:
 
 ```
-$ tachyonc edit patch range::decide --old 'if a < b {' --new 'if a <= b {'
-patched crate::middle::range::decide→compiler/src/middle/range.tach→+1 -1 lines
+$ volec edit patch range::decide --old 'if a < b {' --new 'if a <= b {'
+patched crate::middle::range::decide→compiler/src/middle/range.vl→+1 -1 lines
 ```
 
 - **TARGET** is a NAME as `query` takes it, or `FILE:LINE` (the innermost
@@ -155,7 +155,7 @@ patched crate::middle::range::decide→compiler/src/middle/range.tach→+1 -1 li
 
 ```
 error patch.no-match: OLD 1 is not in crate::calc::clamp; nearest, line 5: if v < lo {
-try: tachyonc edit patch clamp --old 'v < lo' --new 'v <= lo'
+try: volec edit patch clamp --old 'v < lo' --new 'v <= lo'
 ```
 
   An OLD of several lines whose first lines are there together says
@@ -163,7 +163,7 @@ try: tachyonc edit patch clamp --old 'v < lo' --new 'v <= lo'
 
 ```
 error patch.no-match: OLD 1 is not in crate::calc::sum_to; its lines 1-2 match lines 18-19, then its line 3 'i += 2;' is not line 20 'i += 1;'
-try: tachyonc query text calc.tach:18-20
+try: volec query text calc.vl:18-20
 ```
 
 - **Several matches**: `error patch.ambiguous` with their lines, and for
@@ -172,8 +172,8 @@ try: tachyonc query text calc.tach:18-20
 
 ```
 error patch.ambiguous: OLD 1 occurs 2 times in crate::calc::clamp, lines 6, 9; give more of the text around it, or --nth N (--all: every one)
-try: tachyonc edit patch clamp --old 'return lo;' --new 'return 0 + lo;'
-try: tachyonc edit patch clamp --old 'return hi;' --new 'return 0 + hi;'
+try: volec edit patch clamp --old 'return lo;' --new 'return 0 + lo;'
+try: volec edit patch clamp --old 'return hi;' --new 'return 0 + hi;'
 ```
 
   (0.16) Or say which: `--nth N` replaces the Nth match (1 is the first,
@@ -190,7 +190,7 @@ try: tachyonc edit patch clamp --old 'return hi;' --new 'return 0 + hi;'
   checkout):
 
 ```
-try: tachyonc edit patch clamp --pairs .git/tachyon-edits/try-1.pairs
+try: volec edit patch clamp --pairs .git/vole-edits/try-1.pairs
 ```
 
 - A match of whole lines replaced by an empty NEW removes the lines (and
@@ -246,7 +246,7 @@ before the first `--in` is optional), and in a pairs file (stdin or
 `--pairs FILE`) a line `@@ NAME` does, for the blocks after it:
 
 ```
-$ tachyonc edit patch area --old 'r.w * r.h' --new 'r.h * r.w' --in main --old '== 26' --new '== 27'
+$ volec edit patch area --old 'r.w * r.h' --new 'r.h * r.w' --in main --old '== 26' --new '== 27'
 patched crate::shapes::area, crate::main→2 files→+2 -2 lines
 ```
 
@@ -284,8 +284,8 @@ least indented lines get that indentation, the others keep theirs
 relative to them.
 
 ```
-$ tachyonc edit insert --in calc::sum_to --after 'while i <= n {' < stmt.tach
-inserted in crate::calc::sum_to→calc.tach→+3 -0 lines
+$ volec edit insert --in calc::sum_to --after 'while i <= n {' < stmt.vl
+inserted in crate::calc::sum_to→calc.vl→+3 -0 lines
 ```
 
 ## edit apply (0.15)
@@ -317,8 +317,8 @@ of a method's text is fitted); the `use` lines the new text needs are
 added (`note edit.imports`).
 
 ```
-$ tachyonc query show area main > items.tach      # then change them, add blocks
-$ tachyonc edit apply items.tach --show
+$ volec query show area main > items.vl      # then change them, add blocks
+$ volec edit apply items.vl --show
 applied 3 blocks: replaced crate::shapes::area; added crate::shapes::perimeter; replaced crate::main→2 files→+9 -2 lines
 ```
 
@@ -338,13 +338,13 @@ it does not change (errors outside items, in a `use` line, have no tag).
 `--no-check`:
 
 ```
-main.tach:15:5: error[type error] function 'shapes::scale' expects 3 arguments, got 2  [in crate::main]
+main.vl:15:5: error[type error] function 'shapes::scale' expects 3 arguments, got 2  [in crate::main]
 error edit.breaks: 1 new error (1 in crate::main, which the edit does not change); nothing written
 note edit.refactor: the uses of crate::shapes::scale no longer fit its new shape: a refactoring changes them with it (VALUE, EXPR: to fill in), then the rest of the edit
-try: tachyonc refactor signature crate::shapes::scale --add 'm: i64 = VALUE'
+try: volec refactor signature crate::shapes::scale --add 'm: i64 = VALUE'
 note edit.together: change crate::main in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
-try: tachyonc query show crate::main
-try: tachyonc edit patch scale --old 'k: i64' --new 'k: i64, m: i64' --no-check
+try: volec query show crate::main
+try: volec edit patch scale --old 'k: i64' --new 'k: i64, m: i64' --no-check
 ```
 
 - **`note edit.refactor`**: an edited item's shape changed and its uses
@@ -379,10 +379,10 @@ for a bare block. One edit: a wrap that breaks the program (a `let`
 whose name is used after the block) is refused with the errors.
 
 ```
-$ tachyonc edit wrap calc::first --in unsafe
-wrapped the body of crate::calc::first in unsafe→calc.tach→+4 -2 lines
-$ tachyonc edit wrap calc.tach:19 --in '' --lines 17-21
-wrapped lines 17-21 of crate::calc::sum_to in a block→calc.tach→+6 -4 lines
+$ volec edit wrap calc::first --in unsafe
+wrapped the body of crate::calc::first in unsafe→calc.vl→+4 -2 lines
+$ volec edit wrap calc.vl:19 --in '' --lines 17-21
+wrapped lines 17-21 of crate::calc::sum_to in a block→calc.vl→+6 -4 lines
 ```
 
 `error edit.wrap` when TARGET is no function with a body (give
@@ -394,14 +394,14 @@ body's braces share their lines with code.
 `edit new-file PATH [--pub] < TEXT` (0.13) makes file PATH with TEXT and
 its `mod NAME;` line (`pub mod` with `--pub`) in the file of the module
 whose child it is, as the module loader finds children (next to the
-root or a `mod.tach`; else in the directory named after the parent's
-file; `a/b/mod.tach` for a module with children of its own), in one
+root or a `mod.vl`; else in the directory named after the parent's
+file; `a/b/mod.vl` for a module with children of its own), in one
 checked edit: the new module is at once a TARGET of `edit patch` and the
 other commands. The `mod` line goes after the parent's last `mod NAME;`
 line, as `refactor new-module` puts it.
 
 ```
-$ tachyonc edit new-file lib/extra.tach --pub < extra.tach
+$ volec edit new-file lib/extra.vl --pub < extra.vl
 made crate::lib::extra→2 files→+6 -0 lines
 ```
 
@@ -411,35 +411,35 @@ new-module` makes the modules of a path).
 
 ## Editing std by name (0.17)
 
-In the tachyon repository (`compiler/std/` with its `embed.sh`, from the
+In the vole repository (`compiler/std/` with its `embed.sh`, from the
 current directory or one of the three above it), an edit whose target
 is a std item (`edit patch std::trim`, `edit insert --after Vec::swap`,
 `edit replace std::split`, `edit delete`, `edit wrap`, a block of `edit
-apply`) or one of std's files (`edit patch compiler/std/io.tach:102`)
+apply`) or one of std's files (`edit patch compiler/std/io.vl:102`)
 runs again with `--std-tree compiler/std`: std is then read from its
 files, each a file of the module `std` under its own path, so the edit
-is made in `compiler/std/FILE.tach` and checked with the edited std:
+is made in `compiler/std/FILE.vl` and checked with the edited std:
 every function of std, and each generic one nothing instantiates with
 `i64` for its type parameters (`Gpa` for an `Allocator`), so an error in
-a body is found at once (`compiler/std/io.tach:124:16: error[type
+a body is found at once (`compiler/std/io.vl:124:16: error[type
 error] expected '[u8]', got 'i64'`). Once it is written, `compiler/std/embed.sh` makes
-`compiler/src/front/stdsrc.tach` from the files (`note edit.std`);
+`compiler/src/front/stdsrc.vl` from the files (`note edit.std`);
 `undo` of a std edit does the same. The compiler that runs has the old
 std until it is rebuilt (`bootstrap/bootstrap.sh --dev`).
 
 ```
-$ tachyonc edit insert --after std::trim < strip_prefix.tach
-inserted after std::trim→compiler/std/io.tach→+9 -0 lines
-note edit.std: ran compiler/std/embed.sh: compiler/src/front/stdsrc.tach has std's new text; rebuild to use it (bootstrap/bootstrap.sh --dev)
+$ volec edit insert --after std::trim < strip_prefix.vl
+inserted after std::trim→compiler/std/io.vl→+9 -0 lines
+note edit.std: ran compiler/std/embed.sh: compiler/src/front/stdsrc.vl has std's new text; rebuild to use it (bootstrap/bootstrap.sh --dev)
 ```
 
-`tachyonc check` in the repository reads std from its files when they
+`volec check` in the repository reads std from its files when they
 differ from the compiler's std (edited with the Edit tool, or not yet
 built in), with every function checked as above (`note
 check.std-files`); otherwise std is the compiler's, as before. Outside
 the repository std is the compiler's text and an edit of it is refused
 (`edit.not-source`). The recipe, with the test and the guide entry:
-`tachyonc guide how add-std-fn`.
+`volec guide how add-std-fn`.
 
 ## Items as text
 
@@ -485,7 +485,7 @@ checked).
 `MODULE::header` are NAMEs for `edit replace`, `insert` and `delete` too:
 `edit replace m::header < header.txt` replaces the comment at the top of
 m's file (or puts TEXT there, a blank line after it, when it has none);
-`edit replace m::use < uses.tach` replaces its first block of `use` lines
+`edit replace m::use < uses.vl` replaces its first block of `use` lines
 with TEXT and removes the others (none: TEXT goes after the header);
 `edit insert --after|--before m::use` adds lines after the last `use`
 line or before the first; `edit delete` removes them. The header is the
@@ -496,7 +496,7 @@ is one too: its `extern "C"` blocks (replace: the first becomes TEXT;
 with none, TEXT goes after the `use` lines; insert after the last or
 before the first).
 
-**Files and modules (0.17).** `edit replace FILE.tach < TEXT` replaces
+**Files and modules (0.17).** `edit replace FILE.vl < TEXT` replaces
 the whole file. `edit delete MODULE` (or `@@ delete MODULE`) removes its
 `mod` line and its file, and its children's files: one edit, one `undo`.
 A one-line `const` or `static` inserted next to one (`edit insert
@@ -509,20 +509,20 @@ them, delete removes them with their `, `, insert is refused
 
 NAME may be `FILE:LINE`, for every edit and refactoring of an item (the
 innermost item holding that line, as for query): `edit replace
-gvn.tach:740`, `edit delete`, `refactor rename`, `signature`.
+gvn.vl:740`, `edit delete`, `refactor rename`, `signature`.
 NAME must name one definition of the program's own files; std's and
 the C headers' definitions are left out when one of the program's
 matches. When several match: `error query.ambiguous` with a `try:` line
 per path (the first two and `query def NAME` when there are more).
 
-## tachyonc check
+## volec check
 
-`tachyonc check [ROOT]` runs the front end alone (parse, modules and
+`volec check [ROOT]` runs the front end alone (parse, modules and
 names, type check, unsafe check: no lowering, no code) and prints every
 error and warning in the short form, one per line:
 
 ```
-main.tach:13:25: error[type error] undefined variable 'twice' | help: add `use crate::util::twice;`
+main.vl:13:25: error[type error] undefined variable 'twice' | help: add `use crate::util::twice;`
 ```
 
 Exit 0 without errors (and then nothing is printed but warnings), 1 with
@@ -531,7 +531,7 @@ prints the long form. About 60 ms on the compiler's source (77,000
 lines); 0.13: about 7 ms when the program has not changed since a
 command read it, from the tools' cache ([query.md](query.md#speed-the-cache-013)).
 
-## tachyonc fix
+## volec fix
 
 Every fix the compiler can make by itself, in one atomic edit, one
 summary line:
@@ -553,7 +553,7 @@ fixed 2 missing imports, 3 unused imports, 1 pub, 1 unsafe block→3 files→+3 
 | `alloc016` | (0.16) a program written against 0.15's std, whose containers took their memory from an ambient allocator, made explicit (docs/design/effects-allocation.md §2.3): each call the checker resolved to one of std's 0.15 allocating forms (`#[ambient]`: `Vec::new()`, `with_capacity`, `filled`, `Buf::new()`, `HashMap::new()`, `collect()`, `format(x)`, `read_stdin()`, `split`, `split_whitespace`, `sort_stable`, `sort_stable_by`) becomes its `_in` form with the allocator last (`Vec::new_in(gpa)`, `it.collect_in(gpa)`, `format_in(x, gpa)`), and the `use` lines naming them are renamed (or gain the new name while a call is left). N, the functions holding such a call (in a closure of theirs too) and every caller of one, transitively, take `gpa: Gpa` after their other parameters (`fn main()` becomes `fn main(gpa: Gpa)`, `main(argc, argv)` gets it last), and each call of them passes `gpa` (labelled when it leaves a default before it); a trait's function of the program changes with the trait's declaration and every impl; a function that has a parameter of type `Gpa` already uses it by its name, and its callers stay as they are. What cannot take a parameter is an error naming where it allocates, `fix.alloc016-manual`: an impl of std's trait (`Display::fmt`), a function used as a value, a C-called `extern "C" fn`, a call in a parameter's default (take an `Option` and make the value in the body); the functions of N only it calls are left too. A call in a static's or constant's value: `fix.alloc016-static`. The edit is checked with the 0.15 forms errors (the program before it is checked the same way, so the calls left by an error are no new errors); exit 1 when something was left. A second run finds nothing |
 
 | `values` | (0.17; `--values`) a program moved to references (docs/design/value-semantics.md §5, rules 2-4), computed over the whole program, callees first, to a fixed point (std's bodies count, std is never rewritten): a non-`mut` `p: *T` (`self: *T`) of a safe function becomes `&mut T` when the function writes through it (a field, an element, `v[i] = x` through a receiver, a callee that writes what it is given, a view of it passed to one: `sort_by(v.as_slice(), ..)`), else `&T`, and the calls' `&x` become `&mut x` for a `&mut` parameter (a receiver `x.m()` is the checker's; a raw pointer passed on becomes `&mut *p`); a slice parameter that is written becomes `&mut [T]`, the calls' `a[..]` `&mut a[..]` and `v.as_slice()` `v.as_mut_slice()`; a by-value parameter of an owned type (a Vec, Buf, HashMap, a struct holding one) that the function only reads (no move, no write, no use as a value) becomes `&T`, the calls' `v` become `&v` and its own `&v` `v`. Left as they are: a trait's functions and its impls', closures, functions used as values, `unsafe fn`s, C's, `main`, `**T` and `*[T]`, a pointer parameter copied into a local (a raw walk, `q = (*q).next`), and (0.18.1) a raw pointer: a `*T` parameter passed on to C's, an `unsafe fn`'s or a `mut` parameter, given `c"..."` or null (`0 as *T`), compared (`p == q`), indexed (`p[i]`, `&p[i]`), cast or kept in an aggregate, and one passed on to such a parameter; an f-string's holes are read. A call whose argument cannot follow (a temporary to a `&T`, a slice local to a `&mut [T]`) keeps that parameter, and the fixed point runs again. Rule 1: `defer x.free();` (or `defer { x.free(); }`) of a Vec, Buf or HashMap local declared in the same block is deleted once the type has a Drop (std's, 0.17 T4), whose drop at the block's end frees it; conflicts and views of statics are the checker's to report (rule 7). A second run finds nothing |
-| `suggested` | (0.18; `--suggested`) the fixes the compiler knows exactly, which an error marks with `try: tachyonc fix --suggested ROOT`: the range of the source its fix replaces and the text, recorded with the error (base/diag.tach, `err_fix`), and the `imports` and `pub` fixes. Which: a did-you-mean (a variable, function, method, field, path member, argument name) when no other name is as near; a numeric conversion (`x as u8`), `n != 0` for a condition, `a[..]` for an array where a slice goes, `.as_slice()` of a Buf or Vec, `&x` (a simple value); `s.trim()` as `trim(s)` (std's function for a method it lacks; with `gpa` when the function's local `gpa` is the allocator); a 0.15 allocating form (`Vec::new()`, `format(x)`) as its `_in` form when the function has a local `gpa` (else `fix --only alloc016` threads one); a call missing arguments that locals of the parameters' names and types give (`parse_table(s)` becomes `parse_table(s, gpa)`); a module path written from the crate's root (`crate::table::f`, a `use` line's path); a Rust type with one spelling (`String`, `&str`: `[u8]`; `char`: `u8`; `usize`: `i64`); a Rust label (`'outer:`, `break 'outer`); `.len` of a sealed field read as `.len()`. A tie, a VALUE to fill in, a choice between fixes: no suggestion. A new error on a line the edit wrote refuses it (`edit.breaks`); new errors elsewhere are the ones the fixes let the checker reach. After the summary, the edited program's errors are printed as `check` prints them, then `note fix.left: N errors left (above)`. `--at FILE:LINE`: the fixes of that line's errors only |
+| `suggested` | (0.18; `--suggested`) the fixes the compiler knows exactly, which an error marks with `try: volec fix --suggested ROOT`: the range of the source its fix replaces and the text, recorded with the error (base/diag.vl, `err_fix`), and the `imports` and `pub` fixes. Which: a did-you-mean (a variable, function, method, field, path member, argument name) when no other name is as near; a numeric conversion (`x as u8`), `n != 0` for a condition, `a[..]` for an array where a slice goes, `.as_slice()` of a Buf or Vec, `&x` (a simple value); `s.trim()` as `trim(s)` (std's function for a method it lacks; with `gpa` when the function's local `gpa` is the allocator); a 0.15 allocating form (`Vec::new()`, `format(x)`) as its `_in` form when the function has a local `gpa` (else `fix --only alloc016` threads one); a call missing arguments that locals of the parameters' names and types give (`parse_table(s)` becomes `parse_table(s, gpa)`); a module path written from the crate's root (`crate::table::f`, a `use` line's path); a Rust type with one spelling (`String`, `&str`: `[u8]`; `char`: `u8`; `usize`: `i64`); a Rust label (`'outer:`, `break 'outer`); `.len` of a sealed field read as `.len()`. A tie, a VALUE to fill in, a choice between fixes: no suggestion. A new error on a line the edit wrote refuses it (`edit.breaks`); new errors elsewhere are the ones the fixes let the checker reach. After the summary, the edited program's errors are printed as `check` prints them, then `note fix.left: N errors left (above)`. `--at FILE:LINE`: the fixes of that line's errors only |
 
 By default the first four (`imports`, `unused`, `pub`, `unsafe`),
 everywhere; `tidy-imports`, `reexports`, `std015`, `alloc016`, `values` and `suggested` only when asked
@@ -579,7 +579,7 @@ only once the first is imported. So fix runs again on the edited program
 before the check, and the summary counts every round. Nothing to fix:
 `note fix.none: nothing to fix` (exit 0).
 
-`tachyonc --fix-imports ROOT` (0.8) and `tachyonc --fix-unsafe ROOT`
+`volec --fix-imports ROOT` (0.8) and `volec --fix-unsafe ROOT`
 (0.9) are `fix --only imports` and `fix --only unsafe`, silent when
 there is nothing to do.
 
@@ -596,11 +596,11 @@ NAME from there.
 
 ```
 error fix.ambiguous: crate::back uses 'is_blank', which 2 modules as near have: crate::back::asm, crate::back::obj; nothing is imported for it: name one with --use
-try: tachyonc fix --only imports --use crate::back::asm::is_blank
-try: tachyonc fix --only imports --use crate::back::obj::is_blank
+try: volec fix --only imports --use crate::back::asm::is_blank
+try: volec fix --only imports --use crate::back::obj::is_blank
 ```
 
-## tachyonc same-output
+## volec same-output
 
 A pure refactoring proven to change nothing: every program of the
 corpus is compiled by OLD (a path; 0.16: a name without a `/` and no
@@ -611,8 +611,8 @@ have (a target OLD lacks is skipped, `note same-output.target`), at
 assembly, what the compiler printed, its exit status). The corpus is
 `tests/run`, `examples`, `bench` and `compiler/src` (relative to the
 current directory), or the `--corpus` entries: a file, or a directory
-whose `main.tach` is a module tree's root, or else each of its `.tach`
-files and each `SUB/main.tach`. Up to `-j N` comparisons run at once
+whose `main.vl` is a module tree's root, or else each of its `.vl`
+files and each `SUB/main.vl`. Up to `-j N` comparisons run at once
 (default: the processors), each in a copy of this process; their
 outputs go to `--work DIR` (`target/same-output`), kept when they
 differ.
@@ -628,7 +628,7 @@ N`), the first one's differing lines (`-→old`, `+→new`), and
 ```
 error same-output.differs: 3 of 81 compilations differ (kept in target/same-output)
 try: diff target/same-output/64/old/out.s target/same-output/64/new/out.s
-try: tachyonc --target aarch64-macos -O1 examples/md5/main.tach -o new.s
+try: volec --target aarch64-macos -O1 examples/md5/main.vl -o new.s
 ```
 
 `tests/compare.sh` does the same and more (random programs, C interop,
@@ -650,11 +650,11 @@ line, as `query show` prints it).
 lines (1000), and a last line `LINES→ITEMS→total`; then, when files are
 over, `note query.over: N files over 1000 lines` and `try:` the deps of
 the largest one's module. `query stats MODULE` or `query stats FILE` (a
-path with a `/`, or ending in `.tach`): its items, largest first, under
+path with a `/`, or ending in `.vl`): its items, largest first, under
 a header:
 
 ```
-# crate::middle::gvn→compiler/src/middle/gvn.tach→834 lines→51 items
+# crate::middle::gvn→compiler/src/middle/gvn.vl→834 lines→51 items
 102→fn→memory_step
 76→fn→run_gvn
 ```
@@ -668,7 +668,7 @@ a header:
 into cohesive parts. One line per item, in order:
 
 ```
-# crate::lang→lang.tach→27 lines→8 items
+# crate::lang→lang.vl→27 lines→8 items
 lex→3→Token lex_digit→parse→0
 ```
 
@@ -690,7 +690,7 @@ of their items are merged, while they fit together; then the parts that
 have no references between them are packed, first fit, largest first.
 An item larger than N is a part of its own (`→over`). The references
 between parts are what a split would turn into imports (on the
-compiler's check.tach, 214 items in 5 parts of at most 1000 lines, 156
+compiler's check.vl, 214 items in 5 parts of at most 1000 lines, 156
 references between them).
 
 ### query unused
@@ -716,26 +716,26 @@ instances of a generic function (`instances→N→grow<i64> grow<Buf>
 ...`), the functions implementing a trait's function (`impls→...`), and
 `total→CALLS→OTHER→N files[, N instances][, N impls]`.
 
-## tachyonc lint
+## volec lint
 
-`tachyonc lint --max-lines N [ROOT]`: one error per file over N lines,
+`volec lint --max-lines N [ROOT]`: one error per file over N lines,
 largest first, each with the deps of its module. A generated file (one
-starting `// Generated by`, as `front/stdsrc.tach` and the guide's
+starting `// Generated by`, as `front/stdsrc.vl` and the guide's
 `text/`) is not counted: its size is its generator's (0.14).
 
 ```
-error lint.max-lines: compiler/src/front/check.tach: 4785 lines (at most 1000)
-try: tachyonc query deps crate::check --max-lines 1000
+error lint.max-lines: compiler/src/front/check.vl: 4785 lines (at most 1000)
+try: volec query deps crate::check --max-lines 1000
 ```
 
 Exit 1 when a file is over, 0 when none is.
 
-## tachyonc fmt (0.13)
+## volec fmt (0.13)
 
-`tachyonc fmt [FILE|DIR...|MODULE|--all] [--check] [--dry-run]`: one
-layout for tachyon source, written as one edit (journaled, `undo`); the
+`volec fmt [FILE|DIR...|MODULE|--all] [--check] [--dry-run]`: one
+layout for vole source, written as one edit (journaled, `undo`); the
 edit engine lays out the lines every edit writes the same way, and
-`tachyonc explain CODE` says what any code of this page means. See
+`volec explain CODE` says what any code of this page means. See
 [fmt.md](fmt.md).
 
 ## Merge conflicts: query conflicts, edit resolve (0.15)
@@ -745,26 +745,26 @@ parse until they are gone, so neither `query` nor `edit` can read the
 program. These two read the files as text:
 
 ```
-tachyonc query conflicts [FILE|DIR|FILE:LINE...] [--show]
-tachyonc edit resolve FILE:LINE|FILE|NAME --ours|--theirs|--both|--base [--all] [--in FILE]
-tachyonc edit resolve TARGET < TEXT
+volec query conflicts [FILE|DIR|FILE:LINE...] [--show]
+volec edit resolve FILE:LINE|FILE|NAME --ours|--theirs|--both|--base [--all] [--in FILE]
+volec edit resolve TARGET < TEXT
 ```
 
 `query conflicts` prints one line per region (`<<<<<<<` to `>>>>>>>`;
 diff3's `|||||||` base side too): its lines, its items, and each side's
-size and label. Without a FILE it reads the `.tach` files with markers
+size and label. Without a FILE it reads the `.vl` files with markers
 under the root's directory. The items are found from the text: the items
 whose header lines the region has (`fn f`, `struct S`, `use` lines; a
 method as `T::m`), else the item around it, `-` when none. `--show`
 prints each side's lines.
 
 ```
-$ tachyonc query conflicts
-main.tach:4-8→use→ours 1 line (HEAD)→theirs 1 line (feature)
-shapes.tach:10-17→Shape::grow→ours 1 line (HEAD)→base 1 line (base)→theirs 2 lines (feature)
-shapes.tach:22-27→area→ours 1 line (HEAD)→theirs 2 lines (feature)
-$ tachyonc query conflicts shapes.tach:12 --show
-// shapes.tach:10-17→Shape::grow
+$ volec query conflicts
+main.vl:4-8→use→ours 1 line (HEAD)→theirs 1 line (feature)
+shapes.vl:10-17→Shape::grow→ours 1 line (HEAD)→base 1 line (base)→theirs 2 lines (feature)
+shapes.vl:22-27→area→ours 1 line (HEAD)→theirs 2 lines (feature)
+$ volec query conflicts shapes.vl:12 --show
+// shapes.vl:10-17→Shape::grow
 // ours (HEAD), line 11:
         (*self).w += by;
 // base (base), line 13:
@@ -785,10 +785,10 @@ copy renamed onto it) and journaled: `undo` takes it back. `--dry-run`
 prints the diff, `--show` the new lines.
 
 ```
-$ tachyonc edit resolve area --theirs
-resolved shapes.tach:22-27 (theirs)→shapes.tach→+0 -4 lines
+$ volec edit resolve area --theirs
+resolved shapes.vl:22-27 (theirs)→shapes.vl→+0 -4 lines
 note conflict.left: 2 conflict regions left in 2 files
-try: tachyonc query conflicts
+try: volec query conflicts
 ```
 
 While regions are left, `note conflict.left` counts them. The resolve
@@ -798,34 +798,34 @@ together, as both sides' `use` lines importing a name twice).
 
 ## Renaming the language: rewrite --text, refactor extension (0.21)
 
-0.24 renames tachyon to vole: `tachyonc` becomes `volec`, `.tach`
-becomes `.vl`, `TACHYON_X` becomes `VOLE_X`, `_tachyon.` becomes
+0.24 renames vole to vole: `volec` becomes `volec`, `.vl`
+becomes `.vl`, `VOLE_X` becomes `VOLE_X`, `_vole.` becomes
 `_vole.`. The compiler does it, with two tools that edit a whole tree,
 and tools/rename-vole.sh runs them in order. They change the files git
 tracks (`git ls-files`, from the current directory), are one edit each
 for `undo`, and take `--dry-run` and `--diff`.
 
 ```
-tachyonc rewrite --text OLD NEW [--files GLOB]... [--word] [--case] [--regex]
+volec rewrite --text OLD NEW [--files GLOB]... [--word] [--case] [--regex]
     [--comments] [--strings] [--code] [--no-sources] [--move-paths]
     [--exclude SPEC]... [--exclude-from FILE] [--check ROOT]... [--dry-run] [--diff]
-tachyonc refactor extension OLD NEW [ROOT | DIR | --all]...
+volec refactor extension OLD NEW [ROOT | DIR | --all]...
     [--exclude SPEC]... [--exclude-from FILE] [--dry-run] [--diff] [--no-check] [-j N]
-tachyonc query grep --ignore-case --strings --comments TEXT
+volec query grep --ignore-case --strings --comments TEXT
 ```
 
 `rewrite --text` replaces OLD in any text file: markdown, scripts,
 toml, json, the transcripts, and vole sources. `--word`: OLD is not part
 of a longer word of letters and digits (`_`, `.`, `-` end a word, so
-TACHYON_ROOT and `_tachyon.` have the word tachyon, `tachyonc` has not).
-`--case`: OLD in any case, and NEW in the case of each match (`tachyon`,
-`Tachyon`, `TACHYON` become `vole`, `Vole`, `VOLE`; a mixed case is
+VOLE_ROOT and `_vole.` have the word vole, `volec` has not).
+`--case`: OLD in any case, and NEW in the case of each match (`vole`,
+`Vole`, `VOLE` become `vole`, `Vole`, `VOLE`; a mixed case is
 noted). `--regex`: OLD is rewrite's regular expression (`^ $ . * + ?
 [a-z] \d \w`), within a line. In a vole source, `--comments`,
 `--strings` (an f-string's text too) and `--code` take only the matches
 there, as the lexer reads the file, and only sources; `--no-sources` the
 other files only. `--move-paths` also moves a file whose path has OLD
-(`tools/agent-hooks/tachyonc_cmd.py` to `volec_cmd.py`), as `git mv`
+(`tools/agent-hooks/volec_cmd.py` to `volec_cmd.py`), as `git mv`
 does. `--check ROOT` checks the program before and after (the new texts
 read in place of the files): a new error writes nothing. The output is a
 line per file (`PATH<TAB>N matches`, `NEW <- OLD` for a moved one, the
@@ -833,16 +833,16 @@ lines kept), the totals, and notes on what was left: in excluded files
 (`rewrite.excluded`), in kept lines or other places (`rewrite.kept`), in
 sources that do not lex (`rewrite.not-lexed`).
 
-`refactor extension .tach .vl` renames sources: a program's (ROOT: the
+`refactor extension .vl .vl` renames sources: a program's (ROOT: the
 root and its modules), a directory's, or the tree's (`--all`), as `git
 mv` renames them (the index's entries move in one `git update-index`).
 `mod` needs no change: it finds either extension. The mentions of their
 paths change in every file git tracks: in scripts, test runners and
 fixtures, docs, and a source's comments (its directives: `// STDERR:
-main.tach:3: ...`). With ROOT or DIR, a mention changes when it names a
+main.vl:3: ...`). With ROOT or DIR, a mention changes when it names a
 renamed file (from the mentioning file's directory, from here, or by the
 end of its path when that ends one file's path only); with `--all`,
-every one (`*.tach` too). A string literal is never changed (a path in a
+every one (`*.vl` too). A string literal is never changed (a path in a
 string is what the program does): they are counted
 (`extension.strings`), with the `rewrite --text --strings` that changes
 them. Then every program renamed (ROOT; with DIR and `--all` each root
@@ -859,32 +859,32 @@ too; `DIR/` everything under it); `GLOB:/RE/` the lines RE matches;
 `GLOB:/A/,/B/` each range of lines from one A matches to the line before
 the next one B matches. tools/rename-vole.keep keeps the history: the
 seed, the records of past releases, the release notes and the bootstrap
-entries of the releases up to 0.23 (they are built as tachyonc and
-.tach: bootstrap/releases.toml's `bin` and `ext`).
+entries of the releases up to 0.23 (they are built as volec and
+.vl: bootstrap/releases.toml's `bin` and `ext`).
 
 `undo` takes a moved file back to its place (the journal's
 `TO<TAB>3<TAB>FROM` lines), after restoring its text; `query diff` shows
 `moved FROM -> TO`.
 
-tools/rename-vole.sh does the rename, in order: `refactor extension .tach
-.vl --all`; the identifiers with tachyon (`query grep --code
+tools/rename-vole.sh does the rename, in order: `refactor extension .vl
+.vl --all`; the identifiers with vole (`query grep --code
 --ignore-case`: none, else it stops for `refactor rename`); the
-sources' strings and comments (`tachyonc` to `volec`, `tachyon` to
-`vole`, `.tach` to `.vl` in strings, `--check compiler/src/main.vl`);
+sources' strings and comments (`volec` to `volec`, `vole` to
+`vole`, `.vl` to `.vl` in strings, `--check compiler/src/main.vl`);
 the other files ([head]'s interface `volec-0.24` first, then the words,
 paths moved); std's and the guide's generated sources made again; the
 renamed compiler built (target/volec) and checked; with `--test` its
 suite, with `--regen` the transcripts regenerated; and what is left,
-`git grep -i tachyon` counted by file (target/rename-vole/leftovers.txt).
+`git grep -i vole` counted by file (target/rename-vole/leftovers.txt).
 `--dry-run` prints each step's plan.
 
 The dry run of 2026-10-21 (on release-0.21 and these tools, in a scratch
 worktree): 1753 files renamed, 6358 mentions; 1149 programs built the
 same; the renamed suite passed but 7 cases (1653 of 1662), each a value
-computed from the word itself (`c"tachyon"[6]`, the padding of
-`{name:>9}`, a hash of "tachyon", "7 bytes"): their expectations are
+computed from the word itself (`c"vole"[6]`, the padding of
+`{name:>9}`, a hash of "vole", "7 bytes"): their expectations are
 changed by hand in 0.24, or their sample word kept. `git grep -i
-tachyon` then finds 28 files, all kept on purpose: the seed, the eval
+vole` then finds 28 files, all kept on purpose: the seed, the eval
 and tool-gap records, the notes and bootstrap entries of the releases up
 to 0.23, the cache formats' magic words (`tachyong`, `tachyonq`), the
 rename's own test and the script.
@@ -893,17 +893,17 @@ rename's own test and the script.
 
 | code | severity | exit | when | try |
 |---|---|---|---|---|
-| `edit.std` | note | 0 | (0.17) a std edit in the repository wrote std's files; embed.sh made stdsrc.tach | rebuild: `bootstrap/bootstrap.sh --dev` |
+| `edit.std` | note | 0 | (0.17) a std edit in the repository wrote std's files; embed.sh made stdsrc.vl | rebuild: `bootstrap/bootstrap.sh --dev` |
 | `edit.std` | warning | 0 | (0.17) the same, and embed.sh failed | `compiler/std/embed.sh` |
 | `check.std-files` | note | 0 | (0.17) std's files differ from the compiler's std: checked with them | |
 | `edit.breaks` | error | 1 | the edit adds errors (they are printed); nothing written | the command with `--no-check` |
-| `edit.breaks` | warning | 1, 0 | the same with `--dry-run`, or `--no-check` (written) | `tachyonc check` |
+| `edit.breaks` | warning | 1, 0 | the same with `--dry-run`, or `--no-check` (written) | `volec check` |
 | `edit.refactor` | note | | (0.15) with edit.breaks: an edited item's shape changed and its uses broke | the refactoring that changes them with it |
 | `edit.together` | note | | (0.15) with edit.breaks: items the edit does not change have errors | `query show` of them |
 | `edit.format` | error | 2 | (0.15) apply: the file is not blocks | |
 | `edit.overlap` | error | 1 | (0.15) apply: two blocks change one item | |
 | `edit.no-module` | error | 1 | (0.15) apply: a new item for a module with no file of its own | `query items MODULE` |
-| `edit.no-text` | error | 2 | replace or insert without TEXT on stdin; patch without pairs | the command `< new.tach`; with `--old OLD --new NEW` |
+| `edit.no-text` | error | 2 | replace or insert without TEXT on stdin; patch without pairs | the command `< new.vl`; with `--old OLD --new NEW` |
 | `patch.no-match` | error | 1 | an OLD or ANCHOR is not in TARGET (with the nearest line) | the command with that line's text, or with `--loose`, or `query show FILE:LINE` |
 | `patch.ambiguous` | error | 1 | an OLD or ANCHOR occurs several times (their lines) | the command with more context around each |
 | `patch.overlap` | error | 1 | two OLDs overlap | |
@@ -960,5 +960,5 @@ every command.
   `new-module`, `move-module`, `split` in
   [refactor-modules.md](refactor-modules.md); all on this engine
   (`edit_replace`, `edit_new_file`, `apply_edit` in
-  compiler/src/tools/edit.tach), and a command registered in
-  compiler/src/tools/commands.tach runs in scripts too.
+  compiler/src/tools/edit.vl), and a command registered in
+  compiler/src/tools/commands.vl runs in scripts too.

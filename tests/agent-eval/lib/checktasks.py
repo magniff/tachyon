@@ -3,7 +3,7 @@ per task.
 
 (0.17) Also, for the program tasks:
 
-- lints of both reference solutions: tachyon `tachyonc fmt --check`,
+- lints of both reference solutions: vole `volec fmt --check`,
   `lint --max-lines 1000`, `query unused` and `fix --dry-run` clean; Rust
   `rustfmt --check` and `rustc -D warnings` clean (`--no-lint` skips);
 - variants: `variants/LANG-NAME.patch` (`diff -ruN a b` against
@@ -60,12 +60,12 @@ def check_task(task, bins, scratch):
         problems.append("check %s missing" % task.check)
     # twins: the same module files in both languages
     for a, b in (("tach", "rust"), ("solution/tach", "solution/rust")):
-        ta = _sources(os.path.join(task.path, a), ".tach")
+        ta = _sources(os.path.join(task.path, a), ".vl")
         rb = _sources(os.path.join(task.path, b), ".rs")
         if ta != rb and (ta or task.kind != "write"):
             problems.append("%s and %s are not twins: %s vs %s"
                             % (a, b, sorted(ta), sorted(rb)))
-    for lang, ext in (("tach", "main.tach"), ("rust", "main.rs")):
+    for lang, ext in (("tach", "main.vl"), ("rust", "main.rs")):
         if not os.path.isfile(os.path.join(task.path, "solution", lang, ext)):
             problems.append("solution/%s/%s missing" % (lang, ext))
     if problems:
@@ -135,11 +135,11 @@ def lint_solution(task, lang, bins, scratch):
     out = []
     if lang == "tach":
         env = base_env(bins["tach"])
-        cmds = [("fmt --check", ["tachyonc", "fmt", "--check", "main.tach"], None),
-                ("lint", ["tachyonc", "lint", "--max-lines", "1000", "main.tach"], None),
-                ("query unused", ["tachyonc", "query", "unused", "--root", "main.tach"],
+        cmds = [("fmt --check", ["volec", "fmt", "--check", "main.vl"], None),
+                ("lint", ["volec", "lint", "--max-lines", "1000", "main.vl"], None),
+                ("query unused", ["volec", "query", "unused", "--root", "main.vl"],
                  "nothing unused"),
-                ("fix --dry-run", ["tachyonc", "fix", "--dry-run", "--root", "main.tach"],
+                ("fix --dry-run", ["volec", "fix", "--dry-run", "--root", "main.vl"],
                  "nothing to fix")]
         for name, argv, want in cmds:
             rc, o, e, _ = run_proc(argv, src, env, 120)
@@ -176,9 +176,9 @@ def check_prompts(bins, scratch):
         for i, b in enumerate(blocks):
             d = os.path.join(scratch, "prompts", "%s-%d" % (os.path.basename(md)[:-3], i))
             os.makedirs(d, exist_ok=True)
-            with open(os.path.join(d, "main.tach"), "w") as fh:
+            with open(os.path.join(d, "main.vl"), "w") as fh:
                 fh.write(b)
-            rc, o, e, _ = run_proc(["tachyonc", "main.tach", "-o", "prog"], d,
+            rc, o, e, _ = run_proc(["volec", "main.vl", "-o", "prog"], d,
                                    base_env(bins["tach"]), 120)
             if rc != 0:
                 out.append("%s block %d does not build: %s" % (
@@ -189,10 +189,10 @@ def check_prompts(bins, scratch):
 
 def main(args):
     tasks = load_tasks(args.tasks_dir, args.tasks or None, args.set)
-    root = tempfile.mkdtemp(prefix="tachyon-eval-check-")
+    root = tempfile.mkdtemp(prefix="vole-eval-check-")
     bins = None
     if any(not t.is_compiler for t in tasks):
-        bins = prepare_bins(root, args.tachyonc)
+        bins = prepare_bins(root, args.volec)
         if not os.path.exists(os.path.join(bins["rust"], "rustc")):
             print("error: rustc not found")
             return 1

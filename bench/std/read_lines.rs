@@ -1,4 +1,4 @@
-// bench/std: read a 256 MB file of text lines (made by read_lines.tach
+// bench/std: read a 256 MB file of text lines (made by read_lines.vl
 // --make) with a BufReader: `lines()` (a String per line), or with the
 // argument `reuse` before the path, `read_line` into one String. Prints
 // the lines, their bytes (each '\n' included) and the sum of each line's

@@ -2,16 +2,16 @@
 ## is written in place (no closure, no Interp): its type is still shown
 ## as an f-string's, the call is still a reference of println, push_fmt
 ## and format_in, and what its writes do is the call's.
-$ type fstring017/main.tach:9:13
-Interp<closure(*Fmt) -> () at fstring017/main.tach:9:13>	f"n = {n}"
-$ type fstring017/main.tach:10:10
-Interp<closure(inout Fmt) -> () at fstring017/main.tach:10:10>	f"n = {n}"
-$ type fstring017/main.tach:9:20
+$ type fstring017/main.vl:9:13
+Interp<closure(*Fmt) -> () at fstring017/main.vl:9:13>	f"n = {n}"
+$ type fstring017/main.vl:10:10
+Interp<closure(inout Fmt) -> () at fstring017/main.vl:10:10>	f"n = {n}"
+$ type fstring017/main.vl:9:20
 i64	n
-$ type fstring017/main.tach:12:16
-Interp<closure(*Fmt) -> () at fstring017/main.tach:12:16>	f"[{n}]"
-$ refs println push_fmt format_in --in fstring017/main.tach
-# fstring017/main.tach
+$ type fstring017/main.vl:12:16
+Interp<closure(*Fmt) -> () at fstring017/main.vl:12:16>	f"[{n}]"
+$ refs println push_fmt format_in --in fstring017/main.vl
+# fstring017/main.vl
 1:30	use	crate	->std::fmt::format_in	use std::{Buf, Display, Gpa, format_in, println};
 1:41	use	crate	->std::fmt::println	use std::{Buf, Display, Gpa, format_in, println};
 4:5	call	show	->std::fmt::println	println(x);
@@ -21,7 +21,7 @@ $ refs println push_fmt format_in --in fstring017/main.tach
 14:5	call	main	->std::fmt::println	println(t.as_slice());
 $ effects main --why io
 crate::main	alloc(Gpa) io global panic diverge
-  'println(f"n = {n}")' at fstring017/main.tach:9:5 calls 'std::fmt::println'
+  'println(f"n = {n}")' at fstring017/main.vl:9:5 calls 'std::fmt::println'
   'print_acquire()' at <std>:10725:5 calls 'std::fmt::print_acquire'
   'print_acquire_held()' at <std>:10686:9 calls 'std::fmt::print_acquire_held'
   (no source found)

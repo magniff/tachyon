@@ -1,5 +1,5 @@
 // bench/std spawn (0.20): 1000 times, Command::new("/usr/bin/true").status(),
-// then the number that exited 0 (as spawn.tach). std only.
+// then the number that exited 0 (as spawn.vl). std only.
 use std::process::Command;
 
 fn main() {

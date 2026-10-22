@@ -5,10 +5,10 @@ both together.
 
 ## Build and run
 
-From this folder (with `tachyonc` on your `PATH`, or `../../target/tachyonc`):
+From this folder (with `volec` on your `PATH`, or `../../target/volec`):
 
 ```sh
-tachyonc main.tach -o variadic && ./variadic
+volec main.vl -o variadic && ./variadic
 ```
 
 ## Expected output
@@ -43,12 +43,12 @@ unsafe {
 }
 ```
 
-The types must match the format, as in C: nothing checks them. Tachyon's
+The types must match the format, as in C: nothing checks them. Vole's
 own printing (`println(f"{x}")`) is checked and needs no `unsafe`; use
 `printf` when you are talking to C anyway.
 
 ## Language features
 
-- variadic `extern "C"` functions: `tachyonc guide c-interop`
-- `c"..."` literals: `tachyonc guide types`
-- `unsafe` blocks: `tachyonc guide unsafe`
+- variadic `extern "C"` functions: `volec guide c-interop`
+- `c"..."` literals: `volec guide types`
+- `unsafe` blocks: `volec guide unsafe`

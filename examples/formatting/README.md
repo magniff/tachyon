@@ -1,6 +1,6 @@
 # formatting
 
-Formatted text in tachyon: f-strings and every part of a format spec
+Formatted text in vole: f-strings and every part of a format spec
 (width, alignment, zero padding, precision, hex, binary, characters,
 Debug), `Display` and `Debug` written by hand and derived, and the ways
 to send formatted text somewhere (`println`, `eprintln`, `format`,
@@ -9,10 +9,10 @@ table, some Debug views and a hex dump.
 
 ## Build and run
 
-From this folder (with `tachyonc` on your `PATH`, or `../../target/tachyonc`):
+From this folder (with `volec` on your `PATH`, or `../../target/volec`):
 
 ```sh
-tachyonc main.tach -o formatting && ./formatting
+volec main.vl -o formatting && ./formatting
 ./formatting 2>/dev/null     # the report alone, without the warnings on stderr
 ```
 
@@ -31,8 +31,8 @@ On stdout:
 {x}           [3.14159]    the shortest text that reads back
 {x:.2}        [3.14]       two decimals
 {x:>9.3}      [    3.142]  width and precision
-{name:>9}     [  tachyon]  text goes left by default
-{name:?}      ["tachyon"]  Debug: quoted and escaped
+{name:>9}     [     vole]  text goes left by default
+{name:?}      ["vole"]     Debug: quoted and escaped
 {'A':c}       [A]          a u8 as a character
 {n * 2 + 1}   [85]         any expression
 {{ and }} in an f-string are literal braces: {n}
@@ -51,9 +51,9 @@ Item { sku: SKU-0007, name: "hammer", category: Tools, qty: 12, price: Money(159
 Food(180) SKU-0108 Money(1275)
 [12, 3, 40, 250, 2] Some(2) "tab\there"
 == hex dump
-0000  74 61 63 68 79 6f 6e 20  |tachyon |
-0008  66 6f 72 6d 61 74 73 09  |formats.|
-0010  62 79 74 65 73 0a        |bytes.|
+0000  76 6f 6c 65 20 66 6f 72  |vole for|
+0008  6d 61 74 73 09 62 79 74  |mats.byt|
+0010  65 73 0a                 |es.|
 ```
 
 On stderr:
@@ -156,9 +156,9 @@ allocation.
 
 ## Language features
 
-- f-strings, specs, `Display`, `Debug`, `format`, `push_fmt`, `eprintln`, `#[derive(Debug)]`: `tachyonc guide formatting`
-- `Buf`, `Vec`, `defer`/`free`: `tachyonc guide std`, `tachyonc guide memory`
-- struct field shorthand (`Item { sku: Sku { id }, name, ... }`): `tachyonc guide syntax`
+- f-strings, specs, `Display`, `Debug`, `format`, `push_fmt`, `eprintln`, `#[derive(Debug)]`: `volec guide formatting`
+- `Buf`, `Vec`, `defer`/`free`: `volec guide std`, `volec guide memory`
+- struct field shorthand (`Item { sku: Sku { id }, name, ... }`): `volec guide syntax`
 
 ## Going further
 

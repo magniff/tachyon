@@ -6,7 +6,7 @@
 string literal is one where a `str` goes, and a `str` goes where a `[u8]`
 does, for free. `String` owns its text, on an allocator:
 `String::new_in(gpa)`, `String::from_in("x", gpa)`, `s.push_str("..")`,
-`s.push(c)` (a code point, a `u32`: tachyon has no `char` yet),
+`s.push(c)` (a code point, a `u32`: vole has no `char` yet),
 `s.push_fmt(f"{x}")`, `to_string_in(f"..", gpa)`. A String has its
 `str`'s methods (`s.trim()`), and `&s` goes where a `str` or `[u8]` does.
 The methods are Rust's, and what they return views the text: `len`,

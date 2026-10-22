@@ -12,9 +12,9 @@
 # everything else as it was (tasks, conditions, reps, models), its
 # results beside the first round's and compared with them:
 #
-#   ROUND=0.18-polish sh tests/agent-eval/plans/0.18.sh --compiler target/tachyonc
+#   ROUND=0.18-polish sh tests/agent-eval/plans/0.18.sh --compiler target/volec
 #
-# Environment (or --compiler PATH for TACHYONC):
+# Environment (or --compiler PATH for VOLEC):
 #   ROUND       the round's name (default 0.18): results in $OUT/ROUND-P-*,
 #               ROUND-C-*, reports docs/eval/ROUND-*.md, and ROUND-manifest.txt
 #               (the compiler's md5 and version, the commit, the prompts' md5s)
@@ -23,7 +23,7 @@
 #   BASE        the earlier rounds (default: the main checkout's
 #               .claude/briefs/evalruns): 0.16/ (rust), 0.17-validation/,
 #               iter/03-night017/
-#   TACHYONC    the 0.18 compiler for the program tasks (default target/tachyonc)
+#   VOLEC    the 0.18 compiler for the program tasks (default target/volec)
 #   CBASE       the compiler tasks' base (default v0.18.0; release-0.18 before the tag)
 #   CTASKS      compiler tasks (default 21-opt-peephole,23-fix-checker: the
 #               two whose patches apply to the 0.18 tree; 22 and 24 do not)
@@ -39,15 +39,15 @@ set -eu
 cd "$(dirname "$0")/../../.."
 while [ $# -gt 0 ]; do
     case "$1" in
-        --compiler) [ $# -ge 2 ] || { echo "plan: --compiler needs a path" >&2; exit 2; }; TACHYONC=$2; shift 2 ;;
-        --compiler=*) TACHYONC=${1#--compiler=}; shift ;;
+        --compiler) [ $# -ge 2 ] || { echo "plan: --compiler needs a path" >&2; exit 2; }; VOLEC=$2; shift 2 ;;
+        --compiler=*) VOLEC=${1#--compiler=}; shift ;;
         *) echo "plan: unknown argument '$1' (--compiler PATH; the rest is environment)" >&2; exit 2 ;;
     esac
 done
 RUN=tests/agent-eval/run.py
 main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 BASE=${BASE:-$main/.claude/briefs/evalruns}
-TACHYONC=${TACHYONC:-target/tachyonc}
+VOLEC=${VOLEC:-target/volec}
 CBASE=${CBASE:-v0.18.0}
 CTASKS=${CTASKS:-21-opt-peephole,23-fix-checker}
 MODELS=${MODELS:-"claude:haiku claude:sonnet"}
@@ -59,7 +59,7 @@ OUT=${OUT:-tests/agent-eval/results}
 STEP=${STEP:-all}
 ROUND=${ROUND:-0.18}
 if [ "$ROUND" = 0.18 ]; then PREV=${PREV:-}; else PREV=${PREV-$BASE/0.18}; fi
-[ -x "$TACHYONC" ] || { echo "plan: no compiler at $TACHYONC" >&2; exit 2; }
+[ -x "$VOLEC" ] || { echo "plan: no compiler at $VOLEC" >&2; exit 2; }
 
 # The tasks: iteration 1's seven (01, 03, 06 from a spec; 08, 10, 16, 17
 # on existing code), the 0.17 rounds' comparison set, and three where
@@ -132,8 +132,8 @@ fi
 # The tasks are valid with this compiler: solutions pass, starters fail,
 # the prompts' examples build; the compiler tasks apply to CBASE
 if want check; then
-    say "check-tasks (programs) with $TACHYONC"
-    $RUN check-tasks --set programs --tachyonc "$TACHYONC" $(echo "$TASKS" | tr ',' ' ')
+    say "check-tasks (programs) with $VOLEC"
+    $RUN check-tasks --set programs --volec "$VOLEC" $(echo "$TASKS" | tr ',' ' ')
     say "check-tasks (compiler) on $CBASE"
     $RUN check-tasks --set compiler --base "$CBASE" $(echo "$CTASKS" | tr ',' ' ')
 fi
@@ -142,7 +142,7 @@ fi
 if want dry; then
     say "dry run"
     rm -rf "$OUT/$ROUND-dry"
-    $RUN run --model claude:haiku --set programs --tasks 01-wordfreq --tachyonc "$TACHYONC" \
+    $RUN run --model claude:haiku --set programs --tasks 01-wordfreq --volec "$VOLEC" \
         --cond "$PCONDS" --dry-run --selfcheck none --out "$OUT/$ROUND-dry"
     $RUN run --model claude:haiku --set compiler --tasks "${CTASKS%%,*}" --base "$CBASE" \
         --cond "$CCONDS" --dry-run --selfcheck none --out "$OUT/$ROUND-dry"
@@ -173,8 +173,8 @@ manifest() {
     mkdir -p "$OUT"
     {
         echo "round $ROUND"
-        echo "tachyonc $TACHYONC $(md5 -q "$TACHYONC" 2>/dev/null || md5sum "$TACHYONC" | cut -d' ' -f1)"
-        echo "version $("$TACHYONC" --version 2>/dev/null)"
+        echo "volec $VOLEC $(md5 -q "$VOLEC" 2>/dev/null || md5sum "$VOLEC" | cut -d' ' -f1)"
+        echo "version $("$VOLEC" --version 2>/dev/null)"
         echo "commit $(git rev-parse HEAD)$(git diff --quiet HEAD -- tests/agent-eval || echo ' (tests/agent-eval changed)')"
         for f in tests/agent-eval/prompts/*.md; do
             echo "prompt $(basename "$f") $(md5 -q "$f" 2>/dev/null || md5sum "$f" | cut -d' ' -f1)"
@@ -190,7 +190,7 @@ if want P; then
     for m in $MODELS; do
         say "P: $m $PCONDS on $(count "$TASKS") tasks x $(reps_for "$m")"
         $RUN run --model "$m" --set programs --tasks "$TASKS" --cond "$PCONDS" \
-            --reps "$(reps_for "$m")" --jobs "$JOBS" --tachyonc "$TACHYONC" \
+            --reps "$(reps_for "$m")" --jobs "$JOBS" --volec "$VOLEC" \
             --out "$OUT/$ROUND-P-$(slug "$m")" &
         pids="$pids $!"
     done
@@ -220,7 +220,7 @@ if want report; then
     # shellcheck disable=SC2086
     {
     # the binary every program run used (the 0.17 iterations' harness lesson)
-    [ -n "$p" ] && $RUN binaudit $p --expect "$TACHYONC"
+    [ -n "$p" ] && $RUN binaudit $p --expect "$VOLEC"
     if [ -n "$p" ]; then
         rust18=""; g18=""
         for d in $p; do rust18="$rust18 $d:rust"; g18="$g18${g18:+,}$d:$G"; done

@@ -21,9 +21,9 @@ positions the run-time checks print, which move with the text) and the
 output on every sample, before any change:
 
 ```console
-$ tachyonc main.tach --no-positions -o before.s
+$ volec main.vl --no-positions -o before.s
 ok: wrote before.s
-$ tachyonc main.tach -o pack && for f in samples/*.txt; do ./pack < $f; done > before.out
+$ volec main.vl -o pack && for f in samples/*.txt; do ./pack < $f; done > before.out
 ok: built pack
 $ cat before.out
 in        0 bytes  adler32 00000001
@@ -46,24 +46,24 @@ longest run 20
 `FUNCTION::name`:
 
 ```console
-$ tachyonc refactor rename adler32::a low --show
-renamed local a to low in crate::adler::adler32, 4 uses	adler.tach	+4 -4 lines
-// adler.tach:4
+$ volec refactor rename adler32::a low --show
+renamed local a to low in crate::adler::adler32, 4 uses	adler.vl	+4 -4 lines
+// adler.vl:4
 4	    var low: u64 = 1;
-// adler.tach:7-8
+// adler.vl:7-8
 7	        low = (low + x as u64) % 65521;
 8	        b = (b + low) % 65521;
-// adler.tach:10
+// adler.vl:10
 10	    (b << 16) | low
-$ tachyonc refactor rename adler32::b high
-renamed local b to high in crate::adler::adler32, 3 uses	adler.tach	+3 -3 lines
-$ tachyonc refactor rename main::c1 sum_in
-renamed local c1 to sum_in in crate::main, 1 use	main.tach	+2 -2 lines
-$ tachyonc refactor rename main::c2 sum_out
-renamed local c2 to sum_out in crate::main, 1 use	main.tach	+2 -2 lines
-$ tachyonc refactor rename main::p out
-renamed local p to out in crate::main, 4 uses	main.tach	+4 -4 lines
-$ tachyonc main.tach --no-positions -o after.s && cmp before.s after.s && echo same assembly
+$ volec refactor rename adler32::b high
+renamed local b to high in crate::adler::adler32, 3 uses	adler.vl	+3 -3 lines
+$ volec refactor rename main::c1 sum_in
+renamed local c1 to sum_in in crate::main, 1 use	main.vl	+2 -2 lines
+$ volec refactor rename main::c2 sum_out
+renamed local c2 to sum_out in crate::main, 1 use	main.vl	+2 -2 lines
+$ volec refactor rename main::p out
+renamed local p to out in crate::main, 4 uses	main.vl	+4 -4 lines
+$ volec main.vl --no-positions -o after.s && cmp before.s after.s && echo same assembly
 same assembly
 ok: wrote after.s
 ```
@@ -74,22 +74,22 @@ the constant's own value, `const MOD_ADLER: u64 = MOD_ADLER;`, and the
 check refuses that; the pattern `$e % 65521` only matches the uses:
 
 ```console
-$ tachyonc edit insert --before adler32 <<'EOF'
+$ volec edit insert --before adler32 <<'EOF'
 > // the largest prime below 2^16
 > const MOD_ADLER: u64 = 65521;
 > EOF
-inserted before crate::adler::adler32	adler.tach	+3 -0 lines
-$ tachyonc rewrite '65521' 'MOD_ADLER'
-adler.tach:4:1: error[type error] constant 'MOD_ADLER' is defined in terms of itself  [edited: crate::adler::MOD_ADLER]
+inserted before crate::adler::adler32	adler.vl	+3 -0 lines
+$ volec rewrite '65521' 'MOD_ADLER'
+adler.vl:4:1: error[type error] constant 'MOD_ADLER' is defined in terms of itself  [edited: crate::adler::MOD_ADLER]
 error edit.breaks: 1 new error; nothing written
-try: tachyonc rewrite 65521 MOD_ADLER --no-check
+try: volec rewrite 65521 MOD_ADLER --no-check
 [exit 1]
-$ tachyonc rewrite '$e % 65521' '$e % MOD_ADLER' --show
-rewrote 2 sites in 1 file	adler.tach	+2 -2 lines
-// adler.tach:10-11
+$ volec rewrite '$e % 65521' '$e % MOD_ADLER' --show
+rewrote 2 sites in 1 file	adler.vl	+2 -2 lines
+// adler.vl:10-11
 10	        low = (low + x as u64) % MOD_ADLER;
 11	        high = (high + low) % MOD_ADLER;
-$ tachyonc main.tach --no-positions -o after.s && cmp before.s after.s && echo same assembly
+$ volec main.vl --no-positions -o after.s && cmp before.s after.s && echo same assembly
 same assembly
 ok: wrote after.s
 ```
@@ -99,14 +99,14 @@ ok: wrote after.s
 A patch arrives that documents `run_at`'s loop, written by hand:
 
 ```console
-$ git apply colleague.patch && git diff --stat rle.tach
- rle.tach | 9 ++++-----
+$ git apply colleague.patch && git diff --stat rle.vl
+ rle.vl | 9 ++++-----
  1 file changed, 4 insertions(+), 5 deletions(-)
-$ tachyonc fmt --check
-rle.tach
+$ volec fmt --check
+rle.vl
 error fmt.unformatted: 1 of 3 files are not formatted
-try: tachyonc fmt --dry-run rle.tach
-try: tachyonc fmt rle.tach
+try: volec fmt --dry-run rle.vl
+try: volec fmt rle.vl
 [exit 1]
 ```
 
@@ -116,20 +116,20 @@ journaled like any other), and the assembly shows that it changed only
 the layout:
 
 ```console
-$ tachyonc fmt rle.tach
-formatted	rle.tach	+4 -4 lines
-$ tachyonc query show run_at
-// crate::rle::run_at	rle.tach:4-9	effects: panic diverge
+$ volec fmt rle.vl
+formatted	rle.vl	+4 -4 lines
+$ volec query show run_at
+// crate::rle::run_at	rle.vl:4-9	effects: panic diverge
 fn run_at(s: [u8], i: i64) -> i64 {
     var n = 1;
     // a run ends at the end of s, at another byte, or at 255 (one count byte)
     while i + n < s.len && s[i + n] == s[i] && n < 255 { n += 1; }
     n
 }
-$ tachyonc main.tach --no-positions -o after.s && cmp before.s after.s && echo same assembly
+$ volec main.vl --no-positions -o after.s && cmp before.s after.s && echo same assembly
 same assembly
 ok: wrote after.s
-$ tachyonc fmt --check && echo formatted
+$ volec fmt --check && echo formatted
 formatted
 ```
 
@@ -141,11 +141,11 @@ parameters (in the order of their first use), the one they define and
 `main` uses after them its result:
 
 ```console
-$ tachyonc refactor extract-function main --lines 21-24 --to round_trips --show
-extracted lines 21-24 of crate::main into round_trips(out, gpa, s) -> bool	main.tach	+9 -4 lines
-// main.tach:21
+$ volec refactor extract-function main --lines 21-24 --to round_trips --show
+extracted lines 21-24 of crate::main into round_trips(out, gpa, s) -> bool	main.vl	+9 -4 lines
+// main.vl:21
 21	    let ok = round_trips(out, gpa, s);
-// main.tach:34-41
+// main.vl:34-41
 34	}
 35	
 36	fn round_trips(out: [u8], gpa: Gpa, s: [u8]) -> bool {
@@ -160,10 +160,10 @@ The compiled code changes now (there is a new function), so the
 evidence is the program's behaviour, on every sample:
 
 ```console
-$ tachyonc main.tach --no-positions -o after.s && cmp -s before.s after.s || echo the assembly differs
+$ volec main.vl --no-positions -o after.s && cmp -s before.s after.s || echo the assembly differs
 the assembly differs
 ok: wrote after.s
-$ tachyonc main.tach -o pack && for f in samples/*.txt; do ./pack < $f; done | diff before.out - && echo same output
+$ volec main.vl -o pack && for f in samples/*.txt; do ./pack < $f; done | diff before.out - && echo same output
 same output
 ok: built pack
 ```
@@ -171,15 +171,15 @@ ok: built pack
 ## 4. When the compiler is what changed
 
 The same question, asked of two compilers instead of two versions of a
-program: does a new `tachyonc` compile my programs to the same code as
+program: does a new `volec` compile my programs to the same code as
 the old one? `same-output OLD` compiles every program of a corpus with
 both, for every target, at `-O0`, `-O1` and `-O2`, and compares the
-assembly, the messages and the exit status. It is how tachyon's own
+assembly, the messages and the exit status. It is how vole's own
 refactorings of the compiler are proven ([docs/refactor.md](../../../docs/refactor.md));
 OLD is a path to the other compiler, here a copy of this one:
 
 ```console
-$ cp "$(command -v tachyonc)" old-tachyonc && tachyonc same-output ./old-tachyonc --corpus main.tach --work so
+$ cp "$(command -v volec)" old-volec && volec same-output ./old-volec --corpus main.vl --work so
 identical	12 compilations	1 programs	4 targets	-O0 -O1 -O2
 ```
 
@@ -187,9 +187,9 @@ identical	12 compilations	1 programs	4 targets	-O0 -O1 -O2
 
 ```console
 $ git diff --stat
- adler.tach | 13 ++++++++-----
- main.tach  | 23 ++++++++++++++---------
- rle.tach   |  5 ++---
+ adler.vl | 13 ++++++++-----
+ main.vl  | 23 ++++++++++++++---------
+ rle.vl   |  5 ++---
  3 files changed, 24 insertions(+), 17 deletions(-)
 ```
 

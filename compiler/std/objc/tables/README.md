@@ -1,6 +1,6 @@
 # Objective-C binding tables (`.objc`)
 
-A table lists the Objective-C methods a tachyon module calls, with their C
+A table lists the Objective-C methods a vole module calls, with their C
 types. `tools/objcgen` turns it into that module (the typed
 `objc_msgSend` declarations, one wrapper per method, the selector cache),
 and checks it against the Objective-C runtime and the SDK's headers. No
@@ -9,12 +9,12 @@ corruption (docs/design/gpu.md, §2.9 and R1).
 
 | table | generated module |
 |---|---|
-| `foundation.objc` | `compiler/std/objc/foundation.tach` (`std::objc::foundation`) |
-| `metal.objc` | `compiler/std/gpu/hal/metal/bindings.tach` (`std::gpu::hal::metal::bindings`) |
+| `foundation.objc` | `compiler/std/objc/foundation.vl` (`std::objc::foundation`) |
+| `metal.objc` | `compiler/std/gpu/hal/metal/bindings.vl` (`std::gpu::hal::metal::bindings`) |
 
 ```sh
-cc=cc; tachyonc tools/objcgen/main.tach -o objcgen.o && $cc objcgen.o -o objcgen -lobjc
-./objcgen lib/objc/tables/metal.objc > lib/gpu/metal/sys.tach   # generate
+cc=cc; volec tools/objcgen/main.vl -o objcgen.o && $cc objcgen.o -o objcgen -lobjc
+./objcgen lib/objc/tables/metal.objc > lib/gpu/metal/sys.vl   # generate
 ./objcgen --check lib/objc/tables/metal.objc                    # against the runtime
 ./objcgen --c-check lib/objc/tables/metal.objc > c.m && clang -fsyntax-only -x objective-c c.m
 ```

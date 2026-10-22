@@ -22,16 +22,16 @@
 # entries, kept). The compiler's source also takes real edits: recent
 # commits to compiler/src (git log) of at most 60 changed lines that
 # still apply, each undone (git apply -R), built, and redone. The hits are
-# counted ($TACHYON_CACHE_TRACE).
+# counted ($VOLE_CACHE_TRACE).
 #
 # usage: tests/incremental.sh [-c COMPILER] [-n EDITS] [-r COMMITS] [-s SEED] [-j JOBS] [FILTER]
 #
-#   -c COMPILER   the tachyonc to check (default: target/tachyonc)
+#   -c COMPILER   the volec to check (default: target/volec)
 #   -n EDITS      the compiler's edits (default 10)
 #   -r COMMITS    the compiler's real edits, from git (default 6)
 #   -s SEED       the edits' seed (default 1)
 #   -j JOBS       programs checked at once (default: the number of CPUs,
-#                 or the slots of $TACHYON_JOBSERVER, see tests/run.sh)
+#                 or the slots of $VOLE_JOBSERVER, see tests/run.sh)
 #   FILTER        only the programs whose path contains FILTER
 
 set -u
@@ -39,7 +39,7 @@ LC_ALL=C
 export LC_ALL
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 EDITS=10
 COMMITS=6
 SEED=1
@@ -76,10 +76,10 @@ case_directives() { # <program> <dir>
     awk -v dir="$2" -v target="$TARGET" -f "$ROOT/tests/directives.awk" "$cd_file"
 }
 
-# Edit number $2 (seed $3) of the program in tree $1 (its .tach files);
+# Edit number $2 (seed $3) of the program in tree $1 (its .vl files);
 # prints what it did.
 edit() { # <tree> <n> <seed>
-    find "$1" -name '*.tach' | sort >"$1.files"
+    find "$1" -name '*.vl' | sort >"$1.files"
     awk -v n="$2" -v seed="$3" -v list="$1.files" -v tree="$1/" '
         function rnd(m) { state = (state * 1103515245 + 12345) % 2147483648; return int(state / 65536) % m }
         BEGIN {
@@ -148,8 +148,8 @@ build() { # <tree> <root> <level> <threads> <out> <cache> <directives>
     no=--cache=on
     [ "$6" = yes ] || no=--no-cache
     # shellcheck disable=SC2086
-    (cd "$1" && TACHYON_CODE_CACHE=on TACHYON_CACHE="$1.cache" TACHYON_CACHE_SYNC=1 \
-        TACHYON_CACHE_TRACE="$1.trace" \
+    (cd "$1" && VOLE_CODE_CACHE=on VOLE_CACHE="$1.cache" VOLE_CACHE_SYNC=1 \
+        VOLE_CACHE_TRACE="$1.trace" \
         "$COMPILER" --target "$TARGET" "-O$3" "-j$4" $flags $no -c "$2" -o "$5") >"$5.out" 2>&1
 }
 
@@ -159,8 +159,8 @@ check() { # <program> <level> <threads> <edits> <n>
     w="$WORK/$5"
     dd="$WORK/directives/$(echo "$1" | tr / _)"
     case "$1" in
-        compiler/src/main.tach) src=compiler/src; root=src/main.tach ;;
-        */main.tach) src=$(dirname "$1"); root=$(basename "$src")/main.tach ;;
+        compiler/src/main.vl) src=compiler/src; root=src/main.vl ;;
+        */main.vl) src=$(dirname "$1"); root=$(basename "$src")/main.vl ;;
         *) src=$1; root=$(basename "$1") ;;
     esac
     mkdir -p "$w/tree"
@@ -201,7 +201,7 @@ check() { # <program> <level> <threads> <edits> <n>
         return
     fi
     real=0
-    if [ "$1" = compiler/src/main.tach ]; then
+    if [ "$1" = compiler/src/main.vl ]; then
         for c in $(cat "$WORK/commits" 2>/dev/null); do
             git -C "$ROOT" show "$c" -- compiler/src >"$w/$c.diff"
             (cd "$w/tree" && git apply -R -p2 "$w/$c.diff") 2>/dev/null || continue
@@ -222,7 +222,7 @@ check() { # <program> <level> <threads> <edits> <n>
 
 list="$WORK/list"
 : >"$list"
-for f in compiler/src/main.tach examples/*/main.tach bench/*.tach; do
+for f in compiler/src/main.vl examples/*/main.vl bench/*.vl; do
     [ -f "$f" ] || continue
     case "$f" in *"$FILTER"*) ;; *) continue ;; esac
     grep -q '// CSOURCE\|// CHEADER' "$f" && continue
@@ -246,8 +246,8 @@ if [ "$COMMITS" -gt 0 ] && git -C "$ROOT" rev-parse >/dev/null 2>&1; then
     done
 fi
 # The slots (as tests/threads.sh).
-if [ -z "$JOBS" ] && [ -n "${TACHYON_JOBSERVER:-}" ] && [ -p "$TACHYON_JOBSERVER" ]; then
-    exec 3<>"$TACHYON_JOBSERVER"
+if [ -z "$JOBS" ] && [ -n "${VOLE_JOBSERVER:-}" ] && [ -p "$VOLE_JOBSERVER" ]; then
+    exec 3<>"$VOLE_JOBSERVER"
 else
     [ -n "$JOBS" ] || JOBS=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
     rm -f "$WORK/slots"
@@ -267,7 +267,7 @@ run() { # <program> <level> <threads> <edits>
 }
 while read -r f; do
     edits=4
-    [ "$f" = compiler/src/main.tach ] && edits=$EDITS
+    [ "$f" = compiler/src/main.vl ] && edits=$EDITS
     for o in 1 2; do
         for j in 1 8; do
             run "$f" "$o" "$j" "$edits"

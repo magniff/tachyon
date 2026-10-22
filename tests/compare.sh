@@ -1,5 +1,5 @@
 #!/bin/sh
-# Compares two tachyon compilers: both compile the same corpus, and their
+# Compares two vole compilers: both compile the same corpus, and their
 # outputs must be byte-identical. Run after a refactoring of the compiler
 # (OLD is the compiler before it, NEW after) to show it changed nothing.
 #
@@ -14,9 +14,9 @@
 #             (grep -E) are reported apart and do not fail
 #   -q        print only the summary
 #
-# The corpus: tests/run/*.tach and the multi-module tests/run/*/main.tach,
-# examples/*/main.tach and examples/*/*/main.tach (not examples/tools/),
-# bench/*.tach, the random programs (every mode of tests/fuzz/gen.awk),
+# The corpus: tests/run/*.vl and the multi-module tests/run/*/main.vl,
+# examples/*/main.vl and examples/*/*/main.vl (not examples/tools/),
+# bench/*.vl, the random programs (every mode of tests/fuzz/gen.awk),
 # the C interop programs (tests/abi/gen.awk; half of them through import,
 # the others also through --emit-header), and the
 # compiler's source in this tree and at the last release tag (its 0.2-style
@@ -118,7 +118,7 @@ while [ $i -le "$FUZZ" ]; do
         5) set -- 0 0 0 0 1 0 ;;
     esac
     awk -v seed="$i" -v nonzero="$1" -v loops="$2" -v generics="$3" -v pressure="$4" \
-        -v calls="$5" -f "$ROOT/tests/fuzz/gen.awk" >"$DIR/corpus/fuzz/f$i.tach"
+        -v calls="$5" -f "$ROOT/tests/fuzz/gen.awk" >"$DIR/corpus/fuzz/f$i.vl"
     i=$((i + 1))
 done
 # C interop programs: every other one declares its C half through an
@@ -127,7 +127,7 @@ done
 i=1
 while [ $i -le "$ABI" ]; do
     imp=$((i % 2))
-    awk -v seed="$i" -v cfile="$DIR/corpus/abi/a$i.c" -v tfile="$DIR/corpus/abi/a$i.tach" \
+    awk -v seed="$i" -v cfile="$DIR/corpus/abi/a$i.c" -v tfile="$DIR/corpus/abi/a$i.vl" \
         -v import="$imp" -v hfile="$DIR/corpus/abi/a$i.h" -f "$ROOT/tests/abi/gen.awk"
     rm -f "$DIR/corpus/abi/a$i.c"
     i=$((i + 1))
@@ -143,7 +143,7 @@ for tag in $(sh "$ROOT/bootstrap/release-tags.sh"); do
 done
 if [ -n "$release" ]; then
     (cd "$ROOT" && git archive "$release" compiler/src) | tar -x -C "$DIR/corpus/src-release" --strip-components=2
-    for f in "$DIR"/corpus/src-release/*.tach; do
+    for f in "$DIR"/corpus/src-release/*.vl; do
         sed 's/^extern fn \(.*\)$/extern "C" { fn \1 }/' "$f" >"$f.new" && mv "$f.new" "$f"
     done
 fi
@@ -172,13 +172,13 @@ program() { # name files...
         done
     done
 }
-for f in "$ROOT"/tests/run/*.tach "$ROOT"/examples/*/main.tach "$ROOT"/examples/*/*/main.tach \
-    "$ROOT"/bench/*.tach "$DIR"/corpus/fuzz/*.tach "$DIR"/corpus/abi/*.tach; do
+for f in "$ROOT"/tests/run/*.vl "$ROOT"/examples/*/main.vl "$ROOT"/examples/*/*/main.vl \
+    "$ROOT"/bench/*.vl "$DIR"/corpus/fuzz/*.vl "$DIR"/corpus/abi/*.vl; do
     [ -f "$f" ] || continue
     # (the tools' walkthroughs have their own runner, and programs that do
     # not compile on purpose)
     case $f in "$ROOT"/examples/tools/*) continue ;; esac
-    base=$(basename "$(dirname "$f")")-$(basename "$f" .tach)
+    base=$(basename "$(dirname "$f")")-$(basename "$f" .vl)
     program "$base" "$f"
     add "$base.tokens" --tokens "$f"
     case $f in
@@ -189,17 +189,17 @@ for f in "$ROOT"/tests/run/*.tach "$ROOT"/examples/*/main.tach "$ROOT"/examples/
             ;;
     esac
 done
-# Programs of several modules (a directory with main.tach).
-for f in "$ROOT"/tests/run/*/main.tach; do
+# Programs of several modules (a directory with main.vl).
+for f in "$ROOT"/tests/run/*/main.vl; do
     [ -f "$f" ] || continue
     program "run-$(basename "$(dirname "$f")")" "$f"
 done
 # A source tree: its root file when it has one, else all its files.
 tree() { # dir
-    if [ -f "$1/main.tach" ] && grep -q '^mod ' "$1/main.tach"; then
-        echo "$1/main.tach"
+    if [ -f "$1/main.vl" ] && grep -q '^mod ' "$1/main.vl"; then
+        echo "$1/main.vl"
     else
-        echo "$1"/*.tach
+        echo "$1"/*.vl
     fi
 }
 # shellcheck disable=SC2046

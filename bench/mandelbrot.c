@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <stdint.h>
-/* tachyon never contracts a * b + c into a fused multiply-add */
+/* vole never contracts a * b + c into a fused multiply-add */
 #pragma STDC FP_CONTRACT OFF
 int main(void) {
     long n = 2400, inside = 0;

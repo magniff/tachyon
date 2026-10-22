@@ -4,12 +4,12 @@ A shop's orders, read from stdin (`customer item quantity price`, the
 price in cents), totalled per customer and per item. The program is
 small on purpose: what it shows is where its memory comes from.
 
-In tachyon 0.16 nothing allocates unless it is given an allocator.
+In vole 0.16 nothing allocates unless it is given an allocator.
 There is no global `malloc` to reach for: the general-purpose allocator
 is a value of type `Gpa`, `main` receives it as a parameter, and a
 function that allocates either takes one as a parameter or works on a
 container that holds one. So a function's signature says whether it can
-allocate, and the compiler can prove it: `tachyonc query effects` lists
+allocate, and the compiler can prove it: `volec query effects` lists
 what each function may do.
 
 Every command below is run by `tests/walkthrough/run.sh` in a copy of
@@ -19,7 +19,7 @@ this directory, and its output is checked against this file;
 ## Run it
 
 ```console
-$ tachyonc main.tach -o orders && ./orders < orders.txt
+$ volec main.vl -o orders && ./orders < orders.txt
 alice       4.55
 bob         3.10
 carol      11.00
@@ -55,7 +55,7 @@ fn parse_orders(text: [u8], gpa: Gpa) -> Vec<Order> {
     let mut lines = split_in(text, '\n', gpa);
 ```
 
-There are four kinds of function in `main.tach`, by what they are given:
+There are four kinds of function in `main.vl`, by what they are given:
 
 | function | signature | allocates |
 |---|---|---|
@@ -74,10 +74,10 @@ slice, cannot allocate: a slice is a view, it holds no allocator.
 ## What the compiler knows
 
 `query effects` prints what each function may do, inferred from its
-body and everything it calls (`tachyonc guide effects`):
+body and everything it calls (`volec guide effects`):
 
 ```console
-$ tachyonc query effects crate
+$ volec query effects crate
 crate::parse_orders	alloc(Gpa) io global panic diverge
 crate::total	none
 crate::by_customer	alloc(Gpa) panic
@@ -98,7 +98,7 @@ A 0.15 program allocated without saying so. Here is one, using the old
 forms:
 
 ```console
-$ cat > old.tach <<'EOF'
+$ cat > old.vl <<'EOF'
 > use std::Buf;
 >
 > fn shout(words: [[u8]]) -> Buf {
@@ -120,9 +120,9 @@ $ cat > old.tach <<'EOF'
 >     0
 > }
 > EOF
-$ tachyonc check old.tach
-old.tach:4:13: error[type error] allocation is explicit: pass an allocator (try: Buf::new_in(gpa)) | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'shout' and pass it down | try: tachyonc fix --only alloc016 old.tach
-old.tach:16:28: error[type error] allocation is explicit: pass an allocator (try: split_whitespace_in(s, gpa)) | help: main takes the allocator: `fn main(gpa: Gpa)`, passed down as a parameter | try: tachyonc fix --only alloc016 old.tach
+$ volec check old.vl
+old.vl:4:13: error[type error] allocation is explicit: pass an allocator (try: Buf::new_in(gpa)) | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)': add the parameter `gpa: Gpa` to 'shout' and pass it down | try: volec fix --only alloc016 old.vl
+old.vl:16:28: error[type error] allocation is explicit: pass an allocator (try: split_whitespace_in(s, gpa)) | help: main takes the allocator: `fn main(gpa: Gpa)`, passed down as a parameter | try: volec fix --only alloc016 old.vl
 [exit 1]
 ```
 
@@ -132,9 +132,9 @@ Gpa` is added to each function from `main` down to the calls, and passed
 at each call:
 
 ```console
-$ tachyonc fix --only alloc016 --dry-run old.tach
---- a/old.tach
-+++ b/old.tach
+$ volec fix --only alloc016 --dry-run old.vl
+--- a/old.vl
++++ b/old.vl
 @@ -3,2 +3,2 @@
 -fn shout(words: [[u8]]) -> Buf {
 -    var b = Buf::new();
@@ -147,9 +147,9 @@ $ tachyonc fix --only alloc016 --dry-run old.tach
 +fn main(gpa: Gpa) -> i32 {
 +    let words: Vec<[u8]> = std::split_whitespace_in("hello explicit allocation", gpa);
 +    let b = shout(words.as_slice(), gpa);
-$ tachyonc fix --only alloc016 old.tach
-fixed 2 allocations made explicit	old.tach	+5 -5 lines
-$ tachyonc old.tach -o old && ./old
+$ volec fix --only alloc016 old.vl
+fixed 2 allocations made explicit	old.vl	+5 -5 lines
+$ volec old.vl -o old && ./old
 hello! explicit! allocation!
 ok: built old
 ```
@@ -159,7 +159,7 @@ and `b` are dropped at the end of `main`, so `--check-alloc` (below)
 finds nothing left:
 
 ```console
-$ tachyonc --check-alloc old.tach -o old && ./old
+$ volec --check-alloc old.vl -o old && ./old
 hello! explicit! allocation!
 ok: built old
 ```
@@ -168,7 +168,7 @@ A function that allocates and is not given an allocator cannot make
 one: `gpa` is a name like any other, and here it is not in scope.
 
 ```console
-$ cat > count.tach <<'EOF'
+$ cat > count.vl <<'EOF'
 > fn count(text: [u8]) -> i64 {
 >     let words = std::split_whitespace_in(text, gpa);
 >     words.len()
@@ -179,8 +179,8 @@ $ cat > count.tach <<'EOF'
 >     0
 > }
 > EOF
-$ tachyonc check count.tach
-count.tach:2:48: error[type error] undefined variable 'gpa'
+$ volec check count.vl
+count.vl:2:48: error[type error] undefined variable 'gpa'
 [exit 1]
 ```
 
@@ -189,9 +189,9 @@ The fix is a parameter, and the allocator passed at every call;
 which is in scope at every call since the callers have one):
 
 ```console
-$ tachyonc refactor signature count --add 'gpa: Gpa = gpa' --fill-calls count.tach
-added parameter gpa: Gpa to crate::count, 1 call	count.tach	+2 -2 lines
-$ tachyonc count.tach -o count && ./count
+$ volec refactor signature count --add 'gpa: Gpa = gpa' --fill-calls count.vl
+added parameter gpa: Gpa to crate::count, 1 call	count.vl	+2 -2 lines
+$ volec count.vl -o count && ./count
 3
 ok: built count
 ```
@@ -201,7 +201,7 @@ only std makes one (the one `main` gets), and no constant expression
 does.
 
 ```console
-$ cat > forge.tach <<'EOF'
+$ cat > forge.vl <<'EOF'
 > static var CACHE: Vec<i64> = Vec::new_in(Gpa {});
 >
 > fn main() -> i32 {
@@ -209,9 +209,9 @@ $ cat > forge.tach <<'EOF'
 >     0
 > }
 > EOF
-$ tachyonc check forge.tach
-forge.tach:1:42: error[type error] 'Gpa' is sealed: only module 'std' makes one | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
-forge.tach:4:16: error[type error] 'Gpa' is sealed: only module 'std' makes one | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
+$ volec check forge.vl
+forge.vl:1:42: error[type error] 'Gpa' is sealed: only module 'std' makes one | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
+forge.vl:4:16: error[type error] 'Gpa' is sealed: only module 'std' makes one | help: a 'gpa: Gpa' comes from 'fn main(gpa: Gpa)' and is passed down as a parameter
 [exit 1]
 ```
 
@@ -230,16 +230,16 @@ nothing here: stdout is as before, and stderr has only the skipped
 line.
 
 ```console
-$ tachyonc --check-alloc main.tach -o orders-checked && ./orders-checked < orders.txt > /dev/null
+$ volec --check-alloc main.vl -o orders-checked && ./orders-checked < orders.txt > /dev/null
 ok: built orders-checked
 skipped: bob apples one 120
 ```
 
 ## Read more
 
-- `tachyonc guide allocators`: the `_in` forms, containers and their
+- `volec guide allocators`: the `_in` forms, containers and their
   allocator, arenas, `--check-alloc`, `fix --only alloc016`.
-- `tachyonc guide effects`: what `alloc(Gpa)`, `io`, `global`, `panic`,
+- `volec guide effects`: what `alloc(Gpa)`, `io`, `global`, `panic`,
   `diverge` mean, and how to promise them.
 - [arena-parser](../arena-parser/), [scoped-arena](../scoped-arena/) and
   [fixed-buffer](../fixed-buffer/): the other allocators.
