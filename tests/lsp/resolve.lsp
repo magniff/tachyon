@@ -27,7 +27,7 @@
 > {"jsonrpc":"2.0","id":10,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":4,"character":10}}}
 < {"jsonrpc":"2.0","id":10,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/flat/alloc.vl","range":{"start":{"line":16,"character":10},"end":{"line":16,"character":19}}}}
 > {"jsonrpc":"2.0","id":11,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":4,"character":21}}}
-< {"jsonrpc":"2.0","id":11,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/flat/alloc.vl","range":{"start":{"line":677,"character":11},"end":{"line":677,"character":19}}}}
+< {"jsonrpc":"2.0","id":11,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/flat/alloc.vl","range":{"start":{"line":681,"character":11},"end":{"line":681,"character":19}}}}
 ## the prelude, without a `use`: types, constructors, methods, functions
 > {"jsonrpc":"2.0","id":12,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":64,"character":11}}}
 < {"jsonrpc":"2.0","id":12,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/std.vl","range":{"start":{"line":188,"character":11},"end":{"line":188,"character":14}}}}
@@ -56,7 +56,7 @@
 > {"jsonrpc":"2.0","id":24,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":4}}}
 < {"jsonrpc":"2.0","id":24,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/fmt.vl","range":{"start":{"line":98,"character":7},"end":{"line":98,"character":14}}}}
 > {"jsonrpc":"2.0","id":25,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":4}}}
-< {"jsonrpc":"2.0","id":25,"result":{"contents":{"kind":"markdown","value":"```vole\npub fn println<T: Display>(x: sink T)\neffects of println<i64>: io global panic\neffects of println<Interp<closure(inout Fmt) -> () at flat/test.vl:136:13>>: io global panic\neffects of println<[u8]>: io global panic\nfeatures: none\n```\n\n`std::fmt::println` (fn)\n"},"range":{"start":{"line":80,"character":4},"end":{"line":80,"character":11}}}}
+< {"jsonrpc":"2.0","id":25,"result":{"contents":{"kind":"markdown","value":"```vole\npub fn println<T: Display>(x: T)\neffects of println<i64>: io global panic\neffects of println<Interp<closure(inout Fmt) -> () at flat/test.vl:136:13>>: io global panic\neffects of println<[u8]>: io global panic\nfeatures: none\n```\n\n`std::fmt::println` (fn)\n"},"range":{"start":{"line":80,"character":4},"end":{"line":80,"character":11}}}}
 > {"jsonrpc":"2.0","id":26,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":73,"character":24}}}
 < {"jsonrpc":"2.0","id":26,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/std.vl","range":{"start":{"line":387,"character":11},"end":{"line":387,"character":19}}}}
 ## std::thread, std::cli, std::gpu through their paths and methods
@@ -92,20 +92,20 @@
 > {"jsonrpc":"2.0","id":41,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":49,"character":26}}}
 < {"jsonrpc":"2.0","id":41,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/flat/alloc.vl","range":{"start":{"line":568,"character":11},"end":{"line":568,"character":22}}}}
 > {"jsonrpc":"2.0","id":42,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":57,"character":23}}}
-< {"jsonrpc":"2.0","id":42,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/flat/alloc.vl","range":{"start":{"line":775,"character":11},"end":{"line":775,"character":14}}}}
+< {"jsonrpc":"2.0","id":42,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/flat/alloc.vl","range":{"start":{"line":781,"character":11},"end":{"line":781,"character":14}}}}
 > {"jsonrpc":"2.0","id":43,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":58,"character":20}}}
-< {"jsonrpc":"2.0","id":43,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/flat/alloc.vl","range":{"start":{"line":677,"character":11},"end":{"line":677,"character":19}}}}
+< {"jsonrpc":"2.0","id":43,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/flat/alloc.vl","range":{"start":{"line":681,"character":11},"end":{"line":681,"character":19}}}}
 > {"jsonrpc":"2.0","id":44,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":32,"character":11}}}
 < {"jsonrpc":"2.0","id":44,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/flat/alloc.vl","range":{"start":{"line":16,"character":10},"end":{"line":16,"character":19}}}}
 ## a trait's method through an iterator; through a generic's bound
 > {"jsonrpc":"2.0","id":45,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":81,"character":21}}}
-< {"jsonrpc":"2.0","id":45,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/iter.vl","range":{"start":{"line":565,"character":11},"end":{"line":565,"character":15}}}}
+< {"jsonrpc":"2.0","id":45,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/iter.vl","range":{"start":{"line":599,"character":11},"end":{"line":599,"character":15}}}}
 > {"jsonrpc":"2.0","id":46,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":81,"character":21}}}
 < {"jsonrpc":"2.0","id":46,"result":{"contents":{"kind":"markdown","value":"```vole\npub fn iter(self) -> SliceIter<T>\neffects: none (inferred, of Vec<i64>::iter)\nfeatures: none\n```\n\nIts items, by value (a view: valid until the vector grows or is\nfreed).\n\n`std::Vec::iter` (method)\n"},"range":{"start":{"line":81,"character":21},"end":{"line":81,"character":25}}}}
 > {"jsonrpc":"2.0","id":47,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":81,"character":28}}}
-< {"jsonrpc":"2.0","id":47,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/iter.vl","range":{"start":{"line":78,"character":7},"end":{"line":78,"character":10}}}}
+< {"jsonrpc":"2.0","id":47,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/iter.vl","range":{"start":{"line":90,"character":7},"end":{"line":90,"character":10}}}}
 > {"jsonrpc":"2.0","id":48,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":81,"character":28}}}
-< {"jsonrpc":"2.0","id":48,"result":{"contents":{"kind":"markdown","value":"```vole\nfn sum(self) -> Self::Item\n```\n\nThe sum of the items, from `0 as Self::Item`.\n\n`std::iter::Iterator::sum` (trait-method)\n"},"range":{"start":{"line":81,"character":28},"end":{"line":81,"character":31}}}}
+< {"jsonrpc":"2.0","id":48,"result":{"contents":{"kind":"markdown","value":"```vole\nfn sum(sink self) -> Self::Item\n```\n\nThe sum of the items, from `0 as Self::Item`.\n\n`std::iter::Iterator::sum` (trait-method)\n"},"range":{"start":{"line":81,"character":28},"end":{"line":81,"character":31}}}}
 > {"jsonrpc":"2.0","id":49,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":24,"character":37}}}
 < {"jsonrpc":"2.0","id":49,"result":{"uri":"file://@DIR@/main.vl","range":{"start":{"line":21,"character":7},"end":{"line":21,"character":11}}}}
 > {"jsonrpc":"2.0","id":50,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":72,"character":12}}}
