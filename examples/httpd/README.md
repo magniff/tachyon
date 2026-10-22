@@ -82,17 +82,24 @@ what failed, which `main` prints.
 **Raw pointers from C, viewed safely.** `readdir` returns a pointer to an
 entry; `sys::dirent` casts it to the system's layout and returns the
 name's address and the entry's type. `sys::cstr` turns a C string into a
-`[u8]` slice, after which everything is checked vole code:
+`[u8]` slice, after which everything is checked vole code. Both are
+`unsafe fn`s: their comments state what the caller promises (a pointer
+to this system's `struct dirent`, a NUL-terminated string), and the
+calls sit in `unsafe { }`:
 
 ```tach
-pub fn cstr(s: *u8) -> [u8] {
-    unsafe { s[0..strlen(s) as i64] }
+// Unsafe: `s` must point to a NUL-terminated string that outlives the
+// slice.
+pub unsafe fn cstr(s: *u8) -> [u8] {
+    s[0..strlen(s) as i64]
 }
 ```
 
 **Paths for C.** C wants NUL-terminated strings; `Path` keeps a `Buf`
 with a 0 at the end and hands out both views: `c()` the `*u8` for C,
-`bytes()` the slice without the NUL.
+`bytes()` the slice without the NUL. `probe(system, path)` takes a
+`Path`, not a `*u8`, so it is safe to call: a `Path` always ends with
+its NUL.
 
 **Responses.** The headers are one f-string per line pushed into a `Buf`,
 and sent with one `write` loop:
@@ -104,15 +111,15 @@ if let Some(n) = length {
 }
 ```
 
-**Resources freed on every path.** `defer` closes each descriptor and
-frees each buffer when its block ends, whichever `return` is taken:
+**Resources freed on every path.** `defer` closes each descriptor when
+its block ends, whichever `return` is taken; the buffers (a `Path` holds
+one) are dropped at the end of their scope, so they need no `free`:
 
 ```tach
 fn handle_request(fd: i32, system: System, root: [u8], gpa: Gpa) {
     defer unsafe { close(fd) };
     ...
-    var path = Path::join(root, url, gpa);
-    defer path.free();
+    let path = Path::join(root, url, gpa);   // dropped when the function returns
 ```
 
 **Small pure helpers** (URL decoding, HTML escaping, the MIME type by
@@ -122,8 +129,8 @@ extension) are ordinary safe code over slices, with `match` on bytes and
 ## Language features
 
 - `extern "C"` declarations, `#[repr(C)]` structs, raw pointers: `volec guide c-interop`
-- `unsafe` blocks, raw pointers: `volec guide unsafe`
+- `unsafe fn` with a stated contract, `unsafe` blocks, raw pointers: `volec guide unsafe`
 - inline modules (`mod sys { ... }`), `pub`, `use super::`: `volec guide modules`
-- `defer`, `Buf`: `volec guide memory`
+- `defer` for descriptors, `Buf` and its drop: `volec guide memory`
 - `Result`, `Option`, `if let`: `volec guide conversions`
 - f-strings, `push_fmt`, `eprintln`: `volec guide formatting`
