@@ -3,7 +3,7 @@
 `transit` plans the quickest routes across a city's train network: a
 graph of stations (`graph.vl`), a binary heap (`heap.vl`), Dijkstra's
 search with a cost for changing lines (`route.vl`), the timetable
-(`network.vl`) and a few trips in `main.vl`. About 300 lines.
+(`network.vl`) and a few trips in `main.vl`. About 280 lines.
 
 A bug report comes in: "Airport to Museum is one 16-minute ride on line
 A, but the planner says 21 minutes." This session is the first look of
@@ -43,8 +43,8 @@ generated header:
 $ volec query items
 crate	main.vl	6
 std	<std>	603
-crate::graph	graph.vl	11
-crate::heap	heap.vl	7
+crate::graph	graph.vl	10
+crate::heap	heap.vl	6
 crate::network	network.vl	2
 crate::route	route.vl	7
 std::ops	<std>	5
@@ -133,7 +133,7 @@ $ volec query items route
 23	struct	struct Step
 30	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64
 34	fn	pub fn quickest(g: Graph, from: i64, to: i64, gpa: Gpa) -> Option<Route>
-68	fn	fn legs_to(how: Vec<Step>, from: i64, to: i64, gpa: Gpa) -> Vec<Leg>
+67	fn	fn legs_to(how: Vec<Step>, from: i64, to: i64, gpa: Gpa) -> Vec<Leg>
 ```
 
 ## 2. The function that computes the total
@@ -145,19 +145,18 @@ fit is counted, with the commands that print it:
 
 ```console
 $ volec query context quickest --budget 600
-// crate::route::quickest	route.vl:34-64	effects: alloc(Gpa) panic diverge
+// crate::route::quickest	route.vl:34-63	effects: alloc(Gpa) panic diverge
 pub fn quickest(g: Graph, from: i64, to: i64, gpa: Gpa) -> Option<Route> {
     let n = size(g);
     var best: Vec<i64> = Vec::filled_in(n, i64::MAX, gpa);
     var how: Vec<Step> = Vec::filled_in(n, Step { from: -1, line: 0, minutes: 0 }, gpa);
     var h = new_heap(gpa);
-    defer free_heap(&h);
 
-    best.set(from, 0);
+    best[from] = 0;
     push(&h, Entry { cost: 0, node: from, line: 0 });
     while !is_empty(h) {
         let cur = pop(&h).unwrap();
-        if cur.cost > best.get(cur.node) {
+        if cur.cost > best[cur.node] {
             continue;
         }
         if cur.node == to {
@@ -165,34 +164,36 @@ pub fn quickest(g: Graph, from: i64, to: i64, gpa: Gpa) -> Option<Route> {
         }
         for e in edges_from(g, cur.node) {
             let cost = cur.cost + ride_cost(cur.line, e.minutes, e.line);
-            if cost < best.get(e.to) {
-                best.set(e.to, cost);
-                how.set(e.to, Step { from: cur.node, line: e.line, minutes: e.minutes });
+            if cost < best[e.to] {
+                best[e.to] = cost;
+                how[e.to] = Step { from: cur.node, line: e.line, minutes: e.minutes };
                 push(&h, Entry { cost: cost, node: e.to, line: e.line });
             }
         }
     }
-    if best.get(to) == i64::MAX {
+    if best[to] == i64::MAX {
         return None;
     }
-    Some(Route { legs: legs_to(how, from, to, gpa), total: best.get(to) })
+    Some(Route { legs: legs_to(how, from, to, gpa), total: best[to] })
 }
-// calls (14)
+// calls (13)
 crate::route::ride_cost	route.vl:30:4	fn	fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64
-crate::route::legs_to	route.vl:68:4	fn	fn legs_to(how: Vec<Step>, from: i64, to: i64, gpa: Gpa) -> Vec<Leg>
+crate::route::legs_to	route.vl:67:4	fn	fn legs_to(how: Vec<Step>, from: i64, to: i64, gpa: Gpa) -> Vec<Leg>
 crate::graph::size	graph.vl:21:8	fn	pub fn size(g: Graph) -> i64
-crate::heap::new_heap	heap.vl:14:8	fn	pub fn new_heap(gpa: Gpa) -> MinHeap
-crate::heap::free_heap	heap.vl:63:8	fn	pub fn free_heap(h: inout MinHeap)
-crate::heap::is_empty	heap.vl:18:8	fn	pub fn is_empty(h: MinHeap) -> bool
-crate::heap::pop	heap.vl:35:8	fn	pub fn pop(h: inout MinHeap) -> Option<Entry>
-crate::graph::edges_from	graph.vl:55:8	fn	pub fn edges_from(g: Graph, i: i64) -> [Edge]
-crate::heap::push	heap.vl:22:8	fn	pub fn push(h: inout MinHeap, e: Entry)
-std::Vec::set	<std>:311:12	method	pub fn set(inout self, i: i64, x: sink T) requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
+crate::heap::new_heap	heap.vl:14:8	fn	pub fn new_heap(gpa: Gpa) -> Heap
+crate::heap::is_empty	heap.vl:18:8	fn	pub fn is_empty(h: Heap) -> bool
+crate::heap::pop	heap.vl:35:8	fn	pub fn pop(h: inout Heap) -> Option<Entry>
+crate::graph::edges_from	graph.vl:53:8	fn	pub fn edges_from(g: Graph, i: i64) -> [Edge]
+crate::heap::push	heap.vl:22:8	fn	pub fn push(h: inout Heap, e: Entry)
 std::Vec::filled_in	<std>:1516:12	method	pub fn filled_in(n: i64, x: sink T, a: sink A) -> Vec<T, A>
 std::Option::unwrap	<std>:129:12	method	pub fn unwrap(sink self) -> T requires self.is_some() else "called unwrap on None"
-// callers (1)
-plan	main.vl:20:11	match quickest(g, a, b, gpa) {
-note query.budget: over the budget of 600 tokens, left out: calls 2, types or uses 9
+std::Vec::as_mut_slice	<std>:394:12	method	pub fn as_mut_slice(inout self) -> inout [T]
+<std::Vec as Drop>::drop	<std>:434:8	method	fn drop(inout self)
+std::Vec::as_slice	<std>:388:12	method	pub fn as_slice(self) -> [T]
+// types (9)
+crate::route::Route	route.vl:17:12	struct	pub struct Route { pub legs: Vec<Leg>, pub total: i64, }
+note query.budget: over the budget of 600 tokens, left out: types or uses 8, callers 1
+try: volec query callers quickest
 try: volec query context quickest --budget 1800
 ```
 
@@ -209,7 +210,7 @@ fn ride_cost(here_line: u8, minutes: i64, line: u8) -> i64 {
 // uses (1)
 crate::route::TRANSFER_MINUTES	route.vl:8:11	const	pub const TRANSFER_MINUTES: i64 = 5
 // callers (1)
-route::quickest	route.vl:52:35	let cost = cur.cost + ride_cost(cur.line, e.minutes, e.line);
+route::quickest	route.vl:51:35	let cost = cur.cost + ride_cost(cur.line, e.minutes, e.line);
 ```
 
 `ride_cost` adds a transfer whenever the ride's line differs from the
@@ -225,8 +226,8 @@ function. `--kind` keeps some kinds:
 ```console
 $ volec query refs Entry.line --kind init
 # route.vl
-42:43	init	route::quickest	push(&h, Entry { cost: 0, node: from, line: 0 });
-56:58	init	route::quickest	push(&h, Entry { cost: cost, node: e.to, line: e.line });
+41:43	init	route::quickest	push(&h, Entry { cost: 0, node: from, line: 0 });
+55:58	init	route::quickest	push(&h, Entry { cost: cost, node: e.to, line: e.line });
 ```
 
 The first state is `Entry { ..., line: 0 }`. A search of the comments
@@ -242,13 +243,13 @@ $ volec query grep start --comments
 ```
 
 And `query type` gives the type of the expression at a position (here
-`cur`, on line 46, and the `e.minutes` passed to `ride_cost`):
+`cur`, on line 43, and the `e.minutes` passed to `ride_cost`):
 
 ```console
-$ volec query type route.vl:46:13
-!	continue
-$ volec query type route.vl:54:58
-()	{ best.set(e.to, cost); how.set(e.to, Step { from: cur.node, line: e.line, minutes: e.minutes }); p…
+$ volec query type route.vl:43:13
+Entry	cur
+$ volec query type route.vl:51:57
+i64	e.minutes
 ```
 
 So at the start `cur.line` is 0, which is no line, and `ride_cost`
@@ -322,14 +323,14 @@ Airport to Museum is 16 minutes, Airport to Market 20 (12, a change, 3).
 ## Why not by hand
 
 The usual first look is `ls`, `cat route.vl`, `grep -rn ride_cost`,
-`grep -rn 'line: 0'`, then reading 300 lines to be sure nothing else
+`grep -rn 'line: 0'`, then reading 280 lines to be sure nothing else
 writes the line. Here every answer was exact and short:
 
 - `query context` gave the function, what it calls and its callers in
   one answer of a known size, instead of three files opened to follow
   the calls;
 - `query refs --kind init` found the struct literals that set the
-  field, which no text search for `line` (33 matches: fields of four
+  field, which no text search for `line` (31 matches: fields of four
   structs, two parameters, comments, a format string) separates from
   the rest;
 - `query type` and `try` answered questions that a reader would
