@@ -97,6 +97,11 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   it showed are compile errors now; `--check-alloc` is shown on leaks
   and unsafe code), hand-written frees removed, the Rust-era wording
   gone; `toposort` no longer crashes on an empty input line.
+- **Generic inference through `inout` and coercions**: `[T]` is
+  inferred from `&xs`, subslices, `Vec`, `Buf`, arrays and `String`,
+  under `let`, `inout` and `sink`.
+- **The README's example is a quicksort**, kept the same as
+  tests/run/readme_example.vl by the `readme` check.
 - **Breaking**: nothing in the language. Code that passed `fmt --check`
   under 0.25.0 may need a `volec fmt`.
 
