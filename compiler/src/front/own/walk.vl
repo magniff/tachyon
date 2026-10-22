@@ -40,7 +40,7 @@ use crate::front::lexer::Tok;
 use crate::front::modules::{STD_MODULE, within_std};
 use crate::front::own::{calls, fast, moves, views};
 use crate::front::own::kinds::{
-    P_MUT, P_MUT_VIEW, P_RAW, P_SHARED, P_VALUE, P_VIEW, has_drop_impl, is_owned_type, is_view_type,
+    P_MUT, P_MUT_VIEW, P_RAW, P_SHARED, P_VALUE, P_VIEW, has_drop_impl, is_moved_type, is_owned_type, is_view_type,
     param_mode,
 };
 use crate::front::own::state::{
@@ -209,7 +209,7 @@ pub fn ev_bind(l: i64, n: i64, v: i64) {
         }
         BOUND.push(l);
         views::on_bind(l, n, v);
-        if is_owned_type(LOCALS[l].ty) {
+        if is_moved_type(LOCALS[l].ty) {
             ev_init(local_place(l));
         }
     }
@@ -279,7 +279,7 @@ fn relevant_local(l: i64) -> bool {
         if l < LOC_CAP && (LOC_PL[l] != 0 || LOC_SLOT[l] != 0) {
             return true;
         }
-        LOCALS[l].is_param || is_owned_type(LOCALS[l].ty)
+        LOCALS[l].is_param || is_moved_type(LOCALS[l].ty)
     }
 }
 
@@ -692,7 +692,7 @@ fn eval_place_value(n: i64, ctx: i64, dst: i64) {
             // collection a call views, `v[i]` of a Vec (`v.as_slice()[i]`),
             // or what a call's reference points to, moved: own.move_out)
             // (a raw pointer's `p[i]`, `*p`: unsafe code's bitwise read)
-            if ctx == CX_MOVE && is_owned_type(t) && (NODES[n].p & NODE_RAW) == 0 {
+            if ctx == CX_MOVE && is_moved_type(t) && (NODES[n].p & NODE_RAW) == 0 {
                 let k = NODES[n].kind;
                 if k == NodeKind::Index {
                     crate::front::own::moves::move_out_value(n, MO_INDEX);
@@ -734,13 +734,14 @@ fn eval_place_value(n: i64, ctx: i64, dst: i64) {
             // (`v[i]` of a Vec through a reference: no place, a copy of an
             // element the Vec keeps)
             // (0.25: a field or a tuple part of such an element too, `w[0].v`)
-            if ctx == CX_MOVE && is_owned_type(t) && (NODES[n].p & NODE_RAW) == 0
+            if ctx == CX_MOVE && is_moved_type(t) && (NODES[n].p & NODE_RAW) == 0
                 && part_of_index(n) {
                 crate::front::own::moves::move_out_value(n, MO_INDEX);
             }
             return;
         }
-        if ctx == CX_MOVE && is_owned_type(t) {
+        // (0.25: or one holding an inout access, move-only)
+        if ctx == CX_MOVE && is_moved_type(t) {
             let r = root_of(p);
             let how = if PL_RKIND[r] == RK_STATIC { MO_STATIC } else if PO_INDEX { MO_INDEX }
                 else if PO_DEREF { MO_DEREF } else { MO_PLACE };
@@ -962,7 +963,7 @@ pub fn pattern_binds_owned(p: i64) -> bool {
         }
         let k = NODES[p].kind;
         if k == NodeKind::PatBind {
-            return NODES[p].x >= 0 && is_owned_type(LOCALS[NODES[p].x].ty);
+            return NODES[p].x >= 0 && is_moved_type(LOCALS[NODES[p].x].ty);
         }
         if k == NodeKind::PatTuple || k == NodeKind::PatVariant || k == NodeKind::PatOr {
             for i in 0..NODES[p].count {
@@ -1438,6 +1439,14 @@ fn eval_call(n: i64, dst: i64) {
                 } else if mode == P_RAW || c_callee {
                     kind = PK_RAW;
                 }
+                if i == 0 && crate::front::closures::closure_of_type(NODES[NODES[arg].b].ty) > 0
+                    && kind == PK_RAW {
+                    // (0.25) a closure called or lent, `&g`: an access of its
+                    // captures for the call (o holds them at level 2),
+                    // inout where it changes one
+                    kind = if views::holds_mut(NODES[NODES[arg].b].ty, 0) { PK_MUT_VIEW }
+                        else { PK_VIEW };
+                }
                 if made && mode == P_MUT && f >= 0 && i < FNS[f].param_count {
                     // (a `&mut` parameter, not a legacy `*T` one: through a
                     // `&T` or a `[T]` it is own.readonly, as a write is)
@@ -1480,13 +1489,33 @@ fn eval_call(n: i64, dst: i64) {
                     kind = PK_RAW;
                 } else if mode == P_MUT_VIEW {
                     kind = PK_MUT_VIEW;
-                } else if made && mode == P_MUT && !raw {
+                } else if made && mode == P_MUT && !raw
+                    || mode == P_MUT && k == NodeKind::Unary && NODES[arg].op == Tok::Amp
+                    && through_exclusive_view(NODES[arg].b) {
                     // (0.25) `&mut v[i]` of a Vec, `v[i].push(w)`: a place
                     // inside what a view value points to, written by the
-                    // call: its origin (the loans it holds) is written
+                    // call: its origin (the loans it holds) is written;
+                    // `&v[i]` of a Vec, a Buf, a String: a loan of an
+                    // element through the view `v.as_mut_slice()` makes (o
+                    // holds it), exclusive as `&a[i]` of an array is
                     kind = PK_MUT;
                 } else if is_view_type(at_ty) {
-                    kind = PK_VIEW;
+                    // (0.25) one holding an inout access (a closure that
+                    // writes a capture, a struct with an inout field) may
+                    // change what it views during the call
+                    // (a closure lent to a let parameter, `&|| ..`, too: the
+                    // callee calls it)
+                    let inner = if TYPES[at_ty].kind == TyKind::Ptr { TYPES[at_ty].a } else { 0 };
+                    // (a temporary lent, `&v.iter()`, writes itself: only a
+                    // value that holds an inout access writes through it)
+                    let held = if inner > 0 { views::holds_mut(inner, 0) }
+                        else { views::holds_mut(at_ty, 0) };
+                    kind = if held
+                        || inner > 0 && crate::front::closures::closure_holds_inout(inner) {
+                        PK_MUT_VIEW
+                    } else {
+                        PK_VIEW
+                    };
                 } else if at_ty > 0 && TYPES[at_ty].kind == TyKind::Ptr {
                     kind = PK_RAW;
                 } else if crate::front::own::glue::has_glue(at_ty)
@@ -1519,6 +1548,35 @@ fn eval_call(n: i64, dst: i64) {
         }
         PEND.count = base;
         POOL_TOP = mark;
+    }
+}
+
+// (0.25) Whether place e (`v.as_mut_slice()[i].x`) is reached through an
+// exclusive view a call makes (an `inout [T]` or `inout T` result): a loan of
+// it writes what that view points into. A temporary itself (`&v.iter()`)
+// is not: its change is its own.
+fn through_exclusive_view(e: i64) -> bool {
+    unsafe {
+        var p = e;
+        var depth = 0;
+        while depth < 64 {
+            let k = NODES[p].kind;
+            if k == NodeKind::Index || k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+                p = NODES[p].a;
+            } else if k == NodeKind::Call || k == NodeKind::MethodCall {
+                if depth == 0 {
+                    return false;
+                }
+                // (a part of what a call returns a view of: `v[0]` as a
+                // receiver is `v.as_slice()[0]`; a written element)
+                let t = NODES[p].ty;
+                return t > 0 && (TYPES[t].kind == TyKind::Slice || TYPES[t].kind == TyKind::Ptr);
+            } else {
+                return false;
+            }
+            depth += 1;
+        }
+        false
     }
 }
 

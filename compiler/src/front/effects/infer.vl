@@ -40,8 +40,8 @@ use crate::arch::{INTRS, intrinsic_effect_bits, intrinsic_of_fn};
 use crate::base::{IntVec, SYMS, alloc_array, intern_c};
 use crate::base::timer::{T_CHECK, T_EFFECTS, timer_now, timer_sub};
 use crate::front::ast::{
-    FN_BODY_FAILED, FN_SIG_FAILED, FN_UNSAFE, NODES, NODE_IN_BOUNDS, NODE_RAW, NodeKind, REPR_UNION,
-    VK_LANE, VK_LOAD, VK_STORE, VK_WITH, child,
+    FN_BODY_FAILED, FN_SIG_FAILED, FN_UNSAFE, NODES, NODE_IN_BOUNDS, NODE_RAW, NODE_REF_MUT,
+    NodeKind, REPR_UNION, VK_LANE, VK_LOAD, VK_STORE, VK_WITH, child,
 };
 use crate::front::check::{LOCALS, Res};
 use crate::front::check::unsafety::{NODE_NO_READ, is_borrow, is_borrow_param};
@@ -60,8 +60,8 @@ use crate::front::modules::lookup::std_item_key;
 use crate::front::threadlocal::is_thread_local;
 use crate::front::traits::{IMPLS, impl_of_fn, std_trait};
 use crate::front::types::{
-    FNS, FN_COUNT, STATICS, STRUCTS, SYM_STRUCT, TLISTS, TYPES, TY_ERROR, TyKind, struct_type,
-    vec_lanes,
+    FNS, FN_COUNT, REF_SHARED, STATICS, STRUCTS, SYM_STRUCT, TLISTS, TYPES, TY_ERROR, TyKind,
+    struct_type, vec_lanes,
 };
 use crate::middle::lower::atomic::atomic_intrinsic;
 use crate::middle::lower::ssa::HMap;
@@ -263,10 +263,17 @@ pub fn infer_effects() {
         }
         LOCAL_FX = alloc_array::<Effects>(n + 1);
         CALLEE_INFO = alloc_array::<i64>(n + 1);
+        STATIC_USES.count = 0;
+        STATIC_USE_START.count = 0;
+        SA_MEMO = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        SA_SEEN = 0 as *i64;
+        SA_TOP = alloc_array::<i64>(n + 1);
         for f in 0..n {
             EDGE_START.push(EDGES.count);
+            STATIC_USE_START.push(STATIC_USES.count);
             LOCAL_FX[f] = node_locals(f);
         }
+        STATIC_USE_START.push(STATIC_USES.count);
         // The virtual nodes' edges, in the order they were made.
         let addr = ADDRESS_TAKEN.count;
         for k in 0..VIRTUAL_TYPE.count {
@@ -290,6 +297,75 @@ pub fn infer_effects() {
         FN_EFFECTS_COUNT = n;
     }
     timer_sub(T_CHECK, T_EFFECTS, t);
+}
+
+// (0.25) The mutable statics each function names, as (static, how) pairs
+// from STATIC_USE_START[f] to STATIC_USE_START[f + 1]: how 1 read, 2
+// changed (an assignment's target, `&S`, an `inout self` receiver).
+pub static var STATIC_USES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var STATIC_USE_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// (inside a place the walk changes: an assignment's target, `&place`)
+static var STATIC_WRITE: i64 = 0;
+// (static_access: the nodes visited by the query, stamped, and its memo)
+static var SA_SEEN: *i64 = 0 as *i64;
+static var SA_STAMP: i64 = 0;
+static var SA_MEMO: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var SA_STACK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// (the functions whose effects are unknown, node_locals: ⊤)
+static var SA_TOP: *i64 = 0 as *i64;
+
+// (0.25) How function f may access mutable static s by name, in its body
+// or in what it calls (fn values, unknown C callbacks and dyn calls
+// through their virtual nodes): 0 not at all, bit 1 a read, bit 2 a
+// change. An unknown callee (f < 0), or one whose effects are unknown
+// (a body not checked), may do anything: 3. own::calls::static_args asks
+// it for a static lent to a call.
+pub fn static_access(f: i64, s: i64) -> i64 {
+    unsafe {
+        if f < 0 || f >= GRAPH_FNS || STATIC_USE_START.count <= GRAPH_FNS {
+            return 3;
+        }
+        let key = f * 65536 + s + 1;
+        let known = SA_MEMO.get(key);
+        if known != 0 {
+            return known - 1;
+        }
+        if SA_SEEN == 0 as *i64 {
+            SA_SEEN = alloc_array::<i64>(GRAPH_SIZE + 1);
+        }
+        SA_STAMP += 1;
+        var how = 0;
+        SA_STACK.count = 0;
+        SA_STACK.push(f);
+        SA_SEEN[f] = SA_STAMP;
+        while SA_STACK.count > 0 && how != 3 {
+            SA_STACK.count -= 1;
+            let v = SA_STACK.data[SA_STACK.count];
+            if v < GRAPH_FNS {
+                if SA_TOP[v] != 0 {
+                    how = 3;
+                    break;
+                }
+                var i = STATIC_USE_START.data[v];
+                while i < STATIC_USE_START.data[v + 1] {
+                    if STATIC_USES.data[i] == s {
+                        how |= STATIC_USES.data[i + 1];
+                    }
+                    i += 2;
+                }
+            }
+            for e in EDGE_START.data[v]..EDGE_START.data[v + 1] {
+                let w = edge_to(e);
+                if (EDGES.data[e] & 3) != E_ALLOC && w >= 0 && w < GRAPH_SIZE
+                    && SA_SEEN[w] != SA_STAMP {
+                    SA_SEEN[w] = SA_STAMP;
+                    SA_STACK.push(w);
+                }
+            }
+        }
+        SA_MEMO.put(key, how + 1);
+        how
+    }
 }
 
 fn init_walk() {
@@ -374,6 +450,10 @@ fn node_locals(f: i64) -> Effects {
             return Effects { bits: EFF_IO | EFF_GLOBAL, allocs: 0 };
         }
         if is_top(f) {
+            // (0.25: static_access, a callee that may do anything)
+            if SA_TOP != 0 as *i64 {
+                SA_TOP[f] = 1;
+            }
             return effects_top();
         }
         if FNS[f].is_extern {
@@ -545,7 +625,14 @@ fn walk_node(n: i64) {
     unsafe {
         match NODES[n].kind {
             NodeKind::Ident => walk_ident(n),
-            NodeKind::Binary | NodeKind::Assign | NodeKind::While => {
+            NodeKind::Assign => {
+                // (0.25: its target is changed, static_access)
+                STATIC_WRITE += 1;
+                walk(NODES[n].b);
+                STATIC_WRITE -= 1;
+                walk(NODES[n].c);
+            }
+            NodeKind::Binary | NodeKind::While => {
                 if NODES[n].kind == NodeKind::While && (NODES[n].p & NODE_IN_BOUNDS) == 0 {
                     local(n, EFF_DIVERGE, 0);
                 }
@@ -556,7 +643,18 @@ fn walk_node(n: i64) {
                 if (NODES[n].p & NODE_RAW) != 0 {
                     local(n, EFF_UNSAFE, 0);
                 }
+                // (0.25) `&place` exclusive or raw, a receiver too: the
+                // place may change (static_access)
+                let t = NODES[n].ty;
+                let lends = NODES[n].op == Tok::Amp && ((NODES[n].p & NODE_REF_MUT) != 0
+                    || t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b != REF_SHARED);
+                if lends {
+                    STATIC_WRITE += 1;
+                }
                 walk(NODES[n].b);
+                if lends {
+                    STATIC_WRITE -= 1;
+                }
             }
             NodeKind::Cast => {
                 let operand = NODES[n].a;
@@ -665,6 +763,11 @@ fn walk_ident(n: i64) {
                 local(n, EFF_TLS, 0);
             } else if s >= 0 && (STATICS[s].mutable || STATICS[s].linkage != 0) {
                 local(n, EFF_GLOBAL | (if guarded_static(s) { 0 } else { EFF_RAW_GLOBAL }), 0);
+                if !SEARCH {
+                    // (0.25: static_access)
+                    STATIC_USES.push(s);
+                    STATIC_USES.push(if STATIC_WRITE > 0 { 2 } else { 1 });
+                }
             }
             return;
         }

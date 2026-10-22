@@ -86,9 +86,9 @@ run: exit 0; stdout 4 lines (.volec/probe/out)
   | ###
 ## the values by type: structs field by field, Option, tuples, slices
 % printf 'struct P { x: i64, name: [u8] }\n\nfn main() -> i32 {\n    let p = P { x: 3, name: "ab" };\n    let o: Option<i64> = Some(2);\n    let t = (1, true);\n    let a = [1, 2, 3];\n    std::print_int(p.x);\n    0\n}\n' > one.vl
-$ probe one.vl:8 p o t 'a[1..]' '&a[0] == &a[0]' --root one.vl
+$ probe one.vl:8 p o t 'a[1..]' 'a[0] == a[0]' --root one.vl
 probe one.vl:8 (before `std::print_int(p.x);`): 1 time
-  #1  p = P { x: 3, name: "ab" }  o = Some(2)  t = (1, true)  a[1..] = [2, 3]  &a[0] == &a[0] = true
+  #1  p = P { x: 3, name: "ab" }  o = Some(2)  t = (1, true)  a[1..] = [2, 3]  a[0] == a[0] = true
 run: exit 0; stdout 1 line (.volec/probe/out)
   | 3
 ## mistakes

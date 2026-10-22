@@ -63,10 +63,28 @@ Decided per variable, so the meaning never depends on an analysis:
 | `var x` | inout | `x` itself: its assignments change `x` |
 | anything, in a `sink \|..\|` closure | taken: copied, an owned local moved in | a snapshot; assignments change the closure's own |
 
-A closure capturing `x` by access is a view of `x` (0.17): while the
-closure is still to be called, `x` is not changed another way
-(`own.conflict`). Change it after the closure's last call, or capture a
-snapshot with `sink`.
+A closure capturing `x` by access holds that access from its creation
+to its last call (0.25). One that changes `x` (an assignment, `&x`, an
+inout method such as `x.push(..)`) holds an inout access: while it is
+still to be called, `x` is not read or changed another way, and calling
+it or passing it next to `&x` or a view of `x` is an error
+(`own.conflict`). One that only reads `x` holds a let access: `x` may be
+read, not changed. Use `x` after the closure's last call, pass the
+value to the closure as a parameter instead of capturing it, or capture
+a snapshot with `sink`.
+
+```tach
+fn main(gpa: Gpa) {
+    var v: Vec<i64> = Vec::new_in(gpa);
+    var add = |x: i64| v.push(x);
+    add(1);
+    add(2);
+    println(f"{v.len()}");             // add's last call is above
+}
+```
+```out
+2
+```
 
 A captured variable is the closure's `inout` parameter (0.25): what its
 body stores into one must outlive the call. A view of the body's own

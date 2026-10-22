@@ -807,6 +807,19 @@ v inout`, changes both); a slice to sort in place is `s: inout [T]`,
 passed as `&v` or `&a[..]`.
 
 ```tach
+fn bump(n: inout i64) { n += 1; }
+fn main() -> i32 { let n = 1; bump(&n); n as i32 }
+```
+```err
+error[own.readonly] '&n' changes 'n', a let binding: it is read-only
+```
+An inout access needs a mutable place: `&n`, `inout r = &n`, `match
+&n` and an `inout self` method (`v.push(x)`, `v[i] = x`) on a let
+binding, a let parameter or receiver, or an immutable static are
+errors. The `try:` says which: `var n = ...`, `x: inout T`, `inout
+self`, `static var N`.
+
+```tach
 fn keep(v: sink Vec<i64>) -> i64 { v.len() }
 fn main(gpa: Gpa) -> i32 { let v: Vec<i64> = Vec::new_in(gpa); keep(v); v.len() as i32 }
 ```
@@ -838,7 +851,7 @@ old = self.keys;` reads it where it is (a `let` of a part borrows it).
 ```text
 error[own.conflict] 'v.push(4)' may move v's elements while 'first' (4:17) views them; 'first' is used at 6:16
 error[own.conflict] 'v.push' may move v's elements while the 'for' at 7:1 iterates over them
-error[own.conflict] 'a' is borrowed mutably by '&a' and mutably again by '&a' in the same call
+error[own.conflict] 'a' is lent inout to '&a' and inout again to '&a' in the same call
 ```
 A view (a slice, a let or inout access, a `for` over `v`) is still used
 after `v` changes, or one value is lent inout twice at once. Use the

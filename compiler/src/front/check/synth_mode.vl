@@ -224,6 +224,12 @@ fn synth_cast(n: i64) -> i64 {
         let operand = NODES[n].a;
         let from_ty = synth_expr(operand);
         let to_ty = resolve_type(NODES[n].b);
+        // (0.25) `&x as *T`: an address, not an inout access
+        let raw_to = strip_distinct(to_ty);
+        if NODES[operand].kind == Unary && NODES[operand].op == Tok::Amp && is_pointer(raw_to)
+            && TYPES[raw_to].b == 0 {
+            crate::front::check::assign::RAW_ADDRS.push(operand);
+        }
         // (0.18: a distinct type converts as its underlying type does, and
         // to and from that type for free: the cast is its operand)
         let from = strip_distinct(from_ty);
@@ -997,6 +1003,16 @@ fn synth_unary(n: i64) -> i64 {
         }
         let ty = synth_expr(operand);
         MUT_PLACE = outer_place;
+        // (0.25) an inout access needs the place mutable
+        if mutable && (NODES[operand].p & NODE_TEMP) == 0 && is_place(operand) {
+            crate::front::check::assign::defer_inout_place(operand, n);
+        } else if mutable && (NODES[operand].p & NODE_TEMP) != 0
+            && TYPES[ty].kind != TyKind::Slice && TYPES[ty].kind != TyKind::Fn
+            && crate::front::conv::strict_at(NODES[n].start) {
+            // (0.25) `&make()` given an inout parameter: conv.place, when
+            // the function ends and the `&` is known to be inout
+            crate::front::check::assign::defer_conv_place(n);
+        }
         // (0.18.1) a temporary's local (check/temps.vl) is the value as
         // `&` of it was before: a slice is its own view, a function's
         // name its pointer
@@ -1007,6 +1023,11 @@ fn synth_unary(n: i64) -> i64 {
                 // (0.17) `&s[a..b]`, `&mut a[..]`: a slice value is its own
                 // view; `&mut` makes it the exclusive `&mut [T]`
                 let flags = NODES[n].p;
+                // (0.25) `&a[..]` of an array: an inout access of a
+                let sb = if NODES[operand].kind == Index { NODES[NODES[operand].a].ty } else { 0 };
+                if mutable && sb > 0 && TYPES[sb].kind == TyKind::Array && !temp {
+                    crate::front::check::assign::defer_inout_place(NODES[operand].a, n);
+                }
                 // (0.20: the `&`, for `fix --only conventions`)
                 crate::front::conv::SLICE_AMPS.push(NODES[n].start);
                 crate::front::conv::SLICE_AMPS.push(NODES[operand].start);

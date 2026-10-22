@@ -501,6 +501,11 @@ pub fn synth_method(n: i64) -> i64 {
             }
             let arg = if through_pointer { receiver }
                 else { synthetic_unary(Tok::Amp, receiver, ptr_to(t)) };
+            // (0.25) an `inout self` receiver needs the place mutable
+            let st = fn_param(f, 0);
+            if !through_pointer && TYPES[st].kind == TyKind::Ptr && TYPES[st].b == REF_MUT {
+                crate::front::check::assign::check_inout_place(receiver, n);
+            }
             return direct_call(n, f, direct, arg);
         }
         if FNS[f].generic > 0 {
@@ -544,6 +549,11 @@ pub fn synth_method(n: i64) -> i64 {
                     err_end();
                 }
                 arg = synthetic_unary(Tok::Amp, receiver, self_ty);
+                // (0.25) an `inout self` receiver needs the place mutable
+                if TYPES[self_ty].b == REF_MUT {
+                    crate::front::check::assign::check_inout_place(receiver, n);
+                    check_elem_receiver(receiver, n);
+                }
             }
         } else if TYPES[self_ty].kind == TyKind::Slice && TYPES[t].kind == TyKind::Slice
             && TYPES[self_ty].a == TYPES[t].a {
@@ -599,6 +609,39 @@ pub fn synth_method(n: i64) -> i64 {
         ensure_checked(f, n);
         check_call_safety(n, f, 1);
         FNS[f].ret
+    }
+}
+
+// (0.25) An `inout self` receiver that is an element of a Vec, a Buf or a
+// String (`v[0].inc()`, checked as `v.as_slice()[0]`): the rule of an inout
+// access for the container, v.
+fn check_elem_receiver(receiver: i64, at: i64) {
+    unsafe {
+        var p = receiver;
+        for _ in 0..64 {
+            let k = NODES[p].kind;
+            if k == NodeKind::FieldAccess && NODES[p].y == 0 || k == NodeKind::TupleField
+                || k == NodeKind::Index {
+                p = NODES[p].a;
+            } else {
+                break;
+            }
+        }
+        if p != receiver
+            && (NODES[p].kind == NodeKind::Call || NODES[p].kind == NodeKind::MethodCall)
+            && NODES[p].count > 0 {
+            let f = NODES[p].x - 1;
+            if f >= 0 && SYMS[FNS[f].display].text.len >= 8 {
+                let w = SYMS[FNS[f].display].text;
+                if w.len >= 8 && w[w.len - 8..w.len] == "as_slice" {
+                    var base = child(p, 0);
+                    if NODES[base].kind == Unary && NODES[base].op == Tok::Amp {
+                        base = NODES[base].b;
+                    }
+                    crate::front::check::assign::check_inout_place(base, at);
+                }
+            }
+        }
     }
 }
 

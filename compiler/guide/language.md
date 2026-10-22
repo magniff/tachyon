@@ -498,6 +498,7 @@ and linking: `guide c-interop`.
 | `conv.marker: 'v' is lent inout here` | `f(&v)`: an inout argument is marked |
 | `conv.marker_extra: '&' marks an argument the callee may change` | `f(v)`: a let or sink argument is not |
 | `own.readonly: writes through 'v' ... read-only (let)` | take it `v: inout T`, called `f(&v)` |
+| `own.readonly: '&n' changes 'n', a let binding` (or `v.push(x)`) | `var n`; a parameter `x: inout T`; `inout self`; `static var` |
 | `cannot infer the type of closure parameter 'x'` | `\|x: i64\| ...`, or pass it where an `Fn` bound or `fn` type gives it |
 | `'?' needs 'f' to return Option or Result` | `fn f(..) -> Option<T>` or `-> Result<T, E>` |
 | `'println!' is a macro call` | no macros: `println(f"{x}")` |

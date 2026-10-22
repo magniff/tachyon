@@ -216,11 +216,9 @@ last|
 ## The API
 
 Generated from std's source in this compiler: every public item a
-program uses, one line each, in std's source spelling (0.19's until
-std is migrated: `self: &Self` is `self`, let, it reads; `self: &mut
-Self` is `inout self`, it changes, called as `v.push(x)` on a `var`;
-`&T` is a let parameter `T`, `&mut T` an `inout T`; `self: Self` by
-value is `sink self`). Each item with its
+program uses, one line each, in std's source spelling (`self` reads;
+`inout self` changes, called as `v.push(x)` on a `var`; `sink self`
+takes the value). Each item with its
 comment: `volec guide std#every-item`; one item's source: `volec
 query show std::Scanner::next_line`.
 
