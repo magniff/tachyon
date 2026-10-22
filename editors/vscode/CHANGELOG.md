@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.25.1
+
+For vole 0.25.1.
+
+- Formatting with the compiler's formatter (`volec fmt`'s style): Format
+  Document, Format Selection, and on save: vole is the default formatter
+  of `.vl` files, `editor.formatOnSave`, `editor.tabSize` 4 and
+  `editor.insertSpaces` for `[vole]` by default (overridable). A file
+  that does not parse is not changed.
+- Completion from `volec lsp`, on code being typed: members after `.`,
+  paths after `::`, names in scope, the prelude, keywords and snippets;
+  documentation (the comment, effects) of the selected item. Signature
+  help in calls.
+- Tests: the manifest (`test/package.test.js`) and the server's answers
+  (`test/lsp.test.js`).
+
 ## 0.24.0 (unreleased)
 
 The first version, for vole 0.24.
