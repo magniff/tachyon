@@ -1,0 +1,380 @@
+// The guard walk (docs/design/arch.md §2.4): what each point of a checked
+// body knows, and the calls and function values found there.
+//
+// The known set at a point is the build's features, the function's
+// declared ones (#[target_feature]), and the atoms of every guard the
+// point is under. A guard is a has("f")/detect("f") call, or several
+// joined by `&&`; it is known
+//   - in the `then` branch of `if G`,
+//   - in the `else` branch of `if !G`,
+//   - in the rest of a block after `if !G { DIVERGES }`,
+//   - in the rest of a block after `assert(G)`.
+// `||`, other negations and a bool kept in a local give nothing.
+//
+// The walk records each direct call (CALLS) and each function taken as a
+// value (VALUES) with the set known there; infer.vl makes the
+// requirements of them, check.vl the errors. It also records the set
+// known at each has()/detect() call, which folds them (known_at).
+
+use crate::arch::{ARCH_AARCH64, ARCH_X86_64, target_arch};
+use crate::arch::features::{bit, feature_ambiguous, feature_bit_in, implied};
+use crate::base::{IntVec, SYMS};
+use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::check::Res;
+use crate::front::closures::CLOSURES;
+use crate::front::features::feature_call_bit;
+use crate::front::lexer::{Tok, str_at};
+use crate::front::modules::{STD_MODULE, within_std};
+use crate::front::types::{FNS, TY_NEVER};
+use crate::middle::lower::ssa::HMap;
+
+// The direct calls, CALL_WIDTH entries each: the caller and the callee
+// (FNS), the set known at the call, the ambiguous readings there (the bits
+// an unqualified two-architecture name like `aes` would have meant on the
+// other architecture, in the guards and the declaration around it), the
+// call node, and where that name is (its Str node + 1, or -1 - the
+// FEATURE_ATTRS index of a declaration; 0: none).
+pub static var CALLS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub const CALL_WIDTH: i64 = 6;
+pub const C_FN: i64 = 0;
+pub const C_CALLEE: i64 = 1;
+pub const C_KNOWN: i64 = 2;
+pub const C_ALT: i64 = 3;
+pub const C_NODE: i64 = 4;
+pub const C_ALT_AT: i64 = 5;
+
+// The functions taken as values, VALUE_WIDTH entries each: the function the
+// value is made in, the function it is, the set known there, the node (an
+// Ident, or a Closure), and whether it is a closure (1) or a plain `fn`
+// value (0).
+pub static var VALUES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub const VALUE_WIDTH: i64 = 5;
+
+// has()/detect() call node + 1 -> the set known there, with KNOWN_MARK.
+static var KNOWN_AT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+const KNOWN_MARK: i64 = 1 << 48;
+
+// The walk's state: the function walked, the set known, the ambiguous
+// readings and where the last such name is.
+static var CUR: i64 = 0;
+static var KNOWN: i64 = 0;
+static var ALT: i64 = 0;
+static var ALT_AT: i64 = 0;
+
+// The set known at has()/detect() call n, or -1 when the walk did not reach
+// it.
+pub fn walked_known(n: i64) -> i64 {
+    unsafe {
+        let v = KNOWN_AT.get(n + 1);
+        if v == 0 { -1 } else { v & ~KNOWN_MARK }
+    }
+}
+
+pub fn regions_reset() {
+    unsafe {
+        CALLS.count = 0;
+        VALUES.count = 0;
+        KNOWN_AT.clear();
+    }
+}
+
+// Walks the body of function f, knowing `known` at its start (the build's
+// and the declared features), with the ambiguous readings of its
+// declaration (`alt`, at `alt_at`).
+pub fn walk_function(f: i64, known: i64, alt: i64, alt_at: i64) {
+    unsafe {
+        CUR = f;
+        KNOWN = known;
+        ALT = alt;
+        ALT_AT = alt_at;
+        walk(NODES[FNS[f].node].c);
+    }
+}
+
+// ---- Guards ----
+
+// The features guard g gives where it holds (0: none): its has()/detect()
+// atoms, through `&&`. Notes its ambiguous names.
+fn atoms(g: i64) -> i64 {
+    unsafe {
+        if g == 0 {
+            return 0;
+        }
+        let kind = NODES[g].kind;
+        if kind == NodeKind::Call {
+            let b = feature_call_bit(g);
+            if b < 0 {
+                return 0;
+            }
+            note_ambiguous(g);
+            return implied(bit(b));
+        }
+        if kind == NodeKind::Binary && NODES[g].op == Tok::AmpAmp {
+            return atoms(NODES[g].b) | atoms(NODES[g].c);
+        }
+        0
+    }
+}
+
+// An atom `has("aes")` whose name is of both architectures: what it would
+// have meant on the other one.
+fn note_ambiguous(g: i64) {
+    unsafe {
+        let arg = child(g, 0);
+        if NODES[arg].kind != NodeKind::Str {
+            return;
+        }
+        let name = str_at(NODES[arg].a);
+        if !feature_ambiguous(name) {
+            return;
+        }
+        let other = if target_arch() == ARCH_X86_64 { ARCH_AARCH64 } else { ARCH_X86_64 };
+        let b = feature_bit_in(name, other);
+        if b >= 0 {
+            ALT |= bit(b);
+            ALT_AT = arg + 1;
+        }
+    }
+}
+
+// The operand of `!x`, or 0.
+fn negated(c: i64) -> i64 {
+    unsafe {
+        if NODES[c].kind == NodeKind::Unary && NODES[c].op == Tok::Bang { NODES[c].b } else { 0 }
+    }
+}
+
+// Whether node n never completes: `return`, `break`, `continue`, a block
+// ending in one, a call of a function returning `!` (panic, exit).
+pub fn diverges(n: i64) -> bool {
+    unsafe {
+        if n == 0 {
+            return false;
+        }
+        if NODES[n].ty == TY_NEVER {
+            return true;
+        }
+        let kind = NODES[n].kind;
+        if kind == NodeKind::Return || kind == NodeKind::Break || kind == NodeKind::Continue {
+            return true;
+        }
+        if kind == NodeKind::ExprStmt {
+            return diverges(NODES[n].a);
+        }
+        if kind == NodeKind::Block {
+            if NODES[n].a != 0 {
+                return diverges(NODES[n].a);
+            }
+            return NODES[n].count > 0 && diverges(child(n, NODES[n].count - 1));
+        }
+        false
+    }
+}
+
+// Whether call n is std's assert.
+fn is_assert(n: i64) -> bool {
+    unsafe {
+        let f = NODES[n].x - 1;
+        if f < 0 || !within_std(FNS[f].module) {
+            return false;
+        }
+        let t = SYMS[FNS[f].display].text;
+        // (0.18: `assert(c)` is checked as std::contract_check(c, ...))
+        t == "assert" || t == "std::assert" || t == "contract_check" || t == "std::contract_check"
+    }
+}
+
+// What statement s makes known for the rest of its block: `if !G {
+// DIVERGES }` and `assert(G)` give G's atoms.
+fn narrows(s: i64) -> i64 {
+    unsafe {
+        let e = if NODES[s].kind == NodeKind::ExprStmt { NODES[s].a } else { s };
+        if e == 0 {
+            return 0;
+        }
+        if NODES[e].kind == NodeKind::If && NODES[e].c == 0 {
+            let g = negated(NODES[e].a);
+            if g != 0 && diverges(NODES[e].b) {
+                return atoms(g);
+            }
+            return 0;
+        }
+        if NODES[e].kind == NodeKind::Call && NODES[e].count > 0 && is_assert(e) {
+            return atoms(child(e, 0));
+        }
+        0
+    }
+}
+
+// ---- The walk ----
+
+fn walk_list(n: i64) {
+    unsafe {
+        for i in 0..NODES[n].count {
+            walk(child(n, i));
+        }
+    }
+}
+
+fn walk(n: i64) {
+    unsafe {
+        if n == 0 {
+            return;
+        }
+        match NODES[n].kind {
+            NodeKind::Int | NodeKind::Str | NodeKind::CStr | NodeKind::Bool | NodeKind::Char
+                | NodeKind::Float | NodeKind::Unit | NodeKind::Continue => {}
+            NodeKind::Ident => walk_ident(n),
+            NodeKind::Binary | NodeKind::Assign | NodeKind::While => {
+                walk(NODES[n].b);
+                walk(NODES[n].c);
+            }
+            NodeKind::Unary => walk(NODES[n].b),
+            NodeKind::Cast | NodeKind::TupleField | NodeKind::ExprStmt | NodeKind::Return
+                | NodeKind::Defer | NodeKind::FieldAccess | NodeKind::EnumPanic => {
+                walk(NODES[n].a);
+            }
+            NodeKind::Call => walk_call(n),
+            NodeKind::MethodCall | NodeKind::VecOp => {
+                walk(NODES[n].a);
+                walk_list(n);
+            }
+            NodeKind::Index | NodeKind::Repeat | NodeKind::Range => {
+                walk(NODES[n].a);
+                walk(NODES[n].b);
+            }
+            NodeKind::Tuple | NodeKind::Array | NodeKind::StructLit | NodeKind::VariantLit => {
+                walk_list(n);
+            }
+            NodeKind::FieldInit | NodeKind::Break | NodeKind::NamedArg => walk(NODES[n].b),
+            NodeKind::Let => walk(NODES[n].c),
+            NodeKind::Block => walk_block(n),
+            NodeKind::If => walk_if(n),
+            NodeKind::Loop => walk(NODES[n].b),
+            NodeKind::For => {
+                walk(NODES[n].c);
+                walk(NODES[n].d);
+            }
+            NodeKind::Match => {
+                walk(NODES[n].a);
+                for i in 0..NODES[n].count {
+                    let arm = child(n, i);
+                    walk(NODES[arm].b);
+                    walk(NODES[arm].c);
+                }
+            }
+            NodeKind::Closure => walk_closure(n),
+            NodeKind::Interp if NODES[n].x > 0 => {
+                let block = NODES[n].y;
+                for i in 0..NODES[block].count {
+                    walk(NODES[child(block, i)].c);
+                }
+                walk(NODES[block].a);
+            }
+            NodeKind::Try | NodeKind::Interp => walk(NODES[n].y),
+            _ => {}
+        }
+    }
+}
+
+fn walk_block(n: i64) {
+    unsafe {
+        let known = KNOWN;
+        let alt = ALT;
+        let alt_at = ALT_AT;
+        for i in 0..NODES[n].count {
+            let s = child(n, i);
+            walk(s);
+            let more = narrows(s);
+            if more != 0 {
+                KNOWN = implied(KNOWN | more);
+            }
+        }
+        walk(NODES[n].a);
+        KNOWN = known;
+        ALT = alt;
+        ALT_AT = alt_at;
+    }
+}
+
+fn walk_if(n: i64) {
+    unsafe {
+        let cond = NODES[n].a;
+        walk(cond);
+        let known = KNOWN;
+        let alt = ALT;
+        let alt_at = ALT_AT;
+        KNOWN = implied(known | atoms(cond));
+        walk(NODES[n].b);
+        KNOWN = known;
+        ALT = alt;
+        ALT_AT = alt_at;
+        let g = negated(cond);
+        if g != 0 {
+            KNOWN = implied(known | atoms(g));
+        }
+        walk(NODES[n].c);
+        KNOWN = known;
+        ALT = alt;
+        ALT_AT = alt_at;
+    }
+}
+
+fn walk_call(n: i64) {
+    unsafe {
+        let f = NODES[n].x - 1;
+        if f < 0 {
+            walk(NODES[n].a);
+            walk_list(n);
+            return;
+        }
+        if feature_call_bit(n) >= 0 {
+            KNOWN_AT.put(n + 1, KNOWN | KNOWN_MARK);
+        }
+        CALLS.push(CUR);
+        CALLS.push(f);
+        CALLS.push(KNOWN);
+        CALLS.push(ALT);
+        CALLS.push(n);
+        CALLS.push(ALT_AT);
+        walk_list(n);
+    }
+}
+
+// A function named as a value (not called): a `fn` pointer.
+fn walk_ident(n: i64) {
+    unsafe {
+        if NODES[n].res != Res::Fn || NODES[n].y < 0 {
+            return;
+        }
+        push_value(NODES[n].y, n, 0);
+    }
+}
+
+// A closure: its function, made here (its body is walked as a function of
+// its own, knowing the build's features).
+fn walk_closure(n: i64) {
+    unsafe {
+        let c = NODES[n].x - 1;
+        if c >= 0 && CLOSURES[c].f >= 0 {
+            // (coerced to a fn type: a plain fn value)
+            let y = NODES[n].y;
+            let coerced = y != 0 && NODES[y].kind == NodeKind::Ident;
+            push_value(CLOSURES[c].f, n, if coerced { 0 } else { 1 });
+            if coerced {
+                return;
+            }
+        }
+        walk(NODES[n].y);
+    }
+}
+
+fn push_value(g: i64, n: i64, closure: i64) {
+    unsafe {
+        VALUES.push(CUR);
+        VALUES.push(g);
+        VALUES.push(KNOWN);
+        VALUES.push(n);
+        VALUES.push(closure);
+    }
+}

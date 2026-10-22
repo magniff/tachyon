@@ -89,11 +89,11 @@ probe python3 python3 -c 'print(1)'
 probe git git status --short
 """
 
-SCRIPT_TACH = r"""probe version tachyonc --version
-probe build tachyonc main.tach -o prog
+SCRIPT_TACH = r"""probe version volec --version
+probe build volec main.vl -o prog
 probe run sh -c 'test "$(printf "1 2 3\n" | ./prog)" = 6'
-probe check tachyonc check main.tach
-probe guide sh -c 'tachyonc guide > /dev/null'
+probe check volec check main.vl
+probe guide sh -c 'volec guide > /dev/null'
 """
 
 SCRIPT_RUST = r"""probe version rustc --version
@@ -101,18 +101,18 @@ probe build rustc -O --edition 2021 main.rs -o prog
 probe run sh -c 'test "$(printf "1 2 3\n" | ./prog)" = 6'
 """
 
-SCRIPT_TEST = r"""probe test-command sh -c 'tachyonc test --help > /dev/null'
+SCRIPT_TEST = r"""probe test-command sh -c 'volec test --help > /dev/null'
 """
 
-SCRIPT_COMPILER = r"""probe version target/tachyonc --version
-probe check target/tachyonc check
+SCRIPT_COMPILER = r"""probe version target/volec --version
+probe check target/volec check
 probe embed sh compiler/std/embed.sh -c
 probe eval-build sh bootstrap/eval-build.sh --quick
-probe suite sh tests/run.sh -c target/tachyonc arith_i64_basic
-probe tools-query sh -c 'test ! -x target/tools/tachyonc || target/tools/tachyonc query items crate > /dev/null'
+probe suite sh tests/run.sh -c target/volec arith_i64_basic
+probe tools-query sh -c 'test ! -x target/tools/volec || target/tools/volec query items crate > /dev/null'
 """
 
-SCRIPT_COMPILER_TEST = r"""probe test-command sh -c 'target/tools/tachyonc test --help > /dev/null'
+SCRIPT_COMPILER_TEST = r"""probe test-command sh -c 'target/tools/volec test --help > /dev/null'
 """
 
 # Optional probes: reported, never stop a round.
@@ -121,11 +121,11 @@ OPTIONAL = {"git", "guide", "tools-query"}
 # Command forms the 0.16 round saw refused, one Bash call each in the
 # hosted session; measured, not required. (name, command per kind)
 FORMS = [
-    ("chain &&", {"tach": "tachyonc main.tach -o prog && ./prog < in.txt",
+    ("chain &&", {"tach": "volec main.vl -o prog && ./prog < in.txt",
                   "rust": "rustc -O --edition 2021 main.rs -o prog && ./prog < in.txt",
-                  "compiler": "target/tachyonc --version && git status --short"}),
+                  "compiler": "target/volec --version && git status --short"}),
     ("status $?", {"*": "./prog < in.txt; echo \"rc=$?\"",
-                   "compiler": "target/tachyonc --version; echo \"rc=$?\""}),
+                   "compiler": "target/volec --version; echo \"rc=$?\""}),
     ("variable", {"*": "X=in.txt; cat $X"}),
     ("$TMPDIR redirect", {"*": "printf '1 2\\n' > $TMPDIR/eval-sc-probe.txt"}),
     ("loop", {"*": "for f in in.txt; do wc -c $f; done"}),
@@ -138,7 +138,7 @@ FORMS = [
     ("perl", {"*": "perl -e 'print 1'"}),
     ("other ./binary", {"tach": "cp prog prog2 && ./prog2 < in.txt",
                         "rust": "cp prog prog2 && ./prog2 < in.txt",
-                        "compiler": "./target/tachyonc --version"}),
+                        "compiler": "./target/volec --version"}),
     ("sed -i", {"*": "sed -i '' 's/x/y/' written.txt"}),
     # last: Claude's Bash keeps the directory a `cd` moves to
     ("cd chain", {"*": "cd sub && ls"}),
@@ -201,9 +201,9 @@ def prepare(kind, ctx, root, test=False):
         dev = load_tasks(None, ["00-hello-sum"], "dev")[0]
         ws, bin_dir = runner.program_workspace(ctx, dev, kind, base)
         for f in os.listdir(ws):
-            if f.endswith((".tach", ".rs")):
+            if f.endswith((".vl", ".rs")):
                 os.remove(os.path.join(ws, f))
-        with open(os.path.join(ws, "main.tach" if kind == "tach" else "main.rs"), "w") as fh:
+        with open(os.path.join(ws, "main.vl" if kind == "tach" else "main.rs"), "w") as fh:
             fh.write(TACH_PROBE if kind == "tach" else RUST_PROBE)
         hooks = ((ctx["hooks"]["check"], os.path.join(base, "check-hook.jsonl"))
                  if kind == "tach" else None, None)
@@ -219,7 +219,7 @@ def prepare(kind, ctx, root, test=False):
         install_mktemp_shim(bin_dir)
         ctasks.setup_workspace(task, "compiler-tools", info["sha"], ws, info["builder"],
                                info["starter"], base_env(bin_dir),
-                               tools_tachyonc=ctx.get("tools_tachyonc"))
+                               tools_volec=ctx.get("tools_volec"))
         hooks = ((ctx["hooks"]["check"], os.path.join(base, "check-hook.jsonl")),
                  ctx["hooks"]["query"])
     with open(os.path.join(ws, "in.txt"), "w") as fh:
@@ -284,11 +284,11 @@ def hosted(kind, ws, bin_dir, hooks, model, rdir, ctx):
     tmpfile = "/tmp/claude-%d/eval-selfcheck-%d.txt" % (os.getuid(), os.getpid())
     forms = [(name, cmds.get(kind, cmds.get("*"))) for name, cmds in FORMS]
     forms = [(n, c) for n, c in forms if c]
-    build = {"tach": "2. Run `tachyonc main.tach -o prog`, then (a second Bash call) "
+    build = {"tach": "2. Run `volec main.vl -o prog`, then (a second Bash call) "
                      "`./prog < in.txt`.",
              "rust": "2. Run `rustc -O --edition 2021 main.rs -o prog`, then (a second Bash "
                      "call) `./prog < in.txt`.",
-             "compiler": "2. Run `target/tachyonc --version`, then (a second Bash call) "
+             "compiler": "2. Run `target/volec --version`, then (a second Bash call) "
                          "`tests/run.sh arith_i64_basic`."}[kind]
     prompt = PROMPT % {"build": build, "tmpfile": tmpfile,
                        "forms": "\n".join("```\n%s\n```" % c for _, c in forms)}
@@ -311,9 +311,9 @@ def hosted(kind, ws, bin_dir, hooks, model, rdir, ctx):
             return "not run"
         return "denied" if c["denied"] else ("error" if c["is_error"] else "ran")
     steps = {}
-    b = {"tach": ("tachyonc main.tach -o prog", "./prog < in.txt"),
+    b = {"tach": ("volec main.vl -o prog", "./prog < in.txt"),
          "rust": ("rustc -O --edition 2021 main.rs -o prog", "./prog < in.txt"),
-         "compiler": ("target/tachyonc --version", "tests/run.sh arith_i64_basic")}[kind]
+         "compiler": ("target/volec --version", "tests/run.sh arith_i64_basic")}[kind]
     steps["agent-build"] = status(b[0])
     steps["agent-run"] = status(b[1])
     steps["agent-selfcheck"] = status("sh selfcheck.sh")
@@ -435,13 +435,13 @@ def main(args):
         DEFAULT_RESULTS_DIR, "selfcheck-" + time.strftime("%Y%m%d-%H%M%S")))
     os.makedirs(out, exist_ok=True)
     ws_root = os.path.realpath(args.ws_root or os.path.join(
-        os.environ.get("TMPDIR", "/tmp"), "tachyon-eval", os.path.basename(out)))
+        os.environ.get("TMPDIR", "/tmp"), "vole-eval", os.path.basename(out)))
     if ws_root.startswith(os.path.realpath(REPO_ROOT) + os.sep):
         raise SystemExit("workspaces must be outside the repository")
     os.makedirs(ws_root, exist_ok=True)
-    bins = prepare_bins(ws_root, os.path.abspath(args.tachyonc))
+    bins = prepare_bins(ws_root, os.path.abspath(args.volec))
     ctx = {"backend": backend, "out": out, "ws_root": ws_root, "bins": bins,
-           "hooks": install_hooks(ws_root), "tools_tachyonc": None,
+           "hooks": install_hooks(ws_root), "tools_volec": None,
            "versions": {"tach": tool_version(bins["tach"], "tach"),
                         "rust": tool_version(bins["rust"], "rust")}, "ctasks": {}}
     kinds = [k for k in args.kinds.split(",") if k]

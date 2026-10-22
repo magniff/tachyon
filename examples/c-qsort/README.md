@@ -1,19 +1,19 @@
 # c-qsort
 
-Sorting tachyon data with the C library's `qsort`, and searching it with
+Sorting vole data with the C library's `qsort`, and searching it with
 `bsearch`. The records are `#[repr(C)]` structs, so C sees exactly the
-layout tachyon wrote, and the comparison functions are tachyon functions
+layout vole wrote, and the comparison functions are vole functions
 with C's calling convention (`extern "C" fn`) that `qsort` calls back. A
 small generic wrapper, `c_sort<T>`, sorts a slice of any element type
 through C, and the same wrapper sorts plain `i32`s at the end.
 
 ## Build and run
 
-From this folder (with `tachyonc` on your `PATH`, or as
-`../../target/tachyonc` from a built tree):
+From this folder (with `volec` on your `PATH`, or as
+`../../target/volec` from a built tree):
 
 ```sh
-tachyonc main.tach -o c-qsort && ./c-qsort
+volec main.vl -o c-qsort && ./c-qsort
 ```
 
 `qsort`, `bsearch`, `strlen` and `strcmp` are in the C library every
@@ -67,10 +67,10 @@ import "string.h" as c;
 ```
 
 `import "header.h" as c;` runs the system's C preprocessor on the header
-and turns its declarations into tachyon ones under the name `c`: here
+and turns its declarations into vole ones under the name `c`: here
 `c::qsort`, `c::bsearch`, `c::strlen`, `c::strcmp`. Every header of a
 program shares one C module, so both imports use the same `c`. To see
-what a header declares: `tachyonc --emit-imports main.tach -o decls.tach`.
+what a header declares: `volec --emit-imports main.vl -o decls.vl`.
 `qsort` arrives as
 
 ```tach
@@ -87,7 +87,7 @@ C's `void *` is `*u8`, `size_t` is `u64`, and the comparator is an
 struct City { name: *u8, country: *u8, population: i64, area: f64 }
 ```
 
-Tachyon's own structs have no promised layout. `#[repr(C)]` asks for
+Vole's own structs have no promised layout. `#[repr(C)]` asks for
 C's: fields in declaration order, C's padding and alignment, so an array
 of `City` is exactly what a C `struct City[]` would be. `size_of(City)`
 (32 here) is the element size `qsort` needs. The names are C strings,
@@ -141,8 +141,8 @@ extern "C" fn name_key(key: *u8, element: *u8) -> i32 {
 
 `bsearch(key, base, n, size, cmp)` passes the key as the first argument
 and an element as the second. The key does not have to be a `City`: here
-it is the address of a tachyon slice (`&name as *u8`). C never looks
-inside it, it only hands it back to the callback, so any tachyon value
+it is the address of a vole slice (`&name as *u8`). C never looks
+inside it, it only hands it back to the callback, so any vole value
 works, `#[repr(C)]` or not. The comparison is byte order (`[u8]`'s `cmp`),
 the same order `strcmp` gave `qsort`: `bsearch` needs the array sorted by
 the order it searches with.
@@ -153,7 +153,7 @@ the order it searches with.
 if hit == 0 as *u8 { None } else { Some(unsafe { *(hit as *City) }) }
 ```
 
-### C strings to tachyon text
+### C strings to vole text
 
 ```tach
 unsafe fn text(p: *u8) -> [u8] {
@@ -188,25 +188,25 @@ f-strings with widths (`>` right, `<` left) and a precision for floats
   comment states the contract.
 - **Strings**: `c"..."` is a NUL-terminated `*u8`; a `[u8]` slice has no
   NUL (pass `.ptr` and `.len`, or copy it with a 0 after).
-- **Linking**: `tachyonc main.tach -o prog` links with `cc` and the C
+- **Linking**: `volec main.vl -o prog` links with `cc` and the C
   library; other libraries and C files go through an object (see
   [c-mixed-build](../c-mixed-build/) and [c-math](../c-math/)).
 
 ## Language features
 
 - `import "stdlib.h" as c`, `extern "C" fn`, `#[repr(C)]`, `size_of(T)`:
-  `tachyonc guide c-interop`
+  `volec guide c-interop`
 - `unsafe fn` with a stated contract, raw pointer casts and dereferences:
-  `tachyonc guide unsafe`
-- generic functions over `[T]`: `tachyonc guide generics`
-- f-strings with width, alignment and precision: `tachyonc guide formatting`
-- `iter().enumerate()`, `fold` with a closure: `tachyonc guide iterators`,
-  `tachyonc guide closures`
-- `Option` for "found or not": `tachyonc guide conversions`
+  `volec guide unsafe`
+- generic functions over `[T]`: `volec guide generics`
+- f-strings with width, alignment and precision: `volec guide formatting`
+- `iter().enumerate()`, `fold` with a closure: `volec guide iterators`,
+  `volec guide closures`
+- `Option` for "found or not": `volec guide conversions`
 
 ## Going further
 
-- `std::sort` and `slice.sort_by(|a, b| ...)` sort in tachyon, with a
+- `std::sort` and `slice.sort_by(|a, b| ...)` sort in vole, with a
   closure and no `unsafe`; the C route is for code that already speaks
   `qsort`.
 - `qsort_r` would let the comparator take a context pointer, but its

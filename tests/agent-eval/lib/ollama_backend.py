@@ -103,7 +103,7 @@ class Tools:
             event = {"tool_name": "Write" if name == "write_file" else "Edit",
                      "tool_input": {"file_path": os.path.join(self.ws, a.get("path", ""))}}
         event.update(hook_event_name="PostToolUse", cwd=self.ws)
-        env = dict(self.env, TACHYON_CHECK_HOOK_LOG=self.check_hook[1])
+        env = dict(self.env, VOLE_CHECK_HOOK_LOG=self.check_hook[1])
         try:
             r = subprocess.run(["/usr/bin/python3", "-I", self.check_hook[0]], input=json.dumps(event),
                                capture_output=True, text=True, env=env, timeout=60)

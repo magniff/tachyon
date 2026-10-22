@@ -1,6 +1,6 @@
 # Tests, properties and fuzzing
 
-Tests are written in the language (0.18) and run by `tachyonc test`,
+Tests are written in the language (0.18) and run by `volec test`,
 which builds them at -O0 and at -O2 and compares the two. Other builds
 leave test items out; `check` and the queries see them.
 
@@ -104,27 +104,27 @@ fn main() -> i32 {
 - A function with an `ensures` is tested as a property too, its
   requires filtering the inputs (`--no-contracts`: not).
 
-## tachyonc test
+## volec test
 
 ```text
-$ tachyonc test
-test main.tach: 6 passed, 2 failed (1 case, 5 #[test], 2 #[property], 1 contract; -O0 and -O2 agree)
-FAIL gap_needs_two: checks.tach:14:8: index out of bounds: index 1, length 1
-  trace: checks.tach:14 checks::gap_needs_two
+$ volec test
+test main.vl: 6 passed, 2 failed (1 case, 5 #[test], 2 #[property], 1 contract; -O0 and -O2 agree)
+FAIL gap_needs_two: checks.vl:14:8: index out of bounds: index 1, length 1
+  trace: checks.vl:14 checks::gap_needs_two
 FAIL bubble_sorts (property, case 11 of 100, shrunk in 8 steps): not sorted
   input: v = [1, 0]
-  try: tachyonc test bubble_sorts --seed 0xf788dd27897d1fed main.tach
+  try: volec test bubble_sorts --seed 0xf788dd27897d1fed main.vl
 ```
 
 - The summary first, then one line per failure, its trace, its input
   and the command that replays it. `FILTER` runs the tests whose name
   holds it; `tests/NAME.in` with `NAME.out` are cases of the program.
 - A test whose -O0 and -O2 runs differ is a `DIFF` line: the compiler's
-  bug, not yours (`tachyonc reduce --differs` shrinks it).
+  bug, not yours (`volec reduce --differs` shrinks it).
 - `--seed H` replays a property's failure, `--accept` takes snapshots,
   case outputs and saved fuzz inputs, `-O N` runs one level.
 
-## #[fuzz] and tachyonc fuzz
+## #[fuzz] and volec fuzz
 
 ```tach
 fn parse(data: [u8]) -> i64 {
@@ -148,20 +148,20 @@ fn main() -> i32 {
 1
 ```
 
-`tachyonc fuzz NAME [--time S]` builds the test binary with `--coverage`
+`volec fuzz NAME [--time S]` builds the test binary with `--coverage`
 (every block counts in std's map) and mutates inputs, keeping those that
-reach new code. A crash is shrunk, saved under `.tachyonc/fuzz/NAME/`
-and replayed by every `tachyonc test` after (`--accept` keeps it in
+reach new code. A crash is shrunk, saved under `.volec/fuzz/NAME/`
+and replayed by every `volec test` after (`--accept` keeps it in
 `tests/fuzz/NAME/`). A `#[fuzz]` takes one `[u8]` (or any generated
 types, like a property).
 
-## tachyonc reduce over programs
+## volec reduce over programs
 
-- `tachyonc reduce PROG.tach --differs [--input F]`: the program cut
+- `volec reduce PROG.vl --differs [--input F]`: the program cut
   while its -O0 and -O2 runs disagree (a miscompile, to report).
 - `--fails 'TEXT'`: while the build or the run prints TEXT.
 - `--test NAME`: while test NAME fails as it does now.
 
 Items, then statements, are cut by halves, then one by one; the result
-is `PROG.min.tach`. For an input instead: `tachyonc reduce FILE --until
+is `PROG.min.vl`. For an input instead: `volec reduce FILE --until
 'CMD'` (guide debug).

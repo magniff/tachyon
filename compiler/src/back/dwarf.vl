@@ -1,0 +1,622 @@
+// Debug information (0.11, `-g`): DWARF line tables, so that debuggers and
+// backtraces see source lines.
+//
+// The assembly carries it as the system assemblers expect it: `.file N
+// "path"` and `.loc N line column` before instructions (a statement's
+// first instruction; both back ends know the source position of what they
+// emit: the -O0 generator per statement, the IR per instruction, from the
+// statement it was lowered from), and the sections a compiler writes
+// itself: .debug_abbrev and .debug_info (a compile unit for the program,
+// with a subprogram per function: name, address range, declaration line)
+// as data, and an empty .debug_line whose start the unit refers to. The
+// assembler (objfile.vl, or `cc -c` of the same text) makes the line
+// program from the `.loc`s into that section. Without `-g` nothing of this
+// is written, and nothing else changes: the code is the same with and
+// without it.
+//
+// DWARF 4, 32-bit. Positions in the compiler's own synthesized sources
+// (`<std>`, `<C import>`...) have no line: code from them keeps the line
+// of the code before it.
+
+use crate::base::{
+    BUFS, FILES, FILE_COUNT, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_fmt, buf_new, buf_reserve,
+    buf_slice, buf_str, buf_uint, cstr, memcmp, out_path, root_dir, strlen,
+};
+use crate::base::target::{ELF, X86};
+use crate::front::types::FNS;
+use crate::gen0::target::{emit_symbol_ref, local_prefix};
+use crate::middle::ctx::FnCtx;
+
+pub static var DEBUG_INFO: bool = false;
+
+// ---- Source positions ----
+
+// The offsets in SRC where lines start (made once, when first needed:
+// every source is loaded by then).
+static var LINE_STARTS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var SRC_END: i64 = 0;
+
+fn init_lines() {
+    unsafe {
+        let last = FILES[FILE_COUNT - 1].end;
+        SRC_END = last;
+        LINE_STARTS.push(0);
+        for i in 0..last {
+            if SRC[i] == '\n' {
+                LINE_STARTS.push(i + 1);
+            }
+        }
+    }
+}
+
+// The index of the line holding position `pos`.
+fn line_index(pos: i64) -> i64 {
+    unsafe {
+        var lo = 0;
+        var hi = LINE_STARTS.count - 1;
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            if LINE_STARTS.data[mid] <= pos {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    }
+}
+
+// The file holding position `pos`.
+fn file_of(pos: i64) -> i64 {
+    unsafe {
+        var lo = 0;
+        var hi = FILE_COUNT - 1;
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            if FILES[mid].start <= pos {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    }
+}
+
+// (0.17) The file holding position `pos` and its line there (from 1), as
+// file << 32 | line: --trace's sites (middle/trace.vl).
+pub fn file_and_line(pos: i64) -> i64 {
+    unsafe {
+        if LINE_STARTS.count == 0 {
+            init_lines();
+        }
+        let file = file_of(pos);
+        let line = line_index(pos) - line_index(FILES[file].start) + 1;
+        (file << 32) | line
+    }
+}
+
+// The `.file` number of each file of FILES (0: none yet).
+static var FILE_NUMBERS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var FILES_USED: i64 = 0;
+
+// Writes the `.loc` of source position `pos` to buffer `out` (and the
+// `.file` of its file, the first time); nothing for a position of a
+// synthesized source, or -1.
+pub fn dbg_loc(out: i64, pos: i64) {
+    unsafe {
+        if !DEBUG_INFO || pos < 0 {
+            return;
+        }
+        if LINE_STARTS.count == 0 {
+            init_lines();
+        }
+        if pos >= SRC_END {
+            return;
+        }
+        let file = file_of(pos);
+        let path = FILES[file].path;
+        if path[0] == '<' {
+            return;
+        }
+        while FILE_NUMBERS.count <= file {
+            FILE_NUMBERS.push(0);
+        }
+        if FILE_NUMBERS.data[file] == 0 {
+            FILES_USED += 1;
+            FILE_NUMBERS.data[file] = FILES_USED;
+            buf_fmt(out, f"    .file {FILES_USED} ");
+            // (0.18) the file by its absolute path, the root's directory and
+            // its root-relative name: the assembler resolves a relative
+            // `.file` against its own current directory, which need not
+            // be the root's (cc assembling `-S` output elsewhere)
+            let root = root_dir();
+            if root[0] != 0 {
+                let full = buf_new();
+                buf_str(full, root);
+                buf_byte(full, '/');
+                buf_str(full, out_path(file));
+                buf_byte(full, 0);
+                quoted(out, BUFS[full].data);
+            } else {
+                quoted(out, out_path(file));
+            }
+            buf_byte(out, '\n');
+        }
+        let line = line_index(pos);
+        let first = line_index(FILES[file].start);
+        buf_fmt(out, f"    .loc {FILE_NUMBERS.data[file]} {line - first + 1} ");
+        buf_fmt(out, f"{pos - LINE_STARTS.data[line] + 1}\n");
+    }
+}
+
+// "<s>", with " and \ escaped.
+fn quoted(out: i64, s: *u8) {
+    unsafe {
+        buf_byte(out, '"');
+        let n = strlen(s) as i64;
+        for i in 0..n {
+            if s[i] == '"' || s[i] == '\\' {
+                buf_byte(out, '\\');
+            }
+            buf_byte(out, s[i]);
+        }
+        buf_byte(out, '"');
+    }
+}
+
+// ---- Functions ----
+
+// Per function emitted: its FNS index, the symbol prefix of its label,
+// its position (the declaration) and the number of its end label.
+static var DBG_FNS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var DBG_PREFIX: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var DBG_POS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Before function f's label (in ASM): the line of its declaration, at
+// `pos`, for its first instruction.
+pub fn dbg_function_begin(cx: sink *FnCtx, f: i64, prefix: *u8, pos: i64) {
+    unsafe {
+        if !DEBUG_INFO {
+            return;
+        }
+        dbg_loc(cx.asm, pos);
+        DBG_FNS.push(f);
+        DBG_PREFIX.push(prefix as i64);
+        DBG_POS.push(pos);
+    }
+}
+
+// After the function's last instruction (in ASM): its end label.
+pub fn dbg_function_end(cx: sink *FnCtx) {
+    unsafe {
+        if !DEBUG_INFO {
+            return;
+        }
+        end_label(cx.asm, DBG_FNS.count - 1);
+        buf_str(cx.asm, c":\n");
+    }
+}
+
+fn end_label(out: i64, i: i64) {
+    unsafe {
+        buf_fmt(out, f"{cstr(local_prefix())}dbg.end{i}");
+    }
+}
+
+// The end of the code (in ASM, after the last instruction of the text
+// section).
+pub fn dbg_text_end(cx: sink *FnCtx) {
+    unsafe {
+        if !DEBUG_INFO || DBG_FNS.count == 0 {
+            return;
+        }
+        buf_fmt(cx.asm, f"{cstr(local_prefix())}dbg.text_end:\n");
+    }
+}
+
+// ---- The sections ----
+
+fn section(cx: sink *FnCtx, name: *u8) {
+    unsafe {
+        if ELF {
+            buf_str(cx.asm, c"\n.section .");
+            buf_str(cx.asm, name);
+            buf_str(cx.asm, c",\"\",@progbits\n");
+        } else {
+            buf_str(cx.asm, c"\n.section __DWARF,__");
+            buf_str(cx.asm, name);
+            buf_str(cx.asm, c",regular,debug\n");
+        }
+    }
+}
+
+fn label(cx: sink *FnCtx, name: *u8) {
+    unsafe {
+        buf_fmt(cx.asm, f"{cstr(local_prefix())}{cstr(name)}:\n");
+    }
+}
+
+// `.byte` lines for a list of bytes.
+fn bytes(cx: sink *FnCtx, b: [u8]) {
+    unsafe {
+        var i = 0;
+        while i < b.len as i64 {
+            buf_str(cx.asm, c"    .byte ");
+            var k = 0;
+            while k < 16 && i < b.len as i64 {
+                if k > 0 {
+                    buf_byte(cx.asm, ',');
+                }
+                buf_uint(cx.asm, b[i]);
+                i += 1;
+                k += 1;
+            }
+            buf_byte(cx.asm, '\n');
+        }
+    }
+}
+
+// A null-terminated string, as bytes.
+fn string(b: i64, s: [u8]) {
+    unsafe {
+        buf_bytes(b, s);
+        buf_byte(b, 0);
+    }
+}
+
+fn uleb(b: i64, value: i64) {
+    unsafe {
+        var v = value;
+        loop {
+            let low = v & 127;
+            v = v >> 7;
+            if v == 0 {
+                buf_byte(b, low as u8);
+                return;
+            }
+            buf_byte(b, (low | 128) as u8);
+        }
+    }
+}
+
+// A reference to the start of another debug section: its offset, 0 on
+// Mach-O (one unit per object, not relocated), a relocated label on ELF
+// (the linker concatenates the sections of every object).
+fn section_offset(cx: sink *FnCtx, name: *u8) {
+    unsafe {
+        if ELF {
+            buf_str(cx.asm, c"    .long ");
+            buf_str(cx.asm, local_prefix());
+            buf_str(cx.asm, name);
+            buf_byte(cx.asm, '\n');
+        } else {
+            buf_str(cx.asm, c"    .long 0\n");
+        }
+    }
+}
+
+// A function's label as an operand.
+fn function_symbol(cx: sink *FnCtx, i: i64) {
+    unsafe {
+        let f = DBG_FNS.data[i];
+        // (emit_symbol_ref writes to CODE)
+        let out = cx.code;
+        cx.code = cx.asm;
+        emit_symbol_ref(cx, DBG_PREFIX.data[i] as *u8, FNS[f].name);
+        cx.code = out;
+    }
+}
+
+// .debug_abbrev, .debug_info and the (empty) .debug_line of the program
+// `main_path` (appended to ASM).
+pub fn dbg_sections(cx: sink *FnCtx, main_path: *u8, producer: *u8) {
+    unsafe {
+        if !DEBUG_INFO || DBG_FNS.count == 0 {
+            return;
+        }
+        // The abbreviations: 1 the compile unit, 2 a subprogram, 3 one
+        // without a declaration (from a synthesized source).
+        section(cx, c"debug_abbrev");
+        label(cx, c"dbg.abbrev");
+        let ab = buf_new();
+        let abbrev: [u8; 46] = [
+            1, 0x11, 1, // DW_TAG_compile_unit, children
+            0x25, 0x08, // DW_AT_producer, DW_FORM_string
+            0x13, 0x05, // DW_AT_language, DW_FORM_data2
+            0x03, 0x08, // DW_AT_name, DW_FORM_string
+            0x10, 0x17, // DW_AT_stmt_list, DW_FORM_sec_offset
+            0x1b, 0x08, // DW_AT_comp_dir, DW_FORM_string
+            0x11, 0x01, // DW_AT_low_pc, DW_FORM_addr
+            0x12, 0x06, // DW_AT_high_pc, DW_FORM_data4
+            0, 0,
+            2, 0x2e, 0, // DW_TAG_subprogram, no children
+            0x03, 0x08, // DW_AT_name, DW_FORM_string
+            0x11, 0x01, // DW_AT_low_pc, DW_FORM_addr
+            0x12, 0x06, // DW_AT_high_pc, DW_FORM_data4
+            0x3a, 0x0f, // DW_AT_decl_file, DW_FORM_udata
+            0x3b, 0x0f, // DW_AT_decl_line, DW_FORM_udata
+            0, 0,
+            3, 0x2e, 0, // DW_TAG_subprogram, no children
+            0x03, 0x08, // DW_AT_name, DW_FORM_string
+            0x11, 0x01, // DW_AT_low_pc, DW_FORM_addr
+            0x12, 0x06, // DW_AT_high_pc, DW_FORM_data4
+            0, 0,
+            0,
+        ];
+        buf_bytes(ab, abbrev[0..46]);
+        bytes(cx, buf_slice(ab));
+        // The compile unit.
+        section(cx, c"debug_info");
+        label(cx, c"dbg.info");
+        buf_fmt(cx.asm, f"    .long {cstr(local_prefix())}dbg.info_end - {cstr(local_prefix())}");
+        buf_str(cx.asm, c"dbg.info_start\n");
+        label(cx, c"dbg.info_start");
+        let version = buf_new();
+        buf_byte(version, 4);
+        buf_byte(version, 0);
+        bytes(cx, buf_slice(version));
+        section_offset(cx, c"dbg.abbrev");
+        let b = buf_new();
+        buf_byte(b, 8);
+        buf_byte(b, 1);
+        string(b, producer[0..strlen(producer) as i64]);
+        // DW_LANG_C99: the closest the debuggers know.
+        buf_byte(b, 0x0c);
+        buf_byte(b, 0);
+        string(b, main_path[0..strlen(main_path) as i64]);
+        bytes(cx, buf_slice(b));
+        section_offset(cx, c"dbg.line");
+        // (0.18) DW_AT_comp_dir: the root file's directory, which the
+        // file names are relative to (out_path), not the current one.
+        let dir = buf_new();
+        let root = root_dir();
+        if root[0] != 0 {
+            string(dir, root[0..strlen(root) as i64]);
+        } else {
+            string(dir, c"."[0..1]);
+        }
+        bytes(cx, buf_slice(dir));
+        buf_str(cx.asm, c"    .quad ");
+        function_symbol(cx, 0);
+        buf_fmt(cx.asm, f"\n    .long {cstr(local_prefix())}dbg.text_end - ");
+        function_symbol(cx, 0);
+        buf_byte(cx.asm, '\n');
+        // The functions.
+        for i in 0..DBG_FNS.count {
+            let f = DBG_FNS.data[i];
+            let pos = DBG_POS.data[i];
+            let file = if pos >= 0 && pos < SRC_END { file_of(pos) } else { -1 };
+            let declared = file >= 0 && file < FILE_NUMBERS.count && FILE_NUMBERS.data[file] > 0;
+            let s = buf_new();
+            buf_byte(s, if declared { 2 } else { 3 });
+            let display = FNS[f].display;
+            string(s, if display > 0 { SYMS[display].text } else { SYMS[FNS[f].name].text });
+            bytes(cx, buf_slice(s));
+            buf_str(cx.asm, c"    .quad ");
+            function_symbol(cx, i);
+            buf_str(cx.asm, c"\n    .long ");
+            end_label(cx.asm, i);
+            buf_str(cx.asm, c" - ");
+            function_symbol(cx, i);
+            buf_byte(cx.asm, '\n');
+            if declared {
+                let d = buf_new();
+                uleb(d, FILE_NUMBERS.data[file]);
+                uleb(d, line_index(pos) - line_index(FILES[file].start) + 1);
+                bytes(cx, buf_slice(d));
+            }
+        }
+        let end = buf_new();
+        buf_byte(end, 0);
+        bytes(cx, buf_slice(end));
+        label(cx, c"dbg.info_end");
+        // The line program goes here (written by the assembler).
+        section(cx, c"debug_line");
+        label(cx, c"dbg.line");
+    }
+}
+
+// ---- Placing the `.loc`s, and call frame information ----
+
+// Whether bytes [a, b) of `t` are an instruction: an indented line that is
+// neither a directive nor a label.
+fn is_instruction(t: *u8, a: i64, b: i64) -> bool {
+    unsafe {
+        var i = a;
+        while i < b && (t[i] == ' ' || t[i] == '\t') {
+            i += 1;
+        }
+        if i == a || i >= b || t[i] == '.' {
+            return false;
+        }
+        t[b - 1] != ':'
+    }
+}
+
+// Whether bytes [a, b) of `t` are the directive `word` (indented or not)
+// followed by a space.
+fn is_directive(t: *u8, a: i64, b: i64, word: *u8) -> bool {
+    unsafe {
+        var i = a;
+        while i < b && (t[i] == ' ' || t[i] == '\t') {
+            i += 1;
+        }
+        let n = strlen(word) as i64;
+        i + n < b && memcmp(&t[i], word, n as u64) == 0 && t[i + n] == ' '
+    }
+}
+
+// Whether bytes [a, b) of `t` are exactly `s`.
+fn line_is(t: *u8, a: i64, b: i64, s: *u8) -> bool {
+    unsafe {
+        let n = strlen(s) as i64;
+        b - a == n && memcmp(&t[a], s, n as u64) == 0
+    }
+}
+
+// The next line from `i` that is not a `.loc`: its start, its end in `end`.
+fn next_line(t: *u8, n: i64, i: i64, end: inout i64) -> i64 {
+    unsafe {
+        var a = i;
+        while a < n {
+            var e = a;
+            while e < n && t[e] != '\n' {
+                e += 1;
+            }
+            if !is_directive(t, a, e, c".loc") {
+                end = e;
+                return a;
+            }
+            a = e + 1;
+        }
+        end = n;
+        n
+    }
+}
+
+// The standard prologue: the frame pointer and return address saved, the
+// frame pointer set.
+fn prologue_first() -> *u8 {
+    if X86 { c"    pushq %rbp" } else { c"    stp x29, x30, [sp, #-16]!" }
+}
+
+fn prologue_second() -> *u8 {
+    if X86 { c"    movq %rsp, %rbp" } else { c"    mov x29, sp" }
+}
+
+// Rewrites ASM so that every `.loc` comes right before an instruction: a
+// `.loc` waits for the next instruction (past labels and data), and one
+// replaced by another before it is dropped, as is one repeating the last
+// (in the same function). The system assemblers attach a `.loc` to the
+// next instruction too, but GNU as also makes a row of one followed by
+// another: written this way, every assembler makes the same rows.
+//
+// On Mach-O, every function that sets up the standard frame at its entry
+// gets its call frame information (`.cfi_*`), which the assembler makes
+// compact unwind information of: lldb unwinds through -O0's code (whose
+// pushes and pops of temporaries its instruction-based unwinder takes for a
+// prologue and an epilogue) with it.
+pub fn dbg_place_locs(cx: sink *FnCtx) {
+    unsafe {
+        if !DEBUG_INFO {
+            return;
+        }
+        let t = BUFS[cx.asm].data;
+        let n = BUFS[cx.asm].len;
+        let out = buf_new();
+        buf_reserve(out, n + n / 8);
+        let cfi = !ELF;
+        var in_text = false;
+        var cfi_open = false;
+        // 1: a function's label was just written (its prologue may follow);
+        // 2: its first instruction was the prologue's first one.
+        var fn_state = 0;
+        var pending_start = -1;
+        var pending_end = -1;
+        var last_start = -1;
+        var last_end = -1;
+        var i = 0;
+        while i < n {
+            var e = i;
+            while e < n && t[e] != '\n' {
+                e += 1;
+            }
+            if is_loc(t, i, e) {
+                pending_start = i;
+                pending_end = e;
+                i = e + 1;
+                continue;
+            }
+            let label = e > i && t[e - 1] == ':' && t[i] != ' ';
+            let section = is_directive(t, i, e, c".section") || line_is(t, i, e, c".text")
+                || line_is(t, i, e, c".data");
+            if cfi && cfi_open
+                && (section || (label && (!is_local_label(t, i, e) || is_dbg_end(t, i, e)))) {
+                buf_str(out, c"    .cfi_endproc\n");
+                cfi_open = false;
+            }
+            if section {
+                in_text = is_directive(t, i, e, c".section")
+                    && memcmp(&t[i + 9], c"__TEXT,__text", 13) == 0
+                    || line_is(t, i, e, c".text");
+            }
+            if is_instruction(t, i, e) {
+                var cfi_after = false;
+                if cfi && fn_state == 1 && line_is(t, i, e, prologue_first()) {
+                    var e2 = 0;
+                    let a2 = next_line(t, n, e + 1, &e2);
+                    if line_is(t, a2, e2, prologue_second()) {
+                        buf_str(out, c"    .cfi_startproc\n");
+                        cfi_open = true;
+                        fn_state = 2;
+                    } else {
+                        fn_state = 0;
+                    }
+                } else if fn_state == 2 {
+                    cfi_after = true;
+                    fn_state = 0;
+                } else {
+                    fn_state = 0;
+                }
+                if pending_start >= 0 {
+                    let same = last_start >= 0
+                        && pending_end - pending_start == last_end - last_start
+                        && memcmp(&t[pending_start], &t[last_start], (last_end - last_start) as u64)
+                        == 0;
+                    if !same {
+                        buf_fmt(out, f"{t[pending_start..pending_end]}\n");
+                        last_start = pending_start;
+                        last_end = pending_end;
+                    }
+                    pending_start = -1;
+                }
+                buf_fmt(out, f"{t[i..e]}\n");
+                if cfi_after {
+                    if X86 {
+                        buf_str(out, c"    .cfi_def_cfa_offset 16\n    .cfi_offset %rbp, -16\n    .cfi_def_cfa_register %rbp\n");
+                    } else {
+                        buf_str(out, c"    .cfi_def_cfa w29, 16\n    .cfi_offset w30, -8\n    .cfi_offset w29, -16\n");
+                    }
+                }
+                i = e + 1;
+                continue;
+            }
+            if label && in_text && !is_local_label(t, i, e) {
+                // A function's label: its first row is written even when it
+                // repeats the last one.
+                last_start = -1;
+                fn_state = 1;
+            }
+            buf_fmt(out, f"{t[i..e]}\n");
+            i = e + 1;
+        }
+        if cfi_open {
+            buf_str(out, c"    .cfi_endproc\n");
+        }
+        cx.asm = out;
+    }
+}
+
+fn is_loc(t: *u8, a: i64, b: i64) -> bool {
+    unsafe { is_directive(t, a, b, c".loc") }
+}
+
+// Whether a label is one of the ends dbg_function_end and dbg_text_end
+// write.
+fn is_dbg_end(t: *u8, a: i64, b: i64) -> bool {
+    unsafe {
+        let p = local_prefix();
+        let k = strlen(p) as i64;
+        b - a > k + 7 && memcmp(&t[a + k], c"dbg.end", 7) == 0
+            || b - a > k + 12 && memcmp(&t[a + k], c"dbg.text_end", 12) == 0
+    }
+}
+
+fn is_local_label(t: *u8, a: i64, b: i64) -> bool {
+    unsafe {
+        let p = local_prefix();
+        let k = strlen(p) as i64;
+        b - a > k && memcmp(&t[a], p, k as u64) == 0
+    }
+}

@@ -1,4 +1,4 @@
-# Run by compiler/std/embed.sh over std's source (std.tach and the files
+# Run by compiler/std/embed.sh over std's source (std.vl and the files
 # appended to it, as std_source writes it): the index of its sections,
 # one line each, for the loader (front/modules: std_sections), which lexes
 # only the sections a program can reach (0.15).
@@ -42,11 +42,15 @@ BEGIN {
     # C call include what a callback may do)
     n = split("std::window|Windows and input (0.23)|std::window::keys|Keys (0.23)|std::window::objc|The Objective-C layer (0.23)|std::window::cocoa|The Cocoa backend (0.23)|the view's methods (IMPs) (0.23)|NSTextInputClient (0.23)|the window delegate (0.23)|watched file descriptors (0.23)|classes (0.23)", lz, "|")
     for (i = 1; i <= n; i++) LAZY[lz[i]] = 1
+    # (0.24) std::cli: every section lazy, behind the cli gate: a program
+    # that does not name `cli` reads none of it
+    n = split("std::cli|Arguments and commands (0.24)|Parsing (0.24)|Matches (0.24)|Help and errors (0.24)", lz, "|")
+    for (i = 1; i <= n; i++) LAZY[lz[i]] = 1
     # (0.20) GATES: modules whose items no program reaches without naming
     # the module (no re-export outside it): a word of one of their lazy
     # sections asks for it only from a program that also names the module's
     # gate word, written first in the section's words as `+WORD` (the
-    # loader: front/modules/stdsections.tach), so that a program's own
+    # loader: front/modules/stdsections.vl), so that a program's own
     # `props` or `to_lower` loads no Unicode table.
     GATES["std::str"] = "str"
     GATES["std::unicode"] = "unicode"
@@ -84,6 +88,9 @@ BEGIN {
     GATES["std::window::keys"] = "window"
     GATES["std::window::objc"] = "window"
     GATES["std::window::cocoa"] = "window"
+    # (0.24) std::cli: read only by a program that names `cli`
+    CLOSED["cli"] = 1
+    GATES["std::cli"] = "cli"
     nmod = 0
     TRIGGERS["Iterators (0.14)"] = "Iterator IntoIterator"
     # (0.20: the Iterator trait in std::iter, before its first banner)

@@ -35,7 +35,7 @@ those three bytes (a literal holding `{name}` of a local passed to
 
 ```tach
 fn main(gpa: Gpa) -> i32 {
-    let name = "tachyon";
+    let name = "vole";
     let n = 42;
     let x = 2.5;
     println(f"{name} has {n} and {x}");
@@ -47,9 +47,9 @@ fn main(gpa: Gpa) -> i32 {
 }
 ```
 ```out
-tachyon has 42 and 2.5
+vole has 42 and 2.5
 [    42] [42    ] [000042] [2a] [2A] [101010]
-[  tachyon] [2.500] [A] {braces} 85
+[     vole] [2.500] [A] {braces} 85
 to stderr: 42-43
 ```
 

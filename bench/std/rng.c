@@ -1,6 +1,6 @@
 /* bench/std rng (0.20, A7): xoshiro256++ (the reference C code) seeded by
  * splitmix64, 10^9 next(), then 10^8 draws in [0, n) for n from 1 to 1024
- * by Lemire's method (unsigned __int128): rng.tach's algorithm in C. */
+ * by Lemire's method (unsigned __int128): rng.vl's algorithm in C. */
 #include <stdint.h>
 #include <stdio.h>
 

@@ -1,6 +1,6 @@
 # c-libc-tour
 
-A walk through the C library from tachyon, using nothing but the
+A walk through the C library from vole, using nothing but the
 system's own headers: the environment (`setenv`, `getenv`, `unsetenv`),
 time (`gmtime`, `localtime`, `strftime`, `mktime`, `tzset`), files
 (`fopen`, `fwrite`, `chmod`, `mkdir`, `mkdtemp`) and directories
@@ -13,18 +13,18 @@ With arguments, it lists those directories instead, like a small `ls -l`.
 
 ## Build and run
 
-From this folder (with `tachyonc` on your `PATH`, or as
-`../../target/tachyonc` from a built tree):
+From this folder (with `volec` on your `PATH`, or as
+`../../target/volec` from a built tree):
 
 ```sh
-tachyonc main.tach -o c-libc-tour && ./c-libc-tour
+volec main.vl -o c-libc-tour && ./c-libc-tour
 ./c-libc-tour /etc ~       # list directories instead
 ```
 
 Everything it calls is in the C library, so it links as it is on macOS
 and Linux. `import` needs a C compiler that can preprocess the target's
 headers: building for your own machine always works; cross-compiling
-for Linux from a Mac needs `TACHYON_CC` set to a cross C compiler with a
+for Linux from a Mac needs `VOLE_CC` set to a cross C compiler with a
 Linux sysroot (the compiler says so when it is missing).
 
 ## Expected output
@@ -81,22 +81,22 @@ Every imported header adds to one C module, here called `c`: functions
 `c::FILE`), and integer macros as constants (`c::S_IFMT`, `c::S_IFDIR`).
 The declarations are those of the target's libc: on macOS `struct stat`
 has `st_birthtimespec` and a 16-bit `st_mode`, on Linux neither, and the
-program never has to know. `tachyonc --emit-imports main.tach -o
-decls.tach` writes out what the headers gave, as tachyon source.
+program never has to know. `volec --emit-imports main.vl -o
+decls.vl` writes out what the headers gave, as vole source.
 
 What headers cannot give: function-like macros (`S_ISDIR(m)`: the example
 writes `is_dir` with `S_IFMT` instead), `static inline` functions, and
 `errno` (a macro over `__error()` on macOS, `__errno_location()` on
 Linux).
 
-### Tachyon text and C strings
+### Vole text and C strings
 
-C wants NUL-terminated strings; a tachyon `[u8]` slice is a pointer and a
+C wants NUL-terminated strings; a vole `[u8]` slice is a pointer and a
 length with no NUL. Two small helpers cross the line, each with one
 direction:
 
 ```tach
-// tachyon -> C: copy the bytes and a 0 into a Buf; pass .as_slice().ptr
+// vole -> C: copy the bytes and a 0 into a Buf; pass .as_slice().ptr
 fn cstring(s: [u8], gpa: Gpa) -> Buf {
     var b = Buf::new_in(gpa);
     b.push_str(s);
@@ -104,7 +104,7 @@ fn cstring(s: [u8], gpa: Gpa) -> Buf {
     b
 }
 
-// C -> tachyon: copy the C string into a Buf of our own
+// C -> vole: copy the C string into a Buf of our own
 unsafe fn owned(p: *u8, gpa: Gpa) -> Buf {
     var b = Buf::new_in(gpa);
     b.push_cstr(p);
@@ -127,7 +127,7 @@ fn env(name: [u8], gpa: Gpa) -> Option<Buf> {
 ```
 
 The unsafe C call is wrapped once; the rest of the program uses a safe
-function with a tachyon type. `{greeting:?}` prints the `Option<Buf>`
+function with a vole type. `{greeting:?}` prints the `Option<Buf>`
 with Debug: `Some("hello from setenv")`.
 
 ### Time: struct tm, strftime, TZ
@@ -138,7 +138,7 @@ var long = format_time("%A, %d %B %Y, %H:%M:%S UTC", &utc, gpa);
 ```
 
 `gmtime` and `localtime` return a pointer to a static `struct tm` inside
-the C library; `*` copies it into a tachyon local, after which it is
+the C library; `*` copies it into a vole local, after which it is
 ours. `&when` passes the address of an `i64` where C wants a `time_t *`.
 `format_time` calls `strftime` into a stack array (`[u8; 128]`, passed as
 `&out as *u8`) and keeps the `n` bytes it wrote.
@@ -194,7 +194,7 @@ if unsafe { c::stat(path.as_slice().ptr, &st) } == 0 {
 ```
 
 A generic `zeroed<T>()` would do this for any C struct, and works when
-compiling to an object or an executable; tachyon 0.15's assembly output
+compiling to an object or an executable; vole 0.15's assembly output
 (`-o x.s`) cannot yet name an instance of a generic function at a C type
 (its symbol holds the C module's `<c>`), so the example keeps to one
 type. Assigning
@@ -207,7 +207,7 @@ widening (`u16` to `u32`) is implicit and lossless; narrowing would need
 `write_file` opens with `fopen`, writes the slice with
 `fwrite(text.ptr, 1, text.len as u64, f)` (a slice needs no NUL when its
 length goes along), and sets the mode with `chmod` so the umask does not
-change the output. Tachyon has no octal literals, so `0755` is written
+change the output. Vole has no octal literals, so `0755` is written
 `0x1ed` in a named constant. `mkdtemp` writes the random part of the
 name into its template, so the template is a `Buf` of the program's, not
 a read-only `c"..."` literal.
@@ -226,18 +226,18 @@ a read-only `c"..."` literal.
   buffer for C; copy C strings out (`Buf::push_cstr`) before C reuses
   them.
 - **Memory**: whatever C allocates, C frees (`closedir`, `free`); whatever
-  tachyon allocates (`Buf`, `Vec`), tachyon frees, when it is dropped.
-- **Linking**: all of this is libc, which `tachyonc -o prog` links.
+  vole allocates (`Buf`, `Vec`), vole frees, when it is dropped.
+- **Linking**: all of this is libc, which `volec -o prog` links.
 
 ## Language features
 
 - `import "x.h" as c`, C structs and constants, `c"..."`, C strings:
-  `tachyonc guide c-interop`
+  `volec guide c-interop`
 - `unsafe fn` with a contract, raw pointers, `&x as *u8`:
-  `tachyonc guide unsafe`
-- `defer`, `Buf`, freeing explicitly: `tachyonc guide memory`
+  `volec guide unsafe`
+- `defer`, `Buf`, freeing explicitly: `volec guide memory`
 - `Option` at the boundary, `{x:?}` on an `Option<Buf>`:
-  `tachyonc guide conversions`, `tachyonc guide formatting`
+  `volec guide conversions`, `volec guide formatting`
 - `sort_by`, `filter`, `map`, `sum` with closures:
-  `tachyonc guide iterators`, `tachyonc guide closures`
-- implicit widening (`u16` to `u32`): `tachyonc guide conversions`
+  `volec guide iterators`, `volec guide closures`
+- implicit widening (`u16` to `u32`): `volec guide conversions`

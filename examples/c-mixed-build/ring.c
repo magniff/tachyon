@@ -2,9 +2,9 @@
 #include <stdlib.h>
 
 #include "ring.h"
-/* The tachyon program's own header, written by
- * `tachyonc --emit-header main.tach -o main.h`: it declares on_evict and
- * the EVICTIONS static, which main.tach defines. */
+/* The vole program's own header, written by
+ * `volec --emit-header main.vl -o main.h`: it declares on_evict and
+ * the EVICTIONS static, which main.vl defines. */
 #include "main.h"
 
 Ring *ring_new(size_t cap) {
@@ -34,8 +34,8 @@ void ring_push(Ring *r, int64_t value) {
         int64_t oldest = r->items[r->head];
         r->head = (r->head + 1) % r->cap;
         r->len--;
-        EVICTIONS++;           /* a tachyon static */
-        on_evict(oldest);      /* a tachyon function */
+        EVICTIONS++;           /* a vole static */
+        on_evict(oldest);      /* a vole function */
     }
     r->items[(r->head + r->len) % r->cap] = value;
     r->len++;

@@ -92,12 +92,12 @@ def _calls(r, pred):
     return sum(n for k, n in (r.get("tool_calls_by_kind") or {}).items() if pred(k))
 
 
-VERIFY_KINDS = ("run", "rustc", "tachyonc:build", "tachyonc:check", "tachyonc:test", "suite",
+VERIFY_KINDS = ("run", "rustc", "volec:build", "volec:check", "volec:test", "suite",
                 "compiler:build", "shell:cmp", "shell:diff")
 
 EXTRA = [
     ("verify calls", lambda r: _calls(r, lambda k: k in VERIFY_KINDS)),
-    ("guide calls", lambda r: _calls(r, lambda k: k == "tachyonc:guide")),
+    ("guide calls", lambda r: _calls(r, lambda k: k == "volec:guide")),
     ("query context", lambda r: sum(1 for t in (_an(r, ["sequence"], []) or [])
                                     if t == "query:context")),
     ("denials", lambda r: r.get("permission_denials") or 0),

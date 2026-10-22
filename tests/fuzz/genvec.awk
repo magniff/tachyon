@@ -1,4 +1,4 @@
-# Writes a random tachyon program of loops the vectorizer takes (0.10):
+# Writes a random vole program of loops the vectorizer takes (0.10):
 # reductions (+ - * & | ^ on integers; + on floats, which stay scalar),
 # maps over slices (lanewise + - * / & | ^ and negation of loads,
 # invariants and constants, at offsets of -1, 0 or 1), stencils, and

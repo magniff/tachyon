@@ -59,4 +59,4 @@ The hidden tests include n = 1, all values equal (m = 1), q much larger
 than n, m = 2, the largest seed, and several inputs with n and q near
 2,000,000 and m from 1,000 to 1,000,000,000. Each test has a time limit
 of a few seconds.
-<!-- reference times on the task author's machine (Apple silicon), largest test (n = q = 2e6): Rust 0.18 s, tachyon 0.37 s; limit 4 s -->
+<!-- reference times on the task author's machine (Apple silicon), largest test (n = q = 2e6): Rust 0.18 s, vole 0.37 s; limit 4 s -->

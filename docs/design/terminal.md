@@ -1,4 +1,4 @@
-# tachyon 0.23 design: windows and input in std (`std::window`), and a terminal emulator (`examples/term`)
+# vole 0.23 design: windows and input in std (`std::window`), and a terminal emulator (`examples/term`)
 
 This document builds on the 0.22 design (docs/design/gpu.md, same
 branch): `std::objc`, `std::gpu`, the OS-specific module files (C1), std
@@ -32,14 +32,14 @@ below is taken as recommended and listed in the last section.
 - **No threads before 0.21.** A pty can still be served on one thread
   with `poll`, inside the window's event loop.
 
-### 1.2 Spike: Core Text rasterization from tachyon (2026-10-16)
+### 1.2 Spike: Core Text rasterization from vole (2026-10-16)
 
 `import "CoreText/CoreText.h" as c;` with `-I` pointing at a directory of
 symlinks to the SDK's framework `Headers` (C4 makes this automatic). The
 program does the following:
 - `CFStringCreateWithCString`, then `CTFontCreateWithName("Menlo", 24)`;
 - `CGColorSpaceCreateDeviceGray`, then `CGBitmapContextCreate` over a
-  tachyon array of 20×30 bytes;
+  vole array of 20×30 bytes;
 - `CTFontGetGlyphsForCharacters`, then `CTFontDrawGlyphs` at
   `(2, descent)`;
 - it prints the coverage as ASCII art.
@@ -152,7 +152,7 @@ so (`precise: false`) rather than guessing.
   - Events are drained with
     `nextEventMatchingMask:untilDate:inMode:dequeue:` and `sendEvent:`,
     inside an autorelease pool per batch.
-  - The view subclass (`TachyonView`) implements the input methods,
+  - The view subclass (`VoleView`) implements the input methods,
     `NSTextInputClient`, `makeBackingLayer` (a `CAMetalLayer`),
     `acceptsFirstResponder`, `setFrameSize:` (live resize) and the
     display link's selector. Its IMPs push events onto the app's queue,
@@ -171,8 +171,8 @@ so (`precise: false`) rather than guessing.
     are O3.
 - **X11.** xcb and xkbcommon-x11, through `import`, the XKB extension and
   `_NET_WM` hints.
-- **Each backend is an OS-specific file:** `window/cocoa.macos.tach`,
-  and `window/linux.linux.tach`, which picks Wayland when
+- **Each backend is an OS-specific file:** `window/cocoa.macos.vl`,
+  and `window/linux.linux.vl`, which picks Wayland when
   `WAYLAND_DISPLAY` is set and X11 otherwise. Both implement
   `trait window::Backend`, the 0.22 pattern.
 - **Order and scope:** Cocoa, then Wayland, then X11, all three in
@@ -183,7 +183,7 @@ so (`precise: false`) rather than guessing.
 
 ## 3. `examples/term` (decided)
 
-A terminal emulator in tachyon, measured against Alacritty. It is an
+A terminal emulator in vole, measured against Alacritty. It is an
 example program: its job is to prove std (0.20–0.23) on a real program,
 and to report what the language and tools lacked to the "Toward 1.0"
 rework.
@@ -192,30 +192,30 @@ rework.
 
 ```
 examples/term/
-  main.tach            options, config, the event loop (pull), wiring
-  pty.tach             forkpty, the child, resize, non-blocking reads and writes
+  main.vl            options, config, the event loop (pull), wiring
+  pty.vl             forkpty, the child, resize, non-blocking reads and writes
   vt/                  the parser: no allocation, no I/O, no knowledge of the grid
-    table.tach         the state machine (Paul Williams' DEC parser, as vte), byte classes
-    params.tach        CSI parameters and sub-parameters (fixed arrays)
-    utf8.tach          the UTF-8 decoder (invalid sequences -> U+FFFD)
-    mod.tach           `Parser::advance<P: Perform>(p: &mut P, bytes: [u8])`, `trait Perform`
+    table.vl         the state machine (Paul Williams' DEC parser, as vte), byte classes
+    params.vl        CSI parameters and sub-parameters (fixed arrays)
+    utf8.vl          the UTF-8 decoder (invalid sequences -> U+FFFD)
+    mod.vl           `Parser::advance<P: Perform>(p: &mut P, bytes: [u8])`, `trait Perform`
   term/                the terminal state: implements Perform
-    cell.tach          Cell, Color, Flags
-    grid.tach          rows, the ring of scrollback, damage
-    screen.tach        cursor, modes, scroll regions, tabs, charsets, primary/alternate
-    ops.tach           every control function (CSI/ESC/OSC dispatch)
-    reflow.tach        resize with reflow
-    select.tach        selection (cells, words, lines, blocks)
-    width.tach         display width (a generated table until 0.20's std::text)
+    cell.vl          Cell, Color, Flags
+    grid.vl          rows, the ring of scrollback, damage
+    screen.vl        cursor, modes, scroll regions, tabs, charsets, primary/alternate
+    ops.vl           every control function (CSI/ESC/OSC dispatch)
+    reflow.vl        resize with reflow
+    select.vl        selection (cells, words, lines, blocks)
+    width.vl         display width (a generated table until 0.20's std::text)
   input/
-    keys.tach          keys -> bytes (xterm encodings, modes)
-    mouse.tach         mouse reporting (X10, normal, button, any, SGR 1006)
+    keys.vl          keys -> bytes (xterm encodings, modes)
+    mouse.vl         mouse reporting (X10, normal, button, any, SGR 1006)
   render/
-    font.macos.tach    Core Text: faces, metrics, fallback, rasterization
-    font.linux.tach    FreeType + fontconfig
-    atlas.tach         shelf packing into atlas pages (R8 coverage, RGBA8 colour)
+    font.macos.vl    Core Text: faces, metrics, fallback, rasterization
+    font.linux.vl    FreeType + fontconfig
+    atlas.vl         shelf packing into atlas pages (R8 coverage, RGBA8 colour)
     cells.wgsl         the one shader (vertex + fragment)
-    renderer.tach      instance buffer ring, damage upload, uniforms, the one draw
+    renderer.vl      instance buffer ring, damage upload, uniforms, the one draw
   bench/               the headless benches and the latency probe (§5)
   oracle/              the Rust harness over alacritty_terminal (§4.2), with its own Cargo.toml
 ```
@@ -300,7 +300,7 @@ keyboard protocol is O4.
   `wide spacer`. A wide character that does not fit at the last column
   wraps, as xterm's does.
 - Combining marks attach to the previous cell's `extra`.
-- Width comes from `term/width.tach`: a two-level table generated from
+- Width comes from `term/width.vl`: a two-level table generated from
   Unicode 16's EastAsianWidth and emoji data by a script in
   examples/term/bench/. It is replaced by 0.20's `std::text` width
   function when that lands (§6.3).
@@ -406,7 +406,7 @@ starts another.
   (0.23):* examples/voltty/render draws through std::gpu (device, queue,
   a surface's frames, storage buffers for the instances and the atlas
   table, the two atlas pages as textures) with `dev.shader_wgsl` on
-  render/cells.wgsl (render/cells.tach holds its text, written by
+  render/cells.wgsl (render/cells.vl holds its text, written by
   render/embed.sh until include_str); the hand-written MSL and the Metal
   shim are gone. With one queue that orders writes (gpu.md §2.11) the
   three per-frame instance buffers became one: a frame writes the
@@ -476,7 +476,7 @@ starts another.
   - the active screen, the scroll region, the modes;
   - the title, and the bytes the terminal wrote back (DSR and DA
     replies).
-- **`term --headless --dump`** prints the same format from the tachyon
+- **`term --headless --dump`** prints the same format from the vole
   terminal: the same size, the same scrollback, no window, no GPU.
 - **The fuzzer** (tests/term-fuzz/run.sh) feeds both the same input and
   compares the dumps after each chunk. The input comes from:
@@ -500,7 +500,7 @@ starts another.
 Alacritty 0.17.0 is on this machine. Each measurement runs both
 terminals with the same font (Menlo 14), the same window size (120×40
 cells at 2× scale) and the same scrollback (10,000). Release builds:
-tachyon -O2.
+vole -O2.
 
 | measure | how | display? | goal |
 |---|---|---|---|
@@ -508,7 +508,7 @@ tachyon -O2.
 | **`cat` throughput** | `time cat 100MB.txt` run as each terminal's command (`-e sh -c '...'`), the elapsed time written to a file; the same with vtebench (cargo-built) inside each terminal | yes | no slower than Alacritty |
 | **memory** | `footprint` of each process: after start-up, with a full scrollback of 10,000 lines × 120 columns, and after a 100 MB `cat` | yes | at most Alacritty's at each point (16-byte cells against 24) |
 | **frame time** | ours: CPU encode time per frame and GPU time (`GPUStartTime`/`GPUEndTime` on the command buffer) under vtebench's dense workload and a full-screen `htop`; Alacritty: the same workloads through the external probe's frame intervals | yes | encode under 0.5 ms for a full redraw of 120×40; frames never miss a 120 Hz deadline under `cat` |
-| **input latency** | an external probe (examples/term/bench/latency, in tachyon): posts a key with `CGEventPost` and watches the window's pixels through ScreenCaptureKit (blocks built by `std::objc`, gpu.md §2.9) until the character appears, typometer's method, 200 samples per terminal; plus our internal key-to-present time (`MTLDrawable` presented time) | yes, and the probe needs **Accessibility and Screen Recording permissions, granted by the user once** | median and 99th percentile no worse than Alacritty |
+| **input latency** | an external probe (examples/term/bench/latency, in vole): posts a key with `CGEventPost` and watches the window's pixels through ScreenCaptureKit (blocks built by `std::objc`, gpu.md §2.9) until the character appears, typometer's method, 200 samples per terminal; plus our internal key-to-present time (`MTLDrawable` presented time) | yes, and the probe needs **Accessibility and Screen Recording permissions, granted by the user once** | median and 99th percentile no worse than Alacritty |
 | **idle CPU** | `top -l` sampling of an idle terminal with a blinking cursor off, then on | yes | 0% with the cursor steady; under 0.5% blinking |
 | **start-up** | time from exec to the first frame presented (internal), and process start to window (probe) | yes | no slower than Alacritty (the pipeline cache, gpu.md §2.10) |
 
@@ -530,7 +530,7 @@ reports only our internal number and says so.
 | `Drop`, `&mut`, views | 0.17 | the final shapes: `App`, `Window`, `Term`, `Pty` owned with `Drop` (closing the fd and killing the child); `Perform` methods take `&mut self`; `Event` stays plain |
 | contracts | 0.18 | `requires` on the grid's coordinate functions (`row < rows`) instead of `validate`; `#[property]` tests (reflow round-trips, selection invariants) |
 | `std::arch` | 0.19 | the NEON fast path of the parser's scan (A19) |
-| `std::text` (UTF-8, display width), `String`, collections, `std::process`/`fs` | 0.20 | `width.tach` replaced by std's; the config file read with std's I/O; the OSC buffer and clipboard on `String`/`Buf` as 0.20 defines them |
+| `std::text` (UTF-8, display width), `String`, collections, `std::process`/`fs` | 0.20 | `width.vl` replaced by std's; the config file read with std's I/O; the OSC buffer and clipboard on `String`/`Buf` as 0.20 defines them |
 | threads, `Mutex`, atomics, a waker | 0.21 | the pty I/O thread (§3.4), `app.waker()`, shader compilation off the main thread |
 
 **The start-now list is long.** The parser, the terminal state, the pty,
@@ -541,7 +541,7 @@ those land, so the two releases' work runs in parallel today.
 
 ### 6.2 Phase 0 (start now; the lead, serial)
 
-- **`compiler/std/window/mod.tach`**: `App`, `Window`, `WindowDesc`,
+- **`compiler/std/window/mod.vl`**: `App`, `Window`, `WindowDesc`,
   `Event` and the key, mouse and IME types, the `trait Backend`, in the
   0.16 form (`self: *T`, `free`), with stub backends that return no
   events.
@@ -565,16 +565,16 @@ Every task is **start now** unless marked.
 
 | task | owns | provides | start |
 |---|---|---|---|
-| **W1 Cocoa** | compiler/std/window/cocoa.macos.tach, window/cocoa/*, objc/tables/{appkit,quartzcore}.objc | §2.2's macOS column: app setup without a bundle, runtime view class, events, `NSTextInputClient`, clipboard, cursor, display link, `CFFileDescriptor` watch, live-resize hook, `CAMetalLayer` | now (on G1's `std::objc`; display for tests) |
-| **W2 Wayland** | window/linux.linux.tach (shared), window/wayland/*, wayland/proto/ (scanner output) | §2.2's Wayland column; tests under weston headless | now (container) |
+| **W1 Cocoa** | compiler/std/window/cocoa.macos.vl, window/cocoa/*, objc/tables/{appkit,quartzcore}.objc | §2.2's macOS column: app setup without a bundle, runtime view class, events, `NSTextInputClient`, clipboard, cursor, display link, `CFFileDescriptor` watch, live-resize hook, `CAMetalLayer` | now (on G1's `std::objc`; display for tests) |
+| **W2 Wayland** | window/linux.linux.vl (shared), window/wayland/*, wayland/proto/ (scanner output) | §2.2's Wayland column; tests under weston headless | now (container) |
 | **W3 X11** | window/x11/* | §2.2's X11 column; tests under Xvfb with XTEST | now (container) |
 | **E1 Parser** | examples/term/vt/* | §3.2: the table, parameters, UTF-8, the ASCII fast path; unit tests per state; no allocation (proven with `query effects`) | now |
 | **E2 Terminal state** | examples/term/term/* | §3.3: cells, grid ring, damage, screen, every control function, alternate screen, wide and combining characters (generated table), reflow, selection | now; width from std after 0.20 |
-| **E3 Pty** | examples/term/pty.tach | §3.4, the single-thread mode; tests with `sh` | now; the thread after 0.21 |
-| **E4 Fonts and atlas** | examples/term/render/{font.macos,font.linux,atlas}.tach | §3.5's fonts and atlas: Core Text (hand-declared externs until C4, then `import`), FreeType + fontconfig in the container | now |
-| **E5 Renderer** | examples/term/render/{renderer.tach,cells.wgsl} | §3.5's draw: instance ring, damage upload, uniforms, cursor and selection, offscreen golden images | now, on G2's hal with hand-written MSL; on `std::gpu` and `cells.wgsl` when G8 and G5 land |
+| **E3 Pty** | examples/term/pty.vl | §3.4, the single-thread mode; tests with `sh` | now; the thread after 0.21 |
+| **E4 Fonts and atlas** | examples/term/render/{font.macos,font.linux,atlas}.vl | §3.5's fonts and atlas: Core Text (hand-declared externs until C4, then `import`), FreeType + fontconfig in the container | now |
+| **E5 Renderer** | examples/term/render/{renderer.vl,cells.wgsl} | §3.5's draw: instance ring, damage upload, uniforms, cursor and selection, offscreen golden images | now, on G2's hal with hand-written MSL; on `std::gpu` and `cells.wgsl` when G8 and G5 land |
 | **E6 Input** | examples/term/input/* | §3.6's encoders as pure functions with their tables; selection-to-text; paste filtering | now; wiring with E7 |
-| **E7 The terminal, assembled** | examples/term/main.tach, config, README | the event loop, config file (font, size, colours, Option-as-Meta), window ↔ term ↔ renderer ↔ pty, live resize, synchronized updates | **needs 0.22 G8 and W1**; the thread after 0.21 |
+| **E7 The terminal, assembled** | examples/term/main.vl, config, README | the event loop, config file (font, size, colours, Option-as-Meta), window ↔ term ↔ renderer ↔ pty, live resize, synchronized updates | **needs 0.22 G8 and W1**; the thread after 0.21 |
 | **E8 Oracle and fuzzing** | examples/term/oracle/*, tests/term-fuzz/* | §4.2: the dump, the generator, the corpus (recorded sessions), reduction, the gate row | now |
 | **E9 Measurement** | examples/term/bench/* | §5: `term-bench` headless against the oracle's timing (now); the latency probe (now, once W1's tables exist); the display runs (after E7) | now / after E7 |
 
@@ -610,7 +610,7 @@ largest (the control functions and reflow), and W1 is the riskiest
 | **A17 values** | after 0.17.0 | `fix --values` on compiler/std/window and examples/term; `impl Drop` for `App`, `Window` (close, release), `Pty` (close the fd, `SIGHUP` the child), `Term`, the atlas; `Perform` methods take `&mut self`; the live-resize hook takes a `&mut` closure |
 | **A18 contracts** | after 0.18.0 | leading `validate` statements become `requires`; `#[property]` tests: reflow to a width and back is identity on logical lines; a selection's text is a substring of the dump; parser chunking does not change the dump |
 | **A19 SIMD** | after 0.19.0 | the parser's printable-run scan on NEON with a scalar fallback, under `has`; the bench shows the gain |
-| **A20 std text and I/O** | after 0.20.0 | `width.tach` deleted for `std::text`'s width; the config read with `std::fs`; the shell path with `std::env`; `String` where 0.20 places it |
+| **A20 std text and I/O** | after 0.20.0 | `width.vl` deleted for `std::text`'s width; the config read with `std::fs`; the shell path with `std::env`; `String` where 0.20 places it |
 | **A21 threads** | after 0.21.0 | the pty I/O thread with `Mutex<Term>` and `app.waker()` (§3.4); the latency and throughput rows measured again in both modes, keeping the faster as the default |
 
 ## 7. Alternatives considered
@@ -672,12 +672,12 @@ largest (the control functions and reflow), and W1 is the riskiest
   `ClassBuilder`.
 - compiler/std/gpu/ (0.22): `RawSurface`, `Surface`, the hal for
   render-to-texture tests.
-- New: compiler/std/window/ (mod.tach, cocoa.macos.tach, cocoa/,
-  linux.linux.tach, wayland/, x11/), examples/term/ (§3.1),
+- New: compiler/std/window/ (mod.vl, cocoa.macos.vl, cocoa/,
+  linux.linux.vl, wayland/, x11/), examples/term/ (§3.1),
   tests/term-fuzz/, tests/window/, tests/examples/term-*.test,
   compiler/guide/window.md.
-- compiler/src/front/cpp/directives.tach (C4: framework headers for Core
-  Text) and back/objfile/output.tach (`-framework`).
+- compiler/src/front/cpp/directives.vl (C4: framework headers for Core
+  Text) and back/objfile/output.vl (`-framework`).
 
 ## Decisions taken (for the user's review)
 

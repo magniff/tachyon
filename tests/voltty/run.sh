@@ -2,7 +2,7 @@
 # The tests of voltty's core (examples/voltty/core) against its oracle,
 # alacritty_terminal 0.26.0 (examples/voltty/core/oracle):
 #
-#   build        voltty and the generator (tests/voltty/gen.tach) at -O2
+#   build        voltty and the generator (tests/voltty/gen.vl) at -O2
 #   regress/N    each reduced case of regress/: N.script through voltty
 #                gives the oracle's dump, N.dump (recorded)
 #   seeds        each line of seeds.txt: the generator's script for the
@@ -29,7 +29,7 @@ export LC_ALL
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 HERE="$ROOT/tests/voltty"
 CORE="$ROOT/examples/voltty/core"
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 SCRIPTS=20
 SECONDS_LIMIT=""
 FIRST=""
@@ -52,8 +52,8 @@ failed=0
 pass() { echo "pass $1"; }
 fail() { echo "FAIL $1"; [ $# -gt 1 ] && echo "    $2"; failed=1; }
 
-if "$COMPILER" -O2 "$CORE/main.tach" -o "$W/voltty" >"$W/build.log" 2>&1 \
-    && "$COMPILER" -O2 "$HERE/gen.tach" -o "$W/gen" >>"$W/build.log" 2>&1; then
+if "$COMPILER" -O2 "$CORE/main.vl" -o "$W/voltty" >"$W/build.log" 2>&1 \
+    && "$COMPILER" -O2 "$HERE/gen.vl" -o "$W/gen" >>"$W/build.log" 2>&1; then
     pass build
 else
     fail build "$(head -5 "$W/build.log")"

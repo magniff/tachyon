@@ -1,6 +1,6 @@
-# The language, the long form (tachyon 0.20)
+# The language, the long form (vole 0.20)
 
-Tachyon is a compiled systems language of values: structs, enums with
+Vole is a compiled systems language of values: structs, enums with
 exhaustive `match`, traits and generics (monomorphized), modules,
 checked slices, `unsafe` raw pointers, exact C interop. A value has one
 owner and is dropped at the end of its scope; a function says what it
@@ -10,16 +10,16 @@ the compiler checks that no two accesses of a value conflict. There
 are no lifetimes to write and no macros. Nothing allocates without an
 allocator, and every function's effects are known (0.16). Safe code
 has no undefined behaviour. This text matches this compiler;
-`tachyonc guide` is the short core of this text, `tachyonc guide TOPIC`
-the detail (topics at the end); `tachyonc guide --full` prints this
+`volec guide` is the short core of this text, `volec guide TOPIC`
+the detail (topics at the end); `volec guide --full` prints this
 topic with std's API in its place.
 
 ## Build and run
 
 ```sh
-tachyonc hello.tach -o hello && ./hello   # executable (cc links it)
-tachyonc hello.tach -o hello.o            # object; `-o x.s`: assembly
-tachyonc check hello.tach                 # errors only, one per line
+volec hello.vl -o hello && ./hello   # executable (cc links it)
+volec hello.vl -o hello.o            # object; `-o x.s`: assembly
+volec check hello.vl                 # errors only, one per line
 ```
 
 ```tach
@@ -35,11 +35,11 @@ hello
 `main` returns the exit status (`fn main()` with no result is 0).
 `fn main(gpa: Gpa)` takes the program's allocator (below), `fn
 main(argc: i32, argv: **u8, gpa: Gpa)` the arguments too. Several files
-on the command line make one program; `mod name;` loads `name.tach`.
+on the command line make one program; `mod name;` loads `name.vl`.
 
-## Rust habits and what tachyon has instead
+## Rust habits and what vole has instead
 
-| Rust | tachyon |
+| Rust | vole |
 |---|---|
 | `String`, `&str` | the same (0.20): `str` (UTF-8 text, a view; `&str` is `str`) and `String` (owned, `String::new_in(gpa)`); bytes are `[u8]`; `c"text"` is a NUL-terminated `*u8` for C |
 | `x: &T`, `x: &mut T`, `x: T` | conventions (0.20): `x: T` (let: read; called `f(v)`), `x: inout T` (called `f(&v)`), `x: sink T` (taken; an owned argument moves); no lifetimes; `*T` is the raw pointer: dereferencing it needs `unsafe`; no `Box` (`guide rust`: the whole mapping) |
@@ -49,7 +49,7 @@ on the command line make one program; `mod name;` loads `name.tach`.
 | `println!("{}", x)`, `format!` | no macros: `println(f"x = {x:>4} {v:?}")`, `format_in(f"..", gpa)` (a `Buf`) (`guide formatting`) |
 | `Vec::new()`, a global allocator | `Vec::new_in(gpa)`: nothing allocates without an allocator; `gpa` comes from `fn main(gpa: Gpa)`, passed down as a parameter (0.16, `guide allocators`) |
 | `Box<T>`, arenas | a `Vec`; `arena_scope(gpa, \|a\| ..)` frees all it allocated at its end; `--check-alloc` traps a use after free |
-| `const fn`, purity | `#[pure]`, `#[no_alloc]`: checked declarations; `tachyonc query effects f` (0.16, `guide effects`) |
+| `const fn`, purity | `#[pure]`, `#[no_alloc]`: checked declarations; `volec query effects f` (0.16, `guide effects`) |
 | `v[i]` on a `Vec` | the same (0.17): `v[i]`, `v[i] = x`, `v[a..b]` index its slice, checked, also through an access (`v: inout Vec<i64>`); `v.get(i)`, `v.set(i, x)` too |
 | closures, `.iter().map()` | the same (0.14): `v.iter().map(\|x\| x * k).sum()`; `F: Fn(i64) -> i64` bounds; no `dyn Fn`, `iter_mut` (`guide closures`, `guide iterators`) |
 | `x?` | the same on `Option` and `Result` (0.15); `impl From<E> for F` converts the error; `main` may return `Result<(), E>` (`guide conversions`) |
@@ -70,7 +70,7 @@ The prelude, in every module without `use`: `Option`, `Some`, `None`,
 `Clone`, `From`, `Into`, `Allocator`. The rest of std is used by path
 (`std::print_int(n)`) or imported (`use std::{Buf, HashMap};`).
 Calling C or an `unsafe fn`, and dereferencing or indexing a raw
-pointer, are allowed only in `unsafe { }` (`tachyonc guide rust`: the
+pointer, are allowed only in `unsafe { }` (`volec guide rust`: the
 full list).
 
 ## Values and types
@@ -280,12 +280,12 @@ objects: dispatch is static.
 
 ## Modules and imports
 
-`mod geometry;` loads geometry.tach (or `mod geometry { ... }` inline);
+`mod geometry;` loads geometry.vl (or `mod geometry { ... }` inline);
 `use geometry::{Rect, area};` imports by name, never `*`. Paths start
 with a name in scope, `crate`, `self`, `super` or `std`. Items are
 private (to their module and its children) unless `pub`; `pub use`
 re-exports. A missing import's error says which `use` line to add, and
-`tachyonc fix` adds it.
+`volec fix` adds it.
 
 ## Slices, arrays, text
 
@@ -313,7 +313,7 @@ fn main() -> i32 {
 17
 world
 starts with hello
-main.tach:16:20: index out of bounds: index 4, length 4
+main.vl:16:20: index out of bounds: index 4, length 4
 ```
 
 An array `[T; N]` is a value (copied by `=`; `a.len()` is N); a slice
@@ -373,9 +373,9 @@ main's `gpa` is where they come from. `arena_scope(gpa, |a| ...)` hands out
 an arena whose memory is all freed when the closure returns.
 `--check-alloc` builds the program with a checking allocator: a use
 after free, a double free, a leak are reported where they happen.
-`tachyonc fix --only alloc016` moves 0.15 code (`Vec::new()`) over.
+`volec fix --only alloc016` moves 0.15 code (`Vec::new()`) over.
 Every function's effects are inferred (`alloc(Gpa) io global panic
-diverge unsafe`): `tachyonc query effects f --why io` shows where;
+diverge unsafe`): `volec query effects f --why io` shows where;
 `#[pure]` or `#[no_alloc]` on a function is checked (`guide effects`,
 `guide allocators`).
 
@@ -385,8 +385,8 @@ one to a `sink` parameter moves it (`.clone()` copies). Pass `v` to a
 to let a function push. A slice from `as_slice` views the vector: using it after the
 vector grew or was dropped is an error (`guide views`). std's API,
 made from its source in this compiler, a
-line per item: `tachyonc guide std#the-api`; each item with its comment:
-`tachyonc guide std#every-item`; one name: `tachyonc guide --find NAME`.
+line per item: `volec guide std#the-api`; each item with its comment:
+`volec guide std#every-item`; one name: `volec guide --find NAME`.
 @STD-API-FULL@
 
 A priority queue is a `BinaryHeap` (the largest first) or a `MinHeap`
@@ -485,7 +485,7 @@ access (a let or inout parameter, an `inout` local, a `let T` / `inout
 T` field) is safe to read and write through wherever it is kept; every
 `*T` is raw, a parameter too (`fix --values` makes a parameter an
 access).
-`tachyonc fix --only unsafe` wraps what needs it; `#[repr(C)]`, callbacks
+`volec fix --only unsafe` wraps what needs it; `#[repr(C)]`, callbacks
 and linking: `guide c-interop`.
 
 ## Errors you will meet first
@@ -494,7 +494,7 @@ and linking: `guide c-interop`.
 |---|---|
 | `unknown type 'char'` (or `Box`) | `u8` (or a `u32` code point), `*T` or `Vec<T>` |
 | `expected type, got '&'`; `expected identifier, got '&'` | `str` for `&str`; `self`, `inout self` or `sink self` for `&self`, `&mut self`, `self` |
-| `conv.rust: '&mut T' is Rust's spelling` (`let mut`, `&mut x`, `move`) | the `try:` line's form: `inout T`, `var`, `&x`, `sink`; `tachyonc fix --suggested` |
+| `conv.rust: '&mut T' is Rust's spelling` (`let mut`, `&mut x`, `move`) | the `try:` line's form: `inout T`, `var`, `&x`, `sink`; `volec fix --suggested` |
 | `conv.marker: 'v' is lent inout here` | `f(&v)`: an inout argument is marked |
 | `conv.marker_extra: '&' marks an argument the callee may change` | `f(v)`: a let or sink argument is not |
 | `own.readonly: writes through 'v' ... read-only (let)` | take it `v: inout T`, called `f(&v)` |
@@ -503,7 +503,7 @@ and linking: `guide c-interop`.
 | `'println!' is a macro call` | no macros: `println(f"{x}")` |
 | `cannot assign to immutable variable 'x'` | `var x` |
 | `cannot index type 'HashMap<K, V>'` | `m.get(k)` (an Option), `m.insert(k, v)` |
-| `allocation is explicit: pass an allocator (try: Vec::new_in(gpa))` | `fn main(gpa: Gpa)`, `gpa` passed down; `tachyonc fix --only alloc016` |
+| `allocation is explicit: pass an allocator (try: Vec::new_in(gpa))` | `fn main(gpa: Gpa)`, `gpa` passed down; `volec fix --only alloc016` |
 | `'for' iterates over ... got 'i64'` | a range: `for x in 0..n`; a Vec, a HashMap, `v.iter()` and ranges as values iterate too (0.14) |
 | `expected '[i64]', got '[i64; 3]'` | pass `a[..]` |
 | `expected 'i32', got 'i64'` | `x as i32`: only widening is implicit |
@@ -511,37 +511,37 @@ and linking: `guide c-interop`.
 | `error[unsafe] calling a C function is unsafe` | `unsafe { ... }` |
 | `undefined variable 'helper' \| help: add 'use ...'` | add the `use` line the help names |
 
-`tachyonc guide errors` has more, each with its fix.
+`volec guide errors` has more, each with its fix.
 
 ## Tools: read and change code through the compiler
 
 ```sh
-tachyonc check [ROOT]                   # all errors, one line each: FILE:L:C: error[KIND] MSG | help: ...
-tachyonc f.tach -o f                    # the same lines when compiling, off a terminal
-tachyonc query show NAME                # an item's source: fn, Type::method, Enum::Variant, FILE:LINE
-tachyonc query def NAME                 # where it is defined, its signature
-tachyonc query refs NAME                # every resolved use (--count, --in FILE)
-tachyonc query items [MODULE]           # a module's items with signatures (std: its API)
-tachyonc query context NAME             # source, what it calls, its types and callers, at once
-tachyonc query effects NAME             # what it may do: alloc(Gpa) io global panic diverge unsafe
-tachyonc try '7 / 2'                    # run a snippet with std: its output, TYPE = VALUE
-tachyonc edit patch NAME --old 'a < b' --new 'a <= b'   # change text inside one item
-tachyonc edit replace NAME < new.tach   # replace an item; edit insert --after NAME; edit delete NAME
-tachyonc fix                            # missing imports, unused, pub, unsafe blocks
-tachyonc undo                           # take the last edit back
-tachyonc refactor rename main::x total  # a local (or FILE:LINE:COL), an item, a field, with every use
+volec check [ROOT]                   # all errors, one line each: FILE:L:C: error[KIND] MSG | help: ...
+volec f.vl -o f                    # the same lines when compiling, off a terminal
+volec query show NAME                # an item's source: fn, Type::method, Enum::Variant, FILE:LINE
+volec query def NAME                 # where it is defined, its signature
+volec query refs NAME                # every resolved use (--count, --in FILE)
+volec query items [MODULE]           # a module's items with signatures (std: its API)
+volec query context NAME             # source, what it calls, its types and callers, at once
+volec query effects NAME             # what it may do: alloc(Gpa) io global panic diverge unsafe
+volec try '7 / 2'                    # run a snippet with std: its output, TYPE = VALUE
+volec edit patch NAME --old 'a < b' --new 'a <= b'   # change text inside one item
+volec edit replace NAME < new.vl   # replace an item; edit insert --after NAME; edit delete NAME
+volec fix                            # missing imports, unused, pub, unsafe blocks
+volec undo                           # take the last edit back
+volec refactor rename main::x total  # a local (or FILE:LINE:COL), an item, a field, with every use
 ```
 
 They pay off on renames, moves, signature changes, errors across files
 and large code; a small file is cheaper read whole (`query show
-FILE.tach`). ROOT is `--root FILE`, a last argument ending in `.tach`,
-or `./main.tach`. Every edit is checked first: one that adds an error
+FILE.vl`). ROOT is `--root FILE`, a last argument ending in `.vl`,
+or `./main.vl`. Every edit is checked first: one that adds an error
 writes nothing. A problem is one line, `error CODE: message`, then
 `try:` lines to run as they are (`guide tools`).
 
 ## Topics
 
-`tachyonc guide TOPIC` prints one; `tachyonc guide --list` gives their
-sizes; `tachyonc guide --all` prints everything.
+`volec guide TOPIC` prints one; `volec guide --list` gives their
+sizes; `volec guide --all` prints everything.
 
 @TOPICS@

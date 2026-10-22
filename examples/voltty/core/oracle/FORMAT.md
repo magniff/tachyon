@@ -48,4 +48,4 @@ end
 - BYTES: printable ASCII as itself, the rest `\xNN`.
 - Colour queries (OSC 4/10/11/12 `?`) are answered after each `D` (as
   Alacritty's window answers them after a batch), with the colours set,
-  else a fixed palette (`default_color` in term/mod.tach).
+  else a fixed palette (`default_color` in term/mod.vl).

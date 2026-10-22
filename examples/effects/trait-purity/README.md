@@ -32,7 +32,7 @@ this directory, and its output is checked against this file;
 ## Run it
 
 ```console
-$ tachyonc main.tach -o words && ./words
+$ volec main.vl -o words && ./words
 26 words, 13 different
   5 The
   4 cat
@@ -45,7 +45,7 @@ ok: built words
 ## The impls' effects
 
 ```console
-$ tachyonc query effects crate
+$ volec query effects crate
 crate::lower	none
 <crate::Word as Hash>::hash	none
 <crate::Word as Eq>::eq	panic
@@ -65,7 +65,7 @@ and changes `hash` (`edit apply` takes several items' new text, here on
 stdin):
 
 ```console
-$ tachyonc edit apply <<'EOF'
+$ volec edit apply <<'EOF'
 > @@ new before Word
 > // How many times hash was called.
 > static var HASHES: i64 = 0;
@@ -79,9 +79,9 @@ $ tachyonc edit apply <<'EOF'
 >         h
 >     }
 > EOF
-main.tach:23:5: error[effect] 'Word::hash' implements 'Hash::hash', which is #[pure], but it uses a static (global): 'HASHES' at main.tach:24:18 is a static's (global) | help: pass the state in as a parameter, or remove #[pure] (the trait's) | try: tachyonc query effects Word::hash --why global  [edited: <crate::Word as Hash>::hash]
+main.vl:23:5: error[effect] 'Word::hash' implements 'Hash::hash', which is #[pure], but it uses a static (global): 'HASHES' at main.vl:24:18 is a static's (global) | help: pass the state in as a parameter, or remove #[pure] (the trait's) | try: volec query effects Word::hash --why global  [edited: <crate::Word as Hash>::hash]
 error edit.breaks: 1 new error; nothing written
-try: tachyonc edit apply --no-check
+try: volec edit apply --no-check
 [exit 1]
 ```
 
@@ -95,11 +95,11 @@ calls of `insert` and `get` that you make.)
 A debugging print in `eq`:
 
 ```console
-$ tachyonc edit patch Word::eq --old '        if self.text.len() != other.text.len() {' --new '        println(f"comparing {self.text} and {other.text}");
+$ volec edit patch Word::eq --old '        if self.text.len() != other.text.len() {' --new '        println(f"comparing {self.text} and {other.text}");
 >         if self.text.len() != other.text.len() {'
-main.tach:30:5: error[effect] 'Word::eq' implements 'Eq::eq', which is #[pure], but it does io: 'println(f"comparing {self.text} and {other.t..' at main.tach:31:9 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[pure] (the trait's) | try: tachyonc query effects Word::eq --why io  [edited: <crate::Word as Eq>::eq]
+main.vl:30:5: error[effect] 'Word::eq' implements 'Eq::eq', which is #[pure], but it does io: 'println(f"comparing {self.text} and {other.t..' at main.vl:31:9 calls 'std::fmt::println' | help: return the data and let the caller print it, or remove #[pure] (the trait's) | try: volec query effects Word::eq --why io  [edited: <crate::Word as Eq>::eq]
 error edit.breaks: 1 new error; nothing written
-try: tachyonc edit patch Word::eq --old '        if self.text.len() != other.text.len() {' --new '        println(f"comparing {self.text} and {other.text}");
+try: volec edit patch Word::eq --old '        if self.text.len() != other.text.len() {' --new '        println(f"comparing {self.text} and {other.text}");
         if self.text.len() != other.text.len() {' --no-check
 [exit 1]
 ```
@@ -116,13 +116,13 @@ fields, so they are pure when the fields' impls are: every number,
 not make a function's result depend only on its arguments: an impl can
 still read memory through a raw pointer it holds (in `unsafe` code), and
 change what it answers. std's sort is tested with such comparators
-(tests/run/std_sort_adversarial.tach: random, always-less, alternating):
+(tests/run/std_sort_adversarial.vl: random, always-less, alternating):
 they keep their state behind a pointer in each key, which is `unsafe`,
 not `global`. An `Ord` that is not an order leaves a slice in some
 order, never out of bounds.
 
 ## Read more
 
-- `tachyonc guide effects`, section "Declaring" (trait declarations).
-- `tachyonc guide traits`: traits, impls, derive.
+- `volec guide effects`, section "Declaring" (trait declarations).
+- `volec guide traits`: traits, impls, derive.
 - [pure-and-no-alloc](../pure-and-no-alloc/): `#[pure]` on functions.

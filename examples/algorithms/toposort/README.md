@@ -7,7 +7,7 @@ broken; a random DAG of 1,000,000 nodes and 4,000,000 edges sorts in
 about 30 ms, as fast as the same loop in C.
 
 ```sh
-tachyonc examples/algorithms/toposort/main.tach -o toposort && ./toposort
+volec examples/algorithms/toposort/main.vl -o toposort && ./toposort
 ```
 
 ## The problem
@@ -111,7 +111,7 @@ if col[u] == GREY {
 }
 ```
 
-**The build plan** shows tachyon's error handling. Parsing returns
+**The build plan** shows vole's error handling. Parsing returns
 `Result<Plan, PlanError>`; `plan_order` uses `?` twice, once on the
 parse and once (inside `order`) on the sort:
 
@@ -171,29 +171,29 @@ machine, Kahn's algorithm alone:
 
 | | time |
 |---|---|
-| tachyon 0.15, `-O2` (the default) | 29-36 ms |
-| tachyon 0.15, `-O1` | 53 ms |
-| tachyon 0.15, `-O0` | 136 ms |
+| vole 0.15, `-O2` (the default) | 29-36 ms |
+| vole 0.15, `-O1` | 53 ms |
+| vole 0.15, `-O0` | 136 ms |
 | C, `clang -O2` | 31-36 ms |
 
 The loop is memory-bound (each edge touches a random node's in-degree),
-so the bounds checks tachyon adds cost nothing measurable. The whole
+so the bounds checks vole adds cost nothing measurable. The whole
 program, generation and checks included, runs in about 0.3 s.
 
 ## Language features
 
 | feature | where | guide |
 |---|---|---|
-| `Result`, `?`, `map_err` with a closure | `plan_order`, `Plan::order` | `tachyonc guide conversions` |
-| `Option` and `?` | `find_cycle` | `tachyonc guide conversions` |
-| enums with payloads, matched by variant | `PlanError`, `print_plan` | `tachyonc guide syntax` |
-| `HashMap<[u8], i64>`, `split_whitespace` (views, no copies) | `Plan` | `tachyonc guide std` |
-| tuples in `Vec`s, patterns in `for`, `while let`, closures | `Graph::new`, `find_cycle` | `tachyonc guide syntax`, `guide closures` |
-| iterators: `position`, `map`, `collect`, `all`, `any`, `enumerate` | `find_cycle`, `main` | `tachyonc guide iterators` |
-| default arguments | `random_dag` | `tachyonc guide core` |
-| `defer` to free, on every path out | everywhere | `tachyonc guide memory` |
-| f-strings | `print_plan`, `main` | `tachyonc guide formatting` |
-| a C header: `import "time.h" as c;` | `now_ns` | `tachyonc guide c-interop` |
+| `Result`, `?`, `map_err` with a closure | `plan_order`, `Plan::order` | `volec guide conversions` |
+| `Option` and `?` | `find_cycle` | `volec guide conversions` |
+| enums with payloads, matched by variant | `PlanError`, `print_plan` | `volec guide syntax` |
+| `HashMap<[u8], i64>`, `split_whitespace` (views, no copies) | `Plan` | `volec guide std` |
+| tuples in `Vec`s, patterns in `for`, `while let`, closures | `Graph::new`, `find_cycle` | `volec guide syntax`, `guide closures` |
+| iterators: `position`, `map`, `collect`, `all`, `any`, `enumerate` | `find_cycle`, `main` | `volec guide iterators` |
+| default arguments | `random_dag` | `volec guide core` |
+| `defer` to free, on every path out | everywhere | `volec guide memory` |
+| f-strings | `print_plan`, `main` | `volec guide formatting` |
+| a C header: `import "time.h" as c;` | `now_ns` | `volec guide c-interop` |
 
 ## Try
 

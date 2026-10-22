@@ -1,0 +1,664 @@
+// The renderer's headless tests (terminal.md §4.1: "Core Text atlas" and
+// "renderer: a grid rendered to a texture ... compared with a reference
+// image"), run by tests/voltty-render/run.sh from the root of the tree.
+// Each check prints `ok NAME` or `FAIL NAME: why`; the bench prints
+// `bench NAME: numbers`.
+//
+// TERM_RENDER_WRITE=1 rewrites the reference files under ref/ (only the
+// font-independent golden image and the glyph coverages; never from a GPU
+// image alone: the golden is the CPU reference's, and the GPU must match
+// it).
+//
+// `render` is a link to examples/voltty/render:
+// a program's modules sit under its root.
+
+mod count;
+mod cpu;
+mod grid;
+mod image;
+mod render;
+
+use cpu::{Pages, compare, read_pages};
+use grid::TestGrid;
+use image::now_ns;
+use render::font::{BOLD, Font, REGULAR};
+use render::input::{
+    CURSOR_BEAM, CURSOR_BLOCK, CURSOR_HIDDEN, CURSOR_HOLLOW, CURSOR_UNDERLINE, CellGrid, CursorView,
+    DASHED_UNDERLINE, DEFAULT_BG, DEFAULT_FG, DIM, DOTTED_UNDERLINE, DOUBLE_UNDERLINE, HIDDEN,
+    INVERSE, ITALIC, STRIKEOUT, UNDERCURL, UNDERLINE, cell, indexed, named, rgb,
+};
+use render::input::BOLD as F_BOLD;
+use render::renderer::Renderer;
+use std::gpu::{Format, TextureUsage};
+
+extern "C" {
+    fn getenv(name: *u8) -> *u8;
+    // (0.24: the timing case gives way to a loaded machine)
+    fn getloadavg(loads: *f64, n: i32) -> i32;
+    fn sysconf(name: i32) -> i64;
+}
+
+// (0.24) The load average over the last minute, and whether it is above
+// the number of cores (_SC_NPROCESSORS_ONLN: 58 on macOS): a timing is then
+// the load's, not the code's.
+fn overloaded() -> bool {
+    var loads: [f64; 3] = [0.0, 0.0, 0.0];
+    let n = unsafe { getloadavg(&loads[0], 3) };
+    let cores = unsafe { sysconf(58) };
+    n >= 1 && cores > 0 && loads[0] > cores as f64
+}
+
+const REF: [u8] = "tests/voltty-render/ref/";
+
+struct T {
+    failed: i64,
+    gpa: Gpa,
+    write: bool,
+}
+
+impl T {
+    fn check<N: Display, D: Display>(inout self, name: sink N, ok: bool, why: sink D) {
+        if ok {
+            println(f"ok {name}");
+        } else {
+            println(f"FAIL {name}: {why}");
+            self.failed += 1;
+        }
+    }
+}
+
+fn ref_path(name: [u8], b: inout Buf) -> [u8] {
+    b.clear();
+    b.push_str(REF);
+    b.push_str(name);
+    b.as_slice()
+}
+
+// ---- the atlas -----------------------------------------------------------
+
+fn ink(f: Font, g: render::font::Glyph) -> i64 {
+    let px = f.pixels(g.color);
+    let row = f.row_bytes(g.color);
+    var sum = 0;
+    for y in g.y..g.y + g.h {
+        for x in g.x..g.x + g.w {
+            sum += px[y * row + x] as i64;
+        }
+    }
+    sum
+}
+
+// (0.24) The time of the calibration loop on an idle core (us, -O2, an
+// Apple M-series core: about 1.45 ms), and the loop: integer work with no
+// memory, timed, as fast as the core runs now.
+const CALIBRATION_IDLE_US: i64 = 1450;
+
+fn calibration_us() -> i64 {
+    let t0 = now_ns();
+    var x: u64 = 88172645463325252;
+    var acc: u64 = 0;
+    for _ in 0..1000000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        acc ^= x;
+    }
+    let us = (now_ns() - t0) / 1000;
+    // (acc kept, so the loop is not taken away)
+    if acc == 1 {
+        println("calibration");
+    }
+    us
+}
+
+fn test_font(t: T) {
+    var f = match Font::new_in("Menlo", 14.0, 2.0, t.gpa) {
+        Some(f) => f,
+        None => {
+            t.check("font_menlo", false, "Core Text has no Menlo");
+            return;
+        }
+    };
+    let m = f.m;
+    t.check("font_metrics", m.cw == 17 && m.ch == 33 && m.base > m.ch / 2 && m.base < m.ch,
+        f"Menlo 14 at 2x: cell {m.cw}x{m.ch}, baseline {m.base} (want 17x33)");
+    t.check("font_decorations",
+        m.ul_pos > m.base && m.ul_pos + m.ul_thick <= m.ch && m.strike_pos < m.base
+            && m.ul_thick >= 1,
+        f"underline {m.ul_pos}+{m.ul_thick}, strike {m.strike_pos}, baseline {m.base}");
+
+    // The 95 printable ASCII glyphs, timed (the design's budget: 5 ms, on
+    // a core running as fast as an idle one: 0.24 scales it by a
+    // calibration loop timed before and after, so that a loaded machine
+    // (the gate's) slows both; idle, the glyphs take about 0.6 ms).
+    let c0 = calibration_us();
+    let t0 = now_ns();
+    var empty = 0;
+    for c in 33..127 {
+        let g = f.raster(c as u32, REGULAR, 1);
+        if g.w == 0 {
+            empty += 1;
+        }
+    }
+    let us = (now_ns() - t0) / 1000;
+    t.check("font_ascii_inked", empty == 0, f"{empty} printable glyphs have no ink");
+    let c1 = calibration_us();
+    let calib = if c1 > c0 { c1 } else { c0 };
+    let slow = if calib > CALIBRATION_IDLE_US { calib * 100 / CALIBRATION_IDLE_US } else { 100 };
+    let budget = 5000 * slow / 100;
+    t.check("font_ascii_time", us < budget || overloaded(),
+        f"95 glyphs took {us} us (budget {budget} us: 5 ms at {slow}% of the idle calibration's time)");
+    println(f"bench ascii_raster: 94 glyphs in {us} us (calibration {calib} us)");
+
+    // Shapes: 'g' descends below the baseline, 'A' sits on it, '_' is low.
+    let g = f.raster('g' as u32, REGULAR, 1);
+    t.check("font_g_descender", g.y + g.h > m.base + 2,
+        f"g ends at {g.y + g.h}, baseline {m.base}");
+    let a = f.raster('A' as u32, REGULAR, 1);
+    let a_ink = ink(f, a);
+    t.check("font_A_on_baseline", a.y + a.h >= m.base - 1 && a.y + a.h <= m.base + 1,
+        f"A ends at {a.y + a.h}");
+    let ab = f.raster('A' as u32, BOLD, 1);
+    let ab_ink = ink(f, ab);
+    t.check("font_bold_heavier", ab_ink > a_ink * 11 / 10, f"bold A ink {ab_ink}, regular {a_ink}");
+
+    // Fallback: CJK from another face, emoji in colour.
+    var name = Buf::new_in(t.gpa);
+    f.face_for(0x4E2D, &name);
+    t.check("font_cjk_fallback", name.len() > 0 && name.as_slice() != "Menlo-Regular",
+        f"U+4E2D from '{name.as_slice()}'");
+    let cjk = f.raster(0x4E2D, REGULAR, 2);
+    t.check("font_cjk_wide", cjk.w > m.cw && !cjk.color, f"U+4E2D is {cjk.w} px wide");
+    name.clear();
+    f.face_for(0x1F600, &name);
+    let emoji = f.raster(0x1F600, REGULAR, 2);
+    t.check("font_emoji_color", emoji.color && emoji.w > 0,
+        f"U+1F600 from '{name.as_slice()}': colour {emoji.color}");
+
+    // Coverage against the references (Menlo at 28 px), with a tolerance:
+    // Core Text's antialiasing may move by a level between releases.
+    var b = Buf::new_in(t.gpa);
+    let glyphs: [u32; 4] = ['g' as u32, 'A' as u32, '@' as u32, 0x4E2D];
+    let names: [[u8]; 4] = ["menlo28-g.pgm", "menlo28-A.pgm", "menlo28-at.pgm", "menlo28-4e2d.pgm"];
+    for i in 0..4 {
+        let cells = if glyphs[i] > 0x1000 { 2 } else { 1 };
+        let gl = f.raster(glyphs[i], REGULAR, cells);
+        let w = m.cw * cells;
+        let px = f.pixels(false);
+        let row = f.row_bytes(false);
+        var cellpx: Vec<u8> = Vec::new_in(t.gpa);
+        for y in 0..m.ch {
+            for x in 0..w {
+                cellpx.push(px[y * row + x]);
+            }
+        }
+        let path = ref_path(names[i], &b);
+        if t.write {
+            image::write(path, cellpx.as_slice(), w, m.ch, 1, t.gpa);
+        }
+        var want: Vec<u8> = Vec::new_in(t.gpa);
+        match image::read(path, &want, t.gpa) {
+            None => t.check(f"font_ref_{names[i]}", false, "no reference file"),
+            Some((rw, rh, _)) => {
+                var worst = 0;
+                var bad = 0;
+                if rw != w || rh != m.ch {
+                    bad = w * m.ch;
+                } else {
+                    for k in 0..w * m.ch {
+                        var d = want[k] as i64 - cellpx[k] as i64;
+                        if d < 0 {
+                            d = -d;
+                        }
+                        if d > worst {
+                            worst = d;
+                        }
+                        if d > 24 {
+                            bad += 1;
+                        }
+                    }
+                }
+                let _ = gl;
+                t.check(f"font_ref_{names[i]}", bad <= w * m.ch / 50,
+                    f"{bad} texels differ by more than 24 (worst {worst})");
+            }
+        }
+    }
+}
+
+fn test_atlas(t: T) {
+    var r = match Renderer::new_in("Menlo", 14.0, 2.0, Format::Rgba8Unorm, t.gpa) {
+        Ok(r) => r,
+        Err(e) => {
+            t.check("atlas_renderer", false, e.as_slice());
+            return;
+        }
+    };
+    // Entries are stable, distinct, and do not overlap in their page.
+    let a1 = r.lookup('a' as u32, REGULAR, 1);
+    let a2 = r.lookup('a' as u32, REGULAR, 1);
+    let b1 = r.lookup('a' as u32, BOLD, 1);
+    let sp = r.lookup(' ' as u32, REGULAR, 1);
+    t.check("atlas_cached", a1 > 0 && a1 == a2 && b1 != a1 && sp == 0,
+        f"a {a1} {a2}, bold a {b1}, space {sp}");
+    for c in 33..127 {
+        r.lookup(c as u32, REGULAR, 1);
+    }
+    let e = r.lookup(0x1F600, REGULAR, 2);
+    let ee = r.atlas.entry(e);
+    t.check("atlas_color_page", e > 0 && ee[6] == 1 && r.atlas.has_color_page(),
+        f"emoji entry {e} kind {ee[6]}");
+    var overlap = 0;
+    let n = r.atlas.count;
+    for i in 1..n {
+        let p = r.atlas.entry(i);
+        for j in i + 1..n {
+            let q = r.atlas.entry(j);
+            if p[6] == q[6] && p[0] < q[0] + q[2] && q[0] < p[0] + p[2] && p[1] < q[1] + q[3]
+                && q[1] < p[1] + p[3] {
+                overlap += 1;
+            }
+        }
+    }
+    t.check("atlas_no_overlap", overlap == 0, f"{overlap} overlapping entries of {n}");
+
+    // Fill the coverage page with CJK until it is full; it clears.
+    let gen = r.atlas.generation;
+    let t0 = now_ns();
+    var c: u32 = 0x4E00;
+    var full = false;
+    while c < 0x9FFF {
+        let x = r.lookup(c, REGULAR, 2);
+        if x < 0 {
+            full = true;
+            break;
+        }
+        c += 1;
+    }
+    let ms = (now_ns() - t0) / 1000000;
+    let count = r.atlas.count;
+    t.check("atlas_fills", full && count > 1500,
+        f"full {full} after {count} entries ({c - 0x4E00} CJK)");
+    println(f"bench atlas_fill: {count} wide glyphs in {ms} ms");
+    r.atlas.clear();
+    let again = r.lookup('a' as u32, REGULAR, 1);
+    t.check("atlas_clear", r.atlas.generation == gen + 1 && again == 1,
+        f"after clear: entry {again}");
+}
+
+// ---- rendering -------------------------------------------------------------
+
+// A w × h render target the tests read back.
+fn target(r: Renderer, w: i64, h: i64) -> std::gpu::Texture {
+    r.dev.texture(w, h, Format::Rgba8Unorm,
+        usage: TextureUsage::RENDER_ATTACHMENT | TextureUsage::COPY_SRC)
+}
+
+// Renders the renderer's frame into a new w × h texture and reads it.
+fn gpu_frame(r: inout Renderer, w: i64, h: i64, out: inout Vec<u8>) {
+    let tex = target(r, w, h);
+    let view = tex.view();
+    r.render(view);
+    r.read_texture(tex, &out);
+}
+
+// The font-independent scene: backgrounds of every colour form, every
+// decoration, inverse, dim, hidden, the selection and each cursor shape,
+// with no glyph (spaces), and fixed metrics: the image depends on
+// nothing but the shader's rules.
+fn golden_grid(g: inout TestGrid) {
+    let fg = named(DEFAULT_FG);
+    for i in 0..16 {
+        g.set(0, i, cell(32, fg, named(i as u32), 0));
+    }
+    for i in 0..16 {
+        g.set(1, i, cell(32, fg, indexed((16 + i * 15) as u32), 0));
+    }
+    for i in 0..16 {
+        g.set(2, i, cell(32, fg, rgb((i * 16) as u32, 255 - (i * 16) as u32, 128), 0));
+    }
+    let decos: [u16; 7] = [UNDERLINE, DOUBLE_UNDERLINE, UNDERCURL, DOTTED_UNDERLINE,
+        DASHED_UNDERLINE, STRIKEOUT, UNDERLINE | STRIKEOUT];
+    for i in 0..7 {
+        g.set(3, i * 2, cell(32, named(1), named(DEFAULT_BG), decos[i]));
+        g.set(3, i * 2 + 1, cell(32, named(2), named(DEFAULT_BG), decos[i]));
+    }
+    g.set(4, 0, cell(32, named(3), named(4), INVERSE | UNDERLINE));
+    g.set(4, 1, cell(32, named(3), named(4), DIM | UNDERLINE));
+    g.set(4, 2, cell(32, rgb(200, 100, 50), named(0), DIM | UNDERLINE));
+    g.set(4, 3, cell(32, named(3), named(4), HIDDEN | UNDERLINE));
+    g.set(4, 4, cell(32, indexed(196), named(0), DIM | STRIKEOUT));
+}
+
+fn test_golden(t: T) {
+    var r = match Renderer::new_in("Menlo", 14.0, 2.0, Format::Rgba8Unorm, t.gpa) {
+        Ok(r) => r,
+        Err(e) => {
+            t.check("golden_renderer", false, e.as_slice());
+            return;
+        }
+    };
+    r.font.m.cw = 8;
+    r.font.m.ch = 16;
+    r.font.m.base = 12;
+    r.font.m.ul_pos = 13;
+    r.font.m.ul_thick = 2;
+    r.font.m.strike_pos = 8;
+    r.pad_x = 3;
+    r.pad_y = 2;
+    var g = TestGrid::new_in(8, 16, t.gpa);
+    golden_grid(&g);
+    r.update(&g);
+    let w = 16 * 8 + 6;
+    let h = 8 * 16 + 4;
+    var b = Buf::new_in(t.gpa);
+    var gpu: Vec<u8> = Vec::new_in(t.gpa);
+    var cpu: Vec<u8> = Vec::new_in(t.gpa);
+    var want: Vec<u8> = Vec::new_in(t.gpa);
+    var p = read_pages(&r, t.gpa);
+    // Each cursor shape on its own line 5..7 cell, the selection on line 6.
+    let shapes: [i64; 4] = [CURSOR_BLOCK, CURSOR_BEAM, CURSOR_UNDERLINE, CURSOR_HOLLOW];
+    let files: [[u8]; 4] = ["golden-block.ppm", "golden-beam.ppm", "golden-underline.ppm",
+        "golden-hollow.ppm"];
+    for i in 0..4 {
+        r.set_cursor(CursorView { line: 5, col: 2 + i, shape: shapes[i] });
+        r.set_selection(6 * 16 + 3, 7 * 16 + 5);
+        gpu_frame(&r, w, h, &gpu);
+        cpu::render(r, p, w, h, &cpu);
+        let (worst, bad) = compare(gpu.as_slice(), cpu.as_slice(), 0);
+        t.check(f"golden_gpu_cpu_{files[i]}", bad == 0, f"{bad} pixels differ, worst {worst}");
+        // One reference file: the block cursor's frame (the other shapes
+        // are checked against the CPU renderer only).
+        if i > 0 {
+            continue;
+        }
+        let path = ref_path(files[i], &b);
+        if t.write {
+            image::write(path, cpu.as_slice(), w, h, 3, t.gpa);
+        }
+        match image::read(path, &want, t.gpa) {
+            None => t.check(f"golden_ref_{files[i]}", false, "no reference file"),
+            Some(_) => {
+                let (w2, b2) = compare(gpu.as_slice(), want.as_slice(), 0);
+                t.check(f"golden_ref_{files[i]}", b2 == 0,
+                    f"{b2} pixels differ from the reference, worst {w2}");
+            }
+        }
+    }
+}
+
+// A scene with text: ASCII in every style, colours, a wide CJK
+// character, an emoji, and the cursor; the GPU against the CPU
+// reference renderer over the same atlas.
+fn text_grid(g: inout TestGrid) {
+    let fg = named(DEFAULT_FG);
+    let bg = named(DEFAULT_BG);
+    g.text(0, 0, "Hello, terminal! 0123456789 ~!@#$%^&*()", fg, bg, 0);
+    g.text(1, 0, "bold", named(1), bg, F_BOLD);
+    g.text(1, 5, "italic", named(2), bg, ITALIC);
+    g.text(1, 12, "both", named(3), bg, F_BOLD | ITALIC);
+    g.text(1, 17, "under", named(4), bg, UNDERLINE);
+    g.text(1, 23, "curly", named(5), bg, UNDERCURL);
+    g.text(1, 29, "strike", named(6), bg, STRIKEOUT);
+    g.text(2, 0, "inverse", named(3), named(4), INVERSE);
+    g.text(2, 8, "dim", fg, bg, DIM);
+    g.text(2, 12, "rgb", rgb(255, 128, 0), rgb(0, 40, 80), 0);
+    g.text(2, 16, "idx", indexed(46), indexed(17), 0);
+    g.text(3, 0, "wide: \xe4\xb8\xad\xe6\x96\x87 emoji: \xf0\x9f\x98\x80 end", fg, bg, 0);
+    g.text(4, 0, "gjpqy_|", fg, bg, 0);
+}
+
+fn test_text(t: T) {
+    var r = match Renderer::new_in("Menlo", 14.0, 2.0, Format::Rgba8Unorm, t.gpa) {
+        Ok(r) => r,
+        Err(e) => {
+            t.check("text_renderer", false, e.as_slice());
+            return;
+        }
+    };
+    var g = TestGrid::new_in(6, 40, t.gpa);
+    text_grid(&g);
+    r.update(&g);
+    r.set_cursor(CursorView { line: 4, col: 8, shape: CURSOR_BLOCK });
+    r.set_selection(5 * 40 + 2, 5 * 40 + 9);
+    let w = 40 * r.cell_w();
+    let h = 6 * r.cell_h();
+    var gpu: Vec<u8> = Vec::new_in(t.gpa);
+    var cpu: Vec<u8> = Vec::new_in(t.gpa);
+    gpu_frame(&r, w, h, &gpu);
+    var p = read_pages(&r, t.gpa);
+    cpu::render(r, p, w, h, &cpu);
+    let (worst, bad) = compare(gpu.as_slice(), cpu.as_slice(), 1);
+    t.check("text_gpu_cpu", bad == 0, f"{bad} pixels differ by more than 1, worst {worst}");
+    // The glyphs are there: the image has many distinct greys.
+    var levels: [bool; 256] = [false; 256];
+    var i = 0;
+    while i < gpu.len() {
+        levels[gpu[i + 1] as i64] = true;
+        i += 4;
+    }
+    var nl = 0;
+    for k in 0..256 {
+        if levels[k] {
+            nl += 1;
+        }
+    }
+    t.check("text_antialiased", nl > 64, f"{nl} green levels in the image");
+    // TERM_RENDER_SHOW=PATH writes the GPU's image there, to look at.
+    // SAFETY: getenv with a literal name; the result is read up to its NUL.
+    unsafe {
+        let p = getenv(c"TERM_RENDER_SHOW");
+        if p != 0 as *u8 {
+            image::write(render::objc::cstr(p), gpu.as_slice(), w, h, 3, t.gpa);
+        }
+    }
+}
+
+// ---- damage ------------------------------------------------------------
+
+fn same_as_fresh(t: T, name: [u8], r: inout Renderer, g: inout TestGrid) {
+    let w = g.cols * r.cell_w();
+    let h = g.lines * r.cell_h();
+    var a: Vec<u8> = Vec::new_in(t.gpa);
+    var b: Vec<u8> = Vec::new_in(t.gpa);
+    gpu_frame(&r, w, h, &a);
+    var fresh = match Renderer::new_in("Menlo", 14.0, 2.0, Format::Rgba8Unorm, t.gpa) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    // A fresh renderer reads the whole grid without touching its damage.
+    let saved_all = g.all;
+    g.all = true;
+    let saved: Vec<bool> = g.dirty.clone();
+    let saved_scroll = g.scrolled;
+    g.scrolled = 0;
+    fresh.update(&g);
+    g.all = saved_all;
+    for l in 0..g.lines {
+        g.dirty[l] = saved[l];
+    }
+    var sv = saved;
+    g.scrolled = saved_scroll;
+    fresh.set_cursor(r.cursor);
+    fresh.set_selection(r.sel_lo, r.sel_hi);
+    gpu_frame(&fresh, w, h, &b);
+    let (worst, bad) = compare(a.as_slice(), b.as_slice(), 0);
+    t.check(name, bad == 0, f"{bad} pixels differ from a full redraw, worst {worst}");
+}
+
+fn test_damage(t: T) {
+    var r = match Renderer::new_in("Menlo", 14.0, 2.0, Format::Rgba8Unorm, t.gpa) {
+        Ok(r) => r,
+        Err(e) => {
+            t.check("damage_renderer", false, e.as_slice());
+            return;
+        }
+    };
+    var g = TestGrid::new_in(12, 30, t.gpa);
+    for l in 0..12 {
+        var s = format_in(f"line {l} of the screen", t.gpa);
+        g.text(l, 0, s.as_slice(), named(DEFAULT_FG), named(DEFAULT_BG), 0);
+    }
+    r.update(&g);
+    let w = 30 * r.cell_w();
+    let h = 12 * r.cell_h();
+    var img: Vec<u8> = Vec::new_in(t.gpa);
+    gpu_frame(&r, w, h, &img);
+    t.check("damage_first_full", r.stats.rows_built == 12 && r.stats.rows_copied == 12,
+        f"built {r.stats.rows_built}, copied {r.stats.rows_copied}");
+
+    // Nothing changed: nothing to draw.
+    r.update(&g);
+    t.check("damage_idle", !r.dirty() && r.stats.rows_built == 12,
+        f"dirty {r.dirty()}, built {r.stats.rows_built}");
+
+    // One line changes: one row rebuilt, and copied into the next frame's
+    // buffer (which also lacks the first frame's 12).
+    g.text(5, 0, "CHANGED", named(1), named(DEFAULT_BG), F_BOLD);
+    r.update(&g);
+    t.check("damage_one_line", r.dirty() && r.stats.rows_built == 13,
+        f"built {r.stats.rows_built}");
+    same_as_fresh(t, "damage_one_line_image", &r, &g);
+
+    // A cursor move rebuilds nothing.
+    let built = r.stats.rows_built;
+    r.set_cursor(CursorView { line: 3, col: 4, shape: CURSOR_BLOCK });
+    r.update(&g);
+    t.check("damage_cursor", r.dirty() && r.stats.rows_built == built,
+        f"built {r.stats.rows_built - built}");
+    same_as_fresh(t, "damage_cursor_image", &r, &g);
+
+    // A whole-screen scroll by 3: the ring's top moves, the 3 lines that
+    // came in are the only rows built.
+    let built2 = r.stats.rows_built;
+    g.scroll(3);
+    g.text(11, 0, "new bottom line", named(2), named(DEFAULT_BG), 0);
+    r.update(&g);
+    t.check("damage_scroll", r.stats.rows_built - built2 == 3 && r.top == 3,
+        f"built {r.stats.rows_built - built2}, top {r.top}");
+    same_as_fresh(t, "damage_scroll_image", &r, &g);
+
+    // Frames in flight: three buffers; each catches up on the rows it
+    // lacks, and only those.
+    let copied = r.stats.rows_copied;
+    for _ in 0..3 {
+        gpu_frame(&r, w, h, &img);
+    }
+    let per = r.stats.rows_copied - copied;
+    t.check("damage_frames_in_flight", per <= 12 * 3, f"{per} rows copied over 3 frames");
+    same_as_fresh(t, "damage_settled_image", &r, &g);
+
+    // A selection change rebuilds nothing.
+    let built3 = r.stats.rows_built;
+    r.set_selection(30 + 2, 2 * 30 + 7);
+    r.update(&g);
+    t.check("damage_selection", r.dirty() && r.stats.rows_built == built3,
+        f"built {r.stats.rows_built - built3}");
+    same_as_fresh(t, "damage_selection_image", &r, &g);
+}
+
+// ---- the bench -------------------------------------------------------------
+
+fn median(v: inout Vec<i64>) -> i64 {
+    v.sort();
+    v[v.len() / 2]
+}
+
+fn bench(t: T) {
+    var r = match Renderer::new_in("Menlo", 14.0, 2.0, Format::Rgba8Unorm, t.gpa) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let lines = 40;
+    let cols = 120;
+    var g = TestGrid::new_in(lines, cols, t.gpa);
+    // vtebench's dense workload: every cell a printable character with
+    // its own colours.
+    for l in 0..lines {
+        for x in 0..cols {
+            let c = (33 + (l * 7 + x) % 94) as u32;
+            g.set(l, x,
+                cell(c, indexed(((l + x) % 256) as u32), indexed(((l * 3 + x) % 256) as u32),
+                    if x % 5 == 0 { F_BOLD } else { 0 }));
+        }
+    }
+    r.update(&g);
+    let w = cols * r.cell_w();
+    let h = lines * r.cell_h();
+    let tex = target(r, w, h);
+    let view = tex.view();
+    var full: Vec<i64> = Vec::new_in(t.gpa);
+    var walls: Vec<i64> = Vec::new_in(t.gpa);
+    var scroll: Vec<i64> = Vec::new_in(t.gpa);
+    // Allocations inside the timed part of each frame, after the first
+    // ten (warm-up: the bind group, the glyphs' first use).
+    var full_allocs = 0;
+    var scroll_allocs = 0;
+    for i in 0..200 {
+        // A full redraw: every row rebuilt and written, the frame encoded
+        // and submitted; then the time until the GPU is done with it.
+        g.all = true;
+        let a0 = count::allocs();
+        let t0 = now_ns();
+        r.update(&g);
+        r.render(view);
+        let dt = now_ns() - t0;
+        if i >= 10 {
+            full_allocs += count::allocs() - a0;
+        }
+        full.push(dt);
+        r.wait_idle();
+        if i >= 10 {
+            walls.push(now_ns() - t0);
+        }
+    }
+    for i in 0..200 {
+        // A one-line scroll: the ring's top moves, one row is rebuilt.
+        g.scroll(1);
+        g.text(lines - 1, 0, "a new line of output at the bottom of the screen",
+            indexed((i % 256) as u32), named(DEFAULT_BG), 0);
+        let a0 = count::allocs();
+        let t0 = now_ns();
+        r.update(&g);
+        r.render(view);
+        let dt = now_ns() - t0;
+        if i >= 10 {
+            scroll_allocs += count::allocs() - a0;
+        }
+        scroll.push(dt);
+        r.wait_idle();
+    }
+    let f = median(&full);
+    let wl = median(&walls);
+    let sc = median(&scroll);
+    println(f"bench full_redraw_120x40: cpu {f / 1000} us (update + encode)");
+    println(f"bench full_frame_wall: {wl / 1000} us (update, encode, submit, wait)");
+    println(f"bench scroll_1_line_120x40: cpu {sc / 1000} us (update + encode)");
+    println(
+        f"bench allocations: {full_allocs} in 190 full redraws, {scroll_allocs} in 190 scrolls");
+    t.check("bench_encode_budget", f < 500000, f"full redraw encode {f / 1000} us (budget 500 us)");
+    t.check("bench_no_frame_allocations", full_allocs == 0 && scroll_allocs == 0,
+        f"{full_allocs} allocations in full redraws, {scroll_allocs} in scrolls");
+}
+
+fn main(gpa: Gpa) -> i32 {
+    // SAFETY: getenv with a literal name; the result is read only when
+    // not null.
+    let write = unsafe {
+        let p = getenv(c"TERM_RENDER_WRITE");
+        p != 0 as *u8 && p[0] == '1'
+    };
+    var t = T { failed: 0, gpa: gpa, write: write };
+    test_font(t);
+    if std::gpu::Instance::new_in(gpa).adapter().is_err() {
+        println("skip render: no GPU");
+        return 0;
+    }
+    test_atlas(t);
+    test_golden(t);
+    test_text(t);
+    test_damage(t);
+    bench(t);
+    let _ = CURSOR_HIDDEN;
+    if t.failed > 0 { 1 } else { 0 }
+}

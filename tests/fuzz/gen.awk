@@ -1,9 +1,9 @@
-# Writes a random tachyon program: integer arithmetic of every width,
+# Writes a random vole program: integer arithmetic of every width,
 # floats, shifts, comparisons, casts, branches, loops, arrays, pointers and
 # calls; and (unless nonzero=1) the language of 0.3: structs (passed by
 # value too), enums with and without fields, match on integers and enums
 # (literals, ranges, alternatives, bindings, guards), methods and slices.
-# Everything it does is defined in tachyon (wrapping arithmetic, division
+# Everything it does is defined in vole (wrapping arithmetic, division
 # by zero, shift amounts), loops are bounded and indices in range, so
 # every optimization level must print the same.
 #
@@ -28,7 +28,7 @@
 # of their blocks (a log of what ran is printed at the end), if let and
 # while let over the prelude's Option, string slices, and structural ==
 # on structs, tuples, arrays and enums with fields.
-# calls=1 (for the tachyon calling convention of 0.5) adds functions of 3
+# calls=1 (for the vole calling convention of 0.5) adds functions of 3
 # to 12 parameters of every shape (structs, enums, tuples, arrays,
 # scalars) returning aggregates, called directly and through fn pointers,
 # and a recursive one passing aggregates down.
@@ -261,7 +261,7 @@ function lang06_expr(t, depth,    k, w, n, lo, hi, words) {
     if (k == 3) return "((" q_value06(depth) " == " q_value06(depth) ") as " t ")"
     if (k == 4) return "((" r_value06(depth) " != " r_value06(depth) ") as " t ")"
     if (k == 5) return "(([" small06(depth) ", " small06(depth) "] == [" small06(depth) ", " small06(depth) "]) as " t ")"
-    split("tachyon defer slice x ab", words, " ")
+    split("vole defer slice x ab", words, " ")
     w = words[1 + rnd(5)]
     n = length(w)
     if (k == 6) {
@@ -852,7 +852,7 @@ BEGIN {
     print "}"
 }
 
-# ---- The calls mode (0.5: the tachyon calling convention) ----
+# ---- The calls mode (0.5: the vole calling convention) ----
 
 # Aggregate kinds: a struct S0, the enum E, tuples (i64, f64, u8) (three
 # leaves) and (u32 x5) (8-byte chunks), arrays [u8; 3], [f32; 4] (four float

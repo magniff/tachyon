@@ -3,7 +3,7 @@
 A session of the kind an agent runs: a task, the queries that answer it
 without reading every function, one checked refactoring, and a
 declaration that keeps the result true. The program renders a small
-subset of Markdown to HTML (`markup.tach`; `main.tach` renders two
+subset of Markdown to HTML (`markup.vl`; `main.vl` renders two
 documents). The task:
 
 > `markup` makes many small blocks for each document, each freed on its
@@ -20,19 +20,19 @@ program as it is before the session.
 ## 1. Before
 
 ```console
-$ tachyonc main.tach -o render && ./render > before.txt && head -4 before.txt
+$ volec main.vl -o render && ./render > before.txt && head -4 before.txt
 <ul>
 <li><a href="#arenas">Arenas</a></li>
 <li><a href="#why-arenas">Why arenas?</a></li>
 </ul>
 ok: built render
-$ tachyonc --check-alloc main.tach -o render-checked && ./render-checked > /dev/null
+$ volec --check-alloc main.vl -o render-checked && ./render-checked > /dev/null
 ok: built render-checked
 ```
 
 Nothing is left allocated: every value is dropped at the end of its
 scope (0.16's version of this program leaked nine blocks here). They are
-made at five lines of `markup.tach`: the lines' `Vec` (line 11), each
+made at five lines of `markup.vl`: the lines' `Vec` (line 11), each
 heading's id (25), the headings' `Vec` (59), and the HTML's `Buf`, grown
 at lines 49 and 105, which `render` returns and `main` drops after
 printing it. One arena can hold all of them, emptied at once.
@@ -43,7 +43,7 @@ The question "what in this module allocates from `Gpa`?" has an exact
 answer:
 
 ```console
-$ tachyonc query effects crate::markup --has 'alloc(Gpa)'
+$ volec query effects crate::markup --has 'alloc(Gpa)'
 crate::markup::lines	alloc(Gpa) panic
 crate::markup::slug	alloc(Gpa) panic
 crate::markup::inline	alloc(Gpa) panic
@@ -55,15 +55,15 @@ All five functions. Four of them take `gpa: Gpa`; the fifth, `inline`,
 takes no allocator, so a search for `Gpa` misses it:
 
 ```console
-$ tachyonc query refs Gpa --in crate::markup
-# markup.tach
+$ volec query refs Gpa --in crate::markup
+# markup.vl
 10:26	type	markup::lines	fn lines(src: [u8], gpa: Gpa) -> Vec<[u8]> {
 16:27	type	markup::slug	fn slug(title: [u8], gpa: Gpa) -> Buf {
 55:30	type	markup::headings	fn headings(ls: [[u8]], gpa: Gpa) -> Vec<Heading> {
 66:31	type	markup::render	pub fn render(src: [u8], gpa: Gpa) -> Buf {
-$ tachyonc query effects markup::inline --why 'alloc(Gpa)' | head -2
+$ volec query effects markup::inline --why 'alloc(Gpa)' | head -2
 crate::markup::inline	alloc(Gpa) panic
-  'out.push_str(if code { "</code>" } else { "<..' at markup.tach:41:13 grows a Buf
+  'out.push_str(if code { "</code>" } else { "<..' at markup.vl:41:13 grows a Buf
 ```
 
 `inline` appends to a `Buf` it is given, and a `Buf` grows with the
@@ -85,15 +85,15 @@ $ cat > steps.txt <<'EOF'
 > refactor signature markup::headings --type gpa Arena
 > refactor signature markup::render --type gpa Arena
 > EOF
-$ tachyonc refactor --script steps.txt --dry-run | grep ': error'
-main.tach:10:40: error[type error] expected 'Arena', got 'Gpa'  [in crate::main]
-markup.tach:11:25: error[type error] expected 'Gpa', got 'Arena'  [edited: crate::markup::lines]
-markup.tach:31:5: error[type error] expected 'Buf', got 'Buf<Arena>'  [edited: crate::markup::slug]
-markup.tach:56:40: error[type error] expected 'Gpa', got 'Arena'  [edited: crate::markup::headings]
-markup.tach:75:25: error[type error] expected 'inout Buf', got 'inout Buf<Arena>'  [edited: crate::markup::render]
-markup.tach:90:28: error[type error] expected 'inout Buf', got 'inout Buf<Arena>'  [edited: crate::markup::render]
-markup.tach:100:23: error[type error] expected 'inout Buf', got 'inout Buf<Arena>'  [edited: crate::markup::render]
-markup.tach:107:5: error[type error] expected 'Buf', got 'Buf<Arena>'  [edited: crate::markup::render]
+$ volec refactor --script steps.txt --dry-run | grep ': error'
+main.vl:10:40: error[type error] expected 'Arena', got 'Gpa'  [in crate::main]
+markup.vl:11:25: error[type error] expected 'Gpa', got 'Arena'  [edited: crate::markup::lines]
+markup.vl:31:5: error[type error] expected 'Buf', got 'Buf<Arena>'  [edited: crate::markup::slug]
+markup.vl:56:40: error[type error] expected 'Gpa', got 'Arena'  [edited: crate::markup::headings]
+markup.vl:75:25: error[type error] expected 'inout Buf', got 'inout Buf<Arena>'  [edited: crate::markup::render]
+markup.vl:90:28: error[type error] expected 'inout Buf', got 'inout Buf<Arena>'  [edited: crate::markup::render]
+markup.vl:100:23: error[type error] expected 'inout Buf', got 'inout Buf<Arena>'  [edited: crate::markup::render]
+markup.vl:107:5: error[type error] expected 'Buf', got 'Buf<Arena>'  [edited: crate::markup::render]
 warning edit.breaks: 8 new errors (7 in the edited text, 1 in crate::main, which the edit does not change) (dry run)
 ```
 
@@ -140,26 +140,26 @@ $ cat > steps.txt <<'EOF'
 > }
 > END
 > EOF
-$ tachyonc refactor --script steps.txt
-changed parameter gpa to Arena in crate::markup::lines	markup.tach	+1 -1 lines
-changed parameter gpa to Arena in crate::markup::slug	markup.tach	+1 -1 lines
-changed parameter gpa to Arena in crate::markup::headings	markup.tach	+1 -1 lines
-changed parameter gpa to Arena in crate::markup::render	markup.tach	+1 -1 lines
-changed parameter out to inout Buf<Arena> in crate::markup::inline	markup.tach	+1 -1 lines
-changed field id to Buf<Arena> in crate::markup::Heading	markup.tach	+1 -1 lines
-patched crate::markup::lines	markup.tach	+1 -1 lines
-patched crate::markup::slug	markup.tach	+1 -1 lines
-patched crate::markup::headings	markup.tach	+2 -2 lines
-patched crate::markup::render	markup.tach	+1 -1 lines
-renamed parameter gpa to arena of crate::markup::lines	markup.tach	+2 -2 lines
-renamed parameter gpa to arena of crate::markup::slug	markup.tach	+2 -2 lines
-renamed parameter gpa to arena of crate::markup::headings	markup.tach	+3 -3 lines
-renamed parameter gpa to arena of crate::markup::render	markup.tach	+4 -4 lines
-replaced crate::main	main.tach	+8 -1 lines
+$ volec refactor --script steps.txt
+changed parameter gpa to Arena in crate::markup::lines	markup.vl	+1 -1 lines
+changed parameter gpa to Arena in crate::markup::slug	markup.vl	+1 -1 lines
+changed parameter gpa to Arena in crate::markup::headings	markup.vl	+1 -1 lines
+changed parameter gpa to Arena in crate::markup::render	markup.vl	+1 -1 lines
+changed parameter out to inout Buf<Arena> in crate::markup::inline	markup.vl	+1 -1 lines
+changed field id to Buf<Arena> in crate::markup::Heading	markup.vl	+1 -1 lines
+patched crate::markup::lines	markup.vl	+1 -1 lines
+patched crate::markup::slug	markup.vl	+1 -1 lines
+patched crate::markup::headings	markup.vl	+2 -2 lines
+patched crate::markup::render	markup.vl	+1 -1 lines
+renamed parameter gpa to arena of crate::markup::lines	markup.vl	+2 -2 lines
+renamed parameter gpa to arena of crate::markup::slug	markup.vl	+2 -2 lines
+renamed parameter gpa to arena of crate::markup::headings	markup.vl	+3 -3 lines
+renamed parameter gpa to arena of crate::markup::render	markup.vl	+4 -4 lines
+replaced crate::main	main.vl	+8 -1 lines
 script steps.txt: 15 commands	2 files	+21 -14 lines
 $ git diff --stat
- main.tach   |  9 ++++++++-
- markup.tach | 26 +++++++++++++-------------
+ main.vl   |  9 ++++++++-
+ markup.vl | 26 +++++++++++++-------------
  2 files changed, 21 insertions(+), 14 deletions(-)
 ```
 
@@ -179,12 +179,12 @@ that). 0.17.1's arena references close the hole; an
 The same output, and nothing left allocated:
 
 ```console
-$ tachyonc main.tach -o render && ./render | diff before.txt - && echo same output
+$ volec main.vl -o render && ./render | diff before.txt - && echo same output
 same output
 ok: built render
-$ tachyonc --check-alloc main.tach -o render-checked && ./render-checked > /dev/null
+$ volec --check-alloc main.vl -o render-checked && ./render-checked > /dev/null
 ok: built render-checked
-$ tachyonc query effects crate::markup
+$ volec query effects crate::markup
 crate::markup::lines	alloc(Arena) panic
 crate::markup::slug	alloc(Arena) panic
 crate::markup::inline	alloc(Arena) panic
@@ -206,10 +206,10 @@ in, a debugging print. A declaration makes the current set a promise,
 checked on every build:
 
 ```console
-$ tachyonc edit patch markup::render --old 'pub fn render' --new '#[effects(alloc(Arena), panic)]
+$ volec edit patch markup::render --old 'pub fn render' --new '#[effects(alloc(Arena), panic)]
 > pub fn render' --show
-patched crate::markup::render	markup.tach	+1 -0 lines
-// markup.tach:66
+patched crate::markup::render	markup.vl	+1 -0 lines
+// markup.vl:66
 66	#[effects(alloc(Arena), panic)]
 ```
 
@@ -217,19 +217,19 @@ patched crate::markup::render	markup.tach	+1 -0 lines
 guards the whole module. A debugging print three calls down, in `slug`:
 
 ```console
-$ tachyonc edit patch markup::slug --old '    var dash = false;' --new '    eprintln(f"slug of {title}");
+$ volec edit patch markup::slug --old '    var dash = false;' --new '    eprintln(f"slug of {title}");
 >     var dash = false;'
-markup.tach:68:5: error[effect] 'markup::render' is #[effects(alloc(Arena), panic)], but it does io: 'headings(ls.as_slice(), arena)' at markup.tach:71:14 calls 'markup::headings' | help: return the data and let the caller print it, or add 'io' to #[effects(alloc(Arena), panic)] | try: tachyonc query effects markup::render --why io  [in crate::markup::render]
+markup.vl:68:5: error[effect] 'markup::render' is #[effects(alloc(Arena), panic)], but it does io: 'headings(ls.as_slice(), arena)' at markup.vl:71:14 calls 'markup::headings' | help: return the data and let the caller print it, or add 'io' to #[effects(alloc(Arena), panic)] | try: volec query effects markup::render --why io  [in crate::markup::render]
 error edit.breaks: 1 new error (1 in crate::markup::render, which the edit does not change); nothing written
 note edit.together: change crate::markup::render in the same edit: one `edit apply FILE` with a block per item, or `edit patch --pairs FILE` with `@@ NAME` blocks
-try: tachyonc query show crate::markup::render
-try: tachyonc edit patch markup::slug --old '    var dash = false;' --new '    eprintln(f"slug of {title}");
+try: volec query show crate::markup::render
+try: volec edit patch markup::slug --old '    var dash = false;' --new '    eprintln(f"slug of {title}");
     var dash = false;' --no-check
 [exit 1]
 ```
 
 Refused, and nothing written: the edit tools check the program with the
-change before writing it. A build, a `tachyonc check` or the check hook
+change before writing it. A build, a `volec check` or the check hook
 an agent runs after each edit reports the same error.
 
 ## What the agent used
@@ -245,6 +245,6 @@ an agent runs after each edit reports the same error.
 
 ## Read more
 
-- `tachyonc guide effects` and `tachyonc guide allocators`.
-- `tachyonc guide tools`: query, edit, refactor; docs/refactor.md.
+- `volec guide effects` and `volec guide allocators`.
+- `volec guide tools`: query, edit, refactor; docs/refactor.md.
 - [../../tools/](../../tools/): more sessions with the tools.

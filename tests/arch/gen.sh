@@ -3,7 +3,7 @@
 # docs/design/arch.md §6). tests/arch/gen.awk writes, from each table
 # (compiler/arch/portable.def, aarch64.def, x86_64.def), one program per
 # family (the table's `# ---- Family ----` sections, 40 intrinsics at
-# most each): target/arch-tests/arch_<a64|x86|portable>_<family>.tach.
+# most each): target/arch-tests/arch_<a64|x86|portable>_<family>.vl.
 # Each intrinsic is called
 #
 #   - at run time, on inputs the optimizer cannot see: every pair of edge
@@ -21,7 +21,7 @@
 # and each result is compared, lane by lane, with the reference: the
 # table's `semantics` column, translated (compiler/arch/README.md,
 # "Semantics"), or, when the column is prose, `fn ref_NAME` in
-# tests/arch/ref/*.tach. The reference takes the intrinsic's parameters
+# tests/arch/ref/*.vl. The reference takes the intrinsic's parameters
 # (a vector or a slice as its lanes, `[D]`; a scalar as `D`; a constant
 # or an index as `i64`; the slice of a store as `inout [D]`, which it
 # writes) and, for a vector result, the lane `k: i64`, and returns that
@@ -39,20 +39,20 @@
 #
 # usage: tests/arch/gen.sh [-c COMPILER] [-o DIR] [-r N] [-O LEVELS] [-j JOBS] [--check] [FILTER]
 #
-#   -c COMPILER   the tachyonc to build with (default: target/tachyonc)
+#   -c COMPILER   the volec to build with (default: target/volec)
 #   -o DIR        where the programs go (default: target/arch-tests)
 #   -r N          random cases per intrinsic (default 2000; memory forms
 #                 take N / 50 + 4, at every index)
 #   -O LEVELS     the levels to build at, comma-separated (default 0,2)
 #   -j JOBS       builds at once (default: the CPUs, or the slots of
-#                 $TACHYON_JOBSERVER, see tests/run.sh)
+#                 $VOLE_JOBSERVER, see tests/run.sh)
 #   --check       then build, run and check them
 #   FILTER        only the programs whose name contains FILTER
 set -u
 LC_ALL=C
 export LC_ALL
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 OUT="$ROOT/target/arch-tests"
 RANDOM_N=2000
 LEVELS="0,2"
@@ -73,10 +73,10 @@ while [ $# -gt 0 ]; do
 done
 case "$COMPILER" in /*) ;; *) COMPILER="$(pwd)/$COMPILER" ;; esac
 mkdir -p "$OUT"
-rm -f "$OUT"/arch_*.tach
+rm -f "$OUT"/arch_*.vl
 
 # The hand-written references: `NAME PATH` for each `fn ref_NAME(`.
-for f in "$ROOT"/tests/arch/ref/*.tach; do
+for f in "$ROOT"/tests/arch/ref/*.vl; do
     [ -f "$f" ] || continue
     sed -n 's/^fn ref_\([A-Za-z0-9_]*\)(.*/\1/p' "$f" | while read -r n; do echo "$n $f"; done
 done >"$OUT/refs"
@@ -104,7 +104,7 @@ host=$("$COMPILER" --version | sed 's/.*host: \([a-z0-9_]*\)-\([a-z]*\).*/\1/')
 # for without running, or "" for the host. A line `ok ...` or `FAIL ...`.
 build() {
     p=$1 o=$2 t=$3
-    b="$OUT/$(basename "$p" .tach).O$o${t:+.$t}"
+    b="$OUT/$(basename "$p" .vl).O$o${t:+.$t}"
     if [ -n "$t" ]; then
         "$COMPILER" "-O$o" --target "$t" -c "$p" -o "$b.o" >"$b.log" 2>&1 \
             || { echo "FAIL $(basename "$p") -O$o --target $t: $(grep -v '^ok' "$b.log" | head -3)"; return; }
@@ -126,10 +126,10 @@ build() {
     echo "ok $(basename "$p") -O$o"
 }
 
-# The slots: JOBS of them, or the ones $TACHYON_JOBSERVER shares (see
+# The slots: JOBS of them, or the ones $VOLE_JOBSERVER shares (see
 # tests/run.sh).
-if [ -z "$JOBS" ] && [ -n "${TACHYON_JOBSERVER:-}" ] && [ -p "$TACHYON_JOBSERVER" ]; then
-    exec 3<>"$TACHYON_JOBSERVER"
+if [ -z "$JOBS" ] && [ -n "${VOLE_JOBSERVER:-}" ] && [ -p "$VOLE_JOBSERVER" ]; then
+    exec 3<>"$VOLE_JOBSERVER"
 else
     [ -n "$JOBS" ] || JOBS=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
     rm -f "$OUT/slots"

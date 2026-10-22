@@ -1,8 +1,8 @@
 """(0.18) `run.py binaudit DIR... [--expect FILE|MD5]`: which compiler each
 program run used (the 0.17 iterations' iter/binaudit.py, in the tree).
 
-Per run: the md5 the runner recorded (result.json's tachyonc_md5, 0.18)
-and the md5 of `bin-tach/tachyonc` in the workspace root its transcript
+Per run: the md5 the runner recorded (result.json's volec_md5, 0.18)
+and the md5 of `bin-tach/volec` in the workspace root its transcript
 names (its cwd), which is what the agent ran (a stale copy there was the
 0.17 iterations' shared-root bug). Per (model, condition): the binaries
 seen and how many runs each. With --expect, every run must show that md5
@@ -38,7 +38,7 @@ def root_of(rdir, res):
                 if '"cwd"' in line:
                     m = re.search(r'"cwd": ?"([^"]+)"', line)
                     if m:
-                        r = re.search(r"(.*/tachyon-eval/[^/]+)/", m.group(1))
+                        r = re.search(r"(.*/vole-eval/[^/]+)/", m.group(1))
                         if r:
                             return r.group(1)
                         break
@@ -60,8 +60,8 @@ def main(args):
             if res.get("dry_run") or res.get("lang") != "tach":
                 continue
             root = root_of(rdir, res)
-            seen = md5(os.path.join(root, "bin-tach", "tachyonc")) if root else None
-            rec = res.get("tachyonc_md5")
+            seen = md5(os.path.join(root, "bin-tach", "volec")) if root else None
+            rec = res.get("volec_md5")
             got = seen or rec
             key = "%s (recorded %s)" % ((seen or "root gone")[:8], (rec or "-")[:8])
             cells[(res["model"], res["cond"])][key] += 1

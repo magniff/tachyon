@@ -2,17 +2,17 @@
 
 A file is a module. The files on the command line make the root module
 (`crate`); `mod name;` in a module loads its child `name` from
-`name.tach` or `name/mod.tach` next to it (from `a.tach`: `a/name.tach`).
+`name.vl` or `name/mod.vl` next to it (from `a.vl`: `a/name.vl`).
 `mod name { items }` declares one inline.
 
 ```text
-main.tach            mod geometry;  use geometry::shapes::{Shape, area};
-geometry.tach        pub mod shapes;  pub struct Rect { w: i64, h: i64 }
-geometry/shapes.tach pub enum Shape { ... }  pub fn area(s: Shape) -> i64 { ... }
+main.vl            mod geometry;  use geometry::shapes::{Shape, area};
+geometry.vl        pub mod shapes;  pub struct Rect { w: i64, h: i64 }
+geometry/shapes.vl pub enum Shape { ... }  pub fn area(s: Shape) -> i64 { ... }
 ```
 
 ```sh
-tachyonc main.tach -o prog      # loads the modules main.tach names
+volec main.vl -o prog      # loads the modules main.vl names
 ```
 
 ## Visibility
@@ -28,8 +28,8 @@ A path starts with a name in scope, `crate`, `self`, `super` or `std`:
 `geometry::area(s)`, `crate::util::Vec2 { x: 1, y: 2 }`,
 `shapes::Shape::Rect(r)`, `util::Stack::<u8>::new()`.
 
-A path may also start with a sibling module (0.17): in `parser.tach`,
-where `main.tach` has `mod lexer; mod parser;`, `use lexer::{Tok, next};`
+A path may also start with a sibling module (0.17): in `parser.vl`,
+where `main.vl` has `mod lexer; mod parser;`, `use lexer::{Tok, next};`
 is `use crate::lexer::{Tok, next};`, and `lexer::next(..)` or `t:
 lexer::Tok` in code is `crate::lexer::...` the same way. The first
 segment, when the module has no name of its own for it, is a child of its
@@ -89,11 +89,11 @@ their names, as do `extern "C"` items and `#[link_name]`s.
 
 ## Tools
 
-- `tachyonc fix --only imports` adds the `use` lines a program is
+- `volec fix --only imports` adds the `use` lines a program is
   missing (its own items', and std's outside the prelude),
   and `--only unused` removes unused ones.
-- `tachyonc query items` lists every module; `query items MODULE` its
+- `volec query items` lists every module; `query items MODULE` its
   items with signatures.
-- `tachyonc refactor move a::f --to crate::b` moves items, fixing
+- `volec refactor move a::f --to crate::b` moves items, fixing
   imports and `pub`; `refactor rename`, `refactor new-module`,
-  `refactor split` (see `tachyonc guide tools`).
+  `refactor split` (see `volec guide tools`).

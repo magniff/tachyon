@@ -1,6 +1,6 @@
 # C interop
 
-C compatibility is asked for explicitly and then exact. Tachyon's own
+C compatibility is asked for explicitly and then exact. Vole's own
 types and functions have no fixed layout or convention; `#[repr(C)]`
 types and `extern "C"` functions have C's, for the target.
 
@@ -21,7 +21,7 @@ extern "C" {
 }
 
 fn main() -> i32 {
-    let s = c"tachyon";
+    let s = c"vole";
     let n = unsafe { c::strlen(s) } as i64;
     let home = unsafe { getenv(c"NO_SUCH_VARIABLE_HERE") };
     unsafe {
@@ -32,7 +32,7 @@ fn main() -> i32 {
 }
 ```
 ```out
-tachyon has 7 bytes, 1 0.125
+vole has 4 bytes, 1 0.125
 3
 ```
 
@@ -44,8 +44,8 @@ tachyon has 7 bytes, 1 0.125
   `%d` for `i32` and `bool`, `%f` for `f64` (and `f32`), `%s` for `*u8`.
 - Types from C: `int` is `i32`, `long` is `i64`, `char *` and `void *`
   are `*u8`, `size_t` is `u64`, structs are `#[repr(C)]` structs, enums
-  are integer types with constants. `tachyonc --emit-imports prog.tach
-  -o decls.tach` shows what a program's headers declare.
+  are integer types with constants. `volec --emit-imports prog.vl
+  -o decls.vl` shows what a program's headers declare.
 - What headers cannot give: function-like macros, `static inline`
   functions, `errno` (call `__error()` on macOS, `__errno_location()` on
   Linux).
@@ -90,7 +90,7 @@ or `sink` there is `conv.extern`. A C function that writes through a
 pointer takes `p: *T`, and the call passes `&x`, which converts (an
 exclusive loan of `x` for the call).
 
-## C calling tachyon
+## C calling vole
 
 `extern "C" fn` defines a function with C's convention and an unmangled
 symbol; only such a function is a C callback (a plain `fn` is another
@@ -118,13 +118,13 @@ fn main() -> i32 {
 ```
 
 `extern "C" static var COUNT: i64 = 0;` defines a static C can use.
-`tachyonc --emit-header prog.tach -o prog.h` writes the C header of a
+`volec --emit-header prog.vl -o prog.h` writes the C header of a
 program's `extern "C"` functions and statics, with the `#[repr(C)]`
 types they use.
 
 ## Building with C
 
-`tachyonc prog.tach -o prog` links with `cc` (`$TACHYON_CC` instead).
+`volec prog.vl -o prog` links with `cc` (`$VOLE_CC` instead).
 C files, objects (`.o`), archives (`.a`), shared libraries, `-l NAME`
 and `-L DIR` on its command line go to that link, in their order; a C
 file is compiled by `cc` at the program's `-O` level, with its `-I`
@@ -132,13 +132,13 @@ directories. libm is linked when the program calls one of its functions
 (Linux has it apart from libc):
 
 ```sh
-tachyonc prog.tach helper.c -L vendor/lib -l png -o prog
+volec prog.vl helper.c -L vendor/lib -l png -o prog
 ```
 
 `-o prog.o` makes an object instead, for a build that links it itself
 (`cc prog.o helper.o -o prog -lm`).
 
-Reading stdin: std has `read_line` and `read_stdin` (`tachyonc guide
+Reading stdin: std has `read_line` and `read_stdin` (`volec guide
 std`); from C, `getchar()` from `stdio.h`, or `read(0, buf, n)` from
 `unistd.h`, into a `Buf` or an array (not mixed with std's, which
 buffers):

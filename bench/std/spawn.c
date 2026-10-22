@@ -1,6 +1,6 @@
 /* bench/std spawn (0.20): 1000 times, posix_spawn /usr/bin/true with the
  * environment inherited and waitpid, then the number that exited 0 (as
- * spawn.tach). */
+ * spawn.vl). */
 #include <spawn.h>
 #include <stdio.h>
 #include <sys/wait.h>

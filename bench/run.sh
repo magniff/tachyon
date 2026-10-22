@@ -1,26 +1,26 @@
 #!/bin/sh
-# Benchmarks: every bench/*.tach (and examples/md5/main.tach over 8 MB) compiled
-# by tachyon at -O0, -O1 and -O2, by the previous release and the seed when
+# Benchmarks: every bench/*.vl (and examples/md5/main.vl over 8 MB) compiled
+# by vole at -O0, -O1 and -O2, by the previous release and the seed when
 # given, and the C equivalents (bench/*.c) by cc -O2. Prints the fastest of
 # RUNS runs of each, in milliseconds, and checks that all outputs agree;
 # then, for each variant, the geometric mean over the programs with a C
 # version of its time divided by cc -O2's (below 1: faster than C);
-# last (0.14), the time of bench/iterchain.tach (iterator chains) over
-# that of bench/iterloop.tach (the same loops by hand) at -O2, which fails
-# the run above 1.05, and (0.15) the same for bench/fmtloop.tach
-# (f-strings) over bench/fmtints.tach (Buf's push_int), and (0.16) for
-# bench/purecall.tach (calls of pure functions left in loops) over
-# bench/purecall_hoisted.tach (hoisted and merged by hand). Those ratios are
+# last (0.14), the time of bench/iterchain.vl (iterator chains) over
+# that of bench/iterloop.vl (the same loops by hand) at -O2, which fails
+# the run above 1.05, and (0.15) the same for bench/fmtloop.vl
+# (f-strings) over bench/fmtints.vl (Buf's push_int), and (0.16) for
+# bench/purecall.vl (calls of pure functions left in loops) over
+# bench/purecall_hoisted.vl (hoisted and merged by hand). Those ratios are
 # measured on their own, robust to a busy machine: the two -O2 programs
 # run alternately, RUNS rounds of one run each, and each side's time is
 # its fastest round.
 #
 # usage: bench/run.sh [-c COMPILER] [-p PREVIOUS] [-s SEED] [-r RUNS] [-t TARGET]
 #
-#   -c COMPILER   the tachyonc to measure (default: target/tachyonc)
-#   -p PREVIOUS   another tachyonc (e.g. the previous release), at its
+#   -c COMPILER   the volec to measure (default: target/volec)
+#   -p PREVIOUS   another volec (e.g. the previous release), at its
 #                 default level
-#   -s SEED       the seed binary (`tachyon build -O`)
+#   -s SEED       the seed binary (`vole build -O`)
 #   -r RUNS       runs per measurement (default 5)
 #   -t TARGET     the target (default: the host)
 
@@ -28,7 +28,7 @@ set -eu
 LC_ALL=C
 export LC_ALL
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 PREVIOUS=""
 SEED=""
 RUNS=5
@@ -58,7 +58,7 @@ case "$TARGET" in
     *) ARCH=""; SEED_TARGET=linux-x86_64 ;;
 esac
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-bench.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-bench.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 # shellcheck disable=SC2086
@@ -67,7 +67,7 @@ dd if=/dev/zero of="$WORK/md5.in" bs=1048576 count=8 2>/dev/null
 : >"$WORK/empty"
 : >"$WORK/times"
 
-# Builds variant $2 of program $1 (a .tach file) into $3; fails when that
+# Builds variant $2 of program $1 (a .vl file) into $3; fails when that
 # compiler does not know the program's language (the previous release and
 # the seed do not know what came after them).
 build() {
@@ -84,8 +84,8 @@ build() {
         previous) "$PREVIOUS" --target "$TARGET" "$1" -o "$3.s" >/dev/null 2>&1 || return 1 ;;
         seed)
             # The seed knows only 0.2's declarations of C functions.
-            awk -f "$ROOT/tests/seed-compat.awk" "$1" >"$3.tach"
-            "$SEED" build -O --target "$SEED_TARGET" "$3.tach" -o "$3" >/dev/null 2>&1
+            awk -f "$ROOT/tests/seed-compat.awk" "$1" >"$3.vl"
+            "$SEED" build -O --target "$SEED_TARGET" "$3.vl" -o "$3" >/dev/null 2>&1
             return ;;
     esac
     # shellcheck disable=SC2086
@@ -99,8 +99,8 @@ printf "%-10s" "program"
 for v in $VARIANTS; do printf " %9s" "$v"; done
 printf " %9s\n" "cc -O2"
 
-for source in "$ROOT"/bench/*.tach "$ROOT/examples/md5/main.tach"; do
-    name=$(basename "$source" .tach)
+for source in "$ROOT"/bench/*.vl "$ROOT/examples/md5/main.vl"; do
+    name=$(basename "$source" .vl)
     # (an example is a directory: its name)
     [ "$name" = main ] && name=$(basename "$(dirname "$source")")
     input="$WORK/empty"
@@ -159,8 +159,8 @@ awk -v n="$(echo $VARIANTS | wc -w)" '
 # zero cost is a ratio of 1; above 1.05 is a failure. The two run
 # alternately, the fastest of RUNS rounds each (noise from other work on
 # the machine hits both sides alike, and the minimum drops most of it).
-# (0.15) The same for f-strings (bench/fmtloop.tach) against the text
-# made by hand with Buf's push_int (bench/fmtints.tach).
+# (0.15) The same for f-strings (bench/fmtloop.vl) against the text
+# made by hand with Buf's push_int (bench/fmtints.vl).
 # usage: ratio NAME MS OTHER OTHER_MS WHAT
 ratio() {
     a_ms=$2

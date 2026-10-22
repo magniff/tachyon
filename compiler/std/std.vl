@@ -1,0 +1,854 @@
+// The standard library (0.5): the module `std`, built into the compiler
+// (compiler/std/embed.sh makes compiler/src/front/stdsrc.vl from this file,
+// the files it appends and std's modules, std::gpu among them (0.22)). A
+// program that names `std` gets it: `std::Vec<i64>`, `use std::{Buf, Vec};`.
+//
+// This file, the core: Option and Result, a growable vector, a byte
+// buffer, the operator traits, sorting and a hash map.
+// Failures (unwrapping None, an index out of bounds) print a message on
+// stderr and exit with 101, like the language's own checks.
+//
+// Allocation (0.16): Vec, Buf and HashMap take their memory from an
+// allocator, a type parameter (`Vec<T, A: Allocator = Gpa>`, alloc.vl),
+// every growth and free through it.
+//
+// Unsafe code (0.9): the safe functions here have no undefined behaviour
+// as long as a Vec's and a Buf's fields are changed by their methods only
+// (0.16: #[sealed], checked from 0.16's T2), and a slice from `as_slice` (or a
+// HashMap's `get_mut`, `get_or_insert`) is not used after the Vec grows
+// (the map gets a new key) or is freed. The functions taking C strings
+// are `unsafe fn`: the string must end with a NUL.
+
+pub mod ops;
+pub mod iter;
+pub mod slice;
+pub mod collections;
+pub mod io;
+pub mod fmt;
+pub mod num;
+pub mod convert;
+pub mod clone;
+pub mod random;
+pub mod sys;
+pub mod time;
+pub mod hash;
+pub mod str;
+pub mod unicode;
+pub mod sync;
+pub mod thread;
+pub mod objc;
+pub mod gpu;
+pub mod string;
+pub mod path;
+pub mod fs;
+pub mod env;
+pub mod process;
+pub mod window;
+pub mod cli;
+pub use clone::Clone;
+pub use collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+pub use convert::{From, Into};
+use fmt::{fmt_quoted, fmt_signed};
+pub use fmt::{
+    Debug, Display, Fmt, FmtSpec, Interp, __buf_fmt, __buf_fmt_end, __fmt_in_end, __fmt_tmp,
+    __print_begin, __print_end, debug_list, eprint, eprintln, format, format_in, print, print_cstr,
+    print_int, println,
+};
+pub use io::{read_line, read_stdin_in};
+pub use iter::{
+    Enumerate, Filter, HashMapIter, Iterator, Keys, Map, Range, RangeInclusive, SliceIter,
+    SliceRefIter, Take, Values, Zip, sort_by,
+};
+pub use num::{
+    I16_MAX, I16_MIN, I32_MAX, I32_MIN, I64_MAX, I64_MIN, I8_MAX, I8_MIN, U16_MAX, U32_MAX, U64_MAX,
+    U8_MAX, count_ones, leading_zeros, trailing_zeros,
+};
+pub use ops::{Add, Div, Mul, Neg, Sub};
+use slice::{swap_at, swap_raw};
+pub use slice::{sort, sort_stable, sort_stable_by, sort_stable_by_in, sort_stable_in};
+
+// (0.16) Their effects declared: allocation, I/O, none.
+extern "C" {
+    #[effects(alloc(extern))]
+    fn malloc(size: u64) -> *u8;
+    #[effects(alloc(extern))]
+    fn realloc(p: *u8, size: u64) -> *u8;
+    #[effects(alloc(extern))]
+    fn free(p: *u8);
+    #[effects(io)]
+    fn write(fd: i32, data: *u8, count: u64) -> i64;
+    #[effects(io)]
+    fn read(fd: i32, data: *u8, count: u64) -> i64;
+    #[effects(io, diverge)]
+    fn exit(code: i32) -> !;
+    #[effects()]
+    fn memcpy(dst: *u8, src: *u8, n: u64) -> *u8;
+    #[effects()]
+    fn strlen(s: *u8) -> u64;
+    // (0.16) What std's panic calls: its effect is `panic`, not the io of
+    // writing a message and exiting (docs/design/effects-allocation.md
+    // §2.2).
+    #[link_name = "write"]
+    #[effects(panic)]
+    fn panic_write(fd: i32, data: *u8, count: u64) -> i64;
+    #[link_name = "exit"]
+    #[effects(panic)]
+    fn panic_exit(code: i32) -> !;
+}
+
+// Prints `message` (a C string) on stderr and exits with 101.
+pub unsafe fn panic(message: *u8) -> ! {
+    panic_write(2, message, strlen(message));
+    panic_write(2, c"\n", 1);
+    panic_note();
+    panic_exit(101)
+}
+
+// (0.17) The line after a failure's message; a program built with
+// --trace prints the calls that led to the failure instead (the compiler
+// makes this call one of its trace runtime's, compiler/src/middle/trace.vl).
+// (0.18) Without --trace, nothing: a failure is one line.
+fn panic_note() {}
+
+// ---- Option and Result ----
+
+pub enum Option<T> { None, Some(T) }
+
+impl<T> Option<T> {
+    pub fn is_some(self) -> bool {
+        match self {
+            Option::Some(_) => true,
+            Option::None => false,
+        }
+    }
+
+    pub fn is_none(self) -> bool {
+        !self.is_some()
+    }
+
+    pub fn unwrap(sink self) -> T
+        requires self.is_some() else "called unwrap on None"
+    {
+        match self {
+            Option::Some(x) => x,
+            Option::None => unsafe { panic(c"called unwrap on None") },
+        }
+    }
+
+    pub fn unwrap_or(sink self, other: sink T) -> T {
+        match self {
+            Option::Some(x) => x,
+            Option::None => other,
+        }
+    }
+}
+
+pub enum Result<T, E> { Ok(T), Err(E) }
+
+impl<T, E> Result<T, E> {
+    pub fn is_ok(self) -> bool {
+        match self {
+            Result::Ok(_) => true,
+            Result::Err(_) => false,
+        }
+    }
+
+    pub fn is_err(self) -> bool {
+        !self.is_ok()
+    }
+
+    pub fn unwrap(sink self) -> T
+        requires self.is_ok() else "called unwrap on Err"
+    {
+        match self {
+            Result::Ok(x) => x,
+            Result::Err(_) => unsafe { panic(c"called unwrap on Err") },
+        }
+    }
+
+    pub fn unwrap_or(sink self, other: sink T) -> T {
+        match self {
+            Result::Ok(x) => x,
+            Result::Err(_) => other,
+        }
+    }
+
+    pub fn ok(sink self) -> Option<T> {
+        match self {
+            Result::Ok(x) => Option::Some(x),
+            Result::Err(_) => Option::None,
+        }
+    }
+}
+
+// ---- Vec ----
+
+// A growable vector of T, its memory from allocator A (0.16; Gpa, C's
+// malloc, by default); `free` gives its memory back.
+#[sealed]
+pub struct Vec<T, A: Allocator = Gpa> { ptr: *T, len: i64, cap: i64, alloc: A }
+
+impl<T, A: Allocator> Vec<T, A> {
+    // An empty Vec on allocator a (0.16).
+    pub fn new_in(a: sink A) -> Vec<T, A> {
+        Vec { ptr: 0 as *T, len: 0, cap: 0, alloc: a }
+    }
+
+    // An empty Vec on allocator a with room for cap elements (0.16).
+    pub fn with_capacity_in(cap: i64, a: sink A) -> Vec<T, A> {
+        var v: Vec<T, A> = Vec::new_in(a);
+        v.reserve(cap);
+        v
+    }
+
+    pub fn len(self) -> i64 {
+        self.len
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    // Room for `extra` more elements.
+    pub fn reserve(inout self, extra: i64) {
+        if extra > self.cap - self.len && !self.reserve_more(extra) {
+            out_of_memory();
+        }
+    }
+
+    // Grows to room for `extra` (more than it has) more elements: twice the
+    // capacity, or more when needed; false when out of memory.
+    #[inline(never)]
+    fn reserve_more(inout self, extra: i64) -> bool {
+        if extra > ALLOC_LIMIT - self.len {
+            return false;
+        }
+        let cap = grown_cap(self.cap, self.len + extra);
+        let bytes = alloc_bytes(cap, size_of(T));
+        if bytes < 0 {
+            return false;
+        }
+        let p = unsafe {
+            self.alloc.try_resize(self.ptr as *u8, self.cap * size_of(T), bytes, align_of(T))
+        };
+        if p == 0 as *u8 {
+            return false;
+        }
+        self.ptr = p as *T;
+        self.cap = cap;
+        true
+    }
+
+    // Appends the elements of s, which may be a view of this Vec: when it
+    // grows, the elements are copied to the new memory before the old is
+    // freed.
+    #[stores(*s)]
+    pub fn extend_from_slice(inout self, s: [T]) {
+        let n = s.len;
+        var old = 0 as *T;
+        var old_cap = 0;
+        if n > self.cap - self.len {
+            var cap = -1;
+            if n <= ALLOC_LIMIT - self.len {
+                cap = grown_cap(self.cap, self.len + n);
+            }
+            let bytes = alloc_bytes(cap, size_of(T));
+            if bytes < 0 {
+                out_of_memory();
+            }
+            old = self.ptr;
+            old_cap = self.cap;
+            let p = self.alloc.try_alloc(bytes, align_of(T));
+            if p == 0 as *u8 {
+                out_of_memory();
+            }
+            unsafe {
+                self.ptr = p as *T;
+                for i in 0..self.len {
+                    self.ptr[i] = old[i];
+                }
+            }
+            self.cap = cap;
+        }
+        for i in 0..n {
+            unsafe {
+                self.ptr[self.len + i] = s[i];
+            }
+        }
+        self.len += n;
+        unsafe {
+            self.alloc.free(old as *u8, old_cap * size_of(T), align_of(T));
+        }
+    }
+
+    #[stores(x)]
+    pub fn push(inout self, x: sink T) {
+        if self.len == self.cap && !self.reserve_more(1) {
+            out_of_memory();
+        }
+        unsafe {
+            self.ptr[self.len] = x;
+        }
+        self.len += 1;
+    }
+
+    pub fn pop(inout self) -> Option<T> {
+        if self.len == 0 {
+            return Option::None;
+        }
+        self.len -= 1;
+        Option::Some(unsafe { self.ptr[self.len] })
+    }
+
+    // Element i (checked: out of bounds exits with 101).
+    pub fn get(self, i: i64) -> T
+        requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
+    {
+        self.as_slice()[i]
+    }
+
+    #[stores(x)]
+    pub fn set(inout self, i: i64, x: sink T)
+        requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
+    {
+        self.as_mut_slice()[i] = x;
+    }
+
+    // The last element, if there is one (the Vec keeps it; `pop` takes it).
+    pub fn last(self) -> Option<T> {
+        if self.len == 0 { Option::None } else { Option::Some(self.get(self.len - 1)) }
+    }
+
+    // Exchanges elements i and j (checked).
+    pub fn swap(inout self, i: i64, j: i64)
+        requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
+        requires 0 <= j && j < self.len else f"index out of bounds: index {j}, length {self.len}"
+    {
+        swap_at::<T>(self.as_mut_slice(), i, j);
+    }
+
+    // Puts x at index i, 0 to len (checked), moving the elements from i
+    // on up by one.
+    #[stores(x)]
+    pub fn insert(inout self, i: i64, x: sink T)
+        requires 0 <= i && i <= self.len
+        else f"Vec::insert: index {i} out of bounds, length {self.len}"
+        {
+        if i < 0 || i > self.len {
+            unsafe { panic(c"Vec::insert: index out of bounds") }
+        }
+        self.reserve(1);
+        // (0.17: the elements moved up as bits, not as values)
+        unsafe {
+            let p = self.ptr;
+            let last = self.len;
+            for d in 0..last - i {
+                let k = last - d;
+                p[k] = p[k - 1];
+            }
+            p[i] = x;
+        }
+        self.len += 1;
+    }
+
+    // Takes element i out (checked) and returns it, moving the elements
+    // after it down by one.
+    pub fn remove(inout self, i: i64) -> T
+        requires 0 <= i && i < self.len else f"index out of bounds: index {i}, length {self.len}"
+    {
+        // (checked; 0.17: the elements moved down as bits, not as values)
+        let at: *T = &self.as_slice()[i];
+        unsafe {
+            let x = *at;
+            let p = self.ptr;
+            for k in i..self.len - 1 {
+                p[k] = p[k + 1];
+            }
+            self.len -= 1;
+            x
+        }
+    }
+
+    // Keeps the first n elements (all of them when there are fewer); 0.17:
+    // the others are dropped.
+    pub fn truncate(inout self, n: i64) {
+        if n >= 0 && n < self.len {
+            let len = self.len;
+            self.len = n;
+            if needs_drop::<T>() {
+                for i in n..len {
+                    drop(unsafe { self.ptr[i] });
+                }
+            }
+        }
+    }
+
+    // Its elements, a view (0.17: valid while the Vec is not changed).
+    #[views(self)]
+    pub fn as_slice(self) -> [T] {
+        unsafe { self.ptr[0..self.len] }
+    }
+
+    // Its elements, to change in place (0.17): `sort(v.as_mut_slice())`.
+    #[views(self)]
+    pub fn as_mut_slice(inout self) -> inout [T] {
+        unsafe { &self.ptr[0..self.len] }
+    }
+
+    // Drops the elements (0.17); the room stays.
+    pub fn clear(inout self) {
+        self.truncate(0);
+    }
+
+    // Its elements dropped and its memory given back; it is left empty, to
+    // use again (0.17: a Vec is dropped at the end of its scope without
+    // it; `self.items.free()` through a reference still works, and a
+    // second free frees nothing).
+    pub fn free(inout self) {
+        self.release();
+    }
+
+    // Its elements, in a Vec on the same allocator; it is left empty
+    // (0.17: `std::take` for a container, which keeps its allocator).
+    pub fn take(inout self) -> Vec<T, A> {
+        let empty: Vec<T, A> = Vec::new_in(self.alloc);
+        replace(&self, empty)
+    }
+
+    // The elements dropped and the memory given back: empty, with no memory
+    // (0.17: drop and free).
+    #[inline]
+    fn release(inout self) {
+        self.truncate(0);
+        unsafe {
+            self.alloc.free(self.ptr as *u8, self.cap * size_of(T), align_of(T));
+        }
+        self.ptr = 0 as *T;
+        self.cap = 0;
+    }
+}
+
+// (0.17) A Vec's drop: its elements' drops, then its memory given back.
+impl<T, A: Allocator> Drop for Vec<T, A> {
+    #[inline]
+    fn drop(inout self) {
+        self.release();
+    }
+}
+
+// (0.16) The ambient constructors of 0.15, errors outside std: allocation
+// is explicit (front/ambient.vl; fix --only alloc016 reads them).
+impl<T, A: Allocator + Ambient> Vec<T, A> {
+    #[ambient("Vec::new_in(gpa)")]
+    pub fn new() -> Vec<T, A> {
+        Vec { ptr: 0 as *T, len: 0, cap: 0, alloc: A::ambient() }
+    }
+
+    #[ambient("Vec::with_capacity_in(cap, gpa)")]
+    pub fn with_capacity(cap: i64) -> Vec<T, A> {
+        Vec::with_capacity_in(cap, A::ambient())
+    }
+
+    #[ambient("Vec::filled_in(n, x, gpa)")]
+    pub fn filled(n: i64, x: sink T) -> Vec<T, A> {
+        Vec::filled_in(n, x, A::ambient())
+    }
+}
+
+// ---- Vec's room and allocator (0.16) ----
+
+impl<T, A: Allocator> Vec<T, A> {
+    // The elements it has room for (0.16).
+    pub fn capacity(self) -> i64 {
+        self.cap
+    }
+
+    // Its allocator (0.16): a copy of the handle.
+    pub fn allocator(self) -> A {
+        self.alloc
+    }
+
+    // Room for `extra` more elements, or Err when out of memory, the Vec
+    // as it was (0.16).
+    pub fn try_reserve(inout self, extra: i64) -> Result<(), AllocError> {
+        if extra > self.cap - self.len && !self.reserve_more(extra) {
+            return Result::Err(AllocError::OutOfMemory);
+        }
+        Result::Ok(())
+    }
+
+    // push, or Err when out of memory, the Vec as it was (0.16).
+    #[stores(x)]
+    pub fn try_push(inout self, x: sink T) -> Result<(), AllocError> {
+        if self.len == self.cap && !self.reserve_more(1) {
+            return Result::Err(AllocError::OutOfMemory);
+        }
+        unsafe {
+            self.ptr[self.len] = x;
+        }
+        self.len += 1;
+        Result::Ok(())
+    }
+}
+
+// ---- Buf ----
+
+// A growable buffer of bytes, for building text (0.16: on allocator A).
+#[sealed]
+pub struct Buf<A: Allocator = Gpa> { bytes: Vec<u8, A> }
+
+impl<A: Allocator> Buf<A> {
+    // An empty Buf on allocator a (0.16).
+    pub fn new_in(a: sink A) -> Buf<A> {
+        Buf { bytes: Vec::new_in(a) }
+    }
+
+    pub fn len(self) -> i64 {
+        self.bytes.len
+    }
+
+    pub fn push(inout self, b: u8) {
+        self.bytes.push(b);
+    }
+
+    // Appends s, which may be a view of this Buf.
+    pub fn push_str(inout self, s: [u8]) {
+        self.bytes.extend_from_slice(s);
+    }
+
+    // A C string (up to its NUL).
+    pub unsafe fn push_cstr(inout self, s: *u8) {
+        self.bytes.extend_from_slice(s[0..strlen(s) as i64]);
+    }
+
+    // The decimal digits of v.
+    pub fn push_int(inout self, v: i64) {
+        let negative = v < 0;
+        let u = if negative { (-(v + 1)) as u64 + 1 } else { v as u64 };
+        let n = if negative { decimal_len(u) + 1 } else { decimal_len(u) };
+        if n > self.bytes.cap - self.bytes.len {
+            self.bytes.reserve(n);
+        }
+        unsafe {
+            put_decimal(&self.bytes.ptr[self.bytes.len], n, u, negative);
+        }
+        self.bytes.len += n;
+    }
+
+    // Its bytes, a view (0.17: valid while the Buf is not changed).
+    #[views(self)]
+    pub fn as_slice(self) -> [u8] {
+        self.bytes.as_slice()
+    }
+
+    // Its bytes, to change in place (0.17).
+    #[views(self)]
+    pub fn as_mut_slice(inout self) -> inout [u8] {
+        self.bytes.as_mut_slice()
+    }
+
+    pub fn clear(inout self) {
+        self.bytes.clear();
+    }
+
+    // Its memory given back; it is left empty, to use again (0.17: a Buf is
+    // dropped at the end of its scope without it).
+    pub fn free(inout self) {
+        self.bytes.release();
+    }
+
+    // Its bytes, in a Buf on the same allocator; it is left empty (0.17:
+    // `std::take` for a container, which keeps its allocator).
+    pub fn take(inout self) -> Buf<A> {
+        Buf { bytes: self.bytes.take() }
+    }
+}
+
+// (0.17) A Buf's drop: its memory given back.
+impl<A: Allocator> Drop for Buf<A> {
+    #[inline]
+    fn drop(inout self) {
+        self.bytes.release();
+    }
+}
+
+impl<A: Allocator> Buf<A> {
+    // A new Buf of the bytes of s on allocator a (0.17): text that must
+    // outlive the slice it came from.
+    pub fn from_in(s: [u8], a: sink A) -> Buf<A> {
+        var b: Buf<A> = Buf::with_capacity_in(s.len, a);
+        b.push_str(s);
+        b
+    }
+}
+
+impl<A: Allocator + Ambient> Buf<A> {
+    #[ambient("Buf::new_in(gpa)")]
+    pub fn new() -> Buf<A> {
+        Buf { bytes: Vec::new_in(A::ambient()) }
+    }
+}
+
+// The number of decimal digits of u.
+#[inline]
+fn decimal_len(u: u64) -> i64 {
+    var n = 1;
+    var ten: u64 = 10;
+    for _ in 1..20 {
+        if u < ten {
+            break;
+        }
+        n += 1;
+        ten *= 10;
+    }
+    n
+}
+
+// u's decimal digits in p[0..n] (n: decimal_len(u), one more when
+// negative: after a '-'), two at a time. Unsafe: p has n bytes.
+#[inline]
+unsafe fn put_decimal(p: *u8, n: i64, u: u64, negative: bool) {
+    let pairs = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
+    var x = u;
+    var i = n;
+    for _ in 0..10 {
+        if x < 100 {
+            break;
+        }
+        let q = x / 100;
+        let r = (x - q * 100) as i64 * 2;
+        i -= 2;
+        p[i] = pairs.ptr[r];
+        p[i + 1] = pairs.ptr[r + 1];
+        x = q;
+    }
+    if x >= 10 {
+        let r = x as i64 * 2;
+        p[i - 2] = pairs.ptr[r];
+        p[i - 1] = pairs.ptr[r + 1];
+    } else {
+        p[i - 1] = '0' + x as u8;
+    }
+    if negative {
+        p[0] = '-';
+    }
+}
+
+// ---- Buf's room and allocator (0.16) ----
+
+impl<A: Allocator> Buf<A> {
+    // An empty Buf on allocator a with room for cap bytes (0.16).
+    pub fn with_capacity_in(cap: i64, a: sink A) -> Buf<A> {
+        Buf { bytes: Vec::with_capacity_in(cap, a) }
+    }
+
+    // The bytes it has room for (0.16).
+    pub fn capacity(self) -> i64 {
+        self.bytes.cap
+    }
+
+    // Room for `extra` more bytes (0.16).
+    pub fn reserve(inout self, extra: i64) {
+        self.bytes.reserve(extra);
+    }
+
+    // Its allocator (0.16): a copy of the handle.
+    pub fn allocator(self) -> A {
+        self.bytes.alloc
+    }
+}
+
+// ---- Eq, Ord and Hash (0.9) ----
+
+pub trait Eq { #[pure] fn eq(self, other: Self) -> bool; }
+// Negative, zero or positive: self before, like or after other.
+pub trait Ord { #[pure] fn cmp(self, other: Self) -> i64; }
+pub trait Hash { #[pure] fn hash(self) -> u64; }
+
+// The hash of the integers (0.20): FixedState's, foldhash with fixed
+// seeds, one folded multiply (std::hash).
+#[inline]
+pub fn hash_u64(x: u64) -> u64 {
+    hash::fold_hash_u64_fixed(x)
+}
+
+impl Eq for i8 {
+    fn eq(self, other: i8) -> bool { self == other }
+}
+
+impl Ord for i8 {
+    fn cmp(self, other: i8) -> i64 {
+        if self < other { -1 } else if self == other { 0 } else { 1 }
+    }
+}
+
+impl Hash for i8 {
+    fn hash(self) -> u64 { hash_u64(self as u64) }
+}
+
+impl Eq for i16 {
+    fn eq(self, other: i16) -> bool { self == other }
+}
+
+impl Ord for i16 {
+    fn cmp(self, other: i16) -> i64 {
+        if self < other { -1 } else if self == other { 0 } else { 1 }
+    }
+}
+
+impl Hash for i16 {
+    fn hash(self) -> u64 { hash_u64(self as u64) }
+}
+
+impl Eq for i32 {
+    fn eq(self, other: i32) -> bool { self == other }
+}
+
+impl Ord for i32 {
+    fn cmp(self, other: i32) -> i64 {
+        if self < other { -1 } else if self == other { 0 } else { 1 }
+    }
+}
+
+impl Hash for i32 {
+    fn hash(self) -> u64 { hash_u64(self as u64) }
+}
+
+impl Eq for i64 {
+    fn eq(self, other: i64) -> bool { self == other }
+}
+
+impl Ord for i64 {
+    fn cmp(self, other: i64) -> i64 {
+        if self < other { -1 } else if self == other { 0 } else { 1 }
+    }
+}
+
+impl Hash for i64 {
+    fn hash(self) -> u64 { hash_u64(self as u64) }
+}
+
+impl Eq for u8 {
+    fn eq(self, other: u8) -> bool { self == other }
+}
+
+impl Ord for u8 {
+    fn cmp(self, other: u8) -> i64 {
+        if self < other { -1 } else if self == other { 0 } else { 1 }
+    }
+}
+
+impl Hash for u8 {
+    fn hash(self) -> u64 { hash_u64(self as u64) }
+}
+
+impl Eq for u16 {
+    fn eq(self, other: u16) -> bool { self == other }
+}
+
+impl Ord for u16 {
+    fn cmp(self, other: u16) -> i64 {
+        if self < other { -1 } else if self == other { 0 } else { 1 }
+    }
+}
+
+impl Hash for u16 {
+    fn hash(self) -> u64 { hash_u64(self as u64) }
+}
+
+impl Eq for u32 {
+    fn eq(self, other: u32) -> bool { self == other }
+}
+
+impl Ord for u32 {
+    fn cmp(self, other: u32) -> i64 {
+        if self < other { -1 } else if self == other { 0 } else { 1 }
+    }
+}
+
+impl Hash for u32 {
+    fn hash(self) -> u64 { hash_u64(self as u64) }
+}
+
+impl Eq for u64 {
+    fn eq(self, other: u64) -> bool { self == other }
+}
+
+impl Ord for u64 {
+    fn cmp(self, other: u64) -> i64 {
+        if self < other { -1 } else if self == other { 0 } else { 1 }
+    }
+}
+
+impl Hash for u64 {
+    fn hash(self) -> u64 { hash_u64(self as u64) }
+}
+
+impl Eq for bool {
+    fn eq(self, other: bool) -> bool { self == other }
+}
+
+impl Ord for bool {
+    fn cmp(self, other: bool) -> i64 {
+        if !self && other { -1 } else if self == other { 0 } else { 1 }
+    }
+}
+
+impl Hash for bool {
+    fn hash(self) -> u64 { hash_u64(self as u64) }
+}
+
+// Byte strings: compared by bytes, ordered lexicographically, hashed with
+// foldhash (0.20; FNV-1a before).
+impl Eq for [u8] {
+    fn eq(self, other: Self) -> bool {
+        let a = self;
+        let b = other;
+        if a.len != b.len {
+            return false;
+        }
+        for i in 0..a.len {
+            if a[i] != b[i] {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Ord for [u8] {
+    fn cmp(self, other: Self) -> i64 {
+        let a = self;
+        let b = other;
+        let n = if a.len < b.len { a.len } else { b.len };
+        for i in 0..n {
+            if a[i] != b[i] {
+                return if a[i] < b[i] { -1 } else { 1 };
+            }
+        }
+        if a.len < b.len { -1 } else if a.len == b.len { 0 } else { 1 }
+    }
+}
+
+impl Hash for [u8] {
+    #[inline]
+    fn hash(self) -> u64 {
+        // (0.20: FixedState's, foldhash: the length, then the bytes)
+        hash::fold_hash_bytes_fixed(0x082efa98ec4e6c89, self)
+    }
+}
+
+// ---- Contract checks: the implementation (0.18) ----
+
+// (0.18) A contract or assertion check, which the compiler makes (from a
+// `requires` or `ensures` clause, `assert`, `assert_eq`, ...): both back
+// ends branch to the run-time failure when `ok` is false, whose line the
+// compiler writes from `check` (front/contracts/checks.vl) and `site`
+// (the position it blames); a, b, c: the values of the holes of an
+// f-string message (`else f"index {i}"`), evaluated only when `ok` is
+// false. Not called by programs.
+pub fn contract_check(ok: bool, site: i64, check: i64, a: i64 = 0, b: i64 = 0, c: i64 = 0) {
+    if !ok {
+        unsafe { panic(c"contract check failed") }
+    }
+}

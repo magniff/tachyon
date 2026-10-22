@@ -1,4 +1,4 @@
-## tachyonc fix --only alloc016 (0.16) on a program written against 0.15's
+## volec fix --only alloc016 (0.16) on a program written against 0.15's
 ## std, whose containers took their memory from an ambient allocator
 ## (tests/refactor/alloc016run/): std's 0.15 forms become their `_in`
 ## forms, `fn main()` takes `gpa: Gpa`, and every function between them
@@ -16,7 +16,7 @@ fixed 13 allocations made explicit	2 files	+36 -36 lines
  2 files changed, 36 insertions(+), 36 deletions(-)
 $ fix --only conventions
 fixed 1 parameter to let, 4 receivers, 1 '&e' to a let, 6 'let mut's / 'mut x's to var	2 files	+12 -12 lines
-% "$COMPILER" main.tach -o prog && ./prog < input.txt
+% "$COMPILER" main.vl -o prog && ./prog < input.txt
 6 words, shortest 3, longest 5
 squares 16
 (1, 2)

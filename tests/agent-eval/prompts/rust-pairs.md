@@ -1,9 +1,9 @@
-# Rust -> tachyon, side by side
+# Rust -> vole, side by side
 
-Tachyon looks like Rust; what differs is shown below as pairs: each
+Vole looks like Rust; what differs is shown below as pairs: each
 `// Rust:` comment is the Rust you would write, the line under it is the
-tachyon for it. Both programs compile and run as shown (`tachyonc
-main.tach -o prog && ./prog < in.txt`). There are no macros, no `String`
+vole for it. Both programs compile and run as shown (`volec
+main.vl -o prog && ./prog < in.txt`). There are no macros, no `String`
 (text is `[u8]`, built with `std::Buf`), no references or lifetimes to
 write: a parameter's convention says what the callee does with it (`x:
 T` reads it, the default; `x: inout T` changes it, called `f(&x)`; `x:
@@ -147,7 +147,7 @@ fn main(gpa: Gpa) -> i32 {
     // Rust: s.len(), &s[0..2], s.as_bytes()[0] == b'4'
     println(f"{s.as_slice()} {s.len()} {s.as_slice()[0..2]} {s.as_slice()[0] == '4'}");
     println(first_word("hello world"));
-    // Rust: let x: u8 = 250u8.wrapping_add(10);  (tachyon integers always wrap)
+    // Rust: let x: u8 = 250u8.wrapping_add(10);  (vole integers always wrap)
     let x: u8 = 250 + 10;
     // Rust: let q = 7 / 0;  panics; here 0, and 7 % 0 == 7
     let z = 0;
@@ -182,4 +182,4 @@ More pairs, one line each:
   -> `if s == "a" { .. }` (strings are not patterns).
 - `char` -> `u8` (`'a'`); `usize` -> `i64` for lengths and indices.
 
-`tachyonc guide rust` has the full table; `tachyonc guide TOPIC` the rest.
+`volec guide rust` has the full table; `volec guide TOPIC` the rest.

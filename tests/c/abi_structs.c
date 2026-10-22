@@ -1,6 +1,6 @@
-/* C side of tests/run/abi_c_structs.tach: functions taking and returning
-   aggregates by value, and calling tachyon functions that do, to check that
-   tachyon follows the C convention for every kind of aggregate. */
+/* C side of tests/run/abi_c_structs.vl: functions taking and returning
+   aggregates by value, and calling vole functions that do, to check that
+   vole follows the C convention for every kind of aggregate. */
 #include <stdint.h>
 
 typedef struct { uint8_t a, b, c; } I8x3;
@@ -39,7 +39,7 @@ double c_many(F64x4 a, F32x3 b, Mixed c, I64x2 d, I64x2 e, I64x2 f, I64x2 g, I32
     return a.a + a.d + b.z + c.x + c.n + d.a + e.b + f.a + g.b + h.c + i.y + j + k.c;
 }
 
-/* Calls tachyon back with aggregates. */
+/* Calls vole back with aggregates. */
 typedef Mixed (*MixedFn)(Mixed, F32x3, I8x3);
 double c_call_back(MixedFn f) {
     Mixed m = { 1.5, 7 };

@@ -1,0 +1,132 @@
+// --check-alloc's allocation sites (0.16): with the flag, lowering stores a
+// site string (`main.vl:14:9`) in std::CHECK_ALLOC_SITE before each call
+// from code outside std to a function whose effects allocate from an
+// allocator (`alloc(Gpa)`, `alloc(Arena)`, ...; not `alloc(extern)` alone),
+// for the checking allocator's reports, where a block was allocated and
+// freed (compiler/std/alloc_check.vl; docs/design/effects-allocation.md
+// §2.5). A call through a fn value stores too. gen0 does the same
+// (gen0/gen/checkalloc.vl).
+
+use crate::base::{
+    BUFS, FILES, FILE_COUNT, IntVec, SRC, buf_byte, buf_int, buf_new, buf_str, intern_c, out_path,
+};
+use crate::front::ast::NODES;
+use crate::front::effects::fn_effects;
+use crate::front::effects::infer::{ALLOCATOR_TRAIT, is_allocator_method};
+use crate::front::lexer::add_string;
+use crate::front::modules::{STD_MODULE, within_std};
+use crate::front::stdalloc::CHECK_ALLOC_MODE;
+use crate::front::traits::{IMPLS, IMPL_COUNT};
+use crate::front::types::{FNS, SYM_STATIC, TY_U64};
+use crate::middle::ctx::FnCtx;
+use crate::middle::ir::{IRFUNCS, Op, emit_ir, ir_store};
+use crate::middle::profile::PROFILE_MODULE;
+use crate::middle::unsafecheck::CHECK_MODULE;
+
+// The symbol of std's CHECK_ALLOC_SITE; 0: not looked up yet, -1: none
+// (std is not part of the program).
+static var SITE_STATIC: i64 = 0;
+
+// The symbol of the static the sites are stored in, or -1.
+pub fn site_static() -> i64 {
+    unsafe {
+        if SITE_STATIC == 0 {
+            let sym = intern_c(c"std.CHECK_ALLOC_SITE");
+            SITE_STATIC = if STD_MODULE >= 0 && SYM_STATIC[sym] != 0 { sym } else { -1 };
+        }
+        SITE_STATIC
+    }
+}
+
+// Whether call n, in function `caller`, stores its site: with --check-alloc,
+// from the program (not std, nor a runtime of another checking mode), to a
+// function that may allocate from an allocator (an Allocator method itself:
+// its own set is C allocation, the caller's is the allocator's; a method
+// of an allocator type), or through a fn value.
+pub fn needs_site(n: i64, caller: i64) -> bool {
+    unsafe {
+        if !CHECK_ALLOC_MODE || site_static() < 0 {
+            return false;
+        }
+        let m = FNS[caller].module;
+        if within_std(m) || m == CHECK_MODULE || m == PROFILE_MODULE {
+            return false;
+        }
+        let f = NODES[n].x - 1;
+        f < 0 || fn_effects(f).allocs != 0 || is_allocator_method(f) || of_allocator_type(f)
+    }
+}
+
+// Whether f is a method of a type that implements std's Allocator (an
+// arena's reset, free_all or scope: they give blocks back, and the
+// checking Gpa reports where).
+fn of_allocator_type(f: i64) -> bool {
+    unsafe {
+        let t = FNS[f].self_ty;
+        if t == 0 || ALLOCATOR_TRAIT < 0 {
+            return false;
+        }
+        for j in 0..IMPL_COUNT {
+            if IMPLS[j].tr == ALLOCATOR_TRAIT && IMPLS[j].ty == t {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// The starts of the source's lines (built once).
+static var LINES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The index of the last line starting at or before pos.
+fn line_of(pos: i64) -> i64 {
+    unsafe {
+        var lo = 0;
+        var hi = LINES.count;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if LINES.data[mid] <= pos { lo = mid + 1; } else { hi = mid; }
+        }
+        lo - 1
+    }
+}
+
+// The C string `path:line:column` of source position pos, a string
+// literal's id.
+pub fn site_text(pos: i64) -> i64 {
+    unsafe {
+        if LINES.count == 0 {
+            LINES.push(0);
+            for i in 0..FILES[FILE_COUNT - 1].end {
+                if SRC[i] == '\n' {
+                    LINES.push(i + 1);
+                }
+            }
+        }
+        var file = 0;
+        while file + 1 < FILE_COUNT && pos >= FILES[file + 1].start {
+            file += 1;
+        }
+        let line = line_of(pos);
+        let out = buf_new();
+        buf_str(out, out_path(file));
+        buf_byte(out, ':');
+        buf_int(out, line - line_of(FILES[file].start) + 1);
+        buf_byte(out, ':');
+        buf_int(out, pos - LINES.data[line] + 1);
+        add_string(BUFS[out].data[0..BUFS[out].len])
+    }
+}
+
+// Right before lowering call n's Call instruction (its arguments are
+// lowered): its site, when it needs one.
+pub fn site_before_call(cx: sink *FnCtx, n: i64) {
+    unsafe {
+        if !needs_site(n, IRFUNCS[cx.irf].f) {
+            return;
+        }
+        let at = emit_ir(cx, Op::GAddr, TY_U64, 0, 0, site_static());
+        let site = emit_ir(cx, Op::SAddr, TY_U64, 0, 0, site_text(NODES[n].start));
+        ir_store(cx, TY_U64, at, site, 0);
+    }
+}

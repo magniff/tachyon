@@ -2,13 +2,13 @@
 
 A synthesis, written 2026-10-15 for the 0.17 cycle, of three reading
 threads (languages designed for LLMs; teaching a model a language it has
-not seen; tools and interfaces for coding agents) against tachyon's own
+not seen; tools and interfaces for coding agents) against vole's own
 evidence: the 0.13 baseline ([../eval/0.13-findings.md](../eval/0.13-findings.md))
 and the 0.16 round, which was still running when this was written
 (282 finished runs: 180 Sonnet and 54 Haiku program runs, 48 compiler-task
 runs; the Haiku runs of tasks 01-12 and the check-hook conditions had not
 started). The companion document,
-[applying-to-tachyon.md](applying-to-tachyon.md), turns this into a ranked
+[applying-to-vole.md](applying-to-vole.md), turns this into a ranked
 plan.
 
 ## How to read the evidence
@@ -30,7 +30,7 @@ most load-bearing papers) confirm the titles, venues and the abstract-level
 figures ("reduces compilation errors by more than half", "over 20% cost");
 the finer numbers (a 16.7% share, a 2,146-token sheet) are the readers'
 and are not independently re-verified. Several papers are dated 2026 and
-post-date tachyon's own design; their results were not available when
+post-date vole's own design; their results were not available when
 the tools were built, which makes the agreements below more informative
 than they would otherwise be.
 
@@ -44,14 +44,14 @@ difference of a run or two is noise.
 
 | | 0.13 (12 tasks, 1 rep) | 0.16 so far (18 tasks, 3 reps; 4 compiler tasks) |
 |---|---|---|
-| success, Sonnet, tachyon | 59/60 (one bare failure) | 100% in bare, guide and both (126 runs); Rust 98% |
-| success, Haiku, tachyon | 59/60 | hard tasks: bare 18/18, both 17/18; Rust 18/18 |
+| success, Sonnet, vole | 59/60 (one bare failure) | 100% in bare, guide and both (126 runs); Rust 98% |
+| success, Haiku, vole | 59/60 | hard tasks: bare 18/18, both 17/18; Rust 18/18 |
 | Sonnet cost vs Rust, small write tasks | 146k vs 55k input, $0.135 vs $0.073 | easy 01-12: 142k vs 49k input, $0.129 vs $0.062 (2.1x), **turns 5.5 vs 6** |
 | Sonnet cost vs Rust, harder tasks | - | hard 13-18: 345k vs 125k input, $0.256 vs $0.174 (1.5x), **turns 12.5 vs 12.5** |
 | Haiku cost vs Rust, hard tasks | - | both 1224k vs 805k input, $0.053 vs $0.039 (1.35x), turns 25.5 vs 29 |
 | compiler tasks, Sonnet tools/plain | - | refactor 0.29x input, optimize 1.0x, fix 1.45x, feature 2.2x; success 100% both |
 | compiler tasks, Haiku tools/plain | - | refactor 0.29x, optimize 1.05x, fix 1.95x, feature 2.3x; success 100% both |
-| failed builds per run (tachyon) | median 0 | median 0 in every cell; 1-2 distinct compiler errors per Sonnet run, 0.7 per Haiku run with the guide |
+| failed builds per run (vole) | median 0 | median 0 in every cell; 1-2 distinct compiler errors per Sonnet run, 0.7 per Haiku run with the guide |
 | `query context` calls | 0 | 0 in 282 runs; `batch` 0; `--budget` 16 times |
 
 Two things changed between the rounds and matter for reading the
@@ -92,7 +92,7 @@ language differs ("familiar syntax is a bridge; novel syntax is a wall")
 
 **What our data says.** Agrees, and the Rust-like surface is doing the
 work: median failed builds are 0 in every cell, and the compiler errors
-agents do meet are not syntax. Over all 0.16 tachyon runs, the distinct
+agents do meet are not syntax. Over all 0.16 vole runs, the distinct
 error messages seen in tool results (one count per result, suite runs
 excluded) are led by `non-exhaustive match` (35), `calling a C function
 is unsafe` (28), `expected X, got Y` (24), `unknown module` (23),
@@ -139,7 +139,7 @@ peer-reviewed EMNLP].
 halves the turns (13 bare to 5.5 with the guide, Rust 6) and on the hard
 tasks brings them to parity (20.5 to 11.5-12.5, Rust 12.5). The guide is
 already example-dense (every section carries a compiled example, tested
-by `tests/run.sh guide`), but its two tables of Rust-to-tachyon rules are
+by `tests/run.sh guide`), but its two tables of Rust-to-vole rules are
 prose rules of the kind the literature finds weakest, and we have never
 run the examples-only versus rules-only comparison. What we have not
 measured: which part of the guide pays. The errors above say the "Rust
@@ -183,7 +183,7 @@ it; on the easy tasks the whole 2.1x cost gap to Rust is that prompt
 table and hook text add ~4.7k tokens per turn (16.6k against 11.9k) and
 the tools condition reads 11% more input than plain on Sonnet with 18%
 fewer turns. Haiku shows the re-reading effect the AGENTS.md paper saw
-in GPT-5.1 mini: with the guide inlined it still ran `tachyonc guide
+in GPT-5.1 mini: with the guide inlined it still ran `volec guide
 TOPIC` 32 times in 18 runs (1.8 per run), and in the bare condition 64
 times, reading topics it could have had. Haiku's one 0.16 failure
 (15-multi-module, 11 of 12 tests) came in the condition with the most
@@ -233,7 +233,7 @@ and our premium is not thinking tokens: output tokens are nearly equal,
 the prompt is the difference (section 3). The check-after-edit hook on
 the compiler tasks runs in 35-50 ms median per check (the compiler keeps
 a cache) and the eval's `check_hook` records show Sonnet needing it twice
-per run, Haiku six times. Every tachyon diagnostic is one line with a
+per run, Haiku six times. Every vole diagnostic is one line with a
 `help:` and often a `try:`; the FeedbackEval ordering (compiler plus hint
 beats compiler alone) is the argument for keeping that format, and for
 adding a test summary to the same channel, which we have not done. We
@@ -265,7 +265,7 @@ understand differences between languages" is 73.9% of causes ([Ou et al.
 annotations. A position paper claims models fall back on `unsafe` to
 silence the borrow checker (AdaTrans, unread, unverified).
 
-**What our data says.** Tachyon today has no ownership checker, so the
+**What our data says.** Vole today has no ownership checker, so the
 nearest class is the borrow rules around raw pointers and explicit
 allocation: `calling a C function is unsafe` (28), `passing a raw pointer
 to a pointer parameter is unsafe` (7), `access to a field through a raw
@@ -356,11 +356,11 @@ for both models (Sonnet 127k vs 437k, Haiku 349k vs 1215k; 22 files, 88
 uses), which no paper has because no benchmark has refactors; on the fix
 and feature tasks the tools cost 1.45-2.3x, in line with the literature's
 "tools move cost, not success, on bug fixes". The transcripts show why:
-on 23-fix-checker the plain agent ran `cat usefulness.tach` once (one
+on 23-fix-checker the plain agent ran `cat usefulness.vl` once (one
 file, under 500 lines) and patched; the tools agent ran `query items`,
 then `query show` on 15 names, met one `patch.no-match`, and finished
 later. On 24-std-method the tools agent was blocked by the query-first
-hook twice, escaped with `# no-query: need line in std.tach for the Edit
+hook twice, escaped with `# no-query: need line in std.vl for the Edit
 tool` (the tool cannot edit std by name, tool-gaps-016 item 2), and then
 did what the plain agent did. `query context` was never called in 282
 runs; `batch` never; `--budget` 16 times. Of 56 Sonnet `query` calls on
@@ -395,7 +395,7 @@ lowered cost in 0.15's study; tonight's compiler runs show it firing 2
 dominates Haiku's turns: 11-16 verify actions per hard run (`./prog <
 input` 19 times per run in `both`) against 8 in Rust, and Haiku writes its
 own test inputs and comparison scripts in nearly every run. There is no
-`tachyonc test`; the agents build one from `./prog`, `diff`, `cmp` and
+`volec test`; the agents build one from `./prog`, `diff`, `cmp` and
 Python, and the harness refuses part of it. Sonnet's first edit comes at
 call 2-3 with the guide and at call 6 without it or in Rust, which
 reads as "the guide replaces exploration", not "front-loaded patching".
@@ -430,7 +430,7 @@ Rust included, so local models are off until an idle machine. Corpus
 size is the first question and is unmeasured: tokens in compiler/src,
 compiler/std, examples, tests, docs. The eval's Rust twins (18 tasks ×
 reference solutions in both languages) are the seed of exactly the
-MultiPL-T recipe, with `tachyonc` and the hidden tests as the filter.
+MultiPL-T recipe, with `volec` and the hidden tests as the filter.
 
 ## 10. Evaluation methodology
 
@@ -449,7 +449,7 @@ Benjamini-Hochberg; its hard benchmark is what separated techniques that
 tied on easy ones.
 
 **What our data says.** Our suite is at the success ceiling for hosted
-models (0.13: 59/60; 0.16: 100% in every tachyon cell), so the
+models (0.13: 59/60; 0.16: 100% in every vole cell), so the
 instrument measures cost, and cost is where the literature's effects are
 too. Three reps show the noise: Sonnet 17-debug-crash runs 129k (bare),
 368k (both), 201k (guide) — the ordering of conditions on one task is
@@ -462,10 +462,10 @@ tags on errors.
 
 ---
 
-## Open questions nobody has answered (where tachyon's eval can contribute)
+## Open questions nobody has answered (where vole's eval can contribute)
 
 1. **Same frontier agent, same tasks, two languages that share a syntax
-   and differ in semantics.** Rust versus tachyon is the nearest thing to
+   and differ in semantics.** Rust versus vole is the nearest thing to
    this in existence; nobody has it. The publishable result is the
    cost-versus-task-size curve (Endoh has one size; we have three task
    kinds and 18 tasks).

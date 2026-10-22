@@ -1,0 +1,635 @@
+// `edit patch` and `edit insert --in` when an OLD (an ANCHOR) is not in
+// TARGET's text once: `patch.no-match` with the nearest line and the
+// command to try with the part of it nearest to OLD, `patch.ambiguous`
+// with OLD widened a line at a time until it is unique; the commands are
+// quoted for the shell.
+
+use crate::base::{
+    BUFS, IntVec, SRC, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, free,
+    streq,
+};
+use crate::front::modules::file_of_pos;
+use crate::tools::edit::{DRY_RUN, NO_CHECK};
+use crate::tools::edit::apply::try_again;
+use crate::tools::edit::undo::journal_dir;
+use crate::tools::patch::{
+    FROM_STDIN, INSERT_AFTER, LOOSE, NEWS, NTH, OLDS, PAIRS_FILE, PAIR_TARGET, ROOT_PATH, SCOPE_END,
+    SCOPE_NAME, SCOPE_START, TARGETS, WHAT, count_in_scope, find_all, is_blank, target, trimmed,
+};
+use crate::tools::patch::indent::reindented;
+use crate::tools::proc::{absolute_path, buf_cstr, make_dirs, write_file_if};
+use crate::tools::query::c_slice;
+use crate::tools::query::defs::bytes_eq;
+use crate::tools::query::diagnostics::{diag, try_begin, try_end};
+use crate::tools::query::positions::{line_end, line_of, line_start};
+use crate::tools::query::refs::file_text;
+
+// ---- When OLD is not there once ----
+
+// The least edit distance of p to a part of t, and that part
+// ([*from, *to) of t).
+fn near_in(p: [u8], t: [u8], from: inout i64, to: inout i64) -> i64 {
+    unsafe {
+        let prev = alloc_array::<i64>(t.len + 1);
+        let cur = alloc_array::<i64>(t.len + 1);
+        let prev_s = alloc_array::<i64>(t.len + 1);
+        let cur_s = alloc_array::<i64>(t.len + 1);
+        for j in 0..t.len + 1 {
+            prev[j] = 0;
+            prev_s[j] = j;
+        }
+        for i in 1..p.len + 1 {
+            cur[0] = i;
+            cur_s[0] = 0;
+            for j in 1..t.len + 1 {
+                var best = prev[j - 1] + if p[i - 1] == t[j - 1] { 0 } else { 1 };
+                var start = prev_s[j - 1];
+                if prev[j] + 1 < best {
+                    best = prev[j] + 1;
+                    start = prev_s[j];
+                }
+                if cur[j - 1] + 1 < best {
+                    best = cur[j - 1] + 1;
+                    start = cur_s[j - 1];
+                }
+                cur[j] = best;
+                cur_s[j] = start;
+            }
+            for j in 0..t.len + 1 {
+                prev[j] = cur[j];
+                prev_s[j] = cur_s[j];
+            }
+        }
+        var best = p.len + 1;
+        for j in 0..t.len + 1 {
+            if prev[j] < best {
+                best = prev[j];
+                from = prev_s[j];
+                to = j;
+            }
+        }
+        free(prev as *u8);
+        free(cur as *u8);
+        free(prev_s as *u8);
+        free(cur_s as *u8);
+        best
+    }
+}
+
+// text without blanks (for comparing lines whatever their spacing).
+fn squeezed(text: [u8]) -> i64 {
+    let out = buf_new();
+    for i in 0..text.len {
+        if !is_blank(text[i]) {
+            buf_byte(out, text[i]);
+        }
+    }
+    out
+}
+
+// The line of the scope nearest to `want` (by edit distance, blanks
+// aside), as the start of its text (its indentation skipped); -1 when no
+// line is near.
+fn nearest_line(want: [u8]) -> i64 {
+    unsafe {
+        let w = squeezed(trimmed(want));
+        var best = -1;
+        var best_cost = 0;
+        var p = SCOPE_START;
+        while p < SCOPE_END {
+            let e = line_end(p);
+            var a = p;
+            while a < e && (SRC[a] == ' ' || SRC[a] == '\t') {
+                a += 1;
+            }
+            if a < e {
+                let l = squeezed(SRC[a..e]);
+                var from = 0;
+                var to = 0;
+                let cost = near_in(buf_slice(w), buf_slice(l), &from, &to);
+                if best < 0 || cost < best_cost {
+                    best = a;
+                    best_cost = cost;
+                }
+            }
+            p = e + 1;
+        }
+        var limit = BUFS[w].len / 2;
+        if limit < 2 {
+            limit = 2;
+        }
+        if best_cost > limit { -1 } else { best }
+    }
+}
+
+// The scope's line from position a (without its last blanks).
+fn line_from(a: i64) -> [u8] {
+    unsafe {
+        var e = line_end(a);
+        while e > a && is_blank(SRC[e - 1]) {
+            e -= 1;
+        }
+        SRC[a..e]
+    }
+}
+
+fn what_name(d: i64, k: i64) {
+    unsafe {
+        buf_str(d, if streq(WHAT, c"patch") { c"OLD " } else { c"ANCHOR" });
+        if streq(WHAT, c"patch") {
+            buf_int(d, k + 1);
+        }
+    }
+}
+
+// OLD k is nowhere in the scope: the line nearest to it, and the command
+// with the text of that line nearest to OLD (one line of OLD), or with
+// --loose (when it would match).
+pub fn no_match(k: i64) {
+    unsafe {
+        let old = buf_slice(OLDS.data[k]);
+        let d = diag(c"error", c"patch.no-match");
+        what_name(d, k);
+        buf_str(d, c" is not in ");
+        buf_bytes(d, buf_slice(SCOPE_NAME));
+        // With --loose?
+        if !LOOSE {
+            LOOSE = true;
+            var starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            var ends = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            find_all(old, &starts, &ends);
+            LOOSE = false;
+            if starts.count == 1 {
+                buf_str(d, c" as written; with other blanks, at line ");
+                buf_int(d, line_of(starts.data[0]));
+                buf_byte(d, '\n');
+                if FROM_STDIN && PAIRS_FILE == 0 as *u8 {
+                    // (the pairs of stdin, in a file: 0.13)
+                    LOOSE = true;
+                    try_patch(-1, old, old);
+                    LOOSE = false;
+                    return;
+                }
+                try_again(if streq(WHAT, c"patch") { c"--loose" } else { c"--loose < text.vl" });
+                return;
+            }
+        }
+        // Its first lines are there, together: where they stop (0.13).
+        if lines_stop(d, old) {
+            return;
+        }
+        // The first line of OLD that is not in the scope.
+        var probe = trimmed(old);
+        var which = 0;
+        var lines = 0;
+        var i = 0;
+        var found_all = true;
+        while i < old.len {
+            var e = i;
+            while e < old.len && old[e] != '\n' {
+                e += 1;
+            }
+            let line = trimmed(old[i..e]);
+            if line.len > 0 {
+                lines += 1;
+                if found_all && count_loose(line) == 0 {
+                    found_all = false;
+                    probe = line;
+                    which = lines;
+                }
+            }
+            i = e + 1;
+        }
+        if lines > 1 && found_all {
+            buf_str(d, c": each of its lines is, but not in this order or not together\n");
+            try_end(try_begin(c"show", target(), true));
+            return;
+        }
+        if lines > 1 {
+            buf_str(d, c" (its line ");
+            buf_int(d, which);
+            buf_str(d, c" is not)");
+        }
+        let near = nearest_line(probe);
+        if near < 0 {
+            buf_str(d, c"; no line is near it\n");
+            try_end(try_begin(c"show", target(), true));
+            return;
+        }
+        buf_str(d, c"; nearest, line ");
+        buf_int(d, line_of(near));
+        buf_str(d, c": ");
+        buf_bytes(d, line_from(near));
+        buf_byte(d, '\n');
+        if lines == 1 {
+            // (the command, with the part of that line nearest to OLD)
+            let line = line_from(near);
+            var from = 0;
+            var to = 0;
+            near_in(probe, line, &from, &to);
+            if to > from {
+                let old_text = line[from..to];
+                if count_in_scope(old_text) == 1 {
+                    if streq(WHAT, c"patch") {
+                        try_patch(k, old_text, buf_slice(NEWS.data[k]));
+                    } else {
+                        try_insert(old_text);
+                    }
+                    return;
+                }
+            }
+        }
+        let at = buf_new();
+        buf_bytes(at, file_text(file_of_pos(near)));
+        buf_byte(at, ':');
+        buf_int(at, line_of(near));
+        try_end(try_begin(c"show", buf_slice(at), true));
+    }
+}
+
+// OLD of several lines whose first lines are in the scope together, but
+// not the next one: says where they match and how the next line differs
+// from the scope's (diagnostic d, then a `try:` showing those lines).
+// Whether it was so (0.13).
+fn lines_stop(d: i64, old: [u8]) -> bool {
+    unsafe {
+        var at = -1;
+        var len = 0;
+        var lines = 0;
+        var n = 0;
+        for i in 0..old.len {
+            if old[i] == '\n' {
+                n += 1;
+                let p = first_in_scope(old[0..i + 1]);
+                if p < 0 {
+                    break;
+                }
+                at = p;
+                len = i + 1;
+                lines = n;
+            }
+        }
+        if at < 0 {
+            return false;
+        }
+        var e = len;
+        while e < old.len && old[e] != '\n' {
+            e += 1;
+        }
+        let next = at + len;
+        let first = line_of(at);
+        let last = line_of(next - 1);
+        buf_str(d, c"; its line");
+        buf_str(d, if lines > 1 { c"s 1-" } else { c" " });
+        if lines > 1 {
+            buf_int(d, lines);
+        } else {
+            buf_byte(d, '1');
+        }
+        buf_str(d, c" match line");
+        if last > first {
+            buf_str(d, c"s ");
+            buf_int(d, first);
+            buf_byte(d, '-');
+        } else {
+            buf_byte(d, ' ');
+        }
+        buf_int(d, last);
+        buf_str(d, c", then its line ");
+        buf_int(d, lines + 1);
+        buf_str(d, c" '");
+        buf_bytes(d, trimmed(old[len..e]));
+        if next >= SCOPE_END {
+            buf_str(d, c"' is past the end\n");
+        } else {
+            buf_str(d, c"' is not line ");
+            buf_int(d, line_of(next));
+            buf_str(d, c" '");
+            buf_bytes(d, trimmed(SRC[next..line_end(next)]));
+            buf_str(d, c"'\n");
+        }
+        let at_text = buf_new();
+        buf_bytes(at_text, file_text(file_of_pos(at)));
+        buf_byte(at_text, ':');
+        buf_int(at_text, first);
+        buf_byte(at_text, '-');
+        buf_int(at_text, if next < SCOPE_END { line_of(next) } else { last });
+        try_end(try_begin(c"text", buf_slice(at_text), true));
+        true
+    }
+}
+
+// Where text first occurs in the scope (byte for byte), or -1.
+fn first_in_scope(text: [u8]) -> i64 {
+    unsafe {
+        var p = SCOPE_START;
+        while p + text.len <= SCOPE_END {
+            var ok = true;
+            for i in 0..text.len {
+                if SRC[p + i] != text[i] {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return p;
+            }
+            p += 1;
+        }
+        -1
+    }
+}
+
+// How often text matches loosely in the scope.
+fn count_loose(text: [u8]) -> i64 {
+    unsafe {
+        let was = LOOSE;
+        LOOSE = true;
+        var starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var ends = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_all(text, &starts, &ends);
+        LOOSE = was;
+        starts.count
+    }
+}
+
+// OLD k matches several times: their lines, and for each (at most three)
+// the command with OLD widened to the lines around it, up to where it is
+// unique.
+pub fn several(k: i64, starts: IntVec, ends: IntVec) {
+    unsafe {
+        let n = starts.count;
+        let d = diag(c"error", c"patch.ambiguous");
+        what_name(d, k);
+        buf_str(d, c" occurs ");
+        buf_int(d, n);
+        buf_str(d, c" times in ");
+        buf_bytes(d, buf_slice(SCOPE_NAME));
+        buf_str(d, c", lines ");
+        let patching = streq(WHAT, c"patch");
+        for i in 0..n {
+            if i > 0 {
+                buf_str(d, c", ");
+            }
+            if i == 10 {
+                buf_str(d, c"...");
+                break;
+            }
+            buf_int(d, line_of(starts.data[i]));
+        }
+        buf_str(d,
+            if patching { c"; give more of the text around it, or --nth N (--all: every one)\n" }
+            else { c"; give more of the text around it, or --nth N\n" });
+        var tried = 0;
+        for i in 0..n {
+            if i == 3 {
+                break;
+            }
+            let s = starts.data[i];
+            let e = ends.data[i];
+            // Whole lines around [s, e), from the first one's text,
+            // widened a line up and down at a time (an anchor: up
+            // after it, down before it, its line staying the same).
+            var a = line_start(s);
+            var b = line_end(if e > s { e - 1 } else { e });
+            var found = false;
+            for round in 0..4 {
+                if round > 0 {
+                    if a > SCOPE_START && (patching || INSERT_AFTER) {
+                        a = line_start(a - 1);
+                    }
+                    if b + 1 < SCOPE_END && (patching || !INSERT_AFTER) {
+                        b = line_end(b + 1);
+                    }
+                }
+                var a1 = a;
+                while a1 < s && (SRC[a1] == ' ' || SRC[a1] == '\t') {
+                    a1 += 1;
+                }
+                if count_in_scope(SRC[a1..b]) == 1 {
+                    a = a1;
+                    found = true;
+                    break;
+                }
+            }
+            if found && !patching {
+                try_insert(SRC[a..b]);
+                tried += 1;
+            } else if found {
+                let new = buf_new();
+                buf_bytes(new, SRC[a..s]);
+                buf_bytes(new,
+                    if LOOSE {
+                        buf_slice(reindented(buf_slice(NEWS.data[k]), s, buf_slice(OLDS.data[k])))
+                    }
+                    else { buf_slice(NEWS.data[k]) });
+                buf_bytes(new, SRC[e..b]);
+                let was = LOOSE;
+                LOOSE = false;
+                try_patch(k, SRC[a..b], buf_slice(new));
+                LOOSE = was;
+                tried += 1;
+            }
+        }
+        if tried == 0 {
+            let at = buf_new();
+            buf_bytes(at, file_text(file_of_pos(starts.data[0])));
+            buf_byte(at, ':');
+            buf_int(at, line_of(starts.data[0]));
+            try_end(try_begin(c"show", buf_slice(at), true));
+        }
+    }
+}
+
+// (0.16) `--nth N` past the last of OLD k's `count` matches.
+pub fn nth_past(k: i64, count: i64) {
+    unsafe {
+        let d = diag(c"error", c"patch.nth");
+        what_name(d, k);
+        buf_str(d, c" occurs ");
+        buf_int(d, count);
+        buf_str(d, if count == 1 { c" time in " } else { c" times in " });
+        buf_bytes(d, buf_slice(SCOPE_NAME));
+        buf_str(d, c"; --nth ");
+        buf_int(d, NTH);
+        buf_str(d, c" is past the last\n");
+    }
+}
+
+// `try:` the command with pair k as old, new (the other pairs as given).
+// Pairs of several lines, or read as blocks, are written to a file for
+// `--pairs FILE` (0.13: `$'...'` quoting is refused by agent harnesses).
+fn try_patch(k: i64, old: [u8], new: [u8]) {
+    unsafe {
+        var lines = has_control(old) || has_control(new);
+        for j in 0..OLDS.count {
+            if has_control(buf_slice(OLDS.data[j])) || has_control(buf_slice(NEWS.data[j])) {
+                lines = true;
+            }
+        }
+        // (0.15: pairs of several targets name them, `@@ NAME` or --in)
+        let multi = TARGETS.count > 1;
+        let path = if FROM_STDIN || lines || multi { try_pairs_file(k, old, new) }
+            else { 0 as *u8 };
+        let out = try_begin(WHAT, target(), !multi);
+        if path != 0 as *u8 {
+            buf_str(out, c" --pairs");
+            put_sh(out, c_slice(path));
+        } else {
+            for j in 0..OLDS.count {
+                if multi && (j == 0 || PAIR_TARGET.data[j] != PAIR_TARGET.data[j - 1]) {
+                    buf_str(out, c" --in");
+                    put_sh(out, c_slice(TARGETS.data[PAIR_TARGET.data[j]] as *u8));
+                }
+                buf_str(out, c" --old");
+                put_sh(out, if j == k { old } else { buf_slice(OLDS.data[j]) });
+                buf_str(out, c" --new");
+                put_sh(out, if j == k { new } else { buf_slice(NEWS.data[j]) });
+            }
+        }
+        if LOOSE {
+            buf_str(out, c" --loose");
+        }
+        if DRY_RUN {
+            buf_str(out, c" --dry-run");
+        }
+        if NO_CHECK {
+            buf_str(out, c" --no-check");
+        }
+        try_end(out);
+    }
+}
+
+fn has_control(s: [u8]) -> bool {
+    for i in 0..s.len {
+        if s[i] < ' ' {
+            return true;
+        }
+    }
+    false
+}
+
+// The pairs with pair k as old, new (k < 0: as given), as blocks in a file
+// of the journal's directory, `try-N.pairs` (N counting the files of this
+// run): its path, relative to the current directory when it is under it;
+// 0 without a journal.
+fn try_pairs_file(k: i64, old: [u8], new: [u8]) -> *u8 {
+    unsafe {
+        let dir = journal_dir(ROOT_PATH);
+        if dir == 0 as *u8 || !make_dirs(dir) {
+            return 0 as *u8;
+        }
+        let text = buf_new();
+        let multi = TARGETS.count > 1;
+        for j in 0..OLDS.count {
+            if multi && (j == 0 || PAIR_TARGET.data[j] != PAIR_TARGET.data[j - 1]) {
+                buf_str(text, c"@@ ");
+                buf_str(text, TARGETS.data[PAIR_TARGET.data[j]] as *u8);
+                buf_byte(text, '\n');
+            }
+            buf_str(text, c"<<<<<<< OLD\n");
+            let o = if j == k { old } else { buf_slice(OLDS.data[j]) };
+            buf_bytes(text, o);
+            if o.len > 0 {
+                buf_byte(text, '\n');
+            }
+            buf_str(text, c"=======\n");
+            let n = if j == k { new } else { buf_slice(NEWS.data[j]) };
+            buf_bytes(text, n);
+            if n.len > 0 {
+                buf_byte(text, '\n');
+            }
+            buf_str(text, c">>>>>>> NEW\n");
+        }
+        TRY_FILES += 1;
+        let path = buf_new();
+        buf_str(path, dir);
+        buf_str(path, c"/try-");
+        buf_int(path, TRY_FILES);
+        buf_str(path, c".pairs");
+        let p = buf_cstr(path);
+        if !write_file_if(p, buf_slice(text)) {
+            return 0 as *u8;
+        }
+        let here = c_slice(absolute_path(c"."));
+        let full = buf_slice(path);
+        if full.len > here.len + 1 && bytes_eq(full[0..here.len], here) && full[here.len] == '/' {
+            return &p[here.len + 1];
+        }
+        p
+    }
+}
+
+// The pair files written by this run.
+static var TRY_FILES: i64 = 0;
+
+// `try:` the insert command with this anchor.
+fn try_insert(anchor: [u8]) {
+    unsafe {
+        let out = try_begin(WHAT, target(), true);
+        buf_str(out, if INSERT_AFTER { c" --after" } else { c" --before" });
+        put_sh(out, anchor);
+        if LOOSE {
+            buf_str(out, c" --loose");
+        }
+        if DRY_RUN {
+            buf_str(out, c" --dry-run");
+        }
+        buf_str(out, c" < text.vl");
+        try_end(out);
+    }
+}
+
+// A word of a command line, quoted as the shell needs: `'...'` (a `'` as
+// `'\''`), or `$'...'` for text with newlines or tabs.
+pub fn put_sh(out: i64, s: [u8]) {
+    unsafe {
+        buf_byte(out, ' ');
+        var plain = s.len > 0;
+        var control = false;
+        for i in 0..s.len {
+            let c = s[i];
+            if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+                || c == '_' || c == ':' || c == '.' || c == '/' || c == '-' || c == '+' || c == '='
+                || c == ',') {
+                plain = false;
+            }
+            if c < ' ' {
+                control = true;
+            }
+        }
+        if plain {
+            buf_bytes(out, s);
+            return;
+        }
+        if control {
+            buf_str(out, c"$'");
+            for i in 0..s.len {
+                let c = s[i];
+                if c == '\n' {
+                    buf_str(out, c"\\n");
+                } else if c == '\t' {
+                    buf_str(out, c"\\t");
+                } else if c == '\r' {
+                    buf_str(out, c"\\r");
+                } else if c == '\\' || c == '\'' {
+                    buf_byte(out, '\\');
+                    buf_byte(out, c);
+                } else {
+                    buf_byte(out, c);
+                }
+            }
+            buf_byte(out, '\'');
+            return;
+        }
+        buf_byte(out, '\'');
+        for i in 0..s.len {
+            if s[i] == '\'' {
+                buf_str(out, c"'\\''");
+            } else {
+                buf_byte(out, s[i]);
+            }
+        }
+        buf_byte(out, '\'');
+    }
+}

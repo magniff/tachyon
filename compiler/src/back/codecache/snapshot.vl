@@ -1,0 +1,676 @@
+// (0.18.1) The code cache's encoding (back/codecache): bytes of
+// variable-length numbers, and a function's IR tables in them, every
+// field as it is but the ids an edit elsewhere renumbers (a SADDR's
+// string or constant, a GADDR's or CALLC's symbol, a CALL's or FADDR's
+// function), which are indices into the entry's tables (Rel), mapped back
+// to this compilation's ids when the entry is used.
+
+use crate::base::{IntVec, alloc_array, alloc_zeroed, free, memcpy};
+use crate::middle::ctx::FnCtx;
+use crate::middle::ir::{Block, Cond, IRFUNCS, IRTables, Inst, Op, Slot, Term};
+use crate::middle::lower::ssa::HMap;
+
+// ---- Bytes ----
+
+pub struct ByteBuf { data: *u8, len: i64, cap: i64 }
+
+pub fn bb_new() -> ByteBuf {
+    ByteBuf { data: 0 as *u8, len: 0, cap: 0 }
+}
+
+pub fn bb_reserve(b: inout ByteBuf, extra: i64) {
+    unsafe {
+        if b.len + extra <= b.cap {
+            return;
+        }
+        var cap = b.cap * 2;
+        if cap < b.len + extra {
+            cap = b.len + extra;
+        }
+        if cap < 256 {
+            cap = 256;
+        }
+        let n = alloc_zeroed(cap);
+        if b.len > 0 {
+            memcpy(n, b.data, b.len as u64);
+        }
+        free(b.data);
+        b.data = n;
+        b.cap = cap;
+    }
+}
+
+pub fn put_u(b: inout ByteBuf, x: u64) {
+    unsafe {
+        bb_reserve(&b, 10);
+        var v = x;
+        let p = b.data;
+        var n = b.len;
+        while v >= 128 {
+            p[n] = ((v & 127) | 128) as u8;
+            v = v >> 7;
+            n += 1;
+        }
+        p[n] = v as u8;
+        b.len = n + 1;
+    }
+}
+
+// A signed number (zigzag).
+pub fn put_s(b: inout ByteBuf, x: i64) {
+    put_u(&b, ((x << 1) ^ (x >> 63)) as u64);
+}
+
+pub fn put_bytes(b: inout ByteBuf, p: *u8, n: i64) {
+    unsafe {
+        put_u(&b, n as u64);
+        bb_reserve(&b, n);
+        if n > 0 {
+            memcpy(&b.data[b.len], p, n as u64);
+        }
+        b.len += n;
+    }
+}
+
+// Bytes being read: `bad` once a read went past the end (every read
+// after gives 0).
+pub struct Reader { p: *u8, at: i64, end: i64, bad: bool }
+
+pub fn get_u(r: inout Reader) -> u64 {
+    unsafe {
+        var x: u64 = 0;
+        var shift: u64 = 0;
+        while r.at < r.end && shift < 64 {
+            let c = r.p[r.at] as u64;
+            r.at += 1;
+            x = x | ((c & 127) << shift);
+            if c < 128 {
+                return x;
+            }
+            shift += 7;
+        }
+        r.bad = true;
+        0
+    }
+}
+
+pub fn get_s(r: inout Reader) -> i64 {
+    let u = get_u(&r);
+    ((u >> 1) as i64) ^ -((u & 1) as i64)
+}
+
+// A count of at most what is left (each item at least a byte).
+pub fn get_count(r: inout Reader) -> i64 {
+    unsafe {
+        let n = get_u(&r);
+        if n > (r.end - r.at) as u64 {
+            r.bad = true;
+            return 0;
+        }
+        n as i64
+    }
+}
+
+// Bytes in place: their start (and *n their length).
+pub fn get_bytes(r: inout Reader, n: inout i64) -> *u8 {
+    unsafe {
+        let len = get_count(&r);
+        let p = &r.p[r.at];
+        r.at += len;
+        n = len;
+        p
+    }
+}
+
+// ---- The entry's tables ----
+
+// The ids of an entry's outputs that are renumbered, each kind in a table
+// of its own (the index + 1 of an id in its map): strings, by where they
+// come from (`src` a function whose strings the task read, `k` the place
+// among its strings); constant data, by placeholder; symbols; functions
+// (FNS).
+pub struct Rel {
+    str_map: HMap, strs: IntVec,
+    const_map: HMap, consts: IntVec,
+    sym_map: HMap, syms: IntVec,
+    fn_map: HMap, fns: IntVec,
+    // (0.18.1) RTID values (middle::ir::ir_rtid's imm).
+    rtid_map: HMap, rtids: IntVec,
+    // A string id: (src << 32 | k) + 1, from the lists the task read.
+    src_map: HMap,
+    // Whether an output had an id none of the lists has.
+    bad: bool,
+}
+
+pub fn rel_new() -> Rel {
+    Rel {
+        str_map: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
+        strs: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        const_map: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
+        consts: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        sym_map: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
+        syms: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        fn_map: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
+        fns: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        rtid_map: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
+        rtids: IntVec { data: 0 as *i64, count: 0, cap: 0 },
+        src_map: HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 },
+        bad: false,
+    }
+}
+
+pub fn rel_clear(r: inout Rel) {
+    unsafe {
+        r.str_map.clear();
+        r.strs.count = 0;
+        r.const_map.clear();
+        r.consts.count = 0;
+        r.sym_map.clear();
+        r.syms.count = 0;
+        r.fn_map.clear();
+        r.fns.count = 0;
+        r.rtid_map.clear();
+        r.rtids.count = 0;
+        r.src_map.clear();
+        r.bad = false;
+    }
+}
+
+// A map key from an id (never 0).
+fn id_key(id: i64) -> i64 {
+    (id << 1) | 1
+}
+
+// The strings of function `src` (as the task read them): string list[k]
+// is (src, k), unless an earlier list has it.
+pub fn rel_add_source(r: inout Rel, src: i64, list: *i64, n: i64) {
+    unsafe {
+        for k in 0..n {
+            let key = id_key(list[k]);
+            if r.src_map.get(key) == 0 {
+                r.src_map.put(key, ((src << 32) | k) + 1);
+            }
+        }
+    }
+}
+
+fn table_index(map: *HMap, list: *IntVec, id: i64) -> i64 {
+    unsafe {
+        let key = id_key(id);
+        let i = (*map).get(key);
+        if i > 0 {
+            return i - 1;
+        }
+        (*list).push(id);
+        (*map).put(key, (*list).count);
+        (*list).count - 1
+    }
+}
+
+// A SADDR's id: (index << 1) | 1 for constant data a task made, index
+// << 1 for a string.
+pub fn rel_saddr(r: *Rel, id: i64) -> i64 {
+    unsafe {
+        if id < 0 {
+            return (table_index(&(*r).const_map, &(*r).consts, id) << 1) | 1;
+        }
+        if (*r).src_map.get(id_key(id)) == 0 {
+            (*r).bad = true;
+        }
+        table_index(&(*r).str_map, &(*r).strs, id) << 1
+    }
+}
+
+pub fn rel_sym(r: inout Rel, sym: i64) -> i64 {
+    unsafe { table_index(&r.sym_map, &r.syms, sym) }
+}
+
+pub fn rel_fn(r: *Rel, f: i64) -> i64 {
+    unsafe { table_index(&(*r).fn_map, &(*r).fns, f) }
+}
+
+pub fn rel_rtid(r: *Rel, imm: i64) -> i64 {
+    unsafe { table_index(&(*r).rtid_map, &(*r).rtids, imm) }
+}
+
+// The string at table index i: (src << 32 | k).
+pub fn rel_str_source(r: Rel, i: i64) -> i64 {
+    unsafe { r.src_map.get(id_key(r.strs.data[i])) - 1 }
+}
+
+// The tables mapped to this compilation's ids (the entry's, read).
+pub struct Ids { strs: *i64, nstrs: i64, consts: *i64, nconsts: i64, syms: *i64, nsyms: i64,
+    fns: *i64, nfns: i64, rtids: *i64, nrtids: i64 }
+
+pub fn ids_free(t: Ids) {
+    unsafe {
+        free(t.strs as *u8);
+        free(t.consts as *u8);
+        free(t.syms as *u8);
+        free(t.fns as *u8);
+        free(t.rtids as *u8);
+    }
+}
+
+// SADDR's id from its index, or 0 with *bad set.
+pub fn ids_saddr(t: Ids, x: i64, bad: inout bool) -> i64 {
+    unsafe {
+        let i = x >> 1;
+        if (x & 1) != 0 {
+            if i < 0 || i >= t.nconsts {
+                bad = true;
+                return 0;
+            }
+            return t.consts[i];
+        }
+        if i < 0 || i >= t.nstrs {
+            bad = true;
+            return 0;
+        }
+        t.strs[i]
+    }
+}
+
+pub fn ids_at(p: *i64, n: i64, i: i64, bad: inout bool) -> i64 {
+    unsafe {
+        if i < 0 || i >= n {
+            bad = true;
+            return 0;
+        }
+        p[i]
+    }
+}
+
+// ---- A function's IR ----
+
+fn put_ref(b: inout ByteBuf, at: i64, x: i64) {
+    // (an instruction: 0 for none, else 1 + how far from `at`, zigzag)
+    if x == 0 {
+        put_u(&b, 0);
+    } else {
+        let d = x - at;
+        put_u(&b, (((d << 1) ^ (d >> 63)) as u64) + 1);
+    }
+}
+
+fn get_ref(r: inout Reader, at: i64) -> i64 {
+    let u = get_u(&r);
+    if u == 0 {
+        return 0;
+    }
+    let z = u - 1;
+    at + (((z >> 1) as i64) ^ -((z & 1) as i64))
+}
+
+fn put_ints(b: inout ByteBuf, v: *IntVec) {
+    unsafe {
+        put_u(&b, (*v).count as u64);
+        put_u(&b, (*v).cap as u64);
+        for i in 0..(*v).count {
+            put_s(&b, (*v).data[i]);
+        }
+    }
+}
+
+fn get_ints(r: inout Reader) -> IntVec {
+    unsafe {
+        let n = get_count(&r);
+        let cap = get_u(&r) as i64;
+        if cap < n || cap > n + n + 64 {
+            r.bad = true;
+            return IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        }
+        var v = IntVec { data: 0 as *i64, count: n, cap: cap };
+        if cap > 0 {
+            v.data = alloc_array::<i64>(cap);
+        }
+        for i in 0..n {
+            v.data[i] = get_s(&r);
+        }
+        v
+    }
+}
+
+// Writes IR function fi's tables (current in cx) and its IRFUNCS entry.
+pub fn encode_ir(cx: sink *FnCtx, fi: i64, b: inout ByteBuf, rel: *Rel) {
+    unsafe {
+        let irf = IRFUNCS[fi];
+        put_s(&b, irf.entry);
+        put_s(&b, irf.result_ptr);
+        put_ints(&b, &IRFUNCS[fi].blocks);
+        put_ints(&b, &IRFUNCS[fi].slots);
+        put_u(&b, cx.inst_count as u64);
+        put_u(&b, cx.inst_cap as u64);
+        for i in 0..cx.inst_count {
+            let v = cx.insts[i];
+            let op = v.op;
+            put_u(&b, ((op as i64) | ((v.cond as i64) << 8)) as u64);
+            put_s(&b, v.ty);
+            put_ref(&b, i, v.a);
+            put_ref(&b, i, v.b);
+            put_ref(&b, i, v.c);
+            if op == Op::SAddr {
+                put_s(&b, rel_saddr(rel, v.imm));
+            } else if op == Op::GAddr || op == Op::CallC {
+                put_s(&b, rel_sym(&*rel, v.imm));
+            } else if op == Op::Call || op == Op::FAddr {
+                put_s(&b, rel_fn(rel, v.imm));
+            } else if op == Op::RtId {
+                put_s(&b, rel_rtid(rel, v.imm));
+            } else {
+                put_s(&b, v.imm);
+            }
+            put_s(&b, v.imm2);
+            put_s(&b, v.args);
+            put_s(&b, v.nargs);
+            put_s(&b, v.block);
+            put_ref(&b, i, v.prev);
+            put_ref(&b, i, v.next);
+            put_ref(&b, i, v.repl);
+            put_s(&b, v.mark);
+            put_s(&b, v.aux);
+            put_s(&b, v.scale);
+        }
+        put_u(&b, cx.block_count as u64);
+        put_u(&b, cx.block_cap as u64);
+        for i in 0..cx.block_count {
+            let k = cx.blocks[i];
+            put_s(&b, k.first);
+            put_s(&b, k.last);
+            put_ints(&b, &cx.blocks[i].preds);
+            put_u(&b, k.term as i64 as u64);
+            put_s(&b, k.cond);
+            put_s(&b, k.s0);
+            put_s(&b, k.s1);
+            put_s(&b, k.sealed);
+            put_s(&b, k.incomplete);
+            // (its function: this one, or 0 for block 0)
+            if k.func != fi && k.func != 0 {
+                (*rel).bad = true;
+            }
+            put_s(&b, if k.func == fi { -1 } else { k.func });
+            put_s(&b, k.removed);
+            put_s(&b, k.order);
+            put_s(&b, k.idom);
+            put_s(&b, k.mark);
+            put_s(&b, k.aux);
+            put_s(&b, k.loop_depth);
+            put_s(&b, k.novec);
+            put_s(&b, k.count);
+            put_s(&b, k.cases);
+            put_s(&b, k.ncases);
+            put_s(&b, k.succs);
+            put_s(&b, k.nsucc);
+        }
+        put_u(&b, cx.slot_count as u64);
+        put_u(&b, cx.slot_cap as u64);
+        for i in 0..cx.slot_count {
+            let s = cx.slots[i];
+            put_s(&b, s.size);
+            put_s(&b, s.align);
+            put_s(&b, s.offset);
+            put_s(&b, s.escapes);
+            put_s(&b, s.ty);
+        }
+        put_ints(&b, &cx.args);
+        put_ints(&b, &cx.argty);
+        put_ints(&b, &cx.swcases);
+        put_ints(&b, &cx.inst_loc);
+    }
+}
+
+// A function's IR read back (not yet installed).
+pub struct IRCopy { entry: i64, result_ptr: i64, blocks: IntVec, slots: IntVec, t: IRTables }
+
+fn sized(cap: i64, n: i64, r: inout Reader) -> bool {
+    unsafe {
+        if cap < n || cap > n + n + 64 {
+            r.bad = true;
+            return false;
+        }
+        true
+    }
+}
+
+// Reads a function's IR, for IR function fi, with the entry's ids mapped
+// by `ids`; *bad when it does not read whole.
+pub fn decode_ir(r: inout Reader, fi: i64, ids: inout Ids, out: *IRCopy) -> bool {
+    unsafe {
+        var bad = false;
+        (*out).entry = get_s(&r);
+        (*out).result_ptr = get_s(&r);
+        (*out).blocks = get_ints(&r);
+        (*out).slots = get_ints(&r);
+        let n = get_count(&r);
+        let cap = get_u(&r) as i64;
+        if !sized(cap, n, &r) || r.bad {
+            return false;
+        }
+        let insts = alloc_array::<Inst>(if cap > 0 { cap } else { 1 });
+        (*out).t.insts = insts;
+        (*out).t.inst_count = n;
+        (*out).t.inst_cap = cap;
+        for i in 0..n {
+            let opc = get_u(&r) as i64;
+            let op = (opc & 255) as Op;
+            insts[i].op = op;
+            insts[i].cond = ((opc >> 8) & 255) as Cond;
+            insts[i].ty = get_s(&r);
+            insts[i].a = get_ref(&r, i);
+            insts[i].b = get_ref(&r, i);
+            insts[i].c = get_ref(&r, i);
+            let imm = get_s(&r);
+            if op == Op::SAddr {
+                insts[i].imm = ids_saddr(ids, imm, &bad);
+            } else if op == Op::GAddr || op == Op::CallC {
+                insts[i].imm = ids_at(ids.syms, ids.nsyms, imm, &bad);
+            } else if op == Op::Call || op == Op::FAddr {
+                insts[i].imm = ids_at(ids.fns, ids.nfns, imm, &bad);
+            } else if op == Op::RtId {
+                insts[i].imm = ids_at(ids.rtids, ids.nrtids, imm, &bad);
+            } else {
+                insts[i].imm = imm;
+            }
+            insts[i].imm2 = get_s(&r);
+            insts[i].args = get_s(&r);
+            insts[i].nargs = get_s(&r);
+            insts[i].block = get_s(&r);
+            insts[i].prev = get_ref(&r, i);
+            insts[i].next = get_ref(&r, i);
+            insts[i].repl = get_ref(&r, i);
+            insts[i].mark = get_s(&r);
+            insts[i].aux = get_s(&r);
+            insts[i].scale = get_s(&r);
+        }
+        let nb = get_count(&r);
+        let bcap = get_u(&r) as i64;
+        if !sized(bcap, nb, &r) || r.bad {
+            return false;
+        }
+        let blocks = alloc_array::<Block>(if bcap > 0 { bcap } else { 1 });
+        (*out).t.blocks = blocks;
+        (*out).t.block_count = nb;
+        (*out).t.block_cap = bcap;
+        for i in 0..nb {
+            blocks[i].first = get_s(&r);
+            blocks[i].last = get_s(&r);
+            blocks[i].preds = get_ints(&r);
+            blocks[i].term = (get_u(&r) as i64) as Term;
+            blocks[i].cond = get_s(&r);
+            blocks[i].s0 = get_s(&r);
+            blocks[i].s1 = get_s(&r);
+            blocks[i].sealed = get_s(&r);
+            blocks[i].incomplete = get_s(&r);
+            let func = get_s(&r);
+            blocks[i].func = if func == -1 { fi } else { func };
+            blocks[i].removed = get_s(&r);
+            blocks[i].order = get_s(&r);
+            blocks[i].idom = get_s(&r);
+            blocks[i].mark = get_s(&r);
+            blocks[i].aux = get_s(&r);
+            blocks[i].loop_depth = get_s(&r);
+            blocks[i].novec = get_s(&r);
+            blocks[i].count = get_s(&r);
+            blocks[i].cases = get_s(&r);
+            blocks[i].ncases = get_s(&r);
+            blocks[i].succs = get_s(&r);
+            blocks[i].nsucc = get_s(&r);
+        }
+        let ns = get_count(&r);
+        let scap = get_u(&r) as i64;
+        if !sized(scap, ns, &r) || r.bad {
+            return false;
+        }
+        let slots = alloc_array::<Slot>(if scap > 0 { scap } else { 1 });
+        (*out).t.slots = slots;
+        (*out).t.slot_count = ns;
+        (*out).t.slot_cap = scap;
+        for i in 0..ns {
+            slots[i].size = get_s(&r);
+            slots[i].align = get_s(&r);
+            slots[i].offset = get_s(&r);
+            slots[i].escapes = get_s(&r);
+            slots[i].ty = get_s(&r);
+        }
+        (*out).t.args = get_ints(&r);
+        (*out).t.argty = get_ints(&r);
+        (*out).t.swcases = get_ints(&r);
+        (*out).t.inst_loc = get_ints(&r);
+        !bad && !r.bad && valid_copy(*out)
+    }
+}
+
+// Whether the ids a read copy holds are within its tables (a damaged
+// entry is a miss, not a crash later).
+fn valid_copy(c: IRCopy) -> bool {
+    unsafe {
+        let n = c.t.inst_count;
+        let nb = c.t.block_count;
+        if n < 1 || nb < 1 || c.entry < 0 || c.entry >= nb || c.result_ptr < 0
+            || c.result_ptr >= n {
+            return false;
+        }
+        for i in 0..c.blocks.count {
+            let b = c.blocks.data[i];
+            if b < 0 || b >= nb {
+                return false;
+            }
+        }
+        for i in 0..n {
+            let v = c.t.insts[i];
+            if v.a < 0 || v.a >= n || v.b < 0 || v.b >= n || v.c < 0 || v.c >= n || v.prev < 0
+                || v.prev >= n || v.next < 0 || v.next >= n || v.repl < 0 || v.repl >= n
+                || v.block < 0 || v.block >= nb {
+                return false;
+            }
+        }
+        for i in 0..nb {
+            let b = c.t.blocks[i];
+            if b.first < 0 || b.first >= n || b.last < 0 || b.last >= n {
+                return false;
+            }
+            for k in 0..b.preds.count {
+                if b.preds.data[k] < 0 || b.preds.data[k] >= nb {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+pub fn free_copy(c: *IRCopy) {
+    unsafe {
+        free((*c).blocks.data as *u8);
+        free((*c).slots.data as *u8);
+        if (*c).t.blocks != 0 as *Block {
+            for b in 0..(*c).t.block_count {
+                free((*c).t.blocks[b].preds.data as *u8);
+            }
+        }
+        free((*c).t.insts as *u8);
+        free((*c).t.blocks as *u8);
+        free((*c).t.slots as *u8);
+        free((*c).t.args.data as *u8);
+        free((*c).t.argty.data as *u8);
+        free((*c).t.swcases.data as *u8);
+        free((*c).t.inst_loc.data as *u8);
+    }
+}
+
+// (testing, $VOLE_CACHE_CHECK) Where a read copy differs from IR
+// function fi's tables (current in cx): 0 nowhere, else a code of the
+// field (instruction fields 1.., block fields 100.., the rest 200..).
+pub fn copy_differs(cx: sink *FnCtx, fi: i64, c: inout IRCopy) -> i64 {
+    unsafe {
+        let irf = IRFUNCS[fi];
+        if c.entry != irf.entry || c.result_ptr != irf.result_ptr {
+            return 200;
+        }
+        if !same_ints(&c.blocks, &IRFUNCS[fi].blocks)
+            || !same_ints(&c.slots, &IRFUNCS[fi].slots) {
+            return 201;
+        }
+        let t = c.t;
+        if t.inst_count != cx.inst_count || t.block_count != cx.block_count
+            || t.slot_count != cx.slot_count {
+            return 202;
+        }
+        for i in 0..t.inst_count {
+            let a = t.insts[i];
+            let b = cx.insts[i];
+            if a.op != b.op { return 1; }
+            if a.cond != b.cond { return 2; }
+            if a.ty != b.ty { return 3; }
+            if a.a != b.a || a.b != b.b || a.c != b.c { return 4; }
+            if a.imm != b.imm { return 5; }
+            if a.imm2 != b.imm2 { return 6; }
+            if a.args != b.args || a.nargs != b.nargs { return 7; }
+            if a.block != b.block { return 8; }
+            if a.prev != b.prev || a.next != b.next { return 9; }
+            if a.repl != b.repl { return 10; }
+            if a.mark != b.mark || a.aux != b.aux { return 11; }
+            if a.scale != b.scale { return 12; }
+        }
+        for i in 0..t.block_count {
+            let a = t.blocks[i];
+            let b = cx.blocks[i];
+            if a.first != b.first || a.last != b.last { return 101; }
+            if !same_ints(&t.blocks[i].preds, &cx.blocks[i].preds) { return 102; }
+            if a.term != b.term || a.cond != b.cond || a.s0 != b.s0 || a.s1 != b.s1 { return 103; }
+            if a.sealed != b.sealed || a.incomplete != b.incomplete || a.removed != b.removed {
+                return 104;
+            }
+            if a.func != b.func { return 107 + 1000 * i + 1000000 * b.func; }
+            if a.order != b.order || a.idom != b.idom || a.mark != b.mark || a.aux != b.aux
+                || a.loop_depth != b.loop_depth { return 105; }
+            if a.novec != b.novec || a.count != b.count || a.cases != b.cases
+                || a.ncases != b.ncases || a.succs != b.succs || a.nsucc != b.nsucc { return 106; }
+        }
+        for i in 0..t.slot_count {
+            let a = t.slots[i];
+            let b = cx.slots[i];
+            if a.size != b.size || a.align != b.align || a.offset != b.offset
+                || a.escapes != b.escapes || a.ty != b.ty { return 203; }
+        }
+        if !same_ints(&t.args, &cx.args) { return 204; }
+        if !same_ints(&t.argty, &cx.argty) { return 205; }
+        if !same_ints(&t.swcases, &cx.swcases) { return 206; }
+        if !same_ints(&t.inst_loc, &cx.inst_loc) { return 207; }
+        0
+    }
+}
+
+fn same_ints(a: *IntVec, b: *IntVec) -> bool {
+    unsafe {
+        if (*a).count != (*b).count {
+            return false;
+        }
+        for i in 0..(*a).count {
+            if (*a).data[i] != (*b).data[i] {
+                return false;
+            }
+        }
+        true
+    }
+}

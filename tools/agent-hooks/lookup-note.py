@@ -3,20 +3,20 @@
 note when a lookup prints again what it printed earlier in the session.
 
 Registered for PostToolUse on Bash (tools/agent-hooks/settings-eval.json,
-condition `note`). A lookup is one tachyonc call per command line of
-`guide`, `query`, `explain` or `--help` (through any copy: target/tachyonc,
-target/tools/tachyonc, a shell variable; tachyonc_cmd.py). When the same
+condition `note`). A lookup is one volec call per command line of
+`guide`, `query`, `explain` or `--help` (through any copy: target/volec,
+target/tools/volec, a shell variable; volec_cmd.py). When the same
 call (its words after the program) prints the same text (its stdout's
 hash) as an earlier one in the session, the call's result gets one line:
 
-    note: `tachyonc guide std` printed the same text at shell call 4 of this session
+    note: `volec guide std` printed the same text at shell call 4 of this session
 
 once per call and session, never again. The call itself is not blocked:
 an older tool result may have been cleared from the context, and then
 the repeat is how the agent gets it back; the note only says it was
 there (a nudge or a context-size problem: the eval tells which). A query
 whose answer changed (an edit between) gets no note. Text: hints.txt,
-`repeat-lookup`. TACHYON_LOOKUP_NOTE=0 turns it off. State: hookstate.py,
+`repeat-lookup`. VOLE_LOOKUP_NOTE=0 turns it off. State: hookstate.py,
 its own part (`lookup`) of the session's state. Development tooling only.
 """
 import json
@@ -77,7 +77,7 @@ def note_for(event, st, command, out, tc, hs):
 
 
 def main():
-    if os.environ.get("TACHYON_LOOKUP_NOTE") == "0":
+    if os.environ.get("VOLE_LOOKUP_NOTE") == "0":
         return 0
     try:
         event = json.load(sys.stdin)
@@ -88,7 +88,7 @@ def main():
     command = (event.get("tool_input") or {}).get("command") or ""
     resp = event.get("tool_response") or {}
     out = (resp.get("stdout") or "") if isinstance(resp, dict) else str(resp)
-    tc = _load("tachyonc_cmd", "tachyonc_cmd.py")
+    tc = _load("volec_cmd", "volec_cmd.py")
     hs = _load("hookstate", "hookstate.py")
     st = hs.load(event, "lookup")
     note = note_for(event, st, command, out, tc, hs)

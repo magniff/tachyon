@@ -1,0 +1,768 @@
+// Constant folding, sparse conditional constant propagation (Wegman &
+// Zadeck, "Constant Propagation with Conditional Branches", TOPLAS 1991)
+// and instruction combining.
+//
+// Folding computes exactly what the code generator's instructions compute
+// at run time (not what consteval.vl computes for constant items, which
+// differs for out-of-range float-to-integer conversions): wrapping
+// arithmetic on canonical 64-bit values, `x / 0 == 0`, `x % 0 == x`,
+// `MIN / -1 == MIN`, shift amounts modulo 32 (types up to 32 bits) or 64,
+// IEEE comparisons, and the saturating float-to-integer conversions of
+// emit_float_to_int.
+
+pub mod lattice;
+mod arch;
+
+use crate::base::{IntVec, free};
+use crate::front::consteval::{bits_of, f64_of_bits, float_const, wrap_int};
+use crate::front::types::{
+    TY_BOOL, TY_F32, TY_I64, TY_U64, int_bits, is_float, is_integer, is_signed,
+};
+use crate::gen0::target::log2;
+use crate::middle::ctx::FnCtx;
+use crate::middle::ir::{
+    BITS_LEADING, BITS_ONES, Cond, IRFUNCS, Op, Term, ir_append, ir_arg, ir_insert_before, ir_make,
+    ir_replace, ir_resolve_operands, ir_val,
+};
+use crate::middle::ir::Op::{
+    Add, And, BNot, Cmp, Const, Conv, Div, Load, Mul, Neg, Not, Or, Phi, Rem, Shl, Shr, Store, Sub,
+    Xor,
+};
+use crate::middle::loops::new_phi_in;
+use crate::middle::opt::resolve_all;
+use std::Option;
+
+// ---- Folding ----
+
+pub fn shift_amount(b: i64, ty: i64) -> u64 {
+    (b & (if int_bits(ty) == 64 { 63 } else { 31 })) as u64
+}
+
+// (0.16) BITS of the constant a: its 1 bits, its leading or its trailing
+// zeros (kind: BITS_ONES, BITS_LEADING, BITS_TRAILING; 64 for 0).
+pub fn fold_bits(kind: i64, a: i64) -> i64 {
+    let x = a as u64;
+    var n = 0;
+    for i in 0..64 {
+        let bit = (x >> (if kind == BITS_LEADING { 63 - i } else { i }) as u64) & 1;
+        if kind == BITS_ONES {
+            n += bit as i64;
+        } else if bit != 0 {
+            return i;
+        }
+    }
+    if kind == BITS_ONES { n } else { 64 }
+}
+
+// a <op> b (or <op> a) for constant operands, as the machine computes it.
+pub fn fold_value(cx: sink *FnCtx, v: i64, a: i64, b: i64) -> i64 {
+    unsafe {
+        let op = cx.insts[v].op;
+        let ty = cx.insts[v].ty;
+        match op {
+            Const => return cx.insts[v].imm,
+            Cmp => return fold_compare(cx.insts[v].cond, cx.insts[v].imm2, a, b) as i64,
+            Conv => return fold_conversion(cx.insts[v].imm2, ty, a),
+            Op::Bits => return fold_bits(cx.insts[v].imm, a),
+            _ => {}
+        }
+        if is_float(ty) {
+            let x = f64_of_bits(a);
+            let y = f64_of_bits(b);
+            return match op {
+                Add => float_const(x + y, ty),
+                Sub => float_const(x - y, ty),
+                Mul => float_const(x * y, ty),
+                Div => float_const(x / y, ty),
+                // Negation flips the sign bit (also of zero and NaN).
+                _ => a ^ (1 << 63),
+            };
+        }
+        match op {
+            Add => wrap_int(a + b, ty),
+            Sub => wrap_int(a - b, ty),
+            Mul => wrap_int(a * b, ty),
+            Div | Rem => fold_division(op == Rem, ty, a, b),
+            And => wrap_int(a & b, ty),
+            Or => wrap_int(a | b, ty),
+            Xor => wrap_int(a ^ b, ty),
+            Shl => wrap_int(a << shift_amount(b, ty), ty),
+            Shr => if is_signed(ty) {
+                wrap_int(a >> shift_amount(b, ty), ty)
+            } else {
+                wrap_int(((a as u64) >> shift_amount(b, ty)) as i64, ty)
+            },
+            Neg => wrap_int(0 - a, ty),
+            Not => 1 - a,
+            _ => wrap_int(~a, ty),
+        }
+    }
+}
+
+// Whether folding v gave a NaN made by float arithmetic: its bits are the
+// machine's (AArch64's default NaN is positive, x86-64's negative), so it
+// is not made a constant: the target computes it at run time (and the
+// compiler's output does not depend on its host). SCCP still folds what
+// depends on it alone (sccp_rewrite).
+pub fn fold_makes_nan(cx: sink *FnCtx, v: i64, result: i64) -> bool {
+    unsafe {
+        let op = cx.insts[v].op;
+        is_float(cx.insts[v].ty) && op != Neg && op != Const
+            && f64_of_bits(result) != f64_of_bits(result)
+    }
+}
+
+fn fold_division(remainder: bool, ty: i64, a: i64, b: i64) -> i64 {
+    if b == 0 {
+        return if remainder { a } else { 0 };
+    }
+    if is_signed(ty) {
+        if b == -1 {
+            return if remainder { 0 } else { wrap_int(0 - a, ty) };
+        }
+        return wrap_int(if remainder { a % b } else { a / b }, ty);
+    }
+    let ua = a as u64;
+    let ub = b as u64;
+    wrap_int((if remainder { ua % ub } else { ua / ub }) as i64, ty)
+}
+
+pub fn fold_compare(op: Cond, ty: i64, a: i64, b: i64) -> bool {
+    if is_float(ty) {
+        let x = f64_of_bits(a);
+        let y = f64_of_bits(b);
+        return match op {
+            Cond::Eq => x == y,
+            Cond::Ne => x != y,
+            Cond::Lt => x < y,
+            Cond::Le => x <= y,
+            Cond::Gt => x > y,
+            Cond::Ge => x >= y,
+        };
+    }
+    let less = if is_signed(ty) { a < b } else { (a as u64) < (b as u64) };
+    let greater = if is_signed(ty) { a > b } else { (a as u64) > (b as u64) };
+    match op {
+        Cond::Eq => a == b,
+        Cond::Ne => a != b,
+        Cond::Lt => less,
+        Cond::Gt => greater,
+        Cond::Le => !greater,
+        Cond::Ge => !less,
+    }
+}
+
+fn fold_conversion(from: i64, to: i64, a: i64) -> i64 {
+    if is_float(from) && is_float(to) {
+        return float_const(f64_of_bits(a), to);
+    }
+    if is_float(to) {
+        // Converted directly (not through f64) to round once.
+        if to == TY_F32 {
+            let narrow = if is_signed(from) { a as f32 } else { (a as u64) as f32 };
+            return bits_of(narrow as f64);
+        }
+        return bits_of(if is_signed(from) { a as f64 } else { (a as u64) as f64 });
+    }
+    if is_float(from) {
+        return fold_float_to_int(f64_of_bits(a), to);
+    }
+    wrap_int(a, to)
+}
+
+// Saturating conversion to a signed integer of `bits` bits (NaN is 0).
+fn saturate_signed(x: f64, bits: i64) -> i64 {
+    if x != x {
+        return 0;
+    }
+    let limit = if bits == 64 { 9223372036854775808.0 } else { 2147483648.0 };
+    if x <= 0.0 - limit {
+        return if bits == 64 { -9223372036854775807 - 1 } else { -2147483648 };
+    }
+    if x >= limit {
+        return if bits == 64 { 9223372036854775807 } else { 2147483647 };
+    }
+    x as i64
+}
+
+// What emit_float_to_int computes: signed results up to 32 bits convert
+// at 32 bits and wrap, unsigned ones up to 32 bits convert signed at 64
+// bits and wrap; u64 converts unsigned (saturating) at 2^63 and above,
+// signed (saturating, so -5.0 is 2^64 - 5) below.
+fn fold_float_to_int(x: f64, to: i64) -> i64 {
+    if to == TY_U64 && x >= 9223372036854775808.0 {
+        if x >= 18446744073709551616.0 {
+            return -1;
+        }
+        return ((x - 9223372036854775808.0) as i64) ^ (1 << 63);
+    }
+    if is_signed(to) && int_bits(to) <= 32 {
+        return wrap_int(saturate_signed(x, 32), to);
+    }
+    wrap_int(saturate_signed(x, 64), to)
+}
+
+// ---- Instruction combining ----
+
+pub fn is_const(cx: sink *FnCtx, v: i64) -> bool {
+    unsafe { cx.insts[v].op == Const }
+}
+
+// log2 of a power of two, or -1.
+fn power_of_two(value: i64) -> Option<i64> {
+    if value <= 0 || (value & (value - 1)) != 0 {
+        return Option::None;
+    }
+    Option::Some(log2(value))
+}
+
+// A new constant before instruction `at`.
+pub fn const_before(cx: sink *FnCtx, at: i64, value: i64, ty: i64) -> i64 {
+    let c = ir_make(cx, Const, ty, 0, 0, value);
+    ir_insert_before(cx, at, c);
+    c
+}
+
+pub fn op_before(cx: sink *FnCtx, at: i64, op: Op, ty: i64, a: i64, b: i64) -> i64 {
+    let v = ir_make(cx, op, ty, a, b, 0);
+    ir_insert_before(cx, at, v);
+    v
+}
+
+// Replaces v by `by` when they have the same type.
+fn replace_same_type(cx: sink *FnCtx, v: i64, by: i64) -> bool {
+    if unsafe { cx.insts[by].ty != cx.insts[v].ty } {
+        return false;
+    }
+    ir_replace(cx, v, by);
+    true
+}
+
+fn make_const(cx: sink *FnCtx, v: i64, value: i64) -> bool {
+    unsafe {
+        cx.insts[v].op = Const;
+        cx.insts[v].cond = Cond::Eq;
+        cx.insts[v].imm = wrap_int(value, cx.insts[v].ty);
+        cx.insts[v].a = 0;
+        cx.insts[v].b = 0;
+        cx.insts[v].imm2 = 0;
+    }
+    true
+}
+
+// The all-ones value of integer type ty (canonical).
+pub fn all_ones(ty: i64) -> i64 {
+    wrap_int(-1, ty)
+}
+
+// (0.16) !a when a is a comparison of integers: the opposite comparison;
+// !(x | y) and !(x & y) when x and y negate for free (comparisons of
+// integers, negations, and and or of such): !x & !y and !x | !y (what
+// merged branch chains leave, ifconv.vl).
+fn combine_not(cx: sink *FnCtx, v: i64, a: i64) -> bool {
+    unsafe {
+        if !negates_free(cx, a, 0) || cx.insts[a].op == Not {
+            return false;
+        }
+        let n = negated(cx, a, v);
+        cx.insts[v].op = cx.insts[n].op;
+        cx.insts[v].cond = cx.insts[n].cond;
+        cx.insts[v].a = cx.insts[n].a;
+        cx.insts[v].b = cx.insts[n].b;
+        cx.insts[v].imm2 = cx.insts[n].imm2;
+        true
+    }
+}
+
+// The negation of x (negates_free), made before instruction `at`.
+fn negated(cx: sink *FnCtx, x: i64, at: i64) -> i64 {
+    unsafe {
+        let op = cx.insts[x].op;
+        if op == Not {
+            return cx.insts[x].a;
+        }
+        if op == Cmp {
+            let c = op_before(cx, at, Cmp, TY_BOOL, cx.insts[x].a, cx.insts[x].b);
+            cx.insts[c].cond = cx.insts[x].cond.negate();
+            cx.insts[c].imm2 = cx.insts[x].imm2;
+            return c;
+        }
+        let a = negated(cx, cx.insts[x].a, at);
+        let b = negated(cx, cx.insts[x].b, at);
+        op_before(cx, at, if op == Or { And } else { Or }, TY_BOOL, a, b)
+    }
+}
+
+// Whether bool x negates without an instruction more: a comparison of
+// integers, a negation, or an `and` or `or` of such (a few deep).
+fn negates_free(cx: sink *FnCtx, x: i64, depth: i64) -> bool {
+    unsafe {
+        let op = cx.insts[x].op;
+        if op == Not || op == Cmp && !is_float(cx.insts[x].imm2) {
+            return true;
+        }
+        (op == And || op == Or) && cx.insts[x].ty == TY_BOOL && depth < 3
+            && negates_free(cx, cx.insts[x].a, depth + 1)
+            && negates_free(cx, cx.insts[x].b, depth + 1)
+    }
+}
+
+// Rewrites instruction v into something cheaper; returns whether it
+// changed (v may have been replaced).
+fn combine(cx: sink *FnCtx, v: i64) -> bool {
+    unsafe {
+        let op = cx.insts[v].op;
+        let ty = cx.insts[v].ty;
+        if op == Load || op == Store {
+            return fold_address(cx, v);
+        }
+        if op.is_vector() {
+            // (0.19: vectors and intrinsics on constants, fold/arch.vl)
+            return crate::middle::fold::arch::fold_vector(cx, v);
+        }
+        if op == Neg || op == Not || op == BNot {
+            let a = cx.insts[v].a;
+            if cx.insts[a].op == op && !(op == Neg && is_float(ty)) {
+                return replace_same_type(cx, v, cx.insts[a].a);
+            }
+            if op == Not {
+                return combine_not(cx, v, a);
+            }
+            return false;
+        }
+        if op == Cmp {
+            return combine_compare(cx, v);
+        }
+        if op == Op::Sel {
+            return combine_select(cx, v);
+        }
+        if !op.is_binary() || is_float(ty) {
+            return false;
+        }
+        var a = cx.insts[v].a;
+        var b = cx.insts[v].b;
+        // Constants go right.
+        if is_const(cx, a) && !is_const(cx, b) && (op == Add || op == Mul || op == And
+            || op == Or || op == Xor) {
+            cx.insts[v].a = b;
+            cx.insts[v].b = a;
+            a = cx.insts[v].a;
+            b = cx.insts[v].b;
+        }
+        if !is_const(cx, b) {
+            if a == b {
+                if op == Sub || op == Xor {
+                    return make_const(cx, v, 0);
+                }
+                if op == And || op == Or {
+                    return replace_same_type(cx, v, a);
+                }
+            }
+            // (0.11) (x + c) - x is c (an array's end less its start).
+            if op == Sub && cx.insts[a].op == Add && cx.insts[a].a == b
+                && is_const(cx, cx.insts[a].b)
+                && cx.insts[a].ty == ty && is_integer(ty) {
+                return make_const(cx, v, cx.insts[cx.insts[a].b].imm);
+            }
+            // (0.11) An address y + (x + c) is (y + x) + c, which loads and
+            // stores take as an offset, and copies of a body share y + x.
+            if op == Add && ty == TY_U64 && cx.insts[b].op == Add && is_const(cx, cx.insts[b].b)
+                && is_integer(cx.insts[b].ty) && int_bits(cx.insts[b].ty) == 64 {
+                let inner = op_before(cx, v, Add, TY_U64, a, cx.insts[b].a);
+                cx.insts[v].a = inner;
+                cx.insts[v].b = cx.insts[b].b;
+                return true;
+            }
+            return false;
+        }
+        let c = cx.insts[b].imm;
+        if c == 0 && (op == Add || op == Sub || op == Or || op == Xor
+            || op == Shl || op == Shr) {
+            return replace_same_type(cx, v, a);
+        }
+        if (op == Shl || op == Shr) && shift_amount(c, ty) == 0 {
+            return replace_same_type(cx, v, a);
+        }
+        if c == 0 && (op == Mul || op == And) {
+            return make_const(cx, v, 0);
+        }
+        if op == And && c == all_ones(ty) {
+            return replace_same_type(cx, v, a);
+        }
+        if op == Add && cx.insts[a].op == Add && is_const(cx, cx.insts[a].b) && is_integer(ty)
+            && cx.insts[a].ty == ty {
+            // (x + c1) + c2, both of one type (a narrower inner sum would wrap
+            // first)
+            cx.insts[v].a = cx.insts[a].a;
+            let operand = const_before(cx, v, wrap_int(cx.insts[cx.insts[a].b].imm + c, ty), ty);
+            cx.insts[v].b = operand;
+            return true;
+        }
+        if op == Mul {
+            if c == 1 {
+                return replace_same_type(cx, v, a);
+            }
+            match power_of_two(c) {
+                Option::Some(k) if k > 0 => {
+                    cx.insts[v].op = Shl;
+                    let operand = const_before(cx, v, k, ty);
+                    cx.insts[v].b = operand;
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+        if (op == Div || op == Rem) && c == 1 {
+            if op == Div {
+                return replace_same_type(cx, v, a);
+            }
+            return make_const(cx, v, 0);
+        }
+        if op == Div || op == Rem {
+            return combine_division(cx, v, a, c);
+        }
+        false
+    }
+}
+
+// (0.15) k ? x : x is x; a constant k picks; k ? t op x : t, with op one
+// of + - | ^ (0 the identity, t on the left for -), is t op (k ? x : 0):
+// the select leaves the chain through t, a reduction's (ifconv.vl).
+pub fn combine_select(cx: sink *FnCtx, v: i64) -> bool {
+    unsafe {
+        let k = cx.insts[v].a;
+        let x = cx.insts[v].b;
+        let y = cx.insts[v].c;
+        if x == y {
+            return replace_same_type(cx, v, x);
+        }
+        if is_const(cx, k) {
+            return replace_same_type(cx, v, if cx.insts[k].imm != 0 { x } else { y });
+        }
+        let ty = cx.insts[v].ty;
+        if ty == TY_BOOL && cx.insts[k].ty == TY_BOOL && (is_const(cx, x) || is_const(cx, y)) {
+            // (0.16) Bools: k ? true : y is k | y, k ? x : false is k & x
+            // (and with !k the other two), what if-converted `||` and `&&`
+            // (a comparator's `<`) leave.
+            if is_const(cx, x) && is_const(cx, y) {
+                if cx.insts[x].imm != 0 {
+                    return replace_same_type(cx, v, k);
+                }
+                cx.insts[v].op = Not;
+                cx.insts[v].b = 0;
+                cx.insts[v].c = 0;
+                return true;
+            }
+            // k ? true : y = k | y, k ? false : y = !k & y; k ? x : false =
+            // k & x, k ? x : true = !k | x.
+            let then_const = is_const(cx, x);
+            let truth = cx.insts[if then_const { x } else { y }].imm != 0;
+            let other = if then_const { y } else { x };
+            let negate = then_const != truth;
+            cx.insts[v].op = if truth { Or } else { And };
+            cx.insts[v].a = if negate { op_before(cx, v, Not, TY_BOOL, k, 0) } else { k };
+            cx.insts[v].b = other;
+            cx.insts[v].c = 0;
+            return true;
+        }
+        if !is_integer(ty) {
+            return false;
+        }
+        // (the arm holding the operation, and which one it is)
+        var t = y;
+        var w = x;
+        var then_side = true;
+        if cx.insts[x].op != Add && cx.insts[x].op != Sub && cx.insts[x].op != Or
+            && cx.insts[x].op != Xor
+            || (cx.insts[x].a != y && cx.insts[x].b != y) {
+            t = x;
+            w = y;
+            then_side = false;
+        }
+        let op = cx.insts[w].op;
+        if (op != Add && op != Sub && op != Or && op != Xor) || cx.insts[w].ty != ty {
+            return false;
+        }
+        let other = if cx.insts[w].a == t { cx.insts[w].b }
+            else if op != Sub && cx.insts[w].b == t {
+                cx.insts[w].a
+            } else {
+                return false;
+            };
+        if other == t {
+            return false;
+        }
+        let zero = const_before(cx, v, 0, ty);
+        let pick = ir_make(cx, Op::Sel, ty, k, if then_side { other } else { zero }, 0);
+        cx.insts[pick].c = if then_side { zero } else { other };
+        ir_insert_before(cx, v, pick);
+        cx.insts[v].op = op;
+        cx.insts[v].a = t;
+        cx.insts[v].b = pick;
+        cx.insts[v].c = 0;
+        true
+    }
+}
+
+// Division by a power of two: a shift (with a fix-up toward zero for signed
+// values), and the remainder a mask (or x - q * 2^k).
+fn combine_division(cx: sink *FnCtx, v: i64, a: i64, c: i64) -> bool {
+    unsafe {
+        let op = cx.insts[v].op;
+        let ty = cx.insts[v].ty;
+        let k = power_of_two(c).unwrap_or(0);
+        if k <= 0 || k > 62 {
+            return false;
+        }
+        if !is_signed(ty) {
+            if op == Div {
+                cx.insts[v].op = Shr;
+                let operand = const_before(cx, v, k, ty);
+                cx.insts[v].b = operand;
+            } else {
+                cx.insts[v].op = And;
+                let operand = const_before(cx, v, c - 1, ty);
+                cx.insts[v].b = operand;
+            }
+            return true;
+        }
+        // q = (x + ((x >> 63) >>> (64 - k))) >> k, on the canonical 64-bit value.
+        let sign = op_before(cx, v, Shr, TY_I64, a, const_before(cx, v, 63, TY_I64));
+        let bias = op_before(cx, v, Shr, TY_U64, sign, const_before(cx, v, 64 - k, TY_U64));
+        let biased = op_before(cx, v, Add, TY_I64, a, bias);
+        if op == Div {
+            cx.insts[v].op = Shr;
+            cx.insts[v].a = biased;
+            let operand = const_before(cx, v, k, ty);
+            cx.insts[v].b = operand;
+            return true;
+        }
+        let q = op_before(cx, v, Shr, TY_I64, biased, const_before(cx, v, k, TY_I64));
+        let back = op_before(cx, v, Shl, TY_I64, q, const_before(cx, v, k, TY_I64));
+        cx.insts[v].op = Sub;
+        cx.insts[v].b = back;
+        true
+    }
+}
+
+// Whether v is the address of a frame slot, a static or constant data,
+// plus a small constant offset: never null.
+fn is_object_address(cx: sink *FnCtx, v: i64) -> bool {
+    unsafe {
+        var x = v;
+        var offset = 0;
+        while cx.insts[x].op == Add && cx.insts[x].ty == TY_U64 && is_const(cx, cx.insts[x].b) {
+            offset += cx.insts[cx.insts[x].b].imm;
+            x = cx.insts[x].a;
+        }
+        let op = cx.insts[x].op;
+        (op == Op::Slot || op == Op::GAddr || op == Op::SAddr) && offset >= 0 && offset < 1 << 32
+    }
+}
+
+// (0.16) x <cond> c, compare v, when x is a phi whose operands give known
+// outcomes (constants, selects of constants, phis of such): a phi of
+// those outcomes. A comparator's ordering (-1, 0 or 1 from the
+// arms of an inlined `cmp`) compared with 0 becomes the comparison it
+// stands for.
+fn compare_phi(cx: sink *FnCtx, v: i64, x: i64, cond: Cond, ty: i64, c: i64) -> bool {
+    unsafe {
+        let n = cx.insts[x].nargs;
+        if n < 2 || n > 8 {
+            return false;
+        }
+        // (Every operand known: an induction variable's comparison, its
+        // operand from the latch arithmetic, stays what the ranges and the
+        // loop passes know.)
+        for i in 0..n {
+            if !outcome_known(cx, ir_arg(cx, x, i), x, cond, ty, c, 0) {
+                return false;
+            }
+        }
+        let phi = outcome_phi(cx, x, cond, ty, c);
+        ir_replace(cx, v, phi);
+        true
+    }
+}
+
+// Whether w <cond> c is known at the end of each path to it: w a
+// constant, a select of constants, or a phi (not `top`, a few deep) of
+// such.
+fn outcome_known(cx: sink *FnCtx, w: i64, top: i64, cond: Cond, ty: i64, c: i64, depth: i64) -> bool {
+    unsafe {
+        if select_outcome(cx, w, cond, ty, c, 0) >= 0 {
+            return true;
+        }
+        if cx.insts[w].op != Phi || w == top || depth >= 3 || cx.insts[w].nargs > 8 {
+            return false;
+        }
+        for i in 0..cx.insts[w].nargs {
+            if !outcome_known(cx, ir_arg(cx, w, i), top, cond, ty, c, depth + 1) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// The phi of x's operands' outcomes (bools) in x's block (outcome_known
+// of each).
+fn outcome_phi(cx: sink *FnCtx, x: i64, cond: Cond, ty: i64, c: i64) -> i64 {
+    unsafe {
+        let n = cx.insts[x].nargs;
+        let b = cx.insts[x].block;
+        var values = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..n {
+            let p = cx.blocks[b].preds.data[i];
+            let w = ir_arg(cx, x, i);
+            let known = select_outcome(cx, w, cond, ty, c, 0);
+            if known >= 0 {
+                let k = ir_make(cx, Const, TY_BOOL, 0, 0, known);
+                ir_append(cx, p, k);
+                values.push(k);
+            } else {
+                values.push(outcome_phi(cx, w, cond, ty, c));
+            }
+        }
+        let phi = new_phi_in(cx, b, TY_BOOL, &values, 0, n);
+        free(values.data as *u8);
+        phi
+    }
+}
+
+fn combine_compare(cx: sink *FnCtx, v: i64) -> bool {
+    unsafe {
+        var a = cx.insts[v].a;
+        var b = cx.insts[v].b;
+        var cond = cx.insts[v].cond;
+        let ty = cx.insts[v].imm2;
+        if is_const(cx, a) && !is_const(cx, b) {
+            // Constants go right.
+            cx.insts[v].a = b;
+            cx.insts[v].b = a;
+            cx.insts[v].cond = cond.mirror();
+            a = cx.insts[v].a;
+            b = cx.insts[v].b;
+            cond = cx.insts[v].cond;
+        }
+        if a == b && !is_float(ty) {
+            return make_const(cx, v,
+                (cond == Cond::Eq || cond == Cond::Le || cond == Cond::Ge) as i64);
+        }
+        if (cond == Cond::Eq || cond == Cond::Ne) && is_const(cx, b) && cx.insts[b].imm == 0
+            && is_object_address(cx, a) {
+            // (0.16) The address of a slot, a static or constant data is not
+            // null (an allocation heap_to_stack made a slot, checked for
+            // null).
+            return make_const(cx, v, (cond == Cond::Ne) as i64);
+        }
+        // (0.15) A select of constants compared with a constant: the
+        // select's condition, its negation, or a constant (a comparator's
+        // ordering, -1, 0 or 1, compared with 0, once if-converted).
+        if is_const(cx, b) && cx.insts[a].op == Op::Sel && !is_float(ty) {
+            let c = cx.insts[b].imm;
+            let x = select_outcome(cx, cx.insts[a].b, cond, ty, c, 0);
+            let y = select_outcome(cx, cx.insts[a].c, cond, ty, c, 0);
+            if x >= 0 && x == y {
+                return make_const(cx, v, x);
+            }
+            if x == 1 && y == 0 {
+                return replace_same_type(cx, v, cx.insts[a].a);
+            }
+            if x == 0 && y == 1 {
+                cx.insts[v].op = Not;
+                cx.insts[v].a = cx.insts[a].a;
+                cx.insts[v].b = 0;
+                cx.insts[v].imm2 = 0;
+                cx.insts[v].cond = Cond::Eq;
+                return true;
+            }
+        }
+        if is_const(cx, b) && cx.insts[a].op == Phi && !is_float(ty)
+            && compare_phi(cx, v, a, cond, ty, cx.insts[b].imm) {
+            return true;
+        }
+        if ty == TY_BOOL && is_const(cx, b) && !is_const(cx, a) {
+            // b != false, b == true: b itself.
+            let c = cx.insts[b].imm;
+            if (cond == Cond::Ne && c == 0) || (cond == Cond::Eq && c == 1) {
+                return replace_same_type(cx, v, a);
+            }
+        }
+        false
+    }
+}
+
+// (0.15) x <cond> c (operands of type ty) when x is a constant, or a
+// select whose operands all give one outcome: 1 or 0; else -1.
+fn select_outcome(cx: sink *FnCtx, x: i64, cond: Cond, ty: i64, c: i64, depth: i64) -> i64 {
+    unsafe {
+        if is_const(cx, x) {
+            return fold_compare(cond, ty, cx.insts[x].imm, c) as i64;
+        }
+        if cx.insts[x].op != Op::Sel || depth > 3 {
+            return -1;
+        }
+        let p = select_outcome(cx, cx.insts[x].b, cond, ty, c, depth + 1);
+        let q = select_outcome(cx, cx.insts[x].c, cond, ty, c, depth + 1);
+        if p >= 0 && p == q { p } else { -1 }
+    }
+}
+
+// load/store at (x + c) + offset: at x + (offset + c).
+fn fold_address(cx: sink *FnCtx, v: i64) -> bool {
+    unsafe {
+        let addr = cx.insts[v].a;
+        if cx.insts[addr].op == Add && is_const(cx, cx.insts[addr].b)
+            && cx.insts[addr].ty == TY_U64 {
+            let c = cx.insts[cx.insts[addr].b].imm;
+            let offset = cx.insts[v].imm + c;
+            if offset >= -1073741824 && offset <= 1073741824 {
+                cx.insts[v].a = cx.insts[addr].a;
+                cx.insts[v].imm = offset;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+pub fn instcombine(cx: sink *FnCtx, fi: i64) -> bool {
+    var changed = false;
+    unsafe {
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if cx.blocks[b].removed != 0 {
+                continue;
+            }
+            var v = cx.blocks[b].first;
+            while v != 0 {
+                let next = cx.insts[v].next;
+                ir_resolve_operands(cx, v);
+                // Up to a few rewrites of one instruction.
+                var rounds = 0;
+                while rounds < 4 && cx.insts[v].block != 0 && combine(cx, v) {
+                    changed = true;
+                    rounds += 1;
+                    ir_resolve_operands(cx, v);
+                }
+                v = next;
+            }
+            // A branch on !x branches on x the other way.
+            if cx.blocks[b].term == Term::Branch {
+                let cond = ir_val(cx, cx.blocks[b].cond);
+                if cx.insts[cond].op == Not {
+                    cx.blocks[b].cond = cx.insts[cond].a;
+                    let s0 = cx.blocks[b].s0;
+                    cx.blocks[b].s0 = cx.blocks[b].s1;
+                    cx.blocks[b].s1 = s0;
+                    changed = true;
+                }
+            }
+        }
+    }
+    if changed {
+        resolve_all(cx, fi);
+    }
+    changed
+}

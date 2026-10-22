@@ -1,0 +1,817 @@
+// The feature errors (docs/design/arch.md §2.4, §2.9), once the
+// requirements are inferred:
+//   arch.feature            a call whose callee needs what the point does
+//                           not know, in an entry point (main, an `extern
+//                           "C" fn`, a test): nothing above it can know it
+//   arch.declared           the same in a #[target_feature] function: its
+//                           declaration is too small
+//   arch.feature_ambiguous  the same where an unqualified `aes` guards or
+//                           declares it, meaning the target's architecture
+//   arch.fn_pointer         a function that needs features taken as a
+//                           `fn` value, or a closure made where its
+//                           features are not known
+// Each with `try:` lines: the call wrapped in a detect() branch (with the
+// fallback of the same signature, when there is one), the build with the
+// feature, `query features --why`.
+
+use crate::arch::{ARCH_X86_64, intrinsic_of_fn, target_arch};
+use crate::arch::features::{
+    arch_options_given, bit, build_features, feature_ambiguous, feature_is_foreign, feature_name,
+    has_bit, implied, own_features, push_arch_args,
+};
+use crate::base::{
+    FILES, FILE_COUNT, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str,
+    intern_c,
+};
+use crate::base::diag::{err_fmt, err_help, err_help_fmt, err_try_tool};
+use crate::base::target::{ELF, X86};
+use crate::front::ast::NODES;
+use crate::front::closures::{CLOSURES, CLOSURE_COUNT};
+use crate::front::contracts::TEST_ITEM;
+use crate::front::features::{
+    AE_DECLARED, AE_FEATURE, AE_FEATURE_AMBIGUOUS, AE_FN_POINTER, FA_TARGET_FEATURE, FA_WIDTH,
+    FEATURE_ATTRS, arch_error_begin, arch_error_end,
+};
+use crate::front::features::infer::{CALL_FIRST, DECLARED, NEEDS};
+use crate::front::features::regions::{
+    CALLS, CALL_WIDTH, C_ALT, C_ALT_AT, C_CALLEE, C_FN, C_KNOWN, C_NODE, VALUES, VALUE_WIDTH,
+};
+use crate::front::lexer::str_at;
+use crate::front::types::{FNS, FN_COUNT, TLISTS, TY_UNIT};
+
+static var MAIN: i64 = 0;
+static var TESTS: *i64 = 0 as *i64;
+
+// The errors of the program's calls and function values.
+pub fn check_requirements(n: i64) {
+    unsafe {
+        MAIN = intern_c(c"main");
+        TESTS = crate::base::alloc_array::<i64>(n + 1);
+        for i in 0..TEST_ITEM.count {
+            let f = NODES[TEST_ITEM.data[i]].x - 1;
+            if f >= 0 && f < n {
+                TESTS[f] = 1;
+            }
+        }
+        let total = CALLS.count / CALL_WIDTH;
+        for r in 0..total {
+            let at = r * CALL_WIDTH;
+            let g = CALLS.data[at + C_CALLEE];
+            let missing = NEEDS[g] & ~CALLS.data[at + C_KNOWN];
+            if missing == 0 {
+                continue;
+            }
+            let f = CALLS.data[at + C_FN];
+            let version = crate::front::features::multiversion::version_row(f);
+            if (missing & CALLS.data[at + C_ALT]) != 0 {
+                ambiguous_error(at, missing & CALLS.data[at + C_ALT]);
+            } else if version >= 0 {
+                crate::front::features::multiversion::multiversion_error(at, missing, version);
+            } else if DECLARED[f] != 0 {
+                declared_error(at, missing);
+            } else if is_entry(f) {
+                feature_error(at, missing);
+            }
+        }
+        let values = VALUES.count / VALUE_WIDTH;
+        for r in 0..values {
+            let at = r * VALUE_WIDTH;
+            let f = VALUES.data[at];
+            let g = VALUES.data[at + 1];
+            let known = VALUES.data[at + 2];
+            let node = VALUES.data[at + 3];
+            let closure = VALUES.data[at + 4] != 0;
+            // (a closure is called directly, where it is passed: the calls
+            // carry its set; one coerced to a `fn` type is a plain value)
+            let missing = NEEDS[g];
+            if !closure && missing != 0 {
+                pointer_error(f, g, node, closure, missing);
+            }
+        }
+    }
+}
+
+// Whether nothing above function f can know features for it: main, an
+// `extern "C" fn` of the program, a test.
+pub fn is_entry(f: i64) -> bool {
+    unsafe { FNS[f].name == MAIN || FNS[f].export || TESTS[f] != 0 }
+}
+
+// ---- Names ----
+
+// The features of set s worth naming: none implied by another of s (avx2,
+// not avx2, avx, sse4.2, ...), the architecture's bit only alone.
+pub fn top_features(s: i64) -> i64 {
+    var out = 0;
+    for b in 0..33 {
+        if !has_bit(s, b) {
+            continue;
+        }
+        var covered = false;
+        for c in 0..33 {
+            if c != b && has_bit(s, c) && has_bit(implied(bit(c)), b) {
+                covered = true;
+            }
+        }
+        if !covered {
+            out |= bit(b);
+        }
+    }
+    out
+}
+
+// Feature b's name as a program writes it here: qualified (`x86_64.aes`)
+// when it is another architecture's and the plain name is the target's.
+pub fn put_feature(out: i64, b: i64) {
+    unsafe {
+        let name = feature_name(b);
+        if feature_ambiguous(name) && feature_is_foreign(b) {
+            buf_str(out, if target_arch() == ARCH_X86_64 { c"aarch64." } else { c"x86_64." });
+        }
+        buf_bytes(out, name);
+    }
+}
+
+// The names of set s's top features, `sep` between them, `pre` before each.
+pub fn put_features(out: i64, s: i64, sep: *u8, pre: *u8) {
+    unsafe {
+        let top = top_features(s);
+        var first = true;
+        for b in 0..33 {
+            if has_bit(top, b) {
+                if !first {
+                    buf_str(out, sep);
+                }
+                first = false;
+                buf_str(out, pre);
+                put_feature(out, b);
+            }
+        }
+    }
+}
+
+pub fn target_text() -> *u8 {
+    unsafe {
+        if X86 {
+            if ELF { c"x86_64-linux" } else { c"x86_64-macos" }
+        } else {
+            if ELF { c"aarch64-linux" } else { c"aarch64-macos" }
+        }
+    }
+}
+
+// `FILE:LINE:COL` of position pos.
+pub fn put_pos(out: i64, pos: i64) {
+    unsafe {
+        var file = 0;
+        while file + 1 < FILE_COUNT && pos >= FILES[file + 1].start {
+            file += 1;
+        }
+        var line = 1;
+        var col = 1;
+        var i = FILES[file].start;
+        while i < pos {
+            if SRC[i] == '\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+            i += 1;
+        }
+        let path = FILES[file].path;
+        buf_str(out, if path[0] == '.' && path[1] == '/' { &path[2] } else { path });
+        buf_byte(out, ':');
+        buf_int(out, line);
+        buf_byte(out, ':');
+        buf_int(out, col);
+    }
+}
+
+// Function f's name in a message: an intrinsic's without its module.
+fn fn_name(f: i64) -> [u8] {
+    unsafe {
+        let t = SYMS[FNS[f].display].text;
+        if intrinsic_of_fn(f) < 0 {
+            return t;
+        }
+        var i = t.len as i64;
+        while i > 1 && !(t[i - 1] == ':' && t[i - 2] == ':') {
+            i -= 1;
+        }
+        if i > 1 { t[i..t.len as i64] } else { t }
+    }
+}
+
+// Whether function f is a closure's.
+fn is_closure_fn(f: i64) -> bool {
+    unsafe {
+        for c in 0..CLOSURE_COUNT {
+            if CLOSURES[c].f == f {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// ---- Why ----
+
+// The call that brings feature b into function f's set: the call node of
+// the intrinsic at the end of the chain (0: none found), with the chain
+// pushed on `chain` (the callees, f's first) when it is given.
+pub fn source_of(f: i64, b: i64, chain: *IntVec) -> i64 {
+    unsafe {
+        var g = f;
+        var steps = 0;
+        while steps < 64 {
+            steps += 1;
+            var next = -1;
+            var node = 0;
+            for r in CALL_FIRST[g]..CALL_FIRST[g + 1] {
+                let at = r * CALL_WIDTH;
+                let callee = CALLS.data[at + C_CALLEE];
+                let known = CALLS.data[at + C_KNOWN] | CALLS.data[at + C_ALT];
+                if next < 0 && has_bit(NEEDS[callee] & ~known, b) {
+                    next = callee;
+                    node = CALLS.data[at + C_NODE];
+                }
+            }
+            if next < 0 {
+                return 0;
+            }
+            if chain != 0 as *IntVec {
+                (*chain).push(node);
+            }
+            if intrinsic_of_fn(next) >= 0 || DECLARED[next] != 0 {
+                return node;
+            }
+            g = next;
+        }
+        0
+    }
+}
+
+// ` (from 'INTRINSIC' at FILE:L:C)` for a callee g that is not itself the
+// intrinsic bringing the first feature of `missing`.
+fn put_from(out: i64, g: i64, missing: i64) {
+    unsafe {
+        if intrinsic_of_fn(g) >= 0 {
+            return;
+        }
+        let top = top_features(missing);
+        var b = 0;
+        while b < 33 && !has_bit(top, b) {
+            b += 1;
+        }
+        let node = source_of(g, b, 0 as *IntVec);
+        if node == 0 {
+            return;
+        }
+        let callee = NODES[node].x - 1;
+        buf_str(out, c" (from '");
+        buf_bytes(out, fn_name(callee));
+        if DECLARED[callee] != 0 && intrinsic_of_fn(callee) < 0 {
+            buf_str(out, c"', declared,");
+        } else {
+            buf_str(out, c"'");
+        }
+        buf_str(out, c" at ");
+        put_pos(out, NODES[node].start);
+        buf_byte(out, ')');
+    }
+}
+
+// ---- The errors ----
+
+// error[arch.feature] at call record `at`, in an entry point.
+fn feature_error(at: i64, missing: i64) {
+    unsafe {
+        let f = CALLS.data[at + C_FN];
+        let g = CALLS.data[at + C_CALLEE];
+        let n = CALLS.data[at + C_NODE];
+        let m = buf_new();
+        buf_byte(m, '\'');
+        buf_bytes(m, fn_name(g));
+        buf_str(m, c"' needs ");
+        put_features(m, missing, c", ", c"");
+        put_from(m, g, missing);
+        let foreign = (missing & ~own_features()) != 0;
+        if foreign {
+            buf_str(m, c", of another architecture than ");
+            buf_str(m, target_text());
+            buf_str(m, c"'s: '");
+            buf_bytes(m, fn_name(f));
+            buf_str(m, c"' may call it only under has() or detect() of it, where it is dead code");
+        } else {
+            buf_str(m, c", which '");
+            buf_bytes(m, fn_name(f));
+            buf_str(m, c"' does not know here");
+            if FNS[f].export {
+                buf_str(m, c" (it is extern \"C\": its callers cannot know features)");
+            }
+            buf_str(m, c": ");
+            put_build(m);
+        }
+        arch_error_begin(NODES[n].start, AE_FEATURE);
+        err_fmt(buf_slice(m));
+        let fallback = find_fallback(g, CALLS.data[at + C_KNOWN]);
+        let h = buf_new();
+        if foreign {
+            buf_str(h, c"put the call under `if std::arch::has(\"");
+            put_features(h, missing, c"\") && std::arch::has(\"", c"");
+            buf_str(h, c"\") { ... }`: checked here, generated only for its architecture");
+        } else if fallback < 0 && !is_unit_call(n) && FNS[g].tmpl == 0 && !is_closure_fn(g)
+            && intrinsic_of_fn(g) < 0 {
+            buf_str(h, c"test the CPU with `if std::arch::detect(\"");
+            put_features(h, missing, c"\") && std::arch::detect(\"", c"");
+            buf_str(h, c"\") { ... } else { ... }` and a fallback in the else branch (one of the same signature named `");
+            buf_bytes(h, fn_name(g));
+            buf_str(h, c"_portable`, `_scalar` or `_fallback` is offered here), declare #[target_feature] on the caller, or build for CPUs that have it");
+        } else {
+            buf_str(h, c"test the CPU and keep a fallback, declare #[target_feature] on the caller, or build only for CPUs that have it");
+        }
+        err_help_fmt(buf_slice(h));
+        try_wrap(n, missing, fallback);
+        if !foreign {
+            let a = buf_new();
+            put_features(a, missing, c",", c"+");
+            let args = buf_new();
+            buf_str(args, c"-C target-feature=");
+            buf_bytes(args, buf_slice(a));
+            put_arch_options(args);
+            put_output(args);
+            err_try_tool(buf_slice(args), true);
+        }
+        try_why(g, missing);
+        arch_error_end();
+    }
+}
+
+// `the build's features are ...` or `TARGET's baseline is ...`.
+fn put_build(m: i64) {
+    unsafe {
+        if arch_options_given() {
+            buf_str(m, c"the build's features are ");
+        } else {
+            buf_str(m, target_text());
+            buf_str(m, c"'s baseline is ");
+        }
+        put_features(m, build_features() & own_features(), c", ", c"");
+    }
+}
+
+// `try: volec query features G --why F ROOT`, for a callee that is not
+// itself the intrinsic (a generic function's instance: the function; not
+// for a closure).
+fn try_why(g: i64, missing: i64) {
+    unsafe {
+        if intrinsic_of_fn(g) >= 0 || is_closure_fn(g) {
+            return;
+        }
+        let args = buf_new();
+        buf_str(args, c"query features ");
+        buf_bytes(args, fn_name(if FNS[g].tmpl > 0 { FNS[g].tmpl - 1 } else { g }));
+        buf_str(args, c" --why ");
+        let top = top_features(missing);
+        var b = 0;
+        while b < 33 && !has_bit(top, b) {
+            b += 1;
+        }
+        put_feature(args, b);
+        put_arch_options(args);
+        err_try_tool(buf_slice(args), true);
+    }
+}
+
+// error[arch.declared] at call record `at` of a #[target_feature] function.
+fn declared_error(at: i64, missing: i64) {
+    unsafe {
+        let f = CALLS.data[at + C_FN];
+        let g = CALLS.data[at + C_CALLEE];
+        let n = CALLS.data[at + C_NODE];
+        let attr = declaration_of(f);
+        let m = buf_new();
+        buf_byte(m, '\'');
+        buf_bytes(m, fn_name(f));
+        buf_str(m, c"' is #[target_feature(enable = \"");
+        if attr >= 0 {
+            buf_bytes(m, str_at(FEATURE_ATTRS.data[attr + 2]));
+        }
+        buf_str(m, c"\")], but '");
+        buf_bytes(m, fn_name(g));
+        buf_str(m, c"'");
+        put_from(m, g, missing);
+        buf_str(m, c" needs ");
+        put_features(m, missing, c", ", c"");
+        arch_error_begin(NODES[n].start, AE_DECLARED);
+        err_fmt(buf_slice(m));
+        err_help(c"a declaration is the function's whole requirement: add the feature to it, or test the CPU around the call");
+        if attr >= 0 {
+            let text = str_at(FEATURE_ATTRS.data[attr + 2]);
+            let old = buf_new();
+            buf_byte(old, '"');
+            buf_bytes(old, text);
+            buf_byte(old, '"');
+            let new = buf_new();
+            buf_byte(new, '"');
+            buf_bytes(new, text);
+            put_features(new, missing, c"", c",");
+            buf_byte(new, '"');
+            try_patch_at(FEATURE_ATTRS.data[attr + 3], buf_slice(old), buf_slice(new));
+        }
+        arch_error_end();
+    }
+}
+
+// The FEATURE_ATTRS index of function f's #[target_feature] (its
+// template's, for an instance), or -1.
+pub fn declaration_of(f: i64) -> i64 {
+    unsafe {
+        let node = if FNS[f].tmpl > 0 { FNS[FNS[f].tmpl - 1].node } else { FNS[f].node };
+        var i = 0;
+        while i < FEATURE_ATTRS.count {
+            if FEATURE_ATTRS.data[i] == node && FEATURE_ATTRS.data[i + 1] == FA_TARGET_FEATURE {
+                return i;
+            }
+            i += FA_WIDTH;
+        }
+        -1
+    }
+}
+
+// error[arch.feature_ambiguous] at call record `at`: an unqualified name
+// meant the target's feature where the other architecture's is needed.
+fn ambiguous_error(at: i64, which: i64) {
+    unsafe {
+        let g = CALLS.data[at + C_CALLEE];
+        let n = CALLS.data[at + C_NODE];
+        let where_ = CALLS.data[at + C_ALT_AT];
+        var b = 0;
+        while b < 33 && !has_bit(which, b) {
+            b += 1;
+        }
+        let name = feature_name(b);
+        let own = if target_arch() == ARCH_X86_64 { c"x86_64." } else { c"aarch64." };
+        let other = if target_arch() == ARCH_X86_64 { c"aarch64." } else { c"x86_64." };
+        let m = buf_new();
+        buf_byte(m, '\'');
+        buf_bytes(m, name);
+        buf_str(m, c"' means ");
+        buf_str(m, own);
+        buf_bytes(m, name);
+        buf_str(m, c" on ");
+        buf_str(m, target_text());
+        buf_str(m, c", but '");
+        buf_bytes(m, fn_name(g));
+        buf_str(m, c"'");
+        put_from(m, g, which);
+        buf_str(m, c" needs ");
+        buf_str(m, other);
+        buf_bytes(m, name);
+        arch_error_begin(NODES[n].start, AE_FEATURE_AMBIGUOUS);
+        err_fmt(buf_slice(m));
+        err_help(c"a feature of both architectures is the target's unless qualified: write `aarch64.aes` or `x86_64.aes`");
+        let old = buf_new();
+        let new = buf_new();
+        if where_ > 0 {
+            let s = where_ - 1;
+            buf_bytes(old, SRC[NODES[s].start..NODES[s].end]);
+            buf_byte(new, '"');
+            buf_str(new, other);
+            buf_bytes(new, name);
+            buf_byte(new, '"');
+            try_patch_at(NODES[s].start, buf_slice(old), buf_slice(new));
+        } else if where_ < 0 {
+            let attr = -1 - where_;
+            let text = str_at(FEATURE_ATTRS.data[attr + 2]);
+            buf_byte(old, '"');
+            buf_bytes(old, text);
+            buf_byte(old, '"');
+            buf_byte(new, '"');
+            put_qualified(new, text, name, other);
+            buf_byte(new, '"');
+            try_patch_at(FEATURE_ATTRS.data[attr + 3], buf_slice(old), buf_slice(new));
+        }
+        arch_error_end();
+    }
+}
+
+// The list `text` with each plain `name` qualified by `arch`.
+fn put_qualified(out: i64, text: [u8], name: [u8], arch: *u8) {
+    unsafe {
+        var i = 0;
+        while i < text.len as i64 {
+            var j = i;
+            while j < text.len as i64 && text[j] != ',' {
+                j += 1;
+            }
+            var a = i;
+            while a < j && text[a] == ' ' {
+                a += 1;
+            }
+            if text[a..j] == name {
+                buf_bytes(out, text[i..a]);
+                buf_str(out, arch);
+                buf_bytes(out, name);
+            } else {
+                buf_bytes(out, text[i..j]);
+            }
+            if j < text.len as i64 {
+                buf_byte(out, ',');
+            }
+            i = j + 1;
+        }
+    }
+}
+
+// error[arch.fn_pointer]: function g, which needs `missing`, as a value at
+// node n of function f.
+fn pointer_error(f: i64, g: i64, n: i64, closure: bool, missing: i64) {
+    unsafe {
+        let m = buf_new();
+        if closure {
+            buf_str(m, c"this closure needs ");
+            put_features(m, missing, c", ", c"");
+            put_from(m, g, missing);
+            buf_str(m, c", which '");
+            buf_bytes(m, fn_name(f));
+            buf_str(m, c"' does not know where it makes it");
+        } else {
+            buf_byte(m, '\'');
+            buf_bytes(m, fn_name(g));
+            buf_str(m, c"' needs ");
+            put_features(m, missing, c", ", c"");
+            put_from(m, g, missing);
+            buf_str(m, c": a `fn` value of it escapes the feature analysis, so its callers could call it where ");
+            if (missing & ~own_features()) != 0 {
+                buf_str(m, c"it cannot run");
+            } else {
+                put_build(m);
+            }
+        }
+        arch_error_begin(NODES[n].start, AE_FN_POINTER);
+        err_fmt(buf_slice(m));
+        if closure {
+            err_help(c"make the closure inside the `if std::arch::detect(\"FEATURE\") { ... }` branch that uses it");
+        } else {
+            err_help(c"call it directly, under a detect() guard, or pass a closure made under the guard (`|x| f(x)`), which the analysis follows");
+        }
+        arch_error_end();
+    }
+}
+
+// ---- try: lines ----
+
+// Whether call n's value is unit (a statement: its call can be skipped).
+fn is_unit_call(n: i64) -> bool {
+    unsafe { NODES[n].ty == TY_UNIT }
+}
+
+// A function to call where the CPU lacks what g needs: in g's module, not
+// generic, with g's parameter and result types, needing nothing beyond
+// `known`, named as a fallback of g: its name or its stem (g's without its
+// last `_part`: `sum_avx2` -> `sum`) alone or with `_portable`, `_scalar`,
+// `_generic`, `_fallback`, `_soft`, `_sw`, `_baseline` or `_table`. -1:
+// none.
+fn find_fallback(g: i64, known: i64) -> i64 {
+    unsafe {
+        if FNS[g].self_ty != 0 || intrinsic_of_fn(g) >= 0 {
+            return -1;
+        }
+        let name = fn_name(g);
+        var cut = name.len as i64;
+        while cut > 0 && name[cut - 1] != '_' {
+            cut -= 1;
+        }
+        let stem = if cut <= 1 { name } else { name[0..cut - 1] };
+        var best = -1;
+        for h in 0..FN_COUNT {
+            if h == g || FNS[h].module != FNS[g].module || FNS[h].generic > 0 || FNS[h].tmpl > 0
+                || FNS[h].self_ty != 0 || FNS[h].node == 0 || intrinsic_of_fn(h) >= 0
+                || (NEEDS[h] & ~known) != 0 {
+                continue;
+            }
+            let hn = fn_name(h);
+            let exact = hn == stem && cut > 1;
+            if !(exact || fallback_named(hn, stem) || fallback_named(hn, name))
+                || !same_signature(g, h) {
+                continue;
+            }
+            if best < 0 || exact {
+                best = h;
+            }
+        }
+        best
+    }
+}
+
+// Whether `hn` is `base_SUFFIX` with a fallback's suffix.
+fn fallback_named(hn: [u8], base: [u8]) -> bool {
+    let n = base.len as i64;
+    if hn.len as i64 <= n + 1 || hn[0..n] != base || hn[n] != '_' {
+        return false;
+    }
+    let rest = hn[n + 1..hn.len as i64];
+    rest == "portable" || rest == "scalar" || rest == "generic" || rest == "fallback"
+        || rest == "soft" || rest == "sw" || rest == "baseline" || rest == "table"
+}
+
+fn same_signature(g: i64, h: i64) -> bool {
+    unsafe {
+        if FNS[g].param_count != FNS[h].param_count || FNS[g].ret != FNS[h].ret {
+            return false;
+        }
+        for k in 0..FNS[g].param_count {
+            if TLISTS.data[FNS[g].params + k] != TLISTS.data[FNS[h].params + k] {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// `try: volec edit patch FILE:LINE --old 'LINE' --new 'LINE'` with call
+// n wrapped in `if std::arch::detect("F") { CALL } else { FALLBACK(ARGS) }`
+// (no else for a unit call without a fallback; nothing for a value without
+// one, or a call over several lines).
+fn try_wrap(n: i64, missing: i64, fallback: i64) {
+    unsafe {
+        if fallback < 0 && !is_unit_call(n) {
+            return;
+        }
+        let pre = buf_new();
+        buf_str(pre, c"if ");
+        let top = top_features(missing);
+        var first = true;
+        for b in 0..33 {
+            if has_bit(top, b) {
+                if !first {
+                    buf_str(pre, c" && ");
+                }
+                first = false;
+                buf_str(pre, c"std::arch::detect(\"");
+                put_feature(pre, b);
+                buf_str(pre, c"\")");
+            }
+        }
+        buf_str(pre, c" { ");
+        let post = buf_new();
+        if fallback >= 0 {
+            let callee = NODES[n].a;
+            let ctext = SRC[NODES[callee].start..NODES[callee].end];
+            let gname = fn_name(NODES[n].x - 1);
+            buf_str(post, c" } else { ");
+            if ctext.len >= gname.len
+                && ctext[ctext.len as i64 - gname.len as i64..ctext.len] == gname {
+                buf_bytes(post, ctext[0..ctext.len as i64 - gname.len as i64]);
+            }
+            buf_bytes(post, fn_name(fallback));
+            buf_bytes(post, SRC[NODES[callee].end..NODES[n].end]);
+            buf_str(post, c" }");
+        } else {
+            buf_str(post, c"; }");
+        }
+        try_line_edit(NODES[n].start, NODES[n].end, buf_slice(pre), buf_slice(post));
+    }
+}
+
+// `try: volec edit patch FILE:LINE --old 'LINE' --new 'LINE'`: the line
+// of [start, end) with `pre` before and `post` after that text.
+fn try_line_edit(start: i64, end: i64, pre: [u8], post: [u8]) {
+    unsafe {
+        var file = 0;
+        while file + 1 < FILE_COUNT && start >= FILES[file + 1].start {
+            file += 1;
+        }
+        let path = FILES[file].path;
+        if path[0] == '<' {
+            return;
+        }
+        var ls = start;
+        while ls > FILES[file].start && SRC[ls - 1] != '\n' {
+            ls -= 1;
+        }
+        while ls < start && (SRC[ls] == ' ' || SRC[ls] == '\t') {
+            ls += 1;
+        }
+        var le = start;
+        while SRC[le] != '\n' && SRC[le] != 0 {
+            le += 1;
+        }
+        if end > le {
+            return;
+        }
+        let old = buf_new();
+        buf_bytes(old, SRC[ls..le]);
+        let new = buf_new();
+        buf_bytes(new, SRC[ls..start]);
+        buf_bytes(new, pre);
+        buf_bytes(new, SRC[start..end]);
+        buf_bytes(new, post);
+        buf_bytes(new, SRC[end..le]);
+        put_patch(start, buf_slice(old), buf_slice(new));
+    }
+}
+
+// `try: volec edit patch FILE:LINE --old OLD --new NEW` for the text old
+// on the line of pos.
+fn try_patch_at(pos: i64, old: [u8], new: [u8]) {
+    unsafe {
+        var file = 0;
+        while file + 1 < FILE_COUNT && pos >= FILES[file + 1].start {
+            file += 1;
+        }
+        if FILES[file].path[0] == '<' {
+            return;
+        }
+        put_patch(pos, old, new);
+    }
+}
+
+fn put_patch(pos: i64, old: [u8], new: [u8]) {
+    unsafe {
+        let args = buf_new();
+        buf_str(args, c"edit patch ");
+        let at = buf_new();
+        put_pos(at, pos);
+        // (FILE:LINE: the column dropped)
+        let p = buf_slice(at);
+        var cut = p.len as i64;
+        while cut > 0 && p[cut - 1] != ':' {
+            cut -= 1;
+        }
+        buf_bytes(args, p[0..cut - 1]);
+        buf_str(args, c" --old ");
+        quoted(args, old);
+        buf_str(args, c" --new ");
+        quoted(args, new);
+        put_arch_options(args);
+        err_try_tool(buf_slice(args), true);
+    }
+}
+
+// ` -C OPTION` for each -C option the command line gave (an edit's check
+// then knows the same features).
+fn put_arch_options(out: i64) {
+    unsafe {
+        var opts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        push_arch_args(&opts);
+        for k in 0..opts.count {
+            buf_byte(out, ' ');
+            buf_str(out, opts.data[k] as *u8);
+        }
+    }
+}
+
+// ` -o STEM`: the program the root file builds (`sum.vl` -> `sum`; a
+// `main.vl`: its directory's name).
+fn put_output(out: i64) {
+    unsafe {
+        var f = 0;
+        while f < FILE_COUNT && FILES[f].path[0] == '<' {
+            f += 1;
+        }
+        if f >= FILE_COUNT {
+            return;
+        }
+        let p = FILES[f].path;
+        var n = 0;
+        while p[n] != 0 {
+            n += 1;
+        }
+        let path = p[0..n];
+        var end = n;
+        end -= crate::base::source_ext_len(path);
+        var start = end;
+        while start > 0 && path[start - 1] != '/' {
+            start -= 1;
+        }
+        if path[start..end] == "main" && start > 1 {
+            end = start - 1;
+            start = end;
+            while start > 0 && path[start - 1] != '/' {
+                start -= 1;
+            }
+        }
+        if end > start {
+            buf_str(out, c" -o ");
+            buf_bytes(out, path[start..end]);
+        }
+    }
+}
+
+// s in single quotes for a shell.
+fn quoted(out: i64, s: [u8]) {
+    unsafe {
+        buf_byte(out, '\'');
+        for i in 0..s.len as i64 {
+            if s[i] == '\'' {
+                buf_str(out, c"'\\''");
+            } else {
+                buf_byte(out, s[i]);
+            }
+        }
+        buf_byte(out, '\'');
+    }
+}

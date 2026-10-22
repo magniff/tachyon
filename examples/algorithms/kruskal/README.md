@@ -6,7 +6,7 @@ the edges and building the spanning forest takes about 55 ms, faster
 than C with `qsort` and close to C++ with `std::sort`.
 
 ```sh
-tachyonc examples/algorithms/kruskal/main.tach -o kruskal && ./kruskal
+volec examples/algorithms/kruskal/main.vl -o kruskal && ./kruskal
 ```
 
 ## The problem
@@ -100,7 +100,7 @@ fn find(inout self, x: i64) -> i64 {
 }
 ```
 
-`unite` orders the two roots by size with a tuple-valued `if` (tachyon
+`unite` orders the two roots by size with a tuple-valued `if` (vole
 has no tuple assignment, so `let (ra, rb) = if ... { (y, x) } else {
 (x, y) };` replaces `(ra, rb) = (rb, ra)`):
 
@@ -113,7 +113,7 @@ self.parent.set(rb, ra as i32);
 size[ra] += size[rb];
 ```
 
-(`union` is a keyword in tachyon, for C-compatible unions, hence the
+(`union` is a keyword in vole, for C-compatible unions, hence the
 name `unite`.)
 
 **Kruskal** is then a sort and a loop. It returns a tuple, the forest's
@@ -171,12 +171,12 @@ plus union-find, on an Apple M-series machine:
 
 | | time |
 |---|---|
-| tachyon 0.15, `-O2` (the default) | 55 ms |
-| tachyon 0.15, `-O0` | 310 ms |
+| vole 0.15, `-O2` (the default) | 55 ms |
+| vole 0.15, `-O0` | 310 ms |
 | C, `clang -O2`, `qsort` | 73 ms |
 | C++, `clang++ -O2`, `std::sort` (the same file, the sort swapped) | 51 ms |
 
-`std::sort` in tachyon is generic: it is compiled for `Edge` with the
+`std::sort` in vole is generic: it is compiled for `Edge` with the
 derived `cmp` inlined into the introsort, as C++'s template is, while
 C's `qsort` calls the comparison through a function pointer for every
 one of the ~20 million comparisons.
@@ -185,15 +185,15 @@ one of the ~20 million comparisons.
 
 | feature | where | guide |
 |---|---|---|
-| `#[derive(Eq, Ord, Debug)]`, sorting by a derived `Ord` | `Edge`, `kruskal` | `tachyonc guide formatting` (derive), `guide std` (sort) |
-| default and named arguments | `random_edges` | `tachyonc guide core` |
-| ranges as iterators, `map`, `collect`, `sum`, `max` | `UnionFind::new`, `main` | `tachyonc guide iterators`, `guide closures` |
-| tuples: returned, destructured, a tuple-valued `if` | `kruskal`, `unite`, `main` | `tachyonc guide syntax` |
-| widening (`i32` fields to `i64` parameters) | `kruskal` | `tachyonc guide conversions` |
-| `Vec::filled`, `as_mut_slice`, slices written through | `UnionFind` | `tachyonc guide std`, `guide memory` |
-| `defer` to free | everywhere | `tachyonc guide memory` |
-| f-strings: `{w:>2}`, `{e:?}` | `main` | `tachyonc guide formatting` |
-| a C header: `import "time.h" as c;` | `now_ns` | `tachyonc guide c-interop` |
+| `#[derive(Eq, Ord, Debug)]`, sorting by a derived `Ord` | `Edge`, `kruskal` | `volec guide formatting` (derive), `guide std` (sort) |
+| default and named arguments | `random_edges` | `volec guide core` |
+| ranges as iterators, `map`, `collect`, `sum`, `max` | `UnionFind::new`, `main` | `volec guide iterators`, `guide closures` |
+| tuples: returned, destructured, a tuple-valued `if` | `kruskal`, `unite`, `main` | `volec guide syntax` |
+| widening (`i32` fields to `i64` parameters) | `kruskal` | `volec guide conversions` |
+| `Vec::filled`, `as_mut_slice`, slices written through | `UnionFind` | `volec guide std`, `guide memory` |
+| `defer` to free | everywhere | `volec guide memory` |
+| f-strings: `{w:>2}`, `{e:?}` | `main` | `volec guide formatting` |
+| a C header: `import "time.h" as c;` | `now_ns` | `volec guide c-interop` |
 
 ## Try
 

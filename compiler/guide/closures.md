@@ -49,8 +49,8 @@ fn main() -> i32 {
   closure parameter 'x'`, fixed by writing `|x: i64|`.
 - `return` in the body returns from the closure; `break` and `continue`
   cannot leave it. An `unsafe { }` around a closure covers its body.
-- Messages and `tachyonc query type FILE:LINE:COL` show a closure's type
-  as `closure(i64) -> i64 at main.tach:4:15`.
+- Messages and `volec query type FILE:LINE:COL` show a closure's type
+  as `closure(i64) -> i64 at main.vl:4:15`.
 
 ## What a closure captures
 
@@ -169,4 +169,4 @@ fn main() -> i32 {
 
 Not there: `FnOnce`, `Box<dyn Fn>` and `dyn` (use generics), `impl Fn`
 in a result (0.15), closures in statics, a closure calling itself.
-`tachyonc guide iterators`: closures with `map`, `filter`, `fold`.
+`volec guide iterators`: closures with `map`, `filter`, `fold`.

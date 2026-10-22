@@ -47,7 +47,7 @@ LC_ALL=C
 export LC_ALL
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-IMAGE=tachyon-check:linux-aarch64
+IMAGE=vole-check:linux-aarch64
 PLATFORM=linux/arm64
 WORKTREE=0
 ALL_LEVELS=0
@@ -106,7 +106,7 @@ command -v git >/dev/null 2>&1 || die "git not found"
 docker info >/dev/null 2>&1 || die "docker is not running (with colima: colima start)"
 clamp_cpus
 
-SNAP=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-aarch64-linux-check.XXXXXX")
+SNAP=$(mktemp -d "${TMPDIR:-/tmp}/vole-aarch64-linux-check.XXXXXX")
 trap 'stop_container; rm -rf "$SNAP"' EXIT
 trap 'exit 130' INT TERM
 
@@ -116,20 +116,20 @@ snapshot "$SNAP" 0
 if [ -n "$COMPILER" ]; then
     [ -x "$COMPILER" ] || die "no compiler at $COMPILER"
     echo "==> cross-compiling the compiler for aarch64-linux with $COMPILER" >&2
-    "$COMPILER" --target aarch64-linux "$SNAP/src/compiler/src/main.tach" -o "$SNAP/tachyonc.o" \
+    "$COMPILER" --target aarch64-linux "$SNAP/src/compiler/src/main.vl" -o "$SNAP/volec.o" \
         || die "the cross-compilation failed"
 else
     echo "==> the chain here, and the compiler cross-built for aarch64-linux" >&2
     sh "$ROOT/bootstrap/bootstrap.sh" --host aarch64-linux "$@"
-    OBJECT="$ROOT/target/aarch64-linux/tachyonc.o"
+    OBJECT="$ROOT/target/aarch64-linux/volec.o"
     [ -f "$OBJECT" ] || die "bootstrap.sh left no $OBJECT"
-    cp "$OBJECT" "$SNAP/tachyonc.o"
+    cp "$OBJECT" "$SNAP/volec.o"
 fi
 
 ensure_image "$IMAGE" "$PLATFORM" "$ROOT/bootstrap/ci/linux-aarch64.Dockerfile"
 
 echo "==> on aarch64-linux, in the container ($CPUS CPUs)" >&2
-tar -C "$SNAP" -c -f - src tachyonc.o | docker run --rm -i --name "$CONTAINER" --cpus "$CPUS" --platform "$PLATFORM" \
+tar -C "$SNAP" -c -f - src volec.o | docker run --rm -i --name "$CONTAINER" --cpus "$CPUS" --platform "$PLATFORM" \
     -e CPUS="$CPUS" -e ALL_LEVELS="$ALL_LEVELS" -e FUZZ="$FUZZ" -e ABI="$ABI" -e OBJCHECK="$OBJCHECK" \
     -e DEBUGGER="$DEBUGGER" -e VALGRIND="$VALGRIND" -e ONLY="$ONLY" "$IMAGE" sh -c '
     set -eu
@@ -147,25 +147,25 @@ tar -C "$SNAP" -c -f - src tachyonc.o | docker run --rm -i --name "$CONTAINER" -
     start=$(date +%s)
     mkdir -p target/native
     n=target/native
-    cc -o $n/cross /work/tachyonc.o -lm || fail fixpoint "$start" "linking the cross-built compiler failed"
+    cc -o $n/cross /work/volec.o -lm || fail fixpoint "$start" "linking the cross-built compiler failed"
     echo "cross-built compiler: $($n/cross --version)"
     # Built by itself here: the same object as the cross-compilation, and
     # a fixpoint.
-    $n/cross compiler/src/main.tach -o $n/build2.o || fail fixpoint "$start" "the cross-built compiler failed to build itself"
-    cmp -s /work/tachyonc.o $n/build2.o \
+    $n/cross compiler/src/main.vl -o $n/build2.o || fail fixpoint "$start" "the cross-built compiler failed to build itself"
+    cmp -s /work/volec.o $n/build2.o \
         || fail fixpoint "$start" "the compiler built here differs from the cross-built one"
     cc -o $n/build2 $n/build2.o -lm
-    $n/build2 compiler/src/main.tach -o $n/build3.o || fail fixpoint "$start" "the compiler built here failed to build itself"
+    $n/build2 compiler/src/main.vl -o $n/build3.o || fail fixpoint "$start" "the compiler built here failed to build itself"
     cmp -s $n/build2.o $n/build3.o || fail fixpoint "$start" "no fixpoint on aarch64-linux"
-    cp $n/build2 target/tachyonc
+    cp $n/build2 target/volec
     echo "fixpoint: the cross-built compiler, its build here and that one'"'"'s build emit the same object"
     row fixpoint pass $(( $(date +%s) - start )) "cross-built = built here = built by that"
     start=$(date +%s)
     head -c 3000000 /dev/urandom >/tmp/random
-    ./target/tachyonc examples/md5/main.tach -o /tmp/md5
+    ./target/volec examples/md5/main.vl -o /tmp/md5
     got=$(/tmp/md5 </tmp/random)
     want=$(md5sum </tmp/random | cut -d" " -f1)
-    [ "$got" = "$want" ] || fail md5 "$start" "tachyon $got, md5sum $want"
+    [ "$got" = "$want" ] || fail md5 "$start" "vole $got, md5sum $want"
     echo "md5 example: $got, same as md5sum"
     row md5 pass $(( $(date +%s) - start )) "the md5 example agrees with md5sum"
     # The checks, at once.
@@ -179,6 +179,6 @@ tar -C "$SNAP" -c -f - src tachyonc.o | docker run --rm -i --name "$CONTAINER" -
     [ "$VALGRIND" = 1 ] && steps="$steps,valgrind"
     [ -z "$ONLY" ] || steps=$ONLY
     echo "==> the checks: $(echo "$steps" | tr "," " ")" >&2
-    exec sh bootstrap/gate.sh --inside -c target/tachyonc -j "$CPUS" --only "$steps" \
+    exec sh bootstrap/gate.sh --inside -c target/volec -j "$CPUS" --only "$steps" \
         --fuzz "$([ "$FUZZ" = 0 ] && echo 1 || echo "$FUZZ")" --abi "$([ "$ABI" = 0 ] && echo 1 || echo "$ABI")"
 '

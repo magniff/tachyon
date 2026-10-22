@@ -7,10 +7,10 @@
 #
 # usage: tests/refactor/roundtrip.sh [-c COMPILER] [-n ROUNDS] [-s SEED] [-p PROGRAM]
 #
-#   -c COMPILER   the tachyonc binary (default: target/tachyonc)
+#   -c COMPILER   the volec binary (default: target/volec)
 #   -n ROUNDS     the number of round trips (default: 40)
 #   -s SEED       the first round's seed (default: 1); round k uses SEED+k
-#   -p PROGRAM    the program's directory, with main.tach (default:
+#   -p PROGRAM    the program's directory, with main.vl (default:
 #                 tests/refactor/layout)
 #
 # Each round, in a fresh copy of the program (a git repository of its
@@ -26,7 +26,7 @@ export LC_ALL
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 ROUNDS=40
 SEED=1
 PROGRAM="$HERE/layout"
@@ -46,21 +46,21 @@ esac
 [ -x "$COMPILER" ] || { echo "roundtrip.sh: no compiler at $COMPILER" >&2; exit 2; }
 PROGRAM=$(cd "$PROGRAM" && pwd)
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-roundtrip.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-roundtrip.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
-unset TACHYON_ROOT
+unset VOLE_ROOT
 
 # The modules of the program (but the root), one per line.
 modules() {
-    "$COMPILER" query items "$PROGRAM/main.tach" | awk -F'\t' '$1 != "crate" { print $1 }'
+    "$COMPILER" query items "$PROGRAM/main.vl" | awk -F'\t' '$1 != "crate" { print $1 }'
 }
 
 # The top-level items of module $1 in the copy, in order, after a line
 # `M MODULE FILE`: `KIND NAME LINE`, KIND `-` for what cannot be named
 # for a move (an impl block).
 items() {
-    "$COMPILER" query items "$1" main.tach | awk -F'\t' 'NR == 1 { print "M", substr($1, 3), $2; next }
+    "$COMPILER" query items "$1" main.vl | awk -F'\t' 'NR == 1 { print "M", substr($1, 3), $2; next }
         $2 != "method" && $2 != "field" && $2 != "variant" {
         k = $2; t = $3; name = "-"
         if (k == "fn" || k == "const" || k == "static" || k == "struct" || k == "enum" || k == "trait") {

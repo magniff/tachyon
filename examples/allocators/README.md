@@ -1,6 +1,6 @@
 # Allocators
 
-Allocation in tachyon 0.16 is explicit: nothing allocates unless it is
+Allocation in vole 0.16 is explicit: nothing allocates unless it is
 given an allocator. A program's general-purpose allocator (`Gpa`) is a
 parameter of its `main`, a function that allocates takes one, and a
 container (`Vec`, `Buf`, `HashMap`) holds the one it was made with. The
@@ -32,7 +32,7 @@ allocators` runs them).
 | `Arena` | `Arena::new_in(gpa)` | everything at once: `reset`, `free_all` (unsafe) | data that lives together for longer than a call |
 | `FixedBuf` | `FixedBuf::new(mem[..])` over memory you own | `reset` (unsafe) | no heap, or a hard budget |
 
-`tachyonc guide allocators` is the reference; `tachyonc guide effects`
+`volec guide allocators` is the reference; `volec guide effects`
 explains `alloc(Gpa)`, `alloc(Arena)` and the rest of what
-`tachyonc query effects` prints. [../effects/](../effects/) has the
+`volec query effects` prints. [../effects/](../effects/) has the
 examples for effects.

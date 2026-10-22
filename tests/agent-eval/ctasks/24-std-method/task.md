@@ -1,7 +1,7 @@
 # Add `strip_prefix` and `strip_suffix` to std
 
 std has text helpers for `[u8]` (`trim`, `split`, `split_whitespace`,
-`parse_int`; see `target/tachyonc guide std`) but nothing to take a known
+`parse_int`; see `target/volec guide std`) but nothing to take a known
 prefix or suffix off a text, so programs write the loop themselves. Add
 two public functions to std, next to `trim`:
 
@@ -35,14 +35,14 @@ Acceptance:
 
 1. The two functions, exactly as above, in std.
 2. A test case of your own in `tests/run/` (see the directives at the top
-   of `tests/run.sh`; name it e.g. `std_...tach`, not `eval_...`, a
+   of `tests/run.sh`; name it e.g. `std_...vl`, not `eval_...`, a
    prefix reserved for the grader's own cases) that calls both functions,
    covers the edge cases above, and passes.
 3. An entry in the guide's `std` topic (`compiler/guide/std.md`, the
    hand-written part, not only the API listing that is generated from
    std's source): a sentence or two on what they do and a ```` ```tach ````
    example calling them, with its ```` ```out ```` block, so that
-   `target/tachyonc guide std` shows it.
+   `target/volec guide std` shows it.
 4. After rebuilding the compiler, these pass: `tests/run.sh std` and
    `tests/run.sh guide` (it compiles and runs every guide example; it
    takes a couple of minutes).

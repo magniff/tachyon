@@ -1,0 +1,1796 @@
+// Drops (0.17, docs/design/value-semantics.md §2.2, §4 steps 0 and 5):
+// the drop of an owned value runs where its owner's scope ends, as an
+// implicit `defer` the checker places and the moves then decide.
+//
+// During type checking (check/body.vl, patterns/mod.vl call these):
+// - after each `let` binding a value whose type has glue (glue.vl), an
+//   implicit defer (DEFER_IMPLICIT, its b the PatBind) holding the glue
+//   of the local, checked where it stands; a function body starts with
+//   one per by-value parameter; an arm of a match by value starts with one
+//   per owned binding. A match reached through a reference (`match
+//   self.kind`, `match *p`, `match v[i]`), and a `for` loop's element,
+//   bind by reference instead: no drop, and moving the binding is
+//   own.move_out (BYREF).
+// - an owned temporary whose value a statement discards (`make(3);`) is
+//   bound to a hidden local, which drops at the statement's end;
+// - `p = rhs` on an owned place p (not through a raw pointer, not an
+//   index) becomes `{ let __own_new = rhs; { let =o = p; p = __own_new; } }`:
+//   the right side, then the write, then the old value's drop (=o's
+//   implicit defer) with the state p had before the write.
+//
+// During the own walk (moves.vl): every exit of an implicit defer
+// records, per entry of its glue, whether the place was there, moved, or
+// moved on some paths only. Then (finish_drops, from check_own): an entry
+// moved at every exit is removed; one moved at some exits runs under a
+// drop flag (a hidden `let mut __df = true;` before the defer, `__df =
+// false` where the place moves, `__df = true` where it is assigned again);
+// the others stay. Both back ends lower a `defer` on every exit, so the
+// back end needs nothing more.
+//
+// Only --values=error places drops (drops_on); the other modes keep 0.16's
+// semantics: nothing drops.
+
+use crate::base::{IntVec, SYMS, intern_c};
+use crate::front::ast::{
+    BLOCK_DROPS_DONE, DEFER_IMPLICIT, NODES, NODE_CHECKED, NODE_IN_BOUNDS, NODE_RAW, NodeKind,
+    SCRATCH, child, list_begin, list_end, list_push, new_node,
+};
+use crate::front::check::{CUR_FN, LOCALS, Res, define_local};
+use crate::front::check::synth_mode::synth_expr;
+use crate::front::closures::{CLOSURES, CLOSURE_STACK};
+use crate::front::lexer::Tok;
+use crate::front::modules::{STD_MODULE, within_std};
+use crate::front::own::diag::{
+    MODE_ERROR, MODE_OFF, OWN_DROP_VIEW, OWN_MODE, own_end, own_help, own_str, own_type,
+};
+use crate::front::own::glue::{
+    GLUE_MATCH, G_PATHS, G_PATH_AT, G_STMTS, glue_block, glue_mark, glue_reset, has_glue,
+};
+use crate::front::own::kinds::{has_drop_impl, is_owned_type, is_view_type};
+use crate::front::own::state::{
+    CUR, PL_COUNT, PL_FIELD, PL_PARENT, PL_RID, PL_RKIND, RK_LOCAL, dmoved_bits, get_bit,
+    moved_bits, root_of,
+};
+use crate::front::types::{
+    FNS, REF_MUT, REF_SHARED, STRUCTS, TLISTS, TYPES, TY_BOOL, TY_UNIT, TyKind, fn_param,
+    struct_field,
+};
+use crate::middle::lower::ssa::HMap;
+
+// Node flags (0.17, T1): on the read of the old value of an owned
+// assignment (`let =o = p`): it reads p whatever p's state; on a match's
+// scrutinee reached through a reference (its bindings borrow); on a `let`
+// whose binding moves on at once (`let __own_new = rhs`): no drop; on an
+// Arm whose bindings' drops are placed; on a body whose parameters' drops
+// are; on the Arm of a `for` loop's `next()` (check/iterate.vl): its
+// binding is a copy of an element, not dropped.
+pub const ASSIGN_OLD: i64 = 1 << 57;
+pub const MATCH_BYREF: i64 = 1 << 58;
+pub const NO_DROP: i64 = 1 << 59;
+pub const ARM_DROPS_DONE: i64 = 1 << 60;
+pub const PARAM_DROPS_DONE: i64 = 1 << 61;
+pub const ARM_FOR_NEXT: i64 = 1 << 62;
+
+// What an implicit defer drops: a local (a `let`'s, a parameter's, a
+// binding's), or the old value of an owned assignment.
+const DK_LOCAL: i64 = 0;
+const DK_OLD: i64 = 1;
+
+// The implicit defers (rows): the node, its kind, its local, the block it
+// is in, its entries (E_*[first..first + count]); for DK_OLD, the outer
+// block of the desugaring, and the place assigned (A_LOCAL, -1: through a
+// reference; A_PATH: an offset in PATHS).
+static var D_NODE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var D_KIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var D_LOCAL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var D_BLOCK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var D_FIRST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var D_COUNT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var D_OUTER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var A_LOCAL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var A_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// defer + 1 -> row + 1; local + 1 -> its DK_LOCAL row + 1; the read node
+// of a DK_OLD + 1 -> row + 1.
+static var D_INDEX: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var LOCAL_ROW: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var OLD_OF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// Entries: the glue statement, its path (an offset in PATHS: the count,
+// then the steps), its state at the exits (S_*, ORed).
+static var E_STMT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var E_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var E_STATE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var PATHS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The functions with drops (f + 1 -> 1): check_own walks them in every
+// mode but off.
+static var FN_DROPS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// Locals bound by reference (local + 1 -> the node they borrow + 1).
+pub static var BYREF: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// `impl Drop` of view types (own.drop_view): the method's node, the type.
+static var DROP_VIEWS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// A place's state at an exit: there, moved, moved on some paths.
+pub const ST_LIVE: i64 = 1;
+pub const ST_MOVED: i64 = 2;
+pub const ST_MAYBE: i64 = 4;
+
+// The moves of places of locals with drops (for the flags): the local, the
+// path (in PATHS), the node.
+static var M_LOCAL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var M_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var M_NODE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+static var SYM_OLD: i64 = 0;
+static var SYM_NEW: i64 = 0;
+static var SYM_TMP: i64 = 0;
+static var SYM_FLAG: i64 = 0;
+static var SYM_FOR_SEQ: i64 = 0;
+static var SYM_FORGET: i64 = 0;
+static var SYM_NEEDS_DROP: i64 = 0;
+static var SYM_DROP: i64 = 0;
+
+fn syms() {
+    unsafe {
+        if SYM_OLD == 0 {
+            SYM_OLD = intern_c(c"=o");
+            SYM_NEW = intern_c(c"__own_new");
+            SYM_TMP = intern_c(c"__own_tmp");
+            SYM_FLAG = intern_c(c"__own_flag");
+            SYM_FOR_SEQ = intern_c(c"__for_seq");
+            SYM_FORGET = intern_c(c"forget");
+            SYM_NEEDS_DROP = intern_c(c"needs_drop");
+            SYM_DROP = intern_c(c"drop");
+        }
+    }
+}
+
+// Whether drops are placed: only where moves are enforced, --values=error
+// (0.17, integration of T1 and T4). Under report and warn a use after a
+// move, or a handle copied and freed twice (0.16's idioms, migrated by
+// `fix --values`), still compiles, and dropping the copies would free
+// memory twice; there nothing drops, as in 0.16 (`free` frees).
+pub fn drops_on() -> bool {
+    unsafe { OWN_MODE == MODE_ERROR }
+}
+
+// Whether any drop was placed (check_own walks then).
+pub fn any_drops() -> bool {
+    unsafe { FN_DROPS.count > 0 }
+}
+
+pub fn fn_has_drops(f: i64) -> bool {
+    unsafe { FN_DROPS.get(f + 1) != 0 }
+}
+
+// The function whose walk sees the code being checked: the innermost
+// closure's, else the function's.
+fn owner_fn() -> i64 {
+    unsafe {
+        if CLOSURE_STACK.count > 0 {
+            return CLOSURES[CLOSURE_STACK.data[CLOSURE_STACK.count - 1]].f;
+        }
+        CUR_FN
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rows and entries
+
+fn new_row(d: i64, kind: i64, l: i64, block: i64) -> i64 {
+    unsafe {
+        let r = D_NODE.count;
+        D_NODE.push(d);
+        D_KIND.push(kind);
+        D_LOCAL.push(l);
+        D_BLOCK.push(block);
+        D_FIRST.push(0);
+        D_COUNT.push(0);
+        D_OUTER.push(0);
+        A_LOCAL.push(-1);
+        A_PATH.push(-1);
+        D_INDEX.put(d + 1, r + 1);
+        if kind == DK_LOCAL && l >= 0 {
+            LOCAL_ROW.put(l + 1, r + 1);
+        }
+        r
+    }
+}
+
+fn row_of(d: i64) -> i64 {
+    unsafe { D_INDEX.get(d + 1) - 1 }
+}
+
+// The entries glue.vl made since mark, as row r's.
+fn take_entries(r: i64, mark: i64) {
+    unsafe {
+        D_FIRST.data[r] = E_STMT.count;
+        D_COUNT.data[r] = G_STMTS.count - mark;
+        for g in mark..G_STMTS.count {
+            E_STMT.push(G_STMTS.data[g]);
+            E_PATH.push(PATHS.count);
+            E_STATE.push(0);
+            let at = G_PATH_AT.data[g];
+            let n = G_PATHS.data[at];
+            for i in 0..n + 1 {
+                PATHS.push(G_PATHS.data[at + i]);
+            }
+        }
+        glue_reset(mark);
+        if D_COUNT.data[r] > 0 {
+            FN_DROPS.put(owner_fn() + 1, 1);
+        }
+    }
+}
+
+fn implicit_defer(binding: i64) -> i64 {
+    unsafe {
+        let d = new_node(NodeKind::Defer, NODES[binding].start, NODES[binding].start);
+        NODES[d].b = binding;
+        NODES[d].p |= DEFER_IMPLICIT;
+        d
+    }
+}
+
+// check_defer of implicit defer d: its glue, made for its local's type and
+// checked where d stands.
+pub fn check_implicit_defer(d: i64) {
+    unsafe {
+        let binding = NODES[d].b;
+        let l = if binding != 0 { NODES[binding].x } else { -1 };
+        var r = row_of(d);
+        if r < 0 {
+            r = new_row(d, DK_LOCAL, l, 0);
+        }
+        let mark = glue_mark();
+        let block = if l >= 0 {
+            glue_block(NODES[binding].a, LOCALS[l].ty, binding)
+        } else {
+            glue_block(0, 0, d)
+        };
+        NODES[block].p |= BLOCK_DROPS_DONE;
+        NODES[d].a = block;
+        synth_expr(block);
+        take_entries(r, mark);
+    }
+}
+
+// A new implicit defer for binding (local l), of kind `kind`, in block;
+// checked now when `now`; 0 when its local's type has no glue.
+fn new_defer(binding: i64, kind: i64, block: i64, now: bool) -> i64 {
+    unsafe {
+        let l = NODES[binding].x;
+        if l < 0 || !has_glue(LOCALS[l].ty) {
+            return 0;
+        }
+        let d = implicit_defer(binding);
+        new_row(d, kind, l, block);
+        if now {
+            check_implicit_defer(d);
+        }
+        d
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Placing the drops (check/body.vl)
+
+// Whether function f is std's function `name` (or an instance of it).
+fn is_std_fn(f: i64, name: i64) -> bool {
+    unsafe {
+        let t = if FNS[f].tmpl != 0 { FNS[f].tmpl - 1 } else { f };
+        within_std(FNS[t].module) && FNS[t].node != 0 && NODES[FNS[t].node].a == name
+    }
+}
+
+// (0.17) Whether type t, which has `impl Drop`, holds views of its own:
+// own.drop_view. A view reached only through a type argument does not
+// count when the impl is generic over it: std's `impl<T> Drop for
+// Vec<T>` drops a `Vec<[u8]>`'s elements without reading them (a view
+// has no drop), as Rust's `may_dangle`. Fields of the template are
+// looked at, so `struct P<T> { s: [u8], x: T }` with `impl<T> Drop` is
+// still reported.
+fn drop_reads_views(t: i64) -> bool {
+    unsafe {
+        if !is_view_type(t) {
+            return false;
+        }
+        if TYPES[t].kind != TyKind::Struct {
+            return true;
+        }
+        let s = TYPES[t].a;
+        if STRUCTS[s].tmpl == 0 {
+            return true;
+        }
+        let tm = STRUCTS[s].tmpl - 1;
+        for i in 0..STRUCTS[tm].field_count {
+            let ft = (*struct_field(tm, i)).ty;
+            if ft > 0 && is_view_type(ft) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// check_function, its parameters defined: an implicit defer per by-value
+// parameter, first in the body (not std::forget's, whose point is not to
+// drop); `needs_drop::<T>()` folded; `impl Drop` of a view type noted.
+pub fn param_drops(item: i64, f: i64) {
+    unsafe {
+        syms();
+        let body = NODES[item].c;
+        if FNS[f].tmpl != 0 && is_std_fn(f, SYM_NEEDS_DROP) && body != 0 && NODES[body].a != 0 {
+            let t = TLISTS.data[FNS[f].targs];
+            NODES[NODES[body].a].a = if has_glue(t) { 1 } else { 0 };
+        }
+        if FNS[f].self_ty > 0 && NODES[item].a == SYM_DROP && has_drop_impl(FNS[f].self_ty)
+            && drop_reads_views(FNS[f].self_ty) {
+            DROP_VIEWS.push(item);
+            DROP_VIEWS.push(FNS[f].self_ty);
+        }
+        if !drops_on() || body == 0 || (NODES[body].p & PARAM_DROPS_DONE) != 0 {
+            return;
+        }
+        NODES[body].p |= PARAM_DROPS_DONE;
+        if is_std_fn(f, SYM_FORGET) {
+            return;
+        }
+        if crate::front::contracts::expand::is_pre_fn(f) {
+            // (0.18: a requires check reads the caller's arguments in place:
+            // its owned parameters borrow them, are never dropped, and
+            // moving one is own.move_out)
+            for i in 0..NODES[item].count {
+                let p = child(item, i);
+                let l = NODES[p].x;
+                if l >= 0 && is_owned_type(LOCALS[l].ty) {
+                    BYREF.put(l + 1, p + 1);
+                }
+            }
+            return;
+        }
+        let mark = list_begin();
+        var any = false;
+        for i in 0..NODES[item].count {
+            let d = new_defer(child(item, i), DK_LOCAL, body, false);
+            if d != 0 {
+                list_push(d);
+                any = true;
+            }
+        }
+        if !any {
+            SCRATCH.count = mark;
+            return;
+        }
+        for i in 0..NODES[body].count {
+            list_push(child(body, i));
+        }
+        list_end(body, mark);
+    }
+}
+
+// The defers to put in the blocks being checked: (index of the statement
+// they follow, defer) pairs.
+static var INS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// check_block, before its statements: a mark for block_end, -1 when its
+// drops are placed already (or off).
+pub fn block_begin(block: i64) -> i64 {
+    unsafe {
+        if !drops_on() || (NODES[block].p & BLOCK_DROPS_DONE) != 0 {
+            return -1;
+        }
+        NODES[block].p |= BLOCK_DROPS_DONE;
+        INS.count
+    }
+}
+
+// check_block, after statement i (stmt), checked.
+pub fn after_stmt(block: i64, mark: i64, i: i64, stmt: i64) {
+    unsafe {
+        if mark < 0 {
+            return;
+        }
+        let k = NODES[stmt].kind;
+        if k == NodeKind::Let {
+            let_drops(block, i, stmt);
+            // (0.20: its temporaries, to the end of the statement; to the
+            // end of the block when the binding may view them)
+            let init = NODES[stmt].c;
+            if init != 0 && is_view_type(NODES[init].ty) {
+                temps_before(init, i);
+            } else {
+                NODES[stmt].c = unit_value(init);
+            }
+        } else if k == NodeKind::ExprStmt {
+            let e = NODES[stmt].a;
+            if e == 0 {
+                return;
+            }
+            if NODES[e].kind == NodeKind::Assign {
+                let b = assign_drops(e);
+                if b != 0 {
+                    NODES[stmt].a = b;
+                } else {
+                    NODES[stmt].a = unit_value(e);
+                }
+            } else if NODES[stmt].b != 0 && has_glue(NODES[e].ty) && !is_place(e) {
+                NODES[stmt].a = temporary(e);
+            } else {
+                // (0.20: its temporaries, to the end of the statement)
+                NODES[stmt].a = unit_value(e);
+            }
+        }
+    }
+}
+
+// check_block, after its tail (checked): an assignment there.
+pub fn after_tail(block: i64, mark: i64) {
+    unsafe {
+        let tail = NODES[block].a;
+        if mark < 0 || tail == 0 {
+            return;
+        }
+        if NODES[tail].kind == NodeKind::Assign {
+            let b = assign_drops(tail);
+            if b != 0 {
+                NODES[block].a = b;
+                return;
+            }
+        }
+        // (0.20: its temporaries, to the end of the block)
+        temps_before(tail, NODES[block].count);
+    }
+}
+
+// check_block, at its end: the defers in place.
+pub fn block_end(block: i64, mark: i64) {
+    unsafe {
+        if mark < 0 || INS.count == mark {
+            return;
+        }
+        let m = list_begin();
+        let n = NODES[block].count;
+        for i in 0..n + 1 {
+            var j = mark;
+            while j < INS.count {
+                if INS.data[j] == BEFORE + i {
+                    list_push(INS.data[j + 1]);
+                }
+                j += 2;
+            }
+            if i < n {
+                list_push(child(block, i));
+                j = mark;
+                while j < INS.count {
+                    if INS.data[j] == i {
+                        list_push(INS.data[j + 1]);
+                    }
+                    j += 2;
+                }
+            }
+        }
+        list_end(block, m);
+        INS.count = mark;
+    }
+}
+
+fn is_place(e: i64) -> bool {
+    unsafe {
+        let k = NODES[e].kind;
+        if k == NodeKind::Ident {
+            return NODES[e].res == Res::Local || NODES[e].res == Res::Static;
+        }
+        if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+            return NODES[e].y == 1 || is_place(NODES[e].a);
+        }
+        if k == NodeKind::Unary {
+            return NODES[e].op == Tok::Star;
+        }
+        k == NodeKind::Index
+    }
+}
+
+fn sym_starts(sym: i64, ch: u8) -> bool {
+    unsafe { SYMS[sym].text.len > 0 && SYMS[sym].text[0] == ch }
+}
+
+// The bindings of pattern p (PatBind nodes) onto SCRATCH.
+fn push_bindings(p: i64) {
+    unsafe {
+        if p == 0 {
+            return;
+        }
+        let k = NODES[p].kind;
+        if k == NodeKind::PatBind {
+            list_push(p);
+            return;
+        }
+        if k == NodeKind::PatOr {
+            // (every alternative binds the same names)
+            if NODES[p].count > 0 {
+                push_bindings(child(p, 0));
+            }
+            return;
+        }
+        if k == NodeKind::PatTuple || k == NodeKind::PatVariant {
+            for i in 0..NODES[p].count {
+                push_bindings(child(p, i));
+            }
+        }
+    }
+}
+
+// The last word of a function's display name: `get` of `Vec<T>::get`.
+pub fn method_word(d: [u8]) -> [u8] {
+    var i = d.len;
+    while i > 0 && d[i - 1] != ':' && d[i - 1] != '.' {
+        i -= 1;
+    }
+    d[i..d.len]
+}
+
+// Whether call e gives a copy of an element its shared receiver keeps:
+// std's accessors (`v.get(i)`, `v.last()`, `m.get(k)`, `key_at`,
+// `value_at`; 0.18.1: a heap's `peek`) return a `T`, not a `&T`, until references are type
+// arguments (0.17.1), and through `unwrap`, `expect`, `unwrap_or`. The copy
+// is borrowed: a binding of it is not dropped, and moving it is
+// own.move_out (it would be dropped twice).
+pub fn borrowed_call(e: i64) -> bool {
+    unsafe {
+        // (0.18: through a requires check's block to its call)
+        let wrapped = crate::front::contracts::expand::requires_tail(e);
+        if wrapped > 0 {
+            return borrowed_call(wrapped);
+        }
+        if e <= 0 || NODES[e].kind != NodeKind::Call || NODES[e].count == 0 {
+            return false;
+        }
+        let f = NODES[e].x - 1;
+        if f < 0 || !within_std(FNS[f].module) || !has_glue(NODES[e].ty) {
+            return false;
+        }
+        let name = method_word(SYMS[FNS[f].display].text);
+        let p0 = fn_param(f, 0);
+        if p0 <= 0 {
+            return false;
+        }
+        if name == "get" || name == "last" || name == "first" || name == "key_at"
+            || name == "value_at" || name == "peek" {
+            // (a shared receiver: `&self`, or a slice)
+            return TYPES[p0].kind == TyKind::Slice && TYPES[p0].b != REF_MUT
+                || TYPES[p0].kind == TyKind::Ptr && TYPES[p0].b == REF_SHARED;
+        }
+        // (0.24: a borrowing iterator's items, copies of elements its
+        // container keeps, moves::copies_owned_items: in std's adapters,
+        // `count`, `filter`, an item looked at and passed over is not dropped)
+        if (name == "next" || name == "at" || name == "find" || name == "last" || name == "nth")
+            && TYPES[p0].kind == TyKind::Ptr
+            && crate::front::own::moves::copies_owned_items(TYPES[p0].a, 0) {
+            return true;
+        }
+        if name == "unwrap" || name == "expect" || name == "unwrap_or" {
+            return borrowed_call(crate::front::contracts::desugar::requires_arg(child(e, 0)));
+        }
+        false
+    }
+}
+
+// Pattern p's owned bindings borrow what they bind (node at).
+fn mark_byref(p: i64, at: i64) {
+    unsafe {
+        let mark = list_begin();
+        push_bindings(p);
+        for i in mark..SCRATCH.count {
+            let b = SCRATCH.data[i];
+            let l = NODES[b].x;
+            if l >= 0 && is_owned_type(LOCALS[l].ty) {
+                BYREF.put(l + 1, at + 1);
+            }
+        }
+        SCRATCH.count = mark;
+    }
+}
+
+// (0.24, with moves::iter_item_copy) The parameter (its index) of the
+// closure being checked as the argument of `map`, `for_each`,
+// `filter_map` or `fold` on a borrowing iterator's chain that gets its
+// items, which are copies of the container's elements: borrowed (BYREF:
+// not dropped, and moving it is own.move_out); -1: none.
+pub static var ITEM_BORROW: i64 = -1;
+
+// Closure parameter local l (node p) borrows the item it is given.
+pub fn item_borrowed(l: i64, at: i64) {
+    unsafe {
+        if l >= 0 && is_owned_type(LOCALS[l].ty) {
+            BYREF.put(l + 1, at + 1);
+        }
+    }
+}
+
+// `let pat = init;` (statement i of block), checked: its implicit defers.
+fn let_drops(block: i64, i: i64, stmt: i64) {
+    unsafe {
+        syms();
+        let pat = NODES[stmt].a;
+        let init = NODES[stmt].c;
+        if pat == 0 || (NODES[stmt].p & NO_DROP) != 0 {
+            return;
+        }
+        if borrowed_call(init) {
+            // (a copy of an element a collection keeps: `v.get(i)`)
+            mark_byref(pat, init);
+            return;
+        }
+        if init != 0 && NODES[init].kind == NodeKind::Index
+            && (NODES[init].p & NODE_IN_BOUNDS) != 0 {
+            // (a `for` loop's element: a copy of what the loop borrows)
+            mark_byref(pat, init);
+            return;
+        }
+        if NODES[pat].kind == NodeKind::PatBind && sym_starts(NODES[pat].a, '=') {
+            if init != 0 && (NODES[init].p & ASSIGN_OLD) != 0 {
+                let d = new_defer(pat, DK_OLD, block, true);
+                if d != 0 {
+                    OLD_OF.put(init + 1, row_of(d) + 1);
+                    INS.push(i);
+                    INS.push(d);
+                }
+            }
+            return;
+        }
+        if NODES[pat].kind == NodeKind::PatBind && NODES[pat].a == SYM_FOR_SEQ && init != 0
+            && is_place(init) {
+            // (`for x in v`: the loop borrows v)
+            return;
+        }
+        let mark = list_begin();
+        push_bindings(pat);
+        let end = SCRATCH.count;
+        for k in mark..end {
+            let d = new_defer(SCRATCH.data[k], DK_LOCAL, block, true);
+            if d != 0 {
+                INS.push(i);
+                INS.push(d);
+            }
+        }
+        SCRATCH.count = mark;
+    }
+}
+
+// `e;` discarding an owned value e (checked): `{ let __own_tmp = e; }`,
+// which drops it at once.
+fn temporary(e: i64) -> i64 {
+    unsafe {
+        syms();
+        let start = NODES[e].start;
+        let end = NODES[e].end;
+        NODES[e].p |= NODE_CHECKED;
+        let pat = new_node(NodeKind::PatBind, start, start);
+        NODES[pat].a = SYM_TMP;
+        let st = new_node(NodeKind::Let, start, end);
+        NODES[st].a = pat;
+        NODES[st].c = e;
+        let b = new_node(NodeKind::Block, start, end);
+        let mark = list_begin();
+        list_push(st);
+        list_end(b, mark);
+        synth_expr(b);
+        b
+    }
+}
+
+// A fresh (unchecked) copy of place expression e, made of names, fields
+// and dereferences; 0 when e is something else (an index, a call).
+fn copy_place(e: i64) -> i64 {
+    unsafe {
+        let k = NODES[e].kind;
+        if (NODES[e].p & NODE_RAW) != 0 {
+            return 0;
+        }
+        if k == NodeKind::Ident {
+            if NODES[e].res != Res::Local && NODES[e].res != Res::Static {
+                return 0;
+            }
+            let n = new_node(k, NODES[e].start, NODES[e].end);
+            NODES[n].a = NODES[e].a;
+            // (0.20: the reference itself under an access's `*`, as e is)
+            NODES[n].p = NODES[e].p & crate::front::ast::CONV_NEW;
+            return n;
+        }
+        if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+            let base = copy_place(NODES[e].a);
+            if base == 0 {
+                return 0;
+            }
+            let n = new_node(k, NODES[e].start, NODES[e].end);
+            NODES[n].a = base;
+            NODES[n].b = NODES[e].b;
+            NODES[n].p = NODES[e].p & crate::front::ast::CONV_NEW;
+            return n;
+        }
+        if k == NodeKind::Unary && NODES[e].op == Tok::Star {
+            let base = copy_place(NODES[e].b);
+            if base == 0 {
+                return 0;
+            }
+            let n = new_node(k, NODES[e].start, NODES[e].end);
+            NODES[n].op = Tok::Star;
+            NODES[n].b = base;
+            return n;
+        }
+        0
+    }
+}
+
+// Assignment e (`p = rhs`, checked) to an owned place: its desugaring,
+// checked, or 0 (not owned, compound, or a place this does not handle:
+// through a raw pointer, which writes without dropping, or an index).
+fn assign_drops(e: i64) -> i64 {
+    unsafe {
+        syms();
+        if NODES[e].op != Tok::Eq || (NODES[e].p & NO_DROP) != 0 {
+            return 0;
+        }
+        let target = NODES[e].b;
+        let value = NODES[e].c;
+        if target == 0 || value == 0 || !has_glue(NODES[target].ty) {
+            return 0;
+        }
+        let read = copy_place(target);
+        let write = copy_place(target);
+        if read == 0 || write == 0 {
+            return 0;
+        }
+        let start = NODES[e].start;
+        let end = NODES[e].end;
+        NODES[read].p |= ASSIGN_OLD;
+        NODES[value].p |= NODE_CHECKED;
+        // { let __own_new = rhs; { let =o = p; p = __own_new; } }
+        let npat = new_node(NodeKind::PatBind, start, start);
+        NODES[npat].a = SYM_NEW;
+        let nlet = new_node(NodeKind::Let, start, end);
+        NODES[nlet].a = npat;
+        NODES[nlet].c = value;
+        NODES[nlet].p |= NO_DROP;
+        let opat = new_node(NodeKind::PatBind, start, start);
+        NODES[opat].a = SYM_OLD;
+        let olet = new_node(NodeKind::Let, start, end);
+        NODES[olet].a = opat;
+        NODES[olet].c = read;
+        let nv = new_node(NodeKind::Ident, start, end);
+        NODES[nv].a = SYM_NEW;
+        let asg = new_node(NodeKind::Assign, start, end);
+        NODES[asg].op = Tok::Eq;
+        NODES[asg].b = write;
+        NODES[asg].c = nv;
+        NODES[asg].p |= NO_DROP;
+        let ast = new_node(NodeKind::ExprStmt, start, end);
+        NODES[ast].a = asg;
+        let inner = new_node(NodeKind::Block, start, end);
+        let m1 = list_begin();
+        list_push(olet);
+        list_push(ast);
+        list_end(inner, m1);
+        let ist = new_node(NodeKind::ExprStmt, start, end);
+        NODES[ist].a = inner;
+        let outer = new_node(NodeKind::Block, start, end);
+        let m2 = list_begin();
+        list_push(nlet);
+        list_push(ist);
+        list_end(outer, m2);
+        synth_expr(outer);
+        let r = OLD_OF.get(read + 1) - 1;
+        if r >= 0 {
+            D_OUTER.data[r] = outer;
+        }
+        outer
+    }
+}
+
+// Whether match scrutinee e is reached through a reference, an index or a
+// static (or is a binding that borrows): its bindings borrow.
+fn reached_by_ref(e: i64) -> bool {
+    unsafe {
+        let k = NODES[e].kind;
+        if k == NodeKind::Ident {
+            if NODES[e].res == Res::Static {
+                return true;
+            }
+            return NODES[e].res == Res::Local && NODES[e].y >= 0
+                && BYREF.get(NODES[e].y + 1) != 0;
+        }
+        if k == NodeKind::FieldAccess {
+            return NODES[e].y == 1 || reached_by_ref(NODES[e].a);
+        }
+        if k == NodeKind::TupleField {
+            return reached_by_ref(NODES[e].a);
+        }
+        if k == NodeKind::Unary {
+            return NODES[e].op == Tok::Star;
+        }
+        k == NodeKind::Index
+    }
+}
+
+// check_match, arm `arm` of match m, its pattern checked: by value, an
+// implicit defer per owned binding, the body wrapped in a block that
+// holds them; by reference, the bindings borrow.
+pub fn arm_drops(m: i64, arm: i64) {
+    unsafe {
+        if !drops_on() || (NODES[arm].p & ARM_DROPS_DONE) != 0 {
+            return;
+        }
+        NODES[arm].p |= ARM_DROPS_DONE;
+        let pat = NODES[arm].a;
+        let scrutinee = NODES[m].a;
+        if (NODES[m].p & GLUE_MATCH) == 0 {
+            if (NODES[arm].p & ARM_FOR_NEXT) != 0 {
+                return;
+            }
+            if scrutinee != 0 && (reached_by_ref(scrutinee) || borrowed_call(scrutinee)) {
+                NODES[scrutinee].p |= MATCH_BYREF;
+                mark_byref(pat, scrutinee);
+                return;
+            }
+        }
+        let body = NODES[arm].c;
+        if body == 0 {
+            return;
+        }
+        let wrapper = new_node(NodeKind::Block, NODES[body].start, NODES[body].start);
+        let mark = list_begin();
+        push_bindings(pat);
+        let end = SCRATCH.count;
+        for k in mark..end {
+            let d = new_defer(SCRATCH.data[k], DK_LOCAL, wrapper, false);
+            if d != 0 {
+                list_push(d);
+            }
+        }
+        // (the bindings themselves, off the list)
+        let n = SCRATCH.count - end;
+        if n == 0 {
+            SCRATCH.count = mark;
+            return;
+        }
+        for k in 0..n {
+            SCRATCH.data[mark + k] = SCRATCH.data[end + k];
+        }
+        SCRATCH.count = mark + n;
+        list_end(wrapper, mark);
+        NODES[wrapper].a = body;
+        NODES[wrapper].end = NODES[body].end;
+        NODES[arm].c = wrapper;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The walk's records (moves.vl)
+
+// Entries changed by the walk of the function walked last (a walk of the
+// same function again starts from nothing: walk_fn's wider walk).
+static var LAST_F: i64 = -1;
+static var TOUCHED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var M_MARK: i64 = 0;
+
+pub fn walk_begin(f: i64) {
+    unsafe {
+        if f == LAST_F {
+            for i in 0..TOUCHED.count {
+                E_STATE.data[TOUCHED.data[i]] = 0;
+            }
+            M_LOCAL.count = M_MARK;
+            M_PATH.count = M_MARK;
+            M_NODE.count = M_MARK;
+        } else {
+            M_MARK = M_NODE.count;
+        }
+        TOUCHED.count = 0;
+        LAST_F = f;
+    }
+}
+
+// The child of place parent at step `field`, if the walk made it; -1.
+fn find_child(parent: i64, field: i64) -> i64 {
+    unsafe {
+        for q in parent + 1..PL_COUNT {
+            if PL_PARENT[q] == parent && PL_FIELD[q] == field {
+                return q;
+            }
+        }
+        -1
+    }
+}
+
+// The state (S_*) of the place at path PATHS[path..] from place r.
+fn path_state(r: i64, path: i64) -> i64 {
+    unsafe {
+        let moved = moved_bits();
+        let dmoved = dmoved_bits();
+        var q = r;
+        var any = get_bit(moved, q);
+        var def = get_bit(dmoved, q);
+        let n = PATHS.data[path];
+        var i = 0;
+        while i < n {
+            let c = find_child(q, PATHS.data[path + 1 + i]);
+            if c < 0 {
+                break;
+            }
+            q = c;
+            any = any || get_bit(moved, q);
+            def = def || get_bit(dmoved, q);
+            i += 1;
+        }
+        if def { ST_MOVED } else if any { ST_MAYBE } else { ST_LIVE }
+    }
+}
+
+fn add_state(e: i64, s: i64) {
+    unsafe {
+        if (E_STATE.data[e] | s) != E_STATE.data[e] {
+            if E_STATE.data[e] == 0 {
+                TOUCHED.push(e);
+            }
+            E_STATE.data[e] = E_STATE.data[e] | s;
+        }
+    }
+}
+
+// The path (in PATHS) of place p from its root.
+fn path_of(p: i64) -> i64 {
+    unsafe {
+        let at = PATHS.count;
+        var n = 0;
+        var q = p;
+        while PL_PARENT[q] >= 0 {
+            n += 1;
+            q = PL_PARENT[q];
+        }
+        PATHS.push(n);
+        for _ in 0..n {
+            PATHS.push(0);
+        }
+        q = p;
+        var i = n;
+        while PL_PARENT[q] >= 0 {
+            PATHS.data[at + i] = PL_FIELD[q];
+            i -= 1;
+            q = PL_PARENT[q];
+        }
+        at
+    }
+}
+
+// The drop of local l (place p) at an exit of implicit defer d.
+pub fn drop_state(p: i64, l: i64, d: i64) {
+    unsafe {
+        let r = row_of(d);
+        if r < 0 || D_KIND.data[r] == DK_OLD {
+            return;
+        }
+        let first = D_FIRST.data[r];
+        let count = D_COUNT.data[r];
+        if p < 0 {
+            for e in first..first + count {
+                add_state(e, ST_LIVE);
+            }
+            return;
+        }
+        let root = root_of(p);
+        if PL_RKIND[root] != RK_LOCAL || PL_RID[root] != l {
+            // (a local the walk takes as another place: `for`'s sequence)
+            for e in first..first + count {
+                add_state(e, ST_MOVED);
+            }
+            return;
+        }
+        for e in first..first + count {
+            add_state(e, path_state(p, E_PATH.data[e]));
+        }
+    }
+}
+
+// The read of the old value of an owned assignment (node n, place p): its
+// drop's state is the place's. deref: the place is reached through a
+// reference (always there).
+pub fn assign_read(p: i64, n: i64, deref: bool) {
+    unsafe {
+        let r = OLD_OF.get(n + 1) - 1;
+        if r < 0 {
+            return;
+        }
+        let first = D_FIRST.data[r];
+        let count = D_COUNT.data[r];
+        let root = if p >= 0 { root_of(p) } else { -1 };
+        if p < 0 || deref || PL_RKIND[root] != RK_LOCAL {
+            for e in first..first + count {
+                add_state(e, ST_LIVE);
+            }
+            return;
+        }
+        A_LOCAL.data[r] = PL_RID[root];
+        A_PATH.data[r] = path_of(p);
+        for e in first..first + count {
+            add_state(e, path_state(p, E_PATH.data[e]));
+        }
+    }
+}
+
+// Place p (a local's, with drops) moved at node n.
+pub fn note_move(p: i64, n: i64) {
+    unsafe {
+        let root = root_of(p);
+        if PL_RKIND[root] != RK_LOCAL || LOCAL_ROW.get(PL_RID[root] + 1) == 0 {
+            return;
+        }
+        M_LOCAL.push(PL_RID[root]);
+        M_PATH.push(path_of(p));
+        M_NODE.push(n);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Finishing (check_own, after the walks)
+
+// Whether path a (in PATHS) is path b or a prefix of it.
+fn path_prefix(a: i64, b: i64) -> bool {
+    unsafe {
+        let na = PATHS.data[a];
+        if na > PATHS.data[b] {
+            return false;
+        }
+        for i in 0..na {
+            if PATHS.data[a + 1 + i] != PATHS.data[b + 1 + i] {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// The path a ++ b, in PATHS.
+fn path_concat(a: i64, b: i64) -> i64 {
+    unsafe {
+        let at = PATHS.count;
+        let na = PATHS.data[a];
+        let nb = PATHS.data[b];
+        PATHS.push(na + nb);
+        for i in 0..na {
+            PATHS.push(PATHS.data[a + 1 + i]);
+        }
+        for i in 0..nb {
+            PATHS.push(PATHS.data[b + 1 + i]);
+        }
+        at
+    }
+}
+
+fn same_path(a: i64, b: i64) -> bool {
+    unsafe { PATHS.data[a] == PATHS.data[b] && path_prefix(a, b) }
+}
+
+// Typed nodes for the flags.
+fn t_node(kind: NodeKind, at: i64, ty: i64) -> i64 {
+    unsafe {
+        let n = new_node(kind, NODES[at].start, NODES[at].start);
+        NODES[n].ty = ty;
+        n
+    }
+}
+
+fn t_ident(l: i64, at: i64) -> i64 {
+    unsafe {
+        let n = t_node(NodeKind::Ident, at, LOCALS[l].ty);
+        NODES[n].a = LOCALS[l].name;
+        NODES[n].res = Res::Local;
+        NODES[n].y = l;
+        n
+    }
+}
+
+fn t_bool(v: bool, at: i64) -> i64 {
+    unsafe {
+        let n = t_node(NodeKind::Bool, at, TY_BOOL);
+        NODES[n].a = if v { 1 } else { 0 };
+        n
+    }
+}
+
+// `flag = v;`
+fn t_set(flag: i64, v: bool, at: i64) -> i64 {
+    unsafe {
+        let a = t_node(NodeKind::Assign, at, TY_UNIT);
+        NODES[a].op = Tok::Eq;
+        NODES[a].b = t_ident(flag, at);
+        NODES[a].c = t_bool(v, at);
+        let st = t_node(NodeKind::ExprStmt, at, TY_UNIT);
+        NODES[st].a = a;
+        st
+    }
+}
+
+// Block's list with node `before` preceded by `add` (or, before = 0,
+// `add` appended).
+fn insert_stmt(block: i64, before: i64, add: i64) {
+    unsafe {
+        let m = list_begin();
+        for i in 0..NODES[block].count {
+            let c = child(block, i);
+            if c == before {
+                list_push(add);
+            }
+            list_push(c);
+        }
+        if before == 0 {
+            list_push(add);
+        }
+        list_end(block, m);
+    }
+}
+
+// The flags: per (local, path), the flag local.
+static var F_LOCAL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var F_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var F_FLAG: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The move nodes wrapped already (node + 1 -> its new Block + 1).
+static var WRAPPED: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// Moves node n: it becomes `{ flag = false; <n> }` (more flags: more
+// statements in that block).
+fn clear_at(n: i64, flag: i64) {
+    unsafe {
+        let known = WRAPPED.get(n + 1);
+        if known != 0 {
+            let b = known - 1;
+            for i in 0..NODES[b].count {
+                let st = child(b, i);
+                if NODES[NODES[NODES[st].a].b].y == flag {
+                    return;
+                }
+            }
+            insert_stmt(b, 0, t_set(flag, false, n));
+            return;
+        }
+        let copy = new_node(NodeKind::None, 0, 0);
+        NODES[copy] = NODES[n];
+        let st = t_set(flag, false, n);
+        let ty = NODES[n].ty;
+        let start = NODES[n].start;
+        let end = NODES[n].end;
+        NODES[n] = NODES[t_node(NodeKind::Block, n, ty)];
+        NODES[n].start = start;
+        NODES[n].end = end;
+        let m = list_begin();
+        list_push(st);
+        list_end(n, m);
+        NODES[n].a = copy;
+        WRAPPED.put(n + 1, n + 1);
+    }
+}
+
+// The flag of (local l, path), made when first asked for: -1 when l has no
+// drop to hold one.
+fn flag_for(l: i64, path: i64) -> i64 {
+    unsafe {
+        for i in 0..F_LOCAL.count {
+            if F_LOCAL.data[i] == l && same_path(F_PATH.data[i], path) {
+                return F_FLAG.data[i];
+            }
+        }
+        let r = LOCAL_ROW.get(l + 1) - 1;
+        if r < 0 || D_BLOCK.data[r] == 0 {
+            return -1;
+        }
+        let d = D_NODE.data[r];
+        let flag = define_local(SYM_FLAG, TY_BOOL, true, false);
+        F_LOCAL.push(l);
+        F_PATH.push(path);
+        F_FLAG.push(flag);
+        // `let mut __own_flag = true;` before the defer
+        let pat = t_node(NodeKind::PatBind, d, TY_BOOL);
+        NODES[pat].a = SYM_FLAG;
+        NODES[pat].b = 1;
+        NODES[pat].x = flag;
+        let st = t_node(NodeKind::Let, d, TY_UNIT);
+        NODES[st].a = pat;
+        NODES[st].c = t_bool(true, d);
+        insert_stmt(D_BLOCK.data[r], d, st);
+        // cleared where a place holding it moves
+        for i in 0..M_NODE.count {
+            if M_LOCAL.data[i] == l && path_prefix(M_PATH.data[i], path) {
+                clear_at(M_NODE.data[i], flag);
+            }
+        }
+        // set where one is assigned again (after the old value's drop)
+        for k in 0..D_NODE.count {
+            if D_KIND.data[k] == DK_OLD && A_LOCAL.data[k] == l && D_OUTER.data[k] != 0
+                && path_prefix(A_PATH.data[k], path) {
+                insert_stmt(D_OUTER.data[k], 0, t_set(flag, true, D_OUTER.data[k]));
+            }
+        }
+        flag
+    }
+}
+
+// check_own, after the walks: each entry kept, removed, or run under its
+// flag; own.drop_view.
+pub fn finish_drops() {
+    unsafe {
+        // (0.20: the moves of sink closures' captures)
+        var c = 0;
+        while c < CAP_MOVES.count {
+            wrap_capture_move(CAP_MOVES.data[c], CAP_MOVES.data[c + 1], CAP_MOVES.data[c + 2]);
+            c += 3;
+        }
+        var i = 0;
+        while i < DROP_VIEWS.count {
+            let item = DROP_VIEWS.data[i];
+            crate::front::own::diag::own_begin(item, OWN_DROP_VIEW);
+            own_str(c"'");
+            own_type(DROP_VIEWS.data[i + 1]);
+            own_str(c"' holds views and cannot implement Drop: its drop could read what it views after that is gone");
+            own_help(c"hold owned values (Buf, Vec) instead of the views, or remove the impl");
+            own_end();
+            i += 2;
+        }
+        for r in 0..D_NODE.count {
+            let count = D_COUNT.data[r];
+            if count == 0 {
+                continue;
+            }
+            let first = D_FIRST.data[r];
+            var all_kept = true;
+            for e in first..first + count {
+                let s = E_STATE.data[e];
+                if s != 0 && s != ST_LIVE {
+                    all_kept = false;
+                }
+            }
+            if all_kept {
+                continue;
+            }
+            let d = D_NODE.data[r];
+            let glue = NODES[d].a;
+            let m = list_begin();
+            for e in first..first + count {
+                let s = E_STATE.data[e];
+                let st = E_STMT.data[e];
+                if s == 0 || s == ST_LIVE {
+                    list_push(st);
+                } else if s == ST_MOVED {
+                    // (moved away at every exit)
+                } else {
+                    var flag = -1;
+                    if D_KIND.data[r] == DK_LOCAL {
+                        flag = flag_for(D_LOCAL.data[r], E_PATH.data[e]);
+                    } else if A_LOCAL.data[r] >= 0 {
+                        flag = flag_for(A_LOCAL.data[r],
+                            path_concat(A_PATH.data[r], E_PATH.data[e]));
+                    }
+                    if flag >= 0 {
+                        let b = t_node(NodeKind::Block, st, TY_UNIT);
+                        let bm = list_begin();
+                        list_push(st);
+                        list_end(b, bm);
+                        let f = t_node(NodeKind::If, st, TY_UNIT);
+                        NODES[f].a = t_ident(flag, st);
+                        NODES[f].b = b;
+                        let fs = t_node(NodeKind::ExprStmt, st, TY_UNIT);
+                        NODES[fs].a = f;
+                        list_push(fs);
+                    }
+                }
+            }
+            list_end(glue, m);
+        }
+    }
+}
+
+// (0.20) The moves of sink closures' captures in their bodies: the use
+// node, its flag's name, the env struct (finish_drops wraps each once).
+static var CAP_MOVES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var CAP_DONE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+pub fn capture_move(n: i64, flag: i64, s: i64) {
+    unsafe {
+        if CAP_DONE.get(n + 1) != 0 {
+            return;
+        }
+        CAP_DONE.put(n + 1, 1);
+        CAP_MOVES.push(n);
+        CAP_MOVES.push(flag);
+        CAP_MOVES.push(s);
+    }
+}
+
+// Capture use n (`(*env).x`, typed) becomes `{ if !(*env).__live_x {
+// <failure> } (*env).__live_x = false; (*env).x }`: the first move takes
+// the value, the closure's drop then skips it, a second move (the closure
+// called again) stops the program.
+fn wrap_capture_move(n: i64, flag: i64, s: i64) {
+    unsafe {
+        var fi = -1;
+        for i in 0..STRUCTS[s].field_count {
+            if (*struct_field(s, i)).name == flag {
+                fi = i;
+            }
+        }
+        if fi < 0 {
+            return;
+        }
+        let env = NODES[n].a;
+        let copy = new_node(NodeKind::None, 0, 0);
+        NODES[copy] = NODES[n];
+        let f1 = t_node(NodeKind::FieldAccess, n, TY_BOOL);
+        NODES[f1].a = env;
+        NODES[f1].b = flag;
+        NODES[f1].x = fi;
+        NODES[f1].y = 1;
+        let not = t_node(NodeKind::Unary, n, TY_BOOL);
+        NODES[not].op = Tok::Bang;
+        NODES[not].b = f1;
+        let zero = t_node(NodeKind::Int, n, crate::front::types::TY_I64);
+        NODES[zero].b = crate::front::lexer::SUF_I64;
+        let fail = t_node(NodeKind::EnumPanic, n, crate::front::types::TY_NEVER);
+        NODES[fail].a = zero;
+        NODES[fail].x = crate::gen0::target::message_kind(
+            crate::front::contracts::checks::fixed_message(
+                "a sink closure moved its captured value out a second time: it was called again\n"));
+        let fs = t_node(NodeKind::ExprStmt, n, TY_UNIT);
+        NODES[fs].a = fail;
+        let then = t_node(NodeKind::Block, n, TY_UNIT);
+        let m1 = list_begin();
+        list_push(fs);
+        list_end(then, m1);
+        let test = t_node(NodeKind::If, n, TY_UNIT);
+        NODES[test].a = not;
+        NODES[test].b = then;
+        let ts = t_node(NodeKind::ExprStmt, n, TY_UNIT);
+        NODES[ts].a = test;
+        let f2 = t_node(NodeKind::FieldAccess, n, TY_BOOL);
+        NODES[f2] = NODES[f1];
+        let asg = t_node(NodeKind::Assign, n, TY_UNIT);
+        NODES[asg].op = Tok::Eq;
+        NODES[asg].b = f2;
+        NODES[asg].c = t_bool(false, n);
+        let st = t_node(NodeKind::ExprStmt, n, TY_UNIT);
+        NODES[st].a = asg;
+        let ty = NODES[n].ty;
+        let (start, end) = (NODES[n].start, NODES[n].end);
+        NODES[n] = NODES[t_node(NodeKind::Block, n, ty)];
+        NODES[n].start = start;
+        NODES[n].end = end;
+        let m2 = list_begin();
+        list_push(ts);
+        list_push(st);
+        list_end(n, m2);
+        NODES[n].a = copy;
+        NODES[n].p |= BLOCK_DROPS_DONE;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Statement temporaries (0.20)
+//
+// An owned value made by an expression and used without being moved (a
+// receiver, `f()?.read()`, `make().len()`; a field read out of it,
+// `make().id`; an argument a `let` parameter borrows) lives until its
+// statement ends and is dropped then, after every use: Rust's rule. Its
+// statement gets, in front of it, `var __own_tp: *T = 0 as *T; var
+// __own_tf = false; defer { if __own_tf { unsafe { let __own_drop =
+// *__own_tp; } } }` (the drop is __own_drop's), and the value becomes
+// `{ var __own_tv = value; __own_tp = &__own_tv; __own_tf = true; __own_tp }`
+// where it is made, in the evaluation order: a `?` or a branch that leaves
+// the statement before it is made drops nothing. The value moves into
+// __own_tv, so a `?`'s or a block's value is no longer dropped at the end
+// of its arm (which made `f()?.m()` use a closed File). An expression
+// statement's temporaries drop at its end (it becomes a block); a `let`'s,
+// a tail's, at the end of their block (the `let` may keep a view of them),
+// a `while` condition's at the end of each test. The nodes are made typed:
+// they are not checked again.
+
+static var SYM_TP: i64 = 0;
+static var SYM_TF: i64 = 0;
+static var SYM_TV: i64 = 0;
+static var SYM_TDROP: i64 = 0;
+// The statements made for the unit being visited (its prelude).
+static var PRELUDE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// (0.24) Whether the expression visit_temps is visiting is borrowed by its parent (`&e`).
+static var TEMP_BORROW: bool = false;
+
+// Whether pattern p binds local l.
+fn binds(p: i64, l: i64) -> bool {
+    unsafe {
+        let mark = list_begin();
+        push_bindings(p);
+        var found = false;
+        for i in mark..SCRATCH.count {
+            if NODES[SCRATCH.data[i]].x == l {
+                found = true;
+            }
+        }
+        SCRATCH.count = mark;
+        found
+    }
+}
+
+// Whether value expression e (a branch's, an arm's: pat its pattern, or
+// 0) is new: made by e, or a local that dies with it.
+fn fresh_value(e: i64, pat: i64) -> bool {
+    unsafe {
+        if e == 0 {
+            return false;
+        }
+        if NODES[e].ty == crate::front::types::TY_NEVER {
+            return true;
+        }
+        let k = NODES[e].kind;
+        if k == NodeKind::Block {
+            let t = NODES[e].a;
+            if t == 0 {
+                return false;
+            }
+            if fresh_value(t, pat) {
+                return true;
+            }
+            if NODES[t].kind == NodeKind::Ident && NODES[t].res == Res::Local && NODES[t].y >= 0 {
+                let l = NODES[t].y;
+                for i in 0..NODES[e].count {
+                    let s = child(e, i);
+                    if NODES[s].kind == NodeKind::Let && NODES[s].a != 0 && binds(NODES[s].a, l) {
+                        return BYREF.get(l + 1) == 0;
+                    }
+                }
+            }
+            return false;
+        }
+        if k == NodeKind::Ident {
+            return pat != 0 && NODES[e].res == Res::Local && NODES[e].y >= 0
+                && binds(pat, NODES[e].y) && BYREF.get(NODES[e].y + 1) == 0;
+        }
+        fresh(e)
+    }
+}
+
+// Whether expression e makes a new owned value (not a place's, not a copy
+// a collection keeps: borrowed_call).
+fn fresh(e: i64) -> bool {
+    unsafe {
+        let k = NODES[e].kind;
+        if k == NodeKind::Call {
+            return !borrowed_call(e) && !parametric_copy(e);
+        }
+        if k == NodeKind::MethodCall || k == NodeKind::StructLit || k == NodeKind::Tuple
+            || k == NodeKind::Array || k == NodeKind::VariantLit || k == NodeKind::Repeat
+            || k == NodeKind::Try || k == NodeKind::Interp {
+            return true;
+        }
+        if k == NodeKind::Block {
+            return fresh_value(e, 0);
+        }
+        if k == NodeKind::If {
+            return NODES[e].c != 0 && fresh_value(NODES[e].b, 0) && fresh_value(NODES[e].c, 0);
+        }
+        if k == NodeKind::Match {
+            if NODES[e].count == 0 {
+                return false;
+            }
+            for i in 0..NODES[e].count {
+                let arm = child(e, i);
+                if !fresh_value(NODES[arm].c, NODES[arm].a) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        false
+    }
+}
+
+// Whether call e may give a copy of a value its arguments keep: a generic
+// result made of its type parameters (summary::ret_parametric) from a
+// callee that neither consumes nor changes an argument (`second<T>(p: *T)
+// -> T { p[1] }` reads one through a raw pointer; `unwrap(sink self)`,
+// std's `pop(inout self)` give one up; outside std a function that
+// changes an argument may still return a copy through a raw pointer).
+fn parametric_copy(e: i64) -> bool {
+    unsafe {
+        let f = NODES[e].x - 1;
+        if f < 0 || crate::front::own::summary::ret_parametric(f) == 0 {
+            return false;
+        }
+        for i in 0..FNS[f].param_count {
+            let m = crate::front::own::kinds::param_mode(f, i);
+            let t = fn_param(f, i);
+            // (an owned argument consumed, or one changed in place)
+            if m == crate::front::own::kinds::P_VALUE && is_owned_type(t)
+                || within_std(FNS[f].module) && m == crate::front::own::kinds::P_MUT && t > 0
+                && TYPES[t].b == REF_MUT
+                && is_owned_type(TYPES[t].a) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// Whether e is a temporary to keep to the end of the statement: new,
+// owned, with a drop.
+fn is_temp(e: i64) -> bool {
+    unsafe { e != 0 && NODES[e].ty > 0 && has_glue(NODES[e].ty) && fresh(e) }
+}
+
+fn t_let(l: i64, init: i64, at: i64) -> i64 {
+    unsafe {
+        let pat = t_node(NodeKind::PatBind, at, LOCALS[l].ty);
+        NODES[pat].a = LOCALS[l].name;
+        NODES[pat].b = 1;
+        NODES[pat].x = l;
+        let st = t_node(NodeKind::Let, at, TY_UNIT);
+        NODES[st].a = pat;
+        NODES[st].c = init;
+        NODES[st].p |= NO_DROP;
+        st
+    }
+}
+
+fn t_block(mark: i64, tail: i64, at: i64, ty: i64) -> i64 {
+    let b = t_node(NodeKind::Block, at, ty);
+    list_end(b, mark);
+    unsafe {
+        NODES[b].a = tail;
+        NODES[b].p |= BLOCK_DROPS_DONE;
+    }
+    b
+}
+
+// Temporary e (checked): its prelude onto PRELUDE; the typed block (of
+// type *T) that makes it and gives its address.
+fn temp_ptr(e: i64) -> i64 {
+    unsafe {
+        let t = NODES[e].ty;
+        let pt = crate::front::types::ptr_to(t);
+        let tp = define_local(SYM_TP, pt, true, false);
+        let tf = define_local(SYM_TF, TY_BOOL, true, false);
+        // var __own_tp: *T = 0 as *T; var __own_tf = false;
+        let zero = t_node(NodeKind::Int, e, crate::front::types::TY_I64);
+        NODES[zero].b = crate::front::lexer::SUF_I64;
+        let null = t_node(NodeKind::Cast, e, pt);
+        NODES[null].a = zero;
+        PRELUDE.push(t_let(tp, null, e));
+        PRELUDE.push(t_let(tf, t_bool(false, e), e));
+        // defer { if __own_tf { unsafe { let __own_drop = *__own_tp; } } }
+        let dl = define_local(SYM_TDROP, t, false, false);
+        let deref = t_node(NodeKind::Unary, e, t);
+        NODES[deref].op = Tok::Star;
+        NODES[deref].b = t_ident(tp, e);
+        NODES[deref].p |= NODE_RAW;
+        let dlet = t_let(dl, deref, e);
+        NODES[dlet].p &= ~NO_DROP;
+        NODES[NODES[dlet].a].b = 0;
+        let inner = t_node(NodeKind::Block, e, TY_UNIT);
+        NODES[inner].p |= crate::front::ast::BLOCK_UNSAFE | BLOCK_DROPS_DONE;
+        let d = new_defer(NODES[dlet].a, DK_LOCAL, inner, true);
+        let m1 = list_begin();
+        list_push(dlet);
+        if d != 0 {
+            list_push(d);
+        }
+        list_end(inner, m1);
+        let cond = t_node(NodeKind::If, e, TY_UNIT);
+        NODES[cond].a = t_ident(tf, e);
+        NODES[cond].b = inner;
+        let cs = t_node(NodeKind::ExprStmt, e, TY_UNIT);
+        NODES[cs].a = cond;
+        let body = t_node(NodeKind::Block, e, TY_UNIT);
+        NODES[body].p |= BLOCK_DROPS_DONE;
+        let m2 = list_begin();
+        list_push(cs);
+        list_end(body, m2);
+        let df = t_node(NodeKind::Defer, e, TY_UNIT);
+        NODES[df].a = body;
+        PRELUDE.push(df);
+        // { var __own_tv = e; __own_tp = &__own_tv; __own_tf = true; __own_tp }
+        let tv = define_local(SYM_TV, t, true, false);
+        let m3 = list_begin();
+        list_push(t_let(tv, e, e));
+        let amp = t_node(NodeKind::Unary, e, pt);
+        NODES[amp].op = Tok::Amp;
+        NODES[amp].b = t_ident(tv, e);
+        let asg = t_node(NodeKind::Assign, e, TY_UNIT);
+        NODES[asg].op = Tok::Eq;
+        NODES[asg].b = t_ident(tp, e);
+        NODES[asg].c = amp;
+        let ast = t_node(NodeKind::ExprStmt, e, TY_UNIT);
+        NODES[ast].a = asg;
+        list_push(ast);
+        list_push(t_set(tf, true, e));
+        t_block(m3, t_ident(tp, e), e, pt)
+    }
+}
+
+// Visits expression e (checked) after its parts, in the positions
+// evaluated with its statement: the temporaries it uses without moving
+// them are kept (temp_ptr). Blocks were visited as they were checked;
+// closures' bodies are their own; a `while`'s condition is its own unit.
+fn visit_temps(e: i64) {
+    unsafe {
+        if e == 0 {
+            return;
+        }
+        let k = NODES[e].kind;
+        if k == NodeKind::Block || k == NodeKind::Closure || k == NodeKind::Loop
+            || k == NodeKind::Defer || k == NodeKind::Let {
+            return;
+        }
+        if k == NodeKind::While {
+            NODES[e].b = unit_value(NODES[e].b);
+            return;
+        }
+        if k == NodeKind::For {
+            visit_temps(NODES[e].c);
+            return;
+        }
+        if k == NodeKind::Unary {
+            // (`&make().v`: the field is borrowed, not moved)
+            TEMP_BORROW = NODES[e].op == Tok::Amp;
+            visit_temps(NODES[e].b);
+            TEMP_BORROW = false;
+            if NODES[e].op == Tok::Amp && is_temp(NODES[e].b) {
+                // (`&value`: a receiver, a let argument; the block gives
+                // the address, as `&` did)
+                let ty = NODES[e].ty;
+                let b = temp_ptr(NODES[e].b);
+                NODES[e] = NODES[b];
+                NODES[e].ty = ty;
+            }
+            return;
+        }
+        if k == NodeKind::FieldAccess {
+            let borrowed = TEMP_BORROW;
+            TEMP_BORROW = borrowed && NODES[NODES[e].a].kind == NodeKind::FieldAccess;
+            visit_temps(NODES[e].a);
+            TEMP_BORROW = false;
+            // (0.24: an owned field moved out, `let x = make().v;`, is not
+            // read through the temporary's address, which would drop it
+            // again with the temporary: it moves out of the value, own.partial
+            // when its type implements Drop)
+            if NODES[e].y != 1 && is_temp(NODES[e].a) && (borrowed || !is_owned_type(NODES[e].ty)) {
+                // (`make().id`: read through the address)
+                NODES[e].a = temp_ptr(NODES[e].a);
+                NODES[e].y = 1;
+                NODES[e].p |= NODE_RAW;
+            }
+            return;
+        }
+        if k == NodeKind::Binary || k == NodeKind::Assign || k == NodeKind::Index
+            || k == NodeKind::Range || k == NodeKind::If {
+            if k == NodeKind::If {
+                visit_temps(NODES[e].a);
+                visit_temps(NODES[e].b);
+                visit_temps(NODES[e].c);
+                return;
+            }
+            if k == NodeKind::Index || k == NodeKind::Range {
+                visit_temps(NODES[e].a);
+                visit_temps(NODES[e].b);
+                return;
+            }
+            visit_temps(NODES[e].b);
+            visit_temps(NODES[e].c);
+            return;
+        }
+        if k == NodeKind::Cast || k == NodeKind::TupleField || k == NodeKind::Return
+            || k == NodeKind::Repeat || k == NodeKind::EnumPanic {
+            visit_temps(NODES[e].a);
+            return;
+        }
+        if k == NodeKind::Break || k == NodeKind::FieldInit || k == NodeKind::NamedArg {
+            visit_temps(NODES[e].b);
+            return;
+        }
+        if k == NodeKind::Try {
+            visit_temps(NODES[e].y);
+            return;
+        }
+        if k == NodeKind::Interp {
+            // (the holes, then what the f-string became)
+            for i in 0..NODES[e].count {
+                let h = child(e, i);
+                if NODES[h].kind == NodeKind::InterpHole {
+                    visit_temps(NODES[h].a);
+                }
+            }
+            let y = NODES[e].y;
+            if y > 0 && NODES[y].kind == NodeKind::Block {
+                // (a call written in place, check/interp.vl direct_call:
+                // its holes are the values of its `let`s)
+                for i in 0..NODES[y].count {
+                    let s = child(y, i);
+                    if NODES[s].kind == NodeKind::Let {
+                        visit_temps(NODES[s].c);
+                    }
+                }
+            } else {
+                visit_temps(y);
+            }
+            return;
+        }
+        if k == NodeKind::Match {
+            visit_temps(NODES[e].a);
+            for i in 0..NODES[e].count {
+                let arm = child(e, i);
+                visit_temps(NODES[arm].b);
+                visit_temps(NODES[arm].c);
+            }
+            return;
+        }
+        if k == NodeKind::Call || k == NodeKind::MethodCall || k == NodeKind::VecOp {
+            if k == NodeKind::MethodCall || k == NodeKind::VecOp || NODES[e].x == 0 {
+                visit_temps(NODES[e].a);
+            }
+            for i in 0..NODES[e].count {
+                visit_temps(child(e, i));
+            }
+            return;
+        }
+        if k == NodeKind::Tuple || k == NodeKind::Array || k == NodeKind::StructLit
+            || k == NodeKind::VariantLit {
+            for i in 0..NODES[e].count {
+                visit_temps(child(e, i));
+            }
+        }
+    }
+}
+
+fn temps_syms() {
+    unsafe {
+        if SYM_TP == 0 {
+            SYM_TP = intern_c(c"__own_tp");
+            SYM_TF = intern_c(c"__own_tf");
+            SYM_TV = intern_c(c"__own_tv");
+            SYM_TDROP = intern_c(c"__own_drop");
+        }
+    }
+}
+
+// Expression e (checked), a unit of its own (a `while` condition): its
+// temporaries drop when it is evaluated, `{ prelude; e }`.
+fn unit_value(e: i64) -> i64 {
+    unsafe {
+        if e == 0 || !drops_on() {
+            return e;
+        }
+        temps_syms();
+        let mark = PRELUDE.count;
+        visit_temps(e);
+        if PRELUDE.count == mark {
+            return e;
+        }
+        let m = list_begin();
+        for j in mark..PRELUDE.count {
+            list_push(PRELUDE.data[j]);
+        }
+        PRELUDE.count = mark;
+        t_block(m, e, e, NODES[e].ty)
+    }
+}
+
+// The temporaries of expression e (checked), a statement's of block (before
+// its statement i: BEFORE + i): their preludes go in front of it.
+fn temps_before(e: i64, i: i64) {
+    unsafe {
+        temps_syms();
+        let mark = PRELUDE.count;
+        visit_temps(e);
+        for j in mark..PRELUDE.count {
+            INS.push(BEFORE + i);
+            INS.push(PRELUDE.data[j]);
+        }
+        PRELUDE.count = mark;
+    }
+}
+
+// An INS index meaning "before statement i".
+const BEFORE: i64 = 1 << 40;

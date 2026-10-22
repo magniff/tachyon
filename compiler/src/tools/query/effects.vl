@@ -1,0 +1,447 @@
+// `query effects NAME...|MODULE [--has EFFECT] [--why EFFECT]` (0.16;
+// docs/query.md): the effects the front end inferred
+// (front/effects/, docs/design/effects-allocation.md §2.1), `PATH<TAB>
+// EFFECTS` a line, a generic function's line each of its instances'. A
+// MODULE gives the functions of it and of its modules. `--has EFFECT`
+// keeps the functions that have it (`alloc` any allocator, `alloc(Gpa)`
+// that one, `io`, `global`, `panic`, `diverge`, `unsafe`, `none`: the
+// empty set); `--why EFFECT` adds, under each line, why the function has
+// it (the chain of calls down to where it starts: front/effects/why.vl).
+//
+// def, show and context print a function's set too (`effects: ...`; not
+// for a generic function, whose instances differ, nor a set the front end
+// could not infer), from the tools' cache when it holds (one text per
+// definition, cache.vl).
+
+use crate::base::{
+    IntVec, STDOUT, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, buf_write_fd,
+};
+use crate::front::ast::NODES;
+use crate::front::effects::{
+    ALLOCATORS, ALLOC_ANY, EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_SYNC,
+    EFF_THREAD, EFF_TLS, EFF_UNKNOWN, EFF_UNSAFE, EFF_VISIBLE, Effects, FN_EFFECTS_COUNT,
+    effects_text, fn_effects,
+};
+use crate::front::effects::why::explain_effect;
+use crate::front::modules::{C_MODULE, MODULES, STD_MODULE, module_count, within_std};
+use crate::front::types::{FNS, FN_COUNT, TLISTS, TY_ERROR, buf_type};
+use crate::tools::query::cache::RESTORED;
+use crate::tools::query::defs::{
+    DEFS, DEF_COUNT, K_FN, K_IMPL_METHOD, K_METHOD, K_MOD, K_TRAIT_FN, MOD_DEF, bytes_eq,
+};
+use crate::tools::query::diagnostics::diag;
+
+// --has EFFECT, --why EFFECT (C strings, or null).
+pub static var OPT_HAS: *u8 = 0 as *u8;
+pub static var OPT_WHY: *u8 = 0 as *u8;
+
+// (from the cache, cache.vl: per definition, where in C_EFF_BUF the
+// text of its set for def and show is, and its lines for `query effects`:
+// four positions)
+pub static var C_EFF_TEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var C_EFF_BUF: i64 = -1;
+
+// The cached text k (0: the set, 1: the lines, 2: the features, 0.19) of
+// definition d, into out.
+pub fn cached_text(out: i64, d: i64, k: i64) {
+    unsafe {
+        let at = 6 * d + 2 * k;
+        if C_EFF_BUF < 0 || at + 1 >= C_EFF_TEXT.count {
+            return;
+        }
+        buf_bytes(out, buf_slice(C_EFF_BUF)[C_EFF_TEXT.data[at]..C_EFF_TEXT.data[at + 1]]);
+    }
+}
+
+// An effect asked for: Q_BIT (bits), Q_ALLOC (any allocator), Q_ALLOCATOR
+// (allocs: the allocator's bit; bits: EFF_ALLOC_EXTERN for extern),
+// Q_NONE (the empty set); Q_BAD when the text is none of them.
+const Q_BAD: i64 = 0;
+const Q_BIT: i64 = 1;
+const Q_ALLOC: i64 = 2;
+const Q_ALLOCATOR: i64 = 3;
+const Q_NONE: i64 = 4;
+
+struct Query {
+    kind: i64,
+    bits: i64,
+    allocs: i64,
+}
+
+fn is_fn_def(d: i64) -> bool {
+    unsafe {
+        let k = DEFS[d].kind;
+        k == K_FN || k == K_METHOD || k == K_IMPL_METHOD || k == K_TRAIT_FN
+    }
+}
+
+// The function of definition d (its FNS index), or -1.
+fn fn_of_def(d: i64) -> i64 {
+    unsafe {
+        if !is_fn_def(d) || FN_EFFECTS_COUNT == 0 {
+            return -1;
+        }
+        let f = NODES[DEFS[d].node].x - 1;
+        if f < 0 || f >= FN_COUNT { -1 } else { f }
+    }
+}
+
+// Whether instance g is one query mode made to check a template (a type
+// argument the error type).
+fn error_instance(g: i64) -> bool {
+    unsafe {
+        for i in 0..FNS[g].targ_count {
+            if TLISTS.data[FNS[g].targs + i] == TY_ERROR {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// ` effects: SET` of definition d into out, for def, show and context:
+// whether it has one to show (a function, not generic, inferred).
+pub fn put_def_effects(out: i64, d: i64, sep: *u8) -> bool {
+    unsafe {
+        let text = buf_new();
+        def_effects_text(text, d);
+        if buf_slice(text).len == 0 {
+            return false;
+        }
+        buf_str(out, sep);
+        buf_str(out, c"effects: ");
+        buf_bytes(out, buf_slice(text));
+        true
+    }
+}
+
+// The text of d's set for def and show (nothing when there is none to
+// show), into out.
+pub fn def_effects_text(out: i64, d: i64) {
+    unsafe {
+        if RESTORED {
+            cached_text(out, d, 0);
+            return;
+        }
+        let f = fn_of_def(d);
+        if f < 0 || FNS[f].generic != 0 {
+            return;
+        }
+        let e = fn_effects(f);
+        if (e.bits & EFF_UNKNOWN) != 0 {
+            return;
+        }
+        effects_text(out, e);
+    }
+}
+
+// The lines of `query effects` for definition d into out: one per
+// function (a generic function's instances).
+pub fn def_effect_lines(out: i64, d: i64) {
+    unsafe {
+        if RESTORED {
+            cached_text(out, d, 1);
+            return;
+        }
+        let f = fn_of_def(d);
+        if f < 0 {
+            return;
+        }
+        if FNS[f].generic == 0 {
+            effects_line(out, SYMS[DEFS[d].fqn].text, f);
+            return;
+        }
+        for g in 0..FN_COUNT {
+            if FNS[g].tmpl == f + 1 && !error_instance(g) {
+                effects_line(out, SYMS[FNS[g].display].text, g);
+            }
+        }
+    }
+}
+
+fn effects_line(out: i64, name: [u8], f: i64) {
+    unsafe {
+        buf_bytes(out, name);
+        buf_byte(out, '\t');
+        effects_text(out, fn_effects(f));
+        buf_byte(out, '\n');
+    }
+}
+
+// The effect named by text (`io`, `alloc`, `alloc(Gpa)`, `none`...).
+fn parse_query(s: [u8]) -> Query {
+    unsafe {
+        let names: [*u8; 8] = [c"io", c"global", c"tls", c"thread", c"sync", c"panic", c"diverge",
+            c"unsafe"];
+        let bits: [i64; 8] = [EFF_IO, EFF_GLOBAL, EFF_TLS, EFF_THREAD, EFF_SYNC, EFF_PANIC,
+            EFF_DIVERGE, EFF_UNSAFE];
+        for k in 0..8 {
+            if bytes_eq(s, crate::tools::query::c_slice(names[k])) {
+                return Query { kind: Q_BIT, bits: bits[k], allocs: 0 };
+            }
+        }
+        if bytes_eq(s, "none") {
+            return Query { kind: Q_NONE, bits: 0, allocs: 0 };
+        }
+        if bytes_eq(s, "alloc") {
+            return Query { kind: Q_ALLOC, bits: 0, allocs: 0 };
+        }
+        if s.len > 7 && bytes_eq(s[0..6], "alloc(") && s[s.len - 1] == ')' {
+            let name = s[6..s.len - 1];
+            if bytes_eq(name, "extern") {
+                return Query { kind: Q_ALLOCATOR, bits: EFF_ALLOC_EXTERN, allocs: 0 };
+            }
+            for i in 0..ALLOCATORS.count {
+                let b = buf_new();
+                buf_type(b, ALLOCATORS.data[i]);
+                if bytes_eq(buf_slice(b), name) {
+                    return Query { kind: Q_ALLOCATOR, bits: 0, allocs: 1 << i };
+                }
+            }
+            // (an allocator nothing allocates from: no function has it)
+            return Query { kind: Q_ALLOCATOR, bits: 0, allocs: 0 };
+        }
+        Query { kind: Q_BAD, bits: 0, allocs: 0 }
+    }
+}
+
+fn has_effect(e: Effects, q: Query) -> bool {
+    if q.kind == Q_BIT {
+        return (e.bits & q.bits) != 0;
+    }
+    if q.kind == Q_NONE {
+        return (e.bits & EFF_VISIBLE) == 0 && e.allocs == 0;
+    }
+    if q.kind == Q_ALLOC {
+        return e.allocs != 0 || (e.bits & EFF_ALLOC_EXTERN) != 0;
+    }
+    (q.bits != 0 && (e.bits & q.bits) != 0)
+        || (q.allocs != 0 && (e.allocs & (q.allocs | ALLOC_ANY)) != 0)
+}
+
+// Why f has the effect q (when it has it), into out, an indented line
+// (or several) under f's.
+fn put_why(out: i64, f: i64, q: Query) {
+    unsafe {
+        let e = fn_effects(f);
+        if !has_effect(e, q) {
+            buf_str(out, c"  (not: ");
+            buf_str(out, OPT_WHY);
+            buf_str(out, c")\n");
+            return;
+        }
+        var bit = q.bits;
+        var alloc = q.allocs;
+        if q.kind == Q_ALLOC {
+            // (the first allocator it allocates from)
+            bit = 0;
+            alloc = 0;
+            for i in 0..ALLOCATORS.count {
+                if alloc == 0 && (e.allocs & (1 << i)) != 0 {
+                    alloc = 1 << i;
+                }
+            }
+            if alloc == 0 {
+                bit = if (e.bits & EFF_ALLOC_EXTERN) != 0 { EFF_ALLOC_EXTERN } else { 0 };
+                alloc = if bit == 0 { e.allocs } else { 0 };
+            }
+        }
+        let text = buf_new();
+        explain_effect(f, bit, alloc, text);
+        // (each line indented)
+        let t = buf_slice(text);
+        var i = 0;
+        while i < t.len {
+            var j = i;
+            while j < t.len && t[j] != '\n' {
+                j += 1;
+            }
+            buf_str(out, c"  ");
+            buf_bytes(out, t[i..j]);
+            buf_byte(out, '\n');
+            i = j + 1;
+        }
+    }
+}
+
+// The function definitions of module m and of its modules, into out, in
+// the order of DEFS (by position).
+fn module_fns(m: i64, out: inout IntVec) {
+    unsafe {
+        for d in 0..DEF_COUNT {
+            if !is_fn_def(d) {
+                continue;
+            }
+            var x = DEFS[d].module;
+            // (the root's: not std's nor C's, unless asked for)
+            if (within_std(x) && !within_std(m)) || (x == C_MODULE && x != m) {
+                continue;
+            }
+            var steps = 0;
+            while x >= 0 && x != m && steps < 64 {
+                x = MODULES[x].parent;
+                steps += 1;
+            }
+            if x == m {
+                out.push(d);
+            }
+        }
+    }
+}
+
+// The module definition d stands for (K_MOD), or -1.
+fn module_of_def(d: i64) -> i64 {
+    unsafe {
+        if DEFS[d].kind != K_MOD {
+            return -1;
+        }
+        for m in 0..module_count() {
+            if m < MOD_DEF.count && MOD_DEF.data[m] == d {
+                return m;
+            }
+        }
+        -1
+    }
+}
+
+// Checks --has and --why before the program is read: 2 (after the
+// diagnostic) when one names no effect.
+pub fn check_effect_options() -> i64 {
+    unsafe {
+        let opts: [*u8; 2] = [OPT_HAS, OPT_WHY];
+        for k in 0..2 {
+            let o = opts[k];
+            if o == 0 as *u8 {
+                continue;
+            }
+            if parse_query(crate::tools::query::c_slice(o)).kind == Q_BAD {
+                let e = diag(c"error", c"query.usage");
+                buf_str(e, c"unknown effect '");
+                buf_str(e, o);
+                buf_str(e,
+                    c"' (effects: alloc, alloc(T), io, global, panic, diverge, unsafe, none)\n");
+                return 2;
+            }
+        }
+        0
+    }
+}
+
+// `query effects`: the functions among the definitions `matches` (a
+// module's: its functions), with --has and --why; 1 when none is a
+// function.
+pub fn query_effects(matches: IntVec) -> i64 {
+    unsafe {
+        let has = if OPT_HAS != 0 as *u8 {
+            parse_query(crate::tools::query::c_slice(OPT_HAS))
+        } else {
+            Query { kind: Q_BAD, bits: 0, allocs: 0 }
+        };
+        let why = if OPT_WHY != 0 as *u8 {
+            parse_query(crate::tools::query::c_slice(OPT_WHY))
+        } else {
+            Query { kind: Q_BAD, bits: 0, allocs: 0 }
+        };
+        var defs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..matches.count {
+            let d = matches.data[i];
+            let m = module_of_def(d);
+            if m >= 0 {
+                module_fns(m, &defs);
+            } else if is_fn_def(d) {
+                defs.push(d);
+            }
+        }
+        effects_of(defs, has, why)
+    }
+}
+
+// `query effects MODULE`: the functions of module m and of its modules.
+pub fn query_effects_module(m: i64) -> i64 {
+    var defs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    module_fns(m, &defs);
+    unsafe {
+        let has = if OPT_HAS != 0 as *u8 {
+            parse_query(crate::tools::query::c_slice(OPT_HAS))
+        } else {
+            Query { kind: Q_BAD, bits: 0, allocs: 0 }
+        };
+        let why = if OPT_WHY != 0 as *u8 {
+            parse_query(crate::tools::query::c_slice(OPT_WHY))
+        } else {
+            Query { kind: Q_BAD, bits: 0, allocs: 0 }
+        };
+        effects_of(defs, has, why)
+    }
+}
+
+// The lines of the function definitions `defs`, with --has and --why.
+fn effects_of(defs: IntVec, has: Query, why: Query) -> i64 {
+    unsafe {
+        let out = buf_new();
+        var shown = 0;
+        for i in 0..defs.count {
+            let d = defs.data[i];
+            if RESTORED {
+                // (from the cache: no filter, no why; the command reads the
+                // program in full for those)
+                let before = buf_slice(out).len;
+                def_effect_lines(out, d);
+                if buf_slice(out).len > before {
+                    shown += 1;
+                }
+                continue;
+            }
+            let f = fn_of_def(d);
+            if f < 0 {
+                continue;
+            }
+            var fs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            if FNS[f].generic == 0 {
+                fs.push(f);
+            } else {
+                for g in 0..FN_COUNT {
+                    if FNS[g].tmpl == f + 1 && !error_instance(g) {
+                        fs.push(g);
+                    }
+                }
+            }
+            for k in 0..fs.count {
+                let g = fs.data[k];
+                if has.kind != Q_BAD && !has_effect(fn_effects(g), has) {
+                    continue;
+                }
+                let name = if g == f { SYMS[DEFS[d].fqn].text } else { SYMS[FNS[g].display].text };
+                effects_line(out, name, g);
+                shown += 1;
+                if why.kind != Q_BAD {
+                    put_why(out, g, why);
+                }
+            }
+        }
+        buf_write_fd(out, STDOUT);
+        if defs.count == 0 {
+            let e = diag(c"note", c"query.empty");
+            buf_str(e, c"no function among the names\n");
+            return 1;
+        }
+        if shown == 0 {
+            let e = diag(c"note", c"query.empty");
+            if OPT_HAS != 0 as *u8 {
+                buf_str(e, c"no function has ");
+                buf_str(e, OPT_HAS);
+                buf_byte(e, '\n');
+            } else {
+                buf_str(e, c"no function checked (a generic function without instances)\n");
+            }
+        }
+        0
+    }
+}
+
+// The texts the cache keeps for definition d (cache.vl): its set for
+// def and show, its lines for `query effects`.
+pub fn cache_texts(d: i64, set: i64, lines: i64) {
+    def_effects_text(set, d);
+    def_effect_lines(lines, d);
+}

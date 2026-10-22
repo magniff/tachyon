@@ -5,7 +5,7 @@ MiB of generated text with six patterns, checked against each other:
 about 1 GB/s each, as fast as the same loops in C.
 
 ```sh
-tachyonc examples/algorithms/string-search/main.tach -o search && ./search
+volec examples/algorithms/string-search/main.vl -o search && ./search
 ```
 
 ## The problem
@@ -161,12 +161,12 @@ time over the six patterns (100 MB searched by each), Apple M-series:
 
 | | naive | KMP | Horspool |
 |---|---|---|---|
-| tachyon 0.15, `-O2` (the default) | 92 ms | 165 ms | 83 ms |
-| tachyon 0.15, `-O1` | 98 ms | 160 ms | 86 ms |
-| tachyon 0.15, `-O0` | 360 ms | 360 ms | 280 ms |
+| vole 0.15, `-O2` (the default) | 92 ms | 165 ms | 83 ms |
+| vole 0.15, `-O1` | 98 ms | 160 ms | 86 ms |
+| vole 0.15, `-O0` | 360 ms | 360 ms | 280 ms |
 | C, `clang -O2` | 95 ms | 190 ms | 75 ms |
 
-The tachyon versions check every index and slice; the C ones check
+The vole versions check every index and slice; the C ones check
 none. KMP is the slowest here although it reads each byte once: its
 inner loop has a data-dependent branch per byte (the `while` and the
 two `if`s), where the naive search mostly runs a predictable "first byte
@@ -178,15 +178,15 @@ per position and KMP still one.
 
 | feature | where | guide |
 |---|---|---|
-| a trait with a generic method and a default method | `Searcher` | `tachyonc guide traits` |
-| closures as `FnMut` arguments, capturing a `var` and changing it | `count`, `demo` | `tachyonc guide closures` |
-| generic functions bounded by a trait | `timed<S: Searcher>` | `tachyonc guide generics` |
-| `[u8]` slices, slicing, `==` by bytes | the searchers | `tachyonc guide types` |
-| arrays as values, `[m; 256]`, indexed by a `u8` | `Horspool` | `tachyonc guide types` |
-| iterators: `iter().filter(..).count()`, `fail.iter()` | `main`, `demo` | `tachyonc guide iterators` |
-| f-strings: `{pat:<12}`, `{n:>8}`, `{b:c}`, `{v:?}`, `{x:>6.1}` | output | `tachyonc guide formatting` |
-| `defer` inside a loop body (runs each iteration) | `main` | `tachyonc guide memory` |
-| a C header for the clock | `now_ns` | `tachyonc guide c-interop` |
+| a trait with a generic method and a default method | `Searcher` | `volec guide traits` |
+| closures as `FnMut` arguments, capturing a `var` and changing it | `count`, `demo` | `volec guide closures` |
+| generic functions bounded by a trait | `timed<S: Searcher>` | `volec guide generics` |
+| `[u8]` slices, slicing, `==` by bytes | the searchers | `volec guide types` |
+| arrays as values, `[m; 256]`, indexed by a `u8` | `Horspool` | `volec guide types` |
+| iterators: `iter().filter(..).count()`, `fail.iter()` | `main`, `demo` | `volec guide iterators` |
+| f-strings: `{pat:<12}`, `{n:>8}`, `{b:c}`, `{v:?}`, `{x:>6.1}` | output | `volec guide formatting` |
+| `defer` inside a loop body (runs each iteration) | `main` | `volec guide memory` |
+| a C header for the clock | `now_ns` | `volec guide c-interop` |
 
 ## Try
 

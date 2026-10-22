@@ -2,8 +2,8 @@
 ## new-module, move-module, split; each atomic, journaled for undo, with
 ## --dry-run.
 $ check
-ok: 0 errors in main.tach
-$ main.tach -o prog
+ok: 0 errors in main.vl
+$ main.vl -o prog
 ok: built prog
 % ./prog; echo "exit $?"
 exit 0
@@ -11,24 +11,24 @@ exit 0
 ## An item: its definition, its imports, its uses, and its backquoted
 ## mention in a comment.
 $ refactor rename twice repeat --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -7 +7 @@
 -use util::twice;
 +use util::repeat;
 @@ -11 +11 @@
 -    let n = twice(area(p)) + shapes::perimeter(p) + util::LIMIT + p.sum();
 +    let n = repeat(area(p)) + shapes::perimeter(p) + util::LIMIT + p.sum();
---- a/geom.tach
-+++ b/geom.tach
+--- a/geom.vl
++++ b/geom.vl
 @@ -3 +3 @@
 -use crate::util::twice;
 +use crate::util::repeat;
 @@ -35 +35 @@
 -    scale(p, half(twice(2)))
 +    scale(p, half(repeat(2)))
---- a/util.tach
-+++ b/util.tach
+--- a/util.vl
++++ b/util.vl
 @@ -3 +3 @@
 -// How many times `twice` ran.
 +// How many times `repeat` ran.
@@ -38,21 +38,21 @@ $ refactor rename twice repeat --dry-run
 $ refactor rename geom::area surface
 renamed crate::geom::area to surface	3 files	+5 -5 lines
 % git diff --stat
- geom.tach   | 2 +-
- main.tach   | 4 ++--
- shapes.tach | 4 ++--
+ geom.vl   | 2 +-
+ main.vl   | 4 ++--
+ shapes.vl | 4 ++--
  3 files changed, 5 insertions(+), 5 deletions(-)
 $ undo
 undid renamed crate::geom::area to surface	3 files	+5 -5 lines
 ## A field, a method.
 $ refactor rename Point.x left --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -10 +10 @@
 -    let p = Point { x: 2, y: 3 };
 +    let p = Point { left: 2, y: 3 };
---- a/geom.tach
-+++ b/geom.tach
+--- a/geom.vl
++++ b/geom.vl
 @@ -6 +6 @@
 -    pub x: i64,
 +    pub left: i64,
@@ -65,19 +65,19 @@ $ refactor rename Point.x left --dry-run
 @@ -26 +26 @@
 -    Point { x: p.x * k, y: p.y * k }
 +    Point { left: p.left * k, y: p.y * k }
---- a/shapes.tach
-+++ b/shapes.tach
+--- a/shapes.vl
++++ b/shapes.vl
 @@ -7 +7 @@
 -    scale() * (p.x + p.y) + area(q) - area(q)
 +    scale() * (p.left + p.y) + area(q) - area(q)
 $ refactor rename Point::sum total --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -11 +11 @@
 -    let n = twice(area(p)) + shapes::perimeter(p) + util::LIMIT + p.sum();
 +    let n = twice(area(p)) + shapes::perimeter(p) + util::LIMIT + p.total();
---- a/geom.tach
-+++ b/geom.tach
+--- a/geom.vl
++++ b/geom.vl
 @@ -12 +12 @@
 -    pub fn sum(self) -> i64 {
 +    pub fn total(self) -> i64 {
@@ -85,11 +85,11 @@ $ refactor rename Point::sum total --dry-run
 $ refactor rename crate::util tools
 renamed crate::util to tools	3 files	+4 -4 lines
 % git status --short
- M geom.tach
- M main.tach
- D util.tach
+ M geom.vl
+ M main.vl
+ D util.vl
 ?? prog
-?? tools.tach
+?? tools.vl
 $ undo
 undid renamed crate::util to tools	3 files	+4 -4 lines
 % git status --short
@@ -98,19 +98,19 @@ undid renamed crate::util to tools	3 files	+4 -4 lines
 ## imports twice, and has a double).
 $ refactor rename twice double
 error refactor.collision: 'double' is already a name in crate::geom (fn crate::geom::double); nothing written
-try: tachyonc query def crate::geom::double
+try: volec query def crate::geom::double
 [exit 1]
 $ refactor rename geom::area scale
 error refactor.collision: 'scale' is already a name in crate::geom (fn crate::geom::scale); nothing written
-try: tachyonc query def crate::geom::scale
+try: volec query def crate::geom::scale
 [exit 1]
 ## An edit that breaks the program is refused, nothing written (the
 ## local p would be called).
 $ refactor rename geom::area p
-main.tach:11:19: error[type error] cannot call non-function type 'Point'  [edited: crate::main]
-shapes.tach:7:29: error[type error] cannot call non-function type 'Point'  [edited: crate::shapes::perimeter]
+main.vl:11:19: error[type error] cannot call non-function type 'Point'  [edited: crate::main]
+shapes.vl:7:29: error[type error] cannot call non-function type 'Point'  [edited: crate::shapes::perimeter]
 error edit.breaks: 2 new errors; nothing written
-try: tachyonc refactor rename geom::area p --no-check
+try: volec refactor rename geom::area p --no-check
 [exit 1]
 % git status --short
 ?? prog
@@ -121,8 +121,8 @@ error refactor.usage: the new name must be an identifier (not a keyword)
 ## One item: the imports of the modules naming it are fixed, the private
 ## helper it uses becomes pub, the banner of its group stays.
 $ refactor move geom::double --to crate::util --dry-run
---- a/geom.tach
-+++ b/geom.tach
+--- a/geom.vl
++++ b/geom.vl
 @@ -3,2 +2,0 @@
 -use crate::util::twice;
 -
@@ -134,14 +134,14 @@ $ refactor move geom::double --to crate::util --dry-run
 -
 -pub fn double(p: Point) -> Point {
 -    scale(p, half(twice(2)))
---- a/shapes.tach
-+++ b/shapes.tach
+--- a/shapes.vl
++++ b/shapes.vl
 @@ -3 +3,2 @@
 -use crate::geom::{Point, area, double};
 +use crate::geom::{Point, area};
 +use crate::util::double;
---- a/util.tach
-+++ b/util.tach
+--- a/util.vl
++++ b/util.vl
 @@ -0,0 +1,2 @@
 +use crate::geom::{Point, half, scale};
 +
@@ -152,7 +152,7 @@ $ refactor move geom::double --to crate::util --dry-run
 +    scale(p, half(twice(2)))
 $ refactor move geom::double crate::util
 moved crate::geom::double to crate::util	3 files	+9 -8 lines
-% cat util.tach
+% cat util.vl
 use crate::geom::{Point, half, scale};
 
 pub const LIMIT: i64 = 100;
@@ -168,7 +168,7 @@ pub fn twice(x: i64) -> i64 {
 pub fn double(p: Point) -> Point {
     scale(p, half(twice(2)))
 }
-$ main.tach -o prog
+$ main.vl -o prog
 ok: built prog
 % ./prog; echo "exit $?"
 exit 0
@@ -178,7 +178,7 @@ undid moved crate::geom::double to crate::util	3 files	+9 -8 lines
 ## needed there.
 $ refactor move geom::scale geom::half geom::double --to crate::util
 moved 3 items to crate::util	3 files	+20 -19 lines
-% cat geom.tach
+% cat geom.vl
 // Points and their areas.
 
 pub struct Point {
@@ -197,7 +197,7 @@ impl Point {
 pub fn area(p: Point) -> i64 {
     p.x * p.y
 }
-% cat util.tach
+% cat util.vl
 use crate::geom::Point;
 
 pub const LIMIT: i64 = 100;
@@ -232,10 +232,10 @@ undid moved 3 items to crate::util	3 files	+20 -19 lines
 $ refactor move geom::Point --to crate::shapes
 moved crate::geom::Point to crate::shapes	3 files	+16 -14 lines
 % git diff
-diff --git a/geom.tach b/geom.tach
+diff --git a/geom.vl b/geom.vl
 index c211645..872f916 100644
---- a/geom.tach
-+++ b/geom.tach
+--- a/geom.vl
++++ b/geom.vl
 @@ -1,19 +1,8 @@
  // Points and their areas.
  
@@ -257,10 +257,10 @@ index c211645..872f916 100644
  // The area of the rectangle from the origin to p.
  pub fn area(p: Point) -> i64 {
      p.x * p.y
-diff --git a/main.tach b/main.tach
+diff --git a/main.vl b/main.vl
 index 620be80..2ddb6f5 100644
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -3,7 +3,8 @@ mod geom;
  mod shapes;
  mod util;
@@ -271,10 +271,10 @@ index 620be80..2ddb6f5 100644
  use util::twice;
  
  fn main() -> i32 {
-diff --git a/shapes.tach b/shapes.tach
+diff --git a/shapes.vl b/shapes.vl
 index 0c40caf..a466091 100644
---- a/shapes.tach
-+++ b/shapes.tach
+--- a/shapes.vl
++++ b/shapes.vl
 @@ -1,6 +1,6 @@
  // Shapes made of points.
  
@@ -299,7 +299,7 @@ index 0c40caf..a466091 100644
 +        self.x + self.y
 +    }
 +}
-$ main.tach -o prog
+$ main.vl -o prog
 ok: built prog
 % ./prog; echo "exit $?"
 exit 0
@@ -307,14 +307,14 @@ $ undo
 undid moved crate::geom::Point to crate::shapes	3 files	+16 -14 lines
 ## A static (and its mention).
 $ refactor move util::COUNTER --to crate::geom --dry-run
---- a/geom.tach
-+++ b/geom.tach
+--- a/geom.vl
++++ b/geom.vl
 @@ -36,0 +37,3 @@
 +
 +// How many times `twice` ran.
 +pub static var COUNTER: i64 = 0;
---- a/util.tach
-+++ b/util.tach
+--- a/util.vl
++++ b/util.vl
 @@ -1 +1 @@
 -pub const LIMIT: i64 = 100;
 +use crate::geom::COUNTER;
@@ -325,18 +325,18 @@ $ refactor move util::COUNTER --to crate::geom --dry-run
 ## An item imported alone (`use p::twice;`): the `use` lines get its new
 ## path.
 $ refactor move util::twice --to crate::shapes --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -7 +7 @@
 -use util::twice;
 +use shapes::twice;
---- a/geom.tach
-+++ b/geom.tach
+--- a/geom.vl
++++ b/geom.vl
 @@ -3 +3 @@
 -use crate::util::twice;
 +use crate::shapes::twice;
---- a/shapes.tach
-+++ b/shapes.tach
+--- a/shapes.vl
++++ b/shapes.vl
 @@ -3,0 +4 @@
 +use crate::util::COUNTER;
 @@ -12,0 +14,5 @@
@@ -345,8 +345,8 @@ $ refactor move util::twice --to crate::shapes --dry-run
 +pub fn twice(x: i64) -> i64 {
 +    unsafe { COUNTER += 1; }
 +    x * 2
---- a/util.tach
-+++ b/util.tach
+--- a/util.vl
++++ b/util.vl
 @@ -5,5 +4,0 @@
 -
 -pub fn twice(x: i64) -> i64 {
@@ -356,7 +356,7 @@ $ refactor move util::twice --to crate::shapes --dry-run
 ## Refused: the name is taken there; a method; no such module.
 $ refactor move geom::scale --to crate::shapes
 error refactor.collision: 'scale' is already a name in crate::shapes (fn crate::shapes::scale); nothing written
-try: tachyonc query def crate::shapes::scale
+try: volec query def crate::shapes::scale
 [exit 1]
 $ refactor move Point::sum --to crate::util
 error refactor.not-movable: crate::geom::Point::sum is a method: it moves with its type's impl block
@@ -366,30 +366,30 @@ error refactor.not-movable: crate::geom::Point::sum is a method: it moves with i
 $ refactor move geom::area --to crate::nowhere --dry-run
 made module crate::nowhere	2 files	+1 -0 lines
 moved crate::geom::area to crate::nowhere	4 files	+10 -7 lines
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -4,0 +5 @@
 +mod nowhere;
 @@ -6 +7,2 @@
 -use geom::{Point, area};
 +use geom::Point;
 +use nowhere::area;
---- a/geom.tach
-+++ b/geom.tach
+--- a/geom.vl
++++ b/geom.vl
 @@ -17,5 +16,0 @@
 -// The area of the rectangle from the origin to p.
 -pub fn area(p: Point) -> i64 {
 -    p.x * p.y
 -}
 -
---- a/shapes.tach
-+++ b/shapes.tach
+--- a/shapes.vl
++++ b/shapes.vl
 @@ -3 +3,2 @@
 -use crate::geom::{Point, area, double};
 +use crate::geom::{Point, double};
 +use crate::nowhere::area;
---- a/nowhere.tach
-+++ b/nowhere.tach
+--- a/nowhere.vl
++++ b/nowhere.vl
 @@ -0,0 +1,6 @@
 +use crate::geom::Point;
 +
@@ -400,7 +400,7 @@ moved crate::geom::area to crate::nowhere	4 files	+10 -7 lines
 note refactor.made-module: there was no module crate::nowhere; it was made for the move (refactor new-module)
 $ refactor move geom::area
 error refactor.usage: move takes PATH... and the MODULE (`--to MODULE`)
-try: tachyonc refactor move crate::m::item --to crate::other
+try: volec refactor move crate::m::item --to crate::other
 [exit 2]
 % git status --short
 ?? prog
@@ -408,50 +408,50 @@ try: tachyonc refactor move crate::m::item --to crate::other
 ## A module of its parent's directory; a file module that gains a child
 ## becomes a dir module.
 $ refactor new-module crate::geom::solid --dry-run
---- a/geom/solid.tach
-+++ b/geom/solid.tach
-diff --git a/geom.tach b/geom/mod.tach
-rename from geom.tach
-rename to geom/mod.tach
---- a/geom.tach
-+++ b/geom/mod.tach
+--- a/geom/solid.vl
++++ b/geom/solid.vl
+diff --git a/geom.vl b/geom/mod.vl
+rename from geom.vl
+rename to geom/mod.vl
+--- a/geom.vl
++++ b/geom/mod.vl
 @@ -2,0 +3,2 @@
 +mod solid;
 +
 $ refactor new-module crate::geom::solid --dir
 made module crate::geom::solid	2 files	+2 -0 lines
-% find . -name '*.tach' | sort
-./geom/mod.tach
-./geom/solid/mod.tach
-./main.tach
-./shapes.tach
-./util.tach
+% find . -name '*.vl' | sort
+./geom/mod.vl
+./geom/solid/mod.vl
+./main.vl
+./shapes.vl
+./util.vl
 $ refactor new-module crate::geom::area
 error refactor.collision: 'area' is already a name in crate::geom (fn crate::geom::area); nothing written
-try: tachyonc query def crate::geom::area
+try: volec query def crate::geom::area
 [exit 1]
 $ refactor new-module crate::geom::solid
 error refactor.exists: module crate::geom::solid exists
-try: tachyonc query items crate::geom::solid
+try: volec query items crate::geom::solid
 [exit 1]
 $ undo
 undid made module crate::geom::solid	2 files	+2 -0 lines
 ## A module moved under another (made on the way), and back.
 $ refactor move-module crate::shapes crate::figures::shapes
 moved module crate::shapes to crate::figures::shapes	3 files	+3 -2 lines
-% find . -name '*.tach' | sort
-./figures/mod.tach
-./figures/shapes.tach
-./geom.tach
-./main.tach
-./util.tach
-% cat figures/mod.tach
+% find . -name '*.vl' | sort
+./figures/mod.vl
+./figures/shapes.vl
+./geom.vl
+./main.vl
+./util.vl
+% cat figures/mod.vl
 pub mod shapes;
-% git diff main.tach
-diff --git a/main.tach b/main.tach
+% git diff main.vl
+diff --git a/main.vl b/main.vl
 index 620be80..b915abc 100644
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -1,13 +1,13 @@
  // A program of four modules to reorganize (tests/refactor/modules.t).
  mod geom;
@@ -468,18 +468,18 @@ index 620be80..b915abc 100644
 +    let n = twice(area(p)) + crate::figures::shapes::perimeter(p) + util::LIMIT + p.sum();
      if n == 127 { 0 } else { 1 }
  }
-$ main.tach -o prog
+$ main.vl -o prog
 ok: built prog
 % ./prog; echo "exit $?"
 exit 0
 $ refactor move-module crate::figures::shapes crate::shapes
 moved module crate::figures::shapes to crate::shapes	3 files	+2 -2 lines
-% find . -name '*.tach' | sort
-./figures/mod.tach
-./geom.tach
-./main.tach
-./shapes.tach
-./util.tach
+% find . -name '*.vl' | sort
+./figures/mod.vl
+./geom.vl
+./main.vl
+./shapes.vl
+./util.vl
 $ undo
 undid moved module crate::figures::shapes to crate::shapes	3 files	+2 -2 lines
 $ undo
@@ -490,13 +490,13 @@ undid moved module crate::shapes to crate::figures::shapes	3 files	+3 -2 lines
 ## Into a child module: the module becomes a dir module.
 $ refactor split crate::geom --into crate::geom::scaling --items scale,half,double
 split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
-% find . -name '*.tach' | sort
-./geom/mod.tach
-./geom/scaling.tach
-./main.tach
-./shapes.tach
-./util.tach
-% cat geom/mod.tach
+% find . -name '*.vl' | sort
+./geom/mod.vl
+./geom/scaling.vl
+./main.vl
+./shapes.vl
+./util.vl
+% cat geom/mod.vl
 // Points and their areas.
 
 pub mod scaling;
@@ -517,7 +517,7 @@ impl Point {
 pub fn area(p: Point) -> i64 {
     p.x * p.y
 }
-% cat geom/scaling.tach
+% cat geom/scaling.vl
 // Scaling
 
 use crate::geom::Point;
@@ -536,11 +536,11 @@ fn half(x: i64) -> i64 {
 pub fn double(p: Point) -> Point {
     scale(p, half(twice(2)))
 }
-% git diff shapes.tach
-diff --git a/shapes.tach b/shapes.tach
+% git diff shapes.vl
+diff --git a/shapes.vl b/shapes.vl
 index 0c40caf..df89998 100644
---- a/shapes.tach
-+++ b/shapes.tach
+--- a/shapes.vl
++++ b/shapes.vl
 @@ -1,6 +1,7 @@
  // Shapes made of points.
  
@@ -550,7 +550,7 @@ index 0c40caf..df89998 100644
  
  pub fn perimeter(p: Point) -> i64 {
      let q = double(p);
-$ main.tach -o prog
+$ main.vl -o prog
 ok: built prog
 % ./prog; echo "exit $?"
 exit 0
@@ -564,21 +564,21 @@ $ refactor split crate::geom --plan --max-lines 20
 # crate::geom	36 lines	3 parts of at most 20 lines
 # stays in crate::geom: the part most used from other modules
 # point: type Point: 1 of 2 items, 4 of 8 lines
-tachyonc refactor split crate::geom --into crate::geom::point --items area,half
+volec refactor split crate::geom --into crate::geom::point --items area,half
 # scaling: banner '// ---- Scaling ----': 2 of 2 items, 7 of 7 lines
-tachyonc refactor split crate::geom --into crate::geom::scaling --items scale,double
+volec refactor split crate::geom --into crate::geom::scaling --items scale,double
 note refactor.plan: the same in one edit: --auto (other names: --names a,b)
-try: tachyonc refactor split crate::geom --auto --max-lines 20
+try: volec refactor split crate::geom --auto --max-lines 20
 $ refactor split crate::geom --auto --max-lines 20
 split crate::geom into 2 modules	5 files	+32 -24 lines
-% find . -name '*.tach' | sort
-./geom/mod.tach
-./geom/point.tach
-./geom/scaling.tach
-./main.tach
-./shapes.tach
-./util.tach
-$ main.tach -o prog
+% find . -name '*.vl' | sort
+./geom/mod.vl
+./geom/point.vl
+./geom/scaling.vl
+./main.vl
+./shapes.vl
+./util.vl
+$ main.vl -o prog
 ok: built prog
 % ./prog; echo "exit $?"
 exit 0
@@ -590,17 +590,17 @@ $ refactor split crate::util --plan
 note refactor.fits: crate::util has 9 lines (at most 1000); nothing to split
 $ refactor split crate::geom
 error refactor.usage: split takes MODULE and --into NEWMOD --items a,b,c, or --plan, or --auto
-try: tachyonc refactor split crate::m --plan
+try: volec refactor split crate::m --plan
 [exit 2]
 ## ---- in a script ----
 ## File moves and other edits, checked once, written as one edit; one
 ## undo takes all back.
 $ refactor --script steps.txt --dry-run
 moved module crate::shapes to crate::figures::shapes	3 files	+3 -2 lines
-rewrote 1 site in 1 file	figures/shapes.tach	+1 -1 lines
+rewrote 1 site in 1 file	figures/shapes.vl	+1 -1 lines
 split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -3 +2,0 @@
 -mod shapes;
 @@ -4,0 +4 @@
@@ -608,12 +608,12 @@ split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
 @@ -11 +11 @@
 -    let n = twice(area(p)) + shapes::perimeter(p) + util::LIMIT + p.sum();
 +    let n = twice(area(p)) + crate::figures::shapes::perimeter(p) + util::LIMIT + p.sum();
---- a/figures/mod.tach
-+++ b/figures/mod.tach
+--- a/figures/mod.vl
++++ b/figures/mod.vl
 @@ -0,0 +1 @@
 +pub mod shapes;
---- a/figures/shapes.tach
-+++ b/figures/shapes.tach
+--- a/figures/shapes.vl
++++ b/figures/shapes.vl
 @@ -0,0 +1,14 @@
 +// Shapes made of points.
 +
@@ -629,8 +629,8 @@ split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
 +fn scale() -> i64 {
 +    2
 +}
---- a/geom/scaling.tach
-+++ b/geom/scaling.tach
+--- a/geom/scaling.vl
++++ b/geom/scaling.vl
 @@ -0,0 +1,18 @@
 +// Scaling
 +
@@ -650,8 +650,8 @@ split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
 +pub fn double(p: Point) -> Point {
 +    scale(p, half(twice(2)))
 +}
---- a/geom/mod.tach
-+++ b/geom/mod.tach
+--- a/geom/mod.vl
++++ b/geom/mod.vl
 @@ -0,0 +1,20 @@
 +// Points and their areas.
 +
@@ -673,8 +673,8 @@ split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
 +pub fn area(p: Point) -> i64 {
 +    p.x * p.y
 +}
---- a/shapes.tach
-+++ b/shapes.tach
+--- a/shapes.vl
++++ b/shapes.vl
 @@ -1,13 +0,0 @@
 -// Shapes made of points.
 -
@@ -689,8 +689,8 @@ split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
 -fn scale() -> i64 {
 -    2
 -}
---- a/geom.tach
-+++ b/geom.tach
+--- a/geom.vl
++++ b/geom.vl
 @@ -1,36 +0,0 @@
 -// Points and their areas.
 -
@@ -730,21 +730,21 @@ split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
 -}
 $ refactor --script steps.txt
 moved module crate::shapes to crate::figures::shapes	3 files	+3 -2 lines
-rewrote 1 site in 1 file	figures/shapes.tach	+1 -1 lines
+rewrote 1 site in 1 file	figures/shapes.vl	+1 -1 lines
 split crate::geom: 3 items into crate::geom::scaling	3 files	+21 -18 lines
 script steps.txt: 3 commands	7 files	+55 -51 lines
-% find . -name '*.tach' | sort
-./figures/mod.tach
-./figures/shapes.tach
-./geom/mod.tach
-./geom/scaling.tach
-./main.tach
-./util.tach
-% git diff main.tach
-diff --git a/main.tach b/main.tach
+% find . -name '*.vl' | sort
+./figures/mod.vl
+./figures/shapes.vl
+./geom/mod.vl
+./geom/scaling.vl
+./main.vl
+./util.vl
+% git diff main.vl
+diff --git a/main.vl b/main.vl
 index 620be80..b915abc 100644
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -1,13 +1,13 @@
  // A program of four modules to reorganize (tests/refactor/modules.t).
  mod geom;
@@ -761,7 +761,7 @@ index 620be80..b915abc 100644
 +    let n = twice(area(p)) + crate::figures::shapes::perimeter(p) + util::LIMIT + p.sum();
      if n == 127 { 0 } else { 1 }
  }
-% cat figures/shapes.tach
+% cat figures/shapes.vl
 // Shapes made of points.
 
 use crate::geom::{Point, area};
@@ -776,7 +776,7 @@ pub fn perimeter(p: Point) -> i64 {
 fn scale() -> i64 {
     2
 }
-$ main.tach -o prog
+$ main.vl -o prog
 ok: built prog
 % ./prog; echo "exit $?"
 exit 0
@@ -784,8 +784,8 @@ $ undo
 undid script steps.txt: 3 commands	7 files	+55 -51 lines
 % git status --short
 ?? prog
-% find . -name '*.tach' | sort
-./geom.tach
-./main.tach
-./shapes.tach
-./util.tach
+% find . -name '*.vl' | sort
+./geom.vl
+./main.vl
+./shapes.vl
+./util.vl

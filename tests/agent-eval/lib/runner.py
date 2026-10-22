@@ -141,7 +141,7 @@ def one_run(ctx, task, cond, rep):
         "cache_read_tokens": None, "cost_usd": None, "error": None,
         "compiler": ctx["versions"][lang],
         # (0.18) the binary the run had, for run.py binaudit
-        "tachyonc_md5": ctx.get("tach_md5") if lang == "tach" else None,
+        "volec_md5": ctx.get("tach_md5") if lang == "tach" else None,
         "ws_root": ctx["ws_root"],
         "started": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t0)),
     }
@@ -187,7 +187,7 @@ def one_compiler_run(ctx, task, cond, rep):
     env = base_env(bin_dir)
     try:
         ctasks.setup_workspace(task, cond, info["sha"], ws, info["builder"], info["starter"],
-                               env, tools_tachyonc=ctx.get("tools_tachyonc"))
+                               env, tools_volec=ctx.get("tools_volec"))
     except Exception as e:  # recorded, the other runs go on
         say("setup failed: %s %s rep%d: %r" % (task.id, cond, rep, e))
         write_json(os.path.join(rdir, "setup-error.json"), {"error": repr(e)})
@@ -233,7 +233,7 @@ def one_compiler_run(ctx, task, cond, rep):
     agent["query_hook"] = query_hook_summary(qlog) if tools else None
     files, adds, dels = ctasks.workspace_changes(ws, os.path.join(rdir, "changes.patch"))
     agent["changes"] = {"files": files, "added": adds, "removed": dels}
-    starter_tc = os.path.join(info["starter"], "target", "tachyonc")
+    starter_tc = os.path.join(info["starter"], "target", "volec")
     if ctx.get("dry_run"):
         g = {"success": False, "tests_passed": 0, "tests_total": 0, "build_ok": None,
              "check_ok": None, "grade_error": "not graded (--dry-run)"}
@@ -317,8 +317,8 @@ def dry_run(ctx, prompt, ws, rdir, check_hook, query_hook, extra_hooks=None, deb
     """--dry-run: no model. Writes the backend's settings and command line
     (settings.json, command.json) and feeds each registered hook a
     synthetic event, matched and run as Claude Code would run it: a Write
-    adding an error to a .tach file (PostToolUse: the check hook reports
-    it) and, for the query hook, a `grep` of a .tach file (PreToolUse:
+    adding an error to a .vl file (PostToolUse: the check hook reports
+    it) and, for the query hook, a `grep` of a .vl file (PreToolUse:
     blocked). Proof that the hooks load and fire (result.json's dry_run)."""
     tee = ctx["hooks"]["tee"]
     settings = claude_backend.settings(private_paths(), check_hook and check_hook[0], query_hook,
@@ -336,7 +336,7 @@ def dry_run(ctx, prompt, ws, rdir, check_hook, query_hook, extra_hooks=None, deb
                                     claude_backend.user_message(debrief).strip()[:200]]}
     env = claude_backend.env(os.path.join(os.path.dirname(ws), "bin"))
     if check_hook:
-        env["TACHYON_CHECK_HOOK_LOG"] = check_hook[1]
+        env["VOLE_CHECK_HOOK_LOG"] = check_hook[1]
     env["EVAL_HOOK_OUTPUT_LOG"] = os.path.join(rdir, "hook-output.jsonl")
 
     def fire(event, ev):
@@ -356,11 +356,11 @@ def dry_run(ctx, prompt, ws, rdir, check_hook, query_hook, extra_hooks=None, deb
         return got
 
     # (0.17) a session id of its own: the hooks keep state per session
-    # ($TMPDIR/tachyon-agent-hooks), and a fixed id made a second dry run at
+    # ($TMPDIR/vole-agent-hooks), and a fixed id made a second dry run at
     # the same paths see the first one's errors "as before"
     sid = "dry-run-%d-%d" % (os.getpid(), int(time.time() * 1000))
     probe = None
-    for cand in ("compiler/src/main.tach", "main.tach"):
+    for cand in ("compiler/src/main.vl", "main.vl"):
         if os.path.isfile(os.path.join(ws, cand)):
             probe = os.path.join(ws, cand)
             break
@@ -402,7 +402,7 @@ def program_workspace(ctx, task, lang, base):
         shutil.rmtree(base)
     ws, bin_dir = os.path.join(base, "ws"), os.path.join(base, "bin")
     os.makedirs(bin_dir)
-    tool = "tachyonc" if lang == "tach" else "rustc"
+    tool = "volec" if lang == "tach" else "rustc"
     os.symlink(os.path.join(ctx["bins"][lang], tool), os.path.join(bin_dir, tool))
     install_mktemp_shim(bin_dir)
     copy_tree(os.path.join(task.path, lang), ws)
@@ -435,7 +435,7 @@ def main(args):
     # path, not its last part: two runs with --out .../a/claude-haiku and
     # .../b/claude-haiku shared a root, its compiler copy and hooks
     ws_root = os.path.realpath(args.ws_root or os.path.join(
-        os.environ.get("TMPDIR", "/tmp"), "tachyon-eval", "%s-%s" % (
+        os.environ.get("TMPDIR", "/tmp"), "vole-eval", "%s-%s" % (
             os.path.basename(out), hashlib.sha1(os.path.abspath(out).encode()).hexdigest()[:8])))
     repo = os.path.realpath(REPO_ROOT)
     if ws_root == repo or ws_root.startswith(repo + os.sep):
@@ -446,15 +446,15 @@ def main(args):
     if not jobs:
         raise SystemExit("no task fits the conditions: compiler tasks (--set compiler) run "
                          "in the compiler-* conditions, program tasks in the others")
-    bins = prepare_bins(ws_root, os.path.abspath(args.tachyonc))
-    tach_md5 = file_md5(os.path.join(bins["tach"], "tachyonc"))
+    bins = prepare_bins(ws_root, os.path.abspath(args.volec))
+    tach_md5 = file_md5(os.path.join(bins["tach"], "volec"))
     hooks = install_hooks(ws_root)
     ctx = {"model": args.model, "backend": backend, "model_name": model_name,
            "out": out, "ws_root": ws_root, "bins": bins,
            "keep_ws": args.keep_workspaces or args.dry_run, "dry_run": args.dry_run,
            "check_hook": args.check_hook, "hooks": hooks, "tach_md5": tach_md5,
-           "tools_tachyonc": os.path.abspath(args.tools_tachyonc)
-           if getattr(args, "tools_tachyonc", None) else None,
+           "tools_volec": os.path.abspath(args.tools_volec)
+           if getattr(args, "tools_volec", None) else None,
            "versions": {"tach": tool_version(bins["tach"], "tach"),
                         "rust": tool_version(bins["rust"], "rust")}}
     # (0.17) every condition's hooks from settings-eval.json, checked now
@@ -516,8 +516,8 @@ def main(args):
             "selfcheck": sc and {k: sc.get(k) for k in ("ok", "mode", "path", "refusals")},
             "ctasks": {k: {"base": v["ref"], "commit": v["sha"], "builder": v["builder"]}
                        for k, v in ctx["ctasks"].items()},
-            "tachyonc": os.path.abspath(args.tachyonc), "tachyonc_md5": tach_md5,
-            "tools_tachyonc": ctx["tools_tachyonc"],
+            "volec": os.path.abspath(args.volec), "volec_md5": tach_md5,
+            "tools_volec": ctx["tools_volec"],
             "versions": ctx["versions"], "ws_root": ws_root}) + "\n")
     nj = 1 if backend == "ollama" else max(1, args.jobs)
     say("run %s: %d runs (%d done before), %d at a time; results in %s, "

@@ -1,24 +1,24 @@
 # Errors and their fixes
 
-`tachyonc check`, and a build whose output is not a terminal (an
+`volec check`, and a build whose output is not a terminal (an
 agent's shell, a pipe; `--diagnostics=short` anywhere): one line per
 error, `FILE:LINE:COL: error[KIND] MESSAGE | help: HELP | note: NOTE |
 try: TRY`, every error of every file at once (up to 50), sorted by
 position. A `try:` (0.17) is text to use as it is: code to paste where
 the error is (`a as i32`, `std::trim(s)`, the missing match arms), a
-`use` line, or a `tachyonc` command to run (`tachyonc fix --only unsafe
-main.tach`, `tachyonc edit new-file util.tach main.tach`); VALUE in it
+`use` line, or a `volec` command to run (`volec fix --only unsafe
+main.vl`, `volec edit new-file util.vl main.vl`); VALUE in it
 is yours to fill in.
 An error whose fix the compiler knows exactly (0.18: a did-you-mean with
 one name that near, a conversion, a path from `crate::`, a Rust type or
 label respelled, a missing `use` or `pub`, a missing `gpa` argument)
-also has `try: tachyonc fix --suggested main.tach`: one command makes
-all of them, as one checked edit (`--dry-run` shows the diff, `tachyonc
+also has `try: volec fix --suggested main.vl`: one command makes
+all of them, as one checked edit (`--dry-run` shows the diff, `volec
 undo` takes it back, `--at FILE:LINE` fixes one line's), then prints the
 errors left. Run it instead of editing those lines by hand or with sed.
 KIND is `tokenizer error`, `parser error`, `module error`, `type error`
 or `unsafe`. Fix the first errors first: a parser error can hide
-type errors in the same function. `tachyonc query show FILE:LINE` prints
+type errors in the same function. `volec query show FILE:LINE` prints
 the item at an error's position. Below: what a newcomer writes, the
 error (short form, without the position), and the fix.
 
@@ -32,14 +32,14 @@ error[type error] allocation is explicit: pass an allocator (try: String::new_in
 ```
 `String` and `str` are std's (0.20, `guide text`); what allocates
 takes an allocator: `String::new_in(gpa)`, `s.to_uppercase_in(gpa)`.
-A Rust type tachyon does not have gets the type to write as its `try:`:
+A Rust type vole does not have gets the type to write as its `try:`:
 `char` (`u8`), `Box`, `Rc` (`*T`), `VecDeque`, `RefCell`.
 
 ```tach
 use std::cmp::max;
 ```
 ```err
-error[type error] no 'cmp' in module 'std' | help: tachyon's std has no such module: std's items are all `std::NAME` too
+error[type error] no 'cmp' in module 'std' | help: vole's std has no such module: std's items are all `std::NAME` too
 ```
 std has a few of Rust's modules (0.20: `std::collections::HashMap`,
 `std::fmt::Display`, `std::io::read_line`, `std::iter`, `std::ops`,
@@ -58,7 +58,7 @@ error[type error] no method 'trim' on type '[u8]' | help: 'trim' is no method: s
 `let s: str = "  a ";`, or `"  a ".trim()` on the literal itself. A
 method std has as a function (`trim`, `sort`, `parse` as `parse_int`,
 `split_whitespace` as `split_whitespace_in(s, gpa)`) gets the call to
-write; another unknown method, the type's nearest methods and `tachyonc
+write; another unknown method, the type's nearest methods and `volec
 query items TYPE`, which lists them all.
 
 `fn count(s: str)` takes a `str` (0.20: Rust's `&str` is `str`, as
@@ -102,9 +102,9 @@ local; nothing else takes `&`.
 println!("{}", 1);
 ```
 ```err
-error[parser error] 'println!' is a macro call: tachyon has no macros | help: write `println(f"{1}")`
+error[parser error] 'println!' is a macro call: vole has no macros | help: write `println(f"{1}")`
 ```
-`println(f"{x}")` (0.15, `tachyonc guide formatting`). The help names
+`println(f"{x}")` (0.15, `volec guide formatting`). The help names
 what replaces `vec!`, `format!`, `assert!` and the others.
 
 ```tach
@@ -293,8 +293,8 @@ fn f() -> i64 { 2 }
 duplicate function 'f'
 ```
 The help says where the other one is, and the two `try:` lines delete
-either (`tachyonc edit delete main.tach:3 main.tach`); to change an item
-in place, `tachyonc edit replace f < new.tach` instead of adding a second.
+either (`volec edit delete main.vl:3 main.vl`); to change an item
+in place, `volec edit replace f < new.vl` instead of adding a second.
 
 ```tach
 enum E { A(i64), B }
@@ -357,7 +357,7 @@ for x in n { }
 error[type error] 'for' iterates over ranges, slices, arrays, iterators and types with an 'iter' method, got 'i64'
 ```
 `for x in 0..n`. A type of yours iterates with `impl Iterator for T`, or
-an `iter` method returning one (`tachyonc guide iterators`).
+an `iter` method returning one (`volec guide iterators`).
 
 A misspelt method, field or item gets the nearest name of its kind:
 
@@ -378,7 +378,7 @@ let e: IoError = IoError::Read;
 ```err
 error[type error] unknown type 'IoError'
 ```
-`use std::IoError;` (the prelude's names need no import: `tachyonc guide
+`use std::IoError;` (the prelude's names need no import: `volec guide
 modules`).
 
 ```tach
@@ -602,7 +602,7 @@ use std::*;
 ```err
 error[module error] wildcard imports are not allowed
 ```
-`use std::{Buf, HashMap};`; `tachyonc fix --only imports` writes them.
+`use std::{Buf, HashMap};`; `volec fix --only imports` writes them.
 
 ```tach
 mod m { pub fn helper() -> i64 { 1 } }
@@ -611,18 +611,18 @@ fn main() -> i32 { helper() as i32 }
 ```err
 error[type error] undefined variable 'helper' | help: add `use crate::m::helper;`
 ```
-Add the `use` line the help names, or run the `try:` line, `tachyonc fix
---suggested main.tach`, which adds every missing one (and makes the
+Add the `use` line the help names, or run the `try:` line, `volec fix
+--suggested main.vl`, which adds every missing one (and makes the
 other errors' exact fixes; `fix --only imports`: the imports alone).
 
 In a module other than the root, a path starts in that module, or with
 a sibling module, or one of the root (0.17): `use table::Table;` and
-`table::f(x)` in check.tach are `crate::table::...` when `mod table;` is
-in main.tach. A module elsewhere (`crate::a::table`) is `unknown module
+`table::f(x)` in check.vl are `crate::table::...` when `mod table;` is
+in main.vl. A module elsewhere (`crate::a::table`) is `unknown module
 'table'`, whose help says `crate::a::table::...` and whose `try:` is the
-`use` line so written (in code: `use crate::a::table;`). `mod util;` with no util.tach is
+`use` line so written (in code: `use crate::a::table;`). `mod util;` with no util.vl is
 `cannot find the file of module 'util'`, whose `try:` makes it:
-`tachyonc edit new-file util.tach main.tach < util.tach` (the text on
+`volec edit new-file util.vl main.vl < util.vl` (the text on
 stdin; the `mod` line that is there stays). A `mod` line for a file that
 is next to a submodule's file belongs in the root.
 
@@ -633,7 +633,7 @@ fn main() -> i32 { let text = read_to_string(); 0 }
 error[type error] undefined variable 'read_to_string' | help: std reads stdin: `read_stdin_in(gpa)` (all of it, a Buf)
 ```
 std's items outside the prelude get their `use` line (`add `use
-std::is_digit;``) or the nearest std name; an unknown function with neither points to `tachyonc
+std::is_digit;``) or the nearest std name; an unknown function with neither points to `volec
 guide std`.
 
 ```tach
@@ -653,7 +653,7 @@ fn main() -> i32 { m::hidden() as i32 }
 ```err
 error[type error] 'hidden' is private | help: make it public: `pub fn hidden` at
 ```
-The help gives the declaration with `pub` and where it is (`tachyonc fix
+The help gives the declaration with `pub` and where it is (`volec fix
 --only pub` writes them all). Child modules see their parent's private items, not
 the reverse.
 
@@ -666,8 +666,8 @@ fn main() -> i32 { abs(-3) }
 ```err
 error[unsafe] calling a C function is unsafe
 ```
-`unsafe { abs(-3) }`. The error's `try:`, `tachyonc fix --only unsafe
-main.tach`, wraps every such place; the check hook prints it once at the
+`unsafe { abs(-3) }`. The error's `try:`, `volec fix --only unsafe
+main.vl`, wraps every such place; the check hook prints it once at the
 head of its report, with how many errors it answers.
 
 ```tach
@@ -679,7 +679,7 @@ add the parameter `gpa: Gpa` to 'helper' and pass it down
 ```
 Allocation is explicit (0.16): the help says where the allocator comes
 from here (this function's `gpa`, main's parameter, or one to add), and
-the `try:`, `tachyonc fix --only alloc016 main.tach`, threads main's
+the `try:`, `volec fix --only alloc016 main.vl`, threads main's
 `gpa` down to every such call.
 
 ```tach
@@ -744,7 +744,7 @@ error[unsafe] dereference of a raw pointer is unsafe: `x` is a `*T` parameter
 ```
 A `*T` parameter is a raw pointer (0.18.1), as in Rust. Take it let,
 `x: i64` (`x: inout i64` when written through, called with `&n`;
-`tachyonc fix --values` changes such parameters with their calls), or vouch for it in
+`volec fix --values` changes such parameters with their calls), or vouch for it in
 `unsafe { *x }` (`fix --only unsafe`). The same for a field access, a
 method call and an index through it.
 
@@ -782,7 +782,7 @@ fn main() -> i32 { var q = P { x: 1 }; bump(q); q.x as i32 }
 error[conv.marker] 'q' is lent inout here (the callee may change it): mark it '&q'
 ```
 `bump(&q)`: `&` shows at the call what may change. When the callee only
-reads, the help's `tachyonc refactor signature bump --convention p let`
+reads, the help's `volec refactor signature bump --convention p let`
 makes it a let parameter, with every call.
 
 ```tach
@@ -802,7 +802,7 @@ fn fill(v: Vec<i64>) { v.push(1); }
 error[own.readonly] writes through 'v'
 ```
 A let parameter is read-only: take it `v: inout Vec<i64>` and call
-`fill(&v)` (the `try:`, `tachyonc refactor signature fill --convention
+`fill(&v)` (the `try:`, `volec refactor signature fill --convention
 v inout`, changes both); a slice to sort in place is `s: inout [T]`,
 passed as `&v` or `&a[..]`.
 
@@ -820,8 +820,8 @@ moves; `refactor signature keep --convention v let`); else pass
 `let w = v;`, `return v` and into a struct literal.
 
 The own pass's errors (`own.*`) are one line each, with both positions,
-a `help:` with the fix and `try:` lines; `tachyonc explain own.CODE` has
-each in full, `tachyonc query own FILE:LINE:COL` the state of every
+a `help:` with the fix and `try:` lines; `volec explain own.CODE` has
+each in full, `volec query own FILE:LINE:COL` the state of every
 local there.
 
 ```tach
@@ -870,7 +870,7 @@ A failed check prints its message on stderr and exits with code 101:
 ...`, `called unwrap on None`, `called unwrap on Err`, `invalid value V
 for enum E`. A note follows (0.17). A program built with `--trace`
 prints, instead, the failing line and the calls that led to it
-(`tachyonc test` builds so; `guide debug`). Arithmetic never fails (it
+(`volec test` builds so; `guide debug`). Arithmetic never fails (it
 wraps; `/ 0` is 0). Runaway recursion is stopped by the operating system
 (a signal, no message).
 
@@ -888,5 +888,5 @@ fn main() -> i32 {
 ```
 ```out (exit 101)
 5
-main.tach:7:13: invalid value 3 for enum Level
+main.vl:7:13: invalid value 3 for enum Level
 ```

@@ -1,0 +1,833 @@
+// `volec lsp` (0.24, docs/lsp.md): the language server, JSON-RPC over
+// stdin and stdout (LSP's base protocol: `Content-Length` headers). It
+// keeps the open documents' texts (full sync); the program is read by a
+// worker (answer.vl), a copy of this process (fork) that reads it once,
+// with those texts in place of the files, publishes its diagnostics and
+// answers definition, references, hover and documentSymbol from the
+// tables the queries answer from. After a change (debounced, DEBOUNCE_MS)
+// or a save the worker is replaced by one that reads the program again;
+// a request that comes first replaces it at once.
+//
+// Requests are answered in order, one at a time: a request is handed to
+// the worker and its answer forwarded before the next message is read
+// (the worker's diagnostics are forwarded as they come). The root is the
+// nearest `main.vl` above the document (ROOT_STEM, SOURCE_EXT): the
+// program the tools ask about; one program at a time.
+
+use crate::base::{
+    BUFS, IntVec, OVERLAY, STDERR, STDOUT, alloc_array, alloc_zeroed, buf_byte, buf_bytes,
+    buf_clear, buf_fmt, buf_new, buf_slice, buf_str, getenv, write,
+};
+
+use crate::base::json::buf_json_str;
+
+use crate::tools::lsp::json::{at_path, elements, int_at, is_true, member, raw, str_at, str_into};
+use crate::tools::proc::{buf_cstr, read_file_if, write_file_if};
+use crate::tools::query::{c_slice, parse_digits};
+
+pub mod json;
+mod answer;
+
+// The extension of the language's files, and so of the root every tool
+// looks for (ROOT_STEM then it): the one place it is written.
+pub const SOURCE_EXT: *u8 = c".vl";
+const ROOT_STEM: *u8 = c"main";
+// How long after the last change the program is read again (ms).
+const DEBOUNCE_MS: i64 = 150;
+const POLLIN: i32 = 1;
+
+extern "C" {
+    fn poll(fds: *i32, n: u64, timeout: i32) -> i32;
+    fn fork() -> i32;
+    fn pipe(fds: *i32) -> i32;
+    fn dup2(from: i32, to: i32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn read(fd: i32, buf: *u8, n: u64) -> i64;
+    fn kill(pid: i32, sig: i32) -> i32;
+    fn waitpid(pid: i32, status: *i32, options: i32) -> i32;
+    fn gettimeofday(tv: *i64, tz: *u8) -> i32;
+    fn getpid() -> i32;
+    fn access(path: *u8, mode: i32) -> i32;
+    fn signal(sig: i32, handler: *u8) -> *u8;
+    fn mkdir(path: *u8, mode: i32) -> i32;
+    fn unlink(path: *u8) -> i32;
+    fn rmdir(path: *u8) -> i32;
+}
+
+// ---- the server's state
+
+// Positions in UTF-8 bytes (the client offered it), else UTF-16 units.
+static var UTF8: bool = false;
+// stdin: what was read, how much of it is handled
+static var IN: i64 = -1;
+static var IN_AT: i64 = 0;
+// the message being handled (a copy), a file read to compare (buffers)
+static var MSG: i64 = -1;
+static var DISK: i64 = -1;
+static var DISK_PATH: i64 = -1;
+// the open documents: their paths, texts, the copies the worker reads
+// them from (buffers), whether the copy has the text
+static var DOC_PATH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var DOC_TEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var DOC_COPY: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var DOC_FRESH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var DOC_SEQ: i64 = 0;
+static var TMP_DIR: i64 = -1;
+// the program's root (a buffer, -1: none yet)
+static var ROOT: i64 = -1;
+// the worker: its process, the pipes to and from it, what it wrote
+static var W_PID: i32 = -1;
+static var W_IN: i32 = -1;
+static var W_OUT: i32 = -1;
+static var W_BUF: i64 = -1;
+static var W_AT: i64 = 0;
+// the program changed since the worker read it; read again at DEADLINE
+static var DIRTY: bool = false;
+static var DEADLINE: i64 = 0;
+// the URIs with diagnostics shown, and the ones of the batch coming
+static var SHOWN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var COMING: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var SHUT: bool = false;
+// $VOLE_LSP_TIME: each request's time on stderr
+pub static var TIMING: bool = false;
+static var TV: *i64 = 0 as *i64;
+static var FDS: *i32 = 0 as *i32;
+
+// The time in microseconds.
+pub fn now_us() -> i64 {
+    unsafe {
+        if TV == 0 as *i64 {
+            TV = alloc_array::<i64>(2);
+        }
+        TV[0] = 0;
+        TV[1] = 0;
+        gettimeofday(TV, 0 as *u8);
+        TV[0] * 1000000 + (TV[1] & 4294967295)
+    }
+}
+
+// Writes all of bytes to fd.
+pub fn write_all(fd: i32, bytes: [u8]) {
+    unsafe {
+        var at = 0;
+        while at < bytes.len {
+            let n = write(fd, &bytes.ptr[at], (bytes.len - at) as u64);
+            if n <= 0 {
+                return;
+            }
+            at += n;
+        }
+    }
+}
+
+// A message to the client, with its header.
+fn send_message(body: [u8]) {
+    let head = buf_new();
+    buf_fmt(head, f"Content-Length: {body.len}\r\n\r\n");
+    write_all(STDOUT, buf_slice(head));
+    write_all(STDOUT, body);
+}
+
+fn respond(id: [u8], result: [u8]) {
+    let b = buf_new();
+    buf_str(b, c"{\"jsonrpc\":\"2.0\",\"id\":");
+    buf_bytes(b, id);
+    buf_str(b, c",\"result\":");
+    buf_bytes(b, result);
+    buf_byte(b, '}');
+    send_message(buf_slice(b));
+}
+
+fn respond_error(id: [u8], code: i64, message: [u8]) {
+    let b = buf_new();
+    buf_str(b, c"{\"jsonrpc\":\"2.0\",\"id\":");
+    buf_bytes(b, id);
+    buf_fmt(b, f",\"error\":{{\"code\":{code},\"message\":");
+    buf_json_str(b, message);
+    buf_str(b, c"}}");
+    send_message(buf_slice(b));
+}
+
+// ---- paths
+
+fn hex_digit(c: u8) -> i64 {
+    if c >= '0' && c <= '9' { (c - '0') as i64 }
+    else if c >= 'a' && c <= 'f' { (c - 'a') as i64 + 10 }
+    else if c >= 'A' && c <= 'F' { (c - 'A') as i64 + 10 } else { -1 }
+}
+
+// The path of a file:// URI (percent-decoded), empty for another URI.
+fn uri_path(uri: [u8]) -> [u8] {
+    let b = buf_new();
+    if uri.len < 7 || uri[0..7] != "file://" {
+        return buf_slice(b);
+    }
+    var i = 7;
+    while i < uri.len {
+        let c = uri[i];
+        if c == '%' && i + 2 < uri.len && hex_digit(uri[i + 1]) >= 0 && hex_digit(uri[i + 2]) >= 0 {
+            buf_byte(b, (hex_digit(uri[i + 1]) * 16 + hex_digit(uri[i + 2])) as u8);
+            i += 3;
+        } else {
+            buf_byte(b, c);
+            i += 1;
+        }
+    }
+    buf_slice(b)
+}
+
+// The root of the program file path belongs to: the nearest ROOT_STEM +
+// SOURCE_EXT in its directory or one above (a buffer), or -1.
+pub fn root_of(path: [u8]) -> i64 {
+    unsafe {
+        var end = path.len;
+        while end > 0 && path[end - 1] != '/' {
+            end -= 1;
+        }
+        if end == 0 {
+            return -1;
+        }
+        // path[0..end] is a directory with its `/`
+        loop {
+            let cand = buf_new();
+            buf_bytes(cand, path[0..end]);
+            buf_str(cand, ROOT_STEM);
+            buf_str(cand, SOURCE_EXT);
+            if access(buf_cstr(cand), 0) == 0 {
+                return cand;
+            }
+            // (0.21) `main.vl`
+            let vl = buf_new();
+            buf_bytes(vl, path[0..end]);
+            buf_str(vl, ROOT_STEM);
+            buf_str(vl, c".vl");
+            if access(buf_cstr(vl), 0) == 0 {
+                return vl;
+            }
+            if end <= 1 {
+                return -1;
+            }
+            end -= 1;
+            while end > 0 && path[end - 1] != '/' {
+                end -= 1;
+            }
+            if end == 0 {
+                return -1;
+            }
+        }
+    }
+}
+
+// ---- documents
+
+fn doc_index(path: [u8]) -> i64 {
+    unsafe {
+        for i in 0..DOC_PATH.count {
+            if buf_slice(DOC_PATH.data[i]) == path {
+                return i;
+            }
+        }
+        -1
+    }
+}
+
+// Whether text is not what the file at path holds.
+fn differs_from_disk(path: [u8], text: [u8]) -> bool {
+    unsafe {
+        if DISK < 0 {
+            DISK = buf_new();
+            DISK_PATH = buf_new();
+        }
+        buf_clear(DISK_PATH);
+        buf_bytes(DISK_PATH, path);
+        buf_clear(DISK);
+        !read_file_if(buf_cstr(DISK_PATH), DISK) || buf_slice(DISK) != text
+    }
+}
+
+// The document at path (opened when it is not) gets the text of the JSON
+// string at `at` in msg, decoded into its buffer; that text.
+fn set_doc(path: [u8], msg: [u8], at: i64) -> [u8] {
+    unsafe {
+        var i = doc_index(path);
+        if i < 0 {
+            i = DOC_PATH.count;
+            let p = buf_new();
+            buf_bytes(p, path);
+            DOC_PATH.push(p);
+            DOC_TEXT.push(buf_new());
+            let c = buf_new();
+            buf_bytes(c, buf_slice(TMP_DIR));
+            buf_fmt(c, f"/doc{DOC_SEQ}");
+            buf_str(c, SOURCE_EXT);
+            DOC_SEQ += 1;
+            DOC_COPY.push(c);
+            DOC_FRESH.push(0);
+        }
+        let t = DOC_TEXT.data[i];
+        buf_clear(t);
+        str_into(msg, at, t);
+        DOC_FRESH.data[i] = 0;
+        buf_slice(t)
+    }
+}
+
+fn close_doc(path: [u8]) {
+    unsafe {
+        let i = doc_index(path);
+        if i < 0 {
+            return;
+        }
+        unlink(buf_cstr(DOC_COPY.data[i]));
+        let last = DOC_PATH.count - 1;
+        DOC_PATH.data[i] = DOC_PATH.data[last];
+        DOC_TEXT.data[i] = DOC_TEXT.data[last];
+        DOC_COPY.data[i] = DOC_COPY.data[last];
+        DOC_FRESH.data[i] = DOC_FRESH.data[last];
+        DOC_PATH.count = last;
+        DOC_TEXT.count = last;
+        DOC_COPY.count = last;
+        DOC_FRESH.count = last;
+    }
+}
+
+// The program changes: read again `after` ms from now (sooner when it
+// was already due).
+fn mark_dirty(after: i64) {
+    unsafe {
+        let t = now_us() + after * 1000;
+        if !DIRTY || t < DEADLINE {
+            DEADLINE = t;
+        }
+        DIRTY = true;
+    }
+}
+
+// The root for path is the program's (another program: the worker
+// replaced); false when path is in no program.
+fn use_root(path: [u8]) -> bool {
+    unsafe {
+        let r = root_of(path);
+        if r < 0 {
+            return false;
+        }
+        if ROOT < 0 || buf_slice(ROOT) != buf_slice(r) {
+            ROOT = r;
+            mark_dirty(0);
+        }
+        true
+    }
+}
+
+// ---- the worker
+
+fn stop_worker() {
+    unsafe {
+        if W_PID > 0 {
+            kill(W_PID, 9);
+            var st = 0 as i32;
+            waitpid(W_PID, &st, 0);
+            close(W_IN);
+            close(W_OUT);
+        }
+        W_PID = -1;
+        buf_clear(W_BUF);
+        W_AT = 0;
+        // (a batch cut short: its URIs are shown)
+        for i in 0..COMING.count {
+            SHOWN.push(COMING.data[i]);
+        }
+        COMING.count = 0;
+    }
+}
+
+// The worker ended by itself (its pipe closed).
+fn worker_gone() {
+    unsafe {
+        if W_PID > 0 {
+            var st = 0 as i32;
+            waitpid(W_PID, &st, 0);
+            close(W_IN);
+            close(W_OUT);
+        }
+        W_PID = -1;
+        buf_clear(W_BUF);
+        W_AT = 0;
+    }
+}
+
+// A new worker for the program as it is now (the documents' texts in
+// their copies).
+fn start_worker() {
+    unsafe {
+        stop_worker();
+        DIRTY = false;
+        if ROOT < 0 {
+            return;
+        }
+        OVERLAY.count = 0;
+        for i in 0..DOC_PATH.count {
+            if DOC_FRESH.data[i] == 0 {
+                write_file_if(buf_cstr(DOC_COPY.data[i]), buf_slice(DOC_TEXT.data[i]));
+                DOC_FRESH.data[i] = 1;
+            }
+            OVERLAY.push(buf_cstr(DOC_PATH.data[i]) as i64);
+            OVERLAY.push(buf_cstr(DOC_COPY.data[i]) as i64);
+        }
+        let a = alloc_array::<i32>(2);
+        let b = alloc_array::<i32>(2);
+        if pipe(a) != 0 || pipe(b) != 0 {
+            return;
+        }
+        let pid = fork();
+        if pid == 0 {
+            close(a[1]);
+            close(b[0]);
+            // (nothing but the server writes the client's stdout)
+            dup2(STDERR, STDOUT);
+            crate::tools::lsp::answer::serve(buf_cstr(ROOT), a[0], b[1], UTF8);
+        }
+        close(a[0]);
+        close(b[1]);
+        if pid < 0 {
+            close(a[1]);
+            close(b[0]);
+            return;
+        }
+        W_PID = pid;
+        W_IN = a[1];
+        W_OUT = b[0];
+    }
+}
+
+// Handles the whole frames the worker wrote: notifications forwarded (the
+// URIs with diagnostics noted; at the end of a batch, the ones it no
+// longer has cleared), responses forwarded. Whether there was a response.
+fn worker_frames() -> bool {
+    unsafe {
+        var responded = false;
+        loop {
+            let s = buf_slice(W_BUF);
+            var nl = W_AT;
+            while nl < s.len && s[nl] != '\n' {
+                nl += 1;
+            }
+            if nl >= s.len || nl < W_AT + 3 {
+                break;
+            }
+            let kind = s[W_AT];
+            let len = parse_digits(s[W_AT + 2..nl]);
+            if nl + 1 + len > s.len {
+                break;
+            }
+            let body = s[nl + 1..nl + 1 + len];
+            W_AT = nl + 1 + len;
+            if kind == 'r' {
+                send_message(body);
+                responded = true;
+            } else if kind == 'n' {
+                send_message(body);
+                let u = buf_new();
+                str_into(body, at_path(body, 0, "params.uri"), u);
+                COMING.push(u);
+            } else if kind == 'e' {
+                clear_stale();
+            }
+        }
+        if W_AT > 0 && W_AT == buf_slice(W_BUF).len {
+            buf_clear(W_BUF);
+            W_AT = 0;
+        }
+        responded
+    }
+}
+
+// Empty diagnostics for the URIs shown before and not in the batch just
+// published.
+fn clear_stale() {
+    unsafe {
+        for i in 0..SHOWN.count {
+            let u = buf_slice(SHOWN.data[i]);
+            var kept = false;
+            for j in 0..COMING.count {
+                if buf_slice(COMING.data[j]) == u {
+                    kept = true;
+                }
+            }
+            for j in 0..i {
+                if buf_slice(SHOWN.data[j]) == u {
+                    kept = true;
+                }
+            }
+            if !kept {
+                let b = buf_new();
+                buf_str(b, c"{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":");
+                buf_json_str(b, u);
+                buf_str(b, c",\"diagnostics\":[]}}");
+                send_message(buf_slice(b));
+            }
+        }
+        SHOWN.count = 0;
+        for j in 0..COMING.count {
+            SHOWN.push(COMING.data[j]);
+        }
+        COMING.count = 0;
+    }
+}
+
+// Reads what the worker wrote; false when it ended.
+fn read_worker(chunk: *u8) -> bool {
+    unsafe {
+        let got = read(W_OUT, chunk, 65536);
+        if got <= 0 {
+            worker_gone();
+            return false;
+        }
+        buf_bytes(W_BUF, chunk[0..got]);
+        true
+    }
+}
+
+// A request for the worker: handed to it (a new one when the program
+// changed), its response forwarded.
+fn ask_worker(method: *u8, id: [u8], msg: [u8], params: i64, empty: *u8, chunk: *u8) {
+    unsafe {
+        let path = uri_path(str_at(msg, at_path(msg, params, "textDocument.uri")));
+        if path.len == 0 || !use_root(path) {
+            respond(id, c_slice(empty));
+            return;
+        }
+        if superseded(path, chunk) {
+            respond_error(id, -32801, "content modified");
+            return;
+        }
+        if DIRTY || W_PID < 0 {
+            start_worker();
+        }
+        if W_PID < 0 {
+            respond_error(id, -32603, "the worker could not start");
+            return;
+        }
+        let line = int_at(msg, at_path(msg, params, "position.line"), 0);
+        let ch = int_at(msg, at_path(msg, params, "position.character"), 0);
+        let decl = is_true(msg, at_path(msg, params, "context.includeDeclaration"));
+        let req = buf_new();
+        buf_str(req, method);
+        buf_byte(req, '\t');
+        buf_bytes(req, path);
+        buf_fmt(req, f"\t{line}\t{ch}\t{if decl { 1 } else { 0 }}\t");
+        buf_bytes(req, id);
+        buf_byte(req, '\n');
+        write_all(W_IN, buf_slice(req));
+        loop {
+            if worker_frames() {
+                return;
+            }
+            if !read_worker(chunk) {
+                respond_error(id, -32603, "the worker ended (volec check shows why)");
+                return;
+            }
+        }
+    }
+}
+
+// ---- messages
+
+fn initialize(id: [u8], msg: [u8], params: i64) {
+    unsafe {
+        var encs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        elements(msg, at_path(msg, params, "capabilities.general.positionEncodings"), &encs);
+        for i in 0..encs.count {
+            if str_at(msg, encs.data[i]) == "utf-8" {
+                UTF8 = true;
+            }
+        }
+        let r = buf_new();
+        buf_str(r, c"{\"capabilities\":{\"positionEncoding\":");
+        buf_str(r, if UTF8 { c"\"utf-8\"" } else { c"\"utf-16\"" });
+        buf_str(r, c",\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":true}}");
+        buf_str(r,
+            c",\"definitionProvider\":true,\"referencesProvider\":true,\"hoverProvider\":true");
+        buf_str(r,
+            c",\"documentSymbolProvider\":true},\"serverInfo\":{\"name\":\"volec\",\"version\":\"");
+        buf_str(r, crate::version());
+        buf_str(r, c"\"}}");
+        respond(id, buf_slice(r));
+    }
+}
+
+// Handles one message; false after `exit`.
+fn handle(msg: [u8], chunk: *u8) -> bool {
+    unsafe {
+        let method = str_at(msg, member(msg, 0, "method"));
+        let idv = member(msg, 0, "id");
+        let id = raw(msg, idv);
+        let params = member(msg, 0, "params");
+        let t0 = now_us();
+        if method == "initialize" {
+            initialize(id, msg, params);
+        } else if method == "shutdown" {
+            SHUT = true;
+            respond(id, "null");
+        } else if method == "exit" {
+            return false;
+        } else if method == "textDocument/didOpen" {
+            let path = uri_path(str_at(msg, at_path(msg, params, "textDocument.uri")));
+            if path.len > 0 {
+                let text = set_doc(path, msg, at_path(msg, params, "textDocument.text"));
+                let known = ROOT >= 0;
+                if use_root(path) && (known && differs_from_disk(path, text) || W_PID < 0) {
+                    mark_dirty(0);
+                }
+            }
+        } else if method == "textDocument/didChange" {
+            let path = uri_path(str_at(msg, at_path(msg, params, "textDocument.uri")));
+            var changes = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            elements(msg, member(msg, params, "contentChanges"), &changes);
+            if path.len > 0 && changes.count > 0 {
+                set_doc(path, msg, member(msg, changes.data[changes.count - 1], "text"));
+                if use_root(path) {
+                    mark_dirty(DEBOUNCE_MS);
+                }
+            }
+        } else if method == "textDocument/didSave" {
+            let path = uri_path(str_at(msg, at_path(msg, params, "textDocument.uri")));
+            let tv = member(msg, params, "text");
+            if path.len > 0 {
+                if tv >= 0 && doc_index(path) >= 0 {
+                    set_doc(path, msg, tv);
+                }
+                if use_root(path) {
+                    mark_dirty(0);
+                }
+            }
+        } else if method == "textDocument/didClose" {
+            let path = uri_path(str_at(msg, at_path(msg, params, "textDocument.uri")));
+            let i = doc_index(path);
+            if i >= 0 {
+                let unsaved = differs_from_disk(path, buf_slice(DOC_TEXT.data[i]));
+                close_doc(path);
+                if unsaved && use_root(path) {
+                    mark_dirty(DEBOUNCE_MS);
+                }
+            }
+        } else if method == "textDocument/definition" {
+            ask_worker(c"definition", id, msg, params, c"null", chunk);
+        } else if method == "textDocument/references" {
+            ask_worker(c"references", id, msg, params, c"[]", chunk);
+        } else if method == "textDocument/hover" {
+            ask_worker(c"hover", id, msg, params, c"null", chunk);
+        } else if method == "textDocument/documentSymbol" {
+            ask_worker(c"documentSymbol", id, msg, params, c"[]", chunk);
+        } else if idv >= 0 && method.len > 0 {
+            let m = buf_new();
+            buf_str(m, c"unknown method ");
+            buf_bytes(m, method);
+            respond_error(id, -32601, buf_slice(m));
+        }
+        if TIMING && idv >= 0 {
+            let us = now_us() - t0;
+            let line = buf_new();
+            buf_str(line, c"lsp: ");
+            buf_bytes(line, method);
+            buf_fmt(line, f" {us / 1000}.{(us % 1000) / 100} ms\n");
+            write_all(STDERR, buf_slice(line));
+        }
+        true
+    }
+}
+
+// The next whole message on stdin, handled: 1, 0 when there is none yet,
+// -1 after `exit`.
+fn next_message(chunk: *u8) -> i64 {
+    unsafe {
+        let s = buf_slice(IN);
+        var body_at = 0;
+        var next = 0;
+        let len = frame_at(s, IN_AT, &body_at, &next);
+        if len == -2 {
+            return 0;
+        }
+        IN_AT = next;
+        if len < 0 {
+            // (no length: the header skipped)
+            return 1;
+        }
+        // (a copy: handle may read more of stdin into IN)
+        if MSG < 0 {
+            MSG = buf_new();
+        }
+        buf_clear(MSG);
+        buf_bytes(MSG, s[body_at..body_at + len]);
+        let more = handle(buf_slice(MSG), chunk);
+        if IN_AT == buf_slice(IN).len {
+            buf_clear(IN);
+            IN_AT = 0;
+        }
+        if more { 1 } else { -1 }
+    }
+}
+
+// The message framed at `at` in s: its body's length (its start into
+// *body_at, the next frame's into *next); -1 when the header has no
+// length, -2 when the message is not all there yet.
+fn frame_at(s: [u8], at: i64, body_at: inout i64, next: inout i64) -> i64 {
+    var e = at;
+    while e + 3 < s.len
+        && !(s[e] == '\r' && s[e + 1] == '\n' && s[e + 2] == '\r' && s[e + 3] == '\n') {
+        e += 1;
+    }
+    if e + 3 >= s.len {
+        return -2;
+    }
+    var len = -1;
+    let head = s[at..e];
+    var i = 0;
+    while i < head.len {
+        var j = i;
+        while j < head.len && head[j] != '\r' {
+            j += 1;
+        }
+        let l = head[i..j];
+        if l.len > 15 && lower_eq(l[0..15], "content-length:") {
+            len = int_at(l, 15, -1);
+        }
+        i = j + 2;
+    }
+    body_at = e + 4;
+    if len < 0 {
+        next = e + 4;
+        return -1;
+    }
+    if e + 4 + len > s.len {
+        return -2;
+    }
+    next = e + 4 + len;
+    len
+}
+
+// Whether a change of the document at path waits on stdin (what is there
+// read first): a request about it is then answered `content modified`
+// (LSP's -32801), so that edits made faster than the program is read do
+// not each read it.
+fn superseded(path: [u8], chunk: *u8) -> bool {
+    unsafe {
+        loop {
+            FDS[0] = 0;
+            FDS[1] = POLLIN;
+            if poll(FDS, 1, 0) <= 0 || (FDS[1] >> 16) == 0 {
+                break;
+            }
+            let got = read(0, chunk, 65536);
+            if got <= 0 {
+                break;
+            }
+            buf_bytes(IN, chunk[0..got]);
+        }
+        let s = buf_slice(IN);
+        var at = IN_AT;
+        loop {
+            var body_at = 0;
+            var next = 0;
+            let len = frame_at(s, at, &body_at, &next);
+            if len == -2 {
+                return false;
+            }
+            if len >= 0 {
+                let m = s[body_at..body_at + len];
+                if raw(m, member(m, 0, "method")) == "\"textDocument/didChange\""
+                    && uri_path(str_at(m, at_path(m, member(m, 0, "params"), "textDocument.uri")))
+                    == path {
+                    return true;
+                }
+            }
+            at = next;
+        }
+    }
+}
+
+fn lower_eq(a: [u8], b: [u8]) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    for i in 0..a.len {
+        let c = if a[i] >= 'A' && a[i] <= 'Z' { a[i] + 32 as u8 } else { a[i] };
+        if c != b[i] {
+            return false;
+        }
+    }
+    true
+}
+
+fn cleanup() {
+    unsafe {
+        stop_worker();
+        for i in 0..DOC_COPY.count {
+            unlink(buf_cstr(DOC_COPY.data[i]));
+        }
+        rmdir(buf_cstr(TMP_DIR));
+    }
+}
+
+// `volec lsp`: serves until `exit` or the end of stdin; 0 after a
+// shutdown, else 1 (as LSP says).
+pub fn run_lsp(argc: i64, argv: **u8) -> i64 {
+    unsafe {
+        // (`lsp --help`: help.vl; no options)
+        // (a worker that ended: its pipe's writes fail, not the server)
+        signal(13, 1 as *u8);
+        let t = getenv(c"VOLE_LSP_TIME");
+        TIMING = t != 0 as *u8 && t[0] != 0;
+        TMP_DIR = buf_new();
+        let tmp = getenv(c"TMPDIR");
+        if tmp != 0 as *u8 && tmp[0] != 0 {
+            buf_str(TMP_DIR, tmp);
+            if buf_slice(TMP_DIR)[buf_slice(TMP_DIR).len - 1] == '/' {
+                BUFS[TMP_DIR].len -= 1;
+            }
+        } else {
+            buf_str(TMP_DIR, c"/tmp");
+        }
+        buf_fmt(TMP_DIR, f"/volec-lsp-{getpid()}");
+        mkdir(buf_cstr(TMP_DIR), 448);
+        IN = buf_new();
+        W_BUF = buf_new();
+        FDS = alloc_array::<i32>(4);
+        let chunk = alloc_zeroed(65536);
+        loop {
+            let r = next_message(chunk);
+            if r < 0 {
+                cleanup();
+                return if SHUT { 0 } else { 1 };
+            }
+            if r > 0 {
+                continue;
+            }
+            var timeout = -1;
+            if DIRTY && ROOT >= 0 {
+                let left = (DEADLINE - now_us()) / 1000;
+                timeout = if left < 0 { 0 } else { left };
+            }
+            FDS[0] = 0;
+            FDS[1] = POLLIN;
+            FDS[2] = W_OUT;
+            FDS[3] = POLLIN;
+            let n = if W_PID > 0 { 2 } else { 1 };
+            poll(FDS, n as u64, timeout as i32);
+            if (FDS[1] >> 16) != 0 {
+                let got = read(0, chunk, 65536);
+                if got <= 0 {
+                    cleanup();
+                    return 1;
+                }
+                buf_bytes(IN, chunk[0..got]);
+            }
+            if n == 2 && (FDS[3] >> 16) != 0 && read_worker(chunk) {
+                worker_frames();
+            }
+            if DIRTY && ROOT >= 0 && now_us() >= DEADLINE {
+                start_worker();
+            }
+        }
+    }
+}

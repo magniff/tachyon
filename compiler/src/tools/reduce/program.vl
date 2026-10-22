@@ -1,0 +1,436 @@
+// `volec reduce` over programs (0.18, T3; docs/design/
+// contracts-verification.md §2.9): a program made small while it stays
+// interesting:
+//   reduce PROG.vl --differs [--input F]   its -O0 and -O2 runs disagree
+//                                            (stdout, exit status, first
+//                                            line of stderr)
+//   reduce PROG.vl --fails 'TEXT'          its build or run prints TEXT
+//   reduce PROG.vl --test NAME [--differs] its test NAME fails as it does
+//                                            now (or disagrees between the
+//                                            levels)
+// The program is cut by its layout (volec fmt's): whole items, then
+// the statements inside them, each with the lines indented under it, by
+// halves first, then one by one, to a fixpoint. A candidate is the
+// program's file with lines left out, written next to it (so that its
+// `mod` lines find their files) as NAME.reduce.vl; one that does not
+// build is not interesting (for --differs and --test). The result is
+// NAME.min.vl.
+
+use crate::base::{
+    IntVec, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, buf_write_fd, streq,
+};
+use crate::tools::proc::{buf_cstr, read_file_if, remove_file, write_file_if};
+use crate::tools::query::c_slice;
+use crate::tools::query::diagnostics::{PROG, diag};
+use crate::tools::testrun::program::{JOBS, add_job, argv_of, file_text, first_line, run_jobs};
+
+// The mode and its words.
+static var DIFFERS: bool = false;
+static var FAILS: *u8 = 0 as *u8;
+static var TEST: *u8 = 0 as *u8;
+static var INPUT: *u8 = 0 as *u8;
+static var RUNS: i64 = 0;
+static var MAX_RUNS: i64 = 2000;
+// (--test without --differs: the test's failure as it was first)
+static var WANT: [u8] = "";
+
+// The option at argv[i] of a program mode: how many words it takes (0:
+// not one of them).
+pub fn program_option(argc: i64, argv: **u8, i: i64) -> i64 {
+    unsafe {
+        let a = argv[i];
+        if streq(a, c"--differs") {
+            DIFFERS = true;
+            return 1;
+        }
+        if (streq(a, c"--fails") || streq(a, c"--test") || streq(a, c"--input")) && i + 1 < argc {
+            if streq(a, c"--fails") {
+                FAILS = argv[i + 1];
+            } else if streq(a, c"--test") {
+                TEST = argv[i + 1];
+            } else {
+                INPUT = argv[i + 1];
+            }
+            return 2;
+        }
+        0
+    }
+}
+
+pub fn program_mode() -> bool {
+    unsafe { DIFFERS || FAILS != 0 as *u8 || TEST != 0 as *u8 }
+}
+
+fn with_suffix(file: *u8, suffix: [u8]) -> *u8 {
+    unsafe {
+        let s = c_slice(file);
+        let b = buf_new();
+        buf_bytes(b, s[0..s.len - crate::base::source_ext_len(s)]);
+        buf_bytes(b, suffix);
+        buf_cstr(b)
+    }
+}
+
+fn words(a: *u8, b: *u8, c: *u8, d: *u8, e: *u8, f: *u8) -> IntVec {
+    var w = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    let list = [a, b, c, d, e, f];
+    for k in 0..6 {
+        if list[k] != 0 as *u8 {
+            w.push(list[k] as i64);
+        }
+    }
+    w
+}
+
+// Runs words (stdin from input, 0: none) with a time limit: the job.
+fn run(w: IntVec, input: *u8, out: *u8, err: *u8) -> i64 {
+    unsafe {
+        let j = add_job(argv_of(w), input, out, err);
+        run_jobs(j);
+        j
+    }
+}
+
+// What a build and run of `path` at `level` shows: "B" + the build's
+// output when it does not build, else "R" + exit status, stdout and the
+// first line of stderr.
+fn outcome(path: *u8, level: *u8, test: bool) -> [u8] {
+    unsafe {
+        let bin = with_suffix(path, if streq(level, c"-O0") { ".o0" } else { ".o2" });
+        let log = with_suffix(path, ".log");
+        let w = words(PROG, path, c"-o", bin, level, if test { c"--test-build" } else { 0 as *u8 });
+        let built = run(w, 0 as *u8, log, log);
+        let b = buf_new();
+        if JOBS[built].status != 0 {
+            buf_byte(b, 'B');
+            buf_bytes(b, file_text(log));
+            return buf_slice(b);
+        }
+        var r = words(bin, 0 as *u8, 0 as *u8, 0 as *u8, 0 as *u8, 0 as *u8);
+        if test {
+            r.push(c"--vole-test" as i64);
+            r.push(TEST as i64);
+        }
+        let out = with_suffix(path, ".out");
+        let err = with_suffix(path, ".err");
+        let ran = run(r, INPUT, out, err);
+        buf_byte(b, 'R');
+        buf_int(b, JOBS[ran].status);
+        buf_byte(b, '\n');
+        buf_bytes(b, file_text(out));
+        buf_bytes(b, "\n--\n");
+        buf_bytes(b, first_line(file_text(err)));
+        remove_file(bin);
+        buf_slice(b)
+    }
+}
+
+fn contains(hay: [u8], needle: [u8]) -> bool {
+    var i = 0;
+    while i + needle.len <= hay.len {
+        if hay[i..i + needle.len] == needle {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+// Whether the program at path is interesting.
+fn interesting(path: *u8) -> bool {
+    unsafe {
+        RUNS += 1;
+        let test = TEST != 0 as *u8;
+        if DIFFERS {
+            let a = outcome(path, c"-O0", test);
+            if a[0] != 'R' {
+                return false;
+            }
+            let b = outcome(path, c"-O2", test);
+            return b[0] == 'R' && a != b;
+        }
+        if FAILS != 0 as *u8 {
+            return contains(outcome(path, c"-O2", false), c_slice(FAILS));
+        }
+        let o = outcome(path, c"-O2", true);
+        o[0] == 'R' && o == WANT
+    }
+}
+
+// The lines of text: start and end (with its newline) of each, into
+// lines; their indentation into indent (-1: blank).
+fn split_lines(text: [u8], lines: inout IntVec, indent: inout IntVec) {
+    var s = 0;
+    var k = 0;
+    while k <= text.len {
+        if k == text.len || text[k] == '\n' {
+            if k > s || k < text.len {
+                lines.push(s);
+                lines.push(if k < text.len { k + 1 } else { k });
+                var d = 0;
+                while s + d < k && text[s + d] == ' ' {
+                    d += 1;
+                }
+                indent.push(if s + d == k { -1 } else { d });
+            }
+            s = k + 1;
+        }
+        k += 1;
+    }
+}
+
+// The lines of the unit that starts at line l (of those kept): it and the
+// lines indented under it, with a closing `}` (or `} else {` and what it
+// opens) at its own level; the end (exclusive) in keep's order.
+fn unit_end(text: [u8], lines: IntVec, indent: IntVec, keep: IntVec, at: i64) -> i64 {
+    unsafe {
+        let d = indent.data[keep.data[at]];
+        var j = at + 1;
+        while j < keep.count {
+            let l = keep.data[j];
+            let e = indent.data[l];
+            if e == -1 || e > d {
+                j += 1;
+                continue;
+            }
+            let first = text[lines.data[2 * l] + e];
+            if e == d && (first == '}' || first == ')' || first == ']') {
+                j += 1;
+                continue;
+            }
+            break;
+        }
+        // (trailing blank lines stay with what follows)
+        while j > at + 1 && indent.data[keep.data[j - 1]] == -1 {
+            j -= 1;
+        }
+        j
+    }
+}
+
+fn write_candidate(text: [u8], lines: IntVec, keep: IntVec, path: *u8) {
+    unsafe {
+        let b = buf_new();
+        for k in 0..keep.count {
+            let l = keep.data[k];
+            buf_bytes(b, text[lines.data[2 * l]..lines.data[2 * l + 1]]);
+        }
+        write_file_if(path, buf_slice(b));
+    }
+}
+
+// keep without its entries from..to.
+fn without(keep: IntVec, from: i64, to: i64) -> IntVec {
+    unsafe {
+        var rest = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..keep.count {
+            if k < from || k >= to {
+                rest.push(keep.data[k]);
+            }
+        }
+        rest
+    }
+}
+
+// The units of keep at indentation `depth` (their starts, in keep's
+// order) and their ends.
+fn units(text: [u8], lines: IntVec, indent: IntVec, keep: IntVec, depth: i64,
+    starts: inout IntVec, ends: inout IntVec) {
+    unsafe {
+        starts.count = 0;
+        ends.count = 0;
+        var k = 0;
+        while k < keep.count {
+            let l = keep.data[k];
+            let d = indent.data[l];
+            if d == depth {
+                let first = text[lines.data[2 * l] + d];
+                if first != '}' && first != ')' && first != ']' {
+                    let e = unit_end(text, lines, indent, keep, k);
+                    starts.push(k);
+                    ends.push(e);
+                    k = if depth == 0 { e } else { k + 1 };
+                    continue;
+                }
+            }
+            k += 1;
+        }
+    }
+}
+
+// One pass at a depth: the units left out, a run of them at a time
+// (halves, quarters, ... then one), from the last; whether one went.
+fn pass(text: [u8], lines: IntVec, indent: IntVec, keep: inout IntVec, depth: i64, path: *u8) -> bool {
+    unsafe {
+        var any = false;
+        var starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var ends = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        units(text, lines, indent, keep, depth, &starts, &ends);
+        var size = starts.count / 2;
+        if size < 1 {
+            size = 1;
+        }
+        while size >= 1 && RUNS < MAX_RUNS {
+            var i = starts.count - size;
+            while i >= 0 && RUNS < MAX_RUNS {
+                units(text, lines, indent, keep, depth, &starts, &ends);
+                if i + size > starts.count {
+                    i = starts.count - size;
+                    if i < 0 {
+                        break;
+                    }
+                }
+                // (a run of units: next to each other, in one block)
+                var apart = false;
+                for u in i..i + size - 1 {
+                    if ends.data[u] != starts.data[u + 1] {
+                        apart = true;
+                    }
+                }
+                if apart && depth > 0 {
+                    i -= size;
+                    continue;
+                }
+                let from = starts.data[i];
+                var to = ends.data[i + size - 1];
+                for u in i..i + size {
+                    if ends.data[u] > to {
+                        to = ends.data[u];
+                    }
+                }
+                let rest = without(keep, from, to);
+                if rest.count > 0 {
+                    write_candidate(text, lines, rest, path);
+                    if interesting(path) {
+                        keep = rest;
+                        any = true;
+                    }
+                }
+                i -= size;
+            }
+            if size == 1 {
+                break;
+            }
+            size = size / 2;
+        }
+        any
+    }
+}
+
+// keep without blank lines at its start and end, nor two in a row.
+fn tidy(text: [u8], indent: IntVec, keep: inout IntVec) {
+    unsafe {
+        var rest = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..keep.count {
+            let l = keep.data[k];
+            let blank = indent.data[l] == -1;
+            if blank && (rest.count == 0 || indent.data[rest.data[rest.count - 1]] == -1) {
+                continue;
+            }
+            rest.push(l);
+        }
+        while rest.count > 0 && indent.data[rest.data[rest.count - 1]] == -1 {
+            rest.count -= 1;
+        }
+        keep = rest;
+    }
+}
+
+pub fn reduce_program(file: *u8, out_file: *u8, max_runs: i64) -> i64 {
+    unsafe {
+        if max_runs > 0 {
+            MAX_RUNS = max_runs;
+        }
+        let original = buf_new();
+        if !read_file_if(file, original) {
+            let d = diag(c"error", c"reduce.no-file");
+            buf_str(d, c"cannot read '");
+            buf_str(d, file);
+            buf_str(d, c"'\n");
+            return 2;
+        }
+        let text = buf_slice(original);
+        var lines = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var indent = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        split_lines(text, &lines, &indent);
+        let n_lines = lines.count / 2;
+        var keep = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..n_lines {
+            keep.push(k);
+        }
+        // (absolute: the builds run by their path, not $PATH)
+        let path = with_suffix(crate::tools::proc::absolute_path(file), ".reduce.vl");
+        write_candidate(text, lines, keep, path);
+        if TEST != 0 as *u8 && !DIFFERS {
+            let o = outcome(path, c"-O2", true);
+            let b = buf_new();
+            buf_bytes(b, o);
+            WANT = buf_slice(b);
+            if o[0] != 'R' || o.len > 3 && o[1] == '0' && o[2] == '\n' {
+                remove_file(path);
+                let d = diag(c"error", c"reduce.not-failing");
+                buf_str(d, c"test '");
+                buf_str(d, TEST);
+                buf_str(d, c"' of ");
+                buf_str(d, file);
+                buf_str(d,
+                    if o[0] != 'R' { c"' does not build\n" }
+                    else { c" passes: nothing to keep failing\n" });
+                return 1;
+            }
+        } else if !interesting(path) {
+            remove_file(path);
+            let d = diag(c"error", c"reduce.not-failing");
+            buf_str(d, file);
+            buf_str(d, if DIFFERS { c": -O0 and -O2 agree on it as it is" }
+                else { c": its build and run do not print the text as it is" });
+            buf_str(d, c" (nothing to keep)\n");
+            return 1;
+        }
+        // items first, then deeper and deeper, to a fixpoint
+        var changed = true;
+        while changed && RUNS < MAX_RUNS {
+            changed = false;
+            var depth = 0;
+            while depth <= 40 && RUNS < MAX_RUNS {
+                if pass(text, lines, indent, &keep, depth, path) {
+                    changed = true;
+                }
+                depth += 4;
+            }
+        }
+        tidy(text, indent, &keep);
+        let target = if out_file != 0 as *u8 { out_file } else { with_suffix(file, ".min.vl") };
+        write_candidate(text, lines, keep, target);
+        remove_file(path);
+        remove_file(with_suffix(path, ".log"));
+        remove_file(with_suffix(path, ".out"));
+        remove_file(with_suffix(path, ".err"));
+        let o = buf_new();
+        buf_bytes(o, "reduced ");
+        buf_str(o, file);
+        buf_bytes(o, ": ");
+        buf_int(o, n_lines);
+        buf_bytes(o, " lines to ");
+        buf_int(o, keep.count);
+        buf_bytes(o, " in ");
+        buf_int(o, RUNS);
+        buf_bytes(o, " runs");
+        if RUNS >= MAX_RUNS {
+            buf_bytes(o, " (--max-runs reached: not minimal)");
+        }
+        buf_bytes(o, "; written to ");
+        buf_str(o, target);
+        buf_byte(o, '\n');
+        if keep.count <= 30 {
+            let r = buf_new();
+            for k in 0..keep.count {
+                let l = keep.data[k];
+                buf_bytes(r, text[lines.data[2 * l]..lines.data[2 * l + 1]]);
+            }
+            buf_bytes(o, buf_slice(r));
+        }
+        buf_write_fd(o, STDOUT);
+        0
+    }
+}

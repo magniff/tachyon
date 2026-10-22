@@ -6,7 +6,7 @@ each solution unique, and runs about 50 ns per search node: the same
 speed as the same solver in C.
 
 ```sh
-tachyonc examples/algorithms/sudoku/main.tach -o sudoku && ./sudoku
+volec examples/algorithms/sudoku/main.vl -o sudoku && ./sudoku
 ```
 
 ## The problem
@@ -169,31 +169,31 @@ On an Apple M-series machine:
 
 | | 70 disguised puzzles, 1.9 million nodes |
 |---|---|
-| tachyon 0.15, `-O2` (the default) | 90 ms |
-| tachyon 0.15, `-O1` | 125 ms |
-| tachyon 0.15, `-O0` | 700 ms |
+| vole 0.15, `-O2` (the default) | 90 ms |
+| vole 0.15, `-O1` | 125 ms |
+| vole 0.15, `-O0` | 700 ms |
 | C, `clang -O2`, `__builtin_popcountll` | 90 ms |
 
 The popcount matters. Written as the usual loop (`while x != 0 { x &=
-x - 1; n += 1; }`), the tachyon solver took 1.5 times as long as C:
+x - 1; n += 1; }`), the vole solver took 1.5 times as long as C:
 clang recognizes that loop and emits the processor's population-count
-instruction, and tachyon 0.15 has no such intrinsic. The branch-free
+instruction, and vole 0.15 has no such intrinsic. The branch-free
 version above closes the gap.
 
 ## Language features
 
 | feature | where | guide |
 |---|---|---|
-| fixed-size arrays in a struct, copied as values | `Sudoku`, `Search` | `tachyonc guide types` |
-| `Result` and an error enum with `#[derive(Debug)]`, `{e:?}` | `parse`, `main` | `tachyonc guide conversions`, `guide formatting` |
-| `match` on `Ok` / `Err` | `main` | `tachyonc guide syntax` |
-| default and named arguments: `limit: i64 = 2`, `run(p, limit: 1)` | `Search::run` | `tachyonc guide core` |
-| methods taking `inout self` and writing through it | `place`, `clear`, `fill` | `tachyonc guide core` |
-| bit operations on `u64`, `~`, wrapping `0 - m` | `candidates`, `fill`, `popcount` | `tachyonc guide types` |
-| iterators and closures: `enumerate`, `filter(\|d\| d != 0).count()` | `parse`, `clues` | `tachyonc guide iterators`, `guide closures` |
-| `const` arrays of strings | `PUZZLES` | `tachyonc guide syntax` |
-| slices of arrays passed to functions that write them | `Rng::shuffle`, `shuffle_lines` | `tachyonc guide memory` |
-| a C header: `import "time.h" as c;` | `now_ns` | `tachyonc guide c-interop` |
+| fixed-size arrays in a struct, copied as values | `Sudoku`, `Search` | `volec guide types` |
+| `Result` and an error enum with `#[derive(Debug)]`, `{e:?}` | `parse`, `main` | `volec guide conversions`, `guide formatting` |
+| `match` on `Ok` / `Err` | `main` | `volec guide syntax` |
+| default and named arguments: `limit: i64 = 2`, `run(p, limit: 1)` | `Search::run` | `volec guide core` |
+| methods taking `inout self` and writing through it | `place`, `clear`, `fill` | `volec guide core` |
+| bit operations on `u64`, `~`, wrapping `0 - m` | `candidates`, `fill`, `popcount` | `volec guide types` |
+| iterators and closures: `enumerate`, `filter(\|d\| d != 0).count()` | `parse`, `clues` | `volec guide iterators`, `guide closures` |
+| `const` arrays of strings | `PUZZLES` | `volec guide syntax` |
+| slices of arrays passed to functions that write them | `Rng::shuffle`, `shuffle_lines` | `volec guide memory` |
+| a C header: `import "time.h" as c;` | `now_ns` | `volec guide c-interop` |
 
 ## Try
 

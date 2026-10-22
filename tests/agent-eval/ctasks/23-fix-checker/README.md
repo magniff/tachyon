@@ -1,7 +1,7 @@
 # 23-fix-checker: integer ranges that cover the whole type are "non-exhaustive"
 
 **The change.** `starter.patch` plants an off-by-one in the exhaustiveness
-checker (`compiler/src/front/patterns/usefulness.tach`, Maranget's
+checker (`compiler/src/front/patterns/usefulness.vl`, Maranget's
 usefulness algorithm). Integer columns are split into segments at the
 arms' range boundaries (`int_segments`, start keys in `CUTS`).
 `segment_end(i)` should return the inclusive end of segment `i`
@@ -20,7 +20,7 @@ column is never complete:
 
 It never makes a non-exhaustive match pass, so it cannot miscompile.
 The starter also adds the failing regression test
-`tests/run/eval_regress_ranges.tach` (a UTF-8 lead-byte classifier).
+`tests/run/eval_regress_ranges.vl` (a UTF-8 lead-byte classifier).
 
 **Why it is realistic.** It is the exclusive/inclusive confusion a
 cleanup introduces. Elsewhere `useful` and `find_missing` compute segment
@@ -36,17 +36,17 @@ bug is. The agent has to follow `find_missing` → `ctor_count` →
 **The grading** (`ctasks.grade`; about 1 minute on an M-series Mac):
 
 1. `hidden/tests/run/` is copied in. The cases:
-   - `eval_regress_ranges.tach`: the visible test, so editing or deleting
+   - `eval_regress_ranges.vl`: the visible test, so editing or deleting
      it does not help.
-   - `eval_regress_ranges_signed.tach`: exhaustive `i8`, `u16` (a `const`
+   - `eval_regress_ranges_signed.vl`: exhaustive `i8`, `u16` (a `const`
      arm included), `i64` (from MIN to MAX in five arms) and `u64` (the
      top-bit keys) matches.
-   - `eval_regress_ranges_nested.tach`: ranges inside a tuple
+   - `eval_regress_ranges_nested.vl`: ranges inside a tuple
      `(bool, u8)`, `Option<u8>`, and enum variants with or-patterns.
-   - `eval_regress_ranges_unreachable.tach`: a `_` after full `u8`
+   - `eval_regress_ranges_unreachable.vl`: a `_` after full `u8`
      coverage must still be "unreachable match arm". This fails on the
      starter and on a fix that only changes `find_missing`.
-   - `eval_regress_ranges_missing.tach`: an `i8` match missing `-1`
+   - `eval_regress_ranges_missing.vl`: an `i8` match missing `-1`
      must still be rejected with `'-1' is not covered`. This guards
      against a fix that makes integer columns look complete wrongly, or
      that drops the error.
@@ -73,12 +73,12 @@ when the witness is `_`, still fails `_nested` (its witnesses are
   `_missing` and `err_match_nonexhaustive_int`.
 
 **At v0.16.0, if a patch does not apply** (0.16 moves the compiler's
-source to `?`, derive and interpolation, so `usefulness.tach` may be
+source to `?`, derive and interpolation, so `usefulness.vl` may be
 reformatted): make the starter again in a scratch tree of v0.16.0. Find
-`segment_end` (`tachyonc query show segment_end`), replace its
-`CUTS.data[i + 1] - 1` with `CUTS.data[i + 1]` (`tachyonc edit patch`),
-add `hidden/tests/run/eval_regress_ranges.tach` as
-`tests/run/eval_regress_ranges.tach`, commit, and use `git diff HEAD~1
+`segment_end` (`volec query show segment_end`), replace its
+`CUTS.data[i + 1] - 1` with `CUTS.data[i + 1]` (`volec edit patch`),
+add `hidden/tests/run/eval_regress_ranges.vl` as
+`tests/run/eval_regress_ranges.vl`, commit, and use `git diff HEAD~1
 HEAD` as `starter.patch`. `solution.patch` is the reverse of the
 one-line change. Check that the starter still builds itself and passes
 `tests/run.sh match`. If `segment_end` is gone (merged into its callers),

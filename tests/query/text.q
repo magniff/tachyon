@@ -1,14 +1,14 @@
 ## query text: numbered lines of any file, no program read (0.12).
-$ text text/main.tach:6-11
-// text/main.tach:6-11
+$ text text/main.vl:6-11
+// text/main.vl:6-11
 6	mod util;
 7	
 8	use util::{
 9	    twice,
 10	};
 11	use util::half;
-$ text text/conflict.tach
-// text/conflict.tach:1-8
+$ text text/conflict.vl
+// text/conflict.vl:1-8
 1	// Not part of the program: a file with merge conflict markers.
 2	pub fn twice(x: i64) -> i64 {
 3	<<<<<<< HEAD
@@ -17,11 +17,11 @@ $ text text/conflict.tach
 6	    x + x
 7	>>>>>>> other
 8	}
-$ text text/util.tach:5
-// text/util.tach:5-5
+$ text text/util.vl:5
+// text/util.vl:5-5
 5	pub fn half(x: i64) -> i64 {
-$ text text/long.tach:240-
-// text/long.tach:240-250
+$ text text/long.vl:240-
+// text/long.vl:240-250
 240	// line 240 of a long file
 241	// line 241 of a long file
 242	// line 242 of a long file
@@ -33,8 +33,8 @@ $ text text/long.tach:240-
 248	// line 248 of a long file
 249	// line 249 of a long file
 250	// line 250 of a long file
-$ text text/long.tach:31-300
-// text/long.tach:31-230
+$ text text/long.vl:31-300
+// text/long.vl:31-230
 31	// line 31 of a long file
 32	// line 32 of a long file
 33	// line 33 of a long file
@@ -236,21 +236,21 @@ $ text text/long.tach:31-300
 229	// line 229 of a long file
 230	// line 230 of a long file
 note query.truncated: lines 31-250 are 220 lines; showing 31-230
-try: tachyonc query text text/long.tach:231-250
-$ text text/main.tach:40-45
-error query.no-match: text/main.tach has 27 lines; no lines 40-45
-try: tachyonc query text text/main.tach:1-27
+try: volec query text text/long.vl:231-250
+$ text text/main.vl:40-45
+error query.no-match: text/main.vl has 27 lines; no lines 40-45
+try: volec query text text/main.vl:1-27
 [exit 1]
-$ text text/nowhere.tach
-error query.no-file: cannot read 'text/nowhere.tach'
+$ text text/nowhere.vl
+error query.no-file: cannot read 'text/nowhere.vl'
 [exit 1]
 $ text
 error query.usage: text needs a FILE (FILE:A-B for lines A to B)
-try: tachyonc query text main.tach:1-40
+try: volec query text main.vl:1-40
 [exit 2]
 ## show FILE: a whole small file; a long one is refused.
-$ show text/util.tach
-// text/util.tach:1-7
+$ show text/util.vl
+// text/util.vl:1-7
 pub fn twice(x: i64) -> i64 {
     x * 2
 }
@@ -258,24 +258,24 @@ pub fn twice(x: i64) -> i64 {
 pub fn half(x: i64) -> i64 {
     x / 2
 }
-$ show text/long.tach
-error query.too-long: text/long.tach has 250 lines (show prints a file of at most 200)
-try: tachyonc query text text/long.tach:1-200
+$ show text/long.vl
+error query.too-long: text/long.vl has 250 lines (show prints a file of at most 200)
+try: volec query text text/long.vl:1-200
 [exit 1]
 ## The named regions of a module.
 $ show crate::use
-// crate::use	text/main.tach:8-11
+// crate::use	text/main.vl:8-11
 use util::{
     twice,
 };
 use util::half;
 $ show crate::header crate::extern
-// crate::header	text/main.tach:1-4
+// crate::header	text/main.vl:1-4
 // A program for query text, show FILE, the named regions and
 // --with-comments (tests/query/text.q).
 //
 // Its header comment ends here.
-// crate::extern	text/main.tach:13-15
+// crate::extern	text/main.vl:13-15
 extern "C" {
     fn abs(x: i32) -> i32;
 }
@@ -283,13 +283,13 @@ $ show util::header
 note query.empty: no header comment in util
 ## --with-comments: the section comment above the item too.
 $ show quad
-// crate::quad	text/main.tach:19-22	effects: none
+// crate::quad	text/main.vl:19-22	effects: none
 // Four times x.
 fn quad(x: i64) -> i64 {
     twice(twice(x))
 }
 $ show quad --with-comments
-// crate::quad	text/main.tach:17-22	effects: none
+// crate::quad	text/main.vl:17-22	effects: none
 // ---- Arithmetic ----
 
 // Four times x.
@@ -297,11 +297,11 @@ fn quad(x: i64) -> i64 {
     twice(twice(x))
 }
 ## --in FILE:LINE: the item holding that line.
-$ refs twice --in text/main.tach:22
-# text/main.tach
+$ refs twice --in text/main.vl:22
+# text/main.vl
 21:5	call	quad	twice(twice(x))
 21:11	call	quad	twice(twice(x))
-$ refs twice --in text/main.tach:3
-error query.bad-in: no item at text/main.tach:3
-try: tachyonc query refs twice
+$ refs twice --in text/main.vl:3
+error query.bad-in: no item at text/main.vl:3
+try: volec query refs twice
 [exit 1]

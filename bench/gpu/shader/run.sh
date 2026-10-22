@@ -12,7 +12,7 @@
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 N=200
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -23,7 +23,7 @@ while [ $# -gt 0 ]; do
 done
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/shaderbench.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
-"$COMPILER" "$ROOT/tools/wgslc/main.tach" -O2 -o "$WORK/wgslc" >/dev/null || exit 1
+"$COMPILER" "$ROOT/tools/wgslc/main.vl" -O2 -o "$WORK/wgslc" >/dev/null || exit 1
 mkdir "$WORK/corpus"
 for f in "$ROOT"/tests/wgsl/cases/*.wgsl; do
     case "$(basename "$f")" in err_*) continue ;; esac

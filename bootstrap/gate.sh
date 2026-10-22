@@ -17,7 +17,7 @@
 #   --no-linux       without the containers
 #   --no-x86         without x86_64 (the x86_64-linux container); the
 #                    default since 0.15, set in bootstrap/gate.conf (X86=0)
-#                    or by $TACHYON_GATE_X86 (0 or 1)
+#                    or by $VOLE_GATE_X86 (0 or 1)
 #   --with-x86       with x86_64, whatever the default
 #   --only STEPS     only these steps (comma-separated; `fuzz-*` patterns;
 #                    the chain is added when they need the compiler)
@@ -25,7 +25,7 @@
 #                    (they need an idle machine); `--only bench` for just
 #                    them
 #   -j N             slots for the macOS (or host) steps, shared by all of
-#                    them through $TACHYON_JOBSERVER (default: the number
+#                    them through $VOLE_JOBSERVER (default: the number
 #                    of CPUs)
 #   --cpus N         CPUs of each container (default 8, at most docker's)
 #   --fuzz N         random programs per fuzz mode (overrides the mode's)
@@ -73,8 +73,8 @@ export LC_ALL
 # (0.18.1) The steps build without the code cache (back::codecache), but
 # the incremental step and the suite at -O2 (a smoke row: its cache in the
 # run's directory, removed after).
-TACHYON_CODE_CACHE=off
-export TACHYON_CODE_CACHE
+VOLE_CODE_CACHE=off
+export VOLE_CODE_CACHE
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 MODE=default
@@ -82,15 +82,15 @@ MODE=default
 # its steps side by side with the containers, and the heavier examples
 # (algorithms at -O0) took longer than 20 s on a loaded machine. A hang
 # is still caught.
-TACHYON_TEST_TIMEOUT=${TACHYON_TEST_TIMEOUT:-60}
-export TACHYON_TEST_TIMEOUT
+VOLE_TEST_TIMEOUT=${VOLE_TEST_TIMEOUT:-60}
+export VOLE_TEST_TIMEOUT
 LINUX=1
-# (0.15) x86_64: bootstrap/gate.conf's X86, then $TACHYON_GATE_X86, then
+# (0.15) x86_64: bootstrap/gate.conf's X86, then $VOLE_GATE_X86, then
 # --no-x86/--with-x86
 X86=1
 [ ! -f "$ROOT/bootstrap/gate.conf" ] || X86=$(sed -n 's/^X86=\([01]\)$/\1/p' "$ROOT/bootstrap/gate.conf" | tail -1)
 [ -n "$X86" ] || X86=1
-[ -z "${TACHYON_GATE_X86:-}" ] || X86=$TACHYON_GATE_X86
+[ -z "${VOLE_GATE_X86:-}" ] || X86=$VOLE_GATE_X86
 ONLY=""
 BENCH=0
 JOBS=""
@@ -140,7 +140,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 case "$HISTORY" in fast|full) ;; *) die "--history is fast or full" ;; esac
-case "$X86" in 0|1) ;; *) die "X86 (bootstrap/gate.conf, \$TACHYON_GATE_X86) is 0 or 1, not '$X86'" ;; esac
+case "$X86" in 0|1) ;; *) die "X86 (bootstrap/gate.conf, \$VOLE_GATE_X86) is 0 or 1, not '$X86'" ;; esac
 for n in "$CPUS" ${JOBS:+"$JOBS"} ${FUZZ_N:+"$FUZZ_N"} ${ABI_N:+"$ABI_N"}; do
     case "$n" in ''|*[!0-9]*) die "'$n' is not a number" ;; esac
 done
@@ -249,8 +249,8 @@ while [ $i -lt "$JOBS" ]; do
     echo >&9
     i=$((i + 1))
 done
-TACHYON_JOBSERVER="$RUN/jobs"
-export TACHYON_JOBSERVER
+VOLE_JOBSERVER="$RUN/jobs"
+export VOLE_JOBSERVER
 
 # (0.21, for 0.24's rename) The compiler's name and root at HEAD, from
 # bootstrap/releases.toml's [head].
@@ -264,10 +264,10 @@ fi
 C="$RUN/$HEAD_BIN"
 
 # The bootstrap caches: this checkout's, then the shared one (bootstrap.sh:
-# $TACHYON_BOOTSTRAP_CACHE, or the main checkout's in a linked worktree).
+# $VOLE_BOOTSTRAP_CACHE, or the main checkout's in a linked worktree).
 BOOT_CACHES="$ROOT/target/bootstrap"
-if [ -n "${TACHYON_BOOTSTRAP_CACHE:-}" ]; then
-    BOOT_CACHES="$BOOT_CACHES $TACHYON_BOOTSTRAP_CACHE"
+if [ -n "${VOLE_BOOTSTRAP_CACHE:-}" ]; then
+    BOOT_CACHES="$BOOT_CACHES $VOLE_BOOTSTRAP_CACHE"
 else
     common=$(cd "$ROOT" && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
     [ -z "$common" ] || [ "$(dirname "$common")" = "$ROOT" ] \
@@ -304,9 +304,10 @@ find_previous_release() {
     fp=""
     for tag in $(sh "$ROOT/bootstrap/release-tags.sh"); do
         for b in $BOOT_CACHES; do
-            for p in "$b"/"$HOST"/"$tag"-*/tachyonc; do
+            # (0.24: the releases up to 0.23 are tachyonc, releases.toml's bin)
+            for p in "$b"/"$HOST"/"$tag"-*/volec "$b"/"$HOST"/"$tag"-*/tachyonc; do
                 [ -x "$p" ] || continue
-                case "$p" in *-"$head"/tachyonc) continue ;; esac
+                case "$p" in *-"$head"/volec|*-"$head"/tachyonc) continue ;; esac
                 fp=$p
                 break 2
             done
@@ -324,7 +325,7 @@ run_step() {
             sh "$ROOT/bootstrap/bootstrap.sh" --dev --no-head-tests --history "$HISTORY" </dev/null \
                 && cp "$ROOT/target/$HEAD_BIN" "$C" ;;
         suite-O2)
-            TACHYON_CODE_CACHE=on TACHYON_CACHE="$RUN/code-cache" sh "$ROOT/tests/run.sh" -c "$C" -O 2
+            VOLE_CODE_CACHE=on VOLE_CACHE="$RUN/code-cache" sh "$ROOT/tests/run.sh" -c "$C" -O 2
             st=$?
             rm -rf "$RUN/code-cache"
             return $st ;;
@@ -362,7 +363,7 @@ run_step() {
         incremental) sh "$ROOT/tests/incremental.sh" -c "$C" ;;
         voltty-fuzz) sh "$ROOT/tests/voltty/run.sh" -c "$C" -s 60 -k "$k" ;;
         stress-grow)
-            # (0.14) The compiler with TACHYON_STRESS_GROW=1 (base::grow):
+            # (0.14) The compiler with VOLE_STRESS_GROW=1 (base::grow):
             # every growth of its tables moves them and poisons the old
             # block, so a read through a stale table pointer shows. Its
             # self-compile gives the same object as without, and the suite
@@ -370,11 +371,11 @@ run_step() {
             o="$RUN/stress-grow"
             mkdir -p "$o"
             "$C" "$HEAD_ROOT" -o "$o/plain.o" || return 1
-            TACHYON_STRESS_GROW=1 "$C" "$HEAD_ROOT" -o "$o/stress.o" || return 1
+            VOLE_STRESS_GROW=1 "$C" "$HEAD_ROOT" -o "$o/stress.o" || return 1
             cmp -s "$o/plain.o" "$o/stress.o" \
                 || { echo "stress-grow: the self-compile differs: $o/plain.o $o/stress.o"; return 1; }
             for level in 0 2; do
-                TACHYON_STRESS_GROW=1 sh "$ROOT/tests/run.sh" -c "$C" -O $level || return 1
+                VOLE_STRESS_GROW=1 sh "$ROOT/tests/run.sh" -c "$C" -O $level || return 1
             done
             echo "stress-grow: the self-compile is the same; the suite passes at -O0 and -O2" ;;
         valgrind) sh "$ROOT/tests/valgrind.sh" -c "$C" ;;
@@ -389,7 +390,7 @@ run_step() {
             # come back unnoticed (examples/errors-and-results had one).
             # (a case whose output differs by design with the flag says
             # NO-EXTRA-FLAGS; a checked program runs slower: 2 minutes)
-            TACHYON_TEST_FLAGS=--check-alloc TACHYON_TEST_TIMEOUT=120 \
+            VOLE_TEST_FLAGS=--check-alloc VOLE_TEST_TIMEOUT=120 \
                 sh "$ROOT/tests/run.sh" -c "$C" example >"$RUN/examples-checkalloc.out" 2>&1
             rc=$?
             cat "$RUN/examples-checkalloc.out"

@@ -1,20 +1,20 @@
 #!/bin/sh
 # bench/std: std's routines against Rust's std and C (0.20 P0; design
 # docs/design/collections-text-io.md §3). Each benchmark NAME is a
-# triple, NAME.tach, NAME.rs and NAME.c, making its input in-process from
+# triple, NAME.vl, NAME.rs and NAME.c, making its input in-process from
 # the same xorshift64 seed and printing the same checksum; targets.txt
 # lists the comparisons and their targets. The harness builds each
-# (tachyonc -O2; rustc -C opt-level=3 -C codegen-units=1 -C panic=abort;
+# (volec -O2; rustc -C opt-level=3 -C codegen-units=1 -C panic=abort;
 # cc -O2), checks the checksums agree, runs each RUNS times (the fastest
 # wall-clock time, whole program) and prints a row per comparison:
-# tachyon's time, the baseline's, their ratio and the target.
-# (0.20) A benchmark whose NAME.tach has a line `// bench-std: data` reads
+# vole's time, the baseline's, their ratio and the target.
+# (0.20) A benchmark whose NAME.vl has a line `// bench-std: data` reads
 # a file: `NAME.t --make FILE` makes it once (untimed), and every program
 # then runs with FILE as its last argument (a `rust:ARG` row: ARG FILE).
 #
 # usage: bench/std/run.sh [-c COMPILER] [-r RUNS] [--gate] [NAME...]
 #
-#   -c COMPILER   the tachyonc to measure (default: target/tachyonc)
+#   -c COMPILER   the volec to measure (default: target/volec)
 #   -r RUNS       runs per program (default 5)
 #   --gate        exit 1 when a ratio is above its target by more than 10%
 #                 (noise), or a checksum differs
@@ -28,7 +28,7 @@ LC_ALL=C
 export LC_ALL
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 RUNS=5
 GATE=0
 CC=${CC:-cc}
@@ -46,7 +46,7 @@ done
 HAVE_RUST=1
 command -v rustc >/dev/null 2>&1 || { HAVE_RUST=0; echo "note bench.std: no rustc: the Rust rows are skipped" >&2; }
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-bench-std.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-bench-std.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 "$CC" -O2 -o "$WORK/timer" "$ROOT/bench/timer.c"
@@ -68,11 +68,11 @@ measure() {
     fi
 }
 
-printf '%-14s %-10s %10s %10s %7s %7s  %s\n' bench baseline 'tachyon ms' 'base ms' ratio target result
+printf '%-14s %-10s %10s %10s %7s %7s  %s\n' bench baseline 'vole ms' 'base ms' ratio target result
 for name in $NAMES; do
     src="$HERE/$name"
-    if ! "$COMPILER" -O2 "$src.tach" -o "$WORK/$name.t" >"$WORK/$name.t.log" 2>&1; then
-        echo "FAIL $name: tachyonc: $(tail -3 "$WORK/$name.t.log")"; failed=1; continue
+    if ! "$COMPILER" -O2 "$src.vl" -o "$WORK/$name.t" >"$WORK/$name.t.log" 2>&1; then
+        echo "FAIL $name: volec: $(tail -3 "$WORK/$name.t.log")"; failed=1; continue
     fi
     # (0.20: a benchmark with no C baseline has no NAME.c)
     if [ -f "$src.c" ]; then
@@ -91,7 +91,7 @@ for name in $NAMES; do
             || { echo "FAIL $name: rustc: $(tail -3 "$WORK/$name.r.log")"; failed=1; continue; }
     fi
     data=""
-    if grep -q '^// bench-std: data' "$src.tach"; then
+    if grep -q '^// bench-std: data' "$src.vl"; then
         data="$WORK/$name.data"
         "$WORK/$name.t" --make "$data" >"$WORK/$name.make.log" 2>&1 \
             || { echo "FAIL $name: --make: $(tail -3 "$WORK/$name.make.log")"; failed=1; continue; }

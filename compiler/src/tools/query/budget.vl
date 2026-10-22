@@ -1,0 +1,113 @@
+// The output budget of `volec query` (0.15): `--budget N` keeps an
+// answer to about N tokens (4 bytes a token), cut at a line, with a note
+// saying what was left out and the command that prints it all. Without
+// --budget, an answer over DEFAULT_BUDGET is cut the same way (not with
+// --all; `--budget 0` is no limit). `query context` fits its answer to
+// the budget itself (context.vl).
+
+use crate::base::{
+    BUFS, STDOUT, STDOUT_CAPTURE, buf_byte, buf_int, buf_new, buf_slice, buf_str, write,
+};
+use crate::tools::query::diagnostics::{diag, diags, put_cword};
+use crate::tools::query::refs::OPT_ALL;
+
+// --budget's tokens (-1: not given; 0: no limit).
+pub static var OPT_BUDGET: i64 = -1;
+
+// The budget of an answer without --budget, in tokens.
+pub const DEFAULT_BUDGET: i64 = 8000;
+
+pub const BYTES_PER_TOKEN: i64 = 4;
+
+// Starts keeping stdout, to write it within the budget (end_output).
+pub fn begin_output() {
+    unsafe {
+        STDOUT_CAPTURE = buf_new();
+    }
+}
+
+// Writes what was kept of stdout, within the budget (`own`: the answer
+// fitted itself, only --budget cuts it); the note and `try:` line when it
+// is cut. argv is the command's, for the line that prints it all.
+pub fn end_output(argc: i64, argv: **u8, own: bool) {
+    unsafe {
+        let cap = STDOUT_CAPTURE;
+        if cap < 0 {
+            return;
+        }
+        STDOUT_CAPTURE = -1;
+        let text = buf_slice(cap);
+        let limit = if OPT_BUDGET > 0 { OPT_BUDGET * BYTES_PER_TOKEN }
+            else if OPT_BUDGET == 0 || OPT_ALL || own { -1 }
+            else { DEFAULT_BUDGET * BYTES_PER_TOKEN };
+        if limit < 0 || text.len <= limit {
+            write(STDOUT, BUFS[cap].data, text.len as u64);
+            return;
+        }
+        var end = limit;
+        while end > 0 && text[end - 1] != '\n' {
+            end -= 1;
+        }
+        if end == 0 {
+            end = limit;
+        }
+        let shown = count_lines(text[0..end]);
+        let total = count_lines(text);
+        write(STDOUT, BUFS[cap].data, end as u64);
+        if text[end - 1] != '\n' {
+            let nl = buf_new();
+            buf_byte(nl, '\n');
+            write(STDOUT, BUFS[nl].data, 1);
+        }
+        let need = (text.len + BYTES_PER_TOKEN - 1) / BYTES_PER_TOKEN;
+        let d = diag(c"note", c"query.budget");
+        buf_str(d, c"cut at about ");
+        buf_int(d, limit / BYTES_PER_TOKEN);
+        buf_str(d, c" tokens: ");
+        buf_int(d, shown);
+        buf_str(d, c" of ");
+        buf_int(d, total);
+        buf_str(d, c" lines (about ");
+        buf_int(d, need);
+        buf_str(d, c" tokens in all)\n");
+        try_with_budget(argc, argv, (need + 99) / 100 * 100);
+    }
+}
+
+fn count_lines(s: [u8]) -> i64 {
+    var n = 0;
+    for i in 0..s.len {
+        if s[i] == '\n' {
+            n += 1;
+        }
+    }
+    if s.len > 0 && s[s.len - 1] != '\n' {
+        n += 1;
+    }
+    n
+}
+
+// `try: PROG ARGS --budget N`: the command again (argv, without its
+// --budget), with budget N.
+pub fn try_with_budget(argc: i64, argv: **u8, n: i64) {
+    unsafe {
+        let out = diags();
+        buf_str(out, c"try:");
+        var k = 0;
+        while k < argc {
+            if streq_budget(argv[k]) {
+                k += 2;
+                continue;
+            }
+            put_cword(out, argv[k]);
+            k += 1;
+        }
+        buf_str(out, c" --budget ");
+        buf_int(out, n);
+        buf_byte(out, '\n');
+    }
+}
+
+fn streq_budget(s: *u8) -> bool {
+    unsafe { crate::base::streq(s, c"--budget") }
+}

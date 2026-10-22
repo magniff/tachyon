@@ -1,6 +1,6 @@
 // bench/std: HashMap<u64, u64> churn, 10,000,000 operations on about
 // 100,000 keys (insert the i-th key, remove the one inserted 100,000
-// before). Variants (argv[1]): `default` (SipHash), `same` (tachyon's
+// before). Variants (argv[1]): `default` (SipHash), `same` (vole's
 // 0.19 hash), `fold` (foldhash's): fairhash.rs.
 use std::collections::HashMap;
 use std::hash::BuildHasher;

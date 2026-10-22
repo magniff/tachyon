@@ -4,7 +4,7 @@ Threads, atomics, locks and channels (0.21; the design is
 docs/design/concurrency.md). Safe code cannot make a data race: what
 crosses threads is checked where a thread starts, from the types (Rust's
 `Send` and `Sync`, inferred) and the effects (no `static var` on another
-thread). The errors are `sync.*` (`tachyonc explain sync.global`).
+thread). The errors are `sync.*` (`volec explain sync.global`).
 
 ## Atomics
 

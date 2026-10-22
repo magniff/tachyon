@@ -1,0 +1,409 @@
+// Wrapping a line of more than WIDTH columns (`volec fmt`, 0.13). The
+// line is broken where it overflows, in the brackets around that point
+// (the line itself, or a bracket opened on it and still open there),
+// shallowest first, at the first of these (the last of them before the
+// overflow, so that as much as fits stays on the first line):
+//
+//   1. after a `,` or `;` (the others follow, one level deeper);
+//   2. before an `else`;
+//   3. before a binary operator, loosest first (op_rank);
+//   4. before each `.` of a chain of method calls (0.14: `xs.iter()`,
+//      then `.map(|x| x * 2)` and `.sum()` on lines of their own);
+//   5. after the shallowest `(` or `[` holding the overflow;
+//   6. after the shallowest `{` (and before its `}`).
+//
+// In a `{ }` opened on the line, the contents go on lines of their own
+// instead (a `match`: an arm a line). Before a break, the lines after the
+// line that continue it the same way are joined to it (reflow), to be
+// filled again. A part that is still too long is wrapped in the next
+// pass. A line with a token too long for a line of its own (a long
+// string) is left as it is, and so is a line with a piece of several
+// lines.
+
+use crate::base::IntVec;
+use crate::front::lexer::Tok;
+use crate::tools::fmt::layout::{
+    BRK, IND, LOPEN, RANGED, WIDTH, bar, generic, is_unary, line_end_piece, space,
+};
+use crate::tools::fmt::pieces::{
+    IN_F, LINE_COMMENT, MATCH, P_KIND, P_NL, is_close, is_comment, is_open, kind, piece,
+};
+
+// Per piece of the line being wrapped: the column after it, the
+// innermost bracket opened on the line around it (-1: none), how many.
+static var COL: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var GRP: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var DEP: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The binding of binary operator piece i, loosest first (docs/grammar.md,
+// "Binding powers"): 0 `||`, 1 `&&`, 2 a comparison, 3 `|`, 4 `^`, 5
+// `&`, 6 a shift, 7 `+` `-`, 8 `*` `/` `%`; -1 for any other piece (a
+// prefix `-`, `*` or `&`, the `<` and `>` of type arguments, the bars of
+// a closure).
+fn op_rank(i: i64) -> i64 {
+    let k = kind(i);
+    // (a closure's bars are no operators)
+    if bar(i) != 0 {
+        return -1;
+    }
+    if k == Tok::PipePipe as i64 {
+        return 0;
+    }
+    if k == Tok::AmpAmp as i64 {
+        return if is_unary(i) { -1 } else { 1 };
+    }
+    if k == Tok::EqEq as i64 || k == Tok::BangEq as i64 || k == Tok::LtEq as i64
+        || k == Tok::GtEq as i64
+        || ((k == Tok::Lt as i64 || k == Tok::Gt as i64) && !generic(i)) {
+        return 2;
+    }
+    if k == Tok::Pipe as i64 {
+        return 3;
+    }
+    if k == Tok::Caret as i64 {
+        return 4;
+    }
+    if k == Tok::Amp as i64 {
+        return if is_unary(i) { -1 } else { 5 };
+    }
+    if k == Tok::Shl as i64 || (k == Tok::Shr as i64 && !generic(i)) {
+        return 6;
+    }
+    if k == Tok::Plus as i64 || k == Tok::Minus as i64 {
+        return if is_unary(i) { -1 } else { 7 };
+    }
+    if k == Tok::Star as i64 {
+        return if is_unary(i) { -1 } else { 8 };
+    }
+    if k == Tok::Slash as i64 || k == Tok::Percent as i64 { 8 } else { -1 }
+}
+
+// The break class of a method chain (after the binary operators).
+const CHAIN: i64 = 11;
+
+// Whether piece k is the `.` of a method call (`.map(`, `.collect::<`).
+fn method_dot(k: i64) -> bool {
+    k + 2 < P_KIND.count && kind(k) == Tok::Dot as i64 && kind(k + 1) == Tok::Ident as i64
+        && (kind(k + 2) == Tok::LParen as i64 || kind(k + 2) == Tok::ColonColon as i64)
+}
+
+// Whether piece k can be part of a method chain outside its brackets: a
+// name, a path, a `.`, a `?`, a literal receiver, type arguments.
+fn in_chain(k: i64) -> bool {
+    let kk = kind(k);
+    kk == Tok::Ident as i64 || kk == Tok::Dot as i64 || kk == Tok::ColonColon as i64
+        || kk == Tok::Question as i64
+        || kk == Tok::Int as i64 || kk == Tok::Str as i64 || generic(k)
+}
+
+// The method `.`s of the chain holding method `.` k (0.14: `.iter().map(..)`),
+// pieces i..last of a line, into out; the call brackets are skipped.
+fn chain_dots(k: i64, i: i64, last: i64, out: inout IntVec) {
+    unsafe {
+        var p = k - 1;
+        while p >= i {
+            let kp = kind(p);
+            if (kp == Tok::RParen as i64 || kp == Tok::RBracket as i64) && MATCH.data[p] >= i
+                && MATCH.data[p] < p {
+                p = MATCH.data[p] - 1;
+            } else if in_chain(p) {
+                if method_dot(p) {
+                    out.push(p);
+                }
+                p -= 1;
+            } else {
+                break;
+            }
+        }
+        p = k;
+        while p < last {
+            let kp = kind(p);
+            if (kp == Tok::LParen as i64 || kp == Tok::LBracket as i64) && MATCH.data[p] > p
+                && MATCH.data[p] < last {
+                p = MATCH.data[p] + 1;
+            } else if in_chain(p) {
+                if method_dot(p) {
+                    out.push(p);
+                }
+                p += 1;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+fn has_newline(s: [u8]) -> bool {
+    unsafe {
+        for j in 0..s.len {
+            if s[j] == '\n' {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// Breaks the line of pieces i..e when it is too long; whether it did.
+pub fn wrap_line(i: i64, e: i64) -> bool {
+    unsafe {
+        var last = e;
+        if last - 1 > i && kind(last - 1) == LINE_COMMENT {
+            last -= 1;
+        }
+        COL.count = 0;
+        GRP.count = 0;
+        DEP.count = 0;
+        var col = 4 * IND.data[i];
+        var open = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        // (0.16: type arguments and parameters count as a level, so that a
+        // long `fn f<F: Fn(i64) -> i64 + effects(panic)>(..)` breaks its
+        // parameters first)
+        var angles = 0;
+        for k in i..last {
+            let p = piece(k);
+            if has_newline(p) || 4 * (IND.data[i] + 1) + p.len > WIDTH {
+                return false;
+            }
+            if k > i {
+                col += space(k - 1, k);
+            }
+            col += p.len;
+            COL.push(col);
+            if is_close(kind(k)) && open.count > 0 && open.data[open.count - 1] == MATCH.data[k] {
+                open.pop();
+            }
+            if generic(k) && (kind(k) == Tok::Gt as i64 || kind(k) == Tok::Shr as i64) {
+                angles -= if kind(k) == Tok::Shr as i64 { 2 } else { 1 };
+                if angles < 0 {
+                    angles = 0;
+                }
+            }
+            GRP.push(if open.count > 0 { open.data[open.count - 1] } else { -1 });
+            DEP.push(open.count + angles);
+            if generic(k) && kind(k) == Tok::Lt as i64 {
+                angles += 1;
+            }
+            if is_open(kind(k)) {
+                open.push(k);
+            }
+        }
+        if col <= WIDTH {
+            return false;
+        }
+        var o = i;
+        while COL.data[o - i] <= WIDTH {
+            o += 1;
+        }
+        // (closing brackets and a `;` or `,` after them overflow with what they close)
+        while o > i + 1
+            && (is_close(kind(o)) || kind(o) == Tok::Semi as i64 || kind(o) == Tok::Comma as i64) {
+            o -= 1;
+        }
+        // The best break: the shallowest of a bracket holding the overflow
+        // (opened before it, closed after), by class (a `,` or `;`, an
+        // `else`, a binary operator, loosest first), the last of them
+        // (any before the overflow leaves a first line that fits).
+        var best = -1;
+        var best_dep = 1000;
+        var best_class = 99;
+        var open_at = -1;
+        var open_dep = 1000;
+        var brace_at = -1;
+        var brace_dep = 1000;
+        for k in i + 1..last {
+            // (0.15: no break inside an f-string)
+            if is_open(kind(k)) && k < o && MATCH.data[k] >= o && k + 1 < last
+                && IN_F.data[k + 1] == 0 {
+                if kind(k) == Tok::LBrace as i64 {
+                    if DEP.data[k - i] < brace_dep {
+                        brace_at = k;
+                        brace_dep = DEP.data[k - i];
+                    }
+                } else if DEP.data[k - i] < open_dep {
+                    open_at = k + 1;
+                    open_dep = DEP.data[k - i];
+                }
+            }
+            if k > o || is_comment(kind(k)) || IN_F.data[k] != 0 {
+                continue;
+            }
+            let pk = kind(k - 1);
+            var at = k;
+            var class = 99;
+            // (not between a closure's bars)
+            if (pk == Tok::Comma as i64 && bar(k - 1) != 3) || pk == Tok::Semi as i64 {
+                at = k - 1;
+                class = 0;
+            } else if kind(k) == Tok::Else as i64 {
+                class = 1;
+            } else if op_rank(k) >= 0 {
+                class = 2 + op_rank(k);
+            } else if method_dot(k) {
+                // (a chain of two method calls or more)
+                var dots = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+                chain_dots(k, i, last, &dots);
+                if dots.count >= 2 {
+                    class = CHAIN;
+                }
+            }
+            let g = GRP.data[at - i];
+            let d = DEP.data[at - i];
+            // (class 9 and 10, `+` and `*`, are not breaks: as in 0.13)
+            if (class < 9 || class == CHAIN) && (g < 0 || MATCH.data[g] >= o)
+                && (d < best_dep || (d == best_dep && class <= best_class)) {
+                best = k;
+                best_dep = d;
+                best_class = class;
+            }
+        }
+        // (a `{ }` opened on the line around the break: its contents on lines
+        // of their own first)
+        if brace_at >= 0 && best >= 0 && brace_dep < best_dep {
+            return expand(brace_at, last);
+        }
+        // (a chain: a line for each call, `.iter()` too)
+        if best >= 0 && best_class == CHAIN {
+            var dots = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            chain_dots(best, i, last, &dots);
+            var changed = false;
+            for j in 0..dots.count {
+                if dots.data[j] > i && BRK.data[dots.data[j]] == 0 {
+                    BRK.data[dots.data[j]] = 1;
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+        if best >= 0 {
+            let at = if best_class == 0 { best - 1 } else { best };
+            let g = GRP.data[at - i];
+            if reflow(i, e, best_class, g) {
+                return true;
+            }
+            BRK.data[best] = 1;
+            return true;
+        }
+        // After the shallowest `(` or `[`, else the contents of a `{ }`.
+        if open_at >= 0 {
+            BRK.data[open_at] = 1;
+            return true;
+        }
+        if brace_at >= 0 {
+            return expand(brace_at, last);
+        }
+        false
+    }
+}
+
+// Before breaking line i..e at a break of `class` (0 a comma, 1 an
+// `else`, 2 + its op_rank: a binary operator) in bracket g (-1: the
+// bracket the line is in), the lines after it that continue it the same
+// way are joined to it, to be filled again: lines of that bracket, with
+// no blank line or comment, that start after a `,` (a `(` or `[`'s), or
+// with an `else`, `&&` or `||`, or a binary operator, and close every
+// bracket they open (but the bracket's own `)`). Whether one was joined.
+fn reflow(i: i64, e: i64, class: i64, g: i64) -> bool {
+    unsafe {
+        let group = if g >= 0 { g } else { LOPEN.data[i] };
+        if class == 0 && (group < 0 || kind(group) == Tok::LBrace as i64) {
+            return false;
+        }
+        let n = P_KIND.count;
+        var joined = false;
+        var j = e;
+        while j < n && P_NL.data[j] == 1 && LOPEN.data[j] == group && !is_comment(kind(j))
+            && !is_comment(kind(j - 1)) {
+            let k = kind(j);
+            let starts = if class == 0 { kind(j - 1) == Tok::Comma as i64 }
+                else if class == 1 { k == Tok::Else as i64 }
+                else { op_rank(j) == class - 2 };
+            if !starts {
+                break;
+            }
+            let next = line_end_piece(j);
+            var depth = 0;
+            var closes = false;
+            var ok = true;
+            for p in j..next {
+                if is_comment(kind(p)) || has_newline(piece(p)) {
+                    ok = false;
+                } else if group >= 0 && p == MATCH.data[group] {
+                    closes = true;
+                } else if !closes && is_open(kind(p)) {
+                    depth += 1;
+                } else if !closes && is_close(kind(p)) {
+                    depth -= 1;
+                    if depth < 0 {
+                        ok = false;
+                    }
+                }
+            }
+            if !ok || (depth != 0 && !closes) {
+                break;
+            }
+            BRK.data[j] = 0;
+            joined = true;
+            if closes {
+                break;
+            }
+            j = next;
+        }
+        joined
+    }
+}
+
+// Breaks after `{` piece g and before its `}` when it is on the line
+// (which ends before `last`), and, for a `match`, after each arm's `,`;
+// whether a break was added.
+fn expand(g: i64, last: i64) -> bool {
+    unsafe {
+        let c = MATCH.data[g];
+        if c == g + 1 {
+            return false;
+        }
+        var changed = BRK.data[g + 1] == 0;
+        BRK.data[g + 1] = 1;
+        // (its `}` too when on a later line, but not one copied as it is)
+        if BRK.data[c] == 0 && (c < last || RANGED.data[c] != 0) {
+            BRK.data[c] = 1;
+            changed = true;
+        }
+        if match_body(g) {
+            var p = g + 1;
+            while p < c && p < last {
+                if is_open(kind(p)) {
+                    p = MATCH.data[p];
+                } else if kind(p) == Tok::Comma as i64 && p + 1 < c && !is_comment(kind(p + 1))
+                    && BRK.data[p + 1] == 0 {
+                    BRK.data[p + 1] = 1;
+                }
+                p += 1;
+            }
+        }
+        changed
+    }
+}
+
+// Whether `{` piece g is a `match`'s (its arms).
+fn match_body(g: i64) -> bool {
+    unsafe {
+        var j = g - 1;
+        while j >= 0 {
+            let k = kind(j);
+            if k == Tok::Match as i64 {
+                return true;
+            }
+            if is_close(k) {
+                j = MATCH.data[j];
+            }
+            else if is_open(k) || k == Tok::Semi as i64 || k == Tok::Comma as i64
+                || k == Tok::FatArrow as i64
+                || k == Tok::Eq as i64 {
+                return false;
+            }
+            j -= 1;
+        }
+        false
+    }
+}

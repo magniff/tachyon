@@ -1,18 +1,18 @@
 #!/bin/sh
 # Layout conformance of `import`: for every struct and union imported from
-# the given C headers, C (compiled by cc) and tachyon must agree on its
+# the given C headers, C (compiled by cc) and vole must agree on its
 # size, its alignment and the offset of every field.
 #
 # usage: tests/cimport/layout.sh [-c COMPILER] [-t TARGET] [-I DIR] HEADER...
 #
-#   -c COMPILER   the tachyonc to test (default: target/tachyonc)
+#   -c COMPILER   the volec to test (default: target/volec)
 #   -t TARGET     the target (default: the host)
 #   -I DIR        an include directory (for both compilers)
 #
 # Prints "layout: N records, M fields agree" or the differences.
 set -eu
 
-compiler=target/tachyonc
+compiler=target/volec
 target=
 incs=
 while [ $# -gt 0 ]; do
@@ -33,18 +33,18 @@ case $target in
     x86_64-linux|aarch64-linux) tflag="--target $target" ;;
 esac
 
-dir=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-layout.XXXXXX")
+dir=$(mktemp -d "${TMPDIR:-/tmp}/vole-layout.XXXXXX")
 trap 'rm -rf "$dir"' EXIT
 
 {
     for h in "$@"; do echo "import \"$h\" as c;"; done
     echo 'import "stdio.h" as c;'
-} > "$dir/imp.tach"
+} > "$dir/imp.vl"
 # shellcheck disable=SC2086
-"$compiler" $tflag $incs --emit-imports "$dir/imp.tach" -o "$dir/imp.out"
+"$compiler" $tflag $incs --emit-imports "$dir/imp.vl" -o "$dir/imp.out"
 
 # The records with a C spelling, and their fields (not padding).
-awk -v cfile="$dir/check.c" -v tfile="$dir/check.tach" -v headers="$*" '
+awk -v cfile="$dir/check.c" -v tfile="$dir/check.vl" -v headers="$*" '
 BEGIN {
     n = split(headers, hs, " ")
     for (i = 1; i <= n; i++) print "#include <" hs[i] ">" > cfile
@@ -92,7 +92,7 @@ END {
 # shellcheck disable=SC2086
 cc $arch $incs -o "$dir/c" "$dir/check.c"
 # shellcheck disable=SC2086
-"$compiler" $tflag $incs --deny-warnings "$dir/check.tach" -o "$dir/t.o"
+"$compiler" $tflag $incs --deny-warnings "$dir/check.vl" -o "$dir/t.o"
 # shellcheck disable=SC2086
 cc $arch -o "$dir/t" "$dir/t.o" -lm
 "$dir/c" > "$dir/c.out"
@@ -101,7 +101,7 @@ read -r records fields < "$dir/counts"
 if cmp -s "$dir/c.out" "$dir/t.out"; then
     echo "layout: $records records, $fields fields agree"
 else
-    echo "layout: differences (name size align offsets...; < C, > tachyon):"
+    echo "layout: differences (name size align offsets...; < C, > vole):"
     diff "$dir/c.out" "$dir/t.out" | head -40
     exit 1
 fi

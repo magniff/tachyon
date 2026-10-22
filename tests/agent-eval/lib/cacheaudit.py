@@ -31,7 +31,7 @@ already cached.
 Growth is attributed to what was appended since the previous request: the
 previous assistant message (thinking, by Claude Code's thinking_tokens
 estimate; text and tool calls) and each tool result, by the kind of the call
-that produced it (tachyonc guide, tachyonc query, other tachyonc commands,
+that produced it (volec guide, volec query, other volec commands,
 builds and runs, shell reads, other shell, Read, Edit/Write, Grep/Glob), hook
 text (a PreToolUse block's stderr shown in the tool result; additionalContext
 and Stop reasons from hook-output.jsonl when the run has one, estimated from
@@ -60,11 +60,11 @@ except Exception:  # (standalone use) a minimal classifier
     def classify_call(tool, args):
         if tool == "Bash":
             cmd = (args or {}).get("command", "")
-            if "tachyonc" in cmd:
+            if "volec" in cmd:
                 for sub in ("guide", "query", "edit", "refactor", "check", "fix"):
-                    if "tachyonc " + sub in cmd:
-                        return ["tachyonc:" + sub]
-                return ["tachyonc:build"]
+                    if "volec " + sub in cmd:
+                        return ["volec:" + sub]
+                return ["volec:build"]
             return ["shell:?"]
         return ["file:" + tool]
 
@@ -80,7 +80,7 @@ SLACK = 64           # tokens of read shortfall still counted as a whole read
 BIG_RESULT = 40000   # chars: a tool result this long is named as a break cause
 WRITE_5M, WRITE_1H, READ = 1.25, 2.0, 0.1
 
-SOURCES = ["assistant", "thinking", "guide", "query", "tachyonc-other",
+SOURCES = ["assistant", "thinking", "guide", "query", "volec-other",
            "build-run", "shell-read", "shell-other", "file-read", "file-edit",
            "file-search", "hook-block", "hook-context", "hook-stop",
            "denial", "task-notify", "unattributed"]
@@ -114,13 +114,13 @@ def call_source(name, inp):
     if name != "Bash":
         return "shell-other"
     kinds = classify_call(name, inp)
-    if "tachyonc:guide" in kinds or "tachyonc:explain" in kinds:
+    if "volec:guide" in kinds or "volec:explain" in kinds:
         return "guide"
-    if "tachyonc:query" in kinds:
+    if "volec:query" in kinds:
         return "query"
-    if any(k.startswith("tachyonc:") and k != "tachyonc:build" for k in kinds):
-        return "tachyonc-other"
-    if any(k in ("tachyonc:build", "run", "rustc", "compiler:build", "suite",
+    if any(k.startswith("volec:") and k != "volec:build" for k in kinds):
+        return "volec-other"
+    if any(k in ("volec:build", "run", "rustc", "compiler:build", "suite",
                  "compiler:gate") for k in kinds):
         return "build-run"
     if any(k.startswith("shell:") and k[6:] in ("cat", "head", "tail", "sed", "grep",
@@ -289,7 +289,7 @@ def analyze_run(rundir):
                 if not hooks and checks and name in ("Edit", "Write", "MultiEdit"):
                     # 0.16: check-hook.jsonl has counts, not text; match in order
                     path = (inp.get("file_path") or "")
-                    if path.endswith(".tach") and checks:
+                    if path.endswith(".vl") and checks:
                         c = checks[0]
                         if c.get("tool") == name and c.get("root", "x").split("/")[-1] \
                                 in path:
@@ -449,7 +449,7 @@ def aggregate(runs):
 
 
 GROUPS = [("initial", ["initial"]), ("assist", ["assistant", "thinking"]),
-          ("guide", ["guide"]), ("query", ["query", "tachyonc-other"]),
+          ("guide", ["guide"]), ("query", ["query", "volec-other"]),
           ("build", ["build-run"]), ("reads", ["file-read", "shell-read", "file-search"]),
           ("edits", ["file-edit"]), ("hooks", ["hook-block", "hook-context", "hook-stop"]),
           ("other", ["shell-other", "denial", "task-notify", "unattributed"]),
@@ -548,18 +548,18 @@ def selftest():
         {"type": "system", "subtype": "init"},
         asst("m1", "2026-01-01T00:00:00Z", 2, 20000, 5000,
              [{"type": "tool_use", "id": "t1", "name": "Bash",
-               "input": {"command": "tachyonc guide std"}}]),
+               "input": {"command": "volec guide std"}}]),
         tres("t1", guide),
         # growth: about 2000 tokens of guide plus the call
         asst("m2", "2026-01-01T00:00:10Z", 2, 2100, 25000,
              [{"type": "tool_use", "id": "t2", "name": "Bash",
-               "input": {"command": "tachyonc query show main"}}]),
+               "input": {"command": "volec query show main"}}]),
         # a subagent line: ignored
         dict(asst("s1", "2026-01-01T00:00:11Z", 2, 9999, 0, []), parent_tool_use_id="t2"),
         tres("t2", query),
         asst("m3", "2026-01-01T00:00:20Z", 2, 1100, 27100,
              [{"type": "tool_use", "id": "t3", "name": "Read",
-               "input": {"file_path": "main.tach"}}]),
+               "input": {"file_path": "main.vl"}}]),
         tres("t3", "r" * 400),
         # same id again: counted once
         asst("m3", "2026-01-01T00:00:21Z", 2, 1100, 27100, [{"type": "text", "text": "ok"}]),

@@ -2,7 +2,7 @@
 # Checks the compiler's object files (0.7) against the system assembler:
 # every program of the corpus (tests/run, examples, bench, the compiler
 # itself; 0.19: the intrinsics' programs tests/arch/gen.sh writes) is
-# compiled at -O0 and -O2 both to an object (tachyonc -c) and
+# compiled at -O0 and -O2 both to an object (volec -c) and
 # to assembly, which `cc -c` assembles; both objects are linked by cc into
 # executables, and the two executables must hold the same code and data:
 # their disassembly (alignment padding aside: the system assemblers pick
@@ -26,11 +26,11 @@
 #
 # usage: tests/objcheck.sh [-c COMPILER] [-t TARGET] [-j JOBS] [FILTER]
 #
-#   -c COMPILER   the tachyonc to check (default: target/tachyonc)
+#   -c COMPILER   the volec to check (default: target/volec)
 #   -t TARGET     aarch64-macos, aarch64-linux, x86_64-linux or
 #                 x86_64-macos (default: the host)
 #   -j JOBS       programs checked at once (default: the number of CPUs,
-#                 or the slots of $TACHYON_JOBSERVER, see tests/run.sh)
+#                 or the slots of $VOLE_JOBSERVER, see tests/run.sh)
 #   FILTER        only the programs whose path contains FILTER
 
 set -u
@@ -38,7 +38,7 @@ LC_ALL=C
 export LC_ALL
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 TARGET=""
 JOBS=""
 FILTER=""
@@ -68,7 +68,7 @@ mkdir -p "$WORK"
 
 # The C compiler, once more when it crashed (a signal, or gcc's "internal
 # compiler error"): an emulated toolchain (x86-64 Linux under Rosetta)
-# now and then does, and a crash of cc is not tachyon's. Its output (and
+# now and then does, and a crash of cc is not vole's. Its output (and
 # the crash's, if any) on stdout.
 cc_run() {
     cr_out=$("$CC" "$@" 2>&1)
@@ -179,9 +179,9 @@ check() { # <file> <level> <dir> [-g]
     # (--check-unsafe needs the IR: -O1 for -O0, as tests/run.sh does.)
     case "$o:$flags" in 0:*--check-unsafe*) o=1 ;; esac
     # shellcheck disable=SC2086
-    "$COMPILER" --target "$TARGET" "-O$o" $g $flags -c "$f" -o "$d/ours.o" >"$d/out" 2>&1 || { echo "FAIL $f -O$o $g: tachyonc -c: $(head -c 300 "$d/out")"; return; }
+    "$COMPILER" --target "$TARGET" "-O$o" $g $flags -c "$f" -o "$d/ours.o" >"$d/out" 2>&1 || { echo "FAIL $f -O$o $g: volec -c: $(head -c 300 "$d/out")"; return; }
     # shellcheck disable=SC2086
-    "$COMPILER" --target "$TARGET" "-O$o" $g $flags -S "$f" -o "$d/prog.s" >"$d/out" 2>&1 || { echo "FAIL $f -O$o $g: tachyonc -S"; return; }
+    "$COMPILER" --target "$TARGET" "-O$o" $g $flags -S "$f" -o "$d/prog.s" >"$d/out" 2>&1 || { echo "FAIL $f -O$o $g: volec -S"; return; }
     # shellcheck disable=SC2086
     cc_run $LINK_FLAGS -c "$d/prog.s" -o "$d/cc.o" >"$d/out" 2>&1 || { echo "FAIL $f -O$o: cc -c"; return; }
     # shellcheck disable=SC2086
@@ -225,7 +225,7 @@ check() { # <file> <level> <dir> [-g]
 cd "$ROOT" || exit 1
 list="$WORK/list"
 : >"$list"
-for f in tests/run/*.tach tests/run/*/main.tach examples/*/main.tach examples/*/*/main.tach bench/*.tach compiler/src/main.tach; do
+for f in tests/run/*.vl tests/run/*/main.vl examples/*/main.vl examples/*/*/main.vl bench/*.vl compiler/src/main.vl; do
     [ -f "$f" ] || continue
     case "$f" in examples/tools/*) continue ;; esac   # (their own runner)
     case "$f" in *"$FILTER"*) ;; *) continue ;; esac
@@ -258,7 +258,7 @@ case "$TARGET" in
     x86_64-*) arch_prefix=x86 ;;
 esac
 if sh "$ROOT/tests/arch/gen.sh" -c "$COMPILER" -o "$WORK/arch-gen" -r 20 >"$WORK/arch-gen.log" 2>&1; then
-    for f in "$WORK"/arch-gen/arch_"$arch_prefix"_*.tach "$WORK"/arch-gen/arch_portable_*.tach; do
+    for f in "$WORK"/arch-gen/arch_"$arch_prefix"_*.vl "$WORK"/arch-gen/arch_portable_*.vl; do
         [ -f "$f" ] || continue
         case "arch-gen/$(basename "$f")" in *"$FILTER"*) echo "$f" >>"$list" ;; esac
     done
@@ -266,10 +266,10 @@ else
     echo "FAIL tests/arch/gen.sh: $(tail -3 "$WORK/arch-gen.log")"
     gen_failed=1
 fi
-# The slots: JOBS of them, or (0.11) the ones $TACHYON_JOBSERVER shares
+# The slots: JOBS of them, or (0.11) the ones $VOLE_JOBSERVER shares
 # between the runners of bootstrap/gate.sh (see tests/run.sh).
-if [ -z "$JOBS" ] && [ -n "${TACHYON_JOBSERVER:-}" ] && [ -p "$TACHYON_JOBSERVER" ]; then
-    exec 3<>"$TACHYON_JOBSERVER"
+if [ -z "$JOBS" ] && [ -n "${VOLE_JOBSERVER:-}" ] && [ -p "$VOLE_JOBSERVER" ]; then
+    exec 3<>"$VOLE_JOBSERVER"
 else
     [ -n "$JOBS" ] || JOBS=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
     rm -f "$WORK/slots"

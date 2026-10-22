@@ -1,0 +1,728 @@
+// Generics (0.5): monomorphization, checked at instantiation.
+//
+// A generic function, struct or enum is a template: it is never checked
+// as it is written. Each use with new type arguments makes an instance:
+// a struct or enum of its own (fields resolved with the parameters bound
+// to the arguments), or a function of its own whose AST is a copy of the
+// template's, checked with the parameters bound. The middle end and the
+// code generators only ever see instances. Instances are made in the
+// order the checker meets them, so their order and names are
+// deterministic.
+//
+// Type arguments are written (`Vec<i64>`, `max::<i64>(...)`,
+// `Vec::<u8>::new()`, `Pair::<i64> { ... }`) or inferred: from the types
+// of the arguments (or fields), and from the type the context expects.
+//
+// Symbols: an instance's symbol is its template's, then `.G` and its type
+// arguments in a self-delimiting code (mangle_type): `max.Gl` is
+// max::<i64>, `Vec.Gl.push` is the method push of Vec<i64>.
+//
+// Here: the type parameters in scope, names and symbols of instances, and
+// the instances of structs and enums; in instantiate.vl: inference and
+// the instances of functions.
+
+pub mod instantiate;
+
+use crate::base::{
+    IntVec, SYMS, alloc_zeroed, buf_byte, buf_bytes, buf_int, buf_new, buf_slice, buf_str, free,
+    intern, intern_c,
+};
+use crate::base::diag::{err_begin, err_end, err_int, err_str, err_sym, error_at};
+use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::ast::NodeKind::{Float, Fn, Int, Unary};
+use crate::front::check::{SELF_TYPE, mismatch_error};
+use crate::front::check::args::{check_default_arg, is_default_arg};
+use crate::front::check::check_mode::{check_expr, coerce_ref};
+use crate::front::check::collect::{
+    collect_enum_variants, collect_struct_fields, new_enum, new_struct,
+};
+use crate::front::check::resolve::{enum_cycle_error, resolve_type, struct_cycle_error};
+use crate::front::check::widen::try_widen;
+use crate::front::lexer::{SUF_NONE, Tok};
+use crate::front::modules::{CUR_MOD, item_symbol, module_of};
+use crate::front::traits::check_bounds;
+use crate::front::types::{
+    ENUMS, ENUM_COUNT, STRUCTS, STRUCT_COUNT, SYM_ENUM, SYM_STRUCT, TLISTS, TSCRATCH, TYPES, TY_I8,
+    TY_NEVER, TyKind, buf_type, enum_type, struct_type, type_elem,
+};
+use crate::middle::lower::ssa::HMap;
+
+// What other modules use of the parts.
+
+// The type parameters in scope (of the instance being made or checked):
+// names and types from TP_BASE on.
+pub static var TP_NAMES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var TP_TYPES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var TP_BASE: i64 = 0;
+// The instance whose body is being checked (-1: none).
+pub static var CUR_INST: i64 = -1;
+// Instances whose bodies are still to be checked.
+pub static var INST_QUEUE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Arguments already synthesized to infer type arguments (node + 1 -> 1).
+static var SYNTHED: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// The type the context expects of node HINT_NODE (see check_expr).
+pub static var HINT_NODE: i64 = 0;
+pub static var HINT_TY: i64 = 0;
+
+// The deepest nesting of instantiations in instantiations, and the largest
+// type argument (see type_size); in 0.14 from 64 instances and 12 levels
+// of type: iterator chains nest both a level per adapter.
+const MAX_INST_DEPTH: i64 = 2000;
+const MAX_TYPE_SIZE: i64 = 4096;
+static var TYPE_SIZES: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// Binds the parameters `params` (a Generics node) to the `count` types at
+// TLISTS[targs...]; returns what env_leave restores.
+pub fn env_enter(params: i64, targs: i64, count: i64) -> i64 {
+    let saved = TP_BASE;
+    TP_BASE = TP_NAMES.count;
+    for i in 0..count {
+        unsafe {
+            TP_NAMES.push(NODES[child(params, i)].a);
+            TP_TYPES.push(TLISTS.data[targs + i]);
+        }
+    }
+    saved
+}
+
+pub fn env_leave(saved: i64) {
+    TP_NAMES.count = TP_BASE;
+    TP_TYPES.count = TP_BASE;
+    TP_BASE = saved;
+}
+
+// The type a type parameter in scope stands for, or 0.
+pub fn env_lookup(name: i64) -> i64 {
+    unsafe {
+        for i in TP_BASE..TP_NAMES.count {
+            if TP_NAMES.data[i] == name {
+                return TP_TYPES.data[i];
+            }
+        }
+        0
+    }
+}
+
+pub fn hint_for(n: i64) -> i64 {
+    if HINT_NODE == n { HINT_TY } else { 0 }
+}
+
+pub fn mark_synthed(n: i64) {
+    SYNTHED.put(n + 1, 1);
+}
+
+// Checks argument (or field value) `arg` against `ty`; it may have been
+// synthesized already, to infer type arguments.
+pub fn check_arg(arg: i64, ty: i64) {
+    // (0.15: a default, checked in its function's module)
+    if is_default_arg(arg) {
+        check_default_arg(arg, ty);
+        return;
+    }
+    if SYNTHED.get(arg + 1) == 0 {
+        check_expr(arg, ty);
+        return;
+    }
+    let actual = unsafe { NODES[arg].ty };
+    if actual != ty && actual != TY_NEVER {
+        // (0.15: a narrower integer)
+        if try_widen(arg, actual, ty) {
+            return;
+        }
+        // (0.17: a reference where a pointer or a slice is expected)
+        if coerce_ref(arg, actual, ty) {
+            unsafe { NODES[arg].ty = ty; }
+            return;
+        }
+        mismatch_error(arg, ty, actual);
+    }
+}
+
+// An integer or float literal without a suffix (maybe negated): its type
+// comes from where it goes, so it is looked at last.
+fn is_untyped_literal_expr(n: i64) -> bool {
+    unsafe {
+        let kind = NODES[n].kind;
+        if kind == Unary && NODES[n].op == Tok::Minus {
+            return is_untyped_literal_expr(NODES[n].b);
+        }
+        (kind == Int || kind == Float) && NODES[n].b == SUF_NONE
+    }
+}
+
+// ---- Names and symbols ----
+
+// `name<A, B>` for messages.
+fn generic_display(name: i64, targs: i64, count: i64) -> i64 {
+    unsafe {
+        let out = buf_new();
+        buf_bytes(out, SYMS[name].text);
+        // (0.16: `Buf`, every argument its default)
+        if count == 0 {
+            return intern(buf_slice(out));
+        }
+        buf_byte(out, '<');
+        for i in 0..count {
+            if i > 0 {
+                buf_str(out, c", ");
+            }
+            buf_type(out, TLISTS.data[targs + i]);
+        }
+        buf_byte(out, '>');
+        intern(buf_slice(out))
+    }
+}
+
+// `base.G<code of each argument>` (0.16: base when there is none, every
+// argument of a type its default).
+fn generic_symbol(base: i64, targs: i64, count: i64) -> i64 {
+    unsafe {
+        if count == 0 {
+            return base;
+        }
+        let out = buf_new();
+        buf_bytes(out, SYMS[base].text);
+        buf_str(out, c".G");
+        for i in 0..count {
+            mangle_type(out, TLISTS.data[targs + i]);
+        }
+        intern(buf_slice(out))
+    }
+}
+
+// A code for type t, made of letters, digits, `_` and `.`, from which t
+// can be read back: primitives by a letter (as in C++'s mangling), then
+// P<t> pointer, S<t> slice, A<n>_<t> array, T<n>_<ts> tuple, F<n>_<ts><t>
+// (C<n>_... for extern "C") function, and N<length><symbol> for a struct
+// or an enum.
+pub fn mangle_type(out: i64, t: i64) {
+    unsafe {
+        let kind = TYPES[t].kind;
+        if kind == TyKind::Prim {
+            let codes: [u8; 13] = ['a', 's', 'i', 'l', 'h', 't', 'j', 'm', 'f', 'd', 'b', 'v', 'z'];
+            buf_byte(out, codes[t - TY_I8]);
+            return;
+        }
+        match kind {
+            TyKind::Ptr => {
+                // (0.17: R<t> `&T`, M<t> `&mut T`)
+                buf_byte(out,
+                    if TYPES[t].b == 1 { 'R' } else if TYPES[t].b == 2 { 'M' } else { 'P' });
+                mangle_type(out, TYPES[t].a);
+            }
+            TyKind::Slice => {
+                // (0.17: W<t> `&mut [T]`)
+                buf_byte(out, if TYPES[t].b != 0 { 'W' } else { 'S' });
+                mangle_type(out, TYPES[t].a);
+            }
+            TyKind::Array => {
+                buf_byte(out, 'A');
+                buf_int(out, TYPES[t].b);
+                buf_byte(out, '_');
+                mangle_type(out, TYPES[t].a);
+            }
+            TyKind::Tuple => {
+                buf_byte(out, 'T');
+                buf_int(out, TYPES[t].count);
+                buf_byte(out, '_');
+                for i in 0..TYPES[t].count {
+                    mangle_type(out, type_elem(t, i));
+                }
+            }
+            TyKind::Fn => {
+                buf_byte(out, if TYPES[t].b != 0 { 'C' } else { 'F' });
+                buf_int(out, TYPES[t].count);
+                buf_byte(out, '_');
+                for i in 0..TYPES[t].count {
+                    mangle_type(out, type_elem(t, i));
+                }
+                mangle_type(out, TYPES[t].a);
+            }
+            TyKind::Struct | TyKind::Enum => {
+                let sym = if kind == TyKind::Struct { STRUCTS[TYPES[t].a].sym }
+                    else { ENUMS[TYPES[t].a].sym };
+                buf_byte(out, 'N');
+                buf_int(out, SYMS[sym].text.len);
+                buf_bytes(out, SYMS[sym].text);
+            }
+            // (0.18: a distinct type, by its alias's symbol and its arguments)
+            TyKind::Distinct => {
+                let alias = TYPES[t].b;
+                let sym = item_symbol(module_of(alias), NODES[alias].a);
+                buf_byte(out, 'D');
+                buf_int(out, SYMS[sym].text.len);
+                buf_bytes(out, SYMS[sym].text);
+                buf_int(out, TYPES[t].count);
+                buf_byte(out, '_');
+                for i in 0..TYPES[t].count {
+                    mangle_type(out, type_elem(t, i));
+                }
+            }
+            _ => buf_byte(out, 'x'),
+        }
+    }
+}
+
+// The size of type t as a tree (its nodes, a type argument counted each
+// time it appears), up to MAX_TYPE_SIZE + 1, memoized: instantiations whose
+// type arguments grow without end are stopped by it, whether they grow
+// deeper (`Option<Option<..>>`) or wider (`(x, x)`), while a chain of a
+// few hundred iterator adapters, deep but thin, is not (0.14).
+fn type_tree_size(t: i64) -> i64 {
+    unsafe {
+        let known = TYPE_SIZES.get(t + 1);
+        if known != 0 {
+            return known - 1;
+        }
+        let kind = TYPES[t].kind;
+        var size = 1;
+        if kind == TyKind::Ptr || kind == TyKind::Slice || kind == TyKind::Array {
+            size += type_tree_size(TYPES[t].a);
+        } else if kind == TyKind::Distinct {
+            size += type_tree_size(TYPES[t].a);
+            for i in 0..TYPES[t].count {
+                size += type_tree_size(type_elem(t, i));
+            }
+        } else if kind == TyKind::Tuple || kind == TyKind::Fn {
+            for i in 0..TYPES[t].count {
+                size += type_tree_size(type_elem(t, i));
+            }
+            if kind == TyKind::Fn {
+                size += type_tree_size(TYPES[t].a);
+            }
+        } else if kind == TyKind::Struct && STRUCTS[TYPES[t].a].tmpl != 0 {
+            let s = TYPES[t].a;
+            for i in 0..STRUCTS[s].targ_count {
+                size += type_tree_size(TLISTS.data[STRUCTS[s].targs + i]);
+            }
+        } else if kind == TyKind::Enum && ENUMS[TYPES[t].a].tmpl != 0 {
+            let e = TYPES[t].a;
+            for i in 0..ENUMS[e].targ_count {
+                size += type_tree_size(TLISTS.data[ENUMS[e].targs + i]);
+            }
+        }
+        if size > MAX_TYPE_SIZE {
+            size = MAX_TYPE_SIZE + 1;
+        }
+        TYPE_SIZES.put(t + 1, size + 1);
+        size
+    }
+}
+
+// The type arguments TSCRATCH[mark..] (popped) as a new TLISTS range.
+fn take_targs(mark: i64) -> i64 {
+    let targs = TLISTS.count;
+    for i in mark..TSCRATCH.count {
+        unsafe { TLISTS.push(TSCRATCH.data[i]); }
+    }
+    TSCRATCH.count = mark;
+    targs
+}
+
+fn same_targs(targs: i64, count: i64, mark: i64) -> bool {
+    if TSCRATCH.count - mark != count {
+        return false;
+    }
+    for i in 0..count {
+        if unsafe { TLISTS.data[targs + i] != TSCRATCH.data[mark + i] } {
+            return false;
+        }
+    }
+    true
+}
+
+// (0.16) Instances by template and type arguments, for fn_instance,
+// struct_instance and enum_instance, which scanned every function, struct
+// or enum at each use of a generic one: open addressing, `ids[slot]` = id +
+// 1 (0: empty), `hashes[slot]` its key's hash. A lookup returns the lowest
+// id that matches, as the scan did.
+pub struct InstIndex { ids: *i64, hashes: *i64, size: i64, used: i64 }
+
+pub static var FN_INSTANCES: InstIndex =
+    InstIndex { ids: 0 as *i64, hashes: 0 as *i64, size: 0, used: 0 };
+static var STRUCT_INSTANCES: InstIndex =
+    InstIndex { ids: 0 as *i64, hashes: 0 as *i64, size: 0, used: 0 };
+static var ENUM_INSTANCES: InstIndex =
+    InstIndex { ids: 0 as *i64, hashes: 0 as *i64, size: 0, used: 0 };
+
+// The hash of template `tmpl` with the type arguments TSCRATCH[mark..].
+pub fn inst_hash(tmpl: i64, mark: i64) -> i64 {
+    unsafe {
+        var h: u64 = 14695981039346656037;
+        h = (h ^ tmpl as u64) * 1099511628211;
+        for i in mark..TSCRATCH.count {
+            h = (h ^ TSCRATCH.data[i] as u64) * 1099511628211;
+        }
+        ((h ^ (h >> 29)) & 0x7fffffffffffffff) as i64
+    }
+}
+
+// The first slot of hash h's chain, or -1 (nothing indexed).
+pub fn inst_first(ix: InstIndex, h: i64) -> i64 {
+    unsafe {
+        if ix.size == 0 {
+            return -1;
+        }
+        var slot = h & (ix.size - 1);
+        while ix.ids[slot] != 0 && ix.hashes[slot] != h {
+            slot = (slot + 1) & (ix.size - 1);
+        }
+        if ix.ids[slot] == 0 { -1 } else { slot }
+    }
+}
+
+// The next slot of hash h's chain after `slot`, or -1.
+pub fn inst_next(ix: InstIndex, h: i64, slot: i64) -> i64 {
+    unsafe {
+        var s = (slot + 1) & (ix.size - 1);
+        while ix.ids[s] != 0 && ix.hashes[s] != h {
+            s = (s + 1) & (ix.size - 1);
+        }
+        if ix.ids[s] == 0 { -1 } else { s }
+    }
+}
+
+pub fn inst_id(ix: InstIndex, slot: i64) -> i64 {
+    unsafe { ix.ids[slot] - 1 }
+}
+
+pub fn inst_add(ix: inout InstIndex, id: i64, h: i64) {
+    unsafe {
+        if (ix.used + 1) * 2 > ix.size {
+            let old_ids = ix.ids;
+            let old_hashes = ix.hashes;
+            let old_size = ix.size;
+            let size = if old_size == 0 { 256 } else { old_size * 2 };
+            ix.ids = alloc_zeroed(size * 8) as *i64;
+            ix.hashes = alloc_zeroed(size * 8) as *i64;
+            ix.size = size;
+            ix.used = 0;
+            for s in 0..old_size {
+                if old_ids[s] != 0 {
+                    inst_put(&ix, old_ids[s] - 1, old_hashes[s]);
+                }
+            }
+            free(old_ids as *u8);
+            free(old_hashes as *u8);
+        }
+        inst_put(&ix, id, h);
+    }
+}
+
+fn inst_put(ix: inout InstIndex, id: i64, h: i64) {
+    unsafe {
+        var slot = h & (ix.size - 1);
+        while ix.ids[slot] != 0 {
+            slot = (slot + 1) & (ix.size - 1);
+        }
+        ix.ids[slot] = id + 1;
+        ix.hashes[slot] = h;
+        ix.used += 1;
+    }
+}
+
+fn check_targ_depth(mark: i64, pos: i64) {
+    unsafe {
+        for i in mark..TSCRATCH.count {
+            if type_tree_size(TSCRATCH.data[i]) > MAX_TYPE_SIZE {
+                error_at(pos, c"type arguments nested too deeply (does a generic type instantiate itself with ever larger arguments?)");
+            }
+        }
+    }
+}
+
+pub fn targ_count_error(pos: i64, what: *u8, name: i64, expected: i64, got: i64) -> ! {
+    unsafe {
+        err_begin(pos);
+        err_str(what);
+        err_str(c" '");
+        err_sym(name);
+        err_str(c"' takes ");
+        err_int(expected);
+        err_str(if expected == 1 { c" type argument" } else { c" type arguments" });
+        err_str(c", got ");
+        err_int(got);
+        err_end()
+    }
+}
+
+// ---- Default type parameters (0.16) ----
+
+// The default of type parameter k of generic struct or enum `node`
+// (declared in `module`), `A: Allocator = Gpa`: its type, resolved where
+// the item is declared with the parameters before it bound to the k types
+// on top of TSCRATCH (left there); 0 when it has none.
+pub fn param_default(node: i64, module: i64, k: i64) -> i64 {
+    unsafe {
+        let params = NODES[node].g;
+        let def = NODES[child(params, k)].b;
+        if def == 0 {
+            return 0;
+        }
+        let saved = TP_BASE;
+        TP_BASE = TP_NAMES.count;
+        for i in 0..k {
+            TP_NAMES.push(NODES[child(params, i)].a);
+            TP_TYPES.push(TSCRATCH.data[TSCRATCH.count - k + i]);
+        }
+        let saved_mod = CUR_MOD;
+        let saved_self = SELF_TYPE;
+        CUR_MOD = module;
+        SELF_TYPE = 0;
+        let t = resolve_type(def);
+        CUR_MOD = saved_mod;
+        SELF_TYPE = saved_self;
+        env_leave(saved);
+        t
+    }
+}
+
+// The type arguments TSCRATCH[mark..] of an instance of `node` completed
+// with the defaults of the parameters left out (`Vec<i64>` is `Vec<i64,
+// Gpa>`), as far as they have defaults.
+fn fill_defaults(node: i64, module: i64, mark: i64) {
+    unsafe {
+        let params = NODES[node].g;
+        var k = TSCRATCH.count - mark;
+        while k < NODES[params].count {
+            let t = param_default(node, module, k);
+            if t == 0 {
+                return;
+            }
+            TSCRATCH.push(t);
+            k += 1;
+        }
+    }
+}
+
+// How many of the type arguments TLISTS[targs..targs+count] of an instance
+// of `node` its name and symbol show: the trailing ones equal to their
+// parameters' defaults are left out, so `Vec<i64, Gpa>` is `Vec<i64>` in
+// messages and `Vec.Gl` in symbols, as before defaults existed.
+pub fn shown_targs(node: i64, module: i64, targs: i64, count: i64) -> i64 {
+    unsafe {
+        let params = NODES[node].g;
+        var shown = count;
+        while shown > 0 && NODES[child(params, shown - 1)].b != 0 {
+            let mark = TSCRATCH.count;
+            for i in 0..shown - 1 {
+                TSCRATCH.push(TLISTS.data[targs + i]);
+            }
+            let t = param_default(node, module, shown - 1);
+            TSCRATCH.count = mark;
+            if t != TLISTS.data[targs + shown - 1] {
+                break;
+            }
+            shown -= 1;
+        }
+        shown
+    }
+}
+
+// How many type arguments template `tpl` (encoded as template_of_key's)
+// needs at least: its parameters without defaults.
+pub fn required_targs(tpl: i64) -> i64 {
+    unsafe {
+        if tpl == TPL_SLICE {
+            return 1;
+        }
+        if tpl >= TPL_DISTINCT {
+            return NODES[NODES[tpl - TPL_DISTINCT].g].count;
+        }
+        let node = if tpl > 0 { STRUCTS[tpl - 1].node } else { ENUMS[-tpl - 1].node };
+        let params = NODES[node].g;
+        var k = 0;
+        while k < NODES[params].count && NODES[child(params, k)].b == 0 {
+            k += 1;
+        }
+        k
+    }
+}
+
+// ---- Instances of structs and enums ----
+
+// The instance of struct template `tpl` with the type arguments
+// TSCRATCH[mark..] (popped).
+fn struct_instance(tpl: i64, mark: i64, pos: i64) -> i64 {
+    unsafe {
+        // (0.16: the parameters left out take their defaults)
+        if TSCRATCH.count - mark < STRUCTS[tpl].generic {
+            fill_defaults(STRUCTS[tpl].node, STRUCTS[tpl].module, mark);
+        }
+        let count = TSCRATCH.count - mark;
+        if count != STRUCTS[tpl].generic {
+            targ_count_error(pos, c"struct", STRUCTS[tpl].name, STRUCTS[tpl].generic, count);
+        }
+        let h = inst_hash(tpl, mark);
+        var found = -1;
+        var slot = inst_first(STRUCT_INSTANCES, h);
+        while slot >= 0 {
+            let s = inst_id(STRUCT_INSTANCES, slot);
+            if STRUCTS[s].tmpl == tpl + 1
+                && same_targs(STRUCTS[s].targs, STRUCTS[s].targ_count, mark)
+                && (found < 0 || s < found) {
+                found = s;
+            }
+            slot = inst_next(STRUCT_INSTANCES, h, slot);
+        }
+        if found >= 0 {
+            TSCRATCH.count = mark;
+            return struct_type(found);
+        }
+        check_targ_depth(mark, pos);
+        let targs = take_targs(mark);
+        let node = STRUCTS[tpl].node;
+        check_bounds(NODES[node].g, targs, count, STRUCTS[tpl].name, pos);
+        let shown = shown_targs(node, STRUCTS[tpl].module, targs, count);
+        let s = new_struct(node, generic_display(STRUCTS[tpl].name, targs, shown),
+            generic_symbol(STRUCTS[tpl].sym, targs, shown), STRUCTS[tpl].module);
+        STRUCTS[s].tmpl = tpl + 1;
+        inst_add(&STRUCT_INSTANCES, s, h);
+        STRUCTS[s].targs = targs;
+        STRUCTS[s].targ_count = count;
+        let saved_mod = CUR_MOD;
+        let saved_self = SELF_TYPE;
+        CUR_MOD = STRUCTS[s].module;
+        SELF_TYPE = 0;
+        let saved = env_enter(NODES[node].g, targs, count);
+        collect_struct_fields(s);
+        env_leave(saved);
+        CUR_MOD = saved_mod;
+        SELF_TYPE = saved_self;
+        struct_cycle_error(s, pos);
+        struct_type(s)
+    }
+}
+
+fn enum_instance(tpl: i64, mark: i64, pos: i64) -> i64 {
+    unsafe {
+        if TSCRATCH.count - mark < ENUMS[tpl].generic {
+            fill_defaults(ENUMS[tpl].node, ENUMS[tpl].module, mark);
+        }
+        let count = TSCRATCH.count - mark;
+        if count != ENUMS[tpl].generic {
+            targ_count_error(pos, c"enum", ENUMS[tpl].name, ENUMS[tpl].generic, count);
+        }
+        let h = inst_hash(tpl, mark);
+        var found = -1;
+        var slot = inst_first(ENUM_INSTANCES, h);
+        while slot >= 0 {
+            let e = inst_id(ENUM_INSTANCES, slot);
+            if ENUMS[e].tmpl == tpl + 1 && same_targs(ENUMS[e].targs, ENUMS[e].targ_count, mark)
+                && (found < 0 || e < found) {
+                found = e;
+            }
+            slot = inst_next(ENUM_INSTANCES, h, slot);
+        }
+        if found >= 0 {
+            TSCRATCH.count = mark;
+            return enum_type(found);
+        }
+        check_targ_depth(mark, pos);
+        let targs = take_targs(mark);
+        let node = ENUMS[tpl].node;
+        check_bounds(NODES[node].g, targs, count, ENUMS[tpl].name, pos);
+        let shown = shown_targs(node, ENUMS[tpl].module, targs, count);
+        let e = new_enum(node, generic_display(ENUMS[tpl].name, targs, shown),
+            generic_symbol(ENUMS[tpl].sym, targs, shown), ENUMS[tpl].module);
+        ENUMS[e].tmpl = tpl + 1;
+        inst_add(&ENUM_INSTANCES, e, h);
+        ENUMS[e].targs = targs;
+        ENUMS[e].targ_count = count;
+        let saved_mod = CUR_MOD;
+        let saved_self = SELF_TYPE;
+        CUR_MOD = ENUMS[e].module;
+        SELF_TYPE = 0;
+        let saved = env_enter(NODES[node].g, targs, count);
+        collect_enum_variants(e);
+        env_leave(saved);
+        CUR_MOD = saved_mod;
+        SELF_TYPE = saved_self;
+        enum_cycle_error(e, pos);
+        enum_type(e)
+    }
+}
+
+// A template named by a type node (a TyName): struct s as s + 1, enum e
+// as -(e + 1); 0 for none.
+pub const TPL_NONE: i64 = 0;
+// (0.14) The slice types, `impl<T> [T]` and `impl<T> Tr for [T]`: a
+// template whose argument is the element type.
+pub const TPL_SLICE: i64 = 1099511627776;
+
+// (0.18) A generic distinct type's template (`impl<T> NonNull<T>`):
+// TPL_DISTINCT + its alias's node.
+pub const TPL_DISTINCT: i64 = 2199023255552;
+
+pub fn template_of_key(key: i64) -> i64 {
+    unsafe {
+        if SYM_STRUCT[key] != 0 && STRUCTS[SYM_STRUCT[key] - 1].generic > 0 {
+            return SYM_STRUCT[key];
+        }
+        if SYM_ENUM[key] != 0 && ENUMS[SYM_ENUM[key] - 1].generic > 0 {
+            return -SYM_ENUM[key];
+        }
+        TPL_NONE
+    }
+}
+
+// Whether type t is an instance of template `tpl` (encoded as above).
+pub fn instance_of(t: i64, tpl: i64) -> bool {
+    unsafe {
+        if tpl == TPL_SLICE {
+            return TYPES[t].kind == TyKind::Slice;
+        }
+        if tpl >= TPL_DISTINCT {
+            return TYPES[t].kind == TyKind::Distinct && TYPES[t].b == tpl - TPL_DISTINCT;
+        }
+        if tpl > 0 {
+            return TYPES[t].kind == TyKind::Struct && STRUCTS[TYPES[t].a].tmpl == tpl;
+        }
+        tpl < 0 && TYPES[t].kind == TyKind::Enum && ENUMS[TYPES[t].a].tmpl == -tpl
+    }
+}
+
+pub fn instance_targs(t: i64) -> i64 {
+    unsafe {
+        if TYPES[t].kind == TyKind::Slice {
+            return slice_targs(t);
+        }
+        if TYPES[t].kind == TyKind::Distinct {
+            return TYPES[t].list;
+        }
+        if TYPES[t].kind == TyKind::Struct { STRUCTS[TYPES[t].a].targs }
+        else { ENUMS[TYPES[t].a].targs }
+    }
+}
+
+pub fn template_name(tpl: i64) -> i64 {
+    unsafe {
+        if tpl == TPL_SLICE {
+            return intern_c(c"[T]");
+        }
+        if tpl >= TPL_DISTINCT {
+            return NODES[tpl - TPL_DISTINCT].a;
+        }
+        if tpl > 0 { STRUCTS[tpl - 1].name } else { ENUMS[-tpl - 1].name }
+    }
+}
+
+// The type arguments of slice type t as a template's (TPL_SLICE): its
+// element type, in TLISTS once per slice type.
+static var SLICE_TARGS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+fn slice_targs(t: i64) -> i64 {
+    let known = SLICE_TARGS.get(t + 1);
+    if known != 0 {
+        return known - 1;
+    }
+    let targs = TLISTS.count;
+    unsafe { TLISTS.push(TYPES[t].a); }
+    SLICE_TARGS.put(t + 1, targs + 1);
+    targs
+}
+
+// The instance of template tpl with TSCRATCH[mark..].
+pub fn template_instance(tpl: i64, mark: i64, pos: i64) -> i64 {
+    if tpl > 0 { struct_instance(tpl - 1, mark, pos) } else { enum_instance(-tpl - 1, mark, pos) }
+}

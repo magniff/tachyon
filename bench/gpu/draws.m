@@ -1,7 +1,7 @@
 // bench/gpu: CPU cost of encoding DRAWS draws with a bind group change
 // every 10 into one render pass, in Objective-C (clang -O2, ARC): the
-// baseline of docs/design/gpu.md §5 for draws.tach. A "bind group" here is
-// what the tachyon one does on Metal: a setVertexBuffer:offset:atIndex:
+// baseline of docs/design/gpu.md §5 for draws.vl. A "bind group" here is
+// what the vole one does on Metal: a setVertexBuffer:offset:atIndex:
 // of a 256-byte slice of one uniform buffer.
 //   clang -O2 -fobjc-arc bench/gpu/draws.m -framework Metal -framework Foundation -o draws-objc
 #import <Metal/Metal.h>

@@ -1,57 +1,57 @@
 # c-mixed-build
 
-A project that is half tachyon, half C: `ring.c` is a small ring buffer
+A project that is half vole, half C: `ring.c` is a small ring buffer
 (a sliding window of the last N readings) and a fast hash (FNV-1a);
-`main.tach` reads numbers from stdin, drives the ring, and prints running
+`main.vl` reads numbers from stdin, drives the ring, and prints running
 statistics. The calls go both ways:
 
-- tachyon calls C through the C file's own header (`import "./ring.h" as c;`);
-- C calls tachyon through a function pointer tachyon hands over
+- vole calls C through the C file's own header (`import "./ring.h" as c;`);
+- C calls vole through a function pointer vole hands over
   (`ring_each(ring, accumulate, &stats)`);
-- C calls tachyon **by name**: `ring.c` calls `on_evict(value)` and
-  increments `EVICTIONS`, both defined in `main.tach` and declared for C
-  in a header that `tachyonc --emit-header` writes.
+- C calls vole **by name**: `ring.c` calls `on_evict(value)` and
+  increments `EVICTIONS`, both defined in `main.vl` and declared for C
+  in a header that `volec --emit-header` writes.
 
 | file | what it is |
 |---|---|
-| `main.tach` | the program: input, a safe `Window` type over the C ring, the callbacks |
-| `ring.h` | the C API, imported by tachyon and included by `ring.c` |
+| `main.vl` | the program: input, a safe `Window` type over the C ring, the callbacks |
+| `ring.h` | the C API, imported by vole and included by `ring.c` |
 | `ring.c` | the ring buffer and the hash |
-| `main.h` | written by the build: tachyon's side as a C header (not in the repository) |
+| `main.h` | written by the build: vole's side as a C header (not in the repository) |
 | `Makefile` | the build below |
 
 ## Build and run
 
-From this folder (with `tachyonc` on your `PATH`; from a built tree it
-is `../../target/tachyonc`):
+From this folder (with `volec` on your `PATH`; from a built tree it
+is `../../target/volec`):
 
 ```sh
-tachyonc --emit-header main.tach -o main.h       # 1. tachyon's functions and statics, for C
-tachyonc main.tach ring.c -o c-mixed-build       # 2. the program and the C file, linked
+volec --emit-header main.vl -o main.h       # 1. vole's functions and statics, for C
+volec main.vl ring.c -o c-mixed-build       # 2. the program and the C file, linked
 echo 10 20 30 40 55 15 60 5 25 | ./c-mixed-build
 ```
 
 Step 2 compiles `ring.c` with `cc` (at the program's `-O` level, with
-its `-I` directories) and links it with the tachyon object. Objects
+its `-I` directories) and links it with the vole object. Objects
 (`.o`), archives (`.a`), shared libraries, `-l NAME` and `-L DIR` go on
 the same command line, in the order the linker wants them. The output's
 name says what is made: `-o x.o` an object, `-o x.s` assembly, any other
-name an executable linked by `cc` (`$TACHYON_CC` if set).
+name an executable linked by `cc` (`$VOLE_CC` if set).
 
 A build that links itself (another linker, flags of its own) takes the
-tachyon program as an object, as the Makefile does:
+vole program as an object, as the Makefile does:
 
 ```sh
 cc -O2 -c ring.c -o ring.o                       # the C file (it includes main.h)
-tachyonc main.tach -o main.o                     # the tachyon program, as an object
+volec main.vl -o main.o                     # the vole program, as an object
 cc main.o ring.o -o c-mixed-build                # linked by cc
 ```
 
-Or with make (`TACHYONC` defaults to the tree's compiler):
+Or with make (`VOLEC` defaults to the tree's compiler):
 
 ```sh
 make run                       # builds and runs on the readings above
-make TACHYONC=tachyonc         # with a tachyonc on the PATH
+make VOLEC=volec         # with a volec on the PATH
 make clean
 ```
 
@@ -79,15 +79,15 @@ a window of 4 readings
   +25   n=4 mean=26.25 min=5 max=60
 pushed 9, holding 4, dropped 5
 first reading above 50: number 2 of the window (60)
-fnv1a("tachyon"): C cb01e1cd, tachyon cb01e1cd
+fnv1a("vole"): C 7bbe116d, vole 7bbe116d
 ```
 
-The `(dropped N)` lines are printed by tachyon's `on_evict`, called from
+The `(dropped N)` lines are printed by vole's `on_evict`, called from
 inside C's `ring_push`.
 
 ## How it works
 
-### Tachyon imports the C file's header
+### Vole imports the C file's header
 
 ```tach
 import "./ring.h" as c;
@@ -95,7 +95,7 @@ import "./ring.h" as c;
 
 A path starting with `./` is relative to the importing file. The header's
 `typedef struct Ring { ... } Ring;` becomes a `#[repr(C)]` struct
-`c::Ring` with the same fields, so tachyon can read them directly:
+`c::Ring` with the same fields, so vole can read them directly:
 
 ```tach
 fn len(self) -> i64 {
@@ -103,12 +103,12 @@ fn len(self) -> i64 {
 }
 ```
 
-`size_t` fields are `u64`; `as i64` converts to tachyon's length type.
+`size_t` fields are `u64`; `as i64` converts to vole's length type.
 
-### C imports tachyon's header
+### C imports vole's header
 
-The C file needs declarations of what tachyon defines. They are not
-written by hand: `tachyonc --emit-header main.tach -o main.h` writes them
+The C file needs declarations of what vole defines. They are not
+written by hand: `volec --emit-header main.vl -o main.h` writes them
 from the program's `extern "C"` items:
 
 ```c
@@ -124,12 +124,12 @@ int32_t above(int64_t value, uint8_t *ctx);
 if (r->len == r->cap) {
     int64_t oldest = r->items[r->head];
     ...
-    EVICTIONS++;           /* a tachyon static */
-    on_evict(oldest);      /* a tachyon function */
+    EVICTIONS++;           /* a vole static */
+    on_evict(oldest);      /* a vole function */
 }
 ```
 
-On the tachyon side:
+On the vole side:
 
 ```tach
 extern "C" static var EVICTIONS: i64 = 0;
@@ -140,9 +140,9 @@ extern "C" fn on_evict(value: i64) {
 ```
 
 `extern "C"` gives an item C's calling convention and an unmangled
-symbol; without it, a tachyon function's name and convention are the
+symbol; without it, a vole function's name and convention are the
 compiler's business and C could not link to it. Reading the static from
-tachyon is `unsafe { EVICTIONS }`, since C may change it.
+vole is `unsafe { EVICTIONS }`, since C may change it.
 
 ### Callbacks with a context pointer
 
@@ -155,7 +155,7 @@ typedef int (*ring_visit)(int64_t value, void *ctx);
 size_t ring_each(const Ring *r, ring_visit visit, void *ctx);
 ```
 
-Tachyon passes the address of its own state, and the callback casts it
+Vole passes the address of its own state, and the callback casts it
 back:
 
 ```tach
@@ -201,17 +201,17 @@ safe code: `Window::new(size)` returns `None` for a bad size or a failed
 allocation, and `defer window.free();` releases the C memory on every way
 out of `main`.
 
-### A tachyon slice to C
+### A vole slice to C
 
 ```tach
-let word = "tachyon";
+let word = "vole";
 let from_c = unsafe { c::fnv1a(word.ptr, word.len as u64) };
-println(f"fnv1a(\"{word}\"): C {from_c:08x}, tachyon {fnv1a(word):08x}");
+println(f"fnv1a(\"{word}\"): C {from_c:08x}, vole {fnv1a(word):08x}");
 ```
 
 A `[u8]` is a pointer and a length, which is exactly what a C function
 taking `(const uint8_t *data, size_t n)` wants: no NUL needed. The same
-hash written in tachyon gives the same bits (`u32` arithmetic wraps, as
+hash written in vole gives the same bits (`u32` arithmetic wraps, as
 in C), printed in hex with `{x:08x}`.
 
 ## C interop rules in brief
@@ -219,28 +219,28 @@ in C), printed in hex with `{x:08x}`.
 - **Calling C**: `import "./mine.h" as c;` for your own headers (`-I DIR`
   adds an include directory), `import "stdio.h" as c;` for the system's.
   Every call is `unsafe`.
-- **C calling tachyon**: only `extern "C" fn` and `extern "C" static`;
-  `tachyonc --emit-header prog.tach -o prog.h` writes their C
+- **C calling vole**: only `extern "C" fn` and `extern "C" static`;
+  `volec --emit-header prog.vl -o prog.h` writes their C
   declarations, with the `#[repr(C)]` types they use.
 - **Layout**: `#[repr(C)]` for any struct whose fields both sides read;
   anything C only passes along (a context pointer) can be any type.
 - **Callbacks**: `extern "C" fn` plus a `void *` context, never a
   closure.
-- **Linking**: C files, objects and `-l`/`-L` on `tachyonc`'s command
-  line; or compile tachyon to an object (`-o main.o`) and link it
+- **Linking**: C files, objects and `-l`/`-L` on `volec`'s command
+  line; or compile vole to an object (`-o main.o`) and link it
   yourself.
 - **Ownership**: C frees what C allocated (`ring_free`); wrap it in a
-  tachyon type with a `free` method and `defer` it.
+  vole type with a `free` method and `defer` it.
 
 ## Language features
 
 - `import "./ring.h" as c`, `extern "C" fn`, `extern "C" static var`,
-  `--emit-header`, linking: `tachyonc guide c-interop`
+  `--emit-header`, linking: `volec guide c-interop`
 - `unsafe` blocks kept inside methods, raw pointers, casts of `*u8`:
-  `tachyonc guide unsafe`
-- `impl` blocks and `self: *Window` methods: `tachyonc guide syntax`
+  `volec guide unsafe`
+- `impl` blocks and `self: *Window` methods: `volec guide syntax`
 - `Option` from a constructor, `parse_int(..).unwrap_or(0)`, `Scanner` and
-  `read_stdin`: `tachyonc guide conversions`, `tachyonc guide std`
-- `defer` for C resources: `tachyonc guide memory`
+  `read_stdin`: `volec guide conversions`, `volec guide std`
+- `defer` for C resources: `volec guide memory`
 - f-strings with width and hex (`{x:<4}`, `{h:08x}`, `{m:.2}`):
-  `tachyonc guide formatting`
+  `volec guide formatting`

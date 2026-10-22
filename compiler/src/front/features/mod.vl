@@ -1,0 +1,413 @@
+// Target features of a program (0.19, docs/design/arch.md §2.4): what is
+// known at each point (the baseline, a function's declared features, the
+// has/detect guards it is under), what each function needs (inferred over
+// the call graph, as effects are), and the checks at declarations, entry
+// points and address-taking. A pass after the effects' (check_program),
+// on the checked AST, never through checker hooks; skipped by a program
+// that names no std::arch item and declares no feature.
+//
+// Phase 0 (the interface T2 fills): the feature attributes are parsed and
+// their names checked; has() and detect() are constants of the build's
+// features (known_at is the build's set, every requirement is empty).
+// T2's files: regions.vl (the guard walk: known_at, the static deadness
+// of has/detect branches), infer.vl (fn_needs over the SCCs), check.vl
+// (declarations, entries, arch.fn_pointer, multiversion clones), why.vl.
+
+pub mod regions;
+pub mod infer;
+pub mod check;
+pub mod multiversion;
+
+use crate::arch::{ARCH_AARCH64, ARCH_USED, ARCH_X86_64, target_arch};
+use crate::arch::features::{
+    build_features, feature_ambiguous, feature_bit_in, feature_name, feature_value, implied,
+    parse_feature,
+};
+use crate::base::{IntVec, alloc_array, buf_bytes, buf_new, buf_slice, buf_str};
+use crate::base::diag::{
+    ERR_KIND, edit_distance, err_begin, err_end_soft, err_fix, err_fmt, err_help_fmt,
+};
+use crate::front::ast::{NODES, NodeKind};
+use crate::front::effects::infer::body_walked;
+use crate::front::features::check::{check_requirements, declaration_of};
+use crate::front::features::infer::{
+    CALL_FIRST, DECLARED, DECLARED_MARK, NEEDS, NEEDS_COUNT, infer_needs, intrinsic_needs,
+};
+use crate::front::features::regions::{
+    CALLS, CALL_WIDTH, regions_reset, walk_function, walked_known,
+};
+use crate::front::lexer::{Tok, str_at};
+use crate::front::types::FN_COUNT;
+use crate::middle::lower::ssa::HMap;
+
+// The has()/detect() calls (the checker notes them, front/check/arch.vl):
+// call node + 1 to the feature's bit + 1, plus FC_DETECT for detect.
+static var FEATURE_CALLS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+const FC_DETECT: i64 = 256;
+
+// The feature attributes, FA_WIDTH entries each: the function's Fn node
+// (0 while the parser has not reached it), the kind (FA_*), the string's
+// id (lexer::str_at), its position.
+pub static var FEATURE_ATTRS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub const FA_WIDTH: i64 = 4;
+// `#[target_feature(enable = "a,b")]`
+pub const FA_TARGET_FEATURE: i64 = 1;
+// `#[multiversion("a", "b,c")]`: one entry per set
+pub const FA_MULTIVERSION: i64 = 2;
+
+// ---- The parser's side ----
+
+// An attribute's feature string (the parser, front/parser/items/attrs.vl).
+pub fn note_feature_attr(kind: i64, str_id: i64, pos: i64) {
+    unsafe {
+        ARCH_USED = true;
+        FEATURE_ATTRS.push(0);
+        FEATURE_ATTRS.push(kind);
+        FEATURE_ATTRS.push(str_id);
+        FEATURE_ATTRS.push(pos);
+    }
+}
+
+// The pending attributes belong to Fn node `node` (parse_function).
+pub fn take_feature_attrs(node: i64) {
+    unsafe {
+        var i = FEATURE_ATTRS.count - FA_WIDTH;
+        while i >= 0 && FEATURE_ATTRS.data[i] == 0 {
+            FEATURE_ATTRS.data[i] = node;
+            i -= FA_WIDTH;
+        }
+    }
+}
+
+// ---- What lowering and gen0 read ----
+
+// has()/detect() call n names feature `bit` (front/check/arch.vl).
+pub fn note_feature_call(n: i64, bit: i64, detect: bool) {
+    unsafe {
+        FEATURE_CALLS.put(n + 1, bit + 1 + if detect { FC_DETECT } else { 0 });
+    }
+}
+
+// The feature of has()/detect() call n (-1: not checked).
+pub fn feature_call_bit(n: i64) -> i64 {
+    unsafe { (FEATURE_CALLS.get(n + 1) & (FC_DETECT - 1)) - 1 }
+}
+
+// The value of has()/detect() call n: 1 or 0 when it is a constant there,
+// -1 for a detect tested at run time (CPUFEAT).
+pub fn feature_call_value(n: i64) -> i64 {
+    unsafe {
+        let e = FEATURE_CALLS.get(n + 1);
+        if e == 0 {
+            return 0;
+        }
+        feature_value((e & (FC_DETECT - 1)) - 1, known_at(n), (e & FC_DETECT) != 0)
+    }
+}
+
+// (0.19 T3) Whether some detect() is tested at run time: then gen0's main
+// fills the word first (-O1 and -O2 look for CPUFEATs instead).
+pub fn any_runtime_detect() -> bool {
+    unsafe {
+        for k in 0..FEATURE_CALLS.size {
+            let key = FEATURE_CALLS.keys[k];
+            if key > 0 && feature_call_value(key - 1) < 0 {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// The features known at has()/detect() call n: the build's, the enclosing
+// function's declared ones and the guards n is under (regions.vl; the
+// build's when the pass did not reach n).
+pub fn known_at(n: i64) -> i64 {
+    if n < 0 {
+        return 0;
+    }
+    let k = walked_known(n);
+    if k >= 0 { k } else { build_features() }
+}
+
+// Whether `if c` has a constant condition made of has()/detect() calls
+// (`!`, `&&` and `||` of them): 1 or 0, its value (the other branch is
+// statically dead: lowering and gen0 generate only the live one); -1 when
+// it is not such a constant.
+pub fn static_condition(c: i64) -> i64 {
+    unsafe {
+        if !ARCH_USED || c == 0 {
+            return -1;
+        }
+        let kind = NODES[c].kind;
+        if kind == NodeKind::Call {
+            if feature_call_bit(c) < 0 {
+                return -1;
+            }
+            return feature_call_value(c);
+        }
+        if kind == NodeKind::Unary && NODES[c].op == Tok::Bang {
+            let v = static_condition(NODES[c].b);
+            return if v < 0 { -1 } else { 1 - v };
+        }
+        if kind == NodeKind::Binary
+            && (NODES[c].op == Tok::AmpAmp || NODES[c].op == Tok::PipePipe) {
+            let and = NODES[c].op == Tok::AmpAmp;
+            let l = static_condition(NODES[c].b);
+            if l == if and { 0 } else { 1 } {
+                return l;
+            }
+            if l < 0 {
+                return -1;
+            }
+            return static_condition(NODES[c].c);
+        }
+        -1
+    }
+}
+
+// The features function f needs beyond the build's (inferred over the
+// calls, infer.vl; a declaration's set for a #[target_feature] function).
+pub fn fn_needs(f: i64) -> i64 {
+    unsafe {
+        if f < 0 || f >= NEEDS_COUNT {
+            return 0;
+        }
+        NEEDS[f]
+    }
+}
+
+// The features Fn node `node` declares with #[target_feature] (implied
+// ones included; 0 for none).
+pub fn fn_declared_features(node: i64) -> i64 {
+    unsafe {
+        var s = 0;
+        var i = 0;
+        while i < FEATURE_ATTRS.count {
+            if FEATURE_ATTRS.data[i] == node && FEATURE_ATTRS.data[i + 1] == FA_TARGET_FEATURE {
+                s |= features_of_string(str_at(FEATURE_ATTRS.data[i + 2]));
+            }
+            i += FA_WIDTH;
+        }
+        implied(s)
+    }
+}
+
+// The set a comma-separated list of names gives (unknown names left out).
+pub fn features_of_string(text: [u8]) -> i64 {
+    var s = 0;
+    var i = 0;
+    while i < text.len as i64 {
+        var j = i;
+        while j < text.len as i64 && text[j] != ',' {
+            j += 1;
+        }
+        let b = parse_feature(trim(text[i..j]));
+        if b >= 0 {
+            s |= 1 << b as u64;
+        }
+        i = j + 1;
+    }
+    s
+}
+
+fn trim(s: [u8]) -> [u8] {
+    var a = 0;
+    var b = s.len as i64;
+    while a < b && s[a] == ' ' {
+        a += 1;
+    }
+    while b > a && s[b - 1] == ' ' {
+        b -= 1;
+    }
+    s[a..b]
+}
+
+// ---- The pass ----
+
+// After the effects (check_program): the attributes' names, then the walk
+// of every checked body (regions.vl), the requirements (infer.vl) and
+// their errors (check.vl).
+pub fn check_features() {
+    unsafe {
+        if !ARCH_USED {
+            return;
+        }
+        var i = 0;
+        while i < FEATURE_ATTRS.count {
+            check_feature_string(str_at(FEATURE_ATTRS.data[i + 2]), FEATURE_ATTRS.data[i + 3]);
+            i += FA_WIDTH;
+        }
+        let n = FN_COUNT;
+        let build = build_features();
+        NEEDS = alloc_array::<i64>(n + 1);
+        DECLARED = alloc_array::<i64>(n + 1);
+        CALL_FIRST = alloc_array::<i64>(n + 2);
+        regions_reset();
+        for f in 0..n {
+            CALL_FIRST[f] = CALLS.count / CALL_WIDTH;
+            let own = intrinsic_needs(f, build);
+            if own >= 0 {
+                NEEDS[f] = own;
+                continue;
+            }
+            let attr = declaration_of(f);
+            var known = build;
+            var alt = 0;
+            if attr >= 0 {
+                let text = str_at(FEATURE_ATTRS.data[attr + 2]);
+                let declared = implied(features_of_string(text));
+                DECLARED[f] = declared | DECLARED_MARK;
+                NEEDS[f] = declared & ~build;
+                known = implied(build | declared);
+                alt = ambiguous_of_string(text);
+            } else if crate::front::features::multiversion::is_dispatcher(f) {
+                // (0.19 T3: #[multiversion]'s dispatcher needs the baseline
+                // only; its baseline version's calls are checked as one)
+                DECLARED[f] = DECLARED_MARK;
+            }
+            if body_walked(f) {
+                walk_function(f, known, alt, if alt != 0 { -1 - attr } else { 0 });
+            }
+        }
+        CALL_FIRST[n] = CALLS.count / CALL_WIDTH;
+        NEEDS_COUNT = n;
+        infer_needs(n);
+        check_requirements(n);
+    }
+}
+
+// The other architecture's reading of the unqualified names of both
+// architectures (`aes`) in a comma-separated list.
+fn ambiguous_of_string(text: [u8]) -> i64 {
+    var s = 0;
+    var i = 0;
+    let other = if target_arch() == ARCH_X86_64 { ARCH_AARCH64 } else { ARCH_X86_64 };
+    while i < text.len as i64 {
+        var j = i;
+        while j < text.len as i64 && text[j] != ',' {
+            j += 1;
+        }
+        let name = trim(text[i..j]);
+        if feature_ambiguous(name) {
+            let b = feature_bit_in(name, other);
+            if b >= 0 {
+                s |= 1 << b as u64;
+            }
+        }
+        i = j + 1;
+    }
+    s
+}
+
+// ---- The diagnostics ----
+//
+// The codes of std::arch's errors (docs/design/arch.md §2.9), one line
+// each with `help:` and `try:` lines; `volec explain arch` lists them.
+// An error starts with arch_error_begin(pos, AE_*) and ends with
+// arch_error_end() (soft: the check goes on). Phase 0 reports
+// arch.const_arg, arch.feature_literal and arch.feature_name, and
+// arch.cpu and arch.baseline (fatal, from the command line); the others
+// are T1's (raw_form, rust_form) and T2's (the rest); arch.misaligned is
+// the run-time message of the aligned memory forms (T1).
+pub const AE_FEATURE: i64 = 1;
+pub const AE_DECLARED: i64 = 2;
+pub const AE_FEATURE_NAME: i64 = 3;
+pub const AE_FEATURE_AMBIGUOUS: i64 = 4;
+pub const AE_FEATURE_LITERAL: i64 = 5;
+pub const AE_CONST_ARG: i64 = 6;
+pub const AE_FN_POINTER: i64 = 7;
+pub const AE_MULTIVERSION: i64 = 8;
+pub const AE_CPU: i64 = 9;
+pub const AE_BASELINE: i64 = 10;
+pub const AE_RAW_FORM: i64 = 11;
+pub const AE_RUST_FORM: i64 = 12;
+pub const AE_MISALIGNED: i64 = 13;
+
+static var SAVED_KIND: *u8 = 0 as *u8;
+
+// Starts an error of code `code` (AE_*) at pos: err_* then arch_error_end.
+pub fn arch_error_begin(pos: i64, code: i64) {
+    unsafe {
+        SAVED_KIND = ERR_KIND;
+        if code == AE_FEATURE { ERR_KIND = c"arch.feature"; }
+        else if code == AE_DECLARED { ERR_KIND = c"arch.declared"; }
+        else if code == AE_FEATURE_NAME { ERR_KIND = c"arch.feature_name"; }
+        else if code == AE_FEATURE_AMBIGUOUS { ERR_KIND = c"arch.feature_ambiguous"; }
+        else if code == AE_FEATURE_LITERAL { ERR_KIND = c"arch.feature_literal"; }
+        else if code == AE_CONST_ARG { ERR_KIND = c"arch.const_arg"; }
+        else if code == AE_FN_POINTER { ERR_KIND = c"arch.fn_pointer"; }
+        else if code == AE_MULTIVERSION { ERR_KIND = c"arch.multiversion"; }
+        else if code == AE_CPU { ERR_KIND = c"arch.cpu"; }
+        else if code == AE_BASELINE { ERR_KIND = c"arch.baseline"; }
+        else if code == AE_RAW_FORM { ERR_KIND = c"arch.raw_form"; }
+        else if code == AE_RUST_FORM { ERR_KIND = c"arch.rust_form"; }
+        else { ERR_KIND = c"arch.misaligned"; }
+        err_begin(pos);
+    }
+}
+
+// Ends the error arch_error_begin started; the check goes on.
+pub fn arch_error_end() {
+    unsafe {
+        err_end_soft();
+        ERR_KIND = SAVED_KIND;
+    }
+}
+
+// The names of an attribute's string (at pos, the attribute).
+fn check_feature_string(text: [u8], pos: i64) {
+    var i = 0;
+    while i < text.len as i64 {
+        var j = i;
+        while j < text.len as i64 && text[j] != ',' {
+            j += 1;
+        }
+        let name = trim(text[i..j]);
+        if parse_feature(name) < 0 {
+            unknown_feature(name, pos, -1);
+        }
+        i = j + 1;
+    }
+}
+
+// The known feature name nearest to `name` ("" for none within 2 edits).
+pub fn nearest_feature(name: [u8]) -> [u8] {
+    var best: [u8] = "";
+    var dist = 3;
+    for b in 0..33 {
+        let candidate = feature_name(b);
+        if candidate.len == 0 {
+            continue;
+        }
+        let d = edit_distance(name, candidate);
+        if d < dist {
+            dist = d;
+            best = candidate;
+        }
+    }
+    best
+}
+
+// error[arch.feature_name] for `name` at pos; `lit` is the string
+// literal's node (its quotes fixed), or -1.
+pub fn unknown_feature(name: [u8], pos: i64, lit: i64) {
+    unsafe {
+        arch_error_begin(pos, AE_FEATURE_NAME);
+        let near = nearest_feature(name);
+        err_fmt(f"unknown target feature '{name}'");
+        if near.len > 0 {
+            err_help_fmt(f"did you mean '{near}'? `volec explain arch.feature_name` lists them");
+            if lit >= 0 && NODES[lit].end - NODES[lit].start == name.len as i64 + 2 {
+                let fixed = buf_new();
+                buf_str(fixed, c"\"");
+                buf_bytes(fixed, near);
+                buf_str(fixed, c"\"");
+                err_fix(NODES[lit].start, NODES[lit].end, buf_slice(fixed));
+            }
+        } else {
+            err_help_fmt(f"the features are AArch64's neon, fp, crc, aes, sha2, sha3, dotprod, rdm, lse, fp16, i8mm, bf16 and x86-64's sse ... sse4.2, popcnt, lzcnt, bmi1, bmi2, pclmulqdq, aes, sha, avx, avx2, fma");
+        }
+        arch_error_end();
+    }
+}

@@ -1,0 +1,123 @@
+// `query similar NAME` (0.17): the items to copy when adding one like
+// NAME: those of its kind nearest to it, in full, as `query show` prints
+// them. A method: the methods of its type (a trait's: the same method of
+// the trait's other impls); anything else: the items of its kind in its
+// module, those of its file first. With `query examples KIND`
+// (examples.vl) and `volec guide how`, the "add an X" support.
+
+use crate::base::{
+    IntVec, STDOUT, SYMS, buf_byte, buf_bytes, buf_int, buf_new, buf_str, buf_write_fd,
+};
+use crate::front::modules::file_of_pos;
+use crate::tools::query::resolve_name;
+use crate::tools::query::defs::{DEFS, DEF_COUNT, K_IMPL_METHOD, K_METHOD, kind_name};
+use crate::tools::query::diagnostics::diag;
+use crate::tools::query::refs::OPT_LIMIT;
+use crate::tools::query::show::query_show;
+
+// How many `similar` shows unless --limit says.
+const SIMILAR_DEFAULT: i64 = 3;
+
+// Whether definition e is like d (similar's rule above); `loose`, when
+// nothing is: a method like the methods of other types of its module.
+fn like(d: i64, e: i64, loose: bool) -> bool {
+    unsafe {
+        let k = DEFS[d].kind;
+        let method = k == K_METHOD || k == K_IMPL_METHOD;
+        if loose {
+            return method && (DEFS[e].kind == K_METHOD || DEFS[e].kind == K_IMPL_METHOD)
+                && DEFS[e].module == DEFS[d].module;
+        }
+        if DEFS[d].tr >= 0 {
+            return DEFS[e].tr == DEFS[d].tr && DEFS[e].name == DEFS[d].name;
+        }
+        if method {
+            return (DEFS[e].kind == K_METHOD || DEFS[e].kind == K_IMPL_METHOD)
+                && DEFS[e].owner == DEFS[d].owner;
+        }
+        DEFS[e].kind == k && DEFS[e].module == DEFS[d].module && DEFS[e].parent == DEFS[d].parent
+    }
+}
+
+// Up to limit definitions like d, nearest first (in its file before the
+// others), into out; how many there are in all.
+pub fn similar_defs(d: i64, limit: i64, out: inout IntVec) -> i64 {
+    unsafe {
+        let f = file_of_pos(DEFS[d].start);
+        var all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var keys = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for loose in 0..2 {
+            if all.count > 0 {
+                break;
+            }
+            for e in 0..DEF_COUNT {
+                if e == d || !like(d, e, loose == 1) {
+                    continue;
+                }
+                let dist = if DEFS[e].start > DEFS[d].start { DEFS[e].start - DEFS[d].start }
+                    else { DEFS[d].start - DEFS[e].start };
+                all.push(e);
+                keys.push(if file_of_pos(DEFS[e].start) == f { dist } else { (1 << 40) + dist });
+            }
+        }
+        // (the `limit` smallest keys, in order)
+        var taken = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for _ in 0..all.count {
+            taken.push(0);
+        }
+        while out.count < limit && out.count < all.count {
+            var best = -1;
+            for i in 0..all.count {
+                if taken.data[i] == 0 && (best < 0 || keys.data[i] < keys.data[best]) {
+                    best = i;
+                }
+            }
+            taken.data[best] = 1;
+            out.push(all.data[best]);
+        }
+        all.count
+    }
+}
+
+// `query similar NAME...`.
+pub fn query_similar(args: IntVec) -> i64 {
+    unsafe {
+        var status = 0;
+        let limit = if OPT_LIMIT > 0 { OPT_LIMIT } else { SIMILAR_DEFAULT };
+        for i in 0..args.count {
+            let name = crate::base::cstr(args.data[i] as *u8);
+            var matches = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            if !resolve_name(c"similar", name, &matches) {
+                status = 1;
+                continue;
+            }
+            let d = matches.data[0];
+            var picks = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            let total = similar_defs(d, limit, &picks);
+            let out = buf_new();
+            buf_str(out, c"// ");
+            buf_int(out, picks.count);
+            buf_str(out, c" of ");
+            buf_int(out, total);
+            buf_byte(out, ' ');
+            buf_str(out, kind_name(DEFS[d].kind));
+            buf_str(out, c"s like ");
+            buf_bytes(out, SYMS[DEFS[d].fqn].text);
+            buf_str(out, c", nearest first; a new one beside it: volec edit insert --after ");
+            buf_bytes(out, SYMS[DEFS[d].fqn].text);
+            buf_str(out, c" < new.vl\n");
+            buf_write_fd(out, STDOUT);
+            if picks.count == 0 {
+                let e = diag(c"note", c"query.empty");
+                buf_str(e, c"nothing like ");
+                buf_bytes(e, SYMS[DEFS[d].fqn].text);
+                buf_str(e, c" but itself\n");
+                continue;
+            }
+            if query_show(picks, name) != 0 {
+                status = 1;
+            }
+        }
+        status
+    }
+}

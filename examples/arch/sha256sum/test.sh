@@ -2,7 +2,7 @@
 # The checks of sha256sum, run by the README's session (and so by
 # tests/walkthrough/run.sh on every build): ./sha256sum and
 # ./sha256sum-generic (-C target-cpu=generic, where detect("sha2") is a
-# real test, so TACHYON_ARCH_DISABLE=all reaches the portable rounds)
+# real test, so VOLE_ARCH_DISABLE=all reaches the portable rounds)
 # must be built. Prints one line per check; FAIL lines say what differed.
 set -u
 LC_ALL=C
@@ -39,7 +39,7 @@ hashes() { sed 's/^\\//' | cut -c1-64; }
 # 1. FIPS 180-4's examples and the million a's: the known answers, by
 # both paths.
 known() { # text expected
-    for p in "$fast" "TACHYON_ARCH_DISABLE=all $generic"; do
+    for p in "$fast" "VOLE_ARCH_DISABLE=all $generic"; do
         got=$(printf '%s' "$1" | env $p | cut -c1-64)
         [ "$got" = "$2" ] || fail "'$1' by $p: $got, expected $2"
     done
@@ -51,7 +51,7 @@ known abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq \
 known abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu \
     cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1
 head -c 1000000 /dev/zero | tr '\0' a >million
-for p in "$fast" "TACHYON_ARCH_DISABLE=all $generic"; do
+for p in "$fast" "VOLE_ARCH_DISABLE=all $generic"; do
     got=$(env $p million | cut -c1-64)
     [ "$got" = cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0 ] \
         || fail "a million a's by $p: $got"
@@ -72,7 +72,7 @@ $sys $names | hashes >want
 "$fast" $names | hashes >got
 cmp -s want got || fail "lengths: not the system's hashes"
 # shellcheck disable=SC2086
-TACHYON_ARCH_DISABLE=all "$generic" $names | hashes >got
+VOLE_ARCH_DISABLE=all "$generic" $names | hashes >got
 cmp -s want got || fail "lengths, portable: not the system's hashes"
 for n in $lengths; do
     dd if="len$n" bs=37 2>/dev/null | "$fast" | hashes
@@ -92,7 +92,7 @@ $sys r* | hashes >want
 cmp -s want got || fail "random files: not the system's hashes"
 "$generic" r* | hashes >got
 cmp -s want got || fail "random files, -C target-cpu=generic: not the system's hashes"
-TACHYON_ARCH_DISABLE=all "$generic" r* | hashes >got
+VOLE_ARCH_DISABLE=all "$generic" r* | hashes >got
 cmp -s want got || fail "random files, portable: not the system's hashes"
 echo "random files: 40, by both paths, the system's hashes"
 

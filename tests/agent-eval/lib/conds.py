@@ -3,12 +3,12 @@
 Program tasks (tasks/):
 
 - `bare`, `guide`, `tools`, `both`, `rust` (0.13-0.16): the language
-  preamble; `guide` inlines `tachyonc guide` (today's core topic, ~7k
+  preamble; `guide` inlines `volec guide` (today's core topic, ~7k
   tokens); `tools` the tools table (prompts/tools.md); `both` the two;
   `rust` the control.
 - `guide-core`: bare + the ~2k-token example-first core guide: the intro
-  prompts/guide-core.md and the output of `tachyonc guide` from a compiler
-  whose core is the short one (0.17: it also has `tachyonc guide --full`,
+  prompts/guide-core.md and the output of `volec guide` from a compiler
+  whose core is the short one (0.17: it also has `volec guide --full`,
   the old ~7k core, which the `guide` condition then inlines so that it
   stays the 0.16 control; a compiler without `--full` runs guide-core only
   as a dry run).
@@ -19,15 +19,15 @@ Program tasks (tasks/):
   always-loaded core (the main Rust differences in one compiled example,
   then the lookup lines); with `+readfirst` the iteration-1 cell.
 - `guide-example` (0.17 iterations): bare + prompts/guide-example.md, whose
-  `@EXAMPLE@` is `tachyonc guide example` from the compiler under test: a
+  `@EXAMPLE@` is `volec guide example` from the compiler under test: a
   whole program in three files and a test case (modules, enums and match,
   Result and `?`, Vec, HashMap, Buf, a sort closure, allocators passed
   down) in place of guide-mini's one-file example, then the lookup lines.
   The worked program answers up front what Haiku probed and looked up
   before its first write (.claude/briefs/research/prewrite-deliberation.md).
-- `rust-pairs`: bare + paired Rust -> tachyon lines (prompts/rust-pairs.md),
+- `rust-pairs`: bare + paired Rust -> vole lines (prompts/rust-pairs.md),
   about the core guide's budget: the differences shown as pairs instead
-  of tachyon-only examples.
+  of vole-only examples.
 
 Compiler tasks (ctasks/):
 
@@ -41,13 +41,13 @@ Compiler tasks (ctasks/):
 Modifiers, any order after the base:
 
 - `+hook`: the check hook (tools/agent-hooks/check-after-edit.py after
-  every change to a .tach file) and its prompt note; what `--check-hook`
-  does for tools/both, for any tachyon condition. Always on in the
+  every change to a .vl file) and its prompt note; what `--check-hook`
+  does for tools/both, for any vole condition. Always on in the
   compiler-tools conditions.
-- `+test`: `tachyonc test` named in the prompt (prompts/test.md) and the
+- `+test`: `volec test` named in the prompt (prompts/test.md) and the
   hooks of tools/agent-hooks/settings-eval.json (the check hook that also
   runs the tests); until that file exists the condition runs only as a
-  dry run. Needs a compiler with `tachyonc test` (the self-check probes it).
+  dry run. Needs a compiler with `volec test` (the self-check probes it).
 - `+turn-end`: the Stop hook (tools/agent-hooks/turn-end.py: a check of
   what changed when the agent stops; errors block the stop once); with
   +hook the check hook too (settings-eval.json's `hook+turn-end`), alone
@@ -70,7 +70,7 @@ Modifiers, any order after the base:
   misled, what it would change, three ratings out of 5) and the answer
   goes to result.json's `debrief`, its cost apart from the task's
   (lib/debrief.py). Any condition, `rust` and `compiler-plain` too (about
-  Rust, about tachyon and its tools); not with a Stop hook (+test,
+  Rust, about vole and its tools); not with a Stop hook (+test,
   +turn-end), which would act on the debrief's turn too. Claude only.
 
 `both+hook+test` is the rerun matrix's row D cell; `compiler-tools-core+test`
@@ -95,9 +95,9 @@ MODS = ("hook", "test", "turn-end", "recite", "rewrite", "nohints", "note", "rea
 # environment for every hook of the run, more hooks
 HOOK_MODS = ("rewrite", "nohints", "note")
 
-# What each base puts in the prompt: guide (None, "full": `tachyonc guide`,
+# What each base puts in the prompt: guide (None, "full": `volec guide`,
 # "core": prompts/guide-core.md, "mini": prompts/guide-mini.md, "example":
-# prompts/guide-example.md with `tachyonc guide example`), tools (None,
+# prompts/guide-example.md with `volec guide example`), tools (None,
 # "full": tools.md, "core": tools-core.md), pairs (rust-pairs.md),
 # compiler (None, "full", "plain", "core": the AGENTS.md variant).
 _PARTS = {

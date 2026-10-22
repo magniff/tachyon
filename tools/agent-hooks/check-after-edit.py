@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Agent harness hook (0.15): `tachyonc check` after every change to
-tachyon source, its errors appended to the agent's own tool result, so
+"""Agent harness hook (0.15): `volec check` after every change to
+vole source, its errors appended to the agent's own tool result, so
 that the agent does not spend a call on it (docs/tool-gaps-014.md, gap 3:
 124 eval calls and 21 dev calls ran `check` straight after a Write or
 Edit).
@@ -11,77 +11,77 @@ MultiEdit, Bash), and by the agent eval with `run.py run --check-hook`
 Reads the hook event (JSON) on stdin; prints, when the program has
 errors, a PostToolUse `additionalContext`:
 
-    tachyonc check main.tach: 2 errors
-    main.tach:4:18: error[type error] expected 'i64', got '[u8]'
-    main.tach:5:5: error[type error] undefined variable 'prinln' | help: did you mean 'println'?
+    volec check main.vl: 2 errors
+    main.vl:4:18: error[type error] expected 'i64', got '[u8]'
+    main.vl:5:5: error[type error] undefined variable 'prinln' | help: did you mean 'println'?
 
-at most 10 errors (the edited file's first), then `(N more: tachyonc
+at most 10 errors (the edited file's first), then `(N more: volec
 check ROOT)`. A clean program prints nothing. (0.17) The `try:` commands
-of the errors that one `tachyonc fix` run applies to all of them (`fix
+of the errors that one `volec fix` run applies to all of them (`fix
 --only unsafe`, `alloc016`, `imports`, `pub`) come right after the head,
 once each, with how many errors they answer:
 
-    tachyonc check main.tach: 3 errors
-    try: tachyonc fix --only unsafe main.tach   (3 of the errors)
+    volec check main.vl: 3 errors
+    try: volec fix --only unsafe main.vl   (3 of the errors)
 
 (0.18) `fix --suggested` first: the errors' exact fixes (a did-you-mean
 name, a conversion, a missing `use` or `pub`, ...):
 
-    try: tachyonc fix --suggested main.tach   (2 of the errors: their exact fixes, one checked edit)
+    try: volec fix --suggested main.vl   (2 of the errors: their exact fixes, one checked edit)
 
 (0.18.1) The hook applies them itself: when errors have that `try:` (the
-compiler marks only exact fixes so), it runs `tachyonc fix --suggested
-ROOT` (one checked edit, journaled: `tachyonc undo` takes it back),
+compiler marks only exact fixes so), it runs `volec fix --suggested
+ROOT` (one checked edit, journaled: `volec undo` takes it back),
 checks again and says what it fixed, each error with its fix, before the
 errors left (the 0.18 eval: the line was offered 43 times and run once):
 
-    tachyonc fix --suggested main.tach, run by the hook (tachyonc undo takes it back; positions as before it; main.tach changed: read it again before an Edit):
-    fixed main.tach:2:5: undefined variable 'prinln' | did you mean 'println'?
-    tachyonc check main.tach: 0 errors (1 fixed)
+    volec fix --suggested main.vl, run by the hook (volec undo takes it back; positions as before it; main.vl changed: read it again before an Edit):
+    fixed main.vl:2:5: undefined variable 'prinln' | did you mean 'println'?
+    volec check main.vl: 0 errors (1 fixed)
 
-TACHYON_HOOK_FIX=0: the hook names the fix and applies nothing, as
+VOLE_HOOK_FIX=0: the hook names the fix and applies nothing, as
 before. Not at a turn's end (turn-end.py).
 
-and the compiler is run under the name the agent can type (`tachyonc` when
+and the compiler is run under the name the agent can type (`volec` when
 it is the one on PATH, else its path from the event's directory), so the
 `try:` lines it prints run as they are.
 
-- When: a Write, Edit or MultiEdit of a `.tach` file; a Bash call whose
-  `tachyonc edit|refactor|fix|rewrite|undo` wrote (its summary line; not
-  `--dry-run`), through any copy or variable (tachyonc_cmd.py).
+- When: a Write, Edit or MultiEdit of a `.vl` file; a Bash call whose
+  `volec edit|refactor|fix|rewrite|undo` wrote (its summary line; not
+  `--dry-run`), through any copy or variable (volec_cmd.py).
 - The root: under a checkout's compiler/src or compiler/std,
-  compiler/src/main.tach (0.17: check reads std's edited files); else the nearest main.tach in the
+  compiler/src/main.vl (0.17: check reads std's edited files); else the nearest main.vl in the
   file's directory or above it (not above the checkout), else the file
   itself when it has `fn main`; for a Bash call, its `--root R` or last
-  `.tach` operand, else `check`'s default.
-- The compiler: $TACHYON_CHECK_COMPILER; the checkout's
-  target/tools/tachyonc (bootstrap/bootstrap.sh --dev, a passing build),
-  then target/tachyonc; then `tachyonc` on PATH (the eval's bin/). For a
+  `.vl` operand, else `check`'s default.
+- The compiler: $VOLE_CHECK_COMPILER; the checkout's
+  target/tools/volec (bootstrap/bootstrap.sh --dev, a passing build),
+  then target/volec; then `volec` on PATH (the eval's bin/). For a
   Bash call, the binary it ran when that is a path.
-- How: `tachyonc check --json ROOT` in the event's directory (one JSON
+- How: `volec check --json ROOT` in the event's directory (one JSON
   object per diagnostic, docs/query.md); a compiler without --json is run
   without it, its short lines parsed.
 - Logged as `check-hook` records (root, errors, their codes,
-  milliseconds): into $TACHYON_CHECK_HOOK_LOG when set (the agent eval),
+  milliseconds): into $VOLE_CHECK_HOOK_LOG when set (the agent eval),
   else the query-first hook's log (.git/agent-tools.jsonl).
 
 (0.17; docs/query.md, "The agent hooks")
-- A Bash call runs where its `cd`s lead (`cd WORKTREE && tachyonc edit
+- A Bash call runs where its `cd`s lead (`cd WORKTREE && volec edit
   ...`: WORKTREE's root and compiler); a shell command that writes a
-  .tach file (`> f.tach`, `tee`, `cp`, `mv`) is a change too.
+  .vl file (`> f.vl`, `tee`, `cp`, `mv`) is a change too.
 - The delta: after this session's first check of a root (hookstate.py
   keeps the last error set per root), `N errors (a new, b fixed, c as
   before)` and only the new errors; `0 errors (N fixed)` when it became
   clean.
-- The tests: after a clean check of a program with tests/*.out, `tachyonc
+- The tests: after a clean check of a program with tests/*.out, `volec
   test ROOT --full` (not again within DEBOUNCE_S, never again for one
   slower than SLOW_MS; turn-end.py runs what was left), its counts and
-  the newly failing cases. TACHYON_CHECK_TESTS=0 leaves them out.
+  the newly failing cases. VOLE_CHECK_TESTS=0 leaves them out.
 - The hint `unfamiliar-construct` of hints.txt, once a session, when the
   same error is made twice or an error's help names the guide
-  (TACHYON_HINTS=0: never).
+  (VOLE_HINTS=0: never).
 
-TACHYON_CHECK_HOOK=0 turns it off; TACHYON_HOOK_FIX=0 leaves the exact
+VOLE_CHECK_HOOK=0 turns it off; VOLE_HOOK_FIX=0 leaves the exact
 fixes to the agent. Development tooling only.
 """
 import json
@@ -100,7 +100,7 @@ TIMEOUT = 30
 CASE_TIMEOUT = 2
 TEST_TIMEOUT = 15
 SLOW_MS = 8000
-DEBOUNCE_S = int(os.environ.get("TACHYON_TEST_DEBOUNCE") or 20)
+DEBOUNCE_S = int(os.environ.get("VOLE_TEST_DEBOUNCE") or 20)
 TEST_CHARS = 1500
 WRITES = ("edit", "refactor", "fix", "rewrite", "undo")
 SHORT = re.compile(r"^(?P<file>.+?):(?P<line>\d+):(?P<col>\d+): (?P<sev>\w+)\[(?P<code>[^\]]*)\] (?P<rest>.*)$")
@@ -124,7 +124,7 @@ def which(name):
     return None
 
 
-tc = _load("tachyonc_cmd", "tachyonc_cmd.py")
+tc = _load("volec_cmd", "volec_cmd.py")
 class _LazyState:
     """hookstate.py, loaded at its first use (a call that checks nothing
     does not pay for it); a stand-in when the copy of the hooks lacks it
@@ -159,20 +159,20 @@ def checkout_root(path):
 
 
 def root_of(path):
-    """The program root to check after a change to the .tach file path."""
+    """The program root to check after a change to the .vl file path."""
     p = os.path.abspath(path)
     top = checkout_root(os.path.dirname(p))
     if top:
         # (0.17: std's files are checked through the compiler's root, which
         # `check` then reads std from when they differ from the built-in
-        # std; std.tach as a root defines std twice)
-        for sub, root in (("compiler/src/", "compiler/src/main.tach"), ("compiler/std/", "compiler/src/main.tach"),
-                          ("compiler/std/", "compiler/std/std.tach")):
+        # std; std.vl as a root defines std twice)
+        for sub, root in (("compiler/src/", "compiler/src/main.vl"), ("compiler/std/", "compiler/src/main.vl"),
+                          ("compiler/std/", "compiler/std/std.vl")):
             if p.startswith(os.path.join(top, sub)) and os.path.exists(os.path.join(top, root)):
                 return os.path.join(top, root)
     d = os.path.dirname(p)
     for _ in range(8):
-        cand = os.path.join(d, "main.tach")
+        cand = os.path.join(d, "main.vl")
         if os.path.exists(cand):
             return cand
         if d == top or os.path.dirname(d) == d:
@@ -188,22 +188,22 @@ def root_of(path):
 
 
 def compiler_for(where, ran=None, root=None):
-    """The tachyonc to check with: the one the agent ran (a path), the
+    """The volec to check with: the one the agent ran (a path), the
     override, the checkout's tools binary or build, the one on PATH.
     (0.17) For a program outside the compiler's own source (a test case,
-    an example), target/tachyonc when it is newer than target/tools/tachyonc:
+    an example), target/volec when it is newer than target/tools/volec:
     a compiler just rebuilt from changed source checks the programs written
     for that change (the tools binary, older, reports what was fixed)."""
     if ran and os.sep in ran:
         p = ran if os.path.isabs(ran) else os.path.join(where, ran)
         if os.access(p, os.X_OK):
             return p
-    env = os.environ.get("TACHYON_CHECK_COMPILER")
+    env = os.environ.get("VOLE_CHECK_COMPILER")
     if env and os.access(env, os.X_OK):
         return env
     top = checkout_root(where)
     if top:
-        tools, build = (os.path.join(top, rel) for rel in ("target/tools/tachyonc", "target/tachyonc"))
+        tools, build = (os.path.join(top, rel) for rel in ("target/tools/volec", "target/volec"))
         own = root and os.path.abspath(root).startswith(os.path.join(top, "compiler") + os.sep)
         if root and not own and os.access(build, os.X_OK) and os.access(tools, os.X_OK):
             try:
@@ -214,7 +214,7 @@ def compiler_for(where, ran=None, root=None):
         for p in (tools, build):
             if os.access(p, os.X_OK):
                 return p
-    return which("tachyonc")
+    return which("volec")
 
 
 def run_typed(compiler, cwd, args):
@@ -279,7 +279,7 @@ def exact_errors(errors):
 
 
 def apply_exact(compiler, root, cwd):
-    """(0.18.1) `tachyonc fix --suggested ROOT` (--json): the errors'
+    """(0.18.1) `volec fix --suggested ROOT` (--json): the errors'
     exact fixes, one checked edit. [(file, what it fixed there)], or None
     when it changed nothing (refused, or nothing to fix)."""
     r = run_typed(compiler, cwd, ["fix", "--suggested", "--json"] + root_args(root, cwd))
@@ -302,7 +302,7 @@ def fixed_report(fixed, changed, root_shown):
     fixed error with its fix (its help), at the position it had."""
     where = " " + root_shown if root_shown else ""
     files = ", ".join(sorted({f for f, _ in changed if f})) or "the files"
-    lines = [f"tachyonc fix --suggested{where}, run by the hook (tachyonc undo takes it back; positions as "
+    lines = [f"volec fix --suggested{where}, run by the hook (volec undo takes it back; positions as "
              f"before it; {files} changed: read {'it' if ',' not in files else 'them'} again before an Edit):"]
     for d in fixed:
         pos = f"{d['file']}:{d['line']}:{d['col']}: " if d.get("file") else ""
@@ -314,23 +314,23 @@ def fixed_report(fixed, changed, root_shown):
 
 
 def typed_name(compiler, cwd):
-    """The compiler as the agent would type it: `tachyonc` when that is the
+    """The compiler as the agent would type it: `volec` when that is the
     one on PATH, else its path from cwd when under it, else its path."""
-    on_path = which("tachyonc")
+    on_path = which("volec")
     if on_path and os.path.realpath(on_path) == os.path.realpath(compiler):
-        return "tachyonc"
+        return "volec"
     full = os.path.abspath(compiler)
     if full.startswith(cwd + os.sep):
         return os.path.relpath(full, cwd)
     return compiler
 
 
-FIX = re.compile(r"^\S*tachyonc\S* fix\b")
+FIX = re.compile(r"^\S*volec\S* fix\b")
 SUGGESTED = re.compile(r" fix --suggested\b")
 
 
 def fix_commands(errors):
-    """The `tachyonc fix ...` commands of the errors' try: lines, each with
+    """The `volec fix ...` commands of the errors' try: lines, each with
     how many errors name it, in order of first appearance; (0.18) `fix
     --suggested` (the errors' exact fixes) first."""
     seen = {}
@@ -364,7 +364,7 @@ def fix_lines(errors):
     def which(cmd, k):
         what = 'the error' if n == 1 else 'all of them' if k == n else f'{k} of the errors'
         # (0.18: named for the agent to run; 0.18.1: what is left after the
-        # hook ran it, or all of it with TACHYON_HOOK_FIX=0)
+        # hook ran it, or all of it with VOLE_HOOK_FIX=0)
         return what + ": their exact fixes, one checked edit" if SUGGESTED.search(cmd) else what
     return ([f"try: {cmd}   ({which(cmd, k)})" for cmd, k in fixes], {cmd for cmd, _ in fixes})
 
@@ -379,29 +379,29 @@ def report(diags, root_shown, edited):
         errors.sort(key=lambda d: not (d.get("file") and edited.endswith(os.sep + os.path.normpath(d["file"]))
                                        or os.path.abspath(d.get("file") or "") == edited))
     n = len(errors)
-    lines = [f"tachyonc check{' ' + root_shown if root_shown else ''}: {n} error{'s' if n != 1 else ''}"]
+    lines = [f"volec check{' ' + root_shown if root_shown else ''}: {n} error{'s' if n != 1 else ''}"]
     fl, fixes = fix_lines(errors)
     lines += fl
     lines += [line_of(d, fixes) for d in errors[:MAX_SHOWN]]
     if n > MAX_SHOWN:
-        lines.append(f"({n - MAX_SHOWN} more: tachyonc check{' ' + root_shown if root_shown else ''})")
+        lines.append(f"({n - MAX_SHOWN} more: volec check{' ' + root_shown if root_shown else ''})")
     return "\n".join(lines)
 
 
 WRITE_SUMMARY = re.compile(r"^(undid|patched|replaced|inserted|deleted|fixed|renamed|moved|rewrote|"
                            r"added|removed|changed|made|split|script|wrapped|formatted)\b.*\t", re.M)
-# (0.17) A shell command writing a .tach file: `> f.tach`, `>> f.tach`,
-# `tee [-a] f.tach`, `cp|mv ... f.tach`.
-REDIRECT = re.compile(r"(?:^|[\s;])(?:\d?>>?|&>>?)\s*([^\s;|&<>]+\.tach)\b")
+# (0.17) A shell command writing a .vl file: `> f.vl`, `>> f.vl`,
+# `tee [-a] f.vl`, `cp|mv ... f.vl`.
+REDIRECT = re.compile(r"(?:^|[\s;])(?:\d?>>?|&>>?)\s*([^\s;|&<>]+\.vl)\b")
 
 
 def shell_writes(command, cwd):
-    """[(path, directory)] of the .tach files a shell command writes."""
+    """[(path, directory)] of the .vl files a shell command writes."""
     found = []
     for seg, words, here, assigns in tc.located(command, cwd):
         for m in REDIRECT.finditer(tc.HEREDOC.sub("<<HEREDOC\n", seg)):
             found.append((m.group(1), here, assigns))
-        if words and words[0] in ("tee", "cp", "mv") and words[-1].endswith(".tach") and len(words) > 1:
+        if words and words[0] in ("tee", "cp", "mv") and words[-1].endswith(".vl") and len(words) > 1:
             found.append((words[-1], here, assigns))
     out = []
     for path, here, assigns in found:
@@ -415,8 +415,8 @@ REDIR = re.compile(r"^\d*(?:<<?<?|>>?|&>>?)$")
 
 
 def operands(words):
-    """words without redirections: `edit replace f < new.tach` reads
-    new.tach as its stdin, it is not the root (0.17 validation round: the
+    """words without redirections: `edit replace f < new.vl` reads
+    new.vl as its stdin, it is not the root (0.17 validation round: the
     snippet was checked alone and its names reported as errors)."""
     out, skip = [], False
     for w in words:
@@ -431,15 +431,15 @@ def operands(words):
 
 def trigger(event):
     """(file edited or None, root or None, compiler the agent ran or None,
-    the directory the change was made from) when the event changed tachyon
+    the directory the change was made from) when the event changed vole
     source; None otherwise. For a Bash call the directory follows its
-    `cd`s (0.17: `cd WORKTREE && tachyonc edit ...` is WORKTREE's)."""
+    `cd`s (0.17: `cd WORKTREE && volec edit ...` is WORKTREE's)."""
     tool = event.get("tool_name", "")
     inp = event.get("tool_input") or {}
     cwd = os.path.abspath(event.get("cwd") or os.getcwd())
     if tool in ("Write", "Edit", "MultiEdit"):
         path = inp.get("file_path") or ""
-        if not path.endswith(".tach"):
+        if not path.endswith(".vl"):
             return None
         root = root_of(path)
         return (path, root, None, cwd) if root else None
@@ -459,7 +459,7 @@ def trigger(event):
                 elif w.startswith("--root="):
                     root = w[7:]
             ops = operands(words)
-            if root is None and ops and ops[-1].endswith(".tach") and "new-file" not in ops:
+            if root is None and ops and ops[-1].endswith(".vl") and "new-file" not in ops:
                 root = ops[-1]
             return (None, root, path or None, here)
         for path, here in shell_writes(command, cwd):
@@ -472,8 +472,8 @@ def trigger(event):
 
 def default_root(cwd):
     """The root `check` takes in cwd when none is given: the tree's
-    compiler, else main.tach."""
-    for rel in ("compiler/src/main.tach", "main.tach"):
+    compiler, else main.vl."""
+    for rel in ("compiler/src/main.vl", "main.vl"):
         p = os.path.join(cwd, rel)
         if os.path.exists(p):
             return p
@@ -509,7 +509,7 @@ def delta_report(errors, before, root_shown, edited):
     n = len(errors)
     where = " " + root_shown if root_shown else ""
     if n == 0:
-        return f"tachyonc check{where}: 0 errors ({fixed} fixed)" if fixed else ""
+        return f"volec check{where}: 0 errors ({fixed} fixed)" if fixed else ""
     parts = []
     if new:
         parts.append(f"{len(new)} new")
@@ -517,7 +517,7 @@ def delta_report(errors, before, root_shown, edited):
         parts.append(f"{fixed} fixed")
     if same:
         parts.append(f"{same} as before")
-    lines = [f"tachyonc check{where}: {n} error{'s' if n != 1 else ''} ({', '.join(parts)})"]
+    lines = [f"volec check{where}: {n} error{'s' if n != 1 else ''} ({', '.join(parts)})"]
     # the fix commands once, counted over all the errors (one fix run
     # answers them all), then the new errors without them
     fl, _ = fix_lines(errors)
@@ -525,12 +525,12 @@ def delta_report(errors, before, root_shown, edited):
     shown = report(new, root_shown, edited).split("\n")[1:] if new else []
     lines += [x for x in shown if not x.startswith(("(", "try: "))]
     if len(new) > MAX_SHOWN:
-        lines.append(f"({len(new) - MAX_SHOWN} more new: tachyonc check{where})")
+        lines.append(f"({len(new) - MAX_SHOWN} more new: volec check{where})")
     return "\n".join(lines)
 
 
 def run_tests(compiler, root, cwd):
-    """`tachyonc test ROOT --full` (0.17): {"passed", "failed": [names],
+    """`volec test ROOT --full` (0.17): {"passed", "failed": [names],
     "blocks": {name: text}, "ms", "build": False when it did not build}, or
     None when the compiler has no test command; {"slow": True} past
     TEST_TIMEOUT."""
@@ -576,7 +576,7 @@ def test_report(cur, before, root_shown):
     if not cur.get("build", True) or "text" in cur:
         return cur.get("text", "")
     failed = cur["failed"]
-    head = f"tachyonc test{where}: {cur['passed']} passed" + (f", {len(failed)} failed" if failed else "")
+    head = f"volec test{where}: {cur['passed']} passed" + (f", {len(failed)} failed" if failed else "")
     show = failed
     if before is not None and "failed" in before:
         was = set(before["failed"])
@@ -598,7 +598,7 @@ def test_report(cur, before, root_shown):
     for k, n in enumerate(show):
         b = cur["blocks"].get(n, "FAIL " + n)
         if k > 0 and size + len(b) > TEST_CHARS:
-            out.append(f"({len(show) - k} more: tachyonc test{where})")
+            out.append(f"({len(show) - k} more: volec test{where})")
             break
         out.append(b)
         size += len(b)
@@ -608,7 +608,7 @@ def test_report(cur, before, root_shown):
 def run_dir_for(root, cwd):
     """(0.17) Where check runs: cwd, unless root is in another checkout than
     cwd (a worktree's file edited from a session in the main checkout, or
-    the other way): then root's checkout, because `tachyonc check` reads
+    the other way): then root's checkout, because `volec check` reads
     std's files (compiler/std) from the directory it runs in, and their
     paths and try: lines are relative to it."""
     if not root:
@@ -662,7 +662,7 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
     errors = [d for d in diags if d.get("severity") == "error"]
     # (0.18.1) the errors' exact fixes, applied: fix --suggested, then check again
     fixed_text, hook_fixed = "", None
-    exact = exact_errors(errors) if not at_turn_end and os.environ.get("TACHYON_HOOK_FIX", "1") != "0" else []
+    exact = exact_errors(errors) if not at_turn_end and os.environ.get("VOLE_HOOK_FIX", "1") != "0" else []
     if exact and expects_errors(cwd, key_root, edited):
         exact = []
     if exact:
@@ -687,7 +687,7 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
     keys = [error_key(d) for d in errors]
     text = report(errors, shown, edited) if at_turn_end else delta_report(errors, prev.get("errors"), shown, edited)
     if fixed_text and not text:
-        text = f"tachyonc check{' ' + shown if shown else ''}: 0 errors"
+        text = f"volec check{' ' + shown if shown else ''}: 0 errors"
     texts = [t for t in (fixed_text, text) if t]
     entry = {"errors": keys, "time": time.time(), "root": key_root}
     fp = hs.fingerprint(key_root)[0] if key_root else ""
@@ -702,8 +702,8 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
             seen[k] = seen.get(k, 0) + 1
             if (seen[k] >= 2 or any("guide " in h for h in d.get("help") or [])) and \
                     "unfamiliar-construct" not in hinted:
-                note = hs.hint("unfamiliar-construct", TACHYONC=tachyonc_shown(compiler, run_dir))
-                if note:  # ("" when TACHYON_HINTS=0)
+                note = hs.hint("unfamiliar-construct", VOLEC=volec_shown(compiler, run_dir))
+                if note:  # ("" when VOLE_HINTS=0)
                     hinted.append("unfamiliar-construct")
                     texts.append(note)
             new_keys.discard(k)
@@ -719,7 +719,7 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
         entry["tests"] = last
     if prev.get("slow"):
         entry["slow"] = True
-    if not errors and key_root and os.environ.get("TACHYON_CHECK_TESTS", "1") != "0" \
+    if not errors and key_root and os.environ.get("VOLE_CHECK_TESTS", "1") != "0" \
             and hs.has_tests(key_root) and not prev.get("slow") and (not last or last.get("fp") != fp):
         due = at_turn_end or not last or time.time() - last.get("time", 0) >= DEBOUNCE_S \
             or bool(prev.get("errors"))
@@ -729,8 +729,8 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
                 rec["test_ms"] = cur.get("ms", 0)
                 if cur.get("slow") or cur.get("ms", 0) > SLOW_MS:
                     entry["slow"] = True
-                    texts.append(f"tachyonc test{' ' + shown if shown else ''}: took over {SLOW_MS // 1000} s; "
-                                 "not run after each edit (run tachyonc test)")
+                    texts.append(f"volec test{' ' + shown if shown else ''}: took over {SLOW_MS // 1000} s; "
+                                 "not run after each edit (run volec test)")
                 if not cur.get("slow"):
                     texts.append(test_report(cur, last, shown))
                     entry["tests"] = {"fp": fp, "time": time.time(), "failed": cur.get("failed", []),
@@ -741,18 +741,18 @@ def verify(event, st, compiler, root, cwd, edited, at_turn_end=False):
     return "\n".join(t for t in texts if t), rec
 
 
-def tachyonc_shown(compiler, cwd):
+def volec_shown(compiler, cwd):
     """The compiler as the agent would type it."""
     if not compiler:
-        return "tachyonc"
+        return "volec"
     if compiler.startswith(cwd + os.sep):
         return os.path.relpath(compiler, cwd)
-    return "tachyonc" if os.path.basename(compiler) == "tachyonc" and which("tachyonc") == compiler \
+    return "volec" if os.path.basename(compiler) == "volec" and which("volec") == compiler \
         else compiler
 
 
 def main():
-    if os.environ.get("TACHYON_CHECK_HOOK") == "0":
+    if os.environ.get("VOLE_CHECK_HOOK") == "0":
         return 0
     try:
         event = json.load(sys.stdin)
@@ -785,10 +785,10 @@ def main():
 
 
 def record(event, cwd, rec):
-    """Into $TACHYON_CHECK_HOOK_LOG (the agent eval's, one JSON line per
+    """Into $VOLE_CHECK_HOOK_LOG (the agent eval's, one JSON line per
     check), else the query-first hook's log with who made it; best effort."""
     global qf
-    path = os.environ.get("TACHYON_CHECK_HOOK_LOG")
+    path = os.environ.get("VOLE_CHECK_HOOK_LOG")
     if path:
         rec["time"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         try:

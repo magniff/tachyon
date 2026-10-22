@@ -34,7 +34,7 @@ build; x86-64 is compiled and its encodings checked.
 | table lookup, shuffles | `vqtbl1q_u8`, `vextq_u8`, `vzip1q_u8` | `_mm_shuffle_epi8`, `_mm_alignr_epi8` (ssse3) |
 | saturating arithmetic | `vqaddq_u8`, `vqsubq_u8` | `_mm_adds_epu8`, `_mm_subs_epu8` (sse2) |
 
-The x86-64 column is Intel's names, SSE2 to AVX2 (`tachyonc query arch
+The x86-64 column is Intel's names, SSE2 to AVX2 (`volec query arch
 --arch x86_64` lists them, `--feature avx2` one feature's); the feature
 in parentheses is what the call needs beyond x86-64's baseline (sse2).
 
@@ -43,10 +43,10 @@ program needed; one intrinsic a line: name, features, instruction,
 what it does):
 
 ```sh
-tachyonc query arch saturating subtract u8    # aarch64::vqsubq_u8  neon  uqsub ...
-tachyonc query arch --feature crc             # every CRC intrinsic
-tachyonc query arch --equiv _mm_movemask_epi8 # the other architecture's way
-tachyonc query show vqtbl1q_u8                # signature, features, instruction, what it computes, its use line
+volec query arch saturating subtract u8    # aarch64::vqsubq_u8  neon  uqsub ...
+volec query arch --feature crc             # every CRC intrinsic
+volec query arch --equiv _mm_movemask_epi8 # the other architecture's way
+volec query show vqtbl1q_u8                # signature, features, instruction, what it computes, its use line
 ```
 
 ## Types
@@ -106,7 +106,7 @@ constant. What a function needs is inferred from its calls, as effects
 are, so helpers need no attribute: the error appears in the entry point
 (`main`, an `extern "C"` function, a test) at the call that is not
 guarded, with the intrinsic it comes from and an edit that adds the
-guard. `tachyonc query features NAME` prints a function's requirement,
+guard. `volec query features NAME` prints a function's requirement,
 `--why crc` the calls down to the intrinsic; `def`, `show` and `context`
 print it as `features: crc (inferred)` after its effects.
 
@@ -164,7 +164,7 @@ there, so one source serves both (no `cfg`).
 it, on every command that checks (`check`, `query`, the edits). A
 feature implies those below it (`avx2` => `avx` => `sse4.2` ... => `sse2`;
 `sha3` => `sha2` => `neon`); `aes` exists on both architectures, so
-`aarch64.aes` and `x86_64.aes` name one. `TACHYON_ARCH_DISABLE=crc,aes`
+`aarch64.aes` and `x86_64.aes` name one. `VOLE_ARCH_DISABLE=crc,aes`
 (or `all`) in the environment makes `detect` answer false for those at
 run time: the way to test a fallback on a machine that has the feature.
 It can only clear features, never add one.
@@ -397,5 +397,5 @@ x86-64's `_mm_sha256rnds2_epu32` does two rounds and wants the state as
 | `arch.multiversion` | a call one version cannot make | put it under `has("f")` |
 | `arch.feature_name`, `arch.feature_ambiguous` | an unknown name; `aes` of the other architecture | the suggested name; `aarch64.aes` |
 
-`tachyonc explain arch` lists them; `explain arch.feature` gives one in
+`volec explain arch` lists them; `explain arch.feature` gives one in
 full.

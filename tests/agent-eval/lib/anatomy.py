@@ -7,7 +7,7 @@ spent its calls on, which errors it met, how it recovered.
   the first turn's prompt and the median prompt per turn (fresh + cache
   write + cache read of one model call);
 - `roles`: calls by role (`lookup`: guide, query, explain, Read/Grep/Glob,
-  shell reads; `edit`: Write/Edit, tachyonc edit/refactor/fix/rewrite/undo,
+  shell reads; `edit`: Write/Edit, volec edit/refactor/fix/rewrite/undo,
   sed -i, perl -pi, a heredoc into a source file; `verify`: check, build,
   run, test, suite, cmp/diff, sh SCRIPT; `other`), one role per call (edit
   over verify over lookup); `segment_roles` counts every command of a
@@ -25,7 +25,7 @@ spent its calls on, which errors it met, how it recovered.
   `other`) and all the forms it has;
 - `ngrams`: the run's call sequence as tokens (`Write`, `build`, `run`,
   `query:show`, `edit:patch`, ...), its top bigrams and trigrams;
-- `guide_topics`: `tachyonc guide` topics and `--find` words fetched;
+- `guide_topics`: `volec guide` topics and `--find` words fetched;
 - `erosion` (intent erosion): items, test files and assert-like lines of
   the starter that are gone at the end (programs: starter against the
   final workspace; compiler tasks: changes.patch);
@@ -132,11 +132,11 @@ def load_hook_output(rdir):
 LOOKUP_SHELL = {"cat", "head", "tail", "grep", "egrep", "rg", "awk", "less", "more", "nl",
                 "wc", "ls", "find", "tree", "file", "stat", "xxd", "od", "hexdump"}
 VERIFY_SHELL = {"cmp", "diff", "sh", "bash", "time", "timeout", "hyperfine"}
-SOURCE_EXT = (".tach", ".rs")
+SOURCE_EXT = (".vl", ".rs")
 
 
 def segment_role(kind, seg):
-    if kind.startswith("tachyonc:"):
+    if kind.startswith("volec:"):
         sub = kind[9:]
         if sub in ("guide", "query", "explain", "other"):
             return "lookup"
@@ -199,7 +199,7 @@ def call_token(call, kinds):
     if not best:
         return "shell"
     _, k, s = best
-    if k.startswith("tachyonc:"):
+    if k.startswith("volec:"):
         sub = k[9:]
         if sub in ("query", "edit", "refactor", "fix"):
             w = [x for x in _words(s) if not x.startswith("-")]
@@ -251,7 +251,7 @@ for _c in ("E0382 E0499 E0502 E0505 E0506 E0507 E0515 E0716 E0597 E0596 E0384 E0
            "E0106 E0495 E0621 E0623 E0508 E0509 E0594 E0712 E0713 E0503 E0501").split():
     RUST_CODE_CLASS[_c] = "own"
 
-# Rust habits in tachyon errors: (tag, pattern on the message)
+# Rust habits in vole errors: (tag, pattern on the message)
 HABITS = [
     ("String/&str", re.compile(r"'(&?str|String|&str|&String)'|\bString\b")),
     ("Box/Rc/Arc", re.compile(r"'(Box|Rc|Arc|RefCell|Cell)'")),
@@ -334,7 +334,7 @@ def errors_in(text, lang, rust_build=False):
 
 
 def tool_errors_in(text):
-    """[(code, message)]: tachyonc tool problems (`error patch.no-match: ...`)."""
+    """[(code, message)]: volec tool problems (`error patch.no-match: ...`)."""
     out = []
     for line in (text or "").splitlines():
         m = TOOL_ERR.match(line.strip())
@@ -406,7 +406,7 @@ def denial_causes(call, ws=None):
 # ---------------------------------------------------------------- erosion
 
 ITEM_RE = {
-    ".tach": re.compile(r"^\s*(?:pub\s+)?(?:unsafe\s+)?(fn|struct|enum|trait|type|const|static)\s+"
+    ".vl": re.compile(r"^\s*(?:pub\s+)?(?:unsafe\s+)?(fn|struct|enum|trait|type|const|static)\s+"
                         r"(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)", re.M),
     ".rs": re.compile(r"^\s*(?:pub(?:\([a-z]+\))?\s+)?(?:unsafe\s+)?(fn|struct|enum|trait|type|"
                       r"const|static)\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)", re.M),
@@ -471,12 +471,12 @@ def erosion_patch(patch_path):
                 gone_tests.append(cur)
         elif line.startswith("-") and not line.startswith("---"):
             removed_lines[line[1:].strip()] += 1
-            m = ITEM_RE[".tach"].match(line[1:])
+            m = ITEM_RE[".vl"].match(line[1:])
             if m:
                 removed_items.add(m.group(2))
         elif line.startswith("+") and not line.startswith("+++"):
             added_lines[line[1:].strip()] += 1
-            m = ITEM_RE[".tach"].match(line[1:])
+            m = ITEM_RE[".vl"].match(line[1:])
             if m:
                 added_items.add(m.group(2))
     for l, n in (removed_lines - added_lines).items():
@@ -535,7 +535,7 @@ def for_run(rdir, res, starter=None, final=None):
         roles[role] += 1
         for k, s in kinds:
             seg_roles[segment_role(k, s)] += 1
-            if k == "tachyonc:guide":
+            if k == "volec:guide":
                 w = [x for x in _words(s)]
                 j = w.index("guide") if "guide" in w else -1
                 topics.append(" ".join(x.strip("'\"") for x in w[j + 1:j + 4]) or "core")
@@ -558,7 +558,7 @@ def for_run(rdir, res, starter=None, final=None):
     pending_fail = None
     for i, (c, kinds, role, tok) in enumerate(per_call, 1):
         # the guide and explain print example diagnostics: not errors met
-        reads_docs = any(k in ("tachyonc:guide", "tachyonc:explain") for k, _ in kinds) or (
+        reads_docs = any(k in ("volec:guide", "volec:explain") for k, _ in kinds) or (
             c["tool"] == "Read" and not str(c["input"].get("file_path", "")).endswith(SOURCE_EXT))
         texts = ([] if reads_docs else [c["text"]]) + [
             h.get("stdout", "") + "\n" + h.get("stderr", "") for h in hook_by_id.get(c["id"], [])]
@@ -584,16 +584,16 @@ def for_run(rdir, res, starter=None, final=None):
                 distinct[key] = {"class": cls, "code": code, "msg": msg[:160], "habit": habit,
                                  "call": i}
         verify_like = role in ("verify", "edit") and any(
-            k in ("tachyonc:check", "tachyonc:build", "rustc", "tachyonc:test")
+            k in ("volec:check", "volec:build", "rustc", "volec:test")
             or k.startswith("file:Write") or k.startswith("file:Edit")
-            or k in ("tachyonc:edit", "tachyonc:refactor", "tachyonc:fix")
+            or k in ("volec:edit", "volec:refactor", "volec:fix")
             for k, _ in kinds)
         if found and not c["denied"]:
             if open_ep is None:
                 open_ep = {"start": i, "errors": set()}
             open_ep["errors"] |= {(e[0], _MASK.sub("_", e[2])[:120]) for e in found}
         elif open_ep is not None and verify_like and not c["denied"] and not (
-                c["is_error"] and any(k in ("tachyonc:build", "rustc", "tachyonc:check")
+                c["is_error"] and any(k in ("volec:build", "rustc", "volec:check")
                                       for k, _ in kinds)):
             repair.append({"calls": i - open_ep["start"], "errors": len(open_ep["errors"])})
             open_ep = None
@@ -686,7 +686,7 @@ def analyze_main(args):
     import tarfile
     import tempfile
     from lib.common import EVAL_DIR, write_json
-    tmp = tempfile.mkdtemp(prefix="tachyon-eval-analyze-")
+    tmp = tempfile.mkdtemp(prefix="vole-eval-analyze-")
     n = bad = 0
     classes, habits, msgs = Counter(), Counter(), Counter()
     try:
@@ -732,7 +732,7 @@ def analyze_main(args):
         shutil.rmtree(tmp, ignore_errors=True)
     tot = sum(classes.values()) or 1
     print("%d runs analysed%s" % (n, ", %d mismatched" % bad if args.check else ""))
-    print("tachyon distinct errors by class (per run, summed): " + ", ".join(
+    print("vole distinct errors by class (per run, summed): " + ", ".join(
         "%s %d (%.0f%%)" % (k, v, 100.0 * v / tot) for k, v in classes.most_common()))
     print("Rust habits: " + ", ".join("%s %d" % kv for kv in habits.most_common()))
     print("top messages:")

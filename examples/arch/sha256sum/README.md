@@ -1,6 +1,6 @@
 # sha256sum: SHA-256 checksums by the sha2 instructions
 
-coreutils' `sha256sum`, in tachyon: the same output, options, messages
+coreutils' `sha256sum`, in vole: the same output, options, messages
 and exit codes, and faster than the system's on every workload measured
 below. Armv8's sha2 extension does SHA-256's compression four rounds an
 instruction (`vsha256hq_u32`, `vsha256h2q_u32`), and its message
@@ -25,7 +25,7 @@ coreutils' lists, BSD's `--tag` lines and its own.
 
 ## The design
 
-`sha256.tach` is the hashing; `main.tach` the command. Everything goes
+`sha256.vl` is the hashing; `main.vl` the command. Everything goes
 through one function, which hashes whole 64-byte blocks and picks the
 instructions once a call:
 
@@ -52,7 +52,7 @@ pub fn blocks(state: inout [u32], data: [u8]) {
   destructive form needs, and the bounds checks of the four loads.
 - **The fallback**, `blocks_portable`, is FIPS 180-4's rounds as the
   standard writes them, on `u32`s (their arithmetic wraps, as SHA-256
-  wants: tachyon defines it). `TACHYON_ARCH_DISABLE=all` forces it.
+  wants: vole defines it). `VOLE_ARCH_DISABLE=all` forces it.
 - **x86-64**: `blocks_x86` is the SHA extensions' version (`sha256rnds2`
   two rounds at a time on the state as `abef`/`cdgh`, `sha256msg1` and
   `sha256msg2` for the schedule). On an arm machine it is type-checked and
@@ -74,7 +74,7 @@ constant `true` and the fallback is not generated; on Linux (`generic`:
 Armv8.0) it is a real test.
 
 ```console
-$ tachyonc query features sha256::blocks sha256::blocks_arm sha256::blocks_x86 sha256::blocks_portable main -C target-cpu=generic
+$ volec query features sha256::blocks sha256::blocks_arm sha256::blocks_x86 sha256::blocks_portable main -C target-cpu=generic
 crate::sha256::blocks	none
 crate::sha256::blocks_arm	sha2 (declared)
 crate::sha256::blocks_x86	sse4.1, sha (declared)
@@ -88,15 +88,15 @@ place, and the few bytes after them (fewer than 64) move to its start.
 Nothing is allocated per block or per file; output is buffered (written
 at 64 KiB and at the end, and before an error, so the two streams keep
 their order). The C calls (`open`, `read`, `write`, `close`,
-`strerror`) are declared in `main.tach` without headers, so the program
+`strerror`) are declared in `main.vl` without headers, so the program
 also compiles for another target without its C library, and `errno.c`
 reads `errno`, which is a macro (a different function on each system)
-that tachyon's C import does not give.
+that vole's C import does not give.
 
 ## Run it
 
 ```console
-$ tachyonc main.tach errno.c -o sha256sum
+$ volec main.vl errno.c -o sha256sum
 ok: built sha256sum
 $ printf abc > abc.txt && : > empty.txt && ./sha256sum abc.txt empty.txt | tee sums
 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  abc.txt
@@ -118,7 +118,7 @@ sha256sum: nope: No such file or directory
 ```
 
 `test.sh` checks the rest, with a second build where sha2 is not in the
-baseline, so that `TACHYON_ARCH_DISABLE=all` takes the portable rounds:
+baseline, so that `VOLE_ARCH_DISABLE=all` takes the portable rounds:
 FIPS 180-4's examples and a million a's (the known answers), the lengths
 around the padding's edges (0, 1, 55, 56, 63, 64, 65, 119, 120) and the
 buffer's (1 MiB and one byte either side), as files and through a pipe
@@ -127,7 +127,7 @@ in 37-byte writes, 40 random files against the system's tool (coreutils'
 and the system's:
 
 ```console
-$ tachyonc -C target-cpu=generic main.tach errno.c -o sha256sum-generic
+$ volec -C target-cpu=generic main.vl errno.c -o sha256sum-generic
 ok: built sha256sum-generic
 $ sh test.sh
 known answers: 5 messages, both paths
@@ -140,7 +140,7 @@ all passed
 
 The suite also runs `tests/examples/arch-sha256sum*.test` (stdin, a
 missing file, `-c` with every kind of line), the generic build a second
-time with `TACHYON_ARCH_DISABLE=all`.
+time with `VOLE_ARCH_DISABLE=all`.
 
 ## Timings
 
@@ -169,7 +169,7 @@ tool                              1 GiB file          10,000 files   1 GiB pipe
 ./sha256sum                       0.381 s  2.82 GB/s  0.049 s        0.403 s  2.66 GB/s
 sha256sum (coreutils 9.1)         1.799 s  0.60 GB/s  0.173 s        1.920 s  0.56 GB/s
 openssl dgst -sha256 (3.0.22)     0.407 s  2.64 GB/s  0.069 s        0.538 s  2.00 GB/s
-./sha256sum, TACHYON_ARCH_DISABLE=all (the fallback)
+./sha256sum, VOLE_ARCH_DISABLE=all (the fallback)
                                   3.796 s  0.28 GB/s  0.318 s        3.892 s  0.28 GB/s
 ```
 

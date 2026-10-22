@@ -2,18 +2,18 @@
 ## header (its banner, or --header), moves a banner with most of its
 ## group, keeps the interface with --reexport, and tidies the imports
 ## of the files it edits (tests/refactor/splits/).
-$ main.tach -o prog
+$ main.vl -o prog
 ok: built prog
 % ./prog; echo "exit $?"
 exit 0
-## --reexport: code outside the module (main.tach) is left as it is.
+## --reexport: code outside the module (main.vl) is left as it is.
 $ refactor split crate::table --into crate::table::weights --items W_LOW,W_MID,W_HIGH,weight --reexport
 split crate::table: 4 items into crate::table::weights	2 files	+13 -10 lines
 % git status --short
- D table.tach
+ D table.vl
 ?? prog
 ?? table/
-% cat table/mod.tach
+% cat table/mod.vl
 // A table of kinds.
 
 mod weights;
@@ -31,7 +31,7 @@ pub fn describe(k: i64) -> i64 {
 fn spare() -> i64 {
     0
 }
-% cat table/weights.tach
+% cat table/weights.vl
 // Weights
 
 const W_LOW: i64 = 1;
@@ -42,7 +42,7 @@ const W_HIGH: i64 = 4;
 pub fn weight(k: i64) -> i64 {
     if k == 0 { W_LOW } else if k == 1 { W_MID } else { W_HIGH }
 }
-$ main.tach -o prog
+$ main.vl -o prog
 ok: built prog
 % ./prog; echo "exit $?"
 exit 0
@@ -51,7 +51,7 @@ undid split crate::table: 4 items into crate::table::weights	2 files	+13 -10 lin
 ## --header; the importers' use lines, tidied.
 $ refactor split crate::table --into crate::table::names --items describe,spare --header 'Describing kinds.'
 split crate::table: 2 items into crate::table::names	3 files	+17 -11 lines
-% cat table/names.tach
+% cat table/names.vl
 // Describing kinds.
 
 use crate::table::weight;
@@ -65,7 +65,7 @@ pub fn describe(k: i64) -> i64 {
 fn spare() -> i64 {
     0
 }
-% cat main.tach
+% cat main.vl
 // A program to split (tests/refactor/splits.t).
 mod table;
 
@@ -82,7 +82,7 @@ undid split crate::table: 2 items into crate::table::names	3 files	+17 -11 lines
 ## stays over its constants, and the new file gets a copy as its header.
 $ refactor split crate::table --into crate::table::names --items describe,spare,weight
 split crate::table: 3 items into crate::table::names	3 files	+22 -16 lines
-% cat table/names.tach
+% cat table/names.vl
 // Weights
 
 use crate::table::{W_HIGH, W_LOW, W_MID};
@@ -101,7 +101,7 @@ pub fn describe(k: i64) -> i64 {
 fn spare() -> i64 {
     0
 }
-% cat table/mod.tach
+% cat table/mod.vl
 // A table of kinds.
 
 pub mod names;
@@ -116,19 +116,19 @@ const W_HIGH: i64 = 4;
 $ undo
 undid split crate::table: 3 items into crate::table::names	3 files	+22 -16 lines
 $ refactor split crate::table --into crate::table::names --items spare --no-tidy --dry-run
---- a/table/names.tach
-+++ b/table/names.tach
+--- a/table/names.vl
++++ b/table/names.vl
 @@ -0,0 +1,5 @@
 +// Names
 +
 +pub fn spare() -> i64 {
 +    0
 +}
-diff --git a/table.tach b/table/mod.tach
-rename from table.tach
-rename to table/mod.tach
---- a/table.tach
-+++ b/table/mod.tach
+diff --git a/table.vl b/table/mod.vl
+rename from table.vl
+rename to table/mod.vl
+--- a/table.vl
++++ b/table/mod.vl
 @@ -2,0 +3,4 @@
 +mod names;
 +

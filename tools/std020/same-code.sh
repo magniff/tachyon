@@ -5,10 +5,10 @@
 # for the host, and their functions' code compared (norm.py: std's module
 # segments dropped from symbols, local and string labels made anonymous;
 # the string pool and std's source-position tables follow std's text,
-# which moved). `tachyonc same-output` compares bytes, which the new
+# which moved). `volec same-output` compares bytes, which the new
 # symbol names change.
 #
-# usage: tools/std020/same-code.sh OLD [NEW]   (NEW: target/tachyonc)
+# usage: tools/std020/same-code.sh OLD [NEW]   (NEW: target/volec)
 set -eu
 cd "$(dirname "$0")/../.."
 here=$PWD/tools/std020
@@ -26,10 +26,10 @@ if [ "${1:-}" = --one ]; then
     exit 0
 fi
 old=$1
-new=${2:-$PWD/target/tachyonc}
+new=${2:-$PWD/target/volec}
 work=$(mktemp -d "${TMPDIR:-/tmp}/std020.XXXXXX")
 trap 'rm -rf "$work"' EXIT
-{ ls tests/run/*.tach bench/*.tach; ls examples/*/main.tach examples/*/*/main.tach 2>/dev/null || true; } >"$work/corpus"
+{ ls tests/run/*.vl bench/*.vl; ls examples/*/main.vl examples/*/*/main.vl 2>/dev/null || true; } >"$work/corpus"
 for lvl in 0 1 2; do
     xargs -P 8 -I{} sh "$here/same-code.sh" --one "$old" "$new" "$lvl" {} <"$work/corpus"
 done >"$work/all"

@@ -125,12 +125,12 @@ def build(results, rundirs):
     short = lambda m: m.split(":", 1)[1] if ":" in m else m
     md += [table(["task", "kind"] + ["%s %s" % (short(m), c) for m, c in cols], rows), ""]
 
-    md += ["## tachyonc tools", "",
-           "Per run, means: calls of the tachyonc tools (query, edit, refactor, "
-           "check, fix, explain, undo, ...), `tachyonc guide` calls, and reading "
+    md += ["## volec tools", "",
+           "Per run, means: calls of the volec tools (query, edit, refactor, "
+           "check, fix, explain, undo, ...), `volec guide` calls, and reading "
            "or editing code without them (the file tools Read/Edit/Write/Grep/"
-           "Glob, or cat/sed/grep/head/tail/... in the shell). Share = tachyonc "
-           "tools / (tachyonc tools + the rest).", ""]
+           "Glob, or cat/sed/grep/head/tail/... in the shell). Share = volec "
+           "tools / (volec tools + the rest).", ""]
     rows = []
     for m in models:
         for c in conds:
@@ -144,7 +144,7 @@ def build(results, rundirs):
                     if is_tach_tool(k):
                         tach += n
                         subs[k[9:]] += n
-                    elif k == "tachyonc:guide":
+                    elif k == "volec:guide":
                         guide += n
                     elif is_plain_code_access(k):
                         plain += n
@@ -152,7 +152,7 @@ def build(results, rundirs):
             top = ", ".join("%s %d" % kv for kv in subs.most_common(5)) or "-"
             rows.append([m, c, len(rs), "%.1f" % (tach / n), "%.1f" % (guide / n),
                          "%.1f" % (plain / n), _pct(tach, tach + plain), top])
-    md += [table(["model", "cond", "runs", "tachyonc tools", "guide", "plain reads/edits",
+    md += [table(["model", "cond", "runs", "volec tools", "guide", "plain reads/edits",
                   "share", "top subcommands (total)"], rows), ""]
 
     md += compiler_section(results)
@@ -196,11 +196,11 @@ def compiler_section(results):
         by[(r["model"], r["cond"])].append(r)
         by[(r["model"], r["cond"], r["task"])].append(r)
     md = ["## Compiler tasks: tools against plain", "",
-          "Changes to tachyon's own compiler in a copy of the repository "
+          "Changes to vole's own compiler in a copy of the repository "
           "(tests/agent-eval/ctasks/). `compiler-tools`: AGENTS.md as it is, "
           "with the query-first and check hooks; `compiler-plain`: AGENTS.md "
           "without the tools table, no hooks (file tools and the shell; "
-          "tachyonc to build and test). A run succeeds when the compiler "
+          "volec to build and test). A run succeeds when the compiler "
           "builds (fixpoint), the task's test filters, same-output and "
           "grade.sh pass. Medians per run; cost is the list price.", ""]
     rows = []
@@ -252,7 +252,7 @@ def compiler_section(results):
         rows.append(row)
     md += [table(head, rows), ""]
 
-    md += ["How the code was read and changed, means per run: the tachyonc tools "
+    md += ["How the code was read and changed, means per run: the volec tools "
            "(query, edit, refactor, check, fix, ...), the file tools and shell "
            "reads, compiler builds and test-suite runs; with the tools, the "
            "query-first hook's blocks and `# no-query`/`# no-tool` escapes, and "
@@ -289,7 +289,7 @@ def compiler_section(results):
             rows.append([m, c, len(rs), "%.1f" % (tach / n), "%.1f" % (plain / n),
                          _pct(tach, tach + plain), "%.1f" % (builds / n), "%.1f" % (suites / n),
                          hooks, ", ".join("%s %d" % kv for kv in subs.most_common(4)) or "-"])
-    md += [table(["model", "cond", "runs", "tachyonc tools", "plain reads/edits", "share",
+    md += [table(["model", "cond", "runs", "volec tools", "plain reads/edits", "share",
                   "builds", "suite runs", "blocked / escapes / checks (errors)",
                   "top subcommands (total)"], rows), ""]
 
@@ -377,7 +377,7 @@ def anatomy_sections(results):
           "Medians per run (IQR of input tokens in brackets). Prompt: tokens the model "
           "read in one call (fresh + cache write + cache read), the first call and the "
           "median call. Calls by role, means per run: lookup (guide, query, Read, shell "
-          "reads), edit (Write/Edit, tachyonc edit/refactor/fix), verify (check, build, "
+          "reads), edit (Write/Edit, volec edit/refactor/fix), verify (check, build, "
           "run, test, cmp/diff); first edit: the call number of the first edit (median).", ""]
     rows = []
     for k in keys:
@@ -436,7 +436,7 @@ def anatomy_sections(results):
     if habits:
         tags = [t for t, _ in habits.most_common(10)]
         md += ["## Rust habits (0.17)", "",
-               "Distinct tachyon errors whose message shows a Rust habit, per tag: "
+               "Distinct vole errors whose message shows a Rust habit, per tag: "
                "total over the condition's runs.", ""]
         rows = [[k[0], k[1], len(by[k])] + [hb[k][t] or "-" for t in tags]
                 for k in keys if k[1] != "rust"]

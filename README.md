@@ -1,6 +1,8 @@
-# The Tachyon Programming Language
+<p align="center"><img src="docs/assets/vole-logo.png" alt="The vole logo" width="160"></p>
 
-Tachyon is a compiled systems language designed from the ground up to be
+# The Vole Programming Language
+
+Vole is a compiled systems language designed from the ground up to be
 used by AI agents. A new language is one no model has seen in training,
 so the compiler has to carry the knowledge: it answers questions about a
 program by name, makes semantic edits that are checked before anything is
@@ -8,7 +10,7 @@ written, and reports every problem as one line followed by the exact
 command to run next. The language underneath is small and explicit, with
 no undefined behaviour in safe code and no wildcard imports, so that what
 a program means can be read from its text. It compiles to native code on
-par with `clang -O2`, and the compiler is written in tachyon itself.
+par with `clang -O2`, and the compiler is written in vole itself.
 
 ```rust
 import "stdio.h" as c;
@@ -49,7 +51,7 @@ fn main() -> i32 {
 ```
 
 ```
-$ target/tachyonc shapes.tach -o shapes && ./shapes
+$ target/volec shapes.vl -o shapes && ./shapes
 10.14 7.00 2
 ```
 
@@ -62,40 +64,40 @@ unless declared `var`. The full grammar is in [docs/grammar.md](docs/grammar.md)
 
 ## Built for agents
 
-**The compiler teaches the language.** A newcomer has never seen tachyon,
-so `tachyonc guide` prints a core sized for a context window (about 2k
-tokens): where tachyon looks like Rust and means something else, as
-paired Rust and tachyon lines, std's most used items, the first errors
+**The compiler teaches the language.** A newcomer has never seen vole,
+so `volec guide` prints a core sized for a context window (about 2k
+tokens): where vole looks like Rust and means something else, as
+paired Rust and vole lines, std's most used items, the first errors
 with their fixes. The rest is on demand: `guide TOPIC`, `guide --find
 WORDS`, `guide TOPIC#SECTION` (std's API is generated from its source).
 It is built into the compiler, so it matches its version, and every
 example in it is compiled and run by the test suite.
 
 **The compiler is the toolset.** Agents read and change code through
-`tachyonc` instead of `grep`, `sed` and whole-file rewrites. Names are
+`volec` instead of `grep`, `sed` and whole-file rewrites. Names are
 resolved by the compiler, so a query sees uses through imports and
 ignores comments and strings:
 
 | to | run |
 |---|---|
-| read one item's source | `tachyonc query show Shape::area` |
-| find every resolved reference | `tachyonc query refs Area` (`--count`, `--in MODULE`) |
-| get a definition and signature | `tachyonc query def total` |
-| list a module, like a header | `tachyonc query items crate::middle::gvn` |
-| change a few lines inside an item | `tachyonc edit patch Shape::area --old 'r * r' --new 'r * r * 1.0'` |
-| rename, with every reference (and file) | `tachyonc refactor rename Area Measure` |
-| move items, imports and `pub` fixed | `tachyonc refactor move util::clamp --to crate::math` |
-| split a large module into files | `tachyonc refactor split crate::check --plan` |
-| replace an idiom, typed | `tachyonc rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: *IntVec'` |
-| see the front end's errors | `tachyonc check` (one line each) |
-| apply every mechanical fix | `tachyonc fix` (imports, unused, `pub`, `unsafe`) |
-| prove a refactoring changed nothing | `tachyonc same-output OLD_TACHYONC` |
+| read one item's source | `volec query show Shape::area` |
+| find every resolved reference | `volec query refs Area` (`--count`, `--in MODULE`) |
+| get a definition and signature | `volec query def total` |
+| list a module, like a header | `volec query items crate::middle::gvn` |
+| change a few lines inside an item | `volec edit patch Shape::area --old 'r * r' --new 'r * r * 1.0'` |
+| rename, with every reference (and file) | `volec refactor rename Area Measure` |
+| move items, imports and `pub` fixed | `volec refactor move util::clamp --to crate::math` |
+| split a large module into files | `volec refactor split crate::check --plan` |
+| replace an idiom, typed | `volec rewrite 'grow($v, $n)' '$v.reserve($n)' --where '$v: *IntVec'` |
+| see the front end's errors | `volec check` (one line each) |
+| apply every mechanical fix | `volec fix` (imports, unused, `pub`, `unsafe`) |
+| prove a refactoring changed nothing | `volec same-output OLD_VOLEC` |
 
 Also `refactor signature`, `field` and `variant` (every call, literal and
 `match` updated), `refactor --script` (many steps, checked once), and the
 planning queries `stats`, `deps`, `unused` and `impact`. Every edit is
 atomic: the front end checks the edited program first, and an edit that
-adds an error writes nothing. Edits are journaled; `tachyonc undo` takes
+adds an error writes nothing. Edits are journaled; `volec undo` takes
 the last one back. See [docs/query.md](docs/query.md),
 [docs/refactor.md](docs/refactor.md),
 [docs/refactor-shape.md](docs/refactor-shape.md) and
@@ -106,10 +108,10 @@ the last one back. See [docs/query.md](docs/query.md),
 they are:
 
 ```
-$ tachyonc edit patch Shape::area --old 'r * r' --new 'r * rr' shapes.tach
-shapes.tach:14:50: error[type error] undefined variable 'rr' | help: did you mean 'r'?
+$ volec edit patch Shape::area --old 'r * r' --new 'r * rr' shapes.vl
+shapes.vl:14:50: error[type error] undefined variable 'rr' | help: did you mean 'r'?
 error edit.breaks: 1 new error; nothing written
-try: tachyonc edit patch Shape::area --old 'r * r' --new 'r * rr' shapes.tach --no-check
+try: volec edit patch Shape::area --old 'r * r' --new 'r * rr' shapes.vl --no-check
 ```
 
 Query output is one fact per line with TAB-separated fields and no
@@ -130,11 +132,11 @@ owned values move and are dropped at the end of their scope, references
 (`&T`, `&mut T`) and slices are checked so that none outlives or is
 invalidated under what it views (aliasing XOR mutation). See
 "Undefined behaviour" in [docs/grammar.md](docs/grammar.md) and
-`tachyonc guide memory`.
+`volec guide memory`.
 
 **Every name is traceable.** There are no wildcard imports: every name a
 file uses is declared there, imported by name, or written with its path,
-including C declarations (`c::printf`). `tachyonc fix --only imports` adds
+including C declarations (`c::printf`). `volec fix --only imports` adds
 the `use` lines a program is missing.
 
 **Deterministic builds.** The output is byte-for-byte reproducible and
@@ -143,10 +145,10 @@ output (the fixpoint), and the compiler cross-built for aarch64-linux is
 checked to rebuild there to the same object, byte for byte.
 
 **Measured, not assumed.** Every release traces how agents read, search
-and edit tachyon code, and how much of it went through `tachyonc` rather
+and edit vole code, and how much of it went through `volec` rather
 than the shell; the gaps decide the next release's tools. In the first
 measurement with the query tools, 64% of source reads went through
-`tachyonc query`, against a history in which 56% of all source operations
+`volec query`, against a history in which 56% of all source operations
 were line-range reads (`sed -n`, `head`). Edits inside a function were
 still mostly scripted text replacement, which is why 0.12 added `edit
 patch`. The record is [docs/agent-tool-usage.md](docs/agent-tool-usage.md).
@@ -164,7 +166,7 @@ and ELF objects directly ([docs/optimizer.md](docs/optimizer.md)).
 
 Release 0.11 on Apple silicon (fastest of 9 runs, ms):
 
-| program | tachyon -O2 | clang -O2 |
+| program | vole -O2 | clang -O2 |
 |---|---|---|
 | binarytrees | 156 | 163 |
 | collatz | 292 | 295 |
@@ -181,7 +183,7 @@ Release 0.11 on Apple silicon (fastest of 9 runs, ms):
 | wordcount | 89 | 71 |
 | **geometric mean, against clang** | **0.953** | **1** |
 
-Tachyon is ahead on matmul (vectorized), fannkuch and sieve, and behind
+Vole is ahead on matmul (vectorized), fannkuch and sieve, and behind
 on json, wordcount, nbody, sort and mandelbrot; what remains against
 clang (bounds checks, FMA) is in the optimizer notes. These are thirteen
 small programs, measured on one machine (aarch64-macos); they say little
@@ -190,7 +192,7 @@ about large applications. Every release's numbers are in
 
 Compile speed, on the compiler's own source (71,900 lines, 0.11): 143 ms
 to an object at `-O0`, 1.21 s at `-O2` (1.23 s to an executable, `cc`
-linking); `tachyonc check` answers in 44 ms and `query refs` in 49 ms.
+linking); `volec check` answers in 44 ms and `query refs` in 49 ms.
 
 ## C interop
 
@@ -208,7 +210,7 @@ layouts are compared with C for every record of 55 to 65 system headers.
 
 ## Getting it
 
-The compiler is written in tachyon, so the first binary comes from the
+The compiler is written in vole, so the first binary comes from the
 release chain: the seed, a frozen Rust implementation, builds 0.1.0, each
 release builds the next, and the last builds the working tree. Every step
 must reach its fixpoint and pass its release's test suite
@@ -224,14 +226,14 @@ The seed pins Rust 1.98.0 (`seed/rust-toolchain.toml`), which rustup
 installs on first use.
 
 ```sh
-git clone <repository> tachyon && cd tachyon && git fetch --tags
-bootstrap/bootstrap.sh                   # the chain; leaves target/tachyonc
+git clone <repository> vole && cd vole && git fetch --tags
+bootstrap/bootstrap.sh                   # the chain; leaves target/volec
 ```
 
 Build and run a program, then test:
 
 ```sh
-target/tachyonc examples/md5/main.tach -o md5   # an executable (cc links it)
+target/volec examples/md5/main.vl -o md5   # an executable (cc links it)
 ./md5 < README.md
 tests/run.sh                             # the test suite, for the host
 tests/run.sh -O 0 match                  # cases named *match*, at -O0
@@ -245,10 +247,12 @@ checks every release; `-g` writes DWARF line tables.
 
 ## Status
 
-Tachyon is at 0.x: the language is not stable, and minor releases may
-break programs (with a `tachyonc fix` migration from 0.14 on). The
-current release is 0.23.0: windows and input in std (std::window, on
-Cocoa) and a terminal emulator on them (examples/voltty); on 0.22's GPU
+Vole is at 0.x: the language is not stable, and minor releases may
+break programs (with a `volec fix` migration from 0.14 on). The
+current release is 0.24.0, the first named vole: the rename from
+tachyon, a language server with a VS Code extension (editors/vscode),
+std::cli; on 0.23's windows (std::window, on Cocoa) and terminal
+emulator (examples/voltty), 0.22's GPU
 support (std::gpu with the Metal backend, std::gpu::wgsl compiling WGSL
 to MSL), 0.21's threads with what crosses them checked (std::thread,
 std::sync), Hylo-style parameter conventions (`let`, `inout`, `sink`,
@@ -257,8 +261,7 @@ CPU intrinsics, 0.18's contracts and tests, 0.17's mutable value
 semantics and 0.16's effects and explicit allocators. See [docs/releases.md](docs/releases.md)
 for every release. Next:
 
-- **0.24**: a language server and an editor extension, and the language renamed to vole
-- **then**: the specification, the whole language written down with the user
+- **0.25**: the specification, the whole language written down with the user
 
 **Toward 1.0.** 1.0 is not a feature milestone. It ships when the
 surface language has been reworked against real programs, the tools
@@ -271,7 +274,7 @@ changes wait for 2.0. See [docs/roadmap.md](docs/roadmap.md) and
 
 | | |
 |---|---|
-| `compiler/` | the compiler, in tachyon, in folders by phase: `front`, `middle`, `back`, `gen0`, `base`, `tools` ([compiler/README.md](compiler/README.md)) |
+| `compiler/` | the compiler, in vole, in folders by phase: `front`, `middle`, `back`, `gen0`, `base`, `tools` ([compiler/README.md](compiler/README.md)) |
 | `docs/` | the grammar, the optimizer, the tools, releases and the roadmap |
 | `examples/` | example programs, one folder each with a README: C interop, algorithms, the language tour ([examples/README.md](examples/README.md)) |
 | `tests/`, `bench/` | the test suite and fuzzers, the benchmarks with their C versions |

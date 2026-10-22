@@ -1,12 +1,12 @@
-// C half of tests/run/align_over16.tach: structs aligned above 16, passed
-// to and from tachyon by value and by pointer.
+// C half of tests/run/align_over16.vl: structs aligned above 16, passed
+// to and from vole by value and by pointer.
 #include <stdint.h>
 
 struct __attribute__((aligned(64))) A64 { long x; long y; };
 struct __attribute__((aligned(32))) A32 { double d; int i; };
 
-long tachyon_take_a64(long a, struct A64 s, long b);
-struct A64 tachyon_make_a64(long x);
+long vole_take_a64(long a, struct A64 s, long b);
+struct A64 vole_make_a64(long x);
 
 static int misaligned(const void *p, uintptr_t align) {
     return ((uintptr_t)p & (align - 1)) != 0;
@@ -29,10 +29,10 @@ long c_check_ptr(const struct A64 *p) {
     return misaligned(p, 64) ? -1 : p->x + p->y;
 }
 
-long c_call_tachyon(long x) {
-    struct A64 s = tachyon_make_a64(x);
+long c_call_vole(long x) {
+    struct A64 s = vole_make_a64(x);
     if (misaligned(&s, 64)) {
         return -1;
     }
-    return tachyon_take_a64(1, s, 2);
+    return vole_take_a64(1, s, 2);
 }

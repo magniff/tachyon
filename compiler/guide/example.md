@@ -1,6 +1,6 @@
 # A whole program (0.17)
 
-One complete program, written the way tachyon code is written: modules
+One complete program, written the way vole code is written: modules
 and `use`, enums with data and `match`, `Result` and `?`, `Vec`,
 `HashMap`, `Buf`, text as `[u8]`, a sort closure, f-strings, the
 allocator passed down from `main`, and a test case. A program of this
@@ -8,9 +8,9 @@ kind needs only what it shows: copy its patterns.
 
 `stock` reads commands from stdin, one a line, and prints a line for
 each command it rejects and the report it is asked for. It has three
-files next to each other: `tachyonc main.tach -o prog` builds them all.
+files next to each other: `volec main.vl -o prog` builds them all.
 
-```tach main.tach
+```tach main.vl
 // stock: a ledger of items. Reads commands from stdin, one a line; prints
 // the report it is asked for, and a line for each command it rejects.
 mod command;
@@ -54,7 +54,7 @@ fn cut_comment(s: [u8]) -> [u8] {
 }
 ```
 
-```tach command.tach
+```tach command.vl
 // A line of input as a Command, or the Error that rejects it.
 
 // pub on a struct makes its fields visible with it. Clone: Vec::clone
@@ -125,7 +125,7 @@ fn number(w: [u8]) -> Result<i64, Error> {
 }
 ```
 
-```tach store.tach
+```tach store.vl
 // The items in stock, in the order they were first added.
 
 use command::{Command, Error, Item};
@@ -193,8 +193,8 @@ fn value(it: Item) -> i64 {
 ```
 
 A test case is two files: the input in `tests/basic.in`, the expected
-output in `tests/basic.out`. `tachyonc test` builds the program and runs
-every case (`test main.tach: 1 passed (tests/)`, or the first lines that
+output in `tests/basic.out`. `volec test` builds the program and runs
+every case (`test main.vl: 1 passed (tests/)`, or the first lines that
 differ):
 
 ```in
@@ -240,7 +240,7 @@ total 129
 - Nothing allocates without an allocator. `main` gets `gpa` and passes
   it down. A function that allocates takes `gpa: Gpa`; one holding a
   `Vec` can use `v.allocator()`. Nothing is freed by hand: a value is
-  dropped at the end of its scope (`tachyonc guide memory`).
+  dropped at the end of its scope (`volec guide memory`).
 - Parameters are let by default: read-only, borrowed for the call
   (`value(it)`, `report(self)`). One that changes its argument says
   `inout`, and the call marks it: `run(store: inout Store, ..)` is

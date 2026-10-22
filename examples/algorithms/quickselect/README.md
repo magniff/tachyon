@@ -7,7 +7,7 @@ ranks (minimum, percentiles, median, maximum) in 26 ms and 176 ms,
 against 94 ms for sorting, and agree with the sorted order.
 
 ```sh
-tachyonc examples/algorithms/quickselect/main.tach -o select && ./select
+volec examples/algorithms/quickselect/main.vl -o select && ./select
 ```
 
 ## The problem
@@ -202,12 +202,12 @@ baseline. The seven ranks of 2 million values, Apple M-series:
 
 | | quickselect | median of medians | sort |
 |---|---|---|---|
-| tachyon 0.15, `-O2` (the default) | 26 ms | 176 ms | 94 ms (`std::sort`) |
-| tachyon 0.15, `-O1` | 24 ms | 213 ms | 95 ms |
-| tachyon 0.15, `-O0` | 87 ms | 921 ms | 302 ms |
+| vole 0.15, `-O2` (the default) | 26 ms | 176 ms | 94 ms (`std::sort`) |
+| vole 0.15, `-O1` | 24 ms | 213 ms | 95 ms |
+| vole 0.15, `-O0` | 87 ms | 921 ms | 302 ms |
 | C, `clang -O2` | 24 ms | 154 ms | 137 ms (`qsort`) |
 
-The generic tachyon functions, instantiated for `i64`, are within 1.15x
+The generic vole functions, instantiated for `i64`, are within 1.15x
 of the hand-specialized C, with every index checked. `std::sort` beats
 `qsort` because it is generic too: the comparison is inlined, where
 `qsort` calls a function pointer per comparison.
@@ -216,14 +216,14 @@ of the hand-specialized C, with every index checked. `std::sort` beats
 
 | feature | where | guide |
 |---|---|---|
-| generic functions with a bound: `<T: Ord>`, `<` through `cmp` | `quickselect`, `median_of_medians`, `partition3` | `tachyonc guide generics`, `guide traits` |
-| `inout [T]` views, written through, re-sliced: `w = &w[gt..]` | `median_of_medians` | `tachyonc guide types`, `guide memory` |
-| tuples returned and destructured, in a `Vec` and in `for` | `partition3`, `main` | `tachyonc guide syntax` |
-| closures as `FnMut` arguments, a `var` captured and changed | `ranks`, `main` | `tachyonc guide closures` |
-| iterators: ranges as values, `map`, `collect`, `enumerate` | `ranks`, `main` | `tachyonc guide iterators` |
-| `clone()` of a `Vec`, `==` / `!=` on `Vec` contents | `check_median`, `main` | `tachyonc guide formatting`, `guide std` |
-| `defer` in a loop body | `main` | `tachyonc guide memory` |
-| f-strings with alignment, an `if` inside a hole | output | `tachyonc guide formatting` |
+| generic functions with a bound: `<T: Ord>`, `<` through `cmp` | `quickselect`, `median_of_medians`, `partition3` | `volec guide generics`, `guide traits` |
+| `inout [T]` views, written through, re-sliced: `w = &w[gt..]` | `median_of_medians` | `volec guide types`, `guide memory` |
+| tuples returned and destructured, in a `Vec` and in `for` | `partition3`, `main` | `volec guide syntax` |
+| closures as `FnMut` arguments, a `var` captured and changed | `ranks`, `main` | `volec guide closures` |
+| iterators: ranges as values, `map`, `collect`, `enumerate` | `ranks`, `main` | `volec guide iterators` |
+| `clone()` of a `Vec`, `==` / `!=` on `Vec` contents | `check_median`, `main` | `volec guide formatting`, `guide std` |
+| `defer` in a loop body | `main` | `volec guide memory` |
+| f-strings with alignment, an `if` inside a hole | output | `volec guide formatting` |
 
 ## Try
 

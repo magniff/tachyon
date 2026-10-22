@@ -3,8 +3,8 @@
 ## found.
 ## A method #[derive] makes: the attribute answers (0.15).
 $ items
-crate	syntax015/main.tach	6
-std	<std>	590
+crate	syntax015/main.vl	6
+std	<std>	592
 std::ops	<std>	5
 std::iter	<std>	67
 std::slice	<std>	37
@@ -77,13 +77,14 @@ std::window	<std>	48
 std::window::cocoa	<std>	115
 std::window::keys	<std>	27
 std::window::objc	<std>	88
+std::cli	<std>	71
 std::arch	<std::arch>	3
 std::arch::aarch64	<std::arch::aarch64>	138
 std::arch::x86_64	<std::arch::x86_64>	6
 std::arch::aarch64::raw	<std::arch::aarch64::raw>	110
 std::arch::x86_64::raw	<std::arch::x86_64::raw>	6
 $ show main
-// crate::main	syntax015/main.tach:25-31	effects: io global panic
+// crate::main	syntax015/main.vl:25-31	effects: io global panic
 fn main() -> Option<i64> {
     let x = half(8)?;
     let y = area(x, h: 2);
@@ -92,15 +93,15 @@ fn main() -> Option<i64> {
     Some(p.x)
 }
 $ grep 'f"' --strings
-# syntax015/main.tach
+# syntax015/main.vl
 29:13	string	main	println(f"p = {p:?}, x = {x:>4}, {{y}} = {y:08x}");
 $ refs area
-# syntax015/main.tach
+# syntax015/main.vl
 13:4	def	fn area(w: i64, h: i64 = 1) -> i64 {
 27:13	call	main	let y = area(x, h: 2);
-$ type syntax015/main.tach:22:26
+$ type syntax015/main.vl:22:26
 i64	x
 $ def P::cmp
-note query.derived: 'P::cmp' is derived, at syntax015/main.tach:6:14: #[derive] makes it; it has no source of its own
-try: tachyonc query show crate::P
+note query.derived: 'P::cmp' is derived, at syntax015/main.vl:6:14: #[derive] makes it; it has no source of its own
+try: volec query show crate::P
 [exit 1]

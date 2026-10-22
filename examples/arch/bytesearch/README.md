@@ -34,7 +34,7 @@ length and offset up to 300 bytes, for four needles, and a `z` at every
 position:
 
 ```console
-$ tachyonc main.tach -o bytesearch && ./bytesearch
+$ volec main.vl -o bytesearch && ./bytesearch
 19500 searches, 0 wrong
 first 'q' at 10, first 'z' at -1
 ok: built bytesearch
@@ -47,7 +47,7 @@ instruction, with no program; `--equiv` gives the other architecture's
 way:
 
 ```console
-$ tachyonc query arch --equiv _mm_movemask_epi8
+$ volec query arch --equiv _mm_movemask_epi8
 x86_64::_mm_movemask_epi8	sse2	pmovmskb <a>, <d:w>	the 16 bytes' top bits as a 16-bit mask
 equivalent: aarch64: (recipe) vshrn_n_u16(vreinterpretq_u16_u8(m), 4)
 aarch64::vshrn_n_u16	neon	shrn <d>.8b, <a>.8h, #<n>	each lane shifted right by n, narrowed to its low half (the NEON movemask: n = 4 gives 4 bits per byte)
@@ -60,10 +60,10 @@ SSE2 one needs sse2, which an AArch64 build never has, so it may only
 be called under `detect("sse2")` (or `has`), where it is dead code:
 
 ```console
-$ tachyonc query def find_byte_neon find_byte_sse2 find_byte
-crate::find_byte_neon	main.tach:33:4	fn	fn find_byte_neon(s: [u8], b: u8, from: i64) -> i64	effects: panic diverge
-crate::find_byte_sse2	main.tach:59:4	fn	fn find_byte_sse2(s: [u8], b: u8, from: i64) -> i64	effects: panic diverge	features: sse2 (inferred)
-crate::find_byte	main.tach:75:4	fn	fn find_byte(s: [u8], b: u8) -> i64	effects: panic diverge
+$ volec query def find_byte_neon find_byte_sse2 find_byte
+crate::find_byte_neon	main.vl:33:4	fn	fn find_byte_neon(s: [u8], b: u8, from: i64) -> i64	effects: panic diverge
+crate::find_byte_sse2	main.vl:59:4	fn	fn find_byte_sse2(s: [u8], b: u8, from: i64) -> i64	effects: panic diverge	features: sse2 (inferred)
+crate::find_byte	main.vl:75:4	fn	fn find_byte(s: [u8], b: u8) -> i64	effects: panic diverge
 std::string::find_byte	<std>:40877:4	fn	fn find_byte(b: u8, s: [u8], from: i64) -> i64	effects: panic diverge
 ```
 

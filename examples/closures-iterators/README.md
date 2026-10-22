@@ -8,10 +8,10 @@ an iterator of its own.
 
 ## Build and run
 
-From this folder (with `tachyonc` on your `PATH`, or `../../target/tachyonc`):
+From this folder (with `volec` on your `PATH`, or `../../target/volec`):
 
 ```sh
-tachyonc main.tach -o closures-iterators
+volec main.vl -o closures-iterators
 ./closures-iterators < access.log
 ```
 
@@ -158,16 +158,16 @@ zipping the entries with `all[1..]` pairs each request with the next.
 
 ## Language features
 
-- closures, captures (a `var` inout, the rest let), `sink ||`, `Fn`/`FnMut` bounds: `tachyonc guide closures`
-- `Iterator`, `type Item`, adapters and consumers, `sort_by`: `tachyonc guide iterators`
-- `Option` and `?`, `.ok()`: `tachyonc guide conversions`
-- `HashMap`, `split_whitespace`, `parse_int`, `read_stdin`: `tachyonc guide std`
-- f-string specs (`{n:>3}`, `{service:<6}`): `tachyonc guide formatting`
-- `#[derive(Eq, Debug)]` on an enum: `tachyonc guide formatting`
+- closures, captures (a `var` inout, the rest let), `sink ||`, `Fn`/`FnMut` bounds: `volec guide closures`
+- `Iterator`, `type Item`, adapters and consumers, `sort_by`: `volec guide iterators`
+- `Option` and `?`, `.ok()`: `volec guide conversions`
+- `HashMap`, `split_whitespace`, `parse_int`, `read_stdin`: `volec guide std`
+- f-string specs (`{n:>3}`, `{service:<6}`): `volec guide formatting`
+- `#[derive(Eq, Debug)]` on an enum: `volec guide formatting`
 
 ## Going further
 
-What Rust has that tachyon does not (yet), and what to write instead:
+What Rust has that vole does not (yet), and what to write instead:
 
 - `iter_mut`: loop over indices, `v.set(i, v.get(i) * 2)`.
 - `rev`, `step_by`, `chain`, `flat_map`, `peekable`: write the loop, or

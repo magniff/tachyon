@@ -1,0 +1,287 @@
+// The checking mode for unsafe code (0.10): `volec --check-unsafe`.
+//
+// Unsafe code's raw-pointer accesses (a dereference, an index, a field
+// through a raw pointer, a slice made from one) are checked at run time
+// against the heap blocks the program has allocated: the calls of C's
+// malloc, calloc, realloc and free made by vole code (std's included)
+// go to wrappers in the runtime (the module __check, whose source is built
+// in below and added to the program), which record the live blocks and
+// the last freed ones. An access is an error, reported with its place in
+// the source and exit code 101, when it
+//
+// - starts in a live block and runs past its end (out of bounds),
+// - starts before a live block and runs into it,
+// - falls in a block freed since (use after free), or frees a freed one.
+//
+// Memory the program did not allocate itself (the stack, statics, what C
+// allocates) is not checked: the check knows the heap blocks only.
+
+use crate::base::{buf_str, intern_c, sym_name};
+use crate::front::stdalloc::CHECK_ALLOC_MODE;
+use crate::front::types::{FNS, SYM_FN};
+
+pub static var CHECK_UNSAFE: bool = false;
+// The module of the runtime, or -1.
+pub static var CHECK_MODULE: i64 = -1;
+
+// The runtime, as vole source.
+pub fn check_runtime_source(out: i64) {
+    unsafe {
+        buf_str(out,
+            c"// The checking mode's runtime (0.10): see compiler/src/unsafecheck.vl.\n");
+        buf_str(out, c"extern \"C\" {\n");
+        buf_str(out, c"    fn malloc(size: u64) -> *u8;\n");
+        buf_str(out, c"    fn calloc(count: u64, size: u64) -> *u8;\n");
+        buf_str(out, c"    fn realloc(p: *u8, size: u64) -> *u8;\n");
+        buf_str(out, c"    fn free(p: *u8);\n");
+        buf_str(out, c"    fn memmove(dst: *u8, src: *u8, n: u64) -> *u8;\n");
+        buf_str(out, c"    fn dprintf(fd: i32, format: *u8, ...) -> i32;\n");
+        buf_str(out, c"    fn exit(code: i32) -> !;\n");
+        buf_str(out, c"}\n");
+        buf_str(out, c"// The live blocks: [STARTS[i], ENDS[i]), sorted.\n");
+        buf_str(out, c"// The freed ones: the last FREED freed, in a ring, with the range they\n");
+        buf_str(out, c"// span (FLO, FHI) to pass most addresses by at once.\n");
+        buf_str(out, c"static mut STARTS: *u64 = 0 as *u64;\n");
+        buf_str(out, c"static mut ENDS: *u64 = 0 as *u64;\n");
+        buf_str(out, c"static mut COUNT: i64 = 0;\n");
+        buf_str(out, c"static mut CAP: i64 = 0;\n");
+        buf_str(out, c"const FREED: i64 = 4096;\n");
+        buf_str(out, c"static mut FSTARTS: *u64 = 0 as *u64;\n");
+        buf_str(out, c"static mut FENDS: *u64 = 0 as *u64;\n");
+        buf_str(out, c"static mut FNEXT: i64 = 0;\n");
+        buf_str(out, c"static mut FLO: u64 = 18446744073709551615;\n");
+        buf_str(out, c"static mut FHI: u64 = 0;\n");
+        buf_str(out, c"unsafe fn fail(what: *u8, p: u64, size: u64, start: u64, end: u64, site: *u8) -> ! {\n");
+        buf_str(out, c"    dprintf(2, c\"unsafe access %s: %llu bytes at offset %lld of a block of %llu bytes\\n --> %s\\n\", what, size, p as i64 - start as i64, end - start, site);\n");
+        buf_str(out, c"    exit(101)\n");
+        buf_str(out, c"}\n");
+        buf_str(out, c"// The index of the last live block starting at or before p, or -1.\n");
+        buf_str(out, c"unsafe fn find(p: u64) -> i64 {\n");
+        buf_str(out, c"    let mut lo = 0;\n");
+        buf_str(out, c"    let mut hi = COUNT;\n");
+        buf_str(out, c"    while lo < hi {\n");
+        buf_str(out, c"        let mid = (lo + hi) / 2;\n");
+        buf_str(out, c"        if STARTS[mid] <= p {\n");
+        buf_str(out, c"            lo = mid + 1;\n");
+        buf_str(out, c"        } else {\n");
+        buf_str(out, c"            hi = mid;\n");
+        buf_str(out, c"        }\n");
+        buf_str(out, c"    }\n");
+        buf_str(out, c"    lo - 1\n");
+        buf_str(out, c"}\n");
+        buf_str(out, c"// The freed block holding p, or -1.\n");
+        buf_str(out, c"unsafe fn find_freed(p: u64) -> i64 {\n");
+        buf_str(out, c"    if p < FLO || p >= FHI {\n");
+        buf_str(out, c"        return -1;\n");
+        buf_str(out, c"    }\n");
+        buf_str(out, c"    for k in 0..FREED {\n");
+        buf_str(out, c"        if p >= FSTARTS[k] && p < FENDS[k] {\n");
+        buf_str(out, c"            return k;\n");
+        buf_str(out, c"        }\n");
+        buf_str(out, c"    }\n");
+        buf_str(out, c"    -1\n");
+        buf_str(out, c"}\n");
+        buf_str(out, c"unsafe fn record(p: *u8, size: u64) {\n");
+        buf_str(out, c"    if p == 0 as *u8 {\n");
+        buf_str(out, c"        return;\n");
+        buf_str(out, c"    }\n");
+        buf_str(out, c"    let s = p as u64;\n");
+        buf_str(out, c"    let e = s + (if size == 0 { 1 } else { size });\n");
+        buf_str(out, c"    // Freed blocks the new one reuses are forgotten.\n");
+        buf_str(out, c"    if FSTARTS != 0 as *u64 && s < FHI && e > FLO {\n");
+        buf_str(out, c"        for k in 0..FREED {\n");
+        buf_str(out, c"            if FSTARTS[k] < e && s < FENDS[k] {\n");
+        buf_str(out, c"                FSTARTS[k] = 0;\n");
+        buf_str(out, c"                FENDS[k] = 0;\n");
+        buf_str(out, c"            }\n");
+        buf_str(out, c"        }\n");
+        buf_str(out, c"    }\n");
+        buf_str(out, c"    if COUNT == CAP {\n");
+        buf_str(out, c"        CAP = if CAP == 0 { 256 } else { CAP * 2 };\n");
+        buf_str(out, c"        STARTS = realloc(STARTS as *u8, (CAP * 8) as u64) as *u64;\n");
+        buf_str(out, c"        ENDS = realloc(ENDS as *u8, (CAP * 8) as u64) as *u64;\n");
+        buf_str(out, c"    }\n");
+        buf_str(out, c"    let at = find(s) + 1;\n");
+        buf_str(out,
+            c"    memmove(&STARTS[at + 1] as *u8, &STARTS[at] as *u8, ((COUNT - at) * 8) as u64);\n");
+        buf_str(out,
+            c"    memmove(&ENDS[at + 1] as *u8, &ENDS[at] as *u8, ((COUNT - at) * 8) as u64);\n");
+        buf_str(out, c"    STARTS[at] = s;\n");
+        buf_str(out, c"    ENDS[at] = e;\n");
+        buf_str(out, c"    COUNT += 1;\n");
+        buf_str(out, c"}\n");
+        buf_str(out, c"// Forgets block p (when it is one), into the freed ring.\n");
+        buf_str(out, c"unsafe fn unrecord(p: *u8, site: *u8) {\n");
+        buf_str(out, c"    if p == 0 as *u8 {\n");
+        buf_str(out, c"        return;\n");
+        buf_str(out, c"    }\n");
+        buf_str(out, c"    let s = p as u64;\n");
+        buf_str(out, c"    let i = find(s);\n");
+        buf_str(out, c"    if i < 0 || STARTS[i] != s {\n");
+        buf_str(out, c"        let k = find_freed(s);\n");
+        buf_str(out, c"        if k >= 0 && FSTARTS[k] == s {\n");
+        buf_str(out,
+            c"            fail(c\"(a block freed twice)\", s, 0, FSTARTS[k], FENDS[k], site);\n");
+        buf_str(out, c"        }\n");
+        buf_str(out, c"        return;\n");
+        buf_str(out, c"    }\n");
+        buf_str(out, c"    if FSTARTS == 0 as *u64 {\n");
+        buf_str(out, c"        FSTARTS = calloc(FREED as u64, 8) as *u64;\n");
+        buf_str(out, c"        FENDS = calloc(FREED as u64, 8) as *u64;\n");
+        buf_str(out, c"    }\n");
+        buf_str(out, c"    FSTARTS[FNEXT] = s;\n");
+        buf_str(out, c"    FENDS[FNEXT] = ENDS[i];\n");
+        buf_str(out, c"    FNEXT = (FNEXT + 1) % FREED;\n");
+        buf_str(out, c"    if s < FLO {\n");
+        buf_str(out, c"        FLO = s;\n");
+        buf_str(out, c"    }\n");
+        buf_str(out, c"    if ENDS[i] > FHI {\n");
+        buf_str(out, c"        FHI = ENDS[i];\n");
+        buf_str(out, c"    }\n");
+        buf_str(out, c"    memmove(&STARTS[i] as *u8, &STARTS[i + 1] as *u8, ((COUNT - i - 1) * 8) as u64);\n");
+        buf_str(out,
+            c"    memmove(&ENDS[i] as *u8, &ENDS[i + 1] as *u8, ((COUNT - i - 1) * 8) as u64);\n");
+        buf_str(out, c"    COUNT -= 1;\n");
+        buf_str(out, c"}\n");
+        buf_str(out, c"pub unsafe fn malloc_(size: u64) -> *u8 {\n");
+        buf_str(out, c"    let p = malloc(size);\n");
+        buf_str(out, c"    record(p, size);\n");
+        buf_str(out, c"    p\n");
+        buf_str(out, c"}\n");
+        buf_str(out, c"pub unsafe fn calloc_(count: u64, size: u64) -> *u8 {\n");
+        buf_str(out, c"    let p = calloc(count, size);\n");
+        buf_str(out, c"    record(p, count * size);\n");
+        buf_str(out, c"    p\n");
+        buf_str(out, c"}\n");
+        buf_str(out, c"pub unsafe fn realloc_(old: *u8, size: u64) -> *u8 {\n");
+        buf_str(out, c"    unrecord(old, c\"realloc\");\n");
+        buf_str(out, c"    let p = realloc(old, size);\n");
+        buf_str(out, c"    record(p, size);\n");
+        buf_str(out, c"    p\n");
+        buf_str(out, c"}\n");
+        buf_str(out, c"pub unsafe fn free_(p: *u8) {\n");
+        buf_str(out, c"    unrecord(p, c\"free\");\n");
+        buf_str(out, c"    free(p);\n");
+        buf_str(out, c"}\n");
+        buf_str(out, c"// The access of `size` bytes at p.\n");
+        buf_str(out, c"pub unsafe fn check(p: u64, size: u64, site: *u8) {\n");
+        buf_str(out, c"    if size == 0 {\n");
+        buf_str(out, c"        return;\n");
+        buf_str(out, c"    }\n");
+        if CHECK_ALLOC_MODE && crate::front::modules::STD_MODULE >= 0 {
+            // (0.16, with --check-alloc: the checking Gpa's blocks, known
+            // exactly, freed ones included)
+            buf_str(out, c"    if std::check_alloc_access(p, size, site) {\n");
+            buf_str(out, c"        return;\n");
+            buf_str(out, c"    }\n");
+        }
+        buf_str(out, c"    let i = find(p);\n");
+        buf_str(out, c"    if i >= 0 && p < ENDS[i] {\n");
+        buf_str(out, c"        if size > ENDS[i] - p {\n");
+        buf_str(out, c"            fail(c\"out of bounds\", p, size, STARTS[i], ENDS[i], site);\n");
+        buf_str(out, c"        }\n");
+        buf_str(out, c"        return;\n");
+        buf_str(out, c"    }\n");
+        buf_str(out, c"    if i >= 0 && p == ENDS[i] {\n");
+        buf_str(out, c"        fail(c\"out of bounds (just past the end)\", p, size, STARTS[i], ENDS[i], site);\n");
+        buf_str(out, c"    }\n");
+        buf_str(out, c"    if i + 1 < COUNT && STARTS[i + 1] - p < size {\n");
+        buf_str(out, c"        fail(c\"out of bounds (into the next block)\", p, size, STARTS[i + 1], ENDS[i + 1], site);\n");
+        buf_str(out, c"    }\n");
+        buf_str(out, c"    let k = find_freed(p);\n");
+        buf_str(out, c"    if k >= 0 {\n");
+        buf_str(out, c"        fail(c\"after free\", p, size, FSTARTS[k], FENDS[k], site);\n");
+        buf_str(out, c"    }\n");
+        buf_str(out, c"}\n");
+    }
+}
+
+static var CHECK_FN: i64 = -2;
+
+// The runtime's check function, or -1.
+pub fn check_function() -> i64 {
+    if CHECK_FN == -2 {
+        CHECK_FN = unsafe { check_fn(c"check") };
+    }
+    CHECK_FN
+}
+
+// The runtime function `name` (an item of __check), or -1.
+pub fn check_fn(name: *u8) -> i64 {
+    unsafe {
+        let out = crate::base::buf_new();
+        buf_str(out, c"__check::");
+        buf_str(out, name);
+        crate::base::buf_byte(out, 0);
+        SYM_FN[intern_c(crate::base::BUFS[out].data)] - 1
+    }
+}
+
+// The wrapper a call of C function f, from a function of module `from`,
+// goes to instead (malloc, calloc, realloc and free), or f. (The runtimes'
+// own calls are not redirected.)
+pub fn redirect_alloc(f: i64, from: i64) -> i64 {
+    unsafe {
+        if !CHECK_UNSAFE || f < 0 || !FNS[f].is_extern || from == CHECK_MODULE
+            || from == crate::middle::profile::PROFILE_MODULE {
+            return f;
+        }
+        let name = sym_name(FNS[f].name);
+        let names: [*u8; 4] = [c"malloc", c"calloc", c"realloc", c"free"];
+        let wrappers: [*u8; 4] = [c"malloc_", c"calloc_", c"realloc_", c"free_"];
+        for i in 0..4 {
+            if crate::base::streq(name, names[i]) {
+                let w = check_fn(wrappers[i]);
+                return if w >= 0 { w } else { f };
+            }
+        }
+        f
+    }
+}
+
+// ---- Sites ----
+
+// The starts of the source's lines (built once).
+static var LINES: crate::base::IntVec = crate::base::IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The index of the last line starting at or before pos.
+fn line_of(pos: i64) -> i64 {
+    unsafe {
+        var lo = 0;
+        var hi = LINES.count;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if LINES.data[mid] <= pos { lo = mid + 1; } else { hi = mid; }
+        }
+        lo - 1
+    }
+}
+
+// A C string `path: line L, column C` for source position pos, as a
+// string literal's id.
+pub fn site_string(pos: i64) -> i64 {
+    unsafe {
+        let files = crate::base::FILES;
+        let count = crate::base::FILE_COUNT;
+        if LINES.count == 0 {
+            LINES.push(0);
+            for i in 0..files[count - 1].end {
+                if crate::base::SRC[i] == '\n' {
+                    LINES.push(i + 1);
+                }
+            }
+        }
+        var file = 0;
+        while file + 1 < count && pos >= files[file + 1].start {
+            file += 1;
+        }
+        let line = line_of(pos);
+        let out = crate::base::buf_new();
+        buf_str(out, crate::base::out_path(file));
+        buf_str(out, c": line ");
+        crate::base::buf_int(out, line - line_of(files[file].start) + 1);
+        buf_str(out, c", column ");
+        crate::base::buf_int(out, pos - LINES.data[line] + 1);
+        crate::front::lexer::add_string(crate::base::BUFS[out].data[0..crate::base::BUFS[out].len])
+    }
+}

@@ -1,0 +1,411 @@
+// Loop-invariant code motion. Natural loops are found from back edges
+// (an edge t -> h where h dominates t); a loop's body is h and every block
+// that reaches t without passing h. A pure instruction whose operands are
+// all defined outside the loop moves to the loop's preheader (the single
+// block entering the header from outside; made by splitting the entering
+// edge when needed), and so does a load from a frame slot or a static
+// that nothing in the loop may write. Nothing here can trap: division
+// never traps in vole, and those loads always address valid memory.
+
+// Loops: header, then the index of their first body block in LOOP_BODY,
+// and its count (3 per loop).
+use crate::arch::INTRS;
+use crate::arch::features::{FT_AVX, made_build_features};
+use crate::base::{IntVec, alloc_array, free};
+use crate::base::target::X86;
+use crate::front::features::fn_needs;
+use crate::front::types::{is_vector, type_size};
+use crate::middle::ctx::FnCtx;
+use crate::middle::gvn::{
+    address_base, build_dom_tree, call_may_write, copy_dst, copy_size, find_escaping_slots, is_copy,
+    may_alias, root_of,
+};
+use crate::middle::ipo::{
+    ATTR_NOPANIC, ATTR_READNONE, ATTR_READONLY, ATTR_WILLRETURN, call_attrs, call_writes,
+};
+use crate::middle::ir::{
+    IRFUNCS, Op, Term, ir_append, ir_arg, ir_enter, ir_new_block, ir_resolve_operands, ir_unlink,
+};
+use crate::middle::ir::atomic::is_barrier;
+use crate::middle::ir::cfg::{pred_index, redirect_succ, succ, succ_count};
+use crate::middle::opt::{dominates, resolve_all};
+
+fn find_loops(cx: sink *FnCtx, fi: i64) {
+    unsafe {
+        cx.loops.count = 0;
+        cx.loop_body.count = 0;
+        var work = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..cx.order.count {
+            let h = cx.order.data[i];
+            let start = cx.loop_body.count;
+            // Every back edge into h.
+            for k in 0..cx.blocks[h].preds.count {
+                let t = cx.blocks[h].preds.data[k];
+                if cx.blocks[t].order < 0 || !dominates(cx, h, t) {
+                    continue;
+                }
+                if cx.loop_body.count == start {
+                    for j in 0..cx.order.count {
+                        cx.blocks[cx.order.data[j]].mark = 0;
+                    }
+                    cx.blocks[h].mark = 1;
+                    cx.loop_body.push(h);
+                }
+                if cx.blocks[t].mark == 0 {
+                    cx.blocks[t].mark = 1;
+                    cx.loop_body.push(t);
+                    work.push(t);
+                }
+                while work.count > 0 {
+                    let x = work.pop();
+                    for m in 0..cx.blocks[x].preds.count {
+                        let p = cx.blocks[x].preds.data[m];
+                        if cx.blocks[p].order >= 0 && cx.blocks[p].mark == 0 {
+                            cx.blocks[p].mark = 1;
+                            cx.loop_body.push(p);
+                            work.push(p);
+                        }
+                    }
+                }
+            }
+            if cx.loop_body.count > start {
+                cx.loops.push(h);
+                cx.loops.push(start);
+                cx.loops.push(cx.loop_body.count - start);
+            }
+        }
+        free(work.data as *u8);
+    }
+}
+
+// The preheader of the loop with header h (body blocks marked with
+// `stamp`), or 0 when the loop has several entering edges (or when its
+// entering edge would have to be split and `split` is false).
+fn preheader(cx: sink *FnCtx, fi: i64, h: i64, stamp: i64, split: bool) -> i64 {
+    unsafe {
+        var outside = 0;
+        var count = 0;
+        for k in 0..cx.blocks[h].preds.count {
+            let p = cx.blocks[h].preds.data[k];
+            if cx.blocks[p].mark != stamp {
+                outside = p;
+                count += 1;
+            }
+        }
+        if count != 1 || cx.blocks[outside].order < 0 {
+            return 0;
+        }
+        if cx.blocks[outside].term == Term::Jump {
+            return outside;
+        }
+        if !split {
+            return 0;
+        }
+        // Split the edge: a new block between the predecessor and the header,
+        // at the same index in the header's predecessors.
+        ir_enter(cx, fi);
+        let e = ir_new_block(cx);
+        cx.blocks[e].sealed = 1;
+        cx.blocks[e].term = Term::Jump;
+        cx.blocks[e].s0 = h;
+        cx.blocks[e].preds.push(outside);
+        redirect_succ(cx, outside, h, e);
+        let index = pred_index(cx, h, outside);
+        cx.blocks[h].preds.data[index] = e;
+        e
+    }
+}
+
+// Whether something in the loop (blocks marked `stamp`) may write
+// [base + offset, + size): a store, a copy, or a call (unless the base is
+// a private slot).
+fn loop_may_write(cx: sink *FnCtx, start: i64, count: i64, base: i64, offset: i64, size: i64) -> bool {
+    unsafe {
+        for i in start..start + count {
+            var v = cx.blocks[cx.loop_body.data[i]].first;
+            while v != 0 {
+                let op = cx.insts[v].op;
+                if op == Op::Store || is_copy(cx, v) {
+                    var other_offset = if op == Op::Store { cx.insts[v].imm } else { 0 };
+                    let other = address_base(cx,
+                        if op == Op::Store { cx.insts[v].a } else { copy_dst(cx, v) },
+                        &other_offset);
+                    let other_size = if op == Op::Store { type_size(cx.insts[v].imm2) }
+                        else { copy_size(cx, v) };
+                    if may_alias(cx, base, offset, size, other, other_offset, other_size) {
+                        return true;
+                    }
+                } else if (op.is_call() && call_writes(cx, v) || is_barrier(cx, v))
+                    && call_may_write(cx, base) {
+                    return true;
+                }
+                v = cx.insts[v].next;
+            }
+        }
+        false
+    }
+}
+
+fn defined_outside(cx: sink *FnCtx, v: i64, stamp: i64) -> bool {
+    unsafe { v == 0 || cx.blocks[cx.insts[v].block].mark != stamp }
+}
+
+fn is_invariant(cx: sink *FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> bool {
+    unsafe {
+        let op = cx.insts[v].op;
+        // (0.19) An operation the function may run without (it needs a
+        // feature known only under a has/detect guard: an intrinsic, a
+        // 256-bit value's load on x86-64) is never run before its guard:
+        // hoisted only when it runs in every iteration anyway (as a load
+        // that may trap).
+        if op_guarded(cx, v) && !runs_first(cx, v, stamp, start, count) {
+            return false;
+        }
+        if op == Op::Load {
+            if !defined_outside(cx, cx.insts[v].a, stamp) {
+                return false;
+            }
+            var offset = cx.insts[v].imm;
+            let base = address_base(cx, cx.insts[v].a, &offset);
+            if root_of(cx, base) == 0 {
+                return false;
+            }
+            return !loop_may_write(cx, start, count, base, offset, type_size(cx.insts[v].ty));
+        }
+        if op.is_call() {
+            return call_invariant(cx, v, stamp, start, count);
+        }
+        if !op.is_pure() && !op.is_vector() && op != Op::Sel {
+            return false;
+        }
+        defined_outside(cx, cx.insts[v].a, stamp) && defined_outside(cx, cx.insts[v].b, stamp)
+            && defined_outside(cx, cx.insts[v].c, stamp)
+    }
+}
+
+// (0.19) The target features operation v needs to be encodable: an
+// intrinsic's (its table's); on x86-64, AVX for any 256-bit value, which
+// only a ymm register holds (its load and store are vmovdqu, its move
+// vmovdqa, its constant a ymm load). AArch64 has no such operation: its
+// 256-bit vectors are legalized into halves, NEON is the baseline.
+pub fn op_features(cx: sink *FnCtx, v: i64) -> i64 {
+    unsafe {
+        let op = cx.insts[v].op;
+        var need = 0;
+        if op == Op::Intr {
+            need = INTRS[cx.insts[v].imm].features;
+        }
+        if X86 {
+            let ty = if op == Op::Store { cx.insts[v].imm2 } else { cx.insts[v].ty };
+            if ty > 0 && is_vector(ty) && type_size(ty) == 32 {
+                need = need | (1 << FT_AVX);
+            }
+        }
+        need
+    }
+}
+
+// (0.19) Whether operation v needs a feature (op_features) that the
+// function as a whole does not know (the build's, its declaration's,
+// those it needs from every caller): it is then under a has/detect guard
+// (its own, or the caller's it was inlined into), and must not run where
+// the guard has not been tested (docs/design/arch.md §5.2, the
+// no-speculation line): not hoisted by LICM unless it runs in every
+// iteration, not speculated into a select by if-conversion or isel.
+pub fn op_guarded(cx: sink *FnCtx, v: i64) -> bool {
+    unsafe {
+        let need = op_features(cx, v);
+        if need == 0 {
+            return false;
+        }
+        let f = IRFUNCS[cx.ir_cur].f;
+        let known = made_build_features() | fn_needs(f);
+        (need & ~known) != 0
+    }
+}
+
+// (0.16) Whether call v (in loop l's body, blocks marked `stamp`) may move
+// to the preheader: a direct call with a scalar result, READNONE, its
+// arguments defined outside; and either WILLRETURN and NOPANIC (it may
+// run where the loop would not have run it), or certain to run in the
+// loop's first iteration before anything a panic or a stop would make
+// visible (then it runs once, earlier, with the same arguments).
+fn call_invariant(cx: sink *FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> bool {
+    unsafe {
+        let op = cx.insts[v].op;
+        if op != Op::Call && op != Op::CallC || cx.insts[v].ty == 0 || cx.insts[v].c != 0 {
+            return false;
+        }
+        let attrs = call_attrs(cx, v);
+        if (attrs & ATTR_READNONE) == 0 {
+            return false;
+        }
+        for i in 0..cx.insts[v].nargs {
+            if !defined_outside(cx, ir_arg(cx, v, i), stamp) {
+                return false;
+            }
+        }
+        let speculable = ATTR_WILLRETURN | ATTR_NOPANIC;
+        if (attrs & speculable) == speculable {
+            return true;
+        }
+        runs_first(cx, v, stamp, start, count)
+    }
+}
+
+// Whether v runs in every iteration that completes, and in the first one
+// before anything visible: its block dominates every block of the loop
+// that leaves it or goes back to its header, and the instructions that
+// may run before it in an iteration are not calls that may panic, stop,
+// loop forever or write (I/O included).
+fn runs_first(cx: sink *FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> bool {
+    unsafe {
+        let b = cx.insts[v].block;
+        let quiet = ATTR_WILLRETURN | ATTR_NOPANIC | ATTR_READONLY;
+        for i in start..start + count {
+            let x = cx.loop_body.data[i];
+            var leaves = false;
+            for k in 0..succ_count(cx, x) {
+                let s = succ(cx, x, k);
+                if cx.blocks[s].mark != stamp || s == cx.loop_body.data[start] {
+                    leaves = true;
+                }
+            }
+            if leaves && !dominates(cx, b, x) {
+                return false;
+            }
+            if x != b && dominates(cx, b, x) {
+                continue;
+            }
+            // (An inner loop before v may run forever.)
+            for k in 0..succ_count(cx, x) {
+                let s = succ(cx, x, k);
+                if s != cx.loop_body.data[start] && dominates(cx, s, x) {
+                    return false;
+                }
+            }
+            // Before v (all of x, or b up to v).
+            var w = cx.blocks[x].first;
+            while w != 0 && w != v {
+                if cx.insts[w].op.is_call() && (call_attrs(cx, w) & quiet) != quiet {
+                    return false;
+                }
+                w = cx.insts[w].next;
+            }
+        }
+        true
+    }
+}
+
+pub fn run_licm(cx: sink *FnCtx, fi: i64) -> bool {
+    unsafe {
+        // First give every loop a preheader (splitting edges changes the
+        // blocks, so the loops are found again until no split is needed).
+        var rounds = 0;
+        loop {
+            build_dom_tree(cx, fi);
+            find_loops(cx, fi);
+            var split = false;
+            for l in 0..cx.loops.count / 3 {
+                let stamp = mark_loop(cx, fi, l);
+                let h = cx.loops.data[3 * l];
+                if preheader(cx, fi, h, stamp, false) == 0
+                    && preheader(cx, fi, h, stamp, true) != 0 {
+                    split = true;
+                }
+            }
+            rounds += 1;
+            if !split {
+                break;
+            }
+            if rounds > 4 {
+                // Give up on the remaining splits; the loop info must be
+                // fresh for hoisting.
+                build_dom_tree(cx, fi);
+                find_loops(cx, fi);
+                break;
+            }
+        }
+        find_escaping_slots(cx, fi);
+        var changed = false;
+        let loop_count = cx.loops.count / 3;
+        // Innermost (smallest) loops first.
+        var done = alloc_array::<i64>(loop_count + 1);
+        for _ in 0..loop_count {
+            var best = -1;
+            for l in 0..loop_count {
+                if done[l] == 0
+                    && (best < 0 || cx.loops.data[3 * l + 2] < cx.loops.data[3 * best + 2]) {
+                    best = l;
+                }
+            }
+            done[best] = 1;
+            if hoist_loop(cx, fi, best) {
+                changed = true;
+            }
+        }
+        free(done as *u8);
+        if changed {
+            resolve_all(cx, fi);
+        }
+        changed
+    }
+}
+
+// Marks the body of loop l with a stamp of its own (and only it); returns
+// the stamp.
+fn mark_loop(cx: sink *FnCtx, fi: i64, l: i64) -> i64 {
+    unsafe {
+        let start = cx.loops.data[3 * l + 1];
+        let count = cx.loops.data[3 * l + 2];
+        let stamp = 100 + l;
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if cx.blocks[b].mark == stamp {
+                cx.blocks[b].mark = 0;
+            }
+        }
+        for i in start..start + count {
+            cx.blocks[cx.loop_body.data[i]].mark = stamp;
+        }
+        stamp
+    }
+}
+
+fn hoist_loop(cx: sink *FnCtx, fi: i64, l: i64) -> bool {
+    unsafe {
+        let h = cx.loops.data[3 * l];
+        let start = cx.loops.data[3 * l + 1];
+        let count = cx.loops.data[3 * l + 2];
+        let stamp = mark_loop(cx, fi, l);
+        let pre = preheader(cx, fi, h, stamp, false);
+        if pre == 0 {
+            return false;
+        }
+        var moved_any = false;
+        var moved = true;
+        while moved {
+            moved = false;
+            // In layout order, so operands are seen before their users.
+            for k in 0..cx.order.count {
+                let b = cx.order.data[k];
+                if cx.blocks[b].mark != stamp {
+                    continue;
+                }
+                var v = cx.blocks[b].first;
+                while v != 0 {
+                    let next = cx.insts[v].next;
+                    ir_resolve_operands(cx, v);
+                    if is_invariant(cx, v, stamp, start, count) {
+                        ir_unlink(cx, v);
+                        ir_append(cx, pre, v);
+                        moved = true;
+                        moved_any = true;
+                    }
+                    v = next;
+                }
+            }
+        }
+        moved_any
+    }
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""How agents worked on tachyon: every shell command, search and file read
+"""How agents worked on vole: every shell command, search and file read
 from the development transcripts, classified by what it was for, so that
 the common ones can become compiler queries (see docs/agents.md).
 
@@ -19,34 +19,34 @@ import sys
 import types
 from collections import Counter, defaultdict
 
-# (0.15) tachyonc through copies (target/tc0) and shell variables ($T):
-# tools/agent-hooks/tachyonc_cmd.py, shared with the hooks.
-tc = types.ModuleType("tachyonc_cmd")
-tc.__file__ = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent-hooks", "tachyonc_cmd.py")
+# (0.15) volec through copies (target/tc0) and shell variables ($T):
+# tools/agent-hooks/volec_cmd.py, shared with the hooks.
+tc = types.ModuleType("volec_cmd")
+tc.__file__ = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent-hooks", "volec_cmd.py")
 with open(tc.__file__) as _fh:
     exec(compile(_fh.read(), tc.__file__, "exec"), tc.__dict__)
 
-SOURCE_HINT = re.compile(r"\.tach\b|compiler/src|compiler/std|tests/run|examples/|bench/")
+SOURCE_HINT = re.compile(r"\.vl\b|compiler/src|compiler/std|tests/run|examples/|bench/")
 
 # What a source-inspecting command was for, and the compiler query that
 # would answer it directly.
 CATEGORIES = [
     ("find-definition", "where is NAME defined",
-     "tachyonc query def NAME (file:line, signature)"),
+     "volec query def NAME (file:line, signature)"),
     ("find-references", "who uses NAME",
-     "tachyonc query refs NAME / callers NAME"),
+     "volec query refs NAME / callers NAME"),
     ("list-items", "what does this module or file contain",
-     "tachyonc query items MODULE (signatures, no bodies)"),
+     "volec query items MODULE (signatures, no bodies)"),
     ("show-item", "show the source of a function or type by name",
-     "tachyonc query show NAME (the item's source, with its doc comment)"),
+     "volec query show NAME (the item's source, with its doc comment)"),
     ("read-range", "show lines N..M of a file",
-     "tachyonc query show NAME (the item's source)"),
+     "volec query show NAME (the item's source)"),
     ("extract-section", "a section of a document between two markers",
-     "(docs: tachyonc doc TOPIC)"),
+     "(docs: volec doc TOPIC)"),
     ("count", "how many matches or lines",
-     "tachyonc query refs --count / --stats"),
+     "volec query refs --count / --stats"),
     ("mechanical-edit", "a rename or rewrite with sed/perl/python",
-     "tachyonc refactor rename / fix-* rewrites"),
+     "volec refactor rename / fix-* rewrites"),
     ("check-output", "inspect what the compiler emitted (IR, asm)",
      "--emit-ir / --emit-mir / -S, with filters by function"),
     ("other-source", "other reads of source",
@@ -120,7 +120,7 @@ def classify(prog, args, segment, description):
         return "count"
     if prog in ("python3", "python"):
         return "mechanical-edit" if re.search(r"write|replace|sub\(", text) else "other-source"
-    if prog == "tachyonc" or "tachyonc" in prog:
+    if prog == "volec" or "volec" in prog:
         if re.search(r"--emit-(ir|mir|asm)|-S\b|--print", text):
             return "check-output"
     return None
@@ -135,7 +135,7 @@ def iter_transcripts(root):
 
 def hook_report(path):
     """Summary of the query-first hook's log (tools/agent-hooks/query-first.py):
-    how often agents used `tachyonc query`, were blocked, or went around it,
+    how often agents used `volec query`, were blocked, or went around it,
     and why."""
     recs = []
     with open(path, errors="replace") as fh:
@@ -270,7 +270,7 @@ def print_edit_report(counted, by_tool, other, reasons, per_agent):
           "fixtures, docs and scratch programs (target/, /tmp) are apart.\n")
     print("| how | edits |\n|---|---|")
     tools = ", ".join(f"{k} {v}" for k, v in by_tool.most_common())
-    print(f"| `tachyonc` edit, refactor, fix, rewrite, undo (written){': ' + tools if tools else ''} | {counted['tools']} |")
+    print(f"| `volec` edit, refactor, fix, rewrite, undo (written){': ' + tools if tools else ''} | {counted['tools']} |")
     print(f"| shell rewrites run (`sed -i`, `perl -pi`, Python) | {counted['shell']} |")
     print(f"| Edit tool | {counted['Edit']} |")
     print(f"| Write tool, over an existing file | {counted['Write']} |")
@@ -333,18 +333,18 @@ def main():
                         desc = inp.get("description", "")
                         for sub, _, path, _ in tc.calls(cmd):
                             tach_subs[sub] += 1
-                            if os.path.basename(path) != "tachyonc":
+                            if os.path.basename(path) != "volec":
                                 tach_via[path or "$VAR"] += 1
                         assigns = {}
                         for seg in split_segments(cmd):
                             prog, args = program_of(seg)
                             if not prog:
                                 continue
-                            # (0.15) a copy or a variable running tachyonc
-                            if tc.program_name(seg, assigns) == "tachyonc":
-                                prog = "tachyonc"
+                            # (0.15) a copy or a variable running volec
+                            if tc.program_name(seg, assigns) == "volec":
+                                prog = "volec"
                             prog_counts[prog] += 1
-                            if not SOURCE_HINT.search(seg) and prog not in ("tachyonc",) and "tachyonc" not in prog:
+                            if not SOURCE_HINT.search(seg) and prog not in ("volec",) and "volec" not in prog:
                                 continue
                             cat = classify(prog, args, seg, desc)
                             if cat:
@@ -352,7 +352,7 @@ def main():
                     elif name in ("Grep", "Read", "Glob"):
                         target = inp.get("path") or inp.get("file_path") or inp.get("pattern") or ""
                         pattern = inp.get("pattern", "")
-                        if not SOURCE_HINT.search(target + " " + pattern) and not target.endswith(".tach"):
+                        if not SOURCE_HINT.search(target + " " + pattern) and not target.endswith(".vl"):
                             continue
                         if name == "Read":
                             cat = "read-range"
@@ -378,12 +378,12 @@ def main():
     for p, n in prog_counts.most_common(25):
         print(f"| `{p}` | {n} |")
     if tach_subs:
-        print("\n`tachyonc` invocations by subcommand (copies and shell variables included"
+        print("\n`volec` invocations by subcommand (copies and shell variables included"
               f"{': ' + str(sum(tach_via.values())) + ' through ' + ', '.join(f'`{p}`' for p, _ in tach_via.most_common(4)) if tach_via else ''}):\n")
         print("| subcommand | runs |\n|---|---|")
         for sub, n in tach_subs.most_common():
             print(f"| {sub} | {n} |")
-    print(f"\n## Reading and editing tachyon source: {len(rows)} operations\n")
+    print(f"\n## Reading and editing vole source: {len(rows)} operations\n")
     print("| purpose | operations | share | what could answer it |\n|---|---|---|---|")
     for key, what, query in CATEGORIES:
         n = len(by_cat.get(key, []))

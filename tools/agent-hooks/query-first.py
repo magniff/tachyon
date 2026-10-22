@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
-"""Agent harness hook (testing mode): tachyon source is read through
-`tachyonc query`, not grep/sed/head/cat/awk, and every exception is
+"""Agent harness hook (testing mode): vole source is read through
+`volec query`, not grep/sed/head/cat/awk, and every exception is
 recorded with its reason.
 
 Registered in .claude/settings.json for PreToolUse (Bash, Read, Grep,
 Edit, Write) and PostToolUse (Bash). Reads the hook event (JSON) on stdin.
 
-- A shell command that reads .tach source with grep, rg, sed -n, head,
+- A shell command that reads .vl source with grep, rg, sed -n, head,
   tail, cat, awk, less or more is blocked (exit status 2; the message on
   stderr goes back to the agent) with the query that answers it, unless it
   carries `# no-query: <reason>`: then it runs, and the reason is logged.
   Source is the compiler's (compiler/src, compiler/std) and any program
-  being worked on (examples/, bench/, a .tach elsewhere); a .tach under a
+  being worked on (examples/, bench/, a .vl elsewhere); a .vl under a
   tests/ directory (a test case, a refactoring fixture, an agent-eval
   task's data) is read freely, and logged as `read-fixture` (0.14).
-- A shell command that rewrites compiler source (a .tach file under
+- A shell command that rewrites compiler source (a .vl file under
   compiler/src or compiler/std) with `sed -i`, `perl -pi` or Python
-  (`.write(`) is blocked with the `tachyonc edit patch` command that
+  (`.write(`) is blocked with the `volec edit patch` command that
   does it, unless it carries `# no-tool: <reason>` (or `# no-query:`).
   Test fixtures, docs and scratch copies (target/, /tmp) are not
   affected.
-- `tachyonc query ...` calls are logged, with their outcome; `tachyonc
+- `volec query ...` calls are logged, with their outcome; `volec
   edit/refactor/fix/rewrite/undo` calls with whether they wrote. (0.15)
-  tachyonc is recognised through copies (`target/tc0`,
-  `target/tools/tachyonc`) and shell variables (`T=...; $T query`), by
-  tachyonc_cmd.py; such a record says `via` what it ran.
-- Read and Grep calls on .tach files are logged, not blocked (Edit needs
-  a prior Read); Edit and Write calls on .tach files are logged (whether
+  volec is recognised through copies (`target/tc0`,
+  `target/tools/volec`) and shell variables (`T=...; $T query`), by
+  volec_cmd.py; such a record says `via` what it ran.
+- Read and Grep calls on .vl files are logged, not blocked (Edit needs
+  a prior Read); Edit and Write calls on .vl files are logged (whether
   the file existed), never blocked.
 
 Commands are split at `;`, `|`, `&&` and newlines outside quotes, so a
@@ -42,13 +42,13 @@ who made it: the session, the harness's agent id and transcript when the
 event has them, and the checkout (a parallel agent's worktree).
 tools/agent-tool-usage.py --hook-log summarizes it. Enforcement
 starts only once the compiler answers `query` (marker
-.git/agent-query-ready); TACHYON_QUERY_ENFORCE=0 turns blocking off.
+.git/agent-query-ready); VOLE_QUERY_ENFORCE=0 turns blocking off.
 
 (0.17) Each simple command of a line is judged on its own, in the
 directory its `cd`s lead to, with `$VAR`s assigned on the line expanded;
 the message names the command that reads. A whole file under 300 lines
-is read freely with cat, head, tail, sed -n (`read-small`); a .tach file
-outside any program's module tree (not a main.tach, not declared by a
+is read freely with cat, head, tail, sed -n (`read-small`); a .vl file
+outside any program's module tree (not a main.vl, not declared by a
 `mod` line, not under compiler/, examples/, bench/) is not source
 (`read-scratch`). A blocked record logs its `try:` commands. Python is
 judged by the script it runs, not by a here-document written to a file.
@@ -56,10 +56,10 @@ After a Bash call (PostToolUse): a `# no-query:` reason that wants line
 numbers for the Edit tool is answered (`edit insert --after NAME`, `query
 def NAME`); the `repeat-query` hint of hints.txt after the third show,
 refs, def or callers in a row on related items, once a session, not once
-`query context` ran, never with TACHYON_HINTS=0 (state: hookstate.py,
+`query context` ran, never with VOLE_HINTS=0 (state: hookstate.py,
 its `query` part).
 
-(0.17, E6) TACHYON_QUERY_MODE=rewrite: a read whose query is not in doubt
+(0.17, E6) VOLE_QUERY_MODE=rewrite: a read whose query is not in doubt
 (`sed -n 'A,Bp'`, `head`, `tail -n N`, `cat`, `grep` of one name) runs as
 that query (PreToolUse `updatedInput` with permission `allow`, the
 `rewritten` note of hints.txt beside its result), logged as `rewritten`;
@@ -70,7 +70,7 @@ every write.
 query where it stands, the line's other commands, separators and pipes
 kept as typed (rewrite_parts, translate): on the compiler tasks of
 iteration 3 every blocked line had 2-16 commands, and the reads in them
-were grep of texts or alternatives (-i, -r, `DIR/*.tach`, `^use`), sed -n,
+were grep of texts or alternatives (-i, -r, `DIR/*.vl`, `^use`), sed -n,
 head, cat (`cat F | head`). grep becomes `query grep TEXT...` (or `query
 refs` of one name); a read it cannot translate blocks the line, the
 message naming every blocked read with its `try:` and the reads that will
@@ -87,11 +87,11 @@ import sys
 import time
 import types
 
-# (0.15) tachyonc through copies and shell variables: tachyonc_cmd.py, next
+# (0.15) volec through copies and shell variables: volec_cmd.py, next
 # to this file, loaded by path (`python3 -I` leaves this directory out of
 # sys.path; importlib.util would cost 40 ms of imports on every call).
-tc = types.ModuleType("tachyonc_cmd")
-tc.__file__ = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tachyonc_cmd.py")
+tc = types.ModuleType("volec_cmd")
+tc.__file__ = os.path.join(os.path.dirname(os.path.abspath(__file__)), "volec_cmd.py")
 with open(tc.__file__) as _fh:
     exec(compile(_fh.read(), tc.__file__, "exec"), tc.__dict__)
 
@@ -118,11 +118,11 @@ class _LazyState:
 hs = _LazyState()
 
 READERS = {"grep", "rg", "egrep", "fgrep", "sed", "head", "tail", "cat", "awk", "less", "more"}
-SOURCE = re.compile(r"(\.tach\b|compiler/src\b|compiler/std\b)")
+SOURCE = re.compile(r"(\.vl\b|compiler/src\b|compiler/std\b)")
 HEREDOC = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n.*?\n\s*\1\s*(\n|$)", re.S)
 ESCAPE = re.compile(r"#\s*no-(?:query|tool):\s*(.+)")
-# A .tach file of the compiler's own source (not a test, a doc, a copy).
-COMPILER_TACH = re.compile(r"((?:[\w.~-]+/)*compiler/(?:src|std)/[\w./*-]*\.tach)\b")
+# A .vl file of the compiler's own source (not a test, a doc, a copy).
+COMPILER_TACH = re.compile(r"((?:[\w.~-]+/)*compiler/(?:src|std)/[\w./*-]*\.vl)\b")
 SCRATCH = re.compile(r"(^|/)(target|tmp|private/tmp|var/folders)/")
 TOOL_SUBS = ("edit", "refactor", "fix", "rewrite", "undo")
 SUMMARY = re.compile(r"^(undid|patched|replaced|inserted|deleted|fixed|renamed|moved|rewrote|"
@@ -203,13 +203,13 @@ def log(gd, record):
 
 
 def query_ready(gd, cwd):
-    if os.environ.get("TACHYON_QUERY_ENFORCE") == "0" or not gd:
+    if os.environ.get("VOLE_QUERY_ENFORCE") == "0" or not gd:
         return False
     marker = os.path.join(gd, "agent-query-ready")
     if os.path.exists(marker):
         return True
-    compiler = os.path.join(cwd, "target", "tachyonc")
-    root = os.path.join(cwd, "compiler", "src", "main.tach")
+    compiler = os.path.join(cwd, "target", "volec")
+    root = os.path.join(cwd, "compiler", "src", "main.vl")
     if not (os.path.exists(compiler) and os.path.exists(root)):
         return False
     try:
@@ -267,7 +267,7 @@ SMALL_LINES = 300
 
 def source_reads(command, cwd=None, fixtures=None, small=None, scratch=None):
     """(program, words, segment, [(operand, full path or None)]) of each
-    simple command reading .tach source. (0.17) Each command is judged on
+    simple command reading .vl source. (0.17) Each command is judged on
     its own, in the directory its `cd`s lead to, with `$VAR`s assigned on
     the line expanded; a command that reads only test data is added to
     `fixtures`, one that reads only files outside any program's module tree
@@ -330,7 +330,7 @@ class Read(tuple):
 def file_kind(full, cwd, typed=None):
     """`fixture` (under a tests/ directory of the checkout), `scratch` (a
     temporary or build directory: target/, /tmp, as the path reads inside
-    its checkout, or as typed outside any; or a .tach file outside any
+    its checkout, or as typed outside any; or a .vl file outside any
     program's module tree), else `source`. An operand whose path is not
     known (a variable set in an earlier call) is source."""
     if full is None:
@@ -345,12 +345,12 @@ def file_kind(full, cwd, typed=None):
 
 
 def is_program_source(full):
-    """(0.17) Whether a .tach file belongs to a program: the compiler's
-    source and std, examples/ and bench/ of the checkout, a main.tach, a
+    """(0.17) Whether a .vl file belongs to a program: the compiler's
+    source and std, examples/ and bench/ of the checkout, a main.vl, a
     file a `mod NAME;` line of its directory (or its parent module's file)
     declares; a directory is. A probe the agent wrote next to the program,
     or in a scratch directory, is not."""
-    if not full.endswith(".tach") or os.path.isdir(full) or not os.path.exists(full):
+    if not full.endswith(".vl") or os.path.isdir(full) or not os.path.exists(full):
         return True
     if "/compiler/src/" in full or "/compiler/std/" in full:
         return True
@@ -358,19 +358,19 @@ def is_program_source(full):
     if top and re.match(r"^(examples|bench)/", os.path.relpath(full, top)):
         return True
     base = os.path.basename(full)
-    if base == "main.tach":
+    if base == "main.vl":
         return True
     d = os.path.dirname(full)
     stem = os.path.splitext(base)[0]
-    if base == "mod.tach":
+    if base == "mod.vl":
         stem, d = os.path.basename(d), os.path.dirname(d)
     decl = re.compile(r"^\s*(?:pub\s+)?mod\s+%s\s*;" % re.escape(stem), re.M)
     cands = []
     try:
-        cands = [os.path.join(d, f) for f in sorted(os.listdir(d))[:200] if f.endswith(".tach")]
+        cands = [os.path.join(d, f) for f in sorted(os.listdir(d))[:200] if f.endswith(".vl")]
     except OSError:
         pass
-    cands += [os.path.join(d, "mod.tach"), d + ".tach"]
+    cands += [os.path.join(d, "mod.vl"), d + ".vl"]
     for c in cands:
         if c == full:
             continue
@@ -396,9 +396,9 @@ def lines_of(path):
 
 
 def module_of(full):
-    """The module a .tach file holds, for `query items`: crate::a::b under
+    """The module a .vl file holds, for `query items`: crate::a::b under
     compiler/src or a program's root directory, std for compiler/std."""
-    m = re.search(r"/compiler/(src|std)/(.+)\.tach$", full)
+    m = re.search(r"/compiler/(src|std)/(.+)\.vl$", full)
     if m:
         if m.group(1) == "std":
             return "std"
@@ -407,7 +407,7 @@ def module_of(full):
         d = os.path.dirname(full)
         rel = None
         for _ in range(6):
-            if os.path.exists(os.path.join(d, "main.tach")):
+            if os.path.exists(os.path.join(d, "main.vl")):
                 rel = os.path.splitext(os.path.relpath(full, d))[0]
                 break
             d = os.path.dirname(d)
@@ -430,7 +430,7 @@ def fixture(path, base, cwd):
 
 
 def without_outputs(args):
-    """The words of a command without its output redirections (`> x.tach`,
+    """The words of a command without its output redirections (`> x.vl`,
     `2>/dev/null`): a file written is not read."""
     out, skip = [], False
     for a in args:
@@ -476,16 +476,16 @@ def file_args(prog, args):
 
 
 def reads_source(path):
-    """A .tach file, or a directory of them that grep -r would read; not a
+    """A .vl file, or a directory of them that grep -r would read; not a
     scratch file (target/, /tmp: a generated program, a copy)."""
     if SCRATCH.search(path):
         return False
-    return path.endswith(".tach") or bool(SOURCE_DIRS.match(path)) or (
+    return path.endswith(".vl") or bool(SOURCE_DIRS.match(path)) or (
         ("compiler/src" in path or "compiler/std" in path) and not path.endswith((".sh", ".md", ".toml", ".py", ".awk")))
 
 
 def compiler_paths(text):
-    """The compiler source files (.tach under compiler/src or compiler/std)
+    """The compiler source files (.vl under compiler/src or compiler/std)
     named in text; scratch copies (target/, /tmp) left out."""
     return [m for m in COMPILER_TACH.findall(text) if not SCRATCH.search(m)]
 
@@ -615,7 +615,7 @@ def python_targets(command):
 
 
 def edit_suggestion(prog, files, script):
-    """The tachyonc command for a rewrite: `sed -i 'Ns/a/b/' FILE` of plain
+    """The volec command for a rewrite: `sed -i 'Ns/a/b/' FILE` of plain
     text is `edit patch FILE:N --old a --new b`; (0.18.1) without a line,
     every line's: `edit patch FILE --old a --new b --all`, one per file
     (at most 3). A regex (`\\b`, `.*`, `[..]`), `&` or several commands:
@@ -629,22 +629,22 @@ def edit_suggestion(prog, files, script):
         new = re.sub(r"\\(.)", r"\1", m.group(4))
         pair = f"--old {shlex.quote(old)} --new {shlex.quote(new)}"
         if m.group(1):
-            return f"tachyonc edit patch {f}:{m.group(1)} {pair}"
-        return " ; ".join(f"tachyonc edit patch {x} {pair} --all" for x in fs[:3])
-    return (f"tachyonc edit patch {f}:LINE --old 'TEXT' --new 'TEXT' "
+            return f"volec edit patch {f}:{m.group(1)} {pair}"
+        return " ; ".join(f"volec edit patch {x} {pair} --all" for x in fs[:3])
+    return (f"volec edit patch {f}:LINE --old 'TEXT' --new 'TEXT' "
             "(pairs repeat, or come on stdin; docs/refactor.md)")
 
 
 def tool_target(command):
-    """Whether a tachyonc edit/refactor/fix/rewrite/undo command works on
+    """Whether a volec edit/refactor/fix/rewrite/undo command works on
     the compiler's source (the default root), not a test program or a
     scratch copy."""
-    roots = re.findall(r"--root[= ]\s*(\S+)", command) + re.findall(r"\s(\S+\.tach)(?=\s|$|;|&|\|)", command)
+    roots = re.findall(r"--root[= ]\s*(\S+)", command) + re.findall(r"\s(\S+\.vl)(?=\s|$|;|&|\|)", command)
     dirs = re.findall(r"\bcd\s+(\S+)", command)
     return all(compiler_paths(r) for r in roots) and not any(SCRATCH.search(d + "/") for d in dirs)
 
 
-GREP_ANY = "tachyonc query grep TEXT [--comments|--strings|--code] | tachyonc query items MODULE --comments"
+GREP_ANY = "volec query grep TEXT [--comments|--strings|--code] | volec query items MODULE --comments"
 NAME = re.compile(r"\w+(?:(?:::|\.)\w+)*")
 
 
@@ -677,14 +677,14 @@ def grep_suggestion(prog, args, first):
     names = [re.sub(r"^(\\b|\\<|\^)|(\\b|\\>|\$)$", "", a) for a in alts]
     if all(NAME.fullmatch(n) for n in names):
         if len(names) > 4:
-            return f"tachyonc query refs {' '.join(names)} | {GREP_ANY}"
-        greps = " | ".join(f"tachyonc query grep {n}" for n in names)
-        return f"tachyonc query refs {' '.join(names)} | {greps}"
+            return f"volec query refs {' '.join(names)} | {GREP_ANY}"
+        greps = " | ".join(f"volec query grep {n}" for n in names)
+        return f"volec query refs {' '.join(names)} | {greps}"
     ere = prog in ("egrep", "rg") or any(re.match(r"^-[a-zA-Z]*[EP]", a) for a in args)
     special = r"[\[\]*()+?{}^$\\]|\.\*" if ere else r"[\[\]*^$\\]|\.\*"
     literal = [u for u in unescaped if fixed or not re.search(special, u)]
     if len(literal) == len(alts) and len(alts) <= 4:
-        return " | ".join(f"tachyonc query grep {shlex.quote(u)}" for u in literal)
+        return " | ".join(f"volec query grep {shlex.quote(u)}" for u in literal)
     # A regex: its longest literal run, for query grep to narrow it.
     runs = []
     for a in alts:
@@ -692,7 +692,7 @@ def grep_suggestion(prog, args, first):
         runs += [r for r in re.split(r"\s+", a) if len(r) >= 3]
     if runs:
         best = max(runs, key=len)
-        return f"tachyonc query grep {shlex.quote(best)} | {GREP_ANY}"
+        return f"volec query grep {shlex.quote(best)} | {GREP_ANY}"
     return GREP_ANY
 
 
@@ -700,29 +700,29 @@ def suggestion(prog, args):
     pattern = next((a for a in args if not a.startswith("-")), "")
     m = re.search(r"\b(?:fn|struct|enum|trait|const|static|type|mod)\s+(\w+)", pattern)
     if m:
-        return f"tachyonc query show {m.group(1)}"
-    files = [a for a in file_args(prog, args) if a.endswith(".tach")]
+        return f"volec query show {m.group(1)}"
+    files = [a for a in file_args(prog, args) if a.endswith(".vl")]
     compiler = bool(files) and bool(compiler_paths(files[0]))
     # `sed -n 'N,Mp' FILE`: the item holding line N, or the lines
     m = re.match(r"^(\d+)(?:,(\d+))?p$", pattern)
     if prog == "sed" and m and files:
         a, b = m.group(1), m.group(2) or m.group(1)
-        text = f"tachyonc query text {files[0]}:{a}-{b}"
-        return f"tachyonc query show {files[0]}:{a} | {text}" if compiler else text
+        text = f"volec query text {files[0]}:{a}-{b}"
+        return f"volec query show {files[0]}:{a} | {text}" if compiler else text
     if prog in ("grep", "rg", "egrep", "fgrep"):
         return grep_suggestion(prog, args, pattern)
     if files and prog == "head":
         n = next((args[i + 1] for i, a in enumerate(args[:-1]) if a == "-n"), None) \
             or next((a[1:] for a in args if re.match(r"^-\d+$", a)), "10")
-        text = f"tachyonc query text {files[0]}:1-{n}"
-        return f"tachyonc query show MODULE::header | MODULE::use | {text}" if compiler else text
+        text = f"volec query text {files[0]}:1-{n}"
+        return f"volec query show MODULE::header | MODULE::use | {text}" if compiler else text
     if files and prog == "cat":
-        return f"tachyonc query show {files[0]} (a whole small file) | tachyonc query text {files[0]}:A-B"
+        return f"volec query show {files[0]} (a whole small file) | volec query text {files[0]}:A-B"
     if files:
         if not compiler:
-            return f"tachyonc query text {files[0]}:A-B"
-        return f"tachyonc query stats {files[0]} | tachyonc query show FILE:LINE | tachyonc query text {files[0]}:A-B"
-    return "tachyonc query show NAME | tachyonc query items MODULE | tachyonc query text FILE:A-B"
+            return f"volec query text {files[0]}:A-B"
+        return f"volec query stats {files[0]} | volec query show FILE:LINE | volec query text {files[0]}:A-B"
+    return "volec query show NAME | volec query items MODULE | volec query text FILE:A-B"
 
 
 def blocked_message(command, prog, args, seg, files, cwd, others=(), translated=()):
@@ -745,54 +745,54 @@ def blocked_message(command, prog, args, seg, files, cwd, others=(), translated=
     what = where(seg)
     if len(parts) > 1:
         what += "; the others are not blocked)" if not others else ")"
-    lines = ["blocked hook.query-first: %s reads .tach source" % what]
+    lines = ["blocked hook.query-first: %s reads .vl source" % what]
     tries = [suggestion(prog, args)]
     for arg, full in files[:1]:
         n = lines_of(full) if full else None
         if n is not None and n < (1 << 30):
             mod = module_of(full) or arg
-            lines.append("%s is %s lines (a file under %d is read whole freely): `tachyonc query items %s` "
-                         "lists its items, `tachyonc query show NAME` one of them, `tachyonc query show %s:LINE` "
+            lines.append("%s is %s lines (a file under %d is read whole freely): `volec query items %s` "
+                         "lists its items, `volec query show NAME` one of them, `volec query show %s:LINE` "
                          "the item at a line" % (arg, format(n, ","), SMALL_LINES, mod, arg))
             if mod != arg:
-                tries.append("tachyonc query items %s" % mod)
+                tries.append("volec query items %s" % mod)
     lines += ["try: %s" % t for t in tries]
     for o in others:
         t = suggestion(o[0], o[1])
         tries.append(t)
         lines.append("also blocked: %s); try: %s" % (where(o[2]), t))
     if translated:
-        lines.append("the line's other reads of .tach source run as their queries on a retry: " +
+        lines.append("the line's other reads of .vl source run as their queries on a retry: " +
                      "; ".join("`%s` as `%s`" % (p if len(p) <= 80 else p[:77] + "...", q)
                                for p, q, _ in translated))
     lines.append("override: append '# no-query: <why query is not enough>'")
     return "\n".join(lines) + "\n", tries
 
 
-# (0.17, E6) Rewrite instead of block: TACHYON_QUERY_MODE=rewrite runs a
+# (0.17, E6) Rewrite instead of block: VOLE_QUERY_MODE=rewrite runs a
 # read whose query is not in doubt as that query (PreToolUse `updatedInput`,
 # with a one-line note beside its result), so the agent loses no turn to a
 # refusal; anything else is blocked as before. Writes are always blocked.
 def query_mode():
-    return "rewrite" if os.environ.get("TACHYON_QUERY_MODE", "block") == "rewrite" else "block"
+    return "rewrite" if os.environ.get("VOLE_QUERY_MODE", "block") == "rewrite" else "block"
 
 
-def tachyonc_for(event, cwd, here, own=()):
-    """The tachyonc a rewritten command runs: (n8) the one the line itself
+def volec_for(event, cwd, here, own=()):
+    """The volec a rewritten command runs: (n8) the one the line itself
     runs (`own`: paths from cwd), else the one the agent last ran in this
-    session, else target/tools/tachyonc, `tachyonc` on PATH,
-    target/tachyonc of cwd; as a path that works from `here` (the
+    session, else target/tools/volec, `volec` on PATH,
+    target/volec of cwd; as a path that works from `here` (the
     directory the command runs in). None when there is none."""
     def cands():  # (lazily: the session state and PATH cost a few ms)
         yield from own
-        last = (hs.load(event, "query") or {}).get("tachyonc")
+        last = (hs.load(event, "query") or {}).get("volec")
         if last:
             yield last
-        yield os.path.join(cwd, "target", "tools", "tachyonc")
+        yield os.path.join(cwd, "target", "tools", "volec")
         import shutil
-        if shutil.which("tachyonc"):
-            yield "tachyonc"
-        yield os.path.join(cwd, "target", "tachyonc")
+        if shutil.which("volec"):
+            yield "volec"
+        yield os.path.join(cwd, "target", "volec")
     for c in cands():
         if "/" not in c:
             return c
@@ -805,21 +805,21 @@ def tachyonc_for(event, cwd, here, own=()):
 
 def root_args(full, here):
     """The `--root` a query about file `full` needs when run in `here`:
-    none when the program's root is here's (compiler/src/main.tach, or
-    main.tach), else `--root ROOT`."""
+    none when the program's root is here's (compiler/src/main.vl, or
+    main.vl), else `--root ROOT`."""
     if "/compiler/src/" in full or "/compiler/std/" in full:
         top = full.split("/compiler/")[0]
-        root = os.path.join(top, "compiler", "src", "main.tach")
+        root = os.path.join(top, "compiler", "src", "main.vl")
     else:
         d, root = os.path.dirname(full), None
         for _ in range(6):
-            if os.path.exists(os.path.join(d, "main.tach")):
-                root = os.path.join(d, "main.tach")
+            if os.path.exists(os.path.join(d, "main.vl")):
+                root = os.path.join(d, "main.vl")
                 break
             d = os.path.dirname(d)
         if root is None:
             return None
-    if root in (os.path.join(here, "compiler", "src", "main.tach"), os.path.join(here, "main.tach")):
+    if root in (os.path.join(here, "compiler", "src", "main.vl"), os.path.join(here, "main.vl")):
         return []
     rel = os.path.relpath(root, here)
     return ["--root", rel if not rel.startswith("..") else root]
@@ -830,8 +830,8 @@ def rewrite_parts(event, command, cwd, reads):
     clause)] of the reads translated; [the reads not translated]). (n8)
     Each reading command of the line is replaced by its query where it
     stands (translate()), every other command, separator and pipe kept as
-    typed: `ls; grep -n x a.tach | head` runs `ls; tachyonc query grep x
-    --in a.tach | head`. The line is None when a read has no query that
+    typed: `ls; grep -n x a.vl | head` runs `ls; volec query grep x
+    --in a.vl | head`. The line is None when a read has no query that
     is not in doubt (the caller blocks it), or when the directory a read
     runs in is not known (a `cd` of a variable, a `cd` in a subshell)."""
     spans = tc.segment_spans(command)
@@ -850,10 +850,10 @@ def rewrite_parts(event, command, cwd, reads):
             if subshell or words[0] == "popd" or len(words) != 2 or target is None or target == "-":
                 unsure = i
                 break
-    # (the tachyonc the line itself runs, as a path from cwd)
+    # (the volec the line itself runs, as a path from cwd)
     own = [p if "/" not in p else os.path.relpath(os.path.join(h, p), cwd)
            for _, _, p, _, h in tc.calls_at(command, cwd)
-           if p and not p.startswith("$") and os.path.basename(p).startswith("tachyonc")][:1]
+           if p and not p.startswith("$") and os.path.basename(p).startswith("volec")][:1]
     parts, failed, edits, used = [], [], [], set()
     for r in reads:
         i = r.idx
@@ -955,7 +955,7 @@ def translate_one(event, cwd, prog, files, located, i, pipe_next, piped, own):
         words = words[1:]
     if not words or os.path.basename(words[0]) != prog:
         return None
-    t = tachyonc_for(event, cwd, here, own)
+    t = volec_for(event, cwd, here, own)
     if not t:
         return None
     t = shlex.quote(t)
@@ -1086,7 +1086,7 @@ def grep_options(prog, args):
                     return None
                 o["pats"].append(val if val else args[i + 1])
                 i += 0 if val else 1
-            elif name == "--include" and val.strip("'\"") == "*.tach":
+            elif name == "--include" and val.strip("'\"") == "*.vl":
                 pass
             elif name in ("--color", "--colour") and val in ("", "never", "auto"):
                 pass
@@ -1227,7 +1227,7 @@ def grep_query(t, prog, args, here, assigns, limit=None):
       (`--code`, any indentation; texts that are words get `--word`);
     - -A/-B/-C N on one file: `query text` of the lines grep prints (found
       here; at most three runs);
-    in F (`--in F`); a directory with -r, `DIR/*.tach` (DIR and its
+    in F (`--in F`); a directory with -r, `DIR/*.vl` (DIR and its
     subdirectories); compiler/std or a file of it: `--in std` (std is one
     module). Anything else (a regex, -c, -l, -v, several files) is None."""
     o = grep_options(prog, args)
@@ -1265,13 +1265,13 @@ def grep_query(t, prog, args, here, assigns, limit=None):
     if o["A"] or o["B"]:
         paths = context_files(o, here, assigns)
         return context_query(t, paths, lits, o) if paths else None
-    # the file: as typed (expanded), a directory, DIR/*.tach, std
+    # the file: as typed (expanded), a directory, DIR/*.vl, std
     arg = o["files"][0]
     e = tc.expand(arg, assigns)
     if e is None:
         return None
     if re.search(r"[*?\[]", e):
-        m = re.match(r"^((?:[^*?\[]*/)?)\*\.tach$", e)
+        m = re.match(r"^((?:[^*?\[]*/)?)\*\.vl$", e)
         if not m:
             return None
         e = m.group(1).rstrip("/") or "."
@@ -1279,7 +1279,7 @@ def grep_query(t, prog, args, here, assigns, limit=None):
         if not os.path.isdir(full):
             return None
         if not re.search(r"/compiler/std$", full):
-            notes.append("`%s/*.tach`: %s and its subdirectories" % (e, e))
+            notes.append("`%s/*.vl`: %s and its subdirectories" % (e, e))
     else:
         full = os.path.normpath(os.path.join(here, e))
         if os.path.isdir(full):
@@ -1293,12 +1293,12 @@ def grep_query(t, prog, args, here, assigns, limit=None):
     if std:
         notes.append("std's files are one module, `--in std`")
         e = "std"
-    ra = root_args(os.path.join(full, "_.tach") if is_dir else full, here)
+    ra = root_args(os.path.join(full, "_.vl") if is_dir else full, here)
     if ra is None or e == ".":
         return None
     # (the root's own directory, compiler/src: the whole program, no --in)
     whole = is_dir and not std and (bool(re.search(r"/compiler/src$", full))
-                                    or os.path.exists(os.path.join(full, "main.tach")))
+                                    or os.path.exists(os.path.join(full, "main.vl")))
     tail = " ".join(shlex.quote(x) for x in ([] if whole else ["--in", e]) + ra)
     if o["i"]:
         texts = [v for x in texts for v in case_variants(x)]
@@ -1330,7 +1330,7 @@ def grep_query(t, prog, args, here, assigns, limit=None):
 
 def context_files(o, here, assigns):
     """[(path as typed, full path)] of the files a grep -A/-B/-C reads: its
-    operands, globs expanded, directories (with -r) walked for .tach files;
+    operands, globs expanded, directories (with -r) walked for .vl files;
     None when one is not known or not there."""
     import glob
     out = []
@@ -1350,7 +1350,7 @@ def context_files(o, here, assigns):
             for d, dirs, fs in os.walk(full):
                 dirs.sort()
                 out += [(os.path.join(e.rstrip("/"), os.path.relpath(os.path.join(d, f), full)),
-                         os.path.join(d, f)) for f in sorted(fs) if f.endswith(".tach")]
+                         os.path.join(d, f)) for f in sorted(fs) if f.endswith(".vl")]
         elif os.path.isfile(full):
             out.append((e, full))
         else:
@@ -1417,9 +1417,9 @@ def post_context(event, command, calls, out_text=""):
     esc = ESCAPE.search(command)
     if esc and LINE_FOR_EDIT.search(esc.group(1)):
         out.append("note hook.query-first: no line numbers are needed to change an item: "
-                   "`tachyonc edit insert --after NAME < text` adds an item after NAME, "
-                   "`tachyonc edit patch NAME --old 'TEXT' --new 'TEXT'` changes lines in it, "
-                   "and `tachyonc query def NAME` prints its FILE:LINE")
+                   "`volec edit insert --after NAME < text` adds an item after NAME, "
+                   "`volec edit patch NAME --old 'TEXT' --new 'TEXT'` changes lines in it, "
+                   "and `volec query def NAME` prints its FILE:LINE")
     note = repeat_query_hint(event, calls, out_text)
     if note:
         out.append(note)
@@ -1468,10 +1468,10 @@ def repeat_query_hint(event, calls, out_text):
         if len(rest) >= 2 and rest[1] == "context":
             used_context = True
         if len(rest) >= 3 and rest[1] in QUERY_LOOKUPS:
-            names = [n for n in rest[2:] if not n.endswith(".tach") and not re.match(r"^[\d:-]+$", n)
-                     and not re.search(r"\.tach:", n)]
+            names = [n for n in rest[2:] if not n.endswith(".vl") and not re.match(r"^[\d:-]+$", n)
+                     and not re.search(r"\.vl:", n)]
             if names:
-                recs.append({"args": names[:4], "prog": path or "tachyonc"})
+                recs.append({"args": names[:4], "prog": path or "volec"})
     if not recs and not used_context:
         return ""
     st = hs.load(event, "query")
@@ -1491,7 +1491,7 @@ def repeat_query_hint(event, calls, out_text):
         # (the name asked about most; on a tie the first: where it began)
         firsts = [r["args"][0] for r in window]
         name = max(firsts, key=firsts.count)
-        note = hs.hint("repeat-query", NAME=name, TACHYONC=window[-1].get("prog") or "tachyonc")
+        note = hs.hint("repeat-query", NAME=name, VOLEC=window[-1].get("prog") or "volec")
         if note:
             hinted.append("repeat-query")
     hs.save(event, st, "query")
@@ -1499,9 +1499,9 @@ def repeat_query_hint(event, calls, out_text):
 
 
 def via(calls):
-    """{"via": PATH} when the tachyonc run was not plain `tachyonc` (a copy,
+    """{"via": PATH} when the volec run was not plain `volec` (a copy,
     a shell variable): the record says how the agent ran it."""
-    paths = sorted({c[2] or "$VAR" for c in calls if os.path.basename(c[2]) != "tachyonc"})
+    paths = sorted({c[2] or "$VAR" for c in calls if os.path.basename(c[2]) != "volec"})
     return {"via": " ".join(paths)[:120]} if paths else {}
 
 
@@ -1538,8 +1538,8 @@ def main():
             ran = next((c[2] for c in calls if c[2] and not c[2].startswith("$")), None)
             if ran and not err.startswith("error") and query_mode() == "rewrite":
                 st = hs.load(event, "query")
-                if st.get("tachyonc") != ran:
-                    st["tachyonc"] = ran
+                if st.get("volec") != ran:
+                    st["volec"] = ran
                     hs.save(event, st, "query")
             context = post_context(event, command, calls, out)
             if context:
@@ -1601,7 +1601,7 @@ def main():
                      "to": new[:300], "parts": len(parts)})
             json.dump({"hookSpecificOutput": {
                 "hookEventName": "PreToolUse", "permissionDecision": "allow",
-                "permissionDecisionReason": "hook.query-first: a read of .tach source run as its query",
+                "permissionDecisionReason": "hook.query-first: a read of .vl source run as its query",
                 "updatedInput": dict(inp, command=new), "additionalContext": "\n".join(notes)}}, sys.stdout)
             return 0
         if not failed:
@@ -1618,7 +1618,7 @@ def main():
 
     if tool in ("Edit", "Write", "MultiEdit") and phase == "PreToolUse":
         target = inp.get("file_path") or ""
-        if target.endswith(".tach"):
+        if target.endswith(".vl"):
             log(gd, {"kind": tool.lower(), "target": target[:200],
                      "existed": os.path.exists(target),
                      "bytes": len(inp.get("new_string") or inp.get("content") or "")})

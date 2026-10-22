@@ -1,13 +1,13 @@
 #!/bin/sh
 # C interoperability conformance: random signatures (gen.awk) called in
-# both directions between C and tachyon, every value checked. Each
+# both directions between C and vole, every value checked. Each
 # program is compiled at -O0, -O1 and -O2 (with --verify-ir), linked with
 # its C half (compiled by cc) and run; it must print "ok".
 #
 # usage: tests/abi/run.sh [-c COMPILER] [-t TARGET] [-n COUNT] [-f FIRST]
 #                         [-k DIR] [-j JOBS] [-i | -H]
 #
-#   -c COMPILER   the tachyonc to test (default: target/tachyonc)
+#   -c COMPILER   the volec to test (default: target/volec)
 #   -t TARGET     aarch64-macos, aarch64-linux, x86_64-linux or x86_64-macos (default:
 #                 the host)
 #   -n COUNT      number of programs (default 150; each has 5 to 11
@@ -15,18 +15,18 @@
 #   -f FIRST      the first random seed (default 1)
 #   -k DIR        where to keep failing programs (default: tests/abi/failures)
 #   -j JOBS       programs tested at once (default: the number of CPUs,
-#                 or the slots of $TACHYON_JOBSERVER, see tests/run.sh)
+#                 or the slots of $VOLE_JOBSERVER, see tests/run.sh)
 #   -i            import mode: the C declarations are in a header, which the
-#                 C half includes and the tachyon half imports (`import`);
-#                 the tachyon half declares only its enums (which shadow C's)
-#   -H            header mode: the C half uses the header tachyonc --emit-header
-#                 writes for the tachyon half, not declarations of its own
+#                 C half includes and the vole half imports (`import`);
+#                 the vole half declares only its enums (which shadow C's)
+#   -H            header mode: the C half uses the header volec --emit-header
+#                 writes for the vole half, not declarations of its own
 
 set -u
 LC_ALL=C
 export LC_ALL
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 TARGET=""
 COUNT=150
 FIRST=1
@@ -67,13 +67,13 @@ case "$TARGET" in
     *) ARCH="" ;;
 esac
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-abi.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-abi.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 
 # The C compiler, once more when it crashed (a signal, or gcc's "internal
 # compiler error"): an emulated toolchain (x86-64 Linux under Rosetta)
-# now and then does, and a crash of cc is not tachyon's. Its output (and
+# now and then does, and a crash of cc is not vole's. Its output (and
 # the crash's, if any) on stdout.
 cc_run() {
     cr_out=$("$CC" "$@" 2>&1)
@@ -94,7 +94,7 @@ cc_run() {
 # $WORK/p$1.count.
 test_seed() {
     seed=$1
-    t="$WORK/p$seed.tach"
+    t="$WORK/p$seed.vl"
     c="$WORK/p$seed.c"
     awk -v seed="$seed" -v cfile="$c" -v tfile="$t" -v import="$IMPORT" -v header="$HEADER" -v hfile="$WORK/p$seed.h" -f "$ROOT/tests/abi/gen.awk"
     rm -f "$t.decls"
@@ -121,10 +121,10 @@ test_seed() {
     rm -f "$WORK/p$seed".O*
 }
 
-# The slots: JOBS of them, or (0.11) the ones $TACHYON_JOBSERVER shares
+# The slots: JOBS of them, or (0.11) the ones $VOLE_JOBSERVER shares
 # between the runners of bootstrap/gate.sh (see tests/run.sh).
-if [ -z "$JOBS" ] && [ -n "${TACHYON_JOBSERVER:-}" ] && [ -p "$TACHYON_JOBSERVER" ]; then
-    exec 3<>"$TACHYON_JOBSERVER"
+if [ -z "$JOBS" ] && [ -n "${VOLE_JOBSERVER:-}" ] && [ -p "$VOLE_JOBSERVER" ]; then
+    exec 3<>"$VOLE_JOBSERVER"
 else
     if [ -z "$JOBS" ]; then
         JOBS=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)
@@ -156,7 +156,7 @@ while [ "$seed" -lt "$last" ]; do
     if [ -f "$WORK/p$seed.why" ]; then
         failures=$((failures + 1))
         mkdir -p "$KEEP"
-        cp "$WORK/p$seed.tach" "$WORK/p$seed.c" "$KEEP/"
+        cp "$WORK/p$seed.vl" "$WORK/p$seed.c" "$KEEP/"
         [ -f "$WORK/p$seed.h" ] && cp "$WORK/p$seed.h" "$KEEP/"
         echo "FAIL seed $seed: $(cat "$WORK/p$seed.why") (kept in $KEEP)"
     fi

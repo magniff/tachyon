@@ -1,0 +1,686 @@
+// Object files (0.7): the assembly the code generator wrote (ASM) is
+// assembled here, by the compiler itself, into a Mach-O object (macOS,
+// both instruction sets) or an ELF one (Linux), so that `cc` only links.
+// The text is the single source: `--emit-asm` writes it as it is, and the
+// object holds exactly what it says. tests/objcheck.sh links both this
+// object and `cc -c` of the same text and compares the results.
+//
+// The text is the compiler's own, in a small regular subset of the
+// assembler syntax (one statement per line; labels `name:`; the
+// directives .text, .data, .section, .globl, .p2align, .byte, .long,
+// .quad, .space; with -g, 0.11, also .file, .loc and, on Mach-O, the
+// .cfi_* of the standard frame). Lines are assembled in one pass into fragments: runs of
+// bytes, each followed by an optional tail whose size depends on where it
+// lands (an alignment, or an x86-64 branch that may be short or long).
+// Layout places the fragments, relaxing branches as GNU as and LLVM do
+// (all short first; one that does not reach grows, until nothing does);
+// then fixups are resolved or become relocations, and the object is
+// written (macho_write, elf_write).
+//
+// Instructions are encoded by enc_arm64.vl (AArch64) and enc_x86.vl
+// (x86-64).
+//
+// This file holds the object being built (sections, fragments, symbols,
+// fixups, relocations), the byte writers and the driver (write_object,
+// write_output); the parts, in the order the driver runs them:
+// assemble.vl (the text, line by line), resolve.vl (layout, fixups,
+// section contents), debug.vl (what -g adds: the DWARF line program and
+// compact unwind), macho.vl and elf.vl (the writers).
+
+pub mod assemble;
+mod debug;
+mod resolve;
+mod macho;
+mod elf;
+pub mod output;
+
+use assemble::{HOOKS, MAPPING, assemble_line};
+use crate::back::dwarf::DEBUG_INFO;
+use crate::back::enc_arm64::init_a64;
+use crate::back::enc_x86::init_x86;
+use crate::base::{
+    BUFS, alloc_array, alloc_zeroed, buf_byte, buf_fmt, buf_new, buf_write_file, cstr, die, free,
+    grow, memcpy, realloc, strlen,
+};
+use debug::{CFI_FNS, ROWS, compact_unwind, line_program};
+use elf::elf_write;
+use macho::macho_write;
+use resolve::{build_sections, layout, resolve_fixups};
+
+// The assembler's text helpers, used by the instruction encoders.
+use crate::base::target::{ELF, X86};
+use crate::base::timer::{T_CODEGEN, T_OUTPUT, timer_now, timer_sub};
+use crate::middle::ctx::FnCtx;
+use crate::middle::threads::asm_thread_push;
+use output::{c_module_symbols, link_command};
+
+// ---- Sections ----
+
+pub const SEC_TEXT: i64 = 0;
+pub const SEC_CONST: i64 = 1;
+pub const SEC_DATA: i64 = 2;
+pub const SEC_NOTE: i64 = 3;
+// (0.11, -g) DWARF.
+pub const SEC_DEBUG_ABBREV: i64 = 4;
+pub const SEC_DEBUG_INFO: i64 = 5;
+pub const SEC_DEBUG_LINE: i64 = 6;
+// (0.11, -g) Mach-O's compact unwind information, made from the CFI.
+pub const SEC_UNWIND: i64 = 7;
+const SEC_COUNT: i64 = 8;
+
+pub static var CUR_SEC: i64 = 0;
+static var SEC_ALIGN: [i64; 8] = [0; 8];
+static var SEC_USED: [bool; 8] = [false; 8];
+// Section contents after layout, and their sizes and addresses in the
+// object (Mach-O lays sections out one after the other).
+static var SEC_BUF: [i64; 8] = [-1; 8];
+static var SEC_ADDR: [i64; 8] = [0; 8];
+
+// ---- Fragments ----
+
+const TAIL_NONE: i64 = 0;
+const TAIL_ALIGN: i64 = 1;
+pub const TAIL_JMP: i64 = 2;
+pub const TAIL_JCC: i64 = 3;
+
+// Bytes [start, start + len) of OBJ_BYTES, then the tail: an alignment to
+// 2^arg bytes, or a branch (arg: the condition) to symbol `sym`, short or
+// long. `addr`: the fragment's offset in its section.
+struct Frag {
+    sec: i64, start: i64, len: i64, tail: i64, arg: i64, sym: i64, long: bool, addr: i64, atom: i64
+}
+
+static var FRAGS: *Frag = 0 as *Frag;
+static var FRAG_COUNT: i64 = 0;
+static var FRAG_CAP: i64 = 0;
+// The fragment being filled (always the last one).
+static var OPEN: i64 = -1;
+// (0.18.1) The assembled bytes, the assembler's own (not a buffer of
+// BUFS, which code generation may grow while the assembler runs on a
+// thread of its own).
+pub struct ObjBytes { data: *u8, len: i64, cap: i64 }
+pub static var OBJ: ObjBytes = ObjBytes { data: 0 as *u8, len: 0, cap: 0 };
+
+// Room for n more bytes in OBJ.
+pub fn obj_reserve(n: i64) {
+    unsafe {
+        if OBJ.len + n <= OBJ.cap {
+            return;
+        }
+        var cap = OBJ.cap * 2;
+        while cap < OBJ.len + n {
+            cap *= 2;
+        }
+        let grown = realloc(OBJ.data, cap as u64);
+        if grown == 0 as *u8 {
+            die(c"out of memory");
+        }
+        OBJ.data = grown;
+        OBJ.cap = cap;
+    }
+}
+
+fn new_frag(sec: i64) {
+    unsafe {
+        if OPEN >= 0 {
+            FRAGS[OPEN].len = OBJ.len - FRAGS[OPEN].start;
+        }
+        FRAGS = grow(FRAGS, FRAG_COUNT, &FRAG_CAP);
+        FRAGS[FRAG_COUNT] = Frag {
+            sec, start: OBJ.len, len: 0, tail: TAIL_NONE, arg: 0, sym: -1,
+            long: false, addr: 0, atom: -1
+        };
+        OPEN = FRAG_COUNT;
+        FRAG_COUNT += 1;
+    }
+}
+
+// Ends the open fragment with a tail, and opens the next.
+fn end_frag(tail: i64, arg: i64, sym: i64) {
+    unsafe {
+        FRAGS[OPEN].tail = tail;
+        FRAGS[OPEN].arg = arg;
+        FRAGS[OPEN].sym = sym;
+        FRAGS[OPEN].atom = CUR_ATOM[CUR_SEC];
+    }
+    new_frag(CUR_SEC);
+}
+
+fn switch_section(sec: i64) {
+    SEC_USED[sec] = true;
+    if sec != CUR_SEC {
+        CUR_SEC = sec;
+        new_frag(sec);
+    }
+}
+
+// The position (in OBJ_BYTES) of the next byte.
+pub fn here() -> i64 {
+    unsafe { OBJ.len }
+}
+
+pub fn out8(b: i64) {
+    unsafe {
+        obj_reserve(1);
+        OBJ.data[OBJ.len] = (b & 255) as u8;
+        OBJ.len += 1;
+    }
+}
+
+pub fn out16(v: i64) {
+    out8(v);
+    out8(v >> 8);
+}
+
+// (0.17: the four bytes with one check for room, not four buf_byte calls)
+pub fn out32(v: i64) {
+    unsafe {
+        obj_reserve(4);
+        let at = OBJ.len;
+        let d = OBJ.data;
+        d[at] = (v & 255) as u8;
+        d[at + 1] = ((v >> 8) & 255) as u8;
+        d[at + 2] = ((v >> 16) & 255) as u8;
+        d[at + 3] = ((v >> 24) & 255) as u8;
+        OBJ.len = at + 4;
+    }
+}
+
+pub fn out64(v: i64) {
+    out32(v);
+    out32(v >> 32);
+}
+
+// Reads and writes a little-endian 32-bit word of OBJ_BYTES.
+fn get32(pos: i64) -> i64 {
+    unsafe {
+        let d = OBJ.data;
+        (d[pos] as i64) | (d[pos + 1] as i64) << 8 | (d[pos + 2] as i64) << 16
+            | (d[pos + 3] as i64) << 24
+    }
+}
+
+fn put32(pos: i64, v: i64) {
+    unsafe {
+        let d = OBJ.data;
+        d[pos] = (v & 255) as u8;
+        d[pos + 1] = ((v >> 8) & 255) as u8;
+        d[pos + 2] = ((v >> 16) & 255) as u8;
+        d[pos + 3] = ((v >> 24) & 255) as u8;
+    }
+}
+
+// ---- Symbols ----
+
+// A name of the assembly: a label (defined in `sec` at `off` from the
+// start of fragment `frag`), or a name only referred to. `in_table`: the
+// symbol table needs it (relocations refer to it); `index`: its index
+// there.
+// (0.18.1: its name its own bytes, not an interned symbol: the assembler
+// runs beside code generation's threads, which read the symbols.)
+struct ASym {
+    text: [u8], defined: bool, global: bool, frag: i64, off: i64, sec: i64, in_table: bool,
+    index: i64, atom: i64
+}
+
+// Mach-O's atoms: a label that is not temporary starts one, which runs to
+// the next. LLVM resolves a pc-relative reference only within one atom
+// (else the linker could move them apart): the current atom per section.
+static var CUR_ATOM: [i64; 8] = [-1; 8];
+
+static var ASYMS: *ASym = 0 as *ASym;
+static var ASYM_COUNT: i64 = 0;
+static var ASYM_CAP: i64 = 0;
+// Interned name + 1 -> symbol + 1.
+static var ASYM_TABLE: *i64 = 0 as *i64;
+static var ASYM_TABLE_SIZE: i64 = 0;
+
+pub fn asym(name: [u8]) -> i64 {
+    unsafe {
+        if (ASYM_COUNT + 1) * 2 > ASYM_TABLE_SIZE {
+            asym_rehash();
+        }
+        let hash = name_hash(name);
+        let mask = (ASYM_TABLE_SIZE - 1) as u64;
+        var slot = hash & mask;
+        while ASYM_TABLE[slot] != 0 {
+            let s = ASYM_TABLE[slot] - 1;
+            if ASYMS[s].text == name {
+                return s;
+            }
+            slot = (slot + 1) & mask;
+        }
+        ASYMS = grow(ASYMS, ASYM_COUNT, &ASYM_CAP);
+        let s = ASYM_COUNT;
+        let n = name.len as i64;
+        let copy = alloc_zeroed(n + 1);
+        memcpy(copy, name.ptr, n as u64);
+        ASYMS[s] = ASym {
+            text: copy[0..n], defined: false, global: false, frag: -1, off: 0, sec: -1,
+            in_table: false, index: -1, atom: -1
+        };
+        ASYM_COUNT += 1;
+        ASYM_TABLE[slot] = s + 1;
+        s
+    }
+}
+
+// The table of ASYMS by name (index + 1, open addressing), twice as large.
+fn asym_rehash() {
+    unsafe {
+        let size = if ASYM_TABLE_SIZE == 0 { 1024 } else { ASYM_TABLE_SIZE * 2 };
+        free(ASYM_TABLE as *u8);
+        ASYM_TABLE = alloc_array::<i64>(size);
+        ASYM_TABLE_SIZE = size;
+        let mask = (size - 1) as u64;
+        for s in 0..ASYM_COUNT {
+            var slot = name_hash(ASYMS[s].text) & mask;
+            while ASYM_TABLE[slot] != 0 {
+                slot = (slot + 1) & mask;
+            }
+            ASYM_TABLE[slot] = s + 1;
+        }
+    }
+}
+
+// FNV-1a of a name.
+fn name_hash(t: [u8]) -> u64 {
+    var h: u64 = 14695981039346656037;
+    for i in 0..t.len as i64 {
+        h = (h ^ t[i] as u64) * 1099511628211;
+    }
+    h
+}
+
+// (0.18.1) A table from names to values (0: none): the assembler's own
+// (its mnemonics, registers), so that it reads no table the rest of the
+// compiler grows while it runs on a thread of its own. A name is its
+// bytes' address and length.
+pub struct NameMap { ptrs: *i64, lens: *i64, vals: *i64, size: i64, count: i64 }
+
+fn name_at(m: NameMap, slot: i64) -> [u8] {
+    unsafe { (m.ptrs[slot] as *u8)[0..m.lens[slot]] }
+}
+
+pub fn name_put(m: inout NameMap, name: [u8], value: i64) {
+    unsafe {
+        if (m.count + 1) * 2 > m.size {
+            let old = m;
+            m.size = if old.size == 0 { 256 } else { old.size * 2 };
+            m.ptrs = alloc_array::<i64>(m.size);
+            m.lens = alloc_array::<i64>(m.size);
+            m.vals = alloc_array::<i64>(m.size);
+            m.count = 0;
+            for i in 0..old.size {
+                if old.vals[i] != 0 {
+                    name_put(&m, (old.ptrs[i] as *u8)[0..old.lens[i]], old.vals[i]);
+                }
+            }
+            free(old.ptrs as *u8);
+            free(old.lens as *u8);
+            free(old.vals as *u8);
+        }
+        let mask = (m.size - 1) as u64;
+        var slot = name_hash(name) & mask;
+        while m.vals[slot] != 0 && name_at(m, slot as i64) != name {
+            slot = (slot + 1) & mask;
+        }
+        if m.vals[slot] == 0 {
+            let n = name.len as i64;
+            let copy = alloc_zeroed(n + 1);
+            memcpy(copy, name.ptr, n as u64);
+            m.ptrs[slot] = copy as i64;
+            m.lens[slot] = n;
+            m.count += 1;
+        }
+        m.vals[slot] = value;
+    }
+}
+
+pub fn name_get(m: NameMap, name: [u8]) -> i64 {
+    unsafe {
+        if m.size == 0 {
+            return 0;
+        }
+        let mask = (m.size - 1) as u64;
+        var slot = name_hash(name) & mask;
+        while m.vals[slot] != 0 {
+            if name_at(m, slot as i64) == name {
+                return m.vals[slot];
+            }
+            slot = (slot + 1) & mask;
+        }
+        0
+    }
+}
+
+// A C string's bytes.
+pub fn c_bytes(s: *u8) -> [u8] {
+    unsafe { s[0..strlen(s) as i64] }
+}
+
+// A temporary label (L... on Mach-O, .L... on ELF): never in the symbol
+// table unless a relocation needs it (Mach-O only; ELF uses the section).
+fn is_temp(s: i64) -> bool {
+    let t = unsafe { ASYMS[s].text };
+    if ELF { t.len >= 2 && t[0] == '.' && t[1] == 'L' } else { t.len >= 1 && t[0] == 'L' }
+}
+
+fn sym_addr(s: i64) -> i64 {
+    unsafe { FRAGS[ASYMS[s].frag].addr + ASYMS[s].off }
+}
+
+// ---- Fixups ----
+
+pub const FX_A64_B26: i64 = 1;
+pub const FX_A64_B19: i64 = 2;
+pub const FX_A64_B14: i64 = 3;
+pub const FX_A64_ADR: i64 = 4;
+pub const FX_A64_PAGE: i64 = 5;
+pub const FX_A64_PAGEOFF: i64 = 6;
+pub const FX_A64_GOTPAGE: i64 = 7;
+pub const FX_A64_GOTPAGEOFF: i64 = 8;
+pub const FX_X86_BRANCH: i64 = 9;
+pub const FX_X86_RIP: i64 = 10;
+pub const FX_X86_GOT: i64 = 11;
+pub const FX_DIFF32: i64 = 12;
+pub const FX_ABS64: i64 = 13;
+pub const FX_ABS32: i64 = 14;
+
+// `pos`: the field's position in OBJ_BYTES (an AArch64 instruction, or an
+// x86-64 or data field); `frag`: its fragment; `end`: for x86-64, the
+// position where the instruction ends (pc); `sym2`: the subtracted label
+// of FX_DIFF32. `rex`: an x86-64 GOT load with a REX prefix.
+struct Fixup {
+    kind: i64, frag: i64, pos: i64, sym: i64, sym2: i64, addend: i64, end: i64, rex: bool, atom: i64
+}
+
+static var FIXUPS: *Fixup = 0 as *Fixup;
+static var FIXUP_COUNT: i64 = 0;
+static var FIXUP_CAP: i64 = 0;
+
+pub fn fixup(kind: i64, pos: i64, sym: i64, addend: i64, end: i64, rex: bool) {
+    unsafe {
+        FIXUPS = grow(FIXUPS, FIXUP_COUNT, &FIXUP_CAP);
+        FIXUPS[FIXUP_COUNT] = Fixup {
+            kind, frag: OPEN, pos, sym, sym2: -1, addend, end, rex, atom: CUR_ATOM[CUR_SEC]
+        };
+    }
+    FIXUP_COUNT += 1;
+}
+
+// x86-64 branches whose size layout decides (jmp, jcc to a label).
+pub fn emit_relaxable(tail: i64, cond: i64, sym: i64) {
+    end_frag(tail, cond, sym);
+}
+
+// ---- Relocations ----
+
+// In section `sec` at `offset`: the object format's relocation type
+// `rtype`, against symbol `sym` (an ASYMS index, or -1 - section for a
+// section of ELF), with `addend` (ELF) and, for Mach-O, pc-relativity and
+// the field's length (log2 bytes).
+struct Reloc { sec: i64, offset: i64, rtype: i64, sym: i64, addend: i64, pcrel: bool, length: i64 }
+
+static var RELOCS: *Reloc = 0 as *Reloc;
+static var RELOC_COUNT: i64 = 0;
+static var RELOC_CAP: i64 = 0;
+
+fn reloc(sec: i64, offset: i64, rtype: i64, sym: i64, addend: i64, pcrel: bool, length: i64) {
+    unsafe {
+        RELOCS = grow(RELOCS, RELOC_COUNT, &RELOC_CAP);
+        RELOCS[RELOC_COUNT] = Reloc { sec, offset, rtype, sym, addend, pcrel, length };
+    }
+    RELOC_COUNT += 1;
+}
+
+// A relocation against symbol s itself (a GOT entry's).
+fn reloc_to_symbol(sec: i64, offset: i64, rtype: i64, s: i64, pcrel: bool) {
+    unsafe { ASYMS[s].in_table = true; }
+    reloc(sec, offset, rtype, s, 0, pcrel, 2);
+}
+
+// A relocation against symbol s plus `extra`: on ELF a temporary label
+// becomes its section's symbol plus the label's offset.
+fn reloc_to(sec: i64, offset: i64, rtype: i64, s: i64, extra: i64, pcrel: bool, length: i64) {
+    unsafe {
+        if ELF && ASYMS[s].defined && is_temp(s) {
+            reloc(sec, offset, rtype, -1 - ASYMS[s].sec, extra + sym_addr(s), pcrel, length);
+            return;
+        }
+        ASYMS[s].in_table = true;
+        reloc(sec, offset, rtype, s, extra, pcrel, length);
+    }
+}
+
+// ---- Output helpers ----
+
+fn w8(out: i64, v: i64) {
+    buf_byte(out, (v & 255) as u8);
+}
+
+fn w16(out: i64, v: i64) {
+    w8(out, v);
+    w8(out, v >> 8);
+}
+
+fn w32(out: i64, v: i64) {
+    w16(out, v);
+    w16(out, v >> 16);
+}
+
+fn w64(out: i64, v: i64) {
+    w32(out, v);
+    w32(out, v >> 32);
+}
+
+// A name in a fixed 16-byte field.
+fn wname16(out: i64, name: *u8) {
+    unsafe {
+        let n = strlen(name) as i64;
+        for i in 0..16 {
+            w8(out, if i < n { name[i] } else { 0 });
+        }
+    }
+}
+
+fn pad_to(out: i64, size: i64) {
+    while unsafe { BUFS[out].len < size } {
+        buf_byte(out, 0);
+    }
+}
+
+fn align_up(v: i64, a: i64) -> i64 {
+    (v + a - 1) & (0 - a)
+}
+
+// Whether section `sec` holds DWARF.
+pub fn is_debug(sec: i64) -> bool {
+    sec >= SEC_DEBUG_ABBREV && sec <= SEC_DEBUG_LINE
+}
+
+// ---- The driver ----
+
+// Assembles ASM into an object file at `path` (what asm_flush has not
+// assembled yet).
+pub fn write_object(cx: sink *FnCtx, path: *u8) {
+    unsafe {
+        if !ASM_STREAM {
+            assembler_begin();
+        }
+        assemble_text(cx);
+        if ASM_STREAM {
+            BUFS[cx.asm].len = 0;
+        }
+        new_frag(CUR_SEC);
+        layout();
+        resolve_fixups(cx);
+        build_sections();
+        if ROWS.count > 0 {
+            line_program();
+        }
+        if CFI_FNS.count > 0 {
+            compact_unwind();
+        }
+        if ELF {
+            SEC_ALIGN[SEC_NOTE] = 0;
+            elf_write(path);
+        } else {
+            macho_write(path);
+        }
+    }
+}
+
+// The assembler's state before the first line.
+fn assembler_begin() {
+    unsafe {
+        OBJ = ObjBytes { data: alloc_zeroed(65536), len: 0, cap: 65536 };
+        MAPPING = ELF && !X86;
+        HOOKS = MAPPING;
+        CUR_SEC = SEC_TEXT;
+        SEC_USED[SEC_TEXT] = true;
+        new_frag(SEC_TEXT);
+        if X86 {
+            init_x86();
+        } else {
+            init_a64();
+        }
+    }
+}
+
+// Assembles the lines in ASM.
+fn assemble_text(cx: sink *FnCtx) {
+    unsafe { assemble_bytes(cx, BUFS[cx.asm].data, BUFS[cx.asm].len); }
+}
+
+// (0.18.1) Assembles the lines of text[0..n] (ATEXT while it runs).
+pub fn assemble_bytes(cx: sink *FnCtx, text: *u8, n: i64) {
+    unsafe {
+        ATEXT = text;
+        let t = text;
+        var i = 0;
+        while i < n {
+            // (0.17: the end of the line by memchr, not byte by byte)
+            let nl = memchr(&t[i], 10, (n - i) as u64);
+            let e = if nl == 0 as *u8 { n } else { i + (nl as i64 - (&t[i]) as i64) };
+            assemble_line(cx, i, e);
+            i = e + 1;
+        }
+    }
+}
+
+// (0.17) Whether the assembly is assembled as it is written (asm_flush
+// after each function): when the output is an object (or a program) and
+// there is no debug information, whose sections are made from the whole
+// text. The text in memory is then one function's, not the program's
+// (30 MB at -O0 for the compiler), and it is read while it is in the
+// cache.
+pub static var ASM_STREAM: bool = false;
+
+// (0.18.1) The text being assembled (assemble_text's): the assembler
+// reads it here, not from a buffer of BUFS, which code generation may
+// grow while the assembler runs on a thread of its own.
+pub static var ATEXT: *u8 = 0 as *u8;
+
+// From the first function on (after the file's header): see ASM_STREAM.
+pub fn asm_stream_begin() {
+    unsafe {
+        if OUTPUT_MODE != OUT_ASM && !DEBUG_INFO {
+            ASM_STREAM = true;
+            assembler_begin();
+        }
+    }
+}
+
+// Assembles the text written so far (whole lines: a function's), when
+// streaming.
+pub fn asm_flush(cx: sink *FnCtx) {
+    unsafe {
+        if ASM_STREAM {
+            // (its time is the output's, as when the text is assembled at
+            // the end, not the code generation's that runs it)
+            let t = timer_now();
+            c_module_symbols(cx);
+            assemble_text(cx);
+            BUFS[cx.asm].len = 0;
+            timer_sub(T_CODEGEN, T_OUTPUT, t);
+        }
+    }
+}
+
+// (0.18.1) asm_flush on the assembler's thread (middle::threads): the text
+// so far, copied, is handed to it.
+pub fn asm_hand_over(cx: sink *FnCtx) {
+    unsafe {
+        if ASM_STREAM {
+            c_module_symbols(cx);
+            let n = BUFS[cx.asm].len;
+            let copy = alloc_zeroed(n + 1);
+            memcpy(copy, BUFS[cx.asm].data, n as u64);
+            asm_thread_push(copy, n);
+            BUFS[cx.asm].len = 0;
+        }
+    }
+}
+
+// ---- Output ----
+
+extern "C" {
+    fn system(command: *u8) -> i32;
+    fn unlink(path: *u8) -> i32;
+    fn getenv(name: *u8) -> *u8;
+    fn memchr(s: *u8, c: i32, n: u64) -> *u8;
+}
+
+// What the compiler writes: assembly (`-S`, `--emit-asm`, or an output
+// named *.s), an object (`-c`, or *.o), or an executable linked by `cc`
+// (any other output name).
+pub const OUT_ASM: i64 = 0;
+pub const OUT_OBJECT: i64 = 1;
+pub const OUT_EXECUTABLE: i64 = 2;
+pub static var OUTPUT_MODE: i64 = -1;
+
+// The output mode for `path` when no option chose one.
+pub fn output_mode_of(path: *u8) -> i64 {
+    unsafe {
+        let n = strlen(path) as i64;
+        if n >= 2 && path[n - 2] == '.' && path[n - 1] == 's' {
+            return OUT_ASM;
+        }
+        if n >= 2 && path[n - 2] == '.' && path[n - 1] == 'o' {
+            return OUT_OBJECT;
+        }
+        OUT_EXECUTABLE
+    }
+}
+
+// Writes the program (ASM) to `path` as the output mode says.
+pub fn write_output(cx: sink *FnCtx, path: *u8) {
+    unsafe {
+        c_module_symbols(cx);
+        if OUTPUT_MODE == OUT_ASM {
+            buf_write_file(cx.asm, path);
+            return;
+        }
+        if OUTPUT_MODE == OUT_OBJECT {
+            write_object(cx, path);
+            return;
+        }
+        let obj = buf_new();
+        buf_fmt(obj, f"{cstr(path)}.vole.o\0");
+        let obj_path = BUFS[obj].data;
+        write_object(cx, obj_path);
+        var status = system(link_command(path, obj_path));
+        if status == 0 && DEBUG_INFO && !ELF {
+            // (-g) On macOS the debug information stays in the object, which
+            // goes: dsymutil gathers it into <path>.dSYM first, as clang does.
+            let dsym = buf_new();
+            buf_fmt(dsym, f"dsymutil '{cstr(path)}'\0");
+            status = system(BUFS[dsym].data);
+        }
+        unlink(obj_path);
+        if status != 0 {
+            die(c"linking failed");
+        }
+    }
+}

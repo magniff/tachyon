@@ -13,8 +13,8 @@
 ## by `fix --suggested`; what the fix keeps raw is wrapped in `unsafe` by
 ## `fix --only unsafe`, the second try: of the error.)
 $ fix --values
-fixed 6 suggested fixes, 5 parameters to &mut T, 5 parameters to &T, 1 slice parameter to &mut [T], 3 owned parameters to &T (only read), 10 arguments	main.tach	+23 -23 lines
-% cat main.tach
+fixed 6 suggested fixes, 5 parameters to &mut T, 5 parameters to &T, 1 slice parameter to &mut [T], 3 owned parameters to &T (only read), 10 arguments	main.vl	+23 -23 lines
+% cat main.vl
 struct Stats { count: i64, sum: i64 }
 struct Inv { items: Vec<i64>, name: Buf }
 
@@ -94,9 +94,9 @@ fn ranked(v: &mut Vec<Stats>) {
     sort_by(v.as_mut_slice(), |a: &Stats, b: &Stats| by_rank(&*a, &*b));
 }
 $ fix --suggested
-main.tach:77:68: error[type error] cannot deref non-pointer type 'Stats'  [edited: crate::ranked]
+main.vl:77:68: error[type error] cannot deref non-pointer type 'Stats'  [edited: crate::ranked]
 error edit.breaks: 1 new error; nothing written
-try: tachyonc fix --suggested --no-check
+try: volec fix --suggested --no-check
 [exit 1]
 $ fix --only unsafe
 note fix.none: nothing to fix
@@ -107,8 +107,8 @@ note fix.none: nothing to fix
 ## (0.20) Then 0.20's spelling, `fix --only conventions` (the migration reads
 ## 0.19's spelling itself), before the fixes that read 0.20's.
 $ fix --only conventions
-fixed 11 parameters to let, 5 parameters to inout, 1 parameter to sink, 2 receivers, 7 '&mut e's to '&e', 7 '&e's to a let, 2 '*r's of accesses, 10 'let mut's / 'mut x's to var	main.tach	+35 -35 lines
-$ main.tach -o prog
+fixed 11 parameters to let, 5 parameters to inout, 1 parameter to sink, 2 receivers, 7 '&mut e's to '&e', 7 '&e's to a let, 2 '*r's of accesses, 10 'let mut's / 'mut x's to var	main.vl	+35 -35 lines
+$ main.vl -o prog
 ok: built prog
 % ./prog
 3 3 0 6 0 0 1 9 12

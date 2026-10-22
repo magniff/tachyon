@@ -3,12 +3,12 @@
 ## The root's import of `third` is what shapes::calc imports through
 ## (`use crate::third`): not unused.
 $ query unused
-crate::shapes::calc::unused_one	shapes/calc.tach:12:8	fn
+crate::shapes::calc::unused_one	shapes/calc.vl:12:8	fn
 $ fix --only unused --dry-run
 note fix.none: nothing to fix
 $ fix --only tidy-imports --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -7,3 +7,2 @@
 -use util::square;
 -use shapes::area;
@@ -18,26 +18,26 @@ $ fix --only tidy-imports --dry-run
 @@ -11,2 +9,0 @@
 -use util::third;
 -use shapes::volume;
---- a/shapes/mod.tach
-+++ b/shapes/mod.tach
+--- a/shapes/mod.vl
++++ b/shapes/mod.vl
 @@ -5,2 +5 @@
 -pub use calc::{area, perimeter, unused_one};
 -pub use calc::helper;
 +pub use calc::{area, helper, perimeter, unused_one};
---- a/shapes/calc.tach
-+++ b/shapes/calc.tach
+--- a/shapes/calc.vl
++++ b/shapes/calc.vl
 @@ -2 +2 @@
 -use crate::{twice, third};
 +use crate::{third, twice};
-## Only util.tach's imports: the re-exports stay (main and calc use them).
-$ fix --only reexports --in util.tach --dry-run
---- a/shapes/mod.tach
-+++ b/shapes/mod.tach
+## Only util.vl's imports: the re-exports stay (main and calc use them).
+$ fix --only reexports --in util.vl --dry-run
+--- a/shapes/mod.vl
++++ b/shapes/mod.vl
 @@ -2 +2 @@
 -mod calc;
 +pub mod calc;
---- a/util.tach
-+++ b/util.tach
+--- a/util.vl
++++ b/util.vl
 @@ -3 +3 @@
 -use crate::shapes::{area, perimeter};
 +use crate::shapes::calc::{area, perimeter};
@@ -45,7 +45,7 @@ $ fix --only reexports --in util.tach --dry-run
 ## as a private import (shapes::local uses it), volume is the interface.
 $ fix --only reexports,tidy-imports
 fixed 6 imports through re-exports, 4 unused re-exports, 5 untidy use lines	4 files	+8 -11 lines
-% cat main.tach
+% cat main.vl
 // A program for `fix --only tidy-imports` and `fix --only reexports`
 // (tests/refactor/imports.t): untidy use lines, imports through
 // re-exports, re-exports to remove, one marked as the interface.
@@ -62,7 +62,7 @@ fn main() -> i32 {
     let b = crate::shapes::calc::perimeter(1) + util::twice(1) + shapes::local();
     if a + b > 0 { 0 } else { 1 }
 }
-% cat shapes/mod.tach
+% cat shapes/mod.vl
 // Shapes: what shapes::calc and shapes::extra define, re-exported.
 pub mod calc;
 mod extra;
@@ -74,7 +74,7 @@ pub use extra::volume;
 pub fn local() -> i64 {
     helper(1)
 }
-% cat shapes/calc.tach
+% cat shapes/calc.vl
 // The shapes' arithmetic.
 use crate::util::{third, twice};
 
@@ -94,8 +94,8 @@ pub fn helper(x: i64) -> i64 {
     x
 }
 $ fix --only unused
-fixed 1 unused import	main.tach	+1 -1 lines
+fixed 1 unused import	main.vl	+1 -1 lines
 $ fix --only reexports,tidy-imports
 note fix.none: nothing to fix
 $ check
-ok: 0 errors in main.tach
+ok: 0 errors in main.vl

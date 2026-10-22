@@ -1,25 +1,25 @@
 # c-math
 
-Numerical methods in tachyon, checked against the C math library
+Numerical methods in vole, checked against the C math library
 (libm): composite and adaptive Simpson integration, bisection and
 Newton's method for roots. The algorithms are generic over the function
-they work on (`F: Fn(f64) -> f64`), so they take tachyon closures, and
+they work on (`F: Fn(f64) -> f64`), so they take vole closures, and
 libm's functions go in through closures too. The results print with
 f-strings; libm's out-parameter functions (`frexp`, `modf`) show how C
 returns a second value through a pointer.
 
 ## Build and run
 
-From this folder (with `tachyonc` on your `PATH`, or as
-`../../target/tachyonc` from a built tree).
+From this folder (with `volec` on your `PATH`, or as
+`../../target/volec` from a built tree).
 
 ```sh
-tachyonc main.tach -o c-math && ./c-math
+volec main.vl -o c-math && ./c-math
 ```
 
-On Linux libm is a library of its own, apart from libc: `tachyonc` links
+On Linux libm is a library of its own, apart from libc: `volec` links
 it (`-lm`) because the program calls its functions. Other libraries and
-C files go on the same command line (`tachyonc main.tach helper.c -l png
+C files go on the same command line (`volec main.vl helper.c -l png
 -o prog`): see [c-mixed-build](../c-mixed-build/).
 
 ## Expected output
@@ -91,7 +91,7 @@ println(f"frexp(48)    = {mantissa:.4} * 2^{exponent}");
 ```
 
 C functions that return two values write the second through a pointer
-(`int *exp`). `&exponent` is the address of a tachyon local, a `*i32`,
+(`int *exp`). `&exponent` is the address of a vole local, a `*i32`,
 valid for the call.
 
 ### Algorithms generic over the function
@@ -170,17 +170,17 @@ printed with `{flat:?}`.
   is `*T`. Floats pass to C by value exactly as C expects.
 - **Out-parameters**: pass `&local`; C writes through it.
 - **Callbacks into C APIs** must be `extern "C" fn` (see
-  [c-qsort](../c-qsort/)); closures are for tachyon's own generic code.
+  [c-qsort](../c-qsort/)); closures are for vole's own generic code.
 - **Linking**: libm is linked when the program calls into it (on Linux
   it is apart from libc); other libraries with `-l NAME`, `-L DIR`.
 
 ## Language features
 
 - `import "math.h" as c`, out-parameters, linking:
-  `tachyonc guide c-interop`
-- closures, captures, `Fn` and `FnMut` bounds: `tachyonc guide closures`
-- generic functions with several type parameters: `tachyonc guide generics`
+  `volec guide c-interop`
+- closures, captures, `Fn` and `FnMut` bounds: `volec guide closures`
+- generic functions with several type parameters: `volec guide generics`
 - f-strings with precision and width (`{x:.12}`, `{v:>12.3}`), `{o:?}`:
-  `tachyonc guide formatting`
-- tuples, `Option<(f64, i64)>`, pattern matching: `tachyonc guide syntax`
-- `unsafe` blocks inside closures: `tachyonc guide unsafe`
+  `volec guide formatting`
+- tuples, `Option<(f64, i64)>`, pattern matching: `volec guide syntax`
+- `unsafe` blocks inside closures: `volec guide unsafe`

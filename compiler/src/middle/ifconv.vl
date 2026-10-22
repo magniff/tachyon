@@ -1,0 +1,384 @@
+// If-conversion in innermost loops (0.15), before the vectorizer
+// (opt.vl's optimize_loops).
+//
+// A branch in an innermost loop whose ways meet again after doing little
+// (a triangle or a diamond: arms of at most IFCONV_COST cheap pure
+// instructions, no division, no memory) becomes straight-line code: the
+// arms' instructions move up before the branch, and each phi of the
+// meeting block that takes different values from the two ways becomes a
+// SEL on the branch's condition (k ? x : y). `if x > m { m = x }`, `if
+// x & 1 == 0 { t += x * x }` and `if x > r { c += 1 }` are then
+// reductions the vectorizer and the run-time unroller take (the select a
+// vector select on a mask; instcombine makes `k ? t + x : t` into `t + (k
+// ? x : 0)`), and the loop has no branch to mispredict. A condition the
+// same in every iteration is left to unswitching.
+use crate::base::{IntVec, free};
+use crate::front::types::{TY_BOOL, is_float, is_integer};
+use crate::middle::ctx::FnCtx;
+use crate::middle::fold::combine_select;
+use crate::middle::ir::{
+    IRFUNCS, Op, Term, ir_append, ir_arg, ir_enter, ir_make, ir_operand, ir_operand_count,
+    ir_set_arg, ir_unlink, ir_val,
+};
+use crate::middle::ir::cfg::pred_index;
+use crate::middle::loops::{
+    analyze_loops, invariant_in, is_innermost, loop_block, loop_contains, loop_count, loop_header,
+    loop_size,
+};
+use crate::middle::opt::remove_pred_at;
+use crate::middle::tags::merge_phi_block;
+
+// The instructions both arms may hold together (constants free).
+const IFCONV_COST: i64 = 4;
+
+pub static var IFCONV: bool = true;
+
+// The cost of arm block b (its instructions that are not constants), or -1
+// when it holds one that may not run unconditionally.
+fn arm_cost(cx: sink *FnCtx, b: i64) -> i64 {
+    unsafe {
+        var cost = 0;
+        var v = cx.blocks[b].first;
+        while v != 0 {
+            let op = cx.insts[v].op;
+            if op == Op::Const {
+                v = cx.insts[v].next;
+                continue;
+            }
+            if !(op.is_pure() || op == Op::Sel) || op == Op::Div || op == Op::Rem
+                || is_float(cx.insts[v].ty) || (op == Op::Conv && is_float(cx.insts[v].imm2))
+                || (op == Op::Cmp && is_float(cx.insts[v].imm2))
+                || crate::middle::licm::op_guarded(cx, v) {
+                return -1;
+            }
+            cost += 1;
+            v = cx.insts[v].next;
+        }
+        cost
+    }
+}
+
+// Whether block b is an arm of h: reached from h alone, jumping on.
+fn is_arm(cx: sink *FnCtx, b: i64, h: i64) -> bool {
+    unsafe {
+        cx.blocks[b].preds.count == 1 && cx.blocks[b].preds.data[0] == h
+            && cx.blocks[b].term == Term::Jump
+    }
+}
+
+fn move_up(cx: sink *FnCtx, from: i64, to: i64) {
+    unsafe {
+        var v = cx.blocks[from].first;
+        while v != 0 {
+            let next = cx.insts[v].next;
+            ir_unlink(cx, v);
+            ir_append(cx, to, v);
+            v = next;
+        }
+    }
+}
+
+fn drop_arm(cx: sink *FnCtx, b: i64) {
+    unsafe {
+        cx.blocks[b].removed = 1;
+        cx.blocks[b].term = Term::None;
+        cx.blocks[b].preds.count = 0;
+        cx.blocks[b].first = 0;
+        cx.blocks[b].last = 0;
+    }
+}
+
+// Whether block b branches and is reached from one block (a link of a
+// chain fold_branch_chain may merge).
+fn chained(cx: sink *FnCtx, b: i64) -> bool {
+    unsafe { cx.blocks[b].term == Term::Branch && cx.blocks[b].preds.count == 1 }
+}
+
+// Whether function fi has a branch to an arm (a block reached from it
+// alone, jumping on) or to a link of a chain: no loop analysis without
+// one.
+fn has_arm(cx: sink *FnCtx, fi: i64) -> bool {
+    unsafe {
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let h = IRFUNCS[fi].blocks.data[i];
+            if cx.blocks[h].removed == 0 && cx.blocks[h].term == Term::Branch
+                && (is_arm(cx, cx.blocks[h].s0, h) || is_arm(cx, cx.blocks[h].s1, h)
+                    || chained(cx, cx.blocks[h].s0) || chained(cx, cx.blocks[h].s1)) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// Whether phi (of block join, in loop l) is used by join's branch alone
+// within the loop.
+fn only_branched_on(cx: sink *FnCtx, l: i64, phi: i64, join: i64) -> bool {
+    unsafe {
+        if cx.blocks[join].term != Term::Branch || ir_val(cx, cx.blocks[join].cond) != phi {
+            return false;
+        }
+        for i in 0..loop_size(cx, l) {
+            let b = loop_block(cx, l, i);
+            var v = cx.blocks[b].first;
+            while v != 0 {
+                for k in 0..ir_operand_count(cx, v) {
+                    let o = ir_operand(cx, v, k);
+                    if o != 0 && ir_val(cx, o) == phi {
+                        return false;
+                    }
+                }
+                v = cx.insts[v].next;
+            }
+        }
+        true
+    }
+}
+
+// If-converts the branch ending block h of loop l; returns whether it did.
+fn convert(cx: sink *FnCtx, l: i64, h: i64) -> bool {
+    unsafe {
+        let t = cx.blocks[h].s0;
+        let e = cx.blocks[h].s1;
+        if t == e || t == h || e == h {
+            return false;
+        }
+        var join = 0;
+        var arm_t = 0;
+        var arm_e = 0;
+        if is_arm(cx, t, h) && is_arm(cx, e, h) && cx.blocks[t].s0 == cx.blocks[e].s0 {
+            join = cx.blocks[t].s0;
+            arm_t = t;
+            arm_e = e;
+        } else if is_arm(cx, t, h) && cx.blocks[t].s0 == e {
+            join = e;
+            arm_t = t;
+        } else if is_arm(cx, e, h) && cx.blocks[e].s0 == t {
+            join = t;
+            arm_e = e;
+        } else {
+            return false;
+        }
+        if join == h || join == loop_header(cx, l) || !loop_contains(cx, l, join)
+            || (join == t && arm_t != 0) || (join == e && arm_e != 0) {
+            return false;
+        }
+        let cost_t = if arm_t != 0 { arm_cost(cx, arm_t) } else { 0 };
+        let cost_e = if arm_e != 0 { arm_cost(cx, arm_e) } else { 0 };
+        if cost_t < 0 || cost_e < 0 || cost_t + cost_e > IFCONV_COST {
+            return false;
+        }
+        let index_t = pred_index(cx, join, if arm_t != 0 { arm_t } else { h });
+        let index_e = pred_index(cx, join, if arm_e != 0 { arm_e } else { h });
+        if index_t < 0 || index_e < 0 {
+            return false;
+        }
+        var selects = 0;
+        var phi = cx.blocks[join].first;
+        while phi != 0 && cx.insts[phi].op == Op::Phi {
+            if ir_val(cx, ir_arg(cx, phi, index_t)) != ir_val(cx, ir_arg(cx, phi, index_e)) {
+                if !is_integer(cx.insts[phi].ty) && cx.insts[phi].ty != TY_BOOL {
+                    return false;
+                }
+                // (0.16) A bool only branched on (`a && b` as a condition)
+                // stays two branches: predictable ones cost less than the
+                // bools made and and-ed.
+                if cx.insts[phi].ty == TY_BOOL && only_branched_on(cx, l, phi, join) {
+                    return false;
+                }
+                selects += 1;
+            }
+            phi = cx.insts[phi].next;
+        }
+        if selects == 0 || selects > 3 {
+            return false;
+        }
+        let cond = cx.blocks[h].cond;
+        if arm_t != 0 {
+            move_up(cx, arm_t, h);
+        }
+        if arm_e != 0 {
+            move_up(cx, arm_e, h);
+        }
+        phi = cx.blocks[join].first;
+        while phi != 0 && cx.insts[phi].op == Op::Phi {
+            let value_t = ir_val(cx, ir_arg(cx, phi, index_t));
+            let value_e = ir_val(cx, ir_arg(cx, phi, index_e));
+            var picked = value_t;
+            if value_t != value_e {
+                picked = ir_make(cx, Op::Sel, cx.insts[phi].ty, cond, value_t, 0);
+                cx.insts[picked].c = value_e;
+                ir_append(cx, h, picked);
+                // (k ? t + x : t is t + (k ? x : 0) at once: a reduction the
+                // vectorizer takes)
+                combine_select(cx, picked);
+            }
+            ir_set_arg(cx, phi, index_t, picked);
+            ir_set_arg(cx, phi, index_e, picked);
+            phi = cx.insts[phi].next;
+        }
+        // h jumps to the meeting block, once.
+        let removed_index = if arm_e != 0 { index_e } else { index_t };
+        let kept = if arm_e != 0 { arm_t } else { arm_e };
+        cx.blocks[h].term = Term::Jump;
+        cx.blocks[h].cond = 0;
+        cx.blocks[h].s0 = join;
+        cx.blocks[h].s1 = 0;
+        remove_pred_at(cx, join, removed_index);
+        if kept != 0 {
+            cx.blocks[join].preds.data[pred_index(cx, join, kept)] = h;
+        }
+        if arm_t != 0 {
+            drop_arm(cx, arm_t);
+        }
+        if arm_e != 0 {
+            drop_arm(cx, arm_e);
+        }
+        true
+    }
+}
+
+// (0.16) Branches to a common destination, merged (LLVM's
+// FoldBranchToCommonDest): h branches to T or to B, and B, reached from h
+// alone, computes a little (at most 2 IFCONV_COST cheap pure instructions)
+// and branches to T or to F. h then computes B's condition too and
+// branches once, on (h's way to T) | (B's way to T), to T or F. A
+// comparator's `<` and `<=` (lexicographic over fields) and the chains of
+// `&&` and `||` are one branch then, which mispredicts at most once. T's
+// phis must take the same value from h and B. Returns whether it merged.
+fn fold_branch_chain(cx: sink *FnCtx, l: i64, h: i64) -> bool {
+    unsafe {
+        for side in 0..2 {
+            let b = if side == 0 { cx.blocks[h].s0 } else { cx.blocks[h].s1 };
+            let t = if side == 0 { cx.blocks[h].s1 } else { cx.blocks[h].s0 };
+            if b == h || b == t || cx.blocks[b].term != Term::Branch
+                || cx.blocks[b].preds.count != 1
+                || !loop_contains(cx, l, b) {
+                continue;
+            }
+            let b_to_t = cx.blocks[b].s0 == t;
+            if !b_to_t && cx.blocks[b].s1 != t {
+                continue;
+            }
+            let f = if b_to_t { cx.blocks[b].s1 } else { cx.blocks[b].s0 };
+            if f == t || f == h || f == b || pred_index(cx, f, h) >= 0 {
+                continue;
+            }
+            let cost = arm_cost(cx, b);
+            if cost < 0 || cost > 2 * IFCONV_COST {
+                continue;
+            }
+            let from_h = pred_index(cx, t, h);
+            let from_b = pred_index(cx, t, b);
+            var same = from_h >= 0 && from_b >= 0;
+            var phi = cx.blocks[t].first;
+            while same && phi != 0 && cx.insts[phi].op == Op::Phi {
+                if ir_val(cx, ir_arg(cx, phi, from_h)) != ir_val(cx, ir_arg(cx, phi, from_b)) {
+                    same = false;
+                }
+                phi = cx.insts[phi].next;
+            }
+            if !same {
+                continue;
+            }
+            // h's condition for T, B's for T, then their or.
+            var c1 = ir_val(cx, cx.blocks[h].cond);
+            if side == 0 {
+                c1 = ir_make(cx, Op::Not, TY_BOOL, c1, 0, 0);
+                ir_append(cx, h, c1);
+            }
+            move_up(cx, b, h);
+            var c2 = ir_val(cx, cx.blocks[b].cond);
+            if !b_to_t {
+                c2 = ir_make(cx, Op::Not, TY_BOOL, c2, 0, 0);
+                ir_append(cx, h, c2);
+            }
+            let c = ir_make(cx, Op::Or, TY_BOOL, c1, c2, 0);
+            ir_append(cx, h, c);
+            cx.blocks[h].cond = c;
+            cx.blocks[h].s0 = t;
+            cx.blocks[h].s1 = f;
+            // T loses B, F has h for B.
+            remove_pred_at(cx, t, from_b);
+            cx.blocks[f].preds.data[pred_index(cx, f, b)] = h;
+            drop_arm(cx, b);
+            return true;
+        }
+        false
+    }
+}
+
+// Whether block b holds phis only.
+fn only_phis(cx: sink *FnCtx, b: i64) -> bool {
+    unsafe {
+        var v = cx.blocks[b].first;
+        while v != 0 {
+            if cx.insts[v].op != Op::Phi {
+                return false;
+            }
+            v = cx.insts[v].next;
+        }
+        true
+    }
+}
+
+// If-converts the small branches of fi's innermost loops; returns whether
+// any was.
+pub fn if_convert_loops(cx: sink *FnCtx, fi: i64) -> bool {
+    unsafe {
+        if !IFCONV || !has_arm(cx, fi) {
+            return false;
+        }
+        ir_enter(cx, fi);
+        analyze_loops(cx, fi);
+        var heads = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var owner = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var merged = false;
+        for l in 0..loop_count(cx) {
+            if !is_innermost(cx, l) {
+                continue;
+            }
+            for i in 0..loop_size(cx, l) {
+                let b = loop_block(cx, l, i);
+                // (0.16) A block of phis only, jumping to a block whose phis
+                // take them (an inner `if` meeting before the outer one):
+                // merged into it, so that the outer branch is a diamond.
+                if cx.blocks[b].removed == 0 && cx.blocks[b].term == Term::Jump
+                    && cx.blocks[b].first != 0 && cx.insts[cx.blocks[b].first].op == Op::Phi
+                    && loop_contains(cx, l, cx.blocks[b].s0)
+                    && cx.blocks[b].s0 != loop_header(cx, l)
+                    && only_phis(cx, b) && merge_phi_block(cx, fi, b, cx.blocks[b].s0) {
+                    merged = true;
+                }
+            }
+        }
+        if merged {
+            // (the blocks changed: the loops again)
+            analyze_loops(cx, fi);
+        }
+        for l in 0..loop_count(cx) {
+            if !is_innermost(cx, l) {
+                continue;
+            }
+            for i in 0..loop_size(cx, l) {
+                let b = loop_block(cx, l, i);
+                if cx.blocks[b].removed == 0 && cx.blocks[b].term == Term::Branch
+                    && !invariant_in(cx, l, ir_val(cx, cx.blocks[b].cond)) {
+                    heads.push(b);
+                    owner.push(l);
+                }
+            }
+        }
+        var changed = merged;
+        for i in 0..heads.count {
+            let b = heads.data[i];
+            if cx.blocks[b].removed == 0 && cx.blocks[b].term == Term::Branch
+                && (convert(cx, owner.data[i], b) || fold_branch_chain(cx, owner.data[i], b)) {
+                changed = true;
+            }
+        }
+        free(heads.data as *u8);
+        free(owner.data as *u8);
+        changed
+    }
+}

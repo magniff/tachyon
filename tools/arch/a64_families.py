@@ -19,7 +19,7 @@ usage: tools/arch/a64_families.py [--insn] [--write]
 Semantics are written in the expression language tests/arch/gen.sh
 translates (a lane `k`, the parameters' lanes, max min abs clamp, `if`,
 `as`); a family that needs more names a hand reference, `fn ref_NAME`
-in tests/arch/ref/a64_*.tach, and its semantics column is prose.
+in tests/arch/ref/a64_*.vl, and its semantics column is prose.
 """
 import os
 import re

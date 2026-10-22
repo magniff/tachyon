@@ -6,29 +6,29 @@
 # two must be the same bytes (and print the same; the compiler's own to
 # assembly too). The compiler's own
 # self-compile is also checked at -O0, at -j3, and with
-# TACHYON_FRESH_CONTEXTS=1 (each task in a context of its own: a task
+# VOLE_FRESH_CONTEXTS=1 (each task in a context of its own: a task
 # that used what an earlier task left in its thread's context would make
 # the output depend on the schedule). -O0 compiles from the syntax tree on
 # the main thread and assembles on another.
 #
 # usage: tests/threads.sh [-c COMPILER] [-t TARGET] [-n THREADS] [-j JOBS] [FILTER]
 #
-#   -c COMPILER   the tachyonc to check (default: target/tachyonc)
+#   -c COMPILER   the volec to check (default: target/volec)
 #   -t TARGET     any target the compiler has (default: the host)
 #   -n THREADS    the threads compared with one (default 8)
 #   -j JOBS       programs checked at once (default: the number of CPUs,
-#                 or the slots of $TACHYON_JOBSERVER, see tests/run.sh)
+#                 or the slots of $VOLE_JOBSERVER, see tests/run.sh)
 #   FILTER        only the programs whose path contains FILTER
 
 set -u
 LC_ALL=C
 export LC_ALL
 # (0.18.1) Without the code cache: -jN's tasks would take -j1's outputs.
-TACHYON_CACHE=off
-export TACHYON_CACHE
+VOLE_CACHE=off
+export VOLE_CACHE
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 TARGET=""
 THREADS=8
 JOBS=""
@@ -71,7 +71,7 @@ build() { # <file> <level> <env> <threads> <out>
     dd="$WORK/directives/$(echo "$1" | tr / _)"
     [ -f "$dd/flags" ] && flags=$(sed "s|@ROOT@|$ROOT|g" "$dd/flags")
     kinds=o
-    [ "$1" = compiler/src/main.tach ] && kinds="s o"
+    [ "$1" = compiler/src/main.vl ] && kinds="s o"
     for kind in $kinds; do
         opt=-S
         [ $kind = o ] && opt=-c
@@ -109,7 +109,7 @@ check() { # <file> <level> <env> <threads> <n>
 cd "$ROOT" || exit 1
 list="$WORK/list"
 : >"$list"
-for f in tests/run/*.tach tests/run/*/main.tach examples/*/main.tach examples/*/*/main.tach bench/*.tach compiler/src/main.tach; do
+for f in tests/run/*.vl tests/run/*/main.vl examples/*/main.vl examples/*/*/main.vl bench/*.vl compiler/src/main.vl; do
     [ -f "$f" ] || continue
     case "$f" in examples/tools/*) continue ;; esac
     case "$f" in *"$FILTER"*) ;; *) continue ;; esac
@@ -122,8 +122,8 @@ for f in tests/run/*.tach tests/run/*/main.tach examples/*/main.tach examples/*/
     echo "$f" >>"$list"
 done
 # The slots (as tests/objcheck.sh).
-if [ -z "$JOBS" ] && [ -n "${TACHYON_JOBSERVER:-}" ] && [ -p "$TACHYON_JOBSERVER" ]; then
-    exec 3<>"$TACHYON_JOBSERVER"
+if [ -z "$JOBS" ] && [ -n "${VOLE_JOBSERVER:-}" ] && [ -p "$VOLE_JOBSERVER" ]; then
+    exec 3<>"$VOLE_JOBSERVER"
 else
     [ -n "$JOBS" ] || JOBS=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
     rm -f "$WORK/slots"
@@ -146,10 +146,10 @@ while read -r f; do
         run "$f" "$o" "" "$THREADS"
     done
 done <"$list"
-if [ -z "$FILTER" ] || echo compiler/src/main.tach | grep -q "$FILTER"; then
+if [ -z "$FILTER" ] || echo compiler/src/main.vl | grep -q "$FILTER"; then
     for o in 1 2; do
-        run compiler/src/main.tach "$o" "" 3
-        run compiler/src/main.tach "$o" TACHYON_FRESH_CONTEXTS=1 "$THREADS"
+        run compiler/src/main.vl "$o" "" 3
+        run compiler/src/main.vl "$o" VOLE_FRESH_CONTEXTS=1 "$THREADS"
     done
 fi
 wait

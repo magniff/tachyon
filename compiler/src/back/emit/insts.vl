@@ -1,0 +1,368 @@
+// Instructions (emit/mod.vl): the machine code of each IR instruction
+// but calls: arithmetic, selects, vectors, loads and stores.
+
+use crate::back::emit::arch::emit_intr;
+use crate::back::emit::blocks::is_cmp_imm_operand;
+use crate::back::emit::calls::emit_call_inst;
+use crate::back::emit::machine::{
+    m_cmp, m_conv, m_copy, m_div, m_float_op, m_int_op, m_int_op_imm, m_lea, m_load, m_store,
+    m_unary, reg_move_temp, reg_sp,
+};
+use crate::back::emit::operands::{
+    const_of, float_operand, int_operand, materialize, operand_reg, result_done, result_reg,
+    use_any,
+};
+use crate::back::mc_arm64::atomic::{ma_atomic, ma_fence};
+use crate::back::mc_arm64::ops::{
+    ma_bits, ma_cmp_imm, ma_fmath, ma_madd, ma_mulh, ma_select, ma_shop, ma_ubfx,
+};
+use crate::back::mc_arm64::vector::{
+    ma_vbin, ma_vcmp, ma_vext, ma_vins, ma_vmacw, ma_vneg, ma_vsel, ma_vsplat, ma_vsum,
+};
+use crate::back::mc_x86_64::atomic::{mx_atomic, mx_fence};
+use crate::back::mc_x86_64::ops::{mx_cmp_imm, mx_mulh, mx_select, mx_sqrt};
+use crate::back::mc_x86_64::vector::{
+    mx_vbin, mx_vcmp, mx_vext, mx_vins, mx_vneg, mx_vsel, mx_vsplat, mx_vsum,
+};
+use crate::back::regalloc::USE_NONE;
+use crate::back::regalloc::locations::vloc;
+use crate::back::regalloc::prepare::{is_zero_operand, use_kind};
+use crate::base::{BUFS, die};
+use crate::base::target::X86;
+use crate::front::types::is_float;
+use crate::middle::ctx::FnCtx;
+use crate::middle::ir::{Op, ir_arg};
+use crate::middle::ir::Op::{
+    BNot, Cmp, Conv, Copy, Div, FMath, Lea, Load, LoadX, MAdd, MSub, MulH, Neg, Not, Rem, Select,
+    ShOp, Slot, Store, StoreX, Ubfx, VBin, VCmp, VExt, VIns, VNeg, VSplat, VSum,
+};
+
+// ---- Instructions ----
+
+pub fn emit_inst(cx: sink *FnCtx, v: i64) {
+    unsafe {
+        let op = cx.insts[v].op;
+        if op.is_remat() {
+            materialize(cx, v, result_reg(cx, v));
+        } else if op.is_binary() {
+            emit_binary(cx, v);
+        } else if op == Neg || op == Not || op == BNot {
+            let a = operand_reg(cx, cx.insts[v].a);
+            let r = result_reg(cx, v);
+            m_unary(cx, op, cx.insts[v].ty, r, a);
+            result_done(cx, v, r);
+        } else if op == Cmp && is_cmp_imm_operand(cx, v) {
+            let ty = cx.insts[v].imm2;
+            let a = operand_reg(cx, cx.insts[v].a);
+            let r = result_reg(cx, v);
+            if X86 {
+                mx_cmp_imm(cx, cx.insts[v].cond, ty, r, a, cx.insts[cx.insts[v].b].imm);
+            } else {
+                ma_cmp_imm(cx, cx.insts[v].cond, ty, r, a, cx.insts[cx.insts[v].b].imm);
+            }
+            result_done(cx, v, r);
+        } else if op == Cmp {
+            let ty = cx.insts[v].imm2;
+            let a = operand_reg(cx, cx.insts[v].a);
+            let b = operand_reg(cx, cx.insts[v].b);
+            let r = result_reg(cx, v);
+            m_cmp(cx, cx.insts[v].cond, ty, r, a, b);
+            result_done(cx, v, r);
+        } else if op == Conv {
+            let a = operand_reg(cx, cx.insts[v].a);
+            let r = result_reg(cx, v);
+            m_conv(cx, cx.insts[v].imm2, cx.insts[v].ty, r, a);
+            result_done(cx, v, r);
+        } else if op == Op::Bits {
+            // (0.16; made on AArch64 only: lower/calls.vl)
+            let a = operand_reg(cx, cx.insts[v].a);
+            let r = result_reg(cx, v);
+            ma_bits(cx, cx.insts[v].imm, r, a);
+            result_done(cx, v, r);
+        } else if op == Op::Atomic {
+            emit_atomic(cx, v);
+        } else if op == Op::Fence {
+            if !X86 {
+                ma_fence(cx, cx.insts[v].imm);
+            } else {
+                mx_fence(cx, cx.insts[v].imm);
+            }
+        } else if op == Load {
+            emit_load_inst(cx, v);
+        } else if op == Store {
+            emit_store_inst(cx, v);
+        } else if op == Copy {
+            let dst = int_operand(cx, cx.insts[v].a);
+            let src = int_operand(cx, cx.insts[v].b);
+            m_copy(cx, dst, src, cx.insts[v].imm);
+        } else if op.is_call() {
+            emit_call_inst(cx, v);
+        } else if op == LoadX || op == StoreX || op == Lea {
+            emit_indexed(cx, v);
+        } else if op == Select {
+            emit_select(cx, v);
+        } else if op == FMath {
+            let a = operand_reg(cx, cx.insts[v].a);
+            let r = result_reg(cx, v);
+            if X86 {
+                mx_sqrt(cx, cx.insts[v].ty, r, a);
+            } else {
+                ma_fmath(cx, cx.insts[v].imm, cx.insts[v].ty, r, a);
+            }
+            result_done(cx, v, r);
+        } else if op.is_vector() {
+            emit_vector(cx, v);
+        } else if op == MulH {
+            let a = operand_reg(cx, cx.insts[v].a);
+            let b = operand_reg(cx, cx.insts[v].b);
+            let r = result_reg(cx, v);
+            if X86 {
+                mx_mulh(cx, cx.insts[v].imm == 1, r, a, b);
+            } else {
+                ma_mulh(cx, cx.insts[v].imm == 1, r, a, b);
+            }
+            result_done(cx, v, r);
+        } else if op == MAdd || op == MSub || op == ShOp || op == Ubfx {
+            // AArch64 only (see isel.vl).
+            let a = operand_reg(cx, cx.insts[v].a);
+            let b = if cx.insts[v].b != 0 { operand_reg(cx, cx.insts[v].b) } else { -1 };
+            let r = result_reg(cx, v);
+            if op == Ubfx {
+                ma_ubfx(cx, r, a, cx.insts[v].imm, cx.insts[v].imm2);
+            } else if op == ShOp {
+                ma_shop(cx, cx.insts[v].imm2, cx.insts[v].ty, r, a, b, cx.insts[v].imm);
+            } else {
+                ma_madd(cx, op == MSub, cx.insts[v].ty, r, a, b, operand_reg(cx, cx.insts[v].c));
+            }
+            result_done(cx, v, r);
+        } else {
+            die(c"internal error: unexpected instruction in emission");
+        }
+    }
+}
+
+// (0.21) An ATOMIC (mc_arm64/atomic.vl, mc_x86_64/atomic.vl): its
+// operands only read, its result (when used) written last.
+fn emit_atomic(cx: sink *FnCtx, v: i64) {
+    unsafe {
+        let a = operand_reg(cx, cx.insts[v].a);
+        let b = if cx.insts[v].b != 0 { operand_reg(cx, cx.insts[v].b) } else { -1 };
+        let c = if cx.insts[v].c != 0 { operand_reg(cx, cx.insts[v].c) } else { -1 };
+        var d = -1;
+        if cx.insts[v].ty != 0 {
+            let loc = unsafe { vloc(cx, v, cx.cur_pos + 2) };
+            if loc >= 0 && loc < 64 {
+                d = loc;
+            }
+        }
+        let kind = cx.insts[v].imm & 255;
+        let order = (cx.insts[v].imm >> 8) & 15;
+        if X86 {
+            mx_atomic(cx, kind, order, cx.insts[v].imm2, d, a, b, c);
+        } else {
+            ma_atomic(cx, kind, order, cx.insts[v].imm2, d, a, b, c);
+        }
+        if d >= 0 {
+            result_done(cx, v, d);
+        }
+    }
+}
+
+// LOADX, STOREX and LEA: base + (index << scale) + offset (the base a frame
+// slot from sp on x86-64).
+fn emit_indexed(cx: sink *FnCtx, v: i64) {
+    unsafe {
+        let op = cx.insts[v].op;
+        var offset = cx.insts[v].imm;
+        let base_value = cx.insts[v].a;
+        var base = 0;
+        if cx.insts[base_value].op == Slot {
+            offset += cx.slots[cx.insts[base_value].imm].offset;
+            base = reg_sp();
+        } else {
+            base = int_operand(cx, base_value);
+        }
+        cx.mem_index = if cx.insts[v].b != 0 { int_operand(cx, cx.insts[v].b) } else { -1 };
+        cx.mem_scale = cx.insts[v].scale;
+        if op == StoreX {
+            let r = operand_reg(cx, cx.insts[v].c);
+            m_store(cx, cx.insts[v].imm2, r, base, offset);
+            cx.mem_index = -1;
+            return;
+        }
+        let r = result_reg(cx, v);
+        if op == LoadX {
+            m_load(cx, cx.insts[v].ty, r, base, offset);
+        } else {
+            m_lea(cx, r, base, offset);
+        }
+        cx.mem_index = -1;
+        result_done(cx, v, r);
+    }
+}
+
+// A vector operation (0.10).
+fn emit_vector(cx: sink *FnCtx, v: i64) {
+    unsafe {
+        let op = cx.insts[v].op;
+        if op == Op::Intr || op == Op::VConst || op == Op::CpuFeat {
+            // (0.19: the intrinsics)
+            emit_intr(cx, v);
+            return;
+        }
+        let ty = cx.insts[v].ty;
+        let a = operand_reg(cx, cx.insts[v].a);
+        let b = if cx.insts[v].b != 0 { operand_reg(cx, cx.insts[v].b) } else { -1 };
+        let r = result_reg(cx, v);
+        let vt = if op == VCmp { cx.insts[v].imm2 }
+            else if op == VExt || op == VSum { cx.insts[cx.insts[v].a].ty } else { ty };
+        if op == VBin {
+            let raw = cx.insts[v].imm;
+            let bop = raw as Op;
+            if X86 { mx_vbin(cx, bop, vt, r, a, b); } else { ma_vbin(cx, bop, vt, r, a, b); }
+        } else if op == VCmp {
+            if X86 { mx_vcmp(cx, cx.insts[v].cond, vt, r, a, b); }
+            else { ma_vcmp(cx, cx.insts[v].cond, vt, r, a, b); }
+        } else if op == VNeg {
+            if X86 { mx_vneg(cx, vt, r, a); } else { ma_vneg(cx, vt, r, a); }
+        } else if op == VSplat {
+            if X86 { mx_vsplat(cx, vt, r, a); } else { ma_vsplat(cx, vt, r, a); }
+        } else if op == VExt {
+            if X86 { mx_vext(cx, vt, r, a, cx.insts[v].imm); }
+            else { ma_vext(cx, vt, r, a, cx.insts[v].imm); }
+        } else if op == VIns {
+            if X86 { mx_vins(cx, vt, r, a, b, cx.insts[v].imm); }
+            else { ma_vins(cx, vt, r, a, b, cx.insts[v].imm); }
+        } else if op == VSum {
+            if X86 { mx_vsum(cx, vt, r, a); } else { ma_vsum(cx, vt, r, a); }
+        } else if op == Op::VMacW {
+            // (0.16; made on AArch64 only: vectorize/legality.vl)
+            ma_vmacw(cx, r, a, b, operand_reg(cx, cx.insts[v].c));
+        } else {
+            let c = operand_reg(cx, cx.insts[v].c);
+            if X86 { mx_vsel(cx, r, a, b, c); } else { ma_vsel(cx, r, a, b, c); }
+        }
+        result_done(cx, v, r);
+    }
+}
+
+// SELECT: the comparison (or test) of its last operands, then a conditional
+// select of its first two.
+fn emit_select(cx: sink *FnCtx, v: i64) {
+    unsafe {
+        let lhs = operand_reg(cx, ir_arg(cx, v, 0));
+        let rhs = if ir_arg(cx, v, 1) != 0 { operand_reg(cx, ir_arg(cx, v, 1)) } else { -1 };
+        // (-1: xzr, see use_kind.)
+        let then = if !X86 && is_zero_operand(cx, cx.insts[v].a) { -1 }
+            else { operand_reg(cx, cx.insts[v].a) };
+        let other = if !X86 && is_zero_operand(cx, cx.insts[v].b) { -1 }
+            else { operand_reg(cx, cx.insts[v].b) };
+        let r = result_reg(cx, v);
+        let test = (cx.insts[v].scale & 1) == 1;
+        if X86 {
+            // The flags of the select just before, when it compared the same and
+            // nothing was emitted since (a rematerialized 0 is an xorl).
+            let p = cx.insts[v].prev;
+            let same = p != 0 && p == cx.last_select && BUFS[cx.code].len == cx.last_select_end
+                && ir_arg(cx, p, 0) == ir_arg(cx, v, 0) && ir_arg(cx, p, 1) == ir_arg(cx, v, 1)
+                && cx.insts[p].imm == cx.insts[v].imm && cx.insts[p].imm2 == cx.insts[v].imm2
+                && cx.insts[p].scale == cx.insts[v].scale;
+            mx_select(cx, cx.insts[v].cond, test, !same, cx.insts[v].imm2, lhs, rhs,
+                cx.insts[v].imm, r, then, other);
+            cx.last_select = v;
+            cx.last_select_end = BUFS[cx.code].len;
+        } else {
+            // The flags of the select just before, when it compared the same
+            // (nothing between them on AArch64 touches the flags: moves,
+            // loads, stores and rematerializations do not).
+            let p = cx.insts[v].prev;
+            let same = p != 0 && cx.insts[p].op == Select && ir_arg(cx, p, 0) == ir_arg(cx, v, 0)
+                && ir_arg(cx, p, 1) == ir_arg(cx, v, 1) && cx.insts[p].imm == cx.insts[v].imm
+                && cx.insts[p].imm2 == cx.insts[v].imm2
+                && (cx.insts[p].scale & 1) == (cx.insts[v].scale & 1);
+            ma_select(cx, cx.insts[v].cond, test, !same, cx.insts[v].imm2, lhs, rhs,
+                cx.insts[v].imm, cx.insts[v].ty, r, then, other, (cx.insts[v].scale & 2) != 0);
+        }
+        result_done(cx, v, r);
+    }
+}
+
+fn emit_binary(cx: sink *FnCtx, v: i64) {
+    unsafe {
+        let op = cx.insts[v].op;
+        let ty = cx.insts[v].ty;
+        if is_float(ty) {
+            let a = float_operand(cx, cx.insts[v].a);
+            let b = float_operand(cx, cx.insts[v].b);
+            let r = result_reg(cx, v);
+            m_float_op(cx, op, ty, r, a, b);
+            result_done(cx, v, r);
+            return;
+        }
+        let a = int_operand(cx, cx.insts[v].a);
+        let r = result_reg(cx, v);
+        var imm = 0;
+        if use_kind(cx, v, 1) == USE_NONE && const_of(cx, cx.insts[v].b, &imm) {
+            if !m_int_op_imm(cx, op, ty, r, a, imm) {
+                die(c"internal error: an immediate operand that does not fit");
+            }
+            result_done(cx, v, r);
+            return;
+        }
+        let b = int_operand(cx, cx.insts[v].b);
+        if op == Div || op == Rem {
+            let is_const = const_of(cx, cx.insts[v].b, &imm);
+            m_div(cx, op, ty, r, a, b, imm, is_const);
+        } else {
+            m_int_op(cx, op, ty, r, a, b);
+        }
+        result_done(cx, v, r);
+    }
+}
+
+// The base register and offset of a memory access to `addr` + `offset`
+// (an operand needed in a register): frame slots are addressed from sp
+// directly.
+fn mem_base(cx: sink *FnCtx, addr: i64, offset: i64, out_offset: inout i64) -> i64 {
+    unsafe {
+        if cx.insts[addr].op == Slot {
+            out_offset = cx.slots[cx.insts[addr].imm].offset + offset;
+            return reg_sp();
+        }
+        out_offset = offset;
+        int_operand(cx, addr)
+    }
+}
+
+// The same for an address used at `pos` where it may be anywhere (loaded
+// into the parallel moves' temporary then).
+pub fn mem_base_any(cx: sink *FnCtx, addr: i64, offset: i64, pos: i64, out_offset: inout i64) -> i64 {
+    unsafe {
+        if cx.insts[addr].op == Slot {
+            out_offset = cx.slots[cx.insts[addr].imm].offset + offset;
+            return reg_sp();
+        }
+        out_offset = offset;
+        use_any(cx, addr, pos, reg_move_temp(float: false))
+    }
+}
+
+fn emit_load_inst(cx: sink *FnCtx, v: i64) {
+    unsafe {
+        var offset = 0;
+        let base = mem_base(cx, cx.insts[v].a, cx.insts[v].imm, &offset);
+        let r = result_reg(cx, v);
+        m_load(cx, cx.insts[v].ty, r, base, offset);
+        result_done(cx, v, r);
+    }
+}
+
+fn emit_store_inst(cx: sink *FnCtx, v: i64) {
+    unsafe {
+        var offset = 0;
+        let base = mem_base(cx, cx.insts[v].a, cx.insts[v].imm, &offset);
+        let value = cx.insts[v].b;
+        let r = operand_reg(cx, value);
+        m_store(cx, cx.insts[v].imm2, r, base, offset);
+    }
+}

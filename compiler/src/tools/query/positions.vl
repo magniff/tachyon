@@ -1,0 +1,382 @@
+// Source positions for `query`: the line of a position, `FILE:LINE`, a
+// span of source collapsed to one line, the token at a position; the
+// definitions sorted by position (files in output order), and the
+// definition that encloses a position.
+
+use crate::base::{
+    FILES, FILE_COUNT, IntVec, SRC, alloc_array, buf_byte, buf_bytes, buf_int, buf_new, buf_str,
+    free,
+};
+use crate::front::ast::{FIELD_SHORTHAND, NODES, NODE_COUNT, NodeKind};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
+use crate::front::modules::file_of_pos;
+use crate::front::stdtree::std_file_line;
+use crate::middle::lower::ssa::HMap;
+use crate::tools::query::defs::{DEFS, DEF_COUNT, K_FIELD, K_MOD, K_VARIANT};
+
+// ---- Positions ----
+
+// The start of every line of SRC, in order.
+pub static var LINES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Per file, its rank in the output's order (by path; the files the
+// compiler makes, `<std>` and `<C import>`, last).
+pub static var FILE_RANK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+pub fn init_positions() {
+    unsafe {
+        let end = FILES[FILE_COUNT - 1].end;
+        LINES.push(0);
+        for i in 0..end {
+            if SRC[i] == '\n' {
+                LINES.push(i + 1);
+            }
+        }
+        for f in 0..FILE_COUNT {
+            var rank = 0;
+            for g in 0..FILE_COUNT {
+                if file_before(g, f) {
+                    rank += 1;
+                }
+            }
+            FILE_RANK.push(rank);
+        }
+    }
+}
+
+fn file_before(a: i64, b: i64) -> bool {
+    unsafe {
+        let x = FILES[a].path;
+        let y = FILES[b].path;
+        let xs = x[0] == '<';
+        let ys = y[0] == '<';
+        if xs != ys {
+            return ys;
+        }
+        var i = 0;
+        while x[i] != 0 && x[i] == y[i] {
+            i += 1;
+        }
+        if x[i] != y[i] {
+            return x[i] < y[i];
+        }
+        a < b
+    }
+}
+
+// The index in LINES of the line holding pos.
+pub fn line_index(pos: i64) -> i64 {
+    unsafe {
+        var lo = 0;
+        var hi = LINES.count - 1;
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            if LINES.data[mid] <= pos {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    }
+}
+
+// The line number of pos in its file.
+pub fn line_of(pos: i64) -> i64 {
+    unsafe { line_index(pos) - line_index(FILES[file_of_pos(pos)].start) + 1 }
+}
+
+pub fn line_start(pos: i64) -> i64 {
+    unsafe { LINES.data[line_index(pos)] }
+}
+
+// The end of the line holding pos (its newline).
+pub fn line_end(pos: i64) -> i64 {
+    unsafe {
+        let i = line_index(pos);
+        if i + 1 < LINES.count { LINES.data[i + 1] - 1 } else { FILES[FILE_COUNT - 1].end }
+    }
+}
+
+pub fn put_path(out: i64, f: i64) {
+    unsafe {
+        var p = FILES[f].path;
+        while p[0] == '.' && p[1] == '/' {
+            p = &p[2];
+        }
+        buf_str(out, p);
+    }
+}
+
+// `file:line:col` (0.17: in std's built-in text, in std's file when the
+// vole repository has it: front/stdtree.vl).
+pub fn put_loc(out: i64, pos: i64) {
+    let f = file_of_pos(pos);
+    var path = 0 as *u8;
+    var line = 0;
+    if std_file_line(f, pos, &path, &line) {
+        unsafe {
+            buf_str(out, path);
+        }
+    } else {
+        put_path(out, f);
+        line = line_of(pos);
+    }
+    buf_byte(out, ':');
+    buf_int(out, line);
+    buf_byte(out, ':');
+    buf_int(out, pos - line_start(pos) + 1);
+}
+
+// (0.17) `file:A-B`, the lines of first..last (in one file; in std's file
+// as put_loc says).
+pub fn put_lines(out: i64, first: i64, last: i64) {
+    let f = file_of_pos(first);
+    var path = 0 as *u8;
+    var a = 0;
+    var b = 0;
+    if std_file_line(f, first, &path, &a) && std_file_line(f, last, &path, &b) {
+        unsafe {
+            buf_str(out, path);
+        }
+    } else {
+        put_path(out, f);
+        a = line_of(first);
+        b = line_of(last);
+    }
+    buf_byte(out, ':');
+    buf_int(out, a);
+    buf_byte(out, '-');
+    buf_int(out, b);
+}
+
+// (0.15) The positions of the field shorthands' names (`S { x }`), once
+// the program is checked.
+static var SHORTHANDS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var SHORTHANDS_FROM: i64 = 0;
+
+// (0.15) Whether pos is the name of a field shorthand, `S { x }`: both the
+// field x and the value x, so a rename of one writes `x: y` or `y: x`.
+pub fn shorthand_at(pos: i64) -> bool {
+    unsafe {
+        for n in SHORTHANDS_FROM..NODE_COUNT {
+            if n > 0 && NODES[n].kind == NodeKind::FieldInit
+                && (NODES[n].p & FIELD_SHORTHAND) != 0 {
+                SHORTHANDS.put(NODES[n].start + 1, 1);
+            }
+        }
+        SHORTHANDS_FROM = NODE_COUNT;
+        SHORTHANDS.get(pos + 1) != 0
+    }
+}
+
+// (0.15) The text a field shorthand's name becomes when the field or the
+// value it names is renamed: `field: value`.
+pub fn shorthand_text(field: [u8], value: [u8]) -> i64 {
+    let b = buf_new();
+    buf_bytes(b, field);
+    buf_bytes(b, ": ");
+    buf_bytes(b, value);
+    b
+}
+
+pub fn is_space(c: u8) -> bool {
+    c == ' ' || c == '\t' || c == '\r' || c == '\n'
+}
+
+// The text of from..to with each run of whitespace (and `//` comments)
+// one space, trimmed.
+pub fn collapse(out: i64, from: i64, to: i64) {
+    unsafe {
+        var space = false;
+        var any = false;
+        var i = from;
+        while i < to {
+            let c = SRC[i];
+            if c == '/' && i + 1 < to && SRC[i + 1] == '/' {
+                while i < to && SRC[i] != '\n' {
+                    i += 1;
+                }
+                space = true;
+                continue;
+            }
+            if is_space(c) {
+                space = true;
+            } else {
+                if space && any {
+                    buf_byte(out, ' ');
+                }
+                space = false;
+                any = true;
+                buf_byte(out, c);
+            }
+            i += 1;
+        }
+    }
+}
+
+// The first token starting at or after pos.
+pub fn token_at(pos: i64) -> i64 {
+    unsafe {
+        var lo = 0;
+        var hi = TOK_COUNT;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if TOKS[mid].start < pos {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+}
+
+// Where identifier `name` is written in from..to (to < 0: in the next
+// few tokens): its first occurrence, or its last; -1 if nowhere.
+pub fn find_name(from: i64, to: i64, name: i64, last: bool) -> i64 {
+    unsafe {
+        var i = token_at(from);
+        var seen = 0;
+        var found = -1;
+        while i < TOK_COUNT && TOKS[i].kind != Tok::Eof {
+            if to >= 0 && TOKS[i].start >= to {
+                break;
+            }
+            if to < 0 && seen > 24 {
+                break;
+            }
+            if TOKS[i].kind == Tok::Ident && TOKS[i].value as i64 == name {
+                found = TOKS[i].start;
+                if !last {
+                    return found;
+                }
+            }
+            seen += 1;
+            i += 1;
+        }
+        found
+    }
+}
+
+// The position of definition name `name` after `start` (its keyword).
+pub fn name_position(start: i64, name: i64) -> i64 {
+    let p = find_name(start, -1, name, false);
+    if p < 0 { start } else { p }
+}
+
+// ---- Sorting ----
+
+// Sorts the indices in v (merge sort) by key1, then key2 (arrays indexed
+// by the values).
+pub fn sort_by_keys(v: IntVec, key1: *i64, key2: *i64) {
+    unsafe {
+        let n = v.count;
+        if n < 2 {
+            return;
+        }
+        let tmp = alloc_array::<i64>(n);
+        var width = 1;
+        let a = v.data;
+        while width < n {
+            var lo = 0;
+            while lo < n {
+                let mid = if lo + width < n { lo + width } else { n };
+                let hi = if lo + 2 * width < n { lo + 2 * width } else { n };
+                var i = lo;
+                var j = mid;
+                var k = lo;
+                while i < mid || j < hi {
+                    let take_j = i >= mid || (j < hi && (key1[a[j]] < key1[a[i]]
+                        || (key1[a[j]] == key1[a[i]] && key2[a[j]] < key2[a[i]])));
+                    if take_j {
+                        tmp[k] = a[j];
+                        j += 1;
+                    } else {
+                        tmp[k] = a[i];
+                        i += 1;
+                    }
+                    k += 1;
+                }
+                lo = hi;
+            }
+            for x in 0..n {
+                a[x] = tmp[x];
+            }
+            width *= 2;
+        }
+        free(tmp as *u8);
+    }
+}
+
+// The sort keys of positions: (file rank, position).
+pub fn rank_of(pos: i64) -> i64 {
+    unsafe { FILE_RANK.data[file_of_pos(pos)] }
+}
+
+// Sorts definitions by file, then position.
+pub fn sort_by_position(v: IntVec) {
+    unsafe {
+        let n = DEF_COUNT;
+        let k1 = alloc_array::<i64>(n + 1);
+        let k2 = alloc_array::<i64>(n + 1);
+        for i in 0..v.count {
+            let d = v.data[i];
+            k1[d] = rank_of(DEFS[d].start);
+            k2[d] = DEFS[d].start;
+        }
+        sort_by_keys(v, k1, k2);
+    }
+}
+
+// ---- Enclosing definitions ----
+
+// The definitions that hold code (all but fields, variants and modules),
+// by position.
+pub static var CONTAINERS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+pub fn init_containers() {
+    unsafe {
+        for d in 0..DEF_COUNT {
+            let k = DEFS[d].kind;
+            if k != K_FIELD && k != K_VARIANT && k != K_MOD {
+                CONTAINERS.push(d);
+            }
+        }
+        let k1 = alloc_array::<i64>(DEF_COUNT + 1);
+        let k2 = alloc_array::<i64>(DEF_COUNT + 1);
+        for d in 0..DEF_COUNT {
+            k1[d] = DEFS[d].start;
+            k2[d] = -DEFS[d].end;
+        }
+        sort_by_keys(CONTAINERS, k1, k2);
+    }
+}
+
+// The innermost definition holding pos, or -1.
+pub fn enclosing(pos: i64) -> i64 {
+    unsafe {
+        var lo = 0;
+        var hi = CONTAINERS.count;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if DEFS[CONTAINERS.data[mid]].start <= pos {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // (items do not overlap, except a trait and its functions: a few
+        // steps back at most)
+        var i = lo - 1;
+        var steps = 0;
+        while i >= 0 && steps < 64 {
+            let d = CONTAINERS.data[i];
+            if DEFS[d].end > pos {
+                return d;
+            }
+            i -= 1;
+            steps += 1;
+        }
+        -1
+    }
+}

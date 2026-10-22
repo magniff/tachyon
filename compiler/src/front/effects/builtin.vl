@@ -1,0 +1,154 @@
+// The effects of C functions declared without effect declarations (0.16;
+// docs/design/effects-allocation.md §2.2), by their C symbol: libm,
+// mem*, str*, ctype and number parsing none; malloc, calloc, realloc,
+// free, strdup (and the aligned forms) `alloc(extern)`; stdio and POSIX
+// I/O `io` (clocks too); getenv, rand and errno `global`; exit and abort
+// `io diverge`. Anything else is unknown: `alloc(extern) io global panic
+// diverge`, and the callbacks C may call (infer.vl). It replaces
+// middle's PURE_LIBM (whose functions are here, none).
+
+use crate::base::{SYMS, intern_c};
+use crate::front::effects::{
+    EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_RAW_DIVERGE, EFF_RAW_GLOBAL,
+    EFF_RAW_PANIC, EFF_SYNC, EFF_THREAD, EFF_UNKNOWN, Effects, effects_none,
+};
+use crate::front::types::FNS;
+use crate::gen0::target::LINK_NAMES;
+use crate::middle::lower::ssa::HMap;
+
+// The classes of C functions (C_UNKNOWN: not in the table).
+pub const C_UNKNOWN_CLASS: i64 = 0;
+pub const C_NONE: i64 = 1;
+pub const C_ALLOC: i64 = 2;
+pub const C_IO: i64 = 3;
+pub const C_GLOBAL: i64 = 4;
+pub const C_EXIT: i64 = 5;
+// (0.21) Blocking on, or synchronizing with, another thread: sync; starting
+// a thread: thread, sync and alloc(extern) (its stack).
+pub const C_SYNC: i64 = 6;
+pub const C_THREAD: i64 = 7;
+
+// symbol + 1 -> class.
+static var TABLE: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+fn add(names: inout [*u8], class: i64) {
+    unsafe {
+        for i in 0..names.len {
+            TABLE.put(intern_c(names[i]) + 1, class);
+        }
+    }
+}
+
+fn fill_table() {
+    let libm: [*u8; 60] = [
+        c"fabs", c"fabsf", c"floor", c"floorf", c"ceil", c"ceilf", c"trunc", c"truncf", c"round",
+        c"roundf", c"fmod", c"fmodf", c"sqrt", c"sqrtf", c"cbrt", c"cbrtf", c"sin", c"sinf",
+        c"cos", c"cosf", c"tan", c"tanf", c"asin", c"asinf", c"acos", c"acosf", c"atan", c"atanf",
+        c"atan2", c"atan2f", c"sinh", c"cosh", c"tanh", c"exp", c"expf", c"exp2", c"exp2f",
+        c"expm1", c"log", c"logf", c"log2", c"log2f", c"log10", c"log10f", c"log1p", c"pow",
+        c"powf", c"hypot", c"hypotf", c"fmin", c"fminf", c"fmax", c"fmaxf", c"copysign",
+        c"copysignf", c"nearbyint", c"rint", c"lround", c"llround", c"fma",
+    ];
+    add(&libm[..], C_NONE);
+    let text: [*u8; 44] = [
+        c"memcpy", c"memmove", c"memset", c"memcmp", c"memchr", c"strlen", c"strnlen", c"strcmp",
+        c"strncmp", c"strchr", c"strrchr", c"strstr", c"strcpy", c"strncpy", c"strcat",
+        c"strncat", c"strspn", c"strcspn", c"strpbrk", c"strtol", c"strtoul", c"strtoll",
+        c"strtoull", c"strtod", c"strtof", c"atoi", c"atol", c"atoll", c"atof", c"abs", c"labs",
+        c"llabs", c"isalpha", c"isdigit", c"isalnum", c"isspace", c"isupper", c"islower",
+        c"isxdigit", c"ispunct", c"toupper", c"tolower", c"snprintf", c"sprintf",
+    ];
+    add(&text[..], C_NONE);
+    let alloc: [*u8; 9] = [
+        c"malloc", c"calloc", c"realloc", c"free", c"strdup", c"strndup", c"posix_memalign",
+        c"aligned_alloc", c"reallocarray",
+    ];
+    add(&alloc[..], C_ALLOC);
+    let io: [*u8; 50] = [
+        c"write", c"read", c"open", c"close", c"lseek", c"pread", c"pwrite", c"fsync", c"printf",
+        c"fprintf", c"dprintf", c"vprintf", c"vfprintf", c"puts", c"fputs", c"putchar", c"fputc",
+        c"putc", c"getchar", c"fgetc", c"getc", c"fgets", c"fopen", c"fdopen", c"fclose",
+        c"fread", c"fwrite", c"fflush", c"fseek", c"ftell", c"rewind", c"feof", c"ferror",
+        c"perror", c"scanf", c"fscanf", c"unlink", c"rename", c"mkdir", c"rmdir", c"stat",
+        c"fstat", c"isatty", c"pipe", c"dup", c"dup2", c"clock", c"time", c"gettimeofday",
+        c"clock_gettime",
+    ];
+    add(&io[..], C_IO);
+    let global: [*u8; 6] = [c"getenv", c"rand", c"srand", c"__error", c"__errno_location",
+        c"errno"];
+    add(&global[..], C_GLOBAL);
+    let exits: [*u8; 4] = [c"exit", c"_exit", c"_Exit", c"abort"];
+    add(&exits[..], C_EXIT);
+    let sync: [*u8; 24] = [
+        c"pthread_join", c"pthread_detach", c"pthread_mutex_lock", c"pthread_mutex_unlock",
+        c"pthread_mutex_trylock", c"pthread_mutex_init", c"pthread_mutex_destroy",
+        c"pthread_cond_wait", c"pthread_cond_signal", c"pthread_cond_broadcast",
+        c"pthread_cond_init", c"pthread_cond_destroy", c"pthread_once", c"sched_yield",
+        c"__ulock_wait", c"__ulock_wait2", c"__ulock_wake", c"os_unfair_lock_lock",
+        c"os_unfair_lock_unlock", c"os_sync_wait_on_address", c"os_sync_wake_by_address_any",
+        c"os_sync_wake_by_address_all", c"sem_wait", c"sem_post",
+    ];
+    add(&sync[..], C_SYNC);
+    let thread: [*u8; 1] = [c"pthread_create"];
+    add(&thread[..], C_THREAD);
+}
+
+// The class of the C function with symbol sym (C_UNKNOWN_CLASS: not in
+// the table).
+pub fn c_class(sym: i64) -> i64 {
+    unsafe {
+        if TABLE.count == 0 {
+            fill_table();
+        }
+        TABLE.get(sym + 1)
+    }
+}
+
+// The C symbol of extern function f (its #[link_name], else its name).
+pub fn c_symbol(f: i64) -> i64 {
+    unsafe {
+        let link = LINK_NAMES.get(FNS[f].name + 1);
+        if link > 0 { link - 1 } else { FNS[f].name }
+    }
+}
+
+// Unknown C: anything but unsafe (which a caller does not inherit).
+pub fn unknown_c_effects() -> Effects {
+    Effects {
+        bits: EFF_ALLOC_EXTERN | EFF_IO | EFF_GLOBAL | EFF_PANIC | EFF_DIVERGE | EFF_RAW_PANIC
+            | EFF_RAW_DIVERGE | EFF_RAW_GLOBAL, allocs: 0,
+    }
+}
+
+// The effects of the C function with symbol sym; EFF_UNKNOWN added when
+// it is not in the table (unknown C: unknown_c_effects).
+pub fn known_c_effects(sym: i64) -> Effects {
+    let class = c_class(sym);
+    var e = effects_none();
+    if class == C_ALLOC {
+        e.bits = EFF_ALLOC_EXTERN;
+    } else if class == C_IO {
+        e.bits = EFF_IO;
+    } else if class == C_GLOBAL {
+        e.bits = EFF_GLOBAL | (if is_errno_symbol(sym) { 0 } else { EFF_RAW_GLOBAL });
+    } else if class == C_EXIT {
+        e.bits = EFF_IO | EFF_DIVERGE | EFF_RAW_DIVERGE;
+    } else if class == C_SYNC {
+        e.bits = EFF_SYNC;
+    } else if class == C_THREAD {
+        e.bits = EFF_THREAD | EFF_SYNC | EFF_ALLOC_EXTERN;
+    } else if class == C_UNKNOWN_CLASS {
+        e = unknown_c_effects();
+        e.bits |= EFF_UNKNOWN;
+    }
+    e
+}
+
+// (0.21) Whether sym is C's errno (its address): per thread, so global but
+// not EFF_RAW_GLOBAL.
+pub fn is_errno_symbol(sym: i64) -> bool {
+    unsafe {
+        let t = SYMS[sym].text;
+        t == "__error" || t == "__errno_location" || t == "errno"
+    }
+}

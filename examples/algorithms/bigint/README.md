@@ -7,7 +7,7 @@ Multiplication switches from the schoolbook method to Karatsuba's
 O(n^1.585) splitting above 96 limbs.
 
 ```sh
-tachyonc examples/algorithms/bigint/main.tach -o bigint && ./bigint
+volec examples/algorithms/bigint/main.vl -o bigint && ./bigint
 ```
 
 ## The problem
@@ -253,8 +253,8 @@ M-series machine:
 
 | | F(1000000) | 5000 x 5000 schoolbook | 5000 x 5000 Karatsuba |
 |---|---|---|---|
-| tachyon 0.15, `-O2` | 44 ms | 7.4 ms | 2.5 ms |
-| tachyon 0.15, `-O1` | 71 ms | 11 ms | 4.2 ms |
+| vole 0.15, `-O2` | 44 ms | 7.4 ms | 2.5 ms |
+| vole 0.15, `-O1` | 71 ms | 11 ms | 4.2 ms |
 | C, `clang -O2` | 24 ms | 4.4 ms | 1.4 ms |
 | CPython 3.9 `int` (base 2^30, Karatsuba) | 36 ms | | 2.5 ms (45000 digits) |
 
@@ -262,8 +262,8 @@ The whole program runs in about 60 ms.
 
 The gap with C is one loop: clang vectorizes the schoolbook kernel's
 multiply-add (`umlal`, a 32 x 32 -> 64-bit multiply-accumulate on two
-lanes), and tachyon 0.15 compiles it to unrolled scalar `madd`s. The
-rest (the carries, the bounds checks, which tachyon hoists out of the
+lanes), and vole 0.15 compiles it to unrolled scalar `madd`s. The
+rest (the carries, the bounds checks, which vole hoists out of the
 inner loop) costs little.
 
 What mattered more than the language: the first version carried after
@@ -278,17 +278,17 @@ another 10%.
 
 | feature | where | guide |
 |---|---|---|
-| operator traits `Add`, `Sub`, `Mul` (operands `let`); `Ord` by hand gives `<` | `impl ... for BigUint` | `tachyonc guide traits` |
-| `let` parameters (the default), `inout [u32]` for slices that are written | `plus`/`minus`/`times`, the kernels | `tachyonc guide memory`, `guide views` |
-| `#[derive(Eq, Clone, Debug)]`, `{x:?}` | `BigUint` | `tachyonc guide formatting` |
-| `impl Display`, `f.write(f"...")`, `{x:09}` | `Display for BigUint` | `tachyonc guide formatting` |
-| a `Vec` carries its allocator: `self.limbs.allocator()` | `BigUint::times` | `tachyonc guide allocators` |
-| widening: `u32` limbs into `u64` arithmetic | the kernels | `tachyonc guide conversions` |
-| slices as views, sub-slices `a[..m]`, written through | the kernels | `tachyonc guide types`, `guide memory` |
-| drops: every number freed at the end of its scope | everywhere | `tachyonc guide memory` |
-| closures and iterators: `map`, `sum`, `fold` | `digit_sum`, `main` | `tachyonc guide iterators`, `guide closures` |
-| `unsafe { std::panic(c"...") }` for a broken precondition | `BigUint::minus` | `tachyonc guide unsafe` |
-| a C header: `import "time.h" as c;` | `now_ns` | `tachyonc guide c-interop` |
+| operator traits `Add`, `Sub`, `Mul` (operands `let`); `Ord` by hand gives `<` | `impl ... for BigUint` | `volec guide traits` |
+| `let` parameters (the default), `inout [u32]` for slices that are written | `plus`/`minus`/`times`, the kernels | `volec guide memory`, `guide views` |
+| `#[derive(Eq, Clone, Debug)]`, `{x:?}` | `BigUint` | `volec guide formatting` |
+| `impl Display`, `f.write(f"...")`, `{x:09}` | `Display for BigUint` | `volec guide formatting` |
+| a `Vec` carries its allocator: `self.limbs.allocator()` | `BigUint::times` | `volec guide allocators` |
+| widening: `u32` limbs into `u64` arithmetic | the kernels | `volec guide conversions` |
+| slices as views, sub-slices `a[..m]`, written through | the kernels | `volec guide types`, `guide memory` |
+| drops: every number freed at the end of its scope | everywhere | `volec guide memory` |
+| closures and iterators: `map`, `sum`, `fold` | `digit_sum`, `main` | `volec guide iterators`, `guide closures` |
+| `unsafe { std::panic(c"...") }` for a broken precondition | `BigUint::minus` | `volec guide unsafe` |
+| a C header: `import "time.h" as c;` | `now_ns` | `volec guide c-interop` |
 
 ## Try
 

@@ -1,26 +1,26 @@
 ## The planning queries and lint (tests/refactor/plan/).
 $ query stats
-37	8	lang.tach
-28	6	util.tach
-16	1	main.tach
+37	8	lang.vl
+28	6	util.vl
+16	1	main.vl
 81	15	total
 $ query stats --over 30
-37	8	lang.tach	over
-28	6	util.tach
-16	1	main.tach
+37	8	lang.vl	over
+28	6	util.vl
+16	1	main.vl
 81	15	total
 note query.over: 1 file over 30 lines
-try: tachyonc query deps crate::lang --max-lines 30
+try: volec query deps crate::lang --max-lines 30
 $ query stats util
-# crate::util	util.tach	28 lines	6 items
+# crate::util	util.vl	28 lines	6 items
 5	enum	Shape
 4	struct	Pair
 3	fn	square
 3	fn	times
 3	fn	cube
 3	fn	unused_helper
-$ query stats lang.tach
-# lang.tach	37 lines	8 items
+$ query stats lang.vl
+# lang.vl	37 lines	8 items
 5	fn	parse
 4	struct	Token
 3	fn	lex_digit
@@ -31,7 +31,7 @@ $ query stats lang.tach
 3	fn	summary
 ## lang has two parts that share nothing: two groups of at most 12 lines.
 $ query deps lang --max-lines 12
-# crate::lang	lang.tach	27 lines	8 items
+# crate::lang	lang.vl	27 lines	8 items
 Token	4	-	lex_digit lex parse check report describe summary	2
 lex_digit	3	Token	lex	0
 lex	3	Token lex_digit	parse	0
@@ -46,7 +46,7 @@ group 2	9	report describe summary
 group 3	8	lex parse
 ## 3 groups of at most 12 lines, 8 references between them
 $ query deps util
-# crate::util	util.tach	21 lines	6 items
+# crate::util	util.vl	21 lines	6 items
 square	3	times	cube	2
 times	3	-	square cube	0
 cube	3	square times	-	1
@@ -57,33 +57,33 @@ groups	1	at most 1000 lines	0 references between them
 group 1	21	square times cube unused_helper Shape Pair
 ## 1 group of at most 1000 lines, 0 references between them
 $ query unused
-lang::Token	main.tach:6:19	import
-crate::util::cube	lang.tach:2:18	import
-crate::lang::summary	lang.tach:35:4	fn
-crate::util::cube	util.tach:11:8	fn
-crate::util::unused_helper	util.tach:15:8	fn
-crate::util::Shape::Dot	util.tach:21:5	variant
-crate::util::Shape::Line	util.tach:22:5	variant
-crate::util::Pair	util.tach:25:12	struct
+lang::Token	main.vl:6:19	import
+crate::util::cube	lang.vl:2:18	import
+crate::lang::summary	lang.vl:35:4	fn
+crate::util::cube	util.vl:11:8	fn
+crate::util::unused_helper	util.vl:15:8	fn
+crate::util::Shape::Dot	util.vl:21:5	variant
+crate::util::Shape::Line	util.vl:22:5	variant
+crate::util::Pair	util.vl:25:12	struct
 $ query unused lang
-crate::util::cube	lang.tach:2:18	import
-crate::lang::summary	lang.tach:35:4	fn
+crate::util::cube	lang.vl:2:18	import
+crate::lang::summary	lang.vl:35:4	fn
 $ query impact square
-crate::util::square	util.tach:3:8	fn	pub fn square(x: i64) -> i64	effects: none
-util.tach	1	0	util::cube
-main.tach	1	1	crate main
+crate::util::square	util.vl:3:8	fn	pub fn square(x: i64) -> i64	effects: none
+util.vl	1	0	util::cube
+main.vl	1	1	crate main
 total	2	1	2 files
 $ query impact lang::Token
-crate::lang::Token	lang.tach:4:12	struct	pub struct Token
-lang.tach	0	10	lang::lex_digit lang::lex lang::parse lang::check lang::report lang::describe lang::summary
-main.tach	0	1	crate
+crate::lang::Token	lang.vl:4:12	struct	pub struct Token
+lang.vl	0	10	lang::lex_digit lang::lex lang::parse lang::check lang::report lang::describe lang::summary
+main.vl	0	1	crate
 total	0	11	2 files
 $ lint --max-lines 30
-error lint.max-lines: lang.tach: 37 lines (at most 30)
-try: tachyonc query deps crate::lang --max-lines 30
+error lint.max-lines: lang.vl: 37 lines (at most 30)
+try: volec query deps crate::lang --max-lines 30
 [exit 1]
 $ lint --max-lines 1000
 $ lint
 error lint.usage: lint needs --max-lines N
-try: tachyonc lint --max-lines 1000
+try: volec lint --max-lines 1000
 [exit 2]

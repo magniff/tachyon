@@ -1,13 +1,13 @@
-## tachyonc fmt on the syntax of 0.15 (tests/refactor/fmt015/): `?` after
+## volec fmt on the syntax of 0.15 (tests/refactor/fmt015/): `?` after
 ## its operand, `name: value` arguments, `= default` parameters, field
 ## shorthand and `#[derive(A, B)]` spaced as Rust does; an f-string's text
 ## as written, its holes laid out as expressions (no space inside the
 ## braces, none before a spec), and no line broken inside one; `>>>`
 ## closing type arguments as written. fmt needs no checking: the program
 ## has 0.15's stub errors.
-$ fmt --dry-run main.tach
---- a/main.tach
-+++ b/main.tach
+$ fmt --dry-run main.vl
+--- a/main.vl
++++ b/main.vl
 @@ -2 +2 @@
 -#[derive(Eq,Ord ,Debug)]
 +#[derive(Eq, Ord, Debug)]
@@ -33,9 +33,9 @@ $ fmt --dry-run main.tach
 +    println(
 +        f"the first value is {x} and the second is {scale(x, b: y, c: x * y + 1000000)} at last");
 $ fmt
-formatted	main.tach	+10 -9 lines
-% cat main.tach
-// The syntax of 0.15 laid out by hand, for `tachyonc fmt`.
+formatted	main.vl	+10 -9 lines
+% cat main.vl
+// The syntax of 0.15 laid out by hand, for `volec fmt`.
 #[derive(Eq, Ord, Debug)]
 struct P { x: i64, y: i64 }
 

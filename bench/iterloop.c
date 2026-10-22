@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
-/* bench/iterloop.tach: the kernels of the iterator chains, as loops */
+/* bench/iterloop.vl: the kernels of the iterator chains, as loops */
 static __attribute__((noinline)) long filter_map_sum(const long *s, long n, long r) {
     long t = 0;
     for (long k = 0; k < n; k++) {

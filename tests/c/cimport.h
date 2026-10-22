@@ -1,4 +1,4 @@
-/* The C features `import` reads (tests/run/cimport_*.tach). */
+/* The C features `import` reads (tests/run/cimport_*.vl). */
 #ifndef CIMPORT_H
 #define CIMPORT_H
 
@@ -101,7 +101,7 @@ struct ci_outer {
     union ci_union u;
 };
 
-/* Fields named with tachyon keywords. */
+/* Fields named with vole keywords. */
 struct ci_keywords {
     int type;
     int match;

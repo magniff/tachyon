@@ -3,18 +3,18 @@
 ## file read mixed a let is written `x: let T` (`x: T` is 0.19's by-value
 ## parameter there). `--type x 'inout T'` marks the calls too.
 $ refactor signature Acc::show --convention self let
-made parameter self let in crate::Acc::show	main.tach	+1 -1 lines
+made parameter self let in crate::Acc::show	main.vl	+1 -1 lines
 $ refactor signature peek --convention a inout --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -10 +10 @@
 -fn peek(a: let Acc) -> i64 { a.n }
 +fn peek(a: inout Acc) -> i64 { a.n }
 $ refactor signature eat --convention v let
-made parameter v let in crate::eat	main.tach	+1 -1 lines
+made parameter v let in crate::eat	main.vl	+1 -1 lines
 $ refactor signature bump --type k 'inout i64' --dry-run
---- a/main.tach
-+++ b/main.tach
+--- a/main.vl
++++ b/main.vl
 @@ -8 +8 @@
 -fn bump(a: inout Acc, k: i64) { a.n += k; }
 +fn bump(a: inout Acc, k: inout i64) { a.n += k; }
@@ -23,9 +23,9 @@ $ refactor signature bump --type k 'inout i64' --dry-run
 +    bump(&a, &2);
 $ refactor signature eat --convention v lent
 error refactor.usage: --convention takes a parameter and let, inout or sink
-try: tachyonc refactor signature NAME --convention x inout
+try: volec refactor signature NAME --convention x inout
 [exit 2]
-% cat main.tach
+% cat main.vl
 struct Acc { n: i64 }
 
 impl Acc {

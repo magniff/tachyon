@@ -1,0 +1,320 @@
+// std::window's Objective-C layer: a minimal stand-in for std::objc
+// (docs/design/gpu.md §2.9, 0.22) until it lands. Everything here is replaced then: the message shapes by
+// objcgen's generated, runtime-checked wrappers (tables appkit.objc and
+// quartzcore.objc, owned by W1), `Id` by `Id<T>`/`Ref<T>`, the pool
+// functions by `objc::pool`, the class functions by `ClassBuilder`.
+//
+// One typed declaration per selector shape (`#[link_name =
+// "objc_msgSend"]`): on arm64 objc_msgSend is a trampoline that keeps
+// every argument register and x8, so a call through a declaration whose
+// C types match the method's is exactly the call clang emits. The shapes
+// are named by their result and arguments: p a pointer (an object, a
+// selector, a C string), v void, u u64, i i64, h u16, b BOOL, d f64,
+// r a rect (4 f64, an HFA in v0-v3), z a size and t a point (2 f64), g
+// an NSRange (2 u64 in x0/x1), c a clear colour (4 f64), m an MTLRegion
+// (48 bytes, passed by reference).
+//
+// Every caller is `unsafe`: a shape used with a selector whose types it
+// does not match is undefined behaviour. The callers are cocoa.vl and
+// voltty's renderer (its copy), each call with the selector's documented
+// types, listed in tables/*.objc and checked against the runtime.
+
+// ---- The Objective-C layer (0.23) ----
+
+#[repr(C)]
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[repr(C)]
+pub struct Size {
+    pub w: f64,
+    pub h: f64,
+}
+
+#[repr(C)]
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+#[repr(C)]
+pub struct Range {
+    pub loc: u64,
+    pub len: u64,
+}
+
+// The method-description pair protocol_getMethodDescription returns
+// (16 bytes, in x0/x1).
+#[repr(C)]
+pub struct MethodDesc {
+    pub name: *u8,
+    pub types: *u8,
+}
+
+// NSNotFound, the location of an empty NSRange.
+pub const NOT_FOUND: u64 = 0x7fffffffffffffff;
+
+pub extern "C" {
+    fn objc_getClass(name: *u8) -> *u8;
+    fn objc_getProtocol(name: *u8) -> *u8;
+    fn sel_registerName(name: *u8) -> *u8;
+    fn objc_allocateClassPair(superclass: *u8, name: *u8, extra: u64) -> *u8;
+    fn objc_registerClassPair(cls: *u8);
+    fn class_addProtocol(cls: *u8, protocol: *u8) -> bool;
+    fn class_addIvar(cls: *u8, name: *u8, size: u64, align_log2: u8, types: *u8) -> bool;
+    fn class_getInstanceVariable(cls: *u8, name: *u8) -> *u8;
+    fn class_getInstanceMethod(cls: *u8, sel: *u8) -> *u8;
+    fn method_getTypeEncoding(m: *u8) -> *u8;
+    fn ivar_getOffset(ivar: *u8) -> i64;
+    fn protocol_getMethodDescription(p: *u8, sel: *u8, required: bool, instance: bool) -> MethodDesc;
+    fn objc_autoreleasePoolPush() -> *u8;
+    fn objc_autoreleasePoolPop(pool: *u8);
+    fn objc_retain(o: *u8) -> *u8;
+    fn objc_release(o: *u8);
+    fn strlen(s: *u8) -> u64;
+
+    #[link_name = "objc_msgSend"]
+    fn msg_p(o: *u8, s: *u8) -> *u8;
+    #[link_name = "objc_msgSend"]
+    fn msg_p_p(o: *u8, s: *u8, a: *u8) -> *u8;
+    #[link_name = "objc_msgSend"]
+    fn msg_p_pp(o: *u8, s: *u8, a: *u8, b: *u8) -> *u8;
+    #[link_name = "objc_msgSend"]
+    fn msg_p_ppp(o: *u8, s: *u8, a: *u8, b: *u8, c: *u8) -> *u8;
+    #[link_name = "objc_msgSend"]
+    fn msg_p_u(o: *u8, s: *u8, a: u64) -> *u8;
+    #[link_name = "objc_msgSend"]
+    fn msg_p_uu(o: *u8, s: *u8, a: u64, b: u64) -> *u8;
+    #[link_name = "objc_msgSend"]
+    fn msg_p_d(o: *u8, s: *u8, a: f64) -> *u8;
+    #[link_name = "objc_msgSend"]
+    fn msg_p_r(o: *u8, s: *u8, a: Rect) -> *u8;
+    #[link_name = "objc_msgSend"]
+    fn msg_p_ruub(o: *u8, s: *u8, a: Rect, b: u64, c: u64, d: bool) -> *u8;
+    #[link_name = "objc_msgSend"]
+    fn msg_p_rupp(o: *u8, s: *u8, a: Rect, b: u64, c: *u8, d: *u8) -> *u8;
+    #[link_name = "objc_msgSend"]
+    fn msg_p_uppb(o: *u8, s: *u8, a: u64, b: *u8, c: *u8, d: bool) -> *u8;
+    #[link_name = "objc_msgSend"]
+    fn msg_p_uuub(o: *u8, s: *u8, a: u64, b: u64, c: u64, d: bool) -> *u8;
+    #[link_name = "objc_msgSend"]
+    fn msg_p_ppP(o: *u8, s: *u8, a: *u8, b: *u8, err: **u8) -> *u8;
+    #[link_name = "objc_msgSend"]
+    fn msg_p_pP(o: *u8, s: *u8, a: *u8, err: **u8) -> *u8;
+    // otherEventWithType:location:modifierFlags:timestamp:windowNumber:
+    // context:subtype:data1:data2:
+    #[link_name = "objc_msgSend"]
+    fn msg_p_utudipsii(o: *u8, s: *u8, ty: u64, at: Point, flags: u64, time: f64, win: i64,
+        ctx: *u8, sub: i16, d1: i64, d2: i64) -> *u8;
+    // keyEventWithType:location:modifierFlags:timestamp:windowNumber:
+    // context:characters:charactersIgnoringModifiers:isARepeat:keyCode:
+    #[link_name = "objc_msgSend"]
+    fn msg_p_utudipppbh(o: *u8, s: *u8, ty: u64, at: Point, flags: u64, time: f64, win: i64,
+        ctx: *u8, chars: *u8, plain: *u8, repeat: bool, code: u16) -> *u8;
+    // mouseEventWithType:location:modifierFlags:timestamp:windowNumber:
+    // context:eventNumber:clickCount:pressure:
+    #[link_name = "objc_msgSend"]
+    fn msg_p_utudipiif(o: *u8, s: *u8, ty: u64, at: Point, flags: u64, time: f64, win: i64,
+        ctx: *u8, num: i64, clicks: i64, pressure: f32) -> *u8;
+
+    #[link_name = "objc_msgSend"]
+    fn msg_v(o: *u8, s: *u8);
+    #[link_name = "objc_msgSend"]
+    fn msg_v_p(o: *u8, s: *u8, a: *u8);
+    #[link_name = "objc_msgSend"]
+    fn msg_v_pp(o: *u8, s: *u8, a: *u8, b: *u8);
+    #[link_name = "objc_msgSend"]
+    fn msg_v_pb(o: *u8, s: *u8, a: *u8, b: bool);
+    #[link_name = "objc_msgSend"]
+    fn msg_v_b(o: *u8, s: *u8, a: bool);
+    #[link_name = "objc_msgSend"]
+    fn msg_v_u(o: *u8, s: *u8, a: u64);
+    #[link_name = "objc_msgSend"]
+    fn msg_v_d(o: *u8, s: *u8, a: f64);
+    #[link_name = "objc_msgSend"]
+    fn msg_v_z(o: *u8, s: *u8, a: Size);
+    #[link_name = "objc_msgSend"]
+    fn msg_v_rp(o: *u8, s: *u8, a: Rect, b: *u8);
+    #[link_name = "objc_msgSend"]
+    fn msg_v_pu(o: *u8, s: *u8, a: *u8, b: u64);
+    #[link_name = "objc_msgSend"]
+    fn msg_v_puu(o: *u8, s: *u8, a: *u8, b: u64, c: u64);
+    #[link_name = "objc_msgSend"]
+    fn msg_v_uuuu(o: *u8, s: *u8, a: u64, b: u64, c: u64, d: u64);
+    #[link_name = "objc_msgSend"]
+    fn msg_v_c(o: *u8, s: *u8, a: ClearColor);
+    #[link_name = "objc_msgSend"]
+    fn msg_v_mupu(o: *u8, s: *u8, a: MtlRegion, b: u64, c: *u8, d: u64);
+    #[link_name = "objc_msgSend"]
+    fn msg_v_pumu(o: *u8, s: *u8, a: *u8, b: u64, c: MtlRegion, d: u64);
+    #[link_name = "objc_msgSend"]
+    fn msg_v_pg(o: *u8, s: *u8, a: *u8, b: Range);
+    #[link_name = "objc_msgSend"]
+    fn msg_v_pgg(o: *u8, s: *u8, a: *u8, b: Range, c: Range);
+
+    #[link_name = "objc_msgSend"]
+    fn msg_u(o: *u8, s: *u8) -> u64;
+    #[link_name = "objc_msgSend"]
+    fn msg_u_u(o: *u8, s: *u8, a: u64) -> u64;
+    #[link_name = "objc_msgSend"]
+    fn msg_i(o: *u8, s: *u8) -> i64;
+    #[link_name = "objc_msgSend"]
+    fn msg_h(o: *u8, s: *u8) -> u16;
+    #[link_name = "objc_msgSend"]
+    fn msg_h_u(o: *u8, s: *u8, a: u64) -> u16;
+    #[link_name = "objc_msgSend"]
+    fn msg_b(o: *u8, s: *u8) -> bool;
+    #[link_name = "objc_msgSend"]
+    fn msg_b_p(o: *u8, s: *u8, a: *u8) -> bool;
+    #[link_name = "objc_msgSend"]
+    fn msg_b_pp(o: *u8, s: *u8, a: *u8, b: *u8) -> bool;
+    #[link_name = "objc_msgSend"]
+    fn msg_b_i(o: *u8, s: *u8, a: i64) -> bool;
+    #[link_name = "objc_msgSend"]
+    fn msg_d(o: *u8, s: *u8) -> f64;
+    #[link_name = "objc_msgSend"]
+    fn msg_t(o: *u8, s: *u8) -> Point;
+    #[link_name = "objc_msgSend"]
+    fn msg_r(o: *u8, s: *u8) -> Rect;
+    #[link_name = "objc_msgSend"]
+    fn msg_r_r(o: *u8, s: *u8, a: Rect) -> Rect;
+    #[link_name = "objc_msgSend"]
+    fn msg_r_rp(o: *u8, s: *u8, a: Rect, b: *u8) -> Rect;
+    #[link_name = "objc_msgSend"]
+    fn msg_g(o: *u8, s: *u8) -> Range;
+    #[link_name = "objc_msgSend"]
+    fn msg_r_gP(o: *u8, s: *u8, a: Range, b: *Range) -> Rect;
+    #[link_name = "objc_msgSend"]
+    fn msg_t_tp(o: *u8, s: *u8, a: Point, b: *u8) -> Point;
+    #[link_name = "objc_msgSend"]
+    fn msg_v_gP(o: *u8, s: *u8, a: Range, b: *Range);
+}
+
+// MTLClearColor: four doubles, an HFA passed in v0-v3.
+#[repr(C)]
+pub struct ClearColor {
+    pub r: f64,
+    pub g: f64,
+    pub b: f64,
+    pub a: f64,
+}
+
+// MTLRegion: an origin and a size of three u64 each (48 bytes: passed
+// by reference to a copy, as AAPCS64 says for large aggregates).
+#[repr(C)]
+pub struct MtlRegion {
+    pub x: u64,
+    pub y: u64,
+    pub z: u64,
+    pub w: u64,
+    pub h: u64,
+    pub d: u64,
+}
+
+// A class by name; null when the runtime has none (its framework is not
+// loaded).
+pub fn class(name: *u8) -> *u8 {
+    // SAFETY: objc_getClass reads a NUL-terminated name; every caller
+    // passes a c"..." literal.
+    unsafe { objc_getClass(name) }
+}
+
+// A selector by name (registered on first use).
+pub fn sel(name: *u8) -> *u8 {
+    // SAFETY: as `class`: a NUL-terminated literal.
+    unsafe { sel_registerName(name) }
+}
+
+// The text of a C string as a slice, valid while the string is (for an
+// NSString's UTF8String: until the autorelease pool around it is
+// popped).
+pub unsafe fn cstr(p: *u8) -> [u8] {
+    if p == 0 as *u8 {
+        return "";
+    }
+    p[0..strlen(p) as i64]
+}
+
+// The type encoding of an instance method `name` of class `cls` (or of
+// its superclasses), or of the protocol `proto`'s method: the encoding a
+// method added to a subclass must have. Null when neither has it.
+pub fn method_types(cls: *u8, proto: *u8, name: *u8) -> *u8 {
+    let s = sel(name);
+    // SAFETY: the runtime's metadata queries take a class (or null), a
+    // protocol (or null) and a selector; they return null or a pointer
+    // into the runtime's own (immortal) metadata.
+    unsafe {
+        if cls != 0 as *u8 {
+            let m = class_getInstanceMethod(cls, s);
+            if m != 0 as *u8 {
+                return method_getTypeEncoding(m);
+            }
+        }
+        if proto != 0 as *u8 {
+            let d = protocol_getMethodDescription(proto, s, true, true);
+            if d.types != 0 as *u8 {
+                return d.types;
+            }
+            let o = protocol_getMethodDescription(proto, s, false, true);
+            return o.types;
+        }
+    }
+    0 as *u8
+}
+
+// An autoreleased NSString with the bytes of `s` (UTF-8). Valid until
+// the enclosing autorelease pool is popped; `retain` keeps it longer.
+pub fn nsstring(s: [u8]) -> *u8 {
+    // SAFETY: -[NSString initWithBytes:length:encoding:] reads exactly
+    // `len` bytes at `ptr`; `s` is a live slice. NSUTF8StringEncoding is
+    // 4. alloc/init returns +1, balanced by autorelease.
+    unsafe {
+        let a = msg_p(class(c"NSString"), sel(c"alloc"));
+        let o = msg_p_puu(a, sel(c"initWithBytes:length:encoding:"), s.ptr, s.len as u64, 4);
+        msg_p(o, sel(c"autorelease"))
+    }
+}
+
+pub extern "C" {
+    #[link_name = "objc_msgSend"]
+    fn msg_p_puu(o: *u8, s: *u8, a: *u8, b: u64, c: u64) -> *u8;
+}
+
+// The UTF-8 bytes of an NSString (or NSAttributedString's string), a
+// view valid until the current autorelease pool is popped.
+pub fn nsstring_bytes(o: *u8) -> [u8] {
+    if o == 0 as *u8 {
+        return "";
+    }
+    // SAFETY: `o` is an NSString (callers pass the results of methods
+    // typed NSString); UTF8String returns an inner pointer that lives as
+    // long as the pool the caller is inside.
+    unsafe {
+        let p = msg_p(o, sel(c"UTF8String"));
+        cstr(p)
+    }
+}
+
+pub fn retain(o: *u8) -> *u8 {
+    // SAFETY: objc_retain takes any object or nil.
+    unsafe { objc_retain(o) }
+}
+
+pub fn release(o: *u8) {
+    // SAFETY: callers release only what they retained (or got at +1).
+    unsafe { objc_release(o); }
+}
+
+pub fn pool_push() -> *u8 {
+    // SAFETY: push and pop are paired by every caller, on the main thread.
+    unsafe { objc_autoreleasePoolPush() }
+}
+
+pub fn pool_pop(p: *u8) {
+    // SAFETY: `p` is the token of the matching push.
+    unsafe { objc_autoreleasePoolPop(p); }
+}

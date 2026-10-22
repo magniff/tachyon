@@ -1,5 +1,5 @@
 //! The oracle of examples/voltty/core: alacritty_terminal (the crate Alacritty
-//! 0.17.0 is built on) fed the same bytes as the tachyon terminal, its
+//! 0.17.0 is built on) fed the same bytes as the vole terminal, its
 //! state printed in the dump format of FORMAT.md.
 //!
 //! usage:
@@ -434,7 +434,7 @@ fn bench(args: &[String]) {
 }
 
 /// unicode-width 0.2.2's `width()` of every char, as ranges `lo hi w`
-/// (w: 0, 1, 2, or n for None); the generator of term/width.tach reads it.
+/// (w: 0, 1, 2, or n for None); the generator of term/width.vl reads it.
 fn width_table() {
     use unicode_width::UnicodeWidthChar;
     let code = |w: Option<usize>| match w {

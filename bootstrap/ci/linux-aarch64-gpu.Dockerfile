@@ -2,9 +2,9 @@
 # plus what the shader compiler's tests and, later, the Vulkan hal need:
 # spirv-val (spirv-tools), lavapipe (mesa-vulkan-drivers), the Vulkan
 # loader, headers and validation layers. Built from the minimal image:
-#   docker build -t tachyon-check:linux-aarch64-gpu \
+#   docker build -t vole-check:linux-aarch64-gpu \
 #       -f bootstrap/ci/linux-aarch64-gpu.Dockerfile bootstrap/ci
-ARG BASE=tachyon-check:linux-aarch64
+ARG BASE=vole-check:linux-aarch64
 FROM $BASE
 
 RUN apt-get update \

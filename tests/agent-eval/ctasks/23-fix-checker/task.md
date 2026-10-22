@@ -16,7 +16,7 @@ A user reports:
 > }
 > ```
 >
-> The arms cover 0 to 255, every `u8`, but `tachyonc` rejects it:
+> The arms cover 0 to 255, every `u8`, but `volec` rejects it:
 >
 > ```
 > error[type error] non-exhaustive match: '_' is not covered | help: add an arm for it, or a wildcard arm '_ =>'
@@ -27,7 +27,7 @@ A user reports:
 > the error, the compiler accepts it, but it does not report that arm as
 > unreachable. It does report an unreachable arm in other matches.
 
-`tests/run/eval_regress_ranges.tach` reproduces it (`tests/run.sh
+`tests/run/eval_regress_ranges.vl` reproduces it (`tests/run.sh
 eval_regress` fails now). The compiler's match checking is in
 `compiler/src/front/patterns/`.
 
@@ -42,7 +42,7 @@ Fix the compiler so that:
   after full coverage too) is still an "unreachable match arm" error.
 
 Fix the compiler, not the test: the grader uses its own copy of
-`tests/run/eval_regress_ranges.tach` and other programs of this kind. A
+`tests/run/eval_regress_ranges.vl` and other programs of this kind. A
 fix that only makes this one program compile does not pass. You may add
 test cases of your own in `tests/run/`, named anything except `eval_*`.
 

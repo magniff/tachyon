@@ -1,13 +1,13 @@
-# Rust -> tachyon
+# Rust -> vole
 
-What a Rust programmer reaches for, and what tachyon has instead.
-Tachyon is not Rust: its values are passed by convention (`let`,
+What a Rust programmer reaches for, and what vole has instead.
+Vole is not Rust: its values are passed by convention (`let`,
 `inout`, `sink`), not by reference. A Rust habit compiles to an error
 more often than to something else, and each error names the fix.
 
 ## Text
 
-| Rust | tachyon |
+| Rust | vole |
 |---|---|
 | `&str`, `String` | the same (0.20): `str` is UTF-8 text, a view (`&str` is `str`; a literal is one where one goes, and a `str` goes where `[u8]` does); `String` owns it, on an allocator: `String::new_in(gpa)`, `String::from_in("x", gpa)`; `&s` of a String goes where a `str` does, and it has `str`'s methods (`guide text`) |
 | `String::new()`, `push_str`, `format!` | `String::new_in(gpa)`, `push_str`, `push(c)` (a `u32` code point: no `char` yet), `push_fmt(f"..")`; `to_string_in(f"..", gpa)`; `std::Buf` for bytes, `format_in(f"..", gpa)` (a Buf) |
@@ -46,11 +46,11 @@ not a number
 
 ## Parameters, ownership, memory
 
-Tachyon has no references to store: a parameter's convention says what
+Vole has no references to store: a parameter's convention says what
 the function does with its argument, and the argument is used as the
 value itself.
 
-| Rust | tachyon |
+| Rust | vole |
 |---|---|
 | `x: &T`, `f(&x)` | `x: T` (let, the default: read-only), `f(x)` |
 | `x: &mut T`, `f(&mut x)` | `x: inout T`, `f(&x)`: `&` marks only an inout argument |
@@ -69,17 +69,17 @@ value itself.
 | moves, `Clone`, `Copy` | the same idea: an owned value (`Vec`, `Buf`, `HashMap`, a struct holding one) moves; `.clone()` copies; plain values copy (no `Copy` derive) |
 | `Drop`, RAII | dropped at the end of the scope, last first; `impl Drop for T { fn drop(inout self) }`; `drop(x)` |
 | lifetimes `'a`, `fn f<'a>(x: &'a str) -> &'a str` | none: each function's view summary is inferred (`query views NAME`); `#[views(s)]` pins one (`guide views`) |
-| the borrow checker | the own pass: `own.moved`, `own.conflict`, `own.escape`... each with `try:` lines (`tachyonc explain own.conflict`) |
+| the borrow checker | the own pass: `own.moved`, `own.conflict`, `own.escape`... each with `try:` lines (`volec explain own.conflict`) |
 | `Box<T>`, `Rc<T>`, `Arc<T>` | none: a `Vec<T>`, an index, or `malloc` in `unsafe` |
 | `Vec::new()`, the global allocator | `Vec::new_in(gpa)`: allocation is explicit (0.16); `gpa: Gpa` comes from `fn main(gpa: Gpa)` and is passed down; `arena_scope(gpa, \|a\| ..)` (`guide allocators`) |
 | `Option<&T>` | `Option<T>` of a copy, an index, or a one-element view `[T]` |
 | `&mut v[i]`, `m.get_mut(&k)` | `&v[i]` to an inout parameter, `v[i].f = x`; `m.get_mut(k)`: an `Option<[V]>`, a view of one element (`a[0].f += 1`) |
 | `*m.entry(k).or_insert(0) += 1` | `m.get_or_insert(k, 0)[0] += 1` |
 | `std::mem::take(&mut x)`, `replace` | `std::take(&x)`, `std::replace(&x, v)` |
-| `Mutex`, threads | none in tachyon (C's threads are C's business) |
+| `Mutex`, threads | none in vole (C's threads are C's business) |
 
 Each Rust spelling above is the error `conv.rust`, whose `try:` line
-writes the tachyon form (`tachyonc fix --only conventions` rewrites a
+writes the vole form (`volec fix --only conventions` rewrites a
 whole program). Pass a container to a function that changes it as
 `&v` to an `inout` parameter, to one that reads it as `v`; return a new
 one by value (the caller owns it):
@@ -116,7 +116,7 @@ address.
 
 ## Errors and Option
 
-| Rust | tachyon |
+| Rust | vole |
 |---|---|
 | `x?` | the same (0.15), on `Option` and `Result`; the error goes through `From` |
 | `panic!("msg")`, `unreachable!()` | `panic("msg")`, `unreachable()` (0.17; exit 101), or `return` an error |
@@ -160,7 +160,7 @@ too big: 500
 
 ## Iteration and closures
 
-| Rust | tachyon |
+| Rust | vole |
 |---|---|
 | `for x in v.iter()`, `for x in &v` | the same (0.14), and `for x in v`: a copy of each element |
 | `for (i, x) in s.iter().enumerate()` | the same (0.14) |
@@ -211,7 +211,7 @@ fn main() -> i32 {
 
 ## Types and numbers
 
-| Rust | tachyon |
+| Rust | vole |
 |---|---|
 | `usize` for lengths and indices | `i64` (`s.len()`, `v.len()`); indexing takes any integer type |
 | implicit widening `i32` -> `i64` | the same (0.15), lossless only; `i64::from(x)`; narrowing is `x as i32` |
@@ -232,7 +232,7 @@ fn main() -> i32 {
 
 ## Syntax
 
-| Rust | tachyon |
+| Rust | vole |
 |---|---|
 | `fn f(&self)`, `&mut self`, `self` | `fn f(self)`, `fn f(inout self)`, `fn f(sink self)`; `Self` works (`self: *T` is the raw pointer, 0.18.1) |
 | `let mut x = 0;` | `var x = 0;` |
@@ -247,7 +247,7 @@ fn main() -> i32 {
 | default arguments (none in Rust) | `fn f(a: i64, b: i64 = 2)`, `f(1, b: 3)` (0.15) |
 | `impl<T> Trait for Vec<T>` | the same (one impl per trait and type) |
 | `dyn Trait`, `impl Trait` in argument position | generics: `fn f<T: Trait>(x: T)` |
-| `#[test]`, proptest, cargo-fuzz | `#[test]`, `#[property]`, `#[fuzz]`, run by `tachyonc test` and `tachyonc fuzz` (0.18; guide testing) |
+| `#[test]`, proptest, cargo-fuzz | `#[test]`, `#[property]`, `#[fuzz]`, run by `volec test` and `volec fuzz` (0.18; guide testing) |
 | `assert!`, `debug_assert!`, contracts crates | `assert(c)`, `assert_eq(a, b)`; `requires`/`ensures` clauses (0.18; guide contracts) |
 | `use a::b::*;` | `use a::b::{c, d};` |
 | `x as T` | the same; `bool as i64` works, an integer to an enum is checked |
@@ -256,9 +256,9 @@ fn main() -> i32 {
 
 ## Modules and crates
 
-| Rust | tachyon |
+| Rust | vole |
 |---|---|
-| `mod m;` | the same: `m.tach` or `m/mod.tach` next to the file |
+| `mod m;` | the same: `m.vl` or `m/mod.vl` next to the file |
 | `use crate::a::b;`, `super::`, `self::` | the same |
 | `extern crate`, Cargo dependencies | none: one program from its files; C through headers |
 | `pub use` | the same |
@@ -269,7 +269,7 @@ fn main() -> i32 {
 
 ## unsafe and C
 
-| Rust | tachyon |
+| Rust | vole |
 |---|---|
 | `unsafe { }`, `unsafe fn` | the same |
 | `extern "C" { fn f(); }` | the same; or `import "stdio.h" as c;` then `c::printf` |

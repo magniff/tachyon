@@ -1,9 +1,8 @@
-## (0.21) `.vl`, the extension from 0.24 (vole), wherever `.tach` goes: the
-## root main.vl, a module `geo/` with mod.vl and shapes.vl, next to a
-## `.tach` module (util.tach): a mixed tree builds, runs, and is queried
-## and edited by FILE:LINE; `edit new-file` makes a `.vl` file with its
-## `mod` line; `x.tach` and `x.vl` both are an error; VOLE_ROOT is read as
-## TACHYON_ROOT, and wins.
+## (0.21, renamed in 0.24) A tree of `.vl` sources: the root main.vl, a
+## module `geo/` with mod.vl and shapes.vl, a module util.vl: it builds,
+## runs, and is queried and edited by FILE:LINE; `edit new-file` makes a
+## `.vl` file with its `mod` line; a VOLE_ROOT that cannot be read is an
+## error. (0.21's `x.tach` beside `x.vl` went with the aliases in 0.24.)
 % "$COMPILER" main.vl -o prog && ./prog
 12 10
 ok: built prog
@@ -27,8 +26,7 @@ pub fn circle(r: i64) -> i64 { 314 * r * r / 100 }
 pub mod shapes;
 mod circle;
 pub fn area(w: i64, h: i64) -> i64 { shapes::rect(w, h) }
-% cd geo && VOLE_ROOT=../main.vl TACHYON_ROOT=nowhere.tach "$COMPILER" query def twice
-crate::util::twice	../util.tach:1:8	fn	pub fn twice(x: i64) -> i64	effects: none
-% cp util.tach util.vl && "$COMPILER" check main.vl
-main.vl:2:5: error[module error] module 'util' has two files, ./util.tach and ./util.vl | help: a module is one file: delete or rename one of them (`.vl` is the extension from 0.24)
-[exit 1]
+% cd geo && VOLE_ROOT=nowhere.vl "$COMPILER" query def twice
+error query.bad-root: cannot read 'nowhere.vl'
+try: volec query def twice
+[exit 2]

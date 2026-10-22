@@ -17,13 +17,13 @@ aarch64::__crc32cw	crc	crc32cw <d:w>, <crc:w>, <data:w>	one step of CRC-32C over
 aarch64::__crc32cd	crc	crc32cx <d:w>, <crc:w>, <data:x>	one step of CRC-32C over 8 bytes
 $ intrinsics --feature crc --arch x86_64
 error query.no-match: no intrinsic matches with feature crc
-try: tachyonc guide arch#recipes
+try: volec guide arch#recipes
 [exit 1]
 $ arch byte search --budget 60
 aarch64::vceqq_u8	neon	cmeq <d>.16b, <a>.16b, <b>.16b	lanewise a == b: a mask, each lane all ones or 0
 aarch64::vceq_u8	neon	cmeq <d>.8b, <a>.8b, <b>.8b	lanewise a == b: a mask, each lane all ones or 0
 note query.budget: cut at about 60 tokens: 2 of 3 lines (about 73 tokens in all)
-try: tachyonc query arch byte search --budget 100
+try: volec query arch byte search --budget 100
 $ arch sha256 --arch aarch64
 aarch64::vsha256hq_u32	sha2	sha256h <d:q>, <hash_efgh:q>, <wk>.4s	four SHA-256 rounds of the state with wk (the message plus constants): the new abcd
 aarch64::vsha256h2q_u32	sha2	sha256h2 <d:q>, <hash_abcd:q>, <wk>.4s	four SHA-256 rounds of the state with wk: the new efgh (pass the old abcd, before vsha256hq_u32)
@@ -41,19 +41,19 @@ equivalent: x86_64: _mm_subs_epu8
 x86_64::_mm_subs_epu8	sse2	psubusb <b>, <d>	lanewise a - b, saturating
 $ arch no-such-word
 error query.no-match: no intrinsic matches no-such-word
-try: tachyonc guide arch#recipes
+try: volec guide arch#recipes
 [exit 1]
 $ arch --equiv vnothing
 error query.no-match: no intrinsic 'vnothing'
-try: tachyonc query arch vnothing
+try: volec query arch vnothing
 [exit 1]
 $ arch --arch sparc
 error query.usage: unknown architecture 'sparc' (query arch WORDS... [--feature F] [--arch aarch64|x86_64|portable] [--equiv NAME] [--budget N])
-try: tachyonc query arch 'saturating subtract'
+try: volec query arch 'saturating subtract'
 [exit 2]
 $ arch
 error query.usage: no words to search for (query arch WORDS... [--feature F] [--arch aarch64|x86_64|portable] [--equiv NAME] [--budget N])
-try: tachyonc query arch 'saturating subtract'
+try: volec query arch 'saturating subtract'
 [exit 2]
 ## show, def and context of an intrinsic (with or without its path): the
 ## table's features and instruction on the first line; show adds its doc,
@@ -87,5 +87,5 @@ $ context vdotq_u32 --budget 120
 #[intrinsic(1493)]
 // (1 more lines)
 note query.budget: over the budget of 120 tokens, left out: source lines (or bodies) 1, types or uses 2
-try: tachyonc query show vdotq_u32
-try: tachyonc query context vdotq_u32 --budget 360
+try: volec query show vdotq_u32
+try: volec query context vdotq_u32 --budget 360

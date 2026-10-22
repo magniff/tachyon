@@ -1,5 +1,5 @@
 // bench/std's fair hashers for Rust's HashMap (included by the hash_*
-// programs): `same`, tachyon's std hash as of 0.19 (splitmix64's
+// programs): `same`, vole's std hash as of 0.19 (splitmix64's
 // finalizer for an integer, FNV-1a for bytes), and `fold`, foldhash
 // (0.2's fast FixedState: 0.20's std hash, design §2.4.2), so that a
 // row compares tables, not hash functions. Rust's default (SipHash-1-3)
@@ -32,7 +32,7 @@ impl Hasher for SameHasher {
             self.h = (self.h ^ b as u64).wrapping_mul(0x100000001b3);
         }
     }
-    // (a slice's length prefix: tachyon's hash of [u8] has none)
+    // (a slice's length prefix: vole's hash of [u8] has none)
     fn write_usize(&mut self, _n: usize) {}
     fn write_u64(&mut self, x: u64) {
         self.h = mix64(x);
@@ -50,7 +50,7 @@ impl BuildHasher for Same {
 }
 
 // foldhash 0.2's fast hasher with its fixed seeds (FixedState), written
-// out: tachyon's std hash from 0.20 (std::hash, bit for bit). Inputs above
+// out: vole's std hash from 0.20 (std::hash, bit for bit). Inputs above
 // 16 bytes take foldhash's path up to 128 bytes, enough for these
 // benchmarks.
 const ARBITRARY3: u64 = 0x082efa98ec4e6c89;

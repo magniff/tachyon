@@ -55,7 +55,7 @@ let v: Vec<i64> = Vec::new();
 error[type error] allocation is explicit: pass an allocator (try: Vec::new_in(gpa))
 ```
 
-`tachyonc fix --only alloc016` moves a 0.15 program over: each call
+`volec fix --only alloc016` moves a 0.15 program over: each call
 becomes its `_in` form, and `gpa: Gpa` is added to every function from
 `main` down to the calls (and passed at each call). A function it cannot
 change (an impl of std's `Display`, a function used as a value, a
@@ -117,7 +117,7 @@ fn longest(words: [[u8]], gpa: Gpa) -> i64 {
 
 ## --check-alloc
 
-`tachyonc --check-alloc f.tach -o f` builds the program with a checking
+`volec --check-alloc f.vl -o f` builds the program with a checking
 `Gpa` (like `--check-unsafe`, at any `-O`): every block gets pages of
 its own, never reused, so a use after free, a double free, a free of a
 wrong pointer or size stop the program with where the block was
@@ -125,5 +125,5 @@ allocated and freed; leaks are listed at exit (`gpa.check_leaks()` in a
 test). Arenas and `FixedBuf` are checked the same way: a block
 used after their `reset`, after its scope ended, or after it moved is
 reported. Views (`as_slice()`, a `[T]`) into memory that was freed or
-moved are rejected in safe code since 0.17 (`tachyonc guide views`);
+moved are rejected in safe code since 0.17 (`volec guide views`);
 this mode still finds them in `unsafe` code and under `--values=off`.

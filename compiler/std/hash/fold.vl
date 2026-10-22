@@ -1,0 +1,308 @@
+// std::hash::fold: foldhash (0.20).
+// FoldHasher: foldhash's "fast" algorithm (Orson Peters, foldhash 0.2,
+// hashbrown's default hasher), bit for bit: tests/run/std_hash_vectors.vl
+// checks it against the crate's FixedState. Its core is the folded
+// multiply, the high and low halves of a 64x64-bit product xor'ed. An
+// integer costs one multiply at `finish`; integers written in a row share
+// it, 128 bits at a time (the sponge). Bytes are read 8 at a time, 16 to
+// a multiply, with overlapping reads at the ends, after a rotation of the
+// state by their length. Not a cryptographic hash: a fixed seed
+// (FixedState, the default) gives the same hashes in every run, so that
+// tables iterate in the same order everywhere; RandomState seeds it per
+// process; for keys an attacker chooses, SipHashState (sip.vl).
+
+use std::{Option, panic};
+use std::num::mul_hi;
+
+// ---- foldhash (0.20 implementation) ----
+
+pub const FOLD_ARBITRARY3: u64 = 0x082efa98ec4e6c89;
+const FOLD_ARBITRARY5: u64 = 0xbe5466cf34e90c6c;
+
+// The six seeds a FoldHasher mixes in (foldhash's SharedSeed): the fixed
+// ones (foldhash's global_fixed), or a process's random ones.
+pub struct FoldSeeds {
+    pub s0: u64,
+    pub s1: u64,
+    pub s2: u64,
+    pub s3: u64,
+    pub s4: u64,
+    pub s5: u64,
+}
+
+impl FoldSeeds {
+    // foldhash's fixed seeds (hexadecimal digits of pi).
+    #[inline]
+    pub fn fixed() -> FoldSeeds {
+        FoldSeeds {
+            s0: 0xc0ac29b7c97c50dd,
+            s1: 0x3f84d5b5b5470917,
+            s2: 0x9216d5d98979fb1b,
+            s3: 0xd1310ba698dfb5ac,
+            s4: 0x2ffd72dbd01adfb7,
+            s5: 0xb8e1afed6a267e96,
+        }
+    }
+
+    // The seeds made from one u64 (foldhash's SharedSeed::from_u64).
+    pub fn from_u64(seed: u64) -> FoldSeeds {
+        let a = fold_mix3(seed);
+        let b = fold_mix3(a);
+        let c = fold_mix3(b);
+        let d = fold_mix3(c);
+        let e = fold_mix3(d);
+        let f = fold_mix3(e);
+        // (zeros are the multiply's weak point: some bits forced on)
+        let ones = 0x8000000080000001u64;
+        FoldSeeds {
+            s0: a | ones, s1: b | ones, s2: c | ones, s3: d | ones, s4: e | ones, s5: f | ones
+        }
+    }
+}
+
+fn fold_mix3(x: u64) -> u64 {
+    fold_mul(fold_mul(fold_mul(x, FOLD_ARBITRARY5), FOLD_ARBITRARY5), FOLD_ARBITRARY5)
+}
+
+// The folded multiply: the low and high halves of a * b, xor'ed.
+#[inline]
+pub fn fold_mul(a: u64, b: u64) -> u64 {
+    (a * b) ^ mul_hi(a, b)
+}
+
+#[inline]
+pub fn fold_rotate_right(x: u64, r: i64) -> u64 {
+    let k = (r & 63) as u64;
+    (x >> k) | (x << ((64 - k) & 63))
+}
+
+// The 8 bytes at p[i..i + 8] as a u64, little-endian; the caller
+// guarantees that they are readable. (One load: AArch64 and x86_64, every
+// target of vole, load from any address.)
+#[inline]
+pub unsafe fn fold_read64(p: *u8, i: i64) -> u64 {
+    *(&p[i] as *u64)
+}
+
+// The 4 bytes at p[i..i + 4]; the caller guarantees that they are
+// readable.
+#[inline]
+unsafe fn fold_read32(p: *u8, i: i64) -> u64 {
+    *(&p[i] as *u32) as u64
+}
+
+// foldhash's hash of 0 to 16 bytes into the accumulator.
+#[inline]
+fn fold_bytes_short(s: [u8], acc: u64, s1: u64) -> u64 {
+    let n = s.len;
+    let p = s.ptr;
+    var a = acc;
+    var b = s1;
+    // (every read is of the n bytes of s, a valid slice)
+    unsafe {
+        if n >= 8 {
+            a ^= fold_read64(p, 0);
+            b ^= fold_read64(p, n - 8);
+        } else if n >= 4 {
+            a ^= fold_read32(p, 0);
+            b ^= fold_read32(p, n - 4);
+        } else if n > 0 {
+            a ^= p[0] as u64;
+            b ^= ((p[n - 1] as u64) << 8) | p[n >> 1] as u64;
+        }
+    }
+    fold_mul(a, b)
+}
+
+// foldhash's hash of more than 16 bytes into the accumulator. (Every read
+// is within v: above 256 bytes the first loop reads 96, above 128 the
+// second 64, and the end reads from 16 to 64 of the 17 at least left.)
+#[inline(never)]
+fn fold_bytes_long(s: [u8], acc: u64, seeds: FoldSeeds) -> u64 {
+    let k = seeds.s0;
+    var v = s;
+    var s0 = acc;
+    var s1 = acc + seeds.s1;
+    if v.len > 128 {
+        var s2 = acc + seeds.s2;
+        var s3 = acc + seeds.s3;
+        if v.len > 256 {
+            var s4 = acc + seeds.s4;
+            var s5 = acc + seeds.s5;
+            for _ in 0..v.len / 96 {
+                unsafe {
+                    s0 = fold_mul(fold_read64(v.ptr, 0) ^ s0, fold_read64(v.ptr, 48) ^ k);
+                    s1 = fold_mul(fold_read64(v.ptr, 8) ^ s1, fold_read64(v.ptr, 56) ^ k);
+                    s2 = fold_mul(fold_read64(v.ptr, 16) ^ s2, fold_read64(v.ptr, 64) ^ k);
+                    s3 = fold_mul(fold_read64(v.ptr, 24) ^ s3, fold_read64(v.ptr, 72) ^ k);
+                    s4 = fold_mul(fold_read64(v.ptr, 32) ^ s4, fold_read64(v.ptr, 80) ^ k);
+                    s5 = fold_mul(fold_read64(v.ptr, 40) ^ s5, fold_read64(v.ptr, 88) ^ k);
+                }
+                v = v[96..];
+                if v.len <= 256 {
+                    break;
+                }
+            }
+            s0 ^= s4;
+            s1 ^= s5;
+        }
+        for _ in 0..v.len / 64 {
+            unsafe {
+                s0 = fold_mul(fold_read64(v.ptr, 0) ^ s0, fold_read64(v.ptr, 32) ^ k);
+                s1 = fold_mul(fold_read64(v.ptr, 8) ^ s1, fold_read64(v.ptr, 40) ^ k);
+                s2 = fold_mul(fold_read64(v.ptr, 16) ^ s2, fold_read64(v.ptr, 48) ^ k);
+                s3 = fold_mul(fold_read64(v.ptr, 24) ^ s3, fold_read64(v.ptr, 56) ^ k);
+            }
+            v = v[64..];
+            if v.len <= 128 {
+                break;
+            }
+        }
+        s0 ^= s2;
+        s1 ^= s3;
+    }
+    let n = v.len;
+    unsafe {
+        s0 = fold_mul(fold_read64(v.ptr, 0) ^ s0, fold_read64(v.ptr, n - 16) ^ k);
+        s1 = fold_mul(fold_read64(v.ptr, 8) ^ s1, fold_read64(v.ptr, n - 8) ^ k);
+        if n >= 32 {
+            s0 = fold_mul(fold_read64(v.ptr, 16) ^ s0, fold_read64(v.ptr, n - 32) ^ k);
+            s1 = fold_mul(fold_read64(v.ptr, 24) ^ s1, fold_read64(v.ptr, n - 24) ^ k);
+            if n >= 64 {
+                s0 = fold_mul(fold_read64(v.ptr, 32) ^ s0, fold_read64(v.ptr, n - 48) ^ k);
+                s1 = fold_mul(fold_read64(v.ptr, 40) ^ s1, fold_read64(v.ptr, n - 40) ^ k);
+                if n >= 96 {
+                    s0 = fold_mul(fold_read64(v.ptr, 48) ^ s0, fold_read64(v.ptr, n - 64) ^ k);
+                    s1 = fold_mul(fold_read64(v.ptr, 56) ^ s1, fold_read64(v.ptr, n - 56) ^ k);
+                }
+            }
+        }
+    }
+    s0 ^ s1
+}
+
+// A hasher: bytes and integers written in, a u64 out (`finish`). Its
+// methods are the Hasher trait's (std::hash, A0).
+pub struct FoldHasher {
+    acc: u64,
+    // integers written since the last multiply, 128 bits at most
+    sponge_lo: u64,
+    sponge_hi: u64,
+    sponge_len: i64,
+    seeds: FoldSeeds,
+}
+
+impl FoldHasher {
+    // A hasher with the per-hasher seed `seed` and the shared seeds.
+    #[inline]
+    pub fn with_seeds(seed: u64, seeds: FoldSeeds) -> FoldHasher {
+        FoldHasher { acc: seed, sponge_lo: 0, sponge_hi: 0, sponge_len: 0, seeds: seeds }
+    }
+
+    // `bits` bits of x into the sponge, multiplied in when it is full.
+    #[inline]
+    fn write_num(inout self, x: u64, bits: i64) {
+        if self.sponge_len + bits > 128 {
+            self.acc = fold_mul(self.sponge_lo ^ self.acc, self.sponge_hi ^ self.seeds.s0);
+            self.sponge_lo = x;
+            self.sponge_hi = 0;
+            self.sponge_len = bits;
+        } else {
+            if self.sponge_len < 64 {
+                self.sponge_lo |= x << self.sponge_len as u64;
+                if self.sponge_len > 0 && self.sponge_len + bits > 64 {
+                    self.sponge_hi |= x >> (64 - self.sponge_len) as u64;
+                }
+            } else {
+                self.sponge_hi |= x << (self.sponge_len - 64) as u64;
+            }
+            self.sponge_len += bits;
+        }
+    }
+
+    #[inline]
+    pub fn write(inout self, bytes: [u8]) {
+        self.acc = fold_rotate_right(self.acc, bytes.len);
+        if bytes.len <= 16 {
+            self.acc = fold_bytes_short(bytes, self.acc, self.seeds.s1);
+        } else {
+            self.acc = fold_bytes_long(bytes, self.acc, self.seeds);
+        }
+    }
+
+    #[inline]
+    pub fn write_u8(inout self, x: u8) {
+        self.write_num(x as u64, 8);
+    }
+
+    #[inline]
+    pub fn write_u16(inout self, x: u16) {
+        self.write_num(x as u64, 16);
+    }
+
+    #[inline]
+    pub fn write_u32(inout self, x: u32) {
+        self.write_num(x as u64, 32);
+    }
+
+    #[inline]
+    pub fn write_u64(inout self, x: u64) {
+        self.write_num(x, 64);
+    }
+
+    #[inline]
+    pub fn write_i64(inout self, x: i64) {
+        self.write_num(x as u64, 64);
+    }
+
+    // The hash of what was written.
+    #[inline]
+    pub fn finish(self) -> u64 {
+        if self.sponge_len > 0 {
+            fold_mul(self.sponge_lo ^ self.acc, self.sponge_hi ^ self.seeds.s0)
+        } else {
+            self.acc
+        }
+    }
+}
+
+// The hash of the bytes s with the per-hasher seed `seed` and the shared
+// seeds: what a FoldHasher computes for `write_u64(s.len)`, `write(s)`,
+// `finish()` (Hash for [u8]), without one.
+#[inline]
+pub fn fold_hash_bytes(seed: u64, seeds: FoldSeeds, s: [u8]) -> u64 {
+    let acc = fold_rotate_right(seed, s.len);
+    let h = if s.len <= 16 { fold_bytes_short(s, acc, seeds.s1) }
+        else { fold_bytes_long(s, acc, seeds) };
+    fold_mul(s.len as u64 ^ h, seeds.s0)
+}
+
+// foldhash's fixed seeds, for the long inputs of fold_hash_bytes_fixed.
+static FOLD_FIXED_SEEDS: FoldSeeds = FoldSeeds {
+    s0: 0xc0ac29b7c97c50dd,
+    s1: 0x3f84d5b5b5470917,
+    s2: 0x9216d5d98979fb1b,
+    s3: 0xd1310ba698dfb5ac,
+    s4: 0x2ffd72dbd01adfb7,
+    s5: 0xb8e1afed6a267e96,
+};
+
+// fold_hash_bytes with the fixed seeds (FixedState's), its constants in
+// the code.
+#[inline]
+pub fn fold_hash_bytes_fixed(seed: u64, s: [u8]) -> u64 {
+    let acc = fold_rotate_right(seed, s.len);
+    let h = if s.len <= 16 {
+        fold_bytes_short(s, acc, 0x3f84d5b5b5470917)
+    } else {
+        fold_bytes_long(s, acc, FOLD_FIXED_SEEDS)
+    };
+    fold_mul(s.len as u64 ^ h, 0xc0ac29b7c97c50dd)
+}
+
+// FixedState's hash of the u64 x: `write_u64(x)`, `finish()` of a
+// FoldHasher with the fixed seeds (one folded multiply).
+#[inline]
+pub fn fold_hash_u64_fixed(x: u64) -> u64 {
+    fold_mul(x ^ FOLD_ARBITRARY3, 0xc0ac29b7c97c50dd)
+}

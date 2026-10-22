@@ -24,7 +24,7 @@
 #   --debugger     also check debug information with gdb (tests/debug.sh)
 #   --cpus N       the container's CPUs (default 8, at most docker's)
 #   --fresh        without the cache: the chain's built releases are kept
-#                  in a docker volume (tachyon-bootstrap-x86_64-linux),
+#                  in a docker volume (vole-bootstrap-x86_64-linux),
 #                  by tag and commit as bootstrap.sh caches them, so a
 #                  rerun rebuilds only HEAD; --fresh builds everything
 #                  (with --history full: a complete replay)
@@ -40,9 +40,9 @@ LC_ALL=C
 export LC_ALL
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-IMAGE=tachyon-bootstrap:linux-x86_64
+IMAGE=vole-bootstrap:linux-x86_64
 PLATFORM=linux/amd64
-VOLUME=tachyon-bootstrap-x86_64-linux
+VOLUME=vole-bootstrap-x86_64-linux
 WORKTREE=0
 SEED_TESTS=0
 ALL_LEVELS=0
@@ -97,7 +97,7 @@ clamp_cpus
 ensure_image "$IMAGE" "$PLATFORM" "$ROOT/bootstrap/ci/linux-x86_64.Dockerfile" \
     "$ROOT/seed/rust-toolchain.toml" "$ROOT/seed/Cargo.toml" "$ROOT/seed/Cargo.lock"
 
-SNAP=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-linux-check.XXXXXX")
+SNAP=$(mktemp -d "${TMPDIR:-/tmp}/vole-linux-check.XXXXXX")
 trap 'stop_container; rm -rf "$SNAP"' EXIT
 trap 'exit 130' INT TERM
 
@@ -116,8 +116,8 @@ tar -C "$SNAP" -c -f - src | docker run --rm -i --name "$CONTAINER" --cpus "$CPU
     set -eu
     mkdir /work
     tar -x --no-same-owner -f - -C /work
-    git clone --quiet /work/src /work/tachyon
-    cd /work/tachyon
+    git clone --quiet /work/src /work/vole
+    cd /work/vole
     echo "==> on $(uname -s) $(uname -m): $(cc --version | head -1), $(git --version)" >&2
     # A row of the table bootstrap/gate.sh prints: step, result, seconds, note.
     row() { printf "gate-row\t%s\t%s\t%s\t%s\n" "$@"; }
@@ -136,18 +136,18 @@ tar -C "$SNAP" -c -f - src | docker run --rm -i --name "$CONTAINER" --cpus "$CPU
         echo "--- chain: FAIL"; tail -40 /tmp/chain.log
         exit 1
     fi
-    sed -n "/^tachyon bootstrap on/,\$p" /tmp/chain.log
+    sed -n "/^vole bootstrap on/,\$p" /tmp/chain.log
     echo "chain: $(( $(date +%s) - start ))s"
     row chain pass $(( $(date +%s) - start )) "$(awk "/^  head / { sub(/^  head +/, \"\"); print; exit }" /tmp/chain.log)"
     start=$(date +%s)
     head -c 3000000 /dev/urandom >/tmp/random
-    ./target/tachyonc examples/md5/main.tach -o /tmp/md5.o
+    ./target/volec examples/md5/main.vl -o /tmp/md5.o
     cc -o /tmp/md5 /tmp/md5.o -lm
     got=$(/tmp/md5 </tmp/random)
     want=$(md5sum </tmp/random | cut -d" " -f1)
     if [ "$got" != "$want" ]; then
-        row md5 FAIL $(( $(date +%s) - start )) "tachyon $got, md5sum $want"
-        echo "--- md5: FAIL: tachyon $got, md5sum $want"
+        row md5 FAIL $(( $(date +%s) - start )) "vole $got, md5sum $want"
+        echo "--- md5: FAIL: vole $got, md5sum $want"
         exit 1
     fi
     echo "md5 example: $got, same as md5sum"
@@ -163,7 +163,7 @@ tar -C "$SNAP" -c -f - src | docker run --rm -i --name "$CONTAINER" --cpus "$CPU
     if [ -n "$steps" ]; then
         seed=$(ls -d "$boot"/seed-*/target/release/tachyon "$boot"/seed-worktree/target/release/tachyon 2>/dev/null | head -1) || true
         echo "==> the checks:$(echo "$steps" | tr "," " ")" >&2
-        sh bootstrap/gate.sh --inside -c target/tachyonc -j "$CPUS" --only "${steps#,}" \
+        sh bootstrap/gate.sh --inside -c target/volec -j "$CPUS" --only "${steps#,}" \
             --fuzz "$([ "$FUZZ" = 0 ] && echo 1 || echo "$FUZZ")" --abi "$([ "$ABI" = 0 ] && echo 1 || echo "$ABI")" \
             ${seed:+--seed "$seed"} || status=1
     fi
@@ -185,7 +185,7 @@ tar -C "$SNAP" -c -f - src | docker run --rm -i --name "$CONTAINER" --cpus "$CPU
     if [ "$SEED_TESTS" = 1 ]; then
         echo "==> the seed'"'"'s own tests (cargo test)" >&2
         start=$(date +%s)
-        if (cd seed && TACHYON_REQUIRE_RUN=1 cargo test --locked --no-fail-fast) >/tmp/seed-tests.log 2>&1; then
+        if (cd seed && VOLE_REQUIRE_RUN=1 cargo test --locked --no-fail-fast) >/tmp/seed-tests.log 2>&1; then
             grep -E "^test result|^  [a-z_/0-9.-]+ +[0-9]+ +[0-9]+ +[0-9]+$" /tmp/seed-tests.log || true
             row seed-tests pass $(( $(date +%s) - start )) "cargo test"
         else

@@ -1,0 +1,1149 @@
+// std::cli (0.24, docs/design/cli.md, guide cli): a command-line parser,
+// clap's builder without derive (the overview: below the first banner).
+
+use std::{Allocator, Buf, Display, Fmt, Gpa, Iterator, Option, Result, Vec, arena_scope};
+use std::string::{FromStr, str};
+
+// ---- Arguments and commands (0.24) ----
+
+// A Command lists its arguments (flags, options with a value,
+// positionals) and subcommands; `cmd.parse(args)`
+// gives the Matches, or a CliError that `cmd.exit(e)` prints with the
+// usage line (exit code 2; 0 for --help and --version).
+//
+//     let cmd = Command::new_in("grep", gpa).version("1.0")
+//         .arg(Arg::flag("count").short('c').help("count the matches"))
+//         .arg(Arg::option("max").short('m').value_name("N").default("0"))
+//         .arg(Arg::positional("pattern").required())
+//         .arg(Arg::positional("file").multiple());
+//     let m = cmd.parse_or_exit(env::args());
+//     let n = m.get_as::<i64>("max").unwrap_or(0);
+//
+// Accepted: `-v`, `-vvv` (m.count), `-abc` (a cluster of short flags;
+// an option in it takes the rest, `-ofile`), `-o FILE`, `--out FILE`,
+// `--out=FILE`, `--` (everything after it is positional), `-` (a
+// positional). An option takes the next argument as its value even when
+// it starts with '-' (`--n -5`). An option given twice keeps both values
+// (m.values; m.get: the last). A positional takes one value, or every one
+// left with `.multiple()`. A subcommand's name ends its parent's
+// arguments; its own follow.
+//
+// Parsing is pure but for its allocation: the definition is on the Gpa
+// given to Command::new_in, the Matches on the Gpa or on the allocator
+// given to parse_in (an arena: `arena_scope(gpa, |a| { let m =
+// cmd.parse_in(args, a)?; .. })`). Help and error text are built in a
+// scoped arena when cmd.exit prints them. Only exit and parse_or_exit do
+// io.
+
+const FLAG: i64 = 0;
+const OPTION: i64 = 1;
+const POSITIONAL: i64 = 2;
+
+// One argument of a command: a flag (`-v`, `--verbose`), an option with a
+// value (`-o FILE`, `--out FILE`, `--out=FILE`) or a positional, made by
+// Arg::flag, Arg::option or Arg::positional; each method returns the
+// changed Arg. Its name is what Matches asks for (`m.flag("verbose")`);
+// a flag's or option's long form is its name unless `.long(..)`.
+pub struct Arg {
+    name: str,
+    kind: i64,
+    short: u8,
+    long: str,
+    help: str,
+    value_name: str,
+    default: str,
+    has_default: bool,
+    required: bool,
+    multiple: bool,
+    cmd: i64,
+}
+
+impl Arg {
+    fn make(name: str, kind: i64) -> Arg {
+        var long: str = name;
+        if kind == POSITIONAL {
+            long = "";
+        }
+        Arg {
+            name: name, kind: kind, short: 0, long: long, help: "", value_name: "",
+            default: "", has_default: false, required: false, multiple: false, cmd: 0,
+        }
+    }
+
+    // A flag, `--NAME` (and `.short('x')`): m.flag(name), m.count(name).
+    pub fn flag(name: str) -> Arg {
+        Arg::make(name, FLAG)
+    }
+
+    // An option with a value, `--NAME VALUE` or `--NAME=VALUE`: m.get(name).
+    pub fn option(name: str) -> Arg {
+        Arg::make(name, OPTION)
+    }
+
+    // A positional argument, in the order of the command's `.arg` calls.
+    pub fn positional(name: str) -> Arg {
+        Arg::make(name, POSITIONAL)
+    }
+
+    // Its one-letter form, `-c`.
+    pub fn short(sink self, c: u8) -> Arg {
+        self.short = c;
+        self
+    }
+
+    // Its long form, `--s`, instead of its name (`""`: none).
+    pub fn long(sink self, s: str) -> Arg {
+        self.long = s;
+        self
+    }
+
+    // Its line in the help.
+    pub fn help(sink self, s: str) -> Arg {
+        self.help = s;
+        self
+    }
+
+    // The name of an option's value in the help, `--out <FILE>` (the name
+    // in capitals by default).
+    pub fn value_name(sink self, s: str) -> Arg {
+        self.value_name = s;
+        self
+    }
+
+    // The value when it is not given (m.get gives it; m.flag stays false).
+    pub fn default(sink self, s: str) -> Arg {
+        self.default = s;
+        self.has_default = true;
+        self
+    }
+
+    // An error when it is not given.
+    pub fn required(sink self) -> Arg {
+        self.required = true;
+        self
+    }
+
+    // A positional that takes every value left (m.values).
+    pub fn multiple(sink self) -> Arg {
+        self.multiple = true;
+        self
+    }
+}
+
+// A command of the tree: its subcommands are those whose parent it is.
+struct Cmd {
+    name: str,
+    about: str,
+    version: str,
+    parent: i64,
+}
+
+// A program's command line: its name, arguments and subcommands. The
+// tree is kept flat, every command in `cmds` (the first is this one) and
+// every argument in `args` with its command's index.
+pub struct Command {
+    cmds: Vec<Cmd>,
+    args: Vec<Arg>,
+    width: i64,
+    gpa: Gpa,
+}
+
+impl Command {
+    // A command named name, its definition on gpa.
+    pub fn new_in(name: str, gpa: Gpa) -> Command {
+        var cmds: Vec<Cmd> = Vec::new_in(gpa);
+        cmds.push(Cmd { name: name, about: "", version: "", parent: -1 });
+        Command { cmds: cmds, args: Vec::new_in(gpa), width: 80, gpa: gpa }
+    }
+
+    // The help's line under the name.
+    pub fn about(sink self, s: str) -> Command {
+        self.cmds[0].about = s;
+        self
+    }
+
+    // Its version: `--version` (and `-V`) print `NAME VERSION`.
+    pub fn version(sink self, s: str) -> Command {
+        self.cmds[0].version = s;
+        self
+    }
+
+    // The help's width in columns (80).
+    pub fn width(sink self, n: i64) -> Command {
+        self.width = n;
+        self
+    }
+
+    // Adds an argument.
+    pub fn arg(sink self, a: Arg) -> Command {
+        var x = a;
+        x.cmd = 0;
+        self.args.push(x);
+        self
+    }
+
+    // Adds a subcommand: `prog NAME ...`, m.subcommand().
+    pub fn subcommand(sink self, sub: sink Command) -> Command {
+        let base = self.cmds.len();
+        for i in 0..sub.cmds.len() {
+            var c = sub.cmds[i];
+            c.parent = if c.parent < 0 { 0 } else { c.parent + base };
+            self.cmds.push(c);
+        }
+        for i in 0..sub.args.len() {
+            var a = sub.args[i];
+            a.cmd = a.cmd + base;
+            self.args.push(a);
+        }
+        self
+    }
+
+    // The subcommand of c named name, or -1.
+    fn sub_named(self, c: i64, name: str) -> i64 {
+        for i in 1..self.cmds.len() {
+            if self.cmds[i].parent == c && self.cmds[i].name == name {
+                return i;
+            }
+        }
+        -1
+    }
+
+    fn has_subs(self, c: i64) -> bool {
+        for i in 1..self.cmds.len() {
+            if self.cmds[i].parent == c {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// ---- Parsing (0.24) ----
+
+// What went wrong, or what was asked instead of a run: --help and
+// --version are CliErrors too, whose exit code is 0.
+#[derive(Eq, Debug, Clone)]
+pub enum CliErrorKind {
+    Help,
+    Version,
+    UnknownOption,
+    UnknownCommand,
+    UnexpectedArgument,
+    MissingValue,
+    FlagValue,
+    MissingRequired,
+    InvalidValue,
+}
+
+// An error of parse (or Matches::get_as): Display gives its two lines,
+// `error: ...` and `try: ...`; cmd.exit(e) prints them with the usage line
+// (or the help, the version) and exits with e.exit_code().
+pub struct CliError {
+    pub kind: CliErrorKind,
+    // the argument as given ('--outt', '-vx', the bad value)
+    pub text: str,
+    // the command it is about (cmd.render_in prints its usage)
+    cmd: i64,
+    // an unknown short option inside a cluster (`-x` of `-vx`)
+    short: u8,
+    // the argument it is about
+    arg: Arg,
+    // did you mean: a long option (`--` before it) or a command
+    hint: str,
+    hint_long: bool,
+}
+
+impl CliError {
+    fn new(kind: CliErrorKind, cmd: i64, text: str) -> CliError {
+        CliError {
+            kind: kind, text: text, cmd: cmd, short: 0, arg: Arg::make("", FLAG), hint: "",
+            hint_long: false,
+        }
+    }
+
+    fn of(kind: CliErrorKind, cmd: i64, text: str, a: Arg) -> CliError {
+        var e = CliError::new(kind, cmd, text);
+        e.arg = a;
+        e
+    }
+
+    // 0 for --help and --version, else 2 (a usage error, as clap's).
+    pub fn exit_code(self) -> i32 {
+        match self.kind {
+            CliErrorKind::Help => 0,
+            CliErrorKind::Version => 0,
+            _ => 2,
+        }
+    }
+}
+
+// How an argument is written: `--out <FILE>`, `-o <FILE>`, `--verbose`,
+// `<input>`, `<file>...`.
+struct Spell {
+    a: Arg,
+}
+
+impl Display for Spell {
+    fn fmt(self, f: inout Fmt) {
+        let a = self.a;
+        if a.kind == POSITIONAL {
+            f.byte('<');
+            f.str(a.name);
+            f.byte('>');
+            if a.multiple {
+                f.str("...");
+            }
+            return;
+        }
+        if a.long.len() > 0 {
+            f.str("--");
+            f.str(a.long);
+        } else {
+            f.byte('-');
+            f.byte(a.short);
+        }
+        if a.kind == OPTION {
+            f.byte(' ');
+            f.display(ValueName { a: a });
+        }
+    }
+}
+
+// `<FILE>`: an option's value name, or its name in capitals.
+struct ValueName {
+    a: Arg,
+}
+
+impl Display for ValueName {
+    fn fmt(self, f: inout Fmt) {
+        f.byte('<');
+        if self.a.value_name.len() > 0 {
+            f.str(self.a.value_name);
+        } else {
+            for c in self.a.name.bytes() {
+                f.byte(if c >= 'a' && c <= 'z' { c - 32 } else if c == '-' { '_' } else { c });
+            }
+        }
+        f.byte('>');
+    }
+}
+
+impl Display for CliError {
+    fn fmt(self, f: inout Fmt) {
+        let sp = Spell { a: self.arg };
+        match self.kind {
+            CliErrorKind::Help => f.str("help requested: cmd.exit(e) prints it"),
+            CliErrorKind::Version => f.str("version requested: cmd.exit(e) prints it"),
+            CliErrorKind::UnknownOption => {
+                f.str("error: unknown option '");
+                if self.short != 0 {
+                    f.byte('-');
+                    f.byte(self.short);
+                    if self.text.len() > 2 {
+                        f.str("' in '");
+                        f.str(self.text);
+                    }
+                } else {
+                    f.str(self.text);
+                }
+                f.str("'\ntry: ");
+                if self.hint.len() > 0 {
+                    if self.hint_long {
+                        f.str("--");
+                    }
+                    f.str(self.hint);
+                } else {
+                    f.str("--help");
+                }
+            }
+            CliErrorKind::UnknownCommand => {
+                f.str("error: unknown command '");
+                f.str(self.text);
+                f.str("'\ntry: ");
+                f.str(if self.hint.len() > 0 { self.hint } else { "--help" });
+            }
+            CliErrorKind::UnexpectedArgument => {
+                f.str("error: unexpected argument '");
+                f.str(self.text);
+                f.str("'\ntry: --help");
+            }
+            CliErrorKind::MissingValue => {
+                f.str("error: option '");
+                if self.short != 0 {
+                    f.byte('-');
+                    f.byte(self.short);
+                } else {
+                    f.str(self.text);
+                }
+                f.str("' needs a value\ntry: ");
+                f.display(sp);
+            }
+            CliErrorKind::FlagValue => {
+                f.str("error: flag '");
+                f.display(sp);
+                f.str("' takes no value\ntry: ");
+                f.display(sp);
+            }
+            CliErrorKind::MissingRequired => {
+                f.str(if self.arg.kind == POSITIONAL { "error: missing argument '" }
+                    else { "error: missing option '" });
+                f.display(sp);
+                f.str("'\ntry: ");
+                f.display(sp);
+            }
+            CliErrorKind::InvalidValue => {
+                f.str("error: invalid value '");
+                f.str(self.text);
+                f.str("' for '");
+                f.display(sp);
+                f.str("'\ntry: ");
+                f.display(sp);
+            }
+        }
+    }
+}
+
+// The edit distance of a and b: insertions, deletions, substitutions and
+// swaps of two neighbours (`--nmae` is 1 from `--name`); 64 beyond 63
+// bytes.
+fn distance(a: [u8], b: [u8]) -> i64 {
+    if a.len > 63 || b.len > 63 {
+        return 64;
+    }
+    var prev2: [i64; 64] = [0; 64];
+    var prev: [i64; 64] = [0; 64];
+    var cur: [i64; 64] = [0; 64];
+    for j in 0..b.len + 1 {
+        prev[j] = j;
+    }
+    for i in 1..a.len + 1 {
+        cur[0] = i;
+        for j in 1..b.len + 1 {
+            var best = prev[j - 1] + if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            if prev[j] + 1 < best {
+                best = prev[j] + 1;
+            }
+            if cur[j - 1] + 1 < best {
+                best = cur[j - 1] + 1;
+            }
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1]
+                && prev2[j - 2] + 1 < best {
+                best = prev2[j - 2] + 1;
+            }
+            cur[j] = best;
+        }
+        for j in 0..b.len + 1 {
+            prev2[j] = prev[j];
+            prev[j] = cur[j];
+        }
+    }
+    prev[b.len]
+}
+
+// Whether a candidate at distance d from word is worth suggesting.
+fn near(d: i64, word: [u8]) -> bool {
+    let most = if word.len / 3 > 1 { word.len / 3 } else { 1 };
+    d <= most
+}
+
+impl Command {
+    // The long option of c nearest to word: its name, or "".
+    fn near_long(self, c: i64, word: str) -> str {
+        var best: str = "";
+        var bd = 64;
+        for i in 0..self.args.len() {
+            let a = self.args[i];
+            if a.cmd == c && a.kind != POSITIONAL && a.long.len() > 0 {
+                let d = distance(word, a.long);
+                if d < bd {
+                    bd = d;
+                    best = a.long;
+                }
+            }
+        }
+        let builtin: [str; 2] = ["help", "version"];
+        for k in 0..2 {
+            if k == 1 && self.cmds[c].version.len() == 0 {
+                continue;
+            }
+            let d = distance(word, builtin[k]);
+            if d < bd {
+                bd = d;
+                best = builtin[k];
+            }
+        }
+        if near(bd, word) { best } else { "" }
+    }
+
+    // The subcommand of c nearest to word: its name, or "".
+    fn near_sub(self, c: i64, word: str) -> str {
+        var best: str = "";
+        var bd = 64;
+        for i in 1..self.cmds.len() {
+            if self.cmds[i].parent == c {
+                let d = distance(word, self.cmds[i].name);
+                if d < bd {
+                    bd = d;
+                    best = self.cmds[i].name;
+                }
+            }
+        }
+        if near(bd, word) { best } else { "" }
+    }
+
+    // The argument of c with long form name (not a positional), or -1.
+    fn find_long(self, c: i64, name: str) -> i64 {
+        for i in 0..self.args.len() {
+            let a = self.args[i];
+            if a.cmd == c && a.kind != POSITIONAL && a.long.len() > 0 && a.long == name {
+                return i;
+            }
+        }
+        -1
+    }
+
+    // The argument of c with short form ch, or -1.
+    fn find_short(self, c: i64, ch: u8) -> i64 {
+        for i in 0..self.args.len() {
+            let a = self.args[i];
+            if a.cmd == c && a.kind != POSITIONAL && a.short != 0 && a.short == ch {
+                return i;
+            }
+        }
+        -1
+    }
+
+    // Parses args (the program's name first, as env::args() gives them),
+    // the Matches on the command's Gpa.
+    #[no_io]
+    pub fn parse<I: Iterator<Item = str>>(self, args: sink I) -> Result<Matches, CliError> {
+        self.parse_in(args, self.gpa)
+    }
+
+    // Parses args, the Matches on allocator a.
+    #[no_io]
+    pub fn parse_in<I: Iterator<Item = str>, A: Allocator>(self, args: sink I, a: A)
+        -> Result<Matches<A>, CliError> {
+        var it = args;
+        let _ = it.next();
+        var m: Matches<A> = Matches {
+            slots: Vec::new_in(a), owner: Vec::new_in(a), texts: Vec::new_in(a),
+            names: Vec::new_in(a), cmds: Vec::new_in(a), level: 0,
+        };
+        var cur = 0;
+        m.enter(self, 0);
+        var npos = 0;
+        var dashdash = false;
+        // the slot an option waits for its value in, and how it was written
+        var pending = -1;
+        var pending_text: str = "";
+        var pending_short: u8 = 0;
+        // a required argument missing: reported at the end, so that a
+        // later --help still prints the help
+        var late = CliError::new(CliErrorKind::Help, 0, "");
+        var has_late = false;
+        loop {
+            let tok = match it.next() {
+                Option::Some(t) => t,
+                Option::None => break,
+            };
+            if pending >= 0 {
+                m.push(pending, tok);
+                pending = -1;
+                continue;
+            }
+            let b = tok.as_bytes();
+            if dashdash || b.len < 2 || b[0] != '-' {
+                // a positional, or a subcommand's name
+                if !dashdash {
+                    let sub = self.sub_named(cur, tok);
+                    if sub >= 0 {
+                        match m.finish(cur) {
+                            Err(e) => if !has_late {
+                                late = e;
+                                has_late = true;
+                            },
+                            Ok(_) => {}
+                        }
+                        cur = sub;
+                        m.enter(self, sub);
+                        npos = 0;
+                        continue;
+                    }
+                }
+                let s = m.positional(npos);
+                if s >= 0 {
+                    m.push(s, tok);
+                    if !m.slots[s].arg.multiple {
+                        npos += 1;
+                    }
+                    continue;
+                }
+                if self.has_subs(cur) {
+                    var e = CliError::new(CliErrorKind::UnknownCommand, cur, tok);
+                    e.hint = self.near_sub(cur, tok);
+                    return Err(e);
+                }
+                return Err(CliError::new(CliErrorKind::UnexpectedArgument, cur, tok));
+            }
+            if tok == "--" {
+                dashdash = true;
+                continue;
+            }
+            if b[1] == '-' {
+                // --name, --name=value
+                let body = tok.strip_prefix("--").unwrap();
+                var name = body;
+                var value: str = "";
+                var has_value = false;
+                match body.split_once('=') {
+                    Option::Some((n, v)) => {
+                        name = n;
+                        value = v;
+                        has_value = true;
+                    }
+                    Option::None => {}
+                }
+                let i = self.find_long(cur, name);
+                if i < 0 {
+                    if name == "help" {
+                        return Err(CliError::new(CliErrorKind::Help, cur, tok));
+                    }
+                    if name == "version" && self.cmds[cur].version.len() > 0 {
+                        return Err(CliError::new(CliErrorKind::Version, cur, tok));
+                    }
+                    let shown = if has_value { tok.split_once('=').unwrap().0 } else { tok };
+                    var e = CliError::new(CliErrorKind::UnknownOption, cur, shown);
+                    e.hint = self.near_long(cur, name);
+                    e.hint_long = true;
+                    return Err(e);
+                }
+                let s = m.slot_of(i);
+                let a = self.args[i];
+                if a.kind == FLAG {
+                    if has_value {
+                        return Err(CliError::of(CliErrorKind::FlagValue, cur, tok, a));
+                    }
+                    m.slots[s].count += 1;
+                } else if has_value {
+                    m.push(s, value);
+                } else {
+                    pending = s;
+                    pending_text = tok;
+                    pending_short = 0;
+                }
+                continue;
+            }
+            // -abc: short flags, the last may be an option (-ofile, -o file)
+            var j = 1;
+            while j < b.len {
+                let ch = b[j];
+                let i = self.find_short(cur, ch);
+                if i < 0 {
+                    if ch == 'h' {
+                        return Err(CliError::new(CliErrorKind::Help, cur, tok));
+                    }
+                    if ch == 'V' && self.cmds[cur].version.len() > 0 {
+                        return Err(CliError::new(CliErrorKind::Version, cur, tok));
+                    }
+                    var e = CliError::new(CliErrorKind::UnknownOption, cur, tok);
+                    e.short = ch;
+                    // `-verbose` for `--verbose`
+                    if b.len > 2 {
+                        let word = tok.strip_prefix("-").unwrap();
+                        if self.find_long(cur, word) >= 0 {
+                            e.hint = word;
+                        } else {
+                            e.hint = self.near_long(cur, word);
+                        }
+                        e.hint_long = e.hint.len() > 0;
+                    }
+                    return Err(e);
+                }
+                let s = m.slot_of(i);
+                if self.args[i].kind == FLAG {
+                    m.slots[s].count += 1;
+                    j += 1;
+                    continue;
+                }
+                // (after an ASCII byte: UTF-8)
+                var rest = str::from_utf8(b[j + 1..]).unwrap_or("");
+                match rest.strip_prefix("=") {
+                    Option::Some(r) => rest = r,
+                    Option::None => {}
+                }
+                if rest.len() > 0 {
+                    m.push(s, rest);
+                } else {
+                    pending = s;
+                    pending_text = tok;
+                    pending_short = ch;
+                }
+                break;
+            }
+        }
+        if pending >= 0 {
+            var e = CliError::of(CliErrorKind::MissingValue, cur, pending_text,
+                m.slots[pending].arg);
+            e.short = pending_short;
+            return Err(e);
+        }
+        if has_late {
+            return Err(late);
+        }
+        m.finish(cur)?;
+        m.group();
+        Ok(m)
+    }
+}
+
+// ---- Matches (0.24) ----
+
+// An argument of a matched command: how many times it was given, and
+// (after parse) where its values are in Matches.texts.
+struct Slot {
+    level: i64,
+    index: i64,
+    arg: Arg,
+    count: i64,
+    start: i64,
+    len: i64,
+}
+
+// What parse found: for the command and each subcommand on the line (a
+// level each), every argument's count and values. `m.subcommand()` gives
+// the next level's Matches.
+pub struct Matches<A: Allocator = Gpa> {
+    slots: Vec<Slot, A>,
+    // while parsing, the slot of each value; texts: the values
+    owner: Vec<i64, A>,
+    texts: Vec<str, A>,
+    // each level's command: its name and index
+    names: Vec<str, A>,
+    cmds: Vec<i64, A>,
+    level: i64,
+}
+
+impl<A: Allocator> Matches<A> {
+    // A new level for command c: a slot for each of its arguments.
+    fn enter(inout self, cmd: Command, c: i64) {
+        self.level = self.names.len();
+        self.names.push(cmd.cmds[c].name);
+        self.cmds.push(c);
+        for i in 0..cmd.args.len() {
+            if cmd.args[i].cmd == c {
+                self.slots.push(Slot {
+                    level: self.level, index: i, arg: cmd.args[i], count: 0, start: 0, len: 0,
+                });
+            }
+        }
+    }
+
+    // The slot of argument i on the last level.
+    fn slot_of(self, i: i64) -> i64 {
+        for s in 0..self.slots.len() {
+            if self.slots[s].level == self.level && self.slots[s].index == i {
+                return s;
+            }
+        }
+        -1
+    }
+
+    // The slot of the k-th positional of the last level, or -1.
+    fn positional(self, k: i64) -> i64 {
+        var n = 0;
+        for s in 0..self.slots.len() {
+            if self.slots[s].level == self.level && self.slots[s].arg.kind == POSITIONAL {
+                if n == k {
+                    return s;
+                }
+                n += 1;
+            }
+        }
+        -1
+    }
+
+    fn push(inout self, s: i64, text: str) {
+        self.slots[s].count += 1;
+        self.owner.push(s);
+        self.texts.push(text);
+    }
+
+    // The end of command c's arguments: the defaults, the required ones.
+    fn finish(inout self, c: i64) -> Result<(), CliError> {
+        for s in 0..self.slots.len() {
+            let sl = self.slots[s];
+            if sl.level != self.level || sl.count > 0 {
+                continue;
+            }
+            if sl.arg.has_default {
+                self.owner.push(s);
+                self.texts.push(sl.arg.default);
+            } else if sl.arg.required {
+                return Err(CliError::of(CliErrorKind::MissingRequired, c, "", sl.arg));
+            }
+        }
+        Ok(())
+    }
+
+    // Each slot's values together, in the order given; the first level
+    // current.
+    fn group(inout self) {
+        var out: Vec<str, A> = Vec::with_capacity_in(self.texts.len(), self.texts.allocator());
+        for s in 0..self.slots.len() {
+            self.slots[s].start = out.len();
+            for k in 0..self.owner.len() {
+                if self.owner[k] == s {
+                    out.push(self.texts[k]);
+                }
+            }
+            self.slots[s].len = out.len() - self.slots[s].start;
+        }
+        self.texts = out;
+        self.owner.clear();
+        self.level = 0;
+    }
+
+    // The slot of the argument named name on this level.
+    fn find(self, name: str) -> i64 {
+        for s in 0..self.slots.len() {
+            if self.slots[s].level == self.level && self.slots[s].arg.name == name {
+                return s;
+            }
+        }
+        std::panic_str(
+            "std::cli: Matches: no argument by that name in this command (an Arg's name, not its long or short form)");
+    }
+
+    // Whether the argument was given (a default does not count).
+    pub fn flag(self, name: str) -> bool {
+        self.slots[self.find(name)].count > 0
+    }
+
+    // How many times it was given: `-vvv` is 3.
+    pub fn count(self, name: str) -> i64 {
+        self.slots[self.find(name)].count
+    }
+
+    // Its value (the last one given), else its default.
+    pub fn get(self, name: str) -> Option<str> {
+        let sl = self.slots[self.find(name)];
+        if sl.len == 0 {
+            return Option::None;
+        }
+        Option::Some(self.texts[sl.start + sl.len - 1])
+    }
+
+    // Every value given, in order (or its default).
+    pub fn values(self, name: str) -> [str] {
+        let sl = self.slots[self.find(name)];
+        self.texts.as_slice()[sl.start..sl.start + sl.len]
+    }
+
+    // Its value parsed as a T (`m.get_as::<i64>("n")`): an InvalidValue
+    // error naming the argument when it does not parse, MissingRequired
+    // when it has no value (give it a default, or make it required).
+    pub fn get_as<T: FromStr>(self, name: str) -> Result<T, CliError> {
+        let sl = self.slots[self.find(name)];
+        let c = self.cmds[self.level];
+        if sl.len == 0 {
+            return Err(CliError::of(CliErrorKind::MissingRequired, c, "", sl.arg));
+        }
+        let text = self.texts[sl.start + sl.len - 1];
+        match T::from_str(text) {
+            Ok(v) => Ok(v),
+            Err(_) => Err(CliError::of(CliErrorKind::InvalidValue, c, text, sl.arg)),
+        }
+    }
+
+    // The subcommand given, its name, or None.
+    pub fn subcommand_name(self) -> Option<str> {
+        if self.level + 1 < self.names.len() {
+            return Option::Some(self.names[self.level + 1]);
+        }
+        Option::None
+    }
+
+    // The subcommand given: its name and its Matches (a copy), or None.
+    pub fn subcommand(self) -> Option<(str, Matches<A>)> {
+        if self.level + 1 >= self.names.len() {
+            return Option::None;
+        }
+        let sub = Matches {
+            slots: self.slots.clone(), owner: self.owner.clone(), texts: self.texts.clone(),
+            names: self.names.clone(), cmds: self.cmds.clone(), level: self.level + 1,
+        };
+        Option::Some((self.names[self.level + 1], sub))
+    }
+}
+
+// ---- Help and errors (0.24) ----
+
+// Writes text from column col (already there) to width, breaking at
+// spaces; later lines start at column indent.
+fn wrap<A: Allocator>(out: inout Buf<A>, text: str, col: i64, indent: i64, width: i64) {
+    var at = col;
+    var first = true;
+    for w in text.split(' ') {
+        if w.len() == 0 {
+            continue;
+        }
+        if !first {
+            if at + 1 + w.len() > width && at > indent {
+                out.push('\n');
+                for _ in 0..indent {
+                    out.push(' ');
+                }
+                at = indent;
+            } else {
+                out.push(' ');
+                at += 1;
+            }
+        }
+        out.push_str(w);
+        at += w.len();
+        first = false;
+    }
+}
+
+impl Command {
+    // `git remote add`: the names from the root to c.
+    fn path_into<A: Allocator>(self, c: i64, out: inout Buf<A>) {
+        let p = self.cmds[c].parent;
+        if p >= 0 {
+            self.path_into(p, &out);
+            out.push(' ');
+        }
+        out.push_str(self.cmds[c].name);
+    }
+
+    // `usage: prog [options] --out <FILE> <input> [file]... [command]`
+    fn usage_into<A: Allocator>(self, c: i64, out: inout Buf<A>) {
+        out.push_str("usage: ");
+        self.path_into(c, &out);
+        out.push_str(" [options]");
+        for i in 0..self.args.len() {
+            let a = self.args[i];
+            if a.cmd == c && a.kind == OPTION && a.required {
+                out.push(' ');
+                out.push_fmt(Spell { a: a });
+            }
+        }
+        for i in 0..self.args.len() {
+            let a = self.args[i];
+            if a.cmd == c && a.kind == POSITIONAL {
+                out.push(' ');
+                if a.required {
+                    out.push_fmt(Spell { a: a });
+                } else {
+                    out.push('[');
+                    out.push_str(a.name);
+                    out.push(']');
+                    if a.multiple {
+                        out.push_str("...");
+                    }
+                }
+            }
+        }
+        if self.has_subs(c) {
+            out.push_str(" [command]");
+        }
+    }
+
+    // An argument's left column: `-o, --out <FILE>`, `    --tag`, `<input>`.
+    fn left_into<A: Allocator>(self, a: Arg, out: inout Buf<A>) {
+        if a.kind == POSITIONAL {
+            out.push_fmt(Spell { a: a });
+            return;
+        }
+        if a.short != 0 {
+            out.push('-');
+            out.push(a.short);
+            if a.long.len() > 0 {
+                out.push_str(", ");
+            }
+        } else {
+            out.push_str("    ");
+        }
+        if a.long.len() > 0 {
+            out.push_str("--");
+            out.push_str(a.long);
+        }
+        if a.kind == OPTION {
+            out.push(' ');
+            out.push_fmt(ValueName { a: a });
+        }
+    }
+
+    // The rest of a table's line begun at out[start..] (its left column
+    // written): its help at column col.
+    fn row_end<A: Allocator>(self, out: inout Buf<A>, start: i64, help: str, default: str,
+        has_default: bool, col: i64) {
+        var at = out.len() - start;
+        if help.len() > 0 || has_default {
+            if at + 2 > col {
+                out.push('\n');
+                at = 0;
+            }
+            while at < col {
+                out.push(' ');
+                at += 1;
+            }
+            wrap(&out, help, col, col, self.width);
+            if has_default {
+                if help.len() > 0 {
+                    out.push(' ');
+                }
+                out.push_str("[default: ");
+                out.push_str(default);
+                out.push(']');
+            }
+        }
+        out.push('\n');
+    }
+
+    // A table's line: name, then its help at column col.
+    fn row<A: Allocator>(self, out: inout Buf<A>, name: str, help: str, col: i64) {
+        let start = out.len();
+        out.push_str("  ");
+        out.push_str(name);
+        self.row_end(&out, start, help, "", false, col);
+    }
+
+    // An argument's line of a table.
+    fn arg_row<A: Allocator>(self, out: inout Buf<A>, x: Arg, col: i64) {
+        let start = out.len();
+        out.push_str("  ");
+        self.left_into(x, &out);
+        self.row_end(&out, start, x.help, x.default, x.has_default, col);
+    }
+
+    // The help of command c.
+    fn help_into<A: Allocator>(self, c: i64, out: inout Buf<A>, a: A) {
+        let cmd = self.cmds[c];
+        self.path_into(c, &out);
+        if cmd.version.len() > 0 {
+            out.push(' ');
+            out.push_str(cmd.version);
+        }
+        out.push('\n');
+        if cmd.about.len() > 0 {
+            wrap(&out, cmd.about, 0, 0, self.width);
+            out.push('\n');
+        }
+        out.push('\n');
+        self.usage_into(c, &out);
+        out.push('\n');
+        // the left column's width: the widest entry, at most 24
+        var left = Buf::new_in(a);
+        var widest = 13;
+        for i in 0..self.args.len() {
+            if self.args[i].cmd == c {
+                left.clear();
+                self.left_into(self.args[i], &left);
+                if left.len() > widest && left.len() <= 24 {
+                    widest = left.len();
+                }
+            }
+        }
+        for i in 1..self.cmds.len() {
+            if self.cmds[i].parent == c && self.cmds[i].name.len() > widest
+                && self.cmds[i].name.len() <= 24 {
+                widest = self.cmds[i].name.len();
+            }
+        }
+        let col = 2 + widest + 2;
+        var any = false;
+        for i in 0..self.args.len() {
+            let x = self.args[i];
+            if x.cmd == c && x.kind == POSITIONAL {
+                if !any {
+                    out.push_str("\narguments:\n");
+                    any = true;
+                }
+                self.arg_row(&out, x, col);
+            }
+        }
+        out.push_str("\noptions:\n");
+        var own_help = false;
+        var own_version = false;
+        for i in 0..self.args.len() {
+            let x = self.args[i];
+            if x.cmd == c && x.kind != POSITIONAL {
+                self.arg_row(&out, x, col);
+                if x.long == "help" || x.short == 'h' {
+                    own_help = true;
+                }
+                if x.long == "version" || x.short == 'V' {
+                    own_version = true;
+                }
+            }
+        }
+        if !own_help {
+            self.row(&out, "-h, --help", "print this help", col);
+        }
+        if !own_version && cmd.version.len() > 0 {
+            self.row(&out, "-V, --version", "print the version", col);
+        }
+        if self.has_subs(c) {
+            out.push_str("\ncommands:\n");
+            for i in 1..self.cmds.len() {
+                if self.cmds[i].parent == c {
+                    self.row(&out, self.cmds[i].name, self.cmds[i].about, col);
+                }
+            }
+        }
+    }
+
+    // The help, on allocator a.
+    pub fn help_in<A: Allocator>(self, a: A) -> Buf<A> {
+        var out = Buf::new_in(a);
+        self.help_into(0, &out, a);
+        out
+    }
+
+    // What cmd.exit(e) prints, on allocator a: the help or the version
+    // line, or e's two lines and the usage line.
+    pub fn render_in<A: Allocator>(self, e: CliError, a: A) -> Buf<A> {
+        var out = Buf::new_in(a);
+        match e.kind {
+            CliErrorKind::Help => self.help_into(e.cmd, &out, a),
+            CliErrorKind::Version => {
+                self.path_into(e.cmd, &out);
+                out.push(' ');
+                out.push_str(self.cmds[e.cmd].version);
+                out.push('\n');
+            }
+            _ => {
+                out.push_fmt(e);
+                out.push('\n');
+                self.usage_into(e.cmd, &out);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    // Prints what e asks (the help and the version to stdout, an error
+    // to stderr) and ends the program with e.exit_code().
+    pub fn exit(self, e: CliError) -> ! {
+        let code = e.exit_code();
+        arena_scope(self.gpa, |a| {
+            let text = self.render_in(e, a);
+            if code == 0 {
+                std::print(text.as_slice());
+            } else {
+                std::eprint(text.as_slice());
+            }
+        });
+        std::process::exit(code)
+    }
+
+    // parse, and on an error (or --help, --version) cmd.exit(e).
+    pub fn parse_or_exit<I: Iterator<Item = str>>(self, args: sink I) -> Matches {
+        match self.parse(args) {
+            Ok(m) => m,
+            Err(e) => self.exit(e),
+        }
+    }
+}

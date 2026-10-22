@@ -5,7 +5,7 @@ attack each other, for n = 1 to 14: half a million solutions, found by a
 backtracking search over bitmasks in about 70 ms, the same time as C.
 
 ```sh
-tachyonc examples/algorithms/nqueens/main.tach -o nqueens && ./nqueens
+volec examples/algorithms/nqueens/main.vl -o nqueens && ./nqueens
 ```
 
 ## The problem
@@ -65,7 +65,7 @@ fn count(all: u64, cols: u64, left: u64, right: u64) -> i64 {
 }
 ```
 
-`0 - free` on an unsigned integer wraps, which is defined in tachyon (it
+`0 - free` on an unsigned integer wraps, which is defined in vole (it
 is the two's complement negation); there is no overflow trap to avoid.
 The diagonal masks grow bits above column n as they shift left; `all &`
 drops them.
@@ -138,13 +138,13 @@ line. n = 1 to 14, on an Apple M-series machine:
 
 | | time |
 |---|---|
-| tachyon 0.15, `-O2` (the default) | 71 ms |
-| tachyon 0.15, `-O1` | 87 ms |
-| tachyon 0.15, `-O0` | 250 ms |
+| vole 0.15, `-O2` (the default) | 71 ms |
+| vole 0.15, `-O1` | 87 ms |
+| vole 0.15, `-O0` | 250 ms |
 | C, `clang -O2` | 70 ms |
 
 The masks are `u64` rather than `u32` (which would hold any board up to
-32 x 32) on purpose: with `u32`, tachyon 0.15 zero-extends the result
+32 x 32) on purpose: with `u32`, vole 0.15 zero-extends the result
 of every 32-bit operation on arm64 and the search takes 104 ms; with
 `u64` there is nothing to extend. n = 15 (2,279,184 solutions) takes
 about 0.4 s, n = 16 about 2.5 s.
@@ -153,15 +153,15 @@ about 0.4 s, n = 16 about 2.5 s.
 
 | feature | where | guide |
 |---|---|---|
-| unsigned integers, `~`, `<<`, `>>`, `^=`, defined wrapping | `count` | `tachyonc guide types` |
-| recursion, early `return` | `count`, `first` | `tachyonc guide syntax` |
-| arrays as values, `a[..]` as a slice written through | `main`, `first` | `tachyonc guide types` |
-| `const` arrays | `KNOWN` | `tachyonc guide syntax` |
-| `if` as an expression, inside a call and an f-string hole | `draw`, `main` | `tachyonc guide syntax`, `guide formatting` |
-| `for n in 1..=14`, `for q in queens` | `main`, `draw` | `tachyonc guide syntax` |
-| f-strings with widths: `{found:>10}` | `main` | `tachyonc guide formatting` |
-| `main`'s value as the exit status | `main` | `tachyonc guide core` |
-| a C header: `import "time.h" as c;` | `now_ns` | `tachyonc guide c-interop` |
+| unsigned integers, `~`, `<<`, `>>`, `^=`, defined wrapping | `count` | `volec guide types` |
+| recursion, early `return` | `count`, `first` | `volec guide syntax` |
+| arrays as values, `a[..]` as a slice written through | `main`, `first` | `volec guide types` |
+| `const` arrays | `KNOWN` | `volec guide syntax` |
+| `if` as an expression, inside a call and an f-string hole | `draw`, `main` | `volec guide syntax`, `guide formatting` |
+| `for n in 1..=14`, `for q in queens` | `main`, `draw` | `volec guide syntax` |
+| f-strings with widths: `{found:>10}` | `main` | `volec guide formatting` |
+| `main`'s value as the exit status | `main` | `volec guide core` |
+| a C header: `import "time.h" as c;` | `now_ns` | `volec guide c-interop` |
 
 ## Try
 

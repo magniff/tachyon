@@ -1,4 +1,4 @@
-# Notes: tachyon for agents
+# Notes: vole for agents
 
 Ideas, not scheduled: candidates for the iterations between 0.10 and 1.0
 (see [roadmap.md](roadmap.md), "Toward 1.0").
@@ -8,25 +8,25 @@ designed for them as much as for people. What slowed agents down while
 they built this compiler was rarely writing code. It was finding out what
 code means, what else a change touches, and whether it is correct. And a
 new language has a problem of its own: models know nothing about it from
-training, so every agent learns tachyon from its context window. The
+training, so every agent learns vole from its context window. The
 compiler has to be the teacher.
 
 ## 1. The compiler teaches the language
 
-- `tachyonc guide`: a compact, version-matched reference sized for a
+- `volec guide`: a compact, version-matched reference sized for a
   context window (grammar, idioms, the std API). Done in 0.13: the core
   guide and topics, from `compiler/guide/`, every example tested.
-- `tachyonc doc std::Vec`: documentation from the binary itself, never the
+- `volec doc std::Vec`: documentation from the binary itself, never the
   wrong version from the web.
 - Diagnostics that show the right form, not only what is wrong ("`extern
   fn` was removed in 0.4; write `extern "C" { fn ... }`").
-- `tachyonc migrate --from 0.5`: mechanical rewrites across breaking
+- `volec migrate --from 0.5`: mechanical rewrites across breaking
   changes, which so far have been done by hand at every release.
 
 ## 2. Ask the compiler instead of reading source
 
 (Measured: [agent-tool-usage.md](agent-tool-usage.md) records how agents
-actually read and searched tachyon's source while building it.)
+actually read and searched vole's source while building it.)
 
 A batch, token-efficient query interface (an LSP for programs, not
 editors): `type-at file:line:col`, `callers f`, `refs Node::kind`,
@@ -36,7 +36,7 @@ answer small questions like these.
 
 ## 3. Semantic edits instead of text edits
 
-`tachyonc refactor rename a::b::f g`, `move-item`, `add-param`,
+`volec refactor rename a::b::f g`, `move-item`, `add-param`,
 `change-field-type`: done consistently across the whole program in one
 call. Text edits are where half-applied changes come from.
 
@@ -68,7 +68,7 @@ at once.
 
 `test` blocks, `#[property]` and `#[fuzz]` functions, snapshot tests,
 differential testing between optimization levels as one command, and
-automatic reduction of failing cases (`tachyonc reduce`). The machinery
+automatic reduction of failing cases (`volec reduce`). The machinery
 that kept this project honest (the fuzzers, `tests/compare.sh`, the
 fixpoint) as a feature every program gets.
 
@@ -101,7 +101,7 @@ For agents ambiguity costs more than verbosity.
 
 ## Later: a compiler server (MCP, then LSP)
 
-`tachyonc serve`: the program kept resolved in memory and re-checked
+`volec serve`: the program kept resolved in memory and re-checked
 incrementally, so queries and edits answer in milliseconds instead of a
 35 ms re-check each; its tools (query, edit, check, fix, refactor) typed,
 over MCP for agents and later over LSP for editors, one core for both.

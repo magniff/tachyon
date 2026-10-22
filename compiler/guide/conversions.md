@@ -220,7 +220,7 @@ skipped a token
 ```
 
 Code written for 0.14's API (Option and bool results) is moved by
-`tachyonc fix --only std015`: `parse_int(s)` becomes
+`volec fix --only std015`: `parse_int(s)` becomes
 `parse_int(s).ok()`, `sc.next_int()` `sc.next_int().ok()`,
 `read_line(b)` `read_line(b).unwrap_or(false)`, `read_stdin()`
 `read_stdin().unwrap()`. All four mean what they meant, but a read

@@ -1,0 +1,617 @@
+// The intrinsic tables' parser (0.19): tables.vl's lines into IntrInfo
+// (mod.vl), on the first use, once; and the instruction tables
+// (insn_a64.def, insn_x86.def) the assemblers read for the mnemonics they
+// do not know themselves. compiler/arch/README.md gives the formats; a
+// malformed line is an internal error (the tables are the compiler's).
+
+use crate::arch::{
+    ARCH_AARCH64, ARCH_PORTABLE, ARCH_X86_64, FEAT_DETECT, FEAT_HAS, FIELD_COUNT, FORM_BITS,
+    FORM_CAST, FORM_FEAT, FORM_HINT, FORM_INTR, FORM_INTR_MEM, FORM_LOAD, FORM_LOAD_DUP, FORM_STORE,
+    FORM_VBIN, FORM_VCMP, FORM_VEXT, FORM_VINS, FORM_VNEG, FORM_VSEL, FORM_VSPLAT, FORM_VSUM,
+    F_FEATURES, F_FLAGS, F_FORM, F_MEMORY, F_NAME, F_SIGNATURE, IF_COMMUTATIVE, IF_PURE,
+    IF_TIED_SHIFT, INTRS, INTR_BY_NAME, INTR_COUNT, IntrInfo, MEM_LOAD, MEM_NONE, MEM_RAW,
+    MEM_STORE, TABLE_BUF, init_name_table, intr_text,
+};
+use crate::arch::features::feature_bit_in;
+use crate::arch::tables::{insn_a64_source, insn_x86_source, intrinsics_source};
+use crate::back::objfile::{NameMap, name_get, name_put};
+use crate::base::{BUFS, IntVec, buf_new, die, grow, intern};
+use crate::base::target::X86;
+use crate::middle::ir::{BITS_LEADING, BITS_ONES, BITS_TRAILING, Cond, Op};
+
+// The fields of every line: start, end (in TABLE_BUF), FIELD_COUNT pairs
+// per intrinsic.
+pub static var FIELDS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The parameters: PARAM_WIDTH entries each: name (a symbol), the type's
+// text start and end, lo, hi (an immediate's range; lo > hi otherwise).
+static var PARAMS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+const PARAM_WIDTH: i64 = 5;
+static var INTR_CAP: i64 = 0;
+
+pub fn param_entry(p: i64, k: i64) -> i64 {
+    unsafe { PARAMS.data[p * PARAM_WIDTH + k] }
+}
+
+// The type text of parameter p (an index as IntrInfo.params + k).
+pub fn param_type_text(p: i64) -> [u8] {
+    unsafe { BUFS[TABLE_BUF].data[param_entry(p, 1)..param_entry(p, 2)] }
+}
+
+fn byte(i: i64) -> u8 {
+    unsafe { BUFS[TABLE_BUF].data[i] }
+}
+
+fn text(a: i64, b: i64) -> [u8] {
+    unsafe { BUFS[TABLE_BUF].data[a..b] }
+}
+
+fn is(a: i64, b: i64, word: [u8]) -> bool {
+    if b - a != word.len as i64 {
+        return false;
+    }
+    for i in 0..b - a {
+        if byte(a + i) != word[i] {
+            return false;
+        }
+    }
+    true
+}
+
+fn starts(a: i64, b: i64, word: [u8]) -> bool {
+    b - a >= word.len as i64 && is(a, a + word.len as i64, word)
+}
+
+fn bad(what: *u8) -> ! {
+    unsafe { die(what); }
+}
+
+// An integer at [a, b), decimal (with a sign) or 0x hexadecimal.
+fn number(a: i64, b: i64) -> i64 {
+    unsafe { number_in(a, b) }
+}
+
+unsafe fn number_in(a: i64, b: i64) -> i64 {
+    var i = a;
+    var negative = false;
+    if i < b && byte(i) == '-' {
+        negative = true;
+        i += 1;
+    }
+    var v = 0;
+    if b - i > 2 && byte(i) == '0' && byte(i + 1) == 'x' {
+        i += 2;
+        while i < b {
+            let c = byte(i);
+            let d = if c >= '0' && c <= '9' { (c - '0') as i64 }
+                else if c >= 'a' && c <= 'f' { (c - 'a') as i64 + 10 }
+                else { bad(c"internal error: arch table: bad hexadecimal number") };
+            v = v * 16 + d;
+            i += 1;
+        }
+    } else {
+        while i < b {
+            let c = byte(i);
+            if c < '0' || c > '9' {
+                bad(c"internal error: arch table: bad number");
+            }
+            v = v * 10 + (c - '0') as i64;
+            i += 1;
+        }
+    }
+    if negative { -v } else { v }
+}
+
+fn trim_start(a: i64, b: i64) -> i64 {
+    var i = a;
+    while i < b && byte(i) == ' ' {
+        i += 1;
+    }
+    i
+}
+
+fn trim_end(a: i64, b: i64) -> i64 {
+    var i = b;
+    while i > a && byte(i - 1) == ' ' {
+        i -= 1;
+    }
+    i
+}
+
+// Splits the line [a, b) at " | " into FIELDS (want fields); false when it
+// has another count.
+fn split_fields(a: i64, b: i64, want: i64) -> bool {
+    unsafe {
+        var start = a;
+        var n = 0;
+        var i = a;
+        while i <= b {
+            let at_sep = i + 2 < b && byte(i) == ' ' && byte(i + 1) == '|' && byte(i + 2) == ' ';
+            if i == b || at_sep {
+                FIELDS.push(trim_start(start, i));
+                FIELDS.push(trim_end(start, i));
+                n += 1;
+                if i == b {
+                    break;
+                }
+                i += 3;
+                start = i;
+                continue;
+            }
+            i += 1;
+        }
+        n == want
+    }
+}
+
+// The table, parsed on the first call.
+pub fn load_table() {
+    unsafe {
+        if TABLE_BUF >= 0 {
+            return;
+        }
+        TABLE_BUF = buf_new();
+        intrinsics_source(TABLE_BUF);
+        init_name_table();
+        let len = BUFS[TABLE_BUF].len;
+        var arch = ARCH_PORTABLE;
+        var a = 0;
+        while a < len {
+            var b = a;
+            while b < len && byte(b) != '\n' {
+                b += 1;
+            }
+            if byte(a) == '=' {
+                arch = if is(a + 2, b, "aarch64") { ARCH_AARCH64 }
+                    else if is(a + 2, b, "x86_64") { ARCH_X86_64 } else { ARCH_PORTABLE };
+            } else {
+                parse_intrinsic(a, b, arch);
+            }
+            a = b + 1;
+        }
+        for id in 0..INTR_COUNT {
+            if INTRS[id].form == FORM_INTR_MEM {
+                link_parts(id);
+            }
+        }
+    }
+}
+
+// (T6) The two permutes an `intr.mem` intrinsic is made of at -O1 and -O2:
+// vld2q_T (a deinterleaving load) is two vector loads, then vuzp1q_T and
+// vuzp2q_T; vst2q_T is vzip1q_T and vzip2q_T, then two vector stores.
+// Their ids in part1 and part2 (made while the table is parsed: no symbol
+// is made later).
+fn link_parts(id: i64) {
+    unsafe {
+        let name = intr_text(id, F_NAME);
+        let load = name.len > 6 && name[0..6] == "vld2q_";
+        let store = name.len > 6 && name[0..6] == "vst2q_";
+        if !load && !store {
+            bad(c"internal error: arch table: an intr.mem intrinsic lowering does not know");
+        }
+        var tmp: [u8; 48] = [0; 48];
+        let rest = name.len - 6;
+        if rest > 40 {
+            bad(c"internal error: arch table: a name too long");
+        }
+        for k in 0..2 {
+            let head = if load { "vuzp" } else { "vzip" };
+            for j in 0..4 {
+                tmp[j] = head[j];
+            }
+            tmp[4] = if k == 0 { '1' } else { '2' };
+            tmp[5] = 'q';
+            tmp[6] = '_';
+            for j in 0..rest {
+                tmp[7 + j] = name[6 + j];
+            }
+            let part = INTR_BY_NAME[intern(tmp[0..7 + rest])] - 1;
+            if part < 0 {
+                bad(c"internal error: arch table: an intr.mem intrinsic without its permutes");
+            }
+            if k == 0 {
+                INTRS[id].part1 = part;
+            } else {
+                INTRS[id].part2 = part;
+            }
+        }
+    }
+}
+
+fn field_start(base: i64, f: i64) -> i64 {
+    unsafe { FIELDS.data[base + 2 * f] }
+}
+
+fn field_end(base: i64, f: i64) -> i64 {
+    unsafe { FIELDS.data[base + 2 * f + 1] }
+}
+
+fn parse_intrinsic(a: i64, b: i64, arch: i64) {
+    unsafe {
+        let base = FIELDS.count;
+        if !split_fields(a, b, FIELD_COUNT) {
+            bad(c"internal error: arch table: a line without its 11 columns");
+        }
+        let id = INTR_COUNT;
+        INTRS = grow(INTRS, INTR_COUNT, &INTR_CAP);
+        INTR_COUNT += 1;
+        let name = intern(text(field_start(base, F_NAME), field_end(base, F_NAME)));
+        INTRS[id] = IntrInfo {
+            name, arch, features: 0, form: 0, form_arg: 0, work: 0,
+            params: PARAMS.count / PARAM_WIDTH,
+            nparams: 0, ret_start: 0, ret_end: 0, consts: 0, flags: 0, mem: MEM_NONE, mem_param: -1,
+            mem_bytes: 0, fields: base, part1: -1, part2: -1,
+        };
+        if INTR_BY_NAME[name] != 0 {
+            bad(c"internal error: arch table: an intrinsic named twice");
+        }
+        INTR_BY_NAME[name] = id + 1;
+        parse_features(id, field_start(base, F_FEATURES), field_end(base, F_FEATURES), arch);
+        parse_signature(id, field_start(base, F_SIGNATURE), field_end(base, F_SIGNATURE));
+        parse_form(id, field_start(base, F_FORM), field_end(base, F_FORM));
+        parse_flags(id, field_start(base, F_FLAGS), field_end(base, F_FLAGS));
+        parse_memory(id, field_start(base, F_MEMORY), field_end(base, F_MEMORY));
+    }
+}
+
+// `neon`, `crc`, `sse4.2`, comma-separated; `-`: none.
+fn parse_features(id: i64, a: i64, b: i64, arch: i64) {
+    unsafe {
+        if is(a, b, "-") {
+            return;
+        }
+        var i = a;
+        while i < b {
+            var j = i;
+            while j < b && byte(j) != ',' {
+                j += 1;
+            }
+            let bit = feature_bit_in(text(trim_start(i, j), trim_end(i, j)), arch);
+            if bit < 0 {
+                bad(c"internal error: arch table: an unknown feature");
+            }
+            INTRS[id].features |= 1 << bit as u64;
+            i = j + 1;
+        }
+    }
+}
+
+// `(a: T, n: const LO..=HI) -> R` or `(s: [u8], i: i64, v: T)`.
+fn parse_signature(id: i64, a: i64, b: i64) {
+    unsafe {
+        if a >= b || byte(a) != '(' {
+            bad(c"internal error: arch table: a signature without '('");
+        }
+        var close = a;
+        while close < b && byte(close) != ')' {
+            close += 1;
+        }
+        if close >= b {
+            bad(c"internal error: arch table: a signature without ')'");
+        }
+        var i = a + 1;
+        var k = 0;
+        while i < close {
+            var j = i;
+            var depth = 0;
+            while j < close && !(byte(j) == ',' && depth == 0) {
+                if byte(j) == '[' || byte(j) == '(' {
+                    depth += 1;
+                } else if byte(j) == ']' || byte(j) == ')' {
+                    depth -= 1;
+                }
+                j += 1;
+            }
+            let s = trim_start(i, j);
+            let e = trim_end(i, j);
+            var colon = s;
+            while colon < e && byte(colon) != ':' {
+                colon += 1;
+            }
+            if colon >= e {
+                bad(c"internal error: arch table: a parameter without its type");
+            }
+            let ts = trim_start(colon + 1, e);
+            PARAMS.push(intern(text(s, colon)));
+            if starts(ts, e, "const ") {
+                // `const LO..=HI`
+                let r = trim_start(ts + 6, e);
+                var dots = r;
+                while dots + 2 < e && !(byte(dots) == '.' && byte(dots + 1) == '.') {
+                    dots += 1;
+                }
+                if dots + 2 >= e || byte(dots + 2) != '=' {
+                    bad(c"internal error: arch table: an immediate without LO..=HI");
+                }
+                PARAMS.push(ts);
+                PARAMS.push(ts);
+                PARAMS.push(number(r, dots));
+                PARAMS.push(number(dots + 3, e));
+                INTRS[id].consts |= 1 << k as u64;
+            } else {
+                PARAMS.push(ts);
+                PARAMS.push(e);
+                PARAMS.push(1);
+                PARAMS.push(0);
+            }
+            k += 1;
+            i = j + 1;
+        }
+        INTRS[id].nparams = k;
+        let r = trim_start(close + 1, b);
+        if starts(r, b, "->") {
+            INTRS[id].ret_start = trim_start(r + 2, b);
+            INTRS[id].ret_end = b;
+        } else {
+            INTRS[id].ret_start = b;
+            INTRS[id].ret_end = b;
+        }
+    }
+}
+
+// `intr`, `load`, `vbin.add`, `vcmp.eq:v16i8`, `bits.ones`, `feat.has` ...
+fn parse_form(id: i64, a: i64, b: i64) {
+    unsafe {
+        var e = a;
+        while e < b && byte(e) != ':' {
+            e += 1;
+        }
+        if e < b {
+            INTRS[id].work = intern(text(e + 1, b));
+        }
+        var dot = a;
+        while dot < e && byte(dot) != '.' {
+            dot += 1;
+        }
+        let arg_start = if dot < e { dot + 1 } else { e };
+        var form = 0;
+        var arg = 0;
+        if is(a, e, "intr") { form = FORM_INTR; }
+        else if is(a, e, "intr.mem") { form = FORM_INTR_MEM; }
+        else if is(a, e, "load") { form = FORM_LOAD; }
+        else if is(a, e, "store") { form = FORM_STORE; }
+        else if is(a, e, "cast") { form = FORM_CAST; }
+        else if is(a, e, "vsplat") { form = FORM_VSPLAT; }
+        else if is(a, e, "vext") { form = FORM_VEXT; }
+        else if is(a, e, "hint") { form = FORM_HINT; }
+        else if is(a, e, "vneg") { form = FORM_VNEG; }
+        else if is(a, e, "vins") { form = FORM_VINS; }
+        else if is(a, e, "vsel") { form = FORM_VSEL; }
+        else if is(a, e, "vsum") { form = FORM_VSUM; }
+        else if is(a, e, "load.dup") { form = FORM_LOAD_DUP; }
+        else if is(a, dot, "vbin") {
+            form = FORM_VBIN;
+            arg = if is(arg_start, e, "add") { Op::Add as i64 }
+                else if is(arg_start, e, "sub") { Op::Sub as i64 }
+                else if is(arg_start, e, "mul") { Op::Mul as i64 }
+                else if is(arg_start, e, "and") { Op::And as i64 }
+                else if is(arg_start, e, "or") { Op::Or as i64 }
+                else if is(arg_start, e, "xor") { Op::Xor as i64 }
+                else if is(arg_start, e, "div") { Op::Div as i64 }
+                else { bad(c"internal error: arch table: an unknown vbin") };
+        } else if is(a, dot, "vcmp") {
+            form = FORM_VCMP;
+            arg = if is(arg_start, e, "eq") { Cond::Eq as i64 }
+                else if is(arg_start, e, "gt") { Cond::Gt as i64 }
+                else if is(arg_start, e, "ge") { Cond::Ge as i64 }
+                else if is(arg_start, e, "lt") { Cond::Lt as i64 }
+                else if is(arg_start, e, "le") { Cond::Le as i64 }
+                else { bad(c"internal error: arch table: an unknown vcmp") };
+        } else if is(a, dot, "bits") {
+            form = FORM_BITS;
+            arg = if is(arg_start, e, "ones") { BITS_ONES }
+                else if is(arg_start, e, "leading") { BITS_LEADING }
+                else if is(arg_start, e, "trailing") { BITS_TRAILING }
+                else { bad(c"internal error: arch table: an unknown bits count") };
+        } else if is(a, dot, "feat") {
+            form = FORM_FEAT;
+            arg = if is(arg_start, e, "has") { FEAT_HAS }
+                else if is(arg_start, e, "detect") { FEAT_DETECT }
+                else { bad(c"internal error: arch table: an unknown feat") };
+        } else {
+            bad(c"internal error: arch table: an unknown IR form");
+        }
+        INTRS[id].form = form;
+        INTRS[id].form_arg = arg;
+    }
+}
+
+// The index of parameter `name` of intrinsic id, or -1.
+fn param_index(id: i64, a: i64, b: i64) -> i64 {
+    unsafe {
+        let name = intern(text(a, b));
+        for k in 0..INTRS[id].nparams {
+            if param_entry(INTRS[id].params + k, 0) == name {
+                return k;
+            }
+        }
+        -1
+    }
+}
+
+// `pure commutative tied=a`, space-separated; `-`: none.
+fn parse_flags(id: i64, a: i64, b: i64) {
+    unsafe {
+        var i = a;
+        while i < b {
+            var j = i;
+            while j < b && byte(j) != ' ' {
+                j += 1;
+            }
+            if is(i, j, "pure") {
+                INTRS[id].flags |= IF_PURE;
+            } else if is(i, j, "commutative") {
+                INTRS[id].flags |= IF_COMMUTATIVE;
+            } else if starts(i, j, "tied=") {
+                let k = param_index(id, i + 5, j);
+                if k < 0 {
+                    bad(c"internal error: arch table: tied to an unknown parameter");
+                }
+                INTRS[id].flags |= (k + 1) << IF_TIED_SHIFT as u64;
+            } else if !is(i, j, "-") {
+                bad(c"internal error: arch table: an unknown flag");
+            }
+            i = trim_start(j, b);
+        }
+    }
+}
+
+// `none`, `raw`, `load(s, 16)`, `store(s, 16)`.
+fn parse_memory(id: i64, a: i64, b: i64) {
+    unsafe {
+        if is(a, b, "none") || is(a, b, "-") {
+            return;
+        }
+        if is(a, b, "raw") {
+            INTRS[id].mem = MEM_RAW;
+            return;
+        }
+        let load = starts(a, b, "load(");
+        if !load && !starts(a, b, "store(") {
+            bad(c"internal error: arch table: an unknown memory column");
+        }
+        let open = if load { a + 5 } else { a + 6 };
+        var comma = open;
+        while comma < b && byte(comma) != ',' {
+            comma += 1;
+        }
+        let k = param_index(id, open, comma);
+        if k < 0 || comma >= b || byte(b - 1) != ')' {
+            bad(c"internal error: arch table: a memory column without its slice");
+        }
+        INTRS[id].mem = if load { MEM_LOAD } else { MEM_STORE };
+        INTRS[id].mem_param = k;
+        INTRS[id].mem_bytes = number(trim_start(comma + 1, b - 1), b - 1);
+    }
+}
+
+// ---- The instruction tables ----
+//
+// insn_a64.def: mnemonic | class | bits | syntax; insn_x86.def: mnemonic |
+// class | prefix | map | opcode | flags. By mnemonic (a NameMap, as the
+// assembler's own tables: it reads nothing the rest of the compiler grows
+// while it runs on a thread): index + 1, the lines' fields in INSN_FIELDS
+// (INSN_WIDTH each). Loaded by the front end (load_insns, from
+// virtual.vl) when a program names std::arch; read-only after.
+
+static var INSN_BUF: i64 = -1;
+static var INSN_BY_NAME: NameMap = NameMap {
+    ptrs: 0 as *i64, lens: 0 as *i64, vals: 0 as *i64, size: 0, count: 0
+};
+static var INSN_FIELDS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+const INSN_WIDTH: i64 = 12;
+
+fn insn_byte(i: i64) -> u8 {
+    unsafe { BUFS[INSN_BUF].data[i] }
+}
+
+pub fn load_insns() {
+    unsafe {
+        if INSN_BUF >= 0 {
+            return;
+        }
+        // (the target's table only: the two architectures share mnemonics,
+        // crc32b among them; set_target runs before the modules load)
+        INSN_BUF = buf_new();
+        if X86 {
+            insn_x86_source(INSN_BUF);
+        } else {
+            insn_a64_source(INSN_BUF);
+        }
+        let len = BUFS[INSN_BUF].len;
+        var a = 0;
+        while a < len {
+            var b = a;
+            while b < len && insn_byte(b) != '\n' {
+                b += 1;
+            }
+            let base = INSN_FIELDS.count;
+            var start = a;
+            var n = 0;
+            var i = a;
+            while i <= b && n < INSN_WIDTH / 2 {
+                let at_sep = i + 2 < b && insn_byte(i) == ' ' && insn_byte(i + 1) == '|'
+                    && insn_byte(i + 2) == ' ';
+                if i == b || at_sep {
+                    var s = start;
+                    while s < i && insn_byte(s) == ' ' {
+                        s += 1;
+                    }
+                    var e = i;
+                    while e > s && insn_byte(e - 1) == ' ' {
+                        e -= 1;
+                    }
+                    INSN_FIELDS.push(s);
+                    INSN_FIELDS.push(e);
+                    n += 1;
+                    if i == b {
+                        break;
+                    }
+                    i += 3;
+                    start = i;
+                    continue;
+                }
+                i += 1;
+            }
+            while n < INSN_WIDTH / 2 {
+                INSN_FIELDS.push(b);
+                INSN_FIELDS.push(b);
+                n += 1;
+            }
+            // (a mnemonic of several lines: its first, the encoder tries the
+            // next ones)
+            let mn = BUFS[INSN_BUF].data[INSN_FIELDS.data[base]..INSN_FIELDS.data[base + 1]];
+            if name_get(INSN_BY_NAME, mn) == 0 {
+                name_put(&INSN_BY_NAME, mn, base / INSN_WIDTH + 1);
+            }
+            a = b + 1;
+        }
+    }
+}
+
+// The line of mnemonic `name` in the instruction tables, or -1 (also
+// before the front end loaded them: no program named std::arch).
+pub fn insn_named(name: [u8]) -> i64 {
+    unsafe {
+        if INSN_BUF < 0 {
+            return -1;
+        }
+        name_get(INSN_BY_NAME, name) - 1
+    }
+}
+
+// Field f of instruction line k, as text.
+pub fn insn_text(k: i64, f: i64) -> [u8] {
+    unsafe {
+        // (past the last line: no mnemonic, which ends a run of lines)
+        if k < 0 || (k + 1) * INSN_WIDTH > INSN_FIELDS.count {
+            return "";
+        }
+        let s = INSN_FIELDS.data[k * INSN_WIDTH + 2 * f];
+        let e = INSN_FIELDS.data[k * INSN_WIDTH + 2 * f + 1];
+        BUFS[INSN_BUF].data[s..e]
+    }
+}
+
+// Field f of instruction line k as a hexadecimal number (`0x2e202c00`,
+// `66`, `0f38`), 0 for `-`.
+pub fn insn_hex(k: i64, f: i64) -> i64 {
+    let t = insn_text(k, f);
+    var i = 0;
+    if t.len >= 2 && t[0] == '0' && t[1] == 'x' {
+        i = 2;
+    }
+    var v = 0;
+    while i < t.len as i64 {
+        let c = t[i];
+        if c >= '0' && c <= '9' {
+            v = v * 16 + (c - '0') as i64;
+        } else if c >= 'a' && c <= 'f' {
+            v = v * 16 + (c - 'a') as i64 + 10;
+        } else {
+            return v;
+        }
+        i += 1;
+    }
+    v
+}

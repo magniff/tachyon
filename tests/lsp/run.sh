@@ -1,10 +1,10 @@
 #!/bin/sh
-# The tests of `tachyonc lsp` (0.24, docs/lsp.md): scripted sessions.
+# The tests of `volec lsp` (0.24, docs/lsp.md): scripted sessions.
 # POSIX sh and awk only.
 #
 # usage: tests/lsp/run.sh [-c COMPILER] [-u]
 #
-#   -c COMPILER   the tachyonc binary (default: target/tachyonc)
+#   -c COMPILER   the volec binary (default: target/volec)
 #   -u            rewrite the .lsp files with the answers they get now
 #
 # Each tests/lsp/NAME.lsp is a session with the program tests/lsp/prog
@@ -19,11 +19,11 @@
 # its response (the diagnostics published before it), and at the end
 # the ones after the last response. `##` lines are comments. The
 # scratch directory is written @DIR@ in the answers, the compiler's path
-# `tachyonc`.
+# `volec`.
 #
 # Then the compiler's own source is opened and asked for a file's symbols
 # and a definition: the answers must be plausible (it changes too often
-# for a transcript), and the times are printed (TACHYON_LSP_TIME).
+# for a transcript), and the times are printed (VOLE_LSP_TIME).
 #
 # Prints `pass NAME` or `FAIL NAME` (and the difference) for each
 # session; exits 1 if one failed.
@@ -34,7 +34,7 @@ export LC_ALL
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 UPDATE=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -49,7 +49,7 @@ case "$COMPILER" in
 esac
 [ -x "$COMPILER" ] || { echo "lsp/run.sh: no compiler at $COMPILER" >&2; exit 2; }
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-lsp.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-lsp.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 STATUS=0
@@ -77,7 +77,7 @@ session_input() {
         case "$line" in
             @open\ *)
                 f=${line#@open }
-                msg="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file://$2/$f\",\"languageId\":\"tachyon\",\"version\":1,\"text\":$(json_text "$2/$f")}}}"
+                msg="{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file://$2/$f\",\"languageId\":\"vole\",\"version\":1,\"text\":$(json_text "$2/$f")}}}"
                 ;;
             @change\ *)
                 set -- "$1" "$2" ${line#@change }
@@ -128,8 +128,8 @@ run_session() {
 # newline), the directory and compiler written back as placeholders.
 unframe() {
     tr -d '\r' <"$WORK/out" | sed 's/Content-Length: [0-9]*$//' | sed '/^$/d' \
-        | sed "s|$2|@DIR@|g; s|$COMPILER|tachyonc|g" \
-        | sed 's/"serverInfo":{"name":"tachyonc","version":"[0-9.]*"}/"serverInfo":{"name":"tachyonc","version":"@VERSION@"}/'
+        | sed "s|$2|@DIR@|g; s|$COMPILER|volec|g" \
+        | sed 's/"serverInfo":{"name":"volec","version":"[0-9.]*"}/"serverInfo":{"name":"volec","version":"@VERSION@"}/'
 }
 
 # The transcript of session $1: its `##` and `>` lines, each request's
@@ -160,7 +160,7 @@ for case in "$HERE"/*.lsp; do
     dir="$WORK/$name"
     rm -rf "$dir"
     mkdir -p "$dir"
-    cp "$HERE"/prog/*.tach "$dir/"
+    cp "$HERE"/prog/*.vl "$dir/"
     session_input "$case" "$dir"
     mode=sync
     head -1 "$case" | grep -q '^## burst' && mode=burst
@@ -187,8 +187,8 @@ done
 
 # The compiler's own source: plausible answers, and their times.
 SRC="$ROOT/compiler/src"
-if [ -f "$SRC/main.tach" ]; then
-    F="$SRC/tools/lsp/mod.tach"
+if [ -f "$SRC/main.vl" ]; then
+    F="$SRC/tools/lsp/mod.vl"
     U="file://$F"
     {
         frame '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}'
@@ -199,11 +199,11 @@ if [ -f "$SRC/main.tach" ]; then
         frame '{"jsonrpc":"2.0","id":5,"method":"shutdown"}'
         frame '{"jsonrpc":"2.0","method":"exit"}'
     } >"$WORK/in"
-    TACHYON_LSP_TIME=1 "$COMPILER" lsp <"$WORK/in" >"$WORK/out" 2>"$WORK/err"
+    VOLE_LSP_TIME=1 "$COMPILER" lsp <"$WORK/in" >"$WORK/out" 2>"$WORK/err"
     rc=$?
     unframe "$WORK/out" "$WORK" >"$WORK/answers"
     if [ "$rc" = 0 ] && grep -q '"name":"run_lsp"' "$WORK/answers" \
-        && grep -q 'tools/commands.tach' "$WORK/answers" \
+        && grep -q 'tools/commands.vl' "$WORK/answers" \
         && grep -q 'effects: ' "$WORK/answers"; then
         echo "pass compiler-source"
         grep '^lsp' "$WORK/err" | sed 's/^/    /'

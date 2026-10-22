@@ -27,7 +27,7 @@ this directory, and its output is checked against this file;
 ## Run it
 
 ```console
-$ tachyonc main.tach -o store && ./store < requests.txt
+$ volec main.vl -o store && ./store < requests.txt
 SET apples 3             -> apples = 3
 SET Pears 5              -> pears = 5
 ADD apples 4             -> apples = 7
@@ -46,7 +46,7 @@ No request frees anything by hand, and none leaks: `--check-alloc`
 arena's block after its scope) has nothing to say.
 
 ```console
-$ tachyonc --check-alloc main.tach -o store-checked && ./store-checked < requests.txt | tail -1
+$ volec --check-alloc main.vl -o store-checked && ./store-checked < requests.txt | tail -1
 the keys' arena holds 11 bytes
 ok: built store-checked
 ```
@@ -111,7 +111,7 @@ fn intern(names: Arena, s: [u8]) -> [u8] {
 ## What the effects say
 
 ```console
-$ tachyonc query effects crate
+$ volec query effects crate
 crate::intern	alloc(Arena) panic unsafe
 lower_in<ScopedArena>	alloc(ScopedArena) panic
 answer<ScopedArena>	alloc(Gpa, Arena, ScopedArena) io global panic diverge
@@ -131,7 +131,7 @@ A container on the scope's arena is gone when the scope ends, so it
 cannot be the scope's value:
 
 ```console
-$ cat > escape.tach <<'EOF'
+$ cat > escape.vl <<'EOF'
 > fn main(gpa: Gpa) -> i32 {
 >     let words = arena_scope(gpa, |a| {
 >         std::split_whitespace_in("scratch words to keep", a)
@@ -140,8 +140,8 @@ $ cat > escape.tach <<'EOF'
 >     0
 > }
 > EOF
-$ tachyonc check escape.tach
-escape.tach:3:9: error[type error] this arena scope's value holds 'ScopedArena' (Vec<[u8], ScopedArena>): its memory is gone when the scope ends | help: copy it out: 'v.clone_in(gpa)', or return what is computed from it
+$ volec check escape.vl
+escape.vl:3:9: error[type error] this arena scope's value holds 'ScopedArena' (Vec<[u8], ScopedArena>): its memory is gone when the scope ends | help: copy it out: 'v.clone_in(gpa)', or return what is computed from it
 [exit 1]
 ```
 
@@ -152,7 +152,7 @@ Nor can a scope use a container of another scope's arena, even an
 enclosing one (`a.scope(|inner| ...)` makes a scope inside a scope):
 
 ```console
-$ cat > capture.tach <<'EOF'
+$ cat > capture.vl <<'EOF'
 > fn main(gpa: Gpa) -> i32 {
 >     let n = arena_scope(gpa, |outer| {
 >         var seen: Vec<i64, ScopedArena> = Vec::new_in(outer);
@@ -166,8 +166,8 @@ $ cat > capture.tach <<'EOF'
 >     0
 > }
 > EOF
-$ tachyonc check capture.tach
-capture.tach:5:21: error[type error] an arena scope cannot use 'seen': its type holds another scope's arena | help: take a view first: 'let s = seen.as_slice();'
+$ volec check capture.vl
+capture.vl:5:21: error[type error] an arena scope cannot use 'seen': its type holds another scope's arena | help: take a view first: 'let s = seen.as_slice();'
 [exit 1]
 ```
 
@@ -186,7 +186,7 @@ only `--check-alloc` caught the read). The view cannot outlive the `Vec`
 it views, which is dropped when the scope's closure returns:
 
 ```console
-$ cat > view.tach <<'EOF'
+$ cat > view.vl <<'EOF'
 > fn main(gpa: Gpa) -> i32 {
 >     let words = arena_scope(gpa, |a| {
 >         let v = std::split_whitespace_in("scratch words to keep", a);
@@ -196,8 +196,8 @@ $ cat > view.tach <<'EOF'
 >     0
 > }
 > EOF
-$ tachyonc check view.tach
-view.tach:4:9: error[own.escape] 'closure(ScopedArena) -> [[u8]] at view.tach:2:34' returns a view of 'v', which is dropped when 'closure(ScopedArena) -> [[u8]] at view.tach:2:34' returns | help: return the owner itself; a caller that wants a view takes '.as_slice()' of it | try: tachyonc edit patch closure(ScopedArena) -> [[u8]] at view.tach:2:34 --old '-> [[u8]]' --new '-> Vec<[u8], ScopedArena>' --old 'v.as_slice()' --new 'v'
+$ volec check view.vl
+view.vl:4:9: error[own.escape] 'closure(ScopedArena) -> [[u8]] at view.vl:2:34' returns a view of 'v', which is dropped when 'closure(ScopedArena) -> [[u8]] at view.vl:2:34' returns | help: return the owner itself; a caller that wants a view takes '.as_slice()' of it | try: volec edit patch closure(ScopedArena) -> [[u8]] at view.vl:2:34 --old '-> [[u8]]' --new '-> Vec<[u8], ScopedArena>' --old 'v.as_slice()' --new 'v'
 [exit 1]
 ```
 
@@ -207,6 +207,6 @@ view.tach:4:9: error[own.escape] 'closure(ScopedArena) -> [[u8]] at view.tach:2:
 
 ## Read more
 
-- `tachyonc guide allocators`, section "Arenas".
+- `volec guide allocators`, section "Arenas".
 - [arena-parser](../arena-parser/): a whole tree in an arena, timed
   against `Gpa`.

@@ -1,6 +1,6 @@
 #!/bin/sh
-# Writes render/cells.tach from render/cells.wgsl: the shader's text as a
-# constant (tachyon has no include_str yet). Run it after editing
+# Writes render/cells.vl from render/cells.wgsl: the shader's text as a
+# constant (vole has no include_str yet). Run it after editing
 # cells.wgsl; tests/voltty-render/run.sh checks that the two agree.
 #
 # usage: examples/voltty/render/embed.sh [--check]
@@ -22,10 +22,10 @@ trap 'rm -f "$out"' EXIT
         | awk 'NR > 1 { printf "\\n\\\n    " } { printf "%s", $0 } END { printf "\\n\";\n" }'
 } >"$out"
 if [ "${1:-}" = --check ]; then
-    cmp -s "$out" "$HERE/cells.tach" || {
-        echo "render/cells.tach is not render/cells.wgsl's: run examples/voltty/render/embed.sh" >&2
+    cmp -s "$out" "$HERE/cells.vl" || {
+        echo "render/cells.vl is not render/cells.wgsl's: run examples/voltty/render/embed.sh" >&2
         exit 1
     }
 else
-    cp "$out" "$HERE/cells.tach"
+    cp "$out" "$HERE/cells.vl"
 fi

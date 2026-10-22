@@ -1,4 +1,4 @@
-"""Compiler tasks (ctasks/, 0.16): a change to tachyon's own compiler, made
+"""Compiler tasks (ctasks/, 0.16): a change to vole's own compiler, made
 in a copy of the repository at a fixed commit, graded by building it and
 running a part of its test suite plus the task's own checks.
 
@@ -10,7 +10,7 @@ A task is `ctasks/NN-name/`:
   not exist, for validating the task before that release), `suite` (the
   tests/run.sh filters the grading runs, comma-separated; every one must
   pass), optional `same_output` (comma-separated corpus paths for
-  `tachyonc same-output STARTER`: the outputs of the graded compiler and
+  `volec same-output STARTER`: the outputs of the graded compiler and
   the starter's must be identical), optional `grade_timeout_s`;
 - `task.md`: what the agent is asked (the prompt's last part);
 - `README.md`: for people: the change, the grading, the reference;
@@ -18,18 +18,18 @@ A task is `ctasks/NN-name/`:
   point (a planted bug); `solution.patch`: the reference solution,
   applied on top of the starter (both `git diff` output, -p1);
 - `hidden/` (optional): files copied over the graded tree before it is
-  built (hidden regression tests, `tests/run/eval_*.tach`);
+  built (hidden regression tests, `tests/run/eval_*.vl`);
 - `grade.sh` (optional): run last, in the graded tree's root, with
-  `TACHYONC` (the graded compiler), `EVAL_STARTER_TACHYONC` (the
+  `VOLEC` (the graded compiler), `EVAL_STARTER_VOLEC` (the
   starter's compiler), `EVAL_STARTER_TREE` (the starter's source, built)
   and `EVAL_TASK` (the task directory); exit status
   non-zero with a one-line reason on stderr when it fails.
 
 The workspace (`setup_workspace`): `git archive` of the base, the
 starter patch, `bootstrap/eval-build.sh` (lib/eval-build.sh: the
-build bootstrap.sh does for HEAD, from `target/builder/tachyonc`, the
+build bootstrap.sh does for HEAD, from `target/builder/volec`, the
 release that builds the base, since the copy has no tags or cache), the
-starter's compiler in `target/tachyonc` (and `target/tools/tachyonc` for
+starter's compiler in `target/volec` (and `target/tools/volec` for
 compiler-tools), AGENTS.md for the condition, CLAUDE.md and .claude/
 removed (the prompt carries AGENTS.md), (0.17) tests/agent-eval removed
 (the reference solutions), `git init` with one commit."""
@@ -131,7 +131,7 @@ def builder_for(sha, override=None):
     """The compiler that builds the base: the `built_by` release of the last
     [[release]] in the base's bootstrap/releases.toml (the last release
     itself when the base comes after it), from a bootstrap
-    cache (this checkout's, the main checkout's, $TACHYON_BOOTSTRAP_CACHE)."""
+    cache (this checkout's, the main checkout's, $VOLE_BOOTSTRAP_CACHE)."""
     if override:
         if not os.access(override, os.X_OK):
             raise SystemExit("--builder %s is not an executable" % override)
@@ -164,13 +164,13 @@ def builder_for(sha, override=None):
         raise SystemExit("the builder release %s (tag %s) is not tagged here; pass --builder"
                          % (by, tag))
     host = detect_host()
-    caches = [os.environ.get("TACHYON_BOOTSTRAP_CACHE"),
+    caches = [os.environ.get("VOLE_BOOTSTRAP_CACHE"),
               os.path.join(REPO_ROOT, "target", "bootstrap"),
               os.path.join(main_checkout(), "target", "bootstrap")]
     for c in caches:
         if not c:
             continue
-        p = os.path.join(c, host, "%s-%s" % (tag, tsha[:12]), "tachyonc")
+        p = os.path.join(c, host, "%s-%s" % (tag, tsha[:12]), "volec")
         if os.access(p, os.X_OK):
             return p
     raise SystemExit("no bootstrap cache holds %s (%s); run bootstrap/bootstrap.sh, "
@@ -222,7 +222,7 @@ def build(tree, builder, quick=False):
     env["EVAL_BUILDER"] = builder
     argv = ["/bin/sh", "bootstrap/eval-build.sh"] + (["--quick"] if quick else [])
     rc, out, err, secs = run_proc(argv, tree, env, BUILD_TIMEOUT_S)
-    ok = rc == 0 and os.access(os.path.join(tree, "target", "tachyonc"), os.X_OK)
+    ok = rc == 0 and os.access(os.path.join(tree, "target", "volec"), os.X_OK)
     return ok, tail(out + err, 3000), secs
 
 
@@ -231,11 +231,11 @@ _tree_lock = threading.Lock()
 
 def built_tree(task, sha, builder, cache_root, solution=False):
     """A built tree of the starter (or the reference solution), cached under
-    cache_root: its path (target/tachyonc inside)."""
+    cache_root: its path (target/volec inside)."""
     which = "solution" if solution else "starter"
     d = os.path.join(cache_root, "ctask-trees", task.id, sha[:12], which)
     with _tree_lock:
-        if os.access(os.path.join(d, "target", "tachyonc"), os.X_OK) and \
+        if os.access(os.path.join(d, "target", "volec"), os.X_OK) and \
                 os.path.isfile(os.path.join(d, ".built")):
             return d
         make_tree(task, sha, d, solution=solution)
@@ -251,8 +251,8 @@ def built_tree(task, sha, builder, cache_root, solution=False):
 PLAIN_READ = """## Reading and changing the source
 
 Read the source with your file tools (Read, Grep, Glob) or the shell
-(grep, sed, cat), and change it with Edit and Write. Use `tachyonc` to
-build and test: `target/tachyonc check` (the front end's errors, one per
+(grep, sed, cat), and change it with Edit and Write. Use `volec` to
+build and test: `target/volec check` (the front end's errors, one per
 line), compiling programs, `tests/run.sh`.
 """
 
@@ -284,9 +284,9 @@ def agents_md(tree, cond):
             + text[m.end():]
     text = text[:m.start()] + PLAIN_READ + "\n" + text[m.end():]
     # the inner loop's mentions of the hook and the tools binary
-    text = re.sub(r"the check hook's errors \(or (`target/tachyonc check`)\s+when the hook is "
+    text = re.sub(r"the check hook's errors \(or (`target/volec check`)\s+when the hook is "
                   r"not there\)", r"\1", text)
-    text = re.sub(r";\s+when its suite passes it is also\s+`target/tools/tachyonc`, the binary "
+    text = re.sub(r";\s+when its suite passes it is also\s+`target/tools/volec`, the binary "
                   r"to query and edit with;", ";", text)
     left = [w for w in PLAIN_FORBIDDEN if w in text]
     if left:
@@ -296,11 +296,11 @@ def agents_md(tree, cond):
 
 
 # (+rewrite) The query-first hook's paragraph of AGENTS.md as the hook acts
-# in rewrite mode: reads of large .tach files are answered with the query,
+# in rewrite mode: reads of large .vl files are answered with the query,
 # so the block-mode wording (blocked, rerun with `# no-query:`) is left out;
 # shell rewrites are still blocked. Both forms: 0.16's "This is being
 # tested" paragraphs and 0.17's tiered "**Hooks.**" sentence.
-REWRITE_HOOK_TEXT = ("shell reads of large `.tach` files are answered with the matching query "
+REWRITE_HOOK_TEXT = ("shell reads of large `.vl` files are answered with the matching query "
                      "(`sed -n`, `head`, `tail`: `query text`; `cat`: `query items`; `grep`: "
                      "`query refs` or `query grep`), each command of a line on its own; the result "
                      "says what ran. Shell rewrites of compiler source "
@@ -341,13 +341,13 @@ def tools_section(path):
 
 
 # What the compiler-plain AGENTS.md must not mention.
-PLAIN_FORBIDDEN = ("tachyonc query", "query show", "edit patch", "tachyonc refactor", "hook",
-                   "target/tools/tachyonc", "agent-feedback", "no-query")
+PLAIN_FORBIDDEN = ("volec query", "query show", "edit patch", "volec refactor", "hook",
+                   "target/tools/volec", "agent-feedback", "no-query")
 
 
 # ---------------------------------------------------------------- workspace
 
-def setup_workspace(task, cond, sha, ws, builder, starter_tree, env, tools_tachyonc=None):
+def setup_workspace(task, cond, sha, ws, builder, starter_tree, env, tools_volec=None):
     """The agent's copy of the repository (see the module's comment)."""
     from lib.conds import Cond
     make_tree(task, sha, ws)
@@ -365,14 +365,14 @@ def setup_workspace(task, cond, sha, ws, builder, starter_tree, env, tools_tachy
         fh.write(text)
     tgt = os.path.join(ws, "target")
     os.makedirs(os.path.join(tgt, "builder"), exist_ok=True)
-    shutil.copy2(builder, os.path.join(tgt, "builder", "tachyonc"))
-    shutil.copy2(os.path.join(starter_tree, "target", "tachyonc"), os.path.join(tgt, "tachyonc"))
+    shutil.copy2(builder, os.path.join(tgt, "builder", "volec"))
+    shutil.copy2(os.path.join(starter_tree, "target", "volec"), os.path.join(tgt, "volec"))
     if Cond(cond).query_hook:
-        # the tools binary: the starter's, or (0.17, --tools-tachyonc) a
+        # the tools binary: the starter's, or (0.17, --tools-volec) a
         # newer one, so that new tools can be measured on the same tasks
         os.makedirs(os.path.join(tgt, "tools"), exist_ok=True)
-        shutil.copy2(tools_tachyonc or os.path.join(starter_tree, "target", "tachyonc"),
-                     os.path.join(tgt, "tools", "tachyonc"))
+        shutil.copy2(tools_volec or os.path.join(starter_tree, "target", "volec"),
+                     os.path.join(tgt, "tools", "volec"))
     e = dict(env, GIT_AUTHOR_NAME="eval", GIT_AUTHOR_EMAIL="eval@localhost",
              GIT_COMMITTER_NAME="eval", GIT_COMMITTER_EMAIL="eval@localhost")
     for argv in (["git", "init", "-q"],
@@ -437,7 +437,7 @@ def grade(task, src, scratch, builder, starter_compiler):
          "check_ok": None, "check_msg": ""}
     steps = [ok]
     env = base_env("/nonexistent")
-    tc = os.path.join(scratch, "target", "tachyonc")
+    tc = os.path.join(scratch, "target", "volec")
     if ok:
         for f in task.suite:
             rc, out, err, s = run_proc(["/bin/sh", "tests/run.sh", "-c", tc, f], scratch, env,
@@ -469,7 +469,7 @@ def grade(task, src, scratch, builder, starter_compiler):
             g["same_output_msg"] = tail(out + err, 600).strip()
             steps.append(rc == 0)
         if task.check:
-            e = dict(env, TACHYONC=tc, EVAL_STARTER_TACHYONC=starter_compiler,
+            e = dict(env, VOLEC=tc, EVAL_STARTER_VOLEC=starter_compiler,
                      EVAL_STARTER_TREE=os.path.dirname(os.path.dirname(starter_compiler)),
                      EVAL_TASK=task.path)
             rc, out, err, s = run_proc(["/bin/sh", os.path.join(task.path, task.check)],
@@ -517,7 +517,7 @@ def check_ctask(task, base_override, builder_override, root):
             agents_md(st, cond)
         except RuntimeError as e:
             problems.append(str(e))
-    starter_tc = os.path.join(st, "target", "tachyonc")
+    starter_tc = os.path.join(st, "target", "volec")
     try:
         sol = os.path.join(root, "work", task.id, "solution-src")
         make_tree(task, sha, sol, solution=True)
@@ -565,7 +565,7 @@ def regrade_main(args):
     from lib.common import load_tasks, write_json
     tasks = {t.id: t for t in load_tasks(None, None, "compiler")}
     ws_root = os.path.abspath(args.ws_root or os.path.join(
-        os.environ.get("TMPDIR", "/tmp"), "tachyon-eval", "regrade"))
+        os.environ.get("TMPDIR", "/tmp"), "vole-eval", "regrade"))
     os.makedirs(ws_root, exist_ok=True)
     runs, pruns = [], []
     for top in args.rundirs:
@@ -608,7 +608,7 @@ def regrade_main(args):
                 print("skip %s: changes.patch does not apply: %s" % (rdir, r.stderr.strip()[:200]))
                 continue
         g = grade(task, tree, os.path.join(ws_root, "regrade-grade"), builder,
-                  os.path.join(st, "target", "tachyonc"))
+                  os.path.join(st, "target", "volec"))
         write_json(gpath, g)
         prev = {k: res.get(k) for k in ("success", "tests_passed", "tests_total", "build_ok",
                                          "check_ok", "same_output_ok", "grade_summary")}
@@ -626,14 +626,14 @@ def regrade_main(args):
 
 def regrade_programs(args, runs, ws_root):
     """Program-task runs: the kept workspace.tar.gz graded again (build,
-    hidden tests, check.sh) with the compiler under test (--tachyonc), as
+    hidden tests, check.sh) with the compiler under test (--volec), as
     `run` grades it; --tasks, --only-failed and --only-check-failed pick."""
     import tarfile
     from lib.common import load_tasks, write_json
     from lib.grade import grade_dir, prepare_bins
     tasks = {t.id: t for t in load_tasks(None, None, "programs")}
     want = set(filter(None, (args.tasks or "").split(",")))
-    bins = prepare_bins(ws_root, os.path.abspath(args.tachyonc))
+    bins = prepare_bins(ws_root, os.path.abspath(args.volec))
     n = 0
     for rdir in runs:
         with open(os.path.join(rdir, "result.json")) as fh:
@@ -654,7 +654,7 @@ def regrade_programs(args, runs, ws_root):
         # the tarball holds the workspace's files, maybe under one top directory
         top = os.listdir(ws)
         src = os.path.join(ws, top[0]) if len(top) == 1 and os.path.isdir(
-            os.path.join(ws, top[0])) and not os.path.exists(os.path.join(ws, "main.tach")) \
+            os.path.join(ws, top[0])) and not os.path.exists(os.path.join(ws, "main.vl")) \
             and not os.path.exists(os.path.join(ws, "main.rs")) else ws
         lang = res["lang"]
         g = grade_dir(task, lang, src, os.path.join(ws_root, "regrade-grade"), bins[lang])

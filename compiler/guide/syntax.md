@@ -13,7 +13,7 @@ The whole grammar is docs/grammar.md; this is what a program uses.
   true type union unsafe use var while`; `inout` and `sink` (0.20) are
   words where a convention, a binding or a closure starts. Reserved
   (errors): `where`, `dyn`, `@`; `mut` and `move` are Rust's spellings,
-  each a `conv.rust` error naming tachyon's (`var`, `sink ||`). `self`,
+  each a `conv.rust` error naming vole's (`var`, `sink ||`). `self`,
   `Self`, `super`, `crate` are names.
 - Integers: `42`, `1_000`, `0xff`, `0b1010`, with a type suffix
   `255u8`, `7i32`. Floats: `1.5`, `2e10`, `1.5f32`. Chars: `'a'`, `'\n'`,
@@ -125,7 +125,7 @@ From loosest to tightest (all left-associative except where noted):
 
 No `**` (power), no ternary (`if c { a } else { b }` is an
 expression). `e?` (0.15) is postfix, as tight as a call: `parse(s)?.len()`
-(`tachyonc guide conversions`). `return`,
+(`volec guide conversions`). `return`,
 `break`, `continue` have type `!` and fit anywhere:
 `let v = if ok { x } else { return 1 };`.
 

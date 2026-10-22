@@ -1,0 +1,348 @@
+// The contract checks (0.18 T1, design §2.4): what each
+// `std::contract_check(COND, SITE, CHECK)` the compiler makes reports when
+// COND is false, and the message both back ends give the run-time helper.
+//
+// A check is a clause (requires, ensures) or an assertion; its condition is
+// checked one conjunct of its `&&` chain at a time, each conjunct with its
+// own message: `requires failed: 'i < self.len()' of 'Stack::get'
+// (stack.vl:4:14): i = 5, self.len() = 3`. The values are the integer
+// operands of a comparison (or the arguments of a call) that are not
+// literals, at most three, printed by the helper's dprintf; the helper
+// prints the site's `FILE:LINE:COL: ` first.
+
+use crate::base::{
+    IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_clear, buf_int, buf_new, buf_slice, buf_str,
+    out_path,
+};
+use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::contracts::flags::NO_POSITIONS;
+use crate::front::contracts::sites::{file_of_pos, line_col};
+use crate::front::lexer::{Tok, str_at};
+use crate::front::types::{FNS, is_integer, is_signed};
+
+pub const CHK_REQUIRES: i64 = 1;
+pub const CHK_ENSURES: i64 = 2;
+pub const CHK_INVARIANT: i64 = 3;
+pub const CHK_ASSERT: i64 = 4;
+
+// The checks: the kind, the condition as written (a node; its source text
+// is the report's), the `else` message (a Str node, or 0), the function
+// whose clause it is (a Fn node, or 0), the position of the clause (or
+// the assertion), and a text that replaces the condition's (a buffer, or
+// -1: `assert_eq(a, b)` reports 'a == b').
+pub static var CHECK_KIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var CHECK_COND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var CHECK_MESSAGE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var CHECK_OWNER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var CHECK_POS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var CHECK_TEXT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// std::contract_check (a FNS index), once a call of it is checked; -1
+// before.
+pub static var CHECK_FN: i64 = -1;
+
+static var MSG: i64 = -1;
+
+pub fn add_check(kind: i64, cond: i64, message: i64, owner: i64, pos: i64) -> i64 {
+    unsafe {
+        CHECK_KIND.push(kind);
+        CHECK_COND.push(cond);
+        CHECK_MESSAGE.push(message);
+        CHECK_OWNER.push(owner);
+        CHECK_POS.push(pos);
+        CHECK_TEXT.push(-1);
+        CHECK_KIND.count - 1
+    }
+}
+
+// The conjuncts of condition `cond` (its `&&` chain, left to right),
+// pushed to `out`.
+pub fn conjuncts(cond: i64, out: inout IntVec) {
+    unsafe {
+        var c = cond;
+        while NODES[c].kind == NodeKind::Block && NODES[c].count == 0 && NODES[c].a != 0 {
+            c = NODES[c].a;
+        }
+        if NODES[c].kind == NodeKind::Binary && NODES[c].op == Tok::AmpAmp {
+            conjuncts(NODES[c].b, &out);
+            conjuncts(NODES[c].c, &out);
+            return;
+        }
+        out.push(c);
+    }
+}
+
+fn is_literal(n: i64) -> bool {
+    unsafe {
+        let k = NODES[n].kind;
+        if k == NodeKind::Int || k == NodeKind::Float || k == NodeKind::Char || k == NodeKind::Bool
+            || k == NodeKind::Str || k == NodeKind::CStr || k == NodeKind::Unit {
+            return true;
+        }
+        k == NodeKind::Unary && NODES[n].op == Tok::Minus && is_literal(NODES[n].b)
+    }
+}
+
+// Whether the value of n can be shown (an integer), and is evaluated again
+// without harm on the failing path (it is pure, as a condition is; its
+// tree is a simple read: names, fields, calls of names and fields).
+fn shown(n: i64) -> bool {
+    unsafe {
+        let t = NODES[n].ty;
+        if t <= 0 || !is_integer(t) || is_literal(n) {
+            return false;
+        }
+        simple(n, 0)
+    }
+}
+
+fn simple(n: i64, depth: i64) -> bool {
+    unsafe {
+        if depth > 4 {
+            return false;
+        }
+        match NODES[n].kind {
+            NodeKind::Ident | NodeKind::Int | NodeKind::Bool | NodeKind::Char
+                | NodeKind::Path => true,
+            NodeKind::FieldAccess => simple(NODES[n].a, depth + 1),
+            NodeKind::TupleField => simple(NODES[n].a, depth + 1),
+            NodeKind::Unary => simple(NODES[n].b, depth + 1),
+            NodeKind::Cast => simple(NODES[n].a, depth + 1),
+            NodeKind::Call => {
+                if NODES[n].x <= 0 {
+                    return false;
+                }
+                for i in 0..NODES[n].count {
+                    if !simple(child(n, i), depth + 1) {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+fn is_comparison(op: Tok) -> bool {
+    op == Tok::EqEq || op == Tok::BangEq || op == Tok::Lt || op == Tok::LtEq || op == Tok::Gt
+        || op == Tok::GtEq
+}
+
+// The operands of conjunct `conj` whose values the report shows (at most
+// three), pushed to `out`.
+pub fn operands(conj: i64, out: inout IntVec) {
+    unsafe {
+        var c = conj;
+        if NODES[c].kind == NodeKind::Unary && NODES[c].op == Tok::Bang {
+            c = NODES[c].b;
+        }
+        if NODES[c].kind == NodeKind::Binary && is_comparison(NODES[c].op) {
+            if shown(NODES[c].b) {
+                out.push(NODES[c].b);
+            }
+            if shown(NODES[c].c) {
+                out.push(NODES[c].c);
+            }
+            return;
+        }
+        if NODES[c].kind == NodeKind::Call {
+            for i in 0..NODES[c].count {
+                let a = child(c, i);
+                if out.count < 3 && shown(a) {
+                    out.push(a);
+                }
+            }
+        }
+    }
+}
+
+// The values the report of conjunct `conj` of contract check `call` shows,
+// pushed to `out`: the holes of an f-string message (the call's arguments
+// after the third), or the conjunct's operands.
+pub fn check_values(call: i64, conj: i64, out: inout IntVec) {
+    unsafe {
+        let check = NODES[child(call, 2)].a;
+        let message = CHECK_MESSAGE.data[check];
+        if message != 0 && NODES[message].kind == NodeKind::Interp {
+            for i in 3..NODES[call].count {
+                out.push(child(call, i));
+            }
+            return;
+        }
+        operands(conj, &out);
+    }
+}
+
+// The source text of node n, on one line (runs of whitespace one space),
+// '%' doubled for the helper's format, cut at `room` bytes.
+fn put_text(out: i64, n: i64, room: i64) {
+    unsafe {
+        let start = NODES[n].start;
+        let end = NODES[n].end;
+        var space = false;
+        var put = 0;
+        for i in start..end {
+            let c = SRC[i];
+            if c == ' ' || c == '\n' || c == '\t' || c == '\r' {
+                space = true;
+                continue;
+            }
+            if space && put > 0 {
+                buf_byte(out, ' ');
+            }
+            space = false;
+            if put >= room {
+                buf_str(out, c"...");
+                return;
+            }
+            if c == '%' {
+                buf_byte(out, '%');
+            }
+            buf_byte(out, c);
+            put += 1;
+        }
+    }
+}
+
+fn put_escaped(out: i64, s: [u8]) {
+    for i in 0..s.len {
+        if s[i] == '%' {
+            buf_byte(out, '%');
+        }
+        buf_byte(out, s[i]);
+    }
+}
+
+// `FILE:LINE:COL` of position pos.
+pub fn put_position(out: i64, pos: i64) {
+    unsafe {
+        let file = file_of_pos(pos);
+        var col = 0;
+        let line = line_col(file, pos, &col);
+        let path = out_path(file);
+        var k = 0;
+        while path[k] != 0 {
+            if path[k] == '%' {
+                buf_byte(out, '%');
+            }
+            buf_byte(out, path[k]);
+            k += 1;
+        }
+        buf_byte(out, ':');
+        buf_int(out, line);
+        buf_byte(out, ':');
+        buf_int(out, col);
+    }
+}
+
+// The name of function f in reports: its display, without the `$pre`
+// of a requires' companion.
+fn put_owner(out: i64, f: i64) {
+    unsafe {
+        let text = SYMS[FNS[f].display].text;
+        var n = text.len as i64;
+        for i in 0..n {
+            if text[i] == '$' {
+                n = i;
+                break;
+            }
+        }
+        put_escaped(out, text[0..n]);
+    }
+}
+
+// The message (a string id: the helper's format) of conjunct `conj` of
+// check `check`, made in function `f` (a FNS index), with `ops` the
+// operands shown (as `operands` gave them).
+pub fn check_message(check: i64, conj: i64, ops: IntVec, f: i64) -> i64 {
+    unsafe {
+        if MSG < 0 {
+            MSG = buf_new();
+        }
+        let out = MSG;
+        buf_clear(out);
+        let kind = CHECK_KIND.data[check];
+        let message = CHECK_MESSAGE.data[check];
+        let interp = message != 0 && NODES[message].kind == NodeKind::Interp;
+        if message != 0 && NODES[message].kind == NodeKind::Str {
+            put_escaped(out, str_at(NODES[message].a));
+        } else if interp {
+            // (an f-string: its holes are the values, as the call passes them)
+            var holes = 0;
+            for i in 0..NODES[message].count {
+                let piece = child(message, i);
+                if NODES[piece].kind == NodeKind::Str {
+                    put_escaped(out, str_at(NODES[piece].a));
+                } else if holes < 3 {
+                    buf_str(out, c"%lld");
+                    holes += 1;
+                }
+            }
+            buf_byte(out, '\n');
+            return keep_message(out);
+        } else {
+            buf_str(out, if kind == CHK_REQUIRES { c"requires failed: '" }
+                else if kind == CHK_ENSURES { c"ensures failed: '" }
+                else if kind == CHK_INVARIANT { c"invariant failed: '" }
+                else { c"assertion failed: '" });
+            if CHECK_TEXT.data[check] >= 0 {
+                put_escaped(out, buf_slice(CHECK_TEXT.data[check]));
+            } else {
+                put_text(out, conj, 120);
+            }
+            buf_byte(out, '\'');
+            if kind == CHK_REQUIRES || kind == CHK_ENSURES {
+                buf_str(out, c" of '");
+                put_owner(out, f);
+                buf_byte(out, '\'');
+                if kind == CHK_REQUIRES && !NO_POSITIONS {
+                    buf_str(out, c" (");
+                    put_position(out, CHECK_POS.data[check]);
+                    buf_byte(out, ')');
+                }
+            }
+        }
+        for i in 0..ops.count {
+            buf_str(out, if i == 0 { c": " } else { c", " });
+            let op = ops.data[i];
+            put_text(out, op, 40);
+            buf_str(out, if is_signed(NODES[op].ty) { c" = %lld" } else { c" = %llu" });
+        }
+        buf_byte(out, '\n');
+        keep_message(out)
+    }
+}
+
+// The messages made (buffers), each once: check_message's results.
+static var MESSAGES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// Message `out` kept (or the same one found): its number.
+fn keep_message(out: i64) -> i64 {
+    unsafe {
+        let text = buf_slice(out);
+        for i in 0..MESSAGES.count {
+            if buf_slice(MESSAGES.data[i]) == text {
+                return i;
+            }
+        }
+        let b = buf_new();
+        buf_bytes(b, text);
+        MESSAGES.push(b);
+        MESSAGES.count - 1
+    }
+}
+
+// The text of message `m` (check_message's number).
+pub fn message_text(m: i64) -> [u8] {
+    unsafe { buf_slice(MESSAGES.data[m]) }
+}
+
+// (0.18) The number of a fixed message (its text ends in a newline), for a
+// check that is not a clause: `p as NonNull<T>` of a null p
+// (front/check/distinct.vl).
+pub fn fixed_message(text: [u8]) -> i64 {
+    let out = buf_new();
+    buf_bytes(out, text);
+    keep_message(out)
+}

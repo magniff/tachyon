@@ -1,0 +1,983 @@
+// std::fmt: printing, Display and Debug, and Fmt, the formatter (0.20: from flat/fmt.vl).
+
+use std::{Allocator, Buf, Gpa, Vec, decimal_len, memcpy, put_decimal, strlen, write};
+use std::num::{FloatFmt, write_f32, write_f64};
+use std::sync::RawLock;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+extern "C" {
+    #[effects()]
+    fn snprintf(buf: *u8, n: u64, format: *u8, ...) -> i32;
+    #[effects()]
+    fn strtod(s: *u8, end: **u8) -> f64;
+    #[effects()]
+    fn strtof(s: *u8, end: **u8) -> f32;
+    #[link_name = "pthread_self"]
+    #[effects()]
+    fn fmt_c_thread_self() -> u64;
+}
+
+// ---- Printing ----
+
+// (0.21) Printing from several threads: once a thread was started
+// (std::thread::spawn sets FMT_THREADED), each print holds a lock while it
+// fills std's buffer and writes it, so lines do not mix and the buffer is
+// never shared. A print inside a print (a Display that prints) on the
+// thread holding it takes nothing more.
+static var FMT_THREADED: AtomicU32 = AtomicU32 { v: 0 };
+static var FMT_LOCK: RawLock = RawLock { state: AtomicU32 { v: 0 } };
+static var FMT_OWNER: AtomicU64 = AtomicU64 { v: 0 };
+// The holder's prints in progress (prints inside prints).
+static var FMT_DEPTH: i64 = 0;
+
+// Called before the first thread starts.
+pub fn print_threads_started() {
+    FMT_THREADED.store(1, Ordering::Release);
+}
+
+#[inline]
+fn print_acquire() {
+    if FMT_THREADED.load(Ordering::Relaxed) != 0 {
+        print_acquire_held();
+    }
+}
+
+#[inline(never)]
+fn print_acquire_held() {
+    let me = unsafe { fmt_c_thread_self() };
+    if FMT_OWNER.load(Ordering::Relaxed) != me {
+        FMT_LOCK.lock();
+        FMT_OWNER.store(me, Ordering::Relaxed);
+    }
+    FMT_DEPTH += 1;
+}
+
+#[inline]
+fn print_release() {
+    if FMT_THREADED.load(Ordering::Relaxed) != 0 {
+        print_release_held();
+    }
+}
+
+#[inline(never)]
+fn print_release_held() {
+    let me = unsafe { fmt_c_thread_self() };
+    if FMT_OWNER.load(Ordering::Relaxed) != me {
+        return;
+    }
+    FMT_DEPTH -= 1;
+    if FMT_DEPTH == 0 {
+        FMT_OWNER.store(0, Ordering::Relaxed);
+        FMT_LOCK.unlock();
+    }
+}
+
+// What `print(f"...")` and its kin compile to (front/check/interp.vl):
+// `let mut __out = std::__print_begin(1); WRITES; std::__print_end(&mut
+// __out);`. Not for programs to call.
+#[inline]
+pub fn __print_begin(fd: i32) -> Fmt {
+    print_acquire();
+    Fmt::to_fd(fd)
+}
+
+#[inline]
+pub fn __print_end(f: inout Fmt) {
+    f.flush();
+    print_release();
+}
+
+// x's Display (`print("text")`, `print(f"{a} {b:?}")`): one `write`.
+pub fn print<T: Display>(x: sink T) {
+    print_acquire();
+    var f = Fmt::to_fd(1);
+    x.fmt(&f);
+    f.flush();
+    print_release();
+}
+
+pub fn println<T: Display>(x: sink T) {
+    print_acquire();
+    var f = Fmt::to_fd(1);
+    x.fmt(&f);
+    f.byte('\n');
+    f.flush();
+    print_release();
+}
+
+#[inline(never)]
+pub fn print_int(v: i64) {
+    print_acquire();
+    var f = Fmt::to_fd(1);
+    // (decimal only: not Fmt::int, whose hex and binary every program
+    // using print_int would compile)
+    let negative = v < 0;
+    fmt_decimal(&f, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative);
+    f.flush();
+    print_release();
+}
+
+// A C string (up to its NUL).
+pub unsafe fn print_cstr(s: *u8) {
+    print_acquire();
+    var f = Fmt::to_fd(1);
+    f.str(s[0..strlen(s) as i64]);
+    f.flush();
+    print_release();
+}
+
+// ---- Display, Debug and Fmt (0.15) ----
+
+// x's Display on stderr.
+pub fn eprint<T: Display>(x: sink T) {
+    print_acquire();
+    var f = Fmt::to_fd(2);
+    x.fmt(&f);
+    f.flush();
+    print_release();
+}
+
+pub fn eprintln<T: Display>(x: sink T) {
+    print_acquire();
+    var f = Fmt::to_fd(2);
+    x.fmt(&f);
+    f.byte('\n');
+    f.flush();
+    print_release();
+}
+
+// x's Display in a new Buf on allocator a, of its length (the caller frees
+// it): `format_in(f"{x:>8}", gpa)`. (0.16: up to 256 bytes, x's Display
+// runs once, into a buffer on the stack.)
+pub fn format_in<T: Display, A: Allocator>(x: sink T, a: sink A) -> Buf<A> {
+    var b: Buf<A> = Buf::new_in(a);
+    var tmp: [u8; 256] = [0; 256];
+    var f = __fmt_tmp(&tmp);
+    // (one call of x's Display in the code: first to tmp, then, when the
+    // text did not fit, to b's room)
+    loop {
+        x.fmt(&f);
+        if __fmt_in_end(&b, &f, &tmp) {
+            return b;
+        }
+    }
+}
+
+// (0.17) What the compiler writes for an f-string passed straight to
+// format_in, push_fmt, print, println, eprint or eprintln
+// (front/check/interp.vl): the holes' values, then the writes of
+// the text in place, with no closure. `format_in(f"..", a)` is
+//
+//   { let __f0 = e0; ...; let __a = a; let mut __b = std::Buf::new_in(__a);
+//     let mut __t = [0u8; 256]; let mut __out = std::__fmt_tmp(&mut __t);
+//     loop { WRITES; if std::__fmt_in_end(&mut __b, &mut __out, &__t) { break; } }
+//     __b }
+//
+// and `b.push_fmt(f"..")` is `{ let __r = &b; let __f0 = e0; ...; let mut
+// __out = std::__buf_fmt(&mut *__r); loop { WRITES; if
+// std::__buf_fmt_end(&mut *__r, &mut __out) { break; } } }`. Not for programs to call.
+
+// A Fmt writing into tmp (format_in's first pass).
+#[inline]
+#[views(tmp)]
+pub fn __fmt_tmp(tmp: inout [u8; 256]) -> Fmt {
+    var f = Fmt::to_fd(-1);
+    f.out = tmp[..];
+    f
+}
+
+// The end of a pass of format_in: the text written to tmp, when it fits,
+// copied to b, of its length (true); else b reserves the length and f
+// writes into b's room (false); after that pass, as __buf_fmt_end.
+// (0.20: tmp is format_in's buffer itself, compared by its address: a raw
+// pointer, as a let parameter would copy it)
+pub fn __fmt_in_end<A: Allocator>(b: inout Buf<A>, f: inout Fmt, tmp: *[u8; 256]) -> bool {
+    if f.out.ptr != unsafe { (*tmp)[..].ptr } {
+        return fmt_end_vec(&b.bytes, &f);
+    }
+    if f.need == 0 {
+        b.bytes.reserve(f.len);
+        b.bytes.extend_from_slice(unsafe { (*tmp)[0..f.len] });
+        return true;
+    }
+    b.bytes.reserve(f.need);
+    f = fmt_to_vec(&b.bytes);
+    false
+}
+
+// A Fmt writing into b's room (push_fmt).
+#[inline]
+#[views(b)]
+pub fn __buf_fmt<A: Allocator>(b: inout Buf<A>) -> Fmt {
+    fmt_to_vec(&b.bytes)
+}
+
+// The text f wrote is b's (true), or did not fit: b grows, f starts again.
+#[inline]
+pub fn __buf_fmt_end<A: Allocator>(b: inout Buf<A>, f: inout Fmt) -> bool {
+    fmt_end_vec(&b.bytes, &f)
+}
+
+#[ambient("format_in(x, gpa)")]
+pub fn format<T: Display>(x: sink T) -> Buf {
+    format_in(x, Gpa::ambient())
+}
+
+impl<A: Allocator> Buf<A> {
+    // Appends x's Display: `b.push_fmt(f"{k}={v};")`. (0.16: into the room
+    // the Buf has; when the text does not fit, the Buf grows and x's
+    // Display runs again.)
+    pub fn push_fmt<T: Display>(inout self, x: sink T) {
+        var f = __buf_fmt(&self);
+        loop {
+            x.fmt(&f);
+            if __buf_fmt_end(&self, &f) {
+                return;
+            }
+        }
+    }
+}
+
+// A Fmt writing into v's room.
+#[inline]
+pub fn fmt_to_vec<A: Allocator>(v: inout Vec<u8, A>) -> Fmt {
+    var f = Fmt::to_fd(-1);
+    f.out = unsafe { v.ptr[0..v.cap] };
+    f.len = v.len;
+    f
+}
+
+// The text f wrote into v's room is v's (true), or did not fit: v grows to
+// fit it, f starts again (false).
+pub fn fmt_end_vec<A: Allocator>(v: inout Vec<u8, A>, f: inout Fmt) -> bool {
+    if f.need == 0 {
+        v.len = f.len;
+        return true;
+    }
+    v.reserve(f.need - v.len);
+    f = fmt_to_vec(&v);
+    false
+}
+
+// (0.20) x's Display written into out: its length, or -1 when it did not
+// fit (std::io's write_fmt).
+pub fn __fmt_into_len<T: Display>(out: inout [u8], x: T) -> i64 {
+    var f = Fmt::to_fd(-1);
+    f.out = out;
+    x.fmt(&f);
+    if f.need == 0 { f.len } else { -1 }
+}
+
+// (0.20) Writes out what print and println have buffered (std::io's
+// stdout() writes after it).
+pub fn __flush_print() {
+    fmt_flush();
+}
+
+// `{x}` in an f-string, and what print writes.
+pub trait Display { fn fmt(self, f: inout Fmt); }
+
+// `{x:?}`: as the code that makes it.
+pub trait Debug { fn fmt_debug(self, f: inout Fmt); }
+
+// A spec's flags (front/ast.vl's FMT_*): `<`, `>`, `0`, `x`, `X`, `b`,
+// `c`; spec adds FMT_PAD to a hole with a width or a precision, and a
+// number written first in such a hole adds FMT_NUM (right-aligned,
+// zero-padded after its sign, not cut by the precision).
+const FMT_LEFT: i64 = 1;
+const FMT_RIGHT: i64 = 2;
+const FMT_ZERO: i64 = 4;
+const FMT_HEX: i64 = 8;
+const FMT_UPPER: i64 = 16;
+const FMT_BIN: i64 = 32;
+const FMT_CHAR: i64 = 64;
+const FMT_NUM: i64 = 128;
+const FMT_PAD: i64 = 256;
+
+// The buffer of stdout and stderr: FMT_LEN bytes for FMT_FD; FMT_DONE
+// bytes were written out before them (FMT_DONE + FMT_LEN: the position a
+// spec marks).
+const FMT_CAP: i64 = 4096;
+static var FMT_OUT: [u8; 4096] = [0; 4096];
+static var FMT_LEN: i64 = 0;
+static var FMT_FD: i32 = 1;
+static var FMT_DONE: i64 = 0;
+
+// Writes the buffer out.
+#[inline(never)]
+fn fmt_flush() {
+    var i = 0;
+    // (each round writes a byte at least)
+    for _ in 0..FMT_LEN {
+        if i >= FMT_LEN {
+            break;
+        }
+        let rest = FMT_OUT[i..FMT_LEN];
+        let n = unsafe { write(FMT_FD, rest.ptr, rest.len as u64) };
+        if n <= 0 {
+            break;
+        }
+        i += n;
+    }
+    FMT_DONE += FMT_LEN;
+    FMT_LEN = 0;
+}
+
+// The next n bytes of f's destination, taken, when they fit (the Buf has
+// the room, the buffer holds FMT_FD's bytes); else an empty slice.
+#[inline]
+fn fmt_room(f: inout Fmt, n: i64) -> [u8] {
+    let at = f.len;
+    if at + n <= f.out.len {
+        f.len = at + n;
+        return unsafe { f.out.ptr[at..at + n] };
+    }
+    if f.fd == FMT_FD && FMT_LEN + n <= FMT_CAP {
+        let at = FMT_LEN;
+        FMT_LEN = at + n;
+        return FMT_OUT[at..at + n];
+    }
+    ""
+}
+
+// fmt_room when they do not fit (n: at most FMT_CAP): the buffer written
+// out first; to a Buf, an empty slice, the n bytes counted (fmt_lost). (A
+// Fmt's file descriptor or Buf is chosen inline, so that print compiles
+// only the file descriptor's functions.)
+#[inline]
+fn fmt_make_room(f: inout Fmt, n: i64) -> [u8] {
+    if f.fd >= 0 { fmt_fd_room(f.fd, n) } else { fmt_lost(&f, n) }
+}
+
+#[inline(never)]
+fn fmt_fd_room(fd: i32, n: i64) -> [u8] {
+    if fd != FMT_FD || FMT_LEN + n > FMT_CAP {
+        fmt_flush();
+        FMT_FD = fd;
+    }
+    let at = FMT_LEN;
+    FMT_LEN = at + n;
+    FMT_OUT[at..at + n]
+}
+
+// n bytes to a Buf that has no room for them: counted, not written (the
+// text is written again, push_fmt).
+#[inline(never)]
+fn fmt_lost(f: inout Fmt, n: i64) -> [u8] {
+    let end = f.len + n;
+    if end > f.need {
+        f.need = end;
+    }
+    f.len = end;
+    ""
+}
+
+// Fmt::str (a call: an f-string's text is one).
+#[inline]
+fn fmt_str(f: inout Fmt, s: [u8]) {
+    if f.fd >= 0 {
+        fmt_str_fd(f.fd, s);
+    } else {
+        fmt_str_buf(&f, s);
+    }
+}
+
+#[inline(never)]
+fn fmt_str_fd(fd: i32, s: [u8]) {
+    let n = s.len;
+    var out: [u8] = "";
+    if fd == FMT_FD && FMT_LEN + n <= FMT_CAP {
+        let at = FMT_LEN;
+        FMT_LEN = at + n;
+        out = FMT_OUT[at..at + n];
+    } else if n > FMT_CAP {
+        // (written directly)
+        fmt_flush();
+        FMT_FD = fd;
+        var i = 0;
+        for _ in 0..n {
+            if i >= n {
+                break;
+            }
+            let rest = s[i..n];
+            let k = unsafe { write(fd, rest.ptr, rest.len as u64) };
+            if k <= 0 {
+                break;
+            }
+            i += k;
+        }
+        FMT_DONE += n;
+        return;
+    } else {
+        out = fmt_fd_room(fd, n);
+    }
+    unsafe {
+        memcpy(out.ptr, s.ptr, n as u64);
+    }
+}
+
+#[inline(never)]
+fn fmt_str_buf(f: inout Fmt, s: [u8]) {
+    let at = f.len;
+    let n = s.len;
+    if at + n <= f.out.len {
+        unsafe {
+            memcpy(&f.out.ptr[at], s.ptr, n as u64);
+        }
+        f.len = at + n;
+    } else {
+        fmt_lost(&f, n);
+    }
+}
+
+// Fmt::byte when it does not fit.
+#[inline]
+fn fmt_byte(f: inout Fmt, b: u8) {
+    let out = fmt_make_room(&f, 1);
+    if out.len == 1 {
+        out[0] = b;
+    }
+}
+
+// u's decimal digits, after a '-' when negative.
+#[inline]
+fn fmt_decimal(f: inout Fmt, u: u64, negative: bool) {
+    let len = if negative { decimal_len(u) + 1 } else { decimal_len(u) };
+    var out = fmt_room(&f, len);
+    if out.len != len {
+        out = fmt_make_room(&f, len);
+        if out.len != len {
+            return;
+        }
+    }
+    unsafe {
+        put_decimal(out.ptr, len, u, negative);
+    }
+}
+
+// What Display and Debug write to: a file descriptor `fd` (through std's
+// buffer: `flush` writes it out), or (fd -1) the room out[len..] of a
+// Buf, `need` the length the text reached when it did not fit (0: it
+// fits). (0.17) A view: `out`, the Buf's room, so a Buf cannot change while
+// a Fmt writes into it. `width`, `prec` (-1: none) and `flags` are the spec of the hole
+// being written, `mark` the position it started at. (0.16: sealed; std's
+// functions make one.)
+#[sealed]
+pub struct Fmt {
+    out: [u8], len: i64, need: i64, fd: i32, width: i64, prec: i64, flags: i64,
+    mark: i64,
+}
+
+impl Fmt {
+    #[inline]
+    #[views()]
+    pub fn to_fd(fd: i32) -> Fmt {
+        Fmt {
+            out: "", len: 0, need: 0, fd: fd, width: -1, prec: -1, flags: 0, mark: 0
+        }
+    }
+
+    #[inline]
+    pub fn str(inout self, s: [u8]) {
+        fmt_str(&self, s);
+    }
+
+    #[inline]
+    pub fn byte(inout self, b: u8) {
+        let at = self.len;
+        if at < self.out.len {
+            unsafe {
+                self.out.ptr[at] = b;
+            }
+            self.len = at + 1;
+            return;
+        }
+        if self.fd == FMT_FD && FMT_LEN < FMT_CAP {
+            let out: *u8 = &FMT_OUT[0];
+            unsafe {
+                out[FMT_LEN] = b;
+            }
+            FMT_LEN += 1;
+            return;
+        }
+        fmt_byte(&self, b);
+    }
+
+    // Writes out what a Fmt to a file descriptor has buffered (print does).
+    #[inline]
+    pub fn flush(inout self) {
+        if self.fd >= 0 {
+            fmt_flush();
+        }
+    }
+
+    // x's Display: `f.write(f"({self.x}, {self.y})")` in a Display impl.
+    #[inline]
+    pub fn write<T: Display>(inout self, x: sink T) {
+        x.fmt(&self);
+    }
+
+    #[inline]
+    pub fn display<T: Display>(inout self, x: T) {
+        x.fmt(&self);
+    }
+
+    #[inline]
+    pub fn debug<T: Debug>(inout self, x: T) {
+        x.fmt_debug(&self);
+    }
+
+    // The position written to.
+    fn pos(inout self) -> i64 {
+        if self.fd >= 0 { FMT_DONE + FMT_LEN } else { self.len }
+    }
+
+    // Starts a hole with a spec (width w, precision p, -1: none; FMT_*
+    // flags): what is written up to end_spec, given the result, is padded
+    // to w. The buffer is first written out unless w bytes fit in it, so
+    // the hole's text is either all in it or at least w long.
+    #[inline]
+    pub fn spec(inout self, w: i64, p: i64, flags: i64) -> FmtSpec {
+        let old = FmtSpec {
+            width: self.width, prec: self.prec, flags: self.flags, mark: self.mark
+        };
+        self.flags = flags;
+        if w > 0 || p >= 0 {
+            if self.fd >= 0 && (self.fd != FMT_FD || FMT_CAP - FMT_LEN < w) {
+                fmt_flush();
+                FMT_FD = self.fd;
+            }
+            self.width = w;
+            self.prec = p;
+            self.flags = flags | FMT_PAD;
+            self.mark = self.pos();
+        }
+        old
+    }
+
+    // Ends the hole `spec` started (`old`: what it returned).
+    #[inline]
+    pub fn end_spec(inout self, old: FmtSpec) {
+        if (self.flags & FMT_PAD) != 0 {
+            fmt_pad(&self);
+        }
+        self.width = old.width;
+        self.prec = old.prec;
+        self.flags = old.flags;
+        self.mark = old.mark;
+    }
+
+    // v in decimal (x, X, b: in hex or binary, as a u64; c: its low byte).
+    #[inline(never)]
+    pub fn int(inout self, v: i64) {
+        if self.flags != 0 {
+            if (self.flags & (FMT_HEX | FMT_BIN | FMT_CHAR)) != 0 {
+                fmt_radix(&self, v as u64);
+            } else {
+                let negative = v < 0;
+                fmt_spec_decimal(&self, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 },
+                    negative);
+            }
+            return;
+        }
+        let negative = v < 0;
+        fmt_decimal(&self, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative);
+    }
+
+    // v in decimal, hex (x, X), binary (b), or as a byte (c).
+    #[inline(never)]
+    pub fn uint(inout self, v: u64) {
+        if self.flags != 0 {
+            if (self.flags & (FMT_HEX | FMT_BIN | FMT_CHAR)) != 0 {
+                fmt_radix(&self, v);
+            } else {
+                fmt_spec_decimal(&self, v, false);
+            }
+            return;
+        }
+        fmt_decimal(&self, v, false);
+    }
+}
+
+// Fmt::int and Fmt::uint with a spec of a decimal: u, after a '-' when
+// negative.
+#[inline(never)]
+fn fmt_spec_decimal(f: inout Fmt, u: u64, negative: bool) {
+    fmt_number_start(&f);
+    fmt_decimal(&f, u, negative);
+}
+
+// A number starts here: when nothing of the hole is written yet, the hole
+// is a number's (right-aligned, zero-padded after the sign).
+fn fmt_number_start(f: inout Fmt) {
+    if (f.flags & FMT_PAD) != 0 && f.pos() == f.mark {
+        f.flags |= FMT_NUM;
+    }
+}
+
+// v in hex or binary, or its low byte (c).
+#[inline(never)]
+fn fmt_radix(f: inout Fmt, v: u64) {
+    let flags = f.flags;
+    if (flags & FMT_CHAR) != 0 {
+        f.byte(v as u8);
+        return;
+    }
+    fmt_number_start(&f);
+    let shift: u64 = if (flags & FMT_HEX) != 0 { 4 } else { 1 };
+    let mask = (1u64 << shift) - 1;
+    let digits = if (flags & FMT_UPPER) != 0 { "0123456789ABCDEF" } else { "0123456789abcdef" };
+    var n = 1;
+    var bits = shift;
+    for _ in 0..64 {
+        if bits >= 64 || (v >> bits) == 0 {
+            break;
+        }
+        n += 1;
+        bits += shift;
+    }
+    var out = fmt_room(&f, n);
+    if out.len != n {
+        out = fmt_make_room(&f, n);
+        if out.len != n {
+            return;
+        }
+    }
+    var u = v;
+    unsafe {
+        let p = out.ptr;
+        for k in 0..n {
+            p[n - 1 - k] = digits.ptr[(u & mask) as i64];
+            u = u >> shift;
+        }
+    }
+}
+
+// A signed integer of `bits` bits: in hex or binary as its unsigned value
+// of that size (Rust's `{:x}` of -1i8 is ff).
+pub fn fmt_signed(f: inout Fmt, v: i64, bits: u64) {
+    if v < 0 && (f.flags & (FMT_HEX | FMT_BIN)) != 0 {
+        f.uint((v as u64) & ((1u64 << bits) - 1));
+    } else {
+        f.int(v);
+    }
+}
+
+// The padding and truncation of the hole f.spec started.
+#[inline(never)]
+fn fmt_pad(f: inout Fmt) {
+    let flags = f.flags;
+    let start = f.mark;
+    var end = f.pos();
+    let number = (flags & FMT_NUM) != 0;
+    let reach = if f.fd >= 0 { start >= FMT_DONE && f.fd == FMT_FD } else { true };
+    // (a precision cuts text)
+    if f.prec >= 0 && !number && end - start > f.prec && reach {
+        end = start + f.prec;
+        if f.fd >= 0 {
+            FMT_LEN = end - FMT_DONE;
+        } else {
+            f.len = end;
+        }
+    }
+    let pad = f.width - (end - start);
+    if pad <= 0 {
+        return;
+    }
+    if (flags & FMT_LEFT) != 0 || (flags & FMT_RIGHT) == 0 && !number {
+        for i in 0..pad {
+            f.byte(' ');
+        }
+        return;
+    }
+    if !reach {
+        return;
+    }
+    // Right-aligned: the text moves right by pad, after the sign when zeros
+    // fill.
+    let zeros = number && (flags & FMT_ZERO) != 0;
+    var text: *u8 = 0 as *u8;
+    var base = 0;
+    if f.fd >= 0 {
+        // (spec made room for the width)
+        text = &FMT_OUT[0];
+        base = FMT_DONE;
+        FMT_LEN += pad;
+    } else {
+        // (when the text was lost or the room is short: counted)
+        if f.need != 0 || f.len + pad > f.out.len {
+            fmt_lost(&f, pad);
+            return;
+        }
+        text = f.out.ptr;
+        f.len += pad;
+    }
+    var at = start - base;
+    unsafe {
+        if zeros && end > start && (text[at] == '-' || text[at] == '+') {
+            at += 1;
+        }
+        let count = end - base - at;
+        for k in 0..count {
+            let i = count - 1 - k;
+            text[at + pad + i] = text[at + i];
+        }
+        for k in 0..pad {
+            text[at + k] = if zeros { '0' } else { ' ' };
+        }
+    }
+}
+
+// Text in quotes, escaped as Rust's Debug of a str does.
+#[inline(never)]
+pub fn fmt_quoted(f: inout Fmt, s: [u8]) {
+    f.byte('"');
+    var from = 0;
+    for i in 0..s.len {
+        let c = s[i];
+        if c == '"' || c == '\\' || c < 32 || c == 127 {
+            f.str(s[from..i]);
+            from = i + 1;
+            f.byte('\\');
+            if c == '\n' {
+                f.byte('n');
+            } else if c == '\t' {
+                f.byte('t');
+            } else if c == '\r' {
+                f.byte('r');
+            } else if c == 0 {
+                f.byte('0');
+            } else if c == '"' || c == '\\' {
+                f.byte(c);
+            } else {
+                let hex = "0123456789abcdef";
+                f.str("u{");
+                if c >= 16 {
+                    f.byte(hex[(c >> 4) as i64]);
+                }
+                f.byte(hex[(c & 15) as i64]);
+                f.byte('}');
+            }
+        }
+    }
+    f.str(s[from..s.len]);
+    f.byte('"');
+}
+
+// The elements of s, as Debug writes a Vec: `[1, 2, 3]`.
+pub fn debug_list<T: Debug>(f: inout Fmt, s: [T]) {
+    f.byte('[');
+    for i in 0..s.len {
+        if i > 0 {
+            f.str(", ");
+        }
+        f.debug(s[i]);
+    }
+    f.byte(']');
+}
+
+// An f-string's value: its holes' values, and a closure that writes the
+// text.
+pub struct Interp<F> { f: F }
+
+impl<F: Fn(inout Fmt)> Display for Interp<F> {
+    #[inline]
+    fn fmt(self, out: inout Fmt) {
+        (self.f)(&out);
+    }
+}
+
+// ---- Fmt's holes (0.16) ----
+
+// The spec of the hole a Fmt was writing, which Fmt::spec saves and
+// end_spec puts back (0.16).
+pub struct FmtSpec { width: i64, prec: i64, flags: i64, mark: i64 }
+
+impl Fmt {
+    // An f-string's hole of a decimal integer with a spec of width w and
+    // flags (`{n:>5}`, `{n:05}`): what spec, int and end_spec write, in one
+    // pass (0.16).
+    #[inline]
+    pub fn int_hole(inout self, v: i64, w: i64, flags: i64) {
+        let negative = v < 0;
+        fmt_hole(&self, if negative { (-(v + 1)) as u64 + 1 } else { v as u64 }, negative, w,
+            flags);
+    }
+
+    #[inline]
+    pub fn uint_hole(inout self, v: u64, w: i64, flags: i64) {
+        fmt_hole(&self, v, false, w, flags);
+    }
+}
+
+// Fmt::int_hole: u (after a '-' when negative) padded to w: with spaces
+// before it (after it: FMT_LEFT), or zeros after its sign (FMT_ZERO).
+#[inline(never)]
+fn fmt_hole(f: inout Fmt, u: u64, negative: bool, w: i64, flags: i64) {
+    let n = if negative { decimal_len(u) + 1 } else { decimal_len(u) };
+    let pad = w - n;
+    if pad <= 0 {
+        fmt_decimal(&f, u, negative);
+        return;
+    }
+    if w > FMT_CAP {
+        // (as spec and end_spec do)
+        let old = f.spec(w, -1, flags);
+        fmt_number_start(&f);
+        fmt_decimal(&f, u, negative);
+        f.end_spec(old);
+        return;
+    }
+    var out = fmt_room(&f, w);
+    if out.len != w {
+        out = fmt_make_room(&f, w);
+        if out.len != w {
+            return;
+        }
+    }
+    unsafe {
+        let p = out.ptr;
+        if (flags & FMT_LEFT) != 0 {
+            put_decimal(p, n, u, negative);
+            for k in n..w {
+                p[k] = ' ';
+            }
+        } else {
+            put_decimal(&p[pad], n, u, negative);
+            let fill: u8 = if (flags & FMT_ZERO) != 0 { '0' } else { ' ' };
+            for k in 0..pad {
+                p[k] = fill;
+            }
+            if negative && fill == '0' {
+                p[0] = '-';
+                p[pad] = '0';
+            }
+        }
+    }
+}
+
+// ---- Display and Debug of floats (0.20) ----
+
+// (A section of its own, read only by programs that have floats: a float
+// literal, `f64` or `f32`, an `import` (front/modules/stdsections.vl);
+// with it the shortest digits and the powers of ten.)
+
+impl Display for f64 {
+    #[inline]
+    fn fmt(self, f: inout Fmt) { fmt_float(&f, self, false, false); }
+}
+
+impl Debug for f64 {
+    #[inline]
+    fn fmt_debug(self, f: inout Fmt) { fmt_float(&f, self, false, true); }
+}
+
+impl Display for f32 {
+    #[inline]
+    fn fmt(self, f: inout Fmt) { fmt_float(&f, self as f64, true, false); }
+}
+
+impl Debug for f32 {
+    #[inline]
+    fn fmt_debug(self, f: inout Fmt) { fmt_float(&f, self as f64, true, true); }
+}
+
+impl Fmt {
+    // v as Display writes it: the shortest decimal that reads back as v,
+    // never with an exponent; with a precision, that many decimals.
+    pub fn float(inout self, v: f64) {
+        fmt_float(&self, v, false, false);
+    }
+}
+
+// (0.20) `{:e}`, `{:E}` (with FMT_UPPER; fmt.vl's FMT_ flags): a
+// float's exponent form (fmt_float).
+const FMT_EXP: i64 = 512;
+
+// v in decimal (single: an f32's value): the shortest digits that read
+// back as v (Schubfach, 0.20), never with an exponent for Display; Debug
+// as Rust writes it (`1.0`, `1e16`, `1e-7`); `{:e}`, `{:E}` (FMT_EXP) as
+// Rust's LowerExp and UpperExp (`1.5e3`). With a precision, that many
+// decimals (C's %.Nf; with `e`, %.Ne in Rust's layout).
+#[inline(never)]
+fn fmt_float(f: inout Fmt, v: f64, single: bool, debug: bool) {
+    if f.flags != 0 {
+        fmt_number_start(&f);
+    }
+    if f.prec >= 0 && v == v && v - v == 0.0 {
+        fmt_float_prec(&f, v);
+        return;
+    }
+    var mode = if debug { FloatFmt::Debug } else { FloatFmt::Display };
+    if (f.flags & FMT_EXP) != 0 {
+        mode = if (f.flags & FMT_UPPER) != 0 { FloatFmt::UpperExp } else { FloatFmt::LowerExp };
+    }
+    var tmp: [u8; 48] = [0; 48];
+    let n = if single { write_f32(v as f32, mode, &tmp[..]) } else { write_f64(v, mode, &tmp[..]) };
+    if n <= 48 {
+        f.str(tmp[0..n]);
+    } else {
+        fmt_float_long(&f, v, single, mode);
+    }
+}
+
+// fmt_float's text of more than 48 bytes (Display of 1e300).
+#[inline(never)]
+fn fmt_float_long(f: inout Fmt, v: f64, single: bool, mode: FloatFmt) {
+    var tmp: [u8; 336] = [0; 336];
+    let n = if single { write_f32(v as f32, mode, &tmp[..]) } else { write_f64(v, mode, &tmp[..]) };
+    f.str(tmp[0..n]);
+}
+
+// fmt_float with a precision, v finite: C's %.*f (FMT_EXP: %.*e, its
+// exponent then written as Rust's, `1.50e3`).
+#[inline(never)]
+fn fmt_float_prec(f: inout Fmt, v: f64) {
+    if (f.flags & FMT_EXP) == 0 {
+        var tmp: [u8; 64] = [0; 64];
+        let n = unsafe { snprintf(&tmp[0], 64, c"%.*f", f.prec as i32, v) } as i64;
+        if n < 64 {
+            f.str(tmp[0..n]);
+        } else {
+            fmt_fixed_long(&f, v);
+        }
+        return;
+    }
+    // (a double's exact digits end before the 770th: zeros after 1100)
+    let prec = if f.prec > 1100 { 1100 } else { f.prec };
+    var tmp: [u8; 1200] = [0; 1200];
+    let n = unsafe { snprintf(&tmp[0], 1200, c"%.*e", prec as i32, v) } as i64;
+    var i = 0;
+    while i < n && tmp[i] != 'e' {
+        i += 1;
+    }
+    f.str(tmp[0..i]);
+    for _ in prec..f.prec {
+        f.byte('0');
+    }
+    f.byte(if (f.flags & FMT_UPPER) != 0 { 'E' } else { 'e' });
+    // e+05 is 5, e-05 is -5
+    var j = i + 1;
+    if j < n && tmp[j] == '-' {
+        f.byte('-');
+    }
+    j += 1;
+    while j + 1 < n && tmp[j] == '0' {
+        j += 1;
+    }
+    f.str(tmp[j..n]);
+}
+
+// v with f's precision, of 64 bytes or more: C's %.*f into a buffer on
+// the stack (a double has at most 309 digits before the point and 1074
+// after it: from 1100 decimals on they are zeros, written after).
+#[inline(never)]
+fn fmt_fixed_long(f: inout Fmt, v: f64) {
+    let prec = if f.prec > 1100 { 1100 } else { f.prec };
+    var tmp: [u8; 1424] = [0; 1424];
+    let n = unsafe { snprintf(&tmp[0], 1424, c"%.*f", prec as i32, v) } as i64;
+    f.str(tmp[0..if n < 1424 { n } else { 1423 }]);
+    for _ in prec..f.prec {
+        f.byte('0');
+    }
+}

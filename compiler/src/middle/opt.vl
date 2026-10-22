@@ -1,0 +1,975 @@
+// The optimizer's infrastructure and the CFG cleanups: operand resolution,
+// unreachable-block removal, trivial-phi removal, dominators (Cooper,
+// Harvey & Kennedy, "A Simple, Fast Dominance Algorithm"), block merging
+// and jump threading, and dead code elimination. The pass pipeline is
+// optimize_program, at the end.
+
+use crate::back::codecache::cc_begin;
+use crate::back::regalloc::prepare::layout_order;
+use crate::base::{IntVec, alloc_array, die, free};
+use crate::base::timer::{
+    T_ATTRS, T_GLOBAL_DCE, T_HEAP, T_INLINE, T_IPCP, T_LICM, T_LOOPS, T_PROMOTE, T_SCALAR, T_SLP,
+    T_TRE, timer_add, timer_now,
+};
+use crate::front::modules::{STD_MODULE, module_of, within_std};
+use crate::front::types::FNS;
+use crate::gen0::gen::{EMIT_IR, EMIT_MIR, fn_is_global};
+use crate::middle::adce::aggressive_dce;
+use crate::middle::copies::elide_copies;
+use crate::middle::ctx::FnCtx;
+use crate::middle::entryfacts::{drop_assumes, entry_assumes, strip_taken};
+use crate::middle::exits::count_loop_exits;
+use crate::middle::fold::instcombine;
+use crate::middle::fold::lattice::sccp;
+use crate::middle::gvn::run_gvn;
+use crate::middle::gvn_calls::repeated_pure_calls;
+use crate::middle::ifconv::if_convert_loops;
+use crate::middle::inline::{
+    FN_ADDRESS, FN_CALLS, FN_LIVE, FN_SCC, FN_SIZE, compute_sccs, count_call_sites,
+    forget_fn_caches, func_size, init_fn_caches, inline_rounds, inlined_everywhere, ir_callee,
+    optimize_with_leaves, simplify_inlining_leaves, start_inlining_budget,
+};
+use crate::middle::ipo::{
+    PRINT_ATTRS, has_effect, heap_to_stack, init_attrs, print_attrs, propagate_constants,
+};
+use crate::middle::ir::{
+    FN_IR, IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_arg, ir_enter, ir_operand,
+    ir_operand_count, ir_replace, ir_resolve_operands, ir_shrink, ir_unlink, ir_val,
+};
+use crate::middle::ir::cfg::{
+    copy_terminator, is_succ, pred_index, redirect_succ, succ, succ_count, switch_target,
+};
+use crate::middle::ir::verify::verify_func;
+use crate::middle::licm::run_licm;
+use crate::middle::loops::{rotate_loops, seal_all};
+use crate::middle::lower::ssa::ssa_undef;
+use crate::middle::lsr::reduce_and_unswitch;
+use crate::middle::parallel::{
+    cleanup_all, optimize_components, parallel_begin, phase_time, simplify_all,
+};
+use crate::middle::promote::promote_loop_memory;
+use crate::middle::range::fold_by_ranges;
+use crate::middle::scev::transform_loops;
+use crate::middle::slp::slp_vectorize;
+use crate::middle::sroa::{promote_constant_slots, run_sroa};
+use crate::middle::tags::thread_tags;
+use crate::middle::tre::eliminate_tail_recursion;
+use crate::middle::vectorize::{VECTORIZE, vectorize_loops};
+use crate::middle::vectorize::unroll::unroll_runtime_loops;
+
+pub static var OPT_LEVEL: i64 = 2;
+
+// Resolves every operand of every instruction of function `fi` (after
+// replacements).
+pub fn resolve_all(cx: sink *FnCtx, fi: i64) {
+    unsafe {
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if cx.blocks[b].removed != 0 {
+                continue;
+            }
+            var v = cx.blocks[b].first;
+            while v != 0 {
+                ir_resolve_operands(cx, v);
+                v = cx.insts[v].next;
+            }
+            if cx.blocks[b].cond != 0 {
+                cx.blocks[b].cond = ir_val(cx, cx.blocks[b].cond);
+            }
+        }
+    }
+}
+
+// ---- Predecessors and phis ----
+
+// Removes predecessor `pred` (at index `index`) from block `b`, with the
+// matching phi operands.
+pub fn remove_pred_at(cx: sink *FnCtx, b: i64, index: i64) {
+    unsafe {
+        let preds = &cx.blocks[b].preds as *IntVec;
+        for i in index..(*preds).count - 1 {
+            (*preds).data[i] = (*preds).data[i + 1];
+        }
+        (*preds).count -= 1;
+        var phi = cx.blocks[b].first;
+        while phi != 0 && cx.insts[phi].op == Op::Phi {
+            let base = cx.insts[phi].args;
+            for i in index..cx.insts[phi].nargs - 1 {
+                cx.args.data[base + i] = cx.args.data[base + i + 1];
+            }
+            cx.insts[phi].nargs -= 1;
+            phi = cx.insts[phi].next;
+        }
+    }
+}
+
+pub fn remove_pred(cx: sink *FnCtx, b: i64, pred: i64) {
+    let index = pred_index(cx, b, pred);
+    if index >= 0 {
+        remove_pred_at(cx, b, index);
+    }
+}
+
+// Appends predecessor `pred` to block `b`; each phi gets `pred_operand`'s
+// operand for it (the phi's operand for predecessor `like`).
+pub fn add_pred_like(cx: sink *FnCtx, b: i64, pred: i64, like: i64) {
+    unsafe {
+        let like_index = pred_index(cx, b, like);
+        cx.blocks[b].preds.push(pred);
+        var phi = cx.blocks[b].first;
+        while phi != 0 && cx.insts[phi].op == Op::Phi {
+            let n = cx.insts[phi].nargs;
+            let start = cx.args.count;
+            for i in 0..n {
+                cx.args.push(cx.args.data[cx.insts[phi].args + i]);
+                cx.argty.push(0);
+            }
+            cx.args.push(cx.args.data[cx.insts[phi].args + like_index]);
+            cx.argty.push(0);
+            cx.insts[phi].args = start;
+            cx.insts[phi].nargs = n + 1;
+            phi = cx.insts[phi].next;
+        }
+    }
+}
+
+// Removes block `b` from the function: from its successors' predecessor
+// lists, and its instructions from their blocks.
+pub fn remove_block(cx: sink *FnCtx, b: i64) {
+    unsafe {
+        for i in 0..succ_count(cx, b) {
+            remove_pred(cx, succ(cx, b, i), b);
+        }
+        cx.blocks[b].removed = 1;
+        cx.blocks[b].term = Term::None;
+        var v = cx.blocks[b].first;
+        while v != 0 {
+            let next = cx.insts[v].next;
+            cx.insts[v].block = 0;
+            cx.insts[v].prev = 0;
+            cx.insts[v].next = 0;
+            v = next;
+        }
+        cx.blocks[b].first = 0;
+        cx.blocks[b].last = 0;
+    }
+}
+
+// Removes the blocks the entry does not reach. Returns whether any was.
+pub fn remove_unreachable(cx: sink *FnCtx, fi: i64) -> bool {
+    layout_order(cx, fi);
+    var changed = false;
+    unsafe {
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if cx.blocks[b].removed == 0 && cx.blocks[b].order < 0 {
+                remove_block(cx, b);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+// Replaces phis whose operands are one value (or the phi itself) by that
+// value, until none is left.
+pub fn remove_trivial_phis(cx: sink *FnCtx, fi: i64) -> bool {
+    var any = false;
+    var changed = true;
+    while changed {
+        changed = false;
+        unsafe {
+            for i in 0..IRFUNCS[fi].blocks.count {
+                let b = IRFUNCS[fi].blocks.data[i];
+                if cx.blocks[b].removed != 0 {
+                    continue;
+                }
+                var phi = cx.blocks[b].first;
+                while phi != 0 && cx.insts[phi].op == Op::Phi {
+                    let next = cx.insts[phi].next;
+                    var same = 0;
+                    var trivial = true;
+                    for k in 0..cx.insts[phi].nargs {
+                        let operand = ir_val(cx, ir_arg(cx, phi, k));
+                        if operand == same || operand == phi {
+                            continue;
+                        }
+                        if same != 0 {
+                            trivial = false;
+                            break;
+                        }
+                        same = operand;
+                    }
+                    if trivial {
+                        if same == 0 {
+                            ir_enter(cx, fi);
+                            same = ssa_undef(cx, cx.insts[phi].ty);
+                        }
+                        ir_replace(cx, phi, same);
+                        changed = true;
+                        any = true;
+                    }
+                    phi = next;
+                }
+            }
+        }
+    }
+    if any {
+        resolve_all(cx, fi);
+    }
+    any
+}
+
+// ---- Dominators ----
+
+fn intersect(cx: sink *FnCtx, b1: i64, b2: i64) -> i64 {
+    unsafe {
+        var x = b1;
+        var y = b2;
+        var steps = 0;
+        while x != y {
+            steps += 1;
+            if steps > 100000000 {
+                die(c"internal error: dominators do not converge");
+            }
+            while cx.blocks[x].order > cx.blocks[y].order {
+                x = cx.blocks[x].idom;
+            }
+            while cx.blocks[y].order > cx.blocks[x].order {
+                y = cx.blocks[y].idom;
+            }
+        }
+        x
+    }
+}
+
+// BLOCKS[b].idom for every reachable block (the entry is its own); also
+// lays out the blocks (BLOCKS[b].order, ORDER) in reverse post-order.
+pub fn compute_dominators(cx: sink *FnCtx, fi: i64) {
+    unsafe {
+        layout_order(cx, fi);
+        for i in 0..cx.order.count {
+            cx.blocks[cx.order.data[i]].idom = 0;
+        }
+        let entry = IRFUNCS[fi].entry;
+        cx.blocks[entry].idom = entry;
+        var changed = true;
+        while changed {
+            changed = false;
+            for i in 1..cx.order.count {
+                let b = cx.order.data[i];
+                var new_idom = 0;
+                for k in 0..cx.blocks[b].preds.count {
+                    let p = cx.blocks[b].preds.data[k];
+                    if cx.blocks[p].order < 0 || cx.blocks[p].idom == 0 {
+                        continue;
+                    }
+                    new_idom = if new_idom == 0 { p } else { intersect(cx, p, new_idom) };
+                }
+                if new_idom != cx.blocks[b].idom {
+                    cx.blocks[b].idom = new_idom;
+                    changed = true;
+                }
+            }
+        }
+    }
+}
+
+// Whether block a dominates block b (both reachable).
+pub fn dominates(cx: sink *FnCtx, a: i64, b: i64) -> bool {
+    var x = b;
+    loop {
+        if x == a {
+            return true;
+        }
+        let up = unsafe { cx.blocks[x].idom };
+        if up == x || up == 0 {
+            return false;
+        }
+        x = up;
+    }
+}
+
+// ---- CFG simplification ----
+
+// Whether blocks x and y (two of them) hold nothing and jump to one block,
+// whose phis take the same value from both.
+fn same_forward(cx: sink *FnCtx, x: i64, y: i64) -> bool {
+    unsafe {
+        if x == y || cx.blocks[x].first != 0 || cx.blocks[y].first != 0
+            || cx.blocks[x].term != Term::Jump || cx.blocks[y].term != Term::Jump
+            || cx.blocks[x].s0 != cx.blocks[y].s0
+            || cx.blocks[x].preds.count != 1 || cx.blocks[y].preds.count != 1 {
+            return false;
+        }
+        let t = cx.blocks[x].s0;
+        let ix = pred_index(cx, t, x);
+        let iy = pred_index(cx, t, y);
+        var phi = cx.blocks[t].first;
+        while phi != 0 && cx.insts[phi].op == Op::Phi {
+            if ir_val(cx, ir_arg(cx, phi, ix)) != ir_val(cx, ir_arg(cx, phi, iy)) {
+                return false;
+            }
+            phi = cx.insts[phi].next;
+        }
+        true
+    }
+}
+
+// Merges blocks into their only predecessor when it has no other
+// successor, and threads jumps through empty blocks. Returns whether
+// anything changed.
+pub fn simplify_cfg(cx: sink *FnCtx, fi: i64) -> bool {
+    unsafe {
+        var changed = false;
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if cx.blocks[b].removed != 0 {
+                continue;
+            }
+            // A branch with both edges to one block is a jump.
+            if cx.blocks[b].term == Term::Branch && cx.blocks[b].s0 == cx.blocks[b].s1 {
+                let s = cx.blocks[b].s0;
+                remove_pred(cx, s, b);
+                cx.blocks[b].term = Term::Jump;
+                cx.blocks[b].cond = 0;
+                cx.blocks[b].s1 = 0;
+                changed = true;
+            }
+            // A branch on a constant is a jump.
+            if cx.blocks[b].term == Term::Branch && cx.insts[cx.blocks[b].cond].op == Op::Const {
+                let taken = if cx.insts[cx.blocks[b].cond].imm != 0 { cx.blocks[b].s0 }
+                    else { cx.blocks[b].s1 };
+                let dropped = if taken == cx.blocks[b].s0 { cx.blocks[b].s1 }
+                    else { cx.blocks[b].s0 };
+                remove_pred(cx, dropped, b);
+                cx.blocks[b].term = Term::Jump;
+                cx.blocks[b].cond = 0;
+                cx.blocks[b].s0 = taken;
+                cx.blocks[b].s1 = 0;
+                changed = true;
+            }
+            // (0.14) So is a branch to two empty blocks that go on to one
+            // block, where its phis take the same value from both (what a
+            // threaded comparison of -1, 0 and 1 leaves).
+            if cx.blocks[b].term == Term::Branch
+                && same_forward(cx, cx.blocks[b].s0, cx.blocks[b].s1) {
+                let dropped = cx.blocks[b].s1;
+                remove_pred(cx, dropped, b);
+                cx.blocks[b].term = Term::Jump;
+                cx.blocks[b].cond = 0;
+                cx.blocks[b].s1 = 0;
+                changed = true;
+            }
+            // So is a switch on a constant, or with one successor.
+            if cx.blocks[b].term == Term::Switch
+                && (cx.insts[cx.blocks[b].cond].op == Op::Const || cx.blocks[b].nsucc == 1) {
+                let taken = if cx.blocks[b].nsucc == 1 { cx.blocks[b].s0 }
+                    else { switch_target(cx, b, cx.insts[cx.blocks[b].cond].imm) };
+                switch_to_jump(cx, b, taken);
+                changed = true;
+            }
+        }
+        if changed {
+            remove_unreachable(cx, fi);
+        }
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if cx.blocks[b].removed != 0 {
+                continue;
+            }
+            if merge_into_pred(cx, fi, b) || thread_jump(cx, fi, b) {
+                changed = true;
+            }
+        }
+        if changed {
+            resolve_all(cx, fi);
+            remove_trivial_phis(cx, fi);
+        }
+        changed
+    }
+}
+
+// Turns switch b into a jump to `taken` (one of its successors).
+pub fn switch_to_jump(cx: sink *FnCtx, b: i64, taken: i64) {
+    unsafe {
+        for i in 0..cx.blocks[b].nsucc {
+            let s = succ(cx, b, i);
+            if s != taken {
+                remove_pred(cx, s, b);
+            }
+        }
+        cx.blocks[b].term = Term::Jump;
+        cx.blocks[b].cond = 0;
+        cx.blocks[b].s0 = taken;
+        cx.blocks[b].s1 = 0;
+    }
+}
+
+// Block b has one predecessor p, which jumps to it: move b's instructions
+// to the end of p.
+fn merge_into_pred(cx: sink *FnCtx, fi: i64, b: i64) -> bool {
+    unsafe {
+        if cx.blocks[b].preds.count != 1 || b == IRFUNCS[fi].entry {
+            return false;
+        }
+        let p = cx.blocks[b].preds.data[0];
+        if p == b || cx.blocks[p].term != Term::Jump {
+            return false;
+        }
+        // Phis of a block with one predecessor are that operand.
+        var v = cx.blocks[b].first;
+        while v != 0 && cx.insts[v].op == Op::Phi {
+            let next = cx.insts[v].next;
+            ir_replace(cx, v, ir_val(cx, ir_arg(cx, v, 0)));
+            v = next;
+        }
+        v = cx.blocks[b].first;
+        while v != 0 {
+            let next = cx.insts[v].next;
+            ir_unlink(cx, v);
+            ir_append(cx, p, v);
+            v = next;
+        }
+        copy_terminator(cx, p, b);
+        for i in 0..succ_count(cx, b) {
+            let s = succ(cx, b, i);
+            let index = pred_index(cx, s, b);
+            cx.blocks[s].preds.data[index] = p;
+        }
+        cx.blocks[b].term = Term::None;
+        cx.blocks[b].removed = 1;
+        cx.blocks[b].preds.count = 0;
+        true
+    }
+}
+
+// Block b is empty (no instructions) and jumps to s: its predecessors can
+// go to s directly, when s has no phis.
+fn thread_jump(cx: sink *FnCtx, fi: i64, b: i64) -> bool {
+    unsafe {
+        if cx.blocks[b].first != 0 || cx.blocks[b].term != Term::Jump || b == IRFUNCS[fi].entry {
+            return false;
+        }
+        let s = cx.blocks[b].s0;
+        if s == b {
+            return false;
+        }
+        let first = cx.blocks[s].first;
+        if first != 0 && cx.insts[first].op == Op::Phi {
+            return false;
+        }
+        if cx.blocks[b].preds.count == 0 {
+            return false;
+        }
+        for i in 0..cx.blocks[b].preds.count {
+            let p = cx.blocks[b].preds.data[i];
+            if cx.blocks[p].term == Term::Switch && is_succ(cx, p, s) {
+                return false;
+            }
+        }
+        for i in 0..cx.blocks[b].preds.count {
+            let p = cx.blocks[b].preds.data[i];
+            redirect_succ(cx, p, b, s);
+            cx.blocks[s].preds.push(p);
+        }
+        remove_pred(cx, s, b);
+        cx.blocks[b].term = Term::None;
+        cx.blocks[b].removed = 1;
+        cx.blocks[b].preds.count = 0;
+        true
+    }
+}
+
+// ---- Dead code elimination ----
+
+// Removes the instructions whose values are not used, transitively (mark
+// and sweep from the instructions with side effects and the terminators).
+pub fn eliminate_dead_code(cx: sink *FnCtx, fi: i64) -> bool {
+    unsafe {
+        var work = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if cx.blocks[b].removed != 0 {
+                continue;
+            }
+            var v = cx.blocks[b].first;
+            while v != 0 {
+                cx.insts[v].mark = 0;
+                v = cx.insts[v].next;
+            }
+        }
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if cx.blocks[b].removed != 0 {
+                continue;
+            }
+            var v = cx.blocks[b].first;
+            while v != 0 {
+                if has_effect(cx, v) {
+                    mark_live(cx, v, &work);
+                }
+                v = cx.insts[v].next;
+            }
+            if cx.blocks[b].cond != 0 {
+                mark_live(cx, cx.blocks[b].cond, &work);
+            }
+        }
+        while work.count > 0 {
+            let v = work.pop();
+            for k in 0..ir_operand_count(cx, v) {
+                let operand = ir_operand(cx, v, k);
+                if operand != 0 {
+                    mark_live(cx, operand, &work);
+                }
+            }
+        }
+        free(work.data as *u8);
+        var changed = false;
+        for i in 0..IRFUNCS[fi].blocks.count {
+            let b = IRFUNCS[fi].blocks.data[i];
+            if cx.blocks[b].removed != 0 {
+                continue;
+            }
+            var v = cx.blocks[b].first;
+            while v != 0 {
+                let next = cx.insts[v].next;
+                if cx.insts[v].mark == 0 {
+                    ir_unlink(cx, v);
+                    changed = true;
+                }
+                v = next;
+            }
+        }
+        changed
+    }
+}
+
+fn mark_live(cx: sink *FnCtx, v: i64, work: inout IntVec) {
+    unsafe {
+        if cx.insts[v].mark == 0 {
+            cx.insts[v].mark = 1;
+            work.push(v);
+        }
+    }
+}
+
+// ---- The pipeline ----
+
+// Cleanup that every IR function gets before code generation.
+pub fn cleanup_function(cx: sink *FnCtx, fi: i64) {
+    resolve_all(cx, fi);
+    remove_unreachable(cx, fi);
+    remove_trivial_phis(cx, fi);
+    resolve_all(cx, fi);
+    unsafe { verify_func(cx, fi, c"lowering, inlining and cleanup"); }
+}
+
+// (0.17) The -O1 pipeline of one function (PER_FUNCTION), after the
+// program's leaves (simplify_inlining_leaves): the small leaves' calls
+// inlined, the scalar pipeline.
+pub fn optimize_function(cx: sink *FnCtx, fi: i64) {
+    optimize_with_leaves(cx, fi);
+}
+
+// (0.17) Whether the -O1 pipeline runs per function, from emission
+// (emit_ir_functions), not over the whole program first: -O1 without
+// --emit-ir or --emit-mir.
+pub static var PER_FUNCTION: bool = false;
+
+// After inlining into fi: the cleanup and the scalar pipeline.
+pub fn optimize_after_inlining(cx: sink *FnCtx, fi: i64) {
+    cleanup_function(cx, fi);
+    simplify_function(cx, fi);
+}
+
+// The scalar pipeline (-O1), twice: constants, peepholes, control flow,
+// value numbering, dead code.
+pub fn simplify_function(cx: sink *FnCtx, fi: i64) {
+    unsafe {
+        for round in 0..2 {
+            sccp(cx, fi);
+            verify_func(cx, fi, c"sccp");
+            instcombine(cx, fi);
+            verify_func(cx, fi, c"instcombine");
+            if round == 0 && elide_copies(cx, fi) {
+                verify_func(cx, fi, c"copy elision");
+            }
+            if round == 0 && run_sroa(cx, fi) {
+                verify_func(cx, fi, c"sroa");
+            }
+            if round == 0 && promote_constant_slots(cx, fi) {
+                verify_func(cx, fi, c"constant slots");
+            }
+            simplify_cfg(cx, fi);
+            verify_func(cx, fi, c"simplify_cfg");
+            run_gvn(cx, fi);
+            verify_func(cx, fi, c"gvn");
+            eliminate_dead_code(cx, fi);
+            verify_func(cx, fi, c"dead code elimination");
+            simplify_cfg(cx, fi);
+            verify_func(cx, fi, c"simplify_cfg");
+            if round == 0 && thread_tags(cx, fi) {
+                verify_func(cx, fi, c"threading on tags");
+            }
+        }
+        remove_trivial_phis(cx, fi);
+    }
+}
+
+pub fn optimize_program(cx: sink *FnCtx) {
+    unsafe {
+        FN_LIVE = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        for fi in 0..IRFUNC_COUNT {
+            FN_LIVE[fi] = 1;
+        }
+        // (0.18.1) No entry facts in a function an indirect call may enter.
+        strip_taken(cx);
+        drop_unreachable_std(cx);
+        // (0.18.1) The code cache (back::codecache).
+        cc_begin();
+        // (0.18.1) The tasks' threads (middle::parallel), and each function's
+        // cleanup on them.
+        parallel_begin(cx);
+        cleanup_all(cx);
+        phase_time(c"cleanup");
+        if OPT_LEVEL == 0 {
+            return;
+        }
+        var t = timer_now();
+        // (0.17) -O1: small leaf functions inlined (inline.vl)
+        if OPT_LEVEL == 1 {
+            simplify_inlining_leaves(cx);
+            timer_add(T_SCALAR, t);
+            phase_time(c"small leaves");
+            return;
+        }
+        simplify_all(cx);
+        timer_add(T_SCALAR, t);
+        phase_time(c"scalar pipeline");
+        if OPT_LEVEL < 2 {
+            return;
+        }
+        t = timer_now();
+        // -O2: interprocedural constants, then bottom-up over the call graph's
+        // components: tail recursion, inlining, the loop passes, scalar
+        // promotion and loop-invariant code motion, and each component's
+        // attributes (docs/optimizer.md, 0.6).
+        FN_SCC = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        FN_SIZE = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        FN_CALLS = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        FN_ADDRESS = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        init_fn_caches();
+        init_attrs();
+        count_call_sites(cx);
+        // The functions whose address the program takes stay in it, even when
+        // every call through the address is made direct (see
+        // remove_dead_functions).
+        FN_TAKEN = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        DEFERRED = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        for fi in 0..IRFUNC_COUNT {
+            FN_TAKEN[fi] = FN_ADDRESS[fi];
+        }
+        compute_sccs(cx);
+        propagate_constants(cx);
+        for fi in 0..IRFUNC_COUNT {
+            ir_enter(cx, fi);
+            FN_SIZE[fi] = func_size(cx, fi);
+        }
+        start_inlining_budget();
+        timer_add(T_IPCP, t);
+        phase_time(c"interprocedural constants, components");
+        // (0.18.1: each component once the components it calls are done,
+        // middle::parallel; one thread takes them in SCC_ORDER, as 0.17 did)
+        optimize_components(cx);
+        phase_time(c"components, bottom up");
+        t = timer_now();
+        remove_dead_functions(cx);
+        timer_add(T_GLOBAL_DCE, t);
+        phase_time(c"dead functions");
+        // The functions whose loop passes waited for their callers, and that
+        // are still called somewhere, then SLP (finish_function): when each
+        // is emitted (0.18.1), or here for the IR printers.
+        if EMIT_IR || EMIT_MIR {
+            for fi in 0..IRFUNC_COUNT {
+                deferred_loops(cx, fi);
+            }
+            for fi in 0..IRFUNC_COUNT {
+                slp_function(cx, fi);
+            }
+        }
+        if PRINT_ATTRS {
+            print_attrs();
+        }
+    }
+}
+
+// (0.18.1) The bottom-up pipeline of function fi, of its component's task
+// (middle::parallel): tail recursion, inlining, heap to stack, the loop
+// passes (or not yet, DEFERRED), its size.
+pub fn optimize_component_function(cx: sink *FnCtx, fi: i64) {
+    unsafe {
+        ir_enter(cx, fi);
+        var t = timer_now();
+        if eliminate_tail_recursion(cx, fi) {
+            cleanup_function(cx, fi);
+            simplify_function(cx, fi);
+        }
+        timer_add(T_TRE, t);
+        t = timer_now();
+        inline_rounds(cx, fi);
+        // (0.18.1) the checks of its requires, inlined at its entry, as facts
+        entry_assumes(cx, fi);
+        timer_add(T_INLINE, t);
+        t = timer_now();
+        if heap_to_stack(cx, fi) {
+            simplify_function(cx, fi);
+        } else if repeated_pure_calls(cx, fi) {
+            // (0.16: merged now that the callees' attributes are known)
+            run_gvn(cx, fi);
+            eliminate_dead_code(cx, fi);
+        }
+        timer_add(T_HEAP, t);
+        if inlined_everywhere(fi) {
+            DEFERRED[fi] = 1;
+        } else {
+            loop_pipeline(cx, fi);
+        }
+        t = timer_now();
+        FN_SIZE[fi] = func_size(cx, fi);
+        ir_shrink(cx);
+        // (asked before, through a call made direct, it is asked again)
+        forget_fn_caches(fi);
+        timer_add(T_ATTRS, t);
+    }
+}
+
+// (0.18.1) -O2: function fi's loop passes, when they waited for its
+// callers (DEFERRED) and it is still called.
+pub fn deferred_loops(cx: sink *FnCtx, fi: i64) {
+    unsafe {
+        if DEFERRED[fi] != 0 && FN_LIVE[fi] != 0 {
+            ir_enter(cx, fi);
+            loop_pipeline(cx, fi);
+        }
+    }
+}
+
+// (0.18.1) -O2: function fi's SLP vectorization (0.11: last, on the code
+// as it will be emitted: stores packed earlier would hide their values
+// from the loads of the functions they are inlined into).
+pub fn slp_function(cx: sink *FnCtx, fi: i64) {
+    unsafe {
+        let t = timer_now();
+        // (0.18.1) the facts of entry_assumes gone before the code is made
+        if FN_LIVE[fi] != 0 {
+            ir_enter(cx, fi);
+            drop_assumes(cx, fi);
+        }
+        if FN_LIVE[fi] != 0 && slp_vectorize(cx, fi) {
+            ir_enter(cx, fi);
+            resolve_all(cx, fi);
+            eliminate_dead_code(cx, fi);
+            verify_func(cx, fi, c"SLP vectorization");
+        }
+        timer_add(T_SLP, t);
+    }
+}
+
+// Functions whose loop passes wait until inlining is done (see
+// inlined_everywhere).
+pub static var DEFERRED: *i64 = 0 as *i64;
+
+// The loop passes, LICM and scalar promotion of function fi, each followed
+// by the scalar pipeline when it changed something.
+fn loop_pipeline(cx: sink *FnCtx, fi: i64) {
+    unsafe {
+        var t = timer_now();
+        if optimize_loops(cx, fi) {
+            simplify_function(cx, fi);
+        }
+        timer_add(T_LOOPS, t);
+        t = timer_now();
+        if run_licm(cx, fi) {
+            resolve_all(cx, fi);
+            verify_func(cx, fi, c"licm");
+            simplify_function(cx, fi);
+        }
+        timer_add(T_LICM, t);
+        // After LICM: the addresses of slots and statics are out of the
+        // loops by then.
+        t = timer_now();
+        if promote_loop_memory(cx, fi) {
+            simplify_function(cx, fi);
+        }
+        timer_add(T_PROMOTE, t);
+    }
+}
+
+// -O2's loop passes (loops.vl and the files after it), before LICM.
+// Returns whether anything changed.
+fn optimize_loops(cx: sink *FnCtx, fi: i64) -> bool {
+    unsafe {
+        ir_enter(cx, fi);
+        resolve_all(cx, fi);
+        seal_all(cx, fi);
+        simplify_cfg(cx, fi);
+        // Between the passes a light cleanup only; the scalar pipeline runs
+        // once after them (in optimize_program).
+        var changed = false;
+        if count_loop_exits(cx, fi) {
+            changed = true;
+            light_cleanup(cx, fi);
+        }
+        if rotate_loops(cx, fi) {
+            changed = true;
+            light_cleanup(cx, fi);
+        }
+        if transform_loops(cx, fi) {
+            changed = true;
+            light_cleanup(cx, fi);
+        }
+        if fold_by_ranges(cx, fi) {
+            changed = true;
+            light_cleanup(cx, fi);
+        }
+        // (0.15: small branches in innermost loops, selects for the
+        // vectorizer and the unroller)
+        // (0.16: again while it converts, a few times: a branch whose arms
+        // were converted may be a diamond itself then, the tree of an
+        // inlined comparator's `<`)
+        var rounds = 0;
+        while rounds < 4 && if_convert_loops(cx, fi) {
+            changed = true;
+            light_cleanup(cx, fi);
+            rounds += 1;
+        }
+        // (0.10: after the checks the ranges remove, before strength
+        // reduction rewrites the addresses)
+        let vectorized = vectorize_loops(cx, fi);
+        if vectorized {
+            changed = true;
+            light_cleanup(cx, fi);
+        }
+        // (0.11: the loops the vectorizer left to be unrolled whole, which
+        // their checks kept transform_loops from before the ranges)
+        var unrolled = false;
+        if cx.unroll_whole {
+            unrolled = transform_loops(cx, fi);
+            // (and the LCSSA phis of the loops it left)
+            resolve_all(cx, fi);
+            remove_trivial_phis(cx, fi);
+            changed = true;
+            light_cleanup(cx, fi);
+        }
+        // (0.11: the loops the vectorizer left, in its frame; the loop forest
+        // it found is current when it changed nothing)
+        if unroll_runtime_loops(cx, fi, !vectorized && !unrolled && VECTORIZE) {
+            changed = true;
+            light_cleanup(cx, fi);
+        }
+        if reduce_and_unswitch(cx, fi) {
+            changed = true;
+        }
+        if aggressive_dce(cx, fi) {
+            changed = true;
+            verify_func(cx, fi, c"aggressive dead code elimination");
+        }
+        if changed {
+            resolve_all(cx, fi);
+            verify_func(cx, fi, c"loop passes");
+        }
+        changed
+    }
+}
+
+// Unused values and trivial control flow, between the loop passes.
+fn light_cleanup(cx: sink *FnCtx, fi: i64) {
+    resolve_all(cx, fi);
+    eliminate_dead_code(cx, fi);
+    simplify_cfg(cx, fi);
+    remove_trivial_phis(cx, fi);
+    seal_all(cx, fi);
+    unsafe { verify_func(cx, fi, c"cleanup"); }
+}
+
+// Per IR function: whether the program took its address (before
+// optimization).
+static var FN_TAKEN: *i64 = 0 as *i64;
+
+// Global dead code elimination: functions nobody calls or takes the
+// address of (other than main and the extern "C" definitions) are not
+// emitted, transitively. A function whose address the program took is
+// kept even when every call through it was made direct and inlined: a
+// function used as a value is part of what the program is (and of what
+// the tests look at).
+fn remove_dead_functions(cx: sink *FnCtx) {
+    unsafe {
+        var changed = true;
+        while changed {
+            changed = false;
+            count_call_sites(cx);
+            for fi in 0..IRFUNC_COUNT {
+                if FN_LIVE[fi] != 0 && FN_CALLS[fi] == 0 && FN_ADDRESS[fi] == 0
+                    && FN_TAKEN[fi] == 0 && !fn_is_global(IRFUNCS[fi].f) {
+                    FN_LIVE[fi] = 0;
+                    changed = true;
+                }
+            }
+        }
+    }
+}
+
+// (0.14) std's functions the program cannot reach are not optimized or
+// emitted, at every level: std grew with 0.14 (iterators, sort_by, input),
+// and its non-generic functions, all lowered, cost most of the time of
+// compiling a small program. The roots are every function not from std
+// (a program's own unused functions stay, as before); a std function is
+// reachable when a reachable function calls it or takes its address.
+fn drop_unreachable_std(cx: sink *FnCtx) {
+    unsafe {
+        if STD_MODULE < 0 {
+            return;
+        }
+        let reach = alloc_array::<i64>(IRFUNC_COUNT + 1);
+        var work = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for fi in 0..IRFUNC_COUNT {
+            reach[fi] = 0;
+            let f = IRFUNCS[fi].f;
+            if fn_is_global(f) || !within_std(module_of(FNS[f].node)) {
+                reach[fi] = 1;
+                work.push(fi);
+            }
+        }
+        while work.count > 0 {
+            work.count -= 1;
+            let fi = work.data[work.count];
+            ir_enter(cx, fi);
+            for i in 0..IRFUNCS[fi].blocks.count {
+                let b = IRFUNCS[fi].blocks.data[i];
+                if cx.blocks[b].removed != 0 {
+                    continue;
+                }
+                var v = cx.blocks[b].first;
+                while v != 0 {
+                    var g = ir_callee(cx, v);
+                    if cx.insts[v].op == Op::FAddr && FN_IR[cx.insts[v].imm] != 0 {
+                        g = FN_IR[cx.insts[v].imm] - 1;
+                    }
+                    if g >= 0 && reach[g] == 0 {
+                        reach[g] = 1;
+                        work.push(g);
+                    }
+                    v = cx.insts[v].next;
+                }
+            }
+        }
+        for fi in 0..IRFUNC_COUNT {
+            if reach[fi] == 0 {
+                FN_LIVE[fi] = 0;
+            }
+        }
+        free(work.data as *u8);
+        free(reach as *u8);
+    }
+}

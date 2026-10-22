@@ -3,10 +3,10 @@
 # draws with a bind group change every 10 into one render pass, on Metal:
 #
 #   objc         draws.m, clang -O2 (the baseline)
-#   tachyon      draws.tach, std::gpu with its contracts (goal: within 10%
+#   vole      draws.vl, std::gpu with its contracts (goal: within 10%
 #                of objc, faster than wgpu)
-#   tachyon-hal  draws_hal.tach, std::gpu::hal::metal directly: the
-#                difference from tachyon is what the contracts cost (goal:
+#   vole-hal  draws_hal.vl, std::gpu::hal::metal directly: the
+#                difference from vole is what the contracts cost (goal:
 #                under 3%)
 #   wgpu         wgpu/ (Rust, wgpu 30.0.1, built offline from ~/.cargo's
 #                cache; skipped when it does not build)
@@ -19,7 +19,7 @@
 
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 ROUNDS=5
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -29,13 +29,13 @@ while [ $# -gt 0 ]; do
     esac
 done
 [ "$(uname -s)-$(uname -m)" = "Darwin-arm64" ] || { echo "bench/gpu: Metal needs macOS on arm64"; exit 0; }
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-gpubench.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-gpubench.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT INT TERM
 B="$ROOT/bench/gpu"
 clang -O2 -fobjc-arc "$B/draws.m" -framework Metal -framework Foundation -o "$WORK/objc" || exit 1
-"$COMPILER" -O2 "$B/draws.tach" -l objc -o "$WORK/tachyon" >/dev/null 2>&1 || exit 1
-"$COMPILER" -O2 "$B/draws_hal.tach" -l objc -o "$WORK/tachyon-hal" >/dev/null 2>&1 || exit 1
-progs="objc tachyon tachyon-hal"
+"$COMPILER" -O2 "$B/draws.vl" -l objc -o "$WORK/vole" >/dev/null 2>&1 || exit 1
+"$COMPILER" -O2 "$B/draws_hal.vl" -l objc -o "$WORK/vole-hal" >/dev/null 2>&1 || exit 1
+progs="objc vole vole-hal"
 if command -v cargo >/dev/null 2>&1 &&
    CARGO_TARGET_DIR="$WORK/cargo" cargo build -q --release --offline --manifest-path "$B/wgpu/Cargo.toml" >"$WORK/cargo.log" 2>&1; then
     cp "$WORK/cargo/release/wgpu-draws" "$WORK/wgpu"

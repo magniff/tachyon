@@ -1,0 +1,951 @@
+// The module base: the C library, growable arrays, byte buffers, the
+// symbol interner and source files; error reporting (and recovery) is in
+// diag.vl, the phase timer in timer.vl. The compiler's root is
+// main.vl.
+
+pub mod timer;
+pub mod diag;
+pub mod target;
+pub mod json;
+// (0.18) the compilation's allocators, Comp and Ast (T6)
+pub mod comp;
+
+// ---- C library ----
+
+pub extern "C" {
+    // Error recovery (see err_end): the jumps back to a recovery point.
+    fn _setjmp(env: *u8) -> i32;
+    fn _longjmp(env: *u8, value: i32) -> !;
+    fn malloc(size: u64) -> *u8;
+    fn realloc(ptr: *u8, size: u64) -> *u8;
+    fn free(ptr: *u8);
+    fn memcpy(dst: *u8, src: *u8, n: u64) -> *u8;
+    fn memset(dst: *u8, c: i32, n: u64) -> *u8;
+    fn memcmp(a: *u8, b: *u8, n: u64) -> i32;
+    fn strlen(s: *u8) -> u64;
+    fn strtod(s: *u8, end: **u8) -> f64;
+    fn fopen(path: *u8, mode: *u8) -> *u8;
+    fn fread(buf: *u8, size: u64, count: u64, file: *u8) -> u64;
+    fn fwrite(buf: *u8, size: u64, count: u64, file: *u8) -> u64;
+    fn fclose(file: *u8) -> i32;
+    fn write(fd: i32, buf: *u8, n: u64) -> i64;
+    fn exit(code: i32) -> !;
+    fn getenv(name: *u8) -> *u8;
+    fn realpath(path: *u8, resolved: *u8) -> *u8;
+    fn getcwd(buf: *u8, size: u64) -> *u8;
+}
+
+pub const STDOUT: i32 = 1;
+pub const STDERR: i32 = 2;
+
+// ---- Growable arrays ----
+
+// Makes room for one more element in an array of `count` elements of T
+// with capacity `*cap`; returns the (possibly moved) data.
+pub fn grow<T>(data: *T, count: i64, cap: *i64) -> *T {
+    unsafe {
+        if count < *cap {
+            return data;
+        }
+        if stress_grow() {
+            let old = *cap;
+            *cap = stress_cap(old, count + 1);
+            return moved_block(data as *u8, old * size_of(T), *cap * size_of(T)) as *T;
+        }
+        var new_cap = *cap * 2;
+        if new_cap < 64 {
+            new_cap = 64;
+        }
+        *cap = new_cap;
+        let grown = realloc(data as *u8, (new_cap * size_of(T)) as u64);
+        if grown == 0 as *u8 {
+            die(c"out of memory");
+        }
+        grown as *T
+    }
+}
+
+// The address of element i of the array of T at data. (0.17) Where T is a
+// slice, a Vec or a Buf, `data[i]` indexes the one data points to, not the
+// array: such arrays (STRS) are reached through this.
+pub fn elem_at<T>(data: *T, i: i64) -> *T {
+    unsafe { (&(data as *u8)[i * size_of(T)]) as *T }
+}
+
+// The stress-grow mode (0.14), for finding reads through a table's old
+// storage (an index whose evaluation grows the table it indexes): with
+// VOLE_STRESS_GROW=1 in the environment, every growth of a table
+// (`grow`, `buf_reserve`, the symbol tables) moves it, by half its size
+// from a capacity of 1, and the old block is filled with 0xAA bytes and
+// kept (never freed, never reused), so such a read finds garbage. The
+// gate's stress-grow step runs the suite and a self-compile with it.
+static var STRESS_GROW: i64 = -1;
+
+pub fn stress_grow() -> bool {
+    unsafe {
+        if STRESS_GROW < 0 {
+            let value = getenv(c"VOLE_STRESS_GROW");
+            STRESS_GROW = if value != 0 as *u8 && *value == '1' { 1 } else { 0 };
+        }
+        STRESS_GROW == 1
+    }
+}
+
+// The capacity after `cap` under stress_grow: room for `needed`.
+fn stress_cap(cap: i64, needed: i64) -> i64 {
+    var new_cap = cap + cap / 2 + 1;
+    while new_cap < needed {
+        new_cap = new_cap + new_cap / 2 + 1;
+    }
+    new_cap
+}
+
+// A new block of new_size bytes holding the first old_size bytes of
+// data, which is poisoned and kept (stress_grow). The caller keeps
+// data's contract: old_size bytes of a malloc'ed block (or none).
+unsafe fn moved_block(data: *u8, old_size: i64, new_size: i64) -> *u8 {
+    let moved = malloc(new_size as u64);
+    if moved == 0 as *u8 {
+        die(c"out of memory");
+    }
+    if old_size > 0 {
+        memcpy(moved, data, old_size as u64);
+        memset(data, 0xAA, old_size as u64);
+    }
+    moved
+}
+
+// An array of `n` elements of T, zeroed.
+pub fn alloc_array<T>(n: i64) -> *T {
+    alloc_zeroed(n * size_of(T)) as *T
+}
+
+pub fn alloc_zeroed(size: i64) -> *u8 {
+    unsafe {
+        var bytes = size;
+        if bytes < 8 {
+            bytes = 8;
+        }
+        let data = malloc(bytes as u64);
+        if data == 0 as *u8 {
+            die(c"out of memory");
+        }
+        memset(data, 0, bytes as u64);
+        data
+    }
+}
+
+// A growable array of i64, used for node lists and scratch stacks.
+pub struct IntVec { data: *i64, count: i64, cap: i64 }
+
+// IntVec::items(): the vector, the next index, the end.
+pub struct IntVecItems { v: *IntVec, i: i64, n: i64 }
+
+impl Iterator for IntVecItems {
+    type Item = i64;
+
+    #[inline]
+    fn next(inout self) -> Option<i64> {
+        if self.i < self.n {
+            let x = unsafe { self.v.data[self.i] };
+            self.i += 1;
+            Option::Some(x)
+        } else {
+            Option::None
+        }
+    }
+
+    #[inline]
+    fn exact_len(self) -> i64 {
+        self.n - self.i
+    }
+
+    #[inline]
+    fn at(inout self, k: i64) -> i64 {
+        unsafe { self.v.data[self.i + k] }
+    }
+
+    #[inline]
+    fn fold<B, F: FnMut(B, i64) -> B>(self, init: sink B, f: F) -> B {
+        var g = f;
+        var acc = init;
+        for k in self.i..self.n {
+            acc = g(acc, unsafe { self.v.data[k] });
+        }
+        acc
+    }
+}
+
+impl IntVec {
+    // (0.17: with room, no call of grow)
+    fn push(inout self, value: i64) {
+        let n = self.count;
+        if n < self.cap {
+            unsafe { self.data[n] = value; }
+            self.count = n + 1;
+            return;
+        }
+        unsafe {
+            self.data = grow(self.data, n, &self.cap);
+            self.data[n] = value;
+        }
+        self.count = n + 1;
+    }
+
+    fn pop(inout self) -> i64 {
+        self.count -= 1;
+        unsafe { self.data[self.count] }
+    }
+
+    // Its items, by value (0.15): `for x in v.items() { .. }` is exactly
+    // `for i in 0..v.count { let x = v.data[i]; .. }`. The count is taken
+    // when the loop starts and each item is read when it is reached, so a
+    // push in the body (which may move the data) is seen as it is there.
+    // The IntVec itself must not move meanwhile (an element of a growing
+    // array of structs).
+    #[inline]
+    fn items(self: *IntVec) -> IntVecItems {
+        unsafe { IntVecItems { v: self, i: 0, n: self.count } }
+    }
+
+    // Items from..to, likewise (`kids` of a node's list in LISTS).
+    #[inline]
+    fn items_in(self: *IntVec, from: i64, to: i64) -> IntVecItems {
+        IntVecItems { v: self, i: from, n: to }
+    }
+}
+
+// ---- Byte buffers ----
+
+// Buffers are referred to by id; `BUFS[id]` holds the bytes.
+struct Buf { data: *u8, len: i64, cap: i64 }
+
+pub static var BUFS: *Buf = 0 as *Buf;
+static var BUF_COUNT: i64 = 0;
+static var BUF_CAP: i64 = 0;
+
+pub fn buf_new() -> i64 {
+    unsafe {
+        BUFS = grow(BUFS, BUF_COUNT, &BUF_CAP);
+        let id = BUF_COUNT;
+        BUFS[id] = Buf { data: alloc_zeroed(256), len: 0, cap: 256 };
+        BUF_COUNT += 1;
+        id
+    }
+}
+
+pub fn buf_reserve(b: i64, extra: i64) {
+    unsafe {
+        let needed = BUFS[b].len + extra;
+        if needed <= BUFS[b].cap {
+            return;
+        }
+        if stress_grow() {
+            let new_cap = stress_cap(BUFS[b].cap, needed);
+            BUFS[b].data = moved_block(BUFS[b].data, BUFS[b].len, new_cap);
+            BUFS[b].cap = new_cap;
+            return;
+        }
+        var new_cap = BUFS[b].cap * 2;
+        while new_cap < needed {
+            new_cap *= 2;
+        }
+        BUFS[b].data = realloc(BUFS[b].data, new_cap as u64);
+        BUFS[b].cap = new_cap;
+    }
+}
+
+pub fn buf_clear(b: i64) {
+    unsafe { BUFS[b].len = 0; }
+}
+
+pub fn buf_byte(b: i64, c: u8) {
+    unsafe {
+        if BUFS[b].len == BUFS[b].cap {
+            buf_reserve(b, 1);
+        }
+        BUFS[b].data[BUFS[b].len] = c;
+        BUFS[b].len += 1;
+    }
+}
+
+pub fn buf_bytes(b: i64, bytes: [u8]) {
+    let n = bytes.len as i64;
+    buf_reserve(b, n);
+    unsafe {
+        memcpy(&BUFS[b].data[BUFS[b].len], bytes.ptr, bytes.len as u64);
+        BUFS[b].len += n;
+    }
+}
+
+// The bytes of buffer b.
+pub fn buf_slice(b: i64) -> [u8] {
+    unsafe { BUFS[b].data[0..BUFS[b].len] }
+}
+
+pub fn buf_str(b: i64, s: *u8) {
+    unsafe { buf_bytes(b, s[0..strlen(s) as i64]); }
+}
+
+pub fn buf_uint(b: i64, value: u64) {
+    var digits: [u8; 24] = [0; 24];
+    var n = 0;
+    var v = value;
+    loop {
+        digits[n] = '0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while n > 0 {
+        n -= 1;
+        buf_byte(b, digits[n]);
+    }
+}
+
+pub fn buf_int(b: i64, value: i64) {
+    if value < 0 {
+        buf_byte(b, '-');
+        // Also right for the most negative value: its negation wraps to
+        // itself, which as u64 is the right magnitude.
+        buf_uint(b, (0 - value) as u64);
+    } else {
+        buf_uint(b, value as u64);
+    }
+}
+
+fn hex_digit_char(d: u64) -> u8 {
+    if d < 10 { '0' + d as u8 } else { 'a' + (d - 10) as u8 }
+}
+
+// `value` as exactly `digits` lowercase hex digits.
+pub fn buf_hex(b: i64, value: u64, digits: i64) {
+    var i = digits - 1;
+    while i >= 0 {
+        buf_byte(b, hex_digit_char((value >> (i * 4) as u64) & 15));
+        i -= 1;
+    }
+}
+
+// (0.16) Appends x's Display, an f-string above all:
+// `buf_fmt(b, f"v{n}: {sym_text(s)}")`. The text is made in one std::Buf
+// kept for it (fmt_scratch), then copied (fmt_end): a Display that calls
+// buf_fmt itself would clobber it (none of the compiler's do). Through
+// push_fmt, which 0.15's std and 0.16's both have (0.16 has no
+// Fmt::to_buf).
+pub fn buf_fmt<T: std::Display>(b: i64, x: sink T) {
+    unsafe { (*fmt_scratch()).push_fmt(x); }
+    fmt_end(b);
+}
+
+// The scratch Buf, emptied.
+pub fn fmt_scratch() -> *std::Buf {
+    unsafe {
+        if FMT_SCRATCH == 0 as *std::Buf {
+            // Zeroed: an empty Buf (no bytes, no capacity), in 0.15 as in
+            // 0.16 (std::Buf::new allocates nothing, but it is not 0.16's).
+            FMT_SCRATCH = alloc_zeroed(size_of(std::Buf)) as *std::Buf;
+        }
+        (*FMT_SCRATCH).clear();
+        FMT_SCRATCH
+    }
+}
+
+// The scratch Buf's text, appended to buffer b.
+pub fn fmt_end(b: i64) {
+    unsafe { buf_bytes(b, (*FMT_SCRATCH).as_slice()); }
+}
+
+static var FMT_SCRATCH: *std::Buf = 0 as *std::Buf;
+
+// A C string's bytes, up to its NUL: `{cstr(s)}` in an f-string.
+pub fn cstr(s: *u8) -> [u8] {
+    unsafe { s[0..strlen(s) as i64] }
+}
+
+// Writes the whole buffer to a file descriptor (0.15: what goes to
+// stdout while STDOUT_CAPTURE is a buffer goes to that buffer, for the
+// output budget of `volec query`).
+pub fn buf_write_fd(b: i64, fd: i32) {
+    unsafe {
+        if fd == STDOUT && STDOUT_CAPTURE >= 0 && b != STDOUT_CAPTURE {
+            buf_bytes(STDOUT_CAPTURE, BUFS[b].data[0..BUFS[b].len]);
+            return;
+        }
+        // (0.15) --json: what goes to stdout as JSON lines
+        if crate::base::json::DIAG_JSON && fd == STDOUT {
+            let j = buf_new();
+            crate::base::json::json_output(j, buf_slice(b));
+            write(fd, BUFS[j].data, BUFS[j].len as u64);
+            return;
+        }
+        write(fd, BUFS[b].data, BUFS[b].len as u64);
+    }
+}
+
+// (0.15) The buffer stdout's writes go to (buf_write_fd), or -1.
+pub static var STDOUT_CAPTURE: i64 = -1;
+
+pub fn buf_write_file(b: i64, path: *u8) {
+    unsafe {
+        let file = fopen(path, c"wb");
+        if file == 0 as *u8 {
+            die2(c"cannot write ", path);
+        }
+        fwrite(BUFS[b].data, 1, BUFS[b].len as u64, file);
+        fclose(file);
+    }
+}
+
+// ---- Fatal errors without a source position ----
+
+pub fn die(message: *u8) -> ! {
+    unsafe {
+        write(STDERR, c"error: ", 7);
+        write(STDERR, message, strlen(message));
+        write(STDERR, c"\n", 1);
+        exit(1)
+    }
+}
+
+pub fn die2(message: *u8, detail: *u8) -> ! {
+    unsafe {
+        write(STDERR, c"error: ", 7);
+        write(STDERR, message, strlen(message));
+        write(STDERR, detail, strlen(detail));
+        write(STDERR, c"\n", 1);
+        exit(1)
+    }
+}
+
+// ---- Symbols ----
+
+// Every identifier is interned once; a symbol is its index in SYMS.
+// `text` is NUL-terminated (text.ptr is a C string).
+struct Sym { text: [u8], hash: u64 }
+
+pub static var SYMS: *Sym = 0 as *Sym;
+pub static var SYM_COUNT: i64 = 0;
+static var SYM_CAP: i64 = 0;
+// Open addressing: symbol + 1 per slot, 0 when empty.
+static var SYM_TABLE: *i64 = 0 as *i64;
+static var SYM_TABLE_SIZE: i64 = 0;
+
+fn hash_bytes(bytes: [u8]) -> u64 {
+    var h: u64 = 14695981039346656037;
+    for i in 0..bytes.len as i64 {
+        h ^= bytes[i];
+        h *= 1099511628211;
+    }
+    h
+}
+
+fn sym_table_insert(sym: i64) {
+    unsafe {
+        let mask = (SYM_TABLE_SIZE - 1) as u64;
+        var slot = SYMS[sym].hash & mask;
+        while SYM_TABLE[slot] != 0 {
+            slot = (slot + 1) & mask;
+        }
+        SYM_TABLE[slot] = sym + 1;
+    }
+}
+
+fn sym_table_rehash() {
+    var new_size = SYM_TABLE_SIZE * 2;
+    if new_size < 1024 {
+        new_size = 1024;
+    }
+    unsafe { free(SYM_TABLE as *u8); }
+    SYM_TABLE = alloc_array::<i64>(new_size);
+    SYM_TABLE_SIZE = new_size;
+    for sym in 0..SYM_COUNT {
+        sym_table_insert(sym);
+    }
+}
+
+// The symbol with these bytes, or -1 (none is made).
+pub fn find_sym(bytes: [u8]) -> i64 {
+    unsafe {
+        if SYM_TABLE_SIZE == 0 {
+            return -1;
+        }
+        let n = bytes.len as i64;
+        let hash = hash_bytes(bytes);
+        let mask = (SYM_TABLE_SIZE - 1) as u64;
+        var slot = hash & mask;
+        while SYM_TABLE[slot] != 0 {
+            let sym = SYM_TABLE[slot] - 1;
+            if SYMS[sym].hash == hash && SYMS[sym].text.len as i64 == n
+                && memcmp(SYMS[sym].text.ptr, bytes.ptr, n as u64) == 0 {
+                return sym;
+            }
+            slot = (slot + 1) & mask;
+        }
+        -1
+    }
+}
+
+pub fn intern(bytes: [u8]) -> i64 {
+    unsafe {
+        let n = bytes.len as i64;
+        if (SYM_COUNT + 1) * 2 > SYM_TABLE_SIZE {
+            sym_table_rehash();
+        }
+        let hash = hash_bytes(bytes);
+        let mask = (SYM_TABLE_SIZE - 1) as u64;
+        var slot = hash & mask;
+        while SYM_TABLE[slot] != 0 {
+            let sym = SYM_TABLE[slot] - 1;
+            if SYMS[sym].hash == hash && SYMS[sym].text.len as i64 == n
+                && memcmp(SYMS[sym].text.ptr, bytes.ptr, n as u64) == 0 {
+                return sym;
+            }
+            slot = (slot + 1) & mask;
+        }
+        SYMS = grow(SYMS, SYM_COUNT, &SYM_CAP);
+        let sym = SYM_COUNT;
+        // Symbols keep their own NUL-terminated copy, usable as a C string.
+        let copy = alloc_zeroed(n + 1);
+        memcpy(copy, bytes.ptr, n as u64);
+        SYMS[sym] = Sym { text: copy[0..n], hash };
+        SYM_COUNT += 1;
+        SYM_TABLE[slot] = sym + 1;
+        if SYM_COUNT > SYM_TABLES_CAP && SYM_TABLES.count > 0 {
+            grow_sym_tables();
+        }
+        sym
+    }
+}
+
+// Appends a symbol the table does not hold yet, with its hash (the tools'
+// cache, 0.13: the symbols of a program in their order, so that each
+// gets its number back). `text` is NUL-terminated and stays.
+pub fn restore_sym(text: [u8], hash: u64) -> i64 {
+    unsafe {
+        if (SYM_COUNT + 1) * 2 > SYM_TABLE_SIZE {
+            sym_table_rehash();
+        }
+        SYMS = grow(SYMS, SYM_COUNT, &SYM_CAP);
+        let sym = SYM_COUNT;
+        SYMS[sym] = Sym { text, hash };
+        SYM_COUNT += 1;
+        sym_table_insert(sym);
+        sym
+    }
+}
+
+// The hash of symbol sym.
+pub fn sym_hash(sym: i64) -> u64 {
+    unsafe { SYMS[sym].hash }
+}
+
+// Tables indexed by symbol (see sym_table): their addresses, and their
+// capacity, which grows with the symbols (names made after the tables,
+// such as the keys of module items and the names of generic instances).
+static var SYM_TABLES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var SYM_TABLES_CAP: i64 = 0;
+
+// A zeroed table indexed by symbol, stored in `*slot` and kept as large
+// as the symbol table.
+pub fn sym_table(slot: **i64) {
+    if SYM_TABLES_CAP < SYM_COUNT + 1 {
+        if SYM_TABLES.count > 0 {
+            grow_sym_tables();
+        } else {
+            SYM_TABLES_CAP = (SYM_COUNT + 1) * 2;
+        }
+    }
+    unsafe { *slot = alloc_array::<i64>(SYM_TABLES_CAP); }
+    SYM_TABLES.push(slot as i64);
+}
+
+fn grow_sym_tables() {
+    unsafe {
+        let old = SYM_TABLES_CAP;
+        var cap = old * 2;
+        while cap < SYM_COUNT + 1 {
+            cap *= 2;
+        }
+        for i in 0..SYM_TABLES.count {
+            let slot = SYM_TABLES.data[i] as **i64;
+            let table = alloc_array::<i64>(cap);
+            memcpy(table as *u8, *slot as *u8, (old * 8) as u64);
+            if stress_grow() {
+                memset(*slot as *u8, 0xAA, (old * 8) as u64);
+            } else {
+                free(*slot as *u8);
+            }
+            *slot = table;
+        }
+        SYM_TABLES_CAP = cap;
+    }
+}
+
+pub fn intern_c(s: *u8) -> i64 {
+    unsafe { intern(s[0..strlen(s) as i64]) }
+}
+
+// The symbol's name as a C string.
+pub fn sym_name(sym: i64) -> *u8 {
+    unsafe { SYMS[sym].text.ptr }
+}
+
+// The symbol's name: `{sym_text(s)}` in an f-string.
+pub fn sym_text(sym: i64) -> [u8] {
+    unsafe { SYMS[sym].text }
+}
+
+// ---- Source files ----
+
+// All files are read into one buffer, SRC; a position is an offset in it.
+// `module`: the module the file makes (modules.vl; 0 for the root).
+struct SourceFile { path: *u8, start: i64, end: i64, module: i64 }
+
+pub static var SRC: *u8 = 0 as *u8;
+static var SRC_LEN: i64 = 0;
+pub static var FILES: *SourceFile = 0 as *SourceFile;
+pub static var FILE_COUNT: i64 = 0;
+static var FILE_CAP: i64 = 0;
+
+// Files read from elsewhere (0.11: the edited copies an edit checks
+// before it writes them, see edit.vl): (path, copy) pairs of C strings.
+pub static var OVERLAY: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The file to read for `path`: its copy in OVERLAY, or itself.
+pub fn overlay_of(path: *u8) -> *u8 {
+    unsafe {
+        var i = 0;
+        while i < OVERLAY.count {
+            let p = OVERLAY.data[i] as *u8;
+            let n = strlen(p);
+            if n == strlen(path) && memcmp(p, path, n) == 0 {
+                return OVERLAY.data[i + 1] as *u8;
+            }
+            i += 2;
+        }
+        path
+    }
+}
+
+pub fn read_file(path: *u8, out: i64) {
+    unsafe {
+        let file = fopen(overlay_of(path), c"rb");
+        if file == 0 as *u8 {
+            die2(c"cannot read ", path);
+        }
+        loop {
+            buf_reserve(out, 65536);
+            let got = fread(&BUFS[out].data[BUFS[out].len], 1, 65536, file);
+            BUFS[out].len += got as i64;
+            if got == 0 {
+                break;
+            }
+        }
+        fclose(file);
+    }
+}
+
+// Reads all source files into SRC; each file is followed by a newline so
+// that tokens never span files.
+pub fn load_sources(paths: **u8, count: i64) {
+    unsafe {
+        let all = buf_new();
+        for i in 0..count {
+            let start = BUFS[all].len;
+            read_file(paths[i], all);
+            FILES = grow(FILES, FILE_COUNT, &FILE_CAP);
+            FILES[FILE_COUNT] = SourceFile { path: paths[i], start, end: BUFS[all].len, module: 0 };
+            FILE_COUNT += 1;
+            buf_byte(all, '\n');
+        }
+        buf_byte(all, 0);
+        SRC = BUFS[all].data;
+        SRC_LEN = BUFS[all].len - 1;
+        SRC_BUF = all;
+    }
+}
+
+static var SRC_BUF: i64 = 0;
+
+// Adds a source file made by the compiler (the declarations of `import`ed
+// C headers) after the others; returns its start in SRC.
+pub fn add_source(path: *u8, text: i64) -> i64 {
+    unsafe {
+        let all = SRC_BUF;
+        BUFS[all].len -= 1;
+        let start = BUFS[all].len;
+        buf_bytes(all, buf_slice(text));
+        FILES = grow(FILES, FILE_COUNT, &FILE_CAP);
+        FILES[FILE_COUNT] = SourceFile { path, start, end: BUFS[all].len, module: 0 };
+        FILE_COUNT += 1;
+        buf_byte(all, '\n');
+        buf_byte(all, 0);
+        SRC = BUFS[all].data;
+        SRC_LEN = BUFS[all].len - 1;
+        start
+    }
+}
+
+// (0.18) Source file paths as the compiler writes them into what it makes
+// (run-time failure positions, --trace, --check-alloc and --check-unsafe
+// sites, the test runner's labels, -g's line table), by file: relative
+// to the root file's directory, so that the output is the same whatever
+// the current directory and however the root's path is spelled
+// (`main.vl`, `./main.vl`, an absolute path). A file the compiler
+// made (`<std>`) keeps its name; one outside the root's directory is
+// `../`-relative. OUT_PATHS holds each file's, made when first asked.
+static var OUT_PATHS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var ROOT_DIR: *u8 = 0 as *u8;
+
+// The absolute directory of the root file (FILES[0]), resolved once; the
+// empty string when it cannot be.
+pub fn root_dir() -> *u8 {
+    unsafe {
+        if ROOT_DIR == 0 as *u8 {
+            ROOT_DIR = c"";
+            if FILE_COUNT > 0 {
+                let abs = realpath(FILES[0].path, 0 as *u8);
+                if abs != 0 as *u8 {
+                    var cut = strlen(abs) as i64;
+                    while cut > 0 && abs[cut - 1] != '/' {
+                        cut -= 1;
+                    }
+                    // (the root at "/x.vl": its directory is "/")
+                    abs[if cut > 1 { cut - 1 } else { cut }] = 0;
+                    ROOT_DIR = abs;
+                }
+            }
+        }
+        ROOT_DIR
+    }
+}
+
+// (0.18) The root's directory as out_path compares with (normal_path's,
+// once), and the current directory, read once.
+static var ROOT_LEX: *u8 = 0 as *u8;
+
+static var ROOT_LEX_ABS: bool = false;
+static var CWD: *u8 = 0 as *u8;
+
+// path normal by its text: empty and "." components dropped, ".."
+// taking the component before it away (kept at the start of a relative
+// path). With `absolute`, a relative path is first put after the current
+// directory (read once). Symbolic links are not followed, so two
+// spellings of a file through the same links agree.
+fn normal_path(path: *u8, absolute: bool) -> *u8 {
+    unsafe {
+        let full = buf_new();
+        if absolute && path[0] != '/' {
+            if CWD == 0 as *u8 {
+                let b = alloc_zeroed(4096);
+                CWD = if getcwd(b, 4096) != 0 as *u8 { b } else { c"/" };
+            }
+            buf_str(full, CWD);
+            buf_byte(full, '/');
+        }
+        buf_str(full, path);
+        let s = BUFS[full].data;
+        let n = BUFS[full].len;
+        let rooted = s[0] == '/';
+        let out = buf_new();
+        // where each kept component starts in out, and whether it is ".."
+        var starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var ups = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var i = 0;
+        while i < n {
+            while i < n && s[i] == '/' {
+                i += 1;
+            }
+            let a = i;
+            while i < n && s[i] != '/' {
+                i += 1;
+            }
+            let len = i - a;
+            if len == 0 || (len == 1 && s[a] == '.') {
+                continue;
+            }
+            let up = len == 2 && s[a] == '.' && s[a + 1] == '.';
+            if up && starts.count > 0 && ups.data[ups.count - 1] == 0 {
+                BUFS[out].len = starts.data[starts.count - 1];
+                starts.count -= 1;
+                ups.count -= 1;
+                continue;
+            }
+            if up && rooted {
+                continue;
+            }
+            starts.push(BUFS[out].len);
+            ups.push(if up { 1 } else { 0 });
+            if rooted || BUFS[out].len > 0 {
+                buf_byte(out, '/');
+            }
+            buf_bytes(out, s[a..i]);
+        }
+        if rooted && BUFS[out].len == 0 {
+            buf_byte(out, '/');
+        }
+        buf_byte(out, 0);
+        free(starts.data as *u8);
+        free(ups.data as *u8);
+        BUFS[out].data
+    }
+}
+
+// The path of file `file` relative to the root's directory (see
+// OUT_PATHS). Both are made normal by their text (normal_path): no
+// call of realpath or getcwd per file, which walk the directories above
+// the current one on some systems.
+pub fn out_path(file: i64) -> *u8 {
+    unsafe {
+        let path = FILES[file].path;
+        if path[0] == '<' {
+            return path;
+        }
+        while OUT_PATHS.count <= file {
+            OUT_PATHS.push(0);
+        }
+        if OUT_PATHS.data[file] != 0 {
+            return OUT_PATHS.data[file] as *u8;
+        }
+        // Both relative (the usual case: the modules' paths are made from
+        // the root's) need no current directory; else both absolute.
+        let absolute = FILES[0].path[0] == '/' || path[0] == '/';
+        if ROOT_LEX == 0 as *u8 || ROOT_LEX_ABS != absolute {
+            // the root's directory: its normal path up to the last '/'
+            // ("/" for a root at the top, "" for one in the current
+            // directory)
+            let r = normal_path(FILES[0].path, absolute);
+            var cut = strlen(r) as i64;
+            while cut > 0 && r[cut] != '/' {
+                cut -= 1;
+            }
+            if r[cut] != '/' {
+                r[0] = 0;
+            } else {
+                r[if cut > 0 { cut } else { 1 }] = 0;
+            }
+            ROOT_LEX = r;
+            ROOT_LEX_ABS = absolute;
+        }
+        let dir = ROOT_LEX;
+        let abs = normal_path(path, absolute);
+        // the longest common prefix of whole components
+        var i = 0;
+        var last = 0;
+        while abs[i] != 0 && abs[i] == dir[i] {
+            if abs[i] == '/' {
+                last = i + 1;
+            }
+            i += 1;
+        }
+        let out = buf_new();
+        if dir[i] == 0 && abs[i] == '/' {
+            // under the root's directory
+            last = i + 1;
+        } else if dir[last] != 0 {
+            // one "../" for each component of dir after the common prefix
+            // (last <= i: within dir)
+            buf_str(out, c"../");
+            var k = last;
+            while dir[k] != 0 {
+                if dir[k] == '/' {
+                    buf_str(out, c"../");
+                }
+                k += 1;
+            }
+        }
+        buf_str(out, &abs[last]);
+        buf_byte(out, 0);
+        let made = BUFS[out].data;
+        OUT_PATHS.data[file] = made as i64;
+        made
+    }
+}
+
+// The sources as the tools' cache read them (0.13): buffer `all` holds
+// the files as load_sources and add_source lay them out (each followed by
+// a newline, then a NUL); `files` their paths, starts, ends and modules,
+// in fours.
+pub fn restore_sources(all: i64, files: IntVec) {
+    unsafe {
+        var i = 0;
+        while i < files.count {
+            FILES = grow(FILES, FILE_COUNT, &FILE_CAP);
+            FILES[FILE_COUNT] = SourceFile {
+                path: files.data[i] as *u8, start: files.data[i + 1],
+                end: files.data[i + 2],
+                module: files.data[i + 3],
+            };
+            FILE_COUNT += 1;
+            i += 4;
+        }
+        SRC = BUFS[all].data;
+        SRC_LEN = BUFS[all].len - 1;
+        SRC_BUF = all;
+    }
+}
+
+// ---- C strings ----
+
+pub fn streq(a: *u8, b: *u8) -> bool {
+    unsafe {
+        let n = strlen(a);
+        n == strlen(b) && memcmp(a, b, n) == 0
+    }
+}
+
+// (0.21) A source file's extension: `.vl`, or `.vl` (vole, the name of
+// 0.24): its length in s, 0 when s names no source file.
+pub fn source_ext_len(s: [u8]) -> i64 {
+    if s.len > 5 && s[s.len - 5..s.len] == ".vl" {
+        return 5;
+    }
+    if s.len > 3 && s[s.len - 3..s.len] == ".vl" {
+        return 3;
+    }
+    0
+}
+
+// (0.21) Whether path p (a C string) names a source file, `.vl` or `.vl`.
+pub fn is_source_path(p: *u8) -> bool {
+    unsafe { source_ext_len(p[0..strlen(p) as i64]) > 0 }
+}
+
+extern "C" {
+    #[link_name = "setenv"]
+    fn base_setenv(name: *u8, value: *u8, overwrite: i32) -> i32;
+}
+
+// (0.21) The environment variables the compiler reads, VOLE_ + these
+// (tests/run.sh checks that every VOLE_ name in compiler/src is here).
+const ENV_NAMES: [*u8; 20] = [
+    c"CACHE", c"CACHE_CHECK", c"CACHE_LIMIT", c"CACHE_STATS", c"CACHE_SYNC", c"CACHE_TRACE",
+    c"CACHE_WHY", c"CC", c"CODE_CACHE", c"FRESH_CONTEXTS", c"LSP_TIME", c"OK", c"OWN_STD",
+    c"PHASE_TIMES", c"PLANT_MISCOMPILE", c"QUERY_FULL", c"QUERY_STD", c"ROOT", c"STRESS_GROW",
+    c"SYNTAX",];
+
+// (0.21, for 0.24's name) At start (main): each VOLE_X in the environment
+// is copied to VOLE_X, so that it is read as that one, and wins over it;
+// the children inherit both.
+pub fn env_aliases() {
+    unsafe {
+        for k in 0..20 {
+            let n = ENV_NAMES[k];
+            let vole = buf_new();
+            buf_str(vole, c"VOLE_");
+            buf_str(vole, n);
+            buf_byte(vole, 0);
+            let v = getenv(BUFS[vole].data);
+            if v != 0 as *u8 {
+                let tach = buf_new();
+                buf_str(tach, c"VOLE_");
+                buf_str(tach, n);
+                buf_byte(tach, 0);
+                base_setenv(BUFS[tach].data, v, 1);
+            }
+        }
+    }
+}

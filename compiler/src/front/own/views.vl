@@ -1,0 +1,1425 @@
+// Views and exclusivity: the walk's view events (0.17, docs/design/
+// value-semantics.md §2.4, §4 step 4). T2 owns this file, calls.vl,
+// fast.vl and observe.vl.
+//
+// A slot (state.vl) is a view-holding local: its origin (level 1, what
+// its views point into; level 2, what those hold), its flags and the node
+// that invalidated it. The rules:
+// - a write, move, drop or `&mut` of a place invalidates the slots whose
+//   origin overlaps it (invalidate); a read of a place invalidates the
+//   slots holding an exclusive loan on it (F_MUTLOAN);
+// - liveness is implicit: using an invalidated slot is the finding,
+//   reported at the node that invalidated it, once per slot (use_slot);
+// - a reborrow (`let out = acc[..]`, `let q = &mut *p`, a `&mut` local
+//   passed on) is a child slot (SLOT_PARENT): writing through it leaves its
+//   parents valid; using a parent ends its `&mut` children;
+// - places under a reference local are paths into its referent: a write
+//   that reaches a reference's referent reaches every path under it
+//   (close_mask);
+// - a scope's end invalidates the views of its locals: a later use, a
+//   block value, a result or a store into a `&mut` parameter that views
+//   one is own.escape;
+// - a write through `&T` or `[T]` is own.readonly (U2).
+// An origin holding the mark place (state::mark_place) came in part from
+// an assumed (top) summary: its conflicts are warnings (design §7 V3)
+// until T3's inferred summaries replace the fallback. Findings inside
+// std's own functions are not reported (std is trusted code; T4).
+
+use crate::base::{IntVec, SRC, SYMS, buf_bytes, buf_new, buf_slice, buf_str};
+use crate::base::diag::{buf_position, buf_tool_command};
+use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::check::{LOCALS, Res};
+use crate::front::lexer::Tok;
+use crate::front::modules::within_std;
+use crate::front::own::diag::{
+    OWN_CONFLICT, OWN_ESCAPE, OWN_READONLY, OWN_STATIC, own_begin, own_bytes, own_end, own_help,
+    own_pos, own_soft, own_str, own_sym, own_try, own_type,
+};
+use crate::front::own::kinds::{P_MUT, is_owned_type, is_view_type, param_mode};
+use crate::front::own::state::{
+    CUR, DEREF_FIELD, F_INVALID, F_SCOPE, F_STATIC, LOC_CAP, LOC_PL, NSLOT, NW, OV, PE, PEND, PE_BY,
+    PE_INVALID, PE_KIND, PE_OV, PK_NONE, PK_RAW, PL_COUNT, PL_FIELD, PL_MASK, PL_PARENT, PL_RID,
+    PL_RKIND, POOL, POOL_TOP, RK_LOCAL, RK_MARK, RK_ROOT, RK_STATIC, SLOT_LOCAL, SLOT_PARENT,
+    TUPLE_FIELD, any_and, at, child_place, clear_bit, field_number, get_bit, is_deref_place, l1, l2,
+    mark_place, new_ov, or_expanded, or_into, ov_hits, ov_inner, ov_or, root_of, root_place,
+    set_bit, slot_for, slot_of_local, slot_of_place, slot_off,
+};
+use crate::front::own::walk::{
+    BOUND, CUR_F, PARAM_LOCALS, PO_DEREF, PO_INNER, PO_RAW, PO_VIEWSLOT, W_DROP, W_MOVE,
+    W_MUT_BORROW,
+};
+use crate::front::types::{FNS, REF_MUT, REF_SHARED, STATICS, TYPES, TyKind};
+
+// ---------------------------------------------------------------------------
+// Flags and the per-walk tables
+
+// The slot holds an exclusive loan (its type is `&mut T`, `&mut [T]`, or
+// holds one): a read of what it views ends it.
+pub const F_MUTLOAN: i64 = 8;
+// How a slot was invalidated (bits 8-11 of its flags), for the messages.
+const HOW_SHIFT: i64 = 8;
+
+// The place the invalidation hit, + 1 (bits 16-25), for the messages.
+const HIT_SHIFT: i64 = 16;
+pub const H_WRITE: i64 = 1;
+pub const H_MOVE: i64 = 2;
+pub const H_DROP: i64 = 3;
+pub const H_MUT: i64 = 4;
+pub const H_READ: i64 = 5;
+pub const H_CALL: i64 = 6;
+pub const H_GLOBAL: i64 = 7;
+pub const H_SCOPE: i64 = 8;
+pub const H_PARENT: i64 = 9;
+
+// The nodes reported in this walk (one finding per node), whether any
+// slot holds a `&mut` loan, a reference, or a parent; whether findings
+// are reported (not in std's own functions).
+static var REPORTED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var ANY_MUT: bool = false;
+static var ANY_REF: bool = false;
+static var ANY_CHILD: bool = false;
+pub static var QUIET: bool = false;
+// Per slot (this walk, not per state): the pattern that last bound it, the
+// expression it was bound to (0: none).
+static var SLOT_BIND: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var SLOT_INIT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var SYM_FOR_SEQ: i64 = 0;
+
+// Per local: 1 bound by the checker, 2 by the program (note_binding).
+static var GEN: *u8 = 0 as *u8;
+static var GEN_CAP: i64 = 0;
+// The last read (on_read): the place, the node.
+static var LAST_READ_NODE: i64 = 0;
+static var LAST_READ_PLACE: i64 = -1;
+
+fn slot_note(s: i64, bind: i64, init: i64) {
+    unsafe {
+        while SLOT_BIND.count <= s {
+            SLOT_BIND.push(0);
+            SLOT_INIT.push(0);
+        }
+        if bind >= 0 {
+            SLOT_BIND.data[s] = bind;
+        }
+        if init >= 0 {
+            SLOT_INIT.data[s] = init;
+        }
+    }
+}
+
+fn slot_bind(s: i64) -> i64 {
+    unsafe { if s < SLOT_BIND.count { SLOT_BIND.data[s] } else { 0 } }
+}
+
+fn slot_init(s: i64) -> i64 {
+    unsafe { if s < SLOT_INIT.count { SLOT_INIT.data[s] } else { 0 } }
+}
+
+// Whether node n was reported in this walk; marks it.
+pub fn seen(n: i64) -> bool {
+    unsafe {
+        let key = NODES[n].start * 16 + 1;
+        for i in 0..REPORTED.count {
+            if REPORTED.data[i] == key {
+                return true;
+            }
+        }
+        REPORTED.push(key);
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Types
+
+fn is_ptr(t: i64) -> bool {
+    unsafe { t > 0 && TYPES[t].kind == TyKind::Ptr }
+}
+
+// Whether a value of type t holds an exclusive loan.
+fn holds_mut(t: i64, depth: i64) -> bool {
+    unsafe {
+        if t <= 0 || depth > 3 || !is_view_type(t) {
+            return false;
+        }
+        let k = TYPES[t].kind;
+        if k == TyKind::Ptr || k == TyKind::Slice {
+            return TYPES[t].b == REF_MUT;
+        }
+        if k == TyKind::Struct {
+            let s = TYPES[t].a;
+            for i in 0..crate::front::types::STRUCTS[s].field_count {
+                if holds_mut((*crate::front::types::struct_field(s, i)).ty, depth + 1) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+// The flags a slot of local l starts with.
+fn start_flags(l: i64) -> i64 {
+    unsafe {
+        let t = LOCALS[l].ty;
+        if is_ptr(t) {
+            ANY_REF = true;
+        }
+        if holds_mut(t, 0) {
+            ANY_MUT = true;
+            return F_MUTLOAN;
+        }
+        0
+    }
+}
+
+// Whether slot local l is a reference (its places are paths into what it
+// points to).
+fn is_ref_slot(s: i64) -> bool {
+    unsafe { is_ptr(LOCALS[SLOT_LOCAL.data[s]].ty) }
+}
+
+// ---------------------------------------------------------------------------
+// Invalidation
+
+// Whether slot a is s or an ancestor of s (by reborrow).
+fn is_slot_ancestor(a: i64, s: i64) -> bool {
+    unsafe {
+        if s < 0 {
+            return false;
+        }
+        var p = s;
+        var steps = 0;
+        while p >= 0 && steps < 32 {
+            if p == a {
+                return true;
+            }
+            p = SLOT_PARENT.data[p];
+            steps += 1;
+        }
+        false
+    }
+}
+
+// Mask m (NW words, already expanded) also covers the paths under every
+// reference whose referent it reaches: a write to x reaches `r.f` for
+// `let r = &mut x`.
+pub fn close_mask(m: *i64) {
+    unsafe {
+        if !ANY_REF {
+            return;
+        }
+        var round = 0;
+        var grew = true;
+        while grew && round < 4 {
+            grew = false;
+            for s in 0..NSLOT {
+                if !is_ref_slot(s) {
+                    continue;
+                }
+                let l = SLOT_LOCAL.data[s];
+                if l >= LOC_CAP || LOC_PL[l] == 0 {
+                    continue;
+                }
+                let lp = LOC_PL[l] - 1;
+                if get_bit(m, lp) {
+                    continue;
+                }
+                if any_and(l1(slot_off(CUR, s)), m) {
+                    or_into(m, &PL_MASK[lp * NW]);
+                    grew = true;
+                }
+            }
+            round += 1;
+        }
+    }
+}
+
+// Invalidates the slots viewing a place of mask m (how: H_*, reason: the
+// node, or -(l + 1) for local l's scope end), except slot `except` and
+// its ancestors; and the pending arguments PEND[..pend_end] viewing one.
+pub fn invalidate(m: *i64, reason: i64, how: i64, except: i64, pend_end: i64) {
+    unsafe {
+        for s in 0..NSLOT {
+            if except >= 0 && is_slot_ancestor(s, except) {
+                continue;
+            }
+            let off = slot_off(CUR, s);
+            if !ov_hits(off, m) {
+                continue;
+            }
+            let fl = off + OV;
+            if (POOL[fl] & F_INVALID) == 0 {
+                POOL[fl + 1] = reason;
+                POOL[fl] = (POOL[fl] & ~(15 << HOW_SHIFT) & ~(1023 << HIT_SHIFT))
+                    | (how << HOW_SHIFT) | F_INVALID;
+                let hit = first_place(off, m);
+                if hit >= 0 && hit < 1023 {
+                    POOL[fl] |= (hit + 1) << HIT_SHIFT;
+                }
+                if how == H_GLOBAL {
+                    POOL[fl] |= F_STATIC;
+                }
+                if how == H_SCOPE || how == H_DROP {
+                    POOL[fl] |= F_SCOPE;
+                }
+            }
+        }
+        var e = 0;
+        while e < pend_end {
+            let k = PEND.data[e + PE_KIND];
+            let o = PEND.data[e + PE_OV];
+            if k != PK_NONE && k != PK_RAW && o >= 0 && PEND.data[e + PE_INVALID] == 0
+                && ov_hits(o, m) {
+                PEND.data[e + PE_INVALID] = how;
+                PEND.data[e + PE_BY] = reason;
+            }
+            e += PE;
+        }
+    }
+}
+
+// Invalidates what a write to place p reaches.
+fn write_place(p: i64, n: i64, how: i64, except: i64) {
+    unsafe {
+        let m = new_ov();
+        or_into(at(m), &PL_MASK[p * NW]);
+        close_mask(at(m));
+        // (a drop is never one of a call's own arguments changing what an
+        // earlier one borrows: the locals a scope drops inside an argument
+        // were declared there, after the pending ones; a jump out of the
+        // argument, `?` or `return`, drops the older ones but skips the call)
+        invalidate(at(m), n, how, except, if how == H_DROP { 0 } else { PEND.count });
+        POOL_TOP = m;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+
+fn src_of(n: i64) -> [u8] {
+    unsafe {
+        let s = NODES[n].start;
+        var e = NODES[n].end;
+        if e <= s {
+            return "";
+        }
+        var i = s;
+        while i < e {
+            if SRC[i] == '\n' {
+                e = i;
+            }
+            i += 1;
+        }
+        if e - s > 60 {
+            e = s + 60;
+        }
+        SRC[s..e]
+    }
+}
+
+// 'TEXT' of node n.
+pub fn own_src(n: i64) {
+    unsafe {
+        own_str(c"'");
+        own_bytes(src_of(n));
+        own_str(c"'");
+    }
+}
+
+// The name of place p: its root (a local, a static, `*p`), then its fields.
+pub fn own_place(p: i64) {
+    unsafe {
+        own_str(c"'");
+        put_place(p);
+        own_str(c"'");
+    }
+}
+
+fn put_place(p: i64) {
+    unsafe {
+        if PL_PARENT[p] >= 0 {
+            put_place(PL_PARENT[p]);
+            let f = PL_FIELD[p];
+            if f == DEREF_FIELD {
+                return;
+            }
+            own_str(c".");
+            if f >= TUPLE_FIELD {
+                let b = buf_new();
+                crate::base::buf_int(b, field_number(f));
+                own_bytes(buf_slice(b));
+            } else {
+                own_bytes(SYMS[f].text);
+            }
+            return;
+        }
+        let k = PL_RKIND[p];
+        if k == RK_LOCAL {
+            own_bytes(SYMS[LOCALS[PL_RID[p]].name].text);
+        } else if k == RK_STATIC {
+            own_bytes(SYMS[NODES[STATICS[PL_RID[p]].node].a].text);
+        } else if k == RK_MARK {
+            own_str(c"?");
+        } else {
+            if PL_FIELD[p] == 1 {
+                own_str(c"*");
+            }
+            own_bytes(SYMS[LOCALS[PL_RID[p]].name].text);
+        }
+    }
+}
+
+// The first place of origin o (level 1, else 2) that is a local's, a
+// static's or a parameter's; -1.
+pub fn first_place(o: i64, m: *i64) -> i64 {
+    unsafe {
+        for q in 0..PL_COUNT {
+            if PL_RKIND[root_of(q)] == RK_MARK {
+                continue;
+            }
+            let hit = get_bit(l1(o), q) || get_bit(l2(o), q);
+            if hit && (m == 0 as *i64 || get_bit(m, q)) {
+                return q;
+            }
+        }
+        -1
+    }
+}
+
+// FILE:LINE:COL of position pos (or FILE:LINE), into buffer out.
+pub fn put_loc(out: i64, pos: i64, col: bool) {
+    unsafe {
+        let t = buf_new();
+        buf_position(t, pos);
+        let s = buf_slice(t);
+        // `FILE: line L, column C`
+        var i = 0;
+        while i + 7 < s.len && !(s[i] == ':' && s[i + 1] == ' ' && s[i + 2] == 'l') {
+            i += 1;
+        }
+        buf_bytes(out, s[0..i]);
+        var j = i + 7;
+        buf_str(out, c":");
+        while j < s.len && s[j] != ',' {
+            buf_bytes(out, s[j..j + 1]);
+            j += 1;
+        }
+        if col {
+            buf_str(out, c":");
+            j += 9;
+            if j <= s.len {
+                buf_bytes(out, s[j..s.len]);
+            }
+        }
+    }
+}
+
+// `try: volec query own FILE:L:C` at node n.
+fn try_query_own(n: i64) {
+    unsafe {
+        let a = buf_new();
+        buf_str(a, c"query own ");
+        put_loc(a, NODES[n].start, true);
+        let t = buf_new();
+        buf_tool_command(t, buf_slice(a), false);
+        own_try(buf_slice(t));
+    }
+}
+
+// `try: volec edit patch FN --old OLD --new NEW` in function CUR_F.
+fn try_patch(old: [u8], new: [u8]) {
+    unsafe {
+        let a = buf_new();
+        buf_str(a, c"edit patch ");
+        buf_bytes(a, SYMS[FNS[CUR_F].display].text);
+        buf_str(a, c" --old '");
+        buf_bytes(a, old);
+        buf_str(a, c"' --new '");
+        buf_bytes(a, new);
+        buf_str(a, c"'");
+        let t = buf_new();
+        buf_tool_command(t, buf_slice(a), false);
+        own_try(buf_slice(t));
+    }
+}
+
+fn ends_with(s: [u8], t: *u8) -> bool {
+    unsafe {
+        var n = 0;
+        while t[n] != 0 {
+            n += 1;
+        }
+        if s.len < n {
+            return false;
+        }
+        for i in 0..n {
+            if s[s.len - n + i] != t[i] {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn verb(how: i64) -> *u8 {
+    if how == H_WRITE { return c"writes"; }
+    if how == H_MOVE { return c"moves"; }
+    if how == H_DROP { return c"drops"; }
+    if how == H_MUT { return c"borrows mutably"; }
+    if how == H_READ { return c"reads"; }
+    if how == H_CALL { return c"may change"; }
+    if how == H_PARENT { return c"uses"; }
+    c"changes"
+}
+
+// Whether the walk reports findings (not in std's own functions, nor in a
+// round the driver throws away).
+fn reporting(n: i64) -> bool {
+    unsafe { !QUIET && !seen(n) }
+}
+
+static var OWN_STD: i64 = -1;
+
+// (0.22) Whether std's own functions are reported too: VOLE_OWN_STD=1
+// (tests/std_own.sh, which runs the own pass over std and fails on any
+// finding).
+fn own_std() -> bool {
+    unsafe {
+        if OWN_STD < 0 {
+            let v = crate::base::getenv(c"VOLE_OWN_STD");
+            OWN_STD = if v != 0 as *u8 && v[0] == '1' { 1 } else { 0 };
+        }
+        OWN_STD == 1
+    }
+}
+
+// Whether local l is the checker's own: a desugaring's (`__t`, `__out`,
+// `__b` of format_in; `__f`, `__a0` of a derived impl) or an f-string
+// hole's (`=f0`, `==l`). Its views and loans are the desugaring's, which
+// std's raw code keeps right: a finding on them would name nothing the
+// program wrote, so none is reported. A `for` loop's `__for_seq` is the
+// user's sequence and stays. What decides is where the local was bound
+// (note_binding), never its name alone: a program's own `let __out` is
+// checked like any local.
+pub fn hidden_local(l: i64) -> bool {
+    unsafe { l >= 0 && l < GEN_CAP && GEN[l] == 1 && LOCALS[l].name != SYM_FOR_SEQ }
+}
+
+// Local l is bound by node n (a pattern, a parameter): it is the
+// checker's when its name is one a program cannot write there: `=f0`, or
+// a `__` name that is not the text at n's position (the checker made the
+// binding: an f-string's block, a derived impl's text, a `for` loop).
+fn note_binding(l: i64, n: i64) {
+    unsafe {
+        if l < 0 || n <= 0 {
+            return;
+        }
+        if l >= GEN_CAP {
+            let c = l * 2 + 1024;
+            let a = crate::base::alloc_array::<u8>(c);
+            for i in 0..GEN_CAP {
+                a[i] = GEN[i];
+            }
+            GEN = a;
+            GEN_CAP = c;
+        }
+        let name = SYMS[LOCALS[l].name].text;
+        var gen = false;
+        if name.len >= 1 && name[0] == '=' {
+            gen = true;
+        } else if name.len >= 2 && name[0] == '_' && name[1] == '_' {
+            var s = NODES[n].start;
+            // (`mut x`: the name after it)
+            if NODES[n].end - s > 4 && SRC[s] == 'm' && SRC[s + 1] == 'u' && SRC[s + 2] == 't'
+                && (SRC[s + 3] == ' ' || SRC[s + 3] == '\t') {
+                s += 3;
+                while s < NODES[n].end && (SRC[s] == ' ' || SRC[s] == '\t') {
+                    s += 1;
+                }
+            }
+            gen = NODES[n].end - s < name.len;
+            var i = 0;
+            while !gen && i < name.len {
+                if SRC[s + i] != name[i] {
+                    gen = true;
+                }
+                i += 1;
+            }
+        }
+        GEN[l] = if gen { 1 } else { 2 };
+    }
+}
+
+// Whether place p's root is a hidden local (or one of its roots).
+pub fn hidden_place(p: i64) -> bool {
+    unsafe {
+        if p < 0 {
+            return false;
+        }
+        let r = root_of(p);
+        (PL_RKIND[r] == RK_LOCAL || PL_RKIND[r] == RK_ROOT) && hidden_local(PL_RID[r])
+    }
+}
+
+// Slot s, invalidated, is used at node n: the finding.
+fn report_invalid(s: i64, n: i64) {
+    unsafe {
+        let off = slot_off(CUR, s);
+        let flags = POOL[off + OV];
+        let reason = POOL[off + OV + 1];
+        let how = (flags >> HOW_SHIFT) & 15;
+        let l = SLOT_LOCAL.data[s];
+        let at_node = if reason > 0 { reason } else { n };
+        let hit = (flags >> HIT_SHIFT) & 1023;
+        let what = if hit > 0 { hit - 1 } else { first_place(off, 0 as *i64) };
+        if hidden_local(l) || hidden_place(what) || !reporting(at_node) {
+            return;
+        }
+        let assumed = (any_and(l1(off), at_mark()) || any_and(l2(off), at_mark()));
+        if LOCALS[l].name == SYM_FOR_SEQ && reason > 0 && how != H_GLOBAL {
+            // (a `for` loop's sequence: §2.9 situation 4)
+            own_begin(at_node, OWN_CONFLICT);
+            own_src(reason);
+            own_str(c" ");
+            own_str(verb(how));
+            own_str(c" the elements of ");
+            if what >= 0 {
+                own_place(what);
+            } else {
+                own_str(c"the sequence");
+            }
+            own_str(c" while the 'for' at ");
+            own_pos(n);
+            own_str(c" iterates over them");
+            own_help(c"loop over the indexes (the loop sees the elements present when it starts), or collect the new elements and append them after the loop");
+            try_for_index(n);
+        } else if (flags & F_STATIC) != 0 && how == H_GLOBAL {
+            own_begin(at_node, OWN_STATIC);
+            own_src(reason);
+            own_str(c" writes statics (its effects include global) while ");
+            own_sym(LOCALS[l].name);
+            put_bound_at(s);
+            own_str(c" views ");
+            if what >= 0 {
+                own_place(what);
+            } else {
+                own_str(c"a static");
+            }
+            own_str(c"; ");
+            own_sym(LOCALS[l].name);
+            own_str(c" is used at ");
+            own_pos(n);
+            own_help(c"copy the plain value out of the static first, or take the view again after the call");
+            try_query_own(n);
+        } else if how == H_SCOPE || how == H_DROP {
+            own_begin(n, OWN_ESCAPE);
+            own_sym(LOCALS[l].name);
+            own_str(c" is used here, but ");
+            if reason < 0 {
+                own_sym(LOCALS[0 - reason - 1].name);
+            } else if what >= 0 {
+                own_place(what);
+            } else {
+                own_str(c"what it views");
+            }
+            own_str(c", which it views, ");
+            own_str(if how == H_DROP { c"was dropped" } else { c"went out of scope" });
+            if reason > 0 {
+                own_str(c" at ");
+                own_pos(reason);
+            }
+            own_help(c"keep the owner alive as long as the view (declare it in an outer block), or keep a copy instead of the view");
+            try_query_own(n);
+        } else {
+            own_begin(at_node, OWN_CONFLICT);
+            if reason > 0 && how != H_READ {
+                own_src(reason);
+                own_str(c" ");
+                own_str(verb(how));
+                own_str(c" ");
+            }
+            if what >= 0 {
+                own_place(what);
+            } else {
+                own_str(c"what it views");
+            }
+            if how == H_READ {
+                own_str(c" is read");
+            }
+            own_str(c" while ");
+            own_sym(LOCALS[l].name);
+            put_bound_at(s);
+            own_str(if (flags & F_MUTLOAN) != 0 { c" borrows it mutably; " }
+                else { c" views it; " });
+            own_sym(LOCALS[l].name);
+            own_str(c" is used at ");
+            own_pos(n);
+            if how == H_READ {
+                own_help(c"an inout access is the only way to its place while it is used: read through it, or end it (use it for the last time) before the read");
+            } else {
+                own_help(c"use the view before the change, keep an index instead of a view, or keep a copy");
+            }
+            let init = slot_init(s);
+            if init > 0 && ends_with(src_of(init), c".as_slice()") {
+                let old = src_of(init);
+                let b = buf_new();
+                buf_bytes(b, old[0..old.len - 11]);
+                buf_str(b, c".clone()");
+                try_patch(old, buf_slice(b));
+            }
+            try_query_own(n);
+        }
+        if assumed {
+            own_soft();
+        }
+        own_end();
+    }
+}
+
+// ` (L:C)`: where slot s was bound.
+fn put_bound_at(s: i64) {
+    unsafe {
+        let b = slot_bind(s);
+        if b > 0 {
+            own_str(c" (");
+            own_pos(b);
+            own_str(c")");
+        }
+    }
+}
+
+// The `try:` of §2.9 situation 4: `for x in v {` becomes an index loop.
+fn try_for_index(n: i64) {
+    unsafe {
+        let s = NODES[n].start;
+        var e = s;
+        while e < NODES[n].end && SRC[e] != '{' && SRC[e] != '\n' {
+            e += 1;
+        }
+        if e >= NODES[n].end || SRC[e] != '{' {
+            return;
+        }
+        let head = SRC[s..e + 1];
+        if head.len < 10 || head[0] != 'f' || head[1] != 'o' || head[2] != 'r' || head[3] != ' ' {
+            return;
+        }
+        var k = 4;
+        while k + 4 < head.len && !(head[k] == ' ' && head[k + 1] == 'i' && head[k + 2] == 'n'
+            && head[k + 3] == ' ') {
+            k += 1;
+        }
+        if k + 4 >= head.len {
+            return;
+        }
+        let pat = head[4..k];
+        var q = head.len - 1;
+        while q > k + 4 && head[q - 1] == ' ' {
+            q -= 1;
+        }
+        let seq = head[k + 4..q];
+        let b = buf_new();
+        buf_str(b, c"for i in 0..");
+        buf_bytes(b, seq);
+        buf_str(b, c".len() { let ");
+        buf_bytes(b, pat);
+        buf_str(b, c" = ");
+        buf_bytes(b, seq);
+        buf_str(b, c"[i];");
+        try_patch(head, buf_slice(b));
+    }
+}
+
+static var MARK_WORDS: i64 = -1;
+
+// A mask holding only the mark place (empty when it has none yet).
+fn at_mark() -> *i64 {
+    unsafe {
+        let m = new_ov();
+        let p = mark_place();
+        if p >= 0 {
+            set_bit(at(m), p);
+        }
+        POOL_TOP = m;
+        at(m)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The events
+
+// Slot s is used at node n: an invalidated slot is the finding; a `&mut`
+// child of s ends, if it borrows what mask m covers (null: all; the place
+// read through s: a field read leaves a view of another field alive).
+pub fn use_slot(s: i64, n: i64, m: *i64) {
+    unsafe {
+        let fl = slot_off(CUR, s) + OV;
+        if (POOL[fl] & F_INVALID) != 0 {
+            report_invalid(s, n);
+            POOL[fl] = POOL[fl] & ~F_INVALID;
+        }
+        if ANY_CHILD && ANY_MUT {
+            for q in 0..NSLOT {
+                if q != s && is_slot_ancestor(s, q)
+                    && (m == 0 as *i64 || any_and(l1(slot_off(CUR, q)), m)) {
+                    let qf = slot_off(CUR, q) + OV;
+                    if (POOL[qf] & F_MUTLOAN) != 0 && (POOL[qf] & F_INVALID) == 0 {
+                        POOL[qf + 1] = n;
+                        POOL[qf] = (POOL[qf] & ~(15 << HOW_SHIFT)) | (H_PARENT << HOW_SHIFT)
+                            | F_INVALID;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The walk starts function f, its parameters bound (walk::PARAM_LOCALS):
+// a parameter's slot views its roots (`p` at level 1, `*p` at level 2).
+pub fn on_enter(f: i64) {
+    unsafe {
+        if SYM_FOR_SEQ == 0 {
+            SYM_FOR_SEQ = crate::base::intern_c(c"__for_seq");
+        }
+        REPORTED.count = 0;
+        SLOT_BIND.count = 0;
+        SLOT_INIT.count = 0;
+        ANY_MUT = false;
+        ANY_REF = false;
+        ANY_CHILD = false;
+        LAST_READ_NODE = 0;
+        QUIET = within_std(FNS[f].module) && !own_std();
+        for i in 0..PARAM_LOCALS.count {
+            let l = PARAM_LOCALS.data[i];
+            if l < 0 {
+                continue;
+            }
+            note_binding(l, crate::front::ast::child(FNS[f].node, i));
+            let t = LOCALS[l].ty;
+            var s = slot_of_local(l);
+            if s < 0 && is_ptr(t) && param_mode(f, i) == P_MUT && is_view_type(TYPES[t].a) {
+                // (a legacy `*T` parameter to what holds views: its
+                // referent's views are tracked, for the stores)
+                s = slot_for(l, true);
+            }
+            if s < 0 {
+                continue;
+            }
+            let off = slot_off(CUR, s);
+            let a = root_place(l, false);
+            let b = root_place(l, true);
+            if a >= 0 {
+                set_bit(l1(off), a);
+            }
+            if b >= 0 {
+                set_bit(l2(off), b);
+            }
+            POOL[off + OV] = start_flags(l);
+            if is_ptr(t) && LOCALS[l].ty > 0 && TYPES[t].b == 0 {
+                ANY_REF = true;
+                if param_mode(f, i) == P_MUT {
+                    ANY_MUT = true;
+                    POOL[off + OV] |= F_MUTLOAN;
+                }
+            }
+        }
+    }
+}
+
+// Place p is read, or borrowed, at node n: an invalidated slot used here
+// is the finding; a slot's `&mut` loan on p ends. (A pending `&mut`
+// argument is two-phase, as a receiver is: a plain read of its place in a
+// later argument is fine, `f(&mut v, v.len())`; a later argument that
+// keeps a view of it overlaps it at the call, calls.vl.)
+pub fn on_read(p: i64, n: i64) {
+    unsafe {
+        crate::front::own::observe::at(n);
+        LAST_READ_NODE = n;
+        LAST_READ_PLACE = p;
+        if NSLOT == 0 {
+            return;
+        }
+        let s = slot_of_place(p);
+        if s >= 0 {
+            use_slot(s, n, &PL_MASK[p * NW]);
+        }
+        if ANY_MUT {
+            let m = &PL_MASK[p * NW];
+            for q in 0..NSLOT {
+                if q == s || is_slot_ancestor(q, s) || is_slot_ancestor(s, q) {
+                    continue;
+                }
+                let off = slot_off(CUR, q);
+                let fl = off + OV;
+                if (POOL[fl] & F_MUTLOAN) != 0 && (POOL[fl] & F_INVALID) == 0
+                    && any_and(l1(off), m) {
+                    POOL[fl + 1] = n;
+                    POOL[fl] = (POOL[fl] & ~(15 << HOW_SHIFT)) | (H_READ << HOW_SHIFT) | F_INVALID;
+                }
+            }
+        }
+    }
+}
+
+// Place p is written, moved, dropped or mutably borrowed at node n (how:
+// walk::W_*): the views of it are invalid from here.
+pub fn on_write(p: i64, n: i64, how: i64) {
+    unsafe {
+        crate::front::own::observe::at(n);
+        // (p < 0: no place, a local past the bitsets' room, PL_OVERFLOW; the
+        // walk is redone wider. A local with no place was never borrowed in
+        // this walk: no slot views it, so there is nothing to invalidate)
+        if p < 0 || NSLOT == 0 && PEND.count == 0 {
+            return;
+        }
+        let h = if how == W_MOVE { H_MOVE } else if how == W_DROP { H_DROP }
+            else if how == W_MUT_BORROW { H_MUT } else { H_WRITE };
+        let except = if how == W_MUT_BORROW { slot_of_place(p) } else { -1 };
+        // (a `&mut` of a slot's own place, or a path through a reference:
+        // the slot itself stays valid)
+        write_place(p, n, h, if PO_DEREF { except } else { -1 });
+    }
+}
+
+// `&p` (kind REF_SHARED) or `&mut p` (REF_MUT) at node n; raw: reached
+// through a raw pointer. dst (-1: none) gets the loan, and at level 2
+// what p holds. An Ident n is a reference local passed on to a call (an
+// implicit reborrow): dst gets what it views, and its own place (the
+// paths through it).
+pub fn on_borrow(p: i64, n: i64, kind: i64, raw: bool, dst: i64) {
+    unsafe {
+        crate::front::own::observe::at(n);
+        if raw || dst < 0 || p < 0 {
+            return;
+        }
+        if NODES[n].kind == NodeKind::Ident && NODES[n].res == Res::Local {
+            let s = slot_of_local(NODES[n].y);
+            if s >= 0 {
+                ov_or(dst, slot_off(CUR, s));
+            }
+            // (0.18.1: what it points to, DEREF_FIELD, not its own storage)
+            let d = child_place(p, DEREF_FIELD);
+            set_bit(l1(dst), if d >= 0 { d } else { p });
+            return;
+        }
+        // (0.20) `&*r` or `*r` of an access r (a use of it, names::
+        // access_use): a reborrow, as r passed on is: dst gets what r
+        // views, and the place r designates
+        var id = n;
+        if NODES[id].kind == NodeKind::Unary && NODES[id].op == Tok::Amp && NODES[id].b > 0 {
+            id = NODES[id].b;
+        }
+        if NODES[id].kind == NodeKind::Unary && NODES[id].op == Tok::Star && NODES[id].b > 0 {
+            let r = NODES[id].b;
+            if NODES[r].kind == NodeKind::Ident && NODES[r].res == Res::Local && NODES[r].y >= 0
+                && LOCALS[NODES[r].y].access {
+                let s = slot_of_local(NODES[r].y);
+                if s >= 0 && !LOCALS[NODES[r].y].is_param {
+                    // (a parameter's place lives for the call: `*r` stays a
+                    // place of its own, below)
+                    ov_or(dst, slot_off(CUR, s));
+                    return;
+                }
+            }
+        }
+        set_bit(l1(dst), p);
+        let s = slot_of_place(p);
+        if s >= 0 {
+            let so = slot_off(CUR, s);
+            if PO_INNER || PO_DEREF {
+                // (inside what the slot points to)
+                if PO_INNER {
+                    or_into(l1(dst), l1(so));
+                }
+                or_into(l2(dst), l2(so));
+            } else {
+                or_into(l2(dst), l1(so));
+                or_into(l2(dst), l2(so));
+            }
+            return;
+        }
+        let r = root_of(p);
+        if PL_RKIND[r] == RK_LOCAL && LOCALS[PL_RID[r]].is_param && PO_DEREF {
+            let t = NODES[n].ty;
+            if t > 0 && (TYPES[t].kind == TyKind::Ptr || TYPES[t].kind == TyKind::Slice)
+                && is_view_type(TYPES[t].a) {
+                let q = root_place(PL_RID[r], true);
+                if q >= 0 {
+                    set_bit(l2(dst), q);
+                }
+            }
+        }
+    }
+}
+
+// The value read out of place p at node n, of type ty: dst gets the views
+// it holds (walk::PO_* say how p was reached).
+pub fn on_value(p: i64, n: i64, ty: i64, dst: i64) {
+    unsafe {
+        if PO_RAW {
+            return;
+        }
+        let r0 = root_of(p);
+        if PO_DEREF && ty > 0 && TYPES[ty].kind == TyKind::Ptr && TYPES[ty].b == 0
+            && PL_RKIND[r0] == RK_LOCAL && LOCALS[PL_RID[r0]].is_param {
+            // (a raw pointer read out of what a parameter points to: into
+            // storage that referent owns, `p`: how std's `as_slice` views
+            // `self`)
+            set_bit(l1(dst), p);
+            let q = root_place(PL_RID[r0], true);
+            if q >= 0 {
+                set_bit(l2(dst), q);
+            }
+            return;
+        }
+        let s = slot_of_place(p);
+        if s >= 0 {
+            let so = slot_off(CUR, s);
+            if PO_INNER || PO_DEREF {
+                ov_inner(dst, so);
+            } else {
+                ov_or(dst, so);
+            }
+            return;
+        }
+        let r = root_of(p);
+        if PL_RKIND[r] == RK_LOCAL && PO_DEREF && LOCALS[PL_RID[r]].is_param {
+            let q = root_place(PL_RID[r], true);
+            if q >= 0 {
+                set_bit(l1(dst), q);
+                set_bit(l2(dst), q);
+            }
+        }
+    }
+}
+
+// The expression a pattern binds out of (walk::eval_match), or 0.
+pub static var BIND_FROM: i64 = 0;
+
+// Local l bound at node n (a pattern) to a value of origin v (-1: none).
+pub fn on_bind(l: i64, n: i64, v: i64) {
+    unsafe {
+        crate::front::own::observe::at(n);
+        note_binding(l, n);
+        let s = slot_of_local(l);
+        if s < 0 {
+            return;
+        }
+        let off = slot_off(CUR, s);
+        for w in 0..OV + 2 {
+            POOL[off + w] = 0;
+        }
+        if v >= 0 {
+            ov_or(off, v);
+        }
+        POOL[off + OV] = start_flags(l);
+        SLOT_PARENT.data[s] = -1;
+        if BIND_FROM != 0 {
+            let ps = root_slot(BIND_FROM);
+            if ps >= 0 && ps != s {
+                SLOT_PARENT.data[s] = ps;
+                ANY_CHILD = true;
+            }
+        }
+        slot_note(s, n, 0);
+    }
+}
+
+// The slot an expression's value comes from (a slot local, an element or
+// a field of one, a reference to one), or -1.
+fn root_slot(e: i64) -> i64 {
+    unsafe {
+        let k = NODES[e].kind;
+        if k == NodeKind::Ident && NODES[e].res == Res::Local {
+            return slot_of_local(NODES[e].y);
+        }
+        if k == NodeKind::Index || k == NodeKind::Cast || k == NodeKind::FieldAccess
+            || k == NodeKind::TupleField {
+            return root_slot(NODES[e].a);
+        }
+        if k == NodeKind::Unary {
+            return root_slot(NODES[e].b);
+        }
+        if k == NodeKind::Call && NODES[e].count > 0 && is_view_type(NODES[e].ty) {
+            // (a view a method makes of its receiver, `v.as_mut_slice()`
+            // of a reference `v`: a reborrow of it)
+            return root_slot(child(e, 0));
+        }
+        -1
+    }
+}
+
+// `let l = init;` after the binding: a view taken from a view local is a
+// reborrow of it (SLOT_PARENT).
+pub fn on_let(l: i64, init: i64) {
+    unsafe {
+        let s = slot_of_local(l);
+        if s < 0 {
+            return;
+        }
+        slot_note(s, -1, init);
+        let ps = root_slot(init);
+        if ps >= 0 && ps != s {
+            SLOT_PARENT.data[s] = ps;
+            ANY_CHILD = true;
+        }
+    }
+}
+
+// A `for` over owned place p: the loop's sequence local l is p (the loop
+// borrows it through its `as_slice()`, whose slot the loop reads at every
+// step: a change of p in the body invalidates it).
+pub fn on_for_alias(l: i64, p: i64, init: i64) {}
+
+// Assignment n to place p, its value's origin v (walk::PO_* as the target
+// left them: PO_VIEWSLOT, a write through a view).
+pub fn on_assign(p: i64, n: i64, v: i64) {
+    unsafe {
+        crate::front::own::observe::at(n);
+        let vs = PO_VIEWSLOT;
+        let inner = PO_INNER;
+        let deref = PO_DEREF;
+        if PO_RAW {
+            return;
+        }
+        if vs >= 0 {
+            // A write through a slice: an exclusive use of what it views.
+            let t = LOCALS[SLOT_LOCAL.data[vs]].ty;
+            if t > 0 && TYPES[t].kind == TyKind::Slice && TYPES[t].b != REF_MUT {
+                readonly(n, SLOT_LOCAL.data[vs], t);
+            }
+            use_slot(vs, n, 0 as *i64);
+            let so = slot_off(CUR, vs);
+            let m = new_ov();
+            or_expanded(at(m), l1(so));
+            close_mask(at(m));
+            invalidate(at(m), n, H_WRITE, vs, PEND.count);
+            POOL_TOP = m;
+            if v >= 0 {
+                or_into(l2(slot_off(CUR, vs)), l1(v));
+                or_into(l2(slot_off(CUR, vs)), l2(v));
+            }
+            return;
+        }
+        let s = slot_of_place(p);
+        if deref && s >= 0 {
+            // Through a reference: `r.f = v`, `*r = v`.
+            let l = SLOT_LOCAL.data[s];
+            let t = LOCALS[l].ty;
+            if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == REF_SHARED {
+                readonly(n, l, t);
+            }
+            // (a `&mut` child viewing another field stays: write_place
+            // invalidates what views p)
+            use_slot(s, n, &PL_MASK[p * NW]);
+            write_place(p, n, H_WRITE, s);
+            if v >= 0 {
+                or_into(l2(slot_off(CUR, s)), l1(v));
+                or_into(l2(slot_off(CUR, s)), l2(v));
+            }
+            return;
+        }
+        write_place(p, n, H_WRITE, -1);
+        let r = root_of(p);
+        if PL_RKIND[r] == RK_STATIC && v >= 0 && !deref {
+            static_store(p, n, v);
+        }
+        if s >= 0 && !deref {
+            let off = slot_off(CUR, s);
+            if PL_PARENT[p] < 0 && NODES[n].op == crate::front::lexer::Tok::Eq && !inner {
+                for w in 0..OV + 2 {
+                    POOL[off + w] = 0;
+                }
+                POOL[off + OV] = start_flags(SLOT_LOCAL.data[s]);
+                SLOT_PARENT.data[s] = -1;
+                slot_note(s, n, NODES[n].c);
+                if v >= 0 {
+                    ov_or(off, v);
+                }
+            } else if v >= 0 {
+                ov_or(off, v);
+            }
+        }
+    }
+}
+
+// own.readonly for a `&mut` loan of place p at node n (a `&mut self`
+// receiver, `&mut x` to a `&mut T` parameter), as for an assignment: p
+// reached through a `&T` or a read-only `[T]` (walk::PO_* as the place
+// left them).
+pub fn on_mut_loan(p: i64, n: i64) {
+    unsafe {
+        if PO_RAW {
+            return;
+        }
+        let nt = NODES[n].ty;
+        if nt > 0 && TYPES[nt].kind == TyKind::Ptr {
+            crate::front::own::moves::byref_change(p, n, TYPES[nt].a);
+        }
+        let vs = PO_VIEWSLOT;
+        if vs >= 0 {
+            let t = LOCALS[SLOT_LOCAL.data[vs]].ty;
+            if t > 0 && TYPES[t].kind == TyKind::Slice && TYPES[t].b != REF_MUT {
+                readonly(n, SLOT_LOCAL.data[vs], t);
+            }
+            return;
+        }
+        let s = slot_of_place(p);
+        if PO_DEREF && s >= 0 {
+            let l = SLOT_LOCAL.data[s];
+            let t = LOCALS[l].ty;
+            if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == REF_SHARED {
+                readonly(n, l, t);
+            }
+        }
+    }
+}
+
+// own.readonly: assignment n writes through local l of type t (`&T`, `[T]`).
+fn readonly(n: i64, l: i64, t: i64) {
+    unsafe {
+        if hidden_local(l) || !reporting(n) {
+            return;
+        }
+        own_begin(n, OWN_READONLY);
+        // (0.20: in the conventions' words, but in a crate read in 0.19's)
+        let words = crate::front::conv::strict_at(NODES[n].start);
+        own_str(c"writes through ");
+        own_sym(LOCALS[l].name);
+        own_str(c", a '");
+        own_type(t);
+        own_str(c"', which is read-only");
+        if words && TYPES[t].kind == TyKind::Slice {
+            own_str(c" (a let view)");
+            own_help(c"take the slice inout ('s: inout [T]', called with '&v' or '&a[..]') to change its elements");
+        } else if words {
+            own_str(c" (let: borrowed to be read)");
+            own_help(c"take it inout ('x: inout T', called with '&x') to change it");
+        } else if TYPES[t].kind == TyKind::Slice {
+            own_help(c"take the slice inout ('s: inout [T]', called with '&v' or '&a[..]') to write its elements");
+        } else {
+            own_help(c"take it inout ('x: inout T', called with '&x') to write through it");
+        }
+        if LOCALS[l].is_param {
+            // (the parameter retyped, with every call)
+            let a = buf_new();
+            buf_str(a, c"refactor signature ");
+            buf_bytes(a, SYMS[FNS[CUR_F].display].text);
+            buf_str(a, c" --type ");
+            buf_bytes(a, SYMS[LOCALS[l].name].text);
+            buf_str(a, c" 'inout ");
+            if TYPES[t].kind == TyKind::Slice {
+                buf_str(a, c"[");
+                crate::front::types::buf_type(a, TYPES[t].a);
+                buf_str(a, c"]");
+            } else {
+                crate::front::types::buf_type(a, TYPES[t].a);
+            }
+            buf_str(a, c"'");
+            let tl = buf_new();
+            buf_tool_command(tl, buf_slice(a), false);
+            own_try(buf_slice(tl));
+        }
+        own_end();
+    }
+}
+
+// Static place p is assigned a value of origin v at node n: statics hold
+// only views of static data (∅).
+fn static_store(p: i64, n: i64, v: i64) {
+    unsafe {
+        let q = first_place(v, 0 as *i64);
+        if q < 0 || hidden_place(q) || !reporting(n) {
+            return;
+        }
+        own_begin(n, OWN_ESCAPE);
+        own_place(root_of(p));
+        own_str(c" would hold a view of ");
+        own_place(q);
+        own_str(c": statics hold only views of static data (literals)");
+        own_help(c"store an owned copy (a Buf or a Vec), or an index");
+        own_end();
+    }
+}
+
+// A scope ends: the locals walk::BOUND[mark..] die. v is the origin of its
+// value (-1: none), tail that value's node (0: none): a value viewing a
+// dying local escapes.
+pub fn on_scope_end(mark: i64, v: i64, tail: i64) {
+    unsafe {
+        if NSLOT == 0 && v < 0 {
+            return;
+        }
+        let m = new_ov();
+        var first = -1;
+        for i in mark..BOUND.count {
+            let l = BOUND.data[i];
+            if l < LOC_CAP && LOC_PL[l] != 0 {
+                set_bit(at(m), LOC_PL[l] - 1);
+                if first < 0 {
+                    first = l;
+                }
+            }
+        }
+        if first < 0 {
+            POOL_TOP = m;
+            return;
+        }
+        let mask = new_ov();
+        or_expanded(at(mask), at(m));
+        close_mask(at(mask));
+        // (0.18.1) what a dying reference points to lives on: the views
+        // through it, DEREF_FIELD, also hold what it views
+        for q in 0..PL_COUNT {
+            if is_deref_place(q) && get_bit(at(m), PL_PARENT[q]) {
+                clear_bit(at(mask), q);
+            }
+        }
+        // (the pending arguments outlive the scope, write_place)
+        invalidate(at(mask), 0 - first - 1, H_SCOPE, -1, 0);
+        let body = NODES[FNS[CUR_F].node].c;
+        if v >= 0 && tail != 0 && tail != NODES[body].a && ov_hits(v, at(mask))
+            && !hidden_place(first_place(v, at(mask))) && reporting(tail) {
+            let q = first_place(v, at(mask));
+            own_begin(tail, OWN_ESCAPE);
+            own_str(c"the block's value views ");
+            if q >= 0 {
+                own_place(q);
+            } else {
+                own_str(c"a local");
+            }
+            own_str(c", which dies at the block's end");
+            own_help(c"declare the owner before the block, or make the value an owned copy");
+            own_end();
+        }
+        POOL_TOP = m;
+    }
+}
+
+// The function's result at node e, origin v (-1: none): views of locals
+// or of owned by-value parameters escape (own.escape); so do views of
+// them stored into what a `&mut` parameter points to.
+pub fn on_result(e: i64, v: i64) {
+    unsafe {
+        let f = CUR_F;
+        let rt = FNS[f].ret;
+        if is_ptr(rt) && TYPES[rt].b != 0 && reporting(FNS[f].node) {
+            own_begin(FNS[f].node, OWN_ESCAPE);
+            own_sym(FNS[f].display);
+            own_str(c" returns a reference ('");
+            own_type(rt);
+            own_str(c"'): references as results come in 0.17.1");
+            own_help(c"return the value (a copy, or '.clone()'), a view ('[T]'), or an index");
+            own_end();
+        }
+        if v >= 0 {
+            let q = escaping(v, 0 as *i64);
+            if q >= 0 && !hidden_place(q) && reporting(e) {
+                let l = PL_RID[root_of(q)];
+                own_begin(e, OWN_ESCAPE);
+                own_sym(FNS[f].display);
+                own_str(c" returns a view of ");
+                own_place(q);
+                own_str(c", which is dropped when ");
+                own_sym(FNS[f].display);
+                own_str(c" returns");
+                let lt = LOCALS[l].ty;
+                if crate::front::own::drops::BYREF.get(l + 1) != 0 {
+                    // (0.18.1) `match *e { E::S(s) => s.as_slice() }`
+                    own_help(c"it is a copy that 'match *e' (a loop, a 'get') binds; match the reference itself, 'match e', whose bindings are references to what it points to");
+                } else if is_owned_type(lt) {
+                    own_help(c"return the owner itself; a caller that wants a view takes '.as_slice()' of it");
+                    let text = src_of(e);
+                    if ends_with(text, c".as_slice()") {
+                        let tb = buf_new();
+                        crate::front::types::buf_type(tb, lt);
+                        let rb = buf_new();
+                        crate::front::types::buf_type(rb, rt);
+                        let a = buf_new();
+                        buf_str(a, c"edit patch ");
+                        buf_bytes(a, SYMS[FNS[f].display].text);
+                        buf_str(a, c" --old '-> ");
+                        buf_bytes(a, buf_slice(rb));
+                        buf_str(a, c"' --new '-> ");
+                        buf_bytes(a, buf_slice(tb));
+                        buf_str(a, c"' --old '");
+                        buf_bytes(a, text);
+                        buf_str(a, c"' --new '");
+                        buf_bytes(a, text[0..text.len - 11]);
+                        buf_str(a, c"'");
+                        let t = buf_new();
+                        buf_tool_command(t, buf_slice(a), false);
+                        own_try(buf_slice(t));
+                    }
+                } else {
+                    own_help(c"return an owned copy, or take the storage as a parameter and return a view of it");
+                }
+                if any_and(l1(v), at_mark()) {
+                    own_soft();
+                }
+                own_end();
+            }
+        }
+        // What the `&mut` parameters' referents now hold.
+        for i in 0..PARAM_LOCALS.count {
+            let l = PARAM_LOCALS.data[i];
+            if l < 0 {
+                continue;
+            }
+            let s = slot_of_local(l);
+            if s < 0 || (POOL[slot_off(CUR, s) + OV] & F_MUTLOAN) == 0 {
+                continue;
+            }
+            let off = slot_off(CUR, s);
+            let m = new_ov();
+            or_into(at(m), l2(off));
+            let q = escaping(m, 0 as *i64);
+            if q >= 0 && !hidden_place(q) && !hidden_local(l) && reporting(e) {
+                own_begin(e, OWN_ESCAPE);
+                own_sym(FNS[f].display);
+                own_str(c" stores a view of ");
+                own_place(q);
+                own_str(c" into what ");
+                own_sym(LOCALS[l].name);
+                own_str(c" points to, and ");
+                own_place(root_of(q));
+                own_str(c" is dropped when ");
+                own_sym(FNS[f].display);
+                own_str(c" returns");
+                own_help(
+                    c"store an owned copy (a Buf, '.to_vec()'), or keep the owner in the caller");
+                if any_and(l2(off), at_mark()) {
+                    own_soft();
+                }
+                own_end();
+            }
+            POOL_TOP = m;
+        }
+    }
+}
+
+// The first place of origin o (both levels) that dies when the function
+// returns: a local's, or a by-value parameter's own place; -1.
+fn escaping(o: i64, m: *i64) -> i64 {
+    unsafe {
+        for q in 0..PL_COUNT {
+            if !get_bit(l1(o), q) && !get_bit(l2(o), q) || is_deref_place(q) {
+                continue;
+            }
+            let r = root_of(q);
+            if PL_RKIND[r] != RK_LOCAL {
+                continue;
+            }
+            let l = PL_RID[r];
+            if !LOCALS[l].is_param {
+                return q;
+            }
+            let t = LOCALS[l].ty;
+            if t > 0 && TYPES[t].kind != TyKind::Ptr && TYPES[t].kind != TyKind::Slice
+                && !is_view_type(t) {
+                return q;
+            }
+        }
+        -1
+    }
+}

@@ -1,0 +1,111 @@
+// EXPECT: echo: hello from a child
+// EXPECT: exit 0 signal none
+// EXPECT: false: exit 1
+// EXPECT: env child: FOO=bar
+// EXPECT: running true then killed by 9
+// EXPECT: bad argv InvalidInput missing prog NotFound
+// EXPECT: env count true at has = true PATH true
+// EXPECT: set ok get v1 unset gone
+// 0.20 (A7): std's OS layer on processes: pipe, posix_spawnp with file
+// actions, waitpid (blocking and WNOHANG), the wait status, kill, and the
+// environment (environ, getenv, setenv, unsetenv).
+use std::sys::{
+    SYS_SIGKILL, SysErrorKind, SysSpawnActions, sys_close, sys_env_at, sys_env_count,
+    sys_errno_kind, sys_exit_code, sys_exit_signal, sys_getenv, sys_kill, sys_pipe, sys_read,
+    sys_setenv, sys_spawn, sys_spawn_actions, sys_unsetenv, sys_waitpid,
+};
+
+// Runs argv with its stdout into a pipe: what it wrote, and its status.
+fn run_capture(argv: inout [*u8], envp: [*u8], out: inout [u8]) -> (i64, i32) {
+    let p = sys_pipe().unwrap();
+    var acts = sys_spawn_actions().unwrap();
+    acts.dup2(p.1, 1).unwrap();
+    acts.close(p.0).unwrap();
+    let pid = unsafe { sys_spawn(argv[0], argv, envp, &acts) }.unwrap();
+    acts.free();
+    sys_close(p.1).unwrap();
+    var n = 0;
+    for _ in 0..100 {
+        let k = sys_read(p.0, &out[n..out.len]).unwrap();
+        if k == 0 {
+            break;
+        }
+        n += k;
+    }
+    sys_close(p.0).unwrap();
+    let w = sys_waitpid(pid, false).unwrap();
+    (n, w.1)
+}
+
+fn show_signal(status: i32) -> i64 {
+    match sys_exit_signal(status) {
+        Some(s) => s as i64,
+        None => -1,
+    }
+}
+
+fn main() -> i32 {
+    var out = [0u8; 256];
+    let none: [*u8; 0] = [];
+    let echo: [*u8; 5] = [c"echo", c"hello", c"from", c"a child", 0 as *u8];
+    let r = run_capture(&echo[..], none[..], &out[..]);
+    print(f"echo: {out[0..r.0]}");
+    println(
+        f"exit {sys_exit_code(r.1).unwrap()} signal {if show_signal(r.1) < 0 { "none" } else { "some" }}");
+
+    let f: [*u8; 2] = [c"false", 0 as *u8];
+    let r2 = run_capture(&f[..], none[..], &out[..]);
+    println(f"false: exit {sys_exit_code(r2.1).unwrap()}");
+
+    let sh: [*u8; 4] = [c"/bin/sh", c"-c", c"echo FOO=$FOO", 0 as *u8];
+    let env: [*u8; 2] = [c"FOO=bar", 0 as *u8];
+    let r3 = run_capture(&sh[..], env[..], &out[..]);
+    print(f"env child: {out[0..r3.0]}");
+
+    let sl: [*u8; 3] = [c"sleep", c"10", 0 as *u8];
+    let pid = unsafe { sys_spawn(sl[0], sl[..], none[..], 0 as *SysSpawnActions) }.unwrap();
+    let w0 = sys_waitpid(pid, true).unwrap();
+    sys_kill(pid, SYS_SIGKILL).unwrap();
+    let w1 = sys_waitpid(pid, false).unwrap();
+    println(f"running {w0.0 == 0} then killed by {show_signal(w1.1)}");
+
+    let bad: [*u8; 1] = [c"echo"];
+    let e1 = match unsafe { sys_spawn(bad[0], bad[..], none[..], 0 as *SysSpawnActions) } {
+        Ok(_) => SysErrorKind::Other,
+        Err(e) => sys_errno_kind(e),
+    };
+    let missing: [*u8; 2] = [c"no-such-program-vole", 0 as *u8];
+    let e2 = match unsafe {
+        sys_spawn(missing[0], missing[..], none[..], 0 as *SysSpawnActions)
+    } {
+        Ok(p) => {
+            // (glibc reports a missing program as the child's exit 127)
+            let w = sys_waitpid(p, false).unwrap();
+            if sys_exit_code(w.1).unwrap_or(0) == 127 { SysErrorKind::NotFound }
+            else { SysErrorKind::Other }
+        }
+        Err(e) => sys_errno_kind(e),
+    };
+    println(f"bad argv {e1:?} missing prog {e2:?}");
+
+    let n = sys_env_count();
+    var has_eq = true;
+    for i in 0..n {
+        let v = sys_env_at(i);
+        var found = false;
+        for c in v {
+            if c == '=' { found = true; }
+        }
+        if !found { has_eq = false; }
+    }
+    println(f"env count {n > 0} at has = {has_eq} PATH {sys_getenv("PATH").is_some()}");
+
+    let set = unsafe { sys_setenv("VOLE_SYS_TEST", "v1") };
+    set.unwrap();
+    let got = sys_getenv("VOLE_SYS_TEST").unwrap();
+    print(f"set ok get {got}");
+    let unset = unsafe { sys_unsetenv("VOLE_SYS_TEST") };
+    unset.unwrap();
+    println(f" unset {if sys_getenv("VOLE_SYS_TEST").is_none() { "gone" } else { "still" }}");
+    0
+}

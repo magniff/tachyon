@@ -1,26 +1,26 @@
 # The optimizer
 
-How the tachyon compiler optimizes, since release 0.2: the IR, its
+How the vole compiler optimizes, since release 0.2: the IR, its
 invariants, the passes and the pipeline at each level, the back end, and
 how all of it is tested. This is the living design document of the middle
 and back end; later releases extend it (see [roadmap.md](roadmap.md)).
 
 The code (0.12: in folders, see compiler/README.md): the middle end in
-`compiler/src/middle/`: `ir.tach` (IR), `lower.tach` (AST to SSA),
-`opt.tach` (CFG cleanups, dominators, dead code, the pipeline),
-`fold.tach` (folding, SCCP, instruction combining), `gvn.tach`
+`compiler/src/middle/`: `ir.vl` (IR), `lower.vl` (AST to SSA),
+`opt.vl` (CFG cleanups, dominators, dead code, the pipeline),
+`fold.vl` (folding, SCCP, instruction combining), `gvn.vl`
 (value numbering, alias analysis, memory forwarding, dead stores),
-`sroa.tach` (scalar replacement, constant tables), `licm.tach`,
-`inline.tach` and the other passes; the back end in
-`compiler/src/back/`: `isel.tach`, `regalloc.tach` (linear scan),
-`emit.tach` (emission), `mc_arm64.tach` and `mc_x86_64.tach`
+`sroa.vl` (scalar replacement, constant tables), `licm.vl`,
+`inline.vl` and the other passes; the back end in
+`compiler/src/back/`: `isel.vl`, `regalloc.vl` (linear scan),
+`emit.vl` (emission), `mc_arm64.vl` and `mc_x86_64.vl`
 (instructions); `-O0`'s generator in `compiler/src/gen0/`.
 
 ## Optimization levels
 
 | flag | pipeline |
 |---|---|
-| `-O0` | the 0.1 code generator (`gen.tach`), unchanged: stack-machine code straight from the AST |
+| `-O0` | the 0.1 code generator (`gen.vl`), unchanged: stack-machine code straight from the AST |
 | `-O1` | lowering to SSA; (0.17) the calls of small leaf functions inlined; per function, twice: SCCP, instruction combining, (the first time) scalar replacement of aggregates and constant tables, CFG simplification, GVN with memory forwarding and dead stores, dead code elimination, CFG simplification; linear-scan register allocation |
 | `-O2` (default) | `-O1`, then per function in call-graph order (callees first): tail recursion elimination, inlining, the loop optimizer (0.4: rotation, induction variables and unrolling, value ranges, strength reduction and unswitching, aggressive DCE) and loop-invariant code motion, each followed by the `-O1` pipeline again; functions left without callers are not emitted |
 
@@ -71,12 +71,12 @@ typed scalar values in SSA form; memory is explicit.
   `switch` on an integer: case values with their blocks and a default;
   its distinct successors are listed once, and each has the switch block
   once among its predecessors.
-- **Calls follow the callee's convention** (C's, or tachyon's: see
+- **Calls follow the callee's convention** (C's, or vole's: see
   "Calling conventions"): an aggregate argument passed in registers is
   split by the lowering into its scalar pieces (one `load` each, so the
   optimizer sees through the round trip), and a parameter's pieces are
   separate `param`s (`imm2` = piece + 1) stored into a slot; larger
-  aggregates go by reference or as a copy on the stack (`abi.tach`).
+  aggregates go by reference or as a copy on the stack (`abi.vl`).
 - **Replacement** is lazy: `ir_replace(v, w)` records that `v` now stands
   for `w` (and unlinks `v`); `ir_val` follows such records, and passes
   resolve operands before they look at them.
@@ -91,7 +91,7 @@ Invariants (checked by `--verify-ir` after every pass):
   phi operand: dominates the end of the corresponding predecessor);
 - operands are resolved (no replaced instruction is referenced).
 
-**Construction** (`lower.tach`) follows Braun et al., *Simple and
+**Construction** (`lower.vl`) follows Braun et al., *Simple and
 Efficient Construction of Static Single Assignment Form* (CC 2013),
 directly from the checked AST. Scalar locals whose address is never taken
 are SSA variables; the others get frame slots. The values of `if`, `&&`,
@@ -106,28 +106,28 @@ pointer) and every arithmetic rule.
 
 | pass | algorithm | file |
 |---|---|---|
-| cleanup | unreachable-block removal; trivial-phi removal (a phi whose operands are one value is that value), to a fixpoint | `opt.tach` |
-| SCCP | Wegman & Zadeck, *Constant Propagation with Conditional Branches* (TOPLAS 1991): a lattice per value, executable edges, two work lists; constant values and decided branches are rewritten | `fold.tach` |
-| folding | what the machine computes: wrapping arithmetic at every width, `x / 0 == 0`, `x % 0 == x`, `MIN / -1 == MIN`, shift amounts modulo 32 (types up to 32 bits) or 64, IEEE comparisons, the saturating float-to-integer conversions of `-O0` (including its quirks: up to 32-bit signed targets saturate at 32 bits and wrap) | `fold.tach` |
-| instruction combining | constants on the right; identities (`x + 0`, `x * 1`, `x & 0`, `x - x`, `x ^ x`, `x & x`, double negation, `b != false`); `x * 2^k` to a shift; unsigned division and remainder by `2^k` to a shift and a mask; signed division by `2^k` with the rounding fix-up (`(x + ((x >> 63) >>> (64 - k))) >> k`) and remainder from it; reassociation of constant address offsets and their folding into loads and stores; comparisons with the constant on the left mirrored; a branch on `!x` swapped | `fold.tach` |
-| CFG simplification | branches on constants and branches with one target become jumps; a block merges into its only predecessor when that predecessor jumps to it; jumps through empty blocks are threaded (when the target has no phis) | `opt.tach` |
-| dominators | Cooper, Harvey & Kennedy, *A Simple, Fast Dominance Algorithm*, over a reverse post-order | `opt.tach` |
-| GVN | a walk of the dominator tree with a scoped hash table (undo log, so scopes are popped in constant time per entry) over the pure instructions; commutative operands in a canonical order | `gvn.tach` |
-| alias analysis | an address is a base plus a constant offset; it points into a memory object (a frame slot, a static, constant data) through additions of constant or variable offsets, or into unknown memory; distinct objects never overlap; constant data is never written; a slot whose address only serves loads, stores, copies (memcpy calls included) and address arithmetic is private: no pointer from elsewhere and no call reaches it; within one object, byte ranges are compared when both offsets are known. No type-based rule: tachyon allows casts between any pointers | `gvn.tach` |
-| dead code elimination | mark from instructions with side effects and the terminators, sweep the rest | `opt.tach` |
-| LICM | natural loops from back edges (`h` dominates `t`); a preheader for each loop (the entering edge is split when needed); pure instructions whose operands are defined outside the loop move to the preheader, innermost loops first, and so do loads from frame slots and statics that nothing in the loop may write. Nothing moved can trap (division never traps in tachyon) | `licm.tach` |
-| SROA | a frame slot of a struct, tuple, enum, slice, small array or scalar whose address serves only loads, stores and copies at constant offsets becomes one SSA variable per scalar leaf of its type, by Braun et al.'s construction over the existing CFG (blocks in reverse post-order, sealed once their predecessors are filled); copies move leaf by leaf, to or from memory when the other side stays there. The values of `if`, `match` and `loop` of up to 128 bytes are built in one slot each exit copies into, so they are replaced too | `sroa.tach` |
-| constant tables | a private slot written only by stores of constants at known offsets, in one block that comes before every read, becomes read-only data; loads from read-only data (and string literals) at known offsets become constants | `sroa.tach`, `gvn.tach` |
-| memory forwarding | along the dominator tree: what a block knows about memory (location to value) goes to a block it dominates when that one's only predecessor is it, or after the writes of every block on the paths between them are applied; loads of known locations are their values; storing what a location holds is dropped; a load from the destination of a copy that still holds reads its source (and the copy may then die) | `gvn.tach` |
-| dead stores | within a block, a store (or a copy) overwritten before anything may read it; a store or copy into a private slot that nothing reads | `gvn.tach` |
-| switches | a `match` on an integer, a fieldless enum or an enum's tag whose arms are literals, ranges, alternatives of them, or variants whose fields only bind (and no guards), is a `switch`; SCCP decides switches on constants and prunes them to their reachable successor | `lower.tach`, `fold.tach`, `opt.tach` |
-| inlining | strongly connected components of the call graph (Tarjan), callees first, so a callee is already optimized and recursion is never inlined; a callee is inlined when it has at most 30 instructions, or when this is its only call site and it has at most 400 (and is neither `main` nor address-taken); callers grow to at most 3,000 instructions. The callee's blocks are copied, parameters become the arguments, frame slots are copied, returns jump to a continuation block with a phi for the result | `inline.tach` |
-| copy elision (0.14) | a whole slot copied once (outside loops) into another slot or a field of one, the source used only before, the destination's part only after, neither escaping: the source is that part, the copy goes | `copies.tach` |
-| threading on tags (0.14) | a switch on a phi, or a branch comparing one with a constant, whose operands are constants or phis: the block (or a chain of single-predecessor blocks from the phi's) is copied for each predecessor giving a constant, going to its outcome; uses repaired by the SSA updater | `tags.tach` |
-| if-conversion (0.15) | in innermost loops, a branch whose ways meet again after at most 4 pure instructions: the instructions move up, the meeting block's phis become selects (`sel`) | `ifconv.tach` |
-| exit merging (0.14) | several exits at a loop's top testing induction variables against invariants: one counter tested against the smallest trip count; header phis with one start and step merged | `exits.tach` |
+| cleanup | unreachable-block removal; trivial-phi removal (a phi whose operands are one value is that value), to a fixpoint | `opt.vl` |
+| SCCP | Wegman & Zadeck, *Constant Propagation with Conditional Branches* (TOPLAS 1991): a lattice per value, executable edges, two work lists; constant values and decided branches are rewritten | `fold.vl` |
+| folding | what the machine computes: wrapping arithmetic at every width, `x / 0 == 0`, `x % 0 == x`, `MIN / -1 == MIN`, shift amounts modulo 32 (types up to 32 bits) or 64, IEEE comparisons, the saturating float-to-integer conversions of `-O0` (including its quirks: up to 32-bit signed targets saturate at 32 bits and wrap) | `fold.vl` |
+| instruction combining | constants on the right; identities (`x + 0`, `x * 1`, `x & 0`, `x - x`, `x ^ x`, `x & x`, double negation, `b != false`); `x * 2^k` to a shift; unsigned division and remainder by `2^k` to a shift and a mask; signed division by `2^k` with the rounding fix-up (`(x + ((x >> 63) >>> (64 - k))) >> k`) and remainder from it; reassociation of constant address offsets and their folding into loads and stores; comparisons with the constant on the left mirrored; a branch on `!x` swapped | `fold.vl` |
+| CFG simplification | branches on constants and branches with one target become jumps; a block merges into its only predecessor when that predecessor jumps to it; jumps through empty blocks are threaded (when the target has no phis) | `opt.vl` |
+| dominators | Cooper, Harvey & Kennedy, *A Simple, Fast Dominance Algorithm*, over a reverse post-order | `opt.vl` |
+| GVN | a walk of the dominator tree with a scoped hash table (undo log, so scopes are popped in constant time per entry) over the pure instructions; commutative operands in a canonical order | `gvn.vl` |
+| alias analysis | an address is a base plus a constant offset; it points into a memory object (a frame slot, a static, constant data) through additions of constant or variable offsets, or into unknown memory; distinct objects never overlap; constant data is never written; a slot whose address only serves loads, stores, copies (memcpy calls included) and address arithmetic is private: no pointer from elsewhere and no call reaches it; within one object, byte ranges are compared when both offsets are known. No type-based rule: vole allows casts between any pointers | `gvn.vl` |
+| dead code elimination | mark from instructions with side effects and the terminators, sweep the rest | `opt.vl` |
+| LICM | natural loops from back edges (`h` dominates `t`); a preheader for each loop (the entering edge is split when needed); pure instructions whose operands are defined outside the loop move to the preheader, innermost loops first, and so do loads from frame slots and statics that nothing in the loop may write. Nothing moved can trap (division never traps in vole) | `licm.vl` |
+| SROA | a frame slot of a struct, tuple, enum, slice, small array or scalar whose address serves only loads, stores and copies at constant offsets becomes one SSA variable per scalar leaf of its type, by Braun et al.'s construction over the existing CFG (blocks in reverse post-order, sealed once their predecessors are filled); copies move leaf by leaf, to or from memory when the other side stays there. The values of `if`, `match` and `loop` of up to 128 bytes are built in one slot each exit copies into, so they are replaced too | `sroa.vl` |
+| constant tables | a private slot written only by stores of constants at known offsets, in one block that comes before every read, becomes read-only data; loads from read-only data (and string literals) at known offsets become constants | `sroa.vl`, `gvn.vl` |
+| memory forwarding | along the dominator tree: what a block knows about memory (location to value) goes to a block it dominates when that one's only predecessor is it, or after the writes of every block on the paths between them are applied; loads of known locations are their values; storing what a location holds is dropped; a load from the destination of a copy that still holds reads its source (and the copy may then die) | `gvn.vl` |
+| dead stores | within a block, a store (or a copy) overwritten before anything may read it; a store or copy into a private slot that nothing reads | `gvn.vl` |
+| switches | a `match` on an integer, a fieldless enum or an enum's tag whose arms are literals, ranges, alternatives of them, or variants whose fields only bind (and no guards), is a `switch`; SCCP decides switches on constants and prunes them to their reachable successor | `lower.vl`, `fold.vl`, `opt.vl` |
+| inlining | strongly connected components of the call graph (Tarjan), callees first, so a callee is already optimized and recursion is never inlined; a callee is inlined when it has at most 30 instructions, or when this is its only call site and it has at most 400 (and is neither `main` nor address-taken); callers grow to at most 3,000 instructions. The callee's blocks are copied, parameters become the arguments, frame slots are copied, returns jump to a continuation block with a phi for the result | `inline.vl` |
+| copy elision (0.14) | a whole slot copied once (outside loops) into another slot or a field of one, the source used only before, the destination's part only after, neither escaping: the source is that part, the copy goes | `copies.vl` |
+| threading on tags (0.14) | a switch on a phi, or a branch comparing one with a constant, whose operands are constants or phis: the block (or a chain of single-predecessor blocks from the phi's) is copied for each predecessor giving a constant, going to its outcome; uses repaired by the SSA updater | `tags.vl` |
+| if-conversion (0.15) | in innermost loops, a branch whose ways meet again after at most 4 pure instructions: the instructions move up, the meeting block's phis become selects (`sel`) | `ifconv.vl` |
+| exit merging (0.14) | several exits at a loop's top testing induction variables against invariants: one counter tested against the smallest trip count; header phis with one start and step merged | `exits.vl` |
 
-The pipeline (`optimize_program` in `opt.tach`) runs the cleanup on
+The pipeline (`optimize_program` in `opt.vl`) runs the cleanup on
 every function, then the `-O1` pipeline twice per function, then at `-O2`
 inlining and LICM in call-graph order, each followed by the `-O1`
 pipeline, and finally drops functions nobody calls (other than `main` and
@@ -138,7 +138,7 @@ optimized and emitted end to end (see "0.17: compile time").
 
 ## The back end
 
-**Layout and liveness** (`regalloc.tach`). Critical edges (from a block
+**Layout and liveness** (`regalloc.vl`). Critical edges (from a block
 with several successors to one with several predecessors) are split, so
 that every edge has a place for its moves. Blocks are laid out in reverse
 post-order; back edges (to a block not later in the order: the graph is
@@ -212,7 +212,7 @@ least a third of their range (up to 4096 entries): 32-bit offsets from the
 table, so the code is position independent on ELF too; otherwise a binary
 search of compares and branches.
 
-**Emission** (`emit.tach`). The frame is addressed from sp, which does
+**Emission** (`emit.vl`). The frame is addressed from sp, which does
 not move in the body: outgoing stack arguments, spill slots, saved
 callee-saved registers, then the frame slots. Locations depend on the
 position: an instruction reads its operands where the allocation has them
@@ -247,7 +247,7 @@ an immediate, `cbz` and `cbnz`); division by a constant other than 0 and
   `-s SEED` the seed is a third oracle (divisors are then made non-zero,
   since the seed traps on division by zero).
 - **C interoperability.** `tests/abi/gen.awk` writes a C file and a
-  tachyon file that call each other with random signatures (scalars of
+  vole file that call each other with random signatures (scalars of
   every width, `#[repr(C)]` structs, unions and enums, packed and aligned
   ones, more arguments than registers, every kind of result, variadic
   calls); every value is checked on the other side. `tests/abi/run.sh` runs
@@ -255,7 +255,7 @@ an immediate, `cbz` and `cbnz`); division by a constant other than 0 and
 - **IR tests.** Test cases with `// CHECK: text` and `// CHECK-NOT: text`
   are matched against `--emit-ir` (FileCheck's rules: CHECKs in order,
   CHECK-NOTs between them; `// CHECK-OPT: n` picks the level). The
-  `tests/run/opt_*.tach` cases cover each pass, and their folding edge
+  `tests/run/opt_*.vl` cases cover each pass, and their folding edge
   cases (overflow, division by zero, NaN, shifts, conversions) are checked
   against `-O0` at run time too.
 - **Fixpoint.** At the default level, the compiler compiles itself to
@@ -271,8 +271,8 @@ interop):
 - the C calling convention for aggregates on both targets (and in the
   `-O0` generator), checked against C by `tests/abi/run.sh`: random
   signatures of scalars, `#[repr(C)]` structs (nested, with arrays, packed,
-  aligned), unions and enums, called from tachyon to C and from C to
-  tachyon (by name and through pointers), with results of every kind and
+  aligned), unions and enums, called from vole to C and from C to
+  vole (by name and through pointers), with results of every kind and
   variadic calls;
 - SROA, constant tables, the alias analysis above, memory forwarding along
   the dominator tree, copies read through, dead store elimination;
@@ -285,12 +285,12 @@ interop):
 ## 0.4: the loop optimizer
 
 0.4 adds a loop optimizer to `-O2`, run per function after inlining and
-before LICM (`optimize_loops` in `opt.tach`; light cleanups between
+before LICM (`optimize_loops` in `opt.vl`; light cleanups between
 its passes, the `-O1` pipeline once after them). Tail recursion
-elimination runs before inlining (`tre.tach`). The passes, in
+elimination runs before inlining (`tre.vl`). The passes, in
 pipeline order:
 
-1. **Loop analysis and canonical form** (`loops.tach`): the loop forest
+1. **Loop analysis and canonical form** (`loops.vl`): the loop forest
    (natural loops by header, nesting, depth); every loop gets a preheader
    (one block entering the header, ending in a jump), a single latch (one
    back edge) and dedicated exits (exit blocks entered only from inside the
@@ -304,7 +304,7 @@ pipeline order:
    guarded `do`-`while` (the test duplicated in the preheader, the exit
    test at the latch): one branch per iteration instead of two, and the
    body known to run at least once.
-3. **Induction variables and trip counts** (`scev.tach`): add
+3. **Induction variables and trip counts** (`scev.vl`): add
    recurrences `{start, +, step}` of header phis; for a loop whose only
    exit is at the latch, the trip count when it is a constant (by
    evaluating the exit test with the folding rules, so wrapping is exactly
@@ -318,7 +318,7 @@ pipeline order:
    innermost loops with a constant trip count (found up to 4096) that the
    factor divides, up to 96 instructions. All copies are made from the
    untouched loop, then chained.
-6. **Loop strength reduction** (`lsr.tach`): an address affine in an
+6. **Loop strength reduction** (`lsr.vl`): an address affine in an
    induction variable (`k + c1*b1 + c2*b2 + (s + m*v)*i`, all 64-bit,
    `b1`, `b2`, `v` invariant) that costs a multiplication or a shift
    becomes a pointer induction variable; addresses a constant apart share
@@ -327,7 +327,7 @@ pipeline order:
    add per element.
 7. **Unswitching**: a branch on a loop-invariant condition inside a small
    loop: the loop is cloned, one copy per outcome, the test hoisted.
-8. **Value ranges and bounds checks** (`range.tach`): the range of an
+8. **Value ranges and bounds checks** (`range.vl`): the range of an
    integer value at a block, from its type, its operation (masks,
    remainders, conversions), induction variables, and the branch conditions
    that dominate the block; with it, bounds checks of slices whose index is
@@ -339,11 +339,11 @@ pipeline order:
    `match` with guards into a decision tree.
 9. **Comparison chains**: `x == c1` / `x == c2` / ... tests of one value in
    a chain of blocks become a `switch`.
-10. **Aggressive dead code elimination** (`adce.tach`): over control
+10. **Aggressive dead code elimination** (`adce.vl`): over control
     dependence (post-dominators), branches that decide nothing live are
     removed; branches of loops are kept (a loop may not terminate: only
     the loop deletion above removes loops, when they are finite).
-11. **Tail recursion elimination** (`tre.tach`): `return f(args)`,
+11. **Tail recursion elimination** (`tre.vl`): `return f(args)`,
     `return f(args) op y` and `return y op f(args)` (op one of `+ * & | ^`
     on integers, nothing with an effect after the call) become a loop with
     a phi per parameter and one for the accumulator; returns through a phi
@@ -367,8 +367,8 @@ inner loop rotated after the outer one's updater added to them, and the
 header phis' own operands skipped when rewriting a rotated header's
 uses.
 
-Tested by IR `CHECK` tests (`tests/run/opt_loops.tach`,
-`opt_ranges.tach`, `opt_loop_transforms.tach`), the suite at every level,
+Tested by IR `CHECK` tests (`tests/run/opt_loops.vl`,
+`opt_ranges.vl`, `opt_loop_transforms.vl`), the suite at every level,
 the fixpoint (the compiler itself is the largest loop test) and the loop
 mode of the random program generator (`tests/fuzz/run.sh -l`: counted
 loops with bounds from expressions, while loops of every integer type up,
@@ -389,7 +389,7 @@ The plan, in order of priority:
    one pass. Acceptance: collatz's loop-carried value in one register (no
    move in its loop), sieve's bound kept in a register instead of
    rebuilt every iteration.
-2. A tachyon calling convention for plain `fn`s (more argument registers,
+2. A vole calling convention for plain `fn`s (more argument registers,
    aggregates of up to four registers passed and returned in registers),
    `extern "C"` staying exactly C. Safe per optimization level: a program
    is compiled at one level, -O0 (the oracle) keeps C's convention, and
@@ -407,18 +407,18 @@ instructions (rax and rdx stay fixed for division, rcx for shifts).
 
 Moved to stage B: the calling convention (2), which needs the lowering of
 calls and parameters to classify aggregates by convention (classification
-lives in `lower.tach` and `abi.tach`, shared with C's), and the
+lives in `lower.vl` and `abi.vl`, shared with C's), and the
 realigned frames (from 3), which touch the -O0 generator too. Both are done
 (stage B1, below).
 
 ## Calling conventions
 
-Plain `fn`s compiled at -O1 and -O2 call each other with tachyon's own
+Plain `fn`s compiled at -O1 and -O2 call each other with vole's own
 convention; C's is kept by everything C can reach or call: functions
 imported from C or defined `extern "C"`, `main` (called by C), variadic
 functions, calls through `extern "C" fn` pointers, the run-time helpers,
 and every function at -O0, the oracle (`fn_uses_c`, `fn_type_uses_c` in
-`abi.tach`).
+`abi.vl`).
 
 The two never meet. A program is compiled at one level, and a plain `fn`
 value only ever holds a plain function of the same program: `fn` and
@@ -426,7 +426,7 @@ value only ever holds a plain function of the same program: `fn` and
 generic instances (they are type-checked the same way). `main` is the one
 plain function following C's convention whose value can be taken; for a
 `main` taking scalars that fit in C's argument registers and returning a
-scalar, as C's `main` does, the two conventions agree, because tachyon's
+scalar, as C's `main` does, the two conventions agree, because vole's
 puts the first scalars where C's does.
 
 **Arguments.** Every argument is a list of scalars, assigned one by one to
@@ -471,7 +471,7 @@ copied onto the stack starts at a multiple of its alignment, as clang and
 GCC place it; on AArch64 an aggregate aligned above 16 is larger than 16
 bytes and goes by reference anyway.
 
-Testing: `tests/run/conv_tachyon.tach` (20 integer and 20 float arguments,
+Testing: `tests/run/conv_vole.vl` (20 integer and 20 float arguments,
 aggregates of every shape in both directions, fn pointers, recursion,
 generic instances, registers running out), `align_over16` (locals, arrays,
 nested and 4096-aligned values, statics, parameters and results, C by value
@@ -494,7 +494,7 @@ layout, post-allocation peepholes, unrolling with run-time trip counts,
 scheduling, shrink-wrapping. Done: the first three, and of scheduling the
 two rules that paid off; the rest is below.
 
-**Instruction selection** (`isel.tach`) runs between the optimizer and
+**Instruction selection** (`isel.vl`) runs between the optimizer and
 register allocation, after `--emit-ir` (so the optimizer's IR checks are
 unaffected; `--emit-mir` shows the IR after it). Per function:
 
@@ -549,7 +549,7 @@ unaffected; `--emit-mir` shows the IR after it). Per function:
    needed in a register (a store's value, a float) is made once; the
    allocator rematerializes it, before the loop, when it runs short.
 
-**Block layout** (`layout.tach`). The emission order is apart from the
+**Block layout** (`layout.vl`). The emission order is apart from the
 allocation order (any order is correct: every move belongs to a block or
 an edge, and a block's code depends on its positions only). Chains by
 fall-through (Pettis and Hansen, PLDI 1990, with static estimates): a
@@ -582,7 +582,7 @@ needed there is now as near as any other value.
 
 Not done: unrolling with run-time trip counts (moved to 0.8, whose loop
 vectorizer needs the same remainder loop), a general list scheduler (on
-the out-of-order cores tachyon targets, the two rules above are what
+the out-of-order cores vole targets, the two rules above are what
 mattered in `bench/`; moved to 0.9, where profiles tell which blocks are
 worth it), shrink-wrapping (moved to 0.6, with interprocedural attribute
 inference: its gain is in small functions with early returns that are
@@ -590,7 +590,7 @@ not inlined).
 
 ## 0.6: the back end, polished
 
-**Shrink-wrapping** (`emit.tach`). The frame (the saved frame pointer
+**Shrink-wrapping** (`emit.vl`). The frame (the saved frame pointer
 and return address, the reserved area, the saved callee-saved registers)
 is set up at the start of one block, SAVE: the nearest common dominator
 of the blocks that need it, moved up the dominator tree out of loops. A
@@ -677,7 +677,7 @@ values (`a, b = b, a + b`) need a three-move cycle on the back edge
 
 ## 0.6: interprocedural optimization
 
-The -O2 pipeline gains a whole-program layer (`ipo.tach`, `inline.tach`)
+The -O2 pipeline gains a whole-program layer (`ipo.vl`, `inline.vl`)
 around the per-function passes. In order:
 
 1. **Per function, -O1 pipeline** (as before): every function simplified
@@ -690,7 +690,7 @@ around the per-function passes. In order:
    attributes show it has none). Only internal functions: not `main`,
    not `extern "C"` definitions, not address-taken (a function pointer
    may reach them from anywhere). Signatures do not change (dead argument
-   *removal* would change the tachyon convention's register assignment
+   *removal* would change the vole convention's register assignment
    per function; the arguments are simply no longer read, and the
    caller's computation of them dies when nothing else uses it).
 3. **Bottom-up over the call graph's strongly connected components**
@@ -775,7 +775,7 @@ not reach the location (a private slot, or a readnone callee). The pass
 runs after LICM, and an address constant (a slot's or a static's
 address) defined in the loop is made again outside it. Not promoted:
 `bench/interp`'s `vm.sp`. Indexing a fixed array is not checked in
-tachyon, so nothing bounds `vm.stack[vm.sp]` away from `vm.sp`; with
+vole, so nothing bounds `vm.stack[vm.sp]` away from `vm.sp`; with
 checked array indexing (or out-of-bounds array indexing declared
 undefined) the ranges would.
 
@@ -826,11 +826,11 @@ profile-guided scheduling (0.9).
 ## 0.7: object files
 
 **0.7 status**
-- done: the assembler (`objfile.tach`, `enc_arm64.tach`, `enc_x86.tach`),
+- done: the assembler (`objfile.vl`, `enc_arm64.vl`, `enc_x86.vl`),
   Mach-O and ELF writers; `-c` (or `-o x.o`) writes an object, `-S`,
   `--emit-asm` (or `-o x.s`) assembly, any other output an executable
   (cc links); tests/run.sh, the fuzzers, the benchmarks and the bootstrap
-  (interface `tachyonc-0.7`: its fixpoint compares objects) use objects;
+  (interface `volec-0.7`: its fixpoint compares objects) use objects;
   tests/objcheck.sh: on all three targets every compilation of the corpus
   (374) links to the same program as `cc -c` of its assembly; objects are
   identical whatever the host; compile times in roadmap.md
@@ -839,7 +839,7 @@ profile-guided scheduling (0.9).
   all three targets, the fuzzer in every mode (about 1,300 programs on
   macOS), the ABI fuzzer in all three modes, host independence
 - done (scope added by the user: no undefined behaviour): fixed-array
-  indexing `a[i]` is checked like slice indexing, at every level (gen.tach
+  indexing `a[i]` is checked like slice indexing, at every level (gen.vl
   for -O0, lowering for -O1/-O2); SCCP and the value ranges remove what
   they prove: matmul, nbody, stencil, sieve keep none, md5 keeps 2 (speed
   unchanged), interp keeps 15 (46 -> 49 ms). With the checks scalar
@@ -852,12 +852,12 @@ profile-guided scheduling (0.9).
   (`unsafe` in 0.8)
 
 The compiler writes object files itself. The assembly text it has always
-written stays the single source: `objfile.tach` assembles exactly that
+written stays the single source: `objfile.vl` assembles exactly that
 text (one statement per line, the subset of the syntax the code
 generator uses), so `--emit-asm` and the object cannot disagree, and
 `cc -c` of the same text is an oracle for every object.
 
-**How it works.** `objfile.tach` reads the text line by line into
+**How it works.** `objfile.vl` reads the text line by line into
 fragments: runs of bytes, each with an optional tail whose size depends
 on where it lands: an alignment (zeros in data, NOPs in code, LLVM's
 NOPs on x86-64), or an x86-64 jump to a label, short or long. Labels
@@ -893,9 +893,9 @@ build of the compiler (under Rosetta) are identical to the arm64 one's.
 
 ## 0.9: the e-graph
 
-GVN (`gvn.tach`) hash-conses the pure instructions along the dominator
+GVN (`gvn.vl`) hash-conses the pure instructions along the dominator
 tree; 0.9 makes its table an acyclic e-graph, in the manner of
-Cranelift's aegraph (`egraph.tach`). Every value has an e-class (the
+Cranelift's aegraph (`egraph.vl`). Every value has an e-class (the
 values known equal to it). Classes are directional, as in Cranelift: when
 a rule shows instruction v equal to w (which dominates it), w and its
 members join v's class but not the other way round, since w's other
@@ -931,7 +931,7 @@ matchers:
 cancellation (`(x + y) - y`, `x - (x - y)`, `(x ^ y) ^ y`), absorption,
 `x * c + x`, comparisons with constants through additions and xors,
 `x - y == 0`, negations and complements. Commutative operations match
-either way round. **Checked**: `tachyonc --check-rules` (run by
+either way round. **Checked**: `volec --check-rules` (run by
 tests/run.sh) evaluates both sides of every rule on random values (edge
 values included: 0, -1, 1, powers of two and their neighbours) at every
 integer width, with the optimizer's folding (which is the language's
@@ -951,7 +951,7 @@ computes with the vector instructions (`vbin.op`, `vcmp.cond`, `vsplat`,
 slot; scalar replacement keeps a vector slot's leaf whole, so the slots
 become SSA values. `-O0` computes lane by lane, through frame slots: it
 shares nothing with the vector instructions, and stays the oracle. Calls
-pass vectors as structs of their lanes (tachyon's convention); C's
+pass vectors as structs of their lanes (vole's convention); C's
 conventions for vectors are not supported (vectors are not FFI-safe).
 
 The vector instructions are pure, GVN numbers them and LICM moves them;
@@ -966,11 +966,11 @@ x17). SSE2 has no 8-, 32- or 64-bit multiplication, no 64-bit
 comparison, and moves lanes to and from the integer registers poorly:
 those go lane by lane through the red zone below `%rsp` (System V
 leaves 128 bytes there for the function; nothing else in the generated
-code uses it). Both encoders (`enc_arm64.tach`, `enc_x86.tach`) learned
+code uses it). Both encoders (`enc_arm64.vl`, `enc_x86.vl`) learned
 the instructions; `tests/objcheck.sh` checks them against `cc -c`. AVX2
 is not used: Rosetta, where x86-64 is tested on Apple silicon, has none.
 
-**The loop vectorizer** (`vectorize.tach`, after the value ranges and
+**The loop vectorizer** (`vectorize.vl`, after the value ranges and
 before strength reduction). A candidate is an innermost counted loop
 (an induction variable `i` from `start`, step 1, to `n`, the latch's test
 `i + 1 < n` or `!=`) whose blocks form a chain from the header to the
@@ -1046,11 +1046,11 @@ Scalar evolution's entry test (`entry_implies`) now also finds the guard
 in a block dominating the preheader (an inner loop's guard that the outer
 loop's made redundant was not found before).
 
-Tested by `tests/run/opt_vectorize.tach` (IR and assembly checks, every
+Tested by `tests/run/opt_vectorize.vl` (IR and assembly checks, every
 level, overlapping slices, a check failing part way),
-`opt_vectorize_outer.tach` (matrix-vector and matrix products, f64 and
+`opt_vectorize_outer.vl` (matrix-vector and matrix products, f64 and
 f32, an output overlapping the input),
-`tests/run/vector_*.tach`, and `tests/fuzz/run.sh -V`: random
+`tests/run/vector_*.vl`, and `tests/fuzz/run.sh -V`: random
 reductions, maps, stencils and explicit vector code over slices of
 random lengths and starts, overlapping slices of one array, slices too
 short for the loop, nested loops over raw pointers (an output overlapping
@@ -1058,16 +1058,16 @@ the input now and then). `--no-vectorize` turns the vectorizer off.
 
 ## 0.10: profiles
 
-`tachyonc --profile-generate FILE` (at `-O1` or `-O2`) instruments the
+`volec --profile-generate FILE` (at `-O1` or `-O2`) instruments the
 program: after lowering, every IR block starts by incrementing its
 counter (a 64-bit load, add and store), and `main` starts with a call to
-the runtime (`profile.tach` holds its source, added to the program as the
+the runtime (`profile.vl` holds its source, added to the program as the
 module `__profile`), which allocates the counters and registers, with
 `atexit`, the function writing them to FILE when the program exits (also
 through `exit`, a failed check included):
 
 ```
-tachyon-profile 1
+vole-profile 1
 fn <symbol> <checksum> <blocks>
 <count of block 0>
 ...
@@ -1087,7 +1087,7 @@ The counts are hints. Passes that copy blocks keep them (inlining scales
 a callee's counts by the call site's over the callee's entry; loop
 cloning copies them); blocks made later are unknown. They decide:
 
-- **block layout** (`layout.tach`): the counts are the blocks'
+- **block layout** (`layout.vl`): the counts are the blocks'
   frequencies (unknown ones estimated: an edge's block as the lesser of
   its ends, others from their predecessors' shares), a branch's
   successors share in proportion to their counts, and blocks that never
@@ -1101,16 +1101,16 @@ cloning copies them); blocks made later are unknown. They decide:
   instructions) when unrolled partially.
 
 Not done: hot/cold function splitting, profile-guided register
-allocation and scheduling. Tested by `tests/run/opt_profile.tach` (the
+allocation and scheduling. Tested by `tests/run/opt_profile.vl` (the
 test runner's `PROFILE` directive compiles a case with
 `--profile-generate`, runs it, then checks it compiled with the profile:
 the rare way of a branch out of the fall-through, a hot call inlined)
-and `opt_profile_stale.tach` (a checked-in profile, stale for one
+and `opt_profile_stale.vl` (a checked-in profile, stale for one
 function).
 
 ## 0.11: performance
 
-**The vectorizer's cost model** (`vector_unroll` in `vectorize.tach`).
+**The vectorizer's cost model** (`vector_unroll` in `vectorize.vl`).
 After the analysis, the loop is vectorized only when the vector version
 is expected to be cheaper, in rough cycles of throughput: a scalar
 iteration costs S (an instruction 1, a check 2, a float division 4), a
@@ -1131,7 +1131,7 @@ iterations it replaces. Unrolling asks the same question
 as before.
 
 *Against full unrolling.* A loop of a few constant trips is unrolled
-whole by `transform_loops` (scev.tach: at most 16 trips and 160
+whole by `transform_loops` (scev.vl: at most 16 trips and 160
 instructions), and there the scalar alternative is not the loop: each
 copy keeps only its loads, stores and operations (the induction variable,
 the latch's test and the addresses affine in it become constants and
@@ -1150,19 +1150,19 @@ loop not unrolled; it is now ten loads and stores, which SLP makes five
 16-byte copies, as with `--no-vectorize`: about 5% faster, which takes
 back the 3% it had lost (it was not the forwarding of 8-byte stores to
 16-byte loads, as first thought: the unrolled copy has those too).
-`tests/run/opt_vectorize_unrolled.tach`. The compiler's own code is
+`tests/run/opt_vectorize_unrolled.vl`. The compiler's own code is
 unchanged.
 
 In 0.10, `[0; 20]` became a loop of two 16-byte stores an iteration,
 which never ran (20 < 32); it is now one vector store and four scalar
 ones. A loop the profile shows running two iterations an entry over
-`i32`s (four lanes) stays scalar (`tests/run/opt_vectorize_cost.tach`).
+`i32`s (four lanes) stays scalar (`tests/run/opt_vectorize_cost.vl`).
 bench/interp, which 0.10 measured 5% slower with the vectorizer, has no
 loop the vectorizer takes: its IR is the same with `--no-vectorize`, and
 the difference was noise.
 
 **Unrolling with run-time trip counts** (`unroll_runtime_loops` in
-`vectorize.tach`, after the vectorizer, in its frame). An innermost
+`vectorize.vl`, after the vectorizer, in its frame). An innermost
 counted loop (i from start, step 1, to n) whose trip count is not a
 constant, whose only exits are the latch's and failing checks, and which
 has no call, gets U copies of its body per iteration:
@@ -1190,7 +1190,7 @@ offsets of one base: `y + (x + c)` is `(y + x) + c` for addresses (u64;
 loads and stores take c as their offset, and GVN shares y + x), and
 `(x + c) - x` is c. The headers of both loops are marked `novec`.
 `--no-unroll-runtime` turns it off. Tested by
-`tests/run/opt_unroll_runtime.tach` (a recurrence and a reversed copy,
+`tests/run/opt_unroll_runtime.vl` (a recurrence and a reversed copy,
 every length from 0 to 10, a check failing part way).
 
 Compile time: the self-compile at -O2 is within 0.5% (the candidates
@@ -1198,7 +1198,7 @@ are rejected before LCSSA is formed, and the vectorizer's loop forest is
 reused when it changed nothing). fannkuch's flips and rotations run about
 5% faster.
 
-**The SLP vectorizer** (`slp.tach`, last of the -O2 pipeline, on each
+**The SLP vectorizer** (`slp.vl`, last of the -O2 pipeline, on each
 function as it will be emitted: run earlier, vector stores would hide
 their values from the loads of the functions they are inlined into). In
 a block, the stores writing the VF lanes of one 16-byte vector (one base,
@@ -1213,7 +1213,7 @@ group's last store, which a vector store replaces; scalars left unused go
 with dead code elimination.
 
 That moves the group's loads and stores down to its last store, which the
-memory between must allow (gvn.tach's `may_alias`): no call or other
+memory between must allow (gvn.vl's `may_alias`): no call or other
 side effect in between, no store in between that may write what a moved
 load reads, no access in between to what a moved store writes, no moved
 load reading a store of the group made before it. Cost: the vector
@@ -1228,13 +1228,13 @@ nbody's position update (`b.x += dt * b.vx; b.y += dt * b.vy`) is one
 addition to the loaded positions, one store; its velocity updates pack
 the same way, gathering dx and dy (which the distance also uses). Two
 pointers the analysis cannot tell apart are left alone (`q.a = q.a +
-r.a` ... may be one struct). Tested by `tests/run/opt_slp.tach`.
+r.a` ... may be one struct). Tested by `tests/run/opt_slp.vl`.
 `--no-slp` turns it off.
 
 **The gaps against clang -O2** on the new benchmarks, and what was done
 about the cheap and general ones:
 
-- *Branches on `&&`* (isel.tach). `a && b` leaves a block with a phi of
+- *Branches on `&&`* (isel.vl). `a && b` leaves a block with a phi of
   a's value and b's and a branch on it; the predecessor that branched on
   a kept a materialized bool, tested twice (`cset`, `cbz`, and `cbz`
   again), as only predecessors ending in a jump were threaded. Now one
@@ -1242,7 +1242,7 @@ about the cheap and general ones:
   false (or true) way. bench/sort's heapsort (`child + 1 < end &&
   s[child] < s[child + 1]`) is about 30% faster, a `csel` where clang
   has one.
-- *Equalities from branches* (gvn.tach). Below the edge where `x == y`
+- *Equalities from branches* (gvn.vl). Below the edge where `x == y`
   holds (the true way of `==`, the false way of `!=`, into a block with no
   other predecessor), uses of y take x in the blocks the edge dominates:
   a constant when one side is one, else the older value; `conv(a) ==
@@ -1250,8 +1250,8 @@ about the cheap and general ones:
   After `if a.len != b.len { return false; }` an index below a.len is
   below b.len, so the range analysis drops the check of b[i] in std's
   slice equality, which bench/wordcount's map runs for every word (about
-  8%); `tests/run/opt_equality.tach`.
-- *Division by a constant* (isel.tach, before tiling). `x / d` and
+  8%); `tests/run/opt_equality.vl`.
+- *Division by a constant* (isel.vl, before tiling). `x / d` and
   `x % d` for a constant d multiply by a magic number (Granlund and
   Montgomery; Hacker's Delight, chapter 10) with a new machine operation,
   `mulh` (the high half of the 128-bit product: `umulh`, `smulh` on
@@ -1263,16 +1263,16 @@ about the cheap and general ones:
   number and an arithmetic shift, i64 a `smulh` with its corrections; then
   one more when negative (`sub q, t, t, asr #63`). The remainder is
   `x - q * d` (`msub`), sharing q with a quotient of the same operands in
-  the block. Tachyon's results are kept: division by 0 is left to the
+  the block. Vole's results are kept: division by 0 is left to the
   division instruction (x / 0 is 0, x % 0 is x), x / -1 is -x (MIN / -1
-  wraps to MIN). Tested by `tests/run/opt_divide_constant.tach` (every
+  wraps to MIN). Tested by `tests/run/opt_divide_constant.vl` (every
   kind of constant at every width, against divisions by the same numbers
   unknown to the compiler) and a fuzz mode, `tests/fuzz/run.sh -D`
   (`gendiv.awk`: random constants and dividends, the extremes and exact
   multiples, every level against -O0). bench/wordcount (`% 26`, `/ 26`:
   `umulh`, `lsr`, `msub`) is 3.5% faster, bench/json 3%; collatz divides
   by 2 only, which was a shift already.
-- *Ranges through phis* (range.tach). A phi's range is the union of its
+- *Ranges through phis* (range.vl). A phi's range is the union of its
   operands' ranges, each at the end of its predecessor with the facts
   there and on the edge. The phis of a loop header are found together by
   induction: each is assumed in a range H, the operands coming back around
@@ -1291,7 +1291,7 @@ about the cheap and general ones:
   quarter of the depth of one of two (light cleanup leaves chains like
   `0 + (n - 0) * 1`). A branch on the phi of `&&` or `||` (a block of the
   phi and the branch alone) is threaded from each predecessor that
-  branched on the phi's operand for it, as isel.tach does, but before the
+  branched on the phi's operand for it, as isel.vl does, but before the
   ranges: in `child + 1 < end && s[child] < s[child + 1]`, the first test
   then holds wherever the whole is true.
 
@@ -1303,7 +1303,7 @@ about the cheap and general ones:
   now, in the generic sift-down of the records); bench/sort is 5% faster.
   The threading costs the loop passes about 6% of their time, and pays it
   back: the compiler built with it builds itself in 2.6% fewer
-  instructions. `tests/run/opt_range_phi.tach`: a step of 2, a step read
+  instructions. `tests/run/opt_range_phi.vl`: a step of 2, a step read
   from memory, a decreasing index, a sift-down; and an index that reaches
   past the end, whose check stays (and fails); a fuzz mode,
   `tests/fuzz/run.sh -R` (`genrange.awk`), of such loops (some going past
@@ -1314,9 +1314,9 @@ What remains, measured:
 - *Bounds checks* that need facts the ranges do not carry: in a generic
   sift-down, `end <= s.len` (so the first `s[root]`, with root the
   caller's start, keeps its check). C has no checks; this is the safety
-  tachyon keeps.
+  vole keeps.
 - *FMA*: clang contracts `a * b + c` by default (nbody: 27 ms against 29
-  with `-ffp-contract=off`); tachyon never does, as that changes results.
+  with `-ffp-contract=off`); vole never does, as that changes results.
 - *Floats compared for a branch* are `fcmp`, `cset`, `cbnz` on AArch64
   rather than `fcmp`, `b.cond` (`is_fused_compare` excludes floats).
   Fusing them (with the unordered-aware negated conditions `pl`, `hi`,
@@ -1343,7 +1343,7 @@ the loop written by hand: no call, no frame slot, the same vector loop.
 What was missing, in pipeline order:
 
 - **Loop passes of `#[inline]` functions wait** (`inlined_everywhere`,
-  `loop_pipeline` in `opt.tach`). Bottom-up, a callee's loops were
+  `loop_pipeline` in `opt.vl`). Bottom-up, a callee's loops were
   rotated, vectorized and unrolled before it was inlined: a source's
   `fold` loops from `self.pos`, unknown there, so its bounds check stayed
   and the vector loop got run-time checks and a checked scalar
@@ -1352,7 +1352,7 @@ What was missing, in pipeline order:
   now skips the loop passes, LICM and scalar promotion; they run after
   inlining for those still called somewhere. Its size also stays out of
   the program's inlining budget (it leaves the program once inlined).
-- **Copy elision** (`copies.tach`, before SROA). A frame slot copied
+- **Copy elision** (`copies.vl`, before SROA). A frame slot copied
   whole into another slot or into a part of one at a constant offset (a
   field), by a copy outside loops, where the source is used only before
   the copy and that part of the destination only after it (or elsewhere
@@ -1364,7 +1364,7 @@ What was missing, in pipeline order:
   into a slot that is replaced (a variable captured by reference, held by
   the closure's environment) is not a candidate in that round; its address
   then reaches its uses directly, and SROA runs again (at most 4 rounds).
-- **Threading on constant tags** (`tags.tach`, at the end of the first
+- **Threading on constant tags** (`tags.vl`, at the end of the first
   round of the scalar pipeline). A block whose switch decides on a phi
   (`match` on an enum's tag), or whose branch compares one with a
   constant, is copied for each predecessor giving that phi a constant,
@@ -1381,7 +1381,7 @@ What was missing, in pipeline order:
   it.next()` becomes a plain loop; a fold whose accumulator is an `Option`
   (`max`) is peeled once and then keeps a plain maximum.
 - **Counted loops out of several exits; equal induction variables**
-  (`exits.tach`, before rotation). A loop whose header, and blocks after
+  (`exits.vl`, before rotation). A loop whose header, and blocks after
   it that have no effects and one predecessor each, test several exits to
   one block (past the exit blocks canonical form makes), each an induction
   variable with a step of ±1 against an invariant (`!=` either way, `<`
@@ -1417,7 +1417,7 @@ merges slots only when neither address escapes (all uses are loads,
 stores and copies the analysis sees), and nothing colours the stack.
 
 The key kernel, `v.iter().map(|x| x * 3).sum()` hand-desugared
-(`tests/run/opt_iter_map_sum.tach`): before, 111 lines of IR, the
+(`tests/run/opt_iter_map_sum.vl`): before, 111 lines of IR, the
 callee's vector loop with its run-time check (`cmp.ge`, `cmp.lt` and
 `and`s before it), a scalar remainder with a bounds check and a
 `callc rt.panic`; after, the hand loop's 77 lines, instruction for
@@ -1441,15 +1441,15 @@ b333 <- b332 b333:
     branch v1352, b333, b334
 ```
 
-Tests: `tests/run/opt_iter_map_sum.tach` (no call, no slot, the vector
-loop), `opt_iter_next.tach` (`take` over `next` vectorized, `while let`
+Tests: `tests/run/opt_iter_map_sum.vl` (no call, no slot, the vector
+loop), `opt_iter_next.vl` (`take` over `next` vectorized, `while let`
 over `map`, `max` with an `Option` accumulator: no switch, no tag phi
-left), `opt_iter_deep.tach` (60 capturing maps: one vector loop, no
-memcpy), all three hand-desugared, and `opt_iter_real.tach`: the same
+left), `opt_iter_deep.vl` (60 capturing maps: one vector loop, no
+memcpy), all three hand-desugared, and `opt_iter_real.vl`: the same
 kernels (and filter, zip, enumerate, count) written with std's
 iterators and closures as the front end makes them, with the same
-checks. bench/iterchain.tach (six kernels as chains of std's iterators
-and closures) against bench/iterloop.tach (the same by hand), with C
+checks. bench/iterchain.vl (six kernels as chains of std's iterators
+and closures) against bench/iterloop.vl (the same by hand), with C
 twins; bench/run.sh prints the ratio of their -O2 times, the fastest of
 RUNS rounds each, run alternately, and fails above 1.05.
 
@@ -1477,7 +1477,7 @@ sort kernel's comparator, threaded, still leaves an unused comparison.
 0.14's benchmarks found bench/iterloop (six loop kernels written by
 hand) at about 2.2 times the time of its C twin under cc -O2, the
 iterator chains the same. Comparing the assembly kernel by kernel
-(`tachyonc -S`, `cc -O2 -S`), the causes were:
+(`volec -S`, `cc -O2 -S`), the causes were:
 
 | kernel | cause | ratio to cc -O2, before / after |
 |---|---|---|
@@ -1506,7 +1506,7 @@ its condition, the negation, or a constant: a comparator's ordering (-1,
 from (std's `sort_by` had kept a chain of three `csel`s for it, and its
 sift-down ran a third slower).
 
-**If-conversion** (`ifconv.tach`, in the loop passes after the ranges,
+**If-conversion** (`ifconv.vl`, in the loop passes after the ranges,
 before the vectorizer; `--no-ifconv`). In an innermost loop, a branch
 on a condition that is not invariant (unswitching takes those) whose
 ways meet again within the loop, a triangle or a diamond whose arms
@@ -1587,7 +1587,7 @@ front end knows a counted `for` ends), no raw `panic` is `nopanic`, and
 a C function whose effects have no `alloc`, `io` or `global` and whose
 parameters are all numbers is `readnone`. A C function the program
 declares nothing about has the builtin table's effects
-(`front/effects/builtin.tach`, `known_c_effects`): libm none (so
+(`front/effects/builtin.vl`, `known_c_effects`): libm none (so
 `readnone`, as 0.6's `PURE_LIBM` list had it, now the whole of libm),
 `mem*`/`str*` none, the allocation functions `alloc(extern)`, stdio and
 POSIX I/O `io`, `exit`/`abort` `io diverge` (and so not `nopanic`: a C
@@ -1595,7 +1595,7 @@ function that may not return may stop the program). The lowering's own
 C calls (`callc`) take the table too, `readnone` when their arguments
 are floats.
 
-**Value numbering of calls** (`gvn.tach`): a direct call with a scalar
+**Value numbering of calls** (`gvn.vl`): a direct call with a scalar
 result whose callee is `readnone` is hashed like a pure instruction, by
 its callee and its arguments, in the scoped table of the dominator-tree
 walk: a call dominated by an equal one is that one's value (the first
@@ -1607,7 +1607,7 @@ callees get their attributes only once they are optimized, after the
 function's first value numbering; a function with two such calls of one
 callee is simplified again after inlining (`repeated_pure_calls`).
 
-**Loop-invariant calls** (`licm.tach`): a direct call with a scalar
+**Loop-invariant calls** (`licm.vl`): a direct call with a scalar
 result, `readnone`, its arguments defined outside the loop, moves to the
 preheader when it is also `willreturn` and `nopanic` (it may then run
 where the loop would not have run it: on no path, or once for a call
@@ -1633,17 +1633,17 @@ written as std's will be (the fast path in `try_alloc`, the refill in a
 state, the aligned bump, a compare with the limit, a store, and the
 refill call on the cold edge.
 
-Tests: `tests/run/opt_effects_cse.tach` (readnone calls merged across
+Tests: `tests/run/opt_effects_cse.vl` (readnone calls merged across
 blocks, libm's `sqrt`, readonly calls merged and not merged across a
-store), `opt_effects_licm.tach` (a `readnone` call that may loop forever
+store), `opt_effects_licm.vl` (a `readnone` call that may loop forever
 hoisted because it runs first, a `readnone willreturn nopanic` call
 under a condition hoisted, one after a print and one reading a static
-the loop writes left in place), `opt_effects_arena.tach` (the bump path
+the loop writes left in place), `opt_effects_arena.vl` (the bump path
 without a call, heap to stack through Gpa). Benchmarks:
-`bench/purecall.tach` against `bench/purecall_hoisted.tach` (the same
+`bench/purecall.vl` against `bench/purecall_hoisted.vl` (the same
 with the calls hoisted and merged by hand), whose -O2 ratio bench/run.sh
 checks against 1.05 like the iterator and f-string pairs; and
-`bench/arena_trees.tach` (binarytrees with arenas through the Allocator
+`bench/arena_trees.vl` (binarytrees with arenas through the Allocator
 trait, its C twin `arena_trees.c`).
 
 **The gaps examples/algorithms found** (against clang -O2; the times are
@@ -1661,10 +1661,10 @@ this branch after merging release-0.15, so with 0.15's if-conversion):
 - *Comparators.* A derived `<` is `cmp(a, b) < 0` over an inlined `cmp`
   whose arms return -1, 0 or 1: a phi of constants (and phis of them, and
   selects of constants) compared with a constant is now a phi of the
-  comparisons' bools (`compare_phi`, fold.tach: every operand's outcome
+  comparisons' bools (`compare_phi`, fold.vl: every operand's outcome
   known, so an induction variable's comparison is left alone);
-  tags.tach threads branches on bool phis too; if-conversion
-  (ifconv.tach) first merges a block of phis only into the block whose
+  tags.vl threads branches on bool phis too; if-conversion
+  (ifconv.vl) first merges a block of phis only into the block whose
   phis take them (so the outer branch of an `if` nested in another's arm
   is a diamond), converts bool phis, and runs again while it converts;
   `k ? true : y` is `k | y` and its three siblings (combine_select); a
@@ -1715,12 +1715,12 @@ the prerequisite for per-function arenas and for code generation on
 several threads (0.18).
 
 **Method.** `sample` (macOS) on the self-compile (`-c
-compiler/src/main.tach`) at each level, three runs, shares of
+compiler/src/main.vl`) at each level, three runs, shares of
 `compile_program`'s samples (inclusive); instructions retired and peak
 RSS from `/usr/bin/time -l`; `--time-passes` with `clock()` replaced by
 instructions retired (a C file defining `clock` from
-`proc_pid_rusage`, linked into a build of the compiler: `tachyonc
-compiler/src/main.tach iclock.c -o icount`) for each phase's
+`proc_pid_rusage`, linked into a build of the compiler: `volec
+compiler/src/main.vl iclock.c -o icount`) for each phase's
 instructions, which a loaded machine does not blur. `same-output`
 against the compiler before each change proved every change but two
 (see below) left the output of 6984 compilations as it was.
@@ -1863,7 +1863,7 @@ closure function, its environment, an `Interp` type and its Display
 `fmt`, and an instance of `println` or `push_fmt` (and of every generic
 function in between), which -O0 and -O1 do not inline.
 
-**Written in place** (`front/check/interp.tach`, `direct_kind` and
+**Written in place** (`front/check/interp.vl`, `direct_kind` and
 `direct_call`). An f-string passed straight to std's `print`,
 `println`, `eprint`, `eprintln`, `format_in` or `Buf::push_fmt` (outside
 std, without a turbofish) makes none of them: the checker makes the call
@@ -1895,7 +1895,7 @@ effect's explanation names the call (`'println(f"..")' calls
 elsewhere (a variable, a function of the program taking `T: Display`,
 std's own) are as before.
 
-**-O1 inlines small leaf functions** (`middle/inline.tach`,
+**-O1 inlines small leaf functions** (`middle/inline.vl`,
 `simplify_inlining_leaves`, -O1's scalar pipeline): the functions with
 no calls are simplified first; one of at most 6 instructions
 (`func_size`; 40 with `#[inline]`; never `#[inline(never)]` or
@@ -1961,7 +1961,7 @@ for the optimizer. `error` is the default since the migration (T7);
 under the opt-outs `report`, `warn` and `off` the facts are unsound
 (`sweep(sa, sa)`), so nothing changes there.
 
-**Reference parameters** (middle/gvn.tach, "Reference parameters"). The
+**Reference parameters** (middle/gvn.vl, "Reference parameters"). The
 facts come from the parameter types, and only when the own pass ran in
 error mode (`noalias_active`: `OWN_MODE == MODE_ERROR`; that mode stops
 the compilation at its first error):
@@ -1979,7 +1979,7 @@ the compilation at its first error):
   tracked loan. So do the parameters of exported functions and of
   functions with C's convention (their callers are not checked).
 - the vectorizer emits no run-time overlap test between the groups of two
-  such parameters (vectorize/checks.tach, `needs_test`); fewer pairs
+  such parameters (vectorize/checks.vl, `needs_test`); fewer pairs
   also keep a loop under VEC_MAX_OVERLAPS and lower its cost.
 
 *Inlining.* The facts are about a function's parameters, which inlining
@@ -2010,7 +2010,7 @@ As the prototype found (value-semantics.md §8.5), the overlap tests run
 once per outer iteration, so bench/ does not move; the facts pay in
 kernels with many streams and short trip counts.
 
-**Moves** (middle/copies.tach). Under `--values=error`, `let w = v` of an
+**Moves** (middle/copies.vl). Under `--values=error`, `let w = v` of an
 owned local is a move: the lowering notes its copy (`note_move_copies`,
 lower_let). The own pass guarantees v is not read before it is bound
 again, and in a loop it must be bound again before the next move; with
@@ -2020,11 +2020,11 @@ which keeps away from copies in loops, elides a move in a loop too.
 Moving an argument without its copy at the call (§4's "Passing") is left
 for later: it needs the moves enforced (T1).
 
-**NRVO** (middle/copies.tach, `elide_result_copy`). A function returning
+**NRVO** (middle/copies.vl, `elide_result_copy`). A function returning
 a compound value through the result pointer, whose every return copies
 one local slot there (and nothing else touches the result), builds the
 local in the result: the copies go. The caller's result is a fresh slot
-(lower/calls.tach), which nothing else the function sees reaches. Only
+(lower/calls.vl), which nothing else the function sees reaches. Only
 for copies over INLINE_COPY_MAX bytes (memcpy calls): smaller locals are
 scalar replacement's, which the result's memory would stop. A copy must
 end its returning block, so that a defer after it cannot reach the
@@ -2058,7 +2058,7 @@ are worth having, and past 8 the serial part (the front end, lowering,
 interprocedural constants, the join) dominates. `-j1` makes no thread:
 the main thread runs every task, in order.
 
-**The state of a thread** (`middle/ctx.tach`). The 289 statics of
+**The state of a thread** (`middle/ctx.vl`). The 289 statics of
 middle, back and gen0 that a function's optimization and emission write
 (the passes' scratch, the current function's IR tables, the loop forest,
 the value ranges, the register allocator's intervals, the emitter's frame
@@ -2072,7 +2072,7 @@ v0.17.0 found the 8316 compilations identical. The parameter is a raw
 pointer (`mut`): as a 0.17 legacy reference, nested calls (`f(cx,
 g(cx))`) would be exclusivity conflicts.
 
-**The tasks** (`middle/parallel.tach`, on `middle/threads.tach`'s pool):
+**The tasks** (`middle/parallel.vl`, on `middle/threads.vl`'s pool):
 
 | phase | -O1 | -O2 | a task |
 |---|---|---|---|
@@ -2126,7 +2126,7 @@ program order between phases:
   before had made them large enough; e-graph folding uses the free entry
   after the function's last instruction (0.17 made the program's first
   scratch an instruction of whichever function needed it first).
-  `TACHYON_FRESH_CONTEXTS=1` gives each task a new context: the output
+  `VOLE_FRESH_CONTEXTS=1` gives each task a new context: the output
   must not change (tests/threads.sh).
 - Modes that keep the program's state in statics or print as they go run
   on one thread: `-g`, `--time-passes` (its clock is the process's),
@@ -2219,8 +2219,8 @@ words); the -j1 and -j4 objects are the same there too.
 **Tests.** `tests/threads.sh` (the gate's `threads` step, also in
 `--quick`, with `tests/threads_writes.sh`): every program of the corpus
 at -O0, -O1 and -O2 compiled at -j1 and -j8 (the self-compile also at
--j3, and with `TACHYON_FRESH_CONTEXTS=1`, and to assembly) must give the
-same object, the same output and the same exit: 2179 compilations. `TACHYON_PHASE_TIMES=1` prints each
+-j3, and with `VOLE_FRESH_CONTEXTS=1`, and to assembly) must give the
+same object, the same output and the same exit: 2179 compilations. `VOLE_PHASE_TIMES=1` prints each
 phase's wall time.
 
 **Measured** (aarch64-macos, the compiler compiling itself, `-c`, after
@@ -2248,7 +2248,7 @@ threads (the efficiency cores run slower; the allocator and the caches
 are shared). Measured before the merge, against v0.17.0 at load 2 to 6:
 -O2 1.98 s to 0.69 s at -j8, -O1 0.81 to 0.35, -O0 0.33 to 0.27.
 
-Phases at -O2 -j8 (`TACHYON_PHASE_TIMES=1`, ms; -j1's in parentheses):
+Phases at -O2 -j8 (`VOLE_PHASE_TIMES=1`, ms; -j1's in parentheses):
 front end 115, lowering 45, cleanup 13 (20), scalar pipeline 40 (206),
 interprocedural constants and the components' levels 42, bottom up 242
 (994), dead functions 32, emission with the join and the assembler 106
@@ -2294,7 +2294,7 @@ running (`back/codecache`). Three kinds of tasks are cached:
 
 **The key** of an entry: the kind; the compiler (a hash of its
 executable) and the command line (every option but `-o`, `-j`, the
-cache's own and the diagnostics', and the `TACHYON_*` variables the code
+cache's own and the diagnostics', and the `VOLE_*` variables the code
 generator reads); the target and the optimizer's switches; every type
 of the program (`types_hash`: each type's description and layout, a
 struct or enum by its fields and variants, not its name); and per
@@ -2347,8 +2347,8 @@ the IR, the facts and the text, and makes the constant data again in
 its order, in its phase and rank (the same placeholders, numbered as
 one thread numbers them).
 
-**The pack**: `target/tachyonc-cache/g-KEY.pack`, where the tools'
-cache is (`$TACHYON_CACHE` names another directory, or `off`; without
+**The pack**: `target/volec-cache/g-KEY.pack`, where the tools'
+cache is (`$VOLE_CACHE` names another directory, or `off`; without
 it there is a cache only when the current directory has a `target`
 directory), KEY a hash of the root as given, the current directory, the
 command line, the options and the compiler. It is 8-byte words: a
@@ -2359,13 +2359,13 @@ is checked against its hash when its entry is used (a damaged one is a
 miss). A build that made entries writes a new pack, renamed over the old
 one (concurrent builds each write a whole one; the last stays), by a
 copy of the process after the output is written (here with
-`$TACHYON_CACHE_SYNC` or `$TACHYON_CACHE_TRACE`): the entries it used and
+`$VOLE_CACHE_SYNC` or `$VOLE_CACHE_TRACE`): the entries it used and
 made, and the others for 3 builds while the pack stays under twice the
 used ones (32 MB at least). When the directory's packs pass
-`$TACHYON_CACHE_LIMIT` MB (1024), the least recently used go. A build
+`$VOLE_CACHE_LIMIT` MB (1024), the least recently used go. A build
 that used every entry and made none only marks the pack used.
 
-**Run-time numbers.** A check's site (front/contracts/sites.tach) and
+**Run-time numbers.** A check's site (front/contracts/sites.vl) and
 its kind past the four fixed ones (an enum's, a contract's message) are
 numbers the run-time helper reads, made in the front end's order: an
 edit that added a check anywhere moved every later one, and the code of
@@ -2378,7 +2378,7 @@ given in the order the join meets them (`gen0::target::rt_output`);
 `emit_runtime` writes the tables in that order. -O0 keeps the front end's
 numbers.
 
-**Off:** `--no-cache` or `--cache=off`, or `$TACHYON_CODE_CACHE=off` (the
+**Off:** `--no-cache` or `--cache=off`, or `$VOLE_CODE_CACHE=off` (the
 tools' cache as it is); a program whose live functions have fewer than
 8000 instructions as lowered, unless `--cache=on` (a 7-line program with
 std has 1405: its build at -O1 takes 6 ms, the cache's start, the
@@ -2389,12 +2389,12 @@ and 8.0; examples/closures-iterators, 8230, 10.6 and 10.5 at -O1, 36 and
 profiles, `--check-alloc`, `--check-unsafe`, `--coverage`,
 `--verify-effects`, `--print-checks`, `--emit-ir`, `--emit-mir`,
 `--vec-stats`, and any option the cache does not know. tests/run.sh
-runs without it (`TACHYON_CODE_CACHE=off` unless set), and so do the
+runs without it (`VOLE_CODE_CACHE=off` unless set), and so do the
 gate's steps but `incremental` and `suite-O2` (a smoke row, its cache in
 the run's directory, removed after).
-`$TACHYON_CACHE_STATS` prints each kind's hits and misses (new, a read
-changed, unreadable, not cacheable); `$TACHYON_CACHE_WHY` (with `-j1`)
-each miss and the read that changed; `$TACHYON_CACHE_CHECK` reads every
+`$VOLE_CACHE_STATS` prints each kind's hits and misses (new, a read
+changed, unreadable, not cacheable); `$VOLE_CACHE_WHY` (with `-j1`)
+each miss and the read that changed; `$VOLE_CACHE_CHECK` reads every
 component entry back as it is made and compares the IR.
 
 **The same bytes.** `tests/incremental.sh` (the gate's `incremental`
@@ -2468,14 +2468,14 @@ call).
 ## Contracts and generated code: the evidence
 
 0.18 turns a checked `requires` into a branch at the call and a checked
-`ensures` into a branch after the call (front/contracts/expand.tach), so
+`ensures` into a branch after the call (front/contracts/expand.vl), so
 the range analysis (middle/range) sees their conditions as facts once
 the callee is inlined. Nothing is ever assumed: a fact comes only from a
 check that ran. This section measures whether that makes code faster
 (0.18.1, aarch64-macos, -O2, the M-series host).
 
-**The bench pair.** bench/contracts.tach has four kernels over
-`Vec<i64>`; bench/contracts_plain.tach is the same program without the
+**The bench pair.** bench/contracts.vl has four kernels over
+`Vec<i64>`; bench/contracts_plain.vl is the same program without the
 clauses (an argument 1-4 runs one kernel). Instructions retired (robust
 under load); wall time the best of 5 runs at a load of about 5.5 on 12
 cores, so only large differences in it mean anything. "HEAD" is
@@ -2517,8 +2517,8 @@ data-dependent (interp's `code[pc]`, `regs[r]`, `stack[sp]`, json's
 `s[pos]`, fannkuch's `perm[k - i]`), would need a type invariant (not a
 fact in 0.18), or are analysis gaps listed below.
 
-**The fixes (this branch).** Both small, in middle/range/mod.tach, with
-tests/run/opt_range_chain.tach:
+**The fixes (this branch).** Both small, in middle/range/mod.vl, with
+tests/run/opt_range_chain.vl:
 - *`sub len, 0`.* Indexing a Vec reads its length as a slice's, `len - 0`
   in u64, which instcombine keeps because the type changes; the analysis
   took it for another value, so even `for i in 0..v.len() { v[i] }` kept
@@ -2572,7 +2572,7 @@ clause is not free: a contract that removes nothing costs its check.
    removed check says `removed (ranges)`, not the fact that removed it.
 
 **After entry facts (c181-facts).** Three changes, in middle/:
-- *Entry facts* (middle/entryfacts.tach). A requires is checked at every
+- *Entry facts* (middle/entryfacts.vl). A requires is checked at every
   direct call, before it, so at the callee's entry its clauses hold:
   every direct call passed the checks with these arguments, or the
   program exited 101. At -O2 a function's entry calls its `$pre`
@@ -2589,9 +2589,9 @@ clause is not free: a contract that removes nothing costs its check.
   (passed again as it is), or a clause that is not cheap to evaluate
   again (locals, constants, operators, fields and std's `len()` only).
   The optimizer never assumes a clause that is not checked.
-  tests/run/opt_entry_facts.tach (a bounds check gone; the address-taken
+  tests/run/opt_entry_facts.vl (a bounds check gone; the address-taken
   and the exported function keep theirs) and
-  contract_entry_indirect.tach (through a fn value, an index out of
+  contract_entry_indirect.vl (through a fn value, an index out of
   bounds still stops at the body's check, exit 101).
 - *Only where no caller inlines.* A function a caller may inline
   (inline::never_inlined: not `#[inline(never)]`, cold, nor larger than

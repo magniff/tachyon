@@ -1,0 +1,809 @@
+// Patterns: their type checking (bindings, constants, literals, ranges,
+// tuples, variants and or-patterns), refutability, the type of `match`, and
+// the exhaustiveness and reachability of its arms by usefulness (Maranget,
+// "Warnings for pattern matching", JFP 2007; in usefulness.vl).
+//
+// Resolutions recorded on pattern nodes:
+//   NodeKind::PatBind     x = the local
+//   NodeKind::PatLit      x = the value (canonical for the type; a bool is 0 or 1)
+//   NodeKind::PatRange    x = the low value, y = the high value
+//   NodeKind::PatVariant  x = the variant (VARIANTS)
+
+pub mod usefulness;
+
+use crate::base::{SRC, buf_fmt, buf_new, buf_slice, cstr, sym_text};
+use crate::base::diag::{
+    ERR_HELP, err_begin, err_end, err_fmt, err_help, err_help_fmt, err_str, err_try_fmt,
+};
+use crate::front::ast::{
+    ARM_LET_ELSE, ARM_NO_ELSE, NODES, NODE_CHECKED, NodeKind, PAT_DEREF, PAT_FIELDS, PAT_PARENS,
+    PAT_REF, child, list_begin, list_end, list_push, new_node,
+};
+use crate::front::ast::NodeKind::{
+    Ident, PatBind, PatLit, PatOr, PatRange, PatTuple, PatVariant, PatWild,
+};
+use crate::front::check::{
+    ENV, LOCALS, LOCAL_COUNT, SELF_TYPE, SELF_TYPE_SYM, check_recovering, define_local,
+    lookup_local, mismatch_error, name_error, poison_pattern, pop_scope, push_scope, type_error,
+    type_error_got,
+};
+use crate::front::check::check_mode::check_expr;
+use crate::front::check::names::{scope_const, unknown_name_error, used_variant_enum};
+use crate::front::check::resolve::{resolve_key, resolve_named};
+use crate::front::check::synth_mode::is_context_literal;
+use crate::front::check::unsafety::check_wrapped;
+use crate::front::check::variant_fields::{has_named_fields, pattern_fields, positional_error};
+use crate::front::check::widen::{join_arm, takes_context};
+use crate::front::closures::escape::check_scope_exit;
+use crate::front::consteval::{check_const_expr, const_eval, const_less, const_value, wrap_int};
+use crate::front::distinct::{is_distinct_type, strip_distinct};
+use crate::front::generics::{TPL_NONE, env_lookup, instance_of, template_of_key};
+use crate::front::lexer::Tok;
+use crate::front::modules::CUR_MOD;
+use crate::front::modules::lookup::{
+    B_ITEM, B_PRIVATE, B_TVARIANT, B_VARIANT, access_error, binding_kind, binding_value,
+    lookup_commit, lookup_name, lookup_quiet, note_c_use, note_pattern_pos, path_module,
+};
+use crate::front::own::drops::arm_drops;
+use crate::front::patterns::usefulness::check_arms;
+use crate::front::types::{
+    CONSTS, ENUMS, REF_MUT, REF_SHARED, SYM_PRIMITIVE, TYPES, TY_BOOL, TY_ERROR, TY_NEVER, TY_UNIT,
+    TyKind, VARIANTS, buf_type, enum_type, enum_variant, err_type, find_variant, is_fieldless_enum,
+    is_float, is_integer, is_ref, item_node_of, ref_to, type_elem, variant_field,
+};
+use crate::tools::query::command_line::qnote;
+
+// What other modules use of the parts.
+
+// Or-patterns: the alternatives after the first bind the locals of the
+// first (OR_FIRST..OR_END in ENV) instead of new ones.
+pub static var OR_MODE: bool = false;
+static var OR_FIRST: i64 = 0;
+static var OR_END: i64 = 0;
+// Where the locals of the pattern being checked start in ENV.
+static var PATTERN_START: i64 = 0;
+
+// (0.18.1) The binding mode under the references matched so far
+// (PAT_DEREF): 0 by value, REF_SHARED or REF_MUT: bindings are references.
+static var BIND_REF: i64 = 0;
+
+// Whether PatBind p names a value rather than binding one: a constant, or
+// a variant in scope (`None`), as check_pat reads it.
+fn names_value(p: i64) -> bool {
+    unsafe {
+        let name = NODES[p].a;
+        if NODES[p].b != 0 || lookup_local(name).is_some() {
+            return false;
+        }
+        if scope_const(name) != 0 {
+            return true;
+        }
+        let k = binding_kind(lookup_quiet(CUR_MOD, name, CUR_MOD));
+        k == B_VARIANT || k == B_TVARIANT
+    }
+}
+
+// Whether pattern p, matched against a value of reference type ty, matches
+// what it points to (Rust's default binding modes): any pattern but a
+// binding or `_`, against `&T` or `&mut T` of a T that is no reference.
+fn derefs(p: i64, ty: i64) -> bool {
+    unsafe {
+        if !is_ref(ty) || is_ref(TYPES[ty].a) {
+            return false;
+        }
+        let k = NODES[p].kind;
+        k != PatWild && (k != PatBind || names_value(p))
+    }
+}
+
+// (0.18.1, for the code generators) What pattern p, given a value of type
+// ty, matches: the referent of a reference it matches through
+// (PAT_DEREF), else 0.
+pub fn pattern_referent(p: i64, ty: i64) -> i64 {
+    unsafe {
+        if (NODES[p].p & PAT_DEREF) != 0 && is_ref(ty) {
+            return TYPES[ty].a;
+        }
+    }
+    0
+}
+
+// Whether pattern p is a binding that takes a reference into the matched
+// value (PAT_REF): the generators give it the value's address.
+pub fn binds_ref(p: i64) -> bool {
+    unsafe { NODES[p].kind == PatBind && (NODES[p].p & PAT_REF) != 0 }
+}
+
+pub fn check_pattern(p: i64, ty: i64) {
+    PATTERN_START = ENV.count;
+    let saved = BIND_REF;
+    BIND_REF = 0;
+    check_pat(p, ty);
+    BIND_REF = saved;
+}
+
+fn check_pat(p: i64, ty: i64) {
+    unsafe {
+        if derefs(p, ty) {
+            // (0.18.1) a pattern on a reference matches what it points to;
+            // its bindings are references into it, `&mut` only under
+            // `&mut` all the way down (lowering: PAT_DEREF, PAT_REF)
+            let saved = BIND_REF;
+            BIND_REF = if saved == REF_SHARED || TYPES[ty].b == REF_SHARED { REF_SHARED }
+                else { REF_MUT };
+            check_pat(p, TYPES[ty].a);
+            BIND_REF = saved;
+            NODES[p].p |= PAT_DEREF;
+            return;
+        }
+        // (a pattern checked again, a generic's instance: flags of its own)
+        NODES[p].p &= ~(PAT_DEREF | PAT_REF);
+        let kind = NODES[p].kind;
+        // (0.18: a literal pattern of a distinct type matches its
+        // underlying type's values)
+        if (kind == PatLit || kind == PatRange) && is_distinct_type(ty) {
+            check_pat(p, strip_distinct(ty));
+            return;
+        }
+        NODES[p].ty = ty;
+        if kind == PatWild {
+            return;
+        }
+        if kind == PatBind && NODES[p].b == 0 && scope_const(NODES[p].a) == 0
+            && lookup_local(NODES[p].a).is_none() && used_variant_enum(NODES[p].a, ty, p) != 0 {
+            // A variant brought into scope by `use` (0.4) or the prelude (0.6).
+            lookup_commit(NODES[p].a, NODES[p].start);
+            NODES[p].y = used_variant_enum(NODES[p].a, ty, p);
+            NODES[p].kind = PatVariant;
+            NODES[p].b = NODES[p].a;
+            NODES[p].c = 0;
+            check_pat(p, ty);
+            return;
+        }
+        if kind == PatVariant && NODES[p].d == 1 {
+            // `V(p, ...)`: a variant by its own name, from `use`.
+            let t = used_variant_enum(NODES[p].b, ty, p);
+            if t == 0 && (NODES[p].p & PAT_FIELDS) != 0 {
+                // (0.17) `P { x, y }` of a struct
+                name_error(NODES[p].start, c"'", NODES[p].b,
+                    c"' is not an enum variant: only variants are matched by field name ('E::V { a, .. }'); bind the struct and read its fields ('p => p.x')");
+            }
+            if t == 0 {
+                name_error(NODES[p].start, c"unknown variant '", NODES[p].b,
+                    c"' (write 'Enum::Variant', or bring it into scope with 'use Enum::Variant;')");
+            }
+            lookup_commit(NODES[p].b, NODES[p].start);
+            NODES[p].y = t;
+            NODES[p].d = 0;
+            check_pat(p, ty);
+            return;
+        }
+        if kind == PatRange && (NODES[NODES[p].a].kind == PatVariant
+            || NODES[NODES[p].b].kind == PatVariant) {
+            if TYPES[ty].kind != TyKind::Enum {
+                // (0.17) `i8::MIN..=-1`, `0..=i64::MAX`: constants' paths
+                NODES[p].a = pattern_path(NODES[p].a);
+                NODES[p].b = pattern_path(NODES[p].b);
+                check_pat(p, ty);
+                return;
+            }
+            if NODES[NODES[p].a].kind != PatVariant || NODES[NODES[p].b].kind != PatVariant {
+                type_error(p, c"a variant range needs two variants of the same enum");
+            }
+            variant_range(p, ty);
+            return;
+        }
+        if kind == PatBind && NODES[p].b == 0 && scope_const(NODES[p].a) != 0
+            && lookup_local(NODES[p].a).is_none()
+            && is_fieldless_enum(CONSTS[scope_const(NODES[p].a) - 1].ty) {
+            // A constant of a fieldless enum: its variant's pattern.
+            note_pattern_pos(NODES[p].start);
+            lookup_commit(NODES[p].a, NODES[p].start);
+            let c = scope_const(NODES[p].a) - 1;
+            let e = TYPES[CONSTS[c].ty].a;
+            let value = const_value(c);
+            for i in 0..ENUMS[e].variant_count {
+                let v = enum_variant(e, i);
+                if wrap_int(VARIANTS[v].discr, ENUMS[e].tag) == value {
+                    NODES[p].kind = PatVariant;
+                    NODES[p].y = enum_type(e);
+                    NODES[p].b = VARIANTS[v].name;
+                    NODES[p].c = 0;
+                }
+            }
+            check_pat(p, ty);
+            return;
+        }
+        if kind == PatBind {
+            let name = NODES[p].a;
+            if scope_const(name) != 0 && NODES[p].b == 0 && lookup_local(name).is_none() {
+                // A constant's name: a literal pattern.
+                note_pattern_pos(NODES[p].start);
+                let e = new_node(Ident, NODES[p].start, NODES[p].end);
+                NODES[e].a = name;
+                NODES[p].kind = PatLit;
+                NODES[p].a = e;
+                check_pat(p, ty);
+                return;
+            }
+            var bty = ty;
+            // (a slice is a view already: a copy, as `&[T]` is `[T]`)
+            if BIND_REF != 0 && !(TYPES[ty].kind == TyKind::Slice && TYPES[ty].b == 0) {
+                if NODES[p].b != 0 {
+                    err_begin(NODES[p].start);
+                    err_fmt(
+                        f"'var {sym_text(name)}' in a pattern through an access: its bindings are accesses into the value");
+                    err_help(c"drop the 'var' (matched through an inout access, 'x = v' changes the field), or match a copy: 'match e.clone()'");
+                    err_end();
+                }
+                bty = ref_to(ty, BIND_REF);
+                NODES[p].p |= PAT_REF;
+                NODES[p].ty = bty;
+            }
+            if OR_MODE {
+                NODES[p].x = or_rebind(p, name, bty);
+                return;
+            }
+            for i in PATTERN_START..ENV.count {
+                if LOCALS[ENV.data[i]].name == name {
+                    name_error(NODES[p].start, c"identifier '", name,
+                        c"' is bound more than once in the same pattern");
+                }
+            }
+            NODES[p].x = define_local(name, bty, NODES[p].b != 0 && bty == ty, false);
+            // (0.20) a binding into a value matched through an access (`match
+            // &x`, `match e` of an access) is an access too, in a 0.20 file:
+            // used as the value it designates (conventions.md §5.3)
+            if (NODES[p].p & crate::front::ast::PAT_REF) != 0 && bty > 0 && is_ref(bty)
+                && crate::front::conv::strict_at(NODES[p].start) {
+                LOCALS[NODES[p].x].access = true;
+            }
+            return;
+        }
+        if kind == PatOr {
+            check_or_pattern(p, ty);
+            return;
+        }
+        if kind == PatVariant && NODES[p].c == 0 && NODES[p].d == 0 && NODES[p].y == 0
+            && is_integer(ty) {
+            // (0.17) `i64::MAX =>`: a constant's path
+            let e = pattern_path(p);
+            NODES[p].kind = PatLit;
+            NODES[p].a = e;
+            check_pat(p, ty);
+            return;
+        }
+        if ty == TY_NEVER {
+            for i in 0..NODES[p].count {
+                check_pat(child(p, i), TY_NEVER);
+            }
+            return;
+        }
+        match kind {
+            PatTuple => {
+                let count = NODES[p].count;
+                if ty == TY_UNIT && count == 0 {
+                    return;
+                }
+                if TYPES[ty].kind != TyKind::Tuple || TYPES[ty].count != count {
+                    err_begin(NODES[p].start);
+                    err_fmt(f"a tuple pattern with {count} elements cannot bind a value of type '");
+                    err_type(ty);
+                    err_str(c"'");
+                    err_end();
+                }
+                for i in 0..count {
+                    check_pat(child(p, i), type_elem(ty, i));
+                }
+            }
+            PatLit => {
+                check_literal_type(p, ty, c"a literal pattern");
+                let e = NODES[p].a;
+                check_const_expr(e, ty);
+                NODES[p].x = const_eval(e);
+            }
+            PatRange => {
+                check_literal_type(p, ty, c"a range pattern");
+                if ty == TY_BOOL {
+                    type_error(p, c"range patterns need an integer type, not 'bool'");
+                }
+                check_const_expr(NODES[p].a, ty);
+                check_const_expr(NODES[p].b, ty);
+                NODES[p].x = const_eval(NODES[p].a);
+                NODES[p].y = const_eval(NODES[p].b);
+                if const_less(NODES[p].y, NODES[p].x, ty) {
+                    type_error(p, c"the range pattern is empty (its start is above its end)");
+                }
+            }
+            _ => check_variant_pattern(p, ty),
+        }
+    }
+}
+
+// `E::A..=E::C` (0.4): the variants from A to C in declaration order, as
+// an or-pattern.
+fn variant_range(p: i64, ty: i64) {
+    unsafe {
+        let lo = NODES[p].a;
+        let hi = NODES[p].b;
+        let t = pattern_enum_type(lo, ty);
+        if TYPES[t].kind != TyKind::Enum || pattern_enum_type(hi, ty) != t {
+            type_error(p, c"a variant range needs two variants of the same enum");
+        }
+        let e = TYPES[t].a;
+        let first = find_variant(e, NODES[lo].b);
+        let last = find_variant(e, NODES[hi].b);
+        if first < 0 || last < 0 {
+            type_error(p, c"unknown variant in a variant range");
+        }
+        if last < first {
+            type_error(p,
+                c"the variant range is empty (its first variant is declared after its last)");
+        }
+        let mark = list_begin();
+        for v in first..last + 1 {
+            if VARIANTS[v].field_count > 0 {
+                name_error(NODES[p].start, c"variant ranges are for variants without fields; '",
+                    VARIANTS[v].name, c"' has fields");
+            }
+            let alt = new_node(PatVariant, NODES[p].start, NODES[p].end);
+            NODES[alt].y = t;
+            NODES[alt].b = VARIANTS[v].name;
+            list_push(alt);
+        }
+        list_end(p, mark);
+        NODES[p].kind = PatOr;
+        check_pat(p, ty);
+    }
+}
+
+// (0.17) A bound of a range pattern parsed as a variant (`i8::MIN` in
+// `i8::MIN..=-1`): the path expression it is; any other bound as it is.
+fn pattern_path(b: i64) -> i64 {
+    unsafe {
+        if NODES[b].kind != PatVariant || NODES[b].c != 0 {
+            return b;
+        }
+        let n = new_node(NodeKind::Path, NODES[b].start, NODES[b].end);
+        NODES[n].a = NODES[b].a;
+        NODES[n].b = NODES[b].b;
+        let prefix = NODES[b].h;
+        if prefix != 0 {
+            let mark = list_begin();
+            for i in 0..NODES[prefix].count {
+                list_push(child(prefix, i));
+            }
+            for k in 0..2 {
+                let seg = new_node(Ident, NODES[b].start, NODES[b].end);
+                NODES[seg].a = if k == 0 { NODES[b].a } else { NODES[b].b };
+                list_push(seg);
+            }
+            list_end(n, mark);
+        }
+        n
+    }
+}
+
+fn check_literal_type(p: i64, ty: i64, what: *u8) {
+    unsafe {
+        if is_float(ty) {
+            err_begin(NODES[p].start);
+            err_fmt(f"{cstr(what)} cannot match a float");
+            err_help(c"compare with '==' in a guard: 'x if x == 1.5 =>'");
+            err_end();
+        }
+        if !(is_integer(ty) || ty == TY_BOOL) {
+            err_begin(NODES[p].start);
+            err_fmt(f"{cstr(what)} cannot match a value of type '");
+            err_type(ty);
+            err_str(c"'");
+            err_end();
+        }
+    }
+}
+
+// The type a variant pattern's enum name stands for: through its module
+// path (h); a generic enum written without arguments stands for the
+// instance being matched.
+fn pattern_enum_type(p: i64, ty: i64) -> i64 {
+    unsafe {
+        if NODES[p].y != 0 {
+            return NODES[p].y;
+        }
+        let name = NODES[p].a;
+        if NODES[p].h == 0
+            && (env_lookup(name) != 0 || SYM_PRIMITIVE[name] != 0
+                || (name == SELF_TYPE_SYM && SELF_TYPE != 0)) {
+            return resolve_named(name, NODES[p].start);
+        }
+        let m = if NODES[p].h != 0 { path_module(NODES[p].h, NODES[NODES[p].h].count) }
+            else { CUR_MOD };
+        let b = lookup_name(m, name, CUR_MOD);
+        if NODES[p].h == 0 {
+            note_c_use(NODES[p].start, name, b);
+        }
+        if binding_kind(b) == B_PRIVATE {
+            access_error(b, NODES[p].start, name);
+        }
+        if binding_kind(b) != B_ITEM {
+            unknown_name_error(NODES[p].start, c"unknown type '", name);
+        }
+        let key = binding_value(b);
+        qnote(NODES[p].start, name, item_node_of(key), 0);
+        let tpl = template_of_key(key);
+        if tpl != TPL_NONE {
+            if instance_of(ty, tpl) {
+                return ty;
+            }
+            err_begin(NODES[p].start);
+            err_str(c"expected '");
+            err_type(ty);
+            err_fmt(f"', got a pattern of '{sym_text(name)}'");
+            err_end();
+        }
+        resolve_key(key, name, NODES[p].start)
+    }
+}
+
+fn check_variant_pattern(p: i64, ty: i64) {
+    unsafe {
+        let t = pattern_enum_type(p, ty);
+        if TYPES[t].kind != TyKind::Enum {
+            err_begin(NODES[p].start);
+            err_str(c"'");
+            err_type(t);
+            err_str(c"' is not an enum");
+            err_end();
+        }
+        if t != ty {
+            mismatch_error(p, ty, t);
+        }
+        let v = find_variant(TYPES[t].a, NODES[p].b);
+        if v < 0 {
+            err_begin(NODES[p].start);
+            err_fmt(f"no variant '{sym_text(NODES[p].b)}' in enum '");
+            err_type(t);
+            err_str(c"'");
+            err_end();
+        }
+        // (0.17: struct-like variants)
+        if (NODES[p].p & PAT_FIELDS) != 0 {
+            pattern_fields(p, v, t);
+        } else if (NODES[p].p & PAT_PARENS) != 0 && has_named_fields(v) {
+            positional_error(p, v, t, true);
+        }
+        let count = VARIANTS[v].field_count;
+        if NODES[p].c == 0 && count > 0 && has_named_fields(v) {
+            err_begin(NODES[p].start);
+            err_str(c"variant '");
+            err_type(t);
+            err_fmt(f"::{sym_text(NODES[p].b)}' has {count}");
+            err_str(if count == 1 { c" field" } else { c" fields" });
+            err_help(c"match them by name, or leave them out with '..'");
+            let b = buf_new();
+            buf_type(b, t);
+            buf_fmt(b, f"::{sym_text(NODES[p].b)} {{ .. }}");
+            err_try_fmt(buf_slice(b));
+            err_end();
+        }
+        if NODES[p].c == 0 && count > 0 {
+            err_begin(NODES[p].start);
+            err_str(c"variant '");
+            err_type(t);
+            err_fmt(f"::{sym_text(NODES[p].b)}' has {count}");
+            err_str(if count == 1 { c" field" } else { c" fields" });
+            err_help(c"match them: '");
+            buf_type(ERR_HELP, t);
+            err_help_fmt(f"::{sym_text(NODES[p].b)}(_");
+            for _ in 1..count {
+                err_help(c", _");
+            }
+            err_help(c")'");
+            err_end();
+        }
+        if NODES[p].c != 0 && NODES[p].count != count {
+            err_begin(NODES[p].start);
+            err_str(c"variant '");
+            err_type(t);
+            err_fmt(f"::{sym_text(NODES[p].b)}' has {count}");
+            err_str(if count == 1 { c" field" } else { c" fields" });
+            err_fmt(f", the pattern has {NODES[p].count}");
+            err_end();
+        }
+        NODES[p].x = v;
+        for i in 0..count {
+            check_pat(child(p, i), variant_field(v, i));
+        }
+    }
+}
+
+fn check_or_pattern(p: i64, ty: i64) {
+    let first = ENV.count;
+    check_pat(child(p, 0), ty);
+    let saved_mode = OR_MODE;
+    let saved_first = OR_FIRST;
+    let saved_end = OR_END;
+    if !OR_MODE {
+        OR_FIRST = first;
+        OR_END = ENV.count;
+    }
+    OR_MODE = true;
+    let bound = binding_count(child(p, 0));
+    unsafe {
+        for i in 1..NODES[p].count {
+            let alt = child(p, i);
+            check_pat(alt, ty);
+            if binding_count(alt) != bound {
+                type_error(alt, c"every alternative of an or-pattern must bind the same variables");
+            }
+        }
+    }
+    unsafe {
+        for i in 0..NODES[p].count {
+            if binds_ref(child(p, i)) {
+                // (0.18.1: the generators give an alternative a value, not
+                // the address a reference binding takes)
+                type_error(child(p, i), c"a binding as an alternative of an or-pattern on a reference: bind the value once, outside the or-pattern");
+            }
+        }
+    }
+    OR_MODE = saved_mode;
+    OR_FIRST = saved_first;
+    OR_END = saved_end;
+}
+
+// The local of the first alternative named `name`, for a later one.
+fn or_rebind(p: i64, name: i64, ty: i64) -> i64 {
+    unsafe {
+        for i in OR_FIRST..OR_END {
+            let id = ENV.data[i];
+            if LOCALS[id].name == name {
+                if LOCALS[id].ty != ty {
+                    err_begin(NODES[p].start);
+                    err_fmt(f"variable '{sym_text(name)}' has type '");
+                    err_type(LOCALS[id].ty);
+                    err_str(c"' in one alternative and '");
+                    err_type(ty);
+                    err_str(c"' in another");
+                    err_end();
+                }
+                return id;
+            }
+        }
+        name_error(NODES[p].start, c"variable '", name,
+            c"' is not bound in every alternative of the or-pattern")
+    }
+}
+
+pub fn binding_count(p: i64) -> i64 {
+    unsafe {
+        match NODES[p].kind {
+            PatBind => 1,
+            PatOr => binding_count(child(p, 0)),
+            // (0.17) a field of `E::V { a, b: q }` before it is checked
+            NodeKind::FieldInit => binding_count(NODES[p].b),
+            PatTuple | PatVariant => {
+                var total = 0;
+                for i in 0..NODES[p].count {
+                    total += binding_count(child(p, i));
+                }
+                total
+            }
+            _ => 0,
+        }
+    }
+}
+
+// ---- Refutability ----
+
+pub fn is_irrefutable(p: i64) -> bool {
+    unsafe {
+        match NODES[p].kind {
+            PatWild | PatBind => true,
+            _ if NODES[p].ty == TY_NEVER => true,
+            PatVariant if ENUMS[VARIANTS[NODES[p].x].enum_id].variant_count != 1 => false,
+            PatTuple | PatVariant => {
+                for i in 0..NODES[p].count {
+                    if !is_irrefutable(child(p, i)) {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+fn has_or_pattern(p: i64) -> i64 {
+    unsafe {
+        if NODES[p].kind == PatOr {
+            return p;
+        }
+        if NODES[p].kind == NodeKind::FieldInit {
+            return has_or_pattern(NODES[p].b);
+        }
+        if NODES[p].kind == PatTuple || NODES[p].kind == PatVariant {
+            for i in 0..NODES[p].count {
+                let found = has_or_pattern(child(p, i));
+                if found != 0 {
+                    return found;
+                }
+            }
+        }
+        0
+    }
+}
+
+// Patterns of `let` and `for` must match every value.
+pub fn check_irrefutable(p: i64, what: *u8) {
+    unsafe {
+        let or = has_or_pattern(p);
+        if or != 0 {
+            err_begin(NODES[or].start);
+            err_fmt(f"or-patterns are only allowed in match arms, not in '{cstr(what)}'");
+            err_end();
+        }
+        if !is_irrefutable(p) {
+            err_begin(NODES[p].start);
+            err_fmt(
+                f"refutable pattern in '{cstr(what)}': it does not match every value of type '");
+            err_type(NODES[p].ty);
+            err_str(c"'");
+            if cstr(what) == "let" {
+                // (0.18.1) let-else
+                err_help(c"leave when it does not match: 'let PAT = e else { return ...; };' (or a 'match')");
+                if NODES[p].end > NODES[p].start {
+                    err_try_fmt(
+                        f"let {SRC[NODES[p].start..NODES[p].end]} = VALUE else {{ return ...; }};");
+                }
+            } else {
+                err_help(c"use 'match' to handle the other cases");
+                if NODES[p].end > NODES[p].start {
+                    // (0.17) the match to write, its arms ready
+                    err_try_fmt(
+                        f"match VALUE {{ {SRC[NODES[p].start..NODES[p].end]} => ..., _ => ... }}");
+                }
+            }
+            err_end();
+        }
+    }
+}
+
+// ---- match ----
+
+// `match`; `expected` (0 for none) is the type of the arms.
+pub fn check_match(n: i64, expected: i64) -> i64 {
+    unsafe {
+        let scrutinee = NODES[n].a;
+        // (0.20, conventions.md §5.3) `match e` of an access matches through
+        // it, as 0.19's `match r` of a reference did: its bindings are
+        // accesses into the value (default binding modes), not copies
+        if NODES[scrutinee].kind == NodeKind::Ident
+            && (NODES[scrutinee].p & crate::front::ast::CONV_NEW) == 0
+            && crate::front::conv::strict_at(NODES[scrutinee].start) {
+            match lookup_local(NODES[scrutinee].a) {
+                Option::Some(l) => {
+                    if LOCALS[l].access && is_ref(LOCALS[l].ty) {
+                        NODES[scrutinee].p |= crate::front::ast::CONV_NEW;
+                    }
+                }
+                Option::None => {}
+            }
+        }
+        var st = check_recovering(scrutinee, 0);
+        // (0.20, D13 for a match: `match q.conds[i]` of an owned value the
+        // function cannot take, an element or a part through an access,
+        // matches it through a borrow, as `let x = part` does: its
+        // bindings are accesses into it)
+        if st > 0 && st != TY_ERROR && crate::front::conv::strict_at(NODES[scrutinee].start)
+            && !crate::front::conv::std_at(NODES[scrutinee].start)
+            && !crate::front::conv::copyable(st)
+            && crate::front::conv::borrowed_place(scrutinee) {
+            let inner = new_node(NodeKind::None, NODES[scrutinee].start, NODES[scrutinee].end);
+            NODES[inner] = NODES[scrutinee];
+            NODES[inner].p |= NODE_CHECKED;
+            NODES[inner].ty = st;
+            NODES[scrutinee].kind = NodeKind::Unary;
+            NODES[scrutinee].op = Tok::Amp;
+            NODES[scrutinee].a = 0;
+            NODES[scrutinee].b = inner;
+            NODES[scrutinee].count = 0;
+            NODES[scrutinee].list = 0;
+            NODES[scrutinee].p = 0;
+            NODES[scrutinee].ty = 0;
+            st = check_recovering(scrutinee, 0);
+        }
+        var result = expected;
+        var all_never = true;
+        // `if let` without `else` (0.6): of type `()`, like an `if`.
+        let no_else = NODES[n].count == 2 && (NODES[child(n, 1)].p & ARM_NO_ELSE) != 0;
+        if no_else && expected != 0 && expected != TY_UNIT {
+            err_begin(NODES[n].start);
+            err_str(c"'if let' without else must have type '()', expected '");
+            err_type(expected);
+            err_str(c"'");
+            err_end();
+        }
+        // (0.14) without an expected type, an arm whose value is an
+        // unsuffixed literal takes the type of the first other arm: checked
+        // after it (a literal needs none of the pattern's bindings)
+        let later = expected == 0 && !no_else
+            && (0..NODES[n].count).any(|i| !is_context_literal(NODES[child(n, i)].c));
+        var typed_at = NODES[n].count;
+        for i in 0..NODES[n].count {
+            let arm = child(n, i);
+            push_scope();
+            let locals = LOCAL_COUNT;
+            if st == TY_ERROR {
+                // (after an error in the scrutinee: bindings of the error type)
+                poison_pattern(NODES[arm].a);
+            } else {
+                check_pattern(NODES[arm].a, st);
+                // (0.17, T1: its bindings' drops, or they borrow:
+                // front/own/drops)
+                arm_drops(n, arm);
+            }
+            if NODES[arm].b != 0 {
+                check_expr(NODES[arm].b, TY_BOOL);
+            }
+            let body = NODES[arm].c;
+            var t = 0;
+            if (NODES[arm].p & ARM_LET_ELSE) != 0 {
+                // (0.18.1) `let ... else { .. }`: the block leaves
+                t = check_wrapped(body, 0);
+                if t != TY_NEVER && t != TY_ERROR {
+                    err_begin(NODES[body].start);
+                    err_str(c"the 'else' block of a 'let ... else' must not end normally");
+                    err_help(c"end it with 'return', 'break', 'continue' or a call that never returns ('panic(..)')");
+                    err_end();
+                }
+            } else if no_else && i == 0 {
+                t = check_wrapped(body, 0);
+                if t != TY_UNIT && t != TY_NEVER {
+                    type_error_got(n, c"'if let' without else must have type '()'", t);
+                }
+                result = TY_UNIT;
+            } else if result != 0 && expected == 0 && is_integer(result) && !takes_context(body) {
+                // (0.15: two integer types join to the wider one)
+                t = join_arm(n, i, body, result, later);
+                if t != TY_NEVER {
+                    result = t;
+                }
+            } else if result != 0 {
+                t = check_wrapped(body, result);
+            } else if later && is_context_literal(body) {
+                t = TY_ERROR;
+            } else {
+                t = check_wrapped(body, 0);
+                if t != TY_NEVER {
+                    result = t;
+                    typed_at = i;
+                }
+            }
+            if t != TY_NEVER {
+                all_never = false;
+            }
+            check_scope_exit(t, locals, NODES[body].start);
+            pop_scope();
+        }
+        if later {
+            for i in 0..typed_at {
+                let body = NODES[child(n, i)].c;
+                if is_context_literal(body) {
+                    let t = check_wrapped(body, result);
+                    if result == 0 {
+                        result = t;
+                    }
+                }
+            }
+        }
+        if st != TY_NEVER && st != TY_ERROR {
+            check_arms(n, st);
+        }
+        if all_never || result == 0 {
+            return TY_NEVER;
+        }
+        result
+    }
+}

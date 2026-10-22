@@ -1,0 +1,854 @@
+// AArch64 for macOS (Apple's arm64 ABI, Mach-O) and Linux (the standard
+// AAPCS64, ELF; 0.11), as text for clang's assembler or GNU as: the a64_*
+// half of the target interface in target.vl. The two differ in symbol
+// syntax (`sym@PAGE` against `:lo12:sym`...) and in where stack and
+// variadic arguments go.
+//
+// Registers: the virtual registers are x<n> with the same number (R_ACC is
+// x0, R_RESULT x8, the ABI's indirect result register); the float
+// accumulator is d0 (s0 for f32), the second float operand d1. x16 and x17
+// are scratch; x29 is the frame pointer.
+
+use crate::base::{SYMS, buf_str, cstr};
+use crate::base::target::{APPLE_A64, ELF};
+use crate::front::consteval::{f32_bits, f64_of_bits};
+use crate::front::lexer::Tok;
+use crate::front::lexer::Tok::{Amp, Caret, Minus, Percent, Pipe, Plus, Shl, Shr, Slash, Star};
+use crate::front::types::{
+    FNS, TY_F32, TY_F64, TY_I16, TY_I32, TY_I8, TY_U16, TY_U32, TY_U64, TY_U8, align_to, int_bits,
+    is_compound, is_float, is_signed, type_size,
+};
+use crate::gen0::gen::fn_symbol_prefix;
+use crate::gen0::target::{
+    cx_fmt, emit_symbol_ref, end, end_i, function_prefix, global_prefix, ins, ins_i, local_prefix,
+    log2, o, o_label, o_str_label, oi, on, rt_panic_sym,
+};
+use crate::middle::ctx::FnCtx;
+use crate::middle::ir::Cond;
+use crate::middle::trace::trace_dump_fn;
+
+// ---- Symbols and labels ----
+
+// A label as an operand: L<n> on Mach-O, .L<n> on ELF.
+pub fn a64_label(cx: sink *FnCtx, label: i64) {
+    o_label(cx, label);
+}
+
+// "    <s> <label>\n"
+fn a64_branch(cx: sink *FnCtx, s: *u8, label: i64) {
+    unsafe {
+        o(cx, c"    ");
+        o(cx, s);
+        o(cx, c" ");
+    }
+    a64_label(cx, label);
+    on(cx);
+}
+
+// The symbol operands of AArch64 addressing: the 4 KB page of a symbol
+// (adrp), its offset in the page (add, ldr), and the same for its GOT
+// entry; `sym@PAGE`, `sym@PAGEOFF`, `sym@GOTPAGE`, `sym@GOTPAGEOFF` on
+// Mach-O, `sym`, `:lo12:sym`, `:got:sym`, `:got_lo12:sym` on ELF.
+pub const A64_PAGE: i64 = 0;
+pub const A64_PAGEOFF: i64 = 1;
+pub const A64_GOTPAGE: i64 = 2;
+pub const A64_GOTPAGEOFF: i64 = 3;
+
+fn a64_modifier_before(cx: sink *FnCtx, kind: i64) {
+    unsafe {
+        if ELF {
+            o(cx, if kind == A64_PAGEOFF { c":lo12:" } else if kind == A64_GOTPAGE { c":got:" }
+                else if kind == A64_GOTPAGEOFF { c":got_lo12:" } else { c"" });
+        }
+    }
+}
+
+fn a64_modifier_after(cx: sink *FnCtx, kind: i64) {
+    unsafe {
+        if !ELF {
+            o(cx, if kind == A64_PAGE { c"@PAGE" } else if kind == A64_PAGEOFF { c"@PAGEOFF" }
+                else if kind == A64_GOTPAGE { c"@GOTPAGE" } else { c"@GOTPAGEOFF" });
+        }
+    }
+}
+
+// <prefix><name> with modifier `kind`.
+pub fn a64_sym(cx: sink *FnCtx, prefix: *u8, name: i64, kind: i64) {
+    a64_modifier_before(cx, kind);
+    emit_symbol_ref(cx, prefix, name);
+    a64_modifier_after(cx, kind);
+}
+
+// String literal `id` (a local label) with modifier `kind`.
+pub fn a64_str_sym(cx: sink *FnCtx, id: i64, kind: i64) {
+    a64_modifier_before(cx, kind);
+    o_str_label(cx, id);
+    a64_modifier_after(cx, kind);
+}
+
+// ---- Control flow ----
+
+pub fn a64_jump(cx: sink *FnCtx, label: i64) {
+    unsafe { a64_branch(cx, c"b", label); }
+}
+
+pub fn a64_jump_if_zero(cx: sink *FnCtx, label: i64) {
+    unsafe { a64_branch(cx, c"cbz x0,", label); }
+}
+
+pub fn a64_jump_if_nonzero(cx: sink *FnCtx, label: i64) {
+    unsafe { a64_branch(cx, c"cbnz x0,", label); }
+}
+
+pub fn a64_decrement(cx: sink *FnCtx, reg: i64) {
+    unsafe {
+        o(cx, c"    subs x");
+        oi(cx, reg);
+        o(cx, c", x");
+        oi(cx, reg);
+        o(cx, c", #1\n");
+    }
+}
+
+pub fn a64_jump_unless_zero_result(cx: sink *FnCtx, label: i64) {
+    unsafe { a64_branch(cx, c"b.ne", label); }
+}
+
+pub fn a64_compare_jump(cx: sink *FnCtx, op: Cond, signed: bool, label: i64) {
+    unsafe {
+        ins(cx, c"cmp x0, x1");
+        o(cx, c"    b.");
+        o(cx, a64_condition(op, signed, float: false));
+        o(cx, c" ");
+    }
+    a64_label(cx, label);
+    on(cx);
+}
+
+// ---- Constants and addresses ----
+
+pub fn a64_load_imm(cx: sink *FnCtx, reg: i64, value: u64) {
+    unsafe {
+        var first = true;
+        for chunk in 0..4 {
+            let part = (value >> (chunk * 16) as u64) & 0xffff;
+            if part != 0 || (chunk == 3 && first) {
+                if first {
+                    o(cx, c"    movz x");
+                } else {
+                    o(cx, c"    movk x");
+                }
+                oi(cx, reg);
+                o(cx, c", #");
+                oi(cx, part as i64);
+                if chunk > 0 {
+                    o(cx, c", lsl #");
+                    oi(cx, chunk * 16);
+                }
+                on(cx);
+                first = false;
+            }
+        }
+    }
+}
+
+// reg &= -align (align a power of two: a logical immediate).
+pub fn a64_align_down(cx: sink *FnCtx, reg: i64, align: i64) {
+    unsafe {
+        o(cx, c"    and x");
+        oi(cx, reg);
+        o(cx, c", x");
+        oi(cx, reg);
+        end_i(cx, c", #", 0 - align, c"");
+    }
+}
+
+pub fn a64_frame_addr(cx: sink *FnCtx, reg: i64, offset: i64) {
+    unsafe {
+        if offset < 4096 {
+            o(cx, c"    sub x");
+            oi(cx, reg);
+            end_i(cx, c", x29, #", offset, c"");
+            return;
+        }
+        a64_load_imm(cx, 17, offset as u64);
+        o(cx, c"    sub x");
+        oi(cx, reg);
+        end(cx, c", x29, x17");
+    }
+}
+
+pub fn a64_add_imm(cx: sink *FnCtx, reg: i64, value: i64) {
+    unsafe {
+        if value == 0 {
+            return;
+        }
+        if value > 0 && value < 4096 {
+            o(cx, c"    add x");
+            oi(cx, reg);
+            o(cx, c", x");
+            oi(cx, reg);
+            end_i(cx, c", #", value, c"");
+            return;
+        }
+        a64_load_imm(cx, 17, value as u64);
+        o(cx, c"    add x");
+        oi(cx, reg);
+        o(cx, c", x");
+        oi(cx, reg);
+        end(cx, c", x17");
+    }
+}
+
+pub fn a64_local_symbol_addr(cx: sink *FnCtx, prefix: *u8, name: i64) {
+    unsafe {
+        o(cx, c"    adrp x0, ");
+        a64_sym(cx, prefix, name, A64_PAGE);
+        o(cx, c"\n    add x0, x0, ");
+        a64_sym(cx, prefix, name, A64_PAGEOFF);
+        on(cx);
+    }
+}
+
+// Through the GOT.
+pub fn a64_extern_symbol_addr(cx: sink *FnCtx, name: i64) {
+    unsafe {
+        o(cx, c"    adrp x0, ");
+        a64_sym(cx, global_prefix(), name, A64_GOTPAGE);
+        o(cx, c"\n    ldr x0, [x0, ");
+        a64_sym(cx, global_prefix(), name, A64_GOTPAGEOFF);
+        o(cx, c"]\n");
+    }
+}
+
+pub fn a64_string_addr(cx: sink *FnCtx, id: i64) {
+    unsafe {
+        o(cx, c"    adrp x0, ");
+        a64_str_sym(cx, id, A64_PAGE);
+        o(cx, c"\n    add x0, x0, ");
+        a64_str_sym(cx, id, A64_PAGEOFF);
+        on(cx);
+    }
+}
+
+pub fn a64_load_float(cx: sink *FnCtx, bits: i64, ty: i64) {
+    unsafe {
+        if ty == TY_F32 {
+            a64_load_imm(cx, 16, f32_bits(f64_of_bits(bits)));
+            ins(cx, c"fmov s0, w16");
+        } else {
+            a64_load_imm(cx, 16, bits as u64);
+            ins(cx, c"fmov d0, x16");
+        }
+    }
+}
+
+// ---- Temporaries ----
+
+pub fn a64_push_int(cx: sink *FnCtx) {
+    unsafe { ins(cx, c"str x0, [sp, #-16]!"); }
+}
+
+pub fn a64_push_float(cx: sink *FnCtx) {
+    unsafe { ins(cx, c"str d0, [sp, #-16]!"); }
+}
+
+pub fn a64_pop_int(cx: sink *FnCtx, reg: i64) {
+    unsafe { ins_i(cx, c"ldr x", reg, c", [sp], #16"); }
+}
+
+pub fn a64_pop_float(cx: sink *FnCtx, reg: i64) {
+    unsafe { ins_i(cx, c"ldr d", reg, c", [sp], #16"); }
+}
+
+pub fn a64_peek(cx: sink *FnCtx, reg: i64) {
+    unsafe { ins_i(cx, c"ldr x", reg, c", [sp]"); }
+}
+
+pub fn a64_peek_at(cx: sink *FnCtx, reg: i64, depth: i64, float: bool) {
+    unsafe {
+        o(cx, if float { c"    ldr d" } else { c"    ldr x" });
+        oi(cx, reg);
+        end_i(cx, c", [sp, #", depth * 16, c"]");
+    }
+}
+
+pub fn a64_drop_temps(cx: sink *FnCtx, count: i64) {
+    unsafe { ins_i(cx, c"add sp, sp, #", count * 16, c""); }
+}
+
+// ---- Loads and stores ----
+
+pub fn a64_load(cx: sink *FnCtx, ty: i64, addr: i64) {
+    unsafe {
+        let size = type_size(ty);
+        if ty == TY_F32 {
+            ins_i(cx, c"ldr s0, [x", addr, c"]");
+        } else if ty == TY_F64 {
+            ins_i(cx, c"ldr d0, [x", addr, c"]");
+        } else if ty == TY_I8 {
+            ins_i(cx, c"ldrsb x0, [x", addr, c"]");
+        } else if size == 1 {
+            ins_i(cx, c"ldrb w0, [x", addr, c"]");
+        } else if ty == TY_I16 {
+            ins_i(cx, c"ldrsh x0, [x", addr, c"]");
+        } else if size == 2 {
+            ins_i(cx, c"ldrh w0, [x", addr, c"]");
+        } else if ty == TY_I32 {
+            ins_i(cx, c"ldrsw x0, [x", addr, c"]");
+        } else if size == 4 {
+            ins_i(cx, c"ldr w0, [x", addr, c"]");
+        } else {
+            ins_i(cx, c"ldr x0, [x", addr, c"]");
+        }
+    }
+}
+
+pub fn a64_load_reg(cx: sink *FnCtx, reg: i64, addr: i64) {
+    unsafe {
+        o(cx, c"    ldr x");
+        oi(cx, reg);
+        end_i(cx, c", [x", addr, c"]");
+    }
+}
+
+pub fn a64_store(cx: sink *FnCtx, ty: i64, reg: i64, addr: i64) {
+    unsafe {
+        let size = type_size(ty);
+        if ty == TY_F32 {
+            o(cx, c"    str s");
+        } else if ty == TY_F64 {
+            o(cx, c"    str d");
+        } else if size == 1 {
+            o(cx, c"    strb w");
+        } else if size == 2 {
+            o(cx, c"    strh w");
+        } else if size == 4 {
+            o(cx, c"    str w");
+        } else {
+            o(cx, c"    str x");
+        }
+        oi(cx, reg);
+        end_i(cx, c", [x", addr, c"]");
+    }
+}
+
+pub fn a64_store_offset(cx: sink *FnCtx, reg: i64, addr: i64, offset: i64) {
+    unsafe {
+        o(cx, c"    str x");
+        oi(cx, reg);
+        o(cx, c", [x");
+        oi(cx, addr);
+        end_i(cx, c", #", offset, c"]");
+    }
+}
+
+pub fn a64_copy(cx: sink *FnCtx, size: i64) {
+    unsafe {
+        if size > 128 {
+            ins(cx, c"mov x16, x0");
+            ins(cx, c"mov x0, x1");
+            ins(cx, c"mov x1, x16");
+            a64_load_imm(cx, 2, size as u64);
+            a64_call_c(cx, c"memcpy");
+            return;
+        }
+        var offset = 0;
+        while offset + 8 <= size {
+            ins_i(cx, c"ldr x16, [x0, #", offset, c"]");
+            ins_i(cx, c"str x16, [x1, #", offset, c"]");
+            offset += 8;
+        }
+        if offset + 4 <= size {
+            ins_i(cx, c"ldr w16, [x0, #", offset, c"]");
+            ins_i(cx, c"str w16, [x1, #", offset, c"]");
+            offset += 4;
+        }
+        if offset + 2 <= size {
+            ins_i(cx, c"ldrh w16, [x0, #", offset, c"]");
+            ins_i(cx, c"strh w16, [x1, #", offset, c"]");
+            offset += 2;
+        }
+        if offset < size {
+            ins_i(cx, c"ldrb w16, [x0, #", offset, c"]");
+            ins_i(cx, c"strb w16, [x1, #", offset, c"]");
+        }
+    }
+}
+
+pub fn a64_move_to_second(cx: sink *FnCtx, ty: i64) {
+    unsafe {
+        if is_float(ty) {
+            ins(cx, c"fmov d1, d0");
+        } else {
+            ins(cx, c"mov x1, x0");
+        }
+    }
+}
+
+// ---- Integer operations ----
+
+pub fn a64_normalize(cx: sink *FnCtx, ty: i64) {
+    unsafe {
+        if ty == TY_I8 { ins(cx, c"sxtb x0, w0"); }
+        else if ty == TY_U8 { ins(cx, c"and x0, x0, #0xff"); }
+        else if ty == TY_I16 { ins(cx, c"sxth x0, w0"); }
+        else if ty == TY_U16 { ins(cx, c"and x0, x0, #0xffff"); }
+        else if ty == TY_I32 { ins(cx, c"sxtw x0, w0"); }
+        else if ty == TY_U32 { ins(cx, c"mov w0, w0"); }
+    }
+}
+
+// Division by zero gives 0 (and the remainder the dividend), as sdiv and
+// udiv do; the x86-64 target matches this.
+pub fn a64_int_binary(cx: sink *FnCtx, op: Tok, ty: i64) {
+    unsafe {
+        let signed = is_signed(ty);
+        match op {
+            Plus => ins(cx, c"add x0, x0, x1"),
+            Minus => ins(cx, c"sub x0, x0, x1"),
+            Star => ins(cx, c"mul x0, x0, x1"),
+            Slash => ins(cx, if signed { c"sdiv x0, x0, x1" } else { c"udiv x0, x0, x1" }),
+            Percent => {
+                ins(cx, if signed { c"sdiv x16, x0, x1" } else { c"udiv x16, x0, x1" });
+                ins(cx, c"msub x0, x16, x1, x0");
+            }
+            Amp => ins(cx, c"and x0, x0, x1"),
+            Pipe => ins(cx, c"orr x0, x0, x1"),
+            Caret => ins(cx, c"eor x0, x0, x1"),
+            Shl | Shr => {
+                // The amount is taken modulo 32 for types up to 32 bits (8- and
+                // 16-bit values are shifted at 32 bits), modulo 64 for 64-bit ones.
+                ins(cx, if int_bits(ty) == 64 { c"and x1, x1, #63" } else { c"and x1, x1, #31" });
+                if op == Shl {
+                    ins(cx, c"lsl x0, x0, x1");
+                } else if signed {
+                    ins(cx, c"asr x0, x0, x1");
+                } else {
+                    ins(cx, c"lsr x0, x0, x1");
+                }
+            }
+            _ => {}
+        }
+        a64_normalize(cx, ty);
+    }
+}
+
+// The condition code of a comparison.
+pub fn a64_condition(op: Cond, signed: bool, float: bool) -> *u8 {
+    match op {
+        Cond::Eq => c"eq",
+        Cond::Ne => c"ne",
+        // False when unordered (NaN).
+        Cond::Lt if float => c"mi",
+        Cond::Le if float => c"ls",
+        Cond::Gt if float => c"gt",
+        Cond::Ge if float => c"ge",
+        Cond::Lt => if signed { c"lt" } else { c"lo" },
+        Cond::Le => if signed { c"le" } else { c"ls" },
+        Cond::Gt => if signed { c"gt" } else { c"hi" },
+        Cond::Ge => if signed { c"ge" } else { c"hs" },
+    }
+}
+
+pub fn a64_compare(cx: sink *FnCtx, op: Cond, ty: i64) {
+    unsafe {
+        let float = is_float(ty);
+        if ty == TY_F32 {
+            ins(cx, c"fcmp s0, s1");
+        } else if ty == TY_F64 {
+            ins(cx, c"fcmp d0, d1");
+        } else {
+            ins(cx, c"cmp x0, x1");
+        }
+        o(cx, c"    cset x0, ");
+        o(cx, a64_condition(op, is_signed(ty), float));
+        on(cx);
+    }
+}
+
+pub fn a64_negate(cx: sink *FnCtx, ty: i64) {
+    unsafe {
+        if ty == TY_F32 {
+            ins(cx, c"fneg s0, s0");
+        } else if ty == TY_F64 {
+            ins(cx, c"fneg d0, d0");
+        } else {
+            ins(cx, c"neg x0, x0");
+            a64_normalize(cx, ty);
+        }
+    }
+}
+
+pub fn a64_not_bool(cx: sink *FnCtx) {
+    unsafe { ins(cx, c"eor x0, x0, #1"); }
+}
+
+pub fn a64_bitnot(cx: sink *FnCtx, ty: i64) {
+    unsafe { ins(cx, c"mvn x0, x0"); }
+    a64_normalize(cx, ty);
+}
+
+pub fn a64_index_addr(cx: sink *FnCtx, elem_size: i64) {
+    unsafe {
+        if elem_size == 1 {
+            ins(cx, c"add x0, x1, x0");
+        } else if elem_size > 0 && (elem_size & (elem_size - 1)) == 0 {
+            ins_i(cx, c"add x0, x1, x0, lsl #", log2(elem_size), c"");
+        } else {
+            a64_load_imm(cx, 16, elem_size as u64);
+            ins(cx, c"madd x0, x0, x16, x1");
+        }
+    }
+}
+
+// ---- Floats ----
+
+pub fn a64_float_binary(cx: sink *FnCtx, op: Tok, ty: i64) {
+    unsafe {
+        let r = if ty == TY_F32 { c"s" } else { c"d" };
+        if op == Percent {
+            a64_call_c(cx, if ty == TY_F32 { c"fmodf" } else { c"fmod" });
+            return;
+        }
+        o(cx, match op {
+            Plus => c"    fadd ",
+            Minus => c"    fsub ",
+            Star => c"    fmul ",
+            _ => c"    fdiv ",
+        });
+        o(cx, r);
+        o(cx, c"0, ");
+        o(cx, r);
+        o(cx, c"0, ");
+        o(cx, r);
+        o(cx, c"1\n");
+    }
+}
+
+pub fn a64_int_to_float(cx: sink *FnCtx, from: i64, to: i64) {
+    let reg = if to == TY_F32 { c"s0" } else { c"d0" };
+    unsafe {
+        o(cx, if is_signed(from) { c"    scvtf " } else { c"    ucvtf " });
+        o(cx, reg);
+        o(cx, c", x0\n");
+    }
+}
+
+pub fn a64_float_to_float(cx: sink *FnCtx, to: i64) {
+    unsafe { ins(cx, if to == TY_F64 { c"fcvt d0, s0" } else { c"fcvt s0, d0" }); }
+}
+
+pub fn a64_float_to_int(cx: sink *FnCtx, from: i64, to: i64) {
+    unsafe {
+        let src = if from == TY_F32 { c"s0" } else { c"d0" };
+        if is_signed(to) && int_bits(to) <= 32 {
+            o(cx, c"    fcvtzs w0, ");
+            o(cx, src);
+            on(cx);
+            ins(cx, c"sxtw x0, w0");
+        } else if to != TY_U64 {
+            o(cx, c"    fcvtzs x0, ");
+            o(cx, src);
+            on(cx);
+        } else {
+            // x0 = value >= 2^63 ? fcvtzu(value) : fcvtzs(value)
+            o(cx, c"    fcvtzs x16, ");
+            o(cx, src);
+            on(cx);
+            o(cx, c"    fcvtzu x17, ");
+            o(cx, src);
+            on(cx);
+            if from == TY_F32 {
+                a64_load_imm(cx, 9, 0x5f000000);
+                ins(cx, c"fmov s1, w9");
+                ins(cx, c"fcmp s0, s1");
+            } else {
+                a64_load_imm(cx, 9, 0x43e0000000000000);
+                ins(cx, c"fmov d1, x9");
+                ins(cx, c"fcmp d0, d1");
+            }
+            ins(cx, c"csel x0, x17, x16, ge");
+        }
+        a64_normalize(cx, to);
+    }
+}
+
+// ---- Functions ----
+
+pub fn a64_function_start(cx: sink *FnCtx, symbol_prefix: *u8, name: i64, global: bool) {
+    unsafe {
+        let out = cx.asm;
+        buf_str(out, c"\n.p2align 2\n");
+        if global {
+            cx_fmt(cx, out, f".globl {cstr(symbol_prefix)}{SYMS[name].text}\n");
+        }
+        cx_fmt(cx, out, f"{cstr(symbol_prefix)}{SYMS[name].text}:\n");
+        buf_str(out, c"    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n");
+    }
+}
+
+pub fn a64_frame_reserve(cx: sink *FnCtx, size: i64) {
+    unsafe {
+        if size < 4096 {
+            ins_i(cx, c"sub sp, sp, #", size, c"");
+        } else {
+            a64_load_imm(cx, 16, size as u64);
+            ins(cx, c"sub sp, sp, x16");
+        }
+    }
+}
+
+pub fn a64_epilogue(cx: sink *FnCtx) {
+    unsafe {
+        ins(cx, c"mov sp, x29");
+        ins(cx, c"ldp x29, x30, [sp], #16");
+        ins(cx, c"ret");
+    }
+}
+
+// ---- Calls ----
+
+pub fn a64_arg_location(ty: i64, state: *i64) -> i64 {
+    unsafe {
+        if is_float(ty) {
+            if state[1] < 8 {
+                state[1] += 1;
+                return 8 + state[1] - 1;
+            }
+        } else if state[0] < 8 {
+            state[0] += 1;
+            return state[0] - 1;
+        }
+        // Apple's arm64 ABI packs stack arguments at their natural alignment;
+        // AAPCS64 gives each one an 8-byte slot.
+        let size = if is_compound(ty) || !APPLE_A64 { 8 } else { type_size(ty) };
+        state[2] = align_to(state[2], size);
+        let offset = state[2];
+        state[2] += size;
+        16 + offset
+    }
+}
+
+// Apple's arm64 ABI: variadic arguments go on the stack, each in an 8-byte
+// slot.
+pub fn a64_variadic_arg_location(state: *i64) -> i64 {
+    unsafe {
+        state[2] = align_to(state[2], 8);
+        let location = 16 + state[2];
+        state[2] += 8;
+        location
+    }
+}
+
+pub fn a64_load_param(cx: sink *FnCtx, location: i64, ty: i64) {
+    unsafe {
+        if location < 8 {
+            ins_i(cx, c"mov x0, x", location, c"");
+        } else if location < 16 {
+            ins_i(cx, c"fmov d0, d", location - 8, c"");
+        } else {
+            ins_i(cx, c"add x9, x29, #", location, c"");
+            a64_load(cx, ty, 9);
+        }
+    }
+}
+
+pub fn a64_sp_sub(cx: sink *FnCtx, size: i64) {
+    unsafe { ins_i(cx, c"sub sp, sp, #", size, c""); }
+}
+
+pub fn a64_sp_add(cx: sink *FnCtx, size: i64) {
+    a64_load_imm(cx, 16, size as u64);
+    unsafe { ins(cx, c"add sp, sp, x16"); }
+}
+
+pub fn a64_load_arg_reg(cx: sink *FnCtx, location: i64, ty: i64, from: i64, promote: bool) {
+    unsafe {
+        if location >= 8 {
+            o(cx, if ty == TY_F32 { c"    ldr s" } else { c"    ldr d" });
+            oi(cx, location - 8);
+            if ty == TY_F32 && promote {
+                // A variadic f32 in a register (AAPCS64), as C's double.
+                end_i(cx, c", [sp, #", from, c"]");
+                o(cx, c"    fcvt d");
+                oi(cx, location - 8);
+                o(cx, c", s");
+                oi(cx, location - 8);
+                on(cx);
+                return;
+            }
+        } else {
+            o(cx, c"    ldr x");
+            oi(cx, location);
+        }
+        end_i(cx, c", [sp, #", from, c"]");
+    }
+}
+
+pub fn a64_stack_arg(cx: sink *FnCtx, ty: i64, from: i64, offset: i64, promote: bool) {
+    unsafe {
+        if is_float(ty) {
+            if ty == TY_F32 {
+                ins_i(cx, c"ldr s16, [sp, #", from, c"]");
+                if promote {
+                    ins(cx, c"fcvt d16, s16");
+                    ins_i(cx, c"str d16, [sp, #", offset, c"]");
+                } else {
+                    ins_i(cx, c"str s16, [sp, #", offset, c"]");
+                }
+            } else {
+                ins_i(cx, c"ldr d16, [sp, #", from, c"]");
+                ins_i(cx, c"str d16, [sp, #", offset, c"]");
+            }
+            return;
+        }
+        ins_i(cx, c"ldr x16, [sp, #", from, c"]");
+        let size = if is_compound(ty) || promote || !APPLE_A64 { 8 } else { type_size(ty) };
+        if size == 1 {
+            ins_i(cx, c"strb w16, [sp, #", offset, c"]");
+        } else if size == 2 {
+            ins_i(cx, c"strh w16, [sp, #", offset, c"]");
+        } else if size == 4 {
+            ins_i(cx, c"str w16, [sp, #", offset, c"]");
+        } else {
+            ins_i(cx, c"str x16, [sp, #", offset, c"]");
+        }
+    }
+}
+
+pub fn a64_load_callee(cx: sink *FnCtx, from: i64) {
+    unsafe { ins_i(cx, c"ldr x16, [sp, #", from, c"]"); }
+}
+
+pub fn a64_call(cx: sink *FnCtx, prefix: *u8, name: i64) {
+    unsafe { o(cx, c"    bl "); }
+    emit_symbol_ref(cx, prefix, name);
+    on(cx);
+}
+
+// Calls the C library's function `name`.
+pub fn a64_call_c(cx: sink *FnCtx, name: *u8) {
+    unsafe {
+        o(cx, c"    bl ");
+        o(cx, global_prefix());
+        o(cx, name);
+    }
+    on(cx);
+}
+
+pub fn a64_call_indirect(cx: sink *FnCtx) {
+    unsafe { ins(cx, c"blr x16"); }
+}
+
+// ---- Run-time checks ----
+
+// (0.18) site: the check's site (front/contracts/sites.vl), 0 for none,
+// in x4.
+pub fn a64_panic(cx: sink *FnCtx, kind: i64, site: i64) {
+    unsafe {
+        ins(cx, c"mov x3, x9");
+        ins(cx, c"mov x2, x1");
+        ins(cx, c"mov x1, x0");
+        ins_i(cx, c"mov x0, #", kind, c"");
+        if site >= 0 {
+            a64_load_imm(cx, 4, site as u64);
+        }
+        o(cx, c"    bl ");
+        emit_symbol_ref(cx, function_prefix(), rt_panic_sym());
+    }
+    on(cx);
+}
+
+// rt.panic(kind, a, b, c, site): (0.18) when site is not 0,
+// dprintf(2, "%s:%u:%u: ", file, line, column) from the site tables;
+// then dprintf(2, message[kind], a, b, c); (--trace) __trace::dump();
+// exit(101). The messages are a table of 32-bit offsets from
+// rt.messages, the sites one of (line, file << 16 | column) pairs and the
+// files one of offsets from rt.files (emit_runtime).
+// Apple's arm64 ABI passes the variadic arguments on the stack, AAPCS64 in
+// registers.
+pub fn a64_runtime(cx: sink *FnCtx) {
+    unsafe {
+        o(cx, c"\n.p2align 2\n");
+        emit_symbol_ref(cx, function_prefix(), rt_panic_sym());
+        o(cx, c":\n");
+        ins(cx, c"stp x29, x30, [sp, #-16]!");
+        ins(cx, c"mov x29, sp");
+        ins(cx, c"sub sp, sp, #64");
+        ins(cx, c"stp x0, x1, [sp, #32]");
+        ins(cx, c"stp x2, x3, [sp, #48]");
+        o(cx, c"    cbz x4, ");
+        o(cx, local_prefix());
+        o(cx, c"rt.nosite\n");
+        a64_rt_addr(cx, 8, c"rt.sites");
+        ins(cx, c"add x9, x8, x4, lsl #3");
+        ins(cx, c"ldr w11, [x9]");
+        ins(cx, c"ldr w12, [x9, #4]");
+        ins(cx, c"ubfx x10, x12, #16, #16");
+        ins(cx, c"ubfx x12, x12, #0, #16");
+        a64_rt_addr(cx, 8, c"rt.files");
+        ins(cx, c"ldrsw x13, [x8, x10, lsl #2]");
+        ins(cx, c"add x13, x8, x13");
+        if APPLE_A64 {
+            ins(cx, c"stp x13, x11, [sp]");
+            ins(cx, c"str x12, [sp, #16]");
+        } else {
+            ins(cx, c"mov x2, x13");
+            ins(cx, c"mov x3, x11");
+            ins(cx, c"mov x4, x12");
+        }
+        a64_rt_addr(cx, 1, c"rt.at");
+        ins(cx, c"mov w0, #2");
+        a64_call_c(cx, c"dprintf");
+        o(cx, local_prefix());
+        o(cx, c"rt.nosite:\n");
+        ins(cx, c"ldp x0, x1, [sp, #32]");
+        ins(cx, c"ldp x2, x3, [sp, #48]");
+        if APPLE_A64 {
+            ins(cx, c"stp x1, x2, [sp]");
+            ins(cx, c"str x3, [sp, #16]");
+        } else {
+            ins(cx, c"mov x4, x3");
+            ins(cx, c"mov x3, x2");
+            ins(cx, c"mov x2, x1");
+        }
+        a64_rt_addr(cx, 8, c"rt.messages");
+        ins(cx, c"ldrsw x9, [x8, x0, lsl #2]");
+        ins(cx, c"add x1, x8, x9");
+        ins(cx, c"mov w0, #2");
+        a64_call_c(cx, c"dprintf");
+        // (0.17) --trace: the frames.
+        let dump = trace_dump_fn();
+        if dump >= 0 {
+            o(cx, c"    bl ");
+            emit_symbol_ref(cx, fn_symbol_prefix(dump), FNS[dump].name);
+            on(cx);
+        }
+        ins(cx, c"mov w0, #101");
+        a64_call_c(cx, c"exit");
+    }
+}
+
+// (0.18) x`reg` = the address of the run-time helper's local label `name`.
+fn a64_rt_addr(cx: sink *FnCtx, reg: i64, name: *u8) {
+    unsafe {
+        o(cx, c"    adrp x");
+        oi(cx, reg);
+        o(cx, c", ");
+        a64_modifier_before(cx, A64_PAGE);
+        o(cx, local_prefix());
+        o(cx, name);
+        a64_modifier_after(cx, A64_PAGE);
+        o(cx, c"\n    add x");
+        oi(cx, reg);
+        o(cx, c", x");
+        oi(cx, reg);
+        o(cx, c", ");
+        a64_modifier_before(cx, A64_PAGEOFF);
+        o(cx, local_prefix());
+        o(cx, name);
+        a64_modifier_after(cx, A64_PAGEOFF);
+        on(cx);
+    }
+}

@@ -1,0 +1,594 @@
+// The C calling convention for aggregates (structs, tuples, arrays, enums
+// with fields and slices passed or returned by value), shared by the -O0
+// code generator and the IR back end, so that every function follows C's
+// convention and can be handed to C.
+//
+// AArch64 (AAPCS64; Apple's variant on macOS): a homogeneous float
+// aggregate (one to four floats of one type) goes in consecutive v
+// registers, or entirely on the stack (and no further v register is used);
+// another aggregate of up to 16 bytes goes in one or two x registers (an
+// aligned pair for one aligned to 16, except on Apple's), or entirely on
+// the stack (and no further x register is used); a larger one is copied by
+// the caller and passed by reference. Results: an HFA in v0-v3, up to 16
+// bytes in x0/x1, larger ones through the pointer in x8. On the stack,
+// AAPCS64 gives every argument 8-byte slots; Apple's packs scalars and
+// homogeneous float aggregates at their alignment, and passes every
+// variadic argument on the stack, where AAPCS64 passes them as named ones.
+//
+// x86-64 (System V): an aggregate of up to 16 bytes is split into
+// eightbytes, each INTEGER (an rdi/rsi/... register) when it holds any
+// non-float, else SSE (an xmm register); it goes in registers only when
+// all of its eightbytes fit, else entirely on the stack (and the registers
+// stay available). A larger one (MEMORY) is copied onto the stack. Results:
+// INTEGER eightbytes in rax then rdx, SSE ones in xmm0 then xmm1; MEMORY
+// ones through a hidden pointer (the first argument), returned in rax.
+//
+// An aggregate passed in registers is a list of pieces: (scalar type,
+// offset). A piece is read and written whole, so the memory holding such an
+// aggregate is a multiple of 8 bytes (frame slots are; see new_slot_for).
+
+// How a value is passed.
+use crate::back::regalloc::intervals::min_i64;
+use crate::base::target::{APPLE_A64, X86};
+use crate::front::ast::{REPR_C, REPR_PACKED};
+use crate::front::distinct::enum_niche;
+use crate::front::types::{
+    ENUMS, FNS, STRUCTS, TYPES, TY_F32, TY_F64, TY_U16, TY_U32, TY_U64, TY_U8, TyKind, VARIANTS,
+    align_to, enum_variant, field_offset, in_fregs, is_compound, is_float, is_vector, is_void,
+    max_i64, scalar_type, struct_field, tuple_offset, type_align, type_elem, type_size,
+    variant_field, variant_field_offset, vector_half,
+};
+use crate::gen0::gen::MAIN_SYM;
+use crate::middle::ctx::FnCtx;
+use crate::middle::ir::ir_type;
+use crate::middle::opt::OPT_LEVEL;
+
+pub enum AbiClass {
+    // A scalar, in a register (or a stack slot).
+    Scalar,
+    // In registers (or on the stack, in the same layout), as pieces.
+    Pieces,
+    // By reference: a pointer to a copy (AArch64, over 16 bytes).
+    Ref,
+    // Copied onto the stack (x86-64 MEMORY, over 16 bytes); results of
+    // both kinds go through a result pointer.
+    Stack,
+}
+
+// How a value of type `ty` is passed; for AbiClass::Pieces, its pieces.
+pub fn abi_classify(cx: sink *FnCtx, ty: i64) -> AbiClass {
+    unsafe {
+        cx.abi_piece_count = 0;
+        if !is_compound(ty) {
+            return AbiClass::Scalar;
+        }
+        let size = type_size(ty);
+        cx.abi_leaves.count = 0;
+        abi_leaves(cx, ty, 0);
+        if !X86 {
+            var elem = 0;
+            var count = 0;
+            if is_hfa(cx, size, &elem, &count) {
+                for i in 0..count {
+                    abi_add_piece(cx, elem, i * type_size(elem));
+                }
+                return AbiClass::Pieces;
+            }
+            if size > 16 {
+                return AbiClass::Ref;
+            }
+            var offset = 0;
+            while offset < size {
+                abi_add_piece(cx, int_piece_type(size - offset), offset);
+                offset += 8;
+            }
+            return AbiClass::Pieces;
+        }
+        if size > 16 || has_unaligned_leaf(cx) {
+            return AbiClass::Stack;
+        }
+        var offset = 0;
+        while offset < size {
+            let chunk = min_i64(8, size - offset);
+            var integer = false;
+            var f32_only = true;
+            var any = false;
+            var i = 0;
+            while i < cx.abi_leaves.count {
+                let at = cx.abi_leaves.data[i];
+                let leaf = cx.abi_leaves.data[i + 1];
+                if at < offset + 8 && at + type_size(leaf) > offset {
+                    any = true;
+                    if !is_float(leaf) {
+                        integer = true;
+                    }
+                    if leaf != TY_F32 {
+                        f32_only = false;
+                    }
+                }
+                i += 2;
+            }
+            if !any {
+                // Padding only (NO_CLASS): no register.
+            } else if integer {
+                abi_add_piece(cx, int_piece_type(chunk), offset);
+            } else if f32_only && chunk <= 4 {
+                abi_add_piece(cx, TY_F32, offset);
+            } else {
+                abi_add_piece(cx, TY_F64, offset);
+            }
+            offset += 8;
+        }
+        AbiClass::Pieces
+    }
+}
+
+// Whether a leaf sits at an offset that is not a multiple of its
+// alignment (in a packed struct): such aggregates are MEMORY on x86-64.
+fn has_unaligned_leaf(cx: sink *FnCtx) -> bool {
+    var i = 0;
+    while unsafe { i < cx.abi_leaves.count } {
+        if unsafe { cx.abi_leaves.data[i] % type_align(cx.abi_leaves.data[i + 1]) != 0 } {
+            return true;
+        }
+        i += 2;
+    }
+    false
+}
+
+fn abi_add_piece(cx: sink *FnCtx, ty: i64, offset: i64) {
+    unsafe {
+        cx.abi_piece_ty[cx.abi_piece_count] = ty;
+        cx.abi_piece_offset[cx.abi_piece_count] = offset;
+        cx.abi_piece_count += 1;
+    }
+}
+
+// The integer type of a piece of `left` bytes (read whole: 3 bytes are
+// read as 4, 5 to 8 as 8).
+fn int_piece_type(left: i64) -> i64 {
+    if left >= 5 { return TY_U64; }
+    if left >= 3 { return TY_U32; }
+    if left == 2 { return TY_U16; }
+    TY_U8
+}
+
+// Appends the scalar leaves of `ty` at `offset` to ABI_LEAVES; the fields
+// of every variant of an enum overlap (a union).
+pub fn abi_leaves(cx: sink *FnCtx, ty: i64, offset: i64) {
+    unsafe {
+        let kind = TYPES[ty].kind;
+        if kind == TyKind::Vector {
+            if cx.leaves_whole_vectors && type_size(ty) == 32 {
+                // (0.19: a 256-bit vector is two 128-bit halves,
+                // middle/lower/vector.vl)
+                let half = vector_half(ty);
+                cx.abi_leaves.push(offset);
+                cx.abi_leaves.push(half);
+                cx.abi_leaves.push(offset + 16);
+                cx.abi_leaves.push(half);
+                return;
+            }
+            if cx.leaves_whole_vectors {
+                cx.abi_leaves.push(offset);
+                cx.abi_leaves.push(ty);
+                return;
+            }
+            let elem = TYPES[ty].a;
+            for i in 0..TYPES[ty].b {
+                abi_leaves(cx, elem, offset + i * type_size(elem));
+            }
+        } else if kind == TyKind::Struct {
+            let s = TYPES[ty].a;
+            for i in 0..STRUCTS[s].field_count {
+                abi_leaves(cx, (*struct_field(s, i)).ty, offset + struct_offset(cx, s, i));
+            }
+        } else if kind == TyKind::Tuple {
+            for i in 0..TYPES[ty].count {
+                abi_leaves(cx, type_elem(ty, i), offset + tuple_offset(ty, i));
+            }
+        } else if kind == TyKind::Array {
+            let elem = TYPES[ty].a;
+            for i in 0..TYPES[ty].b {
+                abi_leaves(cx, elem, offset + i * type_size(elem));
+            }
+        } else if kind == TyKind::Slice {
+            cx.abi_leaves.push(offset);
+            cx.abi_leaves.push(TY_U64);
+            cx.abi_leaves.push(offset + 8);
+            cx.abi_leaves.push(TY_U64);
+        } else if kind == TyKind::Enum && is_compound(ty) && enum_niche(TYPES[ty].a) {
+            // (0.18: the null niche: one pointer)
+            cx.abi_leaves.push(offset);
+            cx.abi_leaves.push(TY_U64);
+        } else if kind == TyKind::Enum && is_compound(ty) {
+            let e = TYPES[ty].a;
+            cx.abi_leaves.push(offset);
+            cx.abi_leaves.push(ENUMS[e].tag);
+            for i in 0..ENUMS[e].variant_count {
+                let v = enum_variant(e, i);
+                for k in 0..VARIANTS[v].field_count {
+                    abi_leaves(cx, variant_field(v, k), offset + variant_offset(cx, v, k));
+                }
+            }
+        } else if !is_void(ty) {
+            cx.abi_leaves.push(offset);
+            cx.abi_leaves.push(scalar_type(ty));
+        }
+    }
+}
+
+// (0.18.1) variant_field_offset and field_offset, in a task without the
+// enum's or struct's type made (make_type writes the program's tables,
+// even to find a type that exists; middle::parallel): the layouts are
+// made before the tasks run, the payloads and the fields' offsets with
+// them.
+fn variant_offset(cx: sink *FnCtx, v: i64, i: i64) -> i64 {
+    unsafe {
+        if cx.task_phase == 0 {
+            return variant_field_offset(v, i);
+        }
+        let e = VARIANTS[v].enum_id;
+        if (ENUMS[e].repr & REPR_C) != 0 {
+            return ENUMS[e].payload + tuple_offset(VARIANTS[v].shape, i);
+        }
+        tuple_offset(VARIANTS[v].shape, i + 1)
+    }
+}
+
+fn struct_offset(cx: sink *FnCtx, s: i64, i: i64) -> i64 {
+    unsafe {
+        if cx.task_phase == 0 {
+            return field_offset(s, i);
+        }
+        (*struct_field(s, i)).offset
+    }
+}
+
+// Whether the leaves are one to four floats of one type, one after the
+// other, filling the aggregate's `total` bytes (an AArch64 homogeneous
+// float aggregate has no padding); leaves that coincide (the members of a
+// union) count once.
+fn is_hfa(cx: sink *FnCtx, total: i64, elem: inout i64, count: inout i64) -> bool {
+    unsafe {
+        let n = cx.abi_leaves.count / 2;
+        if n < 1 {
+            return false;
+        }
+        let first = cx.abi_leaves.data[1];
+        if !is_float(first) {
+            return false;
+        }
+        let size = type_size(first);
+        // Every leaf is a float of that type at a multiple of its size, and the
+        // offsets used are 0, size, 2 * size... without a gap.
+        var highest = -1;
+        for i in 0..n {
+            let offset = cx.abi_leaves.data[2 * i];
+            if cx.abi_leaves.data[2 * i + 1] != first || offset % size != 0 {
+                return false;
+            }
+            highest = max_i64(highest, offset / size);
+        }
+        if highest > 3 || (highest + 1) * size != total {
+            return false;
+        }
+        for k in 0..highest + 1 {
+            if !(0..n).any(|i| cx.abi_leaves.data[2 * i] == k * size) {
+                return false;
+            }
+        }
+        elem = first;
+        count = highest + 1;
+        true
+    }
+}
+
+// The locations of the pieces of the aggregate of type `ty` just
+// classified (see arg_location for locations and `state`), in
+// `locations`. An aggregate aligned to 16 starts at a multiple of 16 on
+// the stack, and in an even x register under AAPCS64 (Apple's AArch64
+// convention does not round it).
+pub fn abi_piece_locations(cx: sink *FnCtx, ty: i64, state: *i64, locations: *i64) {
+    unsafe {
+        let size = type_size(ty);
+        let aapcs = !X86 && !APPLE_A64;
+        let wide = (if aapcs { natural_align(ty) } else { type_align(ty) }) >= 16;
+        let n = cx.abi_piece_count;
+        var ints = 0;
+        var floats = 0;
+        for i in 0..n {
+            if is_float(cx.abi_piece_ty[i]) {
+                floats += 1;
+            } else {
+                ints += 1;
+            }
+        }
+        let int_limit = if X86 { 6 } else { 8 };
+        if aapcs && wide && ints > 0 {
+            state[0] = align_to(state[0], 2);
+        }
+        if state[0] + ints <= int_limit && state[1] + floats <= 8 {
+            for i in 0..n {
+                if is_float(cx.abi_piece_ty[i]) {
+                    locations[i] = 8 + state[1];
+                    state[1] += 1;
+                } else {
+                    locations[i] = state[0];
+                    state[0] += 1;
+                }
+            }
+            return;
+        }
+        // On the stack, laid out as in memory.
+        if !X86 {
+            if floats > 0 {
+                state[1] = 8;
+            } else {
+                state[0] = 8;
+            }
+        }
+        // Apple's AArch64 convention passes a homogeneous float aggregate on
+        // the stack as its elements: at the element's alignment, taking its
+        // exact size (a union of three f32 takes 12 bytes at a multiple of 4),
+        // where other aggregates take 8-byte slots (as every one does under
+        // AAPCS64).
+        let hfa = !X86 && APPLE_A64 && ints == 0 && !wide;
+        let base = align_to(state[2],
+            if wide && aapcs { 16 } else if wide { type_align(ty) }
+            else if hfa { type_size(cx.abi_piece_ty[0]) } else { 8 });
+        for i in 0..n {
+            locations[i] = 16 + base + cx.abi_piece_offset[i];
+        }
+        state[2] = base + if hfa { size } else { align_to(size, 8) };
+    }
+}
+
+// The alignment AAPCS64 places an aggregate by (an even register pair, a
+// stack slot): its natural alignment, that of its fields (packing
+// included) without its own repr(align), as GCC and clang have it.
+fn natural_align(ty: i64) -> i64 {
+    unsafe {
+        if TYPES[ty].kind != TyKind::Struct {
+            return type_align(ty);
+        }
+        let s = TYPES[ty].a;
+        var align = 1;
+        for i in 0..STRUCTS[s].field_count {
+            var field = type_align((*struct_field(s, i)).ty);
+            if (STRUCTS[s].repr & REPR_PACKED) != 0 && field > STRUCTS[s].align {
+                field = STRUCTS[s].align;
+            }
+            align = max_i64(align, field);
+        }
+        align
+    }
+}
+
+// The stack offset (from the outgoing area) of an aggregate copied onto the
+// stack (AbiClass::Stack): at a multiple of its alignment when that is 16
+// or more (as clang and GCC place them).
+pub fn abi_stack_location(ty: i64, state: *i64) -> i64 {
+    unsafe {
+        let base = align_to(state[2], if type_align(ty) >= 16 { type_align(ty) } else { 8 });
+        state[2] = base + align_to(type_size(ty), 8);
+        16 + base
+    }
+}
+
+// The `...` arguments of a C function: aggregates are classified as named
+// ones; on x86-64 and under AAPCS64 they also go where named ones would, on
+// Apple's AArch64 every variadic argument goes on the stack (an aggregate in pieces as its
+// bytes, homogeneous float aggregates of any size included; a larger one
+// by reference, in an 8-byte slot). Classifies ty.
+pub fn variadic_kind(cx: sink *FnCtx, ty: i64) -> AbiClass {
+    abi_classify(cx, ty)
+}
+
+// The locations of the pieces of a variadic aggregate passed by value (see
+// variadic_by_reference), classified just before.
+pub fn abi_variadic_piece_locations(cx: sink *FnCtx, ty: i64, state: *i64, locations: *i64) {
+    unsafe {
+        if X86 || !APPLE_A64 {
+            abi_piece_locations(cx, ty, state, locations);
+            return;
+        }
+        let base = align_to(state[2], if type_align(ty) >= 16 { 16 } else { 8 });
+        for i in 0..cx.abi_piece_count {
+            locations[i] = 16 + base + cx.abi_piece_offset[i];
+        }
+        state[2] = base + align_to(type_size(ty), 8);
+    }
+}
+
+// Whether a function returning `ret` gets a result pointer (does not
+// change the pieces of the last classified aggregate).
+pub fn returns_through_pointer(cx: sink *FnCtx, ret: i64) -> bool {
+    if !is_compound(ret) {
+        return false;
+    }
+    unsafe { cx.abi_leaves.count = 0; }
+    abi_leaves(cx, ret, 0);
+    if X86 {
+        return type_size(ret) > 16 || has_unaligned_leaf(cx);
+    }
+    var elem = 0;
+    var count = 0;
+    type_size(ret) > 16 && !is_hfa(cx, type_size(ret), &elem, &count)
+}
+
+// The machine register of return piece i (x0/x1 or rax/rdx, v0-v3 or
+// xmm0/xmm1).
+pub fn return_piece_reg(cx: sink *FnCtx, i: i64) -> i64 {
+    var float = false;
+    let index = return_piece_index(cx, i, &float);
+    if float {
+        return 32 + index;
+    }
+    if X86 && index == 1 { 2 } else { index }
+}
+
+// The register returning piece i of an aggregate result: x0, x1 / rax, rdx
+// for integers (0, 1: the argument-register numbering of the machine
+// layer is not used here), v0-v3 / xmm0, xmm1 for floats and (0.19, the
+// vole convention) vectors; as (is_float, index) in `float`.
+fn return_piece_index(cx: sink *FnCtx, i: i64, float: inout bool) -> i64 {
+    unsafe {
+        var ints = 0;
+        var floats = 0;
+        for k in 0..i {
+            if in_fregs(cx.abi_piece_ty[k]) {
+                floats += 1;
+            } else {
+                ints += 1;
+            }
+        }
+        float = in_fregs(cx.abi_piece_ty[i]);
+        if float { floats } else { ints }
+    }
+}
+
+// ---- The vole convention (0.5) ----
+//
+// Plain `fn`s compiled at -O1 and -O2 call each other with a convention of
+// their own; C's is kept by everything C can reach or call: functions
+// imported from C or defined `extern "C"`, `main`, variadic functions,
+// calls through `extern "C" fn` pointers, the run-time helpers, and every
+// function at -O0 (the oracle). The two never meet: a plain `fn` value only
+// ever holds a plain function of the same program (the types `fn` and
+// `extern "C" fn` do not convert into each other), and a program is
+// compiled at one level. `main`, called by C, is the one plain function
+// whose value can be taken while it follows C's convention; for a `main`
+// taking only scalars (in registers) and returning a scalar, as C's `main`
+// does, the two conventions agree.
+//
+// The convention: every argument is a list of scalars, passed one by one,
+// each in the next free register of its class (AArch64: x0-x15 and d0-d7,
+// d16-d23; x86-64: rdi, rsi, rdx, rcx, r8, r9, rax and xmm0-xmm13), or else
+// in the next 8-byte slot of the stack area. An aggregate (struct, tuple,
+// array, enum with fields, slice) of at most four scalar leaves that do not
+// overlap is its leaves; (0.19) a vector is one leaf (a 256-bit one two
+// 128-bit halves), passed in the float registers whole, a vector register,
+// or in a stack slot of its size, at a multiple of it; another one of at most 32 bytes is its 8-byte
+// chunks (read as integers); a larger one is a pointer to the caller's
+// copy. Results: up to four pieces in x0-x3 / rax, rdx, rcx, rsi and d0-d3
+// / xmm0-xmm3; a larger aggregate through a result pointer passed as the
+// first argument (and not returned). The scalars of the first registers go
+// where C's convention puts them, so a function taking scalars that fit in
+// C's registers and returning a scalar follows both.
+
+// Whether function f follows C's convention.
+pub fn fn_uses_c(f: i64) -> bool {
+    unsafe {
+        OPT_LEVEL == 0 || FNS[f].is_extern || FNS[f].export || FNS[f].variadic
+            || FNS[f].name == MAIN_SYM
+    }
+}
+
+// Whether calls through a pointer of fn type t follow C's convention.
+pub fn fn_type_uses_c(t: i64) -> bool {
+    unsafe { OPT_LEVEL == 0 || TYPES[t].b != 0 }
+}
+
+// How a value of type `ty` is passed under C's convention (c) or
+// vole's; for AbiClass::Pieces, its pieces.
+pub fn conv_classify(cx: sink *FnCtx, c: bool, ty: i64) -> AbiClass {
+    if c { abi_classify(cx, ty) } else { tabi_classify(cx, ty) }
+}
+
+// Whether a function returning `ret` gets a result pointer (does not
+// change the pieces of the last classified aggregate).
+pub fn conv_returns_through_pointer(cx: sink *FnCtx, c: bool, ret: i64) -> bool {
+    if c {
+        return returns_through_pointer(cx, ret);
+    }
+    if !is_compound(ret) {
+        return false;
+    }
+    unsafe { cx.abi_leaves.count = 0; }
+    tabi_leaves(cx, ret);
+    !leaves_as_pieces(cx) && type_size(ret) > 32
+}
+
+// The leaves of `ty` under the vole convention: (0.19) a vector is one
+// leaf, in a vector register; a 256-bit one two.
+fn tabi_leaves(cx: sink *FnCtx, ty: i64) {
+    unsafe {
+        let saved = cx.leaves_whole_vectors;
+        cx.leaves_whole_vectors = true;
+        abi_leaves(cx, ty, 0);
+        cx.leaves_whole_vectors = saved;
+    }
+}
+
+// The vole convention's classification (see above).
+pub fn tabi_classify(cx: sink *FnCtx, ty: i64) -> AbiClass {
+    unsafe {
+        cx.abi_piece_count = 0;
+        if !is_compound(ty) {
+            return AbiClass::Scalar;
+        }
+        cx.abi_leaves.count = 0;
+        tabi_leaves(cx, ty);
+        if leaves_as_pieces(cx) {
+            var i = 0;
+            while i < cx.abi_leaves.count {
+                unsafe {
+                    abi_add_piece(cx, ir_type(cx.abi_leaves.data[i + 1]), cx.abi_leaves.data[i]);
+                }
+                i += 2;
+            }
+            return AbiClass::Pieces;
+        }
+        let size = type_size(ty);
+        if size > 32 {
+            return AbiClass::Ref;
+        }
+        var offset = 0;
+        while offset < size {
+            abi_add_piece(cx, int_piece_type(size - offset), offset);
+            offset += 8;
+        }
+        AbiClass::Pieces
+    }
+}
+
+// Whether the leaves just collected are at most four that do not overlap.
+fn leaves_as_pieces(cx: sink *FnCtx) -> bool {
+    unsafe {
+        let n = cx.abi_leaves.count / 2;
+        if n > 4 {
+            return false;
+        }
+        for i in 0..n {
+            let a = cx.abi_leaves.data[2 * i];
+            let a_end = a + type_size(cx.abi_leaves.data[2 * i + 1]);
+            for j in i + 1..n {
+                let b = cx.abi_leaves.data[2 * j];
+                let b_end = b + type_size(cx.abi_leaves.data[2 * j + 1]);
+                if a < b_end && b < a_end {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+// The machine register of return piece i of the last classified aggregate
+// under either convention.
+pub fn conv_return_piece_reg(cx: sink *FnCtx, c: bool, i: i64) -> i64 {
+    if c {
+        return return_piece_reg(cx, i);
+    }
+    var float = false;
+    let index = return_piece_index(cx, i, &float);
+    if float {
+        return 32 + index;
+    }
+    if !X86 {
+        return index;
+    }
+    // rax, rdx, rcx, rsi.
+    if index == 0 { 0 } else if index == 1 { 2 } else if index == 2 { 1 } else { 6 }
+}

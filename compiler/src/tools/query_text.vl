@@ -1,0 +1,744 @@
+// Source as text, for what is not an item (0.12; docs/query.md):
+//
+//   volec query text FILE[:A[-B]]...   lines A to B, numbered; any file,
+//                                         no program read
+//   volec query show FILE.vl...      a whole file, when small
+//   volec query show MODULE::use       its `use` lines (::header: the
+//                                         comment at the top of its file;
+//                                         ::extern: its extern blocks)
+//   volec query show NAME --with-comments
+//                                         with the section comment above
+//
+// At most TEXT_MAX lines are printed: past them, `note query.truncated`
+// (text) or `error query.too-long` (show), with `try:` lines narrowing.
+
+use crate::base::{
+    FILES, FILE_COUNT, IntVec, SRC, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice,
+    buf_str, buf_write_fd,
+};
+use crate::front::cpp::directives::file_exists;
+use crate::front::modules::file_of_pos;
+use crate::front::stdsrc::std_source;
+use crate::tools::proc::{buf_cstr, read_file_if};
+use crate::tools::query::{c_slice, ends_with_c, find_root};
+use crate::tools::query::defs::mod_fqn_text;
+use crate::tools::query::diagnostics::{diag, try_begin, try_end};
+use crate::tools::query::positions::{line_start, put_path};
+use crate::tools::query::show::find_modules;
+
+pub const TEXT_MAX: i64 = 200;
+
+// --with-comments: show includes the comment block above an item's own
+// comments (a section comment), with the blank lines between.
+pub static var WITH_COMMENTS: bool = false;
+
+// ---- query text ----
+
+// `query text FILE[:A[-B]]...`: the exit status.
+pub fn run_text(args: IntVec) -> i64 {
+    unsafe {
+        if args.count == 0 {
+            let d = diag(c"error", c"query.usage");
+            buf_str(d, c"text needs a FILE (FILE:A-B for lines A to B)\n");
+            try_end(try_begin(c"text", c_slice(c"main.vl:1-40"), true));
+            return 2;
+        }
+        var status = 0;
+        for i in 0..args.count {
+            if text_one(c_slice(args.data[i] as *u8)) != 0 {
+                status = 1;
+            }
+        }
+        status
+    }
+}
+
+// Splits `FILE[:A[-B]]`: the file (a buffer, a C string), and A, B (-1
+// when not given).
+fn split_range(arg: [u8], file: inout i64, a: inout i64, b: inout i64) {
+    unsafe {
+        a = -1;
+        b = -1;
+        var end = arg.len;
+        // (the last `:` followed by digits, and maybe `-digits`)
+        var k = arg.len;
+        while k > 0 && ((arg[k - 1] >= '0' && arg[k - 1] <= '9') || arg[k - 1] == '-') {
+            k -= 1;
+        }
+        if k > 0 && k < arg.len && arg[k - 1] == ':' && arg[k] != '-' {
+            var p = k;
+            var x = 0;
+            while p < arg.len && arg[p] != '-' {
+                x = x * 10 + (arg[p] - '0') as i64;
+                p += 1;
+            }
+            a = x;
+            if p < arg.len {
+                p += 1;
+                var y = 0;
+                var digits = false;
+                while p < arg.len && arg[p] >= '0' && arg[p] <= '9' {
+                    y = y * 10 + (arg[p] - '0') as i64;
+                    p += 1;
+                    digits = true;
+                }
+                b = if digits { y } else { -1 };
+            } else {
+                b = x;
+            }
+            end = k - 1;
+        }
+        let f = buf_new();
+        buf_bytes(f, arg[0..end]);
+        file = f;
+    }
+}
+
+// The starts of text's lines (a last line without its newline counts).
+fn line_starts(text: [u8], out: inout IntVec) {
+    var i = 0;
+    while i < text.len {
+        out.push(i);
+        while i < text.len && text[i] != '\n' {
+            i += 1;
+        }
+        i += 1;
+    }
+}
+
+// Line k (0-based) of text, without its newline.
+fn line_at(text: [u8], starts: IntVec, k: i64) -> [u8] {
+    unsafe {
+        let a = starts.data[k];
+        var e = a;
+        while e < text.len && text[e] != '\n' {
+            e += 1;
+        }
+        text[a..e]
+    }
+}
+
+fn cannot_read(file: [u8]) -> i64 {
+    let d = unsafe { diag(c"error", c"query.no-file") };
+    unsafe {
+        buf_str(d, c"cannot read '");
+        buf_bytes(d, file);
+        buf_str(d, c"'\n");
+    }
+    1
+}
+
+// One FILE[:A[-B]] of `query text`.
+fn text_one(arg: [u8]) -> i64 {
+    unsafe {
+        var fb = 0;
+        var a = 0;
+        var b = 0;
+        split_range(arg, &fb, &a, &b);
+        let file = buf_slice(fb);
+        let path = buf_cstr(fb);
+        let content = buf_new();
+        if !file_exists(path) && (file == "std" || file == "<std>") {
+            // (0.15: std's source, as the compiler has it: `<std>` in
+            // the answers of the other queries)
+            std_source(content);
+        } else if !file_exists(path) || !read_file_if(path, content) {
+            return cannot_read(file);
+        }
+        let text = buf_slice(content);
+        var starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        line_starts(text, &starts);
+        let n = starts.count;
+        if a < 0 {
+            a = 1;
+            b = n;
+        }
+        if b < 0 || b > n {
+            b = n;
+        }
+        if a < 1 || a > n || b < a {
+            let d = diag(c"error", c"query.no-match");
+            buf_bytes(d, file);
+            buf_str(d, c" has ");
+            buf_int(d, n);
+            buf_str(d, c" lines; no lines ");
+            buf_bytes(d, arg[file.len + 1..arg.len]);
+            buf_byte(d, '\n');
+            try_text(file, if n > TEXT_MAX { n - TEXT_MAX + 1 } else { 1 }, n);
+            return 1;
+        }
+        let shown_last = if b - a + 1 > TEXT_MAX { a + TEXT_MAX - 1 } else { b };
+        let out = buf_new();
+        buf_str(out, c"// ");
+        buf_bytes(out, file);
+        buf_byte(out, ':');
+        buf_int(out, a);
+        buf_byte(out, '-');
+        buf_int(out, shown_last);
+        buf_byte(out, '\n');
+        for k in a - 1..shown_last {
+            buf_int(out, k + 1);
+            buf_byte(out, '\t');
+            buf_bytes(out, line_at(text, starts, k));
+            buf_byte(out, '\n');
+        }
+        buf_write_fd(out, STDOUT);
+        if shown_last < b {
+            let d = diag(c"note", c"query.truncated");
+            buf_str(d, c"lines ");
+            buf_int(d, a);
+            buf_byte(d, '-');
+            buf_int(d, b);
+            buf_str(d, c" are ");
+            buf_int(d, b - a + 1);
+            buf_str(d, c" lines; showing ");
+            buf_int(d, a);
+            buf_byte(d, '-');
+            buf_int(d, shown_last);
+            buf_byte(d, '\n');
+            let next_last = if b - shown_last > TEXT_MAX { shown_last + TEXT_MAX } else { b };
+            try_text(file, shown_last + 1, next_last);
+            if has_part(file, c"compiler/src/") {
+                try_end(try_begin(c"stats", file, true));
+            }
+        }
+        0
+    }
+}
+
+// `try: query text FILE:A-B`.
+fn try_text(file: [u8], a: i64, b: i64) {
+    let w = buf_new();
+    buf_bytes(w, file);
+    buf_byte(w, ':');
+    buf_int(w, a);
+    buf_byte(w, '-');
+    buf_int(w, b);
+    unsafe { try_end(try_begin(c"text", buf_slice(w), true)); }
+}
+
+// The root for NAMEs that name a file outside the compiler's source
+// (`tests/run/x.vl:12`, `prog.vl`) when the default root is the
+// compiler's (or none): the main.vl of the file's directory or one
+// above it (a module tree), else the file itself. 0 otherwise.
+pub fn infer_root(args: IntVec) -> *u8 {
+    unsafe {
+        let default = find_root(0 as *u8);
+        if default != 0 as *u8 && !ends_with_c(default, c"compiler/src/main.vl") {
+            return 0 as *u8;
+        }
+        for i in 0..args.count {
+            var fb = 0;
+            var a = 0;
+            var b = 0;
+            split_range(c_slice(args.data[i] as *u8), &fb, &a, &b);
+            let file = buf_slice(fb);
+            let path = buf_cstr(fb);
+            if !crate::base::is_source_path(path) || !file_exists(path)
+                || has_part(file, c"compiler/src/")
+                || has_part(file, c"compiler/std/") {
+                continue;
+            }
+            // (its directory, then up to two above)
+            var dir = file.len;
+            while dir > 0 && file[dir - 1] != '/' {
+                dir -= 1;
+            }
+            for _ in 0..3 {
+                let m = buf_new();
+                buf_bytes(m, file[0..dir]);
+                buf_str(m, c"main.vl");
+                if file_exists(buf_cstr(m)) {
+                    return buf_cstr(m);
+                }
+                // (0.21) `main.vl`
+                let v = buf_new();
+                buf_bytes(v, file[0..dir]);
+                buf_str(v, c"main.vl");
+                if file_exists(buf_cstr(v)) {
+                    return buf_cstr(v);
+                }
+                if dir == 0 {
+                    break;
+                }
+                dir -= 1;
+                while dir > 0 && file[dir - 1] != '/' {
+                    dir -= 1;
+                }
+            }
+            return path;
+        }
+        0 as *u8
+    }
+}
+
+// Whether s contains part.
+fn has_part(s: [u8], part: *u8) -> bool {
+    let t = c_slice(part);
+    var i = 0;
+    while i + t.len <= s.len {
+        var ok = true;
+        for j in 0..t.len {
+            if s[i + j] != t[j] {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+// ---- query show FILE ----
+
+// Whether every argument is a file to show whole (ends in .vl, no
+// line).
+pub fn all_files(args: IntVec) -> bool {
+    unsafe {
+        if args.count == 0 {
+            return false;
+        }
+        for i in 0..args.count {
+            if !crate::base::is_source_path(args.data[i] as *u8) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// `query show FILE.vl...`: each file whole, or refused when longer than
+// TEXT_MAX lines.
+pub fn show_files(args: IntVec) -> i64 {
+    unsafe {
+        var status = 0;
+        for i in 0..args.count {
+            let path = args.data[i] as *u8;
+            let file = c_slice(path);
+            let content = buf_new();
+            if !file_exists(path) || !read_file_if(path, content) {
+                status = cannot_read(file);
+                continue;
+            }
+            let text = buf_slice(content);
+            var starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            line_starts(text, &starts);
+            let n = starts.count;
+            if n > TEXT_MAX {
+                let d = diag(c"error", c"query.too-long");
+                buf_bytes(d, file);
+                buf_str(d, c" has ");
+                buf_int(d, n);
+                buf_str(d, c" lines (show prints a file of at most ");
+                buf_int(d, TEXT_MAX);
+                buf_str(d, c")\n");
+                if has_part(file, c"compiler/src/") {
+                    try_end(try_begin(c"stats", file, true));
+                }
+                try_text(file, 1, TEXT_MAX);
+                status = 1;
+                continue;
+            }
+            let out = buf_new();
+            buf_str(out, c"// ");
+            buf_bytes(out, file);
+            buf_str(out, c":1-");
+            buf_int(out, n);
+            buf_byte(out, '\n');
+            buf_bytes(out, text);
+            if text.len > 0 && text[text.len - 1] != '\n' {
+                buf_byte(out, '\n');
+            }
+            buf_write_fd(out, STDOUT);
+        }
+        status
+    }
+}
+
+// ---- Named regions of a module ----
+
+// `query show MODULE::use|header|extern`: its exit status, or -1 when
+// name is not one (or MODULE is no module: then it is a NAME).
+pub fn show_region(name: [u8]) -> i64 {
+    unsafe {
+        var kind = 0;
+        var cut = 0;
+        if ends_with_bytes(name, c"::use") {
+            kind = 1;
+            cut = 5;
+        } else if ends_with_bytes(name, c"::header") {
+            kind = 2;
+            cut = 8;
+        } else if ends_with_bytes(name, c"::extern") {
+            kind = 3;
+            cut = 8;
+        }
+        if kind == 0 || name.len <= cut {
+            return -1;
+        }
+        let module = name[0..name.len - cut];
+        var modules = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_modules(module, false, &modules);
+        if modules.count == 0 && root_stem(module) {
+            modules.push(0);
+        }
+        // (the files of those modules)
+        var files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..modules.count {
+            for f in 0..FILE_COUNT {
+                if FILES[f].module == modules.data[i] && FILES[f].path[0] != '<' {
+                    files.push(f);
+                }
+            }
+        }
+        if files.count == 0 {
+            return -1;
+        }
+        let out = buf_new();
+        var found = 0;
+        for i in 0..files.count {
+            let f = files.data[i];
+            let label = buf_new();
+            buf_bytes(label, mod_fqn_text(FILES[f].module));
+            buf_str(label,
+                if kind == 1 { c"::use" } else if kind == 2 { c"::header" } else { c"::extern" });
+            found += region_lines(out, f, kind, buf_slice(label));
+        }
+        buf_write_fd(out, STDOUT);
+        if found == 0 {
+            let d = diag(c"note", c"query.empty");
+            buf_str(d, c"no ");
+            buf_str(d,
+                if kind == 1 { c"use lines" } else if kind == 2 { c"header comment" }
+                else { c"extern blocks" });
+            buf_str(d, c" in ");
+            buf_bytes(d, module);
+            buf_byte(d, '\n');
+        }
+        0
+    }
+}
+
+fn ends_with_bytes(s: [u8], suffix: *u8) -> bool {
+    let t = c_slice(suffix);
+    if s.len < t.len {
+        return false;
+    }
+    for i in 0..t.len {
+        if s[s.len - t.len + i] != t[i] {
+            return false;
+        }
+    }
+    true
+}
+
+// Whether text starts with word s.
+fn starts_with(text: [u8], s: *u8) -> bool {
+    let t = c_slice(s);
+    if text.len < t.len {
+        return false;
+    }
+    for i in 0..t.len {
+        if text[i] != t[i] {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_comment_line(line: [u8]) -> bool {
+    var i = 0;
+    while i < line.len && (line[i] == ' ' || line[i] == '\t') {
+        i += 1;
+    }
+    i + 1 < line.len && line[i] == '/' && line[i + 1] == '/'
+}
+
+fn is_blank_line(line: [u8]) -> bool {
+    for i in 0..line.len {
+        if line[i] != ' ' && line[i] != '\t' && line[i] != '\r' {
+            return false;
+        }
+    }
+    true
+}
+
+// The regions of kind `kind` of file f, printed to out (each as `query
+// show` prints an item: `// LABEL<TAB>FILE:A-B`, its lines); how many.
+fn region_lines(out: i64, f: i64, kind: i64, label: [u8]) -> i64 {
+    unsafe {
+        let text = SRC[FILES[f].start..FILES[f].end];
+        var starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        line_starts(text, &starts);
+        var spans = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        region_spans(f, kind, &spans);
+        var k = 0;
+        while k < spans.count {
+            put_region(out, f, label, text, starts, spans.data[k], spans.data[k + 1]);
+            k += 2;
+        }
+        spans.count / 2
+    }
+}
+
+// The regions of kind `kind` (1 use lines, 2 the header comment, 3 extern
+// blocks) of file f: their first and last lines (0-based), in pairs, into
+// out. The header is the comment lines at the top (blank lines among
+// them), but for those right above the first item (its own comment, when
+// it is not a mod or use line);
+// consecutive use lines are one region.
+pub fn region_spans(f: i64, kind: i64, out: inout IntVec) {
+    unsafe {
+        let text = SRC[FILES[f].start..FILES[f].end];
+        var starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        line_starts(text, &starts);
+        let n = starts.count;
+        if kind == 2 {
+            var last = -1;
+            var k = 0;
+            while k < n {
+                let line = line_at(text, starts, k);
+                if is_comment_line(line) {
+                    last = k;
+                } else if !is_blank_line(line) {
+                    break;
+                }
+                k += 1;
+            }
+            let first = if k < n { line_at(text, starts, k) } else { text[0..0] };
+            let decl = starts_with(first, c"mod ") || starts_with(first, c"pub mod ")
+                || starts_with(first, c"use ") || starts_with(first, c"pub use ")
+                || starts_with(first, c"import ");
+            if k < n && last == k - 1 && !decl {
+                // (the comment lines right above the first item are its
+                // own: the header ends at the blank line before them; not
+                // above a mod or use line)
+                while last >= 0 && is_comment_line(line_at(text, starts, last)) {
+                    last -= 1;
+                }
+                while last >= 0 && is_blank_line(line_at(text, starts, last)) {
+                    last -= 1;
+                }
+            }
+            if last >= 0 {
+                out.push(0);
+                out.push(last);
+            }
+            return;
+        }
+        var k = 0;
+        while k < n {
+            let line = line_at(text, starts, k);
+            let opens = if kind
+                == 1 { starts_with(line, c"use ") || starts_with(line, c"pub use ") }
+                else {
+                    starts_with(line, c"extern \"C\"") || starts_with(line, c"pub extern \"C\"")
+                };
+            if !opens {
+                k += 1;
+                continue;
+            }
+            // To the `;` (use) or the matching `}` (extern).
+            let first = k;
+            var last = k;
+            if kind == 1 {
+                loop {
+                    while last < n && !has_byte(line_at(text, starts, last), ';') {
+                        last += 1;
+                    }
+                    if last + 1 < n && (starts_with(line_at(text, starts, last + 1), c"use ")
+                        || starts_with(line_at(text, starts, last + 1), c"pub use ")) {
+                        last += 1;
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                var depth = 0;
+                var seen = false;
+                loop {
+                    let l = line_at(text, starts, last);
+                    for j in 0..l.len {
+                        if l[j] == '{' {
+                            depth += 1;
+                            seen = true;
+                        } else if l[j] == '}' {
+                            depth -= 1;
+                        }
+                    }
+                    if (seen && depth <= 0) || last + 1 >= n {
+                        break;
+                    }
+                    last += 1;
+                }
+            }
+            if last >= n {
+                last = n - 1;
+            }
+            out.push(first);
+            out.push(last);
+            k = last + 1;
+        }
+    }
+}
+
+// `MODULE::use`, `MODULE::header` (0.12) or `MODULE::extern` (0.17) as the
+// TARGET of an edit: -1 when name is not one (or names no module: then it
+// is a NAME), 1 after a diagnostic (several modules), else 0 with its
+// file, its kind (1 use, 2 header, 3 extern) and the byte ranges of its
+// regions in SRC (whole lines, in
+// pairs: start, end after the last line's newline) in spans.
+pub fn region_target(name: [u8], what: *u8, file: inout i64, kind: inout i64, spans: inout IntVec) -> i64 {
+    unsafe {
+        var cut = 0;
+        if ends_with_bytes(name, c"::use") {
+            kind = 1;
+            cut = 5;
+        } else if ends_with_bytes(name, c"::header") {
+            kind = 2;
+            cut = 8;
+        } else if ends_with_bytes(name, c"::extern") {
+            kind = 3;
+            cut = 8;
+        }
+        if cut == 0 || name.len <= cut {
+            return -1;
+        }
+        let module = name[0..name.len - cut];
+        var modules = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        find_modules(module, false, &modules);
+        if modules.count == 0 && root_stem(module) {
+            modules.push(0);
+        }
+        var files = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..modules.count {
+            for f in 0..FILE_COUNT {
+                if FILES[f].module == modules.data[i] && FILES[f].path[0] != '<' {
+                    files.push(f);
+                }
+            }
+        }
+        if files.count == 0 {
+            return -1;
+        }
+        if files.count > 1 {
+            let d = diag(c"error", c"query.ambiguous");
+            buf_bytes(d, module);
+            buf_str(d, c" names ");
+            buf_int(d, files.count);
+            buf_str(d, c" modules; give more of its path\n");
+            for i in 0..files.count {
+                if i < 3 {
+                    let label = buf_new();
+                    buf_bytes(label, mod_fqn_text(FILES[files.data[i]].module));
+                    buf_bytes(label, name[name.len - cut..name.len]);
+                    try_end(try_begin(what, buf_slice(label), true));
+                }
+            }
+            return 1;
+        }
+        let f = files.data[0];
+        file = f;
+        var lines = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        region_spans(f, kind, &lines);
+        let text = SRC[FILES[f].start..FILES[f].end];
+        var starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        line_starts(text, &starts);
+        var k = 0;
+        while k < lines.count {
+            let last = lines.data[k + 1];
+            spans.push(FILES[f].start + starts.data[lines.data[k]]);
+            spans.push(if last + 1 < starts.count { FILES[f].start + starts.data[last + 1] }
+                else { FILES[f].end });
+            k += 2;
+        }
+        0
+    }
+}
+
+// Whether name is the root file's name without `.vl` (`main::header`
+// for `crate::header`).
+pub fn root_stem(name: [u8]) -> bool {
+    unsafe {
+        var root = -1;
+        for f in 0..FILE_COUNT {
+            if FILES[f].module == 0 && FILES[f].path[0] != '<' {
+                root = f;
+            }
+        }
+        if root < 0 {
+            return false;
+        }
+        let p = c_slice(FILES[root].path);
+        var s = p.len;
+        while s > 0 && p[s - 1] != '/' {
+            s -= 1;
+        }
+        let e = crate::base::source_ext_len(p);
+        e > 0 && p.len - s == name.len + e
+            && crate::tools::proc::same_bytes(p[s..s + name.len], name)
+    }
+}
+
+fn has_byte(s: [u8], c: u8) -> bool {
+    for i in 0..s.len {
+        if s[i] == c {
+            return true;
+        }
+    }
+    false
+}
+
+fn put_region(out: i64, f: i64, label: [u8], text: [u8], starts: IntVec, first: i64, last: i64) {
+    unsafe {
+        buf_str(out, c"// ");
+        buf_bytes(out, label);
+        buf_byte(out, '\t');
+        put_path(out, f);
+        buf_byte(out, ':');
+        buf_int(out, first + 1);
+        buf_byte(out, '-');
+        buf_int(out, last + 1);
+        buf_byte(out, '\n');
+        for k in first..last + 1 {
+            buf_bytes(out, line_at(text, starts, k));
+            buf_byte(out, '\n');
+        }
+    }
+}
+
+// ---- --with-comments ----
+
+// The start of the text query show prints from `first` (an item's first
+// line), with --with-comments: the comment block above it after blank
+// lines (a section comment), when there is one.
+pub fn section_start(first: i64) -> i64 {
+    unsafe {
+        if !WITH_COMMENTS {
+            return first;
+        }
+        let file_start = FILES[file_of_pos(first)].start;
+        var p = first;
+        // (blank lines)
+        while p > file_start {
+            let prev = line_start(p - 1);
+            if !is_blank_line(SRC[prev..p - 1]) {
+                break;
+            }
+            p = prev;
+        }
+        var top = -1;
+        while p > file_start {
+            let prev = line_start(p - 1);
+            if !is_comment_line(SRC[prev..p - 1]) {
+                break;
+            }
+            p = prev;
+            top = p;
+        }
+        if top < 0 { first } else { top }
+    }
+}

@@ -1,0 +1,89 @@
+// std::cli (0.24): parsing any argument list returns Ok or a CliError,
+// never panics, and every accessor works on what it returns: a
+// #[property] over generated lists (indexes into a vocabulary of the
+// tricky tokens), and main runs the same check over 3000 lists of its
+// own (a fixed generator) for the suite.
+// EXPECT: true
+use std::cli::{Arg, Command, Matches};
+
+fn command(gpa: Gpa) -> Command {
+    Command::new_in("prog", gpa).version("1")
+        .arg(Arg::flag("verbose").short('v'))
+        .arg(Arg::option("out").short('o').default("-"))
+        .arg(Arg::option("n").short('n'))
+        .arg(Arg::positional("input").required())
+        .arg(Arg::positional("rest").multiple())
+        .subcommand(Command::new_in("add", gpa)
+            .arg(Arg::flag("force").short('f'))
+            .arg(Arg::positional("what")))
+}
+
+const WORDS: [str; 24] = [
+    "-", "--", "-v", "-vv", "-vo", "-ov", "--out", "--out=", "--out=x", "-o", "-o=",
+    "-n", "--n=-5", "-5", "x", "add", "-f", "--force", "--zz", "-vx", "--verbose=1", "=", "-h",
+    "--version",
+];
+
+// Every accessor on m and its subcommand; a checksum of what they give.
+fn touch(m: Matches) -> i64 {
+    var t = m.count("verbose") + m.values("rest").len() + m.values("out").len();
+    if m.flag("n") {
+        t += 1;
+    }
+    match m.get_as::<i64>("n") {
+        Ok(n) => t += n,
+        Err(e) => t += e.exit_code() as i64,
+    }
+    t += m.get("input").unwrap_or("").len();
+    match m.subcommand() {
+        Some((_, sub)) => {
+            t += sub.count("force") + sub.values("what").len();
+            if sub.get("what").is_some() {
+                t += 1;
+            }
+        }
+        None => {}
+    }
+    t
+}
+
+fn check(cmd: Command, picks: [i64], gpa: Gpa) -> i64 {
+    var toks: Vec<str> = Vec::new_in(gpa);
+    toks.push("prog");
+    for p in picks {
+        let k = if p < 0 { 0 - (p % 24) } else { p % 24 };
+        toks.push(WORDS[k]);
+    }
+    match cmd.parse(toks.iter()) {
+        Ok(m) => touch(m),
+        Err(e) => {
+            let text = cmd.render_in(e, gpa);
+            text.len() + e.exit_code() as i64
+        }
+    }
+}
+
+#[property]
+fn parse_never_panics(picks: Vec<i64>) {
+    let gpa = picks.allocator();
+    let _ = check(command(gpa), picks.as_slice(), gpa);
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let cmd = command(gpa);
+    var seed: u64 = 0x9e3779b97f4a7c15;
+    var total = 0;
+    var picks: Vec<i64> = Vec::new_in(gpa);
+    for _ in 0..3000 {
+        picks.clear();
+        seed = seed * 6364136223846793005 + 1442695040888963407;
+        let n = ((seed >> 33) % 7) as i64;
+        for _ in 0..n {
+            seed = seed * 6364136223846793005 + 1442695040888963407;
+            picks.push(((seed >> 33) % 24) as i64);
+        }
+        total += check(cmd, picks.as_slice(), gpa);
+    }
+    println(f"{total > 0}");
+    0
+}

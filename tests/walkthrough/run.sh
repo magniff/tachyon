@@ -7,7 +7,7 @@
 #
 # usage: tests/walkthrough/run.sh [-c COMPILER] [-u] [NAME...]
 #
-#   -c COMPILER   the tachyonc binary (default: target/tachyonc)
+#   -c COMPILER   the volec binary (default: target/volec)
 #   -u            rewrite the READMEs' session blocks with the output
 #                 they get now (the prose around them is kept)
 #   NAME          only these examples (examples/GROUP/NAME/)
@@ -18,7 +18,7 @@
 # undo and `git diff` shows what changed). The
 # README's ```console blocks are the session, in order:
 #
-#   $ COMMAND     a shell command line, run in the copy (`tachyonc` is
+#   $ COMMAND     a shell command line, run in the copy (`volec` is
 #                 the compiler under test, first in PATH)
 #   > MORE        the command's next line (a heredoc's text), right
 #                 after its `$` line (`>` alone: an empty line)
@@ -39,7 +39,7 @@ export LC_ALL
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-COMPILER="$ROOT/target/tachyonc"
+COMPILER="$ROOT/target/volec"
 UPDATE=0
 ONLY=
 while [ $# -gt 0 ]; do
@@ -56,16 +56,16 @@ case "$COMPILER" in
 esac
 [ -x "$COMPILER" ] || { echo "walkthrough/run.sh: no compiler at $COMPILER" >&2; exit 2; }
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/tachyon-walkthrough.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-walkthrough.XXXXXX")
 WORK=$(cd "$WORK" && pwd -P)
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
 STATUS=0
 
-# The environment of the sessions: the compiler as `tachyonc`, an empty
+# The environment of the sessions: the compiler as `volec`, an empty
 # HOME, git with no configuration but a name.
 mkdir -p "$WORK/bin" "$WORK/home"
-ln -s "$COMPILER" "$WORK/bin/tachyonc"
+ln -s "$COMPILER" "$WORK/bin/volec"
 PATH="$WORK/bin:$PATH"
 HOME="$WORK/home"
 XDG_CONFIG_HOME="$WORK/home"
@@ -78,7 +78,7 @@ GIT_AUTHOR_DATE='2026-01-01T00:00:00Z'
 GIT_COMMITTER_DATE='2026-01-01T00:00:00Z'
 export PATH HOME XDG_CONFIG_HOME GIT_CONFIG_NOSYSTEM GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL \
     GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_AUTHOR_DATE GIT_COMMITTER_DATE
-unset TACHYON_ROOT
+unset VOLE_ROOT
 
 # Splits README $1 into $2/want (the console blocks, each ended by a
 # line ```), $2/cmd.N (the commands, numbered from 1) and $2/blocks
@@ -117,8 +117,8 @@ run_one() {
     cp -R "$src/." "$dir/"
     (cd "$dir" && git init -q . && git symbolic-ref HEAD refs/heads/main && git add -A \
         && git commit -q -m start) >/dev/null 2>&1
-    TACHYON_CACHE="$WORK/cache-$name"
-    export TACHYON_CACHE
+    VOLE_CACHE="$WORK/cache-$name"
+    export VOLE_CACHE
     : >"$meta/got"
     last=1
     while read -r n b; do
@@ -133,7 +133,7 @@ run_one() {
             rc=$?
             # (the compiler as the shell found it: some systems give
             # it its path in PATH, the link to COMPILER)
-            cat "$meta/out" "$meta/err" | sed -e "s|$WORK/bin/tachyonc|tachyonc|g" -e "s|$COMPILER|tachyonc|g" -e "s|$dir|WORK|g" -e "s|$WORK|WORK|g"
+            cat "$meta/out" "$meta/err" | sed -e "s|$WORK/bin/volec|volec|g" -e "s|$COMPILER|volec|g" -e "s|$dir|WORK|g" -e "s|$WORK|WORK|g"
             [ $rc -eq 0 ] || echo "[exit $rc]"
         ) >>"$meta/got"
     done <"$meta/blocks"

@@ -1,0 +1,375 @@
+// Instruction selection: from the optimized IR to machine operations, just
+// before register allocation (after --emit-ir, so the optimizer's IR is what
+// that shows).
+//
+// Three steps per function:
+//
+// 0. Branches on phis. A block holding nothing but a phi and a branch on
+//    it (what `&&`, `||` and a `bool` result of `if` leave) is threaded:
+//    each predecessor that jumps there branches itself, on its own value
+//    for the phi (a comparison it made, fused with the branch then), or
+//    jumps where a constant goes.
+//
+// 1. Selects. A branch whose two ways (a diamond, or a triangle with one
+//    way empty) do at most a few pure, cheap instructions and meet again in
+//    a block whose phis pick between their values becomes those
+//    instructions, moved up, and a SELECT per phi (csel / fcsel on AArch64,
+//    cmov on x86-64, integers only there). A select owns its comparison: it
+//    compares its two extra operands itself (ARGS: the left side, and the
+//    right side or 0 for an immediate in imm), so nothing can come between
+//    the comparison and its use of the flags.
+//
+// 1b. Divisions by constants (0.11): x / d and x % d for a constant d are
+//    a multiplication by a magic number (divisions.vl), then tiled as the rest.
+//
+// 2. Tiling, by maximal munch: the instructions of each block from the last
+//    to the first, so that a user is matched before what it uses. A rule
+//    matches an instruction (the root) and the definitions of some of its
+//    operands, each in the same block and used by the root alone, and
+//    rewrites the root in place into a machine operation whose operands are
+//    the leaves; what the rule covered dies, and dead code elimination
+//    removes it. The machine operations (ir.vl):
+//
+//    loadx  ty a, b [off, -, s]      load ty from a + (b << s) + off
+//    storex a, b, c [off, ty, s]     store c (of type ty) there
+//    lea    a, b [off, -, s]         a + (b << s) + off (b may be 0), 64-bit
+//    madd   a, b, c                  c + a * b (AArch64)
+//    msub   a, b, c                  c - a * b (AArch64)
+//    shop   a, b [k, 4 * op + kind]  a op (b sh k); sh: 0 lsl, 1 lsr, 2 asr
+//                                    (AArch64)
+//    ubfx   a [k, n]                 (a >> k) & (2^n - 1), k + n within the
+//                                    type (AArch64)
+//    test.c a, b [m]                 (a & b) c 0, b 0 for the mask m: only
+//                                    as the condition of the branch ending
+//                                    its block
+//    fmath  a [kind]                 sqrt, fabs, floor, ceil, trunc, round
+//                                    (kind 0 to 5) of a float
+//    mulh   a, b [signed]            the high 64 bits of the 128-bit a * b
+//                                    (umulh, smulh; mulq, imulq: rdx)
+//    select.c a, b; lhs, rhs [imm, ty, kind]
+//                                    a if lhs c rhs (kind & 1 == 0) or if
+//                                    (lhs & rhs) c 0 (kind & 1 == 1), else
+//                                    b, or b + 1 when kind & 2 (csinc);
+//                                    rhs 0: the immediate imm; ty the
+//                                    comparison's operand type
+//
+// Then two scheduling rules (before register allocation): a branch's
+// comparison moves to the end of its block, where the branch fuses with
+// it; constants defined in loops move to the entry block (up to 16 per
+// function), so that a constant needed in a register is made once (the
+// allocator still brings it back by rematerialization, before the loop,
+// when it runs short of registers).
+//
+// The rules, per target:
+//
+//   both     load/store of (a + (b << s)), (a + b)  -> loadx/storex
+//            branch on (x & m) == 0, != 0           -> test
+//            selects (above); a select on (x & m) == 0 or != 0 tests
+//            the C library's sqrt (and sqrtf) on macOS, whose libm never
+//            sets errno                             -> fmath (fsqrt, sqrtsd)
+//   AArch64  s is the access size (or 0) and there is no offset;
+//            c + a * b, c - a * b                   -> madd, msub
+//            x op (y sh k), op in + - & | ^         -> shop
+//            (x >> k) & (2^n - 1)                   -> ubfx
+//            c ? a : b + 1, c ? a + 1 : b (integers) -> csinc
+//            fabs, floor, ceil, trunc, round (and their f32 forms: exact
+//            instructions, no errno)               -> fmath (fabs, frint*)
+//   x86-64   s up to 3, any offset, a frame slot as the base (from %rsp);
+//            a + (b << s), a + b, a + k, a - k (64-bit) -> lea
+//
+// Integer arithmetic wraps, and every machine operation normalizes its
+// result to its type once, so fusing integer operations is exact. Floats
+// are never fused (no fmadd): vole's float arithmetic is IEEE, one
+// rounding per operation.
+
+mod branches;
+mod divisions;
+mod tiling;
+pub mod arch;
+
+use crate::arch::ARCH_USED;
+use crate::back::isel::arch::expand_cpu_features;
+use crate::back::isel::branches::{form_selects, lower_sels, thread_phi_branches};
+use crate::back::isel::divisions::lower_divisions;
+use crate::back::isel::tiling::isel_function;
+use crate::back::regalloc::prepare::layout_blocks;
+use crate::base::{alloc_array, free};
+use crate::base::target::X86;
+use crate::front::types::{TY_F64, is_float, is_vector, type_size};
+use crate::middle::ctx::FnCtx;
+use crate::middle::inline::FN_LIVE;
+use crate::middle::ir::{
+    IRFUNCS, IRFUNC_COUNT, Op, Term, ir_append, ir_enter, ir_insert_before, ir_operand,
+    ir_operand_count, ir_unlink,
+};
+use crate::middle::ir::Op::{Cmp, Const, Copy, Load, LoadX, Param, Store, StoreX, Test};
+use crate::middle::ir::verify::verify_func;
+use crate::middle::opt::{eliminate_dead_code, resolve_all};
+
+pub fn select_instructions(cx: sink *FnCtx) {
+    unsafe {
+        for fi in 0..IRFUNC_COUNT {
+            if FN_LIVE[fi] != 0 {
+                select_function(cx, fi);
+            }
+        }
+    }
+}
+
+// Instruction selection for function fi.
+pub fn select_function(cx: sink *FnCtx, fi: i64) {
+    unsafe {
+        ir_enter(cx, fi);
+        if lower_sels(cx, fi) {
+            resolve_all(cx, fi);
+            eliminate_dead_code(cx, fi);
+        }
+        let threaded = thread_phi_branches(cx, fi);
+        if form_selects(cx, fi) || threaded {
+            eliminate_dead_code(cx, fi);
+        }
+        // (0.19: std::arch's run-time feature tests)
+        if ARCH_USED {
+            expand_cpu_features(cx, fi);
+        }
+        lower_divisions(cx, fi);
+        isel_function(cx, fi);
+        eliminate_dead_code(cx, fi);
+        schedule_function(cx, fi);
+        verify_func(cx, fi, c"instruction selection");
+    }
+}
+
+// ---- Use counts ----
+
+fn isel_count_uses(cx: sink *FnCtx, fi: i64) {
+    unsafe {
+        if cx.isel_cap < cx.inst_count + 1 {
+            free(cx.isel_uses as *u8);
+            cx.isel_cap = 2 * cx.inst_count + 1024;
+            cx.isel_uses = alloc_array::<i64>(cx.isel_cap);
+        }
+        for b in IRFUNCS[fi].blocks.items() {
+            if cx.blocks[b].removed != 0 {
+                continue;
+            }
+            var v = cx.blocks[b].first;
+            while v != 0 {
+                cx.isel_uses[v] = 0;
+                v = cx.insts[v].next;
+            }
+        }
+        for b in IRFUNCS[fi].blocks.items() {
+            if cx.blocks[b].removed != 0 {
+                continue;
+            }
+            var v = cx.blocks[b].first;
+            while v != 0 {
+                for k in 0..ir_operand_count(cx, v) {
+                    let operand = ir_operand(cx, v, k);
+                    if operand != 0 {
+                        cx.isel_uses[operand] += 1;
+                    }
+                }
+                v = cx.insts[v].next;
+            }
+            if cx.blocks[b].cond != 0 {
+                cx.isel_uses[cx.blocks[b].cond] += 1;
+            }
+        }
+    }
+}
+
+// One use of `v` less; when it was the last, `v` is dead and so are its
+// own uses.
+fn isel_release(cx: sink *FnCtx, v: i64) {
+    unsafe {
+        if v == 0 {
+            return;
+        }
+        cx.isel_uses[v] -= 1;
+        if cx.isel_uses[v] == 0 && !cx.insts[v].op.has_side_effect() {
+            for k in 0..ir_operand_count(cx, v) {
+                isel_release(cx, ir_operand(cx, v, k));
+            }
+        }
+    }
+}
+
+fn isel_retain(cx: sink *FnCtx, v: i64) {
+    if v != 0 {
+        unsafe { cx.isel_uses[v] += 1; }
+    }
+}
+
+// Whether `v` (an operand of `user`) can be covered by a rule rooted at
+// `user`: an integer instruction `op` of the same block used by `user`
+// alone.
+fn coverable(cx: sink *FnCtx, v: i64, op: Op, user: i64) -> bool {
+    unsafe {
+        v != 0 && cx.insts[v].op == op && cx.insts[v].block == cx.insts[user].block
+            && cx.isel_uses[v] == 1 && !is_float(cx.insts[v].ty)
+    }
+}
+
+fn isel_const(cx: sink *FnCtx, v: i64, out: inout i64) -> bool {
+    unsafe {
+        if v != 0 && cx.insts[v].op == Const && !is_float(cx.insts[v].ty) {
+            out = cx.insts[v].imm;
+            return true;
+        }
+        false
+    }
+}
+
+// Rewrites root `v`'s operands to a, b, c (counting the new uses before
+// releasing the old ones, so that shared leaves stay alive).
+fn isel_set_operands(cx: sink *FnCtx, v: i64, a: i64, b: i64, c: i64) {
+    unsafe {
+        let old_a = cx.insts[v].a;
+        let old_b = cx.insts[v].b;
+        let old_c = cx.insts[v].c;
+        cx.insts[v].a = a;
+        cx.insts[v].b = b;
+        cx.insts[v].c = c;
+        isel_retain(cx, a);
+        isel_retain(cx, b);
+        isel_retain(cx, c);
+        isel_release(cx, old_a);
+        isel_release(cx, old_b);
+        isel_release(cx, old_c);
+    }
+}
+
+// ---- Scheduling ----
+
+fn schedule_function(cx: sink *FnCtx, fi: i64) {
+    unsafe {
+        isel_count_uses(cx, fi);
+        let entry = IRFUNCS[fi].entry;
+        // Loop depths (by layout index), from the allocator's layout.
+        layout_blocks(cx, fi);
+        // Constants go after the entry's parameters (and before its branch's
+        // comparison, which stays last).
+        var at = cx.blocks[entry].first;
+        while at != 0 && cx.insts[at].op == Param {
+            at = cx.insts[at].next;
+        }
+        var hoisted = 0;
+        for b in IRFUNCS[fi].blocks.items() {
+            if cx.blocks[b].removed != 0 || cx.blocks[b].order < 0 {
+                continue;
+            }
+            // The branch's comparison (or test), used by it alone, last.
+            let c = cx.blocks[b].cond;
+            if cx.blocks[b].term == Term::Branch && c != 0 && cx.insts[c].block == b
+                && cx.insts[c].next != 0
+                && (cx.insts[c].op == Cmp || cx.insts[c].op == Test) && cx.isel_uses[c] == 1 {
+                ir_unlink(cx, c);
+                ir_append(cx, b, c);
+            }
+            if !X86 {
+                pair_accesses(cx, b);
+            }
+            if b == entry || cx.ldepth.data[cx.blocks[b].order] == 0 {
+                continue;
+            }
+            var v = cx.blocks[b].first;
+            while v != 0 {
+                let next = cx.insts[v].next;
+                if cx.insts[v].op == Const && cx.isel_uses[v] > 0 && hoisted < 16 {
+                    ir_unlink(cx, v);
+                    if at == 0 {
+                        ir_append(cx, entry, v);
+                    } else {
+                        ir_insert_before(cx, at, v);
+                    }
+                    hoisted += 1;
+                }
+                v = next;
+            }
+        }
+    }
+}
+
+// (0.15) The size of an access ldp or stp can pair (a 64-bit integer or
+// float, a vector), or 0.
+fn pair_size(cx: sink *FnCtx, v: i64) -> i64 {
+    unsafe {
+        let ty = if cx.insts[v].op == Load { cx.insts[v].ty } else { cx.insts[v].imm2 };
+        if is_vector(ty) {
+            16
+        } else if type_size(ty) == 8 && (!is_float(ty) || ty == TY_F64) {
+            8
+        } else {
+            0
+        }
+    }
+}
+
+// (0.15, AArch64) Loads (stores) of one base at offsets one access apart
+// are put side by side, the lower offset first, for emission to make them
+// one ldp (stp): a load moves up to the other, past no store or call; a
+// store moves down to the other, past no memory access or call. Unrolled
+// copies of a loop body load a[k], b[k], then a[k + 1], b[k + 1].
+fn pair_accesses(cx: sink *FnCtx, b: i64) {
+    unsafe {
+        var w = cx.blocks[b].first;
+        while w != 0 {
+            let next = cx.insts[w].next;
+            let op = cx.insts[w].op;
+            let size = if op == Load || op == Store { pair_size(cx, w) } else { 0 };
+            if size != 0 && (op == Store || cx.isel_uses[w] > 0) {
+                var v = cx.insts[w].prev;
+                var steps = 0;
+                while v != 0 && steps < 16 {
+                    let vop = cx.insts[v].op;
+                    if vop == op && cx.insts[v].a == cx.insts[w].a && pair_size(cx, v) == size
+                        && (cx.insts[v].imm + size == cx.insts[w].imm
+                            || cx.insts[w].imm + size == cx.insts[v].imm)
+                        && (op == Store
+                            || (cx.isel_uses[v] > 0 && cx.insts[v].ty == cx.insts[w].ty))
+                        && (op == Load || cx.insts[v].imm2 == cx.insts[w].imm2) {
+                        if op == Load {
+                            ir_unlink(cx, w);
+                            if cx.insts[v].imm < cx.insts[w].imm {
+                                insert_after(cx, v, w);
+                            } else {
+                                ir_insert_before(cx, v, w);
+                            }
+                        } else {
+                            ir_unlink(cx, v);
+                            if cx.insts[v].imm < cx.insts[w].imm {
+                                ir_insert_before(cx, w, v);
+                            } else {
+                                insert_after(cx, w, v);
+                            }
+                        }
+                        break;
+                    }
+                    // What the move may not pass.
+                    if vop.is_call() || vop == Store || vop == StoreX || vop == Copy
+                        || vop == Op::Phi || (op == Store && (vop == Load || vop == LoadX))
+                        || vop == Op::Atomic || vop == Op::Fence
+                        || cx.insts[v].block != b {
+                        break;
+                    }
+                    v = cx.insts[v].prev;
+                    steps += 1;
+                }
+            }
+            w = next;
+        }
+    }
+}
+
+// Puts unlinked instruction y right after x.
+fn insert_after(cx: sink *FnCtx, x: i64, y: i64) {
+    unsafe {
+        if cx.insts[x].next != 0 {
+            ir_insert_before(cx, cx.insts[x].next, y);
+        } else {
+            ir_append(cx, cx.insts[x].block, y);
+        }
+    }
+}

@@ -1,0 +1,365 @@
+// std::collections::btree_map: BTreeMap and BTreeSet (0.20), ordered by
+// their keys' Ord, on the B-tree engine (btree_node.vl).
+
+use std::{Allocator, Ambient, Debug, Drop, Fmt, Gpa, Iterator, Option, Ord};
+use super::btree_node::{BTreeIter, BTreeRaw};
+
+// ---- BTreeMap and BTreeSet (0.20) ----
+
+// A map from K to V kept in key order (Rust's BTreeMap: 11 pairs a node,
+// a linear search in each). `iter()` and `range(lo, hi)` give the pairs
+// in order; `first_key_value`, `pop_first` and their `last` forms the
+// ends.
+#[sealed]
+pub struct BTreeMap<K: Ord, V, A: Allocator = Gpa> {
+    tree: BTreeRaw<K, V, A>,
+}
+
+impl<K: Ord, V, A: Allocator> BTreeMap<K, V, A> {
+    // An empty map on allocator a.
+    pub fn new_in(a: sink A) -> BTreeMap<K, V, A> {
+        BTreeMap { tree: BTreeRaw::new_in(a) }
+    }
+
+    #[inline]
+    pub fn len(self) -> i64 {
+        self.tree.len()
+    }
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.tree.len() == 0
+    }
+
+    // The value of key, as a copy, if it has one.
+    pub fn get(self, key: sink K) -> Option<V> {
+        let (found, h) = self.tree.search(|k: K| key.cmp(k));
+        // (h: from this search)
+        if found { Option::Some(unsafe { self.tree.read_val(h) }) } else { Option::None }
+    }
+
+    pub fn contains_key(self, key: sink K) -> bool {
+        self.tree.search(|k: K| key.cmp(k)).0
+    }
+
+    // The value of key in place, a writable view of one element (as
+    // HashMap's get_mut), until the map's next insert or remove.
+    #[views(self)]
+    pub fn get_mut(inout self, key: sink K) -> Option<inout [V]> {
+        let (found, h) = self.tree.search(|k: K| key.cmp(k));
+        if !found {
+            return Option::None;
+        }
+        let p = unsafe { self.tree.val_ptr(h) };
+        Option::Some(unsafe { &p[0..1] })
+    }
+
+    // Sets the value of key; returns its old value, if it had one.
+    #[stores(key, value)]
+    pub fn insert(inout self, key: sink K, value: sink V) -> Option<V> {
+        let (found, h) = self.tree.search(|k: K| key.cmp(k));
+        if found {
+            // (the old value moves out, the new one in)
+            let p = unsafe { self.tree.val_ptr(h) };
+            let old = unsafe { *p };
+            unsafe {
+                *p = value;
+            }
+            return Option::Some(old);
+        }
+        unsafe {
+            self.tree.insert_at(h, key, value);
+        }
+        Option::None
+    }
+
+    // Removes key; returns its value, if it had one (the stored key is
+    // dropped).
+    pub fn remove(inout self, key: sink K) -> Option<V> {
+        let (found, h) = self.tree.search(|k: K| key.cmp(k));
+        if !found {
+            return Option::None;
+        }
+        let (_, v) = unsafe { self.tree.remove_kv(h) };
+        Option::Some(v)
+    }
+
+    // The smallest key and its value (copies).
+    pub fn first_key_value(self) -> Option<(K, V)> {
+        self.iter().next()
+    }
+
+    // The largest key and its value (copies).
+    pub fn last_key_value(self) -> Option<(K, V)> {
+        self.iter().next_back()
+    }
+
+    // Removes the pair with the smallest key and returns it.
+    pub fn pop_first(inout self) -> Option<(K, V)> {
+        if self.tree.len() == 0 {
+            return Option::None;
+        }
+        // (the first pair of the tree as it is)
+        unsafe {
+            let kv = self.tree.first_leaf_edge().next_kv();
+            Option::Some(self.tree.remove_kv(kv))
+        }
+    }
+
+    // Removes the pair with the largest key and returns it.
+    pub fn pop_last(inout self) -> Option<(K, V)> {
+        if self.tree.len() == 0 {
+            return Option::None;
+        }
+        unsafe {
+            let kv = self.tree.last_leaf_edge().next_back_kv();
+            Option::Some(self.tree.remove_kv(kv))
+        }
+    }
+
+    // The pairs in key order (copies): a view of the map; `next_back`
+    // from the end.
+    #[views(self)]
+    pub fn iter(self) -> BTreeIter<K, V, A> {
+        self.tree.iter()
+    }
+
+    // The pairs whose keys are in [lo, hi), in order (Rust's
+    // `range(lo..hi)`; `range_inclusive` for [lo, hi]).
+    #[views(self)]
+    pub fn range(self, lo: sink K, hi: sink K) -> BTreeIter<K, V, A> {
+        let front = self.tree.lower_edge(|k: K| lo.cmp(k), false);
+        let back = self.tree.lower_edge(|k: K| hi.cmp(k), false);
+        let ok = !(lo.cmp(hi) > 0);
+        // (both from this tree, as it is)
+        unsafe { self.tree.iter_between(front, if ok { back } else { front }) }
+    }
+
+    // The pairs whose keys are in [lo, hi], in order.
+    #[views(self)]
+    pub fn range_inclusive(self, lo: sink K, hi: sink K) -> BTreeIter<K, V, A> {
+        let front = self.tree.lower_edge(|k: K| lo.cmp(k), false);
+        let back = self.tree.lower_edge(|k: K| hi.cmp(k), true);
+        let ok = !(lo.cmp(hi) > 0);
+        unsafe { self.tree.iter_between(front, if ok { back } else { front }) }
+    }
+
+    // Removes every pair (dropped) and gives the memory back.
+    pub fn clear(inout self) {
+        self.tree.free();
+    }
+
+    // The same as clear.
+    pub fn free(inout self) {
+        self.tree.free();
+    }
+
+    pub fn allocator(self) -> A {
+        self.tree.allocator()
+    }
+
+    // (tests) The tree's invariants: "" when they hold.
+    pub fn check(self) -> [u8] {
+        self.tree.check(|a: K, b: K| a.cmp(b) < 0)
+    }
+
+    // (tests) The tree's height.
+    pub fn height(self) -> i64 {
+        self.tree.height()
+    }
+}
+
+impl<K: Ord, V, A: Allocator> Drop for BTreeMap<K, V, A> {
+    fn drop(inout self) {
+        self.tree.free();
+    }
+}
+
+impl<K: Ord, V, A: Allocator + Ambient> BTreeMap<K, V, A> {
+    #[ambient("BTreeMap::new_in(gpa)")]
+    pub fn new() -> BTreeMap<K, V, A> {
+        BTreeMap::new_in(A::ambient())
+    }
+}
+
+// `{k: v, ...}` in key order.
+impl<K: Ord + Debug, V: Debug, A: Allocator> Debug for BTreeMap<K, V, A> {
+    fn fmt_debug(self, f: inout Fmt) {
+        f.byte('{');
+        var first = true;
+        for (k, v) in self.iter() {
+            if !first {
+                f.str(", ");
+            }
+            first = false;
+            f.debug(k);
+            f.str(": ");
+            f.debug(v);
+        }
+        f.byte('}');
+    }
+}
+
+// A set of T kept in order (Rust's BTreeSet), a BTreeMap<T, ()>.
+#[sealed]
+pub struct BTreeSet<T: Ord, A: Allocator = Gpa> {
+    tree: BTreeRaw<T, (), A>,
+}
+
+impl<T: Ord, A: Allocator> BTreeSet<T, A> {
+    pub fn new_in(a: sink A) -> BTreeSet<T, A> {
+        BTreeSet { tree: BTreeRaw::new_in(a) }
+    }
+
+    #[inline]
+    pub fn len(self) -> i64 {
+        self.tree.len()
+    }
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.tree.len() == 0
+    }
+
+    pub fn contains(self, x: sink T) -> bool {
+        self.tree.search(|k: T| x.cmp(k)).0
+    }
+
+    // Adds x; false when the set had it already (x is dropped then).
+    #[stores(x)]
+    pub fn insert(inout self, x: sink T) -> bool {
+        let (found, h) = self.tree.search(|k: T| x.cmp(k));
+        if found {
+            return false;
+        }
+        unsafe {
+            self.tree.insert_at(h, x, ());
+        }
+        true
+    }
+
+    // Removes x; false when the set did not have it.
+    pub fn remove(inout self, x: sink T) -> bool {
+        let (found, h) = self.tree.search(|k: T| x.cmp(k));
+        if !found {
+            return false;
+        }
+        unsafe {
+            self.tree.remove_kv(h);
+        }
+        true
+    }
+
+    // The smallest value (a copy).
+    pub fn first(self) -> Option<T> {
+        match self.tree.iter().next() {
+            Option::Some(e) => Option::Some(e.0),
+            Option::None => Option::None,
+        }
+    }
+
+    // The largest value (a copy).
+    pub fn last(self) -> Option<T> {
+        match self.tree.iter().next_back() {
+            Option::Some(e) => Option::Some(e.0),
+            Option::None => Option::None,
+        }
+    }
+
+    pub fn pop_first(inout self) -> Option<T> {
+        if self.tree.len() == 0 {
+            return Option::None;
+        }
+        unsafe {
+            let kv = self.tree.first_leaf_edge().next_kv();
+            Option::Some(self.tree.remove_kv(kv).0)
+        }
+    }
+
+    pub fn pop_last(inout self) -> Option<T> {
+        if self.tree.len() == 0 {
+            return Option::None;
+        }
+        unsafe {
+            let kv = self.tree.last_leaf_edge().next_back_kv();
+            Option::Some(self.tree.remove_kv(kv).0)
+        }
+    }
+
+    // The values in order (copies): a view of the set.
+    #[views(self)]
+    pub fn iter(self) -> BTreeSetIter<T, A> {
+        BTreeSetIter { it: self.tree.iter() }
+    }
+
+    // The values in [lo, hi), in order.
+    #[views(self)]
+    pub fn range(self, lo: sink T, hi: sink T) -> BTreeSetIter<T, A> {
+        let front = self.tree.lower_edge(|k: T| lo.cmp(k), false);
+        let back = self.tree.lower_edge(|k: T| hi.cmp(k), false);
+        let ok = !(lo.cmp(hi) > 0);
+        BTreeSetIter { it: unsafe { self.tree.iter_between(front, if ok { back } else { front }) } }
+    }
+
+    pub fn clear(inout self) {
+        self.tree.free();
+    }
+
+    pub fn free(inout self) {
+        self.tree.free();
+    }
+}
+
+impl<T: Ord, A: Allocator> Drop for BTreeSet<T, A> {
+    fn drop(inout self) {
+        self.tree.free();
+    }
+}
+
+impl<T: Ord, A: Allocator + Ambient> BTreeSet<T, A> {
+    #[ambient("BTreeSet::new_in(gpa)")]
+    pub fn new() -> BTreeSet<T, A> {
+        BTreeSet::new_in(A::ambient())
+    }
+}
+
+// A set's values in order: a view of the set.
+pub struct BTreeSetIter<T, A: Allocator> {
+    it: BTreeIter<T, (), A>,
+}
+
+impl<T, A: Allocator> BTreeSetIter<T, A> {
+    pub fn next_back(inout self) -> Option<T> {
+        match self.it.next_back() {
+            Option::Some(e) => Option::Some(e.0),
+            Option::None => Option::None,
+        }
+    }
+}
+
+impl<T, A: Allocator> Iterator for BTreeSetIter<T, A> {
+    type Item = T;
+
+    fn next(inout self) -> Option<T> {
+        match self.it.next() {
+            Option::Some(e) => Option::Some(e.0),
+            Option::None => Option::None,
+        }
+    }
+}
+
+// `{a, b, ...}` in order.
+impl<T: Ord + Debug, A: Allocator> Debug for BTreeSet<T, A> {
+    fn fmt_debug(self, f: inout Fmt) {
+        f.byte('{');
+        var first = true;
+        for x in self.iter() {
+            if !first {
+                f.str(", ");
+            }
+            first = false;
+            f.debug(x);
+        }
+        f.byte('}');
+    }
+}

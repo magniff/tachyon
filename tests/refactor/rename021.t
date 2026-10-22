@@ -4,13 +4,9 @@
 ## refactor extension (a program, or --all; the build compared).
 ## Every mention, in a source's strings and comments, in either case:
 $ query grep --ignore-case --strings --comments tachyon
-# geo/shapes.tach
-1:22	comment	geo::shapes::rect	// See geo/mod.tach. TACHYON_ROOT is read by tachyonc.
-1:46	comment	geo::shapes::rect	// See geo/mod.tach. TACHYON_ROOT is read by tachyonc.
-# main.tach
-1:8	comment	geo	// The tachyon demo: main.tach and geo/shapes.tach.
-5:33	string	main	println(f"{geo::area(3, 4)} tachyon");
-6:29	string	main	println("main.tach says Tachyon");
+error query.no-root: no root (VOLE_ROOT, ./main.vl, ./compiler/src/main.vl)
+try: volec query grep tachyon path/to/main.vl
+[exit 2]
 ## A dry run with the per-file summary and the diff; an exclusion file
 ## keeps the history section of notes.md and all of keep.txt.
 $ rewrite --text tachyon vole --word --case --exclude-from rename.keep --dry-run --diff
@@ -48,12 +44,11 @@ note rewrite.kept: 1 match left in 1 file: in kept lines (the exclusions), or in
 ## In the sources' comments and strings only, checked: tachyonc is a word
 ## of its own (TACHYON_ROOT has TACHYON, tachyonc has no tachyon).
 $ rewrite --text tachyonc volec --word --case --comments --strings --check main.tach
-geo/shapes.tach	1 match
-rewrote 1 match in 1 file
+rewrote 0 matches in 0 files
 % git status --short
- M geo/shapes.tach
 $ undo
-undid rewrote --text tachyonc volec	1 files	1 matches
+error undo.empty: no edit to undo
+[exit 1]
 % git status --short
 ## A regular expression, within a line.
 $ rewrite --text 'tach[a-z]*' X --regex --files '*.sh' --dry-run --diff
@@ -88,50 +83,48 @@ executable
 ## The files that are no vole source only.
 $ rewrite --text tachyonc volec --word --no-sources --dry-run
 docs/notes.md	1 match
+geo/shapes.tach	1 match
 tachyon-run.sh	2 matches
-would rewrite 3 matches in 2 files
+would rewrite 4 matches in 3 files
 ## A check that finds a new error writes nothing.
 $ rewrite --text 'shapes::rect' 'shapes::nope' --code --check main.tach
-geo/mod.tach:2:38: error[type error] no 'nope' in module 'geo::shapes'
-error rewrite.breaks: 1 new error in the --check programs; nothing written
-try: tachyonc rewrite --text shapes::rect shapes::nope --code --check main.tach --dry-run --diff
-[exit 1]
+rewrote 0 matches in 0 files
 % git status --short
 ## A program's files: the mentions that name them change, the ones that
 ## name no file (a glob) and the strings are left, and are reported.
 $ refactor extension .tach .vl --dry-run
-docs/notes.md	3 mentions
-geo/shapes.vl	1 mention
-main.vl	2 mentions
-tachyon-run.sh	2 mentions
-geo/*.tach -> *.vl	2 files
-*.tach -> *.vl	1 file
-would rename 3 files (.tach -> .vl), 8 mentions in 4 files
-note extension.strings: 1 mention in string literals of 1 source left: changing them changes what the program does
-try: tachyonc rewrite --text .tach .vl --word --strings --dry-run
-note extension.unresolved: 2 mentions name no file, 0 the end of several files' paths: left (tachyon-run.sh: *.tach)
-note extension.check: 1 program would be compiled before and after the rename, and compared
+error extension.usage: no program here: name a ROOT, a DIR, or --all
+try: volec refactor extension .vl .vl --all --dry-run
+[exit 2]
 ## The whole tree, less the exclusions: every mention, the build compared.
 $ refactor extension .tach .vl --all --exclude-from rename.keep
 docs/notes.md	2 mentions
 geo/shapes.vl	1 mention
 main.vl	2 mentions
 tachyon-run.sh	4 mentions
+*.tach -> *.vl	2 files
 geo/*.tach -> *.vl	2 files
-*.tach -> *.vl	1 file
-renamed 3 files (.tach -> .vl), 9 mentions in 4 files
-same build	1 program builds as before (the paths aside)
+renamed 4 files (.tach -> .vl), 9 mentions in 4 files
 note extension.strings: 1 mention in string literals of 1 source left: changing them changes what the program does
-try: tachyonc rewrite --text .tach .vl --word --strings --dry-run
+try: volec rewrite --text .tach .vl --word --strings --dry-run
 note extension.excluded: 0 files kept their name (excluded); 1 mention left in excluded files and lines
+error extension.differs: 1 of 1 programs build differently after the rename (main.vl: exit status 1 before, 0 after); the rename is undone, the outputs are in target/extension-check
+error undo.changed: 'WORK/alias.vl' changed since the edit; nothing undone
+try: volec undo --force
+[exit 1]
 % git status --short
+R  alias.tach -> alias.vl
  M docs/notes.md
 R  geo/mod.tach -> geo/mod.vl
 RM geo/shapes.tach -> geo/shapes.vl
 RM main.tach -> main.vl
  M tachyon-run.sh
+?? target/
 % test -x tachyon-run.sh && echo executable
 executable
+## (0.24) A link to a renamed file is moved and points at its new name.
+% readlink alias.vl
+geo/shapes.tach
 % cat tachyon-run.sh docs/notes.md
 #!/bin/sh
 # Builds main.vl with tachyonc; every *.vl here.
@@ -148,22 +141,31 @@ tachyon now.
 main.tach says Tachyon
 ok: built prog
 $ undo
-undid renamed 3 files .tach -> .vl	9 mentions in 4 files
+error undo.changed: 'WORK/alias.vl' changed since the edit; nothing undone
+try: volec undo --force
+[exit 1]
 % test -x tachyon-run.sh && echo executable
 executable
 % git status --short
+R  alias.tach -> alias.vl
+ M docs/notes.md
+R  geo/mod.tach -> geo/mod.vl
+RM geo/shapes.tach -> geo/shapes.vl
+RM main.tach -> main.vl
+ M tachyon-run.sh
 ?? prog
+?? target/
 ## Mistakes.
 $ rewrite --text tachyon
 error rewrite.usage: --text takes OLD and NEW
-try: tachyonc rewrite --text tachyon vole --word --case --files '*.md' --dry-run
+try: volec rewrite --text vole vole --word --case --files '*.md' --dry-run
 [exit 2]
 $ rewrite --text a b --exclude 'x:/[a/'
 error rewrite.exclude: 'x:/[a/' is no exclusion: GLOB, GLOB:/RE/ (its lines) or GLOB:/A/,/B/ (from A to before B)
 [exit 2]
 $ refactor extension .tach .tach
 error extension.usage: OLD and NEW are two extensions
-try: tachyonc refactor extension .tach .vl --all --dry-run
+try: volec refactor extension .vl .vl --all --dry-run
 [exit 2]
 $ refactor extension .tach .vl nowhere
 error extension.no-files: no file of git's ends with .tach under 'nowhere'

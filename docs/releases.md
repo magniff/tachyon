@@ -1,7 +1,7 @@
 # Releases and the bootstrap chain
 
-The tachyon compiler is written in tachyon. To build it on a machine that
-has no tachyon compiler yet, the chain of releases is replayed from its
+The vole compiler is written in vole. To build it on a machine that
+has no vole compiler yet, the chain of releases is replayed from its
 root, the seed:
 
 ```
@@ -13,7 +13,7 @@ seed (Rust)  ──builds──▶  0.1.0  ──builds──▶  next release  
   (`seed/rust-toolchain.toml`, `seed/Cargo.lock`), and it only ever has to
   build release 0.1.0. New language features never go into it.
 - **Every release** is a git tag (`v0.1.0`, `v0.2.0`, ...) whose tree is
-  self-contained: the compiler for that release in tachyon (`compiler/`),
+  self-contained: the compiler for that release in vole (`compiler/`),
   its examples (`examples/`), its test suite (`tests/`), the documentation
   of its language (`docs/`), and the chain tooling (`bootstrap/`). The tree
   of `v0.1.0` also holds the seed, so that one tag has everything.
@@ -31,33 +31,94 @@ binary is invoked, where its test runner is and which hosts it supports.
 | release | tag | built by | hosts | introduced |
 |---|---|---|---|---|
 | seed | `seed` | Rust 1.98.0 | aarch64-macos, x86_64-macos, x86_64-linux | the language, and its Rust implementation with a Cranelift backend |
-| 0.1.0 | `v0.1.0` | seed | aarch64-macos, x86_64-linux, x86_64-macos | the compiler in tachyon: the seed's whole language, compiled to AArch64 (Apple's arm64 ABI) and x86-64 (System V, ELF and Mach-O) assembly; a test suite run without cargo |
+| 0.1.0 | `v0.1.0` | seed | aarch64-macos, x86_64-linux, x86_64-macos | the compiler in vole: the seed's whole language, compiled to AArch64 (Apple's arm64 ABI) and x86-64 (System V, ELF and Mach-O) assembly; a test suite run without cargo |
 | 0.2.0 | `v0.2.0` | 0.1.0 | aarch64-macos, x86_64-linux, x86_64-macos | the optimizer: SSA IR, SCCP, instruction combining, GVN, LICM, inlining, linear-scan register allocation; `-O0`/`-O1`/`-O2` (default `-O2`); random differential testing; `bench/` |
 | 0.3.0 | `v0.3.0` | 0.2.0 | aarch64-macos, x86_64-linux, x86_64-macos | aggregates and memory: enums with fields and `match`, methods, slices, C interop (`extern "C"`, `#[repr(C)]`, unions, C's convention for aggregates); SROA, memory forwarding across blocks, dead stores, switches and jump tables; ABI conformance fuzzing |
 | 0.4.0 | `v0.4.0` | 0.3.0 | aarch64-macos, x86_64-linux, x86_64-macos | loops and C headers: the compiler written in the 0.3 language; `import "x.h"` (a C preprocessor and declaration reader) and `--emit-header`; `use`, checked `as` to enums, enum ordering, `size_of`/`align_of`, `for x in s`; loop canonicalization, induction variables, rotation, unrolling, unswitching, strength reduction, value ranges and bounds-check elimination, aggressive DCE, tail recursion elimination |
-| 0.5.0 | `v0.5.0` | 0.4.0 | aarch64-macos, x86_64-linux, x86_64-macos | generics, modules and the back end: generics by monomorphization, modules (`mod`, `pub`, `use`), several errors per compilation, a small `std`; register allocation by linear scan with interval splitting, a calling convention of tachyon's own, frames aligned above 16, instruction selection by rules, block layout, selects, leaf frames, sibling calls |
+| 0.5.0 | `v0.5.0` | 0.4.0 | aarch64-macos, x86_64-linux, x86_64-macos | generics, modules and the back end: generics by monomorphization, modules (`mod`, `pub`, `use`), several errors per compilation, a small `std`; register allocation by linear scan with interval splitting, a calling convention of vole's own, frames aligned above 16, instruction selection by rules, block layout, selects, leaf frames, sibling calls |
 | 0.6.0 | `v0.6.0` | 0.5.0 | aarch64-macos, x86_64-linux, x86_64-macos | interprocedural: the compiler written as a module tree; string literals as slices, `if let`, `defer`, structural `==`, a prelude, inline modules, generic type aliases; a cost-model inliner, attribute inference, interprocedural constants, devirtualization, scalar promotion, heap to stack, global DCE; shrink-wrapping; `--time-passes`, `--stats` |
 | 0.7.0 | `v0.7.0` | 0.6.0 | aarch64-macos, x86_64-linux, x86_64-macos | object files: an assembler in the compiler writes Mach-O and ELF objects, `cc` only links (the compiler builds itself 4.4× faster at `-O2`, 15.7× at `-O0`); fixed-array indexing is checked; the undefined behaviour left is documented |
-| 0.8.0 | `v0.8.0` | 0.7.0 | aarch64-macos, x86_64-linux, x86_64-macos | no wildcard imports: `use x::*` and `import "h.h";` without `as` are removed, every name a file uses is declared, imported by name or written with its path; `tachyonc --fix-imports` rewrites older code |
+| 0.8.0 | `v0.8.0` | 0.7.0 | aarch64-macos, x86_64-linux, x86_64-macos | no wildcard imports: `use x::*` and `import "h.h";` without `as` are removed, every name a file uses is declared, imported by name or written with its path; `volec --fix-imports` rewrites older code |
 | 0.9.0 | `v0.9.0` | 0.8.0 | aarch64-macos, x86_64-linux, x86_64-macos | `unsafe`, traits and an e-graph: `unsafe` blocks and functions (safe code has no undefined behaviour; a warning in 0.9, an error from 0.10), `--fix-unsafe`; traits, bounds, operator traits, std `HashMap` and `sort`; array constants, line continuations; GVN on an acyclic e-graph with rewrite rules checked by `--check-rules` |
 | 0.10.0 | `v0.10.0` | 0.9.0 | aarch64-macos, x86_64-linux, x86_64-macos | vectors and profiles: an unsafe operation outside `unsafe` is an error; vector types (`v4f32`, `v2f64`, ...) on NEON and SSE2; a loop vectorizer; profile-guided optimization; `--check-unsafe`; every error of a compilation reported |
-| 0.11.0 | `v0.11.0` | 0.10.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | feature-complete, and tools for agents: DWARF line tables (`-g`); aarch64-linux as a target and a host; a broader `bench/`, a cost model for the loop vectorizer, unrolling with run-time trip counts, an SLP vectorizer, division by constants, value ranges through phis; `tachyonc query`, `check`, `fix`, `lint`, `same-output`, `edit` by name and semantic refactorings (`refactor rename`, `move`, `signature`, `field`, `variant`, `split`, `rewrite`, scripts, `undo`) |
+| 0.11.0 | `v0.11.0` | 0.10.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | feature-complete, and tools for agents: DWARF line tables (`-g`); aarch64-linux as a target and a host; a broader `bench/`, a cost model for the loop vectorizer, unrolling with run-time trip counts, an SLP vectorizer, division by constants, value ranges through phis; `volec query`, `check`, `fix`, `lint`, `same-output`, `edit` by name and semantic refactorings (`refactor rename`, `move`, `signature`, `field`, `variant`, `split`, `rewrite`, scripts, `undo`) |
 | 0.12.0 | `v0.12.0` | 0.11.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | the compiler's source reorganized through its own tools: folders by phase, no file over 1,000 lines, no re-exports, tidy imports, output identical to 0.11's; `edit patch`, `edit insert --in`, `query text`, a module's `use` lines and header as targets, `fix --only reexports` and `tidy-imports`, `split --reexport`; the release gate in one command (`bootstrap/gate.sh`) |
-| 0.13.0 | `v0.13.0` | 0.12.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | the tools, improved from 0.12's record: `edit patch` inside a line, `--pairs`, `edit wrap`, `edit new-file`, `signature --default`, `fix --in` over a subtree; section banners, `query grep`, `query type`, kinds of references; an on-disk cache (a query or `check` of an unchanged program in about 6 to 8 ms); `split` part names, layout kept by `move` and `split`, `refactor extract-function` and `inline`; `tachyonc fmt` (the tree formatted), `explain` and `guide` |
+| 0.13.0 | `v0.13.0` | 0.12.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | the tools, improved from 0.12's record: `edit patch` inside a line, `--pairs`, `edit wrap`, `edit new-file`, `signature --default`, `fix --in` over a subtree; section banners, `query grep`, `query type`, kinds of references; an on-disk cache (a query or `check` of an unchanged program in about 6 to 8 ms); `split` part names, layout kept by `move` and `split`, `refactor extract-function` and `inline`; `volec fmt` (the tree formatted), `explain` and `guide` |
 | 0.14.0 | `v0.14.0` | 0.13.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | closures and iterators: closures (captures by value or by reference, `move`, `Fn`/`FnMut` bounds, a non-capturing closure is a `fn`, an escape check); associated types; an `Iterator` trait, `for` over anything iterable, ranges as values, std's sources, adapters and consumers, chains compiled to the hand-written loop; std reads stdin (`read_line`, `read_stdin`, `Scanner`), text helpers, values changed in place, an introsort; did-you-mean across the program and std, helps for Rust habits; the tools on a user's program; the agent eval (`tests/agent-eval/`) and its 0.13 baseline |
 | 0.15.0 | `v0.15.0` | 0.14.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | errors, conversions, less boilerplate: `?` on `Option` and `Result`, generic traits, `From`/`Into`, `main` returning `Result`, std's I/O on `Result` with typed errors (`fix --only std015` moves 0.14 code); lossless integer widening and joins, `i64::MAX`; f-strings over `Display` and `Debug`, generic `print`/`format`; `#[derive(Eq, Ord, Hash, Debug, Clone)]`; named and default arguments, field shorthand; `==` on `Vec`, `Buf`, `HashMap` by contents; std loaded by sections; if-conversion, vector masks and min/max reductions, split accumulators, `ldp`/`stp` (iterloop from 2.1 to about 1.05 times C); the tools for agents (`query context`, budgets, std from any program, `try`, `batch`, `edit apply`, merge conflicts, `--json`, the check hook); back end, gen0 and base on closures and iterators; algorithm and tool examples; six harder eval tasks |
 | 0.16.0 | `v0.16.0` | 0.15.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | effects and explicit allocation: inferred effect sets (`alloc(A)`, `io`, `global`, `panic`, `diverge`, `unsafe`) shown by `query effects` (`--why`, `--has`), `#[pure]`/`#[no_alloc]`/`#[no_io]`/`#[no_panic]`/`#[effects(..)]` and `effects(..)` bounds checked transitively (std's `Eq`/`Ord`/`Hash` pure), `--verify-effects`; allocation explicit (`fn main(gpa: Gpa)`, `Vec::new_in(gpa)`, `fix --only alloc016` moves 0.15 code), the `Allocator` trait, `Gpa`, arenas, `arena_scope`, `FixedBuf`, a `Fmt` that never allocates; `#[sealed]` std types, `#[scoped]` arenas; `--check-alloc` (use after free, double free, leaks, arena resets and scopes); pure calls numbered and hoisted, arena allocation without a call; link inputs on the command line (`x.c`, `-l`, `-L`); examples in folders with READMEs, C interop and language tours; the compiler's source on 0.15's features; compiler tasks in the agent eval |
-| 0.17.0 | `v0.17.0` | 0.16.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | memory safety by mutable value semantics: owned values (`Vec`, `Buf`, `HashMap`, `Drop` types, what holds one) move and are dropped at the end of their scope (`Drop`, generated drop glue, drop flags, `.clone()` explicit); references `&T`/`&mut T` and slices split into read-only `[T]` and exclusive `&mut [T]`, second-class: views checked so none outlives or is invalidated under what it views, with inferred view summaries (`views(..)`, `stores(..)`, `#[views]` pins), two-phase receivers and reborrows, no lifetime annotations; `--values=error` the default (`warn`, `report`, `off` for 0.17 only); noalias and read-only facts from reference parameters, NRVO, moves elided in loops; std on values (`Drop` for the containers, `&Self`/`&mut Self` receivers, sorts on `&mut [T]`, `Eq`/`Ord`/`Hash` on `&Self`); `fix --values` and the corpus migrated; `query own`, `query views`, `explain own.*`, tests/own-try; familiar forms (`&mut x`, `v[i]` on Vec and Buf, indexing through a pointer by its type, `p.0`, `len()`, `panic`/`unreachable`, a larger prelude, module paths in code resolved as `use` lines, struct-like enum variants); `fix --suggested`, the `&f` diagnostic; `--trace`, `probe`, `reduce`, `tachyonc test`, `guide debug`; compile speed (per-function IR and pipeline, -O1 leaf inlining, f-strings written in place: the compiler compiles itself 14% faster at -O0, 37% at -O2, in a third less memory) |
-| 0.18.0 | `v0.18.0` | 0.17.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | contracts and verification in the language: `requires`/`ensures` (`result`, `old(..)`, `else` messages, `debug` clauses), checked at run time, a requires at the call so the caller is blamed, pure conditions (`contract.effect`); std's own clauses (`unwrap`, `Vec::get`, ...); `assert`, `assert_eq`, `assert_ne`, `debug_assert`; every run-time check one line `FILE:LINE:COL: message` with the condition and its values; `query checks` (the checks the optimizer proved away and those left), `--no-positions`; `#[test]`, `#[cfg(test)]` modules, `assert_snapshot`, `#[property]` with inputs generated from the types and shrunk, contracts tested as properties, `#[fuzz]` with block coverage (`--coverage`, `tachyonc fuzz`), leaks failing a test; `tachyonc test` builds at -O0 and -O2 and compares them; `reduce` over programs (`--differs`, `--fails`, `--test`); `type X = distinct T`, `std::NonNull<T>` with the null niche (`Option<NonNull<T>>` is a pointer, FFI-safe, `_Nonnull` imported) and a checked `as NonNull<T>`; std's `Display`, `Debug`, `Iterator`, `Clone` on references, `fix --values` over traits; the agent eval's `+debrief` |
+| 0.17.0 | `v0.17.0` | 0.16.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | memory safety by mutable value semantics: owned values (`Vec`, `Buf`, `HashMap`, `Drop` types, what holds one) move and are dropped at the end of their scope (`Drop`, generated drop glue, drop flags, `.clone()` explicit); references `&T`/`&mut T` and slices split into read-only `[T]` and exclusive `&mut [T]`, second-class: views checked so none outlives or is invalidated under what it views, with inferred view summaries (`views(..)`, `stores(..)`, `#[views]` pins), two-phase receivers and reborrows, no lifetime annotations; `--values=error` the default (`warn`, `report`, `off` for 0.17 only); noalias and read-only facts from reference parameters, NRVO, moves elided in loops; std on values (`Drop` for the containers, `&Self`/`&mut Self` receivers, sorts on `&mut [T]`, `Eq`/`Ord`/`Hash` on `&Self`); `fix --values` and the corpus migrated; `query own`, `query views`, `explain own.*`, tests/own-try; familiar forms (`&mut x`, `v[i]` on Vec and Buf, indexing through a pointer by its type, `p.0`, `len()`, `panic`/`unreachable`, a larger prelude, module paths in code resolved as `use` lines, struct-like enum variants); `fix --suggested`, the `&f` diagnostic; `--trace`, `probe`, `reduce`, `volec test`, `guide debug`; compile speed (per-function IR and pipeline, -O1 leaf inlining, f-strings written in place: the compiler compiles itself 14% faster at -O0, 37% at -O2, in a third less memory) |
+| 0.18.0 | `v0.18.0` | 0.17.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | contracts and verification in the language: `requires`/`ensures` (`result`, `old(..)`, `else` messages, `debug` clauses), checked at run time, a requires at the call so the caller is blamed, pure conditions (`contract.effect`); std's own clauses (`unwrap`, `Vec::get`, ...); `assert`, `assert_eq`, `assert_ne`, `debug_assert`; every run-time check one line `FILE:LINE:COL: message` with the condition and its values; `query checks` (the checks the optimizer proved away and those left), `--no-positions`; `#[test]`, `#[cfg(test)]` modules, `assert_snapshot`, `#[property]` with inputs generated from the types and shrunk, contracts tested as properties, `#[fuzz]` with block coverage (`--coverage`, `volec fuzz`), leaks failing a test; `volec test` builds at -O0 and -O2 and compares them; `reduce` over programs (`--differs`, `--fails`, `--test`); `type X = distinct T`, `std::NonNull<T>` with the null niche (`Option<NonNull<T>>` is a pointer, FFI-safe, `_Nonnull` imported) and a checked `as NonNull<T>`; std's `Display`, `Debug`, `Iterator`, `Clone` on references, `fix --values` over traits; the agent eval's `+debrief` |
 | 0.18.1 | `v0.18.1` | 0.18.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | two use-after-free holes in safe code closed (a changed copy of a borrowed owned value; a reference into a Vec across a push); functions compiled in parallel (`-j N`, the same bytes at any N; the -O2 self-compile 2.13 s to 0.72 s at -j8) and incremental rebuilds from a code cache (a one-function edit 0.53 s, byte-identical to clean); V4: every `*T` raw, borrowing only `&`/`&mut`, the compiler and std on references; contracts in generated code (range fixes, `x % n` ranges, entry facts: the contracts bench 25% fewer instructions than without clauses); BinaryHeap/MinHeap, binding modes on references, `&f()` temporaries, let-else and the 0.18 eval's polish; a valgrind row and threads/incremental steps in the gate, a lock on the bootstrap cache |
-| 0.19.0 | `v0.19.0` | 0.18.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | CPU intrinsics and target features: `std::arch` with over 1,775 AArch64 intrinsics (NEON, crc, sha2, sha512, sha3, aes, pmull, dotprod, float), each checked lane by lane against a scalar reference, and 484 x86-64 intrinsics (SSE to AVX2, FMA, BMI, AES-NI, SHA, PCLMULQDQ) encoded as cc does but not run; unsigned, 64-bit and 256-bit vector types; target features inferred like effects, `has`/`detect` guards, foreign architectures constant false, `-C target-cpu`/`target-feature`; run-time detection and `#[multiversion]`; intrinsics pure to the optimizer, never hoisted above their guard, vectors in vector registers; `query arch`, `guide arch`, examples/arch, the fuzzer's arch mode, `tachyonc assemble` |
+| 0.19.0 | `v0.19.0` | 0.18.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | CPU intrinsics and target features: `std::arch` with over 1,775 AArch64 intrinsics (NEON, crc, sha2, sha512, sha3, aes, pmull, dotprod, float), each checked lane by lane against a scalar reference, and 484 x86-64 intrinsics (SSE to AVX2, FMA, BMI, AES-NI, SHA, PCLMULQDQ) encoded as cc does but not run; unsigned, 64-bit and 256-bit vector types; target features inferred like effects, `has`/`detect` guards, foreign architectures constant false, `-C target-cpu`/`target-feature`; run-time detection and `#[multiversion]`; intrinsics pure to the optimizer, never hoisted above their guard, vectors in vector registers; `query arch`, `guide arch`, examples/arch, the fuzzer's arch mode, `volec assemble` |
 | 0.19.1 | `v0.19.1` | 0.19.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | two soundness fixes: the store intrinsics' destination is `&mut [T]` (a store through a read-only view, or while a view of the buffer is used, is an error), and 0.17's transitional rule accepting a read-only `[T]` where `&mut [T]` is wanted is gone (`fix --values` migrates); examples/arch/sha256sum, coreutils-compatible on the SHA-256 instructions, faster than macOS's sha256sum and OpenSSL, about 5 times coreutils' on Linux |
-| 0.20.0 | `v0.20.0` | 0.19.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | parameter conventions in Hylo's spelling, the default syntax: `let` (the default), `inout` with `&x` at the call, `sink`, `var`, accesses used as their values; Rust's spellings `conv.rust` errors with a `try:`, `fix --only conventions` migrates, std, tests, examples, bench and the eval on it (compiler/src on the 0.19 pragma until 0.21); std as a module tree; HashMap/HashSet on a Swiss table (foldhash, SipHash-1-3), BTreeMap/BTreeSet, ipnsort and driftsort; `String` and `str`, std::unicode (UTF-8, graphemes, width, case, Unicode 18), number formatting and parsing; std::io, fs, path, env, process, time, random; owned temporaries dropped at the statement's end; `tachyonc lsp` |
+| 0.20.0 | `v0.20.0` | 0.19.1 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | parameter conventions in Hylo's spelling, the default syntax: `let` (the default), `inout` with `&x` at the call, `sink`, `var`, accesses used as their values; Rust's spellings `conv.rust` errors with a `try:`, `fix --only conventions` migrates, std, tests, examples, bench and the eval on it (compiler/src on the 0.19 pragma until 0.21); std as a module tree; HashMap/HashSet on a Swiss table (foldhash, SipHash-1-3), BTreeMap/BTreeSet, ipnsort and driftsort; `String` and `str`, std::unicode (UTF-8, graphemes, width, case, Unicode 18), number formatting and parsing; std::io, fs, path, env, process, time, random; owned temporaries dropped at the statement's end; `volec lsp` |
 | 0.21.0 | `v0.21.0` | 0.20.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | concurrency: safe `std::thread::spawn` and `scope` with what crosses threads checked (Send and Sync from the types), `std::sync` (atomics with every ordering, Mutex, RawLock, Once, Condvar, mpsc channels), `#[thread_local]`, effects `thread`, `sync`, `tls`, atomics as barriers in the optimizer; the compiler's source in 0.20's conventions, the 0.19 spelling removed (`var`, `inout`, `sink` keywords; the mixed reading only inside fix's migrations); `.vl` sources and `VOLE_*` variables accepted |
 | 0.22.0 | `v0.22.0` | 0.21.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | GPU: `std::gpu`, a wgpu-like API native-first with the Metal backend (device, queue, buffers, textures, samplers, bind groups, compute and render pipelines, command encoders, headless surfaces) over `std::objc`, the sizes of runtime-sized arrays bound per dispatch and draw; `std::gpu::wgsl`, a WGSL compiler to MSL with reflection, `Device::shader_wgsl`; std's section index fixed (a hello world 357 M to 96 M instructions) and a compile-cost gate row; std own-checked; `f(x?)` into a `let` parameter kept alive through the call; `fn(T)` is `fn(let T)` |
 | 0.23.0 | `v0.23.0` | 0.22.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | windows: `std::window`, winit-like with events pulled, on Cocoa (windows, keyboard and text input with IME basics, mouse, scroll, scale, cursor, clipboard, frames on request, watched fds), loaded only when a program names it; voltty (examples/voltty), a terminal emulator on std::window and std::gpu: a core checked against alacritty_terminal by an oracle and a fuzzer, Core Text glyphs in an atlas, one instanced draw of 16-byte cells per frame with `cells.wgsl` through std::gpu::wgsl, damage tracking, no allocation per frame, a shell on a pty; the rename tools for 0.24: `rewrite --text`, `refactor extension`, `query grep --ignore-case`, releases.toml's `bin` and `ext` |
+| 0.24.0 | `v0.24.0` | 0.23.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | **vole**: tachyon renamed (`tachyonc` to `volec`, `.tach` to `.vl`, `TACHYON_*` to `VOLE_*`, symbols `_vole.`; no aliases) by the compiler's own tools and checked by same-output; the releases up to 0.23 still built as tachyonc through releases.toml's `bin` and `ext`; the logo; the language server with a VS Code extension (editors/vscode: highlighting, diagnostics, definitions, references, symbols, hovers with computed effects); `std::cli`, clap's builder without derive; `let` as a borrow, `str` and `Path` views to the own pass, `gl(make())`, the `make().v` double free fixed, an iterator's copied items kept refused (`own.move_out`, a stopgap); timing tests steady under load |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.24
+
+The language is **vole** from this release; the design of the rename is
+docs/refactor.md ("Renaming the language") and tools/rename-vole.sh, the server's
+docs/lsp.md, the parser's docs/design/cli.md and `volec guide cli`.
+
+- **The rename**: tachyon is vole. The compiler is `volec`, sources are
+  `.vl`, the environment's variables `VOLE_*`, the symbols `_vole.`; no
+  aliases are kept. It was done by the compiler's own tools, in one run
+  of tools/rename-vole.sh (`refactor extension .tach .vl --all`,
+  `rewrite --text` for the words in comments, strings and other files),
+  every program's build compared before and after (`same-output`). The
+  chain still builds the releases up to 0.23 as `tachyonc` from `.tach`
+  sources (releases.toml's `bin` and `ext`); v0.23.0 builds this
+  release's `volec`.
+- **The logo** (docs/assets/vole-logo.png), at the top of the README.
+- **The language server and a VS Code extension** (editors/vscode):
+  highlighting for `.vl` (a TextMate grammar with its tests), the
+  editor's brackets and comments, and from `volec lsp`: diagnostics as
+  you type, go to definition, references, document symbols, and hovers
+  showing a function's signature with its effects, declared or inferred,
+  a line of why for each, and its CPU features (a call of a generic
+  function: the instance's).
+- **std::cli**: clap's builder without derive. Flags (counted), options
+  with defaults, positionals (required, multiple), subcommands; typed
+  values (`get_as::<T>`, `FromStr`); generated help and `--version`;
+  errors in one line with a did-you-mean `try:`; the Matches on an
+  allocator (an arena); `parse` is `#[no_io]`. voltty reads its
+  arguments with it.
+- **Language and safety**:
+  - `let` is a borrow: a copyable `let` parameter is passed by reference
+    when the result may hold a view of it, so `DirEntry::file_name(self)`
+    is back;
+  - `str` and `Path` are views to the own pass (a distinct type has its
+    underlying kind);
+  - `gl(make())`: a call's or a struct literal's value given to a
+    generic `let` parameter is a temporary;
+  - `make().v`: a field moved out of a temporary is no longer freed
+    again with it;
+  - **a stopgap for a double free in safe code**: `iter()`, `keys()`,
+    `values()` hand out copies of items the container still owns, and
+    keeping one (collecting, storing, returning, sinking it) freed it
+    twice. Such a keep is now `own.move_out`, with `try:` lines
+    (`.iter_ref().map(|x| x.clone())`); it is broader than needed (a
+    named fn given to `map`, a destructured closure item, are refused
+    too) until iterator items are views.
+- **Timing tests** (voltty's renderer, the sort and parser examples) no
+  longer fail under a loaded machine.
+- **Found by the release gate** and fixed: `volec test` took every
+  `#[test]`, `#[property]` and `#[fuzz]` for a contract, so it replayed
+  no saved fuzz crash (the test list's prefix was cut at the old name's
+  length); `env::args()` reads the arguments and its iterator does no
+  io, so std::cli's `#[no_io]` parse builds on Linux too.
+- **Tested on aarch64 only**, as since 0.15 (`gate.sh --with-x86`).
+- **Breaking**: every name: `volec`, `.vl` (a `.tach` file is not a
+  source any more), `VOLE_*`; programs read through the stopgap above.
+- **Known issues**: a closure's by-value parameters leak; the stopgap's
+  breadth; the four missing-feature XFAILs; std::window's Linux
+  backends are not written; std's core is 144 KB.
 
 ### What's new in 0.23
 
@@ -1634,8 +1695,8 @@ check proves it for every host it runs on):
    x86_64-linux), `bootstrap.sh --host aarch64-linux` runs the chain as
    usual (HEAD built by the last release, its fixpoint and its test suite
    on that host), then has HEAD's compiler compile its own source for
-   aarch64-linux: `target/aarch64-linux/tachyonc.o`, the object of the
-   compiler that runs there (`cc -o tachyonc tachyonc.o -lm` links it
+   aarch64-linux: `target/aarch64-linux/volec.o`, the object of the
+   compiler that runs there (`cc -o volec volec.o -lm` links it
    there). On aarch64-linux itself, `bootstrap.sh` stops with this advice.
 2. On aarch64-linux, the cross-built compiler builds itself. The object it
    writes must be the cross-built one, byte for byte (the host made no
@@ -1702,19 +1763,19 @@ Say the last release is 0.2.0 and you have implemented a feature on main.
    ```
    $ bootstrap/bootstrap.sh            # builds the seed, 0.1.0 and 0.2.0, then HEAD with 0.2.0
    ```
-2. Add the tests for the new behaviour to `tests/` (`tests/run/*.tach` with
+2. Add the tests for the new behaviour to `tests/` (`tests/run/*.vl` with
    `// EXPECT:` ... directives; see `tests/run.sh`), and examples if useful.
    Update `docs/grammar.md` for language changes.
-3. Bump the version string in `compiler/src/main.tach` (`version()`).
+3. Bump the version string in `compiler/src/main.vl` (`version()`).
 4. Add the release to `bootstrap/releases.toml`:
    ```toml
    [[release]]
    version = "0.3.0"
    tag = "v0.3.0"
    compiler = "compiler/src"
-   root = "main.tach"          # from 0.6: the root of the compiler's module tree
+   root = "main.vl"          # from 0.6: the root of the compiler's module tree
    built_by = "0.2.0"
-   cli = "tachyonc-0.1"
+   cli = "volec-0.1"
    tests = "tests/run.sh"
    hosts = ["aarch64-macos", "x86_64-linux", "x86_64-macos"]
    summary = "What 0.3.0 introduced."
@@ -1760,7 +1821,7 @@ intrinsics, `tests/fuzz/run.sh -A`) and `fuzz-seed` (the seed as a
 third oracle); `abi-plain`, `abi-import`, `abi-header`; `objcheck`;
 `layout` (`tests/cimport/layout.sh` on the system headers); `debug`
 (`tests/debug.sh`); `stress-grow` (0.14, not in `--quick`: the compiler
-run with `TACHYON_STRESS_GROW=1`, under which every growth of its tables,
+run with `VOLE_STRESS_GROW=1`, under which every growth of its tables,
 `base::grow`, `buf_reserve` and the symbol tables, moves them, by half
 their size from a capacity of 1, and fills the old block with 0xAA bytes
 and keeps it; a read through a table pointer taken before a growth then
@@ -1774,7 +1835,7 @@ built by `--check-alloc`, whose Gpa puts every block on pages of its own
 and never reuses them, so a use after free, a double free or a wrong free
 in an example stops it with where the block was allocated and freed;
 added after examples/errors-and-results printed an error holding a view
-of memory it had freed; through `TACHYON_TEST_FLAGS=--check-alloc`, which
+of memory it had freed; through `VOLE_TEST_FLAGS=--check-alloc`, which
 a case whose output differs by design with the flag declines with `//
 NO-EXTRA-FLAGS: why`); `valgrind` (0.18.1, `--release` only, in the
 `linux-aarch64` container, where valgrind is: `tests/valgrind.sh`, the
@@ -1786,10 +1847,10 @@ memory to the exit; added after two memory bugs of 0.17, an SLP table
 overflow and a read of the own pass's place -1, passed every macOS check
 and only valgrind showed them; about 2 minutes, beside the container's other steps; on its own:
 `bootstrap/aarch64-linux-check.sh --worktree --dev --compiler
-target/tachyonc --only valgrind`); `compile-cost` (0.21.1, in `--quick`
+target/volec --only valgrind`); `compile-cost` (0.21.1, in `--quick`
 too, a few seconds: `tests/compile_cost.sh`, the instructions retired,
 from `/usr/bin/time -l`, the fewest of three runs, of building a hello
-world and tests/cost/std_heavy.tach and of `check` of a copy of
+world and tests/cost/std_heavy.vl and of `check` of a copy of
 compiler/src, with this compiler and with the newest release built here
 that is not this commit; it fails when a build costs more than 1.5 times
 the release's or `check` more than 1.15 times, and prints the three
@@ -1808,7 +1869,7 @@ need an idle machine.
 (0.15) x86_64 is off by default: `bootstrap/gate.conf` sets `X86=0`, so
 the `linux-x86_64` step (the emulated container: about half of the
 release gate's machine time) is not run; `--with-x86` (or
-`TACHYON_GATE_X86=1`) runs it, `--no-x86` leaves it out whatever the
+`VOLE_GATE_X86=1`) runs it, `--no-x86` leaves it out whatever the
 default. Since then programs are not run on x86_64 by the gate (the
 x86_64-macos suite never was: Rosetta); the x86_64 back end is still
 compiled and same-output still compares its assembly.
@@ -1816,7 +1877,7 @@ compiled and same-output still compares its assembly.
 It stays parallel without overloading the machine: the test runners
 (`tests/run.sh`, `tests/fuzz/run.sh`, `tests/abi/run.sh`,
 `tests/objcheck.sh`) take their slots from one pool, a FIFO named by
-`$TACHYON_JOBSERVER` that the gate fills with `-j` lines (by default one
+`$VOLE_JOBSERVER` that the gate fills with `-j` lines (by default one
 per CPU). Twenty steps share the CPUs, none waits for another's tail, and
 no program runs late enough to hit its timeout.
 
@@ -1845,11 +1906,11 @@ emulated (Rosetta, in colima's VM), aarch64-linux natively, both at once.
 Emulated, gcc and ld now and then crash (a segmentation fault in
 collect2, two in one release run): the runners run `cc` once more when
 it crashed (a signal, or gcc's "internal compiler error"), and say so in
-the case's output; a crash of `cc` is not tachyon's.
+the case's output; a crash of `cc` is not vole's.
 An image is built again only when its recipe (the Dockerfile and the
 files it copies) changes (`--rebuild-image` forces it, for a newer base
 image). The x86_64-linux chain keeps its built releases in a docker
-volume (`tachyon-bootstrap-x86_64-linux`), by tag and commit as
+volume (`vole-bootstrap-x86_64-linux`), by tag and commit as
 `bootstrap.sh` caches them, so a rerun builds only the working tree;
 `gate.sh --fresh` (`linux-check.sh --fresh`) starts from nothing, as a
 new machine does.
@@ -1870,7 +1931,7 @@ where it stopped, and stops after the current batch once
 `target/fuzz-forever/stop` exists:
 
 ```
-$ tests/fuzz/forever.sh &      # --follow: test each new target/tachyonc
+$ tests/fuzz/forever.sh &      # --follow: test each new target/volec
 $ touch target/fuzz-forever/stop
 ```
 
@@ -1879,12 +1940,12 @@ command line), give it a new `cli` value and teach `compile_with` in
 `bootstrap/bootstrap.sh` about it; the script keeps every interface that a
 release in the chain uses. How a release's *source* is laid out is the
 `root` key's business: from 0.6 the compiler is a module tree whose root
-file (`compiler/src/main.tach`) is the only file on the command line; a
-release without `root` (0.1.0 to 0.5.0) is compiled from all the `.tach`
+file (`compiler/src/main.vl`) is the only file on the command line; a
+release without `root` (0.1.0 to 0.5.0) is compiled from all the `.vl`
 files of its `compiler` directory, as one module. The builder's `cli` says
 how to invoke the builder; the release's `root` says what to give it.
 
-From 0.16 the gate gives each test program a minute (`TACHYON_TEST_TIMEOUT`,
+From 0.16 the gate gives each test program a minute (`VOLE_TEST_TIMEOUT`,
 60; tests/run.sh's own default stays 20 s): its steps run side by side
 with the Linux container, and the heavier examples at -O0 took longer
 than 20 s on a loaded machine (the examples-checkalloc step: 2 minutes).
@@ -1894,11 +1955,11 @@ than 20 s on a loaded machine (the examples-checkalloc step: 2 minutes).
 A new host (say `aarch64-linux`) needs:
 
 1. A backend for it in the compiler: an instruction set file next to
-   `compiler/src/gen0/arm64.tach` and `x86_64.tach`, and the back end's
-   `compiler/src/back/mc_arm64.tach` and `mc_x86_64.tach` (or a new
+   `compiler/src/gen0/arm64.vl` and `x86_64.vl`, and the back end's
+   `compiler/src/back/mc_arm64.vl` and `mc_x86_64.vl` (or a new
    object format and ABI in an existing one), a target name in
-   `compiler/src/gen0/target.tach`, and its detection in `host_target()` in
-   `main.tach`. The release that adds it is built on an existing host,
+   `compiler/src/gen0/target.vl`, and its detection in `host_target()` in
+   `main.vl`. The release that adds it is built on an existing host,
    and is checked on the new one by cross-compiling: its assembly for the
    new target must be the same wherever it is produced, and the suite must
    pass there (`tests/run.sh -t <target>`).
@@ -1913,32 +1974,32 @@ starts the chain; that is a decision to document here.
 
 ## Building and testing
 
-With a compiler binary at hand (`target/tachyonc`, as `bootstrap.sh` leaves
+With a compiler binary at hand (`target/volec`, as `bootstrap.sh` leaves
 it), on aarch64-macos:
 
 ```
-$ target/tachyonc compiler/src/main.tach -o tachyonc.s   # the compiler (its root file), by itself
-$ cc -arch arm64 -o tachyonc tachyonc.s -lm
-$ tests/run.sh -c ./tachyonc                            # the test suite, for the host
-$ tests/run.sh -c ./tachyonc prog_                      # only cases named *prog_*
-$ tests/run.sh -c ./tachyonc -t x86_64-macos            # x86-64, under Rosetta
-$ tests/run.sh -c ./tachyonc -O 0                       # at another optimization level
-$ tests/fuzz/run.sh -c ./tachyonc -n 500                # random programs, -O0 vs -O1 vs -O2
-$ tests/abi/run.sh -c ./tachyonc -n 150                 # C interop: random signatures, both ways
-$ tests/objcheck.sh -c ./tachyonc                       # objects (and -g line tables) against cc -c
-$ tests/debug.sh -c ./tachyonc                          # -g under lldb or gdb (0.11)
-$ bench/run.sh -c ./tachyonc                            # benchmarks
+$ target/volec compiler/src/main.vl -o volec.s   # the compiler (its root file), by itself
+$ cc -arch arm64 -o volec volec.s -lm
+$ tests/run.sh -c ./volec                            # the test suite, for the host
+$ tests/run.sh -c ./volec prog_                      # only cases named *prog_*
+$ tests/run.sh -c ./volec -t x86_64-macos            # x86-64, under Rosetta
+$ tests/run.sh -c ./volec -O 0                       # at another optimization level
+$ tests/fuzz/run.sh -c ./volec -n 500                # random programs, -O0 vs -O1 vs -O2
+$ tests/abi/run.sh -c ./volec -n 150                 # C interop: random signatures, both ways
+$ tests/objcheck.sh -c ./volec                       # objects (and -g line tables) against cc -c
+$ tests/debug.sh -c ./volec                          # -g under lldb or gdb (0.11)
+$ bench/run.sh -c ./volec                            # benchmarks
 ```
 
 and on x86_64-linux:
 
 ```
-$ target/tachyonc compiler/src/main.tach -o tachyonc.s
-$ cc -o tachyonc tachyonc.s -lm
-$ tests/run.sh -c ./tachyonc
+$ target/volec compiler/src/main.vl -o volec.s
+$ cc -o volec volec.s -lm
+$ tests/run.sh -c ./volec
 ```
 
-`tachyonc --target T` picks the target (`aarch64-macos`, `aarch64-linux`, `x86_64-linux`,
+`volec --target T` picks the target (`aarch64-macos`, `aarch64-linux`, `x86_64-linux`,
 `x86_64-macos`); the default is the host. The assembly for a target is the
 same on every host, so a compiler can cross-compile itself.
 
@@ -1963,7 +2024,7 @@ On macOS (Apple silicon or Intel):
 ```
 $ xcode-select --install                                  # git and clang
 $ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-$ git clone <repository> tachyon && cd tachyon && git fetch --tags
+$ git clone <repository> vole && cd vole && git fetch --tags
 $ bootstrap/bootstrap.sh
 ```
 
@@ -1972,7 +2033,7 @@ On x86-64 Linux (Debian/Ubuntu shown):
 ```
 $ sudo apt-get install git gcc libc6-dev curl ca-certificates
 $ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-$ git clone <repository> tachyon && cd tachyon && git fetch --tags
+$ git clone <repository> vole && cd vole && git fetch --tags
 $ bootstrap/bootstrap.sh
 ```
 
@@ -1981,7 +2042,7 @@ This builds the seed from the `seed` tag with cargo, builds 0.1.0 (from
 later release (0.2.0 is built by 0.1.0), runs the last release's test
 suite, and finally builds, checks and tests HEAD (`--history full` runs
 every release's test suite as well). It prints a
-summary and leaves the HEAD compiler in `target/tachyonc`.
+summary and leaves the HEAD compiler in `target/volec`.
 
 To check the Linux chain from any machine with docker:
 
@@ -2009,7 +2070,7 @@ passed, so no run sees a half-built entry or deletes another's tree (two
 gates built 0.17.0 into it at once, and one removed the other's tree
 mid-suite). A second run waits for the lock, then finds the entry built;
 a lock whose holder is gone, or older than
-`TACHYON_BOOTSTRAP_LOCK_STALE` minutes (120), is taken over. Options of `bootstrap.sh`:
+`VOLE_BOOTSTRAP_LOCK_STALE` minutes (120), is taken over. Options of `bootstrap.sh`:
 
 ```
 --until 0.1.0      stop after a release: a from-scratch build of any release
