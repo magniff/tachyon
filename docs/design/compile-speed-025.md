@@ -510,17 +510,32 @@ Foundation, CoreText, libobjc and libSystem, and `./voltty -- true` exits
 0 on its own.
 
 **Peak RSS.** The source grew with link_macho.vl, and the syntax tree's
-table (`NODES`, 18 words a node) crossed a doubling: its realloc went
-from 128 to 256 MB, made in the checker. Peak RSS went up as a result:
+table (`NODES`, 128 bytes a node) crossed a doubling: 1,048,591 nodes,
+15 past 2^20. Its realloc from 128 to 256 MB, made in the checker, raised
+the peak RSS:
 
 | run | v0.24.0 source | release-0.25 source |
 |---|---|---|
 | -O0 | 430 MB | 539–564 MB |
 | `check` | 310 MB | 445 MB |
 
-v0.24.0 compiling the same input peaks at 570 MB too, so the cause is
-the input, not the changes. #9 (tables sized up front, a smaller `Node`)
-is the fix, for 0.26.
+v0.24.0 compiling the same input peaks at 570 MB too.
+
+f97c5f70 fixes this. The parser reserves room for 1.25 nodes a token
+before parsing (`base::reserve`); the self-compile makes 0.76 a token.
+The table then never doubles, and the capacity left unused is never
+touched. The stress-grow gate step passes. Peak RSS, v0.24.0 →
+release-0.25:
+
+| run | same input (release-0.25's source) | v0.24.0's source | each its own source |
+|---|---|---|---|
+| `check` | 445 → 307 MB | 307 → 303 | 310 → 311 |
+| -O0 | 570 → 406 | 432 → 400 | 432 → 406 |
+| -O2 | 873 → 851 | 858 → 854 | 862 → 850 |
+
+On the same input, no run peaks higher than with v0.24.0. With each
+compiler on its own source, `check` is up 1 MB: the source itself grew,
+by about 3k lines.
 
 **Against the plan.** In instructions:
 - -O0 fell 49%, `check` 44% and the cold query 75%.
