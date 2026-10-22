@@ -793,9 +793,10 @@ fn main() {
 ```
 
 The list now writes past the end of its memory. And yet, built the
-usual way, the program seems to work:
+usual way, the program seems to work on macOS (on Linux, glibc's
+allocator may notice the damage and abort the program instead):
 
-```console
+```console macos
 $ volec ints.vl -o ints
 ok: built ints
 $ ./ints

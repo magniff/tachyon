@@ -192,13 +192,14 @@ assembly instead of an executable:
 ```console
 $ volec lines.vl -S -o lines.s
 ok: wrote lines.s
-$ grep '^_vole.count' lines.s
-_vole.count_loop:
-_vole.count_iter:
+$ grep -o 'vole\.count_[a-z]*:' lines.s
+vole.count_loop:
+vole.count_iter:
 ```
 
 Assembly is long, and you don't need to read all of it. Find your
-function (its name is in it: `_vole.count_loop` here) and look for the
+function (its name is in it: `_vole.count_loop` on macOS, whose symbols
+start with `_`, `vole.count_loop` on Linux) and look for the
 loop: a label near the top, and a branch back to it at the bottom.
 Here's the heart of `count_loop`, on AArch64:
 
@@ -418,9 +419,9 @@ have special instructions of their own: checksums, encryption,
 hashing, dot products. `std::arch` has them, under the names the
 processor vendors give them, which are the names C and Rust use too
 (*intrinsics*). Here's one: `__crc32cb` does a step of the CRC-32C
-checksum, a byte at a time, in one instruction. Save this as `crc.vl`:
+checksum, a byte at a time, in one instruction. Save this as `crc.vl` (on macOS: the next paragraphs say why):
 
-```vole crc.vl
+```vole crc.vl macos
 use std::arch::aarch64::__crc32cb;
 
 // CRC-32C of s, a byte at a time, by the CPU's crc instruction.
@@ -449,7 +450,7 @@ would stop the program with an "illegal instruction" crash. Vole won't
 let that happen. Build for a generic ARM processor, as a Linux build
 does, and see:
 
-```console
+```console macos
 $ volec -C target-cpu=generic crc.vl -o crc
 error[arch.feature]: 'crc32c_hw' needs crc (from '__crc32cb' at crc.vl:7:13), which 'main' does not know here: the build's features are neon
  --> crc.vl: line 13, column 16

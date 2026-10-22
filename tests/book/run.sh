@@ -28,6 +28,9 @@
 #                 when there is one, else the first file.
 #   ```vole ... warn   compiled without --deny-warnings
 #   ```vole ... skip   not checked at all (say why in the prose)
+#   ```vole ... macos  (0.25) checked on macOS only, with the in, out or
+#                 err block after it (what Apple's baseline or allocator
+#                 gives; say so in the prose); `console macos` likewise
 #   ```in         stdin for the program of the block before it
 #   ```out        after a vole block (and its in block): the program is
 #                 run, and its stdout and stderr together are this text,
@@ -105,7 +108,7 @@ chmod +x "$WORK/bin/volec"
 # out, exit, err, warn, console-NNN. Problems with the annotations go to
 # $WORK/lint.
 split_chapter() {
-    awk -v chap="$2" -v dir="$WORK/units" -v lint="$WORK/lint" '
+    awk -v chap="$2" -v dir="$WORK/units" -v lint="$WORK/lint" -v host="$(uname -s)" '
         function item_line(l) {
             return l ~ /^(pub |fn |struct |enum |union |impl|trait |const |static |type |use |mod |import |extern |unsafe fn |#\[|}|\/\/|$)/
         }
@@ -153,12 +156,13 @@ split_chapter() {
             n = split(info, w, /[ \t]+/)
             lang = (n > 0) ? w[1] : ""
             if (lang == "vole") {
-                fname = ""; skip = 0; warn = 0
+                fname = ""; skip = 0; warn = 0; oskip = 0
                 for (i = 2; i <= n; i++) {
                     if (w[i] ~ /^[A-Za-z_][A-Za-z0-9_]*\.vl$/) fname = w[i]
                     else if (w[i] == "skip") skip = 1
                     else if (w[i] == "warn") warn = 1
-                    else problem("unknown annotation `" w[i] "` on a vole block (NAME.vl, warn, skip)")
+                    else if (w[i] == "macos") { if (host != "Darwin") { skip = 1; oskip = 1 } }
+                    else problem("unknown annotation `" w[i] "` on a vole block (NAME.vl, warn, skip, macos)")
                 }
                 if (skip) { pending = ""; row = 0; nhid = 0; nskip++; next }
                 if (fname == "") {
@@ -208,6 +212,8 @@ split_chapter() {
                 next
             }
             row = 0
+            if ((lang == "in" || lang == "out" || lang == "err") && oskip) next
+            oskip = 0
             if (lang == "in" || lang == "out" || lang == "err") {
                 if (pending == "") { problem("a " lang " block with no vole block right before it"); next }
                 if (lang == "in") {
@@ -227,6 +233,7 @@ split_chapter() {
                 next
             }
             pending = ""
+            if (lang == "console" && host != "Darwin" && info ~ /(^|[ \t])macos([ \t]|$)/) { nskip++; next }
             if (lang == "console") {
                 if (last == "") { last = new_unit(start) }
                 ncons[last]++
