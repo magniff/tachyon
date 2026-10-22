@@ -3,8 +3,9 @@
 // keeps the open documents' texts (full sync); the program is read by a
 // worker (answer.vl), a copy of this process (fork) that reads it once,
 // with those texts in place of the files, publishes its diagnostics and
-// answers definition, references, hover and documentSymbol from the
-// tables the queries answer from. After a change (debounced, DEBOUNCE_MS)
+// answers definition, references, hover, documentSymbol and (0.25)
+// workspace/symbol from the tables the queries answer from; std's
+// definitions are in std's text written as files (stdfiles.vl). After a change (debounced, DEBOUNCE_MS)
 // or a save the worker is replaced by one that reads the program again;
 // a request that comes first replaces it at once.
 //
@@ -22,11 +23,14 @@ use crate::base::{
 use crate::base::json::buf_json_str;
 
 use crate::tools::lsp::json::{at_path, elements, int_at, is_true, member, raw, str_at, str_into};
+use crate::tools::lsp::stdfiles::is_std_path;
 use crate::tools::proc::{buf_cstr, read_file_if, write_file_if};
 use crate::tools::query::{c_slice, parse_digits};
 
 pub mod json;
 mod answer;
+pub mod stdfiles;
+mod words;
 
 // The extension of the language's files, and so of the root every tool
 // looks for (ROOT_STEM then it): the one place it is written.
@@ -493,19 +497,14 @@ fn read_worker(chunk: *u8) -> bool {
 fn ask_worker(method: *u8, id: [u8], msg: [u8], params: i64, empty: *u8, chunk: *u8) {
     unsafe {
         let path = uri_path(str_at(msg, at_path(msg, params, "textDocument.uri")));
-        if path.len == 0 || !use_root(path) {
+        // (0.25: a file of std's, stdfiles.vl: asked of the program read)
+        let of_std = path.len > 0 && ROOT >= 0 && is_std_path(path);
+        if path.len == 0 || !of_std && !use_root(path) {
             respond(id, c_slice(empty));
             return;
         }
         if superseded(path, chunk) {
             respond_error(id, -32801, "content modified");
-            return;
-        }
-        if DIRTY || W_PID < 0 {
-            start_worker();
-        }
-        if W_PID < 0 {
-            respond_error(id, -32603, "the worker could not start");
             return;
         }
         let line = int_at(msg, at_path(msg, params, "position.line"), 0);
@@ -518,7 +517,45 @@ fn ask_worker(method: *u8, id: [u8], msg: [u8], params: i64, empty: *u8, chunk: 
         buf_fmt(req, f"\t{line}\t{ch}\t{if decl { 1 } else { 0 }}\t");
         buf_bytes(req, id);
         buf_byte(req, '\n');
-        write_all(W_IN, buf_slice(req));
+        hand_to_worker(id, buf_slice(req), chunk);
+    }
+}
+
+// workspace/symbol (0.25): the query asked of the program read (none
+// yet: no symbols).
+fn ask_symbols(id: [u8], msg: [u8], params: i64, chunk: *u8) {
+    unsafe {
+        if ROOT < 0 {
+            respond(id, "[]");
+            return;
+        }
+        let q = buf_new();
+        str_into(msg, member(msg, params, "query"), q);
+        let req = buf_new();
+        buf_str(req, c"workspaceSymbol\t");
+        let s = buf_slice(q);
+        for i in 0..s.len {
+            buf_byte(req, if s[i] == '\t' || s[i] == '\n' || s[i] == '\r' { ' ' } else { s[i] });
+        }
+        buf_str(req, c"\t0\t0\t0\t");
+        buf_bytes(req, id);
+        buf_byte(req, '\n');
+        hand_to_worker(id, buf_slice(req), chunk);
+    }
+}
+
+// Hands request line req to the worker (a new one when the program
+// changed), its response forwarded.
+fn hand_to_worker(id: [u8], req: [u8], chunk: *u8) {
+    unsafe {
+        if DIRTY || W_PID < 0 {
+            start_worker();
+        }
+        if W_PID < 0 {
+            respond_error(id, -32603, "the worker could not start");
+            return;
+        }
+        write_all(W_IN, req);
         loop {
             if worker_frames() {
                 return;
@@ -549,7 +586,7 @@ fn initialize(id: [u8], msg: [u8], params: i64) {
         buf_str(r,
             c",\"definitionProvider\":true,\"referencesProvider\":true,\"hoverProvider\":true");
         buf_str(r,
-            c",\"documentSymbolProvider\":true},\"serverInfo\":{\"name\":\"volec\",\"version\":\"");
+            c",\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true},\"serverInfo\":{\"name\":\"volec\",\"version\":\"");
         buf_str(r, crate::version());
         buf_str(r, c"\"}}");
         respond(id, buf_slice(r));
@@ -619,6 +656,8 @@ fn handle(msg: [u8], chunk: *u8) -> bool {
             ask_worker(c"hover", id, msg, params, c"null", chunk);
         } else if method == "textDocument/documentSymbol" {
             ask_worker(c"documentSymbol", id, msg, params, c"[]", chunk);
+        } else if method == "workspace/symbol" {
+            ask_symbols(id, msg, params, chunk);
         } else if idv >= 0 && method.len > 0 {
             let m = buf_new();
             buf_str(m, c"unknown method ");

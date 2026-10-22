@@ -1,0 +1,381 @@
+// std's built-in text as files on disk (0.25, docs/lsp.md): std is in the
+// compiler (front/stdsrc.vl), so a definition in it has no file of the
+// user's. The worker writes std's text once per compiler (its version and
+// a hash of the text) to a cache directory, each of std's files at its
+// path under compiler/std (std.vl, flat/iter.vl, collections/mod.vl...,
+// then gpa.vl, alloc_flag.vl (std::CHECK_ALLOC) and sys/macos.vl or
+// sys/linux.vl, the end std_alloc_tail adds), the files read-only, and answers with their
+// file:// URIs: any client opens them. A position in std's text is one in
+// such a file (a segment), line for line; the text between them (a
+// module's banner and braces, embed.sh's) belongs to the next one.
+//
+// The directory: $XDG_CACHE_HOME/vole when it is set, else
+// ~/Library/Caches/vole on macOS, ~/.cache/vole on Linux; in it
+// std-VERSION-HASH/. It is made under another name and renamed, so a
+// directory with that name is whole.
+
+use crate::base::{
+    BUFS, FILES, FILE_COUNT, IntVec, SRC, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str,
+    cstr, getenv, realpath, streq,
+};
+use crate::base::target::ELF;
+use crate::front::stdsrc::{std_gpa_source, std_sys_len};
+use crate::front::stdtree::built_files;
+use crate::tools::proc::{buf_cstr, read_file_if, write_file_if};
+
+extern "C" {
+    fn mkdir(path: *u8, mode: i32) -> i32;
+    fn access(path: *u8, mode: i32) -> i32;
+    fn rename(from: *u8, to: *u8) -> i32;
+    fn chmod(path: *u8, mode: i32) -> i32;
+    fn unlink(path: *u8) -> i32;
+    fn rmdir(path: *u8) -> i32;
+    fn getpid() -> i32;
+}
+
+// The file of std's built-in text (`<std>`), -1: none (the program does
+// not use std, or std is read from its files: positions in them are in
+// files already).
+pub static var STD_F: i64 = -1;
+// The segments: where each starts and ends in SRC, its path under the
+// directory (a buffer).
+static var SEG_FROM: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var SEG_TO: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var SEG_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The directory (a buffer, without its last `/`), -1: not known.
+static var STD_DIR: i64 = -1;
+
+// The directory the caches are in (a buffer: $XDG_CACHE_HOME/vole,
+// ~/Library/Caches/vole, ~/.cache/vole; made first when `make`), its
+// real path when it is there (as a client names the files: no `..`, no
+// link); -1 when there is no home.
+pub fn cache_base(make: bool) -> i64 {
+    unsafe {
+        let b = buf_new();
+        let xdg = getenv(c"XDG_CACHE_HOME");
+        if xdg != 0 as *u8 && xdg[0] == '/' {
+            buf_str(b, xdg);
+            buf_str(b, c"/vole");
+        } else {
+            let home = getenv(c"HOME");
+            if home == 0 as *u8 || home[0] != '/' {
+                return -1;
+            }
+            buf_str(b, home);
+            buf_str(b, if ELF { c"/.cache/vole" } else { c"/Library/Caches/vole" });
+        }
+        if make {
+            make_dirs(buf_slice(b));
+        }
+        let real = realpath(buf_cstr(b), 0 as *u8);
+        if real == 0 as *u8 {
+            return b;
+        }
+        let r = buf_new();
+        buf_str(r, real);
+        r
+    }
+}
+
+// Whether path is a file of a std cache (`BASE/std-.../...`): the server
+// asks the program it has about it.
+pub fn is_std_path(path: [u8]) -> bool {
+    let base = cache_base(false);
+    if base < 0 {
+        return false;
+    }
+    let b = buf_slice(base);
+    path.len > b.len + 5 && path[0..b.len] == b && path[b.len..b.len + 5] == "/std-"
+}
+
+// Makes directory path and the ones above it (errors ignored: the file
+// written in it says).
+fn make_dirs(path: [u8]) {
+    unsafe {
+        for i in 1..path.len + 1 {
+            if i == path.len || path[i] == '/' {
+                let d = buf_new();
+                buf_bytes(d, path[0..i]);
+                mkdir(buf_cstr(d), 493);
+            }
+        }
+    }
+}
+
+// The directory of path (without its `/`).
+fn dir_of(path: [u8]) -> [u8] {
+    var e = path.len;
+    while e > 0 && path[e - 1] != '/' {
+        e -= 1;
+    }
+    if e > 0 { path[0..e - 1] } else { path[0..0] }
+}
+
+// Whether a banner of embed.sh starts at pos (`// ---- mod std::` or
+// `// ---- end mod std::`).
+fn banner_at(pos: i64, end: i64) -> bool {
+    unsafe {
+        let a = "// ---- mod std::";
+        let b = "// ---- end mod std::";
+        pos + a.len <= end && SRC[pos..pos + a.len] == a
+            || pos + b.len <= end && SRC[pos..pos + b.len] == b
+    }
+}
+
+fn add_segment(from: i64, to: i64, name: [u8]) {
+    unsafe {
+        let n = buf_new();
+        buf_bytes(n, name);
+        SEG_FROM.push(from);
+        SEG_TO.push(to);
+        SEG_NAME.push(n);
+    }
+}
+
+// std's segments (SEG_*), from std_files and the tail's lengths; false
+// when the text is not the one they describe.
+fn find_segments(f: i64) -> bool {
+    unsafe {
+        let base = FILES[f].start;
+        let len = FILES[f].end - base;
+        var starts = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var names = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        built_files(&starts, &names);
+        if names.count == 0 || starts.count != names.count + 1 {
+            return false;
+        }
+        for k in 0..names.count {
+            // (a file ends at the first banner after it: its first module's,
+            // or its own module's end)
+            let next = starts.data[k + 1];
+            var p = starts.data[k];
+            var to = next;
+            while p < next && to == next {
+                if banner_at(base + p, FILES[f].end) {
+                    to = p;
+                }
+                while p < next && SRC[base + p] != '\n' {
+                    p += 1;
+                }
+                p += 1;
+            }
+            add_segment(base + starts.data[k], base + to, cstr(names.data[k] as *u8));
+        }
+        // the end: Gpa's implementation, std::CHECK_ALLOC, the system's file
+        let end = starts.data[names.count];
+        let gpa = buf_new();
+        std_gpa_source(gpa);
+        let g = buf_slice(gpa).len;
+        let sys = std_sys_len();
+        if end + g + sys > len {
+            return false;
+        }
+        add_segment(base + end, base + end + g, "gpa.vl");
+        add_segment(base + end + g, FILES[f].end - sys, "alloc_flag.vl");
+        add_segment(FILES[f].end - sys, FILES[f].end,
+            if ELF { "sys/linux.vl" } else { "sys/macos.vl" });
+        true
+    }
+}
+
+// 64-bit FNV-1a of SRC[from..to], 16 hex digits into b.
+fn put_hash(b: i64, from: i64, to: i64) {
+    unsafe {
+        var h = -3750763034362895579;
+        for p in from..to {
+            h = (h ^ SRC[p] as i64) * 1099511628211;
+        }
+        let hex = "0123456789abcdef";
+        for k in 0..16 {
+            buf_byte(b, hex[(h >> (60 - 4 * k)) & 15]);
+        }
+    }
+}
+
+// The segments and the directory, std's files written when they are not
+// there; false when std is not the built-in text (or no home).
+pub fn std_files_ready() -> bool {
+    unsafe {
+        if STD_DIR >= 0 {
+            return true;
+        }
+        if STD_F >= 0 {
+            return false;
+        }
+        for f in 0..FILE_COUNT {
+            if streq(FILES[f].path, c"<std>") {
+                STD_F = f;
+            }
+        }
+        if STD_F < 0 {
+            return false;
+        }
+        let f = STD_F;
+        let base = cache_base(true);
+        if base < 0 || !find_segments(f) {
+            STD_F = -1;
+            return false;
+        }
+        let dir = buf_new();
+        buf_bytes(dir, buf_slice(base));
+        buf_str(dir, c"/std-");
+        buf_str(dir, crate::version());
+        buf_byte(dir, '-');
+        put_hash(dir, FILES[f].start, FILES[f].end);
+        let there = access(buf_cstr(dir), 0) == 0;
+        if !(there && std_files_match(buf_slice(dir))) && !write_std_files(buf_slice(dir), there) {
+            STD_F = -1;
+            return false;
+        }
+        STD_DIR = dir;
+        true
+    }
+}
+
+// Writes the segments into a new directory, then renames it to dir (a
+// directory there that is not std's text, `stale`, renamed away and
+// removed first); whether dir then holds std's text.
+fn write_std_files(dir: [u8], stale: bool) -> bool {
+    unsafe {
+        let tmp = buf_new();
+        buf_bytes(tmp, dir);
+        buf_fmt(tmp, f".tmp{getpid()}");
+        mkdir(buf_cstr(tmp), 493);
+        for k in 0..SEG_NAME.count {
+            let p = segment_file(buf_slice(tmp), k);
+            make_dirs(dir_of(buf_slice(p)));
+            write_file_if(buf_cstr(p), SRC[SEG_FROM.data[k]..SEG_TO.data[k]]);
+            chmod(buf_cstr(p), 292);
+        }
+        let d = buf_new();
+        buf_bytes(d, dir);
+        if stale {
+            let old = buf_new();
+            buf_bytes(old, dir);
+            buf_fmt(old, f".stale{getpid()}");
+            if rename(buf_cstr(d), buf_cstr(old)) == 0 {
+                remove_segments(buf_slice(old));
+            }
+        }
+        if rename(buf_cstr(tmp), buf_cstr(d)) != 0 {
+            // (another server wrote it first: this copy removed)
+            remove_segments(buf_slice(tmp));
+        }
+        std_files_match(dir)
+    }
+}
+
+// The path of segment k's file in directory dir (a buffer).
+fn segment_file(dir: [u8], k: i64) -> i64 {
+    unsafe {
+        let p = buf_new();
+        buf_bytes(p, dir);
+        buf_byte(p, '/');
+        buf_bytes(p, buf_slice(SEG_NAME.data[k]));
+        p
+    }
+}
+
+// Whether directory dir holds std's text: each segment's file, the same
+// bytes (a directory of the name that another compiler, or a hand, left
+// otherwise is not used: no answer depends on what the cache held).
+fn std_files_match(dir: [u8]) -> bool {
+    unsafe {
+        let text = buf_new();
+        for k in 0..SEG_NAME.count {
+            BUFS[text].len = 0;
+            if !read_file_if(buf_cstr(segment_file(dir, k)), text)
+                || buf_slice(text) != SRC[SEG_FROM.data[k]..SEG_TO.data[k]] {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// Removes the segments' files from directory dir, then their directories
+// and dir (what else is there stays).
+fn remove_segments(dir: [u8]) {
+    unsafe {
+        for k in 0..SEG_NAME.count {
+            unlink(buf_cstr(segment_file(dir, k)));
+        }
+        var k = SEG_NAME.count - 1;
+        while k >= 0 {
+            var sub = dir_of(buf_slice(segment_file(dir, k)));
+            while sub.len > dir.len {
+                let s = buf_new();
+                buf_bytes(s, sub);
+                rmdir(buf_cstr(s));
+                sub = dir_of(sub);
+            }
+            k -= 1;
+        }
+        let d = buf_new();
+        buf_bytes(d, dir);
+        rmdir(buf_cstr(d));
+    }
+}
+
+// The segment of position pos in std's text (one in a banner: the next
+// segment's), or -1 when pos is not in std's text.
+pub fn segment_of(pos: i64) -> i64 {
+    unsafe {
+        if STD_DIR < 0 || pos < FILES[STD_F].start || pos > FILES[STD_F].end {
+            return -1;
+        }
+        for k in 0..SEG_FROM.count {
+            if pos < SEG_TO.data[k] || k + 1 == SEG_FROM.count {
+                return k;
+            }
+        }
+        -1
+    }
+}
+
+pub fn segment_from(k: i64) -> i64 {
+    unsafe { SEG_FROM.data[k] }
+}
+
+pub fn segment_to(k: i64) -> i64 {
+    unsafe { SEG_TO.data[k] }
+}
+
+// The path of segment k's file into b.
+pub fn put_segment_path(b: i64, k: i64) {
+    unsafe {
+        buf_bytes(b, buf_slice(STD_DIR));
+        buf_byte(b, '/');
+        buf_bytes(b, buf_slice(SEG_NAME.data[k]));
+    }
+}
+
+// The path of segment k's file under the directory (`std.vl`,
+// `collections/hash_map.vl`).
+pub fn segment_name(k: i64) -> [u8] {
+    unsafe { buf_slice(SEG_NAME.data[k]) }
+}
+
+// The segment whose file is at path, or -1.
+pub fn segment_by_path(path: [u8]) -> i64 {
+    unsafe {
+        if STD_DIR < 0 {
+            return -1;
+        }
+        let d = buf_slice(STD_DIR);
+        if path.len <= d.len + 1 || path[0..d.len] != d || path[d.len] != '/' {
+            return -1;
+        }
+        let rest = path[d.len + 1..path.len];
+        for k in 0..SEG_NAME.count {
+            if buf_slice(SEG_NAME.data[k]) == rest {
+                return k;
+            }
+        }
+        -1
+    }
+}
+
+pub fn segment_count() -> i64 {
+    unsafe { SEG_NAME.count }
+}

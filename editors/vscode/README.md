@@ -22,8 +22,14 @@ from the compiler's language server, `volec lsp`.
 - **Editing:** comment toggling, bracket matching and auto-closing,
   indentation after an open bracket.
 - **Language server:** started from `volec lsp` over stdio. Errors and
-  warnings appear as you type; F12, Shift+F12, hover and the outline come
-  from the compiler.
+  warnings appear as you type; F12, Shift+F12, hover, the outline and
+  Go to Symbol in Workspace (Cmd/Ctrl+T) come from the compiler, on
+  every name: std's items (`Vec`, `println`, `Gpa`, `std::cli::Command`)
+  open in std's source, which the server writes to a cache directory
+  (`~/Library/Caches/vole/std-*`, `~/.cache/vole/std-*`) and the
+  extension opens read-only; operators, type parameters, names in
+  f-strings and contracts resolve too, and a hover on a keyword
+  (`inout`, `sink`), an attribute or a primitive type explains it.
 
 The extension makes no network requests and collects no telemetry.
 
