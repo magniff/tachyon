@@ -99,7 +99,7 @@ format
 | `C import` | an `import "header.h"` that can't be read (chapter 15) |
 | `unsafe` | an unsafe operation outside `unsafe` (chapter 15) |
 | `effect` | a broken effect promise (chapter 12) |
-| `profile`, `format` | warnings: a stale profile (chapter 16), a string that looks like an f-string |
+| `profile`, `format` | warnings: a stale profile (`volec guide tools`), a string that looks like an f-string |
 
 Newer checks have *codes* with a family prefix and a dot. The code is
 stable: its message may be reworded, but the code stays, so it's what
@@ -153,7 +153,7 @@ too, a couple of hundred of them.
 
 A `try:` line is meant to be used as it is, with no editing:
 
-- code, such as `try: [1.0, 9.5][..]` or a missing `match` arm, to put
+- code, such as `try: y as i32` or a missing `match` arm, to put
   where the error points;
 - a `use` line to add at the top of the file;
 - a `volec` command to run, such as `volec fix --suggested main.vl`.

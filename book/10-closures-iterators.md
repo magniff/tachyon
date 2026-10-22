@@ -70,17 +70,66 @@ on a `Vec<i64>` says it passes an `i64`.
 
 ## What a closure captures
 
-When a closure uses a variable from outside, what exactly does it get?
-In vole the answer depends only on how the variable was declared:
+When a closure uses a variable from outside, it doesn't get a copy. It
+uses the variable itself, in place, the way an `inout` or a `let`
+parameter does (chapter 4). And like a parameter, it holds an *access*
+to the variable: not just for one call, but from the moment the closure
+is made until the last time it's used. What kind of access depends on
+what the closure does with the variable:
 
-| the variable | the closure gets | so |
+| the closure | it holds | while the closure is still to be used |
 |---|---|---|
-| a `let` of a plain value (a number, a struct of numbers) | a copy | nothing can change it under the closure |
-| a `let` of an owned value (a `Vec`, a `String`) | the variable itself, read-only | no copy is made |
-| a `var` | the variable itself | the closure's changes change the variable |
-| anything, in a `sink \|..\|` closure | a copy, or the value moved in | the closure owns what it captured |
+| only reads the variable | a let access | the variable may be read, not changed |
+| changes the variable | an inout access | nothing else may read or change it |
+| is a `sink \|..\|` closure | its own copy, or the value moved in | nothing is shared at all |
 
-Here the closure changes a `var`:
+After the closure's last use, the access is over, and the variable is
+yours again.
+
+### A closure that reads
+
+```vole
+fn main() {
+    var limit = 10;
+    let over = |x: i64| x > limit;
+    println(f"{limit} {over(5)} {over(15)}");
+    limit = 3;
+    println(f"{limit}");
+}
+```
+
+```out
+10 false true
+3
+```
+
+`over` only reads `limit`, so `main` can read it too, even in the same
+line as the calls. Changing it is fine as well, once `over` won't be
+called again. What isn't allowed is changing `limit` while `over` is
+still to be used: the closure would see a value change under it.
+
+```vole
+fn main() {
+    var limit = 10;
+    let over = |x: i64| x > limit;
+    println(over(5));
+    limit = 3;
+    println(over(5));
+}
+```
+
+```err
+error[own.conflict]: 'limit = 3' writes 'limit' while 'over' (main.vl: line 3, column 9) views it; 'over' is used at main.vl: line 6, column 13
+ --> main.vl: line 5, column 5
+  = help: use the view before the change, keep an index instead of a view, or keep a copy | try: volec query own main.vl:6:13
+```
+
+The message calls the closure a *view* of `limit`, as a slice is a view
+of a Vec: it reads something that lives somewhere else. The fix is to
+change `limit` after the closure's last use, or, if `over` should keep
+the old limit, to give it its own copy with `sink` (below).
+
+### A closure that changes
 
 ```vole
 fn main() {
@@ -98,13 +147,10 @@ fn main() {
 2
 ```
 
-`count` is a `var`, so `bump` changes the real `count`, and `main` sees
-the result.
-
-While a closure that captures `count` may still be called, nothing else
-may change `count`. Otherwise you'd have two ways to change one
-variable at the same time, which is exactly what vole's value
-semantics rule out (chapter 4):
+`bump` changes `count`, the real one, and `main` sees the result. A
+closure that changes a variable is the only way to that variable while
+it is still to be used, as an `inout` parameter is during a call. So
+`main` can't even read `count` between the two calls:
 
 ```vole
 fn main() {
@@ -112,21 +158,25 @@ fn main() {
     let bump = || {
         count += 1;
     };
-    count = 10;
     bump();
     println(count);
+    bump();
 }
 ```
 
 ```err
-error[own.conflict]: 'count = 10' writes 'count' while 'bump' (main.vl: line 3, column 9) views it; 'bump' is used at main.vl: line 7, column 5
- --> main.vl: line 6, column 5
-  = help: use the view before the change, keep an index instead of a view, or keep a copy | try: volec query own main.vl:7:5
+error[own.conflict]: 'count' is read while 'bump' (main.vl: line 3, column 9) borrows it mutably; 'bump' is used at main.vl: line 8, column 5
+ --> main.vl: line 7, column 13
+  = help: an inout access is the only way to its place while it is used: read through it, or end it (use it for the last time) before the read | try: volec query own main.vl:8:5
 ```
 
-The message calls the closure a *view* of `count`, as a slice is a view
-of a Vec. The fix is to do the change after the closure's last use, or
-before the closure is made.
+"Borrows it mutably" is the compiler's way of saying `bump` holds an
+inout access to `count`. The help gives the two ways out: read `count`
+after `bump`'s last call, as the first version did, or pass the value
+to the closure as a parameter instead of capturing it. This is the
+same rule as everywhere else in vole: while something may change a
+value, nothing else looks at it, so nothing changes behind anyone's
+back.
 
 ### sink closures
 
@@ -158,8 +208,9 @@ after passing it to a `sink` parameter.
 > `|&x|`.
 
 > **If you know Python or JavaScript:** a closure never sees a variable
-> "change behind its back". A plain `let` is copied, and while a
-> closure can still use a `var`, nothing else may change that `var`.
+> "change behind its back". While a closure that reads a variable is
+> still to be used, nothing else changes it; while one that changes it
+> is, nothing else even reads it.
 
 ## Fn, FnMut and fn
 
@@ -616,10 +667,11 @@ the job of each. The list will shrink.
 
 - A closure, `|x: i64| x + k`, is a function written where it's used.
   Its parameter types come from where it's passed, or are written out.
-- What it captures depends on the variable: a plain `let` is copied, an
-  owned `let` is read in place, a `var` is changed in place, and a
-  `sink ||` closure takes everything. While a closure may still use a
-  variable, nothing else changes it.
+- A closure uses what it captures in place, and holds an access to it
+  from its creation to its last use: a let access if it only reads the
+  variable (others may read it, not change it), an inout access if it
+  changes it (nothing else may read or change it). After its last use,
+  the variable is free again. A `sink ||` closure takes its own copies.
 - Functions take closures through bounds, `F: Fn(i64) -> i64` or `F:
   FnMut(i64)`; a closure that captures nothing is also a plain `fn(i64)
   -> i64`.

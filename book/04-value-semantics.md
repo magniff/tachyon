@@ -443,6 +443,71 @@ the same memory.)
 Passing two *different* parts of one value is fine: `f(&song.seconds,
 song.title)` lends one field to be changed and another to be read.
 
+### When the change begins
+
+An inout access begins when the call starts, after every argument has
+been worked out. So an argument that only reads the same value, and is
+done reading by then, is fine:
+
+```vole playlist.vl
+struct Song { title: str, seconds: i64 }
+
+fn add_copies(list: inout Vec<Song>, n: i64) {
+    for i in 0..n {
+        list.push(Song { title: "Encore", seconds: 60 + i });
+    }
+}
+
+fn main(gpa: Gpa) {
+    var list: Vec<Song> = Vec::new_in(gpa);
+    list.push(Song { title: "Blue Moon", seconds: 185 });
+    add_copies(&list, list.len());
+    println(f"{list.len()} songs");
+}
+```
+
+```out
+2 songs
+```
+
+`list.len()` runs first, and gives a number, 1. By the time
+`add_copies` starts changing the list, nothing else is looking at it.
+That's also why `v.push(v.len())` works.
+
+What can't go alongside an inout argument is one that is still looking
+at the same value *while the call runs*: a view of it, or a second
+inout access, as in `append_all(&list, &list)`. Here `add_all` would
+push onto the list while it reads the songs to add from that same list:
+
+```vole playlist.vl
+struct Song { title: str, seconds: i64 }
+
+fn add_all(list: inout Vec<Song>, more: [Song]) {
+    for s in more {
+        list.push(s);
+    }
+}
+
+fn main(gpa: Gpa) {
+    var list: Vec<Song> = Vec::new_in(gpa);
+    list.push(Song { title: "Blue Moon", seconds: 185 });
+    add_all(&list, list[..]);
+    println(f"{list.len()} songs");
+}
+```
+
+```err
+error[own.conflict]: 'list' is borrowed mutably by '&list' and viewed by 'list[..]' in the same call
+ --> playlist.vl: line 12, column 20
+  = help: pass disjoint places ('&a.x, a.y'), copy the plain value out first, or for two elements of one Vec use 'v.swap(i, j)'
+```
+
+`list[..]` is a view of all the songs (views come later in this
+chapter), and it would still be in use while `add_all` changes the list
+under it. The rule is the same as before: while a call may change a
+value, nothing else in that call may look at it. Put the songs to add
+in a list of their own first, and pass that.
+
 ### Keeping an access in a variable
 
 Sometimes you want to change one value through several calls, and give

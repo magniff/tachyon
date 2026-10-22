@@ -11,7 +11,7 @@ These words are reserved: you can't use them as names.
 
 | keyword | meaning | chapter |
 |---|---|---|
-| `as` | converts a number, `bool` or fieldless enum: `x as i32` | 3 |
+| `as` | converts a number, `bool` or fieldless enum (`x as i32`), a pointer, or a distinct type | 3, 15 |
 | `break` | leaves a loop, optionally with a value or a label: `break n`, `break :outer` | 3 |
 | `const` | a constant item: `const MAX: i64 = 100;` | 3 |
 | `continue` | starts the next round of a loop: `continue :outer` | 3 |
@@ -61,7 +61,7 @@ variable called `result` or `debug`:
 | `crate`, `super` | at the start of a path | this program's root module; the parent module | 11 |
 | `requires`, `ensures` | between a function's signature and its body | what the function needs, and what it promises | 6, 13 |
 | `result`, `old` | in an `ensures` | the returned value; a value as it was at entry: `old(v.len())` | 13 |
-| `debug` | before `requires`, `ensures` or `invariant` | checked only in test builds | 13 |
+| `debug` | before `requires`, `ensures` or `invariant` | checked only by `volec test` and `--debug-contracts` | 13 |
 | `distinct` | after `type X =` | a new type with another type's representation | `guide types` |
 | `invariant` | after a type | a condition its values keep | docs/grammar.md |
 
@@ -102,7 +102,7 @@ allowed.
 | `T::f` | an associated function or a variant: `Player::new()`, `Option::None` | 5 |
 | `f::<T>()` | a function told its type (the *turbofish*): `s.parse::<i64>()` | 2 |
 | `e?` | the value in an `Ok` or `Some`; else return the error or `None` | 6 |
-| `&x` | at a call, marks an argument the function may change (inout) | 4 |
+| `&x` | at a call, marks an argument the function may change (inout); where a raw pointer is wanted, the address of `x` | 4, 15 |
 | `*p` | reads or writes through a raw pointer, in `unsafe` code only | 15 |
 | `\|x\| e` | a closure | 10 |
 | `=>` | separates a `match` arm's pattern from its value | 5 |
@@ -204,12 +204,12 @@ an item.
 | `#[property]` | function | a property test, run with generated inputs | 13 |
 | `#[fuzz]` | function | a fuzz target | 13 |
 | `#[cfg(test)]` | item | compiled only for `volec test` | 13 |
-| `#[pure]` | function | checked: no allocation, I/O, globals or panics | 12 |
+| `#[pure]` | function | checked: no allocation, I/O or globals (it may still panic) | 12 |
 | `#[no_alloc]`, `#[no_io]`, `#[no_panic]` | function | checked: the function never allocates, does I/O, or panics | 12 |
 | `#[effects(io, global, ...)]` | function | checked: the function does at most these | 12 |
-| `#[views(s)]` | function | states its view summary, checked against its body | 4 |
+| `#[views(s)]` | function | states its view summary, checked against its body | `guide views` |
 | `#[inline]`, `#[inline(never)]` | function | asks the optimizer to inline it, or not to | 16 |
-| `#[cold]` | function | rarely called: the optimizer keeps it out of the way | 16 |
+| `#[cold]` | function | rarely called: the optimizer keeps it out of the way | `guide syntax` |
 | `#[target_feature(...)]`, `#[multiversion(...)]` | function | compiled for particular CPU features | 16 |
 | `#[thread_local]` | `static var` | one copy per thread | 14 |
 | `#[link(...)]`, `#[link_name = "..."]` | `extern` block, function | which C library to link, and a function's C name | 15 |

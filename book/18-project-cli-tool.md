@@ -66,7 +66,7 @@ fn run(m: Matches, n: i64, gpa: Gpa) -> io::Result<()> {
     var counts: HashMap<String, i64> = HashMap::new_in(gpa);
     for path in m.values("file") {
         let text = fs::read_to_string_in(path, gpa)?;
-        count::add_words(&counts, &text, gpa);
+        count::add_words(&counts, text, gpa);
     }
     let top = report::top(counts, n, gpa);
     report::print_table(top);
@@ -98,10 +98,37 @@ fn main(gpa: Gpa) -> i32 {
 ```vole count.vl
 // Counting the words of a text.
 
+// Letters, digits and apostrophes are parts of words. So is every
+// byte of a non-ASCII character (0x80 and up), so "café" stays whole.
+fn is_word_byte(b: u8) -> bool {
+    match b {
+        'a'..='z' | 'A'..='Z' | '0'..='9' | '\'' => true,
+        0x80..=0xff => true,
+        _ => false,
+    }
+}
+
+// The word without the punctuation around it: "end!" is "end".
+fn trim_punct(word: str) -> str {
+    var start = 0;
+    var end = word.len();
+    while start < end && !is_word_byte(word[start]) {
+        start += 1;
+    }
+    while end > start && !is_word_byte(word[end - 1]) {
+        end -= 1;
+    }
+    word[start..end]
+}
+
+// Adds the words of text to counts, lowercased.
 pub fn add_words(counts: inout HashMap<String, i64>, text: str, gpa: Gpa) {
     for word in text.split_whitespace() {
-        let w = word.to_lowercase_in(gpa);
-        counts.get_or_insert(w, 0)[0] += 1;
+        let w = trim_punct(word);
+        if w.is_empty() {
+            continue;
+        }
+        counts.get_or_insert(w.to_lowercase_in(gpa), 0)[0] += 1;
     }
 }
 ```
@@ -114,7 +141,7 @@ pub fn top(counts: HashMap<String, i64>, n: i64, gpa: Gpa) -> Vec<(String, i64)>
     for (word, k) in counts.iter() {
         pairs.push((word.clone(), k));
     }
-    pairs.sort_by(|a, b| if a.1 != b.1 { b.1 - a.1 } else { cmp_of(a.0, b.0) });
+    pairs.sort_by(|a, b| if a.1 != b.1 { b.1 - a.1 } else { a.0.cmp(b.0) });
     pairs.truncate(n);
     pairs
 }
@@ -134,8 +161,8 @@ $ volec main.vl -o tally
 ok: built tally
 $ ./tally -t 3 notes.txt
 the             4
+cat             2
 on              2
-sat             2
 ```
 
 ### Describing the command line
@@ -263,29 +290,34 @@ pub fn count(text: str) -> Counts {
 #[no_io]
 pub fn add_words<A: Allocator>(freq: inout HashMap<str, i64, A>, text: str) {
     for word in text.split_whitespace() {
-        let w = trim_punctuation(word);
+        let w = trim_punct(word);
         if w.len() > 0 {
             freq.get_or_insert(w, 0)[0] += 1;
         }
     }
 }
 
-// word without the ASCII punctuation at either end: "(end)." is "end".
-fn trim_punctuation(word: str) -> str {
-    let b = word.as_bytes();
-    var lo = 0;
-    var hi = b.len();
-    while lo < hi && is_punctuation(b[lo]) {
-        lo += 1;
+// Chapter 7's: letters, digits and apostrophes are parts of words, and
+// so is every byte of a non-ASCII character, so "café" stays whole.
+fn is_word_byte(b: u8) -> bool {
+    match b {
+        'a'..='z' | 'A'..='Z' | '0'..='9' | '\'' => true,
+        0x80..=0xff => true,
+        _ => false,
     }
-    while hi > lo && is_punctuation(b[hi - 1]) {
-        hi -= 1;
-    }
-    word[lo..hi]
 }
 
-fn is_punctuation(c: u8) -> bool {
-    "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~".contains(c)
+// Chapter 7's: the word without the punctuation around it.
+fn trim_punct(word: str) -> str {
+    var start = 0;
+    var end = word.len();
+    while start < end && !is_word_byte(word[start]) {
+        start += 1;
+    }
+    while end > start && !is_word_byte(word[end - 1]) {
+        end -= 1;
+    }
+    word[start..end]
 }
 
 #[test]
@@ -315,12 +347,12 @@ fn counts_add_up(bytes: Vec<u8>) {
         text.push_str(pieces[(b % 4) as i64]);
     }
     var freq: HashMap<str, i64> = HashMap::new_in(gpa);
-    add_words(&freq, &text);
+    add_words(&freq, text);
     var total = 0;
     for (_, k) in freq.iter() {
         total += k;
     }
-    assert_eq(total, count(&text).words);
+    assert_eq(total, count(text).words);
 }
 ```
 
@@ -342,9 +374,10 @@ That's only safe if the text outlives the map, and the compiler checks
 exactly that: a view can't be used after what it views is gone or has
 changed. If `main` dropped the text while the map was still around,
 the program wouldn't compile. You get the speed of pointers into a
-buffer, the way a C program would do it, with none of the risk.
+buffer, the way a C program would do it, without the risk of a pointer to memory that is gone.
 
-`trim_punctuation` returns a view too: `word[lo..hi]` is a slice of
+`trim_punct` and `is_word_byte` are chapter 7's, unchanged.
+`trim_punct` returns a view too: `word[start..end]` is a slice of
 `word`, so "(end)." becomes "end" without copying. And `add_words` is
 generic over the map's allocator (`A: Allocator`), so it works with a
 map on any allocator: in the tests, the `Gpa`; in `main.vl`, an arena.
@@ -373,7 +406,7 @@ pub fn top(counts: HashMap<String, i64>, n: i64, gpa: Gpa) -> Vec<(String, i64)>
     for (word, k) in counts.iter() {
         pairs.push((word.clone(), k));
     }
-    pairs.sort_by(|a, b| if a.1 != b.1 { b.1 - a.1 } else { cmp_of(a.0, b.0) });
+    pairs.sort_by(|a, b| if a.1 != b.1 { b.1 - a.1 } else { a.0.cmp(b.0) });
     pairs.truncate(n);
     pairs
 }
@@ -401,7 +434,7 @@ pub fn print_table(rows: [(String, i64)]) {
     let w = word_width(rows);
     for row in rows {
         print(f"{row.0}");
-        for _ in 0..padding(&row.0, w) {
+        for _ in 0..padding(row.0, w) {
             print(" ");
         }
         println(f"{row.1:>6}");
@@ -485,7 +518,7 @@ fn tally(text: str, fold: bool, totals: inout HashMap<String, i64>, gpa: Gpa) ->
             String::from_in(text, a)
         };
         var freq: HashMap<str, i64, ScopedArena> = HashMap::new_in(a);
-        count::add_words(&freq, &words);
+        count::add_words(&freq, words);
         for (word, k) in freq.iter() {
             totals.get_or_insert(String::from_in(word, gpa), 0)[0] += k;
         }
@@ -500,7 +533,7 @@ fn run(m: Matches, top: i64, gpa: Gpa) -> Result<(), TallyError> {
     let files = m.values("file");
     if files.len() == 0 {
         let text = String::from_buf(io::read_stdin_in(gpa)?)?;
-        report::print_counts(tally(&text, fold, &totals, gpa), "", words_only);
+        report::print_counts(tally(text, fold, &totals, gpa), "", words_only);
     }
     var all = Counts { lines: 0, words: 0, bytes: 0 };
     for path in files {
@@ -508,7 +541,7 @@ fn run(m: Matches, top: i64, gpa: Gpa) -> Result<(), TallyError> {
             Ok(t) => t,
             Err(e) => return Err(TallyError::File(String::from_in(path, gpa), e)),
         };
-        let c = tally(&text, fold, &totals, gpa);
+        let c = tally(text, fold, &totals, gpa);
         report::print_counts(c, path, words_only);
         all.add(c);
     }
@@ -706,8 +739,8 @@ crate::count::Counts::add	none
 crate::count::count	panic diverge
 add_words<ScopedArena>	alloc(ScopedArena) panic diverge
 add_words<Gpa>	alloc(Gpa) panic diverge
-crate::count::trim_punctuation	panic diverge
-crate::count::is_punctuation	panic diverge
+crate::count::is_word_byte	none
+crate::count::trim_punct	panic diverge
 crate::count::counts_lines_words_bytes	panic diverge
 crate::count::trims_punctuation	alloc(Gpa) panic diverge
 crate::count::counts_add_up	alloc(Gpa) panic diverge

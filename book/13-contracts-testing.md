@@ -631,14 +631,21 @@ reach code no earlier input reached:
 
 ```console
 $ volec fuzz parse_never_crashes commands.vl --time 10
+...
+```
+
+The inputs are made up as it goes, so every run is different. Here is
+one:
+
+```text
 FAIL parse_never_crashes (fuzz, after 685 runs, shrunk in 0 steps): commands.vl:18:17: slice range out of bounds: 4..3, length 3
   input: data = "get"
   saved: .volec/fuzz/parse_never_crashes/crash-d4e26318faaa79f7 (volec test replays it; test --accept keeps it in tests/fuzz/parse_never_crashes/)
   try: volec test parse_never_crashes commands.vl
 ```
 
-`--time 10` would let it search for ten seconds; it found a crash in
-less than one. The input `get`, with no space and no number, passes
+`--time 10` would let it search for ten seconds; this run found a
+crash in less than one. The input `get`, with no space and no number, passes
 `starts_with("get")`, and then `line[4..]` asks for text past the end of
 a three-byte line. (`push` is fine: it checks for the space.)
 

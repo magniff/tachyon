@@ -297,8 +297,8 @@ a failed check". A failure like this is called a *panic*.
 
 A panic is not a crash. Vole checks the things that could go wrong in a
 program (an index past the end of a list, an `unwrap` of an error), and
-stops cleanly with a message when one does. Nothing reads or writes
-memory it shouldn't. We'll handle bad input properly in the next step.
+stops cleanly with a message when one does, instead of reading or
+writing memory it shouldn't. We'll handle bad input properly in the next step.
 
 ## Step 3: guessing until you win
 

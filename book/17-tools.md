@@ -20,10 +20,10 @@ uses the same tools.
 Suppose you want to know where a function called `top` is used. A text
 search for `top` finds it, but it also finds the local variable called
 `top` in `run`, the word "top" in comments and in `WC_TOP`, and any
-field or function of the same name somewhere else. It misses nothing only if nothing is renamed on
-import. The compiler doesn't have this problem: it has already worked
-out which `rows` each use refers to, through every `use` line, and it
-knows that a comment is a comment.
+field or function of the same name somewhere else; and it misses a use
+under another name, imported with `as`. The compiler doesn't have this
+problem: it has already worked out which `top` each use refers to,
+through every `use` line, and it knows that a comment is a comment.
 
 So vole's compiler answers questions about a program by name, and makes
 changes by name. Each command prints its answer one fact per line, so
@@ -54,7 +54,7 @@ fn run(gpa: Gpa) -> io::Result<()> {
     var counts: HashMap<String, i64> = HashMap::new_in(gpa);
     for path in args[1..] {
         let text = fs::read_to_string_in(path, gpa)?;
-        count::add_words(&counts, &text, gpa);
+        count::add_words(&counts, text, gpa);
     }
     let n = match env::get_in("WC_TOP", gpa) {
         Ok(s) => s.parse::<i64>().unwrap_or(5),
@@ -79,10 +79,37 @@ fn main(gpa: Gpa) -> i32 {
 ```vole count.vl
 // Counting the words of a text.
 
+// Letters, digits and apostrophes are parts of words. So is every
+// byte of a non-ASCII character (0x80 and up), so "café" stays whole.
+fn is_word_byte(b: u8) -> bool {
+    match b {
+        'a'..='z' | 'A'..='Z' | '0'..='9' | '\'' => true,
+        0x80..=0xff => true,
+        _ => false,
+    }
+}
+
+// The word without the punctuation around it: "end!" is "end".
+fn trim_punct(word: str) -> str {
+    var start = 0;
+    var end = word.len();
+    while start < end && !is_word_byte(word[start]) {
+        start += 1;
+    }
+    while end > start && !is_word_byte(word[end - 1]) {
+        end -= 1;
+    }
+    word[start..end]
+}
+
+// Adds the words of text to counts, lowercased.
 pub fn add_words(counts: inout HashMap<String, i64>, text: str, gpa: Gpa) {
     for word in text.split_whitespace() {
-        let w = word.to_lowercase_in(gpa);
-        counts.get_or_insert(w, 0)[0] += 1;
+        let w = trim_punct(word);
+        if w.is_empty() {
+            continue;
+        }
+        counts.get_or_insert(w.to_lowercase_in(gpa), 0)[0] += 1;
     }
 }
 ```
@@ -103,7 +130,7 @@ pub fn top(counts: HashMap<String, i64>, n: i64, order: Order, gpa: Gpa) -> Vec<
     }
     match order {
         Order::ByCount => pairs.sort_by(by_count),
-        Order::Alphabetical => pairs.sort_by(|a, b| cmp_of(a.0, b.0)),
+        Order::Alphabetical => pairs.sort_by(|a, b| a.0.cmp(b.0)),
     }
     pairs.truncate(n);
     pairs
@@ -111,7 +138,7 @@ pub fn top(counts: HashMap<String, i64>, n: i64, order: Order, gpa: Gpa) -> Vec<
 
 // The most common first; words as common as each other, alphabetically.
 fn by_count(a: (String, i64), b: (String, i64)) -> i64 {
-    if a.1 != b.1 { b.1 - a.1 } else { cmp_of(a.0, b.0) }
+    if a.1 != b.1 { b.1 - a.1 } else { a.0.cmp(b.0) }
 }
 
 pub fn print_table(rows: [(String, i64)]) {
@@ -156,7 +183,7 @@ pub fn top(counts: HashMap<String, i64>, n: i64, order: Order, gpa: Gpa) -> Vec<
     }
     match order {
         Order::ByCount => pairs.sort_by(by_count),
-        Order::Alphabetical => pairs.sort_by(|a, b| cmp_of(a.0, b.0)),
+        Order::Alphabetical => pairs.sort_by(|a, b| a.0.cmp(b.0)),
     }
     pairs.truncate(n);
     pairs
@@ -209,12 +236,12 @@ $ volec query refs Order
 4:10	def	pub enum Order {
 9:57	type	report::top	pub fn top(counts: HashMap<String, i64>, n: i64, order: Order, gpa: Gpa) -> Vec<(String, i64)> {
 15:9	type	report::top	Order::ByCount => pairs.sort_by(by_count),
-16:9	type	report::top	Order::Alphabetical => pairs.sort_by(|a, b| cmp_of(a.0, b.0)),
+16:9	type	report::top	Order::Alphabetical => pairs.sort_by(|a, b| a.0.cmp(b.0)),
 # main.vl
 20:46	type	run	let top = report::top(counts, n, report::Order::ByCount, gpa);
 $ volec query callers add_words
 # main.vl
-14:16	call	run	count::add_words(&counts, &text, gpa);
+14:16	call	run	count::add_words(&counts, text, gpa);
 ```
 
 Each line is `LINE:COLUMN`, then the kind (`def` for the definition,
@@ -230,6 +257,8 @@ module never does any input or output:
 
 ```console
 $ volec query effects crate::count
+crate::count::is_word_byte	none
+crate::count::trim_punct	panic diverge
 crate::count::add_words	alloc(Gpa) panic diverge
 ```
 
@@ -313,9 +342,9 @@ $ volec refactor rename count::add_words count_words
 renamed crate::count::add_words to count_words	2 files	+2 -2 lines
 $ volec query refs count_words
 # count.vl
-3:8	def	pub fn count_words(counts: inout HashMap<String, i64>, text: str, gpa: Gpa) {
+27:8	def	pub fn count_words(counts: inout HashMap<String, i64>, text: str, gpa: Gpa) {
 # main.vl
-14:16	call	run	count::count_words(&counts, &text, gpa);
+14:16	call	run	count::count_words(&counts, text, gpa);
 ```
 
 Both the definition and the call changed. A rename changes the uses the
@@ -328,8 +357,8 @@ variants, modules, and local variables (give `FILE:LINE:COL` or
 ### signature
 
 Let's give `count_words` a new parameter, `min_len`, so that it can
-skip short words like "a" and "on". Adding a parameter means changing every call, so
-`refactor signature` does both. `--add` takes the new parameter with a
+skip short words like "a" and "on". Adding a parameter means changing
+every call, so `refactor signature` does both. `--add` takes the new parameter with a
 value for the existing calls, and `--fill-calls` writes that value into
 each of them:
 
@@ -338,7 +367,7 @@ $ volec refactor signature count::count_words --add 'min_len: i64 = 1' --fill-ca
 added parameter min_len: i64 to crate::count::count_words, 1 call	2 files	+2 -2 lines
 $ volec query callers count_words
 # main.vl
-14:16	call	run	count::count_words(&counts, &text, gpa, 1);
+14:16	call	run	count::count_words(&counts, text, gpa, 1);
 ```
 
 The call in `run` now passes `1`, which keeps every word, as before.
@@ -353,21 +382,27 @@ $ volec refactor signature count::count_words --reorder counts,text,min_len,gpa
 reordered the parameters of crate::count::count_words, 1 call	2 files	+2 -2 lines
 $ volec query callers count_words
 # main.vl
-14:16	call	run	count::count_words(&counts, &text, 1, gpa);
+14:16	call	run	count::count_words(&counts, text, 1, gpa);
 ```
 
-Now the body can use `min_len`. It's a one-line change, so a patch
-does it:
+Now the body can use `min_len`. The loop already skips a word that
+trimming left empty; skipping one shorter than `min_len` instead is a
+one-line change, so a patch does it (with `min_len` 1, the two are the
+same):
 
 ```console
-$ volec edit patch count_words --old 'counts.get_or_insert(w, 0)[0] += 1;' --new 'if w.len() >= min_len { counts.get_or_insert(w, 0)[0] += 1; }'
+$ volec edit patch count_words --old 'if w.is_empty() {' --new 'if w.len() < min_len {'
 patched crate::count::count_words	count.vl	+1 -1 lines
 $ volec query show count_words
-// crate::count::count_words	count.vl:3-8	effects: alloc(Gpa) panic diverge
+// crate::count::count_words	count.vl:26-35	effects: alloc(Gpa) panic diverge
+// Adds the words of text to counts, lowercased.
 pub fn count_words(counts: inout HashMap<String, i64>, text: str, min_len: i64, gpa: Gpa) {
     for word in text.split_whitespace() {
-        let w = word.to_lowercase_in(gpa);
-        if w.len() >= min_len { counts.get_or_insert(w, 0)[0] += 1; }
+        let w = trim_punct(word);
+        if w.len() < min_len {
+            continue;
+        }
+        counts.get_or_insert(w.to_lowercase_in(gpa), 0)[0] += 1;
     }
 }
 ```
@@ -395,7 +430,7 @@ pub fn top(counts: HashMap<String, i64>, n: i64, order: Order, gpa: Gpa) -> Vec<
     }
     match order {
         Order::ByCount => pairs.sort_by(by_count),
-        Order::Alphabetical => pairs.sort_by(|a, b| cmp_of(a.0, b.0)),
+        Order::Alphabetical => pairs.sort_by(|a, b| a.0.cmp(b.0)),
         Order::Longest => pairs.sort_by(|a, b| b.0.len() - a.0.len()),
     }
     pairs.truncate(n);
@@ -587,7 +622,7 @@ guess.
 ### Setting up a project for an agent
 
 Most agents read an instructions file at the root of a project, often
-named `AGENTS.md` (or `CLAUDE.md`, depending on the agent). For a vole
+named `AGENTS.md`. For a vole
 project, a few lines go a long way:
 
 ```text

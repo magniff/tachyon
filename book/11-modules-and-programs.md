@@ -27,7 +27,7 @@ fn main(gpa: Gpa) {
     let input = read_stdin_in(gpa).unwrap();
     let text = String::from_buf(input).unwrap();
     var counts: HashMap<String, i64> = HashMap::new_in(gpa);
-    count::add_words(&counts, &text, gpa);
+    count::add_words(&counts, text, gpa);
     let top = report::top(counts, 5, gpa);
     report::print_table(top);
 }
@@ -38,10 +38,37 @@ Then `count.vl`, the counting:
 ```vole count.vl
 // Counting the words of a text.
 
+// Letters, digits and apostrophes are parts of words. So is every
+// byte of a non-ASCII character (0x80 and up), so "café" stays whole.
+fn is_word_byte(b: u8) -> bool {
+    match b {
+        'a'..='z' | 'A'..='Z' | '0'..='9' | '\'' => true,
+        0x80..=0xff => true,
+        _ => false,
+    }
+}
+
+// The word without the punctuation around it: "end!" is "end".
+fn trim_punct(word: str) -> str {
+    var start = 0;
+    var end = word.len();
+    while start < end && !is_word_byte(word[start]) {
+        start += 1;
+    }
+    while end > start && !is_word_byte(word[end - 1]) {
+        end -= 1;
+    }
+    word[start..end]
+}
+
+// Adds the words of text to counts, lowercased.
 pub fn add_words(counts: inout HashMap<String, i64>, text: str, gpa: Gpa) {
     for word in text.split_whitespace() {
-        let w = word.to_lowercase_in(gpa);
-        counts.get_or_insert(w, 0)[0] += 1;
+        let w = trim_punct(word);
+        if w.is_empty() {
+            continue;
+        }
+        counts.get_or_insert(w.to_lowercase_in(gpa), 0)[0] += 1;
     }
 }
 ```
@@ -56,7 +83,7 @@ pub fn top(counts: HashMap<String, i64>, n: i64, gpa: Gpa) -> Vec<(String, i64)>
     for (word, k) in counts.iter() {
         pairs.push((word.clone(), k));
     }
-    pairs.sort_by(|a, b| if a.1 != b.1 { b.1 - a.1 } else { cmp_of(a.0, b.0) });
+    pairs.sort_by(|a, b| if a.1 != b.1 { b.1 - a.1 } else { a.0.cmp(b.0) });
     pairs.truncate(n);
     pairs
 }
@@ -97,8 +124,15 @@ The compiler starts at `main.vl`, sees `mod count;` and `mod report;`,
 and loads `count.vl` and `report.vl` from the same directory. All three
 are compiled together into one program.
 
-The functions are the ones chapter 7 wrote; what's new is where they
-live, and the two words that connect the files: `mod` and `pub`.
+The code is chapter 7's, rearranged. `count.vl` has chapter 7's
+`is_word_byte` and `trim_punct` as they were. Its `count_words` is now
+`add_words`, which adds to a map it's given instead of making one, so
+that, later in this chapter, the words of several files can go into
+one map. `report.vl`'s `top` is chapter 7's `sorted_counts`, which now
+also keeps only the first `n` rows (`truncate(n)`), so `print_table`
+just prints what it's given, without chapter 7's header. What's really
+new is where the functions live, and the two words that connect the
+files: `mod` and `pub`.
 
 ## Modules
 
@@ -148,7 +182,8 @@ fn main() {
 Every item is *private* unless it says otherwise: only its own module
 (and the modules inside it) can use it. `pub` makes an item *public*,
 usable from anywhere its module can be reached. That's why `add_words`,
-`top` and `print_table` are all `pub fn`.
+`top` and `print_table` are all `pub fn`, while `is_word_byte` and
+`trim_punct`, which only `add_words` uses, stay private to `count`.
 
 Here's what happens without it. A smaller program, with the `pub` left
 off:
@@ -346,7 +381,7 @@ fn run(gpa: Gpa) -> io::Result<()> {
     var counts: HashMap<String, i64> = HashMap::new_in(gpa);
     for path in args[1..] {
         let text = fs::read_to_string_in(path, gpa)?;
-        count::add_words(&counts, &text, gpa);
+        count::add_words(&counts, text, gpa);
     }
     let n = match env::get_in("WC_TOP", gpa) {
         Ok(s) => s.parse::<i64>().unwrap_or(5),
@@ -371,10 +406,37 @@ fn main(gpa: Gpa) -> i32 {
 ```vole count.vl
 // Counting the words of a text.
 
+// Letters, digits and apostrophes are parts of words. So is every
+// byte of a non-ASCII character (0x80 and up), so "café" stays whole.
+fn is_word_byte(b: u8) -> bool {
+    match b {
+        'a'..='z' | 'A'..='Z' | '0'..='9' | '\'' => true,
+        0x80..=0xff => true,
+        _ => false,
+    }
+}
+
+// The word without the punctuation around it: "end!" is "end".
+fn trim_punct(word: str) -> str {
+    var start = 0;
+    var end = word.len();
+    while start < end && !is_word_byte(word[start]) {
+        start += 1;
+    }
+    while end > start && !is_word_byte(word[end - 1]) {
+        end -= 1;
+    }
+    word[start..end]
+}
+
+// Adds the words of text to counts, lowercased.
 pub fn add_words(counts: inout HashMap<String, i64>, text: str, gpa: Gpa) {
     for word in text.split_whitespace() {
-        let w = word.to_lowercase_in(gpa);
-        counts.get_or_insert(w, 0)[0] += 1;
+        let w = trim_punct(word);
+        if w.is_empty() {
+            continue;
+        }
+        counts.get_or_insert(w.to_lowercase_in(gpa), 0)[0] += 1;
     }
 }
 ```
@@ -387,7 +449,7 @@ pub fn top(counts: HashMap<String, i64>, n: i64, gpa: Gpa) -> Vec<(String, i64)>
     for (word, k) in counts.iter() {
         pairs.push((word.clone(), k));
     }
-    pairs.sort_by(|a, b| if a.1 != b.1 { b.1 - a.1 } else { cmp_of(a.0, b.0) });
+    pairs.sort_by(|a, b| if a.1 != b.1 { b.1 - a.1 } else { a.0.cmp(b.0) });
     pairs.truncate(n);
     pairs
 }

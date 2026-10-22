@@ -472,8 +472,10 @@ true false -1
 ```
 
 `cmp` returns an `i64`: negative if `self` comes first, zero if they're
-equal, positive if `o` comes first. Subtracting the fields is the usual
-way to write it. With `Ord`, `Version`s can be compared with `<`, sorted
+equal, positive if `o` comes first. Subtracting the fields is a short
+way to write it, fine for numbers like these; for numbers near the ends
+of the `i64` range the subtraction would wrap (chapter 3), and
+`self.major.cmp(o.major)` is the safe way. With `Ord`, `Version`s can be compared with `<`, sorted
 with `sort()`, and given to `largest`.
 
 ### Deriving
@@ -498,7 +500,7 @@ fn main(gpa: Gpa) {
 
     var notes: HashMap<Version, str> = HashMap::new_in(gpa);
     let current = Version { major: 1, minor: 10 };
-    notes.insert(current.clone(), "current");
+    notes.insert(current, "current");
     println(f"{notes.get(current):?}");
 }
 ```
@@ -518,7 +520,9 @@ Some("current")
   (with `Eq`).
 - `Debug`: the `{x:?}` form, as in `Version { major: 0, minor: 9 }`.
 - `Clone`: `x.clone()`, a copy of every field (a `Vec` field is copied
-  too, with all its elements).
+  too, with all its elements). A plain struct like `Version` is copied
+  by `=` anyway, which is why `notes.insert(current, ...)` above needs
+  no `clone()`; `Clone` matters for owned types (chapter 4).
 
 `Display` can't be derived: how your type looks to a user is for you to
 decide.

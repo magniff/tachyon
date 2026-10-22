@@ -26,7 +26,7 @@ changing its `inout` arguments. The compiler knows six of them:
 | `unsafe` | does unsafe operations itself | chapter 15 |
 
 The allocator's type is part of the effect: a function that allocates
-from an arena (chapter 8) is `alloc(Arena)`. Threads add three more,
+from `arena_scope`'s arena (chapter 8) is `alloc(ScopedArena)`. Threads add three more,
 `sync`, `thread` and `tls`, which chapter 14 shows.
 
 The compiler *infers* every function's effects, from its body and

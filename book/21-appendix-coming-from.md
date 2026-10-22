@@ -23,7 +23,7 @@ called `conv.rust` with the vole spelling on its `try:` line.
 | `x: &T`, `f(&x)` | `x: T`, `f(x)`: a parameter is read-only by default (*let*) | 4 |
 | `x: &mut T`, `f(&mut x)` | `x: inout T`, `f(&x)`: `&` marks the argument that may change | 4 |
 | `x: T`, taking ownership | `x: sink T`, `f(x)` | 4 |
-| `&self`, `&mut self`, `self` | `self`, `inout self`, `sink self` | 5 |
+| `&self`, `&mut self`, `self` | `self`, `inout self`, `sink self` | 4, 5 |
 | `let mut x` | `var x` | 3 |
 | `*r += 1` through a `&mut` | `r += 1`: an `inout` is used as the value; `*` is only for raw pointers | 4, 15 |
 | lifetimes, `'a` | none: the compiler infers what each function's result views | 4 |
@@ -103,13 +103,13 @@ is designed so that ordinary code can't have undefined behaviour.
 |---|---|---|
 | undefined behaviour: signed overflow, a bad index, an uninitialized variable | none in safe code: integers wrap, every index is checked, every variable is set | 3, 15 |
 | `malloc` and `free`, `new` and `delete` | allocators passed as parameters; values are freed when they go out of scope | 8 |
-| destructors (C++) | `impl Drop`, run at the end of the scope | 15 |
+| destructors (C++) | `impl Drop`, run at the end of the scope | 4, 15 |
 | a pointer and a length, passed separately | a slice, `[T]`, which carries its length | 7 |
 | `char *` strings | `str`, UTF-8 with a length; `c"..."` for C | 7, 15 |
 | `int`, `long`, `size_t` | `i32`, `i64`, `u64`; lengths and indices are `i64` | 3 |
 | `#include` and the preprocessor | `mod` and `use`; no macros | 11 |
 | exceptions (C++), error codes | `Result` and `?` | 6 |
-| templates (C++) | generics with trait bounds, checked when written | 9 |
+| templates (C++) | generics, compiled once per type as templates are; bounds are checked at each call | 9 |
 | calling C | direct: `import "stdio.h" as c;`, or `extern "C"` | 15 |
 | struct layout | unspecified, unless `#[repr(C)]` | 15 |
 | `-ffast-math`, optimizations based on UB | none; contracts tell the optimizer facts, and they're checked | 16 |
@@ -118,8 +118,9 @@ is designed so that ordinary code can't have undefined behaviour.
 Two of these surprise C programmers most. First, indexing is checked:
 `v[i]` past the end stops the program with a message and exit status
 101, rather than reading some other memory. The compiler removes the
-check wherever it can prove `i` is in range, which in a typical loop is
-everywhere. Second, division by zero isn't a crash: `x / 0` is 0 and
+check wherever it can prove `i` is in range, as it can in a simple
+counted loop, and `volec query checks` shows the ones left (chapter
+16). Second, division by zero isn't a crash: `x / 0` is 0 and
 `x % 0` is `x`. Both are defined, so the optimizer has nothing to
 assume.
 
@@ -161,8 +162,9 @@ c.vl:17:16: index out of bounds: index 2, length 2
 
 ## From Go
 
-Go and vole share a taste for simple, explicit code and a fast compiler
-(chapter 16), but they make the opposite choice about memory.
+Go and vole share a taste for simple, explicit code and a compiler that
+cares about its own speed (chapter 16), but they make the opposite
+choice about memory.
 
 | Go | vole | chapter |
 |---|---|---|
@@ -174,7 +176,7 @@ Go and vole share a taste for simple, explicit code and a fast compiler
 | interfaces, satisfied implicitly | traits, implemented explicitly, resolved at compile time; enums for "one of several types" | 5, 9 |
 | generics | generics, specialized for each type (no boxing) | 9 |
 | slices that share an array | `[T]` views, which can't outlive or see changes to what they view | 4 |
-| `defer` | `defer`, and `Drop` for values that clean up after themselves | 15 |
+| `defer` | `defer` (`volec guide syntax`), and `Drop` for values that clean up after themselves | 4, 15 |
 | `go fmt`, `go vet` | `volec fmt`, and the compiler's own checks | 17 |
 | modules and packages | modules (`mod`, `use`, `pub`); no packages yet | 11 |
 | zero values | every variable is set when it's declared | 3 |

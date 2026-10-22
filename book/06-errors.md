@@ -564,9 +564,9 @@ odd
 (The remainder of a positive number divided by 2 is 0 or 1, but the
 compiler only knows it's an `i64`, so the `match` needs the last arm.)
 
-A panic is not a crash. Nothing reads or writes memory it shouldn't,
-nothing goes on running in a broken state: vole checks, and stops
-cleanly at the first sign of trouble. Drops don't run on a panic, and
+A panic is not a crash. Nothing goes on running in a broken state:
+vole checks, and stops cleanly at the first sign of trouble, before a
+bad index can read or write memory it shouldn't. Drops don't run on a panic, and
 there's no way to catch one. The program is over, and the line on
 stderr says where to look.
 

@@ -244,7 +244,7 @@ in your program, check for it, or state it as a requirement (chapter 6
 shows a first `requires`).
 
 `i64::MAX`, `i64::MIN`, `u8::MAX` and so on are constants, one pair for
-each integer type. Numbers have no methods, though: `x.abs()` and
+each integer type. Numbers have few methods, though: `x.abs()` and
 `x.pow(2)` don't exist. Write the expression instead (`if x < 0 { -x }
 else { x }`), or a small function of your own.
 

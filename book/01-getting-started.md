@@ -15,7 +15,9 @@ it ships a `volec fix` command that rewrites your code for you.
 
 This book tracks the current release. Every example in it is compiled
 and run by the book's own test suite, so the code you see works with
-the compiler it was written for. If you are using a newer compiler and
+the compiler it was written for. The rules the book teaches are the
+language's design; the compiler that checks them is young too, and
+when it falls short of one, that's a bug a later release fixes. If you are using a newer compiler and
 an example no longer builds, the error message is your best guide, and
 the book will catch up soon.
 

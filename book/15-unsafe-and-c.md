@@ -692,11 +692,12 @@ and each relies on something the safe code around it made true:
 `get` with a bad index panics just like indexing a `Vec` does.
 
 `impl Drop` does more than free the memory. A type with a `Drop` is
-*move-only*: assigning it moves it, and the old name can't be used
+owned, as chapter 4 showed, even when its fields are plain numbers and
+pointers: assigning it moves it, and the old name can't be used
 again. That matters here. If `Ints` could be copied, two copies would
 hold the same `data` pointer; one `push` could move the numbers to a
 new block and free the old one, leaving the other copy pointing at
-freed memory. Because it's move-only, the compiler stops that:
+freed memory. Because it's owned, the compiler stops that:
 
 ```vole skip
     let ys = xs;
@@ -717,7 +718,7 @@ around it stays safe:
   has the right to change it (an `inout` parameter is the only way to
   its value while the call runs, and the optimizer relies on that);
 - a type that manages memory through raw pointers implements `Drop`,
-  which makes it move-only.
+  which makes it owned, so it is moved, never copied.
 
 `volec guide unsafe` has them in full.
 
@@ -875,7 +876,7 @@ exercises your unsafe code gets this checking for free.
   function C's calling convention, for callbacks and for C calling vole;
   `--emit-header` writes the C declarations.
 - Wrap unsafe code in a safe type; one that owns raw memory implements
-  `Drop`, which also makes it move-only.
+  `Drop`, which also makes it owned: moved, never copied.
 - `--check-unsafe` and `--check-alloc` find out-of-bounds accesses and
   uses after free at run time.
 

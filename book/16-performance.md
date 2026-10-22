@@ -577,8 +577,7 @@ vole compiler itself.
   `detect` with a fallback keeps a program running on every processor.
 
 The next chapter is about the compiler's tools for reading and
-changing code, and about working on a vole program with an AI
-assistant.
+changing code, and about working on a vole program with an agent.
 
 ## Try it yourself
 

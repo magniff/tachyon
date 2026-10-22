@@ -8,8 +8,9 @@ and f-strings in full.
 
 By the end of the chapter you'll have written a word counter: it reads
 text, counts every word in it, and prints the most common ones as a
-table. Chapter 11 splits it into modules, and chapter 18 grows it into a
-real command-line tool.
+table. Chapter 11 splits it into modules, chapter 17 works on it with
+the compiler's tools, and chapter 18 grows it into a real command-line
+tool.
 
 ## Vec: a list that grows
 
@@ -122,8 +123,8 @@ fn main(gpa: Gpa) {
 ```
 
 Inside `for p in prices`, `p` is each element in turn, read-only. Vole
-has no way to loop over a Vec's elements "by reference" and change them
-in place; the index loop is how you do it.
+has no loop yet that changes a Vec's elements in place as it goes over
+them; the index loop is how you do it.
 
 ### Sorting and searching
 
@@ -723,7 +724,7 @@ true false true
 includes 75 and stops before 95, like `75..95`.
 
 `HashSet` and `BTreeMap` aren't in the prelude, so they need a `use`
-line. Two more containers are: `BinaryHeap`, a *priority queue*, where
+line. Two more containers are in the prelude: `BinaryHeap`, a *priority queue*, where
 you push values in any order and `pop` always gives back the largest
 one left, and `MinHeap`, which gives back the smallest.
 
