@@ -1,4 +1,4 @@
-# volec lsp: the language server (0.24; every name resolves, 0.25)
+# volec lsp: the language server (0.24; every name resolves, 0.25; completion and formatting, 0.25.1)
 
 `volec lsp` is a language server: an editor runs it and speaks the
 Language Server Protocol with it over stdin and stdout. It answers from
@@ -21,6 +21,10 @@ dependency: its JSON is read in place and written by hand.
 | `textDocument/hover` | a definition's signature; a function's effects, declared or inferred, with why (below), and its CPU features; the comment above it; its path. A local or an expression: its type (one per instance in a generic function, six at most). A type parameter: its bounds. A keyword or convention (`let`, `var`, `inout`, `sink`, `fn`, `self`, `requires`, `ensures`, `result`...), an attribute (`#[derive]`, `#[pure]`, `#[test]`...) or a primitive type (`i64`, `u8`...): a line or two of the guide, with the topic to read |
 | `textDocument/documentSymbol` | the file's definitions, as `query items` lists them, with their fields, variants and trait functions as children; ranges in the file (a file of std's too) |
 | `workspace/symbol` | the definitions whose names match the query: the program's (its letters in order, case ignored), then std's (holding it); 256 at most, with their module as `containerName` |
+| `textDocument/completion` (0.25.1) | on the editor's text as it is, parsing or not: after `.` the receiver's fields and methods, after `::` a module's items, an enum's variants, a type's functions, else the names in scope, the prelude and keywords (below); each with its kind and signature; a call's parameters as snippet placeholders when the client takes snippets. Triggered by `.` and `:` |
+| `completionItem/resolve` (0.25.1) | the item with the hover of its definition as its documentation: the signature, effects with why, features, the comment above it |
+| `textDocument/signatureHelp` (0.25.1) | in a call's arguments: the function's signature, its parameters as written (with their conventions, `x: sink T`, `v: inout Vec<i64>`; a method's `self` is no argument of `x.m(..)`), the one being typed, the comment above it. Triggered by `(` and `,` |
+| `textDocument/formatting`, `rangeFormatting` (0.25.1) | the document's text (an open one's unsaved text) laid out by `volec fmt`'s engine, one edit from the first line that changes to the last; a range formats the lines it touches. No edits when the text does not parse (below) |
 | `shutdown`, `exit` | the exit status is 0 after a shutdown, else 1 |
 
 A request for a method it does not have gets `MethodNotFound`
@@ -106,6 +110,74 @@ vole repository) its positions are in those files already.
 each file in the text, `front/stdtree.vl: built_files`) and the tail's
 lengths.
 
+## Completion (0.25.1)
+
+A text being typed rarely parses (`v.` with nothing after it), and
+reading the program again for each keystroke would cost the front end's
+time (hundreds of milliseconds on a big program). So completion reads
+the text it is given with a small lexer of its own (`tools/lsp/
+complete.vl`: the tokens, the bindings in scope at the cursor, the `use`
+lines) and asks the program the worker read last, perhaps an edit or
+two behind, for the rest: a binding at a place the edit did not touch
+(the text and the file read are compared from both ends) is the
+program's local there, with its type; one the program does not have
+gets its type from the text (`let v: T`, `let v = Vec::new_in(gpa)`,
+`let s = "a b".trim()`, `for x in v.iter()`). Then:
+
+- after `.`: the receiver's type (a local, a parameter, `self`, a
+  static, a literal, a field, a method's or a call's result, an index,
+  `?`, chained), its fields (another module's: its public ones), its
+  methods (its impl blocks', its traits' with their default methods,
+  std's: a String has `str`'s, a PathBuf `Path`'s, an array its
+  slice's); a method of a generic type has its result from the instance
+  the program made, else from its signature with the receiver's type
+  arguments (`Vec<i64>::first` gives `Option<i64>`, its `unwrap` an
+  `i64`);
+- after `::`: a module's items (`shapes::`, `std::`, `crate::tools::`),
+  an enum's variants, a type's associated functions and methods
+  (`Vec::new_in`, `Self::`); in `use a::b::{`: b's items; after `use`:
+  `crate`, `std`, `self`, `super` and the modules;
+- a name: the bindings in scope (innermost first, with their types),
+  the module's items, the names it imports, the prelude, the keywords
+  and snippets of the common forms (`fn`, `if`, `for`, `match`,
+  `struct`, `#[test]`...);
+- nothing in a comment or a string's text (an f-string's hole is code),
+  or where a new name is written (`let |`, `fn |`).
+
+Items whose names start with what is typed come first, then those
+case-insensitively, then those with its letters in order; within each,
+an item of the type the place expects (`let x: T = |`, `x = |` of a
+known x, `return |`) first, then the bindings, the members or the
+module's items, the imports, std's, the keywords. 400 items at most
+(`isIncomplete` when cut). Each item's `data` names its definition by
+its path and the worker by its number, for resolve.
+
+The server answers completion (and signature help) from a worker that
+is ready, never reading the program for it: the current one when it
+has read the program, else the one before it, which the server keeps
+(ready, with its program) until the new one is ready, else the current
+one, waited for (the first request). So a completion typed while the
+program is read again after an edit is answered at once, from the
+program as it was. The worker says it is ready with a frame `l` (`b`:
+ready, without a program: the text did not lex).
+
+## Formatting (0.25.1)
+
+`textDocument/formatting` formats the document's text as the editor
+has it (an open document's unsaved text; a file not opened: its text on
+disk) with `volec fmt`'s engine (`tools/fmt`), the same style, in a
+child process (fork), so that nothing the engine or the parser leaves
+in the tables reaches the server or the workers it starts. The text is
+first parsed alone (its modules not read): a text with a syntax error,
+one that does not lex or that fmt cannot lay out gets no edits, so
+broken code is never rewritten. The answer is one edit, from the start
+of the first line that changes to the end of the last
+(`tools/lsp/format.vl`); VS Code narrows it further.
+`rangeFormatting` lays out the lines the range touches (fmt's ranges).
+The VS Code extension makes vole the formatter of `.vl` files and
+formats on save (`editor.formatOnSave` for `[vole]`, which a user's
+setting overrides).
+
 ## The program it reads
 
 The root is the nearest `main.vl` in the document's directory or one
@@ -149,8 +221,15 @@ round trip (median of 15):
 | hover on a local (its type) | 13 ms |
 | documentSymbol of a 1,040-line file (53 symbols) | 0.4 ms |
 | the first request after an edit: the program read again | ~710 ms |
+| completion (0.25.1), after `.`, `::` or in a name, on an edited text | 1.6 ms |
+| completion while the program is read again (the kept worker) | 1.6 ms |
+| signature help | 0.5 ms |
+| formatting a 1,100-line file (parsed, laid out, in a child process) | 3 ms |
 
-Every request on a program read is well under 50 ms. Reading the
+Every request on a program read is well under 50 ms; completion
+(0.25.1) never waits for the program to be read again (above): 1.6 ms
+(the median of 15 rounds of six contexts, a load average of about 3; 2.5
+ms at most), measured with the client's clock. Reading the
 program is the front end's time (`check --time-passes` without the
 cache: about 450 ms of CPU here, the rest the machine's load): an edit
 costs one reading, in the background after the debounce, and the
@@ -212,8 +291,17 @@ answers they get now. std's files are written under the scratch
 directory (`XDG_CACHE_HOME`), `@DIR@/.cache/vole/std-@STD@/` in the
 answers; a session that asks about one names it so, and std is written
 first to know the directory. Then the compiler's source is opened and asked
-for symbols, references and a hover, which must be plausible; the
-times are printed.
+for symbols, references, a hover, a completion, a signature and its
+formatting (0.25.1), which must be plausible; the times are printed.
+
+(0.25.1) `complete.lsp` asks for completion in every context on texts
+that do not parse (`tests/lsp/texts/complete-*`, the program
+`prog-complete`), from the worker that read the program before the
+edit and from one that read the edited text (the same answers), and
+for resolve and signature help; `format.lsp` formats a text, a range,
+a broken text (no edits) and a file not opened. The VS Code extension's
+`npm test` runs `test/lsp.test.js`: the requests VS Code sends on save
+and while typing.
 
 ## Known limits
 
@@ -222,6 +310,13 @@ times are printed.
 - In a file of std's, a local's definition and references are not
   found (a generic function of std is checked per instance); its items'
   are. A builtin operator (`+` of integers) has no definition.
-- No rename, completion, signature help or formatting yet: `volec
-  refactor rename`, `volec fmt` do them from the command line.
-- A program that does not parse gets its diagnostics, and empty answers.
+- No rename yet: `volec refactor rename` does it from the command line.
+- A program that does not parse gets its diagnostics, and empty answers
+  but completion's, signature help's and formatting's (which read the
+  text themselves).
+- Completion (0.25.1) tells types from the program read and the text:
+  a generic method's result needs the instance the program made or its
+  signature's type arguments; a type parameter's bounds' methods (`x:
+  T` of `T: Ord`) are not offered; a binding's scope is its braces (a
+  match arm's names are seen to the end of the match); the expected
+  type is a `let`'s written one, an assignment's and a `return`'s.

@@ -41,6 +41,7 @@ use crate::front::modules::file_of_pos;
 use crate::front::types::{FNS, FN_COUNT, buf_type};
 use crate::middle::lower::ssa::HMap;
 use crate::tools::lsp::{TIMING, now_us, write_all};
+use crate::tools::lsp::json::{at_path, str_into};
 use crate::tools::lsp::stdfiles::{
     STD_F, put_segment_path, segment_by_path, segment_from, segment_name, segment_of, segment_to,
     std_files_ready,
@@ -129,22 +130,35 @@ pub fn serve(root: *u8, input: i32, output: i32, utf8: bool) -> ! {
             local_named_at(0);
             TYPED = alloc_array::<TypedIndex>(1);
             TYPED[0] = typed_index();
+            crate::tools::lsp::complete::index_locals(LOCAL_DECL);
             lap("index", t2);
         }
+        // (0.25.1) ready: the server may keep this worker for completion
+        // after the program changes (`l`; `b`: the program was not read)
+        send(if LOADED { 'l' } else { 'b' }, "");
         let pending = buf_new();
         let chunk = alloc_zeroed(65536);
         var from = 0;
         loop {
-            // a whole line: answered
+            // a whole line: answered (with the bytes after it that a
+            // completion or resolve request carries: its FLAG field's count)
             let s = buf_slice(pending);
             var nl = from;
             while nl < s.len && s[nl] != '\n' {
                 nl += 1;
             }
             if nl < s.len {
-                answer_line(s[from..nl]);
-                from = nl + 1;
-                continue;
+                let line = s[from..nl];
+                let m = field(line, 0);
+                var more = 0;
+                if m.len >= 10 && m[0..10] == "completion" || m == "signatureHelp" {
+                    more = parse_digits(field(line, 4));
+                }
+                if nl + 1 + more <= s.len {
+                    answer_line(line, s[nl + 1..nl + 1 + more]);
+                    from = nl + 1 + more;
+                    continue;
+                }
             }
             let got = read(input, chunk, 65536);
             if got <= 0 {
@@ -187,7 +201,7 @@ fn field(line: [u8], k: i64) -> [u8] {
     if n == k { line[start..line.len] } else { line[0..0] }
 }
 
-fn answer_line(line: [u8]) {
+fn answer_line(line: [u8], payload: [u8]) {
     unsafe {
         let t0 = now_us();
         let method = field(line, 0);
@@ -218,12 +232,40 @@ fn answer_line(line: [u8]) {
             }
         } else if method == "workspaceSymbol" {
             if LOADED { put_workspace_symbols(out, path); } else { buf_str(out, c"[]"); }
+        } else if method == "completion" || method == "completion+s" {
+            // (0.25.1) the editor's text in the payload; f: its file, if the
+            // program has it
+            crate::tools::lsp::complete::put_completion(out, f, payload, ln, ch, UTF8, LOADED,
+                method == "completion+s");
+        } else if method == "completionResolve" {
+            put_resolve(out, payload);
+        } else if method == "signatureHelp" {
+            crate::tools::lsp::complete::put_signature_help(out, f, payload, ln, ch, UTF8, LOADED);
         } else {
             buf_str(out, c"null");
         }
         buf_byte(out, '}');
         send('r', buf_slice(out));
         lap(method, t0);
+    }
+}
+
+// completionItem/resolve (0.25.1): the item (JSON) with the hover of the
+// definition its data names as its documentation.
+fn put_resolve(out: i64, item: [u8]) {
+    unsafe {
+        let path = buf_new();
+        str_into(item, at_path(item, 0, "data.p"), path);
+        let d = if LOADED && buf_slice(path).len > 0 {
+            crate::tools::lsp::complete::def_by_path(buf_slice(path))
+        } else {
+            -1
+        };
+        let md = buf_new();
+        if d >= 0 {
+            hover_def(md, d, -1);
+        }
+        crate::tools::lsp::complete::put_resolved(out, item, d, buf_slice(md));
     }
 }
 
@@ -1530,7 +1572,7 @@ fn put_why_lines(md: i64, f: i64) {
 // The hover of definition d: its signature, a function's effects (declared
 // or inferred, with their reasons) and features, its path. At a call of a
 // generic function (inst: the instance called, else -1), the instance's.
-fn hover_def(md: i64, d: i64, inst: i64) {
+pub fn hover_def(md: i64, d: i64, inst: i64) {
     unsafe {
         buf_str(md, c"```vole\n");
         put_signature(md, d);
@@ -1604,7 +1646,7 @@ fn hover_def(md: i64, d: i64, inst: i64) {
 
 // The comment right above definition d (its `//` lines, without the
 // slashes; attribute lines left out), as a paragraph after an empty line.
-fn put_doc(md: i64, d: i64) {
+pub fn put_doc(md: i64, d: i64) {
     unsafe {
         let parent = DEFS[d].parent;
         if parent >= 0 && line_start(DEFS[d].start) == line_start(DEFS[parent].start) {

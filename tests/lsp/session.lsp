@@ -2,7 +2,7 @@
 ## request answered from the worker that read the program; an edit that
 ## breaks it publishes the error, one that fixes it clears it.
 > {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
-< {"jsonrpc":"2.0","id":1,"result":{"capabilities":{"positionEncoding":"utf-16","textDocumentSync":{"openClose":true,"change":1,"save":{"includeText":true}},"definitionProvider":true,"referencesProvider":true,"hoverProvider":true,"documentSymbolProvider":true,"workspaceSymbolProvider":true},"serverInfo":{"name":"volec","version":"@VERSION@"}}}
+< {"jsonrpc":"2.0","id":1,"result":{"capabilities":{"positionEncoding":"utf-16","textDocumentSync":{"openClose":true,"change":1,"save":{"includeText":true}},"definitionProvider":true,"referencesProvider":true,"hoverProvider":true,"documentSymbolProvider":true,"workspaceSymbolProvider":true,"documentFormattingProvider":true,"documentRangeFormattingProvider":true,"completionProvider":{"triggerCharacters":[".",":"],"resolveProvider":true},"signatureHelpProvider":{"triggerCharacters":["(",","]}},"serverInfo":{"name":"volec","version":"@VERSION@"}}}
 > {"jsonrpc":"2.0","method":"initialized","params":{}}
 > @open main.vl
 ## definition and references of a function (from a call)

@@ -4,7 +4,7 @@
 ## contracts and attributes; keywords, attributes and primitive types
 ## explained. The program: tests/lsp/prog-resolve/main.vl.
 > {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}
-< {"jsonrpc":"2.0","id":1,"result":{"capabilities":{"positionEncoding":"utf-16","textDocumentSync":{"openClose":true,"change":1,"save":{"includeText":true}},"definitionProvider":true,"referencesProvider":true,"hoverProvider":true,"documentSymbolProvider":true,"workspaceSymbolProvider":true},"serverInfo":{"name":"volec","version":"@VERSION@"}}}
+< {"jsonrpc":"2.0","id":1,"result":{"capabilities":{"positionEncoding":"utf-16","textDocumentSync":{"openClose":true,"change":1,"save":{"includeText":true}},"definitionProvider":true,"referencesProvider":true,"hoverProvider":true,"documentSymbolProvider":true,"workspaceSymbolProvider":true,"documentFormattingProvider":true,"documentRangeFormattingProvider":true,"completionProvider":{"triggerCharacters":[".",":"],"resolveProvider":true},"signatureHelpProvider":{"triggerCharacters":["(",","]}},"serverInfo":{"name":"volec","version":"@VERSION@"}}}
 > {"jsonrpc":"2.0","method":"initialized","params":{}}
 > @open main.vl
 ## std's modules and items named by `use`; `std` itself

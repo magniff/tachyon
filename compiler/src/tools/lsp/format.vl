@@ -1,0 +1,239 @@
+// textDocument/formatting and rangeFormatting (0.25.1, docs/lsp.md): the
+// document's text as the editor has it (unsaved edits too), formatted by
+// `volec fmt`'s engine (tools/fmt: format_text, the same style), in a
+// child process (fork), so that what the engine and the parser leave in
+// the tables never reaches the server or the workers it forks. A text
+// that does not parse, or that fmt cannot lay out, gets no edits: broken
+// code is never rewritten. The answer is one edit: the lines that differ,
+// from the first to the last (an editor narrows it further; VS Code
+// does).
+
+use crate::base::{
+    FILES, IntVec, STDERR, _setjmp, alloc_array, alloc_zeroed, buf_byte, buf_bytes, buf_clear,
+    buf_fmt, buf_new, buf_slice, buf_str, load_sources,
+};
+use crate::base::diag::{ERR_BAIL, ERR_KIND, errors_mark};
+use crate::base::json::buf_json_str;
+use crate::front::ast::init_ast;
+use crate::front::lexer::{init_lexer, lex_range};
+use crate::front::parser::parse_program;
+use crate::tools::fmt::{format_text, generated};
+use crate::tools::lsp::{TIMING, now_us, write_all};
+use crate::tools::proc::{buf_cstr, write_file_if};
+use crate::tools::query::command_line::QUERY;
+
+extern "C" {
+    fn fork() -> i32;
+    fn pipe(fds: *i32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn read(fd: i32, buf: *u8, n: u64) -> i64;
+    fn waitpid(pid: i32, status: *i32, options: i32) -> i32;
+    fn unlink(path: *u8) -> i32;
+    fn getpid() -> i32;
+    fn _exit(code: i32) -> !;
+}
+
+// ---- positions in a text
+
+// The bytes of the UTF-8 sequence starting with c.
+fn seq_len(c: u8) -> i64 {
+    if c < 128 as u8 { 1 } else if c < 224 as u8 { 2 } else if c < 240 as u8 { 3 } else { 4 }
+}
+
+// The byte offset in text of (line, character), the character in UTF-8
+// bytes (utf8) or UTF-16 units; the end of the line when the character is
+// past it, the end of the text when the line is.
+pub fn text_offset(text: [u8], line: i64, ch: i64, utf8: bool) -> i64 {
+    var p = 0;
+    var l = 0;
+    while l < line && p < text.len {
+        if text[p] == '\n' {
+            l += 1;
+        }
+        p += 1;
+    }
+    if l < line {
+        return text.len;
+    }
+    var units = 0;
+    while p < text.len && text[p] != '\n' && units < ch {
+        let n = seq_len(text[p]);
+        units += if utf8 { n } else if n == 4 { 2 } else { 1 };
+        p += n;
+    }
+    if p > text.len { text.len } else { p }
+}
+
+// `{"line":L,"character":C}` of byte offset at of text.
+pub fn put_text_position(out: i64, text: [u8], at: i64, utf8: bool) {
+    var line = 0;
+    var ls = 0;
+    for i in 0..at {
+        if text[i] == '\n' {
+            line += 1;
+            ls = i + 1;
+        }
+    }
+    var units = 0;
+    var p = ls;
+    while p < at {
+        let n = seq_len(text[p]);
+        units += if utf8 { n } else if n == 4 { 2 } else { 1 };
+        p += n;
+    }
+    buf_fmt(out, f"{{\"line\":{line},\"character\":{units}}}");
+}
+
+// ---- the answer
+
+// The edits that make text `old` the text `new`, as a JSON array: one
+// edit, from the start of the first line that differs to the end of the
+// last (`[]` when they are the same).
+pub fn put_edits(out: i64, old: [u8], new: [u8], utf8: bool) {
+    // the common lines at the start
+    var a = 0;
+    var i = 0;
+    while i < old.len && i < new.len && old[i] == new[i] {
+        if old[i] == '\n' {
+            a = i + 1;
+        }
+        i += 1;
+    }
+    if i == old.len && i == new.len {
+        buf_str(out, c"[]");
+        return;
+    }
+    // and at the end: j bytes, of which the last e after a line break
+    // they share (whole lines, not into the common start)
+    var j = 0;
+    while j < old.len - a && j < new.len - a && old[old.len - 1 - j] == new[new.len - 1 - j] {
+        j += 1;
+    }
+    var e = 0;
+    var k = j - 1;
+    while k > 0 {
+        if old[old.len - k - 1] == '\n' {
+            e = k;
+            break;
+        }
+        k -= 1;
+    }
+    buf_str(out, c"[{\"range\":{\"start\":");
+    put_text_position(out, old, a, utf8);
+    buf_str(out, c",\"end\":");
+    put_text_position(out, old, old.len - e, utf8);
+    buf_str(out, c"},\"newText\":");
+    buf_json_str(out, new[a..new.len - e]);
+    buf_str(out, c"}]");
+}
+
+// ---- in the child
+
+// Whether text parses as a file of a program (alone: the modules it
+// names are not read), the file at path holding it.
+fn parses(path: *u8) -> bool {
+    unsafe {
+        QUERY = true;
+        ERR_BAIL = alloc_zeroed(512);
+        var done = false;
+        if _setjmp(ERR_BAIL) == 0 {
+            ERR_KIND = c"tokenizer error";
+            let paths = alloc_array::<*u8>(1);
+            paths[0] = path;
+            load_sources(paths, 1);
+            init_lexer();
+            lex_range(FILES[0].start, FILES[0].end, false);
+            lex_range(FILES[0].end, FILES[0].end, true);
+            init_ast();
+            ERR_KIND = c"parser error";
+            parse_program();
+            done = true;
+        }
+        done && errors_mark() == 0
+    }
+}
+
+// The formatted text into out (`1` then the text), or why there is none
+// (`0` then the reason); ranges: byte offsets, in pairs (none: all).
+fn format_in_child(text: [u8], ranges: *IntVec, scratch: [u8], out: i64) {
+    unsafe {
+        if generated(text) {
+            buf_str(out, c"0generated");
+            return;
+        }
+        let path = buf_new();
+        buf_bytes(path, scratch);
+        buf_fmt(path, f"/fmt{getpid()}");
+        buf_str(path, crate::tools::lsp::SOURCE_EXT);
+        let ok = write_file_if(buf_cstr(path), text) && parses(buf_cstr(path));
+        unlink(buf_cstr(path));
+        if !ok {
+            buf_str(out, c"0does not parse");
+            return;
+        }
+        let formatted = buf_new();
+        if !format_text(text, ranges, formatted) {
+            buf_str(out, c"0");
+            buf_bytes(out, crate::tools::fmt::pieces::BAD_MESSAGE);
+            return;
+        }
+        buf_byte(out, '1');
+        buf_bytes(out, buf_slice(formatted));
+    }
+}
+
+// The edits formatting text (ranges: byte offsets in pairs, none: the
+// whole text) into out, a JSON array; `[]` when nothing changes or it
+// cannot be formatted. scratch: a directory for the child's file.
+pub fn put_formatting(out: i64, text: [u8], ranges: *IntVec, scratch: [u8], utf8: bool) {
+    unsafe {
+        let t0 = now_us();
+        let fds = alloc_array::<i32>(2);
+        if pipe(fds) != 0 {
+            buf_str(out, c"[]");
+            return;
+        }
+        let pid = fork();
+        if pid == 0 {
+            close(fds[0]);
+            let r = buf_new();
+            format_in_child(text, ranges, scratch, r);
+            write_all(fds[1], buf_slice(r));
+            _exit(0);
+        }
+        close(fds[1]);
+        let got = buf_new();
+        if pid > 0 {
+            let chunk = alloc_zeroed(65536);
+            loop {
+                let n = read(fds[0], chunk, 65536);
+                if n <= 0 {
+                    break;
+                }
+                buf_bytes(got, chunk[0..n]);
+            }
+            var st = 0 as i32;
+            waitpid(pid, &st, 0);
+        }
+        close(fds[0]);
+        let r = buf_slice(got);
+        if r.len > 0 && r[0] == '1' {
+            put_edits(out, text, r[1..r.len], utf8);
+        } else {
+            buf_str(out, c"[]");
+        }
+        if TIMING {
+            let us = now_us() - t0;
+            let line = buf_new();
+            buf_str(line, c"lsp: format ");
+            if r.len > 0 && r[0] == '0' {
+                buf_str(line, c"(none: ");
+                buf_bytes(line, r[1..r.len]);
+                buf_str(line, c") ");
+            }
+            buf_fmt(line, f"{us / 1000}.{(us % 1000) / 100} ms\n");
+            write_all(STDERR, buf_slice(line));
+        }
+        buf_clear(got);
+    }
+}
