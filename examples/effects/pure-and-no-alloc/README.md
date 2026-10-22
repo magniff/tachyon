@@ -6,7 +6,7 @@ holds them to it:
 
 | function | promise | meaning |
 |---|---|---|
-| `score` | `#[pure]` | no allocation, no I/O, no statics (it may panic, loop, and write through its pointer parameters) |
+| `score` | `#[pure]` | no allocation, no I/O, no statics (it may panic, loop, and write through its inout parameters) |
 | `histogram` | `#[no_alloc]` | allocates nothing: it fills memory its caller gives it |
 | `peak` | `#[no_panic]` | cannot stop the program: no index that may be out of range, no `unwrap` |
 
@@ -138,7 +138,7 @@ try: volec edit patch peak --old 'var best = s.get(0)?;' --new 'var best = s[0];
 ```
 
 `s[0]` may be out of range (for an empty slice it is), so it may stop
-the program. A counted `for i in 0..s.len` loop's `s[i]` is known to be
+the program. A counted `for i in 0..s.len()` loop's `s[i]` is known to be
 in range and is no `panic`; so are a constant index into an array of
 that length, and `for x in s`.
 
