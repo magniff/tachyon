@@ -27,6 +27,13 @@ pub static var FIELDS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static var PARAMS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 const PARAM_WIDTH: i64 = 5;
 static var INTR_CAP: i64 = 0;
+// (0.25) TABLE_BUF's text while it is parsed (the buffer does not grow
+// then), for the parser's byte by byte reads.
+static var TEXT: *u8 = 0 as *u8;
+
+extern "C" {
+    fn memchr(s: *u8, c: i32, n: u64) -> *u8;
+}
 
 pub fn param_entry(p: i64, k: i64) -> i64 {
     unsafe { PARAMS.data[p * PARAM_WIDTH + k] }
@@ -38,7 +45,7 @@ pub fn param_type_text(p: i64) -> [u8] {
 }
 
 fn byte(i: i64) -> u8 {
-    unsafe { BUFS[TABLE_BUF].data[i] }
+    unsafe { TEXT[i] }
 }
 
 fn text(a: i64, b: i64) -> [u8] {
@@ -118,26 +125,35 @@ fn trim_end(a: i64, b: i64) -> i64 {
 }
 
 // Splits the line [a, b) at " | " into FIELDS (want fields); false when it
-// has another count.
+// has another count. (0.25: the '|'s found by memchr)
 fn split_fields(a: i64, b: i64, want: i64) -> bool {
     unsafe {
+        let t = TEXT;
         var start = a;
         var n = 0;
-        var i = a;
-        while i <= b {
-            let at_sep = i + 2 < b && byte(i) == ' ' && byte(i + 1) == '|' && byte(i + 2) == ' ';
-            if i == b || at_sep {
-                FIELDS.push(trim_start(start, i));
-                FIELDS.push(trim_end(start, i));
-                n += 1;
-                if i == b {
+        while true {
+            // (the next " | " from start, else b)
+            var sep = b;
+            var q = start + 1;
+            while q + 1 < b {
+                let bar = memchr(&t[q], '|' as i32, (b - 1 - q) as u64);
+                if bar == 0 as *u8 {
                     break;
                 }
-                i += 3;
-                start = i;
-                continue;
+                q += bar as i64 - (&t[q]) as i64;
+                if t[q - 1] == ' ' && t[q + 1] == ' ' {
+                    sep = q - 1;
+                    break;
+                }
+                q += 1;
             }
-            i += 1;
+            FIELDS.push(trim_start(start, sep));
+            FIELDS.push(trim_end(start, sep));
+            n += 1;
+            if sep == b {
+                break;
+            }
+            start = sep + 3;
         }
         n == want
     }
@@ -153,13 +169,14 @@ pub fn load_table() {
         intrinsics_source(TABLE_BUF);
         init_name_table();
         let len = BUFS[TABLE_BUF].len;
+        let t = BUFS[TABLE_BUF].data;
+        TEXT = t;
         var arch = ARCH_PORTABLE;
         var a = 0;
         while a < len {
-            var b = a;
-            while b < len && byte(b) != '\n' {
-                b += 1;
-            }
+            // (the end of the line, by memchr)
+            let nl = memchr(&t[a], '\n' as i32, (len - a) as u64);
+            let b = if nl == 0 as *u8 { len } else { a + (nl as i64 - (&t[a]) as i64) };
             if byte(a) == '=' {
                 arch = if is(a + 2, b, "aarch64") { ARCH_AARCH64 }
                     else if is(a + 2, b, "x86_64") { ARCH_X86_64 } else { ARCH_PORTABLE };
