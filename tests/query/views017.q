@@ -64,7 +64,7 @@ Vec<u8>::as_slice	views(self) declared
 Vec<Vec<u64>>::as_slice	views(self) declared
 Vec<Adapter, ScopedArena>::as_slice	views(self) declared
 Vec<Slot>::as_slice	views(self) declared
-Vec<str>::as_slice	views() declared
+Vec<str>::as_slice	views(*self) declared
 Vec<[u8]>::push	views() stores(x) declared
 Vec<Tok>::push	views() stores(x) declared
 Vec<u8>::push	views()
@@ -113,14 +113,14 @@ Vec<u32>::push	views()
 Vec<Event>::push	views()
 Vec<State>::push	views()
 Vec<Watch>::push	views()
-Vec<Cmd>::push	views()
-Vec<Arg>::push	views()
+Vec<Cmd>::push	views() stores(x) declared
+Vec<Arg>::push	views() stores(x) declared
 Vec<Adapter, ScopedArena>::push	views() stores(x) declared
 Vec<(i64, u32)>::push	views()
 Vec<str>::push	views() stores(x) declared
 Vec<Path>::push	views() stores(x) declared
 Vec<Result<DirEntry, Error>>::push	views()
-Vec<Slot>::push	views()
+Vec<Slot>::push	views() stores(x) declared
 $ views crate --why
 crate::first_word	views(s) declared
   why: declared (#[views], #[stores]): callers use the declaration, and the body is checked against it
