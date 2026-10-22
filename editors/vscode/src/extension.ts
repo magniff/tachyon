@@ -1,6 +1,8 @@
 // The vole extension: starts `volec lsp` as a language server over stdio.
 //
-// The server gives diagnostics, go to definition, references, hover and
+// The server gives diagnostics, completion, signature help, formatting
+// (the formatter of `.vl` files, on save by default: package.json's
+// configurationDefaults), go to definition, references, hover and
 // document and workspace symbols, on every name: std's items too, whose
 // definitions are in std's text as the server writes it to a cache
 // directory (`.../vole/std-VERSION-HASH/`, docs/lsp.md); those files open

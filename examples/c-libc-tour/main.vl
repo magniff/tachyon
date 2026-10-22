@@ -19,7 +19,7 @@ use std::cli::{Arg, Command};
 
 // A vole slice as a C string: C wants the NUL a slice does not have,
 // so the bytes are copied into a Buf with a 0 after them. Pass
-// `s.as_slice().ptr` to C; free the Buf after.
+// `s.as_slice().ptr` to C; the Buf is dropped with its owner.
 fn cstring(s: [u8], gpa: Gpa) -> Buf {
     var b = Buf::new_in(gpa);
     b.push_str(s);
@@ -34,8 +34,8 @@ fn c_path(dir: [u8], name: [u8], gpa: Gpa) -> Buf {
     b
 }
 
-// A C string's text, copied into a Buf (the caller frees it): C may
-// reuse its memory (readdir and getenv may), a Buf is ours.
+// A C string's text, copied into a Buf the caller owns: C may reuse
+// its memory (readdir and getenv may), a Buf is ours.
 //
 // Unsafe: `p` must point to a NUL-terminated string.
 unsafe fn owned(p: *u8, gpa: Gpa) -> Buf {
@@ -44,14 +44,13 @@ unsafe fn owned(p: *u8, gpa: Gpa) -> Buf {
     b
 }
 
-// A struct stat of zero bytes, to be filled in by C: it has no vole
-// constructor, and its fields differ between systems. (A generic
-// `zeroed<T>` would serve any C struct; `-S` assembly output cannot
-// name an instance of one with a C type yet, so this one is for stat.)
+// A C struct of zero bytes, to be filled in by C: a struct stat has no
+// vole constructor, and its fields differ between systems.
 //
-// Unsafe: it calls C, and trusts calloc to return zeroed memory.
-unsafe fn zeroed_stat() -> c::stat {
-    let p = c::calloc(1, size_of(c::stat) as u64) as *c::stat;
+// Unsafe: it calls C, and `T` must be a C type for which all zero bytes
+// are a valid value (a C struct of numbers and pointers is).
+unsafe fn zeroed<T>() -> T {
+    let p = c::calloc(1, size_of(T) as u64) as *T;
     let value = *p;
     c::free(p as *u8);
     value
@@ -61,34 +60,26 @@ unsafe fn zeroed_stat() -> c::stat {
 
 // getenv's NULL becomes None.
 fn env(name: [u8], gpa: Gpa) -> Option<Buf> {
-    var cname = cstring(name, gpa);
+    let cname = cstring(name, gpa);
     let p = unsafe { c::getenv(cname.as_slice().ptr) };
     if p == 0 as *u8 { None } else { Some(unsafe { owned(p, gpa) }) }
 }
 
 fn set_env(name: [u8], value: [u8], gpa: Gpa) {
-    var cname = cstring(name, gpa);
-    var cvalue = cstring(value, gpa);
+    let cname = cstring(name, gpa);
+    let cvalue = cstring(value, gpa);
     unsafe { c::setenv(cname.as_slice().ptr, cvalue.as_slice().ptr, 1); }
 }
 
 fn environment(gpa: Gpa) {
     println("== environment");
     set_env("TOUR_GREETING", "hello from setenv", gpa);
-    var greeting = env("TOUR_GREETING", gpa);
+    let greeting = env("TOUR_GREETING", gpa);
     println(f"TOUR_GREETING = {greeting:?}");
-    if let Some(var b) = greeting { b.free(); }
     unsafe { c::unsetenv(c"TOUR_MISSING"); }
     println(f"TOUR_MISSING  = {env("TOUR_MISSING", gpa):?}");
     let entries = match env("PATH", gpa) {
-        Some(path) => {
-            var path = path;
-            var dirs = std::split_in(path.as_slice(), ':', gpa);
-            let n = dirs.len();
-            dirs.free();
-            path.free();
-            n
-        }
+        Some(path) => std::split_in(path.as_slice(), ':', gpa).len(),
         None => 0,
     };
     println(f"PATH is set: {entries > 0}");
@@ -98,7 +89,7 @@ fn environment(gpa: Gpa) {
 
 // strftime into a stack buffer; the text as a Buf.
 fn format_time(format: [u8], t: c::tm, gpa: Gpa) -> Buf {
-    var cformat = cstring(format, gpa);
+    let cformat = cstring(format, gpa);
     var out: [u8; 128] = [0; 128];
     let n = unsafe { c::strftime(&out as *u8, 128, cformat.as_slice().ptr, &t) };
     var b = Buf::new_in(gpa);
@@ -116,7 +107,7 @@ fn show_in_zone(zone: [u8], when: i64, gpa: Gpa) {
     use_zone(zone, gpa);
     // localtime returns a pointer to a static struct tm: copy it out.
     let parts: c::tm = unsafe { *c::localtime(&when) };
-    var text = format_time("%Y-%m-%d %H:%M:%S %z", parts, gpa);
+    let text = format_time("%Y-%m-%d %H:%M:%S %z", parts, gpa);
     let offset = parts.tm_gmtoff;
     let sign = if offset < 0 { "-" } else { "+" };
     let minutes = if offset < 0 { -offset / 60 } else { offset / 60 };
@@ -128,7 +119,7 @@ fn time_demo(gpa: Gpa) {
     // A fixed moment, so the output is the same on every run.
     let when: i64 = 1234567890;
     var utc: c::tm = unsafe { *c::gmtime(&when) };
-    var long = format_time("%A, %d %B %Y, %H:%M:%S UTC", utc, gpa);
+    let long = format_time("%A, %d %B %Y, %H:%M:%S UTC", utc, gpa);
     println(f"{when} is {long.as_slice()}");
     println(
         f"  struct tm: year {utc.tm_year + 1900}, month {utc.tm_mon + 1}, day {utc.tm_yday + 1} of the year, weekday {utc.tm_wday}");
@@ -139,7 +130,7 @@ fn time_demo(gpa: Gpa) {
     use_zone("UTC0", gpa);
     utc.tm_mday += 100;
     let later = unsafe { c::mktime(&utc) };
-    var date = format_time("%Y-%m-%d, a %A", utc, gpa);
+    let date = format_time("%Y-%m-%d, a %A", utc, gpa);
     println(f"100 days later: {date.as_slice()} ({later - when} seconds later)");
 }
 
@@ -164,7 +155,7 @@ fn mode_text(mode: u32, out: inout Buf) {
 // The entries of `dir` but . and .., sorted by name, with their sizes and
 // modes; None if it cannot be opened.
 fn list(dir: [u8], gpa: Gpa) -> Option<Vec<Entry>> {
-    var cdir = cstring(dir, gpa);
+    let cdir = cstring(dir, gpa);
     let d = unsafe { c::opendir(cdir.as_slice().ptr) };
     if d == 0 as *c::DIR {
         return None;
@@ -192,7 +183,7 @@ fn list(dir: [u8], gpa: Gpa) -> Option<Vec<Entry>> {
     });
     for i in 0..entries.len() {
         let path = c_path(dir, entries[i].name.as_slice(), gpa);
-        var st: c::stat = unsafe { zeroed_stat() };
+        var st: c::stat = unsafe { zeroed() };
         if unsafe { c::stat(path.as_slice().ptr, &st) } == 0 {
             entries[i].size = st.st_size;
             entries[i].mode = st.st_mode; // u16 on macOS, u32 on Linux: it widens
@@ -226,7 +217,7 @@ fn print_listing(title: [u8], entries: Vec<Entry>, gpa: Gpa) {
 // Writes `text` to the file `name` in `dir` with stdio and gives it the
 // permissions `mode` (not left to the umask); false if it cannot.
 fn write_file(dir: [u8], name: [u8], text: [u8], mode: u16, gpa: Gpa) -> bool {
-    var cpath = c_path(dir, name, gpa);
+    let cpath = c_path(dir, name, gpa);
     let f = unsafe { c::fopen(cpath.as_slice().ptr, c"w") };
     if f == 0 as *c::FILE {
         return false;
@@ -255,7 +246,7 @@ fn files_demo(gpa: Gpa) {
     let made = write_file(dir, "notes.txt", "remember the NUL\n", RW_______, gpa)
         && write_file(dir, "data.csv", "a,b\n1,2\n3,4\n", RW_R__R__, gpa)
         && write_file(dir, "empty", "", RW_R__R__, gpa);
-    var sub = c_path(dir, "subdir", gpa);
+    let sub = c_path(dir, "subdir", gpa);
     unsafe {
         c::mkdir(sub.as_slice().ptr, RWXR_XR_X);
         c::chmod(sub.as_slice().ptr, RWXR_XR_X); // mkdir's mode is masked by the umask
@@ -267,7 +258,7 @@ fn files_demo(gpa: Gpa) {
             print_listing("the directory", entries, gpa);
             // clean up: files with unlink, directories with rmdir
             for e in entries.as_slice() {
-                var path = c_path(dir, e.name.as_slice(), gpa);
+                let path = c_path(dir, e.name.as_slice(), gpa);
                 unsafe {
                     if is_dir(e.mode) { c::rmdir(path.as_slice().ptr); }
                     else { c::unlink(path.as_slice().ptr); }

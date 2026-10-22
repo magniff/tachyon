@@ -50,16 +50,16 @@ itself, so the `&` goes). `--dry-run` prints the diff without writing it:
 $ volec rewrite 'buf_add(&$b, $s)' '$b.push_str($s)' --dry-run | head -12
 --- a/report.vl
 +++ b/report.vl
-@@ -3 +3 @@
+@@ -5 +5 @@
 -use crate::compat::{buf_add, buf_add_int, vec_at};
 +use crate::compat::{buf_add_int, vec_at};
-@@ -9 +9 @@
+@@ -10 +10 @@
 -        buf_add(&b, "#");
 +        b.push_str("#");
-@@ -14 +14 @@
+@@ -15 +15 @@
 -    buf_add(&b, "lines ");
 +    b.push_str("lines ");
-@@ -16 +16 @@
+@@ -17 +17 @@
 note rewrite.imports: removed 1 import the rewrite left unused
 $ volec rewrite 'buf_add(&$b, $s)' '$b.push_str($s)'
 rewrote 24 sites in 1 file	report.vl	+25 -25 lines
@@ -67,16 +67,16 @@ note rewrite.imports: removed 1 import the rewrite left unused
 $ volec rewrite 'buf_add_int(&$b, $n)' '$b.push_int($n)'
 rewrote 10 sites in 1 file	report.vl	+11 -11 lines
 note rewrite.imports: removed 1 import the rewrite left unused
-$ volec rewrite 'vec_at($v, $i)' '$v.get($i)' --show
-rewrote 3 sites in 2 files	2 files	+3 -5 lines
-// report.vl:2: 1 line removed after line 2
-// report.vl:31
-31	        let c = top.get(i);
-// stats.vl:2: 1 line removed after line 2
+$ volec rewrite 'vec_at($v, $i)' '$v[$i]' --show
+rewrote 3 sites in 2 files	2 files	+3 -6 lines
+// report.vl:4: 1 line removed after line 4
+// report.vl:32
+32	        let c = top[i];
+// stats.vl:4: 2 lines removed after line 4
 // stats.vl:64
-64	        out.push(v.get(i));
+64	        out.push(v[i]);
 // stats.vl:73
-73	        if v.get(i).n == 1 {
+73	        if v[i].n == 1 {
 note rewrite.imports: removed 2 imports the rewrite left unused
 ```
 
@@ -116,7 +116,7 @@ the hole has two types at the sites, and each gets a command:
 
 ```console
 $ volec rewrite '$v.len() == 0' '$v.is_empty()'
-report.vl:68:8: error[type error] no method 'is_empty' on type 'Buf' | help: no `is_empty`: `x.len() == 0` | try: volec query items Buf main.vl  [edited: crate::report::finish]
+report.vl:69:8: error[type error] no method 'is_empty' on type 'Buf' | help: no `is_empty`: `x.len() == 0` | try: volec query items Buf main.vl  [edited: crate::report::finish]
 error edit.breaks: 1 new error; nothing written
 note rewrite.where: $v has 2 types at the sites: Vec<[u8]> (1 site), Buf (1 site); --where takes the ones the replacement fits
 try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8]>'
@@ -133,7 +133,7 @@ $ volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Vec<[u8]>' --show
 rewrote 1 site in 1 file	main.vl	+1 -1 lines
 // main.vl:17
 17	    if ws.is_empty() {
-note rewrite.types: 1 site matches but for --where; first: $v is Buf at report.vl:68:8
+note rewrite.types: 1 site matches but for --where; first: $v is Buf at report.vl:69:8
 try: volec rewrite '$v.len() == 0' '$v.is_empty()' --where '$v: Buf' --dry-run
 ```
 
@@ -191,9 +191,9 @@ $ git diff HEAD --stat
  compat.vl | 19 -----------------
  main.vl   |  3 +--
  report.vl | 71 +++++++++++++++++++++++++++++++--------------------------------
- stats.vl  | 14 +++++--------
+ stats.vl  | 15 +++++---------
  text.vl   |  3 +--
- 5 files changed, 42 insertions(+), 68 deletions(-)
+ 5 files changed, 42 insertions(+), 69 deletions(-)
 ```
 
 ## Why not by hand

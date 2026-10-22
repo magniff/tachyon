@@ -67,8 +67,9 @@ for (dr, dc) in steps {
 }
 ```
 
-**The heap** is generic over any `T: Ord`: the children of slot `i` are
-`2i + 1` and `2i + 2`. `pop` uses `?` on the `Option` that `Vec::pop`
+**The heap** is generic over any `T: Ord` (the prelude has a `MinHeap`
+too; this one is written out to show a generic struct): the children of
+slot `i` are `2i + 1` and `2i + 2`. `pop` uses `?` on the `Option` that `Vec::pop`
 returns, so an empty heap returns `None` in one token:
 
 ```tach
@@ -81,7 +82,7 @@ fn pop(inout self) -> Option<T> {
 }
 ```
 
-Both sift loops take the Vec's slice once (`as_slice()`) and index it:
+Both sift loops take the Vec's slice once (`as_mut_slice()`) and index it:
 indexing is bounds-checked, and the checks are cheap compared to the
 cache misses of a heap.
 
@@ -177,9 +178,9 @@ by field. The packed `i64` is the classic fix, in either language.
 | generic struct with a bound, `impl<T: Ord>` | `MinHeap<T: Ord>` | `volec guide generics`, `guide traits` |
 | `?` on an `Option` | `MinHeap::pop` | `volec guide conversions` |
 | `while let`, `continue`, tuple patterns | `dijkstra` | `volec guide syntax` |
-| `Vec::filled`, `as_slice`, slices written through | `dijkstra` | `volec guide std`, `guide memory` |
+| `Vec::filled_in`, `as_mut_slice`, slices written through | `dijkstra` | `volec guide std`, `guide memory` |
 | widening (`i32` weight + `i64` distance) | `dijkstra` | `volec guide conversions` |
-| `defer` to free | everywhere | `volec guide memory` |
+| drops: the graph, the paths and the heap are freed at the end of their scope, with no `free` | everywhere | `volec guide memory` |
 | iterators and closures: `iter().max()`, `fold` | `main` | `volec guide iterators`, `guide closures` |
 | f-strings with specs: `{d:>3}`, `{x:c}`, `{h:x}` | `draw`, `main` | `volec guide formatting` |
 | a C header: `import "time.h" as c;` | `now_ns` | `volec guide c-interop` |

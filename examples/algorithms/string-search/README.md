@@ -83,7 +83,7 @@ prints the `Vec` with `{at:?}`.
 two `[u8]` compares their bytes.
 
 ```tach
-for i in 0..text.len - m + 1 {
+for i in 0..text.len() - m + 1 {
     if text[i] == first && text[i..i + m] == pat { found(i); }
 }
 ```
@@ -92,7 +92,7 @@ for i in 0..text.len - m + 1 {
 writes it through a slice; the search is the same loop over the text:
 
 ```tach
-for i in 0..text.len {
+for i in 0..text.len() {
     let b = text[i];
     while k > 0 && b != pat[k] { k = f[k - 1]; }
     if b == pat[k] { k += 1; }
@@ -111,7 +111,7 @@ indexes):
 var shift = [m; 256];
 for j in 0..m - 1 { shift[pat[j]] = m - 1 - j; }
 ...
-while i + m <= text.len {
+while i + m <= text.len() {
     let b = text[i + m - 1];
     if b == last && text[i..i + m - 1] == head { found(i); }
     i += self.shift[b];
@@ -120,7 +120,7 @@ while i + m <= text.len {
 
 **The driver** runs each searcher on each pattern through a generic
 `timed<S: Searcher>`, which adds the time to a slot of `times` (passed
-as `&times[k]`, a pointer to an array element), and stops with exit
+as `&times[k]`, an inout access to an array element), and stops with exit
 status 1 if the counts disagree. The word count is an iterator,
 `t.iter().filter(|b| b == ' ').count()`.
 
@@ -185,7 +185,7 @@ per position and KMP still one.
 | arrays as values, `[m; 256]`, indexed by a `u8` | `Horspool` | `volec guide types` |
 | iterators: `iter().filter(..).count()`, `fail.iter()` | `main`, `demo` | `volec guide iterators` |
 | f-strings: `{pat:<12}`, `{n:>8}`, `{b:c}`, `{v:?}`, `{x:>6.1}` | output | `volec guide formatting` |
-| `defer` inside a loop body (runs each iteration) | `main` | `volec guide memory` |
+| drops: each pattern's KMP table freed at the end of its loop iteration | `main` | `volec guide memory` |
 | a C header for the clock | `now_ns` | `volec guide c-interop` |
 
 ## Try

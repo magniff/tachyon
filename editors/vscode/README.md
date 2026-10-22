@@ -1,8 +1,9 @@
 # Vole for Visual Studio Code
 
 Language support for **vole**: syntax highlighting for `.vl` files, and
-diagnostics, go to definition, references, hover and document symbols
-from the compiler's language server, `volec lsp`.
+diagnostics, completion, formatting on save, signature help, go to
+definition, references, hover and document symbols from the compiler's
+language server, `volec lsp`.
 
 ![Vole in VS Code](images/screenshot.png)
 
@@ -30,6 +31,25 @@ from the compiler's language server, `volec lsp`.
   extension opens read-only; operators, type parameters, names in
   f-strings and contracts resolve too, and a hover on a keyword
   (`inout`, `sink`), an attribute or a primitive type explains it.
+- **Completion** (0.25.1) as you type, on code that does not parse yet:
+  after `.` the receiver's fields and methods (`v.` of a `Vec<i64>`:
+  `push`, `iter`...; a `str`'s, a struct's public ones), after `::` a
+  module's items, an enum's variants, a type's functions (`Vec::new_in`,
+  `std::`), else the locals and parameters, the module's items, imports,
+  the prelude and keywords, with snippets for calls and common forms.
+  Each item shows its signature; the selected one its comment and
+  effects. **Signature help** in a call's arguments: the parameters with
+  their conventions (`let`, `inout`, `sink`).
+- **Formatting** (0.25.1): Format Document and Format Selection use the
+  compiler's formatter (`volec fmt`'s style), on the editor's unsaved
+  text; a file that does not parse is left as it is. Vole is the
+  default formatter of `.vl` files and they are **formatted on save**,
+  indented by four spaces: the extension's defaults for `[vole]`, which
+  your settings override:
+
+  ```json
+  "[vole]": { "editor.formatOnSave": false }
+  ```
 
 The extension makes no network requests and collects no telemetry.
 
@@ -53,7 +73,7 @@ Node 18 or newer and npm:
 cd editors/vscode
 npm install
 npm run compile          # src/extension.ts -> out/extension.js
-npm test                 # grammar assertions (vscode-tmgrammar-test) and snapshots
+npm test                 # grammar assertions and snapshots, the manifest, the server
 npm run package          # vole.vsix, with @vscode/vsce
 code --install-extension vole.vsix
 ```
@@ -75,6 +95,11 @@ vscode-tmgrammar-test's format:
     fill(&v, 4);
 //       ^ keyword.operator.access.vole
 ```
+
+`test/package.test.js` checks the manifest (the formatter defaults),
+`test/lsp.test.js` asks `volec lsp` ($VOLEC, else the repository's
+`target/volec`, else `volec` on PATH) what VS Code asks on save and
+while typing: formatting, completion, resolve.
 
 `python3 test/tmgrammar.py` checks them and the token snapshots in
 `test/snapshots/` with a small TextMate tokenizer in Python, so the

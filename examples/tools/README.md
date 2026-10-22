@@ -9,7 +9,7 @@ drives the tools by hand, and for an agent that drives them in a loop.
 | example | the program | what the tools do |
 |---|---|---|
 | [rename-and-move](rename-and-move/) | a lending library, 5 files | `refactor rename` of a field, two same-named functions, a local and a parameter; `refactor new-module` and `refactor move`; `query diff`, `undo` |
-| [split-a-module](split-a-module/) | a shop's till in one 415-line module | `lint --max-lines`, `query items --comments`, `query deps`, `refactor split --plan`, then `--auto --names`; `undo` |
+| [split-a-module](split-a-module/) | a shop's till in one 381-line module | `lint --max-lines`, `query items --comments`, `query deps`, `refactor split --plan`, then `--auto --names`; `undo` |
 | [signature-and-variants](signature-and-variants/) | a small bank, 5 files | `refactor signature --reorder / --remove / --add / --rename-param`, `refactor field --rename / --add`, `refactor variant --add --arm-in`, `edit insert`, a multi-target `edit patch` |
 | [rewrite-idioms](rewrite-idioms/) | word statistics, 5 files | typed `rewrite` of deprecated helpers into methods, `--where` on a type, index loops into `for x in v`; the imports it leaves unused removed; `query unused`, `edit delete` |
 | [explore-unknown-code](explore-unknown-code/) | a transit route planner, 5 files | a first look and a bug found: `query items`, `query context --budget`, `query refs --kind`, `query grep --comments`, `query type`, `query impact`, `guide --find`, `try`, then `edit patch` |
@@ -96,8 +96,10 @@ To try one by hand, copy its directory, commit it to a new git
 repository on a branch `main` (the sessions use `git diff`, and
 merge-conflicts makes branches), and type the commands.
 
-## Coming in 0.16
+## More tools
 
+The sessions use a part of the toolset. Since 0.16 there are also
 `rewrite --subst` and `--list`, `query callees --transitive`, `query
-refs` on locals, and `edit patch --nth` for text that occurs more than
-once in an item.
+refs` on locals (`FN::x`), and `edit patch --nth` for text that occurs
+more than once in an item; `volec guide tools` and
+[docs/query.md](../../docs/query.md) list every command.

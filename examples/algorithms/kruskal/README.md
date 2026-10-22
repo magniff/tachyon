@@ -109,7 +109,7 @@ let (x, y) = (self.find(a), self.find(b));
 if x == y { return false; }
 let size = self.size.as_mut_slice();
 let (ra, rb) = if size[x] < size[y] { (y, x) } else { (x, y) };
-self.parent.set(rb, ra as i32);
+self.parent[rb] = ra as i32;
 size[ra] += size[rb];
 ```
 
@@ -125,7 +125,6 @@ edge widen to the `i64` parameters of `unite` by themselves:
 fn kruskal(n: i64, edges: inout [Edge], gpa: Gpa) -> (Vec<Edge>, i64) {
     std::sort(edges);
     var uf = UnionFind::new(n, gpa);
-    defer uf.free();
     var tree: Vec<Edge> = Vec::with_capacity_in(n - 1, gpa);
     for e in edges {
         if uf.unite(e.u, e.v) {
@@ -137,10 +136,10 @@ fn kruskal(n: i64, edges: inout [Edge], gpa: Gpa) -> (Vec<Edge>, i64) {
 }
 ```
 
-**The output** destructures that tuple (`let (mut tree, trees) =
-kruskal(7, roads[..]);`), sums and maxes weights with iterator chains
+**The output** destructures that tuple (`let (tree, trees) =
+kruskal(7, &roads[..], gpa);`), sums and maxes weights with iterator chains
 (`tree.iter().map(|e| e.w).sum()`), and prints with f-strings,
-`{tree.get(0):?}` through the derived `Debug`. The timing goes to
+`{tree[0]:?}` through the derived `Debug`. The timing goes to
 stderr through C's `timespec_get`.
 
 ## Output
@@ -190,8 +189,8 @@ one of the ~20 million comparisons.
 | ranges as iterators, `map`, `collect`, `sum`, `max` | `UnionFind::new`, `main` | `volec guide iterators`, `guide closures` |
 | tuples: returned, destructured, a tuple-valued `if` | `kruskal`, `unite`, `main` | `volec guide syntax` |
 | widening (`i32` fields to `i64` parameters) | `kruskal` | `volec guide conversions` |
-| `Vec::filled`, `as_mut_slice`, slices written through | `UnionFind` | `volec guide std`, `guide memory` |
-| `defer` to free | everywhere | `volec guide memory` |
+| `Vec::filled_in`, `as_mut_slice`, slices written through | `UnionFind` | `volec guide std`, `guide memory` |
+| drops: the union-find and the forests freed at the end of their scope, with no `free` | everywhere | `volec guide memory` |
 | f-strings: `{w:>2}`, `{e:?}` | `main` | `volec guide formatting` |
 | a C header: `import "time.h" as c;` | `now_ns` | `volec guide c-interop` |
 
@@ -202,5 +201,5 @@ one of the ~20 million comparisons.
 - Replace path halving by full path compression (a second loop that
   points every node on the path at the root) and time both.
 - Stop when `uf.sets == k` to split the nodes into `k` clusters.
-- Sort with `edges.sort_by(|a, b| b.w.cmp(a.w))` to get a maximum
+- Sort with `edges.sort_by(|a, b| b.w - a.w)` to get a maximum
   spanning tree.

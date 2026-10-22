@@ -83,11 +83,12 @@ A float without a precision prints the shortest text that reads back as
 the same value (`3.14159`, `0.1`).
 
 **An f-string is a value.** It is passed to anything taking a
-`T: Display`: `println`, `eprintln` (stderr), `format` (returns a new
-`Buf`, which the caller frees), `buf.push_fmt(..)` (appends to a `Buf`)
-and `f.write(..)` inside a Display impl. The cheat sheet passes
-`format_in(f"...", gpa)` results to a helper that frees them; the hex dump
-builds each line in a `Buf`:
+`T: Display`: `println`, `eprintln` (stderr), `format_in` (returns a
+new `Buf`, dropped when its owner's scope ends), `buf.push_fmt(..)`
+(appends to a `Buf`) and `f.write(..)` inside a Display impl. The cheat
+sheet passes `format_in(f"...", gpa)` results to a helper that reads
+them (a temporary, dropped at the end of the call's statement); the hex
+dump builds each line in a `Buf`:
 
 ```tach
 var line = format_in(f"{at:04x}  ", gpa); // format: a new Buf to keep
@@ -157,13 +158,14 @@ allocation.
 ## Language features
 
 - f-strings, specs, `Display`, `Debug`, `format`, `push_fmt`, `eprintln`, `#[derive(Debug)]`: `volec guide formatting`
-- `Buf`, `Vec`, `defer`/`free`: `volec guide std`, `volec guide memory`
+- `Buf`, `Vec`, drops: `volec guide std`, `volec guide memory`
 - struct field shorthand (`Item { sku: Sku { id }, name, ... }`): `volec guide syntax`
 
 ## Going further
 
 - Widths and precisions are literal: there is no `{x:>width$}`. For a
   computed width, pad by hand (push spaces into a `Buf`).
-- No `{:+}`, `{:#x}` or `{:e}`: write the sign or `0x` yourself
-  (`f"0x{n:x}"`), or call C's `printf` for exponent notation.
+- No `{:+}` or `{:#x}`: write the sign or `0x` yourself
+  (`f"0x{n:x}"`). `{x:e}` and `{x:E}` print a float in exponent
+  notation (`volec guide formatting`).
 - Display has no derive; write the text you want.

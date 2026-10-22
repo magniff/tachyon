@@ -3,7 +3,7 @@
 A small bank in five files: accounts (`account.vl`), events read from
 lines like `deposit 500` (`event.vl`), the ledger that applies them
 (`ledger.vl`), statements (`report.vl`), and a scripted week in
-`main.vl`. About 220 lines.
+`main.vl`. About 210 lines.
 
 The session changes the program's shape: parameters reordered, removed
 and added, a field renamed and one added, and a new kind of event that
@@ -40,10 +40,10 @@ ok: built bank
 ```console
 $ volec query refs transfer --kind call
 # ledger.vl
-75:35	call	ledger::apply	Event::Transfer(to, n) => transfer(&l, n, who, to),
-81:13	call	ledger::apply	transfer(&l, b * permille / 1000, 0, who)
+66:35	call	ledger::apply	Event::Transfer(to, n) => transfer(&l, n, who, to),
+72:13	call	ledger::apply	transfer(&l, b * permille / 1000, 0, who)
 # main.vl
-45:5	call	main	transfer(&l, 1000, 2, 1);
+44:5	call	main	transfer(&l, 1000, 2, 1);
 ```
 
 `--reorder` takes every parameter once. Forget one and the error lists
@@ -55,14 +55,14 @@ error refactor.usage: --reorder lists each parameter once: (l, amount, from, to)
 [exit 2]
 $ volec refactor signature transfer --reorder l,from,to,amount --show
 reordered the parameters of crate::ledger::transfer, 3 calls	2 files	+4 -4 lines
-// main.vl:45
-45	    transfer(&l, 2, 1, 1000);
-// ledger.vl:49
-49	pub fn transfer(l: inout Ledger, from: i64, to: i64, amount: i64) -> bool {
-// ledger.vl:75
-75	        Event::Transfer(to, n) => transfer(&l, who, to, n),
-// ledger.vl:81
-81	            transfer(&l, 0, who, b * permille / 1000)
+// main.vl:44
+44	    transfer(&l, 2, 1, 1000);
+// ledger.vl:40
+40	pub fn transfer(l: inout Ledger, from: i64, to: i64, amount: i64) -> bool {
+// ledger.vl:66
+66	        Event::Transfer(to, n) => transfer(&l, who, to, n),
+// ledger.vl:72
+72	            transfer(&l, 0, who, b * permille / 1000)
 ```
 
 The three calls were rewritten with it, including the one inside a
@@ -75,15 +75,15 @@ used is refused, with the place that uses it:
 
 ```console
 $ volec refactor signature apply --remove who
-error refactor.used: parameter who is used in crate::ledger::apply at ledger.vl:71:24
-try: volec query show ledger.vl:71
+error refactor.used: parameter who is used in crate::ledger::apply at ledger.vl:62:24
+try: volec query show ledger.vl:62
 [exit 1]
 $ volec refactor signature apply --remove day --show
 removed parameter day of crate::ledger::apply, 1 call	2 files	+2 -2 lines
-// main.vl:36
-36	                let ok = apply(&l, who, e);
-// ledger.vl:65
-65	pub fn apply(l: inout Ledger, who: i64, e: Event) -> bool {
+// main.vl:35
+35	                let ok = apply(&l, who, e);
+// ledger.vl:56
+56	pub fn apply(l: inout Ledger, who: i64, e: Event) -> bool {
 ```
 
 ### Add, with a default
@@ -100,8 +100,8 @@ $ volec edit patch open --old 'balance: 0' --new 'balance: opening'
 patched crate::account::open	account.vl	+1 -1 lines
 $ volec edit patch main --old 'open(2, "Grace", 5000)' --new 'open(2, "Grace", 5000, opening: 800)' --show
 patched crate::main	main.vl	+1 -1 lines
-// main.vl:16
-16	    l.accounts.push(open(2, "Grace", 5000, opening: 800));
+// main.vl:15
+15	    l.accounts.push(open(2, "Grace", 5000, opening: 800));
 ```
 
 ## 2. Fields
@@ -113,8 +113,8 @@ literals (one in `main.vl`), the accesses and the f-string hole in
 ```console
 $ volec refactor field Account --rename limit overdraft --show
 renamed field limit to overdraft of crate::account::Account, 5 uses	3 files	+6 -6 lines
-// main.vl:19
-19	    l.accounts.set(0, account::Account { id: 0, owner: "the bank", balance: 100000, overdraft: 0 });
+// main.vl:18
+18	    l.accounts[0] = account::Account { id: 0, owner: "the bank", balance: 100000, overdraft: 0 };
 // account.vl:8
 8	    pub overdraft: i64,
 // account.vl:12
@@ -123,8 +123,8 @@ renamed field limit to overdraft of crate::account::Account, 5 uses	3 files	+6 -
 17	    Account { id: 0, owner: "the bank", balance: 0, overdraft: 0 }
 // account.vl:21
 21	    a.balance + a.overdraft >= amount
-// report.vl:25
-25	    println(f"#{a.id} {a.owner:<10} balance {a.balance:>6}, may go to -{a.overdraft}");
+// report.vl:26
+26	    println(f"#{a.id} {a.owner:<10} balance {a.balance:>6}, may go to -{a.overdraft}");
 ```
 
 `open`'s parameter is still called `limit`; a parameter rename changes
@@ -143,10 +143,11 @@ A new field gets its value in every literal:
 
 ```console
 $ volec refactor field Account --add 'pub fees_paid: i64 = 0' --show
-added field pub fees_paid: i64 to crate::account::Account, 3 literals	2 files	+5 -3 lines
-// main.vl:19-20
-19	    l.accounts.set(0,
-20	        account::Account { id: 0, owner: "the bank", balance: 100000, overdraft: 0, fees_paid: 0 });
+added field pub fees_paid: i64 to crate::account::Account, 3 literals	2 files	+6 -3 lines
+// main.vl:18-20
+18	    l.accounts[0] = account::Account {
+19	        id: 0, owner: "the bank", balance: 100000, overdraft: 0, fees_paid: 0,
+20	    };
 // account.vl:9
 9	    pub fees_paid: i64,
 // account.vl:13
@@ -164,11 +165,11 @@ in:
 
 ```console
 $ volec refactor variant Event --add 'Fee(i64)'
-ledger.vl:66:5	ledger::apply
-report.vl:8:5	report::describe
-report.vl:18:5	report::is_credit
+ledger.vl:57:5	ledger::apply
+report.vl:9:5	report::describe
+report.vl:19:5	report::is_credit
 error refactor.non-exhaustive: 3 matches on crate::event::Event would not cover Fee; nothing written
-try: volec query show ledger.vl:66 report.vl:8 report.vl:18
+try: volec query show ledger.vl:57 report.vl:9 report.vl:19
 try: volec refactor variant crate::event::Event --add 'Fee(i64)' --arm 'EXPR' --dry-run
 try: volec refactor variant crate::event::Event --add 'Fee(i64)' --arm-in ledger::apply 'EXPR' --arm-in report::describe 'EXPR' --arm-in report::is_credit 'EXPR' --dry-run
 [exit 1]
@@ -183,12 +184,12 @@ $ volec refactor variant Event --add 'Fee(i64)' --arm-in apply false --arm-in de
 added variant Fee(i64) to crate::event::Event, an arm in 3 matches	3 files	+4 -0 lines
 // event.vl:12
 12	    Fee(i64),
-// ledger.vl:83
-83	        Event::Fee(_) => false,
-// report.vl:13
-13	        Event::Fee(_) => format_in("a fee", gpa),
-// report.vl:22
-22	        Event::Fee(_) => false,
+// ledger.vl:74
+74	        Event::Fee(_) => false,
+// report.vl:14
+14	        Event::Fee(_) => format_in("a fee", gpa),
+// report.vl:23
+23	        Event::Fee(_) => false,
 ```
 
 Now the behaviour. The parser learns the word `fee`, the week gets two
@@ -196,15 +197,15 @@ fees, and the ledger a `charge` function:
 
 ```console
 $ volec edit insert --in event::parse --before 'None' --show <<'EOF'
-> if w.len == 2 && w[0] == "fee" {
+> if w.len() == 2 && w[0] == "fee" {
 >     return Some(Event::Fee(number(w[1])));
 > }
 > EOF
 inserted in crate::event::parse	event.vl	+3 -0 lines
-// event.vl:34-36
-34	    if w.len == 2 && w[0] == "fee" {
-35	        return Some(Event::Fee(number(w[1])));
-36	    }
+// event.vl:33-35
+33	    if w.len() == 2 && w[0] == "fee" {
+34	        return Some(Event::Fee(number(w[1])));
+35	    }
 $ volec edit insert --in main --after '(1, "withdraw 99999"),' <<'EOF'
 > (1, "fee 250"),
 > (2, "fee 250"),
@@ -217,14 +218,12 @@ $ volec edit insert --after ledger::transfer <<'EOF'
 >         return false;
 >     }
 >     if let Some(i) = index_of(l, who) {
->         var a = l.accounts.get(i);
->         a.fees_paid += n;
->         l.accounts.set(i, a);
+>         l.accounts[i].fees_paid += n;
 >     }
 >     true
 > }
 > EOF
-inserted after crate::ledger::transfer	ledger.vl	+13 -0 lines
+inserted after crate::ledger::transfer	ledger.vl	+11 -0 lines
 ```
 
 The placeholders become real arms, and the statement shows the fees:
@@ -234,13 +233,13 @@ target's pairs), checked and written as one edit:
 ```console
 $ volec edit patch ledger::apply --old 'Event::Fee(_) => false' --new 'Event::Fee(n) => charge(&l, who, n)' --in report::describe --old 'Event::Fee(_) => format_in("a fee", gpa)' --new 'Event::Fee(n) => format_in(f"fee of {n}", gpa)' --in report::summary --old 'may go to -{a.overdraft}' --new 'may go to -{a.overdraft}, fees {a.fees_paid}' --show
 patched crate::report::describe, crate::report::summary, crate::ledger::apply	2 files	+4 -3 lines
-// ledger.vl:96
-96	        Event::Fee(n) => charge(&l, who, n),
-// report.vl:13
-13	        Event::Fee(n) => format_in(f"fee of {n}", gpa),
-// report.vl:27-28
-27	    println(
-28	        f"#{a.id} {a.owner:<10} balance {a.balance:>6}, may go to -{a.overdraft}, fees {a.fees_paid}");
+// ledger.vl:85
+85	        Event::Fee(n) => charge(&l, who, n),
+// report.vl:14
+14	        Event::Fee(n) => format_in(f"fee of {n}", gpa),
+// report.vl:28-29
+28	    println(
+29	        f"#{a.id} {a.owner:<10} balance {a.balance:>6}, may go to -{a.overdraft}, fees {a.fees_paid}");
 ```
 
 ## 4. The new program
@@ -263,10 +262,10 @@ ok: built bank
 $ git diff --stat
  account.vl | 11 ++++++-----
  event.vl   |  4 ++++
- ledger.vl  | 22 ++++++++++++++++++----
- main.vl    | 11 +++++++----
+ ledger.vl  | 20 ++++++++++++++++----
+ main.vl    | 12 ++++++++----
  report.vl  |  5 ++++-
- 5 files changed, 39 insertions(+), 14 deletions(-)
+ 5 files changed, 38 insertions(+), 14 deletions(-)
 ```
 
 ## Why not by hand

@@ -34,14 +34,14 @@ fn area(p: Point) -> i64 {
 fn describe(k: Kind) -> i64 {
     match k {
         Kind::Small => 1,
-        Kind::Large(n) => n * 1000 + twice(n) * 100 + sum(n, n + 1) * 10 + n
+        Kind::Large(n) => n * 1000 + twice(n) * 100 + sum(n, n + 1) * 10 + n,
     }
 }
 
 fn main() -> i32 {
     let p = Point { x: 3, y: -4 };
     let pair: Pair<i64> = Pair {
-        first: area(p), second: describe(Kind::Large(2)) + describe(Kind::Small)
+        first: area(p), second: describe(Kind::Large(2)) + describe(Kind::Small),
     };
 
     /* a block comment

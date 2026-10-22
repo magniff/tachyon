@@ -58,8 +58,52 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.23.0 | `v0.23.0` | 0.22.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | windows: `std::window`, winit-like with events pulled, on Cocoa (windows, keyboard and text input with IME basics, mouse, scroll, scale, cursor, clipboard, frames on request, watched fds), loaded only when a program names it; voltty (examples/voltty), a terminal emulator on std::window and std::gpu: a core checked against alacritty_terminal by an oracle and a fuzzer, Core Text glyphs in an atlas, one instanced draw of 16-byte cells per frame with `cells.wgsl` through std::gpu::wgsl, damage tracking, no allocation per frame, a shell on a pty; the rename tools for 0.24: `rewrite --text`, `refactor extension`, `query grep --ignore-case`, releases.toml's `bin` and `ext` |
 | 0.24.0 | `v0.24.0` | 0.23.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | **vole**: tachyon renamed (`tachyonc` to `volec`, `.tach` to `.vl`, `TACHYON_*` to `VOLE_*`, symbols `_vole.`; no aliases) by the compiler's own tools and checked by same-output; the releases up to 0.23 still built as tachyonc through releases.toml's `bin` and `ext`; the logo; the language server with a VS Code extension (editors/vscode: highlighting, diagnostics, definitions, references, symbols, hovers with computed effects); `std::cli`, clap's builder without derive; `let` as a borrow, `str` and `Path` views to the own pass, `gl(make())`, the `make().v` double free fixed, an iterator's copied items kept refused (`own.move_out`, a stopgap); timing tests steady under load |
 | 0.25.0 | `v0.25.0` | 0.24.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | compile speed (the resolve scans, a line index, the lexer, data as bytes, the assembler, `ld` run directly, an in-house Mach-O linker by default on aarch64-macos: the -O0 self-compile and `check` near half the instructions, a hello world linked 4 times faster) and a semantics audit (five red-team audits, about 1,600 probes kept as tests, a value-semantics fuzzer as the gate's `fuzz-sem`; about 30 families of soundness bugs of released versions fixed: views, exclusivity, drops, threads, the optimizer); the Vole Book (book/, every example checked); std::cli across the examples; `#[link]` and `-framework`; every name resolved in the language server; the chain rebuilt from the seed and checked against recorded hashes (`chain-fresh`, `chain-diverse`) |
+| 0.25.1 | `v0.25.1` | 0.25.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | one standard style, applied to the whole tree: `volec fmt` groups imports (`std`, `crate`, the rest) and writes trailing commas in lists whose closing bracket starts a line; docs/style.md, `guide fmt` |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.25.1
+
+- **One style, everywhere.** `volec fmt` writes one opinionated layout
+  ([style.md](style.md), `volec guide fmt`): `use` items sorted, merged
+  and grouped, `std` first, then `crate`, then `super`, `self` and child
+  modules, a blank line between groups (a run of imports continues
+  across blank lines); four spaces, 100 columns, deterministic wrapping;
+  a trailing comma in every list whose closing bracket starts a line,
+  none in a list closed on its last line (a tuple of one keeps its
+  own). Comments are kept as written, and fmt is idempotent. Its check
+  still refuses any change but blanks and trailing commas.
+- **The tree is formatted**: `fmt --all` (now with `tools/`) over the
+  compiler, std (stdsrc regenerated), tests, examples, bench and the
+  agent eval's programs. `same-output` against 0.25.0 over the corpus
+  differs only in position tables and the compiler's path in `try:`
+  lines. The tools' transcripts whose positions moved were regenerated.
+  Not formatted: the tools' fixture programs (tests/query,
+  tests/refactor), files that do not lex (the syntax-error tests), the
+  VS Code grammar samples, and the book's code blocks (fmt reads files,
+  not Markdown).
+- **Enforced**: `fmt --all --check` runs in tests/run.sh and so in
+  the gate.
+- `crate::tools::fmt::format_source(text)`: the formatter in the
+  process, for the language server's format-on-save.
+- **The language server** (`volec lsp`, the VS Code extension 0.25.1):
+  format-on-save and range formatting through fmt's engine (no edits on
+  code that does not parse); completion after `.` and `::`, of names,
+  keywords and snippets, on buffers that do not parse too (about 1.6 ms
+  median), resolved with the signature, effects and doc comment;
+  signature help with the conventions (`let`, `inout`, `sink`); the
+  extension formats on save, tab size 4.
+- **The examples audited for 0.25**: `check-alloc` rewritten (the bugs
+  it showed are compile errors now; `--check-alloc` is shown on leaks
+  and unsafe code), hand-written frees removed, the Rust-era wording
+  gone; `toposort` no longer crashes on an empty input line.
+- **Generic inference through `inout` and coercions**: `[T]` is
+  inferred from `&xs`, subslices, `Vec`, `Buf`, arrays and `String`,
+  under `let`, `inout` and `sink`.
+- **The README's example is a quicksort**, kept the same as
+  tests/run/readme_example.vl by the `readme` check.
+- **Breaking**: nothing in the language. Code that passed `fmt --check`
+  under 0.25.0 may need a `volec fmt`.
 
 ### What's new in 0.25
 

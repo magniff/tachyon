@@ -86,7 +86,7 @@ for byte in hash.finish() {
 ## Language features
 
 - fixed-size arrays, slices, `u32`/`u64` and wrapping arithmetic: `volec guide types`
-- statics, structs, methods on `*Self`: `volec guide syntax`
+- statics, structs, methods on `inout self`: `volec guide syntax`
 - `defer`: `volec guide memory`
 - `extern "C"` and `unsafe` calls: `volec guide c-interop`
 - hex format specs, `push_fmt`: `volec guide formatting`

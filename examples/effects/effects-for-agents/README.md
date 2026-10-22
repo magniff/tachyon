@@ -130,9 +130,9 @@ $ cat > steps.txt <<'EOF'
 >     var arena = Arena::new_in(gpa);
 >     defer unsafe { arena.free_all() };
 >     for doc in docs {
->         let html = markup::render(doc, arena);
->         print(html.as_slice());
->         drop(html); // before the reset, which takes its memory
+>         // (the rendered Buf is a temporary: dropped at the end of the
+>         // statement, before the reset)
+>         print(markup::render(doc, arena).as_slice());
 >         // (unsafe: every view into the arena is dead from here)
 >         unsafe { arena.reset() };
 >     }
@@ -155,24 +155,27 @@ renamed parameter gpa to arena of crate::markup::lines	markup.vl	+2 -2 lines
 renamed parameter gpa to arena of crate::markup::slug	markup.vl	+2 -2 lines
 renamed parameter gpa to arena of crate::markup::headings	markup.vl	+3 -3 lines
 renamed parameter gpa to arena of crate::markup::render	markup.vl	+4 -4 lines
-replaced crate::main	main.vl	+8 -1 lines
-script steps.txt: 15 commands	2 files	+21 -14 lines
+replaced crate::main	main.vl	+9 -2 lines
+script steps.txt: 15 commands	2 files	+22 -15 lines
 $ git diff --stat
- main.vl   |  9 ++++++++-
+ main.vl   | 11 +++++++++--
  markup.vl | 26 +++++++++++++-------------
- 2 files changed, 21 insertions(+), 14 deletions(-)
+ 2 files changed, 22 insertions(+), 15 deletions(-)
 ```
 
 `Arena::new_in(gpa)` makes an arena whose chunks come from `gpa`.
 `reset` frees everything allocated from it but keeps its memory for the
 next document, and `free_all` gives the memory back at the end. Both are
-`unsafe`: nothing stops a view into the arena (`html.as_slice()` here),
-or a value still holding its memory, from being used after them; so
-`html` is dropped before the reset (dropped after it, its `Buf` would
-give back memory the reset already took: `--check-alloc` stops at
-that). 0.17.1's arena references close the hole; an
-`arena.scope(|a| ...)` per document has none today, but its arena is a
-`ScopedArena`, and the task asked for `Arena`.
+`unsafe`: the compiler does not follow an `Arena`'s memory across
+them, so nothing stops a view into the arena, or a value still holding
+its memory, from being used after them. Here nothing is: the HTML
+`render` returns is a temporary of the `print` statement, dropped at
+its end (0.25), before the reset (a `let html` would live to the end
+of the loop's body, after it: its `Buf` would give back memory the
+reset already took, which `--check-alloc` reports). An
+`arena.scope(|a| ...)` per document is checked by the compiler, with
+no `unsafe`, but its arena is a `ScopedArena`, and the task asked for
+`Arena`.
 
 ## 4. Checked
 

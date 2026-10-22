@@ -1,113 +1,114 @@
-// Five memory bugs that compile in vole 0.16, one per command-line
-// argument: `copy`, `push`, `scope`, `twice` and `leak` (none: the correct
-// version of each). Built as usual they print a wrong number, or nothing
-// visible goes wrong at all; built with `volec --check-alloc` each
-// stops at the bug, saying which block, where it was allocated and where
-// it was freed. 0.17's value semantics make the first four compile errors.
-import "string.h" as c;
+// The memory bugs vole 0.25 still lets through, one per command-line
+// argument: `leak`, `dangling` and `twice` (none: the correct version of
+// each). Safe code cannot read memory after it is freed or free it twice:
+// since 0.17 those are compile errors (the README shows them). What is
+// left is a leak, which is safe, and a bug in `unsafe` code, whose raw
+// pointers nothing checks. Built as usual, each prints a wrong number,
+// crashes or shows nothing at all; built with `volec --check-alloc`, each
+// is reported with its block, where it was allocated and where it was
+// freed.
+use std::env;
+use std::cli::{Arg, Command};
 
-// A shelf of a shop: the stock of each of its items. `counts` is a Vec
-// handle, copied into the struct: the copy shares the original's memory.
-struct Shelf { name: [u8], counts: Vec<i64> }
-
-fn stock(s: Shelf) -> i64 {
-    s.counts.iter().sum()
-}
-
-// The bug: a Vec freed through one handle, then used through a copy.
-fn copied_handle(gpa: Gpa, fixed: bool) {
-    var counts: Vec<i64> = Vec::new_in(gpa);
-    counts.push(3);
-    counts.push(4);
-    let shelf = Shelf { name: "fruit", counts: counts };
-    println(f"{shelf.name}: {stock(shelf)}");
-    if fixed {
-        // one owner frees it, after the last use
-        println(f"{shelf.name}: {stock(shelf)}");
-        counts.free();
-    } else {
-        counts.free();
-        println(f"{shelf.name}: {stock(shelf)}");
-    }
-}
-
-// The bug: a view of a Vec kept across a push that moved its memory.
-fn slice_after_push(gpa: Gpa, fixed: bool) {
-    var v: Vec<i64> = Vec::new_in(gpa);
-    defer v.free();
-    for i in 0..4 {
-        v.push(i * 10);
-    }
-    let first = v.as_slice();
-    v.push(40);
-    if fixed {
-        // a view taken after the last push
-        println(f"first {v.as_slice()[0]}");
-    } else {
-        println(f"first {first[0]}");
-    }
-}
-
-// The bug: a view of an arena's Vec returned from the arena's scope.
-// The Vec itself could not leave (a compile error); a slice of it can.
-fn view_out_of_scope(gpa: Gpa, fixed: bool) {
-    if fixed {
-        // what leaves the scope is computed from the view
-        let first = arena_scope(gpa, |a| {
-            var v: Vec<i64, ScopedArena> = Vec::new_in(a);
-            v.push(7);
-            v.as_slice()[0]
-        });
-        println(f"{first}");
-    } else {
-        let s = arena_scope(gpa, |a| {
-            var v: Vec<i64, ScopedArena> = Vec::new_in(a);
-            v.push(7);
-            v.as_slice()
-        });
-        println(f"{s[0]}");
-    }
-}
-
-// The bug: two handles, two frees.
-fn freed_twice(gpa: Gpa, fixed: bool) {
-    var counts: Vec<i64> = Vec::new_in(gpa);
-    counts.push(1);
-    var shelf = Shelf { name: "tools", counts: counts };
-    println(f"{shelf.name}: {stock(shelf)}");
-    counts.free();
-    if !fixed {
-        shelf.counts.free();
-    }
-}
-
-// The bug: a Buf never freed.
+// The bug: an Arena's memory never given back. An Arena is not dropped:
+// `free_all` returns its memory, and it is unsafe, as a view into the
+// arena could still be used after it.
 fn leaked(gpa: Gpa, fixed: bool) {
-    var b = std::Buf::new_in(gpa);
-    b.push_str("a report nobody frees");
-    println(b.as_slice());
+    let notes = Arena::new_in(gpa);
+    {
+        var b: Buf<Arena> = Buf::new_in(notes);
+        b.push_str("a report nobody frees");
+        println(b.as_slice());
+    }
     if fixed {
-        b.free();
+        unsafe { notes.free_all() };
     }
 }
 
-fn main(argc: i64, argv: **u8, gpa: Gpa) -> i32 {
-    let bug = if argc > 1 { unsafe { argv[1][0..c::strlen(argv[1]) as i64] } } else { "" };
-    let fixed = bug == "";
-    if fixed || bug == "copy" {
-        copied_handle(gpa, fixed);
+// The bug: a raw pointer into a Vec kept across a push that moved the
+// Vec's memory. A view (`v.as_slice()`) kept across the push would be a
+// compile error; a raw pointer is not checked.
+fn dangling(gpa: Gpa, fixed: bool) {
+    var v: Vec<i64> = Vec::new_in(gpa);
+    for i in 0..4 {
+        v.push(i * 10 + 1);
     }
-    if fixed || bug == "push" {
-        slice_after_push(gpa, fixed);
+    let first = v.as_slice().ptr;
+    v.push(41);
+    if fixed {
+        // safe code indexes the Vec: there is no pointer to keep valid
+        println(f"first {v[0]}");
+    } else {
+        println(f"first {unsafe { first[0] }}");
     }
-    if fixed || bug == "scope" {
-        view_out_of_scope(gpa, fixed);
+}
+
+// Two i64s managed by hand, through a raw pointer. The struct has no
+// `Drop`, so it is a plain type: `let b = a;` copies the pointer, not the
+// memory, and nothing frees it but an explicit `gpa.free`.
+struct Pair { p: *i64 }
+
+fn pair_new(gpa: Gpa, a: i64, b: i64) -> Pair {
+    let p = gpa.try_alloc(16, 8) as *i64;
+    if p == 0 as *i64 {
+        panic("out of memory");
     }
-    if fixed || bug == "twice" {
-        freed_twice(gpa, fixed);
+    unsafe {
+        p[0] = a;
+        p[1] = b;
     }
-    if fixed || bug == "leak" {
+    Pair { p: p }
+}
+
+// The bug: two copies of a Pair, each freed.
+fn freed_twice(gpa: Gpa, fixed: bool) {
+    let counts = pair_new(gpa, 3, 4);
+    let shelf = counts;
+    println(f"shelf: {unsafe { shelf.p[0] + shelf.p[1] }}");
+    unsafe { gpa.free(counts.p as *u8, 16, 8) };
+    if !fixed {
+        unsafe { gpa.free(shelf.p as *u8, 16, 8) };
+    }
+}
+
+enum Bug { NoBug, Leak, Dangling, Twice }
+
+// The bug the arguments name; None (and a message) for one it does not
+// know. `--help` prints the help and exits.
+fn parse_args(gpa: Gpa) -> Option<Bug> {
+    let cmd = Command::new_in("shop", gpa)
+        .about("memory bugs for --check-alloc to find")
+        .arg(Arg::positional("bug").help("leak, dangling or twice (none: the correct versions)"));
+    let m = cmd.parse_or_exit(env::args());
+    let bug = m.get("bug").unwrap_or("");
+    if bug == "" {
+        Some(Bug::NoBug)
+    } else if bug == "leak" {
+        Some(Bug::Leak)
+    } else if bug == "dangling" {
+        Some(Bug::Dangling)
+    } else if bug == "twice" {
+        Some(Bug::Twice)
+    } else {
+        eprintln(f"shop: no bug '{bug}': leak, dangling or twice");
+        None
+    }
+}
+
+fn main(gpa: Gpa) -> i32 {
+    let bug = match parse_args(gpa) {
+        Some(b) => b,
+        None => return 2,
+    };
+    let fixed = bug == Bug::NoBug;
+    if fixed || bug == Bug::Leak {
         leaked(gpa, fixed);
+    }
+    if fixed || bug == Bug::Dangling {
+        dangling(gpa, fixed);
+    }
+    if fixed || bug == Bug::Twice {
+        freed_twice(gpa, fixed);
     }
     if fixed && std::CHECK_ALLOC {
         // (known only to the checking Gpa: -1 otherwise)

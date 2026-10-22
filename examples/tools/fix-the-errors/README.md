@@ -2,7 +2,7 @@
 
 `gradebook` reads a class's test scores and prints each student's
 average, grade and biggest swing between tests. It was written in a
-hurry, with Rust habits, and half-changed: it does not compile. Three
+hurry and half-changed: it does not compile. Three
 files, about 130 lines, nine errors.
 
 The session gets it to build the way an agent should: every error at
@@ -59,8 +59,9 @@ show `edit patch`.) `--dry-run` shows the diff first:
 $ volec fix --dry-run
 --- a/main.vl
 +++ b/main.vl
-@@ -9,0 +10 @@
+@@ -7,0 +8,2 @@
 +use std::I64_MIN;
++
 --- a/grades.vl
 +++ b/grades.vl
 @@ -21 +21 @@
@@ -70,12 +71,12 @@ $ volec fix --dry-run
 -        let d = abs((scores[i] - scores[i - 1]) as i32) as i64;
 +        let d = unsafe { abs((scores[i] - scores[i - 1]) as i32) as i64 };
 $ volec fix
-fixed 1 missing import, 1 pub, 1 unsafe block	2 files	+3 -2 lines
+fixed 1 missing import, 1 pub, 1 unsafe block	2 files	+4 -2 lines
 $ volec check
-main.vl:9:14: error[type error] unresolved import 'roster::add_score'
-main.vl:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+main.vl:11:14: error[type error] unresolved import 'roster::add_score'
 main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
 main.vl:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+main.vl:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
 grades.vl:18:5: error[type error] undefined variable 'totl' | help: did you mean 'total'? | try: volec fix --suggested main.vl
 roster.vl:26:13: error[type error] cannot assign to immutable variable 'count' | help: make it mutable: `var count`
 [exit 1]
@@ -135,10 +136,10 @@ two-argument `enrol` and no `add_score`.
 
 ```console
 $ volec check
-main.vl:9:14: error[type error] unresolved import 'roster::add_score'
-main.vl:17:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+main.vl:11:14: error[type error] unresolved import 'roster::add_score'
 main.vl:18:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
 main.vl:19:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
+main.vl:20:5: error[type error] function 'roster::enrol' expects 2 arguments, got 3 | help: its signature: `fn enrol(r: inout Roster, name: [u8])` (roster.vl:17)
 [exit 1]
 $ volec query show roster::enrol
 // crate::roster::enrol	roster.vl:16-19	effects: alloc(Gpa) panic
@@ -211,9 +212,9 @@ best: Ada (95); 3 students have 3 scores or more
 ok: built gradebook
 $ git diff --stat
  grades.vl |  6 +++---
- main.vl   |  1 +
+ main.vl   |  2 ++
  roster.vl | 21 +++++++++++++++++----
- 3 files changed, 21 insertions(+), 7 deletions(-)
+ 3 files changed, 22 insertions(+), 7 deletions(-)
 ```
 
 ## Why not by hand

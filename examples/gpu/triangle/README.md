@@ -5,7 +5,7 @@ copied to a buffer, mapped and printed: one character a pixel, after the
 channel that dominates it.
 
 ```sh
-volec main.vl -l objc -o triangle && ./triangle
+volec main.vl -o triangle && ./triangle
 ```
 
 ```text
@@ -17,9 +17,12 @@ volec main.vl -l objc -o triangle && ./triangle
 ................................................
 ```
 
+- The shader is WGSL: `dev.shader_wgsl(WGSL)?` translates it for the
+  device (MSL on Metal) and reflects its entry points and inputs; a
+  shader it rejects is a `gpu::Error::Shader` with its `LINE:COL`.
 - The vertex buffer holds `x, y, r, g, b` per vertex; its
   `VertexLayout::new(20)` gives the two attributes' formats and offsets,
-  which must match the shader's inputs (`refl.input`): a mismatch is
+  which must match the shader's `@location` inputs: a mismatch is
   `gpu.format` at `dev.render_pipeline`.
 - `gpu::RenderDesc::new(shader, "vs", "fs", Format::Rgba8Unorm)` names
   the entry points and the target's format; `desc.vertex_buffer(layout)`,

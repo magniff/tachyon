@@ -71,7 +71,7 @@ $ volec edit apply <<'EOF'
 > static var HASHES: i64 = 0;
 > @@ Word::hash
 >     fn hash(self) -> u64 {
->         unsafe { HASHES += 1; }
+>         HASHES += 1;
 >         var h = 0xcbf29ce484222325u64;
 >         for b in self.text {
 >             h = (h ^ lower(b) as u64) * 0x100000001b3u64;
@@ -79,7 +79,7 @@ $ volec edit apply <<'EOF'
 >         h
 >     }
 > EOF
-main.vl:23:5: error[effect] 'Word::hash' implements 'Hash::hash', which is #[pure], but it uses a static (global): 'HASHES' at main.vl:24:18 is a static's (global) | help: pass the state in as a parameter, or remove #[pure] (the trait's) | try: volec query effects Word::hash --why global  [edited: <crate::Word as Hash>::hash]
+main.vl:23:5: error[effect] 'Word::hash' implements 'Hash::hash', which is #[pure], but it uses a static (global): 'HASHES' at main.vl:24:9 is a static's (global) | help: pass the state in as a parameter, or remove #[pure] (the trait's) | try: volec query effects Word::hash --why global  [edited: <crate::Word as Hash>::hash]
 error edit.breaks: 1 new error; nothing written
 try: volec edit apply --no-check
 [exit 1]

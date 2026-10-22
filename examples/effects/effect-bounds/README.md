@@ -8,7 +8,7 @@ the closure may do, with `+ effects(...)` after the `Fn` type:
 pub fn map_values<F: Fn(i64) -> i64 + effects(panic)>(rows: inout [Row], f: F)
 pub fn partition<F: Fn(let Row) -> bool + effects()>(rows: inout [Row], keep: F) -> i64
 pub fn sort_by_key<F: Fn(let Row) -> i64 + effects(panic)>(rows: inout [Row], key: F)
-pub fn each<F: FnMut(let Row)>(rows: [Row], f: F)
+pub fn each<F: FnMut(let Row)>(rows: [Row], f: sink F)
 ```
 
 A library that calls your closure decides how often, and in which

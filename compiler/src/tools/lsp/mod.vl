@@ -19,9 +19,7 @@ use crate::base::{
     BUFS, IntVec, OVERLAY, STDERR, STDOUT, alloc_array, alloc_zeroed, buf_byte, buf_bytes,
     buf_clear, buf_fmt, buf_new, buf_slice, buf_str, getenv, write,
 };
-
 use crate::base::json::buf_json_str;
-
 use crate::tools::lsp::json::{at_path, elements, int_at, is_true, member, raw, str_at, str_into};
 use crate::tools::lsp::stdfiles::is_std_path;
 use crate::tools::proc::{buf_cstr, read_file_if, write_file_if};
@@ -29,6 +27,8 @@ use crate::tools::query::{c_slice, parse_digits};
 
 pub mod json;
 mod answer;
+mod complete;
+mod format;
 pub mod stdfiles;
 mod words;
 
@@ -85,6 +85,20 @@ static var W_IN: i32 = -1;
 static var W_OUT: i32 = -1;
 static var W_BUF: i64 = -1;
 static var W_AT: i64 = 0;
+// (0.25.1) the worker's state: 0 reading the program, 1 ready, 2 ready
+// without a program (it did not lex); the root it reads
+static var W_STATE: i64 = 0;
+static var W_ROOT: i64 = -1;
+// The worker before it, kept (ready, with a program) until the new one is
+// ready: completion asks it rather than wait for the program to be read
+// again after each keystroke. Its process, pipes, what it wrote, its root.
+static var G_PID: i32 = -1;
+static var G_IN: i32 = -1;
+static var G_OUT: i32 = -1;
+static var G_BUF: i64 = -1;
+static var G_ROOT: i64 = -1;
+// The client takes snippets in completion items.
+static var SNIPPET_OK: bool = false;
 // the program changed since the worker read it; read again at DEADLINE
 static var DIRTY: bool = false;
 static var DEADLINE: i64 = 0;
@@ -345,6 +359,23 @@ fn stop_worker() {
     }
 }
 
+// The worker kept for completion, stopped.
+fn stop_spare() {
+    unsafe {
+        if G_PID > 0 {
+            kill(G_PID, 9);
+            var st = 0 as i32;
+            waitpid(G_PID, &st, 0);
+            close(G_IN);
+            close(G_OUT);
+        }
+        G_PID = -1;
+        if G_BUF >= 0 {
+            buf_clear(G_BUF);
+        }
+    }
+}
+
 // The worker ended by itself (its pipe closed).
 fn worker_gone() {
     unsafe {
@@ -364,7 +395,18 @@ fn worker_gone() {
 // their copies).
 fn start_worker() {
     unsafe {
+        if W_PID > 0 && W_STATE == 1 {
+            // (0.25.1: kept for completion until the new one is ready)
+            stop_spare();
+            G_PID = W_PID;
+            G_IN = W_IN;
+            G_OUT = W_OUT;
+            G_ROOT = W_ROOT;
+            W_PID = -1;
+        }
         stop_worker();
+        W_STATE = 0;
+        W_ROOT = ROOT;
         DIRTY = false;
         if ROOT < 0 {
             return;
@@ -436,6 +478,12 @@ fn worker_frames() -> bool {
                 COMING.push(u);
             } else if kind == 'e' {
                 clear_stale();
+            } else if kind == 'l' {
+                // (ready: the one kept before it is not needed)
+                W_STATE = 1;
+                stop_spare();
+            } else if kind == 'b' {
+                W_STATE = 2;
             }
         }
         if W_AT > 0 && W_AT == buf_slice(W_BUF).len {
@@ -568,6 +616,167 @@ fn hand_to_worker(id: [u8], req: [u8], chunk: *u8) {
     }
 }
 
+// textDocument/formatting, rangeFormatting (0.25.1, format.vl): the
+// document's text (an open one's as the editor has it) formatted as `volec
+// fmt` does; no edits when it does not parse.
+fn formatting(id: [u8], msg: [u8], params: i64, ranged: bool) {
+    unsafe {
+        let path = uri_path(str_at(msg, at_path(msg, params, "textDocument.uri")));
+        var text = path[0..0];
+        let i = doc_index(path);
+        if i >= 0 {
+            text = buf_slice(DOC_TEXT.data[i]);
+        } else if path.len > 0 && !differs_from_disk(path, "") {
+            text = path[0..0];
+        } else if path.len > 0 {
+            text = buf_slice(DISK);
+        }
+        if text.len == 0 {
+            respond(id, "[]");
+            return;
+        }
+        var ranges = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        if ranged {
+            let r = member(msg, params, "range");
+            ranges.push(crate::tools::lsp::format::text_offset(text,
+                int_at(msg, at_path(msg, r, "start.line"), 0),
+                int_at(msg, at_path(msg, r, "start.character"), 0), UTF8));
+            ranges.push(crate::tools::lsp::format::text_offset(text,
+                int_at(msg, at_path(msg, r, "end.line"), 0),
+                int_at(msg, at_path(msg, r, "end.character"), 0), UTF8));
+        }
+        let out = buf_new();
+        crate::tools::lsp::format::put_formatting(out, text, &ranges, buf_slice(TMP_DIR), UTF8);
+        respond(id, buf_slice(out));
+    }
+}
+
+// textDocument/completion (0.25.1, complete.vl), and signatureHelp
+// (help): the document's text
+// handed to a worker ready to answer: the current one when it is, else
+// the one kept from before the last change (its program a change or more
+// behind; completion reads the text itself), else the current one, waited
+// for. The program is not read again for it.
+fn completion(id: [u8], msg: [u8], params: i64, chunk: *u8, help: bool) {
+    unsafe {
+        let empty = if help { "null" } else { "{\"isIncomplete\":false,\"items\":[]}" };
+        let path = uri_path(str_at(msg, at_path(msg, params, "textDocument.uri")));
+        if path.len == 0 || !use_root(path) {
+            respond(id, empty);
+            return;
+        }
+        let i = doc_index(path);
+        var text = path[0..0];
+        if i >= 0 {
+            text = buf_slice(DOC_TEXT.data[i]);
+        } else if differs_from_disk(path, "") {
+            text = buf_slice(DISK);
+        }
+        let line = int_at(msg, at_path(msg, params, "position.line"), 0);
+        let ch = int_at(msg, at_path(msg, params, "position.character"), 0);
+        let req = buf_new();
+        buf_str(req, if help { c"signatureHelp\t" } else if SNIPPET_OK { c"completion+s\t" }
+            else { c"completion\t" });
+        buf_bytes(req, path);
+        buf_fmt(req, f"\t{line}\t{ch}\t{text.len}\t");
+        buf_bytes(req, id);
+        buf_byte(req, '\n');
+        buf_bytes(req, text);
+        ask_ready(id, buf_slice(req), -1, chunk);
+    }
+}
+
+// completionItem/resolve (0.25.1): the item handed to a worker ready to
+// answer (as completion's), which adds its documentation: the hover of
+// the definition its data names by path.
+fn resolve(id: [u8], msg: [u8], params: i64, chunk: *u8) {
+    unsafe {
+        let item = raw(msg, params);
+        if ROOT < 0 || member(msg, params, "data") < 0 {
+            respond(id, item);
+            return;
+        }
+        let req = buf_new();
+        buf_fmt(req, f"completionResolve\t-\t0\t0\t{item.len}\t");
+        buf_bytes(req, id);
+        buf_byte(req, '\n');
+        buf_bytes(req, item);
+        ask_ready(id, buf_slice(req), -1, chunk);
+    }
+}
+
+// Hands req to the worker ready to answer it (which: 1 the kept one; -1:
+// the current one if ready, else the kept one, else the current one).
+fn ask_ready(id: [u8], req: [u8], which: i64, chunk: *u8) {
+    unsafe {
+        let current = W_PID > 0 && W_STATE == 1;
+        let spare = G_PID > 0 && G_ROOT >= 0 && ROOT >= 0 && buf_slice(G_ROOT) == buf_slice(ROOT);
+        if which == 1 || which < 0 && !current && spare {
+            ask_spare(id, req, chunk);
+            return;
+        }
+        if W_PID < 0 {
+            start_worker();
+        }
+        if W_PID < 0 {
+            respond_error(id, -32603, "the worker could not start");
+            return;
+        }
+        write_all(W_IN, req);
+        loop {
+            if worker_frames() {
+                return;
+            }
+            if !read_worker(chunk) {
+                respond_error(id, -32603, "the worker ended (volec check shows why)");
+                return;
+            }
+        }
+    }
+}
+
+// Hands req to the kept worker; its response forwarded.
+fn ask_spare(id: [u8], req: [u8], chunk: *u8) {
+    unsafe {
+        if G_BUF < 0 {
+            G_BUF = buf_new();
+        }
+        buf_clear(G_BUF);
+        write_all(G_IN, req);
+        loop {
+            // (only responses: its diagnostics were read before it was kept)
+            let s = buf_slice(G_BUF);
+            var nl = 0;
+            while nl < s.len && s[nl] != '\n' {
+                nl += 1;
+            }
+            if nl < s.len && nl >= 3 {
+                let len = parse_digits(s[2..nl]);
+                if nl + 1 + len <= s.len {
+                    if s[0] == 'r' {
+                        send_message(s[nl + 1..nl + 1 + len]);
+                        buf_clear(G_BUF);
+                        return;
+                    }
+                    // (another frame: dropped)
+                    let rest = buf_new();
+                    buf_bytes(rest, s[nl + 1 + len..s.len]);
+                    buf_clear(G_BUF);
+                    buf_bytes(G_BUF, buf_slice(rest));
+                    continue;
+                }
+            }
+            let got = read(G_OUT, chunk, 65536);
+            if got <= 0 {
+                stop_spare();
+                respond_error(id, -32603, "the worker ended (volec check shows why)");
+                return;
+            }
+            buf_bytes(G_BUF, chunk[0..got]);
+        }
+    }
+}
+
 // ---- messages
 
 fn initialize(id: [u8], msg: [u8], params: i64) {
@@ -579,14 +788,22 @@ fn initialize(id: [u8], msg: [u8], params: i64) {
                 UTF8 = true;
             }
         }
+        SNIPPET_OK = is_true(msg,
+            at_path(msg, params,
+                "capabilities.textDocument.completion.completionItem.snippetSupport"));
         let r = buf_new();
         buf_str(r, c"{\"capabilities\":{\"positionEncoding\":");
         buf_str(r, if UTF8 { c"\"utf-8\"" } else { c"\"utf-16\"" });
         buf_str(r, c",\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":true}}");
         buf_str(r,
             c",\"definitionProvider\":true,\"referencesProvider\":true,\"hoverProvider\":true");
+        buf_str(r, c",\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true");
         buf_str(r,
-            c",\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true},\"serverInfo\":{\"name\":\"volec\",\"version\":\"");
+            c",\"documentFormattingProvider\":true,\"documentRangeFormattingProvider\":true");
+        buf_str(r,
+            c",\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"],\"resolveProvider\":true}");
+        buf_str(r, c",\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]}");
+        buf_str(r, c"},\"serverInfo\":{\"name\":\"volec\",\"version\":\"");
         buf_str(r, crate::version());
         buf_str(r, c"\"}}");
         respond(id, buf_slice(r));
@@ -658,6 +875,16 @@ fn handle(msg: [u8], chunk: *u8) -> bool {
             ask_worker(c"documentSymbol", id, msg, params, c"[]", chunk);
         } else if method == "workspace/symbol" {
             ask_symbols(id, msg, params, chunk);
+        } else if method == "textDocument/completion" {
+            completion(id, msg, params, chunk, false);
+        } else if method == "textDocument/signatureHelp" {
+            completion(id, msg, params, chunk, true);
+        } else if method == "completionItem/resolve" {
+            resolve(id, msg, params, chunk);
+        } else if method == "textDocument/formatting" {
+            formatting(id, msg, params, false);
+        } else if method == "textDocument/rangeFormatting" {
+            formatting(id, msg, params, true);
         } else if idv >= 0 && method.len > 0 {
             let m = buf_new();
             buf_str(m, c"unknown method ");
@@ -800,6 +1027,7 @@ fn lower_eq(a: [u8], b: [u8]) -> bool {
 
 fn cleanup() {
     unsafe {
+        stop_spare();
         stop_worker();
         for i in 0..DOC_COPY.count {
             unlink(buf_cstr(DOC_COPY.data[i]));

@@ -67,11 +67,11 @@ turn:
 
 ```tach
 impl Add for Vec2 {
-    fn add(self: Vec2, o: Vec2) -> Vec2 { Vec2 { x: self.x + o.x, y: self.y + o.y } }
+    fn add(self, o: Vec2) -> Vec2 { Vec2 { x: self.x + o.x, y: self.y + o.y } }
 }
 
 impl Mul for Mat2 {
-    fn mul(self: Mat2, o: Mat2) -> Mat2 { ... }
+    fn mul(self, o: Mat2) -> Mat2 { ... }
 }
 ```
 

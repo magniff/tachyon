@@ -32,11 +32,12 @@ extern "C" {
 ```
 
 Calling it is `unsafe`, as every call into C is: the compiler cannot
-check what C does. The method takes `self` by value (`self: Point`, a
-copy), which suits a small struct of three floats:
+check what C does. The method reads `self` and `other`: a parameter
+with no convention is `let`, read-only, so `a.distance(b)` copies
+nothing and changes neither point:
 
 ```tach
-fn distance(self: Point, other: Point) -> f64 {
+fn distance(self, other: Point) -> f64 {
     let dx = self.x - other.x;
     let dy = self.y - other.y;
     let dz = self.z - other.z;
@@ -56,6 +57,6 @@ as the same float (`1.7320508075688772`).
 ## Language features
 
 - `f64`, float literals: `volec guide types`
-- structs and methods, `self` by value: `volec guide syntax`
+- structs and methods, `self` (let): `volec guide syntax`
 - `extern "C"` declarations, `unsafe` calls: `volec guide c-interop`
 - format specs (`:.6`): `volec guide formatting`

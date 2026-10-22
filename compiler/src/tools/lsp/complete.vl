@@ -1,0 +1,3007 @@
+// textDocument/completion and completionItem/resolve (0.25.1, docs/lsp.md),
+// in the worker (answer.vl). The editor's text is usually not a program
+// while it is typed (`v.` with nothing after it), and reading the program
+// again for each keystroke costs the front end's time; so completion reads
+// the text it is given with a small lexer of its own (the tokens up to the
+// cursor: what is typed, and where), and asks the program the worker read
+// last (perhaps an edit behind) for the rest: the types of the locals
+// (where a local of the text is at a place the edit did not touch, the
+// program's local there), the definitions (DEFS), their members.
+//
+// What is completed:
+// - after `.`: the receiver's fields and methods (its impl blocks', its
+//   traits' and their default methods, std's: `str`'s for a String, a
+//   slice's for an array), the receiver's type found from the program (a
+//   local, a field, a method's result, a call's, a literal), or from the
+//   text (`let v: T`, `let v = Vec::new_in(gpa)`, `for x in v`);
+// - after `::`: a module's items, an enum's variants, a type's associated
+//   functions, std's modules and items (`std::`, `Vec::`, `use a::b::{`);
+// - a name: the locals and parameters in scope (from the text), the
+//   module's items, the names it imports, the prelude, the keywords, and
+//   snippets of the common forms.
+//
+// Ranked: names starting with what is typed first, then those of the type
+// the place expects (`let x: T = `, `return `), then locals before members
+// before the module's items before imports before std's. Each item's
+// `data` names its definition by its path (the same in every worker), so
+// that resolve adds the hover's text: the signature, effects (and why),
+// the comment above it.
+
+use crate::base::{
+    FILES, IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, find_sym,
+};
+use crate::base::json::buf_json_str;
+use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::check::{LOCALS, LOCAL_COUNT, SELF_SYM};
+use crate::front::check::calls::method_of;
+use crate::front::distinct::STR_TYPE;
+use crate::front::modules::{MODULES, STD_MODULE, child_module, module_at, module_count};
+use crate::front::modules::lookup::{PRELUDE_COUNT, prelude_name};
+use crate::front::types::{
+    CONSTS, CONST_COUNT, ENUMS, FNS, FN_COUNT, METHODS, METHOD_COUNT, STATICS, STATIC_COUNT,
+    STRUCTS, TLISTS, TYPES, TY_BOOL, TY_F32, TY_F64, TY_I16, TY_I32, TY_I64, TY_I8, TY_U16, TY_U32,
+    TY_U64, TY_U8, TyKind, buf_type, find_field, fn_param, struct_field, type_elem,
+};
+use crate::middle::lower::ssa::HMap;
+use crate::tools::lsp::format::text_offset;
+use crate::tools::query::defs::{
+    DEFS, DEF_COUNT, K_ALIAS, K_CONST, K_ENUM, K_FIELD, K_FN, K_IMPL_METHOD, K_METHOD, K_MOD,
+    K_STATIC, K_STRUCT, K_TRAIT, K_TRAIT_FN, K_VARIANT, def_of_node, mod_fqn,
+};
+use crate::tools::query::show::put_signature;
+
+// ---- the text's tokens
+
+const T_ID: i64 = 1;
+const T_NUM: i64 = 2;
+const T_STR: i64 = 3;
+const T_CHR: i64 = 4;
+const T_P: i64 = 5;
+
+// The text asked about, the cursor in it (a byte offset).
+static var TX: [u8] = "";
+static var CUR: i64 = 0;
+// Its tokens: kind, start, end.
+static var TK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var TS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var TE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// The cursor is in a comment or a literal: nothing to complete.
+static var IN_TEXT: bool = false;
+// The tokens before the cursor (the one being typed included).
+static var NT: i64 = 0;
+
+fn is_id0(c: u8) -> bool {
+    c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_'
+}
+
+fn is_id(c: u8) -> bool {
+    is_id0(c) || c >= '0' && c <= '9'
+}
+
+fn push_tok(kind: i64, s: i64, e: i64) {
+    unsafe {
+        TK.push(kind);
+        TS.push(s);
+        TE.push(e);
+    }
+}
+
+// A comment or literal from s to e: whether the cursor is in it (`open`:
+// it is not closed, the cursor at its end is in it).
+fn note_literal(s: i64, e: i64, open: bool) {
+    unsafe {
+        if CUR > s && (CUR < e || open && CUR == e) {
+            IN_TEXT = true;
+        }
+    }
+}
+
+// A string literal from its quote at p (its prefix at s); the end.
+fn lex_string(s: i64, p0: i64) -> i64 {
+    unsafe {
+        let t = TX;
+        var p = p0 + 1;
+        while p < t.len && t[p] != '"' {
+            p += if t[p] == '\\' { 2 } else { 1 };
+        }
+        let closed = p < t.len;
+        let e = if closed { p + 1 } else { t.len };
+        push_tok(T_STR, s, e);
+        note_literal(s, e, !closed);
+        e
+    }
+}
+
+// An f-string from its `f` at s: its text as T_STR pieces, its holes'
+// tokens between them; the end.
+fn lex_fstring(s: i64) -> i64 {
+    unsafe {
+        let t = TX;
+        var p = s + 2;
+        var piece = s;
+        loop {
+            if p >= t.len {
+                push_tok(T_STR, piece, t.len);
+                note_literal(piece, t.len, true);
+                return t.len;
+            }
+            let c = t[p];
+            if c == '\\' {
+                p += 2;
+            } else if (c == '{' || c == '}') && p + 1 < t.len && t[p + 1] == c {
+                p += 2;
+            } else if c == '{' {
+                push_tok(T_STR, piece, p + 1);
+                note_literal(piece, p + 1, false);
+                p = lex_code(p + 1, true);
+                piece = p - 1;
+            } else if c == '"' {
+                push_tok(T_STR, piece, p + 1);
+                note_literal(piece, p + 1, false);
+                return p + 1;
+            } else {
+                p += 1;
+            }
+        }
+    }
+}
+
+// The length of the operator at p (`::`, `->`, `..=`...).
+fn op_len(p: i64) -> i64 {
+    unsafe {
+        let t = TX;
+        if p + 1 >= t.len {
+            return 1;
+        }
+        let a = t[p];
+        let b = t[p + 1];
+        if p + 2 < t.len {
+            let c = t[p + 2];
+            if a == '.' && b == '.' && (c == '=' || c == '.') || a == '<' && b == '<' && c == '='
+                || a == '>' && b == '>' && c == '=' {
+                return 3;
+            }
+        }
+        if a == ':' && b == ':' || a == '-' && b == '>' || a == '=' && b == '>'
+            || a == '.' && b == '.' || a == '|' && b == '|' || a == '&' && b == '&'
+            || b == '=' && (a == '=' || a == '!' || a == '<' || a == '>' || a == '+' || a == '-'
+                || a == '*' || a == '/' || a == '%' || a == '&' || a == '|' || a == '^')
+            || a == '<' && b == '<' || a == '>' && b == '>' {
+            return 2;
+        }
+        1
+    }
+}
+
+// Lexes code from p0 to the end of the text (in_hole: to the `}` closing
+// an f-string's hole; the position after it).
+fn lex_code(p0: i64, in_hole: bool) -> i64 {
+    unsafe {
+        let t = TX;
+        var p = p0;
+        var depth = 0;
+        while p < t.len {
+            let c = t[p];
+            if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+                p += 1;
+            } else if c == '/' && p + 1 < t.len && t[p + 1] == '/' {
+                let s = p;
+                while p < t.len && t[p] != '\n' {
+                    p += 1;
+                }
+                note_literal(s, p, true);
+            } else if c == '/' && p + 1 < t.len && t[p + 1] == '*' {
+                let s = p;
+                p += 2;
+                var nest = 1;
+                while p < t.len && nest > 0 {
+                    if p + 1 < t.len && t[p] == '/' && t[p + 1] == '*' {
+                        nest += 1;
+                        p += 2;
+                    } else if p + 1 < t.len && t[p] == '*' && t[p + 1] == '/' {
+                        nest -= 1;
+                        p += 2;
+                    } else {
+                        p += 1;
+                    }
+                }
+                note_literal(s, p, nest > 0);
+            } else if c == 'f' && p + 1 < t.len && t[p + 1] == '"' {
+                p = lex_fstring(p);
+            } else if (c == 'c' || c == 'b' || c == 'r') && p + 1 < t.len && t[p + 1] == '"'
+                && (p == 0 || !is_id(t[p - 1])) {
+                p = lex_string(p, p + 1);
+            } else if c == '"' {
+                p = lex_string(p, p);
+            } else if c == '\'' && p + 2 < t.len
+                && (t[p + 1] == '\\' && p + 3 < t.len || t[p + 2] == '\'') {
+                let s = p;
+                p += if t[p + 1] == '\\' { 3 } else { 2 };
+                while p < t.len && t[p] != '\'' && t[p] != '\n' {
+                    p += 1;
+                }
+                if p < t.len && t[p] == '\'' {
+                    p += 1;
+                }
+                push_tok(T_CHR, s, p);
+                note_literal(s, p, false);
+            } else if is_id0(c) {
+                let s = p;
+                while p < t.len && is_id(t[p]) {
+                    p += 1;
+                }
+                push_tok(T_ID, s, p);
+            } else if c >= '0' && c <= '9' {
+                let s = p;
+                while p < t.len && (is_id(t[p])
+                    || t[p] == '.' && p + 1 < t.len && t[p + 1] >= '0' && t[p + 1] <= '9'
+                    && (p == s || t[p - 1] != '.')) {
+                    p += 1;
+                }
+                push_tok(T_NUM, s, p);
+            } else {
+                if in_hole && c == '{' {
+                    depth += 1;
+                } else if in_hole && c == '}' {
+                    if depth == 0 {
+                        return p + 1;
+                    }
+                    depth -= 1;
+                }
+                let n = op_len(p);
+                push_tok(T_P, p, p + n);
+                p += n;
+            }
+        }
+        p
+    }
+}
+
+fn tok_text(i: i64) -> [u8] {
+    unsafe { TX[TS.data[i]..TE.data[i]] }
+}
+
+// Whether token i is `s` (a word or an operator).
+fn tok_is(i: i64, s: [u8]) -> bool {
+    unsafe { i >= 0 && i < TK.count && tok_text(i) == s }
+}
+
+fn is_ident(i: i64) -> bool {
+    unsafe { i >= 0 && i < TK.count && TK.data[i] == T_ID }
+}
+
+// The bracket matching the opener at i (searching forward up to `to`),
+// or `to` when it is not closed.
+fn match_fwd(i: i64, to: i64) -> i64 {
+    var depth = 0;
+    var j = i;
+    while j < to {
+        let s = tok_text(j);
+        if unsafe { TK.data[j] } == T_P {
+            if s == "(" || s == "[" || s == "{" {
+                depth += 1;
+            } else if s == ")" || s == "]" || s == "}" {
+                depth -= 1;
+                if depth == 0 {
+                    return j;
+                }
+            }
+        }
+        j += 1;
+    }
+    to
+}
+
+// The bracket matching the closer at i, or -1.
+fn match_back(i: i64) -> i64 {
+    var depth = 0;
+    var j = i;
+    while j >= 0 {
+        if unsafe { TK.data[j] } == T_P {
+            let s = tok_text(j);
+            if s == ")" || s == "]" || s == "}" {
+                depth += 1;
+            } else if s == "(" || s == "[" || s == "{" {
+                depth -= 1;
+                if depth == 0 {
+                    return j;
+                }
+            }
+        }
+        j -= 1;
+    }
+    -1
+}
+
+const KEYWORDS: [[u8]; 36] = ["fn", "let", "var", "inout", "sink", "struct", "enum", "trait",
+    "impl", "match", "if", "else", "loop", "while", "for", "in", "break", "continue", "return",
+    "true", "false", "as", "extern", "const", "static", "type", "use", "pub", "mod", "defer",
+    "unsafe", "move", "self", "Self", "requires", "ensures"];
+
+fn is_keyword(s: [u8]) -> bool {
+    for i in 0..36 {
+        if KEYWORDS[i] == s {
+            return true;
+        }
+    }
+    s == "mut" || s == "crate" || s == "super" || s == "import"
+}
+
+// ---- the bindings in scope at the cursor (from the text)
+
+// Each binding: its name's token, the depth of the braces it is in, its
+// type as written (tokens, -1: none), its value (tokens), and whether the
+// value is what a `for` iterates.
+static var B_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var B_DEPTH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var B_ANN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var B_ANN_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var B_INIT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var B_INIT_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var B_ITER: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// A function's parameters, before its body opens: the same, and its depth.
+static var Q_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var Q_ANN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var Q_ANN_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var Q_DEPTH: i64 = -1;
+static var Q_RET: i64 = -1;
+static var Q_RET_END: i64 = -1;
+// The functions and impl blocks the cursor is in: their depth, the
+// function's result type (tokens), the impl's type (its name's token).
+static var F_DEPTH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var F_RET: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var F_RET_END: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var I_DEPTH: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var I_TYPE: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var PENDING_IMPL: i64 = -1;
+
+fn add_binding(name: i64, depth: i64, ann: i64, ann_end: i64, init: i64, init_end: i64,
+    iter: bool) {
+    unsafe {
+        B_NAME.push(name);
+        B_DEPTH.push(depth);
+        B_ANN.push(ann);
+        B_ANN_END.push(ann_end);
+        B_INIT.push(init);
+        B_INIT_END.push(init_end);
+        B_ITER.push(if iter { 1 } else { 0 });
+    }
+}
+
+// Whether token i names a binding in a pattern: a lower-case word that
+// is not a keyword, a path's part, a call's or a struct's name.
+fn binds(i: i64) -> bool {
+    unsafe {
+        if !is_ident(i) {
+            return false;
+        }
+        let s = tok_text(i);
+        if s[0] >= 'A' && s[0] <= 'Z' || is_keyword(s) || s == "_" {
+            return false;
+        }
+        let next = i + 1;
+        if next < TK.count && (tok_is(next, "(") || tok_is(next, "::") || tok_is(next, "{")
+            || tok_is(next, "!")) {
+            return false;
+        }
+        !(i > 0 && (tok_is(i - 1, "::") || tok_is(i - 1, ".")))
+    }
+}
+
+// The end of the tokens from i up to (not with) one of the stops at
+// nesting 0, or to: the index of the stop.
+fn until_stop(i: i64, to: i64, stops: [[u8]], angles: bool) -> i64 {
+    var depth = 0;
+    var j = i;
+    while j < to {
+        let s = tok_text(j);
+        if depth == 0 {
+            for k in 0..stops.len {
+                if s == stops[k] {
+                    return j;
+                }
+            }
+        }
+        if s == "(" || s == "[" || s == "{" || angles && s == "<" {
+            depth += 1;
+        } else if s == ")" || s == "]" || s == "}" || angles && s == ">" {
+            if depth == 0 {
+                return j;
+            }
+            depth -= 1;
+        } else if angles && s == ">>" {
+            depth -= 2;
+            if depth < 0 {
+                return j;
+            }
+        }
+        j += 1;
+    }
+    to
+}
+
+// The pattern's names, from i up to `end`, as bindings at depth.
+fn pattern_bindings(i: i64, end: i64, depth: i64, init: i64, init_end: i64, iter: bool) {
+    // (a single name: its value and type are known)
+    var j = i;
+    while j < end && (tok_is(j, "mut") || tok_is(j, "ref")) {
+        j += 1;
+    }
+    if j + 1 == end && binds(j) {
+        add_binding(j, depth, -1, -1, init, init_end, iter);
+        return;
+    }
+    while j < end {
+        if binds(j) && !tok_is(j + 1, ":") || binds(j) && j + 1 == end {
+            add_binding(j, depth, -1, -1, -1, -1, false);
+        }
+        j += 1;
+    }
+}
+
+// A function's header at token i (`fn`): its parameters are bound when
+// its body opens; the index of its last token read.
+fn fn_header(i: i64, depth: i64) -> i64 {
+    unsafe {
+        Q_NAME.count = 0;
+        Q_ANN.count = 0;
+        Q_ANN_END.count = 0;
+        Q_DEPTH = depth;
+        Q_RET = -1;
+        Q_RET_END = -1;
+        var j = i + 1;
+        if is_ident(j) {
+            j += 1;
+        }
+        if tok_is(j, "<") {
+            j = until_stop(j + 1, NT, [">"], true) + 1;
+        }
+        if !tok_is(j, "(") {
+            return j - 1;
+        }
+        let close = until_stop(j + 1, NT, [")"], true);
+        var p = j + 1;
+        while p < close {
+            let e = until_stop(p, close, [","], true);
+            let colon = until_stop(p, e, [":"], true);
+            if colon < e {
+                // `name: [conv] Type`
+                var n = colon - 1;
+                if binds(n) || tok_is(n, "self") {
+                    var a = colon + 1;
+                    while a < e && (tok_is(a, "inout") || tok_is(a, "sink") || tok_is(a, "let")
+                        || tok_is(a, "var") || tok_is(a, "mut")) {
+                        a += 1;
+                    }
+                    Q_NAME.push(n);
+                    Q_ANN.push(a);
+                    Q_ANN_END.push(e);
+                }
+            } else if e > p && tok_is(e - 1, "self") {
+                Q_NAME.push(e - 1);
+                Q_ANN.push(-1);
+                Q_ANN_END.push(-1);
+            }
+            p = e + 1;
+        }
+        if close >= NT {
+            return NT;
+        }
+        var k = close + 1;
+        if tok_is(k, "->") {
+            let e = until_stop(k + 1, NT, ["{", ";", "requires", "ensures", "where"], true);
+            Q_RET = k + 1;
+            Q_RET_END = e;
+            k = e;
+        }
+        k - 1
+    }
+}
+
+// The bindings in scope at the cursor (B_*), the functions and impls it is
+// in (F_*, I_*): the tokens before it read once.
+fn scan_bindings() {
+    unsafe {
+        B_NAME.count = 0;
+        B_DEPTH.count = 0;
+        B_ANN.count = 0;
+        B_ANN_END.count = 0;
+        B_INIT.count = 0;
+        B_INIT_END.count = 0;
+        B_ITER.count = 0;
+        F_DEPTH.count = 0;
+        F_RET.count = 0;
+        F_RET_END.count = 0;
+        I_DEPTH.count = 0;
+        I_TYPE.count = 0;
+        Q_DEPTH = -1;
+        PENDING_IMPL = -1;
+        var depth = 0;
+        var i = 0;
+        while i < NT {
+            let s = tok_text(i);
+            let kind = TK.data[i];
+            if kind == T_P && s == "{" {
+                depth += 1;
+                if Q_DEPTH >= 0 && Q_DEPTH == depth - 1 {
+                    for q in 0..Q_NAME.count {
+                        add_binding(Q_NAME.data[q], depth, Q_ANN.data[q], Q_ANN_END.data[q], -1,
+                            -1, false);
+                    }
+                    F_DEPTH.push(depth);
+                    F_RET.push(Q_RET);
+                    F_RET_END.push(Q_RET_END);
+                    Q_DEPTH = -1;
+                }
+                if PENDING_IMPL >= 0 {
+                    I_DEPTH.push(depth);
+                    I_TYPE.push(PENDING_IMPL);
+                    PENDING_IMPL = -1;
+                }
+            } else if kind == T_P && s == "}" {
+                while B_DEPTH.count > 0 && B_DEPTH.data[B_DEPTH.count - 1] >= depth {
+                    B_NAME.count -= 1;
+                    B_DEPTH.count -= 1;
+                    B_ANN.count -= 1;
+                    B_ANN_END.count -= 1;
+                    B_INIT.count -= 1;
+                    B_INIT_END.count -= 1;
+                    B_ITER.count -= 1;
+                }
+                while F_DEPTH.count > 0 && F_DEPTH.data[F_DEPTH.count - 1] >= depth {
+                    F_DEPTH.count -= 1;
+                    F_RET.count -= 1;
+                    F_RET_END.count -= 1;
+                }
+                while I_DEPTH.count > 0 && I_DEPTH.data[I_DEPTH.count - 1] >= depth {
+                    I_DEPTH.count -= 1;
+                    I_TYPE.count -= 1;
+                }
+                if depth > 0 {
+                    depth -= 1;
+                }
+            } else if kind == T_P && s == ";" {
+                if Q_DEPTH == depth {
+                    Q_DEPTH = -1;
+                }
+            } else if kind == T_ID && s == "fn" {
+                i = fn_header(i, depth);
+            } else if kind == T_ID && s == "impl" {
+                // `impl<T> Tr for Ty<T>`: Ty's name
+                var j = i + 1;
+                if tok_is(j, "<") {
+                    j = until_stop(j + 1, NT, [">"], true) + 1;
+                }
+                let e = until_stop(j, NT, ["{", ";"], true);
+                var name = -1;
+                var k = j;
+                while k < e {
+                    if tok_is(k, "for") {
+                        name = -1;
+                    } else if is_ident(k) && name < 0 && !tok_is(k, "for") {
+                        name = k;
+                        while tok_is(name + 1, "::") && is_ident(name + 2) {
+                            name += 2;
+                        }
+                    }
+                    k += 1;
+                }
+                PENDING_IMPL = name;
+            } else if kind == T_ID && (s == "let" || s == "var"
+                || s == "inout" && i > 0 && (tok_is(i - 1, ";") || tok_is(i - 1, "{")
+                    || tok_is(i - 1, "}"))) {
+                let e = until_stop(i + 1, NT, [":", "=", ";"], false);
+                var ann = -1;
+                var ann_end = -1;
+                var init = -1;
+                var init_end = -1;
+                var k = e;
+                if tok_is(k, ":") {
+                    ann = k + 1;
+                    ann_end = until_stop(k + 1, NT, ["=", ";"], true);
+                    k = ann_end;
+                }
+                if tok_is(k, "=") {
+                    init = k + 1;
+                    init_end = until_stop(k + 1, NT, [";", "else"], false);
+                }
+                var j = i + 1;
+                while j < e && tok_is(j, "mut") {
+                    j += 1;
+                }
+                if j + 1 == e && binds(j) {
+                    add_binding(j, depth, ann, ann_end, init, init_end, false);
+                } else {
+                    pattern_bindings(i + 1, e, depth, -1, -1, false);
+                }
+                i = e - 1;
+            } else if kind == T_ID && s == "for" {
+                let e = until_stop(i + 1, NT, ["in", "{"], false);
+                if tok_is(e, "in") {
+                    let body = until_stop(e + 1, NT, ["{"], false);
+                    pattern_bindings(i + 1, e, depth + 1, e + 1, body, true);
+                    i = e;
+                }
+            } else if kind == T_ID && (s == "if" || s == "while") && tok_is(i + 1, "let") {
+                let e = until_stop(i + 2, NT, ["="], false);
+                pattern_bindings(i + 2, e, depth + 1, -1, -1, false);
+                i = e;
+            } else if kind == T_P && s == "=>" {
+                // a match arm: its pattern, back to the arm's start
+                var a = i - 1;
+                var nest = 0;
+                while a >= 0 {
+                    let t = tok_text(a);
+                    if t == ")" || t == "]" {
+                        nest += 1;
+                    } else if t == "(" || t == "[" {
+                        if nest == 0 {
+                            break;
+                        }
+                        nest -= 1;
+                    } else if nest == 0 && (t == "," || t == "{" || t == "}") {
+                        break;
+                    }
+                    a -= 1;
+                }
+                let guard = until_stop(a + 1, i, ["if"], false);
+                pattern_bindings(a + 1, guard, depth, -1, -1, false);
+            } else if kind == T_P && s == "|" && i > 0 {
+                let before = tok_text(i - 1);
+                if before == "(" || before == "," || before == "=" || before == "{"
+                    || before == ";" || before == "move" || before == "return"
+                    || before == "=>" || before == "sink" {
+                    var j = i + 1;
+                    while j < NT && !tok_is(j, "|") {
+                        if binds(j) && (tok_is(j + 1, ":") || tok_is(j + 1, ",")
+                            || tok_is(j + 1, "|")) {
+                            var ann = -1;
+                            var ann_end = -1;
+                            if tok_is(j + 1, ":") {
+                                ann = j + 2;
+                                ann_end = until_stop(j + 2, NT, [",", "|"], true);
+                            }
+                            add_binding(j, depth + 1, ann, ann_end, -1, -1, false);
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
+// The binding named `name` in scope before token `before` (the last), or -1.
+fn binding_named(name: [u8], before: i64) -> i64 {
+    unsafe {
+        var b = B_NAME.count - 1;
+        while b >= 0 {
+            if B_NAME.data[b] < before && tok_text(B_NAME.data[b]) == name {
+                return b;
+            }
+            b -= 1;
+        }
+        -1
+    }
+}
+
+// ---- the program read, and the text
+
+// The file of the text in the program (-1: none), its module, and how
+// far the text and the file read are the same: from the start (PRE) and
+// from the end (POST).
+static var FILE: i64 = -1;
+static var MODULE: i64 = 0;
+static var PRE: i64 = 0;
+static var POST: i64 = 0;
+// Each local by the position of its name in its declaration + 1: the
+// local + 1 (made once).
+static var LOCAL_BY_POS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var LOCALS_INDEXED: bool = false;
+// Definitions by their path (fqn + 1 -> definition + 1), made once.
+static var DEF_BY_FQN: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var DEF_BY_PATH: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var DEFS_INDEXED: bool = false;
+// Whether the program was read (answer.vl's LOADED).
+static var HAVE_PROGRAM: bool = false;
+
+fn index_defs() {
+    unsafe {
+        if DEFS_INDEXED {
+            return;
+        }
+        for d in 0..DEF_COUNT {
+            if DEFS[d].fqn >= 0 && DEF_BY_FQN.get(DEFS[d].fqn + 1) == 0 {
+                DEF_BY_FQN.put(DEFS[d].fqn + 1, d + 1);
+            }
+            if DEFS[d].path >= 0 && DEF_BY_PATH.get(DEFS[d].path + 1) == 0 {
+                DEF_BY_PATH.put(DEFS[d].path + 1, d + 1);
+            }
+        }
+        DEFS_INDEXED = true;
+    }
+}
+
+// The locals by their declarations' positions, from decl (answer.vl's
+// LOCAL_DECL: local + 1 -> its name's position + 1).
+pub fn index_locals(decl: HMap) {
+    unsafe {
+        if LOCALS_INDEXED {
+            return;
+        }
+        for l in 0..LOCAL_COUNT {
+            let p = decl.get(l + 1) - 1;
+            if p >= 0 && LOCALS[l].ty > 0 && LOCAL_BY_POS.get(p + 1) == 0 {
+                LOCAL_BY_POS.put(p + 1, l + 1);
+            }
+        }
+        LOCALS_INDEXED = true;
+    }
+}
+
+// The position in the program read of position p of the text, or -1 when
+// it is in what the edit changed.
+fn old_pos(p: i64) -> i64 {
+    unsafe {
+        if FILE < 0 {
+            return -1;
+        }
+        let start = FILES[FILE].start;
+        let old_len = FILES[FILE].end - start;
+        if p < PRE {
+            return start + p;
+        }
+        if p >= TX.len - POST {
+            return start + p - TX.len + old_len;
+        }
+        -1
+    }
+}
+
+// The same, a position in what the edit changed taken as where it starts.
+fn near_old_pos(p: i64) -> i64 {
+    unsafe {
+        let q = old_pos(p);
+        if q >= 0 || FILE < 0 {
+            return q;
+        }
+        FILES[FILE].start + PRE
+    }
+}
+
+fn compare_with_program() {
+    unsafe {
+        PRE = 0;
+        POST = 0;
+        if FILE < 0 {
+            return;
+        }
+        let old = SRC[FILES[FILE].start..FILES[FILE].end];
+        let t = TX;
+        while PRE < old.len && PRE < t.len && old[PRE] == t[PRE] {
+            PRE += 1;
+        }
+        while POST < old.len - PRE && POST < t.len - PRE
+            && old[old.len - 1 - POST] == t[t.len - 1 - POST] {
+            POST += 1;
+        }
+    }
+}
+
+// ---- types
+
+// A type: its type (t > 0), else the definition of its item (d >= 0) and
+// the type of its first type argument when known (arg), or a slice of an
+// unknown element (slice); none of them: unknown.
+struct TyRef { t: i64, d: i64, slice: bool, arg: i64 }
+
+fn no_type() -> TyRef {
+    TyRef { t: 0, d: -1, slice: false, arg: 0 }
+}
+
+fn of_type(t: i64) -> TyRef {
+    TyRef { t: if t > 0 { t } else { 0 }, d: -1, slice: false, arg: 0 }
+}
+
+fn known(r: TyRef) -> bool {
+    r.t > 0 || r.d >= 0 || r.slice
+}
+
+// t without the pointers and references to it.
+fn deref(t0: i64) -> i64 {
+    unsafe {
+        var t = t0;
+        var n = 0;
+        while t > 0 && TYPES[t].kind == TyKind::Ptr && n < 8 {
+            t = TYPES[t].a;
+            n += 1;
+        }
+        t
+    }
+}
+
+// The definition of type t's item (an instance's: its template's), or -1.
+fn item_of_type(t0: i64) -> i64 {
+    unsafe {
+        let t = deref(t0);
+        if t <= 0 {
+            return -1;
+        }
+        let k = TYPES[t].kind;
+        if k == TyKind::Struct {
+            let s = TYPES[t].a;
+            let tm = STRUCTS[s].tmpl;
+            return def_of_node(if tm != 0 { STRUCTS[tm - 1].node } else { STRUCTS[s].node });
+        }
+        if k == TyKind::Enum {
+            let e = TYPES[t].a;
+            let tm = ENUMS[e].tmpl;
+            return def_of_node(if tm != 0 { ENUMS[tm - 1].node } else { ENUMS[e].node });
+        }
+        -1
+    }
+}
+
+// The first type argument of an instance (`Vec<i64>`: i64), or 0.
+fn first_targ(t0: i64) -> i64 {
+    unsafe {
+        let t = deref(t0);
+        if t <= 0 {
+            return 0;
+        }
+        let k = TYPES[t].kind;
+        if k == TyKind::Struct && STRUCTS[TYPES[t].a].targ_count > 0 {
+            return TLISTS.data[STRUCTS[TYPES[t].a].targs];
+        }
+        if k == TyKind::Enum && ENUMS[TYPES[t].a].targ_count > 0 {
+            return TLISTS.data[ENUMS[TYPES[t].a].targs];
+        }
+        0
+    }
+}
+
+// What indexing or iterating r gives: a slice's or an array's element,
+// an instance's first type argument (Vec, an iterator), a range's i64.
+fn element_of(r: TyRef) -> TyRef {
+    unsafe {
+        if r.slice {
+            return no_type();
+        }
+        if r.t <= 0 && r.arg > 0 {
+            return of_type(r.arg);
+        }
+        if r.t > 0 && TYPES[r.t].kind == TyKind::Ptr {
+            // (a raw pointer's element; a reference's: what it refers to's)
+            let to = TYPES[r.t].a;
+            if TYPES[r.t].b == 0 || TYPES[to].kind != TyKind::Slice
+                && TYPES[to].kind != TyKind::Array && TYPES[to].kind != TyKind::Struct {
+                return of_type(to);
+            }
+        }
+        let t = deref(r.t);
+        if t <= 0 {
+            return no_type();
+        }
+        let k = TYPES[t].kind;
+        if k == TyKind::Slice || k == TyKind::Array {
+            return of_type(TYPES[t].a);
+        }
+        let d = item_of_type(t);
+        if d >= 0 && (SYMS[DEFS[d].name].text == "Range"
+            || SYMS[DEFS[d].name].text == "RangeInclusive") {
+            return of_type(TY_I64);
+        }
+        of_type(first_targ(t))
+    }
+}
+
+// The definition of the type item named `name` the module sees: its own,
+// one it imports, std's, any.
+fn type_def_named(name: [u8]) -> i64 {
+    unsafe {
+        let sym = find_sym(name);
+        if sym < 0 {
+            return -1;
+        }
+        var best = -1;
+        var best_rank = 0;
+        for d in 0..DEF_COUNT {
+            let k = DEFS[d].kind;
+            if DEFS[d].name != sym
+                || !(k == K_STRUCT || k == K_ENUM || k == K_TRAIT || k == K_ALIAS) {
+                continue;
+            }
+            var rank = 1;
+            if DEFS[d].module == MODULE {
+                rank = 4;
+            } else if imported_as(d) {
+                rank = 3;
+            } else if DEFS[d].public && in_std(DEFS[d].module) {
+                rank = 2;
+            }
+            if rank > best_rank {
+                best = d;
+                best_rank = rank;
+            }
+        }
+        best
+    }
+}
+
+fn in_std(m0: i64) -> bool {
+    unsafe {
+        var m = m0;
+        var n = 0;
+        while m > 0 && n < 64 {
+            if m == STD_MODULE {
+                return true;
+            }
+            m = MODULES[m].parent;
+            n += 1;
+        }
+        false
+    }
+}
+
+// Whether `s` (a type as written) is a primitive's name: its type, else 0.
+fn primitive_named(s: [u8]) -> i64 {
+    let names: [[u8]; 13] = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64",
+        "bool", "isize", "usize"];
+    let types: [i64; 13] = [TY_I8, TY_I16, TY_I32, TY_I64, TY_U8, TY_U16, TY_U32, TY_U64, TY_F32,
+        TY_F64, TY_BOOL, TY_I64, TY_U64];
+    for i in 0..13 {
+        if names[i] == s {
+            return types[i];
+        }
+    }
+    0
+}
+
+// The definition of ctx's item (an instance's template's).
+fn ctx_def(ctx: TyRef) -> i64 {
+    if ctx.t > 0 { item_of_type(ctx.t) } else { ctx.d }
+}
+
+fn def_ref(d: i64) -> TyRef {
+    TyRef { t: 0, d: d, slice: false, arg: 0 }
+}
+
+// The `Self` of the impl block the cursor is in.
+fn self_ref() -> TyRef {
+    def_ref(self_def())
+}
+
+// The index of type parameter `name` of definition d (`Vec<T, A>`: T 0,
+// A 1), or -1.
+fn type_param_index(d: i64, name: [u8]) -> i64 {
+    unsafe {
+        if d < 0 {
+            return -1;
+        }
+        let s = signature(d);
+        let own = SYMS[DEFS[d].name].text;
+        var i = 0;
+        while i + own.len <= s.len && s[i..i + own.len] != own {
+            i += 1;
+        }
+        i += own.len;
+        if i >= s.len || s[i] != '<' {
+            return -1;
+        }
+        i += 1;
+        var k = 0;
+        while i < s.len {
+            while i < s.len && s[i] == ' ' {
+                i += 1;
+            }
+            var e = i;
+            while e < s.len && is_id(s[e]) {
+                e += 1;
+            }
+            if s[i..e] == name {
+                return k;
+            }
+            // to the next parameter
+            var depth = 0;
+            while e < s.len {
+                let c = s[e];
+                if c == '<' || c == '(' || c == '[' {
+                    depth += 1;
+                } else if c == '>' || c == ')' || c == ']' {
+                    if depth == 0 {
+                        return -1;
+                    }
+                    depth -= 1;
+                } else if c == ',' && depth == 0 {
+                    break;
+                }
+                e += 1;
+            }
+            i = e + 1;
+            k += 1;
+        }
+        -1
+    }
+}
+
+// The k-th type argument of instance t, or 0.
+fn nth_targ(t0: i64, k: i64) -> i64 {
+    unsafe {
+        let t = deref(t0);
+        if t <= 0 || k < 0 {
+            return 0;
+        }
+        let kind = TYPES[t].kind;
+        if kind == TyKind::Struct && STRUCTS[TYPES[t].a].targ_count > k {
+            return TLISTS.data[STRUCTS[TYPES[t].a].targs + k];
+        }
+        if kind == TyKind::Enum && ENUMS[TYPES[t].a].targ_count > k {
+            return TLISTS.data[ENUMS[TYPES[t].a].targs + k];
+        }
+        0
+    }
+}
+
+// The type written as text `s` (`Vec<i64>`, `inout Buf`, `[u8]`, `Self`,
+// `T`), in the context of ctx: what `Self` is, whose type parameters T
+// names (an instance's arguments, or ctx's first argument).
+fn type_from_text(s: [u8], ctx: TyRef) -> TyRef {
+    unsafe {
+        var i = 0;
+        loop {
+            while i < s.len && (s[i] == ' ' || s[i] == '&' || s[i] == '*') {
+                i += 1;
+            }
+            var w = i;
+            while w < s.len && is_id(s[w]) {
+                w += 1;
+            }
+            let word = s[i..w];
+            if word == "mut" || word == "inout" || word == "sink" || word == "let" || word == "var"
+                || word == "const" {
+                i = w;
+                continue;
+            }
+            break;
+        }
+        if i < s.len && s[i] == '[' {
+            // `[T]` (`[T; N]`: an array, as a slice for its methods)
+            var e = i + 1;
+            while e < s.len && s[e] != ']' && s[e] != ';' {
+                e += 1;
+            }
+            let elem = type_from_text(s[i + 1..e], ctx);
+            if elem.t > 0 {
+                return of_type(crate::front::types::slice_of(elem.t));
+            }
+            return TyRef { t: 0, d: -1, slice: true, arg: 0 };
+        }
+        // the path's last name
+        var last = i;
+        var e = i;
+        while e < s.len && (is_id(s[e]) || s[e] == ':') {
+            if s[e] == ':' {
+                last = e + 1;
+            }
+            e += 1;
+        }
+        let name = s[last..e];
+        if name.len == 0 {
+            return no_type();
+        }
+        // its first type argument
+        var arg = 0;
+        if e < s.len && s[e] == '<' {
+            var depth = 0;
+            var j = e + 1;
+            var a_end = s.len;
+            while j < s.len {
+                let c = s[j];
+                if c == '<' || c == '(' || c == '[' {
+                    depth += 1;
+                } else if c == '>' || c == ')' || c == ']' {
+                    if depth == 0 {
+                        a_end = j;
+                        break;
+                    }
+                    depth -= 1;
+                } else if c == ',' && depth == 0 {
+                    a_end = j;
+                    break;
+                }
+                j += 1;
+            }
+            arg = type_from_text(s[e + 1..a_end], ctx).t;
+        }
+        if name == "Self" {
+            return ctx;
+        }
+        let k = type_param_index(ctx_def(ctx), name);
+        if k >= 0 {
+            let targ = nth_targ(ctx.t, k);
+            if targ > 0 {
+                return of_type(targ);
+            }
+            if k == 0 && ctx.arg > 0 {
+                return of_type(ctx.arg);
+            }
+            return no_type();
+        }
+        if name == "str" && STR_TYPE > 0 {
+            return of_type(STR_TYPE);
+        }
+        let p = primitive_named(name);
+        if p > 0 {
+            return of_type(p);
+        }
+        TyRef { t: 0, d: type_def_named(name), slice: false, arg: arg }
+    }
+}
+
+// The text of definition d's signature (without its contract).
+fn signature(d: i64) -> [u8] {
+    let b = buf_new();
+    put_signature(b, d);
+    let s = buf_slice(b);
+    let stops: [[u8]; 2] = [" requires ", " ensures "];
+    var e = s.len;
+    for k in 0..2 {
+        var j = 0;
+        while j + stops[k].len <= e {
+            if s[j..j + stops[k].len] == stops[k] {
+                e = j;
+                break;
+            }
+            j += 1;
+        }
+    }
+    s[0..e]
+}
+
+// The result type of function definition d, as written (after `->`), or
+// empty.
+fn result_text(d: i64) -> [u8] {
+    let s = signature(d);
+    var depth = 0;
+    var i = 0;
+    while i + 1 < s.len {
+        let c = s[i];
+        if c == '(' || c == '[' || c == '<' && !(i > 0 && s[i - 1] == '-') {
+            depth += 1;
+        } else if c == ')' || c == ']' || c == '>' && s[i - 1] != '-' {
+            depth -= 1;
+        } else if c == '-' && s[i + 1] == '>' && depth == 0 {
+            var e = s.len;
+            let stops: [[u8]; 3] = [" requires", " ensures", " where"];
+            for k in 0..3 {
+                var j = i;
+                while j + stops[k].len <= e {
+                    if s[j..j + stops[k].len] == stops[k] {
+                        e = j;
+                        break;
+                    }
+                    j += 1;
+                }
+            }
+            return s[i + 2..e];
+        }
+        i += 1;
+    }
+    s[0..0]
+}
+
+// The type of field definition d, as written (after `:`).
+fn field_text(d: i64) -> [u8] {
+    let s = signature(d);
+    for i in 0..s.len {
+        if s[i] == ':' && (i + 1 >= s.len || s[i + 1] != ':') && (i == 0 || s[i - 1] != ':') {
+            var e = s.len;
+            for j in i..s.len {
+                if s[j] == '=' && e == s.len {
+                    e = j;
+                }
+            }
+            return s[i + 1..e];
+        }
+    }
+    s[0..0]
+}
+
+// The function definition of type r named `name` (a method of its impl
+// blocks or traits), or -1.
+fn member_fn(r: TyRef, name: [u8]) -> i64 {
+    unsafe {
+        let sym = find_sym(name);
+        let od = if r.t > 0 { item_of_type(r.t) } else { r.d };
+        if sym < 0 || od < 0 || DEFS[od].fqn < 0 {
+            return -1;
+        }
+        let owner = DEFS[od].fqn;
+        for d in 0..DEF_COUNT {
+            let k = DEFS[d].kind;
+            if (k == K_METHOD || k == K_IMPL_METHOD) && DEFS[d].owner == owner
+                && DEFS[d].name == sym {
+                return d;
+            }
+        }
+        -1
+    }
+}
+
+// The result type of function f: `str` where it is written so (the
+// checker has its view, `[u8]`).
+fn fn_result(f: i64) -> i64 {
+    unsafe {
+        let d = def_of_node(FNS[f].node);
+        if d >= 0 && STR_TYPE > 0 {
+            let r = result_text(d);
+            var a = 0;
+            var e = r.len;
+            while a < e && r[a] == ' ' {
+                a += 1;
+            }
+            while e > a && r[e - 1] == ' ' {
+                e -= 1;
+            }
+            if r[a..e] == "str" {
+                return STR_TYPE;
+            }
+        }
+        FNS[f].ret
+    }
+}
+
+// The result of calling method `name` on r.
+fn method_result(r: TyRef, name: [u8]) -> TyRef {
+    unsafe {
+        let sym = find_sym(name);
+        let t = deref(r.t);
+        if sym >= 0 && t > 0 {
+            var f = method_of(t, sym);
+            if f < 0 && STR_TYPE > 0 && is_named(t, "String") {
+                f = method_of(STR_TYPE, sym);
+            }
+            if f < 0 && TYPES[t].kind == TyKind::Array {
+                f = method_of(crate::front::types::slice_of(TYPES[t].a), sym);
+            }
+            if f >= 0 {
+                if FNS[f].generic == 0 && FNS[f].ret > 0 {
+                    return of_type(fn_result(f));
+                }
+                // (a template: an instance of it the program made for t)
+                for g in 0..FN_COUNT {
+                    if FNS[g].tmpl == f + 1 && FNS[g].param_count > 0
+                        && deref(fn_param(g, 0)) == t && FNS[g].ret > 0 {
+                        return of_type(FNS[g].ret);
+                    }
+                }
+                let d = def_of_node(FNS[f].node);
+                if d >= 0 {
+                    return type_from_text(result_text(d), r);
+                }
+            }
+        }
+        var d = member_fn(r, name);
+        if d < 0 && sym >= 0 && (t > 0 || r.slice) {
+            // (a type with no item: `str`'s, a slice's, a primitive's impl)
+            let o = buf_new();
+            if r.slice || TYPES[t].kind == TyKind::Slice || TYPES[t].kind == TyKind::Array {
+                buf_str(o, c"[");
+            } else if STR_TYPE > 0 && is_named(t, "String") {
+                buf_str(o, c"str");
+            } else {
+                buf_type(o, t);
+            }
+            let ot = buf_slice(o);
+            for e in 0..DEF_COUNT {
+                let k = DEFS[e].kind;
+                if (k == K_METHOD || k == K_IMPL_METHOD) && DEFS[e].name == sym
+                    && DEFS[e].owner >= 0 {
+                    let own = SYMS[DEFS[e].owner].text;
+                    if own == ot || ot == "[" && own.len > 0 && own[0] == '[' {
+                        d = e;
+                        break;
+                    }
+                }
+            }
+        }
+        if d >= 0 {
+            return type_from_text(result_text(d), r);
+        }
+        no_type()
+    }
+}
+
+// Whether type t is the item named `name` (std's String...).
+fn is_named(t: i64, name: [u8]) -> bool {
+    unsafe {
+        let d = item_of_type(t);
+        d >= 0 && SYMS[DEFS[d].name].text == name
+    }
+}
+
+// The type of field `name` of r.
+fn field_result(r: TyRef, name: [u8]) -> TyRef {
+    unsafe {
+        let t = deref(r.t);
+        if t > 0 && TYPES[t].kind == TyKind::Struct {
+            let sym = find_sym(name);
+            if sym >= 0 {
+                let i = find_field(TYPES[t].a, sym);
+                if i >= 0 {
+                    return of_type((*struct_field(TYPES[t].a, i)).ty);
+                }
+            }
+        }
+        if t > 0 && TYPES[t].kind == TyKind::Tuple && name.len > 0 && name[0] >= '0'
+            && name[0] <= '9' {
+            var k = 0;
+            for i in 0..name.len {
+                k = k * 10 + (name[i] - '0') as i64;
+            }
+            if k < TYPES[t].count {
+                return of_type(type_elem(t, k));
+            }
+        }
+        let od = if t > 0 { item_of_type(t) } else { r.d };
+        let sym = find_sym(name);
+        if od >= 0 && sym >= 0 {
+            for d in 0..DEF_COUNT {
+                if DEFS[d].kind == K_FIELD && DEFS[d].parent == od && DEFS[d].name == sym {
+                    return type_from_text(field_text(d), r);
+                }
+            }
+        }
+        no_type()
+    }
+}
+
+// What `x?` gives of r: an Option's or a Result's first type argument.
+fn unwrapped(r: TyRef) -> TyRef {
+    if r.t <= 0 && r.arg > 0 {
+        return of_type(r.arg);
+    }
+    of_type(first_targ(r.t))
+}
+
+// The impl's type the cursor is in (Self), or -1.
+fn self_def() -> i64 {
+    unsafe {
+        if I_TYPE.count == 0 {
+            return -1;
+        }
+        type_def_named(tok_text(I_TYPE.data[I_TYPE.count - 1]))
+    }
+}
+
+// The type of binding b.
+fn binding_type(b: i64, depth: i64) -> TyRef {
+    unsafe {
+        let name = B_NAME.data[b];
+        let op = old_pos(TS.data[name]);
+        if op >= 0 {
+            let l = LOCAL_BY_POS.get(op + 1) - 1;
+            if l >= 0 {
+                return of_type(LOCALS[l].ty);
+            }
+        }
+        if B_ANN.data[b] >= 0 && B_ANN_END.data[b] > B_ANN.data[b] {
+            let s = TX[TS.data[B_ANN.data[b]]..TE.data[B_ANN_END.data[b] - 1]];
+            let r = type_from_text(s, self_ref());
+            if known(r) {
+                return r;
+            }
+        }
+        if tok_text(name) == "self" {
+            return TyRef { t: 0, d: self_def(), slice: false, arg: 0 };
+        }
+        if B_INIT.data[b] >= 0 && B_INIT_END.data[b] > B_INIT.data[b] && depth < 6 {
+            let r = expr_type(B_INIT.data[b], B_INIT_END.data[b] - 1, depth + 1);
+            return if B_ITER.data[b] != 0 { element_of(r) } else { r };
+        }
+        no_type()
+    }
+}
+
+// The type of the name `name` used at token i: a binding, `self`, a
+// static or a constant of the module.
+fn name_type(name: [u8], i: i64, depth: i64) -> TyRef {
+    unsafe {
+        let b = binding_named(name, i);
+        if b >= 0 {
+            return binding_type(b, depth);
+        }
+        if name == "self" {
+            return TyRef { t: 0, d: self_def(), slice: false, arg: 0 };
+        }
+        let sym = find_sym(name);
+        if sym < 0 {
+            return no_type();
+        }
+        for d in 0..DEF_COUNT {
+            let k = DEFS[d].kind;
+            if (k == K_STATIC || k == K_CONST) && DEFS[d].name == sym && DEFS[d].module == MODULE {
+                return value_type(d);
+            }
+        }
+        // (an imported static or constant)
+        for u in 0..U_NAME.count {
+            if U_DEF.data[u] >= 0 && tok_text(U_NAME.data[u]) == name {
+                let k = DEFS[U_DEF.data[u]].kind;
+                if k == K_STATIC || k == K_CONST {
+                    return value_type(U_DEF.data[u]);
+                }
+            }
+        }
+        no_type()
+    }
+}
+
+// The path `a::b::c` written from token i: its last name's token (the
+// path is i..that), stepping over `::<..>`.
+fn path_end(i: i64, to: i64) -> i64 {
+    var j = i;
+    while j + 2 <= to && tok_is(j + 1, "::") && (is_ident(j + 2) || tok_is(j + 2, "<")) {
+        if tok_is(j + 2, "<") {
+            let e = until_stop(j + 3, to + 1, [">"], true);
+            if !tok_is(e + 1, "::") {
+                return j;
+            }
+            j = e - 1;
+        }
+        j += 2;
+    }
+    j
+}
+
+// The definition the path of tokens i..=e names (`Vec::new_in`,
+// `shapes::area`, `area`, `Self::f`), or -1.
+fn path_def(i: i64, e: i64) -> i64 {
+    unsafe {
+        let name = tok_text(e);
+        let sym = find_sym(name);
+        if sym < 0 {
+            return -1;
+        }
+        if e == i {
+            // a function the module has, imports, or the prelude's
+            var best = -1;
+            var best_rank = 0;
+            for d in 0..DEF_COUNT {
+                if DEFS[d].name != sym || DEFS[d].parent >= 0 || DEFS[d].kind == K_METHOD
+                    || DEFS[d].kind == K_IMPL_METHOD || DEFS[d].kind == K_FIELD {
+                    continue;
+                }
+                var rank = 1;
+                if DEFS[d].module == MODULE {
+                    rank = 4;
+                } else if imported_as(d) {
+                    rank = 3;
+                } else if DEFS[d].public && DEFS[d].module == STD_MODULE {
+                    rank = 2;
+                }
+                if rank > best_rank {
+                    best = d;
+                    best_rank = rank;
+                }
+            }
+            return best;
+        }
+        // `Owner::name`: the owner a type (its functions, its variants) or
+        // a module (its items)
+        var oe = e - 2;
+        while oe > i && tok_is(oe, ">") {
+            oe = match_angle_back(oe) - 2;
+        }
+        let owner = if tok_text(oe) == "Self" { self_def() } else { type_def_named(tok_text(oe)) };
+        if owner >= 0 && DEFS[owner].fqn >= 0 {
+            for d in 0..DEF_COUNT {
+                if DEFS[d].name == sym && (DEFS[d].owner == DEFS[owner].fqn
+                    || DEFS[d].parent == owner) {
+                    return d;
+                }
+            }
+        }
+        let m = path_module(i, oe);
+        if m >= 0 {
+            for d in 0..DEF_COUNT {
+                if DEFS[d].name == sym && DEFS[d].module == m && DEFS[d].parent < 0
+                    && DEFS[d].kind != K_METHOD && DEFS[d].kind != K_IMPL_METHOD {
+                    return d;
+                }
+            }
+        }
+        -1
+    }
+}
+
+// The `<` matching the `>` at token i, or i.
+fn match_angle_back(i: i64) -> i64 {
+    var depth = 0;
+    var j = i;
+    while j >= 0 {
+        if tok_is(j, ">") {
+            depth += 1;
+        } else if tok_is(j, "<") {
+            depth -= 1;
+            if depth == 0 {
+                return j;
+            }
+        }
+        j -= 1;
+    }
+    i
+}
+
+// The type of a value of definition d: a function's result, a constant's
+// or static's type, a variant's enum, a struct's.
+fn value_type(d: i64) -> TyRef {
+    unsafe {
+        let k = DEFS[d].kind;
+        if k == K_FN || k == K_METHOD || k == K_IMPL_METHOD || k == K_TRAIT_FN {
+            let f = NODES[DEFS[d].node].x - 1;
+            if f >= 0 && f < FN_COUNT && FNS[f].generic == 0 && FNS[f].ret > 0 {
+                return of_type(fn_result(f));
+            }
+            if f >= 0 && f < FN_COUNT {
+                for g in 0..FN_COUNT {
+                    if FNS[g].tmpl == f + 1 && FNS[g].ret > 0 {
+                        // (an instance's: an owner's methods are the same)
+                        let r = of_type(FNS[g].ret);
+                        if item_of_type(r.t) >= 0 || deref(r.t) > 0 {
+                            return r;
+                        }
+                    }
+                }
+            }
+            let owner = if DEFS[d].parent >= 0 { DEFS[d].parent }
+                else if DEFS[d].owner >= 0 { DEF_BY_FQN.get(DEFS[d].owner + 1) - 1 } else { -1 };
+            return type_from_text(result_text(d), def_ref(owner));
+        }
+        if k == K_CONST || k == K_STATIC {
+            let node = DEFS[d].node;
+            if k == K_STATIC {
+                for i in 0..STATIC_COUNT {
+                    if STATICS[i].node == node && STATICS[i].ty > 0 {
+                        return of_type(STATICS[i].ty);
+                    }
+                }
+            } else {
+                for i in 0..CONST_COUNT {
+                    if CONSTS[i].node == node && CONSTS[i].ty > 0 {
+                        return of_type(CONSTS[i].ty);
+                    }
+                }
+            }
+            let ty = NODES[node].ty;
+            if ty > 0 {
+                return of_type(ty);
+            }
+            return type_from_text(field_text(d), no_type());
+        }
+        if k == K_VARIANT {
+            return TyRef { t: 0, d: DEFS[d].parent, slice: false, arg: 0 };
+        }
+        if k == K_STRUCT || k == K_ENUM {
+            return TyRef { t: 0, d: d, slice: false, arg: 0 };
+        }
+        no_type()
+    }
+}
+
+// The type of the expression of tokens a..=b, as far as it can be told.
+fn expr_type(a: i64, b: i64, depth: i64) -> TyRef {
+    unsafe {
+        if a > b || depth > 8 {
+            return no_type();
+        }
+        // (the program's own node there, when the edit left it as it was)
+        let oa = old_pos(TS.data[a]);
+        let ob = old_pos(TE.data[b] - 1);
+        if oa >= 0 && ob >= 0 {
+            let t = typed_at(oa, ob + 1);
+            if t > 0 {
+                return of_type(t);
+            }
+        }
+        var i = a;
+        var r = no_type();
+        while i <= b && (tok_is(i, "&") || tok_is(i, "*") || tok_is(i, "-") || tok_is(i, "!")) {
+            i += 1;
+        }
+        if i > b {
+            return r;
+        }
+        if tok_is(i, "(") {
+            let m = match_fwd(i, b + 1);
+            r = expr_type(i + 1, m - 1, depth + 1);
+            i = m + 1;
+        } else if TK.data[i] == T_STR {
+            r = if STR_TYPE > 0 { of_type(STR_TYPE) } else { no_type() };
+            i += 1;
+        } else if TK.data[i] == T_NUM {
+            r = of_type(TY_I64);
+            i += 1;
+        } else if TK.data[i] == T_ID {
+            let e = path_end(i, b);
+            if e + 1 <= b && tok_is(e + 1, "(") {
+                let d = path_def(i, e);
+                if d >= 0 {
+                    r = value_type(d);
+                }
+                i = match_fwd(e + 1, b + 1) + 1;
+            } else if e + 1 <= b && tok_is(e + 1, "{") {
+                r = TyRef { t: 0, d: type_def_named(tok_text(e)), slice: false, arg: 0 };
+                i = match_fwd(e + 1, b + 1) + 1;
+            } else if e == i {
+                r = name_type(tok_text(i), i, depth);
+                i += 1;
+            } else {
+                let d = path_def(i, e);
+                if d >= 0 {
+                    r = value_type(d);
+                }
+                i = e + 1;
+            }
+        } else {
+            return no_type();
+        }
+        while i <= b && known(r) {
+            if tok_is(i, ".") && i + 1 <= b {
+                let name = tok_text(i + 1);
+                var j = i + 2;
+                if j + 1 <= b && tok_is(j, "::") && tok_is(j + 1, "<") {
+                    j = until_stop(j + 2, b + 1, [">"], true) + 1;
+                }
+                if j <= b && tok_is(j, "(") {
+                    r = method_result(r, name);
+                    i = match_fwd(j, b + 1) + 1;
+                } else {
+                    r = field_result(r, name);
+                    i += 2;
+                }
+            } else if tok_is(i, "[") {
+                r = element_of(r);
+                i = match_fwd(i, b + 1) + 1;
+            } else if tok_is(i, "?") {
+                r = unwrapped(r);
+                i += 1;
+            } else if tok_is(i, "as") && i + 1 <= b {
+                r = type_from_text(TX[TS.data[i + 1]..TE.data[b]], self_ref());
+                i = b + 1;
+            } else {
+                break;
+            }
+        }
+        r
+    }
+}
+
+// The type of the program's expression from old position a to b (a node
+// spanning exactly that), or 0.
+fn typed_at(a: i64, b: i64) -> i64 {
+    unsafe {
+        if !SPANS_INDEXED {
+            for n in 1..crate::front::ast::NODE_COUNT {
+                let k = NODES[n].kind;
+                if NODES[n].ty > 0 && NODES[n].end > NODES[n].start
+                    && NODES[n].end - NODES[n].start < 1048576
+                    && (k == NodeKind::Ident || k == NodeKind::FieldAccess || k == NodeKind::Call
+                        || k == NodeKind::MethodCall || k == NodeKind::Index
+                        || k == NodeKind::Str) {
+                    let key = span_key(NODES[n].start, NODES[n].end);
+                    if SPANS.get(key) == 0 {
+                        SPANS.put(key, NODES[n].ty);
+                    }
+                }
+            }
+            SPANS_INDEXED = true;
+        }
+        if b <= a || b - a >= 1048576 {
+            return 0;
+        }
+        SPANS.get(span_key(a, b))
+    }
+}
+
+// The typed expressions' types by their spans (span_key), made once.
+static var SPANS: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var SPANS_INDEXED: bool = false;
+
+fn span_key(a: i64, b: i64) -> i64 {
+    a * 1048576 + (b - a) + 1
+}
+
+// Whether no line break is between tokens i and j (i before j): `v.` at
+// the end of a line is the line's own (what is typed), not the start of
+// the next one's chain.
+fn same_line(i: i64, j: i64) -> bool {
+    unsafe {
+        for p in TE.data[i]..TS.data[j] {
+            if TX[p] == '\n' {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// The start of the expression ending at token e (`a.b(c)[d]`), walking
+// back over its parts.
+fn expr_start(e: i64) -> i64 {
+    var i = e;
+    loop {
+        if i < 0 {
+            return 0;
+        }
+        if tok_is(i, "?") {
+            i -= 1;
+            continue;
+        }
+        if tok_is(i, ")") || tok_is(i, "]") || tok_is(i, "}") {
+            let j = match_back(i);
+            if j < 0 {
+                return i + 1;
+            }
+            if j > 0 && (is_ident(j - 1) && !is_keyword(tok_text(j - 1)) || tok_is(j - 1, ")")
+                || tok_is(j - 1, "]") || tok_is(j - 1, ">") || tok_is(j - 1, "?")) {
+                if tok_is(i, "}") && !is_ident(j - 1) {
+                    return j + 1;
+                }
+                i = j - 1;
+                continue;
+            }
+            return j;
+        }
+        if tok_is(i, ">") {
+            // `::<T>` of a call
+            let j = match_angle_back(i);
+            if j > 0 && tok_is(j - 1, "::") {
+                i = j - 2;
+                continue;
+            }
+            return i + 1;
+        }
+        if unsafe { TK.data[i] } == T_ID || unsafe { TK.data[i] } == T_STR
+            || unsafe { TK.data[i] } == T_NUM {
+            if i >= 2 && (tok_is(i - 1, ".") || tok_is(i - 1, "::")) && same_line(i - 1, i) {
+                i -= 2;
+                continue;
+            }
+            return i;
+        }
+        return i + 1;
+    }
+}
+
+// ---- imports (the text's `use` lines)
+
+// Each name the text imports: its token, the token of the path's first
+// name and the token of its last (`use a::b::{c as d}`: d, a, c).
+static var U_NAME: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var U_FIRST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var U_LAST: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// Each `{` of a use: the token of its path's first name (base), for
+// the names after it.
+static var U_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+fn scan_uses() {
+    unsafe {
+        U_NAME.count = 0;
+        U_FIRST.count = 0;
+        U_LAST.count = 0;
+        U_DEF.count = 0;
+        var depth = 0;
+        var i = 0;
+        while i < TK.count {
+            if tok_is(i, "{") {
+                depth += 1;
+            } else if tok_is(i, "}") {
+                depth -= 1;
+            } else if depth == 0 && tok_is(i, "use") {
+                let e = until_stop(i + 1, TK.count, [";"], false);
+                use_tree(i + 1, e, i + 1);
+                i = e;
+            }
+            i += 1;
+        }
+        for k in 0..U_NAME.count {
+            U_DEF.push(use_def(k));
+        }
+    }
+}
+
+// The names of the use tree of tokens a..e (the path from `first`).
+fn use_tree(a: i64, e: i64, first: i64) {
+    unsafe {
+        var i = a;
+        while i < e {
+            if tok_is(i, "{") {
+                let close = match_fwd(i, e);
+                var p = i + 1;
+                while p < close {
+                    let q = until_stop(p, close, [","], false);
+                    use_tree(p, q, first);
+                    p = q + 1;
+                }
+                return;
+            }
+            if is_ident(i) && !tok_is(i + 1, "::") {
+                var name = i;
+                if tok_is(i + 1, "as") && is_ident(i + 2) {
+                    name = i + 2;
+                }
+                U_NAME.push(name);
+                U_FIRST.push(first);
+                U_LAST.push(i);
+                return;
+            }
+            i += 1;
+        }
+    }
+}
+
+// The definition import k names, or -1: its path's names, from the
+// module the path starts at.
+fn use_def(k: i64) -> i64 {
+    unsafe {
+        let last = U_LAST.data[k];
+        let sym = find_sym(tok_text(last));
+        if sym < 0 {
+            return -1;
+        }
+        let prev = last - 2;
+        if last <= U_FIRST.data[k] {
+            return -1;
+        }
+        // the path's module: its tokens before the last name, skipping a
+        // `{` and the names inside it before ours
+        let m = path_module_tokens(U_FIRST.data[k], last);
+        if m < 0 {
+            if !tok_is(last - 1, "::") {
+                return -1;
+            }
+            // `use a::Type::Variant`, `use a::Trait::f`
+            let td = type_def_named(tok_text(prev));
+            if td >= 0 {
+                for d in 0..DEF_COUNT {
+                    if DEFS[d].parent == td && DEFS[d].name == sym {
+                        return d;
+                    }
+                }
+            }
+            return -1;
+        }
+        for d in 0..DEF_COUNT {
+            if DEFS[d].name == sym && DEFS[d].module == m && DEFS[d].parent < 0
+                && DEFS[d].kind != K_METHOD && DEFS[d].kind != K_IMPL_METHOD {
+                return d;
+            }
+        }
+        -1
+    }
+}
+
+// The module the names of a use path from `first` up to (not with) the
+// token `last` lead to (the names of a `{..}` the path is in skipped), or
+// -1.
+fn path_module_tokens(first: i64, last: i64) -> i64 {
+    unsafe {
+        var segs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var i = first;
+        while i < last {
+            if is_ident(i) && tok_is(i + 1, "::") {
+                segs.push(i);
+                i += 2;
+            } else if tok_is(i, "{") {
+                i += 1;
+            } else {
+                // a sibling's name in the braces: its own path, not ours
+                let e = until_stop(i, last, [","], false);
+                if e >= last {
+                    break;
+                }
+                i = e + 1;
+            }
+        }
+        modules_of(segs)
+    }
+}
+
+// The module of the path of tokens i..=e (all names), or -1.
+fn path_module(i: i64, e: i64) -> i64 {
+    var segs = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+    var j = i;
+    while j <= e {
+        if is_ident(j) {
+            segs.push(j);
+        }
+        j += 1;
+    }
+    modules_of(segs)
+}
+
+// The module the names (tokens) lead to: `crate`, `std`, `self`,
+// `super`, a child of the module, of its parent, of the root, of std.
+fn modules_of(segs: IntVec) -> i64 {
+    unsafe {
+        if segs.count == 0 {
+            return -1;
+        }
+        let first = tok_text(segs.data[0]);
+        var m = -1;
+        var k = 1;
+        if first == "crate" {
+            m = 0;
+        } else if first == "std" {
+            m = STD_MODULE;
+        } else if first == "self" {
+            m = MODULE;
+        } else if first == "super" {
+            m = if MODULE > 0 { MODULES[MODULE].parent } else { 0 };
+        } else {
+            k = 0;
+            let sym = find_sym(first);
+            if sym < 0 {
+                return -1;
+            }
+            m = child_module(MODULE, sym);
+            if m < 0 && MODULE > 0 {
+                m = child_module(MODULES[MODULE].parent, sym);
+            }
+            if m < 0 {
+                m = child_module(0, sym);
+            }
+            if m < 0 && STD_MODULE >= 0 {
+                m = child_module(STD_MODULE, sym);
+            }
+            if m < 0 {
+                // an imported module (`use std::collections; collections::`)
+                for u in 0..U_NAME.count {
+                    if tok_text(U_NAME.data[u]) == first && U_DEF.data[u] >= 0
+                        && DEFS[U_DEF.data[u]].kind == K_MOD {
+                        let d = U_DEF.data[u];
+                        m = child_module(DEFS[d].module, DEFS[d].name);
+                    }
+                }
+            }
+            if m < 0 {
+                return -1;
+            }
+            k = 1;
+        }
+        while k < segs.count && m >= 0 {
+            let sym = find_sym(tok_text(segs.data[k]));
+            if tok_text(segs.data[k]) == "super" {
+                m = MODULES[m].parent;
+            } else {
+                m = if sym < 0 { -1 } else { child_module(m, sym) };
+            }
+            k += 1;
+        }
+        m
+    }
+}
+
+// Whether definition d is a name the text imports.
+fn imported_as(d: i64) -> bool {
+    unsafe {
+        for u in 0..U_DEF.count {
+            if U_DEF.data[u] == d {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// ---- the items
+
+// The items: the answer, the labels given (a hash of each), whether the
+// list was cut; what is typed (the prefix) and what the place expects.
+static var OUT: i64 = -1;
+static var SEEN: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var ITEMS: i64 = 0;
+static var CUT: bool = false;
+static var PREFIX: [u8] = "";
+static var EXPECT: i64 = 0;
+static var EXPECT_D: i64 = -1;
+static var SNIPPETS: bool = false;
+// The token after the cursor's name is `(`: no parentheses inserted.
+static var CALL_FOLLOWS: bool = false;
+const ITEMS_MAX: i64 = 400;
+
+fn lower(c: u8) -> u8 {
+    if c >= 'A' && c <= 'Z' { c + 32 as u8 } else { c }
+}
+
+// How label matches the prefix: 0 it starts with it, 1 so case ignored,
+// 2 its letters in order, -1 not.
+fn match_rank(label: [u8]) -> i64 {
+    unsafe {
+        let p = PREFIX;
+        if p.len == 0 {
+            return 0;
+        }
+        if label.len >= p.len && label[0..p.len] == p {
+            return 0;
+        }
+        var ci = label.len >= p.len;
+        if ci {
+            for i in 0..p.len {
+                if lower(label[i]) != lower(p[i]) {
+                    ci = false;
+                }
+            }
+        }
+        if ci {
+            return 1;
+        }
+        var j = 0;
+        for i in 0..label.len {
+            if j < p.len && lower(label[i]) == lower(p[j]) {
+                j += 1;
+            }
+        }
+        if j == p.len && lower(label[0]) == lower(p[0]) { 2 } else { -1 }
+    }
+}
+
+fn label_hash(s: [u8]) -> i64 {
+    var h = 1469598103934665603 as u64;
+    for i in 0..s.len {
+        h = (h ^ s[i] as u64) * 1099511628211 as u64;
+    }
+    ((h >> 2) as i64) + 1
+}
+
+// Adds an item: its label, LSP kind, detail, group (lower first), the
+// definition (-1: none), what to insert (empty: the label; snippet: a
+// snippet), whether its type is the one expected.
+fn add_item(label: [u8], kind: i64, detail: [u8], group: i64, d: i64, insert: [u8],
+    snippet: bool, expected: bool) {
+    unsafe {
+        if label.len == 0 {
+            return;
+        }
+        let rank = match_rank(label);
+        if rank < 0 {
+            return;
+        }
+        let h = label_hash(label);
+        if SEEN.get(h) != 0 {
+            return;
+        }
+        SEEN.put(h, 1);
+        if ITEMS >= ITEMS_MAX {
+            CUT = true;
+            return;
+        }
+        if ITEMS > 0 {
+            buf_byte(OUT, ',');
+        }
+        ITEMS += 1;
+        buf_str(OUT, c"{\"label\":");
+        buf_json_str(OUT, label);
+        buf_fmt(OUT, f",\"kind\":{kind}");
+        if detail.len > 0 {
+            buf_str(OUT, c",\"detail\":");
+            buf_json_str(OUT, if detail.len > 160 { detail[0..160] } else { detail });
+        }
+        let g = if expected { 0 } else { group };
+        buf_fmt(OUT, f",\"sortText\":\"{rank}{g}");
+        // (the label's own order after: JSON-safe, it is a name)
+        for i in 0..label.len {
+            if label[i] != '"' && label[i] != '\\' {
+                buf_byte(OUT, label[i]);
+            }
+        }
+        buf_byte(OUT, '"');
+        if insert.len > 0 {
+            buf_str(OUT, c",\"insertText\":");
+            buf_json_str(OUT, insert);
+            if snippet {
+                buf_str(OUT, c",\"insertTextFormat\":2");
+            }
+        }
+        if d >= 0 && DEFS[d].fqn >= 0 {
+            // (by its path, not its index: the same in every worker)
+            buf_str(OUT, c",\"data\":{\"p\":");
+            buf_json_str(OUT, SYMS[DEFS[d].fqn].text);
+            buf_str(OUT, c"}");
+        }
+        buf_byte(OUT, '}');
+    }
+}
+
+// The LSP kind of definition d.
+fn item_kind(d: i64) -> i64 {
+    unsafe {
+        let k = DEFS[d].kind;
+        if k == K_FN { 3 }
+        else if k == K_METHOD || k == K_IMPL_METHOD || k == K_TRAIT_FN {
+            if has_self(d) { 2 } else { 3 }
+        }
+        else if k == K_STRUCT || k == K_ALIAS { 22 }
+        else if k == K_ENUM { 13 }
+        else if k == K_VARIANT { 20 }
+        else if k == K_FIELD { 5 }
+        else if k == K_TRAIT { 8 }
+        else if k == K_CONST { 21 }
+        else if k == K_STATIC { 6 }
+        else if k == K_MOD { 9 } else { 1 }
+    }
+}
+
+fn is_fn_def(d: i64) -> bool {
+    unsafe {
+        let k = DEFS[d].kind;
+        k == K_FN || k == K_METHOD || k == K_IMPL_METHOD || k == K_TRAIT_FN
+    }
+}
+
+// Whether function definition d takes `self`.
+fn has_self(d: i64) -> bool {
+    unsafe {
+        let n = DEFS[d].node;
+        NODES[n].kind == NodeKind::Fn && NODES[n].count > 0
+            && NODES[child(n, 0)].kind == NodeKind::Param && NODES[child(n, 0)].a == SELF_SYM
+    }
+}
+
+// The snippet calling function definition d: `name(${1:a}, ${2:b})`
+// (without `self`), or empty.
+fn call_snippet(d: i64) -> [u8] {
+    unsafe {
+        if !SNIPPETS || CALL_FOLLOWS || !is_fn_def(d) {
+            return "";
+        }
+        let n = DEFS[d].node;
+        let b = buf_new();
+        buf_bytes(b, SYMS[DEFS[d].name].text);
+        buf_byte(b, '(');
+        var k = 0;
+        for i in 0..NODES[n].count {
+            let p = child(n, i);
+            if NODES[p].kind != NodeKind::Param {
+                break;
+            }
+            if NODES[p].a == SELF_SYM {
+                continue;
+            }
+            if k > 0 {
+                buf_str(b, c", ");
+            }
+            k += 1;
+            buf_fmt(b, f"${{{k}:");
+            buf_bytes(b, SYMS[NODES[p].a].text);
+            buf_byte(b, '}');
+        }
+        buf_str(b, c")$0");
+        buf_slice(b)
+    }
+}
+
+// Whether the type of a value of definition d is the expected one.
+fn expected_def(d: i64) -> bool {
+    unsafe {
+        if EXPECT <= 0 && EXPECT_D < 0 {
+            return false;
+        }
+        let k = DEFS[d].kind;
+        if !(is_fn_def(d) || k == K_CONST || k == K_STATIC || k == K_VARIANT) {
+            return false;
+        }
+        same_type(value_type(d))
+    }
+}
+
+fn same_type(r: TyRef) -> bool {
+    unsafe {
+        if EXPECT > 0 && r.t > 0 {
+            return deref(r.t) == deref(EXPECT)
+                || item_of_type(r.t) >= 0 && item_of_type(r.t) == item_of_type(EXPECT);
+        }
+        let d = if r.t > 0 { item_of_type(r.t) } else { r.d };
+        d >= 0 && (d == EXPECT_D || EXPECT > 0 && d == item_of_type(EXPECT))
+    }
+}
+
+// The item of definition d (its signature the detail).
+fn add_def(d: i64, group: i64) {
+    unsafe {
+        let label = SYMS[DEFS[d].name].text;
+        if match_rank(label) < 0 {
+            return;
+        }
+        let k = DEFS[d].kind;
+        if !DEFS[d].public && k != K_IMPL_METHOD && k != K_TRAIT_FN && k != K_VARIANT
+            && !sees_inside(DEFS[d].module) {
+            return;
+        }
+        let snip = call_snippet(d);
+        add_item(label, item_kind(d), signature(d), group, d, snip, snip.len > 0, expected_def(d));
+    }
+}
+
+// ---- the contexts
+
+// After `.`: the fields and methods of r.
+fn members(r: TyRef) {
+    unsafe {
+        let t = deref(r.t);
+        if t > 0 && TYPES[t].kind == TyKind::Tuple {
+            for i in 0..TYPES[t].count {
+                let b = buf_new();
+                buf_type(b, type_elem(t, i));
+                let l = buf_new();
+                buf_fmt(l, f"{i}");
+                add_item(buf_slice(l), 5, buf_slice(b), 1, -1, "", false, false);
+            }
+            return;
+        }
+        let od = if t > 0 { item_of_type(t) } else { r.d };
+        // the fields (another module's: its public ones)
+        if od >= 0 && DEFS[od].kind == K_STRUCT {
+            let mine = sees_inside(DEFS[od].module);
+            for d in 0..DEF_COUNT {
+                if DEFS[d].kind == K_FIELD && DEFS[d].parent == od && (mine || DEFS[d].public) {
+                    var detail = signature(d);
+                    let sym = DEFS[d].name;
+                    if t > 0 && TYPES[t].kind == TyKind::Struct {
+                        let i = find_field(TYPES[t].a, sym);
+                        if i >= 0 {
+                            let b = buf_new();
+                            buf_bytes(b, SYMS[sym].text);
+                            buf_str(b, c": ");
+                            buf_type(b, (*struct_field(TYPES[t].a, i)).ty);
+                            detail = buf_slice(b);
+                        }
+                    }
+                    let exp = (EXPECT > 0 || EXPECT_D >= 0)
+                        && same_type(field_result(r, SYMS[sym].text));
+                    add_item(SYMS[sym].text, 5, detail, 1, d, "", false, exp);
+                }
+            }
+        }
+        if od >= 0 {
+            owner_methods(od, 2);
+        }
+        if t > 0 {
+            // the methods the checker knows of t (derived ones too)
+            for i in 0..METHOD_COUNT {
+                if METHODS[i].ty == t {
+                    let d = def_of_node(FNS[METHODS[i].f].node);
+                    if d >= 0 && has_self(d) {
+                        add_def(d, 2);
+                    }
+                }
+            }
+            let k = TYPES[t].kind;
+            if STR_TYPE > 0 && (t == STR_TYPE || is_named(t, "String")) {
+                owner_named("str", 3);
+                if t != STR_TYPE {
+                    let sd = item_of_type(STR_TYPE);
+                    if sd >= 0 {
+                        owner_methods(sd, 3);
+                    }
+                }
+            }
+            if is_named(t, "PathBuf") {
+                let pd = type_def_named("Path");
+                if pd >= 0 {
+                    owner_methods(pd, 3);
+                }
+            }
+            if k == TyKind::Slice || k == TyKind::Array {
+                slice_members();
+            } else if k == TyKind::Prim || k == TyKind::Distinct {
+                let b = buf_new();
+                buf_type(b, t);
+                owner_named(buf_slice(b), 2);
+            }
+        }
+        if r.slice {
+            slice_members();
+        }
+    }
+}
+
+fn slice_members() {
+    unsafe {
+        add_item("len", 2, "fn len(self) -> i64", 1, -1, if SNIPPETS && !CALL_FOLLOWS {
+            "len()$0" } else { "" }, true, false);
+    }
+    owner_named("[T]", 2);
+}
+
+// The methods (with self) of the impl blocks of definition od, and of
+// the traits it implements (their default ones too).
+fn owner_methods(od: i64, group: i64) {
+    unsafe {
+        let owner = DEFS[od].fqn;
+        if owner < 0 {
+            return;
+        }
+        var traits = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for d in 0..DEF_COUNT {
+            let k = DEFS[d].kind;
+            if (k == K_METHOD || k == K_IMPL_METHOD) && DEFS[d].owner == owner {
+                if has_self(d) {
+                    add_def(d, if k == K_METHOD { group } else { group + 1 });
+                }
+                if k == K_IMPL_METHOD && DEFS[d].tr >= 0 {
+                    var seen = false;
+                    for j in 0..traits.count {
+                        if traits.data[j] == DEFS[d].tr {
+                            seen = true;
+                        }
+                    }
+                    if !seen {
+                        traits.push(DEFS[d].tr);
+                    }
+                }
+            }
+        }
+        if DEFS[od].kind == K_TRAIT {
+            traits.push(DEFS[od].fqn);
+        }
+        for j in 0..traits.count {
+            let td = DEF_BY_FQN.get(traits.data[j] + 1) - 1;
+            if td < 0 {
+                continue;
+            }
+            for d in 0..DEF_COUNT {
+                if DEFS[d].kind == K_TRAIT_FN && DEFS[d].parent == td && has_self(d) {
+                    add_def(d, group + 1);
+                }
+            }
+        }
+    }
+}
+
+// The methods of the impl blocks of a type written `name` (`str`, `[T]`,
+// `i64`: no item of its own).
+fn owner_named(name: [u8], group: i64) {
+    unsafe {
+        let slice = name.len > 0 && name[0] == '[';
+        for d in 0..DEF_COUNT {
+            let k = DEFS[d].kind;
+            if (k == K_METHOD || k == K_IMPL_METHOD) && DEFS[d].owner >= 0 {
+                let o = SYMS[DEFS[d].owner].text;
+                if (o == name || slice && o.len > 0 && o[0] == '[') && has_self(d) {
+                    add_def(d, group);
+                }
+            }
+        }
+    }
+}
+
+// After `path::`: the module's items, the type's variants and functions.
+fn path_items(first: i64, last: i64) {
+    unsafe {
+        // a type (`Vec::`, `Shape::`, `Self::`, `std::Vec::`)
+        var td = -1;
+        let lt = tok_text(last);
+        if lt == "Self" {
+            td = self_def();
+        } else if first == last {
+            td = type_def_named(lt);
+            if td >= 0 && DEFS[td].module != MODULE && !imported_as(td)
+                && !(DEFS[td].public && DEFS[td].module == STD_MODULE) {
+                // (a type's name the module does not see, or a module's)
+                let m = path_module(first, last);
+                if m >= 0 {
+                    td = -1;
+                }
+            }
+        } else {
+            td = path_def(first, last);
+            if td >= 0 && !(DEFS[td].kind == K_STRUCT || DEFS[td].kind == K_ENUM
+                || DEFS[td].kind == K_TRAIT || DEFS[td].kind == K_ALIAS) {
+                td = -1;
+            }
+        }
+        if td >= 0 {
+            let owner = DEFS[td].fqn;
+            for d in 0..DEF_COUNT {
+                let k = DEFS[d].kind;
+                if k == K_VARIANT && DEFS[d].parent == td {
+                    add_def(d, 1);
+                } else if (k == K_METHOD || k == K_IMPL_METHOD) && DEFS[d].owner == owner {
+                    add_def(d, if has_self(d) { 3 } else { 2 });
+                } else if k == K_TRAIT_FN && DEFS[d].parent == td {
+                    add_def(d, 2);
+                }
+            }
+            return;
+        }
+        let m = path_module(first, last);
+        if m >= 0 {
+            module_items(m, 2);
+        }
+    }
+}
+
+// Whether the cursor's module is m or one inside it (it sees m's private
+// items).
+fn sees_inside(m: i64) -> bool {
+    unsafe {
+        var c = MODULE;
+        var n = 0;
+        while c >= 0 && n < 64 {
+            if c == m {
+                return true;
+            }
+            if c == 0 {
+                break;
+            }
+            c = MODULES[c].parent;
+            n += 1;
+        }
+        false
+    }
+}
+
+// The items of module m (its public ones, unless the cursor is in it or
+// in one inside it).
+fn module_items(m: i64, group: i64) {
+    unsafe {
+        let inside = sees_inside(m);
+        for d in 0..DEF_COUNT {
+            let k = DEFS[d].kind;
+            if DEFS[d].module == m && DEFS[d].parent < 0 && k != K_METHOD && k != K_IMPL_METHOD
+                && k != K_FIELD && (inside || DEFS[d].public) {
+                add_def(d, group);
+            }
+        }
+        // (the modules std's root declares, which have no `mod` item of
+        // the program when std is one text)
+        for c2 in 1..module_count() {
+            if MODULES[c2].parent == m && (inside || MODULES[c2].public) {
+                add_item(SYMS[MODULES[c2].name].text, 9, mod_detail(c2), group, -1, "", false,
+                    false);
+            }
+        }
+    }
+}
+
+fn mod_detail(m: i64) -> [u8] {
+    let b = buf_new();
+    buf_str(b, c"mod ");
+    unsafe { buf_bytes(b, SYMS[mod_fqn(m)].text) };
+    buf_slice(b)
+}
+
+// After `use ` (or `use a::{`): the roots of paths.
+fn path_roots() {
+    unsafe {
+        add_item("crate", 9, "the program's root module", 4, -1, "", false, false);
+        add_item("std", 9, "the standard library", 4, -1, "", false, false);
+        add_item("self", 9, "this module", 4, -1, "", false, false);
+        add_item("super", 9, "the module this one is in", 4, -1, "", false, false);
+        for c in 1..module_count() {
+            if MODULES[c].parent == MODULE
+                || MODULE > 0 && MODULES[c].parent == MODULES[MODULE].parent {
+                add_item(SYMS[MODULES[c].name].text, 9, mod_detail(c), 2, -1, "", false, false);
+            }
+        }
+    }
+}
+
+// A name: the locals, the module's items, its imports, the prelude, the
+// keywords and snippets.
+fn names() {
+    unsafe {
+        // the locals, innermost first
+        var b = B_NAME.count - 1;
+        while b >= 0 {
+            let name = tok_text(B_NAME.data[b]);
+            if TS.data[B_NAME.data[b]] < CUR && match_rank(name) >= 0 {
+                let r = binding_type(b, 0);
+                let detail = buf_new();
+                if r.t > 0 {
+                    buf_type(detail, r.t);
+                } else if r.d >= 0 {
+                    buf_bytes(detail, SYMS[DEFS[r.d].name].text);
+                } else if B_ANN.data[b] >= 0 && B_ANN_END.data[b] > B_ANN.data[b] {
+                    buf_bytes(detail, TX[TS.data[B_ANN.data[b]]..TE.data[B_ANN_END.data[b] - 1]]);
+                }
+                add_item(name, 6, buf_slice(detail), 1, -1, "", false,
+                    known(r) && same_type(r));
+            }
+            b -= 1;
+        }
+        if HAVE_PROGRAM && FILE >= 0 {
+            module_items(MODULE, 2);
+        }
+        if HAVE_PROGRAM {
+            // the imports
+            for u in 0..U_NAME.count {
+                let d = U_DEF.data[u];
+                let name = tok_text(U_NAME.data[u]);
+                if d >= 0 {
+                    let snip = call_snippet(d);
+                    add_item(name, item_kind(d), signature(d), 3, d, snip, snip.len > 0,
+                        expected_def(d));
+                } else {
+                    add_item(name, 18, "", 3, -1, "", false, false);
+                }
+            }
+            // the prelude
+            for k in 0..PRELUDE_COUNT {
+                let sym = prelude_name(k);
+                let d = prelude_def_at(k);
+                if d >= 0 && DEFS[d].name != sym {
+                    // (`panic`: std's panic_str)
+                    add_item(SYMS[sym].text, item_kind(d), signature(d), 4, d, call_snippet(d),
+                        call_snippet(d).len > 0, false);
+                } else if d >= 0 {
+                    add_def(d, 4);
+                } else {
+                    add_item(SYMS[sym].text, 3, "", 4, -1, "", false, false);
+                }
+            }
+        }
+        keywords();
+    }
+}
+
+// The prelude's definitions (k -> definition + 1), made once.
+static var PRELUDE_DEFS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// The definition in std of the prelude's name k, or -1.
+fn prelude_def_at(k: i64) -> i64 {
+    unsafe {
+        if PRELUDE_DEFS.count == 0 {
+            for j in 0..PRELUDE_COUNT {
+                let sym = prelude_name(j);
+                var d = -1;
+                if SYMS[sym].text == "panic" {
+                    let ps = find_sym("panic_str");
+                    if ps >= 0 {
+                        d = prelude_def(ps);
+                    }
+                }
+                if d < 0 {
+                    d = prelude_def(sym);
+                }
+                PRELUDE_DEFS.push(d + 1);
+            }
+        }
+        PRELUDE_DEFS.data[k] - 1
+    }
+}
+
+// The definition in std of prelude name sym.
+fn prelude_def(sym: i64) -> i64 {
+    unsafe {
+        var best = -1;
+        for d in 0..DEF_COUNT {
+            if DEFS[d].name == sym && DEFS[d].public && in_std(DEFS[d].module)
+                && (DEFS[d].parent < 0 || DEFS[d].kind == K_VARIANT)
+                && DEFS[d].kind != K_METHOD && DEFS[d].kind != K_IMPL_METHOD {
+                if best < 0 || DEFS[d].module == STD_MODULE && DEFS[best].module != STD_MODULE {
+                    best = d;
+                }
+            }
+        }
+        best
+    }
+}
+
+fn keywords() {
+    unsafe {
+        let snips: [[u8]; 13] = ["fn", "if", "for", "while", "loop", "match", "struct", "enum",
+            "impl", "trait", "let", "var", "test"];
+        let bodies: [[u8]; 13] = ["fn ${1:name}(${2}) {\n\t$0\n}", "if ${1:condition} {\n\t$0\n}",
+            "for ${1:x} in ${2:iter} {\n\t$0\n}", "while ${1:condition} {\n\t$0\n}",
+            "loop {\n\t$0\n}", "match ${1:value} {\n\t${2:pattern} => $0,\n}",
+            "struct ${1:Name} {\n\t${2:field}: ${3:i64},\n}",
+            "enum ${1:Name} {\n\t${2:Variant},\n}", "impl ${1:Type} {\n\t$0\n}",
+            "trait ${1:Name} {\n\t$0\n}", "let ${1:name} = $0;", "var ${1:name} = $0;",
+            "#[test]\nfn ${1:name}() {\n\t$0\n}"];
+        let details: [[u8]; 13] = ["fn name(..) { .. }", "if cond { .. }", "for x in iter { .. }",
+            "while cond { .. }", "loop { .. }", "match value { pattern => .. }",
+            "struct Name { field: T }", "enum Name { Variant }", "impl Type { .. }",
+            "trait Name { .. }", "let name = value;", "var name = value;",
+            "#[test] fn name() { .. }"];
+        if SNIPPETS {
+            for i in 0..13 {
+                add_item(snips[i], 15, details[i], 6, -1, bodies[i], true, false);
+            }
+        }
+        for i in 0..36 {
+            add_item(KEYWORDS[i], 14, "", 5, -1, "", false, false);
+        }
+        add_item("crate", 14, "", 5, -1, "", false, false);
+        add_item("super", 14, "", 5, -1, "", false, false);
+        add_item("mut", 14, "", 5, -1, "", false, false);
+    }
+}
+
+// What the place before token i expects: `let x: T = `, `x = ` of a
+// known x, `return ` (the function's result). EXPECT, EXPECT_D.
+fn find_expected(i: i64) {
+    unsafe {
+        EXPECT = 0;
+        EXPECT_D = -1;
+        if i < 0 || !HAVE_PROGRAM {
+            return;
+        }
+        var r = no_type();
+        if tok_is(i, "=") {
+            // `let name: T =`, `name =`
+            if tok_is(i - 1, ">") || is_ident(i - 1) || tok_is(i - 1, "]") {
+                var c = i - 1;
+                var nest = 0;
+                while c > 0 && !(nest == 0 && (tok_is(c, ":") || tok_is(c, ";") || tok_is(c, "{")
+                    || tok_is(c, "}") || tok_is(c, "let") || tok_is(c, "var"))) {
+                    if tok_is(c, ">") || tok_is(c, "]") {
+                        nest += 1;
+                    } else if tok_is(c, "<") || tok_is(c, "[") {
+                        nest -= 1;
+                    }
+                    c -= 1;
+                }
+                if tok_is(c, ":") {
+                    r = type_from_text(TX[TS.data[c + 1]..TE.data[i - 1]], self_ref());
+                } else if is_ident(i - 1) && (tok_is(i - 2, ";") || tok_is(i - 2, "{")
+                    || tok_is(i - 2, "}")) {
+                    r = name_type(tok_text(i - 1), i - 1, 0);
+                }
+            }
+        } else if tok_is(i, "return") && F_RET.count > 0 {
+            let a = F_RET.data[F_RET.count - 1];
+            let e = F_RET_END.data[F_RET_END.count - 1];
+            if a >= 0 && e > a {
+                r = type_from_text(TX[TS.data[a]..TE.data[e - 1]], self_ref());
+            }
+        }
+        EXPECT = r.t;
+        EXPECT_D = r.d;
+    }
+}
+
+// ---- the request
+
+// The text and the cursor read: its tokens (TK..), the program's file
+// compared with it, the cursor's module, the tokens before it (NT).
+fn read_text(f: i64, text: [u8], line: i64, ch: i64, utf8: bool, have_program: bool) {
+    unsafe {
+        let p = text.ptr;
+        TX = p[0..text.len];
+        CUR = text_offset(text, line, ch, utf8);
+        HAVE_PROGRAM = have_program;
+        FILE = if have_program { f } else { -1 };
+        TK.count = 0;
+        TS.count = 0;
+        TE.count = 0;
+        IN_TEXT = false;
+        lex_code(0, false);
+        if have_program {
+            index_defs();
+        }
+        compare_with_program();
+        MODULE = if FILE >= 0 { module_at(near_old_pos(CUR)) } else { 0 };
+        if MODULE < 0 {
+            MODULE = 0;
+        }
+        NT = 0;
+        while NT < TK.count && TS.data[NT] < CUR {
+            NT += 1;
+        }
+    }
+}
+
+// The completion list for the text at (line, ch), into out: the
+// program's file f (-1: none), its own text; utf8: the position encoding;
+// snippets: the client takes them.
+pub fn put_completion(out: i64, f: i64, text: [u8], line: i64, ch: i64, utf8: bool,
+    have_program: bool, snippets: bool) {
+    unsafe {
+        OUT = out;
+        SEEN.clear();
+        ITEMS = 0;
+        CUT = false;
+        SNIPPETS = snippets;
+        read_text(f, text, line, ch, utf8, have_program);
+        buf_str(out, c"{\"isIncomplete\":");
+        let mark = buf_slice(out).len;
+        buf_str(out, c"false,\"items\":[");
+        if IN_TEXT {
+            buf_str(out, c"]}");
+            return;
+        }
+        var pt = NT - 1;
+        PREFIX = TX[CUR..CUR];
+        if pt >= 0 && TK.data[pt] == T_ID && TE.data[pt] >= CUR {
+            PREFIX = TX[TS.data[pt]..CUR];
+            pt -= 1;
+        }
+        // (a word right after the cursor: the snippet leaves its `(` be)
+        var after = CUR;
+        while after < TX.len && is_id(TX[after]) {
+            after += 1;
+        }
+        while after < TX.len && (TX[after] == ' ') {
+            after += 1;
+        }
+        CALL_FOLLOWS = after < TX.len && TX[after] == '(';
+        scan_bindings();
+        scan_uses();
+        if pt >= 0 && tok_is(pt, ".") && pt > 0 {
+            // a member
+            let s = expr_start(pt - 1);
+            find_expected(s - 1);
+            let r = if have_program { expr_type(s, pt - 1, 0) } else { no_type() };
+            members(r);
+        } else if pt >= 1 && tok_is(pt, "::") && is_ident(pt - 1) {
+            // a path's item
+            var first = pt - 1;
+            while first >= 2 && tok_is(first - 1, "::") && is_ident(first - 2)
+                && same_line(first - 1, first) {
+                first -= 2;
+            }
+            if have_program {
+                path_items(first, pt - 1);
+            }
+        } else if pt >= 0 && in_use_path(pt) >= 0 {
+            // `use a::b::{c, |`: a's b's items
+            let open = in_use_path(pt);
+            if have_program {
+                var first = open - 2;
+                while first >= 2 && tok_is(first - 1, "::") && is_ident(first - 2) {
+                    first -= 2;
+                }
+                path_items(first, open - 2);
+            }
+        } else if pt >= 0 && (tok_is(pt, "fn") || tok_is(pt, "struct") || tok_is(pt, "enum")
+            || tok_is(pt, "trait") || tok_is(pt, "mod") || tok_is(pt, "let") || tok_is(pt, "var")
+            || tok_is(pt, "type") || tok_is(pt, "const") || tok_is(pt, "static")) {
+            // (a new name: nothing to complete)
+        } else if pt >= 0 && tok_is(pt, "use") {
+            path_roots();
+        } else {
+            find_expected(pt);
+            names();
+        }
+        buf_str(out, c"]}");
+        if CUT {
+            // (`true,` in place of `false,`: one byte shorter, padded)
+            let b = buf_slice(out);
+            let q = b.ptr;
+            q[mark] = 't';
+            q[mark + 1] = 'r';
+            q[mark + 2] = 'u';
+            q[mark + 3] = 'e';
+            q[mark + 4] = ' ';
+        }
+    }
+}
+
+// In `use a::b::{c, ` at token pt (a `{` or a `,` in it): the `{`'s
+// index; -1 when pt is not in such braces.
+fn in_use_path(pt: i64) -> i64 {
+    unsafe {
+        if !(tok_is(pt, "{") || tok_is(pt, ",")) {
+            return -1;
+        }
+        // back to the `{` (over names and commas)
+        var i = pt;
+        while i >= 0 && !tok_is(i, "{") {
+            if !(is_ident(i) || tok_is(i, ",") || tok_is(i, "::") || tok_is(i, "as")) {
+                return -1;
+            }
+            i -= 1;
+        }
+        if i < 2 || !tok_is(i - 1, "::") {
+            return -1;
+        }
+        // the path before it, back to `use`
+        var j = i - 2;
+        while j >= 0 && (is_ident(j) && !tok_is(j, "use") || tok_is(j, "::")) {
+            j -= 1;
+        }
+        if j < 0 || !tok_is(j, "use") {
+            return -1;
+        }
+        i
+    }
+}
+
+// The definition whose path is `path` (an item's data), or -1.
+pub fn def_by_path(path: [u8]) -> i64 {
+    unsafe {
+        index_defs();
+        let sym = find_sym(path);
+        if sym < 0 { -1 } else { DEF_BY_FQN.get(sym + 1) - 1 }
+    }
+}
+
+// completionItem/resolve: item (its JSON) with its definition's hover as
+// its documentation, into out; doc: answer.vl's hover_def of it.
+pub fn put_resolved(out: i64, item: [u8], d: i64, doc: [u8]) {
+    var end = item.len;
+    while end > 0 && item[end - 1] != '}' {
+        end -= 1;
+    }
+    if d < 0 || end == 0 || doc.len == 0 {
+        buf_bytes(out, item);
+        return;
+    }
+    buf_bytes(out, item[0..end - 1]);
+    buf_str(out, c",\"documentation\":{\"kind\":\"markdown\",\"value\":");
+    buf_json_str(out, doc);
+    buf_str(out, c"}}");
+}
+
+// ---- signature help
+
+// The function definition a call's callee of tokens ..=e names: `f`,
+// `a::f`, `x.m` (x's method), or -1.
+fn callee_def(e: i64) -> i64 {
+    unsafe {
+        if !is_ident(e) {
+            return -1;
+        }
+        if e >= 2 && tok_is(e - 1, ".") {
+            let s = expr_start(e - 2);
+            let r = expr_type(s, e - 2, 0);
+            let name = tok_text(e);
+            let t = deref(r.t);
+            let sym = find_sym(name);
+            if t > 0 && sym >= 0 {
+                var f = method_of(t, sym);
+                if f < 0 && STR_TYPE > 0 && is_named(t, "String") {
+                    f = method_of(STR_TYPE, sym);
+                }
+                if f >= 0 {
+                    let d = def_of_node(FNS[f].node);
+                    if d >= 0 {
+                        return d;
+                    }
+                }
+            }
+            return member_fn(r, name);
+        }
+        var s = e;
+        while s >= 2 && tok_is(s - 1, "::") && is_ident(s - 2) {
+            s -= 2;
+        }
+        path_def(s, e)
+    }
+}
+
+// textDocument/signatureHelp (0.25.1): the signature of the call the
+// cursor is in the arguments of, its parameters (their conventions as
+// written: `x: sink T`, `v: inout Vec<i64>`) and the one being typed,
+// into out (`null`: none).
+pub fn put_signature_help(out: i64, f: i64, text: [u8], line: i64, ch: i64, utf8: bool,
+    have_program: bool) {
+    unsafe {
+        read_text(f, text, line, ch, utf8, have_program);
+        if IN_TEXT || !have_program {
+            buf_str(out, c"null");
+            return;
+        }
+        scan_bindings();
+        scan_uses();
+        // the `(` the cursor is in, and the commas before it
+        var depth = 0;
+        var commas = 0;
+        var i = NT - 1;
+        while i >= 0 {
+            let t = tok_text(i);
+            if TK.data[i] == T_P && (t == ")" || t == "]" || t == "}") {
+                depth += 1;
+            } else if TK.data[i] == T_P && (t == "(" || t == "[" || t == "{") {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            } else if depth == 0 && TK.data[i] == T_P && t == "," {
+                commas += 1;
+            } else if depth == 0 && TK.data[i] == T_P && t == ";" {
+                i = -1;
+                break;
+            }
+            i -= 1;
+        }
+        if i < 1 || !tok_is(i, "(") {
+            buf_str(out, c"null");
+            return;
+        }
+        let d = callee_def(i - 1);
+        if d < 0 || !is_fn_def(d) {
+            buf_str(out, c"null");
+            return;
+        }
+        let sig = signature(d);
+        // the parameters: in the signature after its name's `(`
+        let own = SYMS[DEFS[d].name].text;
+        var a = 0;
+        while a + own.len <= sig.len && sig[a..a + own.len] != own {
+            a += 1;
+        }
+        a += own.len;
+        var nest = 0;
+        while a < sig.len && !(sig[a] == '(' && nest == 0) {
+            if sig[a] == '<' {
+                nest += 1;
+            } else if sig[a] == '>' {
+                nest -= 1;
+            }
+            a += 1;
+        }
+        buf_str(out, c"{\"signatures\":[{\"label\":");
+        buf_json_str(out, sig);
+        buf_str(out, c",\"parameters\":[");
+        var k = 0;
+        var p = a + 1;
+        // (a method called as `x.m(..)`: its self is not an argument)
+        var self_param = !(i >= 3 && tok_is(i - 2, "."));
+        while p < sig.len && sig[p] != ')' {
+            while p < sig.len && sig[p] == ' ' {
+                p += 1;
+            }
+            var e = p;
+            var n = 0;
+            while e < sig.len {
+                let c = sig[e];
+                if c == '(' || c == '[' || c == '<' && !(e > 0 && sig[e - 1] == '-') {
+                    n += 1;
+                } else if c == ')' || c == ']' || c == '>' && sig[e - 1] != '-' {
+                    if n == 0 {
+                        break;
+                    }
+                    n -= 1;
+                } else if c == ',' && n == 0 {
+                    break;
+                }
+                e += 1;
+            }
+            let param = sig[p..e];
+            let is_self = param == "self"
+                || param.len > 5 && param[param.len - 5..param.len] == " self"
+                || param.len > 5 && param[0..5] == "self:";
+            if is_self && k == 0 && !self_param {
+                self_param = true;
+            } else {
+                if k > 0 {
+                    buf_byte(out, ',');
+                }
+                buf_fmt(out, f"{{\"label\":[{utf16_len(sig[0..p])},{utf16_len(sig[0..e])}]}}");
+                k += 1;
+            }
+            p = if e < sig.len && sig[e] == ',' { e + 1 } else { e };
+        }
+        buf_str(out, c"]");
+        let doc = buf_new();
+        crate::tools::lsp::answer::put_doc(doc, d);
+        let ds = buf_slice(doc);
+        if ds.len > 0 {
+            buf_str(out, c",\"documentation\":{\"kind\":\"markdown\",\"value\":");
+            buf_json_str(out, ds[1..ds.len]);
+            buf_byte(out, '}');
+        }
+        buf_fmt(out, f"}}],\"activeSignature\":0,\"activeParameter\":{commas}}}");
+    }
+}
+
+// The length of s in UTF-16 units (a signature's offsets, as LSP has
+// them).
+fn utf16_len(s: [u8]) -> i64 {
+    var n = 0;
+    var i = 0;
+    while i < s.len {
+        let c = s[i];
+        let l = if c < 128 as u8 { 1 } else if c < 224 as u8 { 2 } else if c < 240 as u8 { 3 }
+            else { 4 };
+        n += if l == 4 { 2 } else { 1 };
+        i += l;
+    }
+    n
+}

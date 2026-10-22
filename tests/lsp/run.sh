@@ -15,7 +15,8 @@
 # TEXT` didChange, FILE getting the text of tests/lsp/texts/TEXT. After a
 # request the next message waits for its response, as an editor does;
 # in a session whose first line is `## burst` every message is sent at
-# once (a request then sees the changes queued after it). A line `< JSON`
+# once (a request then sees the changes queued after it); in one with a
+# line `## quiet` the diagnostics are left out. A line `< JSON`
 # is a message of the server: after a request's line, the messages up to
 # its response (the diagnostics published before it), and at the end
 # the ones after the last response. `##` lines are comments. The
@@ -195,6 +196,13 @@ for case in "$HERE"/*.lsp; do
     run_session "$dir" "$mode"
     rc=$?
     unframe "$WORK/out" "$dir" >"$WORK/answers"
+    # (0.25.1) a session with a `## quiet` line leaves the diagnostics out:
+    # its requests do not wait for the program to be read, so when they
+    # come between the answers depends on the machine's load
+    if grep -q '^## quiet' "$case"; then
+        grep -v '"method":"textDocument/publishDiagnostics"' "$WORK/answers" >"$WORK/answers.q"
+        mv "$WORK/answers.q" "$WORK/answers"
+    fi
     transcript "$case" >"$WORK/got"
     if [ "$UPDATE" = 1 ]; then
         cp "$WORK/got" "$case"
@@ -268,7 +276,8 @@ else
     STATUS=1
 fi
 
-# The compiler's own source: plausible answers, and their times.
+# The compiler's own source: plausible answers, and their times (0.25.1:
+# completion, signature help and formatting too).
 SRC="$ROOT/compiler/src"
 if [ -f "$SRC/main.vl" ]; then
     F="$SRC/tools/lsp/mod.vl"
@@ -279,7 +288,13 @@ if [ -f "$SRC/main.vl" ]; then
         line=$(grep -n '^pub fn run_lsp' "$F" | cut -d: -f1)
         frame "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/references\",\"params\":{\"textDocument\":{\"uri\":\"$U\"},\"position\":{\"line\":$((line - 1)),\"character\":8},\"context\":{\"includeDeclaration\":true}}}"
         frame "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"$U\"},\"position\":{\"line\":$((line - 1)),\"character\":8}}}"
-        frame '{"jsonrpc":"2.0","id":5,"method":"shutdown"}'
+        # (0.25.1) completion of `buf_` in run_lsp (`IN = buf_new();`), a
+        # call's signature there, the file formatted
+        cl=$(grep -n '^        IN = buf_new();' "$F" | cut -d: -f1)
+        frame "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"$U\"},\"position\":{\"line\":$((cl - 1)),\"character\":17}}}"
+        frame "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/signatureHelp\",\"params\":{\"textDocument\":{\"uri\":\"$U\"},\"position\":{\"line\":$((cl - 1)),\"character\":21}}}"
+        frame "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/formatting\",\"params\":{\"textDocument\":{\"uri\":\"$U\"},\"options\":{\"tabSize\":4,\"insertSpaces\":true}}}"
+        frame '{"jsonrpc":"2.0","id":8,"method":"shutdown"}'
         frame '{"jsonrpc":"2.0","method":"exit"}'
     } >"$WORK/in"
     XDG_CACHE_HOME="$WORK/cache" VOLE_LSP_TIME=1 "$COMPILER" lsp <"$WORK/in" >"$WORK/out" 2>"$WORK/err"
@@ -287,7 +302,10 @@ if [ -f "$SRC/main.vl" ]; then
     unframe "$WORK/out" "$WORK" >"$WORK/answers"
     if [ "$rc" = 0 ] && grep -q '"name":"run_lsp"' "$WORK/answers" \
         && grep -q 'tools/commands.vl' "$WORK/answers" \
-        && grep -q 'effects: ' "$WORK/answers"; then
+        && grep -q 'effects: ' "$WORK/answers" \
+        && grep -q '"id":5,"result":{"isIncomplete":false,"items":\[.*"label":"buf_new"' "$WORK/answers" \
+        && grep -q '"id":6,"result":{"signatures":\[{"label":"pub fn buf_new() -> i64"' "$WORK/answers" \
+        && grep -q '"id":7,"result":\[' "$WORK/answers"; then
         echo "pass compiler-source"
         grep '^lsp' "$WORK/err" | sed 's/^/    /'
     else

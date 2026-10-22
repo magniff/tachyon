@@ -189,7 +189,14 @@ function's signature, effects (declared or inferred, a line of why
 each), features and comment, a local's type, or a line on a keyword,
 an attribute or a primitive type; the file's and the workspace's
 symbols; `check`'s errors as diagnostics, their `try:` lines attached.
-The root: the nearest `main.vl` (docs/lsp.md).
+(0.25.1) Completion while typing, on text that does not parse yet:
+after `.` the receiver's fields and methods (`v.` of a `Vec<i64>`), after
+`::` a module's items, variants, a type's functions, else the locals,
+the module's items, imports, the prelude and keywords, each with its
+signature, and its comment and effects when chosen; formatting, the
+buffer as `volec fmt` lays it out (the VS Code extension on save), no
+edits when it does not parse. The root: the nearest `main.vl`
+(docs/lsp.md).
 
 ## Other compiler options
 
