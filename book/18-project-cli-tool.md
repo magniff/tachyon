@@ -469,10 +469,11 @@ Last, `main.vl`, which ties it together:
 mod count;
 mod report;
 
-use crate::count::Counts;
 use std::{IoError, env, fs, io};
 use std::cli::{Arg, Command, Matches};
 use std::str::Utf8Error;
+
+use crate::count::Counts;
 
 // What can go wrong.
 enum TallyError {

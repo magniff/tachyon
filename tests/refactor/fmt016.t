@@ -10,7 +10,7 @@ extern "C" {
     fn out_write(fd: i32, data: *u8, count: u64) -> i64;
 }
 
-#[effects(alloc(Gpa, extern), panic,)]
+#[effects(alloc(Gpa, extern), panic)]
 fn grow(v: inout Vec<i64>) {
     v.push(1);
 }

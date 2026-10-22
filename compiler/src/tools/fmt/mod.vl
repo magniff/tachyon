@@ -3,7 +3,7 @@
 //
 //   volec fmt [FILE|DIR]... [--check] [--dry-run] [--show]
 //   volec fmt [MODULE] [--root ROOT] ...     the program's files (MODULE's)
-//   volec fmt --all ...                      compiler/, tests/, examples/, bench/
+//   volec fmt --all ...                      compiler/, tests/, examples/, bench/, tools/
 //
 // Indentation, spaces, blank lines and wrapping at 100 columns (layout,
 // wrap), and the `use` lines tidied as `fix --only tidy-imports` writes
@@ -27,14 +27,14 @@ mod clauses;
 mod conv;
 
 use crate::base::{
-    FILES, FILE_COUNT, IntVec, SRC, STDOUT, buf_byte, buf_bytes, buf_int, buf_new, buf_slice,
-    buf_str, buf_write_fd, load_sources, streq,
+    FILES, FILE_COUNT, IntVec, SRC, STDOUT, buf_byte, buf_bytes, buf_clear, buf_int, buf_new,
+    buf_slice, buf_str, buf_write_fd, load_sources, streq,
 };
 use crate::front::lexer::init_lexer;
 use crate::tools::edit::{TARGET, edit_replace};
 use crate::tools::edit::apply::{SKIP_CHECK, apply_edit, set_command};
 use crate::tools::edit::cli::take_edit_option;
-use crate::tools::fmt::layout::{RANGED, lay_out, write_layout};
+use crate::tools::fmt::layout::{COMMAS_CHANGED, RANGED, lay_out, write_layout};
 use crate::tools::fmt::pieces::{
     BAD_AT, BAD_MESSAGE, FT, P_END, P_KIND, P_START, line_of, read_pieces, same_pieces,
 };
@@ -130,6 +130,24 @@ pub fn format_text(text: [u8], ranges: *IntVec, out: i64) -> bool {
         }
         lay_out();
         write_layout(out);
+        // (0.25.1: trailing commas written or dropped change the lines'
+        // lengths: a whole file is laid out again, to its fixpoint)
+        var pass = 0;
+        while whole && COMMAS_CHANGED && pass < 3 {
+            let again = buf_new();
+            buf_bytes(again, buf_slice(out));
+            if !read_pieces(buf_slice(again)) {
+                return false;
+            }
+            RANGED.count = 0;
+            for i in 0..P_KIND.count {
+                RANGED.push(1);
+            }
+            lay_out();
+            buf_clear(out);
+            write_layout(out);
+            pass += 1;
+        }
         if !same_pieces(src, buf_slice(out)) {
             BAD_MESSAGE = "formatting would change its tokens (a bug of fmt)";
             BAD_AT = 0;
@@ -190,6 +208,24 @@ pub fn format_ranges(text: [u8], ranges: *IntVec) -> i64 {
         let saved = FT;
         let out = buf_new();
         let ok = (*ranges).count > 0 && !generated(text) && format_text(text, ranges, out);
+        FT = saved;
+        if !ok || same_bytes(buf_slice(out), text) {
+            return -1;
+        }
+        out
+    }
+}
+
+// (0.25.1) A whole text formatted, for a caller in the process (the
+// language server's format-on-save): a new buffer with the formatted
+// text, or -1 when the text is formatted already, is generated, or
+// cannot be formatted (does not lex, unbalanced brackets; BAD_MESSAGE,
+// BAD_AT say why). The caller's FT is kept.
+pub fn format_source(text: [u8]) -> i64 {
+    unsafe {
+        let saved = FT;
+        let out = buf_new();
+        let ok = !generated(text) && format_text(text, 0 as *IntVec, out);
         FT = saved;
         if !ok || same_bytes(buf_slice(out), text) {
             return -1;
@@ -401,8 +437,8 @@ fn run_fmt_inner(argc: i64, argv: **u8) -> i64 {
                 check = true;
             } else if streq(a, c"--all") {
                 ALL = true;
-                let dirs = [c"compiler", c"tests", c"examples", c"bench"];
-                for k in 0..4 {
+                let dirs = [c"compiler", c"tests", c"examples", c"bench", c"tools"];
+                for k in 0..5 {
                     if is_dir(dirs[k]) {
                         paths.push(dirs[k] as i64);
                     }

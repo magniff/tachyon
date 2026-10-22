@@ -50,9 +50,9 @@
 > {"jsonrpc":"2.0","id":21,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":68,"character":20}}}
 < {"jsonrpc":"2.0","id":21,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/string.vl","range":{"start":{"line":1122,"character":11},"end":{"line":1122,"character":18}}}}
 > {"jsonrpc":"2.0","id":22,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":69,"character":11}}}
-< {"jsonrpc":"2.0","id":22,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/collections/hash_map.vl","range":{"start":{"line":15,"character":11},"end":{"line":15,"character":18}}}}
+< {"jsonrpc":"2.0","id":22,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/collections/hash_map.vl","range":{"start":{"line":16,"character":11},"end":{"line":16,"character":18}}}}
 > {"jsonrpc":"2.0","id":23,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":70,"character":6}}}
-< {"jsonrpc":"2.0","id":23,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/collections/hash_map.vl","range":{"start":{"line":101,"character":11},"end":{"line":101,"character":17}}}}
+< {"jsonrpc":"2.0","id":23,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/collections/hash_map.vl","range":{"start":{"line":102,"character":11},"end":{"line":102,"character":17}}}}
 > {"jsonrpc":"2.0","id":24,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":4}}}
 < {"jsonrpc":"2.0","id":24,"result":{"uri":"file://@DIR@/.cache/vole/std-@STD@/fmt.vl","range":{"start":{"line":98,"character":7},"end":{"line":98,"character":14}}}}
 > {"jsonrpc":"2.0","id":25,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":80,"character":4}}}

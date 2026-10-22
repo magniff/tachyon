@@ -1,9 +1,11 @@
-// The `use` lines of `volec fmt` (0.13): each run of `use` items on
-// consecutive lines (no blank line, no comment between or after them) is
-// written as `fix --only tidy-imports` writes a module's: the items with
-// one path (and one `pub`) merged, their names sorted, wrapped at 100
-// columns (tidyimports::put_use_text); and the run's items sorted by
-// path, segment by segment (a `pub use` after a `use` of its path).
+// The `use` lines of `volec fmt` (0.13): each run of `use` items (on
+// lines of their own, 0.25.1: blank lines between them too, but no
+// comment) is written as `fix --only tidy-imports` writes a module's: the
+// items with one path (and one `pub`) merged, their names sorted, wrapped
+// at 100 columns (tidyimports::put_use_text); and the run's items in
+// groups (0.25.1), `std` first, then `crate`, then the rest (`super`,
+// `self`, a child module), a blank line between two groups, each sorted
+// by path, segment by segment (a `pub use` after a `use` of its path).
 
 use crate::base::{BUFS, IntVec, buf_byte, buf_bytes, buf_new, buf_slice, intern};
 use crate::front::lexer::Tok;
@@ -122,10 +124,35 @@ fn path_text(u: i64) -> [u8] {
     unsafe { FT[P_START.data[U_PATH.data[u]]..P_END.data[U_PATH_END.data[u] - 1]] }
 }
 
-// Whether item u's path sorts before v's: by segments (`::` lowest),
-// then a `use` before a `pub use`.
+// The group of item u (0.25.1): 0 for a path of `std`, 1 of `crate`, 2
+// for the others.
+fn use_group(u: i64) -> i64 {
+    unsafe {
+        let p = path_text(u);
+        var e = 0;
+        while e < p.len && p[e] != ':' {
+            e += 1;
+        }
+        let root = p[0..e];
+        if same_bytes(root, "std") {
+            0
+        } else if same_bytes(root, "crate") {
+            1
+        } else {
+            2
+        }
+    }
+}
+
+// Whether item u sorts before v: by group, then path, by segments (`::`
+// lowest), then a `use` before a `pub use`.
 fn use_less(u: i64, v: i64) -> bool {
     unsafe {
+        let gu = use_group(u);
+        let gv = use_group(v);
+        if gu != gv {
+            return gu < gv;
+        }
         let a = path_text(u);
         let b = path_text(v);
         let n = if a.len < b.len { a.len } else { b.len };
@@ -165,6 +192,7 @@ fn put_run(out: i64, indent: [u8]) {
             }
         }
         var lines = 0;
+        var last_group = -1;
         var k = 0;
         while k < n {
             let u = order.data[k];
@@ -188,7 +216,12 @@ fn put_run(out: i64, indent: [u8]) {
             }
             if lines > 0 {
                 buf_byte(out, '\n');
+                // (a blank line between two groups)
+                if use_group(u) != last_group {
+                    buf_byte(out, '\n');
+                }
             }
+            last_group = use_group(u);
             put_use_text(out, indent, U_PUB.data[u] != 0, path_text(u), &names, &aliased);
             lines += 1;
         }
@@ -220,7 +253,8 @@ pub fn tidy_uses(ranges: *IntVec, mapped: inout IntVec) -> i64 {
                 var end = i;
                 while j >= 0 {
                     end = j;
-                    if j >= n || P_NL.data[j] != 1 {
+                    // (0.25.1: a blank line between two items continues the run)
+                    if j >= n || P_NL.data[j] == 0 {
                         break;
                     }
                     j = read_use(j);

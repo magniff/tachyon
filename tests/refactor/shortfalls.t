@@ -95,10 +95,15 @@ undid inserted after crate::catalog::price	catalog.vl	+7 -0 lines
 $ edit patch main --old 'area(s)' --new 'area(s) + round(Shape::Dot) as i64' --dry-run
 --- a/main.vl
 +++ b/main.vl
-@@ -8 +8 @@
+@@ -6 +5,0 @@
+-use catalog::{price, summary};
+@@ -8 +6,0 @@
 -use shapes::{Shape, area};
+@@ -9,0 +8,3 @@
++use catalog::{price, summary};
 +use shapes::{Shape, area, round};
-@@ -12 +12 @@
++
+@@ -12 +13 @@
 -    let total = price(Item { cost: 3 }) + area(s) + summary(1) + table::fourth();
 +    let total = price(Item { cost: 3 }) + area(s) + round(Shape::Dot) as i64 + summary(1) + table::fourth();
 note edit.imports: added the imports the new text needs (fix --only imports)

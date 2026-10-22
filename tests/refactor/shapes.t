@@ -272,7 +272,7 @@ $ refactor variant Kind --add 'Ring(i64, i64)' --arm 0 --dry-run
 +        Kind::Circle(_) => 0,
 +        Kind::Dot | Kind::Square(_) => 4,
 +        Kind::Empty => 0,
-+        Kind::Ring(_, _) => 0
++        Kind::Ring(_, _) => 0,
 +    }
 ## Without --arm: the matches that need one.
 $ refactor variant Kind --add 'Ring(i64, i64)'

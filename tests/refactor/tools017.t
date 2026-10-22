@@ -114,10 +114,12 @@ try: volec edit patch crate::report::header --old 1 --new 3
 $ refactor inline percent --dry-run
 --- a/main.vl
 +++ b/main.vl
-@@ -6 +6 @@
+@@ -6 +5,0 @@
 -use calc::{empties, percent, twice};
+@@ -8,0 +8,2 @@
 +use calc::{empties, twice};
-@@ -21 +21 @@
++
+@@ -21 +22 @@
 -    println(f"{TITLE}: share {percent(a, b)}%, twice {twice(a)}");
 +    println(f"{TITLE}: share {if b == 0 { 0 } else { a * 100 / b }}%, twice {twice(a)}");
 --- a/calc.vl
@@ -135,13 +137,15 @@ $ refactor inline percent --dry-run
 $ rewrite 'twice($x)' '$x + $x' --in main --dry-run
 --- a/main.vl
 +++ b/main.vl
-@@ -6 +6 @@
+@@ -6 +5,0 @@
 -use calc::{empties, percent, twice};
+@@ -8,0 +8,2 @@
 +use calc::{empties, percent};
-@@ -21 +21 @@
++
+@@ -21 +22 @@
 -    println(f"{TITLE}: share {percent(a, b)}%, twice {twice(a)}");
 +    println(f"{TITLE}: share {percent(a, b)}%, twice {a + a}");
-@@ -25 +25 @@
+@@ -25 +26 @@
 -    println(f"{geo::area(2)} {A + B} {twice(b)} {calc::header()}");
 +    println(f"{geo::area(2)} {A + B} {b + b} {calc::header()}");
 note rewrite.imports: removed 1 import the rewrite left unused
@@ -149,13 +153,13 @@ $ rewrite 'twice($x)' '$x + $x' --in main --in crate::nowhere
 error rewrite.bad-in: no file, module or item 'crate::nowhere' in the program
 [exit 1]
 $ rewrite 'twice($x)' '$x + $x'
-rewrote 2 sites in 1 file	main.vl	+3 -3 lines
+rewrote 2 sites in 1 file	main.vl	+4 -3 lines
 note rewrite.imports: removed 1 import the rewrite left unused
 % git diff --stat
- main.vl | 6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
+ main.vl | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
 $ undo
-undid rewrote 2 sites in 1 file	main.vl	+3 -3 lines
+undid rewrote 2 sites in 1 file	main.vl	+4 -3 lines
 ## rewrite refused (edit.breaks): a hole of several types gets --where per type.
 $ rewrite '$v.len() == 0' '$v.is_empty()'
 calc.vl:29:8: error[type error] no method 'is_empty' on type 'Buf' | help: no `is_empty`: `x.len() == 0` | try: volec query items Buf main.vl  [edited: crate::calc::empties]
