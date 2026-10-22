@@ -1159,7 +1159,8 @@ fn eval_call(n: i64, dst: i64) {
                     kind = PK_RAW;
                 } else if mode == P_MUT_VIEW {
                     kind = PK_MUT_VIEW;
-                } else if mode == P_MUT && k == NodeKind::Unary && NODES[arg].op == Tok::Amp {
+                } else if mode == P_MUT && k == NodeKind::Unary && NODES[arg].op == Tok::Amp
+                    && through_exclusive_view(NODES[arg].b) {
                     // (0.25) `&v[i]` of a Vec, a Buf, a String: a loan of an
                     // element through the view `v.as_mut_slice()` makes (o
                     // holds it), exclusive as `&a[i]` of an array is
@@ -1171,7 +1172,11 @@ fn eval_call(n: i64, dst: i64) {
                     // (a closure lent to a let parameter, `&|| ..`, too: the
                     // callee calls it)
                     let inner = if TYPES[at_ty].kind == TyKind::Ptr { TYPES[at_ty].a } else { 0 };
-                    kind = if views::holds_mut(at_ty, 0)
+                    // (a temporary lent, `&v.iter()`, writes itself: only a
+                    // value that holds an inout access writes through it)
+                    let held = if inner > 0 { views::holds_mut(inner, 0) }
+                        else { views::holds_mut(at_ty, 0) };
+                    kind = if held
                         || inner > 0 && crate::front::closures::closure_holds_inout(inner) {
                         PK_MUT_VIEW
                     } else {
@@ -1204,6 +1209,34 @@ fn eval_call(n: i64, dst: i64) {
         }
         PEND.count = base;
         POOL_TOP = mark;
+    }
+}
+
+// (0.25) Whether place e (`v.as_mut_slice()[i].x`) is reached through an
+// exclusive view a call makes (an `inout [T]` or `inout T` result): a loan of
+// it writes what that view points into. A temporary itself (`&v.iter()`)
+// is not: its change is its own.
+fn through_exclusive_view(e: i64) -> bool {
+    unsafe {
+        var p = e;
+        var depth = 0;
+        while depth < 64 {
+            let k = NODES[p].kind;
+            if k == NodeKind::Index || k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+                p = NODES[p].a;
+            } else if k == NodeKind::Call || k == NodeKind::MethodCall {
+                if depth == 0 {
+                    return false;
+                }
+                let t = NODES[p].ty;
+                return t > 0 && (TYPES[t].kind == TyKind::Slice || TYPES[t].kind == TyKind::Ptr)
+                    && TYPES[t].b == REF_MUT;
+            } else {
+                return false;
+            }
+            depth += 1;
+        }
+        false
     }
 }
 
