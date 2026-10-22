@@ -26,25 +26,26 @@ text.vl:9:12: error[type error] unknown type 'char' | help: `u8`: text is bytes,
 $ fix --suggested --dry-run
 --- a/main.vl
 +++ b/main.vl
-@@ -0,0 +1,3 @@
+@@ -0,0 +1,4 @@
 +use std::I64_MIN;
++
 +use text::wrap;
 +
-@@ -22,2 +25,2 @@
+@@ -22,2 +26,2 @@
 -    let t = totl(&v);
 -    let small: u8 = t;
 +    let t = total(v);
 +    let small: u8 = t as u8;
-@@ -25 +28 @@
+@@ -25 +29 @@
 -    if n {
 +    if n != 0 {
-@@ -29 +32 @@
+@@ -29 +33 @@
 -    let w = format(f"{t}");
 +    let w = format_in(f"{t}", gpa);
-@@ -32 +35 @@
+@@ -32 +36 @@
 -    let r = table::make(3);
 +    let r = table::make(3, gpa);
-@@ -34 +37 @@
+@@ -34 +38 @@
 -    b.push_string(wrap(s));
 +    b.push_str(wrap(s));
 --- a/text.vl
@@ -81,22 +82,23 @@ $ fix --suggested --in text.vl --dry-run
 -    let c: char = 'x';
 +    let c: u8 = 'x';
 $ fix --suggested --show
-fixed 2 missing imports, 1 pub, 13 suggested fixes	2 files	+14 -11 lines
-// main.vl:1-3
+fixed 2 missing imports, 1 pub, 13 suggested fixes	2 files	+15 -11 lines
+// main.vl:1-4
 1	use std::I64_MIN;
-2	use text::wrap;
-3	
-// main.vl:25-26
-25	    let t = total(v);
-26	    let small: u8 = t as u8;
-// main.vl:28
-28	    if n != 0 {
-// main.vl:32
-32	    let w = format_in(f"{t}", gpa);
-// main.vl:35
-35	    let r = table::make(3, gpa);
-// main.vl:37
-37	    b.push_str(wrap(s));
+2	
+3	use text::wrap;
+4	
+// main.vl:26-27
+26	    let t = total(v);
+27	    let small: u8 = t as u8;
+// main.vl:29
+29	    if n != 0 {
+// main.vl:33
+33	    let w = format_in(f"{t}", gpa);
+// main.vl:36
+36	    let r = table::make(3, gpa);
+// main.vl:38
+38	    b.push_str(wrap(s));
 // text.vl:1
 1	use crate::lib::inner::width;
 // text.vl:3-5
@@ -105,13 +107,13 @@ fixed 2 missing imports, 1 pub, 13 suggested fixes	2 files	+14 -11 lines
 5	    crate::lib::shapes::area(r)
 // text.vl:9
 9	    let c: u8 = 'x';
-main.vl:40:16: error[type error] undefined variable 'cut' | help: did you mean 'cat'?
+main.vl:41:16: error[type error] undefined variable 'cut' | help: did you mean 'cat'?
 note fix.left: 1 error left (above)
 $ check
-main.vl:40:16: error[type error] undefined variable 'cut' | help: did you mean 'cat'?
+main.vl:41:16: error[type error] undefined variable 'cut' | help: did you mean 'cat'?
 [exit 1]
 $ undo
-undid fixed 2 missing imports, 1 pub, 13 suggested fixes	2 files	+14 -11 lines
+undid fixed 2 missing imports, 1 pub, 13 suggested fixes	2 files	+15 -11 lines
 ## A Rust label: the program does not lex; the fix respells each line.
 $ fix --suggested labels.vl --show
 fixed 3 suggested fixes	labels.vl	+3 -3 lines

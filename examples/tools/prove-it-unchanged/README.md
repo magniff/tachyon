@@ -141,19 +141,19 @@ parameters (in the order of their first use), the one they define and
 `main` uses after them its result:
 
 ```console
-$ volec refactor extract-function main --lines 21-24 --to round_trips --show
-extracted lines 21-24 of crate::main into round_trips(out, gpa, s) -> bool	main.vl	+9 -4 lines
-// main.vl:21
-21	    let ok = round_trips(out, gpa, s);
-// main.vl:34-41
-34	}
-35	
-36	fn round_trips(out: [u8], gpa: Gpa, s: [u8]) -> bool {
-37	    let ok = match rle::decode(out, gpa) {
-38	        Some(back) => back.as_slice() == s,
-39	        None => false,
-40	    };
-41	    ok
+$ volec refactor extract-function main --lines 22-25 --to round_trips --show
+extracted lines 22-25 of crate::main into round_trips(out, gpa, s) -> bool	main.vl	+9 -4 lines
+// main.vl:22
+22	    let ok = round_trips(out, gpa, s);
+// main.vl:35-42
+35	}
+36	
+37	fn round_trips(out: [u8], gpa: Gpa, s: [u8]) -> bool {
+38	    let ok = match rle::decode(out, gpa) {
+39	        Some(back) => back.as_slice() == s,
+40	        None => false,
+41	    };
+42	    ok
 ```
 
 The compiled code changes now (there is a new function), so the

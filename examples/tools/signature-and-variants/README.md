@@ -123,8 +123,8 @@ renamed field limit to overdraft of crate::account::Account, 5 uses	3 files	+6 -
 17	    Account { id: 0, owner: "the bank", balance: 0, overdraft: 0 }
 // account.vl:21
 21	    a.balance + a.overdraft >= amount
-// report.vl:25
-25	    println(f"#{a.id} {a.owner:<10} balance {a.balance:>6}, may go to -{a.overdraft}");
+// report.vl:26
+26	    println(f"#{a.id} {a.owner:<10} balance {a.balance:>6}, may go to -{a.overdraft}");
 ```
 
 `open`'s parameter is still called `limit`; a parameter rename changes
@@ -165,10 +165,10 @@ in:
 ```console
 $ volec refactor variant Event --add 'Fee(i64)'
 ledger.vl:66:5	ledger::apply
-report.vl:8:5	report::describe
-report.vl:18:5	report::is_credit
+report.vl:9:5	report::describe
+report.vl:19:5	report::is_credit
 error refactor.non-exhaustive: 3 matches on crate::event::Event would not cover Fee; nothing written
-try: volec query show ledger.vl:66 report.vl:8 report.vl:18
+try: volec query show ledger.vl:66 report.vl:9 report.vl:19
 try: volec refactor variant crate::event::Event --add 'Fee(i64)' --arm 'EXPR' --dry-run
 try: volec refactor variant crate::event::Event --add 'Fee(i64)' --arm-in ledger::apply 'EXPR' --arm-in report::describe 'EXPR' --arm-in report::is_credit 'EXPR' --dry-run
 [exit 1]
@@ -185,10 +185,10 @@ added variant Fee(i64) to crate::event::Event, an arm in 3 matches	3 files	+4 -0
 12	    Fee(i64),
 // ledger.vl:83
 83	        Event::Fee(_) => false,
-// report.vl:13
-13	        Event::Fee(_) => format_in("a fee", gpa),
-// report.vl:22
-22	        Event::Fee(_) => false,
+// report.vl:14
+14	        Event::Fee(_) => format_in("a fee", gpa),
+// report.vl:23
+23	        Event::Fee(_) => false,
 ```
 
 Now the behaviour. The parser learns the word `fee`, the week gets two
@@ -236,11 +236,11 @@ $ volec edit patch ledger::apply --old 'Event::Fee(_) => false' --new 'Event::Fe
 patched crate::report::describe, crate::report::summary, crate::ledger::apply	2 files	+4 -3 lines
 // ledger.vl:96
 96	        Event::Fee(n) => charge(&l, who, n),
-// report.vl:13
-13	        Event::Fee(n) => format_in(f"fee of {n}", gpa),
-// report.vl:27-28
-27	    println(
-28	        f"#{a.id} {a.owner:<10} balance {a.balance:>6}, may go to -{a.overdraft}, fees {a.fees_paid}");
+// report.vl:14
+14	        Event::Fee(n) => format_in(f"fee of {n}", gpa),
+// report.vl:28-29
+28	    println(
+29	        f"#{a.id} {a.owner:<10} balance {a.balance:>6}, may go to -{a.overdraft}, fees {a.fees_paid}");
 ```
 
 ## 4. The new program
