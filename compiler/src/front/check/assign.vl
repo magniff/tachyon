@@ -2,7 +2,11 @@
 // compound assignments (`+=` and the others, on numbers and vectors), and
 // the mutability a write to a place needs.
 
-use crate::base::diag::{ERR_HELP, err_begin, err_end, err_help, err_help_sym, err_str, err_sym};
+use crate::base::{IntVec, SRC, SYMS, buf_bytes, buf_new, buf_slice, buf_str};
+use crate::base::diag::{
+    ERR_HELP, ERR_KIND, err_begin, err_end, err_end_soft, err_fmt, err_help, err_help_sym, err_str,
+    err_sym, err_try, err_try_fmt,
+};
 use crate::front::ast::NODES;
 use crate::front::ast::NodeKind::{FieldAccess, Ident, Index, Range, TupleField, Unary};
 use crate::front::check::{LOCALS, Res, lookup_local, name_error, type_error, type_error_got};
@@ -14,7 +18,8 @@ use crate::front::closures::note_local_write;
 use crate::front::distinct::strip_distinct;
 use crate::front::lexer::Tok;
 use crate::front::types::{
-    CONSTS, STATICS, SYM_STATIC, buf_type, is_integer, is_numeric, is_pointer, is_slice, is_vector,
+    CONSTS, REF_MUT, STATICS, SYM_STATIC, TYPES, TyKind, buf_type, is_integer, is_numeric,
+    is_pointer, is_slice, is_vector,
 };
 
 fn arith_token_of_assign(op: Tok) -> Tok {
@@ -116,22 +121,218 @@ pub fn check_assign(n: i64) {
 }
 
 pub fn check_mutable_place(target: i64) {
+    let root = place_root(target);
+    if root > 0 {
+        check_mutable_name(root, target);
+    }
+}
+
+// The Ident a write to place `target` changes, through fields, tuple parts
+// and the elements of an array (0: none to check, the place reached
+// through a pointer, a reference or a slice, or not a place).
+pub fn place_root(target: i64) -> i64 {
     var root = target;
     loop {
         unsafe {
             match NODES[root].kind {
                 // Through a pointer: no `mut` needed.
-                FieldAccess if NODES[root].y == 1 => return,
+                FieldAccess if NODES[root].y == 1 => return 0,
                 FieldAccess | TupleField => root = NODES[root].a,
                 Index if !is_pointer(NODES[NODES[root].a].ty)
                     && !is_slice(NODES[NODES[root].a].ty) => root = NODES[root].a,
-                Ident => {
-                    check_mutable_name(root, target);
-                    return;
-                }
-                _ => return,
+                Ident => return root,
+                _ => return 0,
             }
         }
+    }
+}
+
+// (0.25) The rule of an inout access: `&place` taken exclusive (an inout
+// argument, `inout r = &place`, `match &place`, `for inout x in &place`)
+// and the receiver of an `inout self` method (`c.inc()`, `v.push(x)`,
+// `v[i] = x` through `as_mut_slice`) need the place's root mutable: a
+// `var` local, an inout parameter or `inout self`, a `static var`, or
+// memory reached through a raw pointer (unsafe) or an inout access. A let
+// binding, a let parameter, a let receiver and an immutable static (in
+// read-only data) are read-only: own.readonly, naming the binding. (A let
+// access to an owned value, a reference inside, is the own pass's:
+// views::on_mut_loan.) `at` is the node reported: the `&`, the call.
+// `&place` given where a raw `*T` is wanted is its address, not an
+// access (unsafe code answers for writes through it): its check waits for
+// the function's end (flush_inout_places), when the node's type says.
+pub fn check_inout_place(target: i64, at: i64) {
+    let kind = inout_root_kind(target);
+    if kind != 0 {
+        unsafe { inout_place_error(at, kind, NODES[INOUT_ROOT].a, INOUT_ROOT_TY); }
+    }
+}
+
+// The same for `&place` (synth_unary): reported at the function's end
+// unless the `&` became a raw pointer.
+pub fn defer_inout_place(target: i64, at: i64) {
+    let kind = inout_root_kind(target);
+    if kind != 0 {
+        unsafe {
+            INOUT_PENDING.push(at);
+            INOUT_PENDING.push(kind);
+            INOUT_PENDING.push(NODES[INOUT_ROOT].a);
+            INOUT_PENDING.push(INOUT_ROOT_TY);
+        }
+    }
+}
+
+// (0.25) `&value` of a temporary (check/temps.vl made its local): conv.place
+// at the function's end if it was lent inout.
+pub fn defer_conv_place(at: i64) {
+    unsafe {
+        INOUT_PENDING.push(at);
+        INOUT_PENDING.push(5);
+        INOUT_PENDING.push(0);
+        INOUT_PENDING.push(0);
+    }
+}
+
+// (`&x as *T`: the `&` nodes cast to a raw pointer, for flush_inout_places)
+pub static var RAW_ADDRS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// (the pending `&place` errors: the node, the kind, the name, the type)
+pub static var INOUT_PENDING: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// While the checker checks code it made that may change a let binding (a
+// drop at the end of its life): no inout check.
+pub static var INOUT_FREE: i64 = 0;
+static var INOUT_ROOT: i64 = 0;
+static var INOUT_ROOT_TY: i64 = 0;
+
+pub fn clear_inout_places() {
+    unsafe {
+        INOUT_PENDING.count = 0;
+        RAW_ADDRS.count = 0;
+    }
+}
+
+pub fn flush_inout_places() {
+    unsafe {
+        var i = 0;
+        while i + 3 < INOUT_PENDING.count {
+            let at = INOUT_PENDING.data[i];
+            let t = NODES[at].ty;
+            // (a raw pointer, or a let `[T]`: no inout access)
+            var raw = t > 0 && (TYPES[t].kind == TyKind::Ptr || TYPES[t].kind == TyKind::Slice)
+                && TYPES[t].b == 0;
+            for j in 0..RAW_ADDRS.count {
+                if RAW_ADDRS.data[j] == at {
+                    raw = true;
+                }
+            }
+            if INOUT_PENDING.data[i + 1] == 5 {
+                // (conv.place: only where the access is inout)
+                if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == REF_MUT {
+                    conv_place_error(at);
+                }
+            } else if !raw {
+                inout_place_error(at, INOUT_PENDING.data[i + 1], INOUT_PENDING.data[i + 2],
+                    INOUT_PENDING.data[i + 3]);
+            }
+            i += 4;
+        }
+        clear_inout_places();
+    }
+}
+
+// conv.place: `&make()` lent inout, a temporary whose change is lost.
+fn conv_place_error(at: i64) {
+    unsafe {
+        let text = SRC[NODES[at].start..NODES[at].end];
+        let value = if text.len > 1 && text[0] == '&' { text[1..text.len] } else { text };
+        let m = buf_new();
+        buf_str(m, c"'&' lends a place for the callee to change; '");
+        buf_bytes(m, value);
+        buf_str(m, c"' is a temporary, whose change would be lost");
+        crate::front::conv::conv_error(crate::front::conv::CODE_PLACE, NODES[at].start,
+            NODES[at].end, buf_slice(m), "name it first, then lend it: 'var t = VALUE;' and '&t'",
+            "");
+    }
+}
+
+// What the root of place `target` is when an inout access of it breaks the
+// rule (0: nothing wrong): 1 a let binding, 2 a let parameter, 3 a let
+// receiver, 4 an immutable static; INOUT_ROOT is the Ident, INOUT_ROOT_TY
+// its type.
+fn inout_root_kind(target: i64) -> i64 {
+    unsafe {
+        if INOUT_FREE > 0 {
+            return 0;
+        }
+        let root = place_root(target);
+        if root <= 0 {
+            return 0;
+        }
+        INOUT_ROOT = root;
+        if NODES[root].res == Res::Local {
+            let local = NODES[root].y;
+            if local < 0 {
+                return 0;
+            }
+            let t = LOCALS[local].ty;
+            INOUT_ROOT_TY = t;
+            if LOCALS[local].mutable {
+                // (a closure that changes it this way writes it)
+                note_local_write(local);
+            }
+            // (an access, a reference: through it; a slice is a view,
+            // whose writes the own pass checks: views::on_mut_loan)
+            if LOCALS[local].mutable || LOCALS[local].access
+                || t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b != 0
+                || t > 0 && TYPES[t].kind == TyKind::Slice {
+                return 0;
+            }
+            if SYMS[NODES[root].a].text == "self" {
+                return 3;
+            }
+            return if LOCALS[local].is_param { 2 } else { 1 };
+        }
+        if NODES[root].res == Res::Static && !STATICS[NODES[root].y].mutable {
+            INOUT_ROOT_TY = STATICS[NODES[root].y].ty;
+            return 4;
+        }
+        0
+    }
+}
+
+fn inout_place_error(at: i64, kind: i64, name: i64, t: i64) {
+    unsafe {
+        let text = SRC[NODES[at].start..NODES[at].end];
+        let saved = ERR_KIND;
+        ERR_KIND = c"own.readonly";
+        err_begin(NODES[at].start);
+        err_fmt(f"'{text}' changes '");
+        err_sym(name);
+        let b = buf_new();
+        if kind == 4 {
+            err_str(c"', an immutable static: it is read-only (in read-only memory)");
+            err_help(c"declare it `static var` to change it");
+            buf_str(b, c"static var ");
+            buf_bytes(b, SYMS[name].text);
+        } else if kind == 3 {
+            err_str(c"', a let receiver: it is read-only");
+            err_help(c"take the receiver inout to change it");
+            buf_str(b, c"inout self");
+        } else if kind == 2 {
+            err_str(c"', a let parameter: it is read-only");
+            err_help(
+                c"take it inout to change the caller's value, or `sink` for a copy of its own");
+            buf_bytes(b, SYMS[name].text);
+            buf_str(b, c": inout ");
+            buf_type(b, t);
+        } else {
+            err_str(c"', a let binding: it is read-only");
+            err_help(c"declare it `var` to change it");
+            buf_str(b, c"var ");
+            buf_bytes(b, SYMS[name].text);
+            buf_str(b, c" = ...");
+        }
+        err_try_fmt(buf_slice(b));
+        err_end_soft();
+        ERR_KIND = saved;
     }
 }
 

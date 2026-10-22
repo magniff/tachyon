@@ -33,9 +33,10 @@ use crate::front::own::diag::{
 use crate::front::own::infer::summary_at_call;
 use crate::front::own::kinds::is_view_type;
 use crate::front::own::state::{
-    CUR, NSLOT, PE, PEND, PE_BY, PE_INVALID, PE_NODE, PE_OV, PE_PLACE, PK_MUT, PK_MUT_VIEW, PK_NONE,
-    PK_RAW, PK_RESERVE, PK_SHARED, PK_VIEW, PL_COUNT, POOL_TOP, STATIC_MASK, at, clear_bit, get_bit,
-    is_empty, l1, l2, mark_place, new_ov, or_expanded, or_into, ov_hits, root_of, set_bit, slot_off,
+    CUR, NSLOT, NW, PE, PEND, PE_BY, PE_INVALID, PE_NODE, PE_OV, PE_PLACE, PK_MUT, PK_MUT_VIEW,
+    PK_NONE, PK_RAW, PK_RESERVE, PK_SHARED, PK_VIEW, PL_COUNT, POOL_TOP, STATIC_MASK, at, clear_bit,
+    get_bit, is_empty, l1, l2, mark_place, new_ov, or_expanded, or_into, ov_hits, root_of, set_bit,
+    slot_off,
 };
 use crate::front::own::summary::{S_L1_P, S_L1_STAR, S_L2_P, S_L2_STAR};
 use crate::front::own::views::{
@@ -124,11 +125,38 @@ fn path_derefs(e: i64) -> bool {
 }
 
 // The mask of what pending entry e may write: what its level 1 points into,
-// expanded, and the paths through references that reach it.
+// expanded, and the paths through references that reach it. (0.25) A
+// closure, called (its env `&g`) or passed (`g`, `&g`, `|| ..`): the
+// captures it changes, its inout accesses (conventions.md §5.4), and no
+// more: its let captures are read.
 fn write_mask(e: i64) -> i64 {
     unsafe {
         let m = new_ov();
+        let t = NODES[PEND.data[e + PE_NODE]].ty;
+        let inner = if t > 0 && TYPES[t].kind == TyKind::Ptr { TYPES[t].a } else { t };
+        let c = crate::front::closures::closure_of_type(inner) - 1;
+        if c >= 0 {
+            let cl = crate::front::closures::CLOSURES[c];
+            for j in 0..cl.capture_count {
+                if crate::front::closures::CAPTURE_LIST.data[cl.captures + 2 * j + 1] == 2 {
+                    let p = crate::front::own::state::local_place(
+                        crate::front::closures::CAPTURE_LIST.data[cl.captures + 2 * j]);
+                    if p >= 0 {
+                        or_into(at(m), &crate::front::own::state::PL_MASK[p * NW]);
+                    }
+                }
+            }
+            close_mask(at(m));
+            return m;
+        }
         or_expanded(at(m), l1(PEND.data[e + PE_OV]));
+        // (0.25) `&c` of a value holding an inout access (a struct with an
+        // inout field): the callee may write through it, what c views at
+        // level 2
+        if t > 0 && TYPES[t].kind == TyKind::Ptr
+            && crate::front::own::views::holds_mut(TYPES[t].a, 0) {
+            or_expanded(at(m), l2(PEND.data[e + PE_OV]));
+        }
         close_mask(at(m));
         m
     }
@@ -191,6 +219,16 @@ pub fn on_call(n: i64, f: i64, base: i64, dst: i64) {
                     if b != a && kb != PK_NONE && kb != PK_RAW && ob >= 0
                         && !(is_mut_kind(kb) && b < a) && ov_hits(ob, at(m)) {
                         overlap(a, b, m);
+                    } else if b < a && is_mut_kind(kb) && ob >= 0 && ov_hits(ob, at(m)) {
+                        // (0.25) an earlier written argument that b's own pass
+                        // missed: what a writes reaches what b views (`run(&g,
+                        // &n)`, g a closure reading n)
+                        let top = POOL_TOP;
+                        let mb = write_mask(b);
+                        if !ov_hits(PEND.data[a + PE_OV], at(mb)) {
+                            overlap(a, b, m);
+                        }
+                        POOL_TOP = top;
                     }
                     b += PE;
                 }

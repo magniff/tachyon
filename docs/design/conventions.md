@@ -273,7 +273,7 @@ a mutating `match`, a mutating `for`, or a `-> inout T` result.
 | `x: inout T` | `f(&v)`, `f(&v[i])`, `f(&self.items)`, `f(&r)` for an inout binding r | `f(v)`: `conv.marker` |
 | `x: inout [T]` | `sort(&v)` (a Vec, Buf or array place gives its elements), `sort(&v[a..b])` | |
 | `x: sink T` | `f(v)` (moves an owned local), `f(make())`, `f(v.clone())` | `f(&v)`: `conv.marker_extra` |
-| `p: *T` (raw) | `f(&x)`: converts to the raw pointer (the call takes an exclusive loan), or a raw pointer | |
+| `p: *T` (raw) | `f(&x)`: converts to the raw pointer (its address; the call takes a loan), or a raw pointer | |
 
 - **An argument that already is an inout access needs no `&`.** This is
   a call returning `-> inout T` (`sort(v.as_mut_slice())`), or an
@@ -293,8 +293,23 @@ a mutating `match`, a mutating `for`, or a `-> inout T` result.
   field) would be noise on the commonest calls. For plain and copyable
   types a sink argument is a copy, and nothing is dead.
 - **Exclusivity and evaluation order are unchanged** (left to right,
-  two-phase receivers): `f(&a, a.len())` conflicts, as `f(&mut a,
-  a.len())` did. `v.push(v.len())` is fine.
+  two-phase): an inout access begins when the call starts, after every
+  argument is evaluated. A read that is over by then is fine:
+  `f(&a, a.len())` and `v.push(v.len())` (the length is a number,
+  computed first). An argument that keeps a view or an access of the
+  place into the call conflicts: `f(&a, a[..])`, `f(&v[0], v)`,
+  `f(&a, &a)`, `v.extend_from_slice(v.as_slice())` (`own.conflict`).
+- **(0.25) An inout access needs a mutable place.** `&place` given to an
+  inout parameter, `inout r = &place`, `match &place`, and the receiver
+  of an `inout self` method (`c.inc()`, `v.push(x)`, `v[i] = x`) need
+  the place's root mutable: a `var` local, an inout parameter or `inout
+  self`, a `static var`, or memory through a raw pointer. A let binding,
+  a let parameter, a let receiver and an immutable static are read-only:
+  `own.readonly`, naming the binding, with `try: var n = ...`, `try: x:
+  inout T`, `try: inout self` or `try: static var N`. An immutable static
+  stays in read-only data. `&x` given where a raw `*T` is wanted is its
+  address and takes no inout access (C reads it: `fwrite(&buf[0], ...)`);
+  writing a let binding through it is unsafe code's mistake.
 
 The diagnostics, each one line with `try:` lines that run as they are:
 
@@ -468,6 +483,40 @@ are otherwise 0.14's, in the new words: a `var` is captured inout, an
 owned `let` by let access, a plain `let` by copy. `sink` and `inout`
 become keywords in new code (D27), so `sink |x|` cannot be read as `sink
 | x | ...`.
+
+**(0.25) A closure holds its captures' accesses while it lives**, from
+its creation to its last use, as an `inout r = &x` local does (the
+lifetime model of value-semantics.md §2.4, refined by use):
+
+- a capture the closure changes (an assignment, `&x`, an `inout self`
+  method such as `v.push(..)`) is an **inout access**: nothing else
+  reads or changes x while the closure is live, and the closure is a
+  move-only view;
+- a capture it only reads is a **let access**: x may be read, not
+  changed, while the closure is live.
+
+```tach
+var v: Vec<i64> = Vec::new_in(gpa);
+var add = |x: i64| v.push(x);
+add(1);
+add(2);                    // fine: only add touches v
+println(f"{v.len()}");     // fine: add's last use is above
+
+var n = 0;
+var f = || { n += 10; };
+f();
+println(f"{n}");           // own.conflict: 'n' is read while 'f' holds
+f();                       // it inout; 'f' is used here
+```
+
+Calling a closure, or passing it, is an access of its captures for the
+call: `f(&n)` for an `f` that captures n, `run(&g, &n)`, `both(|| n, ||
+{ n += 1; })`, `f(v, || v.push(1))` and `let s = v.as_slice(); g();
+s[0]` (g pushes v) conflict. Sequential uses of two closures over one
+variable are fine once the first is dead: `f(); g();` where f is not
+used again. The `try:` lines: move the read after the closure's last
+use, or pass the value to the closure as a parameter instead of
+capturing it.
 
 ## 6. Types (question 5)
 
