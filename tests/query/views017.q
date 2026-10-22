@@ -50,8 +50,8 @@ Vec<Nm, ScopedArena>::as_slice	views(self) declared
 Vec<JobBuffer, ScopedArena>::as_slice	views(self) declared
 Vec<u32, ScopedArena>::as_slice	views(self) declared
 Vec<JobTexture, ScopedArena>::as_slice	views(self) declared
-Vec<FnInfo, ScopedArena>::as_slice	views(self) declared
 Vec<Vec<u32, ScopedArena>, ScopedArena>::as_slice	views(self) declared
+Vec<FnInfo, ScopedArena>::as_slice	views(self) declared
 Vec<Frame, ScopedArena>::as_slice	views(self) declared
 Vec<Inv, ScopedArena>::as_slice	views(self) declared
 Vec<Ctl, ScopedArena>::as_slice	views(self) declared
