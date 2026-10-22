@@ -2480,3 +2480,26 @@ the same run; instructions retired against v0.22.0's build of the same
 programs: every program within 0.1%, the outputs the same. The
 self-compile (0.23's source, no cache): 11.30 G to 11.36 G at -O0
 (+0.5%), 44.56 G to 44.49 G at -O2 -j1 (-0.2%), 834 MB to 813 MB.
+
+### 0.24
+
+The release gate (`gate.sh --release --no-x86`), run twice. The first run
+(35:13) failed in the container: std::cli's `#[no_io]` parse did not
+build on Linux (`env::args`' iterator read /proc/self/cmdline), and
+tests/refactor/fuzzcmd showed `volec test` taking every test for a
+contract, a cut the rename had left at the old name's length; it also
+skipped compile-cost (the previous release looked for as volec only).
+All three fixed, the second run (35:06): every step passing but the
+container's vole021, a transcript the rename had made into `cp util.vl
+util.vl` (repaired; the container's row passed, 12:11). The suite 1862
+(6 XFAIL), aarch64-linux 1420, threads 2677, incremental 160 series,
+objcheck 2504, voltty-fuzz 338 scripts, valgrind 255 clean.
+compile-cost against v0.23.0: a hello world 95.2 M instructions against
+94.4 M (1.01x), std_heavy 1.00x, check of the compiler 5.69 G against
+5.62 G (1.01x).
+
+Bench (load 2 to 10): geomean 0.890 of cc -O2, v0.23.0's build 0.893 in
+the same run; instructions retired against v0.23.0's build of the same
+programs: every program within 0.25%, the outputs the same. The
+self-compile (0.24's source, no cache): 11.40 G to 11.45 G at -O0
+(+0.4%), 44.72 G at -O2 -j1 for both, 726 MB to 754 MB.
