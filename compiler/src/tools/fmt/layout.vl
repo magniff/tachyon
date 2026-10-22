@@ -24,6 +24,10 @@
 // a file, impl, trait, module or extern block, one when either is a
 // function, type, impl, trait or block of several lines.
 //
+// Trailing commas (0.25.1): a list whose closing bracket starts a line
+// has a `,` after its last element; one whose closing bracket is on the
+// line of its last element has none (mark_commas).
+//
 // With ranges (an edit's lines, edit/), only the lines in them are laid
 // out; the others are copied as they are.
 
@@ -31,8 +35,8 @@ use crate::base::{IntVec, buf_byte, buf_bytes};
 use crate::front::lexer::Tok;
 use crate::tools::fmt::clauses::{before_prefix_star, starts_clause, starts_invariant};
 use crate::tools::fmt::pieces::{
-    BLOCK_COMMENT, FT, LINE_COMMENT, MATCH, P_END, P_KIND, P_NL, P_START, is_close, is_comment,
-    is_open, kind, piece,
+    BLOCK_COMMENT, FT, IN_F, LINE_COMMENT, MATCH, P_END, P_KIND, P_NL, P_START, is_close,
+    is_comment, is_open, kind, piece,
 };
 use crate::tools::fmt::wrap::wrap_line;
 
@@ -50,6 +54,11 @@ pub static var RANGED: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 static var GEN: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // The bars of closures (mark_bars).
 static var BAR: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// (0.25.1) The trailing commas (mark_commas): a `,` written after the
+// piece (ADDC), the `,` piece not written (DROPC); whether there is one.
+static var ADDC: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var DROPC: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var COMMAS_CHANGED: bool = false;
 
 // The open brackets (frames) while lines are indented: the base level,
 // the level of the statement being written in it, the kind of its first
@@ -508,6 +517,137 @@ pub fn lay_out() {
         }
         indent_lines(true);
         blank_lines();
+        mark_commas();
+    }
+}
+
+// The commas of the list in brackets o..c, at its level (not a closure's,
+// not in type arguments); -1 when it is no list: a `;` at its level (a
+// block, `[x; n]`).
+fn list_commas(o: i64, c: i64) -> i64 {
+    unsafe {
+        var commas = 0;
+        var angles = 0;
+        var p = o + 1;
+        while p < c {
+            let k = kind(p);
+            if is_open(k) {
+                p = MATCH.data[p] + 1;
+                continue;
+            }
+            if generic(p) {
+                if k == Tok::Lt as i64 {
+                    angles += 1;
+                } else {
+                    angles -= if k == Tok::Shr as i64 { 2 } else { 1 };
+                    if angles < 0 {
+                        angles = 0;
+                    }
+                }
+            } else if k == Tok::Semi as i64 {
+                return -1;
+            } else if k == Tok::Comma as i64 && angles == 0 && bar(p) != 3 {
+                commas += 1;
+            }
+            p += 1;
+        }
+        commas
+    }
+}
+
+// The code piece before i, or -1.
+fn code_before(i: i64) -> i64 {
+    var j = i - 1;
+    while j >= 0 && is_comment(kind(j)) {
+        j -= 1;
+    }
+    j
+}
+
+// Whether `(` piece o is a call's or a declaration's parameters (after a
+// name, a call, an index or type arguments): `f(x,)` is `f(x)`, where
+// `(x,)` is a tuple.
+fn call_paren(o: i64) -> bool {
+    let j = code_before(o);
+    if j < 0 {
+        return false;
+    }
+    let k = kind(j);
+    k == Tok::Ident as i64 || k == Tok::RParen as i64 || k == Tok::RBracket as i64
+        || (generic(j) && (k == Tok::Gt as i64 || k == Tok::Shr as i64))
+}
+
+// Whether the last element of the list in brackets o..c (from its last
+// comma at its level) starts with `..` or `...` (a struct literal's base,
+// a rest pattern, C's varargs): no comma after it.
+fn rest_last(o: i64, c: i64) -> bool {
+    unsafe {
+        var start = o + 1;
+        var p = o + 1;
+        while p < c {
+            let k = kind(p);
+            if is_open(k) {
+                p = MATCH.data[p] + 1;
+                continue;
+            }
+            if k == Tok::Comma as i64 && bar(p) != 3 {
+                start = p + 1;
+            }
+            p += 1;
+        }
+        while start < c && is_comment(kind(start)) {
+            start += 1;
+        }
+        start < c && (kind(start) == Tok::DotDot as i64 || kind(start) == Tok::Ellipsis as i64)
+    }
+}
+
+// ADDC and DROPC: a list (in `(`, `[` or `{`, with a `,` at its level; a
+// call's in `(` with none) whose closing bracket starts a line gets a `,`
+// after its last element; one whose closing bracket follows its `,` on
+// the line loses it (not a tuple's of one: `(x,)`). Not in an attribute's
+// `#[..]`, an f-string, or after a `}` in braces (a block, an arm's).
+fn mark_commas() {
+    unsafe {
+        let n = P_KIND.count;
+        set(&ADDC, n, 0);
+        set(&DROPC, n, 0);
+        COMMAS_CHANGED = false;
+        for c in 0..n {
+            let kc = kind(c);
+            if !is_close(kc) || RANGED.data[c] == 0 || IN_F.data[c] != 0 {
+                continue;
+            }
+            let o = MATCH.data[c];
+            let l = code_before(c);
+            if l <= o || RANGED.data[l] == 0 {
+                continue;
+            }
+            if kc == Tok::RBracket as i64 && o > 0 && kind(o - 1) == Tok::Hash as i64 {
+                continue;
+            }
+            let commas = list_commas(o, c);
+            if commas < 0 {
+                continue;
+            }
+            let kl = kind(l);
+            if BRK.data[c] != 0 {
+                if kl == Tok::Comma as i64 || kl == Tok::LBrace as i64 || rest_last(o, c) {
+                    continue;
+                }
+                let list = if kc == Tok::RParen as i64 { commas > 0 || call_paren(o) }
+                    else if kc == Tok::RBracket as i64 { commas > 0 }
+                    else { commas > 0 && kl != Tok::RBrace as i64 };
+                if list {
+                    ADDC.data[l] = 1;
+                    COMMAS_CHANGED = true;
+                }
+            } else if kl == Tok::Comma as i64 && l == c - 1 && bar(l) != 3
+                && (kc != Tok::RParen as i64 || commas > 1 || call_paren(o)) {
+                DROPC.data[l] = 1;
+                COMMAS_CHANGED = true;
+            }
+        }
     }
 }
 
@@ -723,10 +863,16 @@ pub fn write_layout(out: i64) {
                 buf_bytes(out, "    ");
             }
             for k in i..e {
+                if DROPC.data[k] != 0 {
+                    continue;
+                }
                 if k > i && space(k - 1, k) > 0 {
                     buf_byte(out, ' ');
                 }
                 buf_bytes(out, piece(k));
+                if ADDC.data[k] != 0 {
+                    buf_byte(out, ',');
+                }
             }
             buf_byte(out, '\n');
             i = e;

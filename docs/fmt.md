@@ -19,7 +19,7 @@ The files are given as paths (a `.vl` file, a directory: its `.vl`
 files, recursively), or as a MODULE of the program (its file and its
 children's), or as nothing: every file of the program at ROOT (found as
 for query). `--all` is every `.vl` file under `compiler/`, `tests/`,
-`examples/` and `bench/` of the current directory: the tree, but the
+`examples/`, `bench/` and (0.25.1) `tools/` of the current directory: the tree, but the
 programs of the tools' transcript tests (`tests/query/`,
 `tests/refactor/`), whose text is what they test (untidy imports for
 `fix`, a layout for `fmt`).
@@ -102,11 +102,20 @@ Within that:
   of a file, impl, trait, module or extern block when either is a
   function, type, impl, trait or block of several lines (one-line items,
   `use`, `mod`, `const`, stay together).
-- **`use` lines**: each run of `use` items on consecutive lines (no blank
-  line or comment between or after them) as `fix --only tidy-imports`
+- **`use` lines**: each run of `use` items (on lines of their own; 0.25.1:
+  blank lines between them too, no comment) as `fix --only tidy-imports`
   writes a module's: the items of one path merged, the names sorted, one
-  line when it fits in 100 columns, else wrapped; the run sorted by path,
-  segment by segment.
+  line when it fits in 100 columns, else wrapped; (0.25.1) the run in
+  groups, `std`, then `crate`, then the rest (`super`, `self`, a child
+  module), a blank line between two, each sorted by path, segment by
+  segment.
+- **Trailing commas** (0.25.1): a list in `(`, `[` or `{` (with a `,`;
+  a call's of one argument too) whose closing bracket starts a line has
+  a `,` after its last element; one whose closing bracket follows its
+  last `,` on the line loses it, but a tuple of one (`(x,)`). None after
+  a `}` in braces (a block, an arm's), a `..` or `...`, in an attribute's
+  `#[..]` or an f-string. The check below compares the tokens with the
+  trailing commas aside. The style as a whole: [style.md](style.md).
 - **Wrapping at 100 columns**: a longer line is broken where it
   overflows, in the brackets around that point, at the first of: a `,` or
   `;` (filled: as many as fit on each line), an `else`, a binary operator,
