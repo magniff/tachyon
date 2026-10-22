@@ -41,7 +41,7 @@ Most say what to do, in their `help:`. A `KIND` (`type error`,
 $ volec explain unsafe
 unsafe: error (compiler)
 An unsafe operation (a raw pointer's dereference or indexing, a C call, a union field) outside unsafe code.
-fix: Put it in an `unsafe { }` block, or the function in `unsafe fn`; the try: line, `volec fix --only unsafe ROOT`, wraps every such place (the check hook prints it once, with how many errors it answers). Through a `*T` parameter (raw since 0.18.1, V4; until then a non-`mut` one was a borrow, `&mut T`): make it `&T`, or `&mut T` when written through, with `volec fix --values ROOT` (every such parameter and its calls), then `fix --only unsafe` for what it keeps raw (indexed, compared, cast, stored, given to C).
+fix: Put it in an `unsafe { }` block, or the function in `unsafe fn`; the try: line, `volec fix --only unsafe ROOT`, wraps every such place (the check hook prints it once, with how many errors it answers). Through a `*T` parameter that only reads or writes one value: make it a let parameter `x: T`, or `x: inout T` when written through (`volec refactor signature F --convention x inout`), and keep `*T` for what stays raw (indexed, compared, cast, stored, given to C).
 example:
     main.vl:39:13: error[unsafe] dereference of a raw pointer is unsafe | help: put it in an `unsafe { ... }` block, or the function's body in an `unsafe fn` (the try: line wraps every such place) | try: volec fix --only unsafe main.vl
 ```

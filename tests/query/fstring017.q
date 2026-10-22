@@ -17,11 +17,11 @@ $ refs println push_fmt format_in --in fstring017/main.vl
 4:5	call	show	->std::fmt::println	println(x);
 9:5	call	main	->std::fmt::println	println(f"n = {n}");
 12:7	call	main	->std::Buf::push_fmt	b.push_fmt(f"[{n}]");
-13:13	call	main	->std::fmt::format_in	let t = format_in(f"{n}!", gpa);
+13:13	call	main	->std::fmt::format_in	var t = format_in(f"{n}!", gpa);
 14:5	call	main	->std::fmt::println	println(t.as_slice());
 $ effects main --why io
 crate::main	alloc(Gpa) io global panic diverge
   'println(f"n = {n}")' at fstring017/main.vl:9:5 calls 'std::fmt::println'
-  'print_acquire()' at <std>:10759:5 calls 'std::fmt::print_acquire'
-  'print_acquire_held()' at <std>:10720:9 calls 'std::fmt::print_acquire_held'
+  'print_acquire()' at <std>:10765:5 calls 'std::fmt::print_acquire'
+  'print_acquire_held()' at <std>:10726:9 calls 'std::fmt::print_acquire_held'
   (no source found)
