@@ -39,7 +39,8 @@
 #
 # Steps: chain; suite-O0, suite-O1, suite-O2; fuzz-plain, fuzz-loops,
 # fuzz-generics, fuzz-pressure, fuzz-calls, fuzz-lang06, fuzz-vector,
-# fuzz-div, fuzz-range, fuzz-arch (0.19: intrinsics), fuzz-seed
+# fuzz-div, fuzz-range, fuzz-arch (0.19: intrinsics), fuzz-guard (0.25:
+# guarded accesses, never run where the program does not), fuzz-seed
 # (against the Rust seed); abi-plain,
 # abi-import, abi-header; objcheck; layout (tests/cimport/layout.sh); debug (tests/debug.sh);
 # objcheck-x86-arch (0.19: the std::arch cases for x86_64-macos, compiled
@@ -187,7 +188,7 @@ esac
 [ -z "$FUZZ_N" ] || { FZ=$FUZZ_N; XFZ=$FUZZ_N; AFZ=$FUZZ_N; }
 [ -z "$ABI_N" ] || { AB=$ABI_N; XAB=$ABI_N; AAB=$ABI_N; }
 
-FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-seed"
+FUZZ_STEPS="fuzz-plain fuzz-loops fuzz-generics fuzz-pressure fuzz-calls fuzz-lang06 fuzz-vector fuzz-div fuzz-range fuzz-arch fuzz-guard fuzz-seed"
 ABI_STEPS="abi-plain abi-import abi-header"
 HOST_STEPS="suite-O0 suite-O1 suite-O2 $FUZZ_STEPS $ABI_STEPS objcheck objcheck-x86-arch layout debug threads incremental stress-grow examples-checkalloc compiler-memcheck voltty-fuzz compile-cost"
 # (0.25) the chain's integrity, by --release (or --only): slow, and they
@@ -353,6 +354,7 @@ run_step() {
         fuzz-div) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -D ;;
         fuzz-range) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -R ;;
         fuzz-arch) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -A ;;
+        fuzz-guard) sh "$ROOT/tests/fuzz/run.sh" -c "$C" -n "$FZ" -k "$k" -G ;;
         fuzz-seed)
             seed=$(find_seed)
             if [ -z "$seed" ]; then

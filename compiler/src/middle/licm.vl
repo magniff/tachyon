@@ -5,7 +5,10 @@
 // block entering the header from outside; made by splitting the entering
 // edge when needed), and so does a load from a frame slot or a static
 // that nothing in the loop may write. Nothing here can trap: division
-// never traps in vole, and those loads always address valid memory.
+// never traps in vole, and (0.25) a load moves only when its address is
+// inside its object on every path (a field at a constant offset) or it
+// runs in the loop's first iteration anyway: an element's load, valid
+// only under its bounds check, stays below it.
 
 // Loops: header, then the index of their first body block in LOOP_BODY,
 // and its count (3 per loop).
@@ -17,11 +20,12 @@ use crate::front::features::fn_needs;
 use crate::front::types::{is_vector, type_size};
 use crate::middle::ctx::FnCtx;
 use crate::middle::gvn::{
-    address_base, build_dom_tree, call_may_write, copy_dst, copy_size, find_escaping_slots, is_copy,
-    may_alias, root_of,
+    address_base, build_dom_tree, call_may_write, copy_dst, copy_size, find_escaping_slots,
+    in_object_bounds, is_copy, may_alias, root_of,
 };
 use crate::middle::ipo::{
-    ATTR_NOPANIC, ATTR_READNONE, ATTR_READONLY, ATTR_WILLRETURN, call_attrs, call_writes,
+    ATTR_BOUNDED, ATTR_NOPANIC, ATTR_READNONE, ATTR_READONLY, ATTR_WILLRETURN, call_attrs,
+    call_writes,
 };
 use crate::middle::ir::{
     IRFUNCS, Op, Term, ir_append, ir_arg, ir_enter, ir_new_block, ir_resolve_operands, ir_unlink,
@@ -170,7 +174,17 @@ fn is_invariant(cx: sink *FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> 
             if root_of(cx, base) == 0 {
                 return false;
             }
-            return !loop_may_write(cx, start, count, base, offset, type_size(cx.insts[v].ty));
+            // (0.25) Run in the preheader, it runs where the loop may not
+            // have: only an access known inside its object (a slot's or a
+            // static's field, not an element at a variable index, valid
+            // only under its bounds check), or one that runs in the first
+            // iteration anyway.
+            let size = type_size(cx.insts[v].ty);
+            if !in_object_bounds(cx, cx.insts[v].a, cx.insts[v].imm, size)
+                && !runs_first(cx, v, stamp, start, count) {
+                return false;
+            }
+            return !loop_may_write(cx, start, count, base, offset, size);
         }
         if op.is_call() {
             return call_invariant(cx, v, stamp, start, count);
@@ -226,8 +240,10 @@ pub fn op_guarded(cx: sink *FnCtx, v: i64) -> bool {
 
 // (0.16) Whether call v (in loop l's body, blocks marked `stamp`) may move
 // to the preheader: a direct call with a scalar result, READNONE, its
-// arguments defined outside; and either WILLRETURN and NOPANIC (it may
-// run where the loop would not have run it), or certain to run in the
+// arguments defined outside; and either WILLRETURN, NOPANIC and (0.25)
+// BOUNDED (it may run where the loop would not have run it: returning is
+// not enough, a call that returns after 2^62 steps hangs the program the
+// loop ends), or certain to run in the
 // loop's first iteration before anything a panic or a stop would make
 // visible (then it runs once, earlier, with the same arguments).
 fn call_invariant(cx: sink *FnCtx, v: i64, stamp: i64, start: i64, count: i64) -> bool {
@@ -245,7 +261,7 @@ fn call_invariant(cx: sink *FnCtx, v: i64, stamp: i64, start: i64, count: i64) -
                 return false;
             }
         }
-        let speculable = ATTR_WILLRETURN | ATTR_NOPANIC;
+        let speculable = ATTR_WILLRETURN | ATTR_NOPANIC | ATTR_BOUNDED;
         if (attrs & speculable) == speculable {
             return true;
         }
