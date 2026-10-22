@@ -93,6 +93,10 @@ Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
   median), resolved with the signature, effects and doc comment;
   signature help with the conventions (`let`, `inout`, `sink`); the
   extension formats on save, tab size 4.
+- **The examples audited for 0.25**: `check-alloc` rewritten (the bugs
+  it showed are compile errors now; `--check-alloc` is shown on leaks
+  and unsafe code), hand-written frees removed, the Rust-era wording
+  gone; `toposort` no longer crashes on an empty input line.
 - **Breaking**: nothing in the language. Code that passed `fmt --check`
   under 0.25.0 may need a `volec fmt`.
 
