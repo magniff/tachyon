@@ -222,23 +222,127 @@ fn check_moved(p: i64, n: i64) {
             own_str(if definite { c" is used here after it moved" }
                 else { c" is used here after it may have moved" });
         }
-        if by > 0 {
+        if by > 0 && made_closure(by) {
+            own_str(c" into the sink closure");
+        } else if by > 0 {
             moved_into(by);
+        }
+        if by > 0 {
             own_str(c" at ");
             line_col(NODES[by].start);
         }
         if !definite {
             own_str(c" (on some paths)");
         }
-        own_help(if !crate::front::conv::strict_at(NODES[n].start) {
-            c"use it before the move, pass a copy where it moves ('.clone()'), or take it by reference ('&')"
+        // (0.25: a copy only of what has Clone; a sink closure takes what it
+        // captures, and its node is no argument to wrap)
+        let closure = by > 0 && made_closure(by);
+        let moved_ty = if by > 0 && !closure { NODES[by].ty }
+            else if q == p || q < 0 { NODES[n].ty } else { -1 };
+        let copy = moved_ty >= 0 && can_clone(moved_ty);
+        if closure {
+            own_help(if copy {
+                c"the sink closure takes what it captures: use it before the closure, give the closure a copy ('let c = x.clone();' before it, 'c' in it), or capture it as a view: a closure without 'sink' that does not outlive it"
+            } else {
+                c"the sink closure takes what it captures: use it before the closure, or capture it as a view: a closure without 'sink' that does not outlive it"
+            });
+        } else if !crate::front::conv::strict_at(NODES[n].start) {
+            own_help(if copy {
+                c"use it before the move, pass a copy where it moves ('.clone()'), or take it by reference ('&')"
+            } else {
+                c"use it before the move, or take it by reference ('&')"
+            });
         } else {
-            c"use it before the move, pass a copy where it moves ('.clone()'), or let the callee borrow it: a let parameter ('x: T'), not 'sink'"
-        });
-        if by > 0 {
+            own_help(if copy {
+                c"use it before the move, pass a copy where it moves ('.clone()'), or let the callee read it: a let parameter ('x: T'), not 'sink'"
+            } else {
+                c"use it before the move, or let the callee read it: a let parameter ('x: T'), not 'sink'"
+            });
+        }
+        if by > 0 && copy && !closure {
             try_wrap(by, c"", c".clone()");
         }
         own_end();
+    }
+}
+
+// Whether a value of type t has a `.clone()` to suggest (0.25: not for a
+// type without Clone). std's containers' Clone impls are in a section
+// read only when the program mentions Clone (stdsections), so they are
+// known by name too: Vec, Buf, String, HashMap, Option, Result of what
+// has Clone (an allocator argument aside).
+fn can_clone(t: i64) -> bool {
+    clone_depth(t, 0)
+}
+
+fn clone_depth(t: i64, depth: i64) -> bool {
+    unsafe {
+        // (std's Clone itself is read only when the program mentions it)
+        let tr = crate::front::traits::std_trait(c"Clone");
+        if t <= 0 || crate::front::check::has_error_type(t) || depth > 4 {
+            return false;
+        }
+        if tr >= 0 && crate::front::traits::implements(tr, t) {
+            return true;
+        }
+        if crate::front::derive::intrinsic::is_plain(t) {
+            return true;
+        }
+        let k = TYPES[t].kind;
+        var tmpl = 0;
+        var targs = 0;
+        var count = 0;
+        if k == TyKind::Struct && STRUCTS[TYPES[t].a].tmpl != 0 {
+            let s = TYPES[t].a;
+            tmpl = STRUCTS[s].tmpl;
+            targs = STRUCTS[s].targs;
+            count = STRUCTS[s].targ_count;
+            if !within_std(STRUCTS[STRUCTS[s].tmpl - 1].module) {
+                return false;
+            }
+        } else if k == TyKind::Enum && crate::front::types::ENUMS[TYPES[t].a].tmpl != 0 {
+            let e = TYPES[t].a;
+            tmpl = -crate::front::types::ENUMS[e].tmpl;
+            targs = crate::front::types::ENUMS[e].targs;
+            count = crate::front::types::ENUMS[e].targ_count;
+            if !within_std(
+                crate::front::types::ENUMS[crate::front::types::ENUMS[e].tmpl - 1].module) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        let name = SYMS[crate::front::generics::template_name(tmpl)].text;
+        if !(name == "Vec" || name == "Buf" || name == "String" || name == "HashMap"
+            || name == "Option" || name == "Result") {
+            return false;
+        }
+        let alloc = crate::front::traits::std_trait(c"Allocator");
+        for i in 0..count {
+            let a = TLISTS.data[targs + i];
+            if !(alloc >= 0 && crate::front::traits::implements(alloc, a))
+                && !clone_depth(a, depth + 1) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// Whether node n is a closure as made (the closure, or the env the
+// closures pass made of it at its position).
+fn made_closure(n: i64) -> bool {
+    unsafe {
+        if NODES[n].kind == NodeKind::Closure {
+            return true;
+        }
+        for i in 0..CLOSURE_COUNT {
+            let c = CLOSURES[i].node;
+            if c > 0 && NODES[c].start == NODES[n].start && NODES[c].end == NODES[n].end {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -325,7 +429,7 @@ fn move_out(p: i64, n: i64, how: i64) {
             if at > 0 && NODES[at].kind == NodeKind::Index {
                 own_str(c"out of ");
                 own_sym(LOCALS[PL_RID[root]].name);
-                own_str(c": it is a loop's element, which the loop borrows");
+                own_str(c": it is a loop's element, which the loop reads in place");
             } else if at > 0 && NODES[at].kind == NodeKind::Call {
                 own_str(c"out of ");
                 own_sym(LOCALS[PL_RID[root]].name);
@@ -337,7 +441,7 @@ fn move_out(p: i64, n: i64, how: i64) {
             } else if at > 0 && NODES[at].kind == NodeKind::Closure {
                 own_str(c"out of ");
                 own_sym(LOCALS[PL_RID[root]].name);
-                own_str(c": the closure is given a borrowing iterator's item, a copy of an element the container keeps");
+                own_str(c": the closure is given an iterator's item, a copy of an element the container keeps");
             } else if at > 0 && NODES[at].kind == NodeKind::Param {
                 own_str(c"out of ");
                 own_sym(LOCALS[PL_RID[root]].name);
@@ -351,32 +455,32 @@ fn move_out(p: i64, n: i64, how: i64) {
                 line_col(NODES[at].start);
                 own_str(c") binds it by reference");
             } else {
-                own_str(c"out of a binding that borrows");
+                own_str(c"out of a binding that views it");
             }
         }
         if how == MO_INDEX {
             own_help(if !crate::front::conv::strict_at(NODES[n].start) {
                 c"take it out with 'v.remove(i)' or 'std::take(&mut v[i])', or copy it ('.clone()')"
             } else {
-                c"borrow it ('let x = v[i];' reads it in place), take it out with 'v.remove(i)' or 'std::take(&v[i])', or copy it ('.clone()')"
+                c"read it in place ('let x = v[i];'), take it out with 'v.remove(i)' or 'std::take(&v[i])', or copy it ('.clone()')"
             });
-            try_wrap(n, c"", c".clone()");
+            if can_clone(NODES[n].ty) { try_wrap(n, c"", c".clone()"); }
         } else if how == -1 {
             own_help(c"copy it ('.clone()'), or match (or loop over) a value the code owns");
-            try_wrap(n, c"", c".clone()");
+            if can_clone(NODES[n].ty) { try_wrap(n, c"", c".clone()"); }
         } else if how == MO_CAPTURED {
             own_help(c"use a copy inside the closure ('.clone()'), or move the value out where the closure is made, not in its body");
-            try_wrap(n, c"", c".clone()");
+            if can_clone(NODES[n].ty) { try_wrap(n, c"", c".clone()"); }
         } else if read_only_root(p) {
             // (0.24: through a let access, `fn add(self, ..) -> N { self }`:
             // nothing can be taken out of it)
-            own_help(c"it is borrowed read-only (let): copy it ('.clone()'), or take the parameter 'sink' to own it ('sink self', 'x: sink T')");
-            try_wrap(n, c"", c".clone()");
+            own_help(c"it is a let access, read-only: copy it ('.clone()'), or take the parameter 'sink' to own it ('sink self', 'x: sink T')");
+            if can_clone(NODES[n].ty) { try_wrap(n, c"", c".clone()"); }
         } else {
             own_help(if !crate::front::conv::strict_at(NODES[n].start) {
                 c"take it out and leave an empty value in its place ('x.take()' of a Vec, Buf or HashMap, 'std::take(&mut x)', 'std::replace(&mut x, v)'), copy it ('.clone()'), or borrow it ('&')"
             } else {
-                c"take it out and leave an empty value in its place ('x.take()' of a Vec, Buf or HashMap, 'std::take(&x)', 'std::replace(&x, v)'), copy it ('.clone()'), or borrow it: pass it on let, or take the parameter 'sink' to own it"
+                c"take it out and leave an empty value in its place ('x.take()' of a Vec, Buf or HashMap, 'std::take(&x)', 'std::replace(&x, v)'), copy it ('.clone()'), or read it in place: pass it on let, or take the parameter 'sink' to own it"
             });
             if owned_base_type(NODES[n].ty) {
                 // (a container keeps its allocator: T4's `take`)
@@ -385,7 +489,7 @@ fn move_out(p: i64, n: i64, how: i64) {
                 try_wrap(n,
                     c"std::take(&", c")");
             }
-            try_wrap(n, c"", c".clone()");
+            if can_clone(NODES[n].ty) { try_wrap(n, c"", c".clone()"); }
         }
         own_end();
     }
@@ -444,7 +548,7 @@ pub fn byref_change(p: i64, n: i64, t: i64) {
         own_str(c"), ");
         let k = NODES[at].kind;
         if k == NodeKind::Index {
-            own_str(c"a copy of a loop's element, which the loop borrows: ");
+            own_str(c"a copy of a loop's element, which the loop reads in place: ");
             own_str(c"the change would not reach the element, and could free memory it points to");
             own_help(c"loop over the indices and change the element in place ('for i in 0..v.len() { v[i]... }')");
         } else if crate::front::own::drops::borrowed_call(at) {
@@ -475,7 +579,7 @@ pub fn borrowed_move(n: i64) {
         own_type(NODES[n].ty);
         own_str(c"): it is a copy of an element the collection keeps");
         own_help(c"copy it ('.clone()'), or pass the element by reference ('&v[i]')");
-        try_wrap(n, c"", c".clone()");
+        if can_clone(NODES[n].ty) { try_wrap(n, c"", c".clone()"); }
         own_end();
     }
 }

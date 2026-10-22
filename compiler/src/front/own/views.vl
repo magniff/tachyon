@@ -466,7 +466,7 @@ fn verb(how: i64) -> *u8 {
     if how == H_WRITE { return c"writes"; }
     if how == H_MOVE { return c"moves"; }
     if how == H_DROP { return c"drops"; }
-    if how == H_MUT { return c"borrows mutably"; }
+    if how == H_MUT { return c"takes an inout access to"; }
     if how == H_READ { return c"reads"; }
     if how == H_CALL { return c"may change"; }
     if how == H_PARENT { return c"uses"; }
@@ -650,7 +650,7 @@ fn report_invalid(s: i64, n: i64) {
             own_str(c" while ");
             own_sym(LOCALS[l].name);
             put_bound_at(s);
-            own_str(if (flags & F_MUTLOAN) != 0 { c" borrows it mutably; " }
+            own_str(if (flags & F_MUTLOAN) != 0 { c" has an inout access to it; " }
                 else { c" views it; " });
             own_sym(LOCALS[l].name);
             own_str(c" is used at ");
@@ -1193,7 +1193,7 @@ fn readonly(n: i64, l: i64, t: i64) {
             own_str(c" (a let view)");
             own_help(c"take the slice inout ('s: inout [T]', called with '&v' or '&a[..]') to change its elements");
         } else if words {
-            own_str(c" (let: borrowed to be read)");
+            own_str(c" (let: read-only)");
             own_help(c"take it inout ('x: inout T', called with '&x') to change it");
         } else if TYPES[t].kind == TyKind::Slice {
             own_help(c"take the slice inout ('s: inout [T]', called with '&v' or '&a[..]') to write its elements");
@@ -1317,14 +1317,24 @@ pub fn on_result(e: i64, v: i64) {
             if q >= 0 && !hidden_place(q) && reporting(e) {
                 let l = PL_RID[root_of(q)];
                 own_begin(e, OWN_ESCAPE);
-                own_sym(FNS[f].display);
-                own_str(c" returns a view of ");
-                own_place(q);
-                own_str(c", which is dropped when ");
-                own_sym(FNS[f].display);
-                own_str(c" returns");
+                let main_body = is_main_closure(f);
+                if main_body {
+                    // (0.25: main returning a Result: its body is a closure)
+                    own_str(c"'main' returns an error that views ");
+                    own_place(q);
+                    own_str(c", which is dropped when 'main' returns");
+                } else {
+                    own_sym(FNS[f].display);
+                    own_str(c" returns a view of ");
+                    own_place(q);
+                    own_str(c", which is dropped when ");
+                    own_sym(FNS[f].display);
+                    own_str(c" returns");
+                }
                 let lt = LOCALS[l].ty;
-                if crate::front::own::drops::BYREF.get(l + 1) != 0 {
+                if main_body {
+                    own_help(c"main's error is printed after its locals are dropped: make the error an owned value (a 'String': 'String::from_in(s, gpa)'), or handle it in main and return 'Ok(())'");
+                } else if crate::front::own::drops::BYREF.get(l + 1) != 0 {
                     // (0.18.1) `match *e { E::S(s) => s.as_slice() }`
                     own_help(c"it is a copy that 'match *e' (a loop, a 'get') binds; match the reference itself, 'match e', whose bindings are references to what it points to");
                 } else if is_owned_type(lt) {
@@ -1395,6 +1405,25 @@ pub fn on_result(e: i64, v: i64) {
             }
             POOL_TOP = m;
         }
+    }
+}
+
+// (0.25) Whether function f is the closure main's body became
+// (try_main: main_result_wrapper): its messages name 'main'.
+fn is_main_closure(f: i64) -> bool {
+    unsafe {
+        let m = crate::front::closures::MAIN_CLOSURE;
+        if m <= 0 {
+            return false;
+        }
+        for i in 0..crate::front::closures::CLOSURE_COUNT {
+            let c = crate::front::closures::CLOSURES[i];
+            if c.f == f {
+                return c.node == m
+                    || (NODES[c.node].start == NODES[m].start && NODES[c.node].end == NODES[m].end);
+            }
+        }
+        false
     }
 }
 
