@@ -23,27 +23,29 @@
 // it gives (state::mark_place): conflicts that come from it are warnings
 // (§7 V3).
 
+use crate::base::{SRC, SYMS, buf_bytes, buf_new, buf_slice, buf_str};
 use crate::front::ast::{NODES, NodeKind, child};
 use crate::front::check::Res;
 use crate::front::effects::{EFF_GLOBAL, effects_top, fn_effects};
 use crate::front::modules::{STD_MODULE, within_std};
 use crate::front::own::diag::{
-    OWN_CONFLICT, own_begin, own_end, own_help, own_pos, own_soft, own_str,
+    OWN_CONFLICT, OWN_STATIC, own_begin, own_end, own_help, own_pos, own_soft, own_str, own_sym,
+    own_try,
 };
 use crate::front::own::infer::summary_at_call;
 use crate::front::own::kinds::is_view_type;
 use crate::front::own::state::{
     CUR, NSLOT, NW, PE, PEND, PE_BY, PE_INVALID, PE_NODE, PE_OV, PE_PLACE, PK_MUT, PK_MUT_VIEW,
-    PK_NONE, PK_RAW, PK_RESERVE, PK_SHARED, PK_VIEW, PL_COUNT, POOL_TOP, STATIC_MASK, at, clear_bit,
-    get_bit, is_empty, l1, l2, mark_place, new_ov, or_expanded, or_into, ov_hits, root_of, set_bit,
-    slot_off,
+    PK_NONE, PK_RAW, PK_RESERVE, PK_SHARED, PK_VIEW, PL_COUNT, PL_RID, PL_RKIND, POOL_TOP,
+    RK_STATIC, STATIC_MASK, at, clear_bit, get_bit, is_empty, l1, l2, mark_place, new_ov,
+    or_expanded, or_into, ov_hits, root_of, set_bit, slot_off,
 };
 use crate::front::own::summary::{S_L1_P, S_L1_STAR, S_L2_P, S_L2_STAR};
 use crate::front::own::views::{
     H_CALL, H_GLOBAL, QUIET, close_mask, first_place, hidden_place, invalidate, own_place, own_src,
     seen,
 };
-use crate::front::types::{FNS, TYPES, TyKind};
+use crate::front::types::{FNS, STATICS, TYPES, TyKind};
 
 // Whether origin o holds the mark place (it came in part from a top
 // summary).
@@ -242,6 +244,10 @@ pub fn on_call(n: i64, f: i64, base: i64, dst: i64) {
             }
             a += PE;
         }
+        // (0.25) statics lent to a callee that reaches them by name
+        if end > base && !is_empty(STATIC_MASK) {
+            static_args(n, f, base, end);
+        }
         // 5. Statics (before the stores and the result: they do not hold
         // views of statics that the call may have changed).
         if (NSLOT > 0 || base > 0) && !is_empty(STATIC_MASK) {
@@ -368,6 +374,96 @@ fn global_call(n: i64, base: i64) {
         }
         invalidate(at(m), n, H_GLOBAL, -1, 0);
         POOL_TOP = m;
+    }
+}
+
+// (0.25) Statics lent to call n of f (-1: through a fn value): an
+// argument that reaches mutable static S (`&S`, `&S.f`, a let `S`
+// passed by reference, `S[..]`, a receiver `S.m()`, at level 1 or 2)
+// conflicts with a callee that may change S by name, itself or through
+// what it calls (effects::infer::static_access), and an inout one with a
+// callee that reads it: the callee would see S through two names, which
+// the optimizer takes to be apart (noalias). own.static, at the argument.
+fn static_args(n: i64, f: i64, base: i64, end: i64) {
+    unsafe {
+        var e = base;
+        while e < end {
+            let k = PEND.data[e];
+            let o = PEND.data[e + PE_OV];
+            if k != PK_NONE && k != PK_RAW && o >= 0 {
+                let arg = PEND.data[e + PE_NODE];
+                for p in 0..PL_COUNT {
+                    if !get_bit(l1(o), p) && !get_bit(l2(o), p) {
+                        continue;
+                    }
+                    let r = root_of(p);
+                    if PL_RKIND[r] != RK_STATIC {
+                        continue;
+                    }
+                    let s = PL_RID[r];
+                    let how = crate::front::effects::infer::static_access(f, s);
+                    if (how & 2) != 0 || is_mut_kind(k) && how != 0 {
+                        static_arg_error(n, f, arg, s, how);
+                        break;
+                    }
+                }
+            }
+            e += PE;
+        }
+    }
+}
+
+fn static_arg_error(n: i64, f: i64, arg: i64, s: i64, how: i64) {
+    unsafe {
+        if !reporting(arg) {
+            return;
+        }
+        let name = NODES[STATICS[s].node].a;
+        own_begin(arg, OWN_STATIC);
+        own_src(arg);
+        own_str(c" lends the static ");
+        own_sym(name);
+        own_str(c" to ");
+        own_src(n);
+        if f >= 0 {
+            own_str(c", and ");
+            own_sym(FNS[f].display);
+            own_str(if (how & 2) != 0 { c" changes " } else { c" reads " });
+            own_sym(name);
+            own_str(c" by name (itself or through what it calls)");
+        } else {
+            own_str(c", whose callee is not known and may reach it by name");
+        }
+        own_help(c"a static lent to a call must not be reached by name during the call (two names for one place, which the optimizer takes to be apart): lend a copy, then write it back");
+        // the try: the call on a copy, `var copy = G; f(&copy); G = copy;`
+        let at = SRC[NODES[arg].start..NODES[arg].end];
+        let call = SRC[NODES[n].start..NODES[n].end];
+        let amp = at.len > 1 && at[0] == '&';
+        let whole = if amp { at[1..at.len] } else { at };
+        // (`A[..]`: a copy of A, its elements lent)
+        let sliced = whole.len > 4 && whole[whole.len - 4..whole.len] == "[..]";
+        let place = if sliced { whole[0..whole.len - 4] } else { whole };
+        var cut = 0;
+        while cut + at.len <= call.len && call[cut..cut + at.len] != at {
+            cut += 1;
+        }
+        if cut + at.len <= call.len && place.len > 0 {
+            let t = buf_new();
+            buf_str(t, c"var copy = ");
+            buf_bytes(t, place);
+            buf_str(t, c"; ");
+            buf_bytes(t, call[0..cut]);
+            buf_str(t, if amp { c"&copy" } else { c"copy" });
+            if sliced {
+                buf_str(t, c"[..]");
+            }
+            buf_bytes(t, call[cut + at.len..call.len]);
+            buf_str(t, c"; ");
+            buf_bytes(t, place);
+            buf_str(t, c" = copy;");
+            own_try(buf_slice(t));
+        }
+        own_end();
     }
 }
 
