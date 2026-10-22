@@ -303,11 +303,61 @@ pub fn keyword_of_sym(sym: i64) -> Tok {
 
 // ---- The lexer ----
 
+extern "C" {
+    fn memchr(s: *u8, c: i32, n: u64) -> *u8;
+}
+
 static var LEX_POS: i64 = 0;
 static var LEX_END: i64 = 0;
 // The previous token was '.', so a number is a tuple index (`t.0.1`).
 static var LEX_AFTER_DOT: bool = false;
 static var LEX_SCRATCH: i64 = -1;
+
+// (0.25) The hot loops' byte classes (CL_ bits, by byte), and the token of
+// each byte that is a token by itself and starts no longer one (Eof: not
+// such a byte); made by the first lex_range.
+static var BYTE_CLASS: *u8 = 0 as *u8;
+static var SINGLE_TOK: *Tok = 0 as *Tok;
+// ' ', '\t', '\r', '\n'
+const CL_SPACE: u8 = 1;
+// '_', letters, digits
+const CL_IDENT: u8 = 2;
+// '_', letters: an identifier's first byte
+const CL_ALPHA: u8 = 4;
+const CL_DIGIT: u8 = 8;
+// a byte that starts a two- or three-byte operator
+const CL_OP: u8 = 16;
+
+fn init_byte_classes() {
+    unsafe {
+        BYTE_CLASS = alloc_array::<u8>(256);
+        SINGLE_TOK = alloc_array::<Tok>(256);
+        for b in 0..256 {
+            let c = b as u8;
+            var k: u8 = 0;
+            if is_whitespace(c) {
+                k |= CL_SPACE;
+            }
+            if is_ident_byte(c) {
+                k |= CL_IDENT;
+            }
+            if c == '_' || is_alpha(c) {
+                k |= CL_ALPHA;
+            }
+            if is_digit(c) {
+                k |= CL_DIGIT;
+            }
+            BYTE_CLASS[b] = k;
+            // (the bytes no two- or three-byte operator starts with)
+            if two_char_operator(c, '=') == Eof && c != '<' && c != '>' && c != '&' && c != '|'
+                && c != '-' && c != '.' && c != ':' {
+                SINGLE_TOK[b] = one_char_operator(c);
+            } else if one_char_operator(c) != Eof {
+                BYTE_CLASS[b] = k | CL_OP;
+            }
+        }
+    }
+}
 
 pub fn is_digit(c: u8) -> bool {
     c >= '0' && c <= '9'
@@ -336,43 +386,69 @@ fn at_end() -> bool {
 
 fn push_token(kind: Tok, start: i64, value: u64, suffix: i64) {
     unsafe {
-        TOKS = grow(TOKS, TOK_COUNT, &TOK_CAP);
-        TOKS[TOK_COUNT] = Token { kind, start, end: LEX_POS, value, suffix, joint: at_joint() };
+        add_token(kind, start, LEX_POS, value, suffix, joint_at(SRC, BYTE_CLASS, LEX_POS, LEX_END));
     }
-    TOK_COUNT += 1;
     LEX_AFTER_DOT = kind == Dot;
 }
 
-// Nothing separates the token just lexed from the next one.
-fn at_joint() -> bool {
-    if at_end() {
-        return false;
+fn add_token(kind: Tok, start: i64, end: i64, value: u64, suffix: i64, joint: bool) {
+    unsafe {
+        if TOK_COUNT >= TOK_CAP {
+            TOKS = grow(TOKS, TOK_COUNT, &TOK_CAP);
+        }
+        TOKS[TOK_COUNT] = Token { kind, start, end, value, suffix, joint };
     }
-    let c = peek_at(0);
-    if is_whitespace(c) {
-        return false;
+    TOK_COUNT += 1;
+}
+
+// Nothing separates the token that ends at `pos` from the next one.
+fn joint_at(src: *u8, classes: *u8, pos: i64, end: i64) -> bool {
+    unsafe {
+        if pos >= end {
+            return false;
+        }
+        let c = src[pos];
+        if (classes[c as i64] & CL_SPACE) != 0 {
+            return false;
+        }
+        if c == '/' && pos + 1 < end {
+            let next = src[pos + 1];
+            return !(next == '/' || next == '*');
+        }
+        true
     }
-    if c == '/' {
-        let next = peek_at(1);
-        return !(next == '/' || next == '*');
-    }
-    true
 }
 
 fn skip_whitespace_and_comments() {
-    loop {
-        while !at_end() && is_whitespace(peek_at(0)) {
-            LEX_POS += 1;
-        }
-        if peek_at(0) == '/' && peek_at(1) == '/' {
-            while !at_end() && peek_at(0) != '\n' {
-                LEX_POS += 1;
+    unsafe { LEX_POS = skip_blank(SRC, BYTE_CLASS, LEX_POS, LEX_END); }
+}
+
+// The position of the first byte from `pos` that is neither whitespace nor
+// in a comment (`end` when none is).
+fn skip_blank(src: *u8, classes: *u8, pos: i64, end: i64) -> i64 {
+    unsafe {
+        var p = pos;
+        loop {
+            while p < end && (classes[src[p] as i64] & CL_SPACE) != 0 {
+                p += 1;
             }
-        } else if peek_at(0) == '/' && peek_at(1) == '*' {
-            skip_block_comment();
-        } else {
-            return;
+            if p + 1 >= end || src[p] != '/' {
+                return p;
+            }
+            let next = src[p + 1];
+            if next == '/' {
+                // (to the end of the line, by memchr)
+                let nl = memchr(&src[p], 10, (end - p) as u64);
+                p = if nl == 0 as *u8 { end } else { p + (nl as i64 - (&src[p]) as i64) };
+            } else if next == '*' {
+                LEX_POS = p;
+                skip_block_comment();
+                p = LEX_POS;
+            } else {
+                return p;
+            }
         }
+        p
     }
 }
 
@@ -401,19 +477,133 @@ fn skip_block_comment() {
 pub fn lex_range(start: i64, end: i64, last: bool) {
     if LEX_SCRATCH < 0 {
         LEX_SCRATCH = buf_new();
+        init_byte_classes();
     }
     LEX_POS = start;
     LEX_END = end;
     LEX_AFTER_DOT = false;
-    loop {
-        skip_whitespace_and_comments();
-        if at_end() {
-            break;
-        }
-        lex_token();
-    }
+    lex_loop();
     if last {
         push_token(Eof, LEX_POS, 0, 0);
+    }
+}
+
+// (0.25) The tokens of SRC[LEX_POS..LEX_END), the position in a local:
+// identifiers, keywords, punctuation and plain decimal integers here,
+// the rest (strings, characters, other numbers, errors) by lex_token
+// (LEX_POS set around it).
+fn lex_loop() {
+    unsafe {
+        let src = SRC;
+        let classes = BYTE_CLASS;
+        let singles = SINGLE_TOK;
+        let end = LEX_END;
+        var pos = LEX_POS;
+        while pos < end {
+            var c = src[pos];
+            var class = classes[c as i64];
+            if (class & CL_SPACE) != 0 || c == '/' {
+                pos = skip_blank(src, classes, pos, end);
+                if pos >= end {
+                    break;
+                }
+                c = src[pos];
+                class = classes[c as i64];
+            }
+            var kind = Eof;
+            var p = pos + 1;
+            var value: u64 = 0;
+            if (class & CL_ALPHA) != 0 {
+                let next = if p < end { src[p] } else { 0 };
+                if !((c == 'c' || c == 'f') && next == '"') && !(c == 'r' && next == '#') {
+                    while p < end && (classes[src[p] as i64] & CL_IDENT) != 0 {
+                        p += 1;
+                    }
+                    let sym = intern(src[pos..p]);
+                    kind = Ident;
+                    if sym < SYM_KEYWORD_COUNT && SYM_KEYWORD[sym] != Eof {
+                        kind = SYM_KEYWORD[sym];
+                    }
+                    value = sym as u64;
+                }
+            } else {
+                kind = singles[c as i64];
+                if kind == Eof && (class & CL_OP) != 0 {
+                    // (lex_operator, here)
+                    let b = if p < end { src[p] } else { 0 };
+                    if pos + 2 < end && (c == '<' || c == '>' || c == '.') {
+                        kind = three_char_operator(c, b, src[pos + 2]);
+                        p = pos + 3;
+                    }
+                    if kind == Eof && pos + 1 < end {
+                        kind = two_char_operator(c, b);
+                        p = pos + 2;
+                    }
+                    if kind == Eof {
+                        kind = one_char_operator(c);
+                        p = pos + 1;
+                    }
+                } else if kind == Eof && (class & CL_DIGIT) != 0 {
+                    let after = lex_plain_integer(src, classes, pos, end);
+                    if after > pos {
+                        pos = after;
+                        continue;
+                    }
+                }
+            }
+            if kind == Eof {
+                LEX_POS = pos;
+                lex_token();
+                pos = LEX_POS;
+                continue;
+            }
+            // (joint_at, here)
+            var joint = false;
+            if p < end {
+                let d = src[p];
+                joint = (classes[d as i64] & CL_SPACE) == 0
+                    && !(d == '/' && p + 1 < end && (src[p + 1] == '/' || src[p + 1] == '*'));
+            }
+            if TOK_COUNT >= TOK_CAP {
+                TOKS = grow(TOKS, TOK_COUNT, &TOK_CAP);
+            }
+            TOKS[TOK_COUNT] = Token { kind, start: pos, end: p, value, suffix: 0, joint };
+            TOK_COUNT += 1;
+            LEX_AFTER_DOT = kind == Dot;
+            pos = p;
+        }
+        LEX_POS = pos;
+    }
+}
+
+// A decimal integer without '_' or a suffix at `pos`, not a float (or a
+// tuple index): its token added, its end returned; else `pos`, nothing
+// added (lex_number then lexes it, and reports its errors).
+fn lex_plain_integer(src: *u8, classes: *u8, pos: i64, end: i64) -> i64 {
+    unsafe {
+        var p = pos;
+        var value: u64 = 0;
+        while p < end && (classes[src[p] as i64] & CL_DIGIT) != 0 {
+            let digit = (src[p] - '0') as u64;
+            if value > (0xffffffffffffffff - digit) / 10 {
+                return pos;
+            }
+            value = value * 10 + digit;
+            p += 1;
+        }
+        if p < end {
+            let c = src[p];
+            if (classes[c as i64] & CL_IDENT) != 0 {
+                return pos;
+            }
+            if c == '.' && !LEX_AFTER_DOT && p + 1 < end
+                && (classes[src[p + 1] as i64] & CL_DIGIT) != 0 {
+                return pos;
+            }
+        }
+        add_token(Int, pos, p, value, 0, joint_at(src, classes, p, end));
+        LEX_AFTER_DOT = false;
+        p
     }
 }
 
@@ -532,19 +722,22 @@ fn one_char_operator(c: u8) -> Tok {
 
 fn lex_operator() {
     let start = LEX_POS;
-    let a = peek_at(0);
-    if LEX_POS + 2 < LEX_END {
-        let kind = three_char_operator(a, peek_at(1), peek_at(2));
-        if kind != Eof {
-            LEX_POS += 3;
-            push_token(kind, start, 0, 0);
-            return;
+    let end = LEX_END;
+    let src = SRC;
+    let a = unsafe { src[start] };
+    if start + 1 < end {
+        let b = unsafe { src[start + 1] };
+        if start + 2 < end {
+            let kind = three_char_operator(a, b, unsafe { src[start + 2] });
+            if kind != Eof {
+                LEX_POS = start + 3;
+                push_token(kind, start, 0, 0);
+                return;
+            }
         }
-    }
-    if LEX_POS + 1 < LEX_END {
-        let kind = two_char_operator(a, peek_at(1));
+        let kind = two_char_operator(a, b);
         if kind != Eof {
-            LEX_POS += 2;
+            LEX_POS = start + 2;
             push_token(kind, start, 0, 0);
             return;
         }
@@ -593,11 +786,14 @@ fn lex_radix_digits(radix: u64) -> u64 {
         }
         var value: u64 = 0;
         var last_underscore = false;
-        while !at_end() {
-            let c = peek_at(0);
+        let src = SRC;
+        let end = LEX_END;
+        var p = LEX_POS;
+        while p < end {
+            let c = src[p];
             if c == '_' {
                 last_underscore = true;
-                LEX_POS += 1;
+                p += 1;
                 continue;
             }
             let digit = digit_value(c, radix);
@@ -606,11 +802,12 @@ fn lex_radix_digits(radix: u64) -> u64 {
             }
             last_underscore = false;
             if value > (0xffffffffffffffff - digit as u64) / radix {
-                error_at(LEX_POS, c"literal overflow");
+                error_at(p, c"literal overflow");
             }
             value = value * radix + digit as u64;
-            LEX_POS += 1;
+            p += 1;
         }
+        LEX_POS = p;
         check_trailing_underscore(last_underscore);
         value
     }

@@ -115,7 +115,7 @@ pointer) and every arithmetic rule.
 | GVN | a walk of the dominator tree with a scoped hash table (undo log, so scopes are popped in constant time per entry) over the pure instructions; commutative operands in a canonical order | `gvn.vl` |
 | alias analysis | an address is a base plus a constant offset; it points into a memory object (a frame slot, a static, constant data) through additions of constant or variable offsets, or into unknown memory; distinct objects never overlap; constant data is never written; a slot whose address only serves loads, stores, copies (memcpy calls included) and address arithmetic is private: no pointer from elsewhere and no call reaches it; within one object, byte ranges are compared when both offsets are known. No type-based rule: vole allows casts between any pointers | `gvn.vl` |
 | dead code elimination | mark from instructions with side effects and the terminators, sweep the rest | `opt.vl` |
-| LICM | natural loops from back edges (`h` dominates `t`); a preheader for each loop (the entering edge is split when needed); pure instructions whose operands are defined outside the loop move to the preheader, innermost loops first, and so do loads from frame slots and statics that nothing in the loop may write. Nothing moved can trap (division never traps in vole) | `licm.vl` |
+| LICM | natural loops from back edges (`h` dominates `t`); a preheader for each loop (the entering edge is split when needed); pure instructions whose operands are defined outside the loop move to the preheader, innermost loops first, and so do loads from frame slots and statics that nothing in the loop may write. Nothing moved can trap (division never traps in vole): (0.25) a load moves only when its address is inside its object on every path (a slot's or a static's field, at a constant offset within its size) or it runs in the loop's first iteration anyway (`runs_first`); an element at a variable index is valid only under its bounds check and stays below it | `licm.vl` |
 | SROA | a frame slot of a struct, tuple, enum, slice, small array or scalar whose address serves only loads, stores and copies at constant offsets becomes one SSA variable per scalar leaf of its type, by Braun et al.'s construction over the existing CFG (blocks in reverse post-order, sealed once their predecessors are filled); copies move leaf by leaf, to or from memory when the other side stays there. The values of `if`, `match` and `loop` of up to 128 bytes are built in one slot each exit copies into, so they are replaced too | `sroa.vl` |
 | constant tables | a private slot written only by stores of constants at known offsets, in one block that comes before every read, becomes read-only data; loads from read-only data (and string literals) at known offsets become constants | `sroa.vl`, `gvn.vl` |
 | memory forwarding | along the dominator tree: what a block knows about memory (location to value) goes to a block it dominates when that one's only predecessor is it, or after the writes of every block on the paths between them are applied; loads of known locations are their values; storing what a location holds is dropped; a load from the destination of a copy that still holds reads its source (and the copy may then die) | `gvn.vl` |
@@ -747,6 +747,7 @@ function from its instructions and its callees' attributes:
 | `noreturn` | never returns (every path ends in a panic or a noreturn call) |
 | `willreturn` | always returns: no loop, no recursion, only willreturn callees |
 | `nopanic` | cannot panic or exit: no bounds check, no `as E` check, only nopanic callees |
+| `bounded(N)` | (0.25) returns after a few instructions: no cycle, at most 64 of its own and its callees' (N), only bounded callees; libm's functions are bounded |
 | `nocapture(i)` | pointer parameter i is only dereferenced, compared or passed to nocapture parameters: it is not stored, returned or converted |
 
 A C function (`extern "C"` import), an indirect call and a function that
@@ -773,7 +774,10 @@ offsets are disjoint when the value ranges at their blocks (bounds
 checks, loop counters, masks) keep them apart. Calls in the loop must
 not reach the location (a private slot, or a readnone callee). The pass
 runs after LICM, and an address constant (a slot's or a static's
-address) defined in the loop is made again outside it. Not promoted:
+address) defined in the loop is made again outside it. (0.25) The
+location must be inside its object by the value ranges at the
+preheader, where it is loaded: the facts at the loop's accesses (a
+bounds check's) hold only past them. Not promoted:
 `bench/interp`'s `vm.sp`. Indexing a fixed array is not checked in
 vole, so nothing bounds `vm.stack[vm.sp]` away from `vm.sp`; with
 checked array indexing (or out-of-bounds array indexing declared
@@ -806,7 +810,11 @@ addresses in place of rescanning per address, and a component whose
 functions do not call each other is inferred in one round. The largest
 phases are the loop passes (about 130 ms), register allocation with
 emission (about 110 ms) and inlining with the simplification after it
-(about 80 ms).
+(about 80 ms). (0.25) Its first line, `read, lex and modules (and C
+imports)`, is the time before parsing: reading the files, lexing them,
+loading the modules and std's sections; until 0.25 a compilation left it
+out (about 100 ms of the self-compile), and `VOLE_PHASE_TIMES=1` prints it
+as its first phase too.
 
 **Function pointers as constants:** interprocedural constant propagation
 carries function addresses too: a function pointer parameter every
@@ -1609,9 +1617,12 @@ callee is simplified again after inlining (`repeated_pure_calls`).
 
 **Loop-invariant calls** (`licm.vl`): a direct call with a scalar
 result, `readnone`, its arguments defined outside the loop, moves to the
-preheader when it is also `willreturn` and `nopanic` (it may then run
-where the loop would not have run it: on no path, or once for a call
-that ran on some iterations), or when it is certain to run in the
+preheader when it is also `willreturn`, `nopanic` and (0.25) `bounded`
+(it may then run where the loop would not have run it: on no path, or
+once for a call that ran on some iterations; `willreturn` alone is not
+enough, a `for i in 0..n` returns after n iterations, and run under a
+condition that never holds, with n = 2^62, it hangs a program that
+ends), or when it is certain to run in the
 loop's first iteration before anything visible (`runs_first`): its
 block dominates every block that leaves the loop or goes back to its
 header, no inner loop comes before it, and the calls that may run

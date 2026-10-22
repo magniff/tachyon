@@ -51,7 +51,17 @@ pub const ATTR_READONLY: i64 = 2;
 pub const ATTR_NORETURN: i64 = 4;
 pub const ATTR_WILLRETURN: i64 = 8;
 pub const ATTR_NOPANIC: i64 = 16;
-const ATTR_ALL: i64 = 31;
+// (0.25) BOUNDED: it returns after a small, bounded amount of work (no
+// cycle, at most SPECULATE_COST of its own and its callees' instructions,
+// only bounded callees); its cost is the bits from ATTR_COST_SHIFT. What
+// LICM may run where the program would not have (WILLRETURN alone is not:
+// `for i in 0..n` returns, after n iterations).
+pub const ATTR_BOUNDED: i64 = 32;
+const ATTR_COST_SHIFT: i64 = 8;
+const SPECULATE_COST: i64 = 64;
+// The cost of a bounded C library function (builtin.vl's table: libm).
+const C_LIB_COST: i64 = 16;
+const ATTR_ALL: i64 = 63;
 
 // Per IR function: its attributes, and a bit per call operand that is a
 // pointer the function does not capture (nocapture: only dereferenced,
@@ -112,10 +122,17 @@ pub fn call_attrs(cx: sink *FnCtx, v: i64) -> i64 {
 pub fn front_attrs(f: i64) -> i64 {
     unsafe {
         var e = fn_effects(f);
+        // (0.25) A C function of the table (that declares nothing): libm is
+        // bounded.
+        let table = FNS[f].is_extern && FNS[f].effect_decl == 0
+            && (known_c_effects(FNS[f].name).bits & EFF_UNKNOWN) == 0;
         if (e.bits & EFF_UNKNOWN) != 0 && FNS[f].is_extern && FNS[f].effect_decl == 0 {
             e = known_c_effects(FNS[f].name);
         }
         var attrs = effects_attrs(e, FNS[f].is_extern && numeric_params(f));
+        if table {
+            attrs = c_lib_bounded(attrs);
+        }
         if FNS[f].is_extern && (attrs & ATTR_WILLRETURN) == 0 {
             // (A C function that may not return may exit: `exit`, `abort`.)
             attrs = attrs & ~ATTR_NOPANIC;
@@ -173,8 +190,22 @@ fn c_lib_attrs(cx: sink *FnCtx, v: i64, sym: i64) -> i64 {
             }
         }
         let attrs = effects_attrs(known_c_effects(sym), floats);
-        if (attrs & ATTR_WILLRETURN) == 0 { 0 } else { attrs }
+        if (attrs & ATTR_WILLRETURN) == 0 { 0 } else { c_lib_bounded(attrs) }
     }
+}
+
+// (0.25) A C library function of builtin.vl's table that reads no memory
+// (libm) is bounded: a few dozen instructions, whatever its arguments.
+fn c_lib_bounded(attrs: i64) -> i64 {
+    let pure = ATTR_READNONE | ATTR_WILLRETURN | ATTR_NOPANIC;
+    if (attrs & pure) == pure { attrs | ATTR_BOUNDED | (C_LIB_COST << ATTR_COST_SHIFT) }
+    else { attrs }
+}
+
+// (0.25) The cost of a call with attributes `attrs` (call_attrs) when it is
+// bounded, else -1.
+pub fn bounded_cost(attrs: i64) -> i64 {
+    if (attrs & ATTR_BOUNDED) == 0 { -1 } else { (attrs >> ATTR_COST_SHIFT) & 255 }
 }
 
 // Whether call v may write memory other than the caller's private slots.
@@ -216,6 +247,8 @@ fn compute_attrs(cx: sink *FnCtx, fi: i64) -> i64 {
         layout_order(cx, fi);
         var attrs = ATTR_ALL;
         var returns = false;
+        // (0.25) Its instructions and its callees' costs, for BOUNDED.
+        var cost = 0;
         for i in 0..cx.order.count {
             let b = cx.order.data[i];
             if cx.blocks[b].term == Term::Ret {
@@ -226,12 +259,15 @@ fn compute_attrs(cx: sink *FnCtx, fi: i64) -> i64 {
             for k in 0..succ_count(cx, b) {
                 let s = succ(cx, b, k);
                 if cx.blocks[s].order >= 0 && cx.blocks[s].order <= cx.blocks[b].order {
-                    attrs = attrs & ~ATTR_WILLRETURN;
+                    attrs = attrs & ~(ATTR_WILLRETURN | ATTR_BOUNDED);
                 }
             }
             var v = cx.blocks[b].first;
             while v != 0 {
                 let op = cx.insts[v].op;
+                if op != Const {
+                    cost += 1;
+                }
                 if op == Load {
                     if reads_shared(cx, cx.insts[v].a) {
                         attrs = attrs & ~ATTR_READNONE;
@@ -259,7 +295,7 @@ fn compute_attrs(cx: sink *FnCtx, fi: i64) -> i64 {
                         if g >= 0 && FN_SCC[g] == FN_SCC[fi] {
                             // Within the component: what is assumed so far;
                             // recursion may not return.
-                            known = FN_ATTRS[g] & ~ATTR_WILLRETURN;
+                            known = FN_ATTRS[g] & ~(ATTR_WILLRETURN | ATTR_BOUNDED);
                             cx.used_component = true;
                         }
                     }
@@ -275,6 +311,15 @@ fn compute_attrs(cx: sink *FnCtx, fi: i64) -> i64 {
                     if known & ATTR_NOPANIC == 0 {
                         attrs = attrs & ~ATTR_NOPANIC;
                     }
+                    // (A call that does not return ends the work too.)
+                    if known & ATTR_NORETURN == 0 {
+                        let c = bounded_cost(known);
+                        if c < 0 {
+                            attrs = attrs & ~ATTR_BOUNDED;
+                        } else {
+                            cost += c;
+                        }
+                    }
                 }
                 v = cx.insts[v].next;
             }
@@ -282,7 +327,14 @@ fn compute_attrs(cx: sink *FnCtx, fi: i64) -> i64 {
         if returns {
             attrs = attrs & ~ATTR_NORETURN;
         } else {
-            attrs = attrs & ~ATTR_WILLRETURN;
+            attrs = attrs & ~(ATTR_WILLRETURN | ATTR_BOUNDED);
+        }
+        if (attrs & ATTR_BOUNDED) != 0 {
+            if cost > SPECULATE_COST {
+                attrs = attrs & ~ATTR_BOUNDED;
+            } else {
+                attrs = attrs | (cost << ATTR_COST_SHIFT);
+            }
         }
         FN_NOCAPTURE[fi] = compute_nocapture(cx, fi);
         attrs
@@ -452,6 +504,11 @@ pub fn print_attrs() {
             }
             if a & ATTR_NOPANIC != 0 {
                 buf_str(out, c" nopanic");
+            }
+            if a & ATTR_BOUNDED != 0 {
+                buf_str(out, c" bounded(");
+                buf_int(out, bounded_cost(a));
+                buf_str(out, c")");
             }
             let nc = FN_NOCAPTURE[fi];
             for k in 0..63 {

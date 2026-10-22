@@ -48,9 +48,13 @@ moves in), no views (`sync.borrow_escapes`) and no raw pointers
 (`sync.not_send`). `thread::scope(|s| ...)` joins every thread started
 with `s.spawn` before it returns, so those may use the caller's values
 and views; while the scope runs its closure changes nothing they use
-(`sync.scope_write`), and a scoped thread only reads what it is given
-(`sync.scope_shared_write`: return results through `join`, or use a Mutex
-or an atomic). No thread may reach a `static var` (`sync.global`; `query
+(`sync.scope_write`; a counter no thread uses is fine), and a scoped
+thread only reads what it is given (`sync.scope_shared_write`, also for
+`&v`, `&a[..]`, `v[i] = x` and `a.sort()`: return results through `join`,
+or use a Mutex or an atomic; two threads cannot yet each write their own
+part of one slice, there is no `split_at_mut`). Neither the scope nor a
+scoped thread's handle leaves `thread::scope` (`sync.scope_escape`): join
+inside and return the results. No thread may reach a `static var` (`sync.global`; `query
 effects FILE:LINE --why global` shows the chain); printing is fine.
 
 ```tach
@@ -87,7 +91,9 @@ never interleaves.
 
 `std::sync::Mutex<T>` owns its data: `m.with(|data| ...)` locks, runs the
 closure and unlocks (`try_with` when the lock is free now), the way to
-reach the data in 0.21.0. Scoped threads share the Mutex (and an atomic). `m.lock()` gives a guard that unlocks when dropped, but it is
+reach the data in 0.21.0. The closure's result may not view the data,
+nor may it store a view of it elsewhere (`own.escape`: the lock is
+released when `with` returns): copy out what you need. Scoped threads share the Mutex (and an atomic). `m.lock()` gives a guard that unlocks when dropped, but it is
 `unsafe` and internal until a type holding a view may implement Drop
 (0.21.x): nothing keeps the guard inside the mutex's life yet. `Once`'s
 `call_once(f)` runs f once whatever the threads; `Condvar`'s
@@ -97,7 +103,11 @@ under the lock (`notify_one`, `notify_all`). There is no poisoning.
 `std::sync::mpsc::channel_in(gpa)` gives a `Sender` (clone it for more
 senders) and a `Receiver`: `send(x)` fails, giving `x` back, when the
 receiver is gone; `recv()` waits, and fails when every sender is gone and
-nothing is left; `for x in rx.iter()` runs until then.
+nothing is left; `for x in rx.iter()` runs until then. What a channel
+carries, a Mutex holds and `with`'s closure returns is no view
+(`sync.view_item`): it comes out elsewhere, later, maybe after what it
+views is gone; send an owned copy (`s.to_vec_in(gpa)`,
+`s.to_string_in(gpa)`).
 
 ```tach
 use std::thread;

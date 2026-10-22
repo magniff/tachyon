@@ -3,7 +3,8 @@
 # headless:
 #
 # - every tests/gpu/cases/*.vl is compiled with tests/gpu/support.vl
-#   and `-l objc` (std::objc opens the frameworks at run time), run under
+#   (std::objc links libobjc, `#[link]`, and opens the frameworks at run
+#   time), run under
 #   Metal's API and shader validation (MTL_DEBUG_LAYER,
 #   MTL_SHADER_VALIDATION), checked, and run again under `leaks --atExit`,
 #   which must find nothing;
@@ -65,16 +66,15 @@ fi
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-gpu.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT INT TERM
-LINK="-l objc"
 
 # The tools: objcgen and refgen.
 mkdir -p "$WORK/tools"
 TOOLS_OK=1
-if ! "$COMPILER" $OPT "$ROOT/tools/objcgen/main.vl" $LINK -o "$WORK/tools/objcgen" >"$WORK/tools/objcgen.log" 2>&1; then
+if ! "$COMPILER" $OPT "$ROOT/tools/objcgen/main.vl" -o "$WORK/tools/objcgen" >"$WORK/tools/objcgen.log" 2>&1; then
     TOOLS_OK=0
 fi
 REFGEN_OK=1
-if ! "$COMPILER" $OPT "$ROOT/tests/gpu/refgen.vl" "$ROOT/tests/gpu/support.vl" $LINK -o "$WORK/tools/refgen" >"$WORK/tools/refgen.log" 2>&1; then
+if ! "$COMPILER" $OPT "$ROOT/tests/gpu/refgen.vl" "$ROOT/tests/gpu/support.vl" -o "$WORK/tools/refgen" >"$WORK/tools/refgen.log" 2>&1; then
     REFGEN_OK=0
 fi
 
@@ -90,7 +90,7 @@ run_case() {
     mkdir -p "$dir"
     why="$dir/why"
     : >"$why"
-    if ! "$COMPILER" $OPT --deny-warnings "$file" "$ROOT/tests/gpu/support.vl" $LINK -o "$dir/prog" >"$dir/build" 2>&1; then
+    if ! "$COMPILER" $OPT --deny-warnings "$file" "$ROOT/tests/gpu/support.vl" -o "$dir/prog" >"$dir/build" 2>&1; then
         { echo "build failed:"; sed 's/^/    /' "$dir/build" | head -20; } >>"$why"
         echo fail >"$dir/status"
         return

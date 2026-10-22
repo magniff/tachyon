@@ -5,7 +5,7 @@
 
 use crate::base::{BUFS, IntVec, buf_reserve, memset};
 use crate::base::diag::{err_begin, err_end, err_help, err_str};
-use crate::front::ast::{NODES, NodeKind, VK_NEW, VK_SPLAT, child};
+use crate::front::ast::{BLOCK_UNSAFE, NODES, NodeKind, VK_NEW, VK_SPLAT, child};
 use crate::front::check::{
     CONST_CONTEXT, RETURN_TYPE, Res, Try, attempt, name_error, type_error, type_error_got,
 };
@@ -67,6 +67,15 @@ pub fn float_const(value: f64, ty: i64) -> i64 {
 
 fn not_constant(n: i64) -> ! {
     unsafe { type_error(n, c"expression is not a compile-time constant") }
+}
+
+// (0.25) Whether n is `unsafe { e }`, a block of only a tail: its value is
+// e's (a pointer made from an integer in a static's initializer).
+fn unsafe_tail(n: i64) -> bool {
+    unsafe {
+        NODES[n].kind == NodeKind::Block && (NODES[n].p & BLOCK_UNSAFE) != 0
+            && NODES[n].count == 0 && NODES[n].a != 0
+    }
 }
 
 // Type checks `n` against `ty` with no locals in scope.
@@ -167,6 +176,7 @@ pub fn const_eval(n: i64) -> i64 {
                 }
                 const_value(NODES[n].y)
             }
+            NodeKind::Block if unsafe_tail(n) => const_eval(NODES[n].a),
             NodeKind::Unary => const_unary(n, ty),
             NodeKind::Binary => const_binary(n, ty),
             NodeKind::Cast => {
@@ -312,39 +322,42 @@ fn const_cast(n: i64, value: i64, from: i64, to: i64) -> i64 {
     not_constant(n)
 }
 
-// A saturating float to integer conversion (NaN is 0), like Rust's `as`.
-fn float_to_int(value: f64, to: i64) -> i64 {
+// Float to integer `as` (grammar.md; the constant folder's too, and what
+// the back ends emit): NaN is 0; a signed target saturates at its own
+// bounds; u64 saturates at its maximum and converts exactly from 2^63 up,
+// and below that is the i64 conversion (so -5.0 is 2^64 - 5); a narrower
+// unsigned target takes the low bits of the i64 conversion.
+pub fn float_to_int(value: f64, to: i64) -> i64 {
     if value != value {
         return 0;
     }
     let bits = int_bits(to);
-    if to == TY_U64 {
-        if value <= 0.0 {
-            return 0;
-        }
+    if !is_signed(to) && bits == 64 && value >= 9223372036854775808.0 {
         if value >= 18446744073709551616.0 {
             return -1;
         }
-        if value >= 9223372036854775808.0 {
-            return ((value - 9223372036854775808.0) as i64) ^ (1 << 63);
-        }
-        return value as i64;
+        return ((value - 9223372036854775808.0) as i64) ^ (1 << 63);
     }
-    var min = 0.0;
-    var max = 0.0;
-    if is_signed(to) {
-        min = 0.0 - int_to_f64(1 << (bits - 1) as u64, TY_I64);
-        max = int_to_f64(int_max(to) as i64, TY_I64);
+    // (the i64 conversion, saturating)
+    var wide = 0;
+    if value <= -9223372036854775808.0 {
+        wide = -9223372036854775807 - 1;
+    } else if value >= 9223372036854775808.0 {
+        wide = 9223372036854775807;
     } else {
-        max = int_to_f64(int_max(to) as i64, TY_I64);
+        wide = value as i64;
     }
-    if value <= min {
-        return wrap_int(min as i64, to);
+    if !is_signed(to) || bits == 64 {
+        return wrap_int(wide, to);
     }
-    if value >= max {
-        return int_max(to) as i64;
+    let max = (1 << (bits - 1) as u64) - 1;
+    if wide > max {
+        return max;
     }
-    value as i64
+    if wide < -max - 1 {
+        return -max - 1;
+    }
+    wide
 }
 
 // ---- Aggregate constants (the initializers of statics) ----
@@ -463,6 +476,7 @@ fn const_write(n: i64, ty: i64, out: i64, at: i64) {
                         at + variant_field_offset(v, i));
                 }
             }
+            NodeKind::Block if unsafe_tail(n) => const_write(NODES[n].a, ty, out, at),
             _ => {
                 if is_compound(ty) {
                     not_constant(n);

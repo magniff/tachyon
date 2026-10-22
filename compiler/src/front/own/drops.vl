@@ -8,13 +8,16 @@
 //   of the local, checked where it stands; a function body starts with
 //   one per by-value parameter; an arm of a match by value starts with one
 //   per owned binding. A match reached through a reference (`match
-//   self.kind`, `match *p`, `match v[i]`), and a `for` loop's element,
-//   bind by reference instead: no drop, and moving the binding is
-//   own.move_out (BYREF).
+//   self.kind`, `match *p`, `match v[i]`), a `for` loop's element of a
+//   slice or Vec, and (0.25) the items of a borrowing iterator (copies of
+//   a container's elements, borrowed_call), bind by reference instead: no
+//   drop, and moving the binding is own.move_out (BYREF). A `for` over an
+//   owning iterator drops each item at the end of its iteration, and its
+//   sequence, when not a place, at the loop's end (check/iterate.vl).
 // - an owned temporary whose value a statement discards (`make(3);`) is
 //   bound to a hidden local, which drops at the statement's end;
-// - `p = rhs` on an owned place p (not through a raw pointer, not an
-//   index) becomes `{ let __own_new = rhs; { let =o = p; p = __own_new; } }`:
+// - `p = rhs` on an owned place p (not through a raw pointer; 0.25: an
+//   index too, `v[i]`, its index evaluated once) becomes `{ let __own_new = rhs; { let =o = p; p = __own_new; } }`:
 //   the right side, then the write, then the old value's drop (=o's
 //   implicit defer) with the state p had before the write.
 //
@@ -37,6 +40,7 @@ use crate::front::ast::{
 };
 use crate::front::check::{CUR_FN, LOCALS, Res, define_local};
 use crate::front::check::synth_mode::synth_expr;
+use crate::front::check::temps::NODE_TEMP;
 use crate::front::closures::{CLOSURES, CLOSURE_STACK};
 use crate::front::lexer::Tok;
 use crate::front::modules::{STD_MODULE, within_std};
@@ -62,8 +66,8 @@ use crate::middle::lower::ssa::HMap;
 // scrutinee reached through a reference (its bindings borrow); on a `let`
 // whose binding moves on at once (`let __own_new = rhs`): no drop; on an
 // Arm whose bindings' drops are placed; on a body whose parameters' drops
-// are; on the Arm of a `for` loop's `next()` (check/iterate.vl): its
-// binding is a copy of an element, not dropped.
+// are; on the Arm of a `for` loop's `next()` (check/iterate.vl; 0.25: its
+// bindings are a match's, borrowed only from a borrowing iterator).
 pub const ASSIGN_OLD: i64 = 1 << 57;
 pub const MATCH_BYREF: i64 = 1 << 58;
 pub const NO_DROP: i64 = 1 << 59;
@@ -125,6 +129,7 @@ static var SYM_TMP: i64 = 0;
 static var SYM_FLAG: i64 = 0;
 static var SYM_FOR_SEQ: i64 = 0;
 static var SYM_FORGET: i64 = 0;
+static var SYM_PASS_OVER: i64 = 0;
 static var SYM_NEEDS_DROP: i64 = 0;
 static var SYM_DROP: i64 = 0;
 
@@ -137,6 +142,7 @@ fn syms() {
             SYM_FLAG = intern_c(c"__own_flag");
             SYM_FOR_SEQ = intern_c(c"__for_seq");
             SYM_FORGET = intern_c(c"forget");
+            SYM_PASS_OVER = intern_c(c"pass_over");
             SYM_NEEDS_DROP = intern_c(c"needs_drop");
             SYM_DROP = intern_c(c"drop");
         }
@@ -248,7 +254,10 @@ pub fn check_implicit_defer(d: i64) {
         };
         NODES[block].p |= BLOCK_DROPS_DONE;
         NODES[d].a = block;
+        // (a drop changes its let binding at the end of its life)
+        crate::front::check::assign::INOUT_FREE += 1;
         synth_expr(block);
+        crate::front::check::assign::INOUT_FREE -= 1;
         take_entries(r, mark);
     }
 }
@@ -281,13 +290,14 @@ fn is_std_fn(f: i64, name: i64) -> bool {
     }
 }
 
-// (0.17) Whether type t, which has `impl Drop`, holds views of its own:
-// own.drop_view. A view reached only through a type argument does not
-// count when the impl is generic over it: std's `impl<T> Drop for
-// Vec<T>` drops a `Vec<[u8]>`'s elements without reading them (a view
-// has no drop), as Rust's `may_dangle`. Fields of the template are
-// looked at, so `struct P<T> { s: [u8], x: T }` with `impl<T> Drop` is
-// still reported.
+// (0.17) Whether type t, which has `impl Drop`, holds views: own.drop_view.
+// (0.25) A view reached through a type argument counts too (`impl<T> Drop
+// for G<T>` with T = `[i64]`: its drop may read the view after what it
+// views is gone, which nothing orders), except in std's types, whose
+// generic drops only drop their elements and read none (`impl<T> Drop for
+// Vec<T>` of a `Vec<[u8]>`, as Rust's `may_dangle`). Fields of a std
+// template are looked at, so a std `struct P<T> { s: [u8], x: T }` with
+// `impl<T> Drop` is still reported.
 fn drop_reads_views(t: i64) -> bool {
     unsafe {
         if !is_view_type(t) {
@@ -301,6 +311,9 @@ fn drop_reads_views(t: i64) -> bool {
             return true;
         }
         let tm = STRUCTS[s].tmpl - 1;
+        if !within_std(STRUCTS[tm].module) {
+            return true;
+        }
         for i in 0..STRUCTS[tm].field_count {
             let ft = (*struct_field(tm, i)).ty;
             if ft > 0 && is_view_type(ft) {
@@ -332,6 +345,12 @@ pub fn param_drops(item: i64, f: i64) {
         }
         NODES[body].p |= PARAM_DROPS_DONE;
         if is_std_fn(f, SYM_FORGET) {
+            return;
+        }
+        if FNS[f].tmpl != 0 && is_std_fn(f, SYM_PASS_OVER)
+            && crate::front::own::moves::copies_owned_items(TLISTS.data[FNS[f].targs], 0) {
+            // (0.25: std::iter::pass_over::<I>, an item an adapter passes
+            // over: a copy of an element I's container keeps, not dropped)
             return;
         }
         if crate::front::contracts::expand::is_pre_fn(f) {
@@ -391,6 +410,24 @@ pub fn after_stmt(block: i64, mark: i64, i: i64, stmt: i64) {
         }
         let k = NODES[stmt].kind;
         if k == NodeKind::Let {
+            let init = NODES[stmt].c;
+            if NODES[stmt].a != 0 && NODES[NODES[stmt].a].kind == NodeKind::PatWild
+                && is_temp(init) {
+                // (0.25: `let _ = make();` drops the value at once, as `make();`)
+                NODES[stmt].c = temporary(init);
+                return;
+            }
+            if NODES[stmt].a != 0 && NODES[NODES[stmt].a].kind == NodeKind::PatWild && init != 0
+                && is_owned_type(NODES[init].ty) && is_place(init) {
+                // (`let _ = x;` of an owned place moves nothing, as Rust's:
+                // it reads x)
+                let r = t_node(NodeKind::Unary, init, crate::front::types::ref_to(NODES[init].ty,
+                    REF_SHARED));
+                NODES[r].op = Tok::Amp;
+                NODES[r].b = init;
+                NODES[stmt].c = r;
+                return;
+            }
             let_drops(block, i, stmt);
             // (0.20: its temporaries, to the end of the statement; to the
             // end of the block when the binding may view them)
@@ -541,6 +578,15 @@ pub fn borrowed_call(e: i64) -> bool {
         if wrapped > 0 {
             return borrowed_call(wrapped);
         }
+        // (0.25: `e?`, the payload of a borrowed Option: `v.last()?`)
+        if e > 0 && NODES[e].kind == NodeKind::Try {
+            return borrowed_call(NODES[e].a);
+        }
+        // (0.25: `let Some(t) = v.last() else { .. };`, its match: parser::let_else)
+        if e > 0 && NODES[e].kind == NodeKind::Match && NODES[e].count == 2
+            && (NODES[child(e, 1)].p & crate::front::ast::ARM_LET_ELSE) != 0 {
+            return borrowed_call(NODES[e].a);
+        }
         if e <= 0 || NODES[e].kind != NodeKind::Call || NODES[e].count == 0 {
             return false;
         }
@@ -554,7 +600,8 @@ pub fn borrowed_call(e: i64) -> bool {
             return false;
         }
         if name == "get" || name == "last" || name == "first" || name == "key_at"
-            || name == "value_at" || name == "peek" {
+            || name == "value_at" || name == "peek" || name == "first_key_value"
+            || name == "last_key_value" {
             // (a shared receiver: `&self`, or a slice)
             return TYPES[p0].kind == TyKind::Slice && TYPES[p0].b != REF_MUT
                 || TYPES[p0].kind == TyKind::Ptr && TYPES[p0].b == REF_SHARED;
@@ -562,9 +609,10 @@ pub fn borrowed_call(e: i64) -> bool {
         // (0.24: a borrowing iterator's items, copies of elements its
         // container keeps, moves::copies_owned_items: in std's adapters,
         // `count`, `filter`, an item looked at and passed over is not dropped)
-        if (name == "next" || name == "at" || name == "find" || name == "last" || name == "nth")
-            && TYPES[p0].kind == TyKind::Ptr
-            && crate::front::own::moves::copies_owned_items(TYPES[p0].a, 0) {
+        if (name == "next" || name == "next_back" || name == "at" || name == "find"
+            || name == "last" || name == "nth" || name == "min" || name == "max")
+            && crate::front::own::moves::copies_owned_items(
+                if TYPES[p0].kind == TyKind::Ptr { TYPES[p0].a } else { p0 }, 0) {
             return true;
         }
         if name == "unwrap" || name == "expect" || name == "unwrap_or" {
@@ -587,6 +635,15 @@ fn mark_byref(p: i64, at: i64) {
             }
         }
         SCRATCH.count = mark;
+    }
+}
+
+// (0.25) `e?` (check/try_op.vl), its `let ?try = e;` bound (pattern bind):
+// when e is a borrowed copy (`v.last()?`), ?try borrows it, so the match
+// binds ?v by reference and nothing in the desugaring drops the element.
+pub fn try_let_borrows(bind: i64, operand: i64) {
+    if drops_on() && borrowed_call(operand) {
+        mark_byref(bind, operand);
     }
 }
 
@@ -617,6 +674,14 @@ fn let_drops(block: i64, i: i64, stmt: i64) {
         }
         if borrowed_call(init) {
             // (a copy of an element a collection keeps: `v.get(i)`)
+            mark_byref(pat, init);
+            return;
+        }
+        if init != 0 && NODES[pat].kind != NodeKind::PatBind
+            && NODES[init].kind == NodeKind::Ident && reached_by_ref(init) {
+            // (0.25: a binding that borrows, destructured, `|(i, d)|` of a
+            // borrowing iterator's item: its parts borrow, as a match on it)
+            NODES[init].p |= MATCH_BYREF;
             mark_byref(pat, init);
             return;
         }
@@ -678,8 +743,9 @@ fn temporary(e: i64) -> i64 {
     }
 }
 
-// A fresh (unchecked) copy of place expression e, made of names, fields
-// and dereferences; 0 when e is something else (an index, a call).
+// A fresh (unchecked) copy of place expression e, made of names, fields,
+// dereferences and (0.25) indexes whose index is a name or a literal
+// (hoist_indexes makes them so); 0 when e is something else (a call).
 fn copy_place(e: i64) -> i64 {
     unsafe {
         let k = NODES[e].kind;
@@ -717,13 +783,135 @@ fn copy_place(e: i64) -> i64 {
             NODES[n].b = base;
             return n;
         }
+        if k == NodeKind::Index {
+            let i = NODES[e].b;
+            if i == 0 || NODES[i].kind == NodeKind::Range {
+                return 0;
+            }
+            let r = slice_receiver(NODES[e].a);
+            let base = copy_place(if r != 0 { r } else { NODES[e].a });
+            if base == 0 {
+                return 0;
+            }
+            var idx = 0;
+            if NODES[i].kind == NodeKind::Int {
+                idx = new_node(NodeKind::Int, NODES[i].start, NODES[i].end);
+                NODES[idx].a = NODES[i].a;
+                NODES[idx].b = NODES[i].b;
+            } else {
+                idx = copy_place(i);
+                if idx == 0 || NODES[idx].kind != NodeKind::Ident {
+                    return 0;
+                }
+            }
+            let n = new_node(k, NODES[e].start, NODES[e].end);
+            NODES[n].a = base;
+            NODES[n].b = idx;
+            return n;
+        }
         0
+    }
+}
+
+// (0.25) The receiver of `v.as_mut_slice()` that the checker made of a
+// Vec's or a Buf's `v[i]` written (check/synth_mode.vl: synth_index), when
+// it is call e; else 0.
+fn slice_receiver(e: i64) -> i64 {
+    unsafe {
+        if NODES[e].kind == NodeKind::MethodCall {
+            let name = SYMS[NODES[e].b].text;
+            return if name == "as_mut_slice" { NODES[e].a } else { 0 };
+        }
+        if NODES[e].kind != NodeKind::Call || NODES[e].count != 1 {
+            return 0;
+        }
+        let f = NODES[e].x - 1;
+        if f < 0 || !within_std(FNS[f].module)
+            || method_word(SYMS[FNS[f].display].text) != "as_mut_slice" {
+            return 0;
+        }
+        var r = child(e, 0);
+        if NODES[r].kind == NodeKind::Unary && NODES[r].op == Tok::Amp {
+            r = NODES[r].b;
+        }
+        r
+    }
+}
+
+// (0.25) Whether place e (an assignment's target) is one copy_place copies
+// once its indexes are names: names, fields, `*` and indexes, no call.
+fn indexable_place(e: i64) -> bool {
+    unsafe {
+        if e == 0 || (NODES[e].p & NODE_RAW) != 0 {
+            return false;
+        }
+        let k = NODES[e].kind;
+        if k == NodeKind::Ident {
+            return NODES[e].res == Res::Local || NODES[e].res == Res::Static;
+        }
+        if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
+            return indexable_place(NODES[e].a);
+        }
+        if k == NodeKind::Unary && NODES[e].op == Tok::Star {
+            return indexable_place(NODES[e].b);
+        }
+        if k == NodeKind::Index {
+            let i = NODES[e].b;
+            let r = slice_receiver(NODES[e].a);
+            return i != 0 && NODES[i].kind != NodeKind::Range
+                && indexable_place(if r != 0 { r } else { NODES[e].a });
+        }
+        false
+    }
+}
+
+// (0.25) The indexes of place e that are not a local's name or a literal,
+// each bound first, once (`let __own_iK = i;`, pushed on the list being
+// built), and read by its name in e: the old element's read and the write
+// then index the same element, with the index evaluated once.
+fn hoist_indexes(e: i64, k: i64) -> i64 {
+    unsafe {
+        let kind = NODES[e].kind;
+        if kind == NodeKind::FieldAccess || kind == NodeKind::TupleField {
+            return hoist_indexes(NODES[e].a, k);
+        }
+        if kind == NodeKind::Unary {
+            return hoist_indexes(NODES[e].b, k);
+        }
+        if kind != NodeKind::Index {
+            return k;
+        }
+        let r = slice_receiver(NODES[e].a);
+        let k2 = hoist_indexes(if r != 0 { r } else { NODES[e].a }, k);
+        let i = NODES[e].b;
+        if NODES[i].kind == NodeKind::Int
+            || NODES[i].kind == NodeKind::Ident && NODES[i].res == Res::Local {
+            return k2;
+        }
+        let b = crate::base::buf_new();
+        crate::base::buf_str(b, c"__own_i");
+        crate::base::buf_int(b, k2);
+        let sym = crate::base::intern(crate::base::buf_slice(b));
+        let start = NODES[i].start;
+        let pat = new_node(NodeKind::PatBind, start, start);
+        NODES[pat].a = sym;
+        let st = new_node(NodeKind::Let, start, NODES[i].end);
+        NODES[st].a = pat;
+        NODES[st].c = i;
+        NODES[i].p |= NODE_CHECKED;
+        list_push(st);
+        let id = new_node(NodeKind::Ident, start, NODES[i].end);
+        NODES[id].a = sym;
+        NODES[id].res = Res::Local;
+        NODES[e].b = id;
+        k2 + 1
     }
 }
 
 // Assignment e (`p = rhs`, checked) to an owned place: its desugaring,
 // checked, or 0 (not owned, compound, or a place this does not handle:
-// through a raw pointer, which writes without dropping, or an index).
+// through a raw pointer, which writes without dropping, or a call; 0.25:
+// an index is handled, evaluated once, hoist_indexes).
 fn assign_drops(e: i64) -> i64 {
     unsafe {
         syms();
@@ -735,6 +923,18 @@ fn assign_drops(e: i64) -> i64 {
         if target == 0 || value == 0 || !has_glue(NODES[target].ty) {
             return 0;
         }
+        if !indexable_place(target) {
+            return 0;
+        }
+        // (0.25: `v[i] = x` drops the element it replaces; i once)
+        let hmark = list_begin();
+        hoist_indexes(target, 0);
+        let hoisted = SCRATCH.count - hmark;
+        let lets = crate::base::alloc_array::<i64>(hoisted + 1);
+        for h in 0..hoisted {
+            lets[h] = SCRATCH.data[hmark + h];
+        }
+        SCRATCH.count = hmark;
         let read = copy_place(target);
         let write = copy_place(target);
         if read == 0 || write == 0 {
@@ -775,6 +975,10 @@ fn assign_drops(e: i64) -> i64 {
         let outer = new_node(NodeKind::Block, start, end);
         let m2 = list_begin();
         list_push(nlet);
+        for h in 0..hoisted {
+            list_push(lets[h]);
+        }
+        crate::base::free(lets as *u8);
         list_push(ist);
         list_end(outer, m2);
         synth_expr(outer);
@@ -811,6 +1015,10 @@ fn reached_by_ref(e: i64) -> bool {
     }
 }
 
+// (0.25) The arm of a match by value + 1 -> its mark + 1, a `()` first in
+// its body (arm_drops): where the parts it moves clear their drop flags.
+pub static var ARM_MARK: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
 // check_match, arm `arm` of match m, its pattern checked: by value, an
 // implicit defer per owned binding, the body wrapped in a block that
 // holds them; by reference, the bindings borrow.
@@ -820,12 +1028,16 @@ pub fn arm_drops(m: i64, arm: i64) {
             return;
         }
         NODES[arm].p |= ARM_DROPS_DONE;
+        if (NODES[m].p & crate::front::own::glue::GLUE_REF) != 0 {
+            // (0.25: the glue's way to a part, glue::wrap_variants)
+            return;
+        }
         let pat = NODES[arm].a;
         let scrutinee = NODES[m].a;
         if (NODES[m].p & GLUE_MATCH) == 0 {
-            if (NODES[arm].p & ARM_FOR_NEXT) != 0 {
-                return;
-            }
+            // (0.25: a `for` loop's `next()`, ARM_FOR_NEXT, as any match: a
+            // borrowing iterator's items borrow, an owning one's are dropped
+            // at the end of each iteration unless moved)
             if scrutinee != 0 && (reached_by_ref(scrutinee) || borrowed_call(scrutinee)) {
                 NODES[scrutinee].p |= MATCH_BYREF;
                 mark_byref(pat, scrutinee);
@@ -840,6 +1052,13 @@ pub fn arm_drops(m: i64, arm: i64) {
         let mark = list_begin();
         push_bindings(pat);
         let end = SCRATCH.count;
+        var owned = false;
+        for k in mark..end {
+            let l = NODES[SCRATCH.data[k]].x;
+            if l >= 0 && is_owned_type(LOCALS[l].ty) {
+                owned = true;
+            }
+        }
         for k in mark..end {
             let d = new_defer(SCRATCH.data[k], DK_LOCAL, wrapper, false);
             if d != 0 {
@@ -848,14 +1067,22 @@ pub fn arm_drops(m: i64, arm: i64) {
         }
         // (the bindings themselves, off the list)
         let n = SCRATCH.count - end;
-        if n == 0 {
+        if n == 0 && !owned {
             SCRATCH.count = mark;
             return;
         }
+        // (0.25) first, a mark where the arm is taken: the parts it moves
+        // clear their drop flags there (walk::bind_parts, ARM_MARK), not
+        // on a block holding defers, which clear_at would take apart
+        let unit = new_node(NodeKind::Unit, NODES[body].start, NODES[body].start);
+        let st = new_node(NodeKind::ExprStmt, NODES[body].start, NODES[body].start);
+        NODES[st].a = unit;
+        SCRATCH.data[mark] = st;
         for k in 0..n {
-            SCRATCH.data[mark + k] = SCRATCH.data[end + k];
+            SCRATCH.data[mark + 1 + k] = SCRATCH.data[end + k];
         }
-        SCRATCH.count = mark + n;
+        SCRATCH.count = mark + 1 + n;
+        ARM_MARK.put(arm + 1, unit + 1);
         list_end(wrapper, mark);
         NODES[wrapper].a = body;
         NODES[wrapper].end = NODES[body].end;
@@ -1228,8 +1455,15 @@ pub fn finish_drops() {
             crate::front::own::diag::own_begin(item, OWN_DROP_VIEW);
             own_str(c"'");
             own_type(DROP_VIEWS.data[i + 1]);
-            own_str(c"' holds views and cannot implement Drop: its drop could read what it views after that is gone");
-            own_help(c"hold owned values (Buf, Vec) instead of the views, or remove the impl");
+            let dt = DROP_VIEWS.data[i + 1];
+            if TYPES[dt].kind == TyKind::Struct && STRUCTS[TYPES[dt].a].tmpl != 0 {
+                // (0.25: an instance whose type argument is a view)
+                own_str(c"' holds views (a type argument is one) and cannot implement Drop: its drop could read what it views after that is gone");
+                own_help(c"give it an owned type argument instead of the view (`.to_vec_in(gpa)`, `.to_string_in(gpa)`, a Buf), or remove the impl");
+            } else {
+                own_str(c"' holds views and cannot implement Drop: its drop could read what it views after that is gone");
+                own_help(c"hold owned values (Buf, Vec) instead of the views, or remove the impl");
+            }
             own_end();
             i += 2;
         }
@@ -1388,6 +1622,16 @@ fn wrap_capture_move(n: i64, flag: i64, s: i64) {
 // a tail's, at the end of their block (the `let` may keep a view of them),
 // a `while` condition's at the end of each test. The nodes are made typed:
 // they are not checked again.
+//
+// (0.25, conventions.md §2.2 "Temporaries") This is the one place a
+// statement's temporaries live: a value lent to a let parameter
+// (check_mode::LET_ARG), an operator's operands an impl reads, a
+// scrutinee no arm takes a part of, the rest of a value a part is moved
+// out of (part_drops), and a value moved into a call a later argument may
+// leave before (hold_args, TV_MOVE). The block that makes one gives
+// `&__own_tv` and is no scope of its own (NODE_TEMP, own/walk): views of
+// it end with the statement (or the block), own.escape past that. A `let`
+// keeps its temporaries to the end of the block only when it binds a view.
 
 static var SYM_TP: i64 = 0;
 static var SYM_TF: i64 = 0;
@@ -1455,10 +1699,10 @@ fn fresh_value(e: i64, pat: i64) -> bool {
 
 // Whether expression e makes a new owned value (not a place's, not a copy
 // a collection keeps: borrowed_call).
-fn fresh(e: i64) -> bool {
+pub fn fresh(e: i64) -> bool {
     unsafe {
         let k = NODES[e].kind;
-        if k == NodeKind::Call {
+        if k == NodeKind::Call || k == NodeKind::Try && borrowed_call(e) {
             return !borrowed_call(e) && !parametric_copy(e);
         }
         if k == NodeKind::MethodCall || k == NodeKind::StructLit || k == NodeKind::Tuple
@@ -1498,6 +1742,21 @@ fn parametric_copy(e: i64) -> bool {
     unsafe {
         let f = NODES[e].x - 1;
         if f < 0 || crate::front::own::summary::ret_parametric(f) == 0 {
+            return false;
+        }
+        // (0.25: `clone` makes a new value, `v.clone().len()`; a result
+        // whose type arguments have no glue holds no copy that matters,
+        // `String::from_in("x", gpa)`)
+        if method_word(SYMS[FNS[f].display].text) == "clone" {
+            return false;
+        }
+        var glue_arg = false;
+        for i in 0..FNS[f].targ_count {
+            if has_glue(TLISTS.data[FNS[f].targs + i]) {
+                glue_arg = true;
+            }
+        }
+        if !glue_arg {
             return false;
         }
         for i in 0..FNS[f].param_count {
@@ -1545,14 +1804,57 @@ fn t_block(mark: i64, tail: i64, at: i64, ty: i64) -> i64 {
     b
 }
 
-// Temporary e (checked): its prelude onto PRELUDE; the typed block (of
-// type *T) that makes it and gives its address.
+// Temporary e (checked), whose address its statement uses (`&value`, a
+// receiver, a let argument, a part read out of it): temp_make's block, of
+// type `&T`.
 fn temp_ptr(e: i64) -> i64 {
+    temp_make(e, TV_ADDR, 0)
+}
+
+// What the block temp_make makes gives: the temporary's address,
+// `&__own_tv` (its views are views of __own_tv, which lives as long as
+// the statement: the block is no scope of its own, own/walk), or the value
+// itself, moved on (`two(mk(1), g()?)`: an argument a callee takes, dropped
+// when the statement leaves before the call, as the flag is cleared
+// where the call is made: hold_args).
+const TV_ADDR: i64 = 0;
+const TV_MOVE: i64 = 1;
+
+// The drop flag (a local) of the temporary temp_make made last.
+static var LAST_TF: i64 = -1;
+
+// (0.25) The statement temporaries' locals (__own_tv, + 1) and the
+// expressions they hold (+ 1): own.escape names the temporary
+// (temp_source).
+static var TEMP_SRC: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+
+// The expression whose statement temporary is place p's root, or 0.
+pub fn temp_source(p: i64) -> i64 {
+    unsafe {
+        if p < 0 || TEMP_SRC.count == 0 {
+            return 0;
+        }
+        let r = root_of(p);
+        if PL_RKIND[r] != RK_LOCAL {
+            return 0;
+        }
+        let s = TEMP_SRC.get(PL_RID[r] + 1);
+        if s > 0 { s - 1 } else { 0 }
+    }
+}
+
+// Temporary e (checked): its prelude onto PRELUDE; the typed block that
+// makes it where e was (kind: TV_ADDR or TV_MOVE). except, when not 0, is
+// the outermost node of a chain of fields and tuple parts moved out of the
+// temporary (`make().a`, `make().1.b`): the drop leaves that part out
+// (part_drops).
+fn temp_make(e: i64, kind: i64, except: i64) -> i64 {
     unsafe {
         let t = NODES[e].ty;
         let pt = crate::front::types::ptr_to(t);
         let tp = define_local(SYM_TP, pt, true, false);
         let tf = define_local(SYM_TF, TY_BOOL, true, false);
+        LAST_TF = tf;
         // var __own_tp: *T = 0 as *T; var __own_tf = false;
         let zero = t_node(NodeKind::Int, e, crate::front::types::TY_I64);
         NODES[zero].b = crate::front::lexer::SUF_I64;
@@ -1561,21 +1863,17 @@ fn temp_ptr(e: i64) -> i64 {
         PRELUDE.push(t_let(tp, null, e));
         PRELUDE.push(t_let(tf, t_bool(false, e), e));
         // defer { if __own_tf { unsafe { let __own_drop = *__own_tp; } } }
-        let dl = define_local(SYM_TDROP, t, false, false);
-        let deref = t_node(NodeKind::Unary, e, t);
-        NODES[deref].op = Tok::Star;
-        NODES[deref].b = t_ident(tp, e);
-        NODES[deref].p |= NODE_RAW;
-        let dlet = t_let(dl, deref, e);
-        NODES[dlet].p &= ~NO_DROP;
-        NODES[NODES[dlet].a].b = 0;
         let inner = t_node(NodeKind::Block, e, TY_UNIT);
         NODES[inner].p |= crate::front::ast::BLOCK_UNSAFE | BLOCK_DROPS_DONE;
-        let d = new_defer(NODES[dlet].a, DK_LOCAL, inner, true);
         let m1 = list_begin();
-        list_push(dlet);
-        if d != 0 {
-            list_push(d);
+        if except == 0 {
+            let deref = t_node(NodeKind::Unary, e, t);
+            NODES[deref].op = Tok::Star;
+            NODES[deref].b = t_ident(tp, e);
+            NODES[deref].p |= NODE_RAW;
+            push_drop_let(deref, inner, e);
+        } else {
+            part_drops(tp, t, except, inner, e);
         }
         list_end(inner, m1);
         let cond = t_node(NodeKind::If, e, TY_UNIT);
@@ -1591,8 +1889,9 @@ fn temp_ptr(e: i64) -> i64 {
         let df = t_node(NodeKind::Defer, e, TY_UNIT);
         NODES[df].a = body;
         PRELUDE.push(df);
-        // { var __own_tv = e; __own_tp = &__own_tv; __own_tf = true; __own_tp }
+        // { var __own_tv = e; __own_tp = &__own_tv; __own_tf = true; &__own_tv }
         let tv = define_local(SYM_TV, t, true, false);
+        TEMP_SRC.put(tv + 1, e + 1);
         let m3 = list_begin();
         list_push(t_let(tv, e, e));
         let amp = t_node(NodeKind::Unary, e, pt);
@@ -1606,13 +1905,174 @@ fn temp_ptr(e: i64) -> i64 {
         NODES[ast].a = asg;
         list_push(ast);
         list_push(t_set(tf, true, e));
-        t_block(m3, t_ident(tp, e), e, pt)
+        if kind == TV_MOVE {
+            let b = t_block(m3, t_ident(tv, e), e, t);
+            NODES[b].p |= NODE_TEMP;
+            NODES[b].end = NODES[e].end;
+            return b;
+        }
+        let rt = crate::front::types::ref_to(t, REF_SHARED);
+        let addr = t_node(NodeKind::Unary, e, rt);
+        NODES[addr].op = Tok::Amp;
+        NODES[addr].b = t_ident(tv, e);
+        let b = t_block(m3, addr, e, rt);
+        NODES[b].p |= NODE_TEMP;
+        // (the value's text, for the messages that name it)
+        NODES[b].end = NODES[e].end;
+        b
+    }
+}
+
+// `let __own_drop = place;` and its implicit defer, into the list being
+// made: the drop of place (checked where block stands).
+fn push_drop_let(place: i64, block: i64, at: i64) {
+    unsafe {
+        let dl = define_local(SYM_TDROP, NODES[place].ty, false, false);
+        let dlet = t_let(dl, place, at);
+        NODES[dlet].p &= ~NO_DROP;
+        NODES[NODES[dlet].a].b = 0;
+        let d = new_defer(NODES[dlet].a, DK_LOCAL, block, true);
+        list_push(dlet);
+        if d != 0 {
+            list_push(d);
+        }
+    }
+}
+
+// The drops of temporary *tp (of type t) but for the part chain `except`
+// moves out of it: at each level of the chain, from the temporary up, the
+// fields (or tuple parts) other than the one the chain goes on through, in
+// their order (their defers run last first: the list is made backwards).
+fn part_drops(tp: i64, t: i64, except: i64, block: i64, at: i64) {
+    unsafe {
+        // (the chain, from the node over the temporary up to except)
+        var chain = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var c = except;
+        while c > 0 && is_part_node(c) {
+            chain.push(c);
+            c = NODES[c].a;
+        }
+        // (chain.data[count - 1] is the lowest: level 0's part)
+        var level = chain.count - 1;
+        var ty = t;
+        while level >= 0 {
+            let taken = chain.data[level];
+            let n = part_count(ty);
+            var j = n - 1;
+            while j >= 0 {
+                if j != part_index(taken) {
+                    let pty = part_type(ty, j);
+                    if pty > 0 && has_glue(pty) {
+                        let base = chain_place(tp, t, chain, level, at);
+                        push_drop_let(part_node(base, ty, j, at), block, at);
+                    }
+                }
+                j -= 1;
+            }
+            ty = NODES[taken].ty;
+            level -= 1;
+        }
+    }
+}
+
+// The number of fields (tuple parts, elements) of struct, tuple or array
+// type t.
+fn part_count(t: i64) -> i64 {
+    unsafe {
+        if TYPES[t].kind == TyKind::Struct {
+            return STRUCTS[TYPES[t].a].field_count;
+        }
+        if TYPES[t].kind == TyKind::Tuple {
+            return TYPES[t].count;
+        }
+        if TYPES[t].kind == TyKind::Array {
+            return TYPES[t].b;
+        }
+        0
+    }
+}
+
+fn part_type(t: i64, j: i64) -> i64 {
+    unsafe {
+        if TYPES[t].kind == TyKind::Struct {
+            return (*struct_field(TYPES[t].a, j)).ty;
+        }
+        if TYPES[t].kind == TyKind::Array {
+            return TYPES[t].a;
+        }
+        crate::front::types::type_elem(t, j)
+    }
+}
+
+// The field, tuple part or element access node n takes.
+fn part_index(n: i64) -> i64 {
+    unsafe {
+        if NODES[n].kind == NodeKind::FieldAccess {
+            return NODES[n].x;
+        }
+        if NODES[n].kind == NodeKind::Index {
+            return NODES[NODES[n].b].a;
+        }
+        NODES[n].b
+    }
+}
+
+// `base.j` (base of type t, a struct or a tuple), typed.
+fn part_node(base: i64, t: i64, j: i64, at: i64) -> i64 {
+    unsafe {
+        let pty = part_type(t, j);
+        if TYPES[t].kind == TyKind::Struct {
+            let n = t_node(NodeKind::FieldAccess, at, pty);
+            NODES[n].a = base;
+            NODES[n].b = (*struct_field(TYPES[t].a, j)).name;
+            NODES[n].x = j;
+            NODES[n].y = 0;
+            return n;
+        }
+        if TYPES[t].kind == TyKind::Array {
+            let i = t_node(NodeKind::Int, at, crate::front::types::TY_I64);
+            NODES[i].a = j;
+            NODES[i].b = crate::front::lexer::SUF_I64;
+            let n = t_node(NodeKind::Index, at, pty);
+            NODES[n].a = base;
+            NODES[n].b = i;
+            // (a read of the temporary's storage, through its pointer)
+            NODES[n].p |= NODE_RAW;
+            return n;
+        }
+        let n = t_node(NodeKind::TupleField, at, pty);
+        NODES[n].a = base;
+        NODES[n].b = j;
+        n
+    }
+}
+
+// A new place: `*tp` followed by the chain's parts below level (chain from
+// the top down; level 0 is `*tp` itself).
+fn chain_place(tp: i64, t: i64, chain: IntVec, level: i64, at: i64) -> i64 {
+    unsafe {
+        var p = t_node(NodeKind::Unary, at, t);
+        NODES[p].op = Tok::Star;
+        NODES[p].b = t_ident(tp, at);
+        NODES[p].p |= NODE_RAW;
+        var ty = t;
+        var i = chain.count - 1;
+        while i > level {
+            let taken = chain.data[i];
+            p = part_node(p, ty, part_index(taken), at);
+            ty = NODES[taken].ty;
+            i -= 1;
+        }
+        p
     }
 }
 
 // Visits expression e (checked) after its parts, in the positions
 // evaluated with its statement: the temporaries it uses without moving
-// them are kept (temp_ptr). Blocks were visited as they were checked;
+// them are kept (temp_ptr), the parts moved out of one leave the rest to
+// drop (part_drops), a value it moves into a call is held until the call
+// when a later argument may leave the statement (hold_args). Blocks were
+// visited as they were checked (but an operator's, operator_temps);
 // closures' bodies are their own; a `while`'s condition is its own unit.
 fn visit_temps(e: i64) {
     unsafe {
@@ -1620,6 +2080,9 @@ fn visit_temps(e: i64) {
             return;
         }
         let k = NODES[e].kind;
+        if k == NodeKind::Block && operator_temps(e) {
+            return;
+        }
         if k == NodeKind::Block || k == NodeKind::Closure || k == NodeKind::Loop
             || k == NodeKind::Defer || k == NodeKind::Let {
             return;
@@ -1644,23 +2107,45 @@ fn visit_temps(e: i64) {
                 let b = temp_ptr(NODES[e].b);
                 NODES[e] = NODES[b];
                 NODES[e].ty = ty;
+            } else if NODES[e].op == Tok::Amp && lent_value(NODES[e].b) {
+                // (0.25: a value without glue lent the same way, `E { .. }.nm()`:
+                // a local of the statement, whose views are checked as a
+                // local's)
+                let ty = NODES[e].ty;
+                let b = temp_value(NODES[e].b);
+                NODES[e] = NODES[b];
+                NODES[e].ty = ty;
             }
             return;
         }
-        if k == NodeKind::FieldAccess {
+        if k == NodeKind::FieldAccess || k == NodeKind::TupleField {
             let borrowed = TEMP_BORROW;
-            TEMP_BORROW = borrowed && NODES[NODES[e].a].kind == NodeKind::FieldAccess;
-            visit_temps(NODES[e].a);
+            let base = NODES[e].a;
+            TEMP_BORROW = borrowed && (NODES[base].kind == NodeKind::FieldAccess
+                || NODES[base].kind == NodeKind::TupleField);
+            // (0.25: a part moved out of a part, `make().a.b`: the chain is
+            // the outermost node's)
+            let moved_out = !borrowed && NODES[e].y != 1 && is_owned_type(NODES[e].ty);
+            if moved_out && part_move(e) {
+                TEMP_BORROW = false;
+                return;
+            }
+            visit_temps(base);
             TEMP_BORROW = false;
             // (0.24: an owned field moved out, `let x = make().v;`, is not
             // read through the temporary's address, which would drop it
-            // again with the temporary: it moves out of the value, own.partial
-            // when its type implements Drop)
+            // again with the temporary: part_move, or own.partial when
+            // a type on the way implements Drop)
             if NODES[e].y != 1 && is_temp(NODES[e].a) && (borrowed || !is_owned_type(NODES[e].ty)) {
                 // (`make().id`: read through the address)
                 NODES[e].a = temp_ptr(NODES[e].a);
-                NODES[e].y = 1;
-                NODES[e].p |= NODE_RAW;
+                if k == NodeKind::FieldAccess {
+                    NODES[e].y = 1;
+                    NODES[e].p |= NODE_RAW;
+                } else {
+                    // (`make().1`: a tuple part of the temporary, `(*&tv).1`)
+                    NODES[e].a = deref_of(NODES[e].a);
+                }
             }
             return;
         }
@@ -1672,6 +2157,17 @@ fn visit_temps(e: i64) {
                 visit_temps(NODES[e].c);
                 return;
             }
+            if k == NodeKind::Index && !TEMP_BORROW && is_owned_type(NODES[e].ty) {
+                // (0.25: an element moved out of an array temporary,
+                // `make()[1]`; by a run-time index the others would leak)
+                if part_move(e) {
+                    return;
+                }
+                let base = NODES[e].a;
+                if is_temp(base) && TYPES[NODES[base].ty].kind == TyKind::Array {
+                    temp_element_error(e);
+                }
+            }
             if k == NodeKind::Index || k == NodeKind::Range {
                 visit_temps(NODES[e].a);
                 visit_temps(NODES[e].b);
@@ -1681,8 +2177,8 @@ fn visit_temps(e: i64) {
             visit_temps(NODES[e].c);
             return;
         }
-        if k == NodeKind::Cast || k == NodeKind::TupleField || k == NodeKind::Return
-            || k == NodeKind::Repeat || k == NodeKind::EnumPanic {
+        if k == NodeKind::Cast || k == NodeKind::Return || k == NodeKind::Repeat
+            || k == NodeKind::EnumPanic {
             visit_temps(NODES[e].a);
             return;
         }
@@ -1724,6 +2220,13 @@ fn visit_temps(e: i64) {
                 visit_temps(NODES[arm].b);
                 visit_temps(NODES[arm].c);
             }
+            // (0.25: an owned temporary matched with no binding that takes
+            // a part of it, `match make() { E::A(_) => .. }`: matched where
+            // it is kept, and dropped with the statement)
+            let s = NODES[e].a;
+            if is_temp(s) && !match_binds_owned(e) {
+                NODES[e].a = deref_of(temp_ptr(s));
+            }
             return;
         }
         if k == NodeKind::Call || k == NodeKind::MethodCall || k == NodeKind::VecOp {
@@ -1733,6 +2236,9 @@ fn visit_temps(e: i64) {
             for i in 0..NODES[e].count {
                 visit_temps(child(e, i));
             }
+            if k == NodeKind::Call {
+                hold_args(e);
+            }
             return;
         }
         if k == NodeKind::Tuple || k == NodeKind::Array || k == NodeKind::StructLit
@@ -1741,6 +2247,330 @@ fn visit_temps(e: i64) {
                 visit_temps(child(e, i));
             }
         }
+    }
+}
+
+// `*b` of the block b temp_make made (of type `&T`): the temporary as a
+// place.
+fn deref_of(b: i64) -> i64 {
+    unsafe {
+        let n = t_node(NodeKind::Unary, b, TYPES[NODES[b].ty].a);
+        NODES[n].op = Tok::Star;
+        NODES[n].b = b;
+        n
+    }
+}
+
+// (0.25) Whether `&v` lends value v as a temporary of no glue (`&E { .. }`,
+// a receiver; a let argument): v is no place, and has storage.
+fn lent_value(v: i64) -> bool {
+    unsafe {
+        let t = NODES[v].ty;
+        if t <= 0 || has_glue(t) || is_place(v) {
+            return false;
+        }
+        let k = NODES[v].kind;
+        (k == NodeKind::Call || k == NodeKind::StructLit || k == NodeKind::Tuple
+            || k == NodeKind::Array || k == NodeKind::VariantLit || k == NodeKind::Repeat)
+            && (TYPES[t].kind == TyKind::Struct || TYPES[t].kind == TyKind::Tuple
+                || TYPES[t].kind == TyKind::Array || TYPES[t].kind == TyKind::Enum)
+    }
+}
+
+// (0.25) Value v (no glue) lent as a temporary: `{ var __own_tv = v;
+// &__own_tv }`, a block that is no scope of its own (own/walk), so that
+// __own_tv lives as long as the statement, and views of it are checked as
+// views of a local of it.
+fn temp_value(v: i64) -> i64 {
+    unsafe {
+        let t = NODES[v].ty;
+        let tv = define_local(SYM_TV, t, true, false);
+        TEMP_SRC.put(tv + 1, v + 1);
+        let m = list_begin();
+        list_push(t_let(tv, v, v));
+        let rt = crate::front::types::ref_to(t, REF_SHARED);
+        let addr = t_node(NodeKind::Unary, v, rt);
+        NODES[addr].op = Tok::Amp;
+        NODES[addr].b = t_ident(tv, v);
+        let b = t_block(m, addr, v, rt);
+        NODES[b].p |= NODE_TEMP;
+        NODES[b].end = NODES[v].end;
+        b
+    }
+}
+
+// (0.25) Whether an arm of match m binds an owned part of what it matches.
+fn match_binds_owned(m: i64) -> bool {
+    unsafe {
+        for i in 0..NODES[m].count {
+            if crate::front::own::walk::pattern_binds_owned(NODES[child(m, i)].a) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// (0.25) own.partial: `make()[i]`, an owned element moved out of an array
+// temporary by a run-time index (the other elements have no owner left).
+fn temp_element_error(e: i64) {
+    unsafe {
+        let saved = crate::base::diag::ERR_KIND;
+        crate::base::diag::ERR_KIND = c"own.partial";
+        crate::base::diag::err_begin(NODES[e].start);
+        let text = crate::base::SRC[NODES[e].start..NODES[e].end];
+        crate::base::diag::err_fmt(f"'{text}'");
+        crate::base::diag::err_str(c" moves an element out of a temporary array by a run-time index: the other elements would not be dropped");
+        crate::base::diag::err_help(c"index it by a constant, or bind the array first ('let a = VALUE;') and take the element from it");
+        crate::base::diag::err_end_soft();
+        crate::base::diag::ERR_KIND = saved;
+    }
+}
+
+// (0.25) e, a field, tuple part or array element (by a constant) moved
+// out of a part chain over an owned temporary (`let a = make().a;`,
+// `make().1.b`, `make()[1]`): the temporary is kept and the part read out
+// of it, the rest dropped with the statement (part_drops); false, nothing
+// done, for another chain, or one through a type with `impl Drop`
+// (own.partial, the own walk).
+fn part_move(e: i64) -> bool {
+    unsafe {
+        var c = e;
+        while is_part_node(c) {
+            let base = NODES[c].a;
+            let bt = NODES[base].ty;
+            if bt <= 0 || has_drop_impl(bt) || part_count(bt) == 0 {
+                return false;
+            }
+            if !is_part_node(base) {
+                break;
+            }
+            c = base;
+        }
+        if !is_part_node(c) {
+            return false;
+        }
+        let base = NODES[c].a;
+        if !is_temp(base) {
+            return false;
+        }
+        visit_temps(base);
+        let b = temp_make(base, TV_ADDR, e);
+        NODES[c].a = deref_of(b);
+        NODES[NODES[c].a].p |= NODE_RAW;
+        // (the chain reads the temporary's storage, which keeps the part
+        // no longer: no own.move_out of an index)
+        var d = e;
+        while d != NODES[c].a {
+            NODES[d].p |= NODE_RAW;
+            d = NODES[d].a;
+        }
+        true
+    }
+}
+
+// Whether n takes a part of its base where it is (a field, a tuple part,
+// an element of an array by a constant), not through a pointer.
+fn is_part_node(n: i64) -> bool {
+    unsafe {
+        let k = NODES[n].kind;
+        if k == NodeKind::FieldAccess {
+            return NODES[n].y != 1;
+        }
+        if k == NodeKind::TupleField {
+            return true;
+        }
+        let base = NODES[n].a;
+        k == NodeKind::Index && NODES[NODES[n].b].kind == NodeKind::Int && NODES[base].ty > 0
+            && TYPES[NODES[base].ty].kind == TyKind::Array
+    }
+}
+
+// (0.25) Call e, its arguments visited: an owned value an argument moves
+// into the callee (`two(mk(1), g()?)`) while a later argument may leave
+// the statement (`?`, `return`, `break`) is held as a temporary, its flag
+// cleared once the last argument is evaluated: the statement leaving
+// before the call drops it, once.
+fn hold_args(e: i64) {
+    unsafe {
+        var vals = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..NODES[e].count {
+            vals.push(child(e, i));
+        }
+        hold_values(vals);
+    }
+}
+
+// The values vals (nodes, in evaluation order) a call takes: the owned
+// ones a later one may leave the statement after are held (hold_args).
+fn hold_values(vals: IntVec) {
+    unsafe {
+        let n = vals.count;
+        if n < 2 {
+            return;
+        }
+        var last_leaves = -1;
+        for i in 0..n {
+            if may_leave(vals.data[i]) {
+                last_leaves = i;
+            }
+        }
+        if last_leaves <= 0 {
+            return;
+        }
+        var flags = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..last_leaves {
+            let a = vals.data[i];
+            if is_temp(a) {
+                // (the value moves to a node of its own, under the block made
+                // where it was)
+                let value = t_node(NodeKind::None, a, NODES[a].ty);
+                NODES[value] = NODES[a];
+                let b = temp_make(value, TV_MOVE, 0);
+                NODES[a] = NODES[b];
+                flags.push(LAST_TF);
+            }
+        }
+        if flags.count == 0 {
+            return;
+        }
+        // the last value: `{ let __own_tv = a; __own_tf = false; ..; __own_tv }`
+        let last = vals.data[n - 1];
+        let ty = NODES[last].ty;
+        let inner = t_node(NodeKind::None, last, ty);
+        NODES[inner] = NODES[last];
+        let v = define_local(SYM_TV, ty, false, false);
+        let m = list_begin();
+        list_push(t_let(v, inner, last));
+        for j in 0..flags.count {
+            list_push(t_set(flags.data[j], false, last));
+        }
+        let b = t_block(m, t_ident(v, last), last, ty);
+        NODES[b].p |= NODE_TEMP;
+        NODES[last] = NODES[b];
+    }
+}
+
+// Whether evaluating e may leave its statement before it ends: a `?`, a
+// `return`, a `break` or `continue` (outside a closure's body).
+fn may_leave(e: i64) -> bool {
+    unsafe {
+        if e <= 0 {
+            return false;
+        }
+        let k = NODES[e].kind;
+        if k == NodeKind::Try || k == NodeKind::Return || k == NodeKind::Break
+            || k == NodeKind::Continue {
+            return true;
+        }
+        if k == NodeKind::Closure || k == NodeKind::Defer {
+            return false;
+        }
+        if k == NodeKind::Let {
+            return may_leave(NODES[e].c);
+        }
+        if k == NodeKind::ExprStmt {
+            return may_leave(NODES[e].a);
+        }
+        if k == NodeKind::Unary || k == NodeKind::Binary || k == NodeKind::Assign {
+            return may_leave(NODES[e].b) || may_leave(NODES[e].c);
+        }
+        if k == NodeKind::If {
+            return may_leave(NODES[e].a) || may_leave(NODES[e].b) || may_leave(NODES[e].c);
+        }
+        if k == NodeKind::Match {
+            if may_leave(NODES[e].a) {
+                return true;
+            }
+            for i in 0..NODES[e].count {
+                let arm = child(e, i);
+                if may_leave(NODES[arm].b) || may_leave(NODES[arm].c) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if k == NodeKind::Interp {
+            for i in 0..NODES[e].count {
+                let h = child(e, i);
+                if NODES[h].kind == NodeKind::InterpHole && may_leave(NODES[h].a) {
+                    return true;
+                }
+            }
+            return NODES[e].y > 0 && may_leave(NODES[e].y);
+        }
+        if k == NodeKind::FieldInit || k == NodeKind::NamedArg {
+            return may_leave(NODES[e].b);
+        }
+        if k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Cast
+            || k == NodeKind::Index || k == NodeKind::Range || k == NodeKind::Repeat {
+            return may_leave(NODES[e].a) || (k == NodeKind::Index || k == NodeKind::Range)
+                && may_leave(NODES[e].b);
+        }
+        if k == NodeKind::Block || k == NodeKind::Call || k == NodeKind::MethodCall
+            || k == NodeKind::VecOp || k == NodeKind::Tuple || k == NodeKind::Array
+            || k == NodeKind::StructLit || k == NodeKind::VariantLit || k == NodeKind::Loop
+            || k == NodeKind::While || k == NodeKind::For {
+            if (k == NodeKind::Block || k == NodeKind::MethodCall || k == NodeKind::VecOp
+                || k == NodeKind::Call && NODES[e].x == 0) && may_leave(NODES[e].a) {
+                return true;
+            }
+            if (k == NodeKind::While || k == NodeKind::For)
+                && (may_leave(NODES[e].b) || may_leave(NODES[e].c)) {
+                return true;
+            }
+            for i in 0..NODES[e].count {
+                if may_leave(child(e, i)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+// (0.25) Operator block e (traits::operator_call: `{ let ==l = a; let ==r =
+// b; ==l.add(==r) }`): an operand an impl reads (`==`, a let parameter)
+// that is an owned temporary is kept and dropped with the statement (it
+// was read and never dropped); one it takes (`=+`) moves on. Whether e is
+// one.
+fn operator_temps(e: i64) -> bool {
+    unsafe {
+        if NODES[e].count == 0 {
+            return false;
+        }
+        let s0 = child(e, 0);
+        if NODES[s0].kind != NodeKind::Let || NODES[s0].a == 0
+            || NODES[NODES[s0].a].kind != NodeKind::PatBind {
+            return false;
+        }
+        let w = crate::base::SYMS[NODES[NODES[s0].a].a].text;
+        if w != "==l" && w != "=+l" {
+            return false;
+        }
+        for i in 0..NODES[e].count {
+            let s = child(e, i);
+            if NODES[s].kind != NodeKind::Let || NODES[s].a == 0
+                || NODES[NODES[s].a].kind != NodeKind::PatBind {
+                continue;
+            }
+            visit_temps(NODES[s].c);
+            let name = crate::base::SYMS[NODES[NODES[s].a].a].text;
+            if name.len > 1 && name[1] == '=' && is_temp(NODES[s].c) {
+                NODES[s].c = deref_of(temp_ptr(NODES[s].c));
+            }
+        }
+        // (an operand the impl takes, `=+l`, before one that may leave the
+        // statement, `mk(1) + g()?`: held, as a call's argument)
+        var vals = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in 0..NODES[e].count {
+            let s = child(e, i);
+            if NODES[s].kind == NodeKind::Let {
+                vals.push(NODES[s].c);
+            }
+        }
+        hold_values(vals);
+        true
     }
 }
 

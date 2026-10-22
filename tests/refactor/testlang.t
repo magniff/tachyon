@@ -10,7 +10,7 @@ test main.vl: 7 passed, 4 failed, 1 new snapshot (1 case, 5 #[test], 4 #[propert
 FAIL gap_needs_two: checks.vl:14:8: index out of bounds: index 1, length 1
   trace: checks.vl:14 checks::gap_needs_two
 FAIL keeps_a_buffer: check-alloc: 1 block of Gpa not freed (14 bytes): block #2 (14 bytes), allocated at checks.vl:22:5
-FAIL bubble_sorts (property, case 11 of 100, shrunk in 8 steps): not sorted
+FAIL bubble_sorts (property, case 11 of 100, shrunk in 8 steps): checks.vl:46:13: not sorted
   input: v = [1, 0]
   try: volec test bubble_sorts --seed 0xf788dd27897d1fed main.vl
 FAIL forgets_its_input (property, case 4 of 100, shrunk in 1 step): check-alloc: 1 block of Gpa not freed by the case (32 bytes): block #11 (32 bytes), allocated at <test>:106:21
@@ -21,7 +21,7 @@ FAIL forgets_its_input (property, case 4 of 100, shrunk in 1 step): check-alloc:
 ## a property's failure again, from its seed
 $ test bubble_sorts --seed 0xf788dd27897d1fed
 test main.vl: 0 passed, 1 failed (1 #[property]; -O0 and -O2 agree)
-FAIL bubble_sorts (property, case 11 of 100, shrunk in 8 steps): not sorted
+FAIL bubble_sorts (property, case 11 of 100, shrunk in 8 steps): checks.vl:46:13: not sorted
   input: v = [1, 0]
   try: volec test bubble_sorts --seed 0xf788dd27897d1fed main.vl
 (outputs: .volec/test/O2/case-NAME.got, .err; test-NAME.got, .err)

@@ -67,9 +67,10 @@ fn main(gpa: Gpa) {
 ```
 
 - There are no references to take or store: where other languages
-  borrow (a shared reference `&T`, a mutable reference `&mut T`), a let
-  parameter borrows the value read-only for the call and an inout one
-  borrows it exclusively, with `&x` at the call.
+  borrow a reference, a let parameter borrows the value read-only for
+  the call and an inout one borrows it exclusively, with `&x` at the
+  call. An inout access needs a mutable place: `&x` and an `inout self`
+  method (`x.push(1)`) on a let binding are `own.readonly` (`var x`).
 - For a plain type (`i64`, a struct of numbers) `let` and `sink` are
   both a copy; only `inout` changes the caller's value. For an owned one
   `let` lends it and `sink` moves it.
@@ -93,7 +94,15 @@ fn main(gpa: Gpa) {
   panic. A moved value is not dropped where it was.
 - `impl Drop for T { fn drop(inout self) { ... } }` runs code at the
   drop; a type without one drops its fields. `drop(x)` drops early,
-  `std::forget(x)` never (a leak, safe).
+  `std::forget(x)` never (a leak, safe); `x.drop()` by hand is
+  `own.drop_call` (`try: drop(x)`). A type with a Drop of its own
+  holds no view, also through a type argument (`G<[i64]>` of `impl<T>
+  Drop for G<T>`): `own.drop_view`, since its drop could read what the
+  view points to after that is gone. std's containers of views are fine.
+- A `match`, `if let` or `let (a, _) = t` by value on a local moves
+  only the parts it binds; the rest (`_`, `..`, a wildcard arm) stays
+  in the local and is dropped with it, at its scope's end. `v[i] = x`
+  drops the element it replaces.
 - `let x = v[i];` of an owned element borrows it (a let access, read
   only); `var x = v[i];` would move it out of the Vec and is
   `own.move_out`, as is `var k = self.keys;` in an `inout self` method:

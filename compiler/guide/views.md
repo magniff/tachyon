@@ -127,7 +127,7 @@ main.vl:12:18: error[own.conflict] 'v.push(x)' may change the elements of 'v' wh
   help: loop over the indexes (the loop sees the elements present when it starts), or collect the new elements and append them after the loop
   try: volec edit patch main --old 'for x in v {' --new 'for i in 0..v.len() { let x = v[i];'
 
-main.vl:6:11: error[own.conflict] 'a' is borrowed mutably by '&a' and mutably again by '&a' in the same call
+main.vl:6:11: error[own.conflict] 'a' is lent inout to '&a' and inout again to '&a' in the same call
   help: pass disjoint places, copy the plain value out first, or for two elements of one Vec use 'v.swap(i, j)'
 ```
 

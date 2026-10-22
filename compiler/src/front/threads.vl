@@ -30,13 +30,15 @@
 
 use crate::base::{SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str};
 use crate::base::diag::{buf_file_line, report_error_once};
-use crate::front::ast::{CLOSURE_MOVE, NODES, NODE_CAPTURE, NodeKind, child};
+use crate::front::ast::{CLOSURE_MOVE, NODES, NODE_CAPTURE, NODE_REF_MUT, NodeKind, child};
 use crate::front::check::LOCALS;
 use crate::front::closures::{CAPTURE_LIST, CLOSURES, closure_of_type};
 use crate::front::effects::{EFF_RAW_GLOBAL, EFF_UNKNOWN, fn_effects};
 use crate::front::lexer::Tok;
 use crate::front::modules::within_std;
-use crate::front::own::kinds::{P_MUT, P_MUT_VIEW, P_RAW, is_owned_type, is_view_type, param_mode};
+use crate::front::own::kinds::{
+    P_MUT, P_MUT_VIEW, P_RAW, is_owned_type, is_plain_type, is_view_type, param_mode,
+};
 use crate::front::types::{
     ENUMS, FNS, FN_COUNT, REF_MUT, REF_SHARED, STRUCTS, TLISTS, TYPES, TY_ERROR, TyKind, VARIANTS,
     buf_type, enum_variant, struct_field,
@@ -396,8 +398,8 @@ fn report_static(pos: i64, what: *u8) {
     let help = buf_new();
     unsafe {
         buf_str(msg, what);
-        buf_str(msg, c" runs a closure on another thread, but it reaches a static mut (its effects have `global`): a static mut is for the main thread");
-        buf_str(help, c"make the static an atomic or a Mutex without `mut` (`static N: AtomicI64 = AtomicI64 { v: 0 };`), a #[thread_local], or pass the data in | try: volec query effects ");
+        buf_str(msg, c" runs a closure on another thread, but it reaches a static var (its effects have `global`): a static var is for the main thread");
+        buf_str(help, c"make the static an atomic or a Mutex, not `var` (`static N: AtomicI64 = AtomicI64 { v: 0 };`), a #[thread_local], or pass the data in | try: volec query effects ");
         buf_file_line(help, pos);
         buf_str(help, c" --why global");
     }
@@ -416,7 +418,7 @@ fn check_spawn(f: i64) {
             let help = buf_new();
             buf_str(msg, c"'thread::spawn' takes a closure written at the call, not ");
             buf_type(msg, ft);
-            buf_str(help, c"wrap the function: `thread::spawn(move || work(x))`");
+            buf_str(help, c"wrap the function: `thread::spawn(sink || work(x))`");
             report(pos, c"sync.spawn_closure", msg, help);
             return;
         }
@@ -431,9 +433,9 @@ fn check_spawn(f: i64) {
                 buf_str(msg, c"the closure given to 'thread::spawn' borrows '");
                 buf_bytes(msg, local_name(l));
                 buf_str(msg, c"', but the thread may outlive it");
-                buf_str(help, c"move it into the thread (`move ||`), or start the thread in thread::scope, which ends before it does | try: volec edit patch ");
+                buf_str(help, c"move it into the thread (`sink ||`), or start the thread in thread::scope, which ends before it does | try: volec edit patch ");
                 buf_file_line(help, pos);
-                buf_str(help, c" --old 'spawn(||' --new 'spawn(move ||'");
+                buf_str(help, c" --old 'spawn(||' --new 'spawn(sink ||'");
                 report(pos, c"sync.borrow_escapes", msg, help);
                 return;
             }
@@ -499,6 +501,11 @@ fn capture_write(n: i64, mark: i64) -> i64 {
             if written(captured_root(NODES[n].b), mark) {
                 return n;
             }
+            // (`v.as_mut_slice()[i] = x`: the call making the target)
+            let wt = capture_write(NODES[n].b, mark);
+            if wt != 0 {
+                return wt;
+            }
             let w = capture_write(NODES[n].c, mark);
             if w != 0 {
                 return w;
@@ -522,11 +529,14 @@ fn capture_write(n: i64, mark: i64) -> i64 {
             let f = NODES[n].x - 1;
             for i in 0..NODES[n].count {
                 let a = child(n, i);
-                if f >= 0 && i < FNS[f].param_count && NODES[a].kind == NodeKind::Unary
-                    && NODES[a].op == Tok::Amp {
+                if f >= 0 && i < FNS[f].param_count {
+                    // (`&place`, `&a[..]`, a coerced `&v`, an array or a
+                    // slice receiver of an inout method, `a.sort()`, an
+                    // access passed on)
                     let m = param_mode(f, i);
-                    if (m == P_MUT || m == P_RAW || m == P_MUT_VIEW)
-                        && written(captured_root(NODES[a].b), mark) {
+                    let amp = NODES[a].kind == NodeKind::Unary && NODES[a].op == Tok::Amp;
+                    if (m == P_MUT || m == P_MUT_VIEW || m == P_RAW && amp)
+                        && written(captured_root(a), mark) {
                         return a;
                     }
                 }
@@ -633,6 +643,12 @@ fn capture_write(n: i64, mark: i64) -> i64 {
             || k == NodeKind::Unary {
             return capture_write(NODES[n].b, mark);
         }
+        if k == NodeKind::Index && (NODES[n].p & NODE_REF_MUT) != 0
+            && written(captured_root(NODES[n].a), mark) {
+            // an exclusive slicing of it, `&a[..]`, `&v[i..j]` (what an inout
+            // `[T]` is given; `&v` for a Vec, a Buf or an array becomes `&v[..]`)
+            return n;
+        }
         if k == NodeKind::Index || k == NodeKind::Repeat || k == NodeKind::Range {
             w = capture_write(NODES[n].a, mark);
             if w == 0 {
@@ -650,9 +666,74 @@ static var CW_STACK: crate::base::IntVec = crate::base::IntVec {
 };
 
 // Whether local l (captured_root's) is one of the variables checked:
-// declared before `mark`.
+// declared before `mark`, and, while SHARED_ONLY is set (a scope's own
+// body), one its threads share (SHARED).
 fn written(l: i64, mark: i64) -> bool {
-    l >= 0 && l < mark
+    unsafe {
+        if l < 0 || l >= mark {
+            return false;
+        }
+        if !SHARED_ONLY {
+            return true;
+        }
+        for i in 0..SHARED.count {
+            if SHARED.data[i] == l {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// (0.25) The locals the threads of the scope being checked share with its
+// closure's body: what they capture, by reference or of a type that is not
+// plain, and what the closures among them capture.
+static var SHARED: crate::base::IntVec = crate::base::IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var SHARED_ONLY: bool = false;
+
+// Adds closure g's captures to SHARED; false when one is a view (what it
+// views is not known here: then every write counts).
+fn share_captures(g: i64, depth: i64) -> bool {
+    unsafe {
+        if depth > 8 {
+            return false;
+        }
+        for k in 0..CLOSURES[g].capture_count {
+            let l = CAPTURE_LIST.data[CLOSURES[g].captures + 2 * k];
+            let by_ref = CAPTURE_LIST.data[CLOSURES[g].captures + 2 * k + 1] != 0;
+            let t = LOCALS[l].ty;
+            let inner = closure_id(t);
+            if inner >= 0 {
+                SHARED.push(l);
+                if !share_captures(inner, depth + 1) {
+                    return false;
+                }
+                continue;
+            }
+            if is_view_type(t) {
+                return false;
+            }
+            if by_ref || !is_plain_type(t) {
+                SHARED.push(l);
+            }
+        }
+        true
+    }
+}
+
+// The node that changes local l: an assignment's target, else the place
+// written (`&v`, `&a[..]`, `v.as_mut_slice()`, a receiver).
+fn write_root(w: i64) -> i64 {
+    unsafe {
+        if NODES[w].kind == NodeKind::Assign {
+            return captured_root(NODES[w].b);
+        }
+        let r = captured_root(w);
+        if r < 0 && NODES[w].kind == NodeKind::Call && NODES[w].count > 0 {
+            return captured_root(child(w, 0));
+        }
+        r
+    }
 }
 
 // The local a place expression changes when it is a variable a closure
@@ -665,15 +746,56 @@ fn captured_root(e: i64) -> i64 {
                 return -1;
             }
             if (NODES[x].p & NODE_CAPTURE) != 0 {
-                return if NODES[x].kind == NodeKind::Unary { NODES[x].d - 1 } else { -1 };
+                if NODES[x].kind == NodeKind::Unary {
+                    return NODES[x].d - 1;
+                }
+                // (0.25) a view captured by copy: what changes through the
+                // copy is what the caller's view views (`s.sort()`, `s[0] = 1`)
+                let l = NODES[x].d - 1;
+                return if l >= 0 && is_view_type(LOCALS[l].ty) { l } else { -1 };
             }
             let k = NODES[x].kind;
             if k == NodeKind::FieldAccess || k == NodeKind::TupleField || k == NodeKind::Index {
                 x = NODES[x].a;
+            } else if k == NodeKind::Unary && NODES[x].op == Tok::Amp {
+                // (`&place`: what an inout parameter is given)
+                x = NODES[x].b;
+            } else if k == NodeKind::Call && NODES[x].count > 0 && exclusive_type(NODES[x].ty) {
+                // (an access a method makes of its receiver: `v[i]` is
+                // `v.as_mut_slice()[i]` when written, `m.get_or_insert(k, 0)`)
+                x = child(x, 0);
             } else {
                 return -1;
             }
         }
+    }
+}
+
+// Whether t is an exclusive access: `inout T` (a `&mut T`) or `inout [T]`, or
+// an Option of one (`get_mut`).
+fn exclusive_type(t: i64) -> bool {
+    unsafe {
+        if t <= 0 {
+            return false;
+        }
+        let k = TYPES[t].kind;
+        if (k == TyKind::Ptr || k == TyKind::Slice) && TYPES[t].b == REF_MUT {
+            return true;
+        }
+        if k == TyKind::Enum {
+            let e = TYPES[t].a;
+            for i in 0..ENUMS[e].variant_count {
+                let v = enum_variant(e, i);
+                for j in 0..VARIANTS[v].field_count {
+                    let ft = TLISTS.data[VARIANTS[v].fields + j];
+                    if ft > 0 && (TYPES[ft].kind == TyKind::Ptr || TYPES[ft].kind == TyKind::Slice)
+                        && TYPES[ft].b == REF_MUT {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 }
 
@@ -696,10 +818,41 @@ fn check_scope(f: i64) {
             report(pos, c"sync.spawn_closure", msg, help);
             return;
         }
+        // (0.25) the body may change what no thread of the scope shares (a
+        // counter it keeps): only when no thread captures a view, whose
+        // origin is not known here
+        SHARED.count = 0;
+        SHARED_ONLY = true;
+        for s in 0..FN_COUNT {
+            if FNS[s].tmpl != 0 && FNS[s].tmpl - 1 == SCOPE_SPAWN_FN && FNS[s].targ_count >= 1 {
+                let g = closure_id(TLISTS.data[FNS[s].targs]);
+                if g >= 0 && scope_closure_of(g) == c && !share_captures(g, 0) {
+                    SHARED_ONLY = false;
+                }
+            }
+        }
+        // (0.25) its value holds no Scope and no handle of a thread started
+        // in it: they end with the scope
+        let rt = FNS[CLOSURES[c].f].ret;
+        let held = scope_part(rt, 0);
+        if held != 0 {
+            let msg = buf_new();
+            let help = buf_new();
+            buf_str(msg, c"the closure given to thread::scope returns ");
+            buf_type(msg, rt);
+            if held != rt {
+                buf_str(msg, c", which holds ");
+                buf_type(msg, held);
+            }
+            buf_str(msg,
+                c": its threads are joined and its Scope is gone when thread::scope returns");
+            buf_str(help, c"join the threads inside and return their results: `thread::scope(|s| s.spawn(|| ...).join())`");
+            report(scope_value_pos(c), c"sync.scope_escape", msg, help);
+        }
         let w = capture_write(body_of(c), CLOSURES[c].mark);
+        SHARED_ONLY = false;
         if w != 0 {
-            let l = captured_root(if NODES[w].kind == NodeKind::Assign { NODES[w].b }
-                else { NODES[w].b });
+            let l = write_root(w);
             let msg = buf_new();
             let help = buf_new();
             buf_str(msg, c"the closure given to 'thread::scope' changes '");
@@ -710,6 +863,78 @@ fn check_scope(f: i64) {
             buf_str(help, c"change it before or after thread::scope; inside, give each thread its own data, or share a Mutex or an atomic");
             report(NODES[w].start, c"sync.scope_write", msg, help);
         }
+    }
+}
+
+// The part of type t that is std's Scope or a ScopedJoinHandle (a type),
+// in a field, an element, a variant or behind a pointer; 0: none.
+fn scope_part(t: i64, depth: i64) -> i64 {
+    unsafe {
+        if t <= 0 || t == TY_ERROR || depth > 16 {
+            return 0;
+        }
+        let kind = TYPES[t].kind;
+        if kind == TyKind::Ptr || kind == TyKind::Slice || kind == TyKind::Array {
+            return scope_part(TYPES[t].a, depth + 1);
+        }
+        if kind == TyKind::Tuple {
+            for i in 0..TYPES[t].count {
+                let p = scope_part(TLISTS.data[TYPES[t].list + i], depth + 1);
+                if p != 0 {
+                    return p;
+                }
+            }
+            return 0;
+        }
+        if kind == TyKind::Enum {
+            let e = TYPES[t].a;
+            for i in 0..ENUMS[e].variant_count {
+                let p = scope_part(VARIANTS[enum_variant(e, i)].shape, depth + 1);
+                if p != 0 {
+                    return p;
+                }
+            }
+            return 0;
+        }
+        if kind != TyKind::Struct {
+            return 0;
+        }
+        let s = TYPES[t].a;
+        let name = std_name(s);
+        if name == "Scope" || name == "ScopedJoinHandle" {
+            return t;
+        }
+        if STRUCTS[s].closure != 0 {
+            return 0;
+        }
+        // (a container's elements: its type arguments)
+        for i in 0..STRUCTS[s].targ_count {
+            let p = scope_part(TLISTS.data[STRUCTS[s].targs + i], depth + 1);
+            if p != 0 {
+                return p;
+            }
+        }
+        for i in 0..STRUCTS[s].field_count {
+            let p = scope_part((*struct_field(s, i)).ty, depth + 1);
+            if p != 0 {
+                return p;
+            }
+        }
+        0
+    }
+}
+
+// Where closure c's value is: its body's tail, else the closure.
+fn scope_value_pos(c: i64) -> i64 {
+    unsafe {
+        let body = body_of(c);
+        if body > 0 && NODES[body].kind == NodeKind::Block && NODES[body].a > 0 {
+            return NODES[NODES[body].a].start;
+        }
+        if body > 0 && NODES[body].kind != NodeKind::Block {
+            return NODES[body].start;
+        }
+        NODES[CLOSURES[c].node].start
     }
 }
 
@@ -776,7 +1001,7 @@ fn check_scoped_spawn(f: i64) {
                     } else {
                         c"', made inside the scope's closure, which ends before the thread is joined"
                     });
-                    buf_str(help, c"make it before thread::scope, or move an owned value into the thread (`move ||`)");
+                    buf_str(help, c"make it before thread::scope, or move an owned value into the thread (`sink ||`)");
                     report(pos, c"sync.scope_local", msg, help);
                     return;
                 }
@@ -827,7 +1052,7 @@ fn check_scoped_spawn(f: i64) {
         if w != 0 {
             let msg = buf_new();
             let help = buf_new();
-            let l = captured_root(NODES[w].b);
+            let l = write_root(w);
             buf_str(msg, c"a thread of 'thread::scope' changes '");
             if l >= 0 {
                 buf_bytes(msg, local_name(l));
@@ -853,6 +1078,96 @@ fn check_scoped_spawn(f: i64) {
         }
     }
 }
+
+// (0.25) What a channel carries, a Mutex guards and an atomic holds holds no
+// view: a value put in one is taken out elsewhere, later (another thread, or
+// after the scope of what it views ends), and nothing ties it to what it
+// views. The constructors' instances: mpsc::channel_in::<T>, Mutex::new,
+// Atomic::new. (Scoped threads may still borrow views of data that outlives
+// the scope: check_scoped_spawn.)
+static var CHANNEL_FN: i64 = -2;
+static var MUTEX_NEW_FN: i64 = -2;
+static var ATOMIC_NEW_FN: i64 = -2;
+
+pub fn check_sync_items() {
+    unsafe {
+        if CHANNEL_FN == -2 {
+            CHANNEL_FN = find_std_fn("std.sync.mpsc.channel_in");
+            MUTEX_NEW_FN = find_std_fn("std.sync.Mutex.new");
+            ATOMIC_NEW_FN = find_std_fn("std.sync.atomic.Atomic.new");
+            WITH_FNS.count = 0;
+            WITH_FNS.push(find_std_fn("std.sync.Mutex.with"));
+            WITH_FNS.push(find_std_fn("std.sync.Mutex.try_with"));
+            WITH_FNS.push(find_std_fn("std.sync.MutexGuard.with"));
+            WITH_FNS.push(find_std_fn("std.sync.Condvar.wait_then"));
+        }
+        if CHANNEL_FN < 0 && MUTEX_NEW_FN < 0 && ATOMIC_NEW_FN < 0 {
+            return;
+        }
+        for f in 0..FN_COUNT {
+            if FNS[f].tmpl == 0 || FNS[f].targ_count < 1 || FNS[f].origin <= 0 {
+                continue;
+            }
+            let t = FNS[f].tmpl - 1;
+            var with = false;
+            for i in 0..WITH_FNS.count {
+                if WITH_FNS.data[i] == t && t >= 0 {
+                    with = true;
+                }
+            }
+            if t != CHANNEL_FN && t != MUTEX_NEW_FN && t != ATOMIC_NEW_FN && !with {
+                continue;
+            }
+            let p = FNS[f].parent - 1;
+            if p >= 0 && within_std(FNS[p].module) {
+                continue;
+            }
+            // (with's R: its second type argument, after the Mutex's T or
+            // wait_then's T)
+            if with && FNS[f].targ_count < 2 {
+                continue;
+            }
+            let item = TLISTS.data[FNS[f].targs + if with { 1 } else { 0 }];
+            if item <= 0 || item == TY_ERROR || !is_view_type(item) {
+                continue;
+            }
+            let pos = call_pos(f);
+            let msg = buf_new();
+            let help = buf_new();
+            if with {
+                buf_str(msg, c"the closure given to the lock returns ");
+            } else {
+                buf_str(msg, if t == CHANNEL_FN { c"a channel of " }
+                    else if t == MUTEX_NEW_FN { c"a Mutex of " } else { c"an atomic of " });
+            }
+            buf_type(msg, item);
+            let k = TYPES[item].kind;
+            buf_str(msg, if k == TyKind::Slice || k == TyKind::Ptr || k == TyKind::Distinct {
+                c", a view: "
+            } else {
+                c", which holds views: "
+            });
+            if with {
+                buf_str(msg, c"a view of the locked data would outlive the lock");
+                buf_str(help, c"return an owned copy (`d.to_vec_in(gpa)`, `d.to_string_in(gpa)`) or the plain values you need (`d[0]`, `d.len()`) | try: volec explain sync.view_item");
+            } else {
+                buf_str(msg, if t == CHANNEL_FN {
+                    c"what is sent is received elsewhere, later, and may outlive what it views"
+                } else {
+                    c"what is stored in it is taken out elsewhere, later, and may outlive what it views"
+                });
+                buf_str(help, c"send and store owned values: a copy of the view (`s.to_vec_in(gpa)`, `s.to_string_in(gpa)`, a Buf), or an index into data the threads share | try: volec explain sync.view_item");
+            }
+            report(pos, c"sync.view_item", msg, help);
+        }
+    }
+}
+
+// Mutex::with, try_with, MutexGuard::with, Condvar::wait_then: their
+// result holds no view of the data they lock.
+static var WITH_FNS: crate::base::IntVec = crate::base::IntVec {
+    data: 0 as *i64, count: 0, cap: 0
+};
 
 // (0.21) Whether type t holds std's Atomic (or a lock built on one)
 // anywhere: memory that changes through a shared reference, so an

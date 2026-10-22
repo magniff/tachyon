@@ -18,7 +18,8 @@
 
 use crate::base::{buf_bytes, buf_clear, buf_new, buf_slice, buf_str, intern, intern_c, sym_text};
 use crate::front::ast::{
-    INT_SITE, NODES, NODE_CHECKED, NodeKind, child, list_begin, list_end, list_push, new_node,
+    CONV_NEW, INT_SITE, NODES, NODE_CHECKED, NodeKind, child, list_begin, list_end, list_push,
+    new_node,
 };
 use crate::front::check::{CUR_FN, Res, pop_scope, push_scope};
 use crate::front::check::synth_mode::synth_expr;
@@ -41,6 +42,9 @@ static var SYM_ASSERT_EQ: i64 = 0;
 static var SYM_ASSERT_NE: i64 = 0;
 static var SYM_DEBUG_ASSERT: i64 = 0;
 static var SYM_CHECK: i64 = 0;
+
+static var SYM_PANIC: i64 = 0;
+static var SYM_UNREACHABLE: i64 = 0;
 static var TEXT: i64 = -1;
 
 fn words() {
@@ -53,6 +57,8 @@ fn words() {
         SYM_ASSERT_NE = intern_c(c"std.assert_ne");
         SYM_DEBUG_ASSERT = intern_c(c"std.debug_assert");
         SYM_CHECK = intern_c(c"std.contract_check");
+        SYM_PANIC = intern_c(c"std.panic_str");
+        SYM_UNREACHABLE = intern_c(c"std.unreachable");
         TEXT = buf_new();
         WORDS = true;
     }
@@ -97,6 +103,10 @@ pub fn desugar_call(n: i64) -> i64 {
             }
             if name == SYM_ASSERT_EQ || name == SYM_ASSERT_NE {
                 assert_compare(n, name == SYM_ASSERT_EQ);
+                return n;
+            }
+            if name == SYM_PANIC || name == SYM_UNREACHABLE {
+                panic_site(n);
                 return n;
             }
         }
@@ -359,6 +369,9 @@ fn copy_read(n: i64) -> i64 {
             let id = new_node(NodeKind::Ident, NODES[n].start, NODES[n].end);
             NODES[id].a = NODES[n].a;
             NODES[id].g = NODES[n].g;
+            // (0.25: the reference inside an access local's `*r`, as it was:
+            // not made `*r` again, which would read r's referent as raw)
+            NODES[id].p |= NODES[n].p & CONV_NEW;
             synth_expr(id);
             return id;
         }
@@ -452,6 +465,26 @@ fn assert_compare(n: i64, eq: bool) {
         buf_bytes(text, source(b));
         CHECK_TEXT.data[check] = text;
         make_check(n, cmp, check);
+    }
+}
+
+// (0.25) `panic(m)` / `unreachable()` in the program: their last argument,
+// `at` (its default, ""), becomes the call's `FILE:LINE:COL`, which std
+// prints first, as a failed check does.
+fn panic_site(n: i64) {
+    unsafe {
+        if NODES[n].count == 0 || within_std(FNS[CUR_FN].module)
+            || crate::front::contracts::flags::NO_POSITIONS {
+            return;
+        }
+        let lit = child(n, NODES[n].count - 1);
+        if NODES[lit].kind != NodeKind::Str
+            || crate::front::lexer::str_at(NODES[lit].a).len != 0 {
+            return;
+        }
+        let b = buf_new();
+        crate::front::contracts::checks::put_position(b, NODES[n].start);
+        NODES[lit].a = add_string(buf_slice(b));
     }
 }
 

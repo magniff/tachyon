@@ -1432,6 +1432,26 @@ an iterator's copied items. Moved to 0.24.1 or later: iterator items as
 views (the stopgap's full fix), the closure by-value parameter leak,
 std's core under 128 KB, Wayland and X11.
 
+## 0.25: compile speed, and a semantics audit
+
+- compile speed: the plan of docs/design/compile-speed-025.md (the
+  resolve scans, a line index, the lexer, data as bytes, the assembler,
+  linking without `cc`)
+- the core semantics audited by red teams and a value-semantics fuzzer,
+  every finding fixed or recorded
+- the book; std::cli in the examples; the chain checked from nothing
+
+Done (0.25.0). The compile-speed plan (an in-house Mach-O linker by
+default on aarch64-macos); five audits, about 1,600 probes kept as
+tests, tools/semfuzz as `fuzz-sem`, about 30 families of soundness bugs
+of released versions fixed; the Vole Book; std::cli across the examples;
+`#[link]` and `-framework`; the language server resolving every name;
+`chain-diverse` and `chain-fresh`. Moved to 0.25.1: the closure by-value
+parameter leak (F20), values017, the rest of fix25j's diagnostics and of
+`volec`'s command line on std::cli, `split_at_mut`, iterator items as
+views, the 26 OVERSTRICT cases, a thread-safe `--check-alloc` in a -j8
+compiler.
+
 ## After 0.23: the specification
 
 Decided with the user on 2026-10-16: once 0.23 has shipped, the whole
@@ -2503,3 +2523,57 @@ the same run; instructions retired against v0.23.0's build of the same
 programs: every program within 0.25%, the outputs the same. The
 self-compile (0.24's source, no cache): 11.40 G to 11.45 G at -O0
 (+0.4%), 44.72 G at -O2 -j1 for both, 726 MB to 754 MB.
+
+### 0.25
+
+The release gate (`gate.sh --release --no-x86`, 54:59 wall at load up
+to 80). chain-fresh passed: the seed and all 26 releases rebuilt into an
+empty cache, each the same bytes as bootstrap/chain-hashes/ and the
+shared cache. Every other macOS row passed but the suites, stress-grow
+and chain-diverse; in the container the suites, objcheck and valgrind:
+- in the container, `env::args()` did not build unless the program read
+  files too (std's one index is made from sys/macos.vl; since 0.20):
+  120 cases and objcheck's 448 compilations. Linux's `sys_args` now
+  calls libc's open, read and close itself. Three book blocks gave
+  Linux's output (glibc's malloc catches chapter 15's planted overflow;
+  Mach-O's `_` symbols; crc outside Linux's baseline): marked `macos`
+  or made portable. valgrind's one failure was its kill at load (137);
+- chain-diverse judged target/same-output's earlier runs as its own; in
+  a work directory of its own, its differences are only the compiler's
+  path in `try:` lines;
+- fuzzcmd (macOS suites, stress-grow): the deterministic fuzzer needs
+  16001 runs, which 120 s did not hold at load 80 (`--time 600`);
+  litmus_sb, litmus_sb_llsc and window_idle hit their time limits and
+  passed alone.
+Rerun after the fixes (44:58, then the container 10:25): every row
+passing but those load cases. The suite 3858 (84 XFAIL), the book 311,
+aarch64-linux 3409, threads 7990, incremental 164 series, objcheck 5016,
+compiler-memcheck 535, fuzz-sem 300 programs, voltty-fuzz, valgrind 267
+clean. compile-cost against v0.24.0: a hello world 0.82x, std_heavy
+0.87x, check of the compiler 0.56x.
+
+Bench (load 3 to 7): geomean 0.888 of cc -O2, v0.24.0's build 0.893 in
+the same run; instructions retired against v0.24.0's build of the same
+programs: every program within 0.65%, the outputs the same.
+
+Compile speed, v0.24.0 against 0.25.0, each on its own source, no cache,
+best of 7 wall and fewest instructions, load 2.6 to 3.3:
+
+| run | v0.24.0 | 0.25.0 | instructions | peak RSS |
+|---|---|---|---|---|
+| self -O0 -j8, -c | 495 ms | **290 ms** | 11.38 → 5.96 G | 431 → 451 MB |
+| self -O0 -j8, linked | 521 ms | **287 ms** | 11.37 → 6.11 G | 431 → 476 MB |
+| self -O0 -j1, linked | 583 ms | 357 ms | 11.34 → 6.08 G | 411 → 471 MB |
+| self -O1 -j8, linked | 610 ms | 466 ms | 18.26 → 14.75 G | 609 → 650 MB |
+| self -O2 -j8, linked | 1055 ms | 923 ms | 44.76 → 43.17 G | 854 → 920 MB |
+| self -O2 -j1, linked | 2862 ms | 2835 ms | 44.61 → 43.01 G | 835 → 909 MB |
+| `check` | 298 ms | **206 ms** | 5.58 → 3.22 G | 310 → 354 MB |
+| `query refs buf_new --count`, no cache | 707 ms | **334 ms** | 18.32 → 5.11 G | 420 → 479 MB |
+| hello world, linked | 31.7 ms | **7.3 ms** | 0.10 → 0.08 G | 37 → 16 MB |
+| hello world, -c | 7.6 ms | 7.0 ms | 0.10 → 0.08 G | 17 → 16 MB |
+| std_heavy -O0, -c | 23.7 ms | 17.6 ms | 0.44 → 0.27 G | 39 → 38 MB |
+| std_heavy -O2, linked | 66.6 ms | 37.2 ms | 1.15 → 1.01 G | 56 → 56 MB |
+
+On the same input (0.25.0's compiler/src) v0.24.0 peaks at 449 MB at
+-O0 linked and 386 MB in `check`: 0.25.0's -O0 is 27 MB higher, its
+`check` 32 MB lower; the rest is the source's own growth.

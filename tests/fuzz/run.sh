@@ -5,7 +5,7 @@
 #
 # usage: tests/fuzz/run.sh [-c COMPILER] [-s SEED] [-t TARGET] [-n COUNT]
 #                          [-f FIRST] [-k DIR] [-j JOBS] [-l] [-g] [-p] [-C] [-N]
-#                          [-V] [-D] [-R] [-A]
+#                          [-V] [-D] [-R] [-A] [-G]
 #
 #   -c COMPILER   the volec to test (default: target/volec)
 #   -s SEED       also compare with the seed binary (divisors are then
@@ -31,6 +31,12 @@
 #                 table (compiler/arch/*.def) and portable vector
 #                 operations, on loads near a slice's end, from
 #                 genarch.awk
+#   -G            guarded accesses in loops (0.25): elements far out of
+#                 bounds, raw pointers behind null tests and calls that
+#                 take 2^62 steps, under conditions that never hold, from
+#                 genguard.awk; nothing may run where the program does
+#                 not run it (each program is stopped after 10 s: a hang
+#                 is a failure)
 #   -j JOBS       programs tested at once (default: the number of CPUs,
 #                 or the slots of $VOLE_JOBSERVER, see tests/run.sh)
 
@@ -63,8 +69,9 @@ while [ $# -gt 0 ]; do
         -D) DIVIDE=1; shift ;;
         -R) RANGES=1; shift ;;
         -A) ARCHMODE=1; shift ;;
+        -G) GUARDS=1; shift ;;
         -j) JOBS=$2; shift 2 ;;
-        *) sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+        *) sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
 done
 if [ -z "$TARGET" ]; then
@@ -116,6 +123,8 @@ test_seed() {
         awk -v seed="$seed" -f "$ROOT/tests/fuzz/genvec.awk" >"$program"
     elif [ "${ARCHMODE:-0}" = 1 ]; then
         awk -v seed="$seed" -f "$ROOT/tests/fuzz/genarch.awk" "$ROOT/compiler/arch/portable.def" "$ROOT/compiler/arch/${TARGET%%-*}.def" >"$program"
+    elif [ "${GUARDS:-0}" = 1 ]; then
+        awk -v seed="$seed" -f "$ROOT/tests/fuzz/genguard.awk" >"$program"
     elif [ "${RANGES:-0}" = 1 ]; then
         awk -v seed="$seed" -f "$ROOT/tests/fuzz/genrange.awk" >"$program"
     elif [ "${DIVIDE:-0}" = 1 ]; then
@@ -146,8 +155,23 @@ test_seed() {
         fi
         # The exit status is part of the output (a bounds check exits
         # with 101, alike at every level).
-        "$exe" >"$exe.out" 2>&1
-        echo "exit $?" >>"$exe.out"
+        if [ "${GUARDS:-0}" = 1 ]; then
+            # (0.25) A call hoisted out of a condition that never holds
+            # runs 2^62 steps: stopped by a watchdog, its exit (137)
+            # differs from -O0's.
+            "$exe" >"$exe.out" 2>&1 &
+            run_pid=$!
+            ( sleep 10; kill -9 "$run_pid" 2>/dev/null ) >/dev/null 2>&1 &
+            dog=$!
+            wait "$run_pid"
+            run_rc=$?
+            kill "$dog" 2>/dev/null
+            wait "$dog" 2>/dev/null
+            echo "exit $run_rc" >>"$exe.out"
+        else
+            "$exe" >"$exe.out" 2>&1
+            echo "exit $?" >>"$exe.out"
+        fi
         if grep -q '^FAIL' "$exe.out"; then
             why="-$level: $(grep '^FAIL' "$exe.out" | head -1)"
             break

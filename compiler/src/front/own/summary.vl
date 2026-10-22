@@ -25,13 +25,15 @@
 
 use crate::base::{SYMS, buf_byte, buf_bytes, buf_fmt, buf_new, buf_slice, buf_str, intern_c};
 use crate::base::diag::report_error_once;
-use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::ast::{FN_CLOSURE, NODES, NodeKind, child};
+use crate::front::check::LOCALS;
+use crate::front::closures::{CAPTURE_LIST, CLOSURES, CLOSURE_COUNT};
 use crate::front::effects::infer::template_of;
 use crate::front::own::infer::{filter_summary, param_carries};
 use crate::front::own::kinds::{P_MUT, P_MUT_VIEW, is_view_type, param_mode};
 use crate::front::parser::items::attrs::{STORES_FORM, views_of};
 use crate::front::traits::{IMPLS, impl_of_fn, trait_fn};
-use crate::front::types::{FNS, FN_COUNT, REF_MUT, REF_SHARED, TYPES, TyKind, fn_param};
+use crate::front::types::{FNS, FN_COUNT, REF_MUT, REF_SHARED, STRUCTS, TYPES, TyKind, fn_param};
 
 pub const S_L1_P: i64 = 0;
 pub const S_L1_STAR: i64 = 1;
@@ -199,7 +201,7 @@ static var VIEW_FN_N: i64 = 0;
 pub fn has_mut_ref_param(f: i64) -> bool {
     unsafe {
         for i in 0..FNS[f].param_count {
-            if is_mut_ref(fn_param(f, i)) && is_mut_mode(param_mode(f, i)) {
+            if store_param(f, i) {
                 return true;
             }
         }
@@ -225,6 +227,115 @@ pub fn is_mut_ref(t: i64) -> bool {
 // referent stores go into (`&mut T`, a legacy `*T`, `&mut [T]`).
 pub fn is_mut_mode(m: i64) -> bool {
     m == P_MUT || m == P_MUT_VIEW
+}
+
+// Whether parameter i of f is a closure's env (`*Env`, the first
+// parameter of a closure that captures; closures/mod.vl), whose captures
+// hold or borrow views: the body reads and changes the captured
+// variables through it, so the walk takes it as an `inout` parameter
+// (its stores are checked, own.escape, and summarized).
+pub fn env_param(f: i64, i: i64) -> bool {
+    unsafe {
+        if i != 0 || f < 0 || FNS[f].param_count == 0 || FNS[f].node <= 0
+            || (NODES[FNS[f].node].p & FN_CLOSURE) == 0 {
+            return false;
+        }
+        let t = fn_param(f, 0);
+        if t <= 0 || TYPES[t].kind != TyKind::Ptr {
+            return false;
+        }
+        let e = TYPES[t].a;
+        e > 0 && TYPES[e].kind == TyKind::Struct && STRUCTS[TYPES[e].a].closure != 0
+            && is_view_type(e)
+    }
+}
+
+// Whether parameter i of f holds a closure by value whose captures hold or
+// borrow views (an `F` of a generic function's instance): calling it may
+// store into what it captures, so stores go into it (store_param).
+pub fn closure_param(f: i64, i: i64) -> bool {
+    unsafe {
+        let t = fn_param(f, i);
+        t > 0 && TYPES[t].kind == TyKind::Struct && STRUCTS[TYPES[t].a].closure != 0
+            && is_view_type(t)
+    }
+}
+
+// The closure (a CLOSURES index) whose function f is, or -1 (memoized:
+// the last one asked).
+static var CLOSURE_OF_F: i64 = -1;
+static var CLOSURE_OF_C: i64 = -1;
+
+pub fn closure_of_fn(f: i64) -> i64 {
+    unsafe {
+        if f == CLOSURE_OF_F {
+            return CLOSURE_OF_C;
+        }
+        var c = -1;
+        for i in 0..CLOSURE_COUNT {
+            if CLOSURES[i].f == f {
+                c = i;
+            }
+        }
+        CLOSURE_OF_F = f;
+        CLOSURE_OF_C = c;
+        c
+    }
+}
+
+// Whether field sym of closure function f's env holds a capture by
+// reference (a pointer to the captured variable, `*(*env).x`): what the
+// env's views point into, `*env`, not the env itself.
+pub fn env_ref_field(f: i64, sym: i64) -> bool {
+    unsafe {
+        let c = closure_of_fn(f);
+        if c < 0 {
+            return false;
+        }
+        for j in 0..CLOSURES[c].capture_count {
+            let l = CAPTURE_LIST.data[CLOSURES[c].captures + 2 * j];
+            if LOCALS[l].name == sym {
+                return CAPTURE_LIST.data[CLOSURES[c].captures + 2 * j + 1] != 0;
+            }
+        }
+        false
+    }
+}
+
+// Whether closure function f captures local l by reference.
+pub fn captures_by_ref(f: i64, l: i64) -> bool {
+    unsafe {
+        let c = closure_of_fn(f);
+        if c < 0 {
+            return false;
+        }
+        for j in 0..CLOSURES[c].capture_count {
+            if CAPTURE_LIST.data[CLOSURES[c].captures + 2 * j] == l {
+                return CAPTURE_LIST.data[CLOSURES[c].captures + 2 * j + 1] != 0;
+            }
+        }
+        false
+    }
+}
+
+// Whether parameter i of f is one stores go into: a `&mut` one (a legacy
+// `*T` too) to what holds views, or a closure's env (env_param).
+pub fn store_param(f: i64, i: i64) -> bool {
+    is_mut_ref(fn_param(f, i)) && (is_mut_mode(param_mode(f, i)) || env_param(f, i))
+        || closure_param(f, i)
+}
+
+// Whether f has a `&mut` parameter (a legacy `*T` too) to what holds
+// views: not counting closures' (env_param, closure_param).
+pub fn inout_target(f: i64) -> bool {
+    unsafe {
+        for i in 0..FNS[f].param_count {
+            if is_mut_ref(fn_param(f, i)) && is_mut_mode(param_mode(f, i)) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------

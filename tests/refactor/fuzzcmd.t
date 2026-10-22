@@ -1,8 +1,9 @@
 ## `volec fuzz NAME` (0.18): a #[fuzz] function run on inputs it
 ## mutates, built with --coverage: an input that reaches new code is kept.
 ## Here a crash behind the 4-byte magic "FUZZ", found by the coverage of
-## its four comparisons, shrunk and saved.
-$ fuzz parse_never_crashes --time 120
+## its four comparisons, shrunk and saved. (--time 600: it stops at the
+## crash, after 16001 runs; a loaded machine needs more than 120 s for them.)
+$ fuzz parse_never_crashes --time 600
 FAIL parse_never_crashes (fuzz, after 16001 runs, shrunk in 2 steps): main.vl:9:28: index out of bounds: index 4, length 2
   input: data = "FUZZ"
   saved: .volec/fuzz/parse_never_crashes/crash-c6d0a3857a0d9820 (volec test replays it; test --accept keeps it in tests/fuzz/parse_never_crashes/)

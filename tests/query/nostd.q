@@ -28,8 +28,8 @@ $ text std:1-2
 2	// (compiler/std/embed.sh makes compiler/src/front/stdsrc.vl from this file,
 $ grep 'pub fn read_line' --in std
 # <std>
-9985:1	code	std::io	pub fn read_line<A: Allocator>(line: inout Buf<A>) -> std::Result<bool, IoError> {
-10392:5	code	std::io::buffered	pub fn read_line<A: Allocator>(inout self, s: inout String<A>) -> Result<i64> {
+10123:1	code	std::io	pub fn read_line<A: Allocator>(line: inout Buf<A>) -> std::Result<bool, IoError> {
+10530:5	code	std::io::buffered	pub fn read_line<A: Allocator>(inout self, s: inout String<A>) -> Result<i64> {
 $ def no_such_name
 error query.no-match: no definition 'no_such_name'
 try: volec query items

@@ -3,7 +3,7 @@
 ## that is no file of a program gets nothing; a save reads the program
 ## again (its diagnostics published).
 > {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"general":{"positionEncodings":["utf-8","utf-16"]}}}}
-< {"jsonrpc":"2.0","id":1,"result":{"capabilities":{"positionEncoding":"utf-8","textDocumentSync":{"openClose":true,"change":1,"save":{"includeText":true}},"definitionProvider":true,"referencesProvider":true,"hoverProvider":true,"documentSymbolProvider":true},"serverInfo":{"name":"volec","version":"@VERSION@"}}}
+< {"jsonrpc":"2.0","id":1,"result":{"capabilities":{"positionEncoding":"utf-8","textDocumentSync":{"openClose":true,"change":1,"save":{"includeText":true}},"definitionProvider":true,"referencesProvider":true,"hoverProvider":true,"documentSymbolProvider":true,"workspaceSymbolProvider":true},"serverInfo":{"name":"volec","version":"@VERSION@"}}}
 > @open main.vl
 > {"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://@DIR@/main.vl"},"position":{"line":10,"character":35}}}
 < {"jsonrpc":"2.0","id":2,"result":{"contents":{"kind":"markdown","value":"```vole\na: i64\n```\n"},"range":{"start":{"line":10,"character":35},"end":{"line":10,"character":36}}}}

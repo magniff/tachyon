@@ -152,7 +152,8 @@ after it (`own.moved`); pass it to a let parameter to lend it, or pass
 `v.clone()`. A plain value (numbers, structs of them) is copied. `&f(x)`
 makes a temporary that lives to the end of the block (0.18.1); any other
 owned temporary used without being moved (`f()?.read()`,
-`make().len()`) is dropped at the end of its statement (0.20). A slice
+`make().len()`, `total(make())`) is dropped at the end of its statement,
+or of its block when a `let` keeps a view of it (0.25). A slice
 of `v` is a view: take it again after `v` grows. std's most used items:
 `volec guide std`; all, a line each: `volec guide std#the-api`;
 one name with its comment: `volec guide --find split_in`.
@@ -183,7 +184,7 @@ testing`, `guide contracts`).
 
 SIMD and CPU intrinsics (0.19): `std::arch`, the vendors' names (`vaddq_u8`,
 `__crc32cd`) checked against the CPU: `volec guide arch`; `query arch WORDS`.
-GPU compute and rendering (0.22): `std::gpu`, wgpu's objects on Metal, `-l objc`: `volec guide gpu`.
+GPU compute and rendering (0.22): `std::gpu`, wgpu's objects on Metal: `volec guide gpu`.
 
 ## The loop
 

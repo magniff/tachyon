@@ -57,8 +57,89 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.22.0 | `v0.22.0` | 0.21.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | GPU: `std::gpu`, a wgpu-like API native-first with the Metal backend (device, queue, buffers, textures, samplers, bind groups, compute and render pipelines, command encoders, headless surfaces) over `std::objc`, the sizes of runtime-sized arrays bound per dispatch and draw; `std::gpu::wgsl`, a WGSL compiler to MSL with reflection, `Device::shader_wgsl`; std's section index fixed (a hello world 357 M to 96 M instructions) and a compile-cost gate row; std own-checked; `f(x?)` into a `let` parameter kept alive through the call; `fn(T)` is `fn(let T)` |
 | 0.23.0 | `v0.23.0` | 0.22.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | windows: `std::window`, winit-like with events pulled, on Cocoa (windows, keyboard and text input with IME basics, mouse, scroll, scale, cursor, clipboard, frames on request, watched fds), loaded only when a program names it; voltty (examples/voltty), a terminal emulator on std::window and std::gpu: a core checked against alacritty_terminal by an oracle and a fuzzer, Core Text glyphs in an atlas, one instanced draw of 16-byte cells per frame with `cells.wgsl` through std::gpu::wgsl, damage tracking, no allocation per frame, a shell on a pty; the rename tools for 0.24: `rewrite --text`, `refactor extension`, `query grep --ignore-case`, releases.toml's `bin` and `ext` |
 | 0.24.0 | `v0.24.0` | 0.23.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | **vole**: tachyon renamed (`tachyonc` to `volec`, `.tach` to `.vl`, `TACHYON_*` to `VOLE_*`, symbols `_vole.`; no aliases) by the compiler's own tools and checked by same-output; the releases up to 0.23 still built as tachyonc through releases.toml's `bin` and `ext`; the logo; the language server with a VS Code extension (editors/vscode: highlighting, diagnostics, definitions, references, symbols, hovers with computed effects); `std::cli`, clap's builder without derive; `let` as a borrow, `str` and `Path` views to the own pass, `gl(make())`, the `make().v` double free fixed, an iterator's copied items kept refused (`own.move_out`, a stopgap); timing tests steady under load |
+| 0.25.0 | `v0.25.0` | 0.24.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | compile speed (the resolve scans, a line index, the lexer, data as bytes, the assembler, `ld` run directly, an in-house Mach-O linker by default on aarch64-macos: the -O0 self-compile and `check` near half the instructions, a hello world linked 4 times faster) and a semantics audit (five red-team audits, about 1,600 probes kept as tests, a value-semantics fuzzer as the gate's `fuzz-sem`; about 30 families of soundness bugs of released versions fixed: views, exclusivity, drops, threads, the optimizer); the Vole Book (book/, every example checked); std::cli across the examples; `#[link]` and `-framework`; every name resolved in the language server; the chain rebuilt from the seed and checked against recorded hashes (`chain-fresh`, `chain-diverse`) |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.25
+
+The compile-speed release, and an audit that made the core semantics
+sound. The designs and records: docs/design/compile-speed-025.md, the
+five docs/design/semantics-audit-025-*.md, docs/design/value-semantics.md,
+"Trusting the chain" below; the book is book/.
+
+- **Compile speed** against v0.24.0 (each compiler on its own source,
+  best of 7 on an idle machine, the table in docs/roadmap.md's
+  Benchmarks): the -O0 self-compile linked 521 to 287 ms (11.37 to
+  6.11 G instructions), `check` 298 to 206 ms (5.58 to 3.22 G), a cold
+  `query refs` 707 to 334 ms, a hello world linked 31.7 to 7.3 ms, the
+  -O2 self-compile 1054 to 923 ms; peak memory is higher (the -O0
+  self-compile 431 to 476 MB, `check` 310 to 354 MB). How:
+  the resolve scans made linear, a line index, a faster lexer, data
+  emitted as bytes, a faster assembler, `ld` run directly, and an
+  in-house Mach-O linker as the default on aarch64-macos
+  (back/objfile/link_macho.vl; `cc` still links on Linux).
+- **The semantics audit**: five red-team audits of the core (exclusivity,
+  ownership, views, polymorphism, the core language), about 1,600 probe
+  programs kept as tests (`sem_excl`, `sem_own`, `sem_views`,
+  `sem_poly`, `sem_core`, each at -O0 and -O2 with `--check-alloc`), and
+  a value-semantics fuzzer whose oracle is its own model of the
+  language (tools/semfuzz; the gate's `fuzz-sem`). They found about 30
+  families of soundness bugs **in released versions**, all fixed: use
+  after free, double frees, leaks, aliasing and -O2 miscompiles:
+  - views: origins are conservative by default (a call's result views
+    everything its inputs view unless proven narrower), through `v[i]`,
+    summaries, collections, closures, statics and std's own summaries;
+    std's ownership exceptions audited, each with a written argument;
+  - exclusivity: an `inout` access needs a mutable root (`own.readonly`),
+    `&v[i]` beside `v`, statics against what callees write, closures in
+    the lifetime model, structs with `inout` fields move-only, FixedBuf
+    holding its memory `inout`;
+  - drops: `?` on borrowed payloads, partial patterns and `_` arms,
+    element stores, `Vec::set`, moves out of element parts, `x.drop()`
+    an error, temporaries dropped at the end of their statement, `for`
+    and the iterator adapters (Iterator's consumers take `sink self`);
+  - threads: the drop check, no views across channels, locks or
+    atomics, scoped whole-slice races, scope and handle escapes;
+  - the optimizer: LICM no longer hoists guarded loads or expensive
+    speculative calls, stale loop facts in value ranges, and SLP's
+    nondeterminism under -j (a possible miscompile since 0.18.1);
+  - and effects through `assert`, contract purity, unsafe int-to-pointer
+    casts, float-to-int saturation, a captured-coercion miscompile.
+- **New gate rows**: `fuzz-sem`, `fuzz-guard`, `compile-cost` (from
+  0.22), `chain-diverse` (HEAD built by three paths, byte-compared and
+  same-output on the corpus), `chain-fresh` (the seed and every release
+  rebuilt into an empty cache, against bootstrap/chain-hashes/) and
+  `compiler-memcheck`.
+- **The Vole Book** (book/): 18 chapters and 3 appendices, every
+  example compiled and run by tests/book (311 checks; a block whose
+  output only macOS gives is marked `macos`).
+- **std::cli** across the examples, with any allocator, choices and
+  custom errors; `volec`'s own command line moves to it partly (the rest
+  in 0.25.1).
+- **`#[link]` and `-framework`**: a block names its libraries and
+  frameworks, so `volec examples/voltty/app/main.vl -o voltty` builds
+  with no extra arguments.
+- **The language server** resolves every name: std, allocators,
+  keywords and operators; std's sources are cached.
+- **Diagnostics**: `println` takes `let`; 0.20's words throughout the
+  helps; a panic shows its position.
+- **The README** rewritten, with the round logo (and a dark variant).
+- **Found by the release gate** and fixed: `env::args()` did not build
+  on Linux unless the program also read files (since 0.20; std's one
+  index is made from sys/macos.vl, and Linux's `sys_args` named
+  std::sys's file functions), now `sys_args` calls libc there itself;
+  `chain-diverse` judged earlier runs' compilations as its own.
+- **Tested on aarch64 only**, as since 0.15 (`gate.sh --with-x86`).
+- **Breaking**: the audit's errors refuse programs that were unsound
+  (each with a `try:`); `x.drop()` is an error; Iterator's consumers take
+  `sink self`.
+- **Known issues**, for 0.25.1: a closure's by-value parameters leak
+  (F20); values017; the rest of fix25j's diagnostics; the rest of
+  `volec`'s command line on std::cli (branch cli-volec);
+  `split_at_mut`; iterator items as views (the full fix of 0.24's
+  stopgap); 26 OVERSTRICT cases measured (sound programs refused);
+  `--check-alloc` is not thread-safe in a -j8 compiler.
 
 ### What's new in 0.24
 
@@ -1817,8 +1898,10 @@ then the working tree, built and checked for its fixpoint); then, at
 once, `suite-O0`, `suite-O1`, `suite-O2`; `fuzz-plain`, `fuzz-loops`,
 `fuzz-generics`, `fuzz-pressure`, `fuzz-calls`, `fuzz-lang06`,
 `fuzz-vector`, `fuzz-div`, `fuzz-range`, `fuzz-arch` (0.19: the
-intrinsics, `tests/fuzz/run.sh -A`) and `fuzz-seed` (the seed as a
-third oracle); `abi-plain`, `abi-import`, `abi-header`; `objcheck`;
+intrinsics, `tests/fuzz/run.sh -A`), `fuzz-guard` (0.25: guarded
+accesses far out of bounds and calls of 2^62 steps under conditions
+that never hold, in loops, `-G`) and `fuzz-seed` (the seed as a third
+oracle); `abi-plain`, `abi-import`, `abi-header`; `objcheck`;
 `layout` (`tests/cimport/layout.sh` on the system headers); `debug`
 (`tests/debug.sh`); `stress-grow` (0.14, not in `--quick`: the compiler
 run with `VOLE_STRESS_GROW=1`, under which every growth of its tables,
@@ -1920,8 +2003,10 @@ default (`--history fast`), runs only the last release's test suite (the
 release that builds HEAD); a suite that passed before for the same tag
 and commit (in the cache) is not run again in either mode.
 `--history full` runs every release's suite: an occasional complete
-replay (with `--clean`, from nothing; `gate.sh --history full --fresh`
-does it on this host and in the x86_64-linux container).
+replay (with `--clean`, from nothing). `gate.sh --history full --fresh`
+runs every suite on this host, but from the cache: `--fresh` empties only
+the x86_64-linux container's volume. On this host a rebuild from nothing
+is the `chain-fresh` step (0.25, below).
 
 Between releases, `tests/fuzz/forever.sh` fuzzes in every mode, batch
 after batch on new seeds, at the lowest priority (nice 19), so the gate's
@@ -1949,6 +2034,91 @@ From 0.16 the gate gives each test program a minute (`VOLE_TEST_TIMEOUT`,
 60; tests/run.sh's own default stays 20 s): its steps run side by side
 with the Linux container, and the heavier examples at -O0 took longer
 than 20 s on a loaded machine (the examples-checkalloc step: 2 minutes).
+
+## Trusting the chain
+
+Every compiler since 0.1.0 was built by the one before it. So a bug, or
+worse, in a compiler that the chain trusted could live on in every later
+one without being in any source. These are the checks against that, and
+what remains trusted.
+
+**The root of trust.**
+- **rustc and cargo**, for the seed: the Rust compiler at the `seed` tag,
+  pinned by its rust-toolchain.toml, with its crates (Cranelift) pinned
+  by Cargo.lock (`--locked`).
+- **git**: the tags' trees, read by `git archive` from the repository's
+  objects.
+- **The OS toolchain:**
+  - `cc` and `ld` link every compiler of the chain. bootstrap.sh links
+    with `cc`, even from 0.25 on.
+  - Up to 0.6, `cc` also assembled the compiler's output; from 0.7 the
+    compiler writes its own objects.
+  - The system's libSystem, or glibc on Linux.
+- **The kernel and the CPU.**
+- **From 0.25, the compiler's own Mach-O linker,** `back/objfile/link_macho.vl`.
+  It links what `volec -o` builds on aarch64-macos: the test suite's
+  programs, examples and users' programs. It does not link the compilers
+  of the chain, which `cc` links. `chain-diverse` links with `cc` too, so
+  neither check depends on the new linker.
+
+Nothing else is trusted: no binary built before, no cache.
+
+**The checks**
+
+| check | what it shows | where |
+|---|---|---|
+| the fixpoint | each compiler, built by its builder and then by itself, emits the same bytes | every bootstrap step |
+| `chain-fresh` | the seed is built again by cargo, and every release again from its tag into an empty cache (`bootstrap.sh --clean --cache DIR --until LAST`). What each release emits for itself is compared by SHA-256 with `bootstrap/chain-hashes/<host>.txt` and with the shared cache | `gate.sh --only chain-fresh`, part of `--release` |
+| `chain-diverse` | HEAD's compiler by three paths: the normal chain (-O2); a path with no optimizer before the last step (the previous release at -O0, then HEAD at -O0, which builds HEAD at -O2); and the chain at -j1. The paths must end in the same bytes, and the -O2-built and -O0-built compilers must give the same output on the whole corpus (`same-output`) | `gate.sh --only chain-diverse`, part of `--release` |
+| `valgrind` | the compiler's own -O2 self-compile (at -j4) and the opt_, own_ and contract_ cases plus examples, under memcheck: no invalid read or write, no use of an uninitialised value | aarch64-linux container, `--release` |
+| `compiler-memcheck` | the same set on macOS, two ways. With the compiler built `--check-alloc`, a use after free or double free of Gpa memory stops it. Under Guard Malloc, the same for the memory it takes from malloc itself. The objects must be the plain compiler's | every gate but `--quick` |
+| `stress-grow` | with every table growth moving and poisoning the old block, the self-compile is the same and the suite passes | every gate but `--quick` |
+| `fuzz-seed` | random programs give the same output from the seed, the oracle written in Rust, as from HEAD | every gate |
+
+**chain-fresh's record.** A release adds its line when it is tagged, with
+`bootstrap/chain-fresh.sh --record`. The first record (0.25) was written
+from the long-lived shared cache. The first fresh run then confirms that
+the cache holds what the tags rebuild to. A mismatch is not to be
+re-recorded: find which release differs, and why.
+
+**chain-diverse's argument** (after Wheeler's diverse double-compiling):
+- A3 is what the normally built compiler A2 emits for HEAD at -O2.
+- B3 is what B2 emits for the same input. B2 is a HEAD compiler that no
+  optimizer touched.
+- If an optimizer bug had miscompiled the compiler in a way that changes
+  what it does, A3 and B3 would differ.
+
+For both to be wrong the same way, the -O0 back ends of the previous
+release and of HEAD would both have to miscompile HEAD into the same
+wrong behaviour as the optimizer did. The corpus comparison widens this
+check from the compiler's own source to every program in the corpus.
+
+**The stricter checker as an audit of the compiler** (from 0.25, as
+the semantics fixes merge). When a fix makes the checker reject code it
+used to accept, it checks compiler/src and compiler/std too.
+
+Every site it rejects in the compiler is a place where the compiler may
+have had latent undefined behaviour: a view outliving its buffer, an
+exclusivity violation, a missing drop. Its own builds would not have
+shown it. For each site:
+1. **Record it** in the fix's commit message or in a list in its PR:
+   the error's code, the file and line, and the item.
+2. **Review it before changing it.** Read the code through
+   `volec query context`, and decide whether the rejected pattern was
+   only unprovable or could actually misbehave: which input, which
+   path, what happens.
+3. **For a real case:**
+   - write a test that showed it, if one can (a compilation whose output
+     was wrong, or a memcheck failure);
+   - check whether a release shipped it; for one that did, `chain-diverse`
+     and `same-output` against that release tell whether any output
+     changed.
+4. **Only then patch it.** Do not satisfy the checker by mechanical
+   rewrites (an `unsafe` block, a copy, a reordered borrow) without
+   steps 2 and 3. `fix --suggested` must not be applied blindly to
+   compiler/src for these codes.
+5. **Summarize** in the release notes: how many sites, and how many were
+   real.
 
 ## Adding a host
 

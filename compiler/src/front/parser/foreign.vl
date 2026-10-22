@@ -2,14 +2,15 @@
 // with their link names), functions with the C convention, and statics
 // with a C symbol.
 
-use crate::base::{intern, intern_c};
+use crate::back::objfile::output::add_link_decl;
+use crate::base::{IntVec, intern, intern_c, sym_name};
 use crate::base::diag::error_at;
-use crate::front::ast::{NODES, NodeKind, list_push, new_node};
+use crate::front::ast::{NODES, NodeKind, SCRATCH, list_push, new_node};
 use crate::front::check::name_error;
 use crate::front::lexer::{TOKS, str_at};
 use crate::front::lexer::Tok::{
-    Arrow, Colon, Eof, Eq, Extern, Fn, Hash, LBrace, LBracket, LParen, RBrace, RBracket, RParen,
-    Semi, Static, Str,
+    Arrow, Colon, Comma, Eof, Eq, Extern, Fn, Hash, Ident, LBrace, LBracket, LParen, Pub, RBrace,
+    RBracket, RParen, Semi, Static, Str,
 };
 use crate::front::parser::{
     P, advance, at, cur_start, eat, expect, expect_binding_name, expect_ident, prev_end,
@@ -23,6 +24,102 @@ use crate::front::parser::items::attrs::{
 use crate::front::parser::items::params::parse_params;
 use crate::front::parser::types::parse_type;
 use crate::gen0::target::LINK_NAMES;
+
+// (0.25) At `#[link(...)]`.
+pub fn at_link_attribute() -> bool {
+    unsafe {
+        tok_kind(0) == Hash && tok_kind(1) == LBracket && tok_kind(2) == Ident
+            && TOKS[P + 2].value as i64 == intern_c(c"link") && tok_kind(3) == LParen
+    }
+}
+
+// (0.25) The links of the `#[link]`s read, for the block that follows:
+// a kind ('F' a framework, 'l' a library) and the name's string id, two
+// words each.
+static var LINK_PENDING: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// (0.25) `#[link(...)]`s before an extern block: what the program links
+// when it calls into the block (back::objfile::output::add_link_decl), so
+// a std module the program does not use links nothing. `framework =
+// "Metal"` (macOS's; Linux leaves it out) or `lib = "objc"` (`-lobjc`);
+// Rust's `name = "objc"`, with `kind = "framework"` for a framework, too.
+// Several in one attribute, separated by commas, and several attributes.
+// The block follows; link_block takes them when it is read.
+pub fn parse_link_attributes() {
+    unsafe {
+        let start = cur_start();
+        while at_link_attribute() {
+            advance();
+            advance();
+            advance();
+            advance();
+            var name = 0 - 1;
+            var framework = false;
+            while !at(RParen) && !at(Eof) {
+                let pos = cur_start();
+                let key = expect_ident();
+                expect(Eq);
+                if !at(Str) {
+                    syntax_error(c"expected a string: `#[link(framework = \"Metal\")]` or `#[link(lib = \"objc\")]`");
+                }
+                let value = TOKS[P].value as i64;
+                advance();
+                if key == intern_c(c"framework") || key == intern_c(c"lib") {
+                    LINK_PENDING.push(if key == intern_c(c"framework") { 'F' } else { 'l' } as i64);
+                    LINK_PENDING.push(value);
+                } else if key == intern_c(c"name") {
+                    name = value;
+                } else if key == intern_c(c"kind") {
+                    let kind = str_at(value);
+                    if kind == "framework" {
+                        framework = true;
+                    } else if kind != "dylib" && kind != "static" {
+                        error_at(pos, c"a link's kind is \"framework\", \"dylib\" or \"static\"");
+                    }
+                } else {
+                    name_error(pos, c"unknown key '", key,
+                        c"' in #[link] (expected framework, lib, name or kind)");
+                }
+                if !eat(Comma) {
+                    break;
+                }
+            }
+            expect(RParen);
+            expect(RBracket);
+            if name >= 0 {
+                LINK_PENDING.push(if framework { 'F' } else { 'l' } as i64);
+                LINK_PENDING.push(name);
+            }
+        }
+        if !at(Extern) && !(at(Pub) && tok_kind(1) == Extern) {
+            error_at(start, c"#[link] goes before an extern block: `#[link(lib = \"objc\")] extern \"C\" { ... }`");
+        }
+    }
+}
+
+// (0.25) The block of the `#[link]`s just read was read: its items are
+// SCRATCH from `mark`. Each link is the program's when the program calls
+// one of its functions or uses one of its statics (by their C symbols);
+// a block of none links always.
+pub fn link_block(mark: i64) {
+    unsafe {
+        var syms = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for i in mark..SCRATCH.count {
+            let item = SCRATCH.data[i];
+            if NODES[item].kind == NodeKind::ExternFn
+                || (NODES[item].kind == NodeKind::Static && NODES[item].y == 1) {
+                let link = LINK_NAMES.get(NODES[item].a + 1);
+                syms.push(sym_name(if link > 0 { link - 1 } else { NODES[item].a }) as i64);
+            }
+        }
+        var k = 0;
+        while k < LINK_PENDING.count {
+            add_link_decl(LINK_PENDING.data[k] as u8, str_at(LINK_PENDING.data[k + 1]), &syms);
+            k += 2;
+        }
+        LINK_PENDING.count = 0;
+    }
+}
 
 // After `extern "C"`: a block of C declarations, `extern "C" { fn f(...)
 // -> T; static mut x: T; }`; a function with the C convention and an

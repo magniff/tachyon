@@ -108,11 +108,15 @@ compile_one() { # <n> <program>
     VOLE_OK=0 "$COMPILER" --diagnostics=human -O2 -S "$COPY/$2" -o "$d/b.s" >"$d/b.out" 2>&1
     echo $? >"$d/b.rc"
     # (0.17: try: lines start with the compiler as it was run, and name
-    # positions as FILE:LINE and `the arm at line N`)
+    # positions as FILE:LINE and `the arm at line N`; 0.25: a closure's type
+    # in a note names its file, cut to a length that depends on the path; a
+    # compile that failed may leave part of an assembly file, not compared)
     sed -e "s|$COMPILER|volec|g" -e "s|$ROOT/||g" -e 's|line [0-9]*, column [0-9]*|POS|g' \
-        -e 's|\.vl:[0-9][0-9]*|.vl:N|g' -e 's|at line [0-9]*|at line N|g' "$d/a.out" >"$d/a.msg"
+        -e 's|\.vl:[0-9][0-9]*|.vl:N|g' -e 's|at line [0-9]*|at line N|g' \
+        -e "s|closure([^']*'|closure'|g" "$d/a.out" >"$d/a.msg"
     sed -e "s|$COMPILER|volec|g" -e "s|$COPY/||g" -e 's|line [0-9]*, column [0-9]*|POS|g' \
-        -e 's|\.vl:[0-9][0-9]*|.vl:N|g' -e 's|at line [0-9]*|at line N|g' "$d/b.out" >"$d/b.msg"
+        -e 's|\.vl:[0-9][0-9]*|.vl:N|g' -e 's|at line [0-9]*|at line N|g' \
+        -e "s|closure([^']*'|closure'|g" "$d/b.out" >"$d/b.msg"
     # (0.18: the run-time checks' messages and sites hold positions and the
     # conditions' text: from rt.messages to the next label that is not the
     # helper's, left out)
@@ -121,7 +125,7 @@ compile_one() { # <n> <program>
             skip && /^[^ \t].*:$/ && !/rt\./ { skip = 0 } !skip' "$d/$s.s" >"$d/$s.t" && mv "$d/$s.t" "$d/$s.s"
     done
     if cmp -s "$d/a.rc" "$d/b.rc" && cmp -s "$d/a.msg" "$d/b.msg" \
-        && { [ ! -f "$d/a.s" ] || cmp -s "$d/a.s" "$d/b.s"; }; then
+        && { [ ! -f "$d/a.s" ] || [ "$(cat "$d/a.rc")" != 0 ] || cmp -s "$d/a.s" "$d/b.s"; }; then
         echo same >"$d/result"
     else
         echo "$2" >"$d/result"

@@ -5,13 +5,22 @@
 // queries answer from: definition and references (the references every
 // query collects, query/refs; locals, refactor_mod/local), hover (the
 // signature `query def` prints, the effects and features, `query type`'s
-// typed nodes), the document's symbols (`query items`' definitions). The
-// server replaces it when a document changes.
+// typed nodes), the document's symbols (`query items`' definitions), the
+// workspace's symbols. The server replaces it when a document changes.
+//
+// (0.25) Every name resolves: std's items to std's text written as files
+// (stdfiles.vl), an operator to the function it calls (`+`: Add::add), a
+// type parameter to where it is declared; a hover on a keyword, an
+// attribute or a primitive type explains it (words.vl), one on an item
+// adds the comment above it. The references the checker records for what
+// it made (a local's drop, an f-string's display, a contract's check) are
+// not the program's: a name is what it is written as.
 //
 // Requests come one per line, `METHOD \t PATH \t LINE \t CHARACTER \t FLAG
-// \t ID`; each answer goes back as a frame `KIND LENGTH\n` then the JSON
-// message: `r` a response, `n` a notification (publishDiagnostics), `e`
-// (empty) the end of the diagnostics.
+// \t ID` (workspaceSymbol: the query in PATH); each answer goes back as a
+// frame `KIND LENGTH\n` then the JSON message: `r` a response, `n` a
+// notification (publishDiagnostics), `e` (empty) the end of the
+// diagnostics.
 
 use crate::base::{
     FILES, FILE_COUNT, IntVec, SRC, STDERR, SYMS, alloc_array, alloc_zeroed, buf_byte, buf_bytes,
@@ -19,31 +28,38 @@ use crate::base::{
 };
 use crate::base::diag::{DIAG_SHORT, diag_records, short_diagnostic};
 use crate::base::json::buf_json_str;
-use crate::front::ast::{NODES, NODE_COUNT, NodeKind, child};
+use crate::front::ast::{NODES, NODE_CAPTURE, NODE_COUNT, NodeKind, child};
+use crate::front::check::{LOCALS, LOCAL_COUNT, Res};
 use crate::front::effects::{
     ALLOCATORS, EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_UNKNOWN,
     EFF_UNSAFE, EFF_VISIBLE, effects_text, fn_effects,
 };
 use crate::front::effects::check::buf_decl;
 use crate::front::effects::why::{effect_name, step_text};
-use crate::front::lexer::{TOKS, TOK_COUNT};
+use crate::front::lexer::{TOKS, TOK_COUNT, Tok};
 use crate::front::modules::file_of_pos;
 use crate::front::types::{FNS, FN_COUNT, buf_type};
+use crate::middle::lower::ssa::HMap;
 use crate::tools::lsp::{TIMING, now_us, write_all};
-use crate::tools::query::{QF_DEF, parse_digits};
+use crate::tools::lsp::stdfiles::{
+    STD_F, put_segment_path, segment_by_path, segment_from, segment_name, segment_of, segment_to,
+    std_files_ready,
+};
+use crate::tools::lsp::words::{attribute_text, bound_text, keyword_text, primitive_text};
+use crate::tools::query::{QF_CALL, QF_DEF, QF_USE, parse_digits};
 use crate::tools::query::command_line::load_program;
 use crate::tools::query::defs::{
-    DEFS, DEF_COUNT, K_ALIAS, K_CONST, K_ENUM, K_FIELD, K_FN, K_IMPL_METHOD, K_METHOD, K_STATIC,
-    K_STRUCT, K_TRAIT, K_TRAIT_FN, K_VARIANT, kind_name, last_segment,
+    DEFS, DEF_COUNT, K_ALIAS, K_CONST, K_ENUM, K_FIELD, K_FN, K_IMPL_METHOD, K_METHOD, K_MOD,
+    K_STATIC, K_STRUCT, K_TRAIT, K_TRAIT_FN, K_VARIANT, def_of_node, kind_name, last_segment,
 };
 use crate::tools::query::diagnostics::{PROG, ROOT_GIVEN};
 use crate::tools::query::effects::{def_effect_lines, def_effects_text};
 use crate::tools::query::features::put_def_features;
-use crate::tools::query::positions::{sort_by_position, token_at};
+use crate::tools::query::positions::{line_start, sort_by_position, token_at};
 use crate::tools::query::refs::collect_all_refs;
-use crate::tools::query::show::put_signature;
+use crate::tools::query::show::{put_signature, text_start};
 use crate::tools::query::typeat::{TypedIndex, typed_index, typed_nodes_at, typed_nodes_in};
-use crate::tools::refactor_mod::local::{load_decls, local_at, use_decl};
+use crate::tools::refactor_mod::local::decl_name_pos;
 
 // The worker's state: how positions are counted, the line starts of every
 // file, every reference.
@@ -58,9 +74,28 @@ static var REFS_READY: bool = false;
 // query type's index (made at the first hover)
 static var TYPED: *TypedIndex = 0 as *TypedIndex;
 
+// (0.25) Where each local is named: position + 1 -> its declaration + 1.
+static var LOCAL_AT: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var LOCALS_READY: bool = false;
+
+// Each local's declaration: local + 1 -> the position of its name + 1
+// (refactor_mod/local's DECL_POS without a C function's or a bodiless
+// trait function's parameters, which declare no local of their own).
+static var LOCAL_DECL: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+// (0.25) The request's std file (a segment of std's text), -1: none.
+static var ASK_SEG: i64 = -1;
+// The operators that call a function (`a + b` of a type with Add): the
+// operator's position, its definition, the call's start.
+static var OP_AT: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var OP_DEF: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+static var OP_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
 // What a hover shows of the effects' reasons, at most.
 const WHY_MAX: i64 = 6;
 const WHY_LINE_MAX: i64 = 140;
+
+// The types a hover on a local or an expression shows, at most.
+const TYPES_MAX: i64 = 6;
 
 extern "C" {
     fn read(fd: i32, buf: *u8, n: u64) -> i64;
@@ -86,9 +121,12 @@ pub fn serve(root: *u8, input: i32, output: i32, utf8: bool) -> ! {
         lap("diagnostics", t1);
         // (what the requests look up, made before the first comes)
         if LOADED {
+            let t3 = now_us();
+            std_files_ready();
+            lap("std files", t3);
             let t2 = now_us();
             ensure_refs();
-            load_decls();
+            local_named_at(0);
             TYPED = alloc_array::<TypedIndex>(1);
             TYPED[0] = typed_index();
             lap("index", t2);
@@ -171,7 +209,15 @@ fn answer_line(line: [u8]) {
         } else if method == "hover" {
             if pos >= 0 { put_hover(out, pos); } else { buf_str(out, c"null"); }
         } else if method == "documentSymbol" {
-            if f >= 0 { put_symbols(out, f); } else { buf_str(out, c"[]"); }
+            if f >= 0 && f == STD_F && ASK_SEG >= 0 {
+                put_symbols(out, segment_from(ASK_SEG), segment_to(ASK_SEG));
+            } else if f >= 0 {
+                put_symbols(out, FILES[f].start, FILES[f].end);
+            } else {
+                buf_str(out, c"[]");
+            }
+        } else if method == "workspaceSymbol" {
+            if LOADED { put_workspace_symbols(out, path); } else { buf_str(out, c"[]"); }
         } else {
             buf_str(out, c"null");
         }
@@ -214,15 +260,47 @@ fn index_lines() {
     }
 }
 
-// The file of the program at path (as the front end read it), or -1.
+// The file of the program at path (as the front end read it), or -1; a
+// file of std's (stdfiles.vl): std's text, ASK_SEG its segment.
 fn file_by_path(path: [u8]) -> i64 {
     unsafe {
+        ASK_SEG = -1;
         for f in 0..FILE_COUNT {
             if cstr(FILES[f].path) == path {
                 return f;
             }
         }
+        let k = segment_by_path(path);
+        if k >= 0 {
+            ASK_SEG = k;
+            return STD_F;
+        }
         -1
+    }
+}
+
+// The index in LS of the line holding pos.
+fn line_index(pos: i64) -> i64 {
+    unsafe {
+        let f = file_of_pos(pos);
+        var lo = FIRST_LINE.data[f];
+        var hi = FIRST_LINE.data[f + 1];
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if LS.data[mid] <= pos { lo = mid; } else { hi = mid; }
+        }
+        lo
+    }
+}
+
+// The segment of std's text position pos is shown in, or -1 (a position
+// in a file of its own).
+fn seg_at(pos: i64) -> i64 {
+    unsafe {
+        if STD_F < 0 || pos < FILES[STD_F].start || pos >= FILES[STD_F].end {
+            return -1;
+        }
+        segment_of(pos)
     }
 }
 
@@ -236,12 +314,21 @@ fn seq_len(c: u8) -> i64 {
 // is past it.
 fn pos_at(f: i64, line: i64, ch: i64) -> i64 {
     unsafe {
-        let first = FIRST_LINE.data[f];
-        if line < 0 || first + line >= FIRST_LINE.data[f + 1] {
+        var first = FIRST_LINE.data[f];
+        var last = FIRST_LINE.data[f + 1];
+        var end = FILES[f].end;
+        if f == STD_F && ASK_SEG >= 0 {
+            // (a file of std's: its segment's lines)
+            first = line_index(segment_from(ASK_SEG));
+            end = segment_to(ASK_SEG);
+            if end < FILES[f].end {
+                last = line_index(end);
+            }
+        }
+        if line < 0 || first + line >= last {
             return -1;
         }
         var p = LS.data[first + line];
-        let end = FILES[f].end;
         var units = 0;
         while p < end && SRC[p] != '\n' && units < ch {
             let n = seq_len(SRC[p]);
@@ -252,16 +339,11 @@ fn pos_at(f: i64, line: i64, ch: i64) -> i64 {
     }
 }
 
-// `{"line":L,"character":C}` of position pos.
-fn put_position(out: i64, pos: i64) {
+// `{"line":L,"character":C}` of position pos, its line counted from the
+// line `first` (an index in LS).
+fn put_position(out: i64, pos: i64, first: i64) {
     unsafe {
-        let f = file_of_pos(pos);
-        var lo = FIRST_LINE.data[f];
-        var hi = FIRST_LINE.data[f + 1];
-        while hi - lo > 1 {
-            let mid = (lo + hi) / 2;
-            if LS.data[mid] <= pos { lo = mid; } else { hi = mid; }
-        }
+        let lo = line_index(pos);
         let ls = LS.data[lo];
         var units = 0;
         var p = ls;
@@ -270,16 +352,34 @@ fn put_position(out: i64, pos: i64) {
             units += if UTF8 { n } else if n == 4 { 2 } else { 1 };
             p += n;
         }
-        buf_fmt(out, f"{{\"line\":{lo - FIRST_LINE.data[f]},\"character\":{units}}}");
+        buf_fmt(out, f"{{\"line\":{lo - first},\"character\":{units}}}");
     }
 }
 
+// The range from..to; in std's text, in from's segment (its file).
 fn put_range(out: i64, from: i64, to: i64) {
-    buf_str(out, c"{\"start\":");
-    put_position(out, from);
-    buf_str(out, c",\"end\":");
-    put_position(out, to);
-    buf_byte(out, '}');
+    unsafe {
+        var a = from;
+        var b = to;
+        var first = 0;
+        let k = seg_at(from);
+        if k >= 0 {
+            let s = segment_from(k);
+            let e = segment_to(k) - 1;
+            if a < s { a = s; }
+            if a > e { a = e; }
+            if b > e { b = e; }
+            if b < a { b = a; }
+            first = line_index(s);
+        } else {
+            first = FIRST_LINE.data[file_of_pos(from)];
+        }
+        buf_str(out, c"{\"start\":");
+        put_position(out, a, first);
+        buf_str(out, c",\"end\":");
+        put_position(out, b, first);
+        buf_byte(out, '}');
+    }
 }
 
 // The file:// URI of file f.
@@ -300,6 +400,20 @@ pub fn put_uri(out: i64, path: [u8]) {
     }
 }
 
+// The file:// URI of position pos's file (in std's text: its segment's).
+fn put_pos_uri(out: i64, pos: i64) {
+    unsafe {
+        let k = seg_at(pos);
+        if k >= 0 {
+            let p = buf_new();
+            put_segment_path(p, k);
+            put_uri(out, buf_slice(p));
+        } else {
+            put_uri(out, cstr(FILES[file_of_pos(pos)].path));
+        }
+    }
+}
+
 // Whether position pos is in a file of its own (not std's text).
 fn in_file(pos: i64) -> bool {
     unsafe {
@@ -309,6 +423,18 @@ fn in_file(pos: i64) -> bool {
         let f = file_of_pos(pos);
         f >= 0 && FILES[f].path[0] != '<'
     }
+}
+
+// Whether position pos has a location: in a file, or in std's text (one
+// of its files).
+fn located(pos: i64) -> bool {
+    pos >= 0 && (in_file(pos) || seg_at(pos) >= 0)
+}
+
+// Whether a reference at pos is shown: in the program's files, and in
+// std's when the request is about a file of std's.
+fn shown(pos: i64) -> bool {
+    in_file(pos) || ASK_SEG >= 0 && seg_at(pos) >= 0
 }
 
 // The end of the token at pos (pos + 1 when none starts there).
@@ -327,7 +453,7 @@ fn token_end(pos: i64) -> i64 {
 fn put_location(out: i64, pos: i64) {
     unsafe {
         buf_str(out, c"{\"uri\":\"");
-        put_uri(out, cstr(FILES[file_of_pos(pos)].path));
+        put_pos_uri(out, pos);
         buf_str(out, c"\",\"range\":");
         put_range(out, pos, token_end(pos));
         buf_byte(out, '}');
@@ -356,37 +482,711 @@ fn ensure_refs() {
             let t0 = now_us();
             collect_all_refs(&ALL_REFS);
             lap("references collected", t0);
+            // (0.25: the program's names, std's and operators' calls)
+            let t1 = now_us();
+            find_operators();
+            clean_refs();
+            add_unwritten();
+            lap("references resolved", t1);
             REFS_READY = true;
         }
     }
 }
 
+// The token starting at pos, or -1.
+fn token_starting(pos: i64) -> i64 {
+    unsafe {
+        let t = token_at(pos);
+        if t < TOK_COUNT && TOKS[t].start == pos { t } else { -1 }
+    }
+}
+
+// The text of token t.
+fn tok_text(t: i64) -> [u8] {
+    unsafe { SRC[TOKS[t].start..TOKS[t].end] }
+}
+
+// Whether token kind k is a keyword (`fn`, `let`, `var`, `inout`...; not
+// `true` and `false`, values).
+fn is_keyword(k: i64) -> bool {
+    k >= 10 && k <= 39 && k != 22 && k != 23 || k == 90 || k == 91 || k >= 95 && k <= 97
+}
+
+// The operators that call a function (OP_*): `a + b`, `a == b`, `a < b`,
+// `-a` of a type with std's Add, Sub, Mul, Div, Eq, Ord or Neg, which the
+// checker made `{ let =+l = a; let =+r = b; =+l.add(=+r) }`
+// (traits.vl: operator_call, negation_call), its call at the operator's
+// start: the operator is the token between the operands.
+fn find_operators() {
+    unsafe {
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind != NodeKind::Block || NODES[n].count < 1 || NODES[n].count > 2 {
+                continue;
+            }
+            let first = child(n, 0);
+            if NODES[first].kind != NodeKind::Let
+                || NODES[NODES[first].a].kind != NodeKind::PatBind {
+                continue;
+            }
+            let name = SYMS[NODES[NODES[first].a].a].text;
+            if name.len != 3 || name[0] != '=' || name[2] != 'l' {
+                continue;
+            }
+            // (`!=` negates the call, `<` compares its result)
+            var c = NODES[n].a;
+            if c != 0 && (NODES[c].kind == NodeKind::Unary || NODES[c].kind == NodeKind::Binary) {
+                c = NODES[c].b;
+            }
+            if c == 0 || NODES[c].kind != NodeKind::Call || NODES[c].x <= 0 {
+                continue;
+            }
+            let fnode = FNS[NODES[c].x - 1].node;
+            var d = def_of_node(fnode);
+            if d < 0 {
+                // (a #[derive]'s `eq`, `cmp`: std's trait function)
+                d = trait_fn_named(NODES[fnode].a);
+            }
+            if d < 0 {
+                continue;
+            }
+            var at = -1;
+            if NODES[n].count == 2 {
+                let lhs = NODES[first].c;
+                let rhs = NODES[child(n, 1)].c;
+                var t = token_at(NODES[lhs].end);
+                while t < TOK_COUNT && TOKS[t].kind == Tok::RParen {
+                    t += 1;
+                }
+                if t < TOK_COUNT && TOKS[t].start < NODES[rhs].start {
+                    at = TOKS[t].start;
+                }
+            } else {
+                let t = token_starting(NODES[n].start);
+                if t >= 0 && TOKS[t].kind == Tok::Minus {
+                    at = NODES[n].start;
+                }
+            }
+            if at >= 0 {
+                OP_AT.push(at);
+                OP_DEF.push(d);
+                OP_START.push(NODES[c].start);
+            }
+        }
+    }
+}
+
+// The definition the operator at pos calls, or -1.
+fn operator_def(pos: i64) -> i64 {
+    unsafe {
+        for i in 0..OP_AT.count {
+            if OP_AT.data[i] == pos {
+                return OP_DEF.data[i];
+            }
+        }
+        -1
+    }
+}
+
+// std's trait function named sym (`clone` of Clone, `eq` of Eq): what a
+// call of a function #[derive] wrote names (that function has no item);
+// -1.
+fn trait_fn_named(sym: i64) -> i64 {
+    unsafe {
+        var any = -1;
+        for d in 0..DEF_COUNT {
+            if DEFS[d].kind == K_TRAIT_FN && DEFS[d].name == sym {
+                let fqn = SYMS[DEFS[d].fqn].text;
+                if fqn.len > 5 && fqn[0..5] == "std::" {
+                    return d;
+                }
+                if any < 0 {
+                    any = d;
+                }
+            }
+        }
+        any
+    }
+}
+
+// The names written with no reference at them (ALL_REFS, added to): a
+// method call of what a #[derive] wrote (`p.clone()`: std's
+// Clone::clone), `x.into()` (the checker's `U::from(x)`: that `from`);
+// a path's head that the checker resolved through its member only
+// (`Token` of `use Token::{Num, Plus};`: the program's type, trait or
+// module of that name, else std's). (The candidates' positions in a map,
+// then one pass over the references.)
+fn add_unwritten() {
+    unsafe {
+        // (position, token, call node or 0 for a path's head)
+        var cand = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind != NodeKind::Call || NODES[n].x <= 0 || NODES[n].count == 0 {
+                continue;
+            }
+            let recv = child(n, 0);
+            if NODES[recv].end <= NODES[recv].start {
+                continue;
+            }
+            var t = token_at(NODES[recv].end);
+            while t < TOK_COUNT && TOKS[t].kind == Tok::RParen {
+                t += 1;
+            }
+            if t + 1 < TOK_COUNT && TOKS[t].kind == Tok::Dot && TOKS[t + 1].kind == Tok::Ident
+                && TOKS[t + 1].start < NODES[n].end {
+                cand.push(TOKS[t + 1].start);
+                cand.push(t + 1);
+                cand.push(n);
+            }
+        }
+        for t in 0..TOK_COUNT - 1 {
+            if TOKS[t].kind == Tok::Ident && TOKS[t + 1].kind == Tok::ColonColon
+                && in_file(TOKS[t].start) {
+                cand.push(TOKS[t].start);
+                cand.push(t);
+                cand.push(0);
+            }
+        }
+        var at = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        var c = 0;
+        while c < cand.count {
+            at.put(cand.data[c] + 1, 1);
+            c += 3;
+        }
+        var i = 0;
+        while i < ALL_REFS.count {
+            if at.get(ALL_REFS.data[i] + 1) == 1 {
+                at.put(ALL_REFS.data[i] + 1, 2);
+            }
+            i += 3;
+        }
+        var named = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        var named_ready = false;
+        c = 0;
+        while c < cand.count {
+            let p = cand.data[c];
+            let t = cand.data[c + 1];
+            let n = cand.data[c + 2];
+            c += 3;
+            if at.get(p + 1) != 1 {
+                continue;
+            }
+            var d = -1;
+            if n != 0 {
+                let fnode = FNS[NODES[n].x - 1].node;
+                d = def_of_node(fnode);
+                if d < 0 {
+                    d = trait_fn_named(TOKS[t].value as i64);
+                }
+            } else if local_named_at(p) < 0 {
+                if !named_ready {
+                    for e in 0..DEF_COUNT {
+                        let k = DEFS[e].kind;
+                        if k != K_STRUCT && k != K_ENUM && k != K_TRAIT && k != K_ALIAS
+                            && k != K_MOD {
+                            continue;
+                        }
+                        let have = named.get(DEFS[e].name + 1) - 1;
+                        if have < 0 || !in_file(DEFS[have].name_pos) && in_file(DEFS[e].name_pos) {
+                            named.put(DEFS[e].name + 1, e + 1);
+                        }
+                    }
+                    named_ready = true;
+                }
+                d = named.get(TOKS[t].value as i64 + 1) - 1;
+            }
+            if d >= 0 {
+                ALL_REFS.push(p);
+                ALL_REFS.push(d);
+                ALL_REFS.push(if n != 0 { QF_CALL } else { QF_USE });
+                at.put(p + 1, 2);
+            }
+        }
+    }
+}
+
+// The references that are the program's (ALL_REFS, in place): a name is
+// the definition it is written as. Dropped: what the checker made at a
+// name that is something else (a local's drop at its `let`, an
+// f-string's display or a contract's check at a local, a derive's
+// function at a field or at a variant's types); an operator's call
+// moved to the operator. (A map of the few positions with such a
+// reference, not of every reference: the compiler's source has a
+// million.)
+fn clean_refs() {
+    unsafe {
+        let n = ALL_REFS.count / 3;
+        // each reference's token when it is not written as its name, else -1
+        var odd = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var suspect = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for r in 0..n {
+            let p = ALL_REFS.data[3 * r];
+            let d = ALL_REFS.data[3 * r + 1];
+            let t = token_starting(p);
+            if t >= 0 && (ALL_REFS.data[3 * r + 2] & QF_DEF) == 0
+                && !(TOKS[t].kind == Tok::Ident && TOKS[t].value as i64 == DEFS[d].name) {
+                odd.push(t);
+                suspect.put(p + 1, 1);
+            } else {
+                odd.push(-1);
+            }
+        }
+        // (2: a name written as what it names, or a definition, is there)
+        for r in 0..n {
+            let p = ALL_REFS.data[3 * r];
+            if odd.data[r] < 0 && suspect.get(p + 1) != 0 {
+                suspect.put(p + 1, 2);
+            }
+        }
+        var ops_at = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        var used = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        for k in 0..OP_START.count {
+            ops_at.put(OP_START.data[k] + 1, 1);
+            used.push(0);
+        }
+        var w = 0;
+        for r in 0..n {
+            let p = ALL_REFS.data[3 * r];
+            let d = ALL_REFS.data[3 * r + 1];
+            let flags = ALL_REFS.data[3 * r + 2];
+            let t = odd.data[r];
+            var keep = true;
+            var at = p;
+            if t >= 0 {
+                let text = tok_text(t);
+                keep = false;
+                if ops_at.get(p + 1) != 0 {
+                    for k in 0..OP_START.count {
+                        if !keep && used.data[k] == 0 && OP_START.data[k] == p
+                            && OP_DEF.data[k] == d {
+                            used.data[k] = 1;
+                            at = OP_AT.data[k];
+                            keep = true;
+                        }
+                    }
+                }
+                if !keep && TOKS[t].kind == Tok::Ident {
+                    // (`self`, `Self`; an import's other name: `use a::{b as c}`)
+                    keep = text == "self" || text == "Self"
+                        || suspect.get(p + 1) != 2 && local_named_at(p) < 0 && !is_primitive(t)
+                        && text != "result" && text != "requires" && text != "ensures";
+                }
+            }
+            if keep {
+                ALL_REFS.data[w] = at;
+                ALL_REFS.data[w + 1] = d;
+                ALL_REFS.data[w + 2] = flags;
+                w += 3;
+            }
+        }
+        ALL_REFS.count = w;
+    }
+}
+
 // The definition named at position start (a reference, or a definition's
-// name), or -1.
+// name; one written as its name first; an operator's function), or -1.
 fn def_named_at(start: i64) -> i64 {
     unsafe {
         if start < 0 {
             return -1;
         }
         ensure_refs();
+        let t = token_starting(start);
+        if t >= 0 && is_keyword(TOKS[t].kind as i64) {
+            return -1;
+        }
+        var other = -1;
         var i = 0;
         while i < ALL_REFS.count {
             if ALL_REFS.data[i] == start {
-                return ALL_REFS.data[i + 1];
+                let d = ALL_REFS.data[i + 1];
+                if t < 0 || TOKS[t].value as i64 == DEFS[d].name && TOKS[t].kind == Tok::Ident {
+                    return d;
+                }
+                if other < 0 {
+                    other = d;
+                }
             }
             i += 3;
+        }
+        if other < 0 {
+            other = operator_def(start);
+        }
+        if other < 0 && t >= 0 && TOKS[t].kind == Tok::Ident && tok_text(t) == "Self" {
+            // (in a trait: the trait)
+            var best = 0;
+            for n in 1..NODE_COUNT {
+                if NODES[n].kind == NodeKind::Trait && NODES[n].start <= start
+                    && start < NODES[n].end
+                    && (best == 0 || NODES[n].start > NODES[best].start) {
+                    best = n;
+                }
+            }
+            if best != 0 {
+                other = def_of_node(best);
+            }
+        }
+        other
+    }
+}
+
+// ---- type parameters, std and crate
+
+// The declaration of the type parameter named at start (`T` of `fn f<T>`,
+// of the impl, struct, enum or trait around it), or -1; *item: the item
+// declaring it.
+fn type_param_at(start: i64, item: inout i64) -> i64 {
+    unsafe {
+        let t = token_starting(start);
+        if t < 0 || TOKS[t].kind != Tok::Ident {
+            return -1;
+        }
+        let sym = TOKS[t].value as i64;
+        var best = -1;
+        var best_start = -1;
+        for n in 1..NODE_COUNT {
+            let k = NODES[n].kind;
+            if k != NodeKind::Fn && k != NodeKind::Struct && k != NodeKind::Enum
+                && k != NodeKind::Trait && k != NodeKind::Impl && k != NodeKind::TypeAlias {
+                continue;
+            }
+            let g = NODES[n].g;
+            if g == 0 || NODES[n].start > start || NODES[n].end <= start
+                || NODES[n].start <= best_start {
+                continue;
+            }
+            for i in 0..NODES[g].count {
+                let p = child(g, i);
+                if NODES[p].kind == NodeKind::TyName && NODES[p].a == sym {
+                    best = NODES[p].start;
+                    best_start = NODES[n].start;
+                    item = n;
+                }
+            }
+        }
+        best
+    }
+}
+
+// The uses of the name of token t in from..to, into out (in order).
+fn same_name_in(t: i64, from: i64, to: i64, out: inout IntVec) {
+    unsafe {
+        let a = token_at(from);
+        for u in a..TOK_COUNT {
+            if TOKS[u].start >= to {
+                break;
+            }
+            if TOKS[u].kind == TOKS[t].kind && TOKS[u].value == TOKS[t].value {
+                out.push(TOKS[u].start);
+            }
+        }
+    }
+}
+
+// What a path's first segment at start names: 1 `std`, 2 `crate`, 3
+// `super`, 4 `self`, else 0.
+fn root_named_at(start: i64) -> i64 {
+    unsafe {
+        let t = token_starting(start);
+        if t < 0 || t + 1 >= TOK_COUNT || TOKS[t].kind != Tok::Ident
+            || TOKS[t + 1].kind != Tok::ColonColon || local_named_at(start) >= 0 {
+            return 0;
+        }
+        let w = tok_text(t);
+        if w == "std" { 1 } else if w == "crate" { 2 } else if w == "super" { 3 }
+        else if w == "self" { 4 } else { 0 }
+    }
+}
+
+// Where the root named by `which` at position at starts: std's first
+// file, the program's root file; `self`: the module `mod x { }` around at
+// (its name), else at's file; `super`: the module around that one, or
+// the file `mod x { }` is in; -1 when it has no place (`super` of a
+// file: its parent's `mod x;` is not looked for).
+fn root_start(which: i64, at: i64) -> i64 {
+    unsafe {
+        if which == 1 {
+            return if STD_F >= 0 && seg_at(FILES[STD_F].start) >= 0 { FILES[STD_F].start }
+                else { -1 };
+        }
+        if which >= 3 {
+            // (the braces open before at: a `mod x {` one is its module's,
+            // its name's position on the stack, else -1)
+            let f = file_of_pos(at);
+            var open = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            var t = token_at(FILES[f].start);
+            while t < TOK_COUNT && TOKS[t].start < at {
+                if TOKS[t].kind == Tok::LBrace {
+                    let m = t >= 2 && TOKS[t - 2].kind == Tok::Mod
+                        && TOKS[t - 1].kind == Tok::Ident;
+                    open.push(if m { TOKS[t - 1].start } else { -1 });
+                } else if TOKS[t].kind == Tok::RBrace && open.count > 0 {
+                    open.count -= 1;
+                }
+                t += 1;
+            }
+            var inner = -1;
+            var outer = -1;
+            for k in 0..open.count {
+                if open.data[k] >= 0 {
+                    outer = inner;
+                    inner = open.data[k];
+                }
+            }
+            if which == 4 {
+                return if inner >= 0 { inner } else { FILES[f].start };
+            }
+            return if inner < 0 { -1 } else if outer >= 0 { outer } else { FILES[f].start };
+        }
+        for f in 0..FILE_COUNT {
+            if cstr(FILES[f].path) == cstr(ROOT_GIVEN) {
+                return FILES[f].start;
+            }
         }
         -1
     }
 }
 
-// The declaration of the local named at start, or -1.
-fn local_named_at(start: i64) -> i64 {
-    if start < 0 {
-        return -1;
+// The positions of every `std::` (`crate::`) in the shown files, into out.
+fn root_uses(which: i64, out: inout IntVec) {
+    unsafe {
+        for t in 0..TOK_COUNT - 1 {
+            if TOKS[t].kind == Tok::Ident && TOKS[t + 1].kind == Tok::ColonColon
+                && shown(TOKS[t].start) && root_named_at(TOKS[t].start) == which {
+                out.push(TOKS[t].start);
+            }
+        }
     }
-    load_decls();
-    local_at(start)
+}
+
+// Whether token t is a primitive type's name (`i64`, `u8`, `bool`...).
+fn is_primitive(t: i64) -> bool {
+    unsafe { t >= 0 && TOKS[t].kind == Tok::Ident && primitive_text(tok_text(t)).len > 0 }
+}
+
+// The attribute named at start (`derive` of `#[derive(..)]`): its token,
+// or -1.
+fn attribute_at(start: i64) -> i64 {
+    unsafe {
+        let t = token_starting(start);
+        if t < 2 || TOKS[t].kind != Tok::Ident || TOKS[t - 1].kind != Tok::LBracket
+            || TOKS[t - 2].kind != Tok::Hash {
+            return -1;
+        }
+        t
+    }
+}
+
+// The position of the name sym in node n's tokens (its start when none).
+fn name_in_node(n: i64, sym: i64) -> i64 {
+    unsafe {
+        var u = token_at(NODES[n].start);
+        while u < TOK_COUNT && TOKS[u].start < NODES[n].end {
+            if TOKS[u].kind == Tok::Ident && TOKS[u].value as i64 == sym {
+                return TOKS[u].start;
+            }
+            u += 1;
+        }
+        NODES[n].start
+    }
+}
+
+// The associated type named at start: `type Output = Meters;` of an impl
+// or `type Output;` of a trait (itself), `T::Output`, `Self::Item` or a
+// bound's `Item = i64` (the trait's `type Item;`): its AssocType node, or
+// 0; *decl: where the name is declared.
+fn assoc_at(start: i64, decl: inout i64) -> i64 {
+    unsafe {
+        let t = token_starting(start);
+        if t < 1 || TOKS[t].kind != Tok::Ident {
+            return 0;
+        }
+        let sym = TOKS[t].value as i64;
+        let item = TOKS[t - 1].kind == Tok::Type;
+        let path = TOKS[t - 1].kind == Tok::ColonColon;
+        var in_trait = 0;
+        var here = 0;
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind != NodeKind::AssocType || NODES[n].a != sym {
+                continue;
+            }
+            let p = name_in_node(n, sym);
+            if p == start {
+                here = n;
+            }
+            if NODES[n].b == 0 && in_trait == 0 && located(p) {
+                in_trait = n;
+            }
+        }
+        if here != 0 && (item || in_trait == 0) {
+            decl = start;
+            return here;
+        }
+        if (path || here != 0) && in_trait != 0 {
+            decl = name_in_node(in_trait, sym);
+            return in_trait;
+        }
+        0
+    }
+}
+
+// The uses of the associated type's name of token t in the shown files
+// (its declarations, `X::Name`, `Name = T`), into out.
+fn assoc_uses(t: i64, out: inout IntVec) {
+    unsafe {
+        for u in 1..TOK_COUNT - 1 {
+            if TOKS[u].kind != Tok::Ident || TOKS[u].value != TOKS[t].value
+                || !shown(TOKS[u].start) {
+                continue;
+            }
+            let k = TOKS[u - 1].kind;
+            if k == Tok::Type || k == Tok::ColonColon || TOKS[u + 1].kind == Tok::Eq
+                && (k == Tok::Lt || k == Tok::Comma) {
+                out.push(TOKS[u].start);
+            }
+        }
+    }
+}
+
+// The parameter named at start that is no local (of a C function, of a
+// trait's function without a body): its Param node, or 0.
+fn param_at(start: i64) -> i64 {
+    unsafe {
+        let t = token_starting(start);
+        if t < 0 || TOKS[t].kind != Tok::Ident {
+            return 0;
+        }
+        for n in 1..NODE_COUNT {
+            if NODES[n].kind == NodeKind::Param && NODES[n].a == TOKS[t].value as i64
+                && NODES[n].start <= start && start < NODES[n].end
+                && name_in_node(n, NODES[n].a) == start {
+                return n;
+            }
+        }
+        0
+    }
+}
+
+// The attribute token t is in (`C` of `#[repr(C)]`): its name's token, or
+// -1.
+fn enclosing_attribute(t: i64) -> i64 {
+    unsafe {
+        var depth = 0;
+        var u = t - 1;
+        while u > 0 && u > t - 64 {
+            let k = TOKS[u].kind;
+            if k == Tok::Semi || k == Tok::LBrace || k == Tok::RBrace {
+                return -1;
+            }
+            if k == Tok::RBracket {
+                depth += 1;
+            } else if k == Tok::LBracket {
+                if depth == 0 {
+                    return if TOKS[u - 1].kind == Tok::Hash && u + 1 < t { u + 1 } else { -1 };
+                }
+                depth -= 1;
+            }
+            u -= 1;
+        }
+        -1
+    }
+}
+
+// The source text from..to on one line (runs of blanks as one), without
+// a last `;`.
+fn put_collapsed(md: i64, from: i64, to: i64) {
+    unsafe {
+        var e = to;
+        while e > from && (SRC[e - 1] == ';' || SRC[e - 1] == ' ' || SRC[e - 1] == '\n') {
+            e -= 1;
+        }
+        var blank = false;
+        for p in from..e {
+            let c = SRC[p];
+            if c == ' ' || c == '\n' || c == '\t' {
+                blank = true;
+            } else {
+                if blank {
+                    buf_byte(md, ' ');
+                }
+                blank = false;
+                buf_byte(md, c);
+            }
+        }
+    }
+}
+
+// The declaration of the local named at start, or -1 (local_at's answer,
+// from a table of every position made once: 0.25).
+fn local_named_at(start: i64) -> i64 {
+    unsafe {
+        if start < 0 {
+            return -1;
+        }
+        if !LOCALS_READY {
+            load_local_decls();
+            for n in 1..NODE_COUNT {
+                let p = decl_name_pos(n);
+                if p >= NODES[n].start && p < NODES[n].end && LOCAL_AT.get(p + 1) == 0
+                    && LOCAL_DECL.get(NODES[n].x + 1) == p + 1 {
+                    LOCAL_AT.put(p + 1, p + 1);
+                }
+                let s = NODES[n].start;
+                if s >= 0 && NODES[n].end > s {
+                    let d = decl_of_use(n);
+                    if d >= 0 && LOCAL_AT.get(s + 1) == 0 {
+                        LOCAL_AT.put(s + 1, d + 1);
+                    }
+                }
+            }
+            LOCALS_READY = true;
+        }
+        LOCAL_AT.get(start + 1) - 1
+    }
+}
+
+// LOCAL_DECL, made once.
+fn load_local_decls() {
+    unsafe {
+        if LOCAL_DECL.count > 0 {
+            return;
+        }
+        var skip = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        for n in 1..NODE_COUNT {
+            let k = NODES[n].kind;
+            if k == NodeKind::ExternFn || k == NodeKind::Fn && NODES[n].c == 0 {
+                for i in 0..NODES[n].count {
+                    skip.put(child(n, i) + 1, 1);
+                }
+            }
+        }
+        for n in 1..NODE_COUNT {
+            if skip.get(n + 1) != 0 {
+                continue;
+            }
+            let p = decl_name_pos(n);
+            if p >= 0 && LOCAL_DECL.get(NODES[n].x + 1) == 0 {
+                LOCAL_DECL.put(NODES[n].x + 1, p + 1);
+            }
+        }
+    }
+}
+
+// The position of the declaration of the local node n names, or -1
+// (refactor_mod/local's use_decl, on LOCAL_DECL).
+fn decl_of_use(n: i64) -> i64 {
+    unsafe {
+        if (NODES[n].p & NODE_CAPTURE) != 0 && NODES[n].d > 0 {
+            return LOCAL_DECL.get(NODES[n].d) - 1;
+        }
+        if NODES[n].kind != NodeKind::Ident || NODES[n].res != Res::Local {
+            return -1;
+        }
+        let l = NODES[n].y;
+        if l < 0 || l >= LOCAL_COUNT || LOCALS[l].name != NODES[n].a {
+            return -1;
+        }
+        LOCAL_DECL.get(l + 1) - 1
+    }
 }
 
 fn put_definition(out: i64, pos: i64) {
@@ -394,7 +1194,7 @@ fn put_definition(out: i64, pos: i64) {
         let start = token_start(pos);
         let d = def_named_at(start);
         if d >= 0 {
-            if in_file(DEFS[d].name_pos) {
+            if located(DEFS[d].name_pos) {
                 put_location(out, DEFS[d].name_pos);
             } else {
                 buf_str(out, c"null");
@@ -402,8 +1202,28 @@ fn put_definition(out: i64, pos: i64) {
             return;
         }
         let l = local_named_at(start);
-        if l >= 0 && in_file(l) {
+        if l >= 0 && located(l) {
             put_location(out, l);
+            return;
+        }
+        var item = 0;
+        let tp = type_param_at(start, &item);
+        if tp >= 0 && located(tp) {
+            put_location(out, tp);
+            return;
+        }
+        let root = root_named_at(start);
+        if root > 0 && root_start(root, start) >= 0 {
+            put_location(out, root_start(root, start));
+            return;
+        }
+        var decl = -1;
+        if assoc_at(start, &decl) != 0 && located(decl) {
+            put_location(out, decl);
+            return;
+        }
+        if param_at(start) != 0 && located(start) {
+            put_location(out, start);
             return;
         }
         buf_str(out, c"null");
@@ -416,7 +1236,7 @@ fn local_uses(decl: i64, out: inout IntVec) {
         out.push(decl);
         let dt = token_at(decl);
         for n in 1..NODE_COUNT {
-            if use_decl(n) != decl {
+            if decl_of_use(n) != decl {
                 continue;
             }
             let p = NODES[n].start;
@@ -458,27 +1278,61 @@ fn put_references(out: i64, pos: i64, with_decl: bool) {
         let start = token_start(pos);
         let d = def_named_at(start);
         var at = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+        var item = 0;
+        let l = if d >= 0 { -1 } else { local_named_at(start) };
+        let tp = if d >= 0 || l >= 0 { -1 } else { type_param_at(start, &item) };
+        let root = if d >= 0 || l >= 0 || tp >= 0 { 0 } else { root_named_at(start) };
+        let t = token_starting(start);
+        var adecl = -1;
+        let none = d < 0 && l < 0 && tp < 0 && root == 0;
+        let assoc = if none { assoc_at(start, &adecl) } else { 0 };
+        let param = if none && assoc == 0 { param_at(start) } else { 0 };
         if d >= 0 {
             var i = 0;
             while i < ALL_REFS.count {
-                if ALL_REFS.data[i + 1] == d && (with_decl || (ALL_REFS.data[i + 2] & QF_DEF) == 0)
-                    && in_file(ALL_REFS.data[i]) {
-                    at.push(ALL_REFS.data[i]);
+                let p = ALL_REFS.data[i];
+                let def = (ALL_REFS.data[i + 2] & QF_DEF) != 0;
+                if ALL_REFS.data[i + 1] == d && (with_decl || !def)
+                    && (if def { located(p) } else { shown(p) }) {
+                    at.push(p);
                 }
                 i += 3;
             }
             sort_positions(&at);
-        } else {
-            let l = local_named_at(start);
-            if l >= 0 {
-                var uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
-                local_uses(l, &uses);
-                for k in 0..uses.count {
-                    if with_decl || uses.data[k] != l {
-                        at.push(uses.data[k]);
-                    }
+        } else if l >= 0 {
+            var uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            local_uses(l, &uses);
+            for k in 0..uses.count {
+                if (with_decl || uses.data[k] != l) && located(uses.data[k]) {
+                    at.push(uses.data[k]);
                 }
             }
+        } else if tp >= 0 {
+            // (a type parameter: its name in the item declaring it)
+            var uses = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            same_name_in(t, NODES[item].start, NODES[item].end, &uses);
+            for k in 0..uses.count {
+                if (with_decl || uses.data[k] != tp) && located(uses.data[k]) {
+                    at.push(uses.data[k]);
+                }
+            }
+        } else if root > 0 {
+            root_uses(root, &at);
+        } else if assoc != 0 {
+            assoc_uses(t, &at);
+        } else if param != 0 {
+            if with_decl {
+                at.push(start);
+            }
+        } else if is_primitive(t) && !is_keyword(TOKS[t].kind as i64) {
+            // (a primitive type: its name in the shown files)
+            for u in 0..TOK_COUNT {
+                if TOKS[u].kind == Tok::Ident && TOKS[u].value == TOKS[t].value
+                    && shown(TOKS[u].start) {
+                    at.push(TOKS[u].start);
+                }
+            }
+            sort_positions(&at);
         }
         buf_byte(out, '[');
         var last = -1;
@@ -601,6 +1455,37 @@ fn put_relative(out: i64, text: [u8]) {
     }
 }
 
+// Appends text with each `<std>:LINE:COL` in it written as the place in
+// std's file (`std.vl:286:37`), when std's files are written.
+fn put_std_places(out: i64, text: [u8]) {
+    unsafe {
+        let tag = "<std>:";
+        var i = 0;
+        while i < text.len {
+            if STD_F >= 0 && i + tag.len < text.len && text[i..i + tag.len] == tag {
+                var j = i + tag.len;
+                var line = 0;
+                while j < text.len && text[j] >= '0' && text[j] <= '9' {
+                    line = line * 10 + (text[j] - '0') as i64;
+                    j += 1;
+                }
+                let first = FIRST_LINE.data[STD_F];
+                if line > 0 && first + line - 1 < FIRST_LINE.data[STD_F + 1] {
+                    let k = seg_at(LS.data[first + line - 1]);
+                    if k >= 0 {
+                        buf_bytes(out, segment_name(k));
+                        buf_fmt(out, f":{first + line - 1 - line_index(segment_from(k)) + 1}");
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+            buf_byte(out, text[i]);
+            i += 1;
+        }
+    }
+}
+
 // The reasons of f's effects, one line each (the first step of `query
 // effects --why`), at most WHY_MAX.
 fn put_why_lines(md: i64, f: i64) {
@@ -629,7 +1514,9 @@ fn put_why_lines(md: i64, f: i64) {
             buf_str(line, c" ← ");
             let step = buf_new();
             step_text(step, f, bits.data[k], allocs.data[k], true);
-            put_relative(line, buf_slice(step));
+            let places = buf_new();
+            put_std_places(places, buf_slice(step));
+            put_relative(line, buf_slice(places));
             buf_str(md, c"- ");
             put_cut(md, buf_slice(line), WHY_LINE_MAX);
             buf_byte(md, '\n');
@@ -681,7 +1568,7 @@ fn hover_def(md: i64, d: i64, inst: i64) {
                     while tab < j && t[tab] != '\t' {
                         tab += 1;
                     }
-                    buf_bytes(md, t[i..tab]);
+                    put_std_places(md, t[i..tab]);
                     if tab < j {
                         buf_str(md, c": ");
                         buf_bytes(md, t[tab + 1..j]);
@@ -706,11 +1593,102 @@ fn hover_def(md: i64, d: i64, inst: i64) {
         if why >= 0 && ((fn_effects(why).bits & EFF_VISIBLE) != 0 || fn_effects(why).allocs != 0) {
             put_why_lines(md, why);
         }
+        put_doc(md, d);
         buf_str(md, c"\n`");
         buf_bytes(md, SYMS[DEFS[d].fqn].text);
         buf_str(md, c"` (");
         buf_str(md, kind_name(DEFS[d].kind));
         buf_str(md, c")\n");
+    }
+}
+
+// The comment right above definition d (its `//` lines, without the
+// slashes; attribute lines left out), as a paragraph after an empty line.
+fn put_doc(md: i64, d: i64) {
+    unsafe {
+        let parent = DEFS[d].parent;
+        if parent >= 0 && line_start(DEFS[d].start) == line_start(DEFS[parent].start) {
+            // (a field on its struct's line: the comment is the struct's)
+            return;
+        }
+        let from = text_start(d);
+        let to = line_start(DEFS[d].start);
+        var p = from;
+        var first = true;
+        while p < to {
+            var e = p;
+            while e < to && SRC[e] != '\n' {
+                e += 1;
+            }
+            var a = p;
+            while a < e && (SRC[a] == ' ' || SRC[a] == '\t') {
+                a += 1;
+            }
+            if a + 1 < e && SRC[a] == '/' && SRC[a + 1] == '/' {
+                a += 2;
+                if a < e && SRC[a] == ' ' {
+                    a += 1;
+                }
+                if first {
+                    buf_byte(md, '\n');
+                    first = false;
+                }
+                buf_bytes(md, SRC[a..e]);
+                buf_byte(md, '\n');
+            }
+            p = e + 1;
+        }
+    }
+}
+
+// A hover of a word's text: the word as code, then the text.
+fn hover_word(md: i64, word: [u8], text: [u8]) {
+    buf_str(md, c"```vole\n");
+    buf_bytes(md, word);
+    buf_str(md, c"\n```\n");
+    buf_bytes(md, text);
+    buf_byte(md, '\n');
+}
+
+// The hover of a type parameter declared at decl by item: its
+// declaration (`T: Ord + Copy`) and the item's name.
+fn hover_type_param(md: i64, decl: i64, item: i64) {
+    unsafe {
+        buf_str(md, c"```vole\n");
+        // (its tokens, to the `,` or `>` that ends it)
+        var t = token_starting(decl);
+        var depth = 0;
+        var first = true;
+        while t >= 0 && t < TOK_COUNT {
+            let k = TOKS[t].kind;
+            if depth == 0 && (k == Tok::Comma || k == Tok::Gt) {
+                break;
+            }
+            if k == Tok::Lt || k == Tok::LParen {
+                depth += 1;
+            } else if k == Tok::Gt || k == Tok::RParen {
+                depth -= 1;
+            }
+            if !first && k != Tok::Comma && k != Tok::Colon && k != Tok::Gt && k != Tok::Lt
+                && k != Tok::RParen && TOKS[t - 1].kind != Tok::Lt
+                && TOKS[t - 1].kind != Tok::LParen {
+                buf_byte(md, ' ');
+            }
+            buf_bytes(md, tok_text(t));
+            first = false;
+            t += 1;
+        }
+        buf_str(md, c"\n```\na type parameter");
+        let name = NODES[item].a;
+        let k = NODES[item].kind;
+        if name > 0 && k != NodeKind::Impl {
+            buf_str(md, c" of `");
+            buf_bytes(md, SYMS[name].text);
+            buf_byte(md, '`');
+        } else if k == NodeKind::Impl {
+            buf_str(md, c" of the impl block");
+        }
+        buf_byte(md, '\n');
     }
 }
 
@@ -732,7 +1710,23 @@ fn hover_type(md: i64, pos: i64, start: i64) -> bool {
             TYPED = alloc_array::<TypedIndex>(1);
             TYPED[0] = typed_index();
         }
-        let found = typed_nodes_in(*TYPED, 1, at, 0);
+        var found = typed_nodes_in(*TYPED, 1, at, 0);
+        if l >= 0 {
+            // (0.25: a local named there, not what the checker made at it,
+            // a drop at its `let`, when it is one)
+            var named = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+            for i in 0..found.count {
+                let n = found.data[i];
+                let k = NODES[n].kind;
+                if NODES[n].start == at
+                    && (k == NodeKind::PatBind || k == NodeKind::Ident || k == NodeKind::Param) {
+                    named.push(n);
+                }
+            }
+            if named.count > 0 {
+                found = named;
+            }
+        }
         let widened = &TYPED[0].widened;
         if found.count == 0 {
             return false;
@@ -755,6 +1749,11 @@ fn hover_type(md: i64, pos: i64, start: i64) -> bool {
             if seen {
                 continue;
             }
+            if types.count == TYPES_MAX {
+                // (0.25: a generic function of std has an instance per use)
+                buf_str(md, c" | …");
+                break;
+            }
             if types.count > 0 {
                 buf_str(md, c" | ");
             }
@@ -772,14 +1771,133 @@ fn hover_type(md: i64, pos: i64, start: i64) -> bool {
     }
 }
 
+// The hover at start, into md: false when there is none. In order: an
+// attribute, a keyword, a definition (an operator's function), a type
+// parameter, `std` or `crate`, a primitive type, a local's or an
+// expression's type (`self` and `result` explained after theirs).
+fn hover_at(md: i64, pos: i64, start: i64) -> bool {
+    unsafe {
+        if start < 0 {
+            return false;
+        }
+        let t = token_starting(start);
+        let text = if t >= 0 { tok_text(t) } else { SRC[start..start] };
+        let kind = if t >= 0 { TOKS[t].kind as i64 } else { -1 };
+        if attribute_at(start) >= 0 && attribute_text(text).len > 0 {
+            hover_word(md, text, attribute_text(text));
+            return true;
+        }
+        let contract_word = text == "requires" || text == "ensures";
+        if (is_keyword(kind) || contract_word) && keyword_text(text).len > 0 {
+            hover_word(md, text, keyword_text(text));
+            return true;
+        }
+        if is_keyword(kind) {
+            return false;
+        }
+        let d = def_named_at(start);
+        if d >= 0 {
+            hover_def(md, d, call_at(start));
+            return true;
+        }
+        if kind == Tok::Ident as i64 && local_named_at(start) < 0 {
+            var item = 0;
+            let tp = type_param_at(start, &item);
+            if tp >= 0 {
+                hover_type_param(md, tp, item);
+                return true;
+            }
+            let root = root_named_at(start);
+            if root == 1 {
+                hover_word(md, "mod std",
+                    "The standard library, built into the compiler; its most used names (the prelude: `Vec`, `println`, `Gpa`...) need no `use`. (`volec guide std`)");
+                return true;
+            } else if root == 2 {
+                hover_word(md, "mod crate",
+                    "The program's root module: its `main.vl`. (`volec guide modules`)");
+                return true;
+            } else if root == 3 {
+                hover_word(md, "super", "The module this one is in: `use super::name;` names its sibling's or its parent's item. (`volec guide modules`)");
+                return true;
+            } else if root == 4 {
+                hover_word(md, "self", "This module: `use self::name;`. (`volec guide modules`)");
+                return true;
+            }
+            var adecl = -1;
+            let an = assoc_at(start, &adecl);
+            if an != 0 {
+                buf_str(md, c"```vole\n");
+                let s = NODES[an].start;
+                if !(s + 5 <= NODES[an].end && SRC[s..s + 5] == "type ") {
+                    buf_str(md, c"type ");
+                }
+                put_collapsed(md, s, NODES[an].end);
+                buf_str(md, c"\n```\nan associated type (`volec guide traits`)\n");
+                return true;
+            }
+            let pn = param_at(start);
+            if pn != 0 {
+                buf_str(md, c"```vole\n");
+                put_collapsed(md, NODES[pn].start, NODES[pn].end);
+                buf_str(md, c"\n```\na parameter\n");
+                return true;
+            }
+            if bound_text(text).len > 0 {
+                hover_word(md, text, bound_text(text));
+                return true;
+            }
+            if text == "size_of" || text == "align_of" {
+                hover_word(md, if text == "size_of" { "fn size_of(T) -> i64" } else { "fn align_of(T) -> i64" }, "The size (the alignment) of type T in bytes: a constant (built in; `volec guide c-interop`).");
+                return true;
+            }
+            if t > 0 && TOKS[t - 1].kind == Tok::Dot && (text == "len" || text == "ptr") {
+                // (a slice's or an array's own, no item)
+                if text == "len" {
+                    hover_word(md, "fn len(self) -> i64",
+                        "The length of a slice or an array, an `i64` (built in).");
+                } else {
+                    hover_word(md, "ptr: *T", "The address of a slice's first element, for C (built in; `guide c-interop`).");
+                }
+                return true;
+            }
+            if primitive_text(text).len > 0 {
+                hover_word(md, text, primitive_text(text));
+                return true;
+            }
+            let attr = enclosing_attribute(t);
+            if attr >= 0 && attribute_text(tok_text(attr)).len > 0 {
+                // (an attribute's argument: `C` of `#[repr(C)]`)
+                hover_word(md, tok_text(attr), attribute_text(tok_text(attr)));
+                return true;
+            }
+            if text != "self" && text != "Self" && text != "result" {
+                return false;
+            }
+        }
+        if kind == Tok::FHead as i64 || kind == Tok::FMid as i64 || kind == Tok::FTail as i64 {
+            // (an f-string's text: no name)
+            return false;
+        }
+        let typed = hover_type(md, pos, start);
+        if kind == Tok::Ident as i64 && (text == "self" || text == "Self" || text == "result") {
+            if !typed {
+                buf_str(md, c"```vole\n");
+                buf_bytes(md, text);
+                buf_str(md, c"\n```\n");
+            }
+            buf_bytes(md, keyword_text(text));
+            buf_byte(md, '\n');
+            return true;
+        }
+        typed
+    }
+}
+
 fn put_hover(out: i64, pos: i64) {
     unsafe {
         let start = token_start(pos);
         let md = buf_new();
-        let d = def_named_at(start);
-        if d >= 0 {
-            hover_def(md, d, call_at(start));
-        } else if start < 0 || !hover_type(md, pos, start) {
+        if !hover_at(md, pos, start) {
             buf_str(out, c"null");
             return;
         }
@@ -843,12 +1961,14 @@ fn put_symbol(out: i64, d: i64, children: IntVec) {
     }
 }
 
-fn put_symbols(out: i64, f: i64) {
+// The symbols of the definitions named in from..to (a file, or a file of
+// std's text).
+fn put_symbols(out: i64, from: i64, to: i64) {
     unsafe {
         var all = IntVec { data: 0 as *i64, count: 0, cap: 0 };
         for d in 0..DEF_COUNT {
             let p = DEFS[d].name_pos;
-            if p >= FILES[f].start && p < FILES[f].end {
+            if p >= from && p < to {
                 all.push(d);
             }
         }
@@ -857,7 +1977,8 @@ fn put_symbols(out: i64, f: i64) {
         var first = true;
         for i in 0..all.count {
             let d = all.data[i];
-            if DEFS[d].parent >= 0 && file_of_pos(DEFS[DEFS[d].parent].name_pos) == f {
+            let parent = DEFS[d].parent;
+            if parent >= 0 && DEFS[parent].name_pos >= from && DEFS[parent].name_pos < to {
                 continue;
             }
             var children = IntVec { data: 0 as *i64, count: 0, cap: 0 };
@@ -871,6 +1992,91 @@ fn put_symbols(out: i64, f: i64) {
             }
             first = false;
             put_symbol(out, d, children);
+        }
+        buf_byte(out, ']');
+    }
+}
+
+// ---- workspace symbols
+
+// The answers of a workspace/symbol, at most.
+const WS_MAX: i64 = 256;
+
+fn lower(c: u8) -> u8 {
+    if c >= 'A' && c <= 'Z' { c + 32 as u8 } else { c }
+}
+
+// Whether query's characters are in name in order, case ignored (the
+// match LSP's clients make).
+fn fuzzy_match(query: [u8], name: [u8]) -> bool {
+    var i = 0;
+    for k in 0..name.len {
+        if i < query.len && lower(query[i]) == lower(name[k]) {
+            i += 1;
+        }
+    }
+    i == query.len
+}
+
+// Whether query is in name, case ignored (std's names: fewer, closer
+// answers than fuzzy_match's).
+fn contains_ci(name: [u8], query: [u8]) -> bool {
+    var i = 0;
+    while i + query.len <= name.len {
+        var k = 0;
+        while k < query.len && lower(name[i + k]) == lower(query[k]) {
+            k += 1;
+        }
+        if k == query.len {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+// workspace/symbol: the definitions whose names match query, the
+// program's first (its letters in order), then std's (holding it; not
+// for an empty query), WS_MAX at most:
+// `[{"name":..,"kind":..,"location":..,"containerName":..}]`.
+fn put_workspace_symbols(out: i64, query: [u8]) {
+    unsafe {
+        buf_byte(out, '[');
+        var n = 0;
+        for pass in 0..2 {
+            if pass == 1 && query.len == 0 {
+                break;
+            }
+            for d in 0..DEF_COUNT {
+                if n >= WS_MAX {
+                    break;
+                }
+                let p = DEFS[d].name_pos;
+                let mine = in_file(p);
+                if (pass == 0) != mine || pass == 1 && seg_at(p) < 0
+                    || !(if mine { fuzzy_match(query, SYMS[DEFS[d].name].text) }
+                        else { contains_ci(SYMS[DEFS[d].name].text, query) }) {
+                    continue;
+                }
+                if n > 0 {
+                    buf_byte(out, ',');
+                }
+                n += 1;
+                buf_str(out, c"{\"name\":");
+                buf_json_str(out, SYMS[DEFS[d].name].text);
+                buf_fmt(out, f",\"kind\":{symbol_kind(DEFS[d].kind)},\"location\":");
+                put_location(out, p);
+                let fqn = SYMS[DEFS[d].fqn].text;
+                var e = fqn.len;
+                while e > 1 && !(fqn[e - 1] == ':' && fqn[e - 2] == ':') {
+                    e -= 1;
+                }
+                if e > 2 {
+                    buf_str(out, c",\"containerName\":");
+                    buf_json_str(out, fqn[0..e - 2]);
+                }
+                buf_byte(out, '}');
+            }
         }
         buf_byte(out, ']');
     }

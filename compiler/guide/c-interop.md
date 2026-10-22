@@ -138,6 +138,38 @@ volec prog.vl helper.c -L vendor/lib -l png -o prog
 `-o prog.o` makes an object instead, for a build that links it itself
 (`cc prog.o helper.o -o prog -lm`).
 
+An extern block can say what it links (0.25): `#[link(lib = "objc")]`
+(`-lobjc`), `#[link(framework = "Metal")]` (macOS; Linux leaves it
+out), or Rust's `#[link(name = "objc")]` and `#[link(name = "Metal",
+kind = "framework")]`, several in one attribute or in several, before
+`extern "C"`. A program links them when it calls a function of the
+block or uses one of its statics, so std::gpu, std::objc and
+std::window bring libobjc and their frameworks, and a program without
+them links nothing more (keep the C library's functions in a block of
+their own). On the command line, `-framework NAME` adds a framework.
+
+```tach
+#[link(lib = "m")]
+extern "C" {
+    fn ilogb(x: f64) -> i32;
+}
+
+fn main() {
+    println(f"{unsafe { ilogb(8.0) }}");
+}
+```
+```out
+3
+```
+
+A program with nothing to link but itself skips `cc`: the system's
+linker runs directly, with the command `cc -###` gave the first time
+(kept in the user's cache directory; `$VOLE_LINK_CACHE` names another,
+`off` none). The executable is the same. `--linker=cc` (or
+`$VOLE_LINKER=cc`) links through `cc` anyway. On AArch64 macOS the
+compiler links such a program itself, without `ld` (a few ms), when it
+needs nothing but libSystem; `--linker=system` runs `ld` instead.
+
 Reading stdin: std has `read_line` and `read_stdin` (`volec guide
 std`); from C, `getchar()` from `stdio.h`, or `read(0, buf, n)` from
 `unistd.h`, into a `Buf` or an array (not mixed with std's, which

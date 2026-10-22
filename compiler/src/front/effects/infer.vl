@@ -40,12 +40,13 @@ use crate::arch::{INTRS, intrinsic_effect_bits, intrinsic_of_fn};
 use crate::base::{IntVec, SYMS, alloc_array, intern_c};
 use crate::base::timer::{T_CHECK, T_EFFECTS, timer_now, timer_sub};
 use crate::front::ast::{
-    FN_BODY_FAILED, FN_SIG_FAILED, FN_UNSAFE, NODES, NODE_IN_BOUNDS, NODE_RAW, NodeKind, REPR_UNION,
-    VK_LANE, VK_LOAD, VK_STORE, VK_WITH, child,
+    FN_BODY_FAILED, FN_SIG_FAILED, FN_UNSAFE, NODES, NODE_IN_BOUNDS, NODE_RAW, NODE_REF_MUT,
+    NodeKind, REPR_UNION, VK_LANE, VK_LOAD, VK_STORE, VK_WITH, child,
 };
 use crate::front::check::{LOCALS, Res};
 use crate::front::check::unsafety::{NODE_NO_READ, is_borrow, is_borrow_param};
 use crate::front::closures::{CLOSURES, CLOSURE_COUNT};
+use crate::front::contracts::checks::CHECK_FN;
 use crate::front::effects::{
     ALLOC_ANY, EFF_ALLOC_EXTERN, EFF_DIVERGE, EFF_GLOBAL, EFF_IO, EFF_PANIC, EFF_RAW_DIVERGE,
     EFF_RAW_GLOBAL, EFF_RAW_PANIC, EFF_SYNC, EFF_TLS, EFF_UNKNOWN, EFF_UNSAFE, Effects, FN_EFFECTS,
@@ -53,13 +54,14 @@ use crate::front::effects::{
 };
 use crate::front::effects::builtin::unknown_c_effects;
 use crate::front::effects::check::extern_effects;
+use crate::front::lexer::Tok;
 use crate::front::modules::{STD_MODULE, qualify, within_std};
 use crate::front::modules::lookup::std_item_key;
 use crate::front::threadlocal::is_thread_local;
 use crate::front::traits::{IMPLS, impl_of_fn, std_trait};
 use crate::front::types::{
-    FNS, FN_COUNT, STATICS, STRUCTS, SYM_STRUCT, TLISTS, TYPES, TY_ERROR, TyKind, struct_type,
-    vec_lanes,
+    FNS, FN_COUNT, REF_SHARED, STATICS, STRUCTS, SYM_STRUCT, TLISTS, TYPES, TY_ERROR, TyKind,
+    struct_type, vec_lanes,
 };
 use crate::middle::lower::atomic::atomic_intrinsic;
 use crate::middle::lower::ssa::HMap;
@@ -132,6 +134,10 @@ static var SEARCH_ALLOC: i64 = 0;
 pub static var FOUND_NODE: i64 = 0;
 pub static var FOUND_CALLEE: i64 = -1;
 pub static var FOUND_KIND: i64 = 0;
+
+// (0.25) Evaluation mode (expr_effects): the walk adds what a call brings
+// (its callee's inferred effects) to ACC instead of making edges.
+static var EVAL: bool = false;
 
 // Function f's body failed to check (check_function_recovering): its
 // effects are ⊤.
@@ -257,10 +263,17 @@ pub fn infer_effects() {
         }
         LOCAL_FX = alloc_array::<Effects>(n + 1);
         CALLEE_INFO = alloc_array::<i64>(n + 1);
+        STATIC_USES.count = 0;
+        STATIC_USE_START.count = 0;
+        SA_MEMO = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        SA_SEEN = 0 as *i64;
+        SA_TOP = alloc_array::<i64>(n + 1);
         for f in 0..n {
             EDGE_START.push(EDGES.count);
+            STATIC_USE_START.push(STATIC_USES.count);
             LOCAL_FX[f] = node_locals(f);
         }
+        STATIC_USE_START.push(STATIC_USES.count);
         // The virtual nodes' edges, in the order they were made.
         let addr = ADDRESS_TAKEN.count;
         for k in 0..VIRTUAL_TYPE.count {
@@ -284,6 +297,75 @@ pub fn infer_effects() {
         FN_EFFECTS_COUNT = n;
     }
     timer_sub(T_CHECK, T_EFFECTS, t);
+}
+
+// (0.25) The mutable statics each function names, as (static, how) pairs
+// from STATIC_USE_START[f] to STATIC_USE_START[f + 1]: how 1 read, 2
+// changed (an assignment's target, `&S`, an `inout self` receiver).
+pub static var STATIC_USES: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+pub static var STATIC_USE_START: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// (inside a place the walk changes: an assignment's target, `&place`)
+static var STATIC_WRITE: i64 = 0;
+// (static_access: the nodes visited by the query, stamped, and its memo)
+static var SA_SEEN: *i64 = 0 as *i64;
+static var SA_STAMP: i64 = 0;
+static var SA_MEMO: HMap = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+static var SA_STACK: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+// (the functions whose effects are unknown, node_locals: ⊤)
+static var SA_TOP: *i64 = 0 as *i64;
+
+// (0.25) How function f may access mutable static s by name, in its body
+// or in what it calls (fn values, unknown C callbacks and dyn calls
+// through their virtual nodes): 0 not at all, bit 1 a read, bit 2 a
+// change. An unknown callee (f < 0), or one whose effects are unknown
+// (a body not checked), may do anything: 3. own::calls::static_args asks
+// it for a static lent to a call.
+pub fn static_access(f: i64, s: i64) -> i64 {
+    unsafe {
+        if f < 0 || f >= GRAPH_FNS || STATIC_USE_START.count <= GRAPH_FNS {
+            return 3;
+        }
+        let key = f * 65536 + s + 1;
+        let known = SA_MEMO.get(key);
+        if known != 0 {
+            return known - 1;
+        }
+        if SA_SEEN == 0 as *i64 {
+            SA_SEEN = alloc_array::<i64>(GRAPH_SIZE + 1);
+        }
+        SA_STAMP += 1;
+        var how = 0;
+        SA_STACK.count = 0;
+        SA_STACK.push(f);
+        SA_SEEN[f] = SA_STAMP;
+        while SA_STACK.count > 0 && how != 3 {
+            SA_STACK.count -= 1;
+            let v = SA_STACK.data[SA_STACK.count];
+            if v < GRAPH_FNS {
+                if SA_TOP[v] != 0 {
+                    how = 3;
+                    break;
+                }
+                var i = STATIC_USE_START.data[v];
+                while i < STATIC_USE_START.data[v + 1] {
+                    if STATIC_USES.data[i] == s {
+                        how |= STATIC_USES.data[i + 1];
+                    }
+                    i += 2;
+                }
+            }
+            for e in EDGE_START.data[v]..EDGE_START.data[v + 1] {
+                let w = edge_to(e);
+                if (EDGES.data[e] & 3) != E_ALLOC && w >= 0 && w < GRAPH_SIZE
+                    && SA_SEEN[w] != SA_STAMP {
+                    SA_SEEN[w] = SA_STAMP;
+                    SA_STACK.push(w);
+                }
+            }
+        }
+        SA_MEMO.put(key, how + 1);
+        how
+    }
 }
 
 fn init_walk() {
@@ -368,6 +450,10 @@ fn node_locals(f: i64) -> Effects {
             return Effects { bits: EFF_IO | EFF_GLOBAL, allocs: 0 };
         }
         if is_top(f) {
+            // (0.25: static_access, a callee that may do anything)
+            if SA_TOP != 0 as *i64 {
+                SA_TOP[f] = 1;
+            }
             return effects_top();
         }
         if FNS[f].is_extern {
@@ -494,6 +580,17 @@ fn call_edge(n: i64, to: i64, kind: i64, add: i64) {
             }
             return;
         }
+        if EVAL {
+            // (expr_effects: the callee's effects now; -1: no function of
+            // that fn type is reached)
+            if to < 0 || to >= GRAPH_SIZE {
+                return;
+            }
+            let e = through(NODE_FX[to], kind, add);
+            ACC.bits |= e.bits;
+            ACC.allocs |= e.allocs;
+            return;
+        }
         push_edge(to, kind, add);
     }
 }
@@ -528,7 +625,14 @@ fn walk_node(n: i64) {
     unsafe {
         match NODES[n].kind {
             NodeKind::Ident => walk_ident(n),
-            NodeKind::Binary | NodeKind::Assign | NodeKind::While => {
+            NodeKind::Assign => {
+                // (0.25: its target is changed, static_access)
+                STATIC_WRITE += 1;
+                walk(NODES[n].b);
+                STATIC_WRITE -= 1;
+                walk(NODES[n].c);
+            }
+            NodeKind::Binary | NodeKind::While => {
                 if NODES[n].kind == NodeKind::While && (NODES[n].p & NODE_IN_BOUNDS) == 0 {
                     local(n, EFF_DIVERGE, 0);
                 }
@@ -539,7 +643,18 @@ fn walk_node(n: i64) {
                 if (NODES[n].p & NODE_RAW) != 0 {
                     local(n, EFF_UNSAFE, 0);
                 }
+                // (0.25) `&place` exclusive or raw, a receiver too: the
+                // place may change (static_access)
+                let t = NODES[n].ty;
+                let lends = NODES[n].op == Tok::Amp && ((NODES[n].p & NODE_REF_MUT) != 0
+                    || t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b != REF_SHARED);
+                if lends {
+                    STATIC_WRITE += 1;
+                }
                 walk(NODES[n].b);
+                if lends {
+                    STATIC_WRITE -= 1;
+                }
             }
             NodeKind::Cast => {
                 let operand = NODES[n].a;
@@ -648,6 +763,11 @@ fn walk_ident(n: i64) {
                 local(n, EFF_TLS, 0);
             } else if s >= 0 && (STATICS[s].mutable || STATICS[s].linkage != 0) {
                 local(n, EFF_GLOBAL | (if guarded_static(s) { 0 } else { EFF_RAW_GLOBAL }), 0);
+                if !SEARCH {
+                    // (0.25: static_access)
+                    STATIC_USES.push(s);
+                    STATIC_USES.push(if STATIC_WRITE > 0 { 2 } else { 1 });
+                }
             }
             return;
         }
@@ -658,7 +778,7 @@ fn walk_ident(n: i64) {
         if f < 0 {
             return;
         }
-        if !SEARCH {
+        if !SEARCH && !EVAL {
             ADDRESS_TAKEN.push(NODES[n].ty);
             ADDRESS_TAKEN.push(f);
         }
@@ -696,6 +816,15 @@ fn walk_call(n: i64) {
         let f = NODES[n].x - 1;
         if f >= 0 {
             walk_list(n);
+            if f == CHECK_FN {
+                // (an assertion or a clause, lowered in place as a branch
+                // to the failure: it may panic unless its condition is
+                // true as written, and its body is not called)
+                if !proven_true(child(n, 0)) {
+                    local(n, EFF_PANIC, 0);
+                }
+                return;
+            }
             let info = callee_info(f);
             if (info & CALL_UNSAFE) != 0
                 || (info >> BORROW_SHIFT) != 0 && raw_to_borrow(n, f, info) {
@@ -718,18 +847,80 @@ fn walk_call(n: i64) {
         if TYPES[t].b != 0 {
             // (an `extern "C" fn` value: C, unknown)
             local(n, EFF_UNSAFE, 0);
-            if SEARCH {
+            if EVAL && C_UNKNOWN < 0 {
+                local(n, unknown_c_effects().bits, 0);
+            } else if SEARCH || EVAL {
                 call_edge(n, C_UNKNOWN, E_CALL, 0);
             } else {
                 call_edge(n, c_unknown_node(), E_CALL, 0);
             }
             return;
         }
-        if SEARCH {
+        if SEARCH || EVAL {
             call_edge(n, dispatch_of(t), E_CALL, 0);
         } else {
             call_edge(n, dispatch_node(t), E_CALL, 0);
         }
+    }
+}
+
+// (0.25) Whether condition n is true as written: `true`, or `!`, `&&` and
+// `||` of such, or a comparison of integer literals (an assertion that
+// cannot fail does not panic).
+pub fn proven_true(n: i64) -> bool {
+    const_bool(n, 0) == 1
+}
+
+// The value of condition n as written: 1 true, 0 false, -1 not known.
+fn const_bool(n: i64, depth: i64) -> i64 {
+    unsafe {
+        if n <= 0 || depth > 16 {
+            return -1;
+        }
+        let kind = NODES[n].kind;
+        if kind == NodeKind::Bool {
+            return if NODES[n].a != 0 { 1 } else { 0 };
+        }
+        if kind == NodeKind::Unary && NODES[n].op == Tok::Bang {
+            let v = const_bool(NODES[n].b, depth + 1);
+            return if v < 0 { -1 } else { 1 - v };
+        }
+        if kind != NodeKind::Binary {
+            return -1;
+        }
+        let op = NODES[n].op;
+        let l = NODES[n].b;
+        let r = NODES[n].c;
+        if op == Tok::AmpAmp || op == Tok::PipePipe {
+            let a = const_bool(l, depth + 1);
+            let b = const_bool(r, depth + 1);
+            if op == Tok::AmpAmp {
+                return if a == 0 || b == 0 { 0 } else if a == 1 && b == 1 { 1 } else { -1 };
+            }
+            return if a == 1 || b == 1 { 1 } else if a == 0 && b == 0 { 0 } else { -1 };
+        }
+        if NODES[l].kind != NodeKind::Int || NODES[r].kind != NodeKind::Int {
+            return -1;
+        }
+        let x = NODES[l].a;
+        let y = NODES[r].a;
+        var t = false;
+        if op == Tok::EqEq {
+            t = x == y;
+        } else if op == Tok::BangEq {
+            t = x != y;
+        } else if op == Tok::Lt {
+            t = x < y;
+        } else if op == Tok::LtEq {
+            t = x <= y;
+        } else if op == Tok::Gt {
+            t = x > y;
+        } else if op == Tok::GtEq {
+            t = x >= y;
+        } else {
+            return -1;
+        }
+        if t { 1 } else { 0 }
     }
 }
 
@@ -1055,5 +1246,27 @@ pub fn find_step(f: i64, bit: i64, alloc: i64) {
         }
         walk(NODES[FNS[f].node].c);
         SEARCH = false;
+    }
+}
+
+// (0.25) The effects of expression n of a checked body, once inferred
+// (FN_EFFECTS): its own and those of the functions it calls, directly or
+// through fn values (contracts' conditions, check_contracts); a closure's
+// body is its own function, not part of n.
+pub fn expr_effects(n: i64) -> Effects {
+    unsafe {
+        if n <= 0 || NODE_FX == 0 as *Effects {
+            return effects_top();
+        }
+        let saved = ACC;
+        let mark = LOOPS.count;
+        ACC = effects_none();
+        EVAL = true;
+        walk(n);
+        EVAL = false;
+        LOOPS.count = mark;
+        let e = ACC;
+        ACC = saved;
+        e
     }
 }

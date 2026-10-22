@@ -44,9 +44,8 @@ fn main(gpa: Gpa) -> i32 {
   `text_follows`, then a `Text`. Encode keys that do not (arrows, Return,
   Control-letters); send `Text` as it is. `ime` marks keys an input
   method took.
-- **Linking** (until volec takes `-framework`): link AppKit,
-  QuartzCore, Metal, CoreText, CoreGraphics, CoreFoundation and libobjc,
-  e.g. with `tests/window/frameworks.c` on the command line
-  (`volec main.vl tests/window/frameworks.c -o app`).
+- **Linking**: nothing to add. std::window's extern blocks name what
+  they link (`#[link(framework = "AppKit")]`, `guide c-interop`), so
+  `volec main.vl -o app` links AppKit, QuartzCore and libobjc.
 - **Tests**: `tests/window/run.sh`; the checks that need a display skip
   without one (`VOLE_NO_DISPLAY_TESTS=1` too).

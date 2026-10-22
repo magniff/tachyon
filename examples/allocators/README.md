@@ -30,7 +30,7 @@ allocators` runs them).
 | `Gpa` | the runtime: `fn main(gpa: Gpa)` | each block, when its owner is dropped | anything whose lifetime is its own |
 | `ScopedArena` | `arena_scope(gpa, \|a\| ...)`, `arena.scope(\|a\| ...)` | everything at the scope's end | temporaries of one task: a request, a frame, a parse |
 | `Arena` | `Arena::new_in(gpa)` | everything at once: `reset`, `free_all` (unsafe) | data that lives together for longer than a call |
-| `FixedBuf` | `FixedBuf::new(mem[..])` over memory you own | `reset` (unsafe) | no heap, or a hard budget |
+| `FixedBuf` | `FixedBuf::new(&mem[..])` over memory you own (it holds it inout) | `reset` (unsafe) | no heap, or a hard budget |
 
 `volec guide allocators` is the reference; `volec guide effects`
 explains `alloc(Gpa)`, `alloc(Arena)` and the rest of what

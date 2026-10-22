@@ -27,12 +27,12 @@ pub mod escape;
 pub mod scoped;
 
 use crate::base::{
-    FILES, FILE_COUNT, IntVec, SRC, SYMS, alloc_array, alloc_zeroed, buf_byte, buf_bytes, buf_fmt,
-    buf_int, buf_new, buf_slice, buf_str, free, grow, intern, intern_c,
+    FILES, FILE_COUNT, IntVec, SRC, SYMS, alloc_array, buf_byte, buf_bytes, buf_fmt, buf_int,
+    buf_new, buf_slice, buf_str, free, grow, intern, intern_c,
 };
 use crate::base::diag::{
     ERR_HELP, err_begin, err_end, err_end_soft, err_fix, err_help, err_help_sym, err_int, err_str,
-    err_sym, err_try_fmt,
+    err_sym, err_try_fmt, file_line_col,
 };
 use crate::front::ast::{
     CLOSURE_MOVE, CONV_NEW, FN_CLOSURE, NODES, NODE_CAPTURE, NodeKind, child, list_begin, list_end,
@@ -76,6 +76,10 @@ pub struct ClosureInfo {
 
 pub static var CLOSURES: *ClosureInfo = 0 as *ClosureInfo;
 pub static var CLOSURE_COUNT: i64 = 0;
+
+// (0.25) The closure main's body became (main_result_wrapper), or 0: the
+// own pass names it 'main'.
+pub static var MAIN_CLOSURE: i64 = 0;
 static var CLOSURE_CAP: i64 = 0;
 // The Fn nodes of the closures' functions, in check order: finish_program
 // appends them to the program after the instances.
@@ -534,6 +538,11 @@ fn finish_closure(id: i64, fn_body: i64, params: *i64, tys: *i64, result: i64) {
                 NODES[value].op = Tok::Amp;
                 NODES[value].b = ident;
                 NODES[value].ty = ptr_to(LOCALS[local].ty);
+                // (0.25) a capture it writes: an inout access, held while the
+                // closure lives (conventions.md §5.4)
+                if CAPTURE_LIST.data[CLOSURES[id].captures + 2 * j + 1] == 2 {
+                    NODES[value].p |= crate::front::ast::NODE_REF_MUT;
+                }
             }
             let init = new_node(NodeKind::FieldInit, start, end);
             NODES[init].a = LOCALS[local].name;
@@ -615,55 +624,16 @@ fn closure_name(n: i64, sig: i64) -> i64 {
             file += 1;
         }
         // (0.16: the line from the file's line starts, by halves; it was
-        // counted from the file's start for each closure)
-        let lines = file_lines(file);
-        var lo = 0;
-        var hi = (*lines).count;
-        while hi - lo > 1 {
-            let mid = (lo + hi) / 2;
-            if (*lines).data[mid] <= pos {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        let line = lo + 1;
-        let col = pos - (*lines).data[lo] + 1;
+        // counted from the file's start for each closure. 0.25: diag's
+        // line index, shared)
+        var col = 1;
+        let line = file_line_col(file, pos, &col);
         buf_str(out, FILES[file].path);
         buf_byte(out, ':');
         buf_int(out, line);
         buf_byte(out, ':');
         buf_int(out, col);
         intern(buf_slice(out))
-    }
-}
-
-// (0.16) Per file (FILES index), the positions its lines start at, made
-// the first time a closure in it is named (again when the sources change).
-static var FILE_LINES: *IntVec = 0 as *IntVec;
-static var FILE_LINES_COUNT: i64 = 0;
-static var FILE_LINES_SRC: *u8 = 0 as *u8;
-
-fn file_lines(file: i64) -> *IntVec {
-    unsafe {
-        if FILE_LINES_SRC != SRC || FILE_LINES_COUNT < FILE_COUNT {
-            free(FILE_LINES as *u8);
-            FILE_LINES = alloc_zeroed(FILE_COUNT * size_of(IntVec)) as *IntVec;
-            FILE_LINES_COUNT = FILE_COUNT;
-            FILE_LINES_SRC = SRC;
-        }
-        let lines = &FILE_LINES[file] as *IntVec;
-        let start = FILES[file].start;
-        if (*lines).count == 0 || (*lines).data[0] != start {
-            (*lines).count = 0;
-            (*lines).push(start);
-            for i in start..FILES[file].end {
-                if SRC[i] == '\n' {
-                    (*lines).push(i + 1);
-                }
-            }
-        }
-        lines
     }
 }
 
@@ -681,8 +651,13 @@ fn rewrite_use(id: i64, used: i64, local: i64, env: i64, env_ty: i64) {
             let k = NODES[node].kind;
             if k == NodeKind::Unary && NODES[node].b > 0 {
                 node = NODES[node].b;
-            } else if k == NodeKind::Index && NODES[node].a > 0 {
+            } else if (k == NodeKind::Index || k == NodeKind::MethodCall) && NODES[node].a > 0 {
+                // (0.25: a container given as a slice or as text, `first(v)`,
+                // is `v.as_slice()`: check_mode::coerce_text)
                 node = NODES[node].a;
+            } else if k == NodeKind::Call && NODES[node].count > 0 {
+                // (0.25: `v[..]` of a Vec is std's `as_slice(&v)` once checked)
+                node = child(node, 0);
             } else {
                 break;
             }
@@ -779,13 +754,22 @@ pub fn note_local_write(local: i64) {
             let id = CLOSURE_STACK.data[i];
             if local < CLOSURES[id].mark {
                 CLOSURES[id].writes = true;
+                // (0.25) a capture by reference it writes: 2, its env holds
+                // an inout access (finish_closure)
+                var w = CLOSURES[id].caps;
+                while w < CAPS.count {
+                    if CAPS.data[w] == local && CAPS.data[w + 1] == 1 {
+                        CAPS.data[w + 1] = 2;
+                    }
+                    w += 2;
+                }
                 if LOCALS[local].is_sink {
                     // (0.20: a sink parameter written: by reference)
                     var k = CLOSURES[id].caps;
                     while k < CAPS.count {
                         if CAPS.data[k] == local
                             && (NODES[CLOSURES[id].node].c & CLOSURE_MOVE) == 0 {
-                            CAPS.data[k + 1] = 1;
+                            CAPS.data[k + 1] = 2;
                         }
                         k += 2;
                     }
@@ -824,7 +808,8 @@ fn upgrade_captures(id: i64, n: i64) {
                 let local = NODES[place].y;
                 var i = CLOSURES[id].caps;
                 while i < CAPS.count {
-                    if CAPS.data[i] == local {
+                    // (2, a capture it writes, stays)
+                    if CAPS.data[i] == local && CAPS.data[i + 1] == 0 {
                         CAPS.data[i + 1] = 1;
                     }
                     i += 2;
@@ -939,6 +924,24 @@ pub fn closure_of_type(t: i64) -> i64 {
     }
 }
 
+// (0.25) Whether closure type t holds an inout access: a capture by
+// reference it writes (conventions.md §5.4: held from the closure's
+// creation to its last use; the closure is a move-only view).
+pub fn closure_holds_inout(t: i64) -> bool {
+    unsafe {
+        let c = closure_of_type(t) - 1;
+        if c < 0 {
+            return false;
+        }
+        for j in 0..CLOSURES[c].capture_count {
+            if CAPTURE_LIST.data[CLOSURES[c].captures + 2 * j + 1] == 2 {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 // The fn type of closure c (its id): `fn(params) -> result`, without the
 // env.
 pub fn closure_sig(c: i64) -> i64 {
@@ -963,6 +966,12 @@ pub fn closure_call(n: i64, ty: i64) -> i64 {
             err_end();
         }
         let callee = NODES[n].a;
+        if (NODES[CLOSURES[c].node].c & CLOSURE_MOVE) != 0 && CLOSURES[c].writes {
+            // (0.25) a sink closure that changes what it owns (FnMut): a
+            // call changes the closure, which must be mutable: a var, an
+            // inout or sink parameter, not a let binding or a let access
+            crate::front::check::assign::check_closure_call_place(callee, n);
+        }
         let mark = list_begin();
         if CLOSURES[c].capture_count > 0 {
             let env = new_node(NodeKind::Unary, NODES[callee].start, NODES[callee].end);

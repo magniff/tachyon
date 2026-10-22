@@ -41,24 +41,28 @@ stack, and 160 bytes in the line.
 
 ```tach
 fn main() -> i32 {
-    var mem = [0u8; 512];
-    let fb = FixedBuf::new(mem[..]);
-    var line: Vec<u8, FixedBuf> = Vec::with_capacity_in(160, fb);
-    var stack: Vec<i64, FixedBuf> = Vec::new_in(fb);
+    var line_mem = [0u8; 184];
+    var stack_mem = [0u8; 328];
+    let line_fb = FixedBuf::new(&line_mem[..]);
+    let stack_fb = FixedBuf::new(&stack_mem[..]);
+    var line: Vec<u8, FixedBuf> = Vec::with_capacity_in(160, line_fb);
+    var stack: Vec<i64, FixedBuf> = Vec::new_in(stack_fb);
 ```
 
-`FixedBuf::new(mem[..])` makes an allocator over the array: it keeps
-its count of the bytes used in the first 16, and bumps through the
-rest. Like an arena, it frees only its last block (or grows it in
-place): so the line, whose room is fixed, comes first, and the stack,
-which grows, comes last and grows in place: 4 numbers, 8, 16, 32. At 32
-(256 bytes) the next size needs 256 bytes more, and 80 are left.
+`FixedBuf::new(&line_mem[..])` makes an allocator over the array: it
+keeps its count of the bytes used in the first 16 (after aligning to
+8), and bumps through the rest. Like an arena, it frees only its last
+block (or grows it in place): the stack grows in place, 4 numbers, 8,
+16, 32. At 32 (256 bytes) the next size needs 256 bytes more, and its
+buffer has no room for them.
 
-The `FixedBuf` handle is copied into each `Vec` (it is two words); the
-copies share the count, which lives in `mem`. `mem` must outlive every
-container on it, and nothing checks that in 0.16 (a `FixedBuf` over a
-local array, returned from its function, is a dangling pointer): keep
-the buffer and its containers in one function, as here.
+`&` marks that the allocator changes the array: a `FixedBuf` holds its
+memory inout (0.25), and a container on it holds it through its
+allocator. While the line lives, `line_mem` is not read, written or
+dropped another way (`own.conflict`), and neither the allocator nor the
+line can outlive it (`own.escape`): so the line and the stack, alive
+together, each have a buffer of their own. The final count adds their
+capacities, as the handles were moved into the two `Vec`s.
 
 ## Running out, handled
 

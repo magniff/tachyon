@@ -12,7 +12,7 @@ them:
 | `alloc(Gpa)`, `alloc(Arena)`, `alloc(extern)` | allocating from that allocator type (`extern`: C's malloc) |
 | `io` | a C function that reads or writes: `write`, `read`, stdio |
 | `global` | reading or writing a `static var`, taking its address |
-| `panic` | a checked index or slice, `unwrap`, `as E`, std's panic |
+| `panic` | a checked index or slice, `unwrap`, `as E`, std's panic, an `assert` (but `assert(true)`), a requires (in the caller), an ensures |
 | `diverge` | `while`, `loop`, recursion: it may not return (a counted `for` returns) |
 | `unsafe` | unsafe operations in its own body (not its callers') |
 
