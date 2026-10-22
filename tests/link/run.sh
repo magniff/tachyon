@@ -23,6 +23,7 @@
 # back::objfile::link_macho):
 #   internal    the executable runs, its signature verifies, and the same
 #               input gives the same bytes
+#   default     it is the default
 #   internal-ld a program it does not take (an import libSystem lacks) is
 #               linked by ld, which says why it fails
 #   libsystem   libSystem has every name of link_macho's LIBSYSTEM
@@ -50,7 +51,11 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/vole-link.XXXXXX")
 WORK=$(cd "$WORK" && pwd -P)
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
-unset VOLE_LINKER VOLE_CC
+unset VOLE_CC
+# (the system's linker, run directly, unless a check says otherwise: on
+# aarch64 macOS the default is the compiler's own)
+VOLE_LINKER=system
+export VOLE_LINKER
 VOLE_CODE_CACHE=off
 export VOLE_CODE_CACHE
 VOLE_LINK_CACHE="$WORK/cache"
@@ -202,6 +207,13 @@ if [ "$(uname -s)-$(uname -m)" = Darwin-arm64 ]; then
         pass internal
     else
         fail internal "--linker=internal: $(cat build.out); $(codesign -v prog 2>&1)"
+    fi
+
+    # default: the compiler's own linker, without --linker
+    if env -u VOLE_LINKER "$COMPILER" hello.vl -o prog >build.out 2>&1 && cmp -s prog prog.internal; then
+        pass default
+    else
+        fail default "without --linker, not the internal linker's bytes: $(cat build.out)"
     fi
 
     # internal-ld
