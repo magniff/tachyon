@@ -171,7 +171,7 @@ extern "C" fn accumulate(value: i64, ctx: *u8) -> i32 {
     0 // keep going
 }
 
-fn stats(inout self) -> Stats {
+fn stats(self) -> Stats {
     var s = Stats { count: 0, sum: 0, min: i64::MAX, max: i64::MIN };
     unsafe { c::ring_each(self.ring, accumulate, &s as *u8); }
     s
@@ -190,22 +190,29 @@ struct Window { ring: *c::Ring }
 impl Window {
     fn new(cap: i64) -> Option<Window> { ... }
     fn push(inout self, value: i64) { unsafe { c::ring_push(self.ring, value); } }
-    fn get(inout self, i: i64) -> i64 { ... }   // checks i first
-    fn free(inout self) { ... }
+    fn get(self, i: i64) -> i64 { ... }   // checks i first
+}
+
+impl Drop for Window {
+    fn drop(inout self) {
+        unsafe { c::ring_free(self.ring); }
+    }
 }
 ```
 
 All the `unsafe` lives in the methods, each of which keeps the C side's
 rules (the ring is non-NULL, the index is in range). `main` uses only
 safe code: `Window::new(size)` returns `None` for a bad size or a failed
-allocation, and `defer window.free();` releases the C memory on every way
-out of `main`.
+allocation, and the `Drop` impl releases the C memory when `window` goes
+out of scope, on every way out of `main`. A type with a `Drop` is
+move-only, so no copy of the `*c::Ring` can be freed twice or used after
+the free.
 
 ### A vole slice to C
 
 ```tach
 let word = "vole";
-let from_c = unsafe { c::fnv1a(word.ptr, word.len as u64) };
+let from_c = unsafe { c::fnv1a(word.ptr, word.len() as u64) };
 println(f"fnv1a(\"{word}\"): C {from_c:08x}, vole {fnv1a(word):08x}");
 ```
 
@@ -230,7 +237,7 @@ in C), printed in hex with `{x:08x}`.
   line; or compile vole to an object (`-o main.o`) and link it
   yourself.
 - **Ownership**: C frees what C allocated (`ring_free`); wrap it in a
-  vole type with a `free` method and `defer` it.
+  vole type whose `Drop` calls it.
 
 ## Language features
 
@@ -238,9 +245,9 @@ in C), printed in hex with `{x:08x}`.
   `--emit-header`, linking: `volec guide c-interop`
 - `unsafe` blocks kept inside methods, raw pointers, casts of `*u8`:
   `volec guide unsafe`
-- `impl` blocks and `self: *Window` methods: `volec guide syntax`
+- `impl` blocks, `self` and `inout self` methods, `impl Drop`: `volec guide syntax`, `volec guide memory`
 - `Option` from a constructor, `parse_int(..).unwrap_or(0)`, `Scanner` and
-  `read_stdin`: `volec guide conversions`, `volec guide std`
-- `defer` for C resources: `volec guide memory`
+  `read_stdin_in`: `volec guide conversions`, `volec guide std`
+- `Drop` for C resources: `volec guide memory`
 - f-strings with width and hex (`{x:<4}`, `{h:08x}`, `{m:.2}`):
   `volec guide formatting`
