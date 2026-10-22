@@ -339,8 +339,7 @@ fn trims_punctuation(gpa: Gpa) {
 
 // Every word is counted once: the counts add up to the number of words.
 #[property]
-fn counts_add_up(bytes: Vec<u8>) {
-    let gpa = bytes.allocator(); // the generated Vec's allocator
+fn counts_add_up(bytes: Vec<u8>, gpa: Gpa) {
     let pieces: [str; 4] = ["a", "b", " ", "\n"];
     var text = String::new_in(gpa);
     for b in bytes {
@@ -696,9 +695,8 @@ and runs it on each. The test turns the bytes into a text of "a", "b",
 spaces and newlines, counts it both ways, and checks that the word
 counts in the map add up to the number of words `count` found. If they
 ever didn't, `volec test` would shrink the input to a small one that
-still fails, and print it. (A property can't take an allocator as a
-parameter, since there's nothing to generate; `bytes.allocator()` is
-the allocator the generated `Vec` lives on.)
+still fails, and print it. Its `gpa` is the test's allocator, as a
+`#[test]`'s is; only `bytes` is generated.
 
 ```console
 $ volec test

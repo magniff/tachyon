@@ -183,7 +183,8 @@ fn main(gpa: Gpa) {
 ```err
 error[own.conflict]: 'v.push(x)' may change the elements of 'v' while the 'for' at main.vl: line 5, column 5 iterates over them
  --> main.vl: line 6, column 9
-  = help: loop over the indexes (the loop sees the elements present when it starts), or collect the new elements and append them after the loop | try: volec edit patch main --old 'for x in v {' --new 'for i in 0..v.len() { let x = v[i];'
+  = help: loop over the indexes (the loop sees the elements present when it starts), or collect the new elements and append them after the loop
+  = try: volec edit patch main --old 'for x in v {' --new 'for i in 0..v.len() { let x = v[i];'
 ```
 
 Pushing can move a Vec's elements to a bigger block of memory, and the
@@ -316,7 +317,7 @@ fn main() {
 ```err
 error[type error]: no method 'trim' on type '[u8]'
  --> main.vl: line 3, column 13
-  = help: `[u8]` is bytes; text is `str` (UTF-8), which has it: a literal is a `str` where one goes (`let s: str = "..";`, `fn f(s: &str)`); bytes become one by `str::from_utf8(b)?`
+  = help: `[u8]` is bytes; text is `str` (UTF-8), which has it: a literal is a `str` where one goes (`let s: str = "..";`, `fn f(s: str)`); bytes become one by `str::from_utf8(b)?`
   = try: trim(line)
   = try: volec fix --suggested main.vl
 ```
@@ -479,7 +480,7 @@ fn main(gpa: Gpa) {
 ```err
 error[type error]: expected 'String', got '[u8]'
  --> main.vl: line 4, column 25
-  = help: a String owns its text, on an allocator: `String::from_in(s, gpa)`; a `str` is a view of one (`&str` parameters take both)
+  = help: a String owns its text, on an allocator: `String::from_in(s, gpa)`; a `str` is a view of one (a `str` parameter takes both)
   = try: String::from_in("ada", gpa)
 ```
 

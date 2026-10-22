@@ -30,9 +30,9 @@ fn largest<T: Ord>(items: [T]) -> T {
 fn main() {
     let scores = [3, 9, 4];
     let words: [str; 3] = ["pear", "fig", "plum"];
-    println(largest(scores[..]));
-    println(largest(words[..]));
-    println(largest::<f64>([1.5, 0.5][..]));
+    println(largest(scores));
+    println(largest(words));
+    println(largest::<f64>([1.5, 0.5]));
 }
 ```
 
@@ -52,47 +52,15 @@ later in the chapter.
 At each call, the compiler works out `T` from the arguments: `i64` for
 the scores, `str` for the words. When you want to say it yourself, write
 it after `::`, as in `largest::<f64>(...)`. You met this *turbofish* in
-chapter 2, with `parse::<i64>()`.
+chapter 2, with `parse::<i64>()`. As in chapter 7, an array or a `Vec`
+goes where a slice is wanted as it is: `largest(scores)` reads the
+array's elements in place, and works out `T` from them.
 
 A generic function is a template. For each type it's used with, the
 compiler makes a separate copy, with `T` replaced by that type, and
 compiles it as if you had written it by hand. So `largest::<i64>` is as
 fast as a `largest` written only for `i64`s, and there's nothing to look
 up while the program runs.
-
-### Arrays and generic slices
-
-Notice the `[..]` after `scores`. In chapter 7, a function taking
-`[i64]` accepted an array as it was. A generic one doesn't yet:
-
-```vole largest.vl
-fn largest<T: Ord>(items: [T]) -> T {
-    var best = items[0];
-    for x in items {
-        if x > best {
-            best = x;
-        }
-    }
-    best
-}
-
-fn main() {
-    let scores = [3, 9, 4];
-    println(largest(scores));
-}
-```
-
-```err
-error[type error]: cannot infer type parameter 'T' of 'largest'
- --> largest.vl: line 13, column 13
-  = help: nothing here says what it is: give the variable a type (`let x: TYPE = ...`), or write the type arguments (try:, with the parameter's type for its name)
-  = try: largest::<T>(...)
-```
-
-The compiler can't work out `T` from an array (or from a `Vec`) passed
-where a generic slice is expected. The suggestion in the message isn't
-the easy fix here. Pass a slice instead: `scores[..]` for an array,
-`v.as_slice()` for a `Vec`. This is likely to improve.
 
 ## Generic types
 
@@ -331,7 +299,7 @@ struct Point {
 
 fn main() {
     let points = [Point { x: 1, y: 2 }, Point { x: 3, y: 0 }];
-    println(largest(points[..]).x);
+    println(largest(points).x);
 }
 ```
 

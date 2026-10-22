@@ -219,8 +219,9 @@ not "valid".
 > **If you know Rust:** the `&` in `&xs as *i64` isn't a reference
 > being cast. Vole has no references to store. `&place` is the marker
 > for "the callee may change this", and where a raw pointer is wanted,
-> it converts to the place's address (the call takes an exclusive loan
-> of `xs` while it runs).
+> it is simply the place's address. It takes no inout access, so it
+> works on a `let`; writing through it to a `let` would be the unsafe
+> code's mistake.
 
 ## unsafe fn and its contract
 

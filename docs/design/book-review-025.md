@@ -1,5 +1,15 @@
 # Editorial review of the Vole Book (book-final)
 
+**Phase 3 (on release-0.25 2d6d1211): applied.** Every new diagnostic is
+pasted in. P1 (fixer3's closure wording, now in the compiler), P2, P3,
+P5, P6, P7 and P8 are done, as is ch 8's `FixedBuf::new(&mem[..])`.
+P4's sessions pass unchanged. Not applied: P9 and P10 (optional), and
+P11 (timings need an idle machine; they remain labelled as one busy
+machine's). Still open: 7:695 fails in std, not in the book.
+`BTreeMap<i64, str>::range` hits own.views in
+`BTreeRaw::iter_between` (`#[views(self)]` but it returns a view of
+`front`). The fix goes in std.
+
 A working file for the integrator, not part of the book. Line numbers
 are book-final's as of this review.
 

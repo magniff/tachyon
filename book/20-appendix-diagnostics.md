@@ -129,6 +129,7 @@ own.static
 own.views
 own.drop_view
 own.readonly
+own.drop_call
 ```
 
 and the `sync` family:
@@ -140,10 +141,12 @@ sync.not_send
 sync.not_sync
 sync.global
 sync.scope_write
+sync.scope_escape
 sync.scope_shared_write
 sync.scope_local
 sync.scope_spawn
 sync.spawn_closure
+sync.view_item
 ```
 
 `volec explain --list` without the `grep` prints every code, the tools'

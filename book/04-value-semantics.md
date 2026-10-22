@@ -123,7 +123,8 @@ fn main(gpa: Gpa) {
 ```err
 error[own.moved]: 'list' is used here after it moved at 6:18
  --> playlist.vl: line 7, column 5
-  = help: use it before the move, pass a copy where it moves ('.clone()'), or let the callee borrow it: a let parameter ('x: T'), not 'sink' | try: volec edit patch playlist.vl:6 --old 'let backup = list;' --new 'let backup = list.clone();'
+  = help: use it before the move, pass a copy where it moves ('.clone()'), or let the callee read it: a let parameter ('x: T'), not 'sink'
+  = try: volec edit patch playlist.vl:6 --old 'let backup = list;' --new 'let backup = list.clone();'
 ```
 
 `let backup = list;` *moved* the list into `backup`. After a move, the
@@ -290,9 +291,10 @@ fn main(gpa: Gpa) {
 ```
 
 ```err
-error[own.readonly]: writes through 'list', a 'let Vec<Song>', which is read-only (let: borrowed to be read)
+error[own.readonly]: writes through 'list', a 'let Vec<Song>', which is read-only (let: read-only)
  --> playlist.vl: line 4, column 5
-  = help: take it inout ('x: inout T', called with '&x') to change it | try: volec refactor signature add --type list 'inout Vec<Song>'
+  = help: take it inout ('x: inout T', called with '&x') to change it
+  = try: volec refactor signature add --type list 'inout Vec<Song>'
 ```
 
 The help says how to fix it, and that's the next convention.
@@ -347,7 +349,27 @@ fn main() {
 ```
 
 The variable you pass with `&` must be one you're allowed to change,
-so it's a `var` (or an inout parameter of your own).
+so it's a `var` (or an inout parameter of your own). A `let` can't be
+lent to be changed:
+
+```vole
+fn bump(count: inout i64) {
+    count += 1;
+}
+
+fn main() {
+    let plays = 0;
+    bump(&plays);
+    println(f"{plays}");
+}
+```
+
+```err
+error[own.readonly]: '&plays' changes 'plays', a let binding: it is read-only
+ --> main.vl: line 7, column 10
+  = help: declare it `var` to change it
+  = try: var plays = ...
+```
 
 The compiler checks the `&` both ways. Leave it off for an inout
 parameter:
@@ -426,7 +448,7 @@ fn main(gpa: Gpa) {
 ```
 
 ```err
-error[own.conflict]: 'list' is borrowed mutably by '&list' and mutably again by '&list' in the same call
+error[own.conflict]: 'list' has an inout access, '&list', and another one, '&list', in the same call
  --> playlist.vl: line 12, column 23
   = help: pass disjoint places ('&a.x, a.y'), copy the plain value out first, or for two elements of one Vec use 'v.swap(i, j)'
 ```
@@ -497,7 +519,7 @@ fn main(gpa: Gpa) {
 ```
 
 ```err
-error[own.conflict]: 'list' is borrowed mutably by '&list' and viewed by 'list[..]' in the same call
+error[own.conflict]: 'list' has an inout access, '&list', and a view, 'list[..]', in the same call
  --> playlist.vl: line 12, column 20
   = help: pass disjoint places ('&a.x, a.y'), copy the plain value out first, or for two elements of one Vec use 'v.swap(i, j)'
 ```
@@ -788,7 +810,8 @@ fn main(gpa: Gpa) {
 ```err
 error[own.conflict]: 'add(&list, Song { title: "Cheek to Cheek", seconds: 300 })' may change 'list' while 'start' (playlist.vl: line 15, column 9) views it; 'start' is used at playlist.vl: line 17, column 13
  --> playlist.vl: line 16, column 5
-  = help: use the view before the change, keep an index instead of a view, or keep a copy | try: volec query own playlist.vl:17:13
+  = help: use the view before the change, keep an index instead of a view, or keep a copy
+  = try: volec query own playlist.vl:17:13
 ```
 
 It's the same exclusivity rule as before, applied to views: while

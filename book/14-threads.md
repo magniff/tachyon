@@ -520,15 +520,14 @@ fn main() {
 ```
 
 ```err
-error[sync.global]: 'thread::spawn' runs a closure on another thread, but it reaches a static mut (its effects have `global`): a static mut is for the main thread
+error[sync.global]: 'thread::spawn' runs a closure on another thread, but it reaches a static var (its effects have `global`): a static var is for the main thread
  --> main.vl: line 10, column 13
-  = help: make the static an atomic or a Mutex without `mut` (`static N: AtomicI64 = AtomicI64 { v: 0 };`), a #[thread_local], or pass the data in | try: volec query effects main.vl:10 --why global
+  = help: make the static an atomic or a Mutex, not `var` (`static N: AtomicI64 = AtomicI64 { v: 0 };`), a #[thread_local], or pass the data in | try: volec query effects main.vl:10 --why global
 ```
 
 The compiler uses the closure's effects (chapter 12) to find this: the
 closure calls `bump`, `bump` has the `global` effect, and that's
-enough, however deep the call. (The message says "static mut", Rust's
-name for what vole calls a `static var`.)
+enough, however deep the call.
 
 The help lists the fixes. A `static` atomic or mutex, without `var`,
 can be shared, since it orders its own changes. Or the variable can be a

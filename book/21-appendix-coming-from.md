@@ -230,8 +230,8 @@ fn sum_of_squares(words: [str], gpa: Gpa) -> Result<i64, str> {
 fn main(gpa: Gpa) {
     let good: [str; 3] = ["1", "2", "3"];
     let bad: [str; 2] = ["1", "two"];
-    println(f"{sum_of_squares(good[..], gpa):?}");
-    println(f"{sum_of_squares(bad[..], gpa):?}");
+    println(f"{sum_of_squares(good, gpa):?}");
+    println(f"{sum_of_squares(bad, gpa):?}");
 }
 ```
 
@@ -283,7 +283,8 @@ fn main(gpa: Gpa) {
 ```err
 error[own.moved]: 'a' is used here after it moved at 4:13
  --> main.vl: line 6, column 16
-  = help: use it before the move, pass a copy where it moves ('.clone()'), or let the callee borrow it: a let parameter ('x: T'), not 'sink' | try: volec edit patch main.vl:4 --old 'var b = a;' --new 'var b = a.clone();'
+  = help: use it before the move, pass a copy where it moves ('.clone()'), or let the callee read it: a let parameter ('x: T'), not 'sink'
+  = try: volec edit patch main.vl:4 --old 'var b = a;' --new 'var b = a.clone();'
 ```
 
 Following the `try:` line, `var b = a.clone();` makes `b` a copy, and

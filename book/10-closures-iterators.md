@@ -121,13 +121,15 @@ fn main() {
 ```err
 error[own.conflict]: 'limit = 3' writes 'limit' while 'over' (main.vl: line 3, column 9) views it; 'over' is used at main.vl: line 6, column 13
  --> main.vl: line 5, column 5
-  = help: use the view before the change, keep an index instead of a view, or keep a copy | try: volec query own main.vl:6:13
+  = help: a closure holds what it captures until its last call: move this after that call, or pass the value to the closure as a parameter instead of capturing it
+  = try: volec query own main.vl:6:13
 ```
 
 The message calls the closure a *view* of `limit`, as a slice is a view
-of a Vec: it reads something that lives somewhere else. The fix is to
-change `limit` after the closure's last use, or, if `over` should keep
-the old limit, to give it its own copy with `sink` (below).
+of a Vec: it reads something that lives somewhere else. The help gives
+the fixes: change `limit` after the closure's last call, or pass the
+limit to the closure as a parameter instead of capturing it. If `over`
+should keep the old limit, give it its own copy with `sink` (below).
 
 ### A closure that changes
 
@@ -165,15 +167,17 @@ fn main() {
 ```
 
 ```err
-error[own.conflict]: 'count' is read while 'bump' (main.vl: line 3, column 9) borrows it mutably; 'bump' is used at main.vl: line 8, column 5
+error[own.conflict]: 'count' is read while 'bump' (main.vl: line 3, column 9) has an inout access to it; 'bump' is used at main.vl: line 8, column 5
  --> main.vl: line 7, column 13
-  = help: an inout access is the only way to its place while it is used: read through it, or end it (use it for the last time) before the read | try: volec query own main.vl:8:5
+  = help: a closure holds what it captures until its last call: move this after that call, or pass the value to the closure as a parameter instead of capturing it
+  = try: volec query own main.vl:8:5
 ```
 
-"Borrows it mutably" is the compiler's way of saying `bump` holds an
-inout access to `count`. The help gives the two ways out: read `count`
-after `bump`'s last call, as the first version did, or pass the value
-to the closure as a parameter instead of capturing it. This is the
+The message says it the way this section does: `bump` has an inout
+access to `count`, until its last use on line 8. The help gives the two
+ways out: read `count` after `bump`'s last call, as the first version
+did, or pass the value to the closure as a parameter instead of
+capturing it. This is the
 same rule as everywhere else in vole: while something may change a
 value, nothing else looks at it, so nothing changes behind anyone's
 back.
@@ -324,6 +328,11 @@ time you ask. Many things give you one:
 - `m.iter()`, `m.keys()` and `m.values()` on a `HashMap`;
 - `s.split(',')`, `s.lines()`, `s.chars()` on text, from chapter 7.
 
+The items of `v.iter()`, and of a map's `iter`, `keys` and `values`,
+are the container's own elements, read in place, as `for x in v` reads
+them. To keep an owned one, a `String` say, take a copy with
+`.clone()`, as chapter 7's `sorted_counts` did with the map's words.
+
 On its own, an iterator does nothing. *Adapters* such as `map` and
 `filter` wrap it in a new iterator that changes the values or skips
 some; *consumers* such as `sum` and `count` run the whole thing and give
@@ -427,6 +436,14 @@ true false Some(1)
 - `any` and `all` ask whether some, or every, value passes a test.
 - `min`, `max`, `sum` and `count` do what they say. `min` and `max`
   return an `Option`, since the sequence may be empty.
+
+A consumer takes the iterator for good (`sink self`, chapter 4) and
+uses it up, so a chain is one value from start to end. `find`,
+`position`, `any` and `all` are different: they stop at the value that
+decides the answer, and change the iterator rather than take it
+(`inout self`), so the rest of its values are still there. To go on
+with them, keep the iterator in a `var`, as `parse` below does for
+`next`.
 
 > **If you know Rust:** these are Rust's names. `collect_in(gpa)` makes
 > a `Vec` and nothing else; there's no `collect::<HashSet<_>>()`.

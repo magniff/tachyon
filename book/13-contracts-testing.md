@@ -410,8 +410,7 @@ fn wraps_around(gpa: Gpa) {
 }
 
 #[property]
-fn pop_gives_back_what_push_put(xs: Vec<i64>) {
-    let gpa = xs.allocator();
+fn pop_gives_back_what_push_put(xs: Vec<i64>, gpa: Gpa) {
     for cap in 1..5 {
         var r = Ring::new(cap, gpa);
         var next = 0;
@@ -452,7 +451,7 @@ test ring.vl: 1 passed, 2 failed (2 #[test], 1 #[property]; -O0 and -O2 agree)
 FAIL wraps_around: ring.vl:34:9: index out of bounds: index 2, length 2
   trace: ring.vl:34 Ring::push$body < ring.vl:29 Ring::push < ring.vl:70 wraps_around
 FAIL pop_gives_back_what_push_put (property, case 5 of 100, shrunk in 226 steps): ring.vl:34:9: index out of bounds: index 1, length 1
-  trace: ring.vl:34 Ring::push$body < ring.vl:29 Ring::push < ring.vl:86 pop_gives_back_what_push_put
+  trace: ring.vl:34 Ring::push$body < ring.vl:29 Ring::push < ring.vl:85 pop_gives_back_what_push_put
   input: xs = [0, 0]
   try: volec test pop_gives_back_what_push_put --seed 0xd098fbd5a16acb77 ring.vl
 (outputs: .volec/test/O2/case-NAME.got, .err; test-NAME.got, .err)
@@ -496,8 +495,7 @@ Look at the property again:
 
 ```vole skip
 #[property]
-fn pop_gives_back_what_push_put(xs: Vec<i64>) {
-    let gpa = xs.allocator();
+fn pop_gives_back_what_push_put(xs: Vec<i64>, gpa: Gpa) {
     for cap in 1..5 {
         var r = Ring::new(cap, gpa);
         var next = 0;
@@ -534,9 +532,9 @@ and your own structs and enums can all be generated. For a type that
 needs special values, `impl std::Arbitrary` gives it a generator of its
 own (`volec guide testing` shows how).
 
-A property can't take `gpa: Gpa`, the way a test can, so this one
-borrows the allocator of its generated `Vec`: `xs.allocator()`. That's
-a quirk of the current release.
+A property may take `gpa: Gpa`, as a test can. That parameter is the
+test's allocator, not a generated input, so it isn't shown among the
+inputs when a case fails.
 
 A function with an `ensures` gets tested as a property even if you
 don't write one: `volec test` generates its arguments, keeps the ones

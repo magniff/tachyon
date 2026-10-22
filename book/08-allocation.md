@@ -506,7 +506,7 @@ fn main() {
     ];
     var mem = [0u8; 256];
     for line in requests {
-        let fb = FixedBuf::new(mem[..]);
+        let fb = FixedBuf::new(&mem[..]);
         let reply = handle(line, fb);
         println(f"{line:<24} -> {reply} ({fb.used()} bytes)");
     }
@@ -521,7 +521,10 @@ out of memory
 ```
 
 `var mem = [0u8; 256];` is 256 bytes on `main`'s stack, and
-`FixedBuf::new(mem[..])` makes an allocator that hands them out. Each
+`FixedBuf::new(&mem[..])` makes an allocator that hands them out. The
+`&` is chapter 4's: the `FixedBuf` writes what it allocates into `mem`,
+so it holds an inout access to it, and while the `FixedBuf` and what it
+allocated are in use, nothing else can read or change `mem`. Each
 request gets a fresh `FixedBuf` over the same bytes, because the last
 request's reply and parts were dropped at the end of its round.
 
@@ -592,7 +595,7 @@ fn main() {
     ];
     var mem = [0u8; 256];
     for line in requests {
-        let fb = FixedBuf::new(mem[..]);
+        let fb = FixedBuf::new(&mem[..]);
         let reply = handle(line, fb);
         println(f"{line:<24} -> {reply} ({fb.used()} bytes)");
     }
