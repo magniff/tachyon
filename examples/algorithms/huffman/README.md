@@ -88,7 +88,7 @@ while heap.len() > 1 {
 }
 ...
 while let Some((node, depth)) = stack.pop() {
-    let (left, right) = kids.get(node);
+    let (left, right) = kids[node];
     if left < 0 { lengths[node] = depth; } else { ... }
 }
 ```
@@ -99,7 +99,7 @@ a `Result`: a code longer than the decoder's table allows is an error,
 `HuffError::CodeTooLong`, which `?` passes up to `main`:
 
 ```tach
-std::sort(order.as_slice());                   // by the derived Ord
+std::sort(order.as_mut_slice());                // by the derived Ord
 let max_len = order.last().map(|e| e.len).unwrap_or(0);
 if max_len > MAX_BITS { return Err(HuffError::CodeTooLong(max_len)); }
 ...
@@ -134,7 +134,7 @@ casts:
 ```tach
 for _ in 0..count {
     while have <= 56 {                             // refill a byte at a time
-        let byte = if pos < bits.len { bits[pos] } else { 0 };
+        let byte = if pos < bits.len() { bits[pos] } else { 0 };
         acc = (acc << 8) | byte;
         pos += 1;
         have += 8;
@@ -145,10 +145,10 @@ for _ in 0..count {
 }
 ```
 
-**Checking and reporting.** `round_trip(text, table: true)` uses a
+**Checking and reporting.** `round_trip(text, gpa, table: true)` uses a
 named argument for its defaulted `table` parameter. The first byte that
 differs after the round trip, if any, is found with
-`(0..text.len).position(..)` and returned as `HuffError::Mismatch`;
+`(0..text.len()).position(..)` and returned as `HuffError::Mismatch`;
 `main` returns `Result<(), HuffError>`, so an error prints
 `Error: Mismatch(...)` and exits with status 1. The total bit count is
 a `zip` of the lengths and counts folded into a sum; the entropy calls
@@ -211,7 +211,7 @@ The vole version checks its indexes and grows its output `Vec` with
 `push`; the C one writes into preallocated arrays unchecked.
 
 The encoder was first written with a `BitWriter { out, acc, bits }`
-struct and a `put(self: *BitWriter, code, len)` method: 11.0 ms, because
+struct and a `put(inout self, code, len)` method: 11.0 ms, because
 the accumulator then lives in the struct, in memory, instead of in a
 register. Keeping the hot state in locals of the loop's function is the
 fix (in C too, where the compiler has more freedom to promote it).

@@ -148,13 +148,13 @@ closure captures and changes in place:
 
 ```tach
 var sorted = false;
-var by_sort = ranks("sort", data.as_slice(), ks[..], |s, k| {
+let by_sort = ranks("sort", data.as_slice(), ks[..], |s, k| {
     if !sorted {
         std::sort(s);
         sorted = true;
     }
     s[k]
-});
+}, gpa);
 ```
 
 The answers are compared as whole `Vec`s (`by_quick != by_sort`
@@ -222,7 +222,6 @@ of the hand-specialized C, with every index checked. `std::sort` beats
 | closures as `FnMut` arguments, a `var` captured and changed | `ranks`, `main` | `volec guide closures` |
 | iterators: ranges as values, `map`, `collect`, `enumerate` | `ranks`, `main` | `volec guide iterators` |
 | `clone()` of a `Vec`, `==` / `!=` on `Vec` contents | `check_median`, `main` | `volec guide formatting`, `guide std` |
-| `defer` in a loop body | `main` | `volec guide memory` |
 | f-strings with alignment, an `if` inside a hole | output | `volec guide formatting` |
 
 ## Try

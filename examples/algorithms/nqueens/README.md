@@ -154,6 +154,7 @@ about 0.4 s, n = 16 about 2.5 s.
 | feature | where | guide |
 |---|---|---|
 | unsigned integers, `~`, `<<`, `>>`, `^=`, defined wrapping | `count` | `volec guide types` |
+| `std::trailing_zeros`: a set bit's column (an instruction on AArch64) | `first` | `volec guide std` |
 | recursion, early `return` | `count`, `first` | `volec guide syntax` |
 | arrays as values, `a[..]` as a slice written through | `main`, `first` | `volec guide types` |
 | `const` arrays | `KNOWN` | `volec guide syntax` |
