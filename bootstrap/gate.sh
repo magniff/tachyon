@@ -304,9 +304,10 @@ find_previous_release() {
     fp=""
     for tag in $(sh "$ROOT/bootstrap/release-tags.sh"); do
         for b in $BOOT_CACHES; do
-            for p in "$b"/"$HOST"/"$tag"-*/volec; do
+            # (0.24: the releases up to 0.23 are tachyonc, releases.toml's bin)
+            for p in "$b"/"$HOST"/"$tag"-*/volec "$b"/"$HOST"/"$tag"-*/tachyonc; do
                 [ -x "$p" ] || continue
-                case "$p" in *-"$head"/volec) continue ;; esac
+                case "$p" in *-"$head"/volec|*-"$head"/tachyonc) continue ;; esac
                 fp=$p
                 break 2
             done

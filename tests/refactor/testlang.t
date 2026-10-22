@@ -6,22 +6,22 @@
 ## The summary first, then one line per failure (and its trace, input,
 ## try:).
 $ test --timeout 5
-test main.vl: 7 passed, 4 failed, 1 new snapshot (1 case, 10 contracts; -O0 and -O2 agree)
+test main.vl: 7 passed, 4 failed, 1 new snapshot (1 case, 5 #[test], 4 #[property], 1 contract; -O0 and -O2 agree)
 FAIL gap_needs_two: checks.vl:14:8: index out of bounds: index 1, length 1
   trace: checks.vl:14 checks::gap_needs_two
 FAIL keeps_a_buffer: check-alloc: 1 block of Gpa not freed (14 bytes): block #2 (14 bytes), allocated at checks.vl:22:5
-FAIL bubble_sorts (contract, case 11 of 100, shrunk in 8 steps): not sorted
+FAIL bubble_sorts (property, case 11 of 100, shrunk in 8 steps): not sorted
   input: v = [1, 0]
   try: volec test bubble_sorts --seed 0xf788dd27897d1fed main.vl
-FAIL forgets_its_input (contract, case 4 of 100, shrunk in 1 step): check-alloc: 1 block of Gpa not freed by the case (32 bytes): block #11 (32 bytes), allocated at <test>:106:21
+FAIL forgets_its_input (property, case 4 of 100, shrunk in 1 step): check-alloc: 1 block of Gpa not freed by the case (32 bytes): block #11 (32 bytes), allocated at <test>:106:21
   input: v = [0]
   try: volec test forgets_its_input --seed 0xaf47b961b6c073b main.vl
 (outputs: .volec/test/O2/case-NAME.got, .err; test-NAME.got, .err)
 [exit 1]
 ## a property's failure again, from its seed
 $ test bubble_sorts --seed 0xf788dd27897d1fed
-test main.vl: 0 passed, 1 failed (1 contract; -O0 and -O2 agree)
-FAIL bubble_sorts (contract, case 11 of 100, shrunk in 8 steps): not sorted
+test main.vl: 0 passed, 1 failed (1 #[property]; -O0 and -O2 agree)
+FAIL bubble_sorts (property, case 11 of 100, shrunk in 8 steps): not sorted
   input: v = [1, 0]
   try: volec test bubble_sorts --seed 0xf788dd27897d1fed main.vl
 (outputs: .volec/test/O2/case-NAME.got, .err; test-NAME.got, .err)
@@ -30,20 +30,20 @@ FAIL bubble_sorts (contract, case 11 of 100, shrunk in 8 steps): not sorted
 ## writes it
 % printf 'Range { lo: 0, hi: 9 }\n' > tests/snapshots/checks__span_snapshot__1.snap
 $ test span
-test main.vl: 0 passed, 1 failed (1 contract; -O0 and -O2 agree)
+test main.vl: 0 passed, 1 failed (1 #[test]; -O0 and -O2 agree)
 FAIL span_snapshot: snapshot differs: tests/snapshots/checks__span_snapshot__1.snap line 1: 'Range { lo: 0, hi: 9 }' expected, got 'Range { lo: -2, hi: 9 }'
   try: volec test span_snapshot --accept main.vl
 (outputs: .volec/test/O2/case-NAME.got, .err; test-NAME.got, .err)
 [exit 1]
 $ test span --accept
-test main.vl: 1 passed (1 contract; -O0 and -O2 agree)
+test main.vl: 1 passed (1 #[test]; -O0 and -O2 agree)
 % cat tests/snapshots/checks__span_snapshot__1.snap
 Range { lo: -2, hi: 9 }
 $ test span
-test main.vl: 1 passed (1 contract; -O0 and -O2 agree)
+test main.vl: 1 passed (1 #[test]; -O0 and -O2 agree)
 ## one level only
 $ test -O 2 gap_of
-test main.vl: 1 passed (1 contract; -O2 only)
+test main.vl: 1 passed (1 #[test]; -O2 only)
 ## the program built without its tests (a #[cfg(test)] module is left out)
 % "$COMPILER" main.vl -o prog && ./prog < tests/gaps.in
 5 12345
