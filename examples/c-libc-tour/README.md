@@ -134,7 +134,7 @@ with Debug: `Some("hello from setenv")`.
 
 ```tach
 var utc: c::tm = unsafe { *c::gmtime(&when) };
-var long = format_time("%A, %d %B %Y, %H:%M:%S UTC", &utc, gpa);
+let long = format_time("%A, %d %B %Y, %H:%M:%S UTC", utc, gpa);
 ```
 
 `gmtime` and `localtime` return a pointer to a static `struct tm` inside
@@ -179,25 +179,23 @@ differ between systems, so it is not written out field by field but
 made of zero bytes:
 
 ```tach
-unsafe fn zeroed_stat() -> c::stat {
-    let p = c::calloc(1, size_of(c::stat) as u64) as *c::stat;
+unsafe fn zeroed<T>() -> T {
+    let p = c::calloc(1, size_of(T) as u64) as *T;
     let value = *p;
     c::free(p as *u8);
     value
 }
 
-var st: c::stat = unsafe { zeroed_stat() };
+var st: c::stat = unsafe { zeroed() };
 if unsafe { c::stat(path.as_slice().ptr, &st) } == 0 {
-    e.size = st.st_size;
-    e.mode = st.st_mode; // u16 on macOS, u32 on Linux: it widens
+    entries[i].size = st.st_size;
+    entries[i].mode = st.st_mode; // u16 on macOS, u32 on Linux: it widens
 }
 ```
 
-A generic `zeroed<T>()` would do this for any C struct, and works when
-compiling to an object or an executable; vole 0.15's assembly output
-(`-o x.s`) cannot yet name an instance of a generic function at a C type
-(its symbol holds the C module's `<c>`), so the example keeps to one
-type. Assigning
+`zeroed` is generic: `T` comes from the type the result is given
+(`c::stat`), and the same function serves any C struct whose all-zero
+bytes are a valid value, which is its `unsafe` contract. Assigning
 `st.st_mode` to a `u32` field compiles on both systems because integer
 widening (`u16` to `u32`) is implicit and lossless; narrowing would need
 `as`.
@@ -205,7 +203,7 @@ widening (`u16` to `u32`) is implicit and lossless; narrowing would need
 ### Files, and permissions without octal
 
 `write_file` opens with `fopen`, writes the slice with
-`fwrite(text.ptr, 1, text.len as u64, f)` (a slice needs no NUL when its
+`fwrite(text.ptr, 1, text.len() as u64, f)` (a slice needs no NUL when its
 length goes along), and sets the mode with `chmod` so the umask does not
 change the output. Vole has no octal literals, so `0755` is written
 `0x1ed` in a named constant. `mkdtemp` writes the random part of the
@@ -233,9 +231,9 @@ a read-only `c"..."` literal.
 
 - `import "x.h" as c`, C structs and constants, `c"..."`, C strings:
   `volec guide c-interop`
-- `unsafe fn` with a contract, raw pointers, `&x as *u8`:
+- `unsafe fn` with a contract (a generic one, `zeroed<T>`), raw pointers, `&x as *u8`:
   `volec guide unsafe`
-- `defer`, `Buf`, freeing explicitly: `volec guide memory`
+- `defer` for C resources, `Buf` and its drop: `volec guide memory`
 - `Option` at the boundary, `{x:?}` on an `Option<Buf>`:
   `volec guide conversions`, `volec guide formatting`
 - `sort_by`, `filter`, `map`, `sum` with closures:
