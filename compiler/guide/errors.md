@@ -838,7 +838,7 @@ old = self.keys;` reads it where it is (a `let` of a part borrows it).
 ```text
 error[own.conflict] 'v.push(4)' may move v's elements while 'first' (4:17) views them; 'first' is used at 6:16
 error[own.conflict] 'v.push' may move v's elements while the 'for' at 7:1 iterates over them
-error[own.conflict] 'a' is borrowed mutably by '&a' and mutably again by '&a' in the same call
+error[own.conflict] 'a' is lent inout to '&a' and inout again to '&a' in the same call
 ```
 A view (a slice, a let or inout access, a `for` over `v`) is still used
 after `v` changes, or one value is lent inout twice at once. Use the

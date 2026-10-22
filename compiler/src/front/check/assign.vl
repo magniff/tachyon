@@ -18,8 +18,8 @@ use crate::front::closures::note_local_write;
 use crate::front::distinct::strip_distinct;
 use crate::front::lexer::Tok;
 use crate::front::types::{
-    CONSTS, REF_MUT, STATICS, SYM_STATIC, TYPES, TyKind, buf_type, is_integer, is_numeric,
-    is_pointer, is_slice, is_vector,
+    CONSTS, REF_MUT, REF_SHARED, STATICS, SYM_STATIC, TYPES, TyKind, buf_type, is_integer,
+    is_numeric, is_pointer, is_slice, is_vector,
 };
 
 fn arith_token_of_assign(op: Tok) -> Tok {
@@ -167,6 +167,26 @@ pub fn check_inout_place(target: i64, at: i64) {
     }
 }
 
+// (0.25) The call of a sink closure that changes what it owns, through
+// place `callee`: the rule of an inout access (check_inout_place), and a let
+// access (a let parameter of a generic's instance, `f: F`) is read-only
+// too: own.readonly.
+pub fn check_closure_call_place(callee: i64, at: i64) {
+    unsafe {
+        if NODES[callee].kind == Ident && NODES[callee].res == Res::Local && NODES[callee].y >= 0 {
+            let l = NODES[callee].y;
+            let t = LOCALS[l].ty;
+            if LOCALS[l].access && t > 0 && TYPES[t].kind == TyKind::Ptr
+                && TYPES[t].b == REF_SHARED {
+                inout_place_error(at, if LOCALS[l].is_param { 2 } else { 1 }, NODES[callee].a,
+                    TYPES[t].a);
+                return;
+            }
+        }
+        check_inout_place(callee, at);
+    }
+}
+
 // The same for `&place` (synth_unary): reported at the function's end
 // unless the `&` became a raw pointer.
 pub fn defer_inout_place(target: i64, at: i64) {
@@ -194,6 +214,9 @@ pub fn defer_conv_place(at: i64) {
 
 // (`&x as *T`: the `&` nodes cast to a raw pointer, for flush_inout_places)
 pub static var RAW_ADDRS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
+
+// (the `&` inits of `let`/`inout` bindings, for flush_inout_places)
+pub static var LET_AMPS: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // (the pending `&place` errors: the node, the kind, the name, the type)
 pub static var INOUT_PENDING: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 // While the checker checks code it made that may change a let binding (a
@@ -206,6 +229,7 @@ pub fn clear_inout_places() {
     unsafe {
         INOUT_PENDING.count = 0;
         RAW_ADDRS.count = 0;
+        LET_AMPS.count = 0;
     }
 }
 
@@ -214,10 +238,12 @@ pub fn flush_inout_places() {
         var i = 0;
         while i + 3 < INOUT_PENDING.count {
             let at = INOUT_PENDING.data[i];
-            let t = NODES[at].ty;
-            // (a raw pointer, or a let `[T]`: no inout access)
-            var raw = t > 0 && (TYPES[t].kind == TyKind::Ptr || TYPES[t].kind == TyKind::Slice)
-                && TYPES[t].b == 0;
+            let t0 = NODES[at].ty;
+            let t = if t0 > 0 { strip_distinct(t0) } else { t0 };
+            // (only an exclusive access is checked: `&x` that became a raw
+            // pointer, a let `[T]` or `str`, or a let view is none)
+            var raw = !(t > 0 && (TYPES[t].kind == TyKind::Ptr || TYPES[t].kind == TyKind::Slice)
+                && TYPES[t].b == REF_MUT);
             for j in 0..RAW_ADDRS.count {
                 if RAW_ADDRS.data[j] == at {
                     raw = true;
@@ -225,7 +251,14 @@ pub fn flush_inout_places() {
             }
             if INOUT_PENDING.data[i + 1] == 5 {
                 // (conv.place: only where the access is inout)
-                if t > 0 && TYPES[t].kind == TyKind::Ptr && TYPES[t].b == REF_MUT {
+                // (`inout r = &make()` binds the temporary: no lending)
+                var bound = false;
+                for j in 0..LET_AMPS.count {
+                    if LET_AMPS.data[j] == at {
+                        bound = true;
+                    }
+                }
+                if !raw && !bound {
                     conv_place_error(at);
                 }
             } else if !raw {
