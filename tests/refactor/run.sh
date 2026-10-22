@@ -20,7 +20,8 @@
 # path is written `volec`, the copy's `WORK`, the shell's own errors'
 # prefix `tests/refactor/run.sh:` however the runner was called. Lines starting with `##`
 # are comments. A test passes when the transcript it makes is the file,
-# comments aside.
+# comments aside; one with a `## XFAIL: reason` line is expected to differ
+# (counted xfail), and fails when it does not.
 #
 # Then the compiler's own source is asked for its stats, deps, unused
 # items and lint, which must be plausible, and same-output compares the
@@ -117,8 +118,18 @@ for file in "$HERE"/*.t; do
         cp "$WORK/$name.new" "$file"
     fi
     grep -v '^##' "$file" >"$WORK/$name.want"
+    # (0.25) `## XFAIL: reason` in a transcript: known to differ, for that
+    # reason; one that passes says so (remove the line)
+    xfail=$(sed -n 's/^## XFAIL: //p' "$file" | head -1)
     if cmp -s "$WORK/$name.want" "$WORK/$name.got"; then
-        echo "pass $name ($mode)"
+        if [ -n "$xfail" ]; then
+            echo "FAIL $name ($mode): passes but is marked XFAIL ($xfail); remove the line"
+            STATUS=1
+        else
+            echo "pass $name ($mode)"
+        fi
+    elif [ -n "$xfail" ]; then
+        echo "xfail $name ($mode): $xfail"
     else
         echo "FAIL $name ($mode): the transcript differs (< expected, > got):"
         diff "$WORK/$name.want" "$WORK/$name.got" | sed 's/^/    /' | head -40

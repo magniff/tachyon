@@ -1949,3 +1949,20 @@ the simplest sound rules:
 
 Left: `let v: Vec<i64>; v.push(1)` and `let a = [..]; fill(&a)` change a
 `let` binding (immutability, not memory safety).
+
+### 0.25.1
+
+Deferred from 0.25:
+- **tests/refactor/values017.t** (the 0.17 `fix --values` migration), XFAIL
+  in 0.25. After the 0.25 merges, a closure parameter spelled `a: &Stats`
+  in the unmigrated 0.19 program reads as a let access, not a reference,
+  so `&*a` is already an error before any fix. `fix --suggested`
+  therefore writes its 41 fixes where it used to refuse (edit.breaks),
+  and the next `fix --only conventions` breaks: own.readonly on
+  `fill(&a[..])`, or own.move_out for `keep`'s `v`.
+
+  Either restore the 0.19 reading of a closure's `&T` parameter, or have
+  `fix --suggested` leave conv.* fixes to `fix --only conventions` while a
+  program still has the 0.19 spelling. Then take the transcript's new path.
+
+  Diagnosis: .claude/briefs/resume-025/fix25.md, "values017".
