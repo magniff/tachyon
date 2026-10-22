@@ -138,6 +138,12 @@ volec prog.vl helper.c -L vendor/lib -l png -o prog
 `-o prog.o` makes an object instead, for a build that links it itself
 (`cc prog.o helper.o -o prog -lm`).
 
+A program with nothing to link but itself skips `cc`: the system's
+linker runs directly, with the command `cc -###` gave the first time
+(kept in the user's cache directory; `$VOLE_LINK_CACHE` names another,
+`off` none). The executable is the same. `--linker=cc` (or
+`$VOLE_LINKER=cc`) links through `cc` anyway.
+
 Reading stdin: std has `read_line` and `read_stdin` (`volec guide
 std`); from C, `getchar()` from `stdio.h`, or `read(0, buf, n)` from
 `unistd.h`, into a `Buf` or an array (not mixed with std's, which
