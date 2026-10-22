@@ -7,15 +7,18 @@
 use crate::back::enc_arm64::a64_instruction;
 use crate::back::enc_x86::x86_instruction;
 use crate::back::objfile::{
-    ASYMS, ATEXT, CUR_ATOM, CUR_SEC, FIXUPS, FIXUP_COUNT, FRAGS, FX_ABS32, FX_ABS64, FX_DIFF32, OBJ,
-    OPEN, SEC_ALIGN, SEC_CONST, SEC_DATA, SEC_DEBUG_ABBREV, SEC_DEBUG_INFO, SEC_DEBUG_LINE,
-    SEC_NOTE, SEC_TEXT, TAIL_ALIGN, asym, end_frag, fixup, here, is_debug, is_temp, obj_reserve,
-    out32, out64, out8, switch_section,
+    ASYMS, ASYM_LOOKUPS, ATEXT, CUR_ATOM, CUR_SEC, FIXUPS, FIXUP_COUNT, FRAGS, FRAG_COUNT, FX_ABS32,
+    FX_ABS64, FX_DIFF32, OBJ, OPEN, ObjBytes, RAW, SEC_ALIGN, SEC_CONST, SEC_DATA, SEC_DEBUG_ABBREV,
+    SEC_DEBUG_INFO, SEC_DEBUG_LINE, SEC_NOTE, SEC_TEXT, TAIL_ALIGN, asym, bytes_append, end_frag,
+    fixup, hash_bytes, here, is_debug, is_temp, obj_reserve, out32, out64, out8, switch_section,
 };
 use crate::back::objfile::debug::{
     LOC_COL, LOC_FILE, LOC_LINE, LOC_PENDING, cfi_directive, dwarf_file, line_row,
 };
-use crate::base::{IntVec, STDERR, buf_fmt, buf_new, buf_write_fd, cstr, exit, memset};
+use crate::base::{
+    IntVec, STDERR, alloc_array, buf_fmt, buf_new, buf_write_fd, cstr, exit, free, grow, memcmp,
+    memcpy, memset,
+};
 use crate::base::target::X86;
 use crate::middle::ctx::FnCtx;
 
@@ -65,10 +68,14 @@ pub static var OP_START: [i64; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
 pub static var OP_END: [i64; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
 pub static var OP_COUNT: i64 = 0;
 
+// (0.25) Each byte's class for split_operands: 1 a comma, 2 an opening
+// bracket or parenthesis, 3 a closing one, 0 any other (one test a byte).
+static var OP_CLASS: [u8; 256] = [0; 256];
+
 fn split_operands(cx: sink *FnCtx, a: i64, b: i64) {
     unsafe {
         let t = ATEXT;
-        OP_COUNT = 0;
+        var count = 0;
         var i = a;
         while i < b {
             while i < b && is_space(t[i]) {
@@ -79,11 +86,18 @@ fn split_operands(cx: sink *FnCtx, a: i64, b: i64) {
             }
             let start = i;
             var depth = 0;
-            while i < b && !(t[i] == ',' && depth == 0) {
-                if t[i] == '[' || t[i] == '(' || t[i] == '{' {
-                    depth += 1;
-                } else if t[i] == ']' || t[i] == ')' || t[i] == '}' {
-                    depth -= 1;
+            while i < b {
+                let k = OP_CLASS[t[i] as i64];
+                if k != 0 {
+                    if k == 1 {
+                        if depth == 0 {
+                            break;
+                        }
+                    } else if k == 2 {
+                        depth += 1;
+                    } else {
+                        depth -= 1;
+                    }
                 }
                 i += 1;
             }
@@ -91,14 +105,16 @@ fn split_operands(cx: sink *FnCtx, a: i64, b: i64) {
             while end > start && is_space(t[end - 1]) {
                 end -= 1;
             }
-            if OP_COUNT == 8 {
+            if count == 8 {
+                OP_COUNT = count;
                 asm_error(cx, c"too many operands");
             }
-            OP_START[OP_COUNT] = start;
-            OP_END[OP_COUNT] = end;
-            OP_COUNT += 1;
+            OP_START[count] = start;
+            OP_END[count] = end;
+            count += 1;
             i += 1;
         }
+        OP_COUNT = count;
     }
 }
 
@@ -237,6 +253,25 @@ fn directive(cx: sink *FnCtx, a: i64, b: i64, rest: i64, end: i64) {
             }
             return;
         }
+        if text_is(cx, a, b, c".vole_data") {
+            // (0.25) bytes of RAW (mod.vl): `.vole_data OFFSET, LENGTH`
+            if MAPPING {
+                mapping(MAP_DATA);
+            }
+            split_operands(cx, rest, end);
+            if OP_COUNT != 2 {
+                asm_error(cx, c"bad .vole_data");
+            }
+            let at = parse_number(cx, OP_START[0], OP_END[0]);
+            let n = parse_number(cx, OP_START[1], OP_END[1]);
+            if at < 0 || n < 0 || at + n > RAW.len {
+                asm_error(cx, c"bad .vole_data");
+            }
+            obj_reserve(n);
+            memcpy(&OBJ.data[OBJ.len], &RAW.data[at], n as u64);
+            OBJ.len += n;
+            return;
+        }
         if text_is(cx, a, b, c".long") || text_is(cx, a, b, c".quad") {
             if MAPPING {
                 mapping(MAP_DATA);
@@ -366,6 +401,137 @@ fn label(cx: sink *FnCtx, a: i64, b: i64) {
     }
 }
 
+// ---- Lines assembled before (0.25) ----
+//
+// An instruction that names no symbol (`ldr x0, [x29, #-24]`, `sub sp,
+// sp, #16`) assembles to the same bytes wherever it is. Its bytes are kept
+// by its text, and a line spelling it again is copied, not parsed and
+// encoded: 87% of the lines of the compiler's -O0 code (fewer than 8000
+// distinct ones), half of its -O2 code. An instruction is kept when its
+// encoding asked for no symbol and made no fixup and no fragment.
+
+struct Memo { hash: u64, text: i64, len: i64, code: i64, code2: i64, size: i64 }
+
+static var MEMOS: *Memo = 0 as *Memo;
+static var MEMO_COUNT: i64 = 0;
+static var MEMO_CAP: i64 = 0;
+// Memo + 1 by hash (open addressing).
+static var MEMO_TABLE: *i64 = 0 as *i64;
+static var MEMO_SIZE: i64 = 0;
+// The lines' text.
+static var MEMO_TEXT: ObjBytes = ObjBytes { data: 0 as *u8, len: 0, cap: 0 };
+// The hash of the line memo_find was last asked.
+static var MEMO_HASH: u64 = 0;
+// (bounds the memory a program of only distinct lines takes)
+const MEMO_LIMIT: i64 = 1 << 20;
+
+// The state before an object's first line: no line known, the bytes'
+// classes for split_operands.
+pub fn assemble_begin() {
+    unsafe {
+        OP_CLASS[',' as i64] = 1;
+        OP_CLASS['[' as i64] = 2;
+        OP_CLASS['(' as i64] = 2;
+        OP_CLASS['{' as i64] = 2;
+        OP_CLASS[']' as i64] = 3;
+        OP_CLASS[')' as i64] = 3;
+        OP_CLASS['}' as i64] = 3;
+        free(MEMO_TABLE as *u8);
+        MEMO_TABLE = 0 as *i64;
+        MEMO_SIZE = 0;
+        MEMO_COUNT = 0;
+        MEMO_TEXT.len = 0;
+    }
+}
+
+// The memo of line [a, b) of t, or -1 (MEMO_HASH: the line's hash).
+fn memo_find(t: *u8, a: i64, b: i64) -> i64 {
+    unsafe {
+        let h = hash_bytes(&t[a], b - a);
+        MEMO_HASH = h;
+        if MEMO_SIZE == 0 {
+            return -1;
+        }
+        let n = b - a;
+        let mask = (MEMO_SIZE - 1) as u64;
+        var slot = h & mask;
+        while MEMO_TABLE[slot] != 0 {
+            let m = MEMO_TABLE[slot] - 1;
+            if MEMOS[m].hash == h && MEMOS[m].len == n
+                && memcmp(&MEMO_TEXT.data[MEMOS[m].text], &t[a], n as u64) == 0 {
+                return m;
+            }
+            slot = (slot + 1) & mask;
+        }
+        -1
+    }
+}
+
+// Keeps line [a, b) of t (hash MEMO_HASH), assembled to OBJ's bytes from
+// `start` on.
+fn memo_add(t: *u8, a: i64, b: i64, start: i64) {
+    unsafe {
+        let size = OBJ.len - start;
+        if size < 1 || size > 16 || MEMO_COUNT >= MEMO_LIMIT {
+            return;
+        }
+        if (MEMO_COUNT + 1) * 2 > MEMO_SIZE {
+            memo_rehash();
+        }
+        var code: [i64; 2] = [0, 0];
+        for k in 0..size {
+            code[k / 8] = code[k / 8] | (OBJ.data[start + k] as i64) << (k % 8 * 8);
+        }
+        let text = bytes_append(&MEMO_TEXT, t[a..b]);
+        MEMOS = grow(MEMOS, MEMO_COUNT, &MEMO_CAP);
+        MEMOS[MEMO_COUNT] = Memo {
+            hash: MEMO_HASH, text, len: b - a, code: code[0], code2: code[1], size
+        };
+        let mask = (MEMO_SIZE - 1) as u64;
+        var slot = MEMO_HASH & mask;
+        while MEMO_TABLE[slot] != 0 {
+            slot = (slot + 1) & mask;
+        }
+        MEMO_TABLE[slot] = MEMO_COUNT + 1;
+        MEMO_COUNT += 1;
+    }
+}
+
+// MEMO_TABLE twice as large.
+fn memo_rehash() {
+    unsafe {
+        let size = if MEMO_SIZE == 0 { 4096 } else { MEMO_SIZE * 2 };
+        free(MEMO_TABLE as *u8);
+        MEMO_TABLE = alloc_array::<i64>(size);
+        MEMO_SIZE = size;
+        let mask = (size - 1) as u64;
+        for m in 0..MEMO_COUNT {
+            var slot = MEMOS[m].hash & mask;
+            while MEMO_TABLE[slot] != 0 {
+                slot = (slot + 1) & mask;
+            }
+            MEMO_TABLE[slot] = m + 1;
+        }
+    }
+}
+
+// Writes memo m's bytes.
+fn memo_out(m: i64) {
+    unsafe {
+        let size = MEMOS[m].size;
+        if size == 4 {
+            out32(MEMOS[m].code);
+            return;
+        }
+        obj_reserve(size);
+        for k in 0..size {
+            let word = if k < 8 { MEMOS[m].code } else { MEMOS[m].code2 };
+            OBJ.data[OBJ.len + k] = ((word >> (k % 8 * 8)) & 255) as u8;
+        }
+        OBJ.len += size;
+    }
+}
+
 pub fn assemble_line(cx: sink *FnCtx, a: i64, b: i64) {
     unsafe {
         let t = ATEXT;
@@ -382,6 +548,23 @@ pub fn assemble_line(cx: sink *FnCtx, a: i64, b: i64) {
         }
         LINE_START = i;
         LINE_END = e;
+        // (0.25) an instruction assembled before: its bytes
+        let memo = t[i] != '.' && t[e - 1] != ':';
+        if memo {
+            let m = memo_find(t, i, e);
+            if m >= 0 {
+                if HOOKS {
+                    if LOC_PENDING {
+                        line_row();
+                    }
+                    if MAPPING {
+                        mapping(MAP_CODE);
+                    }
+                }
+                memo_out(m);
+                return;
+            }
+        }
         var w = i;
         while w < e && !is_space(t[w]) {
             w += 1;
@@ -408,10 +591,17 @@ pub fn assemble_line(cx: sink *FnCtx, a: i64, b: i64) {
                 mapping(MAP_CODE);
             }
         }
+        let lookups = ASYM_LOOKUPS;
+        let fixups = FIXUP_COUNT;
+        let frags = FRAG_COUNT;
+        let start = OBJ.len;
         if X86 {
             x86_instruction(cx, i, w);
         } else {
             a64_instruction(cx, i, w);
+        }
+        if memo && ASYM_LOOKUPS == lookups && FIXUP_COUNT == fixups && FRAG_COUNT == frags {
+            memo_add(t, i, e, start);
         }
     }
 }
