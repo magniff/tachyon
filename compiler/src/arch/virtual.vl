@@ -26,7 +26,7 @@ use crate::base::{
     FILES, FILE_COUNT, IntVec, add_source, buf_bytes, buf_int, buf_new, buf_str, intern_c, sym_text,
 };
 use crate::front::lexer::{TOKS, TOK_COUNT, Tok, lex_range};
-use crate::front::modules::{STD_MODULE, add_module};
+use crate::front::modules::{STD_MODULE, add_module, module_at, within_std};
 use crate::middle::ir::{BITS_LEADING, BITS_ONES};
 use crate::middle::lower::ssa::HMap;
 
@@ -58,41 +58,86 @@ pub fn load_arch_modules() {
         let arch = intern_c(c"arch");
         // (0.19 T3: #[multiversion] needs std::arch::detect for its dispatcher)
         let multiversion = intern_c(c"multiversion");
+        let std_sym = intern_c(c"std");
         var named = false;
         var versions = false;
         var imported = HMap { keys: 0 as *i64, vals: 0 as *i64, size: 0, count: 0 };
+        // (0.25) `in_use`: between a `use` and its `;`; an alias of std
+        // (`use std as s`) makes `s::arch` std's
+        var mark = -1;
+        var in_use = false;
+        var use_from_std = false;
+        var std_aliased = false;
+        var arch_in_path = false;
         for i in 0..TOK_COUNT {
-            if TOKS[i].kind == Tok::Ident && TOKS[i].value as i64 == multiversion && i >= 2
-                && TOKS[i - 1].kind == Tok::LBracket && TOKS[i - 2].kind == Tok::Hash {
-                versions = true;
-                named = true;
-            }
-            if TOKS[i].value as i64 == arch && TOKS[i].kind == Tok::Ident {
-                if !in_use_line(i) {
+            let kind = TOKS[i].kind;
+            if kind == Tok::Ident {
+                let sym = TOKS[i].value as i64;
+                if sym == multiversion && i >= 2 && TOKS[i - 1].kind == Tok::LBracket
+                    && TOKS[i - 2].kind == Tok::Hash {
+                    versions = true;
                     named = true;
-                } else {
-                    // (0.21) a `use std::arch::..` line of std's (std::str's,
-                    // std::collections::group's headers, always read): the
-                    // names it imports
-                    var j = i + 1;
-                    while j < TOK_COUNT && TOKS[j].kind != Tok::Semi {
-                        if TOKS[j].kind == Tok::Ident {
-                            imported.put(TOKS[j].value as i64 + 1, 1);
+                }
+                if sym == arch {
+                    if !within_std(module_at(TOKS[i].start)) {
+                        // (0.25) the program's own `crate::arch` is not std's
+                        if arch_names_std(i, std_sym, in_use) {
+                            named = true;
+                        } else if i >= 1 && TOKS[i - 1].kind == Tok::ColonColon {
+                            arch_in_path = true;
                         }
-                        j += 1;
+                    } else if !in_std_use_line(mark, i) {
+                        named = true;
+                    } else {
+                        // (0.21) a `use std::arch::..` line of std's (std::str's,
+                        // std::collections::group's headers, always read): the
+                        // names it imports
+                        var j = i + 1;
+                        while j < TOK_COUNT && TOKS[j].kind != Tok::Semi {
+                            if TOKS[j].kind == Tok::Ident {
+                                imported.put(TOKS[j].value as i64 + 1, 1);
+                            }
+                            j += 1;
+                        }
                     }
                 }
+                if in_use && TOKS[i - 1].kind == Tok::Use {
+                    use_from_std = sym == std_sym;
+                }
+            } else if kind == Tok::As && in_use && use_from_std
+                && !within_std(module_at(TOKS[i].start)) {
+                std_aliased = true;
+            } else if kind == Tok::Use {
+                in_use = true;
+                use_from_std = false;
+            } else if kind == Tok::Semi {
+                in_use = false;
             }
+            if kind == Tok::Use {
+                mark = 2 * i + 1;
+            } else if kind == Tok::Semi || kind == Tok::RBrace {
+                mark = 2 * i;
+            }
+        }
+        if std_aliased && arch_in_path {
+            named = true;
         }
         // (0.21) std names the modules only when the sections read use what
         // its `use` lines import: the tables cost more than a small
         // program's compilation
         if !named && imported.count > 0 {
+            mark = -1;
             for i in 0..TOK_COUNT {
-                if TOKS[i].kind == Tok::Ident && imported.get(TOKS[i].value as i64 + 1) != 0
-                    && !in_use_line(i) {
-                    named = true;
-                    break;
+                let k = TOKS[i].kind;
+                if k == Tok::Ident {
+                    if imported.get(TOKS[i].value as i64 + 1) != 0 && !in_std_use_line(mark, i) {
+                        named = true;
+                        break;
+                    }
+                } else if k == Tok::Use {
+                    mark = 2 * i + 1;
+                } else if k == Tok::Semi || k == Tok::RBrace {
+                    mark = 2 * i;
                 }
             }
         }
@@ -116,13 +161,19 @@ pub fn load_arch_modules() {
         for _ in 0..INTR_COUNT {
             seen.push(0);
         }
+        mark = -1;
         for i in 0..TOK_COUNT {
-            if TOKS[i].kind == Tok::Ident && !in_use_line(i) {
+            let k = TOKS[i].kind;
+            if k == Tok::Ident {
                 let id = intrinsic_named(TOKS[i].value as i64);
-                if id >= 0 && seen.data[id] == 0 {
+                if id >= 0 && seen.data[id] == 0 && !in_std_use_line(mark, i) {
                     seen.data[id] = 1;
                     wanted.push(id);
                 }
+            } else if k == Tok::Use {
+                mark = 2 * i + 1;
+            } else if k == Tok::Semi || k == Tok::RBrace {
+                mark = 2 * i;
             }
         }
         for k in 0..QUERY_WANTED.count {
@@ -156,24 +207,29 @@ pub fn load_arch_modules() {
 }
 
 // (0.20) Whether token i is a name of a `use` line of std's (its
-// re-exports, `pub use num::{count_ones, ..}`): not a use of the intrinsic.
-fn in_use_line(i: i64) -> bool {
+// re-exports, `pub use num::{count_ones, ..}`): not a use of the
+// intrinsic. (0.25) The backward scan kept forward by the caller: `mark`
+// is the last `use`, `;` or `}` before token i, as 2 * its index (+ 1 for
+// a `use`), or -1; token i is in a `use` line when that is a `use` among
+// the 255 tokens before it.
+fn in_std_use_line(mark: i64, i: i64) -> bool {
     unsafe {
-        if !crate::front::modules::within_std(crate::front::modules::module_at(TOKS[i].start)) {
-            return false;
+        mark >= 0 && mark % 2 == 1 && i - mark / 2 < 256
+            && within_std(module_at(TOKS[i].start))
+    }
+}
+
+// (0.25) Whether token i, `arch` outside std, may name std::arch: after
+// `std::`, or first in a path (`arch::aarch64::..`), or in a `use` line
+// (`use std::{io, arch}`) not after a path's `::`. Not: a variable, a
+// field, `mod arch;`, the program's own `crate::arch`, `super::arch`,
+// `x::arch` (unless std is aliased, which the caller checks).
+fn arch_names_std(i: i64, std_sym: i64, in_use: bool) -> bool {
+    unsafe {
+        if i >= 1 && TOKS[i - 1].kind == Tok::ColonColon {
+            return i >= 2 && TOKS[i - 2].kind == Tok::Ident && TOKS[i - 2].value as i64 == std_sym;
         }
-        var j = i - 1;
-        while j >= 0 && i - j < 256 {
-            let k = TOKS[j].kind;
-            if k == Tok::Use {
-                return true;
-            }
-            if k == Tok::Semi || k == Tok::RBrace {
-                return false;
-            }
-            j -= 1;
-        }
-        false
+        in_use || i + 1 < TOK_COUNT && TOKS[i + 1].kind == Tok::ColonColon
     }
 }
 
