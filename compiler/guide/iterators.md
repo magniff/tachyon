@@ -72,8 +72,19 @@ v[i] *= 2; }`.
 - `sort_by(&s, |a, b| ...)` sorts in place by a comparison of two let `T`s
   returning negative, zero or positive (`a.cmp(b)`; `b.cmp(a)`
   descending); also `v.sort_by(...)` and `s.sort_by(...)`.
-- An adapter takes its iterator `sink`, so a chain is one value; to
-  call `next` yourself (`inout self`), keep the iterator in a `var`.
+- An adapter and a consumer take the iterator `sink` (0.25): an adapter
+  owns the one it wraps, so a chain is one value, and what it did not
+  reach drops with it; `it.count()` uses `it` up. `any`, `all`,
+  `position` and `find` take it `inout`: they stop at the item that
+  decides, and the rest stay in `it`. To call `next` yourself (`inout
+  self`), keep the iterator in a `var`.
+- Owned items (a `Vec<D>`'s `pop`, `map(|i| make(i))`) are dropped once:
+  by `for` at the end of each iteration unless moved, and by an adapter
+  or consumer that passes over them (`count`, the ones `filter`
+  rejects, `min`'s and `max`'s losers). The items of a borrowing iterator
+  (`v.iter()`, a map's `iter`, `keys`, `values`, a set's `iter`) are
+  copies of elements the container keeps: read them, or `.clone()` one
+  to keep it (`own.move_out` otherwise).
 
 ## Your own iterator
 
