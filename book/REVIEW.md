@@ -159,14 +159,13 @@ build, chapters 4, 10, 11, 17 and 18 pass. Chapters 4 to 11, 14, 15,
 need no book change: nothing relied on `println` consuming, and every
 chain in the book passes on fix25d.
 
-## Decisions for the user
+## Decisions (settled by the coordinator)
 
-- **AI mentions.** The writers' brief said "no mention of AI anywhere",
-  yet ch 17 is planned as "working with an agent". Kept: ch 17's
-  section, and the "AI assistant" mentions at 1:"Asking the compiler",
-  11:277, 12:414 and 17:555. Removed: `CLAUDE.md`. 17:558-561 says the
-  tools exist because agents worked on the vole compiler, which is how
-  vole was made. My recommendation is to cut that sentence.
+- Chapter 17's agent section stays. What it said about how vole was
+  made is cut: 17:590-596 (that agents built the tools) and 17:644-650
+  (the repository's own setup); the hooks are now offered as tools
+  to use. `CLAUDE.md` is dropped. The other "AI assistant" mentions
+  (ch 1, 11, 12) are about using the tools, and stay.
 
 ## Compiler findings (for the compiler, not the book)
 

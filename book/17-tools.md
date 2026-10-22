@@ -590,10 +590,9 @@ command-line only for now.
 AI coding assistants, *agents*, are programs that read and change code
 by running commands in a loop: they read some files, make an edit,
 build, read the errors, and go round again. Vole's tools were designed
-with them in mind. Most of the commands in this chapter exist because
-agents working on the vole compiler spent most of their effort reading
-files a few lines at a time, searching with `grep`, and making edits
-with `sed` that sometimes changed the wrong line.
+with them in mind: an agent that reads files a few lines at a time,
+searches with `grep` and edits with `sed` spends most of its effort
+getting around, and sometimes changes the wrong line.
 
 ### What an agent uses
 
@@ -641,12 +640,11 @@ of, run `volec guide --find WORDS`.
 ```
 
 Some agents also run *hooks*, small scripts that run before or after
-each command the agent issues. The vole repository's own setup is an
-example: `tools/agent-hooks` has one hook that runs `volec check` after
+each command the agent issues. The vole repository has two you can
+use: `tools/agent-hooks` has one hook that runs `volec check` after
 every edit and shows the agent what changed, and one that stops an
 agent from reading source with `grep` or `sed` and suggests the
-`query` command instead. Its `AGENTS.md` is a longer example of the
-file above.
+`query` command instead.
 
 ### Reviewing what an agent did
 
