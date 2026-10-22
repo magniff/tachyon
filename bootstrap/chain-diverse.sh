@@ -110,10 +110,13 @@ if [ $SAME -eq 1 ] && [ $FAILED -eq 0 ]; then
     cp "$W/A2" "$W/a/$BIN"
     cp "$W/B2" "$W/b/$BIN"
     echo "  same-output: A2 (optimized) against B2 (unoptimized)"
-    (cd "$ROOT" && "$W/a/$BIN" same-output "$W/b/$BIN") >"$W/same-output.log" 2>&1
+    # (its own work directory: target/same-output keeps every earlier
+    # run's compilations, which are not this run's to judge)
+    rm -rf "$W/so"
+    (cd "$ROOT" && "$W/a/$BIN" same-output "$W/b/$BIN" --work "$W/so") >"$W/same-output.log" 2>&1
     rc=$?
     if [ $rc -ne 0 ]; then
-        kept="$ROOT/target/same-output"
+        kept="$W/so"
         real=0
         for d in "$kept"/*; do
             [ -d "$d" ] || continue
