@@ -35,13 +35,13 @@ mod macho;
 mod elf;
 pub mod output;
 
-use assemble::{HOOKS, MAPPING, assemble_line};
+use assemble::{HOOKS, MAPPING, assemble_begin, assemble_line};
 use crate::back::dwarf::DEBUG_INFO;
 use crate::back::enc_arm64::init_a64;
 use crate::back::enc_x86::init_x86;
 use crate::base::{
-    BUFS, alloc_array, alloc_zeroed, buf_byte, buf_fmt, buf_new, buf_write_file, cstr, die, free,
-    grow, memcpy, realloc, strlen,
+    BUFS, alloc_array, alloc_zeroed, buf_byte, buf_fmt, buf_new, buf_reserve, buf_write_file, cstr,
+    die, free, grow, memcmp, memcpy, realloc, strlen,
 };
 use debug::{CFI_FNS, ROWS, compact_unwind, line_program};
 use elf::elf_write;
@@ -131,23 +131,28 @@ pub static var RAW: ObjBytes = ObjBytes { data: 0 as *u8, len: 0, cap: 0 };
 
 // Appends bytes to RAW; returns their offset there.
 pub fn raw_data(bytes: [u8]) -> i64 {
+    bytes_append(&RAW, bytes)
+}
+
+// Appends bytes to b; returns their offset there.
+pub fn bytes_append(b: inout ObjBytes, bytes: [u8]) -> i64 {
     unsafe {
         let n = bytes.len as i64;
-        if RAW.len + n > RAW.cap {
-            var cap = if RAW.cap == 0 { 65536 } else { RAW.cap * 2 };
-            while cap < RAW.len + n {
+        if b.len + n > b.cap {
+            var cap = if b.cap == 0 { 65536 } else { b.cap * 2 };
+            while cap < b.len + n {
                 cap *= 2;
             }
-            let grown = realloc(RAW.data, cap as u64);
+            let grown = realloc(b.data, cap as u64);
             if grown == 0 as *u8 {
                 die(c"out of memory");
             }
-            RAW.data = grown;
-            RAW.cap = cap;
+            b.data = grown;
+            b.cap = cap;
         }
-        let at = RAW.len;
-        memcpy(&RAW.data[at], bytes.ptr, n as u64);
-        RAW.len = at + n;
+        let at = b.len;
+        memcpy(&b.data[at], bytes.ptr, n as u64);
+        b.len = at + n;
         at
     }
 }
@@ -251,7 +256,8 @@ fn put32(pos: i64, v: i64) {
 // (0.18.1: its name its own bytes, not an interned symbol: the assembler
 // runs beside code generation's threads, which read the symbols.)
 struct ASym {
-    text: [u8], defined: bool, global: bool, frag: i64, off: i64, sec: i64, in_table: bool,
+    text: [u8], hash: u64, defined: bool, global: bool, frag: i64, off: i64, sec: i64,
+    in_table: bool,
     index: i64, atom: i64
 }
 
@@ -267,28 +273,35 @@ static var ASYM_CAP: i64 = 0;
 static var ASYM_TABLE: *i64 = 0 as *i64;
 static var ASYM_TABLE_SIZE: i64 = 0;
 
+// (0.25) asym's calls: an instruction that made none names no symbol
+// (assemble.vl's memo).
+pub static var ASYM_LOOKUPS: i64 = 0;
+
 pub fn asym(name: [u8]) -> i64 {
     unsafe {
+        ASYM_LOOKUPS += 1;
         if (ASYM_COUNT + 1) * 2 > ASYM_TABLE_SIZE {
             asym_rehash();
         }
-        let hash = name_hash(name);
+        let n = name.len as i64;
+        let hash = hash_bytes(name.ptr, n);
         let mask = (ASYM_TABLE_SIZE - 1) as u64;
         var slot = hash & mask;
         while ASYM_TABLE[slot] != 0 {
             let s = ASYM_TABLE[slot] - 1;
-            if ASYMS[s].text == name {
+            // (0.25: the hashes first, then memcmp, not the bytes one by one)
+            if ASYMS[s].hash == hash && ASYMS[s].text.len as i64 == n
+                && memcmp(ASYMS[s].text.ptr, name.ptr, n as u64) == 0 {
                 return s;
             }
             slot = (slot + 1) & mask;
         }
         ASYMS = grow(ASYMS, ASYM_COUNT, &ASYM_CAP);
         let s = ASYM_COUNT;
-        let n = name.len as i64;
         let copy = alloc_zeroed(n + 1);
         memcpy(copy, name.ptr, n as u64);
         ASYMS[s] = ASym {
-            text: copy[0..n], defined: false, global: false, frag: -1, off: 0, sec: -1,
+            text: copy[0..n], hash, defined: false, global: false, frag: -1, off: 0, sec: -1,
             in_table: false, index: -1, atom: -1
         };
         ASYM_COUNT += 1;
@@ -306,7 +319,7 @@ fn asym_rehash() {
         ASYM_TABLE_SIZE = size;
         let mask = (size - 1) as u64;
         for s in 0..ASYM_COUNT {
-            var slot = name_hash(ASYMS[s].text) & mask;
+            var slot = ASYMS[s].hash & mask;
             while ASYM_TABLE[slot] != 0 {
                 slot = (slot + 1) & mask;
             }
@@ -315,13 +328,35 @@ fn asym_rehash() {
     }
 }
 
-// FNV-1a of a name.
+// A hash of a name.
 fn name_hash(t: [u8]) -> u64 {
-    var h: u64 = 14695981039346656037;
-    for i in 0..t.len as i64 {
-        h = (h ^ t[i] as u64) * 1099511628211;
+    hash_bytes(t.ptr, t.len as i64)
+}
+
+// (0.25) A hash of bytes [0, n) of p, eight at a time (FNV-1a's byte at a
+// time was a chain of multiplications as long as the name).
+pub fn hash_bytes(p: *u8, n: i64) -> u64 {
+    unsafe {
+        var h: u64 = n as u64 * 0x9e3779b97f4a7c15;
+        var i = 0;
+        while i + 8 <= n {
+            let w = p[i] as u64 | (p[i + 1] as u64) << 8 | (p[i + 2] as u64) << 16
+                | (p[i + 3] as u64) << 24 | (p[i + 4] as u64) << 32 | (p[i + 5] as u64) << 40
+                | (p[i + 6] as u64) << 48 | (p[i + 7] as u64) << 56;
+            h = (h ^ w) * 0xff51afd7ed558ccd;
+            h = h ^ (h >> 32);
+            i += 8;
+        }
+        var w: u64 = 0;
+        var s: u64 = 0;
+        while i < n {
+            w = w | (p[i] as u64) << s;
+            s += 8;
+            i += 1;
+        }
+        h = (h ^ w) * 0xff51afd7ed558ccd;
+        h ^ (h >> 32)
     }
-    h
 }
 
 // (0.18.1) A table from names to values (0: none): the assembler's own
@@ -492,13 +527,28 @@ fn w8(out: i64, v: i64) {
 }
 
 fn w16(out: i64, v: i64) {
-    w8(out, v);
-    w8(out, v >> 8);
+    unsafe {
+        buf_reserve(out, 2);
+        let at = BUFS[out].len;
+        let d = BUFS[out].data;
+        d[at] = (v & 255) as u8;
+        d[at + 1] = ((v >> 8) & 255) as u8;
+        BUFS[out].len = at + 2;
+    }
 }
 
+// (0.25: the bytes with one check for room, not a call each)
 fn w32(out: i64, v: i64) {
-    w16(out, v);
-    w16(out, v >> 16);
+    unsafe {
+        buf_reserve(out, 4);
+        let at = BUFS[out].len;
+        let d = BUFS[out].data;
+        d[at] = (v & 255) as u8;
+        d[at + 1] = ((v >> 8) & 255) as u8;
+        d[at + 2] = ((v >> 16) & 255) as u8;
+        d[at + 3] = ((v >> 24) & 255) as u8;
+        BUFS[out].len = at + 4;
+    }
 }
 
 fn w64(out: i64, v: i64) {
@@ -572,6 +622,7 @@ fn assembler_begin() {
         CUR_SEC = SEC_TEXT;
         SEC_USED[SEC_TEXT] = true;
         new_frag(SEC_TEXT);
+        assemble_begin();
         if X86 {
             init_x86();
         } else {
