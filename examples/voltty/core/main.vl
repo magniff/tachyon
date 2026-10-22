@@ -24,23 +24,12 @@ mod term;
 mod vt;
 
 use std::Buf;
+use std::cli::{Arg, Command};
 use term::Term;
 use vt::Parser;
 
 // The OSC buffer: OSC 52 clipboard payloads fit (vte has no limit).
 const OSC_LIMIT: i64 = 1048576;
-
-fn arg(argv: **u8, i: i64) -> [u8] {
-    // SAFETY: argv[i] is a NUL-terminated string from the C runtime.
-    unsafe {
-        let p = argv[i];
-        var n = 0;
-        while p[n] != 0 {
-            n += 1;
-        }
-        p[0..n]
-    }
-}
 
 fn number(s: [u8]) -> i64 {
     parse_int(s).unwrap_or(-1)
@@ -229,85 +218,83 @@ fn usage() -> i32 {
     2
 }
 
-fn main(argc: i32, argv: **u8, gpa: Gpa) -> i32 {
-    var i = 1;
-    var escaped = false;
-    if i < argc as i64 && arg(argv, i) == "--escaped" {
-        escaped = true;
-        i += 1;
+fn main(gpa: Gpa) -> i32 {
+    let cli = Command::new_in("voltty", gpa).about("voltty's terminal core, headless")
+        .arg(Arg::flag("escaped").help("read stdin with \\e, \\n, \\xNN escapes (for test cases)"))
+        .arg(Arg::flag("dump").help("LINES COLS HISTORY: stdin through the terminal, its dump"))
+        .arg(Arg::flag("script").help("the oracle's script format on stdin (oracle/FORMAT.md)"))
+        .arg(Arg::flag("bench").help("FILE...: parse + grid throughput, 120x40, 10,000 lines"))
+        .arg(Arg::flag("run")
+            .help("LINES COLS -- CMD ARG...: CMD on a pty until it exits; then the dump"))
+        .arg(Arg::flag("keys").help("key, mouse and paste encodings of a table of events on stdin"))
+        .arg(Arg::option("runs").short('n').default("5").help("--bench: the best of RUNS"))
+        .arg(Arg::option("send").value_name("TEXT")
+            .help("--run: typed to CMD after its first output"))
+        .arg(Arg::option("send-n").value_name("N").help("--run: then N bytes `a` (a large paste)"))
+        .arg(Arg::positional("operand").multiple().help("the mode's operands"));
+    let m = cli.parse_or_exit(std::env::args());
+    let args = m.values("operand");
+    var modes = 0;
+    let all: [str; 5] = ["dump", "script", "bench", "run", "keys"];
+    for mode in all {
+        if m.flag(mode) {
+            modes += 1;
+        }
     }
-    if i >= argc as i64 {
+    if modes != 1 {
         return usage();
     }
-    let mode = arg(argv, i);
-    i += 1;
-    if mode == "--bench" {
-        var runs = 5;
+    if m.flag("bench") {
+        let runs = number(m.get("runs").unwrap_or("5"));
         var files: Vec<[u8]> = Vec::new_in(gpa);
-        while i < argc as i64 {
-            let a = arg(argv, i);
-            if a == "-n" && i + 1 < argc as i64 {
-                runs = number(arg(argv, i + 1));
-                i += 2;
-            } else {
-                files.push(a);
-                i += 1;
-            }
+        for a in args {
+            files.push(a);
         }
         let rc = bench_mode(files, runs, gpa);
         files.free();
         return rc;
     }
-    if mode == "--run" {
-        if i + 3 > argc as i64 {
+    if m.flag("run") {
+        if args.len() < 3 {
             return usage();
         }
-        let lines = number(arg(argv, i));
-        let cols = number(arg(argv, i + 1));
-        var cmd: Vec<[u8]> = Vec::new_in(gpa);
-        var k = i + 2;
+        let lines = number(args[0]);
+        let cols = number(args[1]);
         var send = Buf::new_in(gpa);
-        if k + 1 < argc as i64 && arg(argv, k) == "--send" {
-            send = unescape(arg(argv, k + 1), gpa);
-            k += 2;
+        if let Some(text) = m.get("send") {
+            send = unescape(text, gpa);
         }
-        if k + 1 < argc as i64 && arg(argv, k) == "--send-n" {
+        if let Some(n) = m.get("send-n") {
             // N bytes `a` (a large paste: the queue holds what the pty
             // does not take yet)
-            for _ in 0..number(arg(argv, k + 1)) {
+            for _ in 0..number(n) {
                 send.push('a');
             }
-            k += 2;
         }
-        if k < argc as i64 && arg(argv, k) == "--" {
-            k += 1;
-        }
-        while k < argc as i64 {
-            cmd.push(arg(argv, k));
-            k += 1;
+        var cmd: Vec<[u8]> = Vec::new_in(gpa);
+        for a in args[2..] {
+            cmd.push(a);
         }
         let rc = pty::run_headless(lines, cols, cmd.as_slice(), send.as_slice(), gpa);
         cmd.free();
         return rc;
     }
     let raw = read_stdin_in(gpa).unwrap();
-    let input = if escaped { unescape(raw.as_slice(), gpa) } else { raw };
+    let input = if m.flag("escaped") { unescape(raw.as_slice(), gpa) } else { raw };
     var rc: i32 = 0;
-    if mode == "--dump" && i + 3 <= argc as i64 {
-        let lines = number(arg(argv, i));
-        let cols = number(arg(argv, i + 1));
-        let hist = number(arg(argv, i + 2));
+    if m.flag("dump") {
+        let lines = if args.len() >= 3 { number(args[0]) } else { -1 };
+        let cols = if args.len() >= 3 { number(args[1]) } else { -1 };
+        let hist = if args.len() >= 3 { number(args[2]) } else { -1 };
         if lines < 1 || cols < 2 || hist < 0 {
             rc = usage();
         } else {
             dump_mode(lines, cols, hist, input.as_slice(), gpa);
         }
-    } else if mode == "--script" {
+    } else if m.flag("script") {
         rc = script_mode(input.as_slice(), gpa);
-    } else if mode == "--keys" {
-        rc = input::run_table(input.as_slice(), gpa);
     } else {
-        rc = usage();
+        rc = input::run_table(input.as_slice(), gpa);
     }
     rc
 }

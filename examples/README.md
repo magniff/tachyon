@@ -47,6 +47,7 @@ that they print what the README says, errors and traps included.
 |---|---|---|
 | [helloworld](helloworld/) | the smallest program | `main`, `println`, `[u8]` text |
 | [args](args/) | command-line arguments | `main(argc, argv)`, C strings to slices, `unsafe fn` |
+| [cli](cli/) | args with flags and options, parsed by `std::cli` | `Command`, `Arg::flag/option/positional`, `parse_or_exit`, `Matches`, `get_as`; `--help` and errors built in |
 | [factorial](factorial/) | factorials, recursive and folded | recursion, ranges as iterators, `fold`, f-strings |
 | [floats](floats/) | the distance between two points | `f64`, methods, `extern "C"` `sqrt`, `{x:.6}` |
 | [variadic](variadic/) | calling C's `printf` | variadic `extern "C"`, `c"..."` |
