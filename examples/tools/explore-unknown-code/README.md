@@ -42,7 +42,7 @@ generated header:
 ```console
 $ volec query items
 crate	main.vl	6
-std	<std>	592
+std	<std>	593
 crate::graph	graph.vl	11
 crate::heap	heap.vl	7
 crate::network	network.vl	2

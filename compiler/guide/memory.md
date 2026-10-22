@@ -93,7 +93,10 @@ fn main(gpa: Gpa) {
   panic. A moved value is not dropped where it was.
 - `impl Drop for T { fn drop(inout self) { ... } }` runs code at the
   drop; a type without one drops its fields. `drop(x)` drops early,
-  `std::forget(x)` never (a leak, safe).
+  `std::forget(x)` never (a leak, safe). A type with a Drop of its own
+  holds no view, also through a type argument (`G<[i64]>` of `impl<T>
+  Drop for G<T>`): `own.drop_view`, since its drop could read what the
+  view points to after that is gone. std's containers of views are fine.
 - `let x = v[i];` of an owned element borrows it (a let access, read
   only); `var x = v[i];` would move it out of the Vec and is
   `own.move_out`, as is `var k = self.keys;` in an `inout self` method:
