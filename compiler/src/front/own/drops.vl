@@ -8,9 +8,12 @@
 //   of the local, checked where it stands; a function body starts with
 //   one per by-value parameter; an arm of a match by value starts with one
 //   per owned binding. A match reached through a reference (`match
-//   self.kind`, `match *p`, `match v[i]`), and a `for` loop's element,
-//   bind by reference instead: no drop, and moving the binding is
-//   own.move_out (BYREF).
+//   self.kind`, `match *p`, `match v[i]`), a `for` loop's element of a
+//   slice or Vec, and (0.25) the items of a borrowing iterator (copies of
+//   a container's elements, borrowed_call), bind by reference instead: no
+//   drop, and moving the binding is own.move_out (BYREF). A `for` over an
+//   owning iterator drops each item at the end of its iteration, and its
+//   sequence, when not a place, at the loop's end (check/iterate.vl).
 // - an owned temporary whose value a statement discards (`make(3);`) is
 //   bound to a hidden local, which drops at the statement's end;
 // - `p = rhs` on an owned place p (not through a raw pointer, not an
@@ -62,8 +65,8 @@ use crate::middle::lower::ssa::HMap;
 // scrutinee reached through a reference (its bindings borrow); on a `let`
 // whose binding moves on at once (`let __own_new = rhs`): no drop; on an
 // Arm whose bindings' drops are placed; on a body whose parameters' drops
-// are; on the Arm of a `for` loop's `next()` (check/iterate.vl): its
-// binding is a copy of an element, not dropped.
+// are; on the Arm of a `for` loop's `next()` (check/iterate.vl; 0.25: its
+// bindings are a match's, borrowed only from a borrowing iterator).
 pub const ASSIGN_OLD: i64 = 1 << 57;
 pub const MATCH_BYREF: i64 = 1 << 58;
 pub const NO_DROP: i64 = 1 << 59;
@@ -125,6 +128,7 @@ static var SYM_TMP: i64 = 0;
 static var SYM_FLAG: i64 = 0;
 static var SYM_FOR_SEQ: i64 = 0;
 static var SYM_FORGET: i64 = 0;
+static var SYM_PASS_OVER: i64 = 0;
 static var SYM_NEEDS_DROP: i64 = 0;
 static var SYM_DROP: i64 = 0;
 
@@ -137,6 +141,7 @@ fn syms() {
             SYM_FLAG = intern_c(c"__own_flag");
             SYM_FOR_SEQ = intern_c(c"__for_seq");
             SYM_FORGET = intern_c(c"forget");
+            SYM_PASS_OVER = intern_c(c"pass_over");
             SYM_NEEDS_DROP = intern_c(c"needs_drop");
             SYM_DROP = intern_c(c"drop");
         }
@@ -332,6 +337,12 @@ pub fn param_drops(item: i64, f: i64) {
         }
         NODES[body].p |= PARAM_DROPS_DONE;
         if is_std_fn(f, SYM_FORGET) {
+            return;
+        }
+        if FNS[f].tmpl != 0 && is_std_fn(f, SYM_PASS_OVER)
+            && crate::front::own::moves::copies_owned_items(TLISTS.data[FNS[f].targs], 0) {
+            // (0.25: std::iter::pass_over::<I>, an item an adapter passes
+            // over: a copy of an element I's container keeps, not dropped)
             return;
         }
         if crate::front::contracts::expand::is_pre_fn(f) {
@@ -554,7 +565,8 @@ pub fn borrowed_call(e: i64) -> bool {
             return false;
         }
         if name == "get" || name == "last" || name == "first" || name == "key_at"
-            || name == "value_at" || name == "peek" {
+            || name == "value_at" || name == "peek" || name == "first_key_value"
+            || name == "last_key_value" {
             // (a shared receiver: `&self`, or a slice)
             return TYPES[p0].kind == TyKind::Slice && TYPES[p0].b != REF_MUT
                 || TYPES[p0].kind == TyKind::Ptr && TYPES[p0].b == REF_SHARED;
@@ -562,9 +574,10 @@ pub fn borrowed_call(e: i64) -> bool {
         // (0.24: a borrowing iterator's items, copies of elements its
         // container keeps, moves::copies_owned_items: in std's adapters,
         // `count`, `filter`, an item looked at and passed over is not dropped)
-        if (name == "next" || name == "at" || name == "find" || name == "last" || name == "nth")
-            && TYPES[p0].kind == TyKind::Ptr
-            && crate::front::own::moves::copies_owned_items(TYPES[p0].a, 0) {
+        if (name == "next" || name == "next_back" || name == "at" || name == "find"
+            || name == "last" || name == "nth" || name == "min" || name == "max")
+            && crate::front::own::moves::copies_owned_items(
+                if TYPES[p0].kind == TyKind::Ptr { TYPES[p0].a } else { p0 }, 0) {
             return true;
         }
         if name == "unwrap" || name == "expect" || name == "unwrap_or" {
@@ -617,6 +630,14 @@ fn let_drops(block: i64, i: i64, stmt: i64) {
         }
         if borrowed_call(init) {
             // (a copy of an element a collection keeps: `v.get(i)`)
+            mark_byref(pat, init);
+            return;
+        }
+        if init != 0 && NODES[pat].kind != NodeKind::PatBind
+            && NODES[init].kind == NodeKind::Ident && reached_by_ref(init) {
+            // (0.25: a binding that borrows, destructured, `|(i, d)|` of a
+            // borrowing iterator's item: its parts borrow, as a match on it)
+            NODES[init].p |= MATCH_BYREF;
             mark_byref(pat, init);
             return;
         }
@@ -823,9 +844,9 @@ pub fn arm_drops(m: i64, arm: i64) {
         let pat = NODES[arm].a;
         let scrutinee = NODES[m].a;
         if (NODES[m].p & GLUE_MATCH) == 0 {
-            if (NODES[arm].p & ARM_FOR_NEXT) != 0 {
-                return;
-            }
+            // (0.25: a `for` loop's `next()`, ARM_FOR_NEXT, as any match: a
+            // borrowing iterator's items borrow, an owning one's are dropped
+            // at the end of each iteration unless moved)
             if scrutinee != 0 && (reached_by_ref(scrutinee) || borrowed_call(scrutinee)) {
                 NODES[scrutinee].p |= MATCH_BYREF;
                 mark_byref(pat, scrutinee);

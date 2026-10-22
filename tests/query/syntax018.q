@@ -6,7 +6,7 @@ crate	syntax018/main.vl	14
 std	<std>	592
 crate::tests	syntax018/main.vl	1
 std::ops	<std>	5
-std::iter	<std>	67
+std::iter	<std>	68
 std::slice	<std>	37
 std::slice::unstable	<std>	16
 std::slice::stable	<std>	22

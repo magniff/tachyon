@@ -23,37 +23,46 @@ pub trait Iterator {
         self.next().unwrap()
     }
 
+    // (0.25) The adapters and the consumers take the iterator `sink`: an
+    // adapter owns the one it wraps (dropped with it, and with it the items
+    // it did not reach), a consumer uses it up. The searches (any, all,
+    // position, find) take it `inout`: they advance it, and the caller
+    // keeps the rest. An item a consumer or an adapter passes over (count's,
+    // the ones filter rejects, min's and max's losers) is dropped, unless
+    // the iterator's items are copies of the elements of a container it
+    // borrows (`v.iter()` of a Vec<Vec<i64>>): pass_over.
+
     #[inline]
-    fn map<B, F: FnMut(sink Self::Item) -> B>(self, f: F) -> Map<Self, F> {
+    fn map<B, F: FnMut(sink Self::Item) -> B>(sink self, f: F) -> Map<Self, F> {
         Map { it: self, f: f }
     }
 
     #[inline]
-    fn filter<F: FnMut(Self::Item) -> bool>(self, f: F) -> Filter<Self, F> {
+    fn filter<F: FnMut(Self::Item) -> bool>(sink self, f: F) -> Filter<Self, F> {
         Filter { it: self, f: f }
     }
 
     // Items (i64, Self::Item): each with its index.
     #[inline]
-    fn enumerate(self) -> Enumerate<Self> {
+    fn enumerate(sink self) -> Enumerate<Self> {
         Enumerate { it: self, k: 0 }
     }
 
     // Items (Self::Item, J::Item), as long as both have one.
     #[inline]
-    fn zip<J: Iterator>(self, other: sink J) -> Zip<Self, J> {
+    fn zip<J: Iterator>(sink self, other: sink J) -> Zip<Self, J> {
         Zip { a: self, b: other }
     }
 
     // The first n items.
     #[inline]
-    fn take(self, n: i64) -> Take<Self> {
+    fn take(sink self, n: i64) -> Take<Self> {
         Take { it: self, n: n }
     }
 
     // f(...f(f(init, x0), x1)..., xn): the loop every consumer is.
     #[inline]
-    fn fold<B, F: FnMut(sink B, sink Self::Item) -> B>(self, init: sink B, f: F) -> B {
+    fn fold<B, F: FnMut(sink B, sink Self::Item) -> B>(sink self, init: sink B, f: F) -> B {
         var it = self;
         var g = f;
         var acc = init;
@@ -64,43 +73,58 @@ pub trait Iterator {
     }
 
     #[inline]
-    fn for_each<F: FnMut(sink Self::Item)>(self, f: F) {
+    fn for_each<F: FnMut(sink Self::Item)>(sink self, f: F) {
         var g = f;
         self.fold((), |u: (), x| g(x));
     }
 
     #[inline]
-    fn count(self) -> i64 {
-        self.fold(0i64, |n, x| n + 1)
+    fn count(sink self) -> i64 {
+        self.fold(0i64, |n, x| {
+            pass_over::<Self>(x);
+            n + 1
+        })
     }
 
     // The sum of the items, from `0 as Self::Item`.
     #[inline]
-    fn sum(self) -> Self::Item {
+    fn sum(sink self) -> Self::Item {
         self.fold(0 as Self::Item, |s, x| s + x)
     }
 
     #[inline]
-    fn min(self) -> Option<Self::Item> {
+    fn min(sink self) -> Option<Self::Item> {
         var it = self;
         match it.next() {
-            Option::Some(first) => Option::Some(it.fold(first, |m, x| if x < m { x } else { m })),
+            Option::Some(first) => Option::Some(it.fold(first, |m, x| if x < m {
+                pass_over::<Self>(m);
+                x
+            } else {
+                pass_over::<Self>(x);
+                m
+            })),
             Option::None => Option::None,
         }
     }
 
     #[inline]
-    fn max(self) -> Option<Self::Item> {
+    fn max(sink self) -> Option<Self::Item> {
         var it = self;
         match it.next() {
-            Option::Some(first) => Option::Some(it.fold(first, |m, x| if x > m { x } else { m })),
+            Option::Some(first) => Option::Some(it.fold(first, |m, x| if x > m {
+                pass_over::<Self>(m);
+                x
+            } else {
+                pass_over::<Self>(x);
+                m
+            })),
             Option::None => Option::None,
         }
     }
 
     // A new Vec of the items on allocator a (0.16; the caller frees it).
     #[inline]
-    fn collect_in<A: Allocator>(self, a: sink A) -> Vec<Self::Item, A> {
+    fn collect_in<A: Allocator>(sink self, a: sink A) -> Vec<Self::Item, A> {
         var it = self;
         var v: Vec<Self::Item, A> = Vec::new_in(a);
         let n = it.exact_len();
@@ -114,20 +138,20 @@ pub trait Iterator {
     // (0.16: an error outside std, front/ambient.vl)
     #[ambient("collect_in(gpa)")]
     #[inline]
-    fn collect(self) -> Vec<Self::Item> {
+    fn collect(sink self) -> Vec<Self::Item> {
         self.collect_in(Gpa::ambient())
     }
 
     // ---- Searches (0.15) ----
     // They call `next` and stop at the first item that decides: the items
-    // after it are not reached.
+    // after it are not reached, and stay in the iterator (0.25: `inout
+    // self`).
 
     // Whether f is true for some item.
     #[inline]
-    fn any<F: FnMut(Self::Item) -> bool>(self, f: F) -> bool {
-        var it = self;
+    fn any<F: FnMut(Self::Item) -> bool>(inout self, f: F) -> bool {
         var g = f;
-        while let Option::Some(x) = it.next() {
+        while let Option::Some(x) = self.next() {
             if g(x) {
                 return true;
             }
@@ -137,10 +161,9 @@ pub trait Iterator {
 
     // Whether f is true for every item (true when there is none).
     #[inline]
-    fn all<F: FnMut(Self::Item) -> bool>(self, f: F) -> bool {
-        var it = self;
+    fn all<F: FnMut(Self::Item) -> bool>(inout self, f: F) -> bool {
         var g = f;
-        while let Option::Some(x) = it.next() {
+        while let Option::Some(x) = self.next() {
             if !g(x) {
                 return false;
             }
@@ -150,11 +173,10 @@ pub trait Iterator {
 
     // The index (counting from 0) of the first item f is true for.
     #[inline]
-    fn position<F: FnMut(Self::Item) -> bool>(self, f: F) -> Option<i64> {
-        var it = self;
+    fn position<F: FnMut(Self::Item) -> bool>(inout self, f: F) -> Option<i64> {
         var g = f;
         var k = 0;
-        while let Option::Some(x) = it.next() {
+        while let Option::Some(x) = self.next() {
             if g(x) {
                 return Option::Some(k);
             }
@@ -165,10 +187,9 @@ pub trait Iterator {
 
     // The first item f is true for.
     #[inline]
-    fn find<F: FnMut(Self::Item) -> bool>(self, f: F) -> Option<Self::Item> {
-        var it = self;
+    fn find<F: FnMut(Self::Item) -> bool>(inout self, f: F) -> Option<Self::Item> {
         var g = f;
-        while let Option::Some(x) = it.next() {
+        while let Option::Some(x) = self.next() {
             if g(x) {
                 return Option::Some(x);
             }
@@ -176,6 +197,14 @@ pub trait Iterator {
         Option::None
     }
 }
+
+// (0.25) Consumes item x of an iterator of type I that an adapter or a
+// consumer passes over: dropped, unless I's items are copies of elements
+// a container it borrows keeps (`v.iter()`, a map's `iter`, `keys`,
+// `values`, a set's `iter`, and adapters of them): then left alone, as
+// std::forget would (front/own/drops.vl: param_drops decides, by I).
+#[inline]
+pub fn pass_over<I: Iterator>(x: sink I::Item) {}
 
 // ---- Adapters ----
 
@@ -203,7 +232,7 @@ impl<I: Iterator, M> Iterator for Map<I, M> {
     }
 
     #[inline]
-    fn fold<B, F: FnMut(sink B, sink M::Output) -> B>(self, init: sink B, f: F) -> B {
+    fn fold<B, F: FnMut(sink B, sink M::Output) -> B>(sink self, init: sink B, f: F) -> B {
         var m = self.f;
         var g = f;
         self.it.fold(init, |acc, x| g(acc, m(x)))
@@ -230,10 +259,15 @@ impl<I: Iterator, P> Iterator for Filter<I, P> {
     }
 
     #[inline]
-    fn fold<B, F: FnMut(sink B, sink I::Item) -> B>(self, init: sink B, f: F) -> B {
+    fn fold<B, F: FnMut(sink B, sink I::Item) -> B>(sink self, init: sink B, f: F) -> B {
         var p = self.f;
         var g = f;
-        self.it.fold(init, |acc, x| if p(x) { g(acc, x) } else { acc })
+        self.it.fold(init, |acc, x| if p(x) {
+            g(acc, x)
+        } else {
+            pass_over::<I>(x);
+            acc
+        })
     }
 }
 
@@ -265,7 +299,7 @@ impl<I: Iterator> Iterator for Enumerate<I> {
     }
 
     #[inline]
-    fn fold<B, F: FnMut(sink B, sink (i64, I::Item)) -> B>(self, init: sink B, f: F) -> B {
+    fn fold<B, F: FnMut(sink B, sink (i64, I::Item)) -> B>(sink self, init: sink B, f: F) -> B {
         var e = self;
         var g = f;
         var acc = init;
@@ -318,7 +352,7 @@ impl<A: Iterator, J: Iterator> Iterator for Zip<A, J> {
     }
 
     #[inline]
-    fn fold<B, F: FnMut(sink B, sink (A::Item, J::Item)) -> B>(self, init: sink B, f: F) -> B {
+    fn fold<B, F: FnMut(sink B, sink (A::Item, J::Item)) -> B>(sink self, init: sink B, f: F) -> B {
         var z = self;
         var g = f;
         var acc = init;
@@ -370,7 +404,7 @@ impl<I: Iterator> Iterator for Take<I> {
     }
 
     #[inline]
-    fn fold<B, F: FnMut(sink B, sink I::Item) -> B>(self, init: sink B, f: F) -> B {
+    fn fold<B, F: FnMut(sink B, sink I::Item) -> B>(sink self, init: sink B, f: F) -> B {
         var t = self;
         var g = f;
         var acc = init;
@@ -427,7 +461,7 @@ impl<T> Iterator for Range<T> {
     }
 
     #[inline]
-    fn fold<B, F: FnMut(sink B, sink T) -> B>(self, init: sink B, f: F) -> B {
+    fn fold<B, F: FnMut(sink B, sink T) -> B>(sink self, init: sink B, f: F) -> B {
         var g = f;
         var acc = init;
         for x in self.start..self.end {
@@ -468,7 +502,7 @@ impl<T> Iterator for RangeInclusive<T> {
     }
 
     #[inline]
-    fn fold<B, F: FnMut(sink B, sink T) -> B>(self, init: sink B, f: F) -> B {
+    fn fold<B, F: FnMut(sink B, sink T) -> B>(sink self, init: sink B, f: F) -> B {
         var g = f;
         var acc = init;
         if !self.done {
@@ -508,7 +542,7 @@ impl<T> Iterator for SliceIter<T> {
     }
 
     #[inline]
-    fn fold<B, F: FnMut(sink B, sink T) -> B>(self, init: sink B, f: F) -> B {
+    fn fold<B, F: FnMut(sink B, sink T) -> B>(sink self, init: sink B, f: F) -> B {
         var g = f;
         var acc = init;
         let s = self.s;
@@ -635,7 +669,7 @@ impl<K, V> Iterator for HashMapIter<K, V> {
     }
 
     #[inline]
-    fn fold<B, F: FnMut(sink B, sink (K, V)) -> B>(self, init: sink B, f: F) -> B {
+    fn fold<B, F: FnMut(sink B, sink (K, V)) -> B>(sink self, init: sink B, f: F) -> B {
         var g = f;
         var acc = init;
         var it = self.it;
@@ -667,7 +701,7 @@ impl<K, V> Iterator for Keys<K, V> {
     }
 
     #[inline]
-    fn fold<B, F: FnMut(sink B, sink K) -> B>(self, init: sink B, f: F) -> B {
+    fn fold<B, F: FnMut(sink B, sink K) -> B>(sink self, init: sink B, f: F) -> B {
         var g = f;
         self.it.fold(init, |acc, e| g(acc, e.0))
     }
@@ -692,7 +726,7 @@ impl<K, V> Iterator for Values<K, V> {
     }
 
     #[inline]
-    fn fold<B, F: FnMut(sink B, sink V) -> B>(self, init: sink B, f: F) -> B {
+    fn fold<B, F: FnMut(sink B, sink V) -> B>(sink self, init: sink B, f: F) -> B {
         var g = f;
         self.it.fold(init, |acc, e| g(acc, e.1))
     }
