@@ -43,16 +43,16 @@ are the way they are. It is not a specification. For precise rules, see
 12. [Effects: what a function may do](12-effects.md) *(outline)*
 13. [Contracts and testing](13-contracts-testing.md) *(outline)*
 14. [Threads](14-threads.md) *(outline)*
-15. [Unsafe code and C](15-unsafe-and-c.md) *(outline)*
-16. [Performance](16-performance.md) *(outline)*
-17. [The tools, and working with an agent](17-tools.md) *(outline)*
-18. [Project: a command-line tool](18-project-cli-tool.md) *(outline)*
+15. [Unsafe code and C](15-unsafe-and-c.md)
+16. [Performance](16-performance.md)
+17. [The tools, and working with an agent](17-tools.md)
+18. [Project: a command-line tool](18-project-cli-tool.md)
 
 Appendices:
 
 - A. [Keywords, operators and attributes](19-appendix-keywords-operators.md) *(outline)*
 - B. [Reading diagnostics](20-appendix-diagnostics.md) *(outline)*
-- C. [Coming from another language](21-appendix-coming-from.md) *(outline)*
+- C. [Coming from another language](21-appendix-coming-from.md)
 
 Chapters 1 and 2 are written; the others are detailed outlines, being
 filled in.
