@@ -33,11 +33,12 @@
 
 use crate::base::{IntVec, SRC, SYMS, buf_byte, buf_bytes, buf_new, buf_slice, buf_str, intern_c};
 use crate::base::diag::{buf_position, put_short_positions};
-use crate::front::ast::{NODES, NodeKind, child};
+use crate::front::ast::{FN_CLOSURE, NODES, NodeKind, child};
 use crate::front::check::LOCALS;
 use crate::front::effects::infer::{
     ADDRESS_TAKEN, COMPONENT, EDGES, EDGE_START, GRAPH_FNS, GRAPH_SIZE, body_walked, infer_effects,
 };
+use crate::front::modules::within_std;
 use crate::front::own::diag::{
     OWN_VIEWS, own_begin, own_bytes, own_discard, own_end, own_flush, own_help, own_str, own_try,
 };
@@ -45,15 +46,16 @@ use crate::front::own::kinds::{
     K_LEVEL2, is_view_type, owned_base_type, param_mode, type_kind, view_elem,
 };
 use crate::front::own::state::{
-    CUR, NW, PL_COUNT, PL_FIELD, PL_RID, PL_RKIND, POOL, RK_LOCAL, RK_ROOT, RK_STATIC, root_of,
-    slot_of_local, slot_off,
+    CUR, NW, PL_COUNT, PL_FIELD, PL_PARENT, PL_RID, PL_RKIND, POOL, RK_LOCAL, RK_ROOT, RK_STATIC,
+    root_of, slot_of_local, slot_off,
 };
 use crate::front::own::summary::{
-    S_L1_P, S_L1_STAR, S_L2_P, S_L2_STAR, ViewSummary, decl_of, declared_summary, empty_summary,
-    floor_summary, has_mut_ref_param, is_mut_mode, is_mut_ref, join_summary, put_params,
-    ret_parametric, same_summary, summary_inferred, summary_of, summary_store, summary_text,
-    top_summary, view_fn,
+    S_L1_P, S_L1_STAR, S_L2_P, S_L2_STAR, ViewSummary, closure_param, decl_of, declared_summary,
+    empty_summary, env_param, env_ref_field, floor_summary, has_mut_ref_param, is_mut_mode,
+    is_mut_ref, join_summary, put_params, ret_parametric, same_summary, store_param,
+    summary_inferred, summary_of, summary_store, summary_text, top_summary, view_fn,
 };
+use crate::front::own::views::CAPTURES_STORED;
 use crate::front::own::walk::{PARAM_LOCALS, walk_fn};
 use crate::front::types::{
     ENUMS, FNS, FN_COUNT, STRUCTS, TLISTS, TYPES, TyKind, VARIANTS, enum_variant, fn_param,
@@ -418,12 +420,15 @@ fn filter_masks(f: i64) -> i64 {
         var targets = 0;
         var only = -1;
         for i in 0..FNS[f].param_count {
-            if is_mut_ref(fn_param(f, i)) && is_mut_mode(param_mode(f, i)) {
+            if store_param(f, i) {
                 targets += 1;
                 only = i;
             }
         }
-        FILT[o + 3] = if targets == 1 && only < 63 { ~(1 << only) } else { -1 };
+        // (a closure's env, or a closure given: its own bits stay, as one
+        // capture may come to view another)
+        FILT[o + 3] = if targets == 1 && only < 63 && !env_param(f, only) && !closure_param(f, only)
+            { ~(1 << only) } else { -1 };
         FILT[o + 4] = 1;
         o
     }
@@ -505,12 +510,18 @@ static var COL_DECLARED: bool = false;
 // (the why of this walk: (mask, parameter, node, target) quadruples)
 static var COL_WHY: IntVec = IntVec { data: 0 as *i64, count: 0, cap: 0 };
 
+// (the parameters a callable's result views in this walk: col_call)
+static var COL_CALL: i64 = 0;
+
 pub fn col_begin(f: i64, round: i64) {
     unsafe {
         COL_F = f;
         COL_ON = f >= 0 && view_fn(f);
         COL_REPORTED = false;
         COL_WHY.count = 0;
+        COL_CALL = 0;
+        COL_STORED[0] = 0;
+        COL_STORED[1] = 0;
         for k in 0..4 {
             COL_RET[k] = 0;
             COL_STO[k] = 0;
@@ -557,6 +568,17 @@ fn root_param(q: i64, skip: i64) -> i64 {
         // (a place reached through a reference parameter: its referent)
         let t = LOCALS[l].ty;
         if PL_RKIND[r] == RK_LOCAL && t > 0 && TYPES[t].kind == TyKind::Ptr {
+            if q != r && env_param(COL_F, i) {
+                // (a closure's capture by reference: the captured variable,
+                // what the env's views point into)
+                var a = q;
+                while PL_PARENT[a] != r {
+                    a = PL_PARENT[a];
+                }
+                if env_ref_field(COL_F, PL_FIELD[a]) {
+                    return i * 2 + 1;
+                }
+            }
             return i * 2;
         }
         -1
@@ -600,10 +622,7 @@ pub fn col_result(e: i64, v: i64) {
         var target: [i64; 4] = [-1, -1, -1, -1];
         for i in 0..PARAM_LOCALS.count {
             let l = PARAM_LOCALS.data[i];
-            if l < 0 || i >= FNS[f].param_count || !is_mut_ref(fn_param(f, i)) {
-                continue;
-            }
-            if !is_mut_mode(param_mode(f, i)) {
+            if l < 0 || i >= FNS[f].param_count || !store_param(f, i) {
                 continue;
             }
             let s = slot_of_local(l);
@@ -614,6 +633,12 @@ pub fn col_result(e: i64, v: i64) {
             var m: [i64; 2] = [0, 0];
             add_roots(off, l, &m[0], 0);
             add_roots(off + NW, l, &m[0], 0);
+            if i < 63 && (CAPTURES_STORED & (1 << i)) != 0 {
+                // (a closure stored into: one capture may now view another,
+                // its own roots among what was stored, col_stored)
+                m[0] |= COL_STORED[0];
+                m[1] |= COL_STORED[1];
+            }
             for k in 0..4 {
                 let add = if k == S_L1_P || k == S_L2_P { m[0] } else { m[1] };
                 if (add & ~sto[k]) != 0 && target[k] < 0 {
@@ -631,6 +656,47 @@ pub fn col_result(e: i64, v: i64) {
         if COL_DECLARED && !COL_REPORTED {
             check_declared(f, e, ret, sto, target);
         }
+    }
+}
+
+// Whether a call of f (-1: through a fn value) in the walked function is
+// a callable's (a closure's, a fn value's, or a function outside std: what
+// a type parameter's bound lets the body call) whose result's views the
+// parametric floor does not cover: a generic body that calls its `F`
+// makes a result that may view anything the callable views (col_end).
+pub fn col_callable(f: i64) -> bool {
+    unsafe {
+        if !COL_ON || FNS[COL_F].tmpl == 0 || ret_parametric(COL_F) == 0 {
+            return false;
+        }
+        f < 0 || !within_std(FNS[f].module) || FNS[f].node > 0
+            && (NODES[FNS[f].node].p & FN_CLOSURE) != 0
+    }
+}
+
+// The origin v of a callable's result (col_callable): the parameters it
+// views, at any level.
+pub fn col_call(v: i64) {
+    unsafe {
+        var m: [i64; 4] = [0, 0, 0, 0];
+        add_roots(v, -1, &m[0], S_L1_P);
+        add_roots(v + NW, -1, &m[0], S_L2_P);
+        COL_CALL |= m[0] | m[1] | m[2] | m[3];
+    }
+}
+
+// The parameters (`p`, `*p` masks) whose views the walk stored into a
+// closure (views::note_env_store): its own captures among them, which
+// col_result otherwise leaves out of a target's stores.
+static var COL_STORED: [i64; 2] = [0, 0];
+
+pub fn col_stored(v: i64) {
+    unsafe {
+        if !COL_ON {
+            return;
+        }
+        add_roots(v, -1, &COL_STORED[0], 0);
+        add_roots(v + NW, -1, &COL_STORED[0], 0);
     }
 }
 
@@ -682,7 +748,9 @@ pub fn col_end(f: i64) -> ViewSummary {
             let floor = floor_summary(f);
             for k in 0..4 {
                 if ret_parametric(f) != 0 {
-                    s.ret[k] = floor.ret[k];
+                    // (and what its callables' results view, as the body
+                    // passes them on: col_call)
+                    s.ret[k] = floor.ret[k] | COL_RET[k] & COL_CALL;
                 }
                 s.sto[k] |= floor.sto[k];
             }

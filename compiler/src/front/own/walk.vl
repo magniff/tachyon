@@ -32,8 +32,8 @@
 
 use crate::base::{SYMS, intern_c};
 use crate::front::ast::{
-    CLOSURE_MOVE, DEFER_IMPLICIT, FN_CLOSURE, NODES, NODE_IN_BOUNDS, NODE_RAW, NODE_REF_MUT,
-    NodeKind, child,
+    CLOSURE_MOVE, DEFER_IMPLICIT, FN_CLOSURE, NODES, NODE_CAPTURE, NODE_IN_BOUNDS, NODE_RAW,
+    NODE_REF_MUT, NodeKind, child,
 };
 use crate::front::check::{LOCALS, Res};
 use crate::front::lexer::Tok;
@@ -49,7 +49,9 @@ use crate::front::own::state::{
     local_place, new_ov, new_state, pend_push, reachable, reset_places, root_of, same_state,
     set_unreachable, set_words, slot_for, static_has_place, static_place, variant_field_key,
 };
-use crate::front::own::summary::{ViewSummary, collect_begin, collect_end, collect_result};
+use crate::front::own::summary::{
+    ViewSummary, collect_begin, collect_end, collect_result, env_param,
+};
 use crate::front::patterns::binds_ref;
 use crate::front::types::{FNS, REF_MUT, REF_SHARED, TYPES, TyKind};
 
@@ -315,8 +317,23 @@ fn is_reference(e: i64) -> bool {
         if NODES[e].ty > 0 && TYPES[NODES[e].ty].kind == TyKind::Ptr && TYPES[NODES[e].ty].b != 0 {
             return true;
         }
+        if NODES[e].kind == NodeKind::FieldAccess && NODES[e].y == 1 && NODES[e].a > 0
+            && (NODES[e].p & NODE_CAPTURE) == 0 && env_local(NODES[e].a) {
+            // (a closure's capture by reference, `(*env).x`: the captured
+            // variable itself, env_ref_field)
+            return true;
+        }
         NODES[e].kind == NodeKind::Ident && NODES[e].res == Res::Local && NODES[e].y >= 0
-            && LOCALS[NODES[e].y].borrow
+            && (LOCALS[NODES[e].y].borrow || env_local(e))
+    }
+}
+
+// Whether e names the walked closure's env parameter (summary::env_param):
+// a reference to the closure's value, its captures.
+pub fn env_local(e: i64) -> bool {
+    unsafe {
+        NODES[e].kind == NodeKind::Ident && NODES[e].res == Res::Local && PARAM_LOCALS.count > 0
+            && NODES[e].y == PARAM_LOCALS.data[0] && env_param(CUR_F, 0)
     }
 }
 
@@ -562,6 +579,8 @@ pub fn eval(n: i64, ctx: i64, dst: i64) {
                 let moving = (NODES[n].c & CLOSURE_MOVE) != 0;
                 if !moving {
                     NO_MOVE += 1;
+                } else {
+                    moves::sink_borrowed_captures(n);
                 }
                 eval(NODES[n].y, CX_MOVE, dst);
                 if !moving {
