@@ -1413,6 +1413,25 @@ selection and copy, the scrollback view and configuration, the
 measurements against Alacritty's input latency and memory, fonts through
 FreeType and a rasterizer in the language (after 0.24).
 
+## 0.24: vole, a language server, std::cli
+
+- the rename, tachyon to vole (`volec`, `.vl`, `VOLE_*`), by the
+  compiler's own tools and checked by building every program before and
+  after; the chain still builds the releases before it
+- the language server (`volec lsp`) with a VS Code extension
+- std::cli, a command-line parser for the examples and tools
+- the soundness holes 0.22 and 0.23 left: let as a borrow, the
+  temporaries of generic let parameters
+
+Done (0.24.0). The rename (tools/rename-vole.sh in one checked run, no
+aliases), the logo, editors/vscode on `volec lsp` (highlighting,
+diagnostics, definitions, references, symbols, hovers with effects and
+why), std::cli, let as a borrow, str and Path as views, `gl(make())`,
+the `make().v` double free, a sound stopgap (own.move_out) for keeping
+an iterator's copied items. Moved to 0.24.1 or later: iterator items as
+views (the stopgap's full fix), the closure by-value parameter leak,
+std's core under 128 KB, Wayland and X11.
+
 ## After 0.23: the specification
 
 Decided with the user on 2026-10-16: once 0.23 has shipped, the whole

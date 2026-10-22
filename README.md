@@ -249,8 +249,10 @@ checks every release; `-g` writes DWARF line tables.
 
 Vole is at 0.x: the language is not stable, and minor releases may
 break programs (with a `volec fix` migration from 0.14 on). The
-current release is 0.23.0: windows and input in std (std::window, on
-Cocoa) and a terminal emulator on them (examples/voltty); on 0.22's GPU
+current release is 0.24.0, the first named vole: the rename from
+tachyon, a language server with a VS Code extension (editors/vscode),
+std::cli; on 0.23's windows (std::window, on Cocoa) and terminal
+emulator (examples/voltty), 0.22's GPU
 support (std::gpu with the Metal backend, std::gpu::wgsl compiling WGSL
 to MSL), 0.21's threads with what crosses them checked (std::thread,
 std::sync), Hylo-style parameter conventions (`let`, `inout`, `sink`,
@@ -259,8 +261,7 @@ CPU intrinsics, 0.18's contracts and tests, 0.17's mutable value
 semantics and 0.16's effects and explicit allocators. See [docs/releases.md](docs/releases.md)
 for every release. Next:
 
-- **0.24**: a language server and an editor extension, and the language renamed to vole
-- **then**: the specification, the whole language written down with the user
+- **0.25**: the specification, the whole language written down with the user
 
 **Toward 1.0.** 1.0 is not a feature milestone. It ships when the
 surface language has been reworked against real programs, the tools

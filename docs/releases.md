@@ -56,8 +56,64 @@ binary is invoked, where its test runner is and which hosts it supports.
 | 0.21.0 | `v0.21.0` | 0.20.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | concurrency: safe `std::thread::spawn` and `scope` with what crosses threads checked (Send and Sync from the types), `std::sync` (atomics with every ordering, Mutex, RawLock, Once, Condvar, mpsc channels), `#[thread_local]`, effects `thread`, `sync`, `tls`, atomics as barriers in the optimizer; the compiler's source in 0.20's conventions, the 0.19 spelling removed (`var`, `inout`, `sink` keywords; the mixed reading only inside fix's migrations); `.vl` sources and `VOLE_*` variables accepted |
 | 0.22.0 | `v0.22.0` | 0.21.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | GPU: `std::gpu`, a wgpu-like API native-first with the Metal backend (device, queue, buffers, textures, samplers, bind groups, compute and render pipelines, command encoders, headless surfaces) over `std::objc`, the sizes of runtime-sized arrays bound per dispatch and draw; `std::gpu::wgsl`, a WGSL compiler to MSL with reflection, `Device::shader_wgsl`; std's section index fixed (a hello world 357 M to 96 M instructions) and a compile-cost gate row; std own-checked; `f(x?)` into a `let` parameter kept alive through the call; `fn(T)` is `fn(let T)` |
 | 0.23.0 | `v0.23.0` | 0.22.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | windows: `std::window`, winit-like with events pulled, on Cocoa (windows, keyboard and text input with IME basics, mouse, scroll, scale, cursor, clipboard, frames on request, watched fds), loaded only when a program names it; voltty (examples/voltty), a terminal emulator on std::window and std::gpu: a core checked against alacritty_terminal by an oracle and a fuzzer, Core Text glyphs in an atlas, one instanced draw of 16-byte cells per frame with `cells.wgsl` through std::gpu::wgsl, damage tracking, no allocation per frame, a shell on a pty; the rename tools for 0.24: `rewrite --text`, `refactor extension`, `query grep --ignore-case`, releases.toml's `bin` and `ext` |
+| 0.24.0 | `v0.24.0` | 0.23.0 | aarch64-macos, x86_64-linux, x86_64-macos, aarch64-linux (cross-built) | **vole**: tachyon renamed (`tachyonc` to `volec`, `.tach` to `.vl`, `TACHYON_*` to `VOLE_*`, symbols `_vole.`; no aliases) by the compiler's own tools and checked by same-output; the releases up to 0.23 still built as tachyonc through releases.toml's `bin` and `ext`; the logo; the language server with a VS Code extension (editors/vscode: highlighting, diagnostics, definitions, references, symbols, hovers with computed effects); `std::cli`, clap's builder without derive; `let` as a borrow, `str` and `Path` views to the own pass, `gl(make())`, the `make().v` double free fixed, an iterator's copied items kept refused (`own.move_out`, a stopgap); timing tests steady under load |
 
 Add a row here, and an entry to `bootstrap/releases.toml`, for every release.
+
+### What's new in 0.24
+
+The language is **vole** from this release; the design of the rename is
+docs/refactor.md ("Renaming the language") and tools/rename-vole.sh, the server's
+docs/lsp.md, the parser's docs/design/cli.md and `volec guide cli`.
+
+- **The rename**: tachyon is vole. The compiler is `volec`, sources are
+  `.vl`, the environment's variables `VOLE_*`, the symbols `_vole.`; no
+  aliases are kept. It was done by the compiler's own tools, in one run
+  of tools/rename-vole.sh (`refactor extension .tach .vl --all`,
+  `rewrite --text` for the words in comments, strings and other files),
+  every program's build compared before and after (`same-output`). The
+  chain still builds the releases up to 0.23 as `tachyonc` from `.tach`
+  sources (releases.toml's `bin` and `ext`); v0.23.0 builds this
+  release's `volec`.
+- **The logo** (docs/assets/vole-logo.png), at the top of the README.
+- **The language server and a VS Code extension** (editors/vscode):
+  highlighting for `.vl` (a TextMate grammar with its tests), the
+  editor's brackets and comments, and from `volec lsp`: diagnostics as
+  you type, go to definition, references, document symbols, and hovers
+  showing a function's signature with its effects, declared or inferred,
+  a line of why for each, and its CPU features (a call of a generic
+  function: the instance's).
+- **std::cli**: clap's builder without derive. Flags (counted), options
+  with defaults, positionals (required, multiple), subcommands; typed
+  values (`get_as::<T>`, `FromStr`); generated help and `--version`;
+  errors in one line with a did-you-mean `try:`; the Matches on an
+  allocator (an arena); `parse` is `#[no_io]`. voltty reads its
+  arguments with it.
+- **Language and safety**:
+  - `let` is a borrow: a copyable `let` parameter is passed by reference
+    when the result may hold a view of it, so `DirEntry::file_name(self)`
+    is back;
+  - `str` and `Path` are views to the own pass (a distinct type has its
+    underlying kind);
+  - `gl(make())`: a call's or a struct literal's value given to a
+    generic `let` parameter is a temporary;
+  - `make().v`: a field moved out of a temporary is no longer freed
+    again with it;
+  - **a stopgap for a double free in safe code**: `iter()`, `keys()`,
+    `values()` hand out copies of items the container still owns, and
+    keeping one (collecting, storing, returning, sinking it) freed it
+    twice. Such a keep is now `own.move_out`, with `try:` lines
+    (`.iter_ref().map(|x| x.clone())`); it is broader than needed (a
+    named fn given to `map`, a destructured closure item, are refused
+    too) until iterator items are views.
+- **Timing tests** (voltty's renderer, the sort and parser examples) no
+  longer fail under a loaded machine.
+- **Tested on aarch64 only**, as since 0.15 (`gate.sh --with-x86`).
+- **Breaking**: every name: `volec`, `.vl` (a `.tach` file is not a
+  source any more), `VOLE_*`; programs read through the stopgap above.
+- **Known issues**: a closure's by-value parameters leak; the stopgap's
+  breadth; the four missing-feature XFAILs; std::window's Linux
+  backends are not written; std's core is 144 KB.
 
 ### What's new in 0.23
 
