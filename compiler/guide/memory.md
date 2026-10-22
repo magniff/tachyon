@@ -94,7 +94,10 @@ fn main(gpa: Gpa) {
 - `impl Drop for T { fn drop(inout self) { ... } }` runs code at the
   drop; a type without one drops its fields. `drop(x)` drops early,
   `std::forget(x)` never (a leak, safe); `x.drop()` by hand is
-  `own.drop_call` (`try: drop(x)`).
+  `own.drop_call` (`try: drop(x)`). A type with a Drop of its own
+  holds no view, also through a type argument (`G<[i64]>` of `impl<T>
+  Drop for G<T>`): `own.drop_view`, since its drop could read what the
+  view points to after that is gone. std's containers of views are fine.
 - A `match`, `if let` or `let (a, _) = t` by value on a local moves
   only the parts it binds; the rest (`_`, `..`, a wildcard arm) stays
   in the local and is dropped with it, at its scope's end. `v[i] = x`

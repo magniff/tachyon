@@ -1832,3 +1832,64 @@ changed:
 - `clone`, and a generic result whose type arguments have no glue
   (`String::from_in(..)`), make a new value: a receiver of a std method
   that is one is dropped (`v.clone().len()` leaked).
+
+### 0.25: drop check and views across threads (branch fix25g)
+
+Three soundness holes the poly red team found (tests/run/sem_poly_x15,
+x14, x03, x02, th10), and one the exclusivity red team found, closed with
+the simplest sound rules:
+
+- **Drop check: a type with a Drop of its own holds no view, also
+  through a type argument** (`own.drop_view`). 0.17 rejected `impl Drop`
+  on a struct whose own fields hold views, but let `impl<T> Drop for
+  G<T>` be instantiated with a view (`G<[i64]>`), as Rust's `may_dangle`.
+  Nothing orders a drop before the drop of what its views point into
+  (`var g = G { x: a[..] }; var v = ..; g = G { x: v.as_slice() };` drops v
+  first, then g's drop reads the view: a use after free). Rust's answer,
+  dropck, rejects the declaration order instead; the rule here is
+  simpler and loses little: an instance of a user Drop type whose type
+  arguments hold a view is `own.drop_view` at the impl (with a try: an
+  owned argument, `.to_vec_in(gpa)`). std's generic containers keep the
+  exemption (their drops read no element: `Vec<[u8]>`). So drop order
+  never matters for soundness: no drop that runs reads a view. A type
+  holding a view and a Drop field that holds none (`struct W { s: [i64],
+  d: D }`) is fine.
+- **No view in a channel, a Mutex, an atomic or a lock's result**
+  (`sync.view_item`, front/threads::check_sync_items, whether or not the
+  program starts threads). What `tx.send(x)` sends, `Mutex::new(x)` and
+  `m.with(|d| d.push(x))` store and `Atomic::new(x)` holds is taken out
+  elsewhere and later (another thread, or after the scope of what it
+  views), and nothing ties it to what it views; what `m.with(|d| ..)`
+  (`try_with`, a guard's `with`, `Condvar::wait_then`) returns would
+  outlive the lock. The instances of `mpsc::channel_in::<T>`,
+  `Mutex::new`, `Atomic::new` with T a view type, and of the lock
+  functions with R one, are rejected; the try is an owned copy
+  (`s.to_vec_in(gpa)`, new in std, or `s.to_string_in(gpa)`). Scoped
+  threads still borrow views of data that outlives the scope (unchanged);
+  `thread::spawn` already required Send without views. A thread-local of
+  a view type (`#[thread_local] static var X: [u8]`) does not compile
+  today (std's __tls_addr instance fails to check: a separate bug).
+- **Scoped threads only read what they borrow, in every form**
+  (`sync.scope_shared_write`). The check (front/threads::capture_write)
+  missed an exclusive slicing that is no `&x` node after the checker:
+  `&a[..]`, `&v[i..j]`, `&v` and `&a` coerced to `inout [T]`, `v[i] = x`
+  on a Vec or a Buf (`v.as_mut_slice()[i]`), an inout method of an
+  array's slicing (`a.sort()`) or of a captured shared slice. It now takes the
+  root of any argument an inout parameter is given and of any access a
+  call returns. Two threads cannot each write a disjoint part of one
+  slice: std has no `split_at_mut` yet (OVERSTRICT, for later), and a
+  thread may not capture an `inout [T]` at all.
+- **An array's slicing as an inout method's receiver** (`a.sort()`,
+  `a[1..].sort()`) is an exclusive slicing, as `&a[..]` (it was a shared
+  one, which the own pass and the thread check took as a read). An inout
+  method of a shared view (`s.sort()` of `let s = v.as_slice()`) stays
+  legal, unlike `sort(s)` (own.readonly): the own pass takes it as a
+  change of what s views, and a scoped thread's copy of s is a write of
+  the view it copied (two threads sorting one shared slice raced).
+- OVERSTRICT fixed: the scope's own closure may change a variable no
+  thread of the scope borrows (`var n = 0; thread::scope(|s| { s.spawn(||
+  1); n += 1; })`), unless a thread borrows a view, whose origin the check
+  does not know.
+
+Left: `let v: Vec<i64>; v.push(1)` and `let a = [..]; fill(&a)` change a
+`let` binding (immutability, not memory safety).

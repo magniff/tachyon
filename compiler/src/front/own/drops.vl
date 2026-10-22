@@ -287,13 +287,14 @@ fn is_std_fn(f: i64, name: i64) -> bool {
     }
 }
 
-// (0.17) Whether type t, which has `impl Drop`, holds views of its own:
-// own.drop_view. A view reached only through a type argument does not
-// count when the impl is generic over it: std's `impl<T> Drop for
-// Vec<T>` drops a `Vec<[u8]>`'s elements without reading them (a view
-// has no drop), as Rust's `may_dangle`. Fields of the template are
-// looked at, so `struct P<T> { s: [u8], x: T }` with `impl<T> Drop` is
-// still reported.
+// (0.17) Whether type t, which has `impl Drop`, holds views: own.drop_view.
+// (0.25) A view reached through a type argument counts too (`impl<T> Drop
+// for G<T>` with T = `[i64]`: its drop may read the view after what it
+// views is gone, which nothing orders), except in std's types, whose
+// generic drops only drop their elements and read none (`impl<T> Drop for
+// Vec<T>` of a `Vec<[u8]>`, as Rust's `may_dangle`). Fields of a std
+// template are looked at, so a std `struct P<T> { s: [u8], x: T }` with
+// `impl<T> Drop` is still reported.
 fn drop_reads_views(t: i64) -> bool {
     unsafe {
         if !is_view_type(t) {
@@ -307,6 +308,9 @@ fn drop_reads_views(t: i64) -> bool {
             return true;
         }
         let tm = STRUCTS[s].tmpl - 1;
+        if !within_std(STRUCTS[tm].module) {
+            return true;
+        }
         for i in 0..STRUCTS[tm].field_count {
             let ft = (*struct_field(tm, i)).ty;
             if ft > 0 && is_view_type(ft) {
@@ -1429,8 +1433,15 @@ pub fn finish_drops() {
             crate::front::own::diag::own_begin(item, OWN_DROP_VIEW);
             own_str(c"'");
             own_type(DROP_VIEWS.data[i + 1]);
-            own_str(c"' holds views and cannot implement Drop: its drop could read what it views after that is gone");
-            own_help(c"hold owned values (Buf, Vec) instead of the views, or remove the impl");
+            let dt = DROP_VIEWS.data[i + 1];
+            if TYPES[dt].kind == TyKind::Struct && STRUCTS[TYPES[dt].a].tmpl != 0 {
+                // (0.25: an instance whose type argument is a view)
+                own_str(c"' holds views (a type argument is one) and cannot implement Drop: its drop could read what it views after that is gone");
+                own_help(c"give it an owned type argument instead of the view (`.to_vec_in(gpa)`, `.to_string_in(gpa)`, a Buf), or remove the impl");
+            } else {
+                own_str(c"' holds views and cannot implement Drop: its drop could read what it views after that is gone");
+                own_help(c"hold owned values (Buf, Vec) instead of the views, or remove the impl");
+            }
             own_end();
             i += 2;
         }

@@ -4,7 +4,7 @@
 ## A method #[derive] makes: the attribute answers (0.15).
 $ items
 crate	syntax015/main.vl	6
-std	<std>	592
+std	<std>	593
 std::ops	<std>	5
 std::iter	<std>	68
 std::slice	<std>	37
