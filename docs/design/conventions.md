@@ -561,7 +561,14 @@ before:
 - *view*: holds a slice, an access, a by-access closure, or a part that
   is one;
 - *move-only view*: holds an `inout` access or an `inout [T]`, which 0.17
-  called the views with `&mut`.
+  called the views with `&mut`. (0.25) It is move-only transitively
+  (front/own/kinds.vl, holds_inout): a struct with such a field, a tuple,
+  array, enum (`Option<C>`) or container (`Vec<C>`) of one, a generic
+  instance holding one, and a closure that changes a capture or captures
+  one. `let d = c`, `var p2 = p` and a sink argument move it, and a later
+  use of the source is `own.moved`; it is not `Copy`, does not derive
+  `Clone`, and `.clone()` without an impl is no copy of it. An access
+  itself (`inout T`, `inout [T]`) passed on is a reborrow, not a move.
 
 Views are second-class: they live in locals, parameters, fields and
 containers, and the own pass keeps each inside what it views, with
