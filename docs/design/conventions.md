@@ -1966,3 +1966,10 @@ Deferred from 0.25:
   program still has the 0.19 spelling. Then take the transcript's new path.
 
   Diagnosis: .claude/briefs/resume-025/fix25.md, "values017".
+- **The checking Gpa (`--check-alloc`, compiler/std/alloc_check.vl) is
+  not thread-safe.** Its block table and cursor are statics with no lock.
+  A program whose threads allocate gets false reports under load ("use
+  after free", "not a block of Gpa"): the compiler built with
+  `--check-alloc` did at -O2 (worker threads) in the gate's
+  compiler-memcheck step. That step runs the checked compiler at -j1
+  until the checker takes a lock.

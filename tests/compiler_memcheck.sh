@@ -6,7 +6,8 @@
 #               every block on pages of its own, never reused): a use
 #               after free, a double free or a wrong free of Gpa memory
 #               stops it. Leaks are listed and allowed (the compiler
-#               leaves its memory to the exit, by design).
+#               leaves its memory to the exit, by design). At -j1: the
+#               checking Gpa is not thread-safe (0.25.1).
 #   gmalloc     the compiler as built, under Guard Malloc
 #               (/usr/lib/libgmalloc.dylib, MallocScribble): the same for
 #               the memory it takes from malloc directly (its tables,
@@ -73,7 +74,11 @@ check() {
     ch_rc0=$?
     case "$ch_how" in
         checkalloc)
-            "$CHECKED" "-O$ch_o" "$@" -c "$ch_f" -o "$ch_d.o" >"$ch_d.out" 2>&1 ;;
+            # (-j1: the checking Gpa keeps its blocks in statics with no
+            # lock, so the compiler's worker threads, which allocate from
+            # it at -O1 and -O2, race in the checker itself: false reports
+            # under load. The objects are the same at every -j.)
+            "$CHECKED" "-O$ch_o" "$@" -j1 -c "$ch_f" -o "$ch_d.o" >"$ch_d.out" 2>&1 ;;
         gmalloc)
             DYLD_INSERT_LIBRARIES=$GMALLOC MallocScribble=1 MALLOC_PERMIT_INSANE_REQUESTS=1 \
                 "$COMPILER" "-O$ch_o" "$@" -c "$ch_f" -o "$ch_d.o" >"$ch_d.out" 2>&1 ;;
